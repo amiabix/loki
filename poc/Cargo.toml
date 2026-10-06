@@ -31,6 +31,12 @@ rand_zp            = { package = "rand", version = "0.10" }
 # stream stands in for the OS RNG so a publication is reproducible.
 rand_chacha        = "0.3"
 blake2b_simd       = "1"
+# At-rest encryption for member secrets (`MemberDir::write_sealed`). XChaCha20-Poly1305
+# is already in the graph via zcash_note_encryption, so only the KDF is new: Argon2id is
+# the one memory-hard password hash in wide review, and a passphrase needs a real KDF.
+# `default-features = false` keeps it to the raw `hash_password_into` entry point.
+chacha20poly1305   = "0.11"
+argon2             = { version = "0.5", default-features = false, features = ["alloc"] }
 hex                = "0.4"
 ciborium           = "0.2"
 serde_json         = "1"
