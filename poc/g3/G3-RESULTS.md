@@ -706,8 +706,7 @@ adding operators only helps if they all acknowledge every record. Three directio
 prototyped here:
 
 1. **A hardware-backed, non-exportable, non-backed-up key store**, which is what
-   `LOKI_IMPLEMENTATION_SPEC.md:179` already calls for on mobile and which a web page does not
-   have.
+   the design already calls for on mobile, and which a web page does not have.
 2. **A non-rollback counter the page cannot forge**, held by a signing device the user carries,
    so a restored profile fails against something no relay can be talked out of.
 3. **Accept rollback and remove the consequence**, by binding each commitment to one exact

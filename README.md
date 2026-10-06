@@ -56,10 +56,6 @@ poc/
   SECOND-DEVICE-RESULTS.md    finishing without the approvers' files
   DEPENDENCIES.md             the pinned library path, and the ZIP 2005 blocker
   g3/G3-RESULTS.md            the browser drills, per engine
-
-Design record (written before and alongside the prototype):
-  SUMMARY.md, LOKI_PRD.md, LOKI_IMPLEMENTATION_SPEC.md,
-  LOKI_WALLET_TECHNICAL_DESIGN.md, LOKI_FIRST_POC_CLAUDE_BRIEF.md
 ```
 
 ## The claim this exists to test

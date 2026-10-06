@@ -228,8 +228,8 @@ codes; four stages failed in sequence and the script carried on. Stages now run 
   cryptographically after reading it (α recomputed, signature checked under `ak + [α]G`,
   posted transaction checked against the intent), so a corrupted replica cannot produce a
   wrong payment, but a *substituted* intent would be finished faithfully. Binding the
-  replica to an authenticated group record is `LOKI_IMPLEMENTATION_SPEC.md:87` work and is
-  not done here.
+  replica to an authenticated group record, so a substituted proposal could be detected,
+  is design work that is not done here.
 - **No concurrent finishers.** One finisher at a time. Two devices racing to finish the
   same candidate is not tested; the node's double-spend rejection is the only thing that
   would stop the second, and that is after the fact.
