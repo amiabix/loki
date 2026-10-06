@@ -556,7 +556,7 @@ fn propose(args: &[String]) -> Result<(), String> {
 
     let mut inputs = CandidateInputs {
         vault_fvk: &fvk,
-        note,
+        notes: vec![note],
         recipient,
         amount,
         memo: memo.clone(),
@@ -675,7 +675,7 @@ fn propose(args: &[String]) -> Result<(), String> {
         let built = build_candidate(
             &Regtest,
             &inputs,
-            alpha,
+            &[alpha],
             rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng),
         )?;
 
@@ -1361,7 +1361,7 @@ fn tamper(args: &[String]) -> Result<(), String> {
 
     let inputs = CandidateInputs {
         vault_fvk: &fvk,
-        note,
+        notes: vec![note],
         recipient,
         amount: amount_z,
         memo: MemoBytes::from_bytes(&memo_bytes).map_err(|e| format!("memo: {e:?}"))?,

@@ -332,7 +332,7 @@ mod tests {
 
         let mut inputs = CandidateInputs {
             vault_fvk: &fvk,
-            note,
+            notes: vec![note],
             recipient,
             amount: Zatoshis::const_from_u64(AMOUNT),
             memo: MemoBytes::from_bytes(&memo).unwrap(),
@@ -353,7 +353,7 @@ mod tests {
         let built = build_candidate(
             &Regtest,
             &inputs,
-            alpha,
+            &[alpha],
             rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng),
         )
         .unwrap();

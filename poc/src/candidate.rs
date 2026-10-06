@@ -61,7 +61,9 @@ pub fn alpha_from_canonical_bytes(bytes: &[u8; 32]) -> Option<pallas::Scalar> {
 /// What a candidate needs besides the intent.
 pub struct CandidateInputs<'a> {
     pub vault_fvk: &'a FullViewingKey,
-    pub note: Note,
+    /// The notes to spend. One Orchard action each, so each one needs its own
+    /// randomiser and, later, its own FROST signature.
+    pub notes: Vec<Note>,
     pub recipient: orchard::Address,
     pub amount: Zatoshis,
     pub memo: MemoBytes,
@@ -88,9 +90,13 @@ pub fn quote_fee<P: Parameters + Clone>(
     )
     .map_err(|e| format!("deferred builder: {e:?}"))?;
 
-    builder
-        .add_ironwood_spend::<Fe>(inputs.vault_fvk.clone(), inputs.note)
-        .map_err(|e| format!("quote spend: {e:?}"))?;
+    // Every note is its own action, and ZIP 317 prices by action count, so the quote has
+    // to include them all or the fee comes out too low.
+    for note in &inputs.notes {
+        builder
+            .add_ironwood_spend::<Fe>(inputs.vault_fvk.clone(), *note)
+            .map_err(|e| format!("quote spend: {e:?}"))?;
+    }
     builder
         .add_ironwood_output::<Fe>(None, inputs.recipient, inputs.amount, inputs.memo.clone())
         .map_err(|e| format!("quote output: {e:?}"))?;
@@ -115,7 +121,7 @@ pub fn quote_fee<P: Parameters + Clone>(
 pub fn build_candidate<P: Parameters + Clone>(
     params: &P,
     inputs: &CandidateInputs<'_>,
-    alpha: pallas::Scalar,
+    alphas: &[pallas::Scalar],
     rng: impl rand_core_zp::CryptoRng,
 ) -> Result<zcash_primitives::transaction::builder::PcztResult<P>, String> {
     let mut builder = DeferredPcztBuilder::new::<zcash_primitives::transaction::fees::zip317::FeeError>(
@@ -127,14 +133,24 @@ pub fn build_candidate<P: Parameters + Clone>(
     .map_err(|e| format!("deferred builder: {e:?}"))?
     .with_expiry_height(BlockHeight::from_u32(inputs.expiry_height));
 
-    // The spend carries our alpha and no witness.
-    builder
-        .add_ironwood_spend_with_alpha::<zcash_primitives::transaction::fees::zip317::FeeError>(
-            inputs.vault_fvk.clone(),
-            inputs.note,
-            alpha,
-        )
-        .map_err(|e| format!("add ironwood spend: {e:?}"))?;
+    // Each spend carries its own alpha and no witness. One alpha per note: every spend
+    // becomes its own Orchard action with its own `rk`, so they cannot share one.
+    if alphas.len() != inputs.notes.len() {
+        return Err(format!(
+            "{} notes but {} randomisers; each spend needs exactly one",
+            inputs.notes.len(),
+            alphas.len(),
+        ));
+    }
+    for (note, alpha) in inputs.notes.iter().zip(alphas) {
+        builder
+            .add_ironwood_spend_with_alpha::<zcash_primitives::transaction::fees::zip317::FeeError>(
+                inputs.vault_fvk.clone(),
+                *note,
+                *alpha,
+            )
+            .map_err(|e| format!("add ironwood spend: {e:?}"))?;
+    }
 
     builder
         .add_ironwood_output::<zcash_primitives::transaction::fees::zip317::FeeError>(
@@ -186,7 +202,7 @@ pub fn build_tampered<P: Parameters + Clone>(
     builder
         .add_ironwood_spend_with_alpha::<Fe>(
             inputs.vault_fvk.clone(),
-            inputs.note,
+            inputs.notes[0],
             alpha,
         )
         .map_err(|e| format!("add ironwood spend: {e:?}"))?;
@@ -289,6 +305,117 @@ mod tests {
     use reddsa_frost::frost::redpallas as frost;
     use std::collections::BTreeMap;
 
+    /// A real group verifying key, spliced into a test-only vault FVK. `ak` must be a
+    /// canonical Pallas point with even y, so arbitrary bytes will not do.
+    fn a_test_fvk() -> FullViewingKey {
+        let (_, public) = frost::keys::generate_with_dealer(
+            3, 2, frost::keys::IdentifierList::Default, rand_core::OsRng,
+        )
+        .expect("keygen");
+        let ak: [u8; 32] = public.verifying_key().serialize().expect("vk")
+            .as_slice().try_into().expect("32 bytes");
+        vault::test_only_fvk(&ak).expect("a test fvk")
+    }
+
+    /// A vault note of a chosen value. `seed` distinguishes notes: rho must differ or
+    /// two notes would be the same note.
+    fn vault_note_of(fvk: &FullViewingKey, value: u64, seed: u8) -> Note {
+        use orchard::{
+            note::{RandomSeed, Rho},
+            value::NoteValue,
+            NoteVersion,
+        };
+        let rho = Rho::from_bytes(&[seed.wrapping_add(1); 32]).unwrap();
+        let rseed = RandomSeed::from_bytes([seed.wrapping_add(2); 32], &rho).unwrap();
+        Note::from_parts(
+            fvk.address_at(0u64, orchard::keys::Scope::External),
+            NoteValue::from_raw(value),
+            rho,
+            rseed,
+            NoteVersion::V3,
+        )
+        .unwrap()
+    }
+
+    /// A candidate spending two notes must produce two Ironwood spend actions, each with
+    /// its own `rk`, because each one needs its own FROST signature later.
+    #[test]
+    fn two_notes_become_two_spends_with_distinct_rk() {
+        let fvk = a_test_fvk();
+        let notes = vec![
+            vault_note_of(&fvk, 625_000_000, 10),
+            vault_note_of(&fvk, 100_000_000, 20),
+        ];
+        let total: u64 = notes.iter().map(|n| n.value().inner()).sum();
+
+        let mut inputs = CandidateInputs {
+            vault_fvk: &fvk,
+            notes,
+            recipient: fvk.address_at(7u64, orchard::keys::Scope::External),
+            amount: Zatoshis::const_from_u64(700_000_000),
+            memo: MemoBytes::empty(),
+            change: Zatoshis::ZERO,
+            target_height: 100,
+            expiry_height: 1_152,
+        };
+        let fee = quote_fee(&Regtest, &inputs).expect("a fee for two spends");
+        inputs.change =
+            Zatoshis::from_u64(total - 700_000_000 - u64::from(fee)).expect("change");
+
+        let a1 = alpha_from_canonical_bytes(&[3u8; 32]).expect("alpha");
+        let a2 = alpha_from_canonical_bytes(&[5u8; 32]).expect("alpha");
+        let built = build_candidate(
+            &Regtest,
+            &inputs,
+            &[a1, a2],
+            rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng),
+        );
+        let built = match built {
+            Ok(b) => b,
+            Err(e) => panic!("a two-input candidate must build: {e}"),
+        };
+
+        let bundle = built.pczt_parts.ironwood.expect("an ironwood bundle");
+        let real: Vec<_> = bundle
+            .actions()
+            .iter()
+            .filter(|a| a.spend().value().map(|v| v.inner() > 0).unwrap_or(false))
+            .collect();
+        assert_eq!(real.len(), 2, "two notes must give two real spend actions");
+
+        let rk0 = <[u8; 32]>::from(real[0].spend().rk());
+        let rk1 = <[u8; 32]>::from(real[1].spend().rk());
+        assert_ne!(rk0, rk1, "each spend is randomised separately, so rk must differ");
+    }
+
+    /// One randomiser per note. Getting this wrong would silently reuse a randomiser
+    /// across two actions.
+    #[test]
+    fn the_randomiser_count_must_match_the_note_count() {
+        let fvk = a_test_fvk();
+        let inputs = CandidateInputs {
+            vault_fvk: &fvk,
+            notes: vec![vault_note_of(&fvk, 625_000_000, 10), vault_note_of(&fvk, 1_000, 20)],
+            recipient: fvk.address_at(7u64, orchard::keys::Scope::External),
+            amount: Zatoshis::const_from_u64(1_000),
+            memo: MemoBytes::empty(),
+            change: Zatoshis::ZERO,
+            target_height: 100,
+            expiry_height: 1_152,
+        };
+        let a1 = alpha_from_canonical_bytes(&[3u8; 32]).expect("alpha");
+        let err = match build_candidate(
+            &Regtest,
+            &inputs,
+            &[a1],
+            rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("two notes and one randomiser must be refused"),
+        };
+        assert!(err.contains("randomiser"), "got: {err}");
+    }
+
     /// A vault note, built the way the chain would have created one.
     fn vault_note(fvk: &FullViewingKey) -> Note {
         use orchard::{
@@ -378,7 +505,7 @@ mod tests {
 
             let mut inputs = CandidateInputs {
                 vault_fvk: &fvk,
-                note,
+                notes: vec![note],
                 recipient: orchard::Address::from_raw_address_bytes(
                     &intent.recipient.clone().try_into().unwrap(),
                 )
@@ -398,7 +525,7 @@ mod tests {
             let built = build_candidate(
                 &Regtest,
                 &inputs,
-                alpha,
+                &[alpha],
                 rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng),
             )
             .expect("a candidate builds");
@@ -460,3 +587,4 @@ mod tests {
         assert_ne!(rks[0], rks[2]);
     }
 }
+
