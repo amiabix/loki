@@ -1,0 +1,222 @@
+--- /tmp/builder.rs.orig	2026-10-03 00:33:59
++++ vendor/orchard/src/builder.rs	2026-10-03 11:02:34
+@@ -351,6 +351,13 @@
+     pub(crate) scope: Scope,
+     pub(crate) note: Note,
+     pub(crate) merkle_path: Option<MerklePath>,
++    /// LOKI PATCH (B2): a caller-selected spend-authorization randomizer.
++    ///
++    /// `None` preserves upstream behaviour exactly: `build()` samples alpha from the
++    /// supplied RNG. `Some(alpha)` makes the spend use that value instead, so a
++    /// threshold signer set can agree on alpha before the PCZT exists. `rk` is still
++    /// derived from alpha inside `build()`, so no built PCZT is ever mutated.
++    pub(crate) alpha: Option<pallas::Scalar>,
+ }
+ 
+ impl SpendInfo {
+@@ -371,9 +378,45 @@
+             scope,
+             note,
+             merkle_path: Some(merkle_path),
++            alpha: None,
++        })
++    }
++
++    /// LOKI PATCH (B2): as [`SpendInfo::new`], but with a caller-selected spend
++    /// authorization randomizer `alpha`.
++    ///
++    /// Upstream samples `alpha` inside `build()` from the bundle RNG, which makes it
++    /// impossible for a FROST signer set to agree on it beforehand. ZIP 312 requires
++    /// every signer to sign under the same `alpha`, and on Zcash that value is fixed by
++    /// the transaction rather than chosen by a coordinator.
++    ///
++    /// `rk` is still derived from `alpha` inside `build()`; nothing downstream is mutated.
++    ///
++    /// Returns `None` if the `fvk` does not own the `note`.
++    pub fn new_with_alpha(
++        fvk: FullViewingKey,
++        note: Note,
++        merkle_path: MerklePath,
++        alpha: pallas::Scalar,
++    ) -> Option<Self> {
++        Self::new(fvk, note, merkle_path).map(|mut spend| {
++            spend.alpha = Some(alpha);
++            spend
+         })
+     }
+ 
++    /// LOKI PATCH (B2): as [`SpendInfo::new_with_alpha`], for a deferred-witness spend.
++    pub fn unwitnessed_with_alpha(
++        fvk: FullViewingKey,
++        note: Note,
++        alpha: pallas::Scalar,
++    ) -> Option<Self> {
++        Self::unwitnessed(fvk, note).map(|mut spend| {
++            spend.alpha = Some(alpha);
++            spend
++        })
++    }
++
+     /// Constructs a spend whose Merkle witness is DEFERRED to proving time ([ZIP 374]):
+     /// the spend carries no path, so it may only be added to a bundle whose anchor is
+     /// deferred (see [`Builder::new_with_anchor_deferred`]), and the PCZT it is built into
+@@ -391,6 +434,7 @@
+             scope,
+             note,
+             merkle_path: None,
++            alpha: None,
+         })
+     }
+ 
+@@ -409,6 +453,7 @@
+             scope: Scope::External,
+             note,
+             merkle_path,
++            alpha: None,
+         }
+     }
+ 
+@@ -446,7 +491,10 @@
+     ) {
+         let nf_old = self.note.nullifier(&self.fvk);
+         let ak: SpendValidatingKey = self.fvk.clone().into();
+-        let alpha = pallas::Scalar::random(&mut rng);
++        // LOKI PATCH (B2): honour a caller-selected alpha; otherwise behave as upstream.
++        let alpha = self
++            .alpha
++            .unwrap_or_else(|| pallas::Scalar::random(&mut rng));
+         let rk = ak.randomize(&alpha);
+ 
+         (nf_old, ak, alpha, rk)
+@@ -1002,6 +1050,32 @@
+         }
+ 
+         let spend = SpendInfo::unwitnessed(fvk, note).ok_or(SpendError::FvkMismatch)?;
++        self.spends.push(spend);
++
++        Ok(())
++    }
++
++    /// LOKI PATCH (B2): as [`Builder::add_spend_unwitnessed`], with a caller-selected
++    /// spend authorization randomizer.
++    ///
++    /// Threshold signers must agree on `alpha` before the transaction exists, which
++    /// upstream cannot express because `SpendInfo::build` samples it. See
++    /// `vendor/README.md`.
++    pub fn add_spend_unwitnessed_with_alpha(
++        &mut self,
++        fvk: FullViewingKey,
++        note: Note,
++        alpha: pallas::Scalar,
++    ) -> Result<(), SpendError> {
++        if !matches!(self.anchor, BuilderAnchor::Deferred) {
++            return Err(SpendError::WitnessRequired);
++        }
++        if !self.flags.spends_enabled() {
++            return Err(SpendError::SpendsDisabled);
++        }
++
++        let spend = SpendInfo::unwitnessed_with_alpha(fvk, note, alpha)
++            .ok_or(SpendError::FvkMismatch)?;
+         self.spends.push(spend);
+ 
+         Ok(())
+@@ -1426,6 +1500,7 @@
+                 scope,
+                 note,
+                 merkle_path: Some(MerklePath::dummy(&mut rng)),
++                alpha: None,
+             };
+             pairs.push((None, Some(chg_idx), spend, output));
+         }
+@@ -3312,5 +3387,90 @@
+         let pk = crate::cached_test_keys(OrchardCircuitVersion::PostNu6_3).proving_key();
+         let bundle = build_restricted(&mut rng);
+         bundle.create_proof(pk, &mut rng).unwrap();
++    }
++}
++
++/// LOKI PATCH (B2) verification.
++///
++/// These live here rather than in the consuming crate because `SpendInfo::build` is
++/// private: the patch has to be observed where it is applied.
++#[cfg(test)]
++mod loki_b2_alpha {
++    use super::SpendInfo;
++    use crate::{
++        keys::{FullViewingKey, Scope, SpendValidatingKey, SpendingKey},
++        note::{Note, RandomSeed, Rho},
++        tree::MerklePath,
++        value::NoteValue,
++        NoteVersion,
++    };
++    use ff::Field;
++    use pasta_curves::pallas;
++    use rand::{rand_core::UnwrapErr, rngs::SysRng};
++
++    fn fixture() -> (FullViewingKey, Note, MerklePath, UnwrapErr<SysRng>) {
++        let mut rng = UnwrapErr(SysRng::default());
++        let sk = SpendingKey::from_bytes([11u8; 32]).unwrap();
++        let fvk = FullViewingKey::from(&sk);
++        let recipient = fvk.address_at(0u64, Scope::External);
++
++        let rho = Rho::from_bytes(&[0u8; 32]).unwrap();
++        let rseed = RandomSeed::from_bytes([5u8; 32], &rho).unwrap();
++        let note = Note::from_parts(
++            recipient,
++            NoteValue::from_raw(1_000),
++            rho,
++            rseed,
++            NoteVersion::V3,
++        )
++        .unwrap();
++
++        let path = MerklePath::dummy(&mut rng);
++        (fvk, note, path, rng)
+     }
++
++    /// The property ZIP 312 needs: the signer set agrees on alpha first, and the spend
++    /// the builder produces commits to exactly that value.
++    #[test]
++    fn rk_follows_the_caller_selected_alpha() {
++        let (fvk, note, path, mut rng) = fixture();
++        let alpha = pallas::Scalar::random(&mut rng);
++
++        let spend = SpendInfo::new_with_alpha(fvk.clone(), note, path, alpha)
++            .expect("the fvk owns the note");
++
++        let (_nf, ak, used_alpha, rk) = spend.build(&mut rng);
++
++        assert_eq!(used_alpha, alpha, "build() must use the alpha we chose");
++        assert_eq!(
++            <[u8; 32]>::from(&rk),
++            <[u8; 32]>::from(&ak.randomize(&alpha)),
++            "rk must equal ak randomized by that alpha"
++        );
++    }
++
++    /// Two builds of the same spend must agree, which upstream could not promise.
++    #[test]
++    fn a_chosen_alpha_is_deterministic_across_builds() {
++        let (fvk, note, path, mut rng) = fixture();
++        let alpha = pallas::Scalar::random(&mut rng);
++
++        let a = SpendInfo::new_with_alpha(fvk.clone(), note.clone(), path.clone(), alpha)
++            .unwrap()
++            .build(&mut rng);
++        let b = SpendInfo::new_with_alpha(fvk, note, path, alpha).unwrap().build(&mut rng);
++
++        assert_eq!(<[u8; 32]>::from(&a.3), <[u8; 32]>::from(&b.3));
++    }
++
++    /// And without one, upstream behaviour is unchanged: alpha is still sampled.
++    #[test]
++    fn without_a_chosen_alpha_the_builder_still_samples() {
++        let (fvk, note, path, mut rng) = fixture();
++
++        let a = SpendInfo::new(fvk.clone(), note.clone(), path.clone()).unwrap().build(&mut rng);
++        let b = SpendInfo::new(fvk, note, path).unwrap().build(&mut rng);
++
++        assert_ne!(a.2, b.2, "two unset builds must not share an alpha");
++    }
+ }

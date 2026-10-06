@@ -1,0 +1,17 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Loki G3 nonce store</title>
+<body>
+<pre id="out">loading</pre>
+<script type="module">
+import { NonceStore, extractOnReuse, simulateNoStrictDurability } from './nonce-store.js';
+// All four are injected per page load by the drill. An empty relay list is the
+// total-outage case; a relay absent from `__PINNED` is never trusted.
+simulateNoStrictDurability(window.__NO_DURABILITY === true);
+window.__store = await NonceStore.create(
+  window.__RELAYS ?? [], window.__PINNED ?? [], window.__REQUIRED ?? 2);
+window.__extractOnReuse = extractOnReuse;
+document.getElementById('out').textContent = 'ready';
+window.__ready = true;
+</script>
+</body>

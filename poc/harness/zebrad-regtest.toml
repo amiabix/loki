@@ -1,0 +1,34 @@
+# Loki G1-TX regtest harness.
+#
+# Zebra skips proof-of-work validation on Regtest and activates upgrades at height 1
+# by default; NU6.3 (Ironwood) is pinned explicitly here so the config states the
+# network this POC actually requires.
+
+[network]
+network = "Regtest"
+
+[network.testnet_parameters.activation_heights]
+# Field names are serde-renamed in zebra-chain; "NU6.3" is the exact key.
+NU5 = 1
+NU6 = 1
+"NU6.3" = 1
+
+[state]
+# No persistent chain: every run starts from genesis.
+ephemeral = true
+
+[rpc]
+listen_addr = "127.0.0.1:18232"
+# Regtest only, loopback only, no cookie: this is a disposable test network.
+enable_cookie_auth = false
+
+[mining]
+# The G1-TX vault's own address, so coinbase funds the vault directly and no
+# transparent spending machinery is needed. Test-only; written by run-regtest.sh.
+miner_address = 'uregtest1dyf58sh5rm0whhfmfsz6mqzvunpe02fdfxvw8v06ts00hdpkjzgmhke65w70wnuuey9gn6p3dge8fqm2tta4s7xfuyvr0rrapsvdn2wd'
+miner_memo = 'loki g1-tx coinbase'
+# Regtest has no proof-of-work, so the internal miner produces blocks on demand.
+internal_miner = true
+
+[tracing]
+filter = "info"

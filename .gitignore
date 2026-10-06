@@ -1,0 +1,28 @@
+# Build output
+poc/target/
+target/
+
+# Node modules for the G3 browser drills
+poc/g3/node_modules/
+
+# The demo's sandbox. Contains generated FROST key packages and nonce secrets for a
+# throwaway regtest account. Never commit it.
+poc/demo/.sandbox/
+
+# Any run state directory: member key packages, nonce secrets, note secrets.
+/tmp/loki-*
+loki-state/
+*/state/alice/
+*/state/bob/
+*/state/carol/
+
+# The zebrad binary is 87MB and is built from a pinned upstream commit.
+# See poc/harness/README.md for the exact clone + build commands.
+poc/harness/zebrad
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store

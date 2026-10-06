@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Loki POC lab</title>
+<link rel="stylesheet" href="app.css">
+<link rel="stylesheet" href="lab.css">
+</head>
+<body class="lab">
+
+<div class="statusbar">
+  <div class="statusbar-inner">
+    <span class="statusbar-label">Sandbox</span>
+    <div class="chips" id="sysChips"></div>
+    <a class="chips-toggle" href="/notes">Written walkthrough →</a>
+  </div>
+</div>
+
+<header class="labhead">
+  <div class="wrap">
+    <p class="eyebrow">Research prototype · sandboxed regtest · not a wallet</p>
+    <h1>Run it yourself</h1>
+    <p class="lede">
+      This runs the real prototype against a throwaway chain in
+      <code id="sandboxPath">poc/demo/.sandbox</code> on port <strong>18242</strong>. Its own
+      config, its own state, one run at a time, and the chain dies when this server does.
+      Nothing here touches your tracked harness config or any other <code>zebrad</code>.
+    </p>
+  </div>
+</header>
+
+<main class="wrap labmain">
+
+  <!-- ── the pipeline ─────────────────────────────────────────────────── -->
+  <section class="panel" aria-labelledby="pipeH">
+    <div class="panel-head">
+      <h2 id="pipeH">1 · Build a payment</h2>
+      <button class="btn btn-sm" id="runAll" type="button">Run all in order</button>
+    </div>
+    <p class="panel-note">
+      Each button runs one real stage. They are in dependency order: a later one will tell
+      you what it needs if you skip ahead. The whole sequence takes a few minutes, most of
+      it mining and generating the zero-knowledge proof.
+    </p>
+    <div class="steps" id="steps"></div>
+  </section>
+
+  <!-- ── the tamper lab ───────────────────────────────────────────────── -->
+  <section class="panel" aria-labelledby="tamperH">
+    <div class="panel-head">
+      <h2 id="tamperH">2 · Try to slip something past the signer</h2>
+    </div>
+    <p class="panel-note">
+      This is the interesting one. Pick a field; the lab rebuilds candidate AC with that
+      one field changed, hands it to Alice, and shows what she does. A structurally valid,
+      correctly randomised transaction that is not the payment she agreed to.
+      <strong>She must refuse, and no share file may appear.</strong> Run the honest
+      control too: without it, a refusal proves nothing, because a signer that refuses
+      everything would also pass.
+    </p>
+    <div class="tamper" id="tamper"></div>
+    <div class="tamper-verdicts" id="verdicts"></div>
+  </section>
+
+  <!-- ── log ──────────────────────────────────────────────────────────── -->
+  <section class="panel panel-log" aria-labelledby="logH">
+    <div class="panel-head">
+      <h2 id="logH">Output</h2>
+      <div class="loghead-right">
+        <span class="badge badge-live" id="liveBadge">Idle</span>
+        <button class="btn btn-sm btn-quiet" id="clearLog" type="button">Clear view</button>
+      </div>
+    </div>
+    <pre class="console" id="console" aria-live="polite" tabindex="0"></pre>
+  </section>
+
+  <section class="panel panel-danger" aria-labelledby="dangerH">
+    <div class="panel-head"><h2 id="dangerH">Sandbox</h2></div>
+    <p class="panel-note" id="dangerNote"></p>
+    <div class="row-btns">
+      <button class="btn btn-sm btn-quiet" id="stopChain" type="button">Stop the chain</button>
+      <button class="btn btn-sm btn-danger" id="reset" type="button">Delete the sandbox</button>
+    </div>
+  </section>
+
+</main>
+
+<footer class="foot"><div class="wrap">
+  <p>
+    Served from <code>poc/demo</code> on <code>127.0.0.1</code>. The runner spawns only the
+    built <code>loki</code> binary and <code>harness/zebrad</code>, with fixed argument
+    lists; a request names a step and never supplies a path or a flag. No shell is used.
+    Recorded results from earlier runs are in the <a href="/notes">written walkthrough</a>.
+  </p>
+</div></footer>
+
+<script src="lab.js"></script>
+</body>
+</html>

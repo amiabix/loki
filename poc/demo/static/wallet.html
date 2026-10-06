@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Loki Vault — 2 of 3</title>
+<link rel="stylesheet" href="wallet.css">
+</head>
+<body>
+
+<div class="shell">
+
+  <!-- ── sidebar: the account ───────────────────────────────────────────── -->
+  <aside class="side">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <div>
+        <strong>Loki Vault</strong>
+        <span>Zcash shielded · regtest</span>
+      </div>
+    </div>
+
+    <div class="acct" id="acct">
+      <div class="acct-ring" id="acctRing"><span>2<small>/3</small></span></div>
+      <div class="acct-meta">
+        <span class="acct-label">Account</span>
+        <button class="addr" id="addr" type="button" title="Copy address">no account yet</button>
+        <span class="bal" id="bal">—</span>
+      </div>
+    </div>
+
+    <nav class="nav" id="nav" aria-label="Sections">
+      <button type="button" data-view="home"    class="on">Overview</button>
+      <button type="button" data-view="queue">Queue <span class="pill" id="queuePill">0</span></button>
+      <button type="button" data-view="history">History</button>
+      <button type="button" data-view="owners">Owners</button>
+      <button type="button" data-view="security">Security tests</button>
+      <button type="button" data-view="console">Console</button>
+    </nav>
+
+    <div class="side-foot">
+      <div class="sys" id="sys"></div>
+      <a href="/notes">Research notes →</a>
+    </div>
+  </aside>
+
+  <!-- ── main ───────────────────────────────────────────────────────────── -->
+  <main class="main">
+    <header class="topbar">
+      <h1 id="viewTitle">Overview</h1>
+      <div class="topbar-right">
+        <span class="statepill" id="statePill">idle</span>
+        <button class="btn btn-ghost" id="stopChain" type="button">Stop network</button>
+        <button class="btn btn-ghost danger" id="reset" type="button">Reset</button>
+      </div>
+    </header>
+
+    <div class="views">
+
+      <!-- overview -->
+      <section class="view on" data-view="home">
+        <div class="banner" id="banner"></div>
+        <div class="cards">
+          <div class="card stat"><span class="k">Balance</span><strong id="sBal">—</strong><span class="s" id="sBalS">not scanned</span></div>
+          <div class="card stat"><span class="k">Threshold</span><strong>2 of 3</strong><span class="s">any two owners can spend</span></div>
+          <div class="card stat"><span class="k">Queue</span><strong id="sQueue">0</strong><span class="s" id="sQueueS">no pending transaction</span></div>
+          <div class="card stat"><span class="k">Test network</span><strong id="sNet">down</strong><span class="s" id="sNetS">regtest, port 18242</span></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>Set up this account</h2></div>
+          <p class="note">
+            Each action below runs the real prototype against a throwaway chain in
+            <code>poc/demo/.sandbox</code>. Nothing is simulated.
+          </p>
+          <ol class="setup" id="setup"></ol>
+        </div>
+      </section>
+
+      <!-- queue -->
+      <section class="view" data-view="queue">
+        <div id="queueBody"></div>
+      </section>
+
+      <!-- history -->
+      <section class="view" data-view="history">
+        <div id="historyBody"></div>
+      </section>
+
+      <!-- owners -->
+      <section class="view" data-view="owners">
+        <div class="card">
+          <div class="card-head"><h2>Owners</h2><span class="tag">2 of 3 required</span></div>
+          <p class="note">
+            No owner holds a key that can spend on its own, and no complete spending key
+            exists anywhere, not even briefly during setup. Each holds a share; two shares
+            produce one ordinary signature the network cannot tell from a single signer's.
+          </p>
+          <div class="ownerlist" id="ownerList"></div>
+        </div>
+      </section>
+
+      <!-- security -->
+      <section class="view" data-view="security">
+        <div class="card">
+          <div class="card-head"><h2>Can a bad proposal get signed?</h2></div>
+          <p class="note">
+            An owner is handed transaction bytes by someone else. Approving the wrong bytes
+            is the whole risk. Pick a field: the account rebuilds the pending transaction
+            with that one thing changed, hands it to Alice, and shows what she does.
+            <strong>She must reject it, and no signature may be produced.</strong>
+          </p>
+          <p class="note note-warn" id="secNote"></p>
+          <div class="tgrid" id="tgrid"></div>
+          <div class="tscore" id="tscore"></div>
+        </div>
+      </section>
+
+      <!-- console -->
+      <section class="view" data-view="console">
+        <div class="card">
+          <div class="card-head">
+            <h2>Output</h2>
+            <button class="btn btn-ghost" id="clearLog" type="button">Clear</button>
+          </div>
+          <p class="note">
+            Everything the account does, as the prototype printed it. This is the raw
+            command output, not a summary.
+          </p>
+          <pre class="console" id="console" tabindex="0"></pre>
+        </div>
+      </section>
+
+    </div>
+  </main>
+</div>
+
+<script src="wallet.js"></script>
+</body>
+</html>

@@ -1,0 +1,30 @@
+--- /tmp/zp-builder.orig	2026-10-03 11:02:53
++++ vendor/zcash_primitives/src/transaction/builder.rs	2026-10-03 11:02:54
+@@ -613,6 +613,27 @@
+             .map_err(Error::IronwoodSpend)
+     }
+ 
++    /// LOKI PATCH (B2): as [`Self::add_ironwood_spend`], with a caller-selected spend
++    /// authorization randomizer.
++    ///
++    /// ZIP 312 requires every FROST signer to sign under the same `alpha`, and on Zcash
++    /// that value is fixed by the transaction rather than chosen by a coordinator. This
++    /// threads it to `orchard::builder::Builder::add_spend_unwitnessed_with_alpha`.
++    /// See `vendor/README.md`.
++    pub fn add_ironwood_spend_with_alpha<FE>(
++        &mut self,
++        fvk: orchard::keys::FullViewingKey,
++        note: orchard::Note,
++        alpha: pasta_curves::pallas::Scalar,
++    ) -> Result<(), Error<FE>> {
++        if note.version() != orchard::note::NoteVersion::V3 {
++            return Err(Error::IronwoodSpendUnsupportedNoteVersion(note.version()));
++        }
++        self.ironwood_builder
++            .add_spend_unwitnessed_with_alpha(fvk, note, alpha)
++            .map_err(Error::IronwoodSpend)
++    }
++
+     /// Adds an Ironwood recipient to the transaction.
+     ///
+     /// This uses [`orchard::note::NoteVersion::V3`], the Ironwood note plaintext format.
