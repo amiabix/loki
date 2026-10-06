@@ -192,3 +192,76 @@ mod tests {
         assert_eq!(test_only_fvk(&off_curve), Err(VaultKeyError::NotCanonical));
     }
 }
+
+
+/// Decode a unified address into the Orchard receiver this prototype can pay.
+///
+/// The counterpart to [`regtest_unified_address`]. Only the Orchard receiver is used:
+/// the prototype refuses transparent and Sapling outputs everywhere else, so accepting an
+/// address it could only pay through a forbidden pool would be a lie to the caller.
+pub fn orchard_receiver_from_ua(
+    s: &str,
+    expect: zcash_protocol::consensus::NetworkType,
+) -> Result<orchard::Address, String> {
+    use zcash_address::unified::{Address as Ua, Container, Encoding, Receiver};
+
+    let (net, _revision, ua) =
+        Ua::decode(s.trim()).map_err(|e| format!("not a unified address: {e:?}"))?;
+    if net != expect {
+        return Err(format!("that address is for {net:?}, this network is {expect:?}"));
+    }
+
+    for item in ua.items() {
+        if let Receiver::Orchard(raw) = item {
+            return orchard::Address::from_raw_address_bytes(&raw)
+                .into_option()
+                .ok_or_else(|| "the Orchard receiver is not a valid address".to_string());
+        }
+    }
+    Err("that address has no Orchard receiver; this prototype can only pay Orchard".into())
+}
+
+#[cfg(test)]
+mod address_tests {
+    use super::*;
+
+    /// A real group verifying key. `ak` must be a canonical Pallas point with even y, so
+    /// an arbitrary 32 bytes will not do: the first version of this test used `[2u8; 32]`
+    /// and failed with `NotCanonical`.
+    fn real_ak() -> [u8; 32] {
+        use reddsa_frost::frost::redpallas as frost;
+        let (_, public) = frost::keys::generate_with_dealer(
+            3, 2, frost::keys::IdentifierList::Default, rand_core::OsRng,
+        )
+        .expect("keygen");
+        public.verifying_key().serialize().expect("vk serializes")
+            .as_slice().try_into().expect("32 bytes")
+    }
+
+    /// The decoder must be the exact inverse of the encoder, or the prototype would
+    /// accept an address it cannot actually pay.
+    #[test]
+    fn a_vault_address_round_trips() {
+        let fvk = test_only_fvk(&real_ak()).expect("a test fvk");
+        let ua = regtest_unified_address(&fvk);
+        let back = orchard_receiver_from_ua(&ua, zcash_protocol::consensus::NetworkType::Regtest)
+            .expect("the address we just printed must decode");
+        assert_eq!(back, test_only_address(&fvk), "round trip must give the same receiver");
+    }
+
+    #[test]
+    fn a_mainnet_address_is_refused_on_regtest() {
+        let fvk = test_only_fvk(&real_ak()).expect("a test fvk");
+        let ua = regtest_unified_address(&fvk);
+        let err = orchard_receiver_from_ua(&ua, zcash_protocol::consensus::NetworkType::Main)
+            .expect_err("a regtest address must not be accepted as mainnet");
+        assert!(err.contains("network"), "the error should name the mismatch, got: {err}");
+    }
+
+    #[test]
+    fn rubbish_is_refused() {
+        for bad in ["", "not an address", "uregtest1zzzz"] {
+            assert!(orchard_receiver_from_ua(bad, zcash_protocol::consensus::NetworkType::Regtest).is_err());
+        }
+    }
+}

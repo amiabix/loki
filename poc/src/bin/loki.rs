@@ -48,7 +48,9 @@ fn main() {
                    address <state-dir>   print the vault's regtest unified address\n\
                    scan    <state-dir>   find the vault's Ironwood notes on regtest\n\
                    commit  <state-dir> <member>   round 1: preprocess nonces\n\
-                   propose <state-dir>   build the three unproved candidates\n\
+                   propose <state-dir> [note-file]\n\
+                             [--to <unified-address>] [--amount <zat>] [--memo <text>]\n\
+                             build the three unproved candidates\n\
                    review-sign <state-dir> <member>   review all, then sign\n\
                    finish  <state-dir>   aggregate AC, prove, broadcast\n\
                    post-final <state-dir>   aggregate and prove AC, post it, do NOT broadcast\n\
@@ -447,7 +449,16 @@ fn hexn<const N: usize>(m: &std::collections::HashMap<String, String>, k: &str) 
 /// Every candidate spends the same note, pays the same recipient the same amount with the
 /// same memo, fee, change and expiry. Only the signing pair differs, so only `alpha` and
 /// therefore `rk` differ. All three are built with the anchor and witness ABSENT.
+/// Read `--name value` from the stage's own arguments.
+///
+/// Deliberately minimal: the CLI takes a handful of flags and a dependency for that would
+/// be heavier than the thing it parses.
+fn flag(args: &[String], name: &str) -> Option<String> {
+    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+}
+
 fn propose(args: &[String]) -> Result<(), String> {
+    use zcash_protocol::consensus::Parameters as _;
     use loki_poc::{candidate::*, intent::*};
     use orchard::{
         keys::Scope,
@@ -462,7 +473,13 @@ fn propose(args: &[String]) -> Result<(), String> {
     // this is; the proposal and its candidates belong to the round.
     let vault_dir = MemberDir::open(&root, "public");
     let shared = MemberDir::create(&root, &shared_name()).map_err(|e| format!("{e}"))?;
-    let note_file = args.get(1).map(String::as_str).unwrap_or("funded_note.txt");
+    // The note file is positional and optional, so it must not swallow a flag: without
+    // this guard `propose <dir> --amount N` read "--amount" as the filename.
+    let note_file = args
+        .get(1)
+        .map(String::as_str)
+        .filter(|a| !a.starts_with("--"))
+        .unwrap_or("funded_note.txt");
 
     // ── the vault and its funded note ───────────────────────────────────────
     let ak: [u8; 32] = vault_dir
@@ -514,9 +531,28 @@ fn propose(args: &[String]) -> Result<(), String> {
         want.div_ceil(1_152) * 1_152
     };
 
-    let recipient = fvk.address_at(7u64, Scope::External);
-    let amount = Zatoshis::const_from_u64(40_000_000);
-    let memo = MemoBytes::from_bytes(b"loki g1-tx").map_err(|e| format!("memo: {e:?}"))?;
+    // The payment, from the caller. Defaults reproduce what this stage did when the
+    // values were hard-coded, so the existing scripts are unaffected.
+    const DEFAULT_AMOUNT: u64 = 40_000_000;
+    const DEFAULT_MEMO: &str = "loki g1-tx";
+
+    let recipient = match flag(args, "--to") {
+        Some(a) => vault::orchard_receiver_from_ua(&a, Regtest.network_type())?,
+        None => fvk.address_at(7u64, Scope::External),
+    };
+    let amount_zat: u64 = match flag(args, "--amount") {
+        Some(v) => v.parse().map_err(|e| format!("--amount must be a whole number of zatoshis: {e}"))?,
+        None => DEFAULT_AMOUNT,
+    };
+    if amount_zat == 0 {
+        return Err("--amount must be greater than zero".into());
+    }
+    let amount = Zatoshis::from_u64(amount_zat)
+        .map_err(|e| format!("--amount is not a valid amount: {e:?}"))?;
+
+    let memo_text = flag(args, "--memo").unwrap_or_else(|| DEFAULT_MEMO.to_string());
+    let memo = MemoBytes::from_bytes(memo_text.as_bytes())
+        .map_err(|e| format!("--memo: {e:?} (at most 512 bytes)"))?;
 
     let mut inputs = CandidateInputs {
         vault_fvk: &fvk,
@@ -529,7 +565,23 @@ fn propose(args: &[String]) -> Result<(), String> {
         expiry_height: expiry,
     };
     let fee = quote_fee(&Regtest, &inputs)?;
-    let change = Zatoshis::const_from_u64(value - u64::from(amount) - u64::from(fee));
+
+    // The note has to cover the payment and the fee. Without this the subtraction below
+    // underflows: it panics in a debug build and silently wraps to an enormous change
+    // value in a release one, so there was no "insufficient funds" path at all.
+    let needed = amount_zat
+        .checked_add(u64::from(fee))
+        .ok_or("amount plus fee overflows")?;
+    if value < needed {
+        return Err(format!(
+            "insufficient funds: this note holds {value} zat, and the payment needs \
+             {needed} zat ({amount_zat} to pay plus {} fee). Spending several notes in \
+             one payment is not implemented yet, so a single note must cover it.",
+            u64::from(fee),
+        ));
+    }
+    let change = Zatoshis::from_u64(value - needed)
+        .map_err(|e| format!("change is not a valid amount: {e:?}"))?;
     inputs.change = change;
 
     let intent = Intent {
@@ -540,7 +592,7 @@ fn propose(args: &[String]) -> Result<(), String> {
         input_nullifiers: vec![expect_nf],
         recipient: recipient.to_raw_address_bytes().to_vec(),
         amount_zat: u64::from(amount),
-        memo: b"loki g1-tx".to_vec(),
+        memo: memo_text.as_bytes().to_vec(),
         change_policy: ChangePolicy::VaultInternal,
         fee_zat: u64::from(fee),
         change_zat: u64::from(change),
@@ -1210,6 +1262,11 @@ fn tamper(args: &[String]) -> Result<(), String> {
     let root = PathBuf::from(args.first().ok_or("usage: tamper <state-dir> <case>")?);
     let case = args.get(1).ok_or("usage: tamper <state-dir> <case>")?.as_str();
     let shared = MemberDir::open(&root, &shared_name());
+
+    // This case does not touch the candidate at all, so it branches before the rebuild.
+    if case == "cosigner-recommit" {
+        return tamper_cosigner_recommit(&root, &shared);
+    }
 
     let ak: [u8; 32] = shared.read_hex("group_ak.hex").map_err(|e| format!("{e}"))?
         .try_into().map_err(|_| "group_ak")?;
@@ -1966,5 +2023,52 @@ fn verify_effects(args: &[String]) -> Result<(), String> {
     println!("  memo            {:?}", String::from_utf8_lossy(&want_memo));
     println!("  change          {changed} zat to the vault internal address");
     println!("  fee             {implied_fee} zat");
+    Ok(())
+}
+
+
+/// TEST-ONLY: the A.5 attack, against the real signing path.
+///
+/// `src/nonce_binding.rs` showed that in bare FROST a co-signer who simply commits a
+/// second time moves the binding factor while a bound nonce stays fixed, which is the
+/// precondition for recovering a signing share. Loki is not bare FROST: it derives the
+/// per-pair randomiser from the proposal AND the published commitment set, and every
+/// signer recomputes it rather than accepting one.
+///
+/// So the prediction is that this attack cannot reach the signing step here, because
+/// moving carol's commitment moves alpha, and alpha no longer matches the `rk` baked into
+/// the candidate. That prediction had never been run. This case runs it.
+///
+/// Carol re-commits for the AC pair. The candidate is left exactly as it was.
+fn tamper_cosigner_recommit(root: &std::path::Path, shared: &MemberDir) -> Result<(), String> {
+    let carol = MemberDir::open(root, "carol");
+    let key_package = frost::keys::KeyPackage::deserialize(
+        &carol.read_hex("key_package.hex").map_err(|e| format!("{e}"))?,
+    )
+    .map_err(|e| format!("key package: {e}"))?;
+
+    let before = shared
+        .read_hex("commitment_AC_carol.hex")
+        .map_err(|e| format!("run commit and propose first: {e}"))?;
+
+    let mut rng = rand_core::OsRng;
+    let (nonces, commitment) = frost::round1::commit(key_package.signing_share(), &mut rng);
+
+    carol
+        .write_hex("nonces_AC.hex", &nonces.serialize().map_err(|e| format!("{e}"))?)
+        .map_err(|e| e.to_string())?;
+    let after = commitment.serialize().map_err(|e| format!("{e}"))?;
+    shared
+        .write_hex("commitment_AC_carol.hex", &after)
+        .map_err(|e| e.to_string())?;
+
+    if before == after {
+        return Err("the new commitment is identical to the old one; nothing was tampered".into());
+    }
+
+    println!("carol re-committed for pair AC. The candidate is untouched.");
+    println!("  commitment was {}...", &hex::encode(&before)[..16]);
+    println!("  commitment now {}...", &hex::encode(&after)[..16]);
+    println!("alice should now refuse: the commitment set feeds alpha, and alpha fixes rk.");
     Ok(())
 }
