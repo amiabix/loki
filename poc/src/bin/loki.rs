@@ -73,7 +73,7 @@ fn main() {
 /// vault's spend key is never materialized: `part3` returns a share, never the secret.
 fn setup(args: &[String]) -> Result<(), String> {
     let root = PathBuf::from(args.first().ok_or("usage: setup <state-dir>")?);
-    let mut rng = rand_core::OsRng;
+    let rng = rand_core::OsRng;
 
     let ids: Vec<frost::Identifier> = MEMBERS
         .iter()
@@ -84,7 +84,7 @@ fn setup(args: &[String]) -> Result<(), String> {
     let mut r1_secret = BTreeMap::new();
     let mut r1_public = BTreeMap::new();
     for id in &ids {
-        let (secret, public) = frost::keys::dkg::part1(*id, 3, 2, &mut rng)
+        let (secret, public) = frost::keys::dkg::part1(*id, 3, 2, rng)
             .map_err(|e| format!("dkg part1: {e}"))?;
         r1_secret.insert(*id, secret);
         r1_public.insert(*id, public);
@@ -520,7 +520,7 @@ fn propose(args: &[String]) -> Result<(), String> {
 
     let mut inputs = CandidateInputs {
         vault_fvk: &fvk,
-        note: note.clone(),
+        note,
         recipient,
         amount,
         memo: memo.clone(),
@@ -624,7 +624,7 @@ fn propose(args: &[String]) -> Result<(), String> {
             &Regtest,
             &inputs,
             alpha,
-            rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng::default()),
+            rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng),
         )?;
 
         let bundle = built
@@ -665,7 +665,7 @@ fn propose(args: &[String]) -> Result<(), String> {
         // the binding signature signing key. It must run BEFORE anyone computes a
         // sighash, or the signers would sign a transaction whose IO was still open.
         let pczt = pczt::roles::io_finalizer::IoFinalizer::new(pczt)
-            .finalize_io(rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng::default()))
+            .finalize_io(rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng))
             .map_err(|e| format!("{name}: io finalizer: {e:?}"))?;
 
         let bytes = pczt.serialize().map_err(|e| format!("{name}: serialize: {e:?}"))?;
@@ -957,7 +957,10 @@ fn review_sign(args: &[String]) -> Result<(), String> {
 }
 
 /// Collect every Ironwood commitment on the chain, in append order, plus the tip anchor.
-fn chain_commitments(rpc: &loki_poc::rpc::Rpc) -> Result<(Vec<[u8; 32]>, [u8; 32], u64), String> {
+/// The commitment stream, the node's anchor, and the tip height.
+type ChainView = (Vec<[u8; 32]>, [u8; 32], u64);
+
+fn chain_commitments(rpc: &loki_poc::rpc::Rpc) -> Result<ChainView, String> {
     let tip = rpc.json("getblockcount", "[]")?.as_u64().ok_or("getblockcount")?;
     let mut cmxs = Vec::new();
 
@@ -1152,7 +1155,7 @@ fn finish(args: &[String]) -> Result<(), String> {
     );
     let proved = Prover::new(updated)
         .create_ironwood_proof(
-            rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng::default()),
+            rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng),
             &pk,
         )
         .map_err(|e| format!("prove: {e:?}"))?
@@ -1168,7 +1171,7 @@ fn finish(args: &[String]) -> Result<(), String> {
     );
     let tx = TransactionExtractor::new(finalized)
         .with_orchard(&vk)
-        .extract(rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng::default()))
+        .extract(rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng))
         .map_err(|e| format!("extract: {e:?}"))?;
 
     let mut raw = Vec::new();
@@ -1238,7 +1241,7 @@ fn tamper(args: &[String]) -> Result<(), String> {
     let proposal_id: [u8; 32] = hexn(&intent_kv, "proposal_id")?;
 
     // One field differs, everything else is the honest value.
-    let mut note = honest_note.clone();
+    let mut note = honest_note;
     let mut recipient = honest_recipient;
     let mut memo_bytes = hex::decode(&intent_kv["memo"]).map_err(|e| format!("{e}"))?;
     let mut amount_z = Zatoshis::const_from_u64(amount);
@@ -1340,7 +1343,7 @@ fn tamper(args: &[String]) -> Result<(), String> {
         &inputs,
         alpha,
         change_to_vault,
-        rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng::default()),
+        rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng),
     )?;
 
     // Graft on a forbidden pool component, if that is the case under test. `PcztParts`
@@ -1357,7 +1360,7 @@ fn tamper(args: &[String]) -> Result<(), String> {
     let pczt = pczt::roles::creator::Creator::build_from_parts(parts)
         .ok_or("build_from_parts")?;
     let pczt = pczt::roles::io_finalizer::IoFinalizer::new(pczt)
-        .finalize_io(rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng::default()))
+        .finalize_io(rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng))
         .map_err(|e| format!("io finalizer: {e:?}"))?;
     let bytes = pczt.serialize().map_err(|e| format!("serialize: {e:?}"))?;
 
@@ -1535,7 +1538,7 @@ fn prove_and_extract(
     );
     let proved = Prover::new(updated)
         .create_ironwood_proof(
-            rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng::default()),
+            rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng),
             &pk,
         )
         .map_err(|e| format!("prove: {e:?}"))?
@@ -1550,7 +1553,7 @@ fn prove_and_extract(
     );
     let tx = TransactionExtractor::new(finalized)
         .with_orchard(&vk)
-        .extract(rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng::default()))
+        .extract(rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng))
         .map_err(|e| format!("extract: {e:?}"))?;
 
     let mut raw = Vec::new();

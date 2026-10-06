@@ -271,7 +271,7 @@ pub fn check_candidate(
     // ── fee: implied by the transaction, compared with the intent ───────────
     let implied_fee = total_in
         .checked_sub(total_out)
-        .ok_or_else(|| Refusal::FeeDiffers { expected: want.fee_zat, found: 0 })?;
+        .ok_or(Refusal::FeeDiffers { expected: want.fee_zat, found: 0 })?;
     if implied_fee != want.fee_zat {
         return Err(Refusal::FeeDiffers {
             expected: want.fee_zat,
@@ -305,12 +305,12 @@ mod tests {
 
     /// One honest candidate, built the way `propose` builds them.
     fn fixture() -> Fixture {
-        let mut rng = rand_core::OsRng;
+        let rng = rand_core::OsRng;
         let (_shares, pubkeys) = frost::keys::generate_with_dealer(
             3,
             2,
             frost::keys::IdentifierList::Default,
-            &mut rng,
+            rng,
         )
         .unwrap();
         let ak: [u8; 32] = pubkeys.verifying_key().serialize().unwrap().try_into().unwrap();
@@ -332,7 +332,7 @@ mod tests {
 
         let mut inputs = CandidateInputs {
             vault_fvk: &fvk,
-            note: note.clone(),
+            note,
             recipient,
             amount: Zatoshis::const_from_u64(AMOUNT),
             memo: MemoBytes::from_bytes(&memo).unwrap(),
@@ -354,7 +354,7 @@ mod tests {
             &Regtest,
             &inputs,
             alpha,
-            rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng::default()),
+            rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng),
         )
         .unwrap();
 
@@ -449,12 +449,12 @@ mod tests {
     fn c4_change_to_a_foreign_address_is_refused() {
         let f = fixture();
         let other = vault::test_only_fvk(&{
-            let mut rng = rand_core::OsRng;
+            let rng = rand_core::OsRng;
             let (_s, pk) = frost::keys::generate_with_dealer(
                 3,
                 2,
                 frost::keys::IdentifierList::Default,
-                &mut rng,
+                rng,
             )
             .unwrap();
             pk.verifying_key().serialize().unwrap().try_into().unwrap()

@@ -1,9 +1,9 @@
-# Loki POC lab
+# Loki account demo
 
 Two things on one local server:
 
-- **`/`** — the **lab**: run the real prototype against a throwaway chain, and try to slip
-  an altered transaction past a signer.
+- **`/`** — the **account**: a 2-of-3 multisig interface that runs the real prototype
+  against a throwaway chain, and lets you try to slip an altered transaction past a signer.
 - **`/notes`** — a written walkthrough of an earlier recorded run.
 
 It is a demo of a 2-of-3 Ironwood FROST transaction, **not a usable custody wallet**.
@@ -11,33 +11,39 @@ It is a demo of a 2-of-3 Ironwood FROST transaction, **not a usable custody wall
 ## Start it
 
 ```
-cd poc && cargo build          # once: the lab runs the binary, it will not compile for you
+cd poc && cargo build          # once: the UI runs this binary, it will not compile for you
 python3 poc/demo/server.py     # → http://127.0.0.1:8787
 ```
 
 No dependencies beyond the Python standard library. If port 8787 is taken the server says
 so and exits; pass another: `python3 poc/demo/server.py 8788`.
 
-## Using the lab
+## Using it
 
-**1 · Build a payment.** Eight buttons, in dependency order. "Run all in order" does the
-lot; it takes a few minutes, mostly mining and generating the Halo 2 proof. A step you run
-out of order tells you what it needs.
+The root page is the **account**: owners, balance, a transaction queue, history.
 
-**2 · Try to slip something past the signer.** This is the part worth playing with. Pick a
-field and the lab rebuilds candidate AC with that one field changed, hands it to Alice, and
-reports what she did. A tile goes green only when **both** conditions hold: a non-zero exit
-*and* no share file on disk. A signer that printed a refusal and still wrote a share would
-show as `NOT REFUSED ✗`.
+**Overview** carries a setup checklist. Each item runs a real stage against the sandbox:
+create the account (2-of-3 key generation), start the test network, scan for funds, prepare
+signing material, create the transaction. The whole sequence takes a few minutes, most of it
+mining and generating the Halo 2 proof.
 
-Run the **honest control** too. Until you have seen the signer accept a correct candidate,
-a refusal is not evidence of anything: a signer that refuses everything would score ten out
-of ten.
+**Queue** shows the pending transaction with a confirmation counter. Expand *What exactly is
+being signed* to see what an owner is agreeing to: recipient, amount, memo, change, fee, the
+coin being spent, expiry. Sign as each owner in turn; at 2 of 2 the Execute button lights up
+and proves, broadcasts and mines.
+
+**Security tests** is the part worth playing with. Pick a field and the account rebuilds the
+pending transaction with that one thing changed, hands it to Alice, and shows what she does.
+A tile goes green only when **both** conditions hold: she rejected it *and* no signature file
+was produced. A rejection that still produced one shows as `GOT THROUGH ✗`.
+
+Run the **honest control** too. Until you have seen an owner accept a correct transaction, a
+rejection proves nothing: an owner that rejects everything would score full marks.
 
 The honest candidate and Alice's unspent nonces are snapshotted at `propose` and restored
 before every case, so the experiments are repeatable and independent. Without that, re-running
-`commit` would rotate her commitments and every case would refuse on a stale randomiser
-rather than on the field under test.
+`commit` would rotate her commitments and every case would reject on a stale randomiser rather
+than on the field under test.
 
 ## The sandbox
 
@@ -85,13 +91,13 @@ These are properties of `server.py`, not promises:
   is no traversal to defend against. `/../RESULTS.md`, `/static/../server.py` and
   `/etc/passwd` all return 404.
 - **Loopback only.** `HOST` is `127.0.0.1` and there is no flag to change it.
-- **No shell.** The lab does spawn processes, but only the built `loki` binary and
+- **No shell.** The runner does spawn processes, but only the built `loki` binary and
   `harness/zebrad`, with fully formed argv lists chosen from a fixed table in `runner.py`.
   Never `shell=True`.
 
 ## Recorded, not live
 
-This applies to `/notes`, not the lab: in the lab everything you see is a run you just
+This applies to `/notes`, not the account UI, where everything you see is a run you just
 started. Everything substantive on the **walkthrough** page is from a **recorded** run and is badged as such.
 There is exactly one live reading in the whole demo: `GET /api/node` asks a local node on
 `127.0.0.1:18232` for its block count, and the page shows it under a separate **Live
@@ -101,9 +107,9 @@ recorded transaction is on it.
 No approval is ever animated, no progress bar fills, and selecting a stage reveals what
 that stage recorded rather than playing it out.
 
-## Why the lab does not call the shell scripts
+## Why the UI does not call the shell scripts
 
-The lab reimplements the sequence rather than invoking `run-regtest.sh` or
+The runner reimplements the sequence rather than invoking `run-regtest.sh` or
 `run-second-device.sh`, because those scripts are fine in a terminal and not fine behind a
 web request. Four reasons, all still true of the scripts:
 
@@ -117,16 +123,16 @@ web request. Four reasons, all still true of the scripts:
 `runner.py` does each of those things instead: its own sandbox directory, its own generated
 config, its own port with a pre-flight check, a held process object rather than a pattern
 kill, guaranteed teardown, and a single-run lock. The shell scripts are unchanged and remain
-the way to run the full flow, including the second-device paths the lab does not cover.
+the way to run the full flow, including the second-device paths the UI does not cover.
 
 ## Files
 
 ```
 demo/server.py           stdlib HTTP server: static assets and the JSON API
 demo/runner.py           the sandboxed runner: steps, process control, teardown
-demo/static/lab.html     the lab
-demo/static/lab.css      control-panel layer
-demo/static/lab.js       thin client: names a step, polls state, renders the runner's events
+demo/static/wallet.html  the account UI
+demo/static/wallet.css   its visual system
+demo/static/wallet.js    thin client: names a step, polls state, renders the runner's events
 demo/static/index.html   the written walkthrough at /notes
 demo/static/app.css      the shared visual system
 demo/static/app.js       walkthrough rendering

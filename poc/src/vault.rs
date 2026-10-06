@@ -94,6 +94,27 @@ pub fn test_only_address(fvk: &FullViewingKey) -> orchard::Address {
     fvk.address_at(0u64, Scope::External)
 }
 
+/// Encode the vault's Orchard receiver as a Regtest unified address.
+///
+/// There is no Ironwood receiver typecode: `zcash_address` 0.14 knows only Orchard,
+/// Sapling, P2PKH and P2SH. Ironwood reuses the Orchard receiver and the pool is chosen
+/// by the sending bundle, so one address can receive either.
+///
+/// **Test-only.** Not a production Loki vault address.
+pub fn regtest_unified_address(fvk: &FullViewingKey) -> String {
+    use zcash_address::{
+        unified::{Address as Ua, Encoding, Receiver, Revision, Uitem},
+        ToAddress, ZcashAddress,
+    };
+
+    let raw = test_only_address(fvk).to_raw_address_bytes();
+    let ua = Ua::try_from_items(Revision::R0, vec![Uitem::Data(Receiver::Orchard(raw))])
+        .expect("one Orchard receiver is a valid unified address");
+
+    ZcashAddress::from_unified(zcash_protocol::consensus::NetworkType::Regtest, ua)
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,12 +122,12 @@ mod tests {
 
     /// A real 2-of-3 DKG group key, as the three member processes would produce it.
     fn dkg_group_ak() -> [u8; 32] {
-        let mut rng = rand_core::OsRng;
+        let rng = rand_core::OsRng;
         let (_shares, pubkeys) = frost::keys::generate_with_dealer(
             3,
             2,
             frost::keys::IdentifierList::Default,
-            &mut rng,
+            rng,
         )
         .unwrap();
         pubkeys
@@ -170,25 +191,4 @@ mod tests {
         off_curve[31] = 0x7F;
         assert_eq!(test_only_fvk(&off_curve), Err(VaultKeyError::NotCanonical));
     }
-}
-
-/// Encode the vault's Orchard receiver as a Regtest unified address.
-///
-/// There is no Ironwood receiver typecode: `zcash_address` 0.14 knows only Orchard,
-/// Sapling, P2PKH and P2SH. Ironwood reuses the Orchard receiver and the pool is chosen
-/// by the sending bundle, so one address can receive either.
-///
-/// **Test-only.** Not a production Loki vault address.
-pub fn regtest_unified_address(fvk: &FullViewingKey) -> String {
-    use zcash_address::{
-        unified::{Address as Ua, Encoding, Receiver, Revision, Uitem},
-        ToAddress, ZcashAddress,
-    };
-
-    let raw = test_only_address(fvk).to_raw_address_bytes();
-    let ua = Ua::try_from_items(Revision::R0, vec![Uitem::Data(Receiver::Orchard(raw))])
-        .expect("one Orchard receiver is a valid unified address");
-
-    ZcashAddress::from_unified(zcash_protocol::consensus::NetworkType::Regtest, ua)
-        .to_string()
 }

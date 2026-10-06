@@ -89,7 +89,7 @@ pub fn quote_fee<P: Parameters + Clone>(
     .map_err(|e| format!("deferred builder: {e:?}"))?;
 
     builder
-        .add_ironwood_spend::<Fe>(inputs.vault_fvk.clone(), inputs.note.clone())
+        .add_ironwood_spend::<Fe>(inputs.vault_fvk.clone(), inputs.note)
         .map_err(|e| format!("quote spend: {e:?}"))?;
     builder
         .add_ironwood_output::<Fe>(None, inputs.recipient, inputs.amount, inputs.memo.clone())
@@ -116,7 +116,7 @@ pub fn build_candidate<P: Parameters + Clone>(
     params: &P,
     inputs: &CandidateInputs<'_>,
     alpha: pallas::Scalar,
-    rng: impl rand_core_zp::Rng + rand_core_zp::CryptoRng,
+    rng: impl rand_core_zp::CryptoRng,
 ) -> Result<zcash_primitives::transaction::builder::PcztResult<P>, String> {
     let mut builder = DeferredPcztBuilder::new::<zcash_primitives::transaction::fees::zip317::FeeError>(
         params.clone(),
@@ -131,7 +131,7 @@ pub fn build_candidate<P: Parameters + Clone>(
     builder
         .add_ironwood_spend_with_alpha::<zcash_primitives::transaction::fees::zip317::FeeError>(
             inputs.vault_fvk.clone(),
-            inputs.note.clone(),
+            inputs.note,
             alpha,
         )
         .map_err(|e| format!("add ironwood spend: {e:?}"))?;
@@ -160,185 +160,6 @@ pub fn build_candidate<P: Parameters + Clone>(
         .map_err(|e| format!("build_for_pczt: {e:?}"))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{intent::*, vault};
-    use reddsa_frost::frost::redpallas as frost;
-    use std::collections::BTreeMap;
-
-    /// A vault note, built the way the chain would have created one.
-    fn vault_note(fvk: &FullViewingKey) -> Note {
-        use orchard::{
-            note::{RandomSeed, Rho},
-            value::NoteValue,
-            NoteVersion,
-        };
-        let rho = Rho::from_bytes(&[1u8; 32]).unwrap();
-        let rseed = RandomSeed::from_bytes([2u8; 32], &rho).unwrap();
-        Note::from_parts(
-            fvk.address_at(0u64, orchard::keys::Scope::External),
-            NoteValue::from_raw(625_000_000),
-            rho,
-            rseed,
-            NoteVersion::V3,
-        )
-        .unwrap()
-    }
-
-    /// Checkpoint 3, evidence item 2: three candidate families with identical effects
-    /// and nullifiers, distinct per-pair `rk`, and absent anchor/witness/proof.
-    #[test]
-    fn c3_three_candidates_share_effects_and_differ_only_in_rk() {
-        let mut frost_rng = rand_core::OsRng;
-
-        let (shares, pubkeys) = frost::keys::generate_with_dealer(
-            3,
-            2,
-            frost::keys::IdentifierList::Default,
-            &mut frost_rng,
-        )
-        .unwrap();
-        let packages: BTreeMap<_, _> = shares
-            .into_iter()
-            .map(|(id, ss)| (id, frost::keys::KeyPackage::try_from(ss).unwrap()))
-            .collect();
-        let ids: Vec<_> = packages.keys().copied().collect();
-
-        let ak: [u8; 32] = pubkeys
-            .verifying_key()
-            .serialize()
-            .unwrap()
-            .try_into()
-            .unwrap();
-        let fvk = vault::test_only_fvk(&ak).unwrap();
-        let note = vault_note(&fvk);
-
-        let intent = Intent {
-            proposer: ids[0].serialize(),
-            created_height: 700,
-            input_nullifiers: vec![note.nullifier(&fvk).to_bytes()],
-            recipient: fvk
-                .address_at(7u64, orchard::keys::Scope::External)
-                .to_raw_address_bytes()
-                .to_vec(),
-            amount_zat: 40_000_000,
-            memo: b"loki g1-tx".to_vec(),
-            change_policy: ChangePolicy::VaultInternal,
-            fee_zat: 0,
-            change_zat: 0,
-            expiry_height: 1_152,
-        };
-        let proposal_id = intent.proposal_id();
-
-        let mut rks = Vec::new();
-        let mut nullifiers = Vec::new();
-
-        for (x, y) in [(0usize, 1usize), (0, 2), (1, 2)] {
-            // Each pair commits, so each pair's alpha is bound to its own commitments.
-            let mut commitments = BTreeMap::new();
-            for k in [x, y] {
-                let (_n, c) =
-                    frost::round1::commit(packages[&ids[k]].signing_share(), &mut frost_rng);
-                commitments.insert(ids[k], c);
-            }
-            let seed = alpha_seed(&proposal_id, (&ids[x], &ids[y]), 0);
-            let alpha_bytes = alpha_for_candidate(&seed, &commitments).unwrap().serialize();
-
-            // Cross the version boundary as canonical 32 bytes, and reject anything else.
-            let alpha_arr: [u8; 32] = alpha_bytes.as_slice().try_into().unwrap();
-            let alpha = crate::candidate::alpha_from_canonical_bytes(&alpha_arr)
-                .expect("the derived alpha is a canonical Pallas scalar");
-
-            // The fee is what the builder says it is; change is the remainder.
-            let amount = Zatoshis::const_from_u64(40_000_000);
-            let total = Zatoshis::const_from_u64(625_000_000);
-
-            let mut inputs = CandidateInputs {
-                vault_fvk: &fvk,
-                note: note.clone(),
-                recipient: orchard::Address::from_raw_address_bytes(
-                    &intent.recipient.clone().try_into().unwrap(),
-                )
-                .unwrap(),
-                amount,
-                memo: MemoBytes::from_bytes(&intent.memo).unwrap(),
-                change: Zatoshis::ZERO,
-                target_height: 700,
-                expiry_height: 1_152,
-            };
-
-            let fee = quote_fee(&Regtest, &inputs).expect("the builder quotes a fee");
-            inputs.change = Zatoshis::const_from_u64(
-                u64::from(total) - u64::from(amount) - u64::from(fee),
-            );
-
-            let built = build_candidate(
-                &Regtest,
-                &inputs,
-                alpha,
-                rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng::default()),
-            )
-            .expect("a candidate builds");
-
-            let bundle = built
-                .pczt_parts
-                .ironwood
-                .as_ref()
-                .expect("an ironwood bundle");
-
-            // Anchor deferred: the flag that makes a PCZT serializer emit it as ABSENT,
-            // with the empty-tree root standing in as a placeholder.
-            assert!(
-                *bundle.anchor_deferred(),
-                "the anchor must be deferred before proving"
-            );
-            assert_eq!(
-                *bundle.anchor(),
-                orchard::Anchor::empty_tree(),
-                "a deferred anchor carries the empty-tree placeholder"
-            );
-            assert!(
-                bundle.zkproof().is_none(),
-                "the proof must be absent before proving"
-            );
-
-            // The real spend is the one spending OUR note. Padding actions are dummy
-            // spends of notes the builder invented, and they do carry dummy witnesses.
-            let real_nf = note.nullifier(&fvk).to_bytes();
-            let real: Vec<_> = bundle
-                .actions()
-                .iter()
-                .filter(|a| a.spend().nullifier().to_bytes() == real_nf)
-                .collect();
-            assert_eq!(real.len(), 1, "exactly one action spends the vault note");
-            assert!(
-                real[0].spend().witness().is_none(),
-                "the real spend's witness must be absent before proving"
-            );
-
-            // The spend committed to the alpha we chose, which is the B2 patch working
-            // through the whole deferred builder rather than only in isolation.
-            assert_eq!(
-                real[0].spend().alpha(),
-                &Some(alpha),
-                "the spend must carry the derived alpha"
-            );
-            rks.push(<[u8; 32]>::from(real[0].spend().rk()));
-            nullifiers.push(real_nf);
-        }
-
-        // Same note spent by all three.
-        assert_eq!(nullifiers[0], nullifiers[1]);
-        assert_eq!(nullifiers[1], nullifiers[2]);
-
-        // Different pair, different rk.
-        assert_ne!(rks[0], rks[1]);
-        assert_ne!(rks[1], rks[2]);
-        assert_ne!(rks[0], rks[2]);
-    }
-}
-
 /// TEST-ONLY: build a candidate whose change may be sent somewhere other than the vault.
 ///
 /// `build_candidate` always sends change to the vault's own internal address, which is
@@ -349,7 +170,7 @@ pub fn build_tampered<P: Parameters + Clone>(
     inputs: &CandidateInputs<'_>,
     alpha: pallas::Scalar,
     change_to_vault: bool,
-    rng: impl rand_core_zp::Rng + rand_core_zp::CryptoRng,
+    rng: impl rand_core_zp::CryptoRng,
 ) -> Result<zcash_primitives::transaction::builder::PcztResult<P>, String> {
     type Fe = zcash_primitives::transaction::fees::zip317::FeeError;
 
@@ -365,7 +186,7 @@ pub fn build_tampered<P: Parameters + Clone>(
     builder
         .add_ironwood_spend_with_alpha::<Fe>(
             inputs.vault_fvk.clone(),
-            inputs.note.clone(),
+            inputs.note,
             alpha,
         )
         .map_err(|e| format!("add ironwood spend: {e:?}"))?;
@@ -459,4 +280,183 @@ pub fn forbidden_sapling_bundle() -> Result<sapling_crypto::pczt::Bundle, String
         None,
     )
     .map_err(|e| format!("sapling bundle: {e:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{intent::*, vault};
+    use reddsa_frost::frost::redpallas as frost;
+    use std::collections::BTreeMap;
+
+    /// A vault note, built the way the chain would have created one.
+    fn vault_note(fvk: &FullViewingKey) -> Note {
+        use orchard::{
+            note::{RandomSeed, Rho},
+            value::NoteValue,
+            NoteVersion,
+        };
+        let rho = Rho::from_bytes(&[1u8; 32]).unwrap();
+        let rseed = RandomSeed::from_bytes([2u8; 32], &rho).unwrap();
+        Note::from_parts(
+            fvk.address_at(0u64, orchard::keys::Scope::External),
+            NoteValue::from_raw(625_000_000),
+            rho,
+            rseed,
+            NoteVersion::V3,
+        )
+        .unwrap()
+    }
+
+    /// Checkpoint 3, evidence item 2: three candidate families with identical effects
+    /// and nullifiers, distinct per-pair `rk`, and absent anchor/witness/proof.
+    #[test]
+    fn c3_three_candidates_share_effects_and_differ_only_in_rk() {
+        let mut frost_rng = rand_core::OsRng;
+
+        let (shares, pubkeys) = frost::keys::generate_with_dealer(
+            3,
+            2,
+            frost::keys::IdentifierList::Default,
+            frost_rng,
+        )
+        .unwrap();
+        let packages: BTreeMap<_, _> = shares
+            .into_iter()
+            .map(|(id, ss)| (id, frost::keys::KeyPackage::try_from(ss).unwrap()))
+            .collect();
+        let ids: Vec<_> = packages.keys().copied().collect();
+
+        let ak: [u8; 32] = pubkeys
+            .verifying_key()
+            .serialize()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let fvk = vault::test_only_fvk(&ak).unwrap();
+        let note = vault_note(&fvk);
+
+        let intent = Intent {
+            proposer: ids[0].serialize(),
+            created_height: 700,
+            input_nullifiers: vec![note.nullifier(&fvk).to_bytes()],
+            recipient: fvk
+                .address_at(7u64, orchard::keys::Scope::External)
+                .to_raw_address_bytes()
+                .to_vec(),
+            amount_zat: 40_000_000,
+            memo: b"loki g1-tx".to_vec(),
+            change_policy: ChangePolicy::VaultInternal,
+            fee_zat: 0,
+            change_zat: 0,
+            expiry_height: 1_152,
+        };
+        let proposal_id = intent.proposal_id();
+
+        let mut rks = Vec::new();
+        let mut nullifiers = Vec::new();
+
+        for (x, y) in [(0usize, 1usize), (0, 2), (1, 2)] {
+            // Each pair commits, so each pair's alpha is bound to its own commitments.
+            let mut commitments = BTreeMap::new();
+            for k in [x, y] {
+                let (_n, c) =
+                    frost::round1::commit(packages[&ids[k]].signing_share(), &mut frost_rng);
+                commitments.insert(ids[k], c);
+            }
+            let seed = alpha_seed(&proposal_id, (&ids[x], &ids[y]), 0);
+            let alpha_bytes = alpha_for_candidate(&seed, &commitments).unwrap().serialize();
+
+            // Cross the version boundary as canonical 32 bytes, and reject anything else.
+            let alpha_arr: [u8; 32] = alpha_bytes.as_slice().try_into().unwrap();
+            let alpha = crate::candidate::alpha_from_canonical_bytes(&alpha_arr)
+                .expect("the derived alpha is a canonical Pallas scalar");
+
+            // The fee is what the builder says it is; change is the remainder.
+            let amount = Zatoshis::const_from_u64(40_000_000);
+            let total = Zatoshis::const_from_u64(625_000_000);
+
+            let mut inputs = CandidateInputs {
+                vault_fvk: &fvk,
+                note,
+                recipient: orchard::Address::from_raw_address_bytes(
+                    &intent.recipient.clone().try_into().unwrap(),
+                )
+                .unwrap(),
+                amount,
+                memo: MemoBytes::from_bytes(&intent.memo).unwrap(),
+                change: Zatoshis::ZERO,
+                target_height: 700,
+                expiry_height: 1_152,
+            };
+
+            let fee = quote_fee(&Regtest, &inputs).expect("the builder quotes a fee");
+            inputs.change = Zatoshis::const_from_u64(
+                u64::from(total) - u64::from(amount) - u64::from(fee),
+            );
+
+            let built = build_candidate(
+                &Regtest,
+                &inputs,
+                alpha,
+                rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng),
+            )
+            .expect("a candidate builds");
+
+            let bundle = built
+                .pczt_parts
+                .ironwood
+                .as_ref()
+                .expect("an ironwood bundle");
+
+            // Anchor deferred: the flag that makes a PCZT serializer emit it as ABSENT,
+            // with the empty-tree root standing in as a placeholder.
+            assert!(
+                *bundle.anchor_deferred(),
+                "the anchor must be deferred before proving"
+            );
+            assert_eq!(
+                *bundle.anchor(),
+                orchard::Anchor::empty_tree(),
+                "a deferred anchor carries the empty-tree placeholder"
+            );
+            assert!(
+                bundle.zkproof().is_none(),
+                "the proof must be absent before proving"
+            );
+
+            // The real spend is the one spending OUR note. Padding actions are dummy
+            // spends of notes the builder invented, and they do carry dummy witnesses.
+            let real_nf = note.nullifier(&fvk).to_bytes();
+            let real: Vec<_> = bundle
+                .actions()
+                .iter()
+                .filter(|a| a.spend().nullifier().to_bytes() == real_nf)
+                .collect();
+            assert_eq!(real.len(), 1, "exactly one action spends the vault note");
+            assert!(
+                real[0].spend().witness().is_none(),
+                "the real spend's witness must be absent before proving"
+            );
+
+            // The spend committed to the alpha we chose, which is the B2 patch working
+            // through the whole deferred builder rather than only in isolation.
+            assert_eq!(
+                real[0].spend().alpha(),
+                &Some(alpha),
+                "the spend must carry the derived alpha"
+            );
+            rks.push(<[u8; 32]>::from(real[0].spend().rk()));
+            nullifiers.push(real_nf);
+        }
+
+        // Same note spent by all three.
+        assert_eq!(nullifiers[0], nullifiers[1]);
+        assert_eq!(nullifiers[1], nullifiers[2]);
+
+        // Different pair, different rk.
+        assert_ne!(rks[0], rks[1]);
+        assert_ne!(rks[1], rks[2]);
+        assert_ne!(rks[0], rks[2]);
+    }
 }

@@ -3,7 +3,7 @@
 
 Read-only, loopback-only, and deliberately narrow. It exposes three things:
 
-  GET  /                 the lab: run the POC stages against a sandboxed chain
+  GET  /                 the account UI: run the POC stages against a sandboxed chain
   GET  /notes            the written walkthrough of the recorded run
   GET  /api/evidence     numbers extracted from an ALLOWLIST of public result files
   GET  /api/node         whether a local regtest node answers on 127.0.0.1:18232
@@ -18,7 +18,7 @@ What it will not do, by construction rather than by convention:
   * It serves static assets only from demo/static, by exact filename from a fixed map.
     There is no path join from request data anywhere in this file.
   * It binds 127.0.0.1. There is no option to bind anything else.
-  * It runs no SHELL. The lab does spawn processes, but only the built `loki` binary and
+  * It runs no SHELL. The runner does spawn processes, but only the built `loki` binary and
     `harness/zebrad`, with fully formed argv lists chosen from a fixed table in runner.py.
     A request names a step; it never supplies a path, a flag, or an argument. See
     runner.py for the sandbox, port and teardown guarantees.
@@ -36,7 +36,7 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from runner import RUNNER, TAMPER_CASES, loki_bin
+from runner import SANDBOX as RUNNER_SANDBOX, RUNNER, TAMPER_CASES, loki_bin
 
 HOST = "127.0.0.1"
 PORT = 8787
@@ -61,13 +61,10 @@ ASSETS = {
     "/wallet.html": (STATIC / "wallet.html", "text/html; charset=utf-8"),
     "/wallet.css": (STATIC / "wallet.css", "text/css; charset=utf-8"),
     "/wallet.js": (STATIC / "wallet.js", "text/javascript; charset=utf-8"),
-    "/lab.html": (STATIC / "lab.html", "text/html; charset=utf-8"),
     "/notes": (STATIC / "index.html", "text/html; charset=utf-8"),
     "/index.html": (STATIC / "index.html", "text/html; charset=utf-8"),
     "/app.css": (STATIC / "app.css", "text/css; charset=utf-8"),
     "/app.js": (STATIC / "app.js", "text/javascript; charset=utf-8"),
-    "/lab.css": (STATIC / "lab.css", "text/css; charset=utf-8"),
-    "/lab.js": (STATIC / "lab.js", "text/javascript; charset=utf-8"),
 }
 
 
@@ -229,11 +226,16 @@ def build_evidence() -> dict:
 
 
 def probe_node(timeout: float = 0.6) -> dict:
-    """Ask a local regtest node for its block count. Read-only, and clearly separate.
+    """Ask for the block count of a node on 18232. Read-only, and clearly separate.
 
-    This is the one live reading in the demo. It is reported on its own so it can never
-    be confused with the recorded payment above: a reachable node says nothing about
-    whether the recorded transaction is on it.
+    Note the port: 18232 is where the SHELL SCRIPTS put a node, not where the account UI
+    puts its sandbox (18242). This probe exists for the /notes page, to say whether a
+    script-started chain happens to be up. It will correctly report "no node" while the
+    sandbox chain is running, because that is a different chain on a different port.
+
+    It is the one live reading in the demo, reported on its own so it can never be
+    confused with the recorded payment: a reachable node says nothing about whether the
+    recorded transaction is on it.
     """
     import urllib.error
     import urllib.request
@@ -350,11 +352,12 @@ def main() -> int:
         print(f"something is already listening. Stop it, or pass another port: "
               f"python3 {sys.argv[0]} 8788", file=sys.stderr)
         return 1
-    print(f"Loki POC lab on http://{HOST}:{port}")
+    print(f"Loki account demo on http://{HOST}:{port}")
     if loki_bin() is None:
         print("  WARNING: the loki binary is not built. Run: cd poc && cargo build")
     print(f"  reading only: {', '.join(str(p.relative_to(POC)) for p in SOURCES.values())}")
-    print("  read-only, loopback-only, runs no scripts.  ctrl-c to stop")
+    print(f"  loopback only. Runs the prototype in a sandbox: {RUNNER_SANDBOX}")
+    print("  ctrl-c to stop; the sandbox chain stops with it")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

@@ -116,7 +116,9 @@ function renderHome() {
     ready: ['go', `Threshold met: ${W.confirmations} of ${W.threshold} owners have signed. Ready to execute.`],
     executed: ['go', 'Transaction executed and mined.'],
   }[W.status] ?? ['', ''];
-  b.classList.add(msg[0]);
+  // `classList.add('')` throws, and two of the five statuses carry no tone. Leaving this
+  // unguarded aborted the whole Overview render at this line.
+  if (msg[0]) b.classList.add(msg[0]);
   b.append(el('span', null, msg[1]));
   if (W.status === 'awaiting_confirmations' || W.status === 'ready') {
     const go = el('button', 'btn btn-sm', 'Open queue');

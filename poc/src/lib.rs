@@ -72,7 +72,7 @@ mod checkpoint_1 {
             3,
             2,
             frost::keys::IdentifierList::Default,
-            &mut rng,
+            rng,
         )
         .expect("2-of-3 keygen");
 
@@ -124,7 +124,7 @@ mod checkpoint_1 {
     #[test]
     fn c1_1_dkg_three_members_reach_one_group_key() {
         use frost::keys::dkg;
-        let mut rng = rand_core::OsRng;
+        let rng = rand_core::OsRng;
 
         let ids: Vec<frost::Identifier> =
             (1u16..=3).map(|i| i.try_into().unwrap()).collect();
@@ -132,7 +132,7 @@ mod checkpoint_1 {
         let mut r1_secret = BTreeMap::new();
         let mut r1_pub = BTreeMap::new();
         for id in &ids {
-            let (s, p) = dkg::part1(*id, 3, 2, &mut rng).unwrap();
+            let (s, p) = dkg::part1(*id, 3, 2, rng).unwrap();
             r1_secret.insert(*id, s);
             r1_pub.insert(*id, p);
         }
@@ -178,12 +178,12 @@ mod checkpoint_1 {
     fn c1_2_group_key_becomes_an_address_but_only_pre_zip2005() {
         use orchard::keys::{FullViewingKey, Scope, SpendingKey};
 
-        let mut rng = rand_core::OsRng;
+        let rng = rand_core::OsRng;
         let (_shares, pubkeys) = frost::keys::generate_with_dealer(
             3,
             2,
             frost::keys::IdentifierList::Default,
-            &mut rng,
+            rng,
         )
         .unwrap();
 

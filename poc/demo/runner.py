@@ -166,7 +166,7 @@ class Runner:
         """Which steps the sandbox already shows evidence of.
 
         `done` is in-memory, so without this a server restart would grey out the tamper
-        lab even though the candidates are sitting right there. Each entry is keyed on an
+        UI even though the candidates are sitting right there. Each entry is keyed on an
         artifact that only that step produces. `start-chain` is absent on purpose: a
         running process is not something a file can vouch for.
         """
@@ -283,7 +283,7 @@ class Runner:
             return False
         self.emit("cmd", f"loki {' '.join(args)}")
         # The CLI defaults to 127.0.0.1:18232. LOKI_RPC points it at the sandbox chain so
-        # the lab can never drive, or be confused with, a node the shell scripts started.
+        # this can never drive, or be confused with, a node the shell scripts started.
         env = {**os.environ, "LOKI_RPC": f"127.0.0.1:{RPC_PORT}"}
         try:
             p = subprocess.run([str(exe), *args], cwd=str(POC), timeout=timeout,
@@ -417,7 +417,7 @@ class Runner:
     def step_propose(self) -> bool:
         if not self.run_cli(["propose", str(STATE)], "propose", timeout=300):
             return False
-        # Snapshot what the tamper lab has to restore between experiments: the honest
+        # Snapshot what the security tests have to restore between runs: the honest
         # candidate, and alice's unspent nonces. Without this, re-running `commit` would
         # rotate her commitments and every tamper case would refuse on a stale alpha
         # rather than on the field under test.

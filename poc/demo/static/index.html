@@ -236,9 +236,11 @@
     <div class="runsplit">
       <div>
         <p class="prose">
-          These are the real commands. They are printed rather than wired to a button, and the
-          reason is specific, not cautious boilerplate: the existing scripts do three things
-          that are fine in a terminal and not fine behind a web request.
+          These are the real commands. The account UI at <a href="/">the root of this
+          server</a> runs the same sequence from a browser, against an isolated sandbox.
+          It does not call these scripts, and the reason is specific rather than cautious:
+          the scripts do four things that are fine in a terminal and not fine behind a web
+          request.
         </p>
         <ul class="hazards">
           <li>
@@ -265,11 +267,11 @@
           </li>
         </ul>
         <p class="prose prose-tight">
-          Making a button safe means isolating the state directory and the config, checking the
-          port, replacing the broad kill with a recorded PID, guaranteeing teardown, and
-          allowing one run at a time. That is a change to the run scripts, not to this page, and
-          it is deliberately not in this slice. Until it is done, the page shows the command and
-          the output of a run that really happened.
+          <code>demo/runner.py</code> does each of those things instead of calling the
+          scripts: its own sandbox directory, its own generated config, its own port with a
+          pre-flight check, a held process object rather than a pattern kill, teardown on
+          every exit path, and a single-run lock. The scripts are unchanged and remain the
+          way to run the parts the UI does not cover, such as second-device finishing.
         </p>
       </div>
       <div class="cmds" id="cmds"></div>

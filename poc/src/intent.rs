@@ -194,7 +194,7 @@ mod tests {
     fn c3_proposal_id_changes_with_every_checked_field() {
         let base = intent().proposal_id();
 
-        let mut m = |f: &dyn Fn(&mut Intent)| {
+        let m = |f: &dyn Fn(&mut Intent)| {
             let mut i = intent();
             f(&mut i);
             assert_ne!(i.proposal_id(), base);
@@ -236,7 +236,7 @@ mod tests {
             3,
             2,
             frost::keys::IdentifierList::Default,
-            &mut rng,
+            rng,
         )
         .unwrap();
 
