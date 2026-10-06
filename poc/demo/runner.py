@@ -248,14 +248,18 @@ class Runner:
         confirmations = sum(1 for o in owners if o["confirmed_ac"])
         candidates = [p for p in ("AB", "AC", "BC") if (pub / f"candidate_{p}.pczt.hex").exists()]
 
+        # `no_funds` is a distinct state from `no_transaction`: an account can exist
+        # without having been scanned, and saying "funded" then would be a plain lie.
         if mined.get("txid"):
             status = "executed"
         elif confirmations >= 2:
             status = "ready"
         elif intent:
             status = "awaiting_confirmations"
-        elif addr:
+        elif addr and bal:
             status = "no_transaction"
+        elif addr:
+            status = "no_funds"
         else:
             status = "no_account"
 

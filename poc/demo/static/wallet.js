@@ -110,7 +110,8 @@ function renderHome() {
   b.className = 'banner';
   b.replaceChildren();
   const msg = {
-    no_account: ['', 'This account does not exist yet. Work down the list below; each step runs the real prototype.'],
+    no_account: ['', 'No account yet. Work down the list below; each step runs the real prototype.'],
+    no_funds: ['', 'Account created. It holds nothing until the network is running and the chain has been scanned.'],
     no_transaction: ['', 'Account is funded. Create a transaction to see it enter the queue.'],
     awaiting_confirmations: ['wait', `Waiting on signatures: ${W.confirmations} of ${W.threshold}.`],
     ready: ['go', `Threshold met: ${W.confirmations} of ${W.threshold} owners have signed. Ready to execute.`],
