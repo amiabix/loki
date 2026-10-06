@@ -25,6 +25,7 @@ pub mod intent;
 pub mod refresh;
 pub mod rpc;
 pub mod scan;
+pub mod scanstate;
 pub mod state;
 pub mod vault;
 pub mod verify;

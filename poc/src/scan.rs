@@ -17,6 +17,8 @@ use orchard::{
 };
 use zcash_note_encryption::try_note_decryption;
 
+use crate::scanstate::ScanState;
+
 /// One Ironwood action as the node reports it.
 #[derive(Clone, Debug)]
 pub struct RawAction {
@@ -113,25 +115,41 @@ pub fn scan_block(
     let mut position = start_position;
 
     for raw in actions {
-        // Every scope in turn. External finds coinbase funding and payments to a
-        // diversified address; internal finds change. A scan that only tried external
-        // would silently miss every change note the vault owns.
-        if let Some(note) = ivks.iter().find_map(|ivk| try_decrypt(ivk, raw)) {
-            found.push(VaultNote {
-                height,
-                txid: txid.to_string(),
-                position,
-                value_zat: note.value().inner(),
-                cmx: raw.cmx,
-                // The spend nullifier is a function of the note and the vault's key.
-                nullifier: note.nullifier(fvk).to_bytes(),
-                note,
-            });
+        if let Some(note) = vault_note_at(fvk, ivks, height, txid, position, raw) {
+            found.push(note);
         }
         position += 1;
     }
 
     (found, position)
+}
+
+/// What the vault learns from one action, or `None` if the action is not addressed to it.
+///
+/// Shared by the live scan and by [`crate::scanstate::ScanState`] rebuilding a note it
+/// stored earlier, so a note recovered from disk cannot drift from one found on the wire.
+pub(crate) fn vault_note_at(
+    fvk: &FullViewingKey,
+    ivks: &[PreparedIncomingViewingKey],
+    height: u32,
+    txid: &str,
+    position: u64,
+    raw: &RawAction,
+) -> Option<VaultNote> {
+    // Every scope in turn. External finds coinbase funding and payments to a
+    // diversified address; internal finds change. A scan that only tried external
+    // would silently miss every change note the vault owns.
+    let note = ivks.iter().find_map(|ivk| try_decrypt(ivk, raw))?;
+    Some(VaultNote {
+        height,
+        txid: txid.to_string(),
+        position,
+        value_zat: note.value().inner(),
+        cmx: raw.cmx,
+        // The spend nullifier is a function of the note and the vault's key.
+        nullifier: note.nullifier(fvk).to_bytes(),
+        note,
+    })
 }
 
 /// One Ironwood action's `cmx`, as the node's JSON reports it.
@@ -154,18 +172,71 @@ pub struct Chain {
 /// note position and the witness from the chain itself, rather than from a file an
 /// approver wrote. It is the same narrow fixture as before, just callable.
 pub fn scan_chain(rpc: &crate::rpc::Rpc, fvk: &FullViewingKey) -> Result<Chain, String> {
-    let ivks = vault_ivks(fvk);
+    let mut state = ScanState::default();
+    scan_to_tip(rpc, fvk, &mut state)?;
+    state.into_chain(fvk)
+}
+
+/// [`scan_chain`], but only over the blocks that are new since the last run.
+///
+/// `path` is a file this owns: it holds how far the last scan got, the commitment stream
+/// it collected and the vault's own actions, so a second run reads only the blocks mined
+/// since the first. The result is the same `Chain` a full scan returns — including the
+/// whole commitment stream, which is what [`crate::witness::witness_for`] needs to rebuild
+/// the tree and check its root against the node's anchor.
+///
+/// A chain that has got shorter is treated as a different chain and rescanned from
+/// scratch. A reorg that keeps the same height is not detected here; it surfaces as the
+/// anchor mismatch in `witness_for`, which refuses rather than signs.
+pub fn scan_chain_cached(
+    rpc: &crate::rpc::Rpc,
+    fvk: &FullViewingKey,
+    path: &std::path::Path,
+) -> Result<Chain, String> {
+    let mut state = ScanState::load(path)?;
+    scan_to_tip(rpc, fvk, &mut state)?;
+    state.save(path)?;
+    state.into_chain(fvk)
+}
+
+/// Bring `state` up to the node's current tip.
+fn scan_to_tip(
+    rpc: &crate::rpc::Rpc,
+    fvk: &FullViewingKey,
+    state: &mut ScanState,
+) -> Result<(), String> {
     let tip = rpc
         .json("getblockcount", "[]")?
         .as_u64()
         .ok_or("getblockcount did not return a number")?;
 
-    let mut position = 0u64;
-    let mut notes = Vec::new();
-    let mut cmxs: Vec<[u8; 32]> = Vec::new();
+    scan_blocks(fvk, state, tip, |height| {
+        rpc.json("getblock", &format!("[\"{height}\", 2]"))
+    })
+}
 
-    for height in 1..=tip {
-        let block = rpc.json("getblock", &format!("[\"{height}\", 2]"))?;
+/// Scan the blocks `state` has not seen yet, up to and including `to`.
+///
+/// `get_block` is the only thing this needs from the node, which is what lets a test run
+/// the real scan over a canned chain.
+pub fn scan_blocks<F>(
+    fvk: &FullViewingKey,
+    state: &mut ScanState,
+    to: u64,
+    get_block: F,
+) -> Result<(), String>
+where
+    F: Fn(u64) -> Result<serde_json::Value, String>,
+{
+    // A chain shorter than the one we remember is not the chain we scanned, and nothing
+    // in the stored state can be trusted to still be on it.
+    if to < state.tip {
+        *state = ScanState::default();
+    }
+
+    let ivks = vault_ivks(fvk);
+    for height in state.tip + 1..=to {
+        let block = get_block(height)?;
         for tx in block["tx"].as_array().ok_or("block has no tx array")? {
             let txid = tx["txid"].as_str().unwrap_or("?").to_string();
             let actions = match tx["ironwood"]["actions"].as_array() {
@@ -173,36 +244,46 @@ pub fn scan_chain(rpc: &crate::rpc::Rpc, fvk: &FullViewingKey) -> Result<Chain, 
                 _ => continue,
             };
 
-            let raws: Vec<RawAction> = actions
-                .iter()
-                .filter_map(|a| {
-                    Some(RawAction {
-                        cv: hex32(a, "cv")?,
-                        nullifier: hex32(a, "nullifier")?,
-                        rk: hex32(a, "rk")?,
-                        cmx: hex32(a, "cmx")?,
-                        ephemeral_key: hex32(a, "ephemeralKey")?,
-                        enc_ciphertext: hex::decode(a["encCiphertext"].as_str()?).ok()?,
-                        out_ciphertext: hex::decode(a["outCiphertext"].as_str()?)
-                            .ok()?
-                            .try_into()
-                            .ok()?,
-                    })
-                })
-                .collect();
-            if raws.len() != actions.len() {
-                return Err(format!("tx {txid}: an Ironwood action failed to parse"));
-            }
-
-            cmxs.extend(raws.iter().map(|r| r.cmx));
-            let (found, next) =
-                scan_block(fvk, &ivks, height as u32, &txid, &raws, position);
-            position = next;
-            notes.extend(found);
+            let raws = parse_actions(actions, &txid)?;
+            state.push(fvk, &ivks, height as u32, &txid, &raws);
         }
+        state.tip = height;
     }
 
-    Ok(Chain { notes, cmxs, tip })
+    Ok(())
+}
+
+/// One transaction's Ironwood actions, as the node's JSON reports them.
+///
+/// A single unparsable action is fatal: on our own regtest chain it would mean the node
+/// and these crates disagree about the wire format, and a scan that silently skipped it
+/// would assign every later note the wrong tree position.
+fn parse_actions(
+    actions: &[serde_json::Value],
+    txid: &str,
+) -> Result<Vec<RawAction>, String> {
+    let raws: Vec<RawAction> = actions
+        .iter()
+        .filter_map(|a| {
+            Some(RawAction {
+                cv: hex32(a, "cv")?,
+                nullifier: hex32(a, "nullifier")?,
+                rk: hex32(a, "rk")?,
+                cmx: hex32(a, "cmx")?,
+                ephemeral_key: hex32(a, "ephemeralKey")?,
+                enc_ciphertext: hex::decode(a["encCiphertext"].as_str()?).ok()?,
+                out_ciphertext: hex::decode(a["outCiphertext"].as_str()?)
+                    .ok()?
+                    .try_into()
+                    .ok()?,
+            })
+        })
+        .collect();
+
+    if raws.len() != actions.len() {
+        return Err(format!("tx {txid}: an Ironwood action failed to parse"));
+    }
+    Ok(raws)
 }
 
 /// The node's own Ironwood anchor at `height`.
