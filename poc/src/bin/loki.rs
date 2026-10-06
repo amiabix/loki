@@ -47,7 +47,7 @@ fn main() {
                    setup   <state-dir>   run 2-of-3 DKG into three member directories\n\
                    address <state-dir>   print the vault's regtest unified address\n\
                    scan    <state-dir>   find the vault's Ironwood notes on regtest\n\
-                   commit  <state-dir> <member>   round 1: preprocess nonces\n\
+                   commit  <state-dir> <member> [--spends N]   round 1: preprocess nonces\n\
                    propose <state-dir> [note-file]\n\
                              [--to <unified-address>] [--amount <zat>] [--memo <text>]\n\
                              build the three unproved candidates\n\
@@ -400,30 +400,47 @@ fn commit(args: &[String]) -> Result<(), String> {
     let shared = MemberDir::create(&root, &shared_name()).map_err(|e| format!("{e}"))?;
     let mut rng = rand_core::OsRng;
 
+    // One nonce pair per candidate PER SPEND. A transaction that spends several notes has
+    // one Orchard action per note, each with its own `rk`, so each needs its own FROST
+    // signature and therefore its own single-use nonce. Sharing one across two actions
+    // would be nonce reuse, which hands over the signing share.
+    //
+    // The count is fixed here rather than discovered later because commitments must exist
+    // before the proposer can derive a randomiser from them.
+    let spends: usize = match flag(args, "--spends") {
+        Some(v) => v.parse().map_err(|e| format!("--spends must be a whole number: {e}"))?,
+        None => 1,
+    };
+    if spends == 0 {
+        return Err("--spends must be at least 1".into());
+    }
+
     for (name, x, y) in PAIRS {
         if slot != x && slot != y {
             continue;
         }
 
-        let (nonces, commitment) =
-            frost::round1::commit(key_package.signing_share(), &mut rng);
+        for i in 0..spends {
+            let (nonces, commitment) =
+                frost::round1::commit(key_package.signing_share(), &mut rng);
 
-        // Secret: stays here.
-        me.write_hex(
-            &format!("nonces_{name}.hex"),
-            &nonces.serialize().map_err(|e| format!("{e}"))?,
-        )
-        .map_err(|e| e.to_string())?;
-
-        // Public: goes to the proposer.
-        shared
-            .write_hex(
-                &format!("commitment_{name}_{who}.hex"),
-                &commitment.serialize().map_err(|e| format!("{e}"))?,
+            // Secret: stays here.
+            me.write_hex(
+                &nonce_file(name, i),
+                &nonces.serialize().map_err(|e| format!("{e}"))?,
             )
             .map_err(|e| e.to_string())?;
 
-        println!("{who:<6} {name}  nonce pair stored, commitment published");
+            // Public: goes to the proposer.
+            shared
+                .write_hex(
+                    &commitment_file(name, who, i),
+                    &commitment.serialize().map_err(|e| format!("{e}"))?,
+                )
+                .map_err(|e| e.to_string())?;
+        }
+
+        println!("{who:<6} {name}  {spends} nonce pair(s) stored, commitment(s) published");
     }
 
     Ok(())
@@ -455,6 +472,24 @@ fn hexn<const N: usize>(m: &std::collections::HashMap<String, String>, k: &str) 
 /// be heavier than the thing it parses.
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+}
+
+/// Where a member keeps the nonce pair for spend `i` of candidate `pair`.
+///
+/// Spend 0 keeps the original unindexed name. That is not tidiness: the demo runner, the
+/// tamper harness and the shell scripts all name these files directly, and renaming the
+/// common case would break them for no benefit.
+fn nonce_file(pair: &str, i: usize) -> String {
+    if i == 0 { format!("nonces_{pair}.hex") } else { format!("nonces_{pair}_{i}.hex") }
+}
+
+/// The published counterpart of [`nonce_file`]. Same compatibility rule.
+fn commitment_file(pair: &str, who: &str, i: usize) -> String {
+    if i == 0 {
+        format!("commitment_{pair}_{who}.hex")
+    } else {
+        format!("commitment_{pair}_{who}_{i}.hex")
+    }
 }
 
 fn propose(args: &[String]) -> Result<(), String> {
