@@ -56,6 +56,12 @@ SNAP = SANDBOX / "snapshot"
 RPC_PORT = 18242
 RPC_URL = f"http://127.0.0.1:{RPC_PORT}/"
 
+# The peer-to-peer port has to be isolated too, and it was not. Regtest defaults to 18233
+# for BOTH the sandbox and the shell scripts, so a running sandbox chain made
+# tamper-tests.sh panic on startup with a bind failure that looked nothing like a port
+# clash. Isolating only the RPC port was not isolation.
+P2P_PORT = 18243
+
 ZEBRAD = POC / "harness" / "zebrad"
 MINE_TO = 20
 
@@ -64,6 +70,7 @@ CONFIG_TEMPLATE = """\
 # never read or modified by the demo.
 [network]
 network = "Regtest"
+listen_addr = "127.0.0.1:{p2p}"
 
 [network.testnet_parameters.activation_heights]
 NU5 = 1
@@ -315,11 +322,12 @@ class Runner:
         if not ZEBRAD.exists():
             self.emit("fail", f"no zebrad at {ZEBRAD.relative_to(POC)}; see harness/README.md")
             return False
-        if not port_free(RPC_PORT):
-            self.emit("fail", f"port {RPC_PORT} is already in use. "
-                              f"Something else is listening; the demo will not start a "
-                              f"second node on it.")
-            return False
+        for port, what in ((RPC_PORT, "RPC"), (P2P_PORT, "peer-to-peer")):
+            if not port_free(port):
+                self.emit("fail", f"the {what} port {port} is already in use. Something "
+                                  f"else is listening; the demo will not start a node on "
+                                  f"it.")
+                return False
 
         addr_file = STATE / "public" / "vault_address.txt"
         if not addr_file.exists():
@@ -328,7 +336,9 @@ class Runner:
         miner = addr_file.read_text().strip()
 
         SANDBOX.mkdir(parents=True, exist_ok=True)
-        CONF.write_text(CONFIG_TEMPLATE.format(port=RPC_PORT, miner=miner))
+        CONF.write_text(
+            CONFIG_TEMPLATE.format(port=RPC_PORT, p2p=P2P_PORT, miner=miner)
+        )
         self.emit("info", f"wrote {CONF.relative_to(POC.parent)} "
                           f"(the tracked harness config is untouched)")
 
