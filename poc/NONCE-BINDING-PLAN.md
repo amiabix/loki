@@ -166,6 +166,49 @@ rollback; an honest relay that refuses a second commitment for one `(package, si
 preventing the A.5 attack directly. That is a stronger argument for the relay design than
 the one G3 made, and it should be tested on its own.
 
+## Phase A applied to Loki itself: `./nonce-reuse-drill.sh`
+
+A.5 is about bare FROST. Loki is not bare FROST: it derives the per-pair randomiser from
+the proposal AND the published commitment set, and every signer recomputes it rather than
+accepting one. So the question became whether that already defends the real signing path.
+`nonce-reuse-drill.sh` runs it against the live prototype, in two stages.
+
+**Stage A, the naive attack: defended.** Carol re-commits, the candidate is left alone.
+Alice refuses with `rk does not match recomputed alpha`, and writes no share. The
+derivation is doing real work; this is not an accident of the test.
+
+**Stage B, the composed attack: not defended.**
+
+```
+1. alice signs honestly, nonce consumed
+2. nonce files restored, shares dropped: the device believes it never signed
+3. carol re-committed; candidate rebuilt so rk matches the new alpha
+4. alice signed again, and the share DIFFERS
+
+   share 1 5c3c603f906019c0cbb6e875ae99cfba598325b8...
+   share 2 bfbff0c400d23e31804ce22b07162c1f670b6eaa...
+```
+
+Same nonce, two different shares. Once the attacker rebuilds the candidate to match the
+moved commitment set, **nothing is inconsistent for the signer to notice**. The `rk` check
+is satisfied, the effects check is satisfied, and the only thing that had been preventing
+reuse was that the nonce file had been deleted.
+
+### What that pins down
+
+> Nonce safety in this prototype rests on deletion surviving. It does not rest on the `rk`
+> check, which cannot see this attack at all.
+
+This is not a bug in the signer, and nothing in `review_sign` needs fixing: there is no
+information available to it that would distinguish stage B from an honest first signing.
+It is the measured boundary of what the randomiser derivation can do, and it puts the whole
+weight back on nonce-store durability, which is G3's open problem.
+
+It also raises the cost of the G3 relay gate failing. Two colluding relays do not merely
+hide a rollback; combined with a rebuilt candidate they produce a recoverable key.
+
 ## Status
 
 Phase A complete, negative. Phases B and C do not apply.
+Applied to the real signing path: stage A defended, stage B not. Drill kept as
+`nonce-reuse-drill.sh`.

@@ -19,6 +19,8 @@
 pub mod candidate;
 #[cfg(test)]
 mod nonce_binding;
+#[cfg(test)]
+mod coordinator;
 pub mod intent;
 pub mod rpc;
 pub mod scan;
