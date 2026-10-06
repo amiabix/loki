@@ -22,6 +22,7 @@ mod nonce_binding;
 #[cfg(test)]
 mod coordinator;
 pub mod intent;
+pub mod refresh;
 pub mod rpc;
 pub mod scan;
 pub mod state;
