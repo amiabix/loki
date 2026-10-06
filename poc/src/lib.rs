@@ -17,6 +17,8 @@
 //! isolated patch to vendored orchard; see vendor/README.md.
 
 pub mod candidate;
+#[cfg(test)]
+mod nonce_binding;
 pub mod intent;
 pub mod rpc;
 pub mod scan;

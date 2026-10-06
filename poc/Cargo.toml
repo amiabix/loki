@@ -27,6 +27,9 @@ rand_core          = { version = "0.6", features = ["getrandom"] }
 # the graph (DEPENDENCIES.md finding F3), so each is named explicitly at its call site.
 rand_core_zp       = { package = "rand_core", version = "0.10" }
 rand_zp            = { package = "rand", version = "0.10" }
+# Deterministic nonce derivation for the Phase A binding tests. Test-only: a seeded
+# stream stands in for the OS RNG so a publication is reproducible.
+rand_chacha        = "0.3"
 blake2b_simd       = "1"
 hex                = "0.4"
 ciborium           = "0.2"
