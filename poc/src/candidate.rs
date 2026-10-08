@@ -19,7 +19,7 @@ use zcash_protocol::{
     value::Zatoshis,
 };
 
-/// Regtest consensus parameters, matching `harness/zebrad-regtest.toml`: every upgrade
+/// Regtest consensus parameters, matching the THS regtest chain: every upgrade
 /// active from height 1.
 #[derive(Clone)]
 pub struct Regtest;
@@ -31,7 +31,7 @@ impl Parameters for Regtest {
 
     /// Everything up to and including NU6.3 is active from height 1; nothing later is.
     ///
-    /// This must match `harness/zebrad-regtest.toml` exactly. Activating NU7 here too
+    /// This must match the active THS consensus branch. Activating NU7 here too
     /// would make `BranchId::for_height` pick a later branch than the node accepts, and
     /// the transaction is rejected with "incorrect consensus branch id" only at
     /// broadcast, after proving.

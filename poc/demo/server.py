@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Local demo server for the Loki research POC.
 
-Read-only, loopback-only, and deliberately narrow. It exposes three things:
+Loopback-only and deliberately narrow. It exposes three things:
 
-  GET  /                 the account UI: run the POC stages against a sandboxed chain
+  GET  /                 the account UI: run Loki stages against the selected THS chain
   GET  /notes            the written walkthrough of the recorded run
   GET  /api/evidence     numbers extracted from an ALLOWLIST of public result files
-  GET  /api/node         whether a local regtest node answers on 127.0.0.1:18232
+  GET  /api/node         whether the selected THS regtest node answers
   GET  /api/state        sandbox runner state and its event buffer
   POST /api/run          start one named step from a fixed list (see runner.py)
 
@@ -19,13 +19,12 @@ What it will not do, by construction rather than by convention:
     There is no path join from request data anywhere in this file.
   * It binds 127.0.0.1. There is no option to bind anything else.
   * It runs no SHELL. The runner does spawn processes, but only the built `loki` binary and
-    `harness/zebrad`, with fully formed argv lists chosen from a fixed table in runner.py.
+    `ths mine`, with fully formed argv lists chosen in runner.py.
     A request names a step; it never supplies a path, a flag, or an argument. See
     runner.py for the sandbox, port and teardown guarantees.
 
-Everything /api/evidence returns is from a RECORDED run and is labelled as such. The only
-live reading anywhere is /api/node, which asks a local node for its block count and is
-reported separately so it can never be mistaken for the recorded payment.
+Everything /api/evidence returns is from a RECORDED run and is labelled as such. The /notes live probe is reported separately from its historical evidence. The account
+UI runs real stages against THS.
 """
 
 from __future__ import annotations
@@ -226,38 +225,20 @@ def build_evidence() -> dict:
 
 
 def probe_node(timeout: float = 0.6) -> dict:
-    """Ask for the block count of a node on 18232. Read-only, and clearly separate.
-
-    Note the port: 18232 is where the SHELL SCRIPTS put a node, not where the account UI
-    puts its sandbox (18242). This probe exists for the /notes page, to say whether a
-    script-started chain happens to be up. It will correctly report "no node" while the
-    sandbox chain is running, because that is a different chain on a different port.
-
-    It is the one live reading in the demo, reported on its own so it can never be
-    confused with the recorded payment: a reachable node says nothing about whether the
-    recorded transaction is on it.
-    """
-    import urllib.error
-    import urllib.request
-
-    body = json.dumps({"jsonrpc": "2.0", "id": 1,
-                       "method": "getblockcount", "params": []}).encode()
-    req = urllib.request.Request(
-        "http://127.0.0.1:18232/", data=body,
-        headers={"Content-Type": "application/json"},
-    )
+    """Probe the selected THS chain separately from historical experiment evidence."""
+    from ths import THS
+    endpoint = None
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            tip = json.loads(r.read()).get("result")
-        return {"reachable": True, "tip": tip, "endpoint": "127.0.0.1:18232",
-                "provenance": "live",
-                "note": "A node answered just now. This says nothing about whether the "
-                        "recorded transaction is on this chain."}
-    except (urllib.error.URLError, OSError, ValueError, TimeoutError) as e:
-        return {"reachable": False, "endpoint": "127.0.0.1:18232", "provenance": "live",
-                "reason": type(e).__name__,
-                "note": "No local regtest node is answering. The recorded results below "
-                        "are unaffected; they came from an earlier run."}
+        chain = THS()
+        endpoint = chain.rpc_address
+        chain.check()
+        return {"reachable": True, "tip": chain.rpc("getblockcount", timeout=timeout),
+                "endpoint": endpoint, "provenance": "live",
+                "note": "A THS node answered. This does not establish inclusion of a recorded payment."}
+    except Exception as error:
+        return {"reachable": False, "endpoint": endpoint, "provenance": "live",
+                "reason": str(error),
+                "note": "Selected THS instance unavailable; historical evidence is unaffected."}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -357,7 +338,7 @@ def main() -> int:
         print("  WARNING: the loki binary is not built. Run: cd poc && cargo build")
     print(f"  reading only: {', '.join(str(p.relative_to(POC)) for p in SOURCES.values())}")
     print(f"  loopback only. Runs the prototype in a sandbox: {RUNNER_SANDBOX}")
-    print("  ctrl-c to stop; the sandbox chain stops with it")
+    print("  ctrl-c to stop the demo; the external THS instance keeps running")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

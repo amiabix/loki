@@ -1,5 +1,9 @@
 # Second-device finishing on the G1-TX path
 
+> Historical experiment record. Node build/configuration details below describe the
+> original run. Current local-chain setup uses THS; see [harness/README.md](harness/README.md)
+> and [THS-RESULTS.md](THS-RESULTS.md) for current instructions and evidence.
+
 ## Both paths mined and verified. This is not full G1, not G3, and not custody readiness.
 
 Date 2026-10-03. Regtest, NU6.3 (Ironwood). One 2-of-3 FROST vault, two payments, two

@@ -1,153 +1,67 @@
-# Loki account demo
+# Loki account demo on THS
 
-Two things on one local server:
+The `/` account UI runs the real Loki prototype against a selected external THS
+regtest chain. `/notes` shows historical results, separately from a live THS probe.
+This remains a research demonstration, not custody software.
 
-- **`/`** — the **account**: a 2-of-3 multisig interface that runs the real prototype
-  against a throwaway chain, and lets you try to slip an altered transaction past a signer.
-- **`/notes`** — a written walkthrough of an earlier recorded run.
+## Start
 
-It is a demo of a 2-of-3 Ironwood FROST transaction, **not a usable custody wallet**.
+Install THS and Docker as described in [../harness/README.md](../harness/README.md).
+In one terminal:
 
-## Start it
-
-```
-cd poc && cargo build          # once: the UI runs this binary, it will not compile for you
-python3 poc/demo/server.py     # → http://127.0.0.1:8787
+```sh
+ths --name loki start --no-open --port-offset 10
 ```
 
-No dependencies beyond the Python standard library. If port 8787 is taken the server says
-so and exits; pass another: `python3 poc/demo/server.py 8788`.
+In another terminal, from `poc/`:
 
-## Using it
-
-The root page is the **account**: owners, balance, a transaction queue, history.
-
-**Overview** carries a setup checklist. Each item runs a real stage against the sandbox:
-create the account (2-of-3 key generation), start the test network, scan for funds, prepare
-signing material, create the transaction. The whole sequence takes a few minutes, most of it
-mining and generating the Halo 2 proof.
-
-**Queue** shows the pending transaction with a confirmation counter. Expand *What exactly is
-being signed* to see what an owner is agreeing to: recipient, amount, memo, change, fee, the
-coin being spent, expiry. Sign as each owner in turn; at 2 of 2 the Execute button lights up
-and proves, broadcasts and mines.
-
-**Security tests** is the part worth playing with. Pick a field and the account rebuilds the
-pending transaction with that one thing changed, hands it to Alice, and shows what she does.
-A tile goes green only when **both** conditions hold: she rejected it *and* no signature file
-was produced. A rejection that still produced one shows as `GOT THROUGH ✗`.
-
-Run the **honest control** too. Until you have seen an owner accept a correct transaction, a
-rejection proves nothing: an owner that rejects everything would score full marks.
-
-The honest candidate and Alice's unspent nonces are snapshotted at `propose` and restored
-before every case, so the experiments are repeatable and independent. Without that, re-running
-`commit` would rotate her commitments and every case would reject on a stale randomiser rather
-than on the field under test.
-
-## The sandbox
-
-| | |
-|---|---|
-| writes only to | `poc/demo/.sandbox` — a constant, never derived from a request |
-| chain port | **18242**, not 18232, so it cannot collide with or be mistaken for a script-started node |
-| zebrad config | generated into the sandbox; `harness/zebrad-regtest.toml` is never read or written |
-| process control | the zebrad child is held as an object and only that object is signalled — no `pkill`, no pattern match |
-| concurrency | one run at a time; a second request while busy is refused, not queued |
-| teardown | `atexit` + SIGINT/SIGTERM, plus an explicit stop. **`kill -9` on the server orphans the chain** — nothing can prevent that; use `pgrep -f "harness/zebrad -c"` to find it |
-| shell | none. `subprocess` with fully formed argv lists, never `shell=True` |
-
-A request names a step from a fixed table and, for tamper, a case from a fixed set. It never
-supplies a path, a flag, or an argument. `{"step":"rm -rf /"}` returns
-`unknown step 'rm -rf /'`.
-
-**Delete the sandbox** from the page, or `rm -rf poc/demo/.sandbox`. The reset refuses to
-delete anything whose resolved path is not exactly that directory.
-
-## What the /notes page reads
-
-Exactly four files, resolved once at startup and checked by exact path on every read:
-
-```
-poc/RESULTS.md
-poc/SECOND-DEVICE-RESULTS.md
-poc/g3/G3-RESULTS.md
-poc/DEPENDENCIES.md
+```sh
+cargo build
+LOKI_THS_INSTANCE=loki python3 demo/server.py
 ```
 
-Every transaction id, height, `rk`, `alpha`, sighash and refusal reason on the page is
-extracted from those documents at request time and carries the file it came from. A value
-the extractor cannot find renders as **"not recorded"** rather than being filled in.
+Open `http://127.0.0.1:8787`. Pass a different demo port if needed, for example
+`python3 demo/server.py 8788`. The server does not compile Loki or start THS.
 
-## What it will not do
+## Account flow
 
-These are properties of `server.py`, not promises:
+Create the vault, then **Connect to THS and fund the vault**. The runner discovers
+endpoints with `ths endpoints`, verifies active NU6.3 regtest, and requests two
+confirmed equal-value faucet notes. Scan, prepare nonces, and propose. Alice and
+Carol approve; Execute aggregates, proves, broadcasts, mines three blocks through
+THS, and verifies the mined effects against the intent.
 
-- **No state directories, ever.** It cannot open a member directory, a key package, a
-  nonce file, a note secret, or a run state directory. The allowlist above is the whole
-  set of readable files.
-- **No arbitrary paths.** Static assets are served from a fixed map of exact request paths
-  to exact files. There is no path join from request data anywhere in the file, so there
-  is no traversal to defend against. `/../RESULTS.md`, `/static/../server.py` and
-  `/etc/passwd` all return 404.
-- **Loopback only.** `HOST` is `127.0.0.1` and there is no flag to change it.
-- **No shell.** The runner does spawn processes, but only the built `loki` binary and
-  `harness/zebrad`, with fully formed argv lists chosen from a fixed table in `runner.py`.
-  Never `shell=True`.
+Security tests restore the honest candidate and unused test nonces before each
+case. A refusal requires no share; the honest control must accept. This intentional
+nonce restoration is an experiment facility, not crash/rollback safety.
 
-## Recorded, not live
+`POST /api/run` returning `started: true` means the task was accepted, not completed.
+Poll `/api/state` and inspect Console for the outcome. The chain indicator reports
+live reachability of the attached THS node, not a remembered startup result.
 
-This applies to `/notes`, not the account UI, where everything you see is a run you just
-started. Everything substantive on the **walkthrough** page is from a **recorded** run and is badged as such.
-There is exactly one live reading in the whole demo: `GET /api/node` asks a local node on
-`127.0.0.1:18232` for its block count, and the page shows it under a separate **Live
-check** badge with the explicit note that a reachable node says nothing about whether the
-recorded transaction is on it.
+## Ownership
 
-No approval is ever animated, no progress bar fills, and selecting a stage reveals what
-that stage recorded rather than playing it out.
+Loki writes account state only under `poc/demo/.sandbox`, a fixed path never supplied
+by a web request. THS owns Docker resources, node configuration, and chain state.
+**Disconnect THS**, sandbox reset, and server shutdown preserve that environment.
+Reset deletes only the fixed Loki sandbox. Stop THS in its own terminal when done.
 
-## Why the UI does not call the shell scripts
+The instance name comes from `LOKI_THS_INSTANCE` at server startup (default `loki`).
+All discovered HTTP services must bind loopback. No request supplies a path,
+instance, flag, or shell command. Commands run with argument lists and no shell.
+The faucet uses explicit idempotency keys; its CLI compatibility issue is recorded
+in [../THS-ISSUES.md](../THS-ISSUES.md).
 
-The runner reimplements the sequence rather than invoking `run-regtest.sh` or
-`run-second-device.sh`, because those scripts are fine in a terminal and not fine behind a
-web request. Four reasons, all still true of the scripts:
+Static assets have a fixed URL-to-file map. `/notes` evidence is read only from
+`RESULTS.md`, `SECOND-DEVICE-RESULTS.md`, `g3/G3-RESULTS.md`, and `DEPENDENCIES.md`.
+The separate `/api/node` probe asks the selected THS environment; a reachable node
+says nothing about inclusion of a historical recorded transaction.
 
-| hazard | where |
-|---|---|
-| `pkill -f 'zebrad -c harness'` matches on a command line, so it kills any `zebrad` on the machine, including one unrelated to this prototype | `run-regtest.sh:25`, `run-second-device.sh:58` |
-| `rm -rf "$STATE"` where `$STATE` comes from the `LOKI_STATE` environment variable, so the path to delete is caller supplied | `run-regtest.sh:27`, `run-second-device.sh:60` |
-| the scripts rewrite the tracked file `harness/zebrad-regtest.toml` in place to inject a mining address | `run-regtest.sh:36-39`, `run-second-device.sh:67-69` |
-| `run-regtest.sh` does not check that port 18232 is free before starting a node on it (`run-second-device.sh` does) | `run-second-device.sh:52` |
+## Check
 
-`runner.py` does each of those things instead: its own sandbox directory, its own generated
-config, its own port with a pre-flight check, a held process object rather than a pattern
-kill, guaranteed teardown, and a single-run lock. The shell scripts are unchanged and remain
-the way to run the full flow, including the second-device paths the UI does not cover.
-
-## Files
-
-```
-demo/server.py           stdlib HTTP server: static assets and the JSON API
-demo/runner.py           the sandboxed runner: steps, process control, teardown
-demo/static/wallet.html  the account UI
-demo/static/wallet.css   its visual system
-demo/static/wallet.js    thin client: names a step, polls state, renders the runner's events
-demo/static/index.html   the written walkthrough at /notes
-demo/static/app.css      the shared visual system
-demo/static/app.js       walkthrough rendering
+```sh
+python3 -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-## One change outside demo/
-
-`Rpc::regtest()` in `src/rpc.rs` reads `LOKI_RPC`, defaulting to the previous hard-coded
-`127.0.0.1:18232`. Without it the CLI could only talk to the default port and the sandbox
-could not have one of its own. Six call sites in `src/bin/loki.rs` now use it. Every
-existing script behaves exactly as before.
-
-## Checking it
-
-```
-curl -s localhost:8787/api/evidence | python3 -m json.tool | head -40
-curl -s -o /dev/null -w '%{http_code}\n' 'localhost:8787/../RESULTS.md'   # 404
-```
+Run this from `poc/`. Browser and live THS checks are described in
+[../THS-RESULTS.md](../THS-RESULTS.md).

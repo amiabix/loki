@@ -18,13 +18,29 @@
 # implemented nowhere. Full G1 stays BLOCKED on that. This establishes nothing about G3,
 # nothing about recovery, and nothing about custody readiness.
 set -uo pipefail
+unset LOKI_ROUND
 cd "$(dirname "$0")"
 
-STATE="${LOKI_STATE:-/tmp/loki-2dev}"
-BOB="${BOB_STATE:-/tmp/loki-2dev-bob}"
-ATTIC="${ATTIC:-/tmp/loki-2dev-attic}"
-CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/loki}"
-export CARGO_TARGET_DIR
+RUN_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/loki-2dev.XXXXXX")
+STATE="${LOKI_STATE:-$RUN_ROOT/state}"
+BOB="${BOB_STATE:-$RUN_ROOT/bob}"
+ATTIC="${ATTIC:-$RUN_ROOT/attic}"
+RESULTS="$RUN_ROOT/results.txt"
+export LOKI_THS_INSTANCE="${LOKI_THS_INSTANCE:-loki}"
+LOKI_RPC=$(python3 ths.py address) || exit 1
+export LOKI_RPC
+for path in "$STATE" "$BOB" "$ATTIC"; do
+  if [ -e "$path" ]; then echo "refusing existing state path: $path" >&2; exit 1; fi
+done
+python3 - "$STATE" "$BOB" "$ATTIC" <<'CHECK_PATHS' || exit 1
+from pathlib import Path
+import sys
+paths = [Path(value).resolve() for value in sys.argv[1:]]
+for index, first in enumerate(paths):
+    for second in paths[index + 1:]:
+        if first == second or first in second.parents or second in first.parents:
+            raise SystemExit("state, finisher, and attic paths must be separate: %s, %s" % (first, second))
+CHECK_PATHS
 
 loki() { cargo run --quiet --bin loki -- "$@"; }
 # Run a stage and abort on failure. Piping into `sed` would otherwise discard the exit
@@ -38,43 +54,15 @@ step() {
   if [ $rc -ne 0 ]; then echo "   STAGE FAILED: $label (rc=$rc)"; return 1; fi
   return 0
 }
-rpc() {
-  curl -s -X POST -H 'Content-Type: application/json' \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$1\",\"params\":${2:-[]}}" \
-    http://127.0.0.1:18232/
-}
+rpc() { python3 ths.py rpc "$1" "${2:-[]}"; }
 height() { rpc getblockcount | python3 -c 'import json,sys;print(json.load(sys.stdin)["result"])'; }
-mine_to() { local t=$1; until [ "$(height)" -ge "$t" ]; do sleep 2; done; }
+mine_to() { python3 ths.py mine 3; }
 
-cleanup() { [ -n "${ZPID:-}" ] && kill "$ZPID" 2>/dev/null || true; }
-trap cleanup EXIT
-
-if lsof -nP -iTCP:18232 -sTCP:LISTEN >/dev/null 2>&1; then
-  echo "port 18232 is already in use; stop the other zebrad first" >&2
-  exit 1
-fi
-
-echo "== 0. a fresh regtest chain and a funded 2-of-3 vault =="
-pkill -f 'zebrad -c harness' 2>/dev/null || true
-sleep 2
-rm -rf "$STATE" "$BOB" "$ATTIC"
-loki setup "$STATE" >/dev/null
-VAULT=$(loki address "$STATE")
-echo "   vault $VAULT"
-
-python3 - "$VAULT" <<'PY'
-import io, re, sys
-p = 'harness/zebrad-regtest.toml'
-s = io.open(p).read()
-s = re.sub(r"miner_address = '[^']*'", "miner_address = '%s'" % sys.argv[1], s)
-io.open(p, 'w').write(s)
-PY
-
-harness/zebrad -c harness/zebrad-regtest.toml start > /tmp/zebrad-2dev.log 2>&1 &
-ZPID=$!
-for _ in $(seq 1 40); do sleep 2; rpc getblockcount | grep -q result && break; done
-mine_to 20
-loki scan "$STATE" | tail -4
+echo "== a funded 2-of-3 vault on THS =="
+loki setup "$STATE" >/dev/null || exit 1
+VAULT=$(loki address "$STATE") || exit 1
+python3 ths.py fund "$VAULT" 2 || exit 1
+loki scan "$STATE" | tail -4 || exit 1
 [ -s "$STATE/public/funded_note_alt.txt" ] || { echo "need two vault notes"; exit 1; }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -123,7 +111,7 @@ run_payment() {
 
   echo "-- both approver apps close, and their state is MOVED OUT OF REACH"
   mkdir -p "$ATTIC"
-  mv "$STATE" "$ATTIC/state_$ROUND"
+  mv "$STATE" "$ATTIC/state_$ROUND" || return 1
   if [ -e "$STATE" ]; then echo "   FAILED to move approver state aside"; return 1; fi
   echo "   $STATE no longer exists; only $REPLICA remains"
   echo "   replica contents:"
@@ -138,18 +126,18 @@ run_payment() {
   TXID=$(printf '%s\n' "$OUT" | tail -1)
 
   echo "-- mine it"
-  mine_to $(( $(height) + 3 ))
+  mine_to $(( $(height) + 3 )) || return 1
   loki verify-effects "$REPLICA" "$TXID" | sed 's/^/   /' || {
     echo "   effects did NOT match the approved intent"; mv "$ATTIC/state_$ROUND" "$STATE"; return 1; }
 
   # Alice and Carol come back only so the next payment can be proposed. The finish above
   # already happened without them.
-  mv "$ATTIC/state_$ROUND" "$STATE"
-  echo "$ROUND path=$PATHNAME txid=$TXID" >> /tmp/loki-2dev-results.txt
+  mv "$ATTIC/state_$ROUND" "$STATE" || return 1
+  echo "$ROUND path=$PATHNAME txid=$TXID" >> "$RESULTS"
   return 0
 }
 
-: > /tmp/loki-2dev-results.txt
+: > "$RESULTS"
 
 echo
 echo "== Bob's starting state =="
@@ -195,8 +183,7 @@ check_fails() {
 }
 
 # A replica carrying an approver's scan output must be rejected: that is the whole point.
-cp "$ATTIC/../loki-2dev/public/funded_note.txt" "$BOB/replica_p2/funded_note.txt" 2>/dev/null \
-  || cp "$STATE/public/funded_note.txt" "$BOB/replica_p2/funded_note.txt"
+cp "$STATE/public/funded_note.txt" "$BOB/replica_p2/funded_note.txt"
 check_fails "replica carries an approver scan file " \
   cargo run --quiet --bin loki -- finish-second "$BOB/replica_p2" "$BOB/work_reject"
 rm -f "$BOB/replica_p2/funded_note.txt"
@@ -221,7 +208,7 @@ check_local "posted final tx does not parse        " \
 # A posted final transaction that parses perfectly but belongs to a DIFFERENT intent.
 # Payment 2's mined transaction is substituted into payment 1's replica. Bob must notice
 # that it does not spend the nullifier payment 1's intent names, and must notice it LOCALLY.
-P2=$(grep '^p2 ' /tmp/loki-2dev-results.txt | sed 's/.*txid=//')
+P2=$(grep '^p2 ' "$RESULTS" | sed 's/.*txid=//')
 rm -rf "$BOB/replica_wrongtx"; cp -R "$BOB/replica_p1" "$BOB/replica_wrongtx"
 rpc getrawtransaction "[\"$P2\"]" \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"])' \
@@ -237,7 +224,7 @@ check_fails "payment 1 broadcast a second time     " \
 
 echo
 echo "== results =="
-cat /tmp/loki-2dev-results.txt | sed 's/^/   /'
+cat "$RESULTS" | sed 's/^/   /'
 echo
 if [ $FAILS -ne 0 ]; then
   echo "$FAILS failure case(s) were NOT refused"

@@ -236,42 +236,14 @@
     <div class="runsplit">
       <div>
         <p class="prose">
-          These are the real commands. The account UI at <a href="/">the root of this
-          server</a> runs the same sequence from a browser, against an isolated sandbox.
-          It does not call these scripts, and the reason is specific rather than cautious:
-          the scripts do four things that are fine in a terminal and not fine behind a web
-          request.
+          These documents record earlier experiments. The current scripts and account UI
+          attach to a named THS regtest environment started by the developer. THS owns the
+          chain, faucet, and mining; Loki owns its account, signing, and proof construction.
         </p>
-        <ul class="hazards">
-          <li>
-            <code>pkill -f 'zebrad -c harness'</code> matches on a command line, so it would
-            kill any <code>zebrad</code> on the machine, including one that has nothing to do
-            with this prototype.
-            <span class="src">run-regtest.sh:25 · run-second-device.sh:58</span>
-          </li>
-          <li>
-            <code>rm -rf "$STATE"</code> where <code>$STATE</code> comes from the
-            <code>LOKI_STATE</code> environment variable, so the path to delete is caller
-            supplied.
-            <span class="src">run-regtest.sh:27 · run-second-device.sh:60</span>
-          </li>
-          <li>
-            It rewrites the tracked file <code>harness/zebrad-regtest.toml</code> in place to
-            inject a mining address, leaving the working tree modified.
-            <span class="src">run-regtest.sh:36-39 · run-second-device.sh:67-69</span>
-          </li>
-          <li>
-            <code>run-regtest.sh</code> does not check that port 18232 is free before starting
-            a node on it. <code>run-second-device.sh</code> does.
-            <span class="src">run-second-device.sh:52</span>
-          </li>
-        </ul>
         <p class="prose prose-tight">
-          <code>demo/runner.py</code> does each of those things instead of calling the
-          scripts: its own sandbox directory, its own generated config, its own port with a
-          pre-flight check, a held process object rather than a pattern kill, teardown on
-          every exit path, and a single-run lock. The scripts are unchanged and remain the
-          way to run the parts the UI does not cover, such as second-device finishing.
+          Start THS with <code>ths --name loki start --no-open --port-offset 10</code>, then
+          select it with <code>LOKI_THS_INSTANCE=loki</code>. Resetting or disconnecting
+          the account UI preserves THS. See <code>poc/harness/README.md</code> for setup.
         </p>
       </div>
       <div class="cmds" id="cmds"></div>

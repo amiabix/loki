@@ -50,7 +50,7 @@
       <h1 id="viewTitle">Overview</h1>
       <div class="topbar-right">
         <span class="statepill" id="statePill">idle</span>
-        <button class="btn btn-ghost" id="stopChain" type="button">Stop network</button>
+        <button class="btn btn-ghost" id="stopChain" type="button">Disconnect THS</button>
         <button class="btn btn-ghost danger" id="reset" type="button">Reset</button>
       </div>
     </header>
@@ -64,14 +64,14 @@
           <div class="card stat"><span class="k">Balance</span><strong id="sBal">—</strong><span class="s" id="sBalS">not scanned</span></div>
           <div class="card stat"><span class="k">Threshold</span><strong>2 of 3</strong><span class="s">any two owners can spend</span></div>
           <div class="card stat"><span class="k">Queue</span><strong id="sQueue">0</strong><span class="s" id="sQueueS">no pending transaction</span></div>
-          <div class="card stat"><span class="k">Test network</span><strong id="sNet">down</strong><span class="s" id="sNetS">regtest, port 18242</span></div>
+          <div class="card stat"><span class="k">Test network</span><strong id="sNet">down</strong><span class="s" id="sNetS">external THS regtest</span></div>
         </div>
 
         <div class="card">
           <div class="card-head"><h2>Set up this account</h2></div>
           <p class="note">
-            Each action below runs the real prototype against a throwaway chain in
-            <code>poc/demo/.sandbox</code>. Nothing is simulated.
+            Each action runs Loki against your selected THS regtest instance. Account files
+            live in <code>poc/demo/.sandbox</code>; THS owns the chain.
           </p>
           <ol class="setup" id="setup"></ol>
         </div>

@@ -17,7 +17,7 @@ const short = (s, a = 10, b = 8) => (!s ? '—' : s.length <= a + b + 1 ? s : `$
 
 const SETUP = [
   { id: 'setup',       t: 'Create the account',  d: '2-of-3 key generation across three devices' },
-  { id: 'start-chain', t: 'Start the test network', d: 'a throwaway regtest chain, mines to height 20' },
+  { id: 'start-chain', t: 'Connect to THS and fund the vault', d: 'uses the named running THS regtest instance' },
   { id: 'scan',        t: 'Scan for funds',      d: 'trial-decrypts every shielded output' },
   { id: 'commit',      t: 'Prepare signing material', d: 'each owner publishes single-use nonce commitments' },
   { id: 'propose',     t: 'Create the transaction', d: 'one candidate per possible pair of signers' },
@@ -104,7 +104,7 @@ function renderHome() {
     ? (W.status === 'executed' ? 'last transaction executed' : `${W.confirmations} of ${W.threshold} confirmations`)
     : 'no pending transaction';
   $('sNet').textContent = S.chain_running ? `block ${S.tip ?? '…'}` : 'down';
-  $('sNetS').textContent = S.chain_running ? 'regtest, port 18242' : 'start it in step 2';
+  $('sNetS').textContent = S.chain_running ? `THS ${S.ths_instance}, port ${S.rpc_port}` : 'start THS, then connect in step 2';
 
   const b = $('banner');
   b.className = 'banner';
@@ -392,7 +392,7 @@ for (const b of $('nav').children) b.onclick = () => show(b.dataset.view);
 $('clearLog').onclick = () => $('console').replaceChildren();
 $('stopChain').onclick = () => run('stop-chain');
 $('reset').onclick = () => {
-  if (!confirm('Delete the sandbox account and stop the test network?')) return;
+  if (!confirm('Delete the local Loki sandbox account? THS will keep running.')) return;
   VERDICTS = {}; run('reset');
 };
 
