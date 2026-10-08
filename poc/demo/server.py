@@ -3,10 +3,10 @@
 
 Loopback-only and deliberately narrow. It exposes three things:
 
-  GET  /                 the account UI: run Loki stages against the selected THS chain
+  GET  /                 the account UI: run Loki stages against a demo-owned THS chain
   GET  /notes            the written walkthrough of the recorded run
   GET  /api/evidence     numbers extracted from an ALLOWLIST of public result files
-  GET  /api/node         whether the selected THS regtest node answers
+  GET  /api/node         whether the demo-owned THS regtest node answers
   GET  /api/state        sandbox runner state and its event buffer
   POST /api/run          start one named step from a fixed list (see runner.py)
 
@@ -19,7 +19,7 @@ What it will not do, by construction rather than by convention:
     There is no path join from request data anywhere in this file.
   * It binds 127.0.0.1. There is no option to bind anything else.
   * It runs no SHELL. The runner does spawn processes, but only the built `loki` binary and
-    `ths mine`, with fully formed argv lists chosen in runner.py.
+    fixed THS, Docker inspection, and process inspection commands.
     A request names a step; it never supplies a path, a flag, or an argument. See
     runner.py for the sandbox, port and teardown guarantees.
 
@@ -30,6 +30,7 @@ UI runs real stages against THS.
 from __future__ import annotations
 
 import json
+import fcntl
 import re
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -225,11 +226,12 @@ def build_evidence() -> dict:
 
 
 def probe_node(timeout: float = 0.6) -> dict:
-    """Probe the selected THS chain separately from historical experiment evidence."""
-    from ths import THS
+    """Probe the demo-owned chain separately from historical experiment evidence."""
     endpoint = None
     try:
-        chain = THS()
+        chain = RUNNER.ths
+        if not chain or RUNNER.network.ended:
+            raise RuntimeError("start the demo test network first")
         endpoint = chain.rpc_address
         chain.check()
         return {"reachable": True, "tip": chain.rpc("getblockcount", timeout=timeout),
@@ -238,7 +240,7 @@ def probe_node(timeout: float = 0.6) -> dict:
     except Exception as error:
         return {"reachable": False, "endpoint": endpoint, "provenance": "live",
                 "reason": str(error),
-                "note": "Selected THS instance unavailable; historical evidence is unaffected."}
+                "note": "Demo THS instance unavailable; historical evidence is unaffected."}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -324,6 +326,14 @@ def main() -> int:
         print("missing result files:", *missing, sep="\n  ", file=sys.stderr)
         return 1
 
+    lock = (DEMO / ".sandbox-server.lock").open("a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("another demo server already owns this sandbox; stop it first", file=sys.stderr)
+        lock.close()
+        return 1
+
     try:
         srv = ThreadingHTTPServer((HOST, port), Handler)
     except OSError as e:
@@ -338,13 +348,18 @@ def main() -> int:
         print("  WARNING: the loki binary is not built. Run: cd poc && cargo build")
     print(f"  reading only: {', '.join(str(p.relative_to(POC)) for p in SOURCES.values())}")
     print(f"  loopback only. Runs the prototype in a sandbox: {RUNNER_SANDBOX}")
-    print("  ctrl-c to stop the demo; the external THS instance keeps running")
+    RUNNER.active = True
+    RUNNER.recover()
+    print("  Start test network launches a dedicated THS instance and funds the vault")
+    print("  ctrl-c stops the demo and deletes its THS instance with ths stop")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\nstopped")
     finally:
+        RUNNER.shutdown()
         srv.server_close()
+        lock.close()
     return 0
 
 

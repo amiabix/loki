@@ -6,7 +6,14 @@ install/start Docker, and run `ths doctor`. `ths pull` prepares the exact runtim
 images selected by the installed launcher. There is no standalone node binary
 or Loki-owned node configuration to build or copy.
 
-## Start and select an instance
+## Browser demo
+
+From `poc/`, build Loki and run `python3 demo/server.py`. Create the account and
+click **Start the test network**; the browser runner starts and manages its own
+THS instance. Stop network, Reset, and graceful server exit delete that environment
+through `ths stop`. See [../demo/README.md](../demo/README.md).
+
+## Start and select an instance for terminal harnesses
 
 ```sh
 ths --name loki start --no-open --port-offset 10
@@ -31,8 +38,6 @@ cargo build
 ./run-regtest.sh
 ./tamper-tests.sh
 ./run-second-device.sh
-# Or start the account UI:
-python3 demo/server.py
 ```
 
 The shared `ths.py` adapter validates endpoint metadata, requires HTTP on
@@ -58,9 +63,9 @@ checks and moves approver state aside before finishing each payment.
 
 CLI state is created in fresh temporary directories and retained for inspection.
 `LOKI_STATE`, `BOB_STATE`, and `ATTIC` overrides must name new, separate paths.
-No chain harness deletes caller-supplied state or stops THS. Demo disconnect,
-reset, and shutdown likewise leave THS running. Stop the THS foreground process
-when finished to delete that dedicated chain. Account files contain disposable
+No terminal chain harness deletes caller-supplied state or stops THS. Stop its
+THS foreground process when finished to delete that dedicated chain. The browser
+demo manages and deletes a separate instance of its own. Account files contain disposable
 secrets and must not be committed.
 
 The historical Zebra run is recorded in `RESULTS.md` and `DEPENDENCIES.md`.

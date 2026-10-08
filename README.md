@@ -24,21 +24,30 @@ Prerequisites: Rust, Python 3, Docker, and [THS](https://github.com/zcashlabs/th
 No standalone node build or binary is required. See
 [`poc/harness/README.md`](poc/harness/README.md) for installation and lifecycle details.
 
-In one terminal, start a dedicated disposable regtest instance:
+```sh
+cd poc
+cargo build
+python3 demo/server.py          # account UI at http://127.0.0.1:8787
+```
+
+In the browser, create the account and click **Start the test network**. The demo
+launches its own named THS environment, discovers free loopback ports, waits for
+the services, and funds the vault. Stop network, Reset, and graceful server
+shutdown delete that instance using `ths --name <instance> stop`. Closing a browser
+tab leaves it running. No separate THS terminal or standalone node build is needed.
+
+For the terminal harnesses, start a separate developer-owned THS environment in
+one terminal and keep it running:
 
 ```sh
 ths --name loki start --no-open --port-offset 10
 ```
 
-Keep that terminal running. In another terminal:
+In another terminal, from `poc/`:
 
 ```sh
-cd poc
 export LOKI_THS_INSTANCE=loki
-cargo build
-python3 demo/server.py          # account UI at http://127.0.0.1:8787
 
-# Or run the CLI flows against the same THS instance:
 ./run-regtest.sh                # new vault, faucet funding, payment, mined effects
 ./run-second-device.sh          # both finishing paths and failure checks
 ./tamper-tests.sh               # specific signer refusals and zero shares
@@ -47,11 +56,11 @@ cd g3 && ./run-g3.sh             # separate browser nonce-safety drills
 
 Loki discovers RPC from `ths endpoints`, checks the active regtest branch, funds
 through the THS faucet, and mines through `ths mine`. Each CLI flow uses new
-state; a supplied `LOKI_STATE` must not already exist. The demo stores account
-state under `poc/demo/.sandbox` and connects to THS in its second setup step.
-Disconnecting or resetting the demo preserves THS. Stop THS in its terminal when
-finished; that deletes its chain. Keep THS dedicated to this experiment because
-Loki's tests fund vaults and mine blocks on it.
+state; a supplied `LOKI_STATE` must not already exist. The CLI harnesses leave their
+selected THS environment running; stop that THS terminal when finished. The
+browser demo stores its account and owned-instance record under `poc/demo/.sandbox`.
+After deleting its network, reset before a fresh run. Keep terminal-harness THS
+instances dedicated to the experiment because those flows fund vaults and mine blocks.
 
 Local THS setup and usage are documented in
 [`poc/harness/README.md`](poc/harness/README.md). Earlier result documents retain

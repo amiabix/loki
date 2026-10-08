@@ -1,25 +1,22 @@
 #!/usr/bin/env python3
-"""Sandboxed Loki stages attached to a developer-owned THS regtest instance.
+"""Sandboxed Loki stages with a dedicated, demo-owned THS regtest instance.
 
 Requests select fixed stages and tamper cases. Loki state lives only under
-`demo/.sandbox`. The runner does not launch or delete THS resources; disconnect,
-server shutdown, and account reset preserve the selected external environment.
+`demo/.sandbox`. THS manages its Docker data and launcher metadata separately.
+Explicit stop, reset, and graceful server shutdown delete only this run's instance.
 """
 
 from __future__ import annotations
 
 import atexit
-import json
 import os
 import re
 import shutil
 import signal
 import sys
-import subprocess
 import threading
 import time
 import urllib.error
-import urllib.request
 from pathlib import Path
 
 DEMO = Path(__file__).resolve().parent
@@ -31,7 +28,7 @@ STATE = SANDBOX / "state"
 SNAP = SANDBOX / "snapshot"
 
 sys.path.insert(0, str(POC))
-from ths import THS
+from managed_ths import ManagedTHS, command
 
 
 def loki_bin() -> Path | None:
@@ -61,12 +58,16 @@ TAMPER_CASES = (
 class Runner:
     def __init__(self):
         self.lock = threading.Lock()
-        self.ths: THS | None = None
+        self.cancel = threading.Event()
+        self.closing = False
+        self.active = False
+        self.worker = None
         self.events: list[dict] = []
         self.seq = 0
         self.busy: str | None = None
         self.done: set[str] = set()
-        atexit.register(self.stop_chain)
+        self.network = ManagedTHS(SANDBOX, self.emit, self.cancel)
+        atexit.register(self.shutdown)
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
                 signal.signal(sig, self._on_signal)
@@ -74,15 +75,8 @@ class Runner:
                 pass            # not on the main thread; atexit still covers teardown
 
     def _on_signal(self, signum, _frame):
-        """Disconnect from THS, then exit.
-
-        An earlier version chained to the previous handler, which for SIGTERM is the
-        integer SIG_DFL and therefore not callable. The result was a server that tore the
-        chain down and then kept running: `kill` looked like it worked, the port stayed
-        held, and the next start failed to bind. Restoring the default and re-raising is
-        the only way to get the default behaviour back.
-        """
-        self.stop_chain()
+        """Cancel the active stage, delete our THS instance, then exit."""
+        self.shutdown()
         signal.signal(signum, signal.SIG_DFL)
         os.kill(os.getpid(), signum)
 
@@ -109,29 +103,53 @@ class Runner:
             "propose": SNAP / "candidate_AC.pczt.hex",
             "sign-alice": pub / "share_AC_alice.hex",
             "sign-carol": pub / "share_AC_carol.hex",
-            "finish": pub / "mined.txt",
+            "finish": pub / "verified.txt",
         }
         return {k for k, f in marks.items() if f.exists()}
 
     def snapshot(self) -> dict:
-        tip = None
-        if self.ths:
-            try:
-                tip = self.ths.rpc("getblockcount", timeout=1.0)
-            except (urllib.error.URLError, OSError, ValueError, TimeoutError, RuntimeError):
-                tip = None
+        network = self.network.snapshot()
+        done = self.done | self.completed_on_disk()
+        if network["run_ended"]:
+            done = done & {"setup"}
+        if not network["chain_running"] or network["funding_state"] != "confirmed":
+            done.discard("start-chain")
         return {
+            **network,
             "busy": self.busy,
-            "chain_running": tip is not None,
-            "ths_instance": self.ths.name if self.ths else os.environ.get("LOKI_THS_INSTANCE", "loki"),
-            "rpc_port": int(self.ths.rpc_address.rsplit(":", 1)[1]) if self.ths else None,
-            "tip": tip,
-            "done": sorted(self.done | self.completed_on_disk()),
+            "done": sorted(done),
             "done_this_session": sorted(self.done),
             "events": self.events[-400:],
             "seq": self.seq,
             "sandbox": str(SANDBOX.relative_to(POC.parent)),
         }
+
+    @property
+    def ths(self):
+        return self.network.client
+
+    def recover(self):
+        """Finish cleanup of a run whose server could not execute its shutdown hooks."""
+        try:
+            self.network.recover()
+        except Exception as error:
+            self.emit("fail", f"previous THS cleanup failed: {error}; retry Stop network")
+
+    def shutdown(self):
+        if not self.active:
+            return
+        self.closing = True
+        self.cancel.set()
+        if self.worker and self.worker is not threading.current_thread():
+            self.worker.join(timeout=60)
+            if self.worker.is_alive():
+                self.emit("fail", "active stage did not settle before shutdown; ownership record retained")
+                return
+        try:
+            self.stop_chain()
+        except Exception as error:
+            self.emit("fail", f"THS shutdown cleanup failed: {error}; ownership record retained")
+            print(f"THS cleanup failed: {error}", file=sys.stderr)
 
     def wallet(self) -> dict:
         """The account, in multisig terms.
@@ -181,8 +199,11 @@ class Runner:
 
         # `no_funds` is a distinct state from `no_transaction`: an account can exist
         # without having been scanned, and saying "funded" then would be a plain lie.
-        if mined.get("txid"):
+        verified = (pub / "verified.txt").exists()
+        if mined.get("txid") and verified:
             status = "executed"
+        elif mined.get("txid"):
+            status = "submitted"
         elif confirmations >= 2:
             status = "ready"
         elif intent:
@@ -205,7 +226,9 @@ class Runner:
             "transaction": intent or None,
             "confirmations": confirmations,
             "status": status,
-            "executed": mined or None,
+            "executed": mined if verified else None,
+            "broadcast": mined or None,
+            "run_ended": self.network.ended,
         }
 
     # ── process plumbing ────────────────────────────────────────────────────
@@ -220,14 +243,9 @@ class Runner:
         env = self.ths.env() if self.ths else dict(os.environ)
         env.pop("LOKI_ROUND", None)
         if label not in ("setup",) and args[0] in ("scan", "propose", "finish", "verify-effects") and not self.ths:
-            self.emit("fail", "connect to THS first")
+            self.emit("fail", "start the test network first")
             return False
-        try:
-            p = subprocess.run([str(exe), *args], cwd=str(POC), timeout=timeout,
-                               capture_output=True, text=True, env=env)
-        except subprocess.TimeoutExpired:
-            self.emit("fail", f"{label}: timed out after {timeout}s")
-            return False
+        p = self.cli_command(exe, args, env, timeout)
         for line in (p.stdout or "").splitlines():
             if line.strip():
                 self.emit("out", line.rstrip())
@@ -239,6 +257,9 @@ class Runner:
             return False
         return True
 
+    def cli_command(self, exe, args, env, timeout):
+        return command([str(exe), *args], self.cancel, timeout, cwd=str(POC), env=env)
+
     # ── steps ───────────────────────────────────────────────────────────────
 
     def step_start_chain(self) -> bool:
@@ -246,13 +267,12 @@ class Runner:
         if not addr_file.exists():
             self.emit("fail", "run setup first so THS can fund the vault")
             return False
-        chain = THS()
-        chain.check()
-        self.emit("info", f"connected to THS {chain.name}, RPC {chain.rpc_address}")
-        for funded in chain.fund(addr_file.read_text().strip(), 2):
-            self.emit("ok", f"THS faucet confirmed {funded['txid']}")
-        self.ths = chain
-        self.emit("ok", f"THS ready at height {chain.rpc('getblockcount')}")
+        if loki_bin() is None:
+            self.emit("fail", "the loki binary is not built. Run: cd poc && cargo build")
+            return False
+        self.network.start()
+        self.network.fund(addr_file.read_text().strip())
+        self.emit("ok", "test network and vault funding are ready; scan for funds next")
         return True
 
     def step_setup(self) -> bool:
@@ -260,8 +280,10 @@ class Runner:
         if not self.run_cli(["setup", str(STATE)], "setup", timeout=120):
             return False
         exe = loki_bin()
-        p = subprocess.run([str(exe), "address", str(STATE)], cwd=str(POC),
-                           capture_output=True, text=True, timeout=60)
+        env = dict(os.environ)
+        env.pop("LOKI_RPC", None)
+        env.pop("LOKI_ROUND", None)
+        p = self.cli_command(exe, ["address", str(STATE)], env, 60)
         addr = (p.stdout or "").strip()
         if p.returncode != 0 or not addr:
             self.emit("fail", "could not read the vault address")
@@ -278,11 +300,10 @@ class Runner:
             return False
         self.emit("cmd", f"loki scan {STATE}")
         if not self.ths:
-            self.emit("fail", "connect to THS first")
+            self.emit("fail", "start the test network first")
             return False
         env = self.ths.env()
-        p = subprocess.run([str(exe), "scan", str(STATE)], cwd=str(POC), env=env,
-                           capture_output=True, text=True, timeout=300)
+        p = self.cli_command(exe, ["scan", str(STATE)], env, 300)
         for line in (p.stdout or "").splitlines():
             if line.strip():
                 self.emit("out", line.rstrip())
@@ -333,10 +354,9 @@ class Runner:
         same as a block containing them, and a mined transaction is not the same as the
         payment that was approved. Both are checked here.
         """
-        if not self.run_cli(["finish", str(STATE)], "finish", timeout=900):
-            return False
-
         mined = STATE / "public" / "mined.txt"
+        if not mined.exists() and not self.run_cli(["finish", str(STATE)], "finish", timeout=900):
+            return False
         if not mined.exists():
             self.emit("fail", "finish did not record a txid")
             return False
@@ -349,7 +369,7 @@ class Runner:
             return False
 
         self.emit("info", f"broadcast {txid}; mining three blocks through THS")
-        self.ths.mine(3)
+        self.network.mine(3)
         for _ in range(120):
             try:
                 tx = self.ths.rpc("getrawtransaction", [txid, 1], timeout=3.0) or {}
@@ -360,16 +380,20 @@ class Runner:
                 self.emit("ok", f"MINED at height {tx.get('height')}, "
                                 f"{conf} confirmation(s): {txid}")
                 break
-            time.sleep(2)
+            if self.cancel.wait(2):
+                raise RuntimeError("execution cancelled")
         else:
             self.emit("fail", f"{txid} was accepted but no block confirmed it within 240s")
             return False
 
         # The effects check reads the chain, not any local file.
         self.emit("info", "verifying the mined transaction against the approved intent")
-        return self.run_cli(
+        verified = self.run_cli(
             ["verify-effects", str(STATE / "public"), txid], "verify-effects", timeout=300,
         )
+        if verified:
+            (STATE / "public" / "verified.txt").write_text(f"txid={txid}\n")
+        return verified
 
     def restore_honest(self):
         pub = STATE / "public"
@@ -442,10 +466,9 @@ class Runner:
     # ── teardown ────────────────────────────────────────────────────────────
 
     def stop_chain(self):
-        if self.ths:
-            self.emit("info", f"disconnected from THS {self.ths.name}; its services remain running")
-        self.ths = None
+        self.network.stop()
         self.done.discard("start-chain")
+        return True
 
     def step_reset(self) -> bool:
         self.stop_chain()
@@ -457,12 +480,15 @@ class Runner:
         if target.exists():
             shutil.rmtree(target)
         self.done.clear()
-        self.emit("ok", f"removed {target.relative_to(POC.parent)}; nothing else was touched")
+        self.network = ManagedTHS(SANDBOX, self.emit, self.cancel)
+        self.emit("ok", f"removed {target.relative_to(POC.parent)} and its owned THS environment")
         return True
 
     # ── dispatch ────────────────────────────────────────────────────────────
 
     def start(self, step: str, arg: str | None = None) -> dict:
+        if self.closing:
+            return {"started": False, "reason": "demo server is shutting down"}
         if not self.lock.acquire(blocking=False):
             return {"started": False, "reason": f"busy with {self.busy}"}
 
@@ -476,7 +502,7 @@ class Runner:
             "sign-carol": lambda: self.step_review_sign("carol"),
             "finish": self.step_finish,
             "honest-control": self.step_honest_control,
-            "stop-chain": lambda: (self.stop_chain(), True)[1],
+            "stop-chain": self.stop_chain,
             "reset": self.step_reset,
         }
         if step == "tamper":
@@ -490,12 +516,21 @@ class Runner:
             self.lock.release()
             return {"started": False, "reason": f"unknown step {step!r}"}
 
+        try:
+            reason = self.refusal(step)
+        except Exception as error:
+            self.lock.release()
+            return {"started": False, "reason": str(error)}
+        if reason:
+            self.lock.release()
+            return {"started": False, "reason": reason}
+
         self.busy = label
         self.emit("step", f"── {label} ──")
 
         def work():
             try:
-                if fn():
+                if fn() and not self.cancel.is_set():
                     self.done.add(label)
                     self.emit("done", f"{label} finished")
                 else:
@@ -506,8 +541,40 @@ class Runner:
                 self.busy = None
                 self.lock.release()
 
-        threading.Thread(target=work, daemon=True).start()
+        self.worker = threading.Thread(target=work, daemon=True)
+        self.worker.start()
         return {"started": True, "step": label}
+
+    def refusal(self, step):
+        if step in ("reset", "stop-chain"):
+            return None
+        if self.network.ended:
+            return "this network has ended; reset the demo before starting a fresh run"
+        done = self.done | self.completed_on_disk()
+        if step == "setup":
+            return "account already exists; reset before creating another" if "setup" in done else None
+        if step == "start-chain":
+            return None if "setup" in done else "create the account first"
+        if not self.ths or not self.network.probe():
+            return "start the test network first; it must be live before running account stages"
+        if self.network.funding_state != "confirmed":
+            return "vault funding is not confirmed; check the Overview before proceeding"
+        prerequisite = {
+            "scan": "setup", "commit": "scan", "propose": "commit",
+            "sign-alice": "propose", "sign-carol": "propose",
+            "finish": "sign-carol", "tamper": "propose", "honest-control": "propose",
+        }.get(step)
+        if prerequisite and prerequisite not in done:
+            return f"run {prerequisite} first"
+        if step == "finish" and "sign-alice" not in done:
+            return "Alice and Carol must both sign before execution"
+        if step in ("commit", "propose") and "propose" in done:
+            return "a transaction already exists; reset before replacing its signing material"
+        if step in ("scan", "sign-alice", "sign-carol", "tamper", "honest-control") and (STATE / "public" / "mined.txt").exists():
+            return "a transaction is already broadcast; execute it to verify the original payment"
+        if step in ("sign-alice", "sign-carol", "finish", "tamper", "honest-control") and "finish" in done:
+            return "this transaction has already been executed; reset before a fresh run"
+        return None
 
 
 RUNNER = Runner()

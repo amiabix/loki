@@ -16,8 +16,8 @@ const zec = (z) => (z == null ? '—' : (z / 1e8).toLocaleString(undefined, { ma
 const short = (s, a = 10, b = 8) => (!s ? '—' : s.length <= a + b + 1 ? s : `${s.slice(0, a)}…${s.slice(-b)}`);
 
 const SETUP = [
-  { id: 'setup',       t: 'Create the account',  d: '2-of-3 key generation across three devices' },
-  { id: 'start-chain', t: 'Connect to THS and fund the vault', d: 'uses the named running THS regtest instance' },
+  { id: 'setup',       t: 'Create the account',  d: 'creates three local FROST shares and the test vault address' },
+  { id: 'start-chain', t: 'Start the test network', d: 'launches a dedicated THS instance and funds this vault' },
   { id: 'scan',        t: 'Scan for funds',      d: 'trial-decrypts every shielded output' },
   { id: 'commit',      t: 'Prepare signing material', d: 'each owner publishes single-use nonce commitments' },
   { id: 'propose',     t: 'Create the transaction', d: 'one candidate per possible pair of signers' },
@@ -35,18 +35,40 @@ const CASES = {
   'sapling': 'add a Sapling output',
 };
 
-let W = null, S = null, LAST = 0, VERDICTS = {}, PENDING = null, VIEW = 'home';
+let W = null, S = null, LAST = 0, VERDICTS = {}, PENDING = null, VIEW = 'home', FAILURE = null;
 
 /* ── calls ───────────────────────────────────────────────────────────────── */
 
 async function run(step, cse) {
-  const r = await fetch('/api/run', {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(cse ? { step, case: cse } : { step }),
-  });
-  const j = await r.json();
-  if (!j.started) line({ kind: 'fail', text: `not started: ${j.reason}` });
-  return j.started;
+  try {
+    const r = await fetch('/api/run', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(cse ? { step, case: cse } : { step }),
+    });
+    if (!r.ok) throw new Error(`server returned ${r.status}`);
+    const j = await r.json();
+    FAILURE = j.started ? null : `Could not start: ${j.reason}`;
+    if (FAILURE) line({ kind: 'fail', text: FAILURE });
+    draw();
+    return j.started;
+  } catch (error) {
+    FAILURE = `Could not reach the demo server: ${error.message}`;
+    line({ kind: 'fail', text: FAILURE });
+    draw();
+    return false;
+  }
+}
+
+function stageReady(step) {
+  if (S.busy || !S.loki_built || S.run_ended) return false;
+  const done = new Set(S.done);
+  if (step === 'setup') return !done.has('setup');
+  if (step === 'start-chain') return done.has('setup') && S.funding_state !== 'uncertain';
+  if (!S.chain_running || S.funding_state !== 'confirmed') return false;
+  if (step === 'scan') return done.has('setup') && !done.has('propose');
+  if (step === 'commit') return done.has('scan') && !done.has('propose');
+  if (step === 'propose') return done.has('commit') && !done.has('propose');
+  return done.has('propose') && !done.has('finish') && (!W.broadcast || step === 'finish');
 }
 
 function line(e) {
@@ -81,7 +103,8 @@ function renderSide() {
   sys.replaceChildren();
   for (const [cls, txt] of [
     [S.loki_built ? 'go' : 'bad', S.loki_built ? 'prototype built' : 'not built: cargo build'],
-    [S.chain_running ? 'go' : '', S.chain_running ? `network up · block ${S.tip ?? '…'}` : 'network down'],
+    [S.chain_running ? 'go' : S.network_state === 'failed' ? 'bad' : '',
+      S.chain_running ? `THS running · block ${S.tip ?? '…'}` : `network ${S.network_state || 'stopped'}`],
     [S.busy ? 'wait' : '', S.busy ? `running ${S.busy}` : 'idle'],
   ]) {
     const d = el('div'); d.append(el('i', cls), el('span', null, txt)); sys.append(d);
@@ -89,7 +112,7 @@ function renderSide() {
   const sp = $('statePill');
   sp.textContent = S.busy ? `running · ${S.busy}` : 'idle';
   sp.classList.toggle('busy', !!S.busy);
-  $('stopChain').disabled = !!S.busy || !S.chain_running;
+  $('stopChain').disabled = !!S.busy || !S.can_stop;
   $('reset').disabled = !!S.busy;
 }
 
@@ -97,25 +120,40 @@ function renderSide() {
 
 function renderHome() {
   $('sBal').textContent = W.balance_zat != null ? zec(W.balance_zat) : '—';
-  $('sBalS').textContent = W.balance_zat != null
+  $('sBalS').textContent = S.run_ended ? 'previous run · network deleted' : W.balance_zat != null
     ? `${W.note.value_zat ? zec(W.note.value_zat) + ' selected to spend' : 'scanned'}` : 'not scanned yet';
   $('sQueue').textContent = W.transaction && W.status !== 'executed' ? '1' : '0';
   $('sQueueS').textContent = W.transaction
     ? (W.status === 'executed' ? 'last transaction executed' : `${W.confirmations} of ${W.threshold} confirmations`)
     : 'no pending transaction';
-  $('sNet').textContent = S.chain_running ? `block ${S.tip ?? '…'}` : 'down';
-  $('sNetS').textContent = S.chain_running ? `THS ${S.ths_instance}, port ${S.rpc_port}` : 'start THS, then connect in step 2';
+  $('sNet').textContent = S.chain_running ? `block ${S.tip ?? '…'}` : (S.network_state || 'stopped');
+  $('sNetS').textContent = S.chain_running ? `THS regtest · RPC ${S.rpc_port}`
+    : S.run_ended ? 'run ended · reset to start again' : 'start it in step 2';
+  $('fundingStatus').textContent = {
+    not_started: 'Vault funding: not started', funding: `Vault funding: ${S.funding?.length || 0} of 2 confirmed`,
+    confirmed: 'Vault funding: 2 ZEC confirmed', uncertain: 'Vault funding: uncertain · reset required',
+    failed: 'Vault funding: failed',
+  }[S.funding_state] || 'Vault funding: not started';
+  $('networkDetail').textContent = S.ths_instance
+    ? `Instance: ${S.ths_instance}${S.endpoints?.rpc ? ` · RPC: ${S.endpoints.rpc}` : ''}`
+    : 'The demo will start and manage its own THS environment.';
 
   const b = $('banner');
   b.className = 'banner';
   b.replaceChildren();
-  const msg = {
+  const issue = FAILURE || S.network_error || S.funding_error;
+  const msg = issue ? ['bad', issue] : S.run_ended
+    ? ['', 'This run has ended and its test network was deleted. Reset to start a fresh run.']
+    : S.network_state === 'starting' ? ['wait', 'Starting THS. Service startup and image downloads appear in Console.']
+    : S.funding_state === 'funding' ? ['wait', 'THS is running. Funding the vault through the faucet…']
+    : {
     no_account: ['', 'No account yet. Work down the list below; each step runs the real prototype.'],
     no_funds: ['', 'Account created. It holds nothing until the network is running and the chain has been scanned.'],
     no_transaction: ['', 'Account is funded. Create a transaction to see it enter the queue.'],
     awaiting_confirmations: ['wait', `Waiting on signatures: ${W.confirmations} of ${W.threshold}.`],
     ready: ['go', `Threshold met: ${W.confirmations} of ${W.threshold} owners have signed. Ready to execute.`],
     executed: ['go', 'Transaction executed and mined.'],
+    submitted: ['wait', 'Transaction broadcast. Execute will mine and verify this same transaction.'],
   }[W.status] ?? ['', ''];
   // `classList.add('')` throws, and two of the five statuses carry no tone. Leaving this
   // unguarded aborted the whole Overview render at this line.
@@ -135,9 +173,10 @@ function renderHome() {
     const li = el('li', busy ? 'busy' : done ? 'done' : '');
     const mid = el('div');
     mid.append(el('div', 't', s.t), el('div', 'd', s.d));
-    const btn = el('button', 'btn btn-sm' + (done ? ' btn-ghost' : ''), busy ? 'running…' : done ? 'run again' : 'Run');
+    const btn = el('button', 'btn btn-sm' + (done ? ' btn-ghost' : ''),
+      busy ? 'running…' : done ? (s.id === 'start-chain' ? 'Check network' : 'Done') : 'Run');
     btn.type = 'button';
-    btn.disabled = !!S.busy || !S.loki_built;
+    btn.disabled = !stageReady(s.id);
     btn.onclick = () => run(s.id);
     li.append(mid, btn);
     list.append(li);
@@ -218,13 +257,13 @@ function renderQueue() {
     const b = el('button', 'btn btn-sm' + (o.confirmed_ac ? ' btn-ghost' : ''),
       o.confirmed_ac ? `${o.name} signed` : `Sign as ${o.name}`);
     b.type = 'button';
-    b.disabled = !!S.busy || o.confirmed_ac;
+    b.disabled = !stageReady(`sign-${o.name}`) || o.confirmed_ac;
     b.onclick = () => run(`sign-${o.name}`);
     acts.append(b);
   }
   const ex = el('button', 'btn btn-sm', 'Execute');
   ex.type = 'button';
-  ex.disabled = !!S.busy || W.confirmations < W.threshold;
+  ex.disabled = !stageReady('finish') || W.confirmations < W.threshold;
   ex.title = W.confirmations < W.threshold ? 'needs two signatures' : 'prove, broadcast and mine';
   ex.onclick = () => run('finish');
   acts.append(ex);
@@ -294,7 +333,7 @@ function renderOwners() {
 /* ── security ────────────────────────────────────────────────────────────── */
 
 function renderSecurity() {
-  const ready = S.done.includes('propose');
+  const ready = stageReady('tamper');
   $('secNote').textContent = ready
     ? 'Run the honest control too. Until you have seen an owner accept a correct transaction, a rejection proves nothing: an owner that rejects everything would score full marks.'
     : 'Create a transaction first (Overview, steps 1 to 5).';
@@ -383,16 +422,33 @@ async function poll() {
       fetch('/api/state').then((r) => r.json()),
     ]);
     W = w; S = s;
-  } catch { return; }
-  for (const e of S.events) if (e.seq > LAST) { LAST = e.seq; line(e); noteVerdict(e); }
+  } catch {
+    if (S) {
+      S.chain_running = false;
+      S.network_state = 'failed';
+      S.network_error = 'Demo server is unreachable. Restart it to inspect this run.';
+      draw();
+    }
+    return;
+  }
+  if (S.seq < LAST) { LAST = 0; FAILURE = null; VERDICTS = {}; }
+  for (const e of S.events) if (e.seq > LAST) {
+    LAST = e.seq;
+    if (e.kind === 'step') FAILURE = null;
+    if (e.kind === 'fail') FAILURE = e.text;
+    if (e.kind === 'stop' && !FAILURE) FAILURE = e.text;
+    line(e); noteVerdict(e);
+  }
   draw();
 }
 
 for (const b of $('nav').children) b.onclick = () => show(b.dataset.view);
 $('clearLog').onclick = () => $('console').replaceChildren();
-$('stopChain').onclick = () => run('stop-chain');
+$('stopChain').onclick = () => {
+  if (confirm('Stop and delete this run’s THS network? Reset will be required before a fresh run.')) run('stop-chain');
+};
 $('reset').onclick = () => {
-  if (!confirm('Delete the local Loki sandbox account? THS will keep running.')) return;
+  if (!confirm('Delete this run’s THS instance and local Loki account?')) return;
   VERDICTS = {}; run('reset');
 };
 

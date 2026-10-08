@@ -236,14 +236,15 @@
     <div class="runsplit">
       <div>
         <p class="prose">
-          These documents record earlier experiments. The current scripts and account UI
-          attach to a named THS regtest environment started by the developer. THS owns the
-          chain, faucet, and mining; Loki owns its account, signing, and proof construction.
+          These documents record earlier experiments. The account UI starts its own
+          dedicated THS regtest environment. THS supplies the chain, faucet, and mining;
+          Loki owns its account, signing, and proof construction.
         </p>
         <p class="prose prose-tight">
-          Start THS with <code>ths --name loki start --no-open --port-offset 10</code>, then
-          select it with <code>LOKI_THS_INSTANCE=loki</code>. Resetting or disconnecting
-          the account UI preserves THS. See <code>poc/harness/README.md</code> for setup.
+          Build Loki, run <code>python3 demo/server.py</code> from <code>poc/</code>,
+          and click Start the test network. Stop, reset, and server shutdown delete that
+          owned instance with <code>ths stop</code>. The terminal harnesses still use an
+          externally started THS instance; see <code>poc/harness/README.md</code> for setup.
         </p>
       </div>
       <div class="cmds" id="cmds"></div>

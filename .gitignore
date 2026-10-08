@@ -8,6 +8,7 @@ poc/g3/node_modules/
 # The demo's sandbox. Contains generated FROST key packages and nonce secrets for a
 # throwaway regtest account. Never commit it.
 poc/demo/.sandbox/
+poc/demo/.sandbox-server.lock
 
 # Any run state directory: member key packages, nonce secrets, note secrets.
 /tmp/loki-*
