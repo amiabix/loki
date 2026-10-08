@@ -2,7 +2,7 @@
 
 > Historical experiment record. Node build/configuration details below describe the
 > original run. Current local-chain setup uses THS; see [harness/README.md](harness/README.md)
-> and [THS-RESULTS.md](THS-RESULTS.md) for current instructions and evidence.
+> for current local-chain instructions.
 
 ## Both paths mined and verified. This is not full G1, not G3, and not custody readiness.
 

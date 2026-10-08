@@ -2,7 +2,7 @@
 
 > Historical experiment record. Node build/configuration details below describe the
 > original run. Current local-chain setup uses THS; see [harness/README.md](harness/README.md)
-> and [THS-RESULTS.md](THS-RESULTS.md) for current instructions and evidence.
+> for current local-chain instructions.
 
 Date: 2026-10-03 · Host: macOS 27 aarch64 · `rustc 1.95.0 (59807616e 2026-04-14)`
 

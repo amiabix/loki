@@ -48,8 +48,8 @@ THS mines to its treasury. Loki funds its vault with 1 ZEC faucet transfers,
 using `/api/v1/faucet/address` with a stable idempotency key. The tamper and
 second-process tests request two equal-value notes. The app must report confirmed
 funding with a block hash before Loki scans; retrying the same vault's request
-uses the same key. This API path works around the installed THS 0.3.0 faucet CLI
-mismatch documented in [../THS-ISSUES.md](../THS-ISSUES.md).
+uses the same key. The harness supplies the idempotency key directly through
+the app API.
 
 After Loki broadcasts, `ths --name loki mine 3` mines confirmations; Loki reads
 back and decrypts the transaction to verify its approved effects. No continuous
@@ -64,5 +64,5 @@ when finished to delete that dedicated chain. Account files contain disposable
 secrets and must not be committed.
 
 The historical Zebra run is recorded in `RESULTS.md` and `DEPENDENCIES.md`.
-Current THS evidence is in [../THS-RESULTS.md](../THS-RESULTS.md). These runs
-establish G1-TX only; full G1, physical-device safety, and custody remain unproven.
+The prototype remains G1-TX only; full G1, physical-device safety, and custody
+remain unproven.

@@ -49,8 +49,7 @@ Reset deletes only the fixed Loki sandbox. Stop THS in its own terminal when don
 The instance name comes from `LOKI_THS_INSTANCE` at server startup (default `loki`).
 All discovered HTTP services must bind loopback. No request supplies a path,
 instance, flag, or shell command. Commands run with argument lists and no shell.
-The faucet uses explicit idempotency keys; its CLI compatibility issue is recorded
-in [../THS-ISSUES.md](../THS-ISSUES.md).
+The runner funds through the THS app API using explicit idempotency keys.
 
 Static assets have a fixed URL-to-file map. `/notes` evidence is read only from
 `RESULTS.md`, `SECOND-DEVICE-RESULTS.md`, `g3/G3-RESULTS.md`, and `DEPENDENCIES.md`.
@@ -63,5 +62,5 @@ says nothing about inclusion of a historical recorded transaction.
 python3 -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-Run this from `poc/`. Browser and live THS checks are described in
-[../THS-RESULTS.md](../THS-RESULTS.md).
+Run this from `poc/`. To exercise the live chain flows, use the commands in
+[../harness/README.md](../harness/README.md).

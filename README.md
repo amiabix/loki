@@ -53,10 +53,9 @@ Disconnecting or resetting the demo preserves THS. Stop THS in its terminal when
 finished; that deletes its chain. Keep THS dedicated to this experiment because
 Loki's tests fund vaults and mine blocks on it.
 
-THS observations and integration issues are recorded separately in
-[`poc/THS-RESULTS.md`](poc/THS-RESULTS.md) and
-[`poc/THS-ISSUES.md`](poc/THS-ISSUES.md). Earlier result documents retain their
-historical node details; they are not new THS runs.
+Local THS setup and usage are documented in
+[`poc/harness/README.md`](poc/harness/README.md). Earlier result documents retain
+historical node details and are not instructions for the current THS setup.
 
 ## What is here
 
