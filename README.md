@@ -79,12 +79,13 @@ poc/
   demo/                   a local account UI that drives the real prototype
   g3/                     the standalone browser nonce-safety prototype
   harness/                THS regtest setup and lifecycle instructions
-  vendor/                 orchard and zcash_primitives, patched so a caller can choose
+  vendor/                 zakura-orchard and zakura-primitives, patched so a caller can choose
                           the signing randomiser (see vendor/README.md)
 
   RESULTS.md                  G1-TX: the mined transaction and the approval checks
   SECOND-DEVICE-RESULTS.md    finishing without the approvers' files
-  DEPENDENCIES.md             the pinned library path, and the ZIP 2005 blocker
+  DEPENDENCIES.md             the current Zakura graph and dependency history
+  ZAKURA-MIGRATION-RESULTS.md  artifact compatibility and live pair/finisher evidence
   g3/G3-RESULTS.md            the browser drills, per engine
 ```
 
@@ -121,7 +122,8 @@ only the fee wrong will not build. See `RESULTS.md`.
 ## Honest limits
 
 - The account key is a **test-only** `ak || nk || rivk` splice, not ZIP 2005 derivation.
-- Regtest only, one machine, one mined note per payment and one recipient. A two-note candidate signs, proves and extracts offline, but has not been mined in the current run.
+- Regtest only, one machine and one recipient. One- and two-input payments have mined
+  with independent finishing; see [migration results](poc/ZAKURA-MIGRATION-RESULTS.md).
 - Member state is plain files with no rollback guarantee. A nonce is deleted after use,
   which is not a crash-safe consumed-nonce ledger.
 - The "second device" is a second process on the same machine reading a locally copied
@@ -131,6 +133,6 @@ only the fee wrong will not build. See `RESULTS.md`.
 
 ## Licence
 
-Not yet chosen. `poc/vendor/` contains third-party crates (`orchard`,
-`zcash_primitives`) carrying their own upstream licences; see `poc/vendor/README.md` for
-the pinned commits and the patches applied.
+Not yet chosen. `poc/vendor/` contains third-party crates (`zakura-orchard`,
+`zakura-primitives`) carrying their own upstream licences; see `poc/vendor/README.md` for
+the exact published releases, upstream licences, and patches applied.

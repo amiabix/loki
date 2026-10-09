@@ -41,8 +41,8 @@ impl Parameters for Regtest {
     ) -> Option<BlockHeight> {
         use zcash_protocol::consensus::NetworkUpgrade::*;
         match nu {
-            Overwinter | Sapling | Blossom | Heartwood | Canopy | Nu5 | Nu6 | Nu6_1
-            | Nu6_2 | Nu6_3 => Some(BlockHeight::from_u32(1)),
+            Overwinter | Sapling | Blossom | Heartwood | Canopy | Nu5 | Nu6 | Nu6_1 | Nu6_2
+            | Nu6_3 => Some(BlockHeight::from_u32(1)),
             _ => None,
         }
     }
@@ -51,10 +51,10 @@ impl Parameters for Regtest {
 /// Convert a FROST randomizer's canonical 32-byte encoding into the builder's scalar
 /// type, rejecting anything noncanonical.
 ///
-/// The two halves of the graph use different `pasta_curves` majors, so this crossing is
-/// by bytes and is checked on arrival (`DEPENDENCIES.md` finding F3).
+/// FROST exposes the randomizer as serialized bytes rather than through a public
+/// scalar getter. Keep canonical validation at that API boundary.
 pub fn alpha_from_canonical_bytes(bytes: &[u8; 32]) -> Option<pallas::Scalar> {
-    use ff_zp::PrimeField;
+    use ff::PrimeField;
     Option::from(pallas::Scalar::from_repr(*bytes))
 }
 
@@ -103,7 +103,9 @@ pub fn quote_fee<P: Parameters + Clone>(
     builder
         .add_ironwood_output::<Fe>(
             None,
-            inputs.vault_fvk.address_at(0u64, orchard::keys::Scope::Internal),
+            inputs
+                .vault_fvk
+                .address_at(0u64, orchard::keys::Scope::Internal),
             Zatoshis::ZERO,
             MemoBytes::empty(),
         )
@@ -124,14 +126,15 @@ pub fn build_candidate<P: Parameters + Clone>(
     alphas: &[pallas::Scalar],
     rng: impl rand_core_zp::CryptoRng,
 ) -> Result<zcash_primitives::transaction::builder::PcztResult<P>, String> {
-    let mut builder = DeferredPcztBuilder::new::<zcash_primitives::transaction::fees::zip317::FeeError>(
-        params.clone(),
-        BlockHeight::from_u32(inputs.target_height),
-        BundlePadding::DEFAULT,
-        BundlePadding::DEFAULT,
-    )
-    .map_err(|e| format!("deferred builder: {e:?}"))?
-    .with_expiry_height(BlockHeight::from_u32(inputs.expiry_height));
+    let mut builder =
+        DeferredPcztBuilder::new::<zcash_primitives::transaction::fees::zip317::FeeError>(
+            params.clone(),
+            BlockHeight::from_u32(inputs.target_height),
+            BundlePadding::DEFAULT,
+            BundlePadding::DEFAULT,
+        )
+        .map_err(|e| format!("deferred builder: {e:?}"))?
+        .with_expiry_height(BlockHeight::from_u32(inputs.expiry_height));
 
     // Each spend carries its own alpha and no witness. One alpha per note: every spend
     // becomes its own Orchard action with its own `rk`, so they cannot share one.
@@ -165,7 +168,9 @@ pub fn build_candidate<P: Parameters + Clone>(
     builder
         .add_ironwood_output::<zcash_primitives::transaction::fees::zip317::FeeError>(
             None,
-            inputs.vault_fvk.address_at(0u64, orchard::keys::Scope::Internal),
+            inputs
+                .vault_fvk
+                .address_at(0u64, orchard::keys::Scope::Internal),
             inputs.change,
             MemoBytes::empty(),
         )
@@ -200,11 +205,7 @@ pub fn build_tampered<P: Parameters + Clone>(
     .with_expiry_height(BlockHeight::from_u32(inputs.expiry_height));
 
     builder
-        .add_ironwood_spend_with_alpha::<Fe>(
-            inputs.vault_fvk.clone(),
-            inputs.notes[0],
-            alpha,
-        )
+        .add_ironwood_spend_with_alpha::<Fe>(inputs.vault_fvk.clone(), inputs.notes[0], alpha)
         .map_err(|e| format!("add ironwood spend: {e:?}"))?;
 
     builder
@@ -212,11 +213,15 @@ pub fn build_tampered<P: Parameters + Clone>(
         .map_err(|e| format!("add ironwood output: {e:?}"))?;
 
     let change_addr = if change_to_vault {
-        inputs.vault_fvk.address_at(0u64, orchard::keys::Scope::Internal)
+        inputs
+            .vault_fvk
+            .address_at(0u64, orchard::keys::Scope::Internal)
     } else {
         // Somewhere else entirely: still the vault's key, but an external diversifier the
         // intent's change policy does not name.
-        inputs.vault_fvk.address_at(11u64, orchard::keys::Scope::External)
+        inputs
+            .vault_fvk
+            .address_at(11u64, orchard::keys::Scope::External)
     };
 
     builder
@@ -257,33 +262,35 @@ pub fn forbidden_transparent_bundle() -> Result<zcash_transparent::pczt::Bundle,
 /// `cv` has to be a real non-small-order point, so it is derived properly; everything
 /// else is the smallest value that parses.
 pub fn forbidden_sapling_bundle() -> Result<sapling_crypto::pczt::Bundle, String> {
-    use std::collections::BTreeMap;
     use sapling_crypto::{
         pczt::{Bundle, Output},
         value::{NoteValue, ValueCommitTrapdoor},
     };
+    use std::collections::BTreeMap;
 
     // rcv = 1, the smallest canonical nonzero trapdoor. A zero trapdoor on a zero value
     // would give the identity, which `Output::parse` rejects as small order.
     let mut rcv_bytes = [0u8; 32];
     rcv_bytes[0] = 1;
-    let rcv = ValueCommitTrapdoor::from_bytes(rcv_bytes).into_option().ok_or("rcv")?;
+    let rcv = ValueCommitTrapdoor::from_bytes(rcv_bytes)
+        .into_option()
+        .ok_or("rcv")?;
     let cv = sapling_crypto::value::ValueCommitment::derive(NoteValue::from_raw(0), rcv);
 
     let output = Output::parse(
         cv.to_bytes(),
-        [0u8; 32],   // cmu: the canonical zero field element parses
-        [0u8; 32],   // ephemeral_key: opaque bytes
+        [0u8; 32], // cmu: the canonical zero field element parses
+        [0u8; 32], // ephemeral_key: opaque bytes
         vec![0u8; 580],
         vec![0u8; 80],
-        None,              // zkproof: this candidate is never meant to prove
-        None,              // recipient
-        None,              // value
-        None,              // rseed
-        Some(rcv_bytes),   // rcv: the IO Finalizer needs it to derive bsk
-        None,              // ock
-        None,              // zip32_derivation
-        None,              // user_address
+        None,            // zkproof: this candidate is never meant to prove
+        None,            // recipient
+        None,            // value
+        None,            // rseed
+        Some(rcv_bytes), // rcv: the IO Finalizer needs it to derive bsk
+        None,            // ock
+        None,            // zip32_derivation
+        None,            // user_address
         BTreeMap::new(),
     )
     .map_err(|e| format!("sapling output: {e:?}"))?;
@@ -309,11 +316,19 @@ mod tests {
     /// canonical Pallas point with even y, so arbitrary bytes will not do.
     fn a_test_fvk() -> FullViewingKey {
         let (_, public) = frost::keys::generate_with_dealer(
-            3, 2, frost::keys::IdentifierList::Default, rand_core::OsRng,
+            3,
+            2,
+            frost::keys::IdentifierList::Default,
+            rand_core::OsRng,
         )
         .expect("keygen");
-        let ak: [u8; 32] = public.verifying_key().serialize().expect("vk")
-            .as_slice().try_into().expect("32 bytes");
+        let ak: [u8; 32] = public
+            .verifying_key()
+            .serialize()
+            .expect("vk")
+            .as_slice()
+            .try_into()
+            .expect("32 bytes");
         vault::test_only_fvk(&ak).expect("a test fvk")
     }
 
@@ -359,8 +374,7 @@ mod tests {
             expiry_height: 1_152,
         };
         let fee = quote_fee(&Regtest, &inputs).expect("a fee for two spends");
-        inputs.change =
-            Zatoshis::from_u64(total - 700_000_000 - u64::from(fee)).expect("change");
+        inputs.change = Zatoshis::from_u64(total - 700_000_000 - u64::from(fee)).expect("change");
 
         let a1 = alpha_from_canonical_bytes(&[3u8; 32]).expect("alpha");
         let a2 = alpha_from_canonical_bytes(&[5u8; 32]).expect("alpha");
@@ -385,7 +399,65 @@ mod tests {
 
         let rk0 = <[u8; 32]>::from(real[0].spend().rk());
         let rk1 = <[u8; 32]>::from(real[1].spend().rk());
-        assert_ne!(rk0, rk1, "each spend is randomised separately, so rk must differ");
+        assert_ne!(
+            rk0, rk1,
+            "each spend is randomised separately, so rk must differ"
+        );
+    }
+
+    #[test]
+    fn shuffled_spends_keep_each_notes_original_alpha_by_nullifier() {
+        let fvk = a_test_fvk();
+        let notes = vec![
+            vault_note_of(&fvk, 625_000_000, 10),
+            vault_note_of(&fvk, 100_000_000, 20),
+        ];
+        let alphas = [pallas::Scalar::from(3), pallas::Scalar::from(5)];
+        let mut inputs = CandidateInputs {
+            vault_fvk: &fvk,
+            notes,
+            recipient: fvk.address_at(7u64, orchard::keys::Scope::External),
+            amount: Zatoshis::const_from_u64(700_000_000),
+            memo: MemoBytes::empty(),
+            change: Zatoshis::ZERO,
+            target_height: 100,
+            expiry_height: 1_152,
+        };
+        inputs.change =
+            Zatoshis::from_u64(25_000_000 - u64::from(quote_fee(&Regtest, &inputs).unwrap()))
+                .unwrap();
+        let ak = orchard::keys::SpendValidatingKey::from(fvk.clone());
+        let mut reordered = false;
+        for seed in 0..16 {
+            let rng = <rand_zp::rngs::StdRng as rand_core_zp::SeedableRng>::from_seed([seed; 32]);
+            let built = build_candidate(&Regtest, &inputs, &alphas, rng).unwrap();
+            let bundle = built.pczt_parts.ironwood.unwrap();
+            let indices = inputs
+                .notes
+                .iter()
+                .zip(alphas)
+                .map(|(note, alpha)| {
+                    let nf = note.nullifier(&fvk);
+                    let (index, action) = bundle
+                        .actions()
+                        .iter()
+                        .enumerate()
+                        .find(|(_, action)| action.spend().nullifier() == &nf)
+                        .unwrap();
+                    assert_eq!(*action.spend().alpha(), Some(alpha));
+                    assert_eq!(
+                        <[u8; 32]>::from(action.spend().rk()),
+                        <[u8; 32]>::from(&ak.randomize(&alpha))
+                    );
+                    index
+                })
+                .collect::<Vec<_>>();
+            reordered |= indices[0] > indices[1];
+        }
+        assert!(
+            reordered,
+            "exercise reversed real-spend order, not only insertion order"
+        );
     }
 
     /// One randomiser per note. Getting this wrong would silently reuse a randomiser
@@ -395,7 +467,10 @@ mod tests {
         let fvk = a_test_fvk();
         let inputs = CandidateInputs {
             vault_fvk: &fvk,
-            notes: vec![vault_note_of(&fvk, 625_000_000, 10), vault_note_of(&fvk, 1_000, 20)],
+            notes: vec![
+                vault_note_of(&fvk, 625_000_000, 10),
+                vault_note_of(&fvk, 1_000, 20),
+            ],
             recipient: fvk.address_at(7u64, orchard::keys::Scope::External),
             amount: Zatoshis::const_from_u64(1_000),
             memo: MemoBytes::empty(),
@@ -492,9 +567,11 @@ mod tests {
                 commitments.insert(ids[k], c);
             }
             let seed = alpha_seed(&proposal_id, (&ids[x], &ids[y]), 0);
-            let alpha_bytes = alpha_for_candidate(&seed, &commitments).unwrap().serialize();
+            let alpha_bytes = alpha_for_candidate(&seed, &commitments)
+                .unwrap()
+                .serialize();
 
-            // Cross the version boundary as canonical 32 bytes, and reject anything else.
+            // Decode the randomizer through its public canonical encoding.
             let alpha_arr: [u8; 32] = alpha_bytes.as_slice().try_into().unwrap();
             let alpha = crate::candidate::alpha_from_canonical_bytes(&alpha_arr)
                 .expect("the derived alpha is a canonical Pallas scalar");
@@ -518,9 +595,8 @@ mod tests {
             };
 
             let fee = quote_fee(&Regtest, &inputs).expect("the builder quotes a fee");
-            inputs.change = Zatoshis::const_from_u64(
-                u64::from(total) - u64::from(amount) - u64::from(fee),
-            );
+            inputs.change =
+                Zatoshis::const_from_u64(u64::from(total) - u64::from(amount) - u64::from(fee));
 
             let built = build_candidate(
                 &Regtest,
@@ -587,4 +663,3 @@ mod tests {
         assert_ne!(rks[0], rks[2]);
     }
 }
-

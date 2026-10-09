@@ -1,4 +1,82 @@
-# Loki G1 POC — checkpoint 1: pinned library path
+# Loki dependency graph
+
+## Current graph — 9 October 2026
+
+Issue #4 migrates transaction construction, signing, scanning, witness construction,
+PCZT roles, and proving to one Zakura family. Cargo aliases preserve existing Rust
+import names and APIs. The Common releases require Rust 1.91 or later.
+
+| Existing import | Exact package/version |
+| --- | --- |
+| `orchard` | `zakura-orchard 2.2.0`, local alpha patch |
+| `zcash_primitives` | `zakura-primitives 2.2.0`, local alpha delegation patch |
+| `pczt` | `zakura-pczt 0.1.0-rc4`, unmodified registry release |
+| `reddsa_frost` | `zakura-reddsa 2.2.0`, `frost` feature |
+| `pasta_curves` | `zakura-pasta-curves 2.2.0` |
+| `zcash_address`, `zcash_protocol`, `zcash_transparent` | `zakura-address`, `zakura-protocol`, `zakura-transparent` 2.2.0 |
+| `sapling_crypto` | `zakura-sapling-crypto 2.2.0` |
+| `frost_core`, `frost_rerandomized` | `frost-core`, `frost-rerandomized` exactly 3.0.0 |
+
+The locked production graph contains 20 Zakura packages: these direct packages and
+`zakura-bellman`, `zakura-bls12-381`, `zakura-equihash`, `zakura-halo2-gadgets`,
+`zakura-halo2-legacy-pdqsort`, `zakura-halo2-poseidon`, `zakura-halo2-proofs`,
+`zakura-jubjub`, `zakura-pairing`, `zakura-redjubjub`, and `zakura-sinsemilla`. All
+Common packages resolve to 2.2.0. No upstream Orchard, RedDSA, Pasta, PCZT,
+primitives, Sapling, Halo 2, Jubjub, Bellman, BLS12-381, pairing, or Sinsemilla
+package remains on normal/build edges. `tests/test_dependency_graph.py` checks this
+production closure using `cargo tree --locked --edges normal,build`; no differential
+old-graph oracle is included as a dev dependency.
+
+The published PCZT/Common manifests compose with `zcash_note_encryption 0.4.2`
+and `incrementalmerkletree 0.8.2`. The planned optional PCZT manifest patch is
+unnecessary. Intentional remaining upstream utilities include `ff/group 0.14.0`,
+`zcash_encoding 0.4.0`, `zcash_script 0.4.5`, `zcash_spec 0.2.1`, `zip32 0.2.1`,
+`f4jumble 0.1.1`, `corez 0.1.1`, serialization, hash, KDF/AEAD, and separate-member
+Ed25519/X25519 transport dependencies. These do not reintroduce a Zcash crypto family.
+
+FROST 3.0.0 retains `rand_core 0.6.4` and deterministic tests use `rand_chacha
+0.3.1`. Transactions use `rand_core 0.10.1` and `rand 0.10.3`. Zakura adapts RNGs
+internally for its FROST ciphersuite. PCZT rc4 uses an internal system RNG for IO
+finalization, proving, and extraction rather than accepting an RNG argument. No
+application entropy adapter was added. Shared Pallas types compose with `ff/group
+0.14`; the obsolete `ff_zp` alias is removed. Canonical bytes remain at saved/wire
+boundaries and where FROST exposes no scalar getter (`Randomizer::to_scalar` is
+private).
+
+`zakura-primitives` pins `crypto-common = 0.2.0-rc.1`. That conflicts with the
+stable 0.2 requirement of `chacha20poly1305 0.11.0`, so Loki uses 0.10.1, which
+also matches note encryption. This changes the Rust nonce API, not the LOKISEAL
+header, Argon2 parameters, AAD, XChaCha20-Poly1305 construction, or ciphertext
+format. An independent 0.11.0 oracle generated a sealed **public** payload;
+`MemberDir::read_sealed` opens those exact old bytes and leaves the file unchanged.
+Wrong-passphrase and authentication-tamper tests remain enforced.
+
+Compatibility evidence was captured under the old graph **before** editing dependencies:
+public-package and identifier byte round trips, old randomized-signature verification,
+three deterministic key-package serialization hashes, a redacted unproved PCZT byte
+round trip, and exact hashes of deterministic full unproved PCZT bytes. Synthetic
+private keys and complete candidates are regenerated at test runtime. Fixtures contain
+only public bytes or hashes; none contains a key package, nonce, or note secret. Actual
+CLI `commit`/`review-sign` tests reject corrupt/truncated keys and corrupt/truncated/
+unknown-version PCZTs with the expected reason, zero shares, and byte-identical key,
+nonce, commitment, and proposal state. Supported old artifacts require no regeneration.
+
+Issue #3 remained open and unmerged during this implementation. The custom
+`alpha_seed` domain separation, sorted pair identifiers, commitment binding, per-spend
+indexing, and existing signing calls are preserved. The recommended generated-seed
+API is feasible but belongs to #3; the historical statement below that it cannot be
+used is superseded. This migration adds no production deprecated signing calls.
+Payment approval, local sighash, nullifier equality, alpha/rk checks, and forbidden-pool
+checks are unchanged. Test-only payment FVK derivation and the independent, unreviewed
+ZIP 2005 setup path remain separate limitations. Fork ancestry is not audit coverage.
+
+See [migration results](ZAKURA-MIGRATION-RESULTS.md) for actual offline and live evidence,
+and [vendor provenance](vendor/README.md) for reproducible patches and checksums.
+
+## Historical checkpoint 1: pinned library path
+
+The following dated record describes the replaced graph and its original findings.
+Use the current graph above for dependencies and RNG/API composition.
 
 > Historical experiment record. Node build/configuration details below describe the
 > original run. Current local-chain setup uses THS; see [harness/README.md](harness/README.md)

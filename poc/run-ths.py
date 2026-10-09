@@ -5,24 +5,52 @@ import argparse
 import json
 from pathlib import Path
 import subprocess
+import shutil
 import tempfile
 from ths import THS
 
 
 POC = Path(__file__).resolve().parent
+PAIR_MEMBERS = {"AB": ("alice", "bob"), "AC": ("alice", "carol"), "BC": ("bob", "carol")}
 
 
 def run(argv, **kwargs):
     return subprocess.run(argv, check=True, text=True, **kwargs)
 
 
-def main():
+def finish_without_approvers(loki, state, replica, work):
+    withheld = Path(tempfile.mkdtemp(prefix="loki-approvers-withheld-"))
+    moved = []
+    try:
+        for member in ("alice", "bob", "carol"):
+            shutil.move(str(state / member), str(withheld / member))
+            moved.append(member)
+        loki("finish-second", replica, work)
+    finally:
+        failures = []
+        for member in ("alice", "bob", "carol"):
+            if member in moved or (withheld / member).exists():
+                try:
+                    shutil.move(str(withheld / member), str(state / member))
+                except OSError as error:
+                    failures.append(f"{member}: {error}")
+        if failures:
+            raise RuntimeError(f"approver state retained at {withheld}; restore failed: {'; '.join(failures)}")
+        withheld.rmdir()
+
+
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--name", required=True, help="running THS instance name")
     parser.add_argument("--tamper", action="store_true", help="run signer refusal cases")
     parser.add_argument("--finish-mode", choices=("local", "replica", "posted"), default="local")
     parser.add_argument("--state", type=Path, help="new state directory; existing paths are refused")
-    args = parser.parse_args()
+    parser.add_argument("--pair", choices=tuple(PAIR_MEMBERS), default="AB")
+    return parser.parse_args(argv)
+
+
+def main():
+    args = parse_args()
 
     chain = THS(args.name)
     chain.check()
@@ -100,31 +128,37 @@ def main():
         for path, content in snapshot.items():
             path.write_bytes(content)
 
-    for member in ("alice", "bob", "carol"):
+    for member in PAIR_MEMBERS[args.pair]:
         loki("review-sign", state, member)
+    complete = [pair for pair, members in PAIR_MEMBERS.items()
+                if all((public / f"share_{pair}_{member}.hex").is_file() for member in members)]
+    if complete != [args.pair]:
+        raise RuntimeError(f"expected only {args.pair} to be finishable, found {complete}")
 
     if args.finish_mode == "local":
-        loki("finish", state)
+        loki("finish", state, "--pair", args.pair)
         finished = public / "mined.txt"
     else:
         replica = state / "replica"
         work = state / "finisher"
         if args.finish_mode == "posted":
-            loki("post-final", state)
-        loki("replicate", state, replica, *(["--with-final"] if args.finish_mode == "posted" else []))
-        loki("finish-second", replica, work)
+            loki("post-final", state, "--pair", args.pair)
+        loki("replicate", state, replica, "--pair", args.pair, *(["--with-final"] if args.finish_mode == "posted" else []))
+        finish_without_approvers(loki, state, replica, work)
         finished = work / "self" / "finished.txt"
 
     fields = dict(line.split("=", 1) for line in finished.read_text().splitlines() if "=" in line)
+    if fields.get("pair") != args.pair:
+        raise RuntimeError(f"finisher used {fields.get('pair')}, expected {args.pair}")
     txid = fields["txid"]
     chain.mine(3)
-    loki("verify-effects", public, txid)
+    loki("verify-effects", public if args.finish_mode == "local" else replica, txid)
     transaction = rpc("getrawtransaction", [txid, 1])
     if transaction.get("confirmations", 0) < 1:
         raise RuntimeError("transaction was not confirmed")
     report = {
         "instance": args.name, "endpoints": endpoints, "funding": funding,
-        "finish_mode": args.finish_mode, "txid": txid,
+        "finish_mode": args.finish_mode, "pair": args.pair, "txid": txid,
         "height": transaction.get("height"), "confirmations": transaction["confirmations"],
         "tamper": tamper_results,
     }

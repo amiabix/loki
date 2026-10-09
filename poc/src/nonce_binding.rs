@@ -65,7 +65,12 @@ fn group() -> Group {
     .expect("2-of-3 keygen");
     let packages: BTreeMap<_, _> = shares
         .into_iter()
-        .map(|(id, ss)| (id, frost::keys::KeyPackage::try_from(ss).expect("key package")))
+        .map(|(id, ss)| {
+            (
+                id,
+                frost::keys::KeyPackage::try_from(ss).expect("key package"),
+            )
+        })
         .collect();
     let ids: Vec<_> = packages.keys().copied().take(2).collect();
     Group { packages, ids }
@@ -107,8 +112,7 @@ fn sign_one(
 ) -> Vec<u8> {
     let pkg = frost::SigningPackage::new(commitments, message);
     #[allow(deprecated)] // the seed path cannot be used: alpha is fixed by the transaction
-    let share = frost_rerandomized::sign(&pkg, nonces, &g.packages[me], a)
-        .expect("sign");
+    let share = frost_rerandomized::sign(&pkg, nonces, &g.packages[me], a).expect("sign");
     share.serialize()
 }
 
@@ -131,13 +135,15 @@ fn a2_baseline_reuse_is_detectable() {
     let mine = frost::round1::SigningNonces::new(g.packages[&me].signing_share(), &mut rng);
     let theirs = frost::round1::SigningNonces::new(g.packages[&other].signing_share(), &mut rng);
 
-    let set: BTreeMap<_, _> =
-        [(me, *mine.commitments()), (other, *theirs.commitments())].into();
+    let set: BTreeMap<_, _> = [(me, *mine.commitments()), (other, *theirs.commitments())].into();
 
     let z1 = sign_one(&g, &me, &mine, set.clone(), b"pay alice 1", alpha(7));
     let z2 = sign_one(&g, &me, &mine, set, b"pay mallory 99", alpha(7));
 
-    assert_ne!(z1, z2, "two messages over one nonce must give different shares");
+    assert_ne!(
+        z1, z2,
+        "two messages over one nonce must give different shares"
+    );
     assert_eq!(
         commitment_bytes(&mine),
         commitment_bytes(&mine),
@@ -170,12 +176,14 @@ fn a3_same_package_replay_is_byte_identical() {
         "the same package must reproduce the same commitment",
     );
 
-    let set: BTreeMap<_, _> =
-        [(me, *first.commitments()), (other, *theirs.commitments())].into();
+    let set: BTreeMap<_, _> = [(me, *first.commitments()), (other, *theirs.commitments())].into();
     let z1 = sign_one(&g, &me, &first, set.clone(), b"the-message", alpha(7));
     let z2 = sign_one(&g, &me, &again, set, b"the-message", alpha(7));
 
-    assert_eq!(z1, z2, "replaying the same package must reproduce the same share");
+    assert_eq!(
+        z1, z2,
+        "replaying the same package must reproduce the same share"
+    );
 }
 
 /// A.4 Scheme 1, a different package.
@@ -188,8 +196,16 @@ fn a4_a_different_package_changes_the_nonce() {
     let me = g.ids[0];
     let seed = [11u8; 32];
 
-    let a = bound_nonces(g.packages[&me].signing_share(), &seed, b"proposal-1|pair-AC");
-    let b = bound_nonces(g.packages[&me].signing_share(), &seed, b"proposal-2|pair-AC");
+    let a = bound_nonces(
+        g.packages[&me].signing_share(),
+        &seed,
+        b"proposal-1|pair-AC",
+    );
+    let b = bound_nonces(
+        g.packages[&me].signing_share(),
+        &seed,
+        b"proposal-2|pair-AC",
+    );
 
     assert_ne!(
         commitment_bytes(&a),
@@ -281,10 +297,8 @@ fn a6_ordered_binding_protects_only_the_second_signer() {
     };
     assert_ne!(commitment_bytes(&hi_n_1), commitment_bytes(&hi_other));
 
-    let set_1: BTreeMap<_, _> =
-        [(lo, *lo_n.commitments()), (hi, *hi_n_1.commitments())].into();
-    let set_2: BTreeMap<_, _> =
-        [(lo, *lo_n.commitments()), (hi, *hi_other.commitments())].into();
+    let set_1: BTreeMap<_, _> = [(lo, *lo_n.commitments()), (hi, *hi_n_1.commitments())].into();
+    let set_2: BTreeMap<_, _> = [(lo, *lo_n.commitments()), (hi, *hi_other.commitments())].into();
 
     let z1 = sign_one(&g, &lo, &lo_n, set_1, b"the-message", alpha(7));
     let z2 = sign_one(&g, &lo, &lo_n, set_2, b"the-message", alpha(7));

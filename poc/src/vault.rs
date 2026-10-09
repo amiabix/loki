@@ -29,8 +29,7 @@ pub const TEST_ONLY_SEED: [u8; 32] = *b"LOKI-G1-TX-TEST-ONLY-NOT-ZIP2005";
 
 /// Why a candidate group key was refused.
 ///
-/// The two `reddsa` versions in this graph can only exchange 32-byte encodings
-/// (`DEPENDENCIES.md` finding F3), so every crossing is checked rather than assumed.
+/// Saved group-key bytes must be canonical and satisfy Orchard’s key invariants.
 #[derive(Debug, PartialEq, Eq)]
 pub enum VaultKeyError {
     /// All-zero encoding: the identity point is not a valid `ak`.
@@ -60,9 +59,8 @@ fn test_only_tail() -> [u8; 64] {
 
 /// Build the G1-TX viewing key from a DKG-derived group `ak`.
 ///
-/// `group_ak` is the serialized FROST group verifying key, which crosses the crate
-/// version boundary as raw bytes. It is checked for canonicality here, on this side of
-/// that boundary, before anything is built from it.
+/// `group_ak` is the saved FROST group verifying key. Validate its canonical encoding
+/// before composing the test-only viewing key.
 ///
 /// **Test-only.** See the module docs.
 pub fn test_only_fvk(group_ak: &[u8; 32]) -> Result<FullViewingKey, VaultKeyError> {
@@ -96,23 +94,22 @@ pub fn test_only_address(fvk: &FullViewingKey) -> orchard::Address {
 
 /// Encode an Orchard receiver as a Regtest unified address.
 ///
-/// There is no Ironwood receiver typecode: `zcash_address` 0.14 knows only Orchard,
+/// There is no Ironwood receiver typecode: `zakura-address` 2.2 knows only Orchard,
 /// Sapling, P2PKH and P2SH. Ironwood reuses the Orchard receiver and the pool is chosen
 /// by the sending bundle, so one address can receive either.
 ///
 /// Regtest only. The caller is responsible for the FVK's derivation and status.
 pub fn regtest_unified_address(fvk: &FullViewingKey) -> String {
     use zcash_address::{
-        unified::{Address as Ua, Encoding, Receiver, Revision, Uitem},
+        unified::{Address as Ua, Encoding, Receiver},
         ToAddress, ZcashAddress,
     };
 
     let raw = test_only_address(fvk).to_raw_address_bytes();
-    let ua = Ua::try_from_items(Revision::R0, vec![Uitem::Data(Receiver::Orchard(raw))])
+    let ua = Ua::try_from_items(vec![Receiver::Orchard(raw)])
         .expect("one Orchard receiver is a valid unified address");
 
-    ZcashAddress::from_unified(zcash_protocol::consensus::NetworkType::Regtest, ua)
-        .to_string()
+    ZcashAddress::from_unified(zcash_protocol::consensus::NetworkType::Regtest, ua).to_string()
 }
 
 #[cfg(test)]
@@ -123,13 +120,9 @@ mod tests {
     /// A real 2-of-3 DKG group key, as the three member processes would produce it.
     fn dkg_group_ak() -> [u8; 32] {
         let rng = rand_core::OsRng;
-        let (_shares, pubkeys) = frost::keys::generate_with_dealer(
-            3,
-            2,
-            frost::keys::IdentifierList::Default,
-            rng,
-        )
-        .unwrap();
+        let (_shares, pubkeys) =
+            frost::keys::generate_with_dealer(3, 2, frost::keys::IdentifierList::Default, rng)
+                .unwrap();
         pubkeys
             .verifying_key()
             .serialize()
@@ -174,7 +167,7 @@ mod tests {
         assert_ne!(a.to_raw_address_bytes(), b.to_raw_address_bytes());
     }
 
-    /// Noncanonical encodings are refused on this side of the version boundary.
+    /// Noncanonical saved group-key encodings are refused.
     #[test]
     fn c2_noncanonical_group_keys_are_rejected() {
         assert_eq!(test_only_fvk(&[0u8; 32]), Err(VaultKeyError::Identity));
@@ -193,7 +186,6 @@ mod tests {
     }
 }
 
-
 /// Decode a unified address into the Orchard receiver this prototype can pay.
 ///
 /// The counterpart to [`regtest_unified_address`]. Only the Orchard receiver is used:
@@ -205,10 +197,11 @@ pub fn orchard_receiver_from_ua(
 ) -> Result<orchard::Address, String> {
     use zcash_address::unified::{Address as Ua, Container, Encoding, Receiver};
 
-    let (net, _revision, ua) =
-        Ua::decode(s.trim()).map_err(|e| format!("not a unified address: {e:?}"))?;
+    let (net, ua) = Ua::decode(s.trim()).map_err(|e| format!("not a unified address: {e:?}"))?;
     if net != expect {
-        return Err(format!("that address is for {net:?}, this network is {expect:?}"));
+        return Err(format!(
+            "that address is for {net:?}, this network is {expect:?}"
+        ));
     }
 
     for item in ua.items() {
@@ -231,11 +224,19 @@ mod address_tests {
     fn real_ak() -> [u8; 32] {
         use reddsa_frost::frost::redpallas as frost;
         let (_, public) = frost::keys::generate_with_dealer(
-            3, 2, frost::keys::IdentifierList::Default, rand_core::OsRng,
+            3,
+            2,
+            frost::keys::IdentifierList::Default,
+            rand_core::OsRng,
         )
         .expect("keygen");
-        public.verifying_key().serialize().expect("vk serializes")
-            .as_slice().try_into().expect("32 bytes")
+        public
+            .verifying_key()
+            .serialize()
+            .expect("vk serializes")
+            .as_slice()
+            .try_into()
+            .expect("32 bytes")
     }
 
     /// The decoder must be the exact inverse of the encoder, or the prototype would
@@ -246,7 +247,11 @@ mod address_tests {
         let ua = regtest_unified_address(&fvk);
         let back = orchard_receiver_from_ua(&ua, zcash_protocol::consensus::NetworkType::Regtest)
             .expect("the address we just printed must decode");
-        assert_eq!(back, test_only_address(&fvk), "round trip must give the same receiver");
+        assert_eq!(
+            back,
+            test_only_address(&fvk),
+            "round trip must give the same receiver"
+        );
     }
 
     #[test]
@@ -255,13 +260,19 @@ mod address_tests {
         let ua = regtest_unified_address(&fvk);
         let err = orchard_receiver_from_ua(&ua, zcash_protocol::consensus::NetworkType::Main)
             .expect_err("a regtest address must not be accepted as mainnet");
-        assert!(err.contains("network"), "the error should name the mismatch, got: {err}");
+        assert!(
+            err.contains("network"),
+            "the error should name the mismatch, got: {err}"
+        );
     }
 
     #[test]
     fn rubbish_is_refused() {
         for bad in ["", "not an address", "uregtest1zzzz"] {
-            assert!(orchard_receiver_from_ua(bad, zcash_protocol::consensus::NetworkType::Regtest).is_err());
+            assert!(
+                orchard_receiver_from_ua(bad, zcash_protocol::consensus::NetworkType::Regtest)
+                    .is_err()
+            );
         }
     }
 }

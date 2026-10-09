@@ -1,5 +1,11 @@
 # Second-device finishing on the G1-TX path
 
+9 October 2026: the Zakura migration has new mined one- and two-input payment
+evidence. See [migration results](ZAKURA-MIGRATION-RESULTS.md) for package versions,
+artifact compatibility, pair selection, and current validation. This document retains
+the historical run below.
+
+
 > Historical experiment record. Node build/configuration details below describe the
 > original run. Current local-chain setup uses THS; see [harness/README.md](harness/README.md)
 > for current local-chain instructions.

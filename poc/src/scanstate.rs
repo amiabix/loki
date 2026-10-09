@@ -106,7 +106,11 @@ impl ScanState {
     /// The same value a full chain scan returns, without having read the chain again.
     pub fn into_chain(self, fvk: &FullViewingKey) -> Result<Chain, String> {
         let notes = self.notes(fvk)?;
-        Ok(Chain { notes, cmxs: self.cmxs, tip: self.tip })
+        Ok(Chain {
+            notes,
+            cmxs: self.cmxs,
+            tip: self.tip,
+        })
     }
 
     /// Read state left by an earlier scan. A missing file is the first scan, not an error.
@@ -123,9 +127,7 @@ impl ScanState {
             let mut f = line.split_whitespace();
             match f.next() {
                 None => continue,
-                Some("tip") => {
-                    state.tip = f.next().and_then(|v| v.parse().ok()).ok_or_else(bad)?
-                }
+                Some("tip") => state.tip = f.next().and_then(|v| v.parse().ok()).ok_or_else(bad)?,
                 Some("c") => {
                     state.cmxs.push(field(&mut f).ok_or_else(bad)?);
                     state.nfs.push(field(&mut f).ok_or_else(bad)?);
@@ -146,7 +148,12 @@ impl ScanState {
                             .ok_or_else(bad)?,
                         out_ciphertext: field(&mut f).ok_or_else(bad)?,
                     };
-                    state.found.push(Found { height, txid, position, action });
+                    state.found.push(Found {
+                        height,
+                        txid,
+                        position,
+                        action,
+                    });
                 }
                 Some(_) => return Err(bad()),
             }
@@ -238,7 +245,7 @@ mod tests {
             "rk": point,
             "cmx": hex::encode(ExtractedNoteCommitment::from(note.commitment()).to_bytes()),
             "ephemeralKey": hex::encode(IronwoodDomain::epk_bytes(enc.epk()).0),
-            "encCiphertext": hex::encode(enc.encrypt_note_plaintext().0),
+            "encCiphertext": hex::encode(enc.encrypt_note_plaintext()),
             "outCiphertext": hex::encode([0u8; 80]),
         })
     }
@@ -263,7 +270,10 @@ mod tests {
             block(vec![tx("bb", vec![action_json(decoy, 2, 13)])]),
             block(vec![
                 tx("cc", vec![action_json(vault, 200, 14)]),
-                tx("dd", vec![action_json(decoy, 3, 15), action_json(vault, 300, 16)]),
+                tx(
+                    "dd",
+                    vec![action_json(decoy, 3, 15), action_json(vault, 300, 16)],
+                ),
             ]),
             block(vec![]),
         ]
@@ -293,22 +303,35 @@ mod tests {
         // separate processes would do.
         let mut part = ScanState::default();
         scan_blocks(&vault, &mut part, 3, get).unwrap();
-        let path =
-            std::env::temp_dir().join(format!("loki-scanstate-{}.txt", std::process::id()));
+        let path = std::env::temp_dir().join(format!("loki-scanstate-{}.txt", std::process::id()));
         part.save(&path).unwrap();
         let mut part = ScanState::load(&path).unwrap();
-        assert_eq!(part.tip, 3, "the state file remembers where the scan stopped");
+        assert_eq!(
+            part.tip, 3,
+            "the state file remembers where the scan stopped"
+        );
         fetched.set(0);
         scan_blocks(&vault, &mut part, 6, get).unwrap();
         std::fs::remove_file(&path).ok();
-        assert_eq!(fetched.get(), 3, "the resumed scan reads only blocks 4, 5 and 6");
+        assert_eq!(
+            fetched.get(),
+            3,
+            "the resumed scan reads only blocks 4, 5 and 6"
+        );
 
         assert_eq!(part.tip, full.tip);
-        assert_eq!(part.cmxs, full.cmxs, "the commitment streams must be identical");
+        assert_eq!(
+            part.cmxs, full.cmxs,
+            "the commitment streams must be identical"
+        );
 
         let full = full.into_chain(&vault).unwrap();
         let part = part.into_chain(&vault).unwrap();
-        assert_eq!(full.notes.len(), 3, "the fixture funds the vault three times");
+        assert_eq!(
+            full.notes.len(),
+            3,
+            "the fixture funds the vault three times"
+        );
         assert_eq!(part.notes.len(), full.notes.len());
         for (a, b) in full.notes.iter().zip(&part.notes) {
             assert_eq!(a.position, b.position);
@@ -346,7 +369,10 @@ mod tests {
         let mut fresh = ScanState::default();
         scan_blocks(&vault, &mut fresh, 3, get).unwrap();
         assert_eq!(state.tip, 3);
-        assert_eq!(state.cmxs, fresh.cmxs, "the rolled-back state is a fresh scan");
+        assert_eq!(
+            state.cmxs, fresh.cmxs,
+            "the rolled-back state is a fresh scan"
+        );
         assert_eq!(state.found.len(), fresh.found.len());
     }
 
@@ -357,8 +383,12 @@ mod tests {
         let mut chain = canned_chain(&vault, &decoy);
         let mut state = ScanState::default();
         scan_blocks(&vault, &mut state, 6, |h| {
-            chain.get(h as usize - 1).cloned().ok_or_else(|| format!("no block {h}"))
-        }).unwrap();
+            chain
+                .get(h as usize - 1)
+                .cloned()
+                .ok_or_else(|| format!("no block {h}"))
+        })
+        .unwrap();
         let spent = state.notes(&vault).unwrap()[0].nullifier;
         let path = std::env::temp_dir().join(format!("loki-spent-{}.txt", std::process::id()));
         state.save(&path).unwrap();
@@ -370,8 +400,12 @@ mod tests {
         action["nullifier"] = serde_json::json!(hex::encode(spent));
         chain.push(serde_json::json!({ "tx": [tx("spend", vec![action])] }));
         scan_blocks(&vault, &mut state, 7, |h| {
-            chain.get(h as usize - 1).cloned().ok_or_else(|| format!("no block {h}"))
-        }).unwrap();
+            chain
+                .get(h as usize - 1)
+                .cloned()
+                .ok_or_else(|| format!("no block {h}"))
+        })
+        .unwrap();
 
         let notes = state.notes(&vault).unwrap();
         assert_eq!(notes.len(), 2);

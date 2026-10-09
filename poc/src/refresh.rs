@@ -89,7 +89,10 @@ mod tests {
             .iter()
             .zip(refreshing)
             .map(|(id, rs)| {
-                (*id, refresh_share(rs, &wallets[id]).expect("fold in the zero share"))
+                (
+                    *id,
+                    refresh_share(rs, &wallets[id]).expect("fold in the zero share"),
+                )
             })
             .collect();
 
@@ -114,7 +117,12 @@ mod tests {
         msg: &[u8],
     ) -> Result<(), frost::Error> {
         sign_with(
-            &wallets.keys().copied().take(2).map(|id| (id, &wallets[&id])).collect::<Vec<_>>(),
+            &wallets
+                .keys()
+                .copied()
+                .take(2)
+                .map(|id| (id, &wallets[&id]))
+                .collect::<Vec<_>>(),
             pubkeys,
             msg,
         )
@@ -221,7 +229,12 @@ mod tests {
 
         // Aggregation checks each signature share against the refreshed verifying share,
         // so the stale one is caught by name rather than producing a bad signature.
-        assert_eq!(err, frost::Error::InvalidSignatureShare { culprits: vec![ids[0]] });
+        assert_eq!(
+            err,
+            frost::Error::InvalidSignatureShare {
+                culprits: vec![ids[0]]
+            }
+        );
     }
 
     /// And the converse, so the test above is not passing for an unrelated reason: the

@@ -50,9 +50,9 @@
 **Consumes:** Existing Loki APIs and pinned upstream Cargo.lock on the base.
 **Produces:** Public fixtures plus runtime synthetic key serialization compatibility assertions.
 
-- [ ] Read issue #3, `README.md`, `poc/THREAT-MODEL.md`, `poc/RESULTS.md`, `poc/SECOND-DEVICE-RESULTS.md`, `poc/DEPENDENCIES.md`, `poc/vendor/README.md`, and relevant tests. Save the selected original graph/provenance in the migration results document.
-- [ ] Run the full baseline `cd poc && cargo test --locked`, `cargo build --locked`, `cargo fmt --check`, and `cargo clippy --locked --all-targets` (exclude the intentional `probe-zip2005` feature). Record warnings separately from failures.
-- [ ] Generate deterministic synthetic 2-of-3 shares using `rand_chacha::ChaCha20Rng::from_seed([42; 32])` under the old graph. Capture hashes of serialized key packages and public-key-package bytes, identifiers, group key, a randomized signature and its message/alpha, and a deterministic unproved PCZT. Do not commit private key package or nonce bytes. Build the fixture generator as temporary test code before the dependency edit, and retain only non-secret fixture data and the deterministic reproduction in the final tests.
+- [x] Read issue #3, `README.md`, `poc/THREAT-MODEL.md`, `poc/RESULTS.md`, `poc/SECOND-DEVICE-RESULTS.md`, `poc/DEPENDENCIES.md`, `poc/vendor/README.md`, and relevant tests. Save the selected original graph/provenance in the migration results document.
+- [x] Run the full baseline `cd poc && cargo test --locked`, `cargo build --locked`, `cargo fmt --check`, and `cargo clippy --locked --all-targets` (exclude the intentional `probe-zip2005` feature). Record warnings separately from failures.
+- [x] Generate deterministic synthetic 2-of-3 shares using `rand_chacha::ChaCha20Rng::from_seed([42; 32])` under the old graph. Capture hashes of serialized key packages and public-key-package bytes, identifiers, group key, a randomized signature and its message/alpha, and a deterministic unproved PCZT. Do not commit private key package or nonce bytes. Build the fixture generator as temporary test code before the dependency edit, and retain only non-secret fixture data and the deterministic reproduction in the final tests.
 
 ```rust
 use rand_core::SeedableRng;
@@ -73,17 +73,17 @@ for (id, share) in shares {
 assert!(!public.serialize().unwrap().is_empty());
 ```
 
-- [ ] Use `candidate.rs`'s existing synthetic-note setup and a transaction RNG seeded deterministically to capture the old PCZT. Treat PCZTs with note secrets as sensitive: construct a redacted public fixture through `pczt::roles::redactor` if possible, or store only non-secret hashes and create the full artifact at test runtime. State exactly which bytes were checked.
-- [ ] Tests must decode old public fixtures under the migrated graph, check byte round trips and signature verification, regenerate deterministic runtime keys and compare old serialization digests, and reject malformed/corrupted saved artifacts without creating share files. For an incompatible format, document rejection and exercise CLI reads with a temporary synthetic artifact; no key replacement or nonce reset.
-- [ ] Retain the existing `c3_two_notes_become_two_spends_with_distinct_rk`, mismatch-alpha count, DKG, share-verification, refresh, and approval test cases. Add a case matching each spend by its nullifier after builder shuffling to establish alpha association independently of output order.
+- [x] Use `candidate.rs`'s existing synthetic-note setup and a transaction RNG seeded deterministically to capture the old PCZT. Treat PCZTs with note secrets as sensitive: construct a redacted public fixture through `pczt::roles::redactor` if possible, or store only non-secret hashes and create the full artifact at test runtime. State exactly which bytes were checked.
+- [x] Tests must decode old public fixtures under the migrated graph, check byte round trips and signature verification, regenerate deterministic runtime keys and compare old serialization digests, and reject malformed/corrupted saved artifacts without creating share files. For an incompatible format, document rejection and exercise CLI reads with a temporary synthetic artifact; no key replacement or nonce reset.
+- [x] Retain the existing `c3_two_notes_become_two_spends_with_distinct_rk`, mismatch-alpha count, DKG, share-verification, refresh, and approval test cases. Add a case matching each spend by its nullifier after builder shuffling to establish alpha association independently of output order.
 
 ### Task 2: Vendor Zakura and resolve a coherent package graph
 
 **Consumes:** Old fixture evidence and inspected published Zakura manifests.
 **Produces:** Locked aliased production graph and reproducible alpha patches.
 
-- [ ] Download/extract exact published Common crate sources (starting 2.2.0) and PCZT (starting 0.1.0-rc4). Record registry checksums, repository revisions when known, and package versions. Prefer self-contained published manifests to workspace-inherited Git manifests. Keep upstream licences.
-- [ ] Create `poc/vendor/zakura-orchard/` and `poc/vendor/zakura-primitives/`. Rebase the old patches on their actual builder code, not with blind text substitution. Carry over all three `loki_b2_alpha` tests.
+- [x] Download/extract exact published Common crate sources (starting 2.2.0) and PCZT (starting 0.1.0-rc4). Record registry checksums, repository revisions when known, and package versions. Prefer self-contained published manifests to workspace-inherited Git manifests. Keep upstream licences.
+- [x] Create `poc/vendor/zakura-orchard/` and `poc/vendor/zakura-primitives/`. Rebase the old patches on their actual builder code, not with blind text substitution. Carry over all three `loki_b2_alpha` tests.
 
 ```rust
 // In SpendInfo, initialized to None at every existing construction site:
@@ -93,8 +93,8 @@ let alpha = self.alpha.unwrap_or_else(|| pallas::Scalar::random(&mut rng));
 let rk = ak.randomize(&alpha);
 ```
 
-- [ ] Preserve `SpendInfo::new_with_alpha`, `unwitnessed_with_alpha`, `Builder::add_spend_unwitnessed_with_alpha(fvk, note, alpha)` and `DeferredPcztBuilder::add_ironwood_spend_with_alpha<FE>(fvk, note, alpha) -> Result<(), Error<FE>>`. The primitives method must retain the V3 note-version check and delegate through the Orchard builder; never rewrite rk on a built PCZT.
-- [ ] Replace dependencies using real package names. The initial manifest shape is:
+- [x] Preserve `SpendInfo::new_with_alpha`, `unwitnessed_with_alpha`, `Builder::add_spend_unwitnessed_with_alpha(fvk, note, alpha)` and `DeferredPcztBuilder::add_ironwood_spend_with_alpha<FE>(fvk, note, alpha) -> Result<(), Error<FE>>`. The primitives method must retain the V3 note-version check and delegate through the Orchard builder; never rewrite rk on a built PCZT.
+- [x] Replace dependencies using real package names. The initial manifest shape is:
 
 ```toml
 orchard = { package = "zakura-orchard", version = "=2.2.0" }
@@ -114,31 +114,31 @@ zakura-orchard = { path = "vendor/zakura-orchard" }
 zakura-primitives = { path = "vendor/zakura-primitives" }
 ```
 
-- [ ] Verify PCZT's actual published transitive graph. Resolve matching note-encryption and Merkle-tree versions from compiler/public-type evidence; update direct dependencies accordingly. If the selected PCZT still requires incompatible 0.4 note encryption alongside Common 0.5, vendor PCZT and patch only the manifest edge to the matching version, adding `zakura-pczt` to `[patch.crates-io]` and recording a separate patch. A later published compatible PCZT release is an alternative only after documenting exact versions and verifying its APIs/artifacts. Do not suppress type errors by retaining a second upstream crypto universe.
-- [ ] Run `cargo metadata --format-version 1` and `cargo tree --edges normal,build`. Inspect the graph for upstream orchard, reddsa, pasta_curves, primitives, PCZT, Sapling, halo2, jubjub, bellman, and corresponding proving dependencies. Document intentional remaining upstream utility/protocol crates and RNG versions. Add a focused automated production-graph assertion if useful; exclude dev-only differential oracle edges explicitly.
-- [ ] Delete old `vendor/orchard/` and `vendor/zcash_primitives/` once replaced. Regenerate patch files against clean exact downloaded releases; verify patches apply cleanly to pristine sources.
+- [x] Verify PCZT's actual published transitive graph. Resolve matching note-encryption and Merkle-tree versions from compiler/public-type evidence; update direct dependencies accordingly. If the selected PCZT still requires incompatible 0.4 note encryption alongside Common 0.5, vendor PCZT and patch only the manifest edge to the matching version, adding `zakura-pczt` to `[patch.crates-io]` and recording a separate patch. A later published compatible PCZT release is an alternative only after documenting exact versions and verifying its APIs/artifacts. Do not suppress type errors by retaining a second upstream crypto universe.
+- [x] Run `cargo metadata --format-version 1` and `cargo tree --edges normal,build`. Inspect the graph for upstream orchard, reddsa, pasta_curves, primitives, PCZT, Sapling, halo2, jubjub, bellman, and corresponding proving dependencies. Document intentional remaining upstream utility/protocol crates and RNG versions. Add a focused automated production-graph assertion if useful; exclude dev-only differential oracle edges explicitly.
+- [x] Delete old `vendor/orchard/` and `vendor/zcash_primitives/` once replaced. Regenerate patch files against clean exact downloaded releases; verify patches apply cleanly to pristine sources.
 
 ### Task 3: Adapt APIs and preserve approval and artifact handling
 
 **Consumes:** Zakura graph and rebased builders.
 **Produces:** Compiling Loki with preserved checked protocol/state boundaries.
 
-- [ ] Run `cd poc && cargo check --locked --all-targets` and fix actual API differences at their source. Align direct `ff`/`group` traits to 0.14 when types compose; remove obsolete `ff_zp` aliases only when no call site needs them.
-- [ ] Use typed `Randomizer::from_scalar`/shared scalar interfaces where public APIs permit. `Randomizer::to_scalar` is crate-private in FROST 3.0.0, so do not assume it is callable. Keep serialization where it is a genuine saved/wire/canonical-validation boundary or an API exposes no scalar getter. Remove stale comments claiming two unrelated Pallas type universes.
-- [ ] Retain `rand_core` 0.6 for FROST APIs and deterministic nonce tests, plus transaction RNG 0.10. Do not make custom entropy adapters unless an actual public API boundary requires one; Zakura already provides its internal FROST adapter.
-- [ ] Preserve current `alpha_seed` domain separation, commitment-based derivation, pair sorting, per-spend indices, local sighash, and rk verification. Existing calls to the deprecated explicit-randomizer signing API are coordinated with #3; migrate to its seed flow if merged/present, otherwise preserve behavior and document the coordination.
-- [ ] Run the compatibility tests from Task 1 and all existing Rust tests. If a fixture is incompatible, prove explicit refusal without output or file regeneration and document supported/rejected formats; do not weaken validation merely to round trip.
-- [ ] Verify two-input association through shuffled actions by nullifier, sign each real spend under the expected alpha, install witnesses/anchor afterward, prove/extract, and check the effects sighash is unchanged. Preserve mismatch count rejection and distinct rk checks.
-- [ ] Run vendor regression tests using `cargo test --manifest-path vendor/zakura-orchard/Cargo.toml --lib loki_b2`; ensure standalone vendor test resolution uses the intended family/patches.
+- [x] Run `cd poc && cargo check --locked --all-targets` and fix actual API differences at their source. Align direct `ff`/`group` traits to 0.14 when types compose; remove obsolete `ff_zp` aliases only when no call site needs them.
+- [x] Use typed `Randomizer::from_scalar`/shared scalar interfaces where public APIs permit. `Randomizer::to_scalar` is crate-private in FROST 3.0.0, so do not assume it is callable. Keep serialization where it is a genuine saved/wire/canonical-validation boundary or an API exposes no scalar getter. Remove stale comments claiming two unrelated Pallas type universes.
+- [x] Retain `rand_core` 0.6 for FROST APIs and deterministic nonce tests, plus transaction RNG 0.10. Do not make custom entropy adapters unless an actual public API boundary requires one; Zakura already provides its internal FROST adapter.
+- [x] Preserve current `alpha_seed` domain separation, commitment-based derivation, pair sorting, per-spend indices, local sighash, and rk verification. Existing calls to the deprecated explicit-randomizer signing API are coordinated with #3; migrate to its seed flow if merged/present, otherwise preserve behavior and document the coordination.
+- [x] Run the compatibility tests from Task 1 and all existing Rust tests. If a fixture is incompatible, prove explicit refusal without output or file regeneration and document supported/rejected formats; do not weaken validation merely to round trip.
+- [x] Verify two-input association through shuffled actions by nullifier, sign each real spend under the expected alpha, install witnesses/anchor afterward, prove/extract, and check the effects sighash is unchanged. Preserve mismatch count rejection and distinct rk checks.
+- [x] Run vendor regression tests using `cargo test --manifest-path vendor/zakura-orchard/Cargo.toml --lib loki_b2`; ensure standalone vendor test resolution uses the intended family/patches.
 
 ### Task 4: Prove AB, AC, BC and independent finishing on THS
 
 **Consumes:** Migrated built CLI and existing THS adapter/harnesses.
 **Produces:** Live mined payment evidence for every pair, tamper/handoff/nonce results.
 
-- [ ] Read `poc/harness/README.md`, `run-ths.py`, `run-second-device.sh`, `tamper-tests.sh`, and `nonce-reuse-drill.sh`. Inspect current `LOKI_STATE`, `LOKI_THS_INSTANCE`, `BOB_STATE`, and `ATTIC` without printing unrelated environment secrets. Select fresh paths and a dedicated THS name.
-- [ ] Diagnose Docker/THS, start only a dedicated disposable instance, and discover loopback endpoints. Verify the selected runtime image/version and NU6.3 branch `37a5165b`. If needed, start the installed Docker application; never prune shared resources or replace the node.
-- [ ] The current harness signs all members and default finishing selects AB first. Add `--pair {AB,AC,BC}` to `run-ths.py` (default AB to preserve behavior) and select only the requested pair's available shares before finishing, while allowing every member to publish its existing commitments. Exercise independent finisher access without approver secret directories. Unit-test parser/pair mapping and ensure AC/BC do not accidentally finish AB.
+- [x] Read `poc/harness/README.md`, `run-ths.py`, `run-second-device.sh`, `tamper-tests.sh`, and `nonce-reuse-drill.sh`. Inspect current `LOKI_STATE`, `LOKI_THS_INSTANCE`, `BOB_STATE`, and `ATTIC` without printing unrelated environment secrets. Select fresh paths and a dedicated THS name.
+- [x] Diagnose Docker/THS, start only a dedicated disposable instance, and discover loopback endpoints. Verify the selected runtime image/version and NU6.3 branch `37a5165b`. If needed, start the installed Docker application; never prune shared resources or replace the node.
+- [x] The current harness signs all members, while local finishing and handoffs hardcode AC. Add `--pair {AB,AC,BC}` to `run-ths.py` (default AB for the new harness option) and select only the requested pair's available shares before finishing, while allowing every member to publish its existing commitments. Thread pair selection through local finishing, posted final transactions, replication, independent finishing, and chain-effects verification; preserve AC as the historical CLI default. Exercise independent finisher access without approver secret directories. Test command plumbing and require the resulting receipt to name the selected pair.
 
 ```python
 PAIR_MEMBERS = {"AB": ("alice", "bob"), "AC": ("alice", "carol"), "BC": ("bob", "carol")}
@@ -147,7 +147,7 @@ for member in PAIR_MEMBERS[args.pair]:
     loki("review-sign", state, member)
 ```
 
-- [ ] Run the standard required harnesses and additional pair coverage:
+- [x] Run the standard required harnesses and additional pair coverage:
 
 ```sh
 cargo build --locked
@@ -159,19 +159,19 @@ python3 run-ths.py --name loki-zakura-issue4 --pair AC --finish-mode replica
 python3 run-ths.py --name loki-zakura-issue4 --pair BC --finish-mode replica
 ```
 
-- [ ] Run `nonce-reuse-drill.sh` against fresh funded/unspent disposable state, not a state whose payment already consumed its note. Assert stage A refusal/no shares and preserve stage B's measured rollback reuse limitation; its weak exit code alone does not prove stage B ran successfully. Record output observations explicitly.
-- [ ] Record actual txids, selected pair, sign-before-anchor/proof checks, unchanged sighashes, mined confirmation heights, independent finishing and nine refused tamper cases/no shares. Fee-only fixture remains unconstructible unless a genuinely equivalent test is added. Report skipped/blocked cases distinctly from passes.
-- [ ] Stop only the THS instance created for this work after validation; keep secrets and state outside tracked files.
+- [x] Run `nonce-reuse-drill.sh` against fresh funded/unspent disposable state, not a state whose payment already consumed its note. Assert stage A refusal/no shares and preserve stage B's measured rollback reuse limitation; its weak exit code alone does not prove stage B ran successfully. Record output observations explicitly.
+- [x] Record actual txids, selected pair, sign-before-anchor/proof checks, unchanged sighashes, mined confirmation heights, independent finishing and nine refused tamper cases/no shares. Fee-only fixture remains unconstructible unless a genuinely equivalent test is added. Report skipped/blocked cases distinctly from passes.
+- [ ] Stop only the THS instance created for this work after validation; keep secrets and state outside tracked files. Root owns this instance and will perform shutdown after independent validation.
 
 ### Task 5: Documentation, review, and PR delivery
 
 **Consumes:** Locked graph, fixtures, test/harness evidence.
 **Produces:** Reviewable implementation commits and PR closing #4 when all acceptance checks are satisfied.
 
-- [ ] Update `poc/DEPENDENCIES.md` with exact final package versions, matching PCZT transitive dependencies, residual upstream dependencies, RNG boundary, artifact results, and continued key-derivation limitations. Preserve dated historical findings as historical rather than presenting the old graph as current.
-- [ ] Update `poc/vendor/README.md`, root README vendor names/licences, and migration results. Record patch base revisions/checksums, paths, reproducible commands, audit provenance (fork ancestry is not audit coverage), and no intended approval-policy change.
-- [ ] Final checks: `cargo build --locked`, `cargo test --locked`, `cargo fmt --check`, `cargo clippy --locked --all-targets`, focused vendor alpha tests, relevant Python harness tests, and all Task 4 live checks. No intentional probe feature in routine checks.
-- [ ] Review the final diff against every issue requirement, including multiple-input alpha association, old artifact handling, seed-flow coordination, and production graph closure. Fix actionable findings and rerun affected checks.
+- [x] Update `poc/DEPENDENCIES.md` with exact final package versions, matching PCZT transitive dependencies, residual upstream dependencies, RNG boundary, artifact results, and continued key-derivation limitations. Preserve dated historical findings as historical rather than presenting the old graph as current.
+- [x] Update `poc/vendor/README.md`, root README vendor names/licences, and migration results. Record patch base revisions/checksums, paths, reproducible commands, audit provenance (fork ancestry is not audit coverage), and no intended approval-policy change.
+- [x] Final checks: `cargo build --locked`, `cargo test --locked`, `cargo fmt --check`, `cargo clippy --locked --all-targets`, focused vendor alpha tests, relevant Python harness tests, and all Task 4 live checks. No intentional probe feature in routine checks.
+- [x] Review the final diff against every issue requirement, including multiple-input alpha association, old artifact handling, seed-flow coordination, and production graph closure. Fix actionable findings and rerun affected checks.
 - [ ] Commit only relevant changes using Conventional Commits, for example `refactor(deps): migrate transaction and crypto stack to Zakura`. Do not stage temporary generators, synthetic secret state, registry extraction metadata secrets, or unrelated main changes.
 - [ ] Root agent independently reviews evidence, pushes `refactor/zakura-dependencies`, and creates a PR against main with a concrete behavior description, `Closes #4` when verified, actual validation results, and material limitations. PR creation is already authorized by the user; no further approval ceremony is required.
 

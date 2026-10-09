@@ -15,12 +15,12 @@
 //! an isolated patch to vendored orchard; see vendor/README.md.
 
 pub mod candidate;
-pub mod distributed_setup;
-#[cfg(test)]
-mod nonce_binding;
 #[cfg(test)]
 mod coordinator;
+pub mod distributed_setup;
 pub mod intent;
+#[cfg(test)]
+mod nonce_binding;
 pub mod refresh;
 pub mod rpc;
 pub mod scan;
@@ -75,13 +75,9 @@ mod checkpoint_1 {
     fn c1_1_frost_pallas_signs_under_a_caller_supplied_alpha() {
         let mut rng = rand_core::OsRng;
 
-        let (shares, pubkeys) = frost::keys::generate_with_dealer(
-            3,
-            2,
-            frost::keys::IdentifierList::Default,
-            rng,
-        )
-        .expect("2-of-3 keygen");
+        let (shares, pubkeys) =
+            frost::keys::generate_with_dealer(3, 2, frost::keys::IdentifierList::Default, rng)
+                .expect("2-of-3 keygen");
 
         let wallets: BTreeMap<_, _> = shares
             .into_iter()
@@ -91,10 +87,9 @@ mod checkpoint_1 {
 
         // The randomizer is OURS, not the coordinator's: on Zcash it is fixed by the
         // transaction. This is the property Loki's per-pair alpha derivation needs.
-        let alpha = frost_rerandomized::Randomizer::<frost::PallasBlake2b512>::deserialize(
-            &[7u8; 32],
-        )
-        .expect("a canonical scalar");
+        let alpha =
+            frost_rerandomized::Randomizer::<frost::PallasBlake2b512>::deserialize(&[7u8; 32])
+                .expect("a canonical scalar");
 
         let mut nonces = BTreeMap::new();
         let mut commitments = BTreeMap::new();
@@ -109,15 +104,12 @@ mod checkpoint_1 {
         let mut sigshares = BTreeMap::new();
         for id in &ids {
             #[allow(deprecated)] // the seed path cannot be used: alpha is fixed by the tx
-            let share =
-                frost_rerandomized::sign(&pkg, &nonces[id], &wallets[id], alpha).unwrap();
+            let share = frost_rerandomized::sign(&pkg, &nonces[id], &wallets[id], alpha).unwrap();
             sigshares.insert(*id, share);
         }
 
-        let params = frost_rerandomized::RandomizedParams::from_randomizer(
-            pubkeys.verifying_key(),
-            alpha,
-        );
+        let params =
+            frost_rerandomized::RandomizedParams::from_randomizer(pubkeys.verifying_key(), alpha);
         let sig = frost_rerandomized::aggregate(&pkg, &sigshares, &pubkeys, &params)
             .expect("two of three aggregate");
 
@@ -133,8 +125,7 @@ mod checkpoint_1 {
         use frost::keys::dkg;
         let rng = rand_core::OsRng;
 
-        let ids: Vec<frost::Identifier> =
-            (1u16..=3).map(|i| i.try_into().unwrap()).collect();
+        let ids: Vec<frost::Identifier> = (1u16..=3).map(|i| i.try_into().unwrap()).collect();
 
         let mut r1_secret = BTreeMap::new();
         let mut r1_pub = BTreeMap::new();
@@ -147,8 +138,11 @@ mod checkpoint_1 {
         let mut r2_secret = BTreeMap::new();
         let mut r2_pub: BTreeMap<_, BTreeMap<_, _>> = BTreeMap::new();
         for id in &ids {
-            let others: BTreeMap<_, _> =
-                r1_pub.iter().filter(|(k, _)| *k != id).map(|(k, v)| (*k, v.clone())).collect();
+            let others: BTreeMap<_, _> = r1_pub
+                .iter()
+                .filter(|(k, _)| *k != id)
+                .map(|(k, v)| (*k, v.clone()))
+                .collect();
             let (s, pkgs) = dkg::part2(r1_secret.remove(id).unwrap(), &others).unwrap();
             r2_secret.insert(*id, s);
             for (to, pkg) in pkgs {
@@ -158,10 +152,12 @@ mod checkpoint_1 {
 
         let mut group_keys = Vec::new();
         for id in &ids {
-            let others: BTreeMap<_, _> =
-                r1_pub.iter().filter(|(k, _)| *k != id).map(|(k, v)| (*k, v.clone())).collect();
-            let (_kp, pubkeys) =
-                dkg::part3(&r2_secret[id], &others, &r2_pub[id]).unwrap();
+            let others: BTreeMap<_, _> = r1_pub
+                .iter()
+                .filter(|(k, _)| *k != id)
+                .map(|(k, v)| (*k, v.clone()))
+                .collect();
+            let (_kp, pubkeys) = dkg::part3(&r2_secret[id], &others, &r2_pub[id]).unwrap();
             group_keys.push(pubkeys.verifying_key().serialize().unwrap());
         }
 
@@ -174,10 +170,8 @@ mod checkpoint_1 {
         );
     }
 
-    /// C1.2, as far as it can go — the group key crosses the crate-version boundary.
-    ///
-    /// FROST lives in reddsa 0.5.2 / pasta_curves 0.5; orchard 0.16 lives in reddsa 0.6 /
-    /// pasta_curves 0.6. The two cannot exchange typed points, only bytes. They do.
+    /// C1.2, as far as it can go: validate the saved group-key encoding and compose
+    /// the documented test-only FVK. ZIP 2005 remains a separate setup path.
     ///
     /// **This is the pre-ZIP-2005 path and the brief says it is NOT a pass for G1.**
     /// It is recorded here to show exactly how far the available APIs reach.
@@ -186,13 +180,9 @@ mod checkpoint_1 {
         use orchard::keys::{FullViewingKey, Scope, SpendingKey};
 
         let rng = rand_core::OsRng;
-        let (_shares, pubkeys) = frost::keys::generate_with_dealer(
-            3,
-            2,
-            frost::keys::IdentifierList::Default,
-            rng,
-        )
-        .unwrap();
+        let (_shares, pubkeys) =
+            frost::keys::generate_with_dealer(3, 2, frost::keys::IdentifierList::Default, rng)
+                .unwrap();
 
         // 32 bytes is the only common currency between the two crate universes.
         let group_ak: [u8; 32] = pubkeys
@@ -209,8 +199,8 @@ mod checkpoint_1 {
         let mut bytes = carrier.to_bytes();
         bytes[0..32].copy_from_slice(&group_ak);
 
-        let vault = FullViewingKey::from_bytes(&bytes)
-            .expect("the group key is a structurally valid ak");
+        let vault =
+            FullViewingKey::from_bytes(&bytes).expect("the group key is a structurally valid ak");
 
         assert_ne!(
             vault.address_at(0u64, Scope::External),
@@ -226,12 +216,12 @@ mod checkpoint_1 {
     #[test]
     fn c1_3_deferred_pczt_builder_and_ironwood_roles_resolve() {
         #[allow(unused_imports)]
-        use zcash_primitives::transaction::builder::DeferredPcztBuilder;
-        #[allow(unused_imports)]
         use pczt::{
             roles::{io_finalizer::IoFinalizer, signer::Signer},
             Pczt,
         };
+        #[allow(unused_imports)]
+        use zcash_primitives::transaction::builder::DeferredPcztBuilder;
 
         // Named so a future reader can see which symbols were confirmed present.
         fn _confirmed<P>(_: Option<DeferredPcztBuilder<P>>, _: Option<Pczt>) {}

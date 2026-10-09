@@ -37,10 +37,19 @@ fn group() -> Group {
     .expect("2-of-3 keygen");
     let packages: BTreeMap<_, _> = shares
         .into_iter()
-        .map(|(id, ss)| (id, frost::keys::KeyPackage::try_from(ss).expect("key package")))
+        .map(|(id, ss)| {
+            (
+                id,
+                frost::keys::KeyPackage::try_from(ss).expect("key package"),
+            )
+        })
         .collect();
     let ids: Vec<_> = packages.keys().copied().collect();
-    Group { packages, public, ids }
+    Group {
+        packages,
+        public,
+        ids,
+    }
 }
 
 fn alpha(byte: u8) -> frost_rerandomized::Randomizer<frost::PallasBlake2b512> {
@@ -85,18 +94,24 @@ fn co1_equivocation_does_not_aggregate() {
     let pkg_carol = frost::SigningPackage::new(commitments.clone(), b"pay mallory 99");
 
     #[allow(deprecated)]
-    let s_alice =
-        frost_rerandomized::sign(&pkg_alice, &nonces[&signers[0]], &g.packages[&signers[0]], a)
-            .expect("alice signs what she was shown");
+    let s_alice = frost_rerandomized::sign(
+        &pkg_alice,
+        &nonces[&signers[0]],
+        &g.packages[&signers[0]],
+        a,
+    )
+    .expect("alice signs what she was shown");
     #[allow(deprecated)]
-    let s_carol =
-        frost_rerandomized::sign(&pkg_carol, &nonces[&signers[1]], &g.packages[&signers[1]], a)
-            .expect("carol signs what she was shown");
+    let s_carol = frost_rerandomized::sign(
+        &pkg_carol,
+        &nonces[&signers[1]],
+        &g.packages[&signers[1]],
+        a,
+    )
+    .expect("carol signs what she was shown");
 
-    let shares: BTreeMap<_, _> =
-        [(signers[0], s_alice), (signers[1], s_carol)].into();
-    let params =
-        frost_rerandomized::RandomizedParams::from_randomizer(g.public.verifying_key(), a);
+    let shares: BTreeMap<_, _> = [(signers[0], s_alice), (signers[1], s_carol)].into();
+    let params = frost_rerandomized::RandomizedParams::from_randomizer(g.public.verifying_key(), a);
 
     // Whichever package the coordinator presents, one of the two shares was made under a
     // different one, so aggregation cannot succeed.
@@ -126,8 +141,7 @@ fn co2_one_share_is_not_enough() {
             .expect("one signer signs");
 
     let shares: BTreeMap<_, _> = [(signers[0], only_one)].into();
-    let params =
-        frost_rerandomized::RandomizedParams::from_randomizer(g.public.verifying_key(), a);
+    let params = frost_rerandomized::RandomizedParams::from_randomizer(g.public.verifying_key(), a);
 
     assert!(
         frost_rerandomized::aggregate(&pkg, &shares, &g.public, &params).is_err(),
@@ -177,8 +191,7 @@ fn co3_two_leaked_shares_spend_without_their_owners() {
         shares.insert(*id, s);
     }
 
-    let params =
-        frost_rerandomized::RandomizedParams::from_randomizer(g.public.verifying_key(), a);
+    let params = frost_rerandomized::RandomizedParams::from_randomizer(g.public.verifying_key(), a);
     let sig = frost_rerandomized::aggregate(&pkg, &shares, &g.public, &params)
         .expect("two shares are a signature");
 
@@ -207,12 +220,11 @@ fn co4_a_forged_share_is_rejected_and_the_culprit_named() {
         .expect("alice signs");
 
     // The coordinator invents carol's share by reusing alice's bytes.
-    let forged = frost::round2::SignatureShare::deserialize(&real.serialize())
-        .expect("a well-formed share");
+    let forged =
+        frost::round2::SignatureShare::deserialize(&real.serialize()).expect("a well-formed share");
 
     let shares: BTreeMap<_, _> = [(signers[0], real), (signers[1], forged)].into();
-    let params =
-        frost_rerandomized::RandomizedParams::from_randomizer(g.public.verifying_key(), a);
+    let params = frost_rerandomized::RandomizedParams::from_randomizer(g.public.verifying_key(), a);
 
     let err = frost_rerandomized::aggregate(&pkg, &shares, &g.public, &params)
         .expect_err("a forged share must be rejected");

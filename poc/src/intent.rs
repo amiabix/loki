@@ -232,13 +232,9 @@ mod tests {
     #[test]
     fn c3_each_pair_derives_a_distinct_alpha_that_a_signer_can_recompute() {
         let mut rng = rand_core::OsRng;
-        let (shares, _pub) = frost::keys::generate_with_dealer(
-            3,
-            2,
-            frost::keys::IdentifierList::Default,
-            rng,
-        )
-        .unwrap();
+        let (shares, _pub) =
+            frost::keys::generate_with_dealer(3, 2, frost::keys::IdentifierList::Default, rng)
+                .unwrap();
 
         let packages: BTreeMap<_, _> = shares
             .into_iter()
@@ -251,8 +247,7 @@ mod tests {
         for (x, y) in [(0, 1), (0, 2), (1, 2)] {
             let mut commitments = BTreeMap::new();
             for k in [x, y] {
-                let (_n, c) =
-                    frost::round1::commit(packages[&ids[k]].signing_share(), &mut rng);
+                let (_n, c) = frost::round1::commit(packages[&ids[k]].signing_share(), &mut rng);
                 commitments.insert(ids[k], c);
             }
 

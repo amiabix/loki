@@ -10,7 +10,7 @@
 use orchard::{
     keys::{FullViewingKey, IncomingViewingKey, PreparedIncomingViewingKey, Scope},
     note::{ExtractedNoteCommitment, Note, Nullifier, TransmittedNoteCiphertext},
-    note_encryption::{IronwoodDomain, NoteBytesData},
+    note_encryption::IronwoodDomain,
     primitives::redpallas::{self, SpendAuth},
     value::ValueCommitment,
     Action,
@@ -60,7 +60,7 @@ fn rebuild(raw: &RawAction) -> Option<Action<()>> {
         ExtractedNoteCommitment::from_bytes(&raw.cmx).into_option()?,
         TransmittedNoteCiphertext {
             epk_bytes: raw.ephemeral_key,
-            enc_ciphertext: NoteBytesData(enc),
+            enc_ciphertext: enc,
             out_ciphertext: raw.out_ciphertext,
         },
         ValueCommitment::from_bytes(&raw.cv).into_option()?,
@@ -258,10 +258,7 @@ where
 /// A single unparsable action is fatal: on our own regtest chain it would mean the node
 /// and these crates disagree about the wire format, and a scan that silently skipped it
 /// would assign every later note the wrong tree position.
-fn parse_actions(
-    actions: &[serde_json::Value],
-    txid: &str,
-) -> Result<Vec<RawAction>, String> {
+fn parse_actions(actions: &[serde_json::Value], txid: &str) -> Result<Vec<RawAction>, String> {
     let raws: Vec<RawAction> = actions
         .iter()
         .filter_map(|a| {

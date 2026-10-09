@@ -180,10 +180,10 @@ impl Identity {
         OsRng.fill_bytes(&mut nonce);
         header.extend_from_slice(&nonce);
         header.extend_from_slice(&((plaintext.len() + 16) as u32).to_be_bytes());
-        let nonce = XNonce::try_from(nonce.as_slice()).map_err(|_| "invalid DKG nonce")?;
+        let nonce = XNonce::from_slice(&nonce);
         let ciphertext = cipher
             .encrypt(
-                &nonce,
+                nonce,
                 Payload {
                     msg: plaintext,
                     aad: &header,
@@ -225,10 +225,10 @@ impl Identity {
             .verify_strict(&wire[..HEADER + size], &signature)
             .map_err(|_| "DKG sender signature failed")?;
         let key = self.box_key(sender, vault)?;
-        let nonce = XNonce::try_from(&wire[44..68]).map_err(|_| "invalid DKG nonce")?;
+        let nonce = XNonce::from_slice(&wire[44..68]);
         XChaCha20Poly1305::new(&key.into())
             .decrypt(
-                &nonce,
+                nonce,
                 Payload {
                     msg: &wire[HEADER..HEADER + size],
                     aad: &wire[..HEADER],
