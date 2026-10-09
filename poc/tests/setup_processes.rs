@@ -240,13 +240,40 @@ fn three_processes_create_one_vault_without_sharing_secrets() {
     assert!(public_packages.windows(2).all(|pair| pair[0] == pair[1]));
     assert!(vault_secrets.windows(2).all(|pair| pair[0] == pair[1]));
     {
+        use loki_poc::{
+            candidate::{
+                alpha_from_canonical_bytes, build_candidate, quote_fee, CandidateInputs, Regtest,
+            },
+            intent::{alpha_for_candidate, alpha_seed, ChangePolicy, Intent},
+            verify::{check_candidate, Expectations, Refusal},
+            zip2005,
+        };
+        use orchard::{
+            keys::Scope,
+            note::{RandomSeed, Rho},
+            value::NoteValue,
+            Note, NoteVersion,
+        };
+        use pczt::roles::{
+            creator::Creator,
+            io_finalizer::IoFinalizer,
+            signer::Signer,
+            verifier::{OrchardError, Verifier},
+        };
         use reddsa_frost::frost::redpallas as frost;
+        use zcash_protocol::{memo::MemoBytes, value::Zatoshis};
+
         let public =
             frost::keys::PublicKeyPackage::deserialize(&hex::decode(&public_packages[0]).unwrap())
                 .unwrap();
-        let alpha =
-            frost_rerandomized::Randomizer::<frost::PallasBlake2b512>::deserialize(&[7u8; 32])
-                .unwrap();
+        let ak: [u8; 32] = public
+            .verifying_key()
+            .serialize()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let sk: [u8; 32] = hex::decode(&vault_secrets[0]).unwrap().try_into().unwrap();
+        let fvk = zip2005::frost_viewing_key(&ak, &sk).unwrap();
         let keys: Vec<_> = shares[..2]
             .iter()
             .map(|s| frost::keys::KeyPackage::deserialize(&hex::decode(s).unwrap()).unwrap())
@@ -259,11 +286,85 @@ fn three_processes_create_one_vault_without_sharing_secrets() {
             nonces.insert(*key.identifier(), nonce);
             commitments.insert(*key.identifier(), commitment);
         }
-        let message = b"DKG shares from the three separate member processes";
-        let package = frost::SigningPackage::new(commitments, message);
+
+        let rho = Rho::from_bytes(&[1u8; 32]).unwrap();
+        let rseed = RandomSeed::from_bytes([2u8; 32], &rho).unwrap();
+        let note = Note::from_parts(
+            fvk.address_at(0u64, Scope::External),
+            NoteValue::from_raw(625_000_000),
+            rho,
+            rseed,
+            NoteVersion::V3,
+        )
+        .unwrap();
+        let recipient = fvk.address_at(7u64, Scope::External);
+        let memo = b"separate-member transaction".to_vec();
+        let amount_zat = 40_000_000;
+        let mut inputs = CandidateInputs {
+            vault_fvk: &fvk,
+            notes: vec![note],
+            recipient,
+            amount: Zatoshis::const_from_u64(amount_zat),
+            memo: MemoBytes::from_bytes(&memo).unwrap(),
+            change: Zatoshis::ZERO,
+            target_height: 700,
+            expiry_height: 1_152,
+        };
+        let fee_zat = u64::from(quote_fee(&Regtest, &inputs).unwrap());
+        let change_zat = 625_000_000 - amount_zat - fee_zat;
+        inputs.change = Zatoshis::const_from_u64(change_zat);
+        let intent = Intent {
+            proposer: keys[0].identifier().serialize(),
+            created_height: 700,
+            input_nullifiers: vec![note.nullifier(&fvk).to_bytes()],
+            recipient: recipient.to_raw_address_bytes().to_vec(),
+            amount_zat,
+            memo: memo.clone(),
+            change_policy: ChangePolicy::VaultInternal,
+            fee_zat,
+            change_zat,
+            expiry_height: 1_152,
+        };
+        let seed = alpha_seed(
+            &intent.proposal_id(),
+            (keys[0].identifier(), keys[1].identifier()),
+            0,
+        );
+        let alpha = alpha_for_candidate(&seed, &commitments).unwrap();
+        let alpha_bytes: [u8; 32] = alpha.serialize().try_into().unwrap();
+        let built = build_candidate(
+            &Regtest,
+            &inputs,
+            &[alpha_from_canonical_bytes(&alpha_bytes).unwrap()],
+            rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng),
+        )
+        .unwrap();
+        let pczt = Creator::build_from_parts(built.pczt_parts).unwrap();
+        let pczt = IoFinalizer::new(pczt)
+            .finalize_io(rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng))
+            .unwrap();
+        let candidate_bytes = pczt.serialize().unwrap();
+        let pczt = pczt::Pczt::parse(&candidate_bytes).unwrap();
+        let want = Expectations {
+            input_nullifiers: intent.input_nullifiers,
+            recipient: recipient.to_raw_address_bytes(),
+            amount_zat,
+            memo,
+            change_zat,
+            fee_zat,
+            expiry_height: 1_152,
+        };
+        let checked = Verifier::new(pczt)
+            .with_ironwood::<Refusal, _>(|bundle| {
+                check_candidate(bundle, &fvk, &want).map_err(OrchardError::Custom)
+            })
+            .unwrap()
+            .finish();
+        let sighash = Signer::new(checked.clone()).unwrap().shielded_sighash();
+        let package = frost::SigningPackage::new(commitments, &sighash);
         let mut signature_shares = BTreeMap::new();
         for key in &keys {
-            #[allow(deprecated)] // The transaction path supplies alpha; this checks the DKG shares.
+            #[allow(deprecated)] // The transaction fixes alpha before its sighash exists.
             let share =
                 frost_rerandomized::sign(&package, &nonces[key.identifier()], key, alpha).unwrap();
             signature_shares.insert(*key.identifier(), share);
@@ -274,8 +375,18 @@ fn three_processes_create_one_vault_without_sharing_secrets() {
             frost_rerandomized::aggregate(&package, &signature_shares, &public, &params).unwrap();
         params
             .randomized_verifying_key()
-            .verify(message, &signature)
+            .verify(&sighash, &signature)
             .unwrap();
+        let real = checked
+            .ironwood()
+            .actions()
+            .iter()
+            .find(|action| *action.spend().nullifier() == note.nullifier(&fvk).to_bytes())
+            .unwrap();
+        assert_eq!(
+            params.randomized_verifying_key().serialize().unwrap(),
+            real.spend().rk().to_vec(),
+        );
     }
     let mut addresses = Vec::new();
     for id in 1..=3 {
