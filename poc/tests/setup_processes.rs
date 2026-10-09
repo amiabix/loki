@@ -187,7 +187,21 @@ fn three_processes_create_one_vault_without_sharing_secrets() {
         .unwrap();
         assert_eq!(state["version"], 1);
         assert_eq!(state["network"], "regtest");
+        assert_eq!(state["key_derivation"], "zip2005-use-qsk-2026.8.0");
         assert_eq!(state["address"], addresses[0].trim());
+        let ak: [u8; 32] = hex::decode(state["group_ak"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let sk: [u8; 32] = hex::decode(state["vault_secret"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let fvk = loki_poc::zip2005::frost_viewing_key(&ak, &sk).unwrap();
+        assert_eq!(
+            loki_poc::vault::regtest_unified_address(&fvk),
+            addresses[0].trim()
+        );
         shares.push(state["key_package"].as_str().unwrap().to_string());
         vault_secrets.push(state["vault_secret"].as_str().unwrap().to_string());
     }
@@ -205,5 +219,50 @@ fn three_processes_create_one_vault_without_sharing_secrets() {
         .unwrap();
     assert!(recovered_address.status.success());
     assert_eq!(recovered_address.stdout, addresses[0].as_bytes());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn address_refuses_legacy_or_inconsistent_state() {
+    let exe = env!("CARGO_BIN_EXE_loki_setup_member");
+    let sk = orchard::keys::SpendingKey::from_bytes([42u8; 32]).unwrap();
+    let ak = orchard::keys::FullViewingKey::from(&sk).to_bytes()[..32].to_vec();
+    let root = std::env::temp_dir().join(format!("loki-bad-address-{}", std::process::id()));
+    fs::create_dir(&root).unwrap();
+    for (case, derivation) in [
+        ("legacy", None),
+        ("mismatched", Some(loki_poc::zip2005::VERSION)),
+    ] {
+        let member = root.join(case);
+        fs::create_dir(&member).unwrap();
+        let pass = member.join("pass.txt");
+        fs::write(&pass, "test passphrase\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&pass, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let state = serde_json::json!({
+            "version": 1,
+            "network": "regtest",
+            "key_derivation": derivation,
+            "group_ak": hex::encode(&ak),
+            "vault_secret": hex::encode([42u8; 32]),
+            "address": "wrong",
+        });
+        MemberDir::create(&member, "secrets")
+            .unwrap()
+            .write_sealed(
+                "vault.sealed",
+                &serde_json::to_vec(&state).unwrap(),
+                "test passphrase",
+            )
+            .unwrap();
+        let out = Command::new(exe)
+            .args(["address", member.to_str().unwrap(), pass.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{case} state produced an address");
+    }
     fs::remove_dir_all(root).unwrap();
 }

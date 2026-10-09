@@ -94,13 +94,13 @@ pub fn test_only_address(fvk: &FullViewingKey) -> orchard::Address {
     fvk.address_at(0u64, Scope::External)
 }
 
-/// Encode the vault's Orchard receiver as a Regtest unified address.
+/// Encode an Orchard receiver as a Regtest unified address.
 ///
 /// There is no Ironwood receiver typecode: `zcash_address` 0.14 knows only Orchard,
 /// Sapling, P2PKH and P2SH. Ironwood reuses the Orchard receiver and the pool is chosen
 /// by the sending bundle, so one address can receive either.
 ///
-/// **Test-only.** Not a production Loki vault address.
+/// Regtest only. The caller is responsible for the FVK's derivation and status.
 pub fn regtest_unified_address(fvk: &FullViewingKey) -> String {
     use zcash_address::{
         unified::{Address as Ua, Encoding, Receiver, Revision, Uitem},

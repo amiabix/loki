@@ -110,7 +110,14 @@ explicit canonicality check on both sides. Record this as an assumption for step
 
 ---
 
-## B1 — ZIP 2005 `use_qsk` derivation: **BLOCKED, not patchable at POC scope**
+## B1 — ZIP 2005 `use_qsk` derivation: **local implementation, not yet a G1 pass**
+
+9 October update: `src/zip2005.rs` implements the current proposed derivation for
+separate-member regtest setup. Its FVK bytes match an independently calculated
+Python `hashlib`/`blake3` vector. Orchard still has no upstream API, the implementation
+has no independent security review, and no payment from this derived FVK has been
+mined. The compile probe below now records the **upstream API gap**, not the absence
+of a local implementation. Public testnet and custody use remain blocked.
 
 The brief requires an FVK from a DKG-derived `ak` plus the ZIP 2005 `use_qsk = true`
 derivation, and states that a pre-ZIP-2005 method alone is **not a pass**.
@@ -122,7 +129,7 @@ qsk  --H^qk-->  qk
 rivk_ext = H^rivk_ext_qk(ak, nk)      keyed by qk, selected by use_qsk
 ```
 
-None of it is implemented anywhere:
+At the dates checked below, none of it was implemented in these upstream crates:
 
 | Source | Checked | `qsk` occurrences |
 |---|---|---|

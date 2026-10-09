@@ -13,10 +13,10 @@ result documents, which are the authority.
 | | |
 |---|---|
 | **G1-TX** | **demonstrated on regtest** — a real Ironwood payment, authorised by two of three FROST members, signed before its anchor and proof existed, mined |
-| **Full G1** | **BLOCKED** on ZIP 2005 key derivation. `qsk → qk → rivk_ext` is implemented in no crate and the ZIP is `Status: Proposed`. The account key here is a documented **test-only** splice |
+| **Full G1** | **BLOCKED**. Separate-member setup now has a local ZIP 2005 `use_qsk` derivation with an independently calculated vector, but it has not been reviewed, upstreamed, or used for a mined payment. The original transaction CLI still uses its documented **test-only** key splice |
 | **G3** (browser nonce safety) | **PARTIAL** and separate. 29/32 drills on Chromium, 6/8 on WebKit, Firefox would not launch, no physical device case tested |
 | **Second-device finishing** | demonstrated: a party holding none of the approvers' files completed two payments, one from posted bytes and one by re-proving |
-| **Separate-member setup** | three isolated processes complete DKG with encrypted peer shares and matching certificates on one machine; regtest-only, not yet connected to payments ([details](poc/SEPARATE-MEMBER-SETUP.md)) |
+| **Separate-member setup** | three isolated processes complete DKG with encrypted peer shares, matching certificates and the locally derived viewing key on one machine; regtest-only, not yet connected to payments or backups ([details](poc/SEPARATE-MEMBER-SETUP.md)) |
 | **Recovery, key rotation, custody** | **not established.** No drill, no review |
 
 ## Quick start

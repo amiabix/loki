@@ -5,16 +5,14 @@
 //!
 //!   C1.1  Is the FROST Pallas ciphersuite available?            -> PASS
 //!   C1.2  Can an FVK be built from a DKG group `ak`
-//!         plus ZIP 2005 `use_qsk = true`?                       -> BLOCKED
+//!         plus ZIP 2005 `use_qsk = true`?                       -> LOCAL, UNREVIEWED
 //!   C1.3  Does the deferred v6 PCZT path exist?                 -> PASS
 //!   C1.4  Can the builder accept a caller-selected `alpha`?     -> BLOCKED
 //!
-//! C1.2 and C1.4 are *absences*. An absent API cannot be asserted at runtime, so each
-//! C1.2 is an *absence*. An absent API cannot be asserted at runtime, so it has a
-//! cargo feature that compiles the smallest call that would work if the API existed:
-//! `cargo build --features probe-zip2005` produces the exact compiler error that
-//! constitutes the blocker report. C1.4 was absent too and is now supplied by an
-//! isolated patch to vendored orchard; see vendor/README.md.
+//! Orchard's ZIP 2005 API is still absent. The local derivation in `zip2005` is checked
+//! against an independent vector but needs review and a mined transaction. The
+//! `probe-zip2005` feature still records the missing upstream API. C1.4 is supplied by
+//! an isolated patch to vendored orchard; see vendor/README.md.
 
 pub mod candidate;
 pub mod distributed_setup;
@@ -32,6 +30,7 @@ pub mod state;
 pub mod vault;
 pub mod verify;
 pub mod witness;
+pub mod zip2005;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Compile probe for the one blocked requirement.

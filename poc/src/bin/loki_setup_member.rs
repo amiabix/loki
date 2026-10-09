@@ -1,5 +1,5 @@
 //! Separate-member DKG ceremony on regtest. The exchange directory is an untrusted courier.
-//! This command still uses a test-only viewing key and must not receive public funds.
+//! This ZIP 2005 implementation has not been independently reviewed; regtest only.
 
 use std::{
     collections::BTreeMap,
@@ -15,7 +15,7 @@ use loki_poc::{
     distributed_setup::Member,
     setup_transport::{Identity, PublicIdentity},
     state::MemberDir,
-    vault,
+    vault, zip2005,
 };
 use rand_core::{OsRng, RngCore};
 
@@ -244,13 +244,22 @@ fn address(args: &[String]) -> Result<(), String> {
     {
         return Err("unsupported vault state version or network".into());
     }
-    println!(
-        "{}",
-        state
-            .get("address")
-            .and_then(|v| v.as_str())
-            .ok_or("missing vault address")?
-    );
+    if state.get("key_derivation").and_then(|v| v.as_str()) != Some(zip2005::VERSION) {
+        return Err("unsupported key derivation; recreate this regtest vault".into());
+    }
+    let ak = hex32(state["group_ak"].as_str().ok_or("missing group key")?)?;
+    let sk = hex32(
+        state["vault_secret"]
+            .as_str()
+            .ok_or("missing vault secret")?,
+    )?;
+    let fvk = zip2005::frost_viewing_key(&ak, &sk)
+        .map_err(|e| format!("ZIP 2005 key derivation: {e:?}"))?;
+    let expected = vault::regtest_unified_address(&fvk);
+    if state["address"].as_str() != Some(&expected) {
+        return Err("stored address differs from the derived vault address".into());
+    }
+    println!("{expected}");
     Ok(())
 }
 
@@ -354,6 +363,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut cert_body = completed.certificate_digest().to_vec();
     cert_body.extend_from_slice(&digest(b"Loki_vs_cert_v1", &[&vs]));
     cert_body.extend_from_slice(&roster.fingerprint());
+    cert_body.extend_from_slice(zip2005::VERSION.as_bytes());
     publish(
         exchange,
         &name(&roster.vault, "cert", own.id, None),
@@ -371,12 +381,14 @@ fn run(args: &[String]) -> Result<(), String> {
         certificates.insert(peer.id, body[..32].try_into().unwrap());
     }
     let certified = completed.certify(&certificates)?;
-    let fvk = vault::test_only_fvk(&certified.group_ak).map_err(|e| format!("{e:?}"))?;
+    let fvk = zip2005::frost_viewing_key(&certified.group_ak, &vs)
+        .map_err(|e| format!("ZIP 2005 key derivation: {e:?}"))?;
     let pass = passphrase(Path::new(&args[1]))?;
     let address = vault::regtest_unified_address(&fvk);
     let state = serde_json::to_vec(&serde_json::json!({
         "version": 1,
         "network": "regtest",
+        "key_derivation": zip2005::VERSION,
         "vault": hex::encode(roster.vault),
         "roster_fingerprint": hex::encode(roster.fingerprint()),
         "key_package": hex::encode(&certified.key_package),
@@ -390,7 +402,7 @@ fn run(args: &[String]) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     println!("{address}");
     eprintln!(
-        "REGTEST ONLY: this address uses the test-only viewing-key construction, not ZIP 2005"
+        "REGTEST ONLY: ZIP 2005 key derivation is locally implemented and awaits independent review"
     );
     Ok(())
 }
