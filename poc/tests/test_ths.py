@@ -81,23 +81,25 @@ class RunnerTests(unittest.TestCase):
             with patch.object(runner, "STATE", root), patch.object(runner, "SNAP", snap):
                 self.assertFalse(instance.step_tamper("memo"))
 
-    def test_disconnect_never_stops_external_ths(self):
+    def test_stop_delegates_to_owned_network(self):
         instance = self.make_runner()
-        chain = Mock()
-        chain.name = "owned-by-developer"
-        instance.ths = chain
-        instance.stop_chain()
-        self.assertIsNone(instance.ths)
-        chain.mine.assert_not_called()
-        self.assertEqual(chain.mock_calls, [])
+        instance.network = Mock()
+        instance.done.add("start-chain")
+        self.assertTrue(instance.stop_chain())
+        instance.network.stop.assert_called_once_with()
+        self.assertNotIn("start-chain", instance.done)
 
-    def test_snapshot_reports_unreachable_attached_node(self):
+    def test_snapshot_does_not_treat_completion_as_a_live_network(self):
         instance = self.make_runner()
-        instance.ths = Mock(name="chain")
-        instance.ths.name = "loki"
-        instance.ths.rpc_address = "127.0.0.1:18242"
-        instance.ths.rpc.side_effect = RuntimeError("node unavailable")
-        self.assertFalse(instance.snapshot()["chain_running"])
+        instance.done.add("start-chain")
+        instance.network = Mock()
+        instance.network.snapshot.return_value = {
+            "chain_running": False, "funding_state": "confirmed", "run_ended": False,
+        }
+        with patch.object(instance, "completed_on_disk", return_value=set()):
+            snapshot = instance.snapshot()
+        self.assertFalse(snapshot["chain_running"])
+        self.assertNotIn("start-chain", snapshot["done"])
 
     def test_reset_removes_only_loki_sandbox(self):
         instance = self.make_runner()
@@ -108,10 +110,10 @@ class RunnerTests(unittest.TestCase):
             (sandbox / "account").write_text("disposable")
             outside = demo / "external-ths"
             outside.mkdir()
-            instance.ths = Mock()
-            instance.ths.name = "loki"
+            network = instance.network = Mock()
             with patch.object(runner, "DEMO", demo), patch.object(runner, "SANDBOX", sandbox), patch.object(runner, "POC", demo):
                 self.assertTrue(instance.step_reset())
+            network.stop.assert_called_once_with()
             self.assertFalse(sandbox.exists())
             self.assertTrue(outside.exists())
 

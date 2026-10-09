@@ -206,68 +206,15 @@ fn scan(args: &[String]) -> Result<(), String> {
         .try_into()
         .map_err(|_| "group_ak.hex is not 32 bytes")?;
     let fvk = vault::test_only_fvk(&ak).map_err(|e| format!("{e:?}"))?;
-    let ivks = loki_poc::scan::vault_ivks(&fvk);
-
     let rpc = loki_poc::rpc::Rpc::regtest();
-    let tip = rpc
-        .json("getblockcount", "[]")?
-        .as_u64()
-        .ok_or("getblockcount did not return a number")?;
-
-    let mut position = 0u64;
-    let mut notes = Vec::new();
-    let mut cmxs: Vec<[u8; 32]> = Vec::new();
-
-    for height in 1..=tip {
-        let block = rpc.json("getblock", &format!("[\"{height}\", 2]"))?;
-        let txs = block["tx"].as_array().ok_or("block has no tx array")?;
-
-        for tx in txs {
-            let txid = tx["txid"].as_str().unwrap_or("?").to_string();
-            let actions = match tx["ironwood"]["actions"].as_array() {
-                Some(a) if !a.is_empty() => a,
-                _ => continue,
-            };
-
-            let raws: Vec<_> = actions
-                .iter()
-                .filter_map(|a| {
-                    Some(loki_poc::scan::RawAction {
-                        cv: hex32(a, "cv")?,
-                        nullifier: hex32(a, "nullifier")?,
-                        rk: hex32(a, "rk")?,
-                        cmx: hex32(a, "cmx")?,
-                        ephemeral_key: hex32(a, "ephemeralKey")?,
-                        enc_ciphertext: hex::decode(a["encCiphertext"].as_str()?).ok()?,
-                        out_ciphertext: hex::decode(a["outCiphertext"].as_str()?)
-                            .ok()?
-                            .try_into()
-                            .ok()?,
-                    })
-                })
-                .collect();
-
-            if raws.len() != actions.len() {
-                return Err(format!("tx {txid}: an Ironwood action failed to parse"));
-            }
-
-            cmxs.extend(raws.iter().map(|r| r.cmx));
-
-            let (found, next) = loki_poc::scan::scan_block(
-                &fvk,
-                &ivks,
-                height as u32,
-                &txid,
-                &raws,
-                position,
-            );
-            position = next;
-            notes.extend(found);
-        }
-    }
+    let chain = loki_poc::scan::scan_chain(&rpc, &fvk)?;
+    let tip = chain.tip;
+    let cmxs = chain.cmxs;
+    let notes = chain.notes;
+    let position = cmxs.len();
 
     println!("scanned {tip} blocks, {position} Ironwood actions");
-    println!("vault notes: {}", notes.len());
+    println!("unspent vault notes: {}", notes.len());
     println!();
 
     let mut total = 0u64;
@@ -363,8 +310,31 @@ fn scan(args: &[String]) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
 
+    // Every note the vault owns, so the proposer can choose a set that covers a payment
+    // rather than being limited to whatever single note this scan happened to rank first.
+    // The two single-note files above stay for the scripts and the tamper harness, which
+    // name them directly.
+    let mut all = String::new();
+    for n in &notes {
+        all.push_str(&format!(
+            "height={} txid={} position={} value_zat={} cmx={} nullifier={} \
+             recipient={} rho={} rseed={}\n",
+            n.height,
+            n.txid,
+            n.position,
+            n.value_zat,
+            hex::encode(n.cmx),
+            hex::encode(n.nullifier),
+            hex::encode(n.note.recipient().to_raw_address_bytes()),
+            hex::encode(n.note.rho().to_bytes()),
+            hex::encode(n.note.rseed().as_bytes()),
+        ));
+    }
+    shared.write_text("funded_notes.txt", &all).map_err(|e| e.to_string())?;
+
     println!();
     println!("funding fixture written: {}/public/funded_note.txt", root.display());
+    println!("all {} vault notes written to public/funded_notes.txt", notes.len());
     Ok(())
 }
 
@@ -474,6 +444,147 @@ fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
 }
 
+/// The nullifiers this proposal spends, in the order the proposer chose.
+///
+/// Order is load-bearing: spend `i` uses commitment `i`, nonce `i` and randomiser `i`, so
+/// a stage that read them in a different order would check one spend's `rk` against
+/// another spend's alpha. Written comma-separated on one line so the fixture stays a flat
+/// key=value file.
+fn intent_nullifiers(
+    m: &std::collections::HashMap<String, String>,
+) -> Result<Vec<[u8; 32]>, String> {
+    let raw = m.get("input_nullifier").ok_or("intent has no input_nullifier")?;
+    let nullifiers: Vec<[u8; 32]> = raw.split(',')
+        .filter(|f| !f.trim().is_empty())
+        .map(|f| {
+            hex::decode(f.trim())
+                .map_err(|e| format!("input_nullifier: {e}"))?
+                .try_into()
+                .map_err(|_| "input_nullifier is not 32 bytes".to_string())
+        })
+        .collect::<Result<_, _>>()?;
+    if nullifiers.is_empty() || nullifiers.iter().enumerate().any(|(i, nf)| nullifiers[..i].contains(nf)) {
+        return Err("intent has no inputs or repeats an input nullifier".into());
+    }
+    Ok(nullifiers)
+}
+
+/// Where a member keeps its signature share for spend `i` of candidate `pair`. Same
+/// index-0-keeps-the-old-name rule as the nonce and commitment files.
+fn share_file(pair: &str, who: &str, i: usize) -> String {
+    if i == 0 {
+        format!("share_{pair}_{who}.hex")
+    } else {
+        format!("share_{pair}_{who}_{i}.hex")
+    }
+}
+
+/// Split one space-separated `key=value` record into a map.
+///
+/// `kv` reads one pair per LINE, so it cannot parse a record written on a single line:
+/// the first key swallows the rest. `funded_notes.txt` keeps one note per line so the
+/// file stays greppable, which means it needs this.
+fn kv_record(line: &str) -> std::collections::HashMap<String, String> {
+    line.split_whitespace()
+        .filter_map(|f| f.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+/// Rebuild a note from the fields `scan` recorded, and check it is the note it claims.
+///
+/// The nullifier check is the point: it is derived from the note and the vault key, so a
+/// note whose recorded nullifier does not match was not reconstructed correctly and must
+/// not be spent.
+type SpendNote = (orchard::Note, [u8; 32], u64);
+
+fn note_from_kv(
+    m: &std::collections::HashMap<String, String>,
+    fvk: &orchard::keys::FullViewingKey,
+) -> Result<SpendNote, String> {
+    use orchard::{note::{RandomSeed, Rho}, value::NoteValue, Note, NoteVersion};
+
+    let rho = Rho::from_bytes(&hexn::<32>(m, "rho")?)
+        .into_option()
+        .ok_or("note has an invalid rho")?;
+    let rseed = RandomSeed::from_bytes(hexn::<32>(m, "rseed")?, &rho)
+        .into_option()
+        .ok_or("note has an invalid rseed")?;
+    let value: u64 = m["value_zat"].parse().map_err(|e| format!("value: {e}"))?;
+    let note = Note::from_parts(
+        orchard::Address::from_raw_address_bytes(&hexn::<43>(m, "recipient")?)
+            .into_option()
+            .ok_or("note has an invalid recipient")?,
+        NoteValue::from_raw(value),
+        rho,
+        rseed,
+        NoteVersion::V3,
+    )
+    .into_option()
+    .ok_or("note does not reconstruct")?;
+
+    let expect: [u8; 32] = hexn(m, "nullifier")?;
+    if note.nullifier(fvk).to_bytes() != expect {
+        return Err("reconstructed note has a different nullifier than the scan recorded".into());
+    }
+    let position: u64 = m["position"].parse().map_err(|e| format!("position: {e}"))?;
+    Ok((note, expect, position))
+}
+
+/// Choose notes that cover `amount` plus the fee those notes imply.
+///
+/// Largest first, which keeps the action count down, and the action count is what ZIP 317
+/// charges for. The fee is re-quoted after each addition because adding a note adds an
+/// action and therefore raises the fee: selecting against a fixed fee quote would
+/// occasionally come up one note short.
+fn select_notes(
+    available: &[SpendNote],
+    fvk: &orchard::keys::FullViewingKey,
+    recipient: orchard::Address,
+    amount: zcash_protocol::value::Zatoshis,
+    memo: &zcash_protocol::memo::MemoBytes,
+    target_height: u32,
+    expiry_height: u32,
+) -> Result<(Vec<SpendNote>, zcash_protocol::value::Zatoshis), String> {
+    use loki_poc::candidate::{quote_fee, CandidateInputs, Regtest};
+    use zcash_protocol::value::Zatoshis;
+
+    let mut by_value = available.to_vec();
+    by_value.sort_by_key(|(n, _, _)| std::cmp::Reverse(n.value().inner()));
+
+    let mut chosen: Vec<SpendNote> = Vec::new();
+    for candidate_note in by_value {
+        chosen.push(candidate_note);
+
+        let inputs = CandidateInputs {
+            vault_fvk: fvk,
+            notes: chosen.iter().map(|(n, _, _)| *n).collect(),
+            recipient,
+            amount,
+            memo: memo.clone(),
+            change: Zatoshis::ZERO,
+            target_height,
+            expiry_height,
+        };
+        let fee = quote_fee(&Regtest, &inputs)?;
+        let total: u64 = chosen.iter().map(|(n, _, _)| n.value().inner()).sum();
+        let needed = u64::from(amount)
+            .checked_add(u64::from(fee))
+            .ok_or("amount plus fee overflows")?;
+        if total >= needed {
+            return Ok((chosen, fee));
+        }
+    }
+
+    let total: u64 = available.iter().map(|(n, _, _)| n.value().inner()).sum();
+    Err(format!(
+        "insufficient funds: the account holds {total} zat across {} note(s), which does \
+         not cover {} zat plus the fee those notes would imply",
+        available.len(),
+        u64::from(amount),
+    ))
+}
+
 /// Where a member keeps the nonce pair for spend `i` of candidate `pair`.
 ///
 /// Spend 0 keeps the original unindexed name. That is not tidiness: the demo runner, the
@@ -495,12 +606,7 @@ fn commitment_file(pair: &str, who: &str, i: usize) -> String {
 fn propose(args: &[String]) -> Result<(), String> {
     use zcash_protocol::consensus::Parameters as _;
     use loki_poc::{candidate::*, intent::*};
-    use orchard::{
-        keys::Scope,
-        note::{RandomSeed, Rho},
-        value::NoteValue,
-        Note, NoteVersion,
-    };
+    use orchard::keys::Scope;
     use zcash_protocol::{memo::MemoBytes, value::Zatoshis};
 
     let root = PathBuf::from(args.first().ok_or("usage: propose <state-dir> [note-file]")?);
@@ -524,35 +630,31 @@ fn propose(args: &[String]) -> Result<(), String> {
         .map_err(|_| "group_ak.hex is not 32 bytes")?;
     let fvk = vault::test_only_fvk(&ak).map_err(|e| format!("{e:?}"))?;
 
-    let note_kv = kv(&vault_dir
-        .read_text(note_file)
-        .map_err(|e| format!("run scan first: {e}"))?);
-
-    let recipient_bytes: [u8; 43] = hexn(&note_kv, "recipient")?;
-    let rho = Rho::from_bytes(&hexn::<32>(&note_kv, "rho")?)
-        .into_option()
-        .ok_or("funded note has an invalid rho")?;
-    let rseed = RandomSeed::from_bytes(hexn::<32>(&note_kv, "rseed")?, &rho)
-        .into_option()
-        .ok_or("funded note has an invalid rseed")?;
-    let value: u64 = note_kv["value_zat"].parse().map_err(|e| format!("value: {e}"))?;
-
-    let note = Note::from_parts(
-        orchard::Address::from_raw_address_bytes(&recipient_bytes)
-            .into_option()
-            .ok_or("funded note has an invalid recipient")?,
-        NoteValue::from_raw(value),
-        rho,
-        rseed,
-        NoteVersion::V3,
-    )
-    .into_option()
-    .ok_or("funded note does not reconstruct")?;
-
-    // The reconstructed note must be the one we scanned.
-    let expect_nf: [u8; 32] = hexn(&note_kv, "nullifier")?;
-    if note.nullifier(&fvk).to_bytes() != expect_nf {
-        return Err("reconstructed note has a different nullifier than the scan recorded".into());
+    // Which notes are available to spend. A named note file pins the choice to exactly
+    // that one, which is what the tamper harness and the second-device script rely on;
+    // otherwise every scanned note is a candidate and the selector picks a covering set.
+    let named_note = args.get(1).map(String::as_str).filter(|a| !a.starts_with("--")).is_some();
+    let available: Vec<SpendNote> = if named_note {
+        let m = kv(&vault_dir
+            .read_text(note_file)
+            .map_err(|e| format!("run scan first: {e}"))?);
+        vec![note_from_kv(&m, &fvk)?]
+    } else if vault_dir.exists("funded_notes.txt") {
+        vault_dir
+            .read_text("funded_notes.txt")
+            .map_err(|e| format!("{e}"))?
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| note_from_kv(&kv_record(l), &fvk))
+            .collect::<Result<_, String>>()?
+    } else {
+        let m = kv(&vault_dir
+            .read_text(note_file)
+            .map_err(|e| format!("run scan first: {e}"))?);
+        vec![note_from_kv(&m, &fvk)?]
+    };
+    if available.is_empty() {
+        return Err("the account holds no notes; run scan after the chain has funded it".into());
     }
 
     // ── the intent ──────────────────────────────────────────────────────────
@@ -589,42 +691,36 @@ fn propose(args: &[String]) -> Result<(), String> {
     let memo = MemoBytes::from_bytes(memo_text.as_bytes())
         .map_err(|e| format!("--memo: {e:?} (at most 512 bytes)"))?;
 
-    let mut inputs = CandidateInputs {
-        vault_fvk: &fvk,
-        notes: vec![note],
-        recipient,
-        amount,
-        memo: memo.clone(),
-        change: Zatoshis::ZERO,
-        target_height: tip,
-        expiry_height: expiry,
-    };
-    let fee = quote_fee(&Regtest, &inputs)?;
-
-    // The note has to cover the payment and the fee. Without this the subtraction below
-    // underflows: it panics in a debug build and silently wraps to an enormous change
-    // value in a release one, so there was no "insufficient funds" path at all.
+    // Pick a covering set. The fee is quoted inside the selector because each added note
+    // is another action and ZIP 317 charges by action count, so a fee quoted once up
+    // front would occasionally leave the selection one note short.
+    let (chosen, fee) =
+        select_notes(&available, &fvk, recipient, amount, &memo, tip, expiry)?;
+    let selected_total: u64 = chosen.iter().map(|(n, _, _)| n.value().inner()).sum();
     let needed = amount_zat
         .checked_add(u64::from(fee))
         .ok_or("amount plus fee overflows")?;
-    if value < needed {
-        return Err(format!(
-            "insufficient funds: this note holds {value} zat, and the payment needs \
-             {needed} zat ({amount_zat} to pay plus {} fee). Spending several notes in \
-             one payment is not implemented yet, so a single note must cover it.",
-            u64::from(fee),
-        ));
-    }
-    let change = Zatoshis::from_u64(value - needed)
+    let change = Zatoshis::from_u64(selected_total - needed)
         .map_err(|e| format!("change is not a valid amount: {e:?}"))?;
-    inputs.change = change;
+
+    let inputs = CandidateInputs {
+        vault_fvk: &fvk,
+        notes: chosen.iter().map(|(n, _, _)| *n).collect(),
+        recipient,
+        amount,
+        memo: memo.clone(),
+        change,
+        target_height: tip,
+        expiry_height: expiry,
+    };
+    let spend_nullifiers: Vec<[u8; 32]> = chosen.iter().map(|(_, nf, _)| *nf).collect();
 
     let intent = Intent {
         proposer: MemberDir::open(&root, "alice")
             .read_hex("identifier.hex")
             .map_err(|e| format!("{e}"))?,
         created_height: tip,
-        input_nullifiers: vec![expect_nf],
+        input_nullifiers: spend_nullifiers.clone(),
         recipient: recipient.to_raw_address_bytes().to_vec(),
         amount_zat: u64::from(amount),
         memo: memo_text.as_bytes().to_vec(),
@@ -647,7 +743,7 @@ fn propose(args: &[String]) -> Result<(), String> {
                 hex::encode(proposal_id),
                 hex::encode(&intent.proposer),
                 intent.created_height,
-                hex::encode(expect_nf),
+                spend_nullifiers.iter().map(hex::encode).collect::<Vec<_>>().join(","),
                 hex::encode(&intent.recipient),
                 intent.amount_zat,
                 hex::encode(&intent.memo),
@@ -663,7 +759,12 @@ fn propose(args: &[String]) -> Result<(), String> {
     shared.write_hex("group_ak.hex", &ak).map_err(|e| e.to_string())?;
 
     println!("proposal   {}", hex::encode(proposal_id));
-    println!("spend      {} zat from position {}", value, note_kv["position"]);
+    println!(
+        "spend      {} zat across {} note(s) at position(s) {}",
+        selected_total,
+        chosen.len(),
+        chosen.iter().map(|(_, _, p)| p.to_string()).collect::<Vec<_>>().join(", "),
+    );
     println!("pay        {} zat  fee {}  change {}", u64::from(amount), u64::from(fee), u64::from(change));
     println!("expiry     {expiry}  (tip {tip})");
     println!();
@@ -682,35 +783,51 @@ fn propose(args: &[String]) -> Result<(), String> {
             })
             .collect::<Result<_, String>>()?;
 
-        // That pair's published commitments.
-        let mut commitments = BTreeMap::new();
-        for (slot, id) in [x, y].iter().zip(ids.iter()) {
-            let raw = shared
-                .read_hex(&format!("commitment_{name}_{}.hex", MEMBERS[*slot].0))
-                .map_err(|e| format!("run commit first: {e}"))?;
-            commitments.insert(
-                *id,
-                frost::round1::SigningCommitments::deserialize(&raw)
-                    .map_err(|e| format!("commitment: {e}"))?,
-            );
-        }
+        // One randomiser per spend, each from that spend's own commitment set. Every spend
+        // is a separate Orchard action with its own `rk` and its own FROST signature, so
+        // reusing one randomiser across two of them would mean signing twice under the
+        // same key.
+        let mut alphas = Vec::with_capacity(spend_nullifiers.len());
+        let mut alpha_bytes: Vec<[u8; 32]> = Vec::with_capacity(spend_nullifiers.len());
+        for i in 0..spend_nullifiers.len() {
+            let mut commitments = BTreeMap::new();
+            for (slot, id) in [x, y].iter().zip(ids.iter()) {
+                let raw = shared
+                    .read_hex(&commitment_file(name, MEMBERS[*slot].0, i))
+                    .map_err(|e| {
+                        format!(
+                            "this payment spends {} note(s), so each member needs that \
+                             many commitments; run: commit <state-dir> <member> \
+                             --spends {} ({e})",
+                            spend_nullifiers.len(),
+                            spend_nullifiers.len(),
+                        )
+                    })?;
+                commitments.insert(
+                    *id,
+                    frost::round1::SigningCommitments::deserialize(&raw)
+                        .map_err(|e| format!("commitment: {e}"))?,
+                );
+            }
 
-        // alpha, derived from the proposal and this pair's commitments.
-        let seed = alpha_seed(&proposal_id, (&ids[0], &ids[1]), 0);
-        let alpha_bytes = alpha_for_candidate(&seed, &commitments)
-            .map_err(|e| format!("alpha: {e}"))?
-            .serialize();
-        let alpha_arr: [u8; 32] = alpha_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| "alpha is not 32 bytes")?;
-        let alpha = alpha_from_canonical_bytes(&alpha_arr)
-            .ok_or("derived alpha is not a canonical Pallas scalar")?;
+            let seed = alpha_seed(&proposal_id, (&ids[0], &ids[1]), i as u32);
+            let alpha_arr: [u8; 32] = alpha_for_candidate(&seed, &commitments)
+                .map_err(|e| format!("alpha: {e}"))?
+                .serialize()
+                .as_slice()
+                .try_into()
+                .map_err(|_| "alpha is not 32 bytes")?;
+            alphas.push(
+                alpha_from_canonical_bytes(&alpha_arr)
+                    .ok_or("derived alpha is not a canonical Pallas scalar")?,
+            );
+            alpha_bytes.push(alpha_arr);
+        }
 
         let built = build_candidate(
             &Regtest,
             &inputs,
-            &[alpha],
+            &alphas,
             rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng),
         )?;
 
@@ -730,19 +847,32 @@ fn propose(args: &[String]) -> Result<(), String> {
         let real: Vec<_> = bundle
             .actions()
             .iter()
-            .filter(|a| a.spend().nullifier().to_bytes() == expect_nf)
+            .filter(|a| spend_nullifiers.contains(&a.spend().nullifier().to_bytes()))
             .collect();
-        if real.len() != 1 {
-            return Err(format!("{name}: expected exactly one real spend"));
+        if real.len() != spend_nullifiers.len() {
+            return Err(format!(
+                "{name}: expected {} real spend(s), found {}",
+                spend_nullifiers.len(),
+                real.len(),
+            ));
         }
-        if real[0].spend().witness().is_some() {
-            return Err(format!("{name}: real spend already has a witness"));
+        // Every spend, not just the first: checking only `real[0]` would have let a
+        // second action keep a witness or repeat an `rk` without anyone noticing.
+        for a in &real {
+            if a.spend().witness().is_some() {
+                return Err(format!("{name}: a real spend already has a witness"));
+            }
+            let rk = <[u8; 32]>::from(a.spend().rk());
+            if seen_rk.contains(&rk) {
+                return Err(format!(
+                    "{name}: rk {} collides with another spend or candidate",
+                    &hex::encode(rk)[..16],
+                ));
+            }
+            seen_rk.push(rk);
         }
-        let rk = <[u8; 32]>::from(real[0].spend().rk());
-        if seen_rk.contains(&rk) {
-            return Err(format!("{name}: rk collides with another candidate"));
-        }
-        seen_rk.push(rk);
+        let spend_count = real.len();
+        let first_rk = <[u8; 32]>::from(real[0].spend().rk());
 
         // Serialize the PCZT: this is the handoff artifact the signers receive.
         let pczt = pczt::roles::creator::Creator::build_from_parts(built.pczt_parts)
@@ -760,14 +890,24 @@ fn propose(args: &[String]) -> Result<(), String> {
         shared
             .write_hex(&format!("candidate_{name}.pczt.hex"), &bytes)
             .map_err(|e| e.to_string())?;
-        shared
-            .write_hex(&format!("alpha_{name}.hex"), &alpha_arr)
-            .map_err(|e| e.to_string())?;
+        // One alpha file per spend, matching the commitment and nonce naming so a reader
+        // can line all three up by index.
+        for (i, a) in alpha_bytes.iter().enumerate() {
+            let file = if i == 0 {
+                format!("alpha_{name}.hex")
+            } else {
+                format!("alpha_{name}_{i}.hex")
+            };
+            shared
+                .write_hex(&file, a)
+                .map_err(|e| e.to_string())?;
+        }
 
         println!(
-            "{name}  rk {}  alpha {}  {} bytes, anchor deferred, no witness, no proof",
-            &hex::encode(rk)[..16],
-            &hex::encode(alpha_arr)[..16],
+            "{name}  {} spend(s)  rk {}  alpha {}  {} bytes, anchor deferred, no witness, no proof",
+            spend_count,
+            &hex::encode(first_rk)[..16],
+            &hex::encode(alpha_bytes[0])[..16],
             bytes.len()
         );
     }
@@ -811,7 +951,7 @@ fn review_sign(args: &[String]) -> Result<(), String> {
     // The intent fixture: machine-readable, and the signer recomputes the proposal id
     // from it rather than trusting the one it was handed.
     let intent_kv = kv(&shared.read_text("intent.txt").map_err(|e| format!("{e}"))?);
-    let want_nf: [u8; 32] = hexn(&intent_kv, "input_nullifier")?;
+    let want_nfs = intent_nullifiers(&intent_kv)?;
     let want_recipient: [u8; 43] = hexn(&intent_kv, "recipient")?;
     let want_amount: u64 = intent_kv["amount_zat"].parse().map_err(|e| format!("{e}"))?;
     let want_change: u64 = intent_kv["change_zat"].parse().map_err(|e| format!("{e}"))?;
@@ -830,7 +970,7 @@ fn review_sign(args: &[String]) -> Result<(), String> {
     let vault_fvk = vault::test_only_fvk(&ak).map_err(|e| format!("{e:?}"))?;
 
     let want = Expectations {
-        input_nullifiers: vec![want_nf],
+        input_nullifiers: want_nfs.clone(),
         recipient: want_recipient,
         amount_zat: want_amount,
         memo: want_memo.clone(),
@@ -918,25 +1058,24 @@ fn review_sign(args: &[String]) -> Result<(), String> {
             .map_err(|e| format!("{name}: signer: {e:?}"))?
             .shielded_sighash();
 
-        // Read this candidate's alpha out of the PCZT, and recompute what it should be.
-        let mut found_alpha = None;
-        let mut found_rk = None;
+        // Read each spend's alpha and rk out of the PCZT, indexed by the nullifier the
+        // intent names, so a reordered action bundle cannot pair spend i's rk with
+        // spend j's randomiser.
+        let mut found: BTreeMap<[u8; 32], (pasta_curves::pallas::Scalar, [u8; 32])> =
+            BTreeMap::new();
         LowLevelSigner::new(checked.clone())
             .sign_ironwood_with::<pczt::roles::low_level_signer::OrchardParseError, _>(
                 |_pczt, bundle, _| {
                 for action in bundle.actions() {
-                    if action.spend().nullifier().to_bytes() == want_nf {
-                        found_alpha = *action.spend().alpha();
-                        found_rk = Some(<[u8; 32]>::from(action.spend().rk()));
+                    let nf = action.spend().nullifier().to_bytes();
+                    if let Some(alpha) = *action.spend().alpha() {
+                        found.insert(nf, (alpha, <[u8; 32]>::from(action.spend().rk())));
                     }
                 }
                     Ok(())
                 },
             )
             .map_err(|e| format!("{name}: low level signer: {e:?}"))?;
-
-        let in_pczt_alpha = found_alpha.ok_or(format!("{name}: the spend carries no alpha"))?;
-        let in_pczt_rk = found_rk.ok_or(format!("{name}: the spend carries no rk"))?;
 
         // Rebuild the pair's commitments and recompute alpha independently.
         let ids: Vec<frost::Identifier> = [x, y]
@@ -949,62 +1088,79 @@ fn review_sign(args: &[String]) -> Result<(), String> {
             })
             .collect::<Result<_, String>>()?;
 
-        let mut commitments = BTreeMap::new();
-        for (k, id) in [x, y].iter().zip(ids.iter()) {
-            let raw = shared
-                .read_hex(&format!("commitment_{name}_{}.hex", MEMBERS[*k].0))
-                .map_err(|e| format!("{e}"))?;
-            commitments.insert(
-                *id,
-                frost::round1::SigningCommitments::deserialize(&raw)
-                    .map_err(|e| format!("{e}"))?,
-            );
+        // One pass per spend. Each has its own commitment round, its own randomiser and
+        // its own rk, so the check below is repeated rather than hoisted: a spend whose
+        // rk matched some *other* spend's alpha would otherwise go unnoticed.
+        let mut per_spend = Vec::new();
+        for (i, want_nf) in want_nfs.iter().enumerate() {
+            let mut commitments = BTreeMap::new();
+            for (k, id) in [x, y].iter().zip(ids.iter()) {
+                let raw = shared
+                    .read_hex(&commitment_file(name, MEMBERS[*k].0, i))
+                    .map_err(|e| format!("{e}"))?;
+                commitments.insert(
+                    *id,
+                    frost::round1::SigningCommitments::deserialize(&raw)
+                        .map_err(|e| format!("{e}"))?,
+                );
+            }
+
+            let seed = alpha_seed(&proposal_id, (&ids[0], &ids[1]), i as u32);
+            let recomputed = loki_poc::intent::alpha_for_candidate(&seed, &commitments)
+                .map_err(|e| format!("{name}: spend {i}: alpha: {e}"))?;
+            let recomputed_bytes: [u8; 32] = recomputed
+                .serialize()
+                .as_slice()
+                .try_into()
+                .map_err(|_| "alpha is not 32 bytes")?;
+
+            let (in_pczt_alpha, in_pczt_rk) = *found
+                .get(want_nf)
+                .ok_or(format!("{name}: spend {i} carries no alpha"))?;
+
+            // rk must equal ak randomized by the alpha WE recomputed, not the one supplied.
+            let scalar = loki_poc::candidate::alpha_from_canonical_bytes(&recomputed_bytes)
+                .ok_or(format!("{name}: recomputed alpha is noncanonical"))?;
+            if in_pczt_alpha != scalar {
+                return Err(format!(
+                    "{name}: REFUSED: {}",
+                    Refusal::RkDoesNotMatchAlpha {
+                        expected: hex::encode(recomputed_bytes),
+                        found: format!("a different alpha on spend {i}"),
+                    }
+                ));
+            }
+
+            let expect_rk: orchard::primitives::redpallas::VerificationKey<
+                orchard::primitives::redpallas::SpendAuth,
+            > = orchard::keys::SpendValidatingKey::from(vault_fvk.clone()).randomize(&scalar);
+            if <[u8; 32]>::from(&expect_rk) != in_pczt_rk {
+                return Err(format!(
+                    "{name}: REFUSED: {}",
+                    Refusal::RkDoesNotMatchAlpha {
+                        expected: hex::encode(<[u8; 32]>::from(&expect_rk)),
+                        found: hex::encode(in_pczt_rk),
+                    }
+                ));
+            }
+
+            // Build the FROST package HERE, from the local sighash and the sorted
+            // commitments. A package that named a different sighash could not be used.
+            // Every spend signs the same sighash; only the commitments differ.
+            let package = frost::SigningPackage::new(commitments, &sighash);
+            if package.message() != &sighash[..] {
+                return Err(format!("{name}: REFUSED: {}", Refusal::PackageSighashMismatch));
+            }
+
+            per_spend.push((package, recomputed));
         }
 
-        let seed = alpha_seed(&proposal_id, (&ids[0], &ids[1]), 0);
-        let recomputed = loki_poc::intent::alpha_for_candidate(&seed, &commitments)
-            .map_err(|e| format!("{name}: alpha: {e}"))?;
-        let recomputed_bytes: [u8; 32] = recomputed
-            .serialize()
-            .as_slice()
-            .try_into()
-            .map_err(|_| "alpha is not 32 bytes")?;
-
-        // rk must equal ak randomized by the alpha WE recomputed, not the one supplied.
-        let scalar = loki_poc::candidate::alpha_from_canonical_bytes(&recomputed_bytes)
-            .ok_or(format!("{name}: recomputed alpha is noncanonical"))?;
-        if in_pczt_alpha != scalar {
-            return Err(format!(
-                "{name}: REFUSED: {}",
-                Refusal::RkDoesNotMatchAlpha {
-                    expected: hex::encode(recomputed_bytes),
-                    found: "a different alpha in the PCZT".into(),
-                }
-            ));
-        }
-
-        let expect_rk: orchard::primitives::redpallas::VerificationKey<
-            orchard::primitives::redpallas::SpendAuth,
-        > = orchard::keys::SpendValidatingKey::from(vault_fvk.clone()).randomize(&scalar);
-        if <[u8; 32]>::from(&expect_rk) != in_pczt_rk {
-            return Err(format!(
-                "{name}: REFUSED: {}",
-                Refusal::RkDoesNotMatchAlpha {
-                    expected: hex::encode(<[u8; 32]>::from(&expect_rk)),
-                    found: hex::encode(in_pczt_rk),
-                }
-            ));
-        }
-
-        // Build the FROST package HERE, from the local sighash and the sorted
-        // commitments. A package that named a different sighash could not be used.
-        let package = frost::SigningPackage::new(commitments.clone(), &sighash);
-        if package.message() != &sighash[..] {
-            return Err(format!("{name}: REFUSED: {}", Refusal::PackageSighashMismatch));
-        }
-
-        reviewed.push((name, package, recomputed, sighash));
-        println!("{who:<6} {name}  reviewed: effects match, rk matches recomputed alpha");
+        let spends = per_spend.len();
+        reviewed.push((name, per_spend, sighash));
+        println!(
+            "{who:<6} {name}  reviewed: effects match, rk matches recomputed alpha on all \
+             {spends} spend(s)"
+        );
     }
 
     if reviewed.is_empty() {
@@ -1012,30 +1168,30 @@ fn review_sign(args: &[String]) -> Result<(), String> {
     }
 
     // ── only now, emit the share batch ──────────────────────────────────────
-    for (name, package, alpha, sighash) in reviewed {
-        let nonces = frost::round1::SigningNonces::deserialize(
-            &me.read_hex(&format!("nonces_{name}.hex"))
-                .map_err(|e| format!("{name}: run commit first: {e}"))?,
-        )
-        .map_err(|e| format!("{name}: nonces: {e}"))?;
-
-        #[allow(deprecated)] // alpha is fixed by the transaction; the seed path cannot be used
-        let share = frost_rerandomized::sign(&package, &nonces, &key_package, alpha)
-            .map_err(|e| format!("{name}: sign: {e}"))?;
-
-        shared
-            .write_hex(
-                &format!("share_{name}_{who}.hex"),
-                &share.serialize(),
+    for (name, per_spend, sighash) in reviewed {
+        let spends = per_spend.len();
+        for (i, (package, alpha)) in per_spend.into_iter().enumerate() {
+            let nonces = frost::round1::SigningNonces::deserialize(
+                &me.read_hex(&nonce_file(name, i))
+                    .map_err(|e| format!("{name}: spend {i}: run commit first: {e}"))?,
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("{name}: spend {i}: nonces: {e}"))?;
 
-        // The nonce is spent. Remove it so it cannot be used a second time.
-        std::fs::remove_file(me.path().join(format!("nonces_{name}.hex")))
-            .map_err(|e| format!("{name}: removing spent nonce: {e}"))?;
+            #[allow(deprecated)] // alpha is fixed by the transaction; the seed path cannot be used
+            let share = frost_rerandomized::sign(&package, &nonces, &key_package, alpha)
+                .map_err(|e| format!("{name}: spend {i}: sign: {e}"))?;
+
+            shared
+                .write_hex(&share_file(name, who, i), &share.serialize())
+                .map_err(|e| e.to_string())?;
+
+            // The nonce is spent. Remove it so it cannot be used a second time.
+            std::fs::remove_file(me.path().join(nonce_file(name, i)))
+                .map_err(|e| format!("{name}: spend {i}: removing spent nonce: {e}"))?;
+        }
 
         println!(
-            "{who:<6} {name}  share emitted, nonce consumed  (sighash {})",
+            "{who:<6} {name}  {spends} share(s) emitted, nonce(s) consumed  (sighash {})",
             &hex::encode(sighash)[..16]
         );
     }
@@ -1096,7 +1252,7 @@ fn finish(args: &[String]) -> Result<(), String> {
     let (name, x, y) = PAIR;
 
     let intent_kv = kv(&shared.read_text("intent.txt").map_err(|e| format!("{e}"))?);
-    let want_nf: [u8; 32] = hexn(&intent_kv, "input_nullifier")?;
+    let want_nfs = intent_nullifiers(&intent_kv)?;
     let proposal_id: [u8; 32] = hexn(&intent_kv, "proposal_id")?;
 
     let ak: [u8; 32] = shared.read_hex("group_ak.hex").map_err(|e| format!("{e}"))?
@@ -1131,83 +1287,106 @@ fn finish(args: &[String]) -> Result<(), String> {
         })
         .collect::<Result<_, String>>()?;
 
-    let mut commitments = BTreeMap::new();
-    for (k, id) in [x, y].iter().zip(ids.iter()) {
-        let raw = shared
-            .read_hex(&format!("commitment_{name}_{}.hex", MEMBERS[*k].0))
-            .map_err(|e| format!("{e}"))?;
-        commitments.insert(
-            *id,
-            frost::round1::SigningCommitments::deserialize(&raw).map_err(|e| format!("{e}"))?,
+    // One aggregation per spend. Each spend has its own commitment round, randomiser and
+    // signature, so there is no single group signature to compute here -- there are as
+    // many as the proposal has inputs, and each is applied to its own action.
+    let mut signer = Signer::new(pczt.clone()).map_err(|e| format!("signer: {e:?}"))?;
+    let mut spend_indices = Vec::new();
+
+    for (i, want_nf) in want_nfs.iter().enumerate() {
+        let mut commitments = BTreeMap::new();
+        for (k, id) in [x, y].iter().zip(ids.iter()) {
+            let raw = shared
+                .read_hex(&commitment_file(name, MEMBERS[*k].0, i))
+                .map_err(|e| format!("{e}"))?;
+            commitments.insert(
+                *id,
+                frost::round1::SigningCommitments::deserialize(&raw)
+                    .map_err(|e| format!("{e}"))?,
+            );
+        }
+
+        let seed = alpha_seed(&proposal_id, (&ids[0], &ids[1]), i as u32);
+        let alpha = loki_poc::intent::alpha_for_candidate(&seed, &commitments)
+            .map_err(|e| format!("spend {i}: alpha: {e}"))?;
+
+        // Verify and aggregate this spend's two shares. `aggregate` checks each share and
+        // names any culprit, so a bad share is identified rather than silently producing
+        // garbage.
+        let package = frost::SigningPackage::new(commitments, &sighash);
+        let mut shares = BTreeMap::new();
+        for (k, id) in [x, y].iter().zip(ids.iter()) {
+            let raw = shared
+                .read_hex(&share_file(name, MEMBERS[*k].0, i))
+                .map_err(|e| format!("run review-sign first: {e}"))?;
+            shares.insert(
+                *id,
+                frost::round2::SignatureShare::deserialize(&raw).map_err(|e| format!("{e}"))?,
+            );
+        }
+
+        let params = frost_rerandomized::RandomizedParams::from_randomizer(
+            public_package.verifying_key(),
+            alpha,
         );
+        let group_sig = frost_rerandomized::aggregate(&package, &shares, &public_package, &params)
+            .map_err(|e| format!("spend {i}: aggregate: {e}"))?;
+
+        // The signature verifies under ak+alpha before it ever reaches the node.
+        params
+            .randomized_verifying_key()
+            .verify(&sighash, &group_sig)
+            .map_err(|e| format!("spend {i}: the aggregated signature does not verify: {e}"))?;
+
+        // Cross the version boundary as 64 canonical bytes.
+        let sig_bytes: [u8; 64] = group_sig
+            .serialize()
+            .map_err(|e| format!("{e}"))?
+            .as_slice()
+            .try_into()
+            .map_err(|_| "signature is not 64 bytes")?;
+        let orchard_sig =
+            orchard::primitives::redpallas::Signature::<
+                orchard::primitives::redpallas::SpendAuth,
+            >::from(sig_bytes);
+
+        // Which action spends this note? Matched by nullifier, not by position, so the
+        // signature cannot land on an action it was not made for.
+        let index = pczt
+            .ironwood()
+            .actions()
+            .iter()
+            .position(|a| a.spend().nullifier() == want_nf)
+            .ok_or(format!("the candidate does not spend note {i}"))?;
+
+        signer
+            .apply_ironwood_signature(index, orchard_sig)
+            .map_err(|e| format!("spend {i}: apply signature: {e:?}"))?;
+        spend_indices.push(index);
+        println!("{name}  spend {i}: two shares aggregated, verified, applied to action {index}");
     }
 
-    let seed = alpha_seed(&proposal_id, (&ids[0], &ids[1]), 0);
-    let alpha = loki_poc::intent::alpha_for_candidate(&seed, &commitments)
-        .map_err(|e| format!("alpha: {e}"))?;
-
-    // Verify and aggregate the two shares. `aggregate` checks each share and names any
-    // culprit, so a bad share is identified rather than silently producing garbage.
-    let package = frost::SigningPackage::new(commitments, &sighash);
-    let mut shares = BTreeMap::new();
-    for (k, id) in [x, y].iter().zip(ids.iter()) {
-        let raw = shared
-            .read_hex(&format!("share_{name}_{}.hex", MEMBERS[*k].0))
-            .map_err(|e| format!("run review-sign first: {e}"))?;
-        shares.insert(
-            *id,
-            frost::round2::SignatureShare::deserialize(&raw).map_err(|e| format!("{e}"))?,
-        );
-    }
-
-    let params = frost_rerandomized::RandomizedParams::from_randomizer(
-        public_package.verifying_key(),
-        alpha,
-    );
-    let group_sig = frost_rerandomized::aggregate(&package, &shares, &public_package, &params)
-        .map_err(|e| format!("aggregate: {e}"))?;
-
-    // The signature verifies under ak+alpha before it ever reaches the node.
-    params
-        .randomized_verifying_key()
-        .verify(&sighash, &group_sig)
-        .map_err(|e| format!("the aggregated signature does not verify: {e}"))?;
-    println!("{name}  aggregated two shares; verifies under ak+alpha");
-
-    // Cross the version boundary as 64 canonical bytes.
-    let sig_bytes: [u8; 64] = group_sig
-        .serialize()
-        .map_err(|e| format!("{e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "signature is not 64 bytes")?;
-    let orchard_sig =
-        orchard::primitives::redpallas::Signature::<
-            orchard::primitives::redpallas::SpendAuth,
-        >::from(sig_bytes);
-
-    // Which action spends our note?
-    let index = pczt
-        .ironwood()
-        .actions()
-        .iter()
-        .position(|a| a.spend().nullifier() == &want_nf)
-        .ok_or("the candidate does not spend the funded note")?;
-
-    let mut signer = Signer::new(pczt).map_err(|e| format!("signer: {e:?}"))?;
-    signer
-        .apply_ironwood_signature(index, orchard_sig)
-        .map_err(|e| format!("apply signature: {e:?}"))?;
     let signed = signer.finish();
-    println!("{name}  signature applied to action {index}");
 
     // ── everything below happens AFTER signing ──────────────────────────────
     let rpc = loki_poc::rpc::Rpc::regtest();
     let (cmxs, anchor, tip) = chain_commitments(&rpc)?;
 
-    let note_kv = kv(&vault_dir.read_text("funded_note.txt").map_err(|e| format!("{e}"))?);
-    let position: u64 = note_kv["position"].parse().map_err(|e| format!("{e}"))?;
-    let path = loki_poc::witness::witness_for(&cmxs, position, &anchor)?;
+    // A witness per spend, each against the same anchor. The position comes from the
+    // scan output, matched on nullifier, so spend i gets note i's merkle path.
+    let scanned = vault_dir
+        .read_text("funded_notes.txt")
+        .map_err(|e| format!("{e}"))?;
+    let mut witnesses = Vec::new();
+    for (want_nf, index) in want_nfs.iter().zip(spend_indices.iter()) {
+        let line = scanned
+            .lines()
+            .map(kv_record)
+            .find(|m| m.get("nullifier").map(String::as_str) == Some(&hex::encode(want_nf)))
+            .ok_or("the scan output has no note matching a spent nullifier")?;
+        let position: u64 = line["position"].parse().map_err(|e| format!("{e}"))?;
+        witnesses.push((*index, loki_poc::witness::witness_for(&cmxs, position, &anchor)?));
+    }
     println!("{name}  anchor {} at height {tip}", &hex::encode(anchor)[..16]);
 
     let updated = Updater::new(signed)
@@ -1217,7 +1396,7 @@ fn finish(args: &[String]) -> Result<(), String> {
                 .ok_or("the node's anchor is not a valid Anchor")?,
         )
         .map_err(|e| format!("set anchor: {e:?}"))?
-        .set_ironwood_spend_witnesses(vec![(index, path)])
+        .set_ironwood_spend_witnesses(witnesses)
         .map_err(|e| format!("set witness: {e:?}"))?
         .finish();
     println!("{name}  anchor and witness installed after signing");
@@ -1494,15 +1673,40 @@ struct AggregateInputs {
     candidate: Vec<u8>,
     public_package: Vec<u8>,
     ids: [Vec<u8>; 2],
-    commitments: [Vec<u8>; 2],
-    shares: [Vec<u8>; 2],
+    commitments: Vec<[Vec<u8>; 2]>,
+    shares: Vec<[Vec<u8>; 2]>,
     proposal_id: [u8; 32],
-    want_nf: [u8; 32],
+    want_nfs: Vec<[u8; 32]>,
+}
+
+/// Compute the v6 shielded sighash of finalized bytes for comparison with the PCZT.
+/// The transaction crate requires a transparent signing context even when the bundle is
+/// absent, so map only that empty slot to its effects-only authorization type.
+fn finalized_sighash(tx: &zcash_primitives::transaction::Transaction) -> Result<[u8; 32], String> {
+    use zcash_primitives::transaction::{Authorization, TransactionData};
+    struct ShieldedOnly;
+    impl Authorization for ShieldedOnly {
+        type TransparentAuth = zcash_transparent::bundle::EffectsOnly;
+        type SaplingAuth = sapling_crypto::bundle::Authorized;
+        type OrchardAuth = orchard::bundle::Authorized;
+    }
+    if tx.transparent_bundle().is_some() || tx.sapling_bundle().is_some() || tx.orchard_bundle().is_some() {
+        return Err("the finalized transaction has an unexpected pool".into());
+    }
+    let data: TransactionData<ShieldedOnly> = tx.clone().into_data().try_map_bundles(
+        |_| Ok::<_, String>(None), |_| Ok::<_, String>(None), Ok::<_, String>,
+    )?;
+    let digest = zcash_primitives::transaction::sighash::signature_hash(
+        &data,
+        &zcash_primitives::transaction::sighash::SignableInput::Shielded,
+        &data.digest(zcash_primitives::transaction::txid::TxIdDigester),
+    );
+    Ok(*digest.as_ref())
 }
 
 /// Verify the two shares, aggregate, check the group signature under `ak + [alpha]G`, and
-/// apply it. Returns the signed PCZT, its effects sighash, and the action index.
-fn aggregate_and_apply(i: &AggregateInputs) -> Result<(pczt::Pczt, [u8; 32], usize), String> {
+/// apply it for every spend. Returns the signed PCZT, its effects sighash, and action indices.
+fn aggregate_and_apply(i: &AggregateInputs) -> Result<(pczt::Pczt, [u8; 32], Vec<usize>), String> {
     use loki_poc::intent::alpha_seed;
     use pczt::roles::signer::Signer;
 
@@ -1522,73 +1726,56 @@ fn aggregate_and_apply(i: &AggregateInputs) -> Result<(pczt::Pczt, [u8; 32], usi
         .map(|raw| frost::Identifier::deserialize(raw).map_err(|e| format!("{e}")))
         .collect::<Result<_, String>>()?;
 
-    let mut commitments = BTreeMap::new();
-    for (id, raw) in ids.iter().zip(i.commitments.iter()) {
-        commitments.insert(
-            *id,
-            frost::round1::SigningCommitments::deserialize(raw).map_err(|e| format!("{e}"))?,
-        );
+    let mut signer = Signer::new(pczt.clone()).map_err(|e| format!("signer: {e:?}"))?;
+    if i.want_nfs.is_empty() || i.commitments.len() != i.want_nfs.len() || i.shares.len() != i.want_nfs.len() {
+        return Err("the replica has an incomplete spend batch".into());
     }
-
-    // alpha is recomputed from the proposal and the published commitments, not accepted.
-    let seed = alpha_seed(&i.proposal_id, (&ids[0], &ids[1]), 0);
-    let alpha = loki_poc::intent::alpha_for_candidate(&seed, &commitments)
-        .map_err(|e| format!("alpha: {e}"))?;
-
-    let package = frost::SigningPackage::new(commitments, &sighash);
-    let mut shares = BTreeMap::new();
-    for (id, raw) in ids.iter().zip(i.shares.iter()) {
-        shares.insert(
-            *id,
-            frost::round2::SignatureShare::deserialize(raw).map_err(|e| format!("{e}"))?,
-        );
+    let mut indices = Vec::with_capacity(i.want_nfs.len());
+    for (spend, want_nf) in i.want_nfs.iter().enumerate() {
+        let mut commitments = BTreeMap::new();
+        for (id, raw) in ids.iter().zip(i.commitments[spend].iter()) {
+            commitments.insert(*id, frost::round1::SigningCommitments::deserialize(raw)
+                .map_err(|e| format!("spend {spend}: {e}"))?);
+        }
+        let seed = alpha_seed(&i.proposal_id, (&ids[0], &ids[1]), spend as u32);
+        let alpha = loki_poc::intent::alpha_for_candidate(&seed, &commitments)
+            .map_err(|e| format!("spend {spend}: alpha: {e}"))?;
+        let package = frost::SigningPackage::new(commitments, &sighash);
+        let mut shares = BTreeMap::new();
+        for (id, raw) in ids.iter().zip(i.shares[spend].iter()) {
+            shares.insert(*id, frost::round2::SignatureShare::deserialize(raw)
+                .map_err(|e| format!("spend {spend}: {e}"))?);
+        }
+        let params = frost_rerandomized::RandomizedParams::from_randomizer(public_package.verifying_key(), alpha);
+        let group_sig = frost_rerandomized::aggregate(&package, &shares, &public_package, &params)
+            .map_err(|e| format!("spend {spend}: aggregate: {e}"))?;
+        params.randomized_verifying_key().verify(&sighash, &group_sig)
+            .map_err(|e| format!("spend {spend}: the aggregated signature does not verify: {e}"))?;
+        let sig_bytes: [u8; 64] = group_sig.serialize().map_err(|e| format!("{e}"))?
+            .as_slice().try_into().map_err(|_| "signature is not 64 bytes")?;
+        let orchard_sig = orchard::primitives::redpallas::Signature::<
+            orchard::primitives::redpallas::SpendAuth,
+        >::from(sig_bytes);
+        let index = pczt.ironwood().actions().iter()
+            .position(|a| a.spend().nullifier() == want_nf)
+            .ok_or(format!("the candidate does not spend note {spend} named by the intent"))?;
+        if indices.contains(&index) { return Err("the intent names the same input twice".into()); }
+        signer.apply_ironwood_signature(index, orchard_sig)
+            .map_err(|e| format!("spend {spend}: apply signature: {e:?}"))?;
+        indices.push(index);
     }
-
-    let params = frost_rerandomized::RandomizedParams::from_randomizer(
-        public_package.verifying_key(),
-        alpha,
-    );
-    let group_sig = frost_rerandomized::aggregate(&package, &shares, &public_package, &params)
-        .map_err(|e| format!("aggregate: {e}"))?;
-    params
-        .randomized_verifying_key()
-        .verify(&sighash, &group_sig)
-        .map_err(|e| format!("the aggregated signature does not verify: {e}"))?;
-
-    let sig_bytes: [u8; 64] = group_sig
-        .serialize()
-        .map_err(|e| format!("{e}"))?
-        .as_slice()
-        .try_into()
-        .map_err(|_| "signature is not 64 bytes")?;
-    let orchard_sig = orchard::primitives::redpallas::Signature::<
-        orchard::primitives::redpallas::SpendAuth,
-    >::from(sig_bytes);
-
-    let index = pczt
-        .ironwood()
-        .actions()
-        .iter()
-        .position(|a| a.spend().nullifier() == &i.want_nf)
-        .ok_or("the candidate does not spend the note the intent names")?;
-
-    let mut signer = Signer::new(pczt).map_err(|e| format!("signer: {e:?}"))?;
-    signer
-        .apply_ironwood_signature(index, orchard_sig)
-        .map_err(|e| format!("apply signature: {e:?}"))?;
-    Ok((signer.finish(), sighash, index))
+    Ok((signer.finish(), sighash, indices))
 }
 
 /// Install the anchor and witness AFTER signing, prove, extract.
 ///
-/// `position` and `anchor` come from whoever called this; in path B they come from the
+/// `positions` and `anchor` come from whoever called this; in path B they come from the
 /// finisher's own scan. The sighash is re-checked after installation and must be
 /// byte-identical, which is the claim the whole v6 path rests on.
 fn prove_and_extract(
     signed: pczt::Pczt,
     sighash: &[u8],
-    index: usize,
-    position: u64,
+    positions: &[(usize, u64)],
     cmxs: &[[u8; 32]],
     anchor: [u8; 32],
     label: &str,
@@ -1598,7 +1785,9 @@ fn prove_and_extract(
         tx_extractor::TransactionExtractor, updater::Updater,
     };
 
-    let path = loki_poc::witness::witness_for(cmxs, position, &anchor)?;
+    let witnesses = positions.iter().map(|(index, position)|
+        Ok((*index, loki_poc::witness::witness_for(cmxs, *position, &anchor)?))
+    ).collect::<Result<Vec<_>, String>>()?;
 
     let updated = Updater::new(signed)
         .set_ironwood_anchor(
@@ -1607,7 +1796,7 @@ fn prove_and_extract(
                 .ok_or("the node's anchor is not a valid Anchor")?,
         )
         .map_err(|e| format!("set anchor: {e:?}"))?
-        .set_ironwood_spend_witnesses(vec![(index, path)])
+        .set_ironwood_spend_witnesses(witnesses)
         .map_err(|e| format!("set witness: {e:?}"))?
         .finish();
     println!("{label}  anchor and witness installed after signing");
@@ -1659,14 +1848,27 @@ fn prove_and_extract(
 fn replica_inputs(r: &MemberDir) -> Result<AggregateInputs, String> {
     let intent_kv = kv(&r.read_text("intent.txt").map_err(|e| format!("{e}"))?);
     let rd = |f: &str| r.read_hex(f).map_err(|e| format!("{f}: {e}"));
+    let want_nfs = intent_nullifiers(&intent_kv)?;
+    let mut commitments = Vec::new();
+    let mut shares = Vec::new();
+    for spend in 0..want_nfs.len() {
+        commitments.push([
+            rd(&commitment_file("AC", "alice", spend))?,
+            rd(&commitment_file("AC", "carol", spend))?,
+        ]);
+        shares.push([
+            rd(&share_file("AC", "alice", spend))?,
+            rd(&share_file("AC", "carol", spend))?,
+        ]);
+    }
     Ok(AggregateInputs {
         candidate: rd("candidate_AC.pczt.hex")?,
         public_package: rd("public_package.hex")?,
         ids: [rd("identifier_alice.hex")?, rd("identifier_carol.hex")?],
-        commitments: [rd("commitment_AC_alice.hex")?, rd("commitment_AC_carol.hex")?],
-        shares: [rd("share_AC_alice.hex")?, rd("share_AC_carol.hex")?],
+        commitments,
+        shares,
         proposal_id: hexn(&intent_kv, "proposal_id")?,
-        want_nf: hexn(&intent_kv, "input_nullifier")?,
+        want_nfs,
     })
 }
 
@@ -1679,28 +1881,27 @@ fn post_final(args: &[String]) -> Result<(), String> {
     let shared = MemberDir::open(&root, &shared_name());
 
     let intent_kv = kv(&shared.read_text("intent.txt").map_err(|e| format!("{e}"))?);
+    let want_nfs = intent_nullifiers(&intent_kv)?;
+    let rd = |f: &str| shared.read_hex(f).map_err(|e| format!("{f}: {e}"));
     let inputs = AggregateInputs {
-        candidate: shared.read_hex("candidate_AC.pczt.hex").map_err(|e| format!("{e}"))?,
-        public_package: MemberDir::open(&root, "alice")
-            .read_hex("public_package.hex").map_err(|e| format!("{e}"))?,
+        candidate: rd("candidate_AC.pczt.hex")?,
+        public_package: MemberDir::open(&root, "alice").read_hex("public_package.hex").map_err(|e| format!("{e}"))?,
         ids: [
             MemberDir::open(&root, "alice").read_hex("identifier.hex").map_err(|e| format!("{e}"))?,
             MemberDir::open(&root, "carol").read_hex("identifier.hex").map_err(|e| format!("{e}"))?,
         ],
-        commitments: [
-            shared.read_hex("commitment_AC_alice.hex").map_err(|e| format!("{e}"))?,
-            shared.read_hex("commitment_AC_carol.hex").map_err(|e| format!("{e}"))?,
-        ],
-        shares: [
-            shared.read_hex("share_AC_alice.hex").map_err(|e| format!("{e}"))?,
-            shared.read_hex("share_AC_carol.hex").map_err(|e| format!("{e}"))?,
-        ],
+        commitments: (0..want_nfs.len()).map(|spend| Ok([
+            rd(&commitment_file("AC", "alice", spend))?, rd(&commitment_file("AC", "carol", spend))?,
+        ])).collect::<Result<_, String>>()?,
+        shares: (0..want_nfs.len()).map(|spend| Ok([
+            rd(&share_file("AC", "alice", spend))?, rd(&share_file("AC", "carol", spend))?,
+        ])).collect::<Result<_, String>>()?,
         proposal_id: hexn(&intent_kv, "proposal_id")?,
-        want_nf: hexn(&intent_kv, "input_nullifier")?,
+        want_nfs,
     };
 
-    let (signed, sighash, index) = aggregate_and_apply(&inputs)?;
-    println!("AC  aggregated two shares; verifies under ak+alpha");
+    let (signed, sighash, indices) = aggregate_and_apply(&inputs)?;
+    println!("AC  aggregated two shares per spend; verifies under ak+alpha");
 
     let rpc = loki_poc::rpc::Rpc::regtest();
     let ak: [u8; 32] = shared.read_hex("group_ak.hex").map_err(|e| format!("{e}"))?
@@ -1708,14 +1909,13 @@ fn post_final(args: &[String]) -> Result<(), String> {
     let fvk = vault::test_only_fvk(&ak).map_err(|e| format!("{e:?}"))?;
     let chain = loki_poc::scan::scan_chain(&rpc, &fvk)?;
     let anchor = loki_poc::scan::chain_anchor(&rpc, chain.tip)?;
-    let note = chain
-        .notes
-        .iter()
-        .find(|n| n.nullifier == inputs.want_nf)
-        .ok_or("the intent's input note is not on this chain")?;
+    let positions = inputs.want_nfs.iter().zip(indices).map(|(nf, index)| {
+        let note = chain.notes.iter().find(|n| &n.nullifier == nf)
+            .ok_or("an intent input note is not on this chain")?;
+        Ok((index, note.position))
+    }).collect::<Result<Vec<_>, String>>()?;
 
-    let (raw, txid) =
-        prove_and_extract(signed, &sighash, index, note.position, &chain.cmxs, anchor, "AC")?;
+    let (raw, txid) = prove_and_extract(signed, &sighash, &positions, &chain.cmxs, anchor, "AC")?;
 
     shared.write_hex("final_tx.hex", &raw).map_err(|e| e.to_string())?;
     shared
@@ -1738,6 +1938,8 @@ fn replicate(args: &[String]) -> Result<(), String> {
     let out = PathBuf::from(args.get(1).ok_or("usage: replicate <state-dir> <replica-dir> [--with-final]")?);
     let with_final = args.iter().any(|a| a == "--with-final");
     let shared = MemberDir::open(&root, &shared_name());
+    let intent_kv = kv(&shared.read_text("intent.txt").map_err(|e| format!("{e}"))?);
+    let spend_count = intent_nullifiers(&intent_kv)?.len();
 
     std::fs::create_dir_all(&out).map_err(|e| format!("{e}"))?;
     let replica = MemberDir::open(out.parent().unwrap_or(&out), out.file_name()
@@ -1748,14 +1950,19 @@ fn replicate(args: &[String]) -> Result<(), String> {
         "intent.txt",
         "candidate_AC.pczt.hex",
         "group_ak.hex",
-        "commitment_AC_alice.hex",
-        "commitment_AC_carol.hex",
-        "share_AC_alice.hex",
-        "share_AC_carol.hex",
     ] {
         let bytes = std::fs::read(shared.path().join(f))
             .map_err(|e| format!("{f}: {e} (run propose and review-sign first)"))?;
         std::fs::write(replica.path().join(f), bytes).map_err(|e| format!("{f}: {e}"))?;
+    }
+    for spend in 0..spend_count {
+        for member in ["alice", "carol"] {
+            for file in [commitment_file("AC", member, spend), share_file("AC", member, spend)] {
+                let bytes = std::fs::read(shared.path().join(&file))
+                    .map_err(|e| format!("{file}: {e} (run review-sign first)"))?;
+                std::fs::write(replica.path().join(&file), bytes).map_err(|e| format!("{file}: {e}"))?;
+            }
+        }
     }
 
     // The group's public key package and the two approvers' public identifiers. These are
@@ -1780,10 +1987,13 @@ fn replicate(args: &[String]) -> Result<(), String> {
          #\n\
          # copied (all public, all relay-carried):\n\
          intent.txt\ncandidate_AC.pczt.hex\ngroup_ak.hex\npublic_package.hex\n\
-         identifier_alice.hex\nidentifier_carol.hex\n\
-         commitment_AC_alice.hex\ncommitment_AC_carol.hex\n\
-         share_AC_alice.hex\nshare_AC_carol.hex\n",
+         identifier_alice.hex\nidentifier_carol.hex\n",
     );
+    for spend in 0..spend_count {
+        for member in ["alice", "carol"] {
+            manifest.push_str(&format!("{}\n{}\n", commitment_file("AC", member, spend), share_file("AC", member, spend)));
+        }
+    }
 
     if with_final {
         std::fs::write(
@@ -1804,6 +2014,7 @@ fn replicate(args: &[String]) -> Result<(), String> {
          #   */nonces_*.hex             every member's nonce secrets\n\
          #   funded_note.txt            an approver's scan output: note, rho, rseed, position\n\
          #   funded_note_alt.txt        the same for the second note\n\
+         #   funded_notes.txt           the proposer's multi-note scan output\n\
          #   cmxs.hex                   an approver's commitment stream\n\
          #   anchor.txt                 an approver's anchor\n\
          # The finisher derives the note, its position, the commitment stream and the\n\
@@ -1843,7 +2054,7 @@ fn finish_second(args: &[String]) -> Result<(), String> {
             ));
         }
     }
-    for forbidden in ["funded_note.txt", "cmxs.hex", "anchor.txt"] {
+    for forbidden in ["funded_note.txt", "funded_notes.txt", "cmxs.hex", "anchor.txt"] {
         if replica.exists(forbidden) {
             return Err(format!(
                 "the replica contains {forbidden}, which is an approver's scan output; \
@@ -1853,7 +2064,7 @@ fn finish_second(args: &[String]) -> Result<(), String> {
     }
 
     let intent_kv = kv(&replica.read_text("intent.txt").map_err(|e| format!("{e}"))?);
-    let want_nf: [u8; 32] = hexn(&intent_kv, "input_nullifier")?;
+    let want_nfs = intent_nullifiers(&intent_kv)?;
 
     // THE TEST-ONLY KEY CONSTRUCTION, stated at the point of use. The vault FVK is a
     // documented splice of the DKG group key into `ak || nk || rivk`, NOT the ZIP 2005
@@ -1865,59 +2076,75 @@ fn finish_second(args: &[String]) -> Result<(), String> {
     println!("second device: vault FVK rebuilt from the replicated group ak");
     println!("               TEST-ONLY construction (ak || nk || rivk), not ZIP 2005");
 
+    // Check posted bytes before the chain scan. A substituted transaction must be
+    // refused for its effects even if the original input has since been mined away.
+    let posted = if replica.exists("final_tx.hex") {
+        let raw = replica.read_hex("final_tx.hex").map_err(|e| format!("{e}"))?;
+        let tx = zcash_primitives::transaction::Transaction::read(
+            &raw[..], zcash_protocol::consensus::BranchId::Nu6_3,
+        ).map_err(|e| format!("the posted final transaction does not parse: {e}"))?;
+        let candidate = pczt::Pczt::parse(&replica.read_hex("candidate_AC.pczt.hex").map_err(|e| format!("candidate: {e}"))?)
+            .map_err(|e| format!("parse candidate: {e:?}"))?;
+        let approved_sighash = pczt::roles::signer::Signer::new(candidate.clone())
+            .map_err(|e| format!("candidate sighash: {e:?}"))?.shielded_sighash();
+        if finalized_sighash(&tx)? != approved_sighash {
+            return Err("the posted transaction's effects differ from the signed candidate".into());
+        }
+        let bundle = tx.ironwood_bundle().ok_or("the posted transaction has no Ironwood bundle")?;
+        let expected = candidate.ironwood().actions().iter()
+            .map(|a| *a.spend().nullifier()).collect::<Vec<_>>();
+        let actual = bundle.actions().iter().map(|a| a.nullifier().to_bytes()).collect::<Vec<_>>();
+        if actual != expected || want_nfs.iter().any(|nf| !actual.contains(nf)) {
+            return Err("the posted transaction's inputs differ from the signed candidate".into());
+        }
+        let txid = tx.txid().to_string();
+        println!("path A         posted final transaction parsed: {txid}");
+        println!("path A         every input and effect matches the signed candidate");
+        Some((raw, txid))
+    } else { None };
+
     // ── its own chain scan ──────────────────────────────────────────────────
     let rpc = loki_poc::rpc::Rpc::regtest();
     let chain = loki_poc::scan::scan_chain(&rpc, &fvk)?;
     let anchor = loki_poc::scan::chain_anchor(&rpc, chain.tip)?;
-    let note = chain
-        .notes
-        .iter()
-        .find(|n| n.nullifier == want_nf)
-        .ok_or("the intent's input note was not found by this device's own scan")?;
+    let positions = want_nfs.iter().map(|nf| chain.notes.iter()
+        .find(|n| &n.nullifier == nf)
+        .map(|n| (n.position, n.value_zat))
+        .ok_or("an intent input note was not found by this device's own scan")
+    ).collect::<Result<Vec<_>, _>>()?;
+    let input_total: u64 = positions.iter().try_fold(0u64, |sum, (_, value)|
+        sum.checked_add(*value).ok_or("input values overflow")
+    )?;
     println!(
-        "               own scan: {} blocks, {} vault notes, input note at position {}",
+        "               own scan: {} blocks, {} vault notes, {} input note(s)",
         chain.tip,
         chain.notes.len(),
-        note.position
+        positions.len()
     );
     mine.write_text(
         "own_scan.txt",
         &format!(
-            "tip={}\nactions={}\nvault_notes={}\ninput_position={}\ninput_value_zat={}\nanchor={}\n",
-            chain.tip, chain.cmxs.len(), chain.notes.len(), note.position, note.value_zat,
+            "tip={}\nactions={}\nvault_notes={}\ninput_positions={}\ninput_value_zat={}\nanchor={}\n",
+            chain.tip, chain.cmxs.len(), chain.notes.len(),
+            positions.iter().map(|(position, _)| position.to_string()).collect::<Vec<_>>().join(","), input_total,
             hex::encode(anchor),
         ),
     )
     .map_err(|e| e.to_string())?;
 
     // ── path A or path B ────────────────────────────────────────────────────
-    let (raw, txid, path_name) = if replica.exists("final_tx.hex") {
-        let raw = replica.read_hex("final_tx.hex").map_err(|e| format!("{e}"))?;
-
-        // A posted transaction is still checked before it is broadcast. The finisher
-        // parses it and confirms it spends the note the intent names.
-        let tx = zcash_primitives::transaction::Transaction::read(
-            &raw[..],
-            zcash_protocol::consensus::BranchId::Nu6_3,
-        )
-        .map_err(|e| format!("the posted final transaction does not parse: {e}"))?;
-        let txid = tx.txid().to_string();
-        let bundle = tx
-            .ironwood_bundle()
-            .ok_or("the posted transaction has no Ironwood bundle")?;
-        if !bundle.actions().iter().any(|a| a.nullifier().to_bytes() == want_nf) {
-            return Err("the posted transaction does not spend the note the intent names".into());
-        }
-        println!("path A         posted final transaction parsed: {txid}");
-        println!("path A         it spends the nullifier the intent names");
+    let (raw, txid, path_name) = if let Some((raw, txid)) = posted {
         (raw, txid, "A")
     } else {
         println!("path B         no final transaction posted; re-proving the signed candidate");
         let inputs = replica_inputs(&replica)?;
-        let (signed, sighash, index) = aggregate_and_apply(&inputs)?;
-        println!("path B         aggregated two shares; verifies under ak+alpha");
+        let (signed, sighash, indices) = aggregate_and_apply(&inputs)?;
+        println!("path B         aggregated two shares per spend; verifies under ak+alpha");
+        let witnesses = indices.into_iter().zip(positions.iter()).map(|(index, (position, _))|
+            (index, *position)
+        ).collect::<Vec<_>>();
         let (raw, txid) = prove_and_extract(
-            signed, &sighash, index, note.position, &chain.cmxs, anchor, "path B       ",
+            signed, &sighash, &witnesses, &chain.cmxs, anchor, "path B       ",
         )?;
         (raw, txid, "B")
     };
@@ -1951,7 +2178,7 @@ fn verify_effects(args: &[String]) -> Result<(), String> {
     );
 
     let intent_kv = kv(&replica.read_text("intent.txt").map_err(|e| format!("{e}"))?);
-    let want_nf: [u8; 32] = hexn(&intent_kv, "input_nullifier")?;
+    let want_nfs = intent_nullifiers(&intent_kv)?;
     let want_recipient: [u8; 43] = hexn(&intent_kv, "recipient")?;
     let want_amount: u64 = intent_kv["amount_zat"].parse().map_err(|e| format!("{e}"))?;
     let want_change: u64 = intent_kv["change_zat"].parse().map_err(|e| format!("{e}"))?;
@@ -1975,14 +2202,44 @@ fn verify_effects(args: &[String]) -> Result<(), String> {
         return Err(format!("{txid} has {conf} confirmations; it is not mined"));
     }
 
+    // The consensus transaction carries the signed value balance. Reading it from the
+    // mined bytes avoids treating a proposed input value as evidence of the paid fee.
+    let raw_hex = rpc.json("getrawtransaction", &format!("[\"{txid}\", 0]"))?;
+    let raw = hex::decode(raw_hex.as_str().ok_or("getrawtransaction did not return hex")?)
+        .map_err(|e| format!("mined transaction hex: {e}"))?;
+    let mined = zcash_primitives::transaction::Transaction::read(
+        &raw[..], zcash_protocol::consensus::BranchId::Nu6_3,
+    ).map_err(|e| format!("mined transaction does not parse: {e}"))?;
+    if mined.txid().to_string() != *txid || mined.transparent_bundle().is_some()
+        || mined.sapling_bundle().is_some() || mined.orchard_bundle().is_some() {
+        return Err("mined transaction has a different txid or an unexpected pool".into());
+    }
+    let bundle = mined.ironwood_bundle().ok_or("mined transaction has no Ironwood bundle")?;
+    let candidate = pczt::Pczt::parse(&replica.read_hex("candidate_AC.pczt.hex").map_err(|e| format!("candidate: {e}"))?)
+        .map_err(|e| format!("parse candidate: {e:?}"))?;
+    let approved_sighash = pczt::roles::signer::Signer::new(candidate.clone())
+        .map_err(|e| format!("candidate sighash: {e:?}"))?.shielded_sighash();
+    if finalized_sighash(&mined)? != approved_sighash {
+        return Err("mined transaction effects differ from the signed candidate".into());
+    }
+    let expected = candidate.ironwood().actions().iter()
+        .map(|a| *a.spend().nullifier()).collect::<Vec<_>>();
+    let actual = bundle.actions().iter().map(|a| a.nullifier().to_bytes()).collect::<Vec<_>>();
+    if actual != expected || want_nfs.iter().any(|nf| !actual.contains(nf)) {
+        return Err("mined transaction inputs differ from the signed candidate".into());
+    }
+    let implied_fee: u64 = (*bundle.value_balance()).try_into()
+        .map_err(|_| "mined Ironwood value balance is not a valid fee")?;
+    if implied_fee != want_fee {
+        return Err(format!("mined fee {implied_fee} zat, intent says {want_fee}"));
+    }
+
     let actions = tx["ironwood"]["actions"]
         .as_array()
         .ok_or("the mined transaction has no Ironwood actions")?;
 
-    let mut spent = false;
     let mut paid: Option<u64> = None;
     let mut changed: Option<u64> = None;
-    let mut total_out = 0u64;
 
     for a in actions {
         let raw = loki_poc::scan::RawAction {
@@ -1998,9 +2255,6 @@ fn verify_effects(args: &[String]) -> Result<(), String> {
                 .try_into()
                 .map_err(|_| "out_ciphertext is not 80 bytes")?,
         };
-        if raw.nullifier == want_nf {
-            spent = true;
-        }
         let Some((note, memo)) = ivks
             .iter()
             .find_map(|ivk| loki_poc::scan::try_decrypt_with_memo(ivk, &raw))
@@ -2008,20 +2262,21 @@ fn verify_effects(args: &[String]) -> Result<(), String> {
             continue;
         };
         let value = note.value().inner();
-        total_out += value;
         let to = note.recipient().to_raw_address_bytes();
         if to == want_recipient {
             // The memo is padded to 512 bytes; compare the prefix the intent named and
             // require the rest to be zero, so a trailing payload cannot hide there.
-            if memo[..want_memo.len()] != want_memo[..] || memo[want_memo.len()..].iter().any(|b| *b != 0) {
+            if want_memo.len() > memo.len()
+                || memo[..want_memo.len()] != want_memo[..]
+                || memo[want_memo.len()..].iter().any(|b| *b != 0) {
                 return Err(format!(
                     "the payment output's memo is not the approved memo: chain has {}",
                     hex::encode(&memo[..want_memo.len().min(32)])
                 ));
             }
-            paid = Some(value);
+            if paid.replace(value).is_some() { return Err("multiple outputs pay the approved recipient".into()); }
         } else if to == change_addr {
-            changed = Some(value);
+            if changed.replace(value).is_some() { return Err("multiple change outputs".into()); }
         } else {
             return Err(format!(
                 "the mined transaction pays {value} zat to an address the intent does not name"
@@ -2029,9 +2284,6 @@ fn verify_effects(args: &[String]) -> Result<(), String> {
         }
     }
 
-    if !spent {
-        return Err(format!("{txid} does not spend the nullifier the intent names"));
-    }
     let paid = paid.ok_or("no output to the approved recipient could be decrypted")?;
     let changed = changed.ok_or("no change output to the vault could be decrypted")?;
     if paid != want_amount {
@@ -2041,19 +2293,10 @@ fn verify_effects(args: &[String]) -> Result<(), String> {
         return Err(format!("change {changed} zat, intent says {want_change}"));
     }
 
-    let note_value: u64 = intent_kv
-        .get("input_value_zat")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(paid + changed + want_fee);
-    let implied_fee = note_value.saturating_sub(total_out);
-    if implied_fee != want_fee {
-        return Err(format!("implied fee {implied_fee} zat, intent says {want_fee}"));
-    }
-
     println!("effects verified against the chain, not against a local file:");
     println!("  txid            {txid}");
     println!("  mined at height {height}, {conf} confirmation(s)");
-    println!("  nullifier spent {}", &hex::encode(want_nf)[..16]);
+    println!("  input notes     {} (all match the signed candidate)", want_nfs.len());
     println!("  paid            {paid} zat to {}", &hex::encode(want_recipient)[..16]);
     println!("  memo            {:?}", String::from_utf8_lossy(&want_memo));
     println!("  change          {changed} zat to the vault internal address");
@@ -2106,4 +2349,153 @@ fn tamper_cosigner_recommit(root: &std::path::Path, shared: &MemberDir) -> Resul
     println!("  commitment now {}...", &hex::encode(&after)[..16]);
     println!("alice should now refuse: the commitment set feeds alpha, and alpha fixes rk.");
     Ok(())
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use loki_poc::{candidate::{build_candidate, quote_fee, CandidateInputs, Regtest}, intent::{alpha_for_candidate, alpha_seed}};
+    use orchard::{
+        keys::Scope,
+        note::{RandomSeed, Rho},
+        value::NoteValue,
+        Note, NoteVersion,
+    };
+    use zcash_protocol::{memo::MemoBytes, value::Zatoshis};
+
+    #[test]
+    fn payment_needing_two_notes_selects_both_and_quotes_their_fee() {
+        let (_, public) = frost::keys::generate_with_dealer(
+            3,
+            2,
+            frost::keys::IdentifierList::Default,
+            rand_core::OsRng,
+        )
+        .unwrap();
+        let ak: [u8; 32] = public
+            .verifying_key()
+            .serialize()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let fvk = vault::test_only_fvk(&ak).unwrap();
+
+        let note = |value, seed: u8, position| {
+            let rho = Rho::from_bytes(&[seed + 1; 32]).unwrap();
+            let rseed = RandomSeed::from_bytes([seed + 2; 32], &rho).unwrap();
+            let note = Note::from_parts(
+                fvk.address_at(0u64, Scope::External),
+                NoteValue::from_raw(value),
+                rho,
+                rseed,
+                NoteVersion::V3,
+            )
+            .unwrap();
+            let nullifier = note.nullifier(&fvk).to_bytes();
+            (note, nullifier, position)
+        };
+        let notes = [note(30_000_000, 1, 0), note(35_000_000, 2, 1)];
+        let memo = MemoBytes::from_bytes(b"two notes").unwrap();
+        let pay = Zatoshis::from_u64(50_000_000).unwrap();
+        let recipient = fvk.address_at(7u64, Scope::External);
+
+        assert!(select_notes(&notes[..1], &fvk, recipient, pay, &memo, 20, 9_216).is_err());
+        let (selected, fee) = select_notes(&notes, &fvk, recipient, pay, &memo, 20, 9_216).unwrap();
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].0.value().inner(), 35_000_000);
+        assert!(65_000_000 >= 50_000_000 + u64::from(fee));
+    }
+
+    #[test]
+    fn second_device_aggregates_each_input_with_its_own_shares() {
+        let (shares, public) = frost::keys::generate_with_dealer(
+            3, 2, frost::keys::IdentifierList::Default, rand_core::OsRng,
+        ).unwrap();
+        let packages: BTreeMap<_, _> = shares.into_iter().map(|(id, share)|
+            (id, frost::keys::KeyPackage::try_from(share).unwrap())
+        ).collect();
+        let ids = [*packages.keys().next().unwrap(), *packages.keys().nth(2).unwrap()];
+        let ak: [u8; 32] = public.verifying_key().serialize().unwrap().try_into().unwrap();
+        let fvk = vault::test_only_fvk(&ak).unwrap();
+        let notes = [1u8, 2].map(|seed| {
+            let rho = Rho::from_bytes(&[seed + 1; 32]).unwrap();
+            let rseed = RandomSeed::from_bytes([seed + 2; 32], &rho).unwrap();
+            Note::from_parts(fvk.address_at(0u64, Scope::External), NoteValue::from_raw(30_000_000), rho, rseed, NoteVersion::V3).unwrap()
+        });
+        let proposal_id = [9u8; 32];
+        let mut nonces = Vec::new();
+        let mut commitments = Vec::new();
+        let mut alphas = Vec::new();
+        for spend in 0..2 {
+            let mut n = BTreeMap::new();
+            let mut c = BTreeMap::new();
+            for id in ids {
+                let (nonce, commitment) = frost::round1::commit(packages[&id].signing_share(), &mut rand_core::OsRng);
+                n.insert(id, nonce);
+                c.insert(id, commitment);
+            }
+            let alpha = alpha_for_candidate(&alpha_seed(&proposal_id, (&ids[0], &ids[1]), spend), &c).unwrap();
+            nonces.push(n);
+            commitments.push(c);
+            alphas.push(alpha);
+        }
+        let mut inputs = CandidateInputs {
+            vault_fvk: &fvk, notes: notes.to_vec(),
+            recipient: fvk.address_at(7u64, Scope::External),
+            amount: Zatoshis::const_from_u64(50_000_000),
+            memo: MemoBytes::empty(), change: Zatoshis::ZERO,
+            target_height: 20, expiry_height: 9_216,
+        };
+        let fee = quote_fee(&Regtest, &inputs).unwrap();
+        inputs.change = Zatoshis::const_from_u64(10_000_000 - u64::from(fee));
+        let builder_alphas = alphas.iter().map(|a| {
+            let bytes: [u8; 32] = a.serialize().try_into().unwrap();
+            loki_poc::candidate::alpha_from_canonical_bytes(&bytes).unwrap()
+        }).collect::<Vec<_>>();
+        let built = build_candidate(&Regtest, &inputs, &builder_alphas, rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng)).unwrap();
+        let candidate = pczt::roles::creator::Creator::build_from_parts(built.pczt_parts).unwrap();
+        let candidate = pczt::roles::io_finalizer::IoFinalizer::new(candidate)
+            .finalize_io(rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng)).unwrap();
+        let sighash = pczt::roles::signer::Signer::new(candidate.clone()).unwrap().shielded_sighash();
+        let mut signed_shares = Vec::new();
+        for spend in 0..2 {
+            let package = frost::SigningPackage::new(commitments[spend].clone(), &sighash);
+            let pair = ids.map(|id| {
+                #[allow(deprecated)]
+                let share = frost_rerandomized::sign(&package, &nonces[spend][&id], &packages[&id], alphas[spend]).unwrap();
+                share.serialize()
+            });
+            signed_shares.push(pair);
+        }
+        let aggregate_inputs = AggregateInputs {
+            candidate: candidate.serialize().unwrap(),
+            public_package: public.serialize().unwrap(),
+            ids: ids.map(|id| id.serialize()),
+            commitments: commitments.iter().map(|c| ids.map(|id| c[&id].serialize().unwrap())).collect(),
+            shares: signed_shares,
+            proposal_id,
+            want_nfs: notes.iter().map(|note| note.nullifier(&fvk).to_bytes()).collect(),
+        };
+        let (signed, actual_sighash, indices) = aggregate_and_apply(&aggregate_inputs).unwrap();
+        assert_eq!(actual_sighash, sighash);
+        assert_eq!(indices.len(), 2);
+        assert_ne!(indices[0], indices[1]);
+
+        let mut wrong = aggregate_inputs;
+        wrong.shares[1][0] = wrong.shares[0][0].clone();
+        assert!(aggregate_and_apply(&wrong).is_err(), "a share for input 0 cannot authorize input 1");
+
+        let cmxs = notes.map(|note| {
+            orchard::note::ExtractedNoteCommitment::from(note.commitment()).to_bytes()
+        });
+        let anchor = loki_poc::witness::CommitmentTree::build(&cmxs).unwrap().root().to_bytes();
+        let positions = indices.into_iter().enumerate().map(|(position, index)| (index, position as u64)).collect::<Vec<_>>();
+        let (raw, txid) = prove_and_extract(signed, &sighash, &positions, &cmxs, anchor, "offline two-note").unwrap();
+        let tx = zcash_primitives::transaction::Transaction::read(
+            &raw[..], zcash_protocol::consensus::BranchId::Nu6_3,
+        ).unwrap();
+        assert_eq!(tx.txid().to_string(), txid);
+        assert_eq!(finalized_sighash(&tx).unwrap(), sighash);
+        assert_eq!(u64::try_from(*tx.ironwood_bundle().unwrap().value_balance()).unwrap(), u64::from(fee));
+    }
 }

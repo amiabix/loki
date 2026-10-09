@@ -38,6 +38,10 @@ pub struct ScanState {
     pub tip: u64,
     /// Every Ironwood commitment up to `tip`, in append order.
     pub cmxs: Vec<[u8; 32]>,
+    /// Every nullifier revealed up to `tip`, in the same order as `cmxs`. A vault note
+    /// whose nullifier appears here has already been spent, by this vault or by anyone
+    /// else holding the key, and must not be offered as an input again.
+    pub nfs: Vec<[u8; 32]>,
     /// The vault's own actions, in the same order.
     pub found: Vec<Found>,
 }
@@ -57,6 +61,7 @@ impl ScanState {
             // which is exactly what the note commitment tree does.
             let position = self.cmxs.len() as u64;
             self.cmxs.push(raw.cmx);
+            self.nfs.push(raw.nullifier);
             if vault_note_at(fvk, ivks, height, txid, position, raw).is_some() {
                 self.found.push(Found {
                     height,
@@ -68,12 +73,17 @@ impl ScanState {
         }
     }
 
-    /// The vault's notes, rebuilt from the stored actions.
+    /// The vault's **unspent** notes, rebuilt from the stored actions.
     ///
     /// Built by the same code as a live scan ([`vault_note_at`]), so a note recovered
     /// from disk cannot drift from one found on the wire.
+    ///
+    /// A note whose nullifier has already appeared on the chain is dropped: it is gone,
+    /// and a proposer handed it would build a candidate the network rejects as a double
+    /// spend.
     pub fn notes(&self, fvk: &FullViewingKey) -> Result<Vec<VaultNote>, String> {
         let ivks = vault_ivks(fvk);
+        let spent: std::collections::HashSet<_> = self.nfs.iter().collect();
         self.found
             .iter()
             .map(|f| {
@@ -85,6 +95,10 @@ impl ScanState {
                         )
                     },
                 )
+            })
+            .filter(|n| match n {
+                Ok(n) => !spent.contains(&n.nullifier),
+                Err(_) => true,
             })
             .collect()
     }
@@ -112,7 +126,10 @@ impl ScanState {
                 Some("tip") => {
                     state.tip = f.next().and_then(|v| v.parse().ok()).ok_or_else(bad)?
                 }
-                Some("c") => state.cmxs.push(field(&mut f).ok_or_else(bad)?),
+                Some("c") => {
+                    state.cmxs.push(field(&mut f).ok_or_else(bad)?);
+                    state.nfs.push(field(&mut f).ok_or_else(bad)?);
+                }
                 Some("n") => {
                     let height = f.next().and_then(|v| v.parse().ok()).ok_or_else(bad)?;
                     let position = f.next().and_then(|v| v.parse().ok()).ok_or_else(bad)?;
@@ -147,8 +164,8 @@ impl ScanState {
         let mut out = std::io::BufWriter::new(f);
 
         writeln!(out, "tip {}", self.tip).map_err(io)?;
-        for c in &self.cmxs {
-            writeln!(out, "c {}", hex::encode(c)).map_err(io)?;
+        for (c, nf) in self.cmxs.iter().zip(self.nfs.iter()) {
+            writeln!(out, "c {} {}", hex::encode(c), hex::encode(nf)).map_err(io)?;
         }
         for n in &self.found {
             let a = &n.action;
@@ -331,5 +348,33 @@ mod tests {
         assert_eq!(state.tip, 3);
         assert_eq!(state.cmxs, fresh.cmxs, "the rolled-back state is a fresh scan");
         assert_eq!(state.found.len(), fresh.found.len());
+    }
+
+    #[test]
+    fn a_spent_note_is_not_offered_after_resuming_the_scan() {
+        let vault = a_fvk(3);
+        let decoy = a_fvk(9);
+        let mut chain = canned_chain(&vault, &decoy);
+        let mut state = ScanState::default();
+        scan_blocks(&vault, &mut state, 6, |h| {
+            chain.get(h as usize - 1).cloned().ok_or_else(|| format!("no block {h}"))
+        }).unwrap();
+        let spent = state.notes(&vault).unwrap()[0].nullifier;
+        let path = std::env::temp_dir().join(format!("loki-spent-{}.txt", std::process::id()));
+        state.save(&path).unwrap();
+        let mut state = ScanState::load(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        // The next action spends that note and sends its output to another account.
+        let mut action = action_json(&decoy, 1, 20);
+        action["nullifier"] = serde_json::json!(hex::encode(spent));
+        chain.push(serde_json::json!({ "tx": [tx("spend", vec![action])] }));
+        scan_blocks(&vault, &mut state, 7, |h| {
+            chain.get(h as usize - 1).cloned().ok_or_else(|| format!("no block {h}"))
+        }).unwrap();
+
+        let notes = state.notes(&vault).unwrap();
+        assert_eq!(notes.len(), 2);
+        assert!(notes.iter().all(|note| note.nullifier != spent));
     }
 }

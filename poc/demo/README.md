@@ -91,6 +91,7 @@ Unrelated THS environments are preserved; no shared Docker pruning is performed.
 All discovered HTTP endpoints and published ports stay on loopback. No browser
 request supplies a path, instance name, endpoint, flag, or shell command. The
 fixed step and tamper allowlists select commands with argument lists, never a shell.
+`POST /api/run` requires JSON and rejects browser Origins outside this loopback server.
 Loki still owns DKG, scanning, threshold approvals, proofs, and effects verification.
 THS supplies the chain, funding, and mining. The test-only vault derivation remains.
 
@@ -107,6 +108,12 @@ nothing about inclusion of a historical recorded transaction.
 - `static/wallet.*`: account UI and operation status.
 - `../ths.py`: external-instance adapter retained for the terminal harnesses.
 
-New test authoring is deferred at the user's request. Syntax checks and a live
-disposable run verify this implementation; the existing tests still describe the
-previous external-instance lifecycle and need a later update.
+## Checking it
+
+```sh
+python3 -B demo/test_runner.py
+python3 -B -m unittest discover -s tests -p 'test_*.py'
+```
+
+These checks cover binary lookup, request validation, endpoint restrictions, and
+selected runner boundaries. They do not establish live Docker lifecycle coverage.

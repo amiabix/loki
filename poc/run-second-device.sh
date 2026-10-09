@@ -6,22 +6,23 @@
 # never held an approver file and finishes from a replica of public artifacts plus his own
 # chain scan.
 #
-# Two payments, two paths:
+# The original two one-note payments plus two payments that require two notes:
 #   payment 1, path A   a final transaction was already produced and posted. Bob checks it
 #                       and broadcasts it.
 #   payment 2, path B   no final transaction exists. Bob aggregates the shares, finds the
 #                       note and the anchor by his own scan, installs them after the
 #                       signature, proves, extracts and broadcasts.
+#   payments 3 and 4    repeat paths B and A with two input notes each.
 #
 # The vault FVK is the documented TEST-ONLY splice of the DKG group ak into
-# `ak || nk || rivk`. It is NOT the ZIP 2005 `qsk -> qk -> rivk_ext` derivation, which is
-# implemented nowhere. Full G1 stays BLOCKED on that. This establishes nothing about G3,
+# `ak || nk || rivk`. Separate-member setup has a local ZIP 2005 derivation, but this
+# payment path does not use it. Full G1 stays BLOCKED. This establishes nothing about G3,
 # nothing about recovery, and nothing about custody readiness.
 set -uo pipefail
 unset LOKI_ROUND
 cd "$(dirname "$0")"
 
-RUN_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/loki-2dev.XXXXXX")
+RUN_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/loki-2dev.XXXXXX") || exit 1
 STATE="${LOKI_STATE:-$RUN_ROOT/state}"
 BOB="${BOB_STATE:-$RUN_ROOT/bob}"
 ATTIC="${ATTIC:-$RUN_ROOT/attic}"
@@ -56,7 +57,7 @@ step() {
 }
 rpc() { python3 ths.py rpc "$1" "${2:-[]}"; }
 height() { rpc getblockcount | python3 -c 'import json,sys;print(json.load(sys.stdin)["result"])'; }
-mine_to() { python3 ths.py mine 3; }
+mine_next() { python3 ths.py mine 3; }
 
 echo "== a funded 2-of-3 vault on THS =="
 loki setup "$STATE" >/dev/null || exit 1
@@ -67,7 +68,7 @@ loki scan "$STATE" | tail -4 || exit 1
 
 # ─────────────────────────────────────────────────────────────────────────────
 run_payment() {
-  local ROUND=$1 NOTE=$2 PATHNAME=$3 WITH_FINAL=$4
+  local ROUND=$1 NOTE=$2 PATHNAME=$3 WITH_FINAL=$4 SPENDS=${5:-1} AMOUNT=${6:-}
   local PUB="$STATE/public_$ROUND"
   local REPLICA="$BOB/replica_$ROUND"
   local WORK="$BOB/work_$ROUND"
@@ -80,13 +81,24 @@ run_payment() {
   echo "-- round 1: every member preprocesses a fresh nonce pair for this payment"
   for M in alice bob carol; do
     LOKI_ROUND="$ROUND" step "commit $M" env LOKI_ROUND="$ROUND" \
-      cargo run --quiet --bin loki -- commit "$STATE" "$M" >/dev/null || return 1
+      cargo run --quiet --bin loki -- commit "$STATE" "$M" --spends "$SPENDS" >/dev/null || return 1
   done
   echo "   alice, bob, carol committed"
 
-  echo "-- Alice proposes (note file: $NOTE)"
-  LOKI_ROUND="$ROUND" step "propose" env LOKI_ROUND="$ROUND" \
-    cargo run --quiet --bin loki -- propose "$STATE" "$NOTE" || return 1
+  if [ -n "$AMOUNT" ]; then
+    echo "-- Alice proposes $AMOUNT zat from $SPENDS notes"
+    LOKI_ROUND="$ROUND" step "propose" env LOKI_ROUND="$ROUND" \
+      cargo run --quiet --bin loki -- propose "$STATE" --amount "$AMOUNT" || return 1
+  else
+    echo "-- Alice proposes (note file: $NOTE)"
+    LOKI_ROUND="$ROUND" step "propose" env LOKI_ROUND="$ROUND" \
+      cargo run --quiet --bin loki -- propose "$STATE" "$NOTE" || return 1
+  fi
+  local ACTUAL
+  ACTUAL=$(awk -F= '/^input_nullifier=/{print split($2, a, ",")}' "$PUB/intent.txt")
+  [ "$ACTUAL" = "$SPENDS" ] || {
+    echo "   STAGE FAILED: expected $SPENDS input notes, proposal selected $ACTUAL"; return 1;
+  }
 
   echo "-- Alice and Carol review and sign, as separate processes"
   for M in alice carol; do
@@ -126,7 +138,7 @@ run_payment() {
   TXID=$(printf '%s\n' "$OUT" | tail -1)
 
   echo "-- mine it"
-  mine_to $(( $(height) + 3 )) || return 1
+  mine_next || return 1
   loki verify-effects "$REPLICA" "$TXID" | sed 's/^/   /' || {
     echo "   effects did NOT match the approved intent"; mv "$ATTIC/state_$ROUND" "$STATE"; return 1; }
 
@@ -147,6 +159,14 @@ ls -A "$BOB" | sed 's/^/     /' || true
 
 run_payment p1 funded_note.txt     A yes || exit 1
 run_payment p2 funded_note_alt.txt B no  || exit 1
+
+# The payment recipient belongs to the same test FVK, so the first two payments leave
+# two 0.5999-ZEC change notes from the two 1-ZEC faucet notes. Refresh the scan,
+# then pay more than either note can cover while staying within the funded balance.
+step "scan before two-note payment" cargo run --quiet --bin loki -- scan "$STATE" || exit 1
+run_payment p3 "" B no 2 100000000 || exit 1
+step "scan before second two-note payment" cargo run --quiet --bin loki -- scan "$STATE" || exit 1
+run_payment p4 "" A yes 2 110000000 || exit 1
 
 echo
 echo "== failure cases, asserted rather than asserted-about =="
@@ -189,7 +209,7 @@ check_fails "replica carries an approver scan file " \
 rm -f "$BOB/replica_p2/funded_note.txt"
 
 # A replica missing a share cannot be finished at all.
-rm -rf "$BOB/replica_broken"; cp -R "$BOB/replica_p2" "$BOB/replica_broken"
+cp -R "$BOB/replica_p2" "$BOB/replica_broken"
 rm -f "$BOB/replica_broken/share_AC_carol.hex"
 check_fails "replica missing carol's share        " \
   cargo run --quiet --bin loki -- finish-second "$BOB/replica_broken" "$BOB/work_broken"
@@ -198,7 +218,7 @@ check_fails "replica missing carol's share        " \
 # anything reaches a node. The earlier version of this case flipped a byte in the proof of
 # an already-spent transaction, so the node rejected it as a double spend and the case
 # proved nothing about Bob's checking. It now asserts which component refused.
-rm -rf "$BOB/replica_badfinal"; cp -R "$BOB/replica_p1" "$BOB/replica_badfinal"
+cp -R "$BOB/replica_p1" "$BOB/replica_badfinal"
 python3 -c 'import io,sys; p=sys.argv[1]; s=io.open(p).read().strip(); io.open(p,"w").write(s[:len(s)//2])' \
   "$BOB/replica_badfinal/final_tx.hex"
 check_local "posted final tx does not parse        " \
@@ -209,26 +229,26 @@ check_local "posted final tx does not parse        " \
 # Payment 2's mined transaction is substituted into payment 1's replica. Bob must notice
 # that it does not spend the nullifier payment 1's intent names, and must notice it LOCALLY.
 P2=$(grep '^p2 ' "$RESULTS" | sed 's/.*txid=//')
-rm -rf "$BOB/replica_wrongtx"; cp -R "$BOB/replica_p1" "$BOB/replica_wrongtx"
+cp -R "$BOB/replica_p1" "$BOB/replica_wrongtx"
 rpc getrawtransaction "[\"$P2\"]" \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"])' \
   > "$BOB/replica_wrongtx/final_tx.hex"
 check_local "posted final tx is for another intent " \
-  "does not spend the note the intent names" \
+  "effects differ from the signed candidate" \
   cargo run --quiet --bin loki -- finish-second "$BOB/replica_wrongtx" "$BOB/work_wrongtx"
 
-# Re-broadcasting payment 1 must be rejected. This one is rejected by the NODE, which is
-# the correct layer for it: the nullifier is already spent on chain.
+# Re-broadcasting payment 1 must be rejected. The finisher's own scan now excludes
+# spent notes, so this may be refused locally before the bytes reach the node.
 check_fails "payment 1 broadcast a second time     " \
   cargo run --quiet --bin loki -- finish-second "$BOB/replica_p1" "$BOB/work_again"
 
 echo
 echo "== results =="
-cat "$RESULTS" | sed 's/^/   /'
+sed 's/^/   /' "$RESULTS"
 echo
 if [ $FAILS -ne 0 ]; then
   echo "$FAILS failure case(s) were NOT refused"
   exit 1
 fi
-echo "second-device finishing: both paths mined and verified"
+echo "second-device finishing: both paths, one and two inputs, mined and verified"
 echo "G1-TX second-device PASS; G1 BLOCKED (ZIP 2005); G3 unaffected; no custody claim"

@@ -16,6 +16,9 @@ loki-state/
 */state/alice/
 */state/bob/
 */state/carol/
+# Separate-member setup stores and operator passphrase files.
+**/secrets/
+*.passphrase
 
 # Python
 __pycache__/
