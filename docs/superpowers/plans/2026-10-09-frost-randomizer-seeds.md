@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Base is latest fetched origin/main `e66f97ce894e3784efa53e5625919a0b8abce9e4`.
+- Base is latest fetched origin/main `0aee73aeb65763ac889cb5e3b33ec77cd3edf560`.
 - Work only in `/private/tmp/loki-frost-randomizer-seeds`, branch `refactor/frost-randomizer-seeds`. Preserve the dirty original checkout.
 - Keep regtest-only claims and pinned caller-alpha vendor patches. No Zakura migration or ZIP 2005 implementation changes.
 - Never commit generated seeds, key packages, nonce secrets, run state or demo sandbox contents.
