@@ -18,55 +18,26 @@
 set -uo pipefail
 
 cd "$(dirname "$0")"
-STATE="${LOKI_STATE:-/tmp/loki-tamper-state}"
-CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/loki}"
-export CARGO_TARGET_DIR
+STATE="${LOKI_STATE:-$(mktemp -d "${TMPDIR:-/tmp}/loki-tamper.XXXXXX")/state}"
+if [ -e "$STATE" ]; then echo "refusing existing state path: $STATE" >&2; exit 1; fi
+export LOKI_THS_INSTANCE="${LOKI_THS_INSTANCE:-loki}"
+LOKI_RPC=$(python3 ths.py address) || exit 1
+export LOKI_RPC
+unset LOKI_ROUND
 PUB="$STATE/public"
-SNAP="/tmp/loki-tamper-snapshot"
-
+SNAP=$(mktemp -d)
+trap 'rm -rf "$SNAP"' EXIT
 loki() { cargo run --quiet --bin loki -- "$@"; }
-rpc() {
-  curl -s -X POST -H 'Content-Type: application/json' \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$1\",\"params\":${2:-[]}}" \
-    http://127.0.0.1:18232/
-}
-height() { rpc getblockcount | python3 -c 'import json,sys;print(json.load(sys.stdin)["result"])'; }
-
-cleanup() { [ -n "${ZPID:-}" ] && kill "$ZPID" 2>/dev/null || true; }
-trap cleanup EXIT
-
-echo "== setting up a vault and three honest candidates =="
-pkill -f 'zebrad -c harness' 2>/dev/null || true
-sleep 2
-rm -rf "$STATE"
-loki setup "$STATE" >/dev/null
-VAULT=$(loki address "$STATE")
-
-python3 - "$VAULT" <<'PY'
-import io, re, sys
-p = 'harness/zebrad-regtest.toml'
-s = io.open(p).read()
-s = re.sub(r"miner_address = '[^']*'", "miner_address = '%s'" % sys.argv[1], s)
-io.open(p, 'w').write(s)
-PY
-
-harness/zebrad -c harness/zebrad-regtest.toml start > /tmp/zebrad-tamper.log 2>&1 &
-ZPID=$!
-for _ in $(seq 1 30); do sleep 2; rpc getblockcount | grep -q result && break; done
-until [ "$(height)" -ge 20 ]; do sleep 2; done
-
-loki scan "$STATE" >/dev/null
-for m in alice bob carol; do loki commit "$STATE" "$m" >/dev/null; done
-loki propose "$STATE" >/dev/null
-echo "   ready at height $(height)"
-echo
-
-# Snapshot the honest candidate, alice's unspent nonces, and her published commitments.
-rm -rf "$SNAP"; mkdir -p "$SNAP"
+echo "== funding a fresh vault on THS =="
+loki setup "$STATE" >/dev/null || exit 1
+VAULT=$(loki address "$STATE") || exit 1
+python3 ths.py fund "$VAULT" 2 || exit 1
+loki scan "$STATE" >/dev/null || exit 1
+for m in alice bob carol; do loki commit "$STATE" "$m" >/dev/null || exit 1; done
+loki propose "$STATE" >/dev/null || exit 1
 cp "$PUB/candidate_AC.pczt.hex" "$SNAP/candidate_AC.hex"
 cp "$STATE/alice/nonces_AB.hex" "$SNAP/"
 cp "$STATE/alice/nonces_AC.hex" "$SNAP/"
-
 restore() {
   cp "$SNAP/candidate_AC.hex" "$PUB/candidate_AC.pczt.hex"
   cp "$SNAP/nonces_AB.hex" "$STATE/alice/nonces_AB.hex"
@@ -103,12 +74,18 @@ for CASE in $CASES; do
   WANT=$(want "$CASE")
   restore
   if ! ERR=$(loki tamper "$STATE" "$CASE" 2>&1); then
-    echo "  $(printf '%-15s' "$CASE") COULD NOT CONSTRUCT: $(printf '%s' "$ERR" | tail -1)"
-    SKIP=$((SKIP+1)); continue
+    if [ "$CASE" = fee ] && printf '%s' "$ERR" | grep -qF 'ChangeRequired'; then
+      echo "  fee             COULD NOT CONSTRUCT: $(printf '%s' "$ERR" | tail -1)"
+      SKIP=$((SKIP+1))
+    else
+      echo "  $CASE FAIL: unexpected fixture construction failure: $ERR"
+      FAIL=$((FAIL+1))
+    fi
+    continue
   fi
 
   OUT=$(loki review-sign "$STATE" alice 2>&1); RC=$?
-  SHARE=no; [ -f "$PUB/share_AC_alice.hex" ] && SHARE=yes
+  SHARE=no; { [ -f "$PUB/share_AC_alice.hex" ] || [ -f "$PUB/share_AB_alice.hex" ]; } && SHARE=yes
   REASON=$(printf '%s' "$OUT" | grep -o 'REFUSED: .*' | head -1)
 
   if [ $RC -eq 0 ] || [ "$SHARE" = yes ]; then

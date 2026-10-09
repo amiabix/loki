@@ -25,8 +25,9 @@ set -uo pipefail
 cd "$(dirname "$0")"
 
 S="${LOKI_STATE:-demo/.sandbox/state}"
-L="${LOKI_BIN:-/tmp/loki/debug/loki}"
-export LOKI_RPC="${LOKI_RPC:-127.0.0.1:18242}"
+L="${LOKI_BIN:-${CARGO_TARGET_DIR:-target}/debug/loki}"
+LOKI_RPC=$(python3 ths.py address) || exit 1
+export LOKI_RPC
 SNAP=$(mktemp -d)
 trap 'rm -rf "$SNAP"' EXIT
 

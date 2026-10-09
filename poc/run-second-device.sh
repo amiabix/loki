@@ -15,20 +15,33 @@
 #   payments 3 and 4    repeat paths B and A with two input notes each.
 #
 # The vault FVK is the documented TEST-ONLY splice of the DKG group ak into
-# `ak || nk || rivk`. It is NOT the ZIP 2005 `qsk -> qk -> rivk_ext` derivation, which is
-# implemented nowhere. Full G1 stays BLOCKED on that. This establishes nothing about G3,
+# `ak || nk || rivk`. Separate-member setup has a local ZIP 2005 derivation, but this
+# payment path does not use it. Full G1 stays BLOCKED. This establishes nothing about G3,
 # nothing about recovery, and nothing about custody readiness.
 set -uo pipefail
+unset LOKI_ROUND
 cd "$(dirname "$0")"
 
-WORK_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/loki-2dev.XXXXXX") || exit 1
-STATE="$WORK_ROOT/state"
-BOB="$WORK_ROOT/bob"
-ATTIC="$WORK_ROOT/attic"
-CONF="$WORK_ROOT/zebrad.toml"
-RESULTS="$WORK_ROOT/results.txt"
-CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/loki}"
-export CARGO_TARGET_DIR
+RUN_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/loki-2dev.XXXXXX") || exit 1
+STATE="${LOKI_STATE:-$RUN_ROOT/state}"
+BOB="${BOB_STATE:-$RUN_ROOT/bob}"
+ATTIC="${ATTIC:-$RUN_ROOT/attic}"
+RESULTS="$RUN_ROOT/results.txt"
+export LOKI_THS_INSTANCE="${LOKI_THS_INSTANCE:-loki}"
+LOKI_RPC=$(python3 ths.py address) || exit 1
+export LOKI_RPC
+for path in "$STATE" "$BOB" "$ATTIC"; do
+  if [ -e "$path" ]; then echo "refusing existing state path: $path" >&2; exit 1; fi
+done
+python3 - "$STATE" "$BOB" "$ATTIC" <<'CHECK_PATHS' || exit 1
+from pathlib import Path
+import sys
+paths = [Path(value).resolve() for value in sys.argv[1:]]
+for index, first in enumerate(paths):
+    for second in paths[index + 1:]:
+        if first == second or first in second.parents or second in first.parents:
+            raise SystemExit("state, finisher, and attic paths must be separate: %s, %s" % (first, second))
+CHECK_PATHS
 
 loki() { cargo run --quiet --bin loki -- "$@"; }
 # Run a stage and abort on failure. Piping into `sed` would otherwise discard the exit
@@ -42,43 +55,15 @@ step() {
   if [ $rc -ne 0 ]; then echo "   STAGE FAILED: $label (rc=$rc)"; return 1; fi
   return 0
 }
-rpc() {
-  curl -s -X POST -H 'Content-Type: application/json' \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$1\",\"params\":${2:-[]}}" \
-    http://127.0.0.1:18232/
-}
+rpc() { python3 ths.py rpc "$1" "${2:-[]}"; }
 height() { rpc getblockcount | python3 -c 'import json,sys;print(json.load(sys.stdin)["result"])'; }
-mine_to() { local t=$1; until [ "$(height)" -ge "$t" ]; do sleep 2; done; }
+mine_next() { python3 ths.py mine 3; }
 
-cleanup() { [ -n "${ZPID:-}" ] && kill "$ZPID" 2>/dev/null || true; }
-trap cleanup EXIT
-
-if lsof -nP -iTCP:18232 -sTCP:LISTEN >/dev/null 2>&1 ||
-   lsof -nP -iTCP:18243 -sTCP:LISTEN >/dev/null 2>&1; then
-  echo "regtest port 18232 or 18243 is already in use; stop the other node first" >&2
-  exit 1
-fi
-
-echo "== 0. a fresh regtest chain and a funded 2-of-3 vault =="
-echo "   artifacts $WORK_ROOT"
-loki setup "$STATE" >/dev/null
-VAULT=$(loki address "$STATE")
-echo "   vault $VAULT"
-
-python3 - "$VAULT" "$CONF" <<'PY'
-import io, re, sys
-p = 'harness/zebrad-regtest.toml'
-s = io.open(p).read()
-s = re.sub(r"miner_address = '[^']*'", "miner_address = '%s'" % sys.argv[1], s)
-s = s.replace('network = "Regtest"', 'network = "Regtest"\nlisten_addr = "127.0.0.1:18243"')
-io.open(sys.argv[2], 'w').write(s)
-PY
-
-harness/zebrad -c "$CONF" start > "$WORK_ROOT/zebrad.log" 2>&1 &
-ZPID=$!
-for _ in $(seq 1 40); do sleep 2; rpc getblockcount | grep -q result && break; done
-mine_to 20
-loki scan "$STATE" | tail -4
+echo "== a funded 2-of-3 vault on THS =="
+loki setup "$STATE" >/dev/null || exit 1
+VAULT=$(loki address "$STATE") || exit 1
+python3 ths.py fund "$VAULT" 2 || exit 1
+loki scan "$STATE" | tail -4 || exit 1
 [ -s "$STATE/public/funded_note_alt.txt" ] || { echo "need two vault notes"; exit 1; }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -138,7 +123,7 @@ run_payment() {
 
   echo "-- both approver apps close, and their state is MOVED OUT OF REACH"
   mkdir -p "$ATTIC"
-  mv "$STATE" "$ATTIC/state_$ROUND"
+  mv "$STATE" "$ATTIC/state_$ROUND" || return 1
   if [ -e "$STATE" ]; then echo "   FAILED to move approver state aside"; return 1; fi
   echo "   $STATE no longer exists; only $REPLICA remains"
   echo "   replica contents:"
@@ -153,13 +138,13 @@ run_payment() {
   TXID=$(printf '%s\n' "$OUT" | tail -1)
 
   echo "-- mine it"
-  mine_to $(( $(height) + 3 ))
+  mine_next || return 1
   loki verify-effects "$REPLICA" "$TXID" | sed 's/^/   /' || {
     echo "   effects did NOT match the approved intent"; mv "$ATTIC/state_$ROUND" "$STATE"; return 1; }
 
   # Alice and Carol come back only so the next payment can be proposed. The finish above
   # already happened without them.
-  mv "$ATTIC/state_$ROUND" "$STATE"
+  mv "$ATTIC/state_$ROUND" "$STATE" || return 1
   echo "$ROUND path=$PATHNAME txid=$TXID" >> "$RESULTS"
   return 0
 }
@@ -176,11 +161,12 @@ run_payment p1 funded_note.txt     A yes || exit 1
 run_payment p2 funded_note_alt.txt B no  || exit 1
 
 # The payment recipient belongs to the same test FVK, so the first two payments leave
-# two large change notes. Refresh the scan, then pay more than either note can cover.
+# two 0.5999-ZEC change notes from the two 1-ZEC faucet notes. Refresh the scan,
+# then pay more than either note can cover while staying within the funded balance.
 step "scan before two-note payment" cargo run --quiet --bin loki -- scan "$STATE" || exit 1
-run_payment p3 "" B no 2 1000000000 || exit 1
+run_payment p3 "" B no 2 100000000 || exit 1
 step "scan before second two-note payment" cargo run --quiet --bin loki -- scan "$STATE" || exit 1
-run_payment p4 "" A yes 2 1100000000 || exit 1
+run_payment p4 "" A yes 2 110000000 || exit 1
 
 echo
 echo "== failure cases, asserted rather than asserted-about =="

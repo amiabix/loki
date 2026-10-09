@@ -1,5 +1,9 @@
 # Second-device finishing on the G1-TX path
 
+> Historical experiment record. Node build/configuration details below describe the
+> original run. Current local-chain setup uses THS; see [harness/README.md](harness/README.md)
+> for current local-chain instructions.
+
 ## Both paths mined and verified. This is not full G1, not G3, and not custody readiness.
 
 Date 2026-10-03. Regtest, NU6.3 (Ironwood). One 2-of-3 FROST vault, two payments, two
@@ -37,10 +41,11 @@ cd poc && ./run-second-device.sh
 
 The current script runs the two historical one-note payments, then two new two-note
 payments (paths B and A). It exits nonzero if any payment fails to mine, if the mined
-effects do not match the approved intent, or if any failure case is not refused. It checks
-ports 18232 and 18243, creates a unique temporary directory, and prints its location.
-The generated Zebra config, chain log, approver state, replica, and results stay there for
-inspection. It stops only the Zebra process it started.
+effects do not match the approved intent, or if any failure case is not refused. It
+attaches to the developer-started THS instance selected by `LOKI_THS_INSTANCE` and
+requests two confirmed 1-ZEC faucet notes. The two-note payments use 1 and 1.1 ZEC
+to stay within that funding. Approver state, replicas, and results remain under the
+printed temporary directory for inspection. The script does not stop the THS instance.
 
 The historical run below used fixed `/tmp` paths. The current driver runs the same stages
 under its printed temporary directory and adds the two two-note payments.

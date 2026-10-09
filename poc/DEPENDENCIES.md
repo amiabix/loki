@@ -1,5 +1,9 @@
 # Loki G1 POC — checkpoint 1: pinned library path
 
+> Historical experiment record. Node build/configuration details below describe the
+> original run. Current local-chain setup uses THS; see [harness/README.md](harness/README.md)
+> for current local-chain instructions.
+
 Date: 2026-10-03 · Host: macOS 27 aarch64 · `rustc 1.95.0 (59807616e 2026-04-14)`
 
 Result: **2 PASS, 1 PATCHED, 1 BLOCKED.** B2 is patched and verified. B1 stops full G1;

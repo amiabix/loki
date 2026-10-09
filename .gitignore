@@ -8,6 +8,7 @@ poc/g3/node_modules/
 # The demo's sandbox. Contains generated FROST key packages and nonce secrets for a
 # throwaway regtest account. Never commit it.
 poc/demo/.sandbox/
+poc/demo/.sandbox-server.lock
 
 # Any run state directory: member key packages, nonce secrets, note secrets.
 /tmp/loki-*
@@ -19,13 +20,11 @@ loki-state/
 **/secrets/
 *.passphrase
 
-# The zebrad binary is 87MB and is built from a pinned upstream commit.
-# See poc/harness/README.md for the exact clone + build commands.
-poc/harness/zebrad
-
 # Python
 __pycache__/
 *.pyc
 
 # macOS
 .DS_Store
+
+/docs/superpowers/

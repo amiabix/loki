@@ -21,22 +21,51 @@ result documents, which are the authority.
 
 ## Quick start
 
-Prerequisites: Rust, Python 3, and `zebrad` built from the pinned commit in
-[`poc/harness/README.md`](poc/harness/README.md) (the 87MB binary is not committed).
+Prerequisites: Rust, Python 3, Docker, and [THS](https://github.com/zcashlabs/thus-spoke-zakura).
+No standalone node build or binary is required. See
+[`poc/harness/README.md`](poc/harness/README.md) for installation and lifecycle details.
 
 ```sh
 cd poc
 cargo build
-
-# the interactive account UI: run the prototype from a browser
-python3 demo/server.py          # → http://127.0.0.1:8787
-
-# or straight from the terminal
-./run-regtest.sh                # genesis to a mined transaction
-./run-second-device.sh          # finishing without the approvers' files
-./tamper-tests.sh               # the signer's refusals, 10 adversarial cases
-cd g3 && ./run-g3.sh            # browser nonce-safety drills
+python3 demo/server.py          # account UI at http://127.0.0.1:8787
 ```
+
+In the browser, create the account and click **Start the test network**. The demo
+launches its own named THS environment, discovers free loopback ports, waits for
+the services, and funds the vault. Stop network, Reset, and graceful server
+shutdown delete that instance using `ths --name <instance> stop`. Closing a browser
+tab leaves it running. No separate THS terminal or standalone node build is needed.
+
+For the terminal harnesses, start a separate developer-owned THS environment in
+one terminal and keep it running:
+
+```sh
+ths --name loki start --no-open --port-offset 10
+```
+
+In another terminal, from `poc/`:
+
+```sh
+export LOKI_THS_INSTANCE=loki
+
+./run-regtest.sh                # new vault, faucet funding, payment, mined effects
+./run-second-device.sh          # both finishing paths and failure checks
+./tamper-tests.sh               # specific signer refusals and zero shares
+cd g3 && ./run-g3.sh             # separate browser nonce-safety drills
+```
+
+Loki discovers RPC from `ths endpoints`, checks the active regtest branch, funds
+through the THS faucet, and mines through `ths mine`. Each CLI flow uses new
+state; a supplied `LOKI_STATE` must not already exist. The CLI harnesses leave their
+selected THS environment running; stop that THS terminal when finished. The
+browser demo stores its account and owned-instance record under `poc/demo/.sandbox`.
+After deleting its network, reset before a fresh run. Keep terminal-harness THS
+instances dedicated to the experiment because those flows fund vaults and mine blocks.
+
+Local THS setup and usage are documented in
+[`poc/harness/README.md`](poc/harness/README.md). Earlier result documents retain
+historical node details and are not instructions for the current THS setup.
 
 ## What is here
 
@@ -49,7 +78,7 @@ poc/
     bin/loki.rs           the CLI: setup, scan, commit, propose, review-sign, finish …
   demo/                   a local account UI that drives the real prototype
   g3/                     the standalone browser nonce-safety prototype
-  harness/                regtest config, and how to build the node
+  harness/                THS regtest setup and lifecycle instructions
   vendor/                 orchard and zcash_primitives, patched so a caller can choose
                           the signing randomiser (see vendor/README.md)
 

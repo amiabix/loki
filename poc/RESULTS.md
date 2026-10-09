@@ -1,5 +1,9 @@
 # Loki G1-TX POC — results
 
+> Historical experiment record. Node build/configuration details below describe the
+> original run. Current local-chain setup uses THS; see [harness/README.md](harness/README.md)
+> for current local-chain instructions.
+
 ## G1-TX PASS; G1 BLOCKED (ZIP 2005)
 
 Date 2026-10-03. Scope is **G1-TX** per the 3 October decision in the brief: the v6

@@ -64,15 +64,16 @@
           <div class="card stat"><span class="k">Balance</span><strong id="sBal">—</strong><span class="s" id="sBalS">not scanned</span></div>
           <div class="card stat"><span class="k">Threshold</span><strong>2 of 3</strong><span class="s">any two owners can spend</span></div>
           <div class="card stat"><span class="k">Queue</span><strong id="sQueue">0</strong><span class="s" id="sQueueS">no pending transaction</span></div>
-          <div class="card stat"><span class="k">Test network</span><strong id="sNet">down</strong><span class="s" id="sNetS">regtest, port 18242</span></div>
+          <div class="card stat"><span class="k">Test network</span><strong id="sNet">stopped</strong><span class="s" id="sNetS">start it in step 2</span><span class="s" id="fundingStatus">Vault funding: not started</span></div>
         </div>
 
         <div class="card">
           <div class="card-head"><h2>Set up this account</h2></div>
           <p class="note">
-            Each action below runs the real prototype against a throwaway chain in
-            <code>poc/demo/.sandbox</code>. Nothing is simulated.
+            Each action runs the real prototype. Account files live in
+            <code>poc/demo/.sandbox</code>; the demo manages a dedicated THS test network.
           </p>
+          <p class="note" id="networkDetail">The demo will start and manage its own THS environment.</p>
           <ol class="setup" id="setup"></ol>
         </div>
       </section>

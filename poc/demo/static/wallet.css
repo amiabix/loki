@@ -231,6 +231,7 @@ code {
 }
 .banner.go   { border-left-color: var(--mint);  color: var(--mint);  background: rgba(20,224,166,.05); }
 .banner.wait { border-left-color: var(--amber); color: var(--amber); background: rgba(255,176,32,.05); }
+.banner.bad  { border-left-color: var(--hot); color: var(--hot); background: rgba(255,70,85,.05); }
 
 /* ── buttons ─────────────────────────────────────────────────────────────── */
 
