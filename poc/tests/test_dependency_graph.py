@@ -17,9 +17,9 @@ class DependencyGraphTests(unittest.TestCase):
                "bellman", "bls12_381", "pairing", "sinsemilla", "equihash",
                "zcash_address", "zcash_protocol", "zcash_transparent"}
         self.assertFalse({name for name, _ in packages} & old)
-        family = {name: version for name, version in packages if name.startswith("zakura-")}
+        family = {(name, version) for name, version in packages if name.startswith("zakura-")}
         self.assertEqual(len(family), 20)
-        self.assertEqual(family.pop("zakura-pczt"), "0.1.0-rc4")
-        self.assertEqual(set(family.values()), {"2.2.0"})
+        self.assertEqual({entry for entry in family if entry[0] == "zakura-pczt"}, {("zakura-pczt", "0.1.0-rc4")})
+        self.assertEqual({version for name, version in family if name != "zakura-pczt"}, {"2.2.0"})
         for name in ("frost-core", "frost-rerandomized"):
             self.assertEqual({version for package, version in packages if package == name}, {"3.0.0"})

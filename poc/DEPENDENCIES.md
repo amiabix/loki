@@ -4,7 +4,8 @@
 
 Issue #4 migrates transaction construction, signing, scanning, witness construction,
 PCZT roles, and proving to one Zakura family. Cargo aliases preserve existing Rust
-import names and APIs. The Common releases require Rust 1.91 or later.
+import names and application payment interfaces; library API call sites are adapted
+where required by the selected releases. The Common releases require Rust 1.91 or later.
 
 | Existing import | Exact package/version |
 | --- | --- |
