@@ -161,7 +161,7 @@ python3 run-ths.py --name loki-zakura-issue4 --pair BC --finish-mode replica
 
 - [x] Run `nonce-reuse-drill.sh` against fresh funded/unspent disposable state, not a state whose payment already consumed its note. Assert stage A refusal/no shares and preserve stage B's measured rollback reuse limitation; its weak exit code alone does not prove stage B ran successfully. Record output observations explicitly.
 - [x] Record actual txids, selected pair, sign-before-anchor/proof checks, unchanged sighashes, mined confirmation heights, independent finishing and nine refused tamper cases/no shares. Fee-only fixture remains unconstructible unless a genuinely equivalent test is added. Report skipped/blocked cases distinctly from passes.
-- [ ] Stop only the THS instance created for this work after validation; keep secrets and state outside tracked files. Root owns this instance and will perform shutdown after independent validation.
+- [x] Stop only the THS instance created for this work after validation; keep secrets and state outside tracked files. Root stopped `loki-zakura-issue4` after independent validation; other instances were left alone.
 
 ### Task 5: Documentation, review, and PR delivery
 
@@ -173,8 +173,10 @@ python3 run-ths.py --name loki-zakura-issue4 --pair BC --finish-mode replica
 - [x] Final checks: `cargo build --locked`, `cargo test --locked`, `cargo fmt --check`, `cargo clippy --locked --all-targets`, focused vendor alpha tests, relevant Python harness tests, and all Task 4 live checks. No intentional probe feature in routine checks.
 - [x] Review the final diff against every issue requirement, including multiple-input alpha association, old artifact handling, seed-flow coordination, and production graph closure. Fix actionable findings and rerun affected checks.
 - [x] Commit only relevant changes using Conventional Commits, for example `refactor(deps): migrate transaction and crypto stack to Zakura`. Do not stage temporary generators, synthetic secret state, registry extraction metadata secrets, or unrelated main changes.
-- [ ] Root agent independently reviews evidence, pushes `refactor/zakura-dependencies`, and creates a PR against main with a concrete behavior description, `Closes #4` when verified, actual validation results, and material limitations. PR creation is already authorized by the user; no further approval ceremony is required.
+- [x] Root agent independently reviews evidence, pushes `refactor/zakura-dependencies`, and creates a PR against main with a concrete behavior description, `Closes #4` when verified, actual validation results, and material limitations. PR creation is already authorized by the user; no further approval ceremony is required.
 
 ## Completion audit
 
 Every issue acceptance item maps to a task: production family closure (2), DKG/signature/share/refresh and serialized artifacts (1/3), three pairs/independent finishing/unchanged sign-before-proof/multi-input association (3/4), tamper/no-share/handoff/nonce reuse (4), build/test/fmt/clippy and patch tests (3/5), dependency/vendor documentation and #3 coordination (2/3/5). A green build alone is insufficient; pending live gates remain pending.
+
+Root independently reran build, all 72 Rust tests, formatting, Clippy, and all 16 Python tests on the merged tree. [PR #5](https://github.com/amiabix/loki-zcash-frost/pull/5) is open against main at `754445a`; GitHub reported `MERGEABLE` and `CLEAN` after creation. PR #2 is already included, and conflicts from the later main update were resolved before delivery. No GitHub status checks are configured on the PR.
