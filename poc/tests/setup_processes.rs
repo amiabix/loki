@@ -350,9 +350,7 @@ fn three_processes_create_one_vault_without_sharing_secrets() {
         )
         .unwrap();
         let pczt = Creator::build_from_parts(built.pczt_parts).unwrap();
-        let pczt = IoFinalizer::new(pczt)
-            .finalize_io(rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng))
-            .unwrap();
+        let pczt = IoFinalizer::new(pczt).finalize_io().unwrap();
         let candidate_bytes = pczt.serialize().unwrap();
         let pczt = pczt::Pczt::parse(&candidate_bytes).unwrap();
         let want = Expectations {

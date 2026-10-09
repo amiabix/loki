@@ -117,11 +117,10 @@ impl MemberDir {
             passphrase,
             &header[SEAL_MAGIC.len()..SEAL_MAGIC.len() + SEAL_SALT],
         )?;
-        let nonce = XNonce::try_from(&header[SEAL_MAGIC.len() + SEAL_SALT..])
-            .expect("the header reserves exactly SEAL_NONCE bytes for the nonce");
+        let nonce = XNonce::from_slice(&header[SEAL_MAGIC.len() + SEAL_SALT..]);
         let sealed = cipher
             .encrypt(
-                &nonce,
+                nonce,
                 Payload {
                     msg: bytes,
                     aad: &header,
@@ -175,11 +174,10 @@ impl MemberDir {
             passphrase,
             &header[SEAL_MAGIC.len()..SEAL_MAGIC.len() + SEAL_SALT],
         )?;
-        let nonce = XNonce::try_from(&header[SEAL_MAGIC.len() + SEAL_SALT..])
-            .expect("the header reserves exactly SEAL_NONCE bytes for the nonce");
+        let nonce = XNonce::from_slice(&header[SEAL_MAGIC.len() + SEAL_SALT..]);
         cipher
             .decrypt(
-                &nonce,
+                nonce,
                 Payload {
                     msg: sealed,
                     aad: header,

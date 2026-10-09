@@ -51,10 +51,10 @@ impl Parameters for Regtest {
 /// Convert a FROST randomizer's canonical 32-byte encoding into the builder's scalar
 /// type, rejecting anything noncanonical.
 ///
-/// The two halves of the graph use different `pasta_curves` majors, so this crossing is
-/// by bytes and is checked on arrival (`DEPENDENCIES.md` finding F3).
+/// FROST exposes the randomizer as serialized bytes rather than through a public
+/// scalar getter. Keep canonical validation at that API boundary.
 pub fn alpha_from_canonical_bytes(bytes: &[u8; 32]) -> Option<pallas::Scalar> {
-    use ff_zp::PrimeField;
+    use ff::PrimeField;
     Option::from(pallas::Scalar::from_repr(*bytes))
 }
 
@@ -404,6 +404,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn shuffled_spends_keep_each_notes_original_alpha_by_nullifier() {
+        let fvk = a_test_fvk();
+        let notes = vec![
+            vault_note_of(&fvk, 625_000_000, 10),
+            vault_note_of(&fvk, 100_000_000, 20),
+        ];
+        let alphas = [pallas::Scalar::from(3), pallas::Scalar::from(5)];
+        let mut inputs = CandidateInputs {
+            vault_fvk: &fvk,
+            notes,
+            recipient: fvk.address_at(7u64, orchard::keys::Scope::External),
+            amount: Zatoshis::const_from_u64(700_000_000),
+            memo: MemoBytes::empty(),
+            change: Zatoshis::ZERO,
+            target_height: 100,
+            expiry_height: 1_152,
+        };
+        inputs.change =
+            Zatoshis::from_u64(25_000_000 - u64::from(quote_fee(&Regtest, &inputs).unwrap()))
+                .unwrap();
+        let ak = orchard::keys::SpendValidatingKey::from(fvk.clone());
+        let mut reordered = false;
+        for seed in 0..16 {
+            let rng = <rand_zp::rngs::StdRng as rand_core_zp::SeedableRng>::from_seed([seed; 32]);
+            let built = build_candidate(&Regtest, &inputs, &alphas, rng).unwrap();
+            let bundle = built.pczt_parts.ironwood.unwrap();
+            let indices = inputs
+                .notes
+                .iter()
+                .zip(alphas)
+                .map(|(note, alpha)| {
+                    let nf = note.nullifier(&fvk);
+                    let (index, action) = bundle
+                        .actions()
+                        .iter()
+                        .enumerate()
+                        .find(|(_, action)| action.spend().nullifier() == &nf)
+                        .unwrap();
+                    assert_eq!(*action.spend().alpha(), Some(alpha));
+                    assert_eq!(
+                        <[u8; 32]>::from(action.spend().rk()),
+                        <[u8; 32]>::from(&ak.randomize(&alpha))
+                    );
+                    index
+                })
+                .collect::<Vec<_>>();
+            reordered |= indices[0] > indices[1];
+        }
+        assert!(
+            reordered,
+            "exercise reversed real-spend order, not only insertion order"
+        );
+    }
+
     /// One randomiser per note. Getting this wrong would silently reuse a randomiser
     /// across two actions.
     #[test]
@@ -528,7 +583,7 @@ mod tests {
             );
             let alpha_bytes = params.randomizer().serialize();
 
-            // Cross the version boundary as canonical 32 bytes, and reject anything else.
+            // Decode the randomizer through its public canonical encoding.
             let alpha_arr: [u8; 32] = alpha_bytes.as_slice().try_into().unwrap();
             let alpha = crate::candidate::alpha_from_canonical_bytes(&alpha_arr)
                 .expect("the derived alpha is a canonical Pallas scalar");

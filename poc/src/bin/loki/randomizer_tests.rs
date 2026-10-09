@@ -202,7 +202,7 @@ impl Fixture {
         .unwrap();
         let candidate = pczt::roles::creator::Creator::build_from_parts(built.pczt_parts).unwrap();
         let candidate = pczt::roles::io_finalizer::IoFinalizer::new(candidate)
-            .finalize_io(rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng))
+            .finalize_io()
             .unwrap();
         self.shared()
             .write_hex(
@@ -791,4 +791,44 @@ fn randomizer_loaders_refuse_surplus_seed_records_without_partial_shares() {
         error.contains("unexpected randomizer seed record count"),
         "{error}"
     );
+}
+
+#[test]
+fn randomizer_selected_pair_routes_approver_and_confidential_replica_inputs() {
+    let f = Fixture::new();
+    f.sign_all();
+    for (pair, _, _) in PAIRS {
+        let approver = approver_inputs(&f.root, &f.shared(), pair).unwrap();
+        assert_eq!(approver.pair, pair);
+        let (_, sighash, indices) = aggregate_and_apply(&approver).unwrap();
+        assert_eq!(indices.len(), 2);
+        let replica_path = f.root.join(format!("replica-{pair}"));
+        replicate(&[
+            f.arg(),
+            replica_path.to_string_lossy().into_owned(),
+            "--pair".into(),
+            pair.into(),
+        ])
+        .unwrap();
+        let replica = MemberDir::open(&f.root, &format!("replica-{pair}"));
+        let restored = replica_inputs(&replica).unwrap();
+        assert_eq!(restored.pair, pair);
+        assert_eq!(restored.seeds, approver.seeds);
+        assert_eq!(restored.candidate, approver.candidate);
+        let (_, replica_sighash, replica_indices) = aggregate_and_apply(&restored).unwrap();
+        assert_eq!(replica_sighash, sighash);
+        assert_eq!(replica_indices, indices);
+        let surplus = seed_file(pair, 2);
+        replica.write_text(&surplus, "unexpected").unwrap();
+        assert!(replica_inputs(&replica)
+            .err()
+            .unwrap()
+            .contains("unexpected randomizer seed record count"));
+        f.shared().write_text(&surplus, "unexpected").unwrap();
+        assert!(approver_inputs(&f.root, &f.shared(), pair)
+            .err()
+            .unwrap()
+            .contains("unexpected randomizer seed record count"));
+        fs::remove_file(f.shared().path().join(&surplus)).unwrap();
+    }
 }

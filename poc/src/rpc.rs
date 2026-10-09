@@ -9,7 +9,9 @@ pub struct Rpc {
 
 impl Rpc {
     pub fn new(addr: &str) -> Self {
-        Rpc { addr: addr.to_string() }
+        Rpc {
+            addr: addr.to_string(),
+        }
     }
 
     /// The regtest node this process should talk to.
@@ -18,16 +20,12 @@ impl Rpc {
     /// cannot be confused with, or collide with, one started by the shell scripts. The
     /// default is unchanged, so every existing script behaves exactly as before.
     pub fn regtest() -> Self {
-        Rpc::new(
-            &std::env::var("LOKI_RPC").unwrap_or_else(|_| "127.0.0.1:18232".to_string()),
-        )
+        Rpc::new(&std::env::var("LOKI_RPC").unwrap_or_else(|_| "127.0.0.1:18232".to_string()))
     }
 
     /// Issue a JSON-RPC call and return the `result` value.
     pub fn call(&self, method: &str, params: &str) -> Result<ciborium::value::Value, String> {
-        let body = format!(
-            r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{params}}}"#
-        );
+        let body = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{params}}}"#);
         let req = format!(
             "POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n\
              Content-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -37,9 +35,13 @@ impl Rpc {
         );
 
         let mut stream = TcpStream::connect(&self.addr).map_err(|e| format!("connect: {e}"))?;
-        stream.write_all(req.as_bytes()).map_err(|e| format!("write: {e}"))?;
+        stream
+            .write_all(req.as_bytes())
+            .map_err(|e| format!("write: {e}"))?;
         let mut raw = String::new();
-        stream.read_to_string(&mut raw).map_err(|e| format!("read: {e}"))?;
+        stream
+            .read_to_string(&mut raw)
+            .map_err(|e| format!("read: {e}"))?;
 
         let json = raw
             .split_once("\r\n\r\n")

@@ -28,16 +28,36 @@ pub struct Expectations {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Refusal {
     WrongNetworkOrVersion(String),
-    InputSetDiffers { expected: usize, found: usize, detail: String },
+    InputSetDiffers {
+        expected: usize,
+        found: usize,
+        detail: String,
+    },
     MissingOpening(String),
     OpeningsDoNotMatchCommitment(String),
     MemoDiffers(String),
-    ChangeAddressDiffers { expected: String, found: String },
-    AmountDiffers { what: String, expected: u64, found: u64 },
-    FeeDiffers { expected: u64, found: u64 },
-    ExpiryDiffers { expected: u32, found: u32 },
+    ChangeAddressDiffers {
+        expected: String,
+        found: String,
+    },
+    AmountDiffers {
+        what: String,
+        expected: u64,
+        found: u64,
+    },
+    FeeDiffers {
+        expected: u64,
+        found: u64,
+    },
+    ExpiryDiffers {
+        expected: u32,
+        found: u32,
+    },
     ExtraOutputOrPool(String),
-    RkDoesNotMatchAlpha { expected: String, found: String },
+    RkDoesNotMatchAlpha {
+        expected: String,
+        found: String,
+    },
     PackageSighashMismatch,
 }
 
@@ -145,9 +165,9 @@ fn check_memo(
     );
 
     let recomputed = enc.encrypt_note_plaintext();
-    let actual = action.output().encrypted_note().enc_ciphertext.as_ref();
+    let actual: &[u8] = &action.output().encrypted_note().enc_ciphertext;
 
-    if recomputed.as_ref() != actual {
+    if &recomputed[..] != actual {
         return Err(Refusal::MemoDiffers(format!(
             "{label}: re-encrypting with the intended memo does not reproduce enc_ciphertext"
         )));
@@ -269,9 +289,10 @@ pub fn check_candidate(
     }
 
     // ── fee: implied by the transaction, compared with the intent ───────────
-    let implied_fee = total_in
-        .checked_sub(total_out)
-        .ok_or(Refusal::FeeDiffers { expected: want.fee_zat, found: 0 })?;
+    let implied_fee = total_in.checked_sub(total_out).ok_or(Refusal::FeeDiffers {
+        expected: want.fee_zat,
+        found: 0,
+    })?;
     if implied_fee != want.fee_zat {
         return Err(Refusal::FeeDiffers {
             expected: want.fee_zat,
@@ -306,14 +327,15 @@ mod tests {
     /// One honest candidate, built the way `propose` builds them.
     fn fixture() -> Fixture {
         let rng = rand_core::OsRng;
-        let (_shares, pubkeys) = frost::keys::generate_with_dealer(
-            3,
-            2,
-            frost::keys::IdentifierList::Default,
-            rng,
-        )
-        .unwrap();
-        let ak: [u8; 32] = pubkeys.verifying_key().serialize().unwrap().try_into().unwrap();
+        let (_shares, pubkeys) =
+            frost::keys::generate_with_dealer(3, 2, frost::keys::IdentifierList::Default, rng)
+                .unwrap();
+        let ak: [u8; 32] = pubkeys
+            .verifying_key()
+            .serialize()
+            .unwrap()
+            .try_into()
+            .unwrap();
         let fvk = zip2005::frost_viewing_key(&ak, &[42u8; 32]).unwrap();
 
         let rho = Rho::from_bytes(&[1u8; 32]).unwrap();
@@ -405,7 +427,10 @@ mod tests {
         let r = refuses(|w| w.amount_zat += 1);
         // A different amount means no output matches the payment address at that value.
         assert!(
-            matches!(r, Refusal::AmountDiffers { .. } | Refusal::ExtraOutputOrPool(_)),
+            matches!(
+                r,
+                Refusal::AmountDiffers { .. } | Refusal::ExtraOutputOrPool(_)
+            ),
             "got {r}"
         );
     }
@@ -414,7 +439,10 @@ mod tests {
     fn c4_tampered_change_amount_is_refused() {
         let r = refuses(|w| w.change_zat -= 1);
         assert!(
-            matches!(r, Refusal::AmountDiffers { .. } | Refusal::ChangeAddressDiffers { .. }),
+            matches!(
+                r,
+                Refusal::AmountDiffers { .. } | Refusal::ChangeAddressDiffers { .. }
+            ),
             "got {r}"
         );
     }
@@ -450,13 +478,9 @@ mod tests {
         let f = fixture();
         let other = vault::test_only_fvk(&{
             let rng = rand_core::OsRng;
-            let (_s, pk) = frost::keys::generate_with_dealer(
-                3,
-                2,
-                frost::keys::IdentifierList::Default,
-                rng,
-            )
-            .unwrap();
+            let (_s, pk) =
+                frost::keys::generate_with_dealer(3, 2, frost::keys::IdentifierList::Default, rng)
+                    .unwrap();
             pk.verifying_key().serialize().unwrap().try_into().unwrap()
         })
         .unwrap();
@@ -466,7 +490,10 @@ mod tests {
         let r = check_candidate(&f.bundle, &other, &f.want)
             .expect_err("change to another vault's address must be refused");
         assert!(
-            matches!(r, Refusal::ExtraOutputOrPool(_) | Refusal::ChangeAddressDiffers { .. }),
+            matches!(
+                r,
+                Refusal::ExtraOutputOrPool(_) | Refusal::ChangeAddressDiffers { .. }
+            ),
             "got {r}"
         );
     }

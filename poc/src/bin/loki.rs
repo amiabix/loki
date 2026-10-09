@@ -362,6 +362,29 @@ fn hex32(v: &serde_json::Value, key: &str) -> Option<[u8; 32]> {
 /// The three candidate pairs, by member slot.
 const PAIRS: [(&str, usize, usize); 3] = [("AB", 0, 1), ("AC", 0, 2), ("BC", 1, 2)];
 
+fn named_pair(name: &str) -> Result<(&'static str, usize, usize), String> {
+    PAIRS
+        .into_iter()
+        .find(|(pair, _, _)| *pair == name)
+        .ok_or_else(|| format!("unknown signing pair: {name}"))
+}
+
+fn selected_pair(args: &[String]) -> Result<(&'static str, usize, usize), String> {
+    match args.iter().position(|arg| arg == "--pair") {
+        Some(index) => named_pair(args.get(index + 1).ok_or("--pair requires AB, AC or BC")?),
+        None => named_pair("AC"),
+    }
+}
+
+fn saved_pair(dir: &MemberDir) -> Result<(&'static str, usize, usize), String> {
+    if dir.exists("pair.txt") {
+        named_pair(dir.read_text("pair.txt").map_err(|e| e.to_string())?.trim())
+    } else {
+        // Existing replicas predate pair selection and contain only AC artifacts.
+        named_pair("AC")
+    }
+}
+
 /// Checkpoint 3, round 1: each member preprocesses one nonce pair per candidate it is in.
 ///
 /// Nonces stay in the member's own directory and never leave it. Only commitments are
@@ -1147,7 +1170,7 @@ fn propose(args: &[String]) -> Result<(), String> {
         // the binding signature signing key. It must run BEFORE anyone computes a
         // sighash, or the signers would sign a transaction whose IO was still open.
         let pczt = pczt::roles::io_finalizer::IoFinalizer::new(pczt)
-            .finalize_io(rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng))
+            .finalize_io()
             .map_err(|e| format!("{name}: io finalizer: {e:?}"))?;
 
         let bytes = pczt
@@ -1571,12 +1594,14 @@ fn finish(args: &[String]) -> Result<(), String> {
     let shared = MemberDir::open(&root, &shared_name());
     let vault_dir = MemberDir::open(&root, "public");
 
+    let (name, _, _) = selected_pair(args)?;
     let intent_kv = kv(&shared.read_text("intent.txt").map_err(|e| e.to_string())?);
     let want_nfs = intent_nullifiers(&intent_kv)?;
-    let inputs = approver_inputs(&root, &shared)?;
+    let inputs = approver_inputs(&root, &shared, name)?;
     let (signed, sighash, spend_indices) = aggregate_and_apply(&inputs)?;
-    let name = "AC";
-    println!("AC  two shares per spend aggregated, verified, applied before anchor/witness/proof");
+    println!(
+        "{name}  two shares per spend aggregated, verified, applied before anchor/witness/proof"
+    );
 
     // ── everything below happens AFTER signing ──────────────────────────────
     let rpc = loki_poc::rpc::Rpc::regtest();
@@ -1635,7 +1660,7 @@ fn finish(args: &[String]) -> Result<(), String> {
     let pk =
         orchard::circuit::ProvingKey::build(orchard::circuit::OrchardCircuitVersion::PostNu6_3);
     let proved = Prover::new(updated)
-        .create_ironwood_proof(rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng), &pk)
+        .create_ironwood_proof(&pk)
         .map_err(|e| format!("prove: {e:?}"))?
         .finish();
     println!("{name}  proof created");
@@ -1648,7 +1673,7 @@ fn finish(args: &[String]) -> Result<(), String> {
         orchard::circuit::VerifyingKey::build(orchard::circuit::OrchardCircuitVersion::PostNu6_3);
     let tx = TransactionExtractor::new(finalized)
         .with_orchard(&vk)
-        .extract(rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng))
+        .extract()
         .map_err(|e| format!("extract: {e:?}"))?;
 
     let mut raw = Vec::new();
@@ -1670,12 +1695,15 @@ fn finish(args: &[String]) -> Result<(), String> {
         .write_text(
             "mined.txt",
             &format!(
-                "txid={txid}\nbroadcast_at_height={tip}\nanchor={}\n",
+                "pair={name}\ntxid={txid}\nbroadcast_at_height={tip}\nanchor={}\n",
                 hex::encode(anchor)
             ),
         )
         .map_err(|e| e.to_string())?;
 
+    shared
+        .write_text("pair.txt", name)
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1913,7 +1941,7 @@ fn tamper(args: &[String]) -> Result<(), String> {
 
     let pczt = pczt::roles::creator::Creator::build_from_parts(parts).ok_or("build_from_parts")?;
     let pczt = pczt::roles::io_finalizer::IoFinalizer::new(pczt)
-        .finalize_io(rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng))
+        .finalize_io()
         .map_err(|e| format!("io finalizer: {e:?}"))?;
     let bytes = pczt.serialize().map_err(|e| format!("serialize: {e:?}"))?;
 
@@ -2150,7 +2178,7 @@ fn prove_and_extract(
     let pk =
         orchard::circuit::ProvingKey::build(orchard::circuit::OrchardCircuitVersion::PostNu6_3);
     let proved = Prover::new(updated)
-        .create_ironwood_proof(rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng), &pk)
+        .create_ironwood_proof(&pk)
         .map_err(|e| format!("prove: {e:?}"))?
         .finish();
     println!("{label}  proof created");
@@ -2162,7 +2190,7 @@ fn prove_and_extract(
         orchard::circuit::VerifyingKey::build(orchard::circuit::OrchardCircuitVersion::PostNu6_3);
     let tx = TransactionExtractor::new(finalized)
         .with_orchard(&vk)
-        .extract(rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng))
+        .extract()
         .map_err(|e| format!("extract: {e:?}"))?;
 
     let mut raw = Vec::new();
@@ -2176,35 +2204,40 @@ fn prove_and_extract(
     Ok((raw, txid))
 }
 
-/// Read the AC aggregate inputs out of a flat replica directory.
+/// Read the selected pair’s aggregate inputs out of a flat replica directory.
 fn replica_inputs(r: &MemberDir) -> Result<AggregateInputs, String> {
+    let (name, x, y) = saved_pair(r)?;
+    let members = [MEMBERS[x].0, MEMBERS[y].0];
     let intent_kv = kv(&r.read_text("intent.txt").map_err(|e| format!("{e}"))?);
     let rd = |f: &str| r.read_hex(f).map_err(|e| format!("{f}: {e}"));
     let want_nfs = intent_nullifiers(&intent_kv)?;
-    check_seed_record_count(r, "AC", want_nfs.len())?;
+    check_seed_record_count(r, name, want_nfs.len())?;
     let mut commitments = Vec::new();
     let mut shares = Vec::new();
     for spend in 0..want_nfs.len() {
         commitments.push([
-            rd(&commitment_file("AC", "alice", spend))?,
-            rd(&commitment_file("AC", "carol", spend))?,
+            rd(&commitment_file(name, members[0], spend))?,
+            rd(&commitment_file(name, members[1], spend))?,
         ]);
         shares.push([
-            rd(&share_file("AC", "alice", spend))?,
-            rd(&share_file("AC", "carol", spend))?,
+            rd(&share_file(name, members[0], spend))?,
+            rd(&share_file(name, members[1], spend))?,
         ]);
     }
     Ok(AggregateInputs {
-        pair: "AC".into(),
+        pair: name.into(),
         group_ak: rd("group_ak.hex")?
             .try_into()
             .map_err(|_| "group_ak length")?,
         seeds: (0..want_nfs.len())
-            .map(|spend| load_seed_record(r, "AC", spend))
+            .map(|spend| load_seed_record(r, name, spend))
             .collect::<Result<_, _>>()?,
-        candidate: rd("candidate_AC.pczt.hex")?,
+        candidate: rd(&format!("candidate_{name}.pczt.hex"))?,
         public_package: rd("public_package.hex")?,
-        ids: [rd("identifier_alice.hex")?, rd("identifier_carol.hex")?],
+        ids: [
+            rd(&format!("identifier_{}.hex", members[0]))?,
+            rd(&format!("identifier_{}.hex", members[1]))?,
+        ],
         commitments,
         shares,
         proposal_id: checked_proposal_id(&intent_kv)?,
@@ -2216,46 +2249,52 @@ fn replica_inputs(r: &MemberDir) -> Result<AggregateInputs, String> {
 ///
 /// This is how path A's input comes to exist: Alice proved the transaction but never got
 /// it to a node. Everything after this point is the second device's job.
-fn approver_inputs(root: &std::path::Path, shared: &MemberDir) -> Result<AggregateInputs, String> {
+fn approver_inputs(
+    root: &std::path::Path,
+    shared: &MemberDir,
+    name: &str,
+) -> Result<AggregateInputs, String> {
+    let (_, x, y) = named_pair(name)?;
+    let members = [MEMBERS[x].0, MEMBERS[y].0];
     let intent_kv = kv(&shared.read_text("intent.txt").map_err(|e| format!("{e}"))?);
     let want_nfs = intent_nullifiers(&intent_kv)?;
-    check_seed_record_count(shared, "AC", want_nfs.len())?;
+    check_seed_record_count(shared, name, want_nfs.len())?;
     let rd = |f: &str| shared.read_hex(f).map_err(|e| format!("{f}: {e}"));
     Ok(AggregateInputs {
-        pair: "AC".into(),
+        pair: name.into(),
         group_ak: MemberDir::open(root, "public")
             .read_hex("group_ak.hex")
             .map_err(|e| e.to_string())?
             .try_into()
             .map_err(|_| "group_ak length")?,
         seeds: (0..want_nfs.len())
-            .map(|spend| load_seed_record(shared, "AC", spend))
+            .map(|spend| load_seed_record(shared, name, spend))
             .collect::<Result<_, _>>()?,
-        candidate: rd("candidate_AC.pczt.hex")?,
-        public_package: MemberDir::open(root, "alice")
+        candidate: rd(&format!("candidate_{name}.pczt.hex"))?,
+        public_package: MemberDir::open(root, members[0])
             .read_hex("public_package.hex")
             .map_err(|e| format!("{e}"))?,
         ids: [
-            MemberDir::open(root, "alice")
+            MemberDir::open(root, members[0])
                 .read_hex("identifier.hex")
                 .map_err(|e| format!("{e}"))?,
-            MemberDir::open(root, "carol")
+            MemberDir::open(root, members[1])
                 .read_hex("identifier.hex")
                 .map_err(|e| format!("{e}"))?,
         ],
         commitments: (0..want_nfs.len())
             .map(|spend| {
                 Ok([
-                    rd(&commitment_file("AC", "alice", spend))?,
-                    rd(&commitment_file("AC", "carol", spend))?,
+                    rd(&commitment_file(name, members[0], spend))?,
+                    rd(&commitment_file(name, members[1], spend))?,
                 ])
             })
             .collect::<Result<_, String>>()?,
         shares: (0..want_nfs.len())
             .map(|spend| {
                 Ok([
-                    rd(&share_file("AC", "alice", spend))?,
-                    rd(&share_file("AC", "carol", spend))?,
+                    rd(&share_file(name, members[0], spend))?,
+                    rd(&share_file(name, members[1], spend))?,
                 ])
             })
             .collect::<Result<_, String>>()?,
@@ -2266,12 +2305,13 @@ fn approver_inputs(root: &std::path::Path, shared: &MemberDir) -> Result<Aggrega
 
 fn post_final(args: &[String]) -> Result<(), String> {
     let root = PathBuf::from(args.first().ok_or("usage: post-final <state-dir>")?);
+    let (name, _, _) = selected_pair(args)?;
     let shared = MemberDir::open(&root, &shared_name());
 
-    let inputs = approver_inputs(&root, &shared)?;
+    let inputs = approver_inputs(&root, &shared, name)?;
 
     let (signed, sighash, indices) = aggregate_and_apply(&inputs)?;
-    println!("AC  aggregated two shares per spend; verifies under ak+alpha");
+    println!("{name}  aggregated two shares per spend; verifies under ak+alpha");
 
     let rpc = loki_poc::rpc::Rpc::regtest();
     let ak: [u8; 32] = shared
@@ -2296,7 +2336,7 @@ fn post_final(args: &[String]) -> Result<(), String> {
         })
         .collect::<Result<Vec<_>, String>>()?;
 
-    let (raw, txid) = prove_and_extract(signed, &sighash, &positions, &chain.cmxs, anchor, "AC")?;
+    let (raw, txid) = prove_and_extract(signed, &sighash, &positions, &chain.cmxs, anchor, name)?;
 
     shared
         .write_hex("final_tx.hex", &raw)
@@ -2312,7 +2352,10 @@ fn post_final(args: &[String]) -> Result<(), String> {
             ),
         )
         .map_err(|e| e.to_string())?;
-    println!("AC  final transaction POSTED, not broadcast: {txid}");
+    println!("{name}  final transaction POSTED, not broadcast: {txid}");
+    shared
+        .write_text("pair.txt", name)
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -2329,6 +2372,9 @@ fn replicate(args: &[String]) -> Result<(), String> {
         args.get(1)
             .ok_or("usage: replicate <state-dir> <replica-dir> [--with-final]")?,
     );
+    let (name, x, y) = selected_pair(args)?;
+    let members = [MEMBERS[x].0, MEMBERS[y].0];
+    let candidate_file = format!("candidate_{name}.pczt.hex");
     let with_final = args.iter().any(|a| a == "--with-final");
     if out.exists()
         && std::fs::read_dir(&out)
@@ -2341,7 +2387,7 @@ fn replicate(args: &[String]) -> Result<(), String> {
     let shared = MemberDir::open(&root, &shared_name());
     let intent_kv = kv(&shared.read_text("intent.txt").map_err(|e| format!("{e}"))?);
     let spend_count = intent_nullifiers(&intent_kv)?.len();
-    check_seed_record_count(&shared, "AC", spend_count)?;
+    check_seed_record_count(&shared, name, spend_count)?;
 
     let replica = MemberDir::create(
         out.parent().unwrap_or(&out),
@@ -2352,18 +2398,18 @@ fn replicate(args: &[String]) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
 
     // Public group data and the proposal. All of this is designed to be replicated.
-    for f in ["intent.txt", "candidate_AC.pczt.hex", "group_ak.hex"] {
+    for f in ["intent.txt", candidate_file.as_str(), "group_ak.hex"] {
         let bytes = std::fs::read(shared.path().join(f))
             .map_err(|e| format!("{f}: {e} (run propose and review-sign first)"))?;
         std::fs::write(replica.path().join(f), bytes).map_err(|e| format!("{f}: {e}"))?;
     }
     for spend in 0..spend_count {
-        let record = load_seed_record(&shared, "AC", spend)?;
-        write_seed_record(&replica, "AC", spend, &record)?;
-        for member in ["alice", "carol"] {
+        let record = load_seed_record(&shared, name, spend)?;
+        write_seed_record(&replica, name, spend, &record)?;
+        for member in members {
             for file in [
-                commitment_file("AC", member, spend),
-                share_file("AC", member, spend),
+                commitment_file(name, member, spend),
+                share_file(name, member, spend),
             ] {
                 let bytes = std::fs::read(shared.path().join(&file))
                     .map_err(|e| format!("{file}: {e} (run review-sign first)"))?;
@@ -2378,14 +2424,14 @@ fn replicate(args: &[String]) -> Result<(), String> {
     std::fs::write(
         replica.path().join("public_package.hex"),
         std::fs::read(
-            MemberDir::open(&root, "alice")
+            MemberDir::open(&root, members[0])
                 .path()
                 .join("public_package.hex"),
         )
         .map_err(|e| format!("public_package: {e}"))?,
     )
     .map_err(|e| format!("{e}"))?;
-    for m in ["alice", "carol"] {
+    for m in members {
         std::fs::write(
             replica.path().join(format!("identifier_{m}.hex")),
             std::fs::read(MemberDir::open(&root, m).path().join("identifier.hex"))
@@ -2394,26 +2440,30 @@ fn replicate(args: &[String]) -> Result<(), String> {
         .map_err(|e| format!("{e}"))?;
     }
 
-    let mut manifest = String::from(
-        "# Replica handed to the second device.\n\
-         #\n\
-         # confidential local handoff: seeds require confidential transport; no encrypted relay is implemented.\n\
-         # copied:\n\
-         intent.txt\ncandidate_AC.pczt.hex\ngroup_ak.hex\npublic_package.hex\n\
-         identifier_alice.hex\nidentifier_carol.hex\n",
+    replica
+        .write_text("pair.txt", name)
+        .map_err(|e| e.to_string())?;
+    let mut manifest = format!(
+        "# Replica handed to the second device.\n# Confidential local handoff: seeds require confidential transport; no encrypted relay is implemented.\n# Copied artifacts:\n\
+         intent.txt\n{candidate_file}\ngroup_ak.hex\npublic_package.hex\npair.txt\n\
+         identifier_{}.hex\nidentifier_{}.hex\n",
+        members[0], members[1],
     );
     for spend in 0..spend_count {
-        manifest.push_str(&format!("{}\n", seed_file("AC", spend)));
-        for member in ["alice", "carol"] {
+        manifest.push_str(&format!("{}\n", seed_file(name, spend)));
+        for member in members {
             manifest.push_str(&format!(
                 "{}\n{}\n",
-                commitment_file("AC", member, spend),
-                share_file("AC", member, spend)
+                commitment_file(name, member, spend),
+                share_file(name, member, spend)
             ));
         }
     }
 
     if with_final {
+        if saved_pair(&shared)?.0 != name {
+            return Err("posted transaction belongs to a different signing pair".into());
+        }
         std::fs::write(
             replica.path().join("final_tx.hex"),
             std::fs::read(shared.path().join("final_tx.hex"))
@@ -2477,6 +2527,7 @@ fn finish_second(args: &[String]) -> Result<(), String> {
             .and_then(|s| s.to_str())
             .unwrap_or("replica"),
     );
+    let (name, _, _) = saved_pair(&replica)?;
     let mine = MemberDir::create(&work, "self").map_err(|e| format!("{e}"))?;
 
     // Refuse to run against a directory that still contains approver state. A second
@@ -2537,7 +2588,7 @@ fn finish_second(args: &[String]) -> Result<(), String> {
         .map_err(|e| format!("the posted final transaction does not parse: {e}"))?;
         let candidate = pczt::Pczt::parse(
             &replica
-                .read_hex("candidate_AC.pczt.hex")
+                .read_hex(&format!("candidate_{name}.pczt.hex"))
                 .map_err(|e| format!("candidate: {e}"))?,
         )
         .map_err(|e| format!("parse candidate: {e:?}"))?;
@@ -2639,7 +2690,7 @@ fn finish_second(args: &[String]) -> Result<(), String> {
     mine.write_text(
         "finished.txt",
         &format!(
-            "path={path_name}\ntxid={txid}\nbroadcast_at_height={}\n",
+            "pair={name}\npath={path_name}\ntxid={txid}\nbroadcast_at_height={}\n",
             chain.tip
         ),
     )
@@ -2671,6 +2722,7 @@ fn verify_effects(args: &[String]) -> Result<(), String> {
             .unwrap_or("replica"),
     );
 
+    let (name, _, _) = saved_pair(&replica)?;
     let intent_kv = kv(&replica
         .read_text("intent.txt")
         .map_err(|e| format!("{e}"))?);
@@ -2731,7 +2783,7 @@ fn verify_effects(args: &[String]) -> Result<(), String> {
         .ok_or("mined transaction has no Ironwood bundle")?;
     let candidate = pczt::Pczt::parse(
         &replica
-            .read_hex("candidate_AC.pczt.hex")
+            .read_hex(&format!("candidate_{name}.pczt.hex"))
             .map_err(|e| format!("candidate: {e}"))?,
     )
     .map_err(|e| format!("parse candidate: {e:?}"))?;
@@ -3059,7 +3111,7 @@ mod selection_tests {
         .unwrap();
         let candidate = pczt::roles::creator::Creator::build_from_parts(built.pczt_parts).unwrap();
         let candidate = pczt::roles::io_finalizer::IoFinalizer::new(candidate)
-            .finalize_io(rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng))
+            .finalize_io()
             .unwrap();
         let sighash = pczt::roles::signer::Signer::new(candidate.clone())
             .unwrap()

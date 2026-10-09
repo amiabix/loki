@@ -79,13 +79,14 @@ poc/
   demo/                   a local account UI that drives the real prototype
   g3/                     the standalone browser nonce-safety prototype
   harness/                THS regtest setup and lifecycle instructions
-  vendor/                 orchard and zcash_primitives, patched so a caller can choose
+  vendor/                 zakura-orchard and zakura-primitives, patched so a caller can choose
                           the signing randomiser (see vendor/README.md)
 
   FROST-RANDOMIZER-RESULTS.md  current seed-flow validation and live-run status
   RESULTS.md                  historical G1-TX mined transaction and approval checks
   SECOND-DEVICE-RESULTS.md    finishing without the approvers' files
-  DEPENDENCIES.md             the pinned library path, and the ZIP 2005 blocker
+  DEPENDENCIES.md             the current Zakura graph and dependency history
+  ZAKURA-MIGRATION-RESULTS.md  artifact compatibility and live pair/finisher evidence
   g3/G3-RESULTS.md            the browser drills, per engine
 ```
 
@@ -142,7 +143,7 @@ honest session needs a new `LOKI_ROUND` and fresh nonce commitments. See
 - The legacy transaction CLI uses a **test-only** `ak || nk || rivk` splice. Separate-member
   setup preserves its experimental ZIP 2005 derivation and backup gate, but has not
   established a mined payment from that derivation.
-- Regtest only, one machine and one recipient. The AC live flow mined payments with one and two inputs; AB/AC/BC independent two-input finishing is verified offline.
+- Regtest only, one machine and one recipient. AB/AC/BC payments and independent finishing mined under the migration; seed-based AB/AC/BC independent two-input finishing is verified offline.
 - Member state is plain files with no rollback guarantee. A nonce is deleted after use,
   which is not a crash-safe consumed-nonce ledger. Batch validation does not make share
   writes and nonce deletion atomic.
@@ -158,6 +159,6 @@ honest session needs a new `LOKI_ROUND` and fresh nonce commitments. See
 
 ## Licence
 
-Not yet chosen. `poc/vendor/` contains third-party crates (`orchard`,
-`zcash_primitives`) carrying their own upstream licences; see `poc/vendor/README.md` for
-the pinned commits and the patches applied.
+Not yet chosen. `poc/vendor/` contains third-party crates (`zakura-orchard`,
+`zakura-primitives`) carrying their own upstream licences; see `poc/vendor/README.md` for
+the exact published releases, upstream licences, and patches applied.

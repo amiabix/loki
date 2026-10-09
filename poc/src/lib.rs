@@ -184,10 +184,8 @@ mod checkpoint_1 {
         );
     }
 
-    /// C1.2, as far as it can go — the group key crosses the crate-version boundary.
-    ///
-    /// FROST lives in reddsa 0.5.2 / pasta_curves 0.5; orchard 0.16 lives in reddsa 0.6 /
-    /// pasta_curves 0.6. The two cannot exchange typed points, only bytes. They do.
+    /// C1.2, as far as it can go: validate the saved group-key encoding and compose
+    /// the documented test-only FVK. ZIP 2005 remains a separate setup path.
     ///
     /// **This is the pre-ZIP-2005 path and the brief says it is NOT a pass for G1.**
     /// It is recorded here to show exactly how far the available APIs reach.

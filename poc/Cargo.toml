@@ -4,27 +4,20 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
-# G1 checkpoint 1: pin a COMPATIBLE graph and prove the APIs compose.
-# The October 1 version list is the starting point; what builds is the authority.
+# One Zakura family serves transaction construction, proving, scanning and FROST.
 [dependencies]
-orchard            = "0.16.0"
-zcash_primitives   = "0.31.0-pre.0"
-pczt               = { version = "0.10.0-pre.0", features = ["orchard", "signer", "io-finalizer", "prover", "spend-finalizer", "tx-extractor", "zcp-builder"] }
-# FROST RedPallas lives ONLY in reddsa 0.5.x. reddsa 0.6 removed src/frost entirely,
-# and orchard 0.16 requires reddsa 0.6. Both end up in the graph as separate semver
-# majors; they can meet only through serialized bytes. See DEPENDENCIES.md finding F3.
-reddsa_frost       = { package = "reddsa", version = "0.5.2", features = ["frost"] }
-frost-core         = { version = "3.0.0", features = ["serialization"] }
-frost-rerandomized = { version = "3.0.0", features = ["serialization"] }
-pasta_curves       = "0.6"   # must match orchard 0.16; the FROST half uses 0.5 transitively
-group              = "0.13"
-incrementalmerkletree = "0.9"
-ff                 = "0.13"
-# pasta_curves 0.6 (the orchard half) implements ff 0.14's traits.
-ff_zp              = { package = "ff", version = "0.14" }
+orchard            = { package = "zakura-orchard", version = "=2.2.0" }
+zcash_primitives   = { package = "zakura-primitives", version = "=2.2.0" }
+pczt               = { package = "zakura-pczt", version = "=0.1.0-rc4", features = ["orchard", "signer", "io-finalizer", "prover", "spend-finalizer", "tx-extractor", "zcp-builder"] }
+reddsa_frost       = { package = "zakura-reddsa", version = "=2.2.0", features = ["frost"] }
+frost-core         = { version = "=3.0.0", features = ["serialization"] }
+frost-rerandomized = { version = "=3.0.0", features = ["serialization"] }
+pasta_curves       = { package = "zakura-pasta-curves", version = "=2.2.0" }
+group              = "0.14"
+incrementalmerkletree = "0.8.2"
+ff                 = "0.14"
 rand_core          = { version = "0.6", features = ["getrandom"] }
-# zcash_primitives builds against rand_core 0.10; the FROST half is on 0.6. Both are in
-# the graph (DEPENDENCIES.md finding F3), so each is named explicitly at its call site.
+# Transactions use rand_core 0.10; FROST 3.0.0 keeps its public 0.6 RNG API.
 rand_core_zp       = { package = "rand_core", version = "0.10" }
 rand_zp            = { package = "rand", version = "0.10" }
 # Deterministic nonce derivation for the Phase A binding tests. Test-only: a seeded
@@ -38,21 +31,21 @@ bip39              = { version = "2.2.2", default-features = false, features = [
 # is already in the graph via zcash_note_encryption, so only the KDF is new: Argon2id is
 # the one memory-hard password hash in wide review, and a passphrase needs a real KDF.
 # `default-features = false` keeps it to the raw `hash_password_into` entry point.
-chacha20poly1305   = "0.11"
+chacha20poly1305   = "=0.10.1"
 argon2             = { version = "0.5", default-features = false, features = ["alloc"] }
 ed25519-dalek      = { version = "2.2", features = ["rand_core"] }
 x25519-dalek       = { version = "2.0", features = ["static_secrets"] }
 hex                = "0.4"
 ciborium           = "0.2"
 serde_json         = "1"
-zcash_address      = "0.14.0-pre.0"
-zcash_protocol     = "0.11.0-pre.0"
-zcash_note_encryption = "0.5"
+zcash_address = { package = "zakura-address", version = "=2.2.0" }
+zcash_protocol = { package = "zakura-protocol", version = "=2.2.0" }
+zcash_note_encryption = "0.4.2"
 # Only for the forbidden-pool tamper fixtures: these build a transparent / Sapling
 # PCZT component directly through the public `pczt::parse` constructors, which is the
 # only way to produce one (DeferredPcztBuilder has no transparent or Sapling methods).
-zcash_transparent  = "0.11.0-pre.0"
-sapling-crypto     = "0.9.0"
+zcash_transparent = { package = "zakura-transparent", version = "=2.2.0" }
+sapling-crypto = { package = "zakura-sapling-crypto", version = "=2.2.0" }
 ciborium-io        = "0.2"
 
 [features]
@@ -60,9 +53,7 @@ ciborium-io        = "0.2"
 # Each FAILS TO COMPILE on purpose; the compiler error is the blocker report.
 probe-zip2005 = []
 
-# LOKI PATCH (B2): orchard vendored at zcash/orchard 616a669df8c9a59c33d47064d3ce04b25d026b2e
-# (2026-09-30, version 0.16.0) with one isolated change: SpendInfo may carry a
-# caller-selected `alpha`. See vendor/orchard.patch and DEPENDENCIES.md finding B2.
+# Caller-supplied alpha is threaded into the spend before rk is derived.
 [patch.crates-io]
-orchard = { path = "vendor/orchard" }
-zcash_primitives = { path = "vendor/zcash_primitives" }
+zakura-orchard = { path = "vendor/zakura-orchard" }
+zakura-primitives = { path = "vendor/zakura-primitives" }

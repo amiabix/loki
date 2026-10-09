@@ -4,7 +4,7 @@
 //! vectors and the key and backup flow is reviewed. The ZIP is still Proposed.
 
 use blake2b_simd::Params;
-use ff_zp::{FromUniformBytes, PrimeField};
+use ff::{FromUniformBytes, PrimeField};
 use orchard::keys::FullViewingKey;
 use pasta_curves::pallas;
 use zeroize::Zeroize;
