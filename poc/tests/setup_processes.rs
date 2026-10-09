@@ -1,5 +1,6 @@
 use loki_poc::state::MemberDir;
 use std::{
+    collections::BTreeMap,
     fs,
     process::{Command, Stdio},
     thread,
@@ -204,6 +205,7 @@ fn three_processes_create_one_vault_without_sharing_secrets() {
     );
     let mut shares = Vec::new();
     let mut vault_secrets = Vec::new();
+    let mut public_packages = Vec::new();
     for id in 1..=3 {
         let secrets = root.join(format!("member-{id}/secrets"));
         assert!(secrets.join("vault.sealed").exists());
@@ -230,11 +232,51 @@ fn three_processes_create_one_vault_without_sharing_secrets() {
         let fvk = loki_poc::zip2005::frost_viewing_key(&ak, &sk).unwrap();
         assert_eq!(loki_poc::vault::regtest_unified_address(&fvk), address);
         shares.push(state["key_package"].as_str().unwrap().to_string());
+        public_packages.push(state["public_package"].as_str().unwrap().to_string());
         vault_secrets.push(state["vault_secret"].as_str().unwrap().to_string());
     }
     assert_ne!(shares[0], shares[1]);
     assert_ne!(shares[1], shares[2]);
+    assert!(public_packages.windows(2).all(|pair| pair[0] == pair[1]));
     assert!(vault_secrets.windows(2).all(|pair| pair[0] == pair[1]));
+    {
+        use reddsa_frost::frost::redpallas as frost;
+        let public =
+            frost::keys::PublicKeyPackage::deserialize(&hex::decode(&public_packages[0]).unwrap())
+                .unwrap();
+        let alpha =
+            frost_rerandomized::Randomizer::<frost::PallasBlake2b512>::deserialize(&[7u8; 32])
+                .unwrap();
+        let keys: Vec<_> = shares[..2]
+            .iter()
+            .map(|s| frost::keys::KeyPackage::deserialize(&hex::decode(s).unwrap()).unwrap())
+            .collect();
+        let mut nonces = BTreeMap::new();
+        let mut commitments = BTreeMap::new();
+        for key in &keys {
+            let (nonce, commitment) =
+                frost::round1::commit(key.signing_share(), &mut rand_core::OsRng);
+            nonces.insert(*key.identifier(), nonce);
+            commitments.insert(*key.identifier(), commitment);
+        }
+        let message = b"DKG shares from the three separate member processes";
+        let package = frost::SigningPackage::new(commitments, message);
+        let mut signature_shares = BTreeMap::new();
+        for key in &keys {
+            #[allow(deprecated)] // The transaction path supplies alpha; this checks the DKG shares.
+            let share =
+                frost_rerandomized::sign(&package, &nonces[key.identifier()], key, alpha).unwrap();
+            signature_shares.insert(*key.identifier(), share);
+        }
+        let params =
+            frost_rerandomized::RandomizedParams::from_randomizer(public.verifying_key(), alpha);
+        let signature =
+            frost_rerandomized::aggregate(&package, &signature_shares, &public, &params).unwrap();
+        params
+            .randomized_verifying_key()
+            .verify(message, &signature)
+            .unwrap();
+    }
     let mut addresses = Vec::new();
     for id in 1..=3 {
         let member = root.join(format!("member-{id}"));

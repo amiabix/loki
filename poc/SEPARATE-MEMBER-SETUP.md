@@ -11,7 +11,7 @@ cargo test --test distributed_setup
 cargo test --test setup_transport
 ```
 
-The process test creates three owner-only stores, a public exchange directory, and a roster. It starts three `loki_setup_member run` processes concurrently, checks that no address is printed, then requires all three members to check their cards before the address command succeeds. It restores each member's sealed state from the card and words, including once with the exchange directory removed. The DKG core test checks that the shares differ. A wrong roster fingerprint is refused before any DKG message is published.
+The process test creates three owner-only stores, a public exchange directory, and a roster. It starts three `loki_setup_member run` processes concurrently, checks that no address is printed, then requires all three members to check their cards before the address command succeeds. Two shares loaded from those member stores produce a valid rerandomized FROST signature on a test message; this is not a transaction signature. The test restores each member's sealed state from the card and words, including once with the exchange directory removed. A wrong roster fingerprint is refused before any DKG message is published.
 
 ## Manual ceremony
 

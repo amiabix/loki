@@ -616,7 +616,7 @@ fn run(args: &[String]) -> Result<(), String> {
     dir.write_sealed("vault.sealed", &state, &pass)
         .map_err(|e| e.to_string())?;
     eprintln!(
-        "Regtest setup complete. Save and verify each member's backup before the address is shown."
+        "REGTEST ONLY: key derivation and backup card await review. Save and verify each member's backup before the address is shown."
     );
     Ok(())
 }
