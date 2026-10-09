@@ -21,6 +21,7 @@ pub mod distributed_setup;
 pub mod intent;
 #[cfg(test)]
 mod nonce_binding;
+pub mod randomizer;
 pub mod refresh;
 pub mod rpc;
 pub mod scan;
@@ -72,7 +73,7 @@ mod checkpoint_1 {
     /// rerandomized signing, share verification and aggregation, which is the list the
     /// brief asks to confirm.
     #[test]
-    fn c1_1_frost_pallas_signs_under_a_caller_supplied_alpha() {
+    fn c1_1_frost_pallas_signs_with_a_saved_randomizer_seed() {
         let mut rng = rand_core::OsRng;
 
         let (shares, pubkeys) =
@@ -85,12 +86,6 @@ mod checkpoint_1 {
             .collect();
         let ids: Vec<_> = wallets.keys().copied().take(2).collect();
 
-        // The randomizer is OURS, not the coordinator's: on Zcash it is fixed by the
-        // transaction. This is the property Loki's per-pair alpha derivation needs.
-        let alpha =
-            frost_rerandomized::Randomizer::<frost::PallasBlake2b512>::deserialize(&[7u8; 32])
-                .expect("a canonical scalar");
-
         let mut nonces = BTreeMap::new();
         let mut commitments = BTreeMap::new();
         for id in &ids {
@@ -99,17 +94,36 @@ mod checkpoint_1 {
             commitments.insert(*id, c);
         }
 
+        let (params, seed) = frost_rerandomized::RandomizedParams::new_from_commitments(
+            pubkeys.verifying_key(),
+            &commitments,
+            rand_core::OsRng,
+        )
+        .unwrap();
+        let restored = frost_rerandomized::RandomizedParams::regenerate_from_seed_and_commitments(
+            pubkeys.verifying_key(),
+            &seed,
+            &commitments,
+        )
+        .unwrap();
+        assert_eq!(
+            params.randomizer().serialize(),
+            restored.randomizer().serialize()
+        );
         let pkg = frost::SigningPackage::new(commitments, b"stand-in sighash");
 
         let mut sigshares = BTreeMap::new();
         for id in &ids {
-            #[allow(deprecated)] // the seed path cannot be used: alpha is fixed by the tx
-            let share = frost_rerandomized::sign(&pkg, &nonces[id], &wallets[id], alpha).unwrap();
+            let share = frost_rerandomized::sign_with_randomizer_seed(
+                &pkg,
+                &nonces[id],
+                &wallets[id],
+                &seed,
+            )
+            .unwrap();
             sigshares.insert(*id, share);
         }
 
-        let params =
-            frost_rerandomized::RandomizedParams::from_randomizer(pubkeys.verifying_key(), alpha);
         let sig = frost_rerandomized::aggregate(&pkg, &sigshares, &pubkeys, &params)
             .expect("two of three aggregate");
 

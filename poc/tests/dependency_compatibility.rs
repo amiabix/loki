@@ -188,13 +188,15 @@ struct Scratch(std::path::PathBuf);
 
 impl Scratch {
     fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let root = std::env::temp_dir().join(format!(
-            "loki-artifact-{}-{}",
+            "loki-artifact-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir(&root).unwrap();
         Self(root)
@@ -252,8 +254,61 @@ impl Scratch {
         dir.write_hex("group_ak.hex", &public.verifying_key().serialize().unwrap())
             .unwrap();
         let f = old_fixture();
-        dir.write_text("intent.txt", &format!("input_nullifier={}\nrecipient={}\namount_zat=40000000\nchange_zat=584990000\nmemo={}\nexpiry_height=1152\nfee_zat=10000\nproposal_id={}\n",
-            hex::encode([1; 32]), hex::encode([1; 43]), f["message"].as_str().unwrap(), hex::encode([9; 32]))).unwrap();
+        let intent = loki_poc::intent::Intent {
+            proposer: frost::Identifier::try_from(1u16).unwrap().serialize(),
+            created_height: 700,
+            input_nullifiers: vec![[1; 32]],
+            recipient: vec![1; 43],
+            amount_zat: 40_000_000,
+            change_zat: 584_990_000,
+            memo: bytes(&f, "message"),
+            fee_zat: 10_000,
+            expiry_height: 1_152,
+            change_policy: loki_poc::intent::ChangePolicy::VaultInternal,
+        };
+        dir.write_text("intent.txt", &format!("input_nullifier={}\nrecipient={}\namount_zat=40000000\nchange_zat=584990000\nmemo={}\nexpiry_height=1152\nfee_zat=10000\nproposal_id={}\nproposer={}\ncreated_height=700\nchange_policy=vault_internal\n",
+            hex::encode([1; 32]), hex::encode([1; 43]), f["message"].as_str().unwrap(), hex::encode(intent.proposal_id()), hex::encode(&intent.proposer))).unwrap();
+        for (pair, members) in [
+            ("AB", ["alice", "bob"]),
+            ("AC", ["alice", "carol"]),
+            ("BC", ["bob", "carol"]),
+        ] {
+            let mut commitments = BTreeMap::new();
+            for member in members {
+                let id = frost::Identifier::deserialize(
+                    &loki_poc::state::MemberDir::open(&scratch.0, member)
+                        .read_hex("identifier.hex")
+                        .unwrap(),
+                )
+                .unwrap();
+                let commitment = frost::round1::SigningCommitments::deserialize(
+                    &dir.read_hex(&format!("commitment_{pair}_{member}.hex"))
+                        .unwrap(),
+                )
+                .unwrap();
+                commitments.insert(id, commitment);
+            }
+            let (_, seed) = frost_rerandomized::RandomizedParams::new_from_commitments(
+                public.verifying_key(),
+                &commitments,
+                &mut rng,
+            )
+            .unwrap();
+            let record = loki_poc::randomizer::SeedRecord::new(
+                intent.proposal_id(),
+                pair,
+                0,
+                [1; 32],
+                &commitments,
+                &seed,
+            )
+            .unwrap();
+            dir.write_text(
+                &format!("randomizer_seed_{pair}.hex"),
+                &record.encode().unwrap(),
+            )
+            .unwrap();
+        }
         for pair in ["AB", "AC", "BC"] {
             dir.write_hex(
                 &format!("candidate_{pair}.pczt.hex"),
@@ -349,7 +404,7 @@ fn old_sealed_public_payload_is_read_without_changing_the_saved_file() {
 }
 
 #[test]
-fn cli_handoff_copies_only_the_selected_pairs_public_inputs() {
+fn cli_handoff_copies_only_the_selected_pairs_inputs_and_confidential_seed() {
     let state = Scratch::synthetic_signer_state();
     let public = state.0.join("public");
     for (pair, members) in [
@@ -386,6 +441,27 @@ fn cli_handoff_copies_only_the_selected_pairs_public_inputs() {
             pair
         );
         assert!(replica.join(format!("candidate_{pair}.pczt.hex")).is_file());
+        let seed_file = format!("randomizer_seed_{pair}.hex");
+        assert_eq!(
+            std::fs::read(replica.join(&seed_file)).unwrap(),
+            std::fs::read(public.join(&seed_file)).unwrap()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(replica.join(&seed_file))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(&replica).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
         for member in members {
             assert!(replica.join(format!("identifier_{member}.hex")).is_file());
             assert!(replica.join(format!("share_{pair}_{member}.hex")).is_file());
@@ -395,6 +471,9 @@ fn cli_handoff_copies_only_the_selected_pairs_public_inputs() {
             .filter(|other| *other != pair)
         {
             assert!(!replica.join(format!("candidate_{other}.pczt.hex")).exists());
+            assert!(!replica
+                .join(format!("randomizer_seed_{other}.hex"))
+                .exists());
         }
         assert!(!std::fs::read_dir(&replica).unwrap().any(|entry| {
             let name = entry.unwrap().file_name().to_string_lossy().into_owned();

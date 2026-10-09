@@ -54,7 +54,7 @@ fn main() {
                    review-sign <state-dir> <member>   review all, then sign\n\
                    finish  <state-dir>   aggregate AC, prove, broadcast\n\
                    post-final <state-dir>   aggregate and prove AC, post it, do NOT broadcast\n\
-                   replicate <state-dir> <replica-dir> [--with-final]   public artifacts only\n\
+                   replicate <state-dir> <replica-dir> [--with-final]   confidential seed handoff\n\
                    finish-second <replica-dir> <work-dir>   finish from a replica + own scan\n\
                    verify-effects <replica-dir> <txid>   check the mined effects\n\
                    tamper  <state-dir> <case>   TEST-ONLY: corrupt candidate AC\n"
@@ -671,6 +671,155 @@ fn commitment_file(pair: &str, who: &str, i: usize) -> String {
     }
 }
 
+fn seed_file(pair: &str, i: usize) -> String {
+    if i == 0 {
+        format!("randomizer_seed_{pair}.hex")
+    } else {
+        format!("randomizer_seed_{pair}_{i}.hex")
+    }
+}
+
+fn write_seed_record(
+    shared: &MemberDir,
+    pair: &str,
+    i: usize,
+    record: &loki_poc::randomizer::SeedRecord,
+) -> Result<(), String> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(shared.path().join(seed_file(pair, i)))
+        .map_err(|e| e.to_string())?;
+    file.write_all(record.encode()?.as_bytes())
+        .map_err(|e| e.to_string())
+}
+
+fn check_seed_record_count(shared: &MemberDir, pair: &str, spends: usize) -> Result<(), String> {
+    let expected: Vec<_> = (0..spends).map(|i| seed_file(pair, i)).collect();
+    for entry in std::fs::read_dir(shared.path()).map_err(|e| e.to_string())? {
+        let name = entry
+            .map_err(|e| e.to_string())?
+            .file_name()
+            .to_string_lossy()
+            .into_owned();
+        if (name == seed_file(pair, 0) || name.starts_with(&format!("randomizer_seed_{pair}_")))
+            && !expected.contains(&name)
+        {
+            return Err(format!(
+                "REFUSED: unexpected randomizer seed record count for {pair}: {name}"
+            ));
+        }
+    }
+    // Missing expected records retain the descriptive missing-record refusal when loaded.
+    Ok(())
+}
+
+fn load_seed_record(
+    shared: &MemberDir,
+    pair: &str,
+    i: usize,
+) -> Result<loki_poc::randomizer::SeedRecord, String> {
+    let file = seed_file(pair, i);
+    let text = shared
+        .read_text(&file)
+        .map_err(|e| format!("REFUSED: missing randomizer seed record {file}: {e}"))?;
+    loki_poc::randomizer::SeedRecord::decode(&text).map_err(|e| format!("REFUSED: {file}: {e}"))
+}
+
+fn checked_proposal_id(m: &std::collections::HashMap<String, String>) -> Result<[u8; 32], String> {
+    use loki_poc::intent::{ChangePolicy, Intent};
+    let number = |k: &str| -> Result<u64, String> {
+        m.get(k)
+            .ok_or(format!("missing {k}"))?
+            .parse()
+            .map_err(|e| format!("{k}: {e}"))
+    };
+    if m.get("change_policy").map(String::as_str) != Some("vault_internal") {
+        return Err("REFUSED: unknown change policy".into());
+    }
+    let intent = Intent {
+        proposer: hex::decode(m.get("proposer").ok_or("missing proposer")?)
+            .map_err(|e| e.to_string())?,
+        created_height: number("created_height")?
+            .try_into()
+            .map_err(|_| "created_height overflow")?,
+        input_nullifiers: intent_nullifiers(m)?,
+        recipient: hex::decode(m.get("recipient").ok_or("missing recipient")?)
+            .map_err(|e| e.to_string())?,
+        amount_zat: number("amount_zat")?,
+        memo: hex::decode(m.get("memo").ok_or("missing memo")?).map_err(|e| e.to_string())?,
+        change_policy: ChangePolicy::VaultInternal,
+        fee_zat: number("fee_zat")?,
+        change_zat: number("change_zat")?,
+        expiry_height: number("expiry_height")?
+            .try_into()
+            .map_err(|_| "expiry_height overflow")?,
+    };
+    let recorded = hexn(m, "proposal_id")?;
+    if intent.proposal_id() != recorded {
+        return Err("REFUSED: proposal ID differs from canonical intent".into());
+    }
+    Ok(recorded)
+}
+
+fn check_randomized_spend(
+    candidate: &pczt::Pczt,
+    nf: &[u8; 32],
+    params: &frost_rerandomized::RandomizedParams<frost::PallasBlake2b512>,
+    ak: &[u8; 32],
+) -> Result<usize, String> {
+    use pczt::roles::low_level_signer::Signer;
+    let alpha: [u8; 32] = params
+        .randomizer()
+        .serialize()
+        .try_into()
+        .map_err(|_| "alpha length")?;
+    let scalar =
+        loki_poc::candidate::alpha_from_canonical_bytes(&alpha).ok_or("noncanonical alpha")?;
+    let fvk = vault::test_only_fvk(ak).map_err(|e| format!("{e:?}"))?;
+    let expected: orchard::primitives::redpallas::VerificationKey<
+        orchard::primitives::redpallas::SpendAuth,
+    > = orchard::keys::SpendValidatingKey::from(fvk).randomize(&scalar);
+    let expected_rk = <[u8; 32]>::from(&expected);
+    if params
+        .randomized_verifying_key()
+        .serialize()
+        .map_err(|e| e.to_string())?
+        != expected_rk
+    {
+        return Err("REFUSED: public package differs from known vault key".into());
+    }
+    let mut found = None;
+    Signer::new(candidate.clone())
+        .sign_ironwood_with::<pczt::roles::low_level_signer::OrchardParseError, _>(
+            |_, bundle, _| {
+                for (index, action) in bundle.actions().iter().enumerate() {
+                    if action.spend().nullifier().to_bytes() == *nf {
+                        found = Some((
+                            index,
+                            *action.spend().alpha(),
+                            <[u8; 32]>::from(action.spend().rk()),
+                        ));
+                    }
+                }
+                Ok(())
+            },
+        )
+        .map_err(|e| format!("parse spend: {e:?}"))?;
+    let (index, actual_alpha, actual_rk) =
+        found.ok_or("REFUSED: candidate missing intended nullifier")?;
+    if actual_alpha != Some(scalar) || actual_rk != expected_rk {
+        return Err("REFUSED: rk does not match recomputed alpha".into());
+    }
+    Ok(index)
+}
+
 fn propose(args: &[String]) -> Result<(), String> {
     use loki_poc::{candidate::*, intent::*};
     use orchard::keys::Scope;
@@ -685,6 +834,23 @@ fn propose(args: &[String]) -> Result<(), String> {
     // this is; the proposal and its candidates belong to the round.
     let vault_dir = MemberDir::open(&root, "public");
     let shared = MemberDir::create(&root, &shared_name()).map_err(|e| format!("{e}"))?;
+    if std::fs::read_dir(shared.path())
+        .map_err(|e| e.to_string())?
+        .any(|entry| {
+            entry
+                .ok()
+                .and_then(|e| e.file_name().into_string().ok())
+                .is_some_and(|f| {
+                    f == "intent.txt"
+                        || f.starts_with("candidate_")
+                        || f.starts_with("randomizer_seed_")
+                        || f.starts_with("alpha_")
+                        || f.starts_with("share_")
+                })
+        })
+    {
+        return Err("REFUSED: saved signing session exists; keep its candidate and seeds unchanged, or use a fresh round with fresh commitments".into());
+    }
     // The note file is positional and optional, so it must not swallow a flag: without
     // this guard `propose <dir> --amount N` read "--amount" as the filename.
     let note_file = args
@@ -699,6 +865,20 @@ fn propose(args: &[String]) -> Result<(), String> {
         .map_err(|e| format!("run setup first: {e}"))?
         .try_into()
         .map_err(|_| "group_ak.hex is not 32 bytes")?;
+    let public_package = frost::keys::PublicKeyPackage::deserialize(
+        &MemberDir::open(&root, "alice")
+            .read_hex("public_package.hex")
+            .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    if public_package
+        .verifying_key()
+        .serialize()
+        .map_err(|e| e.to_string())?
+        != ak
+    {
+        return Err("REFUSED: public package differs from known vault key".into());
+    }
     let fvk = vault::test_only_fvk(&ak).map_err(|e| format!("{e:?}"))?;
 
     // Which notes are available to spend. A named note file pins the choice to exactly
@@ -904,9 +1084,23 @@ fn propose(args: &[String]) -> Result<(), String> {
                 );
             }
 
-            let seed = alpha_seed(&proposal_id, (&ids[0], &ids[1]), i as u32);
-            let alpha_arr: [u8; 32] = alpha_for_candidate(&seed, &commitments)
-                .map_err(|e| format!("alpha: {e}"))?
+            let (params, seed) = frost_rerandomized::RandomizedParams::new_from_commitments(
+                public_package.verifying_key(),
+                &commitments,
+                rand_core::OsRng,
+            )
+            .map_err(|e| format!("randomizer: {e}"))?;
+            let record = loki_poc::randomizer::SeedRecord::new(
+                proposal_id,
+                name,
+                i,
+                spend_nullifiers[i],
+                &commitments,
+                &seed,
+            )?;
+            write_seed_record(&shared, name, i, &record)?;
+            let alpha_arr: [u8; 32] = params
+                .randomizer()
                 .serialize()
                 .as_slice()
                 .try_into()
@@ -1020,7 +1214,6 @@ fn propose(args: &[String]) -> Result<(), String> {
 ///
 /// Nothing is emitted until every candidate containing this member has passed.
 fn review_sign(args: &[String]) -> Result<(), String> {
-    use loki_poc::intent::alpha_seed;
     use loki_poc::verify::{Expectations, Refusal};
     use pczt::roles::{
         low_level_signer::Signer as LowLevelSigner,
@@ -1065,7 +1258,7 @@ fn review_sign(args: &[String]) -> Result<(), String> {
         .parse()
         .map_err(|e| format!("{e}"))?;
     let want_fee: u64 = intent_kv["fee_zat"].parse().map_err(|e| format!("{e}"))?;
-    let proposal_id: [u8; 32] = hexn(&intent_kv, "proposal_id")?;
+    let proposal_id = checked_proposal_id(&intent_kv)?;
 
     // The vault key: the signer derives the change address from this itself rather than
     // taking one from the intent, so a swapped change address cannot be smuggled in.
@@ -1074,6 +1267,31 @@ fn review_sign(args: &[String]) -> Result<(), String> {
         .map_err(|e| format!("{e}"))?
         .try_into()
         .map_err(|_| "group_ak.hex is not 32 bytes")?;
+    let public_package = frost::keys::PublicKeyPackage::deserialize(
+        &me.read_hex("public_package.hex")
+            .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    if public_package
+        .verifying_key()
+        .serialize()
+        .map_err(|e| e.to_string())?
+        != ak
+    {
+        return Err("REFUSED: public package differs from known vault key".into());
+    }
+    let known_ak = MemberDir::open(&root, "public")
+        .read_hex("group_ak.hex")
+        .map_err(|e| e.to_string())?;
+    if known_ak != ak
+        || key_package
+            .verifying_key()
+            .serialize()
+            .map_err(|e| e.to_string())?
+            != ak
+    {
+        return Err("REFUSED: public package differs from known vault key".into());
+    }
     let vault_fvk = vault::test_only_fvk(&ak).map_err(|e| format!("{e:?}"))?;
 
     let want = Expectations {
@@ -1093,6 +1311,7 @@ fn review_sign(args: &[String]) -> Result<(), String> {
         if slot != x && slot != y {
             continue;
         }
+        check_seed_record_count(&shared, name, want_nfs.len())?;
 
         let bytes = shared
             .read_hex(&format!("candidate_{name}.pczt.hex"))
@@ -1212,10 +1431,19 @@ fn review_sign(args: &[String]) -> Result<(), String> {
                 );
             }
 
-            let seed = alpha_seed(&proposal_id, (&ids[0], &ids[1]), i as u32);
-            let recomputed = loki_poc::intent::alpha_for_candidate(&seed, &commitments)
-                .map_err(|e| format!("{name}: spend {i}: alpha: {e}"))?;
-            let recomputed_bytes: [u8; 32] = recomputed
+            let record = load_seed_record(&shared, name, i)?;
+            let seed = record
+                .validate(&proposal_id, name, i, want_nf, &commitments)
+                .map_err(|e| format!("{name}: REFUSED: {e}"))?;
+            let params =
+                frost_rerandomized::RandomizedParams::regenerate_from_seed_and_commitments(
+                    key_package.verifying_key(),
+                    &seed,
+                    &commitments,
+                )
+                .map_err(|e| format!("{name}: REFUSED: randomizer: {e}"))?;
+            let recomputed_bytes: [u8; 32] = params
+                .randomizer()
                 .serialize()
                 .as_slice()
                 .try_into()
@@ -1262,7 +1490,12 @@ fn review_sign(args: &[String]) -> Result<(), String> {
                 ));
             }
 
-            per_spend.push((package, recomputed));
+            let nonces = frost::round1::SigningNonces::deserialize(
+                &me.read_hex(&nonce_file(name, i))
+                    .map_err(|e| format!("REFUSED: {name}: spend {i}: run commit first: {e}"))?,
+            )
+            .map_err(|e| format!("REFUSED: nonces: {e}"))?;
+            per_spend.push((package, seed, nonces));
         }
 
         let spends = per_spend.len();
@@ -1277,29 +1510,31 @@ fn review_sign(args: &[String]) -> Result<(), String> {
         return Err(format!("{who} is not a member of any candidate"));
     }
 
-    // ── only now, emit the share batch ──────────────────────────────────────
+    // Compute the entire batch before writing shares or consuming any nonce.
+    let mut batch = Vec::new();
     for (name, per_spend, sighash) in reviewed {
-        let spends = per_spend.len();
-        for (i, (package, alpha)) in per_spend.into_iter().enumerate() {
-            let nonces = frost::round1::SigningNonces::deserialize(
-                &me.read_hex(&nonce_file(name, i))
-                    .map_err(|e| format!("{name}: spend {i}: run commit first: {e}"))?,
+        let mut shares = Vec::new();
+        for (i, (package, seed, nonces)) in per_spend.into_iter().enumerate() {
+            let share = frost_rerandomized::sign_with_randomizer_seed(
+                &package,
+                &nonces,
+                &key_package,
+                &seed,
             )
-            .map_err(|e| format!("{name}: spend {i}: nonces: {e}"))?;
-
-            #[allow(deprecated)] // alpha is fixed by the transaction; the seed path cannot be used
-            let share = frost_rerandomized::sign(&package, &nonces, &key_package, alpha)
-                .map_err(|e| format!("{name}: spend {i}: sign: {e}"))?;
-
+            .map_err(|e| format!("{name}: REFUSED: spend {i}: sign: {e}"))?;
+            shares.push(share);
+        }
+        batch.push((name, shares, sighash));
+    }
+    for (name, shares, sighash) in batch {
+        let spends = shares.len();
+        for (i, share) in shares.into_iter().enumerate() {
             shared
                 .write_hex(&share_file(name, who, i), &share.serialize())
                 .map_err(|e| e.to_string())?;
-
-            // The nonce is spent. Remove it so it cannot be used a second time.
             std::fs::remove_file(me.path().join(nonce_file(name, i)))
                 .map_err(|e| format!("{name}: spend {i}: removing spent nonce: {e}"))?;
         }
-
         println!(
             "{who:<6} {name}  {spends} share(s) emitted, nonce(s) consumed  (sighash {})",
             &hex::encode(sighash)[..16]
@@ -1350,7 +1585,6 @@ fn chain_commitments(rpc: &loki_poc::rpc::Rpc) -> Result<ChainView, String> {
 /// It verifies Alice's and Carol's shares, aggregates them, applies the signature, and
 /// only THEN installs the anchor and witness, proves, extracts and broadcasts.
 fn finish(args: &[String]) -> Result<(), String> {
-    use loki_poc::intent::alpha_seed;
     use pczt::roles::{
         prover::Prover, signer::Signer, spend_finalizer::SpendFinalizer,
         tx_extractor::TransactionExtractor, updater::Updater,
@@ -1360,125 +1594,14 @@ fn finish(args: &[String]) -> Result<(), String> {
     let shared = MemberDir::open(&root, &shared_name());
     let vault_dir = MemberDir::open(&root, "public");
 
-    let (name, x, y) = selected_pair(args)?;
-
-    let intent_kv = kv(&shared.read_text("intent.txt").map_err(|e| format!("{e}"))?);
+    let (name, _, _) = selected_pair(args)?;
+    let intent_kv = kv(&shared.read_text("intent.txt").map_err(|e| e.to_string())?);
     let want_nfs = intent_nullifiers(&intent_kv)?;
-    let proposal_id: [u8; 32] = hexn(&intent_kv, "proposal_id")?;
-
-    let ak: [u8; 32] = shared
-        .read_hex("group_ak.hex")
-        .map_err(|e| format!("{e}"))?
-        .try_into()
-        .map_err(|_| "group_ak")?;
-    let _fvk = vault::test_only_fvk(&ak).map_err(|e| format!("{e:?}"))?;
-
-    let public_package = frost::keys::PublicKeyPackage::deserialize(
-        &MemberDir::open(&root, "alice")
-            .read_hex("public_package.hex")
-            .map_err(|e| format!("{e}"))?,
-    )
-    .map_err(|e| format!("public package: {e}"))?;
-
-    let bytes = shared
-        .read_hex(&format!("candidate_{name}.pczt.hex"))
-        .map_err(|e| format!("{e}"))?;
-    let pczt = pczt::Pczt::parse(&bytes).map_err(|e| format!("parse: {e:?}"))?;
-
-    // The coordinator computes the sighash from the same bytes the signers did.
-    let sighash = Signer::new(pczt.clone())
-        .map_err(|e| format!("signer: {e:?}"))?
-        .shielded_sighash();
-
-    // Rebuild the pair's commitments and alpha.
-    let ids: Vec<frost::Identifier> = [x, y]
-        .iter()
-        .map(|k| {
-            let raw = MemberDir::open(&root, MEMBERS[*k].0)
-                .read_hex("identifier.hex")
-                .map_err(|e| format!("{e}"))?;
-            frost::Identifier::deserialize(&raw).map_err(|e| format!("{e}"))
-        })
-        .collect::<Result<_, String>>()?;
-
-    // One aggregation per spend. Each spend has its own commitment round, randomiser and
-    // signature, so there is no single group signature to compute here -- there are as
-    // many as the proposal has inputs, and each is applied to its own action.
-    let mut signer = Signer::new(pczt.clone()).map_err(|e| format!("signer: {e:?}"))?;
-    let mut spend_indices = Vec::new();
-
-    for (i, want_nf) in want_nfs.iter().enumerate() {
-        let mut commitments = BTreeMap::new();
-        for (k, id) in [x, y].iter().zip(ids.iter()) {
-            let raw = shared
-                .read_hex(&commitment_file(name, MEMBERS[*k].0, i))
-                .map_err(|e| format!("{e}"))?;
-            commitments.insert(
-                *id,
-                frost::round1::SigningCommitments::deserialize(&raw).map_err(|e| format!("{e}"))?,
-            );
-        }
-
-        let seed = alpha_seed(&proposal_id, (&ids[0], &ids[1]), i as u32);
-        let alpha = loki_poc::intent::alpha_for_candidate(&seed, &commitments)
-            .map_err(|e| format!("spend {i}: alpha: {e}"))?;
-
-        // Verify and aggregate this spend's two shares. `aggregate` checks each share and
-        // names any culprit, so a bad share is identified rather than silently producing
-        // garbage.
-        let package = frost::SigningPackage::new(commitments, &sighash);
-        let mut shares = BTreeMap::new();
-        for (k, id) in [x, y].iter().zip(ids.iter()) {
-            let raw = shared
-                .read_hex(&share_file(name, MEMBERS[*k].0, i))
-                .map_err(|e| format!("run review-sign first: {e}"))?;
-            shares.insert(
-                *id,
-                frost::round2::SignatureShare::deserialize(&raw).map_err(|e| format!("{e}"))?,
-            );
-        }
-
-        let params = frost_rerandomized::RandomizedParams::from_randomizer(
-            public_package.verifying_key(),
-            alpha,
-        );
-        let group_sig = frost_rerandomized::aggregate(&package, &shares, &public_package, &params)
-            .map_err(|e| format!("spend {i}: aggregate: {e}"))?;
-
-        // The signature verifies under ak+alpha before it ever reaches the node.
-        params
-            .randomized_verifying_key()
-            .verify(&sighash, &group_sig)
-            .map_err(|e| format!("spend {i}: the aggregated signature does not verify: {e}"))?;
-
-        // Install the aggregated signature through its canonical 64-byte encoding.
-        let sig_bytes: [u8; 64] = group_sig
-            .serialize()
-            .map_err(|e| format!("{e}"))?
-            .as_slice()
-            .try_into()
-            .map_err(|_| "signature is not 64 bytes")?;
-        let orchard_sig = orchard::primitives::redpallas::Signature::<
-            orchard::primitives::redpallas::SpendAuth,
-        >::from(sig_bytes);
-
-        // Which action spends this note? Matched by nullifier, not by position, so the
-        // signature cannot land on an action it was not made for.
-        let index = pczt
-            .ironwood()
-            .actions()
-            .iter()
-            .position(|a| a.spend().nullifier() == want_nf)
-            .ok_or(format!("the candidate does not spend note {i}"))?;
-
-        signer
-            .apply_ironwood_signature(index, orchard_sig)
-            .map_err(|e| format!("spend {i}: apply signature: {e:?}"))?;
-        spend_indices.push(index);
-        println!("{name}  spend {i}: two shares aggregated, verified, applied to action {index}");
-    }
-
-    let signed = signer.finish();
+    let inputs = approver_inputs(&root, &shared, name)?;
+    let (signed, sighash, spend_indices) = aggregate_and_apply(&inputs)?;
+    println!(
+        "{name}  two shares per spend aggregated, verified, applied before anchor/witness/proof"
+    );
 
     // ── everything below happens AFTER signing ──────────────────────────────
     let rpc = loki_poc::rpc::Rpc::regtest();
@@ -1590,7 +1713,7 @@ fn finish(args: &[String]) -> Result<(), String> {
 /// signers a PCZT that is structurally valid and correctly built, but not the payment
 /// they agreed to. The honest `intent.txt` is left untouched.
 fn tamper(args: &[String]) -> Result<(), String> {
-    use loki_poc::{candidate::*, intent::*};
+    use loki_poc::candidate::*;
     use orchard::{
         keys::Scope,
         note::{RandomSeed, Rho},
@@ -1605,6 +1728,23 @@ fn tamper(args: &[String]) -> Result<(), String> {
         .ok_or("usage: tamper <state-dir> <case>")?
         .as_str();
     let shared = MemberDir::open(&root, &shared_name());
+
+    if case == "rebuild-session" {
+        // Deliberately adversarial rollback experiment; ordinary propose cannot do this.
+        for entry in std::fs::read_dir(shared.path()).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let file = entry.file_name().to_string_lossy().into_owned();
+            if file == "intent.txt"
+                || file.starts_with("candidate_")
+                || file.starts_with("randomizer_seed_")
+                || file.starts_with("alpha_")
+                || file.starts_with("share_")
+            {
+                std::fs::remove_file(entry.path()).map_err(|e| e.to_string())?;
+            }
+        }
+        return propose(&[root.to_string_lossy().into_owned()]);
+    }
 
     // This case does not touch the candidate at all, so it branches before the rebuild.
     if case == "cosigner-recommit" {
@@ -1658,7 +1798,7 @@ fn tamper(args: &[String]) -> Result<(), String> {
     let target: u32 = intent_kv["target_height"]
         .parse()
         .map_err(|e| format!("{e}"))?;
-    let proposal_id: [u8; 32] = hexn(&intent_kv, "proposal_id")?;
+    let proposal_id = checked_proposal_id(&intent_kv)?;
 
     // One field differs, everything else is the honest value.
     let mut note = honest_note;
@@ -1758,11 +1898,24 @@ fn tamper(args: &[String]) -> Result<(), String> {
             frost::round1::SigningCommitments::deserialize(&raw).map_err(|e| format!("{e}"))?,
         );
     }
-    let seed = alpha_seed(&proposal_id, (&ids[0], &ids[1]), 0);
-    let alpha_bytes: [u8; 32] = alpha_for_candidate(&seed, &commitments)
-        .map_err(|e| format!("{e}"))?
+    let record = load_seed_record(&shared, "AC", 0)?;
+    let seed = record.validate(
+        &proposal_id,
+        "AC",
+        0,
+        &intent_nullifiers(&intent_kv)?[0],
+        &commitments,
+    )?;
+    let group_key = frost::VerifyingKey::deserialize(&ak).map_err(|e| e.to_string())?;
+    let params = frost_rerandomized::RandomizedParams::regenerate_from_seed_and_commitments(
+        &group_key,
+        &seed,
+        &commitments,
+    )
+    .map_err(|e| e.to_string())?;
+    let alpha_bytes: [u8; 32] = params
+        .randomizer()
         .serialize()
-        .as_slice()
         .try_into()
         .map_err(|_| "alpha")?;
     let alpha = alpha_from_canonical_bytes(&alpha_bytes).ok_or("alpha noncanonical")?;
@@ -1813,8 +1966,8 @@ fn tamper(args: &[String]) -> Result<(), String> {
 //            the note and anchor by its OWN chain scan, install them after the signature,
 //            prove, extract and broadcast.
 //
-// What the finisher is given is a replica of public artifacts, the kind a relay would
-// carry. What it is NOT given: any approver's key package, nonces, scan output or witness.
+// The finisher receives a confidential local handoff, including saved randomizer seeds.
+// Approver key packages, nonce secrets, scan output and witnesses are withheld.
 // `replicate` is explicit about both halves, and writes a manifest naming what it withheld.
 //
 // None of this is G4. It is one regtest flow on the documented test-only FVK, and it
@@ -1827,6 +1980,9 @@ fn tamper(args: &[String]) -> Result<(), String> {
 /// layout and a flat replica. The finisher cannot accidentally reach for a file that is
 /// not in here.
 struct AggregateInputs {
+    pair: String,
+    group_ak: [u8; 32],
+    seeds: Vec<loki_poc::randomizer::SeedRecord>,
     candidate: Vec<u8>,
     public_package: Vec<u8>,
     ids: [Vec<u8>; 2],
@@ -1869,11 +2025,18 @@ fn finalized_sighash(tx: &zcash_primitives::transaction::Transaction) -> Result<
 /// Verify the two shares, aggregate, check the group signature under `ak + [alpha]G`, and
 /// apply it for every spend. Returns the signed PCZT, its effects sighash, and action indices.
 fn aggregate_and_apply(i: &AggregateInputs) -> Result<(pczt::Pczt, [u8; 32], Vec<usize>), String> {
-    use loki_poc::intent::alpha_seed;
     use pczt::roles::signer::Signer;
 
     let public_package = frost::keys::PublicKeyPackage::deserialize(&i.public_package)
         .map_err(|e| format!("public package: {e}"))?;
+    if public_package
+        .verifying_key()
+        .serialize()
+        .map_err(|e| e.to_string())?
+        != i.group_ak
+    {
+        return Err("REFUSED: public package differs from known vault key".into());
+    }
     let pczt = pczt::Pczt::parse(&i.candidate).map_err(|e| format!("parse: {e:?}"))?;
 
     // The finisher computes the sighash from the candidate bytes itself, exactly as the
@@ -1892,6 +2055,7 @@ fn aggregate_and_apply(i: &AggregateInputs) -> Result<(pczt::Pczt, [u8; 32], Vec
     if i.want_nfs.is_empty()
         || i.commitments.len() != i.want_nfs.len()
         || i.shares.len() != i.want_nfs.len()
+        || i.seeds.len() != i.want_nfs.len()
     {
         return Err("the replica has an incomplete spend batch".into());
     }
@@ -1905,9 +2069,16 @@ fn aggregate_and_apply(i: &AggregateInputs) -> Result<(pczt::Pczt, [u8; 32], Vec
                     .map_err(|e| format!("spend {spend}: {e}"))?,
             );
         }
-        let seed = alpha_seed(&i.proposal_id, (&ids[0], &ids[1]), spend as u32);
-        let alpha = loki_poc::intent::alpha_for_candidate(&seed, &commitments)
-            .map_err(|e| format!("spend {spend}: alpha: {e}"))?;
+        let seed = i.seeds[spend]
+            .validate(&i.proposal_id, &i.pair, spend, want_nf, &commitments)
+            .map_err(|e| format!("REFUSED: {e}"))?;
+        let params = frost_rerandomized::RandomizedParams::regenerate_from_seed_and_commitments(
+            public_package.verifying_key(),
+            &seed,
+            &commitments,
+        )
+        .map_err(|e| format!("REFUSED: randomizer: {e}"))?;
+        check_randomized_spend(&pczt, want_nf, &params, &i.group_ak)?;
         let package = frost::SigningPackage::new(commitments, &sighash);
         let mut shares = BTreeMap::new();
         for (id, raw) in ids.iter().zip(i.shares[spend].iter()) {
@@ -1917,10 +2088,6 @@ fn aggregate_and_apply(i: &AggregateInputs) -> Result<(pczt::Pczt, [u8; 32], Vec
                     .map_err(|e| format!("spend {spend}: {e}"))?,
             );
         }
-        let params = frost_rerandomized::RandomizedParams::from_randomizer(
-            public_package.verifying_key(),
-            alpha,
-        );
         let group_sig = frost_rerandomized::aggregate(&package, &shares, &public_package, &params)
             .map_err(|e| format!("spend {spend}: aggregate: {e}"))?;
         params
@@ -2044,6 +2211,7 @@ fn replica_inputs(r: &MemberDir) -> Result<AggregateInputs, String> {
     let intent_kv = kv(&r.read_text("intent.txt").map_err(|e| format!("{e}"))?);
     let rd = |f: &str| r.read_hex(f).map_err(|e| format!("{f}: {e}"));
     let want_nfs = intent_nullifiers(&intent_kv)?;
+    check_seed_record_count(r, name, want_nfs.len())?;
     let mut commitments = Vec::new();
     let mut shares = Vec::new();
     for spend in 0..want_nfs.len() {
@@ -2057,6 +2225,13 @@ fn replica_inputs(r: &MemberDir) -> Result<AggregateInputs, String> {
         ]);
     }
     Ok(AggregateInputs {
+        pair: name.into(),
+        group_ak: rd("group_ak.hex")?
+            .try_into()
+            .map_err(|_| "group_ak length")?,
+        seeds: (0..want_nfs.len())
+            .map(|spend| load_seed_record(r, name, spend))
+            .collect::<Result<_, _>>()?,
         candidate: rd(&format!("candidate_{name}.pczt.hex"))?,
         public_package: rd("public_package.hex")?,
         ids: [
@@ -2065,7 +2240,7 @@ fn replica_inputs(r: &MemberDir) -> Result<AggregateInputs, String> {
         ],
         commitments,
         shares,
-        proposal_id: hexn(&intent_kv, "proposal_id")?,
+        proposal_id: checked_proposal_id(&intent_kv)?,
         want_nfs,
     })
 }
@@ -2074,25 +2249,36 @@ fn replica_inputs(r: &MemberDir) -> Result<AggregateInputs, String> {
 ///
 /// This is how path A's input comes to exist: Alice proved the transaction but never got
 /// it to a node. Everything after this point is the second device's job.
-fn post_final(args: &[String]) -> Result<(), String> {
-    let root = PathBuf::from(args.first().ok_or("usage: post-final <state-dir>")?);
-    let (name, x, y) = selected_pair(args)?;
+fn approver_inputs(
+    root: &std::path::Path,
+    shared: &MemberDir,
+    name: &str,
+) -> Result<AggregateInputs, String> {
+    let (_, x, y) = named_pair(name)?;
     let members = [MEMBERS[x].0, MEMBERS[y].0];
-    let shared = MemberDir::open(&root, &shared_name());
-
     let intent_kv = kv(&shared.read_text("intent.txt").map_err(|e| format!("{e}"))?);
     let want_nfs = intent_nullifiers(&intent_kv)?;
+    check_seed_record_count(shared, name, want_nfs.len())?;
     let rd = |f: &str| shared.read_hex(f).map_err(|e| format!("{f}: {e}"));
-    let inputs = AggregateInputs {
+    Ok(AggregateInputs {
+        pair: name.into(),
+        group_ak: MemberDir::open(root, "public")
+            .read_hex("group_ak.hex")
+            .map_err(|e| e.to_string())?
+            .try_into()
+            .map_err(|_| "group_ak length")?,
+        seeds: (0..want_nfs.len())
+            .map(|spend| load_seed_record(shared, name, spend))
+            .collect::<Result<_, _>>()?,
         candidate: rd(&format!("candidate_{name}.pczt.hex"))?,
-        public_package: MemberDir::open(&root, members[0])
+        public_package: MemberDir::open(root, members[0])
             .read_hex("public_package.hex")
             .map_err(|e| format!("{e}"))?,
         ids: [
-            MemberDir::open(&root, members[0])
+            MemberDir::open(root, members[0])
                 .read_hex("identifier.hex")
                 .map_err(|e| format!("{e}"))?,
-            MemberDir::open(&root, members[1])
+            MemberDir::open(root, members[1])
                 .read_hex("identifier.hex")
                 .map_err(|e| format!("{e}"))?,
         ],
@@ -2112,9 +2298,17 @@ fn post_final(args: &[String]) -> Result<(), String> {
                 ])
             })
             .collect::<Result<_, String>>()?,
-        proposal_id: hexn(&intent_kv, "proposal_id")?,
+        proposal_id: checked_proposal_id(&intent_kv)?,
         want_nfs,
-    };
+    })
+}
+
+fn post_final(args: &[String]) -> Result<(), String> {
+    let root = PathBuf::from(args.first().ok_or("usage: post-final <state-dir>")?);
+    let (name, _, _) = selected_pair(args)?;
+    let shared = MemberDir::open(&root, &shared_name());
+
+    let inputs = approver_inputs(&root, &shared, name)?;
 
     let (signed, sighash, indices) = aggregate_and_apply(&inputs)?;
     println!("{name}  aggregated two shares per spend; verifies under ak+alpha");
@@ -2158,7 +2352,7 @@ fn post_final(args: &[String]) -> Result<(), String> {
             ),
         )
         .map_err(|e| e.to_string())?;
-    println!("AC  final transaction POSTED, not broadcast: {txid}");
+    println!("{name}  final transaction POSTED, not broadcast: {txid}");
     shared
         .write_text("pair.txt", name)
         .map_err(|e| e.to_string())?;
@@ -2182,17 +2376,26 @@ fn replicate(args: &[String]) -> Result<(), String> {
     let members = [MEMBERS[x].0, MEMBERS[y].0];
     let candidate_file = format!("candidate_{name}.pczt.hex");
     let with_final = args.iter().any(|a| a == "--with-final");
+    if out.exists()
+        && std::fs::read_dir(&out)
+            .map_err(|e| e.to_string())?
+            .next()
+            .is_some()
+    {
+        return Err("REFUSED: replica destination is not empty".into());
+    }
     let shared = MemberDir::open(&root, &shared_name());
     let intent_kv = kv(&shared.read_text("intent.txt").map_err(|e| format!("{e}"))?);
     let spend_count = intent_nullifiers(&intent_kv)?.len();
+    check_seed_record_count(&shared, name, spend_count)?;
 
-    std::fs::create_dir_all(&out).map_err(|e| format!("{e}"))?;
-    let replica = MemberDir::open(
+    let replica = MemberDir::create(
         out.parent().unwrap_or(&out),
         out.file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("replica"),
-    );
+    )
+    .map_err(|e| e.to_string())?;
 
     // Public group data and the proposal. All of this is designed to be replicated.
     for f in ["intent.txt", candidate_file.as_str(), "group_ak.hex"] {
@@ -2201,6 +2404,8 @@ fn replicate(args: &[String]) -> Result<(), String> {
         std::fs::write(replica.path().join(f), bytes).map_err(|e| format!("{f}: {e}"))?;
     }
     for spend in 0..spend_count {
+        let record = load_seed_record(&shared, name, spend)?;
+        write_seed_record(&replica, name, spend, &record)?;
         for member in members {
             for file in [
                 commitment_file(name, member, spend),
@@ -2239,12 +2444,13 @@ fn replicate(args: &[String]) -> Result<(), String> {
         .write_text("pair.txt", name)
         .map_err(|e| e.to_string())?;
     let mut manifest = format!(
-        "# Replica handed to the second device.\n# Copied public artifacts:\n\
+        "# Replica handed to the second device.\n# Confidential local handoff: seeds require confidential transport; no encrypted relay is implemented.\n# Copied artifacts:\n\
          intent.txt\n{candidate_file}\ngroup_ak.hex\npublic_package.hex\npair.txt\n\
          identifier_{}.hex\nidentifier_{}.hex\n",
         members[0], members[1],
     );
     for spend in 0..spend_count {
+        manifest.push_str(&format!("{}\n", seed_file(name, spend)));
         for member in members {
             manifest.push_str(&format!(
                 "{}\n{}\n",
@@ -2366,6 +2572,9 @@ fn finish_second(args: &[String]) -> Result<(), String> {
     println!("second device: vault FVK rebuilt from the replicated group ak");
     println!("               TEST-ONLY construction (ak || nk || rivk), not ZIP 2005");
 
+    let inputs = replica_inputs(&replica)?;
+    let (signed_candidate, candidate_sighash, candidate_indices) = aggregate_and_apply(&inputs)?;
+
     // Check posted bytes before the chain scan. A substituted transaction must be
     // refused for its effects even if the original input has since been mined away.
     let posted = if replica.exists("final_tx.hex") {
@@ -2454,8 +2663,7 @@ fn finish_second(args: &[String]) -> Result<(), String> {
         (raw, txid, "A")
     } else {
         println!("path B         no final transaction posted; re-proving the signed candidate");
-        let inputs = replica_inputs(&replica)?;
-        let (signed, sighash, indices) = aggregate_and_apply(&inputs)?;
+        let (signed, sighash, indices) = (signed_candidate, candidate_sighash, candidate_indices);
         println!("path B         aggregated two shares per spend; verifies under ak+alpha");
         let witnesses = indices
             .into_iter()
@@ -2748,7 +2956,7 @@ mod selection_tests {
     use super::*;
     use loki_poc::{
         candidate::{build_candidate, quote_fee, CandidateInputs, Regtest},
-        intent::{alpha_for_candidate, alpha_seed},
+        randomizer::SeedRecord,
     };
     use orchard::{
         keys::Scope,
@@ -2841,7 +3049,9 @@ mod selection_tests {
         let mut nonces = Vec::new();
         let mut commitments = Vec::new();
         let mut alphas = Vec::new();
-        for spend in 0..2 {
+        let mut seeds = Vec::new();
+        let mut records = Vec::new();
+        for (spend, note) in notes.iter().enumerate() {
             let mut n = BTreeMap::new();
             let mut c = BTreeMap::new();
             for id in ids {
@@ -2850,9 +3060,25 @@ mod selection_tests {
                 n.insert(id, nonce);
                 c.insert(id, commitment);
             }
-            let alpha =
-                alpha_for_candidate(&alpha_seed(&proposal_id, (&ids[0], &ids[1]), spend), &c)
-                    .unwrap();
+            let (params, seed) = frost_rerandomized::RandomizedParams::new_from_commitments(
+                public.verifying_key(),
+                &c,
+                rand_core::OsRng,
+            )
+            .unwrap();
+            let alpha = *params.randomizer();
+            records.push(
+                SeedRecord::new(
+                    proposal_id,
+                    "AC",
+                    spend,
+                    note.nullifier(&fvk).to_bytes(),
+                    &c,
+                    &seed,
+                )
+                .unwrap(),
+            );
+            seeds.push(seed);
             nonces.push(n);
             commitments.push(c);
             alphas.push(alpha);
@@ -2894,12 +3120,11 @@ mod selection_tests {
         for spend in 0..2 {
             let package = frost::SigningPackage::new(commitments[spend].clone(), &sighash);
             let pair = ids.map(|id| {
-                #[allow(deprecated)]
-                let share = frost_rerandomized::sign(
+                let share = frost_rerandomized::sign_with_randomizer_seed(
                     &package,
                     &nonces[spend][&id],
                     &packages[&id],
-                    alphas[spend],
+                    &seeds[spend],
                 )
                 .unwrap();
                 share.serialize()
@@ -2907,6 +3132,9 @@ mod selection_tests {
             signed_shares.push(pair);
         }
         let aggregate_inputs = AggregateInputs {
+            pair: "AC".into(),
+            group_ak: ak,
+            seeds: records,
             candidate: candidate.serialize().unwrap(),
             public_package: public.serialize().unwrap(),
             ids: ids.map(|id| id.serialize()),
@@ -2966,3 +3194,27 @@ mod selection_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod saved_session_tests {
+    use super::*;
+    #[test]
+    fn randomizer_reproposal_refuses_before_mutating_saved_session() {
+        let root = std::env::temp_dir().join(format!("loki-reproposal-{}", std::process::id()));
+        let shared = MemberDir::create(&root, "public").unwrap();
+        shared
+            .write_text("intent.txt", "saved session marker")
+            .unwrap();
+        let error = propose(&[root.to_str().unwrap().to_string()]).unwrap_err();
+        assert!(error.contains("saved signing session exists"), "{error}");
+        assert_eq!(
+            shared.read_text("intent.txt").unwrap(),
+            "saved session marker"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+#[path = "loki/randomizer_tests.rs"]
+mod randomizer_tests;

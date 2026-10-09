@@ -101,7 +101,9 @@ fn alpha(byte: u8) -> frost_rerandomized::Randomizer<frost::PallasBlake2b512> {
     frost_rerandomized::Randomizer::deserialize(&[byte; 32]).expect("canonical scalar")
 }
 
-/// Produce one share, exactly as `review_sign` does.
+/// Produce one share under a deliberately fixed scalar to isolate nonce binding.
+/// These adversarial tests vary the scalar independently of commitments; production
+/// review reconstructs parameters and signs using the saved library-generated seed.
 fn sign_one(
     g: &Group,
     me: &frost::Identifier,
@@ -111,7 +113,7 @@ fn sign_one(
     a: frost_rerandomized::Randomizer<frost::PallasBlake2b512>,
 ) -> Vec<u8> {
     let pkg = frost::SigningPackage::new(commitments, message);
-    #[allow(deprecated)] // the seed path cannot be used: alpha is fixed by the transaction
+    #[allow(deprecated)] // Deliberately test independent scalar changes and nonce reuse.
     let share = frost_rerandomized::sign(&pkg, nonces, &g.packages[me], a).expect("sign");
     share.serialize()
 }

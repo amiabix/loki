@@ -15,7 +15,7 @@ result documents, which are the authority.
 | **G1-TX** | **demonstrated on regtest** — a real Ironwood payment, authorised by two of three FROST members, signed before its anchor and proof existed, mined |
 | **Full G1** | **BLOCKED**. Separate-member setup now has a local ZIP 2005 `use_qsk` derivation with an independently calculated vector, but it has not been reviewed, upstreamed, or used for a mined payment. The original transaction CLI still uses its documented **test-only** key splice |
 | **G3** (browser nonce safety) | **PARTIAL** and separate. 29/32 drills on Chromium, 6/8 on WebKit, Firefox would not launch, no physical device case tested |
-| **Second-device finishing** | demonstrated: a party holding none of the approvers' files completed two payments, one from posted bytes and one by re-proving |
+| **Second-device finishing** | seed-flow THS validation: a party holding none of the approvers' files completed both posted and re-proving paths with one and two inputs. Replicas carry confidential randomizer seeds ([evidence](poc/FROST-RANDOMIZER-RESULTS.md)) |
 | **Separate-member setup** | three isolated processes complete DKG; two stored shares sign the actual sighash of an offline, unproved Ironwood candidate for their ZIP 2005 vault. Each member verifies a 24-word and card backup before the regtest address appears, and a clean restore works without the exchange directory. Not yet connected to the mined payment CLI ([details](poc/SEPARATE-MEMBER-SETUP.md)) |
 | **Recovery, key rotation, custody** | local two-artifact restore demonstrated on regtest; independent spend, key rotation in the wallet, and custody readiness **not established** |
 
@@ -82,7 +82,8 @@ poc/
   vendor/                 zakura-orchard and zakura-primitives, patched so a caller can choose
                           the signing randomiser (see vendor/README.md)
 
-  RESULTS.md                  G1-TX: the mined transaction and the approval checks
+  FROST-RANDOMIZER-RESULTS.md  current seed-flow validation and live-run status
+  RESULTS.md                  historical G1-TX mined transaction and approval checks
   SECOND-DEVICE-RESULTS.md    finishing without the approvers' files
   DEPENDENCIES.md             the current Zakura graph and dependency history
   ZAKURA-MIGRATION-RESULTS.md  artifact compatibility and live pair/finisher evidence
@@ -110,24 +111,49 @@ Everything is re-derived from the transaction's own cryptography rather than tru
 a description attached to it. The change address, for example, is computed by the signer
 from the account key and never read from the proposal.
 
-Recipient, amount, memo, change address, change amount, input set, expiry and permitted
-pools are all bound. **A rejected candidate produces no signature share**, so there is
-nothing to leak and nothing to retract. `./tamper-tests.sh` alters one field at a time and
+Recipient, amount, memo, fee, change address, change amount, input set, expiry and permitted
+pools are all bound. Each signer verifies the canonical proposal ID, computes the effects
+sighash locally, and checks every real spend's canonical α and `rk` against the known
+vault key. It validates all relevant candidates and computes all shares before writing
+any share or deleting a nonce. **A validation or signing refusal produces no new share.** `./tamper-tests.sh` alters one field at a time and
 asserts both the specific refusal and zero share files.
 
 One gap, stated plainly: the **exact-fee** check is implemented but **untested against a
 real candidate**, because the fee is pinned by the inputs and outputs, so a candidate with
 only the fee wrong will not build. See `RESULTS.md`.
 
+For each real spend in AB, AC and BC, the coordinator calls the pinned library's
+`RandomizedParams::new_from_commitments` with `OsRng` before passing α to the patched
+builder. The returned 32-byte seed is saved in a versioned JSON record named
+`randomizer_seed_AB.hex` for spend zero, `randomizer_seed_AB_1.hex` for spend one, and
+likewise for AC/BC. Each record binds the proposal ID, pair, spend index, input nullifier
+and exact serialized signer commitments. Review reconstructs parameters with
+`regenerate_from_seed_and_commitments` and signs with `sign_with_randomizer_seed`;
+finishers reconstruct and check the same parameters before aggregation. Missing or
+mixed records, including seedless legacy proposals, are refused.
+
+Restart uses the saved candidate and seed bytes. `propose` refuses any round already
+containing intent, candidate, seed, alpha or share files without changing them; a fresh
+honest session needs a new `LOKI_ROUND` and fresh nonce commitments. See
+[current validation](poc/FROST-RANDOMIZER-RESULTS.md) and the
+[threat model](poc/THREAT-MODEL.md).
+
 ## Honest limits
 
-- The account key is a **test-only** `ak || nk || rivk` splice, not ZIP 2005 derivation.
-- Regtest only, one machine and one recipient. One- and two-input payments have mined
-  with independent finishing; see [migration results](poc/ZAKURA-MIGRATION-RESULTS.md).
+- The legacy transaction CLI uses a **test-only** `ak || nk || rivk` splice. Separate-member
+  setup preserves its experimental ZIP 2005 derivation and backup gate, but has not
+  established a mined payment from that derivation.
+- Regtest only, one machine and one recipient. AB/AC/BC payments and independent finishing mined under the migration; seed-based AB/AC/BC independent two-input finishing is verified offline.
 - Member state is plain files with no rollback guarantee. A nonce is deleted after use,
-  which is not a crash-safe consumed-nonce ledger.
+  which is not a crash-safe consumed-nonce ledger. Batch validation does not make share
+  writes and nonce deletion atomic.
 - The "second device" is a second process on the same machine reading a locally copied
-  replica. No relay, no transport authentication, no second piece of hardware.
+  replica. Seeds require a confidential handoff; on Unix the replica directory is 0700
+  and seed files are 0600. No encrypted or authenticated relay or second piece of hardware
+  is implemented. Approver keys, nonce secrets and scan state are withheld.
+- Recommended seed generation removes the custom seed derivation assumption. It does
+  not prove the coordinator used honest randomness, repair nonce reuse or rollback,
+  supply a security proof, or extend NCC's published audit to rerandomized FROST.
 - G3's three relays are local processes on loopback. Three processes on one machine are
   not three independent operators, and that assumption is exactly what they cannot test.
 

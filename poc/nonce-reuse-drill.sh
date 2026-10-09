@@ -1,106 +1,118 @@
 #!/usr/bin/env bash
-# Does Loki's alpha-from-commitments derivation protect a signer whose nonce state is
-# rolled back?
-#
-# Background. src/nonce_binding.rs (Phase A) showed that in bare FROST a co-signer who
-# commits a second time moves the binding factor while a fixed nonce stays put, which is
-# the precondition for recovering a signing share. Loki is not bare FROST: it derives the
-# per-pair randomiser from the proposal AND the published commitment set, and every signer
-# recomputes it rather than accepting one. So the naive attack is caught by the rk check.
-#
-# This drill asks the harder question: what if the attacker also rebuilds the candidate so
-# that rk matches the new alpha? Then nothing is inconsistent any more, and the only thing
-# left between the signer and a reused nonce is that it deleted the nonce file after using
-# it. Which is exactly the state G3 showed a profile restore can roll back.
-#
-# Two stages, and the drill reports what each one shows:
-#
-#   A  naive: carol re-commits, candidate untouched          expected REFUSED
-#   B  composed: rollback + re-commit + candidate rebuilt    expected REUSE
-#
-# Stage B producing reuse is NOT a bug in the signer. It is the measured boundary of what
-# the rk check can do, and it says plainly that the prototype's safety here rests entirely
-# on nonce deletion surviving, nothing else.
-set -uo pipefail
+# Measure fixed-session refusal and nonce reuse after a deliberately consistent rebuild.
+# Saved seeds do not prevent a profile restore from reviving consumed nonce secrets.
+# --setup creates and funds a fresh disposable vault on the already running THS instance.
+set -euo pipefail
+unset LOKI_ROUND
 cd "$(dirname "$0")"
-
-S="${LOKI_STATE:-demo/.sandbox/state}"
+WORK_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/loki-issue3-rollback.XXXXXX")
 L="${LOKI_BIN:-${CARGO_TARGET_DIR:-target}/debug/loki}"
-LOKI_RPC=$(python3 ths.py address) || exit 1
+export LOKI_THS_INSTANCE="${LOKI_THS_INSTANCE:-loki}"
+LOKI_RPC=$(python3 ths.py address)
 export LOKI_RPC
-SNAP=$(mktemp -d)
-trap 'rm -rf "$SNAP"' EXIT
+[ -x "$L" ] || { echo "no loki binary at $L; run cargo build" >&2; exit 1; }
+if [ "${1:-}" = --setup ] && [ "$#" -eq 1 ]; then
+  S="${LOKI_STATE:-$WORK_ROOT/state}"
+  if [ -e "$S" ] || [ -L "$S" ]; then
+    echo "refusing existing state path: $S" >&2; exit 1
+  fi
+  "$L" setup "$S" >/dev/null
+  VAULT=$("$L" address "$S")
+  python3 ths.py fund "$VAULT" 2
+elif [ "$#" -eq 0 ]; then
+  S="${LOKI_STATE:?supply disposable funded LOKI_STATE or use --setup}"
+  [ -d "$S/alice" ] || { echo 'no account; use --setup with a fresh state path' >&2; exit 1; }
+else
+  echo 'usage: nonce-reuse-drill.sh [--setup]' >&2; exit 1
+fi
+"$L" scan "$S" >/dev/null || { echo "scan failed at THS endpoint $LOKI_RPC" >&2; exit 1; }
+echo "   artifacts $WORK_ROOT; state $S"
 
-[ -x "$L" ] || { echo "no loki binary at $L; run: cargo build" >&2; exit 1; }
-[ -d "$S/alice" ] || { echo "no account at $S; run setup/scan first" >&2; exit 1; }
-"$L" scan "$S" >/dev/null 2>&1 || { echo "scan failed: is the node up on $LOKI_RPC?" >&2; exit 1; }
-
-fresh() {                     # everyone commits, proposer builds, alice has no shares
-  for m in alice bob carol; do "$L" commit "$S" "$m" >/dev/null 2>&1; done
-  "$L" propose "$S" >/dev/null 2>&1
-  rm -f "$S"/public/share_*_alice.hex
+fresh() {
+  export LOKI_ROUND="rollback_${1}_$(basename "$WORK_ROOT" | cut -d. -f2)"
+  PUB="$S/public_$LOKI_ROUND"
+  for m in alice bob carol; do "$L" commit "$S" "$m" >/dev/null; done
+  "$L" propose "$S" funded_note.txt >/dev/null
 }
+snapshot() {
+  local dest=$1
+  mkdir -p "$dest/nonces"
+  cp -R "$PUB" "$dest/public"
+  for member in alice bob carol; do
+    mkdir -p "$dest/nonces/$member"
+    cp "$S/$member"/nonces_*.hex "$dest/nonces/$member/"
+  done
+  for pair in AB AC BC; do
+    [ -s "$dest/public/randomizer_seed_$pair.hex" ]
+    [ -s "$dest/public/candidate_$pair.pczt.hex" ]
+  done
+}
+zero_shares() { [ -z "$(find "$PUB" -name 'share_*.hex' -print)" ]; }
 
 FAILS=0
-echo "== stage A: carol re-commits, the candidate is left alone =="
-fresh
-"$L" tamper "$S" cosigner-recommit 2>&1 | sed 's/^/   /'
-OUT=$("$L" review-sign "$S" alice 2>&1); RC=$?
-printf '   alice: '
-if [ $RC -ne 0 ] && [ ! -f "$S/public/share_AC_alice.hex" ]; then
-  echo "REFUSED, no share  <- $(printf '%s' "$OUT" | grep -o 'REFUSED.*' | cut -c1-72)"
+echo '== stage A: changed commitments against a fixed saved candidate =='
+fresh a
+snapshot "$WORK_ROOT/stage_a"
+"$L" tamper "$S" cosigner-recommit | sed 's/^/   /'
+OUT=$("$L" review-sign "$S" alice 2>&1) && RC=0 || RC=$?
+if [ "$RC" -ne 0 ] && zero_shares && printf '%s' "$OUT" | grep -qF 'randomizer seed commitments mismatch'; then
+  cmp "$WORK_ROOT/stage_a/nonces/alice/nonces_AB.hex" "$S/alice/nonces_AB.hex"
+  cmp "$WORK_ROOT/stage_a/nonces/alice/nonces_AC.hex" "$S/alice/nonces_AC.hex"
+  for pair in AB AC BC; do
+    cmp "$WORK_ROOT/stage_a/public/candidate_$pair.pczt.hex" "$PUB/candidate_$pair.pczt.hex"
+    cmp "$WORK_ROOT/stage_a/public/randomizer_seed_$pair.hex" "$PUB/randomizer_seed_$pair.hex"
+  done
+  echo '   REFUSED: randomizer seed commitments mismatch; zero shares and unchanged Alice nonces'
 else
-  echo "NOT REFUSED (rc=$RC) -- the rk check did not fire"; FAILS=$((FAILS+1))
+  echo "   FAIL: fixed session was not refused with zero shares (rc=$RC)"
+  printf '%s\n' "$OUT" | tail -3
+  FAILS=$((FAILS+1))
 fi
 
 echo
-echo "== stage B: rollback, re-commit, and rebuild the candidate to match =="
-fresh
-cp "$S/alice/nonces_AB.hex" "$S/alice/nonces_AC.hex" "$SNAP/"
+echo '== stage B: consumed nonce restore, new commitments and adversarial session rebuild =='
+fresh b
+snapshot "$WORK_ROOT/stage_b"
+"$L" review-sign "$S" alice >/dev/null
+[ -f "$PUB/share_AB_alice.hex" ] && [ -f "$PUB/share_AC_alice.hex" ] || {
+  echo 'control failed: Alice did not sign both honest candidates'; exit 1;
+}
+[ ! -e "$S/alice/nonces_AB.hex" ] && [ ! -e "$S/alice/nonces_AC.hex" ] || {
+  echo 'control failed: honest signing did not consume Alice nonces'; exit 1;
+}
+cp "$PUB/share_AC_alice.hex" "$WORK_ROOT/share1.hex"
+echo '   1. Alice signed honestly and consumed both nonce files'
 
-"$L" review-sign "$S" alice >/dev/null 2>&1
-[ -f "$S/public/share_AC_alice.hex" ] || { echo "   control failed: alice did not sign the honest candidate"; exit 1; }
-cp "$S/public/share_AC_alice.hex" "$SNAP/share1"
-echo "   1. alice signed honestly, nonce consumed"
+# Restore the exact saved session and consumed nonce bytes, as a profile rollback would.
+rm -rf "$PUB"
+cp -R "$WORK_ROOT/stage_b/public" "$PUB"
+cp "$WORK_ROOT/stage_b/nonces/alice"/nonces_*.hex "$S/alice/"
+cmp "$WORK_ROOT/stage_b/nonces/alice/nonces_AC.hex" "$S/alice/nonces_AC.hex"
+echo '   2. saved seeds/candidates/commitments and used Alice nonce files restored'
 
-# The rollback. A profile restore puts back what the device deleted.
-cp "$SNAP/nonces_AB.hex" "$SNAP/nonces_AC.hex" "$S/alice/"
-rm -f "$S"/public/share_*_alice.hex
-echo "   2. nonce files restored, shares dropped: the device believes it never signed"
+"$L" commit "$S" carol >/dev/null
+"$L" tamper "$S" rebuild-session >/dev/null
+cmp -s "$WORK_ROOT/stage_b/public/commitment_AC_carol.hex" "$PUB/commitment_AC_carol.hex" && {
+  echo 'FAIL: Carol commitment did not change'; exit 1;
+}
+cmp -s "$WORK_ROOT/stage_b/public/candidate_AC.pczt.hex" "$PUB/candidate_AC.pczt.hex" && {
+  echo 'FAIL: adversarial candidate did not change'; exit 1;
+}
+cmp "$WORK_ROOT/stage_b/nonces/alice/nonces_AC.hex" "$S/alice/nonces_AC.hex"
+echo '   3. Carol re-committed; tamper-only rebuild made the seed association and candidate consistent'
 
-# The attacker moves the commitment set AND rebuilds the candidate, so rk is consistent
-# again and the signer has nothing to object to.
-"$L" commit "$S" carol >/dev/null 2>&1
-"$L" propose "$S" >/dev/null 2>&1
-echo "   3. carol re-committed; candidate rebuilt so rk matches the new alpha"
-
-OUT=$("$L" review-sign "$S" alice 2>&1)
-printf '   4. alice: '
-if [ ! -f "$S/public/share_AC_alice.hex" ]; then
-  echo "no second share"
+OUT=$("$L" review-sign "$S" alice 2>&1) && RC=0 || RC=$?
+if [ "$RC" -eq 0 ] && [ -s "$PUB/share_AC_alice.hex" ] &&
+   ! cmp -s "$WORK_ROOT/share1.hex" "$PUB/share_AC_alice.hex"; then
+  cp "$PUB/share_AC_alice.hex" "$WORK_ROOT/share2.hex"
+  echo '   4. Alice signed again: identical restored nonce, different signature share'
 else
-  cp "$S/public/share_AC_alice.hex" "$SNAP/share2"
-  if cmp -s "$SNAP/share1" "$SNAP/share2"; then
-    echo "signed again, but the share is IDENTICAL -- nothing new leaked"
-  else
-    echo "signed again, and the share DIFFERS"
-    echo
-    echo "   share 1 $(cut -c1-40 "$SNAP/share1")..."
-    echo "   share 2 $(cut -c1-40 "$SNAP/share2")..."
-    echo "   same nonce, two different shares: the reuse precondition G3 turns into a"
-    echo "   recovered key. The rk check cannot see this, because the attacker made the"
-    echo "   candidate consistent with the commitment set it moved."
-  fi
+  echo "   FAIL: stage B did not reproduce changed-share nonce reuse (rc=$RC)"
+  printf '%s\n' "$OUT" | tail -3
+  FAILS=$((FAILS+1))
 fi
 
 echo
-echo "== what this measures =="
-echo "   A  the alpha-from-commitments derivation DOES catch a co-signer who re-commits"
-echo "      while the candidate stays put. That is a real defence and it holds."
-echo "   B  it does NOT survive a rollback paired with a rebuilt candidate. Nothing is"
-echo "      inconsistent for the signer to notice, so the only thing protecting the nonce"
-echo "      is that its file was deleted. That is local state, and G3 showed a profile"
-echo "      restore puts it back."
-echo
-echo "   Conclusion: nonce safety here rests on deletion surviving, not on the rk check."
-[ $FAILS -eq 0 ]
+echo 'A measures fixed-session refusal. B measures the existing profile-rollback boundary.'
+echo 'Persisted randomizer seeds do not make consumed-nonce deletion rollback-resistant.'
+[ "$FAILS" -eq 0 ]

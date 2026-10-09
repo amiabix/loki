@@ -244,7 +244,7 @@ fn three_processes_create_one_vault_without_sharing_secrets() {
             candidate::{
                 alpha_from_canonical_bytes, build_candidate, quote_fee, CandidateInputs, Regtest,
             },
-            intent::{alpha_for_candidate, alpha_seed, ChangePolicy, Intent},
+            intent::{ChangePolicy, Intent},
             verify::{check_candidate, Expectations, Refusal},
             zip2005,
         };
@@ -325,13 +325,23 @@ fn three_processes_create_one_vault_without_sharing_secrets() {
             change_zat,
             expiry_height: 1_152,
         };
-        let seed = alpha_seed(
-            &intent.proposal_id(),
-            (keys[0].identifier(), keys[1].identifier()),
-            0,
+        let (params, seed) = frost_rerandomized::RandomizedParams::new_from_commitments(
+            public.verifying_key(),
+            &commitments,
+            rand_core::OsRng,
+        )
+        .unwrap();
+        let restored = frost_rerandomized::RandomizedParams::regenerate_from_seed_and_commitments(
+            public.verifying_key(),
+            &seed,
+            &commitments,
+        )
+        .unwrap();
+        assert_eq!(
+            params.randomizer().serialize(),
+            restored.randomizer().serialize()
         );
-        let alpha = alpha_for_candidate(&seed, &commitments).unwrap();
-        let alpha_bytes: [u8; 32] = alpha.serialize().try_into().unwrap();
+        let alpha_bytes: [u8; 32] = params.randomizer().serialize().try_into().unwrap();
         let built = build_candidate(
             &Regtest,
             &inputs,
@@ -362,13 +372,15 @@ fn three_processes_create_one_vault_without_sharing_secrets() {
         let package = frost::SigningPackage::new(commitments, &sighash);
         let mut signature_shares = BTreeMap::new();
         for key in &keys {
-            #[allow(deprecated)] // The transaction fixes alpha before its sighash exists.
-            let share =
-                frost_rerandomized::sign(&package, &nonces[key.identifier()], key, alpha).unwrap();
+            let share = frost_rerandomized::sign_with_randomizer_seed(
+                &package,
+                &nonces[key.identifier()],
+                key,
+                &seed,
+            )
+            .unwrap();
             signature_shares.insert(*key.identifier(), share);
         }
-        let params =
-            frost_rerandomized::RandomizedParams::from_randomizer(public.verifying_key(), alpha);
         let signature =
             frost_rerandomized::aggregate(&package, &signature_shares, &public, &params).unwrap();
         params

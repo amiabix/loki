@@ -552,7 +552,6 @@ mod tests {
             change_zat: 0,
             expiry_height: 1_152,
         };
-        let proposal_id = intent.proposal_id();
 
         let mut rks = Vec::new();
         let mut nullifiers = Vec::new();
@@ -565,10 +564,24 @@ mod tests {
                     frost::round1::commit(packages[&ids[k]].signing_share(), &mut frost_rng);
                 commitments.insert(ids[k], c);
             }
-            let seed = alpha_seed(&proposal_id, (&ids[x], &ids[y]), 0);
-            let alpha_bytes = alpha_for_candidate(&seed, &commitments)
-                .unwrap()
-                .serialize();
+            let (params, seed) = frost_rerandomized::RandomizedParams::new_from_commitments(
+                pubkeys.verifying_key(),
+                &commitments,
+                rand_core::OsRng,
+            )
+            .unwrap();
+            let restored =
+                frost_rerandomized::RandomizedParams::regenerate_from_seed_and_commitments(
+                    pubkeys.verifying_key(),
+                    &seed,
+                    &commitments,
+                )
+                .unwrap();
+            assert_eq!(
+                params.randomizer().serialize(),
+                restored.randomizer().serialize()
+            );
+            let alpha_bytes = params.randomizer().serialize();
 
             // Decode the randomizer through its public canonical encoding.
             let alpha_arr: [u8; 32] = alpha_bytes.as_slice().try_into().unwrap();

@@ -92,7 +92,8 @@ def main():
     if args.tamper:
         snapshot = {
             path: path.read_bytes()
-            for pattern in ("public/candidate_*.hex", "public/commitment_*.hex", "*/nonces_*.hex")
+            for pattern in ("public/candidate_*.hex", "public/randomizer_seed_*.hex",
+                            "public/commitment_*.hex", "*/nonces_*.hex")
             for path in state.glob(pattern)
         }
         cases = {
@@ -120,7 +121,7 @@ def main():
                 )
                 if reviewed.returncode == 0 or reason not in reviewed.stderr:
                     raise RuntimeError(f"{case}: wrong refusal: {reviewed.stderr}")
-                if list(public.glob("share_*_alice.hex")):
+                if list(public.glob("share_*.hex")):
                     raise RuntimeError(f"{case}: a rejected candidate emitted a share")
                 status = "refused, zero shares"
             tamper_results.append({"case": case, "status": status})

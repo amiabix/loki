@@ -180,3 +180,13 @@ python3 run-ths.py --name loki-zakura-issue4 --pair BC --finish-mode replica
 Every issue acceptance item maps to a task: production family closure (2), DKG/signature/share/refresh and serialized artifacts (1/3), three pairs/independent finishing/unchanged sign-before-proof/multi-input association (3/4), tamper/no-share/handoff/nonce reuse (4), build/test/fmt/clippy and patch tests (3/5), dependency/vendor documentation and #3 coordination (2/3/5). A green build alone is insufficient; pending live gates remain pending.
 
 Root independently reran build, all 72 Rust tests, formatting, Clippy, and all 16 Python tests on the merged tree. [PR #5](https://github.com/amiabix/loki-zcash-frost/pull/5) is open against main at `754445a`; GitHub reported `MERGEABLE` and `CLEAN` after creation. PR #2 is already included, and conflicts from the later main update were resolved before delivery. No GitHub status checks are configured on the PR.
+
+After PR #6 merged, root incorporated main at `10a91fe`, preserving saved seed
+reconstruction and `sign_with_randomizer_seed` alongside the Zakura graph and all
+pair routing. Seven file conflicts were resolved using a locally tested integration.
+The combined tree passes all 85 Rust tests and 16 Python tests, build, formatting and
+Clippy; details and fresh live results are recorded in the migration results.
+
+All combined live gates passed, including independent AB/AC/BC payments, four
+second-device payments, 19 tamper/control cases, and the measured nonce rollback
+boundary. Root stopped only the dedicated issue #4 instance after validation.

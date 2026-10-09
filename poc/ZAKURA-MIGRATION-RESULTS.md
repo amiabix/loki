@@ -3,6 +3,8 @@
 Issue #4 moves Loki's production transaction, signing, scanning, witness, PCZT, and
 proving graph to Zakura. This is regtest evidence for the existing G1-TX prototype.
 There is no intended approval-policy change, custody claim, or new ZIP 2005 claim.
+The initial evidence below predates the issue #3 merge; the final integration section
+records the combined saved-seed and Zakura flow.
 
 ## Before replacing the graph
 
@@ -163,9 +165,75 @@ runs. No failed run is counted as a pass. No required live gate is skipped or bl
 
 ## Coordination and limits
 
-Issue #3 was rechecked open with no open PRs after validation. The custom deterministic
+Before PR delivery, issue #3 was rechecked open with no open PRs after validation. The custom deterministic
 seed flow and existing signing API remain intact; generated randomizer seeds belong
 to the concurrently coordinated #3 work. No unrelated checkout was edited. Full G1,
 physical devices, authenticated remote relays, crash-safe nonce consumption, custody,
 and independent audit coverage remain outside the established claims. Review and
 push/PR creation are owned by the coordinating root agent.
+
+
+## test(deps): integration with merged seed flow
+
+PR #6 merged into main at `10a91fe9d05bd36702c09729f25f350a25728edc`.
+Its final tree matches validated PR head `388a4e9`. The integration resolves seven
+conflicted files while retaining saved `SeedRecord` association checks,
+`regenerate_from_seed_and_commitments`, and production `sign_with_randomizer_seed`.
+The local migration's AB/AC/BC selection, pair metadata, protected confidential
+handoff, and Zakura PCZT API adaptations remain intact. Cargo manifests, lockfile,
+and vendor patches are byte-identical to the migration before this integration.
+
+On the combined source, `cargo test --locked` passes 85 tests: 55 library, 14 CLI,
+and 16 integration cases. Build, formatting, Clippy and all 16 Python tests pass.
+The new CLI regression routes every pair through approver loading, replica loading,
+and verified aggregation, preserving identical candidates/seeds/sighashes and
+rejecting surplus seed records for the selected pair. Migration fixtures now carry
+canonical intent fields and generated seed records. The real CLI handoff regression
+checks each pair's seed bytes, 0600 seed permissions, 0700 replica permissions and
+absence of other pairs' seeds, keys and nonce secrets. Legacy key/signature/PCZT/seal
+compatibility tests still pass. Seedless legacy signing sessions are explicitly
+refused under #3's policy; no automatic seed regeneration is added.
+
+Fresh combined-source runs used a new `loki-zakura-issue4` THS 0.3.0 instance at
+the same loopback endpoints and pinned images. All commands exited zero:
+
+```sh
+LOKI_THS_INSTANCE=loki-zakura-issue4 ./run-regtest.sh
+python3 run-ths.py --name loki-zakura-issue4 --pair AB --finish-mode replica
+python3 run-ths.py --name loki-zakura-issue4 --pair AC --finish-mode replica
+python3 run-ths.py --name loki-zakura-issue4 --pair BC --finish-mode replica
+LOKI_THS_INSTANCE=loki-zakura-issue4 ./run-second-device.sh
+LOKI_THS_INSTANCE=loki-zakura-issue4 ./tamper-tests.sh
+LOKI_THS_INSTANCE=loki-zakura-issue4 ./nonce-reuse-drill.sh --setup
+```
+
+| Combined seed/Zakura flow | Inputs | Txid | Mined height | Confirmations |
+| --- | --- | --- | --- | --- |
+| AB local | 1 | `c91bba454f26dd52d64fdf9d6867dd9595857abf7cd72c4e8cbefeb84a3077bb` | 105 | 3 |
+| AB independent re-prove | 1 | `b3d122606b9eba9e6a653bdb0b1a25a82db0b7c8993496f81d9da80d258a3f60` | 110 | 3 |
+| AC independent re-prove | 1 | `4c8ac09aeda72293131a25aa5e45ff37aff019931ba0f9b62afe1d427d068385` | 114 | 3 |
+| BC independent re-prove | 1 | `7bb69760d92d4eedbc065d12efb3dcac9ef356f1752783520c371d76393b97ae` | 118 | 3 |
+| AC second-device p1 posted | 1 | `43d6d9d78bf3fc17718b1edfb89fde45f714be5c867695e6edd149557579c694` | 123 | 3 |
+| AC second-device p2 re-prove | 1 | `3e801dbd4e95cb8a3cac515e0b346dad70b03e1d374554e5d5f821051bc9ba01` | 126 | 3 |
+| AC second-device p3 re-prove | 2 | `cd2931263ff724389ae51a23315ccced4391c7efeb4c1cae30957fffc036f99e` | 129 | 3 |
+| AC second-device p4 posted | 2 | `435c47e8642572e64cfaf32b0caf46215e527a7522b5ba001911a5de7dc91716` | 132 | 3 |
+
+All three independent pair runs withheld every member directory. Second-device
+validation mined both finishing paths with one and two inputs, preserved seed and
+candidate bytes across signing-process restarts, and passed its five local refusal
+cases. Every mined payment passed input, recipient, memo, change and exact-fee
+verification. Re-proving signed before anchor/witness/proof installation and retained
+the same effects sighash.
+
+The combined tamper harness reports 19 passes: nine constructible effect mutations
+refused, eight saved-seed mutations refused on the final reviewed spend with zero
+partial shares, and two honest controls accepted. There are zero failures. The one
+fee-only mutation remains unconstructible and is not a passed attack case. The nonce
+drill's observed stage A refusal is `randomizer seed commitments mismatch`, with zero
+shares and unchanged Alice nonces. Stage B restores the consumed nonce files and a
+consistent adversarially rebuilt session, then emits a different share with the same
+nonce. The existing rollback limitation is preserved. These observations were read
+from output, not inferred solely from exit codes. No combined live gate was skipped.
+
+Root stopped only `loki-zakura-issue4` after these runs and closed its foreground
+process. Other Docker instances and unrelated worktrees were left unchanged.
