@@ -76,6 +76,16 @@ The production graph assertion confirms 20 Zakura packages, all Common at 2.2.0,
 PCZT at 0.1.0-rc4, and FROST core/rerandomized exactly 3.0.0. Published manifests
 compose without a PCZT patch, using note-encryption 0.4.2 and Merkle-tree 0.8.2.
 
+Current `origin/main` advanced to `754445a` during implementation. After the verified
+migration commits, that main was merged locally. Both test-fixture conflicts retain
+upstream’s proposed ZIP 2005 derivation, and the separate-member real-PCZT signing
+test is retained with rc4’s no-argument IO-finalizer call. Upstream’s one-pager removal
+and documentation changes are preserved. Production payment/key derivation and the
+custom seed flow are unchanged. On the merged tree, build, all 72 Rust tests, fmt,
+clippy and all 16 Python tests passed without Rust warnings. The existing required
+live gates above exercised the same production code; fresh merged-tree AB local and
+BC independent payments additionally mined and passed effects verification.
+
 The deterministic two-input regression builds 16 shuffled candidates, matches each
 real spend by its original note nullifier, checks the original alpha and derived rk,
 and requires observing reversed real-spend order. Existing mismatch-alpha-count,
@@ -128,6 +138,8 @@ never auto-delete them. Injected failure tests verify this behavior.
 | AB | independent posted | 1 | `9479c598d287afc1f52a84378ccc0fb75f8621430aae54106e6848beda1b29e1` | 149 | 3 |
 | BC | independent posted | 1 | `dc0b86b70945e2e6c5bd37489a9660ffc0b06630249a273b23e1afef35c27894` | 154 | 3 |
 | AB, final persistent withholding helper | independent re-prove | 1 | `53acb4b34ce6a938aaf3ab37b8f52afd0e9e4e6e83f5054adec75a0b8c39b860` | 158 | 3 |
+| After main integration, AB | local | 1 | `810f72ce5e6f29df22585b92e2c9ac46d4ae8df9ffd77b164f78ca5009909f78` | 162 | 3 |
+| After main integration, BC | independent re-prove | 1 | `a1ebb49a79464557da78f954a6511299a16a68397829e2553f7f988444c41511` | 166 | 3 |
 
 All completed payments verify input nullifiers, recipient, amount, memo, change and
 10,000-zat fee against mined chain bytes. Re-proving logs record signature application

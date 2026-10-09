@@ -172,7 +172,7 @@ python3 run-ths.py --name loki-zakura-issue4 --pair BC --finish-mode replica
 - [x] Update `poc/vendor/README.md`, root README vendor names/licences, and migration results. Record patch base revisions/checksums, paths, reproducible commands, audit provenance (fork ancestry is not audit coverage), and no intended approval-policy change.
 - [x] Final checks: `cargo build --locked`, `cargo test --locked`, `cargo fmt --check`, `cargo clippy --locked --all-targets`, focused vendor alpha tests, relevant Python harness tests, and all Task 4 live checks. No intentional probe feature in routine checks.
 - [x] Review the final diff against every issue requirement, including multiple-input alpha association, old artifact handling, seed-flow coordination, and production graph closure. Fix actionable findings and rerun affected checks.
-- [ ] Commit only relevant changes using Conventional Commits, for example `refactor(deps): migrate transaction and crypto stack to Zakura`. Do not stage temporary generators, synthetic secret state, registry extraction metadata secrets, or unrelated main changes.
+- [x] Commit only relevant changes using Conventional Commits, for example `refactor(deps): migrate transaction and crypto stack to Zakura`. Do not stage temporary generators, synthetic secret state, registry extraction metadata secrets, or unrelated main changes.
 - [ ] Root agent independently reviews evidence, pushes `refactor/zakura-dependencies`, and creates a PR against main with a concrete behavior description, `Closes #4` when verified, actual validation results, and material limitations. PR creation is already authorized by the user; no further approval ceremony is required.
 
 ## Completion audit

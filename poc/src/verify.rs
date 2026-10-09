@@ -306,7 +306,7 @@ pub fn check_candidate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{candidate::*, vault};
+    use crate::{candidate::*, vault, zip2005};
     use orchard::{
         note::{RandomSeed, Rho},
         value::NoteValue,
@@ -336,7 +336,7 @@ mod tests {
             .unwrap()
             .try_into()
             .unwrap();
-        let fvk = vault::test_only_fvk(&ak).unwrap();
+        let fvk = zip2005::frost_viewing_key(&ak, &[42u8; 32]).unwrap();
 
         let rho = Rho::from_bytes(&[1u8; 32]).unwrap();
         let rseed = RandomSeed::from_bytes([2u8; 32], &rho).unwrap();

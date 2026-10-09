@@ -308,12 +308,11 @@ pub fn forbidden_sapling_bundle() -> Result<sapling_crypto::pczt::Bundle, String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{intent::*, vault};
+    use crate::{intent::*, zip2005};
     use reddsa_frost::frost::redpallas as frost;
     use std::collections::BTreeMap;
 
-    /// A real group verifying key, spliced into a test-only vault FVK. `ak` must be a
-    /// canonical Pallas point with even y, so arbitrary bytes will not do.
+    /// A real group verifying key with the proposed ZIP 2005 viewing-key derivation.
     fn a_test_fvk() -> FullViewingKey {
         let (_, public) = frost::keys::generate_with_dealer(
             3,
@@ -329,7 +328,7 @@ mod tests {
             .as_slice()
             .try_into()
             .expect("32 bytes");
-        vault::test_only_fvk(&ak).expect("a test fvk")
+        zip2005::frost_viewing_key(&ak, &[42u8; 32]).expect("a derived test fvk")
     }
 
     /// A vault note of a chosen value. `seed` distinguishes notes: rho must differ or
@@ -535,7 +534,7 @@ mod tests {
             .unwrap()
             .try_into()
             .unwrap();
-        let fvk = vault::test_only_fvk(&ak).unwrap();
+        let fvk = zip2005::frost_viewing_key(&ak, &[42u8; 32]).unwrap();
         let note = vault_note(&fvk);
 
         let intent = Intent {
