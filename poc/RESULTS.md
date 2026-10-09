@@ -26,8 +26,9 @@ needs a new `LOKI_ROUND`, fresh nonce commitments and new library seeds. Plain-f
 writes and nonce deletion remain non-atomic and provide no consumed-nonce ledger or
 rollback protection.
 
-The current local checks pass 54 library tests and 10 focused CLI tests. Updated live
-regtest, second-device, tamper and rollback outcomes belong in
+The current seed-flow validation includes the full default Rust suite, independent
+AB/AC/BC two-input proving/extraction, and live THS regtest, second-device, tamper and
+rollback checks. Concrete commands, outcomes and limitations are recorded in
 [FROST-RANDOMIZER-RESULTS.md](FROST-RANDOMIZER-RESULTS.md); the transaction evidence
 below is historical and does not establish those new live runs.
 
@@ -269,8 +270,9 @@ sighash**, or the signers sign a transaction whose inputs and outputs are still 
 
 **`incorrect consensus branch id` at broadcast.** The POC's `Regtest` parameters activated
 *every* upgrade at height 1, so `BranchId::for_height` chose a branch later than the node
-accepts. It surfaces only at broadcast, after proving. The parameters now stop at NU6.3
-and must match `harness/zebrad-regtest.toml` exactly.
+accepts. It surfaces only at broadcast, after proving. The parameters stop at NU6.3;
+the historical run matched `harness/zebrad-regtest.toml`. Current execution checks the
+selected THS instance's active consensus branch.
 
 ## The B2 patch grew
 

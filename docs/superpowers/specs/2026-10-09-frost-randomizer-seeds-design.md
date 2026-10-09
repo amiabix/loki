@@ -1,7 +1,7 @@
 # refactor(signing): adopt the recommended FROST seed flow
 
 Issue: https://github.com/amiabix/loki-zcash-frost/issues/3
-Base: `origin/main`, `3f66967f95f8960387799f0d6847adc1b3dd3b3e`, fetched 2026-10-09.
+Base: `origin/main`, `754445a445efdea1adf6be378ca2dd2a453b61dc`, fetched 2026-10-09.
 
 For each real spend of each AB, AC and BC candidate, generate parameters with
 `frost_rerandomized::RandomizedParams::new_from_commitments(group_key,

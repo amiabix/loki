@@ -22,8 +22,9 @@ chain scan. A populated replica destination is refused without changing its save
 bytes. Missing, changed or swapped records fail locally before broadcast. Real
 spends are located by intent nullifier, independent of shuffled action order.
 
-All-pair AB/AC/BC two-input fixtures exercise saved-seed aggregation. Current local
-validation passes 54 library tests and 10 focused CLI tests; updated live outcomes are
+All-pair AB/AC/BC two-input fixtures aggregate, prove and extract after approver
+files are deleted, verifying both nullifiers and the extracted sighash. Live THS AC
+validation mined both paths with one and two inputs; commands and outcomes are
 recorded in [FROST-RANDOMIZER-RESULTS.md](FROST-RANDOMIZER-RESULTS.md). The txids and
 transcripts below are historical, not evidence of a new seed-flow live run.
 

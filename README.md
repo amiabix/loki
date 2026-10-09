@@ -15,7 +15,7 @@ result documents, which are the authority.
 | **G1-TX** | **demonstrated on regtest** — a real Ironwood payment, authorised by two of three FROST members, signed before its anchor and proof existed, mined |
 | **Full G1** | **BLOCKED**. Separate-member setup now has a local ZIP 2005 `use_qsk` derivation with an independently calculated vector, but it has not been reviewed, upstreamed, or used for a mined payment. The original transaction CLI still uses its documented **test-only** key splice |
 | **G3** (browser nonce safety) | **PARTIAL** and separate. 29/32 drills on Chromium, 6/8 on WebKit, Firefox would not launch, no physical device case tested |
-| **Second-device finishing** | historical regtest demonstration: a party holding none of the approvers' files completed two payments, one from posted bytes and one by re-proving. Current replicas also carry confidential randomizer seeds |
+| **Second-device finishing** | seed-flow THS validation: a party holding none of the approvers' files completed both posted and re-proving paths with one and two inputs. Replicas carry confidential randomizer seeds ([evidence](poc/FROST-RANDOMIZER-RESULTS.md)) |
 | **Separate-member setup** | three isolated processes complete DKG; two stored shares sign the actual sighash of an offline, unproved Ironwood candidate for their ZIP 2005 vault. Each member verifies a 24-word and card backup before the regtest address appears, and a clean restore works without the exchange directory. Not yet connected to the mined payment CLI ([details](poc/SEPARATE-MEMBER-SETUP.md)) |
 | **Recovery, key rotation, custody** | local two-artifact restore demonstrated on regtest; independent spend, key rotation in the wallet, and custody readiness **not established** |
 
@@ -142,7 +142,7 @@ honest session needs a new `LOKI_ROUND` and fresh nonce commitments. See
 - The legacy transaction CLI uses a **test-only** `ak || nk || rivk` splice. Separate-member
   setup preserves its experimental ZIP 2005 derivation and backup gate, but has not
   established a mined payment from that derivation.
-- Regtest only, one machine, one mined note per payment and one recipient. A two-note candidate signs, proves and extracts offline, but has not been mined in the current run.
+- Regtest only, one machine and one recipient. The AC live flow mined payments with one and two inputs; AB/AC/BC independent two-input finishing is verified offline.
 - Member state is plain files with no rollback guarantee. A nonce is deleted after use,
   which is not a crash-safe consumed-nonce ledger. Batch validation does not make share
   writes and nonce deletion atomic.
