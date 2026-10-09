@@ -1,6 +1,7 @@
 # test(signing): persisted randomizer seed validation
 
 Issue [#3](https://github.com/amiabix/loki-zcash-frost/issues/3), 9 October 2026.
+Published as [PR #6](https://github.com/amiabix/loki-zcash-frost/pull/6), targeting main; no merge was performed.
 Herdr execution used only `/private/tmp/loki-frost-randomizer-seeds` on
 `refactor/frost-randomizer-seeds`. Final base is fetched main
 `754445a445efdea1adf6be378ca2dd2a453b61dc`; PR #2's THS migration, experimental

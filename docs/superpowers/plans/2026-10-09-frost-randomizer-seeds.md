@@ -133,8 +133,8 @@ LOKI_STATE=/private/tmp/loki-issue3-rollback LOKI_BIN=/private/tmp/loki-frost-ra
 The last drill creates a fresh vault and uses the selected THS faucet to fund its unspent inputs. The controller keeps this isolated instance alive; the harnesses discover loopback endpoints and never manage its lifecycle. Scope formatter changes to affected files where baseline formatting is already broken, and report baseline diagnostics accurately. Do not claim a broad check passes unless its final result does.
 
 - [x] Review the full diff against each acceptance criterion in the spec. Verify git contains no generated state/seeds/secrets. Record actual validation in a concise result document, commit using Conventional Commits, and push only `refactor/frost-randomizer-seeds`.
-- [ ] Create a PR targeting main, title `refactor(signing): adopt recommended FROST randomizer seeds`, with `Closes #3`, behavior, validation results and limitations. Read the conventional-commits skill first. `gh pr create --body-file` is available; use a temporary file for exact multiline prose.
-- [ ] Return the PR URL, commit head, tests/harness outcomes and material remaining limitations to the controller. Do not merge the PR.
+- [x] Create a PR targeting main, title `refactor(signing): adopt recommended FROST randomizer seeds`, with `Closes #3`, behavior, validation results and limitations. Read the conventional-commits skill first. `gh pr create --body-file` is available; use a temporary file for exact multiline prose.
+- [x] Return the PR URL, commit head, tests/harness outcomes and material remaining limitations to the controller. Do not merge the PR.
 
 ## Completion Matrix
 
@@ -160,3 +160,8 @@ THS harnesses exited zero on final stable source; concrete logs, transaction IDs
 limitations are in `poc/FROST-RANDOMIZER-RESULTS.md`. The first tamper run overlapped a
 rebase and is explicitly invalid; the final full rerun is the accepted evidence.
 PR creation/mergeability are recorded in the final GitHub PR and local audit ledger.
+
+Created [PR #6](https://github.com/amiabix/loki-zcash-frost/pull/6) targeting main.
+Final source validation remains commit `265d6a7`; subsequent commits update only
+documentation and publication evidence. The controller receives the final branch head
+and independently queryable mergeability with the completion report.
