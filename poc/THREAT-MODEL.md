@@ -5,7 +5,9 @@ be leaked by a rollback **paired with a rebuilt candidate**, and the party that 
 candidate is the coordinator. So the cost of a leak and the power of the coordinator have to
 be answered together.
 
-Established by `cargo test --lib coordinator` (4 tests) and `./nonce-reuse-drill.sh`.
+The original boundary was demonstrated by coordinator tests and the historical
+`nonce-reuse-drill.sh`. Current seed-flow validation and the updated live drill outcome
+are recorded separately in [FROST-RANDOMIZER-RESULTS.md](FROST-RANDOMIZER-RESULTS.md).
 
 ## What the coordinator cannot do
 
@@ -14,18 +16,44 @@ Established by `cargo test --lib coordinator` (4 tests) and `./nonce-reuse-drill
 | **Equivocate**: show Alice one payment and Carol another, then combine | **CO.1** shares made under different signing packages do not aggregate, under either package |
 | **Reach the threshold alone** | **CO.2** one share is not a signature in a 2-of-3 group |
 | **Forge a missing share** | **CO.4** `aggregate` checks each share against that member's verifying share, rejects the forgery and names the culprit |
-| **Change what a signer agreed to** | `verify.rs` + `tamper-tests.sh`: 10 adversarial cases, each refused with no share written |
-| **Choose the randomiser** | every signer recomputes α from the proposal and the published commitments and checks `rk` against it |
+| **Change what a signer agreed to** | independent payment review and local sighash; historical tamper cases refused with no share written, current seed refusals also check zero new shares |
+| **Change a fixed candidate's seed or commitments unnoticed** | record association and reconstructed canonical α/`rk` checks refuse inconsistent data against the known vault key |
+
+## docs(signing): seed generation and handoff boundaries
+
+Production calls `RandomizedParams::new_from_commitments` with `OsRng` before each
+real spend is built, saves the returned seed with its exact proposal/pair/index/
+nullifier/commitments association, and reconstructs it during review and aggregation.
+Signers independently check the canonical proposal, payment effects and local sighash;
+all checks and share computations precede any share output or nonce deletion. This
+removes the custom seed derivation assumption. It does not prove that a hostile
+coordinator used random seeds, provide a security proof, or extend NCC's published
+audit to rerandomized FROST.
+
+Seeds require confidential handoff. The prototype uses a local replica directory
+protected as 0700 and seed records as 0600 on Unix; it implements no encrypted or
+authenticated relay. It withholds approver key packages, nonce secrets and scan state.
+The replica still needs an authenticated association with the intended account/payment.
+
+Ordinary reproposal refuses any existing intent/candidate/seed/alpha/share files
+unchanged. An honest new session needs a fresh `LOKI_ROUND` and fresh commitments.
+Neither this guard nor batch checking makes writes and nonce consumption crash-atomic
+or provides a consumed-nonce ledger or rollback protection.
 
 ## What the coordinator can do
 
-**Cause a nonce leak, given a rollback.** `nonce-reuse-drill.sh` stage B. Moving the
-commitment set alone is caught by the `rk` check (stage A). Rebuilding the candidate so `rk`
-matches the moved set is not caught, because at that point **nothing is inconsistent for the
-signer to notice**. The only thing that had prevented reuse was the deleted nonce file.
+**Supply a chosen seed.** Reconstructed α/`rk` checks detect inconsistency with the fixed
+candidate, but cannot prove seed randomness.
 
-This is not a flaw in `review_sign`. No information available to it distinguishes that case
-from an honest first signing.
+**Cause a nonce leak, given a rollback.** `nonce-reuse-drill.sh` stage B. Moving the
+commitment set or saved seed against a fixed candidate is caught by association or
+α/`rk` checks (stage A). Deliberately rebuilding a consistent candidate and association
+under restored, already-used nonce secrets (stage B) is not caught, because at that
+point **nothing is inconsistent for the signer to notice**. The only thing that had prevented reuse was the deleted nonce file.
+
+A fresh seed does not repair nonce reuse. Ordinary reproposal refuses a saved round;
+the adversarial rebuild in the drill is a test-only path. No information available to
+`review_sign` distinguishes that case from an honest first signing.
 
 ## What a leaked share is worth
 

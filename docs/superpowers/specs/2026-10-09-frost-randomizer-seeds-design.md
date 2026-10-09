@@ -1,7 +1,7 @@
 # refactor(signing): adopt the recommended FROST seed flow
 
 Issue: https://github.com/amiabix/loki-zcash-frost/issues/3
-Base: `origin/main`, `0aee73aeb65763ac889cb5e3b33ec77cd3edf560`, fetched 2026-10-09.
+Base: `origin/main`, `3f66967f95f8960387799f0d6847adc1b3dd3b3e`, fetched 2026-10-09.
 
 For each real spend of each AB, AC and BC candidate, generate parameters with
 `frost_rerandomized::RandomizedParams::new_from_commitments(group_key,
@@ -57,7 +57,5 @@ signers prove the coordinator used a random seed, establish a security proof, or
 expand NCC's published audit scope to rerandomized FROST. Keep regtest-only claims.
 
 Validation: Rust build, full default-feature tests, formatting and all-target clippy;
-regtest, independent second-device, tamper and nonce-reuse harnesses. Inspect all
-state paths and node processes first; use isolated temporary state and loopback
-services. Tests for refusals assert the specific reason and zero share output.
+regtest, independent second-device, tamper and nonce-reuse harnesses. Preserve current main's THS migration and checked-backup gate. Inspect state paths, selected THS instance endpoints and runtime identities first; use fresh isolated temporary state and loopback services. Validation uses controller-owned `loki-frost-issue3`; never touch the issue #4 instance. Record source-built Loki identity and concrete harness logs. The original e66f97c baseline had 64 passing tests, inherited formatting failure and clean Clippy. Tests for refusals assert the specific reason and zero share output.
 Report skipped or failed checks separately from passes. No UI change is required.

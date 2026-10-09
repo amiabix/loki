@@ -4,7 +4,34 @@
 > original run. Current local-chain setup uses THS; see [harness/README.md](harness/README.md)
 > for current local-chain instructions.
 
-## G1-TX PASS; G1 BLOCKED (ZIP 2005)
+## docs(signing): current persisted-seed behavior
+
+The 9 October refactor generates a library seed for each real spend in AB/AC/BC with
+`RandomizedParams::new_from_commitments` and `OsRng` before building the candidate.
+Versioned JSON records (despite their `.hex` filenames) save the 32-byte seed and its
+proposal ID, pair, spend index, nullifier and exact serialized commitments. Spend zero
+uses `randomizer_seed_AB.hex`; later spends use `randomizer_seed_AB_1.hex`, etc.
+
+Review checks the canonical proposal ID, payment effects and local sighash, reconstructs
+parameters with `regenerate_from_seed_and_commitments`, and checks canonical α and
+`rk` against the known vault key. It validates and computes the entire share batch
+with `sign_with_randomizer_seed` before writing shares or consuming nonces. Missing,
+malformed or mismatched records and seedless legacy proposals are refused without new
+shares. Finishing loads the same associations and reconstructs parameters before
+aggregation, locating real spends by intent nullifier rather than shuffled action order.
+
+`propose` refuses a round with existing intent, candidate, seed, alpha or share files
+without altering them. Restart uses the original saved bytes; a fresh honest round
+needs a new `LOKI_ROUND`, fresh nonce commitments and new library seeds. Plain-file
+writes and nonce deletion remain non-atomic and provide no consumed-nonce ledger or
+rollback protection.
+
+The current local checks pass 54 library tests and 10 focused CLI tests. Updated live
+regtest, second-device, tamper and rollback outcomes belong in
+[FROST-RANDOMIZER-RESULTS.md](FROST-RANDOMIZER-RESULTS.md); the transaction evidence
+below is historical and does not establish those new live runs.
+
+## Historical 3 October: G1-TX PASS; G1 BLOCKED (ZIP 2005)
 
 Date 2026-10-03. Scope is **G1-TX** per the 3 October decision in the brief: the v6
 sign-before-proof transaction path, on a documented test-only FVK.
@@ -21,7 +48,8 @@ anchor and proof were installed**.
 
 ## Run
 
-One command, genesis to mined, nonzero on any failure:
+For current execution, first start a dedicated THS instance as described in
+[harness/README.md](harness/README.md). The payment driver exits nonzero on failure:
 
 ```
 ./poc/run-regtest.sh
@@ -31,7 +59,7 @@ Component checks:
 
 ```
 cd poc
-cargo test                                       # 53 tests as of 8 October
+cargo test                                       # current test results: FROST-RANDOMIZER-RESULTS.md
 cargo build --features probe-zip2005             # blocker B1, as a compiler error
 (cd vendor/orchard && cargo test --lib loki_b2)  # 3 tests, the B2 patch
 ./tamper-tests.sh                                # 10 adversarial cases, self-contained
@@ -44,10 +72,11 @@ extends replication and finishing to carry both spends. A mined multi-note trans
 and a second-device replay of it are still pending a live regtest run; see
 `SECOND-DEVICE-RESULTS.md` for that distinction.
 
-One-time cost: `zebrad` is built from source (2m26s, see `harness/README.md`). There are
+Historical one-time cost: the original standalone `zebrad` build took 2m26s. Current
+chain flows use THS. There are
 no proving-parameter downloads — Orchard uses Halo 2, so `ProvingKey::build` is local.
 
-## Checkpoints
+## Historical checkpoints
 
 | # | Requirement | Status |
 |---|---|---|
@@ -89,8 +118,10 @@ verifies `rk` against an α it **recomputed** from the proposal and that pair's
 commitments, and builds the FROST signing package locally from its own sighash rather
 than accepting one.
 
-Every candidate containing a member is reviewed before that member emits any share, and
-each nonce is assigned to one candidate and deleted on use.
+In the historical run, every candidate containing a member was reviewed before that
+member emitted any share, and each nonce was assigned to one candidate and deleted on use.
+The current flow additionally reconstructs parameters from saved library seeds and
+computes the whole batch before output, as described above.
 
 `src/verify.rs` holds the approval check. Everything below is proven against the PCZT and
 its cryptographic openings; nothing is taken from a proposer annotation, and **an absent
@@ -274,13 +305,15 @@ Both patches are in `vendor/*.patch`; see `vendor/README.md`.
 
 ## What this does NOT establish
 
-- **G1.** The vault FVK is the test-only `ak || nk || rivk` splice. ZIP 2005's
-  `qsk → qk → rivk_ext` is implemented nowhere — not orchard 0.16, not `zcash/orchard`
-  HEAD `616a669d`, not `librustzcash` HEAD `9c5705f5` — and the ZIP is `Status: Proposed`.
-  The compile probe and blocker report stay in place. No ZIP 2005 vector was fabricated.
-- **The α seed derivation is a research assumption pending O1 review.** The library's
-  seed-to-α derivation is unchanged; only the seed's origin differs, and
-  `frost-rerandomized` explicitly advises against supplying your own.
+- **Full G1.** The historical payment and current legacy transaction CLI use the
+  test-only `ak || nk || rivk` splice. Separate-member setup on the current main baseline
+  (`3f66967`) has experimental ZIP 2005 derivation, an independent vector and a backup
+  gate. Those are preserved; a mined payment from the derived FVK, independent review
+  and upstream support remain unestablished.
+- **Security proof or expanded audit.** Current production uses library-generated
+  seeds, removing the historical custom seed derivation assumption. Signers cannot
+  prove honest coordinator RNG use. This change does not repair nonce reuse/rollback
+  or extend NCC's published audit coverage to rerandomized FROST.
 - **G3 crash or restore safety.** The G1 CLI uses file state with no rollback guarantee.
   A nonce is deleted after use, which is not the same as a crash-safe consumed-nonce
   ledger. G3 is prototyped separately in `g3/` and reported in `g3/G3-RESULTS.md`. It is
@@ -293,7 +326,9 @@ Both patches are in `vendor/*.patch`; see `vendor/README.md`.
   finisher that holds no approver file completing both payments, one by broadcasting an
   already posted final transaction and one by re-proving the signed candidate from its own
   chain scan. It is a second *process* on the same machine reading a locally copied
-  replica: no relay, no transport authentication, no second piece of hardware.
+  replica. Current seeds require confidential handoff; Unix replica directories are
+  0700 and seed records 0600. No encrypted/authenticated relay or second hardware
+  device is implemented, and approver keys, nonces and scan state are withheld.
 - **M0, one-visit approvals, production nonce safety, independent recovery, custody
   readiness.** None of these follow from this POC.
 - **Outgoing viewing key material is not checked.** The PCZT outputs carry no populated

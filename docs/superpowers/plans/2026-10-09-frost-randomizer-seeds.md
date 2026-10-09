@@ -10,11 +10,15 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-09-frost-randomizer-seeds-design.md`, derived from https://github.com/amiabix/loki-zcash-frost/issues/3 (no comments at inspection).
 
+## Execution provenance
+
+Originally planned and baseline-tested on `e66f97ce894e3784efa53e5625919a0b8abce9e4` (64 tests, inherited formatting failure, warning-free Clippy). Rebased onto `0aee73a` before implementation, then onto `3f66967` to preserve PR #2's THS migration and main's backup gate. The current commands below target THS; obsolete standalone setup changes were discarded before live validation.
+
 ## Global Constraints
 
-- Base is latest fetched origin/main `0aee73aeb65763ac889cb5e3b33ec77cd3edf560`.
+- Base is latest fetched origin/main `3f66967f95f8960387799f0d6847adc1b3dd3b3e`.
 - Work only in `/private/tmp/loki-frost-randomizer-seeds`, branch `refactor/frost-randomizer-seeds`. Preserve the dirty original checkout.
-- Keep regtest-only claims and pinned caller-alpha vendor patches. No Zakura migration or ZIP 2005 implementation changes.
+- Keep regtest-only claims and pinned caller-alpha vendor patches. Preserve main's THS runtime migration and checked-backup gate. No crypto dependency migration (#4) or ZIP 2005 implementation changes.
 - Never commit generated seeds, key packages, nonce secrets, run state or demo sandbox contents.
 - Read `/Users/megabyte/.codex/skills/conventional-commits/SKILL.md` before source comments, commits, PR text or change-summary comments.
 - Regression refusal tests must check the reason and absence of all new signature-share files, including earlier candidates/spends in the batch.
@@ -94,12 +98,12 @@ let share = frost_rerandomized::sign_with_randomizer_seed(
 
 **Files:** bin/loki.rs replica/loaders/tests, run-second-device.sh, SECOND-DEVICE-RESULTS.md.
 
-**Interfaces:** The replica copies all selected candidate seed records, commitments, shares and association metadata; AggregateInputs is self-contained. No access to approver key packages, nonces or scan output is permitted. The replica's local directory is private (0700 where supported); seed records use restrictive permissions where practical.
+**Interfaces:** The replica copies all selected candidate seed records, commitments, shares and association metadata; AggregateInputs is self-contained. No access to approver key packages, nonces or scan output is permitted. Refuse a nonempty replica destination before writing any bytes. The replica's local directory is private (0700 where supported); seed records use restrictive permissions where practical.
 
-- [ ] Add second-device tests with two real inputs and no approver state. For all pair aggregation fixtures prove signatures precede anchor/witness/proof; the existing live CLI second-device path remains AC unless an existing pair option is present. Test both posted-final and re-proving replica paths load saved seed records. A swapped/missing replica seed fails locally before node broadcast.
+- [ ] Add second-device tests with two real inputs and no approver state. For all pair independent finishing fixtures prove signatures precede anchor/witness/proof, then prove/extract with approver files removed and verify extracted sighash and both real nullifiers; the existing live CLI second-device path remains AC unless an existing pair option is present. Test both posted-final and re-proving replica paths load saved seed records. A swapped/missing replica seed fails locally before node broadcast.
 - [ ] Add restart checks using separate review-sign processes and reload from disk. Save the seed and candidate bytes; validate neither changed across the restart. Check a new session with fresh commit material gets fresh seeds.
 - [ ] Implement replica copying/manifest updates and seed loading, protect the local handoff directory, and clearly describe the confidential transport requirement. Do not advertise raw seeds as public relay material or implement an unrelated networking/encryption layer.
-- [ ] Run CLI fixture tests and then `./run-second-device.sh` with isolated state and the pinned node. Use the already-built target directory via `CARGO_TARGET_DIR` to avoid needless recompilation. Record actual paths/txids and distinguish any blocked case from a pass.
+- [ ] Run CLI fixture tests and then `./run-second-device.sh` with isolated state and the selected THS instance. Use the already-built target directory via `CARGO_TARGET_DIR` to avoid needless recompilation. Record actual paths/txids and distinguish any blocked case from a pass.
 - [ ] Commit as `fix(finisher): carry confidential randomizer seeds in replicas`.
 
 ### Task 4: Adversarial harnesses, documentation and PR
@@ -109,22 +113,24 @@ let share = frost_rerandomized::sign_with_randomizer_seed(
 - [ ] Extend tamper harness with explicit seed failures and assert exact refusals plus no shares. Snapshot/restore seed association with candidate/commitments so unrelated tests retain their intended oracle.
 - [ ] Adapt rollback drill to snapshot saved seeds, fixed candidate bytes, commitments and nonce files. Stage A changes commitments or seed against a fixed candidate and must refuse with zero new shares. Stage B deliberately rebuilds a consistent candidate while restoring an already-used nonce, with seed association updated to match; it must continue to expose the nonce-reuse boundary. If ordinary reproposal refuses reused commitments, construct the adversarial rebuilt candidate through a test/tamper-only path rather than weaken normal session checks.
 - [ ] Update dependencies, intent module docs, threat model and result caveats. State that library-generated seeds remove the custom derivation assumption but do not prove coordinator randomness or supply a security proof/audit. Preserve existing vendor patches and current main's experimental vault changes.
-- [ ] Inspect `LOKI_STATE`, node ports/processes and harness mutations. Use `/private/tmp/loki-issue3-*` state. The original node binary at `/Users/megabyte/Developer/zcash/loki-zcash-frost/poc/harness/zebrad` can be linked into this ignored worktree harness path. Do not terminate an unrelated node. Prefer narrow isolated setup fixes if a harness still kills matching processes or rewrites tracked config.
+- [ ] Inspect `LOKI_STATE`, selected THS endpoints and runtime identities. Use fresh `/private/tmp/loki-issue3-*` state, `${TMPDIR:-/tmp}` portable scratch directories and loopback services. Select the controller-owned `loki-frost-issue3` instance; never start, stop or reset another instance. Preserve main's THS harnesses and removed standalone config. Read `.agents/skills/ths-regtest-verifier/SKILL.md` and THS runtime guidance from the original checkout. Record current source-built Loki binary, runtime image identities and logs under `/private/tmp/loki-issue3-evidence`.
 - [ ] Run and capture these checks in this worktree, without `--all-features`:
 
 ```sh
 cd poc
+export CARGO_TARGET_DIR=/private/tmp/loki-frost-randomizer-seeds/poc/target
+export LOKI_THS_INSTANCE=loki-frost-issue3
 cargo build
 cargo test
 cargo fmt --check
 cargo clippy --all-targets
-./run-regtest.sh
-./run-second-device.sh
+LOKI_STATE=/private/tmp/loki-issue3-regtest-final ./run-regtest.sh
+LOKI_STATE=/private/tmp/loki-issue3-second-device-final ./run-second-device.sh
 LOKI_STATE=/private/tmp/loki-issue3-tamper ./tamper-tests.sh
-LOKI_STATE=/private/tmp/loki-issue3-rollback LOKI_BIN=<built-loki-path> ./nonce-reuse-drill.sh
+LOKI_STATE=/private/tmp/loki-issue3-rollback LOKI_BIN=<built-loki-path> ./nonce-reuse-drill.sh --setup
 ```
 
-The last drill needs a funded unspent account and live isolated loopback node; arrange that before execution, without reusing someone else's state. Scope formatter changes to affected files where baseline formatting is already broken, and report baseline diagnostics accurately. Do not claim a broad check passes unless its final result does.
+The last drill creates a fresh vault and uses the selected THS faucet to fund its unspent inputs. The controller keeps this isolated instance alive; the harnesses discover loopback endpoints and never manage its lifecycle. Scope formatter changes to affected files where baseline formatting is already broken, and report baseline diagnostics accurately. Do not claim a broad check passes unless its final result does.
 
 - [ ] Review the full diff against each acceptance criterion in the spec. Verify git contains no generated state/seeds/secrets. Record actual validation in a concise result document, commit using Conventional Commits, and push only `refactor/frost-randomizer-seeds`.
 - [ ] Create a PR targeting main, title `refactor(signing): adopt recommended FROST randomizer seeds`, with `Closes #3`, behavior, validation results and limitations. Read the conventional-commits skill first. `gh pr create --body-file` is available; use a temporary file for exact multiline prose.
