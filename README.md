@@ -16,8 +16,8 @@ result documents, which are the authority.
 | **Full G1** | **BLOCKED**. Separate-member setup now has a local ZIP 2005 `use_qsk` derivation with an independently calculated vector, but it has not been reviewed, upstreamed, or used for a mined payment. The original transaction CLI still uses its documented **test-only** key splice |
 | **G3** (browser nonce safety) | **PARTIAL** and separate. 29/32 drills on Chromium, 6/8 on WebKit, Firefox would not launch, no physical device case tested |
 | **Second-device finishing** | demonstrated: a party holding none of the approvers' files completed two payments, one from posted bytes and one by re-proving |
-| **Separate-member setup** | three isolated processes complete DKG with encrypted peer shares, matching certificates and the locally derived viewing key on one machine; regtest-only, not yet connected to payments or backups ([details](poc/SEPARATE-MEMBER-SETUP.md)) |
-| **Recovery, key rotation, custody** | **not established.** No drill, no review |
+| **Separate-member setup** | three isolated processes complete DKG with encrypted peer shares and matching certificates; each verifies a 24-word and card backup before the regtest address appears, and a clean restore works without the exchange directory. Not yet connected to payments ([details](poc/SEPARATE-MEMBER-SETUP.md)) |
+| **Recovery, key rotation, custody** | local two-artifact restore demonstrated on regtest; independent spend, key rotation in the wallet, and custody readiness **not established** |
 
 ## Quick start
 

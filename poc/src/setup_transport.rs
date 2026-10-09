@@ -13,6 +13,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 const MAGIC: &[u8; 8] = b"LOKIDKG1";
 const ROUND1_MAGIC: &[u8; 8] = b"LOKIR1V1";
 const CERT_MAGIC: &[u8; 8] = b"LOKICRV1";
+const BACKUP_MAGIC: &[u8; 8] = b"LOKIBKV1";
 const HEADER: usize = 8 + 32 + 2 + 2 + 24 + 4;
 const PUBLIC_HEADER: usize = 8 + 32 + 2 + 4;
 const SIGNATURE: usize = 64;
@@ -79,6 +80,10 @@ impl Identity {
         self.sign_public(CERT_MAGIC, vault, payload)
     }
 
+    pub fn sign_backup(&self, vault: &[u8; 32], payload: &[u8]) -> Result<Vec<u8>, String> {
+        self.sign_public(BACKUP_MAGIC, vault, payload)
+    }
+
     fn sign_public(
         &self,
         magic: &[u8; 8],
@@ -114,6 +119,15 @@ impl Identity {
         wire: &[u8],
     ) -> Result<Vec<u8>, String> {
         self.verify_public(CERT_MAGIC, sender, vault, wire)
+    }
+
+    pub fn verify_backup(
+        &self,
+        sender: &PublicIdentity,
+        vault: &[u8; 32],
+        wire: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        self.verify_public(BACKUP_MAGIC, sender, vault, wire)
     }
 
     fn verify_public(
