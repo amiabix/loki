@@ -463,8 +463,19 @@ fn randomizer_all_pairs_sign_two_inputs_before_anchor_witness_or_proof() {
     for (file, bytes) in saved {
         assert_eq!(fs::read(f.shared().path().join(file)).unwrap(), bytes);
     }
-    for (pair, _, _) in PAIRS {
-        let mut inputs = f.inputs(pair);
+    let candidates = PAIRS.map(|(pair, _, _)| (pair, f.inputs(pair)));
+    for (member, _) in MEMBERS {
+        fs::remove_dir_all(f.root.join(member)).unwrap();
+    }
+    fs::remove_dir_all(f.shared().path()).unwrap();
+    let cmxs = f
+        .notes
+        .map(|note| orchard::note::ExtractedNoteCommitment::from(note.commitment()).to_bytes());
+    let anchor = loki_poc::witness::CommitmentTree::build(&cmxs)
+        .unwrap()
+        .root()
+        .to_bytes();
+    for (pair, mut inputs) in candidates {
         let original = pczt::Pczt::parse(&inputs.candidate).unwrap();
         let expected_sighash = pczt::roles::signer::Signer::new(original.clone())
             .unwrap()
@@ -475,7 +486,7 @@ fn randomizer_all_pairs_sign_two_inputs_before_anchor_witness_or_proof() {
         assert_ne!(indices[0], indices[1]);
         assert!(signed.ironwood().anchor().is_none());
         assert!(signed.ironwood().zkproof().is_none());
-        for (spend, index) in indices.into_iter().enumerate() {
+        for (spend, index) in indices.iter().copied().enumerate() {
             let action = &signed.ironwood().actions()[index];
             assert_eq!(
                 action.spend().nullifier(),
@@ -493,6 +504,43 @@ fn randomizer_all_pairs_sign_two_inputs_before_anchor_witness_or_proof() {
             )
             .unwrap();
         }
+        let positions = indices
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(position, index)| (index, position as u64))
+            .collect::<Vec<_>>();
+        let (raw, txid) = prove_and_extract(
+            signed,
+            &sighash,
+            &positions,
+            &cmxs,
+            anchor,
+            &format!("independent {pair} two-note"),
+        )
+        .unwrap();
+        let tx = zcash_primitives::transaction::Transaction::read(
+            &raw[..],
+            zcash_protocol::consensus::BranchId::Nu6_3,
+        )
+        .unwrap();
+        assert_eq!(tx.txid().to_string(), txid);
+        assert_eq!(finalized_sighash(&tx).unwrap(), expected_sighash);
+        let bundle = tx.ironwood_bundle().unwrap();
+        for nf in &f.intent.input_nullifiers {
+            assert_eq!(
+                bundle
+                    .actions()
+                    .iter()
+                    .filter(|action| action.nullifier().to_bytes() == *nf)
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(
+            u64::try_from(*bundle.value_balance()).unwrap(),
+            f.intent.fee_zat
+        );
         inputs.seeds.swap(0, 1);
         assert!(aggregate_and_apply(&inputs)
             .unwrap_err()

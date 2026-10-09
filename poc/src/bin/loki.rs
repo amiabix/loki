@@ -54,7 +54,7 @@ fn main() {
                    review-sign <state-dir> <member>   review all, then sign\n\
                    finish  <state-dir>   aggregate AC, prove, broadcast\n\
                    post-final <state-dir>   aggregate and prove AC, post it, do NOT broadcast\n\
-                   replicate <state-dir> <replica-dir> [--with-final]   public artifacts only\n\
+                   replicate <state-dir> <replica-dir> [--with-final]   confidential seed handoff\n\
                    finish-second <replica-dir> <work-dir>   finish from a replica + own scan\n\
                    verify-effects <replica-dir> <txid>   check the mined effects\n\
                    tamper  <state-dir> <case>   TEST-ONLY: corrupt candidate AC\n"
@@ -1917,8 +1917,8 @@ fn tamper(args: &[String]) -> Result<(), String> {
 //            the note and anchor by its OWN chain scan, install them after the signature,
 //            prove, extract and broadcast.
 //
-// What the finisher is given is a replica of public artifacts, the kind a relay would
-// carry. What it is NOT given: any approver's key package, nonces, scan output or witness.
+// The finisher receives a confidential local handoff, including saved randomizer seeds.
+// Approver key packages, nonce secrets, scan output and witnesses are withheld.
 // `replicate` is explicit about both halves, and writes a manifest naming what it withheld.
 //
 // None of this is G4. It is one regtest flow on the documented test-only FVK, and it
@@ -2209,14 +2209,14 @@ fn approver_inputs(root: &std::path::Path, shared: &MemberDir) -> Result<Aggrega
             .map(|spend| load_seed_record(shared, "AC", spend))
             .collect::<Result<_, _>>()?,
         candidate: rd("candidate_AC.pczt.hex")?,
-        public_package: MemberDir::open(&root, "alice")
+        public_package: MemberDir::open(root, "alice")
             .read_hex("public_package.hex")
             .map_err(|e| format!("{e}"))?,
         ids: [
-            MemberDir::open(&root, "alice")
+            MemberDir::open(root, "alice")
                 .read_hex("identifier.hex")
                 .map_err(|e| format!("{e}"))?,
-            MemberDir::open(&root, "carol")
+            MemberDir::open(root, "carol")
                 .read_hex("identifier.hex")
                 .map_err(|e| format!("{e}"))?,
         ],
@@ -2975,7 +2975,7 @@ mod selection_tests {
         let mut alphas = Vec::new();
         let mut seeds = Vec::new();
         let mut records = Vec::new();
-        for spend in 0..2 {
+        for (spend, note) in notes.iter().enumerate() {
             let mut n = BTreeMap::new();
             let mut c = BTreeMap::new();
             for id in ids {
@@ -2996,7 +2996,7 @@ mod selection_tests {
                     proposal_id,
                     "AC",
                     spend,
-                    notes[spend].nullifier(&fvk).to_bytes(),
+                    note.nullifier(&fvk).to_bytes(),
                     &c,
                     &seed,
                 )
