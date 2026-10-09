@@ -89,7 +89,10 @@ mod tests {
             .iter()
             .zip(refreshing)
             .map(|(id, rs)| {
-                (*id, refresh_share(rs, &wallets[id]).expect("fold in the zero share"))
+                (
+                    *id,
+                    refresh_share(rs, &wallets[id]).expect("fold in the zero share"),
+                )
             })
             .collect();
 
@@ -107,14 +110,19 @@ mod tests {
     }
 
     /// Sign `msg` with exactly the first two members of `wallets`, verifying against
-    /// `pubkeys`. Mirrors `c1_1_frost_pallas_signs_under_a_caller_supplied_alpha`.
+    /// `pubkeys`. Mirrors `c1_1_frost_pallas_signs_with_a_saved_randomizer_seed`.
     fn sign_2_of_3(
         wallets: &Wallets,
         pubkeys: &frost::keys::PublicKeyPackage,
         msg: &[u8],
     ) -> Result<(), frost::Error> {
         sign_with(
-            &wallets.keys().copied().take(2).map(|id| (id, &wallets[&id])).collect::<Vec<_>>(),
+            &wallets
+                .keys()
+                .copied()
+                .take(2)
+                .map(|id| (id, &wallets[&id]))
+                .collect::<Vec<_>>(),
             pubkeys,
             msg,
         )
@@ -128,10 +136,6 @@ mod tests {
         msg: &[u8],
     ) -> Result<(), frost::Error> {
         let mut rng = rand_core::OsRng;
-        let alpha =
-            frost_rerandomized::Randomizer::<frost::PallasBlake2b512>::deserialize(&[7u8; 32])
-                .expect("a canonical scalar");
-
         let mut nonces = BTreeMap::new();
         let mut commitments = BTreeMap::new();
         for (id, kp) in signers {
@@ -140,17 +144,20 @@ mod tests {
             commitments.insert(*id, c);
         }
 
+        let (params, seed) = frost_rerandomized::RandomizedParams::new_from_commitments(
+            pubkeys.verifying_key(),
+            &commitments,
+            rand_core::OsRng,
+        )?;
         let pkg = frost::SigningPackage::new(commitments, msg);
 
         let mut sigshares = BTreeMap::new();
         for (id, kp) in signers {
-            #[allow(deprecated)] // the seed path cannot be used: alpha is fixed by the tx
-            let share = frost_rerandomized::sign(&pkg, &nonces[id], kp, alpha)?;
+            let share =
+                frost_rerandomized::sign_with_randomizer_seed(&pkg, &nonces[id], kp, &seed)?;
             sigshares.insert(*id, share);
         }
 
-        let params =
-            frost_rerandomized::RandomizedParams::from_randomizer(pubkeys.verifying_key(), alpha);
         let sig = frost_rerandomized::aggregate(&pkg, &sigshares, pubkeys, &params)?;
 
         params.randomized_verifying_key().verify(msg, &sig)
@@ -221,7 +228,12 @@ mod tests {
 
         // Aggregation checks each signature share against the refreshed verifying share,
         // so the stale one is caught by name rather than producing a bad signature.
-        assert_eq!(err, frost::Error::InvalidSignatureShare { culprits: vec![ids[0]] });
+        assert_eq!(
+            err,
+            frost::Error::InvalidSignatureShare {
+                culprits: vec![ids[0]]
+            }
+        );
     }
 
     /// And the converse, so the test above is not passing for an unrelated reason: the

@@ -3,8 +3,8 @@
 #
 # Alice proposes. Alice and Carol review and sign. Both approver processes then END, and
 # their state is MOVED ASIDE so nothing can reach it. Bob starts in a directory that has
-# never held an approver file and finishes from a replica of public artifacts plus his own
-# chain scan.
+# never held an approver file and finishes from a confidential replica of approved
+# artifacts plus his own chain scan.
 #
 # The original two one-note payments plus two payments that require two notes:
 #   payment 1, path A   a final transaction was already produced and posted. Bob checks it
@@ -22,7 +22,7 @@ set -uo pipefail
 unset LOKI_ROUND
 cd "$(dirname "$0")"
 
-RUN_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/loki-2dev.XXXXXX") || exit 1
+RUN_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/loki-issue3-2dev.XXXXXX") || exit 1
 STATE="${LOKI_STATE:-$RUN_ROOT/state}"
 BOB="${BOB_STATE:-$RUN_ROOT/bob}"
 ATTIC="${ATTIC:-$RUN_ROOT/attic}"
@@ -31,7 +31,7 @@ export LOKI_THS_INSTANCE="${LOKI_THS_INSTANCE:-loki}"
 LOKI_RPC=$(python3 ths.py address) || exit 1
 export LOKI_RPC
 for path in "$STATE" "$BOB" "$ATTIC"; do
-  if [ -e "$path" ]; then echo "refusing existing state path: $path" >&2; exit 1; fi
+  if [ -e "$path" ] || [ -L "$path" ]; then echo "refusing existing state path: $path" >&2; exit 1; fi
 done
 python3 - "$STATE" "$BOB" "$ATTIC" <<'CHECK_PATHS' || exit 1
 from pathlib import Path
@@ -65,6 +65,68 @@ VAULT=$(loki address "$STATE") || exit 1
 python3 ths.py fund "$VAULT" 2 || exit 1
 loki scan "$STATE" | tail -4 || exit 1
 [ -s "$STATE/public/funded_note_alt.txt" ] || { echo "need two vault notes"; exit 1; }
+
+FAILS=0
+# Refused, AND for the stated reason, AND without any node call. `sendrawtransaction` in
+# the output means the bytes reached a node, which for a local validation failure is itself
+# the bug.
+check_local() {
+  local label=$1 want=$2; shift 2
+  local out; out=$("$@" 2>&1); local rc=$?
+  if [ $rc -eq 0 ]; then
+    echo "   $label  NOT REFUSED (rc=0)"; FAILS=$((FAILS+1))
+  elif printf '%s' "$out" | grep -q 'sendrawtransaction'; then
+    echo "   $label  refused, but only by the NODE: $(printf '%s' "$out" | tail -1 | cut -c1-64)"
+    FAILS=$((FAILS+1))
+  elif ! printf '%s' "$out" | grep -qF "$want"; then
+    echo "   $label  refused for the WRONG reason"
+    echo "                                          wanted: $want"
+    echo "                                          got:    $(printf '%s' "$out" | tail -1 | cut -c1-72)"
+    FAILS=$((FAILS+1))
+  else
+    echo "   $label  refused locally: $(printf '%s' "$out" | tail -1 | cut -c1-72)"
+  fi
+}
+
+
+session_snapshot() {
+  python3 - "$1" "$2" "$3" <<'PY_SESSION'
+import hashlib, json, pathlib, sys
+root, output = map(pathlib.Path, sys.argv[1:3])
+spends = int(sys.argv[3])
+files = sorted(root.glob('candidate_*.pczt.hex')) + sorted(root.glob('randomizer_seed_*.hex'))
+assert len(files) == 3 + 3 * spends, 'missing candidate or per-spend seed record'
+manifest = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in files}
+output.write_text(json.dumps(manifest, sort_keys=True))
+PY_SESSION
+}
+
+seeds_fresh_and_private() {
+  python3 - "$1" "$2" "$3" "$4" <<'PY_PRIVATE'
+import hashlib, json, pathlib, stat, sys
+root, history = map(pathlib.Path, sys.argv[1:3])
+expected = int(sys.argv[3])
+assert stat.S_IMODE(root.stat().st_mode) == 0o700, 'handoff directory must be 0700'
+files = sorted(root.glob('randomizer_seed_*.hex'))
+assert len(files) == expected, 'wrong number of replica seed records'
+source = pathlib.Path(sys.argv[4])
+for path in files:
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600, 'seed record must be 0600'
+    assert path.read_bytes() == (source / path.name).read_bytes(), 'replica changed saved seed bytes'
+assert (root / 'candidate_AC.pczt.hex').read_bytes() == (source / 'candidate_AC.pczt.hex').read_bytes(), 'replica changed candidate bytes'
+files = sorted(source.glob('randomizer_seed_*.hex'))
+assert len(files) == 3 * expected, 'wrong number of source seed records'
+seen = set(history.read_text().splitlines()) if history.exists() else set()
+current = []
+for path in files:
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600, 'seed record must be 0600'
+    digest = hashlib.sha256(bytes.fromhex(json.loads(path.read_text())['seed'])).hexdigest()
+    assert digest not in seen and digest not in current, 'seed reused across spends or sessions'
+    current.append(digest)
+with history.open('a') as output:
+    output.write(''.join(digest + '\n' for digest in current))
+PY_PRIVATE
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 run_payment() {
@@ -100,11 +162,26 @@ run_payment() {
     echo "   STAGE FAILED: expected $SPENDS input notes, proposal selected $ACTUAL"; return 1;
   }
 
+  local SAVED="$RUN_ROOT/session_$ROUND.json" RELOADED="$RUN_ROOT/reloaded_$ROUND.json"
+  session_snapshot "$PUB" "$SAVED" "$SPENDS" || return 1
+  local REPROPOSE RC
+  REPROPOSE=$(env LOKI_ROUND="$ROUND" cargo run --quiet --bin loki -- propose "$STATE" 2>&1); RC=$?
+  if [ "$RC" -eq 0 ] || ! printf '%s' "$REPROPOSE" | grep -qF 'saved signing session exists'; then
+    echo '   STAGE FAILED: ordinary reproposal did not refuse the saved session'
+    printf '%s\n' "$REPROPOSE" | tail -2
+    return 1
+  fi
+  session_snapshot "$PUB" "$RELOADED" "$SPENDS" || return 1
+  cmp -s "$SAVED" "$RELOADED" || { echo 'reproposal changed saved candidates/seeds'; return 1; }
+
   echo "-- Alice and Carol review and sign, as separate processes"
   for M in alice carol; do
     step "review-sign $M" env LOKI_ROUND="$ROUND" \
       cargo run --quiet --bin loki -- review-sign "$STATE" "$M" || return 1
+    session_snapshot "$PUB" "$RELOADED" "$SPENDS" || return 1
+    cmp -s "$SAVED" "$RELOADED" || { echo 'signing restart changed saved candidates/seeds'; return 1; }
   done
+  echo '   candidate and seed bytes survived refusal and both signing process restarts'
 
   if [ "$WITH_FINAL" = yes ]; then
     echo "-- Alice produces the final transaction and POSTS it, without broadcasting"
@@ -112,7 +189,7 @@ run_payment() {
       cargo run --quiet --bin loki -- post-final "$STATE" || return 1
   fi
 
-  echo "-- replicate the public artifacts Bob is allowed to have"
+  echo "-- replicate approved artifacts and confidential saved seeds for Bob"
   if [ "$WITH_FINAL" = yes ]; then
     step "replicate" env LOKI_ROUND="$ROUND" \
       cargo run --quiet --bin loki -- replicate "$STATE" "$REPLICA" --with-final || return 1
@@ -120,6 +197,18 @@ run_payment() {
     step "replicate" env LOKI_ROUND="$ROUND" \
       cargo run --quiet --bin loki -- replicate "$STATE" "$REPLICA" || return 1
   fi
+
+  seeds_fresh_and_private "$REPLICA" "$RUN_ROOT/seen_seeds.txt" "$SPENDS" "$PUB" || return 1
+  local BAD="$BOB/replica_seed_bad_$ROUND" SEED='randomizer_seed_AC.hex' ABSEED='randomizer_seed_AB.hex'
+  if [ "$SPENDS" -gt 1 ]; then SEED='randomizer_seed_AC_1.hex'; ABSEED='randomizer_seed_AB_1.hex'; fi
+  cp -R "$REPLICA" "$BAD"
+  rm "$BAD/$SEED"
+  check_local "path $PATHNAME ($SPENDS inputs), missing saved seed" 'missing randomizer seed record' \
+    cargo run --quiet --bin loki -- finish-second "$BAD" "$BOB/work_seed_missing_$ROUND"
+  cp "$PUB/$ABSEED" "$BAD/$SEED"
+  check_local "path $PATHNAME ($SPENDS inputs), swapped pair seed" 'randomizer seed pair mismatch' \
+    cargo run --quiet --bin loki -- finish-second "$BAD" "$BOB/work_seed_swapped_$ROUND"
+  rm -rf "$BAD"
 
   echo "-- both approver apps close, and their state is MOVED OUT OF REACH"
   mkdir -p "$ATTIC"
@@ -170,27 +259,6 @@ run_payment p4 "" A yes 2 110000000 || exit 1
 
 echo
 echo "== failure cases, asserted rather than asserted-about =="
-FAILS=0
-# Refused, AND for the stated reason, AND without any node call. `sendrawtransaction` in
-# the output means the bytes reached a node, which for a local validation failure is itself
-# the bug.
-check_local() {
-  local label=$1 want=$2; shift 2
-  local out; out=$("$@" 2>&1); local rc=$?
-  if [ $rc -eq 0 ]; then
-    echo "   $label  NOT REFUSED (rc=0)"; FAILS=$((FAILS+1))
-  elif printf '%s' "$out" | grep -q 'sendrawtransaction'; then
-    echo "   $label  refused, but only by the NODE: $(printf '%s' "$out" | tail -1 | cut -c1-64)"
-    FAILS=$((FAILS+1))
-  elif ! printf '%s' "$out" | grep -qF "$want"; then
-    echo "   $label  refused for the WRONG reason"
-    echo "                                          wanted: $want"
-    echo "                                          got:    $(printf '%s' "$out" | tail -1 | cut -c1-72)"
-    FAILS=$((FAILS+1))
-  else
-    echo "   $label  refused locally: $(printf '%s' "$out" | tail -1 | cut -c1-72)"
-  fi
-}
 
 check_fails() {
   local label=$1; shift

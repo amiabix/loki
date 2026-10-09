@@ -4,7 +4,31 @@
 > original run. Current local-chain setup uses THS; see [harness/README.md](harness/README.md)
 > for current local-chain instructions.
 
-## Both paths mined and verified. This is not full G1, not G3, and not custody readiness.
+## docs(finisher): current confidential seed handoff
+
+The 9 October refactor copies one saved randomizer seed record for every real spend
+in the selected AC candidate, alongside its commitments, shares and proposal metadata.
+These are versioned JSON records named `randomizer_seed_AC.hex`,
+`randomizer_seed_AC_1.hex`, etc. They bind the proposal ID, pair, spend index, input
+nullifier and exact serialized commitments. Seeds require confidential handoff; on
+Unix the local replica directory is 0700 and seed records are 0600. The prototype
+implements no encrypted or authenticated relay. Approver key packages, nonce secrets
+and scan state remain withheld.
+
+Both path A (posted final bytes) and path B (re-proving) load the saved records,
+reconstruct parameters with `regenerate_from_seed_and_commitments`, check canonical
+α/`rk` against the known vault key, and aggregate locally before the finisher's own
+chain scan. A populated replica destination is refused without changing its saved
+bytes. Missing, changed or swapped records fail locally before broadcast. Real
+spends are located by intent nullifier, independent of shuffled action order.
+
+All-pair AB/AC/BC two-input fixtures aggregate, prove and extract after approver
+files are deleted, verifying both nullifiers and the extracted sighash. Live THS AC
+validation mined both paths with one and two inputs; commands and outcomes are
+recorded in [FROST-RANDOMIZER-RESULTS.md](FROST-RANDOMIZER-RESULTS.md). The txids and
+transcripts below are historical, not evidence of a new seed-flow live run.
+
+## Historical 3 October: both paths mined and verified
 
 Date 2026-10-03. Regtest, NU6.3 (Ironwood). One 2-of-3 FROST vault, two payments, two
 finishing paths, one finisher that holds none of the approvers' files.
@@ -18,9 +42,11 @@ p2  path B  txid 5621135c5fd82699fa2a797627e9b7be1b2712c64d9c1bd780873d0062a57d1
 
 The vault FVK is a documented splice of the DKG group `ak` into `ak || nk || rivk`
 (`src/vault.rs::test_only_fvk`). It is **not** the ZIP 2005 `qsk → qk → rivk_ext`
-derivation, which is implemented in no crate (`DEPENDENCIES.md` finding B1, and the ZIP is
-`Status: Proposed`). The finisher prints this at the point of use, every run, before it does
-anything:
+derivation. At the historical checkpoint this was an upstream API blocker
+(`DEPENDENCIES.md` finding B1). Current separate-member setup preserves experimental
+ZIP 2005 derivation, an independent vector and a backup gate from main (`3f66967`),
+but no payment from that derived FVK has been established. The legacy finisher prints
+its test-only construction at the point of use:
 
 ```
 second device: vault FVK rebuilt from the replicated group ak
@@ -74,10 +100,11 @@ loki verify-effects /tmp/loki-2dev-bob/replica_p1 <txid>
 Payment 2 is identical except `LOKI_ROUND=p2`, `funded_note_alt.txt`, no `post-final`, and
 `replicate` without `--with-final`.
 
-## What the finisher is given, and what it is not
+## Historical replica contents
 
-`replicate` writes only public, relay-carried artifacts, and writes a manifest naming what
-it withheld. The replica for path B, verbatim from the run:
+The historical replica omitted seed records and included the following artifacts.
+The current replica additionally carries confidential seeds as described above and
+names withheld files in its manifest. Historical path B contents, verbatim:
 
 ```
 candidate_AC.pczt.hex    commitment_AC_alice.hex   commitment_AC_carol.hex
@@ -148,8 +175,9 @@ path A  it spends the nullifier the intent names
 path A  broadcast: "a5f79ca7a3f41efd33dde6336bb07219251a35bfa0b2aa03042f1cf8bf9dc3d1"
 ```
 
-The finisher does not broadcast blindly. It parses the posted bytes, reads the Ironwood
-bundle, and requires an action whose nullifier is the one the intent names. Two failure
+The historical finisher did not broadcast blindly. Current path A also validates the
+saved seeds and aggregates the candidate locally before its own scan and posted-byte
+checks. It parses the posted bytes, reads the Ironwood bundle, and requires an action whose nullifier is the one the intent names. Two failure
 cases below show that check firing.
 
 ## Path B: re-prove the signed candidate, no final transaction posted
@@ -168,11 +196,11 @@ path B  extracted v6 transaction 5621135c… (9166 bytes)
 path B  broadcast: "5621135c5fd82699fa2a797627e9b7be1b2712c64d9c1bd780873d0062a57d1d"
 ```
 
-It computes the effects sighash from the candidate bytes itself, recomputes α from the
-proposal id and the published commitments rather than accepting one, verifies the
-aggregated signature under `ak + [α]G` before any node sees it, and only then installs the
-anchor and witness from its own scan. The sighash is re-checked after installation and is
-byte-identical, which is the claim the whole deferred-anchor path rests on.
+The historical path computed its own effects sighash and derived α from the proposal
+and published commitments. The current path reconstructs α from the saved library seed
+and exact commitments, verifies the aggregated signature under `ak + [α]G` before
+its own scan or any node broadcast, and then installs the anchor and witnesses. The
+sighash is re-checked after installation and is byte-identical, which is the claim the whole deferred-anchor path rests on.
 
 ## Effects verified against the chain
 
@@ -193,7 +221,7 @@ The memo is compared over the whole 512-byte field: the prefix must equal the ap
 and every remaining byte must be zero, so a trailing payload cannot hide in the padding.
 Any output to an address the intent does not name is a hard failure, not a warning.
 
-## 8 October extension awaiting a live regtest run
+## Historical 8 October multi-input extension
 
 The CLI now carries per-spend commitments and shares through `replicate`, aggregates and
 witnesses every input in `post-final` and `finish-second`, and compares every action's
@@ -207,7 +235,7 @@ historical transaction results above remain single-note chain evidence. The
 `scan` stage now uses the same spent-note filter as the second-device scanner, so the
 new rounds cannot reselect the already mined inputs.
 
-## Failure cases
+## Historical failure cases
 
 All five are asserted, and three of them assert **which layer refused**. A local validation
 failure that only the node caught would mean the finisher shipped unchecked bytes, so
@@ -239,17 +267,21 @@ codes; four stages failed in sequence and the script carried on. Stages now run 
 
 ## What this does NOT establish
 
-- **Not full G1.** The test-only FVK stands in for ZIP 2005 derivation, which exists
-  nowhere. **G1 BLOCKED (ZIP 2005)** is unchanged.
+- **Not full G1.** Historical payments and the current legacy transaction CLI use the
+  test-only FVK. Separate-member experimental ZIP 2005 setup and its backup gate are
+  preserved, but review/upstream support and a mined payment from its derived FVK
+  remain unestablished.
 - **Not G3.** Member state is plain files with no rollback or crash guarantee; a nonce is
-  deleted after use, which is not a crash-safe consumed-nonce ledger. `g3/G3-RESULTS.md`
-  is where that is measured and it is PARTIAL.
+  deleted after use, which is not a crash-safe consumed-nonce ledger. Batch validation
+  and share computation do not make share writes and nonce deletion atomic.
+  `g3/G3-RESULTS.md` is where that is measured and it is PARTIAL.
 - **Not a real second device.** It is a second *process* with a separate directory on the
-  same machine, reading a replica built by a local `cp`. There is no relay, no transport,
-  no authentication of the replicated records, and no second piece of hardware.
+  same machine, reading a local replica. Current seeds require confidential handoff
+  through protected local files; no encrypted or authenticated relay and no second
+  piece of hardware are implemented.
 - **The replica is trusted for authenticity.** `replicate` copies files; nothing signs the
   proposal, the commitments or the shares in transit. The finisher does verify everything
-  cryptographically after reading it (α recomputed, signature checked under `ak + [α]G`,
+  cryptographically after reading it (saved-seed α reconstructed, signature checked under `ak + [α]G`,
   posted transaction checked against the intent), so a corrupted replica cannot produce a
   wrong payment, but a *substituted* intent would be finished faithfully. Binding the
   replica to an authenticated group record, so a substituted proposal could be detected,
@@ -264,12 +296,16 @@ codes; four stages failed in sequence and the script carried on. Stages now run 
 - **Chain scan cost is not addressed.** The finisher rescans every block from genesis on
   every run, and rebuilds the whole commitment tree. Correct on a 40-block regtest chain and
   useless on mainnet; a real finisher needs an incremental tree.
-- **One note per payment, one input, one recipient.** No multi-input spends, no multiple
-  recipients, no Orchard pool, no transparent pool.
+- **Historical live evidence is single-input.** Current code and offline fixtures
+  support multiple inputs; updated live evidence is recorded separately. There is one
+  recipient, no Orchard pool and no transparent pool.
+- **No security proof or expanded audit.** Recommended library seeds remove the
+  custom derivation assumption. They do not prove coordinator RNG use, repair nonce
+  reuse/rollback or extend NCC's published audit to rerandomized FROST.
 - **No custody readiness.** Two regtest payments on a documented test-only key prove a code
   path works. They say nothing about operational safety.
 
-## Files changed
+## Historical files changed
 
 ```
 src/scan.rs            scan_chain, chain_anchor, try_decrypt_with_memo, vault_ivks;
