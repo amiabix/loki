@@ -771,3 +771,24 @@ fn randomizer_replica_refuses_nonempty_destination_without_changing_any_bytes() 
         .collect();
     assert_eq!(after, saved);
 }
+
+#[test]
+fn randomizer_loaders_refuse_surplus_seed_records_without_partial_shares() {
+    let f = Fixture::new();
+    let shared = f.shared();
+    let saved = fs::read(shared.path().join(seed_file("AC", 1))).unwrap();
+    fs::write(shared.path().join(seed_file("AC", 2)), &saved).unwrap();
+    f.assert_alice_refuses("unexpected randomizer seed record count");
+    fs::remove_file(shared.path().join(seed_file("AC", 2))).unwrap();
+    f.sign_all();
+    let out = f.root.join("replica");
+    replicate(&[f.arg(), out.to_str().unwrap().into()]).unwrap();
+    fs::write(out.join(seed_file("AC", 2)), saved).unwrap();
+    let error = replica_inputs(&MemberDir::open(&f.root, "replica"))
+        .err()
+        .unwrap();
+    assert!(
+        error.contains("unexpected randomizer seed record count"),
+        "{error}"
+    );
+}

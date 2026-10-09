@@ -677,6 +677,26 @@ fn write_seed_record(
         .map_err(|e| e.to_string())
 }
 
+fn check_seed_record_count(shared: &MemberDir, pair: &str, spends: usize) -> Result<(), String> {
+    let expected: Vec<_> = (0..spends).map(|i| seed_file(pair, i)).collect();
+    for entry in std::fs::read_dir(shared.path()).map_err(|e| e.to_string())? {
+        let name = entry
+            .map_err(|e| e.to_string())?
+            .file_name()
+            .to_string_lossy()
+            .into_owned();
+        if (name == seed_file(pair, 0) || name.starts_with(&format!("randomizer_seed_{pair}_")))
+            && !expected.contains(&name)
+        {
+            return Err(format!(
+                "REFUSED: unexpected randomizer seed record count for {pair}: {name}"
+            ));
+        }
+    }
+    // Missing expected records retain the descriptive missing-record refusal when loaded.
+    Ok(())
+}
+
 fn load_seed_record(
     shared: &MemberDir,
     pair: &str,
@@ -1268,6 +1288,7 @@ fn review_sign(args: &[String]) -> Result<(), String> {
         if slot != x && slot != y {
             continue;
         }
+        check_seed_record_count(&shared, name, want_nfs.len())?;
 
         let bytes = shared
             .read_hex(&format!("candidate_{name}.pczt.hex"))
@@ -2160,6 +2181,7 @@ fn replica_inputs(r: &MemberDir) -> Result<AggregateInputs, String> {
     let intent_kv = kv(&r.read_text("intent.txt").map_err(|e| format!("{e}"))?);
     let rd = |f: &str| r.read_hex(f).map_err(|e| format!("{f}: {e}"));
     let want_nfs = intent_nullifiers(&intent_kv)?;
+    check_seed_record_count(r, "AC", want_nfs.len())?;
     let mut commitments = Vec::new();
     let mut shares = Vec::new();
     for spend in 0..want_nfs.len() {
@@ -2197,6 +2219,7 @@ fn replica_inputs(r: &MemberDir) -> Result<AggregateInputs, String> {
 fn approver_inputs(root: &std::path::Path, shared: &MemberDir) -> Result<AggregateInputs, String> {
     let intent_kv = kv(&shared.read_text("intent.txt").map_err(|e| format!("{e}"))?);
     let want_nfs = intent_nullifiers(&intent_kv)?;
+    check_seed_record_count(shared, "AC", want_nfs.len())?;
     let rd = |f: &str| shared.read_hex(f).map_err(|e| format!("{f}: {e}"));
     Ok(AggregateInputs {
         pair: "AC".into(),
@@ -2318,6 +2341,7 @@ fn replicate(args: &[String]) -> Result<(), String> {
     let shared = MemberDir::open(&root, &shared_name());
     let intent_kv = kv(&shared.read_text("intent.txt").map_err(|e| format!("{e}"))?);
     let spend_count = intent_nullifiers(&intent_kv)?.len();
+    check_seed_record_count(&shared, "AC", spend_count)?;
 
     let replica = MemberDir::create(
         out.parent().unwrap_or(&out),
