@@ -16,6 +16,7 @@ result documents, which are the authority.
 | **Full G1** | **BLOCKED** on ZIP 2005 key derivation. `qsk → qk → rivk_ext` is implemented in no crate and the ZIP is `Status: Proposed`. The account key here is a documented **test-only** splice |
 | **G3** (browser nonce safety) | **PARTIAL** and separate. 29/32 drills on Chromium, 6/8 on WebKit, Firefox would not launch, no physical device case tested |
 | **Second-device finishing** | demonstrated: a party holding none of the approvers' files completed two payments, one from posted bytes and one by re-proving |
+| **Separate-member setup** | three isolated processes complete DKG with encrypted peer shares and matching certificates on one machine; regtest-only, not yet connected to payments ([details](poc/SEPARATE-MEMBER-SETUP.md)) |
 | **Recovery, key rotation, custody** | **not established.** No drill, no review |
 
 ## Quick start
@@ -91,7 +92,7 @@ only the fee wrong will not build. See `RESULTS.md`.
 ## Honest limits
 
 - The account key is a **test-only** `ak || nk || rivk` splice, not ZIP 2005 derivation.
-- Regtest only, one machine, one note per payment, one recipient.
+- Regtest only, one machine, one mined note per payment and one recipient. A two-note candidate signs, proves and extracts offline, but has not been mined in the current run.
 - Member state is plain files with no rollback guarantee. A nonce is deleted after use,
   which is not a crash-safe consumed-nonce ledger.
 - The "second device" is a second process on the same machine reading a locally copied

@@ -15,6 +15,9 @@ loki-state/
 */state/alice/
 */state/bob/
 */state/carol/
+# Separate-member setup stores and operator passphrase files.
+**/secrets/
+*.passphrase
 
 # The zebrad binary is 87MB and is built from a pinned upstream commit.
 # See poc/harness/README.md for the exact clone + build commands.

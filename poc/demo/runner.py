@@ -96,11 +96,15 @@ filter = "warn"
 
 def loki_bin() -> Path | None:
     """The built CLI. Not rebuilt here: a web request should not trigger a compile."""
-    for p in (
-        Path(os.environ.get("CARGO_TARGET_DIR", "/tmp/loki")) / "debug" / "loki",
+    target = os.environ.get("CARGO_TARGET_DIR")
+    candidates = [
         POC / "target" / "debug" / "loki",
         POC / "target" / "release" / "loki",
-    ):
+        Path("/tmp/loki/debug/loki"),  # older harness builds
+    ]
+    if target:
+        candidates.insert(0, Path(target) / "debug" / "loki")
+    for p in candidates:
         if p.exists() and os.access(p, os.X_OK):
             return p
     return None

@@ -12,11 +12,11 @@ It is a demo of a 2-of-3 Ironwood FROST transaction, **not a usable custody wall
 
 ```
 cd poc && cargo build          # once: the UI runs this binary, it will not compile for you
-python3 poc/demo/server.py     # → http://127.0.0.1:8787
+python3 demo/server.py         # → http://127.0.0.1:8787
 ```
 
 No dependencies beyond the Python standard library. If port 8787 is taken the server says
-so and exits; pass another: `python3 poc/demo/server.py 8788`.
+so and exits; pass another: `python3 demo/server.py 8788`.
 
 ## Using it
 
@@ -60,6 +60,7 @@ than on the field under test.
 A request names a step from a fixed table and, for tamper, a case from a fixed set. It never
 supplies a path, a flag, or an argument. `{"step":"rm -rf /"}` returns
 `unknown step 'rm -rf /'`.
+`POST /api/run` also requires JSON and rejects a browser Origin outside this loopback server.
 
 **Delete the sandbox** from the page, or `rm -rf poc/demo/.sandbox`. The reset refuses to
 delete anything whose resolved path is not exactly that directory.
@@ -109,21 +110,9 @@ that stage recorded rather than playing it out.
 
 ## Why the UI does not call the shell scripts
 
-The runner reimplements the sequence rather than invoking `run-regtest.sh` or
-`run-second-device.sh`, because those scripts are fine in a terminal and not fine behind a
-web request. Four reasons, all still true of the scripts:
-
-| hazard | where |
-|---|---|
-| `pkill -f 'zebrad -c harness'` matches on a command line, so it kills any `zebrad` on the machine, including one unrelated to this prototype | `run-regtest.sh:25`, `run-second-device.sh:58` |
-| `rm -rf "$STATE"` where `$STATE` comes from the `LOKI_STATE` environment variable, so the path to delete is caller supplied | `run-regtest.sh:27`, `run-second-device.sh:60` |
-| the scripts rewrite the tracked file `harness/zebrad-regtest.toml` in place to inject a mining address | `run-regtest.sh:36-39`, `run-second-device.sh:67-69` |
-| `run-regtest.sh` does not check that port 18232 is free before starting a node on it (`run-second-device.sh` does) | `run-second-device.sh:52` |
-
-`runner.py` does each of those things instead: its own sandbox directory, its own generated
-config, its own port with a pre-flight check, a held process object rather than a pattern
-kill, guaranteed teardown, and a single-run lock. The shell scripts are unchanged and remain
-the way to run the full flow, including the second-device paths the UI does not cover.
+The runner owns its sequence so the web request can show each stage and stop its own node.
+Both shell scripts now create isolated scratch directories, check the ports and stop only the
+node process they started. `run-second-device.sh` covers paths that the UI does not.
 
 ## Files
 
@@ -150,4 +139,5 @@ existing script behaves exactly as before.
 ```
 curl -s localhost:8787/api/evidence | python3 -m json.tool | head -40
 curl -s -o /dev/null -w '%{http_code}\n' 'localhost:8787/../RESULTS.md'   # 404
+python3 -B demo/test_runner.py
 ```

@@ -17,6 +17,7 @@
 //! isolated patch to vendored orchard; see vendor/README.md.
 
 pub mod candidate;
+pub mod distributed_setup;
 #[cfg(test)]
 mod nonce_binding;
 #[cfg(test)]
@@ -26,6 +27,7 @@ pub mod refresh;
 pub mod rpc;
 pub mod scan;
 pub mod scanstate;
+pub mod setup_transport;
 pub mod state;
 pub mod vault;
 pub mod verify;
@@ -236,4 +238,3 @@ mod checkpoint_1 {
         fn _confirmed<P>(_: Option<DeferredPcztBuilder<P>>, _: Option<Pczt>) {}
     }
 }
-

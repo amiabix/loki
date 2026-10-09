@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Local demo server for the Loki research POC.
 
-Read-only, loopback-only, and deliberately narrow. It exposes three things:
+Loopback-only and deliberately narrow. It exposes:
 
   GET  /                 the account UI: run the POC stages against a sandboxed chain
   GET  /notes            the written walkthrough of the recorded run
@@ -313,6 +313,12 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path != "/api/run":
             return self._json(404, {"error": "not found"})
+        origin = self.headers.get("Origin")
+        allowed = {f"http://{host}:{self.server.server_port}" for host in ("127.0.0.1", "localhost")}
+        if origin and origin not in allowed:
+            return self._json(403, {"error": "foreign origin"})
+        if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+            return self._json(415, {"error": "JSON required"})
         try:
             n = int(self.headers.get("Content-Length") or 0)
             body = json.loads(self.rfile.read(min(n, 4096)) or b"{}")

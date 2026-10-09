@@ -6,7 +6,9 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
-STATE="${LOKI_STATE:-/tmp/loki-state}"
+WORK_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/loki-regtest.XXXXXX")
+STATE="$WORK_ROOT/state"
+CONF="$WORK_ROOT/zebrad.toml"
 RPC="http://127.0.0.1:18232/"
 CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/loki}"
 export CARGO_TARGET_DIR
@@ -21,24 +23,28 @@ loki() { cargo run --quiet --bin loki -- "$@"; }
 cleanup() { [ -n "${ZPID:-}" ] && kill "$ZPID" 2>/dev/null || true; }
 trap cleanup EXIT
 
-echo "== 0. clean state =="
-pkill -f 'zebrad -c harness' 2>/dev/null || true
-sleep 2
-rm -rf "$STATE"
+if lsof -nP -iTCP:18232 -sTCP:LISTEN >/dev/null 2>&1 ||
+   lsof -nP -iTCP:18243 -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "regtest port 18232 or 18243 is already in use; stop the other node first" >&2
+  exit 1
+fi
+
+echo "== 0. fresh isolated state: $WORK_ROOT =="
 
 echo "== 1. DKG: a 2-of-3 vault =="
 loki setup "$STATE"
 VAULT=$(loki address "$STATE")
 
 echo "== 2. start regtest, mining to the vault =="
-python3 - "$VAULT" <<'PY'
+python3 - "$VAULT" "$CONF" <<'PY'
 import io, re, sys
 p = 'harness/zebrad-regtest.toml'
 s = io.open(p).read()
 s = re.sub(r"miner_address = '[^']*'", "miner_address = '%s'" % sys.argv[1], s)
-io.open(p, 'w').write(s)
+s = s.replace('network = "Regtest"', 'network = "Regtest"\nlisten_addr = "127.0.0.1:18243"')
+io.open(sys.argv[2], 'w').write(s)
 PY
-harness/zebrad -c harness/zebrad-regtest.toml start > /tmp/zebrad.log 2>&1 &
+harness/zebrad -c "$CONF" start > "$WORK_ROOT/zebrad.log" 2>&1 &
 ZPID=$!
 
 for _ in $(seq 1 30); do

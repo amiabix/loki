@@ -35,12 +35,17 @@ readiness. This is one regtest flow on one machine.
 cd poc && ./run-second-device.sh
 ```
 
-Exits nonzero if either payment fails to mine, if the mined effects do not match the
-approved intent, or if any of the five failure cases is not refused. Checks port 18232
-first. Writes approver state under `/tmp/loki-2dev`, the finisher's state under
-`/tmp/loki-2dev-bob`, and the moved-aside approver state under `/tmp/loki-2dev-attic`.
+The current script runs the two historical one-note payments, then two new two-note
+payments (paths B and A). It exits nonzero if any payment fails to mine, if the mined
+effects do not match the approved intent, or if any failure case is not refused. It checks
+ports 18232 and 18243, creates a unique temporary directory, and prints its location.
+The generated Zebra config, chain log, approver state, replica, and results stay there for
+inspection. It stops only the Zebra process it started.
 
-Stage by stage, the commands the script runs:
+The historical run below used fixed `/tmp` paths. The current driver runs the same stages
+under its printed temporary directory and adds the two two-note payments.
+
+Stage by stage, the commands the historical script ran:
 
 ```sh
 loki setup    /tmp/loki-2dev                    # 2-of-3 DKG, three member directories
@@ -168,7 +173,7 @@ byte-identical, which is the claim the whole deferred-anchor path rests on.
 
 `verify-effects` fetches the mined transaction by txid, trial-decrypts its Ironwood actions
 with the vault's own viewing keys in both scopes, and compares every field the intent
-names. Nothing is read from a local artifact.
+names. It also compares the mined effects sighash with the replicated approved candidate.
 
 | | p1, path A | p2, path B |
 |---|---|---|
@@ -182,6 +187,20 @@ names. Nothing is read from a local artifact.
 The memo is compared over the whole 512-byte field: the prefix must equal the approved memo
 and every remaining byte must be zero, so a trailing payload cannot hide in the padding.
 Any output to an address the intent does not name is a hard failure, not a warning.
+
+## 8 October extension awaiting a live regtest run
+
+The CLI now carries per-spend commitments and shares through `replicate`, aggregates and
+witnesses every input in `post-final` and `finish-second`, and compares every action's
+nullifier and the full effects sighash before broadcasting a posted transaction. The mined
+fee is read from the consensus Ironwood value balance. An offline two-note candidate test
+signs and aggregates both spends, rejects a share copied between them, installs both
+witnesses, creates the Halo 2 proof, and extracts a v6 transaction. The extracted bytes
+parse back with the signed effects hash and expected fee. This is local proof and
+extraction; the two-note second-device transaction has **not** yet been mined, so the
+historical transaction results above remain single-note chain evidence. The
+`scan` stage now uses the same spent-note filter as the second-device scanner, so the
+new rounds cannot reselect the already mined inputs.
 
 ## Failure cases
 
@@ -253,5 +272,5 @@ src/scan.rs            scan_chain, chain_anchor, try_decrypt_with_memo, vault_iv
 src/bin/loki.rs        new stages post-final, replicate, finish-second, verify-effects;
                        aggregate_and_apply and prove_and_extract factored out of finish;
                        shared_name() so two payments can run against one vault
-run-second-device.sh   the driver: two payments, two paths, five failure cases
+run-second-device.sh   the driver: four payments, two paths, five failure cases
 ```

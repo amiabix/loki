@@ -27,12 +27,18 @@ Component checks:
 
 ```
 cd poc
-cargo test                                       # 23 tests
+cargo test                                       # 53 tests as of 8 October
 cargo build --features probe-zip2005             # blocker B1, as a compiler error
 (cd vendor/orchard && cargo test --lib loki_b2)  # 3 tests, the B2 patch
 ./tamper-tests.sh                                # 10 adversarial cases, self-contained
 ./run-second-device.sh                           # second-device finishing, both paths
 ```
+
+The single-note mined txid above remains the live evidence. The 8 October multi-note
+extension builds, signs, proves and extracts a two-input candidate in an offline test, and
+extends replication and finishing to carry both spends. A mined multi-note transaction
+and a second-device replay of it are still pending a live regtest run; see
+`SECOND-DEVICE-RESULTS.md` for that distinction.
 
 One-time cost: `zebrad` is built from source (2m26s, see `harness/README.md`). There are
 no proving-parameter downloads — Orchard uses Halo 2, so `ProvingKey::build` is local.

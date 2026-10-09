@@ -24,8 +24,9 @@ enable_cookie_auth = false
 
 [mining]
 # The G1-TX vault's own address, so coinbase funds the vault directly and no
-# transparent spending machinery is needed. Test-only; written by run-regtest.sh.
-miner_address = 'uregtest15chglzvqpkj5d2gly02nus6a62zc66rfyhspru4yaszcklceynamrmvwy022xcpmxurw7repzuzmf2aulzkd3hre56lcjxud6cavmyux'
+# transparent spending machinery is needed. Test-only; the scripts copy this config
+# into their scratch directory and set the actual mining address there.
+miner_address = 'uregtest17uf7q2ezmj2tffzpezcn5vxgfn0p0ktfx99t2u322nv0t0yq84jgwpxtcflez24rw3dmm7afphga02gy6xgep9rt5kf3g5zz7u2syt39'
 miner_memo = 'loki g1-tx coinbase'
 # Regtest has no proof-of-work, so the internal miner produces blocks on demand.
 internal_miner = true
