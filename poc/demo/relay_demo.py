@@ -20,6 +20,7 @@ if str(HARNESS) not in sys.path:
     sys.path.insert(0, str(HARNESS))
 
 import run  # noqa: E402
+from relay_observation import RelayProjection  # noqa: E402
 
 PAYMENT_KINDS = {"sign", "finish", "verify", "resend", "receive"}
 
@@ -162,6 +163,7 @@ class RelayDemo:
         self.cache = {}
         self.stale = {member_id: True for member_id in (1, 2, 3)}
         self.cache_lock = threading.Lock()
+        self.projection = RelayProjection("pending", cache_dir=self.root / "public-cache")
 
     def prepare(self, source) -> None:
         if self.cancel.is_set():
@@ -300,13 +302,24 @@ class RelayDemo:
 
     def restart_relay(self, index: int) -> None:
         """Restart one owned relay on its saved store. This does not start or mine a chain."""
+        relay = self._relay(index)
+        run.restart_relay(self.owner, relay, self.server, time.monotonic() + self.timeout)
+        self.projection.note_lifecycle("relay_standby", relay=index)
+        self._write_children()
+
+    def stop_relay(self, index: int) -> None:
+        """Stop one owned relay process. The chain and the other relays keep running."""
+        relay = self._relay(index)
+        if relay.child is not None:
+            self.owner.stop(relay.child)
+        self.projection.note_lifecycle("relay_stopped", relay=index)
+
+    def _relay(self, index: int):
         if type(index) is not int or index not in (1, 2, 3):
             raise ValueError("relay index must be 1, 2, or 3")
         if self.context is None or self.owner is None:
             raise RuntimeError("relays are not running")
-        relay = self.context.relays[index - 1]
-        run.restart_relay(self.owner, relay, self.server, time.monotonic() + self.timeout)
-        self._write_children()
+        return self.context.relays[index - 1]
 
     def service_snapshot(self, member_id: int, section: str = "logical") -> dict:
         """Ask the owning payment worker for one public page. Never spawn a status command."""

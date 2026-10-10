@@ -28,6 +28,7 @@ sys.path.insert(0, str(POC))
 
 from managed_ths import ManagedTHS, command  # noqa: E402
 import relay_demo  # noqa: E402
+import relay_observation  # noqa: E402
 from relay_demo import RelayDemo  # noqa: E402
 import run  # noqa: E402
 
@@ -405,6 +406,40 @@ class Handler(BaseHTTPRequestHandler):
             if member not in allowed:
                 return self.json(403, {"error": "this member cannot view that relay member"})
             return self.json(200, FLOW.relay.cached_snapshot(member))
+        if path == "/api/relay/state":
+            role = self.role()
+            if not role:
+                return self.json(401, {"error": "open a member link from the coordinator"})
+            return self.json(200, FLOW.relay.projection.state(role))
+        if path == "/api/relay/events":
+            role = self.role()
+            if not role:
+                return self.json(401, {"error": "open a member link from the coordinator"})
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            try:
+                after = int(query.get("after", ["0"])[0])
+                body = FLOW.relay.projection.events(role, after)
+            except (ValueError, relay_observation.Rejected):
+                return self.json(400, {"error": "cursor"})
+            return self.json(200, body)
+        marker = "/api/relay/messages/"
+        if path.startswith(marker) and path.endswith("/objects"):
+            role = self.role()
+            if not role:
+                return self.json(401, {"error": "open a member link from the coordinator"})
+            message = path[len(marker):-len("/objects")]
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            try:
+                after = int(query.get("after", ["0"])[0])
+                limit = int(query.get("limit", ["100"])[0])
+                body = FLOW.relay.projection.objects(role, message, after, limit)
+            except relay_observation.Missing:
+                return self.json(404, {"error": "message"})
+            except relay_observation.Forbidden:
+                return self.json(403, {"error": "this member cannot view that object"})
+            except (ValueError, relay_observation.Rejected):
+                return self.json(400, {"error": "object page"})
+            return self.json(200, body)
         assets = {"/": ("member.html", "text/html; charset=utf-8"),
                   "/member.js": ("member.js", "text/javascript; charset=utf-8"),
                   "/member.css": ("member.css", "text/css; charset=utf-8")}
@@ -438,6 +473,21 @@ class Handler(BaseHTTPRequestHandler):
                 FLOW.finish()
             elif path == "/api/reset" and role == "admin":
                 FLOW.reset()
+            elif path == "/api/relay/restart" and role == "admin":
+                FLOW.relay.restart_relay(body.get("relay"))
+            elif path == "/api/relay/stop" and role == "admin":
+                FLOW.relay.stop_relay(body.get("relay"))
+            elif path == "/api/relay/member" and role == "admin":
+                member = body.get("member")
+                action = body.get("action")
+                if action == "pause":
+                    FLOW.relay.pause_member(member)
+                elif action == "resume":
+                    FLOW.relay.resume_member(member)
+                else:
+                    raise ValueError("action must be pause or resume")
+            elif path == "/api/relay/resend" and role == "admin":
+                FLOW.resend_saved_share(body.get("member"))
             else:
                 return self.json(403, {"error": "this member cannot take that action"})
         except (ValueError, RuntimeError, json.JSONDecodeError) as error:
