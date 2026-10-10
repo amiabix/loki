@@ -370,6 +370,14 @@ class MemberDemoTest(unittest.TestCase):
         self.assertEqual(foreign["code"], 403)
         flow.relay.service_snapshot.assert_not_called()
 
+    def test_an_unbound_member_is_not_sandboxed(self):
+        flow = self.flow()
+        self.assertEqual(flow.wrap_member(1, ["sign"]), ["sign"])
+        flow.member_sandbox[1] = flow.relay.root / "member-1.sb"
+        wrapped = flow.wrap_member(1, ["sign"])
+        self.assertEqual(wrapped[0], "/usr/bin/sandbox-exec")
+        self.assertEqual(wrapped[-1], "sign")
+
     def test_isolated_sandbox_recover_leaves_the_default_instance(self):
         original_root = member_demo.ROOT
         original_run = member_demo.RUN

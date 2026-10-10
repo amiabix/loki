@@ -20,7 +20,7 @@ if str(HARNESS) not in sys.path:
     sys.path.insert(0, str(HARNESS))
 
 import run  # noqa: E402
-from relay_observation import RelayProjection  # noqa: E402
+from relay_observation import Rejected, RelayProjection  # noqa: E402
 
 PAYMENT_KINDS = {"sign", "finish", "verify", "resend", "receive"}
 
@@ -406,6 +406,7 @@ class RelayDemo:
                 worker.responses.put(line)
 
     def _drain(self, fd: int) -> None:
+        pending = b""
         while True:
             try:
                 chunk = os.read(fd, 4096)
@@ -413,6 +414,16 @@ class RelayDemo:
                 break
             if not chunk:
                 break
+            pending += chunk
+            while b"\n" in pending:
+                line, pending = pending.split(b"\n", 1)
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                    self.projection.ingest(event)
+                except (json.JSONDecodeError, Rejected, TypeError, ValueError):
+                    continue
 
     def _mark_stale(self, member_id: int) -> None:
         with self.cache_lock:

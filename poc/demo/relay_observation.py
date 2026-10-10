@@ -88,6 +88,11 @@ class RelayProjection:
         self.fresh_at = None
 
     def ingest(self, event: dict) -> None:
+        if (isinstance(event, dict) and self.run_id == "pending"
+                and _token(str(event.get("run_id", "")))):
+            with self._lock:
+                if self.run_id == "pending" and not self._events:
+                    self.run_id = event["run_id"]
         encoded = self._validate_native(event)
         with self._lock:
             key = (event["producer_id"], event["producer_sequence"])

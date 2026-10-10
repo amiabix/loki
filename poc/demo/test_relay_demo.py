@@ -203,6 +203,40 @@ class RelaySchedulingTests(unittest.TestCase):
         process.stdin.flush()
         self.demo.settle(timeout=3)
 
+    def test_observe_pipe_reaches_the_public_projection(self):
+        script = (
+            "import json, os, sys\n"
+            "fds = {}\n"
+            "args = sys.argv[1:]\n"
+            "index = 0\n"
+            "while index < len(args):\n"
+            "    if args[index] in ('--observe-fd', '--control-fd', '--response-fd'):\n"
+            "        fds[args[index]] = int(args[index + 1])\n"
+            "        index += 2\n"
+            "    else:\n"
+            "        index += 1\n"
+            "event = {'version': 1, 'run_id': 'abc123', 'producer_id': 'member-1',\n"
+            "         'producer_sequence': 1, 'observed_at': '2026-10-11T00:00:00Z',\n"
+            "         'event_type': 'original_authenticated', 'actor_member': 1}\n"
+            "os.write(fds['--observe-fd'], (json.dumps(event) + '\\n').encode())\n"
+            "sys.stdin.readline()\n"
+        )
+        process = self.demo.start_payment(
+            1, [sys.executable, "-u", "-c", script, "sign"], interactive=True)
+        self.addCleanup(lambda: process.kill() if process.poll() is None else None)
+        deadline = time.monotonic() + 2
+        saved = 0
+        while time.monotonic() < deadline:
+            saved = self.demo.projection.state("admin")["saved"]
+            if saved:
+                break
+            time.sleep(0.02)
+        self.assertEqual(saved, 1)
+        self.assertEqual(self.demo.projection.run_id, "abc123")
+        process.stdin.write("\n")
+        process.stdin.flush()
+        self.demo.settle(timeout=3)
+
     def test_snapshot_read_failure_is_stale_and_starts_no_status_command(self):
         script = (
             "import sys\n"

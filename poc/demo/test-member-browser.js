@@ -36,6 +36,19 @@ async function state(page, memberToken) {
     await carol.locator('#links-panel').waitFor({state: 'visible', timeout: 600000});
     const prepared = await state(carol, token);
     assert.equal(prepared.phase, 'waiting_for_reviews');
+    const relay = await carol.request.get(`${base}/api/relay/state`, {
+      headers: {'X-Loki-Token': token},
+    });
+    assert.equal(relay.status(), 200);
+    const network = await relay.json();
+    assert.equal(network.relays['3'].status === 'failed', false);
+    await carol.locator('[data-view="relay"]').click();
+    assert.equal(await carol.locator('#relay-svg .relay-node').count(), 6);
+    assert.match(await carol.locator('#relay-milestones').innerText(), /Transport/);
+    assert.match(await carol.locator('#relay-milestones').innerText(), /Application/);
+    assert.match(await carol.locator('#relay-milestones').innerText(), /Approval/);
+    assert.match(await carol.locator('#relay-milestones').innerText(), /Chain/);
+    await carol.locator('[data-view="overview"]').click();
     assert.equal(prepared.payment.amount_zat, 12_000_000);
     assert.equal(prepared.payment.memo, 'browser workflow check');
     const links = await carol.locator('#member-links a').evaluateAll(anchors => anchors.map(a => a.href));

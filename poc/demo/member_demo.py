@@ -63,6 +63,7 @@ class Flow:
         self.substage = None
         self.relay = self._new_relay()
         self.leases = self.relay.leases
+        self.member_sandbox = {}
         self.tokens = {role: secrets.token_urlsafe(32) for role in ("admin", "alice", "bob")}
 
     def role(self, token: str) -> str | None:
@@ -172,9 +173,10 @@ class Flow:
     def _start_signers(self, transport: str = "relay") -> None:
         for name, number in (("alice", 1), ("bob", 2)):
             owner = RUN / "source" / f"member-{number}"
-            args = [str(binary("loki_member_payment")), "sign", str(owner),
-                    str(owner / "pass.txt"), str(RUN / "source" / "roster.json"),
-                    str(RUN / "payment"), "--transport", transport]
+            args = self.wrap_member(number, [
+                str(binary("loki_member_payment")), "sign", str(owner),
+                str(owner / "pass.txt"), str(RUN / "source" / "roster.json"),
+                str(RUN / "payment"), "--transport", transport])
             process = self.relay.start_payment(
                 number, args, interactive=True, env=self._payment_env(), cwd=str(POC))
             with self.lock:
@@ -261,7 +263,7 @@ class Flow:
                     str(RUN / "payment")]
             program = str(binary("loki_member_payment"))
             out = self.relay.run_payment(
-                3, [program, "finish", *base, "--transport", "relay"],
+                3, self.wrap_member(3, [program, "finish", *base, "--transport", "relay"]),
                 timeout=900, env=self._payment_env(), cwd=str(POC))
             match = re.search(r"broadcast txid=([0-9a-f]{64}) payment=([0-9a-f]{64})", out)
             if not match or match.group(2) != self.payment["id"]:
@@ -272,14 +274,14 @@ class Flow:
                 self.phase = "broadcast"
             self.chain.mine(3)
             verified = self.relay.run_payment(
-                3, [program, "verify", *base, "--transport", "relay", txid],
+                3, self.wrap_member(3, [program, "verify", *base, "--transport", "relay", txid]),
                 timeout=900, env=self._payment_env(), cwd=str(POC))
             recipient = RUN / "recipient" / "member-1"
-            received = self._command([
+            received = self._command(self.wrap_member("recipient", [
                 program, "receive", str(recipient), str(recipient / "pass.txt"),
                 str(RUN / "recipient" / "roster.json"), str(RUN / "payment"),
                 "--transport", "relay", txid,
-            ])
+            ]))
             if f"verified mined txid={txid}" not in verified or f"recipient independently decrypted txid={txid}" not in received:
                 raise RuntimeError("mined transaction verification did not match")
             with self.lock:
@@ -294,10 +296,33 @@ class Flow:
         if self.delivery != "pending":
             raise ValueError("saved-share resend is only while delivery is pending")
         owner = RUN / "source" / f"member-{member_id}"
-        return self.relay.run_payment(member_id, [
+        return self.relay.run_payment(member_id, self.wrap_member(member_id, [
             str(binary("loki_member_payment")), "resend", str(owner), str(owner / "pass.txt"),
             str(RUN / "source" / "roster.json"), str(RUN / "payment"), "--transport", "relay",
-        ], timeout=300, env=self._payment_env(), cwd=str(POC))
+        ]), timeout=300, env=self._payment_env(), cwd=str(POC))
+
+    def bind_member_sandbox(self) -> None:
+        """Deny mailbox, other member roots, and relay stores for later payment children."""
+        import relay_sandbox
+        mailbox = RUN / "payment" / "work" / "mailbox"
+        relay_root = ROOT / "relay"
+        members = {member_id: RUN / "source" / f"member-{member_id}" for member_id in (1, 2, 3)}
+        profiles = {}
+        for member_id, root in members.items():
+            denied = [members[other] for other in members if other != member_id]
+            denied += [mailbox, relay_root]
+            profiles[member_id] = relay_sandbox.write_member_profile(
+                ROOT / "profiles" / f"member-{member_id}.sb", denied)
+        profiles["recipient"] = relay_sandbox.write_member_profile(
+            ROOT / "profiles" / "recipient.sb",
+            [*members.values(), mailbox, relay_root])
+        self.member_sandbox = profiles
+
+    def wrap_member(self, member_id, argv: list[str]) -> list[str]:
+        profile = self.member_sandbox.get(member_id)
+        if profile is None:
+            return list(argv)
+        return ["/usr/bin/sandbox-exec", "-f", str(profile), *argv]
 
     def _fail(self, error: Exception):
         with self.lock:
@@ -322,6 +347,7 @@ class Flow:
         with self.lock:
             if self.worker and self.worker.is_alive():
                 raise ValueError("wait for the current operation to finish before resetting")
+        sandboxed = bool(self.member_sandbox)
         self.cancel.set()
         self._stop_signers()
         try:
@@ -343,6 +369,9 @@ class Flow:
             self.substage = None
             self.review = {"alice": None, "bob": None}
             self.signers = {"alice": "waiting", "bob": "waiting"}
+            self.member_sandbox = {}
+            if sandboxed:
+                self.bind_member_sandbox()
 
     def note_browser_closed(self) -> None:
         """Closing a browser leaves this controller and its relays running."""
@@ -517,6 +546,10 @@ def main():
     args = parser.parse_args()
     if args.sandbox is not None:
         use_sandbox(args.sandbox)
+    if os.environ.get("LOKI_MEMBER_SANDBOX") == "1":
+        if sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").is_file():
+            parser.error("macOS sandbox-exec is required for the relay payment gate")
+        FLOW.bind_member_sandbox()
     lock_path = ROOT / ".lock" if args.sandbox is not None else DEMO / ".member-sandbox.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock_file = lock_path.open("a")

@@ -6,13 +6,21 @@ still uses a test-only viewing key.
 
 ## Run
 
-Install THS and Docker as in [the harness guide](../harness/README.md), then:
+Install THS and Docker as in [the harness guide](../harness/README.md). Feature-build both workspaces, then start the coordinator:
 
 ```sh
-cd poc
-cargo build --locked --bins
-python3 demo/member_demo.py
+cargo build --manifest-path communication/Cargo.toml --locked --offline --bin loki-relay-server
+cargo build --manifest-path poc/Cargo.toml --features relay-communication --locked --offline --bins
+python3 poc/demo/member_demo.py --port 8790
 ```
+
+**Create a test payment** is the only preparation action. It starts THS, creates the vaults from `run/source/member-N`, and starts three relays. There is no second chain launch and no second DKG. The third relay stays on standby while two relays hold the copies. Relay stop or restart reuses that relay store and does not mine or reset THS. Reset abandons the attempt and creates fresh relay state. One attempt is active at a time.
+
+Transport saved, stored, and received stay separate from application acceptance, approval, and chain confirmation. Alice and Bob see their own relay events. Carol sees the network. Replay does not call the backend. Closing a browser leaves the coordinator running.
+
+The live gate is `python3 poc/demo/verify_relay_payment.py --port <free> --timeout 1800`. It owns that port. The public `relay-payment-demo-report.json` is under the selected run. It records source and binary identities, relay pins, carrier and receipt digests, the mailbox-denial canary, scenario results, and the mined txid. It does not record the coordinator token or secret paths.
+
+Supplemental communication-harness checks are separate from this launch. The older `poc/demo/server.py` account UI is a different demo.
 
 Open the **Coordinator** URL printed in the terminal. Create a payment to a
 new independent recipient vault. The amount and memo come from the form; the
