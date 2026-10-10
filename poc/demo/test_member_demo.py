@@ -32,6 +32,18 @@ class MemberDemoTest(unittest.TestCase):
             flow.start(100_000_000, "memo")
         self.assertEqual(flow.phase, "idle")
 
+    def test_member_state_returns_its_own_review(self):
+        flow = self.flow()
+        flow.review = {"alice": "Alice's checked payment", "bob": "Bob's checked payment"}
+        alice = flow.state("alice", "http://127.0.0.1:8790")
+        bob = flow.state("bob", "http://127.0.0.1:8790")
+        carol = flow.state("admin", "http://127.0.0.1:8790")
+        self.assertEqual(alice["review"], "Alice's checked payment")
+        self.assertEqual(bob["review"], "Bob's checked payment")
+        self.assertNotIn("links", alice)
+        self.assertNotIn("links", bob)
+        self.assertNotIn("review", carol)
+
     def test_review_prompt_then_exact_member_approval(self):
         flow = self.flow()
         payment = "a" * 64

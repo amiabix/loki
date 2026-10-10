@@ -547,6 +547,13 @@ input:focus {
   font-weight:700
 }
 
+.approval-row a {
+  margin-left:auto;
+  color:#176b59;
+  font-size:12px;
+  font-weight:700
+}
+
 .review {
   margin:0 30px 26px;
   padding:20px;

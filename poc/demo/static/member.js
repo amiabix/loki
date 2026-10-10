@@ -66,7 +66,7 @@ function render() {
   const s = state;
   const payment = s.payment;
   const approved = Object.values(s.signers).filter((value) => value === 'approved').length;
-  const roleName = {admin: 'Coordinator', alice: 'Alice · member 1', bob: 'Bob · member 2'}[s.role];
+  const roleName = {admin: 'Carol · member 3', alice: 'Alice · member 1', bob: 'Bob · member 2'}[s.role];
   $('side-role').textContent = roleName;
   $('threshold-value').textContent = `${approved} / 2`;
   $('approval-total').textContent = `${approved} of 2`;
@@ -103,6 +103,7 @@ function render() {
       label.append(make('strong', '', name[0].toUpperCase() + name.slice(1)), make('small', '', ` · member ${name === 'alice' ? 1 : 2}`));
       const link = make('a', '', 'Open review');
       link.href = s.links[name]; link.target = '_blank'; link.rel = 'noreferrer';
+      link.dataset.memberWindow = name;
       row.append(label, link); box.append(row);
     }
   }
@@ -128,10 +129,17 @@ function render() {
       const row = make('div', 'approval-row');
       row.append(make('span', 'avatar', name[0].toUpperCase()), make('strong', '', name[0].toUpperCase() + name.slice(1)));
       const status = s.signers[name] || 'waiting';
-      row.append(make('span', status === 'approved' ? 'approved' : '', {
-        waiting: 'Waiting for review', reviewing: 'Needs confirmation', signing: 'Signing',
-        approved: 'Confirmed', declined: 'Declined', failed: 'Failed',
-      }[status] || status));
+      if (s.role === 'admin' && status === 'reviewing') {
+        const link = make('a', '', 'Open review');
+        link.href = s.links[name]; link.target = '_blank'; link.rel = 'noreferrer';
+        link.dataset.memberWindow = name;
+        row.append(link);
+      } else {
+        row.append(make('span', status === 'approved' ? 'approved' : '', {
+          waiting: 'Waiting for review', reviewing: 'Needs confirmation', signing: 'Signing',
+          approved: 'Approved', declined: 'Declined', failed: 'Failed',
+        }[status] || status));
+      }
       box.append(row);
     }
     const reviewReady = ['alice', 'bob'].includes(s.role) && s.signers[s.role] === 'reviewing' && s.review;
@@ -161,6 +169,16 @@ async function refresh() {
 }
 
 for (const button of document.querySelectorAll('.nav-item')) button.addEventListener('click', () => show(button.dataset.view));
+document.addEventListener('click', (event) => {
+  const link = event.target.closest('a[data-member-window]');
+  if (!link) return;
+  const member = window.open('', `loki-${link.dataset.memberWindow}`, 'width=1100,height=900');
+  if (member) {
+    member.opener = null;
+    member.location.replace(link.href);
+    event.preventDefault();
+  }
+});
 $('start-form').addEventListener('submit', (event) => {
   event.preventDefault();
   const raw = $('amount').value;
