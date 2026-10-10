@@ -92,10 +92,48 @@
             <label>Speed<select id="relay-speed"><option value="1">1×</option><option value="2">2×</option></select></label>
           </div>
         </div>
+        <div class="relay-filters">
+          <label>Member
+            <select id="relay-filter-member">
+              <option value="">All</option>
+              <option value="1">Alice</option>
+              <option value="2">Bob</option>
+              <option value="3">Carol</option>
+            </select>
+          </label>
+          <label>Message <input id="relay-filter-message" type="text" spellcheck="false"></label>
+          <label>Relay <input id="relay-filter-relay" type="text" spellcheck="false"></label>
+          <label>Failures <input id="relay-filter-failure" type="checkbox"></label>
+        </div>
+        <p id="relay-status" class="relay-status">Loading</p>
+        <p id="relay-error" class="relay-error" role="alert"></p>
         <div class="relay-milestones" id="relay-milestones"></div>
-        <svg id="relay-svg" class="relay-svg" viewBox="0 0 640 280" role="img" aria-label="Relay network"></svg>
+        <svg id="relay-svg" class="relay-svg" viewBox="0 0 640 320" role="img" aria-label="Relay network"></svg>
+        <div id="relay-messages" class="relay-messages"></div>
         <ol id="relay-timeline" class="relay-timeline"></ol>
         <div id="relay-inspector" class="relay-inspector"></div>
+        <div id="relay-admin" class="relay-admin" hidden>
+          <label>Relay
+            <select id="relay-admin-relay">
+              <option value="1">1</option>
+              <option value="2">2</option>
+              <option value="3">3</option>
+            </select>
+          </label>
+          <label>Member
+            <select id="relay-admin-member">
+              <option value="1">1</option>
+              <option value="2">2</option>
+              <option value="3">3</option>
+            </select>
+          </label>
+          <label>Resend
+            <select id="relay-admin-resend">
+              <option value="1">1</option>
+              <option value="2">2</option>
+            </select>
+          </label>
+        </div>
       </section>
       <footer class="footer"><span>Research prototype · regtest funds only</span><button class="text-button" id="reset" type="button" hidden>Reset demo</button></footer>
     </main>

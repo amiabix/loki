@@ -30,6 +30,38 @@
   padding: 0;
 }
 
+.relay-filters,
+.relay-admin,
+.relay-messages {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  margin: 12px 0;
+}
+
+.relay-status,
+.relay-error {
+  margin: 8px 0;
+}
+
+.relay-error {
+  color: #8d2f2f;
+}
+
+.relay-filters button:focus,
+.relay-filters select:focus,
+.relay-filters input:focus,
+.relay-admin button:focus,
+.relay-admin select:focus,
+.relay-controls button:focus,
+.relay-controls select:focus,
+.relay-messages button:focus,
+.relay-inspector button:focus {
+  outline: 2px solid #3f8f83;
+  outline-offset: 2px;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .relay-svg,
   .relay-event {

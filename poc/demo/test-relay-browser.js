@@ -8,10 +8,21 @@ const vm = require('node:vm');
 
 const sourcePath = path.join(__dirname, 'static', 'relay.js');
 const source = fs.readFileSync(sourcePath, 'utf8');
+const page = fs.readFileSync(path.join(__dirname, 'static', 'member.html'), 'utf8');
+const style = fs.readFileSync(path.join(__dirname, 'static', 'relay.css'), 'utf8');
 assert.equal(source.includes('require('), false);
 assert.equal(source.includes('module.exports'), false);
 assert.equal(source.includes('innerHTML'), false);
 assert.equal(source.includes('textContent'), true);
+for (const id of [
+  'relay-filter-member', 'relay-filter-message', 'relay-filter-relay', 'relay-filter-failure',
+  'relay-admin', 'relay-admin-relay', 'relay-admin-member', 'relay-admin-resend',
+  'relay-status', 'relay-error', 'relay-messages',
+]) {
+  assert.equal(page.includes(`id="${id}"`), true, id);
+}
+assert.equal(page.includes('<script src="/relay.js" defer></script>'), true);
+assert.equal(style.includes('prefers-reduced-motion'), true);
 
 class Element {
   constructor(tag) {
@@ -23,6 +34,8 @@ class Element {
     this.listeners = {};
     this._text = '';
     this.value = '';
+    this.hidden = false;
+    this.checked = false;
   }
 
   set textContent(value) {
@@ -50,6 +63,16 @@ class Element {
 
   addEventListener(type, listener) {
     this.listeners[type] = listener;
+  }
+
+  get firstChild() {
+    return this.children[0] || null;
+  }
+
+  removeChild(child) {
+    const index = this.children.indexOf(child);
+    if (index >= 0) this.children.splice(index, 1);
+    return child;
   }
 }
 
@@ -79,6 +102,9 @@ async function runOnce() {
   const {document, nodes} = documentFor([
     'relay-svg', 'relay-milestones', 'relay-timeline', 'relay-inspector',
     'relay-mode', 'relay-replay', 'relay-live', 'relay-speed',
+    'relay-filter-member', 'relay-filter-message', 'relay-filter-relay', 'relay-filter-failure',
+    'relay-admin', 'relay-admin-relay', 'relay-admin-member', 'relay-admin-resend',
+    'relay-status', 'relay-error', 'relay-messages',
   ]);
   let calls = 0;
   const network = {
@@ -103,6 +129,8 @@ async function runOnce() {
   };
   vm.runInNewContext(source, sandbox, {filename: 'relay.js'});
   assert.equal(typeof sandbox.require, 'undefined');
+  sandbox.renderRelay();
+  assert.match(nodes.get('relay-status').textContent, /Loading/);
   await sandbox.refreshRelay();
   assert.equal(count(nodes.get('relay-svg'), 'relay-node'), 6);
   const milestoneText = nodes.get('relay-milestones').children.map((node) => node.textContent);
@@ -117,6 +145,9 @@ async function runOnce() {
     for (const child of node.children || []) walk(child);
   })(nodes.get('relay-svg'));
   assert.ok(labels.includes('Alice'));
+  assert.equal(count(nodes.get('relay-svg'), 'relay-inbox'), 3);
+  assert.equal(typeof nodes.get('relay-filter-member').listeners.change, 'function');
+  assert.equal(typeof nodes.get('relay-filter-failure').listeners.change, 'function');
 
   sandbox.memberRole = () => 'alice';
   sandbox.renderRelay();
@@ -167,6 +198,150 @@ async function runOnce() {
   await sandbox.refreshRelay();
   assert.equal(calls, before);
   assert.equal(nodes.get('relay-mode').textContent, 'Replay');
+
+  sandbox.memberRole = () => 'admin';
+  nodes.get('relay-filter-member').value = '2';
+  sandbox.renderRelay();
+  assert.match(nodes.get('relay-timeline').textContent, /Bob/);
+  assert.equal(nodes.get('relay-timeline').textContent.includes('Alice sent'), false);
+  nodes.get('relay-filter-member').value = '';
+  nodes.get('relay-filter-relay').value = 'abcdef01';
+  sandbox.renderRelay();
+  assert.match(nodes.get('relay-timeline').textContent, /Bob/);
+  assert.equal(nodes.get('relay-timeline').textContent.includes('Alice sent'), false);
+  nodes.get('relay-filter-relay').value = '';
+  nodes.get('relay-filter-message').value = 'ffff';
+  sandbox.renderRelay();
+  assert.equal(nodes.get('relay-timeline').children.length, 0);
+  nodes.get('relay-filter-message').value = '';
+  sandbox.acceptRelayEvents({
+    events: [{sequence: 7, event_type: 'receipt_rejected', actor_member: 1, origin: 'native'}],
+    next: 7,
+  });
+  nodes.get('relay-filter-failure').checked = true;
+  sandbox.renderRelay();
+  assert.match(nodes.get('relay-timeline').textContent, /rejected/);
+  assert.equal(nodes.get('relay-timeline').textContent.includes('Alice sent'), false);
+  nodes.get('relay-filter-failure').checked = false;
+
+  sandbox.acceptRelayEvents({
+    events: [4, 5, 6].map((sequence) => ({
+      sequence, event_type: 'request_end', result_code: 'empty', actor_member: 1, origin: 'native',
+    })),
+    next: 6,
+  });
+  sandbox.renderRelay();
+  assert.match(nodes.get('relay-timeline').textContent, /3 empty polls collapsed/);
+  assert.match(nodes.get('relay-milestones').textContent, /Transport saved 1/);
+
+  const message = 'ab'.repeat(32);
+  sandbox.acceptRelayEvents({
+    events: [
+      {sequence: 50, event_type: 'application_accepted', message_id: message, recipient_member: 1, origin: 'native'},
+      {sequence: 51, event_type: 'application_accepted', message_id: message, recipient_member: 2, origin: 'native'},
+    ],
+    next: 51,
+  });
+  sandbox.api = async () => ({
+    rows: [1, 2, 3].map((member) => ({
+      object_ordinal: 1,
+      recipient_member: member,
+      wire_bytes: 64,
+      receipt_digest: 'bb'.repeat(32),
+      relay_pin: 'cc'.repeat(32),
+    })),
+    next: 3,
+    complete: true,
+  });
+  await sandbox.inspectRelay(message, 0);
+  const inspector = nodes.get('relay-inspector');
+  assert.equal(count(inspector, 'relay-object'), 3);
+  assert.match(inspector.textContent, /ordinal 1/);
+  assert.match(inspector.textContent, /64 bytes/);
+  assert.match(inspector.textContent, /bbbbbbbb/);
+  const inner = inspector.children.find((node) => String(node.className).includes('relay-inner'));
+  assert.ok(inner);
+  assert.match(inner.textContent, /Alice/);
+  assert.match(inner.textContent, /Bob/);
+  assert.equal(inner.textContent.includes('Carol'), false);
+  assert.match(inspector.textContent, /192 bytes/);
+
+  const actions = [];
+  sandbox.act = async (path, body) => {
+    actions.push({path: String(path), body: JSON.parse(JSON.stringify(body))});
+  };
+  nodes.get('relay-admin-relay').value = '2';
+  nodes.get('relay-admin-member').value = '1';
+  nodes.get('relay-admin-resend').value = '2';
+  sandbox.renderRelay();
+  const adminButtons = [];
+  (function walk(node) {
+    if (String(node.className || '').startsWith('relay-admin-') && node.tagName === 'button') adminButtons.push(node);
+    for (const child of node.children || []) walk(child);
+  })(nodes.get('relay-admin'));
+  const button = (name) => adminButtons.find((node) => node.className === name);
+  await button('relay-admin-stop').listeners.click();
+  await button('relay-admin-restart').listeners.click();
+  await button('relay-admin-pause').listeners.click();
+  await button('relay-admin-resume').listeners.click();
+  await button('relay-admin-resend').listeners.click();
+  assert.deepEqual(actions, [
+    {path: '/api/relay/stop', body: {relay: 2}},
+    {path: '/api/relay/restart', body: {relay: 2}},
+    {path: '/api/relay/member', body: {member: 1, action: 'pause'}},
+    {path: '/api/relay/member', body: {member: 1, action: 'resume'}},
+    {path: '/api/relay/resend', body: {member: 2}},
+  ]);
+  sandbox.act = async () => {
+    throw new Error('member 1 store is busy');
+  };
+  await button('relay-admin-pause').listeners.click();
+  assert.match(nodes.get('relay-error').textContent, /busy/);
+  sandbox.memberRole = () => 'alice';
+  sandbox.renderRelay();
+  const hiddenAdmin = [];
+  (function walk(node) {
+    if (String(node.className || '').startsWith('relay-admin-') && node.tagName === 'button') hiddenAdmin.push(node);
+    for (const child of node.children || []) walk(child);
+  })(nodes.get('relay-admin'));
+  assert.equal(hiddenAdmin.length, 0);
+
+  sandbox.liveRelay();
+  sandbox.demoState = () => ({substage: 'funding', error: null});
+  sandbox.api = async (request) => {
+    if (String(request).startsWith('/api/relay/state')) {
+      return {
+        saved: 1, stored: 2, received: 3, application_accepted: 4, approved: 5,
+        freshness: 'stale', gap: true, run_id: 'demo-1',
+        relays: {1: {status: 'standby'}, 2: {status: 'standby'}, 3: {status: 'failed'}},
+        members: {1: {status: 'offline'}},
+        messages: [message],
+      };
+    }
+    return {events: [], next: 51};
+  };
+  sandbox.memberRole = () => 'admin';
+  await sandbox.refreshRelay();
+  assert.match(nodes.get('relay-status').textContent, /Stale/);
+  assert.match(nodes.get('relay-status').textContent, /Gap/);
+  assert.match(nodes.get('relay-status').textContent, /Member 1 offline/);
+  assert.match(nodes.get('relay-status').textContent, /funding/);
+  const failedLabels = [];
+  (function walk(node) {
+    if (node._text) failedLabels.push(node._text);
+    for (const child of node.children || []) walk(child);
+  })(nodes.get('relay-svg'));
+  assert.ok(failedLabels.includes('Relay 3 failed'));
+  assert.equal(nodes.get('relay-messages').children.length, 1);
+
+  sandbox.api = async () => {
+    throw new Error('not authorized');
+  };
+  await sandbox.refreshRelay();
+  assert.match(nodes.get('relay-error').textContent, /not authorized/);
+  sandbox.resetRelay('demo-2');
+  sandbox.renderRelay();
+  assert.match(nodes.get('relay-status').textContent, /No relay events yet/);
   return 'relay-view-ok';
 }
 

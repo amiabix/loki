@@ -500,12 +500,26 @@ class Handler(BaseHTTPRequestHandler):
         pass  # URLs carry no token; keep the local demo quiet.
 
 
+def use_sandbox(path: Path) -> Flow:
+    """Point this process at a fresh sandbox before any chain recovery."""
+    global ROOT, RUN, FLOW
+    ROOT = Path(path).resolve()
+    RUN = ROOT / "run"
+    FLOW = Flow()
+    return FLOW
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=8790)
+    parser.add_argument("--sandbox", type=Path)
     args = parser.parse_args()
-    lock_file = (DEMO / ".member-sandbox.lock").open("a")
+    if args.sandbox is not None:
+        use_sandbox(args.sandbox)
+    lock_path = ROOT / ".lock" if args.sandbox is not None else DEMO / ".member-sandbox.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = lock_path.open("a")
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:

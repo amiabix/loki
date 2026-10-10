@@ -29,6 +29,10 @@ function memberRole() {
   return state ? state.role : null;
 }
 
+function demoState() {
+  return state;
+}
+
 function notice(message, error = false) {
   const target = $(error ? 'error' : 'info');
   target.textContent = message;

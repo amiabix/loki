@@ -370,6 +370,31 @@ class MemberDemoTest(unittest.TestCase):
         self.assertEqual(foreign["code"], 403)
         flow.relay.service_snapshot.assert_not_called()
 
+    def test_isolated_sandbox_recover_leaves_the_default_instance(self):
+        original_root = member_demo.ROOT
+        original_run = member_demo.RUN
+        original_flow = member_demo.FLOW
+        manifest = original_root / "ths-instance.json"
+        before = manifest.read_bytes() if manifest.exists() else None
+        touched = []
+        original_flow.chain.recover = lambda: touched.append("default")
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                sandbox = Path(temporary).resolve()
+                flow = member_demo.use_sandbox(sandbox)
+                self.assertIsNot(flow, original_flow)
+                self.assertEqual(member_demo.ROOT, sandbox)
+                self.assertEqual(member_demo.RUN, sandbox / "run")
+                flow.chain.recover()
+                self.assertEqual(touched, [])
+                self.assertFalse((sandbox / "ths-instance.json").exists())
+            if before is not None:
+                self.assertEqual(manifest.read_bytes(), before)
+        finally:
+            member_demo.ROOT = original_root
+            member_demo.RUN = original_run
+            member_demo.FLOW = original_flow
+
 
 if __name__ == "__main__":
     unittest.main()
