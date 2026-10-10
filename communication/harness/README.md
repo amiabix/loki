@@ -19,6 +19,58 @@ python3 communication/harness/run.py delete --run-root /private/tmp/SELECTED_RUN
 
 A selected subset leaves unrelated coverage rows `not_selected`. An inventory row passes only when every contributing scenario passes. Failure of any required observation prevents that row from passing. `completed` means all selected scenarios succeeded; consult all 26 inventory rows when assessing complete coverage.
 
+## test(harness): existing vault across three member environments
+
+`three_members.py` reuses a selected completed vault rather than creating new
+member identities. The source must contain `roster.json` and
+`members/{1,2,3}/secrets/{identity,vault}.sealed` plus each member's `passphrase`
+file, as retained by `run.py acceptance`. Selection is explicit: the test never
+silently chooses a different vault or starts a new setup ceremony.
+
+On macOS, each Rust member invocation runs through `sandbox-exec` with a separate
+member root, HOME and TMPDIR. Real read probes must deny both peer roots, relay
+storage and the original vault, while allowing its own state. Runtime commands
+also cannot read the provisioning capabilities. The controller copies only the
+selected sealed identity, sealed vault and passphrase into each private test
+root, with fresh transport journals. Source hashes must remain unchanged.
+These are three process sandboxes on one host, not separate OS users, machines
+or operators. Isolation fails closed when macOS sandboxing is unavailable.
+
+Build the server and member binaries using the commands in
+[`../README.md`](../README.md), then run with a new directory and three free ports:
+
+```sh
+python3 -m unittest discover -s communication/harness -p 'test*.py'
+python3 communication/harness/three_members.py \
+  --vault-root /private/tmp/loki-relay-acceptance-review-20261010-a \
+  --run-root /private/tmp/loki-three-members-new --ports 39401 39402 39403
+```
+
+All members use the same three relay identities, with nine private inboxes and
+six encrypted configuration handoffs. Each member sends one 64-byte message and
+one 65,537-byte chunked message while the other member commands are offline.
+After the sender exits, both peers poll and upload authenticated Received
+acknowledgements. The final checks require six originals, twelve distinct peer
+acknowledgements returned to the corresponding authors, four peer originals per
+member, and two sender self-copies without self acknowledgements. Whole-vault
+Stored must cover every recipient object on the same two distinct relay pins.
+The CLI's `pending_transfers` counter includes outgoing bookkeeping without a
+cached completion marker, so it can remain nonzero after quorum delivery. The
+test uses authenticated readiness, complete replica receipts and peer Received
+evidence as its completion criteria.
+
+Repeated request IDs, uploads and polls must preserve message identity without
+duplicate effects. Restarting the relays and reopening all member sessions must
+preserve ciphertext, sequences and saved receipts. Every command is bounded;
+the full test has a 600-second deadline. Status capture allows at most 256 KiB
+for the larger six-message inventory; the existing harness keeps its 64 KiB cap.
+The CLI reports authenticated IDs and digests, not decrypted payload text.
+
+Success writes `three-members-report.json` with public setup, message, receipt,
+isolation and restart evidence. Failure writes `three-members-failure.json`.
+Owned children are stopped and all run data remains for inspection; the existing
+run-ID deletion command can explicitly remove that test run later.
+
 ## test(harness): scenario evidence classes
 
 | Scenario | Observation and injection |

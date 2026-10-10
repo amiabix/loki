@@ -74,6 +74,7 @@ def find_binary(name, *, workspace, target_dir=None, profile='debug', env=None):
 
 class OwnedRun:
     MARKER = '.harness-owner.json'
+    CAPTURE_OUTPUT_LIMIT = 65536
 
     LIFECYCLE = '.harness-lifecycle.json'
     LOCK = '.harness-owner.lock'
@@ -170,7 +171,7 @@ class OwnedRun:
         """
         if not math.isfinite(timeout) or timeout < 0:
             raise OwnershipError('Command deadline must be finite and nonnegative')
-        if type(output_limit) is not int or not 1 <= output_limit <= 65536:
+        if type(output_limit) is not int or not 1 <= output_limit <= self.CAPTURE_OUTPUT_LIMIT:
             raise OwnershipError('Captured output bound is invalid')
         if not isinstance(jobs, (list, tuple)) or not 1 <= len(jobs) <= 3:
             raise OwnershipError('Command group exceeds the capture bound')
@@ -817,6 +818,13 @@ def _certified_setup(owner, ports, server, setup_bin, member_bin, timeout, mailb
             raise OwnershipError('Owned command exited unsuccessfully')
         if result.stdout != b'':
             raise OwnershipError('Setup run returned unexpected output')
+    return provision_members(owner, relays, members, roster, vault, fingerprint, member_bin,
+                             deadline, mailbox_bytes, total_bytes)
+
+
+def provision_members(owner, relays, members, roster, vault, fingerprint, member_bin,
+                      deadline, mailbox_bytes, total_bytes):
+    """Provision and exchange descriptors for already certified member stores."""
     inboxes = []
     for member in members:
         config, lines = _member_command(owner, member_bin, member, members, relays, roster,
