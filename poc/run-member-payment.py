@@ -61,7 +61,13 @@ def main():
     parser.add_argument("--name", required=True, help="already running THS instance")
     parser.add_argument("--state", type=pathlib.Path, required=True, help="new, private test directory")
     parser.add_argument("--manual", action="store_true", help="prepare, then print commands for two human signers")
+    parser.add_argument("--amount-zat", type=int, default=40_000_000, help="regtest payment amount")
+    parser.add_argument("--memo", default="separate member payment", help="shielded payment memo")
     args = parser.parse_args()
+    if not 0 < args.amount_zat < 100_000_000:
+        parser.error("amount must be between 1 and 99,999,999 zat")
+    if not args.memo or len(args.memo.encode()) > 512:
+        parser.error("memo must contain 1 to 512 UTF-8 bytes")
     root = args.state.resolve()
     root.mkdir(mode=0o700, parents=True, exist_ok=False)
     work = root / "payment"
@@ -83,7 +89,7 @@ def main():
     print("funded source vault on THS", flush=True)
 
     owner, password = members[0]
-    run([pay, "prepare", owner, password, roster, work, recipient_address, "40000000", "separate member payment"], env)
+    run([pay, "prepare", owner, password, roster, work, recipient_address, str(args.amount_zat), args.memo], env)
     manifest = json.loads((work / "payment.json").read_text())
     if args.manual:
         def command(argv):
