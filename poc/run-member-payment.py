@@ -4,6 +4,7 @@
 import argparse
 import concurrent.futures
 import json
+import os
 import pathlib
 import shlex
 import subprocess
@@ -75,8 +76,11 @@ def main():
     chain.check()
     env = chain.env()
     here = pathlib.Path(__file__).resolve().parent
-    setup = here / "target/debug/loki_setup_member"
-    pay = here / "target/debug/loki_member_payment"
+    target = pathlib.Path(os.environ.get("CARGO_TARGET_DIR", here / "target"))
+    if not target.is_absolute():
+        target = here / target
+    setup = target / "debug/loki_setup_member"
+    pay = target / "debug/loki_member_payment"
     if not setup.is_file() or not pay.is_file():
         raise RuntimeError("run cargo build --locked --bins in poc/ first")
 

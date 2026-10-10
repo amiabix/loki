@@ -23,6 +23,23 @@ requires an explicit **Confirm payment** action. After both shares are saved,
 Carol's window can prove and send. The UI says **Confirmed** only
 after the mined transaction passes both source and recipient checks.
 
+For a repeatable browser check, start a second fresh demo on another port in
+one terminal, then run the check from another:
+
+```sh
+python3 demo/member_demo.py --port 8791
+```
+
+```sh
+npm ci --ignore-scripts --prefix g3
+LOKI_DEMO_URL='http://127.0.0.1:8791/#<printed-token>' node demo/test-member-browser.js
+```
+
+The check creates a regtest payment, opens an Alice window, signs from separate
+Alice and Bob browser profiles, and waits for Carol's history to show the mined
+txid. It requires Playwright's Chromium browser installed locally and leaves the
+confirmed demo instance running for inspection.
+
 The server creates and owns one disposable THS instance. Reset or a clean server
 exit stops only that instance. A restart during signing abandons the attempt;
 reset creates fresh vaults and signing material. State under
