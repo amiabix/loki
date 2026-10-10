@@ -92,6 +92,24 @@ class PublicReportTest(unittest.TestCase):
             run.run_faults = original
         self.assertEqual(mapped["offline_delivery"]["outcome"], "passed")
 
+    def test_a_retained_transport_root_is_cleared(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "transport-scenarios"
+            root.mkdir()
+            (root / ".harness-owner.json").write_text("{}\n")
+            (root / "marker").write_text("old")
+            verify.prepare_transport_root(root)
+            self.assertFalse(root.exists())
+
+    def test_an_unmarked_transport_root_is_kept(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "transport-scenarios"
+            root.mkdir()
+            (root / "marker").write_text("keep")
+            with self.assertRaises(verify.GateError):
+                verify.prepare_transport_root(root)
+            self.assertEqual((root / "marker").read_text(), "keep")
+
     def test_unexecuted_scenario_does_not_pass(self):
         scenarios = [
             {"name": name, "label": "transport", "executed": True, "result": "passed"}

@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -168,7 +169,18 @@ def _scenario(name: str, label: str, passed: bool, *, harness: str | None = None
     return item
 
 
+def prepare_transport_root(root: Path) -> None:
+    """Remove one retained harness root so the next fault run can create it."""
+    root = Path(root)
+    if not root.exists():
+        return
+    if not (root / ".harness-owner.json").is_file():
+        raise GateError("transport root exists and is not a harness run")
+    shutil.rmtree(root)
+
+
 def transport_scenarios(root: Path, timeout: float) -> dict[str, dict]:
+    prepare_transport_root(root)
     if str(HARNESS) not in sys.path:
         sys.path.insert(0, str(HARNESS))
     import run  # noqa: E402
