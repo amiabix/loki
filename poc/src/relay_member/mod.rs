@@ -339,5 +339,7 @@ pub fn load(root: &Path, pass_file: &Path, roster_path: &Path) -> MemberResult<L
 
 pub mod config;
 pub mod exchange;
+pub mod session;
+pub use session::{open_session, routed, Session, SessionError};
 pub use config::{ConfigStore, LocalConfig, PendingRequest, ProvisionTarget};
 pub use exchange::{CourierFile, CourierImport};

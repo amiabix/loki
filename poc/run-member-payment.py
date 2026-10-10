@@ -64,6 +64,8 @@ def main():
     parser.add_argument("--manual", action="store_true", help="prepare, then print commands for two human signers")
     parser.add_argument("--amount-zat", type=int, default=40_000_000, help="regtest payment amount")
     parser.add_argument("--memo", default="separate member payment", help="shielded payment memo")
+    parser.add_argument("--transport", choices=("file", "relay"), default="file",
+                        help="signing courier; file keeps the shared work mailbox")
     args = parser.parse_args()
     if not 0 < args.amount_zat < 100_000_000:
         parser.error("amount must be between 1 and 99,999,999 zat")
@@ -104,14 +106,14 @@ def main():
             f"Independent recipient: {recipient_address}",
             f"Payment ID: {manifest['payment']}",
             "Run the next two commands at the same time in separate terminals. Read each review, then type its exact APPROVE prompt:",
-            command([pay, "sign", *members[0], roster, work]),
-            command([pay, "sign", *members[1], roster, work]),
+            command([pay, "sign", *members[0], roster, work, "--transport", args.transport]),
+            command([pay, "sign", *members[1], roster, work, "--transport", args.transport]),
             "After both say approved, run:",
-            command([pay, "finish", *members[2], roster, work]),
+            command([pay, "finish", *members[2], roster, work, "--transport", args.transport]),
             "Copy the txid from the finish output, then run:",
             shlex.join(["ths", "--name", args.name, "mine", "3"]),
-            command([pay, "verify", *members[2], roster, work, "<TXID>"]),
-            command([pay, "receive", *recipient_members[0], recipient_roster, work, "<TXID>"]),
+            command([pay, "verify", *members[2], roster, work, "<TXID>", "--transport", args.transport]),
+            command([pay, "receive", *recipient_members[0], recipient_roster, work, "<TXID>", "--transport", args.transport]),
         ]
         (root / "manual-steps.txt").write_text("\n".join(lines) + "\n")
         print("\n".join(lines), flush=True)
@@ -121,7 +123,7 @@ def main():
     def sign(number):
         member_owner, member_password = members[number - 1]
         result = subprocess.run(
-            [pay, "sign", member_owner, member_password, roster, work],
+            [pay, "sign", member_owner, member_password, roster, work, "--transport", args.transport],
             input=approval, text=True, capture_output=True, env=env, timeout=180,
         )
         if result.returncode:
@@ -134,14 +136,14 @@ def main():
             print(future.result().splitlines()[-1], flush=True)
 
     owner, password = members[2]
-    finished = run([pay, "finish", owner, password, roster, work], env, timeout=900)
+    finished = run([pay, "finish", owner, password, roster, work, "--transport", args.transport], env, timeout=900)
     print(finished, flush=True)
     txid = finished.split("txid=", 1)[1].split()[0]
     chain.mine(3)
-    verified = run([pay, "verify", owner, password, roster, work, txid], env)
+    verified = run([pay, "verify", owner, password, roster, work, txid, "--transport", args.transport], env)
     print(verified, flush=True)
     recipient_owner, recipient_password = recipient_members[0]
-    received = run([pay, "receive", recipient_owner, recipient_password, recipient_roster, work, txid], env)
+    received = run([pay, "receive", recipient_owner, recipient_password, recipient_roster, work, txid, "--transport", args.transport], env)
     print(received, flush=True)
     (root / "result.json").write_text(json.dumps({
         "vault": vault, "recipient": recipient_address,

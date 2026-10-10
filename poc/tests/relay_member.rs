@@ -3266,3 +3266,56 @@ fn communication_cli_missing_referenced_sealed_config_fails_closed() {
     let retained_bytes = fs::read(&retained).unwrap();
     assert!(retained_bytes == original, "original seal retained");
 }
+
+#[test]
+fn shared_session_lock_rejects_a_second_open_until_drop() {
+    let base = certified_setup().canonicalize().unwrap();
+    let root = scratch().canonicalize().unwrap();
+    fs::create_dir(root.join("secrets")).unwrap();
+    private(&root.join("secrets"), true);
+    for file in ["identity.sealed", "vault.sealed"] {
+        let dest = root.join("secrets").join(file);
+        fs::copy(base.join("member-1/secrets").join(file), &dest).unwrap();
+        private(&dest, false);
+    }
+    let pass = root.join("pass");
+    fs::copy(base.join("member-1/pass"), &pass).unwrap();
+    private(&pass, false);
+    let roster = root.join("roster.json");
+    fs::copy(base.join("roster.json"), &roster).unwrap();
+    let first = loki_poc::relay_member::open_session(&root, &pass, &roster).unwrap();
+    assert!(loki_poc::relay_member::open_session(&root, &pass, &roster).is_err());
+    drop(first);
+    let second = loki_poc::relay_member::open_session(&root, &pass, &roster).unwrap();
+    assert!(loki_poc::relay_member::routed(&second).is_err());
+    drop(second);
+
+    let bad_roster = root.join("bad-roster.json");
+    fs::write(&bad_roster, b"{}").unwrap();
+    assert!(loki_poc::relay_member::open_session(&root, &pass, &bad_roster).is_err());
+    let other_pass = root.join("other-pass");
+    fs::write(&other_pass, b"wrong member passphrase\n").unwrap();
+    private(&other_pass, false);
+    assert!(loki_poc::relay_member::open_session(&root, &other_pass, &roster).is_err());
+    let loaded = loki_poc::relay_member::load(&root, &pass, &roster).unwrap();
+    let poisoned = scratch().canonicalize().unwrap();
+    fs::create_dir(poisoned.join("secrets")).unwrap();
+    private(&poisoned.join("secrets"), true);
+    for file in ["identity.sealed", "vault.sealed"] {
+        let dest = poisoned.join("secrets").join(file);
+        fs::copy(base.join("member-1/secrets").join(file), &dest).unwrap();
+        private(&dest, false);
+    }
+    let poisoned_pass = poisoned.join("pass");
+    fs::copy(&pass, &poisoned_pass).unwrap();
+    private(&poisoned_pass, false);
+    let poisoned_roster = poisoned.join("roster.json");
+    fs::copy(&roster, &poisoned_roster).unwrap();
+    drop(
+        loki_relay_client::ClientStore::open(&poisoned.join("transport"), &loaded.roster, 2)
+            .unwrap(),
+    );
+    assert!(
+        loki_poc::relay_member::open_session(&poisoned, &poisoned_pass, &poisoned_roster).is_err()
+    );
+}

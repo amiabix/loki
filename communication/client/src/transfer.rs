@@ -292,6 +292,17 @@ impl AuthenticatedTransfer {
     }
 }
 
+impl std::fmt::Debug for AuthenticatedTransfer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthenticatedTransfer")
+            .field("message", &self.message)
+            .field("recipient", &self.source.recipient)
+            .field("objects", &self.source.required_hashes.len())
+            .finish()
+    }
+}
+
 struct TemporaryValue(Value);
 impl Drop for TemporaryValue {
     fn drop(&mut self) {

@@ -109,6 +109,8 @@ impl fmt::Debug for ClientError {
 
 impl std::error::Error for ClientError {}
 
+mod observe;
+pub use observe::{Observation, ObservationKind, ObservationSink};
 mod store;
 pub use store::{
     AckLink, ClientStore, CommitDisposition, ConfigReference, DiagnosticSample, DownloadRejection, EarlyReceived,
@@ -121,8 +123,8 @@ mod http;
 pub use http::{RelayHttp, VerifiedEntry, VerifiedPage, VerifiedReceipt};
 mod inbox;
 pub use inbox::{
-    authenticate_staged, committed_readiness, poll_once, poll_transport, AuthenticatedCandidate,
-    CandidateReadiness, DownloadOutcome, PrerequisiteStatus, QuarantineReason,
+    authenticate_staged, committed_readiness, poll_once, poll_transport, reopen_committed,
+    AuthenticatedCandidate, CandidateReadiness, DownloadOutcome, PrerequisiteStatus, QuarantineReason,
 };
 mod received;
 pub use received::{prepare_received, received_status, reconcile_received, ReceivedStatus};

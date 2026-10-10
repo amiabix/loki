@@ -1,8 +1,10 @@
 use crate::store::{
-    admit_storage_growth, validate_schema, BoundSource, ClientStore, PendingDownload, StageResult, SCHEMA,
+    admit_storage_growth, validate_schema, BoundSource, ClientStore, PendingDownload, RecoveryRequirement,
+    StageResult, SCHEMA,
 };
 use crate::{
-    http, AuthenticatedDescriptor, AuthenticatedMessage, ClientConfig, ClientError, ClientResult, CommIdentity,
+    http, AuthenticatedDescriptor, AuthenticatedMessage, AuthenticatedTransfer, ClientConfig,
+    ClientError, ClientResult, CommIdentity,
     CompleteSource, ConfigReference, RelayHttp, RootInspection, TransferAssembler,
 };
 use loki_relay_protocol::{
@@ -2049,6 +2051,126 @@ impl<'a> ReadinessWalk<'a> {
     }
 }
 
+fn load_requirement_pages(
+    mut page: impl FnMut(Option<&Id32>) -> ClientResult<Vec<RecoveryRequirement>>,
+) -> ClientResult<Vec<RecoveryRequirement>> {
+    let mut requirements = Vec::new();
+    let mut after = None;
+    loop {
+        let page = page(after.as_ref())?;
+        if page.is_empty() {
+            break;
+        }
+        let next = page[page.len() - 1].hash;
+        if after.is_some_and(|cursor| next <= cursor) {
+            return Err(ClientError::Storage);
+        }
+        let short = page.len() < usize::from(RECOVERY_PAGE);
+        requirements.extend(page);
+        after = Some(next);
+        if requirements.len() > MAX_STAGED_OBJECTS {
+            return Err(ClientError::Wire(WireError::Bounds));
+        }
+        if short {
+            break;
+        }
+    }
+    Ok(requirements)
+}
+
+fn index_requirements(requirements: &[RecoveryRequirement]) -> ClientResult<()> {
+    if requirements.is_empty() || requirements.len() > MAX_STAGED_OBJECTS {
+        return Err(ClientError::Wire(WireError::Bounds));
+    }
+    let mut ordered = requirements.to_vec();
+    ordered.sort_by_key(|requirement| requirement.ordinal);
+    let mut hashes = BTreeSet::new();
+    for (index, requirement) in ordered.iter().enumerate() {
+        if requirement.ordinal as usize != index || !hashes.insert(requirement.hash) {
+            return Err(ClientError::Storage);
+        }
+    }
+    Ok(())
+}
+
+/// Reassemble one saved recipient copy and authenticate it. This is the only opener.
+fn assemble_saved(
+    store: &ClientStore,
+    roster: &Roster,
+    identity: &CommIdentity,
+    requirements: &[RecoveryRequirement],
+    root_hash: &Id32,
+) -> ClientResult<AuthenticatedTransfer> {
+    index_requirements(requirements)?;
+    if !requirements.iter().any(|requirement| requirement.hash == *root_hash) {
+        return Err(ClientError::Identity);
+    }
+    let mut objects = Vec::with_capacity(requirements.len());
+    for requirement in requirements {
+        let Some(object) = store.saved_object(&requirement.hash)? else {
+            return Err(ClientError::MissingObjects(vec![requirement.hash]));
+        };
+        if object.wire.len() as u64 != requirement.length {
+            return Err(ClientError::Storage);
+        }
+        objects.push(object);
+    }
+    let root = objects
+        .iter()
+        .find(|object| object.hash == *root_hash)
+        .cloned()
+        .ok_or(ClientError::Storage)?;
+    let map = objects.iter().cloned().map(|object| (object.hash, object)).collect();
+    let opened = TransferAssembler::open(roster, identity, &root, &map)?;
+    let actual: BTreeSet<_> = objects.iter().map(|object| object.hash).collect();
+    let required: BTreeSet<_> = opened.source().required_hashes().iter().copied().collect();
+    if actual != required || opened.source().required_hashes().len() != objects.len() {
+        return Err(ClientError::Storage);
+    }
+    Ok(opened)
+}
+
+/// Read one committed transport message again and prove it. Nothing is written.
+pub fn reopen_committed(
+    store: &ClientStore,
+    roster: &Roster,
+    identity: &CommIdentity,
+    key: &LogicalKey,
+    digest: &Id32,
+    source_root: &Id32,
+) -> ClientResult<AuthenticatedTransfer> {
+    let owner = identity.public().id;
+    store.check_association(roster, owner)?;
+    if key.vault != roster.vault || key.roster != roster_digest(roster)? || !(1..=3).contains(&key.sender)
+    {
+        return Err(ClientError::Identity);
+    }
+    let Some(saved) = store.saved_commitment(key)? else {
+        return Err(ClientError::Storage);
+    };
+    if saved.digest != *digest || saved.source_root != *source_root {
+        return Err(ClientError::Identity);
+    }
+    if saved.incoming == (key.sender == owner) {
+        return Err(ClientError::Identity);
+    }
+    let requirements = if saved.incoming {
+        load_requirement_pages(|after| store.recover_original_requirements(key, after, RECOVERY_PAGE))?
+    } else {
+        load_requirement_pages(|after| store.recover_requirements(key, owner, after, RECOVERY_PAGE))?
+    };
+    let opened = assemble_saved(store, roster, identity, &requirements, source_root)?;
+    if opened.message().body().key != *key
+        || opened.message().digest() != digest
+        || opened.source().recipient() != owner
+        || opened.source().key() != key
+        || opened.source().digest() != digest
+    {
+        return Err(ClientError::Identity);
+    }
+    Ok(opened)
+}
+
 /// Authenticate the owner's saved copy of one authored message and return its prerequisites.
 ///
 /// A missing object, a short requirement page, or a failed open stays unavailable. It is not
@@ -2135,6 +2257,28 @@ fn outgoing_prerequisites(
         return Ok(None);
     }
     Ok(Some(message.body().prerequisites.clone()))
+}
+
+#[cfg(test)]
+mod reopen_index {
+    use super::index_requirements;
+    use crate::RecoveryRequirement;
+
+    fn row(ordinal: u16, byte: u8) -> RecoveryRequirement {
+        RecoveryRequirement {
+            hash: [byte; 32],
+            length: 1024,
+            ordinal,
+        }
+    }
+
+    #[test]
+    fn duplicate_and_gapped_ordinals_fail_closed() {
+        assert!(index_requirements(&[row(0, 1), row(0, 2)]).is_err());
+        assert!(index_requirements(&[row(0, 1), row(2, 2)]).is_err());
+        assert!(index_requirements(&[row(0, 1), row(1, 1)]).is_err());
+        assert!(index_requirements(&[row(0, 1), row(1, 2)]).is_ok());
+    }
 }
 
 fn prerequisite_node(message: &AuthenticatedMessage) -> PrerequisiteNode {

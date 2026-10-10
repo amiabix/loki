@@ -805,6 +805,58 @@ impl ClientStore {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Pages the exact object list committed with one incoming original.
+    pub(crate) fn recover_original_requirements(
+        &self,
+        key: &LogicalKey,
+        after: Option<&Id32>,
+        limit: u16,
+    ) -> ClientResult<Vec<RecoveryRequirement>> {
+        page_bounds(0, limit)?;
+        if !(1..=3).contains(&key.sender) {
+            return Err(ClientError::Identity);
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT hash,wire_length,ordinal FROM incoming_original_objects WHERE vault=?1 AND roster=?2 AND sender=?3 AND message_id=?4 AND (?5 IS NULL OR hash>?5) ORDER BY hash LIMIT ?6",
+        )?;
+        let rows = statement.query_map(
+            params![key.vault, key.roster, key.sender, key.message, after, limit],
+            |row| {
+                Ok(RecoveryRequirement {
+                    hash: row_id(row, 0)?,
+                    length: row.get(1)?,
+                    ordinal: row.get(2)?,
+                })
+            },
+        )?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The committed digest and source root for one logical identity, if either table has it.
+    pub(crate) fn saved_commitment(&self, key: &LogicalKey) -> ClientResult<Option<SavedRecord>> {
+        if let Some(logical) = logical_at(&self.connection, key)? {
+            return Ok(Some(SavedRecord {
+                digest: logical.digest,
+                source_root: logical.source_root,
+                incoming: false,
+            }));
+        }
+        self.connection
+            .query_row(
+                "SELECT digest,source_root FROM incoming_originals WHERE vault=?1 AND roster=?2 AND sender=?3 AND message_id=?4",
+                params![key.vault, key.roster, key.sender, key.message],
+                |row| {
+                    Ok(SavedRecord {
+                        digest: row_id(row, 0)?,
+                        source_root: row_id(row, 1)?,
+                        incoming: true,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn recover_uploads(&self, after: u64, limit: u16) -> ClientResult<Vec<RecoveryUpload>> {
         page_bounds(after, limit)?;
         let mut statement = self.connection.prepare(

@@ -6,6 +6,7 @@ use loki_relay_protocol::{
     WireError,
 };
 use sha2::{Digest, Sha256};
+use std::fmt;
 
 const MAX_PACKAGE: usize = 16 * 1024 * 1024 + 128;
 const SIGNATURE_DOMAIN: &[u8] = b"Loki_Relay_Message_v1\0";
@@ -44,6 +45,17 @@ impl AuthenticatedMessage {
 
     pub fn digest(&self) -> &Id32 {
         &self.digest
+    }
+}
+
+impl fmt::Debug for AuthenticatedMessage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthenticatedMessage")
+            .field("sender", &self.body.key.sender)
+            .field("message", &self.body.key.message)
+            .field("digest", &self.digest)
+            .finish()
     }
 }
 

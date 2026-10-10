@@ -208,6 +208,56 @@ impl Mailbox {
     }
 }
 
+/// One saved recipient wire. The courier publishes these bytes without resealing them.
+pub struct EnvelopeRoute<'a> {
+    pub context: &'a SessionContext,
+    pub author: u16,
+    pub recipient: u16,
+    pub kind: MessageKind,
+}
+
+/// Signing transport. File delivery and relay delivery both use this boundary.
+pub trait SessionCourier {
+    fn publish(&mut self, route: &EnvelopeRoute<'_>, wire: &[u8]) -> Result<[u8; 32], String>;
+    fn receive(
+        &mut self,
+        own: &Identity,
+        roster: &BTreeMap<u16, PublicIdentity>,
+        context: &SessionContext,
+        kind: MessageKind,
+        sender: u16,
+    ) -> Result<Option<OpenedMessage>, String>;
+    fn drive_once(&mut self) -> Result<(), String>;
+}
+
+/// Explicit file mailbox. Relay mode does not construct this courier.
+pub struct FileCourier<'a>(pub &'a Mailbox);
+
+impl SessionCourier for FileCourier<'_> {
+    fn publish(&mut self, _: &EnvelopeRoute<'_>, wire: &[u8]) -> Result<[u8; 32], String> {
+        self.0.append(wire).map_err(|error| error.to_string())
+    }
+
+    fn receive(
+        &mut self,
+        own: &Identity,
+        roster: &BTreeMap<u16, PublicIdentity>,
+        context: &SessionContext,
+        kind: MessageKind,
+        sender: u16,
+    ) -> Result<Option<OpenedMessage>, String> {
+        Ok(self
+            .0
+            .read_for(own, roster, context)?
+            .into_iter()
+            .find(|message| message.kind() == kind && message.sender() == sender))
+    }
+
+    fn drive_once(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 /// Nonces exist only in this object. Dropping it abandons an unsigned attempt.
 struct LiveAttempt {
     context: SessionContext,
@@ -788,6 +838,21 @@ impl SigningSession {
         mailbox: &Mailbox,
         passphrase: &str,
     ) -> Result<[[u8; 32]; 2], String> {
+        self.publish_package_to_roster_with_courier(
+            roster,
+            package,
+            &mut FileCourier(mailbox),
+            passphrase,
+        )
+    }
+
+    pub fn publish_package_to_roster_with_courier(
+        &self,
+        roster: &BTreeMap<u16, PublicIdentity>,
+        package: &PackagePayload,
+        courier: &mut dyn SessionCourier,
+        passphrase: &str,
+    ) -> Result<[[u8; 32]; 2], String> {
         let own = self.own.public();
         if roster.keys().copied().collect::<Vec<_>>() != [1, 2, 3]
             || roster.get(&own.id) != Some(&own)
@@ -796,8 +861,25 @@ impl SigningSession {
         }
         let body = package.encode(&self.context)?;
         let digest: [u8; 32] = blake3::hash(&body).into();
+        let recipients = package_recipients(roster, own.id)?;
+        let routes = [
+            EnvelopeRoute {
+                context: &self.context,
+                author: own.id,
+                recipient: recipients[0],
+                kind: MessageKind::Package,
+            },
+            EnvelopeRoute {
+                context: &self.context,
+                author: own.id,
+                recipient: recipients[1],
+                kind: MessageKind::Package,
+            },
+        ];
         if self.store.dir.exists("package.sealed") {
-            return self.store.publish_package(mailbox, passphrase, &digest);
+            return self
+                .store
+                .publish_package(courier, passphrase, &digest, &routes);
         }
         let reviewed = review_batch(
             &self.context,
@@ -829,7 +911,8 @@ impl SigningSession {
                 .seal_session(peers[1], &self.context, MessageKind::Package, &body)?,
         ];
         self.store.save_package(&wires, &digest, passphrase)?;
-        self.store.publish_package(mailbox, passphrase, &digest)
+        self.store
+            .publish_package(courier, passphrase, &digest, &routes)
     }
 
     pub fn publish_commitments(
@@ -837,6 +920,16 @@ impl SigningSession {
         peer: &PublicIdentity,
         mailbox: &Mailbox,
     ) -> Result<[u8; 32], String> {
+        self.publish_commitments_with_courier(peer, &mut FileCourier(mailbox), "")
+    }
+
+    pub fn publish_commitments_with_courier(
+        &self,
+        peer: &PublicIdentity,
+        courier: &mut dyn SessionCourier,
+        passphrase: &str,
+    ) -> Result<[u8; 32], String> {
+        let _ = passphrase;
         if !self.context.pair.contains(&peer.id) || peer.id == self.own.public().id {
             return Err("commitment recipient is not selected peer".into());
         }
@@ -848,10 +941,25 @@ impl SigningSession {
             body.extend_from_slice(&(raw.len() as u16).to_be_bytes());
             body.extend_from_slice(&raw);
         }
-        let wire = self
-            .own
-            .seal_session(peer, &self.context, MessageKind::Commitment, &body)?;
-        mailbox.append(&wire).map_err(|e| e.to_string())
+        let route = EnvelopeRoute {
+            context: &self.context,
+            author: self.own.public().id,
+            recipient: peer.id,
+            kind: MessageKind::Commitment,
+        };
+        let wire = if passphrase.is_empty() {
+            self.own
+                .seal_session(peer, &self.context, MessageKind::Commitment, &body)?
+        } else if self.store.dir.exists("commitment.sealed") {
+            self.store.read_commitment(passphrase)?
+        } else {
+            let sealed = self
+                .own
+                .seal_session(peer, &self.context, MessageKind::Commitment, &body)?;
+            self.store.save_commitment(&sealed, passphrase)?;
+            sealed
+        };
+        courier.publish(&route, &wire)
     }
 
     pub fn review_package(
@@ -921,6 +1029,23 @@ impl SigningSession {
         mailbox: &Mailbox,
         passphrase: &str,
     ) -> Result<[u8; 32], String> {
+        self.publish_approved_with_courier(
+            reviewed,
+            peer,
+            finisher,
+            &mut FileCourier(mailbox),
+            passphrase,
+        )
+    }
+
+    pub fn publish_approved_with_courier(
+        &mut self,
+        reviewed: ReviewedPackage,
+        peer: &PublicIdentity,
+        finisher: &PublicIdentity,
+        courier: &mut dyn SessionCourier,
+        passphrase: &str,
+    ) -> Result<[u8; 32], String> {
         if reviewed.batch.context != self.context
             || reviewed.peer != peer.id
             || peer.id == self.own.public().id
@@ -937,7 +1062,8 @@ impl SigningSession {
             {
                 return Err("conflicting package after share release".into());
             }
-            return self.store.publish(mailbox, passphrase);
+            let routes = share_routes(&self.context, self.own.public().id, peer.id, finisher.id);
+            return self.store.publish(courier, passphrase, &routes);
         }
         let ReviewedPackage {
             batch,
@@ -971,7 +1097,8 @@ impl SigningSession {
             &package_hash,
             passphrase,
         )?;
-        self.store.publish(mailbox, passphrase)
+        let routes = share_routes(&self.context, self.own.public().id, peer.id, finisher.id);
+        self.store.publish(courier, passphrase, &routes)
     }
 
     pub fn abort(self) -> Result<(), String> {
@@ -985,7 +1112,33 @@ impl SigningSession {
         passphrase: &str,
         mailbox: &Mailbox,
     ) -> Result<[u8; 32], String> {
-        AttemptStore::reopen(root, context, own)?.publish(mailbox, passphrase)
+        Self::recover_share_with_courier(
+            root,
+            context,
+            own,
+            passphrase,
+            &mut FileCourier(mailbox),
+        )
+    }
+
+    pub fn recover_share_with_courier(
+        root: &Path,
+        context: &SessionContext,
+        own: u16,
+        passphrase: &str,
+        courier: &mut dyn SessionCourier,
+    ) -> Result<[u8; 32], String> {
+        let peer = context
+            .pair
+            .into_iter()
+            .find(|id| *id != own)
+            .ok_or("member is not in selected pair")?;
+        let finisher = [1u16, 2, 3]
+            .into_iter()
+            .find(|id| !context.pair.contains(id))
+            .ok_or("selected pair has no finisher")?;
+        let routes = share_routes(context, own, peer, finisher);
+        AttemptStore::reopen(root, context, own)?.publish(courier, passphrase, &routes)
     }
 
     /// Read only the two original ciphertext copies; no nonce or signing call is possible.
@@ -999,6 +1152,34 @@ impl SigningSession {
         Ok(wires)
     }
 
+    pub fn republish_saved_package(
+        root: &Path,
+        context: &SessionContext,
+        roster: &BTreeMap<u16, PublicIdentity>,
+        own: u16,
+        passphrase: &str,
+        courier: &mut dyn SessionCourier,
+    ) -> Result<[[u8; 32]; 2], String> {
+        let store = AttemptStore::reopen(root, context, own)?;
+        let (digest, _) = store.resend_package(passphrase)?;
+        let recipients = package_recipients(roster, own)?;
+        let routes = [
+            EnvelopeRoute {
+                context,
+                author: own,
+                recipient: recipients[0],
+                kind: MessageKind::Package,
+            },
+            EnvelopeRoute {
+                context,
+                author: own,
+                recipient: recipients[1],
+                kind: MessageKind::Package,
+            },
+        ];
+        store.publish_package(courier, passphrase, &digest, &routes)
+    }
+
     pub fn saved_package_wires(
         root: &Path,
         context: &SessionContext,
@@ -1008,6 +1189,49 @@ impl SigningSession {
         let (_, wires) = AttemptStore::reopen(root, context, own)?.resend_package(passphrase)?;
         Ok(wires)
     }
+}
+
+fn package_recipients(
+    roster: &BTreeMap<u16, PublicIdentity>,
+    author: u16,
+) -> Result<[u16; 2], String> {
+    let recipients: Vec<u16> = roster.keys().copied().filter(|id| *id != author).collect();
+    recipients
+        .try_into()
+        .map_err(|_| "package needs the two other roster members".to_string())
+}
+
+fn share_routes(
+    context: &SessionContext,
+    author: u16,
+    peer: u16,
+    finisher: u16,
+) -> [EnvelopeRoute<'_>; 2] {
+    [
+        EnvelopeRoute {
+            context,
+            author,
+            recipient: peer,
+            kind: MessageKind::Share,
+        },
+        EnvelopeRoute {
+            context,
+            author,
+            recipient: finisher,
+            kind: MessageKind::Share,
+        },
+    ]
+}
+
+fn publish_saved(
+    courier: &mut dyn SessionCourier,
+    wires: &[Vec<u8>; 2],
+    routes: &[EnvelopeRoute<'_>; 2],
+) -> Result<[[u8; 32]; 2], String> {
+    Ok([
+        courier.publish(&routes[0], &wires[0])?,
+        courier.publish(&routes[1], &wires[1])?,
+    ])
 }
 
 fn decode_share_body(
@@ -1213,6 +1437,33 @@ impl AttemptStore {
         Ok(Self { dir })
     }
 
+    fn save_commitment(&self, wire: &[u8], passphrase: &str) -> Result<(), String> {
+        crate::setup_transport::session_envelope(wire)?;
+        let mut out = Vec::with_capacity(4 + wire.len());
+        out.extend_from_slice(&(wire.len() as u32).to_be_bytes());
+        out.extend_from_slice(wire);
+        self.dir
+            .write_sealed("commitment.sealed", &out, passphrase)
+            .map_err(|e| e.to_string())
+    }
+
+    fn read_commitment(&self, passphrase: &str) -> Result<Vec<u8>, String> {
+        let raw = self
+            .dir
+            .read_sealed("commitment.sealed", passphrase)
+            .map_err(|e| e.to_string())?;
+        if raw.len() < 4 {
+            return Err("corrupt sealed commitment outbox".into());
+        }
+        let len = u32::from_be_bytes(raw[..4].try_into().unwrap()) as usize;
+        if raw.len() != 4 + len {
+            return Err("truncated sealed commitment".into());
+        }
+        let wire = raw[4..].to_vec();
+        crate::setup_transport::session_envelope(&wire)?;
+        Ok(wire)
+    }
+
     fn save_package(
         &self,
         wires: &[Vec<u8>; 2],
@@ -1263,18 +1514,17 @@ impl AttemptStore {
 
     fn publish_package(
         &self,
-        mailbox: &Mailbox,
+        courier: &mut dyn SessionCourier,
         passphrase: &str,
         digest: &[u8; 32],
+        routes: &[EnvelopeRoute<'_>; 2],
     ) -> Result<[[u8; 32]; 2], String> {
         let (saved_digest, wires) = self.resend_package(passphrase)?;
         if saved_digest != *digest {
             return Err("conflicting package for this attempt".into());
         }
-        Ok([
-            mailbox.append(&wires[0]).map_err(|e| e.to_string())?,
-            mailbox.append(&wires[1]).map_err(|e| e.to_string())?,
-        ])
+        let published = publish_saved(courier, &wires, routes)?;
+        Ok([published[0], published[1]])
     }
 
     /// Save exact encrypted share envelope bytes before their first delivery.
@@ -1339,15 +1589,20 @@ impl AttemptStore {
         self.decide(b'A')
     }
 
-    fn publish(&self, mailbox: &Mailbox, passphrase: &str) -> Result<[u8; 32], String> {
+    fn publish(
+        &self,
+        courier: &mut dyn SessionCourier,
+        passphrase: &str,
+        routes: &[EnvelopeRoute<'_>; 2],
+    ) -> Result<[u8; 32], String> {
         if fs::read(self.dir.path().join("decision")).map_err(|e| e.to_string())? != b"R" {
             return Err("attempt was aborted or release interrupted".into());
         }
         let (_, _, wires) = self.resend_share(passphrase)?;
+        let published = publish_saved(courier, &wires, routes)?;
         let mut hashes = [[0; 32]; 2];
-        for (i, wire) in wires.iter().enumerate() {
-            hashes[i] = mailbox.append(wire).map_err(|e| e.to_string())?;
-        }
+        hashes[0] = published[0];
+        hashes[1] = published[1];
         let marker: Vec<u8> = hashes.into_iter().flatten().collect();
         let path = self.dir.path().join("published");
         let mut random = [0; 16];

@@ -1,4 +1,7 @@
-use crate::{ClientError, ClientResult, Secret32};
+use crate::{
+    observe::{ObservationKind, ObservationSink},
+    ClientError, ClientResult, Secret32,
+};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::{Signature, VerifyingKey};
 use loki_relay_protocol::{
@@ -19,15 +22,24 @@ use reqwest::{
     Client, Response,
 };
 use sha2::{Digest, Sha256};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 const MAX_CONTROL: usize = 4096;
 pub struct RelayHttp {
     client: Client,
+    observer: ObservationSink,
 }
 impl RelayHttp {
     pub fn new() -> ClientResult<Self> {
+        Self::build(ObservationSink::disabled())
+    }
+
+    pub fn with_observer(observer: ObservationSink) -> ClientResult<Self> {
+        Self::build(observer)
+    }
+
+    fn build(observer: ObservationSink) -> ClientResult<Self> {
         Ok(Self {
             client: Client::builder()
                 .redirect(Policy::none())
@@ -40,7 +52,26 @@ impl RelayHttp {
                 .no_zstd()
                 .timeout(Duration::from_secs(10))
                 .build()?,
+            observer,
         })
+    }
+
+    fn note_request(&self, mailbox: &Id32, hash: Option<Id32>, bytes: Option<u64>) -> u64 {
+        let mut started = self.observer.begin(ObservationKind::RequestStart);
+        started.mailbox = Some(*mailbox);
+        started.object_hash = hash;
+        started.bytes = bytes;
+        let request = started.request;
+        self.observer.emit(started);
+        request
+    }
+
+    fn note_result(&self, request: u64, started: Instant, status: Option<u16>, result: &'static str) {
+        let mut ended = crate::Observation::new(ObservationKind::RequestEnd, request);
+        ended.status = status;
+        ended.duration = Some(started.elapsed());
+        ended.result = Some(result);
+        self.observer.emit(ended);
     }
     async fn control(
         &self,
@@ -171,21 +202,46 @@ impl RelayHttp {
             hex::encode(route.mailbox),
             hex::encode(object.hash)
         );
-        let mut response = self
+        let request = self.note_request(&route.mailbox, Some(object.hash), Some(object.wire.len() as u64));
+        let started = Instant::now();
+        let mut response = match self
             .client
             .put(url)
             .header(AUTHORIZATION, bearer(append)?)
             .header(CONTENT_TYPE, "application/octet-stream")
             .body(object.wire.clone())
             .send()
-            .await?;
-        let (status, body) = finish(&mut response, "application/cbor", RECEIPT_CAP, None).await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                self.note_result(request, started, None, "transport");
+                return Err(error.into());
+            }
+        };
+        let (status, body) = match finish(&mut response, "application/cbor", RECEIPT_CAP, None).await {
+            Ok(finished) => finished,
+            Err(error) => {
+                self.note_result(request, started, None, error.code());
+                return Err(error);
+            }
+        };
         // guard:put_status
         if status != 200 && status != 201 {
+            self.note_result(request, started, Some(status), "transport");
             return Err(ClientError::Transport);
         }
         // end:put_status
-        verify_receipt(route, &body, object.hash, object.wire.len() as u64, None)
+        match verify_receipt(route, &body, object.hash, object.wire.len() as u64, None) {
+            Ok(receipt) => {
+                self.note_result(request, started, Some(status), "ok");
+                Ok(receipt)
+            }
+            Err(error) => {
+                self.note_result(request, started, Some(status), error.code());
+                Err(error)
+            }
+        }
     }
 
     pub async fn get(

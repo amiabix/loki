@@ -3,8 +3,9 @@ use loki_poc::{
     intent::{ChangePolicy, Intent},
     setup_transport::Identity,
     signing_session::{
-        aggregate_and_apply, commitments_from_message, AttemptId, Mailbox, MessageKind,
-        PackagePayload, SessionContext, SigningSession,
+        aggregate_and_apply, commitments_from_message, AttemptId, EnvelopeRoute, FileCourier,
+        Mailbox, MessageKind, OpenedMessage, PackagePayload, SessionContext, SessionCourier,
+        SigningSession,
     },
     vault,
 };
@@ -17,6 +18,39 @@ use orchard::{
 use reddsa_frost::frost::redpallas as frost;
 use std::{collections::BTreeMap, fs};
 use zcash_protocol::{memo::MemoBytes, value::Zatoshis};
+
+struct RecordingCourier<'a> {
+    mailbox: &'a Mailbox,
+    published: Vec<(u16, u16, MessageKind, SessionContext, Vec<u8>)>,
+}
+
+impl SessionCourier for RecordingCourier<'_> {
+    fn publish(&mut self, route: &EnvelopeRoute<'_>, wire: &[u8]) -> Result<[u8; 32], String> {
+        self.published.push((
+            route.author,
+            route.recipient,
+            route.kind,
+            route.context.clone(),
+            wire.to_vec(),
+        ));
+        FileCourier(self.mailbox).publish(route, wire)
+    }
+
+    fn receive(
+        &mut self,
+        own: &Identity,
+        roster: &std::collections::BTreeMap<u16, loki_poc::setup_transport::PublicIdentity>,
+        context: &SessionContext,
+        kind: MessageKind,
+        sender: u16,
+    ) -> Result<Option<OpenedMessage>, String> {
+        FileCourier(self.mailbox).receive(own, roster, context, kind, sender)
+    }
+
+    fn drive_once(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
 
 fn scratch() -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -44,6 +78,10 @@ fn note(fvk: &orchard::keys::FullViewingKey, seed: u8) -> Note {
 fn signing_attempt_end_to_end() {
     let root = scratch();
     let relay = Mailbox::new(&root.join("relay")).unwrap();
+    let mut courier = RecordingCourier {
+        mailbox: &relay,
+        published: Vec::new(),
+    };
     let (shares, public) = frost::keys::generate_with_dealer(
         3,
         2,
@@ -132,8 +170,10 @@ fn signing_attempt_end_to_end() {
     )
     .unwrap();
 
-    a.publish_commitments(&bob_pub, &relay).unwrap();
-    b.publish_commitments(&alice_pub, &relay).unwrap();
+    a.publish_commitments_with_courier(&bob_pub, &mut courier, "alice pass")
+        .unwrap();
+    b.publish_commitments_with_courier(&alice_pub, &mut courier, "bob pass")
+        .unwrap();
     let a_inbox = relay.read_for(&alice_copy, &roster, &context).unwrap();
     let b_inbox = relay.read_for(&bob_copy, &roster, &context).unwrap();
     let a_peer = commitments_from_message(
@@ -217,8 +257,29 @@ fn signing_attempt_end_to_end() {
     assert!(bad_inbox.iter().all(|m| m.kind() != MessageKind::Share));
 
     let from_alice = a
-        .publish_package_to_roster(&roster, &payload, &relay, "alice pass")
+        .publish_package_to_roster_with_courier(&roster, &payload, &mut courier, "alice pass")
         .unwrap();
+    let package_wires: Vec<_> = courier
+        .published
+        .iter()
+        .filter(|item| item.2 == MessageKind::Package)
+        .collect();
+    assert_eq!(package_wires.len(), 2);
+    assert_ne!(package_wires[0].4, package_wires[1].4);
+    assert!(package_wires.iter().all(|item| {
+        item.0 == 1
+            && item.2 == MessageKind::Package
+            && item.3 == context
+            && (item.1 == 2 || item.1 == 3)
+    }));
+    assert_eq!(
+        package_wires.iter().map(|item| item.1).collect::<Vec<_>>(),
+        vec![2, 3]
+    );
+    assert!(courier
+        .published
+        .iter()
+        .all(|item| item.2 != MessageKind::Share));
     let saved_package =
         SigningSession::saved_package_wires(&root.join("alice"), &context, 1, "alice pass")
             .unwrap();
@@ -243,10 +304,22 @@ fn signing_attempt_end_to_end() {
     assert!(b_inbox.iter().all(|m| m.kind() != MessageKind::Share));
 
     let a_share_hash = a
-        .publish_approved(a_review, &bob_pub, &carol_pub, &relay, "alice pass")
+        .publish_approved_with_courier(a_review, &bob_pub, &carol_pub, &mut courier, "alice pass")
         .unwrap();
-    b.publish_approved(b_review, &alice_pub, &carol_pub, &relay, "bob pass")
+    b.publish_approved_with_courier(b_review, &alice_pub, &carol_pub, &mut courier, "bob pass")
         .unwrap();
+    let alice_shares: Vec<_> = courier
+        .published
+        .iter()
+        .filter(|item| item.0 == 1 && item.2 == MessageKind::Share)
+        .collect();
+    assert_eq!(alice_shares.len(), 2);
+    assert_ne!(alice_shares[0].4, alice_shares[1].4);
+    assert!(alice_shares.iter().all(|item| item.3 == context));
+    assert_eq!(
+        alice_shares.iter().map(|item| item.1).collect::<Vec<_>>(),
+        vec![2, 3]
+    );
     drop(a);
     drop(b);
 

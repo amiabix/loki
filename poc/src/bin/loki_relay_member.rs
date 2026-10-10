@@ -2,10 +2,10 @@
 //! Secret bytes stay in sealed files and are never written to stdout or stderr.
 
 use loki_poc::relay_member::{
-    load, ConfigStore, CourierImport, LoadedMember, MemberError, ProvisionTarget,
+    CourierImport, MemberError, ProvisionTarget, Session, SessionError,
 };
 use loki_relay_client::{
-    committed_readiness, open_descriptor, outbox_intent_digest, poll_once, prepare_outbox,
+    committed_readiness, outbox_intent_digest, poll_once, prepare_outbox,
     received_status, upload_pending, AuthenticatedDescriptor, CandidateReadiness, ClientConfig,
     ClientError, ClientStore, DiagnosticSample, DownloadRejection, PendingDownload,
     RecoveryLogical, RecoveryUpload, RelayHttp, RelayRuntime, RouteCursor, Secret32,
@@ -202,27 +202,15 @@ fn run() -> Result<(), Exit> {
     }
 }
 
-struct Session {
-    member: LoadedMember,
-    configs: ConfigStore,
-    db: ClientStore,
+fn session_exit(error: SessionError) -> Exit {
+    match error {
+        SessionError::Member(error) => Exit::Member(error),
+        SessionError::Client(error) => Exit::Client(error),
+    }
 }
 
 fn open_session(root: &Path, pass: &Path, roster: &Path) -> Result<Session, Exit> {
-    let member = load(root, pass, roster).map_err(Exit::Member)?;
-    let configs = ConfigStore::open(root, pass).map_err(Exit::Member)?;
-    // Transport state stays a direct child of the certified member root.
-    let db = ClientStore::open(
-        &root.join("transport"),
-        &member.roster,
-        member.identity.public().id,
-    )
-    .map_err(Exit::Client)?;
-    Ok(Session {
-        member,
-        configs,
-        db,
-    })
+    loki_poc::relay_member::open_session(root, pass, roster).map_err(session_exit)
 }
 
 fn provision(
@@ -1042,22 +1030,7 @@ fn provision_inputs(
 }
 
 fn routed(session: &Session) -> Result<(ClientConfig, AuthenticatedDescriptor), Exit> {
-    let config = session
-        .configs
-        .routing(&session.db, &session.member)
-        .map_err(Exit::Member)?;
-    let local = session
-        .configs
-        .load(&session.db, &session.member)
-        .map_err(Exit::Member)?
-        .ok_or(Exit::Member(MemberError::Sealed))?;
-    let wire = local
-        .self_wire
-        .as_ref()
-        .ok_or(Exit::Member(MemberError::Sealed))?;
-    let self_route = open_descriptor(&session.member.identity, &session.member.roster, wire)
-        .map_err(Exit::Client)?;
-    Ok((config, self_route))
+    loki_poc::relay_member::routed(session).map_err(session_exit)
 }
 
 fn print_reference(session: &Session) -> Result<(), Exit> {

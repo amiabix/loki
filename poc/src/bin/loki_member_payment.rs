@@ -6,7 +6,8 @@ use std::{
     env, fs,
     io::{self, Write},
     path::{Path, PathBuf},
-    process, thread,
+    process, sync::mpsc,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -17,8 +18,9 @@ use loki_poc::{
     rpc::Rpc,
     scan,
     signing_session::{
-        aggregate_and_apply, commitments_from_message, AttemptId, Mailbox, MessageKind,
-        OpenedMessage, PackagePayload, SessionContext, SigningSession,
+        aggregate_and_apply, commitments_from_message, AttemptId, EnvelopeRoute, FileCourier,
+        Mailbox, MessageKind, OpenedMessage, PackagePayload, SessionContext, SessionCourier,
+        SigningSession,
     },
     vault,
 };
@@ -52,6 +54,143 @@ fn number(value: &Value, field: &str) -> Result<u64, String> {
     value[field]
         .as_u64()
         .ok_or_else(|| format!("missing or invalid {field}"))
+}
+
+#[derive(Clone, Copy)]
+enum TransportMode {
+    File,
+    Relay,
+}
+
+fn split_transport(args: &[String]) -> Result<(Vec<String>, TransportMode), String> {
+    let mut positional = Vec::new();
+    let mut mode = TransportMode::File;
+    let mut seen = false;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--transport" {
+            if seen {
+                return Err("transport selected more than once".into());
+            }
+            seen = true;
+            let value = args.next().ok_or("missing transport value")?;
+            mode = match value.as_str() {
+                "file" => TransportMode::File,
+                "relay" => TransportMode::Relay,
+                _ => return Err("transport must be file or relay".into()),
+            };
+        } else if arg.starts_with("--") {
+            return Err(format!("unknown option {arg}"));
+        } else {
+            positional.push(arg.clone());
+        }
+    }
+    Ok((positional, mode))
+}
+
+fn wait_limit(mode: TransportMode) -> Duration {
+    match mode {
+        TransportMode::File => Duration::from_secs(120),
+        TransportMode::Relay => Duration::from_secs(300),
+    }
+}
+
+enum OwnedCourier {
+    File(Mailbox),
+    #[cfg(feature = "relay-communication")]
+    Relay(loki_poc::relay_courier::RelayCourier),
+}
+
+impl SessionCourier for OwnedCourier {
+    fn publish(&mut self, route: &EnvelopeRoute<'_>, wire: &[u8]) -> Result<[u8; 32], String> {
+        match self {
+            Self::File(mailbox) => FileCourier(mailbox).publish(route, wire),
+            #[cfg(feature = "relay-communication")]
+            Self::Relay(courier) => courier.publish(route, wire),
+        }
+    }
+
+    fn receive(
+        &mut self,
+        own: &loki_poc::setup_transport::Identity,
+        roster: &BTreeMap<u16, loki_poc::setup_transport::PublicIdentity>,
+        context: &SessionContext,
+        kind: MessageKind,
+        sender: u16,
+    ) -> Result<Option<OpenedMessage>, String> {
+        match self {
+            Self::File(mailbox) => FileCourier(mailbox).receive(own, roster, context, kind, sender),
+            #[cfg(feature = "relay-communication")]
+            Self::Relay(courier) => courier.receive(own, roster, context, kind, sender),
+        }
+    }
+
+    fn drive_once(&mut self) -> Result<(), String> {
+        match self {
+            Self::File(mailbox) => FileCourier(mailbox).drive_once(),
+            #[cfg(feature = "relay-communication")]
+            Self::Relay(courier) => courier.drive_once(),
+        }
+    }
+}
+
+fn open_courier(
+    mode: TransportMode,
+    member: &Path,
+    pass_file: &Path,
+    roster: &Path,
+    work: &Path,
+) -> Result<OwnedCourier, String> {
+    match mode {
+        TransportMode::File => Ok(OwnedCourier::File(
+            Mailbox::new(&work.join("mailbox")).map_err(|error| error.to_string())?,
+        )),
+        TransportMode::Relay => {
+            if work.join("mailbox").exists() {
+                return Err("relay mode refuses an existing file mailbox".into());
+            }
+            #[cfg(feature = "relay-communication")]
+            {
+                loki_poc::relay_courier::reserve_attempt(
+                    8 * 1024 * 1024 + 53,
+                    loki_poc::relay_courier::demo_quotas(),
+                )?;
+                return loki_poc::relay_courier::RelayCourier::open(member, pass_file, roster)
+                    .map(OwnedCourier::Relay);
+            }
+            #[cfg(not(feature = "relay-communication"))]
+            {
+                let _ = (member, pass_file, roster);
+                Err("relay transport requires the relay-communication feature".into())
+            }
+        }
+    }
+}
+
+fn settle_delivery(courier: &mut OwnedCourier, work: &Path) -> Result<(), String> {
+    #[cfg(not(feature = "relay-communication"))]
+    {
+        let _ = (courier, work);
+        return Ok(());
+    }
+    #[cfg(feature = "relay-communication")]
+    {
+        let OwnedCourier::Relay(relay) = courier else {
+            return Ok(());
+        };
+        let deadline = Instant::now() + Duration::from_secs(300);
+        loop {
+            if work.join("cancel").is_file() || Instant::now() >= deadline {
+                println!("delivery_pending");
+                return Ok(());
+            }
+            if relay.drive_once().is_ok() && relay.whole_attempt_stored().unwrap_or(false) {
+                println!("stored");
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
 }
 
 fn private_work(path: &Path) -> Result<(), String> {
@@ -240,19 +379,27 @@ fn prepare(args: &[String]) -> Result<(), String> {
 }
 
 fn wait_message(
-    mailbox: &Mailbox,
+    courier: &mut dyn SessionCourier,
     member: &MemberState,
     context: &SessionContext,
     kind: MessageKind,
     sender: u16,
+    work: &Path,
+    timeout: Duration,
 ) -> Result<OpenedMessage, String> {
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let deadline = Instant::now() + timeout;
     loop {
-        if let Some(message) = mailbox
-            .read_for(&member.identity, &member.roster.members, context)?
-            .into_iter()
-            .find(|message| message.kind() == kind && message.sender() == sender)
-        {
+        if work.join("cancel").is_file() {
+            return Err("cancelled".into());
+        }
+        courier.drive_once()?;
+        if let Some(message) = courier.receive(
+            &member.identity,
+            &member.roster.members,
+            context,
+            kind,
+            sender,
+        )? {
             return Ok(message);
         }
         if Instant::now() >= deadline {
@@ -347,6 +494,8 @@ fn candidate(
 fn confirm(
     intent: &Intent,
     summary: &loki_poc::signing_session::ReviewSummary,
+    courier: &mut dyn SessionCourier,
+    work: &Path,
 ) -> Result<(), String> {
     if summary.payment != intent.proposal_id()
         || summary.input_nullifiers != intent.input_nullifiers
@@ -371,21 +520,40 @@ fn confirm(
     );
     println!("Type APPROVE {} to sign:", hex::encode(summary.payment));
     io::stdout().flush().map_err(|e| e.to_string())?;
-    let mut line = String::new();
-    io::stdin()
-        .read_line(&mut line)
-        .map_err(|e| e.to_string())?;
-    if line.trim() != format!("APPROVE {}", hex::encode(summary.payment)) {
+    let expected = format!("APPROVE {}", hex::encode(summary.payment));
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let mut line = String::new();
+        let _ = io::stdin().read_line(&mut line);
+        let _ = sender.send(line);
+    });
+    let line = loop {
+        if work.join("cancel").is_file() {
+            return Err("cancelled".into());
+        }
+        match receiver.try_recv() {
+            Ok(line) => break line,
+            Err(mpsc::TryRecvError::Empty) => {
+                courier.drive_once()?;
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err("approval input closed".into());
+            }
+        }
+    };
+    if line.trim() != expected {
         return Err("approval declined or did not match payment ID".into());
     }
     Ok(())
 }
 
 fn sign(args: &[String]) -> Result<(), String> {
+    let (args, mode) = split_transport(args)?;
     if args.len() != 4 {
-        return Err("sign <member-dir> <passphrase-file> <roster.json> <work-dir>".into());
+        return Err("sign <member-dir> <passphrase-file> <roster.json> <work-dir> [--transport file|relay]".into());
     }
-    let (member, owner, pass) = state(args)?;
+    let (member, owner, pass) = state(&args)?;
     let own = member.identity.public().id;
     if own != 1 && own != 2 {
         return Err("this attempt selects only members 1 and 2".into());
@@ -393,12 +561,13 @@ fn sign(args: &[String]) -> Result<(), String> {
     let peer_id = if own == 1 { 2 } else { 1 };
     let peer = member.roster.members[&peer_id].clone();
     let finisher = member.roster.members[&3].clone();
-    let (context, intent) = manifest(&Path::new(&args[3]).join("payment.json"))?;
-    private_work(Path::new(&args[3]))?;
+    let work = PathBuf::from(&args[3]);
+    let (context, intent) = manifest(&work.join("payment.json"))?;
+    private_work(&work)?;
     if context.vault != member.vault {
         return Err("manifest names another vault".into());
     }
-    let mailbox = Mailbox::new(&Path::new(&args[3]).join("mailbox")).map_err(|e| e.to_string())?;
+    let mut courier = open_courier(mode, &owner, Path::new(&args[1]), Path::new(&args[2]), &work)?;
     let session_identity =
         loki_poc::setup_transport::Identity::from_secret_bytes(&member.identity.to_secret_bytes())?;
     let mut session = SigningSession::begin(
@@ -412,61 +581,83 @@ fn sign(args: &[String]) -> Result<(), String> {
         member.fvk.clone(),
         intent.input_nullifiers.len(),
     )?;
-    session.publish_commitments(&peer, &mailbox)?;
+    session.publish_commitments_with_courier(&peer, &mut courier, &pass)?;
     let commitment = wait_message(
-        &mailbox,
+        &mut courier,
         &member,
         &context,
         MessageKind::Commitment,
         peer_id,
+        &work,
+        wait_limit(mode),
     )?;
     let peer_commitments =
         commitments_from_message(&context, &commitment, intent.input_nullifiers.len())?;
     let package_message = if own == 1 {
         let payload = candidate(&member, &intent, &session, peer_commitments)?;
-        session.publish_package_to_roster(&member.roster.members, &payload, &mailbox, &pass)?;
+        session.publish_package_to_roster_with_courier(
+            &member.roster.members,
+            &payload,
+            &mut courier,
+            &pass,
+        )?;
         let wires =
             SigningSession::saved_package_wires(&owner.join("signing"), &context, own, &pass)?;
         member
             .identity
             .open_sent_session(&peer, &context, &wires[0])?
     } else {
-        wait_message(&mailbox, &member, &context, MessageKind::Package, 1)?
+        wait_message(
+            &mut courier,
+            &member,
+            &context,
+            MessageKind::Package,
+            1,
+            &work,
+            wait_limit(mode),
+        )?
     };
     let reviewed = session.review_package(&package_message, &peer)?;
-    confirm(&intent, reviewed.summary())?;
-    session.publish_approved(reviewed, &peer, &finisher, &mailbox, &pass)?;
+    confirm(&intent, reviewed.summary(), &mut courier, &work)?;
+    session.publish_approved_with_courier(reviewed, &peer, &finisher, &mut courier, &pass)?;
     println!(
         "approved payment {} as member {}",
         hex::encode(context.payment),
         own
     );
+    settle_delivery(&mut courier, &work)?;
     Ok(())
 }
 
 fn resend(args: &[String]) -> Result<(), String> {
+    let (args, mode) = split_transport(args)?;
     if args.len() != 4 {
-        return Err("resend <member-dir> <passphrase-file> <roster.json> <work-dir>".into());
+        return Err("resend <member-dir> <passphrase-file> <roster.json> <work-dir> [--transport file|relay]".into());
     }
-    let (member, owner, pass) = state(args)?;
+    let (member, owner, pass) = state(&args)?;
     let own = member.identity.public().id;
     if own != 1 && own != 2 {
         return Err("only a selected signer can resend".into());
     }
-    let work = Path::new(&args[3]);
-    private_work(work)?;
+    let work = PathBuf::from(&args[3]);
+    private_work(&work)?;
     let (context, _) = manifest(&work.join("payment.json"))?;
     if context.vault != member.vault {
         return Err("manifest names another vault".into());
     }
-    let mailbox = Mailbox::new(&work.join("mailbox")).map_err(|e| e.to_string())?;
+    let mut courier = open_courier(mode, &owner, Path::new(&args[1]), Path::new(&args[2]), &work)?;
     let root = owner.join("signing");
     if own == 1 {
-        for wire in SigningSession::saved_package_wires(&root, &context, own, &pass)? {
-            mailbox.append(&wire).map_err(|e| e.to_string())?;
-        }
+        SigningSession::republish_saved_package(
+            &root,
+            &context,
+            &member.roster.members,
+            own,
+            &pass,
+            &mut courier,
+        )?;
     }
-    SigningSession::recover_share(&root, &context, own, &pass, &mailbox)?;
+    SigningSession::recover_share_with_courier(&root, &context, own, &pass, &mut courier)?;
     println!(
         "resent exact saved approval for payment {}",
         hex::encode(context.payment)
@@ -533,24 +724,50 @@ fn prove(
 }
 
 fn finish(args: &[String]) -> Result<(), String> {
+    let (args, mode) = split_transport(args)?;
     if args.len() != 4 {
-        return Err("finish <member-dir> <passphrase-file> <roster.json> <work-dir>".into());
+        return Err("finish <member-dir> <passphrase-file> <roster.json> <work-dir> [--transport file|relay]".into());
     }
-    let (member, _, _) = state(args)?;
+    let (member, owner, _) = state(&args)?;
     if member.identity.public().id != 3 {
         return Err("this attempt requires member 3 as the independent finisher".into());
     }
-    let work = Path::new(&args[3]);
-    private_work(work)?;
+    let work = PathBuf::from(&args[3]);
+    private_work(&work)?;
     let (context, intent) = manifest(&work.join("payment.json"))?;
     if context.vault != member.vault {
         return Err("manifest names another vault".into());
     }
-    let mailbox = Mailbox::new(&work.join("mailbox")).map_err(|e| e.to_string())?;
-    let package = wait_message(&mailbox, &member, &context, MessageKind::Package, 1)?;
+    let mut courier = open_courier(mode, &owner, Path::new(&args[1]), Path::new(&args[2]), &work)?;
+    let limit = wait_limit(mode);
+    let package = wait_message(
+        &mut courier,
+        &member,
+        &context,
+        MessageKind::Package,
+        1,
+        &work,
+        limit,
+    )?;
     let payload = PackagePayload::decode(&context, package.body())?;
-    let alice_share = wait_message(&mailbox, &member, &context, MessageKind::Share, 1)?;
-    let bob_share = wait_message(&mailbox, &member, &context, MessageKind::Share, 2)?;
+    let alice_share = wait_message(
+        &mut courier,
+        &member,
+        &context,
+        MessageKind::Share,
+        1,
+        &work,
+        limit,
+    )?;
+    let bob_share = wait_message(
+        &mut courier,
+        &member,
+        &context,
+        MessageKind::Share,
+        2,
+        &work,
+        limit,
+    )?;
     let (signed, sighash, indices) = aggregate_and_apply(
         &context,
         &intent,
@@ -619,12 +836,13 @@ fn finalized_sighash(tx: &zcash_primitives::transaction::Transaction) -> Result<
 }
 
 fn verify(args: &[String]) -> Result<(), String> {
+    let (args, mode) = split_transport(args)?;
     if args.len() != 5 {
-        return Err("verify <member-dir> <passphrase-file> <roster.json> <work-dir> <txid>".into());
+        return Err("verify <member-dir> <passphrase-file> <roster.json> <work-dir> <txid> [--transport file|relay]".into());
     }
-    let (member, _, _) = state(args)?;
-    let work = Path::new(&args[3]);
-    private_work(work)?;
+    let (member, owner, _) = state(&args)?;
+    let work = PathBuf::from(&args[3]);
+    private_work(&work)?;
     let txid = &args[4];
     if txid.len() != 64 || !txid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err("txid must be 32 hexadecimal bytes".into());
@@ -654,8 +872,16 @@ fn verify(args: &[String]) -> Result<(), String> {
     if tx.txid().to_string() != *txid {
         return Err("mined transaction ID mismatch".into());
     }
-    let mailbox = Mailbox::new(&work.join("mailbox")).map_err(|e| e.to_string())?;
-    let package_message = wait_message(&mailbox, &member, &context, MessageKind::Package, 1)?;
+    let mut courier = open_courier(mode, &owner, Path::new(&args[1]), Path::new(&args[2]), &work)?;
+    let package_message = wait_message(
+        &mut courier,
+        &member,
+        &context,
+        MessageKind::Package,
+        1,
+        &work,
+        wait_limit(mode),
+    )?;
     let payload = PackagePayload::decode(&context, package_message.body())?;
     let pczt =
         pczt::Pczt::parse(&payload.candidate).map_err(|e| format!("candidate parse: {e:?}"))?;
@@ -758,11 +984,16 @@ fn verify(args: &[String]) -> Result<(), String> {
 }
 
 fn receive(args: &[String]) -> Result<(), String> {
+    let (args, mode) = split_transport(args)?;
     if args.len() != 5 {
-        return Err("receive <recipient-member-dir> <passphrase-file> <roster.json> <payment-work-dir> <txid>".into());
+        return Err("receive <recipient-member-dir> <passphrase-file> <roster.json> <payment-work-dir> <txid> [--transport file|relay]".into());
     }
-    let (recipient, _, _) = state(args)?;
-    let (_, intent) = manifest(&Path::new(&args[3]).join("payment.json"))?;
+    let (recipient, _, _) = state(&args)?;
+    let work = Path::new(&args[3]);
+    if matches!(mode, TransportMode::Relay) && work.join("mailbox").exists() {
+        return Err("relay mode refuses an existing file mailbox".into());
+    }
+    let (_, intent) = manifest(&work.join("payment.json"))?;
     let txid = &args[4];
     if txid.len() != 64 || !txid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err("txid must be 32 hexadecimal bytes".into());
