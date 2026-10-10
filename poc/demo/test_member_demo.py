@@ -1,5 +1,7 @@
 """The UI may release a share only after that member's CLI review reaches its prompt."""
 
+import json
+import socket
 import subprocess
 import sys
 import tempfile
@@ -140,6 +142,233 @@ class MemberDemoTest(unittest.TestCase):
         flow.leases.release(1)
         flow.background_pass(1)
         self.assertEqual(spawned, [1])
+
+    def test_interrupted_attempt_requires_reset(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        (root / "run").mkdir()
+        with patch.object(member_demo, "ROOT", root), patch.object(member_demo, "RUN", root / "run"):
+            flow = member_demo.Flow()
+        self.assertEqual(flow.phase, "interrupted")
+        self.assertIn("reset", flow.error)
+        with self.assertRaisesRegex(ValueError, "reset"):
+            flow.start(40_000_000, "paid")
+
+    def test_reset_stops_owned_relays_and_only_the_sandbox(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name).resolve()
+        outside = root.parent / f"outside-{root.name}"
+        outside.write_text("keep")
+        self.addCleanup(lambda: outside.unlink(missing_ok=True))
+        foreign = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        foreign.bind(("127.0.0.1", 0))
+        foreign.listen()
+        self.addCleanup(foreign.close)
+        with patch.object(member_demo, "ROOT", root), patch.object(member_demo, "RUN", root / "run"):
+            flow = member_demo.Flow()
+            flow.leases.reserve(1, "sign")
+            owner = member_demo.run.OwnedRun.create(root / "relay")
+            child = owner.start(
+                [sys.executable, "-c", "import time; time.sleep(60)"], cwd=owner.root)
+            flow.relay.owner = owner
+            flow.reset()
+            self.assertIsNotNone(child.poll())
+            self.assertFalse(root.exists())
+            self.assertEqual(outside.read_text(), "keep")
+            self.assertIsNone(flow.leases.holder[1])
+            flow.background_pass(1)
+        port = foreign.getsockname()[1]
+        with socket.create_connection(("127.0.0.1", port), timeout=1):
+            accepted, _ = foreign.accept()
+            accepted.close()
+
+    def test_close_stops_relays_and_a_browser_close_does_not(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name).resolve()
+        with patch.object(member_demo, "ROOT", root), patch.object(member_demo, "RUN", root / "run"):
+            flow = member_demo.Flow()
+            flow.phase = "waiting_for_reviews"
+            owner = member_demo.run.OwnedRun.create(root / "relay")
+            child = owner.start(
+                [sys.executable, "-c", "import time; time.sleep(60)"], cwd=owner.root)
+            flow.relay.owner = owner
+            flow.note_browser_closed()
+            self.assertEqual(flow.phase, "waiting_for_reviews")
+            self.assertIsNone(child.poll())
+            flow.chain.stop = lambda: None
+            flow.close()
+            self.assertIsNotNone(child.poll())
+            self.assertTrue(root.exists())
+
+    def test_finish_and_verify_hold_member_three_on_the_relay(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name).resolve()
+        payment = "ab" * 32
+        txid = "cd" * 32
+        ready = root / "finish-ready"
+        release = root / "finish-go"
+        args_path = root / "finish-args"
+        program = root / "payment-cli"
+        program.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s\\n' \"$@\" > '{args_path}.'\"$1\"\n"
+            "case \"$1\" in\n"
+            "  finish)\n"
+            f"    touch '{ready}'\n"
+            "    ticks=0\n"
+            f"    while [ ! -f '{release}' ] && [ \"$ticks\" -lt 40 ]; do sleep 0.05; ticks=$((ticks+1)); done\n"
+            f"    echo 'broadcast txid={txid} payment={payment}'\n"
+            "    ;;\n"
+            "  verify)\n"
+            f"    echo 'verified mined txid={txid}'\n"
+            "    ;;\n"
+            "  receive)\n"
+            f"    echo 'recipient independently decrypted txid={txid}'\n"
+            "    ;;\n"
+            "esac\n"
+        )
+        program.chmod(0o755)
+        mined = []
+        self.addCleanup(lambda: release.write_text("go"))
+        with patch.object(member_demo, "ROOT", root), patch.object(member_demo, "RUN", root / "run"):
+            flow = member_demo.Flow()
+            flow.phase = "ready_to_send"
+            flow.payment = {"id": payment}
+            flow.chain.mine = lambda count: mined.append(count)
+            flow.chain.client = SimpleNamespace(env=lambda: None)
+            with patch.object(member_demo, "binary", lambda name: program):
+                worker = threading.Thread(target=flow._finish)
+                worker.start()
+                deadline = time.monotonic() + 3
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists())
+                self.assertEqual(flow.leases.holder[3], "finish")
+                with self.assertRaisesRegex(RuntimeError, "busy"):
+                    flow.background_pass(3)
+                release.write_text("go")
+                worker.join(timeout=5)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(flow.phase, "confirmed")
+            self.assertEqual(mined, [3])
+            recorded = (args_path.with_name(args_path.name + ".finish")).read_text().splitlines()
+            self.assertEqual(recorded[0], "finish")
+            self.assertIn("--transport", recorded)
+            self.assertEqual(recorded[recorded.index("--transport") + 1], "relay")
+            verify_args = (args_path.with_name(args_path.name + ".verify")).read_text().splitlines()
+            self.assertEqual(verify_args[0], "verify")
+            self.assertEqual(verify_args[verify_args.index("--transport") + 1], "relay")
+            self.assertEqual(flow.state("admin", "http://127.0.0.1:8790")["delivery"], "pending")
+            self.assertIsNone(flow.leases.holder[3])
+
+    def test_pending_delivery_stays_distinct_from_approval(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name).resolve()
+        args_path = root / "resend-args"
+        program = root / "resend-cli"
+        program.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s\\n' \"$@\" > '{args_path}'\n"
+            "echo resent\n"
+        )
+        program.chmod(0o755)
+        with patch.object(member_demo, "ROOT", root), patch.object(member_demo, "RUN", root / "run"):
+            flow = member_demo.Flow()
+            flow.signers = {"alice": "approved", "bob": "approved"}
+            flow.phase = "ready_to_send"
+            flow.payment = {"id": "ab" * 32}
+            state = flow.state("admin", "http://127.0.0.1:8790")
+            self.assertEqual(state["signers"]["alice"], "approved")
+            self.assertEqual(state["delivery"], "pending")
+            self.assertNotIn("fetched", json.dumps(state))
+            flow.chain.client = SimpleNamespace(env=lambda: None)
+            with patch.object(member_demo, "binary", lambda name: program):
+                flow.resend_saved_share(1)
+            recorded = args_path.read_text().splitlines()
+            self.assertIn("resend", recorded)
+            self.assertIn("--transport", recorded)
+            self.assertEqual(recorded[recorded.index("--transport") + 1], "relay")
+            self.assertNotIn("file", recorded)
+            self.assertEqual(flow.state("admin", "http://127.0.0.1:8790")["delivery"], "pending")
+
+    def test_startup_reaps_only_a_matching_recorded_relay(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name).resolve()
+        relay = root / "relay"
+        relay.mkdir()
+        owned = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        stranger = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+
+        def stop(process):
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=3)
+
+        self.addCleanup(lambda: stop(owned))
+        self.addCleanup(lambda: stop(stranger))
+        identity = member_demo.relay_demo.process_identity(owned.pid)
+        (relay / "owned-children.json").write_text(json.dumps({
+            "version": 1,
+            "children": [
+                {"pid": owned.pid, "identity": identity},
+                {"pid": stranger.pid, "identity": "not-this-process"},
+            ],
+        }))
+        with patch.object(member_demo, "ROOT", root), patch.object(member_demo, "RUN", root / "run"):
+            member_demo.Flow()
+        self.assertIsNotNone(owned.wait(timeout=3))
+        self.assertIsNone(stranger.poll())
+
+    def snapshot_get(self, flow, path, token):
+        handler = member_demo.Handler.__new__(member_demo.Handler)
+        handler.path = path
+        handler.headers = {"X-Loki-Token": token}
+        handler.server = SimpleNamespace(server_port=8790)
+        captured = {}
+
+        def send(code, data, ctype):
+            del ctype
+            captured["code"] = code
+            captured["body"] = json.loads(data)
+
+        handler.send = send
+        with patch.object(member_demo, "FLOW", flow):
+            handler.do_GET()
+        return captured
+
+    def test_simultaneous_snapshot_gets_read_the_cache_only(self):
+        flow = self.flow()
+        page = {"version": 1, "section": "logical", "rows": [], "member": 1}
+        flow.relay.remember_snapshot(1, page)
+        flow.relay.service_snapshot = Mock(side_effect=AssertionError("GET opened a worker"))
+        spawned = []
+        barrier = threading.Barrier(2)
+        results = []
+
+        def one_get():
+            barrier.wait(timeout=3)
+            with patch("subprocess.Popen", side_effect=lambda *args, **kwargs: spawned.append(args)):
+                results.append(self.snapshot_get(
+                    flow, "/api/relay/snapshot?member=1", flow.tokens["admin"]))
+
+        threads = [threading.Thread(target=one_get) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=3)
+        self.assertEqual(spawned, [])
+        self.assertEqual([item["code"] for item in results], [200, 200])
+        self.assertEqual(results[0]["body"]["page"], page)
+        self.assertEqual(results[0]["body"]["stale"], False)
+        foreign = self.snapshot_get(flow, "/api/relay/snapshot?member=2", flow.tokens["alice"])
+        self.assertEqual(foreign["code"], 403)
+        flow.relay.service_snapshot.assert_not_called()
 
 
 if __name__ == "__main__":

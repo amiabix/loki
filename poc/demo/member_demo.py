@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 import threading
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -26,29 +27,9 @@ STATIC = DEMO / "static"
 sys.path.insert(0, str(POC))
 
 from managed_ths import ManagedTHS, command  # noqa: E402
+import relay_demo  # noqa: E402
 from relay_demo import RelayDemo  # noqa: E402
 import run  # noqa: E402
-
-
-class MemberLease:
-    """One store owner at a time. A payment command and a background pass share the lease."""
-
-    def __init__(self):
-        self._locks = {member_id: threading.Lock() for member_id in (1, 2, 3)}
-        self.holder = {member_id: None for member_id in (1, 2, 3)}
-
-    def reserve(self, member_id: int, kind: str) -> None:
-        if member_id not in self._locks:
-            raise ValueError("member must be 1, 2, or 3")
-        if not self._locks[member_id].acquire(blocking=False):
-            raise RuntimeError(f"member {member_id} store is busy")
-        self.holder[member_id] = kind
-
-    def release(self, member_id: int) -> None:
-        if self.holder.get(member_id) is None:
-            return
-        self.holder[member_id] = None
-        self._locks[member_id].release()
 
 
 def binary(name: str) -> Path:
@@ -63,23 +44,24 @@ def binary(name: str) -> Path:
 
 class Flow:
     def __init__(self):
+        relay_demo.reap_recorded(ROOT / "relay")
         self.lock = threading.RLock()
         self.cancel = threading.Event()
         self.chain = ManagedTHS(ROOT, lambda *_: None, self.cancel)
-        self.phase = "interrupted" if RUN.exists() else "idle"
-        self.error = None
+        interrupted = RUN.exists()
+        self.phase = "interrupted" if interrupted else "idle"
+        self.error = "an unfinished attempt was interrupted; reset to retry" if interrupted else None
         self.payment = None
         self.txid = None
+        self.delivery = "pending"
         self.review = {"alice": None, "bob": None}
         self.signers = {"alice": "waiting", "bob": "waiting"}
         self.processes = {}
         self.signer_threads = []
         self.worker = None
         self.substage = None
-        self.leases = MemberLease()
-        self.relay = RelayDemo(
-            ROOT, (ROOT / "loki-relay-server", ROOT / "loki_relay_member", ROOT / "loki_setup_member"),
-            self.cancel, None)
+        self.relay = self._new_relay()
+        self.leases = self.relay.leases
         self.tokens = {role: secrets.token_urlsafe(32) for role in ("admin", "alice", "bob")}
 
     def role(self, token: str) -> str | None:
@@ -93,6 +75,7 @@ class Flow:
                 "payment": self.payment, "txid": self.txid,
                 "signers": self.signers.copy(),
                 "substage": self.substage,
+                "delivery": self.delivery,
                 "network": self.chain.snapshot(),
             }
             if role in self.review:
@@ -177,24 +160,33 @@ class Flow:
             self.payment = payment
             self.phase = "waiting_for_reviews"
 
+    def _new_relay(self) -> RelayDemo:
+        return RelayDemo(
+            ROOT, (ROOT / "loki-relay-server", ROOT / "loki_relay_member", ROOT / "loki_setup_member"),
+            self.cancel, None)
+
+    def _payment_env(self):
+        return self.chain.client.env() if self.chain.client else None
+
     def _start_signers(self, transport: str = "relay") -> None:
         for name, number in (("alice", 1), ("bob", 2)):
-            self.leases.reserve(number, "sign")
             owner = RUN / "source" / f"member-{number}"
             args = [str(binary("loki_member_payment")), "sign", str(owner),
                     str(owner / "pass.txt"), str(RUN / "source" / "roster.json"),
                     str(RUN / "payment"), "--transport", transport]
-            process = subprocess.Popen(args, cwd=POC, env=self.chain.client.env(),
-                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                       stderr=subprocess.STDOUT, text=True, bufsize=1)
+            process = self.relay.start_payment(
+                number, args, interactive=True, env=self._payment_env(), cwd=str(POC))
             with self.lock:
                 self.processes[name] = process
             reader = threading.Thread(target=self._read_signer, args=(name, process, number), daemon=True)
+            self.relay.workers[number].stdout_thread = reader
             self.signer_threads.append(reader)
             reader.start()
 
     def background_pass(self, member_id: int) -> None:
         """A poll or snapshot pass uses the same lease as a payment command."""
+        if self.relay.paused.get(member_id):
+            raise RuntimeError(f"member {member_id} is paused")
         self.leases.reserve(member_id, "poll")
         try:
             self._spawn_member_command(member_id)
@@ -237,9 +229,6 @@ class Flow:
         except Exception as error:
             process.terminate()
             self._fail(error)
-        finally:
-            if member_id is not None:
-                self.leases.release(member_id)
 
     def decide(self, role: str, action: str):
         if role not in self.review or action not in ("approve", "decline"):
@@ -269,7 +258,10 @@ class Flow:
             owner = RUN / "source" / "member-3"
             base = [str(owner), str(owner / "pass.txt"), str(RUN / "source" / "roster.json"),
                     str(RUN / "payment")]
-            out = self._command([str(binary("loki_member_payment")), "finish", *base], timeout=900)
+            program = str(binary("loki_member_payment"))
+            out = self.relay.run_payment(
+                3, [program, "finish", *base, "--transport", "relay"],
+                timeout=900, env=self._payment_env(), cwd=str(POC))
             match = re.search(r"broadcast txid=([0-9a-f]{64}) payment=([0-9a-f]{64})", out)
             if not match or match.group(2) != self.payment["id"]:
                 raise RuntimeError("finisher did not return the expected payment")
@@ -278,12 +270,14 @@ class Flow:
                 self.txid = txid
                 self.phase = "broadcast"
             self.chain.mine(3)
-            verified = self._command([str(binary("loki_member_payment")), "verify", *base, txid])
+            verified = self.relay.run_payment(
+                3, [program, "verify", *base, "--transport", "relay", txid],
+                timeout=900, env=self._payment_env(), cwd=str(POC))
             recipient = RUN / "recipient" / "member-1"
             received = self._command([
-                str(binary("loki_member_payment")), "receive", str(recipient),
-                str(recipient / "pass.txt"), str(RUN / "recipient" / "roster.json"),
-                str(RUN / "payment"), txid,
+                program, "receive", str(recipient), str(recipient / "pass.txt"),
+                str(RUN / "recipient" / "roster.json"), str(RUN / "payment"),
+                "--transport", "relay", txid,
             ])
             if f"verified mined txid={txid}" not in verified or f"recipient independently decrypted txid={txid}" not in received:
                 raise RuntimeError("mined transaction verification did not match")
@@ -291,6 +285,18 @@ class Flow:
                 self.phase = "confirmed"
         except Exception as error:
             self._fail(error)
+
+    def resend_saved_share(self, member_id: int) -> str:
+        """Resend a saved share through the relay. Approval does not mean the share was fetched."""
+        if member_id not in (1, 2):
+            raise ValueError("only a selected signer can resend")
+        if self.delivery != "pending":
+            raise ValueError("saved-share resend is only while delivery is pending")
+        owner = RUN / "source" / f"member-{member_id}"
+        return self.relay.run_payment(member_id, [
+            str(binary("loki_member_payment")), "resend", str(owner), str(owner / "pass.txt"),
+            str(RUN / "source" / "roster.json"), str(RUN / "payment"), "--transport", "relay",
+        ], timeout=300, env=self._payment_env(), cwd=str(POC))
 
     def _fail(self, error: Exception):
         with self.lock:
@@ -315,21 +321,40 @@ class Flow:
         with self.lock:
             if self.worker and self.worker.is_alive():
                 raise ValueError("wait for the current operation to finish before resetting")
+        self.cancel.set()
         self._stop_signers()
+        try:
+            self.relay.settle(timeout=5)
+        except RuntimeError:
+            pass
+        self.relay.stop()
         with self.lock:
             self.chain.stop()
             if ROOT.exists():
                 shutil.rmtree(ROOT)
             self.cancel = threading.Event()
             self.chain = ManagedTHS(ROOT, lambda *_: None, self.cancel)
+            self.relay = self._new_relay()
+            self.leases = self.relay.leases
             self.phase = "idle"
             self.error = self.payment = self.txid = None
+            self.delivery = "pending"
+            self.substage = None
             self.review = {"alice": None, "bob": None}
             self.signers = {"alice": "waiting", "bob": "waiting"}
+
+    def note_browser_closed(self) -> None:
+        """Closing a browser leaves this controller and its relays running."""
+        return None
 
     def close(self):
         self.cancel.set()
         self._stop_signers()
+        try:
+            self.relay.settle(timeout=5)
+        except RuntimeError:
+            pass
+        self.relay.stop()
         if self.worker and self.worker.is_alive():
             self.worker.join(timeout=30)
             if self.worker.is_alive():
@@ -367,6 +392,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(401, {"error": "open a member link from the coordinator"})
             origin = f"http://127.0.0.1:{self.server.server_port}"
             return self.json(200, FLOW.state(role, origin))
+        if path == "/api/relay/snapshot":
+            role = self.role()
+            if not role:
+                return self.json(401, {"error": "open a member link from the coordinator"})
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            try:
+                member = int(query.get("member", ["0"])[0])
+            except ValueError:
+                return self.json(400, {"error": "member must be 1, 2, or 3"})
+            allowed = {"admin": {1, 2, 3}, "alice": {1}, "bob": {2}}.get(role, set())
+            if member not in allowed:
+                return self.json(403, {"error": "this member cannot view that relay member"})
+            return self.json(200, FLOW.relay.cached_snapshot(member))
         assets = {"/": ("member.html", "text/html; charset=utf-8"),
                   "/member.js": ("member.js", "text/javascript; charset=utf-8"),
                   "/member.css": ("member.css", "text/css; charset=utf-8")}
