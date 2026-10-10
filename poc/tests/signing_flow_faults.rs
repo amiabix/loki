@@ -1,0 +1,462 @@
+use loki_poc::{
+    candidate::{alpha_from_canonical_bytes, build_candidate, quote_fee, CandidateInputs, Regtest},
+    intent::{ChangePolicy, Intent},
+    setup_transport::Identity,
+    signing_session::{
+        aggregate_and_apply, AttemptId, Mailbox, MessageKind, PackagePayload, SessionContext,
+        SigningSession,
+    },
+    state::MemberDir,
+    vault,
+};
+use orchard::{
+    keys::Scope,
+    note::{RandomSeed, Rho},
+    value::NoteValue,
+    Note, NoteVersion,
+};
+use pczt::roles::{creator::Creator, io_finalizer::IoFinalizer};
+use reddsa_frost::frost::redpallas as frost;
+use std::{collections::BTreeMap, fs};
+use zcash_protocol::{memo::MemoBytes, value::Zatoshis};
+
+#[test]
+fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire() {
+    let root = std::env::temp_dir().join(format!(
+        "loki-signing-flow-{}",
+        hex::encode(AttemptId::random().0)
+    ));
+    fs::create_dir(&root).unwrap();
+    let alice_root = root.join("alice");
+    let bob_root = root.join("bob");
+    let mailbox = Mailbox::new(&root.join("relay")).unwrap();
+    let (shares, public) = frost::keys::generate_with_dealer(
+        3,
+        2,
+        frost::keys::IdentifierList::Default,
+        rand_core::OsRng,
+    )
+    .unwrap();
+    let alice_id = frost::Identifier::try_from(1u16).unwrap();
+    let bob_id = frost::Identifier::try_from(2u16).unwrap();
+    let alice_key = frost::keys::KeyPackage::try_from(shares[&alice_id].clone()).unwrap();
+    let bob_key = frost::keys::KeyPackage::try_from(shares[&bob_id].clone()).unwrap();
+    let ak: [u8; 32] = public
+        .verifying_key()
+        .serialize()
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let fvk = vault::test_only_fvk(&ak).unwrap();
+    let notes = [10u8, 20]
+        .into_iter()
+        .zip([625_000_000, 100_000_000])
+        .map(|(seed, value)| {
+            let rho = Rho::from_bytes(&[seed + 1; 32]).unwrap();
+            let rseed = RandomSeed::from_bytes([seed + 2; 32], &rho).unwrap();
+            Note::from_parts(
+                fvk.address_at(0u64, Scope::External),
+                NoteValue::from_raw(value),
+                rho,
+                rseed,
+                NoteVersion::V3,
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let recipient = fvk.address_at(7u64, Scope::External);
+    let memo = b"two spend approved payment".to_vec();
+    let amount = 700_000_000u64;
+    let mut inputs = CandidateInputs {
+        vault_fvk: &fvk,
+        notes: notes.clone(),
+        recipient,
+        amount: Zatoshis::const_from_u64(amount),
+        memo: MemoBytes::from_bytes(&memo).unwrap(),
+        change: Zatoshis::ZERO,
+        target_height: 700,
+        expiry_height: 1_152,
+    };
+    let fee = u64::from(quote_fee(&Regtest, &inputs).unwrap());
+    let change = 725_000_000 - amount - fee;
+    inputs.change = Zatoshis::const_from_u64(change);
+    let intent = Intent {
+        proposer: alice_id.serialize(),
+        created_height: 700,
+        input_nullifiers: notes
+            .iter()
+            .map(|note| note.nullifier(&fvk).to_bytes())
+            .collect(),
+        recipient: recipient.to_raw_address_bytes().to_vec(),
+        amount_zat: amount,
+        memo: memo.clone(),
+        change_policy: ChangePolicy::VaultInternal,
+        fee_zat: fee,
+        change_zat: change,
+        expiry_height: 1_152,
+    };
+    let ctx = SessionContext {
+        vault: ak,
+        payment: intent.proposal_id(),
+        attempt: AttemptId::random(),
+        pair: [1, 2],
+    };
+    let alice_identity = Identity::new(1);
+    let bob_identity = Identity::new(2);
+    let carol = Identity::new(3);
+    let carol_public = carol.public();
+    MemberDir::create(&alice_root, "secrets")
+        .unwrap()
+        .write_sealed("identity.sealed", &alice_identity.to_secret_bytes(), "pass")
+        .unwrap();
+    let alice_sender = Identity::from_secret_bytes(&alice_identity.to_secret_bytes()).unwrap();
+    let bob_sender = Identity::from_secret_bytes(&bob_identity.to_secret_bytes()).unwrap();
+    let alice_public = alice_identity.public();
+    let bob_public = bob_identity.public();
+    let mut alice = SigningSession::begin(
+        &alice_root,
+        ctx.clone(),
+        &ak,
+        intent.clone(),
+        alice_identity,
+        alice_key.clone(),
+        public.clone(),
+        fvk.clone(),
+        2,
+    )
+    .unwrap();
+    let mut bob = SigningSession::begin(
+        &bob_root,
+        ctx.clone(),
+        &ak,
+        intent.clone(),
+        bob_identity,
+        bob_key.clone(),
+        public.clone(),
+        fvk.clone(),
+        2,
+    )
+    .unwrap();
+    let mut sets = Vec::new();
+    let mut seeds = Vec::new();
+    let mut alphas = Vec::new();
+    for spend in 0..2 {
+        let set = BTreeMap::from([
+            (alice_id, alice.commitments()[spend].clone()),
+            (bob_id, bob.commitments()[spend].clone()),
+        ]);
+        let (randomized, seed) = frost_rerandomized::RandomizedParams::new_from_commitments(
+            public.verifying_key(),
+            &set,
+            rand_core::OsRng,
+        )
+        .unwrap();
+        let alpha_bytes: [u8; 32] = randomized.randomizer().serialize().try_into().unwrap();
+        alphas.push(alpha_from_canonical_bytes(&alpha_bytes).unwrap());
+        sets.push(set);
+        seeds.push(seed.try_into().unwrap());
+    }
+    let candidate_for = |payment_amount, change_amount| {
+        let candidate_inputs = CandidateInputs {
+            vault_fvk: &fvk,
+            notes: notes.clone(),
+            recipient,
+            amount: Zatoshis::const_from_u64(payment_amount),
+            memo: MemoBytes::from_bytes(&memo).unwrap(),
+            change: Zatoshis::const_from_u64(change_amount),
+            target_height: 700,
+            expiry_height: 1_152,
+        };
+        let built = build_candidate(
+            &Regtest,
+            &candidate_inputs,
+            &alphas,
+            rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng),
+        )
+        .unwrap();
+        let pczt = Creator::build_from_parts(built.pczt_parts).unwrap();
+        IoFinalizer::new(pczt)
+            .finalize_io()
+            .unwrap()
+            .serialize()
+            .unwrap()
+    };
+    let candidate = candidate_for(amount, change);
+    let send_to_bob = |payload: PackagePayload| {
+        let body = payload.encode(&ctx).unwrap();
+        let wire = alice_sender
+            .seal_session(&bob_public, &ctx, MessageKind::Package, &body)
+            .unwrap();
+        bob_sender.open_session(&alice_public, &ctx, &wire).unwrap()
+    };
+    let honest = PackagePayload {
+        candidate: candidate.clone(),
+        commitments: sets.clone(),
+        seeds: seeds.clone(),
+    };
+    let wrong_effects = send_to_bob(PackagePayload {
+        candidate: candidate_for(amount + 1, change - 1),
+        commitments: sets.clone(),
+        seeds: seeds.clone(),
+    });
+    assert!(bob.review_package(&wrong_effects, &alice_public).is_err());
+    let mut wrong_seeds = seeds.clone();
+    wrong_seeds[1][0] ^= 1;
+    let wrong_seed = send_to_bob(PackagePayload {
+        candidate: candidate.clone(),
+        commitments: sets.clone(),
+        seeds: wrong_seeds,
+    });
+    assert!(bob.review_package(&wrong_seed, &alice_public).is_err());
+    let mut wrong_sets = sets.clone();
+    let (_, other_commitment) =
+        frost::round1::commit(bob_key.signing_share(), &mut rand_core::OsRng);
+    wrong_sets[1].insert(bob_id, other_commitment);
+    let wrong_commitment = send_to_bob(PackagePayload {
+        candidate: candidate.clone(),
+        commitments: wrong_sets,
+        seeds: seeds.clone(),
+    });
+    assert!(bob
+        .review_package(&wrong_commitment, &alice_public)
+        .is_err());
+    let roster = BTreeMap::from([
+        (1, alice_public.clone()),
+        (2, bob_public.clone()),
+        (3, carol_public.clone()),
+    ]);
+    let package_hashes = alice
+        .publish_package_to_roster(&roster, &honest, &mailbox, "pass")
+        .unwrap();
+    let good = mailbox
+        .read_for(&bob_sender, &roster, &ctx)
+        .unwrap()
+        .into_iter()
+        .find(|message| message.wire_hash() == package_hashes[0])
+        .unwrap();
+    let reviewed = bob.review_package(&good, &alice_public).unwrap();
+    assert_eq!(reviewed.summary().vault, ak);
+    assert_eq!(reviewed.summary().payment, intent.proposal_id());
+    assert_eq!(reviewed.summary().attempt, ctx.attempt);
+    assert_eq!(reviewed.summary().pair, [1, 2]);
+    assert_eq!(
+        reviewed.summary().recipient,
+        recipient.to_raw_address_bytes()
+    );
+    assert_eq!(reviewed.summary().amount_zat, amount);
+    assert_eq!(reviewed.summary().memo, memo);
+    assert_eq!(reviewed.summary().fee_zat, fee);
+    assert_eq!(reviewed.summary().change_zat, change);
+    assert_eq!(reviewed.summary().expiry_height, 1_152);
+    assert_eq!(reviewed.summary().input_nullifiers, intent.input_nullifiers);
+    let bob_attempt = bob_root
+        .join(hex::encode(ctx.payment))
+        .join(hex::encode(ctx.attempt.0));
+    assert!(!bob_attempt.join("share.sealed").exists());
+    assert!(mailbox
+        .read_for(
+            &alice_sender,
+            &BTreeMap::from([(1, alice_public.clone()), (2, bob_public.clone())]),
+            &ctx
+        )
+        .unwrap()
+        .is_empty());
+    assert!(mailbox
+        .read_for(
+            &carol,
+            &BTreeMap::from([
+                (1, alice_public.clone()),
+                (2, bob_public.clone()),
+                (3, carol_public.clone()),
+            ]),
+            &ctx
+        )
+        .unwrap()
+        .iter()
+        .all(|message| message.kind() != MessageKind::Share));
+
+    let bob_share_hash = bob
+        .publish_approved(reviewed, &alice_public, &carol_public, &mailbox, "pass")
+        .unwrap();
+    let bob_saved = SigningSession::saved_share_wires(&bob_root, &ctx, 2, "pass").unwrap();
+    let forged_bob_wire = {
+        let opened = carol
+            .open_session(&bob_public, &ctx, &bob_saved[1])
+            .unwrap();
+        let mut body = opened.body().to_vec();
+        let first_len = u16::from_be_bytes(body[99..101].try_into().unwrap()) as usize;
+        let second_len_at = 101 + first_len;
+        let second_len =
+            u16::from_be_bytes(body[second_len_at..second_len_at + 2].try_into().unwrap()) as usize;
+        let second_start = second_len_at + 2;
+        body[second_start] ^= 1;
+        assert!(frost::round2::SignatureShare::deserialize(
+            &body[second_start..second_start + second_len]
+        )
+        .is_ok());
+        bob_sender
+            .seal_session(&carol_public, &ctx, MessageKind::Share, &body)
+            .unwrap()
+    };
+    let bob_wire = fs::read(root.join("relay").join(hex::encode(bob_share_hash))).unwrap();
+    drop(bob);
+    assert_eq!(
+        SigningSession::recover_share(&bob_root, &ctx, 2, "pass", &mailbox).unwrap(),
+        bob_share_hash
+    );
+    assert_eq!(
+        fs::read(root.join("relay").join(hex::encode(bob_share_hash))).unwrap(),
+        bob_wire
+    );
+    assert_eq!(
+        SigningSession::saved_share_wires(&bob_root, &ctx, 2, "pass").unwrap(),
+        bob_saved
+    );
+    assert_eq!(bob_saved[0], bob_wire);
+    assert_eq!(
+        fs::read(
+            root.join("relay")
+                .join(hex::encode(blake3::hash(&bob_saved[1]).as_bytes()))
+        )
+        .unwrap(),
+        bob_saved[1]
+    );
+    let package_for_alice = {
+        let body = PackagePayload {
+            candidate: candidate.clone(),
+            commitments: sets.clone(),
+            seeds: seeds.clone(),
+        }
+        .encode(&ctx)
+        .unwrap();
+        let wire = bob_sender
+            .seal_session(&alice_public, &ctx, MessageKind::Package, &body)
+            .unwrap();
+        mailbox.append(&wire).unwrap();
+        alice_sender.open_session(&bob_public, &ctx, &wire).unwrap()
+    };
+    let alice_review = alice
+        .review_package(&package_for_alice, &bob_public)
+        .unwrap();
+    assert_eq!(
+        alice_review.summary().candidate_hash,
+        *blake3::hash(&candidate).as_bytes()
+    );
+    let sighash = alice_review.summary().sighash;
+    alice
+        .publish_approved(alice_review, &bob_public, &carol_public, &mailbox, "pass")
+        .unwrap();
+    drop(alice);
+    drop(good);
+    drop(honest);
+    drop(wrong_effects);
+    drop(wrong_seed);
+    drop(wrong_commitment);
+    drop(package_for_alice);
+    drop(alice_sender);
+    drop(bob_sender);
+    drop(alice_key);
+    drop(bob_key);
+    drop(shares);
+    drop(candidate);
+    drop(sets);
+    drop(seeds);
+    drop(alphas);
+    drop(inputs);
+    drop(notes);
+    let roster = BTreeMap::from([(1, alice_public), (2, bob_public), (3, carol_public)]);
+    let inbox = mailbox.read_for(&carol, &roster, &ctx).unwrap();
+    let package = inbox
+        .iter()
+        .find(|m| m.kind() == MessageKind::Package)
+        .unwrap();
+    let package = PackagePayload::decode(&ctx, package.body()).unwrap();
+    let shares = inbox
+        .iter()
+        .filter(|m| m.kind() == MessageKind::Share)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(shares.len(), 2);
+    let (signed, checked_sighash, indices) = aggregate_and_apply(
+        &ctx,
+        &intent,
+        &ak,
+        &public,
+        &fvk,
+        &package,
+        &[shares[0].clone(), shares[1].clone()],
+    )
+    .unwrap();
+    assert_eq!(checked_sighash, sighash);
+    assert_eq!(indices.len(), 2);
+    assert!(indices
+        .iter()
+        .all(|i| signed.ironwood().actions()[*i].spend().witness().is_none()));
+    let forged = carol
+        .open_session(&roster[&2], &ctx, &forged_bob_wire)
+        .unwrap();
+    let alice_share = shares.iter().find(|m| m.sender() == 1).unwrap().clone();
+    let error = aggregate_and_apply(
+        &ctx,
+        &intent,
+        &ak,
+        &public,
+        &fvk,
+        &package,
+        &[alice_share, forged],
+    )
+    .err()
+    .expect("authenticated invalid Bob share must refuse the whole batch");
+    assert!(error.contains("member 2"), "{error}");
+    let restarted = Identity::from_secret_bytes(
+        &MemberDir::open(&alice_root, "secrets")
+            .read_sealed("identity.sealed", "pass")
+            .unwrap(),
+    )
+    .unwrap();
+    let saved = SigningSession::saved_share_wires(&alice_root, &ctx, 1, "pass").unwrap();
+    let own_share = restarted
+        .open_sent_session(&roster[&2], &ctx, &saved[0])
+        .unwrap();
+    let alice_inbox = mailbox.read_for(&restarted, &roster, &ctx).unwrap();
+    let peer_share = alice_inbox
+        .iter()
+        .find(|m| m.kind() == MessageKind::Share)
+        .unwrap()
+        .clone();
+    let package = alice_inbox
+        .iter()
+        .find(|m| m.kind() == MessageKind::Package)
+        .unwrap();
+    let package = PackagePayload::decode(&ctx, package.body()).unwrap();
+    let (_, restarted_sighash, restarted_indices) = aggregate_and_apply(
+        &ctx,
+        &intent,
+        &ak,
+        &public,
+        &fvk,
+        &package,
+        &[own_share.clone(), peer_share.clone()],
+    )
+    .unwrap();
+    assert_eq!(restarted_sighash, sighash);
+    assert_eq!(restarted_indices.len(), 2);
+    let sent_wires = SigningSession::saved_package_wires(&alice_root, &ctx, 1, "pass").unwrap();
+    let sent_package = restarted
+        .open_sent_session(&roster[&2], &ctx, &sent_wires[0])
+        .unwrap();
+    let sent_package = PackagePayload::decode(&ctx, sent_package.body()).unwrap();
+    let (_, publisher_sighash, publisher_indices) = aggregate_and_apply(
+        &ctx,
+        &intent,
+        &ak,
+        &public,
+        &fvk,
+        &sent_package,
+        &[own_share, peer_share],
+    )
+    .unwrap();
+    assert_eq!(publisher_sighash, sighash);
+    assert_eq!(publisher_indices.len(), 2);
+    fs::remove_dir_all(root).unwrap();
+}

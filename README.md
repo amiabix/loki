@@ -17,6 +17,7 @@ result documents, which are the authority.
 | **G3** (browser nonce safety) | **PARTIAL** and separate. 29/32 drills on Chromium, 6/8 on WebKit, Firefox would not launch, no physical device case tested |
 | **Second-device finishing** | seed-flow THS validation: a party holding none of the approvers' files completed both posted and re-proving paths with one and two inputs. Replicas carry confidential randomizer seeds ([evidence](poc/FROST-RANDOMIZER-RESULTS.md)) |
 | **Separate-member setup** | three isolated processes complete DKG; two stored shares sign the actual sighash of an offline, unproved Ironwood candidate for their ZIP 2005 vault. Each member verifies a 24-word and card backup before the regtest address appears, and a clean restore works without the exchange directory. Not yet connected to the mined payment CLI ([details](poc/SEPARATE-MEMBER-SETUP.md)) |
+| **Signing sessions** | library and offline test flow for one 2-of-3 attempt with explicit member review, fresh RAM-only nonces, encrypted member messages, sealed exact-share resend, and independent signature assembly. Not connected to the member setup, transaction CLI, or chain ([scope](poc/SIGNING-SESSION.md)) |
 | **Recovery, key rotation, custody** | local two-artifact restore demonstrated on regtest; independent spend, key rotation in the wallet, and custody readiness **not established** |
 
 ## Quick start
@@ -74,6 +75,7 @@ poc/
   src/                    the Rust prototype
     verify.rs             what a signer checks before agreeing to sign
     candidate.rs          building one unproved candidate per signing pair
+    signing_session.rs    offline member-driven attempt and encrypted mailbox
     scan.rs  witness.rs   finding the account's notes, rebuilding the commitment tree
     bin/loki.rs           the CLI: setup, scan, commit, propose, review-sign, finish …
   demo/                   a local account UI that drives the real prototype

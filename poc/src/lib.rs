@@ -27,6 +27,7 @@ pub mod rpc;
 pub mod scan;
 pub mod scanstate;
 pub mod setup_transport;
+pub mod signing_session;
 pub mod state;
 pub mod vault;
 pub mod verify;
