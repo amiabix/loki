@@ -87,7 +87,7 @@ class PublicReportTest(unittest.TestCase):
         run.run_faults = fake
         try:
             with tempfile.TemporaryDirectory() as temporary:
-                mapped = verify.transport_scenarios(Path(temporary), 60)
+                mapped = verify.transport_scenarios(Path(temporary) / "transport-scenarios", 60)
         finally:
             run.run_faults = original
         self.assertEqual(mapped["offline_delivery"]["outcome"], "passed")
