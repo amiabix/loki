@@ -28,11 +28,17 @@ No standalone node build or binary is required. See
 
 ```sh
 cd poc
-cargo build
-python3 demo/server.py          # account UI at http://127.0.0.1:8787
+cargo build --locked --bins
+python3 demo/member_demo.py     # separate-member payment UI at http://127.0.0.1:8790
 ```
 
-In the browser, create the account and click **Start the test network**. The demo
+Open the coordinator link printed in the terminal. It creates a disposable
+regtest vault and payment; open Alice and Bob's review links in separate browser
+sessions, approve in each, then ask Carol to prove and send. See
+[`poc/demo/MEMBER-DEMO.md`](poc/demo/MEMBER-DEMO.md) for the exact flow and limits.
+
+The earlier account UI is still available with `python3 demo/server.py` on port
+8787. In that browser UI, create the account and click **Start the test network**. It
 launches its own named THS environment, discovers free loopback ports, waits for
 the services, and funds the vault. Stop network, Reset, and graceful server
 shutdown delete that instance using `ths --name <instance> stop`. Closing a browser
@@ -78,7 +84,7 @@ poc/
     signing_session.rs    offline member-driven attempt and encrypted mailbox
     scan.rs  witness.rs   finding the account's notes, rebuilding the commitment tree
     bin/loki.rs           the CLI: setup, scan, commit, propose, review-sign, finish …
-  demo/                   a local account UI that drives the real prototype
+  demo/                   local account and separate-member payment UIs
   g3/                     the standalone browser nonce-safety prototype
   harness/                THS regtest setup and lifecycle instructions
   vendor/                 zakura-orchard and zakura-primitives, patched so a caller can choose

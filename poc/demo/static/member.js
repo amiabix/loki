@@ -151,8 +151,10 @@ function render() {
 async function refresh() {
   if (!token) { notice('Open the coordinator or member link printed by the server.', true); return; }
   try {
+    const firstLoad = !state;
     state = await api('/api/state');
     render();
+    if (firstLoad && state.role !== 'admin') show('queue');
   } catch (error) {
     notice(error.message, true);
   }
