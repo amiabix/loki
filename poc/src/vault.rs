@@ -9,8 +9,8 @@
 //!     rivk_ext = H^rivk_ext_qk(ak, nk)        keyed by qk, selected by use_qsk
 //! ```
 //!
-//! That derivation is implemented nowhere (see `DEPENDENCIES.md` finding B1), so this
-//! module takes the documented G1-TX deviation instead: `ak` is real, from the 2-of-3
+//! This module predates the local, unreviewed ZIP 2005 implementation in `zip2005`.
+//! It retains the documented G1-TX deviation: `ak` is real, from the 2-of-3
 //! DKG, and `nk`/`rivk` come from fixed test inputs that all three member processes
 //! share. The result exercises the v6 sign-before-proof transaction path and says
 //! nothing about key derivation.
@@ -100,12 +100,16 @@ pub fn test_only_address(fvk: &FullViewingKey) -> orchard::Address {
 ///
 /// Regtest only. The caller is responsible for the FVK's derivation and status.
 pub fn regtest_unified_address(fvk: &FullViewingKey) -> String {
+    regtest_unified_receiver(test_only_address(fvk).to_raw_address_bytes())
+}
+
+/// Render an Orchard receiver exactly as a Regtest unified address for review.
+pub fn regtest_unified_receiver(raw: [u8; 43]) -> String {
     use zcash_address::{
         unified::{Address as Ua, Encoding, Receiver},
         ToAddress, ZcashAddress,
     };
 
-    let raw = test_only_address(fvk).to_raw_address_bytes();
     let ua = Ua::try_from_items(vec![Receiver::Orchard(raw)])
         .expect("one Orchard receiver is a valid unified address");
 

@@ -1,6 +1,7 @@
 //! Signed, recipient-only transport for one DKG round-two share.
 //! A public identity must be checked against the group's out-of-band roster first.
 
+use crate::signing_session::{MessageKind, OpenedMessage, SessionContext};
 use blake2b_simd::Params;
 use chacha20poly1305::{
     aead::{Aead, Payload},
@@ -17,6 +18,11 @@ const BACKUP_MAGIC: &[u8; 8] = b"LOKIBKV1";
 const HEADER: usize = 8 + 32 + 2 + 2 + 24 + 4;
 const PUBLIC_HEADER: usize = 8 + 32 + 2 + 4;
 const SIGNATURE: usize = 64;
+const SESSION_MAGIC: &[u8; 8] = b"LOKISGN1";
+const SESSION_INNER: &[u8; 8] = b"LOKISGIP";
+const SESSION_HEADER: usize = 8 + 1 + 24 + 4;
+const SESSION_INNER_HEADER: usize = 150;
+const SESSION_LIMIT: usize = SESSION_HEADER + 8 * 1024 * 1024 + 16;
 
 pub struct Identity {
     id: u16,
@@ -263,4 +269,220 @@ impl Identity {
             .try_into()
             .expect("BLAKE2b output is 32 bytes"))
     }
+
+    /// Encrypt a signing packet. All context, member IDs, type, and body are inside
+    /// the AEAD. The outer envelope exposes only a version, nonce, and length bucket.
+    pub fn seal_session(
+        &self,
+        recipient: &PublicIdentity,
+        context: &SessionContext,
+        kind: MessageKind,
+        body: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        context.validate()?;
+        if self.id == recipient.id
+            || !context.pair.contains(&self.id)
+            || !(1..=3).contains(&recipient.id)
+            || (!context.pair.contains(&recipient.id)
+                && !matches!(kind, MessageKind::Package | MessageKind::Share))
+            || body.len() > kind.max_body()
+        {
+            return Err("invalid signing sender, recipient, or body size".into());
+        }
+        let mut inner = Vec::with_capacity(SESSION_INNER_HEADER + body.len() + SIGNATURE);
+        inner.extend_from_slice(SESSION_INNER);
+        inner.push(1);
+        inner.extend_from_slice(&context.vault);
+        inner.extend_from_slice(&context.payment);
+        inner.extend_from_slice(&context.attempt.0);
+        for id in context.pair {
+            inner.extend_from_slice(&id.to_be_bytes());
+        }
+        inner.extend_from_slice(&self.id.to_be_bytes());
+        inner.extend_from_slice(&recipient.id.to_be_bytes());
+        inner.push(kind as u8);
+        inner.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        let transcript = session_transcript(&inner[..118], body);
+        inner.extend_from_slice(&transcript);
+        inner.extend_from_slice(body);
+        inner.extend_from_slice(&self.signing.sign(&inner).to_bytes());
+        let bucket = (inner.len().max(1024)).next_power_of_two();
+        if bucket > 8 * 1024 * 1024 {
+            return Err("signing message exceeds envelope bucket".into());
+        }
+        inner.resize(bucket, 0);
+        let mut header = Vec::with_capacity(SESSION_HEADER);
+        header.extend_from_slice(SESSION_MAGIC);
+        header.push(1);
+        let mut nonce = [0; 24];
+        OsRng.fill_bytes(&mut nonce);
+        header.extend_from_slice(&nonce);
+        header.extend_from_slice(&((bucket + 16) as u32).to_be_bytes());
+        let key = self.session_key(recipient, context)?;
+        let ciphertext = XChaCha20Poly1305::new(&key.into())
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &inner,
+                    aad: &header,
+                },
+            )
+            .map_err(|_| "signing message encryption failed")?;
+        header.extend_from_slice(&ciphertext);
+        Ok(header)
+    }
+
+    /// Try a specific roster peer and locally selected attempt context. Wrong-context
+    /// packets cannot decrypt, so a shared mailbox can carry unrelated attempts.
+    pub fn open_session(
+        &self,
+        sender: &PublicIdentity,
+        context: &SessionContext,
+        wire: &[u8],
+    ) -> Result<OpenedMessage, String> {
+        self.open_session_inner(sender, sender, self.id, context, wire)
+    }
+
+    /// Reopen one of this member's own exact outbound wires from its sealed outbox.
+    /// This lets a selected signer finish after restart without keeping nonce secrets.
+    pub fn open_sent_session(
+        &self,
+        recipient: &PublicIdentity,
+        context: &SessionContext,
+        wire: &[u8],
+    ) -> Result<OpenedMessage, String> {
+        let own = self.public();
+        self.open_session_inner(&own, recipient, recipient.id, context, wire)
+    }
+
+    fn open_session_inner(
+        &self,
+        sender: &PublicIdentity,
+        box_peer: &PublicIdentity,
+        recipient: u16,
+        context: &SessionContext,
+        wire: &[u8],
+    ) -> Result<OpenedMessage, String> {
+        context.validate()?;
+        session_envelope(wire)?;
+        if sender.id == recipient
+            || !context.pair.contains(&sender.id)
+            || !(1..=3).contains(&recipient)
+        {
+            return Err("sender or recipient outside signing pair".into());
+        }
+        let key = self.session_key(box_peer, context)?;
+        let inner = XChaCha20Poly1305::new(&key.into())
+            .decrypt(
+                XNonce::from_slice(&wire[9..33]),
+                Payload {
+                    msg: &wire[SESSION_HEADER..],
+                    aad: &wire[..SESSION_HEADER],
+                },
+            )
+            .map_err(|_| "signing message is not for this member and attempt")?;
+        if inner.len() < SESSION_INNER_HEADER + SIGNATURE
+            || &inner[..8] != SESSION_INNER
+            || inner[8] != 1
+            || inner[9..41] != context.vault
+            || inner[41..73] != context.payment
+            || inner[73..105] != context.attempt.0
+            || inner[105..107] != context.pair[0].to_be_bytes()
+            || inner[107..109] != context.pair[1].to_be_bytes()
+            || inner[109..111] != sender.id.to_be_bytes()
+            || inner[111..113] != recipient.to_be_bytes()
+        {
+            return Err("signing inner context mismatch".into());
+        }
+        let kind = MessageKind::try_from(inner[113])?;
+        if !context.pair.contains(&recipient)
+            && !matches!(kind, MessageKind::Package | MessageKind::Share)
+        {
+            return Err("third member may receive only package or share copies".into());
+        }
+        let size = u32::from_be_bytes(inner[114..118].try_into().unwrap()) as usize;
+        if size > kind.max_body() || SESSION_INNER_HEADER + size + SIGNATURE > inner.len() {
+            return Err("invalid signing body length".into());
+        }
+        let body = &inner[SESSION_INNER_HEADER..SESSION_INNER_HEADER + size];
+        let transcript = session_transcript(&inner[..118], body);
+        if inner[118..150] != transcript {
+            return Err("signing transcript mismatch".into());
+        }
+        let signed_end = SESSION_INNER_HEADER + size;
+        let signature = ed25519_dalek::Signature::from_bytes(
+            inner[signed_end..signed_end + SIGNATURE]
+                .try_into()
+                .unwrap(),
+        );
+        let verify =
+            VerifyingKey::from_bytes(&sender.signing).map_err(|_| "invalid signing sender key")?;
+        verify
+            .verify_strict(&inner[..signed_end], &signature)
+            .map_err(|_| "signing message signature failed")?;
+        if inner[signed_end + SIGNATURE..].iter().any(|b| *b != 0) {
+            return Err("noncanonical signing envelope padding".into());
+        }
+        Ok(OpenedMessage {
+            context: context.clone(),
+            sender: sender.id,
+            recipient,
+            kind,
+            body: body.to_vec(),
+            wire_hash: blake3::hash(wire).into(),
+            transcript_hash: transcript,
+        })
+    }
+
+    fn session_key(
+        &self,
+        peer: &PublicIdentity,
+        context: &SessionContext,
+    ) -> Result<[u8; 32], String> {
+        let shared = self
+            .encryption
+            .diffie_hellman(&PublicKey::from(peer.encryption));
+        if !shared.was_contributory() {
+            return Err("invalid signing encryption public key".into());
+        }
+        let mut hash = Params::new()
+            .hash_length(32)
+            .personal(b"Loki_Sign_Box_v1")
+            .to_state();
+        hash.update(&context.vault);
+        hash.update(&context.payment);
+        hash.update(&context.attempt.0);
+        for id in context.pair {
+            hash.update(&id.to_be_bytes());
+        }
+        hash.update(shared.as_bytes());
+        Ok(hash.finalize().as_bytes().try_into().unwrap())
+    }
+}
+
+fn session_transcript(meta: &[u8], body: &[u8]) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new_derive_key("Loki signing message transcript v1");
+    hash.update(meta);
+    hash.update(body);
+    hash.finalize().into()
+}
+
+/// Validate only the public bucketed envelope. All identifying data is encrypted.
+pub fn session_envelope(wire: &[u8]) -> Result<(), String> {
+    if wire.len() < SESSION_HEADER + 1024 + 16
+        || wire.len() > SESSION_LIMIT
+        || &wire[..8] != SESSION_MAGIC
+        || wire[8] != 1
+    {
+        return Err("invalid signing envelope or version".into());
+    }
+    let size = u32::from_be_bytes(wire[33..37].try_into().unwrap()) as usize;
+    if size < 1024 + 16
+        || size - 16 > 8 * 1024 * 1024
+        || !(size - 16).is_power_of_two()
+        || wire.len() != SESSION_HEADER + size
+    {
+        return Err("invalid signing envelope bucket".into());
+    }
+    Ok(())
 }

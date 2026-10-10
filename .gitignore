@@ -9,6 +9,8 @@ poc/g3/node_modules/
 # throwaway regtest account. Never commit it.
 poc/demo/.sandbox/
 poc/demo/.sandbox-server.lock
+poc/demo/.member-sandbox/
+poc/demo/.member-sandbox.lock
 
 # Any run state directory: member key packages, nonce secrets, note secrets.
 /tmp/loki-*

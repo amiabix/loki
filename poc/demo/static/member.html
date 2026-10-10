@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Loki | Member payment demo</title>
+  <link rel="stylesheet" href="/member.css">
+  <script src="/member.js" defer></script>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <a class="brand" href="/" aria-label="Loki home"><span class="brand-icon">◈</span><span>Loki</span></a>
+      <div class="side-group">
+        <span class="side-caption">Vault</span>
+        <nav aria-label="Vault navigation">
+          <button class="nav-item active" data-view="overview" type="button">Overview</button>
+          <button class="nav-item" data-view="queue" type="button">Transaction queue <span id="queue-count">0</span></button>
+          <button class="nav-item" data-view="history" type="button">History</button>
+        </nav>
+      </div>
+      <div class="side-bottom">
+        <div class="side-role" id="side-role">Opening session…</div>
+        <div class="side-hint">Local regtest demo. This server holds the test member files.</div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div><span class="crumb">Loki vault</span><h1 id="page-title">Overview</h1></div>
+        <span class="network-badge" id="network-badge">Regtest offline</span>
+      </header>
+      <div id="error" class="notice error" role="alert" hidden></div>
+      <div id="info" class="notice" role="status" hidden></div>
+
+      <section class="view active" id="overview">
+        <div class="intro">
+          <div><p class="intro-kicker">2 of 3 shielded vault</p><h2>One payment. Two approvals.</h2>
+          <p>Alice and Bob review the same Ironwood payment in separate browser sessions. Carol finishes it after both approve.</p></div>
+          <div class="threshold"><strong id="threshold-value">0 / 2</strong><span>approvals</span></div>
+        </div>
+        <div class="grid">
+          <section class="panel"><h3>Vault address</h3><p class="address" id="source-address">Created when the test starts</p></section>
+          <section class="panel"><h3>Payment state</h3><p class="large" id="phase-label">Not started</p><p class="muted" id="phase-help">Create a regtest payment to begin.</p></section>
+        </div>
+        <section class="panel" id="start-panel">
+          <div class="panel-head"><div><h3>Create a test payment</h3><p>The demo creates a source vault and an independent recipient, funds the source, and prepares one payment.</p></div></div>
+          <form id="start-form">
+            <label>Amount (ZEC)<input id="amount" type="number" min="0.00000001" max="0.99999999" step="0.00000001" value="0.4" required></label>
+            <label>Memo<input id="memo" type="text" maxlength="512" value="separate member payment" required></label>
+            <button class="button primary" type="submit">Create test payment</button>
+          </form>
+        </section>
+        <section class="panel" id="links-panel" hidden>
+          <div class="panel-head"><div><h3>Open member windows</h3><p>Launch Alice and Bob in separate windows. Each window shows its member's verified review.</p></div></div>
+          <div class="links" id="member-links"></div>
+        </section>
+      </section>
+
+      <section class="view" id="queue">
+        <div class="section-head"><div><h2>Transaction queue</h2><p>Approvals are collected off chain. A transaction is confirmed only after the local node mines it.</p></div></div>
+        <div class="empty" id="queue-empty">No pending payment. Create one from Overview.</div>
+        <article class="payment" id="payment-card" hidden>
+          <div class="payment-top"><div><span class="type">Send ZEC</span><h3 id="payment-amount">—</h3><p id="payment-recipient">—</p></div><span class="status" id="payment-status">Waiting</span></div>
+          <div class="payment-details" id="payment-details"></div>
+          <div class="approval-head"><h4>Confirmations</h4><span id="approval-total">0 of 2</span></div>
+          <div class="approvals" id="approvals"></div>
+          <div class="review" id="review-panel" hidden>
+            <h4>Your verified review</h4>
+            <p>These values came from this member’s transaction check. Confirm only if they match what you intend.</p>
+            <div id="review-lines" class="review-lines"></div>
+            <div class="actions"><button class="button primary" id="approve" type="button">Confirm payment</button><button class="button quiet" id="decline" type="button">Decline</button></div>
+          </div>
+          <div class="payment-footer" id="finish-panel" hidden><p>Two members approved this exact attempt. Carol can now prove and send it.</p><button class="button primary" id="finish" type="button">Prove and send</button></div>
+        </article>
+      </section>
+
+      <section class="view" id="history">
+        <div class="section-head"><div><h2>History</h2><p>Only payments observed on the regtest chain appear as confirmed.</p></div></div>
+        <div class="empty" id="history-empty">No confirmed payment yet.</div>
+        <article class="panel history-item" id="history-item" hidden><span class="success-mark">✓</span><div><strong>Payment confirmed</strong><p id="history-txid"></p><span>Source and recipient vaults both verified the mined transaction.</span></div></article>
+      </section>
+      <footer class="footer"><span>Research prototype · regtest funds only</span><button class="text-button" id="reset" type="button" hidden>Reset demo</button></footer>
+    </main>
+  </div>
+</body>
+</html>

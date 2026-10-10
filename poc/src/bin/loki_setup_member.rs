@@ -13,90 +13,12 @@ use std::{
 use bip39::{Language, Mnemonic};
 use blake2b_simd::Params;
 use loki_poc::{
-    distributed_setup::Member,
-    setup_transport::{Identity, PublicIdentity},
-    state::MemberDir,
+    distributed_setup::Member, member_state::Roster, setup_transport::Identity, state::MemberDir,
     vault, zip2005,
 };
 use rand_core::{OsRng, RngCore};
 use reddsa_frost::frost::redpallas as frost;
 use zeroize::Zeroize;
-
-struct Roster {
-    vault: [u8; 32],
-    members: BTreeMap<u16, PublicIdentity>,
-}
-
-impl Roster {
-    fn load(path: &Path) -> Result<Self, String> {
-        let data: serde_json::Value =
-            serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
-                .map_err(|e| e.to_string())?;
-        let vault = hex32(
-            data.get("vault")
-                .and_then(|v| v.as_str())
-                .ok_or("missing vault id")?,
-        )?;
-        let entries = data
-            .get("members")
-            .and_then(|v| v.as_array())
-            .ok_or("missing members")?;
-        let mut members = BTreeMap::new();
-        for entry in entries {
-            let id: u16 = entry
-                .get("id")
-                .and_then(|v| v.as_u64())
-                .ok_or("missing member id")?
-                .try_into()
-                .map_err(|_| "invalid member id")?;
-            let signing = hex32(
-                entry
-                    .get("signing")
-                    .and_then(|v| v.as_str())
-                    .ok_or("missing signing key")?,
-            )?;
-            let encryption = hex32(
-                entry
-                    .get("encryption")
-                    .and_then(|v| v.as_str())
-                    .ok_or("missing encryption key")?,
-            )?;
-            ed25519_dalek::VerifyingKey::from_bytes(&signing)
-                .map_err(|_| "invalid signing public key")?;
-            if members
-                .insert(
-                    id,
-                    PublicIdentity {
-                        id,
-                        signing,
-                        encryption,
-                    },
-                )
-                .is_some()
-            {
-                return Err("duplicate member in roster".into());
-            }
-        }
-        if members.keys().copied().collect::<Vec<_>>() != [1, 2, 3] {
-            return Err("roster must have exactly members 1, 2 and 3".into());
-        }
-        Ok(Self { vault, members })
-    }
-
-    fn fingerprint(&self) -> [u8; 32] {
-        let mut hash = Params::new()
-            .hash_length(32)
-            .personal(b"Loki_roster_v1")
-            .to_state();
-        hash.update(&self.vault);
-        for member in self.members.values() {
-            hash.update(&member.id.to_be_bytes());
-            hash.update(&member.signing);
-            hash.update(&member.encryption);
-        }
-        hash.finalize().as_bytes().try_into().unwrap()
-    }
-}
 
 fn hex32(text: &str) -> Result<[u8; 32], String> {
     hex::decode(text)

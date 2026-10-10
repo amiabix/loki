@@ -203,6 +203,21 @@ fn three_processes_create_one_vault_without_sharing_secrets() {
         !cached_early.status.success(),
         "address appeared before activation"
     );
+    assert!(loki_poc::member_state::open(&first, &first.join("pass.txt"), &roster).is_err());
+    let unactivated_payment = Command::new(env!("CARGO_BIN_EXE_loki_member_payment"))
+        .args([
+            "sign",
+            first.to_str().unwrap(),
+            first.join("pass.txt").to_str().unwrap(),
+            roster.to_str().unwrap(),
+            root.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!unactivated_payment.status.success());
+    assert!(String::from_utf8_lossy(&unactivated_payment.stderr)
+        .contains("vault needs all members' backup confirmations"));
+    assert!(!first.join("signing").exists());
     let mut shares = Vec::new();
     let mut vault_secrets = Vec::new();
     let mut public_packages = Vec::new();
@@ -531,6 +546,166 @@ fn three_processes_create_one_vault_without_sharing_secrets() {
         .unwrap();
     assert!(recovered_address.status.success());
     assert_eq!(recovered_address.stdout, addresses[0].as_bytes());
+    for id in 1..=3 {
+        let member = root.join(format!("member-{id}"));
+        let activated = Command::new(exe)
+            .args([
+                "address",
+                member.to_str().unwrap(),
+                member.join("pass.txt").to_str().unwrap(),
+                roster.to_str().unwrap(),
+                exchange.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            activated.status.success(),
+            "activation: {}",
+            String::from_utf8_lossy(&activated.stderr)
+        );
+        let loaded =
+            loki_poc::member_state::open(&member, &member.join("pass.txt"), &roster).unwrap();
+        assert_eq!(loaded.identity.public().id, id);
+        assert_eq!(loaded.vault, [7u8; 32]);
+        assert_eq!(
+            loki_poc::vault::regtest_unified_address(&loaded.fvk),
+            addresses[0].trim()
+        );
+    }
+    // The payment CLI must reject bad local context before it can create an
+    // attempt record or publish any commitment.
+    let pay = env!("CARGO_BIN_EXE_loki_member_payment");
+    let work = root.join("payment-cli-faults");
+    fs::create_dir(&work).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&work, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let sign = |roster_path: &std::path::Path| {
+        Command::new(pay)
+            .args([
+                "sign",
+                first.to_str().unwrap(),
+                first.join("pass.txt").to_str().unwrap(),
+                roster_path.to_str().unwrap(),
+                work.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+    };
+    let manifest_path = work.join("payment.json");
+    fs::write(&manifest_path, b"{broken json").unwrap();
+    let malformed = sign(&roster);
+    assert!(!malformed.status.success());
+    assert!(String::from_utf8_lossy(&malformed.stderr).contains("manifest:"));
+    assert!(!first.join("signing").exists());
+
+    let intent = loki_poc::intent::Intent {
+        proposer: reddsa_frost::frost::redpallas::Identifier::try_from(1u16)
+            .unwrap()
+            .serialize(),
+        created_height: 1,
+        input_nullifiers: vec![[1u8; 32]],
+        recipient: vec![2u8; 43],
+        amount_zat: 1,
+        memo: b"check".to_vec(),
+        change_policy: loki_poc::intent::ChangePolicy::VaultInternal,
+        fee_zat: 10_000,
+        change_zat: 1,
+        expiry_height: 1_152,
+    };
+    let mut manifest = serde_json::json!({
+        "version": 1, "network": "regtest", "vault": hex::encode([7u8; 32]),
+        "payment": hex::encode(intent.proposal_id()), "attempt": hex::encode([3u8; 32]),
+        "proposer": hex::encode(&intent.proposer), "created_height": intent.created_height,
+        "input_nullifiers": intent.input_nullifiers.iter().map(hex::encode).collect::<Vec<_>>(),
+        "recipient": hex::encode(&intent.recipient), "amount_zat": intent.amount_zat,
+        "memo": hex::encode(&intent.memo), "change_policy": "vault_internal",
+        "fee_zat": intent.fee_zat, "change_zat": intent.change_zat,
+        "expiry_height": intent.expiry_height,
+    });
+    manifest["payment"] = serde_json::Value::String(hex::encode([9u8; 32]));
+    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let mismatch = sign(&roster);
+    assert!(!mismatch.status.success());
+    assert!(String::from_utf8_lossy(&mismatch.stderr).contains("payment ID or proposer"));
+    assert!(!first.join("signing").exists());
+
+    manifest["payment"] = serde_json::Value::String(hex::encode(intent.proposal_id()));
+    manifest["vault"] = serde_json::Value::String(hex::encode([8u8; 32]));
+    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let wrong_vault = sign(&roster);
+    assert!(!wrong_vault.status.success());
+    assert!(String::from_utf8_lossy(&wrong_vault.stderr).contains("another vault"));
+    assert!(!first.join("signing").exists());
+
+    let wrong_roster = root.join("wrong-roster.json");
+    let mut changed_roster: serde_json::Value =
+        serde_json::from_slice(&fs::read(&roster).unwrap()).unwrap();
+    changed_roster["vault"] = serde_json::Value::String(hex::encode([8u8; 32]));
+    fs::write(&wrong_roster, serde_json::to_vec(&changed_roster).unwrap()).unwrap();
+    let wrong_certificate = sign(&wrong_roster);
+    assert!(!wrong_certificate.status.success());
+    assert!(String::from_utf8_lossy(&wrong_certificate.stderr).contains("roster differs"));
+    assert!(!first.join("signing").exists());
+
+    // A killed signer cannot reuse the attempt. A fresh attempt ID starts a
+    // distinct local record, while resend refuses before a share was saved.
+    manifest["vault"] = serde_json::Value::String(hex::encode([7u8; 32]));
+    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let start = || {
+        Command::new(pay)
+            .args([
+                "sign",
+                first.to_str().unwrap(),
+                first.join("pass.txt").to_str().unwrap(),
+                roster.to_str().unwrap(),
+                work.to_str().unwrap(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+    let attempt_dir = |id: u8| {
+        first
+            .join("signing")
+            .join(hex::encode(intent.proposal_id()))
+            .join(hex::encode([id; 32]))
+    };
+    let mut interrupted = start();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !attempt_dir(3).join("started").exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(attempt_dir(3).join("started").exists());
+    interrupted.kill().unwrap();
+    interrupted.wait().unwrap();
+    let replay = sign(&roster);
+    assert!(!replay.status.success());
+    assert!(String::from_utf8_lossy(&replay.stderr).contains("attempt already exists"));
+    let resend = Command::new(pay)
+        .args([
+            "resend",
+            first.to_str().unwrap(),
+            first.join("pass.txt").to_str().unwrap(),
+            roster.to_str().unwrap(),
+            work.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!resend.status.success(), "no share exists to resend");
+    manifest["attempt"] = serde_json::Value::String(hex::encode([4u8; 32]));
+    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let mut retry = start();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !attempt_dir(4).join("started").exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(attempt_dir(4).join("started").exists());
+    retry.kill().unwrap();
+    retry.wait().unwrap();
     let bad_member = root.join("bad-member");
     let mut bad_state: serde_json::Value = serde_json::from_slice(
         &MemberDir::open(&first, "secrets")
