@@ -61,6 +61,7 @@ class MemberDemoTest(unittest.TestCase):
             f"print('Type APPROVE {payment} to sign:', flush=True)\n"
             f"if input() != 'APPROVE {payment}': sys.exit(1)\n"
             f"print('approved payment {payment} as member 1', flush=True)\n"
+            "print('stored', flush=True)\n"
         )
         process = subprocess.Popen([sys.executable, "-u", "-c", script],
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -82,6 +83,38 @@ class MemberDemoTest(unittest.TestCase):
         reader.join(timeout=3)
         self.assertFalse(reader.is_alive())
         self.assertEqual(flow.signers["alice"], "approved")
+
+    def test_approval_without_stored_does_not_release_the_payment(self):
+        flow = self.flow()
+        payment = "a" * 64
+        flow.payment = {"id": payment}
+        flow.phase = "waiting_for_reviews"
+        script = (
+            "import sys\n"
+            "print('Vault: ' + 'b'*64, flush=True)\n"
+            "print('Recipient: uregtest1recipient', flush=True)\n"
+            "print('Amount: 40000000 zat; memo: \\\"test\\\"', flush=True)\n"
+            "print('Fee: 10000 zat; change to vault: 59990000 zat; expiry height: 1152', flush=True)\n"
+            "print('Inputs: 1; candidate: ' + 'c'*64, flush=True)\n"
+            f"print('Type APPROVE {payment} to sign:', flush=True)\n"
+            f"if input() != 'APPROVE {payment}': sys.exit(1)\n"
+            f"print('approved payment {payment} as member 1', flush=True)\n"
+        )
+        process = subprocess.Popen([sys.executable, "-u", "-c", script],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, text=True)
+        self.addCleanup(lambda: process.kill() if process.poll() is None else None)
+        flow.processes["alice"] = process
+        reader = threading.Thread(target=flow._read_signer, args=("alice", process))
+        reader.start()
+        deadline = time.monotonic() + 3
+        while flow.signers["alice"] != "reviewing" and time.monotonic() < deadline:
+            time.sleep(.01)
+        flow.decide("alice", "approve")
+        reader.join(timeout=3)
+        self.assertEqual(flow.signers["alice"], "failed")
+        self.assertIs(flow.approver_stored["alice"], False)
+        self.assertNotEqual(flow.phase, "ready_to_send")
 
     def test_browser_action_needs_same_origin_and_the_right_member_link(self):
         flow = self.flow()

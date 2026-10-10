@@ -38,7 +38,7 @@ SCENARIOS = (
 ALLOWED = {
     "version", "run_id", "source_revision", "binary_hashes", "vault",
     "roster_fingerprint", "relays", "carriers", "receipt_digests",
-    "mailbox_denial", "scenarios", "txid", "checks",
+    "mailbox_denial", "scenarios", "txid", "checks", "approver_stored",
 }
 DROPPED = {"token", "coordinator_url", "url", "links", "passphrase", "password"}
 
@@ -221,6 +221,11 @@ def assemble(payment: dict, harness: dict[str, dict], canary: dict, mailbox_abse
     outage = harness.get("outage")
     chunk = harness.get("missing_chunk")
     offline_ok = _passed(offline)
+    approvers = payment["state"].get("approver_stored") or {}
+    approver_stored = {
+        "alice": approvers.get("alice") is True,
+        "bob": approvers.get("bob") is True,
+    }
     scenarios = [
         _scenario("normal_transfer", "payment",
                   "request_start" in kinds and network.get("stored", 0) > 0),
@@ -236,7 +241,9 @@ def assemble(payment: dict, harness: dict[str, dict], canary: dict, mailbox_abse
         _scenario("duplicate_restart", "transport", offline_ok,
                   harness="offline_delivery", harness_run=(offline or {}).get("scenario_run_id")),
         _scenario("payment_stored_before_approver_exit", "payment",
-                  payment["state"].get("phase") == "confirmed" and network.get("stored", 0) > 0
+                  payment["state"].get("phase") == "confirmed"
+                  and approver_stored["alice"] and approver_stored["bob"]
+                  and network.get("stored", 0) > 0
                   and mailbox_absent and canary.get("mailbox_denial") is True),
     ]
     carriers_by_message = {}
@@ -277,6 +284,7 @@ def assemble(payment: dict, harness: dict[str, dict], canary: dict, mailbox_abse
         "carriers": carriers,
         "receipt_digests": digests,
         "mailbox_denial": canary.get("mailbox_denial") is True and mailbox_absent,
+        "approver_stored": approver_stored,
         "scenarios": scenarios,
         "txid": payment["state"].get("txid"),
         "checks": {

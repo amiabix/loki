@@ -145,6 +145,36 @@ class PublicReportTest(unittest.TestCase):
                 verify.prepare_transport_root(root)
             self.assertEqual((root / "marker").read_text(), "keep")
 
+    def test_stored_exit_requires_both_approvers(self):
+        base = {
+            "events": [{"event_type": "request_start", "message_id": "ab" * 32,
+                        "message_digest": "cd" * 32, "envelope_hash": "ef" * 32,
+                        "receipt_digest": "12" * 32}],
+            "network": {"stored": 2, "run_id": "relay-run"},
+            "state": {"phase": "confirmed", "txid": "34" * 32,
+                      "approver_stored": {"alice": True, "bob": False}},
+        }
+        harness = {
+            "offline_delivery": {"outcome": "passed", "simulation": False, "scenario_run_id": "off"},
+            "outage": {"outcome": "passed", "simulation": False, "scenario_run_id": "out"},
+            "missing_chunk": {"outcome": "passed", "simulation": True, "scenario_run_id": "chunk"},
+        }
+        canary = {"mailbox_denial": True, "own_read": True, "peer_denial": True, "relay_denial": True}
+        identities = {"source_revision": "abc", "binary_hashes": {}, "run_id": "relay-run",
+                      "vault": "v" * 64, "roster_fingerprint": "r" * 64, "relays": []}
+        one = verify.assemble(base, harness, canary, True, identities)
+        stored = next(item for item in one["scenarios"]
+                      if item["name"] == "payment_stored_before_approver_exit")
+        self.assertEqual(stored["result"], "failed")
+        self.assertEqual(one["approver_stored"], {"alice": True, "bob": False})
+        base["state"]["approver_stored"] = {"alice": True, "bob": True}
+        both = verify.assemble(base, harness, canary, True, identities)
+        stored = next(item for item in both["scenarios"]
+                      if item["name"] == "payment_stored_before_approver_exit")
+        self.assertEqual(stored["result"], "passed")
+        public = verify.build_report(both, forbidden=("secret-token",))
+        self.assertEqual(public["approver_stored"], {"alice": True, "bob": True})
+
     def test_unexecuted_scenario_does_not_pass(self):
         scenarios = [
             {"name": name, "label": "transport", "executed": True, "result": "passed"}

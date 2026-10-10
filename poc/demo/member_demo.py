@@ -57,6 +57,7 @@ class Flow:
         self.delivery = "pending"
         self.review = {"alice": None, "bob": None}
         self.signers = {"alice": "waiting", "bob": "waiting"}
+        self.approver_stored = {"alice": False, "bob": False}
         self.processes = {}
         self.signer_threads = []
         self.worker = None
@@ -76,6 +77,10 @@ class Flow:
                 "role": role, "phase": self.phase, "error": self.error,
                 "payment": self.payment, "txid": self.txid,
                 "signers": self.signers.copy(),
+                "approver_stored": {
+                    "alice": self.approver_stored["alice"] is True,
+                    "bob": self.approver_stored["bob"] is True,
+                },
                 "substage": self.substage,
                 "delivery": self.delivery,
                 "network": self.chain.snapshot(),
@@ -215,12 +220,20 @@ class Flow:
                         self.signers[name] = "reviewing"
                 if line.startswith("approved payment "):
                     lines.append(line)
+                if line == "stored":
+                    lines.append(line)
             code = process.wait()
+            approved = f"approved payment {self.payment['id']} as member {1 if name == 'alice' else 2}"
+            stored_after_approval = (
+                code == 0
+                and approved in lines
+                and lines[-1:] == ["stored"]
+                and lines.index(approved) < lines.index("stored")
+            )
             with self.lock:
-                if code == 0 and lines[-1:] == [
-                    f"approved payment {self.payment['id']} as member {1 if name == 'alice' else 2}"
-                ]:
+                if stored_after_approval:
                     self.signers[name] = "approved"
+                    self.approver_stored[name] = True
                     if all(value == "approved" for value in self.signers.values()):
                         self.phase = "ready_to_send"
                 elif self.signers[name] == "declined":
@@ -369,6 +382,7 @@ class Flow:
             self.substage = None
             self.review = {"alice": None, "bob": None}
             self.signers = {"alice": "waiting", "bob": "waiting"}
+            self.approver_stored = {"alice": False, "bob": False}
             self.member_sandbox = {}
             if sandboxed:
                 self.bind_member_sandbox()
