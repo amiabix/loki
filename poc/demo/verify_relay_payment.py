@@ -178,6 +178,8 @@ def transport_scenarios(root: Path, timeout: float) -> dict[str, dict]:
     report = run.run_faults(
         root, ports, communication_workspace=REPO / "communication", poc_workspace=POC,
         timeout=timeout, scenarios=("offline_delivery", "outage", "missing_chunk"))
+    if isinstance(report, run.FaultResult):
+        report = report.public_report()
     return {item["scenario"]: item for item in report["scenarios"]}
 
 

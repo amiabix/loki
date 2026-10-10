@@ -72,6 +72,26 @@ class PublicReportTest(unittest.TestCase):
         self.assertNotIn("/Users", reason)
         self.assertEqual(verify.public_failure(""), "payment failed")
 
+    def test_transport_scenarios_reads_a_fault_result(self):
+        harness = DEMO.parent.parent / "communication" / "harness"
+        sys.path.insert(0, str(harness))
+        import run
+        sentinel = {"scenarios": [{
+            "scenario": "offline_delivery", "outcome": "passed", "simulation": False,
+        }]}
+        original = run.run_faults
+
+        def fake(root, ports, **kwargs):
+            return run.FaultResult(sentinel)
+
+        run.run_faults = fake
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                mapped = verify.transport_scenarios(Path(temporary), 60)
+        finally:
+            run.run_faults = original
+        self.assertEqual(mapped["offline_delivery"]["outcome"], "passed")
+
     def test_unexecuted_scenario_does_not_pass(self):
         scenarios = [
             {"name": name, "label": "transport", "executed": True, "result": "passed"}
