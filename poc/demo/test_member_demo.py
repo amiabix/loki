@@ -104,5 +104,43 @@ class MemberDemoTest(unittest.TestCase):
             decide.assert_called_once_with("alice", "approve")
 
 
+    def test_api_start_reaches_relay_readiness_once(self):
+        flow = self.flow()
+        order = []
+        flow._preflight_relay = lambda: order.append("preflight")
+        flow.chain.start = lambda: order.append("ths")
+        flow._prepare_fixture = lambda amount, memo, transport="relay": order.append(("vaults", transport))
+        flow.relay.prepare = lambda source: order.append("relays")
+        flow._start_signers = lambda transport="relay": order.append(("signers", transport))
+        flow._prepare(40_000_000, "paid")
+        self.assertEqual(order, [
+            "preflight", "ths", ("vaults", "relay"), "relays", ("signers", "relay"),
+        ])
+        self.assertEqual(flow.substage, "signers_starting")
+        flow.phase = "preparing"
+        with self.assertRaisesRegex(ValueError, "reset"):
+            flow.start(40_000_000, "paid")
+
+    def test_missing_relay_binary_does_not_start_the_chain(self):
+        flow = self.flow()
+        flow.chain.start = Mock()
+        with patch.object(member_demo.run, "find_binary", side_effect=member_demo.run.OwnershipError("missing")):
+            flow._prepare(1000, "memo")
+        flow.chain.start.assert_not_called()
+        self.assertEqual(flow.phase, "failed")
+
+    def test_signer_lease_blocks_a_second_store_open(self):
+        flow = self.flow()
+        spawned = []
+        flow._spawn_member_command = lambda member_id: spawned.append(member_id)
+        flow.leases.reserve(1, "sign")
+        with self.assertRaisesRegex(RuntimeError, "busy"):
+            flow.background_pass(1)
+        self.assertEqual(spawned, [])
+        flow.leases.release(1)
+        flow.background_pass(1)
+        self.assertEqual(spawned, [1])
+
+
 if __name__ == "__main__":
     unittest.main()

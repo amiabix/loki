@@ -19,12 +19,36 @@ from pathlib import Path
 
 DEMO = Path(__file__).resolve().parent
 POC = DEMO.parent
+REPO = POC.parent
 ROOT = DEMO / ".member-sandbox"
 RUN = ROOT / "run"
 STATIC = DEMO / "static"
 sys.path.insert(0, str(POC))
 
 from managed_ths import ManagedTHS, command  # noqa: E402
+from relay_demo import RelayDemo  # noqa: E402
+import run  # noqa: E402
+
+
+class MemberLease:
+    """One store owner at a time. A payment command and a background pass share the lease."""
+
+    def __init__(self):
+        self._locks = {member_id: threading.Lock() for member_id in (1, 2, 3)}
+        self.holder = {member_id: None for member_id in (1, 2, 3)}
+
+    def reserve(self, member_id: int, kind: str) -> None:
+        if member_id not in self._locks:
+            raise ValueError("member must be 1, 2, or 3")
+        if not self._locks[member_id].acquire(blocking=False):
+            raise RuntimeError(f"member {member_id} store is busy")
+        self.holder[member_id] = kind
+
+    def release(self, member_id: int) -> None:
+        if self.holder.get(member_id) is None:
+            return
+        self.holder[member_id] = None
+        self._locks[member_id].release()
 
 
 def binary(name: str) -> Path:
@@ -51,6 +75,11 @@ class Flow:
         self.processes = {}
         self.signer_threads = []
         self.worker = None
+        self.substage = None
+        self.leases = MemberLease()
+        self.relay = RelayDemo(
+            ROOT, (ROOT / "loki-relay-server", ROOT / "loki_relay_member", ROOT / "loki_setup_member"),
+            self.cancel, None)
         self.tokens = {role: secrets.token_urlsafe(32) for role in ("admin", "alice", "bob")}
 
     def role(self, token: str) -> str | None:
@@ -63,6 +92,7 @@ class Flow:
                 "role": role, "phase": self.phase, "error": self.error,
                 "payment": self.payment, "txid": self.txid,
                 "signers": self.signers.copy(),
+                "substage": self.substage,
                 "network": self.chain.snapshot(),
             }
             if role in self.review:
@@ -97,44 +127,84 @@ class Flow:
 
     def _prepare(self, amount: int, memo: str):
         try:
-            self.chain.start()
-            output = self._command([
-                sys.executable, str(POC / "run-member-payment.py"),
-                "--name", self.chain.name, "--state", str(RUN), "--manual",
-                "--amount-zat", str(amount), f"--memo={memo}",
-            ], timeout=1200)
-            source = re.search(r"^Source vault: (uregtest\S+)$", output, re.M)
-            recipient = re.search(r"^Independent recipient: (uregtest\S+)$", output, re.M)
-            manifest = json.loads((RUN / "payment" / "payment.json").read_text())
-            if not source or not recipient or manifest["amount_zat"] != amount:
-                raise RuntimeError("setup output differs from the payment manifest")
-            payment = {
-                "id": manifest["payment"], "source": source.group(1),
-                "recipient": recipient.group(1), "amount_zat": manifest["amount_zat"],
-                "memo": bytes.fromhex(manifest["memo"]).decode("utf-8"),
-                "fee_zat": manifest["fee_zat"], "change_zat": manifest["change_zat"],
-                "expiry_height": manifest["expiry_height"],
-            }
+            self._preflight_relay()
             with self.lock:
-                self.payment = payment
-                self.phase = "waiting_for_reviews"
-            for name, number in (("alice", 1), ("bob", 2)):
-                owner = RUN / "source" / f"member-{number}"
-                args = [str(binary("loki_member_payment")), "sign", str(owner),
-                        str(owner / "pass.txt"), str(RUN / "source" / "roster.json"),
-                        str(RUN / "payment")]
-                process = subprocess.Popen(args, cwd=POC, env=self.chain.client.env(),
-                                           stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                           stderr=subprocess.STDOUT, text=True, bufsize=1)
-                with self.lock:
-                    self.processes[name] = process
-                reader = threading.Thread(target=self._read_signer, args=(name, process), daemon=True)
-                self.signer_threads.append(reader)
-                reader.start()
+                self.substage = "ths_starting"
+            self.chain.start()
+            with self.lock:
+                self.substage = "vaults_preparing"
+            self._prepare_fixture(amount, memo, transport="relay")
+            with self.lock:
+                self.substage = "relays_starting"
+            self.relay.prepare(RUN / "source")
+            with self.lock:
+                self.substage = "signers_starting"
+            self._start_signers(transport="relay")
         except Exception as error:
+            try:
+                self.relay.stop()
+            except Exception:
+                pass
             self._fail(error)
 
-    def _read_signer(self, name: str, process: subprocess.Popen):
+    def _preflight_relay(self) -> None:
+        run.find_binary("loki-relay-server", workspace=REPO / "communication")
+        run.find_binary("loki_relay_member", workspace=POC)
+        run.find_binary("loki_member_payment", workspace=POC)
+        binary("loki_setup_member")
+
+    def _prepare_fixture(self, amount: int, memo: str, transport: str = "relay") -> None:
+        output = self._command([
+            sys.executable, str(POC / "run-member-payment.py"),
+            "--name", self.chain.name, "--state", str(RUN), "--manual",
+            "--amount-zat", str(amount), f"--memo={memo}",
+        ], timeout=1200)
+        source = re.search(r"^Source vault: (uregtest\S+)$", output, re.M)
+        recipient = re.search(r"^Independent recipient: (uregtest\S+)$", output, re.M)
+        manifest = json.loads((RUN / "payment" / "payment.json").read_text())
+        if not source or not recipient or manifest["amount_zat"] != amount:
+            raise RuntimeError("setup output differs from the payment manifest")
+        if transport != "relay":
+            raise RuntimeError("payment preparation uses the relay transport")
+        payment = {
+            "id": manifest["payment"], "source": source.group(1),
+            "recipient": recipient.group(1), "amount_zat": manifest["amount_zat"],
+            "memo": bytes.fromhex(manifest["memo"]).decode("utf-8"),
+            "fee_zat": manifest["fee_zat"], "change_zat": manifest["change_zat"],
+            "expiry_height": manifest["expiry_height"],
+        }
+        with self.lock:
+            self.payment = payment
+            self.phase = "waiting_for_reviews"
+
+    def _start_signers(self, transport: str = "relay") -> None:
+        for name, number in (("alice", 1), ("bob", 2)):
+            self.leases.reserve(number, "sign")
+            owner = RUN / "source" / f"member-{number}"
+            args = [str(binary("loki_member_payment")), "sign", str(owner),
+                    str(owner / "pass.txt"), str(RUN / "source" / "roster.json"),
+                    str(RUN / "payment"), "--transport", transport]
+            process = subprocess.Popen(args, cwd=POC, env=self.chain.client.env(),
+                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT, text=True, bufsize=1)
+            with self.lock:
+                self.processes[name] = process
+            reader = threading.Thread(target=self._read_signer, args=(name, process, number), daemon=True)
+            self.signer_threads.append(reader)
+            reader.start()
+
+    def background_pass(self, member_id: int) -> None:
+        """A poll or snapshot pass uses the same lease as a payment command."""
+        self.leases.reserve(member_id, "poll")
+        try:
+            self._spawn_member_command(member_id)
+        finally:
+            self.leases.release(member_id)
+
+    def _spawn_member_command(self, member_id: int) -> None:
+        return None
+
+    def _read_signer(self, name: str, process: subprocess.Popen, member_id: int | None = None):
         lines = []
         try:
             for raw in process.stdout:
@@ -167,6 +237,9 @@ class Flow:
         except Exception as error:
             process.terminate()
             self._fail(error)
+        finally:
+            if member_id is not None:
+                self.leases.release(member_id)
 
     def decide(self, role: str, action: str):
         if role not in self.review or action not in ("approve", "decline"):

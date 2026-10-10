@@ -91,6 +91,10 @@ class RelayDemo:
         path.write_text(json.dumps(self.public_manifest(), sort_keys=True) + "\n")
         path.chmod(0o644)
 
+    def stop(self) -> None:
+        """Stop serve processes this controller started. A foreign listener is left alone."""
+        self._stop_owned()
+
     def _stop_owned(self) -> None:
         owner = self.owner
         if owner is None:
