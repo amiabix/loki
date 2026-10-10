@@ -1,8 +1,8 @@
 use crate::{ClientError, ClientResult};
-use loki_relay_protocol::WireError;
 use loki_relay_protocol::types::{
     roster_digest, Id32, LogicalKey, MemberId, MessageRef, Object, RelayRoute, Roster,
 };
+use loki_relay_protocol::WireError;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use std::{
@@ -55,9 +55,10 @@ fn incoming_parts() -> (&'static str, &'static str) {
 }
 
 fn seed_diagnostic_ids(connection: &Connection) -> ClientResult<()> {
-    let max_id: Option<i64> = connection.query_row("SELECT max(id) FROM quarantine_samples", [], |row| {
-        row.get(0)
-    })?;
+    let max_id: Option<i64> =
+        connection.query_row("SELECT max(id) FROM quarantine_samples", [], |row| {
+            row.get(0)
+        })?;
     let next = match max_id {
         None => 1,
         Some(id) if id > 0 => id.checked_add(1).ok_or(ClientError::Capacity)?,
@@ -720,7 +721,8 @@ impl ClientStore {
         if owner == 0 || !roster.members.iter().any(|member| member.id == owner) {
             return Err(ClientError::Identity);
         }
-        if validate_metadata(&self.connection, roster, roster_digest(roster)?, owner)? != CURRENT_CATALOG
+        if validate_metadata(&self.connection, roster, roster_digest(roster)?, owner)?
+            != CURRENT_CATALOG
         {
             return Err(ClientError::Storage);
         }
@@ -1289,7 +1291,10 @@ fn payload_kind(payload: &loki_relay_protocol::types::Payload) -> u8 {
     }
 }
 
-fn existing_original(connection: &Connection, key: &LogicalKey) -> ClientResult<Option<ExistingOriginal>> {
+fn existing_original(
+    connection: &Connection,
+    key: &LogicalKey,
+) -> ClientResult<Option<ExistingOriginal>> {
     connection
         .query_row(
             "SELECT digest,kind,session FROM incoming_originals WHERE vault=?1 AND roster=?2 AND sender=?3 AND message_id=?4",
@@ -1452,10 +1457,7 @@ fn reopen_saved(
             missing.push(*hash);
             continue;
         };
-        let object = Object {
-            hash: *hash,
-            wire,
-        };
+        let object = Object { hash: *hash, wire };
         if index == 0 {
             root = Some(object);
         } else {
@@ -1465,7 +1467,12 @@ fn reopen_saved(
     if !missing.is_empty() {
         return Err(ClientError::MissingObjects(missing));
     }
-    crate::TransferAssembler::open(roster, identity, &root.ok_or(ClientError::Storage)?, &objects)
+    crate::TransferAssembler::open(
+        roster,
+        identity,
+        &root.ok_or(ClientError::Storage)?,
+        &objects,
+    )
 }
 
 fn insert_original_objects(
@@ -1806,7 +1813,13 @@ fn route_pins(relays: &[crate::DescriptorRelay]) -> ClientResult<Vec<(Id32, Id32
     }
     Ok(relays
         .iter()
-        .map(|relay| (relay.route.pin.key, relay.route.pin.run, relay.route.mailbox))
+        .map(|relay| {
+            (
+                relay.route.pin.key,
+                relay.route.pin.run,
+                relay.route.mailbox,
+            )
+        })
         .collect())
 }
 
@@ -2305,7 +2318,11 @@ impl ClientStore {
     ) -> ClientResult<()> {
         let body = receipt.body();
         let bytes = receipt.bytes();
-        if bytes.is_empty() || bytes.len() > 4096 || body.retention != 1 || body.sequence == 0 || body.sequence > i64::MAX as u64
+        if bytes.is_empty()
+            || bytes.len() > 4096
+            || body.retention != 1
+            || body.sequence == 0
+            || body.sequence > i64::MAX as u64
         {
             return Err(ClientError::Receipt);
         }
@@ -2368,6 +2385,7 @@ impl ClientStore {
                 relay_key,
                 run,
                 mailbox,
+                &saved,
             );
             return Ok(());
         }
@@ -2411,6 +2429,7 @@ impl ClientStore {
             relay_key,
             run,
             mailbox,
+            bytes,
         );
         Ok(())
     }
@@ -2581,7 +2600,11 @@ impl ClientStore {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    pub fn recover_staged_sources(&self, after: u64, limit: u16) -> ClientResult<Vec<StagedSource>> {
+    pub fn recover_staged_sources(
+        &self,
+        after: u64,
+        limit: u16,
+    ) -> ClientResult<Vec<StagedSource>> {
         page_bounds(after, limit)?;
         let mut statement = self.connection.prepare(
             "SELECT rowid,root_hash,group_id,claimed_transfer FROM staged_sources WHERE rowid>?1 ORDER BY rowid LIMIT ?2",
@@ -2937,19 +2960,25 @@ impl ClientStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if validate_metadata(
-            &transaction,
-            roster,
-            roster_digest(roster)?,
-            owner,
-        )? != CURRENT_CATALOG
+        if validate_metadata(&transaction, roster, roster_digest(roster)?, owner)?
+            != CURRENT_CATALOG
         {
             return Err(ClientError::Storage);
         }
-        if source_rejection_exists(&transaction, &source.required_hashes().first().copied().ok_or(ClientError::Storage)?)? {
+        if source_rejection_exists(
+            &transaction,
+            &source
+                .required_hashes()
+                .first()
+                .copied()
+                .ok_or(ClientError::Storage)?,
+        )? {
             return Err(ClientError::Identity);
         }
-        let root = *source.required_hashes().first().ok_or(ClientError::Storage)?;
+        let root = *source
+            .required_hashes()
+            .first()
+            .ok_or(ClientError::Storage)?;
         let (cached, quarantined) = journal_state(&transaction, &root)?;
         if quarantined && !cached {
             return Err(ClientError::MissingObjects(vec![root]));
@@ -2974,7 +3003,12 @@ impl ClientStore {
                 if kind == 1 && key.sender != owner {
                     reuse_saved_ack(&transaction, roster, identity, message)?;
                 }
-                try_note_alternate_root(&transaction, self.storage_budget, &root, message.digest())?;
+                try_note_alternate_root(
+                    &transaction,
+                    self.storage_budget,
+                    &root,
+                    message.digest(),
+                )?;
                 commit_reuse(transaction)?;
                 crate::observe::note_original(
                     crate::observe::ObservationKind::OriginalCommitted,
@@ -2989,7 +3023,14 @@ impl ClientStore {
             return Ok(CommitDisposition::Conflict);
         }
         if key.sender == owner {
-            return reconcile_self(transaction, self.storage_budget, message, kind, &root, source);
+            return reconcile_self(
+                transaction,
+                self.storage_budget,
+                message,
+                kind,
+                &root,
+                source,
+            );
         }
         if kind == 1 {
             let prepared = ack.ok_or(ClientError::Identity)?;
@@ -3074,14 +3115,17 @@ impl ClientStore {
         if source.objects.iter().any(|(hash, _)| !seen.insert(*hash)) {
             return Err(ClientError::Wire(WireError::Schema));
         }
-        let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if source_rejection_exists(&transaction, &source.root_hash)? {
             transaction.commit()?;
             return Ok(StageResult::Rejected);
         }
         if staged_root_exists(&transaction, &source.root_hash)? {
             let result = if same_binding(&transaction, source)? {
-                let planned = plan_wanted(&transaction, &source.root_hash, &requirement_wires(source))?;
+                let planned =
+                    plan_wanted(&transaction, &source.root_hash, &requirement_wires(source))?;
                 if planned.coverage.is_empty() && planned.tasks.is_empty() {
                     StageResult::Unchanged
                 } else {
@@ -3119,10 +3163,15 @@ impl ClientStore {
         )?;
         transaction.execute(
             "INSERT INTO staged_requirements VALUES(?1,0,?2,?3)",
-            params![source.root_hash, source.root_hash, source.root_wire_length as i64],
+            params![
+                source.root_hash,
+                source.root_hash,
+                source.root_wire_length as i64
+            ],
         )?;
         for (index, (hash, wire)) in source.objects.iter().enumerate() {
-            let ordinal = u16::try_from(index + 1).map_err(|_| ClientError::Wire(WireError::Bounds))?;
+            let ordinal =
+                u16::try_from(index + 1).map_err(|_| ClientError::Wire(WireError::Bounds))?;
             transaction.execute(
                 "INSERT INTO staged_requirements VALUES(?1,?2,?3,?4)",
                 params![source.root_hash, ordinal, hash, *wire as i64],
@@ -3268,7 +3317,9 @@ impl ClientStore {
         if !(1..=64).contains(&reason.len()) {
             return Err(ClientError::Storage);
         }
-        let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if source_rejection_exists(&transaction, root)? {
             transaction.commit()?;
             return Ok(());
@@ -3374,14 +3425,21 @@ fn staged_root_exists(connection: &Connection, root: &Id32) -> ClientResult<bool
 
 fn group_is_open(connection: &Connection, group_id: &Id32) -> ClientResult<Option<bool>> {
     let sql = format!("SELECT {GROUP_OPEN} FROM transfer_groups g WHERE g.group_id=?1");
-    let value: Option<i64> = connection.query_row(&sql, [group_id], |row| row.get(0)).optional()?;
+    let value: Option<i64> = connection
+        .query_row(&sql, [group_id], |row| row.get(0))
+        .optional()?;
     Ok(value.map(|value| value != 0))
 }
 
 fn requirement_wires(source: &BoundSource) -> Vec<(Id32, i64)> {
     let mut wires = Vec::with_capacity(1 + source.objects.len());
     wires.push((source.root_hash, source.root_wire_length as i64));
-    wires.extend(source.objects.iter().map(|(hash, wire)| (*hash, *wire as i64)));
+    wires.extend(
+        source
+            .objects
+            .iter()
+            .map(|(hash, wire)| (*hash, *wire as i64)),
+    );
     wires
 }
 
@@ -3413,14 +3471,23 @@ fn same_binding(connection: &Connection, source: &BoundSource) -> ClientResult<b
         "SELECT ordinal, hash, wire_length FROM staged_requirements WHERE root_hash=?1 ORDER BY ordinal",
     )?;
     let stored = statement.query_map([source.root_hash], |row| {
-        Ok((row.get::<_, u16>(0)?, row_id(row, 1)?, row.get::<_, i64>(2)?))
+        Ok((
+            row.get::<_, u16>(0)?,
+            row_id(row, 1)?,
+            row.get::<_, i64>(2)?,
+        ))
     })?;
     let stored: Vec<_> = stored.collect::<Result<_, _>>()?;
     let expected = requirement_wires(source);
     Ok(stored.len() == expected.len()
-        && stored.iter().enumerate().all(|(index, (ordinal, hash, wire))| {
-            usize::from(*ordinal) == index && *hash == expected[index].0 && *wire == expected[index].1
-        }))
+        && stored
+            .iter()
+            .enumerate()
+            .all(|(index, (ordinal, hash, wire))| {
+                usize::from(*ordinal) == index
+                    && *hash == expected[index].0
+                    && *wire == expected[index].1
+            }))
 }
 
 struct CoveredRoute {
@@ -3450,7 +3517,11 @@ struct WantedPlan {
     tasks: Vec<WantedTask>,
 }
 
-fn plan_wanted(connection: &Connection, root: &Id32, requirements: &[(Id32, i64)]) -> ClientResult<WantedPlan> {
+fn plan_wanted(
+    connection: &Connection,
+    root: &Id32,
+    requirements: &[(Id32, i64)],
+) -> ClientResult<WantedPlan> {
     let mut routes = connection.prepare(
         "SELECT relay_key, run, mailbox FROM incoming_journal WHERE source_hash=?1 UNION SELECT relay_key, run, mailbox FROM staged_coverage WHERE root_hash=?1",
     )?;
@@ -3591,7 +3662,8 @@ mod outbox_commit_tests {
         if stage != kind {
             return;
         }
-        let marker = PathBuf::from(std::env::var_os("RELAY_6_6_MARKER").expect("fixture barrier marker"));
+        let marker =
+            PathBuf::from(std::env::var_os("RELAY_6_6_MARKER").expect("fixture barrier marker"));
         let temporary = marker.with_extension("part");
         std::fs::write(&temporary, kind.as_bytes()).unwrap();
         std::fs::rename(&temporary, &marker).unwrap();
@@ -4097,743 +4169,740 @@ mod outbox_commit_tests {
         );
     }
 
-/// Process-kill and idempotent PUT evidence for the outbox commit and receipt boundaries.
-mod crash {
-    use super::*;
-    use crate::{
-        open_descriptor, seal_descriptor, upload_pending, ClientConfig, Descriptor, DescriptorRelay,
-        OwnerInbox, RelayHttp, Secret32, ThirdPass,
-    };
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-    use ed25519_dalek::{Signer, SigningKey};
-    use loki_relay_protocol::{
-        canonical::{self, Value},
-        receipt,
-        types::{LogicalKey, MessageBody, Payload, ReceiptBody, RelayPin},
-    };
-    use sha2::{Digest, Sha256};
-    use std::{
-        collections::HashMap,
-        io::{Read, Write},
-        net::{TcpListener, TcpStream},
-        os::unix::{fs::PermissionsExt, process::ExitStatusExt},
-        process::{Child, Command, Stdio},
-        sync::{
-            atomic::{AtomicBool, AtomicU64, Ordering},
-            Arc, Mutex,
-        },
-        time::{Duration, Instant},
-    };
+    /// Process-kill and idempotent PUT evidence for the outbox commit and receipt boundaries.
+    mod crash {
+        use super::*;
+        use crate::{
+            open_descriptor, seal_descriptor, upload_pending, ClientConfig, Descriptor,
+            DescriptorRelay, OwnerInbox, RelayHttp, Secret32, ThirdPass,
+        };
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use ed25519_dalek::{Signer, SigningKey};
+        use loki_relay_protocol::{
+            canonical::{self, Value},
+            receipt,
+            types::{LogicalKey, MessageBody, Payload, ReceiptBody, RelayPin},
+        };
+        use sha2::{Digest, Sha256};
+        use std::{
+            collections::HashMap,
+            io::{Read, Write},
+            net::{TcpListener, TcpStream},
+            os::unix::{fs::PermissionsExt, process::ExitStatusExt},
+            process::{Child, Command, Stdio},
+            sync::{
+                atomic::{AtomicBool, AtomicU64, Ordering},
+                Arc, Mutex,
+            },
+            time::{Duration, Instant},
+        };
 
-    const COMMIT_REQUEST: [u8; 32] = [160; 32];
-    const COMMIT_MESSAGE: [u8; 32] = [124; 32];
-    const HTTP_REQUEST: [u8; 32] = [182; 32];
-    const HTTP_MESSAGE: [u8; 32] = [180; 32];
+        const COMMIT_REQUEST: [u8; 32] = [160; 32];
+        const COMMIT_MESSAGE: [u8; 32] = [124; 32];
+        const HTTP_REQUEST: [u8; 32] = [182; 32];
+        const HTTP_MESSAGE: [u8; 32] = [180; 32];
 
-    const SOCKET_WAIT: Duration = Duration::from_secs(2);
-    const REAP_WAIT: Duration = Duration::from_secs(5);
+        const SOCKET_WAIT: Duration = Duration::from_secs(2);
+        const REAP_WAIT: Duration = Duration::from_secs(5);
 
-    struct OwnedChild(Child);
-    impl Drop for OwnedChild {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = wait_bounded(&mut self.0, REAP_WAIT);
-        }
-    }
-
-    fn wait_bounded(child: &mut Child, limit: Duration) -> Option<std::process::ExitStatus> {
-        let deadline = Instant::now() + limit;
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => return Some(status),
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                _ => return None,
+        struct OwnedChild(Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = wait_bounded(&mut self.0, REAP_WAIT);
             }
         }
-    }
 
-    struct PinSecret {
-        signer: SigningKey,
-        key: [u8; 32],
-        run: [u8; 32],
-        mailbox: [u8; 32],
-        append: [u8; 32],
-    }
-
-    struct SavedPut {
-        body: Vec<u8>,
-        receipt: Vec<u8>,
-        sequence: u64,
-        wire_len: u64,
-        hits: u64,
-    }
-
-    struct RelayState {
-        saved: HashMap<([u8; 32], [u8; 32]), SavedPut>,
-        sequences: HashMap<[u8; 32], u64>,
-        first: Option<([u8; 32], [u8; 32])>,
-        puts: u64,
-        duplicate_puts: u64,
-        third_puts: u64,
-        mismatches: u64,
-        quota: u64,
-    }
-
-    struct Shot {
-        puts: u64,
-        duplicate_puts: u64,
-        third_puts: u64,
-        mismatches: u64,
-        entries: u64,
-        quota: u64,
-        hits: u64,
-        sequence: u64,
-        wire_len: u64,
-        mailbox: [u8; 32],
-        hash: [u8; 32],
-        receipt: Vec<u8>,
-    }
-
-    struct Loopback {
-        port: u16,
-        pins: Arc<Vec<PinSecret>>,
-        state: Arc<Mutex<RelayState>>,
-        stop: Arc<AtomicBool>,
-        thread: Option<std::thread::JoinHandle<()>>,
-    }
-
-    impl Drop for Loopback {
-        fn drop(&mut self) {
-            self.stop.store(true, Ordering::SeqCst);
-            if let Some(thread) = self.thread.take() {
-                let _ = thread.join();
-            }
-        }
-    }
-
-    impl Loopback {
-        fn start() -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.set_nonblocking(true).unwrap();
-            let port = listener.local_addr().unwrap().port();
-            let mut pins: Vec<PinSecret> = (0..3u8)
-                .map(|index| {
-                    let signer = SigningKey::from_bytes(&[10 + index; 32]);
-                    PinSecret {
-                        key: signer.verifying_key().to_bytes(),
-                        signer,
-                        run: [21 + index; 32],
-                        mailbox: [31 + index; 32],
-                        append: [41 + index; 32],
+        fn wait_bounded(child: &mut Child, limit: Duration) -> Option<std::process::ExitStatus> {
+            let deadline = Instant::now() + limit;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => return Some(status),
+                    Ok(None) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10));
                     }
+                    _ => return None,
+                }
+            }
+        }
+
+        struct PinSecret {
+            signer: SigningKey,
+            key: [u8; 32],
+            run: [u8; 32],
+            mailbox: [u8; 32],
+            append: [u8; 32],
+        }
+
+        struct SavedPut {
+            body: Vec<u8>,
+            receipt: Vec<u8>,
+            sequence: u64,
+            wire_len: u64,
+            hits: u64,
+        }
+
+        struct RelayState {
+            saved: HashMap<([u8; 32], [u8; 32]), SavedPut>,
+            sequences: HashMap<[u8; 32], u64>,
+            first: Option<([u8; 32], [u8; 32])>,
+            puts: u64,
+            duplicate_puts: u64,
+            third_puts: u64,
+            mismatches: u64,
+            quota: u64,
+        }
+
+        struct Shot {
+            puts: u64,
+            duplicate_puts: u64,
+            third_puts: u64,
+            mismatches: u64,
+            entries: u64,
+            quota: u64,
+            hits: u64,
+            sequence: u64,
+            wire_len: u64,
+            mailbox: [u8; 32],
+            hash: [u8; 32],
+            receipt: Vec<u8>,
+        }
+
+        struct Loopback {
+            port: u16,
+            pins: Arc<Vec<PinSecret>>,
+            state: Arc<Mutex<RelayState>>,
+            stop: Arc<AtomicBool>,
+            thread: Option<std::thread::JoinHandle<()>>,
+        }
+
+        impl Drop for Loopback {
+            fn drop(&mut self) {
+                self.stop.store(true, Ordering::SeqCst);
+                if let Some(thread) = self.thread.take() {
+                    let _ = thread.join();
+                }
+            }
+        }
+
+        impl Loopback {
+            fn start() -> Self {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let port = listener.local_addr().unwrap().port();
+                let mut pins: Vec<PinSecret> = (0..3u8)
+                    .map(|index| {
+                        let signer = SigningKey::from_bytes(&[10 + index; 32]);
+                        PinSecret {
+                            key: signer.verifying_key().to_bytes(),
+                            signer,
+                            run: [21 + index; 32],
+                            mailbox: [31 + index; 32],
+                            append: [41 + index; 32],
+                        }
+                    })
+                    .collect();
+                pins.sort_by(|left, right| left.key.cmp(&right.key));
+                let pins = Arc::new(pins);
+                let state = Arc::new(Mutex::new(RelayState {
+                    saved: HashMap::new(),
+                    sequences: HashMap::new(),
+                    first: None,
+                    puts: 0,
+                    duplicate_puts: 0,
+                    third_puts: 0,
+                    mismatches: 0,
+                    quota: 0,
+                }));
+                let stop = Arc::new(AtomicBool::new(false));
+                let thread_pins = Arc::clone(&pins);
+                let thread_state = Arc::clone(&state);
+                let thread_stop = Arc::clone(&stop);
+                let third = pins[2].mailbox;
+                let thread = std::thread::spawn(move || {
+                    while !thread_stop.load(Ordering::SeqCst) {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                handle(stream, &thread_pins, &thread_state, third);
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+                Self {
+                    port,
+                    pins,
+                    state,
+                    stop,
+                    thread: Some(thread),
+                }
+            }
+
+            fn publish(&self, dir: &Path) {
+                let public = serde_json::json!({
+                    "port": self.port,
+                    "third": hex::encode(self.pins[2].mailbox),
+                    "relays": self.pins.iter().map(|pin| serde_json::json!({
+                        "key": hex::encode(pin.key),
+                        "run": hex::encode(pin.run),
+                        "mailbox": hex::encode(pin.mailbox),
+                    })).collect::<Vec<_>>(),
+                });
+                fs::write(
+                    dir.join("routes.json"),
+                    serde_json::to_vec(&public).unwrap(),
+                )
+                .unwrap();
+                let mut appends = Vec::with_capacity(96);
+                for pin in self.pins.iter() {
+                    appends.extend_from_slice(&pin.append);
+                }
+                let path = dir.join("append.bin");
+                fs::write(&path, &appends).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+
+            fn shot(&self) -> Shot {
+                let state = self.state.lock().unwrap();
+                let (mailbox, hash) = state.first.expect("relay has no stored object");
+                let saved = &state.saved[&(mailbox, hash)];
+                Shot {
+                    puts: state.puts,
+                    duplicate_puts: state.duplicate_puts,
+                    third_puts: state.third_puts,
+                    mismatches: state.mismatches,
+                    entries: state.saved.len() as u64,
+                    quota: state.quota,
+                    hits: saved.hits,
+                    sequence: saved.sequence,
+                    wire_len: saved.wire_len,
+                    mailbox,
+                    hash,
+                    receipt: saved.receipt.clone(),
+                }
+            }
+
+            fn counts(&self) -> (u64, u64) {
+                let state = self.state.lock().unwrap();
+                (state.puts, state.saved.len() as u64)
+            }
+
+            fn append_for(&self, mailbox: [u8; 32]) -> [u8; 32] {
+                self.pins
+                    .iter()
+                    .find(|pin| pin.mailbox == mailbox)
+                    .unwrap()
+                    .append
+            }
+        }
+
+        fn case_dir() -> PathBuf {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let dir = PathBuf::from("/private/tmp/relay-6.6-evidence").join(format!(
+                "native-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+            dir
+        }
+
+        fn scrub_log(path: &Path) -> String {
+            let bytes = fs::read(path).unwrap_or_default();
+            let start = bytes.len().saturating_sub(2000);
+            String::from_utf8_lossy(&bytes[start..])
+                .lines()
+                .filter(|line| {
+                    let lower = line.to_ascii_lowercase();
+                    !lower.contains("bearer ") && !lower.contains("authorization:")
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        fn spawn_barrier(dir: &Path, stage: &str) -> (PathBuf, OwnedChild) {
+            let marker = dir.join("barrier");
+            let log = fs::File::create(dir.join("child.log")).unwrap();
+            let child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "store::outbox_commit_tests::crash::outbox_crash_barrier_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("RELAY_6_6_ROOT", dir.join("client"))
+                .env("RELAY_6_6_BARRIER", stage)
+                .env("RELAY_6_6_MARKER", &marker)
+                .env("RELAY_6_6_ROUTES", dir.join("routes.json"))
+                .env("RELAY_6_6_APPEND", dir.join("append.bin"))
+                .stdout(Stdio::from(log.try_clone().unwrap()))
+                .stderr(Stdio::from(log))
+                .spawn()
+                .unwrap();
+            (marker, OwnedChild(child))
+        }
+
+        fn reap(child: &mut OwnedChild) {
+            let _ = child.0.kill();
+            let status = wait_bounded(&mut child.0, REAP_WAIT)
+                .expect("fixture child was not reaped before the deadline");
+            assert_eq!(
+                status.signal(),
+                Some(9),
+                "fixture child was not reaped by the parent"
+            );
+        }
+
+        fn table_count(root: &Path, table: &str) -> i64 {
+            let sql = Connection::open(root.join("client.sqlite3")).unwrap();
+            sql.busy_timeout(Duration::from_secs(1)).unwrap();
+            sql.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+        }
+
+        fn owner() -> (Roster, crate::CommIdentity) {
+            let identities: Vec<_> = (1u16..=3)
+                .map(|id| {
+                    let mut seed = [0; 66];
+                    seed[..2].copy_from_slice(&id.to_be_bytes());
+                    seed[2..34].fill(id as u8);
+                    seed[34..].fill(id as u8 + 10);
+                    crate::CommIdentity::from_serialized(&seed).unwrap()
                 })
                 .collect();
-            pins.sort_by(|left, right| left.key.cmp(&right.key));
-            let pins = Arc::new(pins);
-            let state = Arc::new(Mutex::new(RelayState {
-                saved: HashMap::new(),
-                sequences: HashMap::new(),
-                first: None,
-                puts: 0,
-                duplicate_puts: 0,
-                third_puts: 0,
-                mismatches: 0,
-                quota: 0,
-            }));
-            let stop = Arc::new(AtomicBool::new(false));
-            let thread_pins = Arc::clone(&pins);
-            let thread_state = Arc::clone(&state);
-            let thread_stop = Arc::clone(&stop);
-            let third = pins[2].mailbox;
-            let thread = std::thread::spawn(move || {
-                while !thread_stop.load(Ordering::SeqCst) {
-                    match listener.accept() {
-                        Ok((stream, _)) => {
-                            handle(stream, &thread_pins, &thread_state, third);
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(Duration::from_millis(5));
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
-            Self {
-                port,
-                pins,
-                state,
-                stop,
-                thread: Some(thread),
-            }
-        }
-
-        fn publish(&self, dir: &Path) {
-            let public = serde_json::json!({
-                "port": self.port,
-                "third": hex::encode(self.pins[2].mailbox),
-                "relays": self.pins.iter().map(|pin| serde_json::json!({
-                    "key": hex::encode(pin.key),
-                    "run": hex::encode(pin.run),
-                    "mailbox": hex::encode(pin.mailbox),
-                })).collect::<Vec<_>>(),
-            });
-            fs::write(dir.join("routes.json"), serde_json::to_vec(&public).unwrap()).unwrap();
-            let mut appends = Vec::with_capacity(96);
-            for pin in self.pins.iter() {
-                appends.extend_from_slice(&pin.append);
-            }
-            let path = dir.join("append.bin");
-            fs::write(&path, &appends).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        }
-
-        fn shot(&self) -> Shot {
-            let state = self.state.lock().unwrap();
-            let (mailbox, hash) = state.first.expect("relay has no stored object");
-            let saved = &state.saved[&(mailbox, hash)];
-            Shot {
-                puts: state.puts,
-                duplicate_puts: state.duplicate_puts,
-                third_puts: state.third_puts,
-                mismatches: state.mismatches,
-                entries: state.saved.len() as u64,
-                quota: state.quota,
-                hits: saved.hits,
-                sequence: saved.sequence,
-                wire_len: saved.wire_len,
-                mailbox,
-                hash,
-                receipt: saved.receipt.clone(),
-            }
-        }
-
-        fn counts(&self) -> (u64, u64) {
-            let state = self.state.lock().unwrap();
-            (state.puts, state.saved.len() as u64)
-        }
-
-        fn append_for(&self, mailbox: [u8; 32]) -> [u8; 32] {
-            self.pins
-                .iter()
-                .find(|pin| pin.mailbox == mailbox)
-                .unwrap()
-                .append
-        }
-    }
-
-    fn case_dir() -> PathBuf {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let dir = PathBuf::from("/private/tmp/relay-6.6-evidence").join(format!(
-            "native-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
-        dir
-    }
-
-    fn scrub_log(path: &Path) -> String {
-        let bytes = fs::read(path).unwrap_or_default();
-        let start = bytes.len().saturating_sub(2000);
-        String::from_utf8_lossy(&bytes[start..])
-            .lines()
-            .filter(|line| {
-                let lower = line.to_ascii_lowercase();
-                !lower.contains("bearer ") && !lower.contains("authorization:")
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    fn spawn_barrier(dir: &Path, stage: &str) -> (PathBuf, OwnedChild) {
-        let marker = dir.join("barrier");
-        let log = fs::File::create(dir.join("child.log")).unwrap();
-        let child = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "store::outbox_commit_tests::crash::outbox_crash_barrier_child",
-                "--ignored",
-                "--nocapture",
-            ])
-            .env("RELAY_6_6_ROOT", dir.join("client"))
-            .env("RELAY_6_6_BARRIER", stage)
-            .env("RELAY_6_6_MARKER", &marker)
-            .env("RELAY_6_6_ROUTES", dir.join("routes.json"))
-            .env("RELAY_6_6_APPEND", dir.join("append.bin"))
-            .stdout(Stdio::from(log.try_clone().unwrap()))
-            .stderr(Stdio::from(log))
-            .spawn()
-            .unwrap();
-        (marker, OwnedChild(child))
-    }
-
-    fn reap(child: &mut OwnedChild) {
-        let _ = child.0.kill();
-        let status = wait_bounded(&mut child.0, REAP_WAIT)
-            .expect("fixture child was not reaped before the deadline");
-        assert_eq!(
-            status.signal(),
-            Some(9),
-            "fixture child was not reaped by the parent"
-        );
-    }
-
-    fn table_count(root: &Path, table: &str) -> i64 {
-        let sql = Connection::open(root.join("client.sqlite3")).unwrap();
-        sql.busy_timeout(Duration::from_secs(1)).unwrap();
-        sql.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get(0))
-            .unwrap()
-    }
-
-    fn owner() -> (Roster, crate::CommIdentity) {
-        let identities: Vec<_> = (1u16..=3)
-            .map(|id| {
-                let mut seed = [0; 66];
-                seed[..2].copy_from_slice(&id.to_be_bytes());
-                seed[2..34].fill(id as u8);
-                seed[34..].fill(id as u8 + 10);
-                crate::CommIdentity::from_serialized(&seed).unwrap()
-            })
-            .collect();
-        let roster = Roster {
-            vault: [70; 32],
-            members: identities.iter().map(crate::CommIdentity::public).collect(),
-        };
-        let identity = identities.into_iter().next().unwrap();
-        (roster, identity)
-    }
-
-    fn http_body(roster: &Roster) -> MessageBody {
-        MessageBody {
-            key: LogicalKey {
-                vault: roster.vault,
-                roster: roster_digest(roster).unwrap(),
-                sender: 1,
-                message: HTTP_MESSAGE,
-            },
-            audience: vec![1, 2, 3],
-            session: Some([181; 32]),
-            prerequisites: vec![],
-            payload: Payload::Test(vec![19; 10]),
-        }
-    }
-
-    fn decode_id(value: &serde_json::Value) -> Id32 {
-        hex::decode(value.as_str().unwrap())
-            .unwrap()
-            .try_into()
-            .unwrap()
-    }
-
-    fn install_routes(
-        store: &mut ClientStore,
-        roster: &Roster,
-        identity: &crate::CommIdentity,
-        routes: &Path,
-        append_path: &Path,
-    ) -> (ClientConfig, crate::AuthenticatedDescriptor) {
-        let public: serde_json::Value =
-            serde_json::from_slice(&fs::read(routes).unwrap()).unwrap();
-        let appends = fs::read(append_path).unwrap();
-        assert_eq!(appends.len(), 96, "route credential file is the wrong length");
-        let port = public["port"].as_u64().unwrap();
-        let mut relays = Vec::new();
-        let mut own = Vec::new();
-        for (index, relay) in public["relays"].as_array().unwrap().iter().enumerate() {
-            let mut append = [0u8; 32];
-            append.copy_from_slice(&appends[index * 32..(index + 1) * 32]);
-            let route = RelayRoute {
-                pin: RelayPin {
-                    key: decode_id(&relay["key"]),
-                    run: decode_id(&relay["run"]),
-                },
-                endpoint: format!("http://127.0.0.1:{port}"),
-                mailbox: decode_id(&relay["mailbox"]),
-                append_revision: 1,
+            let roster = Roster {
+                vault: [70; 32],
+                members: identities.iter().map(crate::CommIdentity::public).collect(),
             };
-            relays.push(DescriptorRelay {
-                route: route.clone(),
-                append: Secret32::from_bytes(append),
-            });
-            own.push(OwnerInbox {
-                route,
-                read: Secret32::from_bytes([51; 32]),
-                append: Secret32::from_bytes(append),
-                admin: Secret32::from_bytes([52; 32]),
-            });
+            let identity = identities.into_iter().next().unwrap();
+            (roster, identity)
         }
-        let descriptor = Descriptor::new(
-            roster.vault,
-            roster_digest(roster).unwrap(),
-            1,
-            1,
-            relays,
-        );
-        let owner_public = identity.public();
-        let sealed = seal_descriptor(identity, roster, &descriptor, &owner_public).unwrap();
-        let opened = open_descriptor(identity, roster, &sealed.wire).unwrap();
-        let reference = ConfigReference::from_ciphertext(1, &sealed.wire).unwrap();
-        // A restarted process keeps the committed pointer. Resealing the same routes
-        // must not replace that pointer just to upload.
-        if store.config_reference().unwrap().is_none() {
-            store.record_config_revision(&reference).unwrap();
+
+        fn http_body(roster: &Roster) -> MessageBody {
+            MessageBody {
+                key: LogicalKey {
+                    vault: roster.vault,
+                    roster: roster_digest(roster).unwrap(),
+                    sender: 1,
+                    message: HTTP_MESSAGE,
+                },
+                audience: vec![1, 2, 3],
+                session: Some([181; 32]),
+                prerequisites: vec![],
+                payload: Payload::Test(vec![19; 10]),
+            }
         }
-        (
-            ClientConfig {
-                own,
-                peers: Vec::new(),
-            },
-            opened,
-        )
-    }
 
-    fn write_expected(path: &Path, body: &MessageBody, prepared: &crate::PreparedOutbox) {
-        let value = serde_json::json!({
-            "request": hex::encode(COMMIT_REQUEST),
-            "message": hex::encode(COMMIT_MESSAGE),
-            "intent": hex::encode(outbox_intent_digest(body).unwrap()),
-            "digest": hex::encode(prepared.digest()),
-            "session": hex::encode(body.session.unwrap()),
-            "recipients": prepared.recipients().iter().map(|recipient| serde_json::json!({
-                "recipient": recipient.recipient(),
-                "transfer": recipient.transfer().map(hex::encode),
-                "root": hex::encode(recipient.root_hash()),
-                "objects": recipient.objects().iter().map(|object| serde_json::json!({
-                    "hash": hex::encode(object.hash),
-                    "wire": hex::encode(&object.wire),
-                })).collect::<Vec<_>>(),
-            })).collect::<Vec<_>>(),
-        });
-        fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
-    }
+        fn decode_id(value: &serde_json::Value) -> Id32 {
+            hex::decode(value.as_str().unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap()
+        }
 
-    fn retained(store: &ClientStore, expected: &serde_json::Value) {
-        let message = decode_id(&expected["message"]);
-        assert_eq!(message, COMMIT_MESSAGE, "retained logical id changed");
-        let intent = decode_id(&expected["intent"]);
-        let logical = store
-            .lookup_outbox_request(&COMMIT_REQUEST, &intent)
-            .unwrap()
-            .expect("caller request was not retained");
-        assert_eq!(logical.key.message, COMMIT_MESSAGE);
-        assert_eq!(logical.digest, decode_id(&expected["digest"]));
-        assert_eq!(logical.session, Some([125; 32]));
-        let saved = store.recover_recipients(&logical.key).unwrap();
-        let recipients = expected["recipients"].as_array().unwrap();
-        assert_eq!(saved.len(), 3, "a committed outbox must retain all three recipients");
-        assert_eq!(saved.len(), recipients.len());
-        for (recipient, expected_recipient) in saved.iter().zip(recipients) {
+        fn install_routes(
+            store: &mut ClientStore,
+            roster: &Roster,
+            identity: &crate::CommIdentity,
+            routes: &Path,
+            append_path: &Path,
+        ) -> (ClientConfig, crate::AuthenticatedDescriptor) {
+            let public: serde_json::Value =
+                serde_json::from_slice(&fs::read(routes).unwrap()).unwrap();
+            let appends = fs::read(append_path).unwrap();
             assert_eq!(
-                recipient.recipient,
-                expected_recipient["recipient"].as_u64().unwrap() as u16
+                appends.len(),
+                96,
+                "route credential file is the wrong length"
             );
-            assert!(recipient.needs_route, "commit must not upload before routing");
-            assert_eq!(recipient.root_hash, decode_id(&expected_recipient["root"]));
-            let transfer = expected_recipient["transfer"]
-                .as_str()
-                .map(|_| decode_id(&expected_recipient["transfer"]));
-            assert_eq!(recipient.transfer, transfer);
-            let mut requirements = store
-                .recover_requirements(&logical.key, recipient.recipient, None, 100)
-                .unwrap();
-            requirements.sort_by_key(|item| item.ordinal);
-            let objects = expected_recipient["objects"].as_array().unwrap();
-            assert!(
-                objects.len() > 1,
-                "chunked recipient set collapsed to a single object"
+            let port = public["port"].as_u64().unwrap();
+            let mut relays = Vec::new();
+            let mut own = Vec::new();
+            for (index, relay) in public["relays"].as_array().unwrap().iter().enumerate() {
+                let mut append = [0u8; 32];
+                append.copy_from_slice(&appends[index * 32..(index + 1) * 32]);
+                let route = RelayRoute {
+                    pin: RelayPin {
+                        key: decode_id(&relay["key"]),
+                        run: decode_id(&relay["run"]),
+                    },
+                    endpoint: format!("http://127.0.0.1:{port}"),
+                    mailbox: decode_id(&relay["mailbox"]),
+                    append_revision: 1,
+                };
+                relays.push(DescriptorRelay {
+                    route: route.clone(),
+                    append: Secret32::from_bytes(append),
+                });
+                own.push(OwnerInbox {
+                    route,
+                    read: Secret32::from_bytes([51; 32]),
+                    append: Secret32::from_bytes(append),
+                    admin: Secret32::from_bytes([52; 32]),
+                });
+            }
+            let descriptor =
+                Descriptor::new(roster.vault, roster_digest(roster).unwrap(), 1, 1, relays);
+            let owner_public = identity.public();
+            let sealed = seal_descriptor(identity, roster, &descriptor, &owner_public).unwrap();
+            let opened = open_descriptor(identity, roster, &sealed.wire).unwrap();
+            let reference = ConfigReference::from_ciphertext(1, &sealed.wire).unwrap();
+            // A restarted process keeps the committed pointer. Resealing the same routes
+            // must not replace that pointer just to upload.
+            if store.config_reference().unwrap().is_none() {
+                store.record_config_revision(&reference).unwrap();
+            }
+            (
+                ClientConfig {
+                    own,
+                    peers: Vec::new(),
+                },
+                opened,
+            )
+        }
+
+        fn write_expected(path: &Path, body: &MessageBody, prepared: &crate::PreparedOutbox) {
+            let value = serde_json::json!({
+                "request": hex::encode(COMMIT_REQUEST),
+                "message": hex::encode(COMMIT_MESSAGE),
+                "intent": hex::encode(outbox_intent_digest(body).unwrap()),
+                "digest": hex::encode(prepared.digest()),
+                "session": hex::encode(body.session.unwrap()),
+                "recipients": prepared.recipients().iter().map(|recipient| serde_json::json!({
+                    "recipient": recipient.recipient(),
+                    "transfer": recipient.transfer().map(hex::encode),
+                    "root": hex::encode(recipient.root_hash()),
+                    "objects": recipient.objects().iter().map(|object| serde_json::json!({
+                        "hash": hex::encode(object.hash),
+                        "wire": hex::encode(&object.wire),
+                    })).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
+            });
+            fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+        }
+
+        fn retained(store: &ClientStore, expected: &serde_json::Value) {
+            let message = decode_id(&expected["message"]);
+            assert_eq!(message, COMMIT_MESSAGE, "retained logical id changed");
+            let intent = decode_id(&expected["intent"]);
+            let logical = store
+                .lookup_outbox_request(&COMMIT_REQUEST, &intent)
+                .unwrap()
+                .expect("caller request was not retained");
+            assert_eq!(logical.key.message, COMMIT_MESSAGE);
+            assert_eq!(logical.digest, decode_id(&expected["digest"]));
+            assert_eq!(logical.session, Some([125; 32]));
+            let saved = store.recover_recipients(&logical.key).unwrap();
+            let recipients = expected["recipients"].as_array().unwrap();
+            assert_eq!(
+                saved.len(),
+                3,
+                "a committed outbox must retain all three recipients"
             );
-            assert_eq!(requirements.len(), objects.len());
-            for (requirement, object) in requirements.iter().zip(objects) {
-                let hash = decode_id(&object["hash"]);
-                let wire = hex::decode(object["wire"].as_str().unwrap()).unwrap();
-                assert_eq!(requirement.hash, hash);
-                let saved_object = store.saved_object(&hash).unwrap().expect("object missing");
-                assert_eq!(saved_object.wire.len(), wire.len(), "retained wire length changed");
+            assert_eq!(saved.len(), recipients.len());
+            for (recipient, expected_recipient) in saved.iter().zip(recipients) {
+                assert_eq!(
+                    recipient.recipient,
+                    expected_recipient["recipient"].as_u64().unwrap() as u16
+                );
                 assert!(
-                    saved_object.wire == wire,
-                    "retained wire bytes differ from the committed object"
+                    recipient.needs_route,
+                    "commit must not upload before routing"
+                );
+                assert_eq!(recipient.root_hash, decode_id(&expected_recipient["root"]));
+                let transfer = expected_recipient["transfer"]
+                    .as_str()
+                    .map(|_| decode_id(&expected_recipient["transfer"]));
+                assert_eq!(recipient.transfer, transfer);
+                let mut requirements = store
+                    .recover_requirements(&logical.key, recipient.recipient, None, 100)
+                    .unwrap();
+                requirements.sort_by_key(|item| item.ordinal);
+                let objects = expected_recipient["objects"].as_array().unwrap();
+                assert!(
+                    objects.len() > 1,
+                    "chunked recipient set collapsed to a single object"
+                );
+                assert_eq!(requirements.len(), objects.len());
+                for (requirement, object) in requirements.iter().zip(objects) {
+                    let hash = decode_id(&object["hash"]);
+                    let wire = hex::decode(object["wire"].as_str().unwrap()).unwrap();
+                    assert_eq!(requirement.hash, hash);
+                    let saved_object = store.saved_object(&hash).unwrap().expect("object missing");
+                    assert_eq!(
+                        saved_object.wire.len(),
+                        wire.len(),
+                        "retained wire length changed"
+                    );
+                    assert!(
+                        saved_object.wire == wire,
+                        "retained wire bytes differ from the committed object"
+                    );
+                }
+            }
+            assert!(
+                store.recover_uploads(0, 100).unwrap().is_empty(),
+                "commit created upload work before routing"
+            );
+        }
+
+        fn empty_outbox(root: &Path) {
+            for table in [
+                "ciphertext_objects",
+                "logical_records",
+                "outgoing_recipients",
+                "required_objects",
+                "caller_requests",
+                "upload_work",
+                "verified_receipts",
+                "delivery_completion",
+            ] {
+                assert_eq!(
+                    table_count(root, table),
+                    0,
+                    "{table} was visible before commit"
                 );
             }
         }
-        assert!(
-            store.recover_uploads(0, 100).unwrap().is_empty(),
-            "commit created upload work before routing"
-        );
-    }
 
-    fn empty_outbox(root: &Path) {
-        for table in [
-            "ciphertext_objects",
-            "logical_records",
-            "outgoing_recipients",
-            "required_objects",
-            "caller_requests",
-            "upload_work",
-            "verified_receipts",
-            "delivery_completion",
-        ] {
-            assert_eq!(table_count(root, table), 0, "{table} was visible before commit");
-        }
-    }
-
-    fn read_request(stream: &mut TcpStream) -> Option<Request> {
-        let mut header = Vec::new();
-        let mut byte = [0u8; 1];
-        while header.len() < 8192 {
-            if stream.read(&mut byte).ok()? == 0 {
+        fn read_request(stream: &mut TcpStream) -> Option<Request> {
+            let mut header = Vec::new();
+            let mut byte = [0u8; 1];
+            while header.len() < 8192 {
+                if stream.read(&mut byte).ok()? == 0 {
+                    return None;
+                }
+                header.push(byte[0]);
+                if header.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            if !header.ends_with(b"\r\n\r\n") {
                 return None;
             }
-            header.push(byte[0]);
-            if header.ends_with(b"\r\n\r\n") {
-                break;
+            let text = String::from_utf8_lossy(&header);
+            let mut lines = text.split("\r\n");
+            let mut parts = lines.next()?.split(' ');
+            let method = parts.next()?.to_string();
+            let path = parts.next()?.split('?').next()?.to_string();
+            let mut content_length = None;
+            let mut authorization = String::new();
+            for line in lines {
+                let Some((name, value)) = line.split_once(':') else {
+                    continue;
+                };
+                let name = name.trim().to_ascii_lowercase();
+                let value = value.trim();
+                if name == "content-length" {
+                    content_length = value.parse().ok();
+                } else if name == "authorization" {
+                    authorization = value.to_string();
+                }
             }
+            let length = content_length?;
+            if length > 65536 {
+                return None;
+            }
+            let mut body = vec![0u8; length];
+            stream.read_exact(&mut body).ok()?;
+            Some(Request {
+                method,
+                path,
+                authorization,
+                body,
+            })
         }
-        if !header.ends_with(b"\r\n\r\n") {
-            return None;
+
+        struct Request {
+            method: String,
+            path: String,
+            authorization: String,
+            body: Vec<u8>,
         }
-        let text = String::from_utf8_lossy(&header);
-        let mut lines = text.split("\r\n");
-        let mut parts = lines.next()?.split(' ');
-        let method = parts.next()?.to_string();
-        let path = parts.next()?.split('?').next()?.to_string();
-        let mut content_length = None;
-        let mut authorization = String::new();
-        for line in lines {
-            let Some((name, value)) = line.split_once(':') else {
-                continue;
+
+        fn parse_put_path(path: &str) -> Option<([u8; 32], [u8; 32])> {
+            let rest = path.strip_prefix("/v1/mailboxes/")?;
+            let (mailbox, hash) = rest.split_once("/objects/")?;
+            if mailbox.len() != 64 || hash.len() != 64 {
+                return None;
+            }
+            Some((
+                hex::decode(mailbox).ok()?.try_into().ok()?,
+                hex::decode(hash).ok()?.try_into().ok()?,
+            ))
+        }
+
+        fn bearer_matches(header: &str, append: &[u8; 32]) -> bool {
+            let Some(token) = header.strip_prefix("Bearer ") else {
+                return false;
             };
-            let name = name.trim().to_ascii_lowercase();
-            let value = value.trim();
-            if name == "content-length" {
-                content_length = value.parse().ok();
-            } else if name == "authorization" {
-                authorization = value.to_string();
-            }
+            URL_SAFE_NO_PAD
+                .decode(token)
+                .ok()
+                .is_some_and(|bytes| bytes.as_slice() == append)
         }
-        let length = content_length?;
-        if length > 65536 {
-            return None;
+
+        fn receipt_bytes(pin: &PinSecret, hash: [u8; 32], wire_len: u64, sequence: u64) -> Vec<u8> {
+            let body = ReceiptBody {
+                pin: RelayPin {
+                    key: pin.key,
+                    run: pin.run,
+                },
+                mailbox: pin.mailbox,
+                hash,
+                wire_length: wire_len,
+                sequence,
+                retention: 1,
+            };
+            let encoded = receipt::encode_body(&body).unwrap();
+            let mut input = b"Loki_Relay_Stored_v1\0".to_vec();
+            input.extend_from_slice(&u32::try_from(encoded.len()).unwrap().to_be_bytes());
+            input.extend_from_slice(&encoded);
+            let signature = pin.signer.sign(&input);
+            canonical::encode(&Value::Array(vec![
+                Value::Bytes(encoded),
+                Value::Bytes(signature.to_bytes().to_vec()),
+            ]))
+            .unwrap()
         }
-        let mut body = vec![0u8; length];
-        stream.read_exact(&mut body).ok()?;
-        Some(Request {
-            method,
-            path,
-            authorization,
-            body,
-        })
-    }
 
-    struct Request {
-        method: String,
-        path: String,
-        authorization: String,
-        body: Vec<u8>,
-    }
-
-    fn parse_put_path(path: &str) -> Option<([u8; 32], [u8; 32])> {
-        let rest = path.strip_prefix("/v1/mailboxes/")?;
-        let (mailbox, hash) = rest.split_once("/objects/")?;
-        if mailbox.len() != 64 || hash.len() != 64 {
-            return None;
-        }
-        Some((
-            hex::decode(mailbox).ok()?.try_into().ok()?,
-            hex::decode(hash).ok()?.try_into().ok()?,
-        ))
-    }
-
-    fn bearer_matches(header: &str, append: &[u8; 32]) -> bool {
-        let Some(token) = header.strip_prefix("Bearer ") else {
-            return false;
-        };
-        URL_SAFE_NO_PAD
-            .decode(token)
-            .ok()
-            .is_some_and(|bytes| bytes.as_slice() == append)
-    }
-
-    fn receipt_bytes(pin: &PinSecret, hash: [u8; 32], wire_len: u64, sequence: u64) -> Vec<u8> {
-        let body = ReceiptBody {
-            pin: RelayPin {
-                key: pin.key,
-                run: pin.run,
-            },
-            mailbox: pin.mailbox,
-            hash,
-            wire_length: wire_len,
-            sequence,
-            retention: 1,
-        };
-        let encoded = receipt::encode_body(&body).unwrap();
-        let mut input = b"Loki_Relay_Stored_v1\0".to_vec();
-        input.extend_from_slice(&u32::try_from(encoded.len()).unwrap().to_be_bytes());
-        input.extend_from_slice(&encoded);
-        let signature = pin.signer.sign(&input);
-        canonical::encode(&Value::Array(vec![
-            Value::Bytes(encoded),
-            Value::Bytes(signature.to_bytes().to_vec()),
-        ]))
-        .unwrap()
-    }
-
-    fn write_cbor(stream: &mut TcpStream, status: u16, body: &[u8]) {
-        let header = format!(
+        fn write_cbor(stream: &mut TcpStream, status: u16, body: &[u8]) {
+            let header = format!(
             "HTTP/1.1 {status} X\r\nContent-Type: application/cbor\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         );
-        let _ = stream.write_all(header.as_bytes());
-        let _ = stream.write_all(body);
-    }
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(body);
+        }
 
-    fn handle(mut stream: TcpStream, pins: &[PinSecret], state: &Mutex<RelayState>, third: [u8; 32]) {
-        // A stalled accepted socket must not block listener shutdown.
-        stream.set_nonblocking(false).expect("fixture socket mode");
-        stream
-            .set_read_timeout(Some(SOCKET_WAIT))
-            .expect("fixture read timeout");
-        stream
-            .set_write_timeout(Some(SOCKET_WAIT))
-            .expect("fixture write timeout");
-        let Some(request) = read_request(&mut stream) else {
-            return;
-        };
-        if request.method != "PUT" {
-            write_cbor(&mut stream, 405, b"");
-            return;
-        }
-        let Some((mailbox, hash)) = parse_put_path(&request.path) else {
-            write_cbor(&mut stream, 400, b"");
-            return;
-        };
-        let Some(pin) = pins.iter().find(|pin| pin.mailbox == mailbox) else {
-            write_cbor(&mut stream, 404, b"");
-            return;
-        };
-        if !bearer_matches(&request.authorization, &pin.append) {
-            write_cbor(&mut stream, 401, b"");
-            return;
-        }
-        if Sha256::digest(&request.body).as_slice() != hash {
-            state.lock().unwrap().mismatches += 1;
-            write_cbor(&mut stream, 400, b"");
-            return;
-        }
-        let mut state = state.lock().unwrap();
-        state.puts += 1;
-        if mailbox == third {
-            state.third_puts += 1;
-        }
-        if state.saved.contains_key(&(mailbox, hash)) {
-            let matches = state.saved[&(mailbox, hash)].body == request.body;
-            if !matches {
-                state.mismatches += 1;
-                drop(state);
-                write_cbor(&mut stream, 409, b"");
+        fn handle(
+            mut stream: TcpStream,
+            pins: &[PinSecret],
+            state: &Mutex<RelayState>,
+            third: [u8; 32],
+        ) {
+            // A stalled accepted socket must not block listener shutdown.
+            stream.set_nonblocking(false).expect("fixture socket mode");
+            stream
+                .set_read_timeout(Some(SOCKET_WAIT))
+                .expect("fixture read timeout");
+            stream
+                .set_write_timeout(Some(SOCKET_WAIT))
+                .expect("fixture write timeout");
+            let Some(request) = read_request(&mut stream) else {
+                return;
+            };
+            if request.method != "PUT" {
+                write_cbor(&mut stream, 405, b"");
                 return;
             }
-            let receipt = state.saved[&(mailbox, hash)].receipt.clone();
-            state.saved.get_mut(&(mailbox, hash)).unwrap().hits += 1;
-            state.duplicate_puts += 1;
+            let Some((mailbox, hash)) = parse_put_path(&request.path) else {
+                write_cbor(&mut stream, 400, b"");
+                return;
+            };
+            let Some(pin) = pins.iter().find(|pin| pin.mailbox == mailbox) else {
+                write_cbor(&mut stream, 404, b"");
+                return;
+            };
+            if !bearer_matches(&request.authorization, &pin.append) {
+                write_cbor(&mut stream, 401, b"");
+                return;
+            }
+            if Sha256::digest(&request.body).as_slice() != hash {
+                state.lock().unwrap().mismatches += 1;
+                write_cbor(&mut stream, 400, b"");
+                return;
+            }
+            let mut state = state.lock().unwrap();
+            state.puts += 1;
+            if mailbox == third {
+                state.third_puts += 1;
+            }
+            if state.saved.contains_key(&(mailbox, hash)) {
+                let matches = state.saved[&(mailbox, hash)].body == request.body;
+                if !matches {
+                    state.mismatches += 1;
+                    drop(state);
+                    write_cbor(&mut stream, 409, b"");
+                    return;
+                }
+                let receipt = state.saved[&(mailbox, hash)].receipt.clone();
+                state.saved.get_mut(&(mailbox, hash)).unwrap().hits += 1;
+                state.duplicate_puts += 1;
+                drop(state);
+                write_cbor(&mut stream, 200, &receipt);
+                return;
+            }
+            let wire_len = request.body.len() as u64;
+            let sequence = state.sequences.entry(mailbox).or_insert(0);
+            *sequence += 1;
+            let sequence = *sequence;
+            let receipt = receipt_bytes(pin, hash, wire_len, sequence);
+            state.quota += wire_len;
+            if state.first.is_none() {
+                state.first = Some((mailbox, hash));
+            }
+            state.saved.insert(
+                (mailbox, hash),
+                SavedPut {
+                    body: request.body,
+                    receipt: receipt.clone(),
+                    sequence,
+                    wire_len,
+                    hits: 1,
+                },
+            );
             drop(state);
-            write_cbor(&mut stream, 200, &receipt);
-            return;
+            write_cbor(&mut stream, 201, &receipt);
         }
-        let wire_len = request.body.len() as u64;
-        let sequence = state.sequences.entry(mailbox).or_insert(0);
-        *sequence += 1;
-        let sequence = *sequence;
-        let receipt = receipt_bytes(pin, hash, wire_len, sequence);
-        state.quota += wire_len;
-        if state.first.is_none() {
-            state.first = Some((mailbox, hash));
-        }
-        state.saved.insert(
-            (mailbox, hash),
-            SavedPut {
-                body: request.body,
-                receipt: receipt.clone(),
-                sequence,
-                wire_len,
-                hits: 1,
-            },
-        );
-        drop(state);
-        write_cbor(&mut stream, 201, &receipt);
-    }
 
-    fn marker_is(dir: &Path, child: &mut OwnedChild, marker: &Path, stage: &str) {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while !marker.exists() {
-            assert!(
-                child.0.try_wait().unwrap().is_none(),
-                "child exited before {stage}\n{}",
-                scrub_log(&dir.join("child.log"))
+        fn marker_is(dir: &Path, child: &mut OwnedChild, marker: &Path, stage: &str) {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !marker.exists() {
+                assert!(
+                    child.0.try_wait().unwrap().is_none(),
+                    "child exited before {stage}\n{}",
+                    scrub_log(&dir.join("child.log"))
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "child never reached {stage}\n{}",
+                    scrub_log(&dir.join("child.log"))
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(
+                fs::read(marker).unwrap(),
+                stage.as_bytes(),
+                "child stopped at the wrong boundary"
             );
-            assert!(
-                Instant::now() < deadline,
-                "child never reached {stage}\n{}",
-                scrub_log(&dir.join("child.log"))
-            );
-            std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(
-            fs::read(marker).unwrap(),
-            stage.as_bytes(),
-            "child stopped at the wrong boundary"
-        );
-    }
 
-    /// Commit, bind the published routes, then upload. A barrier env stops inside that sequence.
-    async fn commit_then_upload(root: &Path, routes: &Path, appends: &Path) -> crate::UploadPass {
-        let (roster, identity, body, prepared) = fixture();
-        write_expected(&root.parent().unwrap().join("expected.json"), &body, &prepared);
-        let mut store = ClientStore::open(root, &roster, 1).unwrap();
-        let logical = store
-            .commit_outbox(&roster, &identity, &COMMIT_REQUEST, &prepared)
-            .unwrap();
-        let (config, opened) = install_routes(&mut store, &roster, &identity, routes, appends);
-        let http = RelayHttp::new().unwrap();
-        upload_pending(
-            &mut store,
-            &http,
-            &logical,
-            &roster,
-            &identity,
-            &config,
-            &opened,
-            1_000,
-            ThirdPass::StopAfterStored,
-        )
-        .await
-        .unwrap()
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn outbox_crash_barrier_child() {
-        let stage = std::env::var("RELAY_6_6_BARRIER").unwrap();
-        let root = PathBuf::from(std::env::var("RELAY_6_6_ROOT").unwrap());
-        if stage == "before-receipt" {
-            let (roster, identity) = owner();
-            let body = http_body(&roster);
-            let prepared = prepare_outbox(&identity, &roster, &body).unwrap();
-            let mut store = ClientStore::open(&root, &roster, 1).unwrap();
+        /// Commit, bind the published routes, then upload. A barrier env stops inside that sequence.
+        async fn commit_then_upload(
+            root: &Path,
+            routes: &Path,
+            appends: &Path,
+        ) -> crate::UploadPass {
+            let (roster, identity, body, prepared) = fixture();
+            write_expected(
+                &root.parent().unwrap().join("expected.json"),
+                &body,
+                &prepared,
+            );
+            let mut store = ClientStore::open(root, &roster, 1).unwrap();
             let logical = store
-                .commit_outbox(&roster, &identity, &HTTP_REQUEST, &prepared)
+                .commit_outbox(&roster, &identity, &COMMIT_REQUEST, &prepared)
                 .unwrap();
-            let (config, opened) = install_routes(
-                &mut store,
-                &roster,
-                &identity,
-                Path::new(&std::env::var("RELAY_6_6_ROUTES").unwrap()),
-                Path::new(&std::env::var("RELAY_6_6_APPEND").unwrap()),
-            );
+            let (config, opened) = install_routes(&mut store, &roster, &identity, routes, appends);
             let http = RelayHttp::new().unwrap();
-            let _ = upload_pending(
+            upload_pending(
                 &mut store,
                 &http,
                 &logical,
@@ -4844,298 +4913,372 @@ mod crash {
                 1_000,
                 ThirdPass::StopAfterStored,
             )
-            .await;
-            panic!("receipt barrier was not reached");
+            .await
+            .unwrap()
         }
-        let routes = PathBuf::from(std::env::var("RELAY_6_6_ROUTES").unwrap());
-        let appends = PathBuf::from(std::env::var("RELAY_6_6_APPEND").unwrap());
-        let _ = commit_then_upload(&root, &routes, &appends).await;
-        panic!("commit barrier was not reached");
-    }
 
-    #[tokio::test]
-    async fn outbox_crash_commit_then_upload_puts() {
-        assert!(
-            std::env::var_os("RELAY_6_6_BARRIER").is_none(),
-            "the PUT control must run with no commit barrier"
-        );
-        let dir = case_dir();
-        let relay = Loopback::start();
-        relay.publish(&dir);
-        let pass = commit_then_upload(
-            &dir.join("client"),
-            &dir.join("routes.json"),
-            &dir.join("append.bin"),
-        )
-        .await;
-        let (puts, entries) = relay.counts();
-        assert!(puts >= 1, "commit-then-upload accepted no PUT");
-        assert!(entries >= 1, "commit-then-upload stored no object");
-        // install_routes leaves peers empty, so Bob and Carol stay unrouted and
-        // whole-vault Stored is impossible. The author third pin is still reachable.
-        assert_eq!(pass.needs_route, vec![2, 3], "needs_route lost Bob or Carol");
-        assert!(
-            !pass.stopped_third,
-            "unbarred upload skipped the third pin without whole-vault Stored"
-        );
-        let shot = relay.shot();
-        assert_eq!(shot.mismatches, 0, "unbarred upload changed the object");
-        let (roster, identity, _, _) = fixture();
-        let mut store = ClientStore::open(dir.join("client").as_path(), &roster, 1).unwrap();
-        let (config, opened) = install_routes(
-            &mut store,
-            &roster,
-            &identity,
-            &dir.join("routes.json"),
-            &dir.join("append.bin"),
-        );
-        let logical = store
-            .recover_logical(0, 100)
-            .unwrap()
-            .pop()
-            .expect("committed logical row missing");
-        let author_copies = store
-            .recover_requirements(&logical.key, 1, None, 100)
-            .unwrap()
-            .len() as u64;
-        assert!(author_copies >= 1, "author copy set was empty");
-        assert_eq!(
-            shot.third_puts, author_copies,
-            "third pin did not receive every author copy"
-        );
-        assert!(
-            !store
-                .delivery_report(&roster, &identity, &logical, &config, &opened)
+        #[tokio::test]
+        #[ignore]
+        async fn outbox_crash_barrier_child() {
+            let stage = std::env::var("RELAY_6_6_BARRIER").unwrap();
+            let root = PathBuf::from(std::env::var("RELAY_6_6_ROOT").unwrap());
+            if stage == "before-receipt" {
+                let (roster, identity) = owner();
+                let body = http_body(&roster);
+                let prepared = prepare_outbox(&identity, &roster, &body).unwrap();
+                let mut store = ClientStore::open(&root, &roster, 1).unwrap();
+                let logical = store
+                    .commit_outbox(&roster, &identity, &HTTP_REQUEST, &prepared)
+                    .unwrap();
+                let (config, opened) = install_routes(
+                    &mut store,
+                    &roster,
+                    &identity,
+                    Path::new(&std::env::var("RELAY_6_6_ROUTES").unwrap()),
+                    Path::new(&std::env::var("RELAY_6_6_APPEND").unwrap()),
+                );
+                let http = RelayHttp::new().unwrap();
+                let _ = upload_pending(
+                    &mut store,
+                    &http,
+                    &logical,
+                    &roster,
+                    &identity,
+                    &config,
+                    &opened,
+                    1_000,
+                    ThirdPass::StopAfterStored,
+                )
+                .await;
+                panic!("receipt barrier was not reached");
+            }
+            let routes = PathBuf::from(std::env::var("RELAY_6_6_ROUTES").unwrap());
+            let appends = PathBuf::from(std::env::var("RELAY_6_6_APPEND").unwrap());
+            let _ = commit_then_upload(&root, &routes, &appends).await;
+            panic!("commit barrier was not reached");
+        }
+
+        #[tokio::test]
+        async fn outbox_crash_commit_then_upload_puts() {
+            assert!(
+                std::env::var_os("RELAY_6_6_BARRIER").is_none(),
+                "the PUT control must run with no commit barrier"
+            );
+            let dir = case_dir();
+            let relay = Loopback::start();
+            relay.publish(&dir);
+            let pass = commit_then_upload(
+                &dir.join("client"),
+                &dir.join("routes.json"),
+                &dir.join("append.bin"),
+            )
+            .await;
+            let (puts, entries) = relay.counts();
+            assert!(puts >= 1, "commit-then-upload accepted no PUT");
+            assert!(entries >= 1, "commit-then-upload stored no object");
+            // install_routes leaves peers empty, so Bob and Carol stay unrouted and
+            // whole-vault Stored is impossible. The author third pin is still reachable.
+            assert_eq!(
+                pass.needs_route,
+                vec![2, 3],
+                "needs_route lost Bob or Carol"
+            );
+            assert!(
+                !pass.stopped_third,
+                "unbarred upload skipped the third pin without whole-vault Stored"
+            );
+            let shot = relay.shot();
+            assert_eq!(shot.mismatches, 0, "unbarred upload changed the object");
+            let (roster, identity, _, _) = fixture();
+            let mut store = ClientStore::open(dir.join("client").as_path(), &roster, 1).unwrap();
+            let (config, opened) = install_routes(
+                &mut store,
+                &roster,
+                &identity,
+                &dir.join("routes.json"),
+                &dir.join("append.bin"),
+            );
+            let logical = store
+                .recover_logical(0, 100)
                 .unwrap()
-                .whole_vault(),
-            "unrouted Bob and Carol counted as whole-vault Stored"
-        );
-        let saved = store.saved_object(&shot.hash).unwrap().expect("PUT hash was not committed");
-        let same = relay.state.lock().unwrap().saved[&(shot.mailbox, shot.hash)].body == saved.wire;
-        assert!(same, "PUT body differed from the committed wire");
-    }
-
-    #[test]
-    fn outbox_crash_before_commit_no_put() {
-        let dir = case_dir();
-        let relay = Loopback::start();
-        relay.publish(&dir);
-        let (marker, mut child) = spawn_barrier(&dir, "before-commit");
-        marker_is(&dir, &mut child, &marker, "before-commit");
-        let (puts, entries) = relay.counts();
-        assert_eq!(puts, 0, "a PUT was accepted before the outbox commit");
-        assert_eq!(entries, 0, "the relay stored an object before the outbox commit");
-        let root = dir.join("client");
-        empty_outbox(&root);
-        reap(&mut child);
-        empty_outbox(&root);
-        let (roster, _identity, body, _) = fixture();
-        let store = ClientStore::open(&root, &roster, 1).unwrap();
-        assert!(
-            store
-                .lookup_outbox_request(&COMMIT_REQUEST, &outbox_intent_digest(&body).unwrap())
+                .pop()
+                .expect("committed logical row missing");
+            let author_copies = store
+                .recover_requirements(&logical.key, 1, None, 100)
                 .unwrap()
-                .is_none(),
-            "a killed pre-commit request became durable"
-        );
-        let (puts, _) = relay.counts();
-        assert_eq!(puts, 0, "reopening the killed root issued a PUT");
-    }
+                .len() as u64;
+            assert!(author_copies >= 1, "author copy set was empty");
+            assert_eq!(
+                shot.third_puts, author_copies,
+                "third pin did not receive every author copy"
+            );
+            assert!(
+                !store
+                    .delivery_report(&roster, &identity, &logical, &config, &opened)
+                    .unwrap()
+                    .whole_vault(),
+                "unrouted Bob and Carol counted as whole-vault Stored"
+            );
+            let saved = store
+                .saved_object(&shot.hash)
+                .unwrap()
+                .expect("PUT hash was not committed");
+            let same =
+                relay.state.lock().unwrap().saved[&(shot.mailbox, shot.hash)].body == saved.wire;
+            assert!(same, "PUT body differed from the committed wire");
+        }
 
-    #[test]
-    fn outbox_crash_after_commit_retains_wires() {
-        let dir = case_dir();
-        let relay = Loopback::start();
-        relay.publish(&dir);
-        let (marker, mut child) = spawn_barrier(&dir, "after-commit");
-        marker_is(&dir, &mut child, &marker, "after-commit");
-        let (puts, entries) = relay.counts();
-        assert_eq!(puts, 0, "upload ran before the after-commit barrier returned");
-        assert_eq!(entries, 0, "a relay entry existed before upload_pending");
-        let root = dir.join("client");
-        assert_eq!(table_count(&root, "logical_records"), 1);
-        assert_eq!(table_count(&root, "caller_requests"), 1);
-        assert_eq!(table_count(&root, "upload_work"), 0);
-        reap(&mut child);
-        let (roster, identity, body, reseal) = fixture();
-        let store_check = ClientStore::open(&root, &roster, 1).unwrap();
-        let expected: serde_json::Value =
-            serde_json::from_slice(&fs::read(dir.join("expected.json")).unwrap()).unwrap();
-        retained(&store_check, &expected);
-        let original_wire = hex::decode(
-            expected["recipients"][0]["objects"][0]["wire"]
-                .as_str()
-                .unwrap(),
-        )
-        .unwrap();
-        assert!(
-            reseal.recipients()[0].objects()[0].wire != original_wire,
-            "reseal matched the committed wire, so replacement would be invisible"
-        );
-        drop(store_check);
-        let mut store = ClientStore::open(&root, &roster, 1).unwrap();
-        let returned = store
-            .commit_outbox(&roster, &identity, &COMMIT_REQUEST, &reseal)
-            .unwrap();
-        assert_eq!(returned.key.message, COMMIT_MESSAGE);
-        retained(&store, &expected);
-        let mut other = body;
-        other.key.message = [201; 32];
-        let other = prepare_outbox(&identity, &roster, &other).unwrap();
-        let returned = store
-            .commit_outbox(&roster, &identity, &COMMIT_REQUEST, &other)
-            .unwrap();
-        assert_eq!(
-            returned.key.message, COMMIT_MESSAGE,
-            "same caller request allocated a new logical identity"
-        );
-        let created: i64 = store
-            .connection
-            .query_row(
-                "SELECT count(*) FROM logical_records WHERE message_id=?1",
-                [[201u8; 32]],
-                |row| row.get(0),
+        #[test]
+        fn outbox_crash_before_commit_no_put() {
+            let dir = case_dir();
+            let relay = Loopback::start();
+            relay.publish(&dir);
+            let (marker, mut child) = spawn_barrier(&dir, "before-commit");
+            marker_is(&dir, &mut child, &marker, "before-commit");
+            let (puts, entries) = relay.counts();
+            assert_eq!(puts, 0, "a PUT was accepted before the outbox commit");
+            assert_eq!(
+                entries, 0,
+                "the relay stored an object before the outbox commit"
+            );
+            let root = dir.join("client");
+            empty_outbox(&root);
+            reap(&mut child);
+            empty_outbox(&root);
+            let (roster, _identity, body, _) = fixture();
+            let store = ClientStore::open(&root, &roster, 1).unwrap();
+            assert!(
+                store
+                    .lookup_outbox_request(&COMMIT_REQUEST, &outbox_intent_digest(&body).unwrap())
+                    .unwrap()
+                    .is_none(),
+                "a killed pre-commit request became durable"
+            );
+            let (puts, _) = relay.counts();
+            assert_eq!(puts, 0, "reopening the killed root issued a PUT");
+        }
+
+        #[test]
+        fn outbox_crash_after_commit_retains_wires() {
+            let dir = case_dir();
+            let relay = Loopback::start();
+            relay.publish(&dir);
+            let (marker, mut child) = spawn_barrier(&dir, "after-commit");
+            marker_is(&dir, &mut child, &marker, "after-commit");
+            let (puts, entries) = relay.counts();
+            assert_eq!(
+                puts, 0,
+                "upload ran before the after-commit barrier returned"
+            );
+            assert_eq!(entries, 0, "a relay entry existed before upload_pending");
+            let root = dir.join("client");
+            assert_eq!(table_count(&root, "logical_records"), 1);
+            assert_eq!(table_count(&root, "caller_requests"), 1);
+            assert_eq!(table_count(&root, "upload_work"), 0);
+            reap(&mut child);
+            let (roster, identity, body, reseal) = fixture();
+            let store_check = ClientStore::open(&root, &roster, 1).unwrap();
+            let expected: serde_json::Value =
+                serde_json::from_slice(&fs::read(dir.join("expected.json")).unwrap()).unwrap();
+            retained(&store_check, &expected);
+            let original_wire = hex::decode(
+                expected["recipients"][0]["objects"][0]["wire"]
+                    .as_str()
+                    .unwrap(),
             )
             .unwrap();
-        assert_eq!(created, 0, "same caller request persisted the resealed message id");
-        retained(&store, &expected);
-    }
+            assert!(
+                reseal.recipients()[0].objects()[0].wire != original_wire,
+                "reseal matched the committed wire, so replacement would be invisible"
+            );
+            drop(store_check);
+            let mut store = ClientStore::open(&root, &roster, 1).unwrap();
+            let returned = store
+                .commit_outbox(&roster, &identity, &COMMIT_REQUEST, &reseal)
+                .unwrap();
+            assert_eq!(returned.key.message, COMMIT_MESSAGE);
+            retained(&store, &expected);
+            let mut other = body;
+            other.key.message = [201; 32];
+            let other = prepare_outbox(&identity, &roster, &other).unwrap();
+            let returned = store
+                .commit_outbox(&roster, &identity, &COMMIT_REQUEST, &other)
+                .unwrap();
+            assert_eq!(
+                returned.key.message, COMMIT_MESSAGE,
+                "same caller request allocated a new logical identity"
+            );
+            let created: i64 = store
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM logical_records WHERE message_id=?1",
+                    [[201u8; 32]],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                created, 0,
+                "same caller request persisted the resealed message id"
+            );
+            retained(&store, &expected);
+        }
 
-    #[tokio::test]
-    async fn outbox_crash_put_before_receipt_retries_original() {
-        let dir = case_dir();
-        let relay = Loopback::start();
-        relay.publish(&dir);
-        let (marker, mut child) = spawn_barrier(&dir, "before-receipt");
-        marker_is(&dir, &mut child, &marker, "before-receipt");
-        let during = relay.shot();
-        assert_eq!(during.puts, 1, "the receipt barrier was not preceded by one PUT");
-        assert_eq!(during.entries, 1);
-        assert_eq!(during.duplicate_puts, 0);
-        assert_eq!(during.third_puts, 0, "StopAfterStored still uploaded the third pin");
-        assert_eq!(during.hits, 1);
-        let root = dir.join("client");
-        assert_eq!(table_count(&root, "verified_receipts"), 0);
-        assert_eq!(table_count(&root, "logical_records"), 1);
-        reap(&mut child);
-        let (roster, identity) = owner();
-        let body = http_body(&roster);
-        let mut store = ClientStore::open(&root, &roster, 1).unwrap();
-        let logical = store
-            .lookup_outbox_request(&HTTP_REQUEST, &outbox_intent_digest(&body).unwrap())
-            .unwrap()
-            .expect("committed request missing after the receipt kill");
-        assert_eq!(logical.key.message, HTTP_MESSAGE);
-        let pending = store
-            .message_uploads(&logical.key)
-            .unwrap()
-            .into_iter()
-            .find(|row| row.upload.mailbox == during.mailbox && row.upload.hash == during.hash)
-            .expect("killed upload row missing");
-        assert!(
-            !pending.upload.acknowledged,
-            "receipt kill left the upload acknowledged"
-        );
-        assert!(store.saved_receipt(&pending.upload).unwrap().is_none());
-        let (config, opened) = install_routes(
-            &mut store,
-            &roster,
-            &identity,
-            &dir.join("routes.json"),
-            &dir.join("append.bin"),
-        );
-        let before_entries = relay.shot().entries;
-        let before_quota = relay.shot().quota;
-        let http = RelayHttp::new().unwrap();
-        let pass = upload_pending(
-            &mut store,
-            &http,
-            &logical,
-            &roster,
-            &identity,
-            &config,
-            &opened,
-            1_000,
-            ThirdPass::StopAfterStored,
-        )
-        .await
-        .unwrap();
-        // The barrier above still stops on the first lesser-pin receipt. This
-        // later pass has no whole-vault pair, so the author third pin is uploaded.
-        assert_eq!(pass.needs_route, vec![2, 3], "needs_route lost Bob or Carol");
-        assert!(
-            !pass.stopped_third,
-            "retry skipped the third pin without whole-vault Stored"
-        );
-        let after = relay.shot();
-        let author_copies = store
-            .recover_requirements(&logical.key, 1, None, 100)
-            .unwrap()
-            .len() as u64;
-        assert_eq!(
-            after.third_puts, author_copies,
-            "retry did not PUT every author copy to the third pin"
-        );
-        assert!(
-            !store
-                .delivery_report(&roster, &identity, &logical, &config, &opened)
+        #[tokio::test]
+        async fn outbox_crash_put_before_receipt_retries_original() {
+            let dir = case_dir();
+            let relay = Loopback::start();
+            relay.publish(&dir);
+            let (marker, mut child) = spawn_barrier(&dir, "before-receipt");
+            marker_is(&dir, &mut child, &marker, "before-receipt");
+            let during = relay.shot();
+            assert_eq!(
+                during.puts, 1,
+                "the receipt barrier was not preceded by one PUT"
+            );
+            assert_eq!(during.entries, 1);
+            assert_eq!(during.duplicate_puts, 0);
+            assert_eq!(
+                during.third_puts, 0,
+                "StopAfterStored still uploaded the third pin"
+            );
+            assert_eq!(during.hits, 1);
+            let root = dir.join("client");
+            assert_eq!(table_count(&root, "verified_receipts"), 0);
+            assert_eq!(table_count(&root, "logical_records"), 1);
+            reap(&mut child);
+            let (roster, identity) = owner();
+            let body = http_body(&roster);
+            let mut store = ClientStore::open(&root, &roster, 1).unwrap();
+            let logical = store
+                .lookup_outbox_request(&HTTP_REQUEST, &outbox_intent_digest(&body).unwrap())
                 .unwrap()
-                .whole_vault(),
-            "unrouted Bob and Carol counted as whole-vault Stored"
-        );
-        assert_eq!(after.mismatches, 0, "retry sent a different object");
-        assert_eq!(after.sequence, during.sequence, "retry received a new sequence");
-        assert_eq!(after.receipt, during.receipt, "retry received a different receipt");
-        assert_eq!(after.hits, 2, "retry did not PUT the saved object again");
-        assert_eq!(after.wire_len, during.wire_len);
-        let same_key_entries = {
-            let state = relay.state.lock().unwrap();
-            state
-                .saved
-                .keys()
-                .filter(|(mailbox, hash)| *mailbox == during.mailbox && *hash == during.hash)
-                .count()
-        };
-        assert_eq!(same_key_entries, 1, "retry created an extra relay entry");
-        assert_eq!(
-            after.quota - before_quota,
-            after.entries.saturating_sub(before_entries) * during.wire_len,
-            "duplicate PUT changed the original object's quota"
-        );
-        let saved = store
-            .message_uploads(&logical.key)
-            .unwrap()
-            .into_iter()
-            .find(|row| row.upload.mailbox == during.mailbox && row.upload.hash == during.hash)
+                .expect("committed request missing after the receipt kill");
+            assert_eq!(logical.key.message, HTTP_MESSAGE);
+            let pending = store
+                .message_uploads(&logical.key)
+                .unwrap()
+                .into_iter()
+                .find(|row| row.upload.mailbox == during.mailbox && row.upload.hash == during.hash)
+                .expect("killed upload row missing");
+            assert!(
+                !pending.upload.acknowledged,
+                "receipt kill left the upload acknowledged"
+            );
+            assert!(store.saved_receipt(&pending.upload).unwrap().is_none());
+            let (config, opened) = install_routes(
+                &mut store,
+                &roster,
+                &identity,
+                &dir.join("routes.json"),
+                &dir.join("append.bin"),
+            );
+            let before_entries = relay.shot().entries;
+            let before_quota = relay.shot().quota;
+            let http = RelayHttp::new().unwrap();
+            let pass = upload_pending(
+                &mut store,
+                &http,
+                &logical,
+                &roster,
+                &identity,
+                &config,
+                &opened,
+                1_000,
+                ThirdPass::StopAfterStored,
+            )
+            .await
             .unwrap();
-        assert!(saved.upload.acknowledged);
-        assert_eq!(store.saved_receipt(&saved.upload).unwrap().unwrap(), during.receipt);
-        let object = store.saved_object(&during.hash).unwrap().unwrap();
-        assert_eq!(object.wire.len() as u64, during.wire_len);
-        let body_matches = relay.state.lock().unwrap().saved[&(during.mailbox, during.hash)]
-            .body
-            == object.wire;
-        assert!(body_matches, "relay did not keep the committed wire");
-    }
+            // The barrier above still stops on the first lesser-pin receipt. This
+            // later pass has no whole-vault pair, so the author third pin is uploaded.
+            assert_eq!(
+                pass.needs_route,
+                vec![2, 3],
+                "needs_route lost Bob or Carol"
+            );
+            assert!(
+                !pass.stopped_third,
+                "retry skipped the third pin without whole-vault Stored"
+            );
+            let after = relay.shot();
+            let author_copies = store
+                .recover_requirements(&logical.key, 1, None, 100)
+                .unwrap()
+                .len() as u64;
+            assert_eq!(
+                after.third_puts, author_copies,
+                "retry did not PUT every author copy to the third pin"
+            );
+            assert!(
+                !store
+                    .delivery_report(&roster, &identity, &logical, &config, &opened)
+                    .unwrap()
+                    .whole_vault(),
+                "unrouted Bob and Carol counted as whole-vault Stored"
+            );
+            assert_eq!(after.mismatches, 0, "retry sent a different object");
+            assert_eq!(
+                after.sequence, during.sequence,
+                "retry received a new sequence"
+            );
+            assert_eq!(
+                after.receipt, during.receipt,
+                "retry received a different receipt"
+            );
+            assert_eq!(after.hits, 2, "retry did not PUT the saved object again");
+            assert_eq!(after.wire_len, during.wire_len);
+            let same_key_entries = {
+                let state = relay.state.lock().unwrap();
+                state
+                    .saved
+                    .keys()
+                    .filter(|(mailbox, hash)| *mailbox == during.mailbox && *hash == during.hash)
+                    .count()
+            };
+            assert_eq!(same_key_entries, 1, "retry created an extra relay entry");
+            assert_eq!(
+                after.quota - before_quota,
+                after.entries.saturating_sub(before_entries) * during.wire_len,
+                "duplicate PUT changed the original object's quota"
+            );
+            let saved = store
+                .message_uploads(&logical.key)
+                .unwrap()
+                .into_iter()
+                .find(|row| row.upload.mailbox == during.mailbox && row.upload.hash == during.hash)
+                .unwrap();
+            assert!(saved.upload.acknowledged);
+            assert_eq!(
+                store.saved_receipt(&saved.upload).unwrap().unwrap(),
+                during.receipt
+            );
+            let object = store.saved_object(&during.hash).unwrap().unwrap();
+            assert_eq!(object.wire.len() as u64, during.wire_len);
+            let body_matches = relay.state.lock().unwrap().saved[&(during.mailbox, during.hash)]
+                .body
+                == object.wire;
+            assert!(body_matches, "relay did not keep the committed wire");
+        }
 
-    fn clamp_to_sqlite_full(connection: &Connection) {
-        // Fill the receipt table's own pages. Another table's full page still leaves
-        // this root page able to accept one receipt without allocating.
-        connection.pragma_update(None, "foreign_keys", "OFF").unwrap();
-        let pages: i64 = connection
-            .pragma_query_value(None, "page_count", |row| row.get(0))
-            .unwrap();
-        connection
-            .pragma_update(None, "max_page_count", pages)
-            .unwrap();
-        let mut saw_full = false;
-        let mut next = 0u32;
-        for size in [4000usize, 2000, 1000, 500, 250, 120, 64] {
-            loop {
-                let mut hash = [9u8; 32];
-                hash[..4].copy_from_slice(&next.to_be_bytes());
-                next += 1;
-                let result = connection.execute(
+        fn clamp_to_sqlite_full(connection: &Connection) {
+            // Fill the receipt table's own pages. Another table's full page still leaves
+            // this root page able to accept one receipt without allocating.
+            connection
+                .pragma_update(None, "foreign_keys", "OFF")
+                .unwrap();
+            let pages: i64 = connection
+                .pragma_query_value(None, "page_count", |row| row.get(0))
+                .unwrap();
+            connection
+                .pragma_update(None, "max_page_count", pages)
+                .unwrap();
+            let mut saw_full = false;
+            let mut next = 0u32;
+            for size in [4000usize, 2000, 1000, 500, 250, 120, 64] {
+                loop {
+                    let mut hash = [9u8; 32];
+                    hash[..4].copy_from_slice(&next.to_be_bytes());
+                    next += 1;
+                    let result = connection.execute(
                     "INSERT INTO verified_receipts VALUES(?1,?2,1,?3,1,?4,?5,?6,?7,1024,1,1,?8)",
                     rusqlite::params![
                         [255u8; 32],
@@ -5148,112 +5291,129 @@ mod crash {
                         vec![7u8; size]
                     ],
                 );
-                match result {
-                    Ok(_) => {}
-                    Err(error) => {
-                        assert_eq!(
-                            error.sqlite_error_code(),
-                            Some(rusqlite::ErrorCode::DiskFull),
-                            "page clamp was not a real SQLite full error"
-                        );
-                        saw_full = true;
-                        break;
+                    match result {
+                        Ok(_) => {}
+                        Err(error) => {
+                            assert_eq!(
+                                error.sqlite_error_code(),
+                                Some(rusqlite::ErrorCode::DiskFull),
+                                "page clamp was not a real SQLite full error"
+                            );
+                            saw_full = true;
+                            break;
+                        }
                     }
                 }
             }
+            connection
+                .pragma_update(None, "foreign_keys", "ON")
+                .unwrap();
+            assert!(
+                saw_full,
+                "lowering max_page_count never returned SQLite full"
+            );
         }
-        connection.pragma_update(None, "foreign_keys", "ON").unwrap();
-        assert!(saw_full, "lowering max_page_count never returned SQLite full");
-    }
 
-    #[tokio::test]
-    async fn outbox_crash_receipt_page_full() {
-        let dir = case_dir();
-        let relay = Loopback::start();
-        relay.publish(&dir);
-        let (roster, identity) = owner();
-        let body = http_body(&roster);
-        let prepared = prepare_outbox(&identity, &roster, &body).unwrap();
-        let mut store = ClientStore::open(dir.join("client").as_path(), &roster, 1).unwrap();
-        let logical = store
-            .commit_outbox(&roster, &identity, &HTTP_REQUEST, &prepared)
-            .unwrap();
-        let (config, opened) = install_routes(
-            &mut store,
-            &roster,
-            &identity,
-            &dir.join("routes.json"),
-            &dir.join("append.bin"),
-        );
-        store
-            .bind_upload_routes(&roster, &identity, &logical, &config, &opened)
-            .unwrap();
-        let third = decode_id(
-            &serde_json::from_slice::<serde_json::Value>(&fs::read(dir.join("routes.json")).unwrap())
+        #[tokio::test]
+        async fn outbox_crash_receipt_page_full() {
+            let dir = case_dir();
+            let relay = Loopback::start();
+            relay.publish(&dir);
+            let (roster, identity) = owner();
+            let body = http_body(&roster);
+            let prepared = prepare_outbox(&identity, &roster, &body).unwrap();
+            let mut store = ClientStore::open(dir.join("client").as_path(), &roster, 1).unwrap();
+            let logical = store
+                .commit_outbox(&roster, &identity, &HTTP_REQUEST, &prepared)
+                .unwrap();
+            let (config, opened) = install_routes(
+                &mut store,
+                &roster,
+                &identity,
+                &dir.join("routes.json"),
+                &dir.join("append.bin"),
+            );
+            store
+                .bind_upload_routes(&roster, &identity, &logical, &config, &opened)
+                .unwrap();
+            let third = decode_id(
+                &serde_json::from_slice::<serde_json::Value>(
+                    &fs::read(dir.join("routes.json")).unwrap(),
+                )
                 .unwrap()["third"],
-        );
-        let pending = store
-            .message_uploads(&logical.key)
-            .unwrap()
-            .into_iter()
-            .find(|row| row.upload.mailbox != third)
-            .expect("no non-third upload row");
-        let route = opened
-            .body()
-            .relays
-            .iter()
-            .find(|relay| relay.route.mailbox == pending.upload.mailbox)
-            .unwrap()
-            .route
-            .clone();
-        let object = store.saved_object(&pending.upload.hash).unwrap().unwrap();
-        let append = Secret32::from_bytes(relay.append_for(pending.upload.mailbox));
-        let http = RelayHttp::new().unwrap();
-        let receipt = http.put(&route, &append, &object).await.unwrap();
-        let shot = relay.shot();
-        assert_eq!(shot.puts, 1);
-        assert_eq!(shot.entries, 1);
-        clamp_to_sqlite_full(&store.connection);
-        let before_receipts: i64 = store
-            .connection
-            .query_row("SELECT count(*) FROM verified_receipts", [], |row| row.get(0))
-            .unwrap();
-        let result = store.commit_upload_receipt(&pending.upload, &receipt);
-        assert_eq!(
-            result,
-            Err(ClientError::Capacity),
-            "real SQLite page ceiling accepted a new receipt"
-        );
-        assert!(store.connection.is_autocommit());
-        let after_receipts: i64 = store
-            .connection
-            .query_row("SELECT count(*) FROM verified_receipts", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(after_receipts, before_receipts, "failed receipt commit persisted");
-        assert!(store.saved_receipt(&pending.upload).unwrap().is_none());
-        configure_storage_limit(&store.connection, 512 * 1024 * 1024).unwrap();
-        store
-            .connection
-            .execute(
-                "DELETE FROM verified_receipts WHERE vault=?1",
-                [[255u8; 32]],
-            )
-            .unwrap();
-        store
-            .commit_upload_receipt(&pending.upload, &receipt)
-            .unwrap();
-        assert_eq!(
-            store.saved_receipt(&pending.upload).unwrap().unwrap(),
-            receipt.bytes()
-        );
-        let after = relay.shot();
-        assert_eq!(after.puts, 1, "receipt retry substituted another PUT");
-        assert_eq!(after.entries, 1, "saved receipt created an extra relay entry");
-        assert_eq!(after.quota, shot.quota, "saved receipt consumed more quota");
-        assert_eq!(after.sequence, shot.sequence);
-        assert_eq!(after.receipt, shot.receipt);
+            );
+            let pending = store
+                .message_uploads(&logical.key)
+                .unwrap()
+                .into_iter()
+                .find(|row| row.upload.mailbox != third)
+                .expect("no non-third upload row");
+            let route = opened
+                .body()
+                .relays
+                .iter()
+                .find(|relay| relay.route.mailbox == pending.upload.mailbox)
+                .unwrap()
+                .route
+                .clone();
+            let object = store.saved_object(&pending.upload.hash).unwrap().unwrap();
+            let append = Secret32::from_bytes(relay.append_for(pending.upload.mailbox));
+            let http = RelayHttp::new().unwrap();
+            let receipt = http.put(&route, &append, &object).await.unwrap();
+            let shot = relay.shot();
+            assert_eq!(shot.puts, 1);
+            assert_eq!(shot.entries, 1);
+            clamp_to_sqlite_full(&store.connection);
+            let before_receipts: i64 = store
+                .connection
+                .query_row("SELECT count(*) FROM verified_receipts", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            let result = store.commit_upload_receipt(&pending.upload, &receipt);
+            assert_eq!(
+                result,
+                Err(ClientError::Capacity),
+                "real SQLite page ceiling accepted a new receipt"
+            );
+            assert!(store.connection.is_autocommit());
+            let after_receipts: i64 = store
+                .connection
+                .query_row("SELECT count(*) FROM verified_receipts", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                after_receipts, before_receipts,
+                "failed receipt commit persisted"
+            );
+            assert!(store.saved_receipt(&pending.upload).unwrap().is_none());
+            configure_storage_limit(&store.connection, 512 * 1024 * 1024).unwrap();
+            store
+                .connection
+                .execute(
+                    "DELETE FROM verified_receipts WHERE vault=?1",
+                    [[255u8; 32]],
+                )
+                .unwrap();
+            store
+                .commit_upload_receipt(&pending.upload, &receipt)
+                .unwrap();
+            assert_eq!(
+                store.saved_receipt(&pending.upload).unwrap().unwrap(),
+                receipt.bytes()
+            );
+            let after = relay.shot();
+            assert_eq!(after.puts, 1, "receipt retry substituted another PUT");
+            assert_eq!(
+                after.entries, 1,
+                "saved receipt created an extra relay entry"
+            );
+            assert_eq!(after.quota, shot.quota, "saved receipt consumed more quota");
+            assert_eq!(after.sequence, shot.sequence);
+            assert_eq!(after.receipt, shot.receipt);
+        }
     }
-}
 }
 
 /// Incoming capture and acknowledgement DiskFull cases. Inert unless a case below arms it.
@@ -5269,8 +5429,8 @@ pub(crate) mod incoming_crash_tests {
         canonical::{self, Value},
         receipt,
         types::{
-            roster_digest, Entry, Id32, LogicalKey, MessageBody, Object, Page, Payload, ReceiptBody,
-            RelayPin, RelayRoute, Roster,
+            roster_digest, Entry, Id32, LogicalKey, MessageBody, Object, Page, Payload,
+            ReceiptBody, RelayPin, RelayRoute, Roster,
         },
     };
     use rusqlite::ErrorCode;
@@ -5399,7 +5559,12 @@ pub(crate) mod incoming_crash_tests {
         .unwrap()
     }
 
-    fn capture(store: &mut ClientStore, route: &RelayRoute, object: &Object, sequence: u64) -> crate::ClientResult<()> {
+    fn capture(
+        store: &mut ClientStore,
+        route: &RelayRoute,
+        object: &Object,
+        sequence: u64,
+    ) -> crate::ClientResult<()> {
         let entry = Entry {
             sequence,
             hash: object.hash,
@@ -5472,7 +5637,9 @@ pub(crate) mod incoming_crash_tests {
     fn rows(store: &ClientStore, table: &str) -> i64 {
         store
             .connection
-            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| row.get(0))
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
             .unwrap()
     }
 
@@ -5489,7 +5656,10 @@ pub(crate) mod incoming_crash_tests {
             .connection
             .pragma_query_value(None, "max_page_count", |row| row.get(0))
             .unwrap();
-        assert_eq!(effective, pages, "writer max_page_count did not stay at page_count");
+        assert_eq!(
+            effective, pages,
+            "writer max_page_count did not stay at page_count"
+        );
         pages
     }
 
@@ -5508,7 +5678,10 @@ pub(crate) mod incoming_crash_tests {
         let wide = framed(8, 65536);
         let arm = Arm::new();
         let result = capture(&mut store, &route, &wide, 2);
-        assert!(Arm::saw_disk_full(), "capture insert did not observe SQLITE_FULL");
+        assert!(
+            Arm::saw_disk_full(),
+            "capture insert did not observe SQLITE_FULL"
+        );
         drop(arm);
         assert_eq!(
             result,
@@ -5518,15 +5691,28 @@ pub(crate) mod incoming_crash_tests {
         assert!(store.connection.is_autocommit());
         drop(store);
         let store = ClientStore::open(&root, &roster, 2).unwrap();
-        assert_eq!(cursor(&store, &route), Some(1), "restart kept the failed capture cursor");
+        assert_eq!(
+            cursor(&store, &route),
+            Some(1),
+            "restart kept the failed capture cursor"
+        );
         let reopened_journal = store.recover_journal(&route, 0, 100).unwrap();
         assert_eq!(reopened_journal.len(), journal);
         assert_eq!(reopened_journal[0].source_hash, prior.hash);
         assert_eq!(reopened_journal[0].disposition, "cached");
-        assert_eq!(store.recover_pending_downloads(0, 100).unwrap().len(), tasks);
+        assert_eq!(
+            store.recover_pending_downloads(0, 100).unwrap().len(),
+            tasks
+        );
         assert_eq!(rows(&store, "ciphertext_objects"), ciphertext);
-        let saved = store.saved_object(&prior.hash).unwrap().expect("prior ciphertext missing");
-        assert!(saved.wire == prior.wire, "restart changed the prior ciphertext");
+        let saved = store
+            .saved_object(&prior.hash)
+            .unwrap()
+            .expect("prior ciphertext missing");
+        assert!(
+            saved.wire == prior.wire,
+            "restart changed the prior ciphertext"
+        );
         assert!(store.saved_object(&wide.hash).unwrap().is_none());
         assert_eq!(rows(&store, "incoming_originals"), 0);
         assert_eq!(rows(&store, "ack_links"), 0);
@@ -5536,8 +5722,14 @@ pub(crate) mod incoming_crash_tests {
         configure_storage_limit(&store.connection, STORAGE_BUDGET).unwrap();
         capture(&mut store, &route, &wide, 2).expect("later capture after the ceiling was lifted");
         assert_eq!(cursor(&store, &route), Some(2));
-        let saved = store.saved_object(&wide.hash).unwrap().expect("lifted capture missing");
-        assert!(saved.wire == wide.wire, "lifted capture changed the new ciphertext");
+        let saved = store
+            .saved_object(&wide.hash)
+            .unwrap()
+            .expect("lifted capture missing");
+        assert!(
+            saved.wire == wide.wire,
+            "lifted capture changed the new ciphertext"
+        );
     }
 
     #[test]
@@ -5612,13 +5804,29 @@ pub(crate) mod incoming_crash_tests {
         assert!(store.connection.is_autocommit());
         drop(store);
         let store = ClientStore::open(&root, &roster, 2).unwrap();
-        assert_eq!(cursor(&store, &route), cursor_before, "restart kept the failed acknowledgement cursor");
-        assert_eq!(store.recover_journal(&route, 0, 100).unwrap().len(), journal);
-        assert_eq!(store.recover_pending_downloads(0, 100).unwrap().len(), tasks);
+        assert_eq!(
+            cursor(&store, &route),
+            cursor_before,
+            "restart kept the failed acknowledgement cursor"
+        );
+        assert_eq!(
+            store.recover_journal(&route, 0, 100).unwrap().len(),
+            journal
+        );
+        assert_eq!(
+            store.recover_pending_downloads(0, 100).unwrap().len(),
+            tasks
+        );
         assert_eq!(rows(&store, "ciphertext_objects"), ciphertext);
         for object in &objects {
-            let saved = store.saved_object(&object.hash).unwrap().expect("captured object missing");
-            assert!(saved.wire == object.wire, "restart changed a captured object");
+            let saved = store
+                .saved_object(&object.hash)
+                .unwrap()
+                .expect("captured object missing");
+            assert!(
+                saved.wire == object.wire,
+                "restart changed a captured object"
+            );
         }
         assert_eq!(rows(&store, "incoming_originals"), 0);
         assert_eq!(rows(&store, "ack_links"), 0);
@@ -5680,28 +5888,59 @@ pub(crate) mod incoming_crash_tests {
         let root = evidence("orphan-flood");
         let mut store = ClientStore::open(&root, &roster, 2).unwrap();
         let missing = framed(2, 1024);
-        store.capture_page(&route, &Page {
-            mailbox: route.mailbox, after: 0, next: 1, high_water: 1,
-            entries: vec![Entry { sequence: 1, hash: missing.hash, wire_length: 1024,
-                receipt: receipt(&route, missing.hash, 1024, 1) }],
-        }, &[DownloadOutcome::Missing(missing.hash)]).unwrap();
-        let page_size: u64 = store.connection.pragma_query_value(None, "page_size", |r| r.get(0)).unwrap();
-        let allocated: u64 = store.connection.pragma_query_value(None, "page_count", |r| r.get(0)).unwrap();
+        store
+            .capture_page(
+                &route,
+                &Page {
+                    mailbox: route.mailbox,
+                    after: 0,
+                    next: 1,
+                    high_water: 1,
+                    entries: vec![Entry {
+                        sequence: 1,
+                        hash: missing.hash,
+                        wire_length: 1024,
+                        receipt: receipt(&route, missing.hash, 1024, 1),
+                    }],
+                },
+                &[DownloadOutcome::Missing(missing.hash)],
+            )
+            .unwrap();
+        let page_size: u64 = store
+            .connection
+            .pragma_query_value(None, "page_size", |r| r.get(0))
+            .unwrap();
+        let allocated: u64 = store
+            .connection
+            .pragma_query_value(None, "page_count", |r| r.get(0))
+            .unwrap();
         // A reduced test budget reaches real staging admission with a small flood.
         store.storage_budget = (allocated + 48) * page_size;
         configure_storage_limit(&store.connection, store.storage_budget).unwrap();
-        let context = crate::SealContext { domain: crate::SealDomain::Message,
-            vault: roster.vault, roster: roster_digest(&roster).unwrap(), recipient: bob.public() };
+        let context = crate::SealContext {
+            domain: crate::SealDomain::Message,
+            vault: roster.vault,
+            roster: roster_digest(&roster).unwrap(),
+            recipient: bob.public(),
+        };
         let mut accepted = Vec::new();
         let mut refused = None;
         for n in 0u8..20 {
-            let record = canonical::encode(&Value::Array(vec![Value::Integer(3.into()),
-                Value::Bytes(vec![n; 32]), Value::Integer(0.into()), Value::Bytes(vec![19; 60 * 1024])])).unwrap();
+            let record = canonical::encode(&Value::Array(vec![
+                Value::Integer(3.into()),
+                Value::Bytes(vec![n; 32]),
+                Value::Integer(0.into()),
+                Value::Bytes(vec![19; 60 * 1024]),
+            ]))
+            .unwrap();
             let object = crate::seal_record(&context, &record).unwrap();
             let sequence = accepted.len() as u64 + 2;
             match capture(&mut store, &route, &object, sequence) {
                 Ok(()) => accepted.push(object),
-                Err(ClientError::Capacity) => { refused = Some(object); break; }
+                Err(ClientError::Capacity) => {
+                    refused = Some(object);
+                    break;
+                }
                 other => panic!("unexpected orphan admission result: {other:?}"),
             }
         }
@@ -5710,7 +5949,9 @@ pub(crate) mod incoming_crash_tests {
         let position = accepted.len() as u64 + 1;
         assert_eq!(cursor(&store, &route), Some(position));
         assert!(store.saved_object(&refused.hash).unwrap().is_none());
-        assert!(authenticate_staged(&mut store, &roster, &bob).unwrap().is_empty());
+        assert!(authenticate_staged(&mut store, &roster, &bob)
+            .unwrap()
+            .is_empty());
         assert_eq!(store.pending_transfer_count().unwrap(), 0);
         assert!(store.recover_incoming_originals(0, 100).unwrap().is_empty());
         assert!(store.recover_ack_links(0, 100).unwrap().is_empty());
@@ -5720,10 +5961,23 @@ pub(crate) mod incoming_crash_tests {
         let pending = store.recover_pending_downloads(0, 100).unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].source_hash, missing.hash);
-        assert_eq!(store.recover_journal(&route, 0, 100).unwrap().len(), position as usize);
-        for object in accepted { assert_eq!(store.saved_object(&object.hash).unwrap().unwrap().wire, object.wire); }
+        assert_eq!(
+            store.recover_journal(&route, 0, 100).unwrap().len(),
+            position as usize
+        );
+        for object in accepted {
+            assert_eq!(
+                store.saved_object(&object.hash).unwrap().unwrap().wire,
+                object.wire
+            );
+        }
         assert!(store.saved_object(&refused.hash).unwrap().is_none());
-        println!("orphan-flood accepted={} pending=1 cursor={} refused_hash={}", position - 1, position, hex::encode(refused.hash));
+        println!(
+            "orphan-flood accepted={} pending=1 cursor={} refused_hash={}",
+            position - 1,
+            position,
+            hex::encode(refused.hash)
+        );
     }
 
     #[test]
@@ -5796,9 +6050,16 @@ pub(crate) mod incoming_crash_tests {
         );
         assert!(store.connection.is_autocommit());
         assert!(store.saved_object(&missing.hash).unwrap().is_none());
-        assert!(!Arm::saw_disk_full(), "pending-object refusal was SQLITE_FULL");
+        assert!(
+            !Arm::saw_disk_full(),
+            "pending-object refusal was SQLITE_FULL"
+        );
         let pending = store.recover_pending_downloads(0, 100).unwrap();
-        assert_eq!(pending.len(), 1, "refused cache deleted the outstanding task");
+        assert_eq!(
+            pending.len(),
+            1,
+            "refused cache deleted the outstanding task"
+        );
         assert_eq!(pending[0].source_hash, missing.hash);
         assert_eq!(cursor(&store, &route), Some(2));
         assert_eq!(store.recover_journal(&route, 0, 100).unwrap().len(), 2);
@@ -5816,7 +6077,10 @@ pub(crate) mod incoming_crash_tests {
         assert_eq!(journal[0].source_hash, cached.hash);
         assert_eq!(journal[1].disposition, "missing");
         assert_eq!(journal[1].source_hash, missing.hash);
-        let saved = store.saved_object(&cached.hash).unwrap().expect("prior ciphertext missing");
+        let saved = store
+            .saved_object(&cached.hash)
+            .unwrap()
+            .expect("prior ciphertext missing");
         assert!(saved.wire == cached.wire, "reopen changed the cached wire");
         assert!(store.saved_object(&missing.hash).unwrap().is_none());
         assert!(store.saved_object(&uncovered.hash).unwrap().is_none());

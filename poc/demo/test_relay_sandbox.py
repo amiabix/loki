@@ -62,6 +62,41 @@ class PublicReportTest(unittest.TestCase):
                 "scenarios": report["scenarios"], "note": "secret-token",
             }, forbidden=("secret-token",))
 
+    def test_split_events_keep_carrier_ids_envelopes_and_receipts(self):
+        message = "ab" * 32
+        digest = "cd" * 32
+        envelope = "ef" * 32
+        receipt = "12" * 32
+        offline = {"outcome": "passed", "simulation": False, "scenario_run_id": "run-offline"}
+        outage = {"outcome": "passed", "simulation": False, "scenario_run_id": "run-outage"}
+        chunk = {"outcome": "passed", "simulation": True, "scenario_run_id": "run-chunk"}
+        report = verify.assemble(
+            {
+                "events": [
+                    {"event_type": "request_start"},
+                    {"event_type": "original_authenticated", "message_id": message,
+                     "message_digest": digest},
+                    {"event_type": "session_envelope_authenticated", "envelope_hash": envelope},
+                    {"event_type": "receipt_persisted", "message_id": message,
+                     "receipt_digest": receipt},
+                ],
+                "network": {"stored": 1, "run_id": "relay-run"},
+                "state": {"phase": "confirmed", "txid": "34" * 32},
+            },
+            {"offline_delivery": offline, "outage": outage, "missing_chunk": chunk},
+            {"mailbox_denial": True, "own_read": True, "peer_denial": True, "relay_denial": True},
+            True,
+            {"source_revision": "abc", "binary_hashes": {}, "run_id": "relay-run",
+             "vault": "v" * 64, "roster_fingerprint": "r" * 64, "relays": []},
+        )
+        self.assertIn({"message_id": message, "message_digest": digest}, report["carriers"])
+        self.assertIn({"envelope_hash": envelope}, report["carriers"])
+        self.assertEqual(report["receipt_digests"], [receipt])
+        verify.require_evidence(report)
+        report["carriers"] = []
+        with self.assertRaises(verify.GateError):
+            verify.require_evidence(report)
+
     def test_payment_failure_keeps_the_reason_and_drops_paths(self):
         reason = verify.public_failure(
             "timed out waiting for member 1 Package /Users/megabyte/pass.txt "

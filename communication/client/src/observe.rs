@@ -1,6 +1,7 @@
 //! Bounded transport observations. A full or disconnected sink cannot change a result.
 
 use loki_relay_protocol::types::{Id32, MemberId};
+use sha2::{Digest, Sha256};
 use std::{
     future::Future,
     sync::{
@@ -44,6 +45,7 @@ pub struct Observation {
     pub object_hash: Option<Id32>,
     pub ordinal: Option<u16>,
     pub bytes: Option<u64>,
+    pub receipt_digest: Option<Id32>,
     pub request: u64,
     pub status: Option<u16>,
     pub duration: Option<Duration>,
@@ -65,6 +67,7 @@ impl Observation {
             object_hash: None,
             ordinal: None,
             bytes: None,
+            receipt_digest: None,
             request,
             status: None,
             duration: None,
@@ -142,7 +145,12 @@ pub(crate) fn note_original(kind: ObservationKind, sender: MemberId, message: Id
     });
 }
 
-pub(crate) fn note_received_link(sender: MemberId, recipient: MemberId, message: Id32, digest: Id32) {
+pub(crate) fn note_received_link(
+    sender: MemberId,
+    recipient: MemberId,
+    message: Id32,
+    digest: Id32,
+) {
     emit_active(ObservationKind::ReceivedLinked, |event| {
         event.sender = Some(sender);
         event.recipient = Some(recipient);
@@ -159,7 +167,9 @@ pub(crate) fn note_persisted_receipt(
     pin: Id32,
     run: Id32,
     mailbox: Id32,
+    receipt: &[u8],
 ) {
+    let digest: Id32 = Sha256::digest(receipt).into();
     emit_active(ObservationKind::ReceiptPersisted, |event| {
         event.sender = Some(sender);
         event.recipient = Some(recipient);
@@ -168,6 +178,7 @@ pub(crate) fn note_persisted_receipt(
         event.pin = Some(pin);
         event.run = Some(run);
         event.mailbox = Some(mailbox);
+        event.receipt_digest = Some(digest);
         event.result = Some("ok");
     });
 }
@@ -212,7 +223,33 @@ pub(crate) fn note_route_failure(pin: Id32, run: Id32, mailbox: Id32, result: &'
     });
 }
 
-pub(crate) fn note_quarantine(pin: Id32, run: Id32, mailbox: Id32, hash: Id32, result: &'static str) {
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    #[tokio::test]
+    async fn persisted_receipt_carries_the_receipt_digest() {
+        let (sink, receiver) = ObservationSink::bounded(2);
+        let receipt = b"stored-receipt";
+        sink.drive(async {
+            note_persisted_receipt(1, 2, [3; 32], [4; 32], [5; 32], [6; 32], [7; 32], receipt);
+        })
+        .await;
+        let event = receiver.try_recv().expect("receipt observation");
+        let digest: Id32 = Sha256::digest(receipt).into();
+        assert_eq!(event.kind, ObservationKind::ReceiptPersisted);
+        assert_eq!(event.receipt_digest, Some(digest));
+    }
+}
+
+pub(crate) fn note_quarantine(
+    pin: Id32,
+    run: Id32,
+    mailbox: Id32,
+    hash: Id32,
+    result: &'static str,
+) {
     emit_active(ObservationKind::Quarantine, |event| {
         event.pin = Some(pin);
         event.run = Some(run);

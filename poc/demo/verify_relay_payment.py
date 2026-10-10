@@ -73,6 +73,19 @@ def build_report(raw: dict, *, forbidden: tuple[str, ...]) -> dict:
     return report
 
 
+def require_evidence(report: dict) -> None:
+    """The public report must contain the carrier, envelope, and receipt evidence."""
+    carriers = report.get("carriers") or []
+    if not any(isinstance(row, dict) and row.get("message_id") for row in carriers):
+        raise GateError("report has no carrier id")
+    if not any(isinstance(row, dict) and row.get("message_digest") for row in carriers):
+        raise GateError("report has no carrier digest")
+    if not any(isinstance(row, dict) and row.get("envelope_hash") for row in carriers):
+        raise GateError("report has no inner envelope hash")
+    if not any(isinstance(item, str) and item for item in (report.get("receipt_digests") or [])):
+        raise GateError("report has no receipt digest")
+
+
 def require_scenarios(scenarios: list[dict]) -> None:
     names = [item.get("name") for item in scenarios]
     if names != list(SCENARIOS):
@@ -226,18 +239,27 @@ def assemble(payment: dict, harness: dict[str, dict], canary: dict, mailbox_abse
                   payment["state"].get("phase") == "confirmed" and network.get("stored", 0) > 0
                   and mailbox_absent and canary.get("mailbox_denial") is True),
     ]
-    carriers = []
+    carriers_by_message = {}
+    envelopes = []
     digests = []
     for event in events:
         message = event.get("message_id")
         envelope = event.get("envelope_hash")
-        if isinstance(message, str) and isinstance(envelope, str):
-            row = {"message_id": message, "envelope_hash": envelope}
-            if row not in carriers:
-                carriers.append(row)
+        message_digest = event.get("message_digest")
+        if isinstance(message, str):
+            row = carriers_by_message.setdefault(message, {"message_id": message})
+            if isinstance(message_digest, str) and "message_digest" not in row:
+                row["message_digest"] = message_digest
+            if isinstance(envelope, str) and "envelope_hash" not in row:
+                row["envelope_hash"] = envelope
+        elif isinstance(envelope, str):
+            row = {"envelope_hash": envelope}
+            if row not in envelopes:
+                envelopes.append(row)
         digest = event.get("receipt_digest")
         if isinstance(digest, str) and digest not in digests:
             digests.append(digest)
+    carriers = [*carriers_by_message.values(), *envelopes]
     relays = []
     for relay in (identities.get("relays") or []):
         relays.append({
@@ -336,6 +358,7 @@ def main() -> int:
         report_path.write_text(json.dumps(public, indent=2, sort_keys=True) + "\n")
         report_path.chmod(0o644)
         require_scenarios(public["scenarios"])
+        require_evidence(public)
         print(f"relay payment verified txid={public['txid']}", flush=True)
         return 0
     except Exception as error:

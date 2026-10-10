@@ -1022,6 +1022,12 @@ fn public_fields(event: &Observation) -> serde_json::Value {
     if let Some(result) = event.result {
         fields.insert("result_code".into(), serde_json::json!(result));
     }
+    if let Some(receipt) = event.receipt_digest {
+        fields.insert(
+            "receipt_digest".into(),
+            serde_json::json!(hex::encode(receipt)),
+        );
+    }
     serde_json::Value::Object(fields)
 }
 
