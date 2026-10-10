@@ -10,7 +10,7 @@
 //!   C1.4  Can the builder accept a caller-selected `alpha`?     -> BLOCKED
 //!
 //! Orchard's ZIP 2005 API is still absent. The local derivation in `zip2005` is checked
-//! against an independent vector but needs review and a mined transaction. The
+//! against an independent vector and used in a mined regtest payment, but needs review. The
 //! `probe-zip2005` feature still records the missing upstream API. C1.4 is supplied by
 //! an isolated patch to vendored orchard; see vendor/README.md.
 

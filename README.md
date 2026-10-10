@@ -13,11 +13,11 @@ result documents, which are the authority.
 | | |
 |---|---|
 | **G1-TX** | **demonstrated on regtest** — a real Ironwood payment, authorised by two of three FROST members, signed before its anchor and proof existed, mined |
-| **Full G1** | **BLOCKED**. Separate-member setup now has a local ZIP 2005 `use_qsk` derivation with an independently calculated vector, but it has not been reviewed, upstreamed, or used for a mined payment. The original transaction CLI still uses its documented **test-only** key splice |
+| **Full G1** | **BLOCKED**. Separate-member setup has a local ZIP 2005 `use_qsk` derivation with an independently calculated vector and a mined regtest payment, but the derivation has not been independently reviewed or upstreamed. The original transaction CLI still uses its documented **test-only** key splice |
 | **G3** (browser nonce safety) | **PARTIAL** and separate. 29/32 drills on Chromium, 6/8 on WebKit, Firefox would not launch, no physical device case tested |
 | **Second-device finishing** | seed-flow THS validation: a party holding none of the approvers' files completed both posted and re-proving paths with one and two inputs. Replicas carry confidential randomizer seeds ([evidence](poc/FROST-RANDOMIZER-RESULTS.md)) |
-| **Separate-member setup** | three isolated processes complete DKG; two stored shares sign the actual sighash of an offline, unproved Ironwood candidate for their ZIP 2005 vault. Each member verifies a 24-word and card backup before the regtest address appears, and a clean restore works without the exchange directory. Not yet connected to the mined payment CLI ([details](poc/SEPARATE-MEMBER-SETUP.md)) |
-| **Signing sessions** | library and offline test flow for one 2-of-3 attempt with explicit member review, fresh RAM-only nonces, encrypted member messages, sealed exact-share resend, and independent signature assembly. Not connected to the member setup, transaction CLI, or chain ([scope](poc/SIGNING-SESSION.md)) |
+| **Separate-member setup** | three isolated processes complete DKG; each member checks a 24-word and card backup before the regtest address appears, and a clean restore works without the exchange directory. Activated member stores feed the mined regtest payment flow ([details](poc/SEPARATE-MEMBER-SETUP.md)) |
+| **Signing sessions** | a 2-of-3 attempt with explicit member review, fresh RAM-only nonces, encrypted local messages, sealed exact-share resend, and independent signature assembly. `loki_member_payment` connects it to separate-member setup and a mined THS regtest payment ([scope](poc/SIGNING-SESSION.md)) |
 | **Recovery, key rotation, custody** | local two-artifact restore demonstrated on regtest; independent spend, key rotation in the wallet, and custody readiness **not established** |
 
 ## Quick start

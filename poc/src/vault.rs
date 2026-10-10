@@ -9,8 +9,8 @@
 //!     rivk_ext = H^rivk_ext_qk(ak, nk)        keyed by qk, selected by use_qsk
 //! ```
 //!
-//! That derivation is implemented nowhere (see `DEPENDENCIES.md` finding B1), so this
-//! module takes the documented G1-TX deviation instead: `ak` is real, from the 2-of-3
+//! This module predates the local, unreviewed ZIP 2005 implementation in `zip2005`.
+//! It retains the documented G1-TX deviation: `ak` is real, from the 2-of-3
 //! DKG, and `nk`/`rivk` come from fixed test inputs that all three member processes
 //! share. The result exercises the v6 sign-before-proof transaction path and says
 //! nothing about key derivation.
