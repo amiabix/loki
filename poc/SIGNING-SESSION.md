@@ -36,6 +36,9 @@ Run `cd poc && cargo test --locked --test signing_session --test signing_faults
 --test signing_flow_faults` for the flow and fault tests. For a live regtest run,
 start a disposable THS instance, then run `cargo build --locked --bins` and
 `python3 run-member-payment.py --name <instance> --state <new-private-directory>`.
+Add `--manual` to stop after setup and print the two concurrent signer commands,
+then the finish, mine, and verification commands. Each signer displays the
+recipient unified address and exact payment before accepting typed approval.
 The script creates three member processes, checks their backups, funds the vault,
 and supplies both approval strings after each signer verifies the candidate. This
 is scripted approval, not a test of independent human review. It creates a second

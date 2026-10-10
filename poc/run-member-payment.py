@@ -5,6 +5,7 @@ import argparse
 import concurrent.futures
 import json
 import pathlib
+import shlex
 import subprocess
 import sys
 
@@ -59,6 +60,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--name", required=True, help="already running THS instance")
     parser.add_argument("--state", type=pathlib.Path, required=True, help="new, private test directory")
+    parser.add_argument("--manual", action="store_true", help="prepare, then print commands for two human signers")
     args = parser.parse_args()
     root = args.state.resolve()
     root.mkdir(mode=0o700, parents=True, exist_ok=False)
@@ -83,6 +85,27 @@ def main():
     owner, password = members[0]
     run([pay, "prepare", owner, password, roster, work, recipient_address, "40000000", "separate member payment"], env)
     manifest = json.loads((work / "payment.json").read_text())
+    if args.manual:
+        def command(argv):
+            return shlex.join(["env", f"LOKI_RPC={env['LOKI_RPC']}", *map(str, argv)])
+
+        lines = [
+            f"Source vault: {vault}",
+            f"Independent recipient: {recipient_address}",
+            f"Payment ID: {manifest['payment']}",
+            "Run the next two commands at the same time in separate terminals. Read each review, then type its exact APPROVE prompt:",
+            command([pay, "sign", *members[0], roster, work]),
+            command([pay, "sign", *members[1], roster, work]),
+            "After both say approved, run:",
+            command([pay, "finish", *members[2], roster, work]),
+            "Copy the txid from the finish output, then run:",
+            shlex.join(["ths", "--name", args.name, "mine", "3"]),
+            command([pay, "verify", *members[2], roster, work, "<TXID>"]),
+            command([pay, "receive", *recipient_members[0], recipient_roster, work, "<TXID>"]),
+        ]
+        (root / "manual-steps.txt").write_text("\n".join(lines) + "\n")
+        print("\n".join(lines), flush=True)
+        return
     approval = "APPROVE " + manifest["payment"] + "\n"
 
     def sign(number):
