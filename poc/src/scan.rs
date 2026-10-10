@@ -258,7 +258,7 @@ where
 /// A single unparsable action is fatal: on our own regtest chain it would mean the node
 /// and these crates disagree about the wire format, and a scan that silently skipped it
 /// would assign every later note the wrong tree position.
-fn parse_actions(actions: &[serde_json::Value], txid: &str) -> Result<Vec<RawAction>, String> {
+pub fn parse_actions(actions: &[serde_json::Value], txid: &str) -> Result<Vec<RawAction>, String> {
     let raws: Vec<RawAction> = actions
         .iter()
         .filter_map(|a| {

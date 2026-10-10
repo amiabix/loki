@@ -1,0 +1,197 @@
+//! Validated regtest state produced by the separate-member setup ceremony.
+
+use std::{collections::BTreeMap, fs, path::Path};
+
+use blake2b_simd::Params;
+use orchard::keys::FullViewingKey;
+use reddsa_frost::frost::redpallas as frost;
+use zeroize::{Zeroize, Zeroizing};
+
+use crate::{
+    setup_transport::{Identity, PublicIdentity},
+    state::MemberDir,
+    vault, zip2005,
+};
+
+pub struct Roster {
+    pub vault: [u8; 32],
+    pub members: BTreeMap<u16, PublicIdentity>,
+}
+
+impl Roster {
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let data: serde_json::Value =
+            serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        let vault = hex32(&data, "vault")?;
+        let entries = data["members"].as_array().ok_or("missing members")?;
+        let mut members = BTreeMap::new();
+        for entry in entries {
+            let id: u16 = entry["id"]
+                .as_u64()
+                .ok_or("missing member id")?
+                .try_into()
+                .map_err(|_| "invalid member id")?;
+            let signing = hex32(entry, "signing")?;
+            let encryption = hex32(entry, "encryption")?;
+            ed25519_dalek::VerifyingKey::from_bytes(&signing)
+                .map_err(|_| "invalid signing public key")?;
+            if members
+                .insert(
+                    id,
+                    PublicIdentity {
+                        id,
+                        signing,
+                        encryption,
+                    },
+                )
+                .is_some()
+            {
+                return Err("duplicate member in roster".into());
+            }
+        }
+        if members.keys().copied().collect::<Vec<_>>() != [1, 2, 3] {
+            return Err("roster must have exactly members 1, 2 and 3".into());
+        }
+        Ok(Self { vault, members })
+    }
+
+    pub fn fingerprint(&self) -> [u8; 32] {
+        let mut hash = Params::new()
+            .hash_length(32)
+            .personal(b"Loki_roster_v1")
+            .to_state();
+        hash.update(&self.vault);
+        for member in self.members.values() {
+            hash.update(&member.id.to_be_bytes());
+            hash.update(&member.signing);
+            hash.update(&member.encryption);
+        }
+        hash.finalize().as_bytes().try_into().unwrap()
+    }
+}
+
+pub struct MemberState {
+    pub vault: [u8; 32],
+    pub roster: Roster,
+    pub identity: Identity,
+    pub key: frost::keys::KeyPackage,
+    pub public: frost::keys::PublicKeyPackage,
+    pub fvk: FullViewingKey,
+}
+
+fn hex32(value: &serde_json::Value, field: &str) -> Result<[u8; 32], String> {
+    hex::decode(
+        value[field]
+            .as_str()
+            .ok_or_else(|| format!("missing {field}"))?,
+    )
+    .map_err(|e| e.to_string())?
+    .try_into()
+    .map_err(|_| format!("{field} is not 32 bytes"))
+}
+
+fn hex_bytes(value: &serde_json::Value, field: &str) -> Result<Vec<u8>, String> {
+    hex::decode(
+        value[field]
+            .as_str()
+            .ok_or_else(|| format!("missing {field}"))?,
+    )
+    .map_err(|e| format!("{field}: {e}"))
+}
+
+pub fn open(owner: &Path, pass_file: &Path, roster_file: &Path) -> Result<MemberState, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if fs::metadata(pass_file)
+            .map_err(|e| e.to_string())?
+            .permissions()
+            .mode()
+            & 0o077
+            != 0
+        {
+            return Err("passphrase file must be owner-only (mode 0600)".into());
+        }
+    }
+    let mut pass = fs::read_to_string(pass_file).map_err(|e| e.to_string())?;
+    let trimmed = Zeroizing::new(pass.trim_end_matches(['\r', '\n']).to_string());
+    pass.zeroize();
+    if trimmed.is_empty() {
+        return Err("empty passphrase".into());
+    }
+    let dir = MemberDir::open(owner, "secrets");
+    let state: serde_json::Value = serde_json::from_slice(
+        &dir.read_sealed("vault.sealed", &trimmed)
+            .map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    if state["version"] != 2
+        || state["network"] != "regtest"
+        || state["key_derivation"] != zip2005::VERSION
+    {
+        return Err("unsupported separate-member regtest vault state".into());
+    }
+    let vault = hex32(&state, "vault")?;
+    let roster = Roster::load(roster_file)?;
+    if roster.vault != vault || roster.fingerprint() != hex32(&state, "roster_fingerprint")? {
+        return Err("roster differs from sealed vault certificate".into());
+    }
+    let identity = Identity::from_secret_bytes(&hex_bytes(&state, "identity_secret")?)?;
+    if roster.members.get(&identity.public().id) != Some(&identity.public())
+        || dir
+            .read_sealed("identity.sealed", &trimmed)
+            .map_err(|e| e.to_string())?
+            != identity.to_secret_bytes()
+    {
+        return Err("member identity differs from certified roster".into());
+    }
+    let ak = hex32(&state, "group_ak")?;
+    let secret = hex32(&state, "vault_secret")?;
+    let fvk = zip2005::frost_viewing_key(&ak, &secret)
+        .map_err(|e| format!("ZIP 2005 derivation: {e:?}"))?;
+    if state["address"].as_str() != Some(&vault::regtest_unified_address(&fvk)) {
+        return Err("stored address differs from derived vault address".into());
+    }
+    let public = frost::keys::PublicKeyPackage::deserialize(&hex_bytes(&state, "public_package")?)
+        .map_err(|e| format!("public package: {e}"))?;
+    let key = frost::keys::KeyPackage::deserialize(&hex_bytes(&state, "key_package")?)
+        .map_err(|e| format!("member share: {e}"))?;
+    let id = frost::Identifier::try_from(identity.public().id).map_err(|e| e.to_string())?;
+    if public
+        .verifying_key()
+        .serialize()
+        .map_err(|e| e.to_string())?
+        != ak
+        || key.identifier() != &id
+        || key.verifying_key() != public.verifying_key()
+        || public.verifying_shares().get(&id) != Some(key.verifying_share())
+        || *key.min_signers() != 2
+        || public.min_signers() != Some(2)
+    {
+        return Err("member share differs from certified 2-of-3 vault".into());
+    }
+    let mut backup = Params::new()
+        .hash_length(32)
+        .personal(b"Loki_bkup_v1")
+        .to_state();
+    backup.update(&vault);
+    backup.update(&roster.fingerprint());
+    backup.update(&ak);
+    backup.update(zip2005::VERSION.as_bytes());
+    if dir
+        .read_sealed("activation.sealed", &trimmed)
+        .map_err(|_| "vault needs all members' backup confirmations")?
+        != backup.finalize().as_bytes()
+    {
+        return Err("activation belongs to a different vault".into());
+    }
+    Ok(MemberState {
+        vault,
+        roster,
+        identity,
+        key,
+        public,
+        fvk,
+    })
+}

@@ -19,6 +19,7 @@ pub mod candidate;
 mod coordinator;
 pub mod distributed_setup;
 pub mod intent;
+pub mod member_state;
 #[cfg(test)]
 mod nonce_binding;
 pub mod randomizer;
