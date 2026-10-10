@@ -943,5 +943,104 @@ class HarnessFaultEvidence(unittest.TestCase):
         self.assertTrue(all(row['acknowledged'] == 1 for row in accepted))
 
 
+class ExistingMemberRelayTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name).resolve()
+
+    def source(self, *, first_signing=None):
+        root = self.base / 'source'
+        root.mkdir()
+        members = []
+        for member_id, mark in ((1, '11'), (2, '22'), (3, '33')):
+            member = root / f'member-{member_id}'
+            (member / 'secrets').mkdir(parents=True)
+            (member / 'secrets' / 'identity.sealed').write_bytes(b'id')
+            (member / 'secrets' / 'vault.sealed').write_bytes(b'vault')
+            (member / 'pass.txt').write_text('pass\n')
+            members.append({
+                'id': member_id,
+                'signing': first_signing if member_id == 1 and first_signing else mark * 32,
+                'encryption': mark * 32,
+            })
+        (root / 'roster.json').write_text(json.dumps({
+            'vault': 'ab' * 32,
+            'members': members,
+        }))
+        return root
+
+    def test_existing_source_preserves_roster_identity(self):
+        members, roster, vault = run.load_existing_members(self.source())
+        self.assertEqual(vault, 'ab' * 32)
+        self.assertEqual([member.member_id for member in members], [1, 2, 3])
+        self.assertTrue(str(members[0].passphrase_file).endswith('pass.txt'))
+        self.assertEqual(roster, self.base / 'source' / 'roster.json')
+        self.assertFalse((self.base / 'source' / 'members').exists())
+
+    def test_wrong_roster_or_layout_is_refused(self):
+        root = self.source(first_signing='22' * 32)
+        with self.assertRaises(run.OwnershipError):
+            run.load_existing_members(root)
+        (root / 'member-2' / 'pass.txt').unlink()
+        (root / 'roster.json').write_text(json.dumps({
+            'vault': 'ab' * 32,
+            'members': [
+                {'id': 1, 'signing': '11' * 32, 'encryption': '11' * 32},
+                {'id': 2, 'signing': '22' * 32, 'encryption': '22' * 32},
+                {'id': 3, 'signing': '33' * 32, 'encryption': '33' * 32},
+            ],
+        }))
+        with self.assertRaises(run.OwnershipError):
+            run.load_existing_members(root)
+
+    def test_repeated_pin_is_refused_before_serve(self):
+        relay = SimpleNamespace(run_id='same-run', receipt_key='aa' * 32)
+        with self.assertRaises(run.OwnershipError):
+            run._require_distinct_relays((relay, relay, relay))
+
+    def test_occupied_port_is_refused_before_binaries(self):
+        owner = run.OwnedRun.create(self.base / 'run')
+        self.addCleanup(owner.close)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as occupied:
+            occupied.bind(('127.0.0.1', 0))
+            occupied.listen()
+            port = occupied.getsockname()[1]
+            others = []
+            for _ in range(2):
+                extra = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                extra.bind(('127.0.0.1', 0))
+                others.append(extra.getsockname()[1])
+                extra.close()
+            with patch.object(run, 'find_binary') as binary:
+                with self.assertRaises(run.OwnershipError):
+                    run.start_existing_members(
+                        owner, self.source(), (port, others[0], others[1]),
+                        communication_workspace=self.base, poc_workspace=self.base,
+                        timeout=5, mailbox_bytes=64, total_bytes=128)
+                binary.assert_not_called()
+            with socket.create_connection(('127.0.0.1', port), timeout=1):
+                accepted, _ = occupied.accept()
+                accepted.close()
+        self.assertEqual(owner._children, [])
+
+    def test_listen_timeout_and_foreign_restart_do_not_signal_a_stranger(self):
+        owner = run.OwnedRun.create(self.base / 'run')
+        child = owner.start([sys.executable, '-c', 'import time; time.sleep(30)'],
+                            cwd=owner.root)
+        self.addCleanup(owner.close)
+        with self.assertRaises(run.OwnershipError) as caught:
+            run._wait_listen(child, '127.0.0.1:9', time.monotonic())
+        self.assertIn('deadline', str(caught.exception))
+        foreign = Mock(spec=subprocess.Popen)
+        foreign.poll.return_value = None
+        relay = SimpleNamespace(root=owner.root, endpoint='http://127.0.0.1:9', child=foreign)
+        with self.assertRaises(run.OwnershipError):
+            run.restart_relay(owner, relay, sys.executable, time.monotonic() + 1)
+        foreign.terminate.assert_not_called()
+        foreign.kill.assert_not_called()
+        self.assertIsNone(child.poll())
+
+
 if __name__ == '__main__':
     unittest.main()

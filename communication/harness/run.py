@@ -766,25 +766,10 @@ def prepare_certified_setup(root, ports, *, communication_workspace, poc_workspa
 def _certified_setup(owner, ports, server, setup_bin, member_bin, timeout, mailbox_bytes,
                      total_bytes):
     deadline = time.monotonic() + timeout
-    for name in ('relays', 'public-manifests', 'capabilities', 'capability-staging',
-                 'members', 'exchange', 'courier-export', 'descriptors'):
+    for name in ('members', 'exchange', 'courier-export', 'descriptors'):
         _mkdir(owner.root / name)
-    relays = tuple(
-        _init_relay(owner, index, port, server, deadline, mailbox_bytes, total_bytes)
-        for index, port in enumerate(ports, start=1))
-    if len({relay.run_id for relay in relays}) != 3 or len({
-            relay.receipt_key for relay in relays}) != 3:
-        raise OwnershipError('Relay identities are not distinct')
-    _rmdir(owner.root / 'capability-staging', 'Capability staging was not retired')
-    _expect_names(owner.root / 'public-manifests', ['1', '2', '3'])
-    _expect_names(owner.root / 'capabilities', sorted(relay.receipt_key for relay in relays))
-    for relay in relays:
-        child = owner.start([
-            str(server), 'serve', '--root', str(relay.root), '--listen',
-            _listen(relay.endpoint),
-        ], cwd=relay.root)
-        relay.child = child
-        _wait_listen(relay.child, _listen(relay.endpoint), deadline)
+    relays = init_relays(owner, ports, server, deadline, mailbox_bytes, total_bytes)
+    start_relays(owner, relays, server, deadline)
     created = []
     for member_id in (1, 2, 3):
         created.append(_create_member(owner, setup_bin, member_id, created, relays, deadline))
@@ -818,6 +803,123 @@ def _certified_setup(owner, ports, server, setup_bin, member_bin, timeout, mailb
             raise OwnershipError('Owned command exited unsuccessfully')
         if result.stdout != b'':
             raise OwnershipError('Setup run returned unexpected output')
+    return provision_members(owner, relays, members, roster, vault, fingerprint, member_bin,
+                             deadline, mailbox_bytes, total_bytes)
+
+
+def init_relays(owner, ports, server, deadline, mailbox_bytes, total_bytes):
+    """Initialize three relay stores and publish their manifests before any serve process."""
+    for name in ('relays', 'public-manifests', 'capabilities', 'capability-staging'):
+        _mkdir(owner.root / name)
+    relays = tuple(
+        _init_relay(owner, index, port, server, deadline, mailbox_bytes, total_bytes)
+        for index, port in enumerate(tuple(ports), start=1))
+    _require_distinct_relays(relays)
+    _rmdir(owner.root / 'capability-staging', 'Capability staging was not retired')
+    _expect_names(owner.root / 'public-manifests', ['1', '2', '3'])
+    _expect_names(owner.root / 'capabilities', sorted(relay.receipt_key for relay in relays))
+    return relays
+
+
+def start_relays(owner, relays, server, deadline):
+    """Start serve processes only after every relay store and manifest exists."""
+    for relay in relays:
+        _serve_relay(owner, relay, server, deadline)
+    return relays
+
+
+def restart_relay(owner, relay, server, deadline):
+    """Stop one owned serve process and start it again on the same store and run."""
+    if relay.child is not None:
+        owner.stop(relay.child)
+    _serve_relay(owner, relay, server, deadline)
+    return relay
+
+
+def _serve_relay(owner, relay, server, deadline):
+    child = owner.start([
+        str(server), 'serve', '--root', str(relay.root), '--listen',
+        _listen(relay.endpoint),
+    ], cwd=relay.root)
+    relay.child = child
+    _wait_listen(relay.child, _listen(relay.endpoint), deadline)
+
+
+def _require_distinct_relays(relays):
+    if len(relays) != 3 or len({relay.run_id for relay in relays}) != 3 or len({
+            relay.receipt_key for relay in relays}) != 3:
+        raise OwnershipError('Relay identities are not distinct')
+
+
+def load_existing_members(source):
+    """Bind certified payment members without copying their vault or running setup."""
+    source = Path(source).absolute()
+    if any(path.is_symlink() for path in (source, *source.parents)):
+        raise OwnershipError('Source vault contains a symlink')
+    roster_path = source / 'roster.json'
+    if not roster_path.is_file() or roster_path.is_symlink():
+        raise OwnershipError('Source roster must certify members 1, 2 and 3')
+    try:
+        roster = json.loads(roster_path.read_text())
+    except (OSError, ValueError) as error:
+        raise OwnershipError('Source roster must certify members 1, 2 and 3') from error
+    publics = roster.get('members', [])
+    if (_HEX64.fullmatch(str(roster.get('vault'))) is None or len(publics) != 3
+            or [item.get('id') for item in publics] != [1, 2, 3]):
+        raise OwnershipError('Source roster must certify members 1, 2 and 3')
+    for field in ('signing', 'encryption'):
+        values = [item.get(field) for item in publics]
+        if any(not isinstance(value, str) or _HEX64.fullmatch(value) is None
+               for value in values) or len(set(values)) != 3:
+            raise OwnershipError('Source member identities are not distinct')
+    members = []
+    for public in publics:
+        root = source / f"member-{public['id']}"
+        passphrase = root / 'pass.txt'
+        for relative in ('secrets/identity.sealed', 'secrets/vault.sealed'):
+            path = root / relative
+            if not path.is_file() or path.is_symlink():
+                raise OwnershipError('Source member layout is incomplete')
+        if not passphrase.is_file() or passphrase.is_symlink():
+            raise OwnershipError('Source member layout is incomplete')
+        members.append(CertifiedMember(
+            public['id'], root, passphrase, public['signing'], public['encryption']))
+    return tuple(members), roster_path, roster['vault']
+
+
+def start_existing_members(owner, source, ports, *, communication_workspace, poc_workspace,
+                           timeout, mailbox_bytes, total_bytes, target_dir=None, profile='debug'):
+    """Initialize, serve, then provision relays for an existing certified payment source.
+
+    HTTP inbox creation runs only after all three serve processes accept connections.
+    This does not copy the vault, run distributed setup, or start a chain.
+    """
+    target_dir = _ambient_target_dir(target_dir)
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise OwnershipError('Setup deadline must be finite and positive')
+    if type(mailbox_bytes) is not int or not 1 <= mailbox_bytes <= _I64_MAX:
+        raise OwnershipError('Mailbox quota is outside the public bound')
+    if type(total_bytes) is not int or not mailbox_bytes <= total_bytes <= _I64_MAX:
+        raise OwnershipError('Relay quota is outside the public bound')
+    ports = tuple(ports)
+    if len(ports) != 3:
+        raise OwnershipError('Three loopback ports are required')
+    members, roster, vault = load_existing_members(source)
+    preflight_ports(ports)
+    server = find_binary('loki-relay-server', workspace=communication_workspace,
+                         target_dir=target_dir, profile=profile)
+    setup_bin = find_binary('loki_setup_member', workspace=poc_workspace,
+                            target_dir=target_dir, profile=profile)
+    member_bin = find_binary('loki_relay_member', workspace=poc_workspace,
+                             target_dir=target_dir, profile=profile)
+    deadline = time.monotonic() + timeout
+    for name in ('exchange', 'courier-export', 'descriptors'):
+        _mkdir(owner.root / name)
+    fingerprint = _fingerprint_text(_command_text(owner, [
+        str(setup_bin), 'fingerprint', str(roster),
+    ], owner.root, deadline))
+    relays = init_relays(owner, ports, server, deadline, mailbox_bytes, total_bytes)
+    start_relays(owner, relays, server, deadline)
     return provision_members(owner, relays, members, roster, vault, fingerprint, member_bin,
                              deadline, mailbox_bytes, total_bytes)
 
