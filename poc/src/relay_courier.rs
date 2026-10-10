@@ -20,7 +20,8 @@ use std::{
     os::fd::{AsRawFd, FromRawFd},
     path::{Path, PathBuf},
     sync::mpsc::Receiver,
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use zeroize::Zeroizing;
 
@@ -938,6 +939,21 @@ impl RelayCourier {
             after = next;
         }
         Ok(seen)
+    }
+
+    /// Pump until every committed message is stored. A deadline or cancel file
+    /// fails unless that condition is already true. This does not delete saved shares.
+    pub fn settle_until_stored(&mut self, work: &Path, deadline: Instant) -> Result<(), String> {
+        loop {
+            if self.whole_attempt_stored().unwrap_or(false) {
+                return Ok(());
+            }
+            if work.join("cancel").is_file() || Instant::now() >= deadline {
+                return Err("delivery_pending".into());
+            }
+            let _ = self.drive_once();
+            thread::sleep(Duration::from_millis(100));
+        }
     }
 }
 

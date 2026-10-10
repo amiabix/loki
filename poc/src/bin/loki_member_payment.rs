@@ -264,17 +264,17 @@ fn settle_delivery(courier: &mut OwnedCourier, work: &Path) -> Result<(), String
         let OwnedCourier::Relay(relay) = courier else {
             return Ok(());
         };
-        let deadline = Instant::now() + Duration::from_secs(300);
-        loop {
-            if work.join("cancel").is_file() || Instant::now() >= deadline {
-                println!("delivery_pending");
-                return Ok(());
-            }
-            if relay.drive_once().is_ok() && relay.whole_attempt_stored().unwrap_or(false) {
+        match relay.settle_until_stored(work, Instant::now() + Duration::from_secs(300)) {
+            Ok(()) => {
                 println!("stored");
-                return Ok(());
+                Ok(())
             }
-            thread::sleep(Duration::from_millis(100));
+            Err(error) => {
+                if error == "delivery_pending" {
+                    println!("delivery_pending");
+                }
+                Err(error)
+            }
         }
     }
 }

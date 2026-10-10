@@ -762,3 +762,39 @@ fn a_later_process_reauthenticates_an_accepted_carrier() {
     );
     assert!(again.pop_events().is_empty());
 }
+
+#[test]
+fn a_delivery_timeout_does_not_succeed_and_keeps_the_saved_share() {
+    let live = start_loopback(1_048_576, 8_388_608);
+    let alice_key = Identity::new(1);
+    let bob_key = Identity::new(2);
+    let context = signing_context();
+    let wire = alice_key
+        .seal_session(&bob_key.public(), &context, MessageKind::Share, b"saved-share")
+        .unwrap();
+    let mut alice = RelayCourier::open(&live.members[0], &live.passes[0], &live.roster).unwrap();
+    let route = EnvelopeRoute {
+        context: &context,
+        author: 1,
+        recipient: 2,
+        kind: MessageKind::Share,
+    };
+    alice.publish(&route, &wire).unwrap();
+    let share = live.members[0].join("signing").join("saved-share");
+    fs::create_dir_all(share.parent().unwrap()).unwrap();
+    fs::write(&share, b"exact-share").unwrap();
+    let work = live.root.join("payment-work");
+    fs::create_dir(&work).unwrap();
+    let error = alice
+        .settle_until_stored(&work, Instant::now() - Duration::from_secs(1))
+        .expect_err("unstored delivery timed out successfully");
+    assert_eq!(error, "delivery_pending");
+    assert_eq!(fs::read(&share).unwrap(), b"exact-share");
+    fs::write(work.join("cancel"), b"").unwrap();
+    let error = alice
+        .settle_until_stored(&work, Instant::now() + Duration::from_secs(30))
+        .expect_err("cancel before stored succeeded");
+    assert_eq!(error, "delivery_pending");
+    assert_eq!(fs::read(&share).unwrap(), b"exact-share");
+    assert!(alice.whole_attempt_stored().unwrap_or(true) == false);
+}
