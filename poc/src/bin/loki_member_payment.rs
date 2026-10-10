@@ -176,6 +176,23 @@ impl SessionCourier for OwnedCourier {
 }
 
 impl OwnedCourier {
+    /// Read a carrier that signing already accepted. File mode has no accepted set.
+    /// Relay mode reopens the saved envelope and does not treat it as a new delivery.
+    fn reopen_accepted(
+        &mut self,
+        own: &loki_poc::setup_transport::Identity,
+        roster: &BTreeMap<u16, loki_poc::setup_transport::PublicIdentity>,
+        context: &SessionContext,
+        kind: MessageKind,
+        sender: u16,
+    ) -> Result<Option<OpenedMessage>, String> {
+        match self {
+            Self::File(mailbox) => FileCourier(mailbox).receive(own, roster, context, kind, sender),
+            #[cfg(feature = "relay-communication")]
+            Self::Relay(courier) => courier.reopen_accepted(own, roster, context, kind, sender),
+        }
+    }
+
     fn note_application(&mut self, accepted: bool, message: &OpenedMessage) {
         #[cfg(feature = "relay-communication")]
         if let Self::Relay(courier) = self {
@@ -471,6 +488,37 @@ fn wait_message(
         )? {
             return Ok(message);
         }
+        if Instant::now() >= deadline {
+            return Err(format!("timed out waiting for member {sender} {kind:?}"));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_reopened(
+    courier: &mut OwnedCourier,
+    member: &MemberState,
+    context: &SessionContext,
+    kind: MessageKind,
+    sender: u16,
+    work: &Path,
+    timeout: Duration,
+) -> Result<OpenedMessage, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if work.join("cancel").is_file() {
+            return Err("cancelled".into());
+        }
+        if let Some(message) = courier.reopen_accepted(
+            &member.identity,
+            &member.roster.members,
+            context,
+            kind,
+            sender,
+        )? {
+            return Ok(message);
+        }
+        courier.drive_once()?;
         if Instant::now() >= deadline {
             return Err(format!("timed out waiting for member {sender} {kind:?}"));
         }
@@ -1012,7 +1060,7 @@ fn verify(args: &[String]) -> Result<(), String> {
         &work,
         export,
     )?;
-    let package_message = wait_message(
+    let package_message = wait_reopened(
         &mut courier,
         &member,
         &context,

@@ -62,6 +62,16 @@ class PublicReportTest(unittest.TestCase):
                 "scenarios": report["scenarios"], "note": "secret-token",
             }, forbidden=("secret-token",))
 
+    def test_payment_failure_keeps_the_reason_and_drops_paths(self):
+        reason = verify.public_failure(
+            "timed out waiting for member 1 Package /Users/megabyte/pass.txt "
+            "http://127.0.0.1:9/#tok")
+        self.assertIn("timed out waiting for member 1 Package", reason)
+        self.assertNotIn("pass.txt", reason)
+        self.assertNotIn("http", reason)
+        self.assertNotIn("/Users", reason)
+        self.assertEqual(verify.public_failure(""), "payment failed")
+
     def test_unexecuted_scenario_does_not_pass(self):
         scenarios = [
             {"name": name, "label": "transport", "executed": True, "result": "passed"}

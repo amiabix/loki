@@ -682,3 +682,83 @@ fn three_loopback_relays_deliver_a_saved_carrier_and_refuse_over_quota() {
     }
     assert!(!tight.members[0].join("mailbox").exists());
 }
+
+#[test]
+fn a_later_process_reauthenticates_an_accepted_carrier() {
+    let live = start_loopback(1_048_576, 8_388_608);
+    let alice_key = Identity::new(1);
+    let bob_key = Identity::new(2);
+    let context = signing_context();
+    let wire = alice_key
+        .seal_session(
+            &bob_key.public(),
+            &context,
+            MessageKind::Package,
+            b"approved-package",
+        )
+        .unwrap();
+    let roster = BTreeMap::from([
+        (1, alice_key.public()),
+        (2, bob_key.public()),
+        (3, Identity::new(3).public()),
+    ]);
+    let mut alice = RelayCourier::open(&live.members[0], &live.passes[0], &live.roster).unwrap();
+    let route = EnvelopeRoute {
+        context: &context,
+        author: 1,
+        recipient: 2,
+        kind: MessageKind::Package,
+    };
+    alice.publish(&route, &wire).unwrap();
+    let mut bob = RelayCourier::open(&live.members[1], &live.passes[1], &live.roster).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut first = None;
+    while Instant::now() < deadline && first.is_none() {
+        alice.drive_once().expect("author pump");
+        bob.drive_once().expect("recipient pump");
+        first = bob
+            .receive(&bob_key, &roster, &context, MessageKind::Package, 1)
+            .unwrap();
+        thread::sleep(Duration::from_millis(40));
+    }
+    let first = first.expect("bob did not accept the package");
+    assert_eq!(first.body(), b"approved-package");
+    let saved = fs::read(live.members[1].join("accepted-carriers")).unwrap();
+    let originals = bob
+        .database()
+        .recover_incoming_originals(0, 10)
+        .unwrap()
+        .len();
+    drop(bob);
+
+    let mut again = RelayCourier::open(&live.members[1], &live.passes[1], &live.roster).unwrap();
+    again.set_events(
+        loki_poc::relay_member::PublicEventWriter::new("loopback", "member-2").unwrap(),
+    );
+    assert!(
+        again
+            .receive(&bob_key, &roster, &context, MessageKind::Package, 1)
+            .unwrap()
+            .is_none(),
+        "an accepted carrier is not a new signing message"
+    );
+    let reopened = again
+        .reopen_accepted(&bob_key, &roster, &context, MessageKind::Package, 1)
+        .unwrap()
+        .expect("verify could not reauthenticate the accepted package");
+    assert_eq!(reopened.body(), b"approved-package");
+    assert_eq!(reopened.wire_hash(), first.wire_hash());
+    assert_eq!(
+        again
+            .database()
+            .recover_incoming_originals(0, 10)
+            .unwrap()
+            .len(),
+        originals
+    );
+    assert_eq!(
+        fs::read(live.members[1].join("accepted-carriers")).unwrap(),
+        saved
+    );
+    assert!(again.pop_events().is_empty());
+}

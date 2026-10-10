@@ -476,7 +476,7 @@ impl SessionCourier for RelayCourier {
         kind: MessageKind,
         sender: u16,
     ) -> Result<Option<OpenedMessage>, String> {
-        let opened = self.receive_authenticated(own, roster, context, kind, sender);
+        let opened = self.receive_authenticated(own, roster, context, kind, sender, true);
         self.service_export();
         opened
     }
@@ -489,6 +489,19 @@ impl SessionCourier for RelayCourier {
 }
 
 impl RelayCourier {
+    /// Open one already accepted carrier again. This does not remember it, emit a new
+    /// delivery event, or write the store. Signing receive still hides that carrier.
+    pub fn reopen_accepted(
+        &mut self,
+        own: &Identity,
+        roster: &BTreeMap<u16, PublicIdentity>,
+        context: &SessionContext,
+        kind: MessageKind,
+        sender: u16,
+    ) -> Result<Option<OpenedMessage>, String> {
+        self.receive_authenticated(own, roster, context, kind, sender, false)
+    }
+
     fn receive_authenticated(
         &mut self,
         own: &Identity,
@@ -496,6 +509,7 @@ impl RelayCourier {
         context: &SessionContext,
         kind: MessageKind,
         sender: u16,
+        persist: bool,
     ) -> Result<Option<OpenedMessage>, String> {
         let mut after = 0u64;
         loop {
@@ -538,7 +552,7 @@ impl RelayCourier {
                 {
                     continue;
                 }
-                if self.accepted.contains(&carrier.envelope_hash) {
+                if persist && self.accepted.contains(&carrier.envelope_hash) {
                     continue;
                 }
                 let Some(peer) = roster.get(&carrier.author) else {
@@ -551,15 +565,17 @@ impl RelayCourier {
                 if message.kind() != kind || message.sender() != sender {
                     continue;
                 }
-                self.remember(carrier.envelope_hash)?;
-                self.emit_signing(
-                    "session_envelope_authenticated",
-                    carrier.author,
-                    Some(carrier.recipient),
-                    kind,
-                    carrier.envelope_hash,
-                    context,
-                );
+                if persist {
+                    self.remember(carrier.envelope_hash)?;
+                    self.emit_signing(
+                        "session_envelope_authenticated",
+                        carrier.author,
+                        Some(carrier.recipient),
+                        kind,
+                        carrier.envelope_hash,
+                        context,
+                    );
+                }
                 return Ok(Some(message));
             }
             if page.len() < 100 {

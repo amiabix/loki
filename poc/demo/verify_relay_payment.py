@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -43,6 +44,16 @@ DROPPED = {"token", "coordinator_url", "url", "links", "passphrase", "password"}
 
 class GateError(RuntimeError):
     pass
+
+
+def public_failure(text: str) -> str:
+    """Keep a payment failure reason without paths or coordinator URLs."""
+    if not isinstance(text, str) or not text.strip():
+        return "payment failed"
+    cleaned = re.sub(r"https?://\S+", " ", text)
+    cleaned = re.sub(r"(?:/[^\s\"']+|[A-Za-z]:\\[^\s\"']+)", " ", cleaned)
+    cleaned = " ".join(cleaned.split())
+    return cleaned[:180] or "payment failed"
 
 
 def build_report(raw: dict, *, forbidden: tuple[str, ...]) -> dict:
@@ -122,7 +133,7 @@ def drive_payment(base: str, admin: str, deadline: float) -> dict:
         state = _request(base, "GET", "/api/state", admin)
         phase = state.get("phase")
         if phase == "failed":
-            raise GateError("payment failed")
+            raise GateError(public_failure(str(state.get("error") or "")))
         if phase == "waiting_for_reviews" and alice is None:
             links = state.get("links") or {}
             alice = _token_from_link(links["alice"])
