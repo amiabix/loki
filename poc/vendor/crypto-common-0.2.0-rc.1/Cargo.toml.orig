@@ -1,0 +1,28 @@
+[package]
+name = "crypto-common"
+description = "Common cryptographic traits"
+version = "0.2.0-rc.1"
+authors = ["RustCrypto Developers"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+edition = "2021"
+rust-version = "1.65"
+documentation = "https://docs.rs/crypto-common"
+repository = "https://github.com/RustCrypto/traits"
+keywords = ["crypto", "traits"]
+categories = ["cryptography", "no-std"]
+
+[dependencies]
+hybrid-array = "0.2.0-rc.8"
+
+# optional dependencies
+rand_core = { version = "0.6.4", optional = true }
+getrandom = { version = "0.2", optional = true }
+
+[features]
+getrandom = ["dep:getrandom", "rand_core?/getrandom"]
+std = ["getrandom?/std", "rand_core?/std"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

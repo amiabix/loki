@@ -1,0 +1,658 @@
+use crate::{
+    store::{HashPresence, PutClass},
+    Capability, DbHandle, RelayError, RelayResult,
+};
+use axum::{
+    body::{Body, Bytes},
+    extract::{rejection::BytesRejection, DefaultBodyLimit, Extension, Request, State},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
+    middleware::{self, Next},
+    response::Response,
+    routing::{get, put},
+    Router,
+};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use loki_relay_protocol::{
+    envelope::MAX_WIRE_LEN,
+    http::ErrorCode,
+    types::{Id32, Object},
+};
+use sha2::{Digest, Sha256};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+const REQUEST_CONCURRENCY: usize = 32;
+const FRESH_REQUEST_LIMIT: usize = 30;
+const RESERVED_REQUESTS: usize = 2;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const RETRY_AFTER: HeaderValue = HeaderValue::from_static("1");
+
+#[derive(Clone, Copy)]
+struct AdmissionMark {
+    reserved_only: bool,
+}
+
+#[derive(Clone)]
+struct Gate {
+    inner: Arc<Mutex<GateCounts>>,
+    db: DbHandle,
+}
+struct GateCounts {
+    total: usize,
+    fresh: usize,
+}
+struct RequestPermit {
+    gate: Gate,
+    fresh: bool,
+}
+impl Drop for RequestPermit {
+    fn drop(&mut self) {
+        let mut counts = self
+            .gate
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        counts.total = counts.total.saturating_sub(1);
+        if self.fresh {
+            counts.fresh = counts.fresh.saturating_sub(1);
+        }
+    }
+}
+impl Gate {
+    fn new(db: DbHandle) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(GateCounts { total: 0, fresh: 0 })),
+            db,
+        }
+    }
+
+    /// One of 30 fresh body slots. Never the leftover reserved progress slots.
+    fn try_acquire_fresh(&self) -> Option<RequestPermit> {
+        let mut counts = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        if counts.total >= REQUEST_CONCURRENCY || counts.fresh >= FRESH_REQUEST_LIMIT {
+            return None;
+        }
+        counts.fresh += 1;
+        counts.total += 1;
+        Some(RequestPermit {
+            gate: self.clone(),
+            fresh: true,
+        })
+    }
+
+    /// A read, or a PUT whose committed hash is already present. Not a fresh body.
+    fn try_acquire_progress(&self) -> Option<RequestPermit> {
+        let mut counts = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        if counts.total >= REQUEST_CONCURRENCY {
+            return None;
+        }
+        let reserved_in_use = counts.total - counts.fresh;
+        if counts.fresh >= FRESH_REQUEST_LIMIT && reserved_in_use >= RESERVED_REQUESTS {
+            return None;
+        }
+        counts.total += 1;
+        Some(RequestPermit {
+            gate: self.clone(),
+            fresh: false,
+        })
+    }
+}
+
+async fn deadline(request: Request, next: Next) -> Response {
+    match tokio::time::timeout(REQUEST_TIMEOUT, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => error_response(RelayError::StorageUnavailable),
+    }
+}
+
+async fn admit(State(gate): State<Gate>, mut request: Request, next: Next) -> Response {
+    if request.method() == Method::GET {
+        let Some(permit) = gate.try_acquire_progress() else {
+            return error_response(RelayError::RateLimit);
+        };
+        request.extensions_mut().insert(AdmissionMark {
+            reserved_only: false,
+        });
+        let response = next.run(request).await;
+        drop(permit);
+        return response;
+    }
+    if let Some(permit) = gate.try_acquire_fresh() {
+        request.extensions_mut().insert(AdmissionMark {
+            reserved_only: false,
+        });
+        let response = next.run(request).await;
+        drop(permit);
+        return response;
+    }
+    // Fresh body slots are full. Do not read an unclassified body on a progress slot.
+    if request.method() == Method::PUT {
+        if let Ok((mailbox, hash)) = path(request.uri()) {
+            return screen_committed_put(gate, request, next, mailbox, hash).await;
+        }
+        if control_path(request.uri()).is_ok() {
+            return error_response(RelayError::RateLimit);
+        }
+        return error_response(RelayError::MalformedRequest);
+    }
+    error_response(RelayError::RateLimit)
+}
+
+/// A fresh hash is refused before the body is read. Only a committed hash may
+/// occupy a progress slot for the rest of the body and the writer retry.
+async fn screen_committed_put(
+    gate: Gate,
+    mut request: Request,
+    next: Next,
+    mailbox: Id32,
+    hash: Id32,
+) -> Response {
+    let headers = request.headers().clone();
+    let capability = match capability(&headers) {
+        Ok(capability) => capability,
+        Err(error) => return error_response(error),
+    };
+    if let Err(error) = request_headers(&headers, request.method()) {
+        return error_response(error);
+    }
+    let Some(permit) = gate.try_acquire_progress() else {
+        return error_response(RelayError::RateLimit);
+    };
+    let db = gate.db.clone();
+    let screened = tokio::task::spawn_blocking(move || db.classify_hash(mailbox, hash, capability))
+        .await
+        .unwrap_or(Err(RelayError::StorageUnavailable));
+    match screened {
+        Ok(HashPresence::Committed) => {
+            request.extensions_mut().insert(AdmissionMark {
+                reserved_only: true,
+            });
+            let response = next.run(request).await;
+            drop(permit);
+            response
+        }
+        Ok(HashPresence::Fresh) | Err(RelayError::RateLimit) => {
+            drop(permit);
+            error_response(RelayError::RateLimit)
+        }
+        Err(error) => {
+            drop(permit);
+            error_response(error)
+        }
+    }
+}
+
+/// The caller retains the DbWriter owner for the lifetime of this router.
+pub fn router(db: DbHandle) -> Router {
+    Router::new()
+        .route(
+            "/v1/mailboxes/{mailbox}/objects/{hash}",
+            put(object_route).get(object_route),
+        )
+        .route(
+            "/v1/mailboxes/{mailbox}",
+            put(control_route).layer(DefaultBodyLimit::max(MAX_CONTROL_LEN)),
+        )
+        .route(
+            "/v1/mailboxes/{mailbox}/append-capability",
+            put(control_route).layer(DefaultBodyLimit::max(MAX_CONTROL_LEN)),
+        )
+        .route("/v1/mailboxes/{mailbox}/entries", get(page_route))
+        .fallback(malformed)
+        .method_not_allowed_fallback(malformed)
+        .layer(DefaultBodyLimit::max(MAX_WIRE_LEN))
+        .layer(middleware::from_fn_with_state(Gate::new(db.clone()), admit))
+        .layer(middleware::from_fn(deadline))
+        .with_state(db)
+}
+
+async fn malformed() -> Response {
+    error_response(RelayError::MalformedRequest)
+}
+
+fn binary(status: StatusCode, media: &'static str, body: Vec<u8>) -> Response {
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = status;
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, media.parse().unwrap());
+    response
+}
+
+fn error_response(error: RelayError) -> Response {
+    let code = ErrorCode::try_from(u64::from(error.code())).expect("defined relay error code");
+    let mut response = binary(
+        StatusCode::from_u16(code.status()).expect("defined HTTP error status"),
+        "application/cbor",
+        loki_relay_protocol::http::encode_error(code).expect("bounded error metadata"),
+    );
+    if error == RelayError::RateLimit {
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, RETRY_AFTER);
+    }
+    response
+}
+
+fn id(raw: &str) -> RelayResult<Id32> {
+    if raw.len() != 64
+        || !raw
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(RelayError::MalformedRequest);
+    }
+    let mut value = [0; 32];
+    hex::decode_to_slice(raw, &mut value).map_err(|_| RelayError::MalformedRequest)?;
+    Ok(value)
+}
+
+fn path(uri: &Uri) -> RelayResult<(Id32, Id32)> {
+    // Inspect the raw URI rather than decoded Path extractor values.
+    let mut segments = uri.path().split('/');
+    let parts = std::array::from_fn::<_, 6, _>(|_| segments.next().unwrap_or(""));
+    if uri.query().is_some()
+        || segments.next().is_some()
+        || parts[..3] != ["", "v1", "mailboxes"]
+        || parts[4] != "objects"
+    {
+        return Err(RelayError::MalformedRequest);
+    }
+    Ok((id(parts[3])?, id(parts[5])?))
+}
+
+fn single<'a>(headers: &'a HeaderMap, name: &'static str) -> RelayResult<Option<&'a str>> {
+    let mut values = headers.get_all(name).iter();
+    let first = values.next();
+    if values.next().is_some() {
+        return Err(RelayError::MalformedRequest);
+    }
+    first
+        .map(|v| v.to_str().map_err(|_| RelayError::MalformedRequest))
+        .transpose()
+}
+
+fn capability(headers: &HeaderMap) -> RelayResult<Capability> {
+    let raw = single(headers, "authorization")?.ok_or(RelayError::Capability)?;
+    let token = raw.strip_prefix("Bearer ").ok_or(RelayError::Capability)?;
+    if token.len() != 43 {
+        return Err(RelayError::Capability);
+    }
+    let mut secret = [0; 32];
+    let length = URL_SAFE_NO_PAD
+        .decode_slice(token, &mut secret)
+        .map_err(|_| RelayError::Capability)?;
+    if length != 32 || URL_SAFE_NO_PAD.encode(secret) != token {
+        return Err(RelayError::Capability);
+    }
+    Ok(Capability::new(secret))
+}
+
+fn request_headers(headers: &HeaderMap, method: &Method) -> RelayResult<Option<usize>> {
+    let media = single(headers, "content-type")?;
+    if (method == Method::PUT || media.is_some()) && media != Some("application/octet-stream") {
+        return Err(RelayError::UnsupportedMediaType);
+    }
+    if single(headers, "content-encoding")?.is_some() {
+        return Err(RelayError::UnsupportedMediaType);
+    }
+    let length = single(headers, "content-length")?
+        .map(|s| {
+            if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(RelayError::MalformedRequest);
+            }
+            s.parse::<usize>().map_err(|_| RelayError::MalformedRequest)
+        })
+        .transpose()?;
+    if let Some(encoding) = single(headers, "transfer-encoding")? {
+        if encoding != "chunked" || length.is_some() {
+            return Err(RelayError::MalformedRequest);
+        }
+    }
+    if length.is_some_and(|n| n > MAX_WIRE_LEN) {
+        return Err(RelayError::ObjectTooLarge);
+    }
+    Ok(length)
+}
+
+async fn object_route(
+    State(db): State<DbHandle>,
+    uri: Uri,
+    method: Method,
+    headers: HeaderMap,
+    admission: Option<Extension<AdmissionMark>>,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let reserved_only = admission.is_some_and(|mark| mark.reserved_only);
+    match object_request(db, uri, method, headers, body, reserved_only).await {
+        Ok(response) => response,
+        Err(error) => error_response(error),
+    }
+}
+
+async fn enqueue_put(
+    db: DbHandle,
+    mailbox: Id32,
+    object: Object,
+    capability: Capability,
+    reserved_only: bool,
+) -> RelayResult<crate::DbReply<crate::StoredResult>> {
+    tokio::task::spawn_blocking(move || {
+        if reserved_only {
+            let admission = db.classify_put(mailbox, object, capability)?;
+            return match admission.class {
+                Ok(PutClass::Fresh) => Err(RelayError::RateLimit),
+                Ok(PutClass::Duplicate(_))
+                | Err(RelayError::Conflict)
+                | Err(RelayError::Capability) => {
+                    db.put(mailbox, admission.object, admission.append)
+                }
+                Err(error) => Err(error),
+            };
+        }
+        db.put(mailbox, object, capability)
+    })
+    .await
+    .map_err(|_| RelayError::StorageUnavailable)?
+}
+
+async fn object_request(
+    db: DbHandle,
+    uri: Uri,
+    method: Method,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+    reserved_only: bool,
+) -> RelayResult<Response> {
+    let (mailbox, hash) = path(&uri)?;
+    let capability = capability(&headers)?;
+    let length = request_headers(&headers, &method)?;
+    let body = body.map_err(|rejection| {
+        if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            RelayError::ObjectTooLarge
+        } else {
+            RelayError::MalformedRequest
+        }
+    })?;
+    if length.is_some_and(|n| n != body.len()) {
+        return Err(RelayError::MalformedRequest);
+    }
+    if method != Method::PUT && method != Method::GET {
+        return Err(RelayError::MalformedRequest);
+    }
+    if method == Method::PUT {
+        loki_relay_protocol::envelope::validate_wire(&body)?;
+        if <Id32>::from(Sha256::digest(&body)) != hash {
+            return Err(RelayError::MalformedRequest);
+        }
+        // Classification and queue admission run off the HTTP worker.
+        // The writer repeats validation, current auth, and the commit.
+        let saved = enqueue_put(
+            db,
+            mailbox,
+            Object {
+                hash,
+                wire: body.to_vec(),
+            },
+            capability,
+            reserved_only,
+        )
+        .await?
+        .receive()
+        .await?;
+        Ok(binary(
+            if saved.created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            },
+            "application/cbor",
+            saved.receipt,
+        ))
+    } else {
+        if !body.is_empty() {
+            return Err(RelayError::MalformedRequest);
+        }
+        let wire = db.get(mailbox, hash, capability)?.receive().await?;
+        Ok(binary(StatusCode::OK, "application/octet-stream", wire))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn object_routes_bearer_shape() {
+        let mut headers = HeaderMap::new();
+        for secret in [vec![0; 31], vec![0; 33]] {
+            headers.insert(
+                "authorization",
+                format!("Bearer {}", URL_SAFE_NO_PAD.encode(secret))
+                    .parse()
+                    .unwrap(),
+            );
+            assert!(capability(&headers).is_err());
+        }
+    }
+
+    async fn mapping(error: RelayError, status: u16, code: u8) {
+        let response = error_response(error);
+        assert_eq!(response.status().as_u16(), status);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/cbor");
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 3)
+                .await
+                .unwrap()
+                .as_ref(),
+            [0x82, 1, code]
+        );
+    }
+
+    macro_rules! mapping_test {
+        ($name:ident, $error:ident, $status:literal, $code:literal) => {
+            #[tokio::test]
+            async fn $name() {
+                mapping(RelayError::$error, $status, $code).await;
+            }
+        };
+    }
+    mapping_test!(object_routes_mapping_malformed, MalformedRequest, 400, 1);
+    mapping_test!(object_routes_mapping_capability, Capability, 401, 2);
+    mapping_test!(object_routes_mapping_missing, ObjectNotFound, 404, 3);
+    mapping_test!(object_routes_mapping_conflict, Conflict, 409, 4);
+    mapping_test!(object_routes_mapping_cursor, CursorAhead, 409, 5);
+    mapping_test!(object_routes_mapping_size, ObjectTooLarge, 413, 6);
+    mapping_test!(object_routes_mapping_media, UnsupportedMediaType, 415, 7);
+    mapping_test!(object_routes_mapping_admission, RateLimit, 429, 8);
+    mapping_test!(object_routes_mapping_storage, StorageUnavailable, 503, 9);
+    mapping_test!(object_routes_mapping_quota, QuotaExhausted, 507, 10);
+}
+
+const MAX_CONTROL_LEN: usize = 4096;
+
+fn control_path(uri: &Uri) -> RelayResult<(Id32, bool)> {
+    // Control paths must retain their raw spelling, just like object paths.
+    let parts: Vec<_> = uri.path().split('/').collect();
+    if uri.query().is_some()
+        || !(parts.len() == 4 || parts.len() == 5)
+        || parts[..3] != ["", "v1", "mailboxes"]
+        || (parts.len() == 5 && parts[4] != "append-capability")
+    {
+        return Err(RelayError::MalformedRequest);
+    }
+    Ok((id(parts[3])?, parts.len() == 5))
+}
+
+fn control_headers(headers: &HeaderMap) -> RelayResult<Option<usize>> {
+    if single(headers, "content-type")? != Some("application/cbor") {
+        return Err(RelayError::UnsupportedMediaType);
+    }
+    if single(headers, "content-encoding")?.is_some() {
+        return Err(RelayError::UnsupportedMediaType);
+    }
+    let length = single(headers, "content-length")?
+        .map(|s| {
+            if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(RelayError::MalformedRequest);
+            }
+            s.parse::<usize>().map_err(|_| RelayError::MalformedRequest)
+        })
+        .transpose()?;
+    if let Some(encoding) = single(headers, "transfer-encoding")? {
+        if encoding != "chunked" || length.is_some() {
+            return Err(RelayError::MalformedRequest);
+        }
+    }
+    if length.is_some_and(|n| n > MAX_CONTROL_LEN) {
+        return Err(RelayError::ObjectTooLarge);
+    }
+    Ok(length)
+}
+
+async fn control_route(
+    State(db): State<DbHandle>,
+    uri: Uri,
+    headers: HeaderMap,
+    admission: Option<Extension<AdmissionMark>>,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let reserved_only = admission.is_some_and(|mark| mark.reserved_only);
+    match control_request(db, uri, headers, body, reserved_only).await {
+        Ok(response) => response,
+        Err(error) => error_response(error),
+    }
+}
+
+async fn control_request(
+    db: DbHandle,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+    reserved_only: bool,
+) -> RelayResult<Response> {
+    if reserved_only {
+        return Err(RelayError::RateLimit);
+    }
+    let (mailbox, rotate) = control_path(&uri)?;
+    let capability = capability(&headers)?;
+    let length = control_headers(&headers)?;
+    let body = body.map_err(|rejection| {
+        if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            RelayError::ObjectTooLarge
+        } else {
+            RelayError::MalformedRequest
+        }
+    })?;
+    if length.is_some_and(|n| n != body.len()) {
+        return Err(RelayError::MalformedRequest);
+    }
+    if rotate {
+        loki_relay_protocol::http::decode_append_update(&body)?;
+        let revision = db
+            .rotate(mailbox, body.to_vec(), capability)?
+            .receive()
+            .await?;
+        Ok(binary(
+            StatusCode::OK,
+            "application/cbor",
+            loki_relay_protocol::http::encode_append_result(&mailbox, revision)?,
+        ))
+    } else {
+        loki_relay_protocol::http::decode_creation(&body)?;
+        let result = db
+            .create(mailbox, body.to_vec(), capability)?
+            .receive()
+            .await?;
+        Ok(binary(
+            if result.created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            },
+            "application/cbor",
+            loki_relay_protocol::http::encode_creation_result(&mailbox, &result)?,
+        ))
+    }
+}
+
+fn decimal(raw: &str) -> RelayResult<u64> {
+    if raw.is_empty()
+        || !raw.bytes().all(|b| b.is_ascii_digit())
+        || (raw.len() > 1 && raw.starts_with('0'))
+    {
+        return Err(RelayError::MalformedRequest);
+    }
+    raw.parse().map_err(|_| RelayError::MalformedRequest)
+}
+
+fn page_path(uri: &Uri) -> RelayResult<(Id32, u64, u16)> {
+    let parts: Vec<_> = uri.path().split('/').collect();
+    if parts.len() != 5 || parts[..3] != ["", "v1", "mailboxes"] || parts[4] != "entries" {
+        return Err(RelayError::MalformedRequest);
+    }
+    let mailbox = id(parts[3])?;
+    let (mut after, mut limit) = (None, None);
+    if let Some(query) = uri.query() {
+        for pair in query.split('&') {
+            let (key, value) = pair.split_once('=').ok_or(RelayError::MalformedRequest)?;
+            match key {
+                "after" if after.is_none() => after = Some(decimal(value)?),
+                "limit" if limit.is_none() => limit = Some(decimal(value)?),
+                _ => return Err(RelayError::MalformedRequest),
+            }
+        }
+    }
+    let limit = loki_relay_protocol::http::validate_limit(limit)?;
+    Ok((mailbox, after.unwrap_or(0), limit as u16))
+}
+
+async fn page_route(
+    State(db): State<DbHandle>,
+    uri: Uri,
+    method: Method,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    match page_request(db, uri, method, headers, body).await {
+        Ok(response) => response,
+        Err(error) => error_response(error),
+    }
+}
+
+async fn page_request(
+    db: DbHandle,
+    uri: Uri,
+    method: Method,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> RelayResult<Response> {
+    if method != Method::GET {
+        return Err(RelayError::MalformedRequest);
+    }
+    let (mailbox, after, limit) = page_path(&uri)?;
+    let capability = capability(&headers)?;
+    let length = request_headers(&headers, &Method::GET)?;
+    let body = body.map_err(|rejection| {
+        if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            RelayError::ObjectTooLarge
+        } else {
+            RelayError::MalformedRequest
+        }
+    })?;
+    if length.is_some_and(|n| n != body.len()) || !body.is_empty() {
+        return Err(RelayError::MalformedRequest);
+    }
+    let page = db
+        .page(mailbox, after, limit, capability)?
+        .receive()
+        .await?;
+    Ok(binary(
+        StatusCode::OK,
+        "application/cbor",
+        loki_relay_protocol::http::encode_page(&page)
+            .map_err(|_| RelayError::StorageUnavailable)?,
+    ))
+}

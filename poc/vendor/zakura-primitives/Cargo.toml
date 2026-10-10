@@ -105,6 +105,7 @@ features = ["alloc"]
 default-features = false
 
 [dependencies.crypto-common]
+path = "../crypto-common-0.2.0-rc.1"
 version = "=0.2.0-rc.1"
 
 [dependencies.document-features]

@@ -1,0 +1,20 @@
+[package]
+name = "loki-relay-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+loki-relay-protocol = { path = "../protocol" }
+axum = { version = "=0.8.6", default-features = false, features = ["http1", "tokio"] }
+tokio = { version = "=1.53.2", features = ["macros", "rt-multi-thread", "sync", "net", "time", "signal"] }
+tower = { version = "=0.5.2", features = ["util", "limit", "timeout"] }
+rusqlite = { version = "=0.37.0", features = ["bundled"] }
+ed25519-dalek = "=2.2.0"
+base64 = "=0.22.1"
+hex = "=0.4.3"
+getrandom = "=0.4.3"
+subtle = "=2.6.1"
+zeroize = "=1.8.2"
+sha2 = "=0.10.9"
