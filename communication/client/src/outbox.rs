@@ -285,6 +285,41 @@ pub async fn upload_pending(
     now_ms: u64,
     third: ThirdPass,
 ) -> ClientResult<UploadPass> {
+    upload_pending_inner(store, http, logical, roster, identity, config, self_route, now_ms, third).await
+}
+
+/// `upload_pending` with journal milestones on `observer`. HTTP events stay on the client sink.
+pub async fn upload_pending_observed(
+    store: &mut ClientStore,
+    http: &RelayHttp,
+    logical: &RecoveryLogical,
+    roster: &Roster,
+    identity: &CommIdentity,
+    config: &ClientConfig,
+    self_route: &AuthenticatedDescriptor,
+    now_ms: u64,
+    third: ThirdPass,
+    observer: &crate::ObservationSink,
+) -> ClientResult<UploadPass> {
+    observer
+        .drive(upload_pending_inner(
+            store, http, logical, roster, identity, config, self_route, now_ms, third,
+        ))
+        .await
+}
+
+async fn upload_pending_inner(
+    store: &mut ClientStore,
+    http: &RelayHttp,
+    logical: &RecoveryLogical,
+    roster: &Roster,
+    identity: &CommIdentity,
+    config: &ClientConfig,
+    self_route: &AuthenticatedDescriptor,
+    now_ms: u64,
+    third: ThirdPass,
+) -> ClientResult<UploadPass> {
+    http.set_actor(Some(identity.public().id));
     let Some(reference) = store.config_reference()? else {
         return Err(ClientError::Config);
     };

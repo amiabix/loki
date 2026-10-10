@@ -1679,6 +1679,12 @@ fn reconcile_self(
     {
         try_note_alternate_root(&transaction, budget, root, message.digest())?;
         commit_reuse(transaction)?;
+        crate::observe::note_original(
+            crate::observe::ObservationKind::OriginalCommitted,
+            message.body().key.sender,
+            message.body().key.message,
+            *message.digest(),
+        );
         return Ok(CommitDisposition::Duplicate);
     }
     // A different body under the author's id is evidence only. The outgoing record stays.
@@ -2218,6 +2224,7 @@ impl ClientStore {
             return Err(ClientError::Storage);
         }
         transaction.commit()?;
+        crate::observe::note_route_failure(*relay_key, *run, *mailbox, "identity");
         Ok(())
     }
 
@@ -2278,6 +2285,15 @@ impl ClientStore {
             return Err(ClientError::Storage);
         }
         transaction.commit()?;
+        crate::observe::note_retry(
+            upload.key.sender,
+            upload.recipient,
+            upload.key.message,
+            upload.hash,
+            upload.relay_key,
+            upload.run,
+            upload.mailbox,
+        );
         Ok(())
     }
 
@@ -2344,6 +2360,15 @@ impl ClientStore {
                 )?;
             }
             transaction.commit()?;
+            crate::observe::note_persisted_receipt(
+                upload.key.sender,
+                upload.recipient,
+                upload.key.message,
+                hash,
+                relay_key,
+                run,
+                mailbox,
+            );
             return Ok(());
         }
         if state != "pending" {
@@ -2378,6 +2403,15 @@ impl ClientStore {
         #[cfg(test)]
         outbox_commit_tests::pause_barrier("before-receipt");
         transaction.commit()?;
+        crate::observe::note_persisted_receipt(
+            upload.key.sender,
+            upload.recipient,
+            upload.key.message,
+            hash,
+            relay_key,
+            run,
+            mailbox,
+        );
         Ok(())
     }
 
@@ -2942,6 +2976,12 @@ impl ClientStore {
                 }
                 try_note_alternate_root(&transaction, self.storage_budget, &root, message.digest())?;
                 commit_reuse(transaction)?;
+                crate::observe::note_original(
+                    crate::observe::ObservationKind::OriginalCommitted,
+                    key.sender,
+                    key.message,
+                    *message.digest(),
+                );
                 return Ok(CommitDisposition::Duplicate);
             }
             save_conflict(&transaction, self.storage_budget, message, source, &root)?;
@@ -2973,12 +3013,27 @@ impl ClientStore {
                     request_id
                 ],
             )?;
-        } else {
-            admit_storage_growth(&transaction, self.storage_budget)?;
-            insert_incoming_original(&transaction, message, source, kind, &root)?;
+            note_body_digest(&transaction, &root, message.digest())?;
+            transaction.commit()?;
+            crate::observe::note_original(
+                crate::observe::ObservationKind::OriginalCommitted,
+                key.sender,
+                key.message,
+                *message.digest(),
+            );
+            crate::observe::note_received_link(key.sender, owner, key.message, *message.digest());
+            return Ok(CommitDisposition::New);
         }
+        admit_storage_growth(&transaction, self.storage_budget)?;
+        insert_incoming_original(&transaction, message, source, kind, &root)?;
         note_body_digest(&transaction, &root, message.digest())?;
         transaction.commit()?;
+        crate::observe::note_original(
+            crate::observe::ObservationKind::OriginalCommitted,
+            key.sender,
+            key.message,
+            *message.digest(),
+        );
         Ok(CommitDisposition::New)
     }
 

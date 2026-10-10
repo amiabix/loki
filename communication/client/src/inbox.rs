@@ -1004,7 +1004,7 @@ fn record_route_failure(
     store: &mut ClientStore,
     route: &RelayRoute,
     now_ms: u64,
-    reason: &str,
+    reason: &'static str,
     sample: &[u8],
     isolate: bool,
 ) -> ClientResult<()> {
@@ -1015,6 +1015,7 @@ fn record_route_failure(
     }
     // The reason is already durable. A full sample budget must not roll it back.
     let _ = save_page_sample(store, route, sample);
+    crate::observe::note_route_failure(route.pin.key, route.pin.run, route.mailbox, reason);
     Ok(())
 }
 
@@ -1065,6 +1066,35 @@ pub async fn poll_once(
     self_route: &AuthenticatedDescriptor,
     now_ms: u64,
 ) -> ClientResult<()> {
+    poll_once_inner(store, http, identity, roster, config, self_route, now_ms).await
+}
+
+/// `poll_once` with journal milestones on `observer`. HTTP events stay on the client sink.
+pub async fn poll_once_observed(
+    store: &mut ClientStore,
+    http: &RelayHttp,
+    identity: &CommIdentity,
+    roster: &Roster,
+    config: &ClientConfig,
+    self_route: &AuthenticatedDescriptor,
+    now_ms: u64,
+    observer: &crate::ObservationSink,
+) -> ClientResult<()> {
+    observer
+        .drive(poll_once_inner(store, http, identity, roster, config, self_route, now_ms))
+        .await
+}
+
+async fn poll_once_inner(
+    store: &mut ClientStore,
+    http: &RelayHttp,
+    identity: &CommIdentity,
+    roster: &Roster,
+    config: &ClientConfig,
+    self_route: &AuthenticatedDescriptor,
+    now_ms: u64,
+) -> ClientResult<()> {
+    http.set_actor(Some(identity.public().id));
     if now_ms > i64::MAX as u64 {
         return Err(ClientError::Capacity);
     }
@@ -1103,6 +1133,13 @@ fn publish_candidates(
 ) -> ClientResult<()> {
     let candidates = authenticate_staged(store, roster, identity)?;
     for candidate in &candidates {
+        let body = candidate.message().body();
+        crate::observe::note_original(
+            crate::observe::ObservationKind::OriginalAuthenticated,
+            body.key.sender,
+            body.key.message,
+            *candidate.message().digest(),
+        );
         let ack = match crate::prepare_received(
             store,
             identity,
@@ -1435,6 +1472,7 @@ fn schedule_download_retry(store: &mut ClientStore, task: &PendingDownload, now_
         return Err(ClientError::Storage);
     }
     transaction.commit()?;
+    crate::observe::note_download_retry(task.source_hash, task.relay_key, task.run, task.mailbox);
     Ok(())
 }
 
@@ -1584,6 +1622,13 @@ fn settle_download(
         return Err(ClientError::Storage);
     }
     transaction.commit()?;
+    if failure.is_some() {
+        let result = failure
+            .as_ref()
+            .map(|(reason, _)| reason.code())
+            .unwrap_or("quarantine");
+        crate::observe::note_quarantine(task.relay_key, task.run, task.mailbox, task.source_hash, result);
+    }
     Ok(())
 }
 

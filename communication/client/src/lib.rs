@@ -123,7 +123,7 @@ mod http;
 pub use http::{RelayHttp, VerifiedEntry, VerifiedPage, VerifiedReceipt};
 mod inbox;
 pub use inbox::{
-    authenticate_staged, committed_readiness, poll_once, poll_transport, reopen_committed,
+    authenticate_staged, committed_readiness, poll_once, poll_once_observed, poll_transport, reopen_committed,
     AuthenticatedCandidate, CandidateReadiness, DownloadOutcome, PrerequisiteStatus, QuarantineReason,
 };
 mod received;
@@ -132,4 +132,6 @@ pub use tokio::runtime::Runtime as RelayRuntime;
 
 mod retry;
 mod outbox;
-pub use outbox::{outbox_intent_digest, upload_pending, DeliveryReport, ThirdPass, UploadPass};
+pub use outbox::{
+    outbox_intent_digest, upload_pending, upload_pending_observed, DeliveryReport, ThirdPass, UploadPass,
+};

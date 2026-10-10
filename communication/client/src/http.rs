@@ -1,5 +1,5 @@
 use crate::{
-    observe::{ObservationKind, ObservationSink},
+    observe::{Observation, ObservationKind, ObservationSink},
     ClientError, ClientResult, Secret32,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -13,7 +13,7 @@ use loki_relay_protocol::{
         MAX_PERSISTED_COUNTER,
     },
     receipt::{self, decode_body},
-    types::{CreationResult, Id32, Object, Page, ReceiptBody, RelayRoute},
+    types::{CreationResult, Id32, MemberId, Object, Page, ReceiptBody, RelayRoute},
     WireError,
 };
 use reqwest::{
@@ -22,13 +22,41 @@ use reqwest::{
     Client, Response,
 };
 use sha2::{Digest, Sha256};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 const MAX_CONTROL: usize = 4096;
+
+struct RequestNote<'a> {
+    http: &'a RelayHttp,
+    request: u64,
+    started: Instant,
+    pin: Id32,
+    run: Id32,
+    mailbox: Id32,
+    status: Option<u16>,
+    result: &'static str,
+}
+
+impl Drop for RequestNote<'_> {
+    fn drop(&mut self) {
+        self.http.note_result(
+            self.request,
+            self.started,
+            self.pin,
+            self.run,
+            self.mailbox,
+            self.status,
+            self.result,
+        );
+    }
+}
+
 pub struct RelayHttp {
     client: Client,
     observer: ObservationSink,
+    actor: Mutex<Option<MemberId>>,
 }
 impl RelayHttp {
     pub fn new() -> ClientResult<Self> {
@@ -53,25 +81,71 @@ impl RelayHttp {
                 .timeout(Duration::from_secs(10))
                 .build()?,
             observer,
+            actor: Mutex::new(None),
         })
     }
 
-    fn note_request(&self, mailbox: &Id32, hash: Option<Id32>, bytes: Option<u64>) -> u64 {
+    /// The local member is the actor for requests this client sends. A GET actor is the recipient.
+    pub fn set_actor(&self, actor: Option<MemberId>) {
+        *self.actor.lock().unwrap_or_else(|error| error.into_inner()) = actor;
+    }
+
+    fn actor(&self) -> Option<MemberId> {
+        *self.actor.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn note_request(&self, route: &RelayRoute, hash: Option<Id32>, bytes: Option<u64>) -> RequestNote<'_> {
         let mut started = self.observer.begin(ObservationKind::RequestStart);
-        started.mailbox = Some(*mailbox);
+        started.actor = self.actor();
+        started.mailbox = Some(route.mailbox);
+        started.pin = Some(route.pin.key);
+        started.run = Some(route.pin.run);
         started.object_hash = hash;
         started.bytes = bytes;
         let request = started.request;
         self.observer.emit(started);
-        request
+        RequestNote {
+            http: self,
+            request,
+            started: Instant::now(),
+            pin: route.pin.key,
+            run: route.pin.run,
+            mailbox: route.mailbox,
+            status: None,
+            result: "transport",
+        }
     }
 
-    fn note_result(&self, request: u64, started: Instant, status: Option<u16>, result: &'static str) {
-        let mut ended = crate::Observation::new(ObservationKind::RequestEnd, request);
+    fn note_result(
+        &self,
+        request: u64,
+        started: Instant,
+        pin: Id32,
+        run: Id32,
+        mailbox: Id32,
+        status: Option<u16>,
+        result: &'static str,
+    ) {
+        let mut ended = Observation::new(ObservationKind::RequestEnd, request);
+        ended.actor = self.actor();
+        ended.mailbox = Some(mailbox);
+        ended.pin = Some(pin);
+        ended.run = Some(run);
         ended.status = status;
         ended.duration = Some(started.elapsed());
         ended.result = Some(result);
         self.observer.emit(ended);
+    }
+
+    fn note_receipt(&self, kind: ObservationKind, request: u64, route: &RelayRoute, hash: Option<Id32>, result: &'static str) {
+        let mut event = Observation::new(kind, request);
+        event.actor = self.actor();
+        event.mailbox = Some(route.mailbox);
+        event.pin = Some(route.pin.key);
+        event.run = Some(route.pin.run);
+        event.object_hash = hash;
+        event.result = Some(result);
+        self.observer.emit(event);
     }
     async fn control(
         &self,
@@ -202,8 +276,7 @@ impl RelayHttp {
             hex::encode(route.mailbox),
             hex::encode(object.hash)
         );
-        let request = self.note_request(&route.mailbox, Some(object.hash), Some(object.wire.len() as u64));
-        let started = Instant::now();
+        let mut note = self.note_request(route, Some(object.hash), Some(object.wire.len() as u64));
         let mut response = match self
             .client
             .put(url)
@@ -214,31 +287,37 @@ impl RelayHttp {
             .await
         {
             Ok(response) => response,
-            Err(error) => {
-                self.note_result(request, started, None, "transport");
-                return Err(error.into());
-            }
+            Err(error) => return Err(error.into()),
         };
         let (status, body) = match finish(&mut response, "application/cbor", RECEIPT_CAP, None).await {
             Ok(finished) => finished,
             Err(error) => {
-                self.note_result(request, started, None, error.code());
+                note.result = error.code();
                 return Err(error);
             }
         };
+        note.status = Some(status);
         // guard:put_status
         if status != 200 && status != 201 {
-            self.note_result(request, started, Some(status), "transport");
+            note.result = "transport";
             return Err(ClientError::Transport);
         }
         // end:put_status
         match verify_receipt(route, &body, object.hash, object.wire.len() as u64, None) {
             Ok(receipt) => {
-                self.note_result(request, started, Some(status), "ok");
+                note.result = "ok";
+                self.note_receipt(ObservationKind::ReceiptValidated, note.request, route, Some(object.hash), "ok");
                 Ok(receipt)
             }
             Err(error) => {
-                self.note_result(request, started, Some(status), error.code());
+                note.result = error.code();
+                self.note_receipt(
+                    ObservationKind::ReceiptRejected,
+                    note.request,
+                    route,
+                    Some(object.hash),
+                    error.code(),
+                );
                 Err(error)
             }
         }
@@ -259,32 +338,45 @@ impl RelayHttp {
             hex::encode(route.mailbox),
             hex::encode(hash)
         );
-        let mut response = self
-            .client
-            .get(url)
-            .header(AUTHORIZATION, bearer(read)?)
-            .send()
-            .await?;
-        let (status, body) = finish(
+        let mut note = self.note_request(route, Some(*hash), None);
+        let mut response = match self.client.get(url).header(AUTHORIZATION, bearer(read)?).send().await {
+            Ok(response) => response,
+            Err(error) => return Err(error.into()),
+        };
+        let (status, body) = match finish(
             &mut response,
             "application/octet-stream",
             OBJECT_CAP,
             Some(*hash),
         )
-        .await?;
+        .await
+        {
+            Ok(finished) => finished,
+            Err(error) => {
+                note.result = error.code();
+                return Err(error);
+            }
+        };
+        note.status = Some(status);
         // guard:get_status
         if status != 200 {
+            note.result = "transport";
             return Err(ClientError::Transport);
         }
         // end:get_status
         // guard:framing
-        envelope::validate_wire(&body)?;
+        if let Err(error) = envelope::validate_wire(&body) {
+            note.result = ClientError::from(error).code();
+            return Err(error.into());
+        }
         // end:framing
         // guard:sha256
         if <Id32>::from(Sha256::digest(&body)) != *hash {
+            note.result = "transport";
             return Err(ClientError::Transport);
         }
         // end:sha256
+        note.result = "ok";
         Ok(Object {
             hash: *hash,
             wire: body,
@@ -310,29 +402,45 @@ impl RelayHttp {
             route.endpoint.trim_end_matches('/'),
             hex::encode(route.mailbox)
         );
-        let mut response = self
-            .client
-            .get(url)
-            .header(AUTHORIZATION, bearer(read)?)
-            .send()
-            .await?;
-        let (status, body) = finish(&mut response, "application/cbor", PAGE_CAP, None).await?;
+        let mut note = self.note_request(route, None, None);
+        let mut response = match self.client.get(url).header(AUTHORIZATION, bearer(read)?).send().await {
+            Ok(response) => response,
+            Err(error) => return Err(error.into()),
+        };
+        let (status, body) = match finish(&mut response, "application/cbor", PAGE_CAP, None).await {
+            Ok(finished) => finished,
+            Err(error) => {
+                note.result = error.code();
+                return Err(error);
+            }
+        };
+        note.status = Some(status);
         // guard:entries_status
         if status != 200 {
+            note.result = "transport";
             return Err(ClientError::Transport);
         }
         // end:entries_status
-        let page = decode_page(&body).map_err(|error| match error {
-            WireError::Bounds => ClientError::Wire(error),
-            _ => ClientError::Transport,
-        })?;
+        let page = match decode_page(&body) {
+            Ok(page) => page,
+            Err(error) => {
+                let error = match error {
+                    WireError::Bounds => ClientError::Wire(error),
+                    _ => ClientError::Transport,
+                };
+                note.result = error.code();
+                return Err(error);
+            }
+        };
         // guard:page_mailbox
         if page.mailbox != route.mailbox {
+            note.result = "transport";
             return Err(ClientError::Transport);
         }
         // end:page_mailbox
         // guard:page_after
         if page.after != after {
+            note.result = "transport";
             return Err(ClientError::Transport);
         }
         // end:page_after
@@ -340,16 +448,39 @@ impl RelayHttp {
         for entry in &page.entries {
             // guard:receipt_cap
             if entry.receipt.len() > RECEIPT_CAP {
+                note.result = "transport";
                 return Err(ClientError::Transport);
             }
             // end:receipt_cap
-            let receipt = verify_receipt(
+            let receipt = match verify_receipt(
                 route,
                 &entry.receipt,
                 entry.hash,
                 entry.wire_length,
                 Some(entry.sequence),
-            )?;
+            ) {
+                Ok(receipt) => {
+                    self.note_receipt(
+                        ObservationKind::ReceiptValidated,
+                        note.request,
+                        route,
+                        Some(entry.hash),
+                        "ok",
+                    );
+                    receipt
+                }
+                Err(error) => {
+                    note.result = error.code();
+                    self.note_receipt(
+                        ObservationKind::ReceiptRejected,
+                        note.request,
+                        route,
+                        Some(entry.hash),
+                        error.code(),
+                    );
+                    return Err(error);
+                }
+            };
             entries.push(VerifiedEntry {
                 sequence: entry.sequence,
                 hash: entry.hash,
@@ -368,9 +499,11 @@ impl RelayHttp {
         }
         let next = after.checked_add(expected).ok_or(ClientError::Transport)?;
         if page.next != next {
+            note.result = "transport";
             return Err(ClientError::Transport);
         }
         // end:page_expected_len
+        note.result = "ok";
         Ok(VerifiedPage {
             mailbox: page.mailbox,
             after: page.after,
@@ -401,14 +534,37 @@ impl RelayHttp {
             route.endpoint.trim_end_matches('/'),
             hex::encode(route.mailbox)
         );
-        let mut response = self
-            .client
-            .get(url)
-            .header(AUTHORIZATION, bearer(read)?)
-            .send()
-            .await?;
-        let held = hold_page(&mut response).await?;
-        classify_page(route, after, limit, held)
+        let mut note = self.note_request(route, None, None);
+        let mut response = match self.client.get(url).header(AUTHORIZATION, bearer(read)?).send().await {
+            Ok(response) => response,
+            Err(error) => return Err(error.into()),
+        };
+        let held = match hold_page(&mut response).await {
+            Ok(held) => held,
+            Err(error) => {
+                note.result = error.code();
+                return Err(error);
+            }
+        };
+        note.status = Some(held.status);
+        let read = match classify_page(route, after, limit, held) {
+            Ok(read) => read,
+            Err(error) => {
+                note.result = error.code();
+                return Err(error);
+            }
+        };
+        note.result = match &read {
+            PageRead::Page(_) => "ok",
+            PageRead::Invalid { reason, .. } => {
+                if *reason == "malformed" {
+                    self.note_receipt(ObservationKind::ReceiptRejected, note.request, route, None, reason);
+                }
+                reason
+            }
+            PageRead::Unavailable { reason, .. } => reason,
+        };
+        Ok(read)
     }
 
     /// Capped object body for a pending download. Framing and hash remain the caller's checks.
@@ -425,31 +581,53 @@ impl RelayHttp {
             hex::encode(route.mailbox),
             hex::encode(hash)
         );
-        let mut response = self
-            .client
-            .get(url)
-            .header(AUTHORIZATION, bearer(read)?)
-            .send()
-            .await?;
+        let mut note = self.note_request(route, Some(*hash), None);
+        let mut response = match self.client.get(url).header(AUTHORIZATION, bearer(read)?).send().await {
+            Ok(response) => response,
+            Err(error) => return Err(error.into()),
+        };
         let status = response.status().as_u16();
+        note.status = Some(status);
         if status == 429 {
-            retry_after(response.headers())?;
+            if let Err(error) = retry_after(response.headers()) {
+                note.result = error.code();
+                return Err(error);
+            }
         }
         let expected = if (200..300).contains(&status) {
             "application/octet-stream"
         } else {
             "application/cbor"
         };
-        media(response.headers(), expected)?;
+        if let Err(error) = media(response.headers(), expected) {
+            note.result = error.code();
+            return Err(error);
+        }
         if !(200..300).contains(&status) {
-            let body = collect(&mut response, OBJECT_CAP).await?;
-            return Err(map_status(status, &body, Some(*hash)));
+            let body = match collect(&mut response, OBJECT_CAP).await {
+                Ok(body) => body,
+                Err(error) => {
+                    note.result = error.code();
+                    return Err(error);
+                }
+            };
+            let error = map_status(status, &body, Some(*hash));
+            note.result = error.code();
+            return Err(error);
         }
         // A body past the object cap is a permanent bounds failure, not a dropped connection.
-        let body = collect_bounded(&mut response, OBJECT_CAP).await?;
+        let body = match collect_bounded(&mut response, OBJECT_CAP).await {
+            Ok(body) => body,
+            Err(error) => {
+                note.result = error.code();
+                return Err(error);
+            }
+        };
         if status != 200 {
+            note.result = "transport";
             return Err(ClientError::Transport);
         }
+        note.result = "ok";
         Ok(body)
     }
 }
