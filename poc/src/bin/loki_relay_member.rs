@@ -7,8 +7,9 @@ use loki_poc::relay_member::{
 use loki_relay_client::{
     committed_readiness, open_descriptor, outbox_intent_digest, poll_once, prepare_outbox,
     received_status, upload_pending, AuthenticatedDescriptor, CandidateReadiness, ClientConfig,
-    ClientError, ClientStore, DiagnosticSample, DownloadRejection, PendingDownload, RecoveryLogical,
-    RecoveryUpload, RelayHttp, RelayRuntime, RouteCursor, Secret32, SourceRejection, ThirdPass,
+    ClientError, ClientStore, DiagnosticSample, DownloadRejection, PendingDownload,
+    RecoveryLogical, RecoveryUpload, RelayHttp, RelayRuntime, RouteCursor, Secret32,
+    SourceRejection, ThirdPass,
 };
 use loki_relay_protocol::types::{
     roster_digest, Id32, LogicalKey, MessageBody, Payload, RelayPin, RelayRoute,
@@ -443,8 +444,14 @@ fn status(
     print_reference(&session)?;
     print_authenticated_inboxes(&session)?;
     let logicals = logical_page(&session.db)?;
-    let incoming = page_rows(|after| session.db.recover_incoming_originals(after, PAGE))?;
-    let acks = page_rows(|after| session.db.recover_ack_links(after, PAGE))?;
+    let incoming = page_rows(
+        |after| session.db.recover_incoming_originals(after, PAGE),
+        usize::MAX,
+    )?;
+    let acks = page_rows(
+        |after| session.db.recover_ack_links(after, PAGE),
+        usize::MAX,
+    )?;
     println!("logical_count={}", logicals.len());
     println!("incoming_count={}", incoming.len());
     println!("ack_count={}", acks.len());
@@ -530,15 +537,34 @@ fn status(
 
 fn print_diagnostics(session: &Session) -> Result<(), Exit> {
     // Transport counters and capture metadata. They do not authenticate a message.
-    let cursors = bounded_page(|after| session.db.recover_route_cursors(after, PAGE))?;
-    let pending = bounded_page(|after| session.db.recover_pending_downloads(after, PAGE))?;
-    let download_rejections =
-        bounded_page(|after| session.db.recover_download_rejections(after, PAGE))?;
-    let source_rejections = bounded_page(|after| session.db.recover_source_rejections(after, PAGE))?;
-    let uploads = bounded_page(|after| session.db.recover_uploads(after, PAGE))?;
-    let samples = diagnostic_samples(&session.db)?;
+    let cursors = page_rows(
+        |after| session.db.recover_route_cursors(after, PAGE),
+        DIAGNOSTIC_ROW_BOUND,
+    )?;
+    let pending = page_rows(
+        |after| session.db.recover_pending_downloads(after, PAGE),
+        DIAGNOSTIC_ROW_BOUND,
+    )?;
+    let download_rejections = page_rows(
+        |after| session.db.recover_download_rejections(after, PAGE),
+        DIAGNOSTIC_ROW_BOUND,
+    )?;
+    let source_rejections = page_rows(
+        |after| session.db.recover_source_rejections(after, PAGE),
+        DIAGNOSTIC_ROW_BOUND,
+    )?;
+    let uploads = page_rows(
+        |after| session.db.recover_uploads(after, PAGE),
+        DIAGNOSTIC_ROW_BOUND,
+    )?;
+    let samples = page_rows(
+        |after| session.db.recover_diagnostic_samples(after, PAGE),
+        DIAGNOSTIC_ROW_BOUND,
+    )?;
     let sample_bytes = samples.iter().try_fold(0u64, |total, sample| {
-        total.checked_add(sample.sample_len).ok_or(Exit::Client(ClientError::Capacity))
+        total
+            .checked_add(sample.sample_len)
+            .ok_or(Exit::Client(ClientError::Capacity))
     })?;
     println!("section=diagnostics");
     println!("diagnostics_authority=transport");
@@ -629,60 +655,6 @@ fn public_reason(reason: &str) -> String {
     } else {
         format!("reason=other length={}", reason.len())
     }
-}
-
-fn bounded_page<T>(mut page: impl FnMut(u64) -> Result<Vec<T>, ClientError>) -> Result<Vec<T>, Exit>
-where
-    T: Cursor,
-{
-    // Stop before retaining another page once the diagnostic cap is reached.
-    let mut after = 0u64;
-    let mut rows = Vec::new();
-    loop {
-        let batch = page(after).map_err(Exit::Client)?;
-        if batch.is_empty() {
-            break;
-        }
-        let next = batch.last().map(Cursor::cursor).unwrap_or(after);
-        if next <= after {
-            return Err(Exit::Client(ClientError::Storage));
-        }
-        if rows.len().saturating_add(batch.len()) > DIAGNOSTIC_ROW_BOUND {
-            return Err(Exit::Client(ClientError::Capacity));
-        }
-        let short = batch.len() < usize::from(PAGE);
-        rows.extend(batch);
-        if short {
-            break;
-        }
-        after = next;
-    }
-    Ok(rows)
-}
-
-fn diagnostic_samples(db: &ClientStore) -> Result<Vec<DiagnosticSample>, Exit> {
-    let mut after = 0u64;
-    let mut rows = Vec::new();
-    loop {
-        let batch = db.recover_diagnostic_samples(after, PAGE).map_err(Exit::Client)?;
-        if batch.is_empty() {
-            break;
-        }
-        let next = batch.last().map(|sample| sample.id).unwrap_or(0);
-        if next <= 0 || next as u64 <= after {
-            return Err(Exit::Client(ClientError::Storage));
-        }
-        let short = batch.len() < usize::from(PAGE);
-        if rows.len().saturating_add(batch.len()) > DIAGNOSTIC_ROW_BOUND {
-            return Err(Exit::Client(ClientError::Capacity));
-        }
-        rows.extend(batch);
-        if short {
-            break;
-        }
-        after = next as u64;
-    }
-    Ok(rows)
 }
 
 fn prepare_selected_rotation(session: &mut Session) -> Result<(), Exit> {
@@ -1118,18 +1090,21 @@ fn print_logical(db: &ClientStore, logical: &RecoveryLogical) -> Result<(), Exit
 }
 
 fn logical_page(db: &ClientStore) -> Result<Vec<RecoveryLogical>, Exit> {
-    page_rows(|after| db.recover_logical(after, PAGE))
+    page_rows(|after| db.recover_logical(after, PAGE), usize::MAX)
 }
 
 fn uploads_for(db: &ClientStore, key: &LogicalKey) -> Result<Vec<RecoveryUpload>, Exit> {
-    let rows = page_rows(|after| db.recover_uploads(after, PAGE))?;
+    let rows = page_rows(|after| db.recover_uploads(after, PAGE), usize::MAX)?;
     Ok(rows
         .into_iter()
         .filter(|upload| upload.key == *key)
         .collect())
 }
 
-fn page_rows<T>(mut page: impl FnMut(u64) -> Result<Vec<T>, ClientError>) -> Result<Vec<T>, Exit>
+fn page_rows<T>(
+    mut page: impl FnMut(u64) -> Result<Vec<T>, ClientError>,
+    max_rows: usize,
+) -> Result<Vec<T>, Exit>
 where
     T: Cursor,
 {
@@ -1143,6 +1118,9 @@ where
         let next = batch.last().map(Cursor::cursor).unwrap_or(after);
         if next <= after {
             return Err(Exit::Client(ClientError::Storage));
+        }
+        if rows.len().saturating_add(batch.len()) > max_rows {
+            return Err(Exit::Client(ClientError::Capacity));
         }
         let short = batch.len() < usize::from(PAGE);
         rows.extend(batch);
@@ -1176,6 +1154,12 @@ cursor_row!(RouteCursor);
 cursor_row!(PendingDownload);
 cursor_row!(DownloadRejection);
 cursor_row!(SourceRejection);
+
+impl Cursor for DiagnosticSample {
+    fn cursor(&self) -> u64 {
+        u64::try_from(self.id).unwrap_or(0)
+    }
+}
 
 fn child_directories(path: &Path) -> Result<Vec<PathBuf>, Exit> {
     let mut found = Vec::new();
@@ -1350,4 +1334,52 @@ fn now_ms() -> Result<u64, Exit> {
 
 fn runtime() -> Result<RelayRuntime, Exit> {
     RelayRuntime::new().map_err(|_| Exit::Member(MemberError::Io))
+}
+
+#[cfg(test)]
+mod pagination_tests {
+    use super::*;
+
+    fn sample(id: i64) -> DiagnosticSample {
+        DiagnosticSample {
+            id,
+            relay_key: [0; 32],
+            run: [0; 32],
+            mailbox: [0; 32],
+            sequence: 1,
+            sample_len: 0,
+        }
+    }
+
+    #[test]
+    fn diagnostic_pagination_enforces_capacity() {
+        for count in [399, 400, 401] {
+            let rows = page_rows(
+                |after| {
+                    Ok(((after + 1)..=count.min(after + u64::from(PAGE)))
+                        .map(|id| sample(id as i64))
+                        .collect())
+                },
+                DIAGNOSTIC_ROW_BOUND,
+            );
+            if count <= 400 {
+                assert_eq!(rows.ok().unwrap().len(), count as usize);
+            } else {
+                assert!(matches!(rows, Err(Exit::Client(ClientError::Capacity))));
+            }
+        }
+    }
+
+    #[test]
+    fn diagnostic_pagination_rejects_invalid_or_stalled_cursors() {
+        for id in [-1, 0] {
+            let rows = page_rows(|_| Ok(vec![sample(id)]), DIAGNOSTIC_ROW_BOUND);
+            assert!(matches!(rows, Err(Exit::Client(ClientError::Storage))));
+        }
+        let rows = page_rows(
+            |_| Ok((1..=i64::from(PAGE)).map(sample).collect()),
+            DIAGNOSTIC_ROW_BOUND,
+        );
+        assert!(matches!(rows, Err(Exit::Client(ClientError::Storage))));
+    }
 }

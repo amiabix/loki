@@ -114,7 +114,7 @@ pub use store::{
     AckLink, ClientStore, CommitDisposition, ConfigReference, DiagnosticSample, DownloadRejection, EarlyReceived,
     IncomingDependency, IncomingOriginal, JournalCapture, PendingDownload, RecoveryLogical,
     RecoveryRecipient, RecoveryRequirement, RecoveryUpload, ReferencePhase, RouteCursor,
-    SourceRejection, StagedRequirement, StagedSource, StorePragmas, TransferGroupView,
+    SourceRejection, StagedRequirement, StagedSource, StorePragmas,
 };
 
 mod http;

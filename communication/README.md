@@ -1,4 +1,6 @@
-# feat(communication): local encrypted relay harness
+# feat(communication): durable encrypted offline relay
+
+Run three independent local relay stores with per-member inboxes. The relay stores opaque HPKE ciphertext and returns signed storage receipts; clients authenticate certified senders, assemble chunked messages, retry saved bytes, and return Received acknowledgements after local persistence. The optional PoC adapter provides the member CLI. This is a communication harness for a fixed three-member roster.
 
 The native harness certifies Alice, Bob and Carol through the existing file setup, provisions nine independent inboxes, and distributes six signed, recipient-encrypted descriptors. Alice saves separately encrypted copies for all three members before any upload. Whole-vault Stored requires the same two distinct pinned relay identities to acknowledge every object of all three copies. Received is a separate authenticated observation.
 
@@ -26,7 +28,11 @@ python3 -m unittest discover -s communication/harness -p test_run.py
 python3 poc/scripts/verify_relay_source_isolation.py
 cargo build --manifest-path communication/Cargo.toml --locked --offline -p loki-relay-server
 cargo build --manifest-path poc/Cargo.toml --locked --offline --features relay-communication --bin loki_relay_member --bin loki_setup_member
+python3 communication/harness/run.py acceptance --run-root /private/tmp/loki-relay-acceptance-new --ports 39101 39102 39103
+python3 communication/harness/run.py faults --run-root /private/tmp/loki-relay-faults-new --ports 39111 39112 39113
 ```
+
+Build before running the harness; choose new run directories and free ports for each run. Reports are saved under those directories and all owned processes stop when the command exits. Data remains until explicit deletion using the run ID. See [harness instructions](harness/README.md) for selected scenarios and deletion, and [Ponytail review](REVIEW.md) for the cleanup and follow-up boundary.
 
 ## docs(communication): scope and durability limits
 

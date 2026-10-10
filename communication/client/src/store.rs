@@ -608,13 +608,6 @@ pub(crate) enum CommittedChain {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TransferGroupView {
-    pub cursor: u64,
-    pub group_id: Id32,
-    pub pending: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IncomingOriginal {
     pub cursor: u64,
     pub key: LogicalKey,
@@ -2543,25 +2536,6 @@ impl ClientStore {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    pub fn recover_transfer_groups(
-        &self,
-        after: u64,
-        limit: u16,
-    ) -> ClientResult<Vec<TransferGroupView>> {
-        page_bounds(after, limit)?;
-        let mut statement = self.connection.prepare(&format!(
-            "SELECT g.rowid,g.group_id,{GROUP_OPEN} FROM transfer_groups g WHERE g.rowid>?1 ORDER BY g.rowid LIMIT ?2"
-        ))?;
-        let rows = statement.query_map(params![after, limit], |row| {
-            Ok(TransferGroupView {
-                cursor: row.get(0)?,
-                group_id: row_id(row, 1)?,
-                pending: row.get::<_, i64>(2)? != 0,
-            })
-        })?;
-        Ok(rows.collect::<Result<_, _>>()?)
-    }
-
     pub fn recover_incoming_originals(
         &self,
         after: u64,
@@ -2652,28 +2626,6 @@ impl ClientStore {
         after: u64,
         limit: u16,
     ) -> ClientResult<Vec<EarlyReceived>> {
-        self.recover_received(roster, owner, after, limit, "")
-    }
-
-    /// Ready references only. Pending, resolved, rejected, and non-actionable rows stay out of this page.
-    pub fn recover_actionable_received(
-        &self,
-        roster: &Roster,
-        owner: MemberId,
-        after: u64,
-        limit: u16,
-    ) -> ClientResult<Vec<EarlyReceived>> {
-        self.recover_received(roster, owner, after, limit, "ready")
-    }
-
-    fn recover_received(
-        &self,
-        roster: &Roster,
-        owner: MemberId,
-        after: u64,
-        limit: u16,
-        phase: &str,
-    ) -> ClientResult<Vec<EarlyReceived>> {
         page_bounds(after, limit)?;
         let members = certified_owner(roster, owner)?;
         let stored = stored_owner(&self.connection)?;
@@ -2689,21 +2641,21 @@ impl ClientStore {
                         WHERE j.vault=e.vault AND j.roster=e.roster AND j.sender=e.sender
                         AND j.message_id=e.message_id AND j.digest=e.digest AND j.from_member=e.from_member
                     ) THEN 'rejected'
-                    WHEN e.from_member NOT IN (?4,?5,?6) OR e.from_member=e.sender OR e.from_member=?7 THEN 'not_actionable'
+                    WHEN e.from_member NOT IN (?3,?4,?5) OR e.from_member=e.sender OR e.from_member=?6 THEN 'not_actionable'
                     WHEN NOT EXISTS (
                         SELECT 1 FROM logical_records l
-                        WHERE e.sender=?7 AND l.vault=e.vault AND l.roster=e.roster AND l.sender=e.sender AND l.message_id=e.message_id
+                        WHERE e.sender=?6 AND l.vault=e.vault AND l.roster=e.roster AND l.sender=e.sender AND l.message_id=e.message_id
                     ) AND NOT EXISTS (
                         SELECT 1 FROM incoming_originals i
-                        WHERE e.sender<>?7 AND i.vault=e.vault AND i.roster=e.roster AND i.sender=e.sender AND i.message_id=e.message_id
+                        WHERE e.sender<>?6 AND i.vault=e.vault AND i.roster=e.roster AND i.sender=e.sender AND i.message_id=e.message_id
                     ) THEN 'pending'
                     WHEN NOT EXISTS (
                         SELECT 1 FROM logical_records l
-                        WHERE e.sender=?7 AND l.vault=e.vault AND l.roster=e.roster AND l.sender=e.sender AND l.message_id=e.message_id
+                        WHERE e.sender=?6 AND l.vault=e.vault AND l.roster=e.roster AND l.sender=e.sender AND l.message_id=e.message_id
                         AND l.digest=e.digest AND l.session IS e.session AND l.kind=1
                     ) AND NOT EXISTS (
                         SELECT 1 FROM incoming_originals i
-                        WHERE e.sender<>?7 AND i.vault=e.vault AND i.roster=e.roster AND i.sender=e.sender AND i.message_id=e.message_id
+                        WHERE e.sender<>?6 AND i.vault=e.vault AND i.roster=e.roster AND i.sender=e.sender AND i.message_id=e.message_id
                         AND i.digest=e.digest AND i.session IS e.session AND i.kind=1
                     ) THEN 'not_actionable'
                     WHEN EXISTS (
@@ -2713,10 +2665,10 @@ impl ClientStore {
                     ELSE 'ready'
                 END AS phase
                 FROM early_received_refs e
-            ) WHERE rowid>?1 AND (?2='' OR phase=?2) ORDER BY rowid LIMIT ?3",
+            ) WHERE rowid>?1 ORDER BY rowid LIMIT ?2",
         )?;
         let rows = statement.query_map(
-            params![after, phase, limit, members[0], members[1], members[2], owner],
+            params![after, limit, members[0], members[1], members[2], owner],
             |row| {
                 Ok(EarlyReceived {
                     cursor: row.get(0)?,
@@ -2737,24 +2689,6 @@ impl ClientStore {
         &self,
         after: u64,
         limit: u16,
-    ) -> ClientResult<Vec<IncomingDependency>> {
-        self.recover_dependency_page(after, limit, "")
-    }
-
-    /// Ready dependencies only: the staged source matches and no accepted association exists yet.
-    pub fn recover_actionable_dependencies(
-        &self,
-        after: u64,
-        limit: u16,
-    ) -> ClientResult<Vec<IncomingDependency>> {
-        self.recover_dependency_page(after, limit, "ready")
-    }
-
-    fn recover_dependency_page(
-        &self,
-        after: u64,
-        limit: u16,
-        phase: &str,
     ) -> ClientResult<Vec<IncomingDependency>> {
         page_bounds(after, limit)?;
         let mut statement = self.connection.prepare(
@@ -2798,9 +2732,9 @@ impl ClientStore {
                     ELSE 'pending'
                 END AS phase
                 FROM incoming_dependencies d
-            ) WHERE rowid>?1 AND (?2='' OR phase=?2) ORDER BY rowid LIMIT ?3",
+            ) WHERE rowid>?1 ORDER BY rowid LIMIT ?2",
         )?;
-        let rows = statement.query_map(params![after, phase, limit], |row| {
+        let rows = statement.query_map(params![after, limit], |row| {
             Ok(IncomingDependency {
                 cursor: row.get(0)?,
                 key: row_key(row, 1)?,

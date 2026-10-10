@@ -56,10 +56,7 @@ impl RelayHttp {
         {
             return Err(ClientError::Config);
         }
-        let mut token = Zeroizing::new(String::from("Bearer "));
-        URL_SAFE_NO_PAD.encode_string(secret.as_bytes(), &mut token);
-        let mut authorization = HeaderValue::from_str(&token).map_err(|_| ClientError::Config)?;
-        authorization.set_sensitive(true);
+        let authorization = bearer(secret)?;
         let url = format!(
             "{}/v1/mailboxes/{}{}",
             route.endpoint.trim_end_matches('/'),
@@ -75,26 +72,8 @@ impl RelayHttp {
             .send()
             .await?;
         let status = response.status().as_u16();
-        if response.headers().get_all(CONTENT_TYPE).iter().count() != 1
-            || response
-                .headers()
-                .get(CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                != Some("application/cbor")
-            || response.headers().contains_key(CONTENT_ENCODING)
-            || response
-                .content_length()
-                .is_some_and(|n| n > MAX_CONTROL as u64)
-        {
-            return Err(ClientError::Transport);
-        }
-        let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await? {
-            if chunk.len() > MAX_CONTROL - body.len() {
-                return Err(ClientError::Transport);
-            }
-            body.extend_from_slice(&chunk);
-        }
+        media(response.headers(), "application/cbor")?;
+        let body = collect(&mut response, MAX_CONTROL).await?;
         if !(200..300).contains(&status) {
             let code = decode_error(&body).map_err(|_| ClientError::Transport)?;
             if code.status() != status {
@@ -760,44 +739,14 @@ fn map_status(status: u16, body: &[u8], missing: Option<Id32>) -> ClientError {
 }
 
 async fn collect_bounded(response: &mut Response, cap: usize) -> ClientResult<Vec<u8>> {
-    if response.headers().contains_key(CONTENT_ENCODING) {
-        return Err(ClientError::Transport);
-    }
-    if response.content_length().is_some_and(|len| len > cap as u64) {
-        return Err(ClientError::Wire(WireError::Bounds));
-    }
-    let declared = response.content_length();
-    let mut body = Vec::new();
-    loop {
-        match response.chunk().await {
-            Ok(Some(chunk)) => {
-                if chunk.len() > cap.saturating_sub(body.len()) {
-                    return Err(ClientError::Wire(WireError::Bounds));
-                }
-                body.extend_from_slice(&chunk);
-            }
-            Ok(None) => break,
-            Err(_) => return Err(ClientError::Transport),
-        }
-    }
-    if declared.is_some_and(|len| len != body.len() as u64) {
-        return Err(ClientError::Transport);
-    }
-    Ok(body)
-}
-
-async fn collect(response: &mut Response, cap: usize) -> ClientResult<Vec<u8>> {
     // guard:content_encoding
     if response.headers().contains_key(CONTENT_ENCODING) {
         return Err(ClientError::Transport);
     }
     // end:content_encoding
     // guard:stream_cap
-    if response
-        .content_length()
-        .is_some_and(|len| len > cap as u64)
-    {
-        return Err(ClientError::Transport);
+    if response.content_length().is_some_and(|len| len > cap as u64) {
+        return Err(ClientError::Wire(WireError::Bounds));
     }
     // end:stream_cap
     let declared = response.content_length();
@@ -805,7 +754,7 @@ async fn collect(response: &mut Response, cap: usize) -> ClientResult<Vec<u8>> {
     while let Some(chunk) = response.chunk().await? {
         // guard:stream_cap
         if chunk.len() > cap.saturating_sub(body.len()) {
-            return Err(ClientError::Transport);
+            return Err(ClientError::Wire(WireError::Bounds));
         }
         // end:stream_cap
         body.extend_from_slice(&chunk);
@@ -814,6 +763,13 @@ async fn collect(response: &mut Response, cap: usize) -> ClientResult<Vec<u8>> {
         return Err(ClientError::Transport);
     }
     Ok(body)
+}
+
+async fn collect(response: &mut Response, cap: usize) -> ClientResult<Vec<u8>> {
+    collect_bounded(response, cap).await.map_err(|error| match error {
+        ClientError::Wire(WireError::Bounds) => ClientError::Transport,
+        other => other,
+    })
 }
 
 async fn finish(

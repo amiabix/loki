@@ -3468,13 +3468,6 @@ def _acked_retries(diag, pins=None):
     return tuple(sorted(rows))
 
 
-def _retry_identity(diag):
-    return tuple(sorted(
-        (row['message'], row['recipient'], row['hash'], row['pin'], row['run'], row['mailbox'],
-         row['acknowledged'], row['attempts'], row['retry_at'])
-        for row in diag['upload_retries']))
-
-
 def _known_cursors(diag, context, member_id):
     """An authenticated inbox with no saved cursor is still at position 0."""
     known = {
