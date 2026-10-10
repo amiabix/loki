@@ -1,0 +1,119 @@
+{
+  "format": 1,
+  "reviewed_implementation": "553ae1b",
+  "integrated_main": "9284d044402800f8a933aecc40b4c9df48f736c1",
+  "platform": "native macOS",
+  "toolchain": "rustc/cargo 1.98.0",
+  "checks": [
+    {
+      "command": "cargo test --manifest-path communication/Cargo.toml --workspace --locked --offline",
+      "exit_code": 0,
+      "passed": 1031,
+      "ignored_child_entry_points": 8,
+      "log_sha256": "0196ceb01f467324b2396acb2ded766d172859fc607e45aabd01357a04853495"
+    },
+    {
+      "command": "cargo test --manifest-path poc/Cargo.toml --features relay-communication --locked --offline",
+      "exit_code": 0,
+      "passed": 180,
+      "ignored_child_entry_points": 4,
+      "log_sha256": "3782248fa14385c9f40db666d1036919223c81db13d67e35a469093a99694bf0"
+    },
+    {
+      "command": "python3 -m unittest discover -s communication/harness -p test_run.py",
+      "exit_code": 0,
+      "passed": 35,
+      "log_sha256": "80a34126f11da30752bbd361a7355ea09cb0810d4ac478a40b337bd56fdd3a2a"
+    },
+    {
+      "command": "python3 -m unittest discover -s poc/tests -p test_dependency_graph.py",
+      "exit_code": 0,
+      "passed": 1,
+      "log_sha256": "70e93564d0764ef0a87cb81eef0920beaaace971b28365ee0acd06f66cbe72d7"
+    },
+    {
+      "command": "python3 poc/scripts/verify_relay_source_isolation.py",
+      "exit_code": 0,
+      "published_archives": 7,
+      "log_sha256": "6eae430bfe42e4365398220c21e2cb9147ef7d8f9fc975ded3e6dc3fa9ec1c68"
+    },
+    {
+      "command": "cargo build --manifest-path communication/Cargo.toml --locked --offline -p loki-relay-server",
+      "exit_code": 0,
+      "log_sha256": "4cf86278c1e6d659943a46a3d7e3da429ac15be90f0f17742e24ef85228e7d3e"
+    },
+    {
+      "command": "cargo build --manifest-path poc/Cargo.toml --locked --offline --features relay-communication --bin loki_relay_member --bin loki_setup_member",
+      "exit_code": 0,
+      "log_sha256": "d7dae192715495fa89ccbe279af3efb9792c1dae1768228e369035e68a1df673"
+    }
+  ],
+  "source_sha256": {
+    "communication/client/src/http.rs": "9e6dd35480849ed1c670a19c72864dfe310927ddcc926894ace6cc7d1e6718fd",
+    "communication/client/src/lib.rs": "66a947079b4eeb8f283b9e8d4f6852f3aace83f2dfdd713314934c2f38e44c95",
+    "communication/client/src/store.rs": "64c62d9ba7617266dd62e97172e8bf875c12a781a29740b47bf61bd93f887036",
+    "communication/harness/run.py": "5473c2735862ddf88c905df77cea6b5993e8869732bb002babc49f5277041183",
+    "poc/src/bin/loki_relay_member.rs": "adf3226fdc0535f2887e7f38b27c0dae6a027bcc0bd29289f95db3bfb33f02ae",
+    "communication/Cargo.lock": "f814c6814578c4ff15b30945cbba91d9517877d97f56a8f6676f6c01233259a1",
+    "poc/Cargo.lock": "e9f59ce49f75e30210d691eaba13023ecb32f7857bb4d9bc29f2851ea7540577",
+    "communication/client/Cargo.toml": "cbe335ddb77863ac9a70211ea23227596b9b0dd995e1a1a0f8ec72710d03aa8e",
+    "communication/relay/Cargo.toml": "7a6590357b82f291be8a408488b7f1072a513fe1b76dc4af4d770d3179477070",
+    "communication/protocol/Cargo.toml": "c2929525aa604e0c4ce05019723dd73f30ee4b01a07d2cf0f3f000033753293c",
+    "poc/Cargo.toml": "f1edbada62a2badd87ea26e472ed89193aee8d0d814df4ae22f853a14b2b3985"
+  },
+  "clippy": {
+    "command": "cargo clippy --manifest-path communication/Cargo.toml --workspace --all-targets --locked --offline",
+    "result": "completed_with_existing_warnings",
+    "strict_warnings": "not_clean"
+  },
+  "harness": {
+    "acceptance": {
+      "command": "python3 communication/harness/run.py acceptance --run-root /private/tmp/loki-relay-acceptance-review-20261010-a --ports 39401 39402 39403",
+      "report_path": "/private/tmp/loki-relay-acceptance-review-20261010-a/acceptance-report.json",
+      "report_sha256": "89733b25cff0c723144131586255aba0f0af5c2d269d313944edc379d2870672",
+      "result": "accepted",
+      "owned_lifecycle": "stopped",
+      "physical_power_loss_verified": false,
+      "checks": [
+        "same_pair",
+        "complete_objects",
+        "identical_ciphertext",
+        "distinct_recipient_ciphertext",
+        "offline_recipients",
+        "self_copy",
+        "both_acknowledgements",
+        "remote_restart"
+      ]
+    },
+    "faults": {
+      "command": "python3 communication/harness/run.py faults --run-root /private/tmp/loki-relay-faults-review-20261010-a --ports 39411 39412 39413",
+      "report_path": "/private/tmp/loki-relay-faults-review-20261010-a/fault-report.json",
+      "report_sha256": "a973617b1e3c3dca6fd71ef1b1d59ac49656d4e1169f61272c5a46b81b986617",
+      "result": "completed",
+      "owned_lifecycle": "stopped",
+      "physical_power_loss_verified": false,
+      "scenarios": {
+        "outage": "passed",
+        "quota": "passed",
+        "retained_restart": "passed",
+        "missing_chunk": "passed",
+        "forged_inner_sender": "passed",
+        "invalid_receipt": "passed",
+        "missing_download": "passed",
+        "append_rotation": "passed",
+        "offline_delivery": "passed",
+        "crash_recovery": "passed",
+        "binding": "passed",
+        "ordering_conflict": "passed",
+        "provisioning_retry": "passed",
+        "canonical_vectors": "passed",
+        "orphan_flood": "passed",
+        "sealed_config": "passed",
+        "capacity": "passed"
+      },
+      "coverage_rows_passed": 26,
+      "simulation_note": "Native test fixtures and real process scenarios are distinguished in the retained report; SQLite FULL/SIGKILL are not physical power loss."
+    }
+  },
+  "net_production_lines_removed": 133
+}

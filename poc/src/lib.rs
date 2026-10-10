@@ -24,6 +24,8 @@ pub mod member_state;
 mod nonce_binding;
 pub mod randomizer;
 pub mod refresh;
+#[cfg(feature = "relay-communication")]
+pub mod relay_member;
 pub mod rpc;
 pub mod scan;
 pub mod scanstate;

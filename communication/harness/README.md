@@ -1,0 +1,50 @@
+# test(harness): offline delivery and fault evidence
+
+`run.py` uses selected built binaries, explicit argv lists, separate member/relay roots, process handles and bounded deadlines. It creates only new owned roots and stops only its children. Ordinary exits retain data. Symlink components, occupied ports, foreign/replaced roots, mismatched run IDs and unowned process handles are refused. Closing an owner after that same handle successfully deleted its run is harmless; a missing or foreign root does not acquire that exception.
+
+The setup uses `loki_setup_member identity`, `fingerprint` and certified `run`, followed by member provisioning and six encrypted descriptor handoffs. Each member child receives its own root/passphrase and the public roster. The controller does not invoke address, backup, funding, scanning, signing, chain, Docker or wallet-server stages.
+
+## test(harness): commands
+
+On macOS `/tmp` is a symlink, so choose `/private/tmp` roots. Existing roots are retained; select another new path and free ports for another run. An explicit `CARGO_TARGET_DIR` is honored by both build workspaces and binary discovery. Default profile is `debug`; the harness does not build binaries.
+
+```sh
+python3 communication/harness/run.py acceptance --run-root /private/tmp/loki-relay-acceptance-new --ports 39101 39102 39103
+python3 communication/harness/run.py faults --run-root /private/tmp/loki-relay-faults-new --ports 39111 39112 39113
+python3 communication/harness/run.py faults --run-root /private/tmp/loki-relay-orphan-new --ports 39301 39302 39303 --scenario orphan_flood
+python3 communication/harness/run.py delete --run-root /private/tmp/SELECTED_RUN --expected-run-id RUN_ID_HEX32
+```
+
+`acceptance` exits zero only after all offline, self-copy, acknowledgement, complete replica and restart assertions pass. `faults` runs all seventeen scenarios by default, or the explicitly selected names. Each scenario has a 300-second bound and the full campaign a 1,200-second bound. Captured stdout/stderr are bounded to 65,536 bytes; stderr and failure bodies are excluded from public reports. Rust fixture summaries must show a successful exit, at least one executed passing case, and matching test names. Cargo's launcher name is preserved for rustup multicall installations.
+
+A selected subset leaves unrelated coverage rows `not_selected`. An inventory row passes only when every contributing scenario passes. Failure of any required observation prevents that row from passing. `completed` means all selected scenarios succeeded; consult all 26 inventory rows when assessing complete coverage.
+
+## test(harness): scenario evidence classes
+
+| Scenario | Observation and injection |
+| --- | --- |
+| `outage` | Stops the third owned relay before publication, then stops one acknowledged relay. Stored was established on the other two; Bob authenticates both messages from the surviving acknowledged replica. New automatic Received entries are allowed while every original remains exact. |
+| `quota` | The preferred two inboxes fill with the original and Bob's Received. They refuse a new message. The available third accepts its copies, but one complete replica leaves whole-vault Stored false. Retry attempts count failed schedules, so a successful first PUT can have zero attempts. Original/Received objects and reads remain intact. |
+| `retained_restart` | Owned production relay stop/restart preserves key, run, ciphertext, sequences and receipt digests. |
+| `append_rotation` | Real member rotation advances each append revision and the sealed reference without changing saved object/receipt identity. Exact retry and redistribution are also checked by `provisioning_retry`. |
+| `offline_delivery` | Built production binaries perform ordinary/chunked offline delivery, self reconciliation, Received return and relay restart. |
+| `missing_chunk` | Native complete-transfer, staged-authentication, partial-input/no-Received and same-pair union fixtures. Missing chunks/copies/manifests withhold completion. |
+| `forged_inner_sender` | Real `RelayStore` accepts and retries an HPKE object using a valid append capability. The recipient rejects the inner signature and preserves encrypted rejection evidence without an original or Received, including after reopen. Public hash, pin, run, length and counts are emitted. |
+| `invalid_receipt` | Scripted HTTP receipts exercise key/run/mailbox/hash/length/sequence/retention/signature binding and duplicate identity counting. |
+| `missing_download` | Scripted HTTP 404, malformed receipt, omitted sequence, durable task/cursor recovery, bounded samples and later valid progress. |
+| `crash_recovery` | Test-only preinsert/afterinsert rollback, simulated commit-error and lost reply, actual SQLite FULL, and actual SIGKILL before/after relay/client commit points. Outgoing and acknowledgement HTTP peers are signed fixtures. |
+| `binding` | Ciphertext/context/sender tamper, canonical framing, complete manifest/chunk validation and exact bounds. |
+| `ordering_conflict` | Reordered three-relay delivery, early Received, wrong target/session/digest/author and same-ID authenticated conflict preservation after reopen. |
+| `provisioning_retry` | Real relay revision fixtures and PoC sealed-state partial rotation/uncertain-response retries. |
+| `canonical_vectors` | Deterministic CBOR rejection, 64 KiB boundaries, the selected RFC suite's known-answer vectors and maximum 274-chunk transfer. |
+| `orphan_flood` | Reduced test budget reaches real staging admission: accepted encrypted orphan chunks and a pre-existing pending download survive refusal and reopen. The refused hash, cursor and counts are public. This is budget admission, not a claim of hardware disk exhaustion. |
+| `sealed_config` | Member CLI restart with missing referenced sealed configuration fails closed. |
+| `capacity` | Real relay-store quotas retain duplicate receipts, reads and accepted objects after reopen. |
+
+Native test-process scenarios set `simulation: true` to distinguish fixture execution from the production controller. The crash group explicitly labels its combination of real process kills, real engine FULL and simulated commit/response faults. `power_loss` is false throughout. Production CLIs expose no fault endpoint.
+
+## docs(harness): retained validation
+
+The real acceptance evidence is `/private/tmp/loki-relay-acceptance-20261010-a/acceptance-report.json`. It includes three public relay keys/run IDs, nine mailbox IDs, six descriptor digests, original/Received ciphertext hashes and receipt digests before/after restart. The final campaign is `/private/tmp/loki-relay-faults-20261010-c/fault-report.json`: all seventeen scenarios and all 26 coverage rows passed, with no failures or skipped rows. The [completed requirement audit](verification-2026-10-10.md) maps all 47 units and 26 rows to named evidence; its JSON companion records source/log/report hashes. The orphan supplement `/private/tmp/loki-relay-orphan-evidence-20261010/fault-report.json` records three accepted orphan chunks, one pending task, cursor four and the refused ciphertext hash. Earlier failed campaign roots remain retained as diagnostic evidence.
+
+No capabilities, passphrases, payloads or decrypted member secrets belong in public reports. Tests verify redaction and process ownership. Local key separation does not establish separate operators. SIGKILL and synchronous FULL do not establish physical power-loss durability. There are no browser, payment or chain claims.

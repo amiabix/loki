@@ -1,0 +1,49 @@
+{
+  "format": 1,
+  "unit": "2.6",
+  "baseline_artifact_sha256": "9bbf9cb3777433186b1546cc4eb4b08da26091be33e3746682e7dcd2cadc27f1",
+  "manifests": {
+    "communication/client/Cargo.toml": {
+      "baseline_sha256": "1000c13ad231232809ab44511f44efb2db46eb6806e48a127403f3e3f5189b1e",
+      "append": "\n[dev-dependencies]\nrand_core = \"=0.10.1\"\nserde_json = \"=1.0.151\"\n"
+    }
+  },
+  "locks": {
+    "communication/Cargo.lock": {
+      "baseline_graph_sha256": "ecdc37d1ed3273faf1bd4e2f8207ecd1f3ed7fde8476c8e884d056d877ffb25c",
+      "add_packages": [
+        {
+          "name": "serde_json",
+          "version": "1.0.151",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "checksum": "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14",
+          "dependencies": [
+            "itoa",
+            "memchr",
+            "serde",
+            "serde_core",
+            "zmij"
+          ]
+        },
+        {
+          "name": "zmij",
+          "version": "1.0.23",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "checksum": "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b",
+          "dependencies": []
+        }
+      ],
+      "add_edges": [
+        {
+          "name": "loki-relay-client",
+          "version": "0.1.0",
+          "source": "",
+          "dependencies": [
+            "rand_core 0.10.1",
+            "serde_json"
+          ]
+        }
+      ]
+    }
+  }
+}
