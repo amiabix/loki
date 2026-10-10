@@ -158,7 +158,10 @@ fn codec_rejects_tamper_trailing_version_and_bounds() {
     let encoded = package.encode().unwrap();
     let decoded = Carrier::decode(&encoded).unwrap();
     assert_eq!(decoded.envelope.as_slice(), package.envelope.as_slice());
-    assert_eq!(decoded.request_binding().unwrap(), package.request_binding().unwrap());
+    assert_eq!(
+        decoded.request_binding().unwrap(),
+        package.request_binding().unwrap()
+    );
     assert_ne!(
         package.request_binding().unwrap(),
         share.request_binding().unwrap()
@@ -400,7 +403,8 @@ fn retry_reuses_message_id_and_outer_objects_conflict_fails_closed() {
         payload: Payload::Test(b"different carrier body".to_vec()),
     };
     OsRng.try_fill_bytes(&mut body.key.message).unwrap();
-    let prepared = prepare_outbox(&conflict.member.identity, &conflict.member.roster, &body).unwrap();
+    let prepared =
+        prepare_outbox(&conflict.member.identity, &conflict.member.roster, &body).unwrap();
     conflict
         .db
         .commit_outbox(
@@ -483,15 +487,16 @@ fn publish_retries_saved_wire_without_a_mailbox_or_second_message() {
     let (root, pass, roster) = member_root(1);
     let mut courier = RelayCourier::open(&root, &pass, &roster).unwrap();
     assert!(courier.drive_once().is_err());
-    assert!(courier.receive(
-        &Identity::new(1),
-        &std::collections::BTreeMap::new(),
-        &context(),
-        MessageKind::Share,
-        2,
-    )
-    .unwrap()
-    .is_none());
+    assert!(courier
+        .receive(
+            &Identity::new(1),
+            &std::collections::BTreeMap::new(),
+            &context(),
+            MessageKind::Share,
+            2,
+        )
+        .unwrap()
+        .is_none());
     let sample = carrier(1, 2, MessageKind::Share, b"saved-share".to_vec());
     let route = EnvelopeRoute {
         context: &sample.context,
@@ -507,4 +512,71 @@ fn publish_retries_saved_wire_without_a_mailbox_or_second_message() {
     assert_eq!(courier.database().recover_logical(0, 100).unwrap().len(), 1);
     assert!(!root.join("mailbox").exists());
     assert!(!root.join("work").exists());
+}
+
+#[test]
+fn control_pipe_pages_a_snapshot_and_a_broken_export_keeps_publication() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::fd::IntoRawFd;
+    let (root, pass, roster) = member_root(1);
+    let mut courier = RelayCourier::open(&root, &pass, &roster).unwrap();
+    let (observe_read, observe_write) = std::io::pipe().unwrap();
+    let (control_read, mut control_write) = std::io::pipe().unwrap();
+    let (response_read, response_write) = std::io::pipe().unwrap();
+    courier
+        .attach_inherited(
+            observe_write.into_raw_fd(),
+            control_read.into_raw_fd(),
+            response_write.into_raw_fd(),
+        )
+        .unwrap();
+    let mut response = BufReader::new(response_read);
+    writeln!(
+        control_write,
+        r#"{{"version":1,"type":"snapshot_page","snapshot_id":"generation-1","section":"logical","after":"0","limit":10}}"#
+    )
+    .unwrap();
+    courier.service_export();
+    let mut line = String::new();
+    response.read_line(&mut line).unwrap();
+    let page: Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(page["version"], 1);
+    assert_eq!(page["section"], "logical");
+    assert_eq!(page["rows"].as_array().unwrap().len(), 0);
+    assert!(courier
+        .database()
+        .recover_logical(0, 10)
+        .unwrap()
+        .is_empty());
+
+    writeln!(
+        control_write,
+        r#"{{"version":1,"type":"sign","command":"approve"}}"#
+    )
+    .unwrap();
+    courier.service_export();
+    line.clear();
+    response.read_line(&mut line).unwrap();
+    let denied: Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(denied["error"], "request");
+    assert!(courier
+        .database()
+        .recover_logical(0, 10)
+        .unwrap()
+        .is_empty());
+
+    drop(observe_read);
+    courier.note_approved(&context(), 1, [3; 32]);
+    assert!(courier.take_events().unwrap().disabled());
+    let sample = carrier(1, 2, MessageKind::Share, b"saved-share".to_vec());
+    let route = EnvelopeRoute {
+        context: &sample.context,
+        author: 1,
+        recipient: 2,
+        kind: MessageKind::Share,
+    };
+    let published = courier.publish(&route, sample.envelope.as_slice()).unwrap();
+    let expected: [u8; 32] = blake3::hash(sample.envelope.as_slice()).into();
+    assert_eq!(published, expected);
+    assert_eq!(courier.database().recover_logical(0, 10).unwrap().len(), 1);
 }

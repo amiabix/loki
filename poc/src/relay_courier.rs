@@ -2,23 +2,24 @@
 //! The inner envelope stays sealed. Retry reuses the committed outer objects.
 
 use crate::{
-    relay_member::{open_session, routed, Session},
+    relay_member::{open_session, routed, snapshot_response, PublicEventWriter, Session},
     setup_transport::{Identity, PublicIdentity},
-    signing_session::{
-        EnvelopeRoute, MessageKind, OpenedMessage, SessionContext, SessionCourier,
-    },
+    signing_session::{EnvelopeRoute, MessageKind, OpenedMessage, SessionContext, SessionCourier},
 };
 use loki_relay_client::{
-    outbox_intent_digest, poll_once, prepare_outbox, reopen_committed, upload_pending, ClientError,
-    ClientStore, CommIdentity, RelayHttp, RelayRuntime, ThirdPass,
+    outbox_intent_digest, poll_once, poll_once_observed, prepare_outbox, reopen_committed,
+    upload_pending, upload_pending_observed, ClientError, ClientStore, CommIdentity, Observation,
+    ObservationKind, ObservationSink, RelayHttp, RelayRuntime, ThirdPass,
 };
 use loki_relay_protocol::types::{roster_digest, LogicalKey, MessageBody, Payload, Roster};
 use rand_core::{OsRng, RngCore};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
-    io::Cursor,
+    fs::{self, File},
+    io::{Cursor, Read, Write},
+    os::fd::{AsRawFd, FromRawFd},
     path::{Path, PathBuf},
+    sync::mpsc::Receiver,
     time::{SystemTime, UNIX_EPOCH},
 };
 use zeroize::Zeroizing;
@@ -270,6 +271,17 @@ pub struct RelayCourier {
     runtime: RelayRuntime,
     http: RelayHttp,
     accepted: BTreeSet<[u8; 32]>,
+    events: Option<PublicEventWriter>,
+    observe: Option<File>,
+    control: Option<File>,
+    response: Option<File>,
+    control_buf: Vec<u8>,
+    http_sink: ObservationSink,
+    journal_sink: Option<ObservationSink>,
+    http_events: Option<Receiver<Observation>>,
+    journal_events: Option<Receiver<Observation>>,
+    seen_http_drops: u64,
+    seen_journal_drops: u64,
 }
 
 impl RelayCourier {
@@ -283,6 +295,17 @@ impl RelayCourier {
             runtime,
             http,
             accepted: BTreeSet::new(),
+            events: None,
+            observe: None,
+            control: None,
+            response: None,
+            control_buf: Vec::new(),
+            http_sink: ObservationSink::disabled(),
+            journal_sink: None,
+            http_events: None,
+            journal_events: None,
+            seen_http_drops: 0,
+            seen_journal_drops: 0,
         };
         courier.load_accepted()?;
         Ok(courier)
@@ -290,6 +313,106 @@ impl RelayCourier {
 
     pub fn database(&self) -> &ClientStore {
         &self.session.db
+    }
+
+    pub fn set_events(&mut self, events: PublicEventWriter) {
+        self.install_sinks();
+        self.events = Some(events);
+    }
+
+    pub fn take_events(&mut self) -> Option<PublicEventWriter> {
+        self.events.take()
+    }
+
+    pub fn pop_events(&mut self) -> Vec<Vec<u8>> {
+        let mut lines = Vec::new();
+        if let Some(events) = &mut self.events {
+            while let Some(line) = events.pop_line() {
+                lines.push(line);
+            }
+        }
+        lines
+    }
+
+    /// Take the write end of the observation pipe and the read/write ends of the control pipes.
+    /// The descriptors are inherited from the controller and are not mixed into approval stdout.
+    pub fn attach_inherited(
+        &mut self,
+        observe: i32,
+        control: i32,
+        response: i32,
+    ) -> Result<(), String> {
+        if observe < 0 || control < 0 || response < 0 {
+            return Err("export_fd".into());
+        }
+        let observe = unsafe { File::from_raw_fd(observe) };
+        let control = unsafe { File::from_raw_fd(control) };
+        set_nonblocking(&control);
+        let response = unsafe { File::from_raw_fd(response) };
+        let id = self.session.member.identity.public().id;
+        let writer = PublicEventWriter::new(&export_run_id(&self.session), &format!("member-{id}"))
+            .map_err(|_| "export_fd".to_string())?;
+        self.set_events(writer);
+        self.observe = Some(observe);
+        self.control = Some(control);
+        self.response = Some(response);
+        Ok(())
+    }
+
+    pub fn note_application(&mut self, accepted: bool, message: &OpenedMessage) {
+        let event = if accepted {
+            "application_accepted"
+        } else {
+            "application_rejected"
+        };
+        self.emit_signing(
+            event,
+            message.sender(),
+            Some(message.recipient()),
+            message.kind(),
+            message.wire_hash(),
+            message.context(),
+        );
+        self.service_export();
+    }
+
+    pub fn note_approved(
+        &mut self,
+        context: &SessionContext,
+        member: u16,
+        envelope_hash: [u8; 32],
+    ) {
+        self.emit_signing(
+            "approved",
+            member,
+            None,
+            MessageKind::Share,
+            envelope_hash,
+            context,
+        );
+        self.service_export();
+    }
+
+    /// Read one snapshot request, if the control pipe has a line, and flush queued public events.
+    /// A broken pipe disables export and leaves the transport result unchanged.
+    pub fn service_export(&mut self) {
+        self.drain_observations();
+        if self.events.as_ref().is_some_and(|events| events.disabled()) {
+            self.persist_gap();
+            return;
+        }
+        let request = self.take_control_request();
+        if let Some(request) = request {
+            let response = match snapshot_response(&self.session, request.trim()) {
+                Ok(page) => page,
+                Err(_) => "{\"version\":1,\"error\":\"request\"}".to_string(),
+            };
+            if self.write_response(&response).is_err() {
+                self.disable_export();
+            }
+        }
+        self.flush_observe();
+        self.persist_gap();
     }
 
     fn load_accepted(&mut self) -> Result<(), String> {
@@ -353,6 +476,27 @@ impl SessionCourier for RelayCourier {
         kind: MessageKind,
         sender: u16,
     ) -> Result<Option<OpenedMessage>, String> {
+        let opened = self.receive_authenticated(own, roster, context, kind, sender);
+        self.service_export();
+        opened
+    }
+
+    fn drive_once(&mut self) -> Result<(), String> {
+        let pumped = self.pump_transport();
+        self.service_export();
+        pumped
+    }
+}
+
+impl RelayCourier {
+    fn receive_authenticated(
+        &mut self,
+        own: &Identity,
+        roster: &BTreeMap<u16, PublicIdentity>,
+        context: &SessionContext,
+        kind: MessageKind,
+        sender: u16,
+    ) -> Result<Option<OpenedMessage>, String> {
         let mut after = 0u64;
         loop {
             let page = self
@@ -408,6 +552,14 @@ impl SessionCourier for RelayCourier {
                     continue;
                 }
                 self.remember(carrier.envelope_hash)?;
+                self.emit_signing(
+                    "session_envelope_authenticated",
+                    carrier.author,
+                    Some(carrier.recipient),
+                    kind,
+                    carrier.envelope_hash,
+                    context,
+                );
                 return Ok(Some(message));
             }
             if page.len() < 100 {
@@ -416,12 +568,13 @@ impl SessionCourier for RelayCourier {
         }
     }
 
-    fn drive_once(&mut self) -> Result<(), String> {
+    fn pump_transport(&mut self) -> Result<(), String> {
         let (config, self_route) = routed(&self.session).map_err(map_session)?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| "carrier_clock")?
             .as_millis() as u64;
+        let journal = self.journal_sink.clone();
         let RelayCourier {
             session,
             runtime,
@@ -437,38 +590,237 @@ impl SessionCourier for RelayCourier {
                 }
                 let next = page.last().map(|row| row.cursor).unwrap_or(after);
                 for logical in &page {
-                    upload_pending(
-                        &mut session.db,
-                        http,
-                        logical,
-                        &session.member.roster,
-                        &session.member.identity,
-                        &config,
-                        &self_route,
-                        now,
-                        ThirdPass::StopAfterStored,
-                    )
-                    .await
-                    .map_err(map_client)?;
+                    if let Some(observer) = &journal {
+                        upload_pending_observed(
+                            &mut session.db,
+                            http,
+                            logical,
+                            &session.member.roster,
+                            &session.member.identity,
+                            &config,
+                            &self_route,
+                            now,
+                            ThirdPass::StopAfterStored,
+                            observer,
+                        )
+                        .await
+                        .map_err(map_client)?;
+                    } else {
+                        upload_pending(
+                            &mut session.db,
+                            http,
+                            logical,
+                            &session.member.roster,
+                            &session.member.identity,
+                            &config,
+                            &self_route,
+                            now,
+                            ThirdPass::StopAfterStored,
+                        )
+                        .await
+                        .map_err(map_client)?;
+                    }
                 }
                 if page.len() < 100 || next <= after {
                     break;
                 }
                 after = next;
             }
-            poll_once(
-                &mut session.db,
-                http,
-                &session.member.identity,
-                &session.member.roster,
-                &config,
-                &self_route,
-                now,
-            )
-            .await
-            .map_err(map_client)?;
+            if let Some(observer) = &journal {
+                poll_once_observed(
+                    &mut session.db,
+                    http,
+                    &session.member.identity,
+                    &session.member.roster,
+                    &config,
+                    &self_route,
+                    now,
+                    observer,
+                )
+                .await
+                .map_err(map_client)?;
+            } else {
+                poll_once(
+                    &mut session.db,
+                    http,
+                    &session.member.identity,
+                    &session.member.roster,
+                    &config,
+                    &self_route,
+                    now,
+                )
+                .await
+                .map_err(map_client)?;
+            }
             Ok(())
         })
+    }
+
+    fn install_sinks(&mut self) {
+        let (http_sink, http_events) = ObservationSink::bounded(1024);
+        let (journal_sink, journal_events) = ObservationSink::bounded(1024);
+        if let Ok(http) = RelayHttp::with_observer(http_sink.clone()) {
+            self.http = http;
+            self.http_sink = http_sink;
+            self.journal_sink = Some(journal_sink);
+            self.http_events = Some(http_events);
+            self.journal_events = Some(journal_events);
+            self.seen_http_drops = 0;
+            self.seen_journal_drops = 0;
+        }
+    }
+
+    fn emit_signing(
+        &mut self,
+        event_type: &str,
+        sender: u16,
+        recipient: Option<u16>,
+        kind: MessageKind,
+        envelope_hash: [u8; 32],
+        context: &SessionContext,
+    ) {
+        let Some(events) = &mut self.events else {
+            return;
+        };
+        let mut fields = serde_json::json!({
+            "authenticated_sender": sender,
+            "kind": kind as u8,
+            "envelope_hash": hex::encode(envelope_hash),
+            "vault_id": hex::encode(context.vault),
+            "payment_id": hex::encode(context.payment),
+            "attempt_id": hex::encode(context.attempt.0),
+        });
+        if let Some(recipient) = recipient {
+            fields["recipient_member"] = serde_json::json!(recipient);
+        }
+        let _ = events.emit(event_type, fields);
+    }
+
+    fn drain_observations(&mut self) {
+        let mut batch = Vec::new();
+        if let Some(events) = &self.http_events {
+            while let Ok(event) = events.try_recv() {
+                batch.push(event);
+            }
+        }
+        if let Some(events) = &self.journal_events {
+            while let Ok(event) = events.try_recv() {
+                batch.push(event);
+            }
+        }
+        let http_drops = self
+            .http_sink
+            .dropped()
+            .saturating_sub(self.seen_http_drops);
+        self.seen_http_drops = self.http_sink.dropped();
+        let journal_now = self
+            .journal_sink
+            .as_ref()
+            .map(ObservationSink::dropped)
+            .unwrap_or(0);
+        let journal_drops = journal_now.saturating_sub(self.seen_journal_drops);
+        self.seen_journal_drops = journal_now;
+        if let Some(events) = &mut self.events {
+            events.note_gap(http_drops.saturating_add(journal_drops));
+            for event in &batch {
+                let _ = events.emit(public_kind(event.kind), public_fields(event));
+            }
+        }
+    }
+
+    fn take_control_request(&mut self) -> Option<String> {
+        loop {
+            if self.control_buf.iter().any(|byte| *byte == b'\n') {
+                break;
+            }
+            let mut tmp = [0u8; 1024];
+            let read = {
+                let control = self.control.as_mut()?;
+                control.read(&mut tmp)
+            };
+            match read {
+                Ok(0) => {
+                    self.disable_export();
+                    return None;
+                }
+                Ok(n) => {
+                    self.control_buf.extend_from_slice(&tmp[..n]);
+                    if self.control_buf.len() > 16 * 1024 {
+                        self.disable_export();
+                        return None;
+                    }
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.kind() == std::io::ErrorKind::Interrupted =>
+                {
+                    return None;
+                }
+                Err(_) => {
+                    self.disable_export();
+                    return None;
+                }
+            }
+        }
+        let pos = self.control_buf.iter().position(|byte| *byte == b'\n')?;
+        let line: Vec<u8> = self.control_buf.drain(..=pos).collect();
+        String::from_utf8(line).ok()
+    }
+
+    fn write_response(&mut self, response: &str) -> std::io::Result<()> {
+        let Some(response_pipe) = &mut self.response else {
+            return Ok(());
+        };
+        response_pipe.write_all(response.as_bytes())?;
+        response_pipe.write_all(b"\n")?;
+        response_pipe.flush()
+    }
+
+    fn flush_observe(&mut self) {
+        if self.observe.is_none() {
+            return;
+        }
+        let mut output = self.observe.take();
+        let failed = match (&mut self.events, output.as_mut()) {
+            (Some(events), Some(output)) => events.write_queued(output).is_err(),
+            _ => false,
+        };
+        if failed {
+            if let Some(events) = &mut self.events {
+                events.disable();
+            }
+            return;
+        }
+        self.observe = output;
+    }
+
+    fn disable_export(&mut self) {
+        if let Some(events) = &mut self.events {
+            events.disable();
+        }
+        self.observe = None;
+        self.control = None;
+        self.response = None;
+    }
+
+    fn persist_gap(&self) {
+        let Some(events) = &self.events else {
+            return;
+        };
+        let count = events.dropped();
+        if count == 0 {
+            return;
+        }
+        let path = self
+            .session
+            .configs
+            .directory()
+            .join("transport")
+            .join("observation-gap");
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(path, count.to_string());
     }
 }
 
@@ -570,6 +922,108 @@ impl RelayCourier {
             after = next;
         }
         Ok(seen)
+    }
+}
+
+fn export_run_id(session: &Session) -> String {
+    match routed(session) {
+        Ok((config, _)) => config
+            .own
+            .first()
+            .map(|inbox| hex::encode(inbox.route.pin.run))
+            .filter(|value| (1..=64).contains(&value.len()))
+            .unwrap_or_else(|| "pending".into()),
+        Err(_) => "pending".into(),
+    }
+}
+
+fn public_kind(kind: ObservationKind) -> &'static str {
+    match kind {
+        ObservationKind::RequestStart => "request_start",
+        ObservationKind::RequestEnd => "request_end",
+        ObservationKind::ReceiptValidated => "receipt_validated",
+        ObservationKind::ReceiptPersisted => "receipt_persisted",
+        ObservationKind::ReceiptRejected => "receipt_rejected",
+        ObservationKind::OriginalAuthenticated => "original_authenticated",
+        ObservationKind::OriginalCommitted => "original_committed",
+        ObservationKind::ReceivedLinked => "received_linked",
+        ObservationKind::RetryDue => "retry_due",
+        ObservationKind::RouteFailure => "route_failure",
+        ObservationKind::Quarantine => "quarantine",
+    }
+}
+
+fn public_fields(event: &Observation) -> serde_json::Value {
+    let mut fields = serde_json::Map::new();
+    if let Some(actor) = event.actor {
+        fields.insert("actor_member".into(), serde_json::json!(actor));
+    }
+    if let Some(sender) = event.sender {
+        fields.insert("authenticated_sender".into(), serde_json::json!(sender));
+    }
+    if let Some(recipient) = event.recipient {
+        fields.insert("recipient_member".into(), serde_json::json!(recipient));
+    }
+    if let Some(pin) = event.pin {
+        fields.insert("relay_pin".into(), serde_json::json!(hex::encode(pin)));
+    }
+    if let Some(run) = event.run {
+        fields.insert("relay_run".into(), serde_json::json!(hex::encode(run)));
+    }
+    if let Some(mailbox) = event.mailbox {
+        fields.insert("mailbox_id".into(), serde_json::json!(hex::encode(mailbox)));
+    }
+    if let Some(message) = event.logical_message {
+        fields.insert("message_id".into(), serde_json::json!(hex::encode(message)));
+    }
+    if let Some(digest) = event.digest {
+        fields.insert(
+            "message_digest".into(),
+            serde_json::json!(hex::encode(digest)),
+        );
+    }
+    if let Some(hash) = event.object_hash {
+        fields.insert("object_hash".into(), serde_json::json!(hex::encode(hash)));
+    }
+    if let Some(ordinal) = event.ordinal {
+        fields.insert("object_ordinal".into(), serde_json::json!(ordinal));
+    }
+    if let Some(bytes) = event.bytes {
+        fields.insert("wire_bytes".into(), serde_json::json!(bytes));
+    }
+    if event.request != 0 {
+        fields.insert("request_id".into(), serde_json::json!(event.request));
+    }
+    if let Some(status) = event.status {
+        fields.insert("http_status".into(), serde_json::json!(status));
+    }
+    if let Some(duration) = event.duration {
+        fields.insert(
+            "duration_ms".into(),
+            serde_json::json!(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
+        );
+    }
+    if let Some(result) = event.result {
+        fields.insert("result_code".into(), serde_json::json!(result));
+    }
+    serde_json::Value::Object(fields)
+}
+
+fn set_nonblocking(file: &File) {
+    extern "C" {
+        fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+    }
+    const F_GETFL: i32 = 3;
+    const F_SETFL: i32 = 4;
+    #[cfg(target_os = "linux")]
+    const O_NONBLOCK: i32 = 0o4000;
+    #[cfg(not(target_os = "linux"))]
+    const O_NONBLOCK: i32 = 0x4;
+    unsafe {
+        let flags = fcntl(file.as_raw_fd(), F_GETFL, 0);
+        if flags >= 0 {
+            let _ = fcntl(file.as_raw_fd(), F_SETFL, flags | O_NONBLOCK);
+        }
     }
 }
 

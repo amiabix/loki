@@ -2,14 +2,13 @@
 //! Secret bytes stay in sealed files and are never written to stdout or stderr.
 
 use loki_poc::relay_member::{
-    CourierImport, MemberError, ProvisionTarget, Session, SessionError,
+    public_snapshot_page, CourierImport, MemberError, ProvisionTarget, Session, SessionError,
 };
 use loki_relay_client::{
-    committed_readiness, outbox_intent_digest, poll_once, prepare_outbox,
-    received_status, upload_pending, AuthenticatedDescriptor, CandidateReadiness, ClientConfig,
-    ClientError, ClientStore, DiagnosticSample, DownloadRejection, PendingDownload,
-    RecoveryLogical, RecoveryUpload, RelayHttp, RelayRuntime, RouteCursor, Secret32,
-    SourceRejection, ThirdPass,
+    committed_readiness, outbox_intent_digest, poll_once, prepare_outbox, received_status,
+    upload_pending, AuthenticatedDescriptor, CandidateReadiness, ClientConfig, ClientError,
+    ClientStore, DiagnosticSample, DownloadRejection, PendingDownload, RecoveryLogical,
+    RecoveryUpload, RelayHttp, RelayRuntime, RouteCursor, Secret32, SourceRejection, ThirdPass,
 };
 use loki_relay_protocol::types::{
     roster_digest, Id32, LogicalKey, MessageBody, Payload, RelayPin, RelayRoute,
@@ -180,6 +179,39 @@ fn run() -> Result<(), Exit> {
             }
             let (root, pass, roster) = common()?;
             poll(&root, &pass, &roster)
+        }
+        "snapshot-page" => {
+            expect(&[
+                "--member-root",
+                "--passphrase-file",
+                "--roster",
+                "--snapshot-id",
+                "--section",
+                "--after",
+                "--limit",
+            ])?;
+            let (root, pass, roster) = common()?;
+            let text = |name: &str| -> Result<String, Exit> {
+                flags
+                    .iter()
+                    .find(|(flag, _)| flag == name)
+                    .and_then(|(_, value)| value.as_ref())
+                    .and_then(|value| value.to_str().map(str::to_string))
+                    .ok_or(Exit::Usage)
+            };
+            let limit: u16 = text("--limit")?.parse().map_err(|_| Exit::Usage)?;
+            if !(1..=100).contains(&limit) {
+                return Err(Exit::Usage);
+            }
+            snapshot_page(
+                &root,
+                &pass,
+                &roster,
+                &text("--snapshot-id")?,
+                &text("--section")?,
+                &text("--after")?,
+                limit,
+            )
         }
         "status" => {
             expect(&[
@@ -396,6 +428,22 @@ fn upload(root: &Path, pass: &Path, roster: &Path) -> Result<(), Exit> {
         }
         Ok(())
     })
+}
+
+fn snapshot_page(
+    root: &Path,
+    pass: &Path,
+    roster: &Path,
+    snapshot_id: &str,
+    section: &str,
+    after: &str,
+    limit: u16,
+) -> Result<(), Exit> {
+    let session = open_session(root, pass, roster)?;
+    let page =
+        public_snapshot_page(&session, snapshot_id, section, after, limit).map_err(session_exit)?;
+    println!("{}", serde_json::to_string(&page).map_err(|_| Exit::Usage)?);
+    Ok(())
 }
 
 fn poll(root: &Path, pass: &Path, roster: &Path) -> Result<(), Exit> {

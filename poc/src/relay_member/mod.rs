@@ -339,7 +339,11 @@ pub fn load(root: &Path, pass_file: &Path, roster_path: &Path) -> MemberResult<L
 
 pub mod config;
 pub mod exchange;
+pub mod observation;
 pub mod session;
-pub use session::{open_session, routed, Session, SessionError};
+pub mod snapshot;
 pub use config::{ConfigStore, LocalConfig, PendingRequest, ProvisionTarget};
 pub use exchange::{CourierFile, CourierImport};
+pub use observation::PublicEventWriter;
+pub use session::{open_session, routed, Session, SessionError};
+pub use snapshot::{public_snapshot_page, snapshot_response};

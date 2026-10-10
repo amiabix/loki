@@ -6,7 +6,8 @@ use std::{
     env, fs,
     io::{self, Write},
     path::{Path, PathBuf},
-    process, sync::mpsc,
+    process,
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -62,10 +63,21 @@ enum TransportMode {
     Relay,
 }
 
-fn split_transport(args: &[String]) -> Result<(Vec<String>, TransportMode), String> {
+struct ExportFds {
+    observe: i32,
+    control: i32,
+    response: i32,
+}
+
+fn split_transport(
+    args: &[String],
+) -> Result<(Vec<String>, TransportMode, Option<ExportFds>), String> {
     let mut positional = Vec::new();
     let mut mode = TransportMode::File;
     let mut seen = false;
+    let mut observe = None;
+    let mut control = None;
+    let mut response = None;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         if arg == "--transport" {
@@ -79,13 +91,42 @@ fn split_transport(args: &[String]) -> Result<(Vec<String>, TransportMode), Stri
                 "relay" => TransportMode::Relay,
                 _ => return Err("transport must be file or relay".into()),
             };
+        } else if matches!(
+            arg.as_str(),
+            "--observe-fd" | "--control-fd" | "--response-fd"
+        ) {
+            let value = args.next().ok_or("missing export descriptor")?;
+            let fd: i32 = value
+                .parse()
+                .map_err(|_| "export descriptor must be an integer")?;
+            if fd < 0 {
+                return Err("export descriptor must be an integer".into());
+            }
+            let slot = match arg.as_str() {
+                "--observe-fd" => &mut observe,
+                "--control-fd" => &mut control,
+                _ => &mut response,
+            };
+            if slot.is_some() {
+                return Err("export descriptor selected more than once".into());
+            }
+            *slot = Some(fd);
         } else if arg.starts_with("--") {
             return Err(format!("unknown option {arg}"));
         } else {
             positional.push(arg.clone());
         }
     }
-    Ok((positional, mode))
+    let export = match (observe, control, response) {
+        (None, None, None) => None,
+        (Some(observe), Some(control), Some(response)) => Some(ExportFds {
+            observe,
+            control,
+            response,
+        }),
+        _ => return Err("export descriptors must include observe, control, and response".into()),
+    };
+    Ok((positional, mode, export))
 }
 
 fn wait_limit(mode: TransportMode) -> Duration {
@@ -134,17 +175,41 @@ impl SessionCourier for OwnedCourier {
     }
 }
 
+impl OwnedCourier {
+    fn note_application(&mut self, accepted: bool, message: &OpenedMessage) {
+        #[cfg(feature = "relay-communication")]
+        if let Self::Relay(courier) = self {
+            courier.note_application(accepted, message);
+            return;
+        }
+        let _ = (accepted, message);
+    }
+
+    fn note_approved(&mut self, context: &SessionContext, member: u16, envelope_hash: [u8; 32]) {
+        #[cfg(feature = "relay-communication")]
+        if let Self::Relay(courier) = self {
+            courier.note_approved(context, member, envelope_hash);
+            return;
+        }
+        let _ = (context, member, envelope_hash);
+    }
+}
+
 fn open_courier(
     mode: TransportMode,
     member: &Path,
     pass_file: &Path,
     roster: &Path,
     work: &Path,
+    export: Option<ExportFds>,
 ) -> Result<OwnedCourier, String> {
     match mode {
-        TransportMode::File => Ok(OwnedCourier::File(
-            Mailbox::new(&work.join("mailbox")).map_err(|error| error.to_string())?,
-        )),
+        TransportMode::File => {
+            let _ = export;
+            Ok(OwnedCourier::File(
+                Mailbox::new(&work.join("mailbox")).map_err(|error| error.to_string())?,
+            ))
+        }
         TransportMode::Relay => {
             if work.join("mailbox").exists() {
                 return Err("relay mode refuses an existing file mailbox".into());
@@ -155,12 +220,16 @@ fn open_courier(
                     8 * 1024 * 1024 + 53,
                     loki_poc::relay_courier::demo_quotas(),
                 )?;
-                return loki_poc::relay_courier::RelayCourier::open(member, pass_file, roster)
-                    .map(OwnedCourier::Relay);
+                let mut courier =
+                    loki_poc::relay_courier::RelayCourier::open(member, pass_file, roster)?;
+                if let Some(export) = export {
+                    courier.attach_inherited(export.observe, export.control, export.response)?;
+                }
+                return Ok(OwnedCourier::Relay(courier));
             }
             #[cfg(not(feature = "relay-communication"))]
             {
-                let _ = (member, pass_file, roster);
+                let _ = (member, pass_file, roster, export);
                 Err("relay transport requires the relay-communication feature".into())
             }
         }
@@ -549,9 +618,12 @@ fn confirm(
 }
 
 fn sign(args: &[String]) -> Result<(), String> {
-    let (args, mode) = split_transport(args)?;
+    let (args, mode, export) = split_transport(args)?;
     if args.len() != 4 {
-        return Err("sign <member-dir> <passphrase-file> <roster.json> <work-dir> [--transport file|relay]".into());
+        return Err(
+            "sign <member-dir> <passphrase-file> <roster.json> <work-dir> [--transport file|relay]"
+                .into(),
+        );
     }
     let (member, owner, pass) = state(&args)?;
     let own = member.identity.public().id;
@@ -567,7 +639,14 @@ fn sign(args: &[String]) -> Result<(), String> {
     if context.vault != member.vault {
         return Err("manifest names another vault".into());
     }
-    let mut courier = open_courier(mode, &owner, Path::new(&args[1]), Path::new(&args[2]), &work)?;
+    let mut courier = open_courier(
+        mode,
+        &owner,
+        Path::new(&args[1]),
+        Path::new(&args[2]),
+        &work,
+        export,
+    )?;
     let session_identity =
         loki_poc::setup_transport::Identity::from_secret_bytes(&member.identity.to_secret_bytes())?;
     let mut session = SigningSession::begin(
@@ -592,7 +671,16 @@ fn sign(args: &[String]) -> Result<(), String> {
         wait_limit(mode),
     )?;
     let peer_commitments =
-        commitments_from_message(&context, &commitment, intent.input_nullifiers.len())?;
+        match commitments_from_message(&context, &commitment, intent.input_nullifiers.len()) {
+            Ok(parsed) => {
+                courier.note_application(true, &commitment);
+                parsed
+            }
+            Err(error) => {
+                courier.note_application(false, &commitment);
+                return Err(error);
+            }
+        };
     let package_message = if own == 1 {
         let payload = candidate(&member, &intent, &session, peer_commitments)?;
         session.publish_package_to_roster_with_courier(
@@ -617,9 +705,20 @@ fn sign(args: &[String]) -> Result<(), String> {
             wait_limit(mode),
         )?
     };
-    let reviewed = session.review_package(&package_message, &peer)?;
+    let reviewed = match session.review_package(&package_message, &peer) {
+        Ok(reviewed) => {
+            courier.note_application(true, &package_message);
+            reviewed
+        }
+        Err(error) => {
+            courier.note_application(false, &package_message);
+            return Err(error);
+        }
+    };
     confirm(&intent, reviewed.summary(), &mut courier, &work)?;
-    session.publish_approved_with_courier(reviewed, &peer, &finisher, &mut courier, &pass)?;
+    let released =
+        session.publish_approved_with_courier(reviewed, &peer, &finisher, &mut courier, &pass)?;
+    courier.note_approved(&context, own, released);
     println!(
         "approved payment {} as member {}",
         hex::encode(context.payment),
@@ -630,7 +729,7 @@ fn sign(args: &[String]) -> Result<(), String> {
 }
 
 fn resend(args: &[String]) -> Result<(), String> {
-    let (args, mode) = split_transport(args)?;
+    let (args, mode, export) = split_transport(args)?;
     if args.len() != 4 {
         return Err("resend <member-dir> <passphrase-file> <roster.json> <work-dir> [--transport file|relay]".into());
     }
@@ -645,7 +744,14 @@ fn resend(args: &[String]) -> Result<(), String> {
     if context.vault != member.vault {
         return Err("manifest names another vault".into());
     }
-    let mut courier = open_courier(mode, &owner, Path::new(&args[1]), Path::new(&args[2]), &work)?;
+    let mut courier = open_courier(
+        mode,
+        &owner,
+        Path::new(&args[1]),
+        Path::new(&args[2]),
+        &work,
+        export,
+    )?;
     let root = owner.join("signing");
     if own == 1 {
         SigningSession::republish_saved_package(
@@ -724,7 +830,7 @@ fn prove(
 }
 
 fn finish(args: &[String]) -> Result<(), String> {
-    let (args, mode) = split_transport(args)?;
+    let (args, mode, export) = split_transport(args)?;
     if args.len() != 4 {
         return Err("finish <member-dir> <passphrase-file> <roster.json> <work-dir> [--transport file|relay]".into());
     }
@@ -738,7 +844,14 @@ fn finish(args: &[String]) -> Result<(), String> {
     if context.vault != member.vault {
         return Err("manifest names another vault".into());
     }
-    let mut courier = open_courier(mode, &owner, Path::new(&args[1]), Path::new(&args[2]), &work)?;
+    let mut courier = open_courier(
+        mode,
+        &owner,
+        Path::new(&args[1]),
+        Path::new(&args[2]),
+        &work,
+        export,
+    )?;
     let limit = wait_limit(mode);
     let package = wait_message(
         &mut courier,
@@ -749,7 +862,13 @@ fn finish(args: &[String]) -> Result<(), String> {
         &work,
         limit,
     )?;
-    let payload = PackagePayload::decode(&context, package.body())?;
+    let payload = match PackagePayload::decode(&context, package.body()) {
+        Ok(payload) => payload,
+        Err(error) => {
+            courier.note_application(false, &package);
+            return Err(error);
+        }
+    };
     let alice_share = wait_message(
         &mut courier,
         &member,
@@ -768,15 +887,28 @@ fn finish(args: &[String]) -> Result<(), String> {
         &work,
         limit,
     )?;
-    let (signed, sighash, indices) = aggregate_and_apply(
+    let (signed, sighash, indices) = match aggregate_and_apply(
         &context,
         &intent,
         &member.vault,
         &member.public,
         &member.fvk,
         &payload,
-        &[alice_share, bob_share],
-    )?;
+        &[alice_share.clone(), bob_share.clone()],
+    ) {
+        Ok(applied) => {
+            courier.note_application(true, &package);
+            courier.note_application(true, &alice_share);
+            courier.note_application(true, &bob_share);
+            applied
+        }
+        Err(error) => {
+            courier.note_application(false, &package);
+            courier.note_application(false, &alice_share);
+            courier.note_application(false, &bob_share);
+            return Err(error);
+        }
+    };
     let rpc = Rpc::regtest();
     let chain = scan::scan_chain(&rpc, &member.fvk)?;
     let positions = indices
@@ -836,7 +968,7 @@ fn finalized_sighash(tx: &zcash_primitives::transaction::Transaction) -> Result<
 }
 
 fn verify(args: &[String]) -> Result<(), String> {
-    let (args, mode) = split_transport(args)?;
+    let (args, mode, export) = split_transport(args)?;
     if args.len() != 5 {
         return Err("verify <member-dir> <passphrase-file> <roster.json> <work-dir> <txid> [--transport file|relay]".into());
     }
@@ -872,7 +1004,14 @@ fn verify(args: &[String]) -> Result<(), String> {
     if tx.txid().to_string() != *txid {
         return Err("mined transaction ID mismatch".into());
     }
-    let mut courier = open_courier(mode, &owner, Path::new(&args[1]), Path::new(&args[2]), &work)?;
+    let mut courier = open_courier(
+        mode,
+        &owner,
+        Path::new(&args[1]),
+        Path::new(&args[2]),
+        &work,
+        export,
+    )?;
     let package_message = wait_message(
         &mut courier,
         &member,
@@ -984,7 +1123,8 @@ fn verify(args: &[String]) -> Result<(), String> {
 }
 
 fn receive(args: &[String]) -> Result<(), String> {
-    let (args, mode) = split_transport(args)?;
+    let (args, mode, export) = split_transport(args)?;
+    let _ = export;
     if args.len() != 5 {
         return Err("receive <recipient-member-dir> <passphrase-file> <roster.json> <payment-work-dir> <txid> [--transport file|relay]".into());
     }

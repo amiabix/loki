@@ -65,6 +65,18 @@ fn relay_flag_is_explicit_and_does_not_create_a_mailbox() {
     let positional = Command::new(pay).args(["sign"]).output().unwrap();
     let error = String::from_utf8(positional.stderr).unwrap();
     assert!(error.contains("sign <member-dir>"), "{error}");
+    let missing_fd = Command::new(pay)
+        .args(["sign", "--observe-fd"])
+        .output()
+        .unwrap();
+    let error = String::from_utf8(missing_fd.stderr).unwrap();
+    assert!(error.contains("missing export descriptor"), "{error}");
+    let partial = Command::new(pay)
+        .args(["sign", "--observe-fd", "1", "--control-fd", "2"])
+        .output()
+        .unwrap();
+    let error = String::from_utf8(partial.stderr).unwrap();
+    assert!(error.contains("export descriptors must include"), "{error}");
     let _ = fs::remove_dir_all(&root);
     let _ = PathBuf::from(pay);
 }
@@ -198,8 +210,7 @@ fn server_bin() -> PathBuf {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../communication/target/debug/loki-relay-server");
     if !path.is_file() {
-        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../communication/Cargo.toml");
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../communication/Cargo.toml");
         let status = Command::new("cargo")
             .args([
                 "build",
@@ -423,7 +434,11 @@ fn start_loopback(mailbox_bytes: u64, total_bytes: u64) -> Loopback {
                 let path = directory.join(name);
                 for entry in fs::read_dir(&directory).unwrap() {
                     let entry = entry.unwrap();
-                    if entry.file_name().to_string_lossy().starts_with(&format!(".{name}.")) {
+                    if entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(&format!(".{name}."))
+                    {
                         fs::remove_file(entry.path()).unwrap();
                     }
                 }
@@ -512,7 +527,12 @@ fn three_loopback_relays_deliver_a_saved_carrier_and_refuse_over_quota() {
     let carol_key = Identity::new(3);
     let context = signing_context();
     let wire = alice_key
-        .seal_session(&bob_key.public(), &context, MessageKind::Share, b"saved-share")
+        .seal_session(
+            &bob_key.public(),
+            &context,
+            MessageKind::Share,
+            b"saved-share",
+        )
         .unwrap();
     let roster = BTreeMap::from([
         (1, alice_key.public()),
@@ -535,10 +555,12 @@ fn three_loopback_relays_deliver_a_saved_carrier_and_refuse_over_quota() {
     drop(alice);
 
     let mut bob = RelayCourier::open(&live.members[1], &live.passes[1], &live.roster).unwrap();
+    bob.set_events(loki_poc::relay_member::PublicEventWriter::new("loopback", "member-2").unwrap());
     let mut alice = RelayCourier::open(&live.members[0], &live.passes[0], &live.roster).unwrap();
     let mut carol = RelayCourier::open(&live.members[2], &live.passes[2], &live.roster).unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut opened = None;
+    let mut observed = Vec::new();
     while Instant::now() < deadline && opened.is_none() {
         alice.drive_once().expect("author pump");
         bob.drive_once().expect("recipient pump");
@@ -548,11 +570,54 @@ fn three_loopback_relays_deliver_a_saved_carrier_and_refuse_over_quota() {
         {
             opened = Some(message);
         }
+        observed.extend(bob.pop_events());
         thread::sleep(Duration::from_millis(40));
     }
     let opened = opened.expect("bob did not open the relay carrier");
+    observed.extend(bob.pop_events());
     assert_eq!(opened.recipient(), 2);
     assert_eq!(opened.body(), b"saved-share");
+    let authenticated = observed
+        .iter()
+        .find_map(|line| {
+            let value: Value = serde_json::from_slice(line).ok()?;
+            (value.get("event_type")?.as_str() == Some("session_envelope_authenticated"))
+                .then_some(value)
+        })
+        .expect("inner open did not emit session_envelope_authenticated");
+    assert_eq!(authenticated["authenticated_sender"], 1);
+    assert_eq!(authenticated["recipient_member"], 2);
+    assert_eq!(
+        authenticated["kind"],
+        serde_json::json!(MessageKind::Share as u8)
+    );
+    assert_eq!(
+        authenticated["envelope_hash"],
+        hex::encode(opened.wire_hash())
+    );
+    assert_eq!(authenticated["vault_id"], hex::encode(context.vault));
+    assert_eq!(authenticated["payment_id"], hex::encode(context.payment));
+    assert_eq!(authenticated["attempt_id"], hex::encode(context.attempt.0));
+    let rendered = String::from_utf8(observed.iter().flatten().copied().collect()).unwrap();
+    assert!(!rendered.contains("saved-share"));
+    assert!(!bob
+        .database()
+        .recover_incoming_originals(0, 10)
+        .unwrap()
+        .is_empty());
+    bob.note_application(false, &opened);
+    let rejected = bob.pop_events();
+    let rejection = rejected
+        .iter()
+        .find_map(|line| {
+            let value: Value = serde_json::from_slice(line).ok()?;
+            (value.get("event_type")?.as_str() == Some("application_rejected")).then_some(value)
+        })
+        .expect("invalid share stayed an authenticated transport object");
+    assert_ne!(rejection["event_type"], "receipt_persisted");
+    assert_eq!(rejection["envelope_hash"], hex::encode(opened.wire_hash()));
+    let rejected_text = String::from_utf8(rejected.iter().flatten().copied().collect()).unwrap();
+    assert!(!rejected_text.contains("saved-share"));
     assert!(bob
         .receive(&bob_key, &roster, &context, MessageKind::Share, 1)
         .unwrap()
@@ -588,8 +653,8 @@ fn three_loopback_relays_deliver_a_saved_carrier_and_refuse_over_quota() {
     let (kept_hashes, kept_message) = object_hashes(&alice);
     assert_eq!(kept_hashes, saved_hashes);
     assert_eq!(kept_message, saved_message);
-    let loaded = loki_poc::relay_member::load(&tight.members[0], &tight.passes[0], &tight.roster)
-        .unwrap();
+    let loaded =
+        loki_poc::relay_member::load(&tight.members[0], &tight.passes[0], &tight.roster).unwrap();
     let logical = alice.database().recover_logical(0, 10).unwrap();
     let root = alice
         .database()

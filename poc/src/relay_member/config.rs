@@ -629,6 +629,10 @@ fn unseal(raw: &[u8], pass: &str) -> MemberResult<Zeroizing<Vec<u8>>> {
         .map_err(error)
 }
 impl ConfigStore {
+    pub fn directory(&self) -> &Path {
+        &self.root
+    }
+
     pub fn open(root: &Path, pass_file: &Path) -> MemberResult<Self> {
         member_root(root)?;
         private_directory(&root.join("secrets"))?;

@@ -2750,7 +2750,11 @@ fn assert_usage(output: &Output) {
 }
 
 fn assert_entered(output: &Output) {
-    assert_ne!(output.status.code(), Some(2), "complete command rejected as usage");
+    assert_ne!(
+        output.status.code(),
+        Some(2),
+        "complete command rejected as usage"
+    );
     assert_ne!(member_stderr(output).trim(), "member_arguments");
 }
 
@@ -2759,7 +2763,10 @@ fn assert_hidden(haystack: &[u8], needle: &[u8]) {
         return;
     }
     assert!(
-        haystack.len() < needle.len() || haystack.windows(needle.len()).all(|window| window != needle),
+        haystack.len() < needle.len()
+            || haystack
+                .windows(needle.len())
+                .all(|window| window != needle),
         "non-public bytes appeared in member output"
     );
 }
@@ -2769,7 +2776,8 @@ fn base64_std(data: &[u8]) -> String {
     let mut out = String::new();
     let mut index = 0;
     while index + 3 <= data.len() {
-        let n = ((data[index] as u32) << 16) | ((data[index + 1] as u32) << 8) | data[index + 2] as u32;
+        let n =
+            ((data[index] as u32) << 16) | ((data[index + 1] as u32) << 8) | data[index + 2] as u32;
         out.push(ALPHA[(n >> 18) as usize] as char);
         out.push(ALPHA[((n >> 12) & 63) as usize] as char);
         out.push(ALPHA[((n >> 6) & 63) as usize] as char);
@@ -2823,13 +2831,19 @@ fn assert_fixture_secrets_absent(f: &Fixture, haystack: &[u8]) {
     assert_secret_absent(haystack, &secret[34..]);
     let state = f.state();
     for key in ["identity_secret", "key_package", "vault_secret"] {
-        let stored = state.get(key).and_then(Value::as_str).expect("secret field");
+        let stored = state
+            .get(key)
+            .and_then(Value::as_str)
+            .expect("secret field");
         assert_stored_hex_absent(haystack, stored);
     }
 }
 
 fn hex64(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 fn uint_token(value: &str) -> bool {
@@ -2841,11 +2855,16 @@ fn bit_token(value: &str) -> bool {
 }
 
 fn status_pair<'a>(token: &'a str, key: &str) -> Option<&'a str> {
-    token.strip_prefix(key).and_then(|rest| rest.strip_prefix('='))
+    token
+        .strip_prefix(key)
+        .and_then(|rest| rest.strip_prefix('='))
 }
 
 fn status_line_public(line: &str) -> bool {
-    if matches!(line, "section=local" | "receipt_digest_alg=blake3" | "config absent=1") {
+    if matches!(
+        line,
+        "section=local" | "receipt_digest_alg=blake3" | "config absent=1"
+    ) {
         return true;
     }
     if let Some(value) = line.strip_prefix("member=") {
@@ -2875,10 +2894,13 @@ fn status_line_public(line: &str) -> bool {
             && status_pair(tokens[1], "sender").is_some_and(uint_token)
             && status_pair(tokens[2], "id").is_some_and(hex64)
             && status_pair(tokens[3], "digest").is_some_and(hex64)
-            && status_pair(tokens[4], "kind").is_some_and(|value| value == "test" || value == "received" || uint_token(value))
+            && status_pair(tokens[4], "kind")
+                .is_some_and(|value| value == "test" || value == "received" || uint_token(value))
             && status_pair(tokens[5], "session").is_some_and(|value| value == "-" || hex64(value))
-            && status_pair(tokens[6], "readiness").is_some_and(|value| value == "ready" || value == "pending")
-            && status_pair(tokens[7], "stored_whole").is_some_and(|value| bit_token(value) || value == "unavailable")
+            && status_pair(tokens[6], "readiness")
+                .is_some_and(|value| value == "ready" || value == "pending")
+            && status_pair(tokens[7], "stored_whole")
+                .is_some_and(|value| bit_token(value) || value == "unavailable")
             && status_pair(tokens[8], "received_whole").is_some_and(bit_token)
             && status_pair(tokens[9], "received_author").is_some_and(bit_token)
             && status_pair(tokens[10], "needs_route").is_some_and(uint_token);
@@ -2945,9 +2967,14 @@ fn saved_outbox(f: &Fixture) -> SavedOutbox {
     let logical = &logicals[0];
     let recipients = db.recover_recipients(&logical.key).unwrap();
     assert_eq!(recipients.len(), 3, "three recipient sets");
-    assert!(recipients.iter().all(|recipient| recipient.needs_route), "upload not bound");
     assert!(
-        recipients.iter().any(|recipient| recipient.recipient == member.identity.public().id),
+        recipients.iter().all(|recipient| recipient.needs_route),
+        "upload not bound"
+    );
+    assert!(
+        recipients
+            .iter()
+            .any(|recipient| recipient.recipient == member.identity.public().id),
         "author copy"
     );
     let mut transfers = Vec::new();
@@ -2963,7 +2990,10 @@ fn saved_outbox(f: &Fixture) -> SavedOutbox {
             .unwrap();
         assert!(required.len() >= 2, "chunked recipient objects");
         for item in &required {
-            let object = db.saved_object(&item.hash).unwrap().expect("saved ciphertext");
+            let object = db
+                .saved_object(&item.hash)
+                .unwrap()
+                .expect("saved ciphertext");
             assert_eq!(object.wire.len() as u64, item.length, "stored length");
             hashes.push(hex::encode(item.hash));
             wires.push(object.wire);
@@ -2971,15 +3001,24 @@ fn saved_outbox(f: &Fixture) -> SavedOutbox {
     }
     assert_eq!(transfers.len(), 3, "three transfers");
     assert_eq!(
-        transfers.iter().collect::<std::collections::BTreeSet<_>>().len(),
+        transfers
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
         3,
         "distinct transfers"
     );
     assert!(
-        wires.iter().enumerate().all(|(index, wire)| wires.iter().skip(index + 1).all(|other| other != wire)),
+        wires
+            .iter()
+            .enumerate()
+            .all(|(index, wire)| wires.iter().skip(index + 1).all(|other| other != wire)),
         "recipient ciphertexts differ"
     );
-    assert!(db.recover_uploads(0, 100).unwrap().is_empty(), "no upload before the upload command");
+    assert!(
+        db.recover_uploads(0, 100).unwrap().is_empty(),
+        "no upload before the upload command"
+    );
     SavedOutbox {
         message: hex::encode(logical.key.message),
         transfers,
@@ -3037,7 +3076,10 @@ fn communication_cli_parses_required_paths_and_rejects_foreign_commands() {
     assert_eq!(bad_id.status.code(), Some(1), "bad request id exit");
     assert_eq!(member_stderr(&bad_id).trim(), "member_bounds");
     assert!(bad_id.stdout.is_empty(), "bad request id stdout");
-    assert!(!f.root.join("transport").exists(), "rejected commands opened transport");
+    assert!(
+        !f.root.join("transport").exists(),
+        "rejected commands opened transport"
+    );
 
     let manifest = f.root.join("manifests");
     let capabilities = f.root.join("capabilities");
@@ -3102,14 +3144,20 @@ fn communication_cli_parses_required_paths_and_rejects_foreign_commands() {
     let send = member_cli(&send);
     assert_eq!(send.status.code(), Some(0), "send exit");
     let send_text = member_stdout(&send);
-    assert!(send_text.contains(&format!("request_id={request}")), "request id");
+    assert!(
+        send_text.contains(&format!("request_id={request}")),
+        "request id"
+    );
     assert!(send_text.contains("needs_route=3"), "three routes unbound");
     assert_hidden(send.stdout.as_slice(), b"relay-8.2a-payload-sentinel");
     let mut status = vec![member_arg("status")];
     status.extend(common_member_args(&f));
     let status = member_cli(&status);
     assert_eq!(status.status.code(), Some(0), "status exit");
-    assert!(member_stdout(&status).contains("section=local"), "local status");
+    assert!(
+        member_stdout(&status).contains("section=local"),
+        "local status"
+    );
 }
 
 #[test]
@@ -3130,7 +3178,10 @@ fn communication_cli_send_saves_three_sets_before_upload_exact_retry_conflict() 
     ]);
     let first = member_cli(&send);
     assert_eq!(first.status.code(), Some(0), "first send");
-    assert!(member_stdout(&first).contains("needs_route=3"), "saved before routing");
+    assert!(
+        member_stdout(&first).contains("needs_route=3"),
+        "saved before routing"
+    );
     let saved = saved_outbox(&f);
     assert!(saved.wires.len() >= 3, "three ciphertext sets");
     let retry = member_cli(&send);
@@ -3150,8 +3201,14 @@ fn communication_cli_send_saves_three_sets_before_upload_exact_retry_conflict() 
     assert_eq!(member_stderr(&conflict).trim(), "conflict");
     assert!(conflict.stdout.is_empty(), "conflict stdout");
     same_saved(&saved, &saved_outbox(&f));
-    assert_hidden(first.stdout.as_slice(), b"relay-8.2a-chunked-payload-marker!");
-    assert_hidden(conflict.stderr.as_slice(), b"relay-8.2a-chunked-payload-marker!");
+    assert_hidden(
+        first.stdout.as_slice(),
+        b"relay-8.2a-chunked-payload-marker!",
+    );
+    assert_hidden(
+        conflict.stderr.as_slice(),
+        b"relay-8.2a-chunked-payload-marker!",
+    );
 }
 
 #[test]
@@ -3169,7 +3226,11 @@ fn communication_cli_status_public_fields_only() {
         member_arg("--request-id"),
         member_arg(&request),
     ]);
-    assert_eq!(member_cli(&send).status.code(), Some(0), "status setup send");
+    assert_eq!(
+        member_cli(&send).status.code(),
+        Some(0),
+        "status setup send"
+    );
     let mut status = vec![member_arg("status")];
     status.extend(common_member_args(&f));
     let status = member_cli(&status);
@@ -3190,10 +3251,19 @@ fn communication_cli_status_public_fields_only() {
     ] {
         assert!(text.contains(field), "public status field missing");
     }
-    assert!(!text.contains("section=remote"), "default status stayed local");
-    assert!(!text.contains("section=diagnostics"), "diagnostics not requested");
+    assert!(
+        !text.contains("section=remote"),
+        "default status stayed local"
+    );
+    assert!(
+        !text.contains("section=diagnostics"),
+        "diagnostics not requested"
+    );
     for line in text.lines() {
-        assert!(status_line_public(line), "status line outside public schema");
+        assert!(
+            status_line_public(line),
+            "status line outside public schema"
+        );
     }
     assert_hidden(status.stdout.as_slice(), sentinel);
     assert_hidden(status.stderr.as_slice(), sentinel);
@@ -3224,8 +3294,14 @@ fn communication_cli_missing_referenced_sealed_config_fails_closed() {
     let present = member_cli(&status);
     assert_eq!(present.status.code(), Some(0), "referenced config status");
     let present_text = member_stdout(&present);
-    assert!(present_text.contains("config revision=1 hash="), "public config reference");
-    assert!(present_text.contains("inbox member="), "authenticated public inbox");
+    assert!(
+        present_text.contains("config revision=1 hash="),
+        "public config reference"
+    );
+    assert!(
+        present_text.contains("inbox member="),
+        "authenticated public inbox"
+    );
     for secret in [[61u8; 32], [71; 32], [31; 32]] {
         assert_hidden(present.stdout.as_slice(), &secret);
         assert_hidden(present.stdout.as_slice(), hex::encode(secret).as_bytes());
@@ -3238,7 +3314,10 @@ fn communication_cli_missing_referenced_sealed_config_fails_closed() {
     let retained = f.root.join("retained-original.sealed");
     fs::rename(&path, &retained).unwrap();
     let orphan = f.root.join("secrets").join("orphan.sealed");
-    let higher = f.root.join("secrets").join("relay-config-0000000000000002.sealed");
+    let higher = f
+        .root
+        .join("secrets")
+        .join("relay-config-0000000000000002.sealed");
     fs::write(&orphan, &original).unwrap();
     fs::write(&higher, &original).unwrap();
     private(&orphan, false);
@@ -3247,15 +3326,24 @@ fn communication_cli_missing_referenced_sealed_config_fails_closed() {
     assert_eq!(missing.status.code(), Some(1), "missing seal exit");
     // bounded_read maps a missing seal's NotFound metadata to MemberError::Io. A different ciphertext stays Sealed.
     assert_eq!(member_stderr(&missing).trim(), "member_io");
-    assert!(!member_stdout(&missing).contains("inbox member="), "missing seal adopted");
+    assert!(
+        !member_stdout(&missing).contains("inbox member="),
+        "missing seal adopted"
+    );
     let stale = config_owner(&member).encode(&member, 1).unwrap();
-    assert!(stale.as_slice() != original.as_slice(), "replacement ciphertext differs");
+    assert!(
+        stale.as_slice() != original.as_slice(),
+        "replacement ciphertext differs"
+    );
     fs::write(&path, stale.as_slice()).unwrap();
     private(&path, false);
     let rejected = member_cli(&status);
     assert_eq!(rejected.status.code(), Some(1), "stale seal exit");
     assert_eq!(member_stderr(&rejected).trim(), "member_sealed");
-    assert!(!member_stdout(&rejected).contains("inbox member="), "stale seal adopted");
+    assert!(
+        !member_stdout(&rejected).contains("inbox member="),
+        "stale seal adopted"
+    );
     let db = loki_relay_client::ClientStore::open(
         &retained_root(&f).join("transport"),
         &member.roster,
@@ -3318,4 +3406,190 @@ fn shared_session_lock_rejects_a_second_open_until_drop() {
     assert!(
         loki_poc::relay_member::open_session(&poisoned, &poisoned_pass, &poisoned_roster).is_err()
     );
+}
+
+#[test]
+fn public_events_are_allowlisted_and_gaps_stay_visible() {
+    let mut writer = loki_poc::relay_member::PublicEventWriter::new("run-1", "member-1").unwrap();
+    writer
+        .emit(
+            "receipt_persisted",
+            serde_json::json!({"object_hash": "ab", "result_code": "ok"}),
+        )
+        .unwrap();
+    assert!(writer.emit("not_a_type", serde_json::json!({})).is_err());
+    assert!(writer
+        .emit(
+            "request_end",
+            serde_json::json!({"authorization": "secret"})
+        )
+        .is_err());
+    assert!(writer
+        .emit("request_end", serde_json::json!({"version": 2}))
+        .is_err());
+    assert!(writer
+        .emit(
+            "request_end",
+            serde_json::json!({"result_code": "x".repeat(200)})
+        )
+        .is_err());
+    let saved: Value = serde_json::from_slice(&writer.pop_line().unwrap()).unwrap();
+    assert_eq!(saved["version"], 1);
+    assert_eq!(saved["event_type"], "receipt_persisted");
+    assert!(saved.get("authorization").is_none());
+    assert!(saved.get("payload").is_none());
+    for index in 0..loki_poc::relay_member::observation::QUEUE_CAP {
+        writer
+            .emit("retry_due", serde_json::json!({"request_id": index}))
+            .unwrap();
+    }
+    writer
+        .emit("quarantine", serde_json::json!({"result_code": "length"}))
+        .unwrap();
+    assert_eq!(writer.gap_count(), 1);
+    while writer.pop_line().is_some() {}
+    writer
+        .emit(
+            "application_rejected",
+            serde_json::json!({"result_code": "share", "message_digest": "aa"}),
+        )
+        .unwrap();
+    let gap: Value = serde_json::from_slice(&writer.pop_line().unwrap()).unwrap();
+    assert_eq!(gap["gap_count"], 1);
+    assert_eq!(gap["event_type"], "application_rejected");
+    assert_ne!(gap["event_type"], "receipt_persisted");
+}
+
+#[test]
+fn snapshot_pages_list_real_objects_and_reject_a_tampered_cursor() {
+    let fixture = Fixture::new();
+    let root = fixture.root.canonicalize().unwrap();
+    let pass = fixture.pass.canonicalize().unwrap();
+    let roster = fixture.roster.canonicalize().unwrap();
+    let mut session = loki_poc::relay_member::open_session(&root, &pass, &roster).unwrap();
+    let owner = session.member.identity.public().id;
+    let body = loki_relay_protocol::types::MessageBody {
+        key: loki_relay_protocol::types::LogicalKey {
+            vault: session.member.roster.vault,
+            roster: loki_relay_protocol::types::roster_digest(&session.member.roster).unwrap(),
+            sender: owner,
+            message: [7; 32],
+        },
+        audience: vec![1, 2, 3],
+        session: None,
+        prerequisites: Vec::new(),
+        payload: loki_relay_protocol::types::Payload::Test(vec![9; 8 * 1024 * 1024]),
+    };
+    let prepared =
+        loki_relay_client::prepare_outbox(&session.member.identity, &session.member.roster, &body)
+            .unwrap();
+    session
+        .db
+        .commit_outbox(
+            &session.member.roster,
+            &session.member.identity,
+            &[4; 32],
+            &prepared,
+        )
+        .unwrap();
+    let first =
+        loki_poc::relay_member::public_snapshot_page(&session, "generation-1", "objects", "0", 100)
+            .unwrap();
+    assert_eq!(first["version"], 1);
+    assert_eq!(first["member"], owner);
+    assert_eq!(first["complete"], false);
+    assert_eq!(first["rows"].as_array().unwrap().len(), 100);
+    assert_eq!(first["next"], "100");
+    let rendered = first.to_string();
+    assert!(!rendered.contains("payload"));
+    assert!(rendered.contains("object_hash"));
+    let mut after = "0".to_string();
+    let mut seen = 0usize;
+    loop {
+        let page = loki_poc::relay_member::public_snapshot_page(
+            &session,
+            "generation-1",
+            "objects",
+            &after,
+            100,
+        )
+        .unwrap();
+        let rows = page["rows"].as_array().unwrap();
+        seen += rows.len();
+        for row in rows {
+            assert!(row.get("object_hash").is_some());
+            assert!(row.get("wire").is_none());
+        }
+        if page["complete"] == true {
+            break;
+        }
+        after = page["next"].as_str().unwrap().to_string();
+    }
+    assert!(seen > 400, "snapshot listed {seen} real objects");
+    assert!(loki_poc::relay_member::public_snapshot_page(
+        &session,
+        "generation-1",
+        "objects",
+        "0",
+        0
+    )
+    .is_err());
+    assert!(loki_poc::relay_member::public_snapshot_page(
+        &session,
+        "generation-1",
+        "objects",
+        "0",
+        101
+    )
+    .is_err());
+    assert!(loki_poc::relay_member::public_snapshot_page(
+        &session,
+        "generation-1",
+        "objects",
+        "50",
+        100
+    )
+    .is_err());
+    assert!(loki_poc::relay_member::public_snapshot_page(
+        &session,
+        "generation-2",
+        "objects",
+        "0",
+        100
+    )
+    .is_err());
+    let response = loki_poc::relay_member::snapshot_response(
+        &session,
+        r#"{"version":1,"type":"other","snapshot_id":"generation-1","section":"objects","after":"0","limit":1}"#,
+    );
+    assert!(response.is_err());
+    drop(session);
+    let output = Command::new(env!("CARGO_BIN_EXE_loki_relay_member"))
+        .args([
+            "snapshot-page",
+            "--member-root",
+            root.to_str().unwrap(),
+            "--passphrase-file",
+            pass.to_str().unwrap(),
+            "--roster",
+            roster.to_str().unwrap(),
+            "--snapshot-id",
+            "generation-1",
+            "--section",
+            "logical",
+            "--after",
+            "0",
+            "--limit",
+            "10",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let cli: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(cli["section"], "logical");
+    assert_eq!(cli["rows"].as_array().unwrap().len(), 1);
 }
