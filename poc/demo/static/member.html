@@ -5,7 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Loki | Member payment demo</title>
   <link rel="stylesheet" href="/member.css">
+  <link rel="stylesheet" href="/relay.css">
   <script src="/member.js" defer></script>
+  <script src="/relay.js" defer></script>
 </head>
 <body>
   <div class="app">
@@ -17,6 +19,7 @@
           <button class="nav-item active" data-view="overview" type="button">Overview</button>
           <button class="nav-item" data-view="queue" type="button">Transaction queue <span id="queue-count">0</span></button>
           <button class="nav-item" data-view="history" type="button">History</button>
+          <button class="nav-item" data-view="relay" type="button">Relay network</button>
         </nav>
       </div>
       <div class="side-bottom">
@@ -79,6 +82,20 @@
         <div class="section-head"><div><h2>History</h2><p>Only payments observed on the regtest chain appear as confirmed.</p></div></div>
         <div class="empty" id="history-empty">No confirmed payment yet.</div>
         <article class="panel history-item" id="history-item" hidden><span class="success-mark">✓</span><div><strong>Payment confirmed</strong><p id="history-txid"></p><span>Source and recipient vaults both verified the mined transaction.</span></div></article>
+      </section>
+      <section class="view" id="relay">
+        <div class="section-head"><div><h2>Relay network</h2><p>Transport, application, approval, and chain stay separate. Replay does not call the backend.</p></div>
+          <div class="relay-controls">
+            <span id="relay-mode">Live</span>
+            <button type="button" id="relay-live">Live</button>
+            <button type="button" id="relay-replay">Replay</button>
+            <label>Speed<select id="relay-speed"><option value="1">1×</option><option value="2">2×</option></select></label>
+          </div>
+        </div>
+        <div class="relay-milestones" id="relay-milestones"></div>
+        <svg id="relay-svg" class="relay-svg" viewBox="0 0 640 280" role="img" aria-label="Relay network"></svg>
+        <ol id="relay-timeline" class="relay-timeline"></ol>
+        <div id="relay-inspector" class="relay-inspector"></div>
       </section>
       <footer class="footer"><span>Research prototype · regtest funds only</span><button class="text-button" id="reset" type="button" hidden>Reset demo</button></footer>
     </main>

@@ -19,7 +19,14 @@ function show(view) {
   activeView = view;
   for (const section of document.querySelectorAll('.view')) section.classList.toggle('active', section.id === view);
   for (const button of document.querySelectorAll('.nav-item')) button.classList.toggle('active', button.dataset.view === view);
-  $('page-title').textContent = {overview: 'Overview', queue: 'Transaction queue', history: 'History'}[view];
+  $('page-title').textContent = {
+    overview: 'Overview', queue: 'Transaction queue', history: 'History', relay: 'Relay network',
+  }[view];
+  if (view === 'relay' && typeof refreshRelay === 'function') refreshRelay();
+}
+
+function memberRole() {
+  return state ? state.role : null;
 }
 
 function notice(message, error = false) {

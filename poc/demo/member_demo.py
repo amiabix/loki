@@ -442,7 +442,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(200, body)
         assets = {"/": ("member.html", "text/html; charset=utf-8"),
                   "/member.js": ("member.js", "text/javascript; charset=utf-8"),
-                  "/member.css": ("member.css", "text/css; charset=utf-8")}
+                  "/member.css": ("member.css", "text/css; charset=utf-8"),
+                  "/relay.js": ("relay.js", "text/javascript; charset=utf-8"),
+                  "/relay.css": ("relay.css", "text/css; charset=utf-8")}
         if path not in assets:
             return self.json(404, {"error": "not found"})
         file, ctype = assets[path]
