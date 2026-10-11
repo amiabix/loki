@@ -3,6 +3,14 @@ const token = location.hash.slice(1);
 const $ = (id) => document.getElementById(id);
 let selectedVault = null;
 
+function selectVault(vault) {
+  selectedVault = vault;
+  $('address').textContent = 'Open this vault to view the address.';
+  $('balance').textContent = "Scan this device's chain view to see the balance.";
+  $('words').textContent = '';
+  $('backup-made').hidden = true;
+}
+
 function message(text, error = false) {
   $('message').textContent = text;
   $('message').hidden = !text;
@@ -40,7 +48,7 @@ function vaultList(vaults) {
     button.type = 'button';
     button.className = 'secondary';
     button.textContent = `${vault.name} · member ${vault.slot}`;
-    button.addEventListener('click', () => { selectedVault = vault.vault; refresh(); });
+    button.addEventListener('click', () => { selectVault(vault.vault); refresh(); });
     list.append(button);
   }
 }
@@ -86,12 +94,12 @@ action('profile-create', async (form) => { await api('profile-create', fields(fo
 action('unlock', async (form) => { await api('unlock', fields(form)); message('Profile unlocked.'); });
 action('create', async (form) => {
   const value = await api('create', fields(form));
-  selectedVault = value.vault;
+  selectVault(value.vault);
   message('Vault draft created. Invite the other two members.');
 });
 action('join', async (form) => {
   const value = await api('join', fields(form));
-  selectedVault = value.vault;
+  selectVault(value.vault);
   message('Joined. Waiting for the other members.');
 });
 action('agree', async (form) => { await api('agree', {vault: selectedVault, ...fields(form)}); message('Key creation started. Each member must compare and confirm the roster.'); });
@@ -129,9 +137,20 @@ action('show-address', async () => {
   const value = await api('activate', {vault: selectedVault});
   $('address').textContent = value.address;
 });
-$('back').addEventListener('click', () => { $('words').textContent = ''; $('backup-made').hidden = true; selectedVault = null; refresh(); });
+$('refresh-balance').addEventListener('click', async () => {
+  const button = $('refresh-balance');
+  button.disabled = true;
+  try {
+    const value = await api('balance', {vault: selectedVault});
+    const zat = BigInt(value.balance_zat);
+    const amount = `${zat / 100000000n}.${(zat % 100000000n).toString().padStart(8, '0')}`;
+    $('balance').textContent = `${amount} ZEC · ${value.unspent_notes} unspent notes · block ${value.height}`;
+  } catch (error) { message(error.message, true); }
+  finally { button.disabled = false; }
+});
+$('back').addEventListener('click', () => { selectVault(null); refresh(); });
 $('lock').addEventListener('click', async () => {
-  try { await api('lock', {}); $('words').textContent = ''; $('backup-made').hidden = true; selectedVault = null; await refresh(); }
+  try { await api('lock', {}); selectVault(null); await refresh(); }
   catch (error) { message(error.message, true); }
 });
 refresh(); setInterval(refresh, 2000);

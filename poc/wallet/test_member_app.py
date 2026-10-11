@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 from member_app import SETUP, Wallet
@@ -84,6 +85,13 @@ class MemberWalletTest(unittest.TestCase):
             self.assertNotEqual(first_key["encryption"], second_key["encryption"])
             self.assertEqual(wallets[0].status()["vaults"][0]["profile"], profiles[0]["id"])
             self.assertEqual(wallets[0].status()["vaults"][1]["profile"], profiles[0]["id"])
+            with patch.object(wallets[0], "command", return_value=json.dumps(
+                    {"vault": vault, "height": 42, "balance_zat": 5000, "unspent_notes": 1})) as call:
+                self.assertEqual(wallets[0].balance(vault)["balance_zat"], 5000)
+                self.assertEqual(call.call_args.args[1], wallets[0].data / "vaults" / vault)
+            with patch.object(wallets[0], "command", return_value=json.dumps({"vault": second})):
+                with self.assertRaisesRegex(ValueError, "another vault"):
+                    wallets[0].balance(vault)
 
     def test_rejects_exchange_inside_private_root(self):
         with tempfile.TemporaryDirectory() as temp:

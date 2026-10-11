@@ -197,6 +197,25 @@ fn state(args: &[String]) -> Result<(MemberState, PathBuf, Zeroizing<String>), S
     Ok((loaded, owner, trimmed))
 }
 
+fn balance(args: &[String]) -> Result<(), String> {
+    if args.len() != 3 {
+        return Err("balance <member-dir> <passphrase-file> <roster.json>".into());
+    }
+    let member = member_state::open(Path::new(&args[0]), Path::new(&args[1]), Path::new(&args[2]))?;
+    let chain = scan::scan_chain(&Rpc::regtest(), &member.fvk)?;
+    let balance_zat = chain
+        .notes
+        .iter()
+        .try_fold(0u64, |sum, note| sum.checked_add(note.value_zat))
+        .ok_or("vault balance exceeds u64")?;
+    println!(
+        "{}",
+        json!({"vault": hex::encode(member.vault), "height": chain.tip,
+               "balance_zat": balance_zat, "unspent_notes": chain.notes.len()})
+    );
+    Ok(())
+}
+
 fn prepare(args: &[String]) -> Result<(), String> {
     if args.len() != 7 && args.len() != 8 {
         return Err("prepare <member-dir> <passphrase-file> <roster.json> <work-dir> <recipient-UA> <amount-zat> <memo> [AB|AC|BC]".into());
@@ -1146,6 +1165,7 @@ fn main() {
     let args = env::args().collect::<Vec<_>>();
     let result = match args.get(1).map(String::as_str) {
         Some("prepare") => prepare(&args[2..]),
+        Some("balance") => balance(&args[2..]),
         #[cfg(feature = "relay-communication")]
         Some("features") => {
             println!("relay-backed-signing=1");
@@ -1163,7 +1183,7 @@ fn main() {
         Some("verify") => verify(&args[2..]),
         Some("receive") => receive(&args[2..]),
         _ => Err(
-            "loki_member_payment <prepare|sign|resend|finish|verify|receive> ... (regtest only)"
+            "loki_member_payment <balance|prepare|sign|resend|finish|verify|receive> ... (regtest only)"
                 .into(),
         ),
     };

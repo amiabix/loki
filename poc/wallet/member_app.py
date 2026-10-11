@@ -22,6 +22,7 @@ from urllib.parse import parse_qs, urlsplit
 
 HERE = Path(__file__).resolve().parent
 SETUP = HERE.parent / "target" / "debug" / "loki_setup_member"
+PAYMENT = HERE.parent / "target" / "debug" / "loki_member_payment"
 
 
 def encoded(value):
@@ -74,12 +75,13 @@ class Wallet:
         self.workers = {}
         self.setup_errors = {}
 
-    def command(self, action, *args, passphrase=None, timeout=30):
-        if not self.setup.is_file():
-            raise ValueError("Build the setup binary: cd poc && cargo build --locked --bin loki_setup_member")
+    def command(self, action, *args, passphrase=None, timeout=30, binary=None):
+        binary = binary or self.setup
+        if not binary.is_file():
+            raise ValueError(f"Build {binary.name}: cd poc && cargo build --locked --bins")
         passfile = None
         try:
-            argv = [str(self.setup), action]
+            argv = [str(binary), action]
             for arg in args:
                 if arg == "@pass":
                     fd, name = tempfile.mkstemp(prefix=".unlock-", dir=self.data)
@@ -273,6 +275,14 @@ class Wallet:
         return self.command("address", member_dir, "@pass", member_dir / "roster.json",
                             self.exchange_vault(vault))
 
+    def balance(self, vault):
+        member_dir, _ = self.vault_dir(vault)
+        result = json.loads(self.command("balance", member_dir, "@pass", member_dir / "roster.json",
+                                         binary=PAYMENT, timeout=120))
+        if result.get("vault") != vault:
+            raise ValueError("Chain scan returned another vault")
+        return result
+
     def status(self, vault=None):
         if not (self.data / "profile" / "profile.sealed").exists():
             return {"phase": "new_profile", "network": "regtest"}
@@ -382,6 +392,7 @@ def serve(wallet, port):
                         "/api/backup": lambda: wallet.backup(value.get("vault")),
                         "/api/verify": lambda: wallet.verify(value.get("vault"), value.get("words"), value.get("card")),
                         "/api/activate": lambda: {"address": wallet.address(value.get("vault"))},
+                        "/api/balance": lambda: wallet.balance(value.get("vault")),
                     }
                     if self.path not in routes:
                         return self.reply(404, {"error": "Not found"})

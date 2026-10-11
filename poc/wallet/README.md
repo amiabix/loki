@@ -8,7 +8,7 @@ no route that creates another member's identity or unlocks another share.
 
 ```sh
 cd poc
-cargo build --locked --bin loki_setup_member
+cargo build --locked --bins
 python3 wallet/member_app.py --data /tmp/loki-member-1 --exchange /tmp/loki-setup-exchange --port 8801
 ```
 
@@ -22,6 +22,9 @@ roster fingerprint through a trusted channel and confirm it. They must start
 key creation within the setup CLI's two-minute wait per round. Each member
 downloads their backup card, records their 24 words separately, and loads both
 back to check them. The receive address appears after all three backup checks.
+An active vault can scan the regtest chain for its unspent balance at a named
+block height. Set `LOKI_RPC=host:port` when starting each app if the local node
+is not on the default `127.0.0.1:18232`; the app does not fund or mine blocks.
 
 The server binds to loopback and uses a private URL token. The passphrase unlocks
 the sealed profile and stays in this process's memory until Lock or shutdown; it
@@ -34,7 +37,7 @@ non-resumable DKG are development controls, not the planned relay transport.
 Data roots created by the previous one-vault app are left untouched and need an
 explicit migration before this version can open them; use a fresh root to test it.
 Separate directories under one OS account do not isolate a compromised account.
-There is no payment, chain sync or passkey UI in this app yet; use the existing
+There is no persistent chain cache, payment or passkey UI in this app yet; use the existing
 separate-member CLI and harness for transaction testing. Do not use real funds.
 
 Verify the member flow:
