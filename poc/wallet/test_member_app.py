@@ -54,7 +54,7 @@ class MemberWalletTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "failed authentication"):
                 wallets[0].unlock("wrong passphrase for this vault")
             self.assertEqual(wallets[0].unlock(passwords[0])["profile"], profiles[0])
-            with self.assertRaisesRegex(ValueError, "Connect your Zcash account"):
+            with self.assertRaisesRegex(ValueError, "Prove control of your Zcash account"):
                 wallets[0].agree(vault, fingerprints[0])
             seed = root / "wallet-seed.txt"
             seed.write_text("abandon " * 23 + "art")

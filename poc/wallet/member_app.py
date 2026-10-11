@@ -257,7 +257,7 @@ class Wallet:
     def account_link(self, vault):
         member_dir, _ = self.vault_dir(vault)
         if not (member_dir / "secrets" / "account-link.sealed").exists():
-            raise ValueError("Connect your Zcash account before key creation")
+            raise ValueError("Prove control of your Zcash account before key creation")
         result = json.loads(self.command("check", self.data, member_dir, "@pass", binary=SEED_WALLET))
         if result["vault"] != vault:
             raise ValueError("Account link belongs to another vault")

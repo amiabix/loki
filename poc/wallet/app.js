@@ -64,7 +64,7 @@ async function refresh() {
     $('title').textContent = state.name || state.profile?.name || 'Your wallet';
     $('subtitle').textContent = selectedVault ? `Member ${state.slot} · 2 of 3 · regtest` : 'One local profile, separate keys for each vault.';
     $('linked-account').hidden = !state.account_ak;
-    if (state.account_ak) $('linked-account').textContent = `Connected Orchard account key: ${state.account_ak.slice(0, 16)}…`;
+    if (state.account_ak) $('linked-account').textContent = `Proved Orchard account key: ${state.account_ak.slice(0, 16)}…`;
     if (state.phase === 'new_profile') $('new-profile').hidden = false;
     else if (state.phase === 'locked') $('locked').hidden = false;
     else if (state.phase === 'home') {
@@ -120,14 +120,14 @@ $('begin-link').addEventListener('click', async () => {
     $('link-challenge').textContent = JSON.stringify(linkChallenge, null, 2);
     $('link-challenge').hidden = false;
     $('download-challenge').hidden = false;
-    message('Challenge ready. Download it and sign it with your separate wallet command.');
+    message('Challenge ready. Download it and sign it with the separate reference wallet command.');
   } catch (error) { message(error.message, true); }
 });
 $('download-challenge').addEventListener('click', challengeDownload);
 action('link-account', async (form) => {
   const proof = JSON.parse(fields(form).proof);
   const result = await api('link', {vault: selectedVault, proof});
-  message(`Account connected: ${result.account_ak}. You can continue vault setup.`);
+  message(`Account proof verified: ${result.account_ak}. You can continue vault setup.`);
 });
 action('agree', async (form) => { await api('agree', {vault: selectedVault, ...fields(form)}); message('Key creation started. Each member must compare and confirm the roster.'); });
 action('make-backup', async () => {
