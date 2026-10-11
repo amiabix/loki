@@ -16,6 +16,33 @@ The first implementation targets regtest. Test funding and mining are developer 
 
 ## Member journey
 
+### What “Connect wallet” means
+
+Safe [connects a signer wallet](https://help.safe.global/articles/8997878213-why-do-i-need-to-connect-a-signer-wallet) that holds an owner key. That wallet, not Safe's page,
+approves the eventual transaction; the Safe address is separate from the
+signer's address. Loki needs the same user contract: the connected **Loki signer**
+holds this member's FROST share and independently reviews a payment before
+releasing a share. A personal Zcash wallet can prove account control or send funds
+to the vault, but a message signature from it does not approve a FROST spend.
+
+Example: Alice opens Loki and chooses **Connect Loki signer**. Her signer shows
+Loki's origin, regtest network, requested access, and a short-lived challenge;
+Alice approves there. Loki shows Alice's signer as connected and lists only the
+vaults whose membership records that signer can open. Alice creates a 2-of-3
+vault, sends one invite each to Bob and Carol, and waits while their own signers
+join the DKG. Each person checks the same roster code and backs up their own
+share. The vault then shows one receive address. Later Bob proposes a payment;
+Alice opens it, and her signer independently checks the transaction and asks her
+to approve. Carol does the same. A synced member finishes and broadcasts it.
+Disconnecting Alice's signer ends this browser session; it does not remove her
+from the vault or delete her share. Reconnecting it restores her vault list.
+
+The current regtest app combines dashboard and signer in one local process. Its
+reference-wallet proof only links an Orchard account locally; it does not provide
+the separate signer connection above. A real connection requires a signer-held
+share, an authenticated session with explicit approval and disconnect, and a
+review request that the signer can verify without trusting the dashboard.
+
 1. **Open / connect / unlock.** The regtest app creates a local profile, then a person exports a challenge, signs it in the separate reference wallet command, and pastes the proof back. Loki verifies the proof before vault key creation. The app shows **Create vault**, **Join vault**, and their vault list. A fresh transport identity is created for each vault; the profile does not publish one stable identity across all its vaults. External-wallet QR connection and passkey unlock remain future work.
 2. **Create vault.** The creator enters a name and selects the supported 2-of-3 policy. The app makes a random vault ID and two invite links. The creator is one member by default. It shows three slots and who has accepted; the vault is a draft with no receive address.
 3. **Join.** Each invitee opens the link in their own app, creates or unlocks a profile, sees the vault name, threshold, inviter identity and their assigned slot, then accepts. The bearer secret stays in the link fragment, expires, and can claim a slot only once. If someone else claims it first, the roster comparison must reveal the wrong identity and setup stops. Member labels are display names; the certified public keys and slot IDs are the identities the protocol checks.
