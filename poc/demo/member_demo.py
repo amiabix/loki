@@ -483,7 +483,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(200, FLOW.state(role, origin))
         assets = {"/": ("member.html", "text/html; charset=utf-8"),
                   "/member.js": ("member.js", "text/javascript; charset=utf-8"),
-                  "/member.css": ("member.css", "text/css; charset=utf-8")}
+                  "/member.css": ("member.css", "text/css; charset=utf-8"),
+                  "/fonts/geist.woff2": ("fonts/geist.woff2", "font/woff2"),
+                  "/fonts/geist-mono.woff2": ("fonts/geist-mono.woff2", "font/woff2"),
+                  "/fonts/young-serif.woff2": ("fonts/young-serif.woff2", "font/woff2")}
         if path not in assets:
             return self.json(404, {"error": "not found"})
         file, ctype = assets[path]

@@ -67,8 +67,10 @@ function render() {
   const payment = s.payment;
   const approved = s.approvals_count;
   const roleName = {admin: 'Carol · member 3', alice: 'Alice · member 1', bob: 'Bob · member 2'}[s.role];
+  document.body.dataset.phase = s.phase;
   $('side-role').textContent = roleName;
   $('threshold-value').textContent = `${approved} / 2`;
+  for (const [index, pip] of [...$('pips').children].entries()) pip.classList.toggle('on', index < approved);
   $('approval-total').textContent = `${approved} of 2`;
   $('queue-count').textContent = payment && s.phase !== 'confirmed' ? '1' : '0';
   $('source-address').textContent = s.vaults?.source || 'Not created yet';
@@ -166,6 +168,10 @@ async function refresh() {
     const wasConfirmed = state?.phase === 'confirmed';
     state = await api('/api/state');
     render();
+    if (state.phase === 'confirmed' && !wasConfirmed) {
+      document.body.classList.add('landed');
+      setTimeout(() => document.body.classList.remove('landed'), 1400);
+    }
     if (state.phase === 'confirmed' && !wasConfirmed && activeView === 'queue') show('history');
     else if (state.role !== 'admin' && state.payment && (firstLoad || !hadPayment))
       show(state.phase === 'confirmed' ? 'history' : 'queue');

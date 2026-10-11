@@ -1,3 +1,7 @@
+@font-face{font-family:Geist;src:url(/fonts/geist.woff2) format("woff2");font-weight:400 700;font-display:swap}
+@font-face{font-family:"Geist Mono";src:url(/fonts/geist-mono.woff2) format("woff2");font-weight:400 600;font-display:swap}
+@font-face{font-family:"Young Serif";src:url(/fonts/young-serif.woff2) format("woff2");font-weight:400;font-display:swap}
+
 /* Loki POC demo.
  *
  * Visual direction: a technical dossier. Cool paper, hairline rules, a numbered band
@@ -7,63 +11,42 @@
  * and graphite so the accent keeps that meaning.
  */
 
+/* Single dark theme, shared with wallet.css and member.css: near-black ground, hairline
+ * rules, cut corners. One accent (mint) still carries exactly one meaning — the AC branch,
+ * the pair that actually got mined — so red is free to mean "blocked" and nothing else. */
 :root {
-  /* Light palette: a cool grey-green paper, not cream. */
-  --paper:      #eceeea;
-  --paper-2:    #f5f6f3;
-  --paper-3:    #e2e5e0;
-  --ink:        #15191a;
-  --ink-2:      #3b4446;
-  --ink-3:      #687476;
-  --rule:       #c5cbc5;
-  --rule-soft:  #d7dcd6;
+  --paper:      #0b131b;
+  --paper-2:    #111e29;
+  --paper-3:    #0a1118;
+  --ink:        #ece8e1;
+  --ink-2:      #b4c0ca;
+  --ink-3:      #7f909e;
+  --rule:       #22323f;
+  --rule-soft:  #1a2833;
 
-  /* One accent, one meaning: the branch that was carried through to a mined payment. */
-  --accent:     #96560c;
-  --accent-ink: #6d3e07;
-  --accent-bg:  #f3e7d5;
+  --accent:     #00e0a4;
+  --accent-ink: #2bf7bd;
+  --accent-bg:  #0c2b25;
 
-  --pass:       #2f6244;
-  --pass-bg:    #dfeae1;
-  --blocked:    #8a2b35;
-  --blocked-bg: #f1dcdd;
-  --partial:    #6a6124;
-  --partial-bg: #eee9d3;
-  --live:       #1f5a6b;
-  --live-bg:    #dbe8ec;
+  --pass:       #00e0a4;
+  --pass-bg:    #0c2b25;
+  --blocked:    #ff4655;
+  --blocked-bg: #2a1519;
+  --partial:    #f4b728;
+  --partial-bg: #2a2110;
+  --live:       #6fd3e8;
+  --live-bg:    #102a31;
 
-  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
-  --body: "Avenir Next", "Segoe UI", Candara, Optima, sans-serif;
-  --disp: "Avenir Next Condensed", "Avenir Next", "Arial Narrow", Impact, sans-serif;
+  --mono: "Geist Mono", ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  --body: Geist, "Segoe UI", system-ui, sans-serif;
+  --disp: Geist, "Segoe UI", system-ui, sans-serif;
+  --serif: "Young Serif", ui-serif, "Iowan Old Style", Georgia, serif;
 
   --maxw: 1180px;
   --gut: clamp(1.1rem, 4vw, 3rem);
-}
 
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    --paper:      #111618;
-    --paper-2:    #171e21;
-    --paper-3:    #0c1012;
-    --ink:        #e6eae8;
-    --ink-2:      #b3bdbd;
-    --ink-3:      #7f8c8e;
-    --rule:       #2d3739;
-    --rule-soft:  #222b2d;
-
-    --accent:     #d79a4e;
-    --accent-ink: #edbd79;
-    --accent-bg:  #2a2016;
-
-    --pass:       #74b98f;
-    --pass-bg:    #16261c;
-    --blocked:    #dd8a93;
-    --blocked-bg: #2a1518;
-    --partial:    #c3b86b;
-    --partial-bg: #232016;
-    --live:       #7cc0d4;
-    --live-bg:    #122429;
-  }
+  --cut: polygon(0 0, calc(100% - 11px) 0, 100% 11px, 100% 100%, 11px 100%, 0 calc(100% - 11px));
+  --cut-sm: polygon(0 0, calc(100% - 7px) 0, 100% 7px, 100% 100%, 7px 100%, 0 calc(100% - 7px));
 }
 
 * { box-sizing: border-box; }
@@ -78,8 +61,9 @@ body {
   font: 400 clamp(0.97rem, 0.3vw + 0.9rem, 1.06rem)/1.62 var(--body);
   -webkit-font-smoothing: antialiased;
   /* A faint hatch, so the ground reads as paper rather than a flat fill. */
-  background-image:
-    repeating-linear-gradient(90deg, color-mix(in srgb, var(--rule) 22%, transparent) 0 1px, transparent 1px 44px);
+  background-image: linear-gradient(#101d28 1px, transparent 1px),
+                    linear-gradient(90deg, #101d28 1px, transparent 1px);
+  background-size: 52px 52px;
 }
 
 .wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 var(--gut); }
@@ -467,4 +451,93 @@ table.data tr.nc td.c { color: var(--partial); }
 .err {
   margin: 0; padding: .8rem 1rem; border: 1px solid var(--blocked);
   background: var(--blocked-bg); color: var(--blocked); font: .8rem/1.5 var(--mono);
+}
+
+
+/* ── tactical pass ───────────────────────────────────────────────────────────
+   Hard edges, cut corners, mint as the one action colour. Everything above this
+   line is the original dossier layout; this block only restyles it. */
+
+code, .chip, .chips-toggle, .btn, .badge, .rule-callout, .copy { border-radius: 0; }
+
+.btn {
+  background: var(--accent); color: #04110d; border-color: var(--accent);
+  font: 700 .72rem/1 var(--disp); letter-spacing: .14em; text-transform: uppercase;
+  padding: .8rem 1.3rem; clip-path: var(--cut-sm);
+  transition: background .08s linear;
+}
+.btn:hover { transform: none; background: #2bf7bd; }
+.btn-quiet, .btn-tiny {
+  background: transparent; color: var(--ink); border-color: var(--rule); clip-path: var(--cut-sm);
+}
+.btn-quiet:hover, .btn-tiny:hover { background: var(--paper-2); color: var(--ink); border-color: var(--accent); }
+
+.hero-card { border-color: var(--rule); box-shadow: none; clip-path: var(--cut); }
+.hero-card-top { border-bottom-color: var(--rule); }
+.cmd { border-color: var(--rule); clip-path: var(--cut-sm); }
+
+.figure, .shared, .member, .pair, .check, .limit, .path, .eviblock, .stage-detail, .nodeprobe {
+  clip-path: var(--cut-sm);
+}
+.pair.is-mined { box-shadow: none; border-color: var(--accent); }
+
+.num { font-weight: 700; letter-spacing: .1em; }
+.band-head h2, h1 { letter-spacing: .005em; }
+
+.statusbar { background: rgba(10, 17, 24, .88); }
+
+/* The diagram's rects are fixed-width; the mono fallback overruns them at 12px. */
+.figure .diagram text { font-size: 11px; }
+
+
+/* Headings and the figures in the hero card carry the serif; every uppercase
+   micro-label stays in the sans, where tracking still reads. */
+h1, .band-head h2, .pair h3, .limit h3, .check h3, .kv dd.big {
+  font-family: var(--serif); font-weight: 400; letter-spacing: 0;
+  font-variant-numeric: lining-nums tabular-nums;
+}
+h1 { font-size: clamp(2.3rem, 6vw, 4rem); line-height: 1.04; }
+.band-head h2 { font-size: clamp(1.4rem, 3vw, 2rem); }
+.pair h3 { font-size: 1.6rem; letter-spacing: .02em; }
+.limit h3, .check h3 { font-size: 1.05rem; }
+.kv dd.big { font-family: var(--serif); font-size: 1.15rem; font-weight: 400; }
+
+
+/* ── kit buttons ─────────────────────────────────────────────────────────────
+   Same anatomy as member.css: gradient body, inner hairline, diamond glyph slot. */
+.btn {
+  display: inline-flex; align-items: center; gap: 10px;
+  background: linear-gradient(180deg, #2bf7bd, #00c48e);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.35);
+}
+.btn::before {
+  content: ""; width: 6px; height: 6px; flex: none;
+  background: currentColor; opacity: .7; transform: rotate(45deg);
+}
+.btn:hover { background: linear-gradient(180deg, #3cffc8, #0bd79c); }
+.btn-quiet, .btn-tiny {
+  background: linear-gradient(180deg, #16252f, #111e29);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.06);
+}
+.btn-quiet:hover, .btn-tiny:hover { background: linear-gradient(180deg, #1d2f3b, #16252f); }
+
+/* ── HUD layer ───────────────────────────────────────────────────────────────
+   Same chrome as member.css: scanlines, corner brackets, notched band numbers. */
+body::before {
+  content: ""; position: fixed; inset: 0; z-index: 900; pointer-events: none;
+  background:
+    repeating-linear-gradient(0deg, rgba(255,255,255,.014) 0 1px, transparent 1px 3px),
+    radial-gradient(ellipse at 50% 42%, transparent 58%, rgba(0,0,0,.38) 100%);
+}
+.hero-card, .member, .pair, .check, .limit, .shared, .figure, .path, .cmd {
+  background-image:
+    linear-gradient(#334a5c,#334a5c), linear-gradient(#334a5c,#334a5c),
+    linear-gradient(#334a5c,#334a5c), linear-gradient(#334a5c,#334a5c);
+  background-size: 16px 2px, 2px 16px, 16px 2px, 2px 16px;
+  background-position: 0 0, 0 0, 100% 100%, 100% 100%;
+  background-repeat: no-repeat;
+}
+.num::before {
+  content: ""; display: inline-block; width: 3px; height: 11px; margin-right: 9px;
+  vertical-align: -1px; background: var(--accent); box-shadow: 0 0 8px rgba(0,224,164,.6);
 }

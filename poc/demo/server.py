@@ -65,6 +65,9 @@ ASSETS = {
     "/index.html": (STATIC / "index.html", "text/html; charset=utf-8"),
     "/app.css": (STATIC / "app.css", "text/css; charset=utf-8"),
     "/app.js": (STATIC / "app.js", "text/javascript; charset=utf-8"),
+    "/fonts/geist.woff2": (STATIC / "fonts" / "geist.woff2", "font/woff2"),
+    "/fonts/geist-mono.woff2": (STATIC / "fonts" / "geist-mono.woff2", "font/woff2"),
+    "/fonts/young-serif.woff2": (STATIC / "fonts" / "young-serif.woff2", "font/woff2"),
 }
 
 

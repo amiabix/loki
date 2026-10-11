@@ -1,3 +1,7 @@
+@font-face{font-family:Geist;src:url(/fonts/geist.woff2) format("woff2");font-weight:400 700;font-display:swap}
+@font-face{font-family:"Geist Mono";src:url(/fonts/geist-mono.woff2) format("woff2");font-weight:400 600;font-display:swap}
+@font-face{font-family:"Young Serif";src:url(/fonts/young-serif.woff2) format("woff2");font-weight:400;font-display:swap}
+
 /* Loki Vault — tactical console.
  *
  * Deliberately single-theme. The whole look depends on a near-black ground, so there is
@@ -9,32 +13,36 @@
  * "signed" and "danger" can never be confused at a glance.
  */
 
+/* Shared Loki palette — same tokens as member.css, one family across the three pages. */
 :root {
-  --void:   #0B1118;   /* page ground */
-  --deep:   #0F1923;   /* sidebar */
-  --panel:  #15202B;   /* cards */
-  --raise:  #1B2834;   /* inset rows */
-  --line:   #223040;
-  --line-2: #1A2531;
+  --void:   #0b131b;   /* page ground */
+  --deep:   #0a1118;   /* sidebar, inset rows */
+  --panel:  #111e29;   /* cards */
+  --raise:  #16252f;
+  --line:   #22323f;
+  --line-2: #1a2833;
 
-  --text:   #ECE8E1;   /* primary, warm off-white */
-  --dim:    #8B9BAB;
-  --faint:  #5A6B7C;
+  --text:   #ece8e1;
+  --dim:    #7f909e;
+  --faint:  #56687a;
 
-  --hot:    #FF4655;   /* act on this */
-  --hot-dk: #C2303C;
-  --mint:   #14E0A6;   /* confirmed */
-  --mint-dk:#0A5F47;
-  --amber:  #FFB020;   /* waiting */
-  --amber-dk:#5E4210;
+  --hot:    #00e0a4;   /* act on this */
+  --hot-dk: #0b4f41;
+  --mint:   #00e0a4;   /* confirmed */
+  --mint-dk:#0b4f41;
+  --amber:  #f4b728;   /* waiting */
+  --amber-dk:#5e4210;
+  --danger: #ff4655;   /* refused, failed, destructive */
+  --danger-dk:#4a2129;
 
-  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
-  --sans: "Avenir Next", "Segoe UI", system-ui, sans-serif;
-  --cond: "Avenir Next Condensed", "Avenir Next", "Arial Narrow", sans-serif;
+  --mono: "Geist Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --sans: Geist, "Segoe UI", system-ui, sans-serif;
+  --cond: Geist, "Segoe UI", system-ui, sans-serif;
+  --serif: "Young Serif", ui-serif, "Iowan Old Style", Georgia, serif;
 
-  /* one cut corner, used everywhere so the shapes feel like one family */
-  --cut: polygon(0 0, 100% 0, 100% calc(100% - 10px), calc(100% - 10px) 100%, 0 100%);
-  --cut-sm: polygon(0 0, 100% 0, 100% calc(100% - 6px), calc(100% - 6px) 100%, 0 100%);
+  /* one bevel, used everywhere so the shapes feel like one family */
+  --cut: polygon(0 0, calc(100% - 11px) 0, 100% 11px, 100% 100%, 11px 100%, 0 calc(100% - 11px));
+  --cut-sm: polygon(0 0, calc(100% - 7px) 0, 100% 7px, 100% 100%, 7px 100%, 0 calc(100% - 7px));
 }
 
 * { box-sizing: border-box; }
@@ -45,12 +53,13 @@ body {
   color: var(--text);
   font: 400 14.5px/1.6 var(--sans);
   -webkit-font-smoothing: antialiased;
-  /* faint scanline, so the ground is not a dead flat fill */
-  background-image: repeating-linear-gradient(
-    0deg, rgba(255,255,255,.012) 0 1px, transparent 1px 3px);
+  /* faint grid, so the ground is not a dead flat fill */
+  background-image: linear-gradient(#101d28 1px, transparent 1px),
+                    linear-gradient(90deg, #101d28 1px, transparent 1px);
+  background-size: 52px 52px;
 }
 
-::selection { background: var(--hot); color: #0B1118; }
+::selection { background: var(--hot); color: #04110d; }
 :focus-visible { outline: 2px solid var(--hot); outline-offset: 2px; }
 
 code {
@@ -141,7 +150,7 @@ code {
 .nav button.on::before { background: var(--hot); }
 
 .pill {
-  font: 700 10px/1 var(--mono); background: var(--hot); color: #0B1118;
+  font: 700 10px/1 var(--mono); background: var(--hot); color: #04110d;
   padding: .22rem .4rem; min-width: 18px; text-align: center;
   clip-path: var(--cut-sm);
 }
@@ -156,7 +165,7 @@ code {
 .sys { display: grid; gap: .3rem; }
 .sys div { display: flex; align-items: center; gap: .45rem; font: 10.5px/1.3 var(--mono); color: var(--faint); }
 .sys i { width: 5px; height: 5px; flex: none; background: var(--faint); transform: rotate(45deg); }
-.sys i.go { background: var(--mint); } .sys i.bad { background: var(--hot); } .sys i.wait { background: var(--amber); }
+.sys i.go { background: var(--mint); } .sys i.bad { background: var(--danger); } .sys i.wait { background: var(--amber); }
 
 /* ── main ────────────────────────────────────────────────────────────────── */
 
@@ -231,14 +240,14 @@ code {
 }
 .banner.go   { border-left-color: var(--mint);  color: var(--mint);  background: rgba(20,224,166,.05); }
 .banner.wait { border-left-color: var(--amber); color: var(--amber); background: rgba(255,176,32,.05); }
-.banner.bad  { border-left-color: var(--hot); color: var(--hot); background: rgba(255,70,85,.05); }
+.banner.bad  { border-left-color: var(--danger); color: var(--danger); background: rgba(255,70,85,.05); }
 
 /* ── buttons ─────────────────────────────────────────────────────────────── */
 
 .btn {
   font: 700 11.5px/1 var(--cond); letter-spacing: .13em; text-transform: uppercase;
   padding: .7rem 1.1rem; cursor: pointer; clip-path: var(--cut-sm);
-  background: var(--hot); color: #0B1118; border: 0;
+  background: var(--hot); color: #04110d; border: 0;
   transition: filter .12s, transform .1s;
 }
 .btn:hover:not(:disabled) { filter: brightness(1.14); transform: translateY(-1px); }
@@ -249,8 +258,8 @@ code {
   box-shadow: inset 0 0 0 1px var(--line); clip-path: none;
 }
 .btn-ghost:hover:not(:disabled) { background: var(--raise); color: var(--text); box-shadow: inset 0 0 0 1px var(--dim); }
-.btn-ghost.danger { color: var(--hot); box-shadow: inset 0 0 0 1px var(--hot-dk); }
-.btn-ghost.danger:hover:not(:disabled) { background: rgba(255,70,85,.1); color: var(--hot); }
+.btn-ghost.danger { color: var(--danger); box-shadow: inset 0 0 0 1px var(--danger-dk); }
+.btn-ghost.danger:hover:not(:disabled) { background: rgba(255,70,85,.1); color: var(--danger); }
 .btn-ghost:disabled { background: transparent; color: var(--faint); box-shadow: inset 0 0 0 1px var(--line-2); }
 .btn-sm { font-size: 10.5px; padding: .5rem .75rem; }
 
@@ -305,7 +314,7 @@ code {
   font: 700 11px/1 var(--mono); background: var(--raise); color: var(--faint);
   clip-path: polygon(50% 0, 100% 25%, 100% 75%, 50% 100%, 0 75%, 0 25%);
 }
-.sig.ok .av { background: var(--mint); color: #0B1118; }
+.sig.ok .av { background: var(--mint); color: #04110d; }
 .sig .who { font-size: 13.5px; font-weight: 600; }
 .sig .st { font: 10.5px/1 var(--mono); color: var(--faint); letter-spacing: .06em; }
 .sig.ok .st { color: var(--mint); }
@@ -354,7 +363,7 @@ code {
 .owner .n { font-weight: 600; font-size: 14.5px; text-transform: capitalize; }
 .owner .r { font: 10.5px/1.4 var(--mono); color: var(--faint); }
 .owner .badge { font-size: 9.5px; font-weight: 700; padding: .32rem .55rem; border: 1px solid var(--line); color: var(--faint); }
-.owner.signed .av { background: var(--mint); color: #0B1118; }
+.owner.signed .av { background: var(--mint); color: #04110d; }
 .owner.signed .badge { color: var(--mint); border-color: var(--mint-dk); background: rgba(20,224,166,.07); }
 
 /* ── security grid ───────────────────────────────────────────────────────── */
@@ -372,8 +381,8 @@ code {
 .tcase .v { font-size: 9px; font-weight: 700; }
 .tcase.ok  { border-left-color: var(--mint); }
 .tcase.ok .v { color: var(--mint); }
-.tcase.bad { border-left-color: var(--hot); background: rgba(255,70,85,.08); }
-.tcase.bad .v { color: var(--hot); }
+.tcase.bad { border-left-color: var(--danger); background: rgba(255,70,85,.08); }
+.tcase.bad .v { color: var(--danger); }
 .tcase.run { border-left-color: var(--amber); }
 .tcase.run .v { color: var(--amber); }
 .tcase.control { border-left-color: var(--faint); }
@@ -395,7 +404,7 @@ code {
 .console .k-step { color: var(--hot); font-weight: 700; display: block; margin-top: .7rem; }
 .console .k-cmd  { color: var(--text); }
 .console .k-ok, .console .k-done { color: var(--mint); }
-.console .k-fail, .console .k-stop, .console .k-err { color: var(--hot); }
+.console .k-fail, .console .k-stop, .console .k-err { color: var(--danger); }
 .console .k-info, .console .k-tick { color: var(--faint); }
 .console:empty::before { content: "// awaiting input"; color: var(--faint); }
 
@@ -403,3 +412,74 @@ code {
 .console::-webkit-scrollbar-track { background: var(--void); }
 .console::-webkit-scrollbar-thumb { background: var(--line); }
 .console::-webkit-scrollbar-thumb:hover { background: var(--faint); }
+
+
+/* ── figures ──────────────────────────────────────────────────────────────
+   Every number a person has to read and trust is set in the serif, at a size
+   that survives a glance. Labels and chrome stay in the sans. */
+.topbar h1, .card-head h2, .card.stat strong, .tx-sum .amt, .acct-ring span, .bal {
+  font-variant-numeric: lining-nums tabular-nums;
+}
+.topbar h1, .card-head h2 {
+  font-family: var(--serif); font-weight: 400; letter-spacing: 0; text-transform: none;
+}
+.topbar h1 { font-size: 24px; }
+.card-head h2 { font-size: 16px; }
+.card.stat strong { font-family: var(--serif); font-weight: 400; font-size: 27px; letter-spacing: 0; }
+.tx-sum .amt { font-family: var(--serif); font-weight: 400; font-size: 34px; letter-spacing: 0; }
+.acct-ring span { font-family: var(--serif); font-weight: 400; }
+.bal { font-family: var(--serif); font-weight: 400; font-size: 19px; }
+
+
+/* ── kit buttons ─────────────────────────────────────────────────────────────
+   Same anatomy as member.css: gradient body, inner hairline, diamond glyph slot. */
+.btn {
+  display: inline-flex; align-items: center; gap: 10px;
+  background: linear-gradient(180deg, #1f2f3b, #16252f);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.07);
+}
+.btn::before {
+  content: ""; width: 6px; height: 6px; flex: none;
+  background: currentColor; opacity: .7; transform: rotate(45deg);
+}
+.btn:not(.btn-ghost):not(:disabled) {
+  background: linear-gradient(180deg, #2bf7bd, #00c48e);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.35);
+}
+.btn:disabled { background: var(--raise); box-shadow: none; }
+.btn:disabled::before { opacity: .3; }
+.btn-ghost.danger { background: linear-gradient(180deg, #ff5d6a, #d93140); color: #fff; box-shadow: inset 0 1px 0 rgba(255,255,255,.3); }
+.btn-ghost.danger:hover:not(:disabled) { filter: brightness(1.15); background: linear-gradient(180deg, #ff5d6a, #d93140); color: #fff; }
+
+/* ── HUD layer ───────────────────────────────────────────────────────────────
+   Same chrome as member.css: scanlines, corner brackets, notched labels. */
+body::before {
+  content: ""; position: fixed; inset: 0; z-index: 900; pointer-events: none;
+  background:
+    repeating-linear-gradient(0deg, rgba(255,255,255,.016) 0 1px, transparent 1px 3px),
+    radial-gradient(ellipse at 50% 42%, transparent 55%, rgba(0,0,0,.42) 100%);
+}
+body::after {
+  content: ""; position: fixed; inset: 10px; z-index: 901; pointer-events: none;
+  background-image:
+    linear-gradient(var(--faint),var(--faint)),linear-gradient(var(--faint),var(--faint)),
+    linear-gradient(var(--faint),var(--faint)),linear-gradient(var(--faint),var(--faint)),
+    linear-gradient(var(--faint),var(--faint)),linear-gradient(var(--faint),var(--faint)),
+    linear-gradient(var(--faint),var(--faint)),linear-gradient(var(--faint),var(--faint));
+  background-size: 14px 1px,1px 14px,14px 1px,1px 14px,14px 1px,1px 14px,14px 1px,1px 14px;
+  background-position: 0 0,0 0,100% 0,100% 0,0 100%,0 100%,100% 100%,100% 100%;
+  background-repeat: no-repeat; opacity: .5;
+}
+.card {
+  background-image:
+    linear-gradient(#334a5c,#334a5c), linear-gradient(#334a5c,#334a5c),
+    linear-gradient(#334a5c,#334a5c), linear-gradient(#334a5c,#334a5c);
+  background-size: 18px 2px, 2px 18px, 18px 2px, 2px 18px;
+  background-position: 0 0, 0 0, 100% 100%, 100% 100%;
+  background-repeat: no-repeat;
+}
+.card.stat .k::before {
+  content: ""; display: inline-block; width: 3px; height: 9px; margin-right: 8px;
+  vertical-align: -1px; background: var(--mint); box-shadow: 0 0 8px rgba(0,224,164,.6);
+}
+.brand-mark { box-shadow: 0 0 18px rgba(0,224,164,.45); }
