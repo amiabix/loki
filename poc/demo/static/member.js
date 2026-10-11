@@ -80,7 +80,7 @@ function render() {
     idle: ['Not started', 'Create a test payment to begin.'],
     preparing: ['Preparing vaults', 'Three separate member stores and the recipient vault are being created. This can take several minutes.'],
     waiting_for_reviews: ['Waiting for member review', 'Open Alice and Bob in separate browser sessions.'],
-    ready_to_send: ['Ready to send', 'Two verified approvals are saved. Carol can finish the transaction.'],
+    ready_to_send: ['Ready to send', 'Two verified approvals are stored by the relays. Carol can finish the transaction.'],
     sending: ['Proving and sending', 'The transaction is being proved and broadcast.'],
     broadcast: ['Broadcast', 'Waiting for the local chain to mine and verify it.'],
     confirmed: ['Confirmed', 'Both vaults verified the mined payment.'],
@@ -137,13 +137,15 @@ function render() {
       } else {
         row.append(make('span', status === 'approved' ? 'approved' : '', {
           waiting: 'Waiting for review', reviewing: 'Needs confirmation', signing: 'Signing',
-          approved: 'Approved', declined: 'Declined', failed: 'Failed',
+          approved: 'Approved', delivery_pending: 'Relay delivery pending',
+          declined: 'Declined', failed: 'Failed',
         }[status] || status));
       }
       box.append(row);
     }
     const reviewReady = ['alice', 'bob'].includes(s.role) && s.signers[s.role] === 'reviewing' && s.review;
     $('review-panel').hidden = !reviewReady;
+    $('retry-panel').hidden = !['alice', 'bob'].includes(s.role) || s.signers[s.role] !== 'delivery_pending';
     if (reviewReady) {
       const lines = $('review-lines'); lines.replaceChildren();
       for (const line of s.review.split('\n')) lines.append(make('div', '', line));
@@ -189,6 +191,7 @@ $('start-form').addEventListener('submit', (event) => {
 });
 $('approve').addEventListener('click', () => act('/api/decide', {action: 'approve'}));
 $('decline').addEventListener('click', () => act('/api/decide', {action: 'decline'}));
+$('retry').addEventListener('click', () => act('/api/decide', {action: 'retry'}));
 $('finish').addEventListener('click', () => act('/api/finish', {}));
 $('reset').addEventListener('click', () => act('/api/reset', {}));
 refresh();

@@ -21,7 +21,7 @@
       </div>
       <div class="side-bottom">
         <div class="side-role" id="side-role">Opening session…</div>
-        <div class="side-hint">Local regtest demo. This server holds the test member files.</div>
+          <div class="side-hint">Local regtest demo. This test server controls all three member stores.</div>
       </div>
     </aside>
 
@@ -71,6 +71,7 @@
             <div id="review-lines" class="review-lines"></div>
             <div class="actions"><button class="button primary" id="approve" type="button">Confirm payment</button><button class="button quiet" id="decline" type="button">Decline</button></div>
           </div>
+          <div class="review" id="retry-panel" hidden><h4>Approval waiting for relay storage</h4><p>Your signed share is saved locally. Retry delivery before this approval can count.</p><button class="button primary" id="retry" type="button">Retry delivery</button></div>
           <div class="payment-footer" id="finish-panel" hidden><p>Two members approved this exact attempt. Carol can now prove and send it.</p><button class="button primary" id="finish" type="button">Prove and send</button></div>
         </article>
       </section>

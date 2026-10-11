@@ -11,20 +11,28 @@ import re
 import secrets
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 DEMO = Path(__file__).resolve().parent
 POC = DEMO.parent
-ROOT = DEMO / ".member-sandbox"
+ROOT = Path(os.environ.get("LOKI_MEMBER_DEMO_ROOT", DEMO / ".member-sandbox")).resolve()
+if ROOT.name != ".member-sandbox" and not ROOT.name.startswith("loki-member-demo-"):
+    raise RuntimeError("demo state directory must be named .member-sandbox or loki-member-demo-*")
 RUN = ROOT / "run"
 STATIC = DEMO / "static"
 sys.path.insert(0, str(POC))
 
 from managed_ths import ManagedTHS, command  # noqa: E402
+sys.path.insert(0, str(POC.parent / "communication" / "harness"))
+import relay_payment  # noqa: E402
+import run as relay_run  # noqa: E402
+import three_members  # noqa: E402
 
 
 def binary(name: str) -> Path:
@@ -35,6 +43,17 @@ def binary(name: str) -> Path:
     if not path.is_file() or not os.access(path, os.X_OK):
         raise RuntimeError(f"build {name} with: cd poc && cargo build --locked --bins")
     return path
+
+
+def free_relay_ports():
+    sockets = [socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in range(3)]
+    try:
+        for listener in sockets:
+            listener.bind(("127.0.0.1", 0))
+        return tuple(listener.getsockname()[1] for listener in sockets)
+    finally:
+        for listener in sockets:
+            listener.close()
 
 
 class Flow:
@@ -51,6 +70,12 @@ class Flow:
         self.processes = {}
         self.signer_threads = []
         self.worker = None
+        self.owner = self.context = self.relay_binary = self.pay_binary = None
+        self.works = {}
+        self.attempt = None
+        self.sent = set()
+        self.before_delivery = {}
+        self.transport_lock = threading.Lock()
         self.tokens = {role: secrets.token_urlsafe(32) for role in ("admin", "alice", "bob")}
 
     def role(self, token: str) -> str | None:
@@ -89,7 +114,12 @@ class Flow:
             if self.phase != "idle":
                 raise ValueError("reset this demo before starting another payment")
             binary("loki_setup_member")
-            binary("loki_member_payment")
+            self.pay_binary = binary("loki_member_payment")
+            feature = subprocess.run([str(self.pay_binary), "features"], capture_output=True, timeout=5)
+            if feature.returncode or feature.stdout != b"relay-backed-signing=1\n":
+                raise ValueError("build loki_member_payment with --features relay-communication")
+            binary("loki_relay_member")
+            relay_run.find_binary("loki-relay-server", workspace=POC.parent / "communication")
             self.phase = "preparing"
             self.error = None
             self.worker = threading.Thread(target=self._prepare, args=(amount, memo), daemon=True)
@@ -115,15 +145,33 @@ class Flow:
                 "fee_zat": manifest["fee_zat"], "change_zat": manifest["change_zat"],
                 "expiry_height": manifest["expiry_height"],
             }
+            self.attempt = manifest["attempt"]
+            self.owner = three_members.MemberEnvironments.create(RUN / "relay")
+            deadline = time.monotonic() + 900
+            self.context, _hashes, _isolation, _server, self.relay_binary = three_members.prepare_existing(
+                self.owner, RUN / "source", free_relay_ports(), POC.parent / "communication", POC, deadline)
+            for member in self.context.members:
+                work = member.root / "payment" / manifest["attempt"]
+                work.parent.mkdir(mode=0o700)
+                work.mkdir(mode=0o700)
+                relay_run._write_new(work / "payment.json", (RUN / "payment" / "payment.json").read_bytes(), 0o600)
+                self.works[member.member_id] = work
+            for member in self.context.members[:2]:
+                if "commitments published" not in self._payment_command(member, "commit"):
+                    raise RuntimeError("member did not publish commitments")
+                self._pump()
+            if "payment package published" not in self._payment_command(self.context.members[0], "package"):
+                raise RuntimeError("proposer did not publish the checked payment package")
+            self._pump()
+            for name, member in (("alice", self.context.members[0]), ("bob", self.context.members[1])):
+                self.before_delivery[name] = {item["id"] for item in
+                    three_members.status(self.context, self.relay_binary, member, time.monotonic() + 120)["messages"]}
             with self.lock:
                 self.payment = payment
                 self.phase = "waiting_for_reviews"
-            for name, number in (("alice", 1), ("bob", 2)):
-                owner = RUN / "source" / f"member-{number}"
-                args = [str(binary("loki_member_payment")), "sign", str(owner),
-                        str(owner / "pass.txt"), str(RUN / "source" / "roster.json"),
-                        str(RUN / "payment")]
-                process = subprocess.Popen(args, cwd=POC, env=self.chain.client.env(),
+            for name, member in (("alice", self.context.members[0]), ("bob", self.context.members[1])):
+                args = self._payment_args(member, "approve")
+                process = subprocess.Popen(args, cwd=member.root,
                                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                            stderr=subprocess.STDOUT, text=True, bufsize=1)
                 with self.lock:
@@ -133,6 +181,32 @@ class Flow:
                 reader.start()
         except Exception as error:
             self._fail(error)
+
+    def _payment_args(self, member, action, *extra):
+        return relay_payment.payment_command(
+            self.owner, member, self.pay_binary, self.context.roster,
+            self.works[member.member_id], self.chain.client.rpc_address, action, *extra)
+
+    def _payment_command(self, member, action, *extra, timeout=300):
+        result = command(self._payment_args(member, action, *extra), self.cancel,
+                         timeout, cwd=str(member.root))
+        if result.returncode:
+            raise RuntimeError((result.stderr or result.stdout).strip()[-1000:]
+                               or f"{action} exited {result.returncode}")
+        return result.stdout
+
+    def _pump(self):
+        with self.transport_lock:
+            relay_payment.pump(self.context, self.relay_binary, self.works,
+                               self.attempt, self.sent, time.monotonic() + 120)
+
+    def _deliver_approval(self, name):
+        self._pump()
+        member = self.context.members[0 if name == "alice" else 1]
+        current = three_members.status(self.context, self.relay_binary, member, time.monotonic() + 120)
+        delivered = [item for item in current["messages"]
+                     if item["id"] not in self.before_delivery[name] and item["kind"] == "test"]
+        return len(delivered) == 2 and all(item["stored_whole"] == "1" for item in delivered)
 
     def _read_signer(self, name: str, process: subprocess.Popen):
         lines = []
@@ -148,16 +222,25 @@ class Flow:
                     with self.lock:
                         self.review[name] = "\n".join(lines)
                         self.signers[name] = "reviewing"
-                if line.startswith("approved payment "):
+                if line == "signed locally; approval delivery pending relay storage":
                     lines.append(line)
             code = process.wait()
+            locally_signed = code == 0 and lines[-1:] == [
+                "signed locally; approval delivery pending relay storage"]
+            delivered = False
+            if locally_signed:
+                try:
+                    delivered = self._deliver_approval(name)
+                except Exception as error:
+                    with self.lock:
+                        self.error = f"{name}'s share is saved locally; relay delivery needs retry: {error}"
             with self.lock:
-                if code == 0 and lines[-1:] == [
-                    f"approved payment {self.payment['id']} as member {1 if name == 'alice' else 2}"
-                ]:
-                    self.signers[name] = "approved"
-                    if all(value == "approved" for value in self.signers.values()):
-                        self.phase = "ready_to_send"
+                if locally_signed:
+                    self.signers[name] = "approved" if delivered else "delivery_pending"
+                    if delivered:
+                        self.error = None
+                        if all(value == "approved" for value in self.signers.values()):
+                            self.phase = "ready_to_send"
                 elif self.signers[name] == "declined":
                     self.phase = "declined"
                 else:
@@ -169,11 +252,19 @@ class Flow:
             self._fail(error)
 
     def decide(self, role: str, action: str):
-        if role not in self.review or action not in ("approve", "decline"):
+        if role not in self.review or action not in ("approve", "decline", "retry"):
             raise ValueError("a signer must approve or decline")
         with self.lock:
             if self.phase != "waiting_for_reviews":
                 raise ValueError("this signing attempt is no longer awaiting approvals")
+            if action == "retry":
+                if self.signers[role] != "delivery_pending":
+                    raise ValueError("this member has no saved approval to retry")
+                self.signers[role] = "signing"
+                reader = threading.Thread(target=self._retry_delivery, args=(role,), daemon=True)
+                self.signer_threads.append(reader)
+                reader.start()
+                return
             if self.signers[role] != "reviewing" or not self.review[role]:
                 raise ValueError("this member has no verified review awaiting a decision")
             process = self.processes[role]
@@ -182,6 +273,22 @@ class Flow:
             self.signers[role] = "signing" if action == "approve" else "declined"
             process.stdin.write(f"APPROVE {self.payment['id']}\n" if action == "approve" else "DECLINE\n")
             process.stdin.flush()
+
+    def _retry_delivery(self, role):
+        try:
+            member = self.context.members[0 if role == "alice" else 1]
+            self._payment_command(member, "resend")
+            delivered = self._deliver_approval(role)
+            with self.lock:
+                self.signers[role] = "approved" if delivered else "delivery_pending"
+                if delivered:
+                    self.error = None
+                    if all(value == "approved" for value in self.signers.values()):
+                        self.phase = "ready_to_send"
+        except Exception as error:
+            with self.lock:
+                self.signers[role] = "delivery_pending"
+                self.error = f"{role}'s relay delivery needs retry: {error}"
 
     def finish(self):
         with self.lock:
@@ -193,10 +300,24 @@ class Flow:
 
     def _finish(self):
         try:
-            owner = RUN / "source" / "member-3"
-            base = [str(owner), str(owner / "pass.txt"), str(RUN / "source" / "roster.json"),
-                    str(RUN / "payment")]
-            out = self._command([str(binary("loki_member_payment")), "finish", *base], timeout=900)
+            member = self.context.members[2]
+            process = subprocess.Popen(self._payment_args(member, "finish"), cwd=member.root,
+                                       stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, text=True)
+            deadline = time.monotonic() + 900
+            try:
+                while process.poll() is None:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("finishing timed out")
+                    self._pump()
+                    time.sleep(0.1)
+                out, err = process.communicate(timeout=2)
+                if process.returncode:
+                    raise RuntimeError((err or out).strip()[-1000:] or "finisher stopped")
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=5)
             match = re.search(r"broadcast txid=([0-9a-f]{64}) payment=([0-9a-f]{64})", out)
             if not match or match.group(2) != self.payment["id"]:
                 raise RuntimeError("finisher did not return the expected payment")
@@ -205,7 +326,7 @@ class Flow:
                 self.txid = txid
                 self.phase = "broadcast"
             self.chain.mine(3)
-            verified = self._command([str(binary("loki_member_payment")), "verify", *base, txid])
+            verified = self._payment_command(member, "verify", txid)
             recipient = RUN / "recipient" / "member-1"
             received = self._command([
                 str(binary("loki_member_payment")), "receive", str(recipient),
@@ -236,6 +357,8 @@ class Flow:
         self.processes.clear()
         for reader in self.signer_threads:
             reader.join(timeout=5)
+            if reader.is_alive():
+                raise ValueError("wait for the current approval to finish before resetting")
         self.signer_threads.clear()
 
     def reset(self):
@@ -244,6 +367,7 @@ class Flow:
                 raise ValueError("wait for the current operation to finish before resetting")
         self._stop_signers()
         with self.lock:
+            self._close_owner()
             self.chain.stop()
             if ROOT.exists():
                 shutil.rmtree(ROOT)
@@ -253,6 +377,21 @@ class Flow:
             self.error = self.payment = self.txid = None
             self.review = {"alice": None, "bob": None}
             self.signers = {"alice": "waiting", "bob": "waiting"}
+            self.context = self.relay_binary = self.pay_binary = None
+            self.works = {}
+            self.attempt = None
+            self.sent = set()
+            self.before_delivery = {}
+
+    def _close_owner(self):
+        if not self.owner and (RUN / "relay").exists():
+            record = json.loads((RUN / "relay" / relay_run.OwnedRun.MARKER).read_text())
+            self.owner = three_members.MemberEnvironments.reopen(
+                RUN / "relay", expected_run_id=record["run_id"])
+        if self.owner:
+            self.owner.close(timeout=10)
+            self.owner.delete(expected_run_id=self.owner.run_id)
+            self.owner = None
 
     def close(self):
         self.cancel.set()
@@ -262,6 +401,7 @@ class Flow:
             if self.worker.is_alive():
                 print("active operation did not settle; saved THS ownership for recovery", file=sys.stderr)
                 return
+        self._close_owner()
         self.chain.stop()
 
 
@@ -342,7 +482,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=8790)
     args = parser.parse_args()
-    lock_file = (DEMO / ".member-sandbox.lock").open("a")
+    ROOT.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = ROOT.with_suffix(".lock").open("a")
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
