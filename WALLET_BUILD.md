@@ -1,6 +1,6 @@
 # Building Loki as a member-owned wallet
 
-Status: implementation plan for the first usable wallet flow, not a custody release. The member setup app under `poc/wallet/` now has one local profile per process and a separate identity and sealed share for each vault membership. It covers create, join, roster comparison, DKG, backup activation, receive address and a manual chain balance scan. A separate regtest reference-wallet command now proves control of one ZIP 32 Orchard account and binds it locally before key creation. This is not an external-wallet or QR connector. The app still uses a local file courier and a simultaneous setup round. Persistent chain sync, payment screens, asynchronous relays, recovery, external wallet integration and passkey unlock remain to be implemented.
+Status: implementation plan for the first usable wallet flow, not a custody release. The member setup app under `poc/wallet/` now has one local profile per process and a separate identity and sealed share for each vault membership. It covers create, join, roster comparison, DKG, backup activation, receive address and a manual chain balance scan. A separate regtest reference-wallet command proves control of one ZIP 32 Orchard account and binds it locally before key creation. A second loopback dashboard origin can now request vault discovery and ask to create a draft; both connecting and each creation need explicit approval in the signer window. It does not request transaction signatures. This is not an external-wallet or QR connector. The app still uses a local file courier and a simultaneous setup round. Persistent chain sync, payment screens, asynchronous relays, recovery, external wallet integration and passkey unlock remain to be implemented.
 
 ## Intent and scope
 
@@ -37,11 +37,13 @@ to approve. Carol does the same. A synced member finishes and broadcasts it.
 Disconnecting Alice's signer ends this browser session; it does not remove her
 from the vault or delete her share. Reconnecting it restores her vault list.
 
-The current regtest app combines dashboard and signer in one local process. Its
-reference-wallet proof only links an Orchard account locally; it does not provide
-the separate signer connection above. A real connection requires a signer-held
-share, an authenticated session with explicit approval and disconnect, and a
-review request that the signer can verify without trusting the dashboard.
+The regtest app now serves a dashboard and signer on separate loopback origins
+from one local process. The dashboard session has explicit approval and
+disconnect, reads only vault names, member slots and setup status, and can
+request a vault draft that the signer separately approves. Joining, roster
+agreement and backup stay in the signer window; the payment review request and relay inbox
+are not connected to the dashboard. Its reference-wallet proof links an
+Orchard account locally and does not give an external wallet a FROST share.
 
 1. **Open / connect / unlock.** The regtest app creates a local profile, then a person exports a challenge, signs it in the separate reference wallet command, and pastes the proof back. Loki verifies the proof before vault key creation. The app shows **Create vault**, **Join vault**, and their vault list. A fresh transport identity is created for each vault; the profile does not publish one stable identity across all its vaults. External-wallet QR connection and passkey unlock remain future work.
 2. **Create vault.** The creator enters a name and selects the supported 2-of-3 policy. The app makes a random vault ID and two invite links. The creator is one member by default. It shows three slots and who has accepted; the vault is a draft with no receive address.

@@ -30,6 +30,28 @@ cargo build --locked --bins
 python3 wallet/member_app.py --data /tmp/loki-member-1 --exchange /tmp/loki-setup-exchange --port 8801
 ```
 
+For the separate dashboard and signer flow, start the same member app with a
+second loopback port:
+
+```sh
+python3 wallet/member_app.py --data /tmp/loki-member-1 --exchange /tmp/loki-setup-exchange --port 8801 --dashboard-port 8901
+```
+
+Open the printed **Signer** URL in one window, create or unlock the local
+profile there, and open the printed **Dashboard** URL in another. Click
+**Connect signer** on the dashboard. The signer window shows the requesting
+origin, regtest network, and requested access; approve there. The dashboard
+then shows only that profile's vault names, member slots and setup status.
+**Create vault** in the dashboard sends a separate request that names the vault;
+it creates nothing until the signer window approves it. Join, compare the
+roster, and back up in the signer window; the dashboard updates its vault list.
+**Disconnect** removes the dashboard grant without removing membership.
+Locking the signer also revokes it. Grants are in memory and expire after one
+hour. They permit status reads and action requests, never silent vault creation
+or signing. Do not share the signer's private URL.
+The dashboard cannot approve or sign payments; that needs a signer-side
+transaction review request and the relay-backed inbox.
+
 Start two more processes with different private data directories and ports 8802
 and 8803, using the same exchange directory. Open each printed private URL in a
 separate browser window. Each person creates a local profile and unlocks it. A
@@ -69,4 +91,5 @@ Verify the member flow:
 
 ```sh
 python3 -m unittest -v wallet/test_account_link.py wallet/test_member_app.py
+python3 -m unittest -v wallet/test_signer_session.py
 ```

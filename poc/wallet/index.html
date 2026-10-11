@@ -12,6 +12,8 @@
 <main>
   <div class="row"><div><h1 id="title">Your wallet</h1><p class="muted" id="subtitle">Unlock your local profile.</p></div><button class="secondary" id="back" type="button" hidden>All vaults</button><button class="secondary" id="lock" type="button" hidden>Lock</button></div>
   <p id="message" role="status" hidden></p>
+  <section class="card" id="signer-requests" hidden><h2>Dashboard connection requests</h2><p>Check the origin and access before approving. This does not approve a payment.</p><div id="signer-request-list"></div></section>
+  <section class="card" id="signer-actions" hidden><h2>Vault requests from your dashboard</h2><p>Check each vault name before creating it. This does not approve a payment.</p><div id="signer-action-list"></div></section>
   <section class="card" id="new-profile" hidden><h2>Create your profile</h2><p>One local profile can belong to several vaults. Each vault gets its own member identity and signing share.</p><form id="profile-create"><label>Your name<input name="name" maxlength="80" required></label><label>Unlock passphrase<input name="passphrase" type="password" minlength="12" autocomplete="new-password" required></label><button>Create profile</button></form></section>
   <section class="card" id="locked" hidden><h2>Unlock your profile</h2><form id="unlock"><label>Passphrase<input name="passphrase" type="password" autocomplete="current-password" required></label><button>Unlock</button></form></section>
   <div id="home" hidden>

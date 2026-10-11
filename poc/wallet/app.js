@@ -54,6 +54,70 @@ function vaultList(vaults) {
     list.append(button);
   }
 }
+async function refreshSignerRequests(unlocked) {
+  const section = $('signer-requests');
+  const actionsSection = $('signer-actions');
+  section.hidden = true;
+  actionsSection.hidden = true;
+  if (!unlocked) return;
+  const {requests} = await api('session/pending');
+  const list = $('signer-request-list');
+  list.replaceChildren();
+  for (const request of requests) {
+    const item = document.createElement('div');
+    const description = document.createElement('p');
+    description.textContent = `${request.origin} · ${request.network} · ${request.access}`;
+    const approve = document.createElement('button');
+    approve.type = 'button';
+    approve.textContent = 'Approve dashboard access';
+    approve.addEventListener('click', async () => {
+      try { await api('session/approve', {request: request.request}); message('Dashboard connected. Each vault creation still needs your approval.'); await refresh(); }
+      catch (error) { message(error.message, true); }
+    });
+    const reject = document.createElement('button');
+    reject.type = 'button';
+    reject.className = 'secondary';
+    reject.textContent = 'Reject';
+    reject.addEventListener('click', async () => {
+      try { await api('session/reject', {request: request.request}); await refresh(); }
+      catch (error) { message(error.message, true); }
+    });
+    item.append(description, approve, reject);
+    list.append(item);
+  }
+  section.hidden = !requests.length;
+  const {actions} = await api('session/actions');
+  const actionList = $('signer-action-list');
+  actionList.replaceChildren();
+  for (const action of actions) {
+    const item = document.createElement('div');
+    const description = document.createElement('p');
+    description.textContent = `${action.origin} requests a new vault named “${action.name}” on regtest.`;
+    const approve = document.createElement('button');
+    approve.type = 'button';
+    approve.textContent = 'Create this vault';
+    approve.addEventListener('click', async () => {
+      approve.disabled = true;
+      try {
+        const result = await api('session/action-approve', {action: action.action});
+        selectVault(result.created);
+        message('Vault draft created. Continue setup and invites in this signer window.');
+        await refresh();
+      } catch (error) { message(error.message, true); approve.disabled = false; }
+    });
+    const reject = document.createElement('button');
+    reject.type = 'button';
+    reject.className = 'secondary';
+    reject.textContent = 'Reject';
+    reject.addEventListener('click', async () => {
+      try { await api('session/action-reject', {action: action.action}); await refresh(); }
+      catch (error) { message(error.message, true); }
+    });
+    item.append(description, approve, reject);
+    actionList.append(item);
+  }
+  actionsSection.hidden = !actions.length;
+}
 async function refresh() {
   try {
     const state = await api('status' + (selectedVault ? `?vault=${encodeURIComponent(selectedVault)}` : ''));
@@ -93,6 +157,7 @@ async function refresh() {
       else if (state.phase === 'stopped') message('Setup stopped: ' + state.error + '. Start a fresh vault session.', true);
     }
     if (state.error) message(state.error, true);
+    await refreshSignerRequests(!!state.profile);
   } catch (error) { message(error.message, true); }
 }
 action('profile-create', async (form) => { await api('profile-create', fields(form)); message('Profile created. You can now create or join vaults.'); });

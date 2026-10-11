@@ -52,6 +52,144 @@ def check_passphrase(value):
     return value
 
 
+class SignerSessions:
+    """Scoped dashboard grants; the signer never exports its private app token."""
+
+    def __init__(self, dashboard_origin, now=time.time):
+        self.origin = dashboard_origin
+        self.now = now
+        self.records = {}
+        self.actions = {}
+        self.lock = threading.Lock()
+
+    def _valid(self, key, origin):
+        item = self.records.get(key)
+        return bool(item and item["state"] == "approved" and item["origin"] == origin
+                    and item["expires"] > self.now())
+
+    def request(self, origin):
+        if origin != self.origin:
+            raise ValueError("Unexpected dashboard origin")
+        with self.lock:
+            self.records = {key: item for key, item in self.records.items() if item["expires"] > self.now()}
+            if len(self.records) >= 16:
+                raise ValueError("Too many connection requests")
+            key = secrets.token_urlsafe(32)
+            self.records[key] = {"origin": origin, "state": "pending", "expires": self.now() + 300}
+            return key
+
+    def pending(self):
+        with self.lock:
+            return [{"request": key, "origin": item["origin"], "network": "regtest",
+                     "access": "View vault status and request vault creation; each creation needs signer approval"}
+                    for key, item in self.records.items()
+                    if item["state"] == "pending" and item["expires"] > self.now()]
+
+    def approve(self, key):
+        with self.lock:
+            item = self.records.get(key)
+            if not item or item["state"] != "pending" or item["expires"] <= self.now():
+                raise ValueError("Connection request missing or expired")
+            item["state"] = "approved"
+            item["expires"] = self.now() + 3600
+
+    def reject(self, key):
+        with self.lock:
+            item = self.records.get(key)
+            if not item or item["state"] != "pending":
+                raise ValueError("Connection request missing")
+            item["state"] = "rejected"
+
+    def poll(self, key):
+        with self.lock:
+            item = self.records.get(key)
+            if not item:
+                return "missing"
+            if item["expires"] <= self.now():
+                return "expired"
+            return item["state"]
+
+    def valid(self, key, origin):
+        with self.lock:
+            return self._valid(key, origin)
+
+    def request_action(self, key, origin, value):
+        if value.get("kind") != "create" or not isinstance(value.get("name"), str):
+            raise ValueError("Unsupported vault request")
+        name = value["name"].strip()
+        if not 1 <= len(name.encode()) <= 80:
+            raise ValueError("Enter a vault name of 1 to 80 UTF-8 bytes")
+        with self.lock:
+            if not self._valid(key, origin):
+                raise ValueError("Connect your signer")
+            self.actions = {action: item for action, item in self.actions.items()
+                            if item["expires"] > self.now()}
+            if len(self.actions) >= 16:
+                raise ValueError("Too many vault requests")
+            action = secrets.token_urlsafe(32)
+            self.actions[action] = {"session": key, "origin": origin, "kind": "create",
+                                    "name": name, "state": "pending", "expires": self.now() + 300}
+            return action
+
+    def pending_actions(self):
+        with self.lock:
+            return [{"action": action, "origin": item["origin"], "kind": item["kind"],
+                     "name": item["name"]} for action, item in self.actions.items()
+                    if item["state"] == "pending" and item["expires"] > self.now()
+                    and self._valid(item["session"], item["origin"])]
+
+    def take_action(self, action):
+        with self.lock:
+            item = self.actions.get(action)
+            if not item or item["state"] != "pending" or item["expires"] <= self.now() \
+                    or not self._valid(item["session"], item["origin"]):
+                raise ValueError("Vault request missing or expired")
+            item["state"] = "executing"
+            return {"kind": item["kind"], "name": item["name"]}
+
+    def finish_action(self, action, result=None, error=None):
+        with self.lock:
+            item = self.actions[action]
+            item["state"] = "failed" if error else "done"
+            item["result"] = result
+            item["error"] = error
+            item["expires"] = self.now() + 3600
+
+    def reject_action(self, action):
+        with self.lock:
+            item = self.actions.get(action)
+            if not item or item["state"] != "pending":
+                raise ValueError("Vault request missing")
+            item["state"] = "rejected"
+
+    def poll_action(self, key, origin, action):
+        with self.lock:
+            item = self.actions.get(action)
+            if not self._valid(key, origin) or not item or item["session"] != key:
+                raise ValueError("Vault request missing")
+            if item["expires"] <= self.now():
+                return {"state": "expired"}
+            response = {"state": item["state"]}
+            if item["state"] == "done":
+                response["result"] = item["result"]
+            if item["state"] == "failed":
+                response["error"] = item["error"]
+            return response
+
+    def disconnect(self, key, origin):
+        if not self.valid(key, origin):
+            raise ValueError("No connected signer session")
+        with self.lock:
+            self.records.pop(key, None)
+            self.actions = {action: item for action, item in self.actions.items()
+                            if item["session"] != key or item["state"] == "executing"}
+
+    def clear(self):
+        with self.lock:
+            self.records.clear()
+            self.actions.clear()
+
+
 class Wallet:
     def __init__(self, data, exchange, setup=SETUP):
         self.data = data.resolve()
@@ -367,16 +505,30 @@ class Wallet:
         self.process_lock.close()
 
 
-def serve(wallet, port):
+def make_signer_server(wallet, port, dashboard_port=None):
     token = secrets.token_urlsafe(32)
+    dashboard_origin = f"http://127.0.0.1:{dashboard_port}" if dashboard_port else None
+    sessions = SignerSessions(dashboard_origin)
 
     class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def trusted_host(self):
+            return self.headers.get("Host") == f"127.0.0.1:{self.server.server_address[1]}"
+
+        def dashboard_origin(self):
+            return dashboard_origin is not None and self.headers.get("Origin") == dashboard_origin
+
         def reply(self, status, value):
             body = json.dumps(value).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
+            if self.path.startswith("/api/session/") and self.dashboard_origin():
+                self.send_header("Access-Control-Allow-Origin", dashboard_origin)
+                self.send_header("Vary", "Origin")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -384,7 +536,19 @@ def serve(wallet, port):
         def authorized(self):
             return secrets.compare_digest(self.headers.get("X-Loki-Token", ""), token)
 
+        def do_OPTIONS(self):
+            if not self.trusted_host() or not self.path.startswith("/api/session/") or not self.dashboard_origin():
+                return self.reply(403, {"error": "Unauthorized"})
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", dashboard_origin)
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Loki-Session")
+            self.send_header("Access-Control-Max-Age", "300")
+            self.end_headers()
+
         def do_GET(self):
+            if not self.trusted_host():
+                return self.reply(403, {"error": "Unauthorized host"})
             path, _, query = self.path.partition("?")
             if path == "/":
                 page = (HERE / "index.html").read_bytes()
@@ -407,9 +571,26 @@ def serve(wallet, port):
                 self.end_headers()
                 self.wfile.write((HERE / "app.css").read_bytes())
                 return
+            if path == "/api/session/vaults":
+                key = self.headers.get("X-Loki-Session", "")
+                if not self.dashboard_origin() or not sessions.valid(key, dashboard_origin):
+                    return self.reply(403, {"error": "Connect your signer"})
+                try:
+                    with wallet.lock:
+                        profile = wallet.require_profile()
+                        vaults = [{"vault": item["vault"], "name": item["name"], "slot": item["slot"],
+                                   "phase": wallet.status(item["vault"])["phase"]}
+                                  for item in wallet.vaults()]
+                    return self.reply(200, {"profile": profile["name"], "vaults": vaults})
+                except Exception as error:
+                    return self.reply(400, {"error": str(error)})
             if not self.authorized():
                 return self.reply(403, {"error": "Open the private local app link"})
             try:
+                if path == "/api/session/pending":
+                    return self.reply(200, {"requests": sessions.pending()})
+                if path == "/api/session/actions":
+                    return self.reply(200, {"actions": sessions.pending_actions()})
                 values = parse_qs(query)
                 vault = values.get("vault", [None])[0]
                 if path == "/api/status":
@@ -423,14 +604,56 @@ def serve(wallet, port):
             self.reply(404, {"error": "Not found"})
 
         def do_POST(self):
-            if not self.authorized() or self.headers.get("Origin") not in (None, f"http://127.0.0.1:{port}"):
+            if not self.trusted_host():
+                return self.reply(403, {"error": "Unauthorized host"})
+            is_dashboard = self.path in ("/api/session/request", "/api/session/poll",
+                                         "/api/session/disconnect", "/api/session/action",
+                                         "/api/session/action-poll")
+            if is_dashboard:
+                if not self.dashboard_origin():
+                    return self.reply(403, {"error": "Unauthorized dashboard origin"})
+            elif not self.authorized() or self.headers.get("Origin") not in (
+                None, f"http://127.0.0.1:{self.server.server_address[1]}"):
                 return self.reply(403, {"error": "Unauthorized"})
             try:
                 size = int(self.headers.get("Content-Length", "0"))
-                if not 0 < size <= 128 * 1024:
+                if not 0 < size <= (4096 if is_dashboard else 128 * 1024):
                     raise ValueError("Invalid request size")
                 value = json.loads(self.rfile.read(size))
+                if is_dashboard:
+                    if self.path == "/api/session/request":
+                        return self.reply(200, {"request": sessions.request(dashboard_origin)})
+                    key = self.headers.get("X-Loki-Session", "") or value.get("request", "")
+                    if self.path == "/api/session/poll":
+                        return self.reply(200, {"state": sessions.poll(key)})
+                    if self.path == "/api/session/action":
+                        return self.reply(200, {"action": sessions.request_action(key, dashboard_origin, value)})
+                    if self.path == "/api/session/action-poll":
+                        return self.reply(200, sessions.poll_action(key, dashboard_origin, value.get("action")))
+                    sessions.disconnect(key, dashboard_origin)
+                    return self.reply(200, {"disconnected": True})
                 with wallet.lock:
+                    if self.path == "/api/session/approve":
+                        wallet.require_profile()
+                        sessions.approve(value.get("request"))
+                        return self.reply(200, {"approved": True})
+                    if self.path == "/api/session/reject":
+                        sessions.reject(value.get("request"))
+                        return self.reply(200, {"rejected": True})
+                    if self.path == "/api/session/action-approve":
+                        wallet.require_profile()
+                        action = value.get("action")
+                        details = sessions.take_action(action)
+                        try:
+                            result = wallet.create(details["name"])
+                        except Exception as error:
+                            sessions.finish_action(action, error=str(error))
+                            raise
+                        sessions.finish_action(action, result={"vault": result["vault"]})
+                        return self.reply(200, {"created": result["vault"]})
+                    if self.path == "/api/session/action-reject":
+                        sessions.reject_action(value.get("action"))
+                        return self.reply(200, {"rejected": True})
                     routes = {
                         "/api/profile-create": lambda: wallet.create_profile(value.get("name"), value.get("passphrase")),
                         "/api/unlock": lambda: wallet.unlock(value.get("passphrase")),
@@ -447,16 +670,65 @@ def serve(wallet, port):
                     }
                     if self.path not in routes:
                         return self.reply(404, {"error": "Not found"})
-                    self.reply(200, routes[self.path]())
+                    result = routes[self.path]()
+                    if self.path == "/api/lock":
+                        sessions.clear()
+                    self.reply(200, result)
             except Exception as error:
                 self.reply(400, {"error": str(error)})
 
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print(f"Open http://127.0.0.1:{port}/#{token}", flush=True)
+    return server, token
+
+
+def make_dashboard_server(signer_port, port):
+    signer_origin = f"http://127.0.0.1:{signer_port}"
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            if self.headers.get("Host") != f"127.0.0.1:{self.server.server_address[1]}":
+                self.send_error(403)
+                return
+            assets = {"/": ("dashboard.html", "text/html; charset=utf-8"),
+                      "/dashboard.js": ("dashboard.js", "text/javascript; charset=utf-8"),
+                      "/app.css": ("app.css", "text/css; charset=utf-8")}
+            if self.path not in assets:
+                self.send_error(404)
+                return
+            name, mime = assets[self.path]
+            body = (HERE / name).read_bytes()
+            if name == "dashboard.html":
+                body = body.replace(b"{{SIGNER_ORIGIN}}", signer_origin.encode())
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'self'; "
+                             f"style-src 'self'; connect-src 'self' {signer_origin}")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    return ThreadingHTTPServer(("127.0.0.1", port), Handler)
+
+
+def serve(wallet, port, dashboard_port=None):
+    server, token = make_signer_server(wallet, port, dashboard_port)
+    dashboard = make_dashboard_server(port, dashboard_port) if dashboard_port else None
+    if dashboard:
+        threading.Thread(target=dashboard.serve_forever, daemon=True).start()
+        print(f"Dashboard: http://127.0.0.1:{dashboard_port}/", flush=True)
+    print(f"Signer: http://127.0.0.1:{port}/#{token}", flush=True)
     try:
         server.serve_forever()
     finally:
         server.server_close()
+        if dashboard:
+            dashboard.shutdown()
+            dashboard.server_close()
         wallet.close()
 
 
@@ -465,5 +737,6 @@ if __name__ == "__main__":
     parser.add_argument("--data", type=Path, required=True, help="private directory for this member only")
     parser.add_argument("--exchange", type=Path, required=True, help="shared untrusted local setup courier")
     parser.add_argument("--port", type=int, required=True)
+    parser.add_argument("--dashboard-port", type=int, help="serve a separate dashboard origin")
     args = parser.parse_args()
-    serve(Wallet(args.data, args.exchange), args.port)
+    serve(Wallet(args.data, args.exchange), args.port, args.dashboard_port)
