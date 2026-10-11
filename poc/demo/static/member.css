@@ -307,9 +307,13 @@ nav {
 
 form {
   display:grid;
-  grid-template-columns:180px minmax(200px,1fr) auto;
+  grid-template-columns:repeat(2,minmax(0,1fr));
   gap:13px;
   align-items:end
+}
+
+form .wide {
+  grid-column:1/-1
 }
 
 label {
@@ -320,7 +324,7 @@ label {
   font-weight:600
 }
 
-input {
+input,select {
   width:100%;
   border:1px solid #d9dfe2;
   background:#fff;
@@ -329,7 +333,7 @@ input {
   color:#202630
 }
 
-input:focus {
+input:focus,select:focus {
   border-color:#378875
 }
 

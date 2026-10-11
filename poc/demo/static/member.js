@@ -14,6 +14,7 @@ const short = (value) => value && value.length > 35 ? `${value.slice(0, 20)}…$
 let state = null;
 let activeView = 'overview';
 let requestPending = false;
+let defaultRecipient = null;
 
 function show(view) {
   activeView = view;
@@ -66,7 +67,7 @@ function render() {
   const s = state;
   const payment = s.payment;
   const approved = s.approvals_count;
-  const roleName = {admin: 'Carol · member 3', alice: 'Alice · member 1', bob: 'Bob · member 2'}[s.role];
+  const roleName = {alice: 'Alice · member 1', bob: 'Bob · member 2', carol: 'Carol · member 3'}[s.role];
   $('side-role').textContent = roleName;
   $('threshold-value').textContent = `${approved} / 2`;
   $('approval-total').textContent = `${approved} of 2`;
@@ -77,17 +78,17 @@ function render() {
   $('network-badge').classList.toggle('live', !!s.network?.chain_running);
 
   const phases = {
-    idle: ['Vault not created', 'Carol can create the vault.'],
+    idle: ['Vault not created', 'Any member can start the vault.'],
     creating_vault: ['Creating vault', 'Three local member stores and an independent recipient are being created.'],
-    vault_ready: ['Vault created', 'Carol can now fund it with test ZEC.'],
+    vault_ready: ['Vault created', 'Add test funds to start making payments.'],
     funding: ['Funding vault', 'Waiting for the test chain to fund the source vault.'],
-    funded: ['Vault funded', 'Alice can now propose a payment.'],
-    preparing_payment: ['Preparing payment', 'Alice is building a candidate and publishing it to the local relays.'],
-    waiting_for_reviews: ['Waiting for approvals', 'Alice and Bob each check and approve in their own window.'],
-    ready_to_send: ['Ready to send', 'Two verified approvals are stored by the relays. Carol can finish the transaction.'],
+    funded: ['Vault funded', 'Any member can propose a payment.'],
+    preparing_payment: ['Preparing payment', 'Building the candidate and publishing it to the local relays.'],
+    waiting_for_reviews: ['Waiting for approvals', 'The selected members check and approve in their own windows.'],
+    ready_to_send: ['Ready to send', 'Two verified approvals are stored by the relays. Any member can send.'],
     sending: ['Proving and sending', 'The transaction is being proved and broadcast.'],
     broadcast: ['Broadcast', 'Waiting for the local chain to mine and verify it.'],
-    confirmed: ['Confirmed', 'Both vaults verified the mined payment.'],
+    confirmed: ['Confirmed', 'The payment was verified on chain.'],
     declined: ['Declined', 'A member declined. Reset to create a fresh attempt.'],
     failed: ['Stopped', s.error || 'Reset to start a fresh attempt.'],
     interrupted: ['Interrupted', 'The server restarted during an attempt. Reset to create fresh signing material.'],
@@ -97,18 +98,15 @@ function render() {
   $('phase-help').textContent = phase[1];
   if (s.error) notice(s.error, true);
 
-  $('intro-title').textContent = {admin: 'Set up and send', alice: 'Propose and approve', bob: 'Review and approve'}[s.role];
-  $('intro-copy').textContent = {
-    admin: 'Create and fund the local vault. Once Alice and Bob approve, prove and send the payment.',
-    alice: 'Propose a payment after funding, then check the transaction and approve it.',
-    bob: 'Review the proposed payment independently and approve it if the details are right.',
-  }[s.role];
-  $('create-panel').hidden = s.role !== 'admin' || s.phase !== 'idle';
-  $('fund-panel').hidden = s.role !== 'admin' || s.phase !== 'vault_ready';
-  $('start-panel').hidden = s.role !== 'alice' || s.phase !== 'funded';
-  $('proposal-recipient').textContent = s.vaults?.recipient
-    ? `Recipient vault: ${s.vaults.recipient}`
-    : 'The recipient appears after vault creation.';
+  $('intro-title').textContent = `${s.role[0].toUpperCase() + s.role.slice(1)}'s vault`;
+  $('intro-copy').textContent = 'Start a vault, propose a payment, review one assigned to you, or send one with two approvals.';
+  $('create-panel').hidden = s.phase !== 'idle';
+  $('fund-panel').hidden = s.phase !== 'vault_ready';
+  $('start-panel').hidden = s.phase !== 'funded';
+  if (s.vaults?.recipient && s.vaults.recipient !== defaultRecipient) {
+    if (!$('recipient').value || $('recipient').value === defaultRecipient) $('recipient').value = s.vaults.recipient;
+    defaultRecipient = s.vaults.recipient;
+  }
 
   const pending = payment && s.phase !== 'confirmed';
   $('queue-empty').hidden = !!pending;
@@ -124,29 +122,28 @@ function render() {
     $('payment-details').replaceChildren(
       detail('Memo', payment.memo), detail('Network fee', `${payment.fee_zat.toLocaleString()} zat`),
       detail('Change to vault', zec(payment.change_zat)), detail('Expires at block', `${payment.expiry_height}`),
-      detail('Payment ID', short(payment.id)), detail('Recipient vault', short(payment.recipient)),
+      detail('Payment ID', short(payment.id)),
+      detail('Selected approvers', payment.pair.map(name => name[0].toUpperCase() + name.slice(1)).join(' + ')),
     );
-    $('approval-heading').textContent = s.role === 'admin' ? 'Member approvals' : 'Your approval';
+    $('approval-heading').textContent = 'Your approval';
     const box = $('approvals'); box.replaceChildren();
-    for (const name of (s.role === 'admin' ? ['alice', 'bob'] : [s.role])) {
-      const row = make('div', 'approval-row');
-      row.append(make('span', 'avatar', name[0].toUpperCase()), make('strong', '', name[0].toUpperCase() + name.slice(1)));
-      const status = s.role === 'admin' ? s.signers[name] : s.own_status;
-      row.append(make('span', status === 'approved' ? 'approved' : '', {
-        waiting: 'Waiting for review', reviewing: 'Needs confirmation', signing: 'Signing',
-        approved: 'Approved', delivery_pending: 'Relay delivery pending',
-        declined: 'Declined', failed: 'Failed',
-      }[status] || status));
-      box.append(row);
-    }
-    const reviewReady = ['alice', 'bob'].includes(s.role) && s.own_status === 'reviewing' && s.review;
+    const row = make('div', 'approval-row');
+    row.append(make('span', 'avatar', s.role[0].toUpperCase()), make('strong', '', s.role[0].toUpperCase() + s.role.slice(1)));
+    const status = s.own_status;
+    row.append(make('span', status === 'approved' ? 'approved' : '', {
+      not_requested: 'Not selected for this payment', waiting: 'Waiting for review',
+      reviewing: 'Needs confirmation', signing: 'Signing', approved: 'Approved',
+      delivery_pending: 'Relay delivery pending', declined: 'Declined', failed: 'Failed',
+    }[status] || status));
+    box.append(row);
+    const reviewReady = s.own_status === 'reviewing' && s.review;
     $('review-panel').hidden = !reviewReady;
-    $('retry-panel').hidden = !['alice', 'bob'].includes(s.role) || s.own_status !== 'delivery_pending';
+    $('retry-panel').hidden = s.own_status !== 'delivery_pending';
     if (reviewReady) {
       const lines = $('review-lines'); lines.replaceChildren();
       for (const line of s.review.split('\n')) lines.append(make('div', '', line));
     }
-    $('finish-panel').hidden = s.role !== 'admin' || s.phase !== 'ready_to_send';
+    $('finish-panel').hidden = s.phase !== 'ready_to_send';
   }
   $('history-empty').hidden = s.phase === 'confirmed';
   $('history-item').hidden = s.phase !== 'confirmed';
@@ -154,7 +151,9 @@ function render() {
   $('history-recipient').textContent = payment ? `To ${payment.recipient}` : '';
   $('history-memo').textContent = payment ? `Memo: ${payment.memo} · Fee: ${payment.fee_zat.toLocaleString()} zat` : '';
   $('history-txid').textContent = s.txid || '';
-  $('reset').hidden = s.role !== 'admin' || s.phase === 'idle' ||
+  $('history-evidence').textContent = payment?.recipient_verified
+    ? 'Source and recipient vaults verified this payment.' : 'The source vault verified this payment on chain.';
+  $('reset').hidden = (s.role !== s.creator && s.phase !== 'interrupted') || s.phase === 'idle' ||
     ['creating_vault', 'funding', 'preparing_payment', 'sending', 'broadcast'].includes(s.phase);
 }
 
@@ -167,7 +166,7 @@ async function refresh() {
     state = await api('/api/state');
     render();
     if (state.phase === 'confirmed' && !wasConfirmed && activeView === 'queue') show('history');
-    else if (state.role !== 'admin' && state.payment && (firstLoad || !hadPayment))
+    else if (state.payment && (firstLoad || !hadPayment))
       show(state.phase === 'confirmed' ? 'history' : 'queue');
   } catch (error) {
     notice(error.message, true);
@@ -183,7 +182,8 @@ $('start-form').addEventListener('submit', (event) => {
   if (!/^\d+(?:\.\d{1,8})?$/.test(raw)) { notice('Enter an amount with at most 8 decimal places.', true); return; }
   const [whole, fraction = ''] = raw.split('.');
   const amount = Number(whole) * 100_000_000 + Number(fraction.padEnd(8, '0'));
-  act('/api/propose', {amount_zat: amount, memo: $('memo').value});
+  act('/api/propose', {amount_zat: amount, memo: $('memo').value,
+                       pair: $('pair').value, recipient: $('recipient').value.trim()});
 });
 $('approve').addEventListener('click', () => act('/api/decide', {action: 'approve'}));
 $('decline').addEventListener('click', () => act('/api/decide', {action: 'decline'}));

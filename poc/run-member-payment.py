@@ -65,6 +65,8 @@ def main():
     parser.add_argument("--stage", choices=("all", "setup", "fund", "prepare"), default="all",
                         help="run one step for the local member UI")
     parser.add_argument("--pair", choices=("AB", "AC", "BC"), default="AB", help="members who approve this payment")
+    parser.add_argument("--proposer", type=int, choices=(1, 2, 3), default=1, help="member creating the payment")
+    parser.add_argument("--recipient", help="recipient unified address; defaults to the local test recipient")
     parser.add_argument("--finisher", type=int, choices=(1, 2, 3), help="member who proves and sends; defaults to the non-signer")
     parser.add_argument("--amount-zat", type=int, default=40_000_000, help="regtest payment amount")
     parser.add_argument("--memo", default="separate member payment", help="shielded payment memo")
@@ -122,8 +124,9 @@ def main():
     elif not vaults["funded"]:
         raise RuntimeError("fund the source vault before preparing a payment")
 
-    owner, password = members[0]
-    run([pay, "prepare", owner, password, roster, work, recipient_address, str(args.amount_zat), args.memo, args.pair], env)
+    destination = args.recipient or recipient_address
+    owner, password = members[args.proposer - 1]
+    run([pay, "prepare", owner, password, roster, work, destination, str(args.amount_zat), args.memo, args.pair], env)
     manifest = json.loads((work / "payment.json").read_text())
     signers = [members[number - 1] for number in manifest["pair"]]
     finisher_id = args.finisher or next(number for number in (1, 2, 3) if number not in manifest["pair"])
@@ -135,6 +138,8 @@ def main():
         lines = [
             f"Source vault: {vault}",
             f"Independent recipient: {recipient_address}",
+            f"Payment recipient: {destination}",
+            f"Proposer: member {args.proposer}",
             f"Payment ID: {manifest['payment']}",
             "Run the next two commands at the same time in separate terminals. Read each review, then type its exact APPROVE prompt:",
             *(command([pay, "sign", *signer, roster, work]) for signer in signers),
@@ -143,8 +148,9 @@ def main():
             "Copy the txid from the finish output, then run:",
             shlex.join(["ths", "--name", args.name, "mine", "3"]),
             command([pay, "verify", *finisher, roster, work, "<TXID>"]),
-            command([pay, "receive", *recipient_members[0], recipient_roster, work, "<TXID>"]),
         ]
+        if destination == recipient_address:
+            lines.append(command([pay, "receive", *recipient_members[0], recipient_roster, work, "<TXID>"]))
         (root / "manual-steps.txt").write_text("\n".join(lines) + "\n")
         print("\n".join(lines), flush=True)
         return
@@ -172,11 +178,13 @@ def main():
     chain.mine(3)
     verified = run([pay, "verify", owner, password, roster, work, txid], env)
     print(verified, flush=True)
-    recipient_owner, recipient_password = recipient_members[0]
-    received = run([pay, "receive", recipient_owner, recipient_password, recipient_roster, work, txid], env)
-    print(received, flush=True)
+    received = None
+    if destination == recipient_address:
+        recipient_owner, recipient_password = recipient_members[0]
+        received = run([pay, "receive", recipient_owner, recipient_password, recipient_roster, work, txid], env)
+        print(received, flush=True)
     (root / "result.json").write_text(json.dumps({
-        "vault": vault, "recipient": recipient_address,
+        "vault": vault, "recipient": destination,
         "payment": manifest["payment"], "txid": txid,
         "verification": verified, "recipient_verification": received,
     }, indent=2) + "\n")

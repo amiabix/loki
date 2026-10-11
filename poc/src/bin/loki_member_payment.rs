@@ -99,6 +99,13 @@ fn peer_in_pair(pair: [u16; 2], own: u16) -> Option<u16> {
     }
 }
 
+fn proposer_id(bytes: &[u8]) -> Result<u16, String> {
+    // shortcut: this CLI has a fixed three-member roster; use certified roster IDs when setup becomes dynamic.
+    (1u16..=3)
+        .find(|id| frost::Identifier::try_from(*id).is_ok_and(|member| member.serialize() == bytes))
+        .ok_or_else(|| "payment proposer is not a vault member".into())
+}
+
 fn private_work(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
@@ -171,11 +178,10 @@ fn manifest(path: &Path) -> Result<(SessionContext, Intent), String> {
         pair: manifest_pair(&value)?,
     };
     context.validate()?;
-    if context.payment != intent.proposal_id()
-        || intent.proposer != frost::Identifier::try_from(1u16).unwrap().serialize()
-    {
-        return Err("manifest payment ID or proposer differs from intent".into());
+    if context.payment != intent.proposal_id() {
+        return Err("manifest payment ID differs from intent".into());
     }
+    proposer_id(&intent.proposer)?;
     Ok((context, intent))
 }
 
@@ -197,9 +203,6 @@ fn prepare(args: &[String]) -> Result<(), String> {
     }
     let pair = pair_from_name(args.get(7).map(String::as_str).unwrap_or("AB"))?;
     let (member, _, _) = state(args)?;
-    if member.identity.public().id != 1 {
-        return Err("member 1 must prepare this two-signer regtest payment".into());
-    }
     let work = Path::new(&args[3]);
     private_work(work)?;
     let rpc = Rpc::regtest();
@@ -1193,5 +1196,15 @@ mod tests {
         assert_eq!(peer_in_pair([2, 3], 1), None);
         assert_eq!(peer_in_pair([2, 3], 2), Some(3));
         assert_eq!(peer_in_pair([2, 3], 3), Some(2));
+    }
+
+    #[test]
+    fn any_roster_member_can_propose() {
+        for id in 1..=3 {
+            let bytes = frost::Identifier::try_from(id).unwrap().serialize();
+            assert_eq!(proposer_id(&bytes).unwrap(), id);
+        }
+        assert!(proposer_id(&frost::Identifier::try_from(4u16).unwrap().serialize()).is_err());
+        assert!(proposer_id(&[0u8; 32]).is_err());
     }
 }

@@ -29,25 +29,41 @@ class MemberDemoTest(unittest.TestCase):
         self.assertEqual(len(set(flow.tokens.values())), 3)
         self.assertIsNone(flow.role("wrong"))
         with self.assertRaisesRegex(ValueError, "amount"):
-            flow.propose(100_000_000, "memo")
+            flow.propose("bob", 100_000_000, "memo", "BC", "uregtest1recipient")
         self.assertEqual(flow.phase, "idle")
         with self.assertRaisesRegex(ValueError, "fund"):
-            flow.propose(40_000_000, "memo")
+            flow.propose("bob", 40_000_000, "memo", "BC", "uregtest1recipient")
         self.assertIsNone(flow.payment)
 
     def test_member_state_returns_its_own_review(self):
         flow = self.flow()
-        flow.review = {"alice": "Alice's checked payment", "bob": "Bob's checked payment"}
-        alice = flow.state("alice", "http://127.0.0.1:8790")
-        bob = flow.state("bob", "http://127.0.0.1:8790")
-        carol = flow.state("admin", "http://127.0.0.1:8790")
+        flow.review = {"alice": "Alice's checked payment", "bob": "Bob's checked payment",
+                       "carol": "Carol's checked payment"}
+        alice = flow.state("alice")
+        bob = flow.state("bob")
+        carol = flow.state("carol")
         self.assertEqual(alice["review"], "Alice's checked payment")
         self.assertEqual(bob["review"], "Bob's checked payment")
         self.assertNotIn("links", alice)
         self.assertNotIn("links", bob)
-        self.assertNotIn("review", carol)
+        self.assertEqual(carol["review"], "Carol's checked payment")
         self.assertNotIn("signers", alice)
         self.assertNotIn("signers", bob)
+
+    def test_unselected_member_cannot_approve(self):
+        flow = self.flow()
+        flow.payment = {"id": "a" * 64, "pair": ("bob", "carol")}
+        flow.phase = "waiting_for_reviews"
+        with self.assertRaisesRegex(ValueError, "not asked"):
+            flow.decide("alice", "approve")
+        self.assertEqual(flow.signers["alice"], "not_requested")
+
+    def test_invalid_pair_does_not_start_preparing(self):
+        flow = self.flow()
+        flow.phase = "funded"
+        with self.assertRaisesRegex(ValueError, "choose two"):
+            flow.propose("bob", 12_000_000, "test", "AA", "uregtest1recipient")
+        self.assertEqual(flow.phase, "funded")
 
     def test_actions_are_staged(self):
         flow = self.flow()
@@ -55,8 +71,9 @@ class MemberDemoTest(unittest.TestCase):
              patch.object(member_demo.relay_run, "find_binary", return_value=Path(sys.executable)), \
              patch.object(subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=b"relay-backed-signing=1\n")), \
              patch.object(flow, "_create_vault"):
-            flow.create_vault()
+            flow.create_vault("bob")
         self.assertEqual(flow.phase, "creating_vault")
+        self.assertEqual(flow.creator, "bob")
         with self.assertRaisesRegex(ValueError, "vault"):
             flow.fund()
         flow.worker.join(timeout=3)
@@ -64,7 +81,7 @@ class MemberDemoTest(unittest.TestCase):
     def test_review_prompt_then_exact_member_approval(self):
         flow = self.flow()
         payment = "a" * 64
-        flow.payment = {"id": payment}
+        flow.payment = {"id": payment, "pair": ("alice", "bob")}
         flow.phase = "waiting_for_reviews"
         script = (
             "import sys\n"
@@ -102,7 +119,7 @@ class MemberDemoTest(unittest.TestCase):
     def test_local_share_is_not_approved_without_relay_delivery(self):
         flow = self.flow()
         payment = "a" * 64
-        flow.payment = {"id": payment}
+        flow.payment = {"id": payment, "pair": ("alice", "bob")}
         flow.phase = "waiting_for_reviews"
         script = (
             "import sys\n"
@@ -137,7 +154,8 @@ class MemberDemoTest(unittest.TestCase):
     def test_delivery_retry_uses_saved_share_without_another_approval_prompt(self):
         flow = self.flow()
         flow.phase = "waiting_for_reviews"
-        flow.signers = {"alice": "delivery_pending", "bob": "approved"}
+        flow.payment = {"pair": ("alice", "bob")}
+        flow.signers = {"alice": "delivery_pending", "bob": "approved", "carol": "not_requested"}
         flow.context = SimpleNamespace(members=[SimpleNamespace(member_id=1)])
         with patch.object(flow, "_payment_command", return_value="resent exact saved approval") as command, \
              patch.object(flow, "_deliver_approval", return_value=True):
@@ -176,21 +194,21 @@ class MemberDemoTest(unittest.TestCase):
             handler.do_POST()
             self.assertEqual(handler.json.call_args.args[0], 403)
             handler.headers["Origin"] = "http://127.0.0.1:8790"
-            handler.headers["X-Loki-Token"] = flow.tokens["admin"]
+            handler.headers["X-Loki-Token"] = "invalid"
             handler.do_POST()
-            self.assertEqual(handler.json.call_args.args[0], 403)
+            self.assertEqual(handler.json.call_args.args[0], 401)
             handler.headers["X-Loki-Token"] = flow.tokens["alice"]
             handler.rfile = BytesIO(b'{"action":"approve"}')
             handler.do_POST()
             self.assertEqual(handler.json.call_args.args[0], 200)
             decide.assert_called_once_with("alice", "approve")
 
-    def test_only_alice_can_propose_and_only_carol_can_create(self):
+    def test_any_member_can_create_and_propose_with_a_selected_pair(self):
         flow = self.flow()
         handler = member_demo.Handler.__new__(member_demo.Handler)
         handler.server = SimpleNamespace(server_port=8790)
         handler.json = Mock()
-        payload = b'{"amount_zat":12000000,"memo":"test"}'
+        payload = b'{"amount_zat":12000000,"memo":"test","pair":"BC","recipient":"uregtest1recipient"}'
         handler.headers = {"Origin": "http://127.0.0.1:8790", "Content-Type": "application/json",
                            "Content-Length": str(len(payload)), "X-Loki-Token": flow.tokens["bob"]}
         handler.path = "/api/propose"
@@ -198,23 +216,15 @@ class MemberDemoTest(unittest.TestCase):
              patch.object(flow, "create_vault") as create:
             handler.rfile = BytesIO(payload)
             handler.do_POST()
-            self.assertEqual(handler.json.call_args.args[0], 403)
-            handler.headers["X-Loki-Token"] = flow.tokens["alice"]
-            handler.rfile = BytesIO(payload)
-            handler.do_POST()
             self.assertEqual(handler.json.call_args.args[0], 200)
-            propose.assert_called_once_with(12_000_000, "test")
+            propose.assert_called_once_with("bob", 12_000_000, "test", "BC", "uregtest1recipient")
             handler.path = "/api/create-vault"
-            handler.headers["X-Loki-Token"] = flow.tokens["alice"]
+            handler.headers["X-Loki-Token"] = flow.tokens["carol"]
             handler.rfile = BytesIO(b'{}')
             handler.headers["Content-Length"] = "2"
             handler.do_POST()
-            self.assertEqual(handler.json.call_args.args[0], 403)
-            handler.headers["X-Loki-Token"] = flow.tokens["admin"]
-            handler.rfile = BytesIO(b'{}')
-            handler.do_POST()
             self.assertEqual(handler.json.call_args.args[0], 200)
-            create.assert_called_once_with()
+            create.assert_called_once_with("carol")
 
 
 if __name__ == "__main__":

@@ -3,19 +3,21 @@
 const assert = require('node:assert/strict');
 const {chromium} = require('../g3/node_modules/playwright-core');
 
-if (!process.env.LOKI_DEMO_URL) {
-  throw new Error('set LOKI_DEMO_URL to Carol’s URL printed by member_demo.py');
-}
-const carolUrl = new URL(process.env.LOKI_DEMO_URL);
-if (carolUrl.protocol !== 'http:' || carolUrl.hostname !== '127.0.0.1' || !carolUrl.hash) {
-  throw new Error('set LOKI_DEMO_URL to Carol’s URL printed by member_demo.py');
-}
-const token = carolUrl.hash.slice(1);
-const base = carolUrl.origin;
+const urls = Object.fromEntries(['alice', 'bob', 'carol'].map(role => {
+  const raw = process.env[`LOKI_${role.toUpperCase()}_URL`];
+  if (!raw) throw new Error(`set LOKI_${role.toUpperCase()}_URL from member_demo.py`);
+  const url = new URL(raw);
+  if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.hash) {
+    throw new Error(`LOKI_${role.toUpperCase()}_URL must be a loopback member link`);
+  }
+  return [role, url];
+}));
+assert.equal(new Set(Object.values(urls).map(url => url.origin)).size, 1);
+const base = urls.alice.origin;
 
-async function state(page, memberToken) {
+async function state(page, role) {
   const response = await page.request.get(`${base}/api/state`, {
-    headers: {'X-Loki-Token': memberToken},
+    headers: {'X-Loki-Token': urls[role].hash.slice(1)},
   });
   assert.equal(response.status(), 200);
   return response.json();
@@ -25,87 +27,79 @@ async function state(page, memberToken) {
   const browser = await chromium.launch({headless: true});
   const errors = [];
   try {
-    const carolProfile = await browser.newContext();
-    const aliceProfile = await browser.newContext();
-    const bobProfile = await browser.newContext();
-    const carol = await carolProfile.newPage();
-    const alice = await aliceProfile.newPage();
-    const bob = await bobProfile.newPage();
-    for (const [name, page] of [['Carol', carol], ['Alice', alice], ['Bob', bob]]) {
-      page.on('pageerror', error => errors.push(`${name}: ${error.message}`));
+    const pages = {};
+    for (const role of Object.keys(urls)) {
+      const profile = await browser.newContext();
+      const page = await profile.newPage();
+      page.on('pageerror', error => errors.push(`${role}: ${error.message}`));
+      await page.goto(urls[role].href);
+      pages[role] = page;
     }
-    await carol.goto(carolUrl.href);
-    const initial = await state(carol, token);
+    const {alice, bob, carol} = pages;
+    const initial = await state(bob, 'bob');
     assert.equal(initial.phase, 'idle', 'use a fresh demo instance');
-    assert.equal(initial.payment, null, 'a new vault must not inherit an old transaction');
-    const links = initial.links;
-    await Promise.all([alice.goto(links.alice), bob.goto(links.bob)]);
-    await carol.locator('#create-panel').waitFor({state: 'visible'});
-    assert.doesNotMatch(await carol.locator('body').innerText(), /regtest/i);
-    assert.equal(await alice.locator('#payment-card').isVisible(), false);
-    assert.equal(await bob.locator('#payment-card').isVisible(), false);
-    assert.equal(await alice.locator('#create-panel').isVisible(), false);
-    assert.equal(await bob.locator('#create-panel').isVisible(), false);
-    assert.match(await alice.locator('#side-role').innerText(), /Alice/);
-    assert.match(await bob.locator('#side-role').innerText(), /Bob/);
-    assert.match(await carol.locator('#side-role').innerText(), /Carol/);
+    assert.equal(initial.payment, null);
+    await Promise.all([alice, bob, carol].map(page =>
+      page.locator('#create-panel').waitFor({state: 'visible'})));
 
-    await carol.locator('#create-vault').click();
-    await carol.locator('#fund-panel').waitFor({state: 'visible', timeout: 600000});
-    const created = await state(carol, token);
-    assert.equal(created.phase, 'vault_ready');
+    await bob.locator('#create-vault').click();
+    await bob.locator('#fund-panel').waitFor({state: 'visible', timeout: 600000});
+    const created = await state(bob, 'bob');
+    assert.equal(created.creator, 'bob');
     assert.match(created.vaults.source, /^uregtest/);
-    assert.equal(created.payment, null);
-    await carol.locator('#fund').click();
-    await alice.locator('#start-panel').waitFor({state: 'visible', timeout: 180000});
-    assert.equal((await state(carol, token)).phase, 'funded');
-    assert.equal(await bob.locator('#start-panel').isVisible(), false);
-    await alice.locator('#amount').fill('0.12');
-    await alice.locator('#memo').fill('browser workflow check');
-    await alice.locator('#propose').click();
-    await Promise.all([alice, bob].map(page => page.locator('#review-panel').waitFor({state: 'visible', timeout: 600000})));
-    const prepared = await state(carol, token);
+    await bob.locator('#fund').click();
+    await bob.locator('#start-panel').waitFor({state: 'visible', timeout: 180000});
+    const funded = await state(bob, 'bob');
+    const destination = funded.vaults.recipient;
+    await bob.locator('#recipient').fill(destination);
+    await bob.locator('#amount').fill('0.12');
+    await bob.locator('#memo').fill('browser workflow check');
+    await bob.locator('#pair').selectOption('BC');
+    await bob.locator('#propose').click();
+    await Promise.all([bob, carol].map(page =>
+      page.locator('#review-panel').waitFor({state: 'visible', timeout: 600000})));
+    const prepared = await state(bob, 'bob');
     assert.equal(prepared.phase, 'waiting_for_reviews');
+    assert.equal(prepared.payment.proposer, 'bob');
+    assert.deepEqual(prepared.payment.pair, ['bob', 'carol']);
+    assert.equal(prepared.payment.recipient, destination);
     assert.equal(prepared.payment.amount_zat, 12_000_000);
     assert.equal(prepared.payment.memo, 'browser workflow check');
-    await carol.locator('[data-view="queue"]').click();
-    assert.equal(await carol.locator('#review-panel').isVisible(), false);
-    const review = await alice.locator('#review-lines').innerText();
-    assert.equal(review, await bob.locator('#review-lines').innerText());
+    const aliceState = await state(alice, 'alice');
+    assert.equal(aliceState.own_status, 'not_requested');
+    assert.equal(aliceState.review, null);
+    assert.equal(await alice.locator('#review-panel').isVisible(), false);
+    const review = await bob.locator('#review-lines').innerText();
+    assert.equal(review, await carol.locator('#review-lines').innerText());
     assert.match(review, /12000000 zat/);
     assert.match(review, /browser workflow check/);
-    for (const [role, page, link, other] of [
-      ['alice', alice, links.alice, 'Bob'], ['bob', bob, links.bob, 'Alice'],
-    ]) {
-      const member = await state(page, new URL(link).hash.slice(1));
-      assert.equal(member.role, role);
-      assert.equal(member.links, undefined);
+    for (const role of ['bob', 'carol']) {
+      const member = await state(pages[role], role);
       assert.equal(member.signers, undefined);
       assert.equal(member.review, review);
-      assert.doesNotMatch(await page.locator('#approvals').innerText(), new RegExp(other));
-      assert.equal(await page.locator('#finish-panel').isVisible(), false);
     }
 
-    await alice.locator('#approve').click();
-    await carol.waitForFunction(() => document.querySelector('#approval-total').textContent === '1 of 2');
+    await carol.locator('#approve').click();
+    await alice.waitForFunction(() => document.querySelector('#approval-total').textContent === '1 of 2');
     await bob.locator('#approve').click();
-    await carol.locator('#finish-panel').waitFor({state: 'visible'});
-    const ready = await state(carol, token);
+    await alice.locator('#finish-panel').waitFor({state: 'visible'});
+    const ready = await state(alice, 'alice');
     assert.equal(ready.phase, 'ready_to_send');
     assert.equal(ready.txid, null);
-    assert.deepEqual(ready.signers, {alice: 'approved', bob: 'approved'});
-    await carol.locator('#finish').click();
-    await carol.locator('[data-view="history"]').click();
-    await carol.locator('#history-item').waitFor({state: 'visible', timeout: 180000});
-    const confirmed = await state(carol, token);
+    assert.equal(ready.approvals_count, 2);
+    await alice.locator('#finish').click();
+    await alice.locator('[data-view="history"]').click();
+    await alice.locator('#history-item').waitFor({state: 'visible', timeout: 180000});
+    const confirmed = await state(alice, 'alice');
     assert.equal(confirmed.phase, 'confirmed');
+    assert.equal(confirmed.payment.recipient_verified, true);
     assert.match(confirmed.txid, /^[0-9a-f]{64}$/);
-    assert.equal(await carol.locator('#history-txid').innerText(), confirmed.txid);
-    assert.equal(await carol.locator('#history-amount').innerText(), '0.12 ZEC sent');
-    assert.equal(await carol.locator('#history-recipient').innerText(), `To ${confirmed.payment.recipient}`);
-    assert.match(await carol.locator('#history-memo').innerText(), /browser workflow check/);
+    assert.equal(await alice.locator('#history-txid').innerText(), confirmed.txid);
+    assert.equal(await alice.locator('#history-amount').innerText(), '0.12 ZEC sent');
+    assert.equal(await alice.locator('#history-recipient').innerText(), `To ${destination}`);
+    assert.match(await alice.locator('#history-memo').innerText(), /browser workflow check/);
     assert.deepEqual(errors, []);
-    console.log(`PASS: staged member payment confirmed, txid ${confirmed.txid}`);
+    console.log(`PASS: Bob proposed, Bob and Carol approved, Alice finished ${confirmed.txid}`);
   } finally {
     await browser.close();
   }

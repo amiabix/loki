@@ -36,15 +36,15 @@
       <section class="view active" id="overview">
         <div class="intro">
           <div><p class="intro-kicker">2 of 3 shielded vault · test network</p><h2 id="intro-title">Your vault</h2>
-          <p id="intro-copy">Create a vault, fund it, then propose and approve a payment from each member's own window.</p></div>
+          <p id="intro-copy">Any member can start the vault, propose a payment, or send one with two approvals.</p></div>
           <div class="threshold"><strong id="threshold-value">0 / 2</strong><span>approvals</span></div>
         </div>
         <div class="grid">
           <section class="panel"><h3>Vault address</h3><p class="address" id="source-address">Not created yet</p></section>
-          <section class="panel"><h3>Status</h3><p class="large" id="phase-label">Vault not created</p><p class="muted" id="phase-help">Carol can create the vault.</p></section>
+          <section class="panel"><h3>Status</h3><p class="large" id="phase-label">Vault not created</p><p class="muted" id="phase-help">Any member can start the vault.</p></section>
         </div>
         <section class="panel" id="create-panel" hidden>
-          <div class="panel-head"><div><h3>Create vault</h3><p>Carol starts separate local member stores and checks their backups. This can take a few minutes.</p></div></div>
+          <div class="panel-head"><div><h3>Create vault</h3><p>Start the local three-member vault and check its backups. This can take a few minutes.</p></div></div>
           <button class="button primary" id="create-vault" type="button">Create vault</button>
         </section>
         <section class="panel" id="fund-panel" hidden>
@@ -52,10 +52,12 @@
           <button class="button primary" id="fund" type="button">Add test funds</button>
         </section>
         <section class="panel" id="start-panel" hidden>
-          <div class="panel-head"><div><h3>Propose payment</h3><p id="proposal-recipient">Alice prepares a shielded payment to the recipient vault. Both signers will check it before approval.</p></div></div>
+          <div class="panel-head"><div><h3>Propose payment</h3><p>Choose a recipient and two approvers for this payment. Each approver checks the transaction before signing.</p></div></div>
           <form id="start-form">
+            <label class="wide">Recipient address<input id="recipient" type="text" autocomplete="off" spellcheck="false" required></label>
             <label>Amount (ZEC)<input id="amount" type="number" min="0.00000001" max="0.99999999" step="0.00000001" value="0.4" required></label>
             <label>Memo<input id="memo" type="text" maxlength="512" value="separate member payment" required></label>
+            <label>Approvers for this payment<select id="pair"><option value="AB">Alice + Bob</option><option value="AC">Alice + Carol</option><option value="BC">Bob + Carol</option></select></label>
             <button class="button primary" id="propose" type="submit">Propose payment</button>
           </form>
         </section>
@@ -76,14 +78,14 @@
             <div class="actions"><button class="button primary" id="approve" type="button">Confirm payment</button><button class="button quiet" id="decline" type="button">Decline</button></div>
           </div>
           <div class="review" id="retry-panel" hidden><h4>Approval waiting for relay storage</h4><p>Your signed share is saved locally. Retry delivery before this approval can count.</p><button class="button primary" id="retry" type="button">Retry delivery</button></div>
-          <div class="payment-footer" id="finish-panel" hidden><p>Two members approved this exact attempt. Carol can now prove and send it.</p><button class="button primary" id="finish" type="button">Prove and send</button></div>
+          <div class="payment-footer" id="finish-panel" hidden><p>Two members approved this exact attempt. Any member can prove and send it.</p><button class="button primary" id="finish" type="button">Prove and send</button></div>
         </article>
       </section>
 
       <section class="view" id="history">
         <div class="section-head"><div><h2>History</h2><p>Payments appear here after confirmation.</p></div></div>
         <div class="empty" id="history-empty">No confirmed payment yet.</div>
-        <article class="panel history-item" id="history-item" hidden><span class="success-mark">✓</span><div><strong id="history-amount">Payment confirmed</strong><p id="history-recipient"></p><span id="history-memo"></span><p id="history-txid"></p><span>Source and recipient vaults verified this payment.</span></div></article>
+        <article class="panel history-item" id="history-item" hidden><span class="success-mark">✓</span><div><strong id="history-amount">Payment confirmed</strong><p id="history-recipient"></p><span id="history-memo"></span><p id="history-txid"></p><span id="history-evidence">This payment was verified on chain.</span></div></article>
       </section>
       <footer class="footer"><span>Local test build · no real funds</span><button class="text-button" id="reset" type="button" hidden>Reset test</button></footer>
     </main>
