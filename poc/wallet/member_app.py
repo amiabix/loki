@@ -269,7 +269,7 @@ def serve(wallet, port):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Cache-Control", "no-store")
-                self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'")
+                self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'")
                 self.end_headers()
                 self.wfile.write(page)
                 return
@@ -284,6 +284,13 @@ def serve(wallet, port):
                 self.send_header("Content-Type", "text/css; charset=utf-8")
                 self.end_headers()
                 self.wfile.write((HERE / "app.css").read_bytes())
+                return
+            if self.path in ("/fonts/geist.woff2", "/fonts/geist-mono.woff2", "/fonts/young-serif.woff2"):
+                self.send_response(200)
+                self.send_header("Content-Type", "font/woff2")
+                self.send_header("Cache-Control", "max-age=86400")
+                self.end_headers()
+                self.wfile.write((HERE / self.path.lstrip("/")).read_bytes())
                 return
             if not self.authorized():
                 return self.reply(403, {"error": "Open the private local app link"})

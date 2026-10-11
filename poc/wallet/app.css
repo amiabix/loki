@@ -1,8 +1,773 @@
-:root{font:16px/1.5 system-ui,-apple-system,sans-serif;color:#18352f;background:#f5f7f4}
-    *{box-sizing:border-box}body{margin:0}header{background:#173d34;color:white;padding:1.2rem max(1rem,calc((100vw - 760px)/2))}header strong{font-size:1.4rem}header span{display:block;color:#c5ded5;font-size:.85rem}
-    main{max-width:760px;margin:2rem auto;padding:0 1rem}h1{font-size:1.7rem;line-height:1.2;margin:0 0 .3rem}h2{font-size:1.1rem;margin:0 0 1rem}.muted{color:#5a6d68}
-    .card{background:white;border:1px solid #dce5df;border-radius:14px;padding:1.5rem;margin:1rem 0;box-shadow:0 2px 10px #18352f08}
-    label{display:block;font-weight:600;margin:.8rem 0 .3rem}input,textarea{font:inherit;width:100%;padding:.65rem;border:1px solid #b9cbc1;border-radius:7px;color:#18352f}textarea{min-height:5rem}
-    button{font:inherit;font-weight:650;border:0;background:#1c7057;color:white;border-radius:7px;padding:.65rem 1rem;cursor:pointer;margin-top:1rem}button.secondary{background:#e6eee9;color:#184a3c}button:hover{filter:brightness(.94)}
-    code,pre{overflow-wrap:anywhere;white-space:pre-wrap;background:#eef3ef;padding:.45rem;border-radius:5px}pre{padding:1rem}#message{padding:.75rem;border-radius:7px;background:#e1f3e8}#message.error{background:#ffe8e1;color:#842e1b}[hidden]{display:none!important}
-    .row{display:flex;gap:.5rem;flex-wrap:wrap}.row>*{flex:1}small{display:block;color:#64736d}.warning{border-left:4px solid #d68b38;padding-left:.8rem}
+/* Loki member app — one person, one private store.
+ *
+ * Same system as the demo pages: near-black ground, cut corners, corner brackets,
+ * Geist for chrome, Young Serif for the things a person reads once and trusts,
+ * Geist Mono for anything they have to compare character by character. Mint is the
+ * one action colour; amber marks the two steps where a mistake is permanent.
+ */
+
+@font-face {
+  font-family: Geist;
+  src: url(/fonts/geist.woff2) format("woff2");
+  font-weight: 400 700;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Geist Mono";
+  src: url(/fonts/geist-mono.woff2) format("woff2");
+  font-weight: 400 600;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Young Serif";
+  src: url(/fonts/young-serif.woff2) format("woff2");
+  font-weight: 400;
+  font-display: swap;
+}
+
+:root {
+  --bg: #0b131b;
+  --grid: #101d28;
+  --surface: #111e29;
+  --inset: #0a1118;
+  --raised: #16252f;
+  --line: #22323f;
+  --line-soft: #1a2833;
+  --bracket: #334a5c;
+  --text: #ece8e1;
+  --dim: #7f909e;
+  --faint: #56687a;
+  --accent: #00e0a4;
+  --danger: #ff4655;
+  --warn: #f4b728;
+  --mono: "Geist Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --serif: "Young Serif", ui-serif, "Iowan Old Style", Georgia, serif;
+  --bevel: polygon(0 0, calc(100% - 11px) 0, 100% 11px, 100% 100%, 11px 100%, 0 calc(100% - 11px));
+  --bevel-sm: polygon(0 0, calc(100% - 7px) 0, 100% 7px, 100% 100%, 7px 100%, 0 calc(100% - 7px));
+  font: 400 15px/1.6 Geist, "Helvetica Neue", Arial, sans-serif;
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+
+body {
+  margin: 0;
+  background-color: var(--bg);
+  background-image: linear-gradient(var(--grid) 1px, transparent 1px),
+                    linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size: 52px 52px;
+}
+
+/* scanlines, vignette, and the four corner crosshairs */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 900;
+  pointer-events: none;
+  background:
+    repeating-linear-gradient(0deg, rgba(255,255,255,.016) 0 1px, transparent 1px 3px),
+    radial-gradient(ellipse at 50% 42%, transparent 55%, rgba(0,0,0,.42) 100%);
+}
+body::after {
+  content: "";
+  position: fixed;
+  inset: 10px;
+  z-index: 901;
+  pointer-events: none;
+  opacity: .5;
+  background-image:
+    linear-gradient(var(--faint),var(--faint)),linear-gradient(var(--faint),var(--faint)),
+    linear-gradient(var(--faint),var(--faint)),linear-gradient(var(--faint),var(--faint)),
+    linear-gradient(var(--faint),var(--faint)),linear-gradient(var(--faint),var(--faint)),
+    linear-gradient(var(--faint),var(--faint)),linear-gradient(var(--faint),var(--faint));
+  background-size: 14px 1px,1px 14px,14px 1px,1px 14px,14px 1px,1px 14px,14px 1px,1px 14px;
+  background-position: 0 0,0 0,100% 0,100% 0,0 100%,0 100%,100% 100%,100% 100%;
+  background-repeat: no-repeat;
+}
+
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* ── header ───────────────────────────────────────────────────────────────── */
+
+header {
+  position: relative;
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  flex-wrap: wrap;
+  background: #0a1118;
+  border-bottom: 1px solid var(--line);
+  padding: 20px max(1rem, calc((100vw - 760px) / 2));
+}
+header strong {
+  font-size: 19px;
+  font-weight: 700;
+  letter-spacing: .16em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+header span {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .2em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+h1 {
+  margin: 0 0 6px;
+  font-family: var(--serif);
+  font-weight: 400;
+  font-size: 34px;
+  line-height: 1.1;
+  font-variant-numeric: lining-nums tabular-nums;
+}
+
+.muted { color: var(--dim); }
+
+main > p.muted:first-of-type { margin: 0 0 28px; font-size: 13px; }
+main > p.muted:last-child {
+  margin-top: 32px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .18em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+/* ── status line ──────────────────────────────────────────────────────────── */
+
+#message {
+  margin: 0 0 24px;
+  padding: 14px 18px;
+  font-size: 13px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--accent);
+  color: var(--dim);
+  clip-path: var(--bevel-sm);
+}
+#message.error {
+  border-left-color: var(--danger);
+  background: rgba(255,70,85,.07);
+  color: #ffb3bb;
+}
+
+/* ── cards ────────────────────────────────────────────────────────────────── */
+
+.card {
+  position: relative;
+  margin: 18px 0;
+  padding: 26px 28px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  clip-path: var(--bevel);
+  /* corner brackets on the two square corners — the other two are the bevel cuts */
+  background-image:
+    linear-gradient(var(--bracket),var(--bracket)), linear-gradient(var(--bracket),var(--bracket)),
+    linear-gradient(var(--bracket),var(--bracket)), linear-gradient(var(--bracket),var(--bracket));
+  background-size: 18px 2px, 2px 18px, 18px 2px, 2px 18px;
+  background-position: 0 0, 0 0, 100% 100%, 100% 100%;
+  background-repeat: no-repeat;
+  transition: border-color .22s ease;
+}
+
+.card:hover { border-color: #2c4050; }
+
+/* the live card arrives, and sits in its own pool of light */
+.card:not([hidden]) {
+  animation: rise .34s cubic-bezier(.2,.7,.3,1) both;
+  box-shadow: 0 32px 80px -40px rgba(0,224,164,.35);
+}
+
+@keyframes rise {
+  from { opacity: 0; transform: translateY(10px) }
+}
+
+.card h2 {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 14px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .2em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+.card h2::before {
+  content: "";
+  width: 3px;
+  height: 11px;
+  flex: none;
+  background: var(--accent);
+  box-shadow: 0 0 8px rgba(0,224,164,.6);
+}
+.card h2::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(90deg, var(--line), transparent);
+}
+
+.card p { margin: 0 0 4px; font-size: 13px; line-height: 1.65; color: var(--dim); max-width: 68ch; }
+
+/* ── forms ────────────────────────────────────────────────────────────────── */
+
+label {
+  display: block;
+  margin: 18px 0 7px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .18em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+input, textarea {
+  width: 100%;
+  padding: 12px 14px;
+  font: 400 14px/1.5 Geist, sans-serif;
+  letter-spacing: normal;
+  text-transform: none;
+  color: var(--text);
+  background: var(--inset);
+  border: 1px solid var(--line);
+  transition: border-color .08s linear;
+}
+input[type="password"], textarea { font-family: var(--mono); font-size: 13px; }
+textarea { min-height: 6rem; resize: vertical; }
+input:focus, textarea:focus {
+  outline: 0;
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+input::placeholder { color: var(--faint); }
+
+input[type="file"] {
+  padding: 10px 12px;
+  font-size: 12px;
+  color: var(--dim);
+  cursor: pointer;
+}
+input[type="file"]::file-selector-button {
+  margin-right: 12px;
+  padding: 7px 13px;
+  font: 700 10px/1 Geist, sans-serif;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: var(--text);
+  background: var(--raised);
+  border: 1px solid var(--line);
+  cursor: pointer;
+}
+input[type="file"]::file-selector-button:hover { border-color: var(--accent); }
+
+button {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 20px;
+  padding: 13px 22px 13px 18px;
+  font: 700 11px/1 Geist, sans-serif;
+  letter-spacing: .16em;
+  text-transform: uppercase;
+  color: #04110d;
+  background: linear-gradient(180deg, #2bf7bd, #00c48e);
+  border: 1px solid #2bf7bd;
+  clip-path: var(--bevel-sm);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.35);
+  cursor: pointer;
+  transition: filter .08s linear, transform .06s ease;
+}
+/* the kit's left glyph slot, and its corner tick */
+button::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  flex: none;
+  background: currentColor;
+  opacity: .75;
+  transform: rotate(45deg);
+}
+button::after {
+  content: "";
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  width: 5px;
+  height: 5px;
+  border-right: 1px solid currentColor;
+  border-bottom: 1px solid currentColor;
+  opacity: .45;
+}
+button:hover:not(:disabled) {
+  filter: brightness(1.1);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.45), 0 0 22px rgba(0,224,164,.35);
+}
+button:active:not(:disabled) { transform: translateY(1px); }
+button:disabled { opacity: .4; cursor: not-allowed; }
+
+button.secondary, #download {
+  color: var(--text);
+  background: linear-gradient(180deg, #1d2f3b, #16252f);
+  border-color: var(--line);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.07);
+}
+
+/* ── the things you have to read character by character ───────────────────── */
+
+/* these live inside <label>, which is uppercased — invite codes are base64 and
+   case-sensitive, so the inherited transform has to be cancelled here. */
+code, pre {
+  text-transform: none;
+  letter-spacing: normal;
+  font-family: var(--mono);
+  background: var(--inset);
+  border: 1px solid var(--line-soft);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+code { padding: 3px 7px; font-size: 12px; color: var(--text); }
+pre {
+  margin: 0;
+  padding: 16px;
+  font-size: 12.5px;
+  line-height: 1.75;
+  color: var(--text);
+  border-left: 2px solid var(--accent);
+}
+
+/* the roster fingerprint is the one step where a single wrong character matters,
+   so it is set as large and as spaced as it can be without wrapping oddly */
+#fingerprint {
+  display: inline-block;
+  margin-top: 4px;
+  padding: 10px 14px;
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: .14em;
+  color: var(--accent);
+  background: var(--inset);
+  border: 1px solid rgba(0,224,164,.35);
+  box-shadow: 0 0 22px rgba(0,224,164,.14);
+}
+
+#words {
+  font-size: 14px;
+  line-height: 2;
+  letter-spacing: .04em;
+  border-left-color: var(--warn);
+}
+
+#address {
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.8;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+#progress {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* ── warnings: the two steps that cannot be undone ────────────────────────── */
+
+.warning {
+  margin: 16px 0 0;
+  padding: 14px 16px;
+  font-size: 12.5px;
+  color: #f6d99a;
+  border: 1px solid rgba(244,183,40,.3);
+  border-left: 2px solid var(--warn);
+  background:
+    repeating-linear-gradient(135deg, rgba(244,183,40,.06) 0 8px, transparent 8px 16px);
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   STATE
+   Six steps, each of them slow and most of them irreversible. The chrome above
+   makes the app look like something; this part makes it behave like something:
+   where you are, what is working, what just happened.
+   ════════════════════════════════════════════════════════════════════════ */
+
+/* ── the stepper ──────────────────────────────────────────────────────────────
+   Vertical in the rail; the narrow layout lays it on its side. Defined once. */
+
+.steps {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  margin: auto 0 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: step;
+}
+
+.steps li {
+  position: relative;
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 9px 0 9px 14px;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: var(--faint);
+  border-left: 2px solid var(--line-soft);
+  transition: color .22s ease, border-color .22s ease, background .22s ease;
+}
+
+.steps li::before {
+  counter-increment: step;
+  content: "0" counter(step);
+  width: 18px;
+  flex: none;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: .08em;
+  color: var(--line);
+  transition: color .22s ease;
+}
+
+.steps li.done { color: var(--dim); border-left-color: rgba(0,224,164,.4); }
+.steps li.done::before { content: "✓"; color: var(--accent); }
+
+.steps li.now {
+  color: var(--text);
+  border-left-color: var(--accent);
+  background: linear-gradient(90deg, rgba(0,224,164,.08), transparent);
+}
+.steps li.now::before { color: var(--accent); }
+
+/* a light travelling down the live step */
+.steps li.now::after {
+  content: "";
+  position: absolute;
+  left: -2px;
+  bottom: 0;
+  width: 2px;
+  height: 40%;
+  background: linear-gradient(180deg, transparent, #9affdf, transparent);
+  animation: trace 2.1s ease-in-out infinite;
+}
+
+@keyframes trace {
+  0%   { transform: translateY(-20%); opacity: 0 }
+  25%  { opacity: 1 }
+  100% { transform: translateY(260%); opacity: 0 }
+}
+
+/* ── cards arrive rather than appear ──────────────────────────────────────── */
+
+
+/* ── a button that is working says so ─────────────────────────────────────── */
+
+button.busy { color: transparent; pointer-events: none; }
+button.busy::before { opacity: 0; }
+button.busy::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border: 0;
+  opacity: 1;
+  background: linear-gradient(90deg, transparent, rgba(4,17,13,.55), transparent);
+  background-size: 45% 100%;
+  background-repeat: no-repeat;
+  animation: shuttle .9s ease-in-out infinite;
+}
+
+@keyframes shuttle {
+  0%   { background-position: -45% 0 }
+  100% { background-position: 145% 0 }
+}
+
+/* ── waiting on other people: the two phases this app cannot hurry ────────── */
+
+body[data-phase="waiting_for_members"] #progress,
+body[data-phase="creating_keys"] #progress,
+body[data-phase="waiting_for_backups"] .card p:first-of-type {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+body[data-phase="waiting_for_members"] #progress::before,
+body[data-phase="creating_keys"] #progress::before,
+body[data-phase="waiting_for_backups"] .card p:first-of-type::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  flex: none;
+  background: var(--warn);
+  transform: rotate(45deg);
+  animation: breathe 1.5s ease-in-out infinite;
+}
+
+@keyframes breathe {
+  50% { opacity: .2; transform: rotate(45deg) scale(.7) }
+}
+
+/* the fingerprint is live data; it should look like it is being held, not printed */
+body[data-phase="compare_roster"] #fingerprint {
+  animation: hold 2.6s ease-in-out infinite;
+}
+
+@keyframes hold {
+  50% { box-shadow: 0 0 34px rgba(0,224,164,.3); border-color: rgba(0,224,164,.6) }
+}
+
+/* an address means the whole setup finished: give it the one celebration */
+body[data-phase="active"] #address {
+  animation: reveal .8s cubic-bezier(.2,.7,.3,1) both;
+}
+
+@keyframes reveal {
+  from { opacity: 0; filter: blur(7px); letter-spacing: .3em }
+}
+
+/* ── copy ─────────────────────────────────────────────────────────────────── */
+
+.copy { margin-top: 12px; font-size: 10px; padding: 9px 16px 9px 13px; }
+.copy.copied {
+  color: #04110d;
+  background: linear-gradient(180deg, #2bf7bd, #00c48e);
+  border-color: #2bf7bd;
+}
+
+/* ── hover: every interactive surface answers ─────────────────────────────── */
+
+pre, code { transition: border-color .18s ease; }
+pre:hover { border-color: var(--line); }
+
+@media (prefers-reduced-motion: reduce) {
+  .steps li.now::after, .card:not([hidden]), button.busy::after,
+  body[data-phase="compare_roster"] #fingerprint, body[data-phase="active"] #address,
+  body[data-phase="waiting_for_members"] #progress::before,
+  body[data-phase="creating_keys"] #progress::before,
+  body[data-phase="waiting_for_backups"] .card p:first-of-type::before {
+    animation: none;
+  }
+  /* a frozen travelling light is just a bright smear; drop it entirely */
+  .steps li.now::after { display: none; }
+}
+
+
+/* ════════════════════════════════════════════════════════════════════════════
+   COMPOSITION
+   A standing identity rail and a working column. The rail never changes shape,
+   so the vault, the member and the sigil stay put while the right side moves
+   through six steps. Scale does the hierarchy: 11px mono labels against a
+   72px serif headline, nothing in between.
+   ════════════════════════════════════════════════════════════════════════ */
+
+.shell {
+  display: grid;
+  grid-template-columns: 330px minmax(0, 1fr);
+  min-height: 100vh;
+}
+
+.rail {
+  position: sticky;
+  top: 0;
+  align-self: start;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  gap: 30px;
+  padding: 34px 32px;
+  background: #0a1118;
+  border-right: 1px solid var(--line);
+  overflow: hidden;
+}
+
+/* a soft field behind the rail so it reads as a surface, not a sidebar */
+.rail::before {
+  content: "";
+  position: absolute;
+  left: -40%;
+  top: 18%;
+  width: 150%;
+  aspect-ratio: 1;
+  background: radial-gradient(circle, rgba(0,224,164,.14), transparent 62%);
+  pointer-events: none;
+}
+
+.rail > * { position: relative; }
+
+.brand {
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: .22em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.slot {
+  display: inline-block;
+  font-family: var(--serif);
+  font-size: 13px;
+  letter-spacing: .1em;
+  color: var(--accent);
+  padding: 3px 10px;
+  border: 1px solid rgba(0,224,164,.3);
+  background: rgba(0,224,164,.06);
+}
+
+.identity h1 {
+  margin: 12px 0 6px;
+  font-size: 30px;
+  line-height: 1.05;
+  overflow-wrap: anywhere;
+}
+
+.identity .muted { font-size: 12px; line-height: 1.55; }
+
+/* ── the sigil ────────────────────────────────────────────────────────────── */
+
+.sigil { margin: 0; }
+
+.sigil svg {
+  width: 100%;
+  max-width: 190px;
+  aspect-ratio: 1;
+  display: block;
+  padding: 14px;
+  background: var(--inset);
+  border: 1px solid var(--line);
+  clip-path: var(--bevel);
+  opacity: .25;
+  transition: opacity .5s ease, filter .5s ease;
+  filter: grayscale(1);
+}
+
+.sigil svg.ready {
+  opacity: 1;
+  filter: none;
+  animation: cast .7s cubic-bezier(.2,.8,.3,1) both;
+}
+
+@keyframes cast {
+  from { opacity: 0; transform: scale(.82) rotate(-12deg) }
+}
+
+.sigil figcaption {
+  margin-top: 10px;
+  max-width: 24ch;
+  font-size: 10px;
+  line-height: 1.6;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+.rail-foot {
+  font-size: 9.5px;
+  letter-spacing: .2em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+/* ── working column ───────────────────────────────────────────────────────── */
+
+main {
+  max-width: 720px;
+  padding: 54px 48px 72px;
+}
+
+.step-kicker {
+  margin: 0 0 14px;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: .22em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.step-title {
+  margin: 0 0 34px;
+  max-width: 17ch;
+  font-family: var(--serif);
+  font-weight: 400;
+  font-size: clamp(34px, 4.6vw, 54px);
+  line-height: 1.02;
+  letter-spacing: -.01em;
+}
+
+/* the live card sits in its own pool of light */
+
+@media (max-width: 900px) {
+  .shell { grid-template-columns: minmax(0, 1fr); }
+  .rail {
+    position: static;
+    height: auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .steps { margin-top: 10px; flex-direction: row; gap: 2px; }
+  .steps li { flex: 1; padding: 10px 8px; border-left: 0; border-top: 2px solid var(--line-soft); }
+  .steps li.done { border-top-color: rgba(0,224,164,.4); }
+  .steps li.now { border-top-color: var(--accent); }
+  .steps li.now::after { display: none; }
+  .sigil svg { max-width: 140px; }
+  main { padding: 32px 22px 56px; }
+}
+
+/* ── seed words as a numbered grid ───────────────────────────────────────── */
+
+#words.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 1px;
+  padding: 1px;
+  background: var(--line-soft);
+  border-left-color: var(--warn);
+  letter-spacing: normal;
+}
+
+#words.grid span {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 11px 13px;
+  background: var(--inset);
+  font-size: 13.5px;
+  color: var(--text);
+}
+
+#words.grid i {
+  font-style: normal;
+  font-size: 10px;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── fingerprint echo ─────────────────────────────────────────────────────── */
+
+.echo {
+  margin: 9px 0 0;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  letter-spacing: .02em;
+  color: var(--dim);
+}
+.echo.ok { color: var(--text); }
+.echo.bad { color: var(--danger); }
+
+/* ── narrow ───────────────────────────────────────────────────────────────── */
+
+@media (max-width: 560px) {
+  .identity h1 { font-size: 25px; }
+  .card { padding: 22px 20px; }
+  #fingerprint { font-size: 14px; letter-spacing: .1em; }
+  #words.grid { grid-template-columns: repeat(auto-fit, minmax(118px, 1fr)); }
+}

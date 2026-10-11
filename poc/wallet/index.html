@@ -8,22 +8,49 @@
   <script src="/app.js" defer></script>
 </head>
 <body>
-<header><strong>◇ Loki</strong><span>One member · regtest setup</span></header>
+<div class="shell">
+<aside class="rail">
+  <strong class="brand">◇ Loki</strong>
+
+  <div class="identity">
+    <span class="slot" id="slot">—</span>
+    <h1 id="title">Your wallet</h1>
+    <p class="muted" id="subtitle">Create or join a vault from this member's own app.</p>
+  </div>
+
+  <figure class="sigil">
+    <svg id="sigil" viewBox="0 0 120 120" role="img" aria-labelledby="sigilCaption"></svg>
+    <figcaption id="sigilCaption">Roster sigil · appears when all three join</figcaption>
+  </figure>
+
+  <ol class="steps" id="steps">
+    <li data-step="0">Create or join</li>
+    <li data-step="1">Compare roster</li>
+    <li data-step="2">Group keys</li>
+    <li data-step="3">Back up</li>
+    <li data-step="4">Active</li>
+  </ol>
+
+  <span class="rail-foot">One member · regtest setup</span>
+</aside>
+
 <main>
-  <h1 id="title">Your wallet</h1><p class="muted" id="subtitle">Create or join a vault from this member's own app.</p>
+  <p class="step-kicker" id="kicker">Step 01 of 05</p>
+  <h2 class="step-title" id="headline">Start or join a vault</h2>
   <p id="message" role="status" hidden></p>
   <div id="new" hidden>
     <section class="card"><h2>Create a vault</h2><p>Start a 2-of-3 vault. The other two people join from their own apps.</p>
       <form id="create"><label>Vault name<input name="name" maxlength="80" required></label><label>Your unlock passphrase<input name="passphrase" type="password" minlength="12" autocomplete="new-password" required></label><button>Create vault</button></form></section>
     <section class="card"><h2>Join a vault</h2><form id="join"><label>Invite code<textarea name="invite" required></textarea></label><label>Your unlock passphrase<input name="passphrase" type="password" minlength="12" autocomplete="new-password" required></label><button>Join vault</button></form></section>
   </div>
-  <section class="card" id="invites" hidden><h2>Invite the other members</h2><p>Give one code to each person. They open Loki in their own app and paste their code. Codes expire after 24 hours.</p><label>Member 2 code<pre id="invite2"></pre></label><label>Member 3 code<pre id="invite3"></pre></label></section>
-  <section class="card" id="setup" hidden><h2>Vault setup</h2><p id="progress"></p><p>Roster fingerprint: <code id="fingerprint"></code></p><p class="warning">Compare this fingerprint with both other members using a channel you trust. Stop if any character differs.</p><form id="agree"><label>Type the full matching fingerprint<input name="fingerprint" autocomplete="off" required></label><label>Your unlock passphrase<input name="passphrase" type="password" autocomplete="current-password" required></label><button>Create group keys</button></form></section>
+  <section class="card" id="invites" hidden><h2>Invite the other members</h2><p>Give one code to each person. They open Loki in their own app and paste their code. Codes expire after 24 hours.</p><label>Member 2 code<pre id="invite2"></pre></label><button type="button" class="copy secondary" data-copy="invite2">Copy member 2 code</button><label>Member 3 code<pre id="invite3"></pre></label><button type="button" class="copy secondary" data-copy="invite3">Copy member 3 code</button></section>
+  <section class="card" id="setup" hidden><h2>Vault setup</h2><p id="progress"></p><p>Roster fingerprint: <code id="fingerprint"></code></p><p class="warning">Compare this fingerprint with both other members using a channel you trust. Stop if any character differs.</p><form id="agree"><label>Type the full matching fingerprint<input name="fingerprint" autocomplete="off" required></label><p class="echo" id="echo" hidden></p><label>Your unlock passphrase<input name="passphrase" type="password" autocomplete="current-password" required></label><button>Create group keys</button></form></section>
   <section class="card" id="backup" hidden><h2>Back up your share</h2><p>Save your 24 words and backup card separately. Anyone with both can view the vault and hold one signing share.</p><form id="make-backup"><label>Your unlock passphrase<input name="passphrase" type="password" autocomplete="current-password" required></label><button>Generate backup</button></form><div id="backup-made" hidden><label>24 words<pre id="words"></pre></label><button type="button" id="download">Download backup card</button><p class="warning">The address stays hidden until every member checks their own backup.</p></div>
     <form id="check-backup"><label>Enter your 24 words<input name="words" autocomplete="off" required></label><label>Load the card you saved<input name="card" type="file" required></label><label>Your unlock passphrase<input name="passphrase" type="password" autocomplete="current-password" required></label><button>Check backup</button></form></section>
   <section class="card" id="waiting" hidden><h2>Waiting for backups</h2><p>All members must check their own backup before the vault address appears.</p><form id="activate"><label>Your unlock passphrase<input name="passphrase" type="password" autocomplete="current-password" required></label><button>Check activation</button></form></section>
-  <section class="card" id="active" hidden><h2>Vault address</h2><p id="address" class="muted">Unlock to view the address.</p><form id="show-address"><label>Your unlock passphrase<input name="passphrase" type="password" autocomplete="current-password" required></label><button>Show receive address</button></form></section>
+  <section class="card" id="active" hidden><h2>Vault address</h2><p id="address" class="muted">Unlock to view the address.</p><button type="button" class="copy secondary" data-copy="address" hidden>Copy address</button><form id="show-address"><label>Your unlock passphrase<input name="passphrase" type="password" autocomplete="current-password" required></label><button>Show receive address</button></form></section>
   <p class="muted">Regtest setup build. No real funds. Payments still run through the separate member CLI.</p>
 </main>
+</div>
 </body>
 </html>
