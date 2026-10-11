@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Loopback UI for one disposable, separately created 2-of-3 regtest payment."""
+"""Loopback UI for a staged, disposable 2-of-3 regtest payment."""
 
 from __future__ import annotations
 
@@ -63,6 +63,7 @@ class Flow:
         self.chain = ManagedTHS(ROOT, lambda *_: None, self.cancel)
         self.phase = "interrupted" if RUN.exists() else "idle"
         self.error = None
+        self.vaults = None
         self.payment = None
         self.txid = None
         self.review = {"alice": None, "bob": None}
@@ -86,13 +87,15 @@ class Flow:
         with self.lock:
             out = {
                 "role": role, "phase": self.phase, "error": self.error,
-                "payment": self.payment, "txid": self.txid,
-                "signers": self.signers.copy(),
+                "vaults": self.vaults, "payment": self.payment, "txid": self.txid,
+                "approvals_count": sum(value == "approved" for value in self.signers.values()),
                 "network": self.chain.snapshot(),
             }
             if role in self.review:
                 out["review"] = self.review[role]
+                out["own_status"] = self.signers[role]
             if role == "admin":
+                out["signers"] = self.signers.copy()
                 out["links"] = {name: f"{origin}/#{self.tokens[name]}"
                                 for name in self.review}
             return out
@@ -105,42 +108,86 @@ class Flow:
                                or f"{Path(args[0]).name} exited {result.returncode}")
         return result.stdout
 
-    def start(self, amount: int, memo: str):
+    def _check_binaries(self):
+        binary("loki_setup_member")
+        self.pay_binary = binary("loki_member_payment")
+        feature = subprocess.run([str(self.pay_binary), "features"], capture_output=True, timeout=5)
+        if feature.returncode or feature.stdout != b"relay-backed-signing=1\n":
+            raise ValueError("build loki_member_payment with --features relay-communication")
+        binary("loki_relay_member")
+        relay_run.find_binary("loki-relay-server", workspace=POC.parent / "communication")
+
+    def create_vault(self):
+        with self.lock:
+            if self.phase != "idle":
+                raise ValueError("reset this demo before creating another vault")
+            self._check_binaries()
+            self.phase = "creating_vault"
+            self.error = None
+            self.worker = threading.Thread(target=self._create_vault, daemon=True)
+            self.worker.start()
+
+    def _create_vault(self):
+        try:
+            self.chain.start()
+            self._command([sys.executable, str(POC / "run-member-payment.py"),
+                           "--name", self.chain.name, "--state", str(RUN), "--stage", "setup"], timeout=1200)
+            vaults = json.loads((RUN / "vaults.json").read_text())
+            if vaults["source"] == vaults["recipient"] or vaults["funded"]:
+                raise RuntimeError("vault setup returned invalid addresses or funding state")
+            with self.lock:
+                self.vaults = vaults
+                self.phase = "vault_ready"
+        except Exception as error:
+            self._fail(error)
+
+    def fund(self):
+        with self.lock:
+            if self.phase != "vault_ready" or not self.vaults:
+                raise ValueError("create the vault before funding it")
+            self.phase = "funding"
+            self.worker = threading.Thread(target=self._fund, daemon=True)
+            self.worker.start()
+
+    def _fund(self):
+        try:
+            self._command([sys.executable, str(POC / "run-member-payment.py"),
+                           "--name", self.chain.name, "--state", str(RUN), "--stage", "fund"], timeout=300)
+            vaults = json.loads((RUN / "vaults.json").read_text())
+            if vaults != {**self.vaults, "funded": True}:
+                raise RuntimeError("funding changed the vault addresses")
+            with self.lock:
+                self.vaults = vaults
+                self.phase = "funded"
+        except Exception as error:
+            self._fail(error)
+
+    def propose(self, amount: int, memo: str):
         if not isinstance(amount, int) or isinstance(amount, bool) or not 0 < amount < 100_000_000:
             raise ValueError("amount must be between 1 and 99,999,999 zat")
         if not isinstance(memo, str) or not 0 < len(memo.encode("utf-8")) <= 512:
             raise ValueError("memo must contain 1 to 512 UTF-8 bytes")
         with self.lock:
-            if self.phase != "idle":
-                raise ValueError("reset this demo before starting another payment")
-            binary("loki_setup_member")
-            self.pay_binary = binary("loki_member_payment")
-            feature = subprocess.run([str(self.pay_binary), "features"], capture_output=True, timeout=5)
-            if feature.returncode or feature.stdout != b"relay-backed-signing=1\n":
-                raise ValueError("build loki_member_payment with --features relay-communication")
-            binary("loki_relay_member")
-            relay_run.find_binary("loki-relay-server", workspace=POC.parent / "communication")
-            self.phase = "preparing"
+            if self.phase != "funded":
+                raise ValueError("fund the vault before proposing a payment")
+            self.phase = "preparing_payment"
             self.error = None
             self.worker = threading.Thread(target=self._prepare, args=(amount, memo), daemon=True)
             self.worker.start()
 
     def _prepare(self, amount: int, memo: str):
         try:
-            self.chain.start()
-            output = self._command([
+            self._command([
                 sys.executable, str(POC / "run-member-payment.py"),
-                "--name", self.chain.name, "--state", str(RUN), "--manual",
+                "--name", self.chain.name, "--state", str(RUN), "--manual", "--stage", "prepare",
                 "--amount-zat", str(amount), f"--memo={memo}",
             ], timeout=1200)
-            source = re.search(r"^Source vault: (uregtest\S+)$", output, re.M)
-            recipient = re.search(r"^Independent recipient: (uregtest\S+)$", output, re.M)
             manifest = json.loads((RUN / "payment" / "payment.json").read_text())
-            if not source or not recipient or manifest["amount_zat"] != amount:
+            if manifest["amount_zat"] != amount:
                 raise RuntimeError("setup output differs from the payment manifest")
             payment = {
-                "id": manifest["payment"], "source": source.group(1),
-                "recipient": recipient.group(1), "amount_zat": manifest["amount_zat"],
+                "id": manifest["payment"], "source": self.vaults["source"],
+                "recipient": self.vaults["recipient"], "amount_zat": manifest["amount_zat"],
                 "memo": bytes.fromhex(manifest["memo"]).decode("utf-8"),
                 "fee_zat": manifest["fee_zat"], "change_zat": manifest["change_zat"],
                 "expiry_height": manifest["expiry_height"],
@@ -374,7 +421,7 @@ class Flow:
             self.cancel = threading.Event()
             self.chain = ManagedTHS(ROOT, lambda *_: None, self.cancel)
             self.phase = "idle"
-            self.error = self.payment = self.txid = None
+            self.error = self.vaults = self.payment = self.txid = None
             self.review = {"alice": None, "bob": None}
             self.signers = {"alice": "waiting", "bob": "waiting"}
             self.context = self.relay_binary = self.pay_binary = None
@@ -459,8 +506,12 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("request body too large")
             body = json.loads(self.rfile.read(length) or b"{}")
             path = self.path.split("?", 1)[0]
-            if path == "/api/start" and role == "admin":
-                FLOW.start(body.get("amount_zat"), body.get("memo"))
+            if path == "/api/create-vault" and role == "admin":
+                FLOW.create_vault()
+            elif path == "/api/fund" and role == "admin":
+                FLOW.fund()
+            elif path == "/api/propose" and role == "alice":
+                FLOW.propose(body.get("amount_zat"), body.get("memo"))
             elif path == "/api/decide" and role in ("alice", "bob"):
                 FLOW.decide(role, body.get("action"))
             elif path == "/api/finish" and role == "admin":
@@ -490,8 +541,9 @@ def main():
         parser.error("another member demo already owns this sandbox")
     FLOW.chain.recover()
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    print(f"Coordinator: http://127.0.0.1:{args.port}/#{FLOW.tokens['admin']}", flush=True)
-    print("Open signer links from the coordinator in two separate browser sessions.", flush=True)
+    for label, role in (("Carol", "admin"), ("Alice", "alice"), ("Bob", "bob")):
+        print(f"{label}: http://127.0.0.1:{args.port}/#{FLOW.tokens[role]}", flush=True)
+    print("Open each member URL in a separate browser profile.", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

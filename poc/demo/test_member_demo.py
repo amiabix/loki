@@ -22,15 +22,18 @@ class MemberDemoTest(unittest.TestCase):
         with patch.object(member_demo, "ROOT", root), patch.object(member_demo, "RUN", root / "run"):
             return member_demo.Flow()
 
-    def test_member_tokens_are_distinct_and_amount_is_checked_before_start(self):
+    def test_member_tokens_are_distinct_and_payment_needs_a_funded_vault(self):
         flow = self.flow()
         for name, token in flow.tokens.items():
             self.assertEqual(flow.role(token), name)
         self.assertEqual(len(set(flow.tokens.values())), 3)
         self.assertIsNone(flow.role("wrong"))
         with self.assertRaisesRegex(ValueError, "amount"):
-            flow.start(100_000_000, "memo")
+            flow.propose(100_000_000, "memo")
         self.assertEqual(flow.phase, "idle")
+        with self.assertRaisesRegex(ValueError, "fund"):
+            flow.propose(40_000_000, "memo")
+        self.assertIsNone(flow.payment)
 
     def test_member_state_returns_its_own_review(self):
         flow = self.flow()
@@ -43,6 +46,20 @@ class MemberDemoTest(unittest.TestCase):
         self.assertNotIn("links", alice)
         self.assertNotIn("links", bob)
         self.assertNotIn("review", carol)
+        self.assertNotIn("signers", alice)
+        self.assertNotIn("signers", bob)
+
+    def test_actions_are_staged(self):
+        flow = self.flow()
+        with patch.object(member_demo, "binary", return_value=Path(sys.executable)), \
+             patch.object(member_demo.relay_run, "find_binary", return_value=Path(sys.executable)), \
+             patch.object(subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=b"relay-backed-signing=1\n")), \
+             patch.object(flow, "_create_vault"):
+            flow.create_vault()
+        self.assertEqual(flow.phase, "creating_vault")
+        with self.assertRaisesRegex(ValueError, "vault"):
+            flow.fund()
+        flow.worker.join(timeout=3)
 
     def test_review_prompt_then_exact_member_approval(self):
         flow = self.flow()
@@ -167,6 +184,37 @@ class MemberDemoTest(unittest.TestCase):
             handler.do_POST()
             self.assertEqual(handler.json.call_args.args[0], 200)
             decide.assert_called_once_with("alice", "approve")
+
+    def test_only_alice_can_propose_and_only_carol_can_create(self):
+        flow = self.flow()
+        handler = member_demo.Handler.__new__(member_demo.Handler)
+        handler.server = SimpleNamespace(server_port=8790)
+        handler.json = Mock()
+        payload = b'{"amount_zat":12000000,"memo":"test"}'
+        handler.headers = {"Origin": "http://127.0.0.1:8790", "Content-Type": "application/json",
+                           "Content-Length": str(len(payload)), "X-Loki-Token": flow.tokens["bob"]}
+        handler.path = "/api/propose"
+        with patch.object(member_demo, "FLOW", flow), patch.object(flow, "propose") as propose, \
+             patch.object(flow, "create_vault") as create:
+            handler.rfile = BytesIO(payload)
+            handler.do_POST()
+            self.assertEqual(handler.json.call_args.args[0], 403)
+            handler.headers["X-Loki-Token"] = flow.tokens["alice"]
+            handler.rfile = BytesIO(payload)
+            handler.do_POST()
+            self.assertEqual(handler.json.call_args.args[0], 200)
+            propose.assert_called_once_with(12_000_000, "test")
+            handler.path = "/api/create-vault"
+            handler.headers["X-Loki-Token"] = flow.tokens["alice"]
+            handler.rfile = BytesIO(b'{}')
+            handler.headers["Content-Length"] = "2"
+            handler.do_POST()
+            self.assertEqual(handler.json.call_args.args[0], 403)
+            handler.headers["X-Loki-Token"] = flow.tokens["admin"]
+            handler.rfile = BytesIO(b'{}')
+            handler.do_POST()
+            self.assertEqual(handler.json.call_args.args[0], 200)
+            create.assert_called_once_with()
 
 
 if __name__ == "__main__":

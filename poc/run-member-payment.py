@@ -62,6 +62,8 @@ def main():
     parser.add_argument("--name", required=True, help="already running THS instance")
     parser.add_argument("--state", type=pathlib.Path, required=True, help="new, private test directory")
     parser.add_argument("--manual", action="store_true", help="prepare, then print commands for two human signers")
+    parser.add_argument("--stage", choices=("all", "setup", "fund", "prepare"), default="all",
+                        help="run one step for the local member UI")
     parser.add_argument("--pair", choices=("AB", "AC", "BC"), default="AB", help="members who approve this payment")
     parser.add_argument("--finisher", type=int, choices=(1, 2, 3), help="member who proves and sends; defaults to the non-signer")
     parser.add_argument("--amount-zat", type=int, default=40_000_000, help="regtest payment amount")
@@ -72,7 +74,10 @@ def main():
     if not args.memo or len(args.memo.encode()) > 512:
         parser.error("memo must contain 1 to 512 UTF-8 bytes")
     root = args.state.resolve()
-    root.mkdir(mode=0o700, parents=True, exist_ok=False)
+    if args.stage in ("all", "setup"):
+        root.mkdir(mode=0o700, parents=True, exist_ok=False)
+    elif not root.is_dir():
+        parser.error("set up the vault before funding or preparing a payment")
     work = root / "payment"
     chain = THS(args.name)
     chain.check()
@@ -86,13 +91,36 @@ def main():
     if not setup.is_file() or not pay.is_file():
         raise RuntimeError("run cargo build --locked --bins in poc/ first")
 
-    members, roster, vault = create_vault(root / "source", 7, setup, env)
-    recipient_members, recipient_roster, recipient_address = create_vault(root / "recipient", 8, setup, env)
-    if vault == recipient_address:
-        raise RuntimeError("recipient has the sender's address")
-    print("activated source and independent recipient vaults", flush=True)
-    chain.fund(vault, 1)
-    print("funded source vault on THS", flush=True)
+    if args.stage in ("all", "setup"):
+        members, roster, vault = create_vault(root / "source", 7, setup, env)
+        recipient_members, recipient_roster, recipient_address = create_vault(root / "recipient", 8, setup, env)
+        if vault == recipient_address:
+            raise RuntimeError("recipient has the sender's address")
+        (root / "vaults.json").write_text(json.dumps({"source": vault, "recipient": recipient_address, "funded": False}))
+        print("activated source and independent recipient vaults", flush=True)
+        print(f"Source vault: {vault}", flush=True)
+        print(f"Independent recipient: {recipient_address}", flush=True)
+        if args.stage == "setup":
+            return
+    else:
+        vaults = json.loads((root / "vaults.json").read_text())
+        vault, recipient_address = vaults["source"], vaults["recipient"]
+        members = [(root / "source" / f"member-{number}", root / "source" / f"member-{number}" / "pass.txt")
+                   for number in (1, 2, 3)]
+        roster = root / "source" / "roster.json"
+        recipient_members = [(root / "recipient" / f"member-{number}", root / "recipient" / f"member-{number}" / "pass.txt")
+                             for number in (1, 2, 3)]
+        recipient_roster = root / "recipient" / "roster.json"
+    if args.stage in ("all", "fund"):
+        if args.stage == "fund" and vaults["funded"]:
+            raise RuntimeError("source vault is already funded")
+        chain.fund(vault, 1)
+        (root / "vaults.json").write_text(json.dumps({"source": vault, "recipient": recipient_address, "funded": True}))
+        print("funded source vault on THS", flush=True)
+        if args.stage == "fund":
+            return
+    elif not vaults["funded"]:
+        raise RuntimeError("fund the source vault before preparing a payment")
 
     owner, password = members[0]
     run([pay, "prepare", owner, password, roster, work, recipient_address, str(args.amount_zat), args.memo, args.pair], env)

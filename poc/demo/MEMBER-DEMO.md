@@ -16,14 +16,15 @@ cargo build --locked --bins --features relay-communication
 python3 demo/member_demo.py
 ```
 
-Open the **Coordinator** URL printed in the terminal. Create a payment to a
-new independent recipient vault. The amount and memo come from the form; the
-regtest source vault receives one faucet note. Setup, backup checks, funding and
-proposal creation take a few minutes. Launch Alice and Bob in separate
-browser profiles. Each page displays that member's verified CLI review and
-requires an explicit **Confirm payment** action. An approval counts only after
+The terminal prints separate **Carol**, **Alice**, and **Bob** URLs. Open each
+in a separate browser profile. The fresh run starts with no vault or payment.
+Carol creates the source vault and an independent recipient vault, then funds
+the source with one regtest ZEC. Alice proposes a payment to that recipient,
+choosing the amount and memo. Alice and Bob each see their own verified CLI
+review and must explicitly **Confirm payment**. An approval counts only after
 its two encrypted share messages are stored by the relays; a failed delivery
-can be retried without signing again. Carol's window can then prove and send.
+can be retried without signing again. Carol's window shows quorum progress and
+can then prove and send.
 The UI says **Confirmed** only
 after the mined transaction passes both source and recipient checks.
 
@@ -36,12 +37,12 @@ LOKI_MEMBER_DEMO_ROOT=/private/tmp/loki-member-demo-browser-check python3 demo/m
 
 ```sh
 npm ci --ignore-scripts --prefix g3
-LOKI_DEMO_URL='http://127.0.0.1:8791/#<printed-token>' node demo/test-member-browser.js
+LOKI_DEMO_URL='http://127.0.0.1:8791/#<Carol-token>' node demo/test-member-browser.js
 ```
 
-The check creates a regtest payment, opens an Alice window, signs from separate
-Alice and Bob browser profiles, and waits for Carol's history to show the mined
-txid. It requires Playwright's Chromium browser installed locally and leaves the
+The check creates and funds a vault, proposes from Alice's browser profile,
+signs from separate Alice and Bob profiles, and waits for Carol's history to
+show the mined txid. It requires Playwright's Chromium browser and leaves the
 confirmed demo instance running for inspection.
 
 The server creates and owns one disposable THS instance and three local relays.
