@@ -6,6 +6,24 @@ public join records and the existing signed or encrypted setup messages. Each
 process calls `loki_setup_member` for its own identity, DKG and backup. It has
 no route that creates another member's identity or unlocks another share.
 
+Before agreeing to the roster, each member connects the reference regtest
+wallet. Click **Create connection challenge**, download its JSON, and run the
+wallet command in a separate terminal:
+
+```sh
+chmod 600 /path/to/your-24-word-seed-file
+./target/debug/loki_seed_wallet prove /path/to/your-24-word-seed-file loki-account-challenge.json
+```
+
+Paste the JSON proof into the member app. The command derives account 0 using
+ZIP 32's regtest coin type, signs the fresh vault-and-member challenge with its
+Orchard spend authorization key, and exits. Loki verifies that signature and
+seals the account link. The profile uses the same account key across its vaults,
+while each vault still gets a separate FROST identity and share. The seed file
+never goes to the Loki app or the setup courier. This adapter supports only the
+reference command; existing Zcash wallets do not automatically expose this
+signing API. Use a **regtest-only seed**. An address QR is not a proof of control.
+
 ```sh
 cd poc
 cargo build --locked --bins
@@ -35,6 +53,10 @@ is not saved as plaintext in the member directory. The profile ID is local and
 does not appear in the vault roster or on chain. A membership links that profile
 ID to the vault ID locally; the certified roster binds that membership's separate
 public identity to its FROST share.
+The account-control proof is verified locally and kept in the member's sealed
+store. It is not part of the group certificate, so other members do not learn a
+reusable account key. The ordinary wallet seed does not recover a Loki FROST
+share; the Loki 24 words and backup card are still required.
 The app is passphrase-only today. Its local file courier and time-limited,
 non-resumable DKG are development controls, not the planned relay transport.
 Data roots created by the previous one-vault app are left untouched and need an
@@ -46,5 +68,5 @@ separate-member CLI and harness for transaction testing. Do not use real funds.
 Verify the member flow:
 
 ```sh
-python3 -m unittest -v wallet/test_member_app.py
+python3 -m unittest -v wallet/test_account_link.py wallet/test_member_app.py
 ```

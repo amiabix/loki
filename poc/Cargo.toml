@@ -27,6 +27,7 @@ blake2b_simd       = "1"
 blake3             = "1.8"
 zeroize            = "1"
 bip39              = { version = "2.2.2", default-features = false, features = ["std"] }
+zip32              = "=0.2.1"
 # At-rest encryption for member secrets (`MemberDir::write_sealed`). XChaCha20-Poly1305
 # is already in the graph via zcash_note_encryption, so only the KDF is new: Argon2id is
 # the one memory-hard password hash in wide review, and a passphrase needs a real KDF.

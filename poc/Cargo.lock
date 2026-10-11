@@ -1504,6 +1504,7 @@ dependencies = [
  "zakura-transparent",
  "zcash_note_encryption",
  "zeroize 1.9.0",
+ "zip32",
 ]
 
 [[package]]

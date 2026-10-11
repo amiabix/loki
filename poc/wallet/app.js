@@ -2,9 +2,11 @@
 const token = location.hash.slice(1);
 const $ = (id) => document.getElementById(id);
 let selectedVault = null;
+let linkChallenge = null;
 
 function selectVault(vault) {
   selectedVault = vault;
+  linkChallenge = null;
   $('address').textContent = 'Open this vault to view the address.';
   $('balance').textContent = "Scan this device's chain view to see the balance.";
   $('words').textContent = '';
@@ -56,17 +58,20 @@ async function refresh() {
   try {
     const state = await api('status' + (selectedVault ? `?vault=${encodeURIComponent(selectedVault)}` : ''));
     if (state.phase === 'new_profile' || state.phase === 'locked') selectedVault = null;
-    for (const id of ['new-profile', 'locked', 'home', 'invites', 'setup', 'backup', 'waiting', 'active']) $(id).hidden = true;
+    for (const id of ['new-profile', 'locked', 'home', 'invites', 'connect-account', 'setup', 'backup', 'waiting', 'active']) $(id).hidden = true;
     $('back').hidden = !selectedVault;
     $('lock').hidden = !state.profile && state.phase !== 'home';
     $('title').textContent = state.name || state.profile?.name || 'Your wallet';
     $('subtitle').textContent = selectedVault ? `Member ${state.slot} · 2 of 3 · regtest` : 'One local profile, separate keys for each vault.';
+    $('linked-account').hidden = !state.account_ak;
+    if (state.account_ak) $('linked-account').textContent = `Connected Orchard account key: ${state.account_ak.slice(0, 16)}…`;
     if (state.phase === 'new_profile') $('new-profile').hidden = false;
     else if (state.phase === 'locked') $('locked').hidden = false;
     else if (state.phase === 'home') {
       $('home').hidden = false;
       vaultList(state.vaults);
     } else {
+      $('connect-account').hidden = state.account_linked;
       if (state.invites) {
         $('invite2').textContent = state.invites[0];
         $('invite3').textContent = state.invites[1];
@@ -101,6 +106,28 @@ action('join', async (form) => {
   const value = await api('join', fields(form));
   selectVault(value.vault);
   message('Joined. Waiting for the other members.');
+});
+function challengeDownload() {
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(new Blob([JSON.stringify(linkChallenge)], {type: 'application/json'}));
+  link.download = 'loki-account-challenge.json';
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+}
+$('begin-link').addEventListener('click', async () => {
+  try {
+    linkChallenge = await api('begin-link', {vault: selectedVault});
+    $('link-challenge').textContent = JSON.stringify(linkChallenge, null, 2);
+    $('link-challenge').hidden = false;
+    $('download-challenge').hidden = false;
+    message('Challenge ready. Download it and sign it with your separate wallet command.');
+  } catch (error) { message(error.message, true); }
+});
+$('download-challenge').addEventListener('click', challengeDownload);
+action('link-account', async (form) => {
+  const proof = JSON.parse(fields(form).proof);
+  const result = await api('link', {vault: selectedVault, proof});
+  message(`Account connected: ${result.account_ak}. You can continue vault setup.`);
 });
 action('agree', async (form) => { await api('agree', {vault: selectedVault, ...fields(form)}); message('Key creation started. Each member must compare and confirm the roster.'); });
 action('make-backup', async () => {

@@ -2,6 +2,8 @@
 
 import base64
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -9,7 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
-from member_app import SETUP, Wallet
+from member_app import SEED_WALLET, SETUP, Wallet
 
 
 class MemberWalletTest(unittest.TestCase):
@@ -52,6 +54,18 @@ class MemberWalletTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "failed authentication"):
                 wallets[0].unlock("wrong passphrase for this vault")
             self.assertEqual(wallets[0].unlock(passwords[0])["profile"], profiles[0])
+            with self.assertRaisesRegex(ValueError, "Connect your Zcash account"):
+                wallets[0].agree(vault, fingerprints[0])
+            seed = root / "wallet-seed.txt"
+            seed.write_text("abandon " * 23 + "art")
+            os.chmod(seed, 0o600)
+            for wallet in wallets:
+                challenge = root / f"challenge-{wallet.data.name}.json"
+                challenge.write_text(json.dumps(wallet.begin_link(vault)))
+                proof = json.loads(subprocess.run(
+                    [SEED_WALLET, "prove", seed, challenge], capture_output=True,
+                    text=True, check=True).stdout)
+                wallet.link(vault, proof)
             for wallet in wallets:
                 self.assertEqual(wallet.agree(vault, fingerprints[0]), {"started": True})
             for wallet in wallets:
@@ -76,7 +90,7 @@ class MemberWalletTest(unittest.TestCase):
             second = wallets[0].create("Second vault")["vault"]
             self.assertNotEqual(second, vault)
             self.assertEqual(len(wallets[0].status()["vaults"]), 2)
-            self.assertEqual(wallets[0].status(second)["phase"], "waiting_for_members")
+            self.assertEqual(wallets[0].status(second)["phase"], "connect_account")
             with self.assertRaisesRegex(ValueError, "not a member"):
                 wallets[1].status(second)
             first_key = json.loads((exchange / vault / "join-1.json").read_text())

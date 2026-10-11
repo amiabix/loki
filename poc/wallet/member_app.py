@@ -23,6 +23,7 @@ from urllib.parse import parse_qs, urlsplit
 HERE = Path(__file__).resolve().parent
 SETUP = HERE.parent / "target" / "debug" / "loki_setup_member"
 PAYMENT = HERE.parent / "target" / "debug" / "loki_member_payment"
+SEED_WALLET = HERE.parent / "target" / "debug" / "loki_seed_wallet"
 
 
 def encoded(value):
@@ -220,6 +221,48 @@ class Wallet:
         fingerprint = self.command("fingerprint", write_path)
         return {"members": members, "fingerprint": fingerprint}
 
+    def begin_link(self, vault):
+        member_dir, local = self.vault_dir(vault)
+        if (member_dir / "secrets" / "account-link.sealed").exists():
+            raise ValueError("This vault membership already has an account link")
+        identity = json.loads(self.command("identity-public", member_dir, "@pass"))
+        challenge = {"version": 1, "network": "regtest", "vault": vault,
+                     "member": local["slot"], "identity_signing": identity["signing"],
+                     "nonce": secrets.token_hex(32), "expires_at": int(time.time()) + 600}
+        path = member_dir / "account-challenge.json"
+        with tempfile.NamedTemporaryFile(mode="w", dir=member_dir, prefix=".challenge-",
+                                         delete=False) as out:
+            json.dump(challenge, out)
+            out.flush()
+            os.fsync(out.fileno())
+            name = out.name
+        os.replace(name, path)
+        return challenge
+
+    def link(self, vault, proof):
+        member_dir, _ = self.vault_dir(vault)
+        challenge = member_dir / "account-challenge.json"
+        if not challenge.is_file():
+            raise ValueError("Begin account connection first")
+        if not isinstance(proof, dict):
+            raise ValueError("Enter the wallet's JSON proof")
+        with tempfile.TemporaryDirectory(prefix=".proof-", dir=member_dir) as temp:
+            path = Path(temp) / "proof.json"
+            write_new(path, json.dumps(proof).encode())
+            result = json.loads(self.command("bind", self.data, member_dir, "@pass", challenge,
+                                             path, binary=SEED_WALLET))
+        challenge.unlink()
+        return result
+
+    def account_link(self, vault):
+        member_dir, _ = self.vault_dir(vault)
+        if not (member_dir / "secrets" / "account-link.sealed").exists():
+            raise ValueError("Connect your Zcash account before key creation")
+        result = json.loads(self.command("check", self.data, member_dir, "@pass", binary=SEED_WALLET))
+        if result["vault"] != vault:
+            raise ValueError("Account link belongs to another vault")
+        return result
+
     def agree(self, vault, fingerprint):
         member_dir, local = self.vault_dir(vault)
         roster = self.roster(vault)
@@ -230,6 +273,7 @@ class Wallet:
         own = json.loads(self.command("identity-public", member_dir, "@pass"))
         if own != roster["members"][local["slot"] - 1]:
             raise ValueError("Your identity differs from the agreed roster")
+        self.account_link(vault)
         if vault in self.workers and self.workers[vault].is_alive():
             raise ValueError("Key creation is already running")
         self.setup_errors.pop(vault, None)
@@ -298,10 +342,15 @@ class Wallet:
                  "slot": local["slot"], "vault": local["vault"], "members": len(roster["members"]),
                  "fingerprint": roster["fingerprint"], "error": self.setup_errors.get(vault),
                  "profile": self.profile_data, "vaults": vaults}
+        state["account_linked"] = (member_dir / "secrets" / "account-link.sealed").exists()
         if local["slot"] == 1 and (member_dir / "invites.json").exists():
             state["invites"] = read_json(member_dir / "invites.json")
         if roster["fingerprint"]:
             state["phase"] = "compare_roster"
+        if not state["account_linked"]:
+            state["phase"] = "connect_account"
+        else:
+            state["account_ak"] = self.account_link(vault)["account_ak"]
         if (member_dir / "secrets" / "vault.sealed").exists():
             state["phase"] = "back_up"
         elif vault in self.workers and self.workers[vault].is_alive():
@@ -388,6 +437,8 @@ def serve(wallet, port):
                         "/api/lock": wallet.lock_profile,
                         "/api/create": lambda: wallet.create(value.get("name")),
                         "/api/join": lambda: wallet.join(value.get("invite")),
+                        "/api/begin-link": lambda: wallet.begin_link(value.get("vault")),
+                        "/api/link": lambda: wallet.link(value.get("vault"), value.get("proof")),
                         "/api/agree": lambda: wallet.agree(value.get("vault"), value.get("fingerprint")),
                         "/api/backup": lambda: wallet.backup(value.get("vault")),
                         "/api/verify": lambda: wallet.verify(value.get("vault"), value.get("words"), value.get("card")),
