@@ -61,13 +61,20 @@ def copy_vault(source, destination):
         run._mkdir(root / 'secrets')
         run._mkdir(root / 'home')
         run._mkdir(root / 'tmp')
-        for relative, cap in (('secrets/identity.sealed', 65536),
-                              ('secrets/vault.sealed', 4 * 1024 * 1024),
-                              ('passphrase', 65536)):
-            path = source / 'members' / str(member_id) / relative
+        source_member = (source / 'members' / str(member_id)
+                         if (source / 'members' / str(member_id)).is_dir()
+                         else source / f'member-{member_id}')
+        pass_name = 'passphrase' if (source_member / 'passphrase').is_file() else 'pass.txt'
+        files = [('secrets/identity.sealed', 'secrets/identity.sealed', 65536),
+                 ('secrets/vault.sealed', 'secrets/vault.sealed', 4 * 1024 * 1024),
+                 (pass_name, 'passphrase', 65536)]
+        if (source_member / 'secrets/activation.sealed').is_file():
+            files.append(('secrets/activation.sealed', 'secrets/activation.sealed', 65536))
+        for source_name, destination_name, cap in files:
+            path = source_member / source_name
             data = read_source(path, cap)
             hashes[path] = hashlib.sha256(data).hexdigest()
-            run._write_new(root / relative, data, 0o600)
+            run._write_new(root / destination_name, data, 0o600)
         members.append(run.CertifiedMember(member_id, root, root / 'passphrase',
                                             public['signing'], public['encryption']))
     return tuple(members), target_roster, hashes
@@ -155,7 +162,10 @@ def check_isolation(owner, source, deadline):
         if own.returncode != 0 or own.stdout != b'member canary\n':
             raise run.OwnershipError('Member sandbox could not read its own state')
         denied = [other.root / 'isolation-canary' for other in owner.members if other is not member]
-        denied += [relay_canary, source / 'members' / str(member.member_id) / 'secrets/vault.sealed']
+        source_member = (source / 'members' / str(member.member_id)
+                         if (source / 'members' / str(member.member_id)).is_dir()
+                         else source / f'member-{member.member_id}')
+        denied += [relay_canary, source_member / 'secrets/vault.sealed']
         for path in denied:
             result = owner.capture(owner.sandbox_command(member, ['/bin/cat', str(path)]),
                                    cwd=member.root, timeout=run._remaining(deadline))

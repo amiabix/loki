@@ -2558,6 +2558,47 @@ impl ClientStore {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Reopen a committed incoming message from its saved ciphertext, checking the certified sender again.
+    pub fn open_incoming(
+        &self,
+        roster: &Roster,
+        identity: &crate::CommIdentity,
+        record: &IncomingOriginal,
+    ) -> ClientResult<crate::AuthenticatedTransfer> {
+        let owner = identity.public().id;
+        self.check_association(roster, owner)?;
+        let saved = self.saved_record(&record.key)?.ok_or(ClientError::Storage)?;
+        let original =
+            existing_original(&self.connection, &record.key)?.ok_or(ClientError::Storage)?;
+        if !saved.incoming
+            || saved.digest != record.digest
+            || saved.source_root != record.source_root
+            || original.kind != record.kind
+            || original.session != record.session
+        {
+            return Err(ClientError::Identity);
+        }
+        let source = crate::CompleteSource::committed(
+            self.incoming_hashes(&record.key)?,
+            record.key.clone(),
+            record.digest,
+            owner,
+        );
+        if source.required_hashes().first() != Some(&record.source_root) {
+            return Err(ClientError::Storage);
+        }
+        let opened = reopen_saved(&self.connection, roster, identity, &source)?;
+        if opened.message().body().key != record.key
+            || opened.message().digest() != &record.digest
+            || opened.message().body().session != record.session
+            || payload_kind(&opened.message().body().payload) != record.kind
+            || opened.source().required_hashes() != source.required_hashes()
+        {
+            return Err(ClientError::Identity);
+        }
+        Ok(opened)
+    }
+
     pub fn recover_ack_links(&self, after: u64, limit: u16) -> ClientResult<Vec<AckLink>> {
         page_bounds(after, limit)?;
         let mut statement = self.connection.prepare(
