@@ -68,6 +68,7 @@ def main(argv=None):
     parser.add_argument('--run-root', type=Path, required=True)
     parser.add_argument('--name', required=True, help='running THS regtest instance')
     parser.add_argument('--ports', type=run._cli_port, nargs=3, required=True)
+    parser.add_argument('--finisher', type=int, choices=(1, 2, 3), help='member who proves and sends; defaults to the non-signer')
     args = parser.parse_args(argv)
     if sys.platform != 'darwin' or not Path('/usr/bin/sandbox-exec').is_file():
         parser.error('The member isolation test requires macOS sandbox-exec')
@@ -77,6 +78,9 @@ def main(argv=None):
     if any(re.fullmatch(r'[0-9a-f]{64}', payment.get(field, '')) is None
            for field in ('payment', 'attempt')):
         parser.error('Payment manifest has invalid identifiers')
+    pair = payment.get('pair', [1, 2])
+    if pair not in ([1, 2], [1, 3], [2, 3]):
+        parser.error('Payment manifest has an invalid signing pair')
     communication, poc = run._default_workspaces()
     sys.path.insert(0, str(poc))
     from ths import THS
@@ -99,7 +103,7 @@ def main(argv=None):
         sent = set()
         pump_once = lambda: pump(context, relay, works, payment['attempt'], sent, deadline)
         approval = ('APPROVE ' + payment['payment'] + '\n').encode('ascii')
-        for member in context.members[:2]:
+        for member in (context.members[number - 1] for number in pair):
             processes.append(subprocess.Popen(
                 payment_command(owner, member, pay, context.roster, works[member.member_id],
                                 chain.rpc_address, 'sign'),
@@ -111,9 +115,10 @@ def main(argv=None):
         signatures = await_members(processes, pump_once, deadline)
         if not all('approved payment ' + payment['payment'] in result for result in signatures):
             raise run.OwnershipError('Both signers did not approve the named payment')
-        finisher = context.members[2]
+        finisher_id = args.finisher or next(number for number in (1, 2, 3) if number not in pair)
+        finisher = context.members[finisher_id - 1]
         processes.append(subprocess.Popen(
-            payment_command(owner, finisher, pay, context.roster, works[3],
+            payment_command(owner, finisher, pay, context.roster, works[finisher.member_id],
                             chain.rpc_address, 'finish'),
             cwd=finisher.root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE))
@@ -124,7 +129,7 @@ def main(argv=None):
         txid = match.group(1)
         chain.mine(3)
         verified = owner.capture(payment_command(owner, finisher, pay, context.roster,
-                                works[3], chain.rpc_address, 'verify', txid),
+                                works[finisher.member_id], chain.rpc_address, 'verify', txid),
                                  cwd=finisher.root, timeout=run._remaining(deadline))
         if verified.returncode != 0 or b'verified' not in verified.stdout:
             raise run.OwnershipError('Mined payment did not match the approved candidate')
@@ -137,7 +142,7 @@ def main(argv=None):
             raise run.OwnershipError('Independent recipient could not decrypt the payment')
         three_members.verify_source(hashes)
         report = {'result': 'accepted', 'payment': payment['payment'], 'txid': txid,
-                  'signers': [1, 2], 'finisher': 3, 'relay_envelopes': len(sent),
+                  'signers': pair, 'finisher': finisher.member_id, 'relay_envelopes': len(sent),
                   'recipient_decrypted': True}
         run._write_new(owner.root / 'relay-payment-report.json', run._json_bytes(report), 0o644)
         print(run._json_bytes(report).decode(), end='')

@@ -62,6 +62,8 @@ def main():
     parser.add_argument("--name", required=True, help="already running THS instance")
     parser.add_argument("--state", type=pathlib.Path, required=True, help="new, private test directory")
     parser.add_argument("--manual", action="store_true", help="prepare, then print commands for two human signers")
+    parser.add_argument("--pair", choices=("AB", "AC", "BC"), default="AB", help="members who approve this payment")
+    parser.add_argument("--finisher", type=int, choices=(1, 2, 3), help="member who proves and sends; defaults to the non-signer")
     parser.add_argument("--amount-zat", type=int, default=40_000_000, help="regtest payment amount")
     parser.add_argument("--memo", default="separate member payment", help="shielded payment memo")
     args = parser.parse_args()
@@ -93,8 +95,11 @@ def main():
     print("funded source vault on THS", flush=True)
 
     owner, password = members[0]
-    run([pay, "prepare", owner, password, roster, work, recipient_address, str(args.amount_zat), args.memo], env)
+    run([pay, "prepare", owner, password, roster, work, recipient_address, str(args.amount_zat), args.memo, args.pair], env)
     manifest = json.loads((work / "payment.json").read_text())
+    signers = [members[number - 1] for number in manifest["pair"]]
+    finisher_id = args.finisher or next(number for number in (1, 2, 3) if number not in manifest["pair"])
+    finisher = members[finisher_id - 1]
     if args.manual:
         def command(argv):
             return shlex.join(["env", f"LOKI_RPC={env['LOKI_RPC']}", *map(str, argv)])
@@ -104,13 +109,12 @@ def main():
             f"Independent recipient: {recipient_address}",
             f"Payment ID: {manifest['payment']}",
             "Run the next two commands at the same time in separate terminals. Read each review, then type its exact APPROVE prompt:",
-            command([pay, "sign", *members[0], roster, work]),
-            command([pay, "sign", *members[1], roster, work]),
+            *(command([pay, "sign", *signer, roster, work]) for signer in signers),
             "After both say approved, run:",
-            command([pay, "finish", *members[2], roster, work]),
+            command([pay, "finish", *finisher, roster, work]),
             "Copy the txid from the finish output, then run:",
             shlex.join(["ths", "--name", args.name, "mine", "3"]),
-            command([pay, "verify", *members[2], roster, work, "<TXID>"]),
+            command([pay, "verify", *finisher, roster, work, "<TXID>"]),
             command([pay, "receive", *recipient_members[0], recipient_roster, work, "<TXID>"]),
         ]
         (root / "manual-steps.txt").write_text("\n".join(lines) + "\n")
@@ -129,11 +133,11 @@ def main():
         return result.stdout.strip()
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [pool.submit(sign, number) for number in (1, 2)]
+        futures = [pool.submit(sign, number) for number in manifest["pair"]]
         for future in futures:
             print(future.result().splitlines()[-1], flush=True)
 
-    owner, password = members[2]
+    owner, password = finisher
     finished = run([pay, "finish", owner, password, roster, work], env, timeout=900)
     print(finished, flush=True)
     txid = finished.split("txid=", 1)[1].split()[0]

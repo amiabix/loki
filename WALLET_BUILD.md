@@ -48,7 +48,7 @@ flowchart LR
 | `poc/src/distributed_setup.rs`, `member_state.rs`, `zip2005.rs` | DKG, member state and restore logic after independent review of key derivation and card format |
 | `poc/src/signing_session.rs`, `verify.rs`, `candidate.rs` | Candidate verification and FROST signing after the session protocol and persistent nonce state are hardened |
 | `poc/src/scan.rs`, `witness.rs` | Starting point for per-member chain sync and proving; reorg and long-absence handling remain |
-| `poc/src/bin/loki_member_payment.rs` | Regtest integration fixture; it hardcodes proposer 1, signers 1 and 2, finisher 3 and a 120-second mailbox wait |
+| `poc/src/bin/loki_member_payment.rs` | Regtest integration fixture; proposer 1 selects one pair when preparing, any member can finish, and each signer still has a 120-second live mailbox wait |
 | `poc/demo/` and `poc/run-member-payment.py` | Test drivers only; one process creates and can operate every member's files |
 
 Moving files out of `poc/` does not close their security gaps. Promote a Rust

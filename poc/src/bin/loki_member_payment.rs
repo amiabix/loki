@@ -54,6 +54,47 @@ fn number(value: &Value, field: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("missing or invalid {field}"))
 }
 
+fn pair_from_name(name: &str) -> Result<[u16; 2], String> {
+    match name {
+        "AB" => Ok([1, 2]),
+        "AC" => Ok([1, 3]),
+        "BC" => Ok([2, 3]),
+        _ => Err("pair must be AB, AC, or BC".into()),
+    }
+}
+
+fn manifest_pair(value: &Value) -> Result<[u16; 2], String> {
+    let Some(pair) = value.get("pair") else {
+        return Ok([1, 2]); // Existing regtest manifests predate pair selection.
+    };
+    let ids = pair
+        .as_array()
+        .ok_or("payment pair must contain two member IDs")?;
+    if ids.len() != 2 {
+        return Err("payment pair must contain two member IDs".into());
+    }
+    let first = ids[0].as_u64().ok_or("invalid payment pair")?;
+    let second = ids[1].as_u64().ok_or("invalid payment pair")?;
+    let pair = [
+        u16::try_from(first).map_err(|_| "invalid payment pair")?,
+        u16::try_from(second).map_err(|_| "invalid payment pair")?,
+    ];
+    if !matches!(pair, [1, 2] | [1, 3] | [2, 3]) {
+        return Err("payment pair must be AB, AC, or BC".into());
+    }
+    Ok(pair)
+}
+
+fn peer_in_pair(pair: [u16; 2], own: u16) -> Option<u16> {
+    if own == pair[0] {
+        Some(pair[1])
+    } else if own == pair[1] {
+        Some(pair[0])
+    } else {
+        None
+    }
+}
+
 fn private_work(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
@@ -123,7 +164,7 @@ fn manifest(path: &Path) -> Result<(SessionContext, Intent), String> {
         vault: hex(&value, "vault")?,
         payment: hex(&value, "payment")?,
         attempt: AttemptId(hex(&value, "attempt")?),
-        pair: [1, 2],
+        pair: manifest_pair(&value)?,
     };
     context.validate()?;
     if context.payment != intent.proposal_id()
@@ -147,9 +188,10 @@ fn state(args: &[String]) -> Result<(MemberState, PathBuf, Zeroizing<String>), S
 }
 
 fn prepare(args: &[String]) -> Result<(), String> {
-    if args.len() != 7 {
-        return Err("prepare <member-dir> <passphrase-file> <roster.json> <work-dir> <recipient-UA> <amount-zat> <memo>".into());
+    if args.len() != 7 && args.len() != 8 {
+        return Err("prepare <member-dir> <passphrase-file> <roster.json> <work-dir> <recipient-UA> <amount-zat> <memo> [AB|AC|BC]".into());
     }
+    let pair = pair_from_name(args.get(7).map(String::as_str).unwrap_or("AB"))?;
     let (member, _, _) = state(args)?;
     if member.identity.public().id != 1 {
         return Err("member 1 must prepare this two-signer regtest payment".into());
@@ -212,7 +254,7 @@ fn prepare(args: &[String]) -> Result<(), String> {
     let attempt = AttemptId::random();
     let value = json!({
         "version": 1, "network": "regtest", "vault": hex::encode(member.vault),
-        "payment": hex::encode(payment), "attempt": hex::encode(attempt.0),
+        "payment": hex::encode(payment), "attempt": hex::encode(attempt.0), "pair": pair,
         "proposer": hex::encode(&intent.proposer), "created_height": tip,
         "input_nullifiers": intent.input_nullifiers.iter().map(hex::encode).collect::<Vec<_>>(),
         "recipient": hex::encode(&intent.recipient), "amount_zat": amount_zat,
@@ -266,6 +308,7 @@ fn candidate(
     member: &MemberState,
     intent: &Intent,
     session: &SigningSession,
+    pair: [u16; 2],
     peer: Vec<frost::round1::SigningCommitments>,
 ) -> Result<PackagePayload, String> {
     let rpc = Rpc::regtest();
@@ -308,8 +351,8 @@ fn candidate(
     let mut alphas = Vec::new();
     for (own, other) in session.commitments().iter().zip(peer) {
         let set = BTreeMap::from([
-            (frost::Identifier::try_from(1u16).unwrap(), own.clone()),
-            (frost::Identifier::try_from(2u16).unwrap(), other),
+            (frost::Identifier::try_from(pair[0]).unwrap(), own.clone()),
+            (frost::Identifier::try_from(pair[1]).unwrap(), other),
         ]);
         let (params, seed) = frost_rerandomized::RandomizedParams::new_from_commitments(
             member.public.verifying_key(),
@@ -387,13 +430,12 @@ fn sign(args: &[String]) -> Result<(), String> {
     }
     let (member, owner, pass) = state(args)?;
     let own = member.identity.public().id;
-    if own != 1 && own != 2 {
-        return Err("this attempt selects only members 1 and 2".into());
-    }
-    let peer_id = if own == 1 { 2 } else { 1 };
-    let peer = member.roster.members[&peer_id].clone();
-    let finisher = member.roster.members[&3].clone();
     let (context, intent) = manifest(&Path::new(&args[3]).join("payment.json"))?;
+    let peer_id =
+        peer_in_pair(context.pair, own).ok_or("member is not in the selected payment pair")?;
+    let peer = member.roster.members[&peer_id].clone();
+    let finisher =
+        member.roster.members[&(1..=3).find(|id| !context.pair.contains(id)).unwrap()].clone();
     private_work(Path::new(&args[3]))?;
     if context.vault != member.vault {
         return Err("manifest names another vault".into());
@@ -422,8 +464,8 @@ fn sign(args: &[String]) -> Result<(), String> {
     )?;
     let peer_commitments =
         commitments_from_message(&context, &commitment, intent.input_nullifiers.len())?;
-    let package_message = if own == 1 {
-        let payload = candidate(&member, &intent, &session, peer_commitments)?;
+    let package_message = if own == context.pair[0] {
+        let payload = candidate(&member, &intent, &session, context.pair, peer_commitments)?;
         session.publish_package_to_roster(&member.roster.members, &payload, &mailbox, &pass)?;
         let wires =
             SigningSession::saved_package_wires(&owner.join("signing"), &context, own, &pass)?;
@@ -431,7 +473,13 @@ fn sign(args: &[String]) -> Result<(), String> {
             .identity
             .open_sent_session(&peer, &context, &wires[0])?
     } else {
-        wait_message(&mailbox, &member, &context, MessageKind::Package, 1)?
+        wait_message(
+            &mailbox,
+            &member,
+            &context,
+            MessageKind::Package,
+            context.pair[0],
+        )?
     };
     let reviewed = session.review_package(&package_message, &peer)?;
     confirm(&intent, reviewed.summary())?;
@@ -450,18 +498,18 @@ fn resend(args: &[String]) -> Result<(), String> {
     }
     let (member, owner, pass) = state(args)?;
     let own = member.identity.public().id;
-    if own != 1 && own != 2 {
-        return Err("only a selected signer can resend".into());
-    }
     let work = Path::new(&args[3]);
     private_work(work)?;
     let (context, _) = manifest(&work.join("payment.json"))?;
+    if !context.pair.contains(&own) {
+        return Err("only a selected signer can resend".into());
+    }
     if context.vault != member.vault {
         return Err("manifest names another vault".into());
     }
     let mailbox = Mailbox::new(&work.join("mailbox")).map_err(|e| e.to_string())?;
     let root = owner.join("signing");
-    if own == 1 {
+    if own == context.pair[0] {
         for wire in SigningSession::saved_package_wires(&root, &context, own, &pass)? {
             mailbox.append(&wire).map_err(|e| e.to_string())?;
         }
@@ -536,10 +584,7 @@ fn finish(args: &[String]) -> Result<(), String> {
     if args.len() != 4 {
         return Err("finish <member-dir> <passphrase-file> <roster.json> <work-dir>".into());
     }
-    let (member, _, _) = state(args)?;
-    if member.identity.public().id != 3 {
-        return Err("this attempt requires member 3 as the independent finisher".into());
-    }
+    let (member, owner, pass) = state(args)?;
     let work = Path::new(&args[3]);
     private_work(work)?;
     let (context, intent) = manifest(&work.join("payment.json"))?;
@@ -547,10 +592,54 @@ fn finish(args: &[String]) -> Result<(), String> {
         return Err("manifest names another vault".into());
     }
     let mailbox = Mailbox::new(&work.join("mailbox")).map_err(|e| e.to_string())?;
-    let package = wait_message(&mailbox, &member, &context, MessageKind::Package, 1)?;
+    let own = member.identity.public().id;
+    let peer = peer_in_pair(context.pair, own);
+    let package = if own == context.pair[0] {
+        let wires =
+            SigningSession::saved_package_wires(&owner.join("signing"), &context, own, &pass)?;
+        member.identity.open_sent_session(
+            &member.roster.members[&peer.unwrap()],
+            &context,
+            &wires[0],
+        )?
+    } else {
+        wait_message(
+            &mailbox,
+            &member,
+            &context,
+            MessageKind::Package,
+            context.pair[0],
+        )?
+    };
     let payload = PackagePayload::decode(&context, package.body())?;
-    let alice_share = wait_message(&mailbox, &member, &context, MessageKind::Share, 1)?;
-    let bob_share = wait_message(&mailbox, &member, &context, MessageKind::Share, 2)?;
+    let shares = if let Some(peer_id) = peer {
+        let wires =
+            SigningSession::saved_share_wires(&owner.join("signing"), &context, own, &pass)?;
+        let own_share = member.identity.open_sent_session(
+            &member.roster.members[&peer_id],
+            &context,
+            &wires[0],
+        )?;
+        let peer_share = wait_message(&mailbox, &member, &context, MessageKind::Share, peer_id)?;
+        [own_share, peer_share]
+    } else {
+        [
+            wait_message(
+                &mailbox,
+                &member,
+                &context,
+                MessageKind::Share,
+                context.pair[0],
+            )?,
+            wait_message(
+                &mailbox,
+                &member,
+                &context,
+                MessageKind::Share,
+                context.pair[1],
+            )?,
+        ]
+    };
     let (signed, sighash, indices) = aggregate_and_apply(
         &context,
         &intent,
@@ -558,7 +647,7 @@ fn finish(args: &[String]) -> Result<(), String> {
         &member.public,
         &member.fvk,
         &payload,
-        &[alice_share, bob_share],
+        &shares,
     )?;
     let rpc = Rpc::regtest();
     let chain = scan::scan_chain(&rpc, &member.fvk)?;
@@ -622,7 +711,7 @@ fn verify(args: &[String]) -> Result<(), String> {
     if args.len() != 5 {
         return Err("verify <member-dir> <passphrase-file> <roster.json> <work-dir> <txid>".into());
     }
-    let (member, _, _) = state(args)?;
+    let (member, owner, pass) = state(args)?;
     let work = Path::new(&args[3]);
     private_work(work)?;
     let txid = &args[4];
@@ -655,7 +744,27 @@ fn verify(args: &[String]) -> Result<(), String> {
         return Err("mined transaction ID mismatch".into());
     }
     let mailbox = Mailbox::new(&work.join("mailbox")).map_err(|e| e.to_string())?;
-    let package_message = wait_message(&mailbox, &member, &context, MessageKind::Package, 1)?;
+    let package_message = if member.identity.public().id == context.pair[0] {
+        let wires = SigningSession::saved_package_wires(
+            &owner.join("signing"),
+            &context,
+            context.pair[0],
+            &pass,
+        )?;
+        member.identity.open_sent_session(
+            &member.roster.members[&context.pair[1]],
+            &context,
+            &wires[0],
+        )?
+    } else {
+        wait_message(
+            &mailbox,
+            &member,
+            &context,
+            MessageKind::Package,
+            context.pair[0],
+        )?
+    };
     let payload = PackagePayload::decode(&context, package_message.body())?;
     let pczt =
         pczt::Pczt::parse(&payload.candidate).map_err(|e| format!("candidate parse: {e:?}"))?;
@@ -829,5 +938,31 @@ fn main() {
     if let Err(error) = result {
         eprintln!("error: {error}");
         process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn payment_pair_is_sorted_and_explicit() {
+        assert_eq!(manifest_pair(&json!({})).unwrap(), [1, 2]);
+        for (name, pair) in [("AB", [1, 2]), ("AC", [1, 3]), ("BC", [2, 3])] {
+            assert_eq!(pair_from_name(name).unwrap(), pair);
+            assert_eq!(manifest_pair(&json!({ "pair": pair })).unwrap(), pair);
+        }
+        for pair in [
+            json!([2, 1]),
+            json!([1, 1]),
+            json!([1, 4]),
+            json!([1]),
+            json!("AC"),
+        ] {
+            assert!(manifest_pair(&json!({ "pair": pair })).is_err());
+        }
+        assert_eq!(peer_in_pair([2, 3], 1), None);
+        assert_eq!(peer_in_pair([2, 3], 2), Some(3));
+        assert_eq!(peer_in_pair([2, 3], 3), Some(2));
     }
 }

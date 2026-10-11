@@ -79,25 +79,26 @@ run-ID deletion command can explicitly remove that test run later.
 against a fresh funded manual payment; each run consumes that payment's note.
 It copies sealed source state into three sandboxed member roots, gives each
 member its own payment mailbox, and moves encrypted signing envelopes through
-three relays. Members 1 and 2 approve; member 3 proves and sends. The finisher
-checks the mined effects and an independent recipient decrypts the output.
+three relays. The selected pair approves; any member can prove and send. The
+finisher checks the mined effects and an independent recipient decrypts the output.
 
 ```sh
 cargo build --manifest-path communication/Cargo.toml --locked -p loki-relay-server
 cargo build --manifest-path poc/Cargo.toml --locked --bins --features relay-communication
 python3 poc/run-member-payment.py --name loki-manual \
-  --state /private/tmp/loki-fresh-payment --manual
+  --state /private/tmp/loki-fresh-payment --manual --pair BC
 python3 communication/harness/relay_payment.py \
   --payment-root /private/tmp/loki-fresh-payment \
   --run-root /private/tmp/loki-fresh-relay-payment \
-  --name loki-manual --ports 39561 39562 39563
+  --name loki-manual --ports 39561 39562 39563 --finisher 2
 ```
 
 The THS regtest instance must already be running and `ths` must be on `PATH`.
 Success writes `relay-payment-report.json` with the payment ID, txid and counts.
-This is a regtest integration fixture: signing still fixes members 1 and 2,
-uses volatile nonces, and prints Approved before the relay has stored the
-share. The relay's kind 1 payload carries the encrypted inner signing envelope,
+This is a regtest integration fixture: the pair is selected when the payment
+is prepared, signing uses volatile nonces and a 120-second live wait, and
+prints Approved before the relay has stored the share. The relay's kind 1
+payload carries the encrypted inner signing envelope,
 selected by the attempt ID; the signer authenticates the inner envelope and
 verifies transaction effects before releasing a share. This run does not
 establish browser custody, approval recovery after a crash, a relay nonce

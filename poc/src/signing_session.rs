@@ -821,7 +821,20 @@ impl SigningSession {
                 ));
             }
         }
-        let peers: Vec<_> = roster.values().filter(|p| p.id != own.id).collect();
+        let peer_id = self
+            .context
+            .pair
+            .iter()
+            .copied()
+            .find(|id| *id != own.id)
+            .unwrap();
+        let peers = [
+            roster.get(&peer_id).unwrap(),
+            roster
+                .values()
+                .find(|p| !self.context.pair.contains(&p.id))
+                .unwrap(),
+        ];
         let wires = [
             self.own
                 .seal_session(peers[0], &self.context, MessageKind::Package, &body)?,
