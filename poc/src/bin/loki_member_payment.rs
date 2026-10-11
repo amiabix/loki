@@ -10,6 +10,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "relay-communication")]
+use loki_poc::signing_session::NonceWitness;
 use loki_poc::{
     candidate::{alpha_from_canonical_bytes, build_candidate, quote_fee, CandidateInputs, Regtest},
     intent::{ChangePolicy, Intent},
@@ -22,6 +24,8 @@ use loki_poc::{
     },
     vault,
 };
+#[cfg(feature = "relay-communication")]
+use loki_relay_client::{ClientStore, OwnerInbox, RelayHttp, RelayRuntime};
 use orchard::{keys::Scope, Address};
 use reddsa_frost::frost::redpallas as frost;
 use serde_json::{json, Value};
@@ -492,6 +496,220 @@ fn sign(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(feature = "relay-communication")]
+fn signing_inputs(
+    args: &[String],
+) -> Result<
+    (
+        MemberState,
+        PathBuf,
+        Zeroizing<String>,
+        SessionContext,
+        Intent,
+        Mailbox,
+    ),
+    String,
+> {
+    if args.len() != 4 {
+        return Err("<member-dir> <passphrase-file> <roster.json> <work-dir>".into());
+    }
+    let (member, owner, pass) = state(args)?;
+    let (context, intent) = manifest(&Path::new(&args[3]).join("payment.json"))?;
+    if context.vault != member.vault || !context.pair.contains(&member.identity.public().id) {
+        return Err("member is not an approver for this payment".into());
+    }
+    private_work(Path::new(&args[3]))?;
+    let mailbox = Mailbox::new(&Path::new(&args[3]).join("mailbox")).map_err(|e| e.to_string())?;
+    Ok((member, owner, pass, context, intent, mailbox))
+}
+
+#[cfg(feature = "relay-communication")]
+fn commit(args: &[String]) -> Result<(), String> {
+    let (member, owner, pass, context, intent, mailbox) = signing_inputs(args)?;
+    let own = member.identity.public().id;
+    let peer = member.roster.members[&peer_in_pair(context.pair, own).unwrap()].clone();
+    let identity =
+        loki_poc::setup_transport::Identity::from_secret_bytes(&member.identity.to_secret_bytes())?;
+    let relays = two_relays(args)?;
+    let session = SigningSession::begin_sealed(
+        &owner.join("signing"),
+        context.clone(),
+        &member.vault,
+        intent.clone(),
+        identity,
+        member.key.clone(),
+        member.public.clone(),
+        member.fvk.clone(),
+        intent.input_nullifiers.len(),
+        &pass,
+        relays.pins(),
+    )?;
+    session.publish_commitments(&peer, &mailbox)?;
+    println!(
+        "commitments published for payment {}; approval pending",
+        hex::encode(context.payment)
+    );
+    Ok(())
+}
+
+#[cfg(feature = "relay-communication")]
+fn reopen_signer(
+    args: &[String],
+) -> Result<
+    (
+        MemberState,
+        PathBuf,
+        Zeroizing<String>,
+        SessionContext,
+        Intent,
+        Mailbox,
+        SigningSession,
+    ),
+    String,
+> {
+    let (member, owner, pass, context, intent, mailbox) = signing_inputs(args)?;
+    let identity =
+        loki_poc::setup_transport::Identity::from_secret_bytes(&member.identity.to_secret_bytes())?;
+    let session = SigningSession::reopen_sealed(
+        &owner.join("signing"),
+        context.clone(),
+        &member.vault,
+        intent.clone(),
+        identity,
+        member.key.clone(),
+        member.public.clone(),
+        member.fvk.clone(),
+        &pass,
+    )?;
+    Ok((member, owner, pass, context, intent, mailbox, session))
+}
+
+#[cfg(feature = "relay-communication")]
+fn next_message(
+    mailbox: &Mailbox,
+    member: &MemberState,
+    context: &SessionContext,
+    kind: MessageKind,
+    sender: u16,
+) -> Result<OpenedMessage, String> {
+    mailbox
+        .read_for(&member.identity, &member.roster.members, context)?
+        .into_iter()
+        .find(|message| message.kind() == kind && message.sender() == sender)
+        .ok_or_else(|| format!("waiting for member {sender} {kind:?}; sync relay inbox and retry"))
+}
+
+#[cfg(feature = "relay-communication")]
+fn package(args: &[String]) -> Result<(), String> {
+    let (member, _owner, pass, context, intent, mailbox, session) = reopen_signer(args)?;
+    let own = member.identity.public().id;
+    if own != context.pair[0] {
+        return Err("only the selected proposer builds this package".into());
+    }
+    let peer_id = context.pair[1];
+    let commitment = next_message(
+        &mailbox,
+        &member,
+        &context,
+        MessageKind::Commitment,
+        peer_id,
+    )?;
+    let peer = commitments_from_message(&context, &commitment, intent.input_nullifiers.len())?;
+    let payload = candidate(&member, &intent, &session, context.pair, peer)?;
+    session.publish_package_to_roster(&member.roster.members, &payload, &mailbox, &pass)?;
+    println!("payment package published; members may review");
+    Ok(())
+}
+
+#[cfg(feature = "relay-communication")]
+struct TwoRelays {
+    own: Vec<OwnerInbox>,
+    http: RelayHttp,
+    runtime: RelayRuntime,
+}
+
+#[cfg(feature = "relay-communication")]
+impl NonceWitness for TwoRelays {
+    fn pins(&self) -> loki_poc::signing_session::WitnessPins {
+        [
+            (&self.own[0].route.pin.key, &self.own[0].route.pin.run),
+            (&self.own[1].route.pin.key, &self.own[1].route.pin.run),
+        ]
+        .map(|(key, run)| (*key, *run))
+    }
+    fn claim(&mut self, cid: [u8; 32], wire: &[u8]) -> Result<(), String> {
+        for inbox in &self.own[..2] {
+            let created = self
+                .runtime
+                .block_on(
+                    self.http
+                        .claim_nonce(&inbox.route, &inbox.read, cid, wire),
+                )
+                .map_err(|e| format!("nonce relay claim: {e}"))?;
+            if !created {
+                return Err("nonce already claimed; start a new signing attempt".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "relay-communication")]
+fn two_relays(args: &[String]) -> Result<TwoRelays, String> {
+    let root = Path::new(&args[0]);
+    let loaded = loki_poc::relay_member::load(root, Path::new(&args[1]), Path::new(&args[2]))
+        .map_err(|e| e.to_string())?;
+    let config_store = loki_poc::relay_member::ConfigStore::open(root, Path::new(&args[1]))
+        .map_err(|e| e.to_string())?;
+    let db = ClientStore::open(
+        &root.join("transport"),
+        &loaded.roster,
+        loaded.identity.public().id,
+    )
+    .map_err(|e| e.to_string())?;
+    let mut own = config_store
+        .routing(&db, &loaded)
+        .map_err(|e| e.to_string())?
+        .own;
+    if own.len() < 2
+        || own[0].route.pin.key == own[1].route.pin.key
+        || own[0].route.pin.run == own[1].route.pin.run
+    {
+        return Err("two distinct configured relays required for nonce safety".into());
+    }
+    own.truncate(2);
+    Ok(TwoRelays {
+        own,
+        http: RelayHttp::new().map_err(|e| e.to_string())?,
+        runtime: RelayRuntime::new().map_err(|e| e.to_string())?,
+    })
+}
+
+#[cfg(feature = "relay-communication")]
+fn approve(args: &[String]) -> Result<(), String> {
+    let (member, owner, pass, context, intent, mailbox, mut session) = reopen_signer(args)?;
+    let own = member.identity.public().id;
+    let peer_id = peer_in_pair(context.pair, own).unwrap();
+    let peer = member.roster.members[&peer_id].clone();
+    let finisher =
+        member.roster.members[&(1..=3).find(|id| !context.pair.contains(id)).unwrap()].clone();
+    let package_message = if own == context.pair[0] {
+        let wires =
+            SigningSession::saved_package_wires(&owner.join("signing"), &context, own, &pass)?;
+        member
+            .identity
+            .open_sent_session(&peer, &context, &wires[0])?
+    } else {
+        next_message(&mailbox, &member, &context, MessageKind::Package, peer_id)?
+    };
+    let reviewed = session.review_package(&package_message, &peer)?;
+    confirm(&intent, reviewed.summary())?;
+    let mut relays = two_relays(args)?;
+    session.publish_approved_secured(reviewed, &peer, &finisher, &mailbox, &pass, &mut relays)?;
+    println!("signed locally; approval delivery pending relay storage");
+    Ok(())
+}
+
 fn resend(args: &[String]) -> Result<(), String> {
     if args.len() != 4 {
         return Err("resend <member-dir> <passphrase-file> <roster.json> <work-dir>".into());
@@ -925,6 +1143,17 @@ fn main() {
     let args = env::args().collect::<Vec<_>>();
     let result = match args.get(1).map(String::as_str) {
         Some("prepare") => prepare(&args[2..]),
+        #[cfg(feature = "relay-communication")]
+        Some("features") => {
+            println!("relay-backed-signing=1");
+            Ok(())
+        }
+        #[cfg(feature = "relay-communication")]
+        Some("commit") => commit(&args[2..]),
+        #[cfg(feature = "relay-communication")]
+        Some("package") => package(&args[2..]),
+        #[cfg(feature = "relay-communication")]
+        Some("approve") => approve(&args[2..]),
         Some("sign") => sign(&args[2..]),
         Some("resend") => resend(&args[2..]),
         Some("finish") => finish(&args[2..]),

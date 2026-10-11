@@ -87,6 +87,9 @@ def main(argv=None):
     chain = THS(args.name)
     chain.check()
     pay = run.find_binary('loki_member_payment', workspace=poc)
+    feature = subprocess.run([str(pay), 'features'], capture_output=True, timeout=5)
+    if feature.returncode != 0 or feature.stdout != b'relay-backed-signing=1\n':
+        parser.error('Build loki_member_payment with --features relay-communication')
     owner = three_members.MemberEnvironments.create(args.run_root)
     processes = []
     deadline = time.monotonic() + 900
@@ -102,19 +105,34 @@ def main(argv=None):
             works[member.member_id] = work
         sent = set()
         pump_once = lambda: pump(context, relay, works, payment['attempt'], sent, deadline)
+        for member in (context.members[number - 1] for number in pair):
+            result = owner.capture(payment_command(owner, member, pay, context.roster,
+                works[member.member_id], chain.rpc_address, 'commit'), cwd=member.root,
+                timeout=run._remaining(deadline))
+            if result.returncode != 0 or b'commitments published' not in result.stdout:
+                raise run.OwnershipError('Member could not persist and publish commitments')
+            pump_once()
+        proposer = context.members[pair[0] - 1]
+        result = owner.capture(payment_command(owner, proposer, pay, context.roster,
+            works[proposer.member_id], chain.rpc_address, 'package'), cwd=proposer.root,
+            timeout=run._remaining(deadline))
+        if result.returncode != 0 or b'payment package published' not in result.stdout:
+            raise run.OwnershipError('Proposer could not build the reviewed payment package')
+        pump_once()
         approval = ('APPROVE ' + payment['payment'] + '\n').encode('ascii')
         for member in (context.members[number - 1] for number in pair):
-            processes.append(subprocess.Popen(
-                payment_command(owner, member, pay, context.roster, works[member.member_id],
-                                chain.rpc_address, 'sign'),
-                cwd=member.root, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE))
-            processes[-1].stdin.write(approval)
-            processes[-1].stdin.close()
-            processes[-1].stdin = None
-        signatures = await_members(processes, pump_once, deadline)
-        if not all('approved payment ' + payment['payment'] in result for result in signatures):
-            raise run.OwnershipError('Both signers did not approve the named payment')
+            before = {item['id'] for item in three_members.status(context, relay, member, deadline)['messages']}
+            result = subprocess.run(payment_command(owner, member, pay, context.roster,
+                works[member.member_id], chain.rpc_address, 'approve'), cwd=member.root,
+                input=approval, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=run._remaining(deadline))
+            if result.returncode != 0 or b'signed locally; approval delivery pending relay storage' not in result.stdout:
+                raise run.OwnershipError('Member could not verify and witness its approval')
+            pump_once()
+            delivered = [item for item in three_members.status(context, relay, member, deadline)['messages']
+                         if item['id'] not in before and item['kind'] == 'test']
+            if len(delivered) != 2 or any(item['stored_whole'] != '1' for item in delivered):
+                raise run.OwnershipError('Approval is not yet durably stored by relays')
         finisher_id = args.finisher or next(number for number in (1, 2, 3) if number not in pair)
         finisher = context.members[finisher_id - 1]
         processes.append(subprocess.Popen(
@@ -122,7 +140,7 @@ def main(argv=None):
                             chain.rpc_address, 'finish'),
             cwd=finisher.root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE))
-        finished = await_members(processes[2:], pump_once, deadline)[0]
+        finished = await_members(processes, pump_once, deadline)[0]
         match = re.search(r'txid=([0-9a-f]{64})', finished)
         if match is None:
             raise run.OwnershipError('Finisher returned no transaction ID')

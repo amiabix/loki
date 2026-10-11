@@ -4,6 +4,7 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use loki_relay_protocol::{
     canonical::{self, Value},
     envelope,
+    nonce,
     http::{
         decode_append_result, decode_append_update, decode_creation, decode_creation_result,
         decode_error, decode_page, validate_limit, ErrorCode, MAX_METADATA_LEN,
@@ -27,6 +28,42 @@ pub struct RelayHttp {
     client: Client,
 }
 impl RelayHttp {
+    /// Claims one CID once. Only a fresh, challenge-bound `created` receipt is usable
+    /// for signing; an identical retry deliberately returns false.
+    pub async fn claim_nonce(
+        &self,
+        route: &RelayRoute,
+        owner_read: &Secret32,
+        cid: Id32,
+        wire: &[u8],
+    ) -> ClientResult<bool> {
+        crate::descriptor::endpoint(&route.endpoint)?;
+        if wire.is_empty() || wire.len() > nonce::MAX_RECORD {
+            return Err(ClientError::Config);
+        }
+        let mut challenge = [0; 32];
+        getrandom::fill(&mut challenge).map_err(|_| ClientError::Crypto)?;
+        let url = format!(
+            "{}/v1/mailboxes/{}/nonces/{}",
+            route.endpoint.trim_end_matches('/'),
+            hex::encode(route.mailbox),
+            hex::encode(cid)
+        );
+        let mut response = self
+            .client
+            .put(url)
+            .header(AUTHORIZATION, bearer(owner_read)?)
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .header("x-loki-challenge", hex::encode(challenge))
+            .body(wire.to_vec())
+            .send()
+            .await?;
+        let (status, raw) = finish(&mut response, "application/cbor", RECEIPT_CAP, None).await?;
+        if status != 200 && status != 201 {
+            return Err(ClientError::Transport);
+        }
+        verify_nonce_claim(route, cid, wire, challenge, status, &raw)
+    }
     pub fn new() -> ClientResult<Self> {
         Ok(Self {
             client: Client::builder()
@@ -795,6 +832,43 @@ async fn finish(
     Ok((status, body))
 }
 
+fn verify_nonce_claim(
+    route: &RelayRoute,
+    cid: Id32,
+    wire: &[u8],
+    challenge: Id32,
+    status: u16,
+    raw: &[u8],
+) -> ClientResult<bool> {
+    let Value::Array(parts) =
+        canonical::decode(&raw, RECEIPT_CAP).map_err(|_| ClientError::Receipt)?
+    else {
+        return Err(ClientError::Receipt);
+    };
+    let [Value::Bytes(body), Value::Bytes(signature)] = parts.as_slice() else {
+        return Err(ClientError::Receipt);
+    };
+    let receipt = nonce::decode_body(body).map_err(|_| ClientError::Receipt)?;
+    if nonce::encode_body(&receipt).map_err(|_| ClientError::Receipt)? != *body
+        || receipt.pin != route.pin
+        || receipt.mailbox != route.mailbox
+        || receipt.cid != cid
+        || receipt.challenge != challenge
+        || receipt.record_hash != <Id32>::from(Sha256::digest(wire))
+        || receipt.created != (status == 201)
+    {
+        return Err(ClientError::Receipt);
+    }
+    let key = VerifyingKey::from_bytes(&route.pin.key).map_err(|_| ClientError::Config)?;
+    let signature = Signature::from_slice(signature).map_err(|_| ClientError::Receipt)?;
+    key.verify_strict(
+        &nonce::signature_input(body).map_err(|_| ClientError::Receipt)?,
+        &signature,
+    )
+    .map_err(|_| ClientError::Receipt)?;
+    Ok(receipt.created)
+}
+
 fn signature_input(body: &[u8]) -> ClientResult<Vec<u8>> {
     let length = u32::try_from(body.len()).map_err(|_| ClientError::Receipt)?;
     let mut input = Vec::with_capacity(25 + body.len());
@@ -890,4 +964,88 @@ pub(crate) fn verify_saved_receipt(
         return Err(ClientError::Receipt);
     }
     Ok(receipt)
+}
+
+#[cfg(test)]
+mod nonce_tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    use loki_relay_protocol::{nonce::NonceReceipt, types::RelayPin};
+
+    #[test]
+    fn nonce_receipt_binds_challenge_record_pin_and_first_write() {
+        let signing = SigningKey::from_bytes(&[7; 32]);
+        let route = RelayRoute {
+            pin: RelayPin {
+                key: signing.verifying_key().to_bytes(),
+                run: [8; 32],
+            },
+            endpoint: "http://127.0.0.1:8000".into(),
+            mailbox: [9; 32],
+            append_revision: 1,
+        };
+        let wire = b"encrypted claim";
+        let receipt = NonceReceipt {
+            pin: route.pin.clone(),
+            mailbox: route.mailbox,
+            cid: [10; 32],
+            record_hash: Sha256::digest(wire).into(),
+            challenge: [11; 32],
+            created: true,
+        };
+        let pack = |receipt: &NonceReceipt| {
+            let body = nonce::encode_body(receipt).unwrap();
+            let signature = signing.sign(&nonce::signature_input(&body).unwrap());
+            canonical::encode(&Value::Array(vec![
+                Value::Bytes(body),
+                Value::Bytes(signature.to_bytes().to_vec()),
+            ]))
+            .unwrap()
+        };
+        let raw = pack(&receipt);
+        assert_eq!(
+            verify_nonce_claim(&route, receipt.cid, wire, receipt.challenge, 201, &raw),
+            Ok(true)
+        );
+        assert!(verify_nonce_claim(&route, receipt.cid, wire, [12; 32], 201, &raw).is_err());
+        assert!(verify_nonce_claim(
+            &route,
+            receipt.cid,
+            b"different",
+            receipt.challenge,
+            201,
+            &raw
+        )
+        .is_err());
+        assert!(
+            verify_nonce_claim(&route, receipt.cid, wire, receipt.challenge, 200, &raw).is_err()
+        );
+        let mut wrong_pin = route.clone();
+        wrong_pin.pin.run = [13; 32];
+        assert!(
+            verify_nonce_claim(&wrong_pin, receipt.cid, wire, receipt.challenge, 201, &raw)
+                .is_err()
+        );
+        let mut corrupt = raw.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(
+            verify_nonce_claim(&route, receipt.cid, wire, receipt.challenge, 201, &corrupt)
+                .is_err()
+        );
+        let duplicate = NonceReceipt {
+            created: false,
+            ..receipt
+        };
+        assert_eq!(
+            verify_nonce_claim(
+                &route,
+                duplicate.cid,
+                wire,
+                duplicate.challenge,
+                200,
+                &pack(&duplicate)
+            ),
+            Ok(false)
+        );
+    }
 }

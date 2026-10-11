@@ -7,7 +7,7 @@ Each member checks the whole exact candidate, claimed note ownership, value
 commitments, seed-derived randomizers and `rk`, and locally derived sighash before
 releasing any share. The caller must give each member its own locally approved
 `Intent` and show the returned `ReviewSummary` for explicit confirmation before
-calling `publish_approved`.
+calling the approval method.
 
 The append-only local mailbox carries padded, authenticated encrypted envelopes.
 It is a courier for this test flow, not a deployed relay protocol: callers preselect
@@ -16,9 +16,15 @@ service has been specified. The envelope hides the vault, payment, attempt,
 membership, candidate, and seeds from a reader of the wire. The package publisher
 saves its own encrypted package copies and delivers copies to the other members.
 Each signer saves its exact encrypted share copies before delivery; an identical
-retry or restart resends those bytes. FROST nonce secrets stay in RAM and are
-consumed at signing. A crash before saving the share abandons that attempt and
-requires a new attempt with fresh commitments, seeds, candidate, and review.
+retry or restart resends those bytes. The old `sign` command is a simultaneous,
+RAM-only regtest fixture. The relay-backed path uses `commit`, `package`, and
+`approve` as separate invocations. `commit` seals nonce secrets before publishing
+commitments. `approve` reopens them, verifies the candidate, and obtains a fresh,
+challenge-bound first-write receipt for each nonce from two pinned relays. It then
+fsyncs a consumed decision, removes the sealed nonce file, computes shares, and
+saves exact encrypted share copies. A crash after a relay claim but before saving
+shares burns the attempt; a new attempt needs fresh nonces. A restored old profile
+cannot reclaim a CID at an honest, reachable relay in the pinned pair.
 
 `aggregate_and_apply` lets a member with the encrypted package and both shares
 verify and assemble a signed PCZT without the approvers' nonce secrets. The
@@ -30,7 +36,9 @@ installs the witness and anchor, proves, broadcasts, and verifies a mined paymen
 The verifier decrypts vault change and compares the mined sighash to a fully checked
 candidate. For an external recipient it cannot independently decrypt the payment
 output, so it reports `candidate-opening-and-mined-sighash` as the recipient evidence.
-No `Signed` or `Confirmed` payment status is recorded from a relay receipt.
+The `approve` command reports local signing as delivery pending. The relay payment
+harness checks that both share envelopes are durably stored before treating that
+member's approval as delivered. Chain confirmation still comes from the node.
 
 Run `cd poc && cargo test --locked --test signing_session --test signing_faults
 --test signing_flow_faults` for the flow and fault tests. For a live regtest run,
@@ -50,8 +58,9 @@ After a crash before the share was saved, start a new private work directory and
 prepare a fresh attempt. If a share was saved, `loki_member_payment resend` republishes
 only its original encrypted bytes.
 
-The sealed file store reuses the
-prototype `MemberDir` and has no rollback or live-process snapshot defense; it
-is not a production nonce or custody boundary. Aborting is allowed only before
-a share is released. A released share cannot be revoked, so later attempts must
-remain associated with the same payment effects and notes.
+The relay-backed path uses a process lock and two pinned relay identities. It
+depends on at least one honest, reachable relay in that pair retaining its
+first-write index. These runs do not establish physical power-loss durability,
+independent relay operators, browser storage safety, or custody readiness.
+Aborting is allowed only before a share is released; a released share cannot be
+revoked.

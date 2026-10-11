@@ -47,4 +47,5 @@ pub mod envelope;
 pub mod types;
 
 pub mod http;
+pub mod nonce;
 pub mod receipt;
