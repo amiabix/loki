@@ -207,7 +207,9 @@ fn profile_open(args: &[String]) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let profile: serde_json::Value = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
     if profile["version"] != 1
-        || profile["name"].as_str().is_none_or(|s| s.is_empty() || s.len() > 80)
+        || profile["name"]
+            .as_str()
+            .is_none_or(|s| s.is_empty() || s.len() > 80)
         || profile["id"].as_str().is_none_or(|s| hex32(s).is_err())
     {
         return Err("invalid sealed profile".into());
@@ -353,14 +355,46 @@ fn backup_create(args: &[String]) -> Result<(), String> {
     let state: serde_json::Value =
         serde_json::from_slice(&state_bytes).map_err(|e| e.to_string())?;
     state_address(&state)?;
-    let mut entropy = [0u8; 32];
-    OsRng.fill_bytes(&mut entropy);
-    let mnemonic = Mnemonic::from_entropy(&entropy).map_err(|e| e.to_string())?;
-    entropy.zeroize();
-    let card = card_dir(Path::new(&args[2]), true)?;
-    // shortcut: this card seals regtest JSON state; use a reviewed CBOR format before custody.
-    card.write_sealed("vault.card", &state_bytes, &mnemonic.to_string())
-        .map_err(|e| e.to_string())?;
+    let secrets = MemberDir::open(Path::new(&args[0]), "secrets");
+    let _lock = setup_lock(&secrets)?;
+    let pass = passphrase(Path::new(&args[1]))?;
+    let mnemonic = if secrets.exists("backup-words.sealed") {
+        String::from_utf8(
+            secrets
+                .read_sealed("backup-words.sealed", &pass)
+                .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?
+    } else {
+        if Path::new(&args[2]).join("vault.card").exists() {
+            return Err("backup card exists without recoverable words; restore from saved artifacts or restart this regtest vault".into());
+        }
+        let mut entropy = [0u8; 32];
+        OsRng.fill_bytes(&mut entropy);
+        let mnemonic = Mnemonic::from_entropy(&entropy)
+            .map_err(|e| e.to_string())?
+            .to_string();
+        entropy.zeroize();
+        secrets
+            .write_sealed("backup-words.sealed", mnemonic.as_bytes(), &pass)
+            .map_err(|e| e.to_string())?;
+        mnemonic
+    };
+    let path = Path::new(&args[2]);
+    let card = card_dir(path, !path.exists())?;
+    if card.exists("vault.card") {
+        if card
+            .read_sealed("vault.card", &mnemonic)
+            .map_err(|e| e.to_string())?
+            != state_bytes
+        {
+            return Err("existing backup card does not match this member's vault".into());
+        }
+    } else {
+        // shortcut: this card seals regtest JSON state; use a reviewed CBOR format before custody.
+        card.write_sealed("vault.card", &state_bytes, &mnemonic)
+            .map_err(|e| e.to_string())?;
+    }
     println!("{mnemonic}");
     eprintln!(
         "Save the 24 words separately from {}/vault.card; then run backup-verify",
@@ -386,6 +420,10 @@ fn backup_verify(args: &[String]) -> Result<(), String> {
     let roster = checked_roster(&state, Path::new(&args[4]))?;
     let identity = state_identity(&state)?;
     let receipt = identity.sign_backup(&roster.vault, &backup_body(&state)?)?;
+    let pending = Path::new(&args[0]).join("secrets/backup-words.sealed");
+    if pending.exists() {
+        fs::remove_file(pending).map_err(|e| e.to_string())?;
+    }
     publish(
         Path::new(&args[5]),
         &name(&roster.vault, "backup", identity.public().id, None),

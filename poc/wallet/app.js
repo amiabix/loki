@@ -126,6 +126,8 @@ action('check-backup', async (form) => {
   if (bytes.length > 65536) throw new Error('Backup card is too large');
   let raw = ''; for (const byte of bytes) raw += String.fromCharCode(byte);
   await api('verify', {vault: selectedVault, words: value.words, card: btoa(raw)});
+  $('words').textContent = '';
+  $('backup-made').hidden = true;
   message('Your backup checked. Waiting for the other members.');
 });
 action('activate', async () => {

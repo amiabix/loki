@@ -434,6 +434,23 @@ fn three_processes_create_one_vault_without_sharing_secrets() {
         );
         let words = String::from_utf8(created.stdout).unwrap();
         assert_eq!(words.split_whitespace().count(), 24);
+        let original_card = fs::read(card.join("vault.card")).unwrap();
+        let resumed = Command::new(exe)
+            .args([
+                "backup-create",
+                member.to_str().unwrap(),
+                pass.to_str().unwrap(),
+                card.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            resumed.status.success(),
+            "backup resume: {}",
+            String::from_utf8_lossy(&resumed.stderr)
+        );
+        assert_eq!(resumed.stdout, words.as_bytes());
+        assert_eq!(fs::read(card.join("vault.card")).unwrap(), original_card);
         let words_file = member.join("words.txt");
         fs::write(&words_file, words).unwrap();
         #[cfg(unix)]
@@ -484,6 +501,7 @@ fn three_processes_create_one_vault_without_sharing_secrets() {
             "backup verify: {}",
             String::from_utf8_lossy(&checked.stderr)
         );
+        assert!(!member.join("secrets/backup-words.sealed").exists());
         if id < 3 {
             let pending = Command::new(exe)
                 .args([

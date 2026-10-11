@@ -22,6 +22,9 @@ roster fingerprint through a trusted channel and confirm it. They must start
 key creation within the setup CLI's two-minute wait per round. Each member
 downloads their backup card, records their 24 words separately, and loads both
 back to check them. The receive address appears after all three backup checks.
+If the page closes before that check, **Show backup words** returns the same
+words and card after unlock. The temporary sealed word copy is removed when
+the member checks the saved artifacts.
 An active vault can scan the regtest chain for its unspent balance at a named
 block height. Set `LOKI_RPC=host:port` when starting each app if the local node
 is not on the default `127.0.0.1:18232`; the app does not fund or mine blocks.
