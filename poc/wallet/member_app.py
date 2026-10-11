@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """One-member, loopback-only regtest setup app. The exchange is an untrusted local courier."""
 
-# shortcut: one vault and a timed local courier; add relay-backed resumable setup before custody.
+# shortcut: timed local courier and passphrase held in this process; use resumable relays and a native key handle before custody.
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 HERE = Path(__file__).resolve().parent
 SETUP = HERE.parent / "target" / "debug" / "loki_setup_member"
@@ -55,6 +56,8 @@ class Wallet:
         self.exchange = exchange.resolve()
         if self.data == self.exchange or self.data in self.exchange.parents or self.exchange in self.data.parents:
             raise ValueError("member data and exchange must be separate directories")
+        if (self.data / "membership.json").exists():
+            raise ValueError("Existing single-vault data root; keep using the previous setup app or choose a new root")
         self.data.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.exchange.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.data, 0o700)
@@ -66,8 +69,10 @@ class Wallet:
             raise ValueError("This member data root is already open in another app") from error
         self.setup = setup
         self.lock = threading.Lock()
-        self.worker = None
-        self.setup_error = None
+        self.passphrase = None
+        self.profile_data = None
+        self.workers = {}
+        self.setup_errors = {}
 
     def command(self, action, *args, passphrase=None, timeout=30):
         if not self.setup.is_file():
@@ -80,7 +85,7 @@ class Wallet:
                     fd, name = tempfile.mkstemp(prefix=".unlock-", dir=self.data)
                     passfile = Path(name)
                     with os.fdopen(fd, "w") as out:
-                        out.write(check_passphrase(passphrase))
+                        out.write(check_passphrase(passphrase if passphrase is not None else self.passphrase))
                     argv.append(name)
                 else:
                     argv.append(str(arg))
@@ -92,40 +97,82 @@ class Wallet:
             if passfile:
                 passfile.unlink(missing_ok=True)
 
-    def local(self):
-        path = self.data / "membership.json"
-        return read_json(path) if path.exists() else None
+    def create_profile(self, name, passphrase):
+        if (self.data / "profile" / "profile.sealed").exists():
+            raise ValueError("This profile already exists; unlock it")
+        if not isinstance(name, str) or not 1 <= len(name.strip().encode()) <= 80:
+            raise ValueError("Enter a profile name of 1 to 80 UTF-8 bytes")
+        check_passphrase(passphrase)
+        profile = json.loads(self.command("profile-create", self.data, "@pass", name.strip(),
+                                          passphrase=passphrase))
+        self.passphrase, self.profile_data = passphrase, profile
+        return {"profile": profile}
+
+    def unlock(self, passphrase):
+        check_passphrase(passphrase)
+        profile = json.loads(self.command("profile-open", self.data, "@pass", passphrase=passphrase))
+        self.passphrase, self.profile_data = passphrase, profile
+        return {"profile": profile}
+
+    def lock_profile(self):
+        if any(worker.is_alive() for worker in self.workers.values()):
+            raise ValueError("Wait for key creation to finish before locking")
+        self.passphrase = None
+        self.profile_data = None
+        return {"locked": True}
+
+    def require_profile(self):
+        if not self.profile_data:
+            raise ValueError("Unlock your profile first")
+        return self.profile_data
+
+    def vault_dir(self, vault):
+        folder = self.data / "vaults" / self.exchange_vault(vault).name
+        local = folder / "membership.json"
+        if not local.is_file():
+            raise ValueError("This profile is not a member of that vault")
+        membership = read_json(local)
+        if membership.get("vault") != vault or membership.get("profile") != self.require_profile()["id"]:
+            raise ValueError("Vault membership does not belong to this profile")
+        return folder, membership
+
+    def vaults(self):
+        self.require_profile()
+        root = self.data / "vaults"
+        if not root.exists():
+            return []
+        return [self.vault_dir(path.name)[1] for path in sorted(root.iterdir())
+                if (path / "membership.json").is_file()]
 
     def exchange_vault(self, vault):
         if not isinstance(vault, str) or len(vault) != 64 or any(c not in "0123456789abcdef" for c in vault):
             raise ValueError("Invalid vault ID")
         return self.exchange / vault
 
-    def create(self, name, passphrase):
-        if self.local():
-            raise ValueError("This app already has a vault; use another member data root")
+    def create(self, name):
+        profile = self.require_profile()
         if not isinstance(name, str) or not 1 <= len(name.strip()) <= 80:
             raise ValueError("Enter a vault name of 1 to 80 characters")
-        check_passphrase(passphrase)
         vault = secrets.token_hex(32)
         folder = self.exchange_vault(vault)
         folder.mkdir(mode=0o700)
+        local = self.data / "vaults" / vault
+        local.mkdir(mode=0o700, parents=True)
         tokens = {slot: secrets.token_urlsafe(24) for slot in (2, 3)}
         draft = {"vault": vault, "name": name.strip(), "threshold": 2,
                  "expires_at": int(time.time()) + 24 * 60 * 60,
                  "invites": {str(slot): hashlib.sha256(token.encode()).hexdigest() for slot, token in tokens.items()}}
         write_new(folder / "draft.json", json.dumps(draft).encode())
-        identity = json.loads(self.command("identity", self.data, "1", "@pass", passphrase=passphrase))
+        identity = json.loads(self.command("identity", local, "1", "@pass"))
         write_new(folder / "join-1.json", json.dumps(identity).encode())
-        write_new(self.data / "membership.json", json.dumps({"vault": vault, "slot": 1, "name": name.strip()}).encode())
+        write_new(local / "membership.json", json.dumps({"vault": vault, "slot": 1,
+                                                          "name": name.strip(), "profile": profile["id"]}).encode())
         invites = [encoded({"vault": vault, "slot": slot, "secret": token}) for slot, token in tokens.items()]
-        write_new(self.data / "invites.json", json.dumps(invites).encode())
-        return {"invites": invites}
+        write_new(local / "invites.json", json.dumps(invites).encode())
+        return {"vault": vault, "invites": invites}
 
-    def join(self, invite, passphrase):
-        if self.local():
-            raise ValueError("This app already has a vault; use another member data root")
-        check_passphrase(passphrase)
+    def join(self, invite):
+        profile = self.require_profile()
         try:
             claim = decoded(invite)
             vault, slot, secret = claim["vault"], claim["slot"], claim["secret"]
@@ -135,31 +182,35 @@ class Wallet:
         draft = read_json(folder / "draft.json")
         if draft["vault"] != vault or int(draft["expires_at"]) < time.time():
             raise ValueError("Invite expired or belongs to another vault")
+        if draft.get("threshold") != 2 or not isinstance(draft.get("name"), str) or not 1 <= len(draft["name"].encode()) <= 80:
+            raise ValueError("Unsupported vault draft")
         if slot not in (2, 3) or not isinstance(secret, str) or not secrets.compare_digest(
             draft["invites"][str(slot)], hashlib.sha256(secret.encode()).hexdigest()
         ):
             raise ValueError("Invite does not match this vault")
         if (folder / f"join-{slot}.json").exists():
             raise ValueError("This invite slot has already been claimed")
-        identity = json.loads(self.command("identity", self.data, str(slot), "@pass", passphrase=passphrase))
+        local = self.data / "vaults" / vault
+        if local.exists():
+            raise ValueError("This profile already has a membership for this vault")
+        local.mkdir(mode=0o700, parents=True)
+        identity = json.loads(self.command("identity", local, str(slot), "@pass"))
         write_new(folder / f"join-{slot}.json", json.dumps(identity).encode())
-        write_new(self.data / "membership.json", json.dumps({"vault": vault, "slot": slot,
-                                                                "name": draft["name"]}).encode())
-        return {"joined": True}
+        write_new(local / "membership.json", json.dumps({"vault": vault, "slot": slot,
+                                                          "name": draft["name"], "profile": profile["id"]}).encode())
+        return {"vault": vault, "joined": True}
 
-    def roster(self):
-        local = self.local()
-        if not local:
-            return None
-        folder = self.exchange_vault(local["vault"])
+    def roster(self, vault):
+        member_dir, local = self.vault_dir(vault)
+        folder = self.exchange_vault(vault)
         members = [read_json(folder / f"join-{slot}.json") for slot in (1, 2, 3)
                    if (folder / f"join-{slot}.json").exists()]
         if len(members) != 3:
             return {"members": members, "fingerprint": None}
         if [member["id"] for member in members] != [1, 2, 3]:
             raise ValueError("Member slots do not match the roster")
-        roster = {"vault": local["vault"], "members": members}
-        write_path = self.data / "roster.json"
+        roster = {"vault": vault, "members": members}
+        write_path = member_dir / "roster.json"
         if not write_path.exists():
             write_new(write_path, json.dumps(roster).encode())
         elif read_json(write_path) != roster:
@@ -167,78 +218,89 @@ class Wallet:
         fingerprint = self.command("fingerprint", write_path)
         return {"members": members, "fingerprint": fingerprint}
 
-    def agree(self, fingerprint, passphrase):
-        roster = self.roster()
-        if not roster or not roster["fingerprint"]:
+    def agree(self, vault, fingerprint):
+        member_dir, local = self.vault_dir(vault)
+        roster = self.roster(vault)
+        if not roster["fingerprint"]:
             raise ValueError("Wait for all three members")
         if not isinstance(fingerprint, str) or not secrets.compare_digest(fingerprint, roster["fingerprint"]):
             raise ValueError("Roster fingerprint does not match")
-        own = json.loads(self.command("identity-public", self.data, "@pass", passphrase=passphrase))
-        if own != roster["members"][self.local()["slot"] - 1]:
+        own = json.loads(self.command("identity-public", member_dir, "@pass"))
+        if own != roster["members"][local["slot"] - 1]:
             raise ValueError("Your identity differs from the agreed roster")
-        if self.worker and self.worker.is_alive():
+        if vault in self.workers and self.workers[vault].is_alive():
             raise ValueError("Key creation is already running")
-        self.setup_error = None
+        self.setup_errors.pop(vault, None)
+        passphrase = self.passphrase
 
         def run():
             try:
-                self.command("run", self.data, "@pass", self.data / "roster.json",
-                             self.exchange_vault(self.local()["vault"]), fingerprint,
-                             passphrase=passphrase, timeout=600)
+                self.command("run", member_dir, "@pass", member_dir / "roster.json",
+                             self.exchange_vault(vault), fingerprint, passphrase=passphrase,
+                             timeout=600)
             except Exception as error:
-                self.setup_error = str(error)
+                self.setup_errors[vault] = str(error)
 
-        self.worker = threading.Thread(target=run, daemon=True)
-        self.worker.start()
+        self.workers[vault] = threading.Thread(target=run, daemon=True)
+        self.workers[vault].start()
         return {"started": True}
 
-    def backup(self, passphrase):
-        card = self.data / "card"
-        words = self.command("backup-create", self.data, "@pass", card, passphrase=passphrase)
+    def backup(self, vault):
+        member_dir, _ = self.vault_dir(vault)
+        card = member_dir / "card"
+        words = self.command("backup-create", member_dir, "@pass", card)
         return {"words": words}
 
-    def verify(self, passphrase, words, card_bytes):
+    def verify(self, vault, words, card_bytes):
+        member_dir, _ = self.vault_dir(vault)
         if not isinstance(words, str) or not isinstance(card_bytes, str):
             raise ValueError("Load the words and saved card")
         raw = base64.b64decode(card_bytes, validate=True)
         if len(raw) > 64 * 1024 or not raw.startswith(b"LOKISEAL\x01"):
             raise ValueError("Invalid backup card")
-        with tempfile.TemporaryDirectory(prefix=".check-", dir=self.data) as temp:
+        with tempfile.TemporaryDirectory(prefix=".check-", dir=member_dir) as temp:
             folder = Path(temp)
             card = folder / "card"
             card.mkdir(mode=0o700)
             write_new(card / "vault.card", raw)
             write_new(folder / "words", words.encode())
-            self.command("backup-verify", self.data, "@pass", card, folder / "words",
-                         self.data / "roster.json", self.exchange_vault(self.local()["vault"]),
-                         passphrase=passphrase)
+            self.command("backup-verify", member_dir, "@pass", card, folder / "words",
+                         member_dir / "roster.json", self.exchange_vault(vault))
         return {"verified": True}
 
-    def address(self, passphrase):
-        return self.command("address", self.data, "@pass", self.data / "roster.json",
-                            self.exchange_vault(self.local()["vault"]), passphrase=passphrase)
+    def address(self, vault):
+        member_dir, _ = self.vault_dir(vault)
+        return self.command("address", member_dir, "@pass", member_dir / "roster.json",
+                            self.exchange_vault(vault))
 
-    def status(self):
-        local = self.local()
-        if not local:
-            return {"phase": "new", "network": "regtest"}
-        roster = self.roster()
+    def status(self, vault=None):
+        if not (self.data / "profile" / "profile.sealed").exists():
+            return {"phase": "new_profile", "network": "regtest"}
+        if not self.profile_data:
+            return {"phase": "locked", "network": "regtest"}
+        vaults = self.vaults()
+        if vault is None:
+            return {"phase": "home", "network": "regtest", "profile": self.profile_data,
+                    "vaults": vaults}
+        member_dir, local = self.vault_dir(vault)
+        roster = self.roster(vault)
         state = {"phase": "waiting_for_members", "network": "regtest", "name": local["name"],
                  "slot": local["slot"], "vault": local["vault"], "members": len(roster["members"]),
-                 "fingerprint": roster["fingerprint"], "error": self.setup_error}
-        if local["slot"] == 1 and (self.data / "invites.json").exists():
-            state["invites"] = read_json(self.data / "invites.json")
+                 "fingerprint": roster["fingerprint"], "error": self.setup_errors.get(vault),
+                 "profile": self.profile_data, "vaults": vaults}
+        if local["slot"] == 1 and (member_dir / "invites.json").exists():
+            state["invites"] = read_json(member_dir / "invites.json")
         if roster["fingerprint"]:
             state["phase"] = "compare_roster"
-        if (self.data / "secrets" / "vault.sealed").exists():
+        if (member_dir / "secrets" / "vault.sealed").exists():
             state["phase"] = "back_up"
-        elif self.worker and self.worker.is_alive():
+        elif vault in self.workers and self.workers[vault].is_alive():
             state["phase"] = "creating_keys"
         if (self.exchange_vault(local["vault"]) / f"{local['vault']}-backup-{local['slot']}.bin").exists():
             state["phase"] = "waiting_for_backups"
-        if (self.data / "secrets" / "activation.sealed").exists():
+        if (member_dir / "secrets" / "activation.sealed").exists():
             state["phase"] = "active"
-        if self.setup_error:
+        if self.setup_errors.get(vault):
             state["phase"] = "stopped"
         return state
 
@@ -264,7 +326,8 @@ def serve(wallet, port):
             return secrets.compare_digest(self.headers.get("X-Loki-Token", ""), token)
 
         def do_GET(self):
-            if self.path == "/":
+            path, _, query = self.path.partition("?")
+            if path == "/":
                 page = (HERE / "index.html").read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -273,13 +336,13 @@ def serve(wallet, port):
                 self.end_headers()
                 self.wfile.write(page)
                 return
-            if self.path == "/app.js":
+            if path == "/app.js":
                 self.send_response(200)
                 self.send_header("Content-Type", "text/javascript; charset=utf-8")
                 self.end_headers()
                 self.wfile.write((HERE / "app.js").read_bytes())
                 return
-            if self.path == "/app.css":
+            if path == "/app.css":
                 self.send_response(200)
                 self.send_header("Content-Type", "text/css; charset=utf-8")
                 self.end_headers()
@@ -288,10 +351,13 @@ def serve(wallet, port):
             if not self.authorized():
                 return self.reply(403, {"error": "Open the private local app link"})
             try:
-                if self.path == "/api/status":
-                    return self.reply(200, wallet.status())
-                if self.path == "/api/card":
-                    card = (wallet.data / "card" / "vault.card").read_bytes()
+                values = parse_qs(query)
+                vault = values.get("vault", [None])[0]
+                if path == "/api/status":
+                    return self.reply(200, wallet.status(vault))
+                if path == "/api/card":
+                    member_dir, _ = wallet.vault_dir(vault)
+                    card = (member_dir / "card" / "vault.card").read_bytes()
                     return self.reply(200, {"card": base64.b64encode(card).decode()})
             except Exception as error:
                 return self.reply(400, {"error": str(error)})
@@ -307,12 +373,15 @@ def serve(wallet, port):
                 value = json.loads(self.rfile.read(size))
                 with wallet.lock:
                     routes = {
-                        "/api/create": lambda: wallet.create(value.get("name"), value.get("passphrase")),
-                        "/api/join": lambda: wallet.join(value.get("invite"), value.get("passphrase")),
-                        "/api/agree": lambda: wallet.agree(value.get("fingerprint"), value.get("passphrase")),
-                        "/api/backup": lambda: wallet.backup(value.get("passphrase")),
-                        "/api/verify": lambda: wallet.verify(value.get("passphrase"), value.get("words"), value.get("card")),
-                        "/api/activate": lambda: {"address": wallet.address(value.get("passphrase"))},
+                        "/api/profile-create": lambda: wallet.create_profile(value.get("name"), value.get("passphrase")),
+                        "/api/unlock": lambda: wallet.unlock(value.get("passphrase")),
+                        "/api/lock": wallet.lock_profile,
+                        "/api/create": lambda: wallet.create(value.get("name")),
+                        "/api/join": lambda: wallet.join(value.get("invite")),
+                        "/api/agree": lambda: wallet.agree(value.get("vault"), value.get("fingerprint")),
+                        "/api/backup": lambda: wallet.backup(value.get("vault")),
+                        "/api/verify": lambda: wallet.verify(value.get("vault"), value.get("words"), value.get("card")),
+                        "/api/activate": lambda: {"address": wallet.address(value.get("vault"))},
                     }
                     if self.path not in routes:
                         return self.reply(404, {"error": "Not found"})

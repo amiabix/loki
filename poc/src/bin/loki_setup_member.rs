@@ -175,6 +175,47 @@ fn identity_public(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn profile_create(args: &[String]) -> Result<(), String> {
+    if args.len() != 3 {
+        return Err("profile-create <data-root> <passphrase-file> <display-name>".into());
+    }
+    let label = args[2].trim();
+    if label.is_empty() || label.len() > 80 {
+        return Err("profile name must be 1 to 80 bytes".into());
+    }
+    let mut id = [0u8; 32];
+    OsRng.fill_bytes(&mut id);
+    let dir = MemberDir::create(Path::new(&args[0]), "profile").map_err(|e| e.to_string())?;
+    let profile = serde_json::json!({"version": 1, "id": hex::encode(id), "name": label});
+    dir.write_sealed(
+        "profile.sealed",
+        &serde_json::to_vec(&profile).map_err(|e| e.to_string())?,
+        &passphrase(Path::new(&args[1]))?,
+    )
+    .map_err(|e| e.to_string())?;
+    println!("{profile}");
+    Ok(())
+}
+
+fn profile_open(args: &[String]) -> Result<(), String> {
+    if args.len() != 2 {
+        return Err("profile-open <data-root> <passphrase-file>".into());
+    }
+    let dir = MemberDir::open(Path::new(&args[0]), "profile");
+    let raw = dir
+        .read_sealed("profile.sealed", &passphrase(Path::new(&args[1]))?)
+        .map_err(|e| e.to_string())?;
+    let profile: serde_json::Value = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
+    if profile["version"] != 1
+        || profile["name"].as_str().is_none_or(|s| s.is_empty() || s.len() > 80)
+        || profile["id"].as_str().is_none_or(|s| hex32(s).is_err())
+    {
+        return Err("invalid sealed profile".into());
+    }
+    println!("{profile}");
+    Ok(())
+}
+
 fn sealed_state(root: &Path, pass_file: &Path) -> Result<Vec<u8>, String> {
     MemberDir::open(root, "secrets")
         .read_sealed("vault.sealed", &passphrase(pass_file)?)
@@ -569,6 +610,8 @@ fn main() {
     let result = match args.first().map(String::as_str) {
         Some("identity") => identity(&args[1..]),
         Some("identity-public") => identity_public(&args[1..]),
+        Some("profile-create") => profile_create(&args[1..]),
+        Some("profile-open") => profile_open(&args[1..]),
         Some("address") => address(&args[1..]),
         Some("backup-create") => backup_create(&args[1..]),
         Some("backup-verify") => backup_verify(&args[1..]),
@@ -577,7 +620,7 @@ fn main() {
             Roster::load(Path::new(&args[1])).map(|r| println!("{}", hex::encode(r.fingerprint())))
         }
         Some("run") => run(&args[1..]),
-        _ => Err("usage: loki_setup_member identity|identity-public|fingerprint|run|backup-create|backup-verify|address|restore ...".into()),
+        _ => Err("usage: loki_setup_member profile-create|profile-open|identity|identity-public|fingerprint|run|backup-create|backup-verify|address|restore ...".into()),
     };
     if let Err(error) = result {
         eprintln!("error: {error}");
