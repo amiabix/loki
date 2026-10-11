@@ -1,6 +1,6 @@
 # Building Loki as a member-owned wallet
 
-Status: design for the first usable wallet flow, not a custody release. This document replaces the local demo's user journey; it does not claim the current code implements it.
+Status: implementation plan for the first usable wallet flow, not a custody release. The member setup app under `poc/wallet/` now covers create, join, roster comparison, DKG and backup activation with one private root per process. It still uses a local file courier and a simultaneous setup round. Receive sync, payment screens, asynchronous relays, recovery and passkey unlock remain to be implemented.
 
 ## Intent and scope
 

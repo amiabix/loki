@@ -629,7 +629,7 @@ fn three_processes_create_one_vault_without_sharing_secrets() {
     fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
     let mismatch = sign(&roster);
     assert!(!mismatch.status.success());
-    assert!(String::from_utf8_lossy(&mismatch.stderr).contains("payment ID or proposer"));
+    assert!(String::from_utf8_lossy(&mismatch.stderr).contains("payment ID differs from intent"));
     assert!(!first.join("signing").exists());
 
     manifest["payment"] = serde_json::Value::String(hex::encode(intent.proposal_id()));

@@ -154,6 +154,27 @@ fn identity(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn identity_public(args: &[String]) -> Result<(), String> {
+    if args.len() != 2 {
+        return Err("identity-public <member-dir> <passphrase-file>".into());
+    }
+    let dir = MemberDir::open(Path::new(&args[0]), "secrets");
+    let secret = Identity::from_secret_bytes(
+        &dir.read_sealed("identity.sealed", &passphrase(Path::new(&args[1]))?)
+            .map_err(|e| e.to_string())?,
+    )?;
+    let public = secret.public();
+    println!(
+        "{}",
+        serde_json::json!({
+            "id": public.id,
+            "signing": hex::encode(public.signing),
+            "encryption": hex::encode(public.encryption),
+        })
+    );
+    Ok(())
+}
+
 fn sealed_state(root: &Path, pass_file: &Path) -> Result<Vec<u8>, String> {
     MemberDir::open(root, "secrets")
         .read_sealed("vault.sealed", &passphrase(pass_file)?)
@@ -547,6 +568,7 @@ fn main() {
     let args: Vec<_> = env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("identity") => identity(&args[1..]),
+        Some("identity-public") => identity_public(&args[1..]),
         Some("address") => address(&args[1..]),
         Some("backup-create") => backup_create(&args[1..]),
         Some("backup-verify") => backup_verify(&args[1..]),
@@ -555,7 +577,7 @@ fn main() {
             Roster::load(Path::new(&args[1])).map(|r| println!("{}", hex::encode(r.fingerprint())))
         }
         Some("run") => run(&args[1..]),
-        _ => Err("usage: loki_setup_member identity|fingerprint|run|backup-create|backup-verify|address|restore ...".into()),
+        _ => Err("usage: loki_setup_member identity|identity-public|fingerprint|run|backup-create|backup-verify|address|restore ...".into()),
     };
     if let Err(error) = result {
         eprintln!("error: {error}");

@@ -10,14 +10,17 @@ custody.
 
 ## Product direction
 
-The next implementation boundary is **one member, one app, one private key
-store**. A member's app must create or restore only that member's share, review
+The setup app now starts with **one member, one app, one private key store**.
+It lets three independently launched members create and join a vault, compare
+their roster, run dealerless key creation, and check their own backups. See
+[the setup app](poc/wallet/README.md) for how to run it and its limits. A member's
+app must still create or restore only that member's share, review
 the transaction itself, and release an approval only after that member acts.
 Other members receive signed, encrypted messages; no coordinator or web server
 can approve on their behalf. See [the implementation path](WALLET_BUILD.md)
 for the sequence and its acceptance checks.
 
-The existing Rust code is valuable input to that work. The Python demo, scripted
+The existing Rust code is valuable input to that work. The older Python demo, scripted
 funding, shared local mailbox and test-only key paths remain under [`poc/`](poc/README.md)
 as regression tools. They are not the product architecture.
 
