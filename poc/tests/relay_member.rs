@@ -1459,6 +1459,29 @@ fn owner_provision_os_random_independent_across_owners_and_roles() {
     }
 }
 
+fn accept_control_request(listener: &std::net::TcpListener) -> (std::net::TcpStream, Vec<u8>, String) {
+    use std::io::{Read, Write};
+    loop {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut raw = Vec::new();
+        let mut byte = [0; 1];
+        while !raw.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            raw.push(byte[0]);
+        }
+        let text = String::from_utf8(raw.clone()).unwrap();
+        if text.starts_with("HEAD / HTTP/1.1") {
+            // Local port probes are not provisioning requests.
+            write!(stream, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").unwrap();
+            continue;
+        }
+        return (stream, raw, text);
+    }
+}
+
 fn provision_mock(
     target: &mut loki_poc::relay_member::ProvisionTarget,
     responses: Vec<Option<(u16, u64, [u8; 32])>>,
@@ -1471,17 +1494,7 @@ fn provision_mock(
     std::thread::spawn(move || {
         let mut requests = Vec::new();
         for response in responses {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(3)))
-                .unwrap();
-            let mut raw = Vec::new();
-            let mut byte = [0; 1];
-            while !raw.ends_with(b"\r\n\r\n") {
-                stream.read_exact(&mut byte).unwrap();
-                raw.push(byte[0]);
-            }
-            let text = String::from_utf8(raw.clone()).unwrap();
+            let (mut stream, mut raw, text) = accept_control_request(&listener);
             let length: usize = text
                 .lines()
                 .find_map(|l| {
@@ -1898,17 +1911,7 @@ fn control_servers(
             std::thread::spawn(move || {
                 let mut requests = Vec::new();
                 for step in script {
-                    let (mut stream, _) = listener.accept().unwrap();
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(3)))
-                        .unwrap();
-                    let mut raw = Vec::new();
-                    let mut byte = [0; 1];
-                    while !raw.ends_with(b"\r\n\r\n") {
-                        stream.read_exact(&mut byte).unwrap();
-                        raw.push(byte[0]);
-                    }
-                    let text = String::from_utf8(raw.clone()).unwrap();
+                    let (mut stream, mut raw, text) = accept_control_request(&listener);
                     let length: usize = text
                         .lines()
                         .find_map(|line| {

@@ -208,6 +208,7 @@ pub fn router(db: DbHandle) -> Router {
             put(control_route).layer(DefaultBodyLimit::max(MAX_CONTROL_LEN)),
         )
         .route("/v1/mailboxes/{mailbox}/entries", get(page_route))
+        .route("/v1/identity", get(identity_route))
         .fallback(malformed)
         .method_not_allowed_fallback(malformed)
         .layer(DefaultBodyLimit::max(MAX_WIRE_LEN))
@@ -218,6 +219,16 @@ pub fn router(db: DbHandle) -> Router {
 
 async fn malformed() -> Response {
     error_response(RelayError::MalformedRequest)
+}
+
+async fn identity_route(State(db): State<DbHandle>, headers: HeaderMap) -> Response {
+    let result: RelayResult<Response> = async {
+        let nonce = id(single(&headers, "x-loki-challenge")?.ok_or(RelayError::MalformedRequest)?)?;
+        let body = db.challenge(nonce)?.receive().await?;
+        Ok(binary(StatusCode::OK, "application/cbor", body))
+    }
+    .await;
+    result.unwrap_or_else(error_response)
 }
 
 fn binary(status: StatusCode, media: &'static str, body: Vec<u8>) -> Response {

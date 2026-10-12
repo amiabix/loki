@@ -154,6 +154,7 @@ fn complete<T>(reply: ReplySender<T>, result: RelayResult<T>) {
 }
 
 enum Command {
+    Challenge(Id32, ReplySender<Vec<u8>>),
     Create(Id32, Vec<u8>, Capability, ReplySender<CreationResult>),
     Rotate(Id32, Vec<u8>, Capability, ReplySender<u64>),
     Put(Id32, Object, Capability, ReplySender<StoredResult>),
@@ -222,6 +223,9 @@ impl DbHandle {
                         break;
                     };
                     match command {
+                        Command::Challenge(nonce, reply) => {
+                            complete(reply, store.challenge(nonce));
+                        }
                         Command::Create(mailbox, body, capability, reply) => {
                             let result = store.create(mailbox, &body, &capability);
                             complete(reply, result);
@@ -372,6 +376,11 @@ impl DbHandle {
         provision: Capability,
     ) -> RelayResult<DbReply<CreationResult>> {
         self.admit_fresh(|sender| Command::Create(mailbox, request, provision, sender))
+    }
+    pub fn challenge(&self, nonce: Id32) -> RelayResult<DbReply<Vec<u8>>> {
+        let (sender, reply) = reply();
+        self.admit(Command::Challenge(nonce, sender))?;
+        Ok(reply)
     }
     pub fn rotate(
         &self,

@@ -589,6 +589,30 @@ impl ReviewedPackage {
     pub fn summary(&self) -> &ReviewSummary {
         &self.summary
     }
+
+    /// Binds a displayed review to this exact member package; it is not member consent.
+    pub fn review_token(&self) -> [u8; 32] {
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"Loki_review_token_v1\0");
+        hash.update(&self.summary.vault);
+        hash.update(&self.summary.payment);
+        hash.update(&self.summary.attempt.0);
+        for member in self.summary.pair {
+            hash.update(&member.to_be_bytes());
+        }
+        hash.update(&self.peer.to_be_bytes());
+        hash.update(&self.summary.candidate_hash);
+        hash.update(&self.summary.sighash);
+        hash.update(&self.package_hash);
+        hash.finalize().into()
+    }
+
+    pub fn require_review_token(&self, token: [u8; 32]) -> Result<(), String> {
+        if self.review_token() != token {
+            return Err("reviewed signing package changed; review again".into());
+        }
+        Ok(())
+    }
 }
 
 impl PackagePayload {

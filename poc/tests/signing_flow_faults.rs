@@ -377,6 +377,18 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
     )
     .unwrap();
     let reviewed = bob.review_package(&good, &alice_public).unwrap();
+    let token = reviewed.review_token();
+    let mut swapped = token;
+    swapped[0] ^= 1;
+    let nonce_bytes = std::fs::read(bob_attempt.join("nonces.sealed")).unwrap();
+    assert!(reviewed.require_review_token(swapped).is_err());
+    assert_eq!(
+        std::fs::read(bob_attempt.join("nonces.sealed")).unwrap(),
+        nonce_bytes
+    );
+    assert!(!bob_attempt.join("decision").exists());
+    assert!(!bob_attempt.join("share.sealed").exists());
+    reviewed.require_review_token(token).unwrap();
     assert!(!bob_attempt.join("share.sealed").exists());
     assert!(mailbox
         .read_for(

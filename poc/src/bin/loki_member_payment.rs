@@ -11,7 +11,7 @@ use std::{
 };
 
 #[cfg(feature = "relay-communication")]
-use loki_poc::signing_session::NonceWitness;
+use loki_poc::signing_session::{NonceWitness, ReviewedPackage};
 use loki_poc::{
     candidate::{alpha_from_canonical_bytes, build_candidate, quote_fee, CandidateInputs, Regtest},
     intent::{ChangePolicy, Intent},
@@ -753,13 +753,23 @@ fn two_relays(args: &[String]) -> Result<TwoRelays, String> {
 }
 
 #[cfg(feature = "relay-communication")]
-fn approve(args: &[String]) -> Result<(), String> {
-    let (member, owner, pass, context, intent, mailbox, mut session) = reopen_signer(args)?;
+fn reviewed_signer(
+    args: &[String],
+) -> Result<
+    (
+        MemberState,
+        Zeroizing<String>,
+        Mailbox,
+        SigningSession,
+        loki_poc::setup_transport::PublicIdentity,
+        ReviewedPackage,
+    ),
+    String,
+> {
+    let (member, owner, pass, context, _intent, mailbox, session) = reopen_signer(args)?;
     let own = member.identity.public().id;
     let peer_id = peer_in_pair(context.pair, own).unwrap();
     let peer = member.roster.members[&peer_id].clone();
-    let finisher =
-        member.roster.members[&(1..=3).find(|id| !context.pair.contains(id)).unwrap()].clone();
     let package_message = if own == context.pair[0] {
         let wires =
             SigningSession::saved_package_wires(&owner.join("signing"), &context, own, &pass)?;
@@ -770,7 +780,67 @@ fn approve(args: &[String]) -> Result<(), String> {
         next_message(&mailbox, &member, &context, MessageKind::Package, peer_id)?
     };
     let reviewed = session.review_package(&package_message, &peer)?;
-    confirm(&intent, reviewed.summary())?;
+    Ok((member, pass, mailbox, session, peer, reviewed))
+}
+
+#[cfg(feature = "relay-communication")]
+fn review(args: &[String]) -> Result<(), String> {
+    let (_, _, _, _, _, reviewed) = reviewed_signer(args)?;
+    let summary = reviewed.summary();
+    println!(
+        "{}",
+        json!({
+            "vault": hex::encode(summary.vault),
+            "payment": hex::encode(summary.payment),
+            "attempt": hex::encode(summary.attempt.0),
+            "pair": summary.pair,
+            "recipient": vault::regtest_unified_receiver(summary.recipient),
+            "amount_zat": summary.amount_zat,
+            "memo_hex": hex::encode(&summary.memo),
+            "memo_utf8": std::str::from_utf8(&summary.memo).ok(),
+            "fee_zat": summary.fee_zat,
+            "change_zat": summary.change_zat,
+            "expiry_height": summary.expiry_height,
+            "input_nullifiers": summary.input_nullifiers.iter().map(hex::encode).collect::<Vec<_>>(),
+            "candidate_hash": hex::encode(summary.candidate_hash),
+            "sighash": hex::encode(summary.sighash),
+            "review_token": hex::encode(reviewed.review_token()),
+            "authorization_required": true,
+        })
+    );
+    Ok(())
+}
+
+#[cfg(feature = "relay-communication")]
+fn approve(args: &[String], reviewed_token: bool) -> Result<(), String> {
+    // The caller must obtain explicit member consent to the displayed review; the token only binds bytes.
+    if args.len() != if reviewed_token { 5 } else { 4 } {
+        return Err(if reviewed_token {
+            "approve-reviewed <member-dir> <passphrase-file> <roster.json> <work-dir> <review-token>"
+                .into()
+        } else {
+            "approve <member-dir> <passphrase-file> <roster.json> <work-dir>".into()
+        });
+    }
+    let token = if reviewed_token {
+        Some(
+            hex::decode(&args[4])
+                .map_err(|_| "invalid review token")?
+                .try_into()
+                .map_err(|_| "review token must be 32 bytes")?,
+        )
+    } else {
+        None
+    };
+    let (member, pass, mailbox, mut session, peer, reviewed) = reviewed_signer(&args[..4])?;
+    if let Some(token) = token {
+        reviewed.require_review_token(token)?;
+    } else {
+        let (_, intent) = manifest(&Path::new(&args[3]).join("payment.json"))?;
+        confirm(&intent, reviewed.summary())?;
+    }
+    let pair = reviewed.summary().pair;
+    let finisher = member.roster.members[&(1..=3).find(|id| !pair.contains(id)).unwrap()].clone();
     let mut relays = two_relays(args)?;
     session.publish_approved_secured(reviewed, &peer, &finisher, &mailbox, &pass, &mut relays)?;
     println!("signed locally; approval delivery pending relay storage");
@@ -1215,7 +1285,11 @@ fn main() {
         #[cfg(feature = "relay-communication")]
         Some("package") => package(&args[2..]),
         #[cfg(feature = "relay-communication")]
-        Some("approve") => approve(&args[2..]),
+        Some("review") => review(&args[2..]),
+        #[cfg(feature = "relay-communication")]
+        Some("approve") => approve(&args[2..], false),
+        #[cfg(feature = "relay-communication")]
+        Some("approve-reviewed") => approve(&args[2..], true),
         Some("sign") => sign(&args[2..]),
         Some("resend") => resend(&args[2..]),
         Some("finish") => finish(&args[2..]),
@@ -1235,6 +1309,23 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "relay-communication")]
+    #[test]
+    fn reviewed_approval_rejects_malformed_token_before_opening_member_state() {
+        let args = [
+            "missing-member",
+            "missing-pass",
+            "missing-roster",
+            "missing-work",
+            "1234",
+        ]
+        .map(str::to_owned);
+        assert_eq!(
+            approve(&args, true),
+            Err("review token must be 32 bytes".into())
+        );
+    }
 
     #[test]
     fn payment_pair_is_sorted_and_explicit() {

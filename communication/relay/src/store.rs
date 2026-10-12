@@ -1,6 +1,7 @@
 use crate::{root::Root, Capability, RelayError, RelayResult, Role};
 use loki_relay_protocol::{
     canonical::{self, Value},
+    challenge::{self, ChallengeResponse},
     envelope,
     http::{decode_append_update, decode_creation},
     nonce::{self, NonceReceipt},
@@ -409,6 +410,22 @@ impl RelayStore {
     }
     pub fn public_key(&self) -> [u8; 32] {
         self.root.public_key
+    }
+
+    pub fn challenge(&self, nonce: Id32) -> RelayResult<Vec<u8>> {
+        let body = challenge::encode_body(&ChallengeResponse {
+            pin: RelayPin {
+                key: self.root.public_key,
+                run: self.root.run_id,
+            },
+            endpoint: self.root.endpoint.clone(),
+            challenge: nonce,
+        })?;
+        let signature = self.root.sign_challenge(&body)?;
+        Ok(canonical::encode(&Value::Array(vec![
+            Value::Bytes(body),
+            Value::Bytes(signature.to_vec()),
+        ]))?)
     }
 
     pub fn rotate(

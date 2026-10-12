@@ -3,15 +3,15 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::{Signature, VerifyingKey};
 use loki_relay_protocol::{
     canonical::{self, Value},
-    envelope,
-    nonce,
+    challenge, envelope,
     http::{
         decode_append_result, decode_append_update, decode_creation, decode_creation_result,
         decode_error, decode_page, validate_limit, ErrorCode, MAX_METADATA_LEN,
         MAX_PERSISTED_COUNTER,
     },
+    nonce,
     receipt::{self, decode_body},
-    types::{CreationResult, Id32, Object, Page, ReceiptBody, RelayRoute},
+    types::{CreationResult, Id32, Object, Page, ReceiptBody, RelayPin, RelayRoute},
     WireError,
 };
 use reqwest::{
@@ -28,6 +28,31 @@ pub struct RelayHttp {
     client: Client,
 }
 impl RelayHttp {
+    /// Check that the pinned signer is reachable; this does not authenticate later HTTP requests.
+    pub async fn authenticate_endpoint(&self, pin: &RelayPin, endpoint: &str) -> ClientResult<()> {
+        crate::descriptor::endpoint(endpoint)?;
+        let mut nonce = [0; 32];
+        getrandom::fill(&mut nonce).map_err(|_| ClientError::Crypto)?;
+        let url = format!("{}/v1/identity", endpoint.trim_end_matches('/'));
+        let mut response = self
+            .client
+            .get(url)
+            .header("x-loki-challenge", hex::encode(nonce))
+            .send()
+            .await?;
+        let (status, raw) = finish(
+            &mut response,
+            "application/cbor",
+            challenge::MAX_RESPONSE,
+            None,
+        )
+        .await?;
+        if status != 200 {
+            return Err(ClientError::Transport);
+        }
+        verify_challenge(pin, endpoint, nonce, &raw)
+    }
+
     /// Claims one CID once. Only a fresh, challenge-bound `created` receipt is usable
     /// for signing; an identical retry deliberately returns false.
     pub async fn claim_nonce(
@@ -517,9 +542,15 @@ impl VerifiedPage {
 pub enum PageRead {
     Page(Page),
     /// The response itself is not a contiguous page. The cursor stays put.
-    Invalid { reason: &'static str, sample: Vec<u8> },
+    Invalid {
+        reason: &'static str,
+        sample: Vec<u8>,
+    },
     /// The relay or the path was unavailable. The stream is retried, not isolated.
-    Unavailable { reason: &'static str, sample: Vec<u8> },
+    Unavailable {
+        reason: &'static str,
+        sample: Vec<u8>,
+    },
 }
 
 const OBJECT_CAP: usize = envelope::MAX_WIRE_LEN;
@@ -586,7 +617,12 @@ fn invalid_page(reason: &'static str, body: &[u8]) -> PageRead {
     }
 }
 
-fn classify_page(route: &RelayRoute, after: u64, limit: u64, held: HeldPage) -> ClientResult<PageRead> {
+fn classify_page(
+    route: &RelayRoute,
+    after: u64,
+    limit: u64,
+    held: HeldPage,
+) -> ClientResult<PageRead> {
     if held.dropped {
         return Ok(PageRead::Unavailable {
             reason: "transport",
@@ -609,12 +645,17 @@ fn classify_page(route: &RelayRoute, after: u64, limit: u64, held: HeldPage) -> 
                 reason: "capacity",
                 sample: sample_prefix(&held.body),
             }),
-            ClientError::Config | ClientError::Conflict | ClientError::Wire(_) | ClientError::Receipt => {
-                Ok(invalid_page(
-                    if body_has_gap(&held.body) { "gap" } else { "malformed" },
-                    &held.body,
-                ))
-            }
+            ClientError::Config
+            | ClientError::Conflict
+            | ClientError::Wire(_)
+            | ClientError::Receipt => Ok(invalid_page(
+                if body_has_gap(&held.body) {
+                    "gap"
+                } else {
+                    "malformed"
+                },
+                &held.body,
+            )),
             _ => Ok(PageRead::Unavailable {
                 reason: "transport",
                 sample: sample_prefix(&held.body),
@@ -642,7 +683,11 @@ fn classify_page(route: &RelayRoute, after: u64, limit: u64, held: HeldPage) -> 
             Ok(PageRead::Page(page))
         }
         Err(_) => Ok(invalid_page(
-            if body_has_gap(&held.body) { "gap" } else { "malformed" },
+            if body_has_gap(&held.body) {
+                "gap"
+            } else {
+                "malformed"
+            },
             &held.body,
         )),
     }
@@ -782,7 +827,10 @@ async fn collect_bounded(response: &mut Response, cap: usize) -> ClientResult<Ve
     }
     // end:content_encoding
     // guard:stream_cap
-    if response.content_length().is_some_and(|len| len > cap as u64) {
+    if response
+        .content_length()
+        .is_some_and(|len| len > cap as u64)
+    {
         return Err(ClientError::Wire(WireError::Bounds));
     }
     // end:stream_cap
@@ -803,10 +851,12 @@ async fn collect_bounded(response: &mut Response, cap: usize) -> ClientResult<Ve
 }
 
 async fn collect(response: &mut Response, cap: usize) -> ClientResult<Vec<u8>> {
-    collect_bounded(response, cap).await.map_err(|error| match error {
-        ClientError::Wire(WireError::Bounds) => ClientError::Transport,
-        other => other,
-    })
+    collect_bounded(response, cap)
+        .await
+        .map_err(|error| match error {
+            ClientError::Wire(WireError::Bounds) => ClientError::Transport,
+            other => other,
+        })
 }
 
 async fn finish(
@@ -867,6 +917,28 @@ fn verify_nonce_claim(
     )
     .map_err(|_| ClientError::Receipt)?;
     Ok(receipt.created)
+}
+
+fn verify_challenge(pin: &RelayPin, endpoint: &str, nonce: Id32, raw: &[u8]) -> ClientResult<()> {
+    let Value::Array(parts) =
+        canonical::decode(raw, challenge::MAX_RESPONSE).map_err(|_| ClientError::Receipt)?
+    else {
+        return Err(ClientError::Receipt);
+    };
+    let [Value::Bytes(body), Value::Bytes(signature)] = parts.as_slice() else {
+        return Err(ClientError::Receipt);
+    };
+    let response = challenge::decode_body(body).map_err(|_| ClientError::Receipt)?;
+    if response.pin != *pin || response.endpoint != endpoint || response.challenge != nonce {
+        return Err(ClientError::Receipt);
+    }
+    let key = VerifyingKey::from_bytes(&pin.key).map_err(|_| ClientError::Config)?;
+    let signature = Signature::from_slice(signature).map_err(|_| ClientError::Receipt)?;
+    key.verify_strict(
+        &challenge::signature_input(body).map_err(|_| ClientError::Receipt)?,
+        &signature,
+    )
+    .map_err(|_| ClientError::Receipt)
 }
 
 fn signature_input(body: &[u8]) -> ClientResult<Vec<u8>> {
@@ -964,6 +1036,206 @@ pub(crate) fn verify_saved_receipt(
         return Err(ClientError::Receipt);
     }
     Ok(receipt)
+}
+
+#[cfg(test)]
+mod challenge_tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    use loki_relay_protocol::{challenge::ChallengeResponse, types::RelayPin};
+
+    #[test]
+    fn identity_challenge_rejects_wrong_pin_run_endpoint_and_replay() {
+        let signing = SigningKey::from_bytes(&[7; 32]);
+        let route = RelayRoute {
+            pin: RelayPin {
+                key: signing.verifying_key().to_bytes(),
+                run: [8; 32],
+            },
+            endpoint: "http://127.0.0.1:8000".into(),
+            mailbox: [9; 32],
+            append_revision: 1,
+        };
+        let make = |response: ChallengeResponse| {
+            let body = challenge::encode_body(&response).unwrap();
+            let signature = signing.sign(&challenge::signature_input(&body).unwrap());
+            canonical::encode(&Value::Array(vec![
+                Value::Bytes(body),
+                Value::Bytes(signature.to_bytes().to_vec()),
+            ]))
+            .unwrap()
+        };
+        let expected = ChallengeResponse {
+            pin: route.pin.clone(),
+            endpoint: route.endpoint.clone(),
+            challenge: [10; 32],
+        };
+        let raw = make(expected.clone());
+        assert_eq!(
+            verify_challenge(&route.pin, &route.endpoint, expected.challenge, &raw),
+            Ok(())
+        );
+        assert_eq!(
+            verify_challenge(&route.pin, &route.endpoint, [11; 32], &raw),
+            Err(ClientError::Receipt)
+        );
+        let mut changed = expected.clone();
+        changed.pin.run = [12; 32];
+        assert_eq!(
+            verify_challenge(
+                &route.pin,
+                &route.endpoint,
+                expected.challenge,
+                &make(changed)
+            ),
+            Err(ClientError::Receipt)
+        );
+        let mut changed = expected.clone();
+        changed.pin.key = [13; 32];
+        assert_eq!(
+            verify_challenge(
+                &route.pin,
+                &route.endpoint,
+                expected.challenge,
+                &make(changed)
+            ),
+            Err(ClientError::Receipt)
+        );
+        let other = SigningKey::from_bytes(&[9; 32]);
+        let mut changed = expected.clone();
+        changed.pin.key = other.verifying_key().to_bytes();
+        let body = challenge::encode_body(&changed).unwrap();
+        let signature = other.sign(&challenge::signature_input(&body).unwrap());
+        let other_response = canonical::encode(&Value::Array(vec![
+            Value::Bytes(body),
+            Value::Bytes(signature.to_bytes().to_vec()),
+        ]))
+        .unwrap();
+        assert_eq!(
+            verify_challenge(
+                &route.pin,
+                &route.endpoint,
+                expected.challenge,
+                &other_response
+            ),
+            Err(ClientError::Receipt)
+        );
+        let mut changed = expected.clone();
+        changed.endpoint = "http://127.0.0.1:8001".into();
+        assert_eq!(
+            verify_challenge(
+                &route.pin,
+                &route.endpoint,
+                expected.challenge,
+                &make(changed)
+            ),
+            Err(ClientError::Receipt)
+        );
+        let mut changed = raw;
+        *changed.last_mut().unwrap() ^= 1;
+        assert_eq!(
+            verify_challenge(&route.pin, &route.endpoint, expected.challenge, &changed),
+            Err(ClientError::Receipt)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn authenticates_a_live_empty_endpoint() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let signing = SigningKey::from_bytes(&[7; 32]);
+        let route = RelayRoute {
+            pin: RelayPin {
+                key: signing.verifying_key().to_bytes(),
+                run: [8; 32],
+            },
+            endpoint: endpoint.clone(),
+            mailbox: [9; 32],
+            append_revision: 1,
+        };
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut chunk = [0; 2048];
+                let size = socket.read(&mut chunk).unwrap();
+                assert!(size > 0 && request.len() + size <= 4096);
+                request.extend_from_slice(&chunk[..size]);
+            }
+            let request = std::str::from_utf8(&request).unwrap().to_ascii_lowercase();
+            assert!(request.starts_with("get /v1/identity http/1.1"));
+            let nonce = request
+                .lines()
+                .find_map(|line| line.strip_prefix("x-loki-challenge: "))
+                .unwrap();
+            let mut challenge_bytes = [0; 32];
+            hex::decode_to_slice(nonce, &mut challenge_bytes).unwrap();
+            let body = challenge::encode_body(&ChallengeResponse {
+                pin: RelayPin {
+                    key: signing.verifying_key().to_bytes(),
+                    run: [8; 32],
+                },
+                endpoint,
+                challenge: challenge_bytes,
+            })
+            .unwrap();
+            let signature = signing.sign(&challenge::signature_input(&body).unwrap());
+            let response = canonical::encode(&Value::Array(vec![
+                Value::Bytes(body),
+                Value::Bytes(signature.to_bytes().to_vec()),
+            ]))
+            .unwrap();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/cbor\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", response.len()).unwrap();
+            socket.write_all(&response).unwrap();
+        });
+        assert_eq!(
+            RelayHttp::new()
+                .unwrap()
+                .authenticate_endpoint(&route.pin, &route.endpoint)
+                .await,
+            Ok(())
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn identity_request_never_follows_redirect() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+        };
+        let redirect = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        target.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", redirect.local_addr().unwrap());
+        let location = format!("http://{}/v1/identity", target.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = redirect.accept().unwrap();
+            let mut request = [0; 2048];
+            assert!(socket.read(&mut request).unwrap() > 0);
+            write!(socket, "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        let route = RelayRoute {
+            pin: RelayPin {
+                key: SigningKey::from_bytes(&[7; 32]).verifying_key().to_bytes(),
+                run: [8; 32],
+            },
+            endpoint,
+            mailbox: [9; 32],
+            append_revision: 1,
+        };
+        assert!(RelayHttp::new()
+            .unwrap()
+            .authenticate_endpoint(&route.pin, &route.endpoint)
+            .await
+            .is_err());
+        server.join().unwrap();
+        assert!(target.accept().is_err());
+    }
 }
 
 #[cfg(test)]

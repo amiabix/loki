@@ -25,6 +25,7 @@ result documents, which are the authority.
 | **Second-device finishing** | seed-flow THS validation: a party holding none of the approvers' files completed both posted and re-proving paths with one and two inputs. Replicas carry confidential randomizer seeds ([evidence](FROST-RANDOMIZER-RESULTS.md)) |
 | **Separate-member setup** | three or four isolated processes complete threshold-two DKG; each member checks a 24-word and card backup before the regtest address appears. Activated 2-of-4 member stores fed a mined regtest payment through the local courier. A clean restore without the exchange directory was demonstrated on 2-of-3 ([details](SEPARATE-MEMBER-SETUP.md)) |
 | **Signing sessions** | a 2-of-3 relay attempt with explicit member review and independent finishing. The relay-backed `commit`/`package`/`approve` path seals nonces across invocations and requires two pinned relay nonce receipts before signing; a staged regtest payment was mined. The simultaneous local-courier `sign` command supports 2-of-3 and 2-of-4 but remains a RAM-only demo ([scope](SIGNING-SESSION.md)) |
+| **Structured review** | the relay-enabled CLI can return a verified payment summary and exact-package review token, then recheck that token before `approve-reviewed` signs. The token binds bytes; an app still has to show the summary and obtain the member's explicit consent |
 | **Recovery, key rotation, custody** | local two-artifact restore demonstrated on regtest; independent spend, key rotation in the wallet, and custody readiness **not established** |
 
 ## Quick start
