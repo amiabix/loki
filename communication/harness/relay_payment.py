@@ -27,16 +27,24 @@ def payment_command(owner, member, binary, roster, work, rpc, action, *extra):
     return command
 
 
-def pump(context, relay_binary, works, attempt, sent, deadline):
+def pump(context, relay_binary, payment_binary, works, attempt, sent, rpc, deadline):
     for member in context.members:
         mailbox = works[member.member_id] / 'mailbox'
-        if mailbox.is_dir():
-            for wire in mailbox.iterdir():
-                if re.fullmatch(r'[0-9a-f]{64}', wire.name) is None or wire.name in sent:
-                    continue
-                run._member_text(context, relay_binary, member, deadline, 'send-signing',
-                                 ['--payload-file', str(wire), '--attempt', attempt])
-                sent.add(wire.name)
+        inventory = context.owner.capture(payment_command(context.owner, member, payment_binary,
+            context.roster, works[member.member_id], rpc, 'local-wires'), cwd=member.root,
+            timeout=run._remaining(deadline))
+        if inventory.returncode != 0:
+            raise run.OwnershipError('Member could not inspect its own signing messages')
+        wires = json.loads(inventory.stdout)['wires']
+        if not isinstance(wires, list) or any(not isinstance(wire, str) or
+                re.fullmatch(r'[0-9a-f]{64}', wire) is None for wire in wires):
+            raise run.OwnershipError('Signer returned an invalid wire inventory')
+        for wire in wires:
+            if wire in sent:
+                continue
+            run._member_text(context, relay_binary, member, deadline, 'send-signing',
+                             ['--payload-file', str(mailbox / wire), '--attempt', attempt])
+            sent.add(wire)
         run._member_text(context, relay_binary, member, deadline, 'upload', [], allow_empty=True)
     for member in context.members:
         three_members.poll(context, relay_binary, member, deadline)
@@ -96,15 +104,38 @@ def main(argv=None):
     try:
         context, hashes, _isolation, _server, relay = three_members.prepare_existing(
             owner, manual / 'source', args.ports, communication, poc, deadline)
-        works = {}
-        for member in context.members:
-            work = member.root / 'payment' / payment['attempt']
-            work.parent.mkdir(mode=0o700)
-            work.mkdir(mode=0o700)
-            run._write_new(work / 'payment.json', manifest, 0o600)
-            works[member.member_id] = work
+        works = {member.member_id: member.root / 'payments' / payment['attempt']
+                 for member in context.members}
+        proposer_id = int.from_bytes(bytes.fromhex(payment['proposer']), 'little')
+        if proposer_id not in (1, 2, 3):
+            raise run.OwnershipError('Payment proposer is outside the certified roster')
+        proposer = context.members[proposer_id - 1]
+        work = works[proposer_id]
+        work.parent.mkdir(mode=0o700)
+        work.mkdir(mode=0o700)
+        run._write_new(work / 'payment.json', manifest, 0o600)
+        run._member_text(context, relay, proposer, deadline, 'send-proposal',
+                         ['--proposal-file', str(work / 'payment.json')])
+        for _ in range(12):
+            run._member_text(context, relay, proposer, deadline, 'upload', [], allow_empty=True)
+            for member in context.members:
+                if member.member_id == proposer_id:
+                    continue
+                three_members.poll(context, relay, member, deadline)
+                run._member_text(context, relay, member, deadline, 'import-proposals',
+                                 ['--payments-dir', str(member.root / 'payments')])
+                run._member_text(context, relay, member, deadline, 'upload', [], allow_empty=True)
+            if all((path / 'payment.json').is_file() for path in works.values()):
+                break
+        else:
+            raise run.OwnershipError('Proposal did not reach every private member store')
+        if any((path / 'payment.json').read_bytes() != manifest for path in works.values()):
+            raise run.OwnershipError('Imported payment differs from the proposed intent')
+        if any((path / 'payment.json').stat().st_mode & 0o777 != 0o600 for path in works.values()):
+            raise run.OwnershipError('Imported payment is not private')
         sent = set()
-        pump_once = lambda: pump(context, relay, works, payment['attempt'], sent, deadline)
+        pump_once = lambda: pump(context, relay, pay, works, payment['attempt'], sent,
+                                 chain.rpc_address, deadline)
         for member in (context.members[number - 1] for number in pair):
             result = owner.capture(payment_command(owner, member, pay, context.roster,
                 works[member.member_id], chain.rpc_address, 'commit'), cwd=member.root,
@@ -119,12 +150,23 @@ def main(argv=None):
         if result.returncode != 0 or b'payment package published' not in result.stdout:
             raise run.OwnershipError('Proposer could not build the reviewed payment package')
         pump_once()
-        approval = ('APPROVE ' + payment['payment'] + '\n').encode('ascii')
         for member in (context.members[number - 1] for number in pair):
             before = {item['id'] for item in three_members.status(context, relay, member, deadline)['messages']}
-            result = subprocess.run(payment_command(owner, member, pay, context.roster,
-                works[member.member_id], chain.rpc_address, 'approve'), cwd=member.root,
-                input=approval, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            review = owner.capture(payment_command(owner, member, pay, context.roster,
+                works[member.member_id], chain.rpc_address, 'review'), cwd=member.root,
+                timeout=run._remaining(deadline))
+            if review.returncode != 0:
+                raise run.OwnershipError('Member could not review the exact candidate')
+            displayed = json.loads(review.stdout)
+            expected = {key: payment[key] for key in ('vault', 'payment', 'attempt', 'pair',
+                'amount_zat', 'memo', 'fee_zat', 'change_zat', 'expiry_height', 'input_nullifiers')}
+            expected['memo_hex'] = expected.pop('memo')
+            if any(displayed.get(key) != value for key, value in expected.items()) or \
+                    displayed.get('authorization_required') is not True:
+                raise run.OwnershipError('Signer review differs from the proposed payment')
+            result = owner.capture(payment_command(owner, member, pay, context.roster,
+                works[member.member_id], chain.rpc_address, 'approve-reviewed',
+                displayed['review_token']), cwd=member.root,
                 timeout=run._remaining(deadline))
             if result.returncode != 0 or b'signed locally; approval delivery pending relay storage' not in result.stdout:
                 raise run.OwnershipError('Member could not verify and witness its approval')

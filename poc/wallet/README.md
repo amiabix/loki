@@ -118,6 +118,12 @@ does not collect capabilities or automate this ceremony. The independent
 three-relay setup in `communication/harness/three_members.py` tests transport;
 it does not configure an app vault.
 
+For a funded separate-member vault, `communication/harness/relay_payment.py`
+now delivers the proposal to each member through the relays, carries only each
+member's own signing messages, uses the exact signer review token, then proves,
+mines, and checks receipt in an independent recipient vault. This validates the
+Rust payment path; it is not a browser end-to-end test.
+
 The app is passphrase-only today. Its local file courier and time-limited,
 non-resumable DKG are development controls, not the planned relay transport.
 Data roots created by the previous one-vault app are left untouched and need an
