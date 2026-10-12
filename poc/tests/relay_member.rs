@@ -14,6 +14,7 @@ use zeroize::Zeroizing;
 
 const PASS: &str = " synthetic setup pass ";
 static CERTIFIED: OnceLock<PathBuf> = OnceLock::new();
+static CERTIFIED_POLICY: OnceLock<PathBuf> = OnceLock::new();
 fn private(path: &Path, directory: bool) {
     #[cfg(unix)]
     {
@@ -36,7 +37,10 @@ fn scratch() -> PathBuf {
     p
 }
 fn certified_setup() -> &'static PathBuf {
-    CERTIFIED.get_or_init(|| {
+    certified_setup_with_policy(false)
+}
+fn certified_setup_with_policy(policy: bool) -> &'static PathBuf {
+    (if policy { &CERTIFIED_POLICY } else { &CERTIFIED }).get_or_init(|| {
         let root = scratch();
         let exchange = root.join("exchange");
         fs::create_dir(&exchange).unwrap();
@@ -64,7 +68,11 @@ fn certified_setup() -> &'static PathBuf {
         let roster = root.join("roster.json");
         fs::write(
             &roster,
-            serde_json::to_vec(&serde_json::json!({"vault":hex::encode([71;32]),"members":public}))
+            serde_json::to_vec(&if policy {
+                serde_json::json!({"vault":hex::encode([71;32]),"threshold":2,"members":public})
+            } else {
+                serde_json::json!({"vault":hex::encode([71;32]),"members":public})
+            })
                 .unwrap(),
         )
         .unwrap();
@@ -112,6 +120,13 @@ fn certified_setup() -> &'static PathBuf {
         root
     })
 }
+#[test]
+fn certified_threshold_two_roster_loads_for_relay() {
+    let base = certified_setup_with_policy(true);
+    let member = base.join("member-2");
+    assert_eq!(load(&member, &member.join("pass"), &base.join("roster.json"))
+        .unwrap().identity.public().id, 2);
+}
 struct Fixture {
     root: PathBuf,
     pass: PathBuf,
@@ -119,7 +134,10 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let base = certified_setup();
+        Self::with_policy(false)
+    }
+    fn with_policy(policy: bool) -> Self {
+        let base = certified_setup_with_policy(policy);
         let root = scratch();
         let dir = MemberDir::create(&root, "secrets").unwrap();
         for file in ["identity.sealed", "vault.sealed"] {
@@ -239,6 +257,17 @@ fn certified_member_wrong_fingerprint() {
     state["roster_fingerprint"] = Value::from(hex::encode([9; 32]));
     f.seal(&state);
     refuses(&f, "member_fingerprint");
+}
+
+#[test]
+fn certified_member_rejects_sealed_policy_mismatch() {
+    for (field, value) in [("threshold", 3), ("members", 4)] {
+        let f = Fixture::with_policy(true);
+        let mut state = f.state();
+        state[field] = Value::from(value);
+        f.seal(&state);
+        refuses(&f, "member_roster");
+    }
 }
 
 #[test]
