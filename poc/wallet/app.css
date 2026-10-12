@@ -571,7 +571,7 @@ pre:hover { border-color: var(--line); }
 /* ════════════════════════════════════════════════════════════════════════════
    COMPOSITION
    A standing identity rail and a working column. The rail never changes shape,
-   so the vault, the member and the sigil stay put while the right side moves
+   so the vault and the member stay put while the right side moves
    through six steps. Scale does the hierarchy: 11px mono labels against a
    72px serif headline, nothing in between.
    ════════════════════════════════════════════════════════════════════════ */
@@ -639,44 +639,6 @@ pre:hover { border-color: var(--line); }
 
 .identity .muted { font-size: 12px; line-height: 1.55; }
 
-/* ── the sigil ────────────────────────────────────────────────────────────── */
-
-.sigil { margin: 0; }
-
-.sigil svg {
-  width: 100%;
-  max-width: 190px;
-  aspect-ratio: 1;
-  display: block;
-  padding: 14px;
-  background: var(--inset);
-  border: 1px solid var(--line);
-  clip-path: var(--bevel);
-  opacity: .25;
-  transition: opacity .5s ease, filter .5s ease;
-  filter: grayscale(1);
-}
-
-.sigil svg.ready {
-  opacity: 1;
-  filter: none;
-  animation: cast .7s cubic-bezier(.2,.8,.3,1) both;
-}
-
-@keyframes cast {
-  from { opacity: 0; transform: scale(.82) rotate(-12deg) }
-}
-
-.sigil figcaption {
-  margin-top: 10px;
-  max-width: 24ch;
-  font-size: 10px;
-  line-height: 1.6;
-  letter-spacing: .1em;
-  text-transform: uppercase;
-  color: var(--faint);
-}
-
 .rail-foot {
   margin-top: auto;
   font-size: 9.5px;
@@ -729,7 +691,6 @@ main {
   .steps li.done { border-top-color: rgba(0,224,164,.4); }
   .steps li.now { border-top-color: var(--accent); }
   .steps li.now::after { display: none; }
-  .sigil svg { max-width: 140px; }
   main { padding: 32px 22px 56px; }
 }
 

@@ -92,94 +92,6 @@ function echo(typed) {
       : `${same} of ${expected.length} characters so far.`;
 }
 
-/* ── roster sigil ───────────────────────────────────────────────────────────
-   A deterministic emblem drawn from the roster fingerprint. Two people holding
-   different rosters get visibly different marks, which is far faster to spot
-   across a video call than 32 hex characters. It is an AID, not the check: the
-   characters are still the thing that must match, and the copy says so. */
-
-const SVG = 'http://www.w3.org/2000/svg';
-const SIGIL_INK = ['#00e0a4', '#49d6ff', '#f4b728', '#c07bff', '#ff6b7a'];
-
-function digest(text) {
-  /* FNV-1a, then stretched: enough spread for 25 cells and two colours. */
-  let hash = 0x811c9dc5;
-  for (const character of text) {
-    hash ^= character.codePointAt(0);
-    hash = Math.imul(hash, 0x01000193) >>> 0;
-  }
-  const stream = [];
-  let state = hash;
-  for (let index = 0; index < 16; index += 1) {
-    state = Math.imul(state ^ (state >>> 13), 0x5bd1e995) >>> 0;
-    stream.push(state);
-  }
-  return stream;
-}
-
-function node(name, attributes) {
-  const element = document.createElementNS(SVG, name);
-  for (const [key, value] of Object.entries(attributes)) element.setAttribute(key, value);
-  return element;
-}
-
-function drawSigil(text) {
-  const target = $('sigil');
-  if (target.dataset.of === text) return;   /* the poll must not recast it every 2s */
-  target.dataset.of = text;
-  target.replaceChildren();
-  target.classList.toggle('ready', Boolean(text));
-  $('sigilCaption').textContent = text
-    ? 'Roster sigil · the same mark on all three screens. The characters are still the check.'
-    : 'Roster sigil · appears when all three join';
-  if (!text) {
-    /* an empty frame reads as broken, so hold the shape until there is a roster */
-    target.append(node('circle', {
-      cx: 60, cy: 60, r: 42, fill: 'none', stroke: '#22323f',
-      'stroke-width': 1, 'stroke-dasharray': '3 7',
-    }));
-    target.append(node('rect', {
-      x: 54, y: 54, width: 12, height: 12, transform: 'rotate(45 60 60)', fill: '#22323f',
-    }));
-    return;
-  }
-
-  const stream = digest(text);
-  const ink = SIGIL_INK[stream[0] % SIGIL_INK.length];
-  const glint = SIGIL_INK[(stream[1] >>> 3) % SIGIL_INK.length];
-
-  /* outer ring of ticks: twelve positions, length set by the hash */
-  for (let index = 0; index < 12; index += 1) {
-    const angle = (index / 12) * Math.PI * 2 - Math.PI / 2;
-    const long = (stream[2 + (index % 8)] >>> index) & 1;
-    const inner = long ? 44 : 49;
-    target.append(node('line', {
-      x1: 60 + Math.cos(angle) * inner, y1: 60 + Math.sin(angle) * inner,
-      x2: 60 + Math.cos(angle) * 55, y2: 60 + Math.sin(angle) * 55,
-      stroke: long ? ink : '#334a5c', 'stroke-width': long ? 2 : 1,
-    }));
-  }
-
-  /* a 5x5 field, mirrored down the middle, so the mark reads as an emblem */
-  for (let row = 0; row < 5; row += 1) {
-    for (let column = 0; column < 3; column += 1) {
-      const bit = (stream[4 + row] >>> (column * 3)) & 7;
-      if (bit < 3) continue;
-      const size = bit > 5 ? 9 : 6;
-      for (const x of new Set([column, 4 - column])) {
-        target.append(node('rect', {
-          x: 24 + x * 15 - size / 2, y: 24 + row * 15 - size / 2,
-          width: size, height: size,
-          transform: `rotate(45 ${24 + x * 15} ${24 + row * 15})`,
-          fill: bit > 5 ? ink : glint,
-          opacity: bit > 5 ? 1 : .55,
-        }));
-      }
-    }
-  }
-  target.append(node('circle', {cx: 60, cy: 60, r: 57, fill: 'none', stroke: ink, 'stroke-width': 1, opacity: .35}));
-}
-
 const HEADLINE = {
   new: ['Step 01 of 05', 'Start or join a vault'],
   waiting_for_members: ['Step 01 of 05', 'Waiting for the other two'],
@@ -216,7 +128,6 @@ async function refresh() {
     $('slot').textContent = state.slot ? `0${state.slot}` : '';
     $('slot').hidden = !state.slot;
     $('subtitle').textContent = state.slot ? `Member ${state.slot} of 3 · threshold 2 · regtest` : 'Create or join a vault from this member’s own app.';
-    drawSigil(state.fingerprint || '');
     if (state.invites) {
       $('invite2').textContent = state.invites[0];
       $('invite3').textContent = state.invites[1];
