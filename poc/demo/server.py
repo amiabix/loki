@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import fcntl
+import os
 import re
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -319,6 +320,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
+    if os.environ.get("LOKI_ALLOW_FIXED_VIEWING_KEY") != "1":
+        print("This legacy account demo uses a fixed test viewing key. Set LOKI_ALLOW_FIXED_VIEWING_KEY=1 for this regtest fixture only.", file=sys.stderr)
+        return 2
     port = PORT
     if len(sys.argv) > 1:
         try:

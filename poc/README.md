@@ -5,6 +5,12 @@ account that spends an Ironwood note, where the signature is produced **before**
 transaction has a proof or an anchor.
 The separate-member local courier path also exercises 2-of-4; the relay path remains 2-of-3.
 
+The separate-member `loki_setup_member` and `loki_member_payment` commands are the
+current regtest vault path. The older `loki` binary uses a fixed test viewing-key
+tail and refuses to run unless `LOKI_ALLOW_FIXED_VIEWING_KEY=1` is explicitly set.
+The terminal research harnesses set this flag themselves. The older account demo
+requires the same opt-in at server startup; the separate-member demo does not.
+
 This is a prototype on a local regtest chain. **It is not a wallet and not custody
 software.** What it does and does not establish is stated precisely below and in the
 result documents, which are the authority.
@@ -38,7 +44,7 @@ regtest vault and payment; open Alice and Bob's review links in separate browser
 sessions, approve in each, then ask Carol to prove and send. See
 [`demo/MEMBER-DEMO.md`](demo/MEMBER-DEMO.md) for the exact flow and limits.
 
-The earlier account UI is still available with `python3 demo/server.py` on port
+The earlier account UI is still available with `LOKI_ALLOW_FIXED_VIEWING_KEY=1 python3 demo/server.py` on port
 8787. In that browser UI, create the account and click **Start the test network**. It
 launches its own named THS environment, discovers free loopback ports, waits for
 the services, and funds the vault. Stop network, Reset, and graceful server

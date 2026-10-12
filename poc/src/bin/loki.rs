@@ -23,6 +23,12 @@ fn shared_name() -> String {
 }
 
 fn main() {
+    if env::var("LOKI_ALLOW_FIXED_VIEWING_KEY").as_deref() != Ok("1") {
+        eprintln!(
+            "refusing the legacy fixed-key fixture; set LOKI_ALLOW_FIXED_VIEWING_KEY=1 only for the G1-TX research harness. Use loki_setup_member for a separate-member vault"
+        );
+        process::exit(2);
+    }
     let args: Vec<String> = env::args().collect();
     let stage = args.get(1).map(String::as_str).unwrap_or("");
 

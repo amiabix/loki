@@ -72,6 +72,7 @@ def main():
     else:
         state = Path(tempfile.mkdtemp(prefix="loki-ths-"))
     env = chain.env()
+    env["LOKI_ALLOW_FIXED_VIEWING_KEY"] = "1"
     print(f"THS instance: {args.name}\nState: {state}", flush=True)
 
     def loki(stage, *params, capture=False):

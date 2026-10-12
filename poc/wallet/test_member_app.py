@@ -15,6 +15,60 @@ from member_app import SEED_WALLET, SETUP, Wallet
 
 
 class MemberWalletTest(unittest.TestCase):
+    def test_payment_draft_uses_only_active_members_own_vault(self):
+        with tempfile.TemporaryDirectory(prefix="loki-draft-") as temp:
+            root = Path(temp)
+            exchange = root / "exchange"
+            alice = Wallet(root / "alice", exchange)
+            bob = Wallet(root / "bob", exchange)
+            self.addCleanup(alice.close)
+            self.addCleanup(bob.close)
+            vault = "a" * 64
+            alice.profile_data = {"id": "alice"}
+            bob.profile_data = {"id": "bob"}
+            alice.passphrase = "alice test passphrase"
+            bob.passphrase = "bob test passphrase"
+            folder = alice.data / "vaults" / vault
+            (folder / "secrets").mkdir(parents=True)
+            (folder / "membership.json").write_text(json.dumps({
+                "vault": vault, "profile": "alice", "slot": 1, "threshold": 2, "members": 3}))
+            (folder / "roster.json").write_text("{}")
+            with self.assertRaisesRegex(ValueError, "not active"):
+                alice.prepare_payment(vault, "uregtest1recipient", "40000000", "test memo", "AB")
+            (folder / "secrets" / "activation.sealed").write_bytes(b"active")
+
+            def prepare(_action, member, _pass, roster, work, _recipient, amount, memo, pair, **kwargs):
+                self.assertEqual(member, folder)
+                self.assertEqual(roster, folder / "roster.json")
+                self.assertEqual(work.parent, folder / "payments")
+                self.assertEqual(work.stat().st_mode & 0o777, 0o700)
+                self.assertEqual((amount, memo, pair), ("40000000", "test memo", "AB"))
+                self.assertEqual(kwargs["binary"], Path(SETUP).with_name("loki_member_payment"))
+                (work / "payment.json").write_text(json.dumps({
+                    "vault": vault, "payment": "b" * 64, "amount_zat": 40000000,
+                    "fee_zat": 10000, "change_zat": 59990000, "expiry_height": 9216,
+                    "pair": [1, 2]}))
+                return "payment created"
+
+            with patch.object(alice, "command", side_effect=prepare) as command:
+                draft = alice.prepare_payment(vault, "uregtest1recipient", "40000000", "test memo", "AB")
+            self.assertEqual(command.call_count, 1)
+            self.assertEqual(draft["payment"], "b" * 64)
+            self.assertEqual(draft["status"], "draft_only")
+            self.assertEqual(len(list((folder / "payments").glob("*/payment.json"))), 1)
+            with self.assertRaisesRegex(ValueError, "Choose two members"):
+                alice.prepare_payment(vault, "uregtest1recipient", "40000000", "test memo", "AD")
+            with self.assertRaisesRegex(ValueError, "positive amount"):
+                alice.prepare_payment(vault, "uregtest1recipient", "0", "test memo", "AB")
+            self.assertEqual(command.call_count, 1)
+            with self.assertRaisesRegex(ValueError, "not a member"):
+                bob.prepare_payment(vault, "uregtest1recipient", "40000000", "test memo", "AB")
+            with self.assertRaisesRegex(ValueError, "not a member"):
+                alice.prepare_payment("c" * 64, "uregtest1recipient", "40000000", "test memo", "AB")
+            alice.profile_data = {"id": "another-profile"}
+            with self.assertRaisesRegex(ValueError, "does not belong"):
+                alice.prepare_payment(vault, "uregtest1recipient", "40000000", "test memo", "AB")
+
     def test_four_member_vault_reaches_one_address_after_every_backup(self):
         if not SETUP.is_file():
             self.skipTest("build setup binary first")

@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import secrets
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -481,6 +482,40 @@ class Wallet:
             raise ValueError("Chain scan returned another vault")
         return result
 
+    def prepare_payment(self, vault, recipient, amount_zat, memo, pair):
+        member_dir, local = self.vault_dir(vault)
+        if not (member_dir / "secrets" / "activation.sealed").is_file():
+            raise ValueError("Vault is not active")
+        if not isinstance(recipient, str) or not recipient.strip():
+            raise ValueError("Enter a recipient address")
+        if not isinstance(amount_zat, str) or not 1 <= len(amount_zat) <= 20 \
+                or not amount_zat.isascii() or not amount_zat.isdigit() or int(amount_zat) <= 0:
+            raise ValueError("Enter a positive amount in zat")
+        if not isinstance(memo, str) or not memo or len(memo.encode()) > 512:
+            raise ValueError("Enter a memo of 1 to 512 bytes")
+        if local.get("members") not in (3, 4):
+            raise ValueError("Unsupported vault roster")
+        pairs = ("AB", "AC", "BC") if local["members"] == 3 else ("AB", "AC", "AD", "BC", "BD", "CD")
+        if pair not in pairs:
+            raise ValueError("Choose two members of this vault")
+        drafts = member_dir / "payments"
+        drafts.mkdir(mode=0o700, exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix="payment-", dir=drafts))
+        try:
+            self.command("prepare", member_dir, "@pass", member_dir / "roster.json", work,
+                         recipient.strip(), amount_zat, memo, pair, binary=PAYMENT, timeout=120)
+            manifest = read_json(work / "payment.json")
+            if manifest.get("vault") != vault or manifest.get("pair") != [ord(c) - ord("A") + 1 for c in pair] \
+                    or manifest.get("amount_zat") != int(amount_zat):
+                raise ValueError("Payment draft does not match this vault and request")
+            return {"status": "draft_only", "payment": manifest["payment"],
+                    "recipient": recipient.strip(), "amount_zat": str(manifest["amount_zat"]),
+                    "fee_zat": str(manifest["fee_zat"]), "change_zat": str(manifest["change_zat"]),
+                    "expiry_height": manifest["expiry_height"], "pair": manifest["pair"]}
+        except Exception:
+            shutil.rmtree(work)
+            raise
+
     def status(self, vault=None):
         if not (self.data / "profile" / "profile.sealed").exists():
             return {"phase": "new_profile", "network": "regtest"}
@@ -685,6 +720,9 @@ def make_signer_server(wallet, port, dashboard_port=None):
                         "/api/verify": lambda: wallet.verify(value.get("vault"), value.get("words"), value.get("card")),
                         "/api/activate": lambda: {"address": wallet.address(value.get("vault"))},
                         "/api/balance": lambda: wallet.balance(value.get("vault")),
+                        "/api/payment-draft": lambda: wallet.prepare_payment(
+                            value.get("vault"), value.get("recipient"), value.get("amount_zat"),
+                            value.get("memo"), value.get("pair")),
                     }
                     if self.path not in routes:
                         return self.reply(404, {"error": "Not found"})

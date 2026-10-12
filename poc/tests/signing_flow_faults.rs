@@ -152,6 +152,23 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
         2,
     )
     .unwrap();
+    let duplicate_relay_key = SigningSession::begin_sealed(
+        &root.join("duplicate-relay-key"),
+        ctx.clone(),
+        &ak,
+        intent.clone(),
+        Identity::from_secret_bytes(&bob_identity.to_secret_bytes()).unwrap(),
+        bob_key.clone(),
+        public.clone(),
+        fvk.clone(),
+        2,
+        "pass",
+        [([7; 32], [8; 32]), ([7; 32], [10; 32])],
+    );
+    assert!(
+        duplicate_relay_key.is_err(),
+        "one relay signing key must not count as two nonce witnesses"
+    );
     let mut bob = SigningSession::begin_sealed(
         &bob_root,
         ctx.clone(),
@@ -302,6 +319,38 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
     for name in ["started", "nonces.sealed"] {
         fs::copy(bob_attempt.join(name), old_attempt.join(name)).unwrap();
     }
+    let bad_root = root.join("bob-duplicate-relay-key-restore");
+    let bad_attempt = bad_root
+        .join(hex::encode(ctx.payment))
+        .join(hex::encode(ctx.attempt.0));
+    let bad_dir = MemberDir::create(
+        &bad_root.join(hex::encode(ctx.payment)),
+        &hex::encode(ctx.attempt.0),
+    )
+    .unwrap();
+    fs::copy(bob_attempt.join("started"), bad_attempt.join("started")).unwrap();
+    let mut bad_nonces = MemberDir::open(
+        &bob_root.join(hex::encode(ctx.payment)),
+        &hex::encode(ctx.attempt.0),
+    )
+    .read_sealed("nonces.sealed", "pass")
+    .unwrap();
+    bad_nonces[65..97].copy_from_slice(&[7; 32]);
+    bad_dir
+        .write_sealed("nonces.sealed", &bad_nonces, "pass")
+        .unwrap();
+    assert!(SigningSession::reopen_sealed(
+        &bad_root,
+        ctx.clone(),
+        &ak,
+        intent.clone(),
+        Identity::from_secret_bytes(&bob_sender.to_secret_bytes()).unwrap(),
+        bob_key.clone(),
+        public.clone(),
+        fvk.clone(),
+        "pass"
+    )
+    .is_err());
     assert!(SigningSession::reopen_sealed(
         &bob_root,
         ctx.clone(),

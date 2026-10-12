@@ -21,6 +21,7 @@
 set -uo pipefail
 unset LOKI_ROUND
 cd "$(dirname "$0")"
+export LOKI_ALLOW_FIXED_VIEWING_KEY=1
 
 RUN_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/loki-issue3-2dev.XXXXXX") || exit 1
 STATE="${LOKI_STATE:-$RUN_ROOT/state}"

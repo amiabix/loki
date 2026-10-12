@@ -158,10 +158,10 @@ const COMMANDS = [
     note: 'Two payments: one where a finished transaction was posted, one where the finisher re-proves it from a signed candidate and its own chain scan.' },
   { title: 'The signer’s refusals', cmd: 'cd poc\n./tamper-tests.sh',
     note: 'Alters one field of a serialized candidate at a time and asserts the specific refusal plus zero share files.' },
-  { title: 'The ZIP 2005 blocker, as a compiler error', cmd: 'cd poc\ncargo build --features probe-zip2005',
-    note: 'Fails to compile. That failure is the evidence: the derivation full G1 needs does not exist in any crate.' },
-  { title: 'This demo', cmd: 'python3 poc/demo/server.py',
-    note: 'Serves this page on http://127.0.0.1:8787. Read-only, loopback-only, runs nothing.' },
+  { title: 'The separate-member vault', cmd: 'cd poc\npython3 wallet/member_app.py --data /tmp/loki-member-1 --exchange /tmp/loki-exchange --port 8801',
+    note: 'Uses the local ZIP 2005 derivation; regtest only and not independently reviewed.' },
+  { title: 'This legacy demo', cmd: 'LOKI_ALLOW_FIXED_VIEWING_KEY=1 python3 poc/demo/server.py',
+    note: 'Opt-in fixed-key regtest fixture on http://127.0.0.1:8787; it can run local payment stages.' },
 ];
 
 /* ── rendering ───────────────────────────────────────────────────────────── */
@@ -532,7 +532,7 @@ async function main() {
   } catch (e) {
     document.querySelector('main').prepend(
       el('p', 'err', `Could not load evidence: ${e.message}. `
-        + `Start the server with: python3 poc/demo/server.py`),
+        + `Start the server with: LOKI_ALLOW_FIXED_VIEWING_KEY=1 python3 poc/demo/server.py`),
     );
     return;
   }

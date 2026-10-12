@@ -86,14 +86,15 @@ the new roster fingerprint; old 2-of-3 roster files retain their original
 fingerprint. A four-member source vault completed a mined payment with members
 3 and 4 signing and member 2 finishing through `run-member-payment.py
 --members 4 --pair CD --finisher 2`. This is the local courier test path; the
-relay adapter and payment UI remain three-member-only or absent, respectively.
+relay adapter remains three-member-only. The member app can create a local
+payment draft, but it has no verified approval or sending UI.
 
 The app is passphrase-only today. Its local file courier and time-limited,
 non-resumable DKG are development controls, not the planned relay transport.
 Data roots created by the previous one-vault app are left untouched and need an
 explicit migration before this version can open them; use a fresh root to test it.
 Separate directories under one OS account do not isolate a compromised account.
-There is no persistent chain cache, payment or passkey UI in this app yet; use the existing
+There is no persistent chain cache or passkey UI in this app yet; use the existing
 separate-member CLI and harness for transaction testing. Do not use real funds.
 
 Verify the member flow:
