@@ -180,14 +180,15 @@ pub fn scan_chain(rpc: &crate::rpc::Rpc, fvk: &FullViewingKey) -> Result<Chain, 
 /// [`scan_chain`], but only over the blocks that are new since the last run.
 ///
 /// `path` is a file this owns: it holds how far the last scan got, the commitment stream
-/// it collected and the vault's own actions, so a second run reads only the blocks mined
-/// since the first. The result is the same `Chain` a full scan returns — including the
-/// whole commitment stream, which is what [`crate::witness::witness_for`] needs to rebuild
+/// it collected and the vault's own actions, so a second run checks its saved-tip block
+/// and reads blocks mined since the first. The result is the same `Chain` a full scan
+/// returns — including the whole commitment stream, which is what
+/// [`crate::witness::witness_for`] needs to rebuild
 /// the tree and check its root against the node's anchor.
 ///
-/// A chain that has got shorter is treated as a different chain and rescanned from
-/// scratch. A reorg that keeps the same height is not detected here; it surfaces as the
-/// anchor mismatch in `witness_for`, which refuses rather than signs.
+/// A shorter chain, a changed saved-tip block, or a legacy cache without a block hash
+/// is rescanned from scratch. A disconnected chain or a tip that changes during the
+/// scan is refused without replacing the saved state.
 pub fn scan_chain_cached(
     rpc: &crate::rpc::Rpc,
     fvk: &FullViewingKey,
@@ -195,8 +196,13 @@ pub fn scan_chain_cached(
 ) -> Result<Chain, String> {
     let mut state = ScanState::load(path)?;
     scan_to_tip(rpc, fvk, &mut state)?;
+    let notes = state.notes(fvk)?;
     state.save(path)?;
-    state.into_chain(fvk)
+    Ok(Chain {
+        notes,
+        cmxs: state.cmxs,
+        tip: state.tip,
+    })
 }
 
 /// Bring `state` up to the node's current tip.
@@ -219,6 +225,7 @@ fn scan_to_tip(
 ///
 /// `get_block` is the only thing this needs from the node, which is what lets a test run
 /// the real scan over a canned chain.
+/// Discard `state` on error; an interrupted block may have added some actions.
 pub fn scan_blocks<F>(
     fvk: &FullViewingKey,
     state: &mut ScanState,
@@ -228,15 +235,24 @@ pub fn scan_blocks<F>(
 where
     F: Fn(u64) -> Result<serde_json::Value, String>,
 {
-    // A chain shorter than the one we remember is not the chain we scanned, and nothing
-    // in the stored state can be trusted to still be on it.
-    if to < state.tip {
+    // A saved height alone cannot identify a chain after a reorg.
+    if to < state.tip
+        || (state.tip > 0
+            && (state.tip_hash.is_none()
+                || Some(block_hash(&get_block(state.tip)?, state.tip)?) != state.tip_hash))
+    {
         *state = ScanState::default();
     }
 
     let ivks = vault_ivks(fvk);
     for height in state.tip + 1..=to {
         let block = get_block(height)?;
+        let hash = block_hash(&block, height)?;
+        if let Some(parent) = state.tip_hash {
+            if hex32(&block, "previousblockhash") != Some(parent) {
+                return Err(format!("block {height} does not extend the scanned chain"));
+            }
+        }
         for tx in block["tx"].as_array().ok_or("block has no tx array")? {
             let txid = tx["txid"].as_str().unwrap_or("?").to_string();
             let actions = match tx["ironwood"]["actions"].as_array() {
@@ -248,9 +264,17 @@ where
             state.push(fvk, &ivks, height as u32, &txid, &raws);
         }
         state.tip = height;
+        state.tip_hash = Some(hash);
+    }
+    if to > 0 && Some(block_hash(&get_block(to)?, to)?) != state.tip_hash {
+        return Err(format!("block {to} changed during the scan"));
     }
 
     Ok(())
+}
+
+fn block_hash(block: &serde_json::Value, height: u64) -> Result<[u8; 32], String> {
+    hex32(block, "hash").ok_or_else(|| format!("block {height} has no valid hash"))
 }
 
 /// One transaction's Ironwood actions, as the node's JSON reports them.

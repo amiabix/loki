@@ -15,6 +15,7 @@ use std::io::Write as _;
 use std::path::Path;
 
 use orchard::keys::{FullViewingKey, PreparedIncomingViewingKey};
+use rand_core::{OsRng, RngCore};
 
 use crate::scan::{vault_ivks, vault_note_at, Chain, RawAction, VaultNote};
 
@@ -36,6 +37,8 @@ pub struct ScanState {
     /// The last block height whose actions are already recorded here. `0` means nothing
     /// has been scanned, which is also what the first run sees.
     pub tip: u64,
+    /// The canonical hash of `tip`; absent in legacy cache files.
+    pub tip_hash: Option<[u8; 32]>,
     /// Every Ironwood commitment up to `tip`, in append order.
     pub cmxs: Vec<[u8; 32]>,
     /// Every nullifier revealed up to `tip`, in the same order as `cmxs`. A vault note
@@ -127,7 +130,18 @@ impl ScanState {
             let mut f = line.split_whitespace();
             match f.next() {
                 None => continue,
-                Some("tip") => state.tip = f.next().and_then(|v| v.parse().ok()).ok_or_else(bad)?,
+                Some("tip") => {
+                    state.tip = f.next().and_then(|v| v.parse().ok()).ok_or_else(bad)?;
+                    state.tip_hash = match f.next() {
+                        Some(hash) => Some(
+                            hex::decode(hash)
+                                .ok()
+                                .and_then(|v| v.try_into().ok())
+                                .ok_or_else(bad)?,
+                        ),
+                        None => None,
+                    };
+                }
                 Some("c") => {
                     state.cmxs.push(field(&mut f).ok_or_else(bad)?);
                     state.nfs.push(field(&mut f).ok_or_else(bad)?);
@@ -167,32 +181,55 @@ impl ScanState {
     /// with `grep` when a scan disagrees with the node.
     pub fn save(&self, path: &Path) -> Result<(), String> {
         let io = |e: std::io::Error| format!("{}: {e}", path.display());
-        let f = std::fs::File::create(path).map_err(io)?;
-        let mut out = std::io::BufWriter::new(f);
+        let mut random = [0u8; 8];
+        OsRng.fill_bytes(&mut random);
+        let temp = path.with_extension(format!("{}.tmp", hex::encode(random)));
+        let result = (|| {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let f = options.open(&temp).map_err(io)?;
+            let mut out = std::io::BufWriter::new(f);
 
-        writeln!(out, "tip {}", self.tip).map_err(io)?;
-        for (c, nf) in self.cmxs.iter().zip(self.nfs.iter()) {
-            writeln!(out, "c {} {}", hex::encode(c), hex::encode(nf)).map_err(io)?;
+            if let Some(hash) = self.tip_hash {
+                writeln!(out, "tip {} {}", self.tip, hex::encode(hash)).map_err(io)?;
+            } else {
+                writeln!(out, "tip {}", self.tip).map_err(io)?;
+            }
+            for (c, nf) in self.cmxs.iter().zip(self.nfs.iter()) {
+                writeln!(out, "c {} {}", hex::encode(c), hex::encode(nf)).map_err(io)?;
+            }
+            for n in &self.found {
+                let a = &n.action;
+                writeln!(
+                    out,
+                    "n {} {} {} {} {} {} {} {} {} {}",
+                    n.height,
+                    n.position,
+                    n.txid,
+                    hex::encode(a.cv),
+                    hex::encode(a.nullifier),
+                    hex::encode(a.rk),
+                    hex::encode(a.cmx),
+                    hex::encode(a.ephemeral_key),
+                    hex::encode(&a.enc_ciphertext),
+                    hex::encode(a.out_ciphertext),
+                )
+                .map_err(io)?;
+            }
+            out.flush().map_err(io)?;
+            out.get_ref().sync_all().map_err(io)?;
+            std::fs::rename(&temp, path).map_err(io)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp);
         }
-        for n in &self.found {
-            let a = &n.action;
-            writeln!(
-                out,
-                "n {} {} {} {} {} {} {} {} {} {}",
-                n.height,
-                n.position,
-                n.txid,
-                hex::encode(a.cv),
-                hex::encode(a.nullifier),
-                hex::encode(a.rk),
-                hex::encode(a.cmx),
-                hex::encode(a.ephemeral_key),
-                hex::encode(&a.enc_ciphertext),
-                hex::encode(a.out_ciphertext),
-            )
-            .map_err(io)?;
-        }
-        out.flush().map_err(io)
+        result
     }
 }
 
@@ -259,7 +296,15 @@ mod tests {
     /// Vault notes sit behind decoys, in more than one block and more than one
     /// transaction, so a wrong position would not survive by luck.
     fn canned_chain(vault: &FullViewingKey, decoy: &FullViewingKey) -> Vec<serde_json::Value> {
-        let block = |txs: Vec<serde_json::Value>| serde_json::json!({ "tx": txs });
+        let mut height = 0u8;
+        let mut block = |txs: Vec<serde_json::Value>| {
+            height += 1;
+            serde_json::json!({
+                "hash": format!("{:064x}", height),
+                "previousblockhash": format!("{:064x}", height - 1),
+                "tx": txs,
+            })
+        };
         vec![
             block(vec![serde_json::json!({ "txid": "coinbase" })]),
             block(vec![tx(
@@ -277,6 +322,133 @@ mod tests {
             ]),
             block(vec![]),
         ]
+    }
+
+    fn rebranch(chain: &mut [serde_json::Value], from: usize) {
+        for i in from..chain.len() {
+            chain[i]["hash"] = serde_json::json!(format!("{:064x}", i + 101));
+            chain[i]["previousblockhash"] =
+                serde_json::json!(format!("{:064x}", if i == from { i } else { i + 100 }));
+        }
+    }
+
+    #[test]
+    fn same_height_reorg_recomputes_spentness_even_with_unchanged_commitments() {
+        let vault = a_fvk(3);
+        let decoy = a_fvk(9);
+        let mut chain = canned_chain(&vault, &decoy);
+        let mut state = ScanState::default();
+        scan_blocks(&vault, &mut state, 6, |h| Ok(chain[h as usize - 1].clone())).unwrap();
+        let spent = state.notes(&vault).unwrap()[0].nullifier;
+        let old_cmxs = state.cmxs.clone();
+        let path = std::env::temp_dir().join(format!("loki-reorg-{}.txt", std::process::id()));
+        state.save(&path).unwrap();
+        let mut state = ScanState::load(&path).unwrap();
+
+        // The replacement action spends a vault note but appends the same commitment.
+        chain[4]["tx"][1]["ironwood"]["actions"][0]["nullifier"] =
+            serde_json::json!(hex::encode(spent));
+        rebranch(&mut chain, 4);
+        scan_blocks(&vault, &mut state, 6, |h| Ok(chain[h as usize - 1].clone())).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        assert_eq!(state.cmxs, old_cmxs);
+        let notes = state.notes(&vault).unwrap();
+        assert_eq!(notes.len(), 2);
+        assert!(notes.iter().all(|note| note.nullifier != spent));
+    }
+
+    #[test]
+    fn earlier_reorg_followed_by_growth_replaces_old_notes() {
+        let vault = a_fvk(3);
+        let decoy = a_fvk(9);
+        let mut chain = canned_chain(&vault, &decoy);
+        let mut state = ScanState::default();
+        scan_blocks(&vault, &mut state, 6, |h| Ok(chain[h as usize - 1].clone())).unwrap();
+        chain[1]["tx"][0]["ironwood"]["actions"][1] = action_json(&vault, 150, 12);
+        rebranch(&mut chain, 1);
+        chain.push(serde_json::json!({
+            "hash": format!("{:064x}", 107),
+            "previousblockhash": format!("{:064x}", 106),
+            "tx": [],
+        }));
+
+        scan_blocks(&vault, &mut state, 7, |h| Ok(chain[h as usize - 1].clone())).unwrap();
+        let notes = state.notes(&vault).unwrap();
+        assert_eq!(notes.len(), 3);
+        assert_eq!(notes[0].value_zat, 150);
+    }
+
+    #[test]
+    fn legacy_cache_without_tip_hash_is_rescanned() {
+        let vault = a_fvk(3);
+        let decoy = a_fvk(9);
+        let chain = canned_chain(&vault, &decoy);
+        let path = std::env::temp_dir().join(format!("loki-legacy-{}.txt", std::process::id()));
+        std::fs::write(&path, "tip 6\n").unwrap();
+        let mut state = ScanState::load(&path).unwrap();
+        scan_blocks(&vault, &mut state, 6, |h| Ok(chain[h as usize - 1].clone())).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(state.notes(&vault).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn disconnected_or_malformed_block_is_rejected() {
+        let vault = a_fvk(3);
+        let decoy = a_fvk(9);
+        let mut chain = canned_chain(&vault, &decoy);
+        chain[3]["previousblockhash"] = serde_json::json!("ff".repeat(32));
+        let mut state = ScanState::default();
+        assert!(scan_blocks(&vault, &mut state, 6, |h| Ok(chain[h as usize - 1].clone())).is_err());
+
+        let mut chain = canned_chain(&vault, &decoy);
+        chain[1]["hash"] = serde_json::json!("bad hash");
+        let mut state = ScanState::default();
+        assert!(scan_blocks(&vault, &mut state, 6, |h| Ok(chain[h as usize - 1].clone())).is_err());
+    }
+
+    #[test]
+    fn changed_tip_during_scan_is_rejected_without_touching_saved_cache() {
+        let vault = a_fvk(3);
+        let decoy = a_fvk(9);
+        let chain = canned_chain(&vault, &decoy);
+        let path = std::env::temp_dir().join(format!("loki-race-{}.txt", std::process::id()));
+        let mut saved = ScanState::default();
+        scan_blocks(&vault, &mut saved, 3, |h| Ok(chain[h as usize - 1].clone())).unwrap();
+        saved.save(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let mut resumed = ScanState::load(&path).unwrap();
+        let reads_of_tip = std::cell::Cell::new(0);
+        let result = scan_blocks(&vault, &mut resumed, 6, |h| {
+            let mut block = chain[h as usize - 1].clone();
+            if h == 6 {
+                reads_of_tip.set(reads_of_tip.get() + 1);
+                if reads_of_tip.get() > 1 {
+                    block["hash"] = serde_json::json!("ff".repeat(32));
+                }
+            }
+            Ok(block)
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn saving_replaces_cache_without_truncating_its_previous_inode() {
+        let path = std::env::temp_dir().join(format!("loki-atomic-{}.txt", std::process::id()));
+        let linked = path.with_extension("linked");
+        let state = ScanState::default();
+        state.save(&path).unwrap();
+        std::fs::hard_link(&path, &linked).unwrap();
+        let prior = std::fs::read(&linked).unwrap();
+        let mut newer = ScanState::default();
+        newer.tip = 1;
+        newer.save(&path).unwrap();
+        assert_eq!(std::fs::read(&linked).unwrap(), prior);
+        assert_ne!(std::fs::read(&path).unwrap(), prior);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&linked).unwrap();
     }
 
     /// The whole point: stopping, saving, and resuming must land on exactly the chain a
@@ -297,7 +469,7 @@ mod tests {
 
         let mut full = ScanState::default();
         scan_blocks(&vault, &mut full, 6, get).unwrap();
-        assert_eq!(fetched.get(), 6, "a full scan reads every block");
+        assert_eq!(fetched.get(), 7, "a full scan rechecks its tip");
 
         // Two runs with the state written and read back between them, which is what two
         // separate processes would do.
@@ -315,8 +487,8 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert_eq!(
             fetched.get(),
-            3,
-            "the resumed scan reads only blocks 4, 5 and 6"
+            5,
+            "the resumed scan checks the old tip, new blocks, and final tip"
         );
 
         assert_eq!(part.tip, full.tip);
@@ -398,7 +570,11 @@ mod tests {
         // The next action spends that note and sends its output to another account.
         let mut action = action_json(&decoy, 1, 20);
         action["nullifier"] = serde_json::json!(hex::encode(spent));
-        chain.push(serde_json::json!({ "tx": [tx("spend", vec![action])] }));
+        chain.push(serde_json::json!({
+            "hash": format!("{:064x}", 7),
+            "previousblockhash": format!("{:064x}", 6),
+            "tx": [tx("spend", vec![action])],
+        }));
         scan_blocks(&vault, &mut state, 7, |h| {
             chain
                 .get(h as usize - 1)
