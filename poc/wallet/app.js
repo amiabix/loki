@@ -64,8 +64,14 @@ function vaultList(vaults) {
   for (const vault of vaults) {
     const button = document.createElement('button');
     button.type = 'button';
-    button.className = 'secondary';
-    button.textContent = `${vault.name} · member ${vault.slot}`;
+    button.className = 'vault-row';
+    const name = document.createElement('strong');
+    name.className = 'vault-name';
+    name.textContent = vault.name;
+    const meta = document.createElement('span');
+    meta.className = 'vault-meta';
+    meta.textContent = `Member ${vault.slot} · ${vault.threshold ?? 2} of ${vault.members ?? 3}`;
+    button.append(name, meta);
     button.addEventListener('click', () => { selectVault(vault.vault); refresh(); });
     list.append(button);
   }
@@ -234,15 +240,35 @@ async function refreshSignerRequests(unlocked) {
   }
   actionsSection.hidden = !actions.length;
 }
+const steps = {
+  new_profile: ['', 'Create your profile'],
+  locked: ['', 'Unlock your profile'],
+  home: ['', 'Your vaults'],
+  waiting_for_members: ['Setup · step 2 of 6', 'Waiting for the other members'],
+  compare_roster: ['Setup · step 3 of 6', 'Compare the roster fingerprint'],
+  creating_keys: ['Setup · step 4 of 6', 'Creating the group keys'],
+  back_up: ['Setup · step 5 of 6', 'Save your words and first card'],
+  waiting_for_backups: ['Setup · step 5 of 6', 'Waiting for the other members to check their cards'],
+  final_backup: ['Setup · step 6 of 6', 'Save your final recovery card'],
+  active: ['', 'Receive and pay'],
+  stopped: ['', 'Setup stopped'],
+};
 async function refresh() {
   try {
     const state = await api('status' + (selectedVault ? `?vault=${encodeURIComponent(selectedVault)}` : ''));
     if ((state.phase === 'new_profile' || state.phase === 'locked') && selectedVault) selectVault(null);
     for (const id of ['new-profile', 'locked', 'home', 'invites', 'connect-account', 'setup', 'backup', 'waiting', 'final-backup', 'active']) $(id).hidden = true;
-    $('back').hidden = !selectedVault;
+    const inVault = !!selectedVault;
+    $('back').hidden = !inVault;
     $('lock').hidden = !state.profile && state.phase !== 'home';
+    $('vault-chip').hidden = !inVault;
+    if (inVault) $('vault-chip').textContent = `MEMBER ${state.slot}`;
     $('title').textContent = state.name || state.profile?.name || 'Your signer';
-    $('subtitle').textContent = selectedVault ? `Member ${state.slot} · ${state.threshold} of ${state.total_members} · regtest` : 'One local profile, separate keys for each vault.';
+    $('subtitle').textContent = inVault ? `${state.threshold} of ${state.total_members} · regtest` : 'One local profile, separate keys for each vault.';
+    const [kicker, headline] = steps[state.phase] || ['', ''];
+    $('kicker').textContent = kicker;
+    $('kicker').hidden = !kicker;
+    $('headline').textContent = headline;
     $('linked-account').hidden = !state.account_ak;
     if (state.account_ak) $('linked-account').textContent = `Proved Orchard account key: ${state.account_ak.slice(0, 16)}…`;
     if (state.phase === 'new_profile') $('new-profile').hidden = false;
@@ -402,6 +428,39 @@ action('payment-draft', async (form) => {
 $('refresh-payments').addEventListener('click', async () => {
   try { await api('payment-sync', {vault: selectedVault}); await refreshPayments(); }
   catch (error) { message(error.message, true); }
+});
+/* ── theme ──────────────────────────────────────────────────────────────────
+   No stored choice means follow the system, which the stylesheet's media query
+   already does; a stored choice pins data-theme on the root and wins.
+
+   Storage throws rather than returning null in private browsing, in embedded
+   webviews and under storage policy, so both sides fail quiet: a theme
+   preference is not worth taking the page down for. */
+
+const THEME_KEY = 'loki-theme';
+const themeStore = {
+  read() { try { return localStorage.getItem(THEME_KEY); } catch { return null; } },
+  write(value) { try { localStorage.setItem(THEME_KEY, value); } catch { /* not fatal */ } },
+};
+
+function currentTheme() {
+  return document.documentElement.dataset.theme
+    || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+}
+
+function applyTheme(mode) {
+  if (mode) document.documentElement.dataset.theme = mode;
+  $('theme').textContent = currentTheme() === 'dark' ? 'Light' : 'Dark';  /* offers the other */
+}
+
+applyTheme(themeStore.read());
+$('theme').addEventListener('click', () => {
+  const next = currentTheme() === 'dark' ? 'light' : 'dark';
+  themeStore.write(next);
+  applyTheme(next);
+});
+matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => {
+  if (!themeStore.read()) applyTheme(null);
 });
 $('back').addEventListener('click', () => { selectVault(null); refresh(); });
 $('lock').addEventListener('click', async () => {

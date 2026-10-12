@@ -885,6 +885,9 @@ class Wallet:
         self.process_lock.close()
 
 
+FONTS = ("/fonts/geist.woff2", "/fonts/geist-mono.woff2", "/fonts/young-serif.woff2")
+
+
 def make_signer_server(wallet, port, dashboard_port=None):
     token = secrets.token_urlsafe(32)
     dashboard_origin = f"http://127.0.0.1:{dashboard_port}" if dashboard_port else None
@@ -935,21 +938,30 @@ def make_signer_server(wallet, port, dashboard_port=None):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Cache-Control", "no-store")
-                self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'")
+                self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'")
                 self.end_headers()
                 self.wfile.write(page)
                 return
             if path == "/app.js":
                 self.send_response(200)
                 self.send_header("Content-Type", "text/javascript; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write((HERE / "app.js").read_bytes())
                 return
             if path == "/app.css":
                 self.send_response(200)
                 self.send_header("Content-Type", "text/css; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write((HERE / "app.css").read_bytes())
+                return
+            if path in FONTS:
+                self.send_response(200)
+                self.send_header("Content-Type", "font/woff2")
+                self.send_header("Cache-Control", "max-age=86400")
+                self.end_headers()
+                self.wfile.write((HERE / path.lstrip("/")).read_bytes())
                 return
             if path == "/api/session/vaults":
                 key = self.headers.get("X-Loki-Session", "")
@@ -1106,7 +1118,8 @@ def make_dashboard_server(signer_port, port):
                 return
             assets = {"/": ("dashboard.html", "text/html; charset=utf-8"),
                       "/dashboard.js": ("dashboard.js", "text/javascript; charset=utf-8"),
-                      "/app.css": ("app.css", "text/css; charset=utf-8")}
+                      "/app.css": ("app.css", "text/css; charset=utf-8"),
+                      **{font: (font.lstrip("/"), "font/woff2") for font in FONTS}}
             if self.path not in assets:
                 self.send_error(404)
                 return
@@ -1119,7 +1132,7 @@ def make_dashboard_server(signer_port, port):
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'self'; "
-                             f"style-src 'self'; connect-src 'self' {signer_origin}")
+                             f"style-src 'self'; font-src 'self'; connect-src 'self' {signer_origin}")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
