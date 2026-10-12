@@ -213,7 +213,8 @@ async function refresh() {
     $('kicker').textContent = kicker;
     $('headline').textContent = headline;
     $('title').textContent = state.name || 'Your wallet';
-    $('slot').textContent = state.slot ? `0${state.slot}` : '—';
+    $('slot').textContent = state.slot ? `0${state.slot}` : '';
+    $('slot').hidden = !state.slot;
     $('subtitle').textContent = state.slot ? `Member ${state.slot} of 3 · threshold 2 · regtest` : 'Create or join a vault from this member’s own app.';
     drawSigil(state.fingerprint || '');
     if (state.invites) {
