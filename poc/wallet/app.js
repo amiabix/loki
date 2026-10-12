@@ -40,9 +40,8 @@ const show = (() => {
     if (current) $(current).hidden = true;
     if (id) $(id).hidden = false;
     current = id;
-    /* the column scrolls inside the shell, so a shorter step would otherwise
-       open halfway down the page; move the reader to the top of the new one */
-    document.querySelector('main').scrollTop = 0;
+    /* a shorter step would otherwise open halfway down; take the reader to it */
+    window.scrollTo({top: 0});
     if (id) $(id).focus({preventScroll: true});
   };
 })();

@@ -8,31 +8,26 @@
   <script src="/app.js" defer></script>
 </head>
 <body>
-<div class="shell">
-<aside class="rail">
-  <strong class="brand">◇ Loki</strong>
-
-  <div class="identity">
-    <span class="slot" id="slot">—</span>
-    <h1 id="title">Your wallet</h1>
-    <p class="muted" id="subtitle">Create or join a vault from this member's own app.</p>
+<header class="top">
+  <div class="band top-row">
+    <strong class="brand">◇ Loki</strong>
+    <div class="who">
+      <span class="slot" id="slot" hidden></span>
+      <h1 id="title">Your wallet</h1>
+      <p class="muted" id="subtitle">Create or join a vault from this member's own app.</p>
+    </div>
+    <button type="button" class="theme" id="theme">Light</button>
   </div>
-
-  <ol class="steps" id="steps" aria-label="Setup progress">
+  <ol class="steps band" id="steps" aria-label="Setup progress">
     <li data-step="0">Create or join</li>
     <li data-step="1">Compare roster</li>
     <li data-step="2">Group keys</li>
     <li data-step="3">Back up</li>
     <li data-step="4">Active</li>
   </ol>
+</header>
 
-  <div class="rail-foot">
-    <span>One member · regtest setup</span>
-    <button type="button" class="theme" id="theme">Light</button>
-  </div>
-</aside>
-
-<main>
+<main class="band">
   <p class="step-kicker" id="kicker">Step 01 of 05</p>
   <h2 class="step-title" id="headline" aria-live="polite">Start or join a vault</h2>
   <p id="message" role="status" hidden></p>
@@ -49,6 +44,5 @@
   <section class="card" id="active" tabindex="-1" hidden><h2>Vault address</h2><p id="address" class="muted">Unlock to view the address.</p><button type="button" class="copy secondary" data-copy="address" hidden>Copy address</button><form id="show-address"><label>Your unlock passphrase<input name="passphrase" type="password" autocomplete="current-password" required></label><button>Show receive address</button></form></section>
   <p class="muted">Regtest setup build. No real funds. Payments still run through the separate member CLI.</p>
 </main>
-</div>
 </body>
 </html>
