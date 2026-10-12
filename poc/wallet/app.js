@@ -40,6 +40,10 @@ const show = (() => {
     if (current) $(current).hidden = true;
     if (id) $(id).hidden = false;
     current = id;
+    /* the column scrolls inside the shell, so a shorter step would otherwise
+       open halfway down the page; move the reader to the top of the new one */
+    document.querySelector('main').scrollTop = 0;
+    if (id) $(id).focus({preventScroll: true});
   };
 })();
 
@@ -72,7 +76,9 @@ function echo(typed) {
   const expected = $('fingerprint').textContent.trim();
   const line = $('echo');
   const clean = typed.trim();
-  if (!clean || !expected || expected.includes(' when all three join')) {
+  /* keyed off the element's own flag, not off the placeholder sentence: the
+     copy can change without silently turning this into a diff against prose */
+  if (!clean || !$('fingerprint').dataset.live) {
     line.hidden = true;
     return;
   }
@@ -100,7 +106,7 @@ const HEADLINE = {
   back_up: ['Step 04 of 05', 'Back up your share'],
   waiting_for_backups: ['Step 04 of 05', 'Waiting for the other backups'],
   active: ['Step 05 of 05', 'The vault is live'],
-  stopped: ['Setup stopped', 'Start a fresh vault session'],
+  stopped: ['Setup stopped', 'Key creation stopped'],
 };
 
 const STEP = {
@@ -114,15 +120,64 @@ function steps(phase) {
     const index = Number(item.dataset.step);
     item.classList.toggle('done', at !== undefined && index < at);
     item.classList.toggle('now', index === at);
+    if (index === at) item.setAttribute('aria-current', 'step');
+    else item.removeAttribute('aria-current');
   }
 }
+
+/* ── flip ───────────────────────────────────────────────────────────────────
+   Characters scramble and settle left to right as a value lands. Used only on
+   values that actually arrive — the roster fingerprint, the receive address,
+   the step counter — never as idle decoration.
+
+   Two rules it must not break: the element always ends holding exactly the
+   string it was given, and a newer flip cancels an older one, so a value can
+   never be left half-scrambled by an overlapping call. */
+
+const FLIP_GLYPHS = '0123456789abcdefghijklmnopqrstuvwxyz';
+const FLIP_FRAMES = 2;   /* frames each character waits before it settles */
+
+function flipInto(element, text) {
+  const calm = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (calm || element.textContent === text || !text) {
+    element.textContent = text;
+    return;
+  }
+  const chars = [...text];
+  const run = String(Number(element.dataset.flip || 0) + 1);
+  element.dataset.flip = run;
+  let frame = 0;
+  const tick = () => {
+    if (element.dataset.flip !== run) return;     /* a newer value took over */
+    frame += 1;
+    const settled = Math.floor(frame / FLIP_FRAMES);
+    if (settled >= chars.length) {
+      element.textContent = text;                 /* exact, always */
+      return;
+    }
+    element.textContent = chars
+      .map((character, index) => (index < settled || character === ' '
+        ? character
+        : FLIP_GLYPHS[Math.floor(Math.random() * FLIP_GLYPHS.length)]))
+      .join('');
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+}
+
+let lastPhase = null;
+let lastPrint = null;
 
 async function refresh() {
   try {
     const state = await api('status');
+    if (state.phase !== lastPhase) {
+      if (lastPhase !== null) message('');   /* belongs to the step that ended */
+      lastPhase = state.phase;
+    }
     steps(state.phase);
     const [kicker, headline] = HEADLINE[state.phase] || ['', ''];
-    $('kicker').textContent = kicker;
+    flipInto($('kicker'), kicker);
     $('headline').textContent = headline;
     $('title').textContent = state.name || 'Your wallet';
     $('slot').textContent = state.slot ? `0${state.slot}` : '';
@@ -131,8 +186,10 @@ async function refresh() {
     if (state.invites) {
       $('invite2').textContent = state.invites[0];
       $('invite3').textContent = state.invites[1];
-      $('invites').hidden = state.phase === 'active';
+      /* the codes are only of use while someone still has to join */
+      $('invites').hidden = state.phase !== 'waiting_for_members';
     }
+    $('fingerprint').dataset.live = state.fingerprint ? '1' : '';
     if (state.phase === 'new') show('new');
     else if (state.phase === 'waiting_for_members') {
       show('setup');
@@ -143,11 +200,26 @@ async function refresh() {
       show('setup');
       $('agree').hidden = state.phase === 'creating_keys';
       $('progress').textContent = state.phase === 'creating_keys' ? 'Creating group keys with the other member apps…' : 'All three members joined.';
-      $('fingerprint').textContent = state.fingerprint;
+      if (state.fingerprint !== lastPrint) {
+        lastPrint = state.fingerprint;
+        flipInto($('fingerprint'), state.fingerprint);
+      }
     } else if (state.phase === 'back_up') show('backup');
     else if (state.phase === 'waiting_for_backups') show('waiting');
     else if (state.phase === 'active') show('active');
-    else if (state.phase === 'stopped') { show(null); message('Setup stopped: ' + state.error + '. Start a fresh vault session.', true); }
+    else if (state.phase === 'stopped') {
+      /* agree() clears the error and starts a fresh round, so the retry has to
+         stay reachable; hiding every card left the only way out off screen */
+      if (state.fingerprint) {
+        show('setup');
+        $('agree').hidden = false;
+        $('progress').textContent = 'Key creation stopped. Confirm the roster again to retry.';
+        $('fingerprint').textContent = state.fingerprint;
+      } else {
+        show(null);
+      }
+      message('Setup stopped: ' + state.error, true);
+    }
     /* only offer a copy once a real address has replaced the placeholder */
     document.querySelector('[data-copy="address"]').hidden = !$('address').dataset.ready;
     if (state.error) message(state.error, true);
@@ -186,7 +258,7 @@ action('check-backup', async (form) => {
   message('Your backup checked. Waiting for the other members.');
 });
 function showAddress(address) {
-  $('address').textContent = address;
+  flipInto($('address'), address);
   $('address').classList.remove('muted');
   $('address').dataset.ready = '1';
   document.querySelector('[data-copy="address"]').hidden = false;
