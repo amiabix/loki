@@ -4,6 +4,7 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 DEMO = Path(__file__).resolve().parent
@@ -174,6 +175,46 @@ class PublicReportTest(unittest.TestCase):
         self.assertEqual(stored["result"], "passed")
         public = verify.build_report(both, forbidden=("secret-token",))
         self.assertEqual(public["approver_stored"], {"alice": True, "bob": True})
+
+    def test_stored_exit_tracks_the_selected_pair(self):
+        payment = {"events": [], "network": {"stored": 2}, "state": {
+            "phase": "confirmed", "payment": {"pair": ("bob", "carol")},
+            "approver_stored": {"alice": False, "bob": True, "carol": True}}}
+        report = verify.assemble(payment, {}, {"mailbox_denial": True}, True,
+                                 {"source_revision": "abc", "binary_hashes": {}})
+        self.assertEqual(report["approver_stored"], {"bob": True, "carol": True})
+        scenario = next(item for item in report["scenarios"]
+                        if item["name"] == "payment_stored_before_approver_exit")
+        self.assertEqual(scenario["result"], "passed")
+
+    def test_verifier_drives_staged_actions_for_dynamic_roles(self):
+        states = iter([
+            {"phase": "creating_vault"}, {"phase": "vault_ready"},
+            {"phase": "funded", "vaults": {"recipient": "uregtest1local"}},
+            {"phase": "waiting_for_reviews"}, {"phase": "ready_to_send"},
+            {"phase": "confirmed", "txid": "a" * 64},
+        ])
+        calls = []
+        def request(base, method, path, token, body=None):
+            if method == "POST":
+                calls.append((path, token, body))
+                return {}
+            if path == "/api/state":
+                if token != "alice-token":
+                    return {"own_status": "reviewing"}
+                return next(states)
+            if path == "/api/relay/state":
+                return {"stored": 2}
+            return {"events": [], "next": 0}
+        with patch.object(verify, "_request", side_effect=request), patch.object(verify.time, "sleep"):
+            report = verify.drive_payment("http://localhost", {
+                "alice": "alice-token", "bob": "bob-token", "carol": "carol-token"},
+                verify.time.monotonic() + 10, pair="BC", proposer="alice")
+        self.assertEqual([call[0] for call in calls], ["/api/create-vault", "/api/fund",
+                         "/api/propose", "/api/decide", "/api/decide", "/api/finish"])
+        self.assertEqual(calls[2][2]["pair"], "BC")
+        self.assertEqual([calls[3][1], calls[4][1]], ["bob-token", "carol-token"])
+        self.assertEqual(report["state"]["phase"], "confirmed")
 
     def test_unexecuted_scenario_does_not_pass(self):
         scenarios = [

@@ -3,6 +3,7 @@ use loki_relay_protocol::{
     canonical::{self, Value},
     envelope,
     http::{decode_append_update, decode_creation},
+    nonce::{self, NonceReceipt},
     receipt,
     types::{CreationResult, Id32, Object, ReceiptBody, RelayPin},
 };
@@ -15,6 +16,8 @@ const MAILBOX_SCHEMA: &str = "-- Mailbox schema is installed transactionally on 
 
 const OBJECT_SCHEMA: &str =
     "-- Object schema is installed after mailbox authentication, including existing roots.\n";
+const NONCE_SCHEMA: &str =
+    "-- First-writer-wins nonce claims survive relay restarts for the lifetime of this root.\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Limits {
@@ -152,6 +155,113 @@ impl Limits {
 }
 
 impl RelayStore {
+    /// Atomically claim a commitment ID. A duplicate is reported as `created=false`,
+    /// even when its encrypted record is identical: it must never authorize re-signing.
+    pub fn claim_nonce(
+        &mut self,
+        mailbox: Id32,
+        cid: Id32,
+        challenge: Id32,
+        wire: &[u8],
+        owner_read: &Capability,
+    ) -> RelayResult<(bool, Vec<u8>)> {
+        if wire.is_empty() || wire.len() > nonce::MAX_RECORD || challenge == [0; 32] {
+            return Err(RelayError::MalformedRequest);
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let verifier: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT read_verifier FROM mailboxes WHERE id=?1",
+                [mailbox.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| RelayError::Capability)?;
+        let verifier: Id32 = verifier
+            .ok_or(RelayError::Capability)?
+            .try_into()
+            .map_err(|_| RelayError::StorageUnavailable)?;
+        if !owner_read.verify(Role::Read, mailbox, &verifier) {
+            return Err(RelayError::Capability);
+        }
+        tx.execute_batch(
+            SCHEMA
+                .split_once(NONCE_SCHEMA)
+                .ok_or(RelayError::StorageUnavailable)?
+                .1,
+        )?;
+        let record_hash: Id32 = Sha256::digest(wire).into();
+        let old: Option<(Vec<u8>, Vec<u8>)> = tx
+            .query_row(
+                "SELECT record_hash,wire FROM nonce_uses WHERE mailbox=?1 AND cid=?2",
+                params![mailbox.as_slice(), cid.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let created =
+            match old {
+                Some((hash, prior)) => {
+                    if hash != record_hash || prior != wire {
+                        return Err(RelayError::Conflict);
+                    }
+                    false
+                }
+                None => {
+                    let length = wire.len() as u64;
+                    let (used, quota): (u64, u64) = tx.query_row(
+                        "SELECT used_bytes,byte_quota FROM mailboxes WHERE id=?1",
+                        [mailbox.as_slice()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )?;
+                    let (total, limit): (u64, u64) = tx.query_row(
+                        "SELECT used_bytes,total_bytes FROM metadata WHERE singleton=1",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )?;
+                    let add = |value: u64, bound: u64| {
+                        value
+                            .checked_add(length)
+                            .filter(|next| *next <= bound && *next <= i64::MAX as u64)
+                            .ok_or(RelayError::QuotaExhausted)
+                    };
+                    let next_used = add(used, quota)?;
+                    let next_total = add(total, limit)?;
+                    tx.execute(
+                    "INSERT INTO nonce_uses (mailbox,cid,record_hash,wire) VALUES (?1,?2,?3,?4)",
+                    params![mailbox.as_slice(), cid.as_slice(), record_hash.as_slice(), wire],
+                )?;
+                    tx.execute(
+                        "UPDATE mailboxes SET used_bytes=?1 WHERE id=?2",
+                        params![next_used, mailbox.as_slice()],
+                    )?;
+                    tx.execute(
+                        "UPDATE metadata SET used_bytes=?1 WHERE singleton=1",
+                        [next_total],
+                    )?;
+                    true
+                }
+            };
+        let body = nonce::encode_body(&NonceReceipt {
+            pin: RelayPin {
+                key: self.root.public_key,
+                run: self.root.run_id,
+            },
+            mailbox,
+            cid,
+            record_hash,
+            challenge,
+            created,
+        })?;
+        let signature = self.root.sign_nonce_receipt(&body)?;
+        let receipt = canonical::encode(&Value::Array(vec![
+            Value::Bytes(body),
+            Value::Bytes(signature.to_vec()),
+        ]))?;
+        tx.commit()?;
+        Ok((created, receipt))
+    }
     /// Create a new root with a fresh receipt seed and caller-supplied provisioning material.
     /// The caller computes the protocol provisioning verifier; this layer only persists it.
     pub fn init(
@@ -752,6 +862,44 @@ mod fault_tests {
     }
     fn put(store: &mut RelayStore, object: &Object) -> RelayResult<StoredResult> {
         store.put([1; 32], object, &Capability::new([3; 32]))
+    }
+
+    #[test]
+    fn nonce_claim_is_first_writer_wins_across_restart() {
+        let (root, mut store) = fixture();
+        let key = Capability::new([2; 32]);
+        let (created, first) = store
+            .claim_nonce([1; 32], [9; 32], [7; 32], b"sealed record", &key)
+            .unwrap();
+        assert!(created);
+        let Value::Array(fields) = canonical::decode(&first, 512).unwrap() else {
+            panic!()
+        };
+        let [Value::Bytes(body), Value::Bytes(_)] = fields.as_slice() else {
+            panic!()
+        };
+        assert_eq!(nonce::decode_body(body).unwrap().challenge, [7; 32]);
+        drop(store);
+        let mut reopened = RelayStore::open(root.path(), limits()).unwrap();
+        let (created, repeat) = reopened
+            .claim_nonce([1; 32], [9; 32], [8; 32], b"sealed record", &key)
+            .unwrap();
+        assert!(!created);
+        assert_ne!(first, repeat);
+        assert_eq!(
+            reopened.claim_nonce([1; 32], [9; 32], [9; 32], b"other record", &key),
+            Err(RelayError::Conflict)
+        );
+        assert_eq!(
+            reopened.claim_nonce(
+                [1; 32],
+                [9; 32],
+                [9; 32],
+                b"sealed record",
+                &Capability::new([3; 32])
+            ),
+            Err(RelayError::Capability)
+        );
     }
     fn snapshot(store: &RelayStore) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
         let counters: (u64,u64,u64,u64,u64) = store.connection.query_row(

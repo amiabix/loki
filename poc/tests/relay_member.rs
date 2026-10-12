@@ -192,6 +192,40 @@ fn certified_member_agrees() {
     }
 }
 
+#[test]
+fn certified_member_policy_bound_roster_agrees_and_rejects_threshold_tampering() {
+    let f = Fixture::new();
+    let mut roster: Value = serde_json::from_slice(&fs::read(&f.roster).unwrap()).unwrap();
+    roster["threshold"] = Value::from(2);
+    fs::write(&f.roster, serde_json::to_vec(&roster).unwrap()).unwrap();
+    refuses(&f, "member_fingerprint");
+    let policy = loki_poc::member_state::Roster::load(&f.roster).unwrap();
+    let mut state = f.state();
+    state["threshold"] = Value::from(2);
+    state["roster_fingerprint"] = Value::from(hex::encode(policy.fingerprint()));
+    f.seal(&state);
+    assert_eq!(f.loaded().unwrap().roster.members.len(), 3);
+    for threshold in [
+        Value::from(1),
+        Value::from(3),
+        Value::Null,
+        Value::from("2"),
+    ] {
+        let mut altered = roster.clone();
+        altered["threshold"] = threshold;
+        fs::write(&f.roster, serde_json::to_vec(&altered).unwrap()).unwrap();
+        refuses(&f, "member_roster");
+    }
+    let mut downgraded = roster.clone();
+    downgraded.as_object_mut().unwrap().remove("threshold");
+    fs::write(&f.roster, serde_json::to_vec(&downgraded).unwrap()).unwrap();
+    refuses(&f, "member_fingerprint");
+    fs::write(&f.roster, serde_json::to_vec(&roster).unwrap()).unwrap();
+    state["threshold"] = Value::from(3);
+    f.seal(&state);
+    refuses(&f, "member_roster");
+}
+
 fn refuses(f: &Fixture, code: &str) {
     match f.loaded() {
         Ok(_) => panic!("accepted altered certified fixture"),
@@ -3467,6 +3501,10 @@ fn snapshot_pages_list_real_objects_and_reject_a_tampered_cursor() {
     let pass = fixture.pass.canonicalize().unwrap();
     let roster = fixture.roster.canonicalize().unwrap();
     let mut session = loki_poc::relay_member::open_session(&root, &pass, &roster).unwrap();
+    let empty =
+        loki_poc::relay_member::public_snapshot_page(&session, "generation-0", "logical", "0", 100)
+            .unwrap();
+    assert!(empty["rows"].as_array().unwrap().is_empty());
     let owner = session.member.identity.public().id;
     let body = loki_relay_protocol::types::MessageBody {
         key: loki_relay_protocol::types::LogicalKey {
@@ -3492,6 +3530,10 @@ fn snapshot_pages_list_real_objects_and_reject_a_tampered_cursor() {
             &prepared,
         )
         .unwrap();
+    let frozen =
+        loki_poc::relay_member::public_snapshot_page(&session, "generation-0", "logical", "0", 100)
+            .unwrap();
+    assert!(frozen["rows"].as_array().unwrap().is_empty());
     let first =
         loki_poc::relay_member::public_snapshot_page(&session, "generation-1", "objects", "0", 100)
             .unwrap();
@@ -3554,7 +3596,19 @@ fn snapshot_pages_list_real_objects_and_reject_a_tampered_cursor() {
         &session,
         "generation-2",
         "objects",
-        "0",
+        "100",
+        100
+    )
+    .is_err());
+    let refreshed =
+        loki_poc::relay_member::public_snapshot_page(&session, "generation-2", "logical", "0", 100)
+            .unwrap();
+    assert_eq!(refreshed["rows"].as_array().unwrap().len(), 1);
+    assert!(loki_poc::relay_member::public_snapshot_page(
+        &session,
+        "generation-1",
+        "objects",
+        "100",
         100
     )
     .is_err());

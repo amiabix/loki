@@ -15,7 +15,9 @@ use crate::{
 
 pub struct Roster {
     pub vault: [u8; 32],
+    pub threshold: u16,
     pub members: BTreeMap<u16, PublicIdentity>,
+    legacy: bool,
 }
 
 impl Roster {
@@ -50,18 +52,47 @@ impl Roster {
                 return Err("duplicate member in roster".into());
             }
         }
-        if members.keys().copied().collect::<Vec<_>>() != [1, 2, 3] {
-            return Err("roster must have exactly members 1, 2 and 3".into());
+        let legacy = data.get("threshold").is_none();
+        let threshold: u16 = if legacy {
+            2
+        } else {
+            data["threshold"]
+                .as_u64()
+                .ok_or("invalid roster threshold")?
+                .try_into()
+                .map_err(|_| "invalid roster threshold")?
+        };
+        let count = members.len();
+        if !matches!((threshold, count), (2, 3) | (2, 4))
+            || (legacy && count != 3)
+            || members.keys().copied().collect::<Vec<_>>() != (1..=count as u16).collect::<Vec<_>>()
+        {
+            return Err(
+                "supported rosters are 2-of-3 and 2-of-4 with consecutive member IDs".into(),
+            );
         }
-        Ok(Self { vault, members })
+        Ok(Self {
+            vault,
+            threshold,
+            members,
+            legacy,
+        })
     }
 
     pub fn fingerprint(&self) -> [u8; 32] {
         let mut hash = Params::new()
             .hash_length(32)
-            .personal(b"Loki_roster_v1")
+            .personal(if self.legacy {
+                b"Loki_roster_v1"
+            } else {
+                b"Loki_roster_v2"
+            })
             .to_state();
         hash.update(&self.vault);
+        if !self.legacy {
+            hash.update(&self.threshold.to_be_bytes());
+            hash.update(&(self.members.len() as u16).to_be_bytes());
+        }
         for member in self.members.values() {
             hash.update(&member.id.to_be_bytes());
             hash.update(&member.signing);
@@ -137,6 +168,15 @@ pub fn open(owner: &Path, pass_file: &Path, roster_file: &Path) -> Result<Member
     if roster.vault != vault || roster.fingerprint() != hex32(&state, "roster_fingerprint")? {
         return Err("roster differs from sealed vault certificate".into());
     }
+    if state
+        .get("threshold")
+        .is_some_and(|value| value.as_u64() != Some(u64::from(roster.threshold)))
+        || state
+            .get("members")
+            .is_some_and(|value| value.as_u64() != Some(roster.members.len() as u64))
+    {
+        return Err("sealed vault policy differs from certified roster".into());
+    }
     let identity = Identity::from_secret_bytes(&hex_bytes(&state, "identity_secret")?)?;
     if roster.members.get(&identity.public().id) != Some(&identity.public())
         || dir
@@ -166,10 +206,10 @@ pub fn open(owner: &Path, pass_file: &Path, roster_file: &Path) -> Result<Member
         || key.identifier() != &id
         || key.verifying_key() != public.verifying_key()
         || public.verifying_shares().get(&id) != Some(key.verifying_share())
-        || *key.min_signers() != 2
-        || public.min_signers() != Some(2)
+        || *key.min_signers() != roster.threshold
+        || public.min_signers() != Some(roster.threshold)
     {
-        return Err("member share differs from certified 2-of-3 vault".into());
+        return Err("member share differs from certified vault policy".into());
     }
     let mut backup = Params::new()
         .hash_length(32)

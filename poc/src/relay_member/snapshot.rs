@@ -67,7 +67,7 @@ pub fn public_snapshot_page(
         .directory()
         .join("transport")
         .join("public-snapshot.json");
-    let mut spool = load_spool(session, &path, snapshot_id)?;
+    let mut spool = load_spool(session, &path, snapshot_id, index == 0)?;
     let rows = spool.sections.get(section).cloned().ok_or_else(config)?;
     {
         let issued = spool
@@ -125,7 +125,12 @@ struct Spool {
     issued: BTreeMap<String, Vec<String>>,
 }
 
-fn load_spool(session: &Session, path: &Path, snapshot_id: &str) -> Result<Spool, SessionError> {
+fn load_spool(
+    session: &Session,
+    path: &Path,
+    snapshot_id: &str,
+    begin: bool,
+) -> Result<Spool, SessionError> {
     if path.is_file() {
         let raw = fs::read(path).map_err(|_| SessionError::Client(ClientError::Storage))?;
         if raw.len() > SPOOL_LIMIT {
@@ -134,15 +139,16 @@ fn load_spool(session: &Session, path: &Path, snapshot_id: &str) -> Result<Spool
         let value: Value =
             serde_json::from_slice(&raw).map_err(|_| SessionError::Client(ClientError::Storage))?;
         let spool = decode_spool(&value)?;
-        let now = unix_now();
-        if now.saturating_sub(spool.created) > 60 {
-            let _ = fs::remove_file(path);
-            return Err(SessionError::Client(ClientError::Cursor));
+        if spool.snapshot_id == snapshot_id {
+            if unix_now().saturating_sub(spool.created) > 60 {
+                let _ = fs::remove_file(path);
+                return Err(SessionError::Client(ClientError::Cursor));
+            }
+            return Ok(spool);
         }
-        if spool.snapshot_id != snapshot_id {
+        if !begin {
             return Err(SessionError::Client(ClientError::Conflict));
         }
-        return Ok(spool);
     }
     let spool = freeze(session, snapshot_id)?;
     store_spool(path, &spool)?;

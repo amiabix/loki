@@ -17,6 +17,7 @@ let relayMode = 'live';
 let relaySpeed = 1;
 let relayNetwork = null;
 let relayFetches = 0;
+let relayRefreshing = false;
 
 const RELAY_FAILURES = new Set([
   'receipt_rejected', 'route_failure', 'quarantine', 'relay_failed', 'application_rejected',
@@ -56,7 +57,7 @@ function relayFilters() {
 function relayVisible(event) {
   const role = typeof memberRole === 'function' ? memberRole() : 'admin';
   if (!role || role === 'admin' || event.origin === 'controller') return true;
-  const member = role === 'alice' ? 1 : role === 'bob' ? 2 : null;
+  const member = {alice: 1, bob: 2, carol: 3}[role];
   return event.actor_member === member || event.recipient_member === member;
 }
 
@@ -107,7 +108,8 @@ function acceptRelayEvents(page) {
 }
 
 async function refreshRelay() {
-  if (relayMode === 'replay') return;
+  if (relayMode === 'replay' || relayRefreshing) return;
+  relayRefreshing = true;
   relayFetches += 1;
   try {
     const network = await api('/api/relay/state');
@@ -124,6 +126,8 @@ async function refreshRelay() {
     if (node) node.textContent = error && error.message ? error.message : 'Relay view failed';
     const status = document.getElementById('relay-status');
     if (status) status.textContent = 'Error';
+  } finally {
+    relayRefreshing = false;
   }
 }
 
@@ -287,7 +291,9 @@ function renderAdmin() {
   const host = document.getElementById('relay-admin');
   if (!host) return;
   const role = typeof memberRole === 'function' ? memberRole() : null;
-  host.hidden = role !== 'admin';
+  const demo = typeof demoState === 'function' ? demoState() : null;
+  const canControl = !!role && !!demo?.creator && role === demo.creator;
+  host.hidden = !canControl;
   let actions = null;
   for (const child of host.children) {
     if (child.id === 'relay-admin-actions') actions = child;
@@ -298,13 +304,13 @@ function renderAdmin() {
     host.append(actions);
   }
   actions.replaceChildren();
-  if (role !== 'admin') return;
+  if (!canControl) return;
   const specs = [
     ['relay-admin-stop', 'Stop relay', () => relayAct('/api/relay/stop', {relay: selectedNumber('relay-admin-relay', [1, 2, 3])})],
     ['relay-admin-restart', 'Restart relay', () => relayAct('/api/relay/restart', {relay: selectedNumber('relay-admin-relay', [1, 2, 3])})],
     ['relay-admin-pause', 'Pause member', () => relayAct('/api/relay/member', {member: selectedNumber('relay-admin-member', [1, 2, 3]), action: 'pause'})],
     ['relay-admin-resume', 'Resume member', () => relayAct('/api/relay/member', {member: selectedNumber('relay-admin-member', [1, 2, 3]), action: 'resume'})],
-    ['relay-admin-resend', 'Resend saved share', () => relayAct('/api/relay/resend', {member: selectedNumber('relay-admin-resend', [1, 2])})],
+    ['relay-admin-resend', 'Resend saved share', () => relayAct('/api/relay/resend', {member: selectedNumber('relay-admin-resend', [1, 2, 3])})],
   ];
   for (const [className, label, run] of specs) {
     const button = relayText('button', className, label);

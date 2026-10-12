@@ -236,7 +236,11 @@ fn hex32(value: &Value) -> MemberResult<[u8; 32]> {
 fn roster(value: &Value) -> MemberResult<Roster> {
     let vault = hex32(&value["vault"])?;
     let entries = value["members"].as_array().ok_or(MemberError::Roster)?;
-    if entries.len() != 3 {
+    if entries.len() != 3
+        || value
+            .get("threshold")
+            .is_some_and(|threshold| threshold.as_u64() != Some(2))
+    {
         return Err(MemberError::Roster);
     }
     let mut members = Vec::with_capacity(3);
@@ -258,12 +262,20 @@ fn roster(value: &Value) -> MemberResult<Roster> {
     }
     Ok(Roster { vault, members })
 }
-fn fingerprint(roster: &Roster) -> [u8; 32] {
+fn fingerprint(roster: &Roster, policy_bound: bool) -> [u8; 32] {
     let mut h = blake2b_simd::Params::new()
         .hash_length(32)
-        .personal(b"Loki_roster_v1")
+        .personal(if policy_bound {
+            b"Loki_roster_v2"
+        } else {
+            b"Loki_roster_v1"
+        })
         .to_state();
     h.update(&roster.vault);
+    if policy_bound {
+        h.update(&2u16.to_be_bytes());
+        h.update(&(roster.members.len() as u16).to_be_bytes());
+    }
     for m in &roster.members {
         h.update(&m.id.to_be_bytes());
         h.update(&m.signing);
@@ -317,7 +329,16 @@ pub fn load(root: &Path, pass_file: &Path, roster_path: &Path) -> MemberResult<L
     if hex32(&state.0["vault"])? != roster.vault {
         return Err(MemberError::Vault);
     }
-    if hex32(&state.0["roster_fingerprint"])? != fingerprint(&roster) {
+    if state
+        .0
+        .get("threshold")
+        .is_some_and(|threshold| threshold.as_u64() != Some(2))
+    {
+        return Err(MemberError::Roster);
+    }
+    if hex32(&state.0["roster_fingerprint"])?
+        != fingerprint(&roster, parsed_roster.0.get("threshold").is_some())
+    {
         return Err(MemberError::Fingerprint);
     }
     let identity =

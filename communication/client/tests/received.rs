@@ -402,6 +402,12 @@ fn incoming_crash_missing_prerequisite_still_commits_ack_received_atomic() {
             .unwrap(),
         CommitDisposition::New
     );
+    let committed = store.recover_incoming_originals(0, 100).unwrap();
+    let reopened = store.open_incoming(&roster, &bob, &committed[0]).unwrap();
+    assert_eq!(reopened.message().body(), candidates[0].message().body());
+    let mut wrong_digest = committed[0].clone();
+    wrong_digest.digest[0] ^= 1;
+    assert!(store.open_incoming(&roster, &bob, &wrong_digest).is_err());
     let links = store.recover_ack_links(0, 100).unwrap();
     assert_eq!(links.len(), 1);
     assert_eq!(links[0].ack_author, 2);

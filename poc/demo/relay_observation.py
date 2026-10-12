@@ -34,7 +34,7 @@ SECTIONS = {
     "logical", "recipients", "objects", "receipts", "incoming",
     "acknowledgements", "rejections", "application",
 }
-ROLES = {"admin": None, "alice": 1, "bob": 2}
+ROLES = {"admin": None, "alice": 1, "bob": 2, "carol": 3}
 
 
 class Rejected(ValueError):
@@ -129,6 +129,8 @@ class RelayProjection:
             member = fields.get("member")
             if event_type == "relay_standby" and relay in (1, 2, 3):
                 self._relays[str(relay)]["status"] = "standby"
+            elif event_type == "relay_stopped" and relay in (1, 2, 3):
+                self._relays[str(relay)]["status"] = "stopped"
             elif event_type == "relay_failed" and relay in (1, 2, 3):
                 self._relays[str(relay)]["status"] = "failed"
             elif event_type == "member_paused" and member in (1, 2, 3):

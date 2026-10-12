@@ -1,61 +1,78 @@
 # Separate-member payment UI
 
-This loopback-only regtest UI drives `loki_setup_member` and
-`loki_member_payment`. It is separate from the older `/` account demo, which
-still uses a test-only viewing key.
+This loopback-only regtest UI drives the relay-backed `loki_member_payment`
+commands through three sandboxed member stores and three local relays. It is
+separate from the older `/` account demo.
 
 ## Run
 
 Install THS and Docker as in [the harness guide](../harness/README.md). Feature-build both workspaces, then start the coordinator:
 
 ```sh
-cargo build --manifest-path communication/Cargo.toml --locked --offline --bin loki-relay-server
-cargo build --manifest-path poc/Cargo.toml --features relay-communication --locked --offline --bins
-python3 poc/demo/member_demo.py --port 8790
+cd communication
+cargo build --locked --bins
+cd ../poc
+cargo build --locked --bins --features relay-communication
+python3 demo/member_demo.py
 ```
 
-**Create a test payment** is the only preparation action. It starts THS, creates the vaults from `run/source/member-N`, and starts three relays. There is no second chain launch and no second DKG. The third relay stays on standby while two relays hold the copies. Relay stop or restart reuses that relay store and does not mine or reset THS. Reset abandons the attempt and creates fresh relay state. One attempt is active at a time.
-
-Transport saved, stored, and received stay separate from application acceptance, approval, and chain confirmation. Alice and Bob see their own relay events. Carol sees the network. Replay does not call the backend. Closing a browser leaves the coordinator running.
-
-The live gate is `python3 poc/demo/verify_relay_payment.py --port <free> --timeout 1800`. It owns that port. The public `relay-payment-demo-report.json` is under the selected run. It records source and binary identities, relay pins, carrier and receipt digests, the mailbox-denial canary, scenario results, and the mined txid. It does not record the coordinator token or secret paths.
-
-Supplemental communication-harness checks are separate from this launch. The older `poc/demo/server.py` account UI is a different demo.
-
-Open the **Coordinator** URL printed in the terminal. Create a payment to a
-new independent recipient vault. The amount and memo come from the form; the
-regtest source vault receives one faucet note. Setup, backup checks, funding and
-proposal creation take a few minutes. Launch Alice and Bob in separate
-windows. Each page displays that member's verified CLI review and
-requires an explicit **Confirm payment** action. After both shares are saved,
-Carol's window can prove and send. The UI says **Confirmed** only
-after the mined transaction passes both source and recipient checks.
+The terminal prints separate **Alice**, **Bob**, and **Carol** URLs. Open each
+in a separate browser profile. The fresh run starts with no vault or payment.
+Any member can start the local 2-of-3 source vault and independent recipient
+vault, then add one test ZEC. Any member can propose a payment, enter a
+unified recipient address, and choose one pair to sign this attempt. The two
+selected members each see their own verified CLI review and must explicitly
+**Confirm payment**. An approval counts only after its exact encrypted share
+carriers are stored by the relays and the approver process prints `stored` before
+exiting successfully. A failed delivery can be retried using the saved share
+without signing again. Any member can then prove and send. The UI says **Confirmed**
+only after the mined transaction passes the source vault's chain check. When
+the recipient is the generated local vault, that vault decrypts and checks it
+too.
 
 For a repeatable browser check, start a second fresh demo on another port in
 one terminal, then run the check from another:
 
 ```sh
-python3 demo/member_demo.py --port 8791
+LOKI_MEMBER_DEMO_ROOT=/private/tmp/loki-member-demo-browser-check python3 demo/member_demo.py --port 8791
 ```
 
 ```sh
 npm ci --ignore-scripts --prefix g3
-LOKI_DEMO_URL='http://127.0.0.1:8791/#<printed-token>' node demo/test-member-browser.js
+LOKI_ALICE_URL='http://127.0.0.1:8791/#<Alice-token>' \
+LOKI_BOB_URL='http://127.0.0.1:8791/#<Bob-token>' \
+LOKI_CAROL_URL='http://127.0.0.1:8791/#<Carol-token>' \
+node demo/test-member-browser.js
 ```
 
-The check creates a regtest payment, opens an Alice window, signs from separate
-Alice and Bob browser profiles, and waits for Carol's history to show the mined
-txid. It requires Playwright's Chromium browser installed locally and leaves the
-confirmed demo instance running for inspection.
+The check starts the vault and proposes from Bob's browser profile, signs
+from separate Bob and Carol profiles, and finishes from Alice's profile. It
+requires Playwright's Chromium browser and leaves the confirmed demo instance
+running for inspection.
 
-The server creates and owns one disposable THS instance. Reset or a clean server
-exit stops only that instance. A restart during signing abandons the attempt;
-reset creates fresh vaults and signing material. State under
-`demo/.member-sandbox` includes keys, backup words, passphrases and nonce state.
+The **Relay network** view shows each member's public transport evidence,
+application acceptance, approvals, and chain status separately. The vault creator
+can stop or restart a relay, pause or resume a member, and resend a saved share
+for any selected approver. Replay reads cached events without fetching new ones.
+
+The live gate is `python3 demo/verify_relay_payment.py --port <free> --timeout
+1800`. It owns that port and uses the same staged member actions. Its public
+`relay-payment-demo-report.json` records binary identities, relay pins, carrier
+and receipt digests, the mailbox-denial canary, scenario results, and the mined
+txid without coordinator tokens or secret paths. Supplemental
+communication-harness checks are separate from the mined payment.
+
+The server creates and owns one disposable THS instance and three local relays.
+Reset or a clean server exit stops those owned services. A restart during
+signing abandons the attempt; reset creates fresh vaults and signing material.
+State under `demo/.member-sandbox` (or the named test root) includes keys,
+backup words, passphrases and nonce state.
 Do not copy it or use real funds.
 
-Separate windows make the review flow visible; separate browser profiles or
-devices are needed to simulate independent member custody. One local server
-still controls every member store. This is **not** independent custody, a relay,
-or a browser signer. Its local file courier and nonce state have no rollback
-protection. The local ZIP 2005 derivation and backup format remain unreviewed.
+The member CLI commands are sandboxed against each other's files, but one local
+test server still controls every member store and all three relays. This does
+not establish independent custody, independent relay operators, browser key
+storage, or physical power-loss safety. Setup remains a fixed 2-of-3 local
+fixture, and a proposal picks one pair before signing: a third member cannot
+join the same attempt if that pair stalls. The local ZIP 2005 derivation and
+backup format remain unreviewed. Do not use real funds.

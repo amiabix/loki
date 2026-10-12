@@ -15,6 +15,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use loki_relay_protocol::{
     envelope::MAX_WIRE_LEN,
     http::ErrorCode,
+    nonce,
     types::{Id32, Object},
 };
 use sha2::{Digest, Sha256};
@@ -135,6 +136,9 @@ async fn admit(State(gate): State<Gate>, mut request: Request, next: Next) -> Re
         if control_path(request.uri()).is_ok() {
             return error_response(RelayError::RateLimit);
         }
+        if nonce_path(request.uri()).is_ok() {
+            return error_response(RelayError::RateLimit);
+        }
         return error_response(RelayError::MalformedRequest);
     }
     error_response(RelayError::RateLimit)
@@ -190,6 +194,10 @@ pub fn router(db: DbHandle) -> Router {
         .route(
             "/v1/mailboxes/{mailbox}/objects/{hash}",
             put(object_route).get(object_route),
+        )
+        .route(
+            "/v1/mailboxes/{mailbox}/nonces/{cid}",
+            put(nonce_route).layer(DefaultBodyLimit::max(nonce::MAX_RECORD)),
         )
         .route(
             "/v1/mailboxes/{mailbox}",
@@ -263,6 +271,18 @@ fn path(uri: &Uri) -> RelayResult<(Id32, Id32)> {
     Ok((id(parts[3])?, id(parts[5])?))
 }
 
+fn nonce_path(uri: &Uri) -> RelayResult<(Id32, Id32)> {
+    let parts: Vec<_> = uri.path().split('/').collect();
+    if uri.query().is_some()
+        || parts.len() != 6
+        || parts[..3] != ["", "v1", "mailboxes"]
+        || parts[4] != "nonces"
+    {
+        return Err(RelayError::MalformedRequest);
+    }
+    Ok((id(parts[3])?, id(parts[5])?))
+}
+
 fn single<'a>(headers: &'a HeaderMap, name: &'static str) -> RelayResult<Option<&'a str>> {
     let mut values = headers.get_all(name).iter();
     let first = values.next();
@@ -330,6 +350,53 @@ async fn object_route(
         Ok(response) => response,
         Err(error) => error_response(error),
     }
+}
+
+async fn nonce_route(
+    State(db): State<DbHandle>,
+    uri: Uri,
+    method: Method,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    let result: RelayResult<Response> = async {
+        let (mailbox, cid) = nonce_path(&uri)?;
+        if method != Method::PUT {
+            return Err(RelayError::MalformedRequest);
+        }
+        let owner_read = capability(&headers)?;
+        let length = request_headers(&headers, &method)?;
+        let challenge =
+            id(single(&headers, "x-loki-challenge")?.ok_or(RelayError::MalformedRequest)?)?;
+        let wire = body.map_err(|rejection| {
+            if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                RelayError::ObjectTooLarge
+            } else {
+                RelayError::MalformedRequest
+            }
+        })?;
+        if wire.is_empty()
+            || wire.len() > nonce::MAX_RECORD
+            || length.is_some_and(|n| n != wire.len())
+        {
+            return Err(RelayError::MalformedRequest);
+        }
+        let (created, receipt) = db
+            .claim_nonce(mailbox, cid, challenge, wire.to_vec(), owner_read)?
+            .receive()
+            .await?;
+        Ok(binary(
+            if created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            },
+            "application/cbor",
+            receipt,
+        ))
+    }
+    .await;
+    result.unwrap_or_else(error_response)
 }
 
 async fn enqueue_put(

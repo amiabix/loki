@@ -3,8 +3,8 @@ use loki_poc::{
     intent::{ChangePolicy, Intent},
     setup_transport::Identity,
     signing_session::{
-        aggregate_and_apply, AttemptId, Mailbox, MessageKind, PackagePayload, SessionContext,
-        SigningSession,
+        aggregate_and_apply, AttemptId, Mailbox, MessageKind, NonceWitness, PackagePayload,
+        SessionContext, SigningSession,
     },
     state::MemberDir,
     vault,
@@ -17,7 +17,34 @@ use orchard::{
 };
 use pczt::roles::{creator::Creator, io_finalizer::IoFinalizer};
 use reddsa_frost::frost::redpallas as frost;
-use std::{collections::BTreeMap, fs};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+};
+
+#[derive(Default)]
+struct FirstWriter(BTreeSet<[u8; 32]>);
+impl NonceWitness for FirstWriter {
+    fn pins(&self) -> loki_poc::signing_session::WitnessPins {
+        [([7; 32], [8; 32]), ([9; 32], [10; 32])]
+    }
+    fn claim(&mut self, cid: [u8; 32], _: &[u8]) -> Result<(), String> {
+        if !self.0.insert(cid) {
+            return Err("already claimed".into());
+        }
+        Ok(())
+    }
+}
+
+struct WrongRelays;
+impl NonceWitness for WrongRelays {
+    fn pins(&self) -> loki_poc::signing_session::WitnessPins {
+        [([11; 32], [12; 32]), ([13; 32], [14; 32])]
+    }
+    fn claim(&mut self, _: [u8; 32], _: &[u8]) -> Result<(), String> {
+        panic!("mismatched relays must be refused before a claim")
+    }
+}
 use zcash_protocol::{memo::MemoBytes, value::Zatoshis};
 
 #[test]
@@ -125,7 +152,7 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
         2,
     )
     .unwrap();
-    let mut bob = SigningSession::begin(
+    let mut bob = SigningSession::begin_sealed(
         &bob_root,
         ctx.clone(),
         &ak,
@@ -135,6 +162,8 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
         public.clone(),
         fvk.clone(),
         2,
+        "pass",
+        [([7; 32], [8; 32]), ([9; 32], [10; 32])],
     )
     .unwrap();
     let mut sets = Vec::new();
@@ -234,6 +263,21 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
         .into_iter()
         .find(|message| message.wire_hash() == package_hashes[0])
         .unwrap();
+    let bob_attempt = bob_root
+        .join(hex::encode(ctx.payment))
+        .join(hex::encode(ctx.attempt.0));
+    let reviewed = bob.review_package(&good, &alice_public).unwrap();
+    assert!(bob
+        .publish_approved_secured(
+            reviewed,
+            &alice_public,
+            &carol_public,
+            &mailbox,
+            "pass",
+            &mut WrongRelays
+        )
+        .is_err());
+    assert!(!bob_attempt.join("decision").exists());
     let reviewed = bob.review_package(&good, &alice_public).unwrap();
     assert_eq!(reviewed.summary().vault, ak);
     assert_eq!(reviewed.summary().payment, intent.proposal_id());
@@ -249,9 +293,41 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
     assert_eq!(reviewed.summary().change_zat, change);
     assert_eq!(reviewed.summary().expiry_height, 1_152);
     assert_eq!(reviewed.summary().input_nullifiers, intent.input_nullifiers);
-    let bob_attempt = bob_root
+    assert!(bob_attempt.join("nonces.sealed").exists());
+    let old_root = root.join("bob-old");
+    let old_attempt = old_root
         .join(hex::encode(ctx.payment))
         .join(hex::encode(ctx.attempt.0));
+    fs::create_dir_all(&old_attempt).unwrap();
+    for name in ["started", "nonces.sealed"] {
+        fs::copy(bob_attempt.join(name), old_attempt.join(name)).unwrap();
+    }
+    assert!(SigningSession::reopen_sealed(
+        &bob_root,
+        ctx.clone(),
+        &ak,
+        intent.clone(),
+        Identity::from_secret_bytes(&bob_sender.to_secret_bytes()).unwrap(),
+        bob_key.clone(),
+        public.clone(),
+        fvk.clone(),
+        "pass"
+    )
+    .is_err()); // A second tab cannot open the same nonce set while Bob is active.
+    drop(bob);
+    let mut bob = SigningSession::reopen_sealed(
+        &bob_root,
+        ctx.clone(),
+        &ak,
+        intent.clone(),
+        Identity::from_secret_bytes(&bob_sender.to_secret_bytes()).unwrap(),
+        bob_key.clone(),
+        public.clone(),
+        fvk.clone(),
+        "pass",
+    )
+    .unwrap();
+    let reviewed = bob.review_package(&good, &alice_public).unwrap();
     assert!(!bob_attempt.join("share.sealed").exists());
     assert!(mailbox
         .read_for(
@@ -275,9 +351,55 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
         .iter()
         .all(|message| message.kind() != MessageKind::Share));
 
+    let mut witness = FirstWriter::default();
     let bob_share_hash = bob
-        .publish_approved(reviewed, &alice_public, &carol_public, &mailbox, "pass")
+        .publish_approved_secured(
+            reviewed,
+            &alice_public,
+            &carol_public,
+            &mailbox,
+            "pass",
+            &mut witness,
+        )
         .unwrap();
+    assert_eq!(witness.0.len(), 2);
+    assert!(!bob_attempt.join("nonces.sealed").exists());
+    assert!(SigningSession::reopen_sealed(
+        &bob_root,
+        ctx.clone(),
+        &ak,
+        intent.clone(),
+        Identity::from_secret_bytes(&bob_sender.to_secret_bytes()).unwrap(),
+        bob_key.clone(),
+        public.clone(),
+        fvk.clone(),
+        "pass"
+    )
+    .is_err());
+    let mut restored = SigningSession::reopen_sealed(
+        &old_root,
+        ctx.clone(),
+        &ak,
+        intent.clone(),
+        Identity::from_secret_bytes(&bob_sender.to_secret_bytes()).unwrap(),
+        bob_key.clone(),
+        public.clone(),
+        fvk.clone(),
+        "pass",
+    )
+    .unwrap();
+    let restored_review = restored.review_package(&good, &alice_public).unwrap();
+    assert!(restored
+        .publish_approved_secured(
+            restored_review,
+            &alice_public,
+            &carol_public,
+            &mailbox,
+            "pass",
+            &mut witness
+        )
+        .is_err());
+    assert!(!old_attempt.join("share.sealed").exists());
     let bob_saved = SigningSession::saved_share_wires(&bob_root, &ctx, 2, "pass").unwrap();
     let forged_bob_wire = {
         let opened = carol
@@ -344,7 +466,13 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
     );
     let sighash = alice_review.summary().sighash;
     alice
-        .publish_approved(alice_review, &bob_public, &carol_public, &mailbox, "pass")
+        .publish_approved(
+            alice_review,
+            &bob_public,
+            &[carol_public.clone()],
+            &mailbox,
+            "pass",
+        )
         .unwrap();
     drop(alice);
     drop(good);

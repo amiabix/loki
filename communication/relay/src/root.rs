@@ -39,6 +39,11 @@ impl Root {
         Ok(self.signing_key.sign(&signed).to_bytes())
     }
 
+    pub(crate) fn sign_nonce_receipt(&self, body: &[u8]) -> RelayResult<[u8; 64]> {
+        let signed = loki_relay_protocol::nonce::signature_input(body)?;
+        Ok(self.signing_key.sign(&signed).to_bytes())
+    }
+
     pub fn open(path: &Path) -> RelayResult<Self> {
         #[cfg(unix)]
         {

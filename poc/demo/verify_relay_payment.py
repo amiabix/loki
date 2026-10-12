@@ -137,35 +137,47 @@ def _events(base: str, token: str) -> list[dict]:
     return events
 
 
-def drive_payment(base: str, admin: str, deadline: float) -> dict:
-    _request(base, "POST", "/api/start", admin, {
-        "amount_zat": 12_000_000, "memo": "relay payment gate"})
-    alice = bob = None
+def drive_payment(base: str, tokens: dict[str, str], deadline: float, *,
+                  proposer: str = "alice", pair: str = "AB") -> dict:
+    pair_roles = {"AB": ("alice", "bob"), "AC": ("alice", "carol"),
+                  "BC": ("bob", "carol")}[pair]
+    creator = tokens[proposer]
+    _request(base, "POST", "/api/create-vault", creator, {})
     approved = set()
-    finished = False
+    funded = proposed = finished = False
     while time.monotonic() < deadline:
-        state = _request(base, "GET", "/api/state", admin)
+        state = _request(base, "GET", "/api/state", creator)
         phase = state.get("phase")
         if phase == "failed":
             raise GateError(public_failure(str(state.get("error") or "")))
-        if phase == "waiting_for_reviews" and alice is None:
-            links = state.get("links") or {}
-            alice = _token_from_link(links["alice"])
-            bob = _token_from_link(links["bob"])
-        if alice and bob and phase == "waiting_for_reviews":
-            for role, token in (("alice", alice), ("bob", bob)):
+        if phase == "vault_ready" and not funded:
+            _request(base, "POST", "/api/fund", creator, {})
+            funded = True
+        if phase == "funded" and not proposed:
+            _request(base, "POST", "/api/propose", creator, {
+                "amount_zat": 12_000_000, "memo": "relay payment gate", "pair": pair,
+                "recipient": state["vaults"]["recipient"],
+            })
+            proposed = True
+        if phase == "waiting_for_reviews":
+            for role in pair_roles:
                 if role in approved:
                     continue
-                member = _request(base, "GET", "/api/state", token)
-                if member.get("signers", {}).get(role) == "reviewing":
-                    _request(base, "POST", "/api/decide", token, {"action": "approve"})
+                member = _request(base, "GET", "/api/state", tokens[role])
+                if member.get("own_status") == "reviewing":
+                    _request(base, "POST", "/api/decide", tokens[role], {"action": "approve"})
                     approved.add(role)
         if phase == "ready_to_send" and not finished:
-            _request(base, "POST", "/api/finish", admin, {})
+            _request(base, "POST", "/api/finish", creator, {})
             finished = True
         if phase == "confirmed" and isinstance(state.get("txid"), str):
-            network = _request(base, "GET", "/api/relay/state", admin)
-            return {"state": state, "network": network, "events": _events(base, admin)}
+            network = _request(base, "GET", "/api/relay/state", creator)
+            events = {}
+            for token in tokens.values():
+                for event in _events(base, token):
+                    events[event["sequence"]] = event
+            return {"state": state, "network": network,
+                    "events": [events[key] for key in sorted(events)]}
         time.sleep(1)
     raise GateError("payment deadline")
 
@@ -222,10 +234,8 @@ def assemble(payment: dict, harness: dict[str, dict], canary: dict, mailbox_abse
     chunk = harness.get("missing_chunk")
     offline_ok = _passed(offline)
     approvers = payment["state"].get("approver_stored") or {}
-    approver_stored = {
-        "alice": approvers.get("alice") is True,
-        "bob": approvers.get("bob") is True,
-    }
+    pair_roles = (payment["state"].get("payment") or {}).get("pair", ("alice", "bob"))
+    approver_stored = {role: approvers.get(role) is True for role in pair_roles}
     scenarios = [
         _scenario("normal_transfer", "payment",
                   "request_start" in kinds and network.get("stored", 0) > 0),
@@ -242,7 +252,7 @@ def assemble(payment: dict, harness: dict[str, dict], canary: dict, mailbox_abse
                   harness="offline_delivery", harness_run=(offline or {}).get("scenario_run_id")),
         _scenario("payment_stored_before_approver_exit", "payment",
                   payment["state"].get("phase") == "confirmed"
-                  and approver_stored["alice"] and approver_stored["bob"]
+                  and len(approver_stored) == 2 and all(approver_stored.values())
                   and network.get("stored", 0) > 0
                   and mailbox_absent and canary.get("mailbox_denial") is True),
     ]
@@ -300,6 +310,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--timeout", type=float, default=1800)
+    parser.add_argument("--pair", choices=("AB", "AC", "BC"), default="AB")
+    parser.add_argument("--proposer", choices=("alice", "bob", "carol"), default="alice")
     args = parser.parse_args()
     if not 1 <= args.port <= 65535 or args.timeout <= 0:
         parser.error("port and timeout must be usable")
@@ -335,13 +347,17 @@ def main() -> int:
         cwd=str(REPO), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     report_path = sandbox / "run" / "relay-payment-demo-report.json"
     try:
-        line = server.stdout.readline() if server.stdout is not None else ""
-        if "Coordinator: " not in line:
-            raise GateError("coordinator did not start")
+        tokens = {}
+        base = None
+        for _ in range(3):
+            line = server.stdout.readline() if server.stdout is not None else ""
+            role, separator, link = line.strip().partition(": ")
+            if not separator or role.lower() not in ("alice", "bob", "carol"):
+                raise GateError("member coordinator did not start")
+            tokens[role.lower()] = _token_from_link(link)
+            base = link.split("/#", 1)[0]
         threading.Thread(target=server.stdout.read, daemon=True).start()
-        base = line.split("Coordinator: ", 1)[1].strip().split("/#", 1)[0]
-        admin = line.split("#", 1)[1].strip()
-        payment = drive_payment(base, admin, deadline)
+        payment = drive_payment(base, tokens, deadline, proposer=args.proposer, pair=args.pair)
         manifest = {}
         manifest_path = sandbox / "relay" / "relay-demo.json"
         if manifest_path.is_file():
@@ -352,7 +368,7 @@ def main() -> int:
             harness = transport_scenarios(sandbox / "transport-scenarios", remaining)
         else:
             raise GateError("no time left for recovery scenarios")
-        mailbox = sandbox / "run" / "payment" / "work" / "mailbox"
+        mailbox = sandbox / "run" / "payment" / "mailbox"
         report = assemble(payment, harness, canary, not mailbox.exists(), {
             "source_revision": revision,
             "binary_hashes": binaries,
@@ -361,7 +377,7 @@ def main() -> int:
             "roster_fingerprint": manifest.get("roster_fingerprint"),
             "relays": manifest.get("relays") or [],
         })
-        public = build_report(report, forbidden=(admin, base, "pass.txt", "passphrase"))
+        public = build_report(report, forbidden=(*tokens.values(), base, "pass.txt", "passphrase"))
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text(json.dumps(public, indent=2, sort_keys=True) + "\n")
         report_path.chmod(0o644)

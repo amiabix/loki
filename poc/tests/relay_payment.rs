@@ -585,6 +585,19 @@ fn three_loopback_relays_deliver_a_saved_carrier_and_refuse_over_quota() {
                 .then_some(value)
         })
         .expect("inner open did not emit session_envelope_authenticated");
+    assert_eq!(authenticated["message_id"], hex::encode(message));
+    assert_eq!(authenticated["actor_member"], 2);
+    bob.note_application(true, &opened);
+    let application = bob
+        .pop_events()
+        .into_iter()
+        .map(|line| serde_json::from_slice::<Value>(&line).unwrap())
+        .find(|event| event["event_type"] == "application_accepted")
+        .unwrap();
+    assert_eq!(application["message_id"], hex::encode(message));
+    assert_eq!(application["actor_member"], 2);
+    assert_eq!(application["authenticated_sender"], 1);
+    assert_eq!(application["recipient_member"], 2);
     assert_eq!(authenticated["authenticated_sender"], 1);
     assert_eq!(authenticated["recipient_member"], 2);
     assert_eq!(
@@ -761,6 +774,22 @@ fn a_later_process_reauthenticates_an_accepted_carrier() {
         saved
     );
     assert!(again.pop_events().is_empty());
+    let original = again
+        .database()
+        .recover_incoming_originals(0, 10)
+        .unwrap()
+        .into_iter()
+        .find(|row| row.key.sender == 1)
+        .unwrap();
+    again.note_application(true, &reopened);
+    let application = again
+        .pop_events()
+        .into_iter()
+        .map(|line| serde_json::from_slice::<Value>(&line).unwrap())
+        .find(|event| event["event_type"] == "application_accepted")
+        .unwrap();
+    assert_eq!(application["message_id"], hex::encode(original.key.message));
+    assert_eq!(application["actor_member"], 2);
 }
 
 #[test]
@@ -770,7 +799,12 @@ fn a_delivery_timeout_does_not_succeed_and_keeps_the_saved_share() {
     let bob_key = Identity::new(2);
     let context = signing_context();
     let wire = alice_key
-        .seal_session(&bob_key.public(), &context, MessageKind::Share, b"saved-share")
+        .seal_session(
+            &bob_key.public(),
+            &context,
+            MessageKind::Share,
+            b"saved-share",
+        )
         .unwrap();
     let mut alice = RelayCourier::open(&live.members[0], &live.passes[0], &live.roster).unwrap();
     let route = EnvelopeRoute {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Loopback UI for one disposable, separately created 2-of-3 regtest payment."""
+"""Loopback UI for a staged, disposable 2-of-3 regtest payment."""
 
 from __future__ import annotations
 
@@ -21,9 +21,14 @@ from pathlib import Path
 DEMO = Path(__file__).resolve().parent
 POC = DEMO.parent
 REPO = POC.parent
-ROOT = DEMO / ".member-sandbox"
+ROOT = Path(os.environ.get("LOKI_MEMBER_DEMO_ROOT", DEMO / ".member-sandbox")).resolve()
+if ROOT.name != ".member-sandbox" and not ROOT.name.startswith("loki-member-demo-"):
+    raise RuntimeError("demo state directory must be named .member-sandbox or loki-member-demo-*")
 RUN = ROOT / "run"
 STATIC = DEMO / "static"
+# shortcut: one local process owns three fixed member stores; replace with member-owned setup before custody use.
+MEMBERS = {"alice": 1, "bob": 2, "carol": 3}
+PAIRS = {"AB": ("alice", "bob"), "AC": ("alice", "carol"), "BC": ("bob", "carol")}
 sys.path.insert(0, str(POC))
 
 from managed_ths import ManagedTHS, command  # noqa: E402
@@ -45,51 +50,50 @@ def binary(name: str) -> Path:
 
 class Flow:
     def __init__(self):
-        relay_demo.reap_recorded(ROOT / "relay")
         self.lock = threading.RLock()
         self.cancel = threading.Event()
         self.chain = ManagedTHS(ROOT, lambda *_: None, self.cancel)
-        interrupted = RUN.exists()
-        self.phase = "interrupted" if interrupted else "idle"
-        self.error = "an unfinished attempt was interrupted; reset to retry" if interrupted else None
+        self.phase = "interrupted" if RUN.exists() else "idle"
+        self.error = "an unfinished attempt was interrupted; reset to retry" if RUN.exists() else None
+        self.vaults = None
         self.payment = None
         self.txid = None
-        self.delivery = "pending"
-        self.review = {"alice": None, "bob": None}
-        self.signers = {"alice": "waiting", "bob": "waiting"}
-        self.approver_stored = {"alice": False, "bob": False}
+        self.review = dict.fromkeys(MEMBERS)
+        self.signers = dict.fromkeys(MEMBERS, "not_requested")
         self.processes = {}
         self.signer_threads = []
         self.worker = None
+        self.pay_binary = None
+        self.delivery = "pending"
         self.substage = None
+        self.approver_stored = dict.fromkeys(MEMBERS, False)
         self.relay = self._new_relay()
         self.leases = self.relay.leases
         self.member_sandbox = {}
-        self.tokens = {role: secrets.token_urlsafe(32) for role in ("admin", "alice", "bob")}
+        self.tokens = {role: secrets.token_urlsafe(32) for role in MEMBERS}
+        self.creator = None
+
+    def recover(self):
+        relay_demo.reap_recorded(ROOT / "relay")
+        self.chain.recover()
 
     def role(self, token: str) -> str | None:
         return next((role for role, secret in self.tokens.items()
                      if hmac.compare_digest(token, secret)), None)
 
-    def state(self, role: str, origin: str) -> dict:
+    def state(self, role: str) -> dict:
         with self.lock:
             out = {
                 "role": role, "phase": self.phase, "error": self.error,
-                "payment": self.payment, "txid": self.txid,
-                "signers": self.signers.copy(),
-                "approver_stored": {
-                    "alice": self.approver_stored["alice"] is True,
-                    "bob": self.approver_stored["bob"] is True,
-                },
-                "substage": self.substage,
-                "delivery": self.delivery,
+                "vaults": self.vaults, "payment": self.payment, "txid": self.txid,
+                "creator": self.creator,
+                "approver_stored": self.approver_stored.copy(),
+                "substage": self.substage, "delivery": self.delivery,
+                "approvals_count": sum(value == "approved" for value in self.signers.values()),
                 "network": self.chain.snapshot(),
             }
-            if role in self.review:
-                out["review"] = self.review[role]
-            if role == "admin":
-                out["links"] = {name: f"{origin}/#{self.tokens[name]}"
-                                for name in self.review}
+            out["review"] = self.review[role]
+            out["own_status"] = self.signers[role]
             return out
 
     def _command(self, args: list[str], timeout: int = 300) -> str:
@@ -100,83 +104,126 @@ class Flow:
                                or f"{Path(args[0]).name} exited {result.returncode}")
         return result.stdout
 
-    def start(self, amount: int, memo: str):
+    def _check_binaries(self):
+        binary("loki_setup_member")
+        self.pay_binary = binary("loki_member_payment")
+        feature = subprocess.run([str(self.pay_binary), "features"], capture_output=True, timeout=5)
+        if feature.returncode or feature.stdout != b"relay-backed-signing=1\n":
+            raise ValueError("build loki_member_payment with --features relay-communication")
+        binary("loki_relay_member")
+        self.relay.server = run.find_binary("loki-relay-server", workspace=REPO / "communication")
+
+    def create_vault(self, role: str):
+        with self.lock:
+            if self.phase != "idle":
+                raise ValueError("reset this demo before creating another vault")
+            self._check_binaries()
+            self.creator = role
+            self.phase = "creating_vault"
+            self.error = None
+            self.worker = threading.Thread(target=self._create_vault, daemon=True)
+            self.worker.start()
+
+    def _create_vault(self):
+        try:
+            self.chain.start()
+            self._command([sys.executable, str(POC / "run-member-payment.py"),
+                           "--name", self.chain.name, "--state", str(RUN), "--stage", "setup"], timeout=1200)
+            vaults = json.loads((RUN / "vaults.json").read_text())
+            if vaults["source"] == vaults["recipient"] or vaults["funded"]:
+                raise RuntimeError("vault setup returned invalid addresses or funding state")
+            with self.lock:
+                self.vaults = vaults
+                self.phase = "vault_ready"
+        except Exception as error:
+            self._fail(error)
+
+    def fund(self):
+        with self.lock:
+            if self.phase != "vault_ready" or not self.vaults:
+                raise ValueError("create the vault before funding it")
+            self.phase = "funding"
+            self.worker = threading.Thread(target=self._fund, daemon=True)
+            self.worker.start()
+
+    def _fund(self):
+        try:
+            self._command([sys.executable, str(POC / "run-member-payment.py"),
+                           "--name", self.chain.name, "--state", str(RUN), "--stage", "fund"], timeout=300)
+            vaults = json.loads((RUN / "vaults.json").read_text())
+            if vaults != {**self.vaults, "funded": True}:
+                raise RuntimeError("funding changed the vault addresses")
+            with self.lock:
+                self.vaults = vaults
+                self.phase = "funded"
+        except Exception as error:
+            self._fail(error)
+
+    def propose(self, role: str, amount: int, memo: str, pair: str, recipient: str):
         if not isinstance(amount, int) or isinstance(amount, bool) or not 0 < amount < 100_000_000:
             raise ValueError("amount must be between 1 and 99,999,999 zat")
         if not isinstance(memo, str) or not 0 < len(memo.encode("utf-8")) <= 512:
             raise ValueError("memo must contain 1 to 512 UTF-8 bytes")
+        if not isinstance(pair, str) or pair not in PAIRS:
+            raise ValueError("choose two vault members to approve")
+        if not isinstance(recipient, str) or not 10 <= len(recipient) <= 512 or any(c.isspace() for c in recipient):
+            raise ValueError("enter a recipient unified address")
         with self.lock:
-            if self.phase != "idle":
-                raise ValueError("reset this demo before starting another payment")
-            binary("loki_setup_member")
-            binary("loki_member_payment")
-            self.phase = "preparing"
+            if self.phase != "funded":
+                raise ValueError("fund the vault before proposing a payment")
+            self.phase = "preparing_payment"
             self.error = None
-            self.worker = threading.Thread(target=self._prepare, args=(amount, memo), daemon=True)
+            self.worker = threading.Thread(target=self._prepare,
+                                           args=(role, amount, memo, pair, recipient), daemon=True)
             self.worker.start()
 
-    def _prepare(self, amount: int, memo: str):
+    def _prepare(self, role: str, amount: int, memo: str, pair: str, recipient: str):
         try:
-            self._preflight_relay()
+            self._command([
+                sys.executable, str(POC / "run-member-payment.py"),
+                "--name", self.chain.name, "--state", str(RUN), "--manual", "--stage", "prepare",
+                "--amount-zat", str(amount), f"--memo={memo}",
+                "--proposer", str(MEMBERS[role]), "--pair", pair, "--recipient", recipient,
+                "--transport", "relay",
+            ], timeout=1200)
+            manifest = json.loads((RUN / "payment" / "payment.json").read_text())
+            pair_roles = PAIRS[pair]
+            if manifest["amount_zat"] != amount or manifest["pair"] != [MEMBERS[name] for name in pair_roles]:
+                raise RuntimeError("setup output differs from the payment manifest")
+            payment = {
+                "id": manifest["payment"], "source": self.vaults["source"],
+                "recipient": recipient, "amount_zat": manifest["amount_zat"],
+                "memo": bytes.fromhex(manifest["memo"]).decode("utf-8"),
+                "fee_zat": manifest["fee_zat"], "change_zat": manifest["change_zat"],
+                "expiry_height": manifest["expiry_height"], "pair": pair_roles,
+                "proposer": role, "recipient_verified": False,
+            }
             with self.lock:
-                self.substage = "ths_starting"
-            self.chain.start()
-            with self.lock:
-                self.substage = "vaults_preparing"
-            self._prepare_fixture(amount, memo, transport="relay")
-            with self.lock:
+                self.payment = payment
+                self.signers = {name: ("waiting" if name in pair_roles else "not_requested") for name in MEMBERS}
                 self.substage = "relays_starting"
             self.relay.prepare(RUN / "source")
             with self.lock:
+                self.phase = "waiting_for_reviews"
                 self.substage = "signers_starting"
-            self._start_signers(transport="relay")
+            self._start_signers()
+            with self.lock:
+                self.substage = None
         except Exception as error:
-            try:
-                self.relay.stop()
-            except Exception:
-                pass
+            self.relay.stop()
             self._fail(error)
-
-    def _preflight_relay(self) -> None:
-        run.find_binary("loki-relay-server", workspace=REPO / "communication")
-        run.find_binary("loki_relay_member", workspace=POC)
-        run.find_binary("loki_member_payment", workspace=POC)
-        binary("loki_setup_member")
-
-    def _prepare_fixture(self, amount: int, memo: str, transport: str = "relay") -> None:
-        output = self._command([
-            sys.executable, str(POC / "run-member-payment.py"),
-            "--name", self.chain.name, "--state", str(RUN), "--manual",
-            "--amount-zat", str(amount), f"--memo={memo}",
-        ], timeout=1200)
-        source = re.search(r"^Source vault: (uregtest\S+)$", output, re.M)
-        recipient = re.search(r"^Independent recipient: (uregtest\S+)$", output, re.M)
-        manifest = json.loads((RUN / "payment" / "payment.json").read_text())
-        if not source or not recipient or manifest["amount_zat"] != amount:
-            raise RuntimeError("setup output differs from the payment manifest")
-        if transport != "relay":
-            raise RuntimeError("payment preparation uses the relay transport")
-        payment = {
-            "id": manifest["payment"], "source": source.group(1),
-            "recipient": recipient.group(1), "amount_zat": manifest["amount_zat"],
-            "memo": bytes.fromhex(manifest["memo"]).decode("utf-8"),
-            "fee_zat": manifest["fee_zat"], "change_zat": manifest["change_zat"],
-            "expiry_height": manifest["expiry_height"],
-        }
-        with self.lock:
-            self.payment = payment
-            self.phase = "waiting_for_reviews"
 
     def _new_relay(self) -> RelayDemo:
         return RelayDemo(
             ROOT, (ROOT / "loki-relay-server", ROOT / "loki_relay_member", ROOT / "loki_setup_member"),
-            self.cancel, None)
+            self.cancel, None, snapshots=True)
 
     def _payment_env(self):
         return self.chain.client.env() if self.chain.client else None
 
     def _start_signers(self, transport: str = "relay") -> None:
-        for name, number in (("alice", 1), ("bob", 2)):
+        for name in self.payment["pair"]:
+            number = MEMBERS[name]
             owner = RUN / "source" / f"member-{number}"
             args = self.wrap_member(number, [
                 str(binary("loki_member_payment")), "sign", str(owner),
@@ -223,7 +270,7 @@ class Flow:
                 if line == "stored":
                     lines.append(line)
             code = process.wait()
-            approved = f"approved payment {self.payment['id']} as member {1 if name == 'alice' else 2}"
+            approved = f"approved payment {self.payment['id']} as member {MEMBERS[name]}"
             stored_after_approval = (
                 code == 0
                 and approved in lines
@@ -234,8 +281,11 @@ class Flow:
                 if stored_after_approval:
                     self.signers[name] = "approved"
                     self.approver_stored[name] = True
-                    if all(value == "approved" for value in self.signers.values()):
+                    if all(self.signers[role] == "approved" for role in self.payment["pair"]):
                         self.phase = "ready_to_send"
+                elif approved in lines:
+                    self.signers[name] = "delivery_pending"
+                    self.error = f"{name}'s share is saved locally; relay delivery needs retry"
                 elif self.signers[name] == "declined":
                     self.phase = "declined"
                 else:
@@ -247,11 +297,21 @@ class Flow:
             self._fail(error)
 
     def decide(self, role: str, action: str):
-        if role not in self.review or action not in ("approve", "decline"):
+        if role not in self.review or action not in ("approve", "decline", "retry"):
             raise ValueError("a signer must approve or decline")
         with self.lock:
             if self.phase != "waiting_for_reviews":
                 raise ValueError("this signing attempt is no longer awaiting approvals")
+            if role not in self.payment["pair"]:
+                raise ValueError("this member is not asked to approve this payment")
+            if action == "retry":
+                if self.signers[role] != "delivery_pending":
+                    raise ValueError("this member has no saved approval to retry")
+                self.signers[role] = "signing"
+                reader = threading.Thread(target=self._retry_delivery, args=(role,), daemon=True)
+                self.signer_threads.append(reader)
+                reader.start()
+                return
             if self.signers[role] != "reviewing" or not self.review[role]:
                 raise ValueError("this member has no verified review awaiting a decision")
             process = self.processes[role]
@@ -261,22 +321,41 @@ class Flow:
             process.stdin.write(f"APPROVE {self.payment['id']}\n" if action == "approve" else "DECLINE\n")
             process.stdin.flush()
 
-    def finish(self):
+    def _retry_delivery(self, role):
+        try:
+            worker = self.relay.workers.get(MEMBERS[role])
+            if worker is not None and not worker.settled.wait(5):
+                raise RuntimeError("payment worker did not settle")
+            self.resend_saved_share(MEMBERS[role])
+            with self.lock:
+                self.signers[role] = "approved"
+                self.approver_stored[role] = True
+                self.error = None
+                if all(self.signers[member] == "approved" for member in self.payment["pair"]):
+                    self.phase = "ready_to_send"
+        except Exception as error:
+            with self.lock:
+                self.signers[role] = "delivery_pending"
+                self.error = f"{role}'s relay delivery needs retry: {error}"
+
+    def finish(self, role: str):
         with self.lock:
             if self.phase != "ready_to_send":
                 raise ValueError("both members must approve before sending")
             self.phase = "sending"
-            self.worker = threading.Thread(target=self._finish, daemon=True)
+            self.worker = threading.Thread(target=self._finish, args=(role,), daemon=True)
             self.worker.start()
 
-    def _finish(self):
+    def _finish(self, role: str):
         try:
-            owner = RUN / "source" / "member-3"
+            member_id = MEMBERS[role]
+            self.relay.settle(timeout=5)
+            owner = RUN / "source" / f"member-{member_id}"
             base = [str(owner), str(owner / "pass.txt"), str(RUN / "source" / "roster.json"),
                     str(RUN / "payment")]
             program = str(binary("loki_member_payment"))
             out = self.relay.run_payment(
-                3, self.wrap_member(3, [program, "finish", *base, "--transport", "relay"]),
+                member_id, self.wrap_member(member_id, [program, "finish", *base, "--transport", "relay"]),
                 timeout=900, env=self._payment_env(), cwd=str(POC))
             match = re.search(r"broadcast txid=([0-9a-f]{64}) payment=([0-9a-f]{64})", out)
             if not match or match.group(2) != self.payment["id"]:
@@ -287,24 +366,29 @@ class Flow:
                 self.phase = "broadcast"
             self.chain.mine(3)
             verified = self.relay.run_payment(
-                3, self.wrap_member(3, [program, "verify", *base, "--transport", "relay", txid]),
+                member_id, self.wrap_member(member_id, [program, "verify", *base, "--transport", "relay", txid]),
                 timeout=900, env=self._payment_env(), cwd=str(POC))
-            recipient = RUN / "recipient" / "member-1"
-            received = self._command(self.wrap_member("recipient", [
-                program, "receive", str(recipient), str(recipient / "pass.txt"),
-                str(RUN / "recipient" / "roster.json"), str(RUN / "payment"),
-                "--transport", "relay", txid,
-            ]))
-            if f"verified mined txid={txid}" not in verified or f"recipient independently decrypted txid={txid}" not in received:
+            if f"verified mined txid={txid}" not in verified:
                 raise RuntimeError("mined transaction verification did not match")
+            local_recipient = self.payment["recipient"] == self.vaults["recipient"]
+            if local_recipient:
+                recipient = RUN / "recipient" / "member-1"
+                received = self._command(self.wrap_member("recipient", [
+                    program, "receive", str(recipient), str(recipient / "pass.txt"),
+                    str(RUN / "recipient" / "roster.json"), str(RUN / "payment"),
+                    "--transport", "relay", txid,
+                ]))
+                if f"recipient independently decrypted txid={txid}" not in received:
+                    raise RuntimeError("recipient vault did not verify the payment")
             with self.lock:
+                self.payment["recipient_verified"] = local_recipient
                 self.phase = "confirmed"
         except Exception as error:
             self._fail(error)
 
     def resend_saved_share(self, member_id: int) -> str:
         """Resend a saved share through the relay. Approval does not mean the share was fetched."""
-        if member_id not in (1, 2):
+        if not self.payment or member_id not in [MEMBERS[role] for role in self.payment["pair"]]:
             raise ValueError("only a selected signer can resend")
         if self.delivery != "pending":
             raise ValueError("saved-share resend is only while delivery is pending")
@@ -317,7 +401,7 @@ class Flow:
     def bind_member_sandbox(self) -> None:
         """Deny mailbox, other member roots, and relay stores for later payment children."""
         import relay_sandbox
-        mailbox = RUN / "payment" / "work" / "mailbox"
+        mailbox = RUN / "payment" / "mailbox"
         relay_root = ROOT / "relay"
         members = {member_id: RUN / "source" / f"member-{member_id}" for member_id in (1, 2, 3)}
         profiles = {}
@@ -354,10 +438,14 @@ class Flow:
         self.processes.clear()
         for reader in self.signer_threads:
             reader.join(timeout=5)
+            if reader.is_alive():
+                raise ValueError("wait for the current approval to finish before resetting")
         self.signer_threads.clear()
 
-    def reset(self):
+    def reset(self, role: str):
         with self.lock:
+            if self.phase != "interrupted" and role != self.creator:
+                raise ValueError("only the member who started this local test can reset it")
             if self.worker and self.worker.is_alive():
                 raise ValueError("wait for the current operation to finish before resetting")
         sandboxed = bool(self.member_sandbox)
@@ -377,12 +465,13 @@ class Flow:
             self.relay = self._new_relay()
             self.leases = self.relay.leases
             self.phase = "idle"
-            self.error = self.payment = self.txid = None
+            self.error = self.vaults = self.payment = self.txid = None
             self.delivery = "pending"
             self.substage = None
-            self.review = {"alice": None, "bob": None}
-            self.signers = {"alice": "waiting", "bob": "waiting"}
-            self.approver_stored = {"alice": False, "bob": False}
+            self.creator = None
+            self.review = dict.fromkeys(MEMBERS)
+            self.signers = dict.fromkeys(MEMBERS, "not_requested")
+            self.approver_stored = dict.fromkeys(MEMBERS, False)
             self.member_sandbox = {}
             if sandboxed:
                 self.bind_member_sandbox()
@@ -434,8 +523,7 @@ class Handler(BaseHTTPRequestHandler):
             role = self.role()
             if not role:
                 return self.json(401, {"error": "open a member link from the coordinator"})
-            origin = f"http://127.0.0.1:{self.server.server_port}"
-            return self.json(200, FLOW.state(role, origin))
+            return self.json(200, FLOW.state(role))
         if path == "/api/relay/snapshot":
             role = self.role()
             if not role:
@@ -445,7 +533,7 @@ class Handler(BaseHTTPRequestHandler):
                 member = int(query.get("member", ["0"])[0])
             except ValueError:
                 return self.json(400, {"error": "member must be 1, 2, or 3"})
-            allowed = {"admin": {1, 2, 3}, "alice": {1}, "bob": {2}}.get(role, set())
+            allowed = {MEMBERS[role]}
             if member not in allowed:
                 return self.json(403, {"error": "this member cannot view that relay member"})
             return self.json(200, FLOW.relay.cached_snapshot(member))
@@ -510,19 +598,24 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("request body too large")
             body = json.loads(self.rfile.read(length) or b"{}")
             path = self.path.split("?", 1)[0]
-            if path == "/api/start" and role == "admin":
-                FLOW.start(body.get("amount_zat"), body.get("memo"))
-            elif path == "/api/decide" and role in ("alice", "bob"):
+            if path == "/api/create-vault":
+                FLOW.create_vault(role)
+            elif path == "/api/fund":
+                FLOW.fund()
+            elif path == "/api/propose":
+                FLOW.propose(role, body.get("amount_zat"), body.get("memo"),
+                             body.get("pair"), body.get("recipient"))
+            elif path == "/api/decide":
                 FLOW.decide(role, body.get("action"))
-            elif path == "/api/finish" and role == "admin":
-                FLOW.finish()
-            elif path == "/api/reset" and role == "admin":
-                FLOW.reset()
-            elif path == "/api/relay/restart" and role == "admin":
+            elif path == "/api/finish":
+                FLOW.finish(role)
+            elif path == "/api/reset":
+                FLOW.reset(role)
+            elif path == "/api/relay/restart" and role == FLOW.creator:
                 FLOW.relay.restart_relay(body.get("relay"))
-            elif path == "/api/relay/stop" and role == "admin":
+            elif path == "/api/relay/stop" and role == FLOW.creator:
                 FLOW.relay.stop_relay(body.get("relay"))
-            elif path == "/api/relay/member" and role == "admin":
+            elif path == "/api/relay/member" and role == FLOW.creator:
                 member = body.get("member")
                 action = body.get("action")
                 if action == "pause":
@@ -531,7 +624,7 @@ class Handler(BaseHTTPRequestHandler):
                     FLOW.relay.resume_member(member)
                 else:
                     raise ValueError("action must be pause or resume")
-            elif path == "/api/relay/resend" and role == "admin":
+            elif path == "/api/relay/resend" and role == FLOW.creator:
                 FLOW.resend_saved_share(body.get("member"))
             else:
                 return self.json(403, {"error": "this member cannot take that action"})
@@ -552,6 +645,7 @@ def use_sandbox(path: Path) -> Flow:
     return FLOW
 
 
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
@@ -564,17 +658,18 @@ def main():
         if sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").is_file():
             parser.error("macOS sandbox-exec is required for the relay payment gate")
         FLOW.bind_member_sandbox()
-    lock_path = ROOT / ".lock" if args.sandbox is not None else DEMO / ".member-sandbox.lock"
+    lock_path = ROOT.with_suffix(".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock_file = lock_path.open("a")
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         parser.error("another member demo already owns this sandbox")
-    FLOW.chain.recover()
+    FLOW.recover()
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    print(f"Coordinator: http://127.0.0.1:{args.port}/#{FLOW.tokens['admin']}", flush=True)
-    print("Open signer links from the coordinator in two separate browser sessions.", flush=True)
+    for role, token in FLOW.tokens.items():
+        print(f"{role.title()}: http://127.0.0.1:{args.port}/#{token}", flush=True)
+    print("Open each member URL in a separate browser profile.", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

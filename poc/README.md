@@ -3,6 +3,7 @@
 A research prototype for **threshold-signed shielded Zcash payments**: a 2-of-3 FROST
 account that spends an Ironwood note, where the signature is produced **before** the
 transaction has a proof or an anchor.
+The separate-member local courier path also exercises 2-of-4; the relay path remains 2-of-3.
 
 This is a prototype on a local regtest chain. **It is not a wallet and not custody
 software.** What it does and does not establish is stated precisely below and in the
@@ -16,8 +17,8 @@ result documents, which are the authority.
 | **Full G1** | **BLOCKED**. Separate-member setup has a local ZIP 2005 `use_qsk` derivation with an independently calculated vector and a mined regtest payment, but the derivation has not been independently reviewed or upstreamed. The original transaction CLI still uses its documented **test-only** key splice |
 | **G3** (browser nonce safety) | **PARTIAL** and separate. 29/32 drills on Chromium, 6/8 on WebKit, Firefox would not launch, no physical device case tested |
 | **Second-device finishing** | seed-flow THS validation: a party holding none of the approvers' files completed both posted and re-proving paths with one and two inputs. Replicas carry confidential randomizer seeds ([evidence](FROST-RANDOMIZER-RESULTS.md)) |
-| **Separate-member setup** | three isolated processes complete DKG; each member checks a 24-word and card backup before the regtest address appears, and a clean restore works without the exchange directory. Activated member stores feed the mined regtest payment flow ([details](SEPARATE-MEMBER-SETUP.md)) |
-| **Signing sessions** | a 2-of-3 attempt with explicit member review, fresh RAM-only nonces, encrypted local messages, sealed exact-share resend, and independent signature assembly. `loki_member_payment` connects it to separate-member setup and a mined THS regtest payment ([scope](SIGNING-SESSION.md)) |
+| **Separate-member setup** | three or four isolated processes complete threshold-two DKG; each member checks a 24-word and card backup before the regtest address appears. Activated 2-of-4 member stores fed a mined regtest payment through the local courier. A clean restore without the exchange directory was demonstrated on 2-of-3 ([details](SEPARATE-MEMBER-SETUP.md)) |
+| **Signing sessions** | a 2-of-3 relay attempt with explicit member review and independent finishing. The relay-backed `commit`/`package`/`approve` path seals nonces across invocations and requires two pinned relay nonce receipts before signing; a staged regtest payment was mined. The simultaneous local-courier `sign` command supports 2-of-3 and 2-of-4 but remains a RAM-only demo ([scope](SIGNING-SESSION.md)) |
 | **Recovery, key rotation, custody** | local two-artifact restore demonstrated on regtest; independent spend, key rotation in the wallet, and custody readiness **not established** |
 
 ## Quick start
@@ -153,9 +154,10 @@ honest session needs a new `LOKI_ROUND` and fresh nonce commitments. See
   derivation, but that derivation and backup format have not been independently
   reviewed.
 - Regtest only, one machine and one recipient. AB/AC/BC payments and independent finishing mined under the migration; seed-based AB/AC/BC independent two-input finishing is verified offline.
-- Member state is plain files with no rollback guarantee. A nonce is deleted after use,
-  which is not a crash-safe consumed-nonce ledger. Batch validation does not make share
-  writes and nonce deletion atomic.
+- The staged relay-backed signer has a durable first-write nonce index and burns an
+  interrupted attempt. Its rollback defense assumes one honest, reachable relay
+  in the pinned pair. The old simultaneous signer and other prototype paths do
+  not have this defense. Browser and physical power-loss behavior remain untested.
 - The "second device" is a second process on the same machine reading a locally copied
   replica. Seeds require a confidential handoff; on Unix the replica directory is 0700
   and seed files are 0600. No deployed relay or second piece of hardware is

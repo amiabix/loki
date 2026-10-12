@@ -80,6 +80,20 @@ def verify():
     assert 'loki-relay-server' not in client_package['dependencies']
     client_package['dependencies'].append('loki-relay-server')
     client_package['dependencies'].sort()
+    # The account-control adapter uses the ZIP 32 package already in the pinned
+    # graph. Allow only that direct dependency; all package sources stay pinned.
+    poc_manifest = approved['manifests']['poc/Cargo.toml']
+    bip39 = 'bip39              = { version = "2.2.2", default-features = false, features = ["std"] }\n'
+    assert poc_manifest['approved'].count(bip39) == 1
+    poc_manifest['approved'] = poc_manifest['approved'].replace(
+        bip39, bip39 + 'zip32              = "=0.2.1"\n')
+    poc_packages = approved['locks']['poc/Cargo.lock']['approved']
+    zip32 = [p for p in poc_packages if p['name'] == 'zip32']
+    assert len(zip32) == 1 and zip32[0]['version'] == '0.2.1'
+    poc_package = next(p for p in poc_packages if p['name'] == 'loki-poc')
+    assert 'zip32' not in poc_package['dependencies']
+    poc_package['dependencies'].append('zip32')
+    poc_package['dependencies'].sort()
     for entry in artifact['packages']:
         directory = vendor / entry['directory']
         archives = list(args.cache.glob('*/' + entry['directory'] + '.crate'))

@@ -580,3 +580,83 @@ fn control_pipe_pages_a_snapshot_and_a_broken_export_keeps_publication() {
     assert_eq!(published, expected);
     assert_eq!(courier.database().recover_logical(0, 10).unwrap().len(), 1);
 }
+
+#[test]
+fn reopened_couriers_start_distinct_observation_producers() {
+    use std::io::{BufRead, BufReader};
+    use std::os::fd::IntoRawFd;
+    let (root, pass, roster) = member_root(1);
+    let mut observations = Vec::new();
+    for _ in 0..2 {
+        let mut courier = RelayCourier::open(&root, &pass, &roster).unwrap();
+        let (observe_read, observe_write) = std::io::pipe().unwrap();
+        let (control_read, _control_write) = std::io::pipe().unwrap();
+        let (_response_read, response_write) = std::io::pipe().unwrap();
+        courier
+            .attach_inherited(
+                observe_write.into_raw_fd(),
+                control_read.into_raw_fd(),
+                response_write.into_raw_fd(),
+            )
+            .unwrap();
+        courier.note_approved(&context(), 1, [3; 32]);
+        let mut line = String::new();
+        BufReader::new(observe_read).read_line(&mut line).unwrap();
+        let event: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(event["producer_sequence"], 1);
+        assert_eq!(event["event_type"], "approved");
+        let producer = event["producer_id"].as_str().unwrap();
+        assert!(producer.starts_with("member-1-"));
+        assert!(producer.len() <= 64);
+        observations.push(event);
+    }
+    assert_eq!(observations[0]["run_id"], observations[1]["run_id"]);
+    assert_ne!(
+        observations[0]["producer_id"],
+        observations[1]["producer_id"]
+    );
+}
+
+#[test]
+fn signing_observations_identify_the_local_actor_and_authenticated_sender() {
+    let (root, pass, roster) = member_root(3);
+    let mut courier = RelayCourier::open(&root, &pass, &roster).unwrap();
+    courier.set_events(
+        loki_poc::relay_member::PublicEventWriter::new("actor-test", "member-3-test").unwrap(),
+    );
+    let mut context = context();
+    context.pair = [1, 3];
+    courier.note_approved(&context, 3, [3; 32]);
+    let events = courier.pop_events();
+    assert_eq!(events.len(), 1);
+    let approval: Value = serde_json::from_slice(&events[0]).unwrap();
+    assert_eq!(approval["event_type"], "approved");
+    assert_eq!(approval["actor_member"], 3);
+    assert_eq!(approval["authenticated_sender"], 3);
+    assert!(approval.get("recipient_member").is_none());
+    assert!(approval.get("message_id").is_none());
+
+    let identity_raw = loki_poc::state::MemberDir::open(&root, "secrets")
+        .read_sealed("identity.sealed", PASS)
+        .unwrap();
+    let own = Identity::from_secret_bytes(&identity_raw).unwrap();
+    let sender = Identity::new(1);
+    let wire = sender
+        .seal_session(
+            &own.public(),
+            &context,
+            MessageKind::Package,
+            b"reviewed package",
+        )
+        .unwrap();
+    let opened = own.open_session(&sender.public(), &context, &wire).unwrap();
+    courier.note_application(true, &opened);
+    let events = courier.pop_events();
+    assert_eq!(events.len(), 1);
+    let application: Value = serde_json::from_slice(&events[0]).unwrap();
+    assert_eq!(application["event_type"], "application_accepted");
+    assert_eq!(application["actor_member"], 3);
+    assert_eq!(application["authenticated_sender"], 1);
+    assert_eq!(application["recipient_member"], 3);
+    assert!(application.get("message_id").is_none());
+}

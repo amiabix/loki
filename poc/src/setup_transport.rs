@@ -60,7 +60,7 @@ impl Identity {
             return Err("invalid DKG identity length".into());
         }
         let id = u16::from_be_bytes(bytes[..2].try_into().unwrap());
-        if !(1..=3).contains(&id) {
+        if !(1..=4).contains(&id) {
             return Err("invalid DKG member id".into());
         }
         Ok(Self {
@@ -282,7 +282,7 @@ impl Identity {
         context.validate()?;
         if self.id == recipient.id
             || !context.pair.contains(&self.id)
-            || !(1..=3).contains(&recipient.id)
+            || !(1..=4).contains(&recipient.id)
             || (!context.pair.contains(&recipient.id)
                 && !matches!(kind, MessageKind::Package | MessageKind::Share))
             || body.len() > kind.max_body()
@@ -367,7 +367,7 @@ impl Identity {
         session_envelope(wire)?;
         if sender.id == recipient
             || !context.pair.contains(&sender.id)
-            || !(1..=3).contains(&recipient)
+            || !(1..=4).contains(&recipient)
         {
             return Err("sender or recipient outside signing pair".into());
         }

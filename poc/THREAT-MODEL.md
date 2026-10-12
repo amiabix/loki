@@ -1,5 +1,9 @@
 # Who has to be malicious, and what do they get?
 
+This chapter records the earlier local seed-flow and rollback drill. The staged
+relay-backed signing path now uses first-write nonce claims from two pinned
+relays; its conditional rollback boundary is in [Signing sessions](SIGNING-SESSION.md).
+
 Two questions that turned out to be one. `nonce-reuse-drill.sh` showed a signing share can
 be leaked by a rollback **paired with a rebuilt candidate**, and the party that rebuilds the
 candidate is the coordinator. So the cost of a leak and the power of the coordinator have to

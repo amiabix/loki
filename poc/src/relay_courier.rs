@@ -272,6 +272,7 @@ pub struct RelayCourier {
     runtime: RelayRuntime,
     http: RelayHttp,
     accepted: BTreeSet<[u8; 32]>,
+    observed_messages: BTreeMap<[u8; 32], [u8; 32]>,
     events: Option<PublicEventWriter>,
     observe: Option<File>,
     control: Option<File>,
@@ -296,6 +297,7 @@ impl RelayCourier {
             runtime,
             http,
             accepted: BTreeSet::new(),
+            observed_messages: BTreeMap::new(),
             events: None,
             observe: None,
             control: None,
@@ -351,7 +353,10 @@ impl RelayCourier {
         set_nonblocking(&control);
         let response = unsafe { File::from_raw_fd(response) };
         let id = self.session.member.identity.public().id;
-        let writer = PublicEventWriter::new(&export_run_id(&self.session), &format!("member-{id}"))
+        let mut producer_nonce = [0; 16];
+        OsRng.fill_bytes(&mut producer_nonce);
+        let producer_id = format!("member-{id}-{}", hex::encode(producer_nonce));
+        let writer = PublicEventWriter::new(&export_run_id(&self.session), &producer_id)
             .map_err(|_| "export_fd".to_string())?;
         self.set_events(writer);
         self.observe = Some(observe);
@@ -460,12 +465,14 @@ impl SessionCourier for RelayCourier {
         if carrier.author != self.session.member.identity.public().id {
             return Err("carrier_author".into());
         }
-        commit_carrier(
+        let committed = commit_carrier(
             &mut self.session.db,
             &self.session.member.identity,
             &self.session.member.roster,
             &carrier,
         )?;
+        self.observed_messages
+            .insert(carrier.envelope_hash, committed.message);
         Ok(blake3::hash(wire).into())
     }
 
@@ -566,6 +573,8 @@ impl RelayCourier {
                 if message.kind() != kind || message.sender() != sender {
                     continue;
                 }
+                self.observed_messages
+                    .insert(message.wire_hash(), original.key.message);
                 if persist {
                     self.remember(carrier.envelope_hash)?;
                     self.emit_signing(
@@ -700,6 +709,7 @@ impl RelayCourier {
             return;
         };
         let mut fields = serde_json::json!({
+            "actor_member": self.session.member.identity.public().id,
             "authenticated_sender": sender,
             "kind": kind as u8,
             "envelope_hash": hex::encode(envelope_hash),
@@ -707,6 +717,9 @@ impl RelayCourier {
             "payment_id": hex::encode(context.payment),
             "attempt_id": hex::encode(context.attempt.0),
         });
+        if let Some(message_id) = self.observed_messages.get(&envelope_hash) {
+            fields["message_id"] = serde_json::json!(hex::encode(message_id));
+        }
         if let Some(recipient) = recipient {
             fields["recipient_member"] = serde_json::json!(recipient);
         }

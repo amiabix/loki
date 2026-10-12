@@ -37,3 +37,13 @@ CREATE TABLE IF NOT EXISTS objects (
     UNIQUE (mailbox, sequence),
     FOREIGN KEY (mailbox) REFERENCES mailboxes(id)
 ) STRICT;
+
+-- First-writer-wins nonce claims survive relay restarts for the lifetime of this root.
+CREATE TABLE IF NOT EXISTS nonce_uses (
+    mailbox BLOB NOT NULL CHECK (length(mailbox) = 32),
+    cid BLOB NOT NULL CHECK (length(cid) = 32),
+    record_hash BLOB NOT NULL CHECK (length(record_hash) = 32),
+    wire BLOB NOT NULL CHECK (length(wire) > 0 AND length(wire) <= 65536),
+    PRIMARY KEY (mailbox, cid),
+    FOREIGN KEY (mailbox) REFERENCES mailboxes(id)
+) STRICT;

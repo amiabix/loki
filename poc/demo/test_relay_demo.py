@@ -203,6 +203,32 @@ class RelaySchedulingTests(unittest.TestCase):
         process.stdin.flush()
         self.demo.settle(timeout=3)
 
+    def test_snapshot_timeout_discards_late_and_mismatched_pages(self):
+        responses = mock.Mock()
+        worker = SimpleNamespace(process=SimpleNamespace(poll=lambda: None),
+                                 control_w=7, responses=responses, snapshot_lock=threading.Lock())
+        self.demo.workers[1] = worker
+        self.addCleanup(self.demo.workers.clear)
+        responses.get.side_effect = relay_demo.queue.Empty
+        with mock.patch.object(relay_demo.os, "write"):
+            with self.assertRaisesRegex(RuntimeError, "snapshot"):
+                self.demo.service_snapshot(1, snapshot_id="old-generation")
+        self.assertTrue(self.demo.cached_snapshot(1)["stale"])
+        page = {"version": 1, "snapshot_id": "new-generation", "member": 1,
+                "section": "objects", "after": "5", "next": "6",
+                "complete": True, "rows": [{"message_id": "ab" * 32}]}
+        stale = [dict(page, snapshot_id="old-generation"), dict(page, member=2),
+                 dict(page, section="logical"), dict(page, after="0")]
+        responses.get.side_effect = [json.dumps(item).encode() for item in [*stale, page]]
+        with mock.patch.object(relay_demo.os, "write"):
+            actual = self.demo.service_snapshot(1, "objects", snapshot_id="new-generation", after="5")
+        self.assertEqual(actual, page)
+        self.assertEqual(self.demo.cached_snapshot(1), {"stale": False, "page": page})
+        self.assertEqual(responses.get.call_count, 6)
+        waits = [call.kwargs["timeout"] for call in responses.get.call_args_list]
+        self.assertTrue(all(0 < timeout <= 1 for timeout in waits))
+        self.assertTrue(all(later <= earlier for earlier, later in zip(waits[1:], waits[2:])))
+
     def test_observe_pipe_reaches_the_public_projection(self):
         script = (
             "import json, os, sys\n"
@@ -334,6 +360,29 @@ class RelaySchedulingTests(unittest.TestCase):
         self.assertEqual(self.demo.chain_start_calls, 0)
         with self.assertRaisesRegex(ValueError, "relay"):
             self.demo.restart_relay(4)
+
+    def test_refresh_collects_pages_and_populates_the_cached_inventory(self):
+        self.demo.projection.run_id = "demo-1"
+        calls = []
+        message = "ab" * 32
+        def snapshot(member, section, *, snapshot_id, after):
+            calls.append((section, snapshot_id, after))
+            rows = [{"message_id": message, "state": "committed"}] if section == "logical" else [
+                {"message_id": message, "actor_member": 1, "recipient_member": 2,
+                 "object_hash": "cd" * 32, "object_ordinal": int(after) + 1}]
+            return {"version": 1, "snapshot_id": snapshot_id, "section": section,
+                    "run_id": "demo-1", "member": member, "owner": member,
+                    "config_revision": 1, "rows": rows,
+                    "complete": section == "logical" or after == "1", "next": "1"}
+        with mock.patch.object(self.demo, "service_snapshot", side_effect=snapshot):
+            self.demo.refresh_snapshots(1)
+            self.demo.refresh_snapshots(1)
+        state = self.demo.projection.state("bob")
+        self.assertEqual(state["messages"], [message])
+        self.assertEqual(state["logical_committed"], 1)
+        self.assertEqual(len(self.demo.projection.objects("bob", message, 0, 100)["rows"]), 2)
+        self.assertEqual([call[2] for call in calls[:3]], ["0", "0", "1"])
+        self.assertNotEqual(calls[0][1], calls[3][1])
 
 
 if __name__ == "__main__":

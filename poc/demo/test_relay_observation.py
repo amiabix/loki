@@ -114,6 +114,16 @@ class ProjectionTests(unittest.TestCase):
         admin = self.projection.events("admin", 0)
         self.assertEqual(len(admin["events"]), 2)
 
+    def test_carol_sees_its_native_events_and_public_lifecycle(self):
+        self.projection.ingest(self.event(1, "request_start", actor_member=1, recipient_member=2))
+        self.projection.ingest(self.event(2, "request_start", actor_member=3, recipient_member=2))
+        self.projection.note_lifecycle("relay_stopped", relay=1)
+        carol = self.projection.events("carol", 0)
+        self.assertEqual([event["event_type"] for event in carol["events"]],
+                         ["request_start", "relay_stopped"])
+        self.assertEqual(carol["events"][0]["actor_member"], 3)
+        self.assertEqual(self.projection.state("carol")["relays"]["1"]["status"], "stopped")
+
     def test_alice_objects_hide_bob_copies(self):
         pages = [{
             "version": 1, "snapshot_id": "generation-1", "member": 1, "owner": 1,
@@ -198,11 +208,11 @@ class CachedApiTests(unittest.TestCase):
         flow, member_demo = self.flow()
         spawned = []
         with patch.object(subprocess, "Popen", side_effect=lambda *args, **kwargs: spawned.append(args)):
-            state = self.get(flow, member_demo, "/api/relay/state", flow.tokens["admin"])
+            state = self.get(flow, member_demo, "/api/relay/state", flow.tokens["carol"])
             events = self.get(flow, member_demo, "/api/relay/events?after=0", flow.tokens["alice"])
             missing = self.get(flow, member_demo, f"/api/relay/messages/{OTHER}/objects?after=0&limit=100",
-                               flow.tokens["admin"])
-            invalid = self.get(flow, member_demo, "/api/relay/events?after=nope", flow.tokens["admin"])
+                               flow.tokens["carol"])
+            invalid = self.get(flow, member_demo, "/api/relay/events?after=nope", flow.tokens["carol"])
         self.assertEqual(spawned, [])
         self.assertEqual(state["code"], 200)
         self.assertEqual(events["code"], 200)
@@ -238,11 +248,12 @@ class CachedApiTests(unittest.TestCase):
             handler.do_POST()
         return captured
 
-    def test_admin_actions_are_fixed_and_pause_of_a_signer_is_busy(self):
+    def test_creator_actions_are_fixed_and_pause_of_a_signer_is_busy(self):
         from types import SimpleNamespace
         flow, member_demo = self.flow()
+        flow.creator = "carol"
         flow.leases.reserve(1, "sign")
-        busy = self.post(flow, member_demo, "/api/relay/member", flow.tokens["admin"],
+        busy = self.post(flow, member_demo, "/api/relay/member", flow.tokens["carol"],
                          {"member": 1, "action": "pause"})
         self.assertEqual(busy["code"], 400)
         self.assertIn("busy", busy["body"]["error"])
@@ -267,11 +278,11 @@ class CachedApiTests(unittest.TestCase):
         restarted = []
         with patch.object(member_demo.run, "restart_relay",
                           lambda owner, relay, server, deadline: restarted.append(relay.run_id)):
-            accepted = self.post(flow, member_demo, "/api/relay/restart", flow.tokens["admin"],
+            accepted = self.post(flow, member_demo, "/api/relay/restart", flow.tokens["carol"],
                                  {"relay": 2})
         self.assertEqual(accepted["code"], 200)
         self.assertEqual(restarted, ["run-2"])
-        stopped = self.post(flow, member_demo, "/api/relay/stop", flow.tokens["admin"], {"relay": 2})
+        stopped = self.post(flow, member_demo, "/api/relay/stop", flow.tokens["carol"], {"relay": 2})
         self.assertEqual(stopped["code"], 200)
         self.assertTrue(child.stopped)
         self.assertEqual(flow.chain_start_calls if hasattr(flow, "chain_start_calls") else 0, 0)

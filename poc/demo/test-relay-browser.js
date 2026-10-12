@@ -266,13 +266,24 @@ async function runOnce() {
   assert.equal(inner.textContent.includes('Carol'), false);
   assert.match(inspector.textContent, /192 bytes/);
 
+  sandbox.memberRole = () => 'carol';
+  sandbox.acceptRelayEvents({events: [
+    {sequence: 60, event_type: 'approved', actor_member: 3, origin: 'native'},
+    {sequence: 61, event_type: 'approved', actor_member: 1, origin: 'native'},
+  ], next: 61});
+  sandbox.renderRelay();
+  assert.match(nodes.get('relay-timeline').textContent, /Carol approved/);
+  assert.equal(nodes.get('relay-timeline').textContent.includes('Alice approved'), false);
+  sandbox.memberRole = () => 'bob';
+  sandbox.demoState = () => ({creator: 'bob', payment: {pair: ['bob', 'carol']}});
+
   const actions = [];
   sandbox.act = async (path, body) => {
     actions.push({path: String(path), body: JSON.parse(JSON.stringify(body))});
   };
   nodes.get('relay-admin-relay').value = '2';
   nodes.get('relay-admin-member').value = '1';
-  nodes.get('relay-admin-resend').value = '2';
+  nodes.get('relay-admin-resend').value = '3';
   sandbox.renderRelay();
   const adminButtons = [];
   (function walk(node) {
@@ -290,7 +301,7 @@ async function runOnce() {
     {path: '/api/relay/restart', body: {relay: 2}},
     {path: '/api/relay/member', body: {member: 1, action: 'pause'}},
     {path: '/api/relay/member', body: {member: 1, action: 'resume'}},
-    {path: '/api/relay/resend', body: {member: 2}},
+    {path: '/api/relay/resend', body: {member: 3}},
   ]);
   sandbox.act = async () => {
     throw new Error('member 1 store is busy');

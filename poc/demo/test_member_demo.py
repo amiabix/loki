@@ -1,5 +1,6 @@
 """The UI may release a share only after that member's CLI review reaches its prompt."""
 
+import fcntl
 import json
 import socket
 import subprocess
@@ -24,32 +25,66 @@ class MemberDemoTest(unittest.TestCase):
         with patch.object(member_demo, "ROOT", root), patch.object(member_demo, "RUN", root / "run"):
             return member_demo.Flow()
 
-    def test_member_tokens_are_distinct_and_amount_is_checked_before_start(self):
+    def test_member_tokens_are_distinct_and_payment_needs_a_funded_vault(self):
         flow = self.flow()
         for name, token in flow.tokens.items():
             self.assertEqual(flow.role(token), name)
         self.assertEqual(len(set(flow.tokens.values())), 3)
         self.assertIsNone(flow.role("wrong"))
         with self.assertRaisesRegex(ValueError, "amount"):
-            flow.start(100_000_000, "memo")
+            flow.propose("bob", 100_000_000, "memo", "BC", "uregtest1recipient")
         self.assertEqual(flow.phase, "idle")
+        with self.assertRaisesRegex(ValueError, "fund"):
+            flow.propose("bob", 40_000_000, "memo", "BC", "uregtest1recipient")
+        self.assertIsNone(flow.payment)
 
     def test_member_state_returns_its_own_review(self):
         flow = self.flow()
-        flow.review = {"alice": "Alice's checked payment", "bob": "Bob's checked payment"}
-        alice = flow.state("alice", "http://127.0.0.1:8790")
-        bob = flow.state("bob", "http://127.0.0.1:8790")
-        carol = flow.state("admin", "http://127.0.0.1:8790")
+        flow.review = {"alice": "Alice's checked payment", "bob": "Bob's checked payment",
+                       "carol": "Carol's checked payment"}
+        alice = flow.state("alice")
+        bob = flow.state("bob")
+        carol = flow.state("carol")
         self.assertEqual(alice["review"], "Alice's checked payment")
         self.assertEqual(bob["review"], "Bob's checked payment")
         self.assertNotIn("links", alice)
         self.assertNotIn("links", bob)
-        self.assertNotIn("review", carol)
+        self.assertEqual(carol["review"], "Carol's checked payment")
+        self.assertNotIn("signers", alice)
+        self.assertNotIn("signers", bob)
+
+    def test_unselected_member_cannot_approve(self):
+        flow = self.flow()
+        flow.payment = {"id": "a" * 64, "pair": ("bob", "carol")}
+        flow.phase = "waiting_for_reviews"
+        with self.assertRaisesRegex(ValueError, "not asked"):
+            flow.decide("alice", "approve")
+        self.assertEqual(flow.signers["alice"], "not_requested")
+
+    def test_invalid_pair_does_not_start_preparing(self):
+        flow = self.flow()
+        flow.phase = "funded"
+        with self.assertRaisesRegex(ValueError, "choose two"):
+            flow.propose("bob", 12_000_000, "test", "AA", "uregtest1recipient")
+        self.assertEqual(flow.phase, "funded")
+
+    def test_actions_are_staged(self):
+        flow = self.flow()
+        with patch.object(member_demo, "binary", return_value=Path(sys.executable)), \
+             patch.object(member_demo.run, "find_binary", return_value=Path(sys.executable)), \
+             patch.object(subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=b"relay-backed-signing=1\n")), \
+             patch.object(flow, "_create_vault"):
+            flow.create_vault("bob")
+        self.assertEqual(flow.phase, "creating_vault")
+        self.assertEqual(flow.creator, "bob")
+        with self.assertRaisesRegex(ValueError, "vault"):
+            flow.fund()
+        flow.worker.join(timeout=3)
 
     def test_review_prompt_then_exact_member_approval(self):
         flow = self.flow()
         payment = "a" * 64
-        flow.payment = {"id": payment}
+        flow.payment = {"id": payment, "pair": ("alice", "bob")}
         flow.phase = "waiting_for_reviews"
         script = (
             "import sys\n"
@@ -70,32 +105,33 @@ class MemberDemoTest(unittest.TestCase):
         self.addCleanup(process.stdout.close)
         self.addCleanup(process.stdin.close)
         flow.processes["alice"] = process
-        reader = threading.Thread(target=flow._read_signer, args=("alice", process))
-        reader.start()
-        deadline = time.monotonic() + 3
-        while flow.signers["alice"] != "reviewing" and time.monotonic() < deadline:
-            time.sleep(.01)
-        self.assertEqual(flow.signers["alice"], "reviewing")
-        self.assertIn("Recipient: uregtest1recipient", flow.review["alice"])
-        with self.assertRaisesRegex(ValueError, "no verified review"):
-            flow.decide("bob", "approve")
-        flow.decide("alice", "approve")
-        reader.join(timeout=3)
-        self.assertFalse(reader.is_alive())
-        self.assertEqual(flow.signers["alice"], "approved")
+        with patch.object(flow, "_payment_env", return_value=None):
+            reader = threading.Thread(target=flow._read_signer, args=("alice", process))
+            reader.start()
+            deadline = time.monotonic() + 3
+            while flow.signers["alice"] != "reviewing" and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertEqual(flow.signers["alice"], "reviewing")
+            self.assertIn("Recipient: uregtest1recipient", flow.review["alice"])
+            with self.assertRaisesRegex(ValueError, "no verified review"):
+                flow.decide("bob", "approve")
+            flow.decide("alice", "approve")
+            reader.join(timeout=3)
+            self.assertFalse(reader.is_alive())
+            self.assertEqual(flow.signers["alice"], "approved")
 
-    def test_approval_without_stored_does_not_release_the_payment(self):
+    def test_local_share_is_not_approved_without_relay_delivery(self):
         flow = self.flow()
         payment = "a" * 64
-        flow.payment = {"id": payment}
+        flow.payment = {"id": payment, "pair": ("alice", "bob")}
         flow.phase = "waiting_for_reviews"
         script = (
             "import sys\n"
-            "print('Vault: ' + 'b'*64, flush=True)\n"
-            "print('Recipient: uregtest1recipient', flush=True)\n"
-            "print('Amount: 40000000 zat; memo: \\\"test\\\"', flush=True)\n"
-            "print('Fee: 10000 zat; change to vault: 59990000 zat; expiry height: 1152', flush=True)\n"
-            "print('Inputs: 1; candidate: ' + 'c'*64, flush=True)\n"
+            "print('Vault: checked', flush=True)\n"
+            "print('Recipient: checked', flush=True)\n"
+            "print('Amount: checked', flush=True)\n"
+            "print('Fee: checked', flush=True)\n"
+            "print('Inputs: checked', flush=True)\n"
             f"print('Type APPROVE {payment} to sign:', flush=True)\n"
             f"if input() != 'APPROVE {payment}': sys.exit(1)\n"
             f"print('approved payment {payment} as member 1', flush=True)\n"
@@ -104,17 +140,33 @@ class MemberDemoTest(unittest.TestCase):
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, text=True)
         self.addCleanup(lambda: process.kill() if process.poll() is None else None)
+        self.addCleanup(process.stdout.close)
+        self.addCleanup(process.stdin.close)
         flow.processes["alice"] = process
-        reader = threading.Thread(target=flow._read_signer, args=("alice", process))
-        reader.start()
-        deadline = time.monotonic() + 3
-        while flow.signers["alice"] != "reviewing" and time.monotonic() < deadline:
-            time.sleep(.01)
-        flow.decide("alice", "approve")
-        reader.join(timeout=3)
-        self.assertEqual(flow.signers["alice"], "failed")
-        self.assertIs(flow.approver_stored["alice"], False)
+        with patch.object(flow, "_payment_env", return_value=None):
+            reader = threading.Thread(target=flow._read_signer, args=("alice", process))
+            reader.start()
+            deadline = time.monotonic() + 3
+            while flow.signers["alice"] != "reviewing" and time.monotonic() < deadline:
+                time.sleep(.01)
+            flow.decide("alice", "approve")
+            reader.join(timeout=3)
+        self.assertFalse(reader.is_alive())
+        self.assertEqual(flow.signers["alice"], "delivery_pending")
         self.assertNotEqual(flow.phase, "ready_to_send")
+
+    def test_delivery_retry_uses_saved_share_without_another_approval_prompt(self):
+        flow = self.flow()
+        flow.phase = "waiting_for_reviews"
+        flow.payment = {"pair": ("alice", "bob")}
+        flow.signers = {"alice": "delivery_pending", "bob": "approved", "carol": "not_requested"}
+        with patch.object(flow, "resend_saved_share", return_value="resent exact saved approval") as command:
+            flow.decide("alice", "retry")
+            flow.signer_threads[-1].join(timeout=3)
+        self.assertEqual(flow.signers["alice"], "approved")
+        self.assertIs(flow.approver_stored["alice"], True)
+        self.assertEqual(flow.phase, "ready_to_send")
+        command.assert_called_once_with(1)
 
     def test_browser_action_needs_same_origin_and_the_right_member_link(self):
         flow = self.flow()
@@ -129,40 +181,38 @@ class MemberDemoTest(unittest.TestCase):
             handler.do_POST()
             self.assertEqual(handler.json.call_args.args[0], 403)
             handler.headers["Origin"] = "http://127.0.0.1:8790"
-            handler.headers["X-Loki-Token"] = flow.tokens["admin"]
+            handler.headers["X-Loki-Token"] = "invalid"
             handler.do_POST()
-            self.assertEqual(handler.json.call_args.args[0], 403)
+            self.assertEqual(handler.json.call_args.args[0], 401)
             handler.headers["X-Loki-Token"] = flow.tokens["alice"]
             handler.rfile = BytesIO(b'{"action":"approve"}')
             handler.do_POST()
             self.assertEqual(handler.json.call_args.args[0], 200)
             decide.assert_called_once_with("alice", "approve")
 
-
-    def test_api_start_reaches_relay_readiness_once(self):
+    def test_any_member_can_create_and_propose_with_a_selected_pair(self):
         flow = self.flow()
-        order = []
-        flow._preflight_relay = lambda: order.append("preflight")
-        flow.chain.start = lambda: order.append("ths")
-        flow._prepare_fixture = lambda amount, memo, transport="relay": order.append(("vaults", transport))
-        flow.relay.prepare = lambda source: order.append("relays")
-        flow._start_signers = lambda transport="relay": order.append(("signers", transport))
-        flow._prepare(40_000_000, "paid")
-        self.assertEqual(order, [
-            "preflight", "ths", ("vaults", "relay"), "relays", ("signers", "relay"),
-        ])
-        self.assertEqual(flow.substage, "signers_starting")
-        flow.phase = "preparing"
-        with self.assertRaisesRegex(ValueError, "reset"):
-            flow.start(40_000_000, "paid")
+        handler = member_demo.Handler.__new__(member_demo.Handler)
+        handler.server = SimpleNamespace(server_port=8790)
+        handler.json = Mock()
+        payload = b'{"amount_zat":12000000,"memo":"test","pair":"BC","recipient":"uregtest1recipient"}'
+        handler.headers = {"Origin": "http://127.0.0.1:8790", "Content-Type": "application/json",
+                           "Content-Length": str(len(payload)), "X-Loki-Token": flow.tokens["bob"]}
+        handler.path = "/api/propose"
+        with patch.object(member_demo, "FLOW", flow), patch.object(flow, "propose") as propose, \
+             patch.object(flow, "create_vault") as create:
+            handler.rfile = BytesIO(payload)
+            handler.do_POST()
+            self.assertEqual(handler.json.call_args.args[0], 200)
+            propose.assert_called_once_with("bob", 12_000_000, "test", "BC", "uregtest1recipient")
+            handler.path = "/api/create-vault"
+            handler.headers["X-Loki-Token"] = flow.tokens["carol"]
+            handler.rfile = BytesIO(b'{}')
+            handler.headers["Content-Length"] = "2"
+            handler.do_POST()
+            self.assertEqual(handler.json.call_args.args[0], 200)
+            create.assert_called_once_with("carol")
 
-    def test_missing_relay_binary_does_not_start_the_chain(self):
-        flow = self.flow()
-        flow.chain.start = Mock()
-        with patch.object(member_demo.run, "find_binary", side_effect=member_demo.run.OwnershipError("missing")):
-            flow._prepare(1000, "memo")
-        flow.chain.start.assert_not_called()
-        self.assertEqual(flow.phase, "failed")
 
     def test_signer_lease_blocks_a_second_store_open(self):
         flow = self.flow()
@@ -186,7 +236,7 @@ class MemberDemoTest(unittest.TestCase):
         self.assertEqual(flow.phase, "interrupted")
         self.assertIn("reset", flow.error)
         with self.assertRaisesRegex(ValueError, "reset"):
-            flow.start(40_000_000, "paid")
+            flow.create_vault("alice")
 
     def test_reset_stops_owned_relays_and_only_the_sandbox(self):
         temporary = tempfile.TemporaryDirectory()
@@ -206,7 +256,16 @@ class MemberDemoTest(unittest.TestCase):
             child = owner.start(
                 [sys.executable, "-c", "import time; time.sleep(60)"], cwd=owner.root)
             flow.relay.owner = owner
-            flow.reset()
+            lock_path = root.with_suffix(".lock")
+            self.addCleanup(lambda: lock_path.unlink(missing_ok=True))
+            with lock_path.open("a") as held:
+                fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                flow.creator = "carol"
+                flow.reset("carol")
+                self.assertTrue(lock_path.exists())
+                with lock_path.open("a") as contender:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.assertIsNotNone(child.poll())
             self.assertFalse(root.exists())
             self.assertEqual(outside.read_text(), "keep")
@@ -270,11 +329,12 @@ class MemberDemoTest(unittest.TestCase):
         with patch.object(member_demo, "ROOT", root), patch.object(member_demo, "RUN", root / "run"):
             flow = member_demo.Flow()
             flow.phase = "ready_to_send"
-            flow.payment = {"id": payment}
+            flow.payment = {"id": payment, "pair": ("alice", "bob"), "recipient": "uregtest1recipient"}
+            flow.vaults = {"recipient": "uregtest1recipient"}
             flow.chain.mine = lambda count: mined.append(count)
             flow.chain.client = SimpleNamespace(env=lambda: None)
             with patch.object(member_demo, "binary", lambda name: program):
-                worker = threading.Thread(target=flow._finish)
+                worker = threading.Thread(target=flow._finish, args=("carol",))
                 worker.start()
                 deadline = time.monotonic() + 3
                 while not ready.exists() and time.monotonic() < deadline:
@@ -295,7 +355,7 @@ class MemberDemoTest(unittest.TestCase):
             verify_args = (args_path.with_name(args_path.name + ".verify")).read_text().splitlines()
             self.assertEqual(verify_args[0], "verify")
             self.assertEqual(verify_args[verify_args.index("--transport") + 1], "relay")
-            self.assertEqual(flow.state("admin", "http://127.0.0.1:8790")["delivery"], "pending")
+            self.assertEqual(flow.state("carol")["delivery"], "pending")
             self.assertIsNone(flow.leases.holder[3])
 
     def test_pending_delivery_stays_distinct_from_approval(self):
@@ -312,11 +372,11 @@ class MemberDemoTest(unittest.TestCase):
         program.chmod(0o755)
         with patch.object(member_demo, "ROOT", root), patch.object(member_demo, "RUN", root / "run"):
             flow = member_demo.Flow()
-            flow.signers = {"alice": "approved", "bob": "approved"}
+            flow.signers = {"alice": "approved", "bob": "approved", "carol": "not_requested"}
             flow.phase = "ready_to_send"
-            flow.payment = {"id": "ab" * 32}
-            state = flow.state("admin", "http://127.0.0.1:8790")
-            self.assertEqual(state["signers"]["alice"], "approved")
+            flow.payment = {"id": "ab" * 32, "pair": ("alice", "bob")}
+            state = flow.state("carol")
+            self.assertEqual(state["approvals_count"], 2)
             self.assertEqual(state["delivery"], "pending")
             self.assertNotIn("fetched", json.dumps(state))
             flow.chain.client = SimpleNamespace(env=lambda: None)
@@ -327,7 +387,7 @@ class MemberDemoTest(unittest.TestCase):
             self.assertIn("--transport", recorded)
             self.assertEqual(recorded[recorded.index("--transport") + 1], "relay")
             self.assertNotIn("file", recorded)
-            self.assertEqual(flow.state("admin", "http://127.0.0.1:8790")["delivery"], "pending")
+            self.assertEqual(flow.state("carol")["delivery"], "pending")
 
     def test_startup_reaps_only_a_matching_recorded_relay(self):
         temporary = tempfile.TemporaryDirectory()
@@ -354,7 +414,10 @@ class MemberDemoTest(unittest.TestCase):
             ],
         }))
         with patch.object(member_demo, "ROOT", root), patch.object(member_demo, "RUN", root / "run"):
-            member_demo.Flow()
+            flow = member_demo.Flow()
+            self.assertIsNone(owned.poll())
+            with patch.object(flow.chain, "recover"):
+                flow.recover()
         self.assertIsNotNone(owned.wait(timeout=3))
         self.assertIsNone(stranger.poll())
 
@@ -388,7 +451,7 @@ class MemberDemoTest(unittest.TestCase):
             barrier.wait(timeout=3)
             with patch("subprocess.Popen", side_effect=lambda *args, **kwargs: spawned.append(args)):
                 results.append(self.snapshot_get(
-                    flow, "/api/relay/snapshot?member=1", flow.tokens["admin"]))
+                    flow, "/api/relay/snapshot?member=1", flow.tokens["alice"]))
 
         threads = [threading.Thread(target=one_get) for _ in range(2)]
         for thread in threads:
@@ -435,6 +498,62 @@ class MemberDemoTest(unittest.TestCase):
             member_demo.ROOT = original_root
             member_demo.RUN = original_run
             member_demo.FLOW = original_flow
+
+    def test_preparing_a_dynamic_pair_uses_the_direct_carrier(self):
+        flow = self.flow()
+        flow.vaults = {"source": "uregtest1source", "recipient": "uregtest1recipient"}
+        manifest = {"amount_zat": 12_000_000, "pair": [2, 3], "payment": "a" * 64,
+                    "memo": "74657374", "fee_zat": 10000, "change_zat": 87990000,
+                    "expiry_height": 1152}
+        with patch.object(flow, "_command") as command, \
+             patch.object(Path, "read_text", return_value=json.dumps(manifest)), \
+             patch.object(flow.relay, "prepare") as prepare, \
+             patch.object(flow, "_start_signers") as start:
+            flow._prepare("carol", 12_000_000, "test", "BC", "uregtest1recipient")
+        self.assertEqual(flow.phase, "waiting_for_reviews")
+        self.assertEqual(flow.payment["pair"], ("bob", "carol"))
+        self.assertEqual(flow.payment["proposer"], "carol")
+        self.assertEqual(flow.signers["alice"], "not_requested")
+        self.assertIn("--transport", command.call_args.args[0])
+        prepare.assert_called_once()
+        start.assert_called_once_with()
+
+    def test_external_recipient_confirms_without_local_receive_claim(self):
+        flow = self.flow()
+        flow.payment = {"id": "a" * 64, "pair": ("bob", "carol"),
+                        "recipient": "uregtest1external", "recipient_verified": False}
+        flow.vaults = {"recipient": "uregtest1local"}
+        txid = "b" * 64
+        with patch.object(member_demo, "binary", return_value=Path(sys.executable)), \
+             patch.object(flow.relay, "run_payment", side_effect=[
+                 f"broadcast txid={txid} payment={'a' * 64}", f"verified mined txid={txid}"]) as pay, \
+             patch.object(flow.chain, "mine") as mine, patch.object(flow, "_command") as receive:
+            flow._finish("bob")
+        self.assertEqual(flow.phase, "confirmed")
+        self.assertIs(flow.payment["recipient_verified"], False)
+        self.assertEqual([call.args[0] for call in pay.call_args_list], [2, 2])
+        self.assertEqual([call.args[1][1] for call in pay.call_args_list], ["finish", "verify"])
+        mine.assert_called_once_with(3)
+        receive.assert_not_called()
+
+    def test_binary_preflight_saves_the_real_relay_server_for_restart(self):
+        flow = self.flow()
+        server = Path("/private/tmp/actual-relay-server")
+        with patch.object(member_demo, "binary", return_value=Path(sys.executable)), \
+             patch.object(member_demo.run, "find_binary", return_value=server), \
+             patch.object(subprocess, "run", return_value=SimpleNamespace(
+                 returncode=0, stdout=b"relay-backed-signing=1\n")):
+            flow._check_binaries()
+        self.assertEqual(flow.relay.server, server)
+
+    def test_controller_initialization_does_not_reap_before_the_lock(self):
+        with patch.object(member_demo.relay_demo, "reap_recorded") as reap:
+            flow = self.flow()
+            reap.assert_not_called()
+            with patch.object(flow.chain, "recover") as recover:
+                flow.recover()
+            reap.assert_called_once()
+            recover.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@
 use loki_poc::relay_member::{
     public_snapshot_page, CourierImport, MemberError, ProvisionTarget, Session, SessionError,
 };
+use loki_poc::{setup_transport::session_envelope, signing_session::Mailbox};
 use loki_relay_client::{
     committed_readiness, outbox_intent_digest, poll_once, prepare_outbox, received_status,
     upload_pending, AuthenticatedDescriptor, CandidateReadiness, ClientConfig, ClientError,
@@ -165,7 +166,45 @@ fn run() -> Result<(), Exit> {
                 .and_then(|(_, value)| value.as_ref())
                 .ok_or(Exit::Usage)?;
             let request = request.to_str().ok_or(Exit::Usage)?;
-            send(&root, &pass, &roster, &take("--payload-file")?, request)
+            send(
+                &root,
+                &pass,
+                &roster,
+                &take("--payload-file")?,
+                Some(parse_id(request)?),
+                None,
+            )
+        }
+        "send-signing" => {
+            expect(&[
+                "--member-root",
+                "--passphrase-file",
+                "--roster",
+                "--payload-file",
+                "--attempt",
+            ])?;
+            let (root, pass, roster) = common()?;
+            let attempt = parse_id(take("--attempt")?.to_str().ok_or(Exit::Usage)?)?;
+            send(
+                &root,
+                &pass,
+                &roster,
+                &take("--payload-file")?,
+                None,
+                Some(attempt),
+            )
+        }
+        "export-signing" => {
+            expect(&[
+                "--member-root",
+                "--passphrase-file",
+                "--roster",
+                "--work-dir",
+                "--attempt",
+            ])?;
+            let (root, pass, roster) = common()?;
+            let attempt = parse_id(take("--attempt")?.to_str().ok_or(Exit::Usage)?)?;
+            export_signing(&root, &pass, &roster, &take("--work-dir")?, attempt)
         }
         "upload" => {
             expect(&["--member-root", "--passphrase-file", "--roster"])?;
@@ -335,10 +374,14 @@ fn send(
     pass: &Path,
     roster: &Path,
     payload_file: &Path,
-    request_hex: &str,
+    request_id: Option<Id32>,
+    signing_attempt: Option<Id32>,
 ) -> Result<(), Exit> {
-    let request_id = parse_id(request_hex)?;
     let mut payload = read_exact(payload_file, MAX_PAYLOAD, false)?;
+    if signing_attempt.is_some() {
+        session_envelope(&payload).map_err(|_| Exit::Member(MemberError::Bounds))?;
+    }
+    let request_id = request_id.unwrap_or_else(|| *blake3::hash(&payload).as_bytes());
     let mut session = open_session(root, pass, roster)?;
     let digest =
         roster_digest(&session.member.roster).map_err(|_| Exit::Member(MemberError::Roster))?;
@@ -356,8 +399,9 @@ fn send(
             .iter()
             .map(|member| member.id)
             .collect(),
-        session: None,
+        session: signing_attempt,
         prerequisites: Vec::new(),
+        // shortcut: kind 1 carries opaque inner signing envelopes until the relay protocol assigns an application kind.
         payload: Payload::Test(payload.to_vec()),
     };
     let intent = outbox_intent_digest(&body).map_err(|error| {
@@ -393,6 +437,59 @@ fn send(
     let saved = saved?;
     println!("request_id={}", hex_id(&request_id));
     print_logical(&session.db, &saved)?;
+    Ok(())
+}
+
+fn export_signing(
+    root: &Path,
+    pass: &Path,
+    roster: &Path,
+    work: &Path,
+    attempt: Id32,
+) -> Result<(), Exit> {
+    let member_root = fs::canonicalize(root).map_err(|_| Exit::Member(MemberError::Io))?;
+    let work = fs::canonicalize(work).map_err(|_| Exit::Member(MemberError::Io))?;
+    if !work.starts_with(&member_root) || work == member_root {
+        return Err(Exit::Member(MemberError::Permissions));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if fs::metadata(&work)
+            .map_err(|_| Exit::Member(MemberError::Io))?
+            .permissions()
+            .mode()
+            & 0o077
+            != 0
+        {
+            return Err(Exit::Member(MemberError::Permissions));
+        }
+    }
+    let session = open_session(root, pass, roster)?;
+    let mailbox = Mailbox::new(&work.join("mailbox")).map_err(|_| Exit::Member(MemberError::Io))?;
+    let rows = page_rows(
+        |after| session.db.recover_incoming_originals(after, PAGE),
+        usize::MAX,
+    )?;
+    let mut count = 0;
+    for row in rows
+        .iter()
+        .filter(|row| row.session == Some(attempt) && row.kind == 1)
+    {
+        let opened = session
+            .db
+            .open_incoming(&session.member.roster, &session.member.identity, row)
+            .map_err(Exit::Client)?;
+        let Payload::Test(wire) = &opened.message().body().payload else {
+            return Err(Exit::Client(ClientError::Identity));
+        };
+        session_envelope(wire).map_err(|_| Exit::Client(ClientError::Identity))?;
+        mailbox
+            .append(wire)
+            .map_err(|_| Exit::Member(MemberError::Io))?;
+        count += 1;
+    }
+    println!("exported_signing={count}");
     Ok(())
 }
 

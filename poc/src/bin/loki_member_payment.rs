@@ -1,5 +1,5 @@
 //! Regtest bridge from separately created vaults to the volatile FROST signing session.
-//! The shared directory is a local test courier; it is not a wallet relay or durable inbox.
+//! File mode uses a local test mailbox; relay mode stores sealed signing carriers.
 
 use std::{
     collections::BTreeMap,
@@ -12,10 +12,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "relay-communication")]
+use loki_poc::signing_session::NonceWitness;
 use loki_poc::{
     candidate::{alpha_from_canonical_bytes, build_candidate, quote_fee, CandidateInputs, Regtest},
     intent::{ChangePolicy, Intent},
-    member_state::{self, MemberState},
+    member_state::{self, MemberState, Roster},
     rpc::Rpc,
     scan,
     signing_session::{
@@ -25,6 +27,8 @@ use loki_poc::{
     },
     vault,
 };
+#[cfg(feature = "relay-communication")]
+use loki_relay_client::{ClientStore, OwnerInbox, RelayHttp, RelayRuntime};
 use orchard::{keys::Scope, Address};
 use reddsa_frost::frost::redpallas as frost;
 use serde_json::{json, Value};
@@ -279,6 +283,56 @@ fn settle_delivery(courier: &mut OwnedCourier, work: &Path) -> Result<(), String
     }
 }
 
+fn pair_from_name(name: &str) -> Result<[u16; 2], String> {
+    match name {
+        "AB" => Ok([1, 2]),
+        "AC" => Ok([1, 3]),
+        "AD" => Ok([1, 4]),
+        "BC" => Ok([2, 3]),
+        "BD" => Ok([2, 4]),
+        "CD" => Ok([3, 4]),
+        _ => Err("pair must be AB, AC, AD, BC, BD, or CD".into()),
+    }
+}
+
+fn manifest_pair(value: &Value) -> Result<[u16; 2], String> {
+    let Some(pair) = value.get("pair") else {
+        return Ok([1, 2]); // Existing regtest manifests predate pair selection.
+    };
+    let ids = pair
+        .as_array()
+        .ok_or("payment pair must contain two member IDs")?;
+    if ids.len() != 2 {
+        return Err("payment pair must contain two member IDs".into());
+    }
+    let first = ids[0].as_u64().ok_or("invalid payment pair")?;
+    let second = ids[1].as_u64().ok_or("invalid payment pair")?;
+    let pair = [
+        u16::try_from(first).map_err(|_| "invalid payment pair")?,
+        u16::try_from(second).map_err(|_| "invalid payment pair")?,
+    ];
+    if pair[0] < 1 || pair[1] > 4 || pair[0] >= pair[1] {
+        return Err("payment pair must be a supported sorted pair".into());
+    }
+    Ok(pair)
+}
+
+fn peer_in_pair(pair: [u16; 2], own: u16) -> Option<u16> {
+    if own == pair[0] {
+        Some(pair[1])
+    } else if own == pair[1] {
+        Some(pair[0])
+    } else {
+        None
+    }
+}
+
+fn proposer_id(bytes: &[u8]) -> Result<u16, String> {
+    (1u16..=4)
+        .find(|id| frost::Identifier::try_from(*id).is_ok_and(|member| member.serialize() == bytes))
+        .ok_or_else(|| "payment proposer is not a vault member".into())
+}
+
 fn private_work(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
@@ -348,15 +402,35 @@ fn manifest(path: &Path) -> Result<(SessionContext, Intent), String> {
         vault: hex(&value, "vault")?,
         payment: hex(&value, "payment")?,
         attempt: AttemptId(hex(&value, "attempt")?),
-        pair: [1, 2],
+        pair: manifest_pair(&value)?,
     };
     context.validate()?;
-    if context.payment != intent.proposal_id()
-        || intent.proposer != frost::Identifier::try_from(1u16).unwrap().serialize()
-    {
-        return Err("manifest payment ID or proposer differs from intent".into());
+    if context.payment != intent.proposal_id() {
+        return Err("manifest payment ID differs from intent".into());
     }
+    proposer_id(&intent.proposer)?;
     Ok((context, intent))
+}
+
+fn check_manifest_roster(
+    roster: &Roster,
+    context: &SessionContext,
+    intent: &Intent,
+) -> Result<(), String> {
+    if context.vault != roster.vault {
+        return Err("manifest names another vault".into());
+    }
+    if context
+        .pair
+        .iter()
+        .any(|id| !roster.members.contains_key(id))
+    {
+        return Err("payment pair includes a member outside this vault".into());
+    }
+    if !roster.members.contains_key(&proposer_id(&intent.proposer)?) {
+        return Err("payment proposer is not a vault member".into());
+    }
+    Ok(())
 }
 
 fn state(args: &[String]) -> Result<(MemberState, PathBuf, Zeroizing<String>), String> {
@@ -371,13 +445,40 @@ fn state(args: &[String]) -> Result<(MemberState, PathBuf, Zeroizing<String>), S
     Ok((loaded, owner, trimmed))
 }
 
-fn prepare(args: &[String]) -> Result<(), String> {
-    if args.len() != 7 {
-        return Err("prepare <member-dir> <passphrase-file> <roster.json> <work-dir> <recipient-UA> <amount-zat> <memo>".into());
+fn balance(args: &[String]) -> Result<(), String> {
+    if args.len() != 3 {
+        return Err("balance <member-dir> <passphrase-file> <roster.json>".into());
     }
+    let member = member_state::open(
+        Path::new(&args[0]),
+        Path::new(&args[1]),
+        Path::new(&args[2]),
+    )?;
+    let chain = scan::scan_chain(&Rpc::regtest(), &member.fvk)?;
+    let balance_zat = chain
+        .notes
+        .iter()
+        .try_fold(0u64, |sum, note| sum.checked_add(note.value_zat))
+        .ok_or("vault balance exceeds u64")?;
+    println!(
+        "{}",
+        json!({"vault": hex::encode(member.vault), "height": chain.tip,
+               "balance_zat": balance_zat, "unspent_notes": chain.notes.len()})
+    );
+    Ok(())
+}
+
+fn prepare(args: &[String]) -> Result<(), String> {
+    if args.len() != 7 && args.len() != 8 {
+        return Err("prepare <member-dir> <passphrase-file> <roster.json> <work-dir> <recipient-UA> <amount-zat> <memo> [AB|AC|AD|BC|BD|CD]".into());
+    }
+    let pair = pair_from_name(args.get(7).map(String::as_str).unwrap_or("AB"))?;
     let (member, _, _) = state(args)?;
-    if member.identity.public().id != 1 {
-        return Err("member 1 must prepare this two-signer regtest payment".into());
+    if pair
+        .iter()
+        .any(|id| !member.roster.members.contains_key(id))
+    {
+        return Err("payment pair includes a member outside this vault".into());
     }
     let work = Path::new(&args[3]);
     private_work(work)?;
@@ -437,7 +538,7 @@ fn prepare(args: &[String]) -> Result<(), String> {
     let attempt = AttemptId::random();
     let value = json!({
         "version": 1, "network": "regtest", "vault": hex::encode(member.vault),
-        "payment": hex::encode(payment), "attempt": hex::encode(attempt.0),
+        "payment": hex::encode(payment), "attempt": hex::encode(attempt.0), "pair": pair,
         "proposer": hex::encode(&intent.proposer), "created_height": tip,
         "input_nullifiers": intent.input_nullifiers.iter().map(hex::encode).collect::<Vec<_>>(),
         "recipient": hex::encode(&intent.recipient), "amount_zat": amount_zat,
@@ -530,6 +631,7 @@ fn candidate(
     member: &MemberState,
     intent: &Intent,
     session: &SigningSession,
+    pair: [u16; 2],
     peer: Vec<frost::round1::SigningCommitments>,
 ) -> Result<PackagePayload, String> {
     let rpc = Rpc::regtest();
@@ -572,8 +674,8 @@ fn candidate(
     let mut alphas = Vec::new();
     for (own, other) in session.commitments().iter().zip(peer) {
         let set = BTreeMap::from([
-            (frost::Identifier::try_from(1u16).unwrap(), own.clone()),
-            (frost::Identifier::try_from(2u16).unwrap(), other),
+            (frost::Identifier::try_from(pair[0]).unwrap(), own.clone()),
+            (frost::Identifier::try_from(pair[1]).unwrap(), other),
         ]);
         let (params, seed) = frost_rerandomized::RandomizedParams::new_from_commitments(
             member.public.verifying_key(),
@@ -675,18 +777,28 @@ fn sign(args: &[String]) -> Result<(), String> {
     }
     let (member, owner, pass) = state(&args)?;
     let own = member.identity.public().id;
-    if own != 1 && own != 2 {
-        return Err("this attempt selects only members 1 and 2".into());
-    }
-    let peer_id = if own == 1 { 2 } else { 1 };
-    let peer = member.roster.members[&peer_id].clone();
-    let finisher = member.roster.members[&3].clone();
     let work = PathBuf::from(&args[3]);
     let (context, intent) = manifest(&work.join("payment.json"))?;
-    private_work(&work)?;
-    if context.vault != member.vault {
-        return Err("manifest names another vault".into());
+    check_manifest_roster(&member.roster, &context, &intent)?;
+    let peer_id =
+        peer_in_pair(context.pair, own).ok_or("member is not in the selected payment pair")?;
+    let peer = member
+        .roster
+        .members
+        .get(&peer_id)
+        .ok_or("payment pair outside vault")?
+        .clone();
+    let finishers = member
+        .roster
+        .members
+        .values()
+        .filter(|person| !context.pair.contains(&person.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !matches!(finishers.len(), 1 | 2) {
+        return Err("payment roster has no supported finisher set".into());
     }
+    private_work(&work)?;
     let mut courier = open_courier(
         mode,
         &owner,
@@ -729,8 +841,8 @@ fn sign(args: &[String]) -> Result<(), String> {
                 return Err(error);
             }
         };
-    let package_message = if own == 1 {
-        let payload = candidate(&member, &intent, &session, peer_commitments)?;
+    let package_message = if own == context.pair[0] {
+        let payload = candidate(&member, &intent, &session, context.pair, peer_commitments)?;
         session.publish_package_to_roster_with_courier(
             &member.roster.members,
             &payload,
@@ -748,7 +860,7 @@ fn sign(args: &[String]) -> Result<(), String> {
             &member,
             &context,
             MessageKind::Package,
-            1,
+            context.pair[0],
             &work,
             wait_limit(mode),
         )?
@@ -765,7 +877,7 @@ fn sign(args: &[String]) -> Result<(), String> {
     };
     confirm(&intent, reviewed.summary(), &mut courier, &work)?;
     let released =
-        session.publish_approved_with_courier(reviewed, &peer, &finisher, &mut courier, &pass)?;
+        session.publish_approved_with_courier(reviewed, &peer, &finishers, &mut courier, &pass)?;
     courier.note_approved(&context, own, released);
     println!(
         "approved payment {} as member {}",
@@ -776,6 +888,226 @@ fn sign(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(feature = "relay-communication")]
+fn signing_inputs(
+    args: &[String],
+) -> Result<
+    (
+        MemberState,
+        PathBuf,
+        Zeroizing<String>,
+        SessionContext,
+        Intent,
+        Mailbox,
+    ),
+    String,
+> {
+    if args.len() != 4 {
+        return Err("<member-dir> <passphrase-file> <roster.json> <work-dir>".into());
+    }
+    let (member, owner, pass) = state(args)?;
+    if member.roster.members.len() != 3 {
+        return Err("relay signing currently supports only 2-of-3 vaults".into());
+    }
+    let (context, intent) = manifest(&Path::new(&args[3]).join("payment.json"))?;
+    check_manifest_roster(&member.roster, &context, &intent)?;
+    if !context.pair.contains(&member.identity.public().id) {
+        return Err("member is not an approver for this payment".into());
+    }
+    private_work(Path::new(&args[3]))?;
+    let mailbox = Mailbox::new(&Path::new(&args[3]).join("mailbox")).map_err(|e| e.to_string())?;
+    Ok((member, owner, pass, context, intent, mailbox))
+}
+
+#[cfg(feature = "relay-communication")]
+fn commit(args: &[String]) -> Result<(), String> {
+    let (member, owner, pass, context, intent, mailbox) = signing_inputs(args)?;
+    let own = member.identity.public().id;
+    let peer = member.roster.members[&peer_in_pair(context.pair, own).unwrap()].clone();
+    let identity =
+        loki_poc::setup_transport::Identity::from_secret_bytes(&member.identity.to_secret_bytes())?;
+    let relays = two_relays(args)?;
+    let session = SigningSession::begin_sealed(
+        &owner.join("signing"),
+        context.clone(),
+        &member.vault,
+        intent.clone(),
+        identity,
+        member.key.clone(),
+        member.public.clone(),
+        member.fvk.clone(),
+        intent.input_nullifiers.len(),
+        &pass,
+        relays.pins(),
+    )?;
+    session.publish_commitments(&peer, &mailbox)?;
+    println!(
+        "commitments published for payment {}; approval pending",
+        hex::encode(context.payment)
+    );
+    Ok(())
+}
+
+#[cfg(feature = "relay-communication")]
+fn reopen_signer(
+    args: &[String],
+) -> Result<
+    (
+        MemberState,
+        PathBuf,
+        Zeroizing<String>,
+        SessionContext,
+        Intent,
+        Mailbox,
+        SigningSession,
+    ),
+    String,
+> {
+    let (member, owner, pass, context, intent, mailbox) = signing_inputs(args)?;
+    let identity =
+        loki_poc::setup_transport::Identity::from_secret_bytes(&member.identity.to_secret_bytes())?;
+    let session = SigningSession::reopen_sealed(
+        &owner.join("signing"),
+        context.clone(),
+        &member.vault,
+        intent.clone(),
+        identity,
+        member.key.clone(),
+        member.public.clone(),
+        member.fvk.clone(),
+        &pass,
+    )?;
+    Ok((member, owner, pass, context, intent, mailbox, session))
+}
+
+#[cfg(feature = "relay-communication")]
+fn next_message(
+    mailbox: &Mailbox,
+    member: &MemberState,
+    context: &SessionContext,
+    kind: MessageKind,
+    sender: u16,
+) -> Result<OpenedMessage, String> {
+    mailbox
+        .read_for(&member.identity, &member.roster.members, context)?
+        .into_iter()
+        .find(|message| message.kind() == kind && message.sender() == sender)
+        .ok_or_else(|| format!("waiting for member {sender} {kind:?}; sync relay inbox and retry"))
+}
+
+#[cfg(feature = "relay-communication")]
+fn package(args: &[String]) -> Result<(), String> {
+    let (member, _owner, pass, context, intent, mailbox, session) = reopen_signer(args)?;
+    let own = member.identity.public().id;
+    if own != context.pair[0] {
+        return Err("only the selected proposer builds this package".into());
+    }
+    let peer_id = context.pair[1];
+    let commitment = next_message(
+        &mailbox,
+        &member,
+        &context,
+        MessageKind::Commitment,
+        peer_id,
+    )?;
+    let peer = commitments_from_message(&context, &commitment, intent.input_nullifiers.len())?;
+    let payload = candidate(&member, &intent, &session, context.pair, peer)?;
+    session.publish_package_to_roster(&member.roster.members, &payload, &mailbox, &pass)?;
+    println!("payment package published; members may review");
+    Ok(())
+}
+
+#[cfg(feature = "relay-communication")]
+struct TwoRelays {
+    own: Vec<OwnerInbox>,
+    http: RelayHttp,
+    runtime: RelayRuntime,
+}
+
+#[cfg(feature = "relay-communication")]
+impl NonceWitness for TwoRelays {
+    fn pins(&self) -> loki_poc::signing_session::WitnessPins {
+        [
+            (&self.own[0].route.pin.key, &self.own[0].route.pin.run),
+            (&self.own[1].route.pin.key, &self.own[1].route.pin.run),
+        ]
+        .map(|(key, run)| (*key, *run))
+    }
+    fn claim(&mut self, cid: [u8; 32], wire: &[u8]) -> Result<(), String> {
+        for inbox in &self.own[..2] {
+            let created = self
+                .runtime
+                .block_on(self.http.claim_nonce(&inbox.route, &inbox.read, cid, wire))
+                .map_err(|e| format!("nonce relay claim: {e}"))?;
+            if !created {
+                return Err("nonce already claimed; start a new signing attempt".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "relay-communication")]
+fn two_relays(args: &[String]) -> Result<TwoRelays, String> {
+    let root = Path::new(&args[0]);
+    let loaded = loki_poc::relay_member::load(root, Path::new(&args[1]), Path::new(&args[2]))
+        .map_err(|e| e.to_string())?;
+    let config_store = loki_poc::relay_member::ConfigStore::open(root, Path::new(&args[1]))
+        .map_err(|e| e.to_string())?;
+    let db = ClientStore::open(
+        &root.join("transport"),
+        &loaded.roster,
+        loaded.identity.public().id,
+    )
+    .map_err(|e| e.to_string())?;
+    let mut own = config_store
+        .routing(&db, &loaded)
+        .map_err(|e| e.to_string())?
+        .own;
+    if own.len() < 2
+        || own[0].route.pin.key == own[1].route.pin.key
+        || own[0].route.pin.run == own[1].route.pin.run
+    {
+        return Err("two distinct configured relays required for nonce safety".into());
+    }
+    own.truncate(2);
+    Ok(TwoRelays {
+        own,
+        http: RelayHttp::new().map_err(|e| e.to_string())?,
+        runtime: RelayRuntime::new().map_err(|e| e.to_string())?,
+    })
+}
+
+#[cfg(feature = "relay-communication")]
+fn approve(args: &[String]) -> Result<(), String> {
+    let (member, owner, pass, context, intent, mailbox, mut session) = reopen_signer(args)?;
+    let own = member.identity.public().id;
+    let peer_id = peer_in_pair(context.pair, own).unwrap();
+    let peer = member.roster.members[&peer_id].clone();
+    let finisher =
+        member.roster.members[&(1..=3).find(|id| !context.pair.contains(id)).unwrap()].clone();
+    let package_message = if own == context.pair[0] {
+        let wires =
+            SigningSession::saved_package_wires(&owner.join("signing"), &context, own, &pass)?;
+        member
+            .identity
+            .open_sent_session(&peer, &context, &wires[0])?
+    } else {
+        next_message(&mailbox, &member, &context, MessageKind::Package, peer_id)?
+    };
+    let reviewed = session.review_package(&package_message, &peer)?;
+    confirm(
+        &intent,
+        reviewed.summary(),
+        &mut FileCourier(&mailbox),
+        Path::new(&args[3]),
+    )?;
+    let mut relays = two_relays(args)?;
+    session.publish_approved_secured(reviewed, &peer, &finisher, &mailbox, &pass, &mut relays)?;
+    println!("signed locally; approval delivery pending relay storage");
+    Ok(())
+}
+
 fn resend(args: &[String]) -> Result<(), String> {
     let (args, mode, export) = split_transport(args)?;
     if args.len() != 4 {
@@ -783,14 +1115,12 @@ fn resend(args: &[String]) -> Result<(), String> {
     }
     let (member, owner, pass) = state(&args)?;
     let own = member.identity.public().id;
-    if own != 1 && own != 2 {
+    let work = Path::new(&args[3]);
+    private_work(work)?;
+    let (context, intent) = manifest(&work.join("payment.json"))?;
+    check_manifest_roster(&member.roster, &context, &intent)?;
+    if !context.pair.contains(&own) {
         return Err("only a selected signer can resend".into());
-    }
-    let work = PathBuf::from(&args[3]);
-    private_work(&work)?;
-    let (context, _) = manifest(&work.join("payment.json"))?;
-    if context.vault != member.vault {
-        return Err("manifest names another vault".into());
     }
     let mut courier = open_courier(
         mode,
@@ -801,7 +1131,7 @@ fn resend(args: &[String]) -> Result<(), String> {
         export,
     )?;
     let root = owner.join("signing");
-    if own == 1 {
+    if own == context.pair[0] {
         SigningSession::republish_saved_package(
             &root,
             &context,
@@ -812,6 +1142,7 @@ fn resend(args: &[String]) -> Result<(), String> {
         )?;
     }
     SigningSession::recover_share_with_courier(&root, &context, own, &pass, &mut courier)?;
+    settle_delivery(&mut courier, work)?;
     println!(
         "resent exact saved approval for payment {}",
         hex::encode(context.payment)
@@ -882,34 +1213,41 @@ fn finish(args: &[String]) -> Result<(), String> {
     if args.len() != 4 {
         return Err("finish <member-dir> <passphrase-file> <roster.json> <work-dir> [--transport file|relay]".into());
     }
-    let (member, owner, _) = state(&args)?;
-    if member.identity.public().id != 3 {
-        return Err("this attempt requires member 3 as the independent finisher".into());
-    }
-    let work = PathBuf::from(&args[3]);
-    private_work(&work)?;
+    let (member, owner, pass) = state(&args)?;
+    let work = Path::new(&args[3]);
+    private_work(work)?;
     let (context, intent) = manifest(&work.join("payment.json"))?;
-    if context.vault != member.vault {
-        return Err("manifest names another vault".into());
-    }
+    check_manifest_roster(&member.roster, &context, &intent)?;
     let mut courier = open_courier(
         mode,
         &owner,
         Path::new(&args[1]),
         Path::new(&args[2]),
-        &work,
+        work,
         export,
     )?;
     let limit = wait_limit(mode);
-    let package = wait_message(
-        &mut courier,
-        &member,
-        &context,
-        MessageKind::Package,
-        1,
-        &work,
-        limit,
-    )?;
+    let own = member.identity.public().id;
+    let peer = peer_in_pair(context.pair, own);
+    let package = if own == context.pair[0] {
+        let wires =
+            SigningSession::saved_package_wires(&owner.join("signing"), &context, own, &pass)?;
+        member.identity.open_sent_session(
+            &member.roster.members[&peer.unwrap()],
+            &context,
+            &wires[0],
+        )?
+    } else {
+        wait_reopened(
+            &mut courier,
+            &member,
+            &context,
+            MessageKind::Package,
+            context.pair[0],
+            work,
+            limit,
+        )?
+    };
     let payload = match PackagePayload::decode(&context, package.body()) {
         Ok(payload) => payload,
         Err(error) => {
@@ -917,24 +1255,46 @@ fn finish(args: &[String]) -> Result<(), String> {
             return Err(error);
         }
     };
-    let alice_share = wait_message(
-        &mut courier,
-        &member,
-        &context,
-        MessageKind::Share,
-        1,
-        &work,
-        limit,
-    )?;
-    let bob_share = wait_message(
-        &mut courier,
-        &member,
-        &context,
-        MessageKind::Share,
-        2,
-        &work,
-        limit,
-    )?;
+    let shares = if let Some(peer_id) = peer {
+        let wires =
+            SigningSession::saved_share_wires(&owner.join("signing"), &context, own, &pass)?;
+        let own_share = member.identity.open_sent_session(
+            &member.roster.members[&peer_id],
+            &context,
+            &wires[0],
+        )?;
+        let peer_share = wait_reopened(
+            &mut courier,
+            &member,
+            &context,
+            MessageKind::Share,
+            peer_id,
+            work,
+            limit,
+        )?;
+        [own_share, peer_share]
+    } else {
+        [
+            wait_reopened(
+                &mut courier,
+                &member,
+                &context,
+                MessageKind::Share,
+                context.pair[0],
+                work,
+                limit,
+            )?,
+            wait_reopened(
+                &mut courier,
+                &member,
+                &context,
+                MessageKind::Share,
+                context.pair[1],
+                work,
+                limit,
+            )?,
+        ]
+    };
     let (signed, sighash, indices) = match aggregate_and_apply(
         &context,
         &intent,
@@ -942,18 +1302,20 @@ fn finish(args: &[String]) -> Result<(), String> {
         &member.public,
         &member.fvk,
         &payload,
-        &[alice_share.clone(), bob_share.clone()],
+        &shares,
     ) {
         Ok(applied) => {
             courier.note_application(true, &package);
-            courier.note_application(true, &alice_share);
-            courier.note_application(true, &bob_share);
+            for share in &shares {
+                courier.note_application(true, share);
+            }
             applied
         }
         Err(error) => {
             courier.note_application(false, &package);
-            courier.note_application(false, &alice_share);
-            courier.note_application(false, &bob_share);
+            for share in &shares {
+                courier.note_application(false, share);
+            }
             return Err(error);
         }
     };
@@ -1020,17 +1382,15 @@ fn verify(args: &[String]) -> Result<(), String> {
     if args.len() != 5 {
         return Err("verify <member-dir> <passphrase-file> <roster.json> <work-dir> <txid> [--transport file|relay]".into());
     }
-    let (member, owner, _) = state(&args)?;
-    let work = PathBuf::from(&args[3]);
-    private_work(&work)?;
+    let (member, owner, pass) = state(&args)?;
+    let work = Path::new(&args[3]);
+    private_work(work)?;
     let txid = &args[4];
     if txid.len() != 64 || !txid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err("txid must be 32 hexadecimal bytes".into());
     }
     let (context, intent) = manifest(&work.join("payment.json"))?;
-    if context.vault != member.vault {
-        return Err("manifest names another vault".into());
-    }
+    check_manifest_roster(&member.roster, &context, &intent)?;
     let rpc = Rpc::regtest();
     let tx_json = rpc.json("getrawtransaction", &format!("[\"{txid}\",1]"))?;
     let confirmations = tx_json["confirmations"].as_u64().unwrap_or(0);
@@ -1060,15 +1420,29 @@ fn verify(args: &[String]) -> Result<(), String> {
         &work,
         export,
     )?;
-    let package_message = wait_reopened(
-        &mut courier,
-        &member,
-        &context,
-        MessageKind::Package,
-        1,
-        &work,
-        wait_limit(mode),
-    )?;
+    let package_message = if member.identity.public().id == context.pair[0] {
+        let wires = SigningSession::saved_package_wires(
+            &owner.join("signing"),
+            &context,
+            context.pair[0],
+            &pass,
+        )?;
+        member.identity.open_sent_session(
+            &member.roster.members[&context.pair[1]],
+            &context,
+            &wires[0],
+        )?
+    } else {
+        wait_reopened(
+            &mut courier,
+            &member,
+            &context,
+            MessageKind::Package,
+            context.pair[0],
+            work,
+            wait_limit(mode),
+        )?
+    };
     let payload = PackagePayload::decode(&context, package_message.body())?;
     let pczt =
         pczt::Pczt::parse(&payload.candidate).map_err(|e| format!("candidate parse: {e:?}"))?;
@@ -1235,18 +1609,118 @@ fn main() {
     let args = env::args().collect::<Vec<_>>();
     let result = match args.get(1).map(String::as_str) {
         Some("prepare") => prepare(&args[2..]),
+        Some("balance") => balance(&args[2..]),
+        #[cfg(feature = "relay-communication")]
+        Some("features") => {
+            println!("relay-backed-signing=1");
+            Ok(())
+        }
+        #[cfg(feature = "relay-communication")]
+        Some("commit") => commit(&args[2..]),
+        #[cfg(feature = "relay-communication")]
+        Some("package") => package(&args[2..]),
+        #[cfg(feature = "relay-communication")]
+        Some("approve") => approve(&args[2..]),
         Some("sign") => sign(&args[2..]),
         Some("resend") => resend(&args[2..]),
         Some("finish") => finish(&args[2..]),
         Some("verify") => verify(&args[2..]),
         Some("receive") => receive(&args[2..]),
         _ => Err(
-            "loki_member_payment <prepare|sign|resend|finish|verify|receive> ... (regtest only)"
+            "loki_member_payment <balance|prepare|sign|resend|finish|verify|receive> ... (regtest only)"
                 .into(),
         ),
     };
     if let Err(error) = result {
         eprintln!("error: {error}");
         process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn payment_pair_is_sorted_and_explicit() {
+        assert_eq!(manifest_pair(&json!({})).unwrap(), [1, 2]);
+        for (name, pair) in [
+            ("AB", [1, 2]),
+            ("AC", [1, 3]),
+            ("AD", [1, 4]),
+            ("BC", [2, 3]),
+            ("BD", [2, 4]),
+            ("CD", [3, 4]),
+        ] {
+            assert_eq!(pair_from_name(name).unwrap(), pair);
+            assert_eq!(manifest_pair(&json!({ "pair": pair })).unwrap(), pair);
+        }
+        for pair in [
+            json!([2, 1]),
+            json!([1, 1]),
+            json!([4, 5]),
+            json!([1]),
+            json!("AC"),
+        ] {
+            assert!(manifest_pair(&json!({ "pair": pair })).is_err());
+        }
+        assert_eq!(peer_in_pair([2, 3], 1), None);
+        assert_eq!(peer_in_pair([2, 3], 2), Some(3));
+        assert_eq!(peer_in_pair([2, 3], 3), Some(2));
+    }
+
+    #[test]
+    fn any_roster_member_can_propose() {
+        for id in 1..=4 {
+            let bytes = frost::Identifier::try_from(id).unwrap().serialize();
+            assert_eq!(proposer_id(&bytes).unwrap(), id);
+        }
+        assert!(proposer_id(&frost::Identifier::try_from(5u16).unwrap().serialize()).is_err());
+        assert!(proposer_id(&[0u8; 32]).is_err());
+    }
+
+    #[test]
+    fn manifest_pair_and_proposer_must_belong_to_certified_roster() {
+        let path = std::env::temp_dir().join(format!("loki-payment-roster-{}", process::id()));
+        let members: Vec<_> = (1..=3)
+            .map(|id| {
+                let public = loki_poc::setup_transport::Identity::new(id).public();
+                json!({"id": id, "signing": hex::encode(public.signing),
+                       "encryption": hex::encode(public.encryption)})
+            })
+            .collect();
+        fs::write(
+            &path,
+            json!({"vault": hex::encode([7u8; 32]),
+                                "threshold": 2, "members": members})
+            .to_string(),
+        )
+        .unwrap();
+        let roster = Roster::load(&path).unwrap();
+        fs::remove_file(path).unwrap();
+        let context = SessionContext {
+            vault: roster.vault,
+            payment: [0; 32],
+            attempt: AttemptId([1; 32]),
+            pair: [1, 3],
+        };
+        let mut intent = Intent {
+            proposer: frost::Identifier::try_from(2u16).unwrap().serialize(),
+            created_height: 1,
+            input_nullifiers: vec![[0; 32]],
+            recipient: vec![0; 43],
+            amount_zat: 1,
+            memo: vec![1],
+            change_policy: ChangePolicy::VaultInternal,
+            fee_zat: 1,
+            change_zat: 1,
+            expiry_height: 2,
+        };
+        assert!(check_manifest_roster(&roster, &context, &intent).is_ok());
+        let mut bad_pair = context.clone();
+        bad_pair.pair = [1, 4];
+        assert!(check_manifest_roster(&roster, &bad_pair, &intent).is_err());
+        intent.proposer = frost::Identifier::try_from(4u16).unwrap().serialize();
+        assert!(check_manifest_roster(&roster, &context, &intent).is_err());
     }
 }

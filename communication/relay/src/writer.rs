@@ -157,6 +157,14 @@ enum Command {
     Create(Id32, Vec<u8>, Capability, ReplySender<CreationResult>),
     Rotate(Id32, Vec<u8>, Capability, ReplySender<u64>),
     Put(Id32, Object, Capability, ReplySender<StoredResult>),
+    ClaimNonce(
+        Id32,
+        Id32,
+        Id32,
+        Vec<u8>,
+        Capability,
+        ReplySender<(bool, Vec<u8>)>,
+    ),
     Get(Id32, Id32, Capability, ReplySender<Vec<u8>>),
     Page(Id32, u64, u16, Capability, ReplySender<Page>),
     Stop,
@@ -224,6 +232,11 @@ impl DbHandle {
                         }
                         Command::Put(mailbox, object, capability, reply) => {
                             let result = store.put(mailbox, &object, &capability);
+                            complete(reply, result);
+                        }
+                        Command::ClaimNonce(mailbox, cid, challenge, wire, capability, reply) => {
+                            let result =
+                                store.claim_nonce(mailbox, cid, challenge, &wire, &capability);
                             complete(reply, result);
                         }
                         Command::Get(mailbox, hash, capability, reply) => {
@@ -393,6 +406,18 @@ impl DbHandle {
             sender,
         ))?;
         Ok(reply)
+    }
+    pub fn claim_nonce(
+        &self,
+        mailbox: Id32,
+        cid: Id32,
+        challenge: Id32,
+        wire: Vec<u8>,
+        owner_read: Capability,
+    ) -> RelayResult<DbReply<(bool, Vec<u8>)>> {
+        self.admit_fresh(|reply| {
+            Command::ClaimNonce(mailbox, cid, challenge, wire, owner_read, reply)
+        })
     }
     pub fn page(
         &self,

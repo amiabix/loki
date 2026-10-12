@@ -24,15 +24,17 @@ A selected subset leaves unrelated coverage rows `not_selected`. An inventory ro
 `three_members.py` reuses a selected completed vault rather than creating new
 member identities. The source must contain `roster.json` and
 `members/{1,2,3}/secrets/{identity,vault}.sealed` plus each member's `passphrase`
-file, as retained by `run.py acceptance`. Selection is explicit: the test never
+file, as retained by `run.py acceptance`. It also accepts the activated
+`source/` directory made by `poc/run-member-payment.py --manual`. Selection is explicit: the test never
 silently chooses a different vault or starts a new setup ceremony.
 
 On macOS, each Rust member invocation runs through `sandbox-exec` with a separate
 member root, HOME and TMPDIR. Real read probes must deny both peer roots, relay
 storage and the original vault, while allowing its own state. Runtime commands
-also cannot read the provisioning capabilities. The controller copies only the
-selected sealed identity, sealed vault and passphrase into each private test
-root, with fresh transport journals. Source hashes must remain unchanged.
+also cannot read the provisioning capabilities. The controller copies the
+selected sealed identity, sealed vault, passphrase and, when present, the sealed
+activation record into each private test root, with fresh transport journals.
+Source hashes must remain unchanged.
 These are three process sandboxes on one host, not separate OS users, machines
 or operators. Isolation fails closed when macOS sandboxing is unavailable.
 
@@ -71,6 +73,37 @@ isolation and restart evidence. Failure writes `three-members-failure.json`.
 Owned children are stopped and all run data remains for inspection; the existing
 run-ID deletion command can explicitly remove that test run later.
 
+## Funded payment through private member relays
+
+`relay_payment.py` connects the regtest signing fixture to the relay. Run it
+against a fresh funded manual payment; each run consumes that payment's note.
+It copies sealed source state into three sandboxed member roots, gives each
+member its own payment mailbox, and moves encrypted signing envelopes through
+three relays. The selected pair approves; any member can prove and send. The
+finisher checks the mined effects and an independent recipient decrypts the output.
+
+```sh
+cargo build --manifest-path communication/Cargo.toml --locked -p loki-relay-server
+cargo build --manifest-path poc/Cargo.toml --locked --bins --features relay-communication
+python3 poc/run-member-payment.py --name loki-manual \
+  --state /private/tmp/loki-fresh-payment --manual --pair BC
+python3 communication/harness/relay_payment.py \
+  --payment-root /private/tmp/loki-fresh-payment \
+  --run-root /private/tmp/loki-fresh-relay-payment \
+  --name loki-manual --ports 39561 39562 39563 --finisher 2
+```
+
+The THS regtest instance must already be running and `ths` must be on `PATH`.
+Success writes `relay-payment-report.json` with the payment ID, txid and counts.
+This is a regtest integration fixture: the pair is selected when the payment
+is prepared, signing uses volatile nonces and a 120-second live wait, and
+prints Approved before the relay has stored the share. The relay's kind 1
+payload carries the encrypted inner signing envelope,
+selected by the attempt ID; the signer authenticates the inner envelope and
+verifies transaction effects before releasing a share. This run does not
+establish browser custody, approval recovery after a crash, a relay nonce
+witness or independent relay operators.
+
 ## test(harness): scenario evidence classes
 
 | Scenario | Observation and injection |
@@ -99,4 +132,4 @@ Native test-process scenarios set `simulation: true` to distinguish fixture exec
 
 The real acceptance evidence is `/private/tmp/loki-relay-acceptance-20261010-a/acceptance-report.json`. It includes three public relay keys/run IDs, nine mailbox IDs, six descriptor digests, original/Received ciphertext hashes and receipt digests before/after restart. The final campaign is `/private/tmp/loki-relay-faults-20261010-c/fault-report.json`: all seventeen scenarios and all 26 coverage rows passed, with no failures or skipped rows. The [completed requirement audit](verification-2026-10-10.md) maps all 47 units and 26 rows to named evidence; its JSON companion records source/log/report hashes. The orphan supplement `/private/tmp/loki-relay-orphan-evidence-20261010/fault-report.json` records three accepted orphan chunks, one pending task, cursor four and the refused ciphertext hash. Earlier failed campaign roots remain retained as diagnostic evidence.
 
-No capabilities, passphrases, payloads or decrypted member secrets belong in public reports. Tests verify redaction and process ownership. Local key separation does not establish separate operators. SIGKILL and synchronous FULL do not establish physical power-loss durability. There are no browser, payment or chain claims.
+No capabilities, passphrases, payloads or decrypted member secrets belong in public reports. Tests verify redaction and process ownership. Local key separation does not establish separate operators. SIGKILL and synchronous FULL do not establish physical power-loss durability. The separate payment fixture above establishes only its named regtest payment and chain checks; it makes no browser or custody claim.

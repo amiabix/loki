@@ -132,8 +132,8 @@ fn identity(args: &[String]) -> Result<(), String> {
         return Err("identity already exists".into());
     }
     let id: u16 = args[1].parse().map_err(|_| "invalid member id")?;
-    if !(1..=3).contains(&id) {
-        return Err("member id must be 1, 2 or 3".into());
+    if !(1..=4).contains(&id) {
+        return Err("member id must be 1, 2, 3 or 4".into());
     }
     let secret = Identity::new(id);
     dir.write_sealed(
@@ -151,6 +151,70 @@ fn identity(args: &[String]) -> Result<(), String> {
             "encryption": hex::encode(public.encryption),
         })
     );
+    Ok(())
+}
+
+fn identity_public(args: &[String]) -> Result<(), String> {
+    if args.len() != 2 {
+        return Err("identity-public <member-dir> <passphrase-file>".into());
+    }
+    let dir = MemberDir::open(Path::new(&args[0]), "secrets");
+    let secret = Identity::from_secret_bytes(
+        &dir.read_sealed("identity.sealed", &passphrase(Path::new(&args[1]))?)
+            .map_err(|e| e.to_string())?,
+    )?;
+    let public = secret.public();
+    println!(
+        "{}",
+        serde_json::json!({
+            "id": public.id,
+            "signing": hex::encode(public.signing),
+            "encryption": hex::encode(public.encryption),
+        })
+    );
+    Ok(())
+}
+
+fn profile_create(args: &[String]) -> Result<(), String> {
+    if args.len() != 3 {
+        return Err("profile-create <data-root> <passphrase-file> <display-name>".into());
+    }
+    let label = args[2].trim();
+    if label.is_empty() || label.len() > 80 {
+        return Err("profile name must be 1 to 80 bytes".into());
+    }
+    let mut id = [0u8; 32];
+    OsRng.fill_bytes(&mut id);
+    let dir = MemberDir::create(Path::new(&args[0]), "profile").map_err(|e| e.to_string())?;
+    let profile = serde_json::json!({"version": 1, "id": hex::encode(id), "name": label});
+    dir.write_sealed(
+        "profile.sealed",
+        &serde_json::to_vec(&profile).map_err(|e| e.to_string())?,
+        &passphrase(Path::new(&args[1]))?,
+    )
+    .map_err(|e| e.to_string())?;
+    println!("{profile}");
+    Ok(())
+}
+
+fn profile_open(args: &[String]) -> Result<(), String> {
+    if args.len() != 2 {
+        return Err("profile-open <data-root> <passphrase-file>".into());
+    }
+    let dir = MemberDir::open(Path::new(&args[0]), "profile");
+    let raw = dir
+        .read_sealed("profile.sealed", &passphrase(Path::new(&args[1]))?)
+        .map_err(|e| e.to_string())?;
+    let profile: serde_json::Value = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
+    if profile["version"] != 1
+        || profile["name"]
+            .as_str()
+            .is_none_or(|s| s.is_empty() || s.len() > 80)
+        || profile["id"].as_str().is_none_or(|s| hex32(s).is_err())
+    {
+        return Err("invalid sealed profile".into());
+    }
+    println!("{profile}");
     Ok(())
 }
 
@@ -206,15 +270,20 @@ fn state_address(state: &serde_json::Value) -> Result<String, String> {
     .map_err(|e| e.to_string())?;
     let key = frost::keys::KeyPackage::deserialize(&key_bytes)
         .map_err(|e| format!("invalid member share: {e}"))?;
+    let (threshold, members) = state_policy(state)?;
+    if !matches!((threshold, members), (2, 3) | (2, 4)) {
+        return Err("unsupported vault policy".into());
+    }
     let id = frost::Identifier::try_from(state_identity(state)?.public().id)
         .map_err(|e| e.to_string())?;
     if key.identifier() != &id
         || key.verifying_key() != public.verifying_key()
         || public.verifying_shares().get(&id) != Some(key.verifying_share())
-        || *key.min_signers() != 2
-        || public.min_signers() != Some(2)
+        || u64::from(*key.min_signers()) != threshold
+        || public.min_signers().map(u64::from) != Some(threshold)
+        || public.verifying_shares().len() as u64 != members
     {
-        return Err("member share differs from certified 2-of-3 vault".into());
+        return Err("member share differs from certified vault policy".into());
     }
     Ok(expected)
 }
@@ -243,10 +312,27 @@ fn state_identity(state: &serde_json::Value) -> Result<Identity, String> {
     Identity::from_secret_bytes(&bytes)
 }
 
+fn state_policy(state: &serde_json::Value) -> Result<(u64, u64), String> {
+    let threshold = state
+        .get("threshold")
+        .map(|value| value.as_u64())
+        .unwrap_or(Some(2))
+        .ok_or("invalid sealed threshold")?;
+    let members = state
+        .get("members")
+        .map(|value| value.as_u64())
+        .unwrap_or(Some(3))
+        .ok_or("invalid sealed member count")?;
+    Ok((threshold, members))
+}
+
 fn checked_roster(state: &serde_json::Value, path: &Path) -> Result<Roster, String> {
     let roster = Roster::load(path)?;
+    let (threshold, members) = state_policy(state)?;
     if hex::encode(roster.vault) != state["vault"]
         || hex::encode(roster.fingerprint()) != state["roster_fingerprint"]
+        || u64::from(roster.threshold) != threshold
+        || roster.members.len() as u64 != members
     {
         return Err("roster differs from the vault certificate".into());
     }
@@ -291,14 +377,46 @@ fn backup_create(args: &[String]) -> Result<(), String> {
     let state: serde_json::Value =
         serde_json::from_slice(&state_bytes).map_err(|e| e.to_string())?;
     state_address(&state)?;
-    let mut entropy = [0u8; 32];
-    OsRng.fill_bytes(&mut entropy);
-    let mnemonic = Mnemonic::from_entropy(&entropy).map_err(|e| e.to_string())?;
-    entropy.zeroize();
-    let card = card_dir(Path::new(&args[2]), true)?;
-    // shortcut: this card seals regtest JSON state; use a reviewed CBOR format before custody.
-    card.write_sealed("vault.card", &state_bytes, &mnemonic.to_string())
-        .map_err(|e| e.to_string())?;
+    let secrets = MemberDir::open(Path::new(&args[0]), "secrets");
+    let _lock = setup_lock(&secrets)?;
+    let pass = passphrase(Path::new(&args[1]))?;
+    let mnemonic = if secrets.exists("backup-words.sealed") {
+        String::from_utf8(
+            secrets
+                .read_sealed("backup-words.sealed", &pass)
+                .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?
+    } else {
+        if Path::new(&args[2]).join("vault.card").exists() {
+            return Err("backup card exists without recoverable words; restore from saved artifacts or restart this regtest vault".into());
+        }
+        let mut entropy = [0u8; 32];
+        OsRng.fill_bytes(&mut entropy);
+        let mnemonic = Mnemonic::from_entropy(&entropy)
+            .map_err(|e| e.to_string())?
+            .to_string();
+        entropy.zeroize();
+        secrets
+            .write_sealed("backup-words.sealed", mnemonic.as_bytes(), &pass)
+            .map_err(|e| e.to_string())?;
+        mnemonic
+    };
+    let path = Path::new(&args[2]);
+    let card = card_dir(path, !path.exists())?;
+    if card.exists("vault.card") {
+        if card
+            .read_sealed("vault.card", &mnemonic)
+            .map_err(|e| e.to_string())?
+            != state_bytes
+        {
+            return Err("existing backup card does not match this member's vault".into());
+        }
+    } else {
+        // shortcut: this card seals regtest JSON state; use a reviewed CBOR format before custody.
+        card.write_sealed("vault.card", &state_bytes, &mnemonic)
+            .map_err(|e| e.to_string())?;
+    }
     println!("{mnemonic}");
     eprintln!(
         "Save the 24 words separately from {}/vault.card; then run backup-verify",
@@ -324,6 +442,10 @@ fn backup_verify(args: &[String]) -> Result<(), String> {
     let roster = checked_roster(&state, Path::new(&args[4]))?;
     let identity = state_identity(&state)?;
     let receipt = identity.sign_backup(&roster.vault, &backup_body(&state)?)?;
+    let pending = Path::new(&args[0]).join("secrets/backup-words.sealed");
+    if pending.exists() {
+        fs::remove_file(pending).map_err(|e| e.to_string())?;
+    }
     publish(
         Path::new(&args[5]),
         &name(&roster.vault, "backup", identity.public().id, None),
@@ -432,7 +554,8 @@ fn run(args: &[String]) -> Result<(), String> {
         b"Loki_vs_commit1",
         &[&roster.vault, &own.id.to_be_bytes(), &contribution],
     );
-    let (member, own_r1) = Member::start(own.id)?;
+    let (member, own_r1) =
+        Member::start_with_policy(own.id, roster.threshold, roster.members.len() as u16)?;
     let mut r1_body = commitment.to_vec();
     r1_body.extend_from_slice(&own_r1);
     publish(
@@ -526,6 +649,8 @@ fn run(args: &[String]) -> Result<(), String> {
         "network": "regtest",
         "key_derivation": zip2005::VERSION,
         "vault": hex::encode(roster.vault),
+        "threshold": roster.threshold,
+        "members": roster.members.len(),
         "roster_fingerprint": hex::encode(roster.fingerprint()),
         "identity_secret": hex::encode(secret.to_secret_bytes()),
         "key_package": hex::encode(&certified.key_package),
@@ -547,6 +672,9 @@ fn main() {
     let args: Vec<_> = env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("identity") => identity(&args[1..]),
+        Some("identity-public") => identity_public(&args[1..]),
+        Some("profile-create") => profile_create(&args[1..]),
+        Some("profile-open") => profile_open(&args[1..]),
         Some("address") => address(&args[1..]),
         Some("backup-create") => backup_create(&args[1..]),
         Some("backup-verify") => backup_verify(&args[1..]),
@@ -555,10 +683,26 @@ fn main() {
             Roster::load(Path::new(&args[1])).map(|r| println!("{}", hex::encode(r.fingerprint())))
         }
         Some("run") => run(&args[1..]),
-        _ => Err("usage: loki_setup_member identity|fingerprint|run|backup-create|backup-verify|address|restore ...".into()),
+        _ => Err("usage: loki_setup_member profile-create|profile-open|identity|identity-public|fingerprint|run|backup-create|backup-verify|address|restore ...".into()),
     };
     if let Err(error) = result {
         eprintln!("error: {error}");
         process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sealed_policy_defaults_only_when_absent() {
+        assert_eq!(state_policy(&serde_json::json!({})).unwrap(), (2, 3));
+        assert_eq!(
+            state_policy(&serde_json::json!({"threshold": 2, "members": 4})).unwrap(),
+            (2, 4)
+        );
+        assert!(state_policy(&serde_json::json!({"threshold": "2", "members": 4})).is_err());
+        assert!(state_policy(&serde_json::json!({"threshold": 2, "members": null})).is_err());
     }
 }

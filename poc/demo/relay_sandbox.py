@@ -44,7 +44,7 @@ def denial_canary(root: Path) -> dict:
     root = Path(root).resolve()
     own = root / "run" / "source" / "member-1"
     peer = root / "run" / "source" / "member-2"
-    mailbox = root / "run" / "payment" / "work" / "mailbox"
+    mailbox = root / "run" / "payment" / "mailbox"
     relay = root / "relay" / "private"
     try:
         for path in (own, peer, mailbox, relay):

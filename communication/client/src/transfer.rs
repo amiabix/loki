@@ -254,6 +254,20 @@ pub struct CompleteSource {
     recipient: MemberId,
 }
 impl CompleteSource {
+    pub(crate) fn committed(
+        required_hashes: Vec<Id32>,
+        key: LogicalKey,
+        digest: Id32,
+        recipient: MemberId,
+    ) -> Self {
+        Self {
+            required_hashes,
+            key,
+            digest,
+            recipient,
+        }
+    }
+
     pub fn required_hashes(&self) -> &[Id32] {
         &self.required_hashes
     }

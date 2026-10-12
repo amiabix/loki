@@ -121,6 +121,8 @@ class _Worker:
         self.stdout_thread = None
         self.response_thread = None
         self.observe_thread = None
+        self.snapshot_thread = None
+        self.snapshot_lock = threading.Lock()
         self.owns_stdio = False
         self.settled = threading.Event()
 
@@ -142,12 +144,15 @@ class RelayDemo:
     """Three relays owned by this controller. A partial start stops only those children."""
 
     def __init__(self, root, binaries, cancel, consumer, *, timeout=120,
-                 communication_workspace=None, poc_workspace=None, lifecycle=None):
+                 communication_workspace=None, poc_workspace=None, lifecycle=None, snapshots=False):
         self.root = Path(root)
         self.server, self.member_bin, self.setup_bin = binaries
         self.cancel = cancel
         self.consumer = consumer
         self.timeout = timeout
+        self.snapshots = snapshots
+        self.generation = 0
+        self.generation_lock = threading.Lock()
         self.communication_workspace = Path(
             communication_workspace or REPO / "communication")
         self.poc_workspace = Path(poc_workspace or DEMO.parent)
@@ -269,6 +274,10 @@ class RelayDemo:
         worker.response_thread.start()
         worker.observe_thread.start()
         self.workers[member_id] = worker
+        if self.snapshots:
+            worker.snapshot_thread = threading.Thread(
+                target=self._snapshot_loop, args=(worker,), daemon=True)
+            worker.snapshot_thread.start()
         threading.Thread(target=self._watch, args=(worker,), daemon=True).start()
         return process
 
@@ -321,28 +330,72 @@ class RelayDemo:
             raise RuntimeError("relays are not running")
         return self.context.relays[index - 1]
 
-    def service_snapshot(self, member_id: int, section: str = "logical") -> dict:
+    def service_snapshot(self, member_id: int, section: str = "logical", *,
+                         snapshot_id: str = "generation-1", after: str = "0") -> dict:
         """Ask the owning payment worker for one public page. Never spawn a status command."""
         worker = self.workers.get(member_id)
         if worker is None or worker.process.poll() is not None:
             self._mark_stale(member_id)
             raise RuntimeError("snapshot read failed")
         request = {
-            "version": 1, "type": "snapshot_page", "snapshot_id": "generation-1",
-            "section": section, "after": "0", "limit": 100,
+            "version": 1, "type": "snapshot_page", "snapshot_id": snapshot_id,
+            "section": section, "after": after, "limit": 100,
         }
         try:
-            os.write(worker.control_w, (json.dumps(request) + "\n").encode())
-            line = worker.responses.get(timeout=1)
-            page = json.loads(line.decode())
+            with worker.snapshot_lock:
+                os.write(worker.control_w, (json.dumps(request) + "\n").encode())
+                deadline = time.monotonic() + 1
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise queue.Empty
+                    line = worker.responses.get(timeout=remaining)
+                    page = json.loads(line.decode())
+                    if (isinstance(page, dict) and page.get("version") == 1
+                            and page.get("snapshot_id") == snapshot_id
+                            and page.get("section") == section and page.get("after") == after
+                            and type(page.get("member")) is int and page["member"] == member_id
+                            and not page.get("error")):
+                        break
         except (OSError, ValueError, queue.Empty, TypeError):
-            self._mark_stale(member_id)
-            raise RuntimeError("snapshot read failed")
-        if not isinstance(page, dict) or page.get("error") or page.get("section") != section:
             self._mark_stale(member_id)
             raise RuntimeError("snapshot read failed")
         self.remember_snapshot(member_id, page)
         return page
+
+    def _snapshot_loop(self, worker: _Worker) -> None:
+        while worker.process.poll() is None and not self.cancel.is_set():
+            try:
+                self.refresh_snapshots(worker.member_id)
+            except (RuntimeError, Rejected):
+                pass
+            if self.cancel.wait(1):
+                break
+
+    def refresh_snapshots(self, member_id: int) -> None:
+        with self.generation_lock:
+            self.generation += 1
+            generation = f"generation-{self.generation}"
+        sections = []
+        for section in ("logical", "objects"):
+            after = "0"
+            combined = None
+            for _ in range(100):
+                page = self.service_snapshot(member_id, section, snapshot_id=generation, after=after)
+                if combined is None:
+                    combined = dict(page, rows=list(page.get("rows", [])))
+                else:
+                    combined["rows"].extend(page.get("rows", []))
+                if page.get("complete") is True:
+                    break
+                cursor = page.get("next")
+                if not isinstance(cursor, str) or cursor == after:
+                    raise RuntimeError("snapshot read failed")
+                after = cursor
+            else:
+                raise RuntimeError("snapshot read failed")
+            sections.append(combined)
+        self.projection.apply_snapshot(sections)
 
     def remember_snapshot(self, member_id: int, page: dict) -> None:
         with self.cache_lock:
@@ -376,6 +429,8 @@ class RelayDemo:
                 time.sleep(0.05)
             if worker.stdout_thread is not None:
                 worker.stdout_thread.join(timeout=5)
+            if worker.snapshot_thread is not None:
+                worker.snapshot_thread.join(timeout=2)
             if worker.response_thread is not None:
                 worker.response_thread.join(timeout=1)
         finally:
