@@ -276,12 +276,14 @@ def serve(wallet, port):
             if self.path == "/app.js":
                 self.send_response(200)
                 self.send_header("Content-Type", "text/javascript; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write((HERE / "app.js").read_bytes())
                 return
             if self.path == "/app.css":
                 self.send_response(200)
                 self.send_header("Content-Type", "text/css; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write((HERE / "app.css").read_bytes())
                 return

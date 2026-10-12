@@ -213,3 +213,32 @@ for (const button of document.querySelectorAll('[data-copy]')) {
 }
 
 $('agree').querySelector('[name="fingerprint"]').addEventListener('input', (event) => echo(event.target.value));
+
+/* ── theme ──────────────────────────────────────────────────────────────────
+   No stored choice means follow the system, which is what the media query in
+   app.css already does. A stored choice pins data-theme on the root and wins.
+   Nothing else in the app reads this: every rule below the token block uses
+   semantic names, so a third theme would be a palette and one more case. */
+
+const THEME_KEY = 'loki-theme';
+
+function currentTheme() {
+  return document.documentElement.dataset.theme
+    || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+}
+
+function applyTheme(mode) {
+  if (mode) document.documentElement.dataset.theme = mode;
+  /* the button offers the other one */
+  $('theme').textContent = currentTheme() === 'dark' ? 'Light' : 'Dark';
+}
+
+applyTheme(localStorage.getItem(THEME_KEY));
+$('theme').addEventListener('click', () => {
+  const next = currentTheme() === 'dark' ? 'light' : 'dark';
+  localStorage.setItem(THEME_KEY, next);
+  applyTheme(next);
+});
+matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => {
+  if (!localStorage.getItem(THEME_KEY)) applyTheme(null);
+});
