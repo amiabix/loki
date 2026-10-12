@@ -201,6 +201,11 @@ body::after {
 
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
+/* Cards are focused in script so a screen reader lands on the new step. They
+   are not tab stops, so no keyboard user can arrive here by tabbing, and a ring
+   around the whole card would only read as a stray box. */
+[tabindex="-1"]:focus { outline: none; }
+
 /* ── header ───────────────────────────────────────────────────────────────────
    One measure governs the whole page. The brand, the step bar and every card
    share it, so every left and right edge lines up with every other one — there
@@ -267,7 +272,8 @@ body::after {
 /* ── status line ──────────────────────────────────────────────────────────── */
 
 #message {
-  margin: 0 0 24px;
+  max-width: 680px;
+  margin: 0 auto 24px;
   padding: 14px 18px;
   font-size: 13px;
   background: var(--surface);
@@ -286,7 +292,8 @@ body::after {
 
 .card {
   position: relative;
-  margin: 18px 0;
+  max-width: 680px;
+  margin: 18px auto;
   padding: 26px 28px;
   background: var(--surface);
   border: 1px solid var(--line);
@@ -690,8 +697,12 @@ pre:hover { border-color: var(--line); }
 
 main { padding-block: 44px 72px; }
 
+/* The column is centred, and so is what sits in it: kicker, headline and card
+   all centre on the page axis. Only the inside of a card stays left-aligned,
+   because labels and fields have to start on a common edge. */
 .step-kicker {
   margin: 0 0 12px;
+  text-align: center;
   font-family: var(--mono);
   font-size: 11px;
   line-height: 18px;
@@ -701,8 +712,9 @@ main { padding-block: 44px 72px; }
 }
 
 .step-title {
-  margin: 0 0 32px;
-  max-width: 18ch;
+  margin: 0 auto 36px;
+  max-width: 20ch;
+  text-align: center;
   font-family: var(--serif);
   font-weight: 400;
   font-size: clamp(30px, 3.6vw, 44px);
@@ -713,6 +725,7 @@ main { padding-block: 44px 72px; }
 
 main > .muted:last-child {
   margin: 28px 0 0;
+  text-align: center;
   font-size: 10px;
   font-weight: 700;
   letter-spacing: .18em;
