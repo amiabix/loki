@@ -294,6 +294,19 @@ $('agree').querySelector('[name="fingerprint"]').addEventListener('input', (even
 
 const THEME_KEY = 'loki-theme';
 
+/* Storage throws rather than returning null in a few real cases — Safari in
+   private browsing, embedded webviews, storage disabled by policy. A theme
+   preference is not worth taking the page down for, so both sides fail quiet
+   and the app falls back to following the system. */
+const store = {
+  read() {
+    try { return localStorage.getItem(THEME_KEY); } catch { return null; }
+  },
+  write(value) {
+    try { localStorage.setItem(THEME_KEY, value); } catch { /* not fatal */ }
+  },
+};
+
 function currentTheme() {
   return document.documentElement.dataset.theme
     || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
@@ -305,12 +318,12 @@ function applyTheme(mode) {
   $('theme').textContent = currentTheme() === 'dark' ? 'Light' : 'Dark';
 }
 
-applyTheme(localStorage.getItem(THEME_KEY));
+applyTheme(store.read());
 $('theme').addEventListener('click', () => {
   const next = currentTheme() === 'dark' ? 'light' : 'dark';
-  localStorage.setItem(THEME_KEY, next);
+  store.write(next);
   applyTheme(next);
 });
 matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => {
-  if (!localStorage.getItem(THEME_KEY)) applyTheme(null);
+  if (!store.read()) applyTheme(null);
 });

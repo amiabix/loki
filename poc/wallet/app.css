@@ -50,6 +50,10 @@
   --d-sheen-soft: rgba(255,255,255,.07);
   --d-scan: rgba(255,255,255,.016);
   --d-vignette: rgba(0,0,0,.42);
+  --d-accent-wash: rgba(0,224,164,.08);   --d-accent-edge: rgba(0,224,164,.35);
+  --d-accent-glow: rgba(0,224,164,.40);   --d-warn-wash: rgba(244,183,40,.08);
+  --d-warn-edge: rgba(244,183,40,.30);    --d-danger-wash: rgba(255,70,85,.08);
+  --d-busy-sweep: rgba(4,17,13,.55);
 
   /* light palette */
   --l-bg: #eef1ef;        --l-grid: #e2e7e4;      --l-rail: #e6eae7;
@@ -65,6 +69,10 @@
   --l-sheen-soft: rgba(255,255,255,.5);
   --l-scan: rgba(0,0,0,.012);
   --l-vignette: rgba(0,0,0,.10);
+  --l-accent-wash: rgba(0,113,79,.08);    --l-accent-edge: rgba(0,113,79,.35);
+  --l-accent-glow: rgba(0,113,79,.40);    --l-warn-wash: rgba(138,90,5,.08);
+  --l-warn-edge: rgba(138,90,5,.30);      --l-danger-wash: rgba(176,32,45,.08);
+  --l-busy-sweep: rgba(0,0,0,.28);
 
   /* semantic names, dark by default */
   color-scheme: dark;
@@ -83,13 +91,10 @@
   --sheen: var(--d-sheen);           --sheen-soft: var(--d-sheen-soft);
   --scan: var(--d-scan);             --vignette: var(--d-vignette);
 
-  /* derived from the accent, so a palette change carries them along */
-  --accent-wash: color-mix(in srgb, var(--accent) 8%, transparent);
-  --accent-edge: color-mix(in srgb, var(--accent) 35%, transparent);
-  --accent-glow: color-mix(in srgb, var(--accent) 40%, transparent);
-  --warn-wash: color-mix(in srgb, var(--warn) 8%, transparent);
-  --warn-edge: color-mix(in srgb, var(--warn) 30%, transparent);
-  --danger-wash: color-mix(in srgb, var(--danger) 8%, transparent);
+  --accent-wash: var(--d-accent-wash);   --accent-edge: var(--d-accent-edge);
+  --accent-glow: var(--d-accent-glow);   --warn-wash: var(--d-warn-wash);
+  --warn-edge: var(--d-warn-edge);       --danger-wash: var(--d-danger-wash);
+  --busy-sweep: var(--d-busy-sweep);
 
   --mono: "Geist Mono", ui-monospace, "SF Mono", Menlo, monospace;
   --serif: "Young Serif", ui-serif, "Iowan Old Style", Georgia, serif;
@@ -118,6 +123,10 @@
     --danger: var(--l-danger);         --danger-text: var(--l-danger-text);
     --sheen: var(--l-sheen);           --sheen-soft: var(--l-sheen-soft);
     --scan: var(--l-scan);             --vignette: var(--l-vignette);
+    --accent-wash: var(--l-accent-wash);   --accent-edge: var(--l-accent-edge);
+    --accent-glow: var(--l-accent-glow);   --warn-wash: var(--l-warn-wash);
+    --warn-edge: var(--l-warn-edge);       --danger-wash: var(--l-danger-wash);
+    --busy-sweep: var(--l-busy-sweep);
   }
 }
 
@@ -137,6 +146,10 @@
   --danger: var(--l-danger);         --danger-text: var(--l-danger-text);
   --sheen: var(--l-sheen);           --sheen-soft: var(--l-sheen-soft);
   --scan: var(--l-scan);             --vignette: var(--l-vignette);
+  --accent-wash: var(--l-accent-wash);   --accent-edge: var(--l-accent-edge);
+  --accent-glow: var(--l-accent-glow);   --warn-wash: var(--l-warn-wash);
+  --warn-edge: var(--l-warn-edge);       --danger-wash: var(--l-danger-wash);
+  --busy-sweep: var(--l-busy-sweep);
 }
 
 
@@ -577,7 +590,7 @@ button.busy::after {
   inset: 0;
   border: 0;
   opacity: 1;
-  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--on-accent) 55%, transparent), transparent);
+  background: linear-gradient(90deg, transparent, var(--busy-sweep), transparent);
   background-size: 45% 100%;
   background-repeat: no-repeat;
   animation: shuttle .9s ease-in-out infinite;
@@ -673,6 +686,7 @@ pre:hover { border-color: var(--line); }
   display: grid;
   grid-template-columns: 330px minmax(0, 760px);
   justify-content: center;
+  height: 100vh;
   height: 100dvh;
   border-inline: 1px solid var(--line-soft);
 }
@@ -775,7 +789,7 @@ main {
 
 @media (max-width: 900px) {
   /* stacked, the shell is a document again: the page scrolls, not the column */
-  .shell { grid-template-columns: minmax(0, 1fr); height: auto; min-height: 100dvh; }
+  .shell { grid-template-columns: minmax(0, 1fr); height: auto; min-height: 100vh; min-height: 100dvh; }
   main { overflow: visible; justify-content: flex-start; }
   .rail {
     position: static;
