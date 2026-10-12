@@ -47,8 +47,10 @@ start a disposable THS instance, then run `cargo build --locked --bins` and
 Add `--manual` to stop after setup and print the two concurrent signer commands,
 then the finish, mine, and verification commands. Each signer displays the
 recipient unified address and exact payment before accepting typed approval.
-The script creates three member processes, checks their backups, funds the vault,
-and supplies both approval strings after each signer verifies the candidate. This
+The script creates three member processes, checks provisional backups, finalizes
+their one-file recovery cards, funds the vault, then restores one selected signer
+from its final card and 24 words into a new data root. It supplies both approval
+strings after each signer verifies the candidate. This
 is scripted approval, not a test of independent human review. It creates a second
 vault as the independent recipient; that vault decrypts the mined payment while the
 source vault verifies the checked candidate, mined sighash, fee and change. The

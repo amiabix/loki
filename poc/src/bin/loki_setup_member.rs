@@ -296,10 +296,32 @@ fn backup_body(state: &serde_json::Value) -> Result<[u8; 32], String> {
             .ok_or("missing roster fingerprint")?,
     )?;
     let ak = hex32(state["group_ak"].as_str().ok_or("missing group key")?)?;
-    Ok(digest(
-        b"Loki_bkup_v1",
-        &[&vault, &roster, &ak, zip2005::VERSION.as_bytes()],
-    ))
+    match state.get("backup_version").and_then(|v| v.as_u64()) {
+        None => Ok(digest(
+            b"Loki_bkup_v1",
+            &[&vault, &roster, &ak, zip2005::VERSION.as_bytes()],
+        )),
+        Some(2) => {
+            let vs = hex32(
+                state["vault_secret"]
+                    .as_str()
+                    .ok_or("missing vault secret")?,
+            )?;
+            let address = state["address"].as_str().ok_or("missing address")?;
+            Ok(digest(
+                b"Loki_bkup_v2",
+                &[
+                    &vault,
+                    &roster,
+                    &ak,
+                    zip2005::VERSION.as_bytes(),
+                    &vs,
+                    address.as_bytes(),
+                ],
+            ))
+        }
+        _ => Err("unsupported backup receipt version".into()),
+    }
 }
 
 fn state_identity(state: &serde_json::Value) -> Result<Identity, String> {
@@ -328,6 +350,11 @@ fn state_policy(state: &serde_json::Value) -> Result<(u64, u64), String> {
 
 fn checked_roster(state: &serde_json::Value, path: &Path) -> Result<Roster, String> {
     let roster = Roster::load(path)?;
+    check_roster(state, &roster)?;
+    Ok(roster)
+}
+
+fn check_roster(state: &serde_json::Value, roster: &Roster) -> Result<(), String> {
     let (threshold, members) = state_policy(state)?;
     if hex::encode(roster.vault) != state["vault"]
         || hex::encode(roster.fingerprint()) != state["roster_fingerprint"]
@@ -340,7 +367,31 @@ fn checked_roster(state: &serde_json::Value, path: &Path) -> Result<Roster, Stri
     if roster.members.get(&own.id) != Some(&own) {
         return Err("member identity differs from the vault roster".into());
     }
-    Ok(roster)
+    Ok(())
+}
+
+fn checked_receipts(
+    state: &serde_json::Value,
+    roster: &Roster,
+    receipts: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    if receipts.len() != roster.members.len() {
+        return Err("recovery card needs every member's backup receipt".into());
+    }
+    let identity = state_identity(state)?;
+    let expected = backup_body(state)?;
+    for peer in roster.members.values() {
+        let wire = hex::decode(
+            receipts
+                .get(&peer.id.to_string())
+                .ok_or("recovery card is missing a member's backup receipt")?,
+        )
+        .map_err(|e| format!("backup receipt: {e}"))?;
+        if identity.verify_backup(peer, &roster.vault, &wire)? != expected {
+            return Err(format!("member {} checked a different vault", peer.id));
+        }
+    }
+    Ok(())
 }
 
 fn words(path: &Path) -> Result<String, String> {
@@ -455,6 +506,115 @@ fn backup_verify(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn backup_finalize(args: &[String]) -> Result<(), String> {
+    if args.len() != 7 {
+        return Err("backup-finalize <member-dir> <passphrase-file> <provisional-card-dir> <new-final-card-dir> <words-file> <roster.json> <exchange-dir>".into());
+    }
+    let state_bytes = sealed_state(Path::new(&args[0]), Path::new(&args[1]))?;
+    let state: serde_json::Value =
+        serde_json::from_slice(&state_bytes).map_err(|e| e.to_string())?;
+    state_address(&state)?;
+    if state.get("backup_version").and_then(|v| v.as_u64()) != Some(2) {
+        return Err("legacy backup receipts do not bind the viewing secret and address".into());
+    }
+    let mnemonic = words(Path::new(&args[4]))?;
+    if card_dir(Path::new(&args[2]), false)?
+        .read_sealed("vault.card", &mnemonic)
+        .map_err(|e| e.to_string())?
+        != state_bytes
+    {
+        return Err("backup card does not match this member's vault state".into());
+    }
+    let roster = checked_roster(&state, Path::new(&args[5]))?;
+    let expected = backup_body(&state)?;
+    if MemberDir::open(Path::new(&args[0]), "secrets")
+        .read_sealed("activation.sealed", &passphrase(Path::new(&args[1]))?)
+        .map_err(|_| "activate the vault before finalizing its recovery card")?
+        != expected
+    {
+        return Err("activation belongs to a different vault".into());
+    }
+    let final_path = Path::new(&args[3]);
+    if final_path.join("vault.card").exists() {
+        let card = card_dir(final_path, false)?;
+        let evidence_bytes = card
+            .read_sealed("vault.card", &mnemonic)
+            .map_err(|e| e.to_string())?;
+        let evidence: serde_json::Value =
+            serde_json::from_slice(&evidence_bytes).map_err(|e| e.to_string())?;
+        if evidence["recovery_version"] != 2 || evidence["state"] != state {
+            return Err("final recovery card differs from this vault".into());
+        }
+        let roster_bytes = serde_json::to_vec(&evidence["roster"]).map_err(|e| e.to_string())?;
+        let card_roster = Roster::from_bytes(&roster_bytes)?;
+        check_roster(&state, &card_roster)?;
+        if card_roster.fingerprint() != roster.fingerprint() {
+            return Err("final recovery card roster differs from this vault".into());
+        }
+        let receipts: BTreeMap<String, String> =
+            serde_json::from_value(evidence["receipts"].clone())
+                .map_err(|e| format!("recovery card receipts: {e}"))?;
+        checked_receipts(&state, &card_roster, &receipts)?;
+        let local_roster: serde_json::Value =
+            serde_json::from_slice(&fs::read(&args[5]).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        if evidence
+            != serde_json::json!({
+                "recovery_version": 2, "state": state, "roster": local_roster, "receipts": receipts
+            })
+        {
+            return Err("final recovery card differs from this vault".into());
+        }
+        eprintln!("Final recovery card verified at {}/vault.card", args[3]);
+        return Ok(());
+    }
+    let mut receipts = BTreeMap::new();
+    for peer in roster.members.values() {
+        let wire = fs::read(Path::new(&args[6]).join(name(&roster.vault, "backup", peer.id, None)))
+            .map_err(|_| format!("member {} has not checked their backup", peer.id))?;
+        receipts.insert(peer.id.to_string(), hex::encode(wire));
+    }
+    checked_receipts(&state, &roster, &receipts)?;
+    let roster_json: serde_json::Value =
+        serde_json::from_slice(&fs::read(&args[5]).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    let evidence = serde_json::to_vec(&serde_json::json!({
+        "recovery_version": 2, "state": state, "roster": roster_json, "receipts": receipts
+    }))
+    .map_err(|e| e.to_string())?;
+    let card = card_dir(final_path, !final_path.exists())?;
+    if !card.exists("vault.card") {
+        card.write_sealed("vault.card", &evidence, &mnemonic)
+            .map_err(|e| e.to_string())?;
+    }
+    if card
+        .read_sealed("vault.card", &mnemonic)
+        .map_err(|e| e.to_string())?
+        != evidence
+    {
+        return Err("final recovery card differs from this vault".into());
+    }
+    eprintln!("Final recovery card verified at {}/vault.card. Save this file with the 24 words kept separately. The provisional card is not a complete spend recovery.", args[3]);
+    Ok(())
+}
+
+fn write_or_verify_sealed(
+    dir: &MemberDir,
+    file: &str,
+    expected: &[u8],
+    pass: &str,
+) -> Result<(), String> {
+    if dir.exists(file) {
+        if dir.read_sealed(file, pass).map_err(|e| e.to_string())? != expected {
+            return Err(format!("restore target has different {file}"));
+        }
+    } else {
+        dir.write_sealed(file, expected, pass)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 fn address(args: &[String]) -> Result<(), String> {
     if args.len() != 2 && args.len() != 4 {
         return Err("address <member-dir> <passphrase-file> [<roster.json> <exchange-dir>]".into());
@@ -494,29 +654,85 @@ fn address(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_roster(args: &[String]) -> Result<(), String> {
+    if args.len() != 3 {
+        return Err("validate-roster <member-dir> <passphrase-file> <roster.json>".into());
+    }
+    let member = loki_poc::member_state::open(
+        Path::new(&args[0]),
+        Path::new(&args[1]),
+        Path::new(&args[2]),
+    )?;
+    println!("{}", hex::encode(member.roster.fingerprint()));
+    Ok(())
+}
+
 fn restore(args: &[String]) -> Result<(), String> {
     if args.len() != 4 {
         return Err(
             "restore <new-member-dir> <new-passphrase-file> <card-dir> <words-file>".into(),
         );
     }
-    let state_bytes = card_dir(Path::new(&args[2]), false)?
-        .read_sealed("vault.card", &words(Path::new(&args[3]))?)
+    let card = card_dir(Path::new(&args[2]), false)?;
+    let mnemonic = words(Path::new(&args[3]))?;
+    let card_bytes = card
+        .read_sealed("vault.card", &mnemonic)
         .map_err(|e| e.to_string())?;
-    let state: serde_json::Value =
-        serde_json::from_slice(&state_bytes).map_err(|e| e.to_string())?;
+    let card_value: serde_json::Value =
+        serde_json::from_slice(&card_bytes).map_err(|e| e.to_string())?;
+    let (state, evidence) = if card_value.get("recovery_version").is_some() {
+        if card_value["recovery_version"] != 1 && card_value["recovery_version"] != 2 {
+            return Err("unsupported recovery card version".into());
+        }
+        (card_value["state"].clone(), Some(card_value))
+    } else {
+        (card_value, None)
+    };
+    let state_bytes = if evidence.is_some() {
+        serde_json::to_vec(&state).map_err(|e| e.to_string())?
+    } else {
+        card_bytes
+    };
     let address = state_address(&state)?;
     let identity = state_identity(&state)?;
+    let recovery = if let Some(evidence) = evidence {
+        let spendable = evidence["recovery_version"] == 2;
+        if spendable != (state.get("backup_version").and_then(|v| v.as_u64()) == Some(2)) {
+            return Err("recovery card and backup receipt versions differ".into());
+        }
+        let roster_bytes = serde_json::to_vec(&evidence["roster"]).map_err(|e| e.to_string())?;
+        let roster = Roster::from_bytes(&roster_bytes)?;
+        check_roster(&state, &roster)?;
+        let receipts: BTreeMap<String, String> =
+            serde_json::from_value(evidence["receipts"].clone())
+                .map_err(|e| format!("recovery card receipts: {e}"))?;
+        checked_receipts(&state, &roster, &receipts)?;
+        if spendable {
+            Some(roster_bytes)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let pass = passphrase(Path::new(&args[1]))?;
     let dir = MemberDir::create(Path::new(&args[0]), "secrets").map_err(|e| e.to_string())?;
     let _lock = setup_lock(&dir)?;
-    if dir.exists("identity.sealed") || dir.exists("vault.sealed") {
-        return Err("restore target already holds vault state".into());
+    write_or_verify_sealed(&dir, "identity.sealed", &identity.to_secret_bytes(), &pass)?;
+    write_or_verify_sealed(&dir, "vault.sealed", &state_bytes, &pass)?;
+    if let Some(roster_bytes) = recovery {
+        let path = Path::new(&args[0]).join("roster.json");
+        if path.exists() {
+            if fs::read(&path).map_err(|e| e.to_string())? != roster_bytes {
+                return Err("restore target has a different roster".into());
+            }
+        } else {
+            publish(Path::new(&args[0]), "roster.json", &roster_bytes)?;
+        }
+        write_or_verify_sealed(&dir, "activation.sealed", &backup_body(&state)?, &pass)?;
+    } else {
+        eprintln!("Legacy card restored keys and address only; legacy receipts do not bind the viewing secret and address. Payment needs a version 2 final recovery card.");
     }
-    dir.write_sealed("identity.sealed", &identity.to_secret_bytes(), &pass)
-        .map_err(|e| e.to_string())?;
-    dir.write_sealed("vault.sealed", &state_bytes, &pass)
-        .map_err(|e| e.to_string())?;
     println!("{address}");
     Ok(())
 }
@@ -646,6 +862,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let address = vault::regtest_unified_address(&fvk);
     let state = serde_json::to_vec(&serde_json::json!({
         "version": 2,
+        "backup_version": 2,
         "network": "regtest",
         "key_derivation": zip2005::VERSION,
         "vault": hex::encode(roster.vault),
@@ -676,14 +893,16 @@ fn main() {
         Some("profile-create") => profile_create(&args[1..]),
         Some("profile-open") => profile_open(&args[1..]),
         Some("address") => address(&args[1..]),
+        Some("validate-roster") => validate_roster(&args[1..]),
         Some("backup-create") => backup_create(&args[1..]),
         Some("backup-verify") => backup_verify(&args[1..]),
+        Some("backup-finalize") => backup_finalize(&args[1..]),
         Some("restore") => restore(&args[1..]),
         Some("fingerprint") if args.len() == 2 => {
             Roster::load(Path::new(&args[1])).map(|r| println!("{}", hex::encode(r.fingerprint())))
         }
         Some("run") => run(&args[1..]),
-        _ => Err("usage: loki_setup_member profile-create|profile-open|identity|identity-public|fingerprint|run|backup-create|backup-verify|address|restore ...".into()),
+        _ => Err("usage: loki_setup_member profile-create|profile-open|identity|identity-public|fingerprint|run|backup-create|backup-verify|backup-finalize|address|validate-roster|restore ...".into()),
     };
     if let Err(error) = result {
         eprintln!("error: {error}");

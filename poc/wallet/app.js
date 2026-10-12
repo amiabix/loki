@@ -11,6 +11,7 @@ function selectVault(vault) {
   $('balance').textContent = "Scan this device's chain view to see the balance.";
   $('words').textContent = '';
   $('backup-made').hidden = true;
+  $('download-final').hidden = true;
   $('draft-result').hidden = true;
   $('payment-draft').reset();
 }
@@ -124,7 +125,7 @@ async function refresh() {
   try {
     const state = await api('status' + (selectedVault ? `?vault=${encodeURIComponent(selectedVault)}` : ''));
     if (state.phase === 'new_profile' || state.phase === 'locked') selectedVault = null;
-    for (const id of ['new-profile', 'locked', 'home', 'invites', 'connect-account', 'setup', 'backup', 'waiting', 'active']) $(id).hidden = true;
+    for (const id of ['new-profile', 'locked', 'home', 'invites', 'connect-account', 'setup', 'backup', 'waiting', 'final-backup', 'active']) $(id).hidden = true;
     $('back').hidden = !selectedVault;
     $('lock').hidden = !state.profile && state.phase !== 'home';
     $('title').textContent = state.name || state.profile?.name || 'Your signer';
@@ -157,6 +158,7 @@ async function refresh() {
         $('fingerprint').textContent = state.fingerprint;
       } else if (state.phase === 'back_up') $('backup').hidden = false;
       else if (state.phase === 'waiting_for_backups') $('waiting').hidden = false;
+      else if (state.phase === 'final_backup') $('final-backup').hidden = false;
       else if (state.phase === 'active') {
         $('active').hidden = false;
         for (const option of $('payment-draft').elements.pair.options) {
@@ -210,19 +212,21 @@ action('make-backup', async () => {
   const result = await api('backup', {vault: selectedVault});
   $('words').textContent = result.words;
   $('backup-made').hidden = false;
-  message('Save both artifacts, then load them back below.');
+  message('Save the words and first card separately, then load the card back below. A final card follows after the group checks its backups.');
 });
-$('download').addEventListener('click', async () => {
+async function downloadCard(path, filename) {
   try {
-    const result = await api(`card?vault=${encodeURIComponent(selectedVault)}`);
+    const result = await api(`${path}?vault=${encodeURIComponent(selectedVault)}`);
     const bytes = Uint8Array.from(atob(result.card), c => c.charCodeAt(0));
     const link = document.createElement('a');
     link.href = URL.createObjectURL(new Blob([bytes], {type: 'application/octet-stream'}));
-    link.download = 'loki-vault.card';
+    link.download = filename;
     link.click();
     setTimeout(() => URL.revokeObjectURL(link.href), 1000);
   } catch (error) { message(error.message, true); }
-});
+}
+$('download').addEventListener('click', () => downloadCard('card', 'loki-provisional.card'));
+$('download-final').addEventListener('click', () => downloadCard('final-card', 'loki-vault.card'));
 action('check-backup', async (form) => {
   const value = fields(form);
   const bytes = new Uint8Array(await value.card.arrayBuffer());
@@ -231,15 +235,27 @@ action('check-backup', async (form) => {
   await api('verify', {vault: selectedVault, words: value.words, card: btoa(raw)});
   $('words').textContent = '';
   $('backup-made').hidden = true;
-  message('Your backup checked. Waiting for the other members.');
+  message('Your first card checked. Waiting for the other members before you save the final card.');
 });
 action('activate', async () => {
-  const value = await api('activate', {vault: selectedVault});
-  $('address').textContent = value.address;
-  message('All three backups checked. Vault active on regtest.');
+  await api('activate', {vault: selectedVault});
+  message('The signed backup checks are complete. Save and check your final recovery card.');
+});
+action('make-final-backup', async (form) => {
+  await api('finalize-backup', {vault: selectedVault, words: fields(form).words});
+  $('download-final').hidden = false;
+  message('Download the final card, then load the saved file to check it.');
+});
+action('check-final-backup', async (form) => {
+  const value = fields(form);
+  const bytes = new Uint8Array(await value.card.arrayBuffer());
+  if (bytes.length > 65536) throw new Error('Final backup card is too large');
+  let raw = ''; for (const byte of bytes) raw += String.fromCharCode(byte);
+  await api('verify-final-backup', {vault: selectedVault, words: value.words, card: btoa(raw)});
+  message('Your final card checked. Ask every member to do the same before depositing.');
 });
 action('show-address', async () => {
-  const value = await api('activate', {vault: selectedVault});
+  const value = await api('address', {vault: selectedVault});
   $('address').textContent = value.address;
 });
 $('refresh-balance').addEventListener('click', async () => {

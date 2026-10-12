@@ -36,6 +36,7 @@ class MemberWalletTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "not active"):
                 alice.prepare_payment(vault, "uregtest1recipient", "40000000", "test memo", "AB")
             (folder / "secrets" / "activation.sealed").write_bytes(b"active")
+            (folder / "final-backup-checked").write_bytes(b"checked\n")
 
             def prepare(_action, member, _pass, roster, work, _recipient, amount, memo, pair, **kwargs):
                 self.assertEqual(member, folder)
@@ -95,10 +96,27 @@ class MemberWalletTest(unittest.TestCase):
                 wallet.workers[vault].join(timeout=90)
                 self.assertFalse(wallet.workers[vault].is_alive())
                 self.assertIsNone(wallet.setup_errors.get(vault))
+            saved_words = []
             for wallet in wallets:
                 words = wallet.backup(vault)["words"]
+                saved_words.append(words)
                 card = (wallet.data / "vaults" / vault / "card" / "vault.card").read_bytes()
                 wallet.verify(vault, words, base64.b64encode(card).decode())
+            for wallet in wallets:
+                wallet.activate(vault)
+                self.assertEqual(wallet.status(vault)["phase"], "final_backup")
+                with self.assertRaisesRegex(ValueError, "final backup"):
+                    wallet.address(vault)
+            for index, (wallet, words) in enumerate(zip(wallets, saved_words)):
+                wallet.finalize_backup(vault, words)
+                final_card = (wallet.data / "vaults" / vault / "final-card" / "vault.card").read_bytes()
+                if index == 0:
+                    damaged = bytearray(final_card)
+                    damaged[-1] ^= 1
+                    with self.assertRaises(ValueError):
+                        wallet.verify_final_backup(vault, words, base64.b64encode(damaged).decode())
+                    self.assertEqual(wallet.status(vault)["phase"], "final_backup")
+                wallet.verify_final_backup(vault, words, base64.b64encode(final_card).decode())
             addresses = [wallet.address(vault) for wallet in wallets]
             self.assertEqual(len(set(addresses)), 1)
             self.assertTrue(addresses[0].startswith("uregtest1"))
@@ -152,11 +170,28 @@ class MemberWalletTest(unittest.TestCase):
                 self.assertIsNone(wallet.setup_errors.get(vault))
                 self.assertEqual(wallet.status(vault)["phase"], "back_up")
 
+            saved_words = []
             for wallet in wallets:
                 words = wallet.backup(vault)["words"]
+                saved_words.append(words)
                 card = (wallet.data / "vaults" / vault / "card" / "vault.card").read_bytes()
                 self.assertEqual(wallet.verify(vault, words, base64.b64encode(card).decode()),
                                  {"verified": True})
+            for wallet in wallets:
+                wallet.activate(vault)
+                self.assertEqual(wallet.status(vault)["phase"], "final_backup")
+            for wallet, words in zip(wallets, saved_words):
+                wallet.finalize_backup(vault, words)
+                final_card = (wallet.data / "vaults" / vault / "final-card" / "vault.card").read_bytes()
+                self.assertEqual(wallet.verify_final_backup(vault, words, base64.b64encode(final_card).decode()),
+                                 {"verified": True})
+            receipts = list((exchange / vault).glob(f"{vault}-backup-*.bin"))
+            self.assertEqual(len(receipts), 3)
+            for receipt in receipts:
+                receipt.unlink()
+            saved_final = (wallets[0].data / "vaults" / vault / "final-card" / "vault.card").read_bytes()
+            self.assertEqual(wallets[0].verify_final_backup(
+                vault, saved_words[0], base64.b64encode(saved_final).decode()), {"verified": True})
             addresses = [wallet.address(vault) for wallet in wallets]
             self.assertEqual(len(set(addresses)), 1)
             self.assertTrue(addresses[0].startswith("uregtest1"))
@@ -205,6 +240,27 @@ class MemberWalletTest(unittest.TestCase):
             self.assertEqual(status["phase"], "active")
             self.assertIn("account_link_error", status)
             self.assertEqual(wallets[0].address(vault), addresses[0])
+
+            (exchange / vault).rename(root / "retired-courier")
+            for wallet in wallets:
+                self.assertEqual(wallet.status(vault)["phase"], "active")
+                self.assertEqual(wallet.status(vault)["fingerprint"], fingerprints[0])
+                self.assertIn(vault, [item["vault"] for item in wallet.status()["vaults"]])
+                self.assertEqual(wallet.address(vault), addresses[0])
+            roster_path = wallets[1].data / "vaults" / vault / "roster.json"
+            saved_roster = json.loads(roster_path.read_text())
+            for changed in ({**saved_roster, "vault": "0" * 64},
+                            {**saved_roster, "members": [{**saved_roster["members"][0],
+                                                          "signing": "0" * 64},
+                                                         *saved_roster["members"][1:]]},
+                            {**saved_roster, "members": [saved_roster["members"][0],
+                                                          {**saved_roster["members"][1], "signing": "0" * 64},
+                                                          *saved_roster["members"][2:]]},
+                            {**saved_roster, "threshold": 3}):
+                roster_path.write_text(json.dumps(changed))
+                with self.assertRaises(ValueError):
+                    wallets[1].status(vault)
+            roster_path.write_text(json.dumps(saved_roster))
 
     def test_rejects_exchange_inside_private_root(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -22,9 +22,11 @@ pub struct Roster {
 
 impl Roster {
     pub fn load(path: &Path) -> Result<Self, String> {
-        let data: serde_json::Value =
-            serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
-                .map_err(|e| e.to_string())?;
+        Self::from_bytes(&fs::read(path).map_err(|e| e.to_string())?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let data: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
         let vault = hex32(&data, "vault")?;
         let entries = data["members"].as_array().ok_or("missing members")?;
         let mut members = BTreeMap::new();
@@ -211,14 +213,26 @@ pub fn open(owner: &Path, pass_file: &Path, roster_file: &Path) -> Result<Member
     {
         return Err("member share differs from certified vault policy".into());
     }
-    let mut backup = Params::new()
-        .hash_length(32)
-        .personal(b"Loki_bkup_v1")
-        .to_state();
+    let backup_version = state.get("backup_version").and_then(|v| v.as_u64());
+    let personal = match backup_version {
+        None => b"Loki_bkup_v1".as_slice(),
+        Some(2) => b"Loki_bkup_v2".as_slice(),
+        _ => return Err("unsupported backup receipt version".into()),
+    };
+    let mut backup = Params::new().hash_length(32).personal(personal).to_state();
     backup.update(&vault);
     backup.update(&roster.fingerprint());
     backup.update(&ak);
     backup.update(zip2005::VERSION.as_bytes());
+    if backup_version == Some(2) {
+        backup.update(&secret);
+        backup.update(
+            state["address"]
+                .as_str()
+                .ok_or("missing address")?
+                .as_bytes(),
+        );
+    }
     if dir
         .read_sealed("activation.sealed", &trimmed)
         .map_err(|_| "vault needs all members' backup confirmations")?

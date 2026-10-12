@@ -55,6 +55,9 @@ def create_vault(root, vault_id, setup, env, member_count=3):
                  for owner, password in members]
     if len(set(addresses)) != 1:
         raise RuntimeError("members derived different vault addresses")
+    for number, (owner, password) in enumerate(members, 1):
+        run([setup, "backup-finalize", owner, password, root / f"card-{number}",
+             root / f"final-card-{number}", owner / "words.txt", roster, exchange], env)
     return members, roster, addresses[0]
 
 
@@ -130,6 +133,27 @@ def main():
             return
     elif not vaults["funded"]:
         raise RuntimeError("fund the source vault before preparing a payment")
+
+    recovered_number = ord(args.pair[0]) - ord("A") + 1
+    recovered = root / f"recovered-member-{recovered_number}"
+    recovered.mkdir(mode=0o700)
+    recovered_card = recovered / "card"
+    recovered_card.mkdir(mode=0o700)
+    (recovered_card / "vault.card").write_bytes(
+        (root / "source" / f"final-card-{recovered_number}" / "vault.card").read_bytes())
+    (recovered_card / "vault.card").chmod(0o600)
+    recovered_words = recovered / "words.txt"
+    recovered_words.write_bytes((root / "source" / f"member-{recovered_number}" / "words.txt").read_bytes())
+    recovered_words.chmod(0o600)
+    recovered_pass = recovered / "pass.txt"
+    recovered_pass.write_text(f"new regtest passphrase for member {recovered_number}\n")
+    recovered_pass.chmod(0o600)
+    recovered_owner = recovered / "member"
+    if run([setup, "restore", recovered_owner, recovered_pass, recovered_card, recovered_words], env) != vault:
+        raise RuntimeError("recovered signer derived another vault address")
+    members[recovered_number - 1] = (recovered_owner, recovered_pass)
+    roster = recovered_owner / "roster.json"
+    print(f"restored signing member {recovered_number} from the final card and words at {recovered}", flush=True)
 
     destination = args.recipient or recipient_address
     if args.proposer not in range(1, member_count + 1):

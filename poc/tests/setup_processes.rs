@@ -589,6 +589,42 @@ fn three_processes_create_one_vault_without_sharing_secrets() {
             loki_poc::vault::regtest_unified_address(&loaded.fvk),
             addresses[0].trim()
         );
+        let finalized = Command::new(exe)
+            .args([
+                "backup-finalize",
+                member.to_str().unwrap(),
+                member.join("pass.txt").to_str().unwrap(),
+                root.join(format!("card-{id}")).to_str().unwrap(),
+                root.join(format!("final-card-{id}")).to_str().unwrap(),
+                member.join("words.txt").to_str().unwrap(),
+                roster.to_str().unwrap(),
+                exchange.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            finalized.status.success(),
+            "backup finalization: {}",
+            String::from_utf8_lossy(&finalized.stderr)
+        );
+        let repeated = Command::new(exe)
+            .args([
+                "backup-finalize",
+                member.to_str().unwrap(),
+                member.join("pass.txt").to_str().unwrap(),
+                root.join(format!("card-{id}")).to_str().unwrap(),
+                root.join(format!("final-card-{id}")).to_str().unwrap(),
+                member.join("words.txt").to_str().unwrap(),
+                roster.to_str().unwrap(),
+                exchange.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            repeated.status.success(),
+            "backup finalization retry: {}",
+            String::from_utf8_lossy(&repeated.stderr)
+        );
     }
     // The payment CLI must reject bad local context before it can create an
     // attempt record or publish any commitment.
@@ -786,6 +822,297 @@ fn three_processes_create_one_vault_without_sharing_secrets() {
         "activated address needs no exchange"
     );
     assert_eq!(cached_address.stdout, addresses[0].as_bytes());
+    let recovery = root.join("new-device");
+    fs::create_dir(&recovery).unwrap();
+    let recovered_card = recovery.join("card");
+    fs::create_dir(&recovered_card).unwrap();
+    fs::copy(
+        root.join("final-card-1/vault.card"),
+        recovered_card.join("vault.card"),
+    )
+    .unwrap();
+    assert!(!root.join("final-card-1/recovery.card").exists());
+    let recovered_words = recovery.join("words.txt");
+    fs::copy(first.join("words.txt"), &recovered_words).unwrap();
+    let recovered_pass = recovery.join("pass.txt");
+    fs::write(&recovered_pass, "new device passphrase\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&recovered_pass, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&recovered_words, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let offline_card_check = Command::new(exe)
+        .args([
+            "backup-finalize",
+            first.to_str().unwrap(),
+            first.join("pass.txt").to_str().unwrap(),
+            root.join("card-1").to_str().unwrap(),
+            recovered_card.to_str().unwrap(),
+            recovered_words.to_str().unwrap(),
+            roster.to_str().unwrap(),
+            exchange.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        offline_card_check.status.success(),
+        "offline saved-card check: {}",
+        String::from_utf8_lossy(&offline_card_check.stderr)
+    );
+
+    let bad_card = recovery.join("bad-card");
+    fs::create_dir(&bad_card).unwrap();
+    let words = fs::read_to_string(&recovered_words).unwrap();
+    let card = MemberDir::open(&recovery, "card");
+    let mut evidence: serde_json::Value =
+        serde_json::from_slice(&card.read_sealed("vault.card", words.trim()).unwrap()).unwrap();
+    evidence["receipts"].as_object_mut().unwrap().remove("3");
+    MemberDir::open(&recovery, "bad-card")
+        .write_sealed(
+            "vault.card",
+            &serde_json::to_vec(&evidence).unwrap(),
+            words.trim(),
+        )
+        .unwrap();
+    let refused_root = recovery.join("refused");
+    let refused = Command::new(exe)
+        .args([
+            "restore",
+            refused_root.to_str().unwrap(),
+            recovered_pass.to_str().unwrap(),
+            bad_card.to_str().unwrap(),
+            recovered_words.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !refused.status.success(),
+        "missing peer receipt restored a spendable share"
+    );
+    assert!(!refused_root.join("secrets").exists());
+
+    let tampered_card = recovery.join("tampered-card");
+    fs::create_dir(&tampered_card).unwrap();
+    let mut evidence: serde_json::Value =
+        serde_json::from_slice(&card.read_sealed("vault.card", words.trim()).unwrap()).unwrap();
+    let mut wire = hex::decode(evidence["receipts"]["3"].as_str().unwrap()).unwrap();
+    *wire.last_mut().unwrap() ^= 1;
+    evidence["receipts"]["3"] = hex::encode(wire).into();
+    MemberDir::open(&recovery, "tampered-card")
+        .write_sealed(
+            "vault.card",
+            &serde_json::to_vec(&evidence).unwrap(),
+            words.trim(),
+        )
+        .unwrap();
+    let tampered_root = recovery.join("tampered");
+    let refused = Command::new(exe)
+        .args([
+            "restore",
+            tampered_root.to_str().unwrap(),
+            recovered_pass.to_str().unwrap(),
+            tampered_card.to_str().unwrap(),
+            recovered_words.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !refused.status.success(),
+        "tampered peer receipt restored a spendable share"
+    );
+    assert!(!tampered_root.join("secrets").exists());
+
+    let changed_view_card = recovery.join("changed-view-card");
+    fs::create_dir(&changed_view_card).unwrap();
+    let mut evidence: serde_json::Value =
+        serde_json::from_slice(&card.read_sealed("vault.card", words.trim()).unwrap()).unwrap();
+    let ak: [u8; 32] = hex::decode(evidence["state"]["group_ak"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let changed_secret = [9u8; 32];
+    let changed_fvk = loki_poc::zip2005::frost_viewing_key(&ak, &changed_secret).unwrap();
+    evidence["state"]["vault_secret"] = hex::encode(changed_secret).into();
+    evidence["state"]["address"] = loki_poc::vault::regtest_unified_address(&changed_fvk).into();
+    MemberDir::open(&recovery, "changed-view-card")
+        .write_sealed(
+            "vault.card",
+            &serde_json::to_vec(&evidence).unwrap(),
+            words.trim(),
+        )
+        .unwrap();
+    let changed_view_root = recovery.join("changed-view");
+    let refused = Command::new(exe)
+        .args([
+            "restore",
+            changed_view_root.to_str().unwrap(),
+            recovered_pass.to_str().unwrap(),
+            changed_view_card.to_str().unwrap(),
+            recovered_words.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !refused.status.success(),
+        "changed viewing secret and matching address kept old peer receipts"
+    );
+    assert!(!changed_view_root.join("secrets").exists());
+
+    let restored_root = recovery.join("restored");
+    let restored = Command::new(exe)
+        .args([
+            "restore",
+            restored_root.to_str().unwrap(),
+            recovered_pass.to_str().unwrap(),
+            recovered_card.to_str().unwrap(),
+            recovered_words.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        restored.status.success(),
+        "two-artifact restore: {}",
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    assert_eq!(restored.stdout, addresses[0].as_bytes());
+    let loaded = loki_poc::member_state::open(
+        &restored_root,
+        &recovered_pass,
+        &restored_root.join("roster.json"),
+    )
+    .unwrap();
+    assert_eq!(loaded.identity.public().id, 1);
+    let interrupted_root = recovery.join("interrupted");
+    MemberDir::create(&interrupted_root, "secrets")
+        .unwrap()
+        .write_sealed(
+            "identity.sealed",
+            &loaded.identity.to_secret_bytes(),
+            "new device passphrase",
+        )
+        .unwrap();
+    let resumed = Command::new(exe)
+        .args([
+            "restore",
+            interrupted_root.to_str().unwrap(),
+            recovered_pass.to_str().unwrap(),
+            recovered_card.to_str().unwrap(),
+            recovered_words.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        resumed.status.success(),
+        "interrupted restore: {}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    loki_poc::member_state::open(
+        &interrupted_root,
+        &recovered_pass,
+        &interrupted_root.join("roster.json"),
+    )
+    .unwrap();
+    let conflicting_root = recovery.join("conflicting-target");
+    MemberDir::create(&conflicting_root, "secrets")
+        .unwrap()
+        .write_sealed("identity.sealed", &[5u8; 32], "new device passphrase")
+        .unwrap();
+    let conflicting = Command::new(exe)
+        .args([
+            "restore",
+            conflicting_root.to_str().unwrap(),
+            recovered_pass.to_str().unwrap(),
+            recovered_card.to_str().unwrap(),
+            recovered_words.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!conflicting.status.success());
+    assert!(!conflicting_root.join("secrets/vault.sealed").exists());
+    assert!(!conflicting_root.join("secrets/activation.sealed").exists());
+    let v1_root = recovery.join("existing-v1-member");
+    let mut v1_state: serde_json::Value =
+        serde_json::from_slice(&card.read_sealed("vault.card", words.trim()).unwrap()).unwrap();
+    v1_state = v1_state["state"].take();
+    v1_state.as_object_mut().unwrap().remove("backup_version");
+    let mut v1_digest = blake2b_simd::Params::new()
+        .hash_length(32)
+        .personal(b"Loki_bkup_v1")
+        .to_state();
+    for field in ["vault", "roster_fingerprint", "group_ak"] {
+        v1_digest.update(&hex::decode(v1_state[field].as_str().unwrap()).unwrap());
+    }
+    v1_digest.update(loki_poc::zip2005::VERSION.as_bytes());
+    let v1_dir = MemberDir::create(&v1_root, "secrets").unwrap();
+    v1_dir
+        .write_sealed(
+            "identity.sealed",
+            &loaded.identity.to_secret_bytes(),
+            "new device passphrase",
+        )
+        .unwrap();
+    v1_dir
+        .write_sealed(
+            "vault.sealed",
+            &serde_json::to_vec(&v1_state).unwrap(),
+            "new device passphrase",
+        )
+        .unwrap();
+    let v1_body: [u8; 32] = v1_digest.finalize().as_bytes().try_into().unwrap();
+    v1_dir
+        .write_sealed("activation.sealed", &v1_body, "new device passphrase")
+        .unwrap();
+    fs::copy(
+        restored_root.join("roster.json"),
+        v1_root.join("roster.json"),
+    )
+    .unwrap();
+    loki_poc::member_state::open(&v1_root, &recovered_pass, &v1_root.join("roster.json"))
+        .expect("previously activated v1 vault must still open");
+    let v1_provisional = recovery.join("v1-provisional");
+    MemberDir::create(&recovery, "v1-provisional")
+        .unwrap()
+        .write_sealed("vault.card", &serde_json::to_vec(&v1_state).unwrap(), words.trim())
+        .unwrap();
+    let mut v1_receipts = BTreeMap::new();
+    for number in 1..=3 {
+        let member = root.join(format!("member-{number}"));
+        let signer = loki_poc::member_state::open(&member, &member.join("pass.txt"), &roster)
+            .unwrap();
+        v1_receipts.insert(
+            number.to_string(),
+            hex::encode(signer.identity.sign_backup(&[7u8; 32], &v1_body).unwrap()),
+        );
+    }
+    let v1_final = recovery.join("v1-disguised-final");
+    let v1_envelope = serde_json::json!({
+        "recovery_version": 2,
+        "state": v1_state,
+        "roster": serde_json::from_slice::<serde_json::Value>(&fs::read(&roster).unwrap()).unwrap(),
+        "receipts": v1_receipts,
+    });
+    MemberDir::create(&recovery, "v1-disguised-final")
+        .unwrap()
+        .write_sealed("vault.card", &serde_json::to_vec(&v1_envelope).unwrap(), words.trim())
+        .unwrap();
+    let v1_final_check = Command::new(exe)
+        .args([
+            "backup-finalize",
+            v1_root.to_str().unwrap(),
+            recovered_pass.to_str().unwrap(),
+            v1_provisional.to_str().unwrap(),
+            v1_final.to_str().unwrap(),
+            recovered_words.to_str().unwrap(),
+            roster.to_str().unwrap(),
+            exchange.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !v1_final_check.status.success(),
+        "legacy receipts must not verify as a restorable final card"
+    );
     let offline = root.join("offline-restore");
     fs::create_dir(&offline).unwrap();
     let offline_pass = offline.join("pass.txt");
@@ -811,6 +1138,14 @@ fn three_processes_create_one_vault_without_sharing_secrets() {
         String::from_utf8_lossy(&offline_restored.stderr)
     );
     assert_eq!(offline_restored.stdout, addresses[0].as_bytes());
+    assert!(String::from_utf8_lossy(&offline_restored.stderr)
+        .contains("Legacy card restored keys and address only"));
+    assert!(
+        loki_poc::member_state::open(&offline, &offline_pass, &roster)
+            .err()
+            .unwrap()
+            .contains("backup confirmations")
+    );
     fs::remove_dir_all(root).unwrap();
 }
 

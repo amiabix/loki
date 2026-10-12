@@ -469,10 +469,50 @@ class Wallet:
                          member_dir / "roster.json", self.exchange_vault(vault))
         return {"verified": True}
 
+    def activate(self, vault):
+        member_dir, _ = self.vault_dir(vault)
+        self.command("address", member_dir, "@pass", member_dir / "roster.json",
+                     self.exchange_vault(vault))
+        return {"final_backup": True}
+
+    def finalize_backup(self, vault, words):
+        member_dir, _ = self.vault_dir(vault)
+        if not isinstance(words, str):
+            raise ValueError("Enter your 24 backup words")
+        with tempfile.TemporaryDirectory(prefix=".finalize-", dir=member_dir) as temp:
+            words_file = Path(temp) / "words"
+            write_new(words_file, words.encode())
+            self.command("backup-finalize", member_dir, "@pass", member_dir / "card",
+                         member_dir / "final-card", words_file, member_dir / "roster.json",
+                         self.exchange_vault(vault))
+        return {"created": True}
+
+    def verify_final_backup(self, vault, words, card_bytes):
+        member_dir, _ = self.vault_dir(vault)
+        if not isinstance(words, str) or not isinstance(card_bytes, str):
+            raise ValueError("Load the final card and enter your 24 words")
+        raw = base64.b64decode(card_bytes, validate=True)
+        if len(raw) > 64 * 1024 or not raw.startswith(b"LOKISEAL\x01"):
+            raise ValueError("Invalid final backup card")
+        with tempfile.TemporaryDirectory(prefix=".final-check-", dir=member_dir) as temp:
+            folder = Path(temp)
+            card = folder / "card"
+            card.mkdir(mode=0o700)
+            write_new(card / "vault.card", raw)
+            words_file = folder / "words"
+            write_new(words_file, words.encode())
+            self.command("backup-finalize", member_dir, "@pass", member_dir / "card", card,
+                         words_file, member_dir / "roster.json", self.exchange_vault(vault))
+        marker = member_dir / "final-backup-checked"
+        if not marker.exists():
+            write_new(marker, b"checked\n")
+        return {"verified": True}
+
     def address(self, vault):
         member_dir, _ = self.vault_dir(vault)
-        return self.command("address", member_dir, "@pass", member_dir / "roster.json",
-                            self.exchange_vault(vault))
+        if not (member_dir / "final-backup-checked").is_file():
+            raise ValueError("Check your final backup card before showing the receive address")
+        return self.command("address", member_dir, "@pass")
 
     def balance(self, vault):
         member_dir, _ = self.vault_dir(vault)
@@ -484,7 +524,7 @@ class Wallet:
 
     def prepare_payment(self, vault, recipient, amount_zat, memo, pair):
         member_dir, local = self.vault_dir(vault)
-        if not (member_dir / "secrets" / "activation.sealed").is_file():
+        if not (member_dir / "final-backup-checked").is_file():
             raise ValueError("Vault is not active")
         if not isinstance(recipient, str) or not recipient.strip():
             raise ValueError("Enter a recipient address")
@@ -526,7 +566,24 @@ class Wallet:
             return {"phase": "home", "network": "regtest", "profile": self.profile_data,
                     "vaults": vaults}
         member_dir, local = self.vault_dir(vault)
-        roster = self.roster(vault)
+        active = (member_dir / "secrets" / "activation.sealed").is_file()
+        if active:
+            roster_path = member_dir / "roster.json"
+            saved = read_json(roster_path)
+            members = saved.get("members")
+            total = local.get("members", 3)
+            slot = local.get("slot")
+            if saved.get("vault") != vault or saved.get("threshold") != local.get("threshold", 2) \
+                    or local.get("threshold", 2) != 2 or type(total) is not int or total not in (3, 4) \
+                    or not isinstance(members, list) or len(members) != total \
+                    or any(not isinstance(member, dict) for member in members) \
+                    or [member.get("id") for member in members] != list(range(1, total + 1)) \
+                    or type(slot) is not int or slot not in range(1, total + 1):
+                raise ValueError("Local roster differs from vault membership")
+            roster = {"members": members,
+                      "fingerprint": self.command("validate-roster", member_dir, "@pass", roster_path)}
+        else:
+            roster = self.roster(vault)
         state = {"phase": "waiting_for_members", "network": "regtest", "name": local["name"],
                  "slot": local["slot"], "vault": local["vault"], "members": len(roster["members"]),
                  "threshold": local.get("threshold", 2), "total_members": local.get("members", 3),
@@ -548,8 +605,8 @@ class Wallet:
             state["phase"] = "creating_keys"
         if (self.exchange_vault(local["vault"]) / f"{local['vault']}-backup-{local['slot']}.bin").exists():
             state["phase"] = "waiting_for_backups"
-        if (member_dir / "secrets" / "activation.sealed").exists():
-            state["phase"] = "active"
+        if active:
+            state["phase"] = "active" if (member_dir / "final-backup-checked").is_file() else "final_backup"
         if self.setup_errors.get(vault):
             state["phase"] = "stopped"
         return state
@@ -652,6 +709,10 @@ def make_signer_server(wallet, port, dashboard_port=None):
                     member_dir, _ = wallet.vault_dir(vault)
                     card = (member_dir / "card" / "vault.card").read_bytes()
                     return self.reply(200, {"card": base64.b64encode(card).decode()})
+                if path == "/api/final-card":
+                    member_dir, _ = wallet.vault_dir(vault)
+                    card = (member_dir / "final-card" / "vault.card").read_bytes()
+                    return self.reply(200, {"card": base64.b64encode(card).decode()})
             except Exception as error:
                 return self.reply(400, {"error": str(error)})
             self.reply(404, {"error": "Not found"})
@@ -718,7 +779,11 @@ def make_signer_server(wallet, port, dashboard_port=None):
                         "/api/agree": lambda: wallet.agree(value.get("vault"), value.get("fingerprint")),
                         "/api/backup": lambda: wallet.backup(value.get("vault")),
                         "/api/verify": lambda: wallet.verify(value.get("vault"), value.get("words"), value.get("card")),
-                        "/api/activate": lambda: {"address": wallet.address(value.get("vault"))},
+                        "/api/activate": lambda: wallet.activate(value.get("vault")),
+                        "/api/finalize-backup": lambda: wallet.finalize_backup(value.get("vault"), value.get("words")),
+                        "/api/verify-final-backup": lambda: wallet.verify_final_backup(
+                            value.get("vault"), value.get("words"), value.get("card")),
+                        "/api/address": lambda: {"address": wallet.address(value.get("vault"))},
                         "/api/balance": lambda: wallet.balance(value.get("vault")),
                         "/api/payment-draft": lambda: wallet.prepare_payment(
                             value.get("vault"), value.get("recipient"), value.get("amount_zat"),
