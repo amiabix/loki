@@ -5,6 +5,12 @@ account that spends an Ironwood note, where the signature is produced **before**
 transaction has a proof or an anchor.
 The separate-member local courier path also exercises 2-of-4; the relay path remains 2-of-3.
 
+The separate-member `loki_setup_member` and `loki_member_payment` commands are the
+current regtest vault path. The older `loki` binary uses a fixed test viewing-key
+tail and refuses to run unless `LOKI_ALLOW_FIXED_VIEWING_KEY=1` is explicitly set.
+The terminal research harnesses set this flag themselves. The older account demo
+requires the same opt-in at server startup; the separate-member demo does not.
+
 This is a prototype on a local regtest chain. **It is not a wallet and not custody
 software.** What it does and does not establish is stated precisely below and in the
 result documents, which are the authority.
@@ -19,6 +25,7 @@ result documents, which are the authority.
 | **Second-device finishing** | seed-flow THS validation: a party holding none of the approvers' files completed both posted and re-proving paths with one and two inputs. Replicas carry confidential randomizer seeds ([evidence](FROST-RANDOMIZER-RESULTS.md)) |
 | **Separate-member setup** | three or four isolated processes complete threshold-two DKG; each member checks a 24-word and card backup before the regtest address appears. Activated 2-of-4 member stores fed a mined regtest payment through the local courier. A clean restore without the exchange directory was demonstrated on 2-of-3 ([details](SEPARATE-MEMBER-SETUP.md)) |
 | **Signing sessions** | a 2-of-3 relay attempt with explicit member review and independent finishing. The relay-backed `commit`/`package`/`approve` path seals nonces across invocations and requires two pinned relay nonce receipts before signing; a staged regtest payment was mined. The simultaneous local-courier `sign` command supports 2-of-3 and 2-of-4 but remains a RAM-only demo ([scope](SIGNING-SESSION.md)) |
+| **Structured review** | the relay-enabled CLI can return a verified payment summary and exact-package review token, then recheck that token before `approve-reviewed` signs. The token binds bytes; an app still has to show the summary and obtain the member's explicit consent |
 | **Recovery, key rotation, custody** | local two-artifact restore demonstrated on regtest; independent spend, key rotation in the wallet, and custody readiness **not established** |
 
 ## Quick start
@@ -38,7 +45,7 @@ regtest vault and payment; open Alice and Bob's review links in separate browser
 sessions, approve in each, then ask Carol to prove and send. See
 [`demo/MEMBER-DEMO.md`](demo/MEMBER-DEMO.md) for the exact flow and limits.
 
-The earlier account UI is still available with `python3 demo/server.py` on port
+The earlier account UI is still available with `LOKI_ALLOW_FIXED_VIEWING_KEY=1 python3 demo/server.py` on port
 8787. In that browser UI, create the account and click **Start the test network**. It
 launches its own named THS environment, discovers free loopback ports, waits for
 the services, and funds the vault. Stop network, Reset, and graceful server

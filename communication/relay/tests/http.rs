@@ -423,6 +423,55 @@ impl HttpFixture {
         );
     }
 }
+
+#[tokio::test]
+async fn identity_route_signs_fresh_challenge_without_mailbox_credentials() {
+    use ed25519_dalek::{Signature, VerifyingKey};
+    use loki_relay_protocol::{
+        canonical::{self, Value},
+        challenge,
+    };
+    let f = HttpFixture::new(1024).await;
+    let request = |challenge: [u8; 32]| {
+        Request::builder()
+            .uri("/v1/identity")
+            .header("x-loki-challenge", hex::encode(challenge))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (status, media, raw) = f.send(request([10; 32])).await;
+    assert_eq!((status, media.as_str()), (200, "application/cbor"));
+    let Value::Array(parts) = canonical::decode(&raw, challenge::MAX_RESPONSE).unwrap() else {
+        panic!("wrapper")
+    };
+    let [Value::Bytes(body), Value::Bytes(signature)] = parts.as_slice() else {
+        panic!("fields")
+    };
+    let signed = challenge::decode_body(body).unwrap();
+    let manifest = std::fs::read_to_string(f._root.path().join("manifest")).unwrap();
+    let pinned: [u8; 32] = hex::decode(manifest.lines().nth(2).unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    assert_eq!(signed.pin.key, pinned);
+    assert_eq!(signed.pin.run, [7; 32]);
+    assert_eq!(signed.endpoint, "http://127.0.0.1:8000");
+    assert_eq!(signed.challenge, [10; 32]);
+    VerifyingKey::from_bytes(&signed.pin.key)
+        .unwrap()
+        .verify_strict(
+            &challenge::signature_input(body).unwrap(),
+            &Signature::from_slice(signature).unwrap(),
+        )
+        .unwrap();
+    assert_ne!(f.send(request([11; 32])).await.2, raw);
+    let missing = Request::builder()
+        .uri("/v1/identity")
+        .body(Body::empty())
+        .unwrap();
+    assert_error(f.send(missing).await, 400, 1);
+    f.owner.shutdown().await.unwrap();
+}
 fn object_uri(obj: &Object) -> String {
     format!(
         "/v1/mailboxes/{}/objects/{}",
@@ -3714,11 +3763,7 @@ async fn http_limits_control_uses_fresh_lane() {
     saturation
         .fixture
         .db
-        .get(
-            mailbox,
-            saturation.duplicate.hash,
-            Capability::new([2; 32]),
-        )
+        .get(mailbox, saturation.duplicate.hash, Capability::new([2; 32]))
         .expect("read lost its reserved queue slot to control");
     finish_saturation(saturation).await;
 }

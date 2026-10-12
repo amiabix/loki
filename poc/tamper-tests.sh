@@ -18,6 +18,7 @@
 set -uo pipefail
 
 cd "$(dirname "$0")"
+export LOKI_ALLOW_FIXED_VIEWING_KEY=1
 STATE="${LOKI_STATE:-$(mktemp -d "${TMPDIR:-/tmp}/loki-issue3-tamper.XXXXXX")/state}"
 if [ -e "$STATE" ] || [ -L "$STATE" ]; then echo "refusing existing state path: $STATE" >&2; exit 1; fi
 export LOKI_THS_INSTANCE="${LOKI_THS_INSTANCE:-loki}"

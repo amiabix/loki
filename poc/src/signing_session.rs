@@ -639,6 +639,30 @@ impl ReviewedPackage {
     pub fn summary(&self) -> &ReviewSummary {
         &self.summary
     }
+
+    /// Binds a displayed review to this exact member package; it is not member consent.
+    pub fn review_token(&self) -> [u8; 32] {
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"Loki_review_token_v1\0");
+        hash.update(&self.summary.vault);
+        hash.update(&self.summary.payment);
+        hash.update(&self.summary.attempt.0);
+        for member in self.summary.pair {
+            hash.update(&member.to_be_bytes());
+        }
+        hash.update(&self.peer.to_be_bytes());
+        hash.update(&self.summary.candidate_hash);
+        hash.update(&self.summary.sighash);
+        hash.update(&self.package_hash);
+        hash.finalize().into()
+    }
+
+    pub fn require_review_token(&self, token: [u8; 32]) -> Result<(), String> {
+        if self.review_token() != token {
+            return Err("reviewed signing package changed; review again".into());
+        }
+        Ok(())
+    }
 }
 
 impl PackagePayload {
@@ -798,8 +822,16 @@ pub struct SigningSession {
 /// (relay public key, relay run ID), fixed before commitments are published.
 pub type WitnessPins = [([u8; 32], [u8; 32]); 2];
 
+fn valid_witness_pins(pins: WitnessPins) -> bool {
+    pins[0].0 != pins[1].0
+        && pins[0].1 != pins[1].1
+        && pins
+            .iter()
+            .all(|(key, run)| *key != [0; 32] && *run != [0; 32])
+}
+
 /// Implementations must verify fresh signed receipts from two fixed, distinct relay
-/// operators. A duplicate claim is a refusal, including for the same package.
+/// identities. Operators must be checked separately. A duplicate claim is a refusal.
 pub trait NonceWitness {
     fn pins(&self) -> WitnessPins;
     fn claim(&mut self, cid: [u8; 32], encrypted_record: &[u8]) -> Result<(), String>;
@@ -854,11 +886,7 @@ impl SigningSession {
         passphrase: &str,
         pins: WitnessPins,
     ) -> Result<Self, String> {
-        if pins[0] == pins[1]
-            || pins
-                .iter()
-                .any(|(key, run)| *key == [0; 32] || *run == [0; 32])
-        {
+        if !valid_witness_pins(pins) {
             return Err("two distinct nonzero relay identities required".into());
         }
         let mut session = Self::begin(
@@ -1680,11 +1708,7 @@ impl AttemptStore {
                 raw[97..129].try_into().unwrap(),
             ),
         ];
-        if pins[0] == pins[1]
-            || pins
-                .iter()
-                .any(|(key, run)| *key == [0; 32] || *run == [0; 32])
-        {
+        if !valid_witness_pins(pins) {
             return Err("invalid sealed relay identities".into());
         }
         let count = u16::from_be_bytes(raw[129..131].try_into().unwrap()) as usize;

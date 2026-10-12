@@ -12,6 +12,7 @@ pub(crate) struct Root {
     _lock: File,
     pub run_id: [u8; 32],
     pub public_key: [u8; 32],
+    pub endpoint: String,
     signing_key: SigningKey,
 }
 
@@ -41,6 +42,11 @@ impl Root {
 
     pub(crate) fn sign_nonce_receipt(&self, body: &[u8]) -> RelayResult<[u8; 64]> {
         let signed = loki_relay_protocol::nonce::signature_input(body)?;
+        Ok(self.signing_key.sign(&signed).to_bytes())
+    }
+
+    pub(crate) fn sign_challenge(&self, body: &[u8]) -> RelayResult<[u8; 64]> {
+        let signed = loki_relay_protocol::challenge::signature_input(body)?;
         Ok(self.signing_key.sign(&signed).to_bytes())
     }
 
@@ -97,6 +103,7 @@ impl Root {
             _lock: lock,
             run_id: decode(lines[1])?,
             public_key,
+            endpoint: lines[0].to_owned(),
             signing_key,
         })
     }
@@ -142,6 +149,7 @@ impl Root {
             _lock: lock,
             run_id,
             public_key,
+            endpoint: url.to_owned(),
             signing_key,
         })
     }

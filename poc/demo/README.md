@@ -13,11 +13,11 @@ the launcher's runtime images beforehand. From `poc/`:
 
 ```sh
 cargo build
-python3 demo/server.py
+LOKI_ALLOW_FIXED_VIEWING_KEY=1 python3 demo/server.py
 ```
 
 Open `http://127.0.0.1:8787`. Pass a different demo port if needed, for example
-`python3 demo/server.py 8788`. The server does not compile Loki. You do not need
+`LOKI_ALLOW_FIXED_VIEWING_KEY=1 python3 demo/server.py 8788`. The server does not compile Loki. You do not need
 to start THS in another terminal, and `LOKI_THS_INSTANCE` does not select the
 browser demo's environment. That variable still selects an external environment
 for the terminal harnesses.

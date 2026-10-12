@@ -241,7 +241,7 @@
           Loki owns its account, signing, and proof construction.
         </p>
         <p class="prose prose-tight">
-          Build Loki, run <code>python3 demo/server.py</code> from <code>poc/</code>,
+          Build Loki, run <code>LOKI_ALLOW_FIXED_VIEWING_KEY=1 python3 demo/server.py</code> from <code>poc/</code>,
           and click Start the test network. Stop, reset, and server shutdown delete that
           owned instance with <code>ths stop</code>. The terminal harnesses still use an
           externally started THS instance; see <code>poc/harness/README.md</code> for setup.

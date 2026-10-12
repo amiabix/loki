@@ -11,6 +11,8 @@ function selectVault(vault) {
   $('balance').textContent = "Scan this device's chain view to see the balance.";
   $('words').textContent = '';
   $('backup-made').hidden = true;
+  $('draft-result').hidden = true;
+  $('payment-draft').reset();
 }
 
 function message(text, error = false) {
@@ -155,7 +157,12 @@ async function refresh() {
         $('fingerprint').textContent = state.fingerprint;
       } else if (state.phase === 'back_up') $('backup').hidden = false;
       else if (state.phase === 'waiting_for_backups') $('waiting').hidden = false;
-      else if (state.phase === 'active') $('active').hidden = false;
+      else if (state.phase === 'active') {
+        $('active').hidden = false;
+        for (const option of $('payment-draft').elements.pair.options) {
+          option.disabled = state.total_members === 3 && option.value.includes('D');
+        }
+      }
       else if (state.phase === 'stopped') message('Setup stopped: ' + state.error + '. Start a fresh vault session.', true);
     }
     if (state.error) message(state.error, true);
@@ -245,6 +252,14 @@ $('refresh-balance').addEventListener('click', async () => {
     $('balance').textContent = `${amount} ZEC · ${value.unspent_notes} unspent notes · block ${value.height}`;
   } catch (error) { message(error.message, true); }
   finally { button.disabled = false; }
+});
+action('payment-draft', async (form) => {
+  const vault = selectedVault;
+  const draft = await api('payment-draft', {vault, ...fields(form)});
+  if (selectedVault !== vault) return;
+  $('draft-result').textContent = `DRAFT ONLY · no member has approved or sent this payment\nPayment ID: ${draft.payment}\nRecipient: ${draft.recipient}\nAmount: ${draft.amount_zat} zat\nFee: ${draft.fee_zat} zat\nChange to vault: ${draft.change_zat} zat\nExpiry height: ${draft.expiry_height}\nSelected pair: members ${draft.pair.join(' and ')}`;
+  $('draft-result').hidden = false;
+  message('Saved a local draft in your signer. Relay delivery and verified approvals are not available in this app yet.');
 });
 $('back').addEventListener('click', () => { selectVault(null); refresh(); });
 $('lock').addEventListener('click', async () => {

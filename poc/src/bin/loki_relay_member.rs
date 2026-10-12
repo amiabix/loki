@@ -295,18 +295,19 @@ fn provision(
     let (targets, capabilities) = provision_inputs(manifest_dir, capability_dir)?;
     let runtime = runtime()?;
     runtime.block_on(async {
+        let http = RelayHttp::new().map_err(Exit::Client)?;
+        for target in &targets {
+            http.authenticate_endpoint(&target.pin, &target.endpoint)
+                .await
+                .map_err(Exit::Client)?;
+        }
         session
             .configs
             .prepare_provision(&mut session.db, &session.member, &targets)
             .map_err(Exit::Member)?;
         session
             .configs
-            .provision(
-                &mut session.db,
-                &session.member,
-                &RelayHttp::new().map_err(Exit::Client)?,
-                &capabilities,
-            )
+            .provision(&mut session.db, &session.member, &http, &capabilities)
             .await
             .map_err(Exit::Member)
     })?;
@@ -1145,6 +1146,9 @@ fn provision_inputs(
     if targets
         .windows(2)
         .any(|pair| pair[0].pin.key == pair[1].pin.key)
+        || targets[0].pin.run == targets[1].pin.run
+        || targets[0].pin.run == targets[2].pin.run
+        || targets[1].pin.run == targets[2].pin.run
     {
         return Err(Exit::Member(MemberError::Bounds));
     }
@@ -1457,6 +1461,47 @@ fn runtime() -> Result<RelayRuntime, Exit> {
 #[cfg(test)]
 mod pagination_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn provisioning_rejects_duplicate_run_ids_before_creating_inboxes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut random = [0u8; 8];
+        OsRng.try_fill_bytes(&mut random).unwrap();
+        let root = env::temp_dir().join(format!(
+            "loki-relay-runs-{}-{}",
+            std::process::id(),
+            hex::encode(random)
+        ));
+        let manifests = root.join("manifests");
+        let capabilities = root.join("capabilities");
+        fs::create_dir_all(&manifests).unwrap();
+        fs::create_dir(&capabilities).unwrap();
+        for index in 1..=3u8 {
+            let relay = manifests.join(index.to_string());
+            fs::create_dir(&relay).unwrap();
+            fs::write(
+                relay.join("manifest"),
+                format!(
+                    "http://127.0.0.1:{}\n{}\n{}\n",
+                    39000 + index as u16,
+                    hex_id(&[if index == 3 { 3 } else { 1 }; 32]),
+                    hex_id(&[index; 32]),
+                ),
+            )
+            .unwrap();
+            fs::write(relay.join("mailbox-bytes"), "1024\n").unwrap();
+            let capability = capabilities.join(hex_id(&[index; 32]));
+            fs::write(&capability, [index; 32]).unwrap();
+            fs::set_permissions(&capability, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert!(matches!(
+            provision_inputs(&manifests, &capabilities),
+            Err(Exit::Member(MemberError::Bounds))
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn sample(id: i64) -> DiagnosticSample {
         DiagnosticSample {

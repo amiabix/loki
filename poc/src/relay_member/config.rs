@@ -1031,17 +1031,28 @@ mod tests {
         let initial = store.prepare_provision(&mut db, &member, &targets).unwrap();
         drop(db);
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
-                .unwrap();
-            let mut byte = [0; 1];
-            let mut raw = Vec::new();
-            while !raw.ends_with(b"\r\n\r\n") {
-                stream.read_exact(&mut byte).unwrap();
-                raw.push(byte[0]);
-            }
-            let text = String::from_utf8(raw).unwrap();
+            let (mut stream, text) = loop {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                    .unwrap();
+                let mut byte = [0; 1];
+                let mut raw = Vec::new();
+                while !raw.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte).unwrap();
+                    raw.push(byte[0]);
+                }
+                let text = String::from_utf8(raw).unwrap();
+                if text.starts_with("HEAD / HTTP/1.1") {
+                    write!(
+                        stream,
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+                    )
+                    .unwrap();
+                    continue;
+                }
+                break (stream, text);
+            };
             let length: usize = text
                 .lines()
                 .find_map(|l| {
@@ -1325,6 +1336,14 @@ mod tests {
                             raw.push(byte[0]);
                         }
                         let text = String::from_utf8(raw.clone()).unwrap();
+                        if text.starts_with("HEAD / HTTP/1.1") {
+                            write!(
+                                stream,
+                                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+                            )
+                            .unwrap();
+                            continue;
+                        }
                         let length: usize = text
                             .lines()
                             .find_map(|line| {
@@ -1833,7 +1852,15 @@ mod tests {
             let start = Instant::now();
             while !finished.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(15) {
                 match listener.accept() {
-                    Ok(_) => {
+                    Ok((mut stream, _)) => {
+                        use std::io::Read;
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(3)))
+                            .unwrap();
+                        let mut method = [0; 4];
+                        if stream.read_exact(&mut method).is_ok() && method == *b"HEAD" {
+                            continue;
+                        }
                         seen.store(true, Ordering::SeqCst);
                         return;
                     }

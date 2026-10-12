@@ -42,6 +42,7 @@ impl fmt::Display for WireError {
 impl std::error::Error for WireError {}
 
 pub mod canonical;
+pub mod challenge;
 pub mod envelope;
 
 pub mod types;

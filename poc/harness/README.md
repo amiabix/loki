@@ -8,7 +8,8 @@ or Loki-owned node configuration to build or copy.
 
 ## Browser demo
 
-From `poc/`, build Loki and run `python3 demo/server.py`. Create the account and
+From `poc/`, build Loki and run `LOKI_ALLOW_FIXED_VIEWING_KEY=1 python3 demo/server.py`.
+This opts into the legacy fixed-key regtest fixture. Create the account and
 click **Start the test network**; the browser runner starts and manages its own
 THS instance. Stop network, Reset, and graceful server exit delete that environment
 through `ths stop`. See [../demo/README.md](../demo/README.md).

@@ -26,3 +26,23 @@ fn frost_viewing_key_keeps_the_zip2005_nullifier_key_but_changes_rivk() {
         ordinary.address_at(0u64, orchard::keys::Scope::External)
     );
 }
+
+#[test]
+fn frost_viewing_key_matches_second_independent_vector() {
+    // Computed from ZIP 2005 with Python hashlib, blake3 and integer reduction.
+    // The fixed ak is the valid Orchard group-key encoding used in the first vector.
+    let ak = hex::decode("c605c0eb00d6bb40b6d058a7308f85883a9b589feb7c4d07265951d415fb1e34")
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let secret = std::array::from_fn(|i| i as u8);
+    let fvk = loki_poc::zip2005::frost_viewing_key(&ak, &secret).unwrap();
+    assert_eq!(
+        hex::encode(fvk.to_bytes()),
+        concat!(
+            "c605c0eb00d6bb40b6d058a7308f85883a9b589feb7c4d07265951d415fb1e34",
+            "415e752227cb69652e2afa94816f630dcec1acdf3c3fb02e1e6b046e12a43111",
+            "f614d417e6b2f1643c49a974d0c16062cf5c4c724d7ec921e08c6edaf5d38508"
+        )
+    );
+}

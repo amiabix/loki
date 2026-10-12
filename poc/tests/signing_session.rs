@@ -328,6 +328,12 @@ fn run_signing_attempt(member_count: u16, first_signer: u16, second_signer: u16)
         .unwrap();
     let a_review = a.review_package(&a_message, &bob_pub).unwrap();
     let b_review = b.review_package(b_message, &alice_pub).unwrap();
+    assert!(a_review
+        .require_review_token(a_review.review_token())
+        .is_ok());
+    assert!(a_review
+        .require_review_token(b_review.review_token())
+        .is_err());
     assert_eq!(a_review.summary().amount_zat, 50_000_000);
     assert_eq!(b_review.summary().input_nullifiers.len(), 2);
     assert_eq!(

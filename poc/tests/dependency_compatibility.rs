@@ -204,6 +204,7 @@ impl Scratch {
 
     fn cli(&self, stage: &str, member: &str) -> std::process::Output {
         std::process::Command::new(env!("CARGO_BIN_EXE_loki"))
+            .env("LOKI_ALLOW_FIXED_VIEWING_KEY", "1")
             .arg(stage)
             .arg(&self.0)
             .arg(member)
@@ -424,6 +425,7 @@ fn cli_handoff_copies_only_the_selected_pairs_inputs_and_confidential_seed() {
         let replica = state.0.join(format!("replica-{pair}"));
         let before = state.snapshot();
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_loki"))
+            .env("LOKI_ALLOW_FIXED_VIEWING_KEY", "1")
             .arg("replicate")
             .arg(&state.0)
             .arg(&replica)
