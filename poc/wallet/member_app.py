@@ -119,6 +119,9 @@ class SignerSessions:
         name = value["name"].strip()
         if not 1 <= len(name.encode()) <= 80:
             raise ValueError("Enter a vault name of 1 to 80 UTF-8 bytes")
+        members = value.get("members", 3)
+        if type(members) is not int or members not in (3, 4):
+            raise ValueError("Choose a 2-of-3 or 2-of-4 vault")
         with self.lock:
             if not self._valid(key, origin):
                 raise ValueError("Connect your signer")
@@ -128,13 +131,14 @@ class SignerSessions:
                 raise ValueError("Too many vault requests")
             action = secrets.token_urlsafe(32)
             self.actions[action] = {"session": key, "origin": origin, "kind": "create",
-                                    "name": name, "state": "pending", "expires": self.now() + 300}
+                                    "name": name, "members": members,
+                                    "state": "pending", "expires": self.now() + 300}
             return action
 
     def pending_actions(self):
         with self.lock:
             return [{"action": action, "origin": item["origin"], "kind": item["kind"],
-                     "name": item["name"]} for action, item in self.actions.items()
+                     "name": item["name"], "members": item["members"]} for action, item in self.actions.items()
                     if item["state"] == "pending" and item["expires"] > self.now()
                     and self._valid(item["session"], item["origin"])]
 
@@ -145,7 +149,7 @@ class SignerSessions:
                     or not self._valid(item["session"], item["origin"]):
                 raise ValueError("Vault request missing or expired")
             item["state"] = "executing"
-            return {"kind": item["kind"], "name": item["name"]}
+            return {"kind": item["kind"], "name": item["name"], "members": item["members"]}
 
     def finish_action(self, action, result=None, error=None):
         with self.lock:
@@ -290,24 +294,28 @@ class Wallet:
             raise ValueError("Invalid vault ID")
         return self.exchange / vault
 
-    def create(self, name):
+    def create(self, name, members=3):
         profile = self.require_profile()
         if not isinstance(name, str) or not 1 <= len(name.strip()) <= 80:
             raise ValueError("Enter a vault name of 1 to 80 characters")
+        if type(members) is not int or members not in (3, 4):
+            raise ValueError("Choose a 2-of-3 or 2-of-4 vault")
         vault = secrets.token_hex(32)
         folder = self.exchange_vault(vault)
         folder.mkdir(mode=0o700)
         local = self.data / "vaults" / vault
         local.mkdir(mode=0o700, parents=True)
-        tokens = {slot: secrets.token_urlsafe(24) for slot in (2, 3)}
+        tokens = {slot: secrets.token_urlsafe(24) for slot in range(2, members + 1)}
         draft = {"vault": vault, "name": name.strip(), "threshold": 2,
+                 "members": members,
                  "expires_at": int(time.time()) + 24 * 60 * 60,
                  "invites": {str(slot): hashlib.sha256(token.encode()).hexdigest() for slot, token in tokens.items()}}
         write_new(folder / "draft.json", json.dumps(draft).encode())
         identity = json.loads(self.command("identity", local, "1", "@pass"))
         write_new(folder / "join-1.json", json.dumps(identity).encode())
         write_new(local / "membership.json", json.dumps({"vault": vault, "slot": 1,
-                                                          "name": name.strip(), "profile": profile["id"]}).encode())
+                                                          "name": name.strip(), "profile": profile["id"],
+                                                          "threshold": 2, "members": members}).encode())
         invites = [encoded({"vault": vault, "slot": slot, "secret": token}) for slot, token in tokens.items()]
         write_new(local / "invites.json", json.dumps(invites).encode())
         return {"vault": vault, "invites": invites}
@@ -323,10 +331,14 @@ class Wallet:
         draft = read_json(folder / "draft.json")
         if draft["vault"] != vault or int(draft["expires_at"]) < time.time():
             raise ValueError("Invite expired or belongs to another vault")
-        if draft.get("threshold") != 2 or not isinstance(draft.get("name"), str) or not 1 <= len(draft["name"].encode()) <= 80:
+        members = draft.get("members", 3)
+        if draft.get("threshold") != 2 or type(members) is not int or members not in (3, 4) \
+                or not isinstance(draft.get("name"), str) or not 1 <= len(draft["name"].encode()) <= 80:
             raise ValueError("Unsupported vault draft")
-        if slot not in (2, 3) or not isinstance(secret, str) or not secrets.compare_digest(
-            draft["invites"][str(slot)], hashlib.sha256(secret.encode()).hexdigest()
+        if type(slot) is not int or slot not in range(2, members + 1) or not isinstance(secret, str) \
+                or set(draft.get("invites", {})) != {str(id) for id in range(2, members + 1)} \
+                or not secrets.compare_digest(
+                    draft["invites"][str(slot)], hashlib.sha256(secret.encode()).hexdigest()
         ):
             raise ValueError("Invite does not match this vault")
         if (folder / f"join-{slot}.json").exists():
@@ -338,19 +350,24 @@ class Wallet:
         identity = json.loads(self.command("identity", local, str(slot), "@pass"))
         write_new(folder / f"join-{slot}.json", json.dumps(identity).encode())
         write_new(local / "membership.json", json.dumps({"vault": vault, "slot": slot,
-                                                          "name": draft["name"], "profile": profile["id"]}).encode())
+                                                          "name": draft["name"], "profile": profile["id"],
+                                                          "threshold": 2, "members": members}).encode())
         return {"vault": vault, "joined": True}
 
     def roster(self, vault):
         member_dir, local = self.vault_dir(vault)
         folder = self.exchange_vault(vault)
-        members = [read_json(folder / f"join-{slot}.json") for slot in (1, 2, 3)
+        draft = read_json(folder / "draft.json")
+        total = local.get("members", 3)
+        if draft.get("threshold") != local.get("threshold", 2) or draft.get("members", 3) != total:
+            raise ValueError("Vault policy changed after joining")
+        members = [read_json(folder / f"join-{slot}.json") for slot in range(1, total + 1)
                    if (folder / f"join-{slot}.json").exists()]
-        if len(members) != 3:
+        if len(members) != total:
             return {"members": members, "fingerprint": None}
-        if [member["id"] for member in members] != [1, 2, 3]:
+        if [member["id"] for member in members] != list(range(1, total + 1)):
             raise ValueError("Member slots do not match the roster")
-        roster = {"vault": vault, "members": members}
+        roster = {"vault": vault, "threshold": 2, "members": members}
         write_path = member_dir / "roster.json"
         if not write_path.exists():
             write_new(write_path, json.dumps(roster).encode())
@@ -405,7 +422,7 @@ class Wallet:
         member_dir, local = self.vault_dir(vault)
         roster = self.roster(vault)
         if not roster["fingerprint"]:
-            raise ValueError("Wait for all three members")
+            raise ValueError("Wait for all vault members")
         if not isinstance(fingerprint, str) or not secrets.compare_digest(fingerprint, roster["fingerprint"]):
             raise ValueError("Roster fingerprint does not match")
         own = json.loads(self.command("identity-public", member_dir, "@pass"))
@@ -478,6 +495,7 @@ class Wallet:
         roster = self.roster(vault)
         state = {"phase": "waiting_for_members", "network": "regtest", "name": local["name"],
                  "slot": local["slot"], "vault": local["vault"], "members": len(roster["members"]),
+                 "threshold": local.get("threshold", 2), "total_members": local.get("members", 3),
                  "fingerprint": roster["fingerprint"], "error": self.setup_errors.get(vault),
                  "profile": self.profile_data, "vaults": vaults}
         state["account_linked"] = (member_dir / "secrets" / "account-link.sealed").exists()
@@ -645,7 +663,7 @@ def make_signer_server(wallet, port, dashboard_port=None):
                         action = value.get("action")
                         details = sessions.take_action(action)
                         try:
-                            result = wallet.create(details["name"])
+                            result = wallet.create(details["name"], details["members"])
                         except Exception as error:
                             sessions.finish_action(action, error=str(error))
                             raise
@@ -658,7 +676,7 @@ def make_signer_server(wallet, port, dashboard_port=None):
                         "/api/profile-create": lambda: wallet.create_profile(value.get("name"), value.get("passphrase")),
                         "/api/unlock": lambda: wallet.unlock(value.get("passphrase")),
                         "/api/lock": wallet.lock_profile,
-                        "/api/create": lambda: wallet.create(value.get("name")),
+                        "/api/create": lambda: wallet.create(value.get("name"), value.get("members", 3)),
                         "/api/join": lambda: wallet.join(value.get("invite")),
                         "/api/begin-link": lambda: wallet.begin_link(value.get("vault")),
                         "/api/link": lambda: wallet.link(value.get("vault"), value.get("proof")),

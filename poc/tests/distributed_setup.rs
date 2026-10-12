@@ -62,3 +62,40 @@ fn a_changed_round_one_package_changes_the_transcript() {
     let (carol, _) = members.remove(&3).unwrap().advance(&round1).unwrap();
     assert_ne!(alice.transcript, carol.transcript);
 }
+
+#[test]
+fn four_members_certify_one_two_of_four_group_key() {
+    let mut members = BTreeMap::new();
+    let mut round1 = BTreeMap::new();
+    for id in 1u16..=4 {
+        let (member, message) = Member::start_with_policy(id, 2, 4).unwrap();
+        members.insert(id, member);
+        round1.insert(id, message);
+    }
+    let mut round2 = BTreeMap::new();
+    for (id, member) in members {
+        round2.insert(id, member.advance(&round1).unwrap());
+    }
+    let completed: BTreeMap<_, _> = round2
+        .iter()
+        .map(|(id, (member, _))| {
+            let incoming = round2
+                .iter()
+                .filter(|(sender, _)| *sender != id)
+                .map(|(sender, (_, outgoing))| (*sender, outgoing[id].clone()))
+                .collect();
+            (*id, member.finish(&incoming).unwrap())
+        })
+        .collect();
+    let digests = completed
+        .iter()
+        .map(|(id, c)| (*id, c.certificate_digest()))
+        .collect();
+    let keys: Vec<_> = completed
+        .into_values()
+        .map(|c| c.certify(&digests).unwrap().group_ak)
+        .collect();
+    assert_eq!(keys.len(), 4);
+    assert!(keys.windows(2).all(|pair| pair[0] == pair[1]));
+    assert!(Member::start_with_policy(1, 3, 4).is_err());
+}

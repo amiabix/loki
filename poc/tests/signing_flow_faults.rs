@@ -466,7 +466,13 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
     );
     let sighash = alice_review.summary().sighash;
     alice
-        .publish_approved(alice_review, &bob_public, &carol_public, &mailbox, "pass")
+        .publish_approved(
+            alice_review,
+            &bob_public,
+            &[carol_public.clone()],
+            &mailbox,
+            "pass",
+        )
         .unwrap();
     drop(alice);
     drop(good);

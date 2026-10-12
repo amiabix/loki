@@ -42,17 +42,26 @@ fn note(fvk: &orchard::keys::FullViewingKey, seed: u8) -> Note {
 
 #[test]
 fn signing_attempt_end_to_end() {
+    run_signing_attempt(3, 2);
+}
+
+#[test]
+fn four_member_vault_delivers_a_valid_payment_to_both_finishers() {
+    run_signing_attempt(4, 4);
+}
+
+fn run_signing_attempt(member_count: u16, second_signer: u16) {
     let root = scratch();
     let relay = Mailbox::new(&root.join("relay")).unwrap();
     let (shares, public) = frost::keys::generate_with_dealer(
-        3,
+        member_count,
         2,
         frost::keys::IdentifierList::Default,
         rand_core::OsRng,
     )
     .unwrap();
     let id1 = frost::Identifier::try_from(1u16).unwrap();
-    let id2 = frost::Identifier::try_from(2u16).unwrap();
+    let id2 = frost::Identifier::try_from(second_signer).unwrap();
     let key1 = frost::keys::KeyPackage::try_from(shares[&id1].clone()).unwrap();
     let key2 = frost::keys::KeyPackage::try_from(shares[&id2].clone()).unwrap();
     let ak: [u8; 32] = public
@@ -92,21 +101,25 @@ fn signing_attempt_end_to_end() {
         vault: [3; 32],
         payment: intent.proposal_id(),
         attempt: AttemptId::random(),
-        pair: [1, 2],
+        pair: [1, second_signer],
     };
     let alice = Identity::new(1);
-    let bob = Identity::new(2);
-    let carol = Identity::new(3);
+    let bob = Identity::new(second_signer);
+    let carol = Identity::new(if member_count == 4 { 2 } else { 3 });
+    let other_finisher = (member_count == 4).then(|| Identity::new(3));
     let alice_copy = Identity::from_secret_bytes(&alice.to_secret_bytes()).unwrap();
     let bob_copy = Identity::from_secret_bytes(&bob.to_secret_bytes()).unwrap();
     let alice_pub = alice.public();
     let bob_pub = bob.public();
     let carol_pub = carol.public();
-    let roster = BTreeMap::from([
+    let mut roster = BTreeMap::from([
         (1, alice_pub.clone()),
-        (2, bob_pub.clone()),
-        (3, carol_pub.clone()),
+        (second_signer, bob_pub.clone()),
+        (carol.public().id, carol_pub.clone()),
     ]);
+    if let Some(other) = &other_finisher {
+        roster.insert(other.public().id, other.public());
+    }
     let mut a = SigningSession::begin(
         &root.join("alice"),
         context.clone(),
@@ -242,10 +255,15 @@ fn signing_attempt_end_to_end() {
     assert!(a_inbox.iter().all(|m| m.kind() != MessageKind::Share));
     assert!(b_inbox.iter().all(|m| m.kind() != MessageKind::Share));
 
+    let finishers = roster
+        .values()
+        .filter(|identity| !context.pair.contains(&identity.id))
+        .cloned()
+        .collect::<Vec<_>>();
     let a_share_hash = a
-        .publish_approved(a_review, &bob_pub, &carol_pub, &relay, "alice pass")
+        .publish_approved(a_review, &bob_pub, &finishers, &relay, "alice pass")
         .unwrap();
-    b.publish_approved(b_review, &alice_pub, &carol_pub, &relay, "bob pass")
+    b.publish_approved(b_review, &alice_pub, &finishers, &relay, "bob pass")
         .unwrap();
     drop(a);
     drop(b);
@@ -274,6 +292,31 @@ fn signing_attempt_end_to_end() {
     )
     .unwrap();
     assert_eq!(indices.len(), 2);
+    if let Some(other) = &other_finisher {
+        let inbox = relay.read_for(other, &roster, &context).unwrap();
+        let package = inbox
+            .iter()
+            .find(|m| m.kind() == MessageKind::Package)
+            .unwrap();
+        let payload = PackagePayload::decode(&context, package.body()).unwrap();
+        let shares: [loki_poc::signing_session::OpenedMessage; 2] = inbox
+            .into_iter()
+            .filter(|m| m.kind() == MessageKind::Share)
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        let (_, other_sighash, _) = aggregate_and_apply(
+            &context,
+            &intent,
+            &context.vault,
+            &public,
+            &fvk,
+            &payload,
+            &shares,
+        )
+        .unwrap();
+        assert_eq!(other_sighash, sighash);
+    }
     assert_eq!(
         pczt::roles::signer::Signer::new(signed)
             .unwrap()

@@ -52,8 +52,8 @@ or signing. Do not share the signer's private URL.
 The dashboard cannot approve or sign payments; that needs a signer-side
 transaction review request and the relay-backed inbox.
 
-Start two more processes with different private data directories and ports 8802
-and 8803, using the same exchange directory. Open each printed private URL in a
+Start two or three more processes with different private data directories and ports,
+using the same exchange directory. Open each printed private URL in a
 separate browser window. Each person creates a local profile and unlocks it. A
 profile can create or join more than one vault; every vault has its own transport
 identity and sealed FROST share under `vaults/<vault-id>/`. The creator copies each invite code to
@@ -79,6 +79,13 @@ The account-control proof is verified locally and kept in the member's sealed
 store. It is not part of the group certificate, so other members do not learn a
 reusable account key. The ordinary wallet seed does not recover a Loki FROST
 share; the Loki 24 words and backup card are still required.
+The app can create 2-of-3 or 2-of-4 regtest vaults. The policy is included in
+the new roster fingerprint; old 2-of-3 roster files retain their original
+fingerprint. A four-member source vault completed a mined payment with members
+3 and 4 signing and member 2 finishing through `run-member-payment.py
+--members 4 --pair CD --finisher 2`. This is the local courier test path; the
+relay adapter and payment UI remain three-member-only or absent, respectively.
+
 The app is passphrase-only today. Its local file courier and time-limited,
 non-resumable DKG are development controls, not the planned relay transport.
 Data roots created by the previous one-vault app are left untouched and need an

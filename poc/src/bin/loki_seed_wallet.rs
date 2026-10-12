@@ -17,8 +17,8 @@ use orchard::keys::{SpendAuthorizingKey, SpendingKey};
 use pasta_curves::pallas;
 use rand_zp::rand_core::UnwrapErr;
 use rand_zp::rngs::SysRng;
-use reddsa_frost::{Signature, VerificationKey, orchard::SpendAuth};
-use serde_json::{Value, json};
+use reddsa_frost::{orchard::SpendAuth, Signature, VerificationKey};
+use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
 fn now() -> Result<u64, String> {
@@ -41,7 +41,7 @@ fn challenge(raw: &[u8], fresh: bool) -> Result<Value, String> {
         || value["network"] != "regtest"
         || value["member"]
             .as_u64()
-            .is_none_or(|id| !(1..=3).contains(&id))
+            .is_none_or(|id| !(1..=4).contains(&id))
     {
         return Err("unsupported account-link challenge".into());
     }

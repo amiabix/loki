@@ -1,4 +1,4 @@
-//! One member's 2-of-3 DKG state. No process ever holds another member's secret package.
+//! One member's dealerless DKG state. No process ever holds another member's secret package.
 //!
 //! The caller must authenticate each sender and encrypt every round-two package before
 //! transport. This module does not make a vault active: a certificate exchange and the
@@ -11,18 +11,21 @@ use reddsa_frost::frost::redpallas as frost;
 
 pub struct Member {
     number: u16,
+    members: u16,
     secret: frost::keys::dkg::round1::SecretPackage,
     own_round1: Vec<u8>,
 }
 
 pub struct Round2Member {
     number: u16,
+    members: u16,
     secret: frost::keys::dkg::round2::SecretPackage,
     peer_round1: BTreeMap<frost::Identifier, frost::keys::dkg::round1::Package>,
     pub transcript: [u8; 32],
 }
 
 pub struct Completed {
+    members: u16,
     key_package: Vec<u8>,
     public_package: Vec<u8>,
     group_ak: [u8; 32],
@@ -36,22 +39,33 @@ pub struct Certified {
     pub transcript: [u8; 32],
 }
 
-fn expected_ids() -> [u16; 3] {
-    [1, 2, 3]
+fn expected_ids(members: u16) -> Vec<u16> {
+    (1..=members).collect()
 }
 
 impl Member {
     pub fn start(id: u16) -> Result<(Self, Vec<u8>), String> {
-        if !expected_ids().contains(&id) {
-            return Err("member id must be 1, 2 or 3".into());
+        Self::start_with_policy(id, 2, 3)
+    }
+
+    pub fn start_with_policy(
+        id: u16,
+        threshold: u16,
+        members: u16,
+    ) -> Result<(Self, Vec<u8>), String> {
+        if !matches!((threshold, members), (2, 3) | (2, 4)) || !expected_ids(members).contains(&id)
+        {
+            return Err("supported DKG policies are 2-of-3 and 2-of-4".into());
         }
         let identifier = frost::Identifier::try_from(id).map_err(|e| e.to_string())?;
-        let (secret, public) = frost::keys::dkg::part1(identifier, 3, 2, rand_core::OsRng)
-            .map_err(|e| e.to_string())?;
+        let (secret, public) =
+            frost::keys::dkg::part1(identifier, members, threshold, rand_core::OsRng)
+                .map_err(|e| e.to_string())?;
         let bytes = public.serialize().map_err(|e| e.to_string())?;
         Ok((
             Self {
                 number: id,
+                members,
                 secret,
                 own_round1: bytes.clone(),
             },
@@ -63,8 +77,8 @@ impl Member {
         self,
         round1: &BTreeMap<u16, Vec<u8>>,
     ) -> Result<(Round2Member, BTreeMap<u16, Vec<u8>>), String> {
-        if round1.len() != 3 || round1.keys().copied().collect::<Vec<_>>() != expected_ids() {
-            return Err("round one needs exactly members 1, 2 and 3".into());
+        if round1.keys().copied().collect::<Vec<_>>() != expected_ids(self.members) {
+            return Err("round one needs exactly the certified members".into());
         }
         let own = self.number;
         if round1[&own] != self.own_round1 {
@@ -92,7 +106,10 @@ impl Member {
         let (secret, outgoing) =
             frost::keys::dkg::part2(self.secret, &peers).map_err(|e| e.to_string())?;
         let mut wire = BTreeMap::new();
-        for peer in expected_ids().into_iter().filter(|peer| *peer != own) {
+        for peer in expected_ids(self.members)
+            .into_iter()
+            .filter(|peer| *peer != own)
+        {
             let id = frost::Identifier::try_from(peer).map_err(|e| e.to_string())?;
             let package = outgoing
                 .get(&id)
@@ -102,6 +119,7 @@ impl Member {
         Ok((
             Round2Member {
                 number: self.number,
+                members: self.members,
                 secret,
                 peer_round1: peers,
                 transcript,
@@ -114,10 +132,10 @@ impl Member {
 impl Round2Member {
     pub fn finish(&self, incoming: &BTreeMap<u16, Vec<u8>>) -> Result<Completed, String> {
         let own = self.number;
-        if incoming.len() != 2
+        if incoming.len() != usize::from(self.members - 1)
             || incoming
                 .keys()
-                .any(|id| !expected_ids().contains(id) || *id == own)
+                .any(|id| !expected_ids(self.members).contains(id) || *id == own)
         {
             return Err("round two needs one authenticated package from each peer".into());
         }
@@ -139,6 +157,7 @@ impl Round2Member {
             .try_into()
             .map_err(|_| "group ak is not 32 bytes")?;
         Ok(Completed {
+            members: self.members,
             key_package: key_package.serialize().map_err(|e| e.to_string())?,
             public_package: public_package.serialize().map_err(|e| e.to_string())?,
             group_ak: ak,
@@ -165,8 +184,8 @@ impl Completed {
     }
 
     pub fn certify(self, digests: &BTreeMap<u16, [u8; 32]>) -> Result<Certified, String> {
-        if digests.len() != 3 || digests.keys().copied().collect::<Vec<_>>() != expected_ids() {
-            return Err("certificates need exactly members 1, 2 and 3".into());
+        if digests.keys().copied().collect::<Vec<_>>() != expected_ids(self.members) {
+            return Err("certificates need exactly the certified members".into());
         }
         let own = self.certificate_digest();
         if digests.values().any(|digest| digest != &own) {

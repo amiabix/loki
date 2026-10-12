@@ -132,8 +132,8 @@ fn identity(args: &[String]) -> Result<(), String> {
         return Err("identity already exists".into());
     }
     let id: u16 = args[1].parse().map_err(|_| "invalid member id")?;
-    if !(1..=3).contains(&id) {
-        return Err("member id must be 1, 2 or 3".into());
+    if !(1..=4).contains(&id) {
+        return Err("member id must be 1, 2, 3 or 4".into());
     }
     let secret = Identity::new(id);
     dir.write_sealed(
@@ -270,15 +270,20 @@ fn state_address(state: &serde_json::Value) -> Result<String, String> {
     .map_err(|e| e.to_string())?;
     let key = frost::keys::KeyPackage::deserialize(&key_bytes)
         .map_err(|e| format!("invalid member share: {e}"))?;
+    let (threshold, members) = state_policy(state)?;
+    if !matches!((threshold, members), (2, 3) | (2, 4)) {
+        return Err("unsupported vault policy".into());
+    }
     let id = frost::Identifier::try_from(state_identity(state)?.public().id)
         .map_err(|e| e.to_string())?;
     if key.identifier() != &id
         || key.verifying_key() != public.verifying_key()
         || public.verifying_shares().get(&id) != Some(key.verifying_share())
-        || *key.min_signers() != 2
-        || public.min_signers() != Some(2)
+        || u64::from(*key.min_signers()) != threshold
+        || public.min_signers().map(u64::from) != Some(threshold)
+        || public.verifying_shares().len() as u64 != members
     {
-        return Err("member share differs from certified 2-of-3 vault".into());
+        return Err("member share differs from certified vault policy".into());
     }
     Ok(expected)
 }
@@ -307,10 +312,27 @@ fn state_identity(state: &serde_json::Value) -> Result<Identity, String> {
     Identity::from_secret_bytes(&bytes)
 }
 
+fn state_policy(state: &serde_json::Value) -> Result<(u64, u64), String> {
+    let threshold = state
+        .get("threshold")
+        .map(|value| value.as_u64())
+        .unwrap_or(Some(2))
+        .ok_or("invalid sealed threshold")?;
+    let members = state
+        .get("members")
+        .map(|value| value.as_u64())
+        .unwrap_or(Some(3))
+        .ok_or("invalid sealed member count")?;
+    Ok((threshold, members))
+}
+
 fn checked_roster(state: &serde_json::Value, path: &Path) -> Result<Roster, String> {
     let roster = Roster::load(path)?;
+    let (threshold, members) = state_policy(state)?;
     if hex::encode(roster.vault) != state["vault"]
         || hex::encode(roster.fingerprint()) != state["roster_fingerprint"]
+        || u64::from(roster.threshold) != threshold
+        || roster.members.len() as u64 != members
     {
         return Err("roster differs from the vault certificate".into());
     }
@@ -532,7 +554,8 @@ fn run(args: &[String]) -> Result<(), String> {
         b"Loki_vs_commit1",
         &[&roster.vault, &own.id.to_be_bytes(), &contribution],
     );
-    let (member, own_r1) = Member::start(own.id)?;
+    let (member, own_r1) =
+        Member::start_with_policy(own.id, roster.threshold, roster.members.len() as u16)?;
     let mut r1_body = commitment.to_vec();
     r1_body.extend_from_slice(&own_r1);
     publish(
@@ -626,6 +649,8 @@ fn run(args: &[String]) -> Result<(), String> {
         "network": "regtest",
         "key_derivation": zip2005::VERSION,
         "vault": hex::encode(roster.vault),
+        "threshold": roster.threshold,
+        "members": roster.members.len(),
         "roster_fingerprint": hex::encode(roster.fingerprint()),
         "identity_secret": hex::encode(secret.to_secret_bytes()),
         "key_package": hex::encode(&certified.key_package),
@@ -663,5 +688,21 @@ fn main() {
     if let Err(error) = result {
         eprintln!("error: {error}");
         process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sealed_policy_defaults_only_when_absent() {
+        assert_eq!(state_policy(&serde_json::json!({})).unwrap(), (2, 3));
+        assert_eq!(
+            state_policy(&serde_json::json!({"threshold": 2, "members": 4})).unwrap(),
+            (2, 4)
+        );
+        assert!(state_policy(&serde_json::json!({"threshold": "2", "members": 4})).is_err());
+        assert!(state_policy(&serde_json::json!({"threshold": 2, "members": null})).is_err());
     }
 }

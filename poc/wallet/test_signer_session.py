@@ -80,7 +80,7 @@ class SessionHttpTests(unittest.TestCase):
                                       "profile": "private-profile-id", "invites": ["secret"]}]
             wallet.status = lambda vault=None: {"phase": "active", "words": "secret"}
             created = []
-            wallet.create = lambda name: created.append(name) or {"vault": "new-vault", "invites": ["private-invite"]}
+            wallet.create = lambda name, members: created.append((name, members)) or {"vault": "new-vault", "invites": ["private-invite"]}
             server, private_token = make_signer_server(wallet, 0, 18802)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -123,15 +123,16 @@ class SessionHttpTests(unittest.TestCase):
                                   {"Origin": "http://evil.example", "X-Loki-Session": key})[0], 403)
             self.assertEqual(call("POST", "/api/session/action", {"kind": "create", "name": " "},
                                   {"Origin": origin, "X-Loki-Session": key})[0], 400)
-            action = call("POST", "/api/session/action", {"kind": "create", "name": "New team"},
+            action = call("POST", "/api/session/action", {"kind": "create", "name": "New team", "members": 4},
                           {"Origin": origin, "X-Loki-Session": key})[1]["action"]
             self.assertEqual(created, [])
             pending_action = call("GET", "/api/session/actions",
                                   headers={"X-Loki-Token": private_token})[1]["actions"]
             self.assertEqual(pending_action[0]["name"], "New team")
+            self.assertEqual(pending_action[0]["members"], 4)
             self.assertEqual(call("POST", "/api/session/action-approve", {"action": action},
                                   {"X-Loki-Token": private_token})[0], 200)
-            self.assertEqual(created, ["New team"])
+            self.assertEqual(created, [("New team", 4)])
             self.assertEqual(call("POST", "/api/session/action-approve", {"action": action},
                                   {"X-Loki-Token": private_token})[0], 400)
             self.assertEqual(call("POST", "/api/session/action-poll", {"action": action},

@@ -93,8 +93,9 @@ $('create-vault').addEventListener('submit', async (event) => {
   button.disabled = true;
   try {
     const name = new FormData(event.target).get('name');
-    const {action} = await call('action', {kind: 'create', name});
-    message(`Approve creation of “${name}” in your signer window.`);
+    const members = Number(new FormData(event.target).get('members'));
+    const {action} = await call('action', {kind: 'create', name, members});
+    message(`Approve creation of the 2-of-${members} “${name}” vault in your signer window.`);
     for (let i = 0; i < 300; i++) {
       await new Promise(resolve => setTimeout(resolve, 1000));
       const result = await call('action-poll', {action});

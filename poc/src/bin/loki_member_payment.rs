@@ -15,7 +15,7 @@ use loki_poc::signing_session::NonceWitness;
 use loki_poc::{
     candidate::{alpha_from_canonical_bytes, build_candidate, quote_fee, CandidateInputs, Regtest},
     intent::{ChangePolicy, Intent},
-    member_state::{self, MemberState},
+    member_state::{self, MemberState, Roster},
     rpc::Rpc,
     scan,
     signing_session::{
@@ -62,8 +62,11 @@ fn pair_from_name(name: &str) -> Result<[u16; 2], String> {
     match name {
         "AB" => Ok([1, 2]),
         "AC" => Ok([1, 3]),
+        "AD" => Ok([1, 4]),
         "BC" => Ok([2, 3]),
-        _ => Err("pair must be AB, AC, or BC".into()),
+        "BD" => Ok([2, 4]),
+        "CD" => Ok([3, 4]),
+        _ => Err("pair must be AB, AC, AD, BC, BD, or CD".into()),
     }
 }
 
@@ -83,8 +86,8 @@ fn manifest_pair(value: &Value) -> Result<[u16; 2], String> {
         u16::try_from(first).map_err(|_| "invalid payment pair")?,
         u16::try_from(second).map_err(|_| "invalid payment pair")?,
     ];
-    if !matches!(pair, [1, 2] | [1, 3] | [2, 3]) {
-        return Err("payment pair must be AB, AC, or BC".into());
+    if pair[0] < 1 || pair[1] > 4 || pair[0] >= pair[1] {
+        return Err("payment pair must be a supported sorted pair".into());
     }
     Ok(pair)
 }
@@ -100,8 +103,7 @@ fn peer_in_pair(pair: [u16; 2], own: u16) -> Option<u16> {
 }
 
 fn proposer_id(bytes: &[u8]) -> Result<u16, String> {
-    // shortcut: this CLI has a fixed three-member roster; use certified roster IDs when setup becomes dynamic.
-    (1u16..=3)
+    (1u16..=4)
         .find(|id| frost::Identifier::try_from(*id).is_ok_and(|member| member.serialize() == bytes))
         .ok_or_else(|| "payment proposer is not a vault member".into())
 }
@@ -185,6 +187,27 @@ fn manifest(path: &Path) -> Result<(SessionContext, Intent), String> {
     Ok((context, intent))
 }
 
+fn check_manifest_roster(
+    roster: &Roster,
+    context: &SessionContext,
+    intent: &Intent,
+) -> Result<(), String> {
+    if context.vault != roster.vault {
+        return Err("manifest names another vault".into());
+    }
+    if context
+        .pair
+        .iter()
+        .any(|id| !roster.members.contains_key(id))
+    {
+        return Err("payment pair includes a member outside this vault".into());
+    }
+    if !roster.members.contains_key(&proposer_id(&intent.proposer)?) {
+        return Err("payment proposer is not a vault member".into());
+    }
+    Ok(())
+}
+
 fn state(args: &[String]) -> Result<(MemberState, PathBuf, Zeroizing<String>), String> {
     if args.len() < 4 {
         return Err("expected <member-dir> <passphrase-file> <roster.json> <work-dir>".into());
@@ -201,7 +224,11 @@ fn balance(args: &[String]) -> Result<(), String> {
     if args.len() != 3 {
         return Err("balance <member-dir> <passphrase-file> <roster.json>".into());
     }
-    let member = member_state::open(Path::new(&args[0]), Path::new(&args[1]), Path::new(&args[2]))?;
+    let member = member_state::open(
+        Path::new(&args[0]),
+        Path::new(&args[1]),
+        Path::new(&args[2]),
+    )?;
     let chain = scan::scan_chain(&Rpc::regtest(), &member.fvk)?;
     let balance_zat = chain
         .notes
@@ -218,10 +245,16 @@ fn balance(args: &[String]) -> Result<(), String> {
 
 fn prepare(args: &[String]) -> Result<(), String> {
     if args.len() != 7 && args.len() != 8 {
-        return Err("prepare <member-dir> <passphrase-file> <roster.json> <work-dir> <recipient-UA> <amount-zat> <memo> [AB|AC|BC]".into());
+        return Err("prepare <member-dir> <passphrase-file> <roster.json> <work-dir> <recipient-UA> <amount-zat> <memo> [AB|AC|AD|BC|BD|CD]".into());
     }
     let pair = pair_from_name(args.get(7).map(String::as_str).unwrap_or("AB"))?;
     let (member, _, _) = state(args)?;
+    if pair
+        .iter()
+        .any(|id| !member.roster.members.contains_key(id))
+    {
+        return Err("payment pair includes a member outside this vault".into());
+    }
     let work = Path::new(&args[3]);
     private_work(work)?;
     let rpc = Rpc::regtest();
@@ -457,15 +490,26 @@ fn sign(args: &[String]) -> Result<(), String> {
     let (member, owner, pass) = state(args)?;
     let own = member.identity.public().id;
     let (context, intent) = manifest(&Path::new(&args[3]).join("payment.json"))?;
+    check_manifest_roster(&member.roster, &context, &intent)?;
     let peer_id =
         peer_in_pair(context.pair, own).ok_or("member is not in the selected payment pair")?;
-    let peer = member.roster.members[&peer_id].clone();
-    let finisher =
-        member.roster.members[&(1..=3).find(|id| !context.pair.contains(id)).unwrap()].clone();
-    private_work(Path::new(&args[3]))?;
-    if context.vault != member.vault {
-        return Err("manifest names another vault".into());
+    let peer = member
+        .roster
+        .members
+        .get(&peer_id)
+        .ok_or("payment pair outside vault")?
+        .clone();
+    let finishers = member
+        .roster
+        .members
+        .values()
+        .filter(|person| !context.pair.contains(&person.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !matches!(finishers.len(), 1 | 2) {
+        return Err("payment roster has no supported finisher set".into());
     }
+    private_work(Path::new(&args[3]))?;
     let mailbox = Mailbox::new(&Path::new(&args[3]).join("mailbox")).map_err(|e| e.to_string())?;
     let session_identity =
         loki_poc::setup_transport::Identity::from_secret_bytes(&member.identity.to_secret_bytes())?;
@@ -509,7 +553,7 @@ fn sign(args: &[String]) -> Result<(), String> {
     };
     let reviewed = session.review_package(&package_message, &peer)?;
     confirm(&intent, reviewed.summary())?;
-    session.publish_approved(reviewed, &peer, &finisher, &mailbox, &pass)?;
+    session.publish_approved(reviewed, &peer, &finishers, &mailbox, &pass)?;
     println!(
         "approved payment {} as member {}",
         hex::encode(context.payment),
@@ -536,8 +580,12 @@ fn signing_inputs(
         return Err("<member-dir> <passphrase-file> <roster.json> <work-dir>".into());
     }
     let (member, owner, pass) = state(args)?;
+    if member.roster.members.len() != 3 {
+        return Err("relay signing currently supports only 2-of-3 vaults".into());
+    }
     let (context, intent) = manifest(&Path::new(&args[3]).join("payment.json"))?;
-    if context.vault != member.vault || !context.pair.contains(&member.identity.public().id) {
+    check_manifest_roster(&member.roster, &context, &intent)?;
+    if !context.pair.contains(&member.identity.public().id) {
         return Err("member is not an approver for this payment".into());
     }
     private_work(Path::new(&args[3]))?;
@@ -663,10 +711,7 @@ impl NonceWitness for TwoRelays {
         for inbox in &self.own[..2] {
             let created = self
                 .runtime
-                .block_on(
-                    self.http
-                        .claim_nonce(&inbox.route, &inbox.read, cid, wire),
-                )
+                .block_on(self.http.claim_nonce(&inbox.route, &inbox.read, cid, wire))
                 .map_err(|e| format!("nonce relay claim: {e}"))?;
             if !created {
                 return Err("nonce already claimed; start a new signing attempt".into());
@@ -740,12 +785,10 @@ fn resend(args: &[String]) -> Result<(), String> {
     let own = member.identity.public().id;
     let work = Path::new(&args[3]);
     private_work(work)?;
-    let (context, _) = manifest(&work.join("payment.json"))?;
+    let (context, intent) = manifest(&work.join("payment.json"))?;
+    check_manifest_roster(&member.roster, &context, &intent)?;
     if !context.pair.contains(&own) {
         return Err("only a selected signer can resend".into());
-    }
-    if context.vault != member.vault {
-        return Err("manifest names another vault".into());
     }
     let mailbox = Mailbox::new(&work.join("mailbox")).map_err(|e| e.to_string())?;
     let root = owner.join("signing");
@@ -828,9 +871,7 @@ fn finish(args: &[String]) -> Result<(), String> {
     let work = Path::new(&args[3]);
     private_work(work)?;
     let (context, intent) = manifest(&work.join("payment.json"))?;
-    if context.vault != member.vault {
-        return Err("manifest names another vault".into());
-    }
+    check_manifest_roster(&member.roster, &context, &intent)?;
     let mailbox = Mailbox::new(&work.join("mailbox")).map_err(|e| e.to_string())?;
     let own = member.identity.public().id;
     let peer = peer_in_pair(context.pair, own);
@@ -959,9 +1000,7 @@ fn verify(args: &[String]) -> Result<(), String> {
         return Err("txid must be 32 hexadecimal bytes".into());
     }
     let (context, intent) = manifest(&work.join("payment.json"))?;
-    if context.vault != member.vault {
-        return Err("manifest names another vault".into());
-    }
+    check_manifest_roster(&member.roster, &context, &intent)?;
     let rpc = Rpc::regtest();
     let tx_json = rpc.json("getrawtransaction", &format!("[\"{txid}\",1]"))?;
     let confirmations = tx_json["confirmations"].as_u64().unwrap_or(0);
@@ -1200,14 +1239,21 @@ mod tests {
     #[test]
     fn payment_pair_is_sorted_and_explicit() {
         assert_eq!(manifest_pair(&json!({})).unwrap(), [1, 2]);
-        for (name, pair) in [("AB", [1, 2]), ("AC", [1, 3]), ("BC", [2, 3])] {
+        for (name, pair) in [
+            ("AB", [1, 2]),
+            ("AC", [1, 3]),
+            ("AD", [1, 4]),
+            ("BC", [2, 3]),
+            ("BD", [2, 4]),
+            ("CD", [3, 4]),
+        ] {
             assert_eq!(pair_from_name(name).unwrap(), pair);
             assert_eq!(manifest_pair(&json!({ "pair": pair })).unwrap(), pair);
         }
         for pair in [
             json!([2, 1]),
             json!([1, 1]),
-            json!([1, 4]),
+            json!([4, 5]),
             json!([1]),
             json!("AC"),
         ] {
@@ -1220,11 +1266,56 @@ mod tests {
 
     #[test]
     fn any_roster_member_can_propose() {
-        for id in 1..=3 {
+        for id in 1..=4 {
             let bytes = frost::Identifier::try_from(id).unwrap().serialize();
             assert_eq!(proposer_id(&bytes).unwrap(), id);
         }
-        assert!(proposer_id(&frost::Identifier::try_from(4u16).unwrap().serialize()).is_err());
+        assert!(proposer_id(&frost::Identifier::try_from(5u16).unwrap().serialize()).is_err());
         assert!(proposer_id(&[0u8; 32]).is_err());
+    }
+
+    #[test]
+    fn manifest_pair_and_proposer_must_belong_to_certified_roster() {
+        let path = std::env::temp_dir().join(format!("loki-payment-roster-{}", process::id()));
+        let members: Vec<_> = (1..=3)
+            .map(|id| {
+                let public = loki_poc::setup_transport::Identity::new(id).public();
+                json!({"id": id, "signing": hex::encode(public.signing),
+                       "encryption": hex::encode(public.encryption)})
+            })
+            .collect();
+        fs::write(
+            &path,
+            json!({"vault": hex::encode([7u8; 32]),
+                                "threshold": 2, "members": members})
+            .to_string(),
+        )
+        .unwrap();
+        let roster = Roster::load(&path).unwrap();
+        fs::remove_file(path).unwrap();
+        let context = SessionContext {
+            vault: roster.vault,
+            payment: [0; 32],
+            attempt: AttemptId([1; 32]),
+            pair: [1, 3],
+        };
+        let mut intent = Intent {
+            proposer: frost::Identifier::try_from(2u16).unwrap().serialize(),
+            created_height: 1,
+            input_nullifiers: vec![[0; 32]],
+            recipient: vec![0; 43],
+            amount_zat: 1,
+            memo: vec![1],
+            change_policy: ChangePolicy::VaultInternal,
+            fee_zat: 1,
+            change_zat: 1,
+            expiry_height: 2,
+        };
+        assert!(check_manifest_roster(&roster, &context, &intent).is_ok());
+        let mut bad_pair = context.clone();
+        bad_pair.pair = [1, 4];
+        assert!(check_manifest_roster(&roster, &bad_pair, &intent).is_err());
+        intent.proposer = frost::Identifier::try_from(4u16).unwrap().serialize();
+        assert!(check_manifest_roster(&roster, &context, &intent).is_err());
     }
 }

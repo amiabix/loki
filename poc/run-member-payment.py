@@ -20,13 +20,13 @@ def run(argv, env, timeout=180):
     return result.stdout.strip()
 
 
-def create_vault(root, vault_id, setup, env):
+def create_vault(root, vault_id, setup, env, member_count=3):
     root.mkdir(mode=0o700)
     exchange = root / "exchange"
     exchange.mkdir()
     members = []
     publics = []
-    for number in (1, 2, 3):
+    for number in range(1, member_count + 1):
         owner = root / f"member-{number}"
         owner.mkdir(mode=0o700)
         password = owner / "pass.txt"
@@ -35,9 +35,10 @@ def create_vault(root, vault_id, setup, env):
         publics.append(json.loads(run([setup, "identity", owner, str(number), password], env)))
         members.append((owner, password))
     roster = root / "roster.json"
-    roster.write_text(json.dumps({"vault": f"{vault_id:02x}" * 32, "members": publics}))
+    roster.write_text(json.dumps({"vault": f"{vault_id:02x}" * 32,
+                                  "threshold": 2, "members": publics}))
     fingerprint = run([setup, "fingerprint", roster], env)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=member_count) as pool:
         futures = [pool.submit(run, [setup, "run", owner, password, roster, exchange, fingerprint], env)
                    for owner, password in members]
         for future in futures:
@@ -62,12 +63,14 @@ def main():
     parser.add_argument("--name", required=True, help="already running THS instance")
     parser.add_argument("--state", type=pathlib.Path, required=True, help="new, private test directory")
     parser.add_argument("--manual", action="store_true", help="prepare, then print commands for two human signers")
+    parser.add_argument("--members", type=int, choices=(3, 4), default=3,
+                        help="number of vault members; two approvals required")
     parser.add_argument("--stage", choices=("all", "setup", "fund", "prepare"), default="all",
                         help="run one step for the local member UI")
-    parser.add_argument("--pair", choices=("AB", "AC", "BC"), default="AB", help="members who approve this payment")
-    parser.add_argument("--proposer", type=int, choices=(1, 2, 3), default=1, help="member creating the payment")
+    parser.add_argument("--pair", choices=("AB", "AC", "AD", "BC", "BD", "CD"), default="AB", help="members who approve this payment")
+    parser.add_argument("--proposer", type=int, default=1, help="member creating the payment")
     parser.add_argument("--recipient", help="recipient unified address; defaults to the local test recipient")
-    parser.add_argument("--finisher", type=int, choices=(1, 2, 3), help="member who proves and sends; defaults to the non-signer")
+    parser.add_argument("--finisher", type=int, help="member who proves and sends; defaults to a non-signer")
     parser.add_argument("--amount-zat", type=int, default=40_000_000, help="regtest payment amount")
     parser.add_argument("--memo", default="separate member payment", help="shielded payment memo")
     args = parser.parse_args()
@@ -94,11 +97,13 @@ def main():
         raise RuntimeError("run cargo build --locked --bins in poc/ first")
 
     if args.stage in ("all", "setup"):
-        members, roster, vault = create_vault(root / "source", 7, setup, env)
-        recipient_members, recipient_roster, recipient_address = create_vault(root / "recipient", 8, setup, env)
+        member_count = args.members
+        members, roster, vault = create_vault(root / "source", 7, setup, env, member_count)
+        recipient_members, recipient_roster, recipient_address = create_vault(root / "recipient", 8, setup, env, member_count)
         if vault == recipient_address:
             raise RuntimeError("recipient has the sender's address")
-        (root / "vaults.json").write_text(json.dumps({"source": vault, "recipient": recipient_address, "funded": False}))
+        (root / "vaults.json").write_text(json.dumps({"source": vault, "recipient": recipient_address,
+                                                       "members": member_count, "funded": False}))
         print("activated source and independent recipient vaults", flush=True)
         print(f"Source vault: {vault}", flush=True)
         print(f"Independent recipient: {recipient_address}", flush=True)
@@ -106,18 +111,20 @@ def main():
             return
     else:
         vaults = json.loads((root / "vaults.json").read_text())
+        member_count = vaults.get("members", 3)
         vault, recipient_address = vaults["source"], vaults["recipient"]
         members = [(root / "source" / f"member-{number}", root / "source" / f"member-{number}" / "pass.txt")
-                   for number in (1, 2, 3)]
+                   for number in range(1, member_count + 1)]
         roster = root / "source" / "roster.json"
         recipient_members = [(root / "recipient" / f"member-{number}", root / "recipient" / f"member-{number}" / "pass.txt")
-                             for number in (1, 2, 3)]
+                             for number in range(1, member_count + 1)]
         recipient_roster = root / "recipient" / "roster.json"
     if args.stage in ("all", "fund"):
         if args.stage == "fund" and vaults["funded"]:
             raise RuntimeError("source vault is already funded")
         chain.fund(vault, 1)
-        (root / "vaults.json").write_text(json.dumps({"source": vault, "recipient": recipient_address, "funded": True}))
+        (root / "vaults.json").write_text(json.dumps({"source": vault, "recipient": recipient_address,
+                                                       "members": member_count, "funded": True}))
         print("funded source vault on THS", flush=True)
         if args.stage == "fund":
             return
@@ -125,11 +132,16 @@ def main():
         raise RuntimeError("fund the source vault before preparing a payment")
 
     destination = args.recipient or recipient_address
+    if args.proposer not in range(1, member_count + 1):
+        parser.error("proposer is outside this vault")
     owner, password = members[args.proposer - 1]
     run([pay, "prepare", owner, password, roster, work, destination, str(args.amount_zat), args.memo, args.pair], env)
     manifest = json.loads((work / "payment.json").read_text())
     signers = [members[number - 1] for number in manifest["pair"]]
-    finisher_id = args.finisher or next(number for number in (1, 2, 3) if number not in manifest["pair"])
+    finisher_id = args.finisher or next(number for number in range(1, member_count + 1)
+                                       if number not in manifest["pair"])
+    if finisher_id not in range(1, member_count + 1):
+        parser.error("finisher is outside this vault")
     finisher = members[finisher_id - 1]
     if args.manual:
         def command(argv):

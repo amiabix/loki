@@ -93,8 +93,19 @@ fn relay_retry_and_reordering_preserve_two_authenticated_messages() {
     assert!(Identity::new(3)
         .seal_session(&bob.public(), &ctx, MessageKind::Package, b"x")
         .is_err());
+    let fourth = Identity::new(4);
+    let fourth_copy = alice
+        .seal_session(&fourth.public(), &ctx, MessageKind::Package, b"x")
+        .unwrap();
+    assert_eq!(
+        fourth
+            .open_session(&alice.public(), &ctx, &fourth_copy)
+            .unwrap()
+            .body(),
+        b"x"
+    );
     assert!(alice
-        .seal_session(&Identity::new(4).public(), &ctx, MessageKind::Package, b"x")
+        .seal_session(&Identity::new(5).public(), &ctx, MessageKind::Package, b"x")
         .is_err());
     fs::remove_dir_all(path).unwrap();
 }

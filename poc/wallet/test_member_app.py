@@ -15,6 +15,49 @@ from member_app import SEED_WALLET, SETUP, Wallet
 
 
 class MemberWalletTest(unittest.TestCase):
+    def test_four_member_vault_reaches_one_address_after_every_backup(self):
+        if not SETUP.is_file() or not SEED_WALLET.is_file():
+            self.skipTest("build setup and seed wallet binaries first")
+        with tempfile.TemporaryDirectory(prefix="loki-four-member-") as temp:
+            root = Path(temp)
+            exchange = root / "exchange"
+            wallets = [Wallet(root / f"member-{slot}", exchange) for slot in range(1, 5)]
+            for wallet in wallets:
+                self.addCleanup(wallet.close)
+            for slot, wallet in enumerate(wallets, 1):
+                wallet.create_profile(f"Member {slot}", f"distinct passphrase for member {slot}")
+            created = wallets[0].create("Four person treasury", members=4)
+            vault = created["vault"]
+            self.assertEqual(len(created["invites"]), 3)
+            for wallet, invite in zip(wallets[1:], created["invites"]):
+                wallet.join(invite)
+            fingerprints = [wallet.roster(vault)["fingerprint"] for wallet in wallets]
+            self.assertEqual(len(set(fingerprints)), 1)
+            self.assertTrue(all(wallet.status(vault)["total_members"] == 4 for wallet in wallets))
+            seed = root / "wallet-seed.txt"
+            seed.write_text("abandon " * 23 + "art")
+            os.chmod(seed, 0o600)
+            for wallet in wallets:
+                challenge = root / f"challenge-{wallet.data.name}.json"
+                challenge.write_text(json.dumps(wallet.begin_link(vault)))
+                proof = json.loads(subprocess.run(
+                    [SEED_WALLET, "prove", seed, challenge], capture_output=True,
+                    text=True, check=True).stdout)
+                wallet.link(vault, proof)
+            for wallet in wallets:
+                wallet.agree(vault, fingerprints[0])
+            for wallet in wallets:
+                wallet.workers[vault].join(timeout=90)
+                self.assertFalse(wallet.workers[vault].is_alive())
+                self.assertIsNone(wallet.setup_errors.get(vault))
+            for wallet in wallets:
+                words = wallet.backup(vault)["words"]
+                card = (wallet.data / "vaults" / vault / "card" / "vault.card").read_bytes()
+                wallet.verify(vault, words, base64.b64encode(card).decode())
+            addresses = [wallet.address(vault) for wallet in wallets]
+            self.assertEqual(len(set(addresses)), 1)
+            self.assertTrue(addresses[0].startswith("uregtest1"))
+
     def test_create_join_certify_and_check_backups_in_three_roots(self):
         if not SETUP.is_file():
             self.skipTest("build loki_setup_member first")

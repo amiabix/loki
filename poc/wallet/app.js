@@ -92,7 +92,7 @@ async function refreshSignerRequests(unlocked) {
   for (const action of actions) {
     const item = document.createElement('div');
     const description = document.createElement('p');
-    description.textContent = `${action.origin} requests a new vault named “${action.name}” on regtest.`;
+    description.textContent = `${action.origin} requests a 2-of-${action.members} vault named “${action.name}” on regtest.`;
     const approve = document.createElement('button');
     approve.type = 'button';
     approve.textContent = 'Create this vault';
@@ -126,7 +126,7 @@ async function refresh() {
     $('back').hidden = !selectedVault;
     $('lock').hidden = !state.profile && state.phase !== 'home';
     $('title').textContent = state.name || state.profile?.name || 'Your wallet';
-    $('subtitle').textContent = selectedVault ? `Member ${state.slot} · 2 of 3 · regtest` : 'One local profile, separate keys for each vault.';
+    $('subtitle').textContent = selectedVault ? `Member ${state.slot} · ${state.threshold} of ${state.total_members} · regtest` : 'One local profile, separate keys for each vault.';
     $('linked-account').hidden = !state.account_ak;
     if (state.account_ak) $('linked-account').textContent = `Proved Orchard account key: ${state.account_ak.slice(0, 16)}…`;
     if (state.phase === 'new_profile') $('new-profile').hidden = false;
@@ -139,17 +139,19 @@ async function refresh() {
       if (state.invites) {
         $('invite2').textContent = state.invites[0];
         $('invite3').textContent = state.invites[1];
+        $('invite4-row').hidden = state.total_members !== 4;
+        if (state.total_members === 4) $('invite4').textContent = state.invites[2];
         $('invites').hidden = state.phase === 'active';
       }
       if (state.phase === 'waiting_for_members') {
         $('setup').hidden = false;
-        $('progress').textContent = `${state.members} of 3 members have joined. Waiting for the other members.`;
+        $('progress').textContent = `${state.members} of ${state.total_members} members have joined. Waiting for the other members.`;
         $('agree').hidden = true;
-        $('fingerprint').textContent = 'Available when all three join';
+        $('fingerprint').textContent = 'Available when all members join';
       } else if (state.phase === 'compare_roster' || state.phase === 'creating_keys') {
         $('setup').hidden = false;
         $('agree').hidden = state.phase === 'creating_keys';
-        $('progress').textContent = state.phase === 'creating_keys' ? 'Creating group keys with the other member apps…' : 'All three members joined.';
+        $('progress').textContent = state.phase === 'creating_keys' ? 'Creating group keys with the other member apps…' : 'All members joined.';
         $('fingerprint').textContent = state.fingerprint;
       } else if (state.phase === 'back_up') $('backup').hidden = false;
       else if (state.phase === 'waiting_for_backups') $('waiting').hidden = false;
@@ -163,9 +165,10 @@ async function refresh() {
 action('profile-create', async (form) => { await api('profile-create', fields(form)); message('Profile created. You can now create or join vaults.'); });
 action('unlock', async (form) => { await api('unlock', fields(form)); message('Profile unlocked.'); });
 action('create', async (form) => {
-  const value = await api('create', fields(form));
+  const inputs = fields(form);
+  const value = await api('create', {...inputs, members: Number(inputs.members)});
   selectVault(value.vault);
-  message('Vault draft created. Invite the other two members.');
+  message(`Vault draft created. Invite the other ${inputs.members - 1} members.`);
 });
 action('join', async (form) => {
   const value = await api('join', fields(form));
