@@ -558,15 +558,18 @@ class Wallet:
                 "members": len(members),
             }).encode())
             os.rename(restored, destination)
-            return {"vault": vault, "slot": own["id"], "address": address}
+            return {"vault": vault, "slot": own["id"],
+                    **({"address": address} if len(members) == 3 else {})}
         finally:
             if restored.exists():
                 shutil.rmtree(restored)
 
     def address(self, vault):
-        member_dir, _ = self.vault_dir(vault)
+        member_dir, local = self.vault_dir(vault)
         if not (member_dir / "final-backup-checked").is_file():
             raise ValueError("Check your final backup card before showing the receive address")
+        if local.get("members") != 3:
+            raise ValueError("2-of-4 payments are not available in this app; do not fund this vault here")
         return self.command("address", member_dir, "@pass")
 
     def balance(self, vault):
@@ -581,6 +584,8 @@ class Wallet:
         member_dir, local = self.vault_dir(vault)
         if not (member_dir / "final-backup-checked").is_file():
             raise ValueError("Vault is not active")
+        if local.get("members") != 3:
+            raise ValueError("2-of-4 payments are not available in this app; do not fund this vault here")
         if not isinstance(recipient, str) or not recipient.strip():
             raise ValueError("Enter a recipient address")
         if not isinstance(amount_zat, str) or not 1 <= len(amount_zat) <= 20 \
@@ -588,9 +593,7 @@ class Wallet:
             raise ValueError("Enter a positive amount in zat")
         if not isinstance(memo, str) or not memo or len(memo.encode()) > 512:
             raise ValueError("Enter a memo of 1 to 512 bytes")
-        if local.get("members") not in (3, 4):
-            raise ValueError("Unsupported vault roster")
-        pairs = ("AB", "AC", "BC") if local["members"] == 3 else ("AB", "AC", "AD", "BC", "BD", "CD")
+        pairs = ("AB", "AC", "BC")
         if pair not in pairs:
             raise ValueError("Choose two members of this vault")
         drafts = member_dir / "payments"
@@ -723,25 +726,44 @@ class Wallet:
         relay("import-proposals", "--payments-dir", member_dir / "payments")
 
         works = sorted((member_dir / "payments").glob("*/payment.json"))
+        approvals = {}
         for path in works:
             attempt = path.parent.name
+            state = path.parent / "payment-status.json"
+            if state.is_file() and read_json(state).get("phase") == "approval_pending_delivery":
+                try:
+                    self.payment_command("resend", vault, attempt)
+                except ValueError:
+                    # A consumed attempt with no saved share must not stall other payments.
+                    self.payment_status(path.parent, "approval_interrupted")
+                    continue
+                approvals[attempt] = []
             _, work, _, output = self.payment_command("local-wires", vault, attempt)
             wires = json.loads(output)["wires"]
             for wire in wires:
-                relay("send-signing", "--payload-file", work / "mailbox" / wire,
-                      "--attempt", attempt)
+                sent = relay("send-signing", "--payload-file", work / "mailbox" / wire,
+                             "--attempt", attempt)
+                if attempt in approvals:
+                    match = re.search(r"\brequest message=([0-9a-f]{64})\b", sent)
+                    if not match:
+                        raise ValueError("Relay did not identify the saved approval message")
+                    approvals[attempt].append(match.group(1))
         relay("upload")
         relay("poll", "--once")
         for path in works:
             relay("export-signing", "--work-dir", path.parent, "--attempt", path.parent.name)
 
-        if proposals:
+        if proposals or approvals:
             report = relay("status")
+            lines = {match.group(1): line for line in report.splitlines()
+                     if (match := re.search(r"^message .*\bid=([0-9a-f]{64})\b", line))}
             for attempt, message in proposals.items():
-                line = next((line for line in report.splitlines()
-                             if line.startswith("message ") and f" id={message} " in line), "")
-                if re.search(r"\bstored_whole=1\b", line):
+                if re.search(r"\bstored_whole=1\b", lines.get(message, "")):
                     self.payment_status(member_dir / "payments" / attempt, "published")
+            for attempt, messages in approvals.items():
+                if messages and all(re.search(r"\bstored_whole=1\b", lines.get(message, ""))
+                                    for message in messages):
+                    self.payment_status(member_dir / "payments" / attempt, "approved")
         return self.payments(vault)
 
     def commit_payment(self, vault, attempt):
@@ -783,8 +805,8 @@ class Wallet:
         if local["slot"] not in manifest["pair"]:
             raise ValueError("Only a selected signer can retry saved signing messages")
         self.payment_command("resend", vault, attempt)
-        status = work / "payment-status.json"
-        return {"phase": read_json(status)["phase"] if status.is_file() else "received"}
+        self.payment_status(work, "approval_pending_delivery")
+        return {"phase": "approval_pending_delivery"}
 
     def finish_payment(self, vault, attempt):
         _, work, _, output = self.payment_command("finish", vault, attempt, timeout=600)

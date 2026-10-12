@@ -54,6 +54,72 @@ class MemberWalletTest(unittest.TestCase):
             self.assertTrue(any(args[-2:] == ("--attempt", attempt) for action, args in calls
                                 if action == "send-signing"))
 
+    def test_saved_approval_waits_for_relay_storage(self):
+        with tempfile.TemporaryDirectory(prefix="loki-approval-sync-") as temp:
+            wallet = Wallet(Path(temp) / "alice", Path(temp) / "exchange")
+            self.addCleanup(wallet.close)
+            vault, attempt, wire, message = ("a" * 64, "b" * 64, "c" * 64, "d" * 64)
+            wallet.profile_data = {"id": "alice"}
+            wallet.passphrase = "alice test passphrase"
+            member = wallet.data / "vaults" / vault
+            work = member / "payments" / attempt
+            (work / "mailbox").mkdir(parents=True)
+            (member / "membership.json").write_text(json.dumps({
+                "vault": vault, "profile": "alice", "slot": 1, "threshold": 2, "members": 3}))
+            (member / "roster.json").write_text("{}")
+            (member / "final-backup-checked").write_text("checked")
+            (work / "payment.json").write_text(json.dumps({
+                "vault": vault, "attempt": attempt, "payment": "e" * 64, "pair": [1, 2]}))
+            wallet.payment_status(work, "approval_pending_delivery")
+            stored = False
+
+            def command(action, *args, **_kwargs):
+                if action == "features": return "relay-backed-signing=1"
+                if action == "local-wires": return json.dumps({"wires": [wire]})
+                if action == "send-signing": return f"request message={message} digest={'f' * 64} needs_route=0"
+                if action == "status":
+                    return f"message sender=1 id={message} stored_whole={int(stored)}"
+                return "ok"
+
+            with patch.object(wallet, "command", side_effect=command) as mocked:
+                self.assertEqual(wallet.sync_payments(vault)["payments"][0]["phase"],
+                                 "approval_pending_delivery")
+                stored = True
+                self.assertEqual(wallet.sync_payments(vault)["payments"][0]["phase"], "approved")
+            self.assertEqual([call.args[0] for call in mocked.call_args_list].count("resend"), 2)
+
+    def test_interrupted_approval_does_not_block_other_payment_sync(self):
+        with tempfile.TemporaryDirectory(prefix="loki-interrupted-sync-") as temp:
+            wallet = Wallet(Path(temp) / "alice", Path(temp) / "exchange")
+            self.addCleanup(wallet.close)
+            vault, bad, good = "a" * 64, "b" * 64, "c" * 64
+            wallet.profile_data = {"id": "alice"}
+            wallet.passphrase = "alice test passphrase"
+            member = wallet.data / "vaults" / vault
+            (member / "membership.json").parent.mkdir(parents=True)
+            (member / "membership.json").write_text(json.dumps({
+                "vault": vault, "profile": "alice", "slot": 1, "threshold": 2, "members": 3}))
+            (member / "roster.json").write_text("{}")
+            (member / "final-backup-checked").write_text("checked")
+            for attempt, phase in ((bad, "approval_pending_delivery"), (good, "queued_for_delivery")):
+                work = member / "payments" / attempt
+                (work / "mailbox").mkdir(parents=True)
+                (work / "payment.json").write_text(json.dumps({
+                    "vault": vault, "attempt": attempt, "payment": "e" * 64, "pair": [1, 2]}))
+                wallet.payment_status(work, phase)
+
+            def command(action, *args, **_kwargs):
+                if action == "features": return "relay-backed-signing=1"
+                if action == "resend": raise ValueError("attempt was interrupted")
+                if action == "local-wires": return json.dumps({"wires": []})
+                if action == "send-proposal": return f"request message={'d' * 64} digest={'f' * 64} needs_route=0"
+                if action == "status": return f"message sender=1 id={'d' * 64} stored_whole=1"
+                return "ok"
+
+            with patch.object(wallet, "command", side_effect=command):
+                phases = {item["attempt"]: item["phase"] for item in wallet.sync_payments(vault)["payments"]}
+            self.assertEqual(phases, {bad: "approval_interrupted", good: "published"})
+
     def test_payment_draft_uses_only_active_members_own_vault(self):
         with tempfile.TemporaryDirectory(prefix="loki-draft-") as temp:
             root = Path(temp)
@@ -235,9 +301,24 @@ class MemberWalletTest(unittest.TestCase):
                         wallet.verify_final_backup(vault, words, base64.b64encode(damaged).decode())
                     self.assertEqual(wallet.status(vault)["phase"], "final_backup")
                 wallet.verify_final_backup(vault, words, base64.b64encode(final_card).decode())
-            addresses = [wallet.address(vault) for wallet in wallets]
+            for wallet in wallets:
+                with self.assertRaisesRegex(ValueError, "2-of-4 payments are not available"):
+                    wallet.address(vault)
+                with self.assertRaisesRegex(ValueError, "2-of-4 payments are not available"):
+                    wallet.prepare_payment(vault, "uregtest1recipient", "40000000", "memo", "AB")
+            addresses = [wallet.command("address", wallet.data / "vaults" / vault, "@pass")
+                         for wallet in wallets]
             self.assertEqual(len(set(addresses)), 1)
             self.assertTrue(addresses[0].startswith("uregtest1"))
+            restored = Wallet(root / "restored", exchange)
+            self.addCleanup(restored.close)
+            restored.create_profile("Restored member", "restored member passphrase")
+            card = (wallets[0].data / "vaults" / vault / "final-card" / "vault.card").read_bytes()
+            result = restored.restore_vault("Four person treasury", saved_words[0],
+                                            base64.b64encode(card).decode())
+            self.assertNotIn("address", result)
+            with self.assertRaisesRegex(ValueError, "2-of-4 payments are not available"):
+                restored.address(vault)
 
     def test_create_join_certify_and_check_backups_in_three_roots(self):
         if not SETUP.is_file():

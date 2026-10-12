@@ -93,8 +93,9 @@ the new roster fingerprint; old 2-of-3 roster files retain their original
 fingerprint. A four-member source vault completed a mined payment with members
 3 and 4 signing and member 2 finishing through `run-member-payment.py
 --members 4 --pair CD --finisher 2`. This is the local courier test path; the
-relay adapter remains three-member-only. The 2-of-4 vault can receive and show
-its balance here, but the app hides its payment controls. For a 2-of-3 vault, the private member
+relay adapter remains three-member-only. The 2-of-4 vault can show its balance
+when funded through the CLI test path, but the app hides its receive address
+and payment controls to avoid deposits it cannot spend. For a 2-of-3 vault, the private member
 app has controls for a fixed signing pair: create a local payment draft, send
 the proposal, publish commitments, build the package, review the transaction,
 approve that exact review, prove and broadcast, then verify it on chain. The
@@ -103,7 +104,7 @@ proposal's annotation. Each member runs these controls in their own private
 signer window. **Refresh payments** uploads queued proposals and this member's
 authenticated signing messages, polls the relays, and imports messages for this
 member. The separate dashboard has no payment approval route. A local approval
-remains pending delivery; confirmation is checked again against this member's
+remains pending delivery until every saved signing message has relay storage; confirmation is checked again against this member's
 chain view whenever the payment list is shown. If a signer closed after saving
 an approval, **Retry saved signing messages** republishes the same sealed share;
 it never creates another signature share.
@@ -116,7 +117,10 @@ on the files addressed to them. Check each member with
 `loki_relay_member status --verify-relays` before using payment controls. The app
 does not collect capabilities or automate this ceremony. The independent
 three-relay setup in `communication/harness/three_members.py` tests transport;
-it does not configure an app vault.
+it does not configure an app vault. Relay keys are checked as distinct, but
+operator independence is a deployment condition that the app cannot verify.
+If signing stops after consuming a nonce and before saving the share, that
+attempt cannot be resumed; create a new payment attempt with fresh nonces.
 
 For a funded separate-member vault, `communication/harness/relay_payment.py`
 now delivers the proposal to each member through the relays, carries only each

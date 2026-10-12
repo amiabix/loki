@@ -500,15 +500,11 @@ fn import_proposals(root: &Path, pass: &Path, roster: &Path, payments: &Path) ->
         return Err(Exit::Member(MemberError::Permissions));
     }
     create_private_dir(&expected)?;
-    let rows = page_rows(
-        |after| session.db.recover_incoming_originals(after, PAGE),
-        usize::MAX,
-    )?;
     let mut imported = 0;
     let mut rejected = 0;
-    for row in rows {
+    visit_pages(|after| session.db.recover_incoming_originals(after, PAGE), |row| {
         if row.kind != 1 {
-            continue;
+            return Ok(());
         }
         let Ok(opened) =
             session
@@ -516,23 +512,23 @@ fn import_proposals(root: &Path, pass: &Path, roster: &Path, payments: &Path) ->
                 .open_incoming(&session.member.roster, &session.member.identity, &row)
         else {
             rejected += 1;
-            continue;
+            return Ok(());
         };
         let body = opened.message().body();
         let Payload::Test(payload) = &body.payload else {
-            continue;
+            return Ok(());
         };
         let manifest = match decode_proposal(payload) {
             Ok(Some(manifest)) => manifest,
-            Ok(None) => continue,
+            Ok(None) => return Ok(()),
             Err(_) => {
                 rejected += 1;
-                continue;
+                return Ok(());
             }
         };
         let Ok((context, intent)) = payment_manifest::parse(manifest) else {
             rejected += 1;
-            continue;
+            return Ok(());
         };
         if payment_manifest::validate_roster(
             session.member.roster.vault,
@@ -543,13 +539,13 @@ fn import_proposals(root: &Path, pass: &Path, roster: &Path, payments: &Path) ->
         .is_err()
         {
             rejected += 1;
-            continue;
+            return Ok(());
         }
         if body.session != Some(context.attempt.0)
             || Some(body.key.sender) != payment_manifest::proposer_id(&intent.proposer).ok()
         {
             rejected += 1;
-            continue;
+            return Ok(());
         }
         let directory = expected.join(hex_id(&context.attempt.0));
         create_private_dir(&directory)?;
@@ -559,7 +555,7 @@ fn import_proposals(root: &Path, pass: &Path, roster: &Path, payments: &Path) ->
             Ok(false) => {}
             Err(Exit::Member(MemberError::Identity)) => {
                 rejected += 1;
-                continue;
+                return Ok(());
             }
             Err(error) => return Err(error),
         }
@@ -568,7 +564,8 @@ fn import_proposals(root: &Path, pass: &Path, roster: &Path, payments: &Path) ->
             hex_id(&context.payment),
             hex_id(&context.attempt.0)
         );
-    }
+        Ok(())
+    })?;
     println!("imported_proposals={imported}");
     println!("rejected_proposals={rejected}");
     Ok(())
@@ -717,40 +714,34 @@ fn export_signing(
     }
     let session = open_session(root, pass, roster)?;
     let mailbox = Mailbox::new(&work.join("mailbox")).map_err(|_| Exit::Member(MemberError::Io))?;
-    let rows = page_rows(
-        |after| session.db.recover_incoming_originals(after, PAGE),
-        usize::MAX,
-    )?;
     let mut count = 0;
-    for row in rows
-        .iter()
-        .filter(|row| row.session == Some(attempt) && row.kind == 1)
-    {
+    visit_pages(|after| session.db.recover_incoming_originals(after, PAGE), |row| {
+        if row.session != Some(attempt) || row.kind != 1 {
+            return Ok(());
+        }
         let Ok(opened) =
             session
                 .db
-                .open_incoming(&session.member.roster, &session.member.identity, row)
+                .open_incoming(&session.member.roster, &session.member.identity, &row)
         else {
-            continue;
+            return Ok(());
         };
         let Payload::Test(wire) = &opened.message().body().payload else {
-            continue;
+            return Ok(());
         };
         match decode_proposal(wire) {
-            Ok(Some(_)) => continue,
-            Err(_) => {
-                continue;
-            }
+            Ok(Some(_)) | Err(_) => return Ok(()),
             Ok(None) => {}
         }
         if session_envelope(wire).is_err() {
-            continue;
+            return Ok(());
         }
         mailbox
             .append(wire)
             .map_err(|_| Exit::Member(MemberError::Io))?;
         count += 1;
-    }
+        Ok(())
+    })?;
     println!("exported_signing={count}");
     Ok(())
 }
@@ -1483,6 +1474,34 @@ fn uploads_for(db: &ClientStore, key: &LogicalKey) -> Result<Vec<RecoveryUpload>
         .collect())
 }
 
+fn visit_pages<T>(
+    mut page: impl FnMut(u64) -> Result<Vec<T>, ClientError>,
+    mut visit: impl FnMut(T) -> Result<(), Exit>,
+) -> Result<(), Exit>
+where
+    T: Cursor,
+{
+    let mut after = 0;
+    loop {
+        let batch = page(after).map_err(Exit::Client)?;
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let next = batch.last().map(Cursor::cursor).unwrap_or(after);
+        if next <= after {
+            return Err(Exit::Client(ClientError::Storage));
+        }
+        let short = batch.len() < usize::from(PAGE);
+        for row in batch {
+            visit(row)?;
+        }
+        if short {
+            return Ok(());
+        }
+        after = next;
+    }
+}
+
 fn page_rows<T>(
     mut page: impl FnMut(u64) -> Result<Vec<T>, ClientError>,
     max_rows: usize,
@@ -1804,5 +1823,26 @@ mod pagination_tests {
             DIAGNOSTIC_ROW_BOUND,
         );
         assert!(matches!(rows, Err(Exit::Client(ClientError::Storage))));
+    }
+
+    #[test]
+    fn incoming_pages_are_visited_without_collecting_the_whole_inbox() {
+        let count = u64::from(PAGE) * 2 + 1;
+        let mut seen = Vec::new();
+        visit_pages(
+            |after| {
+                Ok(((after + 1)..=count.min(after + u64::from(PAGE)))
+                    .map(|id| sample(id as i64))
+                    .collect())
+            },
+            |row| {
+                seen.push(row.id);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(seen.len(), count as usize);
+        assert_eq!(seen[0], 1);
+        assert_eq!(seen.last().copied(), Some(count as i64));
     }
 }

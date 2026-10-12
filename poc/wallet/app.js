@@ -131,10 +131,15 @@ async function refreshPayments() {
         }));
       }
     }
-    if (isSigner && payment.phase === 'approval_pending_delivery') {
+    if (payment.phase === 'approval_interrupted') {
+      const warning = document.createElement('p');
+      warning.textContent = 'The saved approval could not be reopened. Retry it; if it still fails, start a new payment.';
+      card.append(warning);
+    }
+    if (isSigner && ['approval_pending_delivery', 'approval_interrupted'].includes(payment.phase)) {
       card.append(paymentButton('Retry saved signing messages', () => request('payment-resend')));
     }
-    if (['published', 'received', 'commitments', 'package', 'approval_pending_delivery'].includes(payment.phase)) {
+    if (['published', 'received', 'commitments', 'package', 'approval_pending_delivery', 'approved'].includes(payment.phase)) {
       card.append(paymentButton('Try to finish (waits for two shares)', () => request('payment-finish')));
     }
     if (payment.phase === 'broadcast' || payment.phase === 'confirmation_needs_recheck') {
@@ -272,12 +277,11 @@ async function refresh() {
         memberSlot = state.slot;
         const paymentAvailable = state.total_members === 3;
         $('payment-unavailable').hidden = paymentAvailable;
+        $('show-address').hidden = !paymentAvailable;
+        if (!paymentAvailable) $('address').textContent = 'Receive address hidden until this app can spend 2-of-4 funds.';
         $('payment-draft').hidden = !paymentAvailable;
         $('refresh-payments').hidden = !paymentAvailable;
         $('payment-list').hidden = !paymentAvailable;
-        for (const option of $('payment-draft').elements.pair.options) {
-          option.disabled = state.total_members === 3 && option.value.includes('D');
-        }
         if (paymentAvailable && renderedPaymentVault !== selectedVault) await refreshPayments();
       }
       else if (state.phase === 'stopped') message('Setup stopped: ' + state.error + '. Start a fresh vault session.', true);
