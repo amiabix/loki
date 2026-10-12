@@ -30,12 +30,19 @@ function selectVault(vault) {
   $('payment-draft').reset();
   $('amount-zat').textContent = 'Up to 8 decimal places.';
   $('payment-list').replaceChildren();
+  renderedInvites = null;
 }
 
+let notice = null;
 function message(text, error = false) {
   $('message').textContent = text;
   $('message').hidden = !text;
   $('message').classList.toggle('error', error);
+  /* A confirmation describes what just happened; left on screen it starts
+     reading as the state of the step the member is now on. Failures stay:
+     they still need an answer. */
+  clearTimeout(notice);
+  if (text && !error) notice = setTimeout(() => message(''), 8000);
 }
 
 /* A failure belongs beside the control that caused it. The server tags each one
@@ -383,6 +390,146 @@ async function refreshSignerRequests(unlocked) {
   }
   actionsSection.hidden = !actions.length;
 }
+/* ── invitations ─────────────────────────────────────────────────────────────
+   One row per other member. The state is read from the vault: Waiting until
+   that member's app has published an identity, then Joined. Opening the share
+   sheet is not a state of the invitation — Loki never learns whether anything
+   was sent — so it is transient feedback on the control that was pressed. */
+
+function expiryLine(at) {
+  const left = at ? at * 1000 - Date.now() : 0;
+  if (!at) return '';
+  if (left <= 0) return 'These invites have expired.';
+  const hours = Math.floor(left / 3600000);
+  const minutes = Math.floor((left % 3600000) / 60000);
+  const span = hours ? `${hours} h ${minutes} min` : `${minutes} min`;
+  return `These invites expire in ${span}, at ${new Date(at * 1000).toLocaleString()}.`;
+}
+
+function reachLine(origin) {
+  if (!origin) {
+    return 'This app was started without an invite address, so these codes only work for an app '
+      + "that can read this computer's setup folder.";
+  }
+  if (origin.startsWith('https://')) {
+    return `Each member joins from their own device at ${origin}. Keep this app open until setup finishes.`;
+  }
+  return `Same-machine demo: another Loki app on this computer joins at ${origin}. `
+    + 'A separate device needs an https address.';
+}
+
+function inviteMessage(invite, state) {
+  return `Join my Loki vault \u201c${state.name}\u201d as member ${invite.slot}.\n\n`
+    + 'Open your Loki signer app, choose \u201cJoin a vault\u201d and paste this invite:\n\n'
+    + `${invite.code}\n\n`
+    + `It is for member ${invite.slot} only, and for one app. ${expiryLine(state.invites_expire_at)}`;
+}
+
+function rowButton(label, className, run) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = className;
+  button.textContent = label;
+  button.addEventListener('click', async () => {
+    button.disabled = true;
+    try { await run(button); } finally { button.disabled = false; }
+  });
+  return button;
+}
+
+function inviteRow(invite, state, expired) {
+  const standing = invite.joined ? 'joined' : expired ? 'expired' : 'waiting';
+  const row = document.createElement('div');
+  row.className = `invite-row ${standing}`;
+  const who = document.createElement('div');
+  who.className = 'invite-who';
+  const name = document.createElement('strong');
+  name.textContent = `Member ${invite.slot}`;
+  const mark = document.createElement('span');
+  mark.className = `invite-state ${standing}`;
+  mark.textContent = invite.joined ? 'Joined' : expired ? 'Expired' : 'Waiting';
+  who.append(name, mark);
+  row.append(who);
+  const note = document.createElement('p');
+  note.className = 'invite-note';
+  note.setAttribute('role', 'status');
+  note.hidden = true;
+  const say = (text, bad = false) => {
+    note.textContent = text;
+    note.hidden = false;
+    note.classList.toggle('bad', bad);
+  };
+  if (invite.joined) return row;
+  if (expired) {
+    row.append(note);
+    say('Loki cannot re-issue an invite in this build. Create a new vault to invite this member.');
+    return row;
+  }
+  const actions = document.createElement('div');
+  actions.className = 'invite-actions';
+  const code = document.createElement('pre');
+  code.className = 'invite-code';
+  code.hidden = true;
+  code.textContent = invite.code;
+  const copy = async (text, done) => {
+    try { await navigator.clipboard.writeText(text); say(done); }
+    catch { code.hidden = false; say('This browser would not let Loki use the clipboard. The code is shown below.', true); }
+  };
+  actions.append(rowButton('Share invite', 'primary', async () => {
+    const text = inviteMessage(invite, state);
+    if (!navigator.share) {
+      await copy(text, 'No share sheet here, so the invitation is copied. Paste it into Signal yourself.');
+      return;
+    }
+    try {
+      await navigator.share({title: `Loki invite for member ${invite.slot}`, text});
+      say(`Share sheet opened for member ${invite.slot}. Loki cannot tell whether it was sent, so this member stays Waiting until their app joins.`);
+    } catch (error) {
+      if (error.name === 'AbortError') { say('Share cancelled. Nothing was sent.'); return; }
+      await copy(text, 'The share sheet did not open, so the invitation is copied instead.');
+    }
+  }));
+  actions.append(rowButton('Copy code', 'secondary', () => copy(invite.code, 'Invite code copied.')));
+  const show = rowButton('Show code', 'quiet', (button) => {
+    code.hidden = !code.hidden;
+    button.textContent = code.hidden ? 'Show code' : 'Hide code';
+    button.setAttribute('aria-expanded', String(!code.hidden));
+  });
+  show.setAttribute('aria-expanded', 'false');
+  actions.append(show);
+  row.append(actions, note, code);
+  return row;
+}
+
+/* The page polls every two seconds. Rebuilding these rows on every poll would
+   wipe what a member was just told, close a code they opened, and could pull a
+   Share button out of the document while the OS share sheet is still on it. So
+   the rows are rebuilt only when the data they show changes. */
+let renderedInvites = null;
+
+function inviteRows(state) {
+  const expired = !!state.invites_expire_at && state.invites_expire_at * 1000 <= Date.now();
+  const shown = JSON.stringify([selectedVault, expired,
+                                state.invites.map((i) => [i.slot, i.code, i.joined, i.origin])]);
+  if (shown !== renderedInvites) {
+    renderedInvites = shown;
+    const rows = $('invite-rows');
+    rows.replaceChildren();
+    for (const invite of state.invites) rows.append(inviteRow(invite, state, expired));
+    $('invite-reach').textContent = reachLine(state.invites[0]?.origin);
+  }
+  $('invite-expiry').textContent = expiryLine(state.invites_expire_at);
+}
+
+function progressLine(state) {
+  if (state.phase === 'waiting_for_members') {
+    return `${state.members} of ${state.total_members} members have joined.`;
+  }
+  if (state.phase === 'compare_roster') return 'All members joined.';
+  if (state.phase === 'creating_keys') return 'Creating group keys with the other member apps…';
+  return '';
+}
+
 const steps = {
   new_profile: ['', 'Create your profile'],
   locked: ['', 'Unlock your profile'],
@@ -443,6 +590,17 @@ async function refresh() {
     $('kicker').textContent = kicker;
     $('kicker').hidden = !kicker;
     $('headline').textContent = headline;
+    const progress = progressLine(state);
+    $('progress').textContent = progress;
+    $('progress').hidden = !progress;
+    /* A member whose app cannot reach the creator's courier is not waiting for
+       people, it is waiting for a network. Say which. */
+    $('transport-note').hidden = !state.transport_error;
+    if (state.transport_error) {
+      $('transport-note').textContent = state.transport_error.waiting
+        ? `${state.transport_error.message} Setup continues once it is reachable again.`
+        : state.transport_error.message;
+    }
     $('linked-account').hidden = !state.account_ak;
     if (state.account_ak) $('linked-account').textContent = `Proved Orchard account key: ${state.account_ak.slice(0, 16)}…`;
     if (state.phase === 'new_profile') $('new-profile').hidden = false;
@@ -453,26 +611,23 @@ async function refresh() {
     } else {
       $('connect-account').hidden = state.account_linked;
       if (state.invites) {
-        $('invite2').textContent = state.invites[0];
-        $('invite3').textContent = state.invites[1];
-        $('invite4-row').hidden = state.total_members !== 4;
-        if (state.total_members === 4) $('invite4').textContent = state.invites[2];
-        $('invites').hidden = state.phase === 'active';
+        inviteRows(state);
+        $('invites').hidden = state.phase !== 'waiting_for_members';
       }
-      if (state.phase === 'waiting_for_members') {
-        $('setup').hidden = false;
-        $('progress').textContent = `${state.members} of ${state.total_members} members have joined. Waiting for the other members.`;
-        $('agree').hidden = true;
-        $('fingerprint').textContent = 'Available when all members join';
-      } else if (state.phase === 'compare_roster' || state.phase === 'creating_keys') {
+      if (state.phase === 'compare_roster' || state.phase === 'creating_keys') {
         $('setup').hidden = false;
         rosterList(state);
         $('agree').hidden = state.phase === 'creating_keys';
-        $('progress').textContent = state.phase === 'creating_keys' ? 'Creating group keys with the other member apps…' : 'All members joined.';
         $('fingerprint').textContent = state.fingerprint;
       } else if (state.phase === 'back_up') $('backup').hidden = false;
       else if (state.phase === 'waiting_for_backups') $('waiting').hidden = false;
-      else if (state.phase === 'final_backup') $('final-backup').hidden = false;
+      else if (state.phase === 'final_backup') {
+        $('final-backup').hidden = false;
+        $('make-final-backup').hidden = !!state.final_card_created;
+        $('download-final').hidden = !state.final_card_created;
+        $('final-words-fallback').hidden = !state.final_card_needs_words;
+        $('final-words-fallback').querySelector('input').required = !!state.final_card_needs_words;
+      }
       else if (state.phase === 'active') {
         $('active').hidden = false;
         memberSlot = state.slot;
@@ -568,7 +723,6 @@ action('activate', async () => {
 });
 action('make-final-backup', async (form) => {
   await api('finalize-backup', {vault: selectedVault, words: fields(form).words});
-  $('download-final').hidden = false;
   message('Download the final card, then load the saved file to check it.');
 });
 action('check-final-backup', async (form) => {

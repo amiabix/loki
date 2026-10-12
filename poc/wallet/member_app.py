@@ -9,11 +9,14 @@ import argparse
 import base64
 import fcntl
 import hashlib
+import http.client
+import ipaddress
 import json
 import os
 import re
 import secrets
 import shutil
+import ssl
 import subprocess
 import tempfile
 import threading
@@ -64,6 +67,118 @@ def write_replace(path, value, mode=0o600):
 
 def read_json(path):
     return json.loads(path.read_text())
+
+
+INVITE_TTL = 24 * 60 * 60
+COURIER_LIMIT = 256 * 1024
+# one draft, one identity and one roster answer per member, one round-one, one
+# certificate and one backup wire each, and one round-two wire per ordered pair
+COURIER_FILES = 1 + 4 * 5 + 4 * 3
+
+# The setup courier carries a fixed, named set of files: the vault draft, each
+# member's public identity, the roster answer each app published, and the signed
+# DKG and backup wires. Anything else is refused, so a reachable courier cannot
+# be used as general storage.
+COURIER = (r"(?:join|confirm)-{slot}\.json"
+           r"|{vault}-(?:r1|cert|backup)-{slot}\.bin|{vault}-r2-{slot}-[1-4]\.bin")
+
+
+def courier_name(vault, name, slot="[1-4]"):
+    """Whether this is a file member <slot> publishes for this vault."""
+    return bool(re.fullmatch(COURIER.format(vault=vault, slot=slot), name))
+
+
+def courier_carries(vault, name):
+    """Whether the courier carries this name at all. The draft is the creator's."""
+    return name == "draft.json" or courier_name(vault, name)
+
+
+def courier_replaceable(name):
+    """A DKG or backup wire is published once: a second version of one is a
+    protocol failure, not an update. A roster answer is a claim a member can
+    re-publish after a stopped round, so that one may be replaced."""
+    return name.startswith("confirm-")
+
+
+def courier_write(folder, name, body):
+    (write_replace if courier_replaceable(name) else write_new)(folder / name, body)
+
+
+def courier_digests(folder, vault):
+    return {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in folder.iterdir() if courier_carries(vault, path.name)}
+
+
+def loopback(host):
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host == "localhost"
+
+
+def check_origin(value):
+    """The address the other members' apps reach this creator's courier on.
+
+    A joining member carries a bearer token for its invite slot on every
+    request, so the channel has to be authenticated whenever it leaves this
+    machine: plain HTTP is accepted only for a loopback address, and anything
+    else must be HTTPS with a certificate this device already trusts. A LAN
+    http:// address is refused rather than offered, because an observer on
+    that network could take the token and claim the slot.
+
+    The courier itself stays untrusted either way. Every DKG and backup wire it
+    carries is signed and recipient-encrypted by the member apps, and the
+    roster fingerprint is still compared out of band."""
+    parts = urlsplit(value if isinstance(value, str) else "")
+    if parts.scheme not in ("http", "https") or not parts.hostname or parts.username \
+            or parts.password or parts.path or parts.query or parts.fragment:
+        raise ValueError("Give an invite address like https://vault.example.org")
+    if parts.scheme == "http" and not loopback(parts.hostname):
+        raise ValueError("Use https for an invite another device can reach. Plain http is "
+                         "accepted only for 127.0.0.1, because the invite token travels on "
+                         "every request.")
+    return f"{parts.scheme}://{parts.netloc}"
+
+
+class Unreachable(ValueError):
+    """The courier did not answer. Like Timeout, nothing is known to have
+    failed: the next action is to wait and retry, not to repair anything. A
+    refusal or a conflicting file is the opposite case and must not read as
+    something that will clear on its own."""
+
+
+def courier_error(payload, status):
+    try:
+        return str(json.loads(payload)["error"])
+    except (ValueError, KeyError, TypeError):
+        return f"The vault creator's app refused this request ({status})"
+
+
+def courier_request(origin, method, path, token=None, body=None, timeout=15):
+    """One plain HTTP request to the creator's courier. No redirect is followed
+    and no proxy is used: the only address used is the one in the invite."""
+    parts = urlsplit(origin)
+    if parts.scheme == "https":
+        # The platform trust store, fully verified. A courier that cannot prove
+        # its name is not a courier this member will hand an invite token to.
+        connection = http.client.HTTPSConnection(parts.hostname, parts.port, timeout=timeout,
+                                                 context=ssl.create_default_context())
+    else:
+        connection = http.client.HTTPConnection(parts.hostname, parts.port, timeout=timeout)
+    try:
+        headers = {"X-Loki-Setup": token} if token else {}
+        if body is not None:
+            headers["Content-Type"] = "application/octet-stream"
+        connection.request(method, path, body=body, headers=headers)
+        response = connection.getresponse()
+        payload = response.read(COURIER_LIMIT + 1024)
+        if response.status != 200:
+            raise ValueError(courier_error(payload, response.status))
+    except (OSError, http.client.HTTPException) as error:
+        raise Unreachable(f"Cannot reach the vault creator's app at {origin}") from error
+    finally:
+        connection.close()
+    return payload
 
 
 class Timeout(ValueError):
@@ -220,7 +335,7 @@ class SignerSessions:
 
 
 class Wallet:
-    def __init__(self, data, exchange, setup=SETUP):
+    def __init__(self, data, exchange, setup=SETUP, invite_origin=None):
         self.data = data.resolve()
         self.exchange = exchange.resolve()
         if self.data == self.exchange or self.data in self.exchange.parents or self.exchange in self.data.parents:
@@ -237,7 +352,11 @@ class Wallet:
             self.process_lock.close()
             raise ValueError("This member data root is already open in another app") from error
         self.setup = setup
+        self.invite_origin = check_origin(invite_origin) if invite_origin else None
         self.lock = threading.Lock()
+        self.claim_lock = threading.Lock()
+        self.syncs = {}
+        self.transport_errors = {}
         self.passphrase = None
         self.profile_data = None
         self.workers = {}
@@ -334,6 +453,144 @@ class Wallet:
             raise ValueError("Invalid vault ID")
         return self.exchange / vault
 
+    # ── the creator's courier, reachable by the other members ───────────────
+    # The same opaque files the local courier directory carried, served over
+    # HTTP to whoever holds a token claimed with one of this vault's invites.
+    # Nothing here can read the signer's private app token, a profile or a key.
+
+    def courier_folder(self, vault):
+        folder = self.exchange_vault(vault)
+        if not (folder / "draft.json").is_file():
+            raise ValueError("No vault setup is open for that ID")
+        return folder
+
+    def claim_invite(self, vault, slot, secret, token):
+        """Spend one invite for one slot, for the app that presents this token.
+
+        The joining app chooses and saves its own courier token before it asks,
+        so asking twice is the same claim: a lost answer costs a retry, not the
+        invitation. The slot is still spent by one app only — a copy of the code
+        on a second device arrives with a different token and is refused."""
+        if not isinstance(token, str) or len(token) < 32 or len(token) > 256:
+            raise ValueError("The joining app did not present a courier token")
+        draft = read_json(self.courier_folder(vault) / "draft.json")
+        if type(slot) is not int or slot not in range(2, int(draft["members"]) + 1) \
+                or not isinstance(secret, str) or not secrets.compare_digest(
+                    draft["invites"].get(str(slot), ""),
+                    hashlib.sha256(secret.encode()).hexdigest()):
+            raise ValueError("This invite does not match this vault")
+        claims = self.data / "vaults" / vault / "claims.json"
+        presented = hashlib.sha256(token.encode()).hexdigest()
+        with self.claim_lock:
+            spent = read_json(claims) if claims.is_file() else {}
+            if str(slot) in spent:
+                # The same app asking again is the same claim, so the 24 hours
+                # cannot strand a member whose answer was lost just before it.
+                if not secrets.compare_digest(spent[str(slot)], presented):
+                    raise ValueError("This invite was already used by another app. "
+                                     "Ask the vault creator for a new one.")
+            else:
+                if int(draft["expires_at"]) < time.time():
+                    raise ValueError("This invite expired. Ask the vault creator for a new one.")
+                spent[str(slot)] = presented
+                write_replace(claims, json.dumps(spent).encode())
+        return {"draft": draft}
+
+    def courier_slot(self, vault, token):
+        claims = self.data / "vaults" / self.exchange_vault(vault).name / "claims.json"
+        presented = hashlib.sha256((token or "").encode()).hexdigest()
+        for slot, saved in (read_json(claims) if claims.is_file() else {}).items():
+            if secrets.compare_digest(saved, presented):
+                return int(slot)
+        raise ValueError("Claim your invite first")
+
+    def courier_list(self, vault):
+        return courier_digests(self.courier_folder(vault), vault)
+
+    def courier_read(self, vault, name):
+        if not courier_carries(vault, name):
+            raise ValueError("Unknown setup file")
+        folder = self.courier_folder(vault)
+        if not (folder / name).is_file():
+            raise ValueError("Unknown setup file")
+        return (folder / name).read_bytes()
+
+    def courier_publish(self, vault, slot, name, body):
+        """A member may publish only the files their own slot owns."""
+        if not courier_name(vault, name, str(slot)):
+            raise ValueError(f"Member {slot} cannot publish that setup file")
+        if len(body) > COURIER_LIMIT:
+            raise ValueError("Setup file too large")
+        folder = self.courier_folder(vault)
+        if (folder / name).exists() and not courier_replaceable(name):
+            raise ValueError(f"{name} was already published; start a fresh vault session")
+        courier_write(folder, name, body)
+        return {"published": name}
+
+    # ── a joined member's side of the same courier ──────────────────────────
+
+    def ensure_sync(self, vault):
+        """Keep this member's local courier directory and the creator's in step.
+
+        The bytes are unchanged, so every signature, roster and ciphertext check
+        the file courier already made happens exactly as before."""
+        transport = self.data / "vaults" / self.exchange_vault(vault).name / "transport.json"
+        worker = self.syncs.get(vault)
+        if not transport.is_file() or (worker and worker.is_alive()):
+            return
+        worker = threading.Thread(target=self.sync_loop, args=(read_json(transport),), daemon=True)
+        self.syncs[vault] = worker
+        worker.start()
+
+    def sync_loop(self, transport):
+        vault = transport["vault"]
+        done = self.data / "vaults" / vault / "final-backup-checked"
+        while not done.exists():
+            try:
+                self.sync_once(vault, transport["origin"], transport["token"], transport["slot"])
+                self.transport_errors.pop(vault, None)
+            except (ValueError, OSError, KeyError) as error:
+                self.transport_errors[vault] = {"message": str(error),
+                                                "waiting": isinstance(error, Unreachable)}
+            time.sleep(1)
+
+    def sync_once(self, vault, origin, token, slot):
+        """One pass in each direction.
+
+        Nothing the courier says is taken on trust. It names the files it holds
+        and their digests, and it is the other side of an untrusted channel, so
+        every name is checked against the names this vault can have, every body
+        is checked against the digest that was advertised for it, and a file
+        this app already published is never overwritten by a different one."""
+        folder = self.exchange_vault(vault)
+        listed = json.loads(courier_request(origin, "GET", f"/setup/{vault}/files", token))
+        remote = listed.get("files") if isinstance(listed, dict) else None
+        if not isinstance(remote, dict) or len(remote) > COURIER_FILES:
+            raise ValueError("The setup courier did not answer with this vault's file list")
+        for name, digest in remote.items():
+            if not courier_carries(vault, name) or not isinstance(digest, str):
+                raise ValueError("The setup courier listed a file this vault cannot have. "
+                                 "Stop and start a fresh vault session.")
+        local = courier_digests(folder, vault)
+        for name, digest in sorted(remote.items()):
+            if name in local and local[name] != digest and not courier_replaceable(name):
+                # A published wire is published once. Two different versions of
+                # one is a failed round, not something to resolve by keeping
+                # whichever copy arrived first.
+                raise ValueError(f"The setup courier holds a different {name} than this app has. "
+                                 "Stop and start a fresh vault session.")
+            if name not in local or local[name] != digest:
+                body = courier_request(origin, "GET", f"/setup/{vault}/files/{name}", token)
+                if len(body) > COURIER_LIMIT or hashlib.sha256(body).hexdigest() != digest:
+                    raise ValueError(f"The setup courier's {name} is not the file it listed. "
+                                     "Stop and start a fresh vault session.")
+                courier_write(folder, name, body)
+        for name, digest in sorted(local.items()):
+            if courier_name(vault, name, str(slot)) and (
+                    name not in remote or (courier_replaceable(name) and remote[name] != digest)):
+                courier_request(origin, "PUT", f"/setup/{vault}/files/{name}", token,
+                                (folder / name).read_bytes())
+
     def create(self, name, members=3):
         profile = self.require_profile()
         if not isinstance(name, str) or not 1 <= len(name.strip()) <= 80:
@@ -348,7 +605,7 @@ class Wallet:
         tokens = {slot: secrets.token_urlsafe(24) for slot in range(2, members + 1)}
         draft = {"vault": vault, "name": name.strip(), "threshold": 2,
                  "members": members,
-                 "expires_at": int(time.time()) + 24 * 60 * 60,
+                 "expires_at": int(time.time()) + INVITE_TTL,
                  "invites": {str(slot): hashlib.sha256(token.encode()).hexdigest() for slot, token in tokens.items()}}
         write_new(folder / "draft.json", json.dumps(draft).encode())
         identity = json.loads(self.command("identity", local, "1", "@pass"))
@@ -356,7 +613,9 @@ class Wallet:
         write_new(local / "membership.json", json.dumps({"vault": vault, "slot": 1,
                                                           "name": name.strip(), "profile": profile["id"],
                                                           "threshold": 2, "members": members}).encode())
-        invites = [encoded({"vault": vault, "slot": slot, "secret": token}) for slot, token in tokens.items()]
+        invites = [encoded({"vault": vault, "slot": slot, "secret": token,
+                            **({"url": self.invite_origin} if self.invite_origin else {})})
+                   for slot, token in tokens.items()]
         write_new(local / "invites.json", json.dumps(invites).encode())
         return {"vault": vault, "invites": invites}
 
@@ -368,8 +627,17 @@ class Wallet:
         except (ValueError, KeyError, TypeError) as error:
             raise ValueError("Invalid invite") from error
         folder = self.exchange_vault(vault)
+        local = self.data / "vaults" / vault
+        if local.exists():
+            raise ValueError("This profile already has a membership for this vault")
+        origin = check_origin(claim["url"]) if claim.get("url") else None
+        token, repeat = self.pending_claim(vault, slot, secret, origin) if origin else (None, False)
+        if origin:
+            self.claim_remote(vault, slot, secret, origin, token)
         draft = read_json(folder / "draft.json")
-        if draft["vault"] != vault or int(draft["expires_at"]) < time.time():
+        # repeat is this app finishing a claim it already made and the creator's
+        # app already recorded; the 24 hours gate the first claim, not that.
+        if draft["vault"] != vault or (int(draft["expires_at"]) < time.time() and not repeat):
             raise ValueError("Invite expired or belongs to another vault")
         members = draft.get("members", 3)
         if draft.get("threshold") != 2 or type(members) is not int or members not in (3, 4) \
@@ -383,16 +651,61 @@ class Wallet:
             raise ValueError("Invite does not match this vault")
         if (folder / f"join-{slot}.json").exists():
             raise ValueError("This invite slot has already been claimed")
-        local = self.data / "vaults" / vault
-        if local.exists():
-            raise ValueError("This profile already has a membership for this vault")
         local.mkdir(mode=0o700, parents=True)
         identity = json.loads(self.command("identity", local, str(slot), "@pass"))
         write_new(folder / f"join-{slot}.json", json.dumps(identity).encode())
         write_new(local / "membership.json", json.dumps({"vault": vault, "slot": slot,
                                                           "name": draft["name"], "profile": profile["id"],
                                                           "threshold": 2, "members": members}).encode())
+        if origin:
+            write_new(local / "transport.json", json.dumps(
+                {"vault": vault, "slot": slot, "origin": origin, "token": token}).encode())
+            self.ensure_sync(vault)
         return {"vault": vault, "joined": True}
+
+    def pending_claim(self, vault, slot, secret, origin):
+        """This app's courier token for one invite, saved before it is used.
+
+        It is written down first, so a claim whose answer never arrives can be
+        repeated with the same token: the creator's app reads that repeat as the
+        same claim, and a different app's token as a second device.
+
+        It is bound to the exact invite. Repeating is only repeating if it is
+        the same slot, the same secret and the same address; a second, different
+        invite for this vault would otherwise reuse this token and claim another
+        member's slot with it. There is no reissue in this build, so a different
+        invite for a vault this app already claimed is refused outright."""
+        held = {"slot": slot, "secret": hashlib.sha256(secret.encode()).hexdigest(),
+                "origin": origin}
+        path = self.data / "claim-tokens.json"
+        with self.claim_lock:
+            saved = read_json(path) if path.is_file() else {}
+            claimed = saved.get(vault)
+            if claimed and {key: claimed.get(key) for key in held} != held:
+                raise ValueError(
+                    f"This app already claimed the member {claimed['slot']} invite for that "
+                    "vault. Paste that same invite again, or ask the vault creator to start "
+                    "a new vault.")
+            if not claimed:
+                saved[vault] = {**held, "token": secrets.token_urlsafe(32)}
+                write_replace(path, json.dumps(saved).encode())
+            return saved[vault]["token"], bool(claimed)
+
+    def claim_remote(self, vault, slot, secret, origin, token):
+        """Spend the invite at the creator's courier and keep its vault draft.
+
+        The draft is only a claim by that courier; the policy checks in join and
+        the roster fingerprint every member compares by hand are unchanged."""
+        answer = json.loads(courier_request(
+            origin, "POST", f"/setup/{vault}/claim",
+            body=json.dumps({"slot": slot, "secret": secret, "token": token}).encode()))
+        folder = self.exchange_vault(vault)
+        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        draft = answer.get("draft") if isinstance(answer, dict) else None
+        if not isinstance(draft, dict) or len(json.dumps(draft)) > 4096:
+            raise ValueError("The vault creator's app did not return this vault's draft")
+        if not (folder / "draft.json").exists():
+            write_new(folder / "draft.json", json.dumps(draft).encode())
 
     def roster(self, vault):
         member_dir, local = self.vault_dir(vault)
@@ -548,13 +861,15 @@ class Wallet:
                      self.exchange_vault(vault))
         return {"final_backup": True}
 
-    def finalize_backup(self, vault, words):
+    def finalize_backup(self, vault, words=None):
         member_dir, _ = self.vault_dir(vault)
-        if not isinstance(words, str):
+        if words is not None and not isinstance(words, str):
             raise ValueError("Enter your 24 backup words")
         with tempfile.TemporaryDirectory(prefix=".finalize-", dir=member_dir) as temp:
-            words_file = Path(temp) / "words"
-            write_new(words_file, words.encode())
+            words_file = "-"
+            if words:
+                words_file = Path(temp) / "words"
+                write_new(words_file, words.encode())
             self.command("backup-finalize", member_dir, "@pass", member_dir / "card",
                          member_dir / "final-card", words_file, member_dir / "roster.json",
                          self.exchange_vault(vault))
@@ -989,8 +1304,20 @@ class Wallet:
                  "fingerprint": roster["fingerprint"], "error": self.setup_errors.get(vault),
                  "profile": self.profile_data, "vaults": vaults}
         state["account_linked"] = (member_dir / "secrets" / "account-link.sealed").exists()
+        self.ensure_sync(vault)
+        state["transport_error"] = self.transport_errors.get(vault)
         if local["slot"] == 1 and (member_dir / "invites.json").exists():
-            state["invites"] = read_json(member_dir / "invites.json")
+            # One row per other member: the code to hand over, whether that
+            # member's app has published an identity, and where they reach this
+            # courier. "Joined" is only ever the published identity.
+            joined = {member["id"] for member in roster["members"]}
+            codes = read_json(member_dir / "invites.json")
+            state["invites"] = [{"slot": slot, "code": code, "joined": slot in joined,
+                                 "origin": decoded(code).get("url")}
+                                for slot, code in enumerate(codes, 2)]
+            draft = self.exchange_vault(vault) / "draft.json"
+            if draft.is_file():
+                state["invites_expire_at"] = int(read_json(draft)["expires_at"])
         if roster["fingerprint"]:
             state["phase"] = "compare_roster"
             # who else has published a roster answer, and whether it agrees
@@ -1011,12 +1338,103 @@ class Wallet:
             state["phase"] = "waiting_for_backups"
         if active:
             state["phase"] = "active" if (member_dir / "final-backup-checked").is_file() else "final_backup"
+            state["final_card_created"] = (member_dir / "final-card" / "vault.card").is_file()
+            state["final_card_needs_words"] = not (member_dir / "secrets" / "backup-words.sealed").is_file()
         if self.setup_errors.get(vault):
             state["phase"] = "stopped"
         return state
 
     def close(self):
         self.process_lock.close()
+
+
+def make_setup_server(wallet, port):
+    """The creator's setup courier, for the other members' apps only.
+
+    It serves one thing: the opaque files of one open vault setup, to callers
+    holding a token claimed with one of that vault's invites. It has no route
+    to a profile, a passphrase, a key or the signer's private app token, and it
+    is a separate listener from the signer app on its own port.
+
+    It is bound to the loopback interface. Reaching it from another device means
+    putting an HTTPS front with a certificate that device trusts in front of
+    this port and passing that address as --invite-origin; a plain LAN address
+    is refused when the invite is made, because the invite token travels on
+    every request."""
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *_args):
+            pass
+
+        def reply(self, status, value, raw=None):
+            body = raw if raw is not None else json.dumps(value).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/octet-stream" if raw is not None
+                             else "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def route(self, kinds):
+            parts = urlsplit(self.path).path.split("/")
+            if len(parts) < 4 or len(parts) > 5 or parts[0] or parts[1] != "setup" \
+                    or parts[3] not in kinds:
+                raise LookupError("Not found")
+            return parts[2], parts[3], parts[4] if len(parts) == 5 else None
+
+        def body(self, limit):
+            size = int(self.headers.get("Content-Length", "0"))
+            if not 0 < size <= limit:
+                raise ValueError("Invalid request size")
+            return self.rfile.read(size)
+
+        def answer(self, run):
+            try:
+                self.reply(200, *run())
+            except LookupError as error:
+                self.reply(404, {"error": str(error)})
+            except ValueError as error:
+                self.reply(400, {"error": str(error)})
+            except Exception:
+                # Never pass an unexpected internal failure to a remote caller.
+                self.reply(400, {"error": "The setup courier could not serve that request"})
+
+        def slot(self, vault):
+            return wallet.courier_slot(vault, self.headers.get("X-Loki-Setup", ""))
+
+        def do_POST(self):
+            def run():
+                vault, _, name = self.route(("claim",))
+                if name:
+                    raise LookupError("Not found")
+                value = json.loads(self.body(4096))
+                return (wallet.claim_invite(vault, value.get("slot"), value.get("secret"),
+                                            value.get("token")),)
+            self.answer(run)
+
+        def do_GET(self):
+            def run():
+                vault, _, name = self.route(("files",))
+                self.slot(vault)
+                if name is None:
+                    return ({"files": wallet.courier_list(vault)},)
+                return (None, wallet.courier_read(vault, name))
+            self.answer(run)
+
+        def do_PUT(self):
+            def run():
+                vault, _, name = self.route(("files",))
+                if name is None:
+                    raise LookupError("Not found")
+                return (wallet.courier_publish(vault, self.slot(vault), name,
+                                               self.body(COURIER_LIMIT)),)
+            self.answer(run)
+
+    return ThreadingHTTPServer(("127.0.0.1", port), Handler)
 
 
 FONTS = ("/fonts/geist.woff2", "/fonts/geist-mono.woff2", "/fonts/young-serif.woff2")
@@ -1278,9 +1696,14 @@ def make_dashboard_server(signer_port, port):
     return ThreadingHTTPServer(("127.0.0.1", port), Handler)
 
 
-def serve(wallet, port, dashboard_port=None):
+def serve(wallet, port, dashboard_port=None, invite_port=None):
     server, token = make_signer_server(wallet, port, dashboard_port)
     dashboard = make_dashboard_server(port, dashboard_port) if dashboard_port else None
+    setup = make_setup_server(wallet, invite_port) if invite_port else None
+    if setup:
+        threading.Thread(target=setup.serve_forever, daemon=True).start()
+        print(f"Setup courier: 127.0.0.1:{invite_port} · invites say {wallet.invite_origin}",
+              flush=True)
     if dashboard:
         threading.Thread(target=dashboard.serve_forever, daemon=True).start()
         print(f"Dashboard: http://127.0.0.1:{dashboard_port}/", flush=True)
@@ -1292,6 +1715,9 @@ def serve(wallet, port, dashboard_port=None):
         if dashboard:
             dashboard.shutdown()
             dashboard.server_close()
+        if setup:
+            setup.shutdown()
+            setup.server_close()
         wallet.close()
 
 
@@ -1301,5 +1727,18 @@ if __name__ == "__main__":
     parser.add_argument("--exchange", type=Path, required=True, help="shared untrusted local setup courier")
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--dashboard-port", type=int, help="serve a separate dashboard origin")
+    parser.add_argument("--invite-port", type=int,
+                        help="serve this vault's setup courier on 127.0.0.1 so invited "
+                             "members' apps can reach it")
+    parser.add_argument("--invite-origin",
+                        help="address invited members reach that courier on. Defaults to "
+                             "http://127.0.0.1:<invite-port>, which only works for another "
+                             "app on this machine. Any other address must be https.")
     args = parser.parse_args()
-    serve(Wallet(args.data, args.exchange), args.port, args.dashboard_port)
+    origin = args.invite_origin
+    if args.invite_port and not origin:
+        origin = f"http://127.0.0.1:{args.invite_port}"
+    if origin and not args.invite_port:
+        parser.error("--invite-origin needs --invite-port to serve")
+    serve(Wallet(args.data, args.exchange, invite_origin=origin), args.port,
+          args.dashboard_port, args.invite_port)

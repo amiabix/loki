@@ -502,8 +502,19 @@ class MemberWalletTest(unittest.TestCase):
             for wallet in wallets:
                 wallet.activate(vault)
                 self.assertEqual(wallet.status(vault)["phase"], "final_backup")
-            for wallet, words in zip(wallets, saved_words):
-                wallet.finalize_backup(vault, words)
+            for index, (wallet, words) in enumerate(zip(wallets, saved_words)):
+                sealed_words = wallet.data / "vaults" / vault / "secrets" / "backup-words.sealed"
+                if index == 0:
+                    self.assertTrue(sealed_words.is_file())
+                    self.assertFalse(wallet.status(vault)["final_card_needs_words"])
+                    wallet.finalize_backup(vault)
+                    self.assertFalse(sealed_words.exists())
+                    self.assertTrue(wallet.status(vault)["final_card_created"])
+                else:
+                    if index == 1:
+                        sealed_words.unlink()  # an older setup with no temporary copy
+                        self.assertTrue(wallet.status(vault)["final_card_needs_words"])
+                    wallet.finalize_backup(vault, words)
                 final_card = (wallet.data / "vaults" / vault / "final-card" / "vault.card").read_bytes()
                 self.assertEqual(wallet.verify_final_backup(vault, words, base64.b64encode(final_card).decode()),
                                  {"verified": True})

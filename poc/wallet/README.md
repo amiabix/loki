@@ -65,8 +65,56 @@ key creation within the setup CLI's two-minute wait per round. Each member
 downloads their backup card, records their 24 words separately, and loads both
 back to check them. The receive address appears after all members' backup checks.
 If the page closes before that check, **Show backup words** returns the same
-words and card after unlock. The temporary sealed word copy is removed when
-the member checks the saved artifacts.
+words and card after unlock. The temporary word copy stays sealed under the
+member's unlock passphrase until the final card is generated, then is removed.
+The final card still has to be checked using the words the member kept.
+
+## Inviting a member whose app is not on this filesystem
+
+`--invite-port` serves the creator's own setup courier on loopback, and each
+invite then carries the address an invited app should reach it on. The files
+that cross are the same opaque ones the shared `--exchange` directory carried:
+the vault draft, each member's public identity, each app's roster answer, and
+the signed, recipient-encrypted DKG and backup wires. An invited app checks
+every name against the ones this vault can have and every body against the
+digest the courier advertised, refuses a second version of a published wire,
+and may publish only its own slot's files. The roster fingerprint is still
+compared out of band, so the courier remains untrusted.
+
+```sh
+python3 wallet/member_app.py --data /tmp/loki-member-1 --exchange /tmp/loki-setup-1 --port 8801 --invite-port 8787
+```
+
+An invitation spends one slot for one app. The joining app saves its courier
+token before it asks, so an answer that never arrives costs a retry and not the
+invitation; the same code in a second app is refused. The 24 hours gate the
+first claim of a slot, not that retry. There is no reissue: an invitation that
+is spent, expired, or claimed by an app that then lost its data root cannot be
+replaced without a new vault.
+
+### What this does not do yet
+
+* **A separate device needs HTTPS.** `--invite-origin` accepts plain `http`
+  only for a loopback address. Any other address must be `https` with a
+  certificate the joining device already trusts, because the invite's token
+  travels on every request; a LAN `http://` address is refused when the invite
+  is made. Reaching the courier from another device therefore means putting a
+  TLS front with such a certificate ahead of the loopback `--invite-port`. That
+  deployment is not part of this app, and a join from a second physical device
+  has not been verified here.
+* **Members cannot finish at their own times, and the creator cannot be
+  offline.** The courier is served by the creator's app, so it must be open and
+  reachable for the whole join, DKG and backup round. A durable independent
+  relay would fix the creator's availability but not the rest: `loki_setup_member
+  run` publishes its round-one package and then waits for each peer's file with
+  a 120 second deadline, so the ceremony itself still needs every member present
+  at the same time. Asynchronous setup needs a resumable ceremony, not only a
+  different transport.
+* **The `communication/` relay is not used for this.** It is durable and
+  encrypted, but a mailbox's append and read capabilities are distributed in
+  descriptors derived from an already certified roster, which is exactly what
+  setup does not have yet.
+
 On a new device, create and unlock a local profile, then use **Restore your
 membership** with that member's final recovery card and 24 words. The app asks
 the Rust restore command to verify the card's roster and signed backup checks,

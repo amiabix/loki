@@ -493,10 +493,8 @@ fn backup_verify(args: &[String]) -> Result<(), String> {
     let roster = checked_roster(&state, Path::new(&args[4]))?;
     let identity = state_identity(&state)?;
     let receipt = identity.sign_backup(&roster.vault, &backup_body(&state)?)?;
-    let pending = Path::new(&args[0]).join("secrets/backup-words.sealed");
-    if pending.exists() {
-        fs::remove_file(pending).map_err(|e| e.to_string())?;
-    }
+    // Keep the sealed copy until the final card is made, so the member does
+    // not have to enter the same words again merely to generate that card.
     publish(
         Path::new(&args[5]),
         &name(&roster.vault, "backup", identity.public().id, None),
@@ -517,7 +515,17 @@ fn backup_finalize(args: &[String]) -> Result<(), String> {
     if state.get("backup_version").and_then(|v| v.as_u64()) != Some(2) {
         return Err("legacy backup receipts do not bind the viewing secret and address".into());
     }
-    let mnemonic = words(Path::new(&args[4]))?;
+    let pending = Path::new(&args[0]).join("secrets/backup-words.sealed");
+    let mnemonic = if args[4] == "-" {
+        String::from_utf8(
+            MemberDir::open(Path::new(&args[0]), "secrets")
+                .read_sealed("backup-words.sealed", &passphrase(Path::new(&args[1]))?)
+                .map_err(|_| "enter your 24 words to finish this earlier setup")?,
+        )
+        .map_err(|e| e.to_string())?
+    } else {
+        words(Path::new(&args[4]))?
+    };
     if card_dir(Path::new(&args[2]), false)?
         .read_sealed("vault.card", &mnemonic)
         .map_err(|e| e.to_string())?
@@ -566,6 +574,9 @@ fn backup_finalize(args: &[String]) -> Result<(), String> {
             return Err("final recovery card differs from this vault".into());
         }
         eprintln!("Final recovery card verified at {}/vault.card", args[3]);
+        if pending.exists() {
+            fs::remove_file(&pending).map_err(|e| e.to_string())?;
+        }
         return Ok(());
     }
     let mut receipts = BTreeMap::new();
@@ -595,6 +606,9 @@ fn backup_finalize(args: &[String]) -> Result<(), String> {
         return Err("final recovery card differs from this vault".into());
     }
     eprintln!("Final recovery card verified at {}/vault.card. Save this file with the 24 words kept separately. The provisional card is not a complete spend recovery.", args[3]);
+    if pending.exists() {
+        fs::remove_file(&pending).map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 

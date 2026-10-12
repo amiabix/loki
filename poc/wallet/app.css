@@ -352,7 +352,7 @@ header:not(:has(.band)) span {
 }
 
 .step-title {
-  margin: 0 auto 36px;
+  margin: 0 auto 24px;
   max-width: 20ch;
   text-align: center;
   font-family: var(--serif);
@@ -963,3 +963,70 @@ main > .muted:last-child {
 /* The same list says where a payment is. Inside a payment row the card ground
    is already --inset, so the stages take the raised ground to stay a list. */
 #payment-list .roster-row { background: var(--raised); }
+
+/* ── invitations ──────────────────────────────────────────────────────────────
+   The invitations are the work of the waiting step, so they sit in the first
+   screen with the progress line, and each one carries its own controls. A row's
+   word is its real state — Waiting or Joined — and never what this app did with
+   a share sheet, which it cannot follow past the moment it opens. */
+
+.step-progress {
+  max-width: var(--card);
+  margin: 0 auto 18px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--dim);
+}
+
+main > #transport-note {
+  max-width: var(--card);
+  margin: 0 auto 18px;
+}
+
+.invites { display: grid; gap: 1px; margin-top: 14px; background: var(--line-soft); }
+
+.invite-row {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  background: var(--inset);
+  border-left: 2px solid var(--line);
+}
+.invite-row.waiting { border-left-color: var(--warn); }
+.invite-row.joined { border-left-color: var(--accent); }
+.invite-row.expired { border-left-color: var(--danger); background: var(--danger-wash); }
+
+.invite-who {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+}
+.invite-who strong { font-size: 13.5px; font-weight: 600; }
+
+.invite-state {
+  font: 700 10.5px/1 Geist, sans-serif;
+  letter-spacing: .18em;
+  text-transform: uppercase;
+}
+.invite-state.waiting { color: var(--warn-text); }
+.invite-state.joined { color: var(--accent); }
+.invite-state.expired { color: var(--danger-text); font-weight: 700; }
+
+.invite-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.invite-actions button { margin: 0; }
+
+.invite-note { margin: 0; font-size: 12px; line-height: 1.55; color: var(--dim); }
+.invite-note.bad { color: var(--danger-text); }
+
+.invite-code { padding: 12px; font-size: 11.5px; line-height: 1.6; color: var(--dim); }
+
+#invite-expiry { margin: 14px 0 0; }
+
+@media (max-width: 720px) {
+  /* the display headline and its gap are most of the first screen on a phone */
+  main, main.band { padding-top: 28px; }
+  .step-title { margin-bottom: 20px; max-width: 24ch; font-size: clamp(26px, 7vw, 34px); }
+  .invite-actions button { flex: 1 1 auto; justify-content: center; }
+}
