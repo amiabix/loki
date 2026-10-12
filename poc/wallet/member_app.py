@@ -11,6 +11,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -24,6 +25,7 @@ from urllib.parse import parse_qs, urlsplit
 HERE = Path(__file__).resolve().parent
 SETUP = HERE.parent / "target" / "debug" / "loki_setup_member"
 PAYMENT = HERE.parent / "target" / "debug" / "loki_member_payment"
+RELAY = HERE.parent / "target" / "debug" / "loki_relay_member"
 SEED_WALLET = HERE.parent / "target" / "debug" / "loki_seed_wallet"
 
 
@@ -218,6 +220,7 @@ class Wallet:
         self.profile_data = None
         self.workers = {}
         self.setup_errors = {}
+        self.relay_payment_ready = False
 
     def command(self, action, *args, passphrase=None, timeout=30, binary=None):
         binary = binary or self.setup
@@ -600,13 +603,206 @@ class Wallet:
             if manifest.get("vault") != vault or manifest.get("pair") != [ord(c) - ord("A") + 1 for c in pair] \
                     or manifest.get("amount_zat") != int(amount_zat):
                 raise ValueError("Payment draft does not match this vault and request")
+            attempt = manifest.get("attempt")
+            if not isinstance(attempt, str) or not re.fullmatch(r"[0-9a-f]{64}", attempt):
+                raise ValueError("Payment draft has no valid attempt ID")
+            target = drafts / attempt
+            if target.exists():
+                raise ValueError("Payment attempt already exists")
+            work.rename(target)
+            work = target
+            self.payment_status(work, "draft")
             return {"status": "draft_only", "payment": manifest["payment"],
+                    "attempt": attempt,
                     "recipient": recipient.strip(), "amount_zat": str(manifest["amount_zat"]),
                     "fee_zat": str(manifest["fee_zat"]), "change_zat": str(manifest["change_zat"]),
                     "expiry_height": manifest["expiry_height"], "pair": manifest["pair"]}
         except Exception:
             shutil.rmtree(work)
             raise
+
+    def payment(self, vault, attempt):
+        member_dir, local = self.vault_dir(vault)
+        if local.get("threshold", 2) != 2 or local.get("members") != 3:
+            raise ValueError("Relay payments currently require a 2-of-3 vault")
+        if not (member_dir / "final-backup-checked").is_file():
+            raise ValueError("Vault is not active")
+        if not isinstance(attempt, str) or not re.fullmatch(r"[0-9a-f]{64}", attempt):
+            raise ValueError("Invalid payment attempt")
+        for work in (member_dir / "payments").glob("*/payment.json"):
+            manifest = read_json(work)
+            if manifest.get("attempt") == attempt and manifest.get("vault") == vault:
+                if manifest.get("pair") not in ([1, 2], [1, 3], [2, 3]):
+                    raise ValueError("Invalid payment pair")
+                return member_dir, local, work.parent, manifest
+        raise ValueError("Payment is not in this member's vault")
+
+    def payments(self, vault):
+        member_dir, _ = self.vault_dir(vault)
+        if not (member_dir / "final-backup-checked").is_file():
+            raise ValueError("Vault is not active")
+        items = []
+        for path in sorted((member_dir / "payments").glob("*/payment.json")):
+            manifest = read_json(path)
+            attempt = manifest.get("attempt")
+            if manifest.get("vault") != vault or not isinstance(attempt, str) \
+                    or not re.fullmatch(r"[0-9a-f]{64}", attempt):
+                continue
+            state = path.parent / "payment-status.json"
+            status = read_json(state) if state.is_file() else {"phase": "received"}
+            phase = status["phase"]
+            if phase == "confirmed":
+                # shortcut: recheck each confirmed payment until the wallet has an indexed chain store.
+                try:
+                    _, _, _, output = self.payment_command("verify", vault, attempt, status["txid"])
+                    if not re.search(r"\bverified mined txid=" + re.escape(status["txid"]) +
+                                     r" confirmations=[1-9][0-9]*\b", output):
+                        phase = "confirmation_needs_recheck"
+                except (KeyError, ValueError, subprocess.TimeoutExpired):
+                    phase = "confirmation_needs_recheck"
+            items.append({"attempt": attempt, "payment": manifest.get("payment"),
+                          "pair": manifest.get("pair"), "phase": phase,
+                          **({"txid": status["txid"]} if status.get("txid") else {})})
+        return {"payments": items}
+
+    def payment_status(self, work, phase, txid=None):
+        # shortcut: this file is UI progress only; custody state remains in the Rust signer and chain.
+        target = work / "payment-status.json"
+        temporary = work / (".payment-status-" + secrets.token_hex(8))
+        try:
+            write_new(temporary, json.dumps({"phase": phase, **({"txid": txid} if txid else {})}).encode())
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def payment_command(self, action, vault, attempt, *extra, timeout=120):
+        member_dir, local, work, manifest = self.payment(vault, attempt)
+        if not self.relay_payment_ready:
+            if self.command("features", binary=PAYMENT, timeout=5) != "relay-backed-signing=1":
+                raise ValueError("Build payment commands with --features relay-communication")
+            self.relay_payment_ready = True
+        output = self.command(action, member_dir, "@pass", member_dir / "roster.json", work,
+                              *extra, binary=PAYMENT, timeout=timeout)
+        return local, work, manifest, output
+
+    def publish_payment(self, vault, attempt):
+        member_dir, _, work, manifest = self.payment(vault, attempt)
+        output = self.command("send-proposal", "--member-root", member_dir,
+                              "--passphrase-file", "@pass", "--roster", member_dir / "roster.json",
+                              "--proposal-file", work / "payment.json", binary=RELAY, timeout=120)
+        if f"proposal={manifest['payment']} attempt={attempt}" not in output:
+            raise ValueError("Relay did not accept this payment proposal")
+        self.payment_status(work, "queued_for_delivery")
+        return {"phase": "queued_for_delivery"}
+
+    def sync_payments(self, vault):
+        member_dir, local = self.vault_dir(vault)
+        if local.get("threshold", 2) != 2 or local.get("members") != 3 \
+                or not (member_dir / "final-backup-checked").is_file():
+            raise ValueError("Relay payments require an active 2-of-3 vault")
+        roster = member_dir / "roster.json"
+        common = ("--member-root", member_dir, "--passphrase-file", "@pass", "--roster", roster)
+
+        def relay(action, *args):
+            return self.command(action, *common, *args, binary=RELAY, timeout=120)
+
+        works = sorted((member_dir / "payments").glob("*/payment.json"))
+        proposals = {}
+        for path in works:
+            work = path.parent
+            status = work / "payment-status.json"
+            if status.is_file() and read_json(status).get("phase") == "queued_for_delivery":
+                attempt = work.name
+                published = relay("send-proposal", "--proposal-file", path)
+                match = re.search(r"\brequest message=([0-9a-f]{64})\b", published)
+                if not match:
+                    raise ValueError("Relay did not identify the proposal")
+                proposals[attempt] = match.group(1)
+        relay("upload")
+        relay("poll", "--once")
+        relay("import-proposals", "--payments-dir", member_dir / "payments")
+
+        works = sorted((member_dir / "payments").glob("*/payment.json"))
+        for path in works:
+            attempt = path.parent.name
+            _, work, _, output = self.payment_command("local-wires", vault, attempt)
+            wires = json.loads(output)["wires"]
+            for wire in wires:
+                relay("send-signing", "--payload-file", work / "mailbox" / wire,
+                      "--attempt", attempt)
+        relay("upload")
+        relay("poll", "--once")
+        for path in works:
+            relay("export-signing", "--work-dir", path.parent, "--attempt", path.parent.name)
+
+        if proposals:
+            report = relay("status")
+            for attempt, message in proposals.items():
+                line = next((line for line in report.splitlines()
+                             if line.startswith("message ") and f" id={message} " in line), "")
+                if re.search(r"\bstored_whole=1\b", line):
+                    self.payment_status(member_dir / "payments" / attempt, "published")
+        return self.payments(vault)
+
+    def commit_payment(self, vault, attempt):
+        _, local, _, manifest = self.payment(vault, attempt)
+        if local["slot"] not in manifest["pair"]:
+            raise ValueError("This member is not in the selected signing pair")
+        if self.balance(vault)["height"] >= manifest["expiry_height"]:
+            raise ValueError("This payment has expired on this member's chain view")
+        _, work, _, _ = self.payment_command("commit", vault, attempt)
+        self.payment_status(work, "commitments")
+        return {"phase": "commitments"}
+
+    def package_payment(self, vault, attempt):
+        _, local, _, manifest = self.payment(vault, attempt)
+        if local["slot"] != manifest["pair"][0]:
+            raise ValueError("Only the first selected signer can build the package")
+        _, work, _, _ = self.payment_command("package", vault, attempt)
+        self.payment_status(work, "package")
+        return {"phase": "package"}
+
+    def review_payment(self, vault, attempt):
+        _, _, manifest, output = self.payment_command("review", vault, attempt)
+        review = json.loads(output)
+        if review.get("vault") != vault or review.get("payment") != manifest.get("payment") \
+                or review.get("attempt") != attempt or review.get("pair") != manifest.get("pair") \
+                or review.get("authorization_required") is not True:
+            raise ValueError("Verified review differs from this payment")
+        return review
+
+    def approve_payment(self, vault, attempt, review_token):
+        if not isinstance(review_token, str) or not re.fullmatch(r"[0-9a-f]{64}", review_token):
+            raise ValueError("Review this exact payment before approving")
+        _, work, _, _ = self.payment_command("approve-reviewed", vault, attempt, review_token)
+        self.payment_status(work, "approval_pending_delivery")
+        return {"phase": "approval_pending_delivery"}
+
+    def resend_payment(self, vault, attempt):
+        _, local, work, manifest = self.payment(vault, attempt)
+        if local["slot"] not in manifest["pair"]:
+            raise ValueError("Only a selected signer can retry saved signing messages")
+        self.payment_command("resend", vault, attempt)
+        status = work / "payment-status.json"
+        return {"phase": read_json(status)["phase"] if status.is_file() else "received"}
+
+    def finish_payment(self, vault, attempt):
+        _, work, _, output = self.payment_command("finish", vault, attempt, timeout=600)
+        txid = re.search(r"\bbroadcast txid=([0-9a-f]{64})\b", output)
+        if not txid:
+            raise ValueError("Finisher did not return a broadcast transaction ID")
+        self.payment_status(work, "broadcast", txid.group(1))
+        return {"phase": "broadcast", "txid": txid.group(1)}
+
+    def verify_payment(self, vault, attempt, txid):
+        if not isinstance(txid, str) or not re.fullmatch(r"[0-9a-f]{64}", txid):
+            raise ValueError("Enter the broadcast transaction ID")
+        _, work, _, output = self.payment_command("verify", vault, attempt, txid, timeout=120)
+        match = re.search(r"\bverified mined txid=([0-9a-f]{64}) confirmations=([1-9][0-9]*)\b", output)
+        if not match or match.group(1) != txid:
+            raise ValueError("Chain verification did not confirm this payment")
+        self.payment_status(work, "confirmed", txid)
+        return {"phase": "confirmed", "txid": txid, "confirmations": int(match.group(2))}
 
     def status(self, vault=None):
         if not (self.data / "profile" / "profile.sealed").exists():
@@ -757,6 +953,8 @@ def make_signer_server(wallet, port, dashboard_port=None):
                 vault = values.get("vault", [None])[0]
                 if path == "/api/status":
                     return self.reply(200, wallet.status(vault))
+                if path == "/api/payments":
+                    return self.reply(200, wallet.payments(vault))
                 if path == "/api/card":
                     member_dir, _ = wallet.vault_dir(vault)
                     card = (member_dir / "card" / "vault.card").read_bytes()
@@ -842,6 +1040,23 @@ def make_signer_server(wallet, port, dashboard_port=None):
                         "/api/payment-draft": lambda: wallet.prepare_payment(
                             value.get("vault"), value.get("recipient"), value.get("amount_zat"),
                             value.get("memo"), value.get("pair")),
+                        "/api/payment-publish": lambda: wallet.publish_payment(
+                            value.get("vault"), value.get("attempt")),
+                        "/api/payment-sync": lambda: wallet.sync_payments(value.get("vault")),
+                        "/api/payment-commit": lambda: wallet.commit_payment(
+                            value.get("vault"), value.get("attempt")),
+                        "/api/payment-package": lambda: wallet.package_payment(
+                            value.get("vault"), value.get("attempt")),
+                        "/api/payment-review": lambda: wallet.review_payment(
+                            value.get("vault"), value.get("attempt")),
+                        "/api/payment-approve": lambda: wallet.approve_payment(
+                            value.get("vault"), value.get("attempt"), value.get("review_token")),
+                        "/api/payment-resend": lambda: wallet.resend_payment(
+                            value.get("vault"), value.get("attempt")),
+                        "/api/payment-finish": lambda: wallet.finish_payment(
+                            value.get("vault"), value.get("attempt")),
+                        "/api/payment-verify": lambda: wallet.verify_payment(
+                            value.get("vault"), value.get("attempt"), value.get("txid")),
                     }
                     if self.path not in routes:
                         return self.reply(404, {"error": "Not found"})

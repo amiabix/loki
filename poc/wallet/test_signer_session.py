@@ -140,6 +140,12 @@ class SessionHttpTests(unittest.TestCase):
                              {"state": "done", "result": {"vault": "new-vault"}})
             self.assertEqual(call("POST", "/api/create", {"name": "Bad"},
                                   {"Origin": origin, "X-Loki-Session": key})[0], 403)
+            self.assertEqual(call("POST", "/api/payment-approve", {
+                "vault": "abc", "attempt": "a" * 64, "review_token": "b" * 64},
+                {"Origin": origin, "X-Loki-Session": key})[0], 403)
+            self.assertEqual(call("POST", "/api/payment-resend", {
+                "vault": "abc", "attempt": "a" * 64},
+                {"Origin": origin, "X-Loki-Session": key})[0], 403)
             self.assertEqual(call("POST", "/api/session/disconnect", {},
                                   {"Origin": origin, "X-Loki-Session": key})[0], 200)
             self.assertEqual(call("GET", "/api/session/vaults", headers={"Origin": origin,

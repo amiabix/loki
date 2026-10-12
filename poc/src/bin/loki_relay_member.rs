@@ -4,7 +4,11 @@
 use loki_poc::relay_member::{
     load, ConfigStore, CourierImport, LoadedMember, MemberError, ProvisionTarget,
 };
-use loki_poc::{setup_transport::session_envelope, signing_session::Mailbox};
+use loki_poc::{
+    payment_manifest::{self, decode_proposal, encode_proposal},
+    setup_transport::session_envelope,
+    signing_session::Mailbox,
+};
 use loki_relay_client::{
     committed_readiness, open_descriptor, outbox_intent_digest, poll_once, prepare_outbox,
     received_status, upload_pending, AuthenticatedDescriptor, CandidateReadiness, ClientConfig,
@@ -21,7 +25,7 @@ use std::{
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 const PAGE: u16 = 100;
 const ENTRY_LIMIT: u64 = 100;
@@ -30,6 +34,7 @@ const MAX_MANIFEST: usize = 8192;
 const SWITCHES: &[&str] = &["--once", "--verify-relays", "--diagnostics"];
 const DIAGNOSTIC_ROW_BOUND: usize = 400;
 
+#[derive(Debug)]
 enum Exit {
     Usage,
     Member(MemberError),
@@ -178,15 +183,50 @@ fn run() -> Result<(), Exit> {
         }
         "send-signing" => {
             expect(&[
-                "--member-root", "--passphrase-file", "--roster", "--payload-file", "--attempt",
+                "--member-root",
+                "--passphrase-file",
+                "--roster",
+                "--payload-file",
+                "--attempt",
             ])?;
             let (root, pass, roster) = common()?;
             let attempt = parse_id(take("--attempt")?.to_str().ok_or(Exit::Usage)?)?;
-            send(&root, &pass, &roster, &take("--payload-file")?, None, Some(attempt))
+            send(
+                &root,
+                &pass,
+                &roster,
+                &take("--payload-file")?,
+                None,
+                Some(attempt),
+            )
+        }
+        "send-proposal" => {
+            expect(&[
+                "--member-root",
+                "--passphrase-file",
+                "--roster",
+                "--proposal-file",
+            ])?;
+            let (root, pass, roster) = common()?;
+            send_proposal(&root, &pass, &roster, &take("--proposal-file")?)
+        }
+        "import-proposals" => {
+            expect(&[
+                "--member-root",
+                "--passphrase-file",
+                "--roster",
+                "--payments-dir",
+            ])?;
+            let (root, pass, roster) = common()?;
+            import_proposals(&root, &pass, &roster, &take("--payments-dir")?)
         }
         "export-signing" => {
             expect(&[
-                "--member-root", "--passphrase-file", "--roster", "--work-dir", "--attempt",
+                "--member-root",
+                "--passphrase-file",
+                "--roster",
+                "--work-dir",
+                "--attempt",
             ])?;
             let (root, pass, roster) = common()?;
             let attempt = parse_id(take("--attempt")?.to_str().ok_or(Exit::Usage)?)?;
@@ -272,12 +312,7 @@ fn provision(
             .map_err(Exit::Member)?;
         session
             .configs
-            .provision(
-                &mut session.db,
-                &session.member,
-                &http,
-                &capabilities,
-            )
+            .provision(&mut session.db, &session.member, &http, &capabilities)
             .await
             .map_err(Exit::Member)
     })?;
@@ -354,6 +389,17 @@ fn send(
     }
     let request_id = request_id.unwrap_or_else(|| *blake3::hash(&payload).as_bytes());
     let mut session = open_session(root, pass, roster)?;
+    let sent = commit_payload(&mut session, &payload, request_id, signing_attempt);
+    payload.zeroize();
+    sent
+}
+
+fn commit_payload(
+    session: &mut Session,
+    payload: &[u8],
+    request_id: Id32,
+    signing_attempt: Option<Id32>,
+) -> Result<(), Exit> {
     let digest =
         roster_digest(&session.member.roster).map_err(|_| Exit::Member(MemberError::Roster))?;
     let mut body = MessageBody {
@@ -404,11 +450,244 @@ fn send(
             .map_err(Exit::Client)
     });
     wipe_test(&mut body);
-    payload.zeroize();
     let saved = saved?;
     println!("request_id={}", hex_id(&request_id));
     print_logical(&session.db, &saved)?;
     Ok(())
+}
+
+fn send_proposal(root: &Path, pass: &Path, roster: &Path, proposal: &Path) -> Result<(), Exit> {
+    let manifest = read_exact(proposal, payment_manifest::MAX_MANIFEST, false)?;
+    let (context, intent) =
+        payment_manifest::parse(&manifest).map_err(|_| Exit::Member(MemberError::Markers))?;
+    let mut session = open_session(root, pass, roster)?;
+    payment_manifest::validate_roster(
+        session.member.roster.vault,
+        session.member.roster.members.iter().map(|member| member.id),
+        &context,
+        &intent,
+    )
+    .map_err(|_| Exit::Member(MemberError::Roster))?;
+    if payment_manifest::proposer_id(&intent.proposer)
+        .map_err(|_| Exit::Member(MemberError::Identity))?
+        != session.member.identity.public().id
+    {
+        return Err(Exit::Member(MemberError::Identity));
+    }
+    let payload =
+        Zeroizing::new(encode_proposal(&manifest).map_err(|_| Exit::Member(MemberError::Markers))?);
+    commit_payload(
+        &mut session,
+        &payload,
+        context.attempt.0,
+        Some(context.attempt.0),
+    )?;
+    println!(
+        "proposal={} attempt={}",
+        hex_id(&context.payment),
+        hex_id(&context.attempt.0)
+    );
+    Ok(())
+}
+
+fn import_proposals(root: &Path, pass: &Path, roster: &Path, payments: &Path) -> Result<(), Exit> {
+    let session = open_session(root, pass, roster)?;
+    let owner = fs::canonicalize(root).map_err(|_| Exit::Member(MemberError::Io))?;
+    let expected = owner.join("payments");
+    if payments != expected
+        && fs::canonicalize(payments).ok().as_deref() != Some(expected.as_path())
+    {
+        return Err(Exit::Member(MemberError::Permissions));
+    }
+    create_private_dir(&expected)?;
+    let rows = page_rows(
+        |after| session.db.recover_incoming_originals(after, PAGE),
+        usize::MAX,
+    )?;
+    let mut imported = 0;
+    let mut rejected = 0;
+    for row in rows {
+        if row.kind != 1 {
+            continue;
+        }
+        let Ok(opened) =
+            session
+                .db
+                .open_incoming(&session.member.roster, &session.member.identity, &row)
+        else {
+            rejected += 1;
+            continue;
+        };
+        let body = opened.message().body();
+        let Payload::Test(payload) = &body.payload else {
+            continue;
+        };
+        let manifest = match decode_proposal(payload) {
+            Ok(Some(manifest)) => manifest,
+            Ok(None) => continue,
+            Err(_) => {
+                rejected += 1;
+                continue;
+            }
+        };
+        let Ok((context, intent)) = payment_manifest::parse(manifest) else {
+            rejected += 1;
+            continue;
+        };
+        if payment_manifest::validate_roster(
+            session.member.roster.vault,
+            session.member.roster.members.iter().map(|member| member.id),
+            &context,
+            &intent,
+        )
+        .is_err()
+        {
+            rejected += 1;
+            continue;
+        }
+        if body.session != Some(context.attempt.0)
+            || Some(body.key.sender) != payment_manifest::proposer_id(&intent.proposer).ok()
+        {
+            rejected += 1;
+            continue;
+        }
+        let directory = expected.join(hex_id(&context.attempt.0));
+        create_private_dir(&directory)?;
+        let path = directory.join("payment.json");
+        match create_private_file(&path, manifest) {
+            Ok(true) => imported += 1,
+            Ok(false) => {}
+            Err(Exit::Member(MemberError::Identity)) => {
+                rejected += 1;
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+        println!(
+            "proposal={} attempt={}",
+            hex_id(&context.payment),
+            hex_id(&context.attempt.0)
+        );
+    }
+    println!("imported_proposals={imported}");
+    println!("rejected_proposals={rejected}");
+    Ok(())
+}
+
+fn create_private_dir(path: &Path) -> Result<(), Exit> {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(_) => return Err(Exit::Member(MemberError::Io)),
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|_| Exit::Member(MemberError::Io))?;
+    if !metadata.is_dir() {
+        return Err(Exit::Member(MemberError::Permissions));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.permissions().mode() & 0o077 != 0 || metadata.uid() != effective_uid() {
+            return Err(Exit::Member(MemberError::Permissions));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn effective_uid() -> u32 {
+    extern "C" {
+        fn geteuid() -> u32;
+    }
+    unsafe { geteuid() }
+}
+
+fn create_private_file(path: &Path, bytes: &[u8]) -> Result<bool, Exit> {
+    use std::io::Write;
+    let parent = path
+        .parent()
+        .ok_or(Exit::Member(MemberError::Permissions))?;
+    let mut suffix = [0u8; 16];
+    OsRng
+        .try_fill_bytes(&mut suffix)
+        .map_err(|_| Exit::Member(MemberError::Io))?;
+    let staging = parent.join(format!(".proposal-{}", hex::encode(suffix)));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| {
+        let mut file = options
+            .open(&staging)
+            .map_err(|_| Exit::Member(MemberError::Io))?;
+        file.write_all(bytes)
+            .map_err(|_| Exit::Member(MemberError::Io))?;
+        file.sync_all().map_err(|_| Exit::Member(MemberError::Io))?;
+        match fs::hard_link(&staging, path) {
+            Ok(()) => {
+                fs::File::open(parent)
+                    .and_then(|dir| dir.sync_all())
+                    .map_err(|_| Exit::Member(MemberError::Io))?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let saved = read_exact(path, payment_manifest::MAX_MANIFEST, true)?;
+                if saved.as_slice() == bytes {
+                    Ok(false)
+                } else {
+                    Err(Exit::Member(MemberError::Identity))
+                }
+            }
+            Err(_) => Err(Exit::Member(MemberError::Io)),
+        }
+    })();
+    fs::remove_file(staging).map_err(|_| Exit::Member(MemberError::Io))?;
+    result
+}
+
+#[cfg(test)]
+mod proposal_tests {
+    use super::*;
+
+    #[test]
+    fn imported_manifest_is_private_and_conflicting_replay_is_rejected() {
+        let root = std::env::temp_dir().join(format!(
+            "loki-proposals-{}-{}",
+            std::process::id(),
+            hex_id(blake3::hash(b"proposal-test").as_bytes())
+        ));
+        if root.exists() {
+            fs::remove_dir_all(&root).unwrap();
+        }
+        create_private_dir(&root).unwrap();
+        let payment = root.join("payment.json");
+        assert!(create_private_file(&payment, b"one").unwrap());
+        assert!(!create_private_file(&payment, b"one").unwrap());
+        assert!(create_private_file(&payment, b"two").is_err());
+        assert_eq!(fs::read(&payment).unwrap(), b"one");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(&payment).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 fn export_signing(
@@ -438,21 +717,38 @@ fn export_signing(
     }
     let session = open_session(root, pass, roster)?;
     let mailbox = Mailbox::new(&work.join("mailbox")).map_err(|_| Exit::Member(MemberError::Io))?;
-    let rows = page_rows(|after| session.db.recover_incoming_originals(after, PAGE), usize::MAX)?;
+    let rows = page_rows(
+        |after| session.db.recover_incoming_originals(after, PAGE),
+        usize::MAX,
+    )?;
     let mut count = 0;
     for row in rows
         .iter()
         .filter(|row| row.session == Some(attempt) && row.kind == 1)
     {
-        let opened = session
-            .db
-            .open_incoming(&session.member.roster, &session.member.identity, row)
-            .map_err(Exit::Client)?;
-        let Payload::Test(wire) = &opened.message().body().payload else {
-            return Err(Exit::Client(ClientError::Identity));
+        let Ok(opened) =
+            session
+                .db
+                .open_incoming(&session.member.roster, &session.member.identity, row)
+        else {
+            continue;
         };
-        session_envelope(wire).map_err(|_| Exit::Client(ClientError::Identity))?;
-        mailbox.append(wire).map_err(|_| Exit::Member(MemberError::Io))?;
+        let Payload::Test(wire) = &opened.message().body().payload else {
+            continue;
+        };
+        match decode_proposal(wire) {
+            Ok(Some(_)) => continue,
+            Err(_) => {
+                continue;
+            }
+            Ok(None) => {}
+        }
+        if session_envelope(wire).is_err() {
+            continue;
+        }
+        mailbox
+            .append(wire)
+            .map_err(|_| Exit::Member(MemberError::Io))?;
         count += 1;
     }
     println!("exported_signing={count}");

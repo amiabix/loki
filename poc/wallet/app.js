@@ -3,10 +3,16 @@ const token = location.hash.slice(1);
 const $ = (id) => document.getElementById(id);
 let selectedVault = null;
 let linkChallenge = null;
+let memberSlot = null;
+let renderedPaymentVault = null;
+const paymentReviews = new Map();
 
 function selectVault(vault) {
   selectedVault = vault;
   linkChallenge = null;
+  memberSlot = null;
+  renderedPaymentVault = null;
+  paymentReviews.clear();
   $('address').textContent = 'Open this vault to view the address.';
   $('balance').textContent = "Scan this device's chain view to see the balance.";
   $('words').textContent = '';
@@ -14,6 +20,7 @@ function selectVault(vault) {
   $('download-final').hidden = true;
   $('draft-result').hidden = true;
   $('payment-draft').reset();
+  $('payment-list').replaceChildren();
 }
 
 function message(text, error = false) {
@@ -61,6 +68,101 @@ function vaultList(vaults) {
     button.textContent = `${vault.name} · member ${vault.slot}`;
     button.addEventListener('click', () => { selectVault(vault.vault); refresh(); });
     list.append(button);
+  }
+}
+function paymentButton(label, run) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.textContent = label;
+  button.addEventListener('click', async () => {
+    button.disabled = true;
+    try {
+      const result = await run();
+      message(result?.phase ? `Payment: ${result.phase.replaceAll('_', ' ')}.` : 'Payment updated.');
+      await refreshPayments();
+    } catch (error) { message(error.message, true); }
+    finally { button.disabled = false; }
+  });
+  return button;
+}
+async function refreshPayments() {
+  if (!selectedVault) return;
+  const vault = selectedVault;
+  const {payments} = await api(`payments?vault=${encodeURIComponent(vault)}`);
+  if (selectedVault !== vault) return;
+  renderedPaymentVault = vault;
+  const list = $('payment-list');
+  list.replaceChildren();
+  if (!payments.length) { list.textContent = 'No payments in this member’s app.'; return; }
+  for (const payment of payments) {
+    const card = document.createElement('section');
+    card.className = 'card';
+    const title = document.createElement('h3');
+    title.textContent = `Payment ${payment.payment?.slice(0, 12) || payment.attempt.slice(0, 12)}…`;
+    const status = document.createElement('p');
+    status.textContent = `This device: ${payment.phase.replaceAll('_', ' ')} · selected signers: members ${payment.pair.join(' and ')}`;
+    card.append(title, status);
+    const request = (path, extra = {}) => api(path, {vault, attempt: payment.attempt, ...extra});
+    const isSigner = payment.pair.includes(memberSlot);
+    if (payment.phase === 'draft') card.append(paymentButton('Send proposal to members', () => request('payment-publish')));
+    if (isSigner && ['published', 'received'].includes(payment.phase)) {
+      card.append(paymentButton('Publish signing commitment', () => request('payment-commit')));
+    }
+    if (memberSlot === payment.pair[0] && payment.phase === 'commitments') {
+      card.append(paymentButton('Build transaction package', () => request('payment-package')));
+    }
+    if (isSigner && ['commitments', 'package'].includes(payment.phase)) {
+      card.append(paymentButton('Review exact transaction', async () => {
+        const review = await request('payment-review');
+        paymentReviews.set(payment.attempt, review);
+        return {phase: 'reviewed'};
+      }));
+    }
+    const review = paymentReviews.get(payment.attempt);
+    if (isSigner && review) {
+      const summary = document.createElement('pre');
+      summary.textContent = `Recipient: ${review.recipient}\nAmount: ${review.amount_zat} zat\nMemo: ${review.memo_utf8 == null ? 'Cannot display memo bytes' : JSON.stringify(review.memo_utf8)}\nNetwork fee: ${review.fee_zat} zat\nChange to vault: ${review.change_zat} zat\nExpires at block: ${review.expiry_height}`;
+      card.append(summary);
+      if (review.memo_utf8 !== null && review.memo_utf8 !== undefined) {
+        card.append(paymentButton('Approve this exact transaction', async () => {
+          const result = await request('payment-approve', {review_token: review.review_token});
+          paymentReviews.delete(payment.attempt);
+          return result;
+        }));
+      }
+    }
+    if (isSigner && payment.phase === 'approval_pending_delivery') {
+      card.append(paymentButton('Retry saved signing messages', () => request('payment-resend')));
+    }
+    if (['published', 'received', 'commitments', 'package', 'approval_pending_delivery'].includes(payment.phase)) {
+      card.append(paymentButton('Try to finish (waits for two shares)', () => request('payment-finish')));
+    }
+    if (payment.phase === 'broadcast' || payment.phase === 'confirmation_needs_recheck') {
+      const form = document.createElement('form');
+      const label = document.createElement('label');
+      label.textContent = 'Broadcast transaction ID';
+      const input = document.createElement('input');
+      input.name = 'txid';
+      input.value = payment.txid || '';
+      input.pattern = '[0-9a-f]{64}';
+      input.required = true;
+      const button = document.createElement('button');
+      button.textContent = 'Check on chain';
+      label.append(input);
+      form.append(label, button);
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        button.disabled = true;
+        try {
+          const result = await request('payment-verify', {txid: input.value});
+          message(`Confirmed on this device with ${result.confirmations} confirmation(s).`);
+          await refreshPayments();
+        } catch (error) { message(error.message, true); }
+        finally { button.disabled = false; }
+      });
+      card.append(form);
+    }
+    list.append(card);
   }
 }
 async function refreshSignerRequests(unlocked) {
@@ -130,7 +232,7 @@ async function refreshSignerRequests(unlocked) {
 async function refresh() {
   try {
     const state = await api('status' + (selectedVault ? `?vault=${encodeURIComponent(selectedVault)}` : ''));
-    if (state.phase === 'new_profile' || state.phase === 'locked') selectedVault = null;
+    if ((state.phase === 'new_profile' || state.phase === 'locked') && selectedVault) selectVault(null);
     for (const id of ['new-profile', 'locked', 'home', 'invites', 'connect-account', 'setup', 'backup', 'waiting', 'final-backup', 'active']) $(id).hidden = true;
     $('back').hidden = !selectedVault;
     $('lock').hidden = !state.profile && state.phase !== 'home';
@@ -167,9 +269,16 @@ async function refresh() {
       else if (state.phase === 'final_backup') $('final-backup').hidden = false;
       else if (state.phase === 'active') {
         $('active').hidden = false;
+        memberSlot = state.slot;
+        const paymentAvailable = state.total_members === 3;
+        $('payment-unavailable').hidden = paymentAvailable;
+        $('payment-draft').hidden = !paymentAvailable;
+        $('refresh-payments').hidden = !paymentAvailable;
+        $('payment-list').hidden = !paymentAvailable;
         for (const option of $('payment-draft').elements.pair.options) {
           option.disabled = state.total_members === 3 && option.value.includes('D');
         }
+        if (paymentAvailable && renderedPaymentVault !== selectedVault) await refreshPayments();
       }
       else if (state.phase === 'stopped') message('Setup stopped: ' + state.error + '. Start a fresh vault session.', true);
     }
@@ -281,9 +390,14 @@ action('payment-draft', async (form) => {
   const vault = selectedVault;
   const draft = await api('payment-draft', {vault, ...fields(form)});
   if (selectedVault !== vault) return;
-  $('draft-result').textContent = `DRAFT ONLY · no member has approved or sent this payment\nPayment ID: ${draft.payment}\nRecipient: ${draft.recipient}\nAmount: ${draft.amount_zat} zat\nFee: ${draft.fee_zat} zat\nChange to vault: ${draft.change_zat} zat\nExpiry height: ${draft.expiry_height}\nSelected pair: members ${draft.pair.join(' and ')}`;
+  $('draft-result').textContent = `LOCAL DRAFT · no member has approved or sent this payment\nPayment ID: ${draft.payment}\nSelected pair: members ${draft.pair.join(' and ')}`;
   $('draft-result').hidden = false;
-  message('Saved a local draft in your signer. Relay delivery and verified approvals are not available in this app yet.');
+  message('Saved a local draft. Send it to the other members before collecting signing commitments.');
+  await refreshPayments();
+});
+$('refresh-payments').addEventListener('click', async () => {
+  try { await api('payment-sync', {vault: selectedVault}); await refreshPayments(); }
+  catch (error) { message(error.message, true); }
 });
 $('back').addEventListener('click', () => { selectVault(null); refresh(); });
 $('lock').addEventListener('click', async () => {

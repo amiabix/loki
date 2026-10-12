@@ -22,6 +22,7 @@ pub mod intent;
 pub mod member_state;
 #[cfg(test)]
 mod nonce_binding;
+pub mod payment_manifest;
 pub mod randomizer;
 pub mod refresh;
 #[cfg(feature = "relay-communication")]

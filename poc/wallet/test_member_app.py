@@ -15,6 +15,45 @@ from member_app import SEED_WALLET, SETUP, Wallet
 
 
 class MemberWalletTest(unittest.TestCase):
+    def test_payment_sync_moves_only_own_wires_and_waits_for_relay_storage(self):
+        with tempfile.TemporaryDirectory(prefix="loki-payment-sync-") as temp:
+            wallet = Wallet(Path(temp) / "alice", Path(temp) / "exchange")
+            self.addCleanup(wallet.close)
+            vault, attempt, message, wire = ("a" * 64, "b" * 64, "c" * 64, "d" * 64)
+            wallet.profile_data = {"id": "alice"}
+            wallet.passphrase = "alice test passphrase"
+            member = wallet.data / "vaults" / vault
+            work = member / "payments" / attempt
+            (work / "mailbox").mkdir(parents=True)
+            (member / "membership.json").write_text(json.dumps({
+                "vault": vault, "profile": "alice", "slot": 1, "threshold": 2, "members": 3}))
+            (member / "roster.json").write_text("{}")
+            (member / "final-backup-checked").write_text("checked")
+            (work / "payment.json").write_text(json.dumps({
+                "vault": vault, "attempt": attempt, "payment": "e" * 64, "pair": [1, 2]}))
+            (work / "mailbox" / wire).write_bytes(b"own authenticated wire")
+            wallet.payment_status(work, "queued_for_delivery")
+            calls = []
+            stored = False
+
+            def command(action, *args, **_kwargs):
+                calls.append((action, args))
+                if action == "features": return "relay-backed-signing=1"
+                if action == "send-proposal": return f"request message={message} digest={'f' * 64} needs_route=0"
+                if action == "local-wires": return json.dumps({"wires": [wire]})
+                if action == "status":
+                    return f"message sender=1 id={message} stored_whole={int(stored)}"
+                return "ok"
+
+            with patch.object(wallet, "command", side_effect=command):
+                self.assertEqual(wallet.sync_payments(vault)["payments"][0]["phase"], "queued_for_delivery")
+                stored = True
+                self.assertEqual(wallet.sync_payments(vault)["payments"][0]["phase"], "published")
+            self.assertEqual([action for action, _ in calls].count("send-signing"), 2)
+            self.assertEqual([action for action, _ in calls].count("export-signing"), 2)
+            self.assertTrue(any(args[-2:] == ("--attempt", attempt) for action, args in calls
+                                if action == "send-signing"))
+
     def test_payment_draft_uses_only_active_members_own_vault(self):
         with tempfile.TemporaryDirectory(prefix="loki-draft-") as temp:
             root = Path(temp)
@@ -46,7 +85,7 @@ class MemberWalletTest(unittest.TestCase):
                 self.assertEqual((amount, memo, pair), ("40000000", "test memo", "AB"))
                 self.assertEqual(kwargs["binary"], Path(SETUP).with_name("loki_member_payment"))
                 (work / "payment.json").write_text(json.dumps({
-                    "vault": vault, "payment": "b" * 64, "amount_zat": 40000000,
+                    "vault": vault, "payment": "b" * 64, "attempt": "c" * 64, "amount_zat": 40000000,
                     "fee_zat": 10000, "change_zat": 59990000, "expiry_height": 9216,
                     "pair": [1, 2]}))
                 return "payment created"
@@ -55,8 +94,11 @@ class MemberWalletTest(unittest.TestCase):
                 draft = alice.prepare_payment(vault, "uregtest1recipient", "40000000", "test memo", "AB")
             self.assertEqual(command.call_count, 1)
             self.assertEqual(draft["payment"], "b" * 64)
+            self.assertEqual(draft["attempt"], "c" * 64)
             self.assertEqual(draft["status"], "draft_only")
             self.assertEqual(len(list((folder / "payments").glob("*/payment.json"))), 1)
+            self.assertTrue((folder / "payments" / ("c" * 64) / "payment.json").is_file())
+            self.assertEqual(alice.payments(vault)["payments"][0]["phase"], "draft")
             with self.assertRaisesRegex(ValueError, "Choose two members"):
                 alice.prepare_payment(vault, "uregtest1recipient", "40000000", "test memo", "AD")
             with self.assertRaisesRegex(ValueError, "positive amount"):
@@ -69,6 +111,82 @@ class MemberWalletTest(unittest.TestCase):
             alice.profile_data = {"id": "another-profile"}
             with self.assertRaisesRegex(ValueError, "does not belong"):
                 alice.prepare_payment(vault, "uregtest1recipient", "40000000", "test memo", "AB")
+
+    def test_payment_stages_use_only_own_vault_and_verified_review(self):
+        with tempfile.TemporaryDirectory(prefix="loki-payment-stages-") as temp:
+            root = Path(temp)
+            vault = "a" * 64
+            attempt = "b" * 64
+            payment = "c" * 64
+            alice = Wallet(root / "alice", root / "exchange")
+            bob = Wallet(root / "bob", root / "exchange")
+            self.addCleanup(alice.close)
+            self.addCleanup(bob.close)
+            for wallet, name, slot in ((alice, "alice", 1), (bob, "bob", 2)):
+                wallet.profile_data = {"id": name}
+                wallet.passphrase = f"{name} long test passphrase"
+                folder = wallet.data / "vaults" / vault
+                (folder / "payments" / attempt).mkdir(parents=True)
+                (folder / "final-backup-checked").write_text("checked")
+                (folder / "membership.json").write_text(json.dumps({
+                    "vault": vault, "profile": name, "slot": slot,
+                    "threshold": 2, "members": 3}))
+                (folder / "roster.json").write_text("{}")
+            work = alice.data / "vaults" / vault / "payments" / attempt
+            manifest = {"vault": vault, "attempt": attempt, "payment": payment,
+                        "pair": [1, 2], "expiry_height": 9216}
+            (work / "payment.json").write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, "not in this member"):
+                bob.review_payment(vault, attempt)
+            imported = bob.data / "vaults" / vault / "payments" / attempt
+            (imported / "payment.json").write_text(json.dumps(manifest))
+            self.assertEqual(bob.payments(vault)["payments"][0]["phase"], "received")
+            with self.assertRaisesRegex(ValueError, "Invalid payment attempt"):
+                alice.review_payment(vault, "../bob")
+            review = {**manifest, "recipient": "uregtest1recipient", "amount_zat": 40000000,
+                      "memo_utf8": "test memo", "fee_zat": 10000, "change_zat": 59990000,
+                      "expiry_height": 9216, "review_token": "d" * 64,
+                      "authorization_required": True}
+            calls = []
+
+            def command(action, *args, **_kwargs):
+                calls.append(action)
+                if action == "features": return "relay-backed-signing=1"
+                if action == "balance": return json.dumps({"vault": vault, "height": 100})
+                if action == "send-proposal": return f"proposal={payment} attempt={attempt}"
+                if action == "review": return json.dumps(review)
+                if action == "finish": return "broadcast txid=" + "e" * 64 + " payment=" + payment
+                if action == "verify": return "verified mined txid=" + "e" * 64 + " confirmations=3 amount=40000000"
+                return "ok"
+
+            with patch.object(alice, "command", side_effect=command):
+                self.assertEqual(alice.publish_payment(vault, attempt), {"phase": "queued_for_delivery"})
+                with patch.object(alice, "balance", return_value={"height": 9216}):
+                    with self.assertRaisesRegex(ValueError, "expired"):
+                        alice.commit_payment(vault, attempt)
+                self.assertEqual(alice.commit_payment(vault, attempt), {"phase": "commitments"})
+                self.assertEqual(alice.package_payment(vault, attempt), {"phase": "package"})
+                self.assertEqual(alice.review_payment(vault, attempt), review)
+                with self.assertRaisesRegex(ValueError, "Review this exact"):
+                    alice.approve_payment(vault, attempt, "wrong")
+                self.assertNotIn("approve-reviewed", calls)
+                self.assertEqual(alice.approve_payment(vault, attempt, "d" * 64)["phase"],
+                                 "approval_pending_delivery")
+                self.assertEqual(alice.resend_payment(vault, attempt)["phase"],
+                                 "approval_pending_delivery")
+                self.assertEqual(alice.finish_payment(vault, attempt)["phase"], "broadcast")
+                self.assertEqual(alice.verify_payment(vault, attempt, "e" * 64)["phase"], "confirmed")
+            self.assertEqual(calls.count("features"), 1)
+            with patch.object(alice, "command", side_effect=command):
+                self.assertEqual(alice.payments(vault)["payments"][0]["phase"], "confirmed")
+            with patch.object(alice, "payment_command", side_effect=ValueError("reorganized")):
+                self.assertEqual(alice.payments(vault)["payments"][0]["phase"],
+                                 "confirmation_needs_recheck")
+            review["vault"] = "f" * 64
+            with patch.object(alice, "command", return_value=json.dumps(review)) as command:
+                with self.assertRaisesRegex(ValueError, "differs from this payment"):
+                    alice.review_payment(vault, attempt)
+                self.assertEqual(command.call_count, 1)
 
     def test_four_member_vault_reaches_one_address_after_every_backup(self):
         if not SETUP.is_file():

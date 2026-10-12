@@ -16,6 +16,7 @@ use loki_poc::{
     candidate::{alpha_from_canonical_bytes, build_candidate, quote_fee, CandidateInputs, Regtest},
     intent::{ChangePolicy, Intent},
     member_state::{self, MemberState, Roster},
+    payment_manifest::validate_roster,
     rpc::Rpc,
     scan,
     signing_session::{
@@ -28,35 +29,11 @@ use loki_poc::{
 use loki_relay_client::{ClientStore, OwnerInbox, RelayHttp, RelayRuntime};
 use orchard::{keys::Scope, Address};
 use reddsa_frost::frost::redpallas as frost;
-use serde_json::{json, Value};
+use serde_json::json;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use zcash_protocol::{consensus::Parameters, memo::MemoBytes, value::Zatoshis};
 use zeroize::{Zeroize, Zeroizing};
-
-fn hex<const N: usize>(value: &Value, field: &str) -> Result<[u8; N], String> {
-    hex::decode(
-        value[field]
-            .as_str()
-            .ok_or_else(|| format!("missing {field}"))?,
-    )
-    .map_err(|e| format!("{field}: {e}"))?
-    .try_into()
-    .map_err(|_| format!("{field} must be {N} bytes"))
-}
-
-fn bytes(value: &Value, field: &str) -> Result<Vec<u8>, String> {
-    hex::decode(
-        value[field]
-            .as_str()
-            .ok_or_else(|| format!("missing {field}"))?,
-    )
-    .map_err(|e| format!("{field}: {e}"))
-}
-
-fn number(value: &Value, field: &str) -> Result<u64, String> {
-    value[field]
-        .as_u64()
-        .ok_or_else(|| format!("missing or invalid {field}"))
-}
 
 fn pair_from_name(name: &str) -> Result<[u16; 2], String> {
     match name {
@@ -70,28 +47,6 @@ fn pair_from_name(name: &str) -> Result<[u16; 2], String> {
     }
 }
 
-fn manifest_pair(value: &Value) -> Result<[u16; 2], String> {
-    let Some(pair) = value.get("pair") else {
-        return Ok([1, 2]); // Existing regtest manifests predate pair selection.
-    };
-    let ids = pair
-        .as_array()
-        .ok_or("payment pair must contain two member IDs")?;
-    if ids.len() != 2 {
-        return Err("payment pair must contain two member IDs".into());
-    }
-    let first = ids[0].as_u64().ok_or("invalid payment pair")?;
-    let second = ids[1].as_u64().ok_or("invalid payment pair")?;
-    let pair = [
-        u16::try_from(first).map_err(|_| "invalid payment pair")?,
-        u16::try_from(second).map_err(|_| "invalid payment pair")?,
-    ];
-    if pair[0] < 1 || pair[1] > 4 || pair[0] >= pair[1] {
-        return Err("payment pair must be a supported sorted pair".into());
-    }
-    Ok(pair)
-}
-
 fn peer_in_pair(pair: [u16; 2], own: u16) -> Option<u16> {
     if own == pair[0] {
         Some(pair[1])
@@ -100,12 +55,6 @@ fn peer_in_pair(pair: [u16; 2], own: u16) -> Option<u16> {
     } else {
         None
     }
-}
-
-fn proposer_id(bytes: &[u8]) -> Result<u16, String> {
-    (1u16..=4)
-        .find(|id| frost::Identifier::try_from(*id).is_ok_and(|member| member.serialize() == bytes))
-        .ok_or_else(|| "payment proposer is not a vault member".into())
 }
 
 fn private_work(path: &Path) -> Result<(), String> {
@@ -134,57 +83,7 @@ fn private_work(path: &Path) -> Result<(), String> {
 }
 
 fn manifest(path: &Path) -> Result<(SessionContext, Intent), String> {
-    let value: Value = serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
-        .map_err(|e| format!("manifest: {e}"))?;
-    if value["version"] != 1 || value["network"] != "regtest" {
-        return Err("unsupported payment manifest".into());
-    }
-    let notes = value["input_nullifiers"]
-        .as_array()
-        .ok_or("missing input nullifiers")?
-        .iter()
-        .map(|entry| hex::<32>(&json!({"nf": entry}), "nf"))
-        .collect::<Result<Vec<_>, _>>()?;
-    if notes.is_empty() || notes.len() > 8 {
-        return Err("payment needs 1 to 8 input notes".into());
-    }
-    let intent = Intent {
-        proposer: bytes(&value, "proposer")?,
-        created_height: number(&value, "created_height")?
-            .try_into()
-            .map_err(|_| "created height overflow")?,
-        input_nullifiers: notes,
-        recipient: bytes(&value, "recipient")?,
-        amount_zat: number(&value, "amount_zat")?,
-        memo: bytes(&value, "memo")?,
-        change_policy: ChangePolicy::VaultInternal,
-        fee_zat: number(&value, "fee_zat")?,
-        change_zat: number(&value, "change_zat")?,
-        expiry_height: number(&value, "expiry_height")?
-            .try_into()
-            .map_err(|_| "expiry height overflow")?,
-    };
-    if value["change_policy"] != "vault_internal"
-        || intent.recipient.len() != 43
-        || intent.amount_zat == 0
-        || intent.memo.is_empty()
-        || intent.memo.len() > 512
-        || intent.expiry_height <= intent.created_height
-    {
-        return Err("unsupported payment intent".into());
-    }
-    let context = SessionContext {
-        vault: hex(&value, "vault")?,
-        payment: hex(&value, "payment")?,
-        attempt: AttemptId(hex(&value, "attempt")?),
-        pair: manifest_pair(&value)?,
-    };
-    context.validate()?;
-    if context.payment != intent.proposal_id() {
-        return Err("manifest payment ID differs from intent".into());
-    }
-    proposer_id(&intent.proposer)?;
-    Ok((context, intent))
+    loki_poc::payment_manifest::parse(&fs::read(path).map_err(|e| e.to_string())?)
 }
 
 fn check_manifest_roster(
@@ -192,20 +91,12 @@ fn check_manifest_roster(
     context: &SessionContext,
     intent: &Intent,
 ) -> Result<(), String> {
-    if context.vault != roster.vault {
-        return Err("manifest names another vault".into());
-    }
-    if context
-        .pair
-        .iter()
-        .any(|id| !roster.members.contains_key(id))
-    {
-        return Err("payment pair includes a member outside this vault".into());
-    }
-    if !roster.members.contains_key(&proposer_id(&intent.proposer)?) {
-        return Err("payment proposer is not a vault member".into());
-    }
-    Ok(())
+    validate_roster(
+        roster.vault,
+        roster.members.keys().copied(),
+        context,
+        intent,
+    )
 }
 
 fn state(args: &[String]) -> Result<(MemberState, PathBuf, Zeroizing<String>), String> {
@@ -218,6 +109,67 @@ fn state(args: &[String]) -> Result<(MemberState, PathBuf, Zeroizing<String>), S
     let trimmed = Zeroizing::new(pass.trim_end_matches(['\r', '\n']).to_string());
     pass.zeroize();
     Ok((loaded, owner, trimmed))
+}
+
+fn own_wire_hashes(
+    identity: &loki_poc::setup_transport::Identity,
+    roster: &BTreeMap<u16, loki_poc::setup_transport::PublicIdentity>,
+    context: &SessionContext,
+    mailbox: &Path,
+) -> Result<Vec<String>, String> {
+    if roster.get(&identity.public().id) != Some(&identity.public()) {
+        return Err("local identity differs from certified roster".into());
+    }
+    if !mailbox.exists() {
+        return Ok(Vec::new());
+    }
+    let mut hashes = Vec::new();
+    for entry in fs::read_dir(mailbox).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if !entry.file_type().map_err(|e| e.to_string())?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.len() != 64 || !name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        if entry.metadata().map_err(|e| e.to_string())?.len() > 8 * 1024 * 1024 + 53 {
+            continue;
+        }
+        let wire = fs::read(entry.path()).map_err(|e| e.to_string())?;
+        if hex::encode(blake3::hash(&wire).as_bytes()) != name {
+            continue;
+        }
+        if roster
+            .values()
+            .filter(|peer| peer.id != identity.public().id)
+            .any(|peer| identity.open_sent_session(peer, context, &wire).is_ok())
+        {
+            hashes.push(name.to_owned());
+        }
+    }
+    hashes.sort();
+    Ok(hashes)
+}
+
+fn local_wires(args: &[String]) -> Result<(), String> {
+    if args.len() != 4 {
+        return Err("local-wires <member-dir> <passphrase-file> <roster.json> <work-dir>".into());
+    }
+    let (member, _, _) = state(args)?;
+    let work = Path::new(&args[3]);
+    private_work(work)?;
+    let (context, intent) = manifest(&work.join("payment.json"))?;
+    check_manifest_roster(&member.roster, &context, &intent)?;
+    let wires = own_wire_hashes(
+        &member.identity,
+        &member.roster.members,
+        &context,
+        &work.join("mailbox"),
+    )?;
+    println!("{}", json!({"wires": wires}));
+    Ok(())
 }
 
 fn balance(args: &[String]) -> Result<(), String> {
@@ -321,9 +273,11 @@ fn prepare(args: &[String]) -> Result<(), String> {
         "fee_zat": fee_zat, "change_zat": change_zat, "expiry_height": expiry
     });
     let target = work.join("payment.json");
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
         .open(&target)
         .map_err(|e| format!("{}: {e}", target.display()))?;
     file.write_all(serde_json::to_string_pretty(&value).unwrap().as_bytes())
@@ -1274,6 +1228,7 @@ fn main() {
     let args = env::args().collect::<Vec<_>>();
     let result = match args.get(1).map(String::as_str) {
         Some("prepare") => prepare(&args[2..]),
+        Some("local-wires") => local_wires(&args[2..]),
         Some("balance") => balance(&args[2..]),
         #[cfg(feature = "relay-communication")]
         Some("features") => {
@@ -1309,6 +1264,55 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use loki_poc::payment_manifest::{manifest_pair, proposer_id};
+
+    #[test]
+    fn local_wires_excludes_received_and_other_attempts() {
+        use loki_poc::setup_transport::Identity;
+        let own = Identity::new(1);
+        let peer = Identity::new(2);
+        let roster = [(1, own.public()), (2, peer.public())]
+            .into_iter()
+            .collect();
+        let context = SessionContext {
+            vault: [3; 32],
+            payment: [4; 32],
+            attempt: AttemptId([5; 32]),
+            pair: [1, 2],
+        };
+        let path = std::env::temp_dir().join(format!(
+            "loki-local-wires-{}-{}",
+            process::id(),
+            hex::encode(context.attempt.0)
+        ));
+        let mailbox = Mailbox::new(&path).unwrap();
+        let outbound = own
+            .seal_session(&peer.public(), &context, MessageKind::Commitment, b"own")
+            .unwrap();
+        let own_hash = mailbox.append(&outbound).unwrap();
+        mailbox
+            .append(
+                &peer
+                    .seal_session(&own.public(), &context, MessageKind::Commitment, b"peer")
+                    .unwrap(),
+            )
+            .unwrap();
+        let other = SessionContext {
+            attempt: AttemptId([6; 32]),
+            ..context.clone()
+        };
+        mailbox
+            .append(
+                &own.seal_session(&peer.public(), &other, MessageKind::Commitment, b"other")
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            own_wire_hashes(&own, &roster, &context, &path).unwrap(),
+            vec![hex::encode(own_hash)]
+        );
+        fs::remove_dir_all(path).unwrap();
+    }
 
     #[cfg(feature = "relay-communication")]
     #[test]

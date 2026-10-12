@@ -28,7 +28,7 @@ signing API. Use a **regtest-only seed**. An address QR is not a proof of contro
 
 ```sh
 cd poc
-cargo build --locked --bins
+cargo build --locked --bins --features relay-communication
 python3 wallet/member_app.py --data /tmp/loki-member-1 --exchange /tmp/loki-setup-exchange --port 8801
 ```
 
@@ -93,8 +93,30 @@ the new roster fingerprint; old 2-of-3 roster files retain their original
 fingerprint. A four-member source vault completed a mined payment with members
 3 and 4 signing and member 2 finishing through `run-member-payment.py
 --members 4 --pair CD --finisher 2`. This is the local courier test path; the
-relay adapter remains three-member-only. The member app can create a local
-payment draft, but it has no verified approval or sending UI.
+relay adapter remains three-member-only. The 2-of-4 vault can receive and show
+its balance here, but the app hides its payment controls. For a 2-of-3 vault, the private member
+app has controls for a fixed signing pair: create a local payment draft, send
+the proposal, publish commitments, build the package, review the transaction,
+approve that exact review, prove and broadcast, then verify it on chain. The
+review panel uses the Rust signer's verified transaction fields, not the
+proposal's annotation. Each member runs these controls in their own private
+signer window. **Refresh payments** uploads queued proposals and this member's
+authenticated signing messages, polls the relays, and imports messages for this
+member. The separate dashboard has no payment approval route. A local approval
+remains pending delivery; confirmation is checked again against this member's
+chain view whenever the payment list is shown. If a signer closed after saving
+an approval, **Retry saved signing messages** republishes the same sealed share;
+it never creates another signature share.
+
+Relay setup is still an external prerequisite. Each member must provision their
+vault directory with three operator-issued relay manifests and capability files
+using `loki_relay_member provision`, run `export-config`, deliver only the
+recipient-encrypted courier files to the named peers, and run `import-config`
+on the files addressed to them. Check each member with
+`loki_relay_member status --verify-relays` before using payment controls. The app
+does not collect capabilities or automate this ceremony. The independent
+three-relay setup in `communication/harness/three_members.py` tests transport;
+it does not configure an app vault.
 
 The app is passphrase-only today. Its local file courier and time-limited,
 non-resumable DKG are development controls, not the planned relay transport.
