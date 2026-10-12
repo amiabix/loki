@@ -6,9 +6,10 @@ public join records and the existing signed or encrypted setup messages. Each
 process calls `loki_setup_member` for its own identity, DKG and backup. It has
 no route that creates another member's identity or unlocks another share.
 
-Before agreeing to the roster, each member connects the reference regtest
-wallet. Click **Create connection challenge**, download its JSON, and run the
-wallet command in a separate terminal:
+Vault creation needs only each member's Loki signer. A personal Zcash wallet is
+not required. An optional regtest account link can be added before or after
+setup: open **Optional: link a reference Zcash account**, create a challenge,
+download its JSON, and run the wallet command separately:
 
 ```sh
 chmod 600 /path/to/your-24-word-seed-file
@@ -19,8 +20,9 @@ Paste the JSON proof into the member app. The command derives account 0 using
 ZIP 32's regtest coin type, signs the fresh vault-and-member challenge with its
 Orchard spend authorization key, and exits. Loki verifies that signature and
 seals the account link. The profile uses the same account key across its vaults,
-while each vault still gets a separate FROST identity and share. The seed file
-never goes to the Loki app or the setup courier. This adapter supports only the
+while each vault still gets a separate FROST identity and share. Linking does
+not change or recover that share. The seed file never goes to the Loki app or
+the setup courier. This adapter supports only the
 reference command; existing Zcash wallets do not automatically expose this
 signing API. Use a **regtest-only seed**. An address QR is not a proof of control.
 
@@ -57,11 +59,11 @@ using the same exchange directory. Open each printed private URL in a
 separate browser window. Each person creates a local profile and unlocks it. A
 profile can create or join more than one vault; every vault has its own transport
 identity and sealed FROST share under `vaults/<vault-id>/`. The creator copies each invite code to
-the intended member. Each joiner pastes their own code. All three compare the
+the intended member. Each joiner pastes their own code. All members compare the
 roster fingerprint through a trusted channel and confirm it. They must start
 key creation within the setup CLI's two-minute wait per round. Each member
 downloads their backup card, records their 24 words separately, and loads both
-back to check them. The receive address appears after all three backup checks.
+back to check them. The receive address appears after all members' backup checks.
 If the page closes before that check, **Show backup words** returns the same
 words and card after unlock. The temporary sealed word copy is removed when
 the member checks the saved artifacts.
@@ -75,7 +77,7 @@ is not saved as plaintext in the member directory. The profile ID is local and
 does not appear in the vault roster or on chain. A membership links that profile
 ID to the vault ID locally; the certified roster binds that membership's separate
 public identity to its FROST share.
-The account-control proof is verified locally and kept in the member's sealed
+If used, the account-control proof is verified locally and kept in the member's sealed
 store. It is not part of the group certificate, so other members do not learn a
 reusable account key. The ordinary wallet seed does not recover a Loki FROST
 share; the Loki 24 words and backup card are still required.

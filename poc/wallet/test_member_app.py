@@ -16,8 +16,8 @@ from member_app import SEED_WALLET, SETUP, Wallet
 
 class MemberWalletTest(unittest.TestCase):
     def test_four_member_vault_reaches_one_address_after_every_backup(self):
-        if not SETUP.is_file() or not SEED_WALLET.is_file():
-            self.skipTest("build setup and seed wallet binaries first")
+        if not SETUP.is_file():
+            self.skipTest("build setup binary first")
         with tempfile.TemporaryDirectory(prefix="loki-four-member-") as temp:
             root = Path(temp)
             exchange = root / "exchange"
@@ -34,16 +34,7 @@ class MemberWalletTest(unittest.TestCase):
             fingerprints = [wallet.roster(vault)["fingerprint"] for wallet in wallets]
             self.assertEqual(len(set(fingerprints)), 1)
             self.assertTrue(all(wallet.status(vault)["total_members"] == 4 for wallet in wallets))
-            seed = root / "wallet-seed.txt"
-            seed.write_text("abandon " * 23 + "art")
-            os.chmod(seed, 0o600)
-            for wallet in wallets:
-                challenge = root / f"challenge-{wallet.data.name}.json"
-                challenge.write_text(json.dumps(wallet.begin_link(vault)))
-                proof = json.loads(subprocess.run(
-                    [SEED_WALLET, "prove", seed, challenge], capture_output=True,
-                    text=True, check=True).stdout)
-                wallet.link(vault, proof)
+            self.assertTrue(all(not wallet.status(vault)["account_linked"] for wallet in wallets))
             for wallet in wallets:
                 wallet.agree(vault, fingerprints[0])
             for wallet in wallets:
@@ -97,18 +88,8 @@ class MemberWalletTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "failed authentication"):
                 wallets[0].unlock("wrong passphrase for this vault")
             self.assertEqual(wallets[0].unlock(passwords[0])["profile"], profiles[0])
-            with self.assertRaisesRegex(ValueError, "Prove control of your Zcash account"):
-                wallets[0].agree(vault, fingerprints[0])
-            seed = root / "wallet-seed.txt"
-            seed.write_text("abandon " * 23 + "art")
-            os.chmod(seed, 0o600)
-            for wallet in wallets:
-                challenge = root / f"challenge-{wallet.data.name}.json"
-                challenge.write_text(json.dumps(wallet.begin_link(vault)))
-                proof = json.loads(subprocess.run(
-                    [SEED_WALLET, "prove", seed, challenge], capture_output=True,
-                    text=True, check=True).stdout)
-                wallet.link(vault, proof)
+            self.assertEqual(wallets[0].status(vault)["phase"], "compare_roster")
+            self.assertTrue(all(not wallet.status(vault)["account_linked"] for wallet in wallets))
             for wallet in wallets:
                 self.assertEqual(wallet.agree(vault, fingerprints[0]), {"started": True})
             for wallet in wallets:
@@ -125,6 +106,19 @@ class MemberWalletTest(unittest.TestCase):
             addresses = [wallet.address(vault) for wallet in wallets]
             self.assertEqual(len(set(addresses)), 1)
             self.assertTrue(addresses[0].startswith("uregtest1"))
+            sealed = (wallets[0].data / "vaults" / vault / "secrets" / "vault.sealed").read_bytes()
+            seed = root / "wallet-seed.txt"
+            seed.write_text("abandon " * 23 + "art")
+            os.chmod(seed, 0o600)
+            challenge = root / "challenge.json"
+            challenge.write_text(json.dumps(wallets[0].begin_link(vault)))
+            proof = json.loads(subprocess.run(
+                [SEED_WALLET, "prove", seed, challenge], capture_output=True,
+                text=True, check=True).stdout)
+            wallets[0].link(vault, proof)
+            self.assertTrue(wallets[0].status(vault)["account_linked"])
+            self.assertEqual((wallets[0].data / "vaults" / vault / "secrets" / "vault.sealed").read_bytes(), sealed)
+            self.assertEqual(wallets[0].address(vault), addresses[0])
             for index, wallet in enumerate(wallets):
                 self.assertEqual(wallet.status(vault)["phase"], "active")
                 self.assertEqual(len(list(wallet.data.glob("vaults/*/secrets/vault.sealed"))), 1)
@@ -133,7 +127,7 @@ class MemberWalletTest(unittest.TestCase):
             second = wallets[0].create("Second vault")["vault"]
             self.assertNotEqual(second, vault)
             self.assertEqual(len(wallets[0].status()["vaults"]), 2)
-            self.assertEqual(wallets[0].status(second)["phase"], "connect_account")
+            self.assertEqual(wallets[0].status(second)["phase"], "waiting_for_members")
             with self.assertRaisesRegex(ValueError, "not a member"):
                 wallets[1].status(second)
             first_key = json.loads((exchange / vault / "join-1.json").read_text())
@@ -149,6 +143,14 @@ class MemberWalletTest(unittest.TestCase):
             with patch.object(wallets[0], "command", return_value=json.dumps({"vault": second})):
                 with self.assertRaisesRegex(ValueError, "another vault"):
                     wallets[0].balance(vault)
+            link_record = wallets[0].data / "vaults" / vault / "secrets" / "account-link.sealed"
+            damaged = bytearray(link_record.read_bytes())
+            damaged[-1] ^= 1
+            link_record.write_bytes(damaged)
+            status = wallets[0].status(vault)
+            self.assertEqual(status["phase"], "active")
+            self.assertIn("account_link_error", status)
+            self.assertEqual(wallets[0].address(vault), addresses[0])
 
     def test_rejects_exchange_inside_private_root(self):
         with tempfile.TemporaryDirectory() as temp:

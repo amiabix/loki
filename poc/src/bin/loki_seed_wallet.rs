@@ -197,7 +197,7 @@ fn check(args: &[String]) -> Result<(), String> {
     let pass = Zeroizing::new(secret(Path::new(&args[2]))?);
     let stored = MemberDir::open(member, "secrets")
         .read_sealed("account-link.sealed", &pass)
-        .map_err(|_| "prove control of a Zcash account before key creation")?;
+        .map_err(|_| "this vault has no Zcash account link")?;
     let record: Value = serde_json::from_slice(&stored).map_err(|e| e.to_string())?;
     let c = challenge(&serde_json::to_vec(&record["challenge"]).unwrap(), false)?;
     check_context(member, &pass, &c)?;

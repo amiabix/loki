@@ -412,7 +412,7 @@ class Wallet:
     def account_link(self, vault):
         member_dir, _ = self.vault_dir(vault)
         if not (member_dir / "secrets" / "account-link.sealed").exists():
-            raise ValueError("Prove control of your Zcash account before key creation")
+            raise ValueError("No Zcash account link for this vault")
         result = json.loads(self.command("check", self.data, member_dir, "@pass", binary=SEED_WALLET))
         if result["vault"] != vault:
             raise ValueError("Account link belongs to another vault")
@@ -428,7 +428,6 @@ class Wallet:
         own = json.loads(self.command("identity-public", member_dir, "@pass"))
         if own != roster["members"][local["slot"] - 1]:
             raise ValueError("Your identity differs from the agreed roster")
-        self.account_link(vault)
         if vault in self.workers and self.workers[vault].is_alive():
             raise ValueError("Key creation is already running")
         self.setup_errors.pop(vault, None)
@@ -503,10 +502,11 @@ class Wallet:
             state["invites"] = read_json(member_dir / "invites.json")
         if roster["fingerprint"]:
             state["phase"] = "compare_roster"
-        if not state["account_linked"]:
-            state["phase"] = "connect_account"
-        else:
-            state["account_ak"] = self.account_link(vault)["account_ak"]
+        if state["account_linked"]:
+            try:
+                state["account_ak"] = self.account_link(vault)["account_ak"]
+            except (ValueError, subprocess.TimeoutExpired, OSError):
+                state["account_link_error"] = "Optional account link could not be verified"
         if (member_dir / "secrets" / "vault.sealed").exists():
             state["phase"] = "back_up"
         elif vault in self.workers and self.workers[vault].is_alive():

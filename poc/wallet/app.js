@@ -125,7 +125,7 @@ async function refresh() {
     for (const id of ['new-profile', 'locked', 'home', 'invites', 'connect-account', 'setup', 'backup', 'waiting', 'active']) $(id).hidden = true;
     $('back').hidden = !selectedVault;
     $('lock').hidden = !state.profile && state.phase !== 'home';
-    $('title').textContent = state.name || state.profile?.name || 'Your wallet';
+    $('title').textContent = state.name || state.profile?.name || 'Your signer';
     $('subtitle').textContent = selectedVault ? `Member ${state.slot} · ${state.threshold} of ${state.total_members} · regtest` : 'One local profile, separate keys for each vault.';
     $('linked-account').hidden = !state.account_ak;
     if (state.account_ak) $('linked-account').textContent = `Proved Orchard account key: ${state.account_ak.slice(0, 16)}…`;
@@ -159,6 +159,7 @@ async function refresh() {
       else if (state.phase === 'stopped') message('Setup stopped: ' + state.error + '. Start a fresh vault session.', true);
     }
     if (state.error) message(state.error, true);
+    else if (state.account_link_error) message(`${state.account_link_error}. Vault keys are unaffected.`, true);
     await refreshSignerRequests(!!state.profile);
   } catch (error) { message(error.message, true); }
 }
@@ -195,7 +196,7 @@ $('download-challenge').addEventListener('click', challengeDownload);
 action('link-account', async (form) => {
   const proof = JSON.parse(fields(form).proof);
   const result = await api('link', {vault: selectedVault, proof});
-  message(`Account proof verified: ${result.account_ak}. You can continue vault setup.`);
+  message(`Optional account link saved: ${result.account_ak}. Vault signing still uses your Loki share.`);
 });
 action('agree', async (form) => { await api('agree', {vault: selectedVault, ...fields(form)}); message('Key creation started. Each member must compare and confirm the roster.'); });
 action('make-backup', async () => {

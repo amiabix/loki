@@ -3,14 +3,14 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Loki · Member wallet</title>
+  <title>Loki · Member signer</title>
   <link rel="stylesheet" href="/app.css">
   <script src="/app.js" defer></script>
 </head>
 <body>
-<header><strong>◇ Loki</strong><span>Member wallet · regtest</span></header>
+<header><strong>◇ Loki</strong><span>Member signer · regtest</span></header>
 <main>
-  <div class="row"><div><h1 id="title">Your wallet</h1><p class="muted" id="subtitle">Unlock your local profile.</p></div><button class="secondary" id="back" type="button" hidden>All vaults</button><button class="secondary" id="lock" type="button" hidden>Lock</button></div>
+  <div class="row"><div><h1 id="title">Your signer</h1><p class="muted" id="subtitle">Unlock your local profile.</p></div><button class="secondary" id="back" type="button" hidden>All vaults</button><button class="secondary" id="lock" type="button" hidden>Lock</button></div>
   <p id="message" role="status" hidden></p>
   <section class="card" id="signer-requests" hidden><h2>Dashboard connection requests</h2><p>Check the origin and access before approving. This does not approve a payment.</p><div id="signer-request-list"></div></section>
   <section class="card" id="signer-actions" hidden><h2>Vault requests from your dashboard</h2><p>Check each vault name before creating it. This does not approve a payment.</p><div id="signer-action-list"></div></section>
@@ -22,7 +22,7 @@
     <section class="card"><h2>Join a vault</h2><form id="join"><label>Invite code<textarea name="invite" required></textarea></label><button>Join vault</button></form></section>
   </div>
   <section class="card" id="invites" hidden><h2>Invite the other members</h2><p>Give one code to each person. They open Loki in their own app and paste their code. Codes expire after 24 hours.</p><label>Member 2 code<pre id="invite2"></pre></label><label>Member 3 code<pre id="invite3"></pre></label><label id="invite4-row" hidden>Member 4 code<pre id="invite4"></pre></label></section>
-  <section class="card" id="connect-account" hidden><h2>Prove control of a Zcash account</h2><p>This regtest build uses a separate reference wallet command. It proves control of your ZIP 32 Orchard account without giving Loki your seed. Your vault approvals still use the separate Loki FROST share.</p><button id="begin-link" type="button">Create account challenge</button><pre id="link-challenge" hidden></pre><button id="download-challenge" type="button" hidden>Download challenge</button><p class="muted">Run <code>loki_seed_wallet prove &lt;your-owner-only-seed-file&gt; &lt;challenge-file&gt;</code> outside this app. Paste its JSON result below. The challenge expires after 10 minutes.</p><form id="link-account"><label>Wallet proof<textarea name="proof" required></textarea></label><button>Verify account proof</button></form></section>
+  <details class="card" id="connect-account" hidden><summary>Optional: link a reference Zcash account</summary><p>This regtest-only proof is separate from vault creation, signing and recovery. Your personal wallet seed cannot restore a Loki share. Never enter that seed in Loki.</p><button id="begin-link" type="button">Create account challenge</button><pre id="link-challenge" hidden></pre><button id="download-challenge" type="button" hidden>Download challenge</button><p class="muted">Run <code>loki_seed_wallet prove &lt;your-owner-only-seed-file&gt; &lt;challenge-file&gt;</code> outside this app. Paste its JSON result below. The challenge expires after 10 minutes.</p><form id="link-account"><label>Wallet proof<textarea name="proof" required></textarea></label><button>Verify account proof</button></form></details>
   <p id="linked-account" class="muted" hidden></p>
   <section class="card" id="setup" hidden><h2>Vault setup</h2><p id="progress"></p><p>Roster fingerprint: <code id="fingerprint"></code></p><p class="warning">Compare this fingerprint with every other member using a channel you trust. Stop if any character differs.</p><form id="agree"><label>Type the full matching fingerprint<input name="fingerprint" autocomplete="off" required></label><button>Create group keys</button></form></section>
   <section class="card" id="backup" hidden><h2>Back up your share</h2><p>Save your 24 words and backup card separately. Anyone with both can view the vault and hold one signing share.</p><form id="make-backup"><button>Show backup words</button></form><div id="backup-made" hidden><label>24 words<pre id="words"></pre></label><button type="button" id="download">Download backup card</button><p class="warning">The address stays hidden until every member checks their own backup.</p></div><form id="check-backup"><label>Enter your 24 words<input name="words" autocomplete="off" required></label><label>Load the card you saved<input name="card" type="file" required></label><button>Check backup</button></form></section>

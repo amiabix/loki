@@ -1,4 +1,4 @@
-"""A wallet seed proves control of the member identity before vault setup."""
+"""Optional reference-wallet account proof remains bound to one vault identity."""
 
 import json
 import os
