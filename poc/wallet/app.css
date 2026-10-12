@@ -477,6 +477,19 @@ pre {
 
 /* the roster fingerprint is the one step where a single wrong character matters,
    so it is set as large and as spaced as it can be without wrapping oddly */
+/* Only a real fingerprint gets the plate. A placeholder wearing it reads as a
+   value worth comparing, which is the one thing this screen must not suggest. */
+#fingerprint:not([data-live="1"]) {
+  padding: 0;
+  font-size: 13px;
+  font-weight: 400;
+  letter-spacing: normal;
+  color: var(--dim);
+  background: none;
+  border: 0;
+  box-shadow: none;
+}
+
 #fingerprint {
   display: inline-block;
   margin-top: 4px;
@@ -803,3 +816,24 @@ main > .muted:last-child {
 }
 .theme::before, .theme::after { content: none; }
 .theme:hover { color: var(--text); border-color: var(--accent); filter: none; box-shadow: none; }
+
+/* ── invite deadline ──────────────────────────────────────────────────────── */
+
+.deadline {
+  margin-top: 6px !important;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--warn-text);
+}
+.deadline.over { color: var(--danger-text); font-weight: 600; }
+
+label small {
+  display: block;
+  margin-top: 6px;
+  font-family: Geist, sans-serif;
+  font-size: 10.5px;
+  font-weight: 400;
+  letter-spacing: .02em;
+  text-transform: none;
+  color: var(--faint);
+}

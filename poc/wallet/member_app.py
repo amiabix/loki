@@ -239,6 +239,11 @@ class Wallet:
                  "fingerprint": roster["fingerprint"], "error": self.setup_error}
         if local["slot"] == 1 and (self.data / "invites.json").exists():
             state["invites"] = read_json(self.data / "invites.json")
+            # join() refuses an expired draft, so the deadline is real and the
+            # member handing the codes out is the one who needs to see it
+            draft = self.exchange_vault(local["vault"]) / "draft.json"
+            if draft.exists():
+                state["invites_expire_at"] = int(read_json(draft)["expires_at"])
         if roster["fingerprint"]:
             state["phase"] = "compare_roster"
         if (self.data / "secrets" / "vault.sealed").exists():

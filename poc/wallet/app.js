@@ -124,6 +124,29 @@ function steps(phase) {
   }
 }
 
+/* ── invite deadline ────────────────────────────────────────────────────────
+   join() refuses a draft past its expiry, so a code that looks fine can be
+   dead. Report the real remaining time from the draft, not the sentence
+   "expires after 24 hours" that was true only at the moment of creation. */
+
+function remaining(secondsLeft) {
+  if (secondsLeft <= 0) return null;
+  const hours = Math.floor(secondsLeft / 3600);
+  const minutes = Math.floor((secondsLeft % 3600) / 60);
+  return hours ? `${hours}h ${minutes}m` : `${minutes}m`;
+}
+
+function drawDeadline(expiresAt) {
+  const line = $('deadline');
+  if (!expiresAt) { line.hidden = true; return; }
+  line.hidden = false;
+  const left = remaining(expiresAt - Math.floor(Date.now() / 1000));
+  line.classList.toggle('over', !left);
+  line.textContent = left
+    ? `These codes stop working in ${left}.`
+    : 'These codes have expired. Start a fresh vault to invite again.';
+}
+
 /* ── flip ───────────────────────────────────────────────────────────────────
    Characters scramble and settle left to right as a value lands. Used only on
    values that actually arrive — the roster fingerprint, the receive address,
@@ -181,12 +204,13 @@ async function refresh() {
     $('title').textContent = state.name || 'Your wallet';
     $('slot').textContent = state.slot ? `0${state.slot}` : '';
     $('slot').hidden = !state.slot;
-    $('subtitle').textContent = state.slot ? `Member ${state.slot} of 3 · threshold 2 · regtest` : 'Create or join a vault from this member’s own app.';
+    $('subtitle').textContent = state.slot ? `Member ${state.slot} of 3 · threshold 2 · ${state.network}` : 'Create or join a vault from this member’s own app.';
     if (state.invites) {
       $('invite2').textContent = state.invites[0];
       $('invite3').textContent = state.invites[1];
       /* the codes are only of use while someone still has to join */
       $('invites').hidden = state.phase !== 'waiting_for_members';
+      drawDeadline(state.invites_expire_at);
     }
     $('fingerprint').dataset.live = state.fingerprint ? '1' : '';
     if (state.phase === 'new') show('new');
