@@ -52,11 +52,16 @@
   display:none!important
 }
 
-body {
-  margin:0;
+/* The ground lives on html: body's own background would paint over the
+   negative-z-index texture below and hide it. */
+html {
   background-color:var(--bg);
   background-image:linear-gradient(var(--grid) 1px,transparent 1px),linear-gradient(90deg,var(--grid) 1px,transparent 1px);
   background-size:52px 52px
+}
+
+body {
+  margin:0
 }
 
 button,input {
@@ -1065,7 +1070,7 @@ body::before {
   content:"";
   position:fixed;
   inset:0;
-  z-index:900;
+  z-index:-2;
   pointer-events:none;
   background:
     repeating-linear-gradient(0deg,rgba(255,255,255,.016) 0 1px,transparent 1px 3px),
@@ -1076,7 +1081,7 @@ body::after {
   content:"";
   position:fixed;
   inset:10px;
-  z-index:901;
+  z-index:6;
   pointer-events:none;
   background-image:
     linear-gradient(var(--faint),var(--faint)),linear-gradient(var(--faint),var(--faint)),

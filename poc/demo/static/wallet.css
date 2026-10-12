@@ -47,16 +47,21 @@
 
 * { box-sizing: border-box; }
 
-body {
-  margin: 0;
-  background: var(--void);
-  color: var(--text);
-  font: 400 14.5px/1.6 var(--sans);
-  -webkit-font-smoothing: antialiased;
-  /* faint grid, so the ground is not a dead flat fill */
+/* The ground lives on html: body's own background would paint over the
+   negative-z-index texture below and hide it. */
+html {
+  background-color: var(--void);
   background-image: linear-gradient(#101d28 1px, transparent 1px),
                     linear-gradient(90deg, #101d28 1px, transparent 1px);
   background-size: 52px 52px;
+}
+
+body {
+  margin: 0;
+  color: var(--text);
+  font: 400 14.5px/1.6 var(--sans);
+  -webkit-font-smoothing: antialiased;
+
 }
 
 ::selection { background: var(--hot); color: #04110d; }
@@ -454,13 +459,13 @@ code {
 /* ── HUD layer ───────────────────────────────────────────────────────────────
    Same chrome as member.css: scanlines, corner brackets, notched labels. */
 body::before {
-  content: ""; position: fixed; inset: 0; z-index: 900; pointer-events: none;
+  content: ""; position: fixed; inset: 0; z-index: -2; pointer-events: none;
   background:
     repeating-linear-gradient(0deg, rgba(255,255,255,.016) 0 1px, transparent 1px 3px),
     radial-gradient(ellipse at 50% 42%, transparent 55%, rgba(0,0,0,.42) 100%);
 }
 body::after {
-  content: ""; position: fixed; inset: 10px; z-index: 901; pointer-events: none;
+  content: ""; position: fixed; inset: 10px; z-index: 6; pointer-events: none;
   background-image:
     linear-gradient(var(--faint),var(--faint)),linear-gradient(var(--faint),var(--faint)),
     linear-gradient(var(--faint),var(--faint)),linear-gradient(var(--faint),var(--faint)),
