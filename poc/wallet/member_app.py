@@ -45,6 +45,19 @@ def write_new(path, value, mode=0o600):
         os.fsync(out.fileno())
 
 
+def write_replace(path, value, mode=0o600):
+    """Write a file that may already exist, atomically. write_new refuses to
+    overwrite, which is right for material that must never be rewritten; a
+    member re-publishing their roster answer after a stopped round is not that."""
+    with tempfile.NamedTemporaryFile(mode="wb", dir=path.parent, prefix=".tmp-", delete=False) as out:
+        out.write(value)
+        out.flush()
+        os.fsync(out.fileno())
+        name = out.name
+    os.chmod(name, mode)
+    os.replace(name, path)
+
+
 def read_json(path):
     return json.loads(path.read_text())
 
@@ -452,6 +465,14 @@ class Wallet:
             raise ValueError("Your identity differs from the agreed roster")
         if vault in self.workers and self.workers[vault].is_alive():
             raise ValueError("Key creation is already running")
+        # Publish which fingerprint this app confirmed, so the other members can
+        # see who is ready and, more usefully, see immediately if someone is
+        # holding a different roster. The courier is untrusted, so this is a
+        # coordination signal and never evidence: a matching entry proves
+        # nothing, while a differing one is a reason to stop.
+        write_replace(self.exchange_vault(vault) / f"confirm-{local['slot']}.json",
+                      json.dumps({"slot": local["slot"], "fingerprint": fingerprint,
+                                  "at": int(time.time())}).encode())
         self.setup_errors.pop(vault, None)
         passphrase = self.passphrase
 
@@ -471,6 +492,27 @@ class Wallet:
         self.workers[vault] = threading.Thread(target=run, daemon=True)
         self.workers[vault].start()
         return {"started": True}
+
+    def confirmations(self, vault, fingerprint):
+        """What every member's app has published about the roster, compared with
+        ours. Read from the shared courier, so treat every entry as a claim."""
+        folder = self.exchange_vault(vault)
+        draft = read_json(folder / "draft.json")
+        total = int(draft.get("members", 3))
+        found = []
+        for slot in range(1, total + 1):
+            path = folder / f"confirm-{slot}.json"
+            if not path.exists():
+                found.append({"slot": slot, "confirmed": False, "matches": None, "at": None})
+                continue
+            try:
+                claim = read_json(path)
+            except (ValueError, OSError):
+                found.append({"slot": slot, "confirmed": False, "matches": False, "at": None})
+                continue
+            found.append({"slot": slot, "confirmed": True, "at": claim.get("at"),
+                          "matches": bool(fingerprint) and claim.get("fingerprint") == fingerprint})
+        return found
 
     def backup(self, vault):
         member_dir, _ = self.vault_dir(vault)
@@ -887,6 +929,11 @@ class Wallet:
             state["invites"] = read_json(member_dir / "invites.json")
         if roster["fingerprint"]:
             state["phase"] = "compare_roster"
+            # who else has published a roster answer, and whether it agrees
+            try:
+                state["confirmations"] = self.confirmations(vault, roster["fingerprint"])
+            except (OSError, ValueError):
+                state["confirmations"] = []
         if state["account_linked"]:
             try:
                 state["account_ak"] = self.account_link(vault)["account_ak"]

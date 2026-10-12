@@ -282,6 +282,36 @@ const steps = {
   active: ['', 'Receive and pay'],
   stopped: ['', 'Setup stopped'],
 };
+/* ── who has answered the roster ────────────────────────────────────────────
+   Read from the shared courier, so every row is a claim by that member's app
+   and not evidence. Agreement is a readiness signal; a disagreement is the
+   thing worth drawing in red, because it is the case a human must act on. */
+
+function rosterList(state) {
+  const list = $('roster-list');
+  list.replaceChildren();
+  for (const entry of state.confirmations || []) {
+    const row = document.createElement('div');
+    row.className = 'roster-row';
+    const who = document.createElement('strong');
+    who.textContent = entry.slot === state.slot ? `Member ${entry.slot} · you` : `Member ${entry.slot}`;
+    const said = document.createElement('span');
+    if (!entry.confirmed) {
+      row.classList.add('waiting');
+      said.textContent = 'has not confirmed yet';
+    } else if (entry.matches) {
+      row.classList.add('agreed');
+      said.textContent = 'confirmed the same fingerprint';
+    } else {
+      row.classList.add('differs');
+      said.textContent = 'confirmed a DIFFERENT fingerprint — stop and compare again';
+    }
+    row.append(who, said);
+    list.append(row);
+  }
+  list.hidden = !(state.confirmations || []).length;
+}
+
 async function refresh() {
   try {
     const state = await api('status' + (selectedVault ? `?vault=${encodeURIComponent(selectedVault)}` : ''));
@@ -321,6 +351,7 @@ async function refresh() {
         $('fingerprint').textContent = 'Available when all members join';
       } else if (state.phase === 'compare_roster' || state.phase === 'creating_keys') {
         $('setup').hidden = false;
+        rosterList(state);
         $('agree').hidden = state.phase === 'creating_keys';
         $('progress').textContent = state.phase === 'creating_keys' ? 'Creating group keys with the other member apps…' : 'All members joined.';
         $('fingerprint').textContent = state.fingerprint;

@@ -488,6 +488,40 @@ class MemberWalletTest(unittest.TestCase):
                     wallets[1].status(vault)
             roster_path.write_text(json.dumps(saved_roster))
 
+    def test_roster_confirmations_are_published_and_compared(self):
+        """Each app publishes the fingerprint it confirmed, and reads the others.
+
+        The courier is untrusted, so a matching entry is only a coordination
+        signal; the test that matters is that a DIFFERING entry is reported as
+        a mismatch rather than quietly passing as agreement."""
+        with tempfile.TemporaryDirectory(prefix="loki-confirm-") as temp:
+            root = Path(temp)
+            exchange = root / "exchange"
+            wallet = Wallet(root / "member", exchange)
+            self.addCleanup(wallet.close)
+            vault = "a" * 64
+            folder = exchange / vault
+            folder.mkdir(mode=0o700, parents=True)
+            (folder / "draft.json").write_text(json.dumps({"vault": vault, "members": 3}))
+
+            mine = "8f3a 21c7 d490 be65"
+            self.assertEqual(
+                [entry["confirmed"] for entry in wallet.confirmations(vault, mine)],
+                [False, False, False])
+
+            for slot, published in ((1, mine), (2, mine), (3, "0000 1111 2222 3333")):
+                (folder / f"confirm-{slot}.json").write_text(
+                    json.dumps({"slot": slot, "fingerprint": published, "at": 0}))
+
+            seen = wallet.confirmations(vault, mine)
+            self.assertEqual([entry["confirmed"] for entry in seen], [True, True, True])
+            self.assertEqual([entry["matches"] for entry in seen], [True, True, False])
+
+            # an unreadable claim is a mismatch, never a silent pass
+            (folder / "confirm-2.json").write_text("not json")
+            self.assertEqual(wallet.confirmations(vault, mine)[1],
+                             {"slot": 2, "confirmed": False, "matches": False, "at": None})
+
     def test_rejects_exchange_inside_private_root(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
