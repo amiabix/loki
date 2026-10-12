@@ -14,7 +14,7 @@
   <p id="message" role="status" hidden></p>
   <section id="connect" class="card"><h2>Connect Loki signer</h2><p>Your signer holds your vault shares. Approve this dashboard's access in the separate signer window. The dashboard can view vault status and request a new vault; each request needs its own signer approval.</p><button id="connect-button" type="button">Connect signer</button></section>
   <section id="vaults" class="card" hidden><h2 id="profile-name">Your vaults</h2><div id="vault-list"></div><p class="muted">Join a vault and finish setup in your signer window. Your dashboard will update after the signer records your membership.</p></section>
-  <section id="create-vault-card" class="card" hidden><h2>Create vault</h2><p>The signer will show the policy and ask for a separate approval before creating the draft.</p><form id="create-vault"><label>Vault name<input name="name" maxlength="80" required></label><label>Approvals required<select name="members"><option value="3">2 of 3 members</option><option value="4">2 of 4 members (setup only)</option></select></label><button>Create vault request</button></form></section>
+  <section id="create-vault-card" class="card" hidden><h2>Create vault</h2><p>The signer will show the policy and ask for a separate approval before creating the draft.</p><form id="create-vault"><label>Vault name<input name="name" maxlength="80" required></label><label>Approvals required<select name="members"><option value="3">2 of 3 members</option></select></label><button>Create vault request</button></form></section>
   <p class="muted">Regtest build. Payment review and approval happen in the private member app; this dashboard cannot sign or access backup material.</p>
 </main>
 </body>
