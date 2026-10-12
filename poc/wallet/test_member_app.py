@@ -74,6 +74,25 @@ class MemberWalletTest(unittest.TestCase):
                 Wallet(root / "member", root / "exchange")
             self.assertIsNotNone(first.process_lock)
 
+    def test_restart_during_key_creation_is_reported_not_reoffered(self):
+        """A round dies with its process; the next app must say so, not restart it."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            first = Wallet(root / "member", root / "exchange")
+            (first.data / "keygen.running").write_text("8f3a 21c7")
+            first.close()
+
+            second = Wallet(root / "member", root / "exchange")
+            self.addCleanup(second.close)
+            self.assertIn("interrupted", second.setup_error)
+            self.assertFalse((second.data / "keygen.running").exists())
+
+            # and the marker is cleared, so confirming the roster again can proceed
+            second.close()
+            third = Wallet(root / "member", root / "exchange")
+            self.addCleanup(third.close)
+            self.assertIsNone(third.setup_error)
+
 
 if __name__ == "__main__":
     unittest.main()

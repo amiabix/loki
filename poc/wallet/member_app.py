@@ -68,6 +68,14 @@ class Wallet:
         self.lock = threading.Lock()
         self.worker = None
         self.setup_error = None
+        # A key creation round lives in a thread, so it dies with the process. The
+        # marker outlives it: finding one here means the previous app was inside a
+        # round when it stopped. Report that rather than let the UI re-offer the
+        # start, because the other members may still be waiting inside that round.
+        self.keygen_mark = self.data / "keygen.running"
+        if self.keygen_mark.exists():
+            self.setup_error = "Key creation was interrupted when this app restarted"
+            self.keygen_mark.unlink()
 
     def command(self, action, *args, passphrase=None, timeout=30):
         if not self.setup.is_file():
@@ -179,6 +187,7 @@ class Wallet:
         if self.worker and self.worker.is_alive():
             raise ValueError("Key creation is already running")
         self.setup_error = None
+        self.keygen_mark.write_text(fingerprint)
 
         def run():
             try:
@@ -187,6 +196,8 @@ class Wallet:
                              passphrase=passphrase, timeout=600)
             except Exception as error:
                 self.setup_error = str(error)
+            finally:
+                self.keygen_mark.unlink(missing_ok=True)
 
         self.worker = threading.Thread(target=run, daemon=True)
         self.worker.start()
