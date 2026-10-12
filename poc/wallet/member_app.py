@@ -508,6 +508,58 @@ class Wallet:
             write_new(marker, b"checked\n")
         return {"verified": True}
 
+    def restore_vault(self, name, words, card_bytes):
+        profile = self.require_profile()
+        if not isinstance(name, str) or not 1 <= len(name.strip().encode()) <= 80:
+            raise ValueError("Enter a vault name of 1 to 80 UTF-8 bytes")
+        if not isinstance(words, str) or not isinstance(card_bytes, str):
+            raise ValueError("Enter your 24 words and load your final recovery card")
+        raw = base64.b64decode(card_bytes, validate=True)
+        if len(raw) > 64 * 1024 or not raw.startswith(b"LOKISEAL\x01"):
+            raise ValueError("Invalid final recovery card")
+        vaults = self.data / "vaults"
+        vaults.mkdir(mode=0o700, exist_ok=True)
+        restored = Path(tempfile.mkdtemp(prefix=".restore-", dir=vaults))
+        try:
+            with tempfile.TemporaryDirectory(prefix=".input-", dir=restored) as input_dir:
+                input_dir = Path(input_dir)
+                card = input_dir / "card"
+                card.mkdir(mode=0o700)
+                write_new(card / "vault.card", raw)
+                words_file = input_dir / "words"
+                write_new(words_file, words.encode())
+                restored_address = self.command("restore", restored, "@pass", card, words_file)
+            if not (restored / "roster.json").is_file() or not (restored / "secrets" / "activation.sealed").is_file():
+                raise ValueError("Use the final recovery card; the first card cannot restore an active vault")
+            roster = read_json(restored / "roster.json")
+            vault = roster.get("vault")
+            self.exchange_vault(vault)
+            own = json.loads(self.command("identity-public", restored, "@pass"))
+            members = roster.get("members")
+            if not isinstance(members, list) or own not in members:
+                raise ValueError("Restored identity is not in the certified roster")
+            address = self.command("address", restored, "@pass")
+            if address != restored_address:
+                raise ValueError("Restored address differs from the recovery card")
+            self.command("validate-roster", restored, "@pass", restored / "roster.json")
+            destination = vaults / vault
+            if destination.exists():
+                raise ValueError("This profile already has a membership for this vault")
+            final_card = restored / "final-card"
+            final_card.mkdir(mode=0o700)
+            write_new(final_card / "vault.card", raw)
+            write_new(restored / "final-backup-checked", b"checked\n")
+            write_new(restored / "membership.json", json.dumps({
+                "vault": vault, "slot": own["id"], "name": name.strip(),
+                "profile": profile["id"], "threshold": roster["threshold"],
+                "members": len(members),
+            }).encode())
+            os.rename(restored, destination)
+            return {"vault": vault, "slot": own["id"], "address": address}
+        finally:
+            if restored.exists():
+                shutil.rmtree(restored)
+
     def address(self, vault):
         member_dir, _ = self.vault_dir(vault)
         if not (member_dir / "final-backup-checked").is_file():
@@ -783,6 +835,8 @@ def make_signer_server(wallet, port, dashboard_port=None):
                         "/api/finalize-backup": lambda: wallet.finalize_backup(value.get("vault"), value.get("words")),
                         "/api/verify-final-backup": lambda: wallet.verify_final_backup(
                             value.get("vault"), value.get("words"), value.get("card")),
+                        "/api/restore-vault": lambda: wallet.restore_vault(
+                            value.get("name"), value.get("words"), value.get("card")),
                         "/api/address": lambda: {"address": wallet.address(value.get("vault"))},
                         "/api/balance": lambda: wallet.balance(value.get("vault")),
                         "/api/payment-draft": lambda: wallet.prepare_payment(

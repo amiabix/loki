@@ -67,6 +67,13 @@ back to check them. The receive address appears after all members' backup checks
 If the page closes before that check, **Show backup words** returns the same
 words and card after unlock. The temporary sealed word copy is removed when
 the member checks the saved artifacts.
+On a new device, create and unlock a local profile, then use **Restore your
+membership** with that member's final recovery card and 24 words. The app asks
+the Rust restore command to verify the card's roster and signed backup checks,
+then saves that member's signing material and the shared viewing secret under the new profile. It rejects
+the earlier first card, restores the same receive address, and needs neither
+the setup courier nor a relay. The old device remains capable of signing;
+restoring is not revocation.
 An active vault can scan the regtest chain for its unspent balance at a named
 block height. Set `LOKI_RPC=host:port` when starting each app if the local node
 is not on the default `127.0.0.1:18232`; the app does not fund or mine blocks.

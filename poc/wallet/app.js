@@ -34,6 +34,12 @@ async function api(path, body) {
   return result;
 }
 function fields(form) { return Object.fromEntries(new FormData(form)); }
+async function cardBase64(file) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  if (bytes.length > 65536) throw new Error('Backup card is too large');
+  let raw = ''; for (const byte of bytes) raw += String.fromCharCode(byte);
+  return btoa(raw);
+}
 function action(id, task) {
   $(id).addEventListener('submit', async (event) => {
     event.preventDefault();
@@ -185,6 +191,13 @@ action('join', async (form) => {
   selectVault(value.vault);
   message('Joined. Waiting for the other members.');
 });
+action('restore-vault', async (form) => {
+  const value = fields(form);
+  const result = await api('restore-vault', {name: value.name, words: value.words,
+                                           card: await cardBase64(value.card)});
+  selectVault(result.vault);
+  message(`Restored member ${result.slot}. Check your vault address before receiving funds.`);
+});
 function challengeDownload() {
   const link = document.createElement('a');
   link.href = URL.createObjectURL(new Blob([JSON.stringify(linkChallenge)], {type: 'application/json'}));
@@ -229,10 +242,7 @@ $('download').addEventListener('click', () => downloadCard('card', 'loki-provisi
 $('download-final').addEventListener('click', () => downloadCard('final-card', 'loki-vault.card'));
 action('check-backup', async (form) => {
   const value = fields(form);
-  const bytes = new Uint8Array(await value.card.arrayBuffer());
-  if (bytes.length > 65536) throw new Error('Backup card is too large');
-  let raw = ''; for (const byte of bytes) raw += String.fromCharCode(byte);
-  await api('verify', {vault: selectedVault, words: value.words, card: btoa(raw)});
+  await api('verify', {vault: selectedVault, words: value.words, card: await cardBase64(value.card)});
   $('words').textContent = '';
   $('backup-made').hidden = true;
   message('Your first card checked. Waiting for the other members before you save the final card.');
@@ -248,10 +258,8 @@ action('make-final-backup', async (form) => {
 });
 action('check-final-backup', async (form) => {
   const value = fields(form);
-  const bytes = new Uint8Array(await value.card.arrayBuffer());
-  if (bytes.length > 65536) throw new Error('Final backup card is too large');
-  let raw = ''; for (const byte of bytes) raw += String.fromCharCode(byte);
-  await api('verify-final-backup', {vault: selectedVault, words: value.words, card: btoa(raw)});
+  await api('verify-final-backup', {vault: selectedVault, words: value.words,
+                                   card: await cardBase64(value.card)});
   message('Your final card checked. Ask every member to do the same before depositing.');
 });
 action('show-address', async () => {

@@ -195,6 +195,31 @@ class MemberWalletTest(unittest.TestCase):
             addresses = [wallet.address(vault) for wallet in wallets]
             self.assertEqual(len(set(addresses)), 1)
             self.assertTrue(addresses[0].startswith("uregtest1"))
+            saved_final = (wallets[0].data / "vaults" / vault / "final-card" / "vault.card").read_bytes()
+            recovered = Wallet(root / "recovered-member", root / "empty-exchange")
+            self.addCleanup(recovered.close)
+            recovered.create_profile("Recovered member", "new device passphrase for test")
+            with self.assertRaises(ValueError):
+                recovered.restore_vault("Recovered treasury", saved_words[0],
+                                        base64.b64encode((wallets[0].data / "vaults" / vault /
+                                                          "card" / "vault.card").read_bytes()).decode())
+            self.assertEqual(recovered.vaults(), [])
+            damaged = bytearray(saved_final)
+            damaged[-1] ^= 1
+            with self.assertRaises(ValueError):
+                recovered.restore_vault("Recovered treasury", saved_words[0],
+                                        base64.b64encode(damaged).decode())
+            self.assertEqual(recovered.vaults(), [])
+            result = recovered.restore_vault("Recovered treasury", saved_words[0],
+                                             base64.b64encode(saved_final).decode())
+            self.assertEqual(result, {"vault": vault, "slot": 1, "address": addresses[0]})
+            self.assertEqual(recovered.status(vault)["phase"], "active")
+            self.assertEqual(recovered.address(vault), addresses[0])
+            self.assertEqual((recovered.data / "vaults" / vault / "final-card" / "vault.card").read_bytes(),
+                             saved_final)
+            with self.assertRaisesRegex(ValueError, "already has a membership"):
+                recovered.restore_vault("Duplicate", saved_words[0], base64.b64encode(saved_final).decode())
+            self.assertEqual(len(recovered.vaults()), 1)
             sealed = (wallets[0].data / "vaults" / vault / "secrets" / "vault.sealed").read_bytes()
             seed = root / "wallet-seed.txt"
             seed.write_text("abandon " * 23 + "art")
