@@ -630,7 +630,7 @@ button:hover:not(:disabled) {
 button:active:not(:disabled) { transform: translateY(1px); }
 button:disabled { opacity: .4; cursor: not-allowed; }
 
-button.secondary, #download, #download-final, #download-challenge,
+button.secondary, #download-final, #download-challenge,
 #refresh-balance, #refresh-payments {
   color: var(--text);
   background: linear-gradient(180deg, var(--raised-hi), var(--raised));

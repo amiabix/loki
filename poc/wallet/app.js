@@ -537,7 +537,7 @@ const steps = {
   waiting_for_members: ['Setup · step 2 of 6', 'Waiting for the other members'],
   compare_roster: ['Setup · step 3 of 6', 'Compare the roster fingerprint'],
   creating_keys: ['Setup · step 4 of 6', 'Creating the group keys'],
-  back_up: ['Setup · step 5 of 6', 'Save your words and first card'],
+  back_up: ['Setup · step 5 of 6', 'Write down your recovery words'],
   waiting_for_backups: ['Setup · step 5 of 6', 'Waiting for the other members to check their cards'],
   final_backup: ['Setup · step 6 of 6', 'Save your final recovery card'],
   active: ['', 'Receive and pay'],
@@ -695,7 +695,7 @@ action('make-backup', async () => {
   const result = await api('backup', {vault: selectedVault});
   $('words').textContent = result.words;
   $('backup-made').hidden = false;
-  message('Save the words and first card separately, then load the card back below. A final card follows after the group checks its backups.');
+  message('Write down these words, then enter them below to check your copy. The final recovery card follows after the other members finish.');
 });
 async function downloadCard(path, filename) {
   try {
@@ -708,14 +708,13 @@ async function downloadCard(path, filename) {
     setTimeout(() => URL.revokeObjectURL(link.href), 1000);
   } catch (error) { message(error.message, true); }
 }
-$('download').addEventListener('click', () => downloadCard('card', 'loki-provisional.card'));
 $('download-final').addEventListener('click', () => downloadCard('final-card', 'loki-vault.card'));
 action('check-backup', async (form) => {
   const value = fields(form);
-  await api('verify', {vault: selectedVault, words: value.words, card: await cardBase64(value.card)});
+  await api('verify', {vault: selectedVault, words: value.words});
   $('words').textContent = '';
   $('backup-made').hidden = true;
-  message('Your first card checked. Waiting for the other members before you save the final card.');
+  message('Your words match this vault. Waiting for the other members before you save the final card.');
 });
 action('activate', async () => {
   await api('activate', {vault: selectedVault});

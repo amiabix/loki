@@ -838,11 +838,16 @@ class Wallet:
         words = self.command("backup-create", member_dir, "@pass", card)
         return {"words": words}
 
-    def verify(self, vault, words, card_bytes):
+    def verify(self, vault, words, card_bytes=None):
         member_dir, _ = self.vault_dir(vault)
-        if not isinstance(words, str) or not isinstance(card_bytes, str):
-            raise ValueError("Load the words and saved card")
-        raw = base64.b64decode(card_bytes, validate=True)
+        if not isinstance(words, str):
+            raise ValueError("Enter the 24 words you wrote down")
+        if card_bytes is None:
+            raw = (member_dir / "card" / "vault.card").read_bytes()
+        else:
+            if not isinstance(card_bytes, str):
+                raise ValueError("Invalid backup card")
+            raw = base64.b64decode(card_bytes, validate=True)
         if len(raw) > 64 * 1024 or not raw.startswith(b"LOKISEAL\x01"):
             raise ValueError("Invalid backup card")
         with tempfile.TemporaryDirectory(prefix=".check-", dir=member_dir) as temp:

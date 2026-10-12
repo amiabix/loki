@@ -493,12 +493,17 @@ class MemberWalletTest(unittest.TestCase):
                 self.assertEqual(wallet.status(vault)["phase"], "back_up")
 
             saved_words = []
-            for wallet in wallets:
+            for index, wallet in enumerate(wallets):
                 words = wallet.backup(vault)["words"]
                 saved_words.append(words)
                 card = (wallet.data / "vaults" / vault / "card" / "vault.card").read_bytes()
-                self.assertEqual(wallet.verify(vault, words, base64.b64encode(card).decode()),
-                                 {"verified": True})
+                if index == 0:
+                    with self.assertRaises(ValueError):
+                        wallet.verify(vault, "wrong words")
+                    self.assertEqual(wallet.verify(vault, words), {"verified": True})
+                else:
+                    self.assertEqual(wallet.verify(vault, words, base64.b64encode(card).decode()),
+                                     {"verified": True})
             for wallet in wallets:
                 wallet.activate(vault)
                 self.assertEqual(wallet.status(vault)["phase"], "final_backup")

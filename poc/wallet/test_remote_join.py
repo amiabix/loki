@@ -373,8 +373,7 @@ class RemoteJoinTest(unittest.TestCase):
         for app in apps:
             words = app.api("backup", {"vault": vault})["words"]
             saved.append(words)
-            card = app.api(f"card?vault={vault}")["card"]
-            self.assertEqual(app.api("verify", {"vault": vault, "words": words, "card": card}),
+            self.assertEqual(app.api("verify", {"vault": vault, "words": words}),
                              {"verified": True})
         for app in apps:
             # every member's signed backup check has to arrive over the courier

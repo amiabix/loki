@@ -62,12 +62,13 @@ identity and sealed FROST share under `vaults/<vault-id>/`. The creator copies e
 the intended member. Each joiner pastes their own code. All members compare the
 roster fingerprint through a trusted channel and confirm it. They must start
 key creation within the setup CLI's two-minute wait per round. Each member
-downloads their backup card, records their 24 words separately, and loads both
-back to check them. The receive address appears after all members' backup checks.
-If the page closes before that check, **Show backup words** returns the same
-words and card after unlock. The temporary word copy stays sealed under the
-member's unlock passphrase until the final card is generated, then is removed.
-The final card still has to be checked using the words the member kept.
+records their 24 words and enters them to check the app's local provisional
+card. Once every member has checked their words, each app creates a final
+recovery card. The member downloads that card and loads the saved file with
+their words to check it. Only then does their app show the receive address.
+If the page closes during setup, **Show 24 words** returns the same words after
+unlock. The temporary word copy stays sealed under the member's unlock
+passphrase until the final card is generated, then is removed.
 
 ## Inviting a member whose app is not on this filesystem
 
@@ -119,7 +120,7 @@ On a new device, create and unlock a local profile, then use **Restore your
 membership** with that member's final recovery card and 24 words. The app asks
 the Rust restore command to verify the card's roster and signed backup checks,
 then saves that member's signing material and the shared viewing secret under the new profile. It rejects
-the earlier first card, restores the same receive address, and needs neither
+the internal provisional card, restores the same receive address, and needs neither
 the setup courier nor a relay. The old device remains capable of signing;
 restoring is not revocation.
 An active vault can scan the regtest chain for its unspent balance at a named
