@@ -28,6 +28,29 @@ function message(text, error = false) {
   $('message').hidden = !text;
   $('message').classList.toggle('error', error);
 }
+
+/* A failure belongs beside the control that caused it. The server tags each one
+   with the route that raised it, so an unlock that fails lands on the unlock
+   form and never reads as though the step on screen went wrong. Anything with
+   no slot of its own still falls back to the page-level line. */
+function clearFailures() {
+  for (const slot of document.querySelectorAll('.form-error')) {
+    slot.hidden = true;
+    slot.textContent = '';
+  }
+}
+
+function failure(error) {
+  clearFailures();
+  const slot = error.surface && document.getElementById(`fail-${error.surface}`);
+  if (!slot) { message(error.message, true); return; }
+  message('');
+  slot.hidden = false;
+  slot.textContent = error.retry
+    ? `${error.message} Nothing was changed — you can try again.`
+    : error.message;
+  slot.closest('form')?.querySelector('input, textarea, select')?.focus();
+}
 async function api(path, body) {
   if (!token) throw new Error('Open the private local app link printed by the server.');
   const response = await fetch(`/api/${path}`, {
@@ -37,7 +60,12 @@ async function api(path, body) {
     cache: 'no-store',
   });
   const result = await response.json();
-  if (!response.ok) throw new Error(result.error || 'Request failed');
+  if (!response.ok) {
+    const failure = new Error(result.error || 'Request failed');
+    failure.surface = result.surface || '';   /* which action raised it */
+    failure.retry = !!result.retry;           /* nothing is known to have failed */
+    throw failure;
+  }
   return result;
 }
 function fields(form) { return Object.fromEntries(new FormData(form)); }
@@ -52,8 +80,9 @@ function action(id, task) {
     event.preventDefault();
     const button = event.target.querySelector('button');
     button.disabled = true;
+    clearFailures();
     try { await task(event.target); event.target.reset(); await refresh(); }
-    catch (error) { message(error.message, true); }
+    catch (error) { failure(error); }
     finally { button.disabled = false; }
   });
 }

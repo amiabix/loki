@@ -49,6 +49,11 @@ def read_json(path):
     return json.loads(path.read_text())
 
 
+class Timeout(ValueError):
+    """A helper binary ran past its deadline. Distinct from a refusal: nothing
+    is known to have failed, so the next action is to retry, not to repair."""
+
+
 def check_passphrase(value):
     if not isinstance(value, str) or len(value) < 12 or len(value) > 1024:
         raise ValueError("Use a passphrase of at least 12 characters")
@@ -238,7 +243,10 @@ class Wallet:
                     argv.append(name)
                 else:
                     argv.append(str(arg))
-            result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+            try:
+                result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+            except subprocess.TimeoutExpired as error:
+                raise Timeout(f"{action} did not finish within {timeout} seconds") from error
             if result.returncode:
                 raise ValueError(result.stderr.strip() or result.stdout.strip() or f"{action} failed")
             return result.stdout.strip()
@@ -259,7 +267,17 @@ class Wallet:
 
     def unlock(self, passphrase):
         check_passphrase(passphrase)
-        profile = json.loads(self.command("profile-open", self.data, "@pass", passphrase=passphrase))
+        try:
+            profile = json.loads(self.command("profile-open", self.data, "@pass", passphrase=passphrase))
+        except Timeout:
+            raise
+        except ValueError as error:
+            # The binary reports "sealed file failed authentication", which is
+            # accurate and unreadable, and names both causes without saying
+            # which. Keep both causes, in words, on the form that can retry.
+            raise ValueError("Could not open your profile with that passphrase. If you are "
+                             "certain it is right, the profile file on this device may have "
+                             "been changed.") from error
         self.passphrase, self.profile_data = passphrase, profile
         return {"profile": profile}
 
@@ -442,6 +460,11 @@ class Wallet:
                 self.command("run", member_dir, "@pass", member_dir / "roster.json",
                              self.exchange_vault(vault), fingerprint, passphrase=passphrase,
                              timeout=600)
+            except Timeout:
+                self.setup_errors[vault] = (
+                    "Key creation ran out of time. Every member has to be on this step at "
+                    "the same time. Ask the others to open their app and reach this step, "
+                    "then confirm the roster again to start a fresh round.")
             except Exception as error:
                 self.setup_errors[vault] = str(error)
 
@@ -1099,7 +1122,9 @@ def make_signer_server(wallet, port, dashboard_port=None):
                         sessions.clear()
                     self.reply(200, result)
             except Exception as error:
-                self.reply(400, {"error": str(error)})
+                surface = self.path.rsplit("/", 1)[-1] if self.path.startswith("/api/") else ""
+                self.reply(400, {"error": str(error), "surface": surface,
+                                 "retry": isinstance(error, Timeout)})
 
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     return server, token

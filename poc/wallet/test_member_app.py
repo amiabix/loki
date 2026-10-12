@@ -356,7 +356,9 @@ class MemberWalletTest(unittest.TestCase):
                 wallets[0].agree(vault, "0" * 64)
             wallets[0].lock_profile()
             self.assertEqual(wallets[0].status()["phase"], "locked")
-            with self.assertRaisesRegex(ValueError, "failed authentication"):
+            # the wording is part of the interface now: it is what the unlock
+            # form shows, so assert on that rather than on the binary's stderr
+            with self.assertRaisesRegex(ValueError, "Could not open your profile"):
                 wallets[0].unlock("wrong passphrase for this vault")
             self.assertEqual(wallets[0].unlock(passwords[0])["profile"], profiles[0])
             self.assertEqual(wallets[0].status(vault)["phase"], "compare_roster")

@@ -920,3 +920,15 @@ main > .muted:last-child {
     animation: none;
   }
 }
+
+/* ── failure beside the control ───────────────────────────────────────────── */
+
+.form-error {
+  margin: 12px 0 0;
+  padding: 10px 14px;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--danger-text);
+  background: var(--danger-wash);
+  border-left: 2px solid var(--danger);
+}
