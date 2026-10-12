@@ -254,6 +254,127 @@ class MemberWalletTest(unittest.TestCase):
                     alice.review_payment(vault, attempt)
                 self.assertEqual(command.call_count, 1)
 
+    def payment_fixture(self, temp, slot=1, phase="published", pair=(1, 2), txid=None):
+        vault, attempt = "a" * 64, "b" * 64
+        wallet = Wallet(Path(temp) / f"member-{slot}", Path(temp) / "exchange")
+        self.addCleanup(wallet.close)
+        wallet.profile_data = {"id": f"member-{slot}"}
+        wallet.passphrase = f"member {slot} long test passphrase"
+        member = wallet.data / "vaults" / vault
+        work = member / "payments" / attempt
+        (work / "mailbox").mkdir(parents=True)
+        (member / "membership.json").write_text(json.dumps({
+            "vault": vault, "profile": f"member-{slot}", "slot": slot,
+            "threshold": 2, "members": 3}))
+        (member / "roster.json").write_text("{}")
+        (member / "final-backup-checked").write_text("checked")
+        (work / "payment.json").write_text(json.dumps({
+            "vault": vault, "attempt": attempt, "payment": "e" * 64,
+            "pair": list(pair), "expiry_height": 9216}))
+        if phase:
+            wallet.payment_status(work, phase, txid)
+        return wallet, vault, attempt
+
+    def test_payment_advance_runs_mechanical_steps_once_and_never_approves(self):
+        with tempfile.TemporaryDirectory(prefix="loki-advance-") as temp:
+            wallet, vault, attempt = self.payment_fixture(temp, phase="published")
+            calls = []
+
+            def command(action, *_args, **_kwargs):
+                calls.append(action)
+                if action == "features": return "relay-backed-signing=1"
+                if action == "balance": return json.dumps({"vault": vault, "height": 100})
+                return "ok"
+
+            with patch.object(wallet, "command", side_effect=command):
+                self.assertEqual(wallet.advance_payment(vault, attempt),
+                                 {"phase": "package", "did": ["commit", "package"]})
+                self.assertEqual(wallet.advance_payment(vault, attempt),
+                                 {"phase": "package", "did": []})
+                report = wallet.payments(vault)
+            self.assertEqual(report["payments"][0]["phase"], "package")
+            self.assertEqual(report["readiness"], {
+                "relay_ready": True, "relay_detail": "Ready to reach the other members.",
+                "scan_height": 100})
+            self.assertEqual(calls.count("commit"), 1)
+            self.assertEqual(calls.count("package"), 1)
+            for decision in ("review", "approve", "approve-reviewed"):
+                self.assertNotIn(decision, calls)
+
+    def test_payment_advance_returns_while_waiting_and_raises_on_failure(self):
+        with tempfile.TemporaryDirectory(prefix="loki-advance-wait-") as temp:
+            wallet, vault, attempt = self.payment_fixture(temp, phase="commitments")
+
+            def command(action, *_args, **_kwargs):
+                if action == "features": return "relay-backed-signing=1"
+                if action == "package":
+                    raise ValueError("waiting for member 2 Commitment; sync relay inbox and retry")
+                return "ok"
+
+            with patch.object(wallet, "command", side_effect=command):
+                self.assertEqual(wallet.advance_payment(vault, attempt),
+                                 {"phase": "commitments", "did": []})
+            self.assertTrue(wallet.relay_payment_ready)
+            with patch.object(wallet, "command", side_effect=ValueError("package refused")):
+                with self.assertRaisesRegex(ValueError, "package refused"):
+                    wallet.advance_payment(vault, attempt)
+
+    def test_payment_advance_does_nothing_without_a_possible_step(self):
+        with tempfile.TemporaryDirectory(prefix="loki-advance-idle-") as temp:
+            awaiting, vault, attempt = self.payment_fixture(temp, slot=1, phase="package")
+            with patch.object(awaiting, "command") as command:
+                self.assertEqual(awaiting.advance_payment(vault, attempt),
+                                 {"phase": "package", "did": []})
+                self.assertEqual(command.call_count, 0)
+            outsider, vault, attempt = self.payment_fixture(temp, slot=3, phase=None)
+            with patch.object(outsider, "command") as command:
+                self.assertEqual(outsider.advance_payment(vault, attempt),
+                                 {"phase": "received", "did": []})
+                self.assertEqual(command.call_count, 0)
+
+    def test_payment_advance_verifies_with_the_recorded_txid(self):
+        with tempfile.TemporaryDirectory(prefix="loki-advance-verify-") as temp:
+            txid = "e" * 64
+            wallet, vault, attempt = self.payment_fixture(temp, phase="broadcast", txid=txid)
+            seen = []
+
+            def command(action, *args, **_kwargs):
+                if action == "features": return "relay-backed-signing=1"
+                if action == "verify":
+                    seen.append(args[-1])
+                    return f"verified mined txid={txid} confirmations=3 amount=40000000"
+                return "ok"
+
+            with patch.object(wallet, "command", side_effect=command):
+                self.assertEqual(wallet.advance_payment(vault, attempt),
+                                 {"phase": "confirmed", "did": ["verify"]})
+                self.assertEqual(wallet.verify_payment(vault, attempt)["txid"], txid)
+                self.assertEqual(wallet.verify_payment(vault, attempt, txid)["txid"], txid)
+            self.assertEqual(seen, [txid, txid, txid])
+
+    def test_payment_pair_defaults_to_one_holding_this_member(self):
+        with tempfile.TemporaryDirectory(prefix="loki-default-pair-") as temp:
+            for slot, expected in ((1, "AB"), (2, "AB"), (3, "AC")):
+                wallet, vault, _ = self.payment_fixture(temp, slot=slot, phase=None)
+                chosen = []
+
+                def prepare(_action, _member, _pass, _roster, work, _recipient, amount, memo, pair,
+                            **_kwargs):
+                    (work / "payment.json").write_text(json.dumps({
+                        "vault": vault, "payment": "b" * 64, "attempt": format(len(chosen), "064x"),
+                        "amount_zat": int(amount), "fee_zat": 10000, "change_zat": 59990000,
+                        "expiry_height": 9216,
+                        "pair": [ord(letter) - ord("A") + 1 for letter in pair]}))
+                    chosen.append(pair)
+                    return "payment created"
+
+                with patch.object(wallet, "command", side_effect=prepare):
+                    draft = wallet.prepare_payment(vault, "uregtest1recipient", "40000000", "memo")
+                    self.assertEqual(chosen, [expected])
+                    self.assertIn(slot, draft["pair"])
+                    wallet.prepare_payment(vault, "uregtest1recipient", "40000000", "memo", "BC")
+                self.assertEqual(chosen, [expected, "BC"])
+
     def test_four_member_vault_reaches_one_address_after_every_backup(self):
         if not SETUP.is_file():
             self.skipTest("build setup binary first")

@@ -28,6 +28,10 @@ PAYMENT = HERE.parent / "target" / "debug" / "loki_member_payment"
 RELAY = HERE.parent / "target" / "debug" / "loki_relay_member"
 SEED_WALLET = HERE.parent / "target" / "debug" / "loki_seed_wallet"
 
+# A peer's message that has not arrived yet, or a broadcast the node has not mined
+# yet, is a normal outcome of asking too early rather than a failure to report.
+PAYMENT_WAITING = re.compile(r"\bwaiting for member \d+\b|\btransaction is not mined\b")
+
 
 def encoded(value):
     return base64.urlsafe_b64encode(json.dumps(value, separators=(",", ":")).encode()).decode().rstrip("=")
@@ -239,6 +243,7 @@ class Wallet:
         self.workers = {}
         self.setup_errors = {}
         self.relay_payment_ready = False
+        self.scan_height = {}
 
     def command(self, action, *args, passphrase=None, timeout=30, binary=None):
         binary = binary or self.setup
@@ -643,9 +648,10 @@ class Wallet:
                                          binary=PAYMENT, timeout=120))
         if result.get("vault") != vault:
             raise ValueError("Chain scan returned another vault")
+        self.scan_height[vault] = result.get("height")
         return result
 
-    def prepare_payment(self, vault, recipient, amount_zat, memo, pair):
+    def prepare_payment(self, vault, recipient, amount_zat, memo, pair=None):
         member_dir, local = self.vault_dir(vault)
         if not (member_dir / "final-backup-checked").is_file():
             raise ValueError("Vault is not active")
@@ -659,6 +665,10 @@ class Wallet:
         if not isinstance(memo, str) or not memo or len(memo.encode()) > 512:
             raise ValueError("Enter a memo of 1 to 512 bytes")
         pairs = ("AB", "AC", "BC")
+        if pair is None:
+            # The first pair that includes this member: no dropdown, same answer every time.
+            pair = next((item for item in pairs
+                         if chr(ord("A") + local["slot"] - 1) in item), None)
         if pair not in pairs:
             raise ValueError("Choose two members of this vault")
         drafts = member_dir / "payments"
@@ -716,8 +726,7 @@ class Wallet:
             if manifest.get("vault") != vault or not isinstance(attempt, str) \
                     or not re.fullmatch(r"[0-9a-f]{64}", attempt):
                 continue
-            state = path.parent / "payment-status.json"
-            status = read_json(state) if state.is_file() else {"phase": "received"}
+            status = self.payment_phase(path.parent)
             phase = status["phase"]
             if phase == "confirmed":
                 # shortcut: recheck each confirmed payment until the wallet has an indexed chain store.
@@ -731,7 +740,28 @@ class Wallet:
             items.append({"attempt": attempt, "payment": manifest.get("payment"),
                           "pair": manifest.get("pair"), "phase": phase,
                           **({"txid": status["txid"]} if status.get("txid") else {})})
-        return {"payments": items}
+        relay_ready, relay_detail = self.payment_readiness()
+        return {"payments": items,
+                "readiness": {"relay_ready": relay_ready, "relay_detail": relay_detail,
+                              "scan_height": self.scan_height.get(vault)}}
+
+    def payment_phase(self, work):
+        state = work / "payment-status.json"
+        return read_json(state) if state.is_file() else {"phase": "received"}
+
+    def payment_readiness(self):
+        """Whether this device can reach the other members for signing. The payment
+        tool answers it; a build without relay support cannot send or receive."""
+        ready = "Ready to reach the other members."
+        if self.relay_payment_ready:
+            return True, ready
+        try:
+            if self.command("features", binary=PAYMENT, timeout=5) != "relay-backed-signing=1":
+                return False, "This payment build cannot reach the other members."
+        except ValueError as error:
+            return False, str(error)
+        self.relay_payment_ready = True
+        return True, ready
 
     def payment_status(self, work, phase, txid=None):
         # shortcut: this file is UI progress only; custody state remains in the Rust signer and chain.
@@ -881,7 +911,9 @@ class Wallet:
         self.payment_status(work, "broadcast", txid.group(1))
         return {"phase": "broadcast", "txid": txid.group(1)}
 
-    def verify_payment(self, vault, attempt, txid):
+    def verify_payment(self, vault, attempt, txid=None):
+        if txid is None:
+            txid = self.payment_phase(self.payment(vault, attempt)[2]).get("txid")
         if not isinstance(txid, str) or not re.fullmatch(r"[0-9a-f]{64}", txid):
             raise ValueError("Enter the broadcast transaction ID")
         _, work, _, output = self.payment_command("verify", vault, attempt, txid, timeout=120)
@@ -890,6 +922,38 @@ class Wallet:
             raise ValueError("Chain verification did not confirm this payment")
         self.payment_status(work, "confirmed", txid)
         return {"phase": "confirmed", "txid": txid, "confirmations": int(match.group(2))}
+
+    def advance_payment(self, vault, attempt):
+        """Carry out every payment step that is possible now and needs no human
+        judgement, then report where the payment stands. Approving is never such a
+        step: it is this member's decision about the exact transaction bytes, so
+        neither approve_payment nor an accepted review is ever reached from here."""
+        _, local, work, manifest = self.payment(vault, attempt)
+        slot, pair, did = local["slot"], manifest["pair"], []
+        while True:
+            state = self.payment_phase(work)
+            phase = state["phase"]
+            if phase in ("published", "received") and slot in pair:
+                step, run = "commit", self.commit_payment
+            elif phase == "commitments" and slot == pair[0]:
+                step, run = "package", self.package_payment
+            elif phase == "approved":
+                step, run = "finish", self.finish_payment
+            elif phase in ("approval_pending_delivery", "approval_interrupted") and slot in pair:
+                step, run = "resend", self.resend_payment
+            elif phase in ("broadcast", "confirmation_needs_recheck") and state.get("txid"):
+                step, run = "verify", self.verify_payment
+            else:
+                return {"phase": phase, "did": did}
+            if step in did:
+                return {"phase": phase, "did": did}
+            try:
+                run(vault, attempt)
+            except ValueError as error:
+                if not PAYMENT_WAITING.search(str(error)):
+                    raise
+                return {"phase": phase, "did": did}
+            did.append(step)
 
     def status(self, vault=None):
         if not (self.data / "profile" / "profile.sealed").exists():
@@ -1161,6 +1225,8 @@ def make_signer_server(wallet, port, dashboard_port=None):
                             value.get("vault"), value.get("attempt")),
                         "/api/payment-verify": lambda: wallet.verify_payment(
                             value.get("vault"), value.get("attempt"), value.get("txid")),
+                        "/api/payment-advance": lambda: wallet.advance_payment(
+                            value.get("vault"), value.get("attempt")),
                     }
                     if self.path not in routes:
                         return self.reply(404, {"error": "Not found"})

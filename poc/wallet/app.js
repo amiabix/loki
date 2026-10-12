@@ -5,14 +5,22 @@ let selectedVault = null;
 let linkChallenge = null;
 let memberSlot = null;
 let renderedPaymentVault = null;
+let midFlight = [];
+let pumping = false;
+let pumpPaused = false;
+let paymentsLive = false;
 const paymentReviews = new Map();
+const paymentActivity = new Map();
 
 function selectVault(vault) {
   selectedVault = vault;
   linkChallenge = null;
   memberSlot = null;
   renderedPaymentVault = null;
+  midFlight = [];
+  pumpPaused = false;
   paymentReviews.clear();
+  paymentActivity.clear();
   $('address').textContent = 'Open this vault to view the address.';
   $('balance').textContent = "Scan this device's chain view to see the balance.";
   $('words').textContent = '';
@@ -20,6 +28,7 @@ function selectVault(vault) {
   $('download-final').hidden = true;
   $('draft-result').hidden = true;
   $('payment-draft').reset();
+  $('amount-zat').textContent = 'Up to 8 decimal places.';
   $('payment-list').replaceChildren();
 }
 
@@ -105,105 +114,210 @@ function vaultList(vaults) {
     list.append(button);
   }
 }
+/* ── one payment, five stages ───────────────────────────────────────────────
+   A member is told where the payment is, never which protocol call comes next.
+   Every mechanical step — publish, commit, package, finish, resend, the
+   on-chain check — is performed by payment-advance on a poll. Exactly two
+   controls remain, because exactly two things are human decisions: approving
+   an exact transaction that is on screen, and sending it. */
+
+const STAGES = [
+  ['Propose', 'the proposal reaches every member'],
+  ['Review', 'each signer checks the exact transaction'],
+  ['Approve', 'two members approve'],
+  ['Ready to send', 'the signed transaction goes to the network'],
+  ['Confirmed', 'mined on this device’s chain view'],
+];
+
+/* protocol phase → [stage, row state, what this member sees] */
+const PHASES = {
+  draft: [0, 'waiting', 'sending the proposal to the other members'],
+  queued_for_delivery: [0, 'waiting', 'sending the proposal to the other members'],
+  published: [1, 'waiting', 'waiting for the other members’ apps'],
+  received: [1, 'waiting', 'preparing your signing commitment'],
+  commitments: [1, 'waiting', 'building the exact transaction to check'],
+  package: [1, 'waiting', 'building the exact transaction to check'],
+  approval_pending_delivery: [2, 'waiting', 'delivering your approval'],
+  approval_interrupted: [2, 'differs', 'your saved approval could not be reopened — retrying it'],
+  approved: [3, 'agreed', 'approved by two members'],
+  broadcast: [4, 'waiting', 'sent — waiting for a confirmation'],
+  confirmation_needs_recheck: [4, 'waiting', 'checking this device’s chain view again'],
+  confirmed: [4, 'agreed', 'confirmed on chain'],
+};
+
+/* 'approved' waits for the member to press Send, 'confirmed' is done: those are
+   the two phases with no mechanical step left, so the poll leaves them alone. */
+const SETTLED = new Set(['approved', 'confirmed']);
+
+const ZAT = 100000000n;
+
+/* Money is parsed as a decimal string and converted with integers only. A
+   float would turn 0.1 ZEC into 9999999 or 10000001 zat. */
+function zatFromZec(text) {
+  const value = String(text ?? '').trim();
+  if (!/^[0-9]+(\.[0-9]{1,8})?$/.test(value)) {
+    const error = new Error('Enter an amount in ZEC — digits, and at most 8 decimal places.');
+    error.surface = 'payment-draft';
+    throw error;
+  }
+  const [whole, fraction = ''] = value.split('.');
+  const zat = BigInt(whole) * ZAT + BigInt((fraction + '00000000').slice(0, 8));
+  if (zat <= 0n) {
+    const error = new Error('Enter an amount greater than zero.');
+    error.surface = 'payment-draft';
+    throw error;
+  }
+  return zat.toString();
+}
+
+function zecFromZat(amount) {
+  const zat = BigInt(amount);
+  return `${zat / ZAT}.${(zat % ZAT).toString().padStart(8, '0')}`;
+}
+
+function amountEcho() {
+  const slot = $('amount-zat');
+  const raw = $('payment-draft').elements.amount_zec.value.trim();
+  if (!raw) { slot.textContent = 'Up to 8 decimal places.'; return; }
+  try { slot.textContent = `Sends exactly ${zatFromZec(raw)} zat.`; }
+  catch (error) { slot.textContent = error.message; }
+}
+
 function paymentButton(label, run) {
   const button = document.createElement('button');
   button.type = 'button';
   button.textContent = label;
   button.addEventListener('click', async () => {
     button.disabled = true;
+    button.classList.add('busy');
     try {
-      const result = await run();
-      message(result?.phase ? `Payment: ${result.phase.replaceAll('_', ' ')}.` : 'Payment updated.');
+      await run();
       await refreshPayments();
+      pumpPayments();
     } catch (error) { message(error.message, true); }
-    finally { button.disabled = false; }
+    finally { button.disabled = false; button.classList.remove('busy'); }
   });
   return button;
 }
+
+function stageList(current, state, detail) {
+  const list = document.createElement('div');
+  list.className = 'roster';
+  STAGES.forEach(([name, says], index) => {
+    const row = document.createElement('div');
+    row.className = 'roster-row';
+    const stage = document.createElement('strong');
+    stage.textContent = name;
+    const says_now = document.createElement('span');
+    if (index < current) { row.classList.add('agreed'); says_now.textContent = 'done'; }
+    else if (index === current) { row.classList.add(state); says_now.textContent = detail; }
+    else says_now.textContent = says;
+    row.append(stage, says_now);
+    list.append(row);
+  });
+  return list;
+}
+
+function note(text, className = 'muted') {
+  const line = document.createElement('p');
+  line.className = className;
+  line.textContent = text;
+  return line;
+}
+
 async function refreshPayments() {
   if (!selectedVault) return;
   const vault = selectedVault;
-  const {payments} = await api(`payments?vault=${encodeURIComponent(vault)}`);
+  const state = await api(`payments?vault=${encodeURIComponent(vault)}`);
   if (selectedVault !== vault) return;
   renderedPaymentVault = vault;
+  midFlight = [];
   const list = $('payment-list');
   list.replaceChildren();
-  if (!payments.length) { list.textContent = 'No payments in this member’s app.'; return; }
-  for (const payment of payments) {
+  if (!state.payments.length) { list.textContent = 'No payments in this member’s app.'; return; }
+  for (const payment of state.payments) {
+    if (!SETTLED.has(payment.phase)) midFlight.push(payment.attempt);
+    const isSigner = payment.pair.includes(memberSlot);
+    /* the exact transaction is fetched as soon as it can be read: checking it
+       is not a decision, so it is not a button */
+    if (isSigner && ['commitments', 'package'].includes(payment.phase)
+        && !paymentReviews.has(payment.attempt)) {
+      try {
+        paymentReviews.set(payment.attempt, await api('payment-review', {vault, attempt: payment.attempt}));
+      } catch { /* the package is not readable yet; the next pass tries again */ }
+      if (selectedVault !== vault) return;
+    }
+    const review = isSigner ? paymentReviews.get(payment.attempt) : null;
+    let [current, rowState, detail] =
+      PHASES[payment.phase] || [0, 'waiting', payment.phase.replaceAll('_', ' ')];
+    if (review && current === 1) [current, rowState, detail] = [2, 'waiting', 'your approval is the next step'];
+
     const card = document.createElement('section');
     card.className = 'card';
     const title = document.createElement('h3');
     title.textContent = `Payment ${payment.payment?.slice(0, 12) || payment.attempt.slice(0, 12)}…`;
-    const status = document.createElement('p');
-    status.textContent = `This device: ${payment.phase.replaceAll('_', ' ')} · selected signers: members ${payment.pair.join(' and ')}`;
-    card.append(title, status);
-    const request = (path, extra = {}) => api(path, {vault, attempt: payment.attempt, ...extra});
-    const isSigner = payment.pair.includes(memberSlot);
-    if (payment.phase === 'draft') card.append(paymentButton('Send proposal to members', () => request('payment-publish')));
-    if (isSigner && ['published', 'received'].includes(payment.phase)) {
-      card.append(paymentButton('Publish signing commitment', () => request('payment-commit')));
-    }
-    if (memberSlot === payment.pair[0] && payment.phase === 'commitments') {
-      card.append(paymentButton('Build transaction package', () => request('payment-package')));
-    }
-    if (isSigner && ['commitments', 'package'].includes(payment.phase)) {
-      card.append(paymentButton('Review exact transaction', async () => {
-        const review = await request('payment-review');
-        paymentReviews.set(payment.attempt, review);
-        return {phase: 'reviewed'};
+    card.append(title, stageList(current, rowState, detail));
+    card.append(note(`Signers: members ${payment.pair.join(' and ')}${isSigner ? ' — you are one of them' : ''}`
+                     + (payment.txid ? ` · transaction ${payment.txid.slice(0, 16)}…` : '')));
+    const did = paymentActivity.get(payment.attempt);
+    if (did?.length) card.append(note(`Just ran on this device: ${did.join(', ')}.`));
+
+    if (review) {
+      const summary = document.createElement('pre');
+      summary.textContent = `Recipient: ${review.recipient}\n`
+        + `Amount: ${zecFromZat(review.amount_zat)} ZEC (${review.amount_zat} zat)\n`
+        + `Memo: ${review.memo_utf8 == null ? 'Cannot display memo bytes' : JSON.stringify(review.memo_utf8)}\n`
+        + `Network fee: ${review.fee_zat} zat\n`
+        + `Change back to the vault: ${review.change_zat} zat\n`
+        + `Expires at block: ${review.expiry_height}`;
+      card.append(summary);
+      /* a memo that does not render is a transaction this member cannot read,
+         and an unreadable transaction is never approvable */
+      if (review.memo_utf8 == null) card.append(note('This memo does not render as text, so this payment cannot be approved here.', 'warning'));
+      else card.append(paymentButton('Approve this exact transaction', async () => {
+        await api('payment-approve', {vault, attempt: payment.attempt, review_token: review.review_token});
+        paymentReviews.delete(payment.attempt);
+        message('Approved. Your approval is on its way to the other member.');
       }));
     }
-    const review = paymentReviews.get(payment.attempt);
-    if (isSigner && review) {
-      const summary = document.createElement('pre');
-      summary.textContent = `Recipient: ${review.recipient}\nAmount: ${review.amount_zat} zat\nMemo: ${review.memo_utf8 == null ? 'Cannot display memo bytes' : JSON.stringify(review.memo_utf8)}\nNetwork fee: ${review.fee_zat} zat\nChange to vault: ${review.change_zat} zat\nExpires at block: ${review.expiry_height}`;
-      card.append(summary);
-      if (review.memo_utf8 !== null && review.memo_utf8 !== undefined) {
-        card.append(paymentButton('Approve this exact transaction', async () => {
-          const result = await request('payment-approve', {review_token: review.review_token});
-          paymentReviews.delete(payment.attempt);
-          return result;
+
+    if (payment.phase === 'approved') {
+      const scanned = state.scan_height == null
+        ? 'This device has not scanned the chain yet.'
+        : `This device has scanned the chain to block ${state.scan_height}.`;
+      if (state.relay_ready === true) {
+        card.append(note(`${state.relay_detail || 'The relay is reachable.'} ${scanned}`));
+        card.append(paymentButton('Send this payment', async () => {
+          await api('payment-finish', {vault, attempt: payment.attempt});
+          message('Sent. Waiting for a confirmation on this device’s chain view.');
         }));
+      } else {
+        card.append(note(`Cannot send yet. ${state.relay_detail || 'This device cannot reach the relay.'} ${scanned}`, 'warning'));
       }
-    }
-    if (payment.phase === 'approval_interrupted') {
-      const warning = document.createElement('p');
-      warning.textContent = 'The saved approval could not be reopened. Retry it; if it still fails, start a new payment.';
-      card.append(warning);
-    }
-    if (isSigner && ['approval_pending_delivery', 'approval_interrupted'].includes(payment.phase)) {
-      card.append(paymentButton('Retry saved signing messages', () => request('payment-resend')));
-    }
-    if (['published', 'received', 'commitments', 'package', 'approval_pending_delivery', 'approved'].includes(payment.phase)) {
-      card.append(paymentButton('Try to finish (waits for two shares)', () => request('payment-finish')));
-    }
-    if (payment.phase === 'broadcast' || payment.phase === 'confirmation_needs_recheck') {
-      const form = document.createElement('form');
-      const label = document.createElement('label');
-      label.textContent = 'Broadcast transaction ID';
-      const input = document.createElement('input');
-      input.name = 'txid';
-      input.value = payment.txid || '';
-      input.pattern = '[0-9a-f]{64}';
-      input.required = true;
-      const button = document.createElement('button');
-      button.textContent = 'Check on chain';
-      label.append(input);
-      form.append(label, button);
-      form.addEventListener('submit', async (event) => {
-        event.preventDefault();
-        button.disabled = true;
-        try {
-          const result = await request('payment-verify', {txid: input.value});
-          message(`Confirmed on this device with ${result.confirmations} confirmation(s).`);
-          await refreshPayments();
-        } catch (error) { message(error.message, true); }
-        finally { button.disabled = false; }
-      });
-      card.append(form);
     }
     list.append(card);
   }
+}
+
+/* ── the poll that replaces the buttons ─────────────────────────────────────
+   One pass at a time, and it stops after a failure rather than repeating the
+   same red line every few seconds: "Check for updates" restarts it. */
+async function pumpPayments() {
+  if (pumping || pumpPaused || !paymentsLive || !selectedVault) return;
+  const vault = selectedVault;
+  pumping = true;
+  try {
+    await api('payment-sync', {vault});
+    for (const attempt of midFlight) {
+      if (selectedVault !== vault) return;
+      const result = await api('payment-advance', {vault, attempt});
+      paymentActivity.set(attempt, result.did || []);
+    }
+    if (selectedVault === vault) await refreshPayments();
+  } catch (error) {
+    pumpPaused = true;
+    message(`${error.message} This list has stopped updating itself — check for updates to restart it.`, true);
+  } finally { pumping = false; }
 }
 async function refreshSignerRequests(unlocked) {
   const section = $('signer-requests');
@@ -316,6 +430,7 @@ async function refresh() {
   try {
     const state = await api('status' + (selectedVault ? `?vault=${encodeURIComponent(selectedVault)}` : ''));
     if ((state.phase === 'new_profile' || state.phase === 'locked') && selectedVault) selectVault(null);
+    paymentsLive = false;
     for (const id of ['new-profile', 'locked', 'home', 'invites', 'connect-account', 'setup', 'backup', 'waiting', 'final-backup', 'active']) $(id).hidden = true;
     const inVault = !!selectedVault;
     $('back').hidden = !inVault;
@@ -368,6 +483,7 @@ async function refresh() {
         $('payment-draft').hidden = !paymentAvailable;
         $('refresh-payments').hidden = !paymentAvailable;
         $('payment-list').hidden = !paymentAvailable;
+        paymentsLive = paymentAvailable;
         if (paymentAvailable && renderedPaymentVault !== selectedVault) await refreshPayments();
       }
       else if (state.phase === 'stopped') message('Setup stopped: ' + state.error + '. Start a fresh vault session.', true);
@@ -470,24 +586,32 @@ $('refresh-balance').addEventListener('click', async () => {
   button.disabled = true;
   try {
     const value = await api('balance', {vault: selectedVault});
-    const zat = BigInt(value.balance_zat);
-    const amount = `${zat / 100000000n}.${(zat % 100000000n).toString().padStart(8, '0')}`;
-    $('balance').textContent = `${amount} ZEC · ${value.unspent_notes} unspent notes · block ${value.height}`;
+    $('balance').textContent = `${zecFromZat(value.balance_zat)} ZEC · ${value.unspent_notes} unspent notes · block ${value.height}`;
   } catch (error) { message(error.message, true); }
   finally { button.disabled = false; }
 });
 action('payment-draft', async (form) => {
   const vault = selectedVault;
-  const draft = await api('payment-draft', {vault, ...fields(form)});
+  const value = fields(form);
+  const amount_zat = zatFromZec(value.amount_zec);
+  const draft = await api('payment-draft', {vault, recipient: value.recipient, memo: value.memo, amount_zat});
   if (selectedVault !== vault) return;
-  $('draft-result').textContent = `LOCAL DRAFT · no member has approved or sent this payment\nPayment ID: ${draft.payment}\nSelected pair: members ${draft.pair.join(' and ')}`;
+  $('draft-result').textContent = `PROPOSED · no member has approved or sent this payment\n`
+    + `Payment ID: ${draft.payment}\n`
+    + `Amount: ${zecFromZat(amount_zat)} ZEC (${amount_zat} zat)\n`
+    + `Signers: members ${draft.pair.join(' and ')}`;
   $('draft-result').hidden = false;
-  message('Saved a local draft. Send it to the other members before collecting signing commitments.');
+  $('amount-zat').textContent = 'Up to 8 decimal places.';
+  await api('payment-publish', {vault, attempt: draft.attempt});
+  message('Proposal sent to the other members. You approve it below once the exact transaction is on screen.');
+  pumpPaused = false;
   await refreshPayments();
+  pumpPayments();
 });
+$('payment-draft').elements.amount_zec.addEventListener('input', amountEcho);
 $('refresh-payments').addEventListener('click', async () => {
-  try { await api('payment-sync', {vault: selectedVault}); await refreshPayments(); }
-  catch (error) { message(error.message, true); }
+  pumpPaused = false;
+  await pumpPayments();
 });
 /* ── theme ──────────────────────────────────────────────────────────────────
    No stored choice means follow the system, which the stylesheet's media query
@@ -527,4 +651,4 @@ $('lock').addEventListener('click', async () => {
   try { await api('lock', {}); selectVault(null); await refresh(); }
   catch (error) { message(error.message, true); }
 });
-refresh(); setInterval(refresh, 2000);
+refresh(); setInterval(refresh, 2000); setInterval(pumpPayments, 6000);
