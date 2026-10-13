@@ -1223,6 +1223,32 @@ fn owner_provision_random_pending_full_commit_and_exact_reopen() {
     assert!(f.store.routing(&f.db, &f.members[0]).is_err());
 }
 
+#[test]
+fn owner_cannot_reprovision_with_persisted_signing_nonces() {
+    let mut f = ConfigFixture::new();
+    f.store
+        .prepare_provision(&mut f.db, &f.members[0], &provision_targets())
+        .unwrap();
+    // Simulate losing transport state while the member's signing state survives.
+    fs::rename(f.root.join("transport"), f.root.join("lost-transport")).unwrap();
+    f.db = loki_relay_client::ClientStore::open(&f.root.join("transport"), &f.members[0].roster, 1)
+        .unwrap();
+    assert!(f.db.config_reference().unwrap().is_none());
+    assert!(f.store.load(&f.db, &f.members[0]).unwrap().is_none());
+    let attempt = f
+        .root
+        .join("signing")
+        .join("a".repeat(64))
+        .join("b".repeat(64));
+    fs::create_dir_all(&attempt).unwrap();
+    fs::write(attempt.join("nonces.sealed"), b"unfinished signing attempt").unwrap();
+    assert!(f
+        .store
+        .prepare_provision(&mut f.db, &f.members[0], &provision_targets())
+        .is_err());
+    assert!(f.db.config_reference().unwrap().is_none());
+}
+
 fn provision_targets() -> Vec<loki_poc::relay_member::ProvisionTarget> {
     (1..=3u8)
         .map(|i| loki_poc::relay_member::ProvisionTarget {

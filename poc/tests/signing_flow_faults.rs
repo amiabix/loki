@@ -26,7 +26,7 @@ use std::{
 struct FirstWriter(BTreeSet<[u8; 32]>);
 impl NonceWitness for FirstWriter {
     fn pins(&self) -> loki_poc::signing_session::WitnessPins {
-        [([7; 32], [8; 32]), ([9; 32], [10; 32])]
+        [([7; 32], [8; 32], [15; 32]), ([9; 32], [10; 32], [16; 32])]
     }
     fn claim(&mut self, cid: [u8; 32], _: &[u8]) -> Result<(), String> {
         if !self.0.insert(cid) {
@@ -39,10 +39,23 @@ impl NonceWitness for FirstWriter {
 struct WrongRelays;
 impl NonceWitness for WrongRelays {
     fn pins(&self) -> loki_poc::signing_session::WitnessPins {
-        [([11; 32], [12; 32]), ([13; 32], [14; 32])]
+        [
+            ([11; 32], [12; 32], [15; 32]),
+            ([13; 32], [14; 32], [16; 32]),
+        ]
     }
     fn claim(&mut self, _: [u8; 32], _: &[u8]) -> Result<(), String> {
         panic!("mismatched relays must be refused before a claim")
+    }
+}
+struct ReprovisionedMailbox;
+impl NonceWitness for ReprovisionedMailbox {
+    fn pins(&self) -> loki_poc::signing_session::WitnessPins {
+        // Same relay keys and runs, but fresh mailboxes have empty consumed-CID ledgers.
+        [([7; 32], [8; 32], [17; 32]), ([9; 32], [10; 32], [18; 32])]
+    }
+    fn claim(&mut self, _: [u8; 32], _: &[u8]) -> Result<(), String> {
+        panic!("changed mailbox must be refused before a nonce claim")
     }
 }
 use zcash_protocol::{memo::MemoBytes, value::Zatoshis};
@@ -163,7 +176,7 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
         fvk.clone(),
         2,
         "pass",
-        [([7; 32], [8; 32]), ([7; 32], [10; 32])],
+        [([7; 32], [8; 32], [15; 32]), ([7; 32], [10; 32], [16; 32])],
     );
     assert!(
         duplicate_relay_key.is_err(),
@@ -180,7 +193,7 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
         fvk.clone(),
         2,
         "pass",
-        [([7; 32], [8; 32]), ([9; 32], [10; 32])],
+        [([7; 32], [8; 32], [15; 32]), ([9; 32], [10; 32], [16; 32])],
     )
     .unwrap();
     let mut sets = Vec::new();
@@ -296,6 +309,19 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
         .is_err());
     assert!(!bob_attempt.join("decision").exists());
     let reviewed = bob.review_package(&good, &alice_public).unwrap();
+    assert!(bob
+        .publish_approved_secured(
+            reviewed,
+            &alice_public,
+            &carol_public,
+            &mailbox,
+            "pass",
+            &mut ReprovisionedMailbox,
+        )
+        .is_err());
+    assert!(!bob_attempt.join("decision").exists());
+    assert!(!bob_attempt.join("share.sealed").exists());
+    let reviewed = bob.review_package(&good, &alice_public).unwrap();
     assert_eq!(reviewed.summary().vault, ak);
     assert_eq!(reviewed.summary().payment, intent.proposal_id());
     assert_eq!(reviewed.summary().attempt, ctx.attempt);
@@ -335,10 +361,50 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
     )
     .read_sealed("nonces.sealed", "pass")
     .unwrap();
-    bad_nonces[65..97].copy_from_slice(&[7; 32]);
+    bad_nonces[97..129].copy_from_slice(&[7; 32]);
     bad_dir
         .write_sealed("nonces.sealed", &bad_nonces, "pass")
         .unwrap();
+    let legacy_root = root.join("bob-v1-nonce-restore");
+    let legacy_attempt = legacy_root
+        .join(hex::encode(ctx.payment))
+        .join(hex::encode(ctx.attempt.0));
+    let legacy_dir = MemberDir::create(
+        &legacy_root.join(hex::encode(ctx.payment)),
+        &hex::encode(ctx.attempt.0),
+    )
+    .unwrap();
+    fs::copy(bob_attempt.join("started"), legacy_attempt.join("started")).unwrap();
+    // v1 records contain relay key and run, but no mailbox binding. They must fail closed.
+    let current_nonces = MemberDir::open(
+        &bob_root.join(hex::encode(ctx.payment)),
+        &hex::encode(ctx.attempt.0),
+    )
+    .read_sealed("nonces.sealed", "pass")
+    .unwrap();
+    let mut legacy_nonces = Vec::from([1u8]);
+    legacy_nonces.extend_from_slice(&current_nonces[1..65]);
+    legacy_nonces.extend_from_slice(&current_nonces[97..161]);
+    legacy_nonces.extend_from_slice(&current_nonces[193..]);
+    legacy_dir
+        .write_sealed("nonces.sealed", &legacy_nonces, "pass")
+        .unwrap();
+    assert_eq!(
+        SigningSession::reopen_sealed(
+            &legacy_root,
+            ctx.clone(),
+            &ak,
+            intent.clone(),
+            Identity::from_secret_bytes(&bob_sender.to_secret_bytes()).unwrap(),
+            bob_key.clone(),
+            public.clone(),
+            fvk.clone(),
+            "pass"
+        )
+        .err()
+        .as_deref(),
+        Some("invalid sealed nonce record")
+    );
     assert!(SigningSession::reopen_sealed(
         &bad_root,
         ctx.clone(),

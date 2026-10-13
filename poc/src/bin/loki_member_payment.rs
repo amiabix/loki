@@ -656,10 +656,18 @@ struct TwoRelays {
 impl NonceWitness for TwoRelays {
     fn pins(&self) -> loki_poc::signing_session::WitnessPins {
         [
-            (&self.own[0].route.pin.key, &self.own[0].route.pin.run),
-            (&self.own[1].route.pin.key, &self.own[1].route.pin.run),
+            (
+                &self.own[0].route.pin.key,
+                &self.own[0].route.pin.run,
+                &self.own[0].route.mailbox,
+            ),
+            (
+                &self.own[1].route.pin.key,
+                &self.own[1].route.pin.run,
+                &self.own[1].route.mailbox,
+            ),
         ]
-        .map(|(key, run)| (*key, *run))
+        .map(|(key, run, mailbox)| (*key, *run, *mailbox))
     }
     fn claim(&mut self, cid: [u8; 32], wire: &[u8]) -> Result<(), String> {
         for inbox in &self.own[..2] {

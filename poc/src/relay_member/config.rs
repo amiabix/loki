@@ -607,6 +607,32 @@ pub struct ConfigStore {
     root: PathBuf,
     pass: Zeroizing<String>,
 }
+
+fn has_persisted_nonces(root: &Path) -> MemberResult<bool> {
+    let payments = match fs::read_dir(root.join("signing")) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(error(err)),
+    };
+    for payment in payments {
+        let payment = payment.map_err(error)?;
+        if !payment.file_type().map_err(error)?.is_dir() {
+            return Err(MemberError::Sealed);
+        }
+        for attempt in fs::read_dir(payment.path()).map_err(error)? {
+            let attempt = attempt.map_err(error)?;
+            if !attempt.file_type().map_err(error)?.is_dir() {
+                return Err(MemberError::Sealed);
+            }
+            match fs::symlink_metadata(attempt.path().join("nonces.sealed")) {
+                Ok(_) => return Ok(true),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(error(err)),
+            }
+        }
+    }
+    Ok(false)
+}
 fn unseal(raw: &[u8], pass: &str) -> MemberResult<Zeroizing<Vec<u8>>> {
     // Use the existing sealed format on the same bounded bytes that were hashed.
     if raw.len() < SEAL_HEADER + 16 || raw.len() > MAX_SEALED || &raw[..9] != SEAL_MAGIC {
@@ -2343,6 +2369,9 @@ impl ConfigStore {
                 .config_reference()
                 .map_err(error)?
                 .ok_or(MemberError::Sealed);
+        }
+        if has_persisted_nonces(&self.root)? {
+            return Err(MemberError::Sealed);
         }
         if !config.pending.is_empty() {
             return Err(MemberError::Sealed);

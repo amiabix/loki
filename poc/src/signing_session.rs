@@ -769,15 +769,16 @@ pub struct SigningSession {
     witness_pins: Option<WitnessPins>,
 }
 
-/// (relay public key, relay run ID), fixed before commitments are published.
-pub type WitnessPins = [([u8; 32], [u8; 32]); 2];
+/// (relay public key, relay run ID, mailbox), fixed before commitments are published.
+pub type WitnessPins = [([u8; 32], [u8; 32], [u8; 32]); 2];
 
 fn valid_witness_pins(pins: WitnessPins) -> bool {
     pins[0].0 != pins[1].0
         && pins[0].1 != pins[1].1
+        && pins[0].2 != pins[1].2
         && pins
             .iter()
-            .all(|(key, run)| *key != [0; 32] && *run != [0; 32])
+            .all(|(key, run, mailbox)| *key != [0; 32] && *run != [0; 32] && *mailbox != [0; 32])
 }
 
 /// Implementations must verify fresh signed receipts from two fixed, distinct relay
@@ -1430,10 +1431,11 @@ impl AttemptStore {
         pins: WitnessPins,
     ) -> Result<(), String> {
         let mut raw = zeroize::Zeroizing::new(Vec::new());
-        raw.push(1);
-        for (key, run) in pins {
+        raw.push(2);
+        for (key, run, mailbox) in pins {
             raw.extend_from_slice(&key);
             raw.extend_from_slice(&run);
+            raw.extend_from_slice(&mailbox);
         }
         raw.extend_from_slice(&(live.commitments.len() as u16).to_be_bytes());
         for nonce in live.nonces.as_ref().ok_or("nonces already consumed")? {
@@ -1458,27 +1460,31 @@ impl AttemptStore {
                 .read_sealed("nonces.sealed", passphrase)
                 .map_err(|e| e.to_string())?,
         );
-        if raw.len() < 131 || raw[0] != 1 {
+        // v1 omitted mailbox IDs; reopening those nonce records could reuse a CID on
+        // a newly provisioned mailbox. Discard the attempt and start with fresh nonces.
+        if raw.len() < 195 || raw[0] != 2 {
             return Err("invalid sealed nonce record".into());
         }
         let pins = [
             (
                 raw[1..33].try_into().unwrap(),
                 raw[33..65].try_into().unwrap(),
+                raw[65..97].try_into().unwrap(),
             ),
             (
-                raw[65..97].try_into().unwrap(),
                 raw[97..129].try_into().unwrap(),
+                raw[129..161].try_into().unwrap(),
+                raw[161..193].try_into().unwrap(),
             ),
         ];
         if !valid_witness_pins(pins) {
             return Err("invalid sealed relay identities".into());
         }
-        let count = u16::from_be_bytes(raw[129..131].try_into().unwrap()) as usize;
+        let count = u16::from_be_bytes(raw[193..195].try_into().unwrap()) as usize;
         if !(1..=64).contains(&count) {
             return Err("invalid sealed nonce count".into());
         }
-        let mut at = 131;
+        let mut at = 195;
         let mut nonces = Vec::with_capacity(count);
         let mut commitments = Vec::with_capacity(count);
         for _ in 0..count {
