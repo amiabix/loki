@@ -81,6 +81,10 @@ every name against the ones this vault can have and every body against the
 digest the courier advertised, refuses a second version of a published wire,
 and may publish only its own slot's files. The roster fingerprint is still
 compared out of band, so the courier remains untrusted.
+After a member reloads and checks the final card, their app publishes a signed
+status receipt. The status list verifies those signatures against the certified
+roster; it cannot prove anyone still retains their card. Remote reports arrive
+while the creator's courier and joining apps remain online.
 
 ```sh
 python3 wallet/member_app.py --data /tmp/loki-member-1 --exchange /tmp/loki-setup-1 --port 8801 --invite-port 8787

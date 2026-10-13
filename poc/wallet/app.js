@@ -1,7 +1,10 @@
 'use strict';
 const token = location.hash.slice(1);
 const $ = (id) => document.getElementById(id);
-let selectedVault = null;
+const OPEN_VAULT = 'loki-open-vault';
+let selectedVault;
+try { selectedVault = sessionStorage.getItem(OPEN_VAULT); }
+catch { selectedVault = null; }
 let linkChallenge = null;
 let memberSlot = null;
 let renderedPaymentVault = null;
@@ -14,6 +17,10 @@ const paymentActivity = new Map();
 
 function selectVault(vault) {
   selectedVault = vault;
+  try {
+    if (vault) sessionStorage.setItem(OPEN_VAULT, vault);
+    else sessionStorage.removeItem(OPEN_VAULT);
+  } catch { /* Private browsing may disable session storage. */ }
   linkChallenge = null;
   memberSlot = null;
   renderedPaymentVault = null;
@@ -573,12 +580,38 @@ function rosterList(state) {
   list.hidden = !(state.confirmations || []).length;
 }
 
+function backupList(state) {
+  const list = $('backup-list');
+  list.replaceChildren();
+  for (const entry of state.backups || []) {
+    const row = document.createElement('div');
+    row.className = 'roster-row';
+    const who = document.createElement('strong');
+    who.textContent = entry.slot === state.slot ? `Member ${entry.slot} · you` : `Member ${entry.slot}`;
+    const said = document.createElement('span');
+    said.textContent = entry.reported ? 'reported checking a final card'
+      : entry.invalid ? 'invalid report — check with this member' : 'no report yet';
+    row.classList.add(entry.reported ? 'agreed' : entry.invalid ? 'differs' : 'waiting');
+    row.append(who, said);
+    list.append(row);
+  }
+}
+
 async function refresh() {
   try {
-    const state = await api('status' + (selectedVault ? `?vault=${encodeURIComponent(selectedVault)}` : ''));
+    let state;
+    try {
+      state = await api('status' + (selectedVault ? `?vault=${encodeURIComponent(selectedVault)}` : ''));
+    } catch (error) {
+      if (!selectedVault) throw error;
+      const home = await api('status');
+      if (home.vaults?.some((vault) => vault.vault === selectedVault)) throw error;
+      selectVault(null);
+      state = home;
+    }
     if ((state.phase === 'new_profile' || state.phase === 'locked') && selectedVault) selectVault(null);
     paymentsLive = false;
-    for (const id of ['new-profile', 'locked', 'home', 'invites', 'connect-account', 'setup', 'backup', 'waiting', 'final-backup', 'active']) $(id).hidden = true;
+    for (const id of ['new-profile', 'locked', 'home', 'invites', 'connect-account', 'setup', 'backup', 'waiting', 'final-backup', 'backup-status', 'active']) $(id).hidden = true;
     const inVault = !!selectedVault;
     $('back').hidden = !inVault;
     $('lock').hidden = !state.profile && state.phase !== 'home';
@@ -598,7 +631,7 @@ async function refresh() {
     $('transport-note').hidden = !state.transport_error;
     if (state.transport_error) {
       $('transport-note').textContent = state.transport_error.waiting
-        ? `${state.transport_error.message} Setup continues once it is reachable again.`
+        ? `${state.transport_error.message} ${state.phase === 'active' ? 'Backup reports update' : 'Setup continues'} once it is reachable again.`
         : state.transport_error.message;
     }
     $('linked-account').hidden = !state.account_ak;
@@ -642,6 +675,10 @@ async function refresh() {
         if (paymentAvailable && renderedPaymentVault !== selectedVault) await refreshPayments();
       }
       else if (state.phase === 'stopped') message('Setup stopped: ' + state.error + '. Start a fresh vault session.', true);
+      if ((state.phase === 'final_backup' || state.phase === 'active') && state.backups?.length) {
+        backupList(state);
+        $('backup-status').hidden = false;
+      }
     }
     if (state.error) message(state.error, true);
     else if (state.account_link_error) message(`${state.account_link_error}. Vault keys are unaffected.`, true);

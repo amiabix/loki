@@ -15,6 +15,7 @@ const MAGIC: &[u8; 8] = b"LOKIDKG1";
 const ROUND1_MAGIC: &[u8; 8] = b"LOKIR1V1";
 const CERT_MAGIC: &[u8; 8] = b"LOKICRV1";
 const BACKUP_MAGIC: &[u8; 8] = b"LOKIBKV1";
+const FINAL_STATUS_MAGIC: &[u8; 8] = b"LOKIFSV1";
 const HEADER: usize = 8 + 32 + 2 + 2 + 24 + 4;
 const PUBLIC_HEADER: usize = 8 + 32 + 2 + 4;
 const SIGNATURE: usize = 64;
@@ -90,6 +91,10 @@ impl Identity {
         self.sign_public(BACKUP_MAGIC, vault, payload)
     }
 
+    pub fn sign_final_status(&self, vault: &[u8; 32]) -> Result<Vec<u8>, String> {
+        self.sign_public(FINAL_STATUS_MAGIC, vault, b"final-card-checked")
+    }
+
     fn sign_public(
         &self,
         magic: &[u8; 8],
@@ -115,7 +120,7 @@ impl Identity {
         vault: &[u8; 32],
         wire: &[u8],
     ) -> Result<Vec<u8>, String> {
-        self.verify_public(ROUND1_MAGIC, sender, vault, wire)
+        Self::verify_public(ROUND1_MAGIC, sender, vault, wire)
     }
 
     pub fn verify_certificate(
@@ -124,7 +129,7 @@ impl Identity {
         vault: &[u8; 32],
         wire: &[u8],
     ) -> Result<Vec<u8>, String> {
-        self.verify_public(CERT_MAGIC, sender, vault, wire)
+        Self::verify_public(CERT_MAGIC, sender, vault, wire)
     }
 
     pub fn verify_backup(
@@ -133,11 +138,23 @@ impl Identity {
         vault: &[u8; 32],
         wire: &[u8],
     ) -> Result<Vec<u8>, String> {
-        self.verify_public(BACKUP_MAGIC, sender, vault, wire)
+        Self::verify_public(BACKUP_MAGIC, sender, vault, wire)
+    }
+
+    pub fn verify_final_status(
+        sender: &PublicIdentity,
+        vault: &[u8; 32],
+        wire: &[u8],
+    ) -> Result<(), String> {
+        if Self::verify_public(FINAL_STATUS_MAGIC, sender, vault, wire)?.as_slice()
+            != b"final-card-checked"
+        {
+            return Err("invalid final backup status".into());
+        }
+        Ok(())
     }
 
     fn verify_public(
-        &self,
         magic: &[u8; 8],
         sender: &PublicIdentity,
         vault: &[u8; 32],

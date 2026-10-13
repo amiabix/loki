@@ -393,6 +393,10 @@ class RemoteJoinTest(unittest.TestCase):
             addresses.append(app.api("address", {"vault": vault})["address"])
         self.assertEqual(len(set(addresses)), 1)
         self.assertTrue(addresses[0].startswith("uregtest1"))
+        for app in apps:
+            reports = app.until(vault, lambda s: all(r["reported"] for r in s["backups"]),
+                                what="all signed final backup reports")["backups"]
+            self.assertEqual([r["slot"] for r in reports], [1, 2, 3])
 
     def test_invite_refusals_and_courier_limits(self):
         invite_port = free_port()

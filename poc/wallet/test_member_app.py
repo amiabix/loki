@@ -11,10 +11,35 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
-from member_app import SEED_WALLET, SETUP, Wallet
+from member_app import SEED_WALLET, SETUP, Wallet, courier_name
 
 
 class MemberWalletTest(unittest.TestCase):
+    def test_sync_stops_after_all_final_reports(self):
+        with tempfile.TemporaryDirectory(prefix="loki-sync-done-") as temp:
+            wallet = Wallet(Path(temp) / "member", Path(temp) / "exchange")
+            self.addCleanup(wallet.close)
+            vault = "a" * 64
+            member = wallet.data / "vaults" / vault
+            member.mkdir(parents=True)
+            (member / "transport.json").write_text(json.dumps({
+                "vault": vault, "origin": "http://127.0.0.1:1", "token": "test", "slot": 2}))
+            (member / "final-backup-checked").write_text("checked\n")
+            with patch.object(wallet, "sync_once") as sync, patch.object(
+                    wallet, "backup_reports", return_value=[{"reported": True}] * 3):
+                wallet.ensure_sync(vault)
+                worker = wallet.syncs[vault]
+                worker.join(timeout=2)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(sync.call_count, 1)
+                wallet.ensure_sync(vault)
+                self.assertIs(wallet.syncs[vault], worker)
+
+    def test_final_status_receipt_is_owned_by_its_member(self):
+        vault = "a" * 64
+        self.assertTrue(courier_name(vault, f"{vault}-final-status-2.bin", "2"))
+        self.assertFalse(courier_name(vault, f"{vault}-final-status-2.bin", "1"))
+
     def test_payment_sync_moves_only_own_wires_and_waits_for_relay_storage(self):
         with tempfile.TemporaryDirectory(prefix="loki-payment-sync-") as temp:
             wallet = Wallet(Path(temp) / "alice", Path(temp) / "exchange")
@@ -416,12 +441,24 @@ class MemberWalletTest(unittest.TestCase):
                 wallet.finalize_backup(vault, words)
                 final_card = (wallet.data / "vaults" / vault / "final-card" / "vault.card").read_bytes()
                 if index == 0:
+                    member = wallet.data / "vaults" / vault
+                    with self.assertRaisesRegex(ValueError, "Check your final backup card"):
+                        wallet.command("backup-report", member, "@pass", member / "roster.json")
                     damaged = bytearray(final_card)
                     damaged[-1] ^= 1
                     with self.assertRaises(ValueError):
                         wallet.verify_final_backup(vault, words, base64.b64encode(damaged).decode())
                     self.assertEqual(wallet.status(vault)["phase"], "final_backup")
+                    self.assertFalse((exchange / vault / f"{vault}-final-status-1.bin").exists())
                 wallet.verify_final_backup(vault, words, base64.b64encode(final_card).decode())
+                if index == 0:
+                    card_path = member / "final-card" / "vault.card"
+                    card_path.rename(member / "final-card" / "held.card")
+                    try:
+                        with self.assertRaisesRegex(ValueError, "Check your final backup card"):
+                            wallet.command("backup-report", member, "@pass", member / "roster.json")
+                    finally:
+                        (member / "final-card" / "held.card").rename(card_path)
             for wallet in wallets:
                 with self.assertRaisesRegex(ValueError, "2-of-4 payments are not available"):
                     wallet.address(vault)
@@ -507,6 +544,8 @@ class MemberWalletTest(unittest.TestCase):
             for wallet in wallets:
                 wallet.activate(vault)
                 self.assertEqual(wallet.status(vault)["phase"], "final_backup")
+                self.assertEqual([r["reported"] for r in wallet.status(vault)["backups"]],
+                                 [False, False, False])
             for index, (wallet, words) in enumerate(zip(wallets, saved_words)):
                 sealed_words = wallet.data / "vaults" / vault / "secrets" / "backup-words.sealed"
                 if index == 0:
@@ -523,6 +562,33 @@ class MemberWalletTest(unittest.TestCase):
                 final_card = (wallet.data / "vaults" / vault / "final-card" / "vault.card").read_bytes()
                 self.assertEqual(wallet.verify_final_backup(vault, words, base64.b64encode(final_card).decode()),
                                  {"verified": True})
+                self.assertEqual([r["reported"] for r in wallet.status(vault)["backups"]],
+                                 [True] * (index + 1) + [False] * (2 - index))
+            reports = wallets[0].status(vault)["backups"]
+            self.assertEqual([r["reported"] for r in reports], [True, True, True])
+            second = exchange / vault / f"{vault}-final-status-2.bin"
+            third = exchange / vault / f"{vault}-final-status-3.bin"
+            original = second.read_bytes()
+            second.write_bytes(third.read_bytes())
+            self.assertEqual(wallets[0].status(vault)["backups"][1],
+                             {"slot": 2, "reported": False, "invalid": True})
+            forged = bytearray(original)
+            forged[-1] ^= 1
+            second.write_bytes(forged)
+            self.assertEqual(wallets[0].status(vault)["backups"][1],
+                             {"slot": 2, "reported": False, "invalid": True})
+            second.write_bytes(b"unreadable receipt")
+            self.assertEqual(wallets[0].status(vault)["backups"][1],
+                             {"slot": 2, "reported": False, "invalid": True})
+            second.unlink()
+            second.mkdir()
+            self.assertEqual(wallets[0].status(vault)["backups"][1],
+                             {"slot": 2, "reported": False, "invalid": True})
+            second.rmdir()
+            second.write_bytes(original)
+            third.unlink()
+            self.assertEqual(wallets[0].status(vault)["backups"][2],
+                             {"slot": 3, "reported": False, "invalid": False})
             receipts = list((exchange / vault).glob(f"{vault}-backup-*.bin"))
             self.assertEqual(len(receipts), 3)
             for receipt in receipts:

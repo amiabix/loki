@@ -72,15 +72,15 @@ def read_json(path):
 INVITE_TTL = 24 * 60 * 60
 COURIER_LIMIT = 256 * 1024
 # one draft, one identity and one roster answer per member, one round-one, one
-# certificate and one backup wire each, and one round-two wire per ordered pair
-COURIER_FILES = 1 + 4 * 5 + 4 * 3
+# certificate, backup and final-status wires each, and one round-two wire per ordered pair
+COURIER_FILES = 1 + 4 * 6 + 4 * 3
 
 # The setup courier carries a fixed, named set of files: the vault draft, each
 # member's public identity, the roster answer each app published, and the signed
-# DKG and backup wires. Anything else is refused, so a reachable courier cannot
-# be used as general storage.
+# DKG, backup and final-status wires. Anything else is refused, so a reachable
+# courier cannot be used as general storage.
 COURIER = (r"(?:join|confirm)-{slot}\.json"
-           r"|{vault}-(?:r1|cert|backup)-{slot}\.bin|{vault}-r2-{slot}-[1-4]\.bin")
+           r"|{vault}-(?:r1|cert|backup|final-status)-{slot}\.bin|{vault}-r2-{slot}-[1-4]\.bin")
 
 
 def courier_name(vault, name, slot="[1-4]"):
@@ -356,6 +356,8 @@ class Wallet:
         self.lock = threading.Lock()
         self.claim_lock = threading.Lock()
         self.syncs = {}
+        self.sync_done = set()
+        self.sync_stop = threading.Event()
         self.transport_errors = {}
         self.passphrase = None
         self.profile_data = None
@@ -536,7 +538,7 @@ class Wallet:
         the file courier already made happens exactly as before."""
         transport = self.data / "vaults" / self.exchange_vault(vault).name / "transport.json"
         worker = self.syncs.get(vault)
-        if not transport.is_file() or (worker and worker.is_alive()):
+        if vault in self.sync_done or not transport.is_file() or (worker and worker.is_alive()):
             return
         worker = threading.Thread(target=self.sync_loop, args=(read_json(transport),), daemon=True)
         self.syncs[vault] = worker
@@ -544,15 +546,18 @@ class Wallet:
 
     def sync_loop(self, transport):
         vault = transport["vault"]
-        done = self.data / "vaults" / vault / "final-backup-checked"
-        while not done.exists():
+        while not self.sync_stop.is_set():
             try:
                 self.sync_once(vault, transport["origin"], transport["token"], transport["slot"])
                 self.transport_errors.pop(vault, None)
+                checked = self.data / "vaults" / vault / "final-backup-checked"
+                if checked.is_file() and all(report["reported"] for report in self.backup_reports(vault)):
+                    self.sync_done.add(vault)
+                    return
             except (ValueError, OSError, KeyError) as error:
                 self.transport_errors[vault] = {"message": str(error),
                                                 "waiting": isinstance(error, Unreachable)}
-            time.sleep(1)
+            self.sync_stop.wait(1)
 
     def sync_once(self, vault, origin, token, slot):
         """One pass in each direction.
@@ -899,7 +904,16 @@ class Wallet:
         marker = member_dir / "final-backup-checked"
         if not marker.exists():
             write_new(marker, b"checked\n")
+        _, local = self.vault_dir(vault)
+        receipt = bytes.fromhex(self.command("backup-report", member_dir, "@pass",
+                                            member_dir / "roster.json"))
+        write_replace(self.exchange_vault(vault) / f"{vault}-final-status-{local['slot']}.bin", receipt)
         return {"verified": True}
+
+    def backup_reports(self, vault):
+        member_dir = self.data / "vaults" / self.exchange_vault(vault).name
+        return json.loads(self.command("backup-reports", member_dir / "roster.json",
+                                       self.exchange_vault(vault)))
 
     def restore_vault(self, name, words, card_bytes):
         profile = self.require_profile()
@@ -1345,11 +1359,13 @@ class Wallet:
             state["phase"] = "active" if (member_dir / "final-backup-checked").is_file() else "final_backup"
             state["final_card_created"] = (member_dir / "final-card" / "vault.card").is_file()
             state["final_card_needs_words"] = not (member_dir / "secrets" / "backup-words.sealed").is_file()
+            state["backups"] = self.backup_reports(vault)
         if self.setup_errors.get(vault):
             state["phase"] = "stopped"
         return state
 
     def close(self):
+        self.sync_stop.set()
         self.process_lock.close()
 
 
