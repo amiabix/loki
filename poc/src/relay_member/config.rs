@@ -115,7 +115,7 @@ impl LocalConfig {
         }
         let pending_limit = if self.rotated.is_some() { 6 } else { 3 };
         if self.own.is_empty() != self.self_wire.is_none()
-            || self.peer_wires.len() > 2
+            || self.peer_wires.len() > member.roster.members.len() - 1
             || self.pending.len() > pending_limit
             || (self.pending.is_empty() != self.operation.is_none())
             || (self.rotated.is_some() && self.provisioned.is_none())
@@ -137,7 +137,9 @@ impl LocalConfig {
                 }
             }
         }
-        if self.couriers.len() > 2 {
+        if !self.couriers.is_empty()
+            && self.couriers.len() != member.roster.members.len() - 1
+        {
             return Err(MemberError::Bounds);
         }
         if !self.couriers.is_empty() {
@@ -339,7 +341,7 @@ impl LocalConfig {
                 return Ok(());
             }
         }
-        if self.peer_wires.len() == 2 {
+        if self.peer_wires.len() >= member.roster.members.len() - 1 {
             return Err(MemberError::Bounds);
         }
         self.peer_wires.push(wire.to_vec());
@@ -444,6 +446,8 @@ impl LocalConfig {
         Ok(encoded)
     }
     pub fn decode(member: &LoadedMember, revision: u64, encoded: &[u8]) -> MemberResult<Self> {
+        roster_digest(&member.roster).map_err(error)?;
+        let peer_count = member.roster.members.len() - 1;
         let v = SecretValue(canonical::decode(encoded, MAX_CONFIG).map_err(error)?);
         let fields = match &v.0 {
             Value::Array(f) => f,
@@ -504,7 +508,7 @@ impl LocalConfig {
         } else {
             Some(bytes(&f[8])?.to_vec())
         };
-        let peer_wires = list(&f[9], 2)?
+        let peer_wires = list(&f[9], peer_count)?
             .iter()
             .map(|v| Ok(bytes(v)?.to_vec()))
             .collect::<MemberResult<Vec<_>>>()?;
@@ -525,7 +529,7 @@ impl LocalConfig {
                 }
             })
             .collect::<MemberResult<Vec<_>>>()?;
-        let couriers = if list(&f[11], 2)?.is_empty() {
+        let couriers = if list(&f[11], peer_count)?.is_empty() {
             vec![]
         } else {
             let auth = open_descriptor(
@@ -534,7 +538,7 @@ impl LocalConfig {
                 self_wire.as_ref().ok_or(MemberError::Identity)?,
             )
             .map_err(error)?;
-            list(&f[11], 2)?
+            list(&f[11], peer_count)?
                 .iter()
                 .map(|v| {
                     let c = array(v, 3)?;
@@ -662,13 +666,74 @@ impl ConfigStore {
         let mut pass = Zeroizing::new(std::str::from_utf8(&raw).map_err(error)?.to_owned());
         let length = pass.trim_end_matches(['\r', '\n']).len();
         pass.truncate(length);
-        if pass.is_empty() {
+        Self::open_with_passphrase(root, &pass)
+    }
+    pub fn open_with_passphrase(root: &Path, passphrase: &str) -> MemberResult<Self> {
+        member_root(root)?;
+        private_directory(&root.join("secrets"))?;
+        if passphrase.is_empty() {
             return Err(MemberError::Sealed);
+        }
+        if passphrase.len() > MAX_PASS {
+            return Err(MemberError::Bounds);
         }
         Ok(Self {
             root: root.to_owned(),
-            pass,
+            pass: Zeroizing::new(passphrase.to_owned()),
         })
+    }
+    // The hosted adapter must validate scoped admission receipts before activation.
+    // This storage step preserves the exact certified configuration across a pointer crash.
+    pub(crate) fn install_scoped_configuration(
+        &self,
+        db: &mut ClientStore,
+        member: &LoadedMember,
+        config: &LocalConfig,
+    ) -> MemberResult<ConfigReference> {
+        db.check_association(&member.roster, member.identity.public().id).map_err(error)?;
+        let verified = config.authenticated(member)?;
+        if verified.own.len() != 3
+            || verified.peers.len() != member.roster.members.len() - 1
+            || config.couriers.len() != member.roster.members.len() - 1
+            || config.self_wire.is_none()
+            || !config.pending.is_empty()
+            || config.operation.is_some()
+            || config.provisioned.is_some()
+            || config.rotated.is_some()
+            || config.predecessor.is_some()
+        {
+            return Err(MemberError::Sealed);
+        }
+        let encoded = config.encode(member, 1)?;
+        if let Some(reference) = db.config_reference().map_err(error)? {
+            if reference.revision() != 1
+                || self.read(member, &reference)?.encode(member, 1)?.as_slice() != encoded.as_slice()
+            {
+                return Err(MemberError::Sealed);
+            }
+            return Ok(reference);
+        }
+        let provisional = ConfigReference::new(1, [0; 32]).map_err(error)?;
+        let path = self.root.join(provisional.file_name());
+        match fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.save_revision(db, member, 1, config)
+            }
+            Err(_) => Err(MemberError::Io),
+            Ok(_) => {
+                private_directory(&self.root.join("secrets"))?;
+                let ciphertext = bounded_read(&path, MAX_SEALED, true)?;
+                let reference = ConfigReference::from_ciphertext(1, &ciphertext).map_err(error)?;
+                if self.read(member, &reference)?.encode(member, 1)?.as_slice() != encoded.as_slice() {
+                    return Err(MemberError::Sealed);
+                }
+                File::open(&path).and_then(|file| file.sync_all()).map_err(error)?;
+                File::open(self.root.join("secrets"))
+                    .and_then(|directory| directory.sync_all()).map_err(error)?;
+                db.record_config_revision(&reference).map_err(error)?;
+                Ok(reference)
+            }
+        }
     }
     fn read(
         &self,
@@ -743,7 +808,7 @@ impl ConfigStore {
                     }
                     if let Some(reference) = &current {
                         let prior = self.read(member, reference)?;
-                        if !orphan_authority(&prior, config) {
+                        if !orphan_authority(member, &prior, config) {
                             return Err(MemberError::Sealed);
                         }
                     }
@@ -787,8 +852,8 @@ fn validate_successor(
     if let Some(previous) = &prior.provisioned {
         let results = next.provisioned.as_ref().ok_or(MemberError::Sealed)?;
         if prior.operation != next.operation
-            || !creation_and_rotation_authority(prior, next)
-            || !rotation_transition_ok(prior, next)
+            || !creation_and_rotation_authority(member, prior, next)
+            || !rotation_transition_ok(member, prior, next)
             || previous.iter().zip(results).any(|(a, b)| *b < *a)
         {
             return Err(MemberError::Sealed);
@@ -879,7 +944,10 @@ mod tests {
     use super::*;
     use std::process::Command;
     fn member() -> LoadedMember {
-        let identities: Vec<_> = (1..=3u16)
+        member_with_count(3)
+    }
+    fn member_with_count(count: u16) -> LoadedMember {
+        let identities: Vec<_> = (1..=count)
             .map(|id| {
                 let mut raw = Zeroizing::new([id as u8; 66]);
                 raw[..2].copy_from_slice(&id.to_be_bytes());
@@ -895,6 +963,137 @@ mod tests {
             roster,
         }
     }
+    #[test]
+    fn every_owner_persists_all_certified_peer_descriptors_for_both_policies() {
+        use loki_relay_client::{seal_descriptor, CommIdentity, Descriptor, DescriptorRelay};
+        for count in [3u16, 4] {
+            let keys = Zeroizing::new(
+                (1..=count)
+                    .map(|id| crate::setup_transport::Identity::new(id).to_secret_bytes())
+                    .collect::<Vec<_>>(),
+            );
+            let identities: Vec<_> = keys
+                .iter()
+                .map(|raw| CommIdentity::from_serialized(raw).unwrap())
+                .collect();
+            let roster = loki_relay_protocol::types::Roster {
+                vault: [81; 32],
+                members: identities.iter().map(CommIdentity::public).collect(),
+            };
+            for owner in &identities {
+                let member = LoadedMember {
+                    identity: CommIdentity::from_serialized(
+                        &keys[usize::from(owner.public().id - 1)],
+                    )
+                    .unwrap(),
+                    roster: roster.clone(),
+                };
+                let mut config = LocalConfig::empty();
+                for peer in &identities {
+                    if peer.public().id == owner.public().id {
+                        continue;
+                    }
+                    let descriptor = Descriptor::new(
+                        roster.vault,
+                        roster_digest(&roster).unwrap(),
+                        peer.public().id,
+                        1,
+                        (1..=3u8)
+                            .map(|i| DescriptorRelay {
+                                route: RelayRoute {
+                                    pin: RelayPin {
+                                        key: [i; 32],
+                                        run: [i + 10; 32],
+                                    },
+                                    endpoint: format!("http://127.0.0.1:{}", 3100 + u16::from(i)),
+                                    mailbox: [i + 20; 32],
+                                    append_revision: 1,
+                                },
+                                append: Secret32::from_bytes([i + 30; 32]),
+                            })
+                            .collect(),
+                    );
+                    let wire = seal_descriptor(peer, &roster, &descriptor, &owner.public())
+                        .unwrap()
+                        .wire;
+                    config.import(&member, &wire).unwrap();
+                    config.import(&member, &wire).unwrap();
+                }
+                let encoded = config.encode(&member, 1).unwrap();
+                let reopened = LocalConfig::decode(&member, 1, &encoded).unwrap();
+                let verified = reopened.authenticated(&member).unwrap();
+                assert_eq!(verified.peers.len(), usize::from(count - 1));
+                assert_eq!(
+                    reopened.encode(&member, 1).unwrap().as_slice(),
+                    encoded.as_slice()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_owner_reopens_all_saved_descriptor_copies_for_both_policies() {
+        use loki_relay_client::{seal_descriptor, CommIdentity, Descriptor, DescriptorRelay};
+        for count in [3u16, 4] {
+            let keys = Zeroizing::new(
+                (1..=count)
+                    .map(|id| crate::setup_transport::Identity::new(id).to_secret_bytes())
+                    .collect::<Vec<_>>(),
+            );
+            let identities: Vec<_> = keys.iter()
+                .map(|raw| CommIdentity::from_serialized(raw).unwrap()).collect();
+            let roster = loki_relay_protocol::types::Roster {
+                vault: [81; 32],
+                members: identities.iter().map(CommIdentity::public).collect(),
+            };
+            for owner in &identities {
+                let member = LoadedMember {
+                    identity: CommIdentity::from_serialized(
+                        &keys[usize::from(owner.public().id - 1)],
+                    ).unwrap(),
+                    roster: roster.clone(),
+                };
+                let mut config = LocalConfig::empty();
+                config.own = (1..=3u8).map(|i| OwnerInbox {
+                    route: RelayRoute {
+                        pin: RelayPin { key: [i; 32], run: [i + 10; 32] },
+                        endpoint: format!("http://127.0.0.1:{}", 3100 + u16::from(i)),
+                        mailbox: [i + 20; 32],
+                        append_revision: 1,
+                    },
+                    read: Secret32::from_bytes([i + 40; 32]),
+                    append: Secret32::from_bytes([i + 30; 32]),
+                    admin: Secret32::from_bytes([i + 50; 32]),
+                }).collect();
+                let descriptor = Descriptor::new(
+                    roster.vault, roster_digest(&roster).unwrap(), owner.public().id, 1,
+                    config.own.iter().map(|inbox| DescriptorRelay {
+                        route: inbox.route.clone(),
+                        append: Secret32::from_bytes(*inbox.append.as_bytes()),
+                    }).collect(),
+                );
+                let self_wire = seal_descriptor(owner, &roster, &descriptor, &owner.public())
+                    .unwrap().wire;
+                let authenticated = open_descriptor(owner, &roster, &self_wire).unwrap();
+                config.self_wire = Some(self_wire);
+                config.couriers = roster.members.iter()
+                    .filter(|peer| peer.id != owner.public().id)
+                    .map(|peer| super::super::CourierFile::prepare(&member, &authenticated, peer).unwrap())
+                    .collect();
+                let wires = config.couriers.iter().map(|copy| copy.wire().to_vec()).collect::<Vec<_>>();
+                let encoded = config.encode(&member, 1).unwrap();
+                let reopened = LocalConfig::decode(&member, 1, &encoded).unwrap();
+                assert_eq!(reopened.couriers.len(), usize::from(count - 1));
+                for (copy, saved) in reopened.couriers.iter().zip(wires) {
+                    assert_eq!(copy.wire(), saved);
+                    let peer = &identities[usize::from(copy.peer() - 1)];
+                    assert_eq!(open_descriptor(peer, &roster, copy.wire()).unwrap().body().owner,
+                        owner.public().id);
+                }
+            }
+        }
+    }
+
     #[test]
     #[ignore]
     fn sealed_revision_process_child() {
@@ -1170,7 +1369,10 @@ mod tests {
     }
 
     fn finish_provision(root: &Path, endpoint: &str) -> LoadedMember {
-        let member = member();
+        finish_provision_with_count(root, endpoint, 3)
+    }
+    fn finish_provision_with_count(root: &Path, endpoint: &str, count: u16) -> LoadedMember {
+        let member = member_with_count(count);
         let store = ConfigStore::open(root, &root.join("pass")).unwrap();
         let mut db = ClientStore::open(&root.join("transport"), &member.roster, 1).unwrap();
         let targets: Vec<_> = (1..=3u8)
@@ -1207,6 +1409,149 @@ mod tests {
         store.save_revision(&mut db, &member, 2, &config).unwrap();
         member
     }
+    #[test]
+    fn saved_provisioning_and_rotation_keep_the_complete_roster_audience() {
+        for count in [3u16, 4] {
+            let root = rotation_root("relay-hosted-roster-rotation");
+            let member = finish_provision_with_count(&root, "http://127.0.0.1:1", count);
+            let store = ConfigStore::open(&root, &root.join("pass")).unwrap();
+            let mut db = ClientStore::open(&root.join("transport"), &member.roster, 1).unwrap();
+            let routing = store.routing(&db, &member).unwrap();
+            assert_eq!(routing.own.len(), 3);
+            let courier_dir = MemberDir::create(&root, "outbound").unwrap();
+            assert_eq!(store.publish_provision(&db, &member, courier_dir.path()).unwrap().len(),
+                usize::from(count - 1));
+            let reference = store.prepare_rotation(&mut db, &member).unwrap();
+            let prepared = store.load(&db, &member).unwrap().unwrap();
+            let pending_bytes = prepared.encode(&member, reference.revision()).unwrap();
+            assert!(store.routing(&db, &member).is_err());
+            drop(db);
+            let mut db = ClientStore::open(&root.join("transport"), &member.roster, 1).unwrap();
+            assert_eq!(store.prepare_rotation(&mut db, &member).unwrap(), reference);
+            assert_eq!(store.load(&db, &member).unwrap().unwrap()
+                .encode(&member, reference.revision()).unwrap().as_slice(), pending_bytes.as_slice());
+            let mut config = store.load(&db, &member).unwrap().unwrap();
+            let missing = config.couriers.pop().unwrap();
+            assert!(config.encode(&member, reference.revision()).is_err());
+            config.couriers.push(missing);
+            for index in 0..3 {
+                let revision = super::rotate_update(&config, index).unwrap().revision;
+                config.rotated.as_mut().unwrap()[index] = revision;
+            }
+            config.predecessor = db.config_reference().unwrap();
+            save_next(&store, &mut db, &member, &config).unwrap();
+            assert!(super::install_rotation(&member, &mut config).unwrap());
+            config.predecessor = db.config_reference().unwrap();
+            save_next(&store, &mut db, &member, &config).unwrap();
+            assert_eq!(config.couriers.len(), usize::from(count - 1));
+            assert!(store.routing(&db, &member).is_ok());
+            let next = store.prepare_next_rotation(&mut db, &member).unwrap();
+            assert_eq!(store.prepare_next_rotation(&mut db, &member).unwrap(), next);
+            assert!(store.routing(&db, &member).is_err());
+            drop(db);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn unlocked_configuration_reopens_without_exporting_a_passphrase_file() {
+        for count in [3u16, 4] {
+            let root = rotation_root("relay-hosted-unlocked-config");
+            let member = finish_provision_with_count(&root, "http://127.0.0.1:1", count);
+            let db = ClientStore::open(&root.join("transport"), &member.roster, 1).unwrap();
+            let legacy = ConfigStore::open(&root, &root.join("pass")).unwrap();
+            let reference = db.config_reference().unwrap().unwrap();
+            let prior = legacy.load(&db, &member).unwrap().unwrap()
+                .encode(&member, reference.revision()).unwrap();
+            fs::remove_file(root.join("pass")).unwrap();
+            assert!(ConfigStore::open(&root, &root.join("pass")).is_err());
+            let unlocked = ConfigStore::open_with_passphrase(&root, "synthetic").unwrap();
+            assert_eq!(unlocked.load(&db, &member).unwrap().unwrap()
+                .encode(&member, reference.revision()).unwrap().as_slice(), prior.as_slice());
+            assert!(ConfigStore::open_with_passphrase(&root, "wrong").unwrap()
+                .load(&db, &member).is_err());
+            assert!(ConfigStore::open_with_passphrase(&root, "").is_err());
+            assert!(ConfigStore::open_with_passphrase(&root, &"x".repeat(4097)).is_err());
+            assert!(!root.join("pass").exists());
+            assert_eq!(db.config_reference().unwrap().unwrap(), reference);
+            drop(db);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn scoped_install_adopts_only_the_exact_complete_saved_configuration() {
+        use loki_relay_client::{seal_descriptor, CommIdentity, Descriptor, DescriptorRelay};
+        for count in [3u16, 4] {
+            let source = rotation_root("relay-scoped-source");
+            let member = finish_provision_with_count(&source, "http://127.0.0.1:1", count);
+            let source_store = ConfigStore::open_with_passphrase(&source, "synthetic").unwrap();
+            let source_db = ClientStore::open(&source.join("transport"), &member.roster, 1).unwrap();
+            let mut config = source_store.load(&source_db, &member).unwrap().unwrap();
+            config.pending.clear();
+            config.operation = None;
+            config.provisioned = None;
+            config.predecessor = None;
+            for slot in 2..=count {
+                let mut raw = Zeroizing::new([slot as u8; 66]);
+                raw[..2].copy_from_slice(&slot.to_be_bytes());
+                let peer = CommIdentity::from_serialized(&raw).unwrap();
+                let descriptor = Descriptor::new(
+                    member.roster.vault, roster_digest(&member.roster).unwrap(), slot, 1,
+                    config.own.iter().map(|inbox| DescriptorRelay {
+                        route: RelayRoute { mailbox: [slot as u8 + inbox.route.pin.key[0] + 60; 32],
+                            ..inbox.route.clone() },
+                        append: Secret32::from_bytes([slot as u8 + inbox.route.pin.key[0] + 80; 32]),
+                    }).collect(),
+                );
+                config.import(&member, &seal_descriptor(&peer, &member.roster,
+                    &descriptor, &member.identity.public()).unwrap().wire).unwrap();
+            }
+            let target = rotation_root("relay-scoped-target");
+            let store = ConfigStore::open_with_passphrase(&target, "synthetic").unwrap();
+            let mut db = ClientStore::open(&target.join("transport"), &member.roster, 1).unwrap();
+            let prepared = config.encode(&member, 1).unwrap();
+            let filename = "relay-config-0000000000000001.sealed";
+            MemberDir::open(&target, "secrets").write_sealed(filename, &prepared, "synthetic").unwrap();
+            let saved_ciphertext = fs::read(target.join("secrets").join(filename)).unwrap();
+            let expected = ConfigReference::from_ciphertext(1, &saved_ciphertext).unwrap();
+            let missing = config.peer_wires.pop().unwrap();
+            assert!(store.install_scoped_configuration(&mut db, &member, &config).is_err());
+            assert!(db.config_reference().unwrap().is_none());
+            config.peer_wires.push(missing);
+            let old_read = *config.own[0].read.as_bytes();
+            config.own[0].read = Secret32::from_bytes([199; 32]);
+            assert!(store.install_scoped_configuration(&mut db, &member, &config).is_err());
+            assert!(db.config_reference().unwrap().is_none());
+            config.own[0].read = Secret32::from_bytes(old_read);
+            assert_eq!(store.install_scoped_configuration(&mut db, &member, &config).unwrap(), expected);
+            assert_eq!(store.install_scoped_configuration(&mut db, &member, &config).unwrap(), expected);
+            assert_eq!(fs::read(target.join("secrets").join(filename)).unwrap(), saved_ciphertext);
+            assert_eq!(store.routing(&db, &member).unwrap().peers.len(), usize::from(count - 1));
+            config.own[0].read = Secret32::from_bytes([199; 32]);
+            assert!(store.install_scoped_configuration(&mut db, &member, &config).is_err());
+            assert_eq!(db.config_reference().unwrap().unwrap(), expected);
+            config.own[0].read = Secret32::from_bytes(old_read);
+            drop(db);
+            let mut db = ClientStore::open(&target.join("transport"), &member.roster, 1).unwrap();
+            assert_eq!(store.install_scoped_configuration(&mut db, &member, &config).unwrap(), expected);
+            drop(db);
+            let fresh = rotation_root("relay-scoped-fresh");
+            let store = ConfigStore::open_with_passphrase(&fresh, "synthetic").unwrap();
+            let mut db = ClientStore::open(&fresh.join("transport"), &member.roster, 1).unwrap();
+            let installed = store.install_scoped_configuration(&mut db, &member, &config).unwrap();
+            assert_eq!(installed.revision(), 1);
+            assert_eq!(store.install_scoped_configuration(&mut db, &member, &config).unwrap(), installed);
+            assert_eq!(store.load(&db, &member).unwrap().unwrap().encode(&member, 1).unwrap().as_slice(),
+                prepared.as_slice());
+            drop(db);
+            drop(source_db);
+            fs::remove_dir_all(fresh).unwrap();
+            fs::remove_dir_all(target).unwrap();
+            fs::remove_dir_all(source).unwrap();
+        }
+    }
+
     fn rotation_root(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
             "{label}-{}-{}",
@@ -1693,7 +2038,7 @@ mod tests {
         let (store, db, member) = open_prepared("relay56-prepared-counter");
         let mut config = store.load(&db, &member).unwrap().unwrap();
         config.rotated.as_mut().unwrap()[2] = 9;
-        assert!(super::authoritative_rotation(&config).is_err());
+        assert!(super::authoritative_rotation(&member, &config).is_err());
     }
     #[test]
     fn partial_rotation_partial_install_fails_closed() {
@@ -1720,7 +2065,7 @@ mod tests {
         config.rotated.as_mut().unwrap()[0] = revision;
         config.own[0].append = Secret32::from_bytes(append);
         config.own[0].route.append_revision = revision;
-        assert!(super::authoritative_rotation(&config).is_err());
+        assert!(super::authoritative_rotation(&member, &config).is_err());
     }
     #[test]
     fn partial_rotation_counter_change_keeps_credentials() {
@@ -1730,7 +2075,7 @@ mod tests {
         let revision = super::rotate_update(&next, 0).unwrap().revision;
         next.rotated.as_mut().unwrap()[0] = revision;
         next.own[0].read = Secret32::from_bytes([0x44; 32]);
-        assert!(!super::rotation_transition_ok(&prior, &next));
+        assert!(!super::rotation_transition_ok(&member, &prior, &next));
     }
     #[test]
     fn partial_rotation_provisioned_counters_stay_while_rotated() {
@@ -1738,7 +2083,7 @@ mod tests {
         let prior = store.load(&db, &member).unwrap().unwrap();
         let mut next = store.load(&db, &member).unwrap().unwrap();
         next.provisioned = Some(vec![1, 1, 2]);
-        assert!(!super::rotation_transition_ok(&prior, &next));
+        assert!(!super::rotation_transition_ok(&member, &prior, &next));
     }
     #[test]
     fn partial_rotation_completed_generation_cannot_drop_rotated() {
@@ -1746,7 +2091,7 @@ mod tests {
         let prior = store.load(&db, &member).unwrap().unwrap();
         let mut next = store.load(&db, &member).unwrap().unwrap();
         next.rotated = None;
-        assert!(!super::rotation_transition_ok(&prior, &next));
+        assert!(!super::rotation_transition_ok(&member, &prior, &next));
     }
     #[test]
     fn partial_rotation_next_counters_start_at_zero() {
@@ -1777,7 +2122,7 @@ mod tests {
                 }
             }
         }
-        assert!(!super::next_generation_prepare(&prior, &next));
+        assert!(!super::next_generation_prepare(&member, &prior, &next));
     }
     #[test]
     fn partial_rotation_next_revision_is_current_plus_one() {
@@ -1808,7 +2153,7 @@ mod tests {
                 }
             }
         }
-        assert!(!super::next_generation_prepare(&prior, &next));
+        assert!(!super::next_generation_prepare(&member, &prior, &next));
     }
     #[test]
     fn partial_rotation_next_append_must_change() {
@@ -1837,7 +2182,7 @@ mod tests {
                 }
             }
         }
-        assert!(!super::next_generation_prepare(&prior, &next));
+        assert!(!super::next_generation_prepare(&member, &prior, &next));
     }
     #[test]
     fn partial_rotation_provision_skips_creation_after_prepare() {
@@ -2028,7 +2373,7 @@ fn same_rotate(a: &PendingRequest, b: &PendingRequest) -> bool {
         _ => false,
     }
 }
-fn creation_and_rotation_authority(prior: &LocalConfig, next: &LocalConfig) -> bool {
+fn creation_and_rotation_authority(member: &LoadedMember, prior: &LocalConfig, next: &LocalConfig) -> bool {
     let prior_creates = creation_requests(prior);
     let next_creates = creation_requests(next);
     if prior_creates.len() != next_creates.len()
@@ -2039,7 +2384,7 @@ fn creation_and_rotation_authority(prior: &LocalConfig, next: &LocalConfig) -> b
     {
         return false;
     }
-    if next_generation_prepare(prior, next) {
+    if next_generation_prepare(member, prior, next) {
         return true;
     }
     let prior_rotates = rotation_requests(prior);
@@ -2071,24 +2416,24 @@ fn credentials_same(prior: &LocalConfig, next: &LocalConfig) -> bool {
             .zip(&next.couriers)
             .all(|(a, b)| a.peer() == b.peer() && a.wire() == b.wire())
 }
-fn rotation_shape(config: &LocalConfig, counters: &[u64]) -> bool {
+fn rotation_shape(member: &LoadedMember, config: &LocalConfig, counters: &[u64]) -> bool {
     config.own.len() == 3
         && config
             .provisioned
             .as_ref()
             .is_some_and(|results| results.len() == 3 && results.iter().all(|result| *result == 1))
         && counters.len() == 3
-        && config.couriers.len() == 2
+        && config.couriers.len() == member.roster.members.len() - 1
         && config.self_wire.is_some()
         && creation_requests(config).len() == 3
         && rotation_requests(config).len() == 3
         && config.operation.is_some()
 }
-fn authoritative_rotation(config: &LocalConfig) -> MemberResult<bool> {
+fn authoritative_rotation(member: &LoadedMember, config: &LocalConfig) -> MemberResult<bool> {
     let Some(counters) = &config.rotated else {
         return Ok(false);
     };
-    if !rotation_shape(config, counters) {
+    if !rotation_shape(member, config, counters) {
         return Err(MemberError::Sealed);
     }
     let mut installed = 0usize;
@@ -2116,8 +2461,8 @@ fn authoritative_rotation(config: &LocalConfig) -> MemberResult<bool> {
     }
     Ok(true)
 }
-fn generation_complete(config: &LocalConfig) -> MemberResult<bool> {
-    if !authoritative_rotation(config)? {
+fn generation_complete(member: &LoadedMember, config: &LocalConfig) -> MemberResult<bool> {
+    if !authoritative_rotation(member, config)? {
         return Ok(false);
     }
     for index in 0..3 {
@@ -2127,8 +2472,8 @@ fn generation_complete(config: &LocalConfig) -> MemberResult<bool> {
     }
     Ok(true)
 }
-fn next_generation_prepare(prior: &LocalConfig, next: &LocalConfig) -> bool {
-    if !matches!(generation_complete(prior), Ok(true)) {
+fn next_generation_prepare(member: &LoadedMember, prior: &LocalConfig, next: &LocalConfig) -> bool {
+    if !matches!(generation_complete(member, prior), Ok(true)) {
         return false;
     }
     let Some(counters) = &next.rotated else {
@@ -2163,7 +2508,7 @@ fn next_generation_prepare(prior: &LocalConfig, next: &LocalConfig) -> bool {
             && previous.append.as_bytes() != update.append.as_bytes()
     })
 }
-fn rotation_transition_ok(prior: &LocalConfig, next: &LocalConfig) -> bool {
+fn rotation_transition_ok(member: &LoadedMember, prior: &LocalConfig, next: &LocalConfig) -> bool {
     if (prior.rotated.is_some() || next.rotated.is_some()) && prior.provisioned != next.provisioned
     {
         return false;
@@ -2178,7 +2523,7 @@ fn rotation_transition_ok(prior: &LocalConfig, next: &LocalConfig) -> bool {
                 && credentials_same(prior, next)
         }
         (Some(prior_counters), Some(next_counters)) => {
-            if next_generation_prepare(prior, next) {
+            if next_generation_prepare(member, prior, next) {
                 return true;
             }
             if prior_counters.len() != 3 || next_counters.len() != 3 {
@@ -2202,14 +2547,14 @@ fn rotation_transition_ok(prior: &LocalConfig, next: &LocalConfig) -> bool {
         (Some(_), None) => false,
     }
 }
-fn orphan_authority(prior: &LocalConfig, next: &LocalConfig) -> bool {
+fn orphan_authority(member: &LoadedMember, prior: &LocalConfig, next: &LocalConfig) -> bool {
     if prior.operation.is_none() || prior.operation != next.operation {
         return false;
     }
     if same_pending(prior, next) {
         return true;
     }
-    if next_generation_prepare(prior, next) {
+    if next_generation_prepare(member, prior, next) {
         return true;
     }
     prior.provisioned.is_some()
@@ -2218,7 +2563,7 @@ fn orphan_authority(prior: &LocalConfig, next: &LocalConfig) -> bool {
             .rotated
             .as_ref()
             .is_some_and(|counters| counters.len() == 3 && counters.iter().all(|n| *n == 0))
-        && creation_and_rotation_authority(prior, next)
+        && creation_and_rotation_authority(member, prior, next)
         && rotation_requests(prior).is_empty()
         && rotation_requests(next).len() == 3
         && credentials_same(prior, next)
@@ -2455,7 +2800,7 @@ impl ConfigStore {
             Ok(_) => {
                 let raw = bounded_read(&path, MAX_SEALED, true)?;
                 let candidate = LocalConfig::decode(member, revision, &unseal(&raw, &self.pass)?)?;
-                if !orphan_authority(&prior, &candidate) {
+                if !orphan_authority(member, &prior, &candidate) {
                     return Err(MemberError::Sealed);
                 }
                 self.save_revision(db, member, revision, &candidate)?;
@@ -2524,7 +2869,7 @@ impl ConfigStore {
                 .provisioned
                 .as_ref()
                 .is_none_or(|r| r.iter().any(|v| *v != 1))
-                || config.couriers.len() != 2)
+                || config.couriers.len() != member.roster.members.len() - 1)
         {
             return Err(MemberError::Sealed);
         }
@@ -2557,7 +2902,7 @@ impl ConfigStore {
             .provisioned
             .as_ref()
             .is_none_or(|r| r.iter().any(|v| *v != 1))
-            || config.couriers.len() != 2
+            || config.couriers.len() != member.roster.members.len() - 1
         {
             return Err(MemberError::Sealed);
         }
@@ -2570,9 +2915,10 @@ impl ConfigStore {
     fn current_rotation(
         &self,
         db: &ClientStore,
+        member: &LoadedMember,
         config: &LocalConfig,
     ) -> MemberResult<Option<ConfigReference>> {
-        if !authoritative_rotation(config)? {
+        if !authoritative_rotation(member, config)? {
             return Ok(None);
         }
         Ok(Some(
@@ -2590,7 +2936,7 @@ impl ConfigStore {
         use loki_relay_protocol::{http::encode_append_update, types::AppendUpdate};
         use rand_core::{OsRng, RngCore};
         let replacing = if config.rotated.is_some() {
-            if !generation_complete(&config)? {
+            if !generation_complete(member, &config)? {
                 return Err(MemberError::Sealed);
             }
             true
@@ -2598,7 +2944,7 @@ impl ConfigStore {
             let results = config.provisioned.clone().ok_or(MemberError::Sealed)?;
             if config.own.len() != 3
                 || results.len() != 3
-                || config.couriers.len() != 2
+                || config.couriers.len() != member.roster.members.len() - 1
                 || config.self_wire.is_none()
                 || creation_requests(&config).len() != 3
                 || config.operation.is_none()
@@ -2663,7 +3009,7 @@ impl ConfigStore {
     ) -> MemberResult<ConfigReference> {
         self.recover_provision(db, member)?;
         let config = self.load(db, member)?.ok_or(MemberError::Sealed)?;
-        if let Some(reference) = self.current_rotation(db, &config)? {
+        if let Some(reference) = self.current_rotation(db, member, &config)? {
             return Ok(reference);
         }
         self.write_rotation_generation(db, member, config)
@@ -2678,9 +3024,9 @@ impl ConfigStore {
         if config.rotated.is_none() {
             return Err(MemberError::Sealed);
         }
-        if !generation_complete(&config)? {
+        if !generation_complete(member, &config)? {
             return self
-                .current_rotation(db, &config)?
+                .current_rotation(db, member, &config)?
                 .ok_or(MemberError::Sealed);
         }
         self.write_rotation_generation(db, member, config)

@@ -25,6 +25,7 @@ async function call(path, body, key = session) {
 async function refresh() {
   if (!session) {
     $('connect').hidden = false;
+    $('relay-network').hidden = true;
     $('vaults').hidden = true;
     $('create-vault-card').hidden = true;
     $('disconnect').hidden = true;
@@ -36,13 +37,46 @@ async function refresh() {
     $('vaults').hidden = false;
     $('create-vault-card').hidden = false;
     $('disconnect').hidden = false;
+    $('relay-network').hidden = false;
+    $('setup-relays').hidden = result.relay_network?.transport === 'hosted';
+    $('relay-network-mode').textContent = result.relay_network?.transport === 'hosted' ? 'Hosted vaults connect automatically while their signers are unlocked.' : 'One setup connects all eligible vaults in this local environment. Other members connect automatically when they unlock their signers.';
+    $('setup-relays').textContent = result.relay_network?.enabled ? 'Retry connections' : 'Set up relays';
+    $('setup-relays').disabled = relayPending;
+    $('relay-network-detail').textContent = relayPending ? 'Starting local relays and connecting eligible vaults…' : result.relay_network?.detail || '';
     $('profile-name').textContent = `${result.profile}'s vaults`;
     const list = $('vault-list');
     list.replaceChildren();
     if (!result.vaults.length) list.textContent = 'No vaults yet. Create or join one in your signer window.';
     for (const vault of result.vaults) {
-      const item = document.createElement('p');
-      item.textContent = `${vault.name} · member ${vault.slot} · ${vault.phase.replaceAll('_', ' ')}`;
+      const item = document.createElement('div');
+      item.className = 'vault-item';
+      const name = document.createElement('p');
+      name.textContent = `${vault.name} · 2 of ${vault.total_members || 3} · member ${vault.slot} · ${vault.phase.replaceAll('_', ' ')}`;
+      const fund = document.createElement('button');
+      fund.type = 'button';
+      fund.className = 'secondary';
+      const funding = vault.funding || {};
+      const busy = fundingRequests.has(vault.vault);
+      const storageKey = `lokiFundingRequest:${vault.vault}`;
+      if (!busy && funding.phase === 'confirmed' && funding.request_id === sessionStorage.getItem(storageKey))
+        sessionStorage.removeItem(storageKey);
+      fund.textContent = busy ? 'Funding…' : ['failed', 'pending'].includes(funding.phase) ? 'Retry funding' : 'Fund Vault';
+      fund.setAttribute('aria-label', `${fund.textContent} for ${vault.name}`);
+      fund.title = 'Add 5 local test ZEC to this vault';
+      fund.hidden = vault.transport === 'hosted';
+      fund.disabled = !funding.available || busy;
+      fund.addEventListener('click', () => fundVault(vault));
+      const relay = vault.relay_setup || {};
+      const detail = document.createElement('small');
+      detail.className = 'relay-detail';
+      detail.setAttribute('role', 'status');
+      detail.textContent = vault.error || (vault.missing_slots?.length && vault.handoff !== 'ready' ? `Waiting for members ${vault.missing_slots.join(', ')}. ` : '') + (relay.detail || '');
+      const funded = document.createElement('small');
+      funded.className = 'relay-detail';
+      funded.setAttribute('role', 'status');
+      funded.textContent = busy ? 'Sending 5 test ZEC; waiting for confirmation.' : funding.detail || '';
+      funded.hidden = !funded.textContent;
+      item.append(name, fund, detail, funded);
       list.append(item);
     }
   } catch (error) {
@@ -54,6 +88,42 @@ async function refresh() {
     message(error.message, true);
   }
 }
+
+const fundingRequests = new Map();
+async function fundVault(vault) {
+  if (fundingRequests.has(vault.vault)) return;
+  const storageKey = `lokiFundingRequest:${vault.vault}`;
+  const requestId = sessionStorage.getItem(storageKey)
+    || (['pending', 'failed'].includes(vault.funding?.phase) && vault.funding.request_id)
+    || crypto.randomUUID().replaceAll('-', '');
+  sessionStorage.setItem(storageKey, requestId);
+  fundingRequests.set(vault.vault, requestId);
+  try {
+    await refresh();
+    const result = await call('fund', {vault: vault.vault, request_id: requestId});
+    if (result.status !== 'confirmed' || result.amount_zatoshi !== 500000000)
+      throw new Error('Funding is not confirmed yet. Retry funding to check the same request.');
+    sessionStorage.removeItem(storageKey);
+    message(`Funded “${vault.name}” with 5 local test ZEC. Open the vault in your signer and refresh its balance.`);
+  } catch (error) { message(error.message, true); }
+  finally { fundingRequests.delete(vault.vault); await refresh(); }
+}
+
+let relayPending = false;
+async function requestRelaySetup() {
+  if (relayPending) return;
+  relayPending = true;
+  $('setup-relays').disabled = true;
+  try {
+    message('Starting local relays and connecting eligible vaults…');
+    await refresh();
+    await call('relay-setup-all', {});
+    message('Local relays are running. All eligible vaults connect automatically as their signers unlock.');
+  } catch (error) { message(error.message, true); }
+  finally { relayPending = false; await refresh(); }
+}
+
+$('setup-relays').addEventListener('click', requestRelaySetup);
 
 $('connect-button').addEventListener('click', async () => {
   $('connect-button').disabled = true;

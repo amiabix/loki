@@ -423,10 +423,13 @@ class MemberWalletTest(unittest.TestCase):
                     self.assertEqual(wallet.status(vault)["phase"], "final_backup")
                 wallet.verify_final_backup(vault, words, base64.b64encode(final_card).decode())
             for wallet in wallets:
-                with self.assertRaisesRegex(ValueError, "2-of-4 payments are not available"):
-                    wallet.address(vault)
-                with self.assertRaisesRegex(ValueError, "2-of-4 payments are not available"):
-                    wallet.prepare_payment(vault, "uregtest1recipient", "40000000", "memo", "AB")
+                self.assertTrue(wallet.address(vault).startswith("uregtest1"))
+            for pair in ("AB", "AC", "AD", "BC", "BD", "CD"):
+                with patch.object(wallets[0], "command", side_effect=ValueError("native preparation reached")) as native:
+                    with self.assertRaisesRegex(ValueError, "native preparation reached"):
+                        wallets[0].prepare_payment(vault, "uregtest1recipient", "40000000", "memo", pair)
+                    self.assertEqual(native.call_args.args[0], "prepare")
+                    self.assertEqual(native.call_args.args[-1], pair)
             addresses = [wallet.command("address", wallet.data / "vaults" / vault, "@pass")
                          for wallet in wallets]
             self.assertEqual(len(set(addresses)), 1)
@@ -437,9 +440,8 @@ class MemberWalletTest(unittest.TestCase):
             card = (wallets[0].data / "vaults" / vault / "final-card" / "vault.card").read_bytes()
             result = restored.restore_vault("Four person treasury", saved_words[0],
                                             base64.b64encode(card).decode())
-            self.assertNotIn("address", result)
-            with self.assertRaisesRegex(ValueError, "2-of-4 payments are not available"):
-                restored.address(vault)
+            self.assertEqual(result["address"], addresses[0])
+            self.assertEqual(restored.address(vault), addresses[0])
 
     def test_create_join_certify_and_check_backups_in_three_roots(self):
         if not SETUP.is_file():

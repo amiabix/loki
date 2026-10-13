@@ -26,7 +26,7 @@ rand_chacha        = "0.3"
 blake2b_simd       = "1"
 blake3             = "1.8"
 zeroize            = "1"
-bip39              = { version = "2.2.2", default-features = false, features = ["std"] }
+bip39              = { version = "2.2.2", default-features = false, features = ["std", "zeroize"] }
 zip32              = "=0.2.1"
 # At-rest encryption for member secrets (`MemberDir::write_sealed`). XChaCha20-Poly1305
 # is already in the graph via zcash_note_encryption, so only the KDF is new: Argon2id is
@@ -53,6 +53,7 @@ ciborium-io        = "0.2"
 # Compile probes that reproduce the two blocked checkpoint-1 requirements.
 # Each FAILS TO COMPILE on purpose; the compiler error is the blocker report.
 probe-zip2005 = []
+setup-fault-injection = ["relay-communication"]
 relay-communication = ["dep:loki-relay-client", "dep:loki-relay-protocol"]
 
 # Caller-supplied alpha is threaded into the spend before rk is derived.
@@ -73,3 +74,6 @@ optional = true
 name = "loki_relay_member"
 path = "src/bin/loki_relay_member.rs"
 required-features = ["relay-communication"]
+
+[dependencies.sha2]
+version = "=0.10.9"

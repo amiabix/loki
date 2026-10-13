@@ -13,6 +13,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 const MAGIC: &[u8; 8] = b"LOKIDKG1";
 const ROUND1_MAGIC: &[u8; 8] = b"LOKIR1V1";
+const AGREEMENT_MAGIC: &[u8; 8] = b"LOKIAGV1";
 const CERT_MAGIC: &[u8; 8] = b"LOKICRV1";
 const BACKUP_MAGIC: &[u8; 8] = b"LOKIBKV1";
 const HEADER: usize = 8 + 32 + 2 + 2 + 24 + 4;
@@ -76,6 +77,26 @@ impl Identity {
             signing: self.signing.verifying_key().to_bytes(),
             encryption: PublicKey::from(&self.encryption).to_bytes(),
         }
+    }
+
+    pub fn sign_setup_agreement(
+        &self,
+        vault: &[u8; 32],
+        payload: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        self.sign_public(AGREEMENT_MAGIC, vault, payload)
+    }
+    pub fn verify_setup_agreement(
+        &self,
+        sender: &PublicIdentity,
+        vault: &[u8; 32],
+        wire: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        self.verify_public(AGREEMENT_MAGIC, sender, vault, wire)
+    }
+
+    pub fn sign_round2_self(&self, vault: &[u8; 32], payload: &[u8]) -> Result<Vec<u8>, String> {
+        self.sign_public(b"LOKISR21", vault, payload)
     }
 
     pub fn sign_round1(&self, vault: &[u8; 32], payload: &[u8]) -> Result<Vec<u8>, String> {

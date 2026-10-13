@@ -293,7 +293,7 @@ fn descriptor_binding_acceptance_different_vault() {
 #[test]
 fn descriptor_binding_acceptance_different_roster() {
     let mut other_roster = roster();
-    other_roster.members[2].encryption = identity(1).public().encryption;
+    other_roster.members[2].encryption = identity(4).public().encryption;
     let mut input = descriptor(8);
     input.roster = roster_digest(&other_roster).unwrap();
     let wire = seal_descriptor(&identity(1), &other_roster, &input, &identity(2).public())
@@ -409,7 +409,6 @@ body_cases! {
 #[test]
 fn descriptor_binding_url_rejections() {
     for url in [
-        "https://127.0.0.1:8001",
         "http://localhost:8001",
         "http://127.0.0.2:8001",
         "http://0.0.0.0:8001",
@@ -461,6 +460,8 @@ fn descriptor_binding_url_rejections() {
 #[test]
 fn descriptor_binding_url_acceptance_and_revision_independence() {
     for url in [
+        "https://relay.example:443",
+        "https://127.0.0.1:8001",
         "http://127.0.0.1:80",
         "http://127.0.0.1:65535/",
         "http://[::1]:80",
@@ -517,7 +518,7 @@ fn descriptor_binding_opening_recipient_and_roster() {
 #[test]
 fn descriptor_binding_uncertified_recipient_signing_identity() {
     let mut uncertified = roster();
-    uncertified.members[1].signing = identity(3).public().signing;
+    uncertified.members[1].signing = identity(4).public().signing;
     let digest = roster_digest(&uncertified).unwrap();
     let mut fields = body_fields();
     fields[2] = Value::Bytes(digest.to_vec());
@@ -532,7 +533,7 @@ fn descriptor_binding_uncertified_recipient_signing_identity() {
 #[test]
 fn descriptor_binding_uncertified_signing_owner() {
     let mut uncertified = roster();
-    uncertified.members[0].encryption = identity(3).public().encryption;
+    uncertified.members[0].encryption = identity(4).public().encryption;
     let mut input = descriptor(7);
     input.roster = roster_digest(&uncertified).unwrap();
     assert!(seal_descriptor(&identity(1), &uncertified, &input, &identity(2).public()).is_err());
@@ -1382,7 +1383,6 @@ fn owner_provision_http_literal_endpoint() {
         "http://127.0.0.1:0",
         "http://127.0.0.1:1/?x",
         "http://127.0.0.1:1/..",
-        "https://127.0.0.1:1",
         "http://u@127.0.0.1:1",
     ] {
         let route = RelayRoute {

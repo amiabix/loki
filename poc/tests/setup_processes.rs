@@ -501,7 +501,7 @@ fn three_processes_create_one_vault_without_sharing_secrets() {
             "backup verify: {}",
             String::from_utf8_lossy(&checked.stderr)
         );
-        assert!(!member.join("secrets/backup-words.sealed").exists());
+        assert!(member.join("secrets/backup-words.sealed").exists());
         if id < 3 {
             let pending = Command::new(exe)
                 .args([
@@ -607,6 +607,7 @@ fn three_processes_create_one_vault_without_sharing_secrets() {
             "backup finalization: {}",
             String::from_utf8_lossy(&finalized.stderr)
         );
+        assert!(!member.join("secrets/backup-words.sealed").exists());
         let repeated = Command::new(exe)
             .args([
                 "backup-finalize",

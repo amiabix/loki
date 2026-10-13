@@ -242,10 +242,10 @@ fn roster(value: &Value) -> MemberResult<Roster> {
     }
     let vault = hex32(&value["vault"])?;
     let entries = value["members"].as_array().ok_or(MemberError::Roster)?;
-    if entries.len() != 3 {
+    if !matches!(entries.len(), 3 | 4) {
         return Err(MemberError::Roster);
     }
-    let mut members = Vec::with_capacity(3);
+    let mut members = Vec::with_capacity(entries.len());
     for entry in entries {
         let id = u16::try_from(entry["id"].as_u64().ok_or(MemberError::Roster)?)
             .map_err(|_| MemberError::Roster)?;
@@ -259,7 +259,7 @@ fn roster(value: &Value) -> MemberResult<Roster> {
         });
     }
     members.sort_by_key(|m| m.id);
-    if members.iter().map(|m| m.id).collect::<Vec<_>>() != [1, 2, 3] {
+    if members.iter().enumerate().any(|(index, member)| member.id != index as u16 + 1) {
         return Err(MemberError::Roster);
     }
     Ok(Roster { vault, members })

@@ -18,6 +18,7 @@ type Kem = X25519HkdfSha256;
 pub enum SealDomain {
     Message,
     Config,
+    Setup,
 }
 
 impl SealDomain {
@@ -25,6 +26,7 @@ impl SealDomain {
         match self {
             Self::Message => envelope::MESSAGE_MAGIC,
             Self::Config => envelope::CONFIG_MAGIC,
+            Self::Setup => envelope::SETUP_MAGIC,
         }
     }
 
@@ -32,6 +34,7 @@ impl SealDomain {
         match self {
             Self::Message => b"Loki_Relay_Envelope_v1\0",
             Self::Config => b"Loki_Relay_Config_Envelope_v1\0",
+            Self::Setup => b"Loki_Setup_Envelope_v1\0",
         }
     }
 
@@ -39,6 +42,7 @@ impl SealDomain {
         match self {
             Self::Message => b"Loki_Relay_Seal_v1",
             Self::Config => b"Loki_Relay_Config_Seal_v1",
+            Self::Setup => b"Loki_Setup_Seal_v1",
         }
     }
 }
@@ -52,7 +56,7 @@ pub struct SealContext {
 }
 
 fn encode_seal_info(ctx: &SealContext) -> ClientResult<Vec<u8>> {
-    if !(1..=3).contains(&ctx.recipient.id) {
+    if !(1..=4).contains(&ctx.recipient.id) {
         return Err(ClientError::Identity);
     }
     Ok(canonical::encode(&Value::Array(vec![
@@ -89,10 +93,15 @@ fn length_prefix_and_zero_pad(
 
 pub fn seal_record(ctx: &SealContext, record: &[u8]) -> ClientResult<Object> {
     envelope::padded_wire_length(record.len())?;
-    canonical::decode(
+    let decode = if ctx.domain == SealDomain::Setup {
+        canonical::decode
+    } else {
+        canonical::decode_without_text
+    };
+    crate::setup::PrivateValue(decode(
         record,
         MAX_WIRE_LEN - HEADER_LEN - TAG_LEN - LENGTH_PREFIX_LEN,
-    )?;
+    )?);
     let pk = <Kem as KemTrait>::PublicKey::from_bytes(&ctx.recipient.encryption)?;
     let info = encode_seal_info(ctx)?;
     let (enc, mut sender) =
@@ -147,9 +156,14 @@ pub fn open_record(
         return Err(WireError::Canonical.into());
     }
     let record = &padded[LENGTH_PREFIX_LEN..end];
-    canonical::decode(
+    let decode = if ctx.domain == SealDomain::Setup {
+        canonical::decode
+    } else {
+        canonical::decode_without_text
+    };
+    crate::setup::PrivateValue(decode(
         record,
         MAX_WIRE_LEN - HEADER_LEN - TAG_LEN - LENGTH_PREFIX_LEN,
-    )?;
+    )?);
     Ok(record.to_vec())
 }

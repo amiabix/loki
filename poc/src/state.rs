@@ -80,8 +80,8 @@ impl MemberDir {
 // The whole 49-byte header is passed as associated data, so the salt and nonce are
 // covered by the tag: editing them is as detectable as editing the ciphertext.
 //
-// Not covered: the key material is not zeroized after use, and nothing here defends
-// against an attacker who can read the process's memory while a member is signing.
+// This file format does not defend against an attacker who can read the process's
+// memory while a member is signing.
 
 use argon2::Argon2;
 use chacha20poly1305::{
@@ -98,11 +98,11 @@ const SEAL_HEADER: usize = SEAL_MAGIC.len() + SEAL_SALT + SEAL_NONCE;
 /// Stretch the passphrase over `salt` into a cipher. Fails only on invalid parameters,
 /// which here means a salt shorter than Argon2's minimum — i.e. a corrupt header.
 fn seal_cipher(passphrase: &str, salt: &[u8]) -> io::Result<XChaCha20Poly1305> {
-    let mut key = [0u8; 32];
+    let mut key = zeroize::Zeroizing::new([0u8; 32]);
     Argon2::default()
-        .hash_password_into(passphrase.as_bytes(), salt, &mut key)
+        .hash_password_into(passphrase.as_bytes(), salt, &mut *key)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    Ok(XChaCha20Poly1305::new(&key.into()))
+    XChaCha20Poly1305::new_from_slice(&*key).map_err(|_| io::Error::other("invalid sealing key"))
 }
 
 impl MemberDir {

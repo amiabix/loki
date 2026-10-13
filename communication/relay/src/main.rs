@@ -35,6 +35,7 @@ struct InitArgs {
     provision: PathBuf,
     limits: Limits,
     listen: SocketAddr,
+    public_origin: Option<String>,
 }
 
 struct ServeArgs {
@@ -68,7 +69,7 @@ impl Cli {
         };
         match command.as_str() {
             "init" => {
-                if flags.len() != 6 {
+                if flags.len() != 6 && flags.len() != 7 {
                     return Err(RelayError::MalformedRequest);
                 }
                 Ok(Self::Init(InitArgs {
@@ -80,6 +81,13 @@ impl Cli {
                         mailbox_count: decimal(&take("--mailbox-count")?)?,
                     },
                     listen: parse_listen(&take("--listen")?)?,
+                    public_origin: if flags.len() == 7 {
+                        let origin = take("--public-origin")?;
+                        loki_relay_server::validate_public_origin(&origin)?;
+                        Some(origin)
+                    } else {
+                        None
+                    },
                 }))
             }
             "serve" => {
@@ -143,7 +151,7 @@ fn init(args: InitArgs) -> RelayResult<()> {
     let store = RelayStore::init(
         &args.root,
         run_id,
-        &relay_url(args.listen),
+        &args.public_origin.unwrap_or_else(|| relay_url(args.listen)),
         &secret,
         provisioning_verifier(run_id, &secret),
         args.limits,
@@ -154,7 +162,9 @@ fn init(args: InitArgs) -> RelayResult<()> {
 
 fn serve(args: ServeArgs) -> RelayResult<()> {
     let manifest = manifest_url(&args.root)?;
-    if manifest != relay_url(args.listen) {
+    if manifest.starts_with("https://") {
+        loki_relay_server::validate_public_origin(&manifest)?;
+    } else if manifest != relay_url(args.listen) {
         return Err(RelayError::MalformedRequest);
     }
     let limits = persisted_limits(&args.root)?;
@@ -170,6 +180,28 @@ fn serve(args: ServeArgs) -> RelayResult<()> {
         let bound = listener
             .local_addr()
             .map_err(|_| RelayError::StorageUnavailable)?;
+        let cleanup_db = db.clone();
+        let cleanup = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|n| n.as_secs())
+                    .unwrap_or(0);
+                if now == 0 {
+                    continue;
+                }
+                let result = match cleanup_db.cleanup_setup(now) {
+                    Ok(reply) => reply.receive().await,
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = result {
+                    eprintln!("relay_cleanup_error_{}", error.code());
+                }
+            }
+        });
         let app = router(db);
         println!("{}", relay_url(bound));
         io::stdout()
@@ -179,6 +211,8 @@ fn serve(args: ServeArgs) -> RelayResult<()> {
             .with_graceful_shutdown(shutdown_signal())
             .await
             .map_err(|_| RelayError::StorageUnavailable)?;
+        cleanup.abort();
+        let _ = cleanup.await;
         owner.shutdown().await
     })
 }

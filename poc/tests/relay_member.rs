@@ -15,6 +15,7 @@ use zeroize::Zeroizing;
 const PASS: &str = " synthetic setup pass ";
 static CERTIFIED: OnceLock<PathBuf> = OnceLock::new();
 static CERTIFIED_POLICY: OnceLock<PathBuf> = OnceLock::new();
+static CERTIFIED_FOUR: OnceLock<PathBuf> = OnceLock::new();
 fn private(path: &Path, directory: bool) {
     #[cfg(unix)]
     {
@@ -40,13 +41,17 @@ fn certified_setup() -> &'static PathBuf {
     certified_setup_with_policy(false)
 }
 fn certified_setup_with_policy(policy: bool) -> &'static PathBuf {
-    (if policy { &CERTIFIED_POLICY } else { &CERTIFIED }).get_or_init(|| {
+    certified_setup_with_count(policy, 3)
+}
+fn certified_setup_with_count(policy: bool, count: u16) -> &'static PathBuf {
+    assert!(count == 3 || (count == 4 && policy));
+    (if count == 4 { &CERTIFIED_FOUR } else if policy { &CERTIFIED_POLICY } else { &CERTIFIED }).get_or_init(|| {
         let root = scratch();
         let exchange = root.join("exchange");
         fs::create_dir(&exchange).unwrap();
         let exe = env!("CARGO_BIN_EXE_loki_setup_member");
         let mut public = Vec::new();
-        for id in 1..=3 {
+        for id in 1..=count {
             let member = root.join(format!("member-{id}"));
             fs::create_dir(&member).unwrap();
             private(&member, true);
@@ -83,7 +88,7 @@ fn certified_setup_with_policy(policy: bool) -> &'static PathBuf {
         assert!(out.status.success());
         let fp = String::from_utf8(out.stdout).unwrap();
         let mut children = Vec::new();
-        for id in 1..=3 {
+        for id in 1..=count {
             let member = root.join(format!("member-{id}"));
             children.push(
                 Command::new(exe)
@@ -3323,4 +3328,15 @@ fn communication_cli_missing_referenced_sealed_config_fails_closed() {
     assert_eq!(db.config_reference().unwrap().as_ref(), Some(&reference));
     let retained_bytes = fs::read(&retained).unwrap();
     assert!(retained_bytes == original, "original seal retained");
+}
+
+#[test]
+fn certified_four_member_roster_loads_each_owned_member() {
+    let base=certified_setup_with_count(true,4);
+    for id in 1..=4 {
+        let member=base.join(format!("member-{id}"));
+        let loaded=load(&member,&member.join("pass"),&base.join("roster.json")).unwrap();
+        assert_eq!(loaded.identity.public().id,id);
+        assert_eq!(loaded.roster.members.iter().map(|m|m.id).collect::<Vec<_>>(),vec![1,2,3,4]);
+    }
 }

@@ -899,9 +899,33 @@ fn run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn hosted(command: &str, args: &[String]) -> Result<(), String> {
+    #[cfg(feature = "relay-communication")]
+    {
+        if command.starts_with("setup-backup-") {
+            match loki_poc::setup_relay::backup_command(command, args)? {
+                loki_poc::setup_relay::BackupCommandOutput::Words(words) => {
+                    println!("{}", words.as_str())
+                }
+                loki_poc::setup_relay::BackupCommandOutput::Public(status) => println!("{status}"),
+            }
+        } else {
+            let status = loki_poc::setup_relay::command(command, args)?;
+            println!("{status}");
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "relay-communication"))]
+    {
+        let _ = (command, args);
+        Err("setup_transport_unavailable".into())
+    }
+}
+
 fn main() {
     let args: Vec<_> = env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
+        Some(command @ ("setup-config-check" | "setup-create" | "setup-join" | "setup-step" | "setup-abort" | "setup-agree" | "setup-fingerprint" | "setup-info" | "setup-evidence" | "setup-status" | "setup-invite" | "setup-backup-create" | "setup-backup-verify" | "setup-backup-finalize")) => hosted(command, &args[1..]),
         Some("identity") => identity(&args[1..]),
         Some("identity-public") => identity_public(&args[1..]),
         Some("profile-create") => profile_create(&args[1..]),

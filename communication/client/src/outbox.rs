@@ -162,7 +162,7 @@ pub struct UploadPass {
 pub struct DeliveryReport {
     key: LogicalKey,
     source_root: Id32,
-    members: [Vec<(Id32, Id32)>; 3],
+    members: Vec<Vec<(Id32, Id32)>>,
     whole: Vec<(Id32, Id32)>,
 }
 
@@ -170,7 +170,7 @@ impl DeliveryReport {
     pub(crate) fn new(
         key: LogicalKey,
         source_root: Id32,
-        members: [Vec<(Id32, Id32)>; 3],
+        members: Vec<Vec<(Id32, Id32)>>,
         whole: Vec<(Id32, Id32)>,
     ) -> Self {
         Self {
@@ -199,13 +199,14 @@ impl DeliveryReport {
 
     /// Pin key and run pairs that cover every required object of one recipient.
     pub fn member_pins(&self, recipient: MemberId) -> &[(Id32, Id32)] {
-        match recipient {
-            1..=3 => &self.members[(recipient - 1) as usize],
-            _ => &[],
-        }
+        recipient
+            .checked_sub(1)
+            .and_then(|index| self.members.get(index as usize))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
-    /// Pin key and run pairs complete for every required object of all three copies.
+    /// Pin key and run pairs complete for every required object of all roster copies.
     pub fn whole_pins(&self) -> &[(Id32, Id32)] {
         &self.whole
     }
@@ -338,6 +339,7 @@ pub async fn upload_pending(
         }
         transmit(store, http, &reference, &certified, &upload, now_ms).await?;
     }
+    store.release_stored_capacity(roster, identity, logical, config, self_route)?;
     Ok(UploadPass {
         needs_route,
         stopped_third,

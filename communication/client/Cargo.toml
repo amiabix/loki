@@ -11,7 +11,7 @@ hpke = { version = "=0.14.1", default-features = false, features = ["alloc", "ge
 ed25519-dalek = "=2.2.0"
 rusqlite = { version = "=0.37.0", features = ["bundled"] }
 tokio = { version = "=1.53.2", features = ["macros", "rt-multi-thread", "sync", "net", "time", "signal"] }
-reqwest = { version = "=0.13.5", default-features = false }
+reqwest = { version = "=0.13.5", default-features = false, features = ["rustls"] }
 base64 = "=0.22.1"
 hex = "=0.4.3"
 getrandom = "=0.4.3"
@@ -22,3 +22,6 @@ sha2 = "=0.10.9"
 loki-relay-server = { path = "../relay" }
 rand_core = "=0.10.1"
 serde_json = "=1.0.151"
+tokio-rustls = "=0.26.5"
+tokio = { version = "=1.53.2", features = ["io-util"] }
+axum = { version = "=0.8.6", default-features = false, features = ["http1", "tokio"] }

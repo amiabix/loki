@@ -31,6 +31,7 @@ pub mod rpc;
 pub mod scan;
 pub mod scanstate;
 pub mod setup_transport;
+pub mod setup_ceremony;
 pub mod signing_session;
 pub mod state;
 pub mod vault;
@@ -246,3 +247,12 @@ mod checkpoint_1 {
         fn _confirmed<P>(_: Option<DeferredPcztBuilder<P>>, _: Option<Pczt>) {}
     }
 }
+
+#[cfg(feature = "relay-communication")]
+pub mod setup_relay;
+
+#[cfg(feature = "relay-communication")]
+pub(crate) mod setup_backup;
+
+#[cfg(feature = "relay-communication")]
+pub(crate) mod setup_retry;

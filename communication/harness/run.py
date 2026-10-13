@@ -27,12 +27,19 @@ class OwnershipError(RuntimeError):
     pass
 
 
-class CapturedOutput:
-    """Bounded stdout from one owned command. Stderr is not retained."""
+class OwnedCommandError(OwnershipError):
+    def __init__(self, result):
+        super().__init__('Owned command exited unsuccessfully')
+        self.capacity = result.stderr.strip() == b'capacity'
 
-    def __init__(self, returncode, stdout):
+
+class CapturedOutput:
+    """Bounded output from one owned command; diagnostics stay outside public reports."""
+
+    def __init__(self, returncode, stdout, stderr=b''):
         self.returncode = returncode
         self.stdout = stdout
+        self.stderr = stderr
 
 
 def preflight_ports(ports):
@@ -55,11 +62,15 @@ def preflight_ports(ports):
 
 
 def find_binary(name, *, workspace, target_dir=None, profile='debug', env=None):
+    env = os.environ if env is None else env
+    if Path(workspace).resolve().name == 'poc' and profile == 'debug':
+        profile = env.get('LOKI_POC_BIN_PROFILE', profile)
+        if profile not in ('debug', 'release'):
+            raise OwnershipError('PoC acceptance profile must be debug or release')
     if any(not isinstance(part, str) or not part or part in ('.', '..') or
            Path(part).name != part for part in (name, profile)):
         raise OwnershipError('Binary and profile must be single path components')
     workspace = Path(workspace).resolve()
-    env = os.environ if env is None else env
     target = Path(target_dir if target_dir is not None else
                   env.get('CARGO_TARGET_DIR', 'target'))
     if not target.is_absolute():
@@ -189,7 +200,7 @@ class OwnedRun:
                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                          shell=False, bufsize=0)
                 self._children.append(child)
-                items.append({'child': child, 'stdout': bytearray(), 'stderr_len': 0})
+                items.append({'child': child, 'stdout': bytearray(), 'stderr': bytearray()})
             pending = list(items)
             while pending:
                 remaining = deadline - time.monotonic()
@@ -221,12 +232,12 @@ class OwnedRun:
                                 'Owned command output exceeded the capture bound')
                         item['stdout'].extend(chunk)
                     else:
-                        item['stderr_len'] += len(chunk)
-                        if item['stderr_len'] > output_limit:
+                        item['stderr'].extend(chunk)
+                        if len(item['stderr']) > output_limit:
                             raise OwnershipError(
                                 'Owned command output exceeded the capture bound')
                 pending = self._reap_captured(pending, deadline)
-            return [CapturedOutput(item['code'], bytes(item['stdout'])) for item in items]
+            return [CapturedOutput(item['code'], bytes(item['stdout']), bytes(item['stderr'])) for item in items]
         except BaseException as original:
             incomplete = False
             for item in items:
@@ -612,12 +623,12 @@ _HEX64 = re.compile(r'[0-9a-f]{64}\Z')
 _PUBLIC_INT = re.compile(r'[1-9][0-9]*\Z')
 _CONFIG_LINE = re.compile(r'config revision=([1-9][0-9]*) hash=([0-9a-f]{64})\Z')
 _INBOX_LINE = re.compile(
-    r'inbox member=([123]) pin=([0-9a-f]{64}) run=([0-9a-f]{64}) '
+    r'inbox member=([1234]) pin=([0-9a-f]{64}) run=([0-9a-f]{64}) '
     r'mailbox=([0-9a-f]{64}) append_revision=([1-9][0-9]*) endpoint=(\S+)\Z')
 _COURIER_LINE = re.compile(
-    r'courier=([0-9a-f]{64})-relay-config-([123])-([123])-([1-9][0-9]*)\.bin\Z')
+    r'courier=([0-9a-f]{64})-relay-config-([1234])-([1234])-([1-9][0-9]*)\.bin\Z')
 _IMPORT_LINE = re.compile(
-    r'imported owner=([123]) revision=([1-9][0-9]*) digest=([0-9a-f]{64})\Z')
+    r'imported owner=([1234]) revision=([1-9][0-9]*) digest=([0-9a-f]{64})\Z')
 _TEMP_LINK = re.compile(r'\.[0-9a-f]{32}\.tmp\Z')
 _I64_MAX = 2**63 - 1
 
@@ -825,6 +836,9 @@ def _certified_setup(owner, ports, server, setup_bin, member_bin, timeout, mailb
 def provision_members(owner, relays, members, roster, vault, fingerprint, member_bin,
                       deadline, mailbox_bytes, total_bytes):
     """Provision and exchange descriptors for already certified member stores."""
+    ids = tuple(member.member_id for member in members)
+    if ids not in ((1, 2, 3), (1, 2, 3, 4)) or len(relays) != 3:
+        raise OwnershipError('Unsupported member roster or relay count')
     inboxes = []
     for member in members:
         config, lines = _member_command(owner, member_bin, member, members, relays, roster,
@@ -836,7 +850,7 @@ def provision_members(owner, relays, members, roster, vault, fingerprint, member
                                         ])
         member.config_revision, member.config_hash = config
         inboxes.extend(_parse_inboxes(lines, member, relays))
-    if len(inboxes) != 9 or len({inbox['mailbox'] for inbox in inboxes}) != 9:
+    if len(inboxes) != 3 * len(ids) or len({inbox['mailbox'] for inbox in inboxes}) != 3 * len(ids):
         raise OwnershipError('Provision did not publish nine inbox ids')
     couriers = []
     for member in members:
@@ -845,7 +859,7 @@ def provision_members(owner, relays, members, roster, vault, fingerprint, member
             owner, member_bin, member, members, relays, roster, deadline, 'export-config',
             ['--courier-directory', str(owner.root / 'courier-export' / str(member.member_id))])
         export_dir = owner.root / 'courier-export' / str(member.member_id)
-        for name, owner_id, peer_id, revision in _parse_couriers(lines, vault, member.member_id):
+        for name, owner_id, peer_id, revision in _parse_couriers(lines, vault, member.member_id, len(ids)):
             _release_single_link(export_dir, name)
             destination_dir = owner.root / 'descriptors' / str(peer_id)
             _mkdir(destination_dir)
@@ -854,9 +868,9 @@ def provision_members(owner, relays, members, roster, vault, fingerprint, member
             couriers.append(PeerCourier(name, owner_id, peer_id, revision, target))
         _rmdir(export_dir, 'Courier directory has an unexpected file')
     _rmdir(owner.root / 'courier-export', 'Courier directory has an unexpected file')
-    expected_pairs = {(left, right) for left in (1, 2, 3) for right in (1, 2, 3) if left != right}
+    expected_pairs = {(left, right) for left in ids for right in ids if left != right}
     if {(courier.owner, courier.peer) for courier in couriers} != expected_pairs or len({
-            courier.name for courier in couriers}) != 6:
+            courier.name for courier in couriers}) != len(ids) * (len(ids) - 1):
         raise OwnershipError('Export did not publish six peer descriptors')
     for courier in couriers:
         recipient = members[courier.peer - 1]
@@ -1037,8 +1051,8 @@ def _parse_inboxes(lines, member, relays):
     return found
 
 
-def _parse_couriers(lines, vault, owner_id):
-    if len(lines) != 2:
+def _parse_couriers(lines, vault, owner_id, member_count=3):
+    if len(lines) != member_count - 1:
         raise OwnershipError('Export did not publish two peer descriptors')
     found = []
     peers = set()
@@ -1054,7 +1068,7 @@ def _parse_couriers(lines, vault, owner_id):
         found.append((
             f'{file_vault}-relay-config-{owner}-{peer}-{revision}.bin',
             owner_id, peer_id, _public_int(revision)))
-    if peers != {1, 2, 3} - {owner_id}:
+    if peers != set(range(1, member_count + 1)) - {owner_id}:
         raise OwnershipError('Export did not publish two peer descriptors')
     return found
 
@@ -1218,41 +1232,41 @@ _OBJECT_MAX = _CHUNK_MAX + 1
 _AUDIENCE = 3
 
 _MESSAGE_LINE = re.compile(
-    r'message sender=([123]) id=([0-9a-f]{64}) digest=([0-9a-f]{64}) kind=([a-z0-9]+) '
+    r'message sender=([1234]) id=([0-9a-f]{64}) digest=([0-9a-f]{64}) kind=([a-z0-9]+) '
     r'session=(-|[0-9a-f]{64}) readiness=(ready|pending) stored_whole=(unavailable|[01]) '
     r'received_whole=([01]) received_author=([01]) needs_route=([0-9]+)\Z')
-_RECEIVED_MEMBER_LINE = re.compile(r'received_member id=([123]) value=([01])\Z')
-_STORED_MEMBER_LINE = re.compile(r'stored_member id=([123]) value=([01])\Z')
+_RECEIVED_MEMBER_LINE = re.compile(r'received_member id=([1234]) value=([01])\Z')
+_STORED_MEMBER_LINE = re.compile(r'stored_member id=([1234]) value=([01])\Z')
 _STORED_PIN_LINE = re.compile(
-    r'stored_pin scope=(member|whole) member=([123]|-) pin=([0-9a-f]{64}) run=([0-9a-f]{64})\Z')
-_RECIPIENT_LINE = re.compile(r'recipient id=([123]) root=([0-9a-f]{64}) needs_route=([01])\Z')
+    r'stored_pin scope=(member|whole) member=([1234]|-) pin=([0-9a-f]{64}) run=([0-9a-f]{64})\Z')
+_RECIPIENT_LINE = re.compile(r'recipient id=([1234]) root=([0-9a-f]{64}) needs_route=([01])\Z')
 _OBJECT_LINE = re.compile(
-    r'object recipient=([123]) ordinal=([0-9]+) hash=([0-9a-f]{64}) length=([0-9]+)\Z')
+    r'object recipient=([1234]) ordinal=([0-9]+) hash=([0-9a-f]{64}) length=([0-9]+)\Z')
 _UPLOAD_LINE = re.compile(
-    r'upload recipient=([123]) hash=([0-9a-f]{64}) pin=([0-9a-f]{64}) run=([0-9a-f]{64}) '
+    r'upload recipient=([1234]) hash=([0-9a-f]{64}) pin=([0-9a-f]{64}) run=([0-9a-f]{64}) '
     r'acknowledged=([01]) receipt_digest=(-|[0-9a-f]{64})\Z')
 _INCOMING_LINE = re.compile(
-    r'incoming sender=([123]) id=([0-9a-f]{64}) digest=([0-9a-f]{64}) kind=([a-z0-9]+) '
+    r'incoming sender=([1234]) id=([0-9a-f]{64}) digest=([0-9a-f]{64}) kind=([a-z0-9]+) '
     r'session=(-|[0-9a-f]{64}) readiness=(ready|pending) received_whole=([01]) '
     r'received_author=([01]) root=([0-9a-f]{64})\Z')
 _INCOMING_MEMBER_LINE = re.compile(
-    r'incoming_received_member sender=([123]) id=([0-9a-f]{64}) digest=([0-9a-f]{64}) '
-    r'member=([123]) value=([01])\Z')
+    r'incoming_received_member sender=([1234]) id=([0-9a-f]{64}) digest=([0-9a-f]{64}) '
+    r'member=([1234]) value=([01])\Z')
 _ACK_LINE = re.compile(
-    r'ack sender=([123]) id=([0-9a-f]{64}) digest=([0-9a-f]{64}) author=([123]) '
+    r'ack sender=([1234]) id=([0-9a-f]{64}) digest=([0-9a-f]{64}) author=([1234]) '
     r'ack_message=([0-9a-f]{64}) request=([0-9a-f]{64})\Z')
 _ENTRY_LINE = re.compile(
     r'entry pin=([0-9a-f]{64}) run=([0-9a-f]{64}) mailbox=([0-9a-f]{64}) sequence=([0-9]+) '
     r'hash=([0-9a-f]{64}) length=([0-9]+) receipt_digest=([0-9a-f]{64}) '
     r'retrieved_hash=([0-9a-f]{64}) retrieved_length=([0-9]+)\Z')
 _REMOTE_INBOX_LINE = re.compile(
-    r'remote_inbox member=([123]) pin=([0-9a-f]{64}) run=([0-9a-f]{64}) mailbox=([0-9a-f]{64}) '
+    r'remote_inbox member=([1234]) pin=([0-9a-f]{64}) run=([0-9a-f]{64}) mailbox=([0-9a-f]{64}) '
     r'entries=([0-9]+) failures=([0-9]+) result=(ok|partial)\Z')
 _SEND_ID_LINE = re.compile(r'request_id=([0-9a-f]{64})\Z')
 _SEND_LINE = re.compile(
     r'request message=([0-9a-f]{64}) digest=([0-9a-f]{64}) needs_route=([0-9]+)\Z')
 _UPLOAD_PROGRESS_LINE = re.compile(
-    r'upload message=([0-9a-f]{64}) digest=([0-9a-f]{64}) needs_route=(-|[123](?:,[123])*) '
+    r'upload message=([0-9a-f]{64}) digest=([0-9a-f]{64}) needs_route=(-|[1234](?:,[1234])*) '
     r'stopped_third=([01])\Z')
 _COUNT_LINE = re.compile(r'([0-9]+)\Z')
 _ROUTE_ERROR_LINE = re.compile(
@@ -1496,7 +1510,7 @@ def _member_text(context, binary, member, deadline, command, extra, allow_empty=
         argv, cwd=member.root, timeout=_remaining(deadline),
         output_limit=_ACCEPTANCE_OUTPUT_LIMIT)
     if result.returncode != 0:
-        raise OwnershipError('Owned command exited unsuccessfully')
+        raise OwnedCommandError(result)
     if b'\0' in result.stdout or b'\r' in result.stdout:
         raise OwnershipError('Owned command returned an invalid status')
     try:
@@ -1514,8 +1528,11 @@ def _member_text(context, binary, member, deadline, command, extra, allow_empty=
 
 def _member_status(context, binary, member, deadline, *, verify):
     extra = ['--verify-relays'] if verify else []
+    if getattr(context, 'signing_attempt', None) is not None:
+        extra.extend(['--attempt', context.signing_attempt])
     parsed = _parse_status(_member_text(
-        context, binary, member, deadline, 'status', extra), member.member_id, verify)
+        context, binary, member, deadline, 'status', extra), member.member_id, verify,
+        member_count=len(context.members))
     expected = {
         (item['pin'], item['run'], item['mailbox'], item['endpoint'], item['append_revision'])
         for item in context.inboxes if item['member'] == member.member_id}
@@ -2020,12 +2037,14 @@ def _parse_upload_progress(text):
     return rows
 
 
-def _parse_status(text, member_id, verify, *, expected_route_failures=()):
+def _parse_status(text, member_id, verify, *, expected_route_failures=(), member_count=3):
     """Parse member status. An empty failure set still rejects every route error.
 
     Fault observations pass the pins that are expected to fail. Every other
     route must still parse as an exact retrieval.
     """
+    if member_count not in (3, 4) or not 1 <= member_id <= member_count:
+        raise OwnershipError('Unsupported status member roster')
     expected = tuple(expected_route_failures)
     if any(_HEX64.fullmatch(pin) is None for pin in expected) or len(set(expected)) != len(expected):
         raise OwnershipError('Owned command returned an invalid status')
@@ -2064,7 +2083,7 @@ def _parse_status(text, member_id, verify, *, expected_route_failures=()):
         messages.append(_parse_message(cursor))
     incoming = []
     while cursor.peek() is not None and cursor.peek().startswith('incoming '):
-        incoming.append(_parse_incoming(cursor))
+        incoming.append(_parse_incoming(cursor, member_count))
     acks = []
     while cursor.peek() is not None and cursor.peek().startswith('ack '):
         acks.append(_parse_ack(cursor.next()))
@@ -2222,7 +2241,7 @@ def _attach_message_line(message, line):
     return False
 
 
-def _parse_incoming(cursor):
+def _parse_incoming(cursor, member_count=3):
     matched = _INCOMING_LINE.fullmatch(cursor.next())
     if matched is None:
         raise OwnershipError('Owned command returned an invalid status')
@@ -2238,10 +2257,11 @@ def _parse_incoming(cursor):
         'root': matched.group(9),
         'members': [],
     }
-    for _ in range(3):
+    for expected_member in range(1, member_count + 1):
         member = _INCOMING_MEMBER_LINE.fullmatch(cursor.next())
         if member is None or int(member.group(1)) != record['sender'] or (
-                member.group(2) != record['id'] or member.group(3) != record['digest']):
+                member.group(2) != record['id'] or member.group(3) != record['digest']
+                or int(member.group(4)) != expected_member):
             raise OwnershipError('Owned command returned an invalid status')
         record['members'].append({
             'member': int(member.group(4)),
@@ -3215,7 +3235,7 @@ def _parse_source_rejection(line):
 
 def _parse_upload_retry(line):
     matched = re.fullmatch(
-        r'upload_retry message=([0-9a-f]{64}) recipient=([123]) hash=([0-9a-f]{64}) '
+        r'upload_retry message=([0-9a-f]{64}) recipient=([1234]) hash=([0-9a-f]{64}) '
         r'pin=([0-9a-f]{64}) run=([0-9a-f]{64}) mailbox=([0-9a-f]{64}) '
         r'acknowledged=([01]) attempts=([0-9]+) retry_at=([0-9]+)', line)
     if matched is None:

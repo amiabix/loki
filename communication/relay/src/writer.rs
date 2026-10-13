@@ -156,6 +156,8 @@ fn complete<T>(reply: ReplySender<T>, result: RelayResult<T>) {
 enum Command {
     Challenge(Id32, ReplySender<Vec<u8>>),
     Create(Id32, Vec<u8>, Capability, ReplySender<CreationResult>),
+    SetupControl(Id32, Vec<u8>, Capability, ReplySender<CreationResult>),
+    CleanupSetup(u64, ReplySender<usize>),
     Rotate(Id32, Vec<u8>, Capability, ReplySender<u64>),
     Put(Id32, Object, Capability, ReplySender<StoredResult>),
     ClaimNonce(
@@ -229,6 +231,12 @@ impl DbHandle {
                         Command::Create(mailbox, body, capability, reply) => {
                             let result = store.create(mailbox, &body, &capability);
                             complete(reply, result);
+                        }
+                        Command::SetupControl(mailbox, body, capability, reply) => {
+                            complete(reply, store.setup_control(mailbox, &body, &capability));
+                        }
+                        Command::CleanupSetup(now, reply) => {
+                            complete(reply, store.cleanup_setup(now));
                         }
                         Command::Rotate(mailbox, body, capability, reply) => {
                             let result = store.rotate(mailbox, &body, &capability);
@@ -376,6 +384,17 @@ impl DbHandle {
         provision: Capability,
     ) -> RelayResult<DbReply<CreationResult>> {
         self.admit_fresh(|sender| Command::Create(mailbox, request, provision, sender))
+    }
+    pub fn setup_control(
+        &self,
+        mailbox: Id32,
+        request: Vec<u8>,
+        provision: Capability,
+    ) -> RelayResult<DbReply<CreationResult>> {
+        self.admit_fresh(|sender| Command::SetupControl(mailbox, request, provision, sender))
+    }
+    pub fn cleanup_setup(&self, now: u64) -> RelayResult<DbReply<usize>> {
+        self.admit_fresh(|sender| Command::CleanupSetup(now, sender))
     }
     pub fn challenge(&self, nonce: Id32) -> RelayResult<DbReply<Vec<u8>>> {
         let (sender, reply) = reply();

@@ -80,6 +80,31 @@ def verify():
     assert 'loki-relay-server' not in client_package['dependencies']
     client_package['dependencies'].append('loki-relay-server')
     client_package['dependencies'].sort()
+    hosted_raw = (vendor / 'relay-source-isolation-overlay-hosted.json').read_bytes()
+    assert digest(hosted_raw) == 'cf5deca6f1ebfacbbc27b09c39078d73826b9974d8d9a83a92dc50f081245503', 'unapproved hosted isolation overlay'
+    hosted = json.loads(hosted_raw)
+    assert hosted['format'] == 1
+    for relative, change in hosted['manifests'].items():
+        prior = approved['manifests'][relative]['approved']
+        assert digest(prior.encode()) == change['baseline_sha256'], 'hosted manifest baseline mismatch'
+        approved['manifests'][relative]['approved'] = change['approved']
+    for relative, change in hosted['locks'].items():
+        prior = approved['locks'][relative]['approved']
+        assert digest(json.dumps(prior, sort_keys=True, separators=(',', ':')).encode()) == change['baseline_graph_sha256'], 'hosted graph baseline mismatch'
+        key = lambda package: (package['name'], package['version'], package['source'])
+        graph = {key(package): package for package in prior}
+        for removed in change['removed']:
+            assert tuple(removed) in graph, 'hosted removal absent from baseline'
+            del graph[tuple(removed)]
+        for package in change['replacements']:
+            assert key(package) in graph, 'hosted replacement absent from baseline'
+            graph[key(package)] = package
+        for package in change['added']:
+            assert key(package) not in graph, 'hosted addition already present'
+            graph[key(package)] = package
+        order = [tuple(entry) for entry in change['order']]
+        assert len(order) == len(set(order)) and set(order) == set(graph), 'hosted graph order does not cover exact packages'
+        approved['locks'][relative]['approved'] = [graph[entry] for entry in order]
     for entry in artifact['packages']:
         directory = vendor / entry['directory']
         archives = list(args.cache.glob('*/' + entry['directory'] + '.crate'))
@@ -152,7 +177,7 @@ def verify():
         deltas[relative] = dict(before=len(baseline), after=len(actual), source_changes=moved,
                                added=[list(key(p)) for p in actual if key(p) not in old_keys], added_edges=edges)
     print(json.dumps(dict(status='verified', archives=len(artifact['packages']),
-                         overlay=dict(unit='2.6', sha256=overlay_sha), locks=deltas), indent=2))
+                         overlay=dict(unit='2.6', sha256=overlay_sha, hosted_sha256=digest(hosted_raw)), locks=deltas), indent=2))
 
 
 if __name__ == '__main__':

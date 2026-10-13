@@ -29,6 +29,7 @@ signing API. Use a **regtest-only seed**. An address QR is not a proof of contro
 ```sh
 cd poc
 cargo build --locked --bins --features relay-communication
+cargo build --locked --manifest-path ../communication/Cargo.toml -p loki-relay-server
 python3 wallet/member_app.py --data /tmp/loki-member-1 --exchange /tmp/loki-setup-exchange --port 8801
 ```
 
@@ -49,8 +50,8 @@ it creates nothing until the signer window approves it. Join, compare the
 roster, and back up in the signer window; the dashboard updates its vault list.
 **Disconnect** removes the dashboard grant without removing membership.
 Locking the signer also revokes it. Grants are in memory and expire after one
-hour. They permit status reads and action requests, never silent vault creation
-or signing. Do not share the signer's private URL.
+hour. They permit status reads, local relay setup, local test funding, and action
+requests, never silent vault creation or signing. Do not share the signer's private URL.
 The dashboard cannot approve or sign payments; that needs a signer-side
 transaction review request and the relay-backed inbox.
 
@@ -125,7 +126,8 @@ the setup courier nor a relay. The old device remains capable of signing;
 restoring is not revocation.
 An active vault can scan the regtest chain for its unspent balance at a named
 block height. Set `LOKI_RPC=host:port` when starting each app if the local node
-is not on the default `127.0.0.1:18232`; the app does not fund or mine blocks.
+is not on the default `127.0.0.1:18232`. **Refresh balance** only scans the chain;
+the local **Fund Vault** action uses the separate THS faucet described below.
 
 The server binds to loopback and uses a private URL token. The passphrase unlocks
 the sealed profile and stays in this process's memory until Lock or shutdown; it
@@ -158,13 +160,53 @@ chain view whenever the payment list is shown. If a signer closed after saving
 an approval, **Retry saved signing messages** republishes the same sealed share;
 it never creates another signature share.
 
-Relay setup is still an external prerequisite. Each member must provision their
+The dashboard offers **Fund Vault** beside each eligible 2-of-3 vault. Each new
+click requests exactly 5 local test ZEC from the THS address faucet, then waits
+for a confirmed transaction. Dashboard access includes this incoming test-fund
+action; it cannot authorize spending from the vault. Set `LOKI_THS_INSTANCE` to
+the local THS instance name before starting the member app (default: `loki`).
+The faucet must use regtest and the same RPC endpoint as `LOKI_RPC`.
+
+Funding is disabled until the final backup is checked. Progress and confirmation
+appear beside the selected vault. Failed or interrupted requests reuse their
+saved request ID through **Retry funding**, including after app restart. A
+request with an unknown outcome must be resolved before starting another.
+Confirmed funding allows a new 5 ZEC request. Open the vault in its signer and
+click **Refresh balance** to scan the updated balance.
+
+For apps sharing the same local `--exchange` directory, click **Set up relays**
+once in the dashboard's **Payment relays** section with the signer unlocked and
+connected. Setup runs directly through that dashboard session. The private
+signer's vault-list page also offers the same single setup control. This starts
+one saved network of three loopback test
+relays and enables automatic connection for all existing and future eligible
+vaults in that local environment.
+
+Each running member app automatically provisions its own inboxes and exchanges
+recipient-encrypted configurations through the shared courier. Locked apps
+wait until their owners unlock them; no additional relay setup click is needed.
+A vault connects after its final backup is checked, and each vault row shows
+connection progress. Shared-courier 2-of-3 and 2-of-4 vaults support this development flow.
+Payment review and approval still happen separately in each private signer.
+
+Saved relay roots, identities, operator access files, and encrypted couriers live
+under `--exchange/.payment-relays/network/` by default. A single saved network
+with capacity for more vaults is reused in its existing directory. Automatic
+connection settings are saved in `--exchange/.payment-relays/settings.json`. Keep this directory with the
+local test environment. **Retry connections** restarts the same relay network
+if needed and retries failed attachments. The services continue across signer
+restarts. Previously provisioned per-vault networks retain their saved identities
+and configuration; networks originally limited to one vault continue serving
+that vault. New connections use the shared network. These processes run on one machine; hosted HTTPS relays and
+remote onboarding are not implemented by this local test flow.
+
+For manually provisioned relay networks, each member must provision their
 vault directory with three operator-issued relay manifests and capability files
 using `loki_relay_member provision`, run `export-config`, deliver only the
 recipient-encrypted courier files to the named peers, and run `import-config`
 on the files addressed to them. Check each member with
 `loki_relay_member status --verify-relays` before using payment controls. The app
-does not collect capabilities or automate this ceremony. The independent
+does not collect external operator capabilities. The independent
 three-relay setup in `communication/harness/three_members.py` tests transport;
 it does not configure an app vault. Relay keys are checked as distinct, but
 operator independence is a deployment condition that the app cannot verify.
@@ -190,4 +232,28 @@ Verify the member flow:
 ```sh
 python3 -m unittest -v wallet/test_account_link.py wallet/test_member_app.py
 python3 -m unittest -v wallet/test_signer_session.py
+python3 -m unittest -v wallet/test_local_relays.py
+python3 -m unittest -v wallet/test_local_funding.py
+node wallet/test-relay-dashboard-browser.js
+node wallet/test-payment-poll-browser.js
 ```
+
+The browser checks use Playwright from `g3/node_modules`. Set
+`LOKI_BROWSER_EXECUTABLE` if you need to select an installed Chromium executable.
+
+
+## feat(wallet): hosted setup rollout
+
+Select hosted transport explicitly when starting the signer:
+
+```sh
+python3 wallet/member_app.py --data /PRIVATE/NEW/MEMBER --exchange /PRIVATE/LOCAL/PLACEHOLDER --port 18801 --transport hosted --operator-bundle /PRIVATE/operators.cbor --operator-key TRUSTED_CONFIG_SIGNING_KEY_HEX --enrollment-issuer /PRIVATE/configured-issuer
+```
+
+The exchange placeholder is retained for compatibility with local startup arguments; hosted vault creation and payment handoff do not use a shared courier. Supply a scoped `--enrollment-grant` only when it belongs to the saved pending creator identity. A configured issuer receives the public creator key, selected policy and operator bundle path and returns the signed bounded grant on stdout. The product's production authentication/enrollment provider remains a deployment decision. Operator capabilities and issuer private keys stay off the signer. Development loopback requires explicit `--development-http`; production verifies HTTPS and the signed bundle.
+
+Both 2-of-3 and 2-of-4 policies use invitations delivered privately to the respective members, explicit fingerprint comparison and backup checks. While unlocked, the native worker resumes the saved setup, registers scoped inboxes, installs all certified peer configurations and reconciles every signed activation vote. There is no additional per-vault relay approval. Lock stops the worker, terminates its native command and revokes dashboard sessions. A retry keeps the saved identity, exact requests, encrypted DKG state and payment descriptors. Creating again with the same pending name and policy reopens that setup; choose a distinct name for another vault.
+
+Pending member slots appear beside the vault, separately from connection failures. Receiving and payment controls remain gated on checked backups and native payment activation. The dashboard receives public progress only and cannot retrieve keys, DKG packages, recovery words or capabilities. Hosted mode hides local relay-server setup and the local 5-ZEC faucet. Existing local vaults and their saved data retain the local path; there is no automatic migration or relay rotation.
+
+The combined branch still requires consolidated validation of these paths and all six four-member signing pairs before acceptance. Same-host owned fixtures are not distinct-device HTTPS or mainnet custody approval.

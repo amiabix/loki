@@ -62,6 +62,7 @@ impl std::error::Error for RelayError {}
 
 pub mod capability;
 mod root;
+pub use root::validate_public_origin;
 pub use capability::{Capability, Role};
 pub mod store;
 pub use store::{Limits, RelayStore, StoredResult};
