@@ -105,8 +105,9 @@ replaced without a new vault.
   travels on every request; a LAN `http://` address is refused when the invite
   is made. Reaching the courier from another device therefore means putting a
   TLS front with such a certificate ahead of the loopback `--invite-port`. That
-  deployment is not part of this app, and a join from a second physical device
-  has not been verified here.
+  deployment is not part of this app. `test_remote_join.py` completes joining,
+  DKG, and backup across verified HTTPS with separate app roots on one host;
+  a second physical device has not been verified here.
 * **Members cannot finish at their own times, and the creator cannot be
   offline.** The courier is served by the creator's app, so it must be open and
   reachable for the whole join, DKG and backup round. A durable independent

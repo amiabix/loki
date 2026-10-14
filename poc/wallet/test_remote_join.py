@@ -328,25 +328,15 @@ class RemoteJoinTest(unittest.TestCase):
         app.api("profile-create", {"name": name, "passphrase": f"passphrase for {name} only"})
         return app
 
-    def test_three_apps_certify_a_vault_with_no_shared_directory(self):
-        """The whole setup, end to end, with the courier as the only channel."""
-        invite_port = free_port()
-        creator = self.member("creator", invite_port=invite_port)
-        created = creator.api("create", {"name": "Group treasury", "members": 3})
-        vault, invites = created["vault"], created["invites"]
-        second = self.member("second")
-        third = self.member("third")
-
-        self.assertEqual(second.api("join", {"invite": invites[0]}), {"vault": vault, "joined": True})
-        self.assertEqual(third.api("join", {"invite": invites[1]}), {"vault": vault, "joined": True})
-
+    def finish_setup(self, creator, second, third, vault, invites):
+        """Complete the same ceremony over loopback HTTP or verified HTTPS."""
         # the creator's rows, from real state: both other members published an
         # identity, and the page can say "Joined" because of that and nothing else
         state = creator.until(vault, lambda s: all(row["joined"] for row in s.get("invites", [{}])),
                               what="both members joined")
         self.assertEqual([row["slot"] for row in state["invites"]], [2, 3])
         self.assertEqual([row["origin"] for row in state["invites"]],
-                         [f"http://127.0.0.1:{invite_port}"] * 2)
+                         [decoded(code)["url"] for code in invites])
         self.assertGreater(state["invites_expire_at"], time.time())
 
         apps = [creator, second, third]
@@ -368,6 +358,8 @@ class RemoteJoinTest(unittest.TestCase):
         for app in apps:
             app.until(vault, lambda s: s["phase"] != "creating_keys", what="finished key creation")
             self.assertEqual(app.status(vault)["phase"], "back_up")
+            with self.assertRaisesRegex(Refused, "Check your final backup card"):
+                app.api("address", {"vault": vault})
 
         saved = []
         for app in apps:
@@ -394,9 +386,22 @@ class RemoteJoinTest(unittest.TestCase):
         self.assertEqual(len(set(addresses)), 1)
         self.assertTrue(addresses[0].startswith("uregtest1"))
         for app in apps:
+            self.assertTrue((app.data / "vaults" / vault / "secrets" / "vault.sealed").is_file())
+            self.assertEqual(app.status(vault)["phase"], "active")
             reports = app.until(vault, lambda s: all(r["reported"] for r in s["backups"]),
                                 what="all signed final backup reports")["backups"]
             self.assertEqual([r["slot"] for r in reports], [1, 2, 3])
+
+    def test_three_apps_certify_a_vault_with_no_shared_directory(self):
+        """The whole setup, end to end, with the courier as the only channel."""
+        creator = self.member("creator", invite_port=free_port())
+        created = creator.api("create", {"name": "Group treasury", "members": 3})
+        vault, invites = created["vault"], created["invites"]
+        second = self.member("second")
+        third = self.member("third")
+        self.assertEqual(second.api("join", {"invite": invites[0]}), {"vault": vault, "joined": True})
+        self.assertEqual(third.api("join", {"invite": invites[1]}), {"vault": vault, "joined": True})
+        self.finish_setup(creator, second, third, vault, invites)
 
     def test_invite_refusals_and_courier_limits(self):
         invite_port = free_port()
@@ -502,9 +507,8 @@ class RemoteJoinTest(unittest.TestCase):
         with self.assertRaisesRegex(Refused, "already used by another app"):
             self.member("thief").api("join", {"invite": invites[0]})
 
-    def test_join_over_https_the_joiner_verifies(self):
-        """The only channel this build offers beyond this machine: HTTPS with a
-        certificate the joining device already trusts."""
+    def test_full_setup_over_https_the_joiners_verify(self):
+        """One-host HTTPS exercise of join, DKG, and both backup checks."""
         if not shutil.which("openssl"):
             self.skipTest("openssl is needed to make the test certificate")
         ca, leaf, leaf_key = make_certificates(self.root)
@@ -522,13 +526,17 @@ class RemoteJoinTest(unittest.TestCase):
         with self.assertRaisesRegex(Refused, "Cannot reach the vault creator's app"):
             stranger.api("join", {"invite": invites[0]})
 
+        wrong_host = encoded({**decoded(invites[0]), "url": f"https://127.0.0.1:{front_port}"})
+        with self.assertRaisesRegex(Refused, "Cannot reach the vault creator's app"):
+            self.member("wrong-host", env={"SSL_CERT_FILE": str(ca)}).api(
+                "join", {"invite": wrong_host})
+        self.assertFalse((creator.data / "vaults" / vault / "claims.json").exists())
+
         second = self.member("second", env={"SSL_CERT_FILE": str(ca)})
-        self.assertEqual(second.api("join", {"invite": invites[1]}), {"vault": vault, "joined": True})
-        state = creator.until(vault, lambda s: s["invites"][1]["joined"],
-                              what="the member that joined over HTTPS")
-        self.assertFalse(state["invites"][0]["joined"])
-        self.assertEqual(state["invites"][1]["origin"], origin)
-        self.assertIsNone(second.status(vault)["transport_error"])
+        third = self.member("third", env={"SSL_CERT_FILE": str(ca)})
+        self.assertEqual(second.api("join", {"invite": invites[0]}), {"vault": vault, "joined": True})
+        self.assertEqual(third.api("join", {"invite": invites[1]}), {"vault": vault, "joined": True})
+        self.finish_setup(creator, second, third, vault, invites)
 
     def test_lan_http_invite_origin_is_refused(self):
         """A plain http address off this machine would carry the invite token in
