@@ -33,7 +33,8 @@ SEED_WALLET = HERE.parent / "target" / "debug" / "loki_seed_wallet"
 
 # A peer's message that has not arrived yet, or a broadcast the node has not mined
 # yet, is a normal outcome of asking too early rather than a failure to report.
-PAYMENT_WAITING = re.compile(r"\bwaiting for member \d+\b|\btransaction is not mined\b")
+PAYMENT_WAITING = re.compile(r"\bwaiting for member \d+\b|\btransaction is not mined\b"
+                             r"|\bTransaction not found in mempool or best chain\b")
 
 
 def encoded(value):
@@ -1071,6 +1072,8 @@ class Wallet:
                         phase = "confirmation_needs_recheck"
                 except (KeyError, ValueError, subprocess.TimeoutExpired):
                     phase = "confirmation_needs_recheck"
+                if phase == "confirmation_needs_recheck":
+                    self.payment_status(path.parent, phase, status.get("txid"))
             items.append({"attempt": attempt, "payment": manifest.get("payment"),
                           "pair": manifest.get("pair"), "phase": phase,
                           **({"txid": status["txid"]} if status.get("txid") else {})})
@@ -1267,6 +1270,10 @@ class Wallet:
         while True:
             state = self.payment_phase(work)
             phase = state["phase"]
+            if phase == "confirmed" and not did:
+                self.payments(vault)
+                state = self.payment_phase(work)
+                phase = state["phase"]
             if phase in ("published", "received") and slot in pair:
                 step, run = "commit", self.commit_payment
             elif phase == "commitments" and slot == pair[0]:
@@ -1561,7 +1568,9 @@ def make_signer_server(wallet, port, dashboard_port=None):
                 if path == "/api/status":
                     return self.reply(200, wallet.status(vault))
                 if path == "/api/payments":
-                    return self.reply(200, wallet.payments(vault))
+                    with wallet.lock:
+                        payments = wallet.payments(vault)
+                    return self.reply(200, payments)
                 if path == "/api/card":
                     member_dir, _ = wallet.vault_dir(vault)
                     card = (member_dir / "card" / "vault.card").read_bytes()

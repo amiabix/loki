@@ -1,17 +1,19 @@
 """The setup app never creates or unlocks another member's share."""
 
 import base64
+import http.client
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
-from member_app import SEED_WALLET, SETUP, Wallet, courier_name
+from member_app import SEED_WALLET, SETUP, Wallet, courier_name, make_signer_server
 
 
 class MemberWalletTest(unittest.TestCase):
@@ -270,9 +272,14 @@ class MemberWalletTest(unittest.TestCase):
             self.assertEqual(calls.count("features"), 1)
             with patch.object(alice, "command", side_effect=command):
                 self.assertEqual(alice.payments(vault)["payments"][0]["phase"], "confirmed")
-            with patch.object(alice, "payment_command", side_effect=ValueError("reorganized")):
+            with patch.object(alice, "payment_command", side_effect=ValueError("transaction is not mined")):
                 self.assertEqual(alice.payments(vault)["payments"][0]["phase"],
                                  "confirmation_needs_recheck")
+                self.assertEqual(alice.payment_phase(work)["phase"], "confirmation_needs_recheck")
+                self.assertEqual(alice.advance_payment(vault, attempt)["phase"],
+                                 "confirmation_needs_recheck")
+            with patch.object(alice, "command", side_effect=command):
+                self.assertEqual(alice.advance_payment(vault, attempt)["phase"], "confirmed")
             review["vault"] = "f" * 64
             with patch.object(alice, "command", return_value=json.dumps(review)) as command:
                 with self.assertRaisesRegex(ValueError, "differs from this payment"):
@@ -376,6 +383,44 @@ class MemberWalletTest(unittest.TestCase):
                 self.assertEqual(wallet.verify_payment(vault, attempt)["txid"], txid)
                 self.assertEqual(wallet.verify_payment(vault, attempt, txid)["txid"], txid)
             self.assertEqual(seen, [txid, txid, txid])
+
+    def test_payment_advance_rechecks_saved_confirmation_after_reorg(self):
+        with tempfile.TemporaryDirectory(prefix="loki-advance-reorg-") as temp:
+            wallet, vault, attempt = self.payment_fixture(
+                temp, phase="confirmed", txid="e" * 64)
+            missing = 'getrawtransaction: {"code":-5,"message":"Transaction not found in mempool or best chain"}'
+            with patch.object(wallet, "payment_command", side_effect=ValueError(missing)):
+                self.assertEqual(wallet.advance_payment(vault, attempt)["phase"],
+                                 "confirmation_needs_recheck")
+            work = wallet.data / "vaults" / vault / "payments" / attempt
+            self.assertEqual(wallet.payment_phase(work)["phase"],
+                             "confirmation_needs_recheck")
+
+    def test_payment_get_holds_wallet_lock_while_rolling_back_confirmation(self):
+        with tempfile.TemporaryDirectory(prefix="loki-payment-get-reorg-") as temp:
+            wallet, vault, attempt = self.payment_fixture(temp, phase="confirmed", txid="e" * 64)
+            server, token = make_signer_server(wallet, 0)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+            payments = wallet.payments
+
+            def checked(vault):
+                self.assertTrue(wallet.lock.locked())
+                return payments(vault)
+
+            with patch.object(wallet, "payments", side_effect=checked), \
+                 patch.object(wallet, "payment_command", side_effect=ValueError("transaction is not mined")):
+                conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
+                conn.request("GET", f"/api/payments?vault={vault}", headers={"X-Loki-Token": token})
+                response = conn.getresponse()
+                result = json.loads(response.read())
+                conn.close()
+            self.assertEqual(response.status, 200, result)
+            self.assertEqual(result["payments"][0]["phase"], "confirmation_needs_recheck")
+            work = wallet.data / "vaults" / vault / "payments" / attempt
+            self.assertEqual(wallet.payment_phase(work)["phase"], "confirmation_needs_recheck")
 
     def test_payment_pair_defaults_to_one_holding_this_member(self):
         with tempfile.TemporaryDirectory(prefix="loki-default-pair-") as temp:
