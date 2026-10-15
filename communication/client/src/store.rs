@@ -12,6 +12,7 @@ use std::{
 };
 
 pub(crate) const SCHEMA: &str = include_str!("schema.sql");
+const FOUR_SCHEMA: &str = include_str!("schema4.sql");
 const STORAGE_BUDGET: u64 = 512 * 1024 * 1024;
 const PENDING_TRANSFERS: u64 = 128;
 
@@ -165,11 +166,12 @@ pub struct ClientStore {
     // Field order keeps SQLite closed before releasing the root lock.
     pub(crate) connection: Connection,
     pub(crate) storage_budget: u64,
+    member_count: usize,
     _root: RootLock,
 }
 
 #[cfg(unix)]
-fn check_owner(metadata: &fs::Metadata, mode: u32, directory: bool) -> ClientResult<()> {
+pub(crate) fn check_owner(metadata: &fs::Metadata, mode: u32, directory: bool) -> ClientResult<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     unsafe extern "C" {
         fn geteuid() -> u32;
@@ -187,11 +189,11 @@ fn check_owner(metadata: &fs::Metadata, mode: u32, directory: bool) -> ClientRes
 }
 
 #[cfg(not(unix))]
-fn check_owner(_: &fs::Metadata, _: u32, _: bool) -> ClientResult<()> {
+pub(crate) fn check_owner(_: &fs::Metadata, _: u32, _: bool) -> ClientResult<()> {
     Err(ClientError::Storage)
 }
 
-fn root_path(path: &Path) -> ClientResult<PathBuf> {
+pub(crate) fn root_path(path: &Path) -> ClientResult<PathBuf> {
     let path = if path.is_absolute() {
         path.to_owned()
     } else {
@@ -230,7 +232,7 @@ fn check_database_files(root: &Path) -> ClientResult<()> {
     Ok(())
 }
 
-fn configure(connection: &Connection) -> ClientResult<()> {
+pub(crate) fn configure(connection: &Connection) -> ClientResult<()> {
     connection.busy_timeout(Duration::from_millis(5000))?;
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "synchronous", "FULL")?;
@@ -301,14 +303,17 @@ fn validate_metadata(
         || version != 1
         || vault.len() != 32
         || saved_roster.len() != 32
-        || !(1..=3).contains(&saved_owner)
+        || !(1..=roster.members.len() as i64).contains(&saved_owner)
     {
         return Err(ClientError::Storage);
     }
     if vault != roster.vault || saved_roster != digest || saved_owner != i64::from(owner) {
         return Err(ClientError::Identity);
     }
-    let catalog = if validate_schema(connection, schema_parts().0).is_ok() {
+    let catalog = if roster.members.len() == 4 {
+        validate_schema(connection, FOUR_SCHEMA)?;
+        CURRENT_CATALOG
+    } else if validate_schema(connection, schema_parts().0).is_ok() {
         0
     } else if validate_schema(connection, request_schema_parts().0).is_ok() {
         1
@@ -337,6 +342,10 @@ fn validate_metadata(
 }
 
 impl ClientStore {
+    pub(crate) fn schema(&self) -> &'static str {
+        if self.member_count == 4 { FOUR_SCHEMA } else { SCHEMA }
+    }
+
     /// Creates a new dedicated transport root, or validates an existing complete root.
     /// The roster is supplied by the certified member adapter; no association overrides are accepted.
     pub fn open(root: &Path, roster: &Roster, owner: MemberId) -> ClientResult<Self> {
@@ -419,7 +428,7 @@ impl ClientStore {
         if fresh {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction.execute_batch(SCHEMA)?;
+            transaction.execute_batch(if roster.members.len() == 4 { FOUR_SCHEMA } else { SCHEMA })?;
             seed_diagnostic_ids(&transaction)?;
             transaction.execute(
                 "INSERT INTO metadata VALUES(1,1,?1,?2,?3)",
@@ -432,6 +441,7 @@ impl ClientStore {
         Ok(Self {
             connection,
             storage_budget: STORAGE_BUDGET,
+            member_count: roster.members.len(),
             _root: root_lock,
         })
     }
@@ -751,7 +761,7 @@ impl ClientStore {
 
     pub fn recover_recipients(&self, key: &LogicalKey) -> ClientResult<Vec<RecoveryRecipient>> {
         let mut statement = self.connection.prepare(
-            "SELECT recipient,transfer,root_hash,state FROM outgoing_recipients WHERE vault=?1 AND roster=?2 AND sender=?3 AND message_id=?4 ORDER BY recipient LIMIT 3"
+            "SELECT recipient,transfer,root_hash,state FROM outgoing_recipients WHERE vault=?1 AND roster=?2 AND sender=?3 AND message_id=?4 ORDER BY recipient LIMIT 5"
         )?;
         let rows = statement.query_map(
             params![key.vault, key.roster, key.sender, key.message],
@@ -778,7 +788,7 @@ impl ClientStore {
         limit: u16,
     ) -> ClientResult<Vec<RecoveryRequirement>> {
         page_bounds(0, limit)?;
-        if !(1..=3).contains(&recipient) {
+        if !(1..=self.member_count as u16).contains(&recipient) {
             return Err(ClientError::Identity);
         }
         let mut statement = self.connection.prepare(
@@ -982,9 +992,9 @@ fn pending_transfer_total(connection: &Connection) -> ClientResult<u64> {
         .ok_or(ClientError::Capacity)
 }
 
-fn admit_outbox(connection: &Connection, budget: u64) -> ClientResult<()> {
+fn admit_outbox(connection: &Connection, budget: u64, member_count: usize) -> ClientResult<()> {
     admit_storage_growth(connection, budget)?;
-    reserve_pending(pending_transfer_total(connection)?, 3)
+    reserve_pending(pending_transfer_total(connection)?, member_count as u64)
 }
 
 fn logical_at(connection: &Connection, key: &LogicalKey) -> ClientResult<Option<RecoveryLogical>> {
@@ -999,6 +1009,7 @@ fn logical_at(connection: &Connection, key: &LogicalKey) -> ClientResult<Option<
 fn stored_sets(
     connection: &Connection,
     logical: &RecoveryLogical,
+    member_count: usize,
 ) -> ClientResult<Vec<(RecoveryRecipient, Vec<Object>)>> {
     let key = &logical.key;
     let mut statement=connection.prepare("SELECT recipient,transfer,root_hash,state FROM outgoing_recipients WHERE vault=?1 AND roster=?2 AND sender=?3 AND message_id=?4 ORDER BY recipient")?;
@@ -1017,10 +1028,10 @@ fn stored_sets(
         },
     )?;
     let recipients = rows.collect::<Result<Vec<_>, _>>()?;
-    if recipients.iter().map(|r| r.recipient).collect::<Vec<_>>() != [1, 2, 3] {
+    if recipients.len() != member_count || recipients.iter().enumerate().any(|(index, recipient)| recipient.recipient != index as u16 + 1) {
         return Err(ClientError::Storage);
     }
-    let mut sets = Vec::with_capacity(3);
+    let mut sets = Vec::with_capacity(member_count);
     let mut hashes = std::collections::BTreeSet::new();
     for recipient in recipients {
         let mut statement=connection.prepare("SELECT r.ordinal,r.hash,r.length,c.wire FROM required_objects r JOIN ciphertext_objects c ON r.hash=c.hash AND r.length=c.length WHERE r.vault=?1 AND r.roster=?2 AND r.sender=?3 AND r.message_id=?4 AND r.recipient=?5 ORDER BY r.ordinal LIMIT 276")?;
@@ -1080,6 +1091,7 @@ fn request_at(
     connection: &Connection,
     request: &Id32,
     intent: &Id32,
+    member_count: usize,
 ) -> ClientResult<Option<RecoveryLogical>> {
     let mapping=connection.query_row("SELECT intent_digest,vault,roster,sender,message_id FROM caller_requests WHERE request_id=?1",[request],|r|Ok((row_id(r,0)?,row_key(r,1)?))).optional()?;
     let Some((saved_intent, key)) = mapping else {
@@ -1089,7 +1101,7 @@ fn request_at(
         return Err(ClientError::Conflict);
     }
     let logical = logical_at(connection, &key)?.ok_or(ClientError::Storage)?;
-    stored_sets(connection, &logical)?;
+    stored_sets(connection, &logical, member_count)?;
     Ok(Some(logical))
 }
 
@@ -1100,7 +1112,7 @@ fn verify_saved(
     logical: &RecoveryLogical,
     intent: &Id32,
 ) -> ClientResult<()> {
-    let sets = stored_sets(connection, logical)?;
+    let sets = stored_sets(connection, logical, roster.members.len())?;
     let objects = &sets
         .iter()
         .find(|(r, _)| r.recipient == identity.public().id)
@@ -1145,7 +1157,7 @@ fn insert_request(
 /// Insert one prepared outbox into the caller's transaction.
 ///
 /// The caller begins the immediate transaction, admits capacity, and commits.
-/// This writes ciphertext, the logical record, all three recipient sets, and the
+/// This writes ciphertext, the logical record, all roster recipient sets, and the
 /// caller mapping. It does not start another transaction or upload.
 fn persist_prepared_outbox(
     connection: &Connection,
@@ -1643,7 +1655,7 @@ impl ClientStore {
         request_id: &Id32,
         expected_intent: &Id32,
     ) -> ClientResult<Option<RecoveryLogical>> {
-        request_at(&self.connection, request_id, expected_intent)
+        request_at(&self.connection, request_id, expected_intent, self.member_count)
     }
 
     /// Commit all recipient bytes and the caller binding before exposing any work.
@@ -1681,7 +1693,7 @@ impl ClientStore {
         {
             return Err(ClientError::Storage);
         }
-        if let Some(logical) = request_at(&transaction, request_id, &validated.intent)? {
+        if let Some(logical) = request_at(&transaction, request_id, &validated.intent, self.member_count)? {
             verify_saved(&transaction, roster, identity, &logical, &validated.intent)?;
             transaction.commit()?;
             return Ok(logical);
@@ -1697,7 +1709,7 @@ impl ClientStore {
             transaction.commit()?;
             return Ok(logical);
         }
-        admit_outbox(&transaction, self.storage_budget)?;
+        admit_outbox(&transaction, self.storage_budget, self.member_count)?;
         persist_prepared_outbox(&transaction, prepared, &validated, request_id)?;
         let logical = logical_at(&transaction, key)?.ok_or(ClientError::Storage)?;
         #[cfg(test)]
@@ -1882,8 +1894,8 @@ fn delivery_union(
     {
         return Err(ClientError::Identity);
     }
-    let sets = stored_sets(connection, &reloaded)?;
-    let mut members = [Vec::new(), Vec::new(), Vec::new()];
+    let sets = stored_sets(connection, &reloaded, roster.members.len())?;
+    let mut members = vec![Vec::new(); roster.members.len()];
     for (recipient, objects) in &sets {
         let routes = status_routes(
             sender,
@@ -1903,7 +1915,7 @@ fn delivery_union(
     let whole = members[0]
         .iter()
         .copied()
-        .filter(|pin| members[1].contains(pin) && members[2].contains(pin))
+        .filter(|pin| members.iter().skip(1).all(|member| member.contains(pin)))
         .collect();
     Ok(crate::outbox::DeliveryReport::new(
         reloaded.key,
@@ -2010,7 +2022,7 @@ impl ClientStore {
         {
             return Err(ClientError::Identity);
         }
-        let sets = stored_sets(&transaction, &reloaded)?;
+        let sets = stored_sets(&transaction, &reloaded, roster.members.len())?;
         let mut admitted = false;
         for (recipient, objects) in &sets {
             let pins = if recipient.recipient == sender {
@@ -2682,7 +2694,7 @@ impl ClientStore {
                         WHERE j.vault=e.vault AND j.roster=e.roster AND j.sender=e.sender
                         AND j.message_id=e.message_id AND j.digest=e.digest AND j.from_member=e.from_member
                     ) THEN 'rejected'
-                    WHEN e.from_member NOT IN (?3,?4,?5) OR e.from_member=e.sender OR e.from_member=?6 THEN 'not_actionable'
+                    WHEN e.from_member NOT IN (?3,?4,?5,?7) OR e.from_member=e.sender OR e.from_member=?6 THEN 'not_actionable'
                     WHEN NOT EXISTS (
                         SELECT 1 FROM logical_records l
                         WHERE e.sender=?6 AND l.vault=e.vault AND l.roster=e.roster AND l.sender=e.sender AND l.message_id=e.message_id
@@ -2709,7 +2721,7 @@ impl ClientStore {
             ) WHERE rowid>?1 ORDER BY rowid LIMIT ?2",
         )?;
         let rows = statement.query_map(
-            params![after, limit, members[0], members[1], members[2], owner],
+            params![after, limit, members[0], members[1], members[2], owner, members.get(3).copied().unwrap_or(0)],
             |row| {
                 Ok(EarlyReceived {
                     cursor: row.get(0)?,
@@ -2869,7 +2881,7 @@ impl ClientStore {
     /// Save one authenticated original and, for a foreign test message, its Received outbox.
     ///
     /// The immediate transaction is the whole boundary: the original, its source membership,
-    /// dependency edges, and all three acknowledgement copies commit together or not at all.
+    /// dependency edges, and all roster acknowledgement copies commit together or not at all.
     /// Candidate readiness is not an argument. Dependency sources stay null so a later exact
     /// match is derived instead of rewriting an immutable edge. No plaintext, credential,
     /// receipt, or network write is produced.
@@ -2947,7 +2959,7 @@ impl ClientStore {
             admit_storage_growth(&transaction, self.storage_budget)?;
             insert_incoming_original(&transaction, message, source, kind, &root)?;
             // The original root is terminal before the three acknowledgement copies are counted.
-            admit_outbox(&transaction, self.storage_budget)?;
+            admit_outbox(&transaction, self.storage_budget, self.member_count)?;
             persist_prepared_outbox(&transaction, prepared, &validated, &request_id)?;
             transaction.execute(
                 "INSERT INTO ack_links VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
@@ -2996,7 +3008,7 @@ impl ClientStore {
     /// coverage without another slot. An exact no-op does not admit storage growth.
     /// Cached completion does not close the group.
     pub(crate) fn stage_bound_source(&mut self, source: &BoundSource) -> ClientResult<StageResult> {
-        if !(1..=3).contains(&source.key.sender) || source.objects.len() > 274 {
+        if !(1..=self.member_count as u16).contains(&source.key.sender) || source.objects.len() > 274 {
             return Err(ClientError::Wire(WireError::Schema));
         }
         if !framed_wire(source.root_wire_length)
@@ -3130,7 +3142,7 @@ impl ClientStore {
         key: &LogicalKey,
         recipient: MemberId,
     ) -> ClientResult<Vec<Id32>> {
-        if !(1..=3).contains(&recipient) {
+        if !(1..=self.member_count as u16).contains(&recipient) {
             return Err(ClientError::Identity);
         }
         ordered_hashes(
@@ -3154,7 +3166,7 @@ impl ClientStore {
         from_member: MemberId,
         source_root: &Id32,
     ) -> ClientResult<()> {
-        if !(1..=3).contains(&target.sender) || !(1..=3).contains(&from_member) {
+        if !(1..=self.member_count as u16).contains(&target.sender) || !(1..=self.member_count as u16).contains(&from_member) {
             return Err(ClientError::Identity);
         }
         let transaction = self
@@ -3466,17 +3478,12 @@ fn apply_wanted(connection: &Connection, root: &Id32, planned: &WantedPlan) -> C
     Ok(())
 }
 
-fn certified_owner(roster: &Roster, owner: MemberId) -> ClientResult<[MemberId; 3]> {
-    if owner == 0 || !roster.members.iter().any(|member| member.id == owner) {
+fn certified_owner(roster: &Roster, owner: MemberId) -> ClientResult<Vec<MemberId>> {
+    roster_digest(roster)?;
+    if !roster.members.iter().any(|member| member.id == owner) {
         return Err(ClientError::Identity);
     }
-    let mut ids: Vec<MemberId> = roster.members.iter().map(|member| member.id).collect();
-    ids.sort_unstable();
-    ids.dedup();
-    let [first, second, third] = ids.as_slice() else {
-        return Err(ClientError::Identity);
-    };
-    Ok([*first, *second, *third])
+    Ok(roster.members.iter().map(|member| member.id).collect())
 }
 
 fn stored_owner(connection: &Connection) -> ClientResult<MemberId> {

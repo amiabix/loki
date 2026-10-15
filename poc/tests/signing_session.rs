@@ -42,15 +42,39 @@ fn note(fvk: &orchard::keys::FullViewingKey, seed: u8) -> Note {
 
 #[test]
 fn signing_attempt_end_to_end() {
-    run_signing_attempt(3, 2);
+    run_signing_attempt(3, [1, 2], false);
 }
 
 #[test]
 fn four_member_vault_delivers_a_valid_payment_to_both_finishers() {
-    run_signing_attempt(4, 4);
+    run_signing_attempt(4, [1, 4], false);
 }
 
-fn run_signing_attempt(member_count: u16, second_signer: u16) {
+#[test]
+fn secured_four_member_approvals_reach_both_finishers_for_every_pair() {
+    for pair in [[1, 2], [1, 3], [1, 4], [2, 3], [2, 4], [3, 4]] {
+        run_signing_attempt(4, pair, true);
+    }
+}
+
+#[test]
+fn secured_three_member_approvals_keep_the_existing_finisher_and_retry() {
+    run_signing_attempt(3, [1, 2], true);
+}
+
+#[derive(Default)]
+struct FreshClaims(std::collections::BTreeSet<[u8; 32]>);
+impl loki_poc::signing_session::NonceWitness for FreshClaims {
+    fn pins(&self) -> loki_poc::signing_session::WitnessPins {
+        [([7; 32], [8; 32], [15; 32]), ([9; 32], [10; 32], [16; 32])]
+    }
+    fn claim(&mut self, cid: [u8; 32], _: &[u8]) -> Result<(), String> {
+        if self.0.insert(cid) { Ok(()) } else { Err("already claimed".into()) }
+    }
+}
+
+fn run_signing_attempt(member_count: u16, pair: [u16; 2], secured: bool) {
+    let [first_signer, second_signer] = pair;
     let root = scratch();
     let relay = Mailbox::new(&root.join("relay")).unwrap();
     let (shares, public) = frost::keys::generate_with_dealer(
@@ -60,7 +84,7 @@ fn run_signing_attempt(member_count: u16, second_signer: u16) {
         rand_core::OsRng,
     )
     .unwrap();
-    let id1 = frost::Identifier::try_from(1u16).unwrap();
+    let id1 = frost::Identifier::try_from(first_signer).unwrap();
     let id2 = frost::Identifier::try_from(second_signer).unwrap();
     let key1 = frost::keys::KeyPackage::try_from(shares[&id1].clone()).unwrap();
     let key2 = frost::keys::KeyPackage::try_from(shares[&id2].clone()).unwrap();
@@ -101,49 +125,42 @@ fn run_signing_attempt(member_count: u16, second_signer: u16) {
         vault: [3; 32],
         payment: intent.proposal_id(),
         attempt: AttemptId::random(),
-        pair: [1, second_signer],
+        pair,
     };
-    let alice = Identity::new(1);
+    let alice = Identity::new(first_signer);
     let bob = Identity::new(second_signer);
-    let carol = Identity::new(if member_count == 4 { 2 } else { 3 });
-    let other_finisher = (member_count == 4).then(|| Identity::new(3));
+    let observers = (1..=member_count).filter(|id| !pair.contains(id)).collect::<Vec<_>>();
+    let carol = Identity::new(observers[0]);
+    let other_finisher = observers.get(1).map(|id| Identity::new(*id));
     let alice_copy = Identity::from_secret_bytes(&alice.to_secret_bytes()).unwrap();
     let bob_copy = Identity::from_secret_bytes(&bob.to_secret_bytes()).unwrap();
     let alice_pub = alice.public();
     let bob_pub = bob.public();
     let carol_pub = carol.public();
     let mut roster = BTreeMap::from([
-        (1, alice_pub.clone()),
+        (first_signer, alice_pub.clone()),
         (second_signer, bob_pub.clone()),
         (carol.public().id, carol_pub.clone()),
     ]);
     if let Some(other) = &other_finisher {
         roster.insert(other.public().id, other.public());
     }
-    let mut a = SigningSession::begin(
-        &root.join("alice"),
-        context.clone(),
-        &context.vault,
-        intent.clone(),
-        alice,
-        key1,
-        public.clone(),
-        fvk.clone(),
-        2,
-    )
-    .unwrap();
-    let mut b = SigningSession::begin(
-        &root.join("bob"),
-        context.clone(),
-        &context.vault,
-        intent.clone(),
-        bob,
-        key2,
-        public.clone(),
-        fvk.clone(),
-        2,
-    )
-    .unwrap();
+    let begin = |path: &std::path::Path, identity, key, pass| {
+        if secured {
+            SigningSession::begin_sealed(
+                path, context.clone(), &context.vault, intent.clone(), identity, key,
+                public.clone(), fvk.clone(), 2, pass,
+                [([7; 32], [8; 32], [15; 32]), ([9; 32], [10; 32], [16; 32])],
+            )
+        } else {
+            SigningSession::begin(
+                path, context.clone(), &context.vault, intent.clone(), identity, key,
+                public.clone(), fvk.clone(), 2,
+            )
+        }.unwrap()
+    };
+    let mut a = begin(&root.join("alice"), alice, key1, "alice pass");
+    let mut b = begin(&root.join("bob"), bob, key2, "bob pass");
 
     a.publish_commitments(&bob_pub, &relay).unwrap();
     b.publish_commitments(&alice_pub, &relay).unwrap();
@@ -233,7 +250,7 @@ fn run_signing_attempt(member_count: u16, second_signer: u16) {
         .publish_package_to_roster(&roster, &payload, &relay, "alice pass")
         .unwrap();
     let saved_package =
-        SigningSession::saved_package_wires(&root.join("alice"), &context, 1, "alice pass")
+        SigningSession::saved_package_wires(&root.join("alice"), &context, first_signer, "alice pass")
             .unwrap();
     let a_message = alice_copy
         .open_sent_session(&bob_pub, &context, &saved_package[0])
@@ -266,11 +283,61 @@ fn run_signing_attempt(member_count: u16, second_signer: u16) {
         .filter(|identity| !context.pair.contains(&identity.id))
         .cloned()
         .collect::<Vec<_>>();
-    let a_share_hash = a
-        .publish_approved(a_review, &bob_pub, &finishers, &relay, "alice pass")
-        .unwrap();
-    b.publish_approved(b_review, &alice_pub, &finishers, &relay, "bob pass")
-        .unwrap();
+    let a_share_hash = if secured {
+        let mut incomplete = roster.clone();
+        incomplete.remove(&observers[0]);
+        let mut claims = FreshClaims::default();
+        let refused = a.review_package(&a_message, &bob_pub).unwrap();
+        assert!(a.publish_approved_secured_to_roster(
+            refused,
+            &bob_pub, &incomplete, &relay, "alice pass", &mut claims,
+        ).is_err());
+        assert!(claims.0.is_empty());
+        let mut substituted = roster.clone();
+        substituted.get_mut(&observers[0]).unwrap().signing = alice_pub.signing;
+        let refused = a.review_package(&a_message, &bob_pub).unwrap();
+        assert!(a.publish_approved_secured_to_roster(
+            refused,
+            &bob_pub, &substituted, &relay, "alice pass", &mut claims,
+        ).is_err());
+        assert!(claims.0.is_empty());
+        let attempt = root.join("alice")
+            .join(hex::encode(context.payment)).join(hex::encode(context.attempt.0));
+        assert!(!attempt.join("decision").exists());
+        assert!(!attempt.join("share.sealed").exists());
+        assert!(attempt.join("nonces.sealed").exists());
+        let mut claims = FreshClaims::default();
+        let hash = if member_count == 3 {
+            a.publish_approved_secured(
+                a_review, &bob_pub, &finishers[0], &relay, "alice pass", &mut claims,
+            )
+        } else {
+            a.publish_approved_secured_to_roster(
+                a_review, &bob_pub, &roster, &relay, "alice pass", &mut claims,
+            )
+        }.unwrap();
+        assert_eq!(claims.0.len(), 2);
+        let mut claims = FreshClaims::default();
+        if member_count == 3 {
+            b.publish_approved_secured(
+                b_review, &alice_pub, &finishers[0], &relay, "bob pass", &mut claims,
+            )
+        } else {
+            b.publish_approved_secured_to_roster(
+                b_review, &alice_pub, &roster, &relay, "bob pass", &mut claims,
+            )
+        }.unwrap();
+        assert_eq!(claims.0.len(), 2);
+        hash
+    } else {
+        let hash = a.publish_approved(a_review, &bob_pub, &finishers, &relay, "alice pass").unwrap();
+        b.publish_approved(b_review, &alice_pub, &finishers, &relay, "bob pass").unwrap();
+        hash
+    };
+    let saved_before = SigningSession::saved_share_wires(
+        &root.join("alice"), &context, first_signer, "alice pass",
+    ).unwrap();
+    assert_eq!(saved_before.len(), usize::from(member_count - 1));
     drop(a);
     drop(b);
 
@@ -332,7 +399,7 @@ fn run_signing_attempt(member_count: u16, second_signer: u16) {
 
     // Alice can also finish after restart using only her sealed outbound wire and inbox.
     let saved =
-        SigningSession::saved_share_wires(&root.join("alice"), &context, 1, "alice pass").unwrap();
+        SigningSession::saved_share_wires(&root.join("alice"), &context, first_signer, "alice pass").unwrap();
     let own_share = alice_copy
         .open_sent_session(&bob_pub, &context, &saved[0])
         .unwrap();
@@ -360,10 +427,13 @@ fn run_signing_attempt(member_count: u16, second_signer: u16) {
     assert_eq!(alice_indices.len(), 2);
 
     assert_eq!(
-        SigningSession::recover_share(&root.join("alice"), &context, 1, "alice pass", &relay,)
+        SigningSession::recover_share(&root.join("alice"), &context, first_signer, "alice pass", &relay,)
             .unwrap(),
         a_share_hash
     );
+    assert_eq!(SigningSession::saved_share_wires(
+        &root.join("alice"), &context, first_signer, "alice pass",
+    ).unwrap(), saved_before);
     let attempt_dir = root
         .join("alice")
         .join(hex::encode(context.payment))

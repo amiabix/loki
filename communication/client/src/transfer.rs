@@ -128,7 +128,7 @@ fn package_chunks(body_len: usize, package_len: usize) -> ClientResult<usize> {
     Ok(count)
 }
 
-/// Prepare all three complete recipient copies without network or store effects.
+/// Prepare every complete roster recipient copy without network or store effects.
 pub fn prepare_outbox(
     identity: &CommIdentity,
     roster: &Roster,
@@ -142,7 +142,7 @@ pub fn prepare_outbox(
     let single = encode_temporary(Value::Array(vec![uint(1), bytes(&package)]))?;
     let fits_single = envelope::padded_wire_length(single.len()).is_ok();
     let package_hash: Id32 = Sha256::digest(&*package).into();
-    let mut recipients = Vec::with_capacity(3);
+    let mut recipients = Vec::with_capacity(roster.members.len());
     for member in &roster.members {
         let ctx = SealContext {
             vault: body.key.vault,

@@ -1129,14 +1129,75 @@ impl SigningSession {
         passphrase: &str,
         witness: &mut impl NonceWitness,
     ) -> Result<[u8; 32], String> {
+        if self.public.verifying_shares().len() != 3 {
+            return Err("four-member approval requires the complete certified roster".into());
+        }
+        self.publish_approved_secured_to_finishers(
+            reviewed, peer, std::slice::from_ref(finisher), mailbox, passphrase, witness,
+        )
+    }
+
+    /// The caller supplies its certified roster. Validate its complete audience before
+    /// claiming nonces, then compute each share once and persist every recipient copy.
+    pub fn publish_approved_secured_to_roster(
+        &mut self,
+        reviewed: ReviewedPackage,
+        peer: &PublicIdentity,
+        roster: &BTreeMap<u16, PublicIdentity>,
+        mailbox: &Mailbox,
+        passphrase: &str,
+        witness: &mut impl NonceWitness,
+    ) -> Result<[u8; 32], String> {
+        let own = self.own.public();
+        if !matches!(roster.len(), 3 | 4)
+            || roster.keys().copied().collect::<Vec<_>>()
+                != (1..=roster.len() as u16).collect::<Vec<_>>()
+            || roster.get(&own.id) != Some(&own)
+            || roster.get(&peer.id) != Some(peer)
+            || self.context.pair.iter().any(|id| !roster.contains_key(id))
+            || roster.iter().any(|(id, identity)| {
+                *id != identity.id || identity.signing == [0; 32] || identity.encryption == [0; 32]
+            })
+            || roster.values().any(|identity| {
+                roster.values().any(|other| identity.id != other.id &&
+                    (identity.signing == other.signing || identity.encryption == other.encryption))
+            })
+            || self.public.verifying_shares().len() != roster.len()
+            || roster.keys().any(|id| {
+                frost::Identifier::try_from(*id).map_or(true, |identifier| {
+                    !self.public.verifying_shares().contains_key(&identifier)
+                })
+            })
+        {
+            return Err("approval audience differs from certified roster".into());
+        }
+        let finishers = roster.values()
+            .filter(|identity| !self.context.pair.contains(&identity.id))
+            .cloned().collect::<Vec<_>>();
+        self.publish_approved_secured_to_finishers(
+            reviewed, peer, &finishers, mailbox, passphrase, witness,
+        )
+    }
+
+    fn publish_approved_secured_to_finishers(
+        &mut self,
+        reviewed: ReviewedPackage,
+        peer: &PublicIdentity,
+        finishers: &[PublicIdentity],
+        mailbox: &Mailbox,
+        passphrase: &str,
+        witness: &mut impl NonceWitness,
+    ) -> Result<[u8; 32], String> {
         if self._lock.is_none()
             || self.witness_pins != Some(witness.pins())
             || reviewed.batch.context != self.context
             || reviewed.peer != peer.id
             || peer.id == self.own.public().id
             || !self.context.pair.contains(&peer.id)
-            || !(1..=4).contains(&finisher.id)
-            || self.context.pair.contains(&finisher.id)
+            || !matches!(finishers.len(), 1 | 2)
+            || finishers.iter().any(|finisher| {
+                !(1..=4).contains(&finisher.id) || self.context.pair.contains(&finisher.id)
+            })
         {
             return Err("invalid persisted signing attempt or peer".into());
         }
@@ -1194,12 +1255,12 @@ impl SigningSession {
             body.extend_from_slice(&(raw.len() as u16).to_be_bytes());
             body.extend_from_slice(&raw);
         }
-        let wires = [
-            self.own
-                .seal_session(peer, &self.context, MessageKind::Share, &body)?,
-            self.own
-                .seal_session(finisher, &self.context, MessageKind::Share, &body)?,
-        ];
+        let wires = std::iter::once(peer)
+            .chain(finishers.iter())
+            .map(|recipient| {
+                self.own.seal_session(recipient, &self.context, MessageKind::Share, &body)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         self.store
             .save_share_after_decision(&wires, &candidate_hash, &package_hash, passphrase)?;
         self.store.publish(mailbox, passphrase)

@@ -54,6 +54,38 @@ fn open_committed_readonly(path: &Path) -> RelayResult<Connection> {
     Ok(connection)
 }
 
+fn setup_state(connection: &Connection, mailbox: Id32) -> RelayResult<Option<(u64, bool)>> {
+    let installed: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='setup_namespaces')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !installed {
+        return Ok(None);
+    }
+    Ok(connection
+        .query_row(
+            "SELECT expires,retired FROM setup_namespaces WHERE mailbox=?1",
+            [mailbox.as_slice()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?)
+}
+fn current_time() -> RelayResult<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|n| n.as_secs())
+        .map_err(|_| RelayError::StorageUnavailable)
+}
+fn setup_active(connection: &Connection, mailbox: Id32) -> RelayResult<()> {
+    if let Some((expires, retired)) = setup_state(connection, mailbox)? {
+        if retired || current_time()? >= expires {
+            return Err(RelayError::Capability);
+        }
+    }
+    Ok(())
+}
+
 fn authenticate_append(
     connection: &Connection,
     mailbox: Id32,
@@ -78,6 +110,7 @@ fn authenticate_append(
         .ok_or(RelayError::Capability)?
         .try_into()
         .map_err(|_| RelayError::StorageUnavailable)?;
+    setup_active(connection, mailbox)?;
     if !append.verify(Role::Append, mailbox, &verifier) {
         return Err(RelayError::Capability);
     }
@@ -184,6 +217,9 @@ impl RelayStore {
             .ok_or(RelayError::Capability)?
             .try_into()
             .map_err(|_| RelayError::StorageUnavailable)?;
+        if setup_state(&tx, mailbox)?.is_some() {
+            return Err(RelayError::Capability);
+        }
         if !owner_read.verify(Role::Read, mailbox, &verifier) {
             return Err(RelayError::Capability);
         }
@@ -456,6 +492,7 @@ impl RelayStore {
         let verifier: Id32 = verifier
             .try_into()
             .map_err(|_| RelayError::StorageUnavailable)?;
+        setup_active(&transaction, mailbox)?;
         if !admin.verify(Role::Admin, mailbox, &verifier) {
             return Err(RelayError::Capability);
         }
@@ -509,6 +546,7 @@ impl RelayStore {
             .ok_or(RelayError::Capability)?
             .try_into()
             .map_err(|_| RelayError::StorageUnavailable)?;
+        setup_active(&transaction, mailbox)?;
         if !append.verify(Role::Append, mailbox, &verifier) {
             return Err(RelayError::Capability);
         }
@@ -726,6 +764,7 @@ impl RelayStore {
             .ok_or(RelayError::Capability)?
             .try_into()
             .map_err(|_| RelayError::StorageUnavailable)?;
+        setup_active(&transaction, mailbox)?;
         if !read.verify(Role::Read, mailbox, &verifier) {
             return Err(RelayError::Capability);
         }
@@ -769,6 +808,7 @@ impl RelayStore {
         if !provision.verify_provision(self.root.run_id, &expected) {
             return Err(RelayError::Capability);
         }
+        setup_active(&transaction, mailbox)?;
         let creation = decode_creation(request)?;
         transaction.execute_batch(
             SCHEMA
@@ -1388,6 +1428,7 @@ impl RelayStore {
         let verifier: Id32 = verifier
             .try_into()
             .map_err(|_| RelayError::StorageUnavailable)?;
+        setup_active(&transaction, mailbox)?;
         if !read.verify(Role::Read, mailbox, &verifier) {
             return Err(RelayError::Capability);
         }
@@ -1685,5 +1726,161 @@ mod snapshot_tests {
             store.page([1; 32], 0, 100, &Capability::new([2; 32])),
             Err(RelayError::StorageUnavailable)
         ));
+    }
+}
+
+impl RelayStore {
+    pub fn setup_control(
+        &mut self,
+        mailbox: Id32,
+        request: &[u8],
+        provision: &Capability,
+    ) -> RelayResult<CreationResult> {
+        let (creation, expires, retire) = loki_relay_protocol::http::decode_setup_control(request)?;
+        let quota = decode_creation(&creation)?.quota;
+        let digest: Id32 = Sha256::digest(&creation).into();
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let expected: Vec<u8> = tx.query_row(
+            "SELECT provisioning_verifier FROM metadata WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )?;
+        let expected: Id32 = expected
+            .try_into()
+            .map_err(|_| RelayError::StorageUnavailable)?;
+        if !provision.verify_provision(self.root.run_id, &expected) {
+            return Err(RelayError::Capability);
+        }
+        let now = current_time()?;
+        if expires
+            > now
+                .checked_add(2592000)
+                .ok_or(RelayError::MalformedRequest)?
+        {
+            return Err(RelayError::MalformedRequest);
+        }
+        tx.execute_batch(include_str!("setup_schema.sql"))?;
+        let prior: Option<(Vec<u8>, u64, bool)> = tx
+            .query_row(
+                "SELECT creation_digest,expires,retired FROM setup_namespaces WHERE mailbox=?1",
+                [mailbox.as_slice()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        if let Some((old, deadline, retired)) = prior {
+            if old != digest || deadline != expires {
+                return Err(RelayError::Conflict);
+            }
+            if retired && !retire {
+                return Err(RelayError::Capability);
+            }
+        } else {
+            let installed:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='mailboxes')",[],|r|r.get(0))?;
+            if installed {
+                let existing: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM mailboxes WHERE id=?1)",
+                    [mailbox.as_slice()],
+                    |r| r.get(0),
+                )?;
+                if existing {
+                    return Err(RelayError::Conflict);
+                }
+            }
+            tx.execute(
+                "INSERT INTO setup_namespaces VALUES(?1,?2,?3,0)",
+                params![mailbox.as_slice(), digest.as_slice(), expires],
+            )?;
+        }
+        if retire {
+            tx.execute(
+                "UPDATE setup_namespaces SET retired=1 WHERE mailbox=?1",
+                [mailbox.as_slice()],
+            )?;
+        }
+        tx.commit()?;
+        if retire || expires <= now {
+            self.cleanup_setup(now)?;
+            return Ok(CreationResult {
+                created: false,
+                run: self.root.run_id,
+                quota,
+                append_revision: 1,
+            });
+        }
+        self.create(mailbox, &creation, provision)
+    }
+    pub fn cleanup_setup(&mut self, now: u64) -> RelayResult<usize> {
+        if now > i64::MAX as u64 {
+            return Err(RelayError::MalformedRequest);
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let installed:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='setup_namespaces')",[],|r|r.get(0))?;
+        if !installed {
+            return Ok(0);
+        }
+        let mailboxes_installed: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='mailboxes')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !mailboxes_installed {
+            tx.execute(
+                "UPDATE setup_namespaces SET retired=1 WHERE expires<=?1",
+                [now],
+            )?;
+            tx.commit()?;
+            return Ok(0);
+        }
+        let mut q=tx.prepare("SELECT n.mailbox,m.used_bytes FROM setup_namespaces n JOIN mailboxes m ON m.id=n.mailbox WHERE n.retired=1 OR n.expires<=?1")?;
+        let rows = q
+            .query_map([now], |r| {
+                Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, u64>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(q);
+        let objects_installed: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='objects')",
+            [],
+            |r| r.get(0),
+        )?;
+        let nonces_installed: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='nonce_uses')",
+            [],
+            |r| r.get(0),
+        )?;
+        for (mailbox, used) in &rows {
+            if nonces_installed {
+                let nonces: u64 = tx.query_row(
+                    "SELECT count(*) FROM nonce_uses WHERE mailbox=?1",
+                    [mailbox],
+                    |r| r.get(0),
+                )?;
+                if nonces != 0 {
+                    return Err(RelayError::StorageUnavailable);
+                }
+            }
+            if objects_installed {
+                tx.execute("DELETE FROM objects WHERE mailbox=?1", [mailbox])?;
+            }
+            tx.execute(
+                "UPDATE metadata SET used_bytes=used_bytes-?1 WHERE singleton=1",
+                [used],
+            )?;
+            tx.execute("DELETE FROM mailboxes WHERE id=?1", [mailbox])?;
+            tx.execute(
+                "UPDATE setup_namespaces SET retired=1 WHERE mailbox=?1",
+                [mailbox],
+            )?;
+        }
+        tx.execute(
+            "UPDATE setup_namespaces SET retired=1 WHERE expires<=?1",
+            [now],
+        )?;
+        tx.commit()?;
+        Ok(rows.len())
     }
 }

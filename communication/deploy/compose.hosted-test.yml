@@ -1,0 +1,34 @@
+services:
+  relay-1:
+    image: ${LOKI_OWNED_RELAY_IMAGE:?Select an owned test relay image}
+    command: [serve, --root, /state, --listen, "127.0.0.1:39101"]
+    volumes:
+      - ${LOKI_OWNED_RELAY_1_ROOT:?Select a new initialized owned relay 1 root}:/state
+    network_mode: host
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+  relay-2:
+    image: ${LOKI_OWNED_RELAY_IMAGE:?Select an owned test relay image}
+    command: [serve, --root, /state, --listen, "127.0.0.1:39102"]
+    volumes:
+      - ${LOKI_OWNED_RELAY_2_ROOT:?Select a new initialized owned relay 2 root}:/state
+    network_mode: host
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+  relay-3:
+    image: ${LOKI_OWNED_RELAY_IMAGE:?Select an owned test relay image}
+    command: [serve, --root, /state, --listen, "127.0.0.1:39103"]
+    volumes:
+      - ${LOKI_OWNED_RELAY_3_ROOT:?Select a new initialized owned relay 3 root}:/state
+    network_mode: host
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+  admission:
+    image: ${LOKI_OWNED_ADMISSION_IMAGE:?Select an owned test admission image}
+    command: [serve, --root, /state, --bundle-file, /inputs/bundle, --config-key-file, /inputs/config-key, --signing-key-file, /state/signing-key, --issuer-key-file, /inputs/issuer-public-key, --relay-1-provision-file, /inputs/relay-1-provision, --relay-2-provision-file, /inputs/relay-2-provision, --relay-3-provision-file, /inputs/relay-3-provision, --listen, "127.0.0.1:39104", --development]
+    volumes:
+      - ${LOKI_OWNED_ADMISSION_ROOT:?Select a new owned admission root}:/state
+      - ${LOKI_OWNED_OPERATOR_INPUTS:?Select private owned operator inputs}:/inputs:ro
+    network_mode: host
+    read_only: true
+    security_opt: ["no-new-privileges:true"]

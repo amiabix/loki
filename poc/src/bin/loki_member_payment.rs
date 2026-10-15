@@ -534,7 +534,7 @@ fn signing_inputs(
         return Err("<member-dir> <passphrase-file> <roster.json> <work-dir>".into());
     }
     let (member, owner, pass) = state(args)?;
-    if member.roster.members.len() != 3 {
+    if !matches!(member.roster.members.len(), 3 | 4) {
         return Err("relay signing currently supports only 2-of-3 vaults".into());
     }
     let (context, intent) = manifest(&Path::new(&args[3]).join("payment.json"))?;
@@ -608,7 +608,6 @@ fn reopen_signer(
     Ok((member, owner, pass, context, intent, mailbox, session))
 }
 
-#[cfg(feature = "relay-communication")]
 fn next_message(
     mailbox: &Mailbox,
     member: &MemberState,
@@ -696,22 +695,31 @@ fn two_relays(args: &[String]) -> Result<TwoRelays, String> {
         loaded.identity.public().id,
     )
     .map_err(|e| e.to_string())?;
-    let mut own = config_store
+    let configured = config_store
         .routing(&db, &loaded)
         .map_err(|e| e.to_string())?
         .own;
-    if own.len() < 2
+    let http = RelayHttp::new().map_err(|e| e.to_string())?;
+    let runtime = RelayRuntime::new().map_err(|e| e.to_string())?;
+    let mut own: Vec<OwnerInbox> = Vec::new();
+    for inbox in configured {
+        match runtime.block_on(http.authenticate_endpoint(&inbox.route.pin, &inbox.route.endpoint))
+        {
+            Ok(()) => own.push(inbox),
+            Err(loki_relay_client::ClientError::Transport) => continue,
+            Err(error) => return Err(format!("nonce relay identity: {error}")),
+        }
+        if own.len() == 2 {
+            break;
+        }
+    }
+    if own.len() != 2
         || own[0].route.pin.key == own[1].route.pin.key
         || own[0].route.pin.run == own[1].route.pin.run
     {
-        return Err("two distinct configured relays required for nonce safety".into());
+        return Err("two distinct reachable configured relays required for nonce safety".into());
     }
-    own.truncate(2);
-    Ok(TwoRelays {
-        own,
-        http: RelayHttp::new().map_err(|e| e.to_string())?,
-        runtime: RelayRuntime::new().map_err(|e| e.to_string())?,
-    })
+    Ok(TwoRelays { own, http, runtime })
 }
 
 #[cfg(feature = "relay-communication")]
@@ -801,10 +809,15 @@ fn approve(args: &[String], reviewed_token: bool) -> Result<(), String> {
         let (_, intent) = manifest(&Path::new(&args[3]).join("payment.json"))?;
         confirm(&intent, reviewed.summary())?;
     }
-    let pair = reviewed.summary().pair;
-    let finisher = member.roster.members[&(1..=3).find(|id| !pair.contains(id)).unwrap()].clone();
     let mut relays = two_relays(args)?;
-    session.publish_approved_secured(reviewed, &peer, &finisher, &mailbox, &pass, &mut relays)?;
+    session.publish_approved_secured_to_roster(
+        reviewed,
+        &peer,
+        &member.roster.members,
+        &mailbox,
+        &pass,
+        &mut relays,
+    )?;
     println!("signed locally; approval delivery pending relay storage");
     Ok(())
 }
@@ -895,7 +908,7 @@ fn prove(
     Ok((raw, tx.txid().to_string()))
 }
 
-fn finish(args: &[String]) -> Result<(), String> {
+fn finish(args: &[String], broadcast: bool) -> Result<(), String> {
     if args.len() != 4 {
         return Err("finish <member-dir> <passphrase-file> <roster.json> <work-dir>".into());
     }
@@ -907,6 +920,13 @@ fn finish(args: &[String]) -> Result<(), String> {
     let mailbox = Mailbox::new(&work.join("mailbox")).map_err(|e| e.to_string())?;
     let own = member.identity.public().id;
     let peer = peer_in_pair(context.pair, own);
+    let read_message = |kind, sender| {
+        if broadcast {
+            wait_message(&mailbox, &member, &context, kind, sender)
+        } else {
+            next_message(&mailbox, &member, &context, kind, sender)
+        }
+    };
     let package = if own == context.pair[0] {
         let wires =
             SigningSession::saved_package_wires(&owner.join("signing"), &context, own, &pass)?;
@@ -916,13 +936,7 @@ fn finish(args: &[String]) -> Result<(), String> {
             &wires[0],
         )?
     } else {
-        wait_message(
-            &mailbox,
-            &member,
-            &context,
-            MessageKind::Package,
-            context.pair[0],
-        )?
+        read_message(MessageKind::Package, context.pair[0])?
     };
     let payload = PackagePayload::decode(&context, package.body())?;
     let shares = if let Some(peer_id) = peer {
@@ -933,24 +947,12 @@ fn finish(args: &[String]) -> Result<(), String> {
             &context,
             &wires[0],
         )?;
-        let peer_share = wait_message(&mailbox, &member, &context, MessageKind::Share, peer_id)?;
+        let peer_share = read_message(MessageKind::Share, peer_id)?;
         [own_share, peer_share]
     } else {
         [
-            wait_message(
-                &mailbox,
-                &member,
-                &context,
-                MessageKind::Share,
-                context.pair[0],
-            )?,
-            wait_message(
-                &mailbox,
-                &member,
-                &context,
-                MessageKind::Share,
-                context.pair[1],
-            )?,
+            read_message(MessageKind::Share, context.pair[0])?,
+            read_message(MessageKind::Share, context.pair[1])?,
         ]
     };
     let (signed, sighash, indices) = aggregate_and_apply(
@@ -962,6 +964,14 @@ fn finish(args: &[String]) -> Result<(), String> {
         &payload,
         &shares,
     )?;
+    if !broadcast {
+        println!(
+            "aggregate verified payment={} sighash={}",
+            hex::encode(context.payment),
+            hex::encode(sighash)
+        );
+        return Ok(());
+    }
     let rpc = Rpc::regtest();
     let chain = scan::scan_chain(&rpc, &member.fvk)?;
     let positions = indices
@@ -1255,7 +1265,8 @@ fn main() {
         Some("approve-reviewed") => approve(&args[2..], true),
         Some("sign") => sign(&args[2..]),
         Some("resend") => resend(&args[2..]),
-        Some("finish") => finish(&args[2..]),
+        Some("finish") => finish(&args[2..], true),
+        Some("finish-check") => finish(&args[2..], false),
         Some("verify") => verify(&args[2..]),
         Some("receive") => receive(&args[2..]),
         _ => Err(

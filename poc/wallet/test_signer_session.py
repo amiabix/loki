@@ -71,7 +71,7 @@ class SessionHttpTests(unittest.TestCase):
         self.assertEqual(conn.getresponse().status, 404)
         conn.close()
 
-    def test_pairing_allows_only_read_only_vault_discovery(self):
+    def test_pairing_scopes_direct_setup_and_funding_and_vault_approval(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             wallet = Wallet(root / "member", root / "exchange")
@@ -80,7 +80,17 @@ class SessionHttpTests(unittest.TestCase):
                                       "profile": "private-profile-id", "invites": ["secret"]}]
             wallet.status = lambda vault=None: {"phase": "active", "words": "secret"}
             created = []
+            relay_setups = []
+            funding_calls = []
+            wallet.fund_vault = lambda vault, request_id: funding_calls.append((vault, request_id)) or {"status": "confirmed", "amount_zatoshi": 500000000}
             wallet.create = lambda name, members: created.append((name, members)) or {"vault": "new-vault", "invites": ["private-invite"]}
+            wallet.setup_relays = lambda vault: relay_setups.append(vault) or {"vault": vault, "phase": "starting"}
+            wallet.setup_all_relays = lambda: relay_setups.append("all") or {"relay_setup": True}
+            relay_vault = "a" * 64
+            member = wallet.data / "vaults" / relay_vault
+            member.mkdir(parents=True)
+            (member / "membership.json").write_text(json.dumps({
+                "vault": relay_vault, "profile": "private-profile-id", "name": "Treasury", "slot": 2, "members": 3}))
             server, private_token = make_signer_server(wallet, 0, 18802)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -102,6 +112,12 @@ class SessionHttpTests(unittest.TestCase):
 
             status, _, _ = call("POST", "/api/session/request", {}, {"Origin": "http://evil.example"})
             self.assertEqual(status, 403)
+            self.assertEqual(call("POST", "/api/session/fund", {"vault": "abc", "request_id": "d" * 32},
+                                  {"Origin": origin})[0], 403)
+            self.assertEqual(funding_calls, [])
+            self.assertEqual(call("POST", "/api/session/relay-setup-all", {},
+                                  {"Origin": origin})[0], 403)
+            self.assertEqual(relay_setups, [])
             status, request, headers = call("POST", "/api/session/request", {}, {"Origin": origin})
             self.assertEqual(status, 200)
             self.assertEqual(headers.get("Access-Control-Allow-Origin"), origin)
@@ -118,7 +134,15 @@ class SessionHttpTests(unittest.TestCase):
                                       "X-Loki-Session": key})
             self.assertEqual(status, 200)
             self.assertEqual(result, {"profile": "Alice", "vaults": [{"vault": "abc",
-                              "name": "Treasury", "slot": 2, "phase": "active"}]})
+                              "name": "Treasury", "slot": 2, "phase": "active"}],
+                              "relay_network": wallet.relay_network_status()})
+            self.assertEqual(call("POST", "/api/session/fund", {"vault": "abc", "request_id": "d" * 32},
+                                  {"Origin": "http://evil.example", "X-Loki-Session": key})[0], 403)
+            self.assertEqual(funding_calls, [])
+            self.assertEqual(call("POST", "/api/session/fund", {"vault": "abc", "request_id": "d" * 32},
+                                  {"Origin": origin, "X-Loki-Session": key})[1],
+                             {"status": "confirmed", "amount_zatoshi": 500000000})
+            self.assertEqual(funding_calls, [("abc", "d" * 32)])
             self.assertEqual(call("POST", "/api/session/action", {"kind": "create", "name": "Bad"},
                                   {"Origin": "http://evil.example", "X-Loki-Session": key})[0], 403)
             self.assertEqual(call("POST", "/api/session/action", {"kind": "create", "name": " "},
@@ -140,6 +164,32 @@ class SessionHttpTests(unittest.TestCase):
                              {"state": "done", "result": {"vault": "new-vault"}})
             self.assertEqual(call("POST", "/api/create", {"name": "Bad"},
                                   {"Origin": origin, "X-Loki-Session": key})[0], 403)
+            self.assertEqual(call("POST", "/api/relay-setup", {"vault": relay_vault},
+                                  {"Origin": origin, "X-Loki-Session": key})[0], 403)
+            relay_action = call("POST", "/api/session/action", {
+                "kind": "relay-setup", "name": "Treasury", "vault": relay_vault},
+                {"Origin": origin, "X-Loki-Session": key})[1]["action"]
+            self.assertEqual(relay_setups, [])
+            self.assertEqual(call("POST", "/api/session/action-approve", {"action": relay_action},
+                                  {"X-Loki-Token": private_token})[0], 200)
+            self.assertEqual(relay_setups, [relay_vault])
+            self.assertEqual(call("POST", "/api/session/action-approve", {"action": relay_action},
+                                  {"X-Loki-Token": private_token})[0], 400)
+            self.assertEqual(call("POST", "/api/session/action-poll", {"action": relay_action},
+                                  {"Origin": origin, "X-Loki-Session": key})[1],
+                             {"state": "done", "result": {"vault": relay_vault}})
+            self.assertEqual(call("POST", "/api/relay-setup-all", {},
+                                  {"Origin": origin, "X-Loki-Session": key})[0], 403)
+            self.assertEqual(call("POST", "/api/session/relay-setup-all", {},
+                                  {"Origin": "http://evil.example", "X-Loki-Session": key})[0], 403)
+            self.assertEqual(relay_setups, [relay_vault])
+            self.assertEqual(call("POST", "/api/session/relay-setup-all", {},
+                                  {"Origin": origin, "X-Loki-Session": key})[1], {"relay_setup": True})
+            self.assertEqual(relay_setups, [relay_vault, "all"])
+            self.assertEqual(call("GET", "/api/session/actions",
+                                  headers={"X-Loki-Token": private_token})[1]["actions"], [])
+            self.assertEqual(call("POST", "/api/session/action", {"kind": "relay-setup-all"},
+                                  {"Origin": origin, "X-Loki-Session": key})[0], 400)
             self.assertEqual(call("POST", "/api/payment-approve", {
                 "vault": "abc", "attempt": "a" * 64, "review_token": "b" * 64},
                 {"Origin": origin, "X-Loki-Session": key})[0], 403)
@@ -150,12 +200,21 @@ class SessionHttpTests(unittest.TestCase):
                                   {"Origin": origin, "X-Loki-Session": key})[0], 200)
             self.assertEqual(call("GET", "/api/session/vaults", headers={"Origin": origin,
                               "X-Loki-Session": key})[0], 403)
+            self.assertEqual(call("POST", "/api/session/fund", {"vault": "abc", "request_id": "e" * 32},
+                                  {"Origin": origin, "X-Loki-Session": key})[0], 403)
+            self.assertEqual(funding_calls, [("abc", "d" * 32)])
+            self.assertEqual(call("POST", "/api/session/relay-setup-all", {},
+                                  {"Origin": origin, "X-Loki-Session": key})[0], 403)
+            self.assertEqual(relay_setups, [relay_vault, "all"])
             next_key = call("POST", "/api/session/request", {}, {"Origin": origin})[1]["request"]
             self.assertEqual(call("POST", "/api/session/approve", {"request": next_key},
                                   {"X-Loki-Token": private_token})[0], 200)
             self.assertEqual(call("POST", "/api/lock", {}, {"X-Loki-Token": private_token})[0], 200)
             self.assertEqual(call("GET", "/api/session/vaults", headers={"Origin": origin,
                               "X-Loki-Session": next_key})[0], 403)
+            self.assertEqual(call("POST", "/api/session/relay-setup-all", {},
+                                  {"Origin": origin, "X-Loki-Session": next_key})[0], 403)
+            self.assertEqual(relay_setups, [relay_vault, "all"])
 
 if __name__ == "__main__":
     unittest.main()

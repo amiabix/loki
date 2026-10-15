@@ -7,11 +7,13 @@ try { selectedVault = sessionStorage.getItem(OPEN_VAULT); }
 catch { selectedVault = null; }
 let linkChallenge = null;
 let memberSlot = null;
+let memberCount = null;
 let renderedPaymentVault = null;
 let midFlight = [];
 let pumping = false;
 let pumpPaused = false;
 let paymentsLive = false;
+let relaySetupPhase = null;
 const paymentReviews = new Map();
 const paymentActivity = new Map();
 
@@ -23,8 +25,10 @@ function selectVault(vault) {
   } catch { /* Private browsing may disable session storage. */ }
   linkChallenge = null;
   memberSlot = null;
+  memberCount = null;
   renderedPaymentVault = null;
   midFlight = [];
+  relaySetupPhase = null;
   pumpPaused = false;
   paymentReviews.clear();
   paymentActivity.clear();
@@ -37,6 +41,8 @@ function selectVault(vault) {
   $('payment-draft').reset();
   $('amount-zat').textContent = 'Up to 8 decimal places.';
   $('payment-list').replaceChildren();
+  $('payment-updates').hidden = true;
+  $('payment-updates').textContent = '';
   $('relay-state').textContent = 'Relay connection has not been checked on this device.';
   $('relay-downloads').replaceChildren();
   renderedInvites = null;
@@ -127,7 +133,15 @@ function vaultList(vaults) {
     meta.textContent = `Member ${vault.slot} · ${vault.threshold ?? 2} of ${vault.members ?? 3}`;
     button.append(name, meta);
     button.addEventListener('click', () => { selectVault(vault.vault); refresh(); });
-    list.append(button);
+    const item = document.createElement('div');
+    item.className = 'vault-item';
+    const relay = vault.relay_setup || {};
+    const detail = document.createElement('small');
+    detail.className = 'relay-detail';
+    detail.textContent = relay.detail || 'Relay connection is available after the final backup.';
+    detail.setAttribute('role', 'status');
+    item.append(button, detail);
+    list.append(item);
   }
 }
 /* ── one payment, five stages ───────────────────────────────────────────────
@@ -336,10 +350,21 @@ async function pumpPayments() {
       const result = await api('payment-advance', {vault, attempt});
       paymentActivity.set(attempt, result.did || []);
     }
-    if (selectedVault === vault) await refreshPayments();
+    if (selectedVault === vault) {
+      await refreshPayments();
+      if (selectedVault === vault) {
+        $('payment-updates').hidden = true;
+        $('payment-updates').textContent = '';
+      }
+    }
   } catch (error) {
+    if (selectedVault !== vault) return;
     pumpPaused = true;
-    message(`${error.message} This list has stopped updating itself — check for updates to restart it.`, true);
+    const detail = error.surface === 'payment-sync' && error.message === 'member_sealed'
+      ? 'Payment relay configuration is unavailable for this vault. Complete relay setup or check the saved relay configuration. Receiving and balance checks are still available.'
+      : `Payment updates failed: ${error.message}`;
+    $('payment-updates').textContent = `${detail} Check for updates to retry.`;
+    $('payment-updates').hidden = false;
   } finally { pumping = false; }
 }
 async function refreshSignerRequests(unlocked) {
@@ -380,16 +405,20 @@ async function refreshSignerRequests(unlocked) {
   for (const action of actions) {
     const item = document.createElement('div');
     const description = document.createElement('p');
-    description.textContent = `${action.origin} requests a 2-of-${action.members} vault named “${action.name}” on regtest.`;
+    const relaySetup = action.kind === 'relay-setup';
+    description.textContent = relaySetup
+      ? `${action.origin} requests local test relay setup for “${action.name}”. This configures only your own membership; the other members do the same in their apps.`
+      : `${action.origin} requests a 2-of-${action.members} vault named “${action.name}” on regtest.`;
     const approve = document.createElement('button');
     approve.type = 'button';
-    approve.textContent = 'Create this vault';
+    approve.textContent = relaySetup ? 'Set up local relays' : 'Create this vault';
     approve.addEventListener('click', async () => {
       approve.disabled = true;
       try {
         const result = await api('session/action-approve', {action: action.action});
-        selectVault(result.created);
-        message('Vault draft created. Continue setup and invites in this signer window.');
+        selectVault(result.created || null);
+        message(relaySetup ? 'Local relays are running. Vaults connect automatically; check progress in your vault list.'
+          : 'Vault draft created. Continue setup and invites in this signer window.');
         await refresh();
       } catch (error) { message(error.message, true); approve.disabled = false; }
     });
@@ -532,7 +561,7 @@ function inviteRows(state) {
     const rows = $('invite-rows');
     rows.replaceChildren();
     for (const invite of state.invites) rows.append(inviteRow(invite, state, expired));
-    $('invite-reach').textContent = reachLine(state.invites[0]?.origin);
+    $('invite-reach').textContent = state.transport === 'hosted' ? 'Share each invitation privately with its member. Hosted invitations work on separate devices.' : reachLine(state.invites[0]?.origin);
   }
   $('invite-expiry').textContent = expiryLine(state.invites_expire_at);
 }
@@ -542,6 +571,8 @@ function progressLine(state) {
     return `${state.members} of ${state.total_members} members have joined.`;
   }
   if (state.phase === 'compare_roster') return 'All members joined.';
+  if (state.phase === 'connecting_relays') return state.missing_slots?.length ? `Waiting for member${state.missing_slots.length === 1 ? '' : 's'} ${state.missing_slots.join(', ')} to finish connecting.` : 'Connecting hosted relays automatically; saved work will retry.';
+  if (state.phase === 'creating_keys' && state.setup_phase === 'acceptance_pending' && state.missing_slots?.length) return `Waiting for member${state.missing_slots.length === 1 ? '' : 's'} ${state.missing_slots.join(', ')} to confirm the roster.`;
   if (state.phase === 'creating_keys') return 'Creating group keys with the other member apps…';
   return '';
 }
@@ -556,6 +587,7 @@ const steps = {
   back_up: ['Setup · step 5 of 6', 'Write down your recovery words'],
   waiting_for_backups: ['Setup · step 5 of 6', 'Waiting for the other members to check their cards'],
   final_backup: ['Setup · step 6 of 6', 'Save your final recovery card'],
+  connecting_relays: ['Setup · step 6 of 6', 'Connecting payment relays'],
   active: ['', 'Receive and pay'],
   stopped: ['', 'Setup stopped'],
 };
@@ -627,6 +659,11 @@ async function refresh() {
     $('vault-chip').hidden = !inVault;
     if (inVault) $('vault-chip').textContent = `MEMBER ${state.slot}`;
     $('title').textContent = state.name || state.profile?.name || 'Your signer';
+    if (state.phase === 'home') {
+      $('setup-relays').hidden = state.relay_network?.transport === 'hosted';
+      $('setup-relays').textContent = state.relay_network?.enabled ? 'Retry connections' : 'Set up relays';
+      $('relay-network-detail').textContent = state.relay_network?.detail || '';
+    }
     $('subtitle').textContent = inVault ? `${state.threshold} of ${state.total_members} · regtest` : 'One local profile, separate keys for each vault.';
     const [kicker, headline] = steps[state.phase] || ['', ''];
     $('kicker').textContent = kicker;
@@ -651,7 +688,7 @@ async function refresh() {
       $('home').hidden = false;
       vaultList(state.vaults);
     } else {
-      $('connect-account').hidden = state.account_linked;
+      $('connect-account').hidden = state.account_linked || state.transport === 'hosted';
       if (state.invites) {
         inviteRows(state);
         $('invites').hidden = state.phase !== 'waiting_for_members';
@@ -673,15 +710,21 @@ async function refresh() {
       else if (state.phase === 'active') {
         $('active').hidden = false;
         memberSlot = state.slot;
-        const paymentAvailable = state.total_members === 3;
-        $('relay-setup').hidden = !paymentAvailable;
+        const paymentAvailable = [3, 4].includes(state.total_members) && (state.transport !== 'hosted' || state.handoff === 'ready');
+        memberCount = state.total_members;
+        $('relay-setup').hidden = !paymentAvailable || state.transport === 'hosted';
         $('payment-unavailable').hidden = paymentAvailable;
         $('show-address').hidden = !paymentAvailable;
-        if (!paymentAvailable) $('address').textContent = 'Receive address hidden until this app can spend 2-of-4 funds.';
+        if (!paymentAvailable) $('address').textContent = 'Receive address is available after payment activation.';
         $('payment-draft').hidden = !paymentAvailable;
         $('refresh-payments').hidden = !paymentAvailable;
         $('payment-list').hidden = !paymentAvailable;
-        paymentsLive = paymentAvailable;
+        const relayPhase = state.relay_setup?.phase;
+        $('relay-note').textContent = state.relay_setup?.detail || '';
+        $('relay-note').hidden = !state.relay_setup;
+        if (relayPhase === 'ready' && relaySetupPhase !== 'ready') pumpPaused = false;
+        relaySetupPhase = relayPhase;
+        paymentsLive = paymentAvailable && (!state.relay_setup || relayPhase === 'ready');
         if (paymentAvailable && renderedPaymentVault !== selectedVault) await refreshPayments();
       }
       else if (state.phase === 'stopped') message('Setup stopped: ' + state.error + '. Start a fresh vault session.', true);
@@ -814,17 +857,18 @@ $('relay-check').addEventListener('click', async () => {
   button.disabled = true;
   try {
     const vault = selectedVault;
+    const expectedPeers = memberCount - 1;
     const state = await api('relay-status', {vault});
     if (selectedVault !== vault) return;
     $('relay-state').textContent = !state.inboxes
       ? 'This member has no relay inboxes yet. Provision your relay kit.'
-      : state.peers < 2
-        ? `${state.peers} of 2 encrypted peer configs imported. Each other member must send you theirs.`
+      : state.peers < expectedPeers
+        ? `${state.peers} of ${expectedPeers} encrypted peer configs imported. Each other member must send you theirs.`
         : !state.configured
           ? 'Relay configs are present, but this member cannot route payments yet. Check the local kit and try again.'
         : state.live_relays < 2
           ? `${state.live_relays} of 3 relays responded. At least 2 must respond for approvals.`
-          : 'Both peer configs are present. This member’s inbox answered on at least 2 relays; delivery to peers is checked when sending.';
+          : 'All peer configs are present. This member’s inbox answered on at least 2 relays; delivery to peers is checked when sending.';
   } catch (error) { message(error.message, true); }
   finally { button.disabled = false; }
 });
@@ -901,5 +945,14 @@ $('back').addEventListener('click', () => { selectVault(null); refresh(); });
 $('lock').addEventListener('click', async () => {
   try { await api('lock', {}); selectVault(null); await refresh(); }
   catch (error) { message(error.message, true); }
+});
+$('setup-relays').addEventListener('click', async () => {
+  $('setup-relays').disabled = true;
+  try {
+    await api('relay-setup-all', {});
+    message('Local relays are running. All eligible vaults connect automatically as their signers unlock.');
+    await refresh();
+  } catch (error) { failure(error); }
+  finally { $('setup-relays').disabled = false; }
 });
 refresh(); setInterval(refresh, 2000); setInterval(pumpPayments, 6000);

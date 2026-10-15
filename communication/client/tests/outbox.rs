@@ -4468,6 +4468,23 @@ mod upload_retry_failover {
         expect_member(&crossed_report, 2, &[mid, high]);
         expect_member(&crossed_report, 3, &[low, mid]);
         expect_whole(&crossed_report, &[mid]);
+        let saved = rusqlite::Connection::open_with_flags(
+            directory.join("client/client.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let completions: i64 = saved
+            .query_row(
+                "SELECT count(*) FROM delivery_completion WHERE message_id=?1",
+                [crossed_logical.key.message],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(saved);
+        assert_eq!(
+            completions, 0,
+            "upload capacity release must use the verified whole-vault intersection"
+        );
         let crossed_release = store
             .release_stored_capacity(&roster, &alice, &crossed_logical, &config, &self_route)
             .unwrap();
@@ -4730,6 +4747,23 @@ mod upload_retry_failover {
             |_, relay, _| relay == low || relay == mid,
         );
         assert_wires(&store, &wires);
+        let saved = rusqlite::Connection::open_with_flags(
+            directory.join("client/client.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let completions: i64 = saved
+            .query_row(
+                "SELECT count(*) FROM delivery_completion WHERE message_id=?1",
+                [complete_logical.key.message],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(saved);
+        assert_eq!(
+            completions, 1,
+            "upload capacity release must use the verified whole-vault intersection"
+        );
         let released = store
             .release_stored_capacity(&roster, &alice, &complete_logical, &config, &self_route)
             .unwrap();

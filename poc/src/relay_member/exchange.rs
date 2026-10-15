@@ -63,7 +63,7 @@ impl CourierFile {
             digest: *descriptor.digest(),
         })
     }
-    pub(super) fn peer(&self) -> u16 {
+    pub(crate) fn peer(&self) -> u16 {
         self.peer
     }
     pub(super) fn digest(&self) -> &[u8; 32] {
@@ -124,7 +124,7 @@ impl CourierImport {
         &self.wire
     }
 }
-pub(super) fn atomic_publish(directory: &Path, name: &str, bytes: &[u8]) -> MemberResult<()> {
+pub(crate) fn atomic_publish(directory: &Path, name: &str, bytes: &[u8]) -> MemberResult<()> {
     let path = directory.join(name);
     match fs::symlink_metadata(&path) {
         Ok(_) => {

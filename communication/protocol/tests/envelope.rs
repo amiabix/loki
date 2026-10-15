@@ -38,7 +38,7 @@ fn wire_boundary_record_overflow() {
 
 #[test]
 fn wire_boundary_message_and_config() {
-    for magic in [b"LOKIRLY1", b"LOKICFG1"] {
+    for magic in [b"LOKIRLY1", b"LOKICFG1", b"LOKISET1"] {
         for length in [1024, 2048, 65536] {
             assert_eq!(validate_wire(&frame(magic, length)), Ok(()));
         }
@@ -55,7 +55,7 @@ fn wire_boundary_wrong_magic() {
 
 #[test]
 fn wire_boundary_wrong_version() {
-    for magic in [b"LOKIRLY1", b"LOKICFG1"] {
+    for magic in [b"LOKIRLY1", b"LOKICFG1", b"LOKISET1"] {
         for version in [0, 2, 255] {
             let mut wire = frame(magic, 1024);
             wire[8] = version;

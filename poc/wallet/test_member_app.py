@@ -360,21 +360,87 @@ class MemberWalletTest(unittest.TestCase):
             wallet, vault, _ = self.payment_fixture(temp, phase=None)
             report = "inboxes=3 peers=2 live=2 routable=1"
             with patch.object(wallet, "command", return_value=report):
-                self.assertEqual(wallet.relay_status(vault),
+                self.assertEqual(wallet.relay_connection_status(vault),
                                  {"configured": True, "reachable": True, "inboxes": 3,
                                   "peers": 2, "live_relays": 2})
             with patch.object(wallet, "command", return_value=report.replace("peers=2", "peers=1")):
-                self.assertFalse(wallet.relay_status(vault)["configured"])
+                self.assertFalse(wallet.relay_connection_status(vault)["configured"])
             with patch.object(wallet, "command", return_value=report.replace("routable=1", "routable=0")):
-                self.assertFalse(wallet.relay_status(vault)["reachable"])
+                self.assertFalse(wallet.relay_connection_status(vault)["reachable"])
             with patch.object(wallet, "command", return_value=report.replace(
                     "live=2", "live=1")):
-                self.assertEqual(wallet.relay_status(vault),
+                self.assertEqual(wallet.relay_connection_status(vault),
                                  {"configured": True, "reachable": False, "inboxes": 3,
                                   "peers": 2, "live_relays": 1})
             with patch.object(wallet, "command", side_effect=ValueError("member_sealed")):
                 with self.assertRaisesRegex(ValueError, "member_sealed"):
-                    wallet.relay_status(vault)
+                    wallet.relay_connection_status(vault)
+
+    def test_four_member_operator_relays_keep_automatic_status_separate(self):
+        with tempfile.TemporaryDirectory(prefix="loki-four-relay-status-") as temp:
+            wallet, vault, _ = self.payment_fixture(temp, phase=None)
+            member = wallet.data / "vaults" / vault
+            membership = json.loads((member / "membership.json").read_text())
+            membership["members"] = 4
+            (member / "membership.json").write_text(json.dumps(membership))
+            with patch.object(wallet, "command", return_value="inboxes=3 peers=3 live=2 routable=1"):
+                self.assertEqual(wallet.relay_status(vault)["phase"], "not_configured")
+                (member / "relay-setup.json").write_text(json.dumps({
+                    "mode": "operator", "phase": "waiting", "detail": "Connecting operator relays."}))
+                self.assertTrue(wallet.relay_connection_status(vault)["reachable"])
+                self.assertEqual(wallet.relay_status(vault)["phase"], "ready")
+                self.assertFalse(wallet.relay_status(vault)["available"])
+                with self.assertRaisesRegex(ValueError, "operator relay connection controls"):
+                    wallet.setup_relays(vault)
+            with patch.object(wallet, "command", side_effect=AssertionError("cached status must not reprovision")):
+                self.assertEqual(wallet.relay_status(vault)["phase"], "ready")
+            with patch.object(wallet, "command", return_value="inboxes=3 peers=2 live=3 routable=1"):
+                self.assertFalse(wallet.relay_connection_status(vault)["configured"])
+            peers = {slot: f"sealed for {slot}".encode() for slot in (2, 3, 4)}
+            def export(action, *args, **kwargs):
+                self.assertEqual(action, "export-config")
+                for peer, wire in peers.items():
+                    (args[-1] / f"{vault}-relay-config-1-{peer}-1.bin").write_bytes(wire)
+                return "exported"
+            with patch.object(wallet, "command", side_effect=export):
+                self.assertEqual([row["peer"] for row in wallet.relay_export(vault)["files"]], [2, 3, 4])
+            with patch.object(wallet, "command", return_value="imported owner=4 revision=1 digest=" + "e" * 64):
+                self.assertEqual(wallet.relay_import(vault, base64.b64encode(b"sealed from 4").decode(),
+                                                     f"{vault}-relay-config-4-1-1.bin"), {"imported_from": 4})
+
+    def test_readiness_check_preserves_automatic_relay_progress(self):
+        with tempfile.TemporaryDirectory(prefix="loki-automatic-relay-status-") as temp:
+            wallet, vault, _ = self.payment_fixture(temp, phase=None)
+            state_path = wallet.data / "vaults" / vault / "relay-setup.json"
+            saved = {"phase": "waiting", "detail": "Waiting for peer configs.",
+                     "imported": [2], "network": "automatic-network"}
+            state_path.write_text(json.dumps(saved))
+            original = state_path.read_bytes()
+            with patch.object(wallet, "command", return_value="inboxes=3 peers=2 live=2 routable=1"):
+                self.assertTrue(wallet.relay_connection_status(vault)["reachable"])
+            self.assertEqual(state_path.read_bytes(), original)
+            state_path.unlink()
+            with patch.object(wallet, "command", return_value="inboxes=3 peers=2 live=2 routable=1"):
+                self.assertTrue(wallet.relay_connection_status(vault)["reachable"])
+            self.assertFalse(state_path.exists())
+
+    def test_operator_relay_routes_refuse_hosted_vaults(self):
+        with tempfile.TemporaryDirectory(prefix="loki-hosted-relay-guard-") as temp:
+            wallet, vault, _ = self.payment_fixture(temp, phase=None)
+            member = wallet.data / "vaults" / vault
+            membership = json.loads((member / "membership.json").read_text())
+            membership["transport"] = "hosted"
+            (member / "membership.json").write_text(json.dumps(membership))
+            wallet.hosted = object()
+            self.addCleanup(setattr, wallet, "hosted", None)
+            with patch.object(wallet, "command") as command:
+                for action in (lambda: wallet.relay_provision(vault, "/operator/kit"),
+                               lambda: wallet.relay_export(vault),
+                               lambda: wallet.relay_import(vault, "wire", "file"),
+                               lambda: wallet.relay_connection_status(vault)):
+                    with self.assertRaisesRegex(ValueError, "attach to relays automatically"):
+                        action()
+                command.assert_not_called()
 
     def test_relay_import_route_requires_private_token_and_refuses_invalid_file(self):
         with tempfile.TemporaryDirectory(prefix="loki-relay-route-") as temp:
@@ -600,10 +666,13 @@ class MemberWalletTest(unittest.TestCase):
                     finally:
                         (member / "final-card" / "held.card").rename(card_path)
             for wallet in wallets:
-                with self.assertRaisesRegex(ValueError, "2-of-4 payments are not available"):
-                    wallet.address(vault)
-                with self.assertRaisesRegex(ValueError, "2-of-4 payments are not available"):
-                    wallet.prepare_payment(vault, "uregtest1recipient", "40000000", "memo", "AB")
+                self.assertTrue(wallet.address(vault).startswith("uregtest1"))
+            for pair in ("AB", "AC", "AD", "BC", "BD", "CD"):
+                with patch.object(wallets[0], "command", side_effect=ValueError("native preparation reached")) as native:
+                    with self.assertRaisesRegex(ValueError, "native preparation reached"):
+                        wallets[0].prepare_payment(vault, "uregtest1recipient", "40000000", "memo", pair)
+                    self.assertEqual(native.call_args.args[0], "prepare")
+                    self.assertEqual(native.call_args.args[-1], pair)
             addresses = [wallet.command("address", wallet.data / "vaults" / vault, "@pass")
                          for wallet in wallets]
             self.assertEqual(len(set(addresses)), 1)
@@ -614,9 +683,8 @@ class MemberWalletTest(unittest.TestCase):
             card = (wallets[0].data / "vaults" / vault / "final-card" / "vault.card").read_bytes()
             result = restored.restore_vault("Four person treasury", saved_words[0],
                                             base64.b64encode(card).decode())
-            self.assertNotIn("address", result)
-            with self.assertRaisesRegex(ValueError, "2-of-4 payments are not available"):
-                restored.address(vault)
+            self.assertEqual(result["address"], addresses[0])
+            self.assertEqual(restored.address(vault), addresses[0])
 
     def test_create_join_certify_and_check_backups_in_three_roots(self):
         if not SETUP.is_file():

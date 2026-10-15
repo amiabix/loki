@@ -691,6 +691,19 @@ button.quiet:hover:not(:disabled) {
    Each row is a <button>, so every mint-button declaration above has to be
    unwound here: a list of vaults is a list, not a wall of primary actions. */
 
+.vault-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px 12px;
+  align-items: center;
+}
+.vault-item > p { margin: 0; }
+.vault-item > button.secondary { margin: 0; }
+.relay-detail { grid-column: 1 / -1; overflow-wrap: anywhere; }
+@media (max-width: 520px) {
+  .vault-item { grid-template-columns: minmax(0, 1fr); }
+  .vault-item > button.secondary { justify-self: start; }
+}
 .vault-row {
   display: flex;
   align-items: baseline;

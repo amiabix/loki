@@ -25,6 +25,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
+from local_relays import configure_member, ensure_network, network_root, save as save_relay_state
+from local_funding import fund_member, funding_status
 
 HERE = Path(__file__).resolve().parent
 SETUP = HERE.parent / "target" / "debug" / "loki_setup_member"
@@ -164,7 +166,7 @@ def courier_request(origin, method, path, token=None, body=None, timeout=15):
         # The platform trust store, fully verified. A courier that cannot prove
         # its name is not a courier this member will hand an invite token to.
         connection = http.client.HTTPSConnection(parts.hostname, parts.port, timeout=timeout,
-                                                 context=ssl.create_default_context())
+                                                 context=ssl.create_default_context(cafile=os.environ.get("SSL_CERT_FILE") or None))
     else:
         connection = http.client.HTTPConnection(parts.hostname, parts.port, timeout=timeout)
     try:
@@ -223,7 +225,7 @@ class SignerSessions:
     def pending(self):
         with self.lock:
             return [{"request": key, "origin": item["origin"], "network": "regtest",
-                     "access": "View vault status and request vault creation; each creation needs signer approval"}
+                     "access": "View vault status, set up local relays for all eligible vaults, and fund your eligible vaults with 5 local test ZEC per click. Vault creation needs signer approval."}
                     for key, item in self.records.items()
                     if item["state"] == "pending" and item["expires"] > self.now()]
 
@@ -256,7 +258,12 @@ class SignerSessions:
             return self._valid(key, origin)
 
     def request_action(self, key, origin, value):
-        if value.get("kind") != "create" or not isinstance(value.get("name"), str):
+        if not self.valid(key, origin):
+            raise ValueError("Connect your signer")
+        kind = value.get("kind")
+        if kind not in ("create", "relay-setup"):
+            raise ValueError("Unsupported vault request")
+        if not isinstance(value.get("name"), str):
             raise ValueError("Unsupported vault request")
         name = value["name"].strip()
         if not 1 <= len(name.encode()) <= 80:
@@ -264,6 +271,9 @@ class SignerSessions:
         members = value.get("members", 3)
         if type(members) is not int or members not in (3, 4):
             raise ValueError("Choose a 2-of-3 or 2-of-4 vault")
+        if kind == "relay-setup" and (not isinstance(value.get("vault"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", value["vault"])):
+            raise ValueError("Invalid vault ID")
         with self.lock:
             if not self._valid(key, origin):
                 raise ValueError("Connect your signer")
@@ -272,15 +282,17 @@ class SignerSessions:
             if len(self.actions) >= 16:
                 raise ValueError("Too many vault requests")
             action = secrets.token_urlsafe(32)
-            self.actions[action] = {"session": key, "origin": origin, "kind": "create",
-                                    "name": name, "members": members,
+            self.actions[action] = {"session": key, "origin": origin, "kind": kind,
+                                    "name": name, **({"vault": value["vault"]} if kind == "relay-setup" else
+                                                     {"members": members}),
                                     "state": "pending", "expires": self.now() + 300}
             return action
 
     def pending_actions(self):
         with self.lock:
             return [{"action": action, "origin": item["origin"], "kind": item["kind"],
-                     "name": item["name"], "members": item["members"]} for action, item in self.actions.items()
+                     "name": item["name"], **{field: item[field] for field in ("vault", "members") if field in item}}
+                    for action, item in self.actions.items()
                     if item["state"] == "pending" and item["expires"] > self.now()
                     and self._valid(item["session"], item["origin"])]
 
@@ -291,7 +303,8 @@ class SignerSessions:
                     or not self._valid(item["session"], item["origin"]):
                 raise ValueError("Vault request missing or expired")
             item["state"] = "executing"
-            return {"kind": item["kind"], "name": item["name"], "members": item["members"]}
+            return {"kind": item["kind"], "name": item["name"],
+                    **{field: item[field] for field in ("vault", "members") if field in item}}
 
     def finish_action(self, action, result=None, error=None):
         with self.lock:
@@ -337,7 +350,7 @@ class SignerSessions:
 
 
 class Wallet:
-    def __init__(self, data, exchange, setup=SETUP, invite_origin=None):
+    def __init__(self, data, exchange, setup=SETUP, invite_origin=None, transport="local", operator_bundle=None, operator_key=None, enrollment_grant=None, development_http=False, enrollment_issuer=None):
         self.data = data.resolve()
         self.exchange = exchange.resolve()
         if self.data == self.exchange or self.data in self.exchange.parents or self.exchange in self.data.parents:
@@ -354,6 +367,13 @@ class Wallet:
             self.process_lock.close()
             raise ValueError("This member data root is already open in another app") from error
         self.setup = setup
+        if transport not in ("local", "hosted"):
+            raise ValueError("Choose local or hosted transport")
+        self.transport = transport
+        self.hosted = None
+        if transport == "hosted":
+            from hosted_setup import HostedSetup
+            self.hosted = HostedSetup(self, operator_bundle, operator_key, enrollment_grant, development_http, enrollment_issuer)
         self.invite_origin = check_origin(invite_origin) if invite_origin else None
         self.lock = threading.Lock()
         self.claim_lock = threading.Lock()
@@ -367,6 +387,12 @@ class Wallet:
         self.setup_errors = {}
         self.relay_payment_ready = False
         self.scan_height = {}
+        self.relay_jobs = {}
+        self.relay_binary = RELAY
+        self.relay_attempts = {}
+        self.relay_stop = threading.Event()
+        self.relay_monitor = threading.Thread(target=self.monitor_relays, daemon=True)
+        self.relay_monitor.start()
 
     def command(self, action, *args, passphrase=None, timeout=30, binary=None):
         binary = binary or self.setup
@@ -404,6 +430,8 @@ class Wallet:
         profile = json.loads(self.command("profile-create", self.data, "@pass", name.strip(),
                                           passphrase=passphrase))
         self.passphrase, self.profile_data = passphrase, profile
+        if self.hosted:
+            self.hosted.start()
         return {"profile": profile}
 
     def unlock(self, passphrase):
@@ -420,9 +448,13 @@ class Wallet:
                              "certain it is right, the profile file on this device may have "
                              "been changed.") from error
         self.passphrase, self.profile_data = passphrase, profile
+        if self.hosted:
+            self.hosted.start()
         return {"profile": profile}
 
     def lock_profile(self):
+        if self.hosted:
+            self.hosted.stop()
         if any(worker.is_alive() for worker in self.workers.values()):
             raise ValueError("Wait for key creation to finish before locking")
         self.passphrase = None
@@ -440,6 +472,8 @@ class Wallet:
         if not local.is_file():
             raise ValueError("This profile is not a member of that vault")
         membership = read_json(local)
+        if membership.get("transport") == "hosted" and not self.hosted:
+            raise ValueError("Open this profile with hosted transport and its trusted operator bundle")
         if membership.get("vault") != vault or membership.get("profile") != self.require_profile()["id"]:
             raise ValueError("Vault membership does not belong to this profile")
         return folder, membership
@@ -449,8 +483,114 @@ class Wallet:
         root = self.data / "vaults"
         if not root.exists():
             return []
-        return [self.vault_dir(path.name)[1] for path in sorted(root.iterdir())
-                if (path / "membership.json").is_file()]
+        return [{**self.vault_dir(path.name)[1], "relay_setup": self.relay_status(path.name)} for path in sorted(root.iterdir())
+                if re.fullmatch(r"[0-9a-f]{64}", path.name) and (path / "membership.json").is_file()]
+
+    def setup_relays(self, vault):
+        if self.transport == "hosted":
+            raise ValueError("Hosted vaults attach to relays automatically")
+        member, local = self.vault_dir(vault)
+        state_path = member / "relay-setup.json"
+        if state_path.is_file() and read_json(state_path).get("mode") == "operator":
+            raise ValueError("Use this vault's operator relay connection controls")
+        if not (member / "final-backup-checked").is_file():
+            raise ValueError("Check your final backup before setting up relays")
+        if local.get("members") not in (3, 4):
+            raise ValueError("Unsupported vault policy")
+        if (member / "transport.json").exists():
+            raise ValueError("Local test relays require all three apps to use the same local exchange directory")
+        if not (self.exchange_vault(vault) / "draft.json").is_file():
+            raise ValueError("Local test relays require the saved shared setup courier")
+        worker = self.relay_jobs.get(vault)
+        if worker and worker.is_alive():
+            return {"vault": vault, "phase": "starting"}
+        def run():
+            with self.lock:
+                try:
+                    self.require_profile()
+                    configure_member(self, vault)
+                except Exception as error:
+                    path = member / "relay-setup.json"
+                    prior = read_json(path) if path.exists() else {}
+                    save_relay_state(path, {**prior, "phase": "failed", "detail": str(error)})
+        worker = threading.Thread(target=run, daemon=True)
+        self.relay_jobs[vault] = worker
+        worker.start()
+        return {"vault": vault, "phase": "starting"}
+
+    def relay_network_status(self):
+        if self.transport == "hosted":
+            return {"enabled": True, "transport": "hosted", "available": False, "detail": "Vaults connect to hosted relays automatically after setup and backup checks."}
+        settings = self.exchange / '.payment-relays' / 'settings.json'
+        enabled = settings.is_file() and read_json(settings).get('enabled') is True
+        return {"enabled": enabled, "detail":
+                "Automatic relay connection is enabled. Eligible vaults attach when their signers are unlocked."
+                if enabled else "Set up local relays once to connect all eligible vaults automatically."}
+
+    def setup_all_relays(self):
+        if self.transport == "hosted":
+            raise ValueError("Hosted vaults attach to relays automatically")
+        self.require_profile()
+        root = self.exchange / '.payment-relays'
+        network = network_root(self.exchange)
+        ensure_network(network)
+        save_relay_state(root / 'settings.json', {"enabled": True, "revision": secrets.token_hex(16),
+                                                "network": network.name})
+        return {"relay_setup": True}
+
+    def monitor_relays(self):
+        while not self.relay_stop.wait(1):
+            if self.transport == "hosted":
+                continue
+            try:
+                settings = self.exchange / '.payment-relays' / 'settings.json'
+                if not settings.is_file() or not self.profile_data:
+                    continue
+                policy = read_json(settings)
+                if policy.get('enabled') is not True:
+                    continue
+                with self.lock:
+                    if not self.profile_data or self.relay_stop.is_set():
+                        continue
+                    for item in self.vaults():
+                        vault = item['vault']
+                        state = item['relay_setup']
+                        if not state['available'] or state['phase'] == 'starting':
+                            continue
+                        if self.relay_attempts.get(vault) == policy['revision']:
+                            continue
+                        self.relay_attempts[vault] = policy['revision']
+                        self.setup_relays(vault)
+            except Exception:
+                continue
+
+    def relay_status(self, vault):
+        member, local = self.vault_dir(vault)
+        if local.get("transport") == "hosted":
+            native = self.hosted._cached(member)
+            return {"phase": "ready" if native.get("handoff") == "ready" else "waiting", "available": False,
+                    "detail": "Hosted relays are connected." if native.get("handoff") == "ready" else "Connecting hosted relays automatically."}
+        state_path = member / "relay-setup.json"
+        state = read_json(state_path) if state_path.is_file() else {}
+        if state.get("mode") == "operator":
+            return {"phase": state["phase"], "detail": state["detail"], "available": False}
+        active = local.get("members") in (3, 4) and (member / "final-backup-checked").is_file()
+        available = active and not (member / "transport.json").exists() and (self.exchange_vault(vault) / "draft.json").is_file()
+        worker = self.relay_jobs.get(vault)
+        if state.get("phase") == "waiting" and self.profile_data and not (worker and worker.is_alive()):
+            networks = self.exchange / '.payment-relays'
+            if any((networks / network / 'couriers' / str(local['slot']) /
+                    f'{vault}-relay-config-{owner}-{local["slot"]}-1.bin').is_file()
+                   for network in {network_root(self.exchange).name, vault}
+                   for owner in set(range(1, local['members'] + 1)) - {local['slot']} - set(state.get('imported', []))):
+                self.setup_relays(vault)
+                worker = self.relay_jobs.get(vault)
+        return {"phase": "starting" if worker and worker.is_alive() else state.get("phase", "not_configured"),
+                "detail": state.get("detail", "Connecting automatically." if available and self.relay_network_status()['enabled'] else
+                                    "Set up relays once from the dashboard." if available else
+                                    "Local test relays require the shared local setup courier." if active else
+                                    "Available after this member checks the final backup."),
+                "available": available}
 
     def exchange_vault(self, vault):
         if not isinstance(vault, str) or len(vault) != 64 or any(c not in "0123456789abcdef" for c in vault):
@@ -599,6 +739,8 @@ class Wallet:
                                 (folder / name).read_bytes())
 
     def create(self, name, members=3):
+        if self.hosted:
+            return self.hosted.create(f"2-of-{members}", name)
         profile = self.require_profile()
         if not isinstance(name, str) or not 1 <= len(name.strip()) <= 80:
             raise ValueError("Enter a vault name of 1 to 80 characters")
@@ -627,6 +769,8 @@ class Wallet:
         return {"vault": vault, "invites": invites}
 
     def join(self, invite):
+        if self.hosted:
+            return self.hosted.join(invite)
         profile = self.require_profile()
         try:
             claim = decoded(invite)
@@ -779,6 +923,8 @@ class Wallet:
         return result
 
     def agree(self, vault, fingerprint):
+        if self.vault_dir(vault)[1].get("transport") == "hosted":
+            return self.hosted.agree(vault, fingerprint)
         member_dir, local = self.vault_dir(vault)
         roster = self.roster(vault)
         if not roster["fingerprint"]:
@@ -840,12 +986,16 @@ class Wallet:
         return found
 
     def backup(self, vault):
+        if self.vault_dir(vault)[1].get("transport") == "hosted":
+            return self.hosted.backup(vault)
         member_dir, _ = self.vault_dir(vault)
         card = member_dir / "card"
         words = self.command("backup-create", member_dir, "@pass", card)
         return {"words": words}
 
     def verify(self, vault, words, card_bytes=None):
+        if self.vault_dir(vault)[1].get("transport") == "hosted":
+            return self.hosted.verify(vault, words, card_bytes)
         member_dir, _ = self.vault_dir(vault)
         if not isinstance(words, str):
             raise ValueError("Enter the 24 words you wrote down")
@@ -868,12 +1018,16 @@ class Wallet:
         return {"verified": True}
 
     def activate(self, vault):
+        if self.vault_dir(vault)[1].get("transport") == "hosted":
+            return {"final_backup": True}
         member_dir, _ = self.vault_dir(vault)
         self.command("address", member_dir, "@pass", member_dir / "roster.json",
                      self.exchange_vault(vault))
         return {"final_backup": True}
 
     def finalize_backup(self, vault, words=None):
+        if self.vault_dir(vault)[1].get("transport") == "hosted":
+            return self.hosted.finalize(vault, words)
         member_dir, _ = self.vault_dir(vault)
         if words is not None and not isinstance(words, str):
             raise ValueError("Enter your 24 backup words")
@@ -888,6 +1042,8 @@ class Wallet:
         return {"created": True}
 
     def verify_final_backup(self, vault, words, card_bytes):
+        if self.vault_dir(vault)[1].get("transport") == "hosted":
+            return self.hosted.verify(vault, words, card_bytes, final=True)
         member_dir, _ = self.vault_dir(vault)
         if not isinstance(words, str) or not isinstance(card_bytes, str):
             raise ValueError("Load the final card and enter your 24 words")
@@ -965,7 +1121,7 @@ class Wallet:
             }).encode())
             os.rename(restored, destination)
             return {"vault": vault, "slot": own["id"],
-                    **({"address": address} if len(members) == 3 else {})}
+                    **({"address": address} if len(members) in (3, 4) else {})}
         finally:
             if restored.exists():
                 shutil.rmtree(restored)
@@ -974,8 +1130,10 @@ class Wallet:
         member_dir, local = self.vault_dir(vault)
         if not (member_dir / "final-backup-checked").is_file():
             raise ValueError("Check your final backup card before showing the receive address")
-        if local.get("members") != 3:
-            raise ValueError("2-of-4 payments are not available in this app; do not fund this vault here")
+        if local.get("members") not in (3, 4):
+            raise ValueError("Unsupported vault policy")
+        if local.get("transport") == "hosted" and not (member_dir / "secrets" / "activation.sealed").is_file():
+            raise ValueError("Hosted payment activation is pending")
         return self.command("address", member_dir, "@pass")
 
     def balance(self, vault):
@@ -987,12 +1145,17 @@ class Wallet:
         self.scan_height[vault] = result.get("height")
         return result
 
+    def fund_vault(self, vault, request_id):
+        return fund_member(self, vault, request_id)
+
     def prepare_payment(self, vault, recipient, amount_zat, memo, pair=None):
         member_dir, local = self.vault_dir(vault)
         if not (member_dir / "final-backup-checked").is_file():
             raise ValueError("Vault is not active")
-        if local.get("members") != 3:
-            raise ValueError("2-of-4 payments are not available in this app; do not fund this vault here")
+        if local.get("members") not in (3, 4):
+            raise ValueError("Unsupported vault policy")
+        if local.get("transport") == "hosted" and not (member_dir / "secrets" / "activation.sealed").is_file():
+            raise ValueError("Hosted payment activation is pending")
         if not isinstance(recipient, str) or not recipient.strip():
             raise ValueError("Enter a recipient address")
         if not isinstance(amount_zat, str) or not 1 <= len(amount_zat) <= 20 \
@@ -1000,7 +1163,8 @@ class Wallet:
             raise ValueError("Enter a positive amount in zat")
         if not isinstance(memo, str) or not memo or len(memo.encode()) > 512:
             raise ValueError("Enter a memo of 1 to 512 bytes")
-        pairs = ("AB", "AC", "BC")
+        labels = "ABCD"[:local["members"]]
+        pairs = tuple(a + b for i, a in enumerate(labels) for b in labels[i + 1:])
         if pair is None:
             # The first pair that includes this member: no dropdown, same answer every time.
             pair = next((item for item in pairs
@@ -1037,8 +1201,8 @@ class Wallet:
 
     def payment(self, vault, attempt):
         member_dir, local = self.vault_dir(vault)
-        if local.get("threshold", 2) != 2 or local.get("members") != 3:
-            raise ValueError("Relay payments currently require a 2-of-3 vault")
+        if local.get("threshold", 2) != 2 or local.get("members") not in (3, 4):
+            raise ValueError("Unsupported vault policy")
         if not (member_dir / "final-backup-checked").is_file():
             raise ValueError("Vault is not active")
         if not isinstance(attempt, str) or not re.fullmatch(r"[0-9a-f]{64}", attempt):
@@ -1046,7 +1210,7 @@ class Wallet:
         for work in (member_dir / "payments").glob("*/payment.json"):
             manifest = read_json(work)
             if manifest.get("attempt") == attempt and manifest.get("vault") == vault:
-                if manifest.get("pair") not in ([1, 2], [1, 3], [2, 3]):
+                if manifest.get("pair") not in ([a, b] for a in range(1, local["members"] + 1) for b in range(a + 1, local["members"] + 1)):
                     raise ValueError("Invalid payment pair")
                 return member_dir, local, work.parent, manifest
         raise ValueError("Payment is not in this member's vault")
@@ -1103,20 +1267,25 @@ class Wallet:
 
     def relay_args(self, vault):
         member_dir, local = self.vault_dir(vault)
-        if local.get("threshold", 2) != 2 or local.get("members") != 3 \
+        if self.transport == "hosted" or local.get("transport") == "hosted":
+            raise ValueError("Hosted vaults attach to relays automatically")
+        if local.get("threshold", 2) != 2 or local.get("members") not in (3, 4) \
                 or not (member_dir / "final-backup-checked").is_file():
-            raise ValueError("Relay setup requires an active 2-of-3 vault")
+            raise ValueError("Relay setup requires an active 2-of-3 or 2-of-4 vault")
         return member_dir, local, ("--member-root", member_dir, "--passphrase-file", "@pass",
                                    "--roster", member_dir / "roster.json")
 
     def relay_provision(self, vault, bundle_path):
-        _, _, common = self.relay_args(vault)
+        member_dir, _, common = self.relay_args(vault)
         if not isinstance(bundle_path, str) or not Path(bundle_path).is_absolute():
             raise ValueError("Choose an absolute path to this member's relay kit")
         bundle = Path(bundle_path)
         manifests, capabilities = bundle / "manifests", bundle / "capabilities"
         if not manifests.is_dir() or not capabilities.is_dir():
             raise ValueError("Relay kit needs manifests and capabilities directories")
+        write_replace(member_dir / "relay-setup.json", json.dumps({
+            "mode": "operator", "phase": "waiting",
+            "detail": "Provisioning operator-provided relays. Retry the same kit after an interruption."}).encode())
         self.command("provision", *common, "--relay-manifest", manifests,
                      "--provision-capability-files", capabilities, binary=RELAY, timeout=120)
         return {"provisioned": True}
@@ -1139,7 +1308,7 @@ class Wallet:
                 files.append({"peer": int(match.group(1)), "name": path.name,
                               "data": base64.b64encode(wire).decode()})
             files.sort(key=lambda item: item["peer"])
-            if [item["peer"] for item in files] != [slot for slot in (1, 2, 3)
+            if [item["peer"] for item in files] != [slot for slot in range(1, local["members"] + 1)
                                                     if slot != local["slot"]]:
                 raise ValueError("Relay export did not contain one file for each peer")
             return {"files": files}
@@ -1150,7 +1319,7 @@ class Wallet:
             raise ValueError("Invalid relay config file")
         named = re.fullmatch(re.escape(vault) + rf"-relay-config-(\d+)-{local['slot']}-(\d+)\.bin",
                              filename)
-        if not named or int(named.group(1)) not in (1, 2, 3) \
+        if not named or int(named.group(1)) not in range(1, local["members"] + 1) \
                 or int(named.group(1)) == local["slot"] or int(named.group(2)) < 1:
             raise ValueError("Invalid relay config file")
         if not isinstance(encoded_wire, str) or not 0 < len(encoded_wire) <= 88 * 1024:
@@ -1171,14 +1340,21 @@ class Wallet:
             raise ValueError("Relay did not confirm the peer config")
         return {"imported_from": int(match.group(1))}
 
-    def relay_status(self, vault):
-        _, _, common = self.relay_args(vault)
+    def relay_connection_status(self, vault):
+        member_dir, local, common = self.relay_args(vault)
         report = self.command("readiness", *common, binary=RELAY, timeout=40)
         match = re.fullmatch(r"inboxes=(\d+) peers=(\d+) live=(\d+) routable=([01])", report.strip())
         if not match:
             raise ValueError("Relay readiness returned an unexpected result")
         inboxes, peers, live, routable = map(int, match.groups())
-        configured = inboxes == 3 and peers == 2 and routable == 1
+        configured = inboxes == 3 and peers == local["members"] - 1 and routable == 1
+        state_path = member_dir / "relay-setup.json"
+        saved = read_json(state_path) if state_path.is_file() else {}
+        if saved.get("mode") == "operator":
+            ready = configured and live >= 2
+            write_replace(state_path, json.dumps({"mode": "operator", "phase": "ready" if ready else "waiting",
+                "detail": "Operator-provided relays are connected." if ready else
+                          "Check the operator relay connection after importing every peer config."}).encode())
         return {"configured": configured, "reachable": configured and live >= 2,
                 "inboxes": inboxes, "peers": peers, "live_relays": live}
 
@@ -1214,9 +1390,11 @@ class Wallet:
 
     def sync_payments(self, vault):
         member_dir, local = self.vault_dir(vault)
-        if local.get("threshold", 2) != 2 or local.get("members") != 3 \
+        if local.get("threshold", 2) != 2 or local.get("members") not in (3, 4) \
                 or not (member_dir / "final-backup-checked").is_file():
-            raise ValueError("Relay payments require an active 2-of-3 vault")
+            raise ValueError("Relay payments require an active supported vault")
+        if local.get("transport") == "hosted" and not (member_dir / "secrets" / "activation.sealed").is_file():
+            raise ValueError("Hosted payment activation is still pending")
         roster = member_dir / "roster.json"
         common = ("--member-root", member_dir, "--passphrase-file", "@pass", "--roster", roster)
 
@@ -1386,8 +1564,10 @@ class Wallet:
         vaults = self.vaults()
         if vault is None:
             return {"phase": "home", "network": "regtest", "profile": self.profile_data,
-                    "vaults": vaults}
+                    "vaults": vaults, "relay_network": self.relay_network_status()}
         member_dir, local = self.vault_dir(vault)
+        if local.get("transport") == "hosted":
+            return {**self.hosted.status(vault), "vaults": vaults}
         active = (member_dir / "secrets" / "activation.sealed").is_file()
         if active:
             roster_path = member_dir / "roster.json"
@@ -1411,6 +1591,8 @@ class Wallet:
                  "threshold": local.get("threshold", 2), "total_members": local.get("members", 3),
                  "fingerprint": roster["fingerprint"], "error": self.setup_errors.get(vault),
                  "profile": self.profile_data, "vaults": vaults}
+        state["relay_setup"] = self.relay_status(vault)
+        state["funding"] = funding_status(self, vault)
         state["account_linked"] = (member_dir / "secrets" / "account-link.sealed").exists()
         self.ensure_sync(vault)
         state["transport_error"] = self.transport_errors.get(vault)
@@ -1454,6 +1636,12 @@ class Wallet:
         return state
 
     def close(self):
+        if self.hosted:
+            self.hosted.stop()
+        self.relay_stop.set()
+        self.relay_monitor.join(timeout=5)
+        for worker in self.relay_jobs.values():
+            worker.join(timeout=5)
         self.sync_stop.set()
         self.process_lock.close()
 
@@ -1632,10 +1820,16 @@ def make_signer_server(wallet, port, dashboard_port=None):
                 try:
                     with wallet.lock:
                         profile = wallet.require_profile()
-                        vaults = [{"vault": item["vault"], "name": item["name"], "slot": item["slot"],
-                                   "phase": wallet.status(item["vault"])["phase"]}
-                                  for item in wallet.vaults()]
-                    return self.reply(200, {"profile": profile["name"], "vaults": vaults})
+                        vaults = []
+                        for item in wallet.vaults():
+                            state = wallet.status(item["vault"])
+                            vaults.append({"vault": item["vault"], "name": item["name"], "slot": item["slot"],
+                                           "phase": state["phase"],
+                                           **{key: state[key] for key in ("total_members", "transport", "handoff", "missing_slots", "error") if key in state},
+                                           **({"funding": state["funding"]} if "funding" in state else {}),
+                                           **({"relay_setup": state["relay_setup"]} if "relay_setup" in state else {})})
+                    return self.reply(200, {"profile": profile["name"], "vaults": vaults,
+                                            "relay_network": wallet.relay_network_status()})
                 except Exception as error:
                     return self.reply(400, {"error": str(error)})
             if not self.authorized():
@@ -1670,7 +1864,8 @@ def make_signer_server(wallet, port, dashboard_port=None):
                 return self.reply(403, {"error": "Unauthorized host"})
             is_dashboard = self.path in ("/api/session/request", "/api/session/poll",
                                          "/api/session/disconnect", "/api/session/action",
-                                         "/api/session/action-poll")
+                                         "/api/session/action-poll", "/api/session/fund",
+                                         "/api/session/relay-setup-all")
             if is_dashboard:
                 if not self.dashboard_origin():
                     return self.reply(403, {"error": "Unauthorized dashboard origin"})
@@ -1692,8 +1887,19 @@ def make_signer_server(wallet, port, dashboard_port=None):
                         return self.reply(200, {"action": sessions.request_action(key, dashboard_origin, value)})
                     if self.path == "/api/session/action-poll":
                         return self.reply(200, sessions.poll_action(key, dashboard_origin, value.get("action")))
+                    if self.path in ("/api/session/fund", "/api/session/relay-setup-all"):
+                        if not sessions.valid(key, dashboard_origin):
+                            return self.reply(403, {"error": "Connect your signer"})
+                        with wallet.lock:
+                            if not sessions.valid(key, dashboard_origin):
+                                return self.reply(403, {"error": "Connect your signer"})
+                            result = wallet.setup_all_relays() if self.path == "/api/session/relay-setup-all" \
+                                else wallet.fund_vault(value.get("vault"), value.get("request_id"))
+                            return self.reply(200, result)
                     sessions.disconnect(key, dashboard_origin)
                     return self.reply(200, {"disconnected": True})
+                if self.path == "/api/lock" and wallet.hosted:
+                    wallet.hosted.stop()
                 with wallet.lock:
                     if self.path == "/api/session/approve":
                         wallet.require_profile()
@@ -1707,7 +1913,13 @@ def make_signer_server(wallet, port, dashboard_port=None):
                         action = value.get("action")
                         details = sessions.take_action(action)
                         try:
-                            result = wallet.create(details["name"], details["members"])
+                            if details["kind"] == "relay-setup":
+                                _, membership = wallet.vault_dir(details["vault"])
+                                if membership["name"] != details["name"]:
+                                    raise ValueError("Vault name changed; request relay setup again")
+                                result = wallet.setup_relays(details["vault"])
+                            else:
+                                result = wallet.create(details["name"], details["members"])
                         except Exception as error:
                             sessions.finish_action(action, error=str(error))
                             raise
@@ -1735,12 +1947,14 @@ def make_signer_server(wallet, port, dashboard_port=None):
                             value.get("name"), value.get("words"), value.get("card")),
                         "/api/address": lambda: {"address": wallet.address(value.get("vault"))},
                         "/api/balance": lambda: wallet.balance(value.get("vault")),
+                        "/api/relay-setup": lambda: wallet.setup_relays(value.get("vault")),
+                        "/api/relay-setup-all": wallet.setup_all_relays,
                         "/api/relay-provision": lambda: wallet.relay_provision(
                             value.get("vault"), value.get("bundle")),
                         "/api/relay-export": lambda: wallet.relay_export(value.get("vault")),
                         "/api/relay-import": lambda: wallet.relay_import(
                             value.get("vault"), value.get("data"), value.get("name")),
-                        "/api/relay-status": lambda: wallet.relay_status(value.get("vault")),
+                        "/api/relay-status": lambda: wallet.relay_connection_status(value.get("vault")),
                         "/api/payment-draft": lambda: wallet.prepare_payment(
                             value.get("vault"), value.get("recipient"), value.get("amount_zat"),
                             value.get("memo"), value.get("pair")),
@@ -1852,11 +2066,23 @@ if __name__ == "__main__":
                         help="address invited members reach that courier on. Defaults to "
                              "http://127.0.0.1:<invite-port>, which only works for another "
                              "app on this machine. Any other address must be https.")
+    parser.add_argument("--transport", choices=("local", "hosted"), default="local")
+    parser.add_argument("--operator-bundle", type=Path)
+    parser.add_argument("--operator-key")
+    parser.add_argument("--enrollment-grant", type=Path)
+    parser.add_argument("--enrollment-issuer", type=Path)
+    parser.add_argument("--development-http", action="store_true")
     args = parser.parse_args()
+    if args.transport == "hosted" and (not args.operator_bundle or not args.operator_key):
+        parser.error("Hosted transport needs --operator-bundle and --operator-key")
+    if args.transport == "hosted" and args.invite_port:
+        parser.error("Hosted setup uses the admission service rather than --invite-port")
     origin = args.invite_origin
     if args.invite_port and not origin:
         origin = f"http://127.0.0.1:{args.invite_port}"
     if origin and not args.invite_port:
         parser.error("--invite-origin needs --invite-port to serve")
-    serve(Wallet(args.data, args.exchange, invite_origin=origin), args.port,
+    serve(Wallet(args.data, args.exchange, invite_origin=origin, transport=args.transport,
+                 operator_bundle=args.operator_bundle, operator_key=args.operator_key,
+                 enrollment_grant=args.enrollment_grant, development_http=args.development_http, enrollment_issuer=args.enrollment_issuer), args.port,
           args.dashboard_port, args.invite_port)

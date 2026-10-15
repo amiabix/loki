@@ -252,6 +252,7 @@ fn run() -> Result<(), Exit> {
                 "--roster",
                 "--verify-relays",
                 "--diagnostics",
+                "--attempt",
             ])?;
             let (root, pass, roster) = common()?;
             status(
@@ -260,6 +261,11 @@ fn run() -> Result<(), Exit> {
                 &roster,
                 switched("--verify-relays"),
                 switched("--diagnostics"),
+                if switched("--attempt") {
+                    Some(parse_id(take("--attempt")?.to_str().ok_or(Exit::Usage)?)?)
+                } else {
+                    None
+                },
             )
         }
         "readiness" => {
@@ -507,70 +513,73 @@ fn import_proposals(root: &Path, pass: &Path, roster: &Path, payments: &Path) ->
     create_private_dir(&expected)?;
     let mut imported = 0;
     let mut rejected = 0;
-    visit_pages(|after| session.db.recover_incoming_originals(after, PAGE), |row| {
-        if row.kind != 1 {
-            return Ok(());
-        }
-        let Ok(opened) =
-            session
-                .db
-                .open_incoming(&session.member.roster, &session.member.identity, &row)
-        else {
-            rejected += 1;
-            return Ok(());
-        };
-        let body = opened.message().body();
-        let Payload::Test(payload) = &body.payload else {
-            return Ok(());
-        };
-        let manifest = match decode_proposal(payload) {
-            Ok(Some(manifest)) => manifest,
-            Ok(None) => return Ok(()),
-            Err(_) => {
+    visit_pages(
+        |after| session.db.recover_incoming_originals(after, PAGE),
+        |row| {
+            if row.kind != 1 {
+                return Ok(());
+            }
+            let Ok(opened) =
+                session
+                    .db
+                    .open_incoming(&session.member.roster, &session.member.identity, &row)
+            else {
+                rejected += 1;
+                return Ok(());
+            };
+            let body = opened.message().body();
+            let Payload::Test(payload) = &body.payload else {
+                return Ok(());
+            };
+            let manifest = match decode_proposal(payload) {
+                Ok(Some(manifest)) => manifest,
+                Ok(None) => return Ok(()),
+                Err(_) => {
+                    rejected += 1;
+                    return Ok(());
+                }
+            };
+            let Ok((context, intent)) = payment_manifest::parse(manifest) else {
+                rejected += 1;
+                return Ok(());
+            };
+            if payment_manifest::validate_roster(
+                session.member.roster.vault,
+                session.member.roster.members.iter().map(|member| member.id),
+                &context,
+                &intent,
+            )
+            .is_err()
+            {
                 rejected += 1;
                 return Ok(());
             }
-        };
-        let Ok((context, intent)) = payment_manifest::parse(manifest) else {
-            rejected += 1;
-            return Ok(());
-        };
-        if payment_manifest::validate_roster(
-            session.member.roster.vault,
-            session.member.roster.members.iter().map(|member| member.id),
-            &context,
-            &intent,
-        )
-        .is_err()
-        {
-            rejected += 1;
-            return Ok(());
-        }
-        if body.session != Some(context.attempt.0)
-            || Some(body.key.sender) != payment_manifest::proposer_id(&intent.proposer).ok()
-        {
-            rejected += 1;
-            return Ok(());
-        }
-        let directory = expected.join(hex_id(&context.attempt.0));
-        create_private_dir(&directory)?;
-        let path = directory.join("payment.json");
-        match create_private_file(&path, manifest) {
-            Ok(true) => imported += 1,
-            Ok(false) => {}
-            Err(Exit::Member(MemberError::Identity)) => {
+            if body.session != Some(context.attempt.0)
+                || Some(body.key.sender) != payment_manifest::proposer_id(&intent.proposer).ok()
+            {
                 rejected += 1;
                 return Ok(());
             }
-            Err(error) => return Err(error),
-        }
-        println!(
-            "proposal={} attempt={}",
-            hex_id(&context.payment),
-            hex_id(&context.attempt.0)
-        );
-        Ok(())
-    })?;
+            let directory = expected.join(hex_id(&context.attempt.0));
+            create_private_dir(&directory)?;
+            let path = directory.join("payment.json");
+            match create_private_file(&path, manifest) {
+                Ok(true) => imported += 1,
+                Ok(false) => {}
+                Err(Exit::Member(MemberError::Identity)) => {
+                    rejected += 1;
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+            println!(
+                "proposal={} attempt={}",
+                hex_id(&context.payment),
+                hex_id(&context.attempt.0)
+            );
+            Ok(())
+        },
+    )?;
     println!("imported_proposals={imported}");
     println!("rejected_proposals={rejected}");
     Ok(())
@@ -720,33 +729,36 @@ fn export_signing(
     let session = open_session(root, pass, roster)?;
     let mailbox = Mailbox::new(&work.join("mailbox")).map_err(|_| Exit::Member(MemberError::Io))?;
     let mut count = 0;
-    visit_pages(|after| session.db.recover_incoming_originals(after, PAGE), |row| {
-        if row.session != Some(attempt) || row.kind != 1 {
-            return Ok(());
-        }
-        let Ok(opened) =
-            session
-                .db
-                .open_incoming(&session.member.roster, &session.member.identity, &row)
-        else {
-            return Ok(());
-        };
-        let Payload::Test(wire) = &opened.message().body().payload else {
-            return Ok(());
-        };
-        match decode_proposal(wire) {
-            Ok(Some(_)) | Err(_) => return Ok(()),
-            Ok(None) => {}
-        }
-        if session_envelope(wire).is_err() {
-            return Ok(());
-        }
-        mailbox
-            .append(wire)
-            .map_err(|_| Exit::Member(MemberError::Io))?;
-        count += 1;
-        Ok(())
-    })?;
+    visit_pages(
+        |after| session.db.recover_incoming_originals(after, PAGE),
+        |row| {
+            if row.session != Some(attempt) || row.kind != 1 {
+                return Ok(());
+            }
+            let Ok(opened) =
+                session
+                    .db
+                    .open_incoming(&session.member.roster, &session.member.identity, &row)
+            else {
+                return Ok(());
+            };
+            let Payload::Test(wire) = &opened.message().body().payload else {
+                return Ok(());
+            };
+            match decode_proposal(wire) {
+                Ok(Some(_)) | Err(_) => return Ok(()),
+                Ok(None) => {}
+            }
+            if session_envelope(wire).is_err() {
+                return Ok(());
+            }
+            mailbox
+                .append(wire)
+                .map_err(|_| Exit::Member(MemberError::Io))?;
+            count += 1;
+            Ok(())
+        },
+    )?;
     println!("exported_signing={count}");
     Ok(())
 }
@@ -811,6 +823,7 @@ fn status(
     roster: &Path,
     verify_relays: bool,
     diagnostics: bool,
+    attempt: Option<Id32>,
 ) -> Result<(), Exit> {
     let mut session = open_session(root, pass, roster)?;
     println!("section=local");
@@ -818,15 +831,27 @@ fn status(
     println!("member={}", session.member.identity.public().id);
     print_reference(&session)?;
     print_authenticated_inboxes(&session)?;
-    let logicals = logical_page(&session.db)?;
-    let incoming = page_rows(
+    let mut logicals = logical_page(&session.db)?;
+    let mut incoming = page_rows(
         |after| session.db.recover_incoming_originals(after, PAGE),
         usize::MAX,
     )?;
-    let acks = page_rows(
+    let mut acks = page_rows(
         |after| session.db.recover_ack_links(after, PAGE),
         usize::MAX,
     )?;
+    if let Some(attempt) = attempt {
+        logicals.retain(|record| record.session == Some(attempt));
+        incoming.retain(|record| record.session == Some(attempt));
+        acks.retain(|ack| {
+            logicals
+                .iter()
+                .any(|record| record.key == ack.key && record.digest == ack.digest)
+                || incoming
+                    .iter()
+                    .any(|record| record.key == ack.key && record.digest == ack.digest)
+        });
+    }
     println!("logical_count={}", logicals.len());
     println!("incoming_count={}", incoming.len());
     println!("ack_count={}", acks.len());
@@ -923,7 +948,7 @@ fn readiness(root: &Path, pass: &Path, roster: &Path) -> Result<(), Exit> {
     let inboxes = config.own.len();
     let peers = config.peer_wires.len();
     let routable = inboxes == 3
-        && peers == 2
+        && peers == session.member.roster.members.len() - 1
         && session.configs.routing(&session.db, &session.member).is_ok();
     let http = RelayHttp::new().map_err(Exit::Client)?;
     let live = runtime()?.block_on(async {

@@ -6,8 +6,10 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import stat
+import sqlite3
 import sys
 import time
 
@@ -32,7 +34,7 @@ def read_source(path, cap):
         os.close(descriptor)
 
 
-def copy_vault(source, destination):
+def copy_vault(source, destination, preserve_configuration=False):
     """Copy only certified sealed state; never reuse the source transport journal."""
     source = Path(source).absolute()
     destination = Path(destination).absolute()
@@ -42,12 +44,12 @@ def copy_vault(source, destination):
     roster = json.loads(raw)
     publics = roster.get('members', [])
     if (run._HEX64.fullmatch(str(roster.get('vault'))) is None
-            or len(publics) != 3 or [item.get('id') for item in publics] != [1, 2, 3]):
-        raise run.OwnershipError('Source roster must certify members 1, 2 and 3')
+            or len(publics) not in (3, 4) or [item.get('id') for item in publics] != list(range(1, len(publics) + 1))):
+        raise run.OwnershipError('Source roster must certify consecutive members for a supported policy')
     for field in ('signing', 'encryption'):
         values = [item.get(field) for item in publics]
         if any(not isinstance(value, str) or run._HEX64.fullmatch(value) is None
-               for value in values) or len(set(values)) != 3:
+               for value in values) or len(set(values)) != len(publics):
             raise run.OwnershipError('Source member identities are not distinct')
     hashes = {source / 'roster.json': hashlib.sha256(raw).hexdigest()}
     target_roster = destination / 'roster.json'
@@ -75,8 +77,25 @@ def copy_vault(source, destination):
             data = read_source(path, cap)
             hashes[path] = hashlib.sha256(data).hexdigest()
             run._write_new(root / destination_name, data, 0o600)
-        members.append(run.CertifiedMember(member_id, root, root / 'passphrase',
-                                            public['signing'], public['encryption']))
+        if preserve_configuration:
+            database = source_member / 'transport/client.sqlite3'
+            run._mkdir(root / 'transport')
+            with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True) as original:
+                reference = original.execute('SELECT revision,hash FROM config_versions WHERE singleton=1').fetchone()
+                if reference is None or reference[0] != 1 or len(reference[1]) != 32:
+                    raise run.OwnershipError('Hosted source has no exact installed initial configuration')
+                with sqlite3.connect(root / 'transport/client.sqlite3') as target:
+                    original.backup(target)
+            os.chmod(root / 'transport/client.sqlite3', 0o600)
+            name = f'secrets/relay-config-{reference[0]:016}.sealed'
+            raw = read_source(source_member / name, 4 * 1024 * 1024)
+            hashes[source_member / name] = hashlib.sha256(raw).hexdigest()
+            run._write_new(root / name, raw, 0o600)
+        member = run.CertifiedMember(member_id, root, root / 'passphrase',
+                                     public['signing'], public['encryption'])
+        if preserve_configuration:
+            member.config_revision, member.config_hash = reference[0], reference[1].hex()
+        members.append(member)
     return tuple(members), target_roster, hashes
 
 
@@ -89,15 +108,20 @@ def verify_source(hashes):
 class MemberEnvironments(run.OwnedRun):
     """Apply filesystem denial and a private HOME/TMPDIR to every member invocation."""
 
-    CAPTURE_OUTPUT_LIMIT = 262144
+    CAPTURE_OUTPUT_LIMIT = 1048576
 
     def capture_group(self, jobs, *, timeout, output_limit=16384):
         if any(argv[:2] == [getattr(self, 'member_binary', None), 'status']
                for argv, _cwd in jobs):
             output_limit = self.CAPTURE_OUTPUT_LIMIT
-        return super().capture_group(jobs, timeout=timeout, output_limit=output_limit)
+        results = super().capture_group(jobs, timeout=timeout, output_limit=output_limit)
+        for result in results:
+            if result.returncode and result.stderr:
+                index = len(list(self.root.glob('command-failure-*.private')))
+                run._write_new(self.root / f'command-failure-{index}.private', result.stderr, 0o600)
+        return results
 
-    def configure(self, members, source, member_binary):
+    def configure(self, members, source, member_binary, extra_denied=()):
         self.members = members
         self.member_binary = str(member_binary)
         self.profiles = {}
@@ -105,7 +129,7 @@ class MemberEnvironments(run.OwnedRun):
         run._mkdir(profile_root)
         for member in members:
             denied = [other.root for other in members if other is not member]
-            denied += [self.root / 'relays', source]
+            denied += [self.root / 'relays', source, *extra_denied]
             denied += [self.root / 'descriptors' / str(other.member_id)
                        for other in members if other is not member]
             rules = ['(version 1)', '(allow default)']
@@ -172,7 +196,7 @@ def check_isolation(owner, source, deadline):
             if result.returncode != 1 or result.stdout:
                 raise run.OwnershipError('Member sandbox allowed foreign state access')
         evidence.append({'member': member.member_id, 'own_read': True,
-                         'peer_reads_denied': 2, 'relay_read_denied': True,
+                         'peer_reads_denied': len(owner.members) - 1, 'relay_read_denied': True,
                          'source_read_denied': True, 'private_home_and_tmp': True})
     relay_canary.unlink()
     return evidence
@@ -213,13 +237,72 @@ def prepare_existing(owner, source, ports, communication, poc, deadline):
     return context, hashes, isolation, server, member_bin
 
 
+def prepare_hosted_existing(owner, source, runtime, communication, poc, deadline, offline_relay=None, signing_attempt=None):
+    server = run.find_binary('loki-relay-server', workspace=communication)
+    member_bin = run.find_binary('loki_relay_member', workspace=poc)
+    setup_bin = run.find_binary('loki_setup_member', workspace=poc)
+    members, roster, hashes = copy_vault(source, owner.root, preserve_configuration=True)
+    owner.configure(members, source, member_bin, extra_denied=(runtime,))
+    run._mkdir(owner.root / 'relays')
+    isolation = check_isolation(owner, source, deadline)
+    fingerprint = run._fingerprint_text(run._command_text(owner, [str(setup_bin), 'fingerprint', str(roster)], owner.root, deadline))
+    relays = []
+    for index in range(1, 4):
+        root = runtime / f'relay-{index}'
+        fields = read_source(root / 'manifest', 4096).decode().splitlines()
+        if len(fields) != 3 or any(re.fullmatch(r'[0-9a-f]{64}', pin) is None for pin in fields[1:]):
+            raise run.OwnershipError('Saved hosted relay manifest is invalid')
+        endpoint, run_id, receipt_key = fields
+        listen = run._listen(endpoint)
+        child = None
+        if index != offline_relay:
+            child = owner.start([str(server), 'serve', '--root', str(root), '--listen', listen], cwd=root)
+            run._wait_listen(child, listen, deadline)
+        relays.append(run.RelayBinding(endpoint, run_id, receipt_key, root, child))
+    if len({relay.receipt_key for relay in relays}) != 3 or len({relay.run_id for relay in relays}) != 3:
+        raise run.OwnershipError('Hosted relay identities are not independent pins')
+    context = run.SetupContext(owner, json.loads(roster.read_text())['vault'], fingerprint,
+                               0, 0, tuple(relays), members, roster, (), ())
+    context.signing_attempt = signing_attempt
+    inboxes = []
+    expected_routes = {(relay.receipt_key, relay.run_id, relay.endpoint) for relay in relays}
+    expected_failures = (relays[offline_relay - 1].receipt_key,) if offline_relay is not None else ()
+    for member in members:
+        parsed = run._parse_status(run._member_text(context, member_bin, member, deadline,
+            'status', ['--verify-relays', *(['--attempt', signing_attempt] if signing_attempt is not None else [])]), member.member_id, True,
+            expected_route_failures=expected_failures, member_count=len(members))
+        found_routes = {(item['pin'], item['run'], item['endpoint']) for item in parsed['inboxes']}
+        if found_routes != expected_routes or any(item['append_revision'] != 1 for item in parsed['inboxes']) \
+                or (parsed['config_revision'], parsed['config_hash']) != (member.config_revision, member.config_hash):
+            raise run.OwnershipError('Installed hosted configuration differs from its saved relay pins or reference')
+        inboxes.extend(parsed['inboxes'])
+        capability = runtime / 'relay-1.secret'
+        denied = owner.capture(owner.sandbox_command(member, ['/bin/cat', str(capability)]), cwd=member.root, timeout=run._remaining(deadline))
+        if denied.returncode != 1 or denied.stdout:
+            raise run.OwnershipError('Hosted member could read operator provisioning capability')
+        isolation[member.member_id - 1]['runtime_provisioning_read_denied'] = True
+    if len(inboxes) != 3 * len(members) or len({item['mailbox'] for item in inboxes}) != len(inboxes):
+        raise run.OwnershipError('Installed hosted inboxes are not distinct for every member')
+    context.inboxes = tuple(inboxes)
+    return context, hashes, isolation, server, member_bin
+
 def status(context, binary, member, deadline, verify=False):
     return run._member_status(context, binary, member, deadline, verify=verify)
 
 
 def poll(context, binary, member, deadline):
-    if run._member_text(context, binary, member, deadline, 'poll', ['--once']) != 'poll=ok\n':
-        raise run.OwnershipError('Member poll did not complete')
+    for _ in range(32):
+        try:
+            text = run._member_text(context, binary, member, deadline, 'poll', ['--once'])
+        except run.OwnedCommandError as error:
+            if not error.capacity:
+                raise
+            run._member_text(context, binary, member, deadline, 'upload', [], allow_empty=True)
+            continue
+        if text != 'poll=ok\n':
+            raise run.OwnershipError('Member poll did not complete')
+        return
+    raise run.OwnershipError('Member inbox backpressure did not clear within the bounded retry')
 
 
 def send_pair(context, binary, member, deadline):
@@ -273,16 +356,19 @@ def receive_pair(context, binary, member, originals, pair, deadline):
 
 
 def require_complete(context, snapshots, originals, acknowledgements):
-    if len(originals) != 6 or len({item['id'] for item in originals}) != 6:
+    ids = tuple(member.member_id for member in context.members)
+    original_count = 2 * len(ids)
+    acknowledgement_count = original_count * (len(ids) - 1)
+    if len(originals) != original_count or len({item['id'] for item in originals}) != original_count:
         raise run.OwnershipError('Expected six distinct original messages')
     expected_links = {(item['sender'], item['id'], peer)
-                      for item in originals for peer in (1, 2, 3) if peer != item['sender']}
+                      for item in originals for peer in ids if peer != item['sender']}
     observed_links = []
     for member in context.members:
         current = snapshots[member.member_id]
         tests = [message for message in current['messages'] if message['kind'] == 'test']
         incoming = [message for message in current['incoming'] if message['kind'] == 'test']
-        if len(tests) != 2 or len(incoming) != 4 or len(current['acks']) != 4:
+        if len(tests) != 2 or len(incoming) != 2 * (len(ids) - 1) or len(current['acks']) != 2 * (len(ids) - 1):
             raise run.OwnershipError('Member counts differ from two self and four peer originals')
         if any(row['readiness'] != 'ready' for row in incoming):
             raise run.OwnershipError('Peer original is not authenticated and ready')
@@ -293,7 +379,7 @@ def require_complete(context, snapshots, originals, acknowledgements):
             if item['sender'] != member.member_id:
                 continue
             message = run._only_message(current, item['id'])
-            expected_received = {peer: int(peer != member.member_id) for peer in (1, 2, 3)}
+            expected_received = {peer: int(peer != member.member_id) for peer in ids}
             if (message['digest'] != item['digest'] or message['readiness'] != 'ready'
                     or message['received_whole'] != 1 or message['received_author'] != 1
                     or message['received_members'] != expected_received):
@@ -304,9 +390,9 @@ def require_complete(context, snapshots, originals, acknowledgements):
             if target is None or ack['digest'] != target['digest']:
                 raise run.OwnershipError('Acknowledgement names a different original body')
             observed_links.append((ack['sender'], ack['id'], ack['author']))
-    if len(observed_links) != 12 or set(observed_links) != expected_links:
+    if len(observed_links) != acknowledgement_count or set(observed_links) != expected_links:
         raise run.OwnershipError('Acknowledgements include a duplicate, missing peer or self acknowledgement')
-    if len(acknowledgements) != 12 or len({ack['ack_message'] for ack in acknowledgements}) != 12:
+    if len(acknowledgements) != acknowledgement_count or len({ack['ack_message'] for ack in acknowledgements}) != acknowledgement_count:
         raise run.OwnershipError('Expected twelve distinct Received messages')
     for ack in acknowledgements:
         author = next(item['sender'] for item in originals if item['id'] == ack['original_id'])

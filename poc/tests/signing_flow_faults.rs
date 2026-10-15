@@ -62,6 +62,18 @@ use zcash_protocol::{memo::MemoBytes, value::Zatoshis};
 
 #[test]
 fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire() {
+    run_review_and_rollback(3, [1, 2]);
+}
+
+#[test]
+fn every_four_member_pair_refuses_nonce_rollback_and_replays_exact_fanout() {
+    for pair in [[1, 2], [1, 3], [1, 4], [2, 3], [2, 4], [3, 4]] {
+        run_review_and_rollback(4, pair);
+    }
+}
+
+fn run_review_and_rollback(member_count: u16, pair: [u16; 2]) {
+    let [first, second] = pair;
     let root = std::env::temp_dir().join(format!(
         "loki-signing-flow-{}",
         hex::encode(AttemptId::random().0)
@@ -71,14 +83,14 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
     let bob_root = root.join("bob");
     let mailbox = Mailbox::new(&root.join("relay")).unwrap();
     let (shares, public) = frost::keys::generate_with_dealer(
-        3,
+        member_count,
         2,
         frost::keys::IdentifierList::Default,
         rand_core::OsRng,
     )
     .unwrap();
-    let alice_id = frost::Identifier::try_from(1u16).unwrap();
-    let bob_id = frost::Identifier::try_from(2u16).unwrap();
+    let alice_id = frost::Identifier::try_from(first).unwrap();
+    let bob_id = frost::Identifier::try_from(second).unwrap();
     let alice_key = frost::keys::KeyPackage::try_from(shares[&alice_id].clone()).unwrap();
     let bob_key = frost::keys::KeyPackage::try_from(shares[&bob_id].clone()).unwrap();
     let ak: [u8; 32] = public
@@ -139,11 +151,13 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
         vault: ak,
         payment: intent.proposal_id(),
         attempt: AttemptId::random(),
-        pair: [1, 2],
+        pair,
     };
-    let alice_identity = Identity::new(1);
-    let bob_identity = Identity::new(2);
-    let carol = Identity::new(3);
+    let alice_identity = Identity::new(first);
+    let bob_identity = Identity::new(second);
+    let observers = (1..=member_count).filter(|id| !pair.contains(id)).collect::<Vec<_>>();
+    let carol = Identity::new(observers[0]);
+    let other_observer = observers.get(1).map(|id| Identity::new(*id));
     let carol_public = carol.public();
     MemberDir::create(&alice_root, "secrets")
         .unwrap()
@@ -279,11 +293,14 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
     assert!(bob
         .review_package(&wrong_commitment, &alice_public)
         .is_err());
-    let roster = BTreeMap::from([
-        (1, alice_public.clone()),
-        (2, bob_public.clone()),
-        (3, carol_public.clone()),
+    let mut roster = BTreeMap::from([
+        (first, alice_public.clone()),
+        (second, bob_public.clone()),
+        (carol_public.id, carol_public.clone()),
     ]);
+    if let Some(other) = &other_observer {
+        roster.insert(other.public().id, other.public());
+    }
     let package_hashes = alice
         .publish_package_to_roster(&roster, &honest, &mailbox, "pass")
         .unwrap();
@@ -298,10 +315,10 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
         .join(hex::encode(ctx.attempt.0));
     let reviewed = bob.review_package(&good, &alice_public).unwrap();
     assert!(bob
-        .publish_approved_secured(
+        .publish_approved_secured_to_roster(
             reviewed,
             &alice_public,
-            &carol_public,
+            &roster,
             &mailbox,
             "pass",
             &mut WrongRelays
@@ -325,7 +342,7 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
     assert_eq!(reviewed.summary().vault, ak);
     assert_eq!(reviewed.summary().payment, intent.proposal_id());
     assert_eq!(reviewed.summary().attempt, ctx.attempt);
-    assert_eq!(reviewed.summary().pair, [1, 2]);
+    assert_eq!(reviewed.summary().pair, pair);
     assert_eq!(
         reviewed.summary().recipient,
         recipient.to_raw_address_bytes()
@@ -459,7 +476,7 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
     assert!(mailbox
         .read_for(
             &alice_sender,
-            &BTreeMap::from([(1, alice_public.clone()), (2, bob_public.clone())]),
+            &BTreeMap::from([(first, alice_public.clone()), (second, bob_public.clone())]),
             &ctx
         )
         .unwrap()
@@ -467,11 +484,7 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
     assert!(mailbox
         .read_for(
             &carol,
-            &BTreeMap::from([
-                (1, alice_public.clone()),
-                (2, bob_public.clone()),
-                (3, carol_public.clone()),
-            ]),
+            &roster,
             &ctx
         )
         .unwrap()
@@ -480,10 +493,10 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
 
     let mut witness = FirstWriter::default();
     let bob_share_hash = bob
-        .publish_approved_secured(
+        .publish_approved_secured_to_roster(
             reviewed,
             &alice_public,
-            &carol_public,
+            &roster,
             &mailbox,
             "pass",
             &mut witness,
@@ -517,17 +530,17 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
     .unwrap();
     let restored_review = restored.review_package(&good, &alice_public).unwrap();
     assert!(restored
-        .publish_approved_secured(
+        .publish_approved_secured_to_roster(
             restored_review,
             &alice_public,
-            &carol_public,
+            &roster,
             &mailbox,
             "pass",
             &mut witness
         )
         .is_err());
     assert!(!old_attempt.join("share.sealed").exists());
-    let bob_saved = SigningSession::saved_share_wires(&bob_root, &ctx, 2, "pass").unwrap();
+    let bob_saved = SigningSession::saved_share_wires(&bob_root, &ctx, second, "pass").unwrap();
     let forged_bob_wire = {
         let opened = carol
             .open_session(&bob_public, &ctx, &bob_saved[1])
@@ -550,7 +563,7 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
     let bob_wire = fs::read(root.join("relay").join(hex::encode(bob_share_hash))).unwrap();
     drop(bob);
     assert_eq!(
-        SigningSession::recover_share(&bob_root, &ctx, 2, "pass", &mailbox).unwrap(),
+        SigningSession::recover_share(&bob_root, &ctx, second, "pass", &mailbox).unwrap(),
         bob_share_hash
     );
     assert_eq!(
@@ -558,7 +571,7 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
         bob_wire
     );
     assert_eq!(
-        SigningSession::saved_share_wires(&bob_root, &ctx, 2, "pass").unwrap(),
+        SigningSession::saved_share_wires(&bob_root, &ctx, second, "pass").unwrap(),
         bob_saved
     );
     assert_eq!(bob_saved[0], bob_wire);
@@ -592,11 +605,13 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
         *blake3::hash(&candidate).as_bytes()
     );
     let sighash = alice_review.summary().sighash;
+    let finishers = roster.values().filter(|identity| !pair.contains(&identity.id))
+        .cloned().collect::<Vec<_>>();
     alice
         .publish_approved(
             alice_review,
             &bob_public,
-            &[carol_public.clone()],
+            &finishers,
             &mailbox,
             "pass",
         )
@@ -619,7 +634,6 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
     drop(alphas);
     drop(inputs);
     drop(notes);
-    let roster = BTreeMap::from([(1, alice_public), (2, bob_public), (3, carol_public)]);
     let inbox = mailbox.read_for(&carol, &roster, &ctx).unwrap();
     let package = inbox
         .iter()
@@ -647,10 +661,24 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
     assert!(indices
         .iter()
         .all(|i| signed.ironwood().actions()[*i].spend().witness().is_none()));
+    if let Some(other) = &other_observer {
+        let inbox = mailbox.read_for(other, &roster, &ctx).unwrap();
+        let payload = PackagePayload::decode(&ctx,
+            inbox.iter().find(|message| message.kind() == MessageKind::Package).unwrap().body(),
+        ).unwrap();
+        let shares: [loki_poc::signing_session::OpenedMessage; 2] = inbox.into_iter()
+            .filter(|message| message.kind() == MessageKind::Share)
+            .collect::<Vec<_>>().try_into().unwrap();
+        let (_, other_sighash, indices) = aggregate_and_apply(
+            &ctx, &intent, &ak, &public, &fvk, &payload, &shares,
+        ).unwrap();
+        assert_eq!(other_sighash, sighash);
+        assert_eq!(indices.len(), 2);
+    }
     let forged = carol
-        .open_session(&roster[&2], &ctx, &forged_bob_wire)
+        .open_session(&roster[&second], &ctx, &forged_bob_wire)
         .unwrap();
-    let alice_share = shares.iter().find(|m| m.sender() == 1).unwrap().clone();
+    let alice_share = shares.iter().find(|m| m.sender() == first).unwrap().clone();
     let error = aggregate_and_apply(
         &ctx,
         &intent,
@@ -662,16 +690,16 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
     )
     .err()
     .expect("authenticated invalid Bob share must refuse the whole batch");
-    assert!(error.contains("member 2"), "{error}");
+    assert!(error.contains(&format!("member {second}")), "{error}");
     let restarted = Identity::from_secret_bytes(
         &MemberDir::open(&alice_root, "secrets")
             .read_sealed("identity.sealed", "pass")
             .unwrap(),
     )
     .unwrap();
-    let saved = SigningSession::saved_share_wires(&alice_root, &ctx, 1, "pass").unwrap();
+    let saved = SigningSession::saved_share_wires(&alice_root, &ctx, first, "pass").unwrap();
     let own_share = restarted
-        .open_sent_session(&roster[&2], &ctx, &saved[0])
+        .open_sent_session(&roster[&second], &ctx, &saved[0])
         .unwrap();
     let alice_inbox = mailbox.read_for(&restarted, &roster, &ctx).unwrap();
     let peer_share = alice_inbox
@@ -696,9 +724,9 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
     .unwrap();
     assert_eq!(restarted_sighash, sighash);
     assert_eq!(restarted_indices.len(), 2);
-    let sent_wires = SigningSession::saved_package_wires(&alice_root, &ctx, 1, "pass").unwrap();
+    let sent_wires = SigningSession::saved_package_wires(&alice_root, &ctx, first, "pass").unwrap();
     let sent_package = restarted
-        .open_sent_session(&roster[&2], &ctx, &sent_wires[0])
+        .open_sent_session(&roster[&second], &ctx, &sent_wires[0])
         .unwrap();
     let sent_package = PackagePayload::decode(&ctx, sent_package.body()).unwrap();
     let (_, publisher_sighash, publisher_indices) = aggregate_and_apply(
