@@ -1,9 +1,13 @@
 'use strict';
 const token = location.hash.slice(1);
 const $ = (id) => document.getElementById(id);
-let selectedVault = null;
+const OPEN_VAULT = 'loki-open-vault';
+let selectedVault;
+try { selectedVault = sessionStorage.getItem(OPEN_VAULT); }
+catch { selectedVault = null; }
 let linkChallenge = null;
 let memberSlot = null;
+let memberCount = null;
 let renderedPaymentVault = null;
 let midFlight = [];
 let pumping = false;
@@ -15,8 +19,13 @@ const paymentActivity = new Map();
 
 function selectVault(vault) {
   selectedVault = vault;
+  try {
+    if (vault) sessionStorage.setItem(OPEN_VAULT, vault);
+    else sessionStorage.removeItem(OPEN_VAULT);
+  } catch { /* Private browsing may disable session storage. */ }
   linkChallenge = null;
   memberSlot = null;
+  memberCount = null;
   renderedPaymentVault = null;
   midFlight = [];
   relaySetupPhase = null;
@@ -34,6 +43,8 @@ function selectVault(vault) {
   $('payment-list').replaceChildren();
   $('payment-updates').hidden = true;
   $('payment-updates').textContent = '';
+  $('relay-state').textContent = 'Relay connection has not been checked on this device.';
+  $('relay-downloads').replaceChildren();
   renderedInvites = null;
 }
 
@@ -89,9 +100,9 @@ async function api(path, body) {
   return result;
 }
 function fields(form) { return Object.fromEntries(new FormData(form)); }
-async function cardBase64(file) {
+async function cardBase64(file, kind = 'Backup card') {
   const bytes = new Uint8Array(await file.arrayBuffer());
-  if (bytes.length > 65536) throw new Error('Backup card is too large');
+  if (bytes.length > 65536) throw new Error(`${kind} is too large`);
   let raw = ''; for (const byte of bytes) raw += String.fromCharCode(byte);
   return btoa(raw);
 }
@@ -280,6 +291,13 @@ async function refreshPayments() {
                      + (payment.txid ? ` · transaction ${payment.txid.slice(0, 16)}…` : '')));
     const did = paymentActivity.get(payment.attempt);
     if (did?.length) card.append(note(`Just ran on this device: ${did.join(', ')}.`));
+
+    if (payment.phase === 'draft') {
+      card.append(paymentButton('Send this proposal', async () => {
+        await api('payment-publish', {vault, attempt: payment.attempt});
+        message('Proposal sent to the other members.');
+      }));
+    }
 
     if (review) {
       const summary = document.createElement('pre');
@@ -603,12 +621,38 @@ function rosterList(state) {
   list.hidden = !(state.confirmations || []).length;
 }
 
+function backupList(state) {
+  const list = $('backup-list');
+  list.replaceChildren();
+  for (const entry of state.backups || []) {
+    const row = document.createElement('div');
+    row.className = 'roster-row';
+    const who = document.createElement('strong');
+    who.textContent = entry.slot === state.slot ? `Member ${entry.slot} · you` : `Member ${entry.slot}`;
+    const said = document.createElement('span');
+    said.textContent = entry.reported ? 'reported checking a final card'
+      : entry.invalid ? 'invalid report — check with this member' : 'no report yet';
+    row.classList.add(entry.reported ? 'agreed' : entry.invalid ? 'differs' : 'waiting');
+    row.append(who, said);
+    list.append(row);
+  }
+}
+
 async function refresh() {
   try {
-    const state = await api('status' + (selectedVault ? `?vault=${encodeURIComponent(selectedVault)}` : ''));
+    let state;
+    try {
+      state = await api('status' + (selectedVault ? `?vault=${encodeURIComponent(selectedVault)}` : ''));
+    } catch (error) {
+      if (!selectedVault) throw error;
+      const home = await api('status');
+      if (home.vaults?.some((vault) => vault.vault === selectedVault)) throw error;
+      selectVault(null);
+      state = home;
+    }
     if ((state.phase === 'new_profile' || state.phase === 'locked') && selectedVault) selectVault(null);
     paymentsLive = false;
-    for (const id of ['new-profile', 'locked', 'home', 'invites', 'connect-account', 'setup', 'backup', 'waiting', 'final-backup', 'active']) $(id).hidden = true;
+    for (const id of ['new-profile', 'locked', 'home', 'invites', 'connect-account', 'setup', 'backup', 'waiting', 'final-backup', 'backup-status', 'active', 'relay-setup']) $(id).hidden = true;
     const inVault = !!selectedVault;
     $('back').hidden = !inVault;
     $('lock').hidden = !state.profile && state.phase !== 'home';
@@ -633,7 +677,7 @@ async function refresh() {
     $('transport-note').hidden = !state.transport_error;
     if (state.transport_error) {
       $('transport-note').textContent = state.transport_error.waiting
-        ? `${state.transport_error.message} Setup continues once it is reachable again.`
+        ? `${state.transport_error.message} ${state.phase === 'active' ? 'Backup reports update' : 'Setup continues'} once it is reachable again.`
         : state.transport_error.message;
     }
     $('linked-account').hidden = !state.account_ak;
@@ -667,6 +711,8 @@ async function refresh() {
         $('active').hidden = false;
         memberSlot = state.slot;
         const paymentAvailable = [3, 4].includes(state.total_members) && (state.transport !== 'hosted' || state.handoff === 'ready');
+        memberCount = state.total_members;
+        $('relay-setup').hidden = !paymentAvailable || state.transport === 'hosted';
         $('payment-unavailable').hidden = paymentAvailable;
         $('show-address').hidden = !paymentAvailable;
         if (!paymentAvailable) $('address').textContent = 'Receive address is available after payment activation.';
@@ -682,6 +728,10 @@ async function refresh() {
         if (paymentAvailable && renderedPaymentVault !== selectedVault) await refreshPayments();
       }
       else if (state.phase === 'stopped') message('Setup stopped: ' + state.error + '. Start a fresh vault session.', true);
+      if ((state.phase === 'final_backup' || state.phase === 'active') && state.backups?.length) {
+        backupList(state);
+        $('backup-status').hidden = false;
+      }
     }
     if (state.error) message(state.error, true);
     else if (state.account_link_error) message(`${state.account_link_error}. Vault keys are unaffected.`, true);
@@ -770,6 +820,58 @@ action('check-final-backup', async (form) => {
                                    card: await cardBase64(value.card)});
   message('Your final card checked. Ask every member to do the same before depositing.');
 });
+action('relay-provision', async (form) => {
+  await api('relay-provision', {vault: selectedVault, bundle: fields(form).bundle});
+  message('Your relay inboxes are provisioned. Prepare the encrypted files for the other members.');
+});
+action('relay-export', async () => {
+  const vault = selectedVault;
+  const {files} = await api('relay-export', {vault});
+  if (selectedVault !== vault) return;
+  const list = $('relay-downloads');
+  list.replaceChildren();
+  for (const file of files) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = `Download encrypted file for member ${file.peer}`;
+    button.addEventListener('click', () => {
+      const bytes = Uint8Array.from(atob(file.data), c => c.charCodeAt(0));
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(new Blob([bytes], {type: 'application/octet-stream'}));
+      link.download = file.name;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+    });
+    list.append(button);
+  }
+  message('Send each encrypted file only to the member named on its button. Ask them to import it in their own app.');
+});
+action('relay-import', async (form) => {
+  const {file} = fields(form);
+  const result = await api('relay-import', {vault: selectedVault,
+                                             name: file.name, data: await cardBase64(file, 'Relay file')});
+  message(`Member ${result.imported_from}'s relay config was checked and imported.`);
+});
+$('relay-check').addEventListener('click', async () => {
+  const button = $('relay-check');
+  button.disabled = true;
+  try {
+    const vault = selectedVault;
+    const expectedPeers = memberCount - 1;
+    const state = await api('relay-status', {vault});
+    if (selectedVault !== vault) return;
+    $('relay-state').textContent = !state.inboxes
+      ? 'This member has no relay inboxes yet. Provision your relay kit.'
+      : state.peers < expectedPeers
+        ? `${state.peers} of ${expectedPeers} encrypted peer configs imported. Each other member must send you theirs.`
+        : !state.configured
+          ? 'Relay configs are present, but this member cannot route payments yet. Check the local kit and try again.'
+        : state.live_relays < 2
+          ? `${state.live_relays} of 3 relays responded. At least 2 must respond for approvals.`
+          : 'All peer configs are present. This member’s inbox answered on at least 2 relays; delivery to peers is checked when sending.';
+  } catch (error) { message(error.message, true); }
+  finally { button.disabled = false; }
+});
 action('show-address', async () => {
   const value = await api('address', {vault: selectedVault});
   $('address').textContent = value.address;
@@ -789,7 +891,7 @@ action('payment-draft', async (form) => {
   const amount_zat = zatFromZec(value.amount_zec);
   const draft = await api('payment-draft', {vault, recipient: value.recipient, memo: value.memo, amount_zat});
   if (selectedVault !== vault) return;
-  $('draft-result').textContent = `PROPOSED · no member has approved or sent this payment\n`
+  $('draft-result').textContent = `DRAFT · no member has approved or sent this payment\n`
     + `Payment ID: ${draft.payment}\n`
     + `Amount: ${zecFromZat(amount_zat)} ZEC (${amount_zat} zat)\n`
     + `Signers: members ${draft.pair.join(' and ')}`;

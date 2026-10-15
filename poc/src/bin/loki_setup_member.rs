@@ -504,6 +504,44 @@ fn backup_verify(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn backup_report(args: &[String]) -> Result<(), String> {
+    if args.len() != 3 {
+        return Err("backup-report <member-dir> <passphrase-file> <roster.json>".into());
+    }
+    let member_dir = Path::new(&args[0]);
+    if !member_dir.join("final-backup-checked").is_file()
+        || !member_dir.join("final-card/vault.card").is_file()
+    {
+        return Err("Check your final backup card before reporting its status".into());
+    }
+    let state: serde_json::Value =
+        serde_json::from_slice(&sealed_state(Path::new(&args[0]), Path::new(&args[1]))?)
+            .map_err(|e| e.to_string())?;
+    let roster = checked_roster(&state, Path::new(&args[2]))?;
+    println!(
+        "{}",
+        hex::encode(state_identity(&state)?.sign_final_status(&roster.vault)?)
+    );
+    Ok(())
+}
+
+fn backup_reports(args: &[String]) -> Result<(), String> {
+    if args.len() != 2 {
+        return Err("backup-reports <roster.json> <exchange-dir>".into());
+    }
+    let roster = Roster::load(Path::new(&args[0]))?;
+    let reports: Vec<_> = roster.members.values().map(|peer| {
+        let path = Path::new(&args[1]).join(name(&roster.vault, "final-status", peer.id, None));
+        let present = path.exists();
+        let reported = present && fs::read(&path)
+            .map(|wire| Identity::verify_final_status(peer, &roster.vault, &wire).is_ok())
+            .unwrap_or(false);
+        serde_json::json!({"slot": peer.id, "reported": reported, "invalid": present && !reported})
+    }).collect();
+    println!("{}", serde_json::json!(reports));
+    Ok(())
+}
+
 fn backup_finalize(args: &[String]) -> Result<(), String> {
     if args.len() != 7 {
         return Err("backup-finalize <member-dir> <passphrase-file> <provisional-card-dir> <new-final-card-dir> <words-file> <roster.json> <exchange-dir>".into());
@@ -935,12 +973,14 @@ fn main() {
         Some("backup-create") => backup_create(&args[1..]),
         Some("backup-verify") => backup_verify(&args[1..]),
         Some("backup-finalize") => backup_finalize(&args[1..]),
+        Some("backup-report") => backup_report(&args[1..]),
+        Some("backup-reports") => backup_reports(&args[1..]),
         Some("restore") => restore(&args[1..]),
         Some("fingerprint") if args.len() == 2 => {
             Roster::load(Path::new(&args[1])).map(|r| println!("{}", hex::encode(r.fingerprint())))
         }
         Some("run") => run(&args[1..]),
-        _ => Err("usage: loki_setup_member profile-create|profile-open|identity|identity-public|fingerprint|run|backup-create|backup-verify|backup-finalize|address|validate-roster|restore ...".into()),
+        _ => Err("usage: loki_setup_member profile-create|profile-open|identity|identity-public|fingerprint|run|backup-create|backup-verify|backup-finalize|backup-report|backup-reports|address|validate-roster|restore ...".into()),
     };
     if let Err(error) = result {
         eprintln!("error: {error}");

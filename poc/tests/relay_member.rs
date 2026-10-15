@@ -126,6 +126,39 @@ fn certified_setup_with_count(policy: bool, count: u16) -> &'static PathBuf {
     })
 }
 #[test]
+fn communication_cli_readiness_accepts_all_three_peers_in_four_member_vault() {
+    let base = certified_setup_with_count(true, 4);
+    let members: Vec<_> = (1..=4)
+        .map(|id| {
+            let root = base.join(format!("member-{id}"));
+            load(&root, &root.join("pass"), &base.join("roster.json")).unwrap()
+        })
+        .collect();
+    let root = base.join("member-1").canonicalize().unwrap();
+    let mut config = config_owner(&members[0]);
+    for peer in &members[1..] {
+        let wire = loki_relay_client::seal_descriptor(
+            &peer.identity, &peer.roster, &config_descriptor(peer, 1),
+            &members[0].identity.public(),
+        ).unwrap().wire;
+        config.import(&members[0], &wire).unwrap();
+    }
+    let mut db = loki_relay_client::ClientStore::open(&root.join("transport"), &members[0].roster, 1).unwrap();
+    let store = loki_poc::relay_member::ConfigStore::open(&root, &root.join("pass")).unwrap();
+    store.save_revision(&mut db, &members[0], 1, &config).unwrap();
+    drop(db);
+    let result = member_cli(&[
+        member_arg("readiness"), member_arg("--member-root"), member_arg(&root),
+        member_arg("--passphrase-file"), member_arg(root.join("pass")),
+        member_arg("--roster"), member_arg(base.join("roster.json")),
+    ]);
+    assert_eq!(result.status.code(), Some(0), "{}", member_stderr(&result));
+    let output = member_stdout(&result);
+    assert!(output.contains("inboxes=3 peers=3"), "{output}");
+    assert!(output.contains("routable=1"), "{output}");
+}
+
+#[test]
 fn certified_threshold_two_roster_loads_for_relay() {
     let base = certified_setup_with_policy(true);
     let member = base.join("member-2");
@@ -3263,6 +3296,17 @@ fn communication_cli_status_public_fields_only() {
     assert_fixture_secrets_absent(&f, status.stdout.as_slice());
     assert_fixture_secrets_absent(&f, status.stderr.as_slice());
     assert!(member_stderr(&status).is_empty(), "status stderr");
+}
+
+#[test]
+fn communication_cli_readiness_without_config_reports_no_routes() {
+    let f = RetainedFixture::new();
+    let mut args = vec![member_arg("readiness")];
+    args.extend(common_member_args(&f));
+    let result = member_cli(&args);
+    assert_eq!(result.status.code(), Some(0));
+    assert_eq!(member_stdout(&result), "inboxes=0 peers=0 live=0 routable=0\n");
+    assert_fixture_secrets_absent(&f, result.stdout.as_slice());
 }
 
 #[test]

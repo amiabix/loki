@@ -82,6 +82,10 @@ every name against the ones this vault can have and every body against the
 digest the courier advertised, refuses a second version of a published wire,
 and may publish only its own slot's files. The roster fingerprint is still
 compared out of band, so the courier remains untrusted.
+After a member reloads and checks the final card, their app publishes a signed
+status receipt. The status list verifies those signatures against the certified
+roster; it cannot prove anyone still retains their card. Remote reports arrive
+while the creator's courier and joining apps remain online.
 
 ```sh
 python3 wallet/member_app.py --data /tmp/loki-member-1 --exchange /tmp/loki-setup-1 --port 8801 --invite-port 8787
@@ -102,8 +106,9 @@ replaced without a new vault.
   travels on every request; a LAN `http://` address is refused when the invite
   is made. Reaching the courier from another device therefore means putting a
   TLS front with such a certificate ahead of the loopback `--invite-port`. That
-  deployment is not part of this app, and a join from a second physical device
-  has not been verified here.
+  deployment is not part of this app. `test_remote_join.py` completes joining,
+  DKG, and backup across verified HTTPS with separate app roots on one host;
+  a second physical device has not been verified here.
 * **Members cannot finish at their own times, and the creator cannot be
   offline.** The courier is served by the creator's app, so it must be open and
   reachable for the whole join, DKG and backup round. A durable independent
@@ -200,16 +205,19 @@ and configuration; networks originally limited to one vault continue serving
 that vault. New connections use the shared network. These processes run on one machine; hosted HTTPS relays and
 remote onboarding are not implemented by this local test flow.
 
-For manually provisioned relay networks, each member must provision their
-vault directory with three operator-issued relay manifests and capability files
-using `loki_relay_member provision`, run `export-config`, deliver only the
-recipient-encrypted courier files to the named peers, and run `import-config`
-on the files addressed to them. Check each member with
-`loki_relay_member status --verify-relays` before using payment controls. The app
-does not collect external operator capabilities. The independent
+For an operator-provided network, relay operators issue three independent manifest and capability sets
+to each member. Put each member's sets in a local kit with `manifests/` and
+`capabilities/` directories. In that member's private app, **Connect operator-provided relays**
+provisions from the kit path for either supported policy, downloads one recipient-encrypted config file per peer,
+and imports the encrypted files received from the other members. Send each
+download only to its named member. **Check relay connection** requires all
+peer configs and a response from this member's inbox on at least two relays;
+delivery to other members is checked when sending. The app does
+not issue operator credentials or deliver the encrypted files between members.
+Hosted vaults attach automatically and do not expose these manual kit controls.
+Operator independence is a deployment condition it cannot verify. The independent
 three-relay setup in `communication/harness/three_members.py` tests transport;
-it does not configure an app vault. Relay keys are checked as distinct, but
-operator independence is a deployment condition that the app cannot verify.
+it does not configure an app vault.
 If signing stops after consuming a nonce and before saving the share, that
 attempt cannot be resumed; create a new payment attempt with fresh nonces.
 
@@ -218,6 +226,32 @@ now delivers the proposal to each member through the relays, carries only each
 member's own signing messages, uses the exact signer review token, then proves,
 mines, and checks receipt in an independent recipient vault. This validates the
 Rust payment path; it is not a browser end-to-end test.
+
+The opt-in member-app test joins those paths on a disposable THS network. It
+creates and backs up a vault in three separate app processes, provisions three
+real relay processes through the app routes, funds the vault, checks two signer
+reviews, has the third member broadcast, and checks confirmation, the recipient
+balance and all three member balance views:
+
+```sh
+cargo build --manifest-path communication/Cargo.toml --locked -p loki-relay-server
+cargo build --manifest-path poc/Cargo.toml --locked --bins --features relay-communication
+ths --name loki-app-flow start --no-open --port-offset 280  # keep this running
+LOKI_THS_INSTANCE=loki-app-flow python3 poc/wallet/test_relay_payment_flow.py -v
+```
+
+This is three private processes on one host and three relays under one test
+operator. It does not prove physical-device operation or independent relay
+operators. The finisher learns the broadcast txid and can mark that payment
+confirmed; the other apps see the changed vault balance but do not yet receive
+an authenticated executed-payment notice, so their payment rows can remain at
+Approved. For a physical-device acceptance run, use a trusted HTTPS setup
+courier, three independently operated HTTPS relays with a separate kit on each
+device, and a shared regtest chain connection. Record only public evidence:
+matching roster fingerprints, each member's final-card check and relay status,
+the funding and payment txids, both verified review summaries, confirmation
+height, recipient receipt and each member's post-payment balance. Do not copy
+passphrases, cards, capabilities or signing wires into the report.
 
 The app is passphrase-only today. Its local file courier and time-limited,
 non-resumable DKG are development controls, not the planned relay transport.

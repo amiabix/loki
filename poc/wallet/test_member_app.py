@@ -1,20 +1,47 @@
 """The setup app never creates or unlocks another member's share."""
 
 import base64
+import http.client
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
-from member_app import SEED_WALLET, SETUP, Wallet
+from member_app import SEED_WALLET, SETUP, Wallet, courier_name, make_signer_server
 
 
 class MemberWalletTest(unittest.TestCase):
+    def test_sync_stops_after_all_final_reports(self):
+        with tempfile.TemporaryDirectory(prefix="loki-sync-done-") as temp:
+            wallet = Wallet(Path(temp) / "member", Path(temp) / "exchange")
+            self.addCleanup(wallet.close)
+            vault = "a" * 64
+            member = wallet.data / "vaults" / vault
+            member.mkdir(parents=True)
+            (member / "transport.json").write_text(json.dumps({
+                "vault": vault, "origin": "http://127.0.0.1:1", "token": "test", "slot": 2}))
+            (member / "final-backup-checked").write_text("checked\n")
+            with patch.object(wallet, "sync_once") as sync, patch.object(
+                    wallet, "backup_reports", return_value=[{"reported": True}] * 3):
+                wallet.ensure_sync(vault)
+                worker = wallet.syncs[vault]
+                worker.join(timeout=2)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(sync.call_count, 1)
+                wallet.ensure_sync(vault)
+                self.assertIs(wallet.syncs[vault], worker)
+
+    def test_final_status_receipt_is_owned_by_its_member(self):
+        vault = "a" * 64
+        self.assertTrue(courier_name(vault, f"{vault}-final-status-2.bin", "2"))
+        self.assertFalse(courier_name(vault, f"{vault}-final-status-2.bin", "1"))
+
     def test_payment_sync_moves_only_own_wires_and_waits_for_relay_storage(self):
         with tempfile.TemporaryDirectory(prefix="loki-payment-sync-") as temp:
             wallet = Wallet(Path(temp) / "alice", Path(temp) / "exchange")
@@ -245,9 +272,14 @@ class MemberWalletTest(unittest.TestCase):
             self.assertEqual(calls.count("features"), 1)
             with patch.object(alice, "command", side_effect=command):
                 self.assertEqual(alice.payments(vault)["payments"][0]["phase"], "confirmed")
-            with patch.object(alice, "payment_command", side_effect=ValueError("reorganized")):
+            with patch.object(alice, "payment_command", side_effect=ValueError("transaction is not mined")):
                 self.assertEqual(alice.payments(vault)["payments"][0]["phase"],
                                  "confirmation_needs_recheck")
+                self.assertEqual(alice.payment_phase(work)["phase"], "confirmation_needs_recheck")
+                self.assertEqual(alice.advance_payment(vault, attempt)["phase"],
+                                 "confirmation_needs_recheck")
+            with patch.object(alice, "command", side_effect=command):
+                self.assertEqual(alice.advance_payment(vault, attempt)["phase"], "confirmed")
             review["vault"] = "f" * 64
             with patch.object(alice, "command", return_value=json.dumps(review)) as command:
                 with self.assertRaisesRegex(ValueError, "differs from this payment"):
@@ -275,6 +307,166 @@ class MemberWalletTest(unittest.TestCase):
             wallet.payment_status(work, phase, txid)
         return wallet, vault, attempt
 
+    def test_relay_setup_keeps_operator_files_out_of_page_and_imports_only_sealed_peer_file(self):
+        with tempfile.TemporaryDirectory(prefix="loki-relay-setup-") as temp:
+            wallet, vault, _ = self.payment_fixture(temp, phase=None)
+            bundle = Path(temp) / "operator-kit"
+            manifests, capabilities = bundle / "manifests", bundle / "capabilities"
+            manifests.mkdir(parents=True)
+            capabilities.mkdir()
+            own = wallet.data / "vaults" / vault
+            peers = {2: b"sealed for member 2", 3: b"sealed for member 3"}
+            imported = []
+
+            def command(action, *args, **kwargs):
+                self.assertEqual(kwargs["binary"].name, "loki_relay_member")
+                self.assertEqual(args[:6], ("--member-root", own, "--passphrase-file", "@pass",
+                                            "--roster", own / "roster.json"))
+                if action == "provision":
+                    self.assertEqual(args[6:], ("--relay-manifest", manifests,
+                                                "--provision-capability-files", capabilities))
+                    return "config revision=1 hash=" + "f" * 64
+                if action == "export-config":
+                    output = args[-1]
+                    for peer, wire in peers.items():
+                        (output / f"{vault}-relay-config-1-{peer}-1.bin").write_bytes(wire)
+                    return "config revision=1 hash=" + "f" * 64
+                if action == "import-config":
+                    courier = args[-1]
+                    self.assertEqual(courier.stat().st_mode & 0o777, 0o600)
+                    imported.append(courier.read_bytes())
+                    return "imported owner=2 revision=1 digest=" + "e" * 64
+                raise AssertionError(action)
+
+            with patch.object(wallet, "command", side_effect=command):
+                self.assertEqual(wallet.relay_provision(vault, str(bundle)), {"provisioned": True})
+                exported = wallet.relay_export(vault)["files"]
+                self.assertEqual([item["peer"] for item in exported], [2, 3])
+                self.assertEqual([base64.b64decode(item["data"]) for item in exported],
+                                 [peers[2], peers[3]])
+                self.assertEqual(wallet.relay_import(vault, base64.b64encode(b"sealed from peer 2").decode(),
+                                                     f"{vault}-relay-config-2-1-1.bin"),
+                                 {"imported_from": 2})
+                self.assertEqual(imported, [b"sealed from peer 2"])
+                with self.assertRaisesRegex(ValueError, "Invalid relay config file"):
+                    wallet.relay_import(vault, "not base64", f"{vault}-relay-config-2-1-1.bin")
+                with self.assertRaisesRegex(ValueError, "Invalid relay config file"):
+                    wallet.relay_import(vault, base64.b64encode(b"other").decode(), "../courier.bin")
+                with self.assertRaisesRegex(ValueError, "not a member"):
+                    wallet.relay_provision("f" * 64, str(bundle))
+
+    def test_relay_status_requires_peer_configs_and_two_reachable_relays(self):
+        with tempfile.TemporaryDirectory(prefix="loki-relay-status-") as temp:
+            wallet, vault, _ = self.payment_fixture(temp, phase=None)
+            report = "inboxes=3 peers=2 live=2 routable=1"
+            with patch.object(wallet, "command", return_value=report):
+                self.assertEqual(wallet.relay_connection_status(vault),
+                                 {"configured": True, "reachable": True, "inboxes": 3,
+                                  "peers": 2, "live_relays": 2})
+            with patch.object(wallet, "command", return_value=report.replace("peers=2", "peers=1")):
+                self.assertFalse(wallet.relay_connection_status(vault)["configured"])
+            with patch.object(wallet, "command", return_value=report.replace("routable=1", "routable=0")):
+                self.assertFalse(wallet.relay_connection_status(vault)["reachable"])
+            with patch.object(wallet, "command", return_value=report.replace(
+                    "live=2", "live=1")):
+                self.assertEqual(wallet.relay_connection_status(vault),
+                                 {"configured": True, "reachable": False, "inboxes": 3,
+                                  "peers": 2, "live_relays": 1})
+            with patch.object(wallet, "command", side_effect=ValueError("member_sealed")):
+                with self.assertRaisesRegex(ValueError, "member_sealed"):
+                    wallet.relay_connection_status(vault)
+
+    def test_four_member_operator_relays_keep_automatic_status_separate(self):
+        with tempfile.TemporaryDirectory(prefix="loki-four-relay-status-") as temp:
+            wallet, vault, _ = self.payment_fixture(temp, phase=None)
+            member = wallet.data / "vaults" / vault
+            membership = json.loads((member / "membership.json").read_text())
+            membership["members"] = 4
+            (member / "membership.json").write_text(json.dumps(membership))
+            with patch.object(wallet, "command", return_value="inboxes=3 peers=3 live=2 routable=1"):
+                self.assertEqual(wallet.relay_status(vault)["phase"], "not_configured")
+                (member / "relay-setup.json").write_text(json.dumps({
+                    "mode": "operator", "phase": "waiting", "detail": "Connecting operator relays."}))
+                self.assertTrue(wallet.relay_connection_status(vault)["reachable"])
+                self.assertEqual(wallet.relay_status(vault)["phase"], "ready")
+                self.assertFalse(wallet.relay_status(vault)["available"])
+                with self.assertRaisesRegex(ValueError, "operator relay connection controls"):
+                    wallet.setup_relays(vault)
+            with patch.object(wallet, "command", side_effect=AssertionError("cached status must not reprovision")):
+                self.assertEqual(wallet.relay_status(vault)["phase"], "ready")
+            with patch.object(wallet, "command", return_value="inboxes=3 peers=2 live=3 routable=1"):
+                self.assertFalse(wallet.relay_connection_status(vault)["configured"])
+            peers = {slot: f"sealed for {slot}".encode() for slot in (2, 3, 4)}
+            def export(action, *args, **kwargs):
+                self.assertEqual(action, "export-config")
+                for peer, wire in peers.items():
+                    (args[-1] / f"{vault}-relay-config-1-{peer}-1.bin").write_bytes(wire)
+                return "exported"
+            with patch.object(wallet, "command", side_effect=export):
+                self.assertEqual([row["peer"] for row in wallet.relay_export(vault)["files"]], [2, 3, 4])
+            with patch.object(wallet, "command", return_value="imported owner=4 revision=1 digest=" + "e" * 64):
+                self.assertEqual(wallet.relay_import(vault, base64.b64encode(b"sealed from 4").decode(),
+                                                     f"{vault}-relay-config-4-1-1.bin"), {"imported_from": 4})
+
+    def test_readiness_check_preserves_automatic_relay_progress(self):
+        with tempfile.TemporaryDirectory(prefix="loki-automatic-relay-status-") as temp:
+            wallet, vault, _ = self.payment_fixture(temp, phase=None)
+            state_path = wallet.data / "vaults" / vault / "relay-setup.json"
+            saved = {"phase": "waiting", "detail": "Waiting for peer configs.",
+                     "imported": [2], "network": "automatic-network"}
+            state_path.write_text(json.dumps(saved))
+            original = state_path.read_bytes()
+            with patch.object(wallet, "command", return_value="inboxes=3 peers=2 live=2 routable=1"):
+                self.assertTrue(wallet.relay_connection_status(vault)["reachable"])
+            self.assertEqual(state_path.read_bytes(), original)
+            state_path.unlink()
+            with patch.object(wallet, "command", return_value="inboxes=3 peers=2 live=2 routable=1"):
+                self.assertTrue(wallet.relay_connection_status(vault)["reachable"])
+            self.assertFalse(state_path.exists())
+
+    def test_operator_relay_routes_refuse_hosted_vaults(self):
+        with tempfile.TemporaryDirectory(prefix="loki-hosted-relay-guard-") as temp:
+            wallet, vault, _ = self.payment_fixture(temp, phase=None)
+            member = wallet.data / "vaults" / vault
+            membership = json.loads((member / "membership.json").read_text())
+            membership["transport"] = "hosted"
+            (member / "membership.json").write_text(json.dumps(membership))
+            wallet.hosted = object()
+            self.addCleanup(setattr, wallet, "hosted", None)
+            with patch.object(wallet, "command") as command:
+                for action in (lambda: wallet.relay_provision(vault, "/operator/kit"),
+                               lambda: wallet.relay_export(vault),
+                               lambda: wallet.relay_import(vault, "wire", "file"),
+                               lambda: wallet.relay_connection_status(vault)):
+                    with self.assertRaisesRegex(ValueError, "attach to relays automatically"):
+                        action()
+                command.assert_not_called()
+
+    def test_relay_import_route_requires_private_token_and_refuses_invalid_file(self):
+        with tempfile.TemporaryDirectory(prefix="loki-relay-route-") as temp:
+            wallet, vault, _ = self.payment_fixture(temp, phase=None)
+            server, token = make_signer_server(wallet, 0)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+            body = json.dumps({"vault": vault, "data": "not base64"})
+
+            def request(key):
+                conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
+                conn.request("POST", "/api/relay-import", body,
+                             {"X-Loki-Token": key, "Content-Type": "application/json"})
+                response = conn.getresponse()
+                result = response.status, json.loads(response.read())
+                conn.close()
+                return result
+
+            self.assertEqual(request("wrong")[0], 403)
+            code, result = request(token)
+            self.assertEqual(code, 400)
+            self.assertEqual(result["surface"], "relay-import")
+            self.assertEqual(result["error"], "Invalid relay config file")
+
     def test_payment_advance_runs_mechanical_steps_once_and_never_approves(self):
         with tempfile.TemporaryDirectory(prefix="loki-advance-") as temp:
             wallet, vault, attempt = self.payment_fixture(temp, phase="published")
@@ -294,7 +486,8 @@ class MemberWalletTest(unittest.TestCase):
                 report = wallet.payments(vault)
             self.assertEqual(report["payments"][0]["phase"], "package")
             self.assertEqual(report["readiness"], {
-                "relay_ready": True, "relay_detail": "Ready to reach the other members.",
+                "relay_ready": True,
+                "relay_detail": "Payment build supports relay delivery. Check the relay connection above.",
                 "scan_height": 100})
             self.assertEqual(calls.count("commit"), 1)
             self.assertEqual(calls.count("package"), 1)
@@ -351,6 +544,44 @@ class MemberWalletTest(unittest.TestCase):
                 self.assertEqual(wallet.verify_payment(vault, attempt)["txid"], txid)
                 self.assertEqual(wallet.verify_payment(vault, attempt, txid)["txid"], txid)
             self.assertEqual(seen, [txid, txid, txid])
+
+    def test_payment_advance_rechecks_saved_confirmation_after_reorg(self):
+        with tempfile.TemporaryDirectory(prefix="loki-advance-reorg-") as temp:
+            wallet, vault, attempt = self.payment_fixture(
+                temp, phase="confirmed", txid="e" * 64)
+            missing = 'getrawtransaction: {"code":-5,"message":"Transaction not found in mempool or best chain"}'
+            with patch.object(wallet, "payment_command", side_effect=ValueError(missing)):
+                self.assertEqual(wallet.advance_payment(vault, attempt)["phase"],
+                                 "confirmation_needs_recheck")
+            work = wallet.data / "vaults" / vault / "payments" / attempt
+            self.assertEqual(wallet.payment_phase(work)["phase"],
+                             "confirmation_needs_recheck")
+
+    def test_payment_get_holds_wallet_lock_while_rolling_back_confirmation(self):
+        with tempfile.TemporaryDirectory(prefix="loki-payment-get-reorg-") as temp:
+            wallet, vault, attempt = self.payment_fixture(temp, phase="confirmed", txid="e" * 64)
+            server, token = make_signer_server(wallet, 0)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+            payments = wallet.payments
+
+            def checked(vault):
+                self.assertTrue(wallet.lock.locked())
+                return payments(vault)
+
+            with patch.object(wallet, "payments", side_effect=checked), \
+                 patch.object(wallet, "payment_command", side_effect=ValueError("transaction is not mined")):
+                conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
+                conn.request("GET", f"/api/payments?vault={vault}", headers={"X-Loki-Token": token})
+                response = conn.getresponse()
+                result = json.loads(response.read())
+                conn.close()
+            self.assertEqual(response.status, 200, result)
+            self.assertEqual(result["payments"][0]["phase"], "confirmation_needs_recheck")
+            work = wallet.data / "vaults" / vault / "payments" / attempt
+            self.assertEqual(wallet.payment_phase(work)["phase"], "confirmation_needs_recheck")
 
     def test_payment_pair_defaults_to_one_holding_this_member(self):
         with tempfile.TemporaryDirectory(prefix="loki-default-pair-") as temp:
@@ -416,12 +647,24 @@ class MemberWalletTest(unittest.TestCase):
                 wallet.finalize_backup(vault, words)
                 final_card = (wallet.data / "vaults" / vault / "final-card" / "vault.card").read_bytes()
                 if index == 0:
+                    member = wallet.data / "vaults" / vault
+                    with self.assertRaisesRegex(ValueError, "Check your final backup card"):
+                        wallet.command("backup-report", member, "@pass", member / "roster.json")
                     damaged = bytearray(final_card)
                     damaged[-1] ^= 1
                     with self.assertRaises(ValueError):
                         wallet.verify_final_backup(vault, words, base64.b64encode(damaged).decode())
                     self.assertEqual(wallet.status(vault)["phase"], "final_backup")
+                    self.assertFalse((exchange / vault / f"{vault}-final-status-1.bin").exists())
                 wallet.verify_final_backup(vault, words, base64.b64encode(final_card).decode())
+                if index == 0:
+                    card_path = member / "final-card" / "vault.card"
+                    card_path.rename(member / "final-card" / "held.card")
+                    try:
+                        with self.assertRaisesRegex(ValueError, "Check your final backup card"):
+                            wallet.command("backup-report", member, "@pass", member / "roster.json")
+                    finally:
+                        (member / "final-card" / "held.card").rename(card_path)
             for wallet in wallets:
                 self.assertTrue(wallet.address(vault).startswith("uregtest1"))
             for pair in ("AB", "AC", "AD", "BC", "BD", "CD"):
@@ -509,6 +752,8 @@ class MemberWalletTest(unittest.TestCase):
             for wallet in wallets:
                 wallet.activate(vault)
                 self.assertEqual(wallet.status(vault)["phase"], "final_backup")
+                self.assertEqual([r["reported"] for r in wallet.status(vault)["backups"]],
+                                 [False, False, False])
             for index, (wallet, words) in enumerate(zip(wallets, saved_words)):
                 sealed_words = wallet.data / "vaults" / vault / "secrets" / "backup-words.sealed"
                 if index == 0:
@@ -525,6 +770,33 @@ class MemberWalletTest(unittest.TestCase):
                 final_card = (wallet.data / "vaults" / vault / "final-card" / "vault.card").read_bytes()
                 self.assertEqual(wallet.verify_final_backup(vault, words, base64.b64encode(final_card).decode()),
                                  {"verified": True})
+                self.assertEqual([r["reported"] for r in wallet.status(vault)["backups"]],
+                                 [True] * (index + 1) + [False] * (2 - index))
+            reports = wallets[0].status(vault)["backups"]
+            self.assertEqual([r["reported"] for r in reports], [True, True, True])
+            second = exchange / vault / f"{vault}-final-status-2.bin"
+            third = exchange / vault / f"{vault}-final-status-3.bin"
+            original = second.read_bytes()
+            second.write_bytes(third.read_bytes())
+            self.assertEqual(wallets[0].status(vault)["backups"][1],
+                             {"slot": 2, "reported": False, "invalid": True})
+            forged = bytearray(original)
+            forged[-1] ^= 1
+            second.write_bytes(forged)
+            self.assertEqual(wallets[0].status(vault)["backups"][1],
+                             {"slot": 2, "reported": False, "invalid": True})
+            second.write_bytes(b"unreadable receipt")
+            self.assertEqual(wallets[0].status(vault)["backups"][1],
+                             {"slot": 2, "reported": False, "invalid": True})
+            second.unlink()
+            second.mkdir()
+            self.assertEqual(wallets[0].status(vault)["backups"][1],
+                             {"slot": 2, "reported": False, "invalid": True})
+            second.rmdir()
+            second.write_bytes(original)
+            third.unlink()
+            self.assertEqual(wallets[0].status(vault)["backups"][2],
+                             {"slot": 3, "reported": False, "invalid": False})
             receipts = list((exchange / vault).glob(f"{vault}-backup-*.bin"))
             self.assertEqual(len(receipts), 3)
             for receipt in receipts:

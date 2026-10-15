@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import fcntl
 import hashlib
 import http.client
@@ -35,7 +36,8 @@ SEED_WALLET = HERE.parent / "target" / "debug" / "loki_seed_wallet"
 
 # A peer's message that has not arrived yet, or a broadcast the node has not mined
 # yet, is a normal outcome of asking too early rather than a failure to report.
-PAYMENT_WAITING = re.compile(r"\bwaiting for member \d+\b|\btransaction is not mined\b")
+PAYMENT_WAITING = re.compile(r"\bwaiting for member \d+\b|\btransaction is not mined\b"
+                             r"|\bTransaction not found in mempool or best chain\b")
 
 
 def encoded(value):
@@ -74,15 +76,15 @@ def read_json(path):
 INVITE_TTL = 24 * 60 * 60
 COURIER_LIMIT = 256 * 1024
 # one draft, one identity and one roster answer per member, one round-one, one
-# certificate and one backup wire each, and one round-two wire per ordered pair
-COURIER_FILES = 1 + 4 * 5 + 4 * 3
+# certificate, backup and final-status wires each, and one round-two wire per ordered pair
+COURIER_FILES = 1 + 4 * 6 + 4 * 3
 
 # The setup courier carries a fixed, named set of files: the vault draft, each
 # member's public identity, the roster answer each app published, and the signed
-# DKG and backup wires. Anything else is refused, so a reachable courier cannot
-# be used as general storage.
+# DKG, backup and final-status wires. Anything else is refused, so a reachable
+# courier cannot be used as general storage.
 COURIER = (r"(?:join|confirm)-{slot}\.json"
-           r"|{vault}-(?:r1|cert|backup)-{slot}\.bin|{vault}-r2-{slot}-[1-4]\.bin")
+           r"|{vault}-(?:r1|cert|backup|final-status)-{slot}\.bin|{vault}-r2-{slot}-[1-4]\.bin")
 
 
 def courier_name(vault, name, slot="[1-4]"):
@@ -376,6 +378,8 @@ class Wallet:
         self.lock = threading.Lock()
         self.claim_lock = threading.Lock()
         self.syncs = {}
+        self.sync_done = set()
+        self.sync_stop = threading.Event()
         self.transport_errors = {}
         self.passphrase = None
         self.profile_data = None
@@ -486,6 +490,9 @@ class Wallet:
         if self.transport == "hosted":
             raise ValueError("Hosted vaults attach to relays automatically")
         member, local = self.vault_dir(vault)
+        state_path = member / "relay-setup.json"
+        if state_path.is_file() and read_json(state_path).get("mode") == "operator":
+            raise ValueError("Use this vault's operator relay connection controls")
         if not (member / "final-backup-checked").is_file():
             raise ValueError("Check your final backup before setting up relays")
         if local.get("members") not in (3, 4):
@@ -565,6 +572,8 @@ class Wallet:
                     "detail": "Hosted relays are connected." if native.get("handoff") == "ready" else "Connecting hosted relays automatically."}
         state_path = member / "relay-setup.json"
         state = read_json(state_path) if state_path.is_file() else {}
+        if state.get("mode") == "operator":
+            return {"phase": state["phase"], "detail": state["detail"], "available": False}
         active = local.get("members") in (3, 4) and (member / "final-backup-checked").is_file()
         available = active and not (member / "transport.json").exists() and (self.exchange_vault(vault) / "draft.json").is_file()
         worker = self.relay_jobs.get(vault)
@@ -671,7 +680,7 @@ class Wallet:
         the file courier already made happens exactly as before."""
         transport = self.data / "vaults" / self.exchange_vault(vault).name / "transport.json"
         worker = self.syncs.get(vault)
-        if not transport.is_file() or (worker and worker.is_alive()):
+        if vault in self.sync_done or not transport.is_file() or (worker and worker.is_alive()):
             return
         worker = threading.Thread(target=self.sync_loop, args=(read_json(transport),), daemon=True)
         self.syncs[vault] = worker
@@ -679,15 +688,18 @@ class Wallet:
 
     def sync_loop(self, transport):
         vault = transport["vault"]
-        done = self.data / "vaults" / vault / "final-backup-checked"
-        while not done.exists():
+        while not self.sync_stop.is_set():
             try:
                 self.sync_once(vault, transport["origin"], transport["token"], transport["slot"])
                 self.transport_errors.pop(vault, None)
+                checked = self.data / "vaults" / vault / "final-backup-checked"
+                if checked.is_file() and all(report["reported"] for report in self.backup_reports(vault)):
+                    self.sync_done.add(vault)
+                    return
             except (ValueError, OSError, KeyError) as error:
                 self.transport_errors[vault] = {"message": str(error),
                                                 "waiting": isinstance(error, Unreachable)}
-            time.sleep(1)
+            self.sync_stop.wait(1)
 
     def sync_once(self, vault, origin, token, slot):
         """One pass in each direction.
@@ -1050,7 +1062,16 @@ class Wallet:
         marker = member_dir / "final-backup-checked"
         if not marker.exists():
             write_new(marker, b"checked\n")
+        _, local = self.vault_dir(vault)
+        receipt = bytes.fromhex(self.command("backup-report", member_dir, "@pass",
+                                            member_dir / "roster.json"))
+        write_replace(self.exchange_vault(vault) / f"{vault}-final-status-{local['slot']}.bin", receipt)
         return {"verified": True}
+
+    def backup_reports(self, vault):
+        member_dir = self.data / "vaults" / self.exchange_vault(vault).name
+        return json.loads(self.command("backup-reports", member_dir / "roster.json",
+                                       self.exchange_vault(vault)))
 
     def restore_vault(self, name, words, card_bytes):
         profile = self.require_profile()
@@ -1216,6 +1237,8 @@ class Wallet:
                         phase = "confirmation_needs_recheck"
                 except (KeyError, ValueError, subprocess.TimeoutExpired):
                     phase = "confirmation_needs_recheck"
+                if phase == "confirmation_needs_recheck":
+                    self.payment_status(path.parent, phase, status.get("txid"))
             items.append({"attempt": attempt, "payment": manifest.get("payment"),
                           "pair": manifest.get("pair"), "phase": phase,
                           **({"txid": status["txid"]} if status.get("txid") else {})})
@@ -1231,7 +1254,7 @@ class Wallet:
     def payment_readiness(self):
         """Whether this device can reach the other members for signing. The payment
         tool answers it; a build without relay support cannot send or receive."""
-        ready = "Ready to reach the other members."
+        ready = "Payment build supports relay delivery. Check the relay connection above."
         if self.relay_payment_ready:
             return True, ready
         try:
@@ -1241,6 +1264,99 @@ class Wallet:
             return False, str(error)
         self.relay_payment_ready = True
         return True, ready
+
+    def relay_args(self, vault):
+        member_dir, local = self.vault_dir(vault)
+        if self.transport == "hosted" or local.get("transport") == "hosted":
+            raise ValueError("Hosted vaults attach to relays automatically")
+        if local.get("threshold", 2) != 2 or local.get("members") not in (3, 4) \
+                or not (member_dir / "final-backup-checked").is_file():
+            raise ValueError("Relay setup requires an active 2-of-3 or 2-of-4 vault")
+        return member_dir, local, ("--member-root", member_dir, "--passphrase-file", "@pass",
+                                   "--roster", member_dir / "roster.json")
+
+    def relay_provision(self, vault, bundle_path):
+        member_dir, _, common = self.relay_args(vault)
+        if not isinstance(bundle_path, str) or not Path(bundle_path).is_absolute():
+            raise ValueError("Choose an absolute path to this member's relay kit")
+        bundle = Path(bundle_path)
+        manifests, capabilities = bundle / "manifests", bundle / "capabilities"
+        if not manifests.is_dir() or not capabilities.is_dir():
+            raise ValueError("Relay kit needs manifests and capabilities directories")
+        write_replace(member_dir / "relay-setup.json", json.dumps({
+            "mode": "operator", "phase": "waiting",
+            "detail": "Provisioning operator-provided relays. Retry the same kit after an interruption."}).encode())
+        self.command("provision", *common, "--relay-manifest", manifests,
+                     "--provision-capability-files", capabilities, binary=RELAY, timeout=120)
+        return {"provisioned": True}
+
+    def relay_export(self, vault):
+        member_dir, local, common = self.relay_args(vault)
+        with tempfile.TemporaryDirectory(prefix="relay-export-", dir=member_dir) as temporary:
+            directory = Path(temporary)
+            self.command("export-config", *common, "--courier-directory", directory,
+                         binary=RELAY, timeout=120)
+            files = []
+            for path in directory.iterdir():
+                match = re.fullmatch(re.escape(vault) + rf"-relay-config-{local['slot']}-(\d+)-(\d+)\.bin",
+                                     path.name)
+                if not match or not path.is_file() or path.is_symlink():
+                    raise ValueError("Relay export contained an unexpected file")
+                wire = path.read_bytes()
+                if not 0 < len(wire) <= 64 * 1024:
+                    raise ValueError("Relay config file has an invalid size")
+                files.append({"peer": int(match.group(1)), "name": path.name,
+                              "data": base64.b64encode(wire).decode()})
+            files.sort(key=lambda item: item["peer"])
+            if [item["peer"] for item in files] != [slot for slot in range(1, local["members"] + 1)
+                                                    if slot != local["slot"]]:
+                raise ValueError("Relay export did not contain one file for each peer")
+            return {"files": files}
+
+    def relay_import(self, vault, encoded_wire, filename):
+        member_dir, local, common = self.relay_args(vault)
+        if not isinstance(filename, str) or len(filename) > 128:
+            raise ValueError("Invalid relay config file")
+        named = re.fullmatch(re.escape(vault) + rf"-relay-config-(\d+)-{local['slot']}-(\d+)\.bin",
+                             filename)
+        if not named or int(named.group(1)) not in range(1, local["members"] + 1) \
+                or int(named.group(1)) == local["slot"] or int(named.group(2)) < 1:
+            raise ValueError("Invalid relay config file")
+        if not isinstance(encoded_wire, str) or not 0 < len(encoded_wire) <= 88 * 1024:
+            raise ValueError("Invalid relay config file")
+        try:
+            wire = base64.b64decode(encoded_wire, validate=True)
+        except (ValueError, binascii.Error) as error:
+            raise ValueError("Invalid relay config file") from error
+        if not 0 < len(wire) <= 64 * 1024:
+            raise ValueError("Invalid relay config file")
+        with tempfile.TemporaryDirectory(prefix="relay-import-", dir=member_dir) as temporary:
+            path = Path(temporary) / filename
+            write_new(path, wire)
+            output = self.command("import-config", *common, "--courier-file", path,
+                                  binary=RELAY, timeout=120)
+        match = re.search(r"\bimported owner=(\d+) revision=\d+ digest=[0-9a-f]{64}\b", output)
+        if not match or int(match.group(1)) != int(named.group(1)):
+            raise ValueError("Relay did not confirm the peer config")
+        return {"imported_from": int(match.group(1))}
+
+    def relay_connection_status(self, vault):
+        member_dir, local, common = self.relay_args(vault)
+        report = self.command("readiness", *common, binary=RELAY, timeout=40)
+        match = re.fullmatch(r"inboxes=(\d+) peers=(\d+) live=(\d+) routable=([01])", report.strip())
+        if not match:
+            raise ValueError("Relay readiness returned an unexpected result")
+        inboxes, peers, live, routable = map(int, match.groups())
+        configured = inboxes == 3 and peers == local["members"] - 1 and routable == 1
+        state_path = member_dir / "relay-setup.json"
+        saved = read_json(state_path) if state_path.is_file() else {}
+        if saved.get("mode") == "operator":
+            ready = configured and live >= 2
+            write_replace(state_path, json.dumps({"mode": "operator", "phase": "ready" if ready else "waiting",
+                "detail": "Operator-provided relays are connected." if ready else
+                          "Check the operator relay connection after importing every peer config."}).encode())
+        return {"configured": configured, "reachable": configured and live >= 2,
+                "inboxes": inboxes, "peers": peers, "live_relays": live}
 
     def payment_status(self, work, phase, txid=None):
         # shortcut: this file is UI progress only; custody state remains in the Rust signer and chain.
@@ -1414,6 +1530,10 @@ class Wallet:
         while True:
             state = self.payment_phase(work)
             phase = state["phase"]
+            if phase == "confirmed" and not did:
+                self.payments(vault)
+                state = self.payment_phase(work)
+                phase = state["phase"]
             if phase in ("published", "received") and slot in pair:
                 step, run = "commit", self.commit_payment
             elif phase == "commitments" and slot == pair[0]:
@@ -1510,6 +1630,7 @@ class Wallet:
             state["phase"] = "active" if (member_dir / "final-backup-checked").is_file() else "final_backup"
             state["final_card_created"] = (member_dir / "final-card" / "vault.card").is_file()
             state["final_card_needs_words"] = not (member_dir / "secrets" / "backup-words.sealed").is_file()
+            state["backups"] = self.backup_reports(vault)
         if self.setup_errors.get(vault):
             state["phase"] = "stopped"
         return state
@@ -1521,6 +1642,7 @@ class Wallet:
         self.relay_monitor.join(timeout=5)
         for worker in self.relay_jobs.values():
             worker.join(timeout=5)
+        self.sync_stop.set()
         self.process_lock.close()
 
 
@@ -1722,7 +1844,9 @@ def make_signer_server(wallet, port, dashboard_port=None):
                 if path == "/api/status":
                     return self.reply(200, wallet.status(vault))
                 if path == "/api/payments":
-                    return self.reply(200, wallet.payments(vault))
+                    with wallet.lock:
+                        payments = wallet.payments(vault)
+                    return self.reply(200, payments)
                 if path == "/api/card":
                     member_dir, _ = wallet.vault_dir(vault)
                     card = (member_dir / "card" / "vault.card").read_bytes()
@@ -1825,6 +1949,12 @@ def make_signer_server(wallet, port, dashboard_port=None):
                         "/api/balance": lambda: wallet.balance(value.get("vault")),
                         "/api/relay-setup": lambda: wallet.setup_relays(value.get("vault")),
                         "/api/relay-setup-all": wallet.setup_all_relays,
+                        "/api/relay-provision": lambda: wallet.relay_provision(
+                            value.get("vault"), value.get("bundle")),
+                        "/api/relay-export": lambda: wallet.relay_export(value.get("vault")),
+                        "/api/relay-import": lambda: wallet.relay_import(
+                            value.get("vault"), value.get("data"), value.get("name")),
+                        "/api/relay-status": lambda: wallet.relay_connection_status(value.get("vault")),
                         "/api/payment-draft": lambda: wallet.prepare_payment(
                             value.get("vault"), value.get("recipient"), value.get("amount_zat"),
                             value.get("memo"), value.get("pair")),
