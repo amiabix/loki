@@ -344,11 +344,14 @@ class MemberWalletTest(unittest.TestCase):
                 self.assertEqual([item["peer"] for item in exported], [2, 3])
                 self.assertEqual([base64.b64decode(item["data"]) for item in exported],
                                  [peers[2], peers[3]])
-                self.assertEqual(wallet.relay_import(vault, base64.b64encode(b"sealed from peer 2").decode()),
+                self.assertEqual(wallet.relay_import(vault, base64.b64encode(b"sealed from peer 2").decode(),
+                                                     f"{vault}-relay-config-2-1-1.bin"),
                                  {"imported_from": 2})
                 self.assertEqual(imported, [b"sealed from peer 2"])
                 with self.assertRaisesRegex(ValueError, "Invalid relay config file"):
-                    wallet.relay_import(vault, "not base64")
+                    wallet.relay_import(vault, "not base64", f"{vault}-relay-config-2-1-1.bin")
+                with self.assertRaisesRegex(ValueError, "Invalid relay config file"):
+                    wallet.relay_import(vault, base64.b64encode(b"other").decode(), "../courier.bin")
                 with self.assertRaisesRegex(ValueError, "not a member"):
                     wallet.relay_provision("f" * 64, str(bundle))
 

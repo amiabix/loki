@@ -184,6 +184,32 @@ member's own signing messages, uses the exact signer review token, then proves,
 mines, and checks receipt in an independent recipient vault. This validates the
 Rust payment path; it is not a browser end-to-end test.
 
+The opt-in member-app test joins those paths on a disposable THS network. It
+creates and backs up a vault in three separate app processes, provisions three
+real relay processes through the app routes, funds the vault, checks two signer
+reviews, has the third member broadcast, and checks confirmation, the recipient
+balance and all three member balance views:
+
+```sh
+cargo build --manifest-path communication/Cargo.toml --locked -p loki-relay-server
+cargo build --manifest-path poc/Cargo.toml --locked --bins --features relay-communication
+ths --name loki-app-flow start --no-open --port-offset 280  # keep this running
+LOKI_THS_INSTANCE=loki-app-flow python3 poc/wallet/test_relay_payment_flow.py -v
+```
+
+This is three private processes on one host and three relays under one test
+operator. It does not prove physical-device operation or independent relay
+operators. The finisher learns the broadcast txid and can mark that payment
+confirmed; the other apps see the changed vault balance but do not yet receive
+an authenticated executed-payment notice, so their payment rows can remain at
+Approved. For a physical-device acceptance run, use a trusted HTTPS setup
+courier, three independently operated HTTPS relays with a separate kit on each
+device, and a shared regtest chain connection. Record only public evidence:
+matching roster fingerprints, each member's final-card check and relay status,
+the funding and payment txids, both verified review summaries, confirmation
+height, recipient receipt and each member's post-payment balance. Do not copy
+passphrases, cards, capabilities or signing wires into the report.
+
 The app is passphrase-only today. Its local file courier and time-limited,
 non-resumable DKG are development controls, not the planned relay transport.
 Data roots created by the previous one-vault app are left untouched and need an

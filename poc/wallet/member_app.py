@@ -1144,8 +1144,15 @@ class Wallet:
                 raise ValueError("Relay export did not contain one file for each peer")
             return {"files": files}
 
-    def relay_import(self, vault, encoded_wire):
+    def relay_import(self, vault, encoded_wire, filename):
         member_dir, local, common = self.relay_args(vault)
+        if not isinstance(filename, str) or len(filename) > 128:
+            raise ValueError("Invalid relay config file")
+        named = re.fullmatch(re.escape(vault) + rf"-relay-config-(\d+)-{local['slot']}-(\d+)\.bin",
+                             filename)
+        if not named or int(named.group(1)) not in (1, 2, 3) \
+                or int(named.group(1)) == local["slot"] or int(named.group(2)) < 1:
+            raise ValueError("Invalid relay config file")
         if not isinstance(encoded_wire, str) or not 0 < len(encoded_wire) <= 88 * 1024:
             raise ValueError("Invalid relay config file")
         try:
@@ -1155,12 +1162,12 @@ class Wallet:
         if not 0 < len(wire) <= 64 * 1024:
             raise ValueError("Invalid relay config file")
         with tempfile.TemporaryDirectory(prefix="relay-import-", dir=member_dir) as temporary:
-            path = Path(temporary) / "courier.bin"
+            path = Path(temporary) / filename
             write_new(path, wire)
             output = self.command("import-config", *common, "--courier-file", path,
                                   binary=RELAY, timeout=120)
         match = re.search(r"\bimported owner=(\d+) revision=\d+ digest=[0-9a-f]{64}\b", output)
-        if not match or int(match.group(1)) not in (1, 2, 3) or int(match.group(1)) == local["slot"]:
+        if not match or int(match.group(1)) != int(named.group(1)):
             raise ValueError("Relay did not confirm the peer config")
         return {"imported_from": int(match.group(1))}
 
@@ -1732,7 +1739,7 @@ def make_signer_server(wallet, port, dashboard_port=None):
                             value.get("vault"), value.get("bundle")),
                         "/api/relay-export": lambda: wallet.relay_export(value.get("vault")),
                         "/api/relay-import": lambda: wallet.relay_import(
-                            value.get("vault"), value.get("data")),
+                            value.get("vault"), value.get("data"), value.get("name")),
                         "/api/relay-status": lambda: wallet.relay_status(value.get("vault")),
                         "/api/payment-draft": lambda: wallet.prepare_payment(
                             value.get("vault"), value.get("recipient"), value.get("amount_zat"),

@@ -806,7 +806,7 @@ action('relay-export', async () => {
 action('relay-import', async (form) => {
   const {file} = fields(form);
   const result = await api('relay-import', {vault: selectedVault,
-                                             data: await cardBase64(file, 'Relay file')});
+                                             name: file.name, data: await cardBase64(file, 'Relay file')});
   message(`Member ${result.imported_from}'s relay config was checked and imported.`);
 });
 $('relay-check').addEventListener('click', async () => {
