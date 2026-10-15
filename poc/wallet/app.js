@@ -37,6 +37,8 @@ function selectVault(vault) {
   $('payment-draft').reset();
   $('amount-zat').textContent = 'Up to 8 decimal places.';
   $('payment-list').replaceChildren();
+  $('relay-state').textContent = 'Relay connection has not been checked on this device.';
+  $('relay-downloads').replaceChildren();
   renderedInvites = null;
 }
 
@@ -92,9 +94,9 @@ async function api(path, body) {
   return result;
 }
 function fields(form) { return Object.fromEntries(new FormData(form)); }
-async function cardBase64(file) {
+async function cardBase64(file, kind = 'Backup card') {
   const bytes = new Uint8Array(await file.arrayBuffer());
-  if (bytes.length > 65536) throw new Error('Backup card is too large');
+  if (bytes.length > 65536) throw new Error(`${kind} is too large`);
   let raw = ''; for (const byte of bytes) raw += String.fromCharCode(byte);
   return btoa(raw);
 }
@@ -275,6 +277,13 @@ async function refreshPayments() {
                      + (payment.txid ? ` · transaction ${payment.txid.slice(0, 16)}…` : '')));
     const did = paymentActivity.get(payment.attempt);
     if (did?.length) card.append(note(`Just ran on this device: ${did.join(', ')}.`));
+
+    if (payment.phase === 'draft') {
+      card.append(paymentButton('Send this proposal', async () => {
+        await api('payment-publish', {vault, attempt: payment.attempt});
+        message('Proposal sent to the other members.');
+      }));
+    }
 
     if (review) {
       const summary = document.createElement('pre');
@@ -611,7 +620,7 @@ async function refresh() {
     }
     if ((state.phase === 'new_profile' || state.phase === 'locked') && selectedVault) selectVault(null);
     paymentsLive = false;
-    for (const id of ['new-profile', 'locked', 'home', 'invites', 'connect-account', 'setup', 'backup', 'waiting', 'final-backup', 'backup-status', 'active']) $(id).hidden = true;
+    for (const id of ['new-profile', 'locked', 'home', 'invites', 'connect-account', 'setup', 'backup', 'waiting', 'final-backup', 'backup-status', 'active', 'relay-setup']) $(id).hidden = true;
     const inVault = !!selectedVault;
     $('back').hidden = !inVault;
     $('lock').hidden = !state.profile && state.phase !== 'home';
@@ -665,6 +674,7 @@ async function refresh() {
         $('active').hidden = false;
         memberSlot = state.slot;
         const paymentAvailable = state.total_members === 3;
+        $('relay-setup').hidden = !paymentAvailable;
         $('payment-unavailable').hidden = paymentAvailable;
         $('show-address').hidden = !paymentAvailable;
         if (!paymentAvailable) $('address').textContent = 'Receive address hidden until this app can spend 2-of-4 funds.';
@@ -767,6 +777,57 @@ action('check-final-backup', async (form) => {
                                    card: await cardBase64(value.card)});
   message('Your final card checked. Ask every member to do the same before depositing.');
 });
+action('relay-provision', async (form) => {
+  await api('relay-provision', {vault: selectedVault, bundle: fields(form).bundle});
+  message('Your relay inboxes are provisioned. Prepare the encrypted files for the other members.');
+});
+action('relay-export', async () => {
+  const vault = selectedVault;
+  const {files} = await api('relay-export', {vault});
+  if (selectedVault !== vault) return;
+  const list = $('relay-downloads');
+  list.replaceChildren();
+  for (const file of files) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = `Download encrypted file for member ${file.peer}`;
+    button.addEventListener('click', () => {
+      const bytes = Uint8Array.from(atob(file.data), c => c.charCodeAt(0));
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(new Blob([bytes], {type: 'application/octet-stream'}));
+      link.download = file.name;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+    });
+    list.append(button);
+  }
+  message('Send each encrypted file only to the member named on its button. Ask them to import it in their own app.');
+});
+action('relay-import', async (form) => {
+  const {file} = fields(form);
+  const result = await api('relay-import', {vault: selectedVault,
+                                             data: await cardBase64(file, 'Relay file')});
+  message(`Member ${result.imported_from}'s relay config was checked and imported.`);
+});
+$('relay-check').addEventListener('click', async () => {
+  const button = $('relay-check');
+  button.disabled = true;
+  try {
+    const vault = selectedVault;
+    const state = await api('relay-status', {vault});
+    if (selectedVault !== vault) return;
+    $('relay-state').textContent = !state.inboxes
+      ? 'This member has no relay inboxes yet. Provision your relay kit.'
+      : state.peers < 2
+        ? `${state.peers} of 2 encrypted peer configs imported. Each other member must send you theirs.`
+        : !state.configured
+          ? 'Relay configs are present, but this member cannot route payments yet. Check the local kit and try again.'
+        : state.live_relays < 2
+          ? `${state.live_relays} of 3 relays responded. At least 2 must respond for approvals.`
+          : 'Both peer configs are present. This member’s inbox answered on at least 2 relays; delivery to peers is checked when sending.';
+  } catch (error) { message(error.message, true); }
+  finally { button.disabled = false; }
+});
 action('show-address', async () => {
   const value = await api('address', {vault: selectedVault});
   $('address').textContent = value.address;
@@ -786,7 +847,7 @@ action('payment-draft', async (form) => {
   const amount_zat = zatFromZec(value.amount_zec);
   const draft = await api('payment-draft', {vault, recipient: value.recipient, memo: value.memo, amount_zat});
   if (selectedVault !== vault) return;
-  $('draft-result').textContent = `PROPOSED · no member has approved or sent this payment\n`
+  $('draft-result').textContent = `DRAFT · no member has approved or sent this payment\n`
     + `Payment ID: ${draft.payment}\n`
     + `Amount: ${zecFromZat(amount_zat)} ZEC (${amount_zat} zat)\n`
     + `Signers: members ${draft.pair.join(' and ')}`;

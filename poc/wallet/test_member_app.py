@@ -307,6 +307,97 @@ class MemberWalletTest(unittest.TestCase):
             wallet.payment_status(work, phase, txid)
         return wallet, vault, attempt
 
+    def test_relay_setup_keeps_operator_files_out_of_page_and_imports_only_sealed_peer_file(self):
+        with tempfile.TemporaryDirectory(prefix="loki-relay-setup-") as temp:
+            wallet, vault, _ = self.payment_fixture(temp, phase=None)
+            bundle = Path(temp) / "operator-kit"
+            manifests, capabilities = bundle / "manifests", bundle / "capabilities"
+            manifests.mkdir(parents=True)
+            capabilities.mkdir()
+            own = wallet.data / "vaults" / vault
+            peers = {2: b"sealed for member 2", 3: b"sealed for member 3"}
+            imported = []
+
+            def command(action, *args, **kwargs):
+                self.assertEqual(kwargs["binary"].name, "loki_relay_member")
+                self.assertEqual(args[:6], ("--member-root", own, "--passphrase-file", "@pass",
+                                            "--roster", own / "roster.json"))
+                if action == "provision":
+                    self.assertEqual(args[6:], ("--relay-manifest", manifests,
+                                                "--provision-capability-files", capabilities))
+                    return "config revision=1 hash=" + "f" * 64
+                if action == "export-config":
+                    output = args[-1]
+                    for peer, wire in peers.items():
+                        (output / f"{vault}-relay-config-1-{peer}-1.bin").write_bytes(wire)
+                    return "config revision=1 hash=" + "f" * 64
+                if action == "import-config":
+                    courier = args[-1]
+                    self.assertEqual(courier.stat().st_mode & 0o777, 0o600)
+                    imported.append(courier.read_bytes())
+                    return "imported owner=2 revision=1 digest=" + "e" * 64
+                raise AssertionError(action)
+
+            with patch.object(wallet, "command", side_effect=command):
+                self.assertEqual(wallet.relay_provision(vault, str(bundle)), {"provisioned": True})
+                exported = wallet.relay_export(vault)["files"]
+                self.assertEqual([item["peer"] for item in exported], [2, 3])
+                self.assertEqual([base64.b64decode(item["data"]) for item in exported],
+                                 [peers[2], peers[3]])
+                self.assertEqual(wallet.relay_import(vault, base64.b64encode(b"sealed from peer 2").decode()),
+                                 {"imported_from": 2})
+                self.assertEqual(imported, [b"sealed from peer 2"])
+                with self.assertRaisesRegex(ValueError, "Invalid relay config file"):
+                    wallet.relay_import(vault, "not base64")
+                with self.assertRaisesRegex(ValueError, "not a member"):
+                    wallet.relay_provision("f" * 64, str(bundle))
+
+    def test_relay_status_requires_peer_configs_and_two_reachable_relays(self):
+        with tempfile.TemporaryDirectory(prefix="loki-relay-status-") as temp:
+            wallet, vault, _ = self.payment_fixture(temp, phase=None)
+            report = "inboxes=3 peers=2 live=2 routable=1"
+            with patch.object(wallet, "command", return_value=report):
+                self.assertEqual(wallet.relay_status(vault),
+                                 {"configured": True, "reachable": True, "inboxes": 3,
+                                  "peers": 2, "live_relays": 2})
+            with patch.object(wallet, "command", return_value=report.replace("peers=2", "peers=1")):
+                self.assertFalse(wallet.relay_status(vault)["configured"])
+            with patch.object(wallet, "command", return_value=report.replace("routable=1", "routable=0")):
+                self.assertFalse(wallet.relay_status(vault)["reachable"])
+            with patch.object(wallet, "command", return_value=report.replace(
+                    "live=2", "live=1")):
+                self.assertEqual(wallet.relay_status(vault),
+                                 {"configured": True, "reachable": False, "inboxes": 3,
+                                  "peers": 2, "live_relays": 1})
+            with patch.object(wallet, "command", side_effect=ValueError("member_sealed")):
+                with self.assertRaisesRegex(ValueError, "member_sealed"):
+                    wallet.relay_status(vault)
+
+    def test_relay_import_route_requires_private_token_and_refuses_invalid_file(self):
+        with tempfile.TemporaryDirectory(prefix="loki-relay-route-") as temp:
+            wallet, vault, _ = self.payment_fixture(temp, phase=None)
+            server, token = make_signer_server(wallet, 0)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+            body = json.dumps({"vault": vault, "data": "not base64"})
+
+            def request(key):
+                conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
+                conn.request("POST", "/api/relay-import", body,
+                             {"X-Loki-Token": key, "Content-Type": "application/json"})
+                response = conn.getresponse()
+                result = response.status, json.loads(response.read())
+                conn.close()
+                return result
+
+            self.assertEqual(request("wrong")[0], 403)
+            code, result = request(token)
+            self.assertEqual(code, 400)
+            self.assertEqual(result["surface"], "relay-import")
+            self.assertEqual(result["error"], "Invalid relay config file")
+
     def test_payment_advance_runs_mechanical_steps_once_and_never_approves(self):
         with tempfile.TemporaryDirectory(prefix="loki-advance-") as temp:
             wallet, vault, attempt = self.payment_fixture(temp, phase="published")
@@ -326,7 +417,8 @@ class MemberWalletTest(unittest.TestCase):
                 report = wallet.payments(vault)
             self.assertEqual(report["payments"][0]["phase"], "package")
             self.assertEqual(report["readiness"], {
-                "relay_ready": True, "relay_detail": "Ready to reach the other members.",
+                "relay_ready": True,
+                "relay_detail": "Payment build supports relay delivery. Check the relay connection above.",
                 "scan_height": 100})
             self.assertEqual(calls.count("commit"), 1)
             self.assertEqual(calls.count("package"), 1)

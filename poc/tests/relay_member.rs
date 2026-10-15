@@ -3261,6 +3261,17 @@ fn communication_cli_status_public_fields_only() {
 }
 
 #[test]
+fn communication_cli_readiness_without_config_reports_no_routes() {
+    let f = RetainedFixture::new();
+    let mut args = vec![member_arg("readiness")];
+    args.extend(common_member_args(&f));
+    let result = member_cli(&args);
+    assert_eq!(result.status.code(), Some(0));
+    assert_eq!(member_stdout(&result), "inboxes=0 peers=0 live=0 routable=0\n");
+    assert_fixture_secrets_absent(&f, result.stdout.as_slice());
+}
+
+#[test]
 fn communication_cli_missing_referenced_sealed_config_fails_closed() {
     let f = RetainedFixture::new();
     let member = f.loaded().unwrap();

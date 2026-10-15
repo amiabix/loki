@@ -163,16 +163,18 @@ chain view whenever the payment list is shown. If a signer closed after saving
 an approval, **Retry saved signing messages** republishes the same sealed share;
 it never creates another signature share.
 
-Relay setup is still an external prerequisite. Each member must provision their
-vault directory with three operator-issued relay manifests and capability files
-using `loki_relay_member provision`, run `export-config`, deliver only the
-recipient-encrypted courier files to the named peers, and run `import-config`
-on the files addressed to them. Check each member with
-`loki_relay_member status --verify-relays` before using payment controls. The app
-does not collect capabilities or automate this ceremony. The independent
+Relay operators must still issue three independent manifest and capability sets
+to each member. Put each member's sets in a local kit with `manifests/` and
+`capabilities/` directories. In that member's private app, **Connect your relays**
+provisions from the kit path, downloads two recipient-encrypted config files,
+and imports the encrypted files received from the other members. Send each
+download only to its named member. **Check relay connection** requires both
+peer configs and a response from this member's inbox on at least two relays;
+delivery to other members is checked when sending. The app does
+not issue operator credentials or deliver the encrypted files between members.
+Operator independence is a deployment condition it cannot verify. The independent
 three-relay setup in `communication/harness/three_members.py` tests transport;
-it does not configure an app vault. Relay keys are checked as distinct, but
-operator independence is a deployment condition that the app cannot verify.
+it does not configure an app vault.
 If signing stops after consuming a nonce and before saving the share, that
 attempt cannot be resumed; create a new payment attempt with fresh nonces.
 

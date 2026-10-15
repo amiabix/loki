@@ -262,6 +262,11 @@ fn run() -> Result<(), Exit> {
                 switched("--diagnostics"),
             )
         }
+        "readiness" => {
+            expect(&["--member-root", "--passphrase-file", "--roster"])?;
+            let (root, pass, roster) = common()?;
+            readiness(&root, &pass, &roster)
+        }
         _ => Err(Exit::Usage),
     }
 }
@@ -902,6 +907,39 @@ fn status(
     if diagnostics {
         print_diagnostics(&session)?;
     }
+    Ok(())
+}
+
+fn readiness(root: &Path, pass: &Path, roster: &Path) -> Result<(), Exit> {
+    let session = open_session(root, pass, roster)?;
+    let Some(config) = session
+        .configs
+        .load(&session.db, &session.member)
+        .map_err(Exit::Member)?
+    else {
+        println!("inboxes=0 peers=0 live=0 routable=0");
+        return Ok(());
+    };
+    let inboxes = config.own.len();
+    let peers = config.peer_wires.len();
+    let routable = inboxes == 3
+        && peers == 2
+        && session.configs.routing(&session.db, &session.member).is_ok();
+    let http = RelayHttp::new().map_err(Exit::Client)?;
+    let live = runtime()?.block_on(async {
+        let mut live = 0;
+        for inbox in &config.own {
+            if http
+                .entries(&inbox.route, &inbox.read, 0, Some(1))
+                .await
+                .is_ok()
+            {
+                live += 1;
+            }
+        }
+        live
+    });
+    println!("inboxes={inboxes} peers={peers} live={live} routable={}", u8::from(routable));
     Ok(())
 }
 

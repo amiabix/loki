@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import fcntl
 import hashlib
 import http.client
@@ -1089,7 +1090,7 @@ class Wallet:
     def payment_readiness(self):
         """Whether this device can reach the other members for signing. The payment
         tool answers it; a build without relay support cannot send or receive."""
-        ready = "Ready to reach the other members."
+        ready = "Payment build supports relay delivery. Check the relay connection above."
         if self.relay_payment_ready:
             return True, ready
         try:
@@ -1099,6 +1100,80 @@ class Wallet:
             return False, str(error)
         self.relay_payment_ready = True
         return True, ready
+
+    def relay_args(self, vault):
+        member_dir, local = self.vault_dir(vault)
+        if local.get("threshold", 2) != 2 or local.get("members") != 3 \
+                or not (member_dir / "final-backup-checked").is_file():
+            raise ValueError("Relay setup requires an active 2-of-3 vault")
+        return member_dir, local, ("--member-root", member_dir, "--passphrase-file", "@pass",
+                                   "--roster", member_dir / "roster.json")
+
+    def relay_provision(self, vault, bundle_path):
+        _, _, common = self.relay_args(vault)
+        if not isinstance(bundle_path, str) or not Path(bundle_path).is_absolute():
+            raise ValueError("Choose an absolute path to this member's relay kit")
+        bundle = Path(bundle_path)
+        manifests, capabilities = bundle / "manifests", bundle / "capabilities"
+        if not manifests.is_dir() or not capabilities.is_dir():
+            raise ValueError("Relay kit needs manifests and capabilities directories")
+        self.command("provision", *common, "--relay-manifest", manifests,
+                     "--provision-capability-files", capabilities, binary=RELAY, timeout=120)
+        return {"provisioned": True}
+
+    def relay_export(self, vault):
+        member_dir, local, common = self.relay_args(vault)
+        with tempfile.TemporaryDirectory(prefix="relay-export-", dir=member_dir) as temporary:
+            directory = Path(temporary)
+            self.command("export-config", *common, "--courier-directory", directory,
+                         binary=RELAY, timeout=120)
+            files = []
+            for path in directory.iterdir():
+                match = re.fullmatch(re.escape(vault) + rf"-relay-config-{local['slot']}-(\d+)-(\d+)\.bin",
+                                     path.name)
+                if not match or not path.is_file() or path.is_symlink():
+                    raise ValueError("Relay export contained an unexpected file")
+                wire = path.read_bytes()
+                if not 0 < len(wire) <= 64 * 1024:
+                    raise ValueError("Relay config file has an invalid size")
+                files.append({"peer": int(match.group(1)), "name": path.name,
+                              "data": base64.b64encode(wire).decode()})
+            files.sort(key=lambda item: item["peer"])
+            if [item["peer"] for item in files] != [slot for slot in (1, 2, 3)
+                                                    if slot != local["slot"]]:
+                raise ValueError("Relay export did not contain one file for each peer")
+            return {"files": files}
+
+    def relay_import(self, vault, encoded_wire):
+        member_dir, local, common = self.relay_args(vault)
+        if not isinstance(encoded_wire, str) or not 0 < len(encoded_wire) <= 88 * 1024:
+            raise ValueError("Invalid relay config file")
+        try:
+            wire = base64.b64decode(encoded_wire, validate=True)
+        except (ValueError, binascii.Error) as error:
+            raise ValueError("Invalid relay config file") from error
+        if not 0 < len(wire) <= 64 * 1024:
+            raise ValueError("Invalid relay config file")
+        with tempfile.TemporaryDirectory(prefix="relay-import-", dir=member_dir) as temporary:
+            path = Path(temporary) / "courier.bin"
+            write_new(path, wire)
+            output = self.command("import-config", *common, "--courier-file", path,
+                                  binary=RELAY, timeout=120)
+        match = re.search(r"\bimported owner=(\d+) revision=\d+ digest=[0-9a-f]{64}\b", output)
+        if not match or int(match.group(1)) not in (1, 2, 3) or int(match.group(1)) == local["slot"]:
+            raise ValueError("Relay did not confirm the peer config")
+        return {"imported_from": int(match.group(1))}
+
+    def relay_status(self, vault):
+        _, _, common = self.relay_args(vault)
+        report = self.command("readiness", *common, binary=RELAY, timeout=40)
+        match = re.fullmatch(r"inboxes=(\d+) peers=(\d+) live=(\d+) routable=([01])", report.strip())
+        if not match:
+            raise ValueError("Relay readiness returned an unexpected result")
+        inboxes, peers, live, routable = map(int, match.groups())
+        configured = inboxes == 3 and peers == 2 and routable == 1
+        return {"configured": configured, "reachable": configured and live >= 2,
+                "inboxes": inboxes, "peers": peers, "live_relays": live}
 
     def payment_status(self, work, phase, txid=None):
         # shortcut: this file is UI progress only; custody state remains in the Rust signer and chain.
@@ -1653,6 +1728,12 @@ def make_signer_server(wallet, port, dashboard_port=None):
                             value.get("name"), value.get("words"), value.get("card")),
                         "/api/address": lambda: {"address": wallet.address(value.get("vault"))},
                         "/api/balance": lambda: wallet.balance(value.get("vault")),
+                        "/api/relay-provision": lambda: wallet.relay_provision(
+                            value.get("vault"), value.get("bundle")),
+                        "/api/relay-export": lambda: wallet.relay_export(value.get("vault")),
+                        "/api/relay-import": lambda: wallet.relay_import(
+                            value.get("vault"), value.get("data")),
+                        "/api/relay-status": lambda: wallet.relay_status(value.get("vault")),
                         "/api/payment-draft": lambda: wallet.prepare_payment(
                             value.get("vault"), value.get("recipient"), value.get("amount_zat"),
                             value.get("memo"), value.get("pair")),
