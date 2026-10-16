@@ -219,12 +219,13 @@ def make_certificates(folder):
     ca, ca_key = folder / "ca.pem", folder / "ca.key"
     leaf, leaf_key, csr = folder / "leaf.pem", folder / "leaf.key", folder / "leaf.csr"
     extensions = folder / "leaf.ext"
-    extensions.write_text("subjectAltName=DNS:localhost\n")
+    extensions.write_text("subjectAltName=DNS:localhost\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid:always\n")
     run = lambda *argv: subprocess.run(argv, check=True, capture_output=True)
     run("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(ca_key),
         "-out", str(ca), "-days", "1", "-subj", "/CN=Loki setup test CA",
         "-addext", "basicConstraints=critical,CA:TRUE",
-        "-addext", "keyUsage=critical,keyCertSign,cRLSign")
+        "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+        "-addext", "subjectKeyIdentifier=hash")
     run("openssl", "req", "-newkey", "rsa:2048", "-nodes", "-keyout", str(leaf_key),
         "-out", str(csr), "-subj", "/CN=localhost")
     run("openssl", "x509", "-req", "-in", str(csr), "-CA", str(ca), "-CAkey", str(ca_key),

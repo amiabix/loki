@@ -88,6 +88,29 @@ class HostedControllerTests(unittest.TestCase):
             self.wallet.join('unknown-version:abc')
         self.assertNotIn('identity', [action for action, _ in self.calls])
 
+    def test_hosted_vault_from_another_network_is_not_attached(self):
+        native = self.controller.native
+
+        def wrong_network(action, folder, *args, **kwargs):
+            result = native(action, folder, *args, **kwargs)
+            if action == 'setup-info':
+                return json.dumps({**json.loads(result), 'network': 'testnet'})
+            return result
+
+        self.controller.native = wrong_network
+        with self.assertRaisesRegex(ValueError, 'another network'):
+            self.wallet.create('Treasury', 3)
+        self.assertEqual(self.wallet.vaults(), [])
+
+    def test_existing_regtest_membership_without_network_can_resume(self):
+        vault = self.wallet.create('Treasury', 3)['vault']
+        membership = self.wallet.data / 'vaults' / vault / 'membership.json'
+        saved = json.loads(membership.read_text())
+        saved.pop('network')
+        membership.write_text(json.dumps(saved))
+        self.assertEqual(self.wallet.create('Treasury', 3)['vault'], vault)
+        self.assertEqual(self.wallet.status(vault)['network'], 'regtest')
+
     def test_waiting_member_four_is_distinct_from_retry_and_ready(self):
         result = self.wallet.create('Treasury', 4)
         folder, _ = self.wallet.vault_dir(result['vault'])

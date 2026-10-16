@@ -282,9 +282,11 @@ npm ci --prefix poc/g3
 LOKI_THS_INSTANCE=loki-app-flow python3 poc/wallet/test_real_browser_flow.py -v
 ```
 
-Each browser controls a different private app process. The browser test checks
-the backup gate, relay connection, both transaction review panels, two approvals,
-the third member's Send action, and confirmation in all three windows. Members
+Each browser controls a different private app process. The setup courier uses
+verified HTTPS; the companion HTTPS join test checks wrong-hostname refusal.
+The browser test checks the backup gate, relay connection, both transaction
+review panels, two approvals, the third member's Send action, and confirmation
+in all three windows. Members
 discover the mined txid from its input nullifiers and then verify its exact
 approved effects; confirmation does not depend on the finisher announcing a txid.
 The chain lookup scans blocks from the proposal height on each pending check and

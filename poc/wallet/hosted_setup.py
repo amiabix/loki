@@ -152,6 +152,8 @@ class HostedSetup:
 
     def _attach(self, folder, name):
         info = json.loads(self.native("setup-info", folder))
+        if info.get("network") != self.wallet.network:
+            raise ValueError("Hosted vault belongs to another network")
         vault = info["vault"]
         target = self.wallet.data / "vaults" / vault
         if target.exists() and target != folder:
@@ -159,9 +161,10 @@ class HostedSetup:
         membership = folder / "membership.json"
         value = {"vault": vault, "slot": info["own_slot"], "name": name,
                  "profile": self.wallet.require_profile()["id"], "members": info["member_count"],
-                 "threshold": 2, "transport": "hosted"}
+                 "threshold": 2, "transport": "hosted", "network": self.wallet.network}
         if membership.exists():
-            if json.loads(membership.read_text()) != value:
+            saved = json.loads(membership.read_text())
+            if {**saved, "network": saved.get("network", "regtest")} != value:
                 raise ValueError("Saved hosted membership differs from native setup")
         else:
             self._write(membership, json.dumps(value).encode())
@@ -272,7 +275,7 @@ class HostedSetup:
         confirmations = [{"slot": slot, "confirmed": all_agreed or (slot == local["slot"] and bool(native.get("agreed_fingerprint"))),
                           "matches": True} for slot in range(1, local["members"] + 1)]
         result = {"phase": ui_phase, "setup_phase": phase, "handoff": native.get("handoff", "pending"),
-                  "transport": "hosted", "network": "regtest", "name": local["name"], "vault": vault,
+                  "transport": "hosted", "network": local.get("network", "regtest"), "name": local["name"], "vault": vault,
                   "slot": local["slot"], "threshold": 2, "total_members": local["members"],
                   "members": len(native.get("joined_slots", [])), "missing_slots": native.get("missing_slots", []),
                   "fingerprint": info.get("fingerprint"), "confirmations": confirmations, "profile": self.wallet.profile_data,
