@@ -32,6 +32,7 @@ function selectVault(vault) {
   pumpPaused = false;
   paymentReviews.clear();
   paymentActivity.clear();
+  $('payment-draft').elements.pair.value = '';
   $('address').textContent = 'Open this vault to view the address.';
   $('balance').textContent = "Scan this device's chain view to see the balance.";
   $('words').textContent = '';
@@ -722,6 +723,11 @@ async function refresh() {
         memberSlot = state.slot;
         const paymentAvailable = [3, 4].includes(state.total_members) && (state.transport !== 'hosted' || state.handoff === 'ready');
         memberCount = state.total_members;
+        const pairChoice = $('payment-draft').elements.pair;
+        for (const option of pairChoice.options) {
+          option.disabled = option.value.includes('D') && memberCount < 4;
+        }
+        if (pairChoice.selectedOptions[0]?.disabled) pairChoice.value = '';
         $('relay-setup').hidden = !paymentAvailable || state.transport === 'hosted';
         $('payment-unavailable').hidden = paymentAvailable;
         $('show-address').hidden = !paymentAvailable;
@@ -899,7 +905,7 @@ action('payment-draft', async (form) => {
   const vault = selectedVault;
   const value = fields(form);
   const amount_zat = zatFromZec(value.amount_zec);
-  const draft = await api('payment-draft', {vault, recipient: value.recipient, memo: value.memo, amount_zat});
+  const draft = await api('payment-draft', {vault, recipient: value.recipient, memo: value.memo, amount_zat, pair: value.pair});
   if (selectedVault !== vault) return;
   $('draft-result').textContent = `DRAFT · no member has approved or sent this payment\n`
     + `Payment ID: ${draft.payment}\n`

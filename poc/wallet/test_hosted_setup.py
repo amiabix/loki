@@ -122,6 +122,32 @@ class HostedControllerTests(unittest.TestCase):
         self.assertEqual(self.controller._attach(folder, 'Treasury'), {'vault': self.vault})
         self.assertEqual(len(self.wallet.vaults()), 1)
 
+    def test_restored_membership_can_connect_operator_relays_in_hosted_app(self):
+        card = base64.b64encode(b'LOKISEAL\x01' + b'opaque final card').decode()
+        identity = {'id': 1, 'signing': 'a' * 64, 'encryption': 'b' * 64}
+        roster = {'vault': self.vault, 'threshold': 2,
+                  'members': [identity, {'id': 2}, {'id': 3}]}
+
+        def command(action, folder, *_args, **_kwargs):
+            if action == 'restore':
+                (folder / 'secrets').mkdir()
+                (folder / 'secrets' / 'activation.sealed').write_bytes(b'opaque')
+                (folder / 'roster.json').write_text(json.dumps(roster))
+                return 'uregtest1recovered'
+            if action == 'identity-public': return json.dumps(identity)
+            if action == 'address': return 'uregtest1recovered'
+            if action == 'validate-roster': return 'fingerprint'
+            if action == 'provision': return 'provisioned'
+            raise AssertionError(action)
+
+        with patch.object(self.wallet, 'command', side_effect=command):
+            self.wallet.restore_vault('Recovered', 'saved recovery words', card)
+            kit = self.wallet.data / 'operator-kit'
+            (kit / 'manifests').mkdir(parents=True)
+            (kit / 'capabilities').mkdir()
+            self.assertEqual(self.wallet.relay_provision(self.vault, str(kit)), {'provisioned': True})
+        self.assertEqual(self.wallet.relay_status(self.vault)['phase'], 'waiting')
+
     def test_dashboard_receives_public_pending_state_and_lock_revokes_session(self):
         self.wallet.create('Treasury', 4)
         origin = 'http://127.0.0.1:18802'

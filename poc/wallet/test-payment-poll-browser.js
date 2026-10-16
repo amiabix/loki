@@ -14,6 +14,7 @@ async function run() {
     const address = 'uregtest1' + 'q'.repeat(105);
     let relayFailure = true;
     let paymentReady = false;
+    let selectedPair = null;
     await page.route('http://127.0.0.1:18801/**', async route => {
       const url = new URL(route.request().url());
       if (!url.pathname.startsWith('/api/')) {
@@ -35,6 +36,10 @@ async function run() {
       else if (url.pathname === '/api/session/pending') result = {requests: []};
       else if (url.pathname === '/api/session/actions') result = {actions: []};
       else if (url.pathname === '/api/address') result = {address};
+      else if (url.pathname === '/api/payment-draft') {
+        selectedPair = route.request().postDataJSON().pair;
+        result = {payment: 'c'.repeat(64), attempt: 'b'.repeat(64), pair: [2, 3]};
+      }
       else if (url.pathname === '/api/payment-sync' && relayFailure) result = {error: 'member_sealed', surface: 'payment-sync', retry: false};
       return route.fulfill({json: result, status: result.error ? 400 : 200});
     });
@@ -51,6 +56,14 @@ async function run() {
     assert.match(await status.textContent(), /relay configuration/i);
     assert.doesNotMatch(await status.textContent(), /member_sealed/);
     assert.equal(await page.locator('#address').textContent(), address);
+    await page.locator('#payment-draft input[name="recipient"]').fill(address);
+    await page.locator('#payment-draft input[name="amount_zec"]').fill('0.5');
+    await page.locator('#payment-draft textarea[name="memo"]').fill('Payment');
+    assert.equal(await page.locator('#payment-draft option[value="AD"]').evaluate(option => option.disabled), true);
+    await page.locator('#payment-draft select[name="pair"]').selectOption('BC');
+    await page.getByRole('button', {name: 'Propose payment'}).click();
+    await page.waitForFunction(() => document.getElementById('draft-result').textContent.includes('Signers: members 2 and 3'));
+    assert.equal(selectedPair, 'BC');
     relayFailure = false;
     await page.getByRole('button', {name: 'Check for updates'}).click();
     await page.waitForFunction(() => !pumping);
@@ -59,7 +72,7 @@ async function run() {
     await page.getByRole('button', {name: 'Check for updates'}).click();
     await page.getByRole('button', {name: 'Send this payment'}).waitFor();
     assert.deepEqual(errors, []);
-    console.log('PASS: payment relay errors stay beside payments; receiving and retry remain available');
+    console.log('PASS: payment retry, receiving, and chosen signer pair remain available');
   } finally { await browser.close(); }
 }
 

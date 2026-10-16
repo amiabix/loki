@@ -376,6 +376,10 @@ class Wallet:
             self.hosted = HostedSetup(self, operator_bundle, operator_key, enrollment_grant, development_http, enrollment_issuer)
         self.invite_origin = check_origin(invite_origin) if invite_origin else None
         self.lock = threading.Lock()
+        self.native_lock = threading.Lock()
+        self.native_processes = set()
+        self.locked = threading.Event()
+        self.lock_epoch = 0
         self.claim_lock = threading.Lock()
         self.syncs = {}
         self.sync_done = set()
@@ -394,29 +398,41 @@ class Wallet:
         self.relay_monitor = threading.Thread(target=self.monitor_relays, daemon=True)
         self.relay_monitor.start()
 
-    def command(self, action, *args, passphrase=None, timeout=30, binary=None):
+    def command(self, action, *args, passphrase=None, timeout=30, binary=None, generation=None):
         binary = binary or self.setup
         if not binary.is_file():
             raise ValueError(f"Build {binary.name}: cd poc && cargo build --locked --bins")
         passfile = None
         try:
-            argv = [str(binary), action]
-            for arg in args:
-                if arg == "@pass":
-                    fd, name = tempfile.mkstemp(prefix=".unlock-", dir=self.data)
-                    passfile = Path(name)
-                    with os.fdopen(fd, "w") as out:
-                        out.write(check_passphrase(passphrase if passphrase is not None else self.passphrase))
-                    argv.append(name)
-                else:
-                    argv.append(str(arg))
+            with self.native_lock:
+                if (self.locked.is_set() and action not in ("profile-create", "profile-open")) \
+                        or (generation is not None and generation != self.lock_epoch):
+                    raise ValueError("Signer is locked")
+                argv = [str(binary), action]
+                for arg in args:
+                    if arg == "@pass":
+                        fd, name = tempfile.mkstemp(prefix=".unlock-", dir=self.data)
+                        passfile = Path(name)
+                        with os.fdopen(fd, "w") as out:
+                            out.write(check_passphrase(passphrase if passphrase is not None else self.passphrase))
+                        argv.append(name)
+                    else:
+                        argv.append(str(arg))
+                process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                self.native_processes.add(process)
             try:
-                result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
-            except subprocess.TimeoutExpired as error:
-                raise Timeout(f"{action} did not finish within {timeout} seconds") from error
-            if result.returncode:
-                raise ValueError(result.stderr.strip() or result.stdout.strip() or f"{action} failed")
-            return result.stdout.strip()
+                try:
+                    stdout, stderr = process.communicate(timeout=timeout)
+                except subprocess.TimeoutExpired as error:
+                    process.kill()
+                    process.communicate()
+                    raise Timeout(f"{action} did not finish within {timeout} seconds") from error
+                if process.returncode:
+                    raise ValueError(stderr.strip() or stdout.strip() or f"{action} failed")
+                return stdout.strip()
+            finally:
+                with self.native_lock:
+                    self.native_processes.discard(process)
         finally:
             if passfile:
                 passfile.unlink(missing_ok=True)
@@ -427,15 +443,21 @@ class Wallet:
         if not isinstance(name, str) or not 1 <= len(name.strip().encode()) <= 80:
             raise ValueError("Enter a profile name of 1 to 80 UTF-8 bytes")
         check_passphrase(passphrase)
+        generation = self.lock_epoch
         profile = json.loads(self.command("profile-create", self.data, "@pass", name.strip(),
                                           passphrase=passphrase))
-        self.passphrase, self.profile_data = passphrase, profile
-        if self.hosted:
-            self.hosted.start()
+        with self.native_lock:
+            if generation != self.lock_epoch:
+                raise ValueError("Signer was locked during profile creation")
+            self.passphrase, self.profile_data = passphrase, profile
+            self.locked.clear()
+            if self.hosted:
+                self.hosted.start()
         return {"profile": profile}
 
     def unlock(self, passphrase):
         check_passphrase(passphrase)
+        generation = self.lock_epoch
         try:
             profile = json.loads(self.command("profile-open", self.data, "@pass", passphrase=passphrase))
         except Timeout:
@@ -447,18 +469,30 @@ class Wallet:
             raise ValueError("Could not open your profile with that passphrase. If you are "
                              "certain it is right, the profile file on this device may have "
                              "been changed.") from error
-        self.passphrase, self.profile_data = passphrase, profile
-        if self.hosted:
-            self.hosted.start()
+        with self.native_lock:
+            if generation != self.lock_epoch:
+                raise ValueError("Signer was locked during unlock")
+            self.passphrase, self.profile_data = passphrase, profile
+            self.locked.clear()
+            if self.hosted:
+                self.hosted.start()
         return {"profile": profile}
 
     def lock_profile(self):
+        with self.native_lock:
+            self.locked.set()
+            self.lock_epoch += 1
+            self.passphrase = None
+            self.profile_data = None
+            running = tuple(self.native_processes)
+        for process in running:
+            if process.poll() is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
         if self.hosted:
             self.hosted.stop()
-        if any(worker.is_alive() for worker in self.workers.values()):
-            raise ValueError("Wait for key creation to finish before locking")
-        self.passphrase = None
-        self.profile_data = None
         return {"locked": True}
 
     def require_profile(self):
@@ -779,8 +813,16 @@ class Wallet:
             raise ValueError("Invalid invite") from error
         folder = self.exchange_vault(vault)
         local = self.data / "vaults" / vault
-        if local.exists():
-            raise ValueError("This profile already has a membership for this vault")
+        if local.is_symlink():
+            raise ValueError("Member directory must not be a symbolic link")
+        membership_path = local / "membership.json"
+        if membership_path.exists():
+            try:
+                read_json(membership_path)
+            except json.JSONDecodeError:
+                pass  # A stopped write left no complete membership to protect.
+            else:
+                raise ValueError("This profile already has a membership for this vault")
         origin = check_origin(claim["url"]) if claim.get("url") else None
         token, repeat = self.pending_claim(vault, slot, secret, origin) if origin else (None, False)
         if origin:
@@ -800,17 +842,37 @@ class Wallet:
                     draft["invites"][str(slot)], hashlib.sha256(secret.encode()).hexdigest()
         ):
             raise ValueError("Invite does not match this vault")
-        if (folder / f"join-{slot}.json").exists():
-            raise ValueError("This invite slot has already been claimed")
-        local.mkdir(mode=0o700, parents=True)
-        identity = json.loads(self.command("identity", local, str(slot), "@pass"))
-        write_new(folder / f"join-{slot}.json", json.dumps(identity).encode())
-        write_new(local / "membership.json", json.dumps({"vault": vault, "slot": slot,
-                                                          "name": draft["name"], "profile": profile["id"],
-                                                          "threshold": 2, "members": members}).encode())
+        local.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if (local / "secrets" / "identity.sealed").exists():
+            identity = json.loads(self.command("identity-public", local, "@pass"))
+        else:
+            identity = json.loads(self.command("identity", local, str(slot), "@pass"))
+        if identity.get("id") != slot:
+            raise ValueError("Saved identity belongs to another invite slot")
+        published = folder / f"join-{slot}.json"
+        if published.exists():
+            try:
+                previous = read_json(published)
+            except json.JSONDecodeError:
+                # A stopped write may leave a partial answer for this identity.
+                write_replace(published, json.dumps(identity).encode())
+            else:
+                if previous != identity:
+                    raise ValueError("This invite slot has already been claimed")
+        else:
+            write_new(published, json.dumps(identity).encode())
         if origin:
-            write_new(local / "transport.json", json.dumps(
-                {"vault": vault, "slot": slot, "origin": origin, "token": token}).encode())
+            transport_path = local / "transport.json"
+            transport = {"vault": vault, "slot": slot, "origin": origin, "token": token}
+            if transport_path.exists():
+                if read_json(transport_path) != transport:
+                    raise ValueError("Saved courier connection belongs to another invite")
+            else:
+                write_new(transport_path, json.dumps(transport).encode())
+        write_replace(membership_path, json.dumps({"vault": vault, "slot": slot,
+                                                    "name": draft["name"], "profile": profile["id"],
+                                                    "threshold": 2, "members": members}).encode())
+        if origin:
             self.ensure_sync(vault)
         return {"vault": vault, "joined": True}
 
@@ -946,19 +1008,22 @@ class Wallet:
                                   "at": int(time.time())}).encode())
         self.setup_errors.pop(vault, None)
         passphrase = self.passphrase
+        generation = self.lock_epoch
 
         def run():
             try:
                 self.command("run", member_dir, "@pass", member_dir / "roster.json",
                              self.exchange_vault(vault), fingerprint, passphrase=passphrase,
-                             timeout=600)
+                             timeout=600, generation=generation)
             except Timeout:
-                self.setup_errors[vault] = (
-                    "Key creation ran out of time. Every member has to be on this step at "
-                    "the same time. Ask the others to open their app and reach this step, "
-                    "then confirm the roster again to start a fresh round.")
+                if generation == self.lock_epoch:
+                    self.setup_errors[vault] = (
+                        "Key creation ran out of time. Every member has to be on this step at "
+                        "the same time. Ask the others to open their app and reach this step, "
+                        "then confirm the roster again to start a fresh round.")
             except Exception as error:
-                self.setup_errors[vault] = str(error)
+                if generation == self.lock_epoch:
+                    self.setup_errors[vault] = str(error)
 
         self.workers[vault] = threading.Thread(target=run, daemon=True)
         self.workers[vault].start()
@@ -1119,6 +1184,10 @@ class Wallet:
                 "profile": profile["id"], "threshold": roster["threshold"],
                 "members": len(members),
             }).encode())
+            if self.hosted:
+                write_new(restored / "relay-setup.json", json.dumps({
+                    "mode": "operator", "phase": "waiting",
+                    "detail": "Restored signing keys need a new operator relay kit and peer configs on this device."}).encode())
             os.rename(restored, destination)
             return {"vault": vault, "slot": own["id"],
                     **({"address": address} if len(members) in (3, 4) else {})}
@@ -1284,7 +1353,7 @@ class Wallet:
 
     def relay_args(self, vault):
         member_dir, local = self.vault_dir(vault)
-        if self.transport == "hosted" or local.get("transport") == "hosted":
+        if local.get("transport") == "hosted":
             raise ValueError("Hosted vaults attach to relays automatically")
         if local.get("threshold", 2) != 2 or local.get("members") not in (3, 4) \
                 or not (member_dir / "final-backup-checked").is_file():
@@ -1923,8 +1992,12 @@ def make_signer_server(wallet, port, dashboard_port=None):
                             return self.reply(200, result)
                     sessions.disconnect(key, dashboard_origin)
                     return self.reply(200, {"disconnected": True})
-                if self.path == "/api/lock" and wallet.hosted:
-                    wallet.hosted.stop()
+                if self.path == "/api/lock":
+                    try:
+                        result = wallet.lock_profile()
+                    finally:
+                        sessions.clear()
+                    return self.reply(200, result)
                 with wallet.lock:
                     if self.path == "/api/session/approve":
                         wallet.require_profile()
@@ -1956,7 +2029,6 @@ def make_signer_server(wallet, port, dashboard_port=None):
                     routes = {
                         "/api/profile-create": lambda: wallet.create_profile(value.get("name"), value.get("passphrase")),
                         "/api/unlock": lambda: wallet.unlock(value.get("passphrase")),
-                        "/api/lock": wallet.lock_profile,
                         "/api/create": lambda: wallet.create(value.get("name"), value.get("members", 3)),
                         "/api/join": lambda: wallet.join(value.get("invite")),
                         "/api/begin-link": lambda: wallet.begin_link(value.get("vault")),
@@ -2006,8 +2078,6 @@ def make_signer_server(wallet, port, dashboard_port=None):
                     if self.path not in routes:
                         return self.reply(404, {"error": "Not found"})
                     result = routes[self.path]()
-                    if self.path == "/api/lock":
-                        sessions.clear()
                     self.reply(200, result)
             except Exception as error:
                 surface = self.path.rsplit("/", 1)[-1] if self.path.startswith("/api/") else ""

@@ -43,6 +43,7 @@ async function run() {
       phase = 'active';
       await page.waitForFunction(() => !document.getElementById('active').hidden);
       assert.equal(await page.locator('#payment-draft').isVisible(), true);
+      assert.equal(await page.locator('#payment-draft option[value="AD"]').evaluate(option => option.disabled), count === 3);
       assert.equal(await page.locator('#show-address').isVisible(), true);
       assert.equal(await page.locator('#payment-unavailable').isHidden(), true);
       assert.equal(await page.locator('#relay-setup').isHidden(), true);

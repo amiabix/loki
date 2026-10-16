@@ -129,6 +129,10 @@ then saves that member's signing material and the shared viewing secret under th
 the internal provisional card, restores the same receive address, and needs neither
 the setup courier nor a relay. The old device remains capable of signing;
 restoring is not revocation.
+After restoring in a hosted app, the recovered membership can use the
+**Connect operator-provided relays** controls with a new kit and encrypted peer
+configs. The recovery card does not restore the old hosted relay connection;
+payments need that separate reconnection before they can be delivered.
 An active vault can scan the regtest chain for its unspent balance at a named
 block height. Set `LOKI_RPC=host:port` when starting each app if the local node
 is not on the default `127.0.0.1:18232`. **Refresh balance** only scans the chain;
@@ -140,6 +144,9 @@ is not saved as plaintext in the member directory. The profile ID is local and
 does not appear in the vault roster or on chain. A membership links that profile
 ID to the vault ID locally; the certified roster binds that membership's separate
 public identity to its FROST share.
+Lock clears the in-process profile and terminates running native commands,
+including a local key creation round. An interrupted key creation round must be
+started again after unlocking.
 If used, the account-control proof is verified locally and kept in the member's sealed
 store. It is not part of the group certificate, so other members do not learn a
 reusable account key. The ordinary wallet seed does not recover a Loki FROST
@@ -149,12 +156,10 @@ the new roster fingerprint; old 2-of-3 roster files retain their original
 fingerprint. A four-member source vault completed a mined payment with members
 3 and 4 signing and member 2 finishing through `run-member-payment.py
 --members 4 --pair CD --finisher 2`. This is the local courier test path; the
-relay adapter remains three-member-only. The 2-of-4 vault can show its balance
-when funded through the CLI test path, but the app hides its receive address
-and payment controls to avoid deposits it cannot spend. For a 2-of-3 vault, the private member
-app has controls for a fixed signing pair: create a local payment draft, send
-the proposal, publish commitments, build the package, review the transaction,
-approve that exact review, prove and broadcast, then verify it on chain. The
+member app now also accepts 2-of-4 relay payments. The private member app asks
+the proposer to choose two available signers for each attempt. The apps create
+a draft, send the proposal, publish commitments, build the package, review and
+approve the exact transaction, prove and broadcast it, then verify it on chain. The
 review panel uses the Rust signer's verified transaction fields, not the
 proposal's annotation. Each member runs these controls in their own private
 signer window. **Refresh payments** uploads queued proposals and this member's
@@ -164,6 +169,10 @@ remains pending delivery until every saved signing message has relay storage; co
 chain view whenever the payment list is shown. If a signer closed after saving
 an approval, **Retry saved signing messages** republishes the same sealed share;
 it never creates another signature share.
+Payment preparation can combine up to eight confirmed notes. Separate pending
+proposals can still choose the same note; only one such spend can mine, and the
+other attempt needs a new proposal. The chosen pair is fixed for an attempt;
+if either signer becomes unavailable, create a new attempt with another pair.
 
 The dashboard offers **Fund Vault** beside each eligible 2-of-3 vault. Each new
 click requests exactly 5 local test ZEC from the THS address faucet, then waits

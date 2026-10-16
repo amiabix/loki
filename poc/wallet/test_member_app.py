@@ -1,6 +1,7 @@
 """The setup app never creates or unlocks another member's share."""
 
 import base64
+import hashlib
 import http.client
 import json
 import os
@@ -8,15 +9,281 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
-from member_app import SEED_WALLET, SETUP, Wallet, courier_name, make_signer_server
+from member_app import SEED_WALLET, SETUP, Wallet, courier_name, encoded, make_signer_server
+import member_app
 
 
 class MemberWalletTest(unittest.TestCase):
+    def test_lock_clears_profile_while_setup_worker_is_running(self):
+        with tempfile.TemporaryDirectory(prefix="loki-lock-worker-") as temp:
+            wallet = Wallet(Path(temp) / "member", Path(temp) / "exchange")
+            self.addCleanup(wallet.close)
+            wallet.profile_data = {"id": "profile"}
+            wallet.passphrase = "example passphrase"
+            started, release = threading.Event(), threading.Event()
+            worker = threading.Thread(target=lambda: (started.set(), release.wait(2)), daemon=True)
+            worker.start()
+            started.wait(1)
+            wallet.workers["a" * 64] = worker
+            try:
+                self.assertEqual(wallet.lock_profile(), {"locked": True})
+                self.assertIsNone(wallet.profile_data)
+                self.assertIsNone(wallet.passphrase)
+            finally:
+                release.set()
+                worker.join(2)
+
+    def test_lock_route_does_not_wait_for_payment_sync(self):
+        with tempfile.TemporaryDirectory(prefix="loki-lock-sync-") as temp:
+            wallet = Wallet(Path(temp) / "member", Path(temp) / "exchange")
+            self.addCleanup(wallet.close)
+            wallet.profile_data = {"id": "profile"}
+            wallet.passphrase = "example passphrase"
+            started, release = threading.Event(), threading.Event()
+            server, token = make_signer_server(wallet, 0)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+
+            def blocked_sync(_vault):
+                started.set()
+                release.wait(2)
+                return {"payments": []}
+
+            def request(path, body):
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=3)
+                connection.request("POST", path, json.dumps(body), {"X-Loki-Token": token})
+                response = connection.getresponse()
+                result = response.status, json.loads(response.read())
+                connection.close()
+                return result
+
+            with patch.object(wallet, "sync_payments", side_effect=blocked_sync):
+                syncing = threading.Thread(target=lambda: request("/api/payment-sync", {"vault": "a" * 64}), daemon=True)
+                syncing.start()
+                self.assertTrue(started.wait(1))
+                timer = threading.Timer(1, release.set)
+                timer.start()
+                try:
+                    before = time.monotonic()
+                    self.assertEqual(request("/api/lock", {})[0], 200)
+                    self.assertLess(time.monotonic() - before, 0.6)
+                    self.assertIsNone(wallet.passphrase)
+                finally:
+                    release.set()
+                    timer.cancel()
+                    syncing.join(2)
+
+    def test_lock_terminates_running_native_command(self):
+        with tempfile.TemporaryDirectory(prefix="loki-lock-command-") as temp:
+            root = Path(temp)
+            wallet = Wallet(root / "member", root / "exchange")
+            self.addCleanup(wallet.close)
+            wallet.profile_data = {"id": "profile"}
+            wallet.passphrase = "example passphrase"
+            executable = root / "slow-command"
+            executable.write_text("#!/usr/bin/env python3\nimport pathlib, sys, time\npathlib.Path(sys.argv[2]).touch()\ntime.sleep(10)\n")
+            executable.chmod(0o700)
+            marker = root / "started"
+            result = []
+
+            def run():
+                try:
+                    wallet.command("run", marker, "@pass", binary=executable, timeout=12)
+                    result.append("completed")
+                except ValueError:
+                    result.append("stopped")
+
+            worker = threading.Thread(target=run, daemon=True)
+            worker.start()
+            deadline = time.monotonic() + 10
+            while not marker.exists() and worker.is_alive() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(marker.exists())
+            wallet.lock_profile()
+            worker.join(1)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(result, ["stopped"])
+            self.assertEqual(list(wallet.data.glob(".unlock-*")), [])
+
+    def test_lock_does_not_report_cancelled_setup_as_a_vault_failure(self):
+        with tempfile.TemporaryDirectory(prefix="loki-lock-setup-state-") as temp:
+            wallet = Wallet(Path(temp) / "member", Path(temp) / "exchange")
+            self.addCleanup(wallet.close)
+            wallet.profile_data = {"id": "profile"}
+            wallet.passphrase = "example passphrase"
+            vault = "a" * 64
+            member = wallet.data / "vaults" / vault
+            member.mkdir(parents=True)
+            (wallet.exchange / vault).mkdir()
+            identity = {"id": 1, "signing": "b" * 64, "encryption": "c" * 64}
+            started, release = threading.Event(), threading.Event()
+
+            def command(action, *_args, **_kwargs):
+                if action == "identity-public":
+                    return json.dumps(identity)
+                if action == "run":
+                    started.set()
+                    release.wait(2)
+                    raise ValueError("native command was cancelled")
+                raise AssertionError(action)
+
+            with patch.object(wallet, "vault_dir", return_value=(member, {"slot": 1})), \
+                 patch.object(wallet, "roster", return_value={"fingerprint": "f", "members": [identity]}), \
+                 patch.object(wallet, "command", side_effect=command):
+                wallet.agree(vault, "f")
+                self.assertTrue(started.wait(1))
+                wallet.lock_profile()
+                release.set()
+                wallet.workers[vault].join(2)
+            self.assertNotIn(vault, wallet.setup_errors)
+
+    def test_lock_during_unlock_cannot_restore_profile_after_lock_returns(self):
+        with tempfile.TemporaryDirectory(prefix="loki-lock-unlock-race-") as temp:
+            wallet = Wallet(Path(temp) / "member", Path(temp) / "exchange")
+            self.addCleanup(wallet.close)
+            started, release = threading.Event(), threading.Event()
+            result = []
+
+            def opening(*_args, **_kwargs):
+                started.set()
+                release.wait(2)
+                return json.dumps({"id": "profile"})
+
+            def unlock():
+                try:
+                    wallet.unlock("example passphrase")
+                    result.append("unlocked")
+                except ValueError:
+                    result.append("cancelled")
+
+            with patch.object(wallet, "command", side_effect=opening):
+                worker = threading.Thread(target=unlock, daemon=True)
+                worker.start()
+                self.assertTrue(started.wait(1))
+                wallet.lock_profile()
+                release.set()
+                worker.join(2)
+            self.assertEqual(result, ["cancelled"])
+            self.assertIsNone(wallet.profile_data)
+            self.assertIsNone(wallet.passphrase)
+
+    def test_join_retries_after_identity_is_saved_before_membership(self):
+        with tempfile.TemporaryDirectory(prefix="loki-join-retry-") as temp:
+            root = Path(temp)
+            wallet = Wallet(root / "member", root / "exchange")
+            self.addCleanup(wallet.close)
+            wallet.profile_data = {"id": "profile"}
+            wallet.passphrase = "example passphrase"
+            vault, secret = "a" * 64, "invite secret"
+            exchange = wallet.exchange / vault
+            exchange.mkdir()
+            exchange.joinpath("draft.json").write_text(json.dumps({
+                "vault": vault, "name": "Treasury", "members": 3, "threshold": 2,
+                "expires_at": 9999999999,
+                "invites": {"2": hashlib.sha256(secret.encode()).hexdigest(),
+                            "3": "unused"}}))
+            invite = encoded({"vault": vault, "slot": 2, "secret": secret})
+            identity = {"id": 2, "signing": "b" * 64, "encryption": "c" * 64}
+
+            def command(action, member, *_args, **_kwargs):
+                if action == "identity":
+                    secrets_dir = member / "secrets"
+                    secrets_dir.mkdir(exist_ok=True)
+                    (secrets_dir / "identity.sealed").write_bytes(b"saved sealed identity")
+                    raise ValueError("response lost after identity was saved")
+                if action == "identity-public":
+                    return json.dumps(identity)
+                raise AssertionError(action)
+
+            with patch.object(wallet, "command", side_effect=command):
+                with self.assertRaisesRegex(ValueError, "response lost"):
+                    wallet.join(invite)
+                (exchange / "join-2.json").write_bytes(b'{"id":')
+                (wallet.data / "vaults" / vault / "membership.json").write_bytes(b'{"vault":')
+                self.assertEqual(wallet.join(invite), {"vault": vault, "joined": True})
+            self.assertEqual(json.loads((exchange / "join-2.json").read_text()), identity)
+            self.assertEqual(wallet.vault_dir(vault)[1]["slot"], 2)
+
+    def test_remote_join_keeps_membership_uncommitted_until_transport_is_saved(self):
+        with tempfile.TemporaryDirectory(prefix="loki-remote-join-retry-") as temp:
+            root = Path(temp)
+            wallet = Wallet(root / "member", root / "exchange")
+            self.addCleanup(wallet.close)
+            wallet.profile_data = {"id": "profile"}
+            wallet.passphrase = "example passphrase"
+            vault, secret = "a" * 64, "invite secret"
+            origin = "https://setup.example.invalid"
+            exchange = wallet.exchange / vault
+            draft = {"vault": vault, "name": "Treasury", "members": 3, "threshold": 2,
+                     "expires_at": 9999999999,
+                     "invites": {"2": hashlib.sha256(secret.encode()).hexdigest(), "3": "unused"}}
+            invite = encoded({"vault": vault, "slot": 2, "secret": secret, "url": origin})
+            identity = {"id": 2, "signing": "b" * 64, "encryption": "c" * 64}
+
+            def command(action, member, *_args, **_kwargs):
+                if action == "identity":
+                    secrets_dir = member / "secrets"
+                    secrets_dir.mkdir(exist_ok=True)
+                    (secrets_dir / "identity.sealed").write_bytes(b"saved sealed identity")
+                if action in ("identity", "identity-public"):
+                    return json.dumps(identity)
+                raise AssertionError(action)
+
+            def claim(*_args):
+                exchange.mkdir(exist_ok=True)
+                (exchange / "draft.json").write_text(json.dumps(draft))
+
+            original_write = member_app.write_new
+            failed = False
+
+            def fail_transport_once(path, value, mode=0o600):
+                nonlocal failed
+                if path.name == "transport.json" and not failed:
+                    failed = True
+                    raise OSError("transport write interrupted")
+                return original_write(path, value, mode)
+
+            with patch.object(wallet, "claim_remote", side_effect=claim), \
+                 patch.object(wallet, "command", side_effect=command), \
+                 patch.object(wallet, "ensure_sync"), \
+                 patch("member_app.write_new", side_effect=fail_transport_once):
+                with self.assertRaisesRegex(OSError, "transport write interrupted"):
+                    wallet.join(invite)
+                member = wallet.data / "vaults" / vault
+                self.assertFalse((member / "membership.json").exists())
+                self.assertEqual(wallet.join(invite), {"vault": vault, "joined": True})
+                self.assertTrue((member / "transport.json").exists())
+
+    def test_join_does_not_follow_a_partial_member_symlink(self):
+        with tempfile.TemporaryDirectory(prefix="loki-join-symlink-") as temp:
+            root = Path(temp)
+            wallet = Wallet(root / "member", root / "exchange")
+            self.addCleanup(wallet.close)
+            wallet.profile_data = {"id": "profile"}
+            wallet.passphrase = "example passphrase"
+            vault, secret = "a" * 64, "invite secret"
+            exchange = wallet.exchange / vault
+            exchange.mkdir()
+            (exchange / "draft.json").write_text(json.dumps({
+                "vault": vault, "name": "Treasury", "members": 3, "threshold": 2,
+                "expires_at": 9999999999,
+                "invites": {"2": hashlib.sha256(secret.encode()).hexdigest(), "3": "unused"}}))
+            (wallet.data / "vaults").mkdir()
+            outside = root / "outside"
+            outside.mkdir()
+            (wallet.data / "vaults" / vault).symlink_to(outside)
+            with patch.object(wallet, "command", side_effect=AssertionError("followed symlink")):
+                with self.assertRaisesRegex(ValueError, "symbolic link"):
+                    wallet.join(encoded({"vault": vault, "slot": 2, "secret": secret}))
+            self.assertEqual(list(outside.iterdir()), [])
+
     def test_sync_stops_after_all_final_reports(self):
         with tempfile.TemporaryDirectory(prefix="loki-sync-done-") as temp:
             wallet = Wallet(Path(temp) / "member", Path(temp) / "exchange")

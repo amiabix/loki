@@ -195,6 +195,47 @@ fn balance(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn select_notes<'a>(
+    available: &'a [scan::VaultNote],
+    fvk: &orchard::keys::FullViewingKey,
+    recipient: Address,
+    amount: Zatoshis,
+    memo: &MemoBytes,
+    target_height: u32,
+    expiry_height: u32,
+) -> Result<(Vec<&'a scan::VaultNote>, u64), String> {
+    let mut by_value = available.iter().collect::<Vec<_>>();
+    by_value.sort_by_key(|note| std::cmp::Reverse(note.value_zat));
+    let mut selected = Vec::new();
+    let mut total = 0u64;
+    // shortcut: at most eight inputs; revisit when vaults accumulate more small notes.
+    for note in by_value.into_iter().take(8) {
+        selected.push(note);
+        total = total
+            .checked_add(note.value_zat)
+            .ok_or("vault balance exceeds u64")?;
+        let inputs = CandidateInputs {
+            vault_fvk: fvk,
+            notes: selected.iter().map(|note| note.note).collect(),
+            recipient,
+            amount,
+            memo: memo.clone(),
+            change: Zatoshis::ZERO,
+            target_height,
+            expiry_height,
+        };
+        let fee = u64::from(quote_fee(&Regtest, &inputs)?);
+        if total
+            >= u64::from(amount)
+                .checked_add(fee)
+                .ok_or("amount plus fee overflows")?
+        {
+            return Ok((selected, fee));
+        }
+    }
+    Err("vault notes do not cover the amount and fee (maximum eight inputs)".into())
+}
+
 fn prepare(args: &[String]) -> Result<(), String> {
     if args.len() != 7 && args.len() != 8 {
         return Err("prepare <member-dir> <passphrase-file> <roster.json> <work-dir> <recipient-UA> <amount-zat> <memo> [AB|AC|AD|BC|BD|CD]".into());
@@ -228,31 +269,24 @@ fn prepare(args: &[String]) -> Result<(), String> {
         .div_ceil(1_152)
         .checked_mul(1_152)
         .ok_or("expiry overflow")?;
-    // shortcut: this bridge selects one fresh covering note; a wallet needs spentness and coin selection.
-    let (note, fee_zat, change_zat) = chain
-        .notes
+    let (notes, fee_zat) = select_notes(
+        &chain.notes,
+        &member.fvk,
+        recipient,
+        amount,
+        &memo,
+        tip,
+        expiry,
+    )?;
+    let total = notes
         .iter()
-        .rev()
-        .find_map(|note| {
-            let inputs = CandidateInputs {
-                vault_fvk: &member.fvk,
-                notes: vec![note.note],
-                recipient,
-                amount,
-                memo: memo.clone(),
-                change: Zatoshis::ZERO,
-                target_height: tip,
-                expiry_height: expiry,
-            };
-            let fee = u64::from(quote_fee(&Regtest, &inputs).ok()?);
-            let change = note.value_zat.checked_sub(amount_zat.checked_add(fee)?)?;
-            Some((note, fee, change))
-        })
-        .ok_or("no single vault note covers the amount and fee")?;
+        .try_fold(0u64, |sum, note| sum.checked_add(note.value_zat))
+        .ok_or("vault balance exceeds u64")?;
+    let change_zat = total - amount_zat - fee_zat;
     let intent = Intent {
         proposer: member.key.identifier().serialize(),
         created_height: tip,
-        input_nullifiers: vec![note.nullifier],
+        input_nullifiers: notes.iter().map(|note| note.nullifier).collect(),
         recipient: recipient.to_raw_address_bytes().to_vec(),
         amount_zat,
         memo: args[6].as_bytes().to_vec(),
@@ -1339,6 +1373,64 @@ fn main() {
 mod tests {
     use super::*;
     use loki_poc::payment_manifest::{manifest_pair, proposer_id};
+
+    #[test]
+    fn payment_selection_combines_notes_when_no_single_note_covers_amount() {
+        use orchard::{
+            note::{RandomSeed, Rho},
+            value::NoteValue,
+            Note, NoteVersion,
+        };
+        let (_, public) = frost::keys::generate_with_dealer(
+            3,
+            2,
+            frost::keys::IdentifierList::Default,
+            rand_core::OsRng,
+        )
+        .unwrap();
+        let ak: [u8; 32] = public
+            .verifying_key()
+            .serialize()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let fvk = vault::test_only_fvk(&ak).unwrap();
+        let notes = [30_000_000, 35_000_000]
+            .into_iter()
+            .enumerate()
+            .map(|(i, value)| {
+                let rho = Rho::from_bytes(&[i as u8 + 1; 32]).unwrap();
+                let rseed = RandomSeed::from_bytes([i as u8 + 3; 32], &rho).unwrap();
+                let note = Note::from_parts(
+                    fvk.address_at(0u64, Scope::External),
+                    NoteValue::from_raw(value),
+                    rho,
+                    rseed,
+                    NoteVersion::V3,
+                )
+                .unwrap();
+                scan::VaultNote {
+                    height: 20,
+                    txid: format!("{i}"),
+                    position: i as u64,
+                    value_zat: value,
+                    cmx: [i as u8; 32],
+                    nullifier: note.nullifier(&fvk).to_bytes(),
+                    note,
+                }
+            })
+            .collect::<Vec<_>>();
+        let amount = Zatoshis::from_u64(50_000_000).unwrap();
+        let memo = MemoBytes::from_bytes(b"two notes").unwrap();
+        let recipient = fvk.address_at(7u64, Scope::External);
+        let (selected, fee) =
+            select_notes(&notes, &fvk, recipient, amount, &memo, 20, 9_216).unwrap();
+        assert_eq!(
+            selected.iter().map(|n| n.value_zat).collect::<Vec<_>>(),
+            vec![35_000_000, 30_000_000]
+        );
+        assert!(65_000_000 >= 50_000_000 + fee);
+    }
 
     #[test]
     fn mined_spend_discovery_requires_all_intent_inputs_in_one_transaction() {
