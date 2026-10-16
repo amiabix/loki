@@ -5,6 +5,13 @@
 Date 2026-10-03. Standalone: no FROST, no PCZTs, no chain, no G1 state. The subject is the
 nonce store and what a browser plus three relays can and cannot promise about it.
 
+**Browser exposure check (2026-10-16):** this standalone page stores each unspent test
+nonce as a plain `secret` field in IndexedDB and exposes the store on `window.__store`.
+A same-origin script read that field in Chromium. G3 tests nonce *reuse* under crashes;
+it does not protect nonce secrecy from code running at the page's origin. Do not wire
+this store into the wallet signer. The current wallet signs in the local Rust process,
+with its nonce file sealed outside browser storage.
+
 **G3 stays PARTIAL.** No physical device case has been run: no power loss, no OS backup
 restore, no device transfer. A renderer crash and a `SIGKILL` on a desktop browser are not
 device crashes. Every unrun case is listed under

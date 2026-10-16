@@ -20,6 +20,30 @@ async function open(browser, url) {
   return {context, page, errors};
 }
 
+// The current signer is a local Rust process. Its one-use FROST nonce material
+// must not migrate into browser storage or payment API traffic as the UI evolves.
+function watchBrowserNonceBoundary(page) {
+  const bodies = [];
+  page.on('request', request => {
+    if (new URL(request.url()).pathname.startsWith('/api/'))
+      bodies.push(Promise.resolve(request.postData() || ''));
+  });
+  page.on('response', response => {
+    if (new URL(response.url()).pathname.startsWith('/api/'))
+      bodies.push(response.text().catch(() => ''));
+  });
+  return async () => {
+    const databases = await page.evaluate(() => indexedDB.databases());
+    assert.deepEqual(databases, [], 'payment page created browser IndexedDB state');
+    const browserStorage = await page.evaluate(() =>
+      JSON.stringify({local: {...localStorage}, session: {...sessionStorage}}));
+    for (const body of [...await Promise.all(bodies), browserStorage]) {
+      assert.doesNotMatch(body, /"(?:nonce|nonces|nonce_secret|signing_nonces|secret|signing_share|key_package)"\s*:/i,
+        'payment page received or stored signer secret material');
+    }
+  };
+}
+
 async function setup(browser, config) {
   const members = await Promise.all(config.urls.map(url => open(browser, url)));
   try {
@@ -150,6 +174,7 @@ async function relay(browser, config) {
 async function payment(browser, config) {
   const members = await Promise.all(config.urls.slice(0, 2).map(url => open(browser, url)));
   try {
+    const checkNonceBoundaries = members.map(({page}) => watchBrowserNonceBoundary(page));
     for (const {page} of members) {
       await wait(page, '#home');
       await page.locator('.vault-row').click();
@@ -164,8 +189,15 @@ async function payment(browser, config) {
     await creator.locator('#payment-draft button').click();
     await creator.locator('#draft-result').waitFor({state: 'visible'});
     const reviewedRecipients = [];
-    for (const {page} of members) {
-      await page.getByRole('button', {name: 'Approve this exact transaction'}).waitFor({timeout: 180000});
+    for (const [index, {page}] of members.entries()) {
+      try {
+        await page.getByRole('button', {name: 'Approve this exact transaction'}).waitFor({timeout: 180000});
+      } catch (error) {
+        await checkNonceBoundaries[index]();
+        const updates = await page.locator('#payment-updates').textContent();
+        const status = await page.locator('#payment-list').textContent();
+        throw new Error(`approval unavailable: ${updates} | ${status}`, {cause: error});
+      }
       const summary = await page.locator('#payment-list pre').textContent();
       const reviewed = summary.match(/^Recipient: (uregtest1\S+)/m)?.[1];
       assert.ok(reviewed, 'review lacks a shielded recipient');
@@ -183,6 +215,7 @@ async function payment(browser, config) {
       }, null, {timeout: 180000});
     }
     assert.equal(new Set(reviewedRecipients).size, 1, 'the two signers reviewed different recipients');
+    for (const check of checkNonceBoundaries) await check();
     for (const member of members) {
       assert.deepEqual(member.errors, []);
       await member.context.close();
