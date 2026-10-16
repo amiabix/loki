@@ -240,12 +240,25 @@ ths --name loki-app-flow start --no-open --port-offset 280  # keep this running
 LOKI_THS_INSTANCE=loki-app-flow python3 poc/wallet/test_relay_payment_flow.py -v
 ```
 
-This is three private processes on one host and three relays under one test
-operator. It does not prove physical-device operation or independent relay
-operators. The finisher learns the broadcast txid and can mark that payment
-confirmed; the other apps see the changed vault balance but do not yet receive
-an authenticated executed-payment notice, so their payment rows can remain at
-Approved. For a physical-device acceptance run, use a trusted HTTPS setup
+For the same journey through three real Chromium windows, run the opt-in browser
+test with the same THS instance after installing `poc/g3`'s Playwright packages:
+
+```sh
+npm ci --prefix poc/g3
+LOKI_THS_INSTANCE=loki-app-flow python3 poc/wallet/test_real_browser_flow.py -v
+```
+
+Each browser controls a different private app process. The browser test checks
+the backup gate, relay connection, both transaction review panels, two approvals,
+the third member's Send action, and confirmation in all three windows. Members
+discover the mined txid from its input nullifiers and then verify its exact
+approved effects; confirmation does not depend on the finisher announcing a txid.
+The chain lookup scans blocks from the proposal height on each pending check and
+is a test path, not the indexed sync a released wallet needs.
+
+These tests run three private processes on one host and three relays under one
+test operator. They do not prove physical-device operation or independent relay
+operators. For a physical-device acceptance run, use a trusted HTTPS setup
 courier, three independently operated HTTPS relays with a separate kit on each
 device, and a shared regtest chain connection. Record only public evidence:
 matching roster fingerprints, each member's final-card check and relay status,

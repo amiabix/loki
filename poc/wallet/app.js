@@ -146,8 +146,8 @@ function vaultList(vaults) {
 }
 /* ── one payment, five stages ───────────────────────────────────────────────
    A member is told where the payment is, never which protocol call comes next.
-   Every mechanical step — publish, commit, package, finish, resend, the
-   on-chain check — is performed by payment-advance on a poll. Exactly two
+   Every mechanical step — publish, commit, package, resend, the on-chain
+   check — is performed by payment-advance on a poll. Exactly two
    controls remain, because exactly two things are human decisions: approving
    an exact transaction that is on screen, and sending it. */
 
@@ -169,15 +169,14 @@ const PHASES = {
   package: [1, 'waiting', 'building the exact transaction to check'],
   approval_pending_delivery: [2, 'waiting', 'delivering your approval'],
   approval_interrupted: [2, 'differs', 'your saved approval could not be reopened — retrying it'],
-  approved: [3, 'agreed', 'approved by two members'],
+  approved: [2, 'waiting', 'your approval reached the relays; waiting for another member'],
   broadcast: [4, 'waiting', 'sent — waiting for a confirmation'],
   confirmation_needs_recheck: [4, 'waiting', 'checking this device’s chain view again'],
   confirmed: [4, 'agreed', 'confirmed on chain'],
 };
 
-/* 'approved' waits for the member to press Send, 'confirmed' is done: those are
-   the two phases with no mechanical step left, so the poll leaves them alone. */
-const SETTLED = new Set(['approved', 'confirmed']);
+/* Local approval still needs chain updates; only confirmed is done. */
+const SETTLED = new Set(['confirmed']);
 
 const ZAT = 100000000n;
 
@@ -281,6 +280,7 @@ async function refreshPayments() {
     let [current, rowState, detail] =
       PHASES[payment.phase] || [0, 'waiting', payment.phase.replaceAll('_', ' ')];
     if (review && current === 1) [current, rowState, detail] = [2, 'waiting', 'your approval is the next step'];
+    if (payment.ready_to_send) [current, rowState, detail] = [3, 'agreed', 'two approvals verified; ready to send'];
 
     const card = document.createElement('section');
     card.className = 'card';
@@ -318,18 +318,19 @@ async function refreshPayments() {
       }));
     }
 
-    if (payment.phase === 'approved') {
-      const scanned = state.scan_height == null
+    if (payment.ready_to_send) {
+      const readiness = state.readiness || {};
+      const scanned = readiness.scan_height == null
         ? 'This device has not scanned the chain yet.'
-        : `This device has scanned the chain to block ${state.scan_height}.`;
-      if (state.relay_ready === true) {
-        card.append(note(`${state.relay_detail || 'The relay is reachable.'} ${scanned}`));
+        : `This device has scanned the chain to block ${readiness.scan_height}.`;
+      if (readiness.relay_ready === true) {
+        card.append(note(`${readiness.relay_detail || 'The relay is reachable.'} ${scanned}`));
         card.append(paymentButton('Send this payment', async () => {
           await api('payment-finish', {vault, attempt: payment.attempt});
           message('Sent. Waiting for a confirmation on this device’s chain view.');
         }));
       } else {
-        card.append(note(`Cannot send yet. ${state.relay_detail || 'This device cannot reach the relay.'} ${scanned}`, 'warning'));
+        card.append(note(`Cannot send yet. ${readiness.relay_detail || 'This device cannot reach the relay.'} ${scanned}`, 'warning'));
       }
     }
     list.append(card);
@@ -699,7 +700,16 @@ async function refresh() {
         $('agree').hidden = state.phase === 'creating_keys';
         $('fingerprint').textContent = state.fingerprint;
       } else if (state.phase === 'back_up') $('backup').hidden = false;
-      else if (state.phase === 'waiting_for_backups') $('waiting').hidden = false;
+      else if (state.phase === 'waiting_for_backups') {
+        $('waiting').hidden = false;
+        const hosted = state.transport === 'hosted';
+        const arrived = state.backup_checks_received || 0;
+        $('backup-progress').textContent = hosted
+          ? 'Waiting for the other members’ backup checks. Setup continues automatically.'
+          : `${arrived} of ${state.total_members} backup checks have arrived.`;
+        $('activate').hidden = hosted;
+        $('activate').querySelector('button').disabled = arrived < state.total_members;
+      }
       else if (state.phase === 'final_backup') {
         $('final-backup').hidden = false;
         $('make-final-backup').hidden = !!state.final_card_created;

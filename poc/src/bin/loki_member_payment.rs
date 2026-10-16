@@ -1187,6 +1187,60 @@ fn verify(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn mined_spend_in_block(
+    block: &serde_json::Value,
+    inputs: &[[u8; 32]],
+) -> Result<Option<String>, String> {
+    if inputs.is_empty() {
+        return Err("payment has no input nullifiers".into());
+    }
+    let transactions = block["tx"].as_array().ok_or("block has no tx array")?;
+    for tx in transactions {
+        let Some(actions) = tx["ironwood"]["actions"].as_array() else {
+            continue;
+        };
+        let nullifiers = actions
+            .iter()
+            .map(|action| scan::hex32(action, "nullifier").ok_or("invalid mined nullifier"))
+            .collect::<Result<Vec<_>, _>>()?;
+        if inputs.iter().all(|input| nullifiers.contains(input)) {
+            return tx["txid"]
+                .as_str()
+                .map(str::to_owned)
+                .map(Some)
+                .ok_or_else(|| "mined spend has no transaction ID".into());
+        }
+    }
+    Ok(None)
+}
+
+/// Chain-derived txid discovery is a hint only. `verify` checks the exact
+/// approved candidate against the mined transaction before the app confirms it.
+fn find_mined(args: &[String]) -> Result<(), String> {
+    if args.len() != 4 {
+        return Err("find-mined <member-dir> <passphrase-file> <roster.json> <work-dir>".into());
+    }
+    let (member, _, _) = state(args)?;
+    let work = Path::new(&args[3]);
+    private_work(work)?;
+    let (context, intent) = manifest(&work.join("payment.json"))?;
+    check_manifest_roster(&member.roster, &context, &intent)?;
+    let rpc = Rpc::regtest();
+    let tip = rpc
+        .json("getblockcount", "[]")?
+        .as_u64()
+        .ok_or("getblockcount did not return a height")?;
+    for height in u64::from(intent.created_height)..=tip {
+        let block = rpc.json("getblock", &format!("[\"{height}\", 2]"))?;
+        if let Some(txid) = mined_spend_in_block(&block, &intent.input_nullifiers)? {
+            println!("mined txid={txid}");
+            return Ok(());
+        }
+    }
+    println!("not mined");
+    Ok(())
+}
+
 fn receive(args: &[String]) -> Result<(), String> {
     if args.len() != 5 {
         return Err("receive <recipient-member-dir> <passphrase-file> <roster.json> <payment-work-dir> <txid>".into());
@@ -1267,6 +1321,7 @@ fn main() {
         Some("resend") => resend(&args[2..]),
         Some("finish") => finish(&args[2..], true),
         Some("finish-check") => finish(&args[2..], false),
+        Some("find-mined") => find_mined(&args[2..]),
         Some("verify") => verify(&args[2..]),
         Some("receive") => receive(&args[2..]),
         _ => Err(
@@ -1284,6 +1339,23 @@ fn main() {
 mod tests {
     use super::*;
     use loki_poc::payment_manifest::{manifest_pair, proposer_id};
+
+    #[test]
+    fn mined_spend_discovery_requires_all_intent_inputs_in_one_transaction() {
+        let first = [1u8; 32];
+        let second = [2u8; 32];
+        let block = json!({"tx": [
+            {"txid": "unrelated", "ironwood": {"actions": [{"nullifier": hex::encode(first)}]}},
+            {"txid": "matching", "ironwood": {"actions": [
+                {"nullifier": hex::encode(first)}, {"nullifier": hex::encode(second)}]}},
+        ]});
+        assert_eq!(
+            mined_spend_in_block(&block, &[first, second]).unwrap(),
+            Some("matching".into())
+        );
+        assert_eq!(mined_spend_in_block(&block, &[[3u8; 32]]).unwrap(), None);
+        assert!(mined_spend_in_block(&block, &[]).is_err());
+    }
 
     #[test]
     fn local_wires_excludes_received_and_other_attempts() {

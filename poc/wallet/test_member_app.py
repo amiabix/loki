@@ -106,6 +106,8 @@ class MemberWalletTest(unittest.TestCase):
                 if action == "send-signing": return f"request message={message} digest={'f' * 64} needs_route=0"
                 if action == "status":
                     return f"message sender=1 id={message} stored_whole={int(stored)}"
+                if action == "finish-check":
+                    raise ValueError("waiting for member 2 Share; sync relay inbox and retry")
                 return "ok"
 
             with patch.object(wallet, "command", side_effect=command) as mocked:
@@ -515,15 +517,76 @@ class MemberWalletTest(unittest.TestCase):
     def test_payment_advance_does_nothing_without_a_possible_step(self):
         with tempfile.TemporaryDirectory(prefix="loki-advance-idle-") as temp:
             awaiting, vault, attempt = self.payment_fixture(temp, slot=1, phase="package")
-            with patch.object(awaiting, "command") as command:
+            awaiting.relay_payment_ready = True
+            with patch.object(awaiting, "command", return_value="not mined") as command:
                 self.assertEqual(awaiting.advance_payment(vault, attempt),
                                  {"phase": "package", "did": []})
-                self.assertEqual(command.call_count, 0)
+                self.assertEqual(command.call_args.args[0], "find-mined")
             outsider, vault, attempt = self.payment_fixture(temp, slot=3, phase=None)
-            with patch.object(outsider, "command") as command:
+            outsider.relay_payment_ready = True
+            with patch.object(outsider, "command", return_value="not mined") as command:
                 self.assertEqual(outsider.advance_payment(vault, attempt),
                                  {"phase": "received", "did": []})
-                self.assertEqual(command.call_count, 0)
+                self.assertEqual(command.call_args.args[0], "find-mined")
+            authorized, vault, attempt = self.payment_fixture(temp, slot=2, phase="approved")
+            authorized.relay_payment_ready = True
+            with patch.object(authorized, "command", return_value="not mined") as command:
+                self.assertEqual(authorized.advance_payment(vault, attempt),
+                                 {"phase": "approved", "did": []})
+                self.assertEqual(command.call_args.args[0], "find-mined")
+
+    def test_non_signer_sees_ready_only_after_verified_aggregate(self):
+        with tempfile.TemporaryDirectory(prefix="loki-payment-ready-") as temp:
+            wallet, vault, _ = self.payment_fixture(temp, slot=3, phase="received")
+
+            def complete(action, *_args, **_kwargs):
+                if action == "features":
+                    return "relay-backed-signing=1"
+                if action == "finish-check":
+                    return "aggregate verified payment=" + "e" * 64 + " sighash=" + "f" * 64
+                raise AssertionError(action)
+
+            with patch.object(wallet, "command", side_effect=complete):
+                self.assertTrue(wallet.payments(vault)["payments"][0]["ready_to_send"])
+
+            def pending(action, *_args, **_kwargs):
+                if action == "finish-check":
+                    raise ValueError("waiting for member 2 Share; sync relay inbox and retry")
+                raise AssertionError(action)
+
+            with patch.object(wallet, "command", side_effect=pending):
+                self.assertFalse(wallet.payments(vault)["payments"][0]["ready_to_send"])
+
+            def before_package(action, *_args, **_kwargs):
+                if action == "finish-check":
+                    raise ValueError("error: No such file or directory (os error 2)")
+                raise AssertionError(action)
+
+            with patch.object(wallet, "command", side_effect=before_package):
+                self.assertFalse(wallet.payments(vault)["payments"][0]["ready_to_send"])
+            wallet.payment_status(wallet.payment(vault, "b" * 64)[2], "package")
+            with patch.object(wallet, "command", side_effect=before_package):
+                self.assertFalse(wallet.payments(vault)["payments"][0]["ready_to_send"])
+
+    def test_non_finisher_finds_mined_spend_then_checks_exact_candidate(self):
+        with tempfile.TemporaryDirectory(prefix="loki-chain-discovery-") as temp:
+            wallet, vault, attempt = self.payment_fixture(temp, slot=1, phase="approved")
+            txid = "d" * 64
+            called = []
+
+            def command(action, *args, **_kwargs):
+                called.append(action)
+                if action == "features": return "relay-backed-signing=1"
+                if action == "find-mined": return f"mined txid={txid}"
+                if action == "verify":
+                    self.assertEqual(args[-1], txid)
+                    return f"verified mined txid={txid} confirmations=2 amount=40000000"
+                raise AssertionError(action)
+
+            with patch.object(wallet, "command", side_effect=command):
+                self.assertEqual(wallet.advance_payment(vault, attempt)["phase"], "confirmed")
+            self.assertIn("find-mined", called)
+            self.assertIn("verify", called)
 
     def test_payment_advance_verifies_with_the_recorded_txid(self):
         with tempfile.TemporaryDirectory(prefix="loki-advance-verify-") as temp:
@@ -749,6 +812,9 @@ class MemberWalletTest(unittest.TestCase):
                 else:
                     self.assertEqual(wallet.verify(vault, words, base64.b64encode(card).decode()),
                                      {"verified": True})
+                if index == 0:
+                    self.assertEqual(wallet.status(vault)["backup_checks_received"], 1)
+            self.assertEqual(wallets[0].status(vault)["backup_checks_received"], 3)
             for wallet in wallets:
                 wallet.activate(vault)
                 self.assertEqual(wallet.status(vault)["phase"], "final_backup")

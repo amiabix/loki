@@ -1216,7 +1216,7 @@ class Wallet:
         raise ValueError("Payment is not in this member's vault")
 
     def payments(self, vault):
-        member_dir, _ = self.vault_dir(vault)
+        member_dir, local = self.vault_dir(vault)
         if not (member_dir / "final-backup-checked").is_file():
             raise ValueError("Vault is not active")
         items = []
@@ -1228,6 +1228,22 @@ class Wallet:
                 continue
             status = self.payment_phase(path.parent)
             phase = status["phase"]
+            ready_to_send = False
+            is_signer = local["slot"] in manifest["pair"]
+            if phase in ("published", "received", "commitments", "package", "approved") \
+                    and (not is_signer or phase == "approved"):
+                try:
+                    _, _, _, checked = self.payment_command("finish-check", vault, attempt, timeout=30)
+                    expected = r"\baggregate verified payment=" + re.escape(manifest["payment"]) + \
+                               r" sighash=[0-9a-f]{64}\b"
+                    if not re.search(expected, checked):
+                        raise ValueError("Verified aggregate differs from this payment")
+                    ready_to_send = True
+                except ValueError as error:
+                    missing_early_package = phase in ("published", "received", "commitments", "package") \
+                        and "No such file or directory (os error 2)" in str(error)
+                    if not (PAYMENT_WAITING.search(str(error)) or missing_early_package):
+                        raise
             if phase == "confirmed":
                 # shortcut: recheck each confirmed payment until the wallet has an indexed chain store.
                 try:
@@ -1241,6 +1257,7 @@ class Wallet:
                     self.payment_status(path.parent, phase, status.get("txid"))
             items.append({"attempt": attempt, "payment": manifest.get("payment"),
                           "pair": manifest.get("pair"), "phase": phase,
+                          "ready_to_send": ready_to_send,
                           **({"txid": status["txid"]} if status.get("txid") else {})})
         relay_ready, relay_detail = self.payment_readiness()
         return {"payments": items,
@@ -1538,13 +1555,18 @@ class Wallet:
                 step, run = "commit", self.commit_payment
             elif phase == "commitments" and slot == pair[0]:
                 step, run = "package", self.package_payment
-            elif phase == "approved":
-                step, run = "finish", self.finish_payment
             elif phase in ("approval_pending_delivery", "approval_interrupted") and slot in pair:
                 step, run = "resend", self.resend_payment
             elif phase in ("broadcast", "confirmation_needs_recheck") and state.get("txid"):
                 step, run = "verify", self.verify_payment
             else:
+                if phase in ("published", "received", "commitments", "package", "approved"):
+                    _, _, _, found = self.payment_command("find-mined", vault, attempt, timeout=30)
+                    mined = re.search(r"^mined txid=([0-9a-f]{64})$", found.strip())
+                    if mined:
+                        self.verify_payment(vault, attempt, mined.group(1))
+                        did.append("verify")
+                        return {"phase": "confirmed", "did": did}
                 return {"phase": phase, "did": did}
             if step in did:
                 return {"phase": phase, "did": did}
@@ -1626,6 +1648,9 @@ class Wallet:
             state["phase"] = "creating_keys"
         if (self.exchange_vault(local["vault"]) / f"{local['vault']}-backup-{local['slot']}.bin").exists():
             state["phase"] = "waiting_for_backups"
+            state["backup_checks_received"] = sum(
+                (self.exchange_vault(vault) / f"{vault}-backup-{slot}.bin").is_file()
+                for slot in range(1, local["members"] + 1))
         if active:
             state["phase"] = "active" if (member_dir / "final-backup-checked").is_file() else "final_backup"
             state["final_card_created"] = (member_dir / "final-card" / "vault.card").is_file()
