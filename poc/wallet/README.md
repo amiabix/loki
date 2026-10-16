@@ -1,4 +1,38 @@
-# Member setup app
+# Member app
+
+## Public Testnet UI
+
+The same member app can create a Testnet vault, check backups, receive, review,
+approve, and send. Start one process per member, with a separate private data
+directory and browser window. The app needs a synced NU7 Zcash Testnet node on
+loopback; it refuses vault creation while that node is behind. The node's RPC
+cookie must be an owner-only file. Testnet vaults have a certified creation
+block, so chain scans start there.
+
+```sh
+cd poc
+cargo build --locked --bins --features relay-communication
+export LOKI_TESTNET_RPC=127.0.0.1:18232
+export LOKI_TESTNET_COOKIE_FILE=/path/to/your/testnet-rpc.cookie
+python3 wallet/member_app.py --network testnet \
+  --data /path/to/member-1 --exchange /path/to/setup-courier --port 8801
+```
+
+Open the private signer URL printed by the app. Create or unlock your profile,
+create a vault, and share each member's invite. Every member compares the roster
+fingerprint out of band and checks their final recovery card before anyone
+deposits. Use a Testnet wallet able to send to the Ironwood pool for funding;
+there is no Testnet faucet button. Each member connects the payment relays in
+their own app before proposing or approving. A dashboard is optional: pass
+`--dashboard-port 8901` to this same command if you want one. It does not sign.
+
+For members on separate machines, each app needs its own local Testnet node or
+loopback RPC tunnel. The local setup courier needs a verified HTTPS front and
+`--invite-port` plus `--invite-origin` on the creator's app, as described below.
+Hosted setup is currently regtest only. Testnet payments through the browser
+have not yet been mined end to end; use disposable test funds.
+
+## Local regtest
 
 This is the first member-owned regtest path. Run one app process per person, each
 with its own `--data` directory. The shared `--exchange` directory carries only

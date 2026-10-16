@@ -64,6 +64,7 @@ async function setup(browser, config) {
       await row.getByRole('button', {name: 'Show code'}).click();
       const code = await row.locator('.invite-code').textContent();
       const page = members[i].page;
+      await page.getByText('Join a vault', {exact: true}).click();
       await page.locator('#join textarea[name=invite]').fill(code.trim());
       await page.locator('#join button').click();
     }

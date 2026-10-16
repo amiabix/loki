@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-member, loopback-only regtest setup app. The exchange is an untrusted local courier."""
+"""One-member, loopback-only vault app. The exchange is an untrusted local courier."""
 
 # shortcut: timed local courier and passphrase held in this process; use resumable relays and a native key handle before custody.
 
@@ -199,9 +199,10 @@ def check_passphrase(value):
 class SignerSessions:
     """Scoped dashboard grants; the signer never exports its private app token."""
 
-    def __init__(self, dashboard_origin, now=time.time):
+    def __init__(self, dashboard_origin, now=time.time, network="regtest"):
         self.origin = dashboard_origin
         self.now = now
+        self.network = network
         self.records = {}
         self.actions = {}
         self.lock = threading.Lock()
@@ -224,8 +225,9 @@ class SignerSessions:
 
     def pending(self):
         with self.lock:
-            return [{"request": key, "origin": item["origin"], "network": "regtest",
-                     "access": "View vault status, set up local relays for all eligible vaults, and fund your eligible vaults with 5 local test ZEC per click. Vault creation needs signer approval."}
+            return [{"request": key, "origin": item["origin"], "network": self.network,
+                     "access": "View vault status and set up local relays. Vault creation needs signer approval."
+                     + (" This dashboard can fund vaults with local test ZEC." if self.network == "regtest" else "")}
                     for key, item in self.records.items()
                     if item["state"] == "pending" and item["expires"] > self.now()]
 
@@ -350,13 +352,21 @@ class SignerSessions:
 
 
 class Wallet:
-    def __init__(self, data, exchange, setup=SETUP, invite_origin=None, transport="local", operator_bundle=None, operator_key=None, enrollment_grant=None, development_http=False, enrollment_issuer=None):
+    def __init__(self, data, exchange, setup=SETUP, invite_origin=None, transport="local", operator_bundle=None, operator_key=None, enrollment_grant=None, development_http=False, enrollment_issuer=None, network="regtest"):
+        if network not in ("regtest", "testnet"):
+            raise ValueError("Choose regtest or testnet")
+        if network == "testnet" and transport == "hosted":
+            raise ValueError("Hosted setup is not yet available on Testnet; use local courier setup")
+        self.network = network
         self.data = data.resolve()
         self.exchange = exchange.resolve()
         if self.data == self.exchange or self.data in self.exchange.parents or self.exchange in self.data.parents:
             raise ValueError("member data and exchange must be separate directories")
         if (self.data / "membership.json").exists():
             raise ValueError("Existing single-vault data root; keep using the previous setup app or choose a new root")
+        for saved in (self.data / "vaults").glob("*/membership.json"):
+            if read_json(saved).get("network", "regtest") != network:
+                raise ValueError("This profile has vaults on another network; use a separate member data directory")
         self.data.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.exchange.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.data, 0o700)
@@ -415,7 +425,8 @@ class Wallet:
             except subprocess.TimeoutExpired as error:
                 raise Timeout(f"{action} did not finish within {timeout} seconds") from error
             if result.returncode:
-                raise ValueError(result.stderr.strip() or result.stdout.strip() or f"{action} failed")
+                detail = result.stderr.strip() or result.stdout.strip() or f"{action} failed"
+                raise ValueError(detail.removeprefix("error: "))
             return result.stdout.strip()
         finally:
             if passfile:
@@ -472,6 +483,8 @@ class Wallet:
         if not local.is_file():
             raise ValueError("This profile is not a member of that vault")
         membership = read_json(local)
+        if membership.get("network", "regtest") != self.network:
+            raise ValueError("This vault belongs to another network; use its member app")
         if membership.get("transport") == "hosted" and not self.hosted:
             raise ValueError("Open this profile with hosted transport and its trusted operator bundle")
         if membership.get("vault") != vault or membership.get("profile") != self.require_profile()["id"]:
@@ -608,7 +621,7 @@ class Wallet:
             raise ValueError("No vault setup is open for that ID")
         return folder
 
-    def claim_invite(self, vault, slot, secret, token):
+    def claim_invite(self, vault, slot, secret, token, network="regtest"):
         """Spend one invite for one slot, for the app that presents this token.
 
         The joining app chooses and saves its own courier token before it asks,
@@ -618,6 +631,8 @@ class Wallet:
         if not isinstance(token, str) or len(token) < 32 or len(token) > 256:
             raise ValueError("The joining app did not present a courier token")
         draft = read_json(self.courier_folder(vault) / "draft.json")
+        if network != draft.get("network", "regtest"):
+            raise ValueError("This invite is for another network")
         if type(slot) is not int or slot not in range(2, int(draft["members"]) + 1) \
                 or not isinstance(secret, str) or not secrets.compare_digest(
                     draft["invites"].get(str(slot), ""),
@@ -746,6 +761,11 @@ class Wallet:
             raise ValueError("Enter a vault name of 1 to 80 characters")
         if type(members) is not int or members not in (3, 4):
             raise ValueError("Choose a 2-of-3 or 2-of-4 vault")
+        birth_height = None
+        if self.network == "testnet":
+            birth_height = json.loads(self.command("testnet-status"))["height"]
+            if type(birth_height) is not int or not 4_465_026 <= birth_height <= 0xffffffff:
+                raise ValueError("Testnet node returned an invalid birth height")
         vault = secrets.token_hex(32)
         folder = self.exchange_vault(vault)
         folder.mkdir(mode=0o700)
@@ -756,12 +776,16 @@ class Wallet:
                  "members": members,
                  "expires_at": int(time.time()) + INVITE_TTL,
                  "invites": {str(slot): hashlib.sha256(token.encode()).hexdigest() for slot, token in tokens.items()}}
+        if self.network == "testnet":
+            draft.update(network="testnet", birth_height=birth_height)
         write_new(folder / "draft.json", json.dumps(draft).encode())
         identity = json.loads(self.command("identity", local, "1", "@pass"))
         write_new(folder / "join-1.json", json.dumps(identity).encode())
         write_new(local / "membership.json", json.dumps({"vault": vault, "slot": 1,
                                                           "name": name.strip(), "profile": profile["id"],
-                                                          "threshold": 2, "members": members}).encode())
+                                                          "threshold": 2, "members": members,
+                                                          "network": self.network,
+                                                          "birth_height": birth_height}).encode())
         invites = [encoded({"vault": vault, "slot": slot, "secret": token,
                             **({"url": self.invite_origin} if self.invite_origin else {})})
                    for slot, token in tokens.items()]
@@ -790,6 +814,11 @@ class Wallet:
         # app already recorded; the 24 hours gate the first claim, not that.
         if draft["vault"] != vault or (int(draft["expires_at"]) < time.time() and not repeat):
             raise ValueError("Invite expired or belongs to another vault")
+        if draft.get("network", "regtest") != self.network:
+            raise ValueError("Invite is for another network; open a matching member app")
+        if self.network == "testnet" and (type(draft.get("birth_height")) is not int
+                                          or not 4_465_026 <= draft["birth_height"] <= 0xffffffff):
+            raise ValueError("Testnet invite has no valid birth height")
         members = draft.get("members", 3)
         if draft.get("threshold") != 2 or type(members) is not int or members not in (3, 4) \
                 or not isinstance(draft.get("name"), str) or not 1 <= len(draft["name"].encode()) <= 80:
@@ -807,7 +836,9 @@ class Wallet:
         write_new(folder / f"join-{slot}.json", json.dumps(identity).encode())
         write_new(local / "membership.json", json.dumps({"vault": vault, "slot": slot,
                                                           "name": draft["name"], "profile": profile["id"],
-                                                          "threshold": 2, "members": members}).encode())
+                                                          "threshold": 2, "members": members,
+                                                          "network": self.network,
+                                                          "birth_height": draft.get("birth_height")}).encode())
         if origin:
             write_new(local / "transport.json", json.dumps(
                 {"vault": vault, "slot": slot, "origin": origin, "token": token}).encode())
@@ -849,7 +880,8 @@ class Wallet:
         the roster fingerprint every member compares by hand are unchanged."""
         answer = json.loads(courier_request(
             origin, "POST", f"/setup/{vault}/claim",
-            body=json.dumps({"slot": slot, "secret": secret, "token": token}).encode()))
+            body=json.dumps({"slot": slot, "secret": secret, "token": token,
+                             "network": self.network}).encode()))
         folder = self.exchange_vault(vault)
         folder.mkdir(mode=0o700, parents=True, exist_ok=True)
         draft = answer.get("draft") if isinstance(answer, dict) else None
@@ -865,6 +897,9 @@ class Wallet:
         total = local.get("members", 3)
         if draft.get("threshold") != local.get("threshold", 2) or draft.get("members", 3) != total:
             raise ValueError("Vault policy changed after joining")
+        if draft.get("network", "regtest") != local.get("network", "regtest") \
+                or draft.get("birth_height") != local.get("birth_height"):
+            raise ValueError("Vault network or birth height changed after joining")
         members = [read_json(folder / f"join-{slot}.json") for slot in range(1, total + 1)
                    if (folder / f"join-{slot}.json").exists()]
         if len(members) != total:
@@ -872,6 +907,8 @@ class Wallet:
         if [member["id"] for member in members] != list(range(1, total + 1)):
             raise ValueError("Member slots do not match the roster")
         roster = {"vault": vault, "threshold": 2, "members": members}
+        if self.network == "testnet":
+            roster.update(network="testnet", birth_height=local["birth_height"])
         write_path = member_dir / "roster.json"
         if not write_path.exists():
             write_new(write_path, json.dumps(roster).encode())
@@ -881,6 +918,8 @@ class Wallet:
         return {"members": members, "fingerprint": fingerprint}
 
     def begin_link(self, vault):
+        if self.network != "regtest":
+            raise ValueError("Reference account linking is available only on regtest")
         member_dir, local = self.vault_dir(vault)
         if (member_dir / "secrets" / "account-link.sealed").exists():
             raise ValueError("This vault membership already has an account link")
@@ -899,6 +938,8 @@ class Wallet:
         return challenge
 
     def link(self, vault, proof):
+        if self.network != "regtest":
+            raise ValueError("Reference account linking is available only on regtest")
         member_dir, _ = self.vault_dir(vault)
         challenge = member_dir / "account-challenge.json"
         if not challenge.is_file():
@@ -1097,6 +1138,8 @@ class Wallet:
             if not (restored / "roster.json").is_file() or not (restored / "secrets" / "activation.sealed").is_file():
                 raise ValueError("Use the final recovery card; the first card cannot restore an active vault")
             roster = read_json(restored / "roster.json")
+            if roster.get("network", "regtest") != self.network:
+                raise ValueError("Recovery card belongs to another network")
             vault = roster.get("vault")
             self.exchange_vault(vault)
             own = json.loads(self.command("identity-public", restored, "@pass"))
@@ -1117,7 +1160,8 @@ class Wallet:
             write_new(restored / "membership.json", json.dumps({
                 "vault": vault, "slot": own["id"], "name": name.strip(),
                 "profile": profile["id"], "threshold": roster["threshold"],
-                "members": len(members),
+                "members": len(members), "network": self.network,
+                "birth_height": roster.get("birth_height"),
             }).encode())
             os.rename(restored, destination)
             return {"vault": vault, "slot": own["id"],
@@ -1146,6 +1190,8 @@ class Wallet:
         return result
 
     def fund_vault(self, vault, request_id):
+        if self.network != "regtest":
+            raise ValueError("The local faucet cannot fund a Testnet vault")
         return fund_member(self, vault, request_id)
 
     def prepare_payment(self, vault, recipient, amount_zat, memo, pair=None):
@@ -1580,12 +1626,12 @@ class Wallet:
 
     def status(self, vault=None):
         if not (self.data / "profile" / "profile.sealed").exists():
-            return {"phase": "new_profile", "network": "regtest"}
+            return {"phase": "new_profile", "network": self.network}
         if not self.profile_data:
-            return {"phase": "locked", "network": "regtest"}
+            return {"phase": "locked", "network": self.network}
         vaults = self.vaults()
         if vault is None:
-            return {"phase": "home", "network": "regtest", "profile": self.profile_data,
+            return {"phase": "home", "network": self.network, "profile": self.profile_data,
                     "vaults": vaults, "relay_network": self.relay_network_status()}
         member_dir, local = self.vault_dir(vault)
         if local.get("transport") == "hosted":
@@ -1608,13 +1654,15 @@ class Wallet:
                       "fingerprint": self.command("validate-roster", member_dir, "@pass", roster_path)}
         else:
             roster = self.roster(vault)
-        state = {"phase": "waiting_for_members", "network": "regtest", "name": local["name"],
+        state = {"phase": "waiting_for_members", "network": self.network,
+                 "birth_height": local.get("birth_height"), "name": local["name"],
                  "slot": local["slot"], "vault": local["vault"], "members": len(roster["members"]),
                  "threshold": local.get("threshold", 2), "total_members": local.get("members", 3),
                  "fingerprint": roster["fingerprint"], "error": self.setup_errors.get(vault),
                  "profile": self.profile_data, "vaults": vaults}
         state["relay_setup"] = self.relay_status(vault)
-        state["funding"] = funding_status(self, vault)
+        state["funding"] = funding_status(self, vault) if self.network == "regtest" else {
+            "available": False, "phase": "unavailable", "detail": "Fund from a Testnet wallet."}
         state["account_linked"] = (member_dir / "secrets" / "account-link.sealed").exists()
         self.ensure_sync(vault)
         state["transport_error"] = self.transport_errors.get(vault)
@@ -1736,7 +1784,7 @@ def make_setup_server(wallet, port):
                     raise LookupError("Not found")
                 value = json.loads(self.body(4096))
                 return (wallet.claim_invite(vault, value.get("slot"), value.get("secret"),
-                                            value.get("token")),)
+                                            value.get("token"), value.get("network", "regtest")),)
             self.answer(run)
 
         def do_GET(self):
@@ -1766,7 +1814,7 @@ FONTS = ("/fonts/geist.woff2", "/fonts/geist-mono.woff2", "/fonts/young-serif.wo
 def make_signer_server(wallet, port, dashboard_port=None):
     token = secrets.token_urlsafe(32)
     dashboard_origin = f"http://127.0.0.1:{dashboard_port}" if dashboard_port else None
-    sessions = SignerSessions(dashboard_origin)
+    sessions = SignerSessions(dashboard_origin, network=wallet.network)
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
@@ -1849,11 +1897,12 @@ def make_signer_server(wallet, port, dashboard_port=None):
                         for item in wallet.vaults():
                             state = wallet.status(item["vault"])
                             vaults.append({"vault": item["vault"], "name": item["name"], "slot": item["slot"],
-                                           "phase": state["phase"],
+                                            "phase": state["phase"], "network": state["network"],
                                            **{key: state[key] for key in ("total_members", "transport", "handoff", "missing_slots", "error") if key in state},
                                            **({"funding": state["funding"]} if "funding" in state else {}),
                                            **({"relay_setup": state["relay_setup"]} if "relay_setup" in state else {})})
-                    return self.reply(200, {"profile": profile["name"], "vaults": vaults,
+                    return self.reply(200, {"profile": profile["name"], "network": wallet.network,
+                                            "vaults": vaults,
                                             "relay_network": wallet.relay_network_status()})
                 except Exception as error:
                     return self.reply(400, {"error": str(error)})
@@ -2079,7 +2128,8 @@ def serve(wallet, port, dashboard_port=None, invite_port=None):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="One member's regtest vault setup app")
+    parser = argparse.ArgumentParser(description="One member's vault app")
+    parser.add_argument("--network", choices=("regtest", "testnet"), default="regtest")
     parser.add_argument("--data", type=Path, required=True, help="private directory for this member only")
     parser.add_argument("--exchange", type=Path, required=True, help="shared untrusted local setup courier")
     parser.add_argument("--port", type=int, required=True)
@@ -2102,6 +2152,8 @@ if __name__ == "__main__":
         parser.error("Hosted transport needs --operator-bundle and --operator-key")
     if args.transport == "hosted" and args.invite_port:
         parser.error("Hosted setup uses the admission service rather than --invite-port")
+    if args.network == "testnet" and args.transport == "hosted":
+        parser.error("Hosted setup is not yet available on Testnet")
     origin = args.invite_origin
     if args.invite_port and not origin:
         origin = f"http://127.0.0.1:{args.invite_port}"
@@ -2109,5 +2161,6 @@ if __name__ == "__main__":
         parser.error("--invite-origin needs --invite-port to serve")
     serve(Wallet(args.data, args.exchange, invite_origin=origin, transport=args.transport,
                  operator_bundle=args.operator_bundle, operator_key=args.operator_key,
-                 enrollment_grant=args.enrollment_grant, development_http=args.development_http, enrollment_issuer=args.enrollment_issuer), args.port,
+                 enrollment_grant=args.enrollment_grant, development_http=args.development_http,
+                 enrollment_issuer=args.enrollment_issuer, network=args.network), args.port,
           args.dashboard_port, args.invite_port)

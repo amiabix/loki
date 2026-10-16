@@ -983,6 +983,12 @@ fn main() {
         Some("identity-public") => identity_public(&args[1..]),
         Some("profile-create") => profile_create(&args[1..]),
         Some("profile-open") => profile_open(&args[1..]),
+        Some("testnet-status") if args.len() == 1 => (|| {
+            let rpc = Rpc::testnet()?;
+            let height = rpc.json("getblockcount", "[]")?.as_u64().ok_or("Testnet height missing")?;
+            println!("{}", serde_json::json!({"network": "testnet", "height": height}));
+            Ok(())
+        })(),
         Some("address") => address(&args[1..]),
         Some("validate-roster") => validate_roster(&args[1..]),
         Some("backup-create") => backup_create(&args[1..]),

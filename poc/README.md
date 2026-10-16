@@ -6,7 +6,9 @@ transaction has a proof or an anchor.
 The separate-member local courier path also exercises 2-of-4; the relay path remains 2-of-3.
 
 The separate-member `loki_setup_member` and `loki_member_payment` commands are the
-current command-line vault path. The browser and hosted-relay flows remain regtest only.
+command-line vault path. The local member app also exposes Testnet setup and payment
+screens with operator-configured relays ([runbook](wallet/README.md)); hosted setup
+remains regtest only.
 The older `loki` binary uses a fixed test viewing-key
 tail and refuses to run unless `LOKI_ALLOW_FIXED_VIEWING_KEY=1` is explicitly set.
 The terminal research harnesses set this flag themselves. The older account demo
@@ -17,11 +19,13 @@ result documents, which are the authority.
 
 ## Public Testnet research run
 
-The separate-member CLI now accepts a `testnet` roster for a narrow two-member
-approval and a third-member finish. It needs a fully synced local NU7 Testnet Zebra
-node. The browser, hosted setup, and hosted relay signing paths do not accept
-Testnet vaults. The CLI uses a shared courier directory and its volatile signing
-attempt; both approvers must be online. This path has **not** yet mined a public
+The separate-member CLI accepts a `testnet` roster for a narrow two-member
+approval and a third-member finish. The local member app carries that network
+through create, join, backup, review, approval and send. Both paths need a fully
+synced local NU7 Testnet Zebra node. The CLI uses a shared courier directory
+and its volatile signing attempt; both approvers must be online. The browser
+path uses the relay-backed signer and needs each member's relay connection.
+Neither path has **yet** mined a public
 Testnet payment. Use disposable Testnet funds only, and do not call it a released
 wallet.
 

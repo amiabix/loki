@@ -13,10 +13,59 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
-from member_app import SEED_WALLET, SETUP, Wallet, courier_name, make_signer_server
+from member_app import SEED_WALLET, SETUP, Wallet, courier_name, decoded, make_signer_server
 
 
 class MemberWalletTest(unittest.TestCase):
+    def test_testnet_vault_records_chain_and_birth_before_inviting(self):
+        with tempfile.TemporaryDirectory(prefix="loki-testnet-ui-") as temp:
+            root = Path(temp)
+            wallet = Wallet(root / "creator", root / "courier", network="testnet")
+            self.addCleanup(wallet.close)
+            wallet.profile_data = {"id": "profile"}
+            wallet.passphrase = "a long passphrase"
+
+            def command(action, *_args, **_kwargs):
+                if action == "testnet-status":
+                    return json.dumps({"network": "testnet", "height": 4_500_000})
+                if action == "identity":
+                    return json.dumps({"id": 1, "signing": "a" * 64, "encryption": "b" * 64})
+                raise AssertionError(action)
+
+            with patch.object(wallet, "command", side_effect=command):
+                created = wallet.create("Treasury")
+            draft = json.loads((wallet.exchange / created["vault"] / "draft.json").read_text())
+            membership = json.loads((wallet.data / "vaults" / created["vault"] / "membership.json").read_text())
+            self.assertEqual((draft["network"], draft["birth_height"]), ("testnet", 4_500_000))
+            self.assertEqual((membership["network"], membership["birth_height"]), ("testnet", 4_500_000))
+            self.assertEqual(wallet.status()["network"], "testnet")
+            with self.assertRaisesRegex(ValueError, "another network"):
+                Wallet(wallet.data, wallet.exchange, network="regtest")
+            invite = decoded(created["invites"][0])
+            with self.assertRaisesRegex(ValueError, "another network"):
+                wallet.claim_invite(created["vault"], 2, invite["secret"], "t" * 32, "regtest")
+            self.assertFalse((wallet.data / "vaults" / created["vault"] / "claims.json").exists())
+
+            wrong_network = Wallet(root / "other", root / "courier")
+            self.addCleanup(wrong_network.close)
+            wrong_network.profile_data = {"id": "other"}
+            with self.assertRaisesRegex(ValueError, "another network"):
+                wrong_network.join(created["invites"][0])
+            self.assertFalse((wrong_network.data / "vaults" / created["vault"]).exists())
+            with self.assertRaisesRegex(ValueError, "local faucet"):
+                wallet.fund_vault(created["vault"], "a" * 32)
+
+    def test_testnet_creation_waits_for_synced_node_before_writing_vault(self):
+        with tempfile.TemporaryDirectory(prefix="loki-testnet-gate-") as temp:
+            root = Path(temp)
+            wallet = Wallet(root / "member", root / "courier", network="testnet")
+            self.addCleanup(wallet.close)
+            wallet.profile_data = {"id": "profile"}
+            with patch.object(wallet, "command", side_effect=ValueError("Testnet node has not reached the NU7 branch")):
+                with self.assertRaisesRegex(ValueError, "NU7"):
+                    wallet.create("Treasury")
+            self.assertFalse((wallet.data / "vaults").exists())
+
     def test_sync_stops_after_all_final_reports(self):
         with tempfile.TemporaryDirectory(prefix="loki-sync-done-") as temp:
             wallet = Wallet(Path(temp) / "member", Path(temp) / "exchange")

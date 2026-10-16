@@ -14,6 +14,7 @@ let pumping = false;
 let pumpPaused = false;
 let paymentsLive = false;
 let relaySetupPhase = null;
+let currentNetwork = 'regtest';
 const paymentReviews = new Map();
 const paymentActivity = new Map();
 
@@ -409,7 +410,7 @@ async function refreshSignerRequests(unlocked) {
     const relaySetup = action.kind === 'relay-setup';
     description.textContent = relaySetup
       ? `${action.origin} requests local test relay setup for “${action.name}”. This configures only your own membership; the other members do the same in their apps.`
-      : `${action.origin} requests a 2-of-${action.members} vault named “${action.name}” on regtest.`;
+      : `${action.origin} requests a 2-of-${action.members} vault named “${action.name}” on ${currentNetwork}.`;
     const approve = document.createElement('button');
     approve.type = 'button';
     approve.textContent = relaySetup ? 'Set up local relays' : 'Create this vault';
@@ -652,6 +653,12 @@ async function refresh() {
       state = home;
     }
     if ((state.phase === 'new_profile' || state.phase === 'locked') && selectedVault) selectVault(null);
+    currentNetwork = state.network || 'regtest';
+    const testnet = currentNetwork === 'testnet';
+    $('network-chip').textContent = testnet ? 'ZCASH TESTNET' : 'REGTEST';
+    $('build-note').textContent = testnet
+      ? 'Testnet research build. Use disposable test funds only. Each member needs their own app and a synced Testnet node; payments need configured relays.'
+      : 'Regtest test build. No real funds. Payment delivery and signing require configured relays.';
     paymentsLive = false;
     for (const id of ['new-profile', 'locked', 'home', 'invites', 'connect-account', 'setup', 'backup', 'waiting', 'final-backup', 'backup-status', 'active', 'relay-setup']) $(id).hidden = true;
     const inVault = !!selectedVault;
@@ -661,11 +668,20 @@ async function refresh() {
     if (inVault) $('vault-chip').textContent = `MEMBER ${state.slot}`;
     $('title').textContent = state.name || state.profile?.name || 'Your signer';
     if (state.phase === 'home') {
+      $('home-relays').hidden = !state.vaults?.length;
       $('setup-relays').hidden = state.relay_network?.transport === 'hosted';
       $('setup-relays').textContent = state.relay_network?.enabled ? 'Retry connections' : 'Set up relays';
       $('relay-network-detail').textContent = state.relay_network?.detail || '';
     }
-    $('subtitle').textContent = inVault ? `${state.threshold} of ${state.total_members} · regtest` : 'One local profile, separate keys for each vault.';
+    $('subtitle').textContent = inVault
+      ? `${state.threshold} of ${state.total_members} · ${testnet ? 'Testnet' : 'Regtest'}`
+      : 'One local profile, separate keys for each vault.';
+    $('vault-network-detail').textContent = testnet
+      ? `Zcash Testnet · vault starts at block ${state.birth_height}. This chain and block are part of the roster you compare.`
+      : 'Local regtest vault.';
+    $('receive-note').textContent = testnet
+      ? `Zcash Testnet address. Fund it from a wallet that can send to the Ironwood pool. Scan begins at block ${state.birth_height}.`
+      : 'Local regtest address. Fund it from the local test faucet or another regtest wallet.';
     const [kicker, headline] = steps[state.phase] || ['', ''];
     $('kicker').textContent = kicker;
     $('kicker').hidden = !kicker;
@@ -689,7 +705,7 @@ async function refresh() {
       $('home').hidden = false;
       vaultList(state.vaults);
     } else {
-      $('connect-account').hidden = state.account_linked || state.transport === 'hosted';
+      $('connect-account').hidden = testnet || state.account_linked || state.transport === 'hosted';
       if (state.invites) {
         inviteRows(state);
         $('invites').hidden = state.phase !== 'waiting_for_members';

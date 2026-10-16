@@ -33,6 +33,10 @@ async function refresh() {
   }
   try {
     const result = await call('vaults');
+    $('dashboard-network').textContent = `Vault dashboard · ${result.network === 'testnet' ? 'Testnet' : 'Regtest'}`;
+    $('funding-note').textContent = result.network === 'testnet'
+      ? 'Fund a Testnet vault from a wallet that can send to the Ironwood pool. Refresh its balance in the signer.'
+      : 'Fund Vault adds 5 local test ZEC after the final backup is checked.';
     $('connect').hidden = true;
     $('vaults').hidden = false;
     $('create-vault-card').hidden = false;
@@ -51,7 +55,7 @@ async function refresh() {
       const item = document.createElement('div');
       item.className = 'vault-item';
       const name = document.createElement('p');
-      name.textContent = `${vault.name} · 2 of ${vault.total_members || 3} · member ${vault.slot} · ${vault.phase.replaceAll('_', ' ')}`;
+      name.textContent = `${vault.name} · 2 of ${vault.total_members || 3} · member ${vault.slot} · ${vault.phase.replaceAll('_', ' ')} · ${vault.network || result.network}`;
       const fund = document.createElement('button');
       fund.type = 'button';
       fund.className = 'secondary';
@@ -63,7 +67,7 @@ async function refresh() {
       fund.textContent = busy ? 'Funding…' : ['failed', 'pending'].includes(funding.phase) ? 'Retry funding' : 'Fund Vault';
       fund.setAttribute('aria-label', `${fund.textContent} for ${vault.name}`);
       fund.title = 'Add 5 local test ZEC to this vault';
-      fund.hidden = vault.transport === 'hosted';
+      fund.hidden = vault.transport === 'hosted' || vault.network === 'testnet';
       fund.disabled = !funding.available || busy;
       fund.addEventListener('click', () => fundVault(vault));
       const relay = vault.relay_setup || {};
