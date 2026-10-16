@@ -105,7 +105,8 @@ class RelayPaymentFlowTest(unittest.TestCase):
             try:
                 return self.chain.fund(source)
             except RuntimeError as error:
-                if "'status': 'preparing'" not in str(error):
+                if not any(f"'status': '{status}'" in str(error)
+                           for status in ("preparing", "prepared")):
                     raise
                 return []  # THS's idempotency key makes the next call a status retry.
 
@@ -140,6 +141,11 @@ class RelayPaymentFlowTest(unittest.TestCase):
 
         reviews = self.wait_for(ready_to_review, lambda rows: len(rows) == 2,
                                 "two independent transaction reviews")
+        signer_attempt = (second.data / "vaults" / vault / "signing" /
+                          draft["payment"] / attempt)
+        old_signer_attempt = self.root / "old-second-signing-attempt"
+        self.assertTrue((signer_attempt / "nonces.sealed").is_file())
+        shutil.copytree(signer_attempt, old_signer_attempt)
         self.assertEqual(reviews[0]["recipient"], reviews[1]["recipient"])
         for review in reviews:
             self.assertTrue(review["recipient"].startswith("uregtest1"))
@@ -174,6 +180,17 @@ class RelayPaymentFlowTest(unittest.TestCase):
             self.wait_for(lambda app=app: app.api("balance", {"vault": vault}),
                           lambda balance: balance["balance_zat"] == int(draft["change_zat"]),
                           "each member's changed vault balance")
+
+        # A restored old signer directory must not release a second share. These
+        # are the same live relays that witnessed the mined approval above.
+        shutil.rmtree(signer_attempt)
+        shutil.copytree(old_signer_attempt, signer_attempt)
+        with self.assertRaises(join.Refused) as refused:
+            second.api("payment-approve", {"vault": vault, "attempt": attempt,
+                                           "review_token": reviews[1]["review_token"]})
+        self.assertIn("nonce relay claim", str(refused.exception))
+        self.assertFalse((signer_attempt / "decision").exists())
+        self.assertFalse((signer_attempt / "share.sealed").exists())
 
 
 if __name__ == "__main__":

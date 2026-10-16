@@ -12,6 +12,13 @@ it does not protect nonce secrecy from code running at the page's origin. Do not
 this store into the wallet signer. The current wallet signs in the local Rust process,
 with its nonce file sealed outside browser storage.
 
+**Native wallet relay drill (2026-10-16):** `test_relay_payment_flow.py` completed a
+mined 2-of-3 payment through three separate member app processes and three local
+relay servers. It then restored one signer's pre-approval attempt directory and
+retried approval. The live nonce-claim path refused the retry before saving a
+second share. This tests a simulated file rollback on one host; it does not test
+physical power loss, browser storage rollback, or independent relay operators.
+
 **G3 stays PARTIAL.** No physical device case has been run: no power loss, no OS backup
 restore, no device transfer. A renderer crash and a `SIGKILL` on a desktop browser are not
 device crashes. Every unrun case is listed under
