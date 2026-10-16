@@ -1,9 +1,11 @@
 """Read-only preflight for a locally reachable public Zcash Testnet node."""
 
 import argparse
+import base64
 import http.client
 import json
 import re
+from pathlib import Path
 from urllib.parse import urlsplit
 
 
@@ -39,19 +41,27 @@ def preflight(call):
             "ironwood_tree_available": True}
 
 
-def local_rpc(url):
+def local_rpc(url, cookie_file=None):
     endpoint = urlsplit(url)
     if (endpoint.scheme != "http" or endpoint.hostname != "127.0.0.1"
             or endpoint.username or endpoint.password or endpoint.path not in ("", "/")
             or endpoint.query or endpoint.fragment or endpoint.port is None):
         raise ValueError("pass a loopback node URL, such as http://127.0.0.1:18232")
 
+    headers = {"Content-Type": "application/json"}
+    if cookie_file is not None:
+        cookie = Path(cookie_file).read_bytes().strip()
+        username, separator, password = cookie.partition(b":")
+        if not separator or not username or not password:
+            raise ValueError("RPC cookie is malformed")
+        headers["Authorization"] = "Basic " + base64.b64encode(cookie).decode("ascii")
+
     def call(method, params):
         body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method,
                            "params": params}).encode()
         connection = http.client.HTTPConnection("127.0.0.1", endpoint.port, timeout=10)
         try:
-            connection.request("POST", "/", body, {"Content-Type": "application/json"})
+            connection.request("POST", "/", body, headers)
             response = connection.getresponse()
             raw = response.read(1_000_001)
             if response.status != 200 or len(raw) > 1_000_000:
@@ -69,9 +79,10 @@ def local_rpc(url):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rpc", required=True, help="local Testnet node or local SSH tunnel URL")
+    parser.add_argument("--cookie-file", help="Zebra RPC cookie path; never put credentials in the URL")
     args = parser.parse_args()
     try:
-        print(json.dumps(preflight(local_rpc(args.rpc)), sort_keys=True))
+        print(json.dumps(preflight(local_rpc(args.rpc, args.cookie_file)), sort_keys=True))
     except (ValueError, OSError, KeyError, json.JSONDecodeError) as error:
         parser.exit(1, f"Testnet preflight failed: {error}\n")
 

@@ -17,9 +17,12 @@ result documents, which are the authority.
 
 ## Public Testnet migration
 
-The current vault, payment, and browser flows remain regtest only. Before connecting a
-public Testnet node, run `python3 testnet.py --rpc http://127.0.0.1:8232` from `poc/`
-against a local node or a loopback SSH tunnel. This read-only check verifies the
+The current vault, payment, and browser flows remain regtest only. To check a
+public Testnet node, run
+`python3 testnet.py --rpc http://127.0.0.1:18232 --cookie-file /path/to/zebra/.cookie`
+from `poc/` against a local node or a
+loopback SSH tunnel. Zebra enables RPC cookie authentication by default; keep the
+cookie out of the URL and shell history. This read-only check verifies the
 public Testnet genesis, NU7 branch, reported sync height, and Ironwood tree RPC.
 It does not enable Testnet spending. An offline builder test also checks that the
 pinned transaction library produces a deferred Ironwood candidate under NU7.
