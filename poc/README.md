@@ -15,6 +15,21 @@ This is a prototype on a local regtest chain. **It is not a wallet and not custo
 software.** What it does and does not establish is stated precisely below and in the
 result documents, which are the authority.
 
+## Public Testnet migration
+
+The current vault, payment, and browser flows remain regtest only. Before connecting a
+public Testnet node, run `python3 testnet.py --rpc http://127.0.0.1:8232` from `poc/`
+against a local node or a loopback SSH tunnel. This read-only check verifies the
+public Testnet genesis, NU7 branch, reported sync height, and Ironwood tree RPC.
+It does not enable Testnet spending. An offline builder test also checks that the
+pinned transaction library produces a deferred Ironwood candidate under NU7.
+
+The spending path still needs network-tagged vault state, addresses and manifests;
+NU7-aware verification and expiry; a persistent Ironwood scanner and witness store
+starting at the vault birth height; then a funded payment on public Testnet. The
+current scanner rebuilds the tree from genesis and cannot serve that role. Keep
+Testnet funds out of Loki until that path and recovery have been tested separately.
+
 ## Status
 
 | | |
