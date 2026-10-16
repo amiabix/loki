@@ -1629,6 +1629,7 @@ name = "loki-poc"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "base64 0.22.1",
  "bip39",
  "blake2b_simd",
  "blake3",

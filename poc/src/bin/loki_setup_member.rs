@@ -1,5 +1,5 @@
-//! Separate-member DKG ceremony on regtest. The exchange directory is an untrusted courier.
-//! This ZIP 2005 implementation has not been independently reviewed; regtest only.
+//! Separate-member DKG ceremony. The exchange directory is an untrusted courier.
+//! This ZIP 2005 implementation has not been independently reviewed.
 
 use std::{
     collections::BTreeMap,
@@ -13,11 +13,12 @@ use std::{
 use bip39::{Language, Mnemonic};
 use blake2b_simd::Params;
 use loki_poc::{
-    distributed_setup::Member, member_state::Roster, setup_transport::Identity, state::MemberDir,
-    vault, zip2005,
+    distributed_setup::Member, member_state::Roster, network::VaultNetwork, rpc::Rpc,
+    setup_transport::Identity, state::MemberDir, vault, zip2005,
 };
 use rand_core::{OsRng, RngCore};
 use reddsa_frost::frost::redpallas as frost;
+use zcash_protocol::consensus::Parameters;
 use zeroize::Zeroize;
 
 fn hex32(text: &str) -> Result<[u8; 32], String> {
@@ -225,13 +226,15 @@ fn sealed_state(root: &Path, pass_file: &Path) -> Result<Vec<u8>, String> {
 }
 
 fn state_address(state: &serde_json::Value) -> Result<String, String> {
-    if state.get("version").and_then(|v| v.as_u64()) != Some(2)
-        || state.get("network").and_then(|v| v.as_str()) != Some("regtest")
-    {
+    if state.get("version").and_then(|v| v.as_u64()) != Some(2) {
         return Err("unsupported vault state version or network".into());
     }
+    let network = VaultNetwork::parse(state["network"].as_str().ok_or("missing vault network")?)?;
+    if network == VaultNetwork::Testnet && state["birth_height"].as_u64().is_none() {
+        return Err("Testnet vault state has no birth height".into());
+    }
     if state.get("key_derivation").and_then(|v| v.as_str()) != Some(zip2005::VERSION) {
-        return Err("unsupported key derivation; recreate this regtest vault".into());
+        return Err("unsupported key derivation; recreate this vault".into());
     }
     let ak = hex32(state["group_ak"].as_str().ok_or("missing group key")?)?;
     let sk = hex32(
@@ -241,7 +244,7 @@ fn state_address(state: &serde_json::Value) -> Result<String, String> {
     )?;
     let fvk = zip2005::frost_viewing_key(&ak, &sk)
         .map_err(|e| format!("ZIP 2005 key derivation: {e:?}"))?;
-    let expected = vault::regtest_unified_address(&fvk);
+    let expected = vault::unified_address(&fvk, network.network_type());
     if state["address"].as_str() != Some(&expected) {
         return Err("stored address differs from the derived vault address".into());
     }
@@ -357,6 +360,8 @@ fn checked_roster(state: &serde_json::Value, path: &Path) -> Result<Roster, Stri
 fn check_roster(state: &serde_json::Value, roster: &Roster) -> Result<(), String> {
     let (threshold, members) = state_policy(state)?;
     if hex::encode(roster.vault) != state["vault"]
+        || state["network"] != roster.network.label()
+        || state.get("birth_height").and_then(|v| v.as_u64()) != roster.birth_height.map(u64::from)
         || hex::encode(roster.fingerprint()) != state["roster_fingerprint"]
         || u64::from(roster.threshold) != threshold
         || roster.members.len() as u64 != members
@@ -804,6 +809,15 @@ fn run(args: &[String]) -> Result<(), String> {
             .map_err(|e| e.to_string())?,
     )?;
     let roster = Roster::load(Path::new(&args[2]))?;
+    if roster.network == VaultNetwork::Testnet {
+        let tip = Rpc::testnet()?
+            .json("getblockcount", "[]")?
+            .as_u64()
+            .ok_or("Testnet node did not report a height")?;
+        if u64::from(roster.birth_height.ok_or("missing birth height")?) > tip + 1 {
+            return Err("Testnet birth height is ahead of the node".into());
+        }
+    }
     if hex::encode(roster.fingerprint()) != args[4] {
         return Err("roster fingerprint differs from the one compared by members".into());
     }
@@ -911,11 +925,12 @@ fn run(args: &[String]) -> Result<(), String> {
     let fvk = zip2005::frost_viewing_key(&certified.group_ak, &vs)
         .map_err(|e| format!("ZIP 2005 key derivation: {e:?}"))?;
     let pass = passphrase(Path::new(&args[1]))?;
-    let address = vault::regtest_unified_address(&fvk);
+    let address = vault::unified_address(&fvk, roster.network.network_type());
     let state = serde_json::to_vec(&serde_json::json!({
         "version": 2,
         "backup_version": 2,
-        "network": "regtest",
+        "network": roster.network.label(),
+        "birth_height": roster.birth_height,
         "key_derivation": zip2005::VERSION,
         "vault": hex::encode(roster.vault),
         "threshold": roster.threshold,
@@ -932,7 +947,7 @@ fn run(args: &[String]) -> Result<(), String> {
     dir.write_sealed("vault.sealed", &state, &pass)
         .map_err(|e| e.to_string())?;
     eprintln!(
-        "REGTEST ONLY: key derivation and backup card await review. Save and verify each member's backup before the address is shown."
+        "RESEARCH WALLET: key derivation and backup card await review. Save and verify each member's backup before the address is shown."
     );
     Ok(())
 }

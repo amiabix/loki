@@ -1,17 +1,119 @@
 //! Build an authentication path for a vault note from the chain's commitment stream.
 //!
-//! The node does not hand out witnesses, so this rebuilds the Ironwood note commitment
-//! tree from every `cmx` in append order and reads the path off it. Correct because the
-//! regtest chain is short; a real wallet would keep an incremental tree instead.
+//! The node does not hand out witnesses. Regtest rebuilds from every commitment;
+//! Testnet starts from a birth checkpoint and extends incremental witnesses for
+//! notes the vault owns.
 //!
 //! The result is checked against the node's own anchor before it is used, so a mistake
 //! here fails loudly rather than producing a transaction consensus will reject.
 
-use incrementalmerkletree::{Hashable, Level};
+use incrementalmerkletree::{
+    frontier::CommitmentTree as FrontierTree, witness::IncrementalWitness, Hashable, Level,
+};
 use orchard::{
     note::ExtractedNoteCommitment,
     tree::{MerkleHashOrchard, MerklePath},
 };
+use std::{collections::BTreeMap, io::Cursor};
+use zcash_primitives::merkle_tree::read_commitment_tree;
+
+/// Witnesses for notes created after a node-provided birth-height tree checkpoint.
+pub struct BirthWitnesses {
+    tree: FrontierTree<MerkleHashOrchard, 32>,
+    witnesses: BTreeMap<u64, IncrementalWitness<MerkleHashOrchard, 32>>,
+}
+
+impl BirthWitnesses {
+    pub fn from_state(bytes: &[u8]) -> Result<Self, String> {
+        let mut cursor = Cursor::new(bytes);
+        let tree = read_commitment_tree(&mut cursor).map_err(|e| format!("Ironwood tree: {e}"))?;
+        if cursor.position() != bytes.len() as u64 {
+            return Err("Ironwood tree has trailing bytes".into());
+        }
+        Ok(Self {
+            tree,
+            witnesses: BTreeMap::new(),
+        })
+    }
+
+    pub fn append(&mut self, cmx: [u8; 32]) -> Result<u64, String> {
+        let cmx = ExtractedNoteCommitment::from_bytes(&cmx)
+            .into_option()
+            .ok_or("invalid Ironwood commitment")?;
+        let position = self.tree.size() as u64;
+        let leaf = MerkleHashOrchard::from_cmx(&cmx);
+        self.tree
+            .append(leaf)
+            .map_err(|_| "Ironwood tree is full")?;
+        for witness in self.witnesses.values_mut() {
+            witness
+                .append(leaf)
+                .map_err(|_| "Ironwood witness is full")?;
+        }
+        Ok(position)
+    }
+
+    pub fn track_latest(&mut self) -> Result<u64, String> {
+        let position = self
+            .tree
+            .size()
+            .checked_sub(1)
+            .ok_or("Ironwood tree is empty")? as u64;
+        let witness =
+            IncrementalWitness::from_tree(self.tree.clone()).ok_or("Ironwood tree is empty")?;
+        self.witnesses.insert(position, witness);
+        Ok(position)
+    }
+
+    pub fn path(&self, position: u64) -> Result<MerklePath, String> {
+        self.witnesses
+            .get(&position)
+            .and_then(IncrementalWitness::path)
+            .map(Into::into)
+            .ok_or_else(|| format!("no witness for Ironwood position {position}"))
+    }
+
+    pub fn root(&self) -> [u8; 32] {
+        self.tree.root().to_bytes()
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+    use incrementalmerkletree::frontier::CommitmentTree as FrontierTree;
+    use zcash_primitives::merkle_tree::write_commitment_tree;
+
+    fn cmx(n: u8) -> [u8; 32] {
+        let mut bytes = [0; 32];
+        bytes[0] = n;
+        bytes
+    }
+
+    #[test]
+    fn tracks_a_note_added_after_a_nonempty_checkpoint() {
+        let mut checkpoint = FrontierTree::<MerkleHashOrchard, 32>::empty();
+        let old = ExtractedNoteCommitment::from_bytes(&cmx(1))
+            .into_option()
+            .unwrap();
+        checkpoint
+            .append(MerkleHashOrchard::from_cmx(&old))
+            .unwrap();
+        let mut encoded = Vec::new();
+        write_commitment_tree(&checkpoint, &mut encoded).unwrap();
+
+        let mut tree = BirthWitnesses::from_state(&encoded).unwrap();
+        assert_eq!(tree.append(cmx(2)).unwrap(), 1);
+        tree.track_latest().unwrap();
+        tree.append(cmx(3)).unwrap();
+
+        let path = tree.path(1).unwrap();
+        let note = ExtractedNoteCommitment::from_bytes(&cmx(2))
+            .into_option()
+            .unwrap();
+        assert_eq!(path.root(note).to_bytes(), tree.root());
+    }
+}
 
 /// Orchard and Ironwood share a tree depth of 32.
 const DEPTH: usize = 32;

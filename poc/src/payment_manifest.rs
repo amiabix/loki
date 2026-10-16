@@ -2,6 +2,7 @@
 
 use crate::{
     intent::{ChangePolicy, Intent},
+    network::VaultNetwork,
     signing_session::{AttemptId, SessionContext},
 };
 use reddsa_frost::frost::redpallas as frost;
@@ -65,11 +66,18 @@ pub fn proposer_id(bytes: &[u8]) -> Result<u16, String> {
 }
 
 pub fn parse(raw: &[u8]) -> Result<(SessionContext, Intent), String> {
+    parse_for_network(raw, VaultNetwork::Regtest)
+}
+
+pub fn parse_for_network(
+    raw: &[u8],
+    network: VaultNetwork,
+) -> Result<(SessionContext, Intent), String> {
     if raw.len() > MAX_MANIFEST {
         return Err("payment manifest exceeds 8192 bytes".into());
     }
     let value: Value = serde_json::from_slice(raw).map_err(|e| format!("manifest: {e}"))?;
-    if value["version"] != 1 || value["network"] != "regtest" {
+    if value["version"] != 1 || value["network"] != network.label() {
         return Err("unsupported payment manifest".into());
     }
     let notes = value["input_nullifiers"]
@@ -229,5 +237,16 @@ mod tests {
         assert!(validate_roster([1; 32], [1, 2, 3], &context, &intent).is_err());
         assert!(validate_roster([9; 32], [1, 2], &context, &intent).is_err());
         assert_eq!(proposer_id(&intent.proposer).unwrap(), 1);
+    }
+
+    #[test]
+    fn payment_network_must_match_the_member_vault() {
+        let raw = fixture();
+        assert!(parse_for_network(&raw, VaultNetwork::Testnet).is_err());
+        let mut value: Value = serde_json::from_slice(&raw).unwrap();
+        value["network"] = json!("testnet");
+        let testnet = serde_json::to_vec(&value).unwrap();
+        assert!(parse_for_network(&testnet, VaultNetwork::Testnet).is_ok());
+        assert!(parse(&testnet).is_err());
     }
 }

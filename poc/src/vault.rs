@@ -100,11 +100,22 @@ pub fn test_only_address(fvk: &FullViewingKey) -> orchard::Address {
 ///
 /// Regtest only. The caller is responsible for the FVK's derivation and status.
 pub fn regtest_unified_address(fvk: &FullViewingKey) -> String {
-    regtest_unified_receiver(test_only_address(fvk).to_raw_address_bytes())
+    unified_address(fvk, zcash_protocol::consensus::NetworkType::Regtest)
+}
+
+pub fn unified_address(
+    fvk: &FullViewingKey,
+    network: zcash_protocol::consensus::NetworkType,
+) -> String {
+    unified_receiver(test_only_address(fvk).to_raw_address_bytes(), network)
 }
 
 /// Render an Orchard receiver exactly as a Regtest unified address for review.
 pub fn regtest_unified_receiver(raw: [u8; 43]) -> String {
+    unified_receiver(raw, zcash_protocol::consensus::NetworkType::Regtest)
+}
+
+pub fn unified_receiver(raw: [u8; 43], network: zcash_protocol::consensus::NetworkType) -> String {
     use zcash_address::{
         unified::{Address as Ua, Encoding, Receiver},
         ToAddress, ZcashAddress,
@@ -113,7 +124,7 @@ pub fn regtest_unified_receiver(raw: [u8; 43]) -> String {
     let ua = Ua::try_from_items(vec![Receiver::Orchard(raw)])
         .expect("one Orchard receiver is a valid unified address");
 
-    ZcashAddress::from_unified(zcash_protocol::consensus::NetworkType::Regtest, ua).to_string()
+    ZcashAddress::from_unified(network, ua).to_string()
 }
 
 #[cfg(test)]
@@ -255,6 +266,21 @@ mod address_tests {
             back,
             test_only_address(&fvk),
             "round trip must give the same receiver"
+        );
+    }
+
+    #[test]
+    fn testnet_address_cannot_be_used_as_regtest_address() {
+        let fvk = test_only_fvk(&real_ak()).unwrap();
+        let address = unified_address(&fvk, zcash_protocol::consensus::NetworkType::Test);
+        assert!(orchard_receiver_from_ua(
+            &address,
+            zcash_protocol::consensus::NetworkType::Regtest
+        )
+        .is_err());
+        assert!(
+            orchard_receiver_from_ua(&address, zcash_protocol::consensus::NetworkType::Test)
+                .is_ok()
         );
     }
 

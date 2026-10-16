@@ -20,6 +20,7 @@ mod coordinator;
 pub mod distributed_setup;
 pub mod intent;
 pub mod member_state;
+pub mod network;
 #[cfg(test)]
 mod nonce_binding;
 pub mod payment_manifest;

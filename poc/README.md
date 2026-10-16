@@ -6,32 +6,62 @@ transaction has a proof or an anchor.
 The separate-member local courier path also exercises 2-of-4; the relay path remains 2-of-3.
 
 The separate-member `loki_setup_member` and `loki_member_payment` commands are the
-current regtest vault path. The older `loki` binary uses a fixed test viewing-key
+current command-line vault path. The browser and hosted-relay flows remain regtest only.
+The older `loki` binary uses a fixed test viewing-key
 tail and refuses to run unless `LOKI_ALLOW_FIXED_VIEWING_KEY=1` is explicitly set.
 The terminal research harnesses set this flag themselves. The older account demo
 requires the same opt-in at server startup; the separate-member demo does not.
 
-This is a prototype on a local regtest chain. **It is not a wallet and not custody
-software.** What it does and does not establish is stated precisely below and in the
+This is research software. **It is not a custody wallet.** What it does and does not establish is stated precisely below and in the
 result documents, which are the authority.
 
-## Public Testnet migration
+## Public Testnet research run
 
-The current vault, payment, and browser flows remain regtest only. To check a
-public Testnet node, run
-`python3 testnet.py --rpc http://127.0.0.1:18232 --cookie-file /path/to/zebra/.cookie`
-from `poc/` against a local node or a
-loopback SSH tunnel. Zebra enables RPC cookie authentication by default; keep the
-cookie out of the URL and shell history. This read-only check verifies the
-public Testnet genesis, NU7 branch, reported sync height, and Ironwood tree RPC.
-It does not enable Testnet spending. An offline builder test also checks that the
-pinned transaction library produces a deferred Ironwood candidate under NU7.
+The separate-member CLI now accepts a `testnet` roster for a narrow two-member
+approval and a third-member finish. It needs a fully synced local NU7 Testnet Zebra
+node. The browser, hosted setup, and hosted relay signing paths do not accept
+Testnet vaults. The CLI uses a shared courier directory and its volatile signing
+attempt; both approvers must be online. This path has **not** yet mined a public
+Testnet payment. Use disposable Testnet funds only, and do not call it a released
+wallet.
 
-The spending path still needs network-tagged vault state, addresses and manifests;
-NU7-aware verification and expiry; a persistent Ironwood scanner and witness store
-starting at the vault birth height; then a funded payment on public Testnet. The
-current scanner rebuilds the tree from genesis and cannot serve that role. Keep
-Testnet funds out of Loki until that path and recovery have been tested separately.
+From `poc/`, first run `cargo build --locked --bins` and
+`python3 testnet.py --rpc http://127.0.0.1:18232 --cookie-file /path/to/zebra/.cookie`.
+The preflight checks genesis, NU7 branch, sync lag, and Ironwood tree availability.
+Set `LOKI_TESTNET_COOKIE_FILE` to the same owner-only cookie path; optionally set
+`LOKI_TESTNET_RPC` to a loopback `host:port` (default `127.0.0.1:18232`). Never put
+RPC credentials in a URL or command argument.
+
+1. Each member runs `loki_setup_member identity <member-dir> <id> <passphrase-file>`
+   on their own files and shares only the printed public identity. IDs are 1, 2,
+   and 3. Keep each passphrase file at mode `0600`.
+2. Assemble one identical `roster.json` with a fresh random 32-byte hex `vault`,
+   `"threshold":2`, `"network":"testnet"`, `"birth_height":<preflight height>`,
+   and the three printed identities in `members`. No one funds the vault until
+   everyone has finished backup. Every member independently runs
+   `loki_setup_member fingerprint roster.json` and compares the result through a
+   channel outside the courier.
+3. Run `loki_setup_member run <member-dir> <passphrase-file> roster.json
+   <shared-exchange-dir> <agreed-fingerprint>` in all three member processes at
+   the same time. For each member, run `backup-create`, `backup-verify`, then,
+   after all three verify, `backup-finalize`; `address` reveals the common Testnet
+   address only after the confirmations. The exact argument order and recovery
+   sequence are exercised in `tests/setup_processes.rs` and `run-member-payment.py`.
+4. Fund a single Ironwood note with a small amount of Testnet ZEC from an external
+   wallet, then check `loki_member_payment balance <member-dir> <passphrase-file>
+   roster.json`. Run `prepare <member-dir> <passphrase-file> roster.json
+   <shared-payment-dir> <recipient-Testnet-UA> <amount-zat> <memo> AB`.
+   Members 1 and 2 each run `loki_member_payment sign <their-member-dir>
+   <their-passphrase-file> roster.json <shared-payment-dir>` at the same time and
+   explicitly approve the reviewed effects. Member 3 runs the same prefix with
+   `finish` in place of `sign`, then runs `verify` with the mined txid appended.
+
+Testnet vault state binds the network and birth height into the roster fingerprint;
+the scanner starts at the preceding Ironwood tree checkpoint and verifies the
+reconstructed root before proving. It rescans from birth for each command, so a
+long-lived vault still needs a persistent witness store. ZIP 2005 key derivation
+and the recovery tool still need independent review and a public Testnet recovery
+spend before real custody use.
 
 ## Status
 

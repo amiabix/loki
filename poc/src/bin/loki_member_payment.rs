@@ -1,4 +1,4 @@
-//! Regtest bridge from separately created vaults to the volatile FROST signing session.
+//! CLI bridge from separately created vaults to the FROST signing session.
 //! The shared directory is a local test courier; it is not a wallet relay or durable inbox.
 
 use std::{
@@ -13,9 +13,10 @@ use std::{
 #[cfg(feature = "relay-communication")]
 use loki_poc::signing_session::{NonceWitness, ReviewedPackage};
 use loki_poc::{
-    candidate::{alpha_from_canonical_bytes, build_candidate, quote_fee, CandidateInputs, Regtest},
+    candidate::{alpha_from_canonical_bytes, build_candidate, quote_fee, CandidateInputs},
     intent::{ChangePolicy, Intent},
     member_state::{self, MemberState, Roster},
+    network::VaultNetwork,
     payment_manifest::validate_roster,
     rpc::Rpc,
     scan,
@@ -82,8 +83,34 @@ fn private_work(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn manifest(path: &Path) -> Result<(SessionContext, Intent), String> {
-    loki_poc::payment_manifest::parse(&fs::read(path).map_err(|e| e.to_string())?)
+fn manifest(path: &Path, network: VaultNetwork) -> Result<(SessionContext, Intent), String> {
+    loki_poc::payment_manifest::parse_for_network(
+        &fs::read(path).map_err(|e| e.to_string())?,
+        network,
+    )
+}
+
+fn member_rpc(member: &MemberState) -> Result<Rpc, String> {
+    match member.network {
+        VaultNetwork::Regtest => Ok(Rpc::regtest()),
+        VaultNetwork::Testnet => Rpc::testnet(),
+    }
+}
+
+fn member_chain(member: &MemberState, rpc: &Rpc) -> Result<(Vec<scan::VaultNote>, u64), String> {
+    match member.network {
+        VaultNetwork::Regtest => {
+            let chain = scan::scan_chain(rpc, &member.fvk)?;
+            Ok((chain.notes, chain.tip))
+        }
+        VaultNetwork::Testnet => {
+            let birth = member
+                .birth_height
+                .ok_or("Testnet vault has no birth height")?;
+            let chain = scan::scan_chain_from_birth(rpc, &member.fvk, u64::from(birth))?;
+            Ok((chain.notes, chain.tip))
+        }
+    }
 }
 
 fn check_manifest_roster(
@@ -91,6 +118,12 @@ fn check_manifest_roster(
     context: &SessionContext,
     intent: &Intent,
 ) -> Result<(), String> {
+    if roster
+        .birth_height
+        .is_some_and(|birth| intent.created_height < birth)
+    {
+        return Err("payment predates the certified vault birth height".into());
+    }
     validate_roster(
         roster.vault,
         roster.members.keys().copied(),
@@ -160,7 +193,7 @@ fn local_wires(args: &[String]) -> Result<(), String> {
     let (member, _, _) = state(args)?;
     let work = Path::new(&args[3]);
     private_work(work)?;
-    let (context, intent) = manifest(&work.join("payment.json"))?;
+    let (context, intent) = manifest(&work.join("payment.json"), member.network)?;
     check_manifest_roster(&member.roster, &context, &intent)?;
     let wires = own_wire_hashes(
         &member.identity,
@@ -181,16 +214,15 @@ fn balance(args: &[String]) -> Result<(), String> {
         Path::new(&args[1]),
         Path::new(&args[2]),
     )?;
-    let chain = scan::scan_chain(&Rpc::regtest(), &member.fvk)?;
-    let balance_zat = chain
-        .notes
+    let (notes, tip) = member_chain(&member, &member_rpc(&member)?)?;
+    let balance_zat = notes
         .iter()
         .try_fold(0u64, |sum, note| sum.checked_add(note.value_zat))
         .ok_or("vault balance exceeds u64")?;
     println!(
         "{}",
-        json!({"vault": hex::encode(member.vault), "height": chain.tip,
-               "balance_zat": balance_zat, "unspent_notes": chain.notes.len()})
+        json!({"vault": hex::encode(member.vault), "network": member.network.label(),
+               "height": tip, "balance_zat": balance_zat, "unspent_notes": notes.len()})
     );
     Ok(())
 }
@@ -209,10 +241,10 @@ fn prepare(args: &[String]) -> Result<(), String> {
     }
     let work = Path::new(&args[3]);
     private_work(work)?;
-    let rpc = Rpc::regtest();
-    let chain = scan::scan_chain(&rpc, &member.fvk)?;
-    let tip: u32 = chain.tip.try_into().map_err(|_| "height overflow")?;
-    let recipient = vault::orchard_receiver_from_ua(&args[4], Regtest.network_type())?;
+    let rpc = member_rpc(&member)?;
+    let (notes, height) = member_chain(&member, &rpc)?;
+    let tip: u32 = height.try_into().map_err(|_| "height overflow")?;
+    let recipient = vault::orchard_receiver_from_ua(&args[4], member.network.network_type())?;
     let amount_zat: u64 = args[5].parse().map_err(|_| "invalid amount")?;
     if amount_zat == 0 {
         return Err("amount must exceed zero".into());
@@ -223,14 +255,16 @@ fn prepare(args: &[String]) -> Result<(), String> {
         return Err("memo must be nonempty".into());
     }
     let expiry = tip
-        .checked_add(8_064)
+        .checked_add(match member.network {
+            VaultNetwork::Regtest => 8_064,
+            VaultNetwork::Testnet => 24_192, // roughly one week at Testnet's 25-second blocks
+        })
         .ok_or("expiry overflow")?
         .div_ceil(1_152)
         .checked_mul(1_152)
         .ok_or("expiry overflow")?;
     // shortcut: this bridge selects one fresh covering note; a wallet needs spentness and coin selection.
-    let (note, fee_zat, change_zat) = chain
-        .notes
+    let (note, fee_zat, change_zat) = notes
         .iter()
         .rev()
         .find_map(|note| {
@@ -244,7 +278,7 @@ fn prepare(args: &[String]) -> Result<(), String> {
                 target_height: tip,
                 expiry_height: expiry,
             };
-            let fee = u64::from(quote_fee(&Regtest, &inputs).ok()?);
+            let fee = u64::from(quote_fee(&member.network, &inputs).ok()?);
             let change = note.value_zat.checked_sub(amount_zat.checked_add(fee)?)?;
             Some((note, fee, change))
         })
@@ -264,7 +298,7 @@ fn prepare(args: &[String]) -> Result<(), String> {
     let payment = intent.proposal_id();
     let attempt = AttemptId::random();
     let value = json!({
-        "version": 1, "network": "regtest", "vault": hex::encode(member.vault),
+        "version": 1, "network": member.network.label(), "vault": hex::encode(member.vault),
         "payment": hex::encode(payment), "attempt": hex::encode(attempt.0), "pair": pair,
         "proposer": hex::encode(&intent.proposer), "created_height": tip,
         "input_nullifiers": intent.input_nullifiers.iter().map(hex::encode).collect::<Vec<_>>(),
@@ -324,14 +358,13 @@ fn candidate(
     pair: [u16; 2],
     peer: Vec<frost::round1::SigningCommitments>,
 ) -> Result<PackagePayload, String> {
-    let rpc = Rpc::regtest();
-    let chain = scan::scan_chain(&rpc, &member.fvk)?;
+    let rpc = member_rpc(member)?;
+    let (notes_found, _) = member_chain(member, &rpc)?;
     let notes = intent
         .input_nullifiers
         .iter()
         .map(|nf| {
-            chain
-                .notes
+            notes_found
                 .iter()
                 .find(|note| note.nullifier == *nf)
                 .map(|note| note.note)
@@ -356,7 +389,7 @@ fn candidate(
         target_height: intent.created_height,
         expiry_height: intent.expiry_height,
     };
-    if u64::from(quote_fee(&Regtest, &inputs)?) != intent.fee_zat {
+    if u64::from(quote_fee(&member.network, &inputs)?) != intent.fee_zat {
         return Err("ZIP 317 fee differs from approved intent".into());
     }
     let mut sets = Vec::new();
@@ -383,7 +416,7 @@ fn candidate(
         sets.push(set);
     }
     let built = build_candidate(
-        &Regtest,
+        &member.network,
         &inputs,
         &alphas,
         rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng),
@@ -403,6 +436,7 @@ fn candidate(
 fn confirm(
     intent: &Intent,
     summary: &loki_poc::signing_session::ReviewSummary,
+    network: VaultNetwork,
 ) -> Result<(), String> {
     if summary.payment != intent.proposal_id()
         || summary.input_nullifiers != intent.input_nullifiers
@@ -412,7 +446,7 @@ fn confirm(
     println!("Vault: {}", hex::encode(summary.vault));
     println!(
         "Recipient: {}",
-        vault::regtest_unified_receiver(summary.recipient)
+        vault::unified_receiver(summary.recipient, network.network_type())
     );
     let memo = std::str::from_utf8(&summary.memo).map_err(|_| "memo is not UTF-8")?;
     println!("Amount: {} zat; memo: {memo:?}", summary.amount_zat);
@@ -443,7 +477,7 @@ fn sign(args: &[String]) -> Result<(), String> {
     }
     let (member, owner, pass) = state(args)?;
     let own = member.identity.public().id;
-    let (context, intent) = manifest(&Path::new(&args[3]).join("payment.json"))?;
+    let (context, intent) = manifest(&Path::new(&args[3]).join("payment.json"), member.network)?;
     check_manifest_roster(&member.roster, &context, &intent)?;
     let peer_id =
         peer_in_pair(context.pair, own).ok_or("member is not in the selected payment pair")?;
@@ -506,7 +540,7 @@ fn sign(args: &[String]) -> Result<(), String> {
         )?
     };
     let reviewed = session.review_package(&package_message, &peer)?;
-    confirm(&intent, reviewed.summary())?;
+    confirm(&intent, reviewed.summary(), member.network)?;
     session.publish_approved(reviewed, &peer, &finishers, &mailbox, &pass)?;
     println!(
         "approved payment {} as member {}",
@@ -537,7 +571,7 @@ fn signing_inputs(
     if !matches!(member.roster.members.len(), 3 | 4) {
         return Err("relay signing currently supports only 2-of-3 vaults".into());
     }
-    let (context, intent) = manifest(&Path::new(&args[3]).join("payment.json"))?;
+    let (context, intent) = manifest(&Path::new(&args[3]).join("payment.json"), member.network)?;
     check_manifest_roster(&member.roster, &context, &intent)?;
     if !context.pair.contains(&member.identity.public().id) {
         return Err("member is not an approver for this payment".into());
@@ -755,7 +789,7 @@ fn reviewed_signer(
 
 #[cfg(feature = "relay-communication")]
 fn review(args: &[String]) -> Result<(), String> {
-    let (_, _, _, _, _, reviewed) = reviewed_signer(args)?;
+    let (member, _, _, _, _, reviewed) = reviewed_signer(args)?;
     let summary = reviewed.summary();
     println!(
         "{}",
@@ -764,7 +798,7 @@ fn review(args: &[String]) -> Result<(), String> {
             "payment": hex::encode(summary.payment),
             "attempt": hex::encode(summary.attempt.0),
             "pair": summary.pair,
-            "recipient": vault::regtest_unified_receiver(summary.recipient),
+            "recipient": vault::unified_receiver(summary.recipient, member.network.network_type()),
             "amount_zat": summary.amount_zat,
             "memo_hex": hex::encode(&summary.memo),
             "memo_utf8": std::str::from_utf8(&summary.memo).ok(),
@@ -806,8 +840,8 @@ fn approve(args: &[String], reviewed_token: bool) -> Result<(), String> {
     if let Some(token) = token {
         reviewed.require_review_token(token)?;
     } else {
-        let (_, intent) = manifest(&Path::new(&args[3]).join("payment.json"))?;
-        confirm(&intent, reviewed.summary())?;
+        let (_, intent) = manifest(&Path::new(&args[3]).join("payment.json"), member.network)?;
+        confirm(&intent, reviewed.summary(), member.network)?;
     }
     let mut relays = two_relays(args)?;
     session.publish_approved_secured_to_roster(
@@ -830,7 +864,7 @@ fn resend(args: &[String]) -> Result<(), String> {
     let own = member.identity.public().id;
     let work = Path::new(&args[3]);
     private_work(work)?;
-    let (context, intent) = manifest(&work.join("payment.json"))?;
+    let (context, intent) = manifest(&work.join("payment.json"), member.network)?;
     check_manifest_roster(&member.roster, &context, &intent)?;
     if !context.pair.contains(&own) {
         return Err("only a selected signer can resend".into());
@@ -853,23 +887,13 @@ fn resend(args: &[String]) -> Result<(), String> {
 fn prove(
     signed: pczt::Pczt,
     sighash: [u8; 32],
-    positions: &[(usize, u64)],
-    cmxs: &[[u8; 32]],
+    witnesses: Vec<(usize, orchard::tree::MerklePath)>,
     anchor: [u8; 32],
 ) -> Result<(Vec<u8>, String), String> {
     use pczt::roles::{
         prover::Prover, signer::Signer, spend_finalizer::SpendFinalizer,
         tx_extractor::TransactionExtractor, updater::Updater,
     };
-    let witnesses = positions
-        .iter()
-        .map(|(index, position)| {
-            Ok((
-                *index,
-                loki_poc::witness::witness_for(cmxs, *position, &anchor)?,
-            ))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
     let updated = Updater::new(signed)
         .set_ironwood_anchor(
             orchard::Anchor::from_bytes(anchor)
@@ -915,7 +939,7 @@ fn finish(args: &[String], broadcast: bool) -> Result<(), String> {
     let (member, owner, pass) = state(args)?;
     let work = Path::new(&args[3]);
     private_work(work)?;
-    let (context, intent) = manifest(&work.join("payment.json"))?;
+    let (context, intent) = manifest(&work.join("payment.json"), member.network)?;
     check_manifest_roster(&member.roster, &context, &intent)?;
     let mailbox = Mailbox::new(&work.join("mailbox")).map_err(|e| e.to_string())?;
     let own = member.identity.public().id;
@@ -972,22 +996,50 @@ fn finish(args: &[String], broadcast: bool) -> Result<(), String> {
         );
         return Ok(());
     }
-    let rpc = Rpc::regtest();
-    let chain = scan::scan_chain(&rpc, &member.fvk)?;
-    let positions = indices
-        .into_iter()
-        .zip(&intent.input_nullifiers)
-        .map(|(index, nf)| {
-            let note = chain
-                .notes
+    let rpc = member_rpc(&member)?;
+    let (witnesses, anchor) = match member.network {
+        VaultNetwork::Regtest => {
+            let chain = scan::scan_chain(&rpc, &member.fvk)?;
+            let anchor = scan::chain_anchor(&rpc, chain.tip)?;
+            let witnesses = indices
                 .iter()
-                .find(|note| note.nullifier == *nf)
-                .ok_or_else(|| format!("finisher cannot find input {}", hex::encode(nf)))?;
-            Ok((index, note.position))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let anchor = scan::chain_anchor(&rpc, chain.tip)?;
-    let (raw, txid) = prove(signed, sighash, &positions, &chain.cmxs, anchor)?;
+                .zip(&intent.input_nullifiers)
+                .map(|(index, nf)| {
+                    let note = chain
+                        .notes
+                        .iter()
+                        .find(|note| note.nullifier == *nf)
+                        .ok_or_else(|| format!("finisher cannot find input {}", hex::encode(nf)))?;
+                    Ok((
+                        *index,
+                        loki_poc::witness::witness_for(&chain.cmxs, note.position, &anchor)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            (witnesses, anchor)
+        }
+        VaultNetwork::Testnet => {
+            let birth = member
+                .birth_height
+                .ok_or("Testnet vault has no birth height")?;
+            let chain = scan::scan_chain_from_birth(&rpc, &member.fvk, u64::from(birth))?;
+            let anchor = chain.witnesses.root();
+            let witnesses = indices
+                .iter()
+                .zip(&intent.input_nullifiers)
+                .map(|(index, nf)| {
+                    let note = chain
+                        .notes
+                        .iter()
+                        .find(|note| note.nullifier == *nf)
+                        .ok_or_else(|| format!("finisher cannot find input {}", hex::encode(nf)))?;
+                    Ok((*index, chain.witnesses.path(note.position)?))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            (witnesses, anchor)
+        }
+    };
+    let (raw, txid) = prove(signed, sighash, witnesses, anchor)?;
     let sent = rpc.json(
         "sendrawtransaction",
         &format!("[\"{}\"]", hex::encode(&raw)),
@@ -1041,9 +1093,9 @@ fn verify(args: &[String]) -> Result<(), String> {
     if txid.len() != 64 || !txid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err("txid must be 32 hexadecimal bytes".into());
     }
-    let (context, intent) = manifest(&work.join("payment.json"))?;
+    let (context, intent) = manifest(&work.join("payment.json"), member.network)?;
     check_manifest_roster(&member.roster, &context, &intent)?;
-    let rpc = Rpc::regtest();
+    let rpc = member_rpc(&member)?;
     let tx_json = rpc.json("getrawtransaction", &format!("[\"{txid}\",1]"))?;
     let confirmations = tx_json["confirmations"].as_u64().unwrap_or(0);
     if confirmations < 1 {
@@ -1058,7 +1110,10 @@ fn verify(args: &[String]) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     let tx = zcash_primitives::transaction::Transaction::read(
         &raw[..],
-        zcash_protocol::consensus::BranchId::Nu6_3,
+        zcash_protocol::consensus::BranchId::for_height(
+            &member.network,
+            zcash_protocol::consensus::BlockHeight::from_u32(intent.created_height),
+        ),
     )
     .map_err(|e| format!("mined transaction parse: {e}"))?;
     if tx.txid().to_string() != *txid {
@@ -1223,9 +1278,9 @@ fn find_mined(args: &[String]) -> Result<(), String> {
     let (member, _, _) = state(args)?;
     let work = Path::new(&args[3]);
     private_work(work)?;
-    let (context, intent) = manifest(&work.join("payment.json"))?;
+    let (context, intent) = manifest(&work.join("payment.json"), member.network)?;
     check_manifest_roster(&member.roster, &context, &intent)?;
-    let rpc = Rpc::regtest();
+    let rpc = member_rpc(&member)?;
     let tip = rpc
         .json("getblockcount", "[]")?
         .as_u64()
@@ -1246,7 +1301,7 @@ fn receive(args: &[String]) -> Result<(), String> {
         return Err("receive <recipient-member-dir> <passphrase-file> <roster.json> <payment-work-dir> <txid>".into());
     }
     let (recipient, _, _) = state(args)?;
-    let (_, intent) = manifest(&Path::new(&args[3]).join("payment.json"))?;
+    let (_, intent) = manifest(&Path::new(&args[3]).join("payment.json"), recipient.network)?;
     let txid = &args[4];
     if txid.len() != 64 || !txid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err("txid must be 32 hexadecimal bytes".into());
@@ -1260,7 +1315,7 @@ fn receive(args: &[String]) -> Result<(), String> {
     {
         return Err("this member does not control the payment recipient".into());
     }
-    let rpc = Rpc::regtest();
+    let rpc = member_rpc(&recipient)?;
     let tx = rpc.json("getrawtransaction", &format!("[\"{txid}\",1]"))?;
     let confirmations = tx["confirmations"].as_u64().unwrap_or(0);
     if confirmations < 1 {
@@ -1325,8 +1380,7 @@ fn main() {
         Some("verify") => verify(&args[2..]),
         Some("receive") => receive(&args[2..]),
         _ => Err(
-            "loki_member_payment <balance|prepare|sign|resend|finish|verify|receive> ... (regtest only)"
-                .into(),
+            "loki_member_payment <balance|prepare|sign|resend|finish|verify|receive> ...".into(),
         ),
     };
     if let Err(error) = result {
