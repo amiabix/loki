@@ -384,13 +384,18 @@ class SignerSessions:
 class Wallet:
     def __init__(self, data, exchange, setup=None, invite_origin=None, transport="local", operator_bundle=None, operator_key=None, enrollment_grant=None, development_http=False, enrollment_issuer=None):
         self.data = data.resolve()
-        self.exchange = exchange.resolve()
-        if self.data == self.exchange or self.data in self.exchange.parents or self.exchange in self.data.parents:
+        # Hosted vaults never use the local courier; an exchange given for script
+        # compatibility is still checked and otherwise ignored.
+        if exchange is None and transport != "hosted":
+            raise ValueError("Local transport needs an --exchange directory")
+        self.exchange = exchange.resolve() if exchange is not None else None
+        if self.exchange and (self.data == self.exchange or self.data in self.exchange.parents or self.exchange in self.data.parents):
             raise ValueError("member data and exchange must be separate directories")
         if (self.data / "membership.json").exists():
             raise ValueError("Existing single-vault data root; keep using the previous setup app or choose a new root")
         self.data.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self.exchange.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if self.exchange:
+            self.exchange.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.data, 0o700)
         self.process_lock = open(self.data / ".app.lock", "a+b")
         try:
@@ -502,7 +507,7 @@ class Wallet:
         return self.profile_data
 
     def vault_dir(self, vault):
-        folder = self.data / "vaults" / self.exchange_vault(vault).name
+        folder = self.data / "vaults" / self.checked_vault_id(vault)
         local = folder / "membership.json"
         if not local.is_file():
             raise ValueError("This profile is not a member of that vault")
@@ -605,6 +610,9 @@ class Wallet:
             native = self.hosted._cached(member)
             return {"phase": "ready" if native.get("handoff") == "ready" else "waiting", "available": False,
                     "detail": "Hosted relays are connected." if native.get("handoff") == "ready" else "Connecting hosted relays automatically."}
+        if self.exchange is None:
+            return {"phase": "unavailable", "available": False,
+                    "detail": "This local vault needs the app started with local transport and its exchange."}
         state_path = member / "relay-setup.json"
         state = read_json(state_path) if state_path.is_file() else {}
         if state.get("mode") == "operator":
@@ -627,9 +635,16 @@ class Wallet:
                                     "Available after this member checks the final backup."),
                 "available": available}
 
-    def exchange_vault(self, vault):
+    @staticmethod
+    def checked_vault_id(vault):
         if not isinstance(vault, str) or len(vault) != 64 or any(c not in "0123456789abcdef" for c in vault):
             raise ValueError("Invalid vault ID")
+        return vault
+
+    def exchange_vault(self, vault):
+        self.checked_vault_id(vault)
+        if self.exchange is None:
+            raise ValueError("Not available with hosted transport")
         return self.exchange / vault
 
     # ── the creator's courier, reachable by the other members ───────────────
@@ -676,7 +691,7 @@ class Wallet:
         return {"draft": draft}
 
     def courier_slot(self, vault, token):
-        claims = self.data / "vaults" / self.exchange_vault(vault).name / "claims.json"
+        claims = self.data / "vaults" / self.checked_vault_id(vault) / "claims.json"
         presented = hashlib.sha256((token or "").encode()).hexdigest()
         for slot, saved in (read_json(claims) if claims.is_file() else {}).items():
             if secrets.compare_digest(saved, presented):
@@ -713,7 +728,7 @@ class Wallet:
 
         The bytes are unchanged, so every signature, roster and ciphertext check
         the file courier already made happens exactly as before."""
-        transport = self.data / "vaults" / self.exchange_vault(vault).name / "transport.json"
+        transport = self.data / "vaults" / self.checked_vault_id(vault) / "transport.json"
         worker = self.syncs.get(vault)
         if vault in self.sync_done or not transport.is_file() or (worker and worker.is_alive()):
             return
@@ -1104,7 +1119,7 @@ class Wallet:
         return {"verified": True}
 
     def backup_reports(self, vault):
-        member_dir = self.data / "vaults" / self.exchange_vault(vault).name
+        member_dir = self.data / "vaults" / self.checked_vault_id(vault)
         return json.loads(self.command("backup-reports", member_dir / "roster.json",
                                        self.exchange_vault(vault)))
 
@@ -2116,7 +2131,7 @@ def serve(wallet, port, dashboard_port=None, invite_port=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="One member's regtest vault setup app")
     parser.add_argument("--data", type=Path, required=True, help="private directory for this member only")
-    parser.add_argument("--exchange", type=Path, required=True, help="shared untrusted local setup courier")
+    parser.add_argument("--exchange", type=Path, help="shared untrusted local setup courier (local transport only)")
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--dashboard-port", type=int, help="serve a separate dashboard origin")
     parser.add_argument("--invite-port", type=int,
@@ -2141,6 +2156,8 @@ if __name__ == "__main__":
         print(f"Warning: debug binaries are slow; build release with: {BUILD}", flush=True)
     if args.transport == "hosted" and (not args.operator_bundle or not args.operator_key):
         parser.error("Hosted transport needs --operator-bundle and --operator-key")
+    if args.transport == "local" and not args.exchange:
+        parser.error("Local transport needs --exchange")
     if args.transport == "hosted" and args.invite_port:
         parser.error("Hosted setup uses the admission service rather than --invite-port")
     origin = args.invite_origin

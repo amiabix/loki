@@ -1,5 +1,8 @@
 """Public setup controller; native commands own all setup and payment authority."""
 import base64
+import collections
+import concurrent.futures
+import contextlib
 import hashlib
 import json
 import os
@@ -13,6 +16,8 @@ import time
 import timing
 
 FINGERPRINT_PHASES = ("roster_proposed", "agreement_saved", "acceptance_pending", "roster_accepted")
+# UI phases that wait for this member's own action; the worker re-checks them every 5 s.
+HUMAN_PHASES = ("compare_roster", "back_up", "final_backup")
 ROSTER_MISMATCH = "The proposed roster does not match the admitted members. Do not confirm; contact the creator"
 
 
@@ -33,17 +38,69 @@ class HostedSetup:
             raise ValueError("The enrollment issuer must be an executable")
         self.development = development
         self.stop_event = threading.Event()
-        self.command_lock = threading.Lock()
         self.process_lock = threading.Lock()
-        self.process = None
+        self.processes = set()
         self.worker = None
         self.information = {}
         self.information_at = {}
         self.errors = {}
+        # One lock per saved setup folder: native `secrets/.setup.lock` refuses a second
+        # process on the same root, so calls on one vault are serialized here while other
+        # vaults proceed. A pending user action makes the worker skip that vault.
+        self.meta_lock = threading.Lock()
+        self.vault_locks = {}
+        self.user_waiting = collections.Counter()
+        self.local = threading.local()
+        self.schedule = {}
+        self.wake = threading.Event()
+
+    def _key(self, root):
+        return Path(root).resolve()
+
+    def _vault_lock(self, root):
+        with self.meta_lock:
+            return self.vault_locks.setdefault(self._key(root), threading.RLock())
+
+    @contextlib.contextmanager
+    def user_action(self, root):
+        """Run a signer-window action on `root` ahead of background steps."""
+        key = self._key(root)
+        with self.meta_lock:
+            self.user_waiting[key] += 1
+        depth = getattr(self.local, "user", 0)
+        self.local.user = depth + 1
+        try:
+            with self._vault_lock(key):
+                yield
+        finally:
+            self.local.user = depth
+            with self.meta_lock:
+                self.user_waiting[key] -= 1
+                if not self.user_waiting[key]:
+                    del self.user_waiting[key]
+            # Whatever the member just did (agree, check a backup, ...) is new local work.
+            self.poke(key.name)
+
+    def poke(self, name):
+        self.schedule.setdefault(name, {"due": 0.0})["due"] = 0.0
+        self.wake.set()
+
+    def user_pending(self, root):
+        with self.meta_lock:
+            return self.user_waiting.get(self._key(root), 0) > 0
 
     def native(self, action, root, *args, private=None, unlocked=True):
-        with self.command_lock:
-            return self._native(action, root, *args, private=private, unlocked=unlocked)
+        with self._vault_lock(root):
+            for attempt in range(4):
+                try:
+                    return self._native(action, root, *args, private=private, unlocked=unlocked)
+                except ValueError as error:
+                    # Another tool (or a stale worker) holds the vault's native lock.
+                    if "setup_worker_locked" not in str(error) or not getattr(self.local, "user", 0):
+                        raise
+                    if attempt == 3:
+                        raise ValueError("This vault is busy in another tool; try again shortly") from error
+                    time.sleep(0.2 * (attempt + 1))
 
     def _native(self, action, root, *args, private=None, unlocked=True):
         if self.stop_event.is_set():
@@ -57,7 +114,9 @@ class HostedSetup:
             argv = [str(self.wallet.setup), action, str(root)]
             if unlocked:
                 passfile = folder / "pass"
-                self._write(passfile, self.wallet.passphrase.encode())
+                # Consumed at once and unlinked with its directory: no fsync, so the
+                # passphrase is not pushed to stable storage on every native call.
+                self._write(passfile, self.wallet.passphrase.encode(), durable=False)
                 if action == "identity":
                     argv.extend([str(args[0]), str(passfile)])
                     args = args[1:]
@@ -68,7 +127,7 @@ class HostedSetup:
                     if private is None:
                         raise ValueError("Missing private setup input")
                     path = folder / "private"
-                    self._write(path, private)
+                    self._write(path, private, durable=False)
                     argv.append(str(path))
                 else:
                     argv.append(str(arg))
@@ -76,7 +135,7 @@ class HostedSetup:
                 if self.stop_event.is_set():
                     raise ValueError("Signer is locked")
                 process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                self.process = process
+                self.processes.add(process)
             started = time.monotonic()
             try:
                 stdout, stderr = process.communicate(timeout=120)
@@ -91,16 +150,16 @@ class HostedSetup:
                 raise ValueError("Hosted setup timed out; its saved state can be retried") from error
             finally:
                 with self.process_lock:
-                    if self.process is process:
-                        self.process = None
+                    self.processes.discard(process)
 
     @staticmethod
-    def _write(path, raw):
+    def _write(path, raw, durable=True):
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(descriptor, "wb") as output:
             output.write(raw)
             output.flush()
-            os.fsync(output.fileno())
+            if durable:
+                os.fsync(output.fileno())
 
     def start(self):
         if self.worker and self.worker.is_alive():
@@ -111,57 +170,126 @@ class HostedSetup:
 
     def stop(self):
         self.stop_event.set()
+        self.wake.set()
         with self.process_lock:
-            process = self.process
-            if process and process.poll() is None:
-                process.terminate()
+            for process in self.processes:
+                if process.poll() is None:
+                    process.terminate()
         if self.worker and self.worker is not threading.current_thread():
             self.worker.join(timeout=5)
         with self.process_lock:
-            process = self.process
-            if process and process.poll() is None:
-                process.kill()
+            for process in self.processes:
+                if process.poll() is None:
+                    process.kill()
         self.information.clear()
+        self.schedule.clear()
 
     def run(self):
-        while not self.stop_event.wait(1):
-            with self.wallet.lock:
-                if self.stop_event.is_set() or not self.wallet.profile_data:
-                    continue
-                profile = self.wallet.profile_data["id"]
-                root = self.wallet.data / "vaults"
-                folders = sorted(root.glob("*"))
-            for folder in folders:
-                if self.stop_event.is_set():
-                    break
-                self.step_folder(folder, profile)
+        """Step each saved setup on its own timer, at most two vaults at a time."""
+        running = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="hosted-step") as pool:
+            while not self.stop_event.is_set():
+                now = time.monotonic()
+                with self.wallet.lock:
+                    profile = self.wallet.profile_data["id"] if self.wallet.profile_data else None
+                    folders = sorted((self.wallet.data / "vaults").glob("*")) if profile else []
+                for folder, future in list(running.items()):
+                    if future.done():
+                        del running[folder]
+                        self._reschedule(folder, future.result())
+                for folder in folders:
+                    if len(running) >= 2 or self.stop_event.is_set():
+                        break
+                    entry = self.schedule.setdefault(folder.name, {"due": 0.0})
+                    if folder.name in running or entry["due"] > now or self.user_pending(folder):
+                        continue
+                    running[folder.name] = pool.submit(self._background_step, folder, profile)
+                due = [self.schedule[name]["due"] for name in self.schedule
+                       if name not in running and (self.wallet.data / "vaults" / name).exists()]
+                wait = min([0.25, *(max(0.0, value - time.monotonic()) for value in due)])
+                self.wake.wait(max(wait, 0.01) if running or due else 0.25)
+                self.wake.clear()
+            for future in running.values():
+                future.cancel()
 
-    def step_folder(self, folder, profile):
-        """Advance one saved setup by one native step; returns the native status or None."""
+    def _background_step(self, folder, profile):
+        lock = self._vault_lock(folder)
+        if not lock.acquire(timeout=0.05):
+            return ("busy", None)
+        try:
+            if self.user_pending(folder):
+                return ("busy", None)
+            return self.step_folder(folder, profile, classify=True)
+        finally:
+            lock.release()
+
+    def _reschedule(self, name, outcome):
+        """The Finding 3 cadence: immediate after progress, short backoff while peers work,
+        5 s while this member's own action is pending, and 2 → 30 s after errors."""
+        kind, _ = outcome
+        entry = self.schedule.setdefault(name, {"due": 0.0})
+        now = time.monotonic()
+        if kind == "error":
+            entry["error"] = min(30.0, entry.get("error", 1.0) * 2)
+            entry["due"] = now + entry["error"]
+            return
+        entry.pop("error", None)
+        if kind == "progress" and entry.get("burst", 0) < 20:
+            entry["burst"] = entry.get("burst", 0) + 1
+            entry["idle"] = 0.125
+            entry["due"] = now
+            return
+        entry["burst"] = 0
+        if kind == "busy":
+            entry["due"] = now + 0.1
+        elif kind == "human":
+            entry["due"] = now + 5
+        elif kind in ("skip", "ready"):
+            entry["due"] = now + 5
+        else:
+            entry["idle"] = min(2.0, entry.get("idle", 0.125) * 2) if kind == "idle" else 0.25
+            entry["due"] = now + entry["idle"]
+
+    def step_folder(self, folder, profile, classify=False):
+        """Advance one saved setup by one native step.
+
+        Returns the native status, or with `classify` a `(kind, status)` pair for the
+        scheduler: progress, idle, human, ready, skip or error."""
+        def out(kind, result=None):
+            return (kind, result) if classify else result
         try:
             pending = folder / "pending.json"
             if folder.name.startswith(".hosted-") and pending.is_file():
                 metadata = json.loads(pending.read_text())
                 if metadata["profile"] == profile and (folder / "secrets" / "hosted-context.sealed").is_file():
                     self._attach(folder, metadata["name"])
-                return None
+                    return out("progress")
+                return out("skip")
             membership = folder / "membership.json"
             if not membership.is_file():
-                return None
+                return out("skip")
             local = json.loads(membership.read_text())
             if local.get("transport") != "hosted" or local.get("profile") != profile:
-                return None
+                return out("skip")
             prior = self._cached(folder)
             if prior.get("handoff") == "ready":
-                return None
+                return out("ready")
             result = json.loads(self.native("setup-step", folder))
             if self._needs_information(folder.name, prior.get("phase"), result.get("phase")):
                 self._refresh_information(folder)
             self.errors.pop(folder.name, None)
-            return result
+            if not classify:
+                return result
+            changed = any(prior.get(field) != result.get(field) for field in
+                          ("phase", "joined_slots", "missing_slots", "agreed_fingerprint", "handoff"))
+            if result.get("progressed") or changed:
+                return out("progress", result)
+            if self._ui_phase(folder, result) in HUMAN_PHASES:
+                return out("human", result)
+            return out("idle", result)
         except (ValueError, OSError, KeyError, json.JSONDecodeError) as error:
             self.errors[folder.name] = self._error_message(error)
-            return None
+            return out("error")
 
     def _needs_information(self, vault, before, after):
         """The roster fingerprint arrives with a phase change, but a joiner whose first
@@ -207,6 +335,7 @@ class HostedSetup:
         finally:
             os.close(descriptor)
         self.information[vault] = info
+        self.poke(vault)
         return {"vault": vault}
 
     def _pending(self, name, action, binding):
@@ -233,29 +362,30 @@ class HostedSetup:
         if not self.issuer and (not self.enrollment or not self.enrollment.is_file()):
             raise ValueError("A scoped enrollment grant or configured issuer is required")
         folder = self._pending(name.strip(), "create", policy)
-        if not (folder / "secrets" / "identity.sealed").is_file():
-            self.native("identity", folder, 1)
-        if (folder / "secrets" / "hosted-context.sealed").is_file():
-            self.native("setup-step", folder)
-            return self._attach(folder, name.strip())
-        grant = self.enrollment
-        if self.issuer:
-            identity = json.loads(self.native("identity-public", folder))
-            result = subprocess.run([str(self.issuer), "--device-key", identity["signing"],
-                                     "--operator-bundle", str(self.bundle), "--policy", policy],
-                                    capture_output=True, timeout=30)
-            if result.returncode or not 1 <= len(result.stdout) <= 4096:
-                raise ValueError("Enrollment is unavailable; the saved identity is retained")
-            raw = result.stdout
+        with self.user_action(folder):
+            if not (folder / "secrets" / "identity.sealed").is_file():
+                self.native("identity", folder, 1)
             if (folder / "secrets" / "hosted-context.sealed").is_file():
                 self.native("setup-step", folder)
+                return self._attach(folder, name.strip())
+            grant = self.enrollment
+            if self.issuer:
+                identity = json.loads(self.native("identity-public", folder))
+                result = subprocess.run([str(self.issuer), "--device-key", identity["signing"],
+                                         "--operator-bundle", str(self.bundle), "--policy", policy],
+                                        capture_output=True, timeout=30)
+                if result.returncode or not 1 <= len(result.stdout) <= 4096:
+                    raise ValueError("Enrollment is unavailable; the saved identity is retained")
+                raw = result.stdout
+                if (folder / "secrets" / "hosted-context.sealed").is_file():
+                    self.native("setup-step", folder)
+                else:
+                    self.native("setup-create", folder, self.bundle, "@private", policy,
+                                "--operator-key", self.key, *(["--development-http"] if self.development else []), private=raw)
             else:
-                self.native("setup-create", folder, self.bundle, "@private", policy,
-                            "--operator-key", self.key, *(["--development-http"] if self.development else []), private=raw)
-        else:
-            self.native("setup-create", folder, self.bundle, grant, policy,
-                        "--operator-key", self.key, *(["--development-http"] if self.development else []))
-        return self._attach(folder, name.strip())
+                self.native("setup-create", folder, self.bundle, grant, policy,
+                            "--operator-key", self.key, *(["--development-http"] if self.development else []))
+            return self._attach(folder, name.strip())
 
     def join(self, invite):
         if not isinstance(invite, str) or not invite.startswith("loki-hosted-v1:") or len(invite) > 8192:
@@ -268,40 +398,46 @@ class HostedSetup:
         if not 1 <= len(raw) <= 4096:
             raise ValueError("Invalid hosted invitation")
         folder = self._pending("Joined vault", "join", hashlib.sha256(raw).hexdigest())
-        self.native("setup-join", folder, "@private", *self._configuration_args(), private=raw)
-        return self._attach(folder, "Joined vault")
+        with self.user_action(folder):
+            self.native("setup-join", folder, "@private", *self._configuration_args(), private=raw)
+            return self._attach(folder, "Joined vault")
 
     def agree(self, vault, fingerprint):
         folder, _ = self.wallet.vault_dir(vault)
-        result = json.loads(self.native("setup-agree", folder, fingerprint))
-        return {"agreed": result["agreed_fingerprint"]}
+        with self.user_action(folder):
+            result = json.loads(self.native("setup-agree", folder, fingerprint))
+            return {"agreed": result["agreed_fingerprint"]}
 
     def drive(self, vault):
         folder, _ = self.wallet.vault_dir(vault)
-        return json.loads(self.native("setup-step", folder))
+        with self.user_action(folder):
+            return json.loads(self.native("setup-step", folder))
 
     @staticmethod
     def _cached(folder):
         path = folder / "setup-status.json"
         return json.loads(path.read_text()) if path.is_file() else {"phase": "admission_pending", "handoff": "pending", "joined_slots": [], "missing_slots": []}
 
+    def _ui_phase(self, folder, native):
+        phase = native["phase"]
+        if phase in ("aborted", "checkpoint_conflict", "expired", "admission_rejected") or self.errors.get(folder.name) == ROSTER_MISMATCH:
+            return "stopped"
+        if phase in ("roster_proposed", "agreement_saved", "acceptance_pending", "roster_accepted"):
+            return "creating_keys" if native.get("agreed_fingerprint") else "compare_roster"
+        if phase in ("round1_saved", "round2_saved", "certificate_saved"):
+            return "creating_keys"
+        if phase == "awaiting_backups":
+            return "waiting_for_backups" if (folder / "backup-checked").is_file() else "back_up"
+        if phase in ("certified", "payment_handoff", "active"):
+            return "final_backup" if not (folder / "final-backup-checked").is_file() else "active" if native.get("handoff") == "ready" else "connecting_relays"
+        return "waiting_for_members"
+
     def status(self, vault):
         folder, local = self.wallet.vault_dir(vault)
         native = self._cached(folder)
         info = self.information.get(vault, {})
         phase = native["phase"]
-        if phase in ("aborted", "checkpoint_conflict", "expired", "admission_rejected") or self.errors.get(vault) == ROSTER_MISMATCH:
-            ui_phase = "stopped"
-        elif phase in ("roster_proposed", "agreement_saved", "acceptance_pending", "roster_accepted"):
-            ui_phase = "creating_keys" if native.get("agreed_fingerprint") else "compare_roster"
-        elif phase in ("round1_saved", "round2_saved", "certificate_saved"):
-            ui_phase = "creating_keys"
-        elif phase == "awaiting_backups":
-            ui_phase = "waiting_for_backups" if (folder / "backup-checked").is_file() else "back_up"
-        elif phase in ("certified", "payment_handoff", "active"):
-            ui_phase = "final_backup" if not (folder / "final-backup-checked").is_file() else "active" if native.get("handoff") == "ready" else "connecting_relays"
-        else:
-            ui_phase = "waiting_for_members"
+        ui_phase = self._ui_phase(folder, native)
         all_agreed = phase in ("roster_accepted", "round1_saved", "round2_saved", "certificate_saved", "awaiting_backups", "certified", "payment_handoff", "active")
         confirmations = [{"slot": slot, "confirmed": all_agreed or (slot == local["slot"] and bool(native.get("agreed_fingerprint"))),
                           "matches": True} for slot in range(1, local["members"] + 1)]
@@ -322,43 +458,47 @@ class HostedSetup:
             for slot in range(2, local["members"] + 1):
                 path = invitations / str(slot)
                 if not path.exists():
-                    self.native("setup-invite", folder, slot, path)
+                    with self.user_action(folder):
+                        self.native("setup-invite", folder, slot, path)
                 code = "loki-hosted-v1:" + base64.urlsafe_b64encode(path.read_bytes()).decode().rstrip("=")
                 result["invites"].append({"slot": slot, "code": code, "joined": slot in native.get("joined_slots", []), "origin": None})
         return result
 
     def backup(self, vault):
         folder, _ = self.wallet.vault_dir(vault)
-        return {"words": self.native("setup-backup-create", folder, folder / "card")}
+        with self.user_action(folder):
+            return {"words": self.native("setup-backup-create", folder, folder / "card")}
 
     def verify(self, vault, words, card_bytes=None, final=False):
         folder, _ = self.wallet.vault_dir(vault)
-        if not isinstance(words, str):
-            raise ValueError("Enter your recovery words")
-        with tempfile.TemporaryDirectory(prefix=".hosted-card-", dir=folder) as temporary:
-            check = Path(temporary)
-            card = check / "card"
-            card.mkdir(mode=0o700)
-            raw = base64.b64decode(card_bytes, validate=True) if card_bytes is not None else (folder / "card" / "vault.card").read_bytes()
-            if not 1 <= len(raw) <= 64 * 1024 or not raw.startswith(b"LOKISEAL\x01"):
-                raise ValueError("Invalid recovery card")
-            self._write(card / "vault.card", raw)
-            self._write(check / "words", words.encode())
-            if final:
-                self.native("setup-backup-finalize", folder, folder / "card", card, check / "words")
-            else:
-                self.native("setup-backup-verify", folder, card, check / "words")
-        marker = folder / ("final-backup-checked" if final else "backup-checked")
-        if not marker.exists():
-            self._write(marker, b"checked\n")
-        return {"verified": True}
+        with self.user_action(folder):
+            if not isinstance(words, str):
+                raise ValueError("Enter your recovery words")
+            with tempfile.TemporaryDirectory(prefix=".hosted-card-", dir=folder) as temporary:
+                check = Path(temporary)
+                card = check / "card"
+                card.mkdir(mode=0o700)
+                raw = base64.b64decode(card_bytes, validate=True) if card_bytes is not None else (folder / "card" / "vault.card").read_bytes()
+                if not 1 <= len(raw) <= 64 * 1024 or not raw.startswith(b"LOKISEAL\x01"):
+                    raise ValueError("Invalid recovery card")
+                self._write(card / "vault.card", raw)
+                self._write(check / "words", words.encode())
+                if final:
+                    self.native("setup-backup-finalize", folder, folder / "card", card, check / "words")
+                else:
+                    self.native("setup-backup-verify", folder, card, check / "words")
+            marker = folder / ("final-backup-checked" if final else "backup-checked")
+            if not marker.exists():
+                self._write(marker, b"checked\n")
+            return {"verified": True}
 
     def finalize(self, vault, words=None):
         folder, _ = self.wallet.vault_dir(vault)
-        if words is not None and not isinstance(words, str):
-            raise ValueError("Enter your recovery words")
-        if words:
-            self.native("setup-backup-finalize", folder, folder / "card", folder / "final-card", "@private", private=words.encode())
-        else:
-            self.native("setup-backup-finalize", folder, folder / "card", folder / "final-card", "-")
-        return {"created": True}
+        with self.user_action(folder):
+            if words is not None and not isinstance(words, str):
+                raise ValueError("Enter your recovery words")
+            if words:
+                self.native("setup-backup-finalize", folder, folder / "card", folder / "final-card", "@private", private=words.encode())
+            else:
+                self.native("setup-backup-finalize", folder, folder / "card", folder / "final-card", "-")
+            return {"created": True}
