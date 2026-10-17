@@ -16,6 +16,7 @@ let paymentsLive = false;
 let relaySetupPhase = null;
 const paymentReviews = new Map();
 const paymentActivity = new Map();
+const paymentCards = new Map();   /* attempt → {card, sig}; rebuilt only when sig changes */
 
 function selectVault(vault) {
   selectedVault = vault;
@@ -32,6 +33,7 @@ function selectVault(vault) {
   pumpPaused = false;
   paymentReviews.clear();
   paymentActivity.clear();
+  paymentCards.clear();
   $('address').textContent = 'Open this vault to view the address.';
   $('balance').textContent = "Scan this device's chain view to see the balance.";
   $('words').textContent = '';
@@ -254,6 +256,66 @@ function note(text, className = 'muted') {
   return line;
 }
 
+function setPaymentActivity(card, did) {
+  const note = card.querySelector('.payment-activity');
+  if (did?.length) { note.textContent = `Just ran on this device: ${did.join(', ')}.`; note.hidden = false; }
+  else { note.textContent = ''; note.hidden = true; }
+}
+
+function buildPaymentCard(payment, vault, {current, rowState, detail, isSigner, review, readiness}) {
+  const card = document.createElement('section');
+  card.className = 'card';
+  const title = document.createElement('h3');
+  title.textContent = `Payment ${payment.payment?.slice(0, 12) || payment.attempt.slice(0, 12)}…`;
+  card.append(title, stageList(current, rowState, detail));
+  card.append(note(`Signers: members ${payment.pair.join(' and ')}${isSigner ? ' — you are one of them' : ''}`
+                   + (payment.txid ? ` · transaction ${payment.txid.slice(0, 16)}…` : '')));
+  const activity = note('', 'muted');
+  activity.classList.add('payment-activity');
+  activity.hidden = true;
+  card.append(activity);
+
+  if (payment.phase === 'draft') {
+    card.append(paymentButton('Send this proposal', async () => {
+      await api('payment-publish', {vault, attempt: payment.attempt});
+      message('Proposal sent to the other members.');
+    }));
+  }
+
+  if (review) {
+    const summary = document.createElement('pre');
+    summary.textContent = `Recipient: ${review.recipient}\n`
+      + `Amount: ${zecFromZat(review.amount_zat)} ZEC (${review.amount_zat} zat)\n`
+      + `Memo: ${review.memo_utf8 == null ? 'Cannot display memo bytes' : JSON.stringify(review.memo_utf8)}\n`
+      + `Network fee: ${review.fee_zat} zat\n`
+      + `Change back to the vault: ${review.change_zat} zat\n`
+      + `Expires at block: ${review.expiry_height}`;
+    card.append(summary);
+    if (review.memo_utf8 == null) card.append(note('This memo does not render as text, so this payment cannot be approved here.', 'warning'));
+    else card.append(paymentButton('Approve this exact transaction', async () => {
+      await api('payment-approve', {vault, attempt: payment.attempt, review_token: review.review_token});
+      paymentReviews.delete(payment.attempt);
+      message('Approved. Your approval is on its way to the other member.');
+    }));
+  }
+
+  if (payment.ready_to_send) {
+    const scanned = readiness.scan_height == null
+      ? 'This device has not scanned the chain yet.'
+      : `This device has scanned the chain to block ${readiness.scan_height}.`;
+    if (readiness.relay_ready === true) {
+      card.append(note(`${readiness.relay_detail || 'The relay is reachable.'} ${scanned}`));
+      card.append(paymentButton('Send this payment', async () => {
+        await api('payment-finish', {vault, attempt: payment.attempt});
+        message('Sent. Waiting for a confirmation on this device’s chain view.');
+      }));
+    } else {
+      card.append(note(`Cannot send yet. ${readiness.relay_detail || 'This device cannot reach the relay.'} ${scanned}`, 'warning'));
+    }
+  }
+  return card;
+}
+
 async function refreshPayments() {
   if (!selectedVault) return;
   const vault = selectedVault;
@@ -262,13 +324,18 @@ async function refreshPayments() {
   renderedPaymentVault = vault;
   midFlight = [];
   const list = $('payment-list');
-  list.replaceChildren();
-  if (!state.payments.length) { list.textContent = 'No payments in this member’s app.'; return; }
-  for (const payment of state.payments) {
+  if (!state.payments.length) {
+    list.replaceChildren();
+    paymentCards.clear();
+    list.textContent = 'No payments in this member’s app.';
+    return;
+  }
+  if (!paymentCards.size) list.replaceChildren();   /* drop the empty-state text node */
+  const seen = new Set();
+  for (let index = 0; index < state.payments.length; index++) {
+    const payment = state.payments[index];
     if (!SETTLED.has(payment.phase)) midFlight.push(payment.attempt);
     const isSigner = payment.pair.includes(memberSlot);
-    /* the exact transaction is fetched as soon as it can be read: checking it
-       is not a decision, so it is not a button */
     if (isSigner && ['commitments', 'package'].includes(payment.phase)
         && !paymentReviews.has(payment.attempt)) {
       try {
@@ -281,59 +348,25 @@ async function refreshPayments() {
       PHASES[payment.phase] || [0, 'waiting', payment.phase.replaceAll('_', ' ')];
     if (review && current === 1) [current, rowState, detail] = [2, 'waiting', 'your approval is the next step'];
     if (payment.ready_to_send) [current, rowState, detail] = [3, 'agreed', 'two approvals verified; ready to send'];
+    const readiness = state.readiness || {};
 
-    const card = document.createElement('section');
-    card.className = 'card';
-    const title = document.createElement('h3');
-    title.textContent = `Payment ${payment.payment?.slice(0, 12) || payment.attempt.slice(0, 12)}…`;
-    card.append(title, stageList(current, rowState, detail));
-    card.append(note(`Signers: members ${payment.pair.join(' and ')}${isSigner ? ' — you are one of them' : ''}`
-                     + (payment.txid ? ` · transaction ${payment.txid.slice(0, 16)}…` : '')));
-    const did = paymentActivity.get(payment.attempt);
-    if (did?.length) card.append(note(`Just ran on this device: ${did.join(', ')}.`));
+    const sig = JSON.stringify([current, rowState, detail, payment.pair, isSigner,
+      payment.phase, !!payment.ready_to_send, payment.payment, payment.attempt, payment.txid,
+      review ? [review.recipient, review.amount_zat, review.memo_utf8, review.fee_zat,
+                review.change_zat, review.expiry_height, review.review_token] : null,
+      payment.ready_to_send ? [readiness.relay_ready, readiness.relay_detail, readiness.scan_height] : null]);
 
-    if (payment.phase === 'draft') {
-      card.append(paymentButton('Send this proposal', async () => {
-        await api('payment-publish', {vault, attempt: payment.attempt});
-        message('Proposal sent to the other members.');
-      }));
+    let entry = paymentCards.get(payment.attempt);
+    if (!entry || entry.sig !== sig) {
+      entry = {card: buildPaymentCard(payment, vault, {current, rowState, detail, isSigner, review, readiness}), sig};
+      paymentCards.set(payment.attempt, entry);
     }
-
-    if (review) {
-      const summary = document.createElement('pre');
-      summary.textContent = `Recipient: ${review.recipient}\n`
-        + `Amount: ${zecFromZat(review.amount_zat)} ZEC (${review.amount_zat} zat)\n`
-        + `Memo: ${review.memo_utf8 == null ? 'Cannot display memo bytes' : JSON.stringify(review.memo_utf8)}\n`
-        + `Network fee: ${review.fee_zat} zat\n`
-        + `Change back to the vault: ${review.change_zat} zat\n`
-        + `Expires at block: ${review.expiry_height}`;
-      card.append(summary);
-      /* a memo that does not render is a transaction this member cannot read,
-         and an unreadable transaction is never approvable */
-      if (review.memo_utf8 == null) card.append(note('This memo does not render as text, so this payment cannot be approved here.', 'warning'));
-      else card.append(paymentButton('Approve this exact transaction', async () => {
-        await api('payment-approve', {vault, attempt: payment.attempt, review_token: review.review_token});
-        paymentReviews.delete(payment.attempt);
-        message('Approved. Your approval is on its way to the other member.');
-      }));
-    }
-
-    if (payment.ready_to_send) {
-      const readiness = state.readiness || {};
-      const scanned = readiness.scan_height == null
-        ? 'This device has not scanned the chain yet.'
-        : `This device has scanned the chain to block ${readiness.scan_height}.`;
-      if (readiness.relay_ready === true) {
-        card.append(note(`${readiness.relay_detail || 'The relay is reachable.'} ${scanned}`));
-        card.append(paymentButton('Send this payment', async () => {
-          await api('payment-finish', {vault, attempt: payment.attempt});
-          message('Sent. Waiting for a confirmation on this device’s chain view.');
-        }));
-      } else {
-        card.append(note(`Cannot send yet. ${readiness.relay_detail || 'This device cannot reach the relay.'} ${scanned}`, 'warning'));
-      }
-    }
-    list.append(card);
+    setPaymentActivity(entry.card, paymentActivity.get(payment.attempt));
+    if (list.children[index] !== entry.card) list.insertBefore(entry.card, list.children[index] || null);
+    seen.add(payment.attempt);
+  }
+  for (const [attempt, entry] of [...paymentCards]) {
+    if (!seen.has(attempt)) { entry.card.remove(); paymentCards.delete(attempt); }
   }
 }
 
