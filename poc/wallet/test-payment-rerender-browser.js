@@ -39,18 +39,18 @@ async function run() {
     });
     await page.goto('http://127.0.0.1:18801/#test-token');
     await page.locator('.vault-row').filter({hasText: 'Gold'}).click();
-    const approve = page.getByRole('button', {name: 'Approve this payment'});
-    await approve.waitFor();
-    await approve.evaluate(node => { node.dataset.probe = 'kept'; node.focus(); });
+    const review = page.getByRole('button', {name: 'Review payment'});
+    await review.waitFor();
+    await review.evaluate(node => { node.dataset.probe = 'kept'; node.focus(); });
     // Trigger a poll the way the 6s interval does — no click, so the act of
-    // polling does not move focus off the Approve button.
+    // polling does not move focus off the button in the list.
     await page.evaluate(() => document.getElementById('refresh-payments').dispatchEvent(new MouseEvent('click', {bubbles: true})));
     await page.waitForFunction(() => /advance/.test(document.querySelector('.payment-activity')?.textContent || ''));
     assert.match(await page.locator('.payment-activity').textContent(), /advance/);
-    assert.equal(await approve.getAttribute('data-probe'), 'kept',
-      'Approve button DOM node must survive a poll that only changed activity');
+    assert.equal(await review.getAttribute('data-probe'), 'kept',
+      'list card DOM node must survive a poll that only changed activity');
     assert.equal(await page.evaluate(() => document.activeElement?.dataset?.probe), 'kept',
-      'focus must stay on the Approve button across a poll');
+      'focus must stay on the list button across a poll');
     assert.deepEqual(errors, []);
     console.log('PASS: payment cards persist across polls; focus and node identity are preserved');
   } finally { await browser.close(); }

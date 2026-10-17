@@ -29,7 +29,7 @@ async function run() {
     // (The details sits in the card section, a sibling of #join, so locate it by content.)
     const joinAside = page.locator('details.aside').filter({hasText: 'Paste the invite'});
     assert.equal(await joinAside.count(), 1, 'join explanation must be wrapped in details.aside');
-    const joinBody = joinAside.locator('p');
+    const joinBody = joinAside.locator('p').first();
     assert.equal(await joinBody.isVisible(), false, 'educational prose must be hidden until expanded');
     assert.equal(await joinAside.locator('summary').isVisible(), true, 'the disclosure summary is visible');
     // Opening it reveals the prose.

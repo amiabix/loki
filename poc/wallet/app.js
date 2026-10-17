@@ -14,6 +14,7 @@ let pumping = false;
 let pumpPaused = false;
 let paymentsLive = false;
 let relaySetupPhase = null;
+let activeReview = null;   /* {attempt, vault, review} when the focused review view is open */
 const paymentReviews = new Map();
 const paymentActivity = new Map();
 const paymentCards = new Map();   /* attempt → {card, sig}; rebuilt only when sig changes */
@@ -30,6 +31,7 @@ function selectVault(vault) {
   renderedPaymentVault = null;
   midFlight = [];
   relaySetupPhase = null;
+  activeReview = null;
   pumpPaused = false;
   paymentReviews.clear();
   paymentActivity.clear();
@@ -302,7 +304,8 @@ function buildPaymentCard(payment, vault, {current, rowState, detail, isSigner, 
   card.append(head);
 
   if (review) {
-    /* amount and full recipient dominate; the rest is readable, not a pre dump */
+    /* the overview shows a compact summary; the exact transaction opens in a
+       focused review view so approving is a deliberate, uncluttered step */
     const amount = document.createElement('p');
     amount.className = 'pay-amount';
     amount.textContent = `${zecFromZat(review.amount_zat)} ZEC`;
@@ -317,16 +320,15 @@ function buildPaymentCard(payment, vault, {current, rowState, detail, isSigner, 
     addr.textContent = review.recipient;
     to.append(toLabel, addr);
     card.append(to);
-    card.append(payField('Memo', review.memo_utf8 == null ? 'Cannot display memo bytes' : JSON.stringify(review.memo_utf8)));
-    card.append(payField('Network fee', `${zecFromZat(review.fee_zat)} ZEC`));
-    card.append(payField('Change to the vault', `${zecFromZat(review.change_zat)} ZEC`));
-    card.append(payField('Expires at block', String(review.expiry_height)));
-    if (review.memo_utf8 == null) card.append(note('This memo does not render as text, so this payment cannot be approved here.', 'warning'));
-    else card.append(paymentButton('Approve this payment', async () => {
-      await api('payment-approve', {vault, attempt: payment.attempt, review_token: review.review_token});
-      paymentReviews.delete(payment.attempt);
-      message('Approval saved; delivering to the other members.');
-    }));
+    if (review.memo_utf8 == null) {
+      card.append(note('This memo does not render as text, so this payment cannot be approved here.', 'warning'));
+    } else {
+      const open = document.createElement('button');
+      open.type = 'button';
+      open.textContent = 'Review payment';
+      open.addEventListener('click', () => openReview(payment, vault, review));
+      card.append(open);
+    }
   } else if (payment.phase !== 'draft' && !payment.ready_to_send) {
     card.append(note(detail));
   }
@@ -369,6 +371,34 @@ function buildPaymentCard(payment, vault, {current, rowState, detail, isSigner, 
   details.append(activity);
   card.append(details);
   return card;
+}
+
+/* ── the focused review view ────────────────────────────────────────────────
+   Approving is the one irreversible signing decision, so it gets its own
+   screen: the exact transaction, nothing else, with an explicit Back. */
+function renderReview(review) {
+  $('review-amount').textContent = `${zecFromZat(review.amount_zat)} ZEC`;
+  $('review-addr').textContent = review.recipient;
+  const fields = $('review-fields');
+  fields.replaceChildren(
+    payField('Memo', review.memo_utf8 == null ? 'Cannot display memo bytes' : JSON.stringify(review.memo_utf8)),
+    payField('Network fee', `${zecFromZat(review.fee_zat)} ZEC`),
+    payField('Change to the vault', `${zecFromZat(review.change_zat)} ZEC`),
+    payField('Expires at block', String(review.expiry_height)));
+}
+
+function openReview(payment, vault, review) {
+  activeReview = {attempt: payment.attempt, vault, review};
+  renderReview(review);
+  $('review-approve').disabled = false;
+  refresh();   /* refresh swaps the overview for the review view while activeReview is set */
+  $('review-approve').focus();
+}
+
+function closeReview() {
+  activeReview = null;
+  $('review-view').hidden = true;
+  refresh();
 }
 
 async function refreshPayments() {
@@ -741,7 +771,7 @@ async function refresh() {
     }
     if ((state.phase === 'new_profile' || state.phase === 'locked') && selectedVault) selectVault(null);
     paymentsLive = false;
-    for (const id of ['new-profile', 'locked', 'home', 'invites', 'connect-account', 'setup', 'backup', 'waiting', 'final-backup', 'backup-status', 'active', 'relay-setup']) $(id).hidden = true;
+    for (const id of ['new-profile', 'locked', 'home', 'invites', 'connect-account', 'setup', 'backup', 'waiting', 'final-backup', 'backup-status', 'active', 'relay-setup', 'review-view']) $(id).hidden = true;
     const inVault = !!selectedVault;
     $('back').hidden = !inVault;
     $('lock').hidden = !state.profile && state.phase !== 'home';
@@ -829,6 +859,16 @@ async function refresh() {
       if ((state.phase === 'final_backup' || state.phase === 'active') && state.backups?.length) {
         backupList(state);
         $('backup-status').hidden = false;
+      }
+    }
+    /* the focused review view replaces the active overview while it is open,
+       and closes itself if its payment is no longer awaiting this member */
+    if (activeReview) {
+      if (state.phase === 'active' && selectedVault === activeReview.vault && paymentReviews.has(activeReview.attempt)) {
+        $('active').hidden = true;
+        $('review-view').hidden = false;
+      } else {
+        activeReview = null;
       }
     }
     if (state.error) message(state.error, true);
@@ -1039,6 +1079,19 @@ $('theme').addEventListener('click', () => {
 });
 matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => {
   if (!themeStore.read()) applyTheme(null);
+});
+$('review-back').addEventListener('click', closeReview);
+$('review-approve').addEventListener('click', async () => {
+  if (!activeReview) return;
+  const {attempt, vault, review} = activeReview;
+  const button = $('review-approve');
+  button.disabled = true;
+  try {
+    await api('payment-approve', {vault, attempt, review_token: review.review_token});
+    paymentReviews.delete(attempt);
+    message('Approval saved; delivering to the other members.');
+    closeReview();
+  } catch (error) { message(error.message, true); button.disabled = false; }
 });
 $('back').addEventListener('click', () => { selectVault(null); refresh(); });
 $('lock').addEventListener('click', async () => {

@@ -192,6 +192,16 @@ body { margin: 0; }
 .pay-field-label { color: var(--dim); }
 .pay-field span:last-child { text-align: right; overflow-wrap: anywhere; }
 
+/* the focused review view: the exact transaction, nothing competing */
+#review-back { margin: 0 0 14px; }
+.review-head { margin: 0 0 10px; font-family: var(--serif); font-weight: 400; font-size: clamp(22px, 3vw, 28px); color: var(--text); }
+#review-view .pay-amount { font-size: clamp(30px, 6vw, 40px); margin: 4px 0 10px; }
+#review-view .pay-field { font-size: 14.5px; }
+
+/* Create is the one primary action on home, set apart from the vault list */
+.home-create { margin-top: 22px; padding-top: 20px; border-top: 1px solid var(--line-soft); }
+#join-disclosure { margin-top: 16px; }
+
 /* A single soft wash behind the content for depth — the scanlines and the
    eight-hairline corner frame were the loudest part of the HUD skin and are
    gone, leaving the cards to sit in clean, airy space. */
