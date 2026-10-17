@@ -319,6 +319,10 @@ fn owned_testnet_setup_certifies_the_network_and_recovery_card() {
     run_owned_services_flow(OwnedFlow::Full, "testnet");
 }
 #[test]
+fn staggered_testnet_members_resume_with_one_relay_offline() {
+    run_owned_services_flow(OwnedFlow::StaggeredOutage, "testnet");
+}
+#[test]
 fn owned_private_invitation_exports_for_both_policies() {
     run_owned_services_flow(OwnedFlow::InviteExport, "regtest");
 }
@@ -328,6 +332,7 @@ fn owned_pending_abort_reconciles_admission_before_any_provisioning_for_both_pol
 }
 enum OwnedFlow {
     Full,
+    StaggeredOutage,
     InviteExport,
     PendingAbort,
 }
@@ -408,6 +413,9 @@ fn drive_owned_cli(path: &Path, pass: &str) -> std::process::Output {
 }
 fn run_owned_services_flow(mode: OwnedFlow, network: &str) {
     let mut services = hosted_services::HostedServices::start();
+    if matches!(mode, OwnedFlow::StaggeredOutage) {
+        services.stop_relay(0);
+    }
     if let Ok(relay) = std::env::var("LOKI_HOSTED_OFFLINE_RELAY") {
         let index: usize = relay.parse().unwrap();
         assert!((1..=3).contains(&index));
@@ -454,7 +462,7 @@ fn run_owned_services_flow(mode: OwnedFlow, network: &str) {
             Value::Bytes(signature.to_bytes().to_vec()),
         ]))
         .unwrap();
-        let mut setup = if matches!(mode, OwnedFlow::Full) {
+        let mut setup = if matches!(mode, OwnedFlow::Full | OwnedFlow::StaggeredOutage) {
             for (name, bytes) in [
                 ("create-pass", b"pass".as_slice()),
                 ("operators", services.bundle.as_slice()),
@@ -859,6 +867,9 @@ fn run_owned_services_flow(mode: OwnedFlow, network: &str) {
             assert!(!peer.roster_accepted().unwrap());
             peer.agree(fingerprint).unwrap();
             peer.step().unwrap();
+            if matches!(mode, OwnedFlow::StaggeredOutage) {
+                assert_eq!(sealed_files(member.path()), approved_files);
+            }
             if slot != count {
                 assert!(
                     !peer.roster_accepted().unwrap(),
@@ -879,7 +890,9 @@ fn run_owned_services_flow(mode: OwnedFlow, network: &str) {
                 };
                 let mut peer =
                     HostedSetup::open(&path, if slot == 1 { "pass" } else { "peer-pass" }).unwrap();
-                if std::env::var_os("LOKI_HOSTED_KILL_PHASE").is_some() {
+                if std::env::var_os("LOKI_HOSTED_KILL_PHASE").is_some()
+                    || matches!(mode, OwnedFlow::StaggeredOutage)
+                {
                     drop(peer);
                     let output =
                         drive_owned_cli(&path, if slot == 1 { "pass" } else { "peer-pass" });
@@ -1038,7 +1051,9 @@ fn run_owned_services_flow(mode: OwnedFlow, network: &str) {
                 };
                 let mut peer =
                     HostedSetup::open(&path, if slot == 1 { "pass" } else { "peer-pass" }).unwrap();
-                let public = if std::env::var_os("LOKI_HOSTED_KILL_PHASE").is_some() {
+                let public = if std::env::var_os("LOKI_HOSTED_KILL_PHASE").is_some()
+                    || matches!(mode, OwnedFlow::StaggeredOutage)
+                {
                     drop(peer);
                     let output =
                         drive_owned_cli(&path, if slot == 1 { "pass" } else { "peer-pass" });
@@ -1131,6 +1146,23 @@ fn run_owned_services_flow(mode: OwnedFlow, network: &str) {
             }
         }
         finish_owned_handoff(&mut services, count, &member, &backup_words, &group);
+        if matches!(mode, OwnedFlow::StaggeredOutage) {
+            let database = rusqlite::Connection::open(
+                member.path().join("setup-relay-store/setup.sqlite3"),
+            )
+            .unwrap();
+            let stored_relays: u64 = database
+                .query_row("SELECT count(DISTINCT pin) FROM stored", [], |row| row.get(0))
+                .unwrap();
+            let deferred_relays: u64 = database
+                .query_row("SELECT count(*) FROM retries", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(stored_relays, 2, "setup needs two independent relay receipts");
+            assert_eq!(deferred_relays, 1, "the unavailable relay must remain retryable");
+            for index in 1..=3 {
+                assert!(services.root.join(format!("relay-{index}/relay.sqlite3")).is_file());
+            }
+        }
     }
 }
 
