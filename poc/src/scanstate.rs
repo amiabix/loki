@@ -34,6 +34,8 @@ pub struct Found {
 /// Everything a scan carries forward to the next one.
 #[derive(Default)]
 pub struct ScanState {
+    /// Hash of the viewing key that selected `found`; absent in older cache files.
+    pub viewing_key_id: Option<[u8; 32]>,
     /// The last block height whose actions are already recorded here. `0` means nothing
     /// has been scanned, which is also what the first run sees.
     pub tip: u64,
@@ -130,6 +132,9 @@ impl ScanState {
             let mut f = line.split_whitespace();
             match f.next() {
                 None => continue,
+                Some("viewing_key_id") => {
+                    state.viewing_key_id = Some(field(&mut f).ok_or_else(bad)?);
+                }
                 Some("tip") => {
                     state.tip = f.next().and_then(|v| v.parse().ok()).ok_or_else(bad)?;
                     state.tip_hash = match f.next() {
@@ -195,6 +200,9 @@ impl ScanState {
             let f = options.open(&temp).map_err(io)?;
             let mut out = std::io::BufWriter::new(f);
 
+            if let Some(key) = self.viewing_key_id {
+                writeln!(out, "viewing_key_id {}", hex::encode(key)).map_err(io)?;
+            }
             if let Some(hash) = self.tip_hash {
                 writeln!(out, "tip {} {}", self.tip, hex::encode(hash)).map_err(io)?;
             } else {
@@ -518,6 +526,26 @@ mod tests {
             full.notes.iter().map(|n| n.position).collect::<Vec<_>>(),
             vec![1, 3, 5]
         );
+    }
+
+    #[test]
+    fn a_cache_from_another_vault_cannot_skip_earlier_notes() {
+        let vault = a_fvk(3);
+        let decoy = a_fvk(9);
+        let unrelated = a_fvk(20);
+        let chain = canned_chain(&vault, &decoy);
+        let get = |h: u64| Ok(chain[h as usize - 1].clone());
+        let path =
+            std::env::temp_dir().join(format!("loki-cross-vault-{}.txt", std::process::id()));
+        let mut state = ScanState::default();
+        scan_blocks(&unrelated, &mut state, 6, get).unwrap();
+        assert!(state.notes(&unrelated).unwrap().is_empty());
+        state.save(&path).unwrap();
+
+        let mut reused = ScanState::load(&path).unwrap();
+        scan_blocks(&vault, &mut reused, 6, get).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(reused.notes(&vault).unwrap().len(), 3);
     }
 
     /// A chain shorter than the stored one is a different chain, so the state must be

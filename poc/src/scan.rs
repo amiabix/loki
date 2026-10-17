@@ -235,6 +235,11 @@ pub fn scan_blocks<F>(
 where
     F: Fn(u64) -> Result<serde_json::Value, String>,
 {
+    let viewing_key_id = blake3::derive_key("Loki scan cache viewing key v1", &fvk.to_bytes());
+    if state.viewing_key_id != Some(viewing_key_id) {
+        *state = ScanState::default();
+        state.viewing_key_id = Some(viewing_key_id);
+    }
     // A saved height alone cannot identify a chain after a reorg.
     if to < state.tip
         || (state.tip > 0
