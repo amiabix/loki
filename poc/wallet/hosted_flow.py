@@ -183,11 +183,12 @@ class App:
     def __init__(self, flow, name, port, rpc):
         self.flow, self.name, self.port = flow, name, port
         root = flow.root / name
-        argv = [sys.executable, str(HERE / "member_app.py")]
+        app = str(Path(flow.args.app).resolve())
+        argv = [sys.executable, app]
         env = {"LOKI_TIMING_LOG": str(flow.root / f"{name}.timing.jsonl")}
         if flow.args.legacy_app:
             # Unmodified older apps hard-code target/debug; time them through a shim.
-            argv = [sys.executable, str(Path(__file__).resolve()), "legacy-app", flow.args.profile, str(HERE / "member_app.py")]
+            argv = [sys.executable, str(Path(__file__).resolve()), "legacy-app", flow.args.profile, app]
         else:
             argv += ["--bin-profile", flow.args.profile]
         argv += ["--data", str(root / "data"), "--port", str(port), "--transport", "hosted",
@@ -534,6 +535,7 @@ def main():
                      help="driver: call payment-sync/advance like the open signer page")
     run.add_argument("--no-exchange", action="store_true", help="start hosted apps without --exchange")
     run.add_argument("--legacy-app", action="store_true", help="time an unmodified older member_app.py")
+    run.add_argument("--app", default=str(HERE / "member_app.py"), help="member_app.py to run")
     show = commands.add_parser("report")
     show.add_argument("root")
     args = parser.parse_args()

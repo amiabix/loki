@@ -39,7 +39,8 @@ class HostedAppFlowTest(unittest.TestCase):
             root=str(Path(temporary) / "run"), profile=profile, operator_profile=profile,
             rtt=float(os.environ.get("LOKI_HOSTED_FLOW_RTT", "0")), ths=ths, base=39100,
             skip_payment=not ths, isolation="unshare", isolation_name="lokins",
-            joiner_wait=30, pump="driver", no_exchange=True, legacy_app=False)
+            joiner_wait=30, pump="driver", no_exchange=True, legacy_app=False,
+            app=str(HERE / "member_app.py"))
         flow = hosted_flow.Flow(args)
         try:
             hosted_flow.journey(flow)
