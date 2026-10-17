@@ -631,6 +631,14 @@ function backupList(state) {
     const who = document.createElement('strong');
     who.textContent = entry.slot === state.slot ? `Member ${entry.slot} · you` : `Member ${entry.slot}`;
     const said = document.createElement('span');
+    if (state.transport === 'hosted') {
+      // Hosted setups carry each member's signed backup receipt, not a final-card report.
+      said.textContent = entry.backup_checked ? 'checked their backup card' : 'backup check not received yet';
+      row.classList.add(entry.backup_checked ? 'agreed' : 'waiting');
+      row.append(who, said);
+      list.append(row);
+      continue;
+    }
     said.textContent = entry.reported ? 'reported checking a final card'
       : entry.invalid ? 'invalid report — check with this member' : 'no report yet';
     row.classList.add(entry.reported ? 'agreed' : entry.invalid ? 'differs' : 'waiting');
@@ -739,6 +747,7 @@ async function refresh() {
       }
       else if (state.phase === 'stopped') message('Setup stopped: ' + state.error + '. Start a fresh vault session.', true);
       if ((state.phase === 'final_backup' || state.phase === 'active') && state.backups?.length) {
+        $('backup-status').querySelector('h2').textContent = state.transport === 'hosted' ? 'Backup checks' : 'Final backup reports';
         backupList(state);
         $('backup-status').hidden = false;
       }

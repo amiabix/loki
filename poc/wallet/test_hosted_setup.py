@@ -283,6 +283,21 @@ class HostedControllerTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertLess(__import__('time').monotonic() - begun, 5)
 
+    def test_status_lists_backup_checks_from_native_receipts(self):
+        self.count = 3
+        result = self.wallet.create('Treasury', 3)
+        folder, _ = self.wallet.vault_dir(result['vault'])
+        (folder / 'setup-status.json').write_text(json.dumps({'phase': 'awaiting_backups', 'handoff': 'pending',
+                                                            'joined_slots': [1, 2, 3], 'missing_slots': [3]}))
+        self.assertEqual([(row['slot'], row['backup_checked']) for row in self.wallet.status(self.vault)['backups']],
+                         [(1, True), (2, True), (3, False)])
+        (folder / 'setup-status.json').write_text(json.dumps({'phase': 'certified', 'handoff': 'pending',
+                                                            'joined_slots': [1, 2, 3], 'missing_slots': []}))
+        self.assertTrue(all(row['backup_checked'] for row in self.wallet.status(self.vault)['backups']))
+        (folder / 'setup-status.json').write_text(json.dumps({'phase': 'round1_saved', 'handoff': 'pending',
+                                                            'joined_slots': [1, 2, 3], 'missing_slots': [2, 3]}))
+        self.assertEqual(self.wallet.status(self.vault)['backups'], [])
+
     def test_membership_publication_recovers_before_directory_rename(self):
         folder = self.controller._pending('Treasury', 'create', '2-of-4')
         with patch.object(Path, 'rename', side_effect=OSError('interrupted rename')):

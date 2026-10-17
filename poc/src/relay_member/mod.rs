@@ -296,6 +296,7 @@ pub fn load(root: &Path, pass_file: &Path, roster_path: &Path) -> MemberResult<L
     if pass.is_empty() {
         return Err(MemberError::Sealed);
     }
+    crate::seal_kdf::enable_session_cache(&pass);
     let identity_bytes = sealed(&root.join("secrets/identity.sealed"), &pass)?;
     let mut identity_raw = Zeroizing::new([0u8; 66]);
     if identity_bytes.len() != identity_raw.len() {

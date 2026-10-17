@@ -432,6 +432,21 @@ class HostedSetup:
             return "final_backup" if not (folder / "final-backup-checked").is_file() else "active" if native.get("handoff") == "ready" else "connecting_relays"
         return "waiting_for_members"
 
+    @staticmethod
+    def _backups(native, members):
+        """Which members' signed backup receipts this member holds. During
+        awaiting_backups the native status lists authors still missing; from
+        certification on, the certified vault includes every receipt."""
+        phase = native["phase"]
+        if phase == "awaiting_backups":
+            missing = set(native.get("missing_slots", []))
+        elif phase in ("certified", "payment_handoff", "active"):
+            missing = set()
+        else:
+            return []
+        return [{"slot": slot, "backup_checked": slot not in missing, "final_reported": False, "invalid": False}
+                for slot in range(1, members + 1)]
+
     def status(self, vault):
         folder, local = self.wallet.vault_dir(vault)
         native = self._cached(folder)
@@ -450,6 +465,7 @@ class HostedSetup:
                   "relay_setup": {"phase": "ready" if native.get("handoff") == "ready" else "waiting", "available": False,
                                   "detail": "Hosted relays are connected." if native.get("handoff") == "ready" else "Connecting hosted relays automatically."},
                   "funding": {"available": False, "phase": "unavailable", "detail": ""},
+                  "backups": self._backups(native, local["members"]),
                   "final_card_created": (folder / "final-card" / "vault.card").is_file(),
                   "final_card_needs_words": not (folder / "secrets" / "backup-words.sealed").is_file()}
         if local["slot"] == 1 and phase in ("invites_ready", "waiting_joins", "joins_received", "proposal_pending", "roster_proposed"):

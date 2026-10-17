@@ -307,7 +307,7 @@ impl HostedSetup {
             .map_err(|_| "setup_transport")?;
         if may_drive && !already_activated {
             self.runtime
-                .block_on(transport.drive_once(store, routes))
+                .block_on(transport.drive_once_with(store, routes, &self.net))
                 .map_err(|_| "setup_transport")?;
         }
         let key = SetupKey {

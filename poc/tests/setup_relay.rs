@@ -745,13 +745,23 @@ fn run_owned_services_flow(mode: OwnedFlow) {
         }
         let mut reopened = HostedSetup::open(member.path(), "pass").unwrap();
         let public = reopened.step().unwrap().public_json();
-        assert_eq!(public["phase"], "joins_received");
+        // The step that receives the last Join also proposes the roster, so it reports
+        // the proposal unless publishing it is still pending.
+        assert!(
+            matches!(
+                public["phase"].as_str(),
+                Some("joins_received" | "roster_proposed")
+            ),
+            "unexpected creator phase {public}"
+        );
         assert_eq!(
             public["joined_slots"].as_array().unwrap().len(),
             usize::from(count)
         );
         assert!(public["missing_slots"].as_array().unwrap().is_empty());
-        assert!(reopened.proposed_fingerprint().is_err());
+        if public["phase"] == "joins_received" {
+            assert!(reopened.proposed_fingerprint().is_err());
+        }
         let limit = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             if reopened.step().unwrap().public_json()["phase"] == "roster_proposed" {
@@ -936,12 +946,20 @@ fn run_owned_services_flow(mode: OwnedFlow) {
                 ));
                 return;
             }
-            assert_eq!(public["phase"], "round1_saved");
+            // Peers that already saved round 1 let the same step reach round 2.
+            assert!(matches!(
+                public["phase"].as_str(),
+                Some("round1_saved" | "round2_saved")
+            ));
         } else {
             let mut reopened = HostedSetup::open(member.path(), "pass").unwrap();
-            assert_eq!(
-                reopened.step().unwrap().public_json()["phase"],
-                "round1_saved"
+            let public = reopened.step().unwrap().public_json();
+            assert!(
+                matches!(
+                    public["phase"].as_str(),
+                    Some("round1_saved" | "round2_saved")
+                ),
+                "unexpected phase after acceptance {public}"
             );
         }
         let limit = std::time::Instant::now() + std::time::Duration::from_secs(300);

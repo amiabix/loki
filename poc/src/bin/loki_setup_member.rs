@@ -46,6 +46,7 @@ fn passphrase(path: &Path) -> Result<String, String> {
     if pass.is_empty() {
         return Err("empty passphrase".into());
     }
+    loki_poc::seal_kdf::enable_session_cache(pass);
     Ok(pass.to_string())
 }
 
