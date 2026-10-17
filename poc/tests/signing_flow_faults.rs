@@ -58,6 +58,39 @@ impl NonceWitness for ReprovisionedMailbox {
         panic!("changed mailbox must be refused before a nonce claim")
     }
 }
+
+struct OriginalRelayUnavailable;
+impl NonceWitness for OriginalRelayUnavailable {
+    fn pins(&self) -> loki_poc::signing_session::WitnessPins {
+        [([7; 32], [8; 32], [15; 32]), ([9; 32], [10; 32], [16; 32])]
+    }
+    fn claim(&mut self, _: [u8; 32], _: &[u8]) -> Result<(), String> {
+        Err("original relay unavailable".into())
+    }
+}
+
+struct SubstituteRelay;
+impl NonceWitness for SubstituteRelay {
+    fn pins(&self) -> loki_poc::signing_session::WitnessPins {
+        [
+            ([9; 32], [10; 32], [16; 32]),
+            ([11; 32], [12; 32], [21; 32]),
+        ]
+    }
+    fn claim(&mut self, _: [u8; 32], _: &[u8]) -> Result<(), String> {
+        panic!("a substitute relay must be refused before a nonce claim")
+    }
+}
+
+struct ChangedMailbox;
+impl NonceWitness for ChangedMailbox {
+    fn pins(&self) -> loki_poc::signing_session::WitnessPins {
+        [([7; 32], [8; 32], [27; 32]), ([9; 32], [10; 32], [16; 32])]
+    }
+    fn claim(&mut self, _: [u8; 32], _: &[u8]) -> Result<(), String> {
+        panic!("a changed mailbox must be refused before a nonce claim")
+    }
+}
 use zcash_protocol::{memo::MemoBytes, value::Zatoshis};
 
 #[test]
@@ -327,10 +360,10 @@ fn run_review_and_rollback(member_count: u16, pair: [u16; 2]) {
     assert!(!bob_attempt.join("decision").exists());
     let reviewed = bob.review_package(&good, &alice_public).unwrap();
     assert!(bob
-        .publish_approved_secured(
+        .publish_approved_secured_to_roster(
             reviewed,
             &alice_public,
-            &carol_public,
+            &roster,
             &mailbox,
             "pass",
             &mut ReprovisionedMailbox,
@@ -528,6 +561,45 @@ fn run_review_and_rollback(member_count: u16, pair: [u16; 2]) {
         "pass",
     )
     .unwrap();
+    let restored_review = restored.review_package(&good, &alice_public).unwrap();
+    assert!(restored
+        .publish_approved_secured_to_roster(
+            restored_review,
+            &alice_public,
+            &roster,
+            &mailbox,
+            "pass",
+            &mut OriginalRelayUnavailable
+        )
+        .is_err());
+    assert!(!old_attempt.join("share.sealed").exists());
+    assert!(!old_attempt.join("decision").exists());
+    let restored_review = restored.review_package(&good, &alice_public).unwrap();
+    assert!(restored
+        .publish_approved_secured_to_roster(
+            restored_review,
+            &alice_public,
+            &roster,
+            &mailbox,
+            "pass",
+            &mut ChangedMailbox
+        )
+        .is_err());
+    assert!(!old_attempt.join("share.sealed").exists());
+    assert!(!old_attempt.join("decision").exists());
+    let restored_review = restored.review_package(&good, &alice_public).unwrap();
+    assert!(restored
+        .publish_approved_secured_to_roster(
+            restored_review,
+            &alice_public,
+            &roster,
+            &mailbox,
+            "pass",
+            &mut SubstituteRelay
+        )
+        .is_err());
+    assert!(!old_attempt.join("share.sealed").exists());
+    assert!(!old_attempt.join("decision").exists());
     let restored_review = restored.review_package(&good, &alice_public).unwrap();
     assert!(restored
         .publish_approved_secured_to_roster(

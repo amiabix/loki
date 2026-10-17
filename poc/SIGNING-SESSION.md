@@ -25,6 +25,10 @@ fsyncs a consumed decision, removes the sealed nonce file, computes shares, and
 saves exact encrypted share copies. A crash after a relay claim but before saving
 shares burns the attempt; a new attempt needs fresh nonces. A restored old profile
 cannot reclaim a CID at an honest, reachable relay in the pinned pair.
+The attempt pins each relay's signing key, run ID, and the mailbox containing its
+consumed index. A relay outage pauses approval; another relay or a new mailbox
+cannot replace one of the pinned witnesses. Pending nonce records from the older
+format lack mailbox pins and are refused, so the member must start a fresh attempt.
 
 `aggregate_and_apply` lets a member with the encrypted package and both shares
 verify and assemble a signed PCZT without the approvers' nonce secrets. The
