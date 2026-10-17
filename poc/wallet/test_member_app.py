@@ -13,10 +13,80 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
-from member_app import SEED_WALLET, SETUP, Wallet, courier_name, decoded, make_signer_server
+from member_app import PAYMENT, SEED_WALLET, SETUP, WALLET_SYNC, Wallet, courier_name, decoded, make_signer_server
 
 
 class MemberWalletTest(unittest.TestCase):
+    def test_testnet_balance_uses_persistent_wallet_and_reports_scan_progress(self):
+        with tempfile.TemporaryDirectory(prefix="loki-indexed-balance-") as temp:
+            root = Path(temp)
+            wallet = Wallet(root / "member", root / "courier", network="testnet",
+                            lightwalletd_url="https://wallet.example")
+            self.addCleanup(wallet.close)
+            vault = "a" * 64
+            member = wallet.data / "vaults" / vault
+            member.mkdir(parents=True)
+            (member / "membership.json").write_text(json.dumps({
+                "vault": vault, "profile": "profile", "slot": 1, "network": "testnet"}))
+            wallet.profile_data = {"id": "profile"}
+            wallet.passphrase = "a long passphrase"
+            indexed = {"vault": vault, "network": "testnet", "height": 4500010,
+                       "chain_tip": 4500012, "balance_zat": 400000}
+            with patch.object(wallet, "command", return_value=json.dumps(indexed)) as command:
+                result = wallet.balance(vault)
+            self.assertEqual(result["balance_zat"], 400000)
+            self.assertEqual(result["scan_ready"], False)
+            self.assertEqual(result["height"], 4500010)
+            self.assertEqual(command.call_args.args,
+                             (member, "@pass", member / "roster.json", "https://wallet.example"))
+            self.assertEqual(command.call_args.kwargs["binary"], WALLET_SYNC)
+            indexed["height"] = indexed["chain_tip"]
+            with patch.object(wallet, "command", return_value=json.dumps(indexed)):
+                self.assertTrue(wallet.balance(vault)["scan_ready"])
+            indexed["height"] = -1
+            with patch.object(wallet, "command", return_value=json.dumps(indexed)):
+                with self.assertRaisesRegex(ValueError, "invalid Testnet balance"):
+                    wallet.balance(vault)
+            with patch.object(wallet, "command", side_effect=ValueError("lightwalletd unavailable")):
+                with self.assertRaisesRegex(ValueError, "lightwalletd unavailable"):
+                    wallet.balance(vault)
+            self.assertIsNone(wallet.scan_height.get(vault))
+
+    def test_testnet_payment_expiry_keeps_its_payment_chain_view(self):
+        with tempfile.TemporaryDirectory(prefix="loki-testnet-expiry-") as temp:
+            wallet, vault, attempt = self.payment_fixture(temp)
+            wallet.network = "testnet"
+            member = wallet.data / "vaults" / vault
+            membership = json.loads((member / "membership.json").read_text())
+            membership["network"] = "testnet"
+            (member / "membership.json").write_text(json.dumps(membership))
+            with patch.object(wallet, "command", return_value=json.dumps({
+                    "vault": vault, "height": 9216})) as command:
+                with self.assertRaisesRegex(ValueError, "expired"):
+                    wallet.commit_payment(vault, attempt)
+            self.assertEqual(command.call_args.args[0], "balance")
+            self.assertEqual(command.call_args.kwargs["binary"], PAYMENT)
+            self.assertEqual(wallet.scan_height[vault], 9216)
+
+    def test_testnet_payment_stages_stop_when_wallet_sync_fails(self):
+        with tempfile.TemporaryDirectory(prefix="loki-testnet-payment-sync-") as temp:
+            wallet, vault, attempt = self.payment_fixture(temp)
+            wallet.network = "testnet"
+            member = wallet.data / "vaults" / vault
+            membership = json.loads((member / "membership.json").read_text())
+            membership["network"] = "testnet"
+            (member / "membership.json").write_text(json.dumps(membership))
+            with patch.object(wallet, "balance", side_effect=ValueError("wallet sync failed")), \
+                    patch.object(wallet, "payment_command") as command:
+                for stage in (
+                    lambda: wallet.package_payment(vault, attempt),
+                    lambda: wallet.finish_payment(vault, attempt),
+                    lambda: wallet.verify_payment(vault, attempt, "c" * 64),
+                ):
+                    with self.assertRaisesRegex(ValueError, "wallet sync failed"):
+                        stage()
+                command.assert_not_called()
+
     def test_testnet_vault_records_chain_and_birth_before_inviting(self):
         with tempfile.TemporaryDirectory(prefix="loki-testnet-ui-") as temp:
             root = Path(temp)

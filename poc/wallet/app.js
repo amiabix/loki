@@ -323,8 +323,8 @@ async function refreshPayments() {
     if (payment.ready_to_send) {
       const readiness = state.readiness || {};
       const scanned = readiness.scan_height == null
-        ? 'This device has not scanned the chain yet.'
-        : `This device has scanned the chain to block ${readiness.scan_height}.`;
+        ? 'Payment chain scan has not run on this device yet.'
+        : `Payment chain scan reached block ${readiness.scan_height}.`;
       if (readiness.relay_ready === true) {
         card.append(note(`${readiness.relay_detail || 'The relay is reachable.'} ${scanned}`));
         card.append(paymentButton('Send this payment', async () => {
@@ -924,11 +924,18 @@ action('show-address', async () => {
 });
 $('refresh-balance').addEventListener('click', async () => {
   const button = $('refresh-balance');
+  const vault = selectedVault;
   button.disabled = true;
   try {
-    const value = await api('balance', {vault: selectedVault});
-    $('balance').textContent = `${zecFromZat(value.balance_zat)} ZEC · ${value.unspent_notes} unspent notes · block ${value.height}`;
-  } catch (error) { message(error.message, true); }
+    const value = await api('balance', {vault});
+    if (selectedVault !== vault) return;
+    $('balance').textContent = value.network === 'testnet'
+      ? `${zecFromZat(value.balance_zat)} ZEC · scanned block ${value.height} of ${value.chain_tip}`
+        + (value.scan_ready ? ' · scan caught up' : ' · scan still catching up; balance may be incomplete')
+      : `${zecFromZat(value.balance_zat)} ZEC · ${value.unspent_notes} unspent notes · block ${value.height}`;
+  } catch (error) {
+    if (selectedVault === vault) $('balance').textContent = `Scan failed: ${error.message}. Balance unavailable.`;
+  }
   finally { button.disabled = false; }
 });
 action('payment-draft', async (form) => {
