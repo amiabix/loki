@@ -39,7 +39,7 @@ async function run() {
     });
     await page.goto('http://127.0.0.1:18801/#test-token');
     await page.locator('.vault-row').filter({hasText: 'Gold'}).click();
-    const approve = page.getByRole('button', {name: 'Approve this exact transaction'});
+    const approve = page.getByRole('button', {name: 'Approve this payment'});
     await approve.waitFor();
     await approve.evaluate(node => { node.dataset.probe = 'kept'; node.focus(); });
     // Trigger a poll the way the 6s interval does — no click, so the act of

@@ -182,6 +182,21 @@ html {
 
 body { margin: 0; }
 
+/* payment review: the amount and recipient dominate, the rest stays readable */
+.pay-amount {
+  margin: 2px 0;
+  font-family: var(--mono);
+  font-size: clamp(26px, 5vw, 32px);
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+.pay-to { margin: 2px 0 12px; }
+.pay-to .pay-field-label { display: block; margin-bottom: 2px; }
+.pay-addr { font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere; color: var(--text); }
+.pay-field { display: flex; justify-content: space-between; gap: 16px; margin: 5px 0; font-size: 13px; }
+.pay-field-label { color: var(--dim); }
+.pay-field span:last-child { text-align: right; overflow-wrap: anywhere; }
+
 /* the forward-flight starfield sits behind everything and catches no clicks */
 #space {
   position: fixed;

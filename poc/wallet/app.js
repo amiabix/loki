@@ -263,40 +263,78 @@ function setPaymentActivity(card, did) {
   else { note.textContent = ''; note.hidden = true; }
 }
 
+/* one human status per attempt — the handoff's "one status, one next action" */
+function statusHeadline(payment, review, readiness) {
+  if (review && review.memo_utf8 != null) return 'Needs your approval';
+  if (payment.ready_to_send) return readiness.relay_ready === true
+    ? 'Two approvals verified' : 'Ready — this device can’t send yet';
+  switch (payment.phase) {
+    case 'draft': return 'Draft on this device';
+    case 'queued_for_delivery': return 'Sending proposal';
+    case 'approval_pending_delivery': return 'Delivering your approval';
+    case 'approval_interrupted': return 'Approval delivery needs attention';
+    case 'approved': return 'Approval delivered; waiting for the other member';
+    case 'broadcast':
+    case 'confirmation_needs_recheck': return 'Sent; waiting for confirmation on this device';
+    case 'confirmed': return 'Confirmed on this device';
+    default: return 'Preparing payment for review';
+  }
+}
+
+function payField(labelText, valueText, valueClass) {
+  const row = document.createElement('p');
+  row.className = 'pay-field';
+  const label = document.createElement('span');
+  label.className = 'pay-field-label';
+  label.textContent = labelText;
+  const value = document.createElement('span');
+  if (valueClass) value.className = valueClass;
+  value.textContent = valueText;
+  row.append(label, value);
+  return row;
+}
+
 function buildPaymentCard(payment, vault, {current, rowState, detail, isSigner, review, readiness}) {
   const card = document.createElement('section');
   card.className = 'card';
-  const title = document.createElement('h3');
-  title.textContent = `Payment ${payment.payment?.slice(0, 12) || payment.attempt.slice(0, 12)}…`;
-  card.append(title, stageList(current, rowState, detail));
-  card.append(note(`Signers: members ${payment.pair.join(' and ')}${isSigner ? ' — you are one of them' : ''}`
-                   + (payment.txid ? ` · transaction ${payment.txid.slice(0, 16)}…` : '')));
-  const activity = note('', 'muted');
-  activity.classList.add('payment-activity');
-  activity.hidden = true;
-  card.append(activity);
+  const head = document.createElement('h3');
+  head.textContent = statusHeadline(payment, review, readiness);
+  card.append(head);
+
+  if (review) {
+    /* amount and full recipient dominate; the rest is readable, not a pre dump */
+    const amount = document.createElement('p');
+    amount.className = 'pay-amount';
+    amount.textContent = `${zecFromZat(review.amount_zat)} ZEC`;
+    card.append(amount);
+    const to = document.createElement('p');
+    to.className = 'pay-to';
+    const toLabel = document.createElement('span');
+    toLabel.className = 'pay-field-label';
+    toLabel.textContent = 'To';
+    const addr = document.createElement('span');
+    addr.className = 'pay-addr';
+    addr.textContent = review.recipient;
+    to.append(toLabel, addr);
+    card.append(to);
+    card.append(payField('Memo', review.memo_utf8 == null ? 'Cannot display memo bytes' : JSON.stringify(review.memo_utf8)));
+    card.append(payField('Network fee', `${zecFromZat(review.fee_zat)} ZEC`));
+    card.append(payField('Change to the vault', `${zecFromZat(review.change_zat)} ZEC`));
+    card.append(payField('Expires at block', String(review.expiry_height)));
+    if (review.memo_utf8 == null) card.append(note('This memo does not render as text, so this payment cannot be approved here.', 'warning'));
+    else card.append(paymentButton('Approve this payment', async () => {
+      await api('payment-approve', {vault, attempt: payment.attempt, review_token: review.review_token});
+      paymentReviews.delete(payment.attempt);
+      message('Approval saved; delivering to the other members.');
+    }));
+  } else if (payment.phase !== 'draft' && !payment.ready_to_send) {
+    card.append(note(detail));
+  }
 
   if (payment.phase === 'draft') {
     card.append(paymentButton('Send this proposal', async () => {
       await api('payment-publish', {vault, attempt: payment.attempt});
       message('Proposal sent to the other members.');
-    }));
-  }
-
-  if (review) {
-    const summary = document.createElement('pre');
-    summary.textContent = `Recipient: ${review.recipient}\n`
-      + `Amount: ${zecFromZat(review.amount_zat)} ZEC (${review.amount_zat} zat)\n`
-      + `Memo: ${review.memo_utf8 == null ? 'Cannot display memo bytes' : JSON.stringify(review.memo_utf8)}\n`
-      + `Network fee: ${review.fee_zat} zat\n`
-      + `Change back to the vault: ${review.change_zat} zat\n`
-      + `Expires at block: ${review.expiry_height}`;
-    card.append(summary);
-    if (review.memo_utf8 == null) card.append(note('This memo does not render as text, so this payment cannot be approved here.', 'warning'));
-    else card.append(paymentButton('Approve this exact transaction', async () => {
-      await api('payment-approve', {vault, attempt: payment.attempt, review_token: review.review_token});
-      paymentReviews.delete(payment.attempt);
-      message('Approved. Your approval is on its way to the other member.');
     }));
   }
 
@@ -314,6 +352,22 @@ function buildPaymentCard(payment, vault, {current, rowState, detail, isSigner, 
       card.append(note(`Cannot send yet. ${readiness.relay_detail || 'This device cannot reach the relay.'} ${scanned}`, 'warning'));
     }
   }
+
+  /* IDs, signer slots, protocol stages and live activity are diagnostics */
+  const details = document.createElement('details');
+  details.className = 'aside';
+  const sum = document.createElement('summary');
+  sum.textContent = 'Payment details';
+  details.append(sum,
+    note(`Payment ${payment.payment?.slice(0, 16) || payment.attempt.slice(0, 16)}…`
+         + ` · signers: members ${payment.pair.join(' and ')}${isSigner ? ' (you are one)' : ''}`
+         + (payment.txid ? ` · tx ${payment.txid.slice(0, 16)}…` : '')),
+    stageList(current, rowState, detail));
+  const activity = note('', 'muted');
+  activity.classList.add('payment-activity');
+  activity.hidden = true;
+  details.append(activity);
+  card.append(details);
   return card;
 }
 
