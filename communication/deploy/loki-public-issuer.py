@@ -5,9 +5,12 @@ import json
 import re
 import stat
 import subprocess
+import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+MAX_REQUESTS = 16
 
 
 def make_server(root, port):
@@ -20,6 +23,7 @@ def make_server(root, port):
     binary = Path(__file__).resolve().parents[1] / "target/release/loki-owned-testnet-config"
     # shortcut: the 20-grant limit is process-local; use durable enrollment for permanent hosting.
     issued = {}
+    issued_lock = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
@@ -55,28 +59,55 @@ def make_server(root, port):
             if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
                 return self.reply(400)
             key = (device, policy, digest)
-            cached = issued.get(key)
-            if cached and cached[0] > time.time():
-                return self.reply(200, cached[1])
-            if key not in issued and len(issued) >= 20:
-                return self.reply(429)
-            try:
-                result = subprocess.run(
-                    (str(binary), "grant", str(root), device, policy, digest),
-                    capture_output=True, timeout=5,
-                )
-            except (OSError, subprocess.TimeoutExpired):
-                return self.reply(503)
-            if result.returncode or not 1 <= len(result.stdout) <= 4096:
-                return self.reply(400)
-            issued[key] = (time.time() + 3500, result.stdout)
-            self.reply(200, result.stdout)
+            with issued_lock:
+                cached = issued.get(key)
+                if cached and cached[0] > time.time():
+                    status, body = 200, cached[1]
+                elif key not in issued and len(issued) >= 20:
+                    status, body = 429, b""
+                else:
+                    try:
+                        result = subprocess.run(
+                            (str(binary), "grant", str(root), device, policy, digest),
+                            capture_output=True, timeout=5,
+                        )
+                    except (OSError, subprocess.TimeoutExpired):
+                        status, body = 503, b""
+                    else:
+                        if result.returncode or not 1 <= len(result.stdout) <= 4096:
+                            status, body = 400, b""
+                        else:
+                            status, body = 200, result.stdout
+                            issued[key] = (time.time() + 3500, body)
+            self.reply(status, body)
 
-    class Server(HTTPServer):
+    class Server(ThreadingHTTPServer):
+        daemon_threads = True
+
+        def __init__(self, address, handler):
+            self.slots = threading.BoundedSemaphore(MAX_REQUESTS)
+            super().__init__(address, handler)
+
         def get_request(self):
             connection, address = super().get_request()
             connection.settimeout(5)
             return connection, address
+
+        def process_request(self, request, client_address):
+            if not self.slots.acquire(blocking=False):
+                self.close_request(request)
+                return
+            try:
+                super().process_request(request, client_address)
+            except BaseException:
+                self.slots.release()
+                raise
+
+        def process_request_thread(self, request, client_address):
+            try:
+                super().process_request_thread(request, client_address)
+            finally:
+                self.slots.release()
 
     return Server(("127.0.0.1", port), Handler)
 
