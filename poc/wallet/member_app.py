@@ -1817,12 +1817,12 @@ def make_signer_server(wallet, port, dashboard_port=None):
                 self.end_headers()
                 self.wfile.write(page)
                 return
-            if path == "/app.js":
+            if path in ("/app.js", "/space.js"):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/javascript; charset=utf-8")
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
-                self.wfile.write((HERE / "app.js").read_bytes())
+                self.wfile.write((HERE / path.lstrip("/")).read_bytes())
                 return
             if path == "/app.css":
                 self.send_response(200)
@@ -2031,6 +2031,7 @@ def make_dashboard_server(signer_port, port):
                 return
             assets = {"/": ("dashboard.html", "text/html; charset=utf-8"),
                       "/dashboard.js": ("dashboard.js", "text/javascript; charset=utf-8"),
+                      "/space.js": ("space.js", "text/javascript; charset=utf-8"),
                       "/app.css": ("app.css", "text/css; charset=utf-8"),
                       **{font: (font.lstrip("/"), "font/woff2") for font in FONTS}}
             if self.path not in assets:

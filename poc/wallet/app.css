@@ -182,6 +182,16 @@ html {
 
 body { margin: 0; }
 
+/* the forward-flight starfield sits behind everything and catches no clicks */
+#space {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: -1;
+  pointer-events: none;
+}
+
 /* A single soft wash behind the content for depth — the scanlines and the
    eight-hairline corner frame were the loudest part of the HUD skin and are
    gone, leaving the cards to sit in clean, airy space. */
