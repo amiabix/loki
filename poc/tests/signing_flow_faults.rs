@@ -26,7 +26,7 @@ use std::{
 struct FirstWriter(BTreeSet<[u8; 32]>);
 impl NonceWitness for FirstWriter {
     fn pins(&self) -> loki_poc::signing_session::WitnessPins {
-        [([7; 32], [8; 32]), ([9; 32], [10; 32])]
+        [([7; 32], [8; 32], [17; 32]), ([9; 32], [10; 32], [19; 32])]
     }
     fn claim(&mut self, cid: [u8; 32], _: &[u8]) -> Result<(), String> {
         if !self.0.insert(cid) {
@@ -39,10 +39,46 @@ impl NonceWitness for FirstWriter {
 struct WrongRelays;
 impl NonceWitness for WrongRelays {
     fn pins(&self) -> loki_poc::signing_session::WitnessPins {
-        [([11; 32], [12; 32]), ([13; 32], [14; 32])]
+        [
+            ([11; 32], [12; 32], [21; 32]),
+            ([13; 32], [14; 32], [23; 32]),
+        ]
     }
     fn claim(&mut self, _: [u8; 32], _: &[u8]) -> Result<(), String> {
         panic!("mismatched relays must be refused before a claim")
+    }
+}
+
+struct OriginalRelayUnavailable;
+impl NonceWitness for OriginalRelayUnavailable {
+    fn pins(&self) -> loki_poc::signing_session::WitnessPins {
+        [([7; 32], [8; 32], [17; 32]), ([9; 32], [10; 32], [19; 32])]
+    }
+    fn claim(&mut self, _: [u8; 32], _: &[u8]) -> Result<(), String> {
+        Err("original relay unavailable".into())
+    }
+}
+
+struct SubstituteRelay;
+impl NonceWitness for SubstituteRelay {
+    fn pins(&self) -> loki_poc::signing_session::WitnessPins {
+        [
+            ([9; 32], [10; 32], [19; 32]),
+            ([11; 32], [12; 32], [21; 32]),
+        ]
+    }
+    fn claim(&mut self, _: [u8; 32], _: &[u8]) -> Result<(), String> {
+        panic!("a substitute relay must be refused before a nonce claim")
+    }
+}
+
+struct ChangedMailbox;
+impl NonceWitness for ChangedMailbox {
+    fn pins(&self) -> loki_poc::signing_session::WitnessPins {
+        [([7; 32], [8; 32], [27; 32]), ([9; 32], [10; 32], [19; 32])]
+    }
+    fn claim(&mut self, _: [u8; 32], _: &[u8]) -> Result<(), String> {
+        panic!("a changed mailbox must be refused before a nonce claim")
     }
 }
 use zcash_protocol::{memo::MemoBytes, value::Zatoshis};
@@ -163,7 +199,7 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
         fvk.clone(),
         2,
         "pass",
-        [([7; 32], [8; 32]), ([7; 32], [10; 32])],
+        [([7; 32], [8; 32], [17; 32]), ([7; 32], [10; 32], [19; 32])],
     );
     assert!(
         duplicate_relay_key.is_err(),
@@ -180,7 +216,7 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
         fvk.clone(),
         2,
         "pass",
-        [([7; 32], [8; 32]), ([9; 32], [10; 32])],
+        [([7; 32], [8; 32], [17; 32]), ([9; 32], [10; 32], [19; 32])],
     )
     .unwrap();
     let mut sets = Vec::new();
@@ -335,7 +371,7 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
     )
     .read_sealed("nonces.sealed", "pass")
     .unwrap();
-    bad_nonces[65..97].copy_from_slice(&[7; 32]);
+    bad_nonces[97..129].copy_from_slice(&[7; 32]);
     bad_dir
         .write_sealed("nonces.sealed", &bad_nonces, "pass")
         .unwrap();
@@ -351,6 +387,44 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
         "pass"
     )
     .is_err());
+    let legacy_root = root.join("bob-unbound-mailbox-restore");
+    let legacy_dir = MemberDir::create(
+        &legacy_root.join(hex::encode(ctx.payment)),
+        &hex::encode(ctx.attempt.0),
+    )
+    .unwrap();
+    fs::copy(
+        bob_attempt.join("started"),
+        legacy_dir.path().join("started"),
+    )
+    .unwrap();
+    let current = MemberDir::open(
+        &bob_root.join(hex::encode(ctx.payment)),
+        &hex::encode(ctx.attempt.0),
+    )
+    .read_sealed("nonces.sealed", "pass")
+    .unwrap();
+    let mut legacy = vec![1];
+    legacy.extend_from_slice(&current[1..65]);
+    legacy.extend_from_slice(&current[97..161]);
+    legacy.extend_from_slice(&current[193..]);
+    legacy_dir
+        .write_sealed("nonces.sealed", &legacy, "pass")
+        .unwrap();
+    assert!(SigningSession::reopen_sealed(
+        &legacy_root,
+        ctx.clone(),
+        &ak,
+        intent.clone(),
+        Identity::from_secret_bytes(&bob_sender.to_secret_bytes()).unwrap(),
+        bob_key.clone(),
+        public.clone(),
+        fvk.clone(),
+        "pass"
+    )
+    .err()
+    .unwrap()
+    .contains("start a new signing attempt"));
     assert!(SigningSession::reopen_sealed(
         &bob_root,
         ctx.clone(),
@@ -449,6 +523,45 @@ fn two_spend_review_refuses_swaps_before_share_and_recovery_resends_exact_wire()
         "pass",
     )
     .unwrap();
+    let restored_review = restored.review_package(&good, &alice_public).unwrap();
+    assert!(restored
+        .publish_approved_secured(
+            restored_review,
+            &alice_public,
+            &carol_public,
+            &mailbox,
+            "pass",
+            &mut OriginalRelayUnavailable
+        )
+        .is_err());
+    assert!(!old_attempt.join("share.sealed").exists());
+    assert!(!old_attempt.join("decision").exists());
+    let restored_review = restored.review_package(&good, &alice_public).unwrap();
+    assert!(restored
+        .publish_approved_secured(
+            restored_review,
+            &alice_public,
+            &carol_public,
+            &mailbox,
+            "pass",
+            &mut ChangedMailbox
+        )
+        .is_err());
+    assert!(!old_attempt.join("share.sealed").exists());
+    assert!(!old_attempt.join("decision").exists());
+    let restored_review = restored.review_package(&good, &alice_public).unwrap();
+    assert!(restored
+        .publish_approved_secured(
+            restored_review,
+            &alice_public,
+            &carol_public,
+            &mailbox,
+            "pass",
+            &mut SubstituteRelay
+        )
+        .is_err());
+    assert!(!old_attempt.join("share.sealed").exists());
+    assert!(!old_attempt.join("decision").exists());
     let restored_review = restored.review_package(&good, &alice_public).unwrap();
     assert!(restored
         .publish_approved_secured(

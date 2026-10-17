@@ -11,6 +11,14 @@ device crashes. Every unrun case is listed under
 [Device cases: NOT TESTED](#device-cases-not-tested), with a manual procedure for the two
 that matter most. G3 does not close until those pass.
 
+Rechecked 2026-10-17: the full Chromium and portable WebKit suites produced the
+same counts below; Playwright Firefox still did not launch. On both running engines,
+the named `strict-fails-mid-spend` drill released no share, and the named
+`restore-one-liar-honest-acknowledger-offline` drill recovered the simulated key.
+These are store-prototype results. The Rust payment signer pins a fixed relay pair
+and its exact mailboxes, refusing a replacement relay or mailbox instead of using
+the G3 prototype's 2-of-any-3 quorum.
+
 **Full G1 remains BLOCKED (ZIP 2005).** Nothing here changes that. G3 neither needs nor
 advances it.
 
@@ -220,6 +228,14 @@ assumed.
 
 Fail-closed also means a platform without strict durability **cannot sign at all**. That is the
 safe answer and also an unsolved product problem.
+
+On 2026-10-12, the separate `./run-g3.sh strict-fails-mid-spend` drill injected a strict
+transaction-construction error after the startup probe had succeeded. Before the fix, the WAL
+write silently retried without strict durability and a share was saved (1 unexpected failure).
+The store now rejects a previously supported write if strict construction fails or stops
+reflecting `strict`. The same drill passes with zero shares and the nonce still `Generated`.
+The next spend refuses `durability_unsupported` without releasing a share.
+This is a fault injection, not a claim that an exercised browser changed durability mid-spend.
 
 ## The receipt gate
 
@@ -451,6 +467,18 @@ relay-18767 ends up having "really acknowledged 1": it recorded the replay attem
 threshold failed. Over-reporting is the safe direction for rollback detection, and it means a
 relay's record includes attempts that never became shares.
 
+### Additional audit drill: one liar and one unavailable acknowledger
+
+On 2026-10-12, `./run-g3.sh restore-one-liar-honest-acknowledger-offline` ran separately from
+the 32-drill matrix above. Honest A and lying B acknowledged the first package while C was down.
+After a stale profile restore, A was down and honest C returned with no record of that package.
+B withheld its record, then B and C acknowledged a different package. The replay released a
+second share and `extractOnReuse` recovered the signing key. The drill asserts that the replay
+actually saves a share and the oracle detects reuse; it reports **EXPECTED FAILURE** (0 passed,
+1 failed). The first quorum `{A,B}` and second quorum `{B,C}` intersect only at lying B.
+Thus even one lying relay plus an outage defeats this 2-of-3 design. The historical matrix counts
+remain 29/32 and 6/8 because this is a separate named drill.
+
 ## The one-relay baseline, kept because it fails
 
 ```
@@ -650,8 +678,8 @@ case the drills model:
 - **Nothing about operator independence.** Three local processes sharing a kernel, a disk and a
   `kill` command are not three operators. The entire 2-of-3 argument rests on an assumption these
   drills are structurally unable to test.
-- **No production nonce safety.** `restore-all-acknowledgers-lying` is a real exploit path and it
-  is open. Two colluding acknowledgers defeat the gate completely.
+- **No production nonce safety.** `restore-all-acknowledgers-lying` and the additional
+  one-liar/one-outage drill both release shares for distinct packages after a stale restore.
 - **G3 is PARTIAL until real device crash tests pass.** A renderer crash and a browser `SIGKILL`
   on desktop Chromium are not device crashes: no power loss, no kernel panic, no OS-level storage
   eviction, no low-memory tab discard, no filesystem corruption. The platform restore matrix
@@ -699,11 +727,10 @@ case the drills model:
 
 ## Where the real fix has to come from
 
-A 2-of-3 threshold raises the bar from one honest party to one of three, and
-`restore-all-acknowledgers-lying` is what it costs when two of them collude. It also narrows the
-requirement in a way worth noticing: the honest party has to be one that *acknowledged*, so
-adding operators only helps if they all acknowledge every record. Three directions, none
-prototyped here:
+A 2-of-3 receipt gate protects a restored profile only while an honest original acknowledger
+remains reachable. The additional drill shows that one liar and one outage can leave two quorums
+intersecting only at the liar. More operators help only with a quorum rule that guarantees an
+honest intersection. Three directions, none prototyped here:
 
 1. **A hardware-backed, non-exportable, non-backed-up key store**, which is what
    the design already calls for on mobile, and which a web page does not have.

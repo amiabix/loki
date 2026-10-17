@@ -70,6 +70,7 @@ const only = process.argv[2];
 const EXPECTED_FAILURES = new Set([
   'restore-all-acknowledgers-lying',
   'restore-one-relay-baseline',
+  'restore-one-liar-honest-acknowledger-offline',
 ]);
 // Drills whose point is that the platform cannot be counted as passing.
 const INCONCLUSIVE = new Set(['durability-unsupported-is-not-a-pass']);
@@ -99,13 +100,21 @@ async function startRelays(modes) {
       env: { ...process.env, RELAY_MODE: mode, RELAY_PORT: String(PORTS[i]), RELAY_ID: IDS[i] },
       stdio: ['ignore', 'pipe', 'inherit'],
     });
-    await new Promise((res, rej) => {
-      proc.stdout.on('data', (d) => String(d).includes('relay ') && res());
-      proc.on('exit', (c) => rej(new Error(`relay exited ${c}`)));
-      setTimeout(() => rej(new Error('relay did not start')), 5000);
-    });
-    const pk = await fetch(`${base}/pubkey`).then((r) => r.json());
-    out.push({ relay_id: pk.relay_id, base, mode, proc, spki: pk.spki });
+    try {
+      await new Promise((res, rej) => {
+        const timeout = setTimeout(() => rej(new Error('relay did not start')), 30000);
+        proc.stdout.on('data', (d) => {
+          if (String(d).includes('relay ')) { clearTimeout(timeout); res(); }
+        });
+        proc.on('exit', (c) => { clearTimeout(timeout); rej(new Error(`relay exited ${c}`)); });
+      });
+      const pk = await fetch(`${base}/pubkey`).then((r) => r.json());
+      out.push({ relay_id: pk.relay_id, base, mode, proc, spki: pk.spki });
+    } catch (e) {
+      proc.kill('SIGKILL');
+      stopRelays(out);
+      throw e;
+    }
   }
   return out;
 }
@@ -206,7 +215,7 @@ async function drill(name, modes, body) {
   let ok = null, err = null;
   try { ok = await body({ dir, notes, relays }); } catch (e) { err = e; }
   stopRelays(relays);
-  const expected = EXPECTED_FAILURES.has(name);
+  const expected = EXPECTED_FAILURES.has(name) && !err;
   const unsupported = ok === 'unsupported';
   const inconclusive = INCONCLUSIVE.has(name) || unsupported;
   results.push({
@@ -464,6 +473,13 @@ async function restoreDrill(name, modes, opts, expect) {
   });
 }
 
+function expectedReuse({ start, retry, clean }) {
+  if (start.decision !== 'continue' || retry.event !== 'share_saved' || clean) {
+    throw new Error('expected nonce reuse was not reproduced');
+  }
+  return false;
+}
+
 // ── run ────────────────────────────────────────────────────────────────────
 
 // Engine identity, recorded exactly, before any drill runs.
@@ -541,6 +557,40 @@ console.log('\n== strict IndexedDB durability ==');
 await spendDrill('durability-unsupported-is-not-a-pass', ['honest', 'honest', 'honest'],
   { noDurability: true }, 'durability_unsupported');
 
+if (only === 'strict-fails-mid-spend') {
+  await drill(only, ['honest', 'honest', 'honest'], async ({ dir, notes, relays }) => {
+    const ctx = await launch(dir);
+    const page = await openPage(ctx, relays, pinOf(relays));
+    await ev(page, () => window.__store.startup());
+    const id = (await ev(page, () => window.__store.generate(1))).ids[0];
+    let error = null;
+    try {
+      const result = await ev(page, (id) => {
+        const original = IDBDatabase.prototype.transaction;
+        let once = true;
+        IDBDatabase.prototype.transaction = function (stores, mode, options) {
+          if (once && mode === 'readwrite' && options?.durability === 'strict') {
+            once = false;
+            throw new TypeError('injected strict failure');
+          }
+          return original.call(this, stores, mode, options);
+        };
+        return window.__store.spend('rid-1', id, 'pay alice 1');
+      }, id);
+      notes.push(`spend: ${say(result)}`);
+    } catch (e) { error = String(e); notes.push(`spend error: ${error}`); }
+    const sh = await shares(page);
+    const st = (await states(page)).find((n) => n.id === id);
+    const retry = await ev(page, (id) => window.__store.spend('rid-2', id, 'pay mallory 99'), id);
+    notes.push(`shares=${sh.length} nonce=${st.state}/${st.has_secret ? 'secret' : 'nosecret'}`);
+    notes.push(`retry: ${say(retry)}`);
+    await ctx.close();
+    return error?.includes('injected strict failure')
+      && sh.length === 0 && st.state === 'Generated' && st.has_secret
+      && retry.event === 'refused' && retry.code === 'durability_unsupported';
+  });
+}
+
 console.log('\n== two tabs racing for one commitment ==');
 await twoTabs('two-tabs-web-lock', true);
 await twoTabs('two-tabs-no-lock', false);
@@ -599,14 +649,21 @@ await restoreDrill('restore-no-acknowledger-reachable',
 await restoreDrill('restore-all-acknowledgers-lying',
   ['lying', 'lying', 'honest'],
   { downBeforeSpend: [C], upAfterSpend: [C] },
-  () => null);
+  expectedReuse);
+
+// A and B acknowledge the first share. After restore, A is offline, B lies, and C is
+// honest but empty. The two quorums intersect only at B, so even one liar can enable reuse.
+if (only === 'restore-one-liar-honest-acknowledger-offline') {
+  await restoreDrill(only, ['honest', 'lying', 'honest'],
+    { downBeforeSpend: [C], downAfterSpend: [A], upAfterSpend: [C] }, expectedReuse);
+}
 
 console.log('\n== the one-relay baseline, kept because it fails ==');
 // The SAME drill with the threshold set back to 1 and a single lying operator. Keeping the
 // one-relay design runnable is the only way the results above mean anything: without it, a
 // pass could be coming from some unrelated change rather than from the threshold.
 await restoreDrill('restore-one-relay-baseline', ['lying', null, null], { required: 1 },
-  () => null);
+  expectedReuse);
 
 // Durability, read from a real page on this engine rather than asserted.
 let realDurability = null;
