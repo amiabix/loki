@@ -30,6 +30,7 @@ pub mod relay_member;
 pub mod rpc;
 pub mod scan;
 pub mod scanstate;
+pub mod seal_kdf;
 pub mod setup_transport;
 pub mod setup_ceremony;
 pub mod signing_session;

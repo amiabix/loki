@@ -8,6 +8,9 @@ import secrets
 import subprocess
 import tempfile
 import threading
+import time
+
+import timing
 
 
 class HostedSetup:
@@ -70,12 +73,15 @@ class HostedSetup:
                     raise ValueError("Signer is locked")
                 process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 self.process = process
+            started = time.monotonic()
             try:
                 stdout, stderr = process.communicate(timeout=120)
+                timing.record(f"{self.wallet.setup.name} {action}", started, process.returncode, root, stderr=stderr)
                 if process.returncode:
                     raise ValueError(stderr.decode(errors="replace").strip() or "Hosted setup could not advance")
                 return stdout.decode().strip()
             except subprocess.TimeoutExpired as error:
+                timing.record(f"{self.wallet.setup.name} {action}", started, "timeout", root)
                 process.kill()
                 process.communicate()
                 raise ValueError("Hosted setup timed out; its saved state can be retried") from error

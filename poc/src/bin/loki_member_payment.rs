@@ -1329,6 +1329,7 @@ fn main() {
                 .into(),
         ),
     };
+    loki_poc::seal_kdf::report();
     if let Err(error) = result {
         eprintln!("error: {error}");
         process::exit(1);

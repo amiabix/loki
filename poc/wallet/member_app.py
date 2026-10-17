@@ -27,6 +27,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 from local_relays import configure_member, ensure_network, network_root, save as save_relay_state
 from local_funding import fund_member, funding_status
+import timing
 
 HERE = Path(__file__).resolve().parent
 SETUP = HERE.parent / "target" / "debug" / "loki_setup_member"
@@ -410,10 +411,13 @@ class Wallet:
                     argv.append(name)
                 else:
                     argv.append(str(arg))
+            started = time.monotonic()
             try:
                 result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
             except subprocess.TimeoutExpired as error:
+                timing.record(f"{binary.name} {action}", started, "timeout", *args)
                 raise Timeout(f"{action} did not finish within {timeout} seconds") from error
+            timing.record(f"{binary.name} {action}", started, result.returncode, *args, stderr=result.stderr)
             if result.returncode:
                 raise ValueError(result.stderr.strip() or result.stdout.strip() or f"{action} failed")
             return result.stdout.strip()

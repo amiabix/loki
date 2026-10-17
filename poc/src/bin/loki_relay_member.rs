@@ -62,6 +62,7 @@ fn main() {
             1
         }
     };
+    loki_poc::seal_kdf::report();
     std::process::exit(code);
 }
 

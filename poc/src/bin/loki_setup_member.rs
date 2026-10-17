@@ -982,6 +982,7 @@ fn main() {
         Some("run") => run(&args[1..]),
         _ => Err("usage: loki_setup_member profile-create|profile-open|identity|identity-public|fingerprint|run|backup-create|backup-verify|backup-finalize|backup-report|backup-reports|address|validate-roster|restore ...".into()),
     };
+    loki_poc::seal_kdf::report();
     if let Err(error) = result {
         eprintln!("error: {error}");
         process::exit(1);

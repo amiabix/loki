@@ -55,6 +55,9 @@ ciborium-io        = "0.2"
 probe-zip2005 = []
 setup-fault-injection = ["relay-communication"]
 relay-communication = ["dep:loki-relay-client", "dep:loki-relay-protocol"]
+# Counts Argon2id derivations and prints `kdf_derivations=N` to stderr at exit.
+# Measurement only: never in builds used for timing or acceptance.
+kdf-stats = []
 
 # Caller-supplied alpha is threaded into the spend before rk is derived.
 [patch.crates-io]
@@ -70,6 +73,12 @@ optional = true
 path = "../communication/protocol"
 optional = true
 
+[[example]]
+# Test-only fixture: stands up owned development relay operators and issues grants
+# with fixed keys for the hosted app flow (`wallet/test_hosted_app_flow.py`).
+name = "hosted_ops"
+required-features = ["relay-communication"]
+
 [[bin]]
 name = "loki_relay_member"
 path = "src/bin/loki_relay_member.rs"
@@ -77,3 +86,4 @@ required-features = ["relay-communication"]
 
 [dependencies.sha2]
 version = "=0.10.9"
+
