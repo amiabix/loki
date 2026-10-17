@@ -1296,12 +1296,26 @@ fn receive(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The node's block height only (`getblockcount`), for expiry checks that need no scan.
+fn tip(args: &[String]) -> Result<(), String> {
+    if !args.is_empty() {
+        return Err("tip".into());
+    }
+    let height = Rpc::regtest()
+        .json("getblockcount", "[]")?
+        .as_u64()
+        .ok_or("getblockcount did not return a height")?;
+    println!("{}", serde_json::json!({ "height": height }));
+    Ok(())
+}
+
 fn main() {
     let args = env::args().collect::<Vec<_>>();
     let result = match args.get(1).map(String::as_str) {
         Some("prepare") => prepare(&args[2..]),
         Some("local-wires") => local_wires(&args[2..]),
         Some("balance") => balance(&args[2..]),
+        Some("tip") => tip(&args[2..]),
         #[cfg(feature = "relay-communication")]
         Some("features") => {
             println!("relay-backed-signing=1");

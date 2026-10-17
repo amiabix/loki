@@ -364,6 +364,11 @@ def payment(flow, apps, vault, chain, source):
         if pump:
             for app in apps:
                 app.api("payment-sync", {"vault": vault})
+        else:
+            # Like the signer page: Send appears once the app reports ready_to_send.
+            listed = apps[2].api(f"payments?vault={vault}")["payments"]
+            if not any(item["attempt"] == attempt and item["ready_to_send"] for item in listed):
+                return {"phase": "waiting"}
         return apps[2].api("payment-finish", {"vault": vault, "attempt": attempt})
     sent = until(finish, lambda r: r["phase"] == "broadcast", "broadcast")
     flow.mark("broadcast")

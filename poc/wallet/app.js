@@ -9,13 +9,10 @@ let linkChallenge = null;
 let memberSlot = null;
 let memberCount = null;
 let renderedPaymentVault = null;
-let midFlight = [];
-let pumping = false;
-let pumpPaused = false;
 let paymentsLive = false;
+let refreshingPayments = false;
 let relaySetupPhase = null;
 const paymentReviews = new Map();
-const paymentActivity = new Map();
 
 function selectVault(vault) {
   selectedVault = vault;
@@ -27,11 +24,8 @@ function selectVault(vault) {
   memberSlot = null;
   memberCount = null;
   renderedPaymentVault = null;
-  midFlight = [];
   relaySetupPhase = null;
-  pumpPaused = false;
   paymentReviews.clear();
-  paymentActivity.clear();
   $('address').textContent = 'Open this vault to view the address.';
   $('balance').textContent = "Scan this device's chain view to see the balance.";
   $('words').textContent = '';
@@ -146,8 +140,9 @@ function vaultList(vaults) {
 }
 /* ── one payment, five stages ───────────────────────────────────────────────
    A member is told where the payment is, never which protocol call comes next.
-   Every mechanical step — publish, commit, package, resend, the on-chain
-   check — is performed by payment-advance on a poll. Exactly two
+   Every mechanical step — delivery, commit, package, resend, the on-chain
+   check — is performed by the app's payment worker while the profile is
+   unlocked, whether or not this page is open. Exactly two
    controls remain, because exactly two things are human decisions: approving
    an exact transaction that is on screen, and sending it. */
 
@@ -176,7 +171,6 @@ const PHASES = {
 };
 
 /* Local approval still needs chain updates; only confirmed is done. */
-const SETTLED = new Set(['confirmed']);
 
 const ZAT = 100000000n;
 
@@ -222,7 +216,6 @@ function paymentButton(label, run) {
     try {
       await run();
       await refreshPayments();
-      pumpPayments();
     } catch (error) { message(error.message, true); }
     finally { button.disabled = false; button.classList.remove('busy'); }
   });
@@ -260,12 +253,13 @@ async function refreshPayments() {
   const state = await api(`payments?vault=${encodeURIComponent(vault)}`);
   if (selectedVault !== vault) return;
   renderedPaymentVault = vault;
-  midFlight = [];
+  const updates = state.updates || {};
+  $('payment-updates').textContent = updates.error ? `Payment updates failed: ${updates.error} Retrying automatically; Check for updates to retry now.` : '';
+  $('payment-updates').hidden = !updates.error;
   const list = $('payment-list');
   list.replaceChildren();
   if (!state.payments.length) { list.textContent = 'No payments in this member’s app.'; return; }
   for (const payment of state.payments) {
-    if (!SETTLED.has(payment.phase)) midFlight.push(payment.attempt);
     const isSigner = payment.pair.includes(memberSlot);
     /* the exact transaction is fetched as soon as it can be read: checking it
        is not a decision, so it is not a button */
@@ -289,8 +283,6 @@ async function refreshPayments() {
     card.append(title, stageList(current, rowState, detail));
     card.append(note(`Signers: members ${payment.pair.join(' and ')}${isSigner ? ' — you are one of them' : ''}`
                      + (payment.txid ? ` · transaction ${payment.txid.slice(0, 16)}…` : '')));
-    const did = paymentActivity.get(payment.attempt);
-    if (did?.length) card.append(note(`Just ran on this device: ${did.join(', ')}.`));
 
     if (payment.phase === 'draft') {
       card.append(paymentButton('Send this proposal', async () => {
@@ -337,36 +329,14 @@ async function refreshPayments() {
   }
 }
 
-/* ── the poll that replaces the buttons ─────────────────────────────────────
-   One pass at a time, and it stops after a failure rather than repeating the
-   same red line every few seconds: "Check for updates" restarts it. */
-async function pumpPayments() {
-  if (pumping || pumpPaused || !paymentsLive || !selectedVault) return;
-  const vault = selectedVault;
-  pumping = true;
-  try {
-    await api('payment-sync', {vault});
-    for (const attempt of midFlight) {
-      if (selectedVault !== vault) return;
-      const result = await api('payment-advance', {vault, attempt});
-      paymentActivity.set(attempt, result.did || []);
-    }
-    if (selectedVault === vault) {
-      await refreshPayments();
-      if (selectedVault === vault) {
-        $('payment-updates').hidden = true;
-        $('payment-updates').textContent = '';
-      }
-    }
-  } catch (error) {
-    if (selectedVault !== vault) return;
-    pumpPaused = true;
-    const detail = error.surface === 'payment-sync' && error.message === 'member_sealed'
-      ? 'Payment relay configuration is unavailable for this vault. Complete relay setup or check the saved relay configuration. Receiving and balance checks are still available.'
-      : `Payment updates failed: ${error.message}`;
-    $('payment-updates').textContent = `${detail} Check for updates to retry.`;
-    $('payment-updates').hidden = false;
-  } finally { pumping = false; }
+/* ── payment updates ─────────────────────────────────────────────────────────
+   The page only reads: the list is cheap saved state, refreshed every 2 s while
+   payments are live. "Check for updates" asks the worker for one pass now. */
+async function refreshPaymentsQuietly() {
+  if (refreshingPayments || !paymentsLive || !selectedVault) return;
+  refreshingPayments = true;
+  try { await refreshPayments(); } catch { /* the next refresh tries again */ }
+  finally { refreshingPayments = false; }
 }
 async function refreshSignerRequests(unlocked) {
   const section = $('signer-requests');
@@ -740,7 +710,6 @@ async function refresh() {
         const relayPhase = state.relay_setup?.phase;
         $('relay-note').textContent = state.relay_setup?.detail || '';
         $('relay-note').hidden = !state.relay_setup;
-        if (relayPhase === 'ready' && relaySetupPhase !== 'ready') pumpPaused = false;
         relaySetupPhase = relayPhase;
         paymentsLive = paymentAvailable && (!state.relay_setup || relayPhase === 'ready');
         if (paymentAvailable && renderedPaymentVault !== selectedVault) await refreshPayments();
@@ -918,14 +887,21 @@ action('payment-draft', async (form) => {
   $('amount-zat').textContent = 'Up to 8 decimal places.';
   await api('payment-publish', {vault, attempt: draft.attempt});
   message('Proposal sent to the other members. You approve it below once the exact transaction is on screen.');
-  pumpPaused = false;
   await refreshPayments();
-  pumpPayments();
 });
 $('payment-draft').elements.amount_zec.addEventListener('input', amountEcho);
 $('refresh-payments').addEventListener('click', async () => {
-  pumpPaused = false;
-  await pumpPayments();
+  if (!selectedVault) return;
+  try {
+    await api('payment-sync', {vault: selectedVault});
+    await refreshPayments();
+  } catch (error) {
+    const detail = error.surface === 'payment-sync' && error.message === 'member_sealed'
+      ? 'Payment relay configuration is unavailable for this vault. Complete relay setup or check the saved relay configuration. Receiving and balance checks are still available.'
+      : `Payment updates failed: ${error.message}`;
+    $('payment-updates').textContent = `${detail} Check for updates to retry.`;
+    $('payment-updates').hidden = false;
+  }
 });
 /* ── theme ──────────────────────────────────────────────────────────────────
    No stored choice means follow the system, which the stylesheet's media query
@@ -974,4 +950,4 @@ $('setup-relays').addEventListener('click', async () => {
   } catch (error) { failure(error); }
   finally { $('setup-relays').disabled = false; }
 });
-refresh(); setInterval(refresh, 2000); setInterval(pumpPayments, 6000);
+refresh(); setInterval(refresh, 2000); setInterval(refreshPaymentsQuietly, 2000);

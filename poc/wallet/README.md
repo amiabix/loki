@@ -169,11 +169,18 @@ the proposal, publish commitments, build the package, review the transaction,
 approve that exact review, prove and broadcast, then verify it on chain. The
 review panel uses the Rust signer's verified transaction fields, not the
 proposal's annotation. Each member runs these controls in their own private
-signer window. **Refresh payments** uploads queued proposals and this member's
-authenticated signing messages, polls the relays, and imports messages for this
-member. The separate dashboard has no payment approval route. A local approval
+signer window. While the profile is unlocked, the app's payment worker does every
+step that needs no decision, whether or not a page is open: it delivers queued
+proposals and this member's authenticated signing messages, polls the relays,
+imports messages for this member, commits nonces, builds the package, retries
+saved approvals and checks the chain, in one relay process per pass (every 2 s
+while a payment is in flight, every 3 s otherwise). It can never review, approve
+or send; those stay buttons in the signer window, and a frozen allowlist refuses
+them on the worker thread. Lock stops the worker within 5 s. The page only reads
+the saved payment list; **Check for updates** asks the worker for one pass now.
+The separate dashboard has no payment approval route. A local approval
 remains pending delivery until every saved signing message has relay storage; confirmation is checked again against this member's
-chain view whenever the payment list is shown. If a signer closed after saving
+chain view at most every 30 s. If a signer closed after saving
 an approval, **Retry saved signing messages** republishes the same sealed share;
 it never creates another signature share.
 
