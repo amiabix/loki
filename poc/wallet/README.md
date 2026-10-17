@@ -180,7 +180,8 @@ them on the worker thread. Lock stops the worker within 5 s. The page only reads
 the saved payment list; **Check for updates** asks the worker for one pass now.
 The separate dashboard has no payment approval route. A local approval
 remains pending delivery until every saved signing message has relay storage; confirmation is checked again against this member's
-chain view at most every 30 s. If a signer closed after saving
+chain view at most every 10 s: one block-hash lookup confirms the block it was
+mined in is still on the chain, and the full verify runs again only after a reorg. If a signer closed after saving
 an approval, **Retry saved signing messages** republishes the same sealed share;
 it never creates another signature share.
 
@@ -272,8 +273,12 @@ the backup gate, relay connection, both transaction review panels, two approvals
 the third member's Send action, and confirmation in all three windows. Members
 discover the mined txid from its input nullifiers and then verify its exact
 approved effects; confirmation does not depend on the finisher announcing a txid.
-The chain lookup scans blocks from the proposal height on each pending check and
-is a test path, not the indexed sync a released wallet needs.
+Each member keeps a sealed scan cache (`chain/scan.sealed`, keyed by the vault's
+viewing key) with the notes, spends and block hashes it has scanned, so later
+scans read only new blocks; a cache that fails to open or no longer matches the
+chain is discarded and the scan starts over. The spend index answers the mined
+lookup without rereading blocks. It is still a regtest scan over RPC, not the
+light-client sync a released wallet needs.
 
 These tests run three private processes on one host and three relays under one
 test operator. They do not prove physical-device operation or independent relay
@@ -290,7 +295,7 @@ non-resumable DKG are development controls, not the planned relay transport.
 Data roots created by the previous one-vault app are left untouched and need an
 explicit migration before this version can open them; use a fresh root to test it.
 Separate directories under one OS account do not isolate a compromised account.
-There is no persistent chain cache or passkey UI in this app yet; use the existing
+There is no passkey UI in this app yet; use the existing
 separate-member CLI and harness for transaction testing. Do not use real funds.
 
 Verify the member flow:

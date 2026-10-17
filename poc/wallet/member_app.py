@@ -1392,8 +1392,16 @@ class Wallet:
                 self._recheck_confirmed(vault, attempt, work)
 
     def _recheck_confirmed(self, vault, attempt, work):
-        # shortcut: recheck each confirmed payment until the wallet has an indexed chain store.
+        """Is a confirmed payment still mined? While its recorded block is still on the
+        chain (one `getblockhash`), yes; otherwise, or without a recorded block, the full
+        `verify` decides, and a failure marks it for a recheck."""
         status = self.payment_phase(work)
+        if isinstance(status.get("mined_block"), str) and isinstance(status.get("mined_height"), int):
+            try:
+                self.command("chain-check", status["mined_height"], status["mined_block"], binary=PAYMENT, timeout=30)
+                return
+            except (ValueError, subprocess.TimeoutExpired):
+                pass
         try:
             _, _, _, output = self.payment_command("verify", vault, attempt, status["txid"])
             confirmed = re.search(r"\bverified mined txid=" + re.escape(status["txid"]) +
@@ -1529,12 +1537,13 @@ class Wallet:
         return {"configured": configured, "reachable": configured and live >= 2,
                 "inboxes": inboxes, "peers": peers, "live_relays": live}
 
-    def payment_status(self, work, phase, txid=None):
+    def payment_status(self, work, phase, txid=None, mined=None):
         # shortcut: this file is UI progress only; custody state remains in the Rust signer and chain.
         target = work / "payment-status.json"
         temporary = work / (".payment-status-" + secrets.token_hex(8))
         try:
-            write_new(temporary, json.dumps({"phase": phase, **({"txid": txid} if txid else {})}).encode())
+            write_new(temporary, json.dumps({"phase": phase, **({"txid": txid} if txid else {}),
+                                             **(mined or {})}).encode())
             os.replace(temporary, target)
         finally:
             temporary.unlink(missing_ok=True)
@@ -1673,7 +1682,9 @@ class Wallet:
         match = re.search(r"\bverified mined txid=([0-9a-f]{64}) confirmations=([1-9][0-9]*)\b", output)
         if not match or match.group(1) != txid:
             raise ValueError("Chain verification did not confirm this payment")
-        self.payment_status(work, "confirmed", txid)
+        located = re.search(r"\bblock=([0-9a-f]{64}) height=([0-9]+)$", output.strip())
+        self.payment_status(work, "confirmed", txid, {"mined_block": located.group(1),
+                                                       "mined_height": int(located.group(2))} if located else None)
         return {"phase": "confirmed", "txid": txid, "confirmations": int(match.group(2))}
 
     def advance_payment(self, vault, attempt):

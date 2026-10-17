@@ -658,6 +658,32 @@ class MemberWalletTest(unittest.TestCase):
             work = wallet.data / "vaults" / vault / "payments" / attempt
             self.assertEqual(wallet.payment_phase(work)["phase"],
                              "confirmation_needs_recheck")
+            # Verify records where the payment was mined; later rechecks ask only whether
+            # that block is still on the chain, and a reorg falls back to the full verify.
+            block, calls, reorged = "b" * 64, [], []
+
+            def command(action, *args, **_kwargs):
+                calls.append(action)
+                if action == "features": return "relay-backed-signing=1"
+                if action == "verify":
+                    if reorged: raise ValueError(missing)
+                    return f"verified mined txid={'e' * 64} confirmations=3 amount=40000000 block={block} height=105"
+                if action == "chain-check":
+                    self.assertEqual(args, (105, block))
+                    if reorged: raise ValueError("mined block is no longer on the chain")
+                    return "chain-check=ok height=105"
+                raise AssertionError(action)
+
+            with patch.object(wallet, "command", side_effect=command):
+                self.assertEqual(wallet.advance_payment(vault, attempt)["phase"], "confirmed")
+                self.assertEqual(wallet.payment_phase(work)["mined_height"], 105)
+                calls.clear()
+                self.assertEqual(wallet.advance_payment(vault, attempt)["phase"], "confirmed")
+                self.assertEqual([call for call in calls if call != "features"], ["chain-check"])
+                reorged.append(True)
+                self.assertEqual(wallet.advance_payment(vault, attempt)["phase"],
+                                 "confirmation_needs_recheck")
+                self.assertIn("verify", calls)
 
     def test_payment_list_starts_no_process(self):
         with tempfile.TemporaryDirectory(prefix="loki-payment-get-") as temp:

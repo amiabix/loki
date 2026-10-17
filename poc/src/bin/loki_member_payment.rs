@@ -17,6 +17,7 @@ use loki_poc::{
     intent::{ChangePolicy, Intent},
     member_state::{self, MemberState, Roster},
     payment_manifest::validate_roster,
+    chain_cache,
     rpc::Rpc,
     scan,
     signing_session::{
@@ -181,7 +182,12 @@ fn balance(args: &[String]) -> Result<(), String> {
         Path::new(&args[1]),
         Path::new(&args[2]),
     )?;
-    let chain = scan::scan_chain(&Rpc::regtest(), &member.fvk)?;
+    let chain = chain_cache::scan(
+        &Rpc::regtest(),
+        Path::new(&args[0]),
+        &member.fvk,
+        &member.vault,
+    )?;
     let balance_zat = chain
         .notes
         .iter()
@@ -210,7 +216,7 @@ fn prepare(args: &[String]) -> Result<(), String> {
     let work = Path::new(&args[3]);
     private_work(work)?;
     let rpc = Rpc::regtest();
-    let chain = scan::scan_chain(&rpc, &member.fvk)?;
+    let chain = chain_cache::scan(&rpc, Path::new(&args[0]), &member.fvk, &member.vault)?;
     let tip: u32 = chain.tip.try_into().map_err(|_| "height overflow")?;
     let recipient = vault::orchard_receiver_from_ua(&args[4], Regtest.network_type())?;
     let amount_zat: u64 = args[5].parse().map_err(|_| "invalid amount")?;
@@ -318,6 +324,7 @@ fn wait_message(
 }
 
 fn candidate(
+    owner: &Path,
     member: &MemberState,
     intent: &Intent,
     session: &SigningSession,
@@ -325,7 +332,7 @@ fn candidate(
     peer: Vec<frost::round1::SigningCommitments>,
 ) -> Result<PackagePayload, String> {
     let rpc = Rpc::regtest();
-    let chain = scan::scan_chain(&rpc, &member.fvk)?;
+    let chain = chain_cache::scan(&rpc, owner, &member.fvk, &member.vault)?;
     let notes = intent
         .input_nullifiers
         .iter()
@@ -489,7 +496,7 @@ fn sign(args: &[String]) -> Result<(), String> {
     let peer_commitments =
         commitments_from_message(&context, &commitment, intent.input_nullifiers.len())?;
     let package_message = if own == context.pair[0] {
-        let payload = candidate(&member, &intent, &session, context.pair, peer_commitments)?;
+        let payload = candidate(&owner, &member, &intent, &session, context.pair, peer_commitments)?;
         session.publish_package_to_roster(&member.roster.members, &payload, &mailbox, &pass)?;
         let wires =
             SigningSession::saved_package_wires(&owner.join("signing"), &context, own, &pass)?;
@@ -624,7 +631,7 @@ fn next_message(
 
 #[cfg(feature = "relay-communication")]
 fn package(args: &[String]) -> Result<(), String> {
-    let (member, _owner, pass, context, intent, mailbox, session) = reopen_signer(args)?;
+    let (member, owner, pass, context, intent, mailbox, session) = reopen_signer(args)?;
     let own = member.identity.public().id;
     if own != context.pair[0] {
         return Err("only the selected proposer builds this package".into());
@@ -638,7 +645,7 @@ fn package(args: &[String]) -> Result<(), String> {
         peer_id,
     )?;
     let peer = commitments_from_message(&context, &commitment, intent.input_nullifiers.len())?;
-    let payload = candidate(&member, &intent, &session, context.pair, peer)?;
+    let payload = candidate(&owner, &member, &intent, &session, context.pair, peer)?;
     session.publish_package_to_roster(&member.roster.members, &payload, &mailbox, &pass)?;
     println!("payment package published; members may review");
     Ok(())
@@ -973,7 +980,7 @@ fn finish(args: &[String], broadcast: bool) -> Result<(), String> {
         return Ok(());
     }
     let rpc = Rpc::regtest();
-    let chain = scan::scan_chain(&rpc, &member.fvk)?;
+    let chain = chain_cache::scan(&rpc, &owner, &member.fvk, &member.vault)?;
     let positions = indices
         .into_iter()
         .zip(&intent.input_nullifiers)
@@ -1179,39 +1186,66 @@ fn verify(args: &[String]) -> Result<(), String> {
     {
         return Err("mined amount or change differs from approved intent".into());
     }
+    // Where it was mined, so a later recheck can ask only whether that block is still
+    // on the chain (`chain-check`).
+    // A node that does not report the block leaves the recheck to a full `verify`.
+    let location = tx_json["blockhash"]
+        .as_str()
+        .filter(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .and_then(|block| {
+            let height = rpc
+                .json("getblock", &format!("[\"{block}\", 1]"))
+                .ok()?["height"]
+                .as_u64()?;
+            Some(format!(" block={block} height={height}"))
+        })
+        .unwrap_or_default();
     println!(
-        "verified mined txid={txid} confirmations={confirmations} amount={} fee={} change={} recipient_evidence={}",
+        "verified mined txid={txid} confirmations={confirmations} amount={} fee={} change={} recipient_evidence={}{location}",
         intent.amount_zat, fee, intent.change_zat,
         if paid.is_some() { "decrypted" } else { "candidate-opening-and-mined-sighash" }
     );
     Ok(())
 }
 
-fn mined_spend_in_block(
-    block: &serde_json::Value,
+/// Whether block `hash` is still the chain's block at `height` (`getblockhash` only).
+fn chain_check(args: &[String]) -> Result<(), String> {
+    let [height, hash] = args else {
+        return Err("chain-check <height> <block-hash>".into());
+    };
+    let height: u64 = height.parse().map_err(|_| "chain-check height")?;
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("chain-check block hash must be 32 hexadecimal bytes".into());
+    }
+    let current = Rpc::regtest().json("getblockhash", &format!("[{height}]"))?;
+    if current.as_str() != Some(hash.to_ascii_lowercase().as_str()) {
+        return Err("mined block is no longer on the chain".into());
+    }
+    println!("chain-check=ok height={height}");
+    Ok(())
+}
+
+/// The one transaction that spent every input of a payment, at or after its creation.
+fn mined_spend_in_index(
+    spent: &BTreeMap<[u8; 32], (u32, String)>,
     inputs: &[[u8; 32]],
+    created_height: u32,
 ) -> Result<Option<String>, String> {
     if inputs.is_empty() {
         return Err("payment has no input nullifiers".into());
     }
-    let transactions = block["tx"].as_array().ok_or("block has no tx array")?;
-    for tx in transactions {
-        let Some(actions) = tx["ironwood"]["actions"].as_array() else {
-            continue;
-        };
-        let nullifiers = actions
-            .iter()
-            .map(|action| scan::hex32(action, "nullifier").ok_or("invalid mined nullifier"))
-            .collect::<Result<Vec<_>, _>>()?;
-        if inputs.iter().all(|input| nullifiers.contains(input)) {
-            return tx["txid"]
-                .as_str()
-                .map(str::to_owned)
-                .map(Some)
-                .ok_or_else(|| "mined spend has no transaction ID".into());
+    let mut found = None;
+    for input in inputs {
+        match spent.get(input) {
+            Some((height, txid)) if *height >= created_height => match &found {
+                None => found = Some(txid.clone()),
+                Some(seen) if seen == txid => {}
+                Some(_) => return Ok(None),
+            },
+            _ => return Ok(None),
         }
     }
-    Ok(None)
+    Ok(found)
 }
 
 /// Chain-derived txid discovery is a hint only. `verify` checks the exact
@@ -1225,17 +1259,12 @@ fn find_mined(args: &[String]) -> Result<(), String> {
     private_work(work)?;
     let (context, intent) = manifest(&work.join("payment.json"))?;
     check_manifest_roster(&member.roster, &context, &intent)?;
-    let rpc = Rpc::regtest();
-    let tip = rpc
-        .json("getblockcount", "[]")?
-        .as_u64()
-        .ok_or("getblockcount did not return a height")?;
-    for height in u64::from(intent.created_height)..=tip {
-        let block = rpc.json("getblock", &format!("[\"{height}\", 2]"))?;
-        if let Some(txid) = mined_spend_in_block(&block, &intent.input_nullifiers)? {
-            println!("mined txid={txid}");
-            return Ok(());
-        }
+    // The incremental scan's spent index names the transaction that revealed each
+    // vault nullifier; no per-height search.
+    let chain = chain_cache::scan_state(&Rpc::regtest(), Path::new(&args[0]), &member.fvk, &member.vault)?;
+    if let Some(txid) = mined_spend_in_index(&chain.spent, &intent.input_nullifiers, intent.created_height)? {
+        println!("mined txid={txid}");
+        return Ok(());
     }
     println!("not mined");
     Ok(())
@@ -1316,6 +1345,7 @@ fn main() {
         Some("local-wires") => local_wires(&args[2..]),
         Some("balance") => balance(&args[2..]),
         Some("tip") => tip(&args[2..]),
+        Some("chain-check") => chain_check(&args[2..]),
         #[cfg(feature = "relay-communication")]
         Some("features") => {
             println!("relay-backed-signing=1");
@@ -1357,19 +1387,23 @@ mod tests {
 
     #[test]
     fn mined_spend_discovery_requires_all_intent_inputs_in_one_transaction() {
-        let first = [1u8; 32];
-        let second = [2u8; 32];
-        let block = json!({"tx": [
-            {"txid": "unrelated", "ironwood": {"actions": [{"nullifier": hex::encode(first)}]}},
-            {"txid": "matching", "ironwood": {"actions": [
-                {"nullifier": hex::encode(first)}, {"nullifier": hex::encode(second)}]}},
-        ]});
+        let (first, second) = ([1u8; 32], [2u8; 32]);
+        let spent = BTreeMap::from([
+            (first, (40, "matching".to_string())),
+            (second, (40, "matching".to_string())),
+            ([3u8; 32], (41, "other".to_string())),
+            ([4u8; 32], (12, "early".to_string())),
+        ]);
         assert_eq!(
-            mined_spend_in_block(&block, &[first, second]).unwrap(),
+            mined_spend_in_index(&spent, &[first, second], 30).unwrap(),
             Some("matching".into())
         );
-        assert_eq!(mined_spend_in_block(&block, &[[3u8; 32]]).unwrap(), None);
-        assert!(mined_spend_in_block(&block, &[]).is_err());
+        // Inputs spent by different transactions, an unspent input, or a spend before
+        // the payment existed are not this payment.
+        assert_eq!(mined_spend_in_index(&spent, &[first, [3u8; 32]], 30).unwrap(), None);
+        assert_eq!(mined_spend_in_index(&spent, &[first, [5u8; 32]], 30).unwrap(), None);
+        assert_eq!(mined_spend_in_index(&spent, &[[4u8; 32]], 30).unwrap(), None);
+        assert!(mined_spend_in_index(&spent, &[], 30).is_err());
     }
 
     #[test]

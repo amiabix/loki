@@ -25,6 +25,7 @@ ALLOWED = frozenset({
     ("loki_member_payment", "find-mined"),
     ("loki_member_payment", "verify"),
     ("loki_member_payment", "tip"),
+    ("loki_member_payment", "chain-check"),
     ("loki_member_payment", "features"),
 })
 NEVER = frozenset({"review", "approve-reviewed", "finish"})
@@ -32,7 +33,7 @@ NEVER = frozenset({"review", "approve-reviewed", "finish"})
 SETTLED = frozenset({"confirmed", "draft"})
 MID_FLIGHT_SECONDS = 2
 IDLE_SECONDS = 3
-CONFIRMED_RECHECK_SECONDS = 30
+CONFIRMED_RECHECK_SECONDS = 10
 STOP_SECONDS = 5
 
 

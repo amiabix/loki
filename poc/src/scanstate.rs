@@ -47,6 +47,11 @@ pub struct ScanState {
     pub nfs: Vec<[u8; 32]>,
     /// The vault's own actions, in the same order.
     pub found: Vec<Found>,
+    /// For each vault note already spent on the chain: the height and txid of the
+    /// transaction that revealed its nullifier.
+    pub spent: std::collections::BTreeMap<[u8; 32], (u32, String)>,
+    /// Nullifiers of the vault notes in `found`; rebuilt from them, never stored.
+    own: std::collections::HashSet<[u8; 32]>,
 }
 
 impl ScanState {
@@ -65,7 +70,13 @@ impl ScanState {
             let position = self.cmxs.len() as u64;
             self.cmxs.push(raw.cmx);
             self.nfs.push(raw.nullifier);
-            if vault_note_at(fvk, ivks, height, txid, position, raw).is_some() {
+            if self.own.contains(&raw.nullifier) {
+                self.spent
+                    .entry(raw.nullifier)
+                    .or_insert_with(|| (height, txid.to_string()));
+            }
+            if let Some(note) = vault_note_at(fvk, ivks, height, txid, position, raw) {
+                self.own.insert(note.nullifier);
                 self.found.push(Found {
                     height,
                     txid: txid.to_string(),
@@ -116,6 +127,17 @@ impl ScanState {
         })
     }
 
+    /// Rebuild the nullifier set of the vault's own notes after [`ScanState::decode`].
+    pub fn rebuild_own(&mut self, fvk: &FullViewingKey) {
+        let ivks = vault_ivks(fvk);
+        self.own = self
+            .found
+            .iter()
+            .filter_map(|f| vault_note_at(fvk, &ivks, f.height, &f.txid, f.position, &f.action))
+            .map(|note| note.nullifier)
+            .collect();
+    }
+
     /// Read state left by an earlier scan. A missing file is the first scan, not an error.
     pub fn load(path: &Path) -> Result<Self, String> {
         let text = match std::fs::read_to_string(path) {
@@ -123,10 +145,14 @@ impl ScanState {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(e) => return Err(format!("{}: {e}", path.display())),
         };
+        Self::decode(&text).map_err(|line| format!("{}:{line}: malformed scan state", path.display()))
+    }
 
+    /// Parse [`ScanState::encode`]'s text; the error is the 1-based bad line.
+    pub fn decode(text: &str) -> Result<Self, usize> {
         let mut state = Self::default();
         for (i, line) in text.lines().enumerate() {
-            let bad = || format!("{}:{}: malformed scan state", path.display(), i + 1);
+            let bad = || i + 1;
             let mut f = line.split_whitespace();
             match f.next() {
                 None => continue,
@@ -145,6 +171,12 @@ impl ScanState {
                 Some("c") => {
                     state.cmxs.push(field(&mut f).ok_or_else(bad)?);
                     state.nfs.push(field(&mut f).ok_or_else(bad)?);
+                }
+                Some("s") => {
+                    let nf = field(&mut f).ok_or_else(bad)?;
+                    let height = f.next().and_then(|v| v.parse().ok()).ok_or_else(bad)?;
+                    let txid = f.next().ok_or_else(bad)?.to_string();
+                    state.spent.insert(nf, (height, txid));
                 }
                 Some("n") => {
                     let height = f.next().and_then(|v| v.parse().ok()).ok_or_else(bad)?;
@@ -175,10 +207,43 @@ impl ScanState {
         Ok(state)
     }
 
-    /// Write the state for the next scan to pick up.
-    ///
-    /// One record per line, hex throughout: the file is big enough to want to look at
+    /// One record per line, hex throughout: the text is big enough to want to look at
     /// with `grep` when a scan disagrees with the node.
+    pub fn encode(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        if let Some(hash) = self.tip_hash {
+            let _ = writeln!(out, "tip {} {}", self.tip, hex::encode(hash));
+        } else {
+            let _ = writeln!(out, "tip {}", self.tip);
+        }
+        for (c, nf) in self.cmxs.iter().zip(self.nfs.iter()) {
+            let _ = writeln!(out, "c {} {}", hex::encode(c), hex::encode(nf));
+        }
+        for (nf, (height, txid)) in &self.spent {
+            let _ = writeln!(out, "s {} {height} {txid}", hex::encode(nf));
+        }
+        for n in &self.found {
+            let a = &n.action;
+            let _ = writeln!(
+                out,
+                "n {} {} {} {} {} {} {} {} {} {}",
+                n.height,
+                n.position,
+                n.txid,
+                hex::encode(a.cv),
+                hex::encode(a.nullifier),
+                hex::encode(a.rk),
+                hex::encode(a.cmx),
+                hex::encode(a.ephemeral_key),
+                hex::encode(&a.enc_ciphertext),
+                hex::encode(a.out_ciphertext),
+            );
+        }
+        out
+    }
+
+    /// Write the state for the next scan to pick up.
     pub fn save(&self, path: &Path) -> Result<(), String> {
         let io = |e: std::io::Error| format!("{}: {e}", path.display());
         let mut random = [0u8; 8];
@@ -194,33 +259,7 @@ impl ScanState {
             }
             let f = options.open(&temp).map_err(io)?;
             let mut out = std::io::BufWriter::new(f);
-
-            if let Some(hash) = self.tip_hash {
-                writeln!(out, "tip {} {}", self.tip, hex::encode(hash)).map_err(io)?;
-            } else {
-                writeln!(out, "tip {}", self.tip).map_err(io)?;
-            }
-            for (c, nf) in self.cmxs.iter().zip(self.nfs.iter()) {
-                writeln!(out, "c {} {}", hex::encode(c), hex::encode(nf)).map_err(io)?;
-            }
-            for n in &self.found {
-                let a = &n.action;
-                writeln!(
-                    out,
-                    "n {} {} {} {} {} {} {} {} {} {}",
-                    n.height,
-                    n.position,
-                    n.txid,
-                    hex::encode(a.cv),
-                    hex::encode(a.nullifier),
-                    hex::encode(a.rk),
-                    hex::encode(a.cmx),
-                    hex::encode(a.ephemeral_key),
-                    hex::encode(&a.enc_ciphertext),
-                    hex::encode(a.out_ciphertext),
-                )
-                .map_err(io)?;
-            }
+            out.write_all(self.encode().as_bytes()).map_err(io)?;
             out.flush().map_err(io)?;
             out.get_ref().sync_all().map_err(io)?;
             std::fs::rename(&temp, path).map_err(io)?;
@@ -239,7 +278,7 @@ fn field<'a, const N: usize>(f: &mut impl Iterator<Item = &'a str>) -> Option<[u
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::scan::scan_blocks;
     use orchard::{
@@ -251,7 +290,7 @@ mod tests {
     };
     use zcash_note_encryption::Domain;
 
-    fn a_fvk(seed: u8) -> FullViewingKey {
+    pub(crate) fn a_fvk(seed: u8) -> FullViewingKey {
         FullViewingKey::from(&SpendingKey::from_bytes([seed; 32]).unwrap())
     }
 
@@ -259,7 +298,7 @@ mod tests {
     ///
     /// `cv` and `rk` only have to be structurally valid points for the action to be
     /// rebuilt; `ak` is one, so it stands in for both.
-    fn action_json(fvk: &FullViewingKey, value: u64, seed: u8) -> serde_json::Value {
+    pub(crate) fn action_json(fvk: &FullViewingKey, value: u64, seed: u8) -> serde_json::Value {
         // The action's rho IS its nullifier field, so the note has to be built from the
         // same bytes or the domain the scanner derives would not decrypt it.
         let nf = [seed; 32];
@@ -287,7 +326,7 @@ mod tests {
         })
     }
 
-    fn tx(txid: &str, actions: Vec<serde_json::Value>) -> serde_json::Value {
+    pub(crate) fn tx(txid: &str, actions: Vec<serde_json::Value>) -> serde_json::Value {
         serde_json::json!({ "txid": txid, "ironwood": { "actions": actions } })
     }
 
@@ -295,7 +334,7 @@ mod tests {
     ///
     /// Vault notes sit behind decoys, in more than one block and more than one
     /// transaction, so a wrong position would not survive by luck.
-    fn canned_chain(vault: &FullViewingKey, decoy: &FullViewingKey) -> Vec<serde_json::Value> {
+    pub(crate) fn canned_chain(vault: &FullViewingKey, decoy: &FullViewingKey) -> Vec<serde_json::Value> {
         let mut height = 0u8;
         let mut block = |txs: Vec<serde_json::Value>| {
             height += 1;
@@ -324,7 +363,7 @@ mod tests {
         ]
     }
 
-    fn rebranch(chain: &mut [serde_json::Value], from: usize) {
+    pub(crate) fn rebranch(chain: &mut [serde_json::Value], from: usize) {
         for i in from..chain.len() {
             chain[i]["hash"] = serde_json::json!(format!("{:064x}", i + 101));
             chain[i]["previousblockhash"] =
