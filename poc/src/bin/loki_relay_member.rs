@@ -469,9 +469,10 @@ fn commit_payload(
 
 fn send_proposal(root: &Path, pass: &Path, roster: &Path, proposal: &Path) -> Result<(), Exit> {
     let manifest = read_exact(proposal, payment_manifest::MAX_MANIFEST, false)?;
-    let (context, intent) =
-        payment_manifest::parse(&manifest).map_err(|_| Exit::Member(MemberError::Markers))?;
     let mut session = open_session(root, pass, roster)?;
+    let (context, intent) =
+        payment_manifest::parse_for_network(&manifest, session.member.network)
+            .map_err(|_| Exit::Member(MemberError::Markers))?;
     payment_manifest::validate_roster(
         session.member.roster.vault,
         session.member.threshold,
@@ -486,8 +487,10 @@ fn send_proposal(root: &Path, pass: &Path, roster: &Path, proposal: &Path) -> Re
     {
         return Err(Exit::Member(MemberError::Identity));
     }
-    let payload =
-        Zeroizing::new(encode_proposal(&manifest).map_err(|_| Exit::Member(MemberError::Markers))?);
+    let payload = Zeroizing::new(
+        encode_proposal(&manifest, session.member.network)
+            .map_err(|_| Exit::Member(MemberError::Markers))?,
+    );
     commit_payload(
         &mut session,
         &payload,
@@ -532,7 +535,7 @@ fn import_proposals(root: &Path, pass: &Path, roster: &Path, payments: &Path) ->
             let Payload::Test(payload) = &body.payload else {
                 return Ok(());
             };
-            let manifest = match decode_proposal(payload) {
+            let manifest = match decode_proposal(payload, session.member.network) {
                 Ok(Some(manifest)) => manifest,
                 Ok(None) => return Ok(()),
                 Err(_) => {
@@ -540,7 +543,9 @@ fn import_proposals(root: &Path, pass: &Path, roster: &Path, payments: &Path) ->
                     return Ok(());
                 }
             };
-            let Ok((context, intent)) = payment_manifest::parse(manifest) else {
+            let Ok((context, intent)) =
+                payment_manifest::parse_for_network(manifest, session.member.network)
+            else {
                 rejected += 1;
                 return Ok(());
             };
@@ -747,7 +752,7 @@ fn export_signing(
             let Payload::Test(wire) = &opened.message().body().payload else {
                 return Ok(());
             };
-            match decode_proposal(wire) {
+            match decode_proposal(wire, session.member.network) {
                 Ok(Some(_)) | Err(_) => return Ok(()),
                 Ok(None) => {}
             }

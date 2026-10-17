@@ -166,21 +166,21 @@ pub fn validate_roster(
     Ok(())
 }
 
-pub fn encode_proposal(raw: &[u8]) -> Result<Vec<u8>, String> {
+pub fn encode_proposal(raw: &[u8], network: VaultNetwork) -> Result<Vec<u8>, String> {
     require_explicit_signers(raw)?;
-    parse(raw)?;
+    parse_for_network(raw, network)?;
     let mut out = Vec::with_capacity(PROPOSAL_DOMAIN.len() + raw.len());
     out.extend_from_slice(PROPOSAL_DOMAIN);
     out.extend_from_slice(raw);
     Ok(out)
 }
 
-pub fn decode_proposal(raw: &[u8]) -> Result<Option<&[u8]>, String> {
+pub fn decode_proposal(raw: &[u8], network: VaultNetwork) -> Result<Option<&[u8]>, String> {
     let Some(manifest) = raw.strip_prefix(PROPOSAL_DOMAIN) else {
         return Ok(None);
     };
     require_explicit_signers(manifest)?;
-    parse(manifest)?;
+    parse_for_network(manifest, network)?;
     Ok(Some(manifest))
 }
 
@@ -230,25 +230,33 @@ mod tests {
     #[test]
     fn proposal_tag_and_intent_are_required() {
         let raw = fixture();
-        let envelope = encode_proposal(&raw).unwrap();
-        assert_eq!(decode_proposal(&envelope).unwrap(), Some(raw.as_slice()));
-        assert_eq!(decode_proposal(&raw).unwrap(), None);
+        let envelope = encode_proposal(&raw, VaultNetwork::Regtest).unwrap();
+        assert_eq!(
+            decode_proposal(&envelope, VaultNetwork::Regtest).unwrap(),
+            Some(raw.as_slice())
+        );
+        assert_eq!(decode_proposal(&raw, VaultNetwork::Regtest).unwrap(), None);
         let mut wrong = envelope.clone();
         wrong[0] ^= 1;
-        assert_eq!(decode_proposal(&wrong).unwrap(), None);
+        assert_eq!(decode_proposal(&wrong, VaultNetwork::Regtest).unwrap(), None);
         let mut changed: Value = serde_json::from_slice(&raw).unwrap();
         changed["amount_zat"] = json!(100_001);
-        assert!(encode_proposal(&serde_json::to_vec(&changed).unwrap()).is_err());
+        assert!(
+            encode_proposal(&serde_json::to_vec(&changed).unwrap(), VaultNetwork::Regtest).is_err()
+        );
         assert!(decode_proposal(
-            &[PROPOSAL_DOMAIN, &serde_json::to_vec(&changed).unwrap()].concat()
+            &[PROPOSAL_DOMAIN, &serde_json::to_vec(&changed).unwrap()].concat(),
+            VaultNetwork::Regtest
         )
         .is_err());
         let mut legacy: Value = serde_json::from_slice(&raw).unwrap();
         legacy.as_object_mut().unwrap().remove("pair");
         let legacy = serde_json::to_vec(&legacy).unwrap();
         assert!(parse(&legacy).is_ok());
-        assert!(encode_proposal(&legacy).is_err());
-        assert!(decode_proposal(&[PROPOSAL_DOMAIN, &legacy].concat()).is_err());
+        assert!(encode_proposal(&legacy, VaultNetwork::Regtest).is_err());
+        assert!(
+            decode_proposal(&[PROPOSAL_DOMAIN, &legacy].concat(), VaultNetwork::Regtest).is_err()
+        );
     }
 
     #[test]
@@ -287,5 +295,19 @@ mod tests {
         let testnet = serde_json::to_vec(&value).unwrap();
         assert!(parse_for_network(&testnet, VaultNetwork::Testnet).is_ok());
         assert!(parse(&testnet).is_err());
+    }
+
+    #[test]
+    fn testnet_proposal_round_trips() {
+        let mut value: Value = serde_json::from_slice(&fixture()).unwrap();
+        value["network"] = json!("testnet");
+        let raw = serde_json::to_vec(&value).unwrap();
+        let encoded = encode_proposal(&raw, VaultNetwork::Testnet).unwrap();
+        assert_eq!(
+            decode_proposal(&encoded, VaultNetwork::Testnet).unwrap(),
+            Some(raw.as_slice())
+        );
+        assert!(encode_proposal(&raw, VaultNetwork::Regtest).is_err());
+        assert!(decode_proposal(&encoded, VaultNetwork::Regtest).is_err());
     }
 }

@@ -186,6 +186,66 @@ fn relay_loads_testnet_roster_and_binds_birth_height() {
     f.seal(&state);
     refuses(&f, "member_roster");
 }
+
+#[test]
+fn relay_sends_only_proposals_for_its_certified_testnet_vault() {
+    use loki_poc::intent::{ChangePolicy, Intent};
+    let f = Fixture::with_policy(true);
+    let mut roster: Value = serde_json::from_slice(&fs::read(&f.roster).unwrap()).unwrap();
+    roster["network"] = Value::from("testnet");
+    roster["birth_height"] = Value::from(4_500_000);
+    let bytes = serde_json::to_vec(&roster).unwrap();
+    fs::write(&f.roster, &bytes).unwrap();
+    let fingerprint = loki_poc::member_state::Roster::from_bytes(&bytes).unwrap().fingerprint();
+    let mut state = f.state();
+    state["network"] = Value::from("testnet");
+    state["birth_height"] = Value::from(4_500_000);
+    state["roster_fingerprint"] = Value::from(hex::encode(fingerprint));
+    f.seal(&state);
+
+    let root = f.root.canonicalize().unwrap();
+    let proposer = reddsa_frost::frost::redpallas::Identifier::try_from(2u16)
+        .unwrap()
+        .serialize();
+    let intent = Intent {
+        proposer: proposer.clone(),
+        created_height: 4_500_000,
+        input_nullifiers: vec![[3; 32]],
+        recipient: vec![4; 43],
+        amount_zat: 100_000,
+        memo: b"memo".to_vec(),
+        change_policy: ChangePolicy::VaultInternal,
+        fee_zat: 10_000,
+        change_zat: 200_000,
+        expiry_height: 4_501_000,
+    };
+    let mut manifest = serde_json::json!({
+        "version": 1, "network": "testnet", "vault": hex::encode(f.loaded().unwrap().roster.vault),
+        "payment": hex::encode(intent.proposal_id()), "attempt": hex::encode([8; 32]),
+        "pair": [1, 2], "proposer": hex::encode(proposer), "created_height": 4_500_000,
+        "input_nullifiers": [hex::encode([3; 32])], "recipient": hex::encode([4; 43]),
+        "amount_zat": 100_000, "memo": hex::encode(b"memo"),
+        "change_policy": "vault_internal", "fee_zat": 10_000,
+        "change_zat": 200_000, "expiry_height": 4_501_000,
+    });
+    let proposal = root.join("proposal.json");
+    let send = || member_cli(&[
+        member_arg("send-proposal"), member_arg("--member-root"), member_arg(&root),
+        member_arg("--passphrase-file"), member_arg(&f.pass),
+        member_arg("--roster"), member_arg(&f.roster),
+        member_arg("--proposal-file"), member_arg(&proposal),
+    ]);
+    fs::write(&proposal, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    private(&proposal, false);
+    let result = send();
+    assert!(result.status.success(), "{}", member_stderr(&result));
+
+    manifest["network"] = Value::from("regtest");
+    fs::write(&proposal, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let result = send();
+    assert_eq!(result.status.code(), Some(1));
+    assert_eq!(member_stderr(&result).trim(), "member_markers");
+}
 struct Fixture {
     root: PathBuf,
     pass: PathBuf,
@@ -543,6 +603,7 @@ fn config_members() -> Vec<loki_poc::relay_member::LoadedMember> {
             identity,
             roster: roster.clone(),
             threshold: 2,
+            network: loki_poc::network::VaultNetwork::Regtest,
         })
         .collect()
 }
@@ -607,6 +668,7 @@ fn sealed_revision_codec_authenticated_association() {
         identity,
         roster: wrong_roster,
         threshold: 2,
+        network: loki_poc::network::VaultNetwork::Regtest,
     };
     assert!(restored.authenticated(&wrong).is_err());
 }

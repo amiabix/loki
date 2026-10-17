@@ -1211,7 +1211,12 @@ fn finish_owned_handoff(
                 raw.as_slice().try_into().unwrap(),
             )
             .unwrap();
-            let loaded = loki_poc::relay_member::LoadedMember { identity, roster, threshold: 2 };
+            let loaded = loki_poc::relay_member::LoadedMember {
+                identity,
+                roster,
+                threshold: 2,
+                network: certified_roster.network,
+            };
             let db =
                 loki_relay_client::ClientStore::open(&path.join("transport"), &loaded.roster, slot)
                     .unwrap();

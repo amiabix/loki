@@ -202,6 +202,7 @@ impl HostedSetup {
             identity: Self::identity(&self.root, &self.passphrase)?,
             roster: accepted.roster().clone(),
             threshold: accepted.context().policy().threshold,
+            network: crate::network::VaultNetwork::parse(&accepted.context().policy().network)?,
         };
         let saved = SavedActivation::decode(
             engine.prepared_delivery()?,

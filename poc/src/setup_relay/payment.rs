@@ -480,6 +480,7 @@ impl HostedSetup {
             identity: Self::identity(&self.root, &self.passphrase)?,
             roster: accepted.roster().clone(),
             threshold: accepted.context().policy().threshold,
+            network: crate::network::VaultNetwork::parse(&accepted.context().policy().network)?,
         };
         if engine.phase() == CeremonyPhase::Certified {
             let certificate_parents = self.certificate_predecessors(transport, store)?;
@@ -761,6 +762,7 @@ mod tests {
                     .unwrap(),
                     roster: roster.clone(),
                     threshold: 2,
+                    network: crate::network::VaultNetwork::Regtest,
                 };
                 let intent = PaymentIntent::prepare(&member, &operators).unwrap();
                 let outgoing = intent.outgoing(&member).unwrap();
@@ -791,6 +793,7 @@ mod tests {
                     .unwrap(),
                     roster: roster.clone(),
                     threshold: 2,
+                    network: crate::network::VaultNetwork::Regtest,
                 };
                 assert!(PaymentIntent::decode(&encoded, &wrong_owner, &operators).is_err());
                 let mut wrong_roster = roster.clone();
@@ -802,6 +805,7 @@ mod tests {
                     .unwrap(),
                     roster: wrong_roster,
                     threshold: 2,
+                    network: crate::network::VaultNetwork::Regtest,
                 };
                 assert!(PaymentIntent::decode(&encoded, &wrong_context, &operators).is_err());
                 let mut wrong_bundle =
@@ -886,6 +890,7 @@ mod tests {
                     .unwrap(),
                     roster: roster.clone(),
                     threshold: 2,
+                    network: crate::network::VaultNetwork::Regtest,
                 };
                 let transport = SetupTransport::new(
                     owner,

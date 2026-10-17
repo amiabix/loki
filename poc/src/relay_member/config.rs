@@ -962,6 +962,7 @@ mod tests {
             identity: identities.into_iter().next().unwrap(),
             roster,
             threshold: 2,
+            network: crate::network::VaultNetwork::Regtest,
         }
     }
     #[test]
@@ -989,6 +990,7 @@ mod tests {
                     .unwrap(),
                     roster: roster.clone(),
                     threshold: 2,
+                    network: crate::network::VaultNetwork::Regtest,
                 };
                 let mut config = LocalConfig::empty();
                 for peer in &identities {
@@ -1055,6 +1057,7 @@ mod tests {
                     ).unwrap(),
                     roster: roster.clone(),
                     threshold: 2,
+                    network: crate::network::VaultNetwork::Regtest,
                 };
                 let mut config = LocalConfig::empty();
                 config.own = (1..=3u8).map(|i| OwnerInbox {
