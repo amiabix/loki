@@ -171,14 +171,9 @@
 main, .card, .row, .who, .top-row, form, label { min-width: 0; }
 [hidden] { display: none !important; }
 
-/* The ground lives on html, not body: body's own background would paint over
-   the negative-z-index overlays below and hide them completely. */
-html {
-  background-color: var(--bg);
-  background-image: linear-gradient(var(--grid) 1px, transparent 1px),
-                    linear-gradient(90deg, var(--grid) 1px, transparent 1px);
-  background-size: 52px 52px;
-}
+/* A calm, flat ground: the decorative grid and overlays are gone so the
+   signing task owns the screen. */
+html { background-color: var(--bg); }
 
 body { margin: 0; }
 
@@ -192,34 +187,14 @@ body { margin: 0; }
 }
 .pay-to { margin: 2px 0 12px; }
 .pay-to .pay-field-label { display: block; margin-bottom: 2px; }
-.pay-addr { font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere; color: var(--text); }
-.pay-field { display: flex; justify-content: space-between; gap: 16px; margin: 5px 0; font-size: 13px; }
+.pay-addr { font-family: var(--mono); font-size: 15px; line-height: 1.7; overflow-wrap: anywhere; color: var(--text); }
+.pay-field { display: flex; justify-content: space-between; gap: 16px; margin: 6px 0; font-size: 14px; }
 .pay-field-label { color: var(--dim); }
 .pay-field span:last-child { text-align: right; overflow-wrap: anywhere; }
-
-/* the forward-flight starfield sits behind everything and catches no clicks */
-#space {
-  position: fixed;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  z-index: -1;
-  pointer-events: none;
-}
 
 /* A single soft wash behind the content for depth — the scanlines and the
    eight-hairline corner frame were the loudest part of the HUD skin and are
    gone, leaving the cards to sit in clean, airy space. */
-body::before {
-  content: "";
-  position: fixed;
-  inset: 0;
-  z-index: -2;
-  pointer-events: none;
-  background: radial-gradient(ellipse at 50% 0%, var(--accent-wash) 0%, transparent 60%);
-  opacity: .6;
-}
-
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 /* Cards are focused in script so a screen reader lands on the new step. They
@@ -246,14 +221,13 @@ main, main.band {
   padding: 44px 24px 72px;
 }
 
-/* The dashboard keeps a .row heading block where the signer has a centred
-   headline. Centre it too, so the two pages do not disagree about the axis. */
+/* The dashboard heading block is left-aligned to match the signer's single
+   left-aligned task column. */
 main > .row {
   display: flex;
   flex-direction: column;
-  align-items: center;
-  gap: 12px;
-  text-align: center;
+  align-items: flex-start;
+  gap: 10px;
   margin-bottom: 28px;
 }
 
@@ -261,8 +235,8 @@ main > .row h1 {
   margin: 0;
   font-family: var(--serif);
   font-weight: 400;
-  font-size: clamp(30px, 3.6vw, 44px);
-  line-height: 1.04;
+  font-size: clamp(28px, 3.4vw, 40px);
+  line-height: 1.08;
 }
 
 /* ── header ───────────────────────────────────────────────────────────────── */
@@ -348,13 +322,12 @@ header:not(:has(.band)) span {
 }
 
 /* ── the step area ───────────────────────────────────────────────────────────
-   The column is centred, and so is what sits in it: kicker, headline and card
-   all centre on the page axis. Only the inside of a card stays left-aligned,
-   because labels and fields have to start on a common edge. */
+   The column is left-aligned: one task heading starts on the same edge as the
+   card and its fields, so the current task reads as a calm, single column. */
 
 .step-kicker {
-  margin: 0 0 12px;
-  text-align: center;
+  margin: 0 auto 10px;
+  max-width: var(--card);
   font-family: var(--mono);
   font-size: 12px;
   line-height: 18px;
@@ -364,12 +337,11 @@ header:not(:has(.band)) span {
 
 .step-title {
   margin: 0 auto 24px;
-  max-width: 20ch;
-  text-align: center;
+  max-width: var(--card);
   font-family: var(--serif);
   font-weight: 400;
-  font-size: clamp(30px, 3.6vw, 44px);
-  line-height: 1.04;
+  font-size: clamp(28px, 3.4vw, 40px);
+  line-height: 1.08;
   letter-spacing: -.01em;
   font-variant-numeric: lining-nums tabular-nums;
 }
@@ -433,15 +405,8 @@ main h1 {
 
 .card:hover { border-color: var(--hover-line); }
 
-/* the live card arrives, and sits in its own pool of soft light */
-.card:not([hidden]) {
-  animation: rise .34s cubic-bezier(.2,.7,.3,1) both;
-  box-shadow: var(--shadow-card);
-}
-
-@keyframes rise {
-  from { opacity: 0; transform: translateY(10px) }
-}
+/* a still card with a quiet shadow — no entrance animation */
+.card:not([hidden]) { box-shadow: var(--shadow-card); }
 
 .card h2, .card h3 {
   display: flex;
@@ -461,7 +426,6 @@ main h1 {
   height: 11px;
   flex: none;
   background: var(--accent);
-  box-shadow: 0 0 8px var(--accent-glow);
 }
 .card h2::after, .card h3::after {
   content: "";
@@ -609,9 +573,8 @@ button {
 /* the HUD diamond glyph and corner tick are gone — buttons are clean now */
 button::before, button::after { content: none; }
 button:hover:not(:disabled) {
-  filter: brightness(1.06);
-  transform: translateY(-1px);
-  box-shadow: 0 6px 18px -8px var(--accent-glow);
+  filter: brightness(1.04);
+  box-shadow: 0 2px 6px rgba(0,0,0,.12);
 }
 button:active:not(:disabled) { transform: translateY(0); }
 button:disabled { opacity: .4; cursor: not-allowed; }
@@ -803,9 +766,8 @@ pre:hover { border-color: var(--line); }
   color: var(--accent);
   background: var(--inset);
   border: 1px solid var(--accent-edge);
-  box-shadow: 0 0 22px var(--accent-wash);
-  /* deliberately still: this is the value a member reads character by
-     character against another screen, and movement only makes that harder */
+  /* deliberately still and unglowing: this is the value a member reads
+     character by character against another screen */
 }
 #fingerprint:empty {
   padding: 0;
@@ -846,20 +808,15 @@ pre:hover { border-color: var(--line); }
   font-variant-numeric: tabular-nums;
 }
 
-/* an address means the whole setup finished: give it the one celebration */
+/* the receive address must be easy to inspect character by character */
 #address {
   font-family: var(--mono);
-  font-size: 13px;
+  font-size: 15px;
   line-height: 1.8;
   color: var(--text);
   overflow-wrap: anywhere;
 }
 #address.muted { color: var(--dim); }
-#address:not(.muted) { animation: reveal .8s cubic-bezier(.2,.7,.3,1) both; }
-
-@keyframes reveal {
-  from { opacity: 0; filter: blur(7px); letter-spacing: .3em }
-}
 
 #balance {
   font-family: var(--mono);
@@ -920,10 +877,7 @@ main > .muted:last-child {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .card:not([hidden]), button.busy::after,
-  #address:not(.muted) {
-    animation: none;
-  }
+  button.busy::after { animation: none; }
 }
 
 /* ── failure beside the control ───────────────────────────────────────────── */
@@ -978,7 +932,6 @@ main > .muted:last-child {
 .step-progress {
   max-width: var(--card);
   margin: 0 auto 18px;
-  text-align: center;
   font-size: 13px;
   color: var(--dim);
 }
