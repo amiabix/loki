@@ -186,7 +186,8 @@ VAULT_STORE_ROUTES = frozenset((
     "/api/relay-provision", "/api/relay-export", "/api/relay-import", "/api/relay-status",
 ))
 # Store routes that change nothing the payment worker acts on: no worker pass afterwards.
-READ_ONLY_STORE_ROUTES = frozenset(("/api/payment-review", "/api/relay-status"))
+# Not /api/relay-status: it can save phase "ready", which makes the vault eligible.
+READ_ONLY_STORE_ROUTES = frozenset(("/api/payment-review",))
 
 class Unreachable(ValueError):
     """The courier did not answer. Like Timeout, nothing is known to have
