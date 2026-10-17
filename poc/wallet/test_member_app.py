@@ -68,6 +68,25 @@ class MemberWalletTest(unittest.TestCase):
             self.assertEqual(command.call_args.kwargs["binary"], PAYMENT)
             self.assertEqual(wallet.scan_height[vault], 9216)
 
+    def test_testnet_payment_stages_stop_when_wallet_sync_fails(self):
+        with tempfile.TemporaryDirectory(prefix="loki-testnet-payment-sync-") as temp:
+            wallet, vault, attempt = self.payment_fixture(temp)
+            wallet.network = "testnet"
+            member = wallet.data / "vaults" / vault
+            membership = json.loads((member / "membership.json").read_text())
+            membership["network"] = "testnet"
+            (member / "membership.json").write_text(json.dumps(membership))
+            with patch.object(wallet, "balance", side_effect=ValueError("wallet sync failed")), \
+                    patch.object(wallet, "payment_command") as command:
+                for stage in (
+                    lambda: wallet.package_payment(vault, attempt),
+                    lambda: wallet.finish_payment(vault, attempt),
+                    lambda: wallet.verify_payment(vault, attempt, "c" * 64),
+                ):
+                    with self.assertRaisesRegex(ValueError, "wallet sync failed"):
+                        stage()
+                command.assert_not_called()
+
     def test_testnet_vault_records_chain_and_birth_before_inviting(self):
         with tempfile.TemporaryDirectory(prefix="loki-testnet-ui-") as temp:
             root = Path(temp)

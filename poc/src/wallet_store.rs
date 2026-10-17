@@ -12,20 +12,20 @@ use rand_zp::{rand_core::UnwrapErr, rngs::SysRng};
 use rusqlite::{Connection, OptionalExtension};
 use zcash_client_backend::{
     data_api::{
+        AccountBirthday, AccountPurpose, WalletRead, WalletWrite,
         chain::{
-            error::Error as ScanError, scan_cached_blocks, BlockCache, BlockSource, ChainState,
+            BlockCache, BlockSource, ChainState, error::Error as ScanError, scan_cached_blocks,
         },
         scanning::ScanRange,
-        wallet::ConfirmationsPolicy,
-        AccountBirthday, AccountPurpose, WalletRead, WalletWrite,
     },
     proto::compact_formats::CompactBlock,
     wallet::ReceivedNote,
 };
 use zcash_client_sqlite::{
-    util::SystemClock, wallet::init::init_wallet_db, ReceivedNoteId, WalletDb,
+    ReceivedNoteId, WalletDb, util::SystemClock, wallet::init::init_wallet_db,
 };
 use zcash_keys::keys::UnifiedFullViewingKey;
+use zcash_primitives::transaction::TxId;
 use zcash_protocol::consensus::{BlockHeight, Network};
 use zeroize::Zeroizing;
 
@@ -181,6 +181,45 @@ impl VaultWallet {
         birthday: &AccountBirthday,
         passphrase: &str,
     ) -> Result<Self, String> {
+        Self::open_inner(path, network, fvk, Some(birthday), passphrase)
+    }
+
+    pub fn open_existing(
+        path: &Path,
+        network: Network,
+        fvk: &FullViewingKey,
+        birth_height: u32,
+        passphrase: &str,
+    ) -> Result<Self, String> {
+        if !path.is_file() {
+            return Err("wallet database is missing; run loki_wallet_sync first".into());
+        }
+        let wallet = Self::open_inner(path, network, fvk, None, passphrase)?;
+        let account = wallet
+            .db
+            .get_account_ids()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .next()
+            .ok_or("wallet database has no vault account")?;
+        if wallet
+            .db
+            .get_account_birthday(account)
+            .map_err(|e| e.to_string())?
+            != BlockHeight::from_u32(birth_height)
+        {
+            return Err("wallet database has a different vault birth height".into());
+        }
+        Ok(wallet)
+    }
+
+    fn open_inner(
+        path: &Path,
+        network: Network,
+        fvk: &FullViewingKey,
+        birthday: Option<&AccountBirthday>,
+        passphrase: &str,
+    ) -> Result<Self, String> {
         if !path.exists() {
             let mut options = fs::OpenOptions::new();
             options.write(true).create_new(true);
@@ -219,6 +258,7 @@ impl VaultWallet {
             .get_unified_full_viewing_keys()
             .map_err(|e| format!("read wallet accounts: {e}"))?;
         if keys.is_empty() {
+            let birthday = birthday.ok_or("wallet database has no vault account")?;
             let ufvk = UnifiedFullViewingKey::from_orchard_fvk(fvk.clone())
                 .map_err(|e| format!("vault viewing key: {e:?}"))?;
             db.import_account_ufvk(
@@ -245,12 +285,14 @@ impl VaultWallet {
             .into_iter()
             .next()
             .ok_or("wallet database has no vault account")?;
-        if db
-            .get_account_birthday(account)
-            .map_err(|e| format!("read wallet birthday: {e}"))?
-            != birthday.height()
-        {
-            return Err("wallet database has a different vault birth height".into());
+        if let Some(birthday) = birthday {
+            if db
+                .get_account_birthday(account)
+                .map_err(|e| format!("read wallet birthday: {e}"))?
+                != birthday.height()
+            {
+                return Err("wallet database has a different vault birth height".into());
+            }
         }
         Ok(Self { db, network })
     }
@@ -317,18 +359,53 @@ impl VaultWallet {
             .map_err(|e| format!("read scan height: {e}"))
     }
 
+    pub fn scanned_hash(&self, height: BlockHeight) -> Result<String, String> {
+        self.db
+            .get_block_hash(height)
+            .map_err(|e| format!("read scanned block hash: {e}"))?
+            .map(|hash| hash.to_string())
+            .ok_or_else(|| "wallet has no hash for its scanned height".into())
+    }
+
+    pub fn mined_height(&self, txid: TxId) -> Result<Option<BlockHeight>, String> {
+        self.db.get_tx_height(txid)
+            .map_err(|e| format!("read indexed transaction height: {e}"))
+    }
+
     pub fn ironwood_balance_zat(&self) -> Result<u64, String> {
-        let summary = self
+        let height = BlockHeight::from_u32(
+            self.scanned_height()?
+                .ok_or("wallet has no scanned balance yet")?,
+        );
+        let account = self
             .db
-            .get_wallet_summary(ConfirmationsPolicy::MIN)
-            .map_err(|e| format!("read wallet balance: {e}"))?
-            .ok_or("wallet has no scanned balance yet")?;
-        let account = summary
-            .account_balances()
-            .values()
+            .get_account_ids()
+            .map_err(|e| e.to_string())?
+            .into_iter()
             .next()
             .ok_or("wallet has no vault account")?;
-        Ok(account.ironwood_balance().total().into_u64())
+        self.db
+            .get_unspent_ironwood_notes_at_historical_height(account, height)
+            .map_err(|e| format!("read Ironwood notes: {e}"))?
+            .iter()
+            .try_fold(0u64, |sum, note| {
+                sum.checked_add(note.note().value().inner())
+                    .ok_or_else(|| "vault balance exceeds u64".to_string())
+            })
+    }
+
+    pub fn ironwood_note_count(&self, height: BlockHeight) -> Result<usize, String> {
+        let account = self
+            .db
+            .get_account_ids()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .next()
+            .ok_or("wallet has no vault account")?;
+        self.db
+            .get_unspent_ironwood_notes_at_historical_height(account, height)
+            .map(|notes| notes.len())
+            .map_err(|e| format!("read Ironwood notes: {e}"))
     }
 
     pub fn ironwood_inputs_at(
@@ -371,7 +448,19 @@ impl VaultWallet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use incrementalmerkletree::frontier::Frontier;
+    use orchard::{
+        keys::{Scope, SpendingKey},
+        note::{ExtractedNoteCommitment, Note, NoteVersion, RandomSeed, Rho},
+        note_encryption::{IronwoodDomain, IronwoodNoteEncryption},
+        value::NoteValue,
+    };
     use zcash_client_backend::data_api::scanning::ScanPriority;
+    use zcash_client_backend::proto::compact_formats::{
+        ChainMetadata, CompactOrchardAction, CompactTx,
+    };
+    use zcash_note_encryption::Domain;
+    use zcash_primitives::block::BlockHash;
 
     #[test]
     fn downloaded_blocks_must_be_contiguous_and_can_be_replaced() {
@@ -422,5 +511,99 @@ mod tests {
                 Some(BlockHeight::from_u32(8))
             );
         });
+    }
+
+    #[test]
+    fn reorg_removes_confirmed_note_from_reopened_wallet() {
+        let fvk = FullViewingKey::from(&SpendingKey::from_bytes([3; 32]).unwrap());
+        let height = crate::network::TESTNET_NU7_BIRTH;
+        let prior = ChainState::empty(BlockHeight::from_u32(height - 1), BlockHash([7; 32]));
+        let birthday = AccountBirthday::from_parts(prior.clone(), None);
+        let path = std::env::temp_dir().join(format!(
+            "loki-wallet-reorg-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let rho = Rho::from_bytes(&[4; 32]).unwrap();
+        let rseed = RandomSeed::from_bytes([5; 32], &rho).unwrap();
+        let note = Note::from_parts(
+            fvk.address_at(0u64, Scope::External),
+            NoteValue::from_raw(50_000),
+            rho,
+            rseed,
+            NoteVersion::V3,
+        )
+        .unwrap();
+        let enc = IronwoodNoteEncryption::new(None, note, [0; 512]);
+        let cmx = ExtractedNoteCommitment::from(note.commitment());
+        let funded = CompactBlock {
+            height: u64::from(height),
+            hash: vec![8; 32],
+            prev_hash: vec![7; 32],
+            vtx: vec![CompactTx {
+                txid: vec![6; 32],
+                index: 1,
+                ironwood_actions: vec![CompactOrchardAction {
+                    nullifier: vec![4; 32],
+                    cmx: cmx.to_bytes().to_vec(),
+                    ephemeral_key: IronwoodDomain::epk_bytes(enc.epk()).0.to_vec(),
+                    ciphertext: enc.encrypt_note_plaintext()[..52].to_vec(),
+                }],
+                ..Default::default()
+            }],
+            chain_metadata: Some(ChainMetadata {
+                ironwood_commitment_tree_size: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut wallet =
+            VaultWallet::open(&path, Network::TestNetwork, &fvk, &birthday, "pass").unwrap();
+        wallet.sync_blocks(&prior, &[funded]).unwrap();
+        drop(wallet);
+        let mut wallet =
+            VaultWallet::open_existing(&path, Network::TestNetwork, &fvk, height, "pass").unwrap();
+        assert_eq!(wallet.scanned_hash(BlockHeight::from_u32(height)).unwrap(), BlockHash([8; 32]).to_string());
+        assert_eq!(wallet.mined_height(TxId::from_bytes([6; 32])).unwrap(), Some(BlockHeight::from_u32(height)));
+        assert_eq!(wallet.ironwood_balance_zat().unwrap(), 50_000);
+        assert_eq!(
+            wallet
+                .ironwood_note_count(BlockHeight::from_u32(height))
+                .unwrap(),
+            1
+        );
+        let mut frontier = Frontier::<MerkleHashOrchard, 32>::empty();
+        assert!(frontier.append(MerkleHashOrchard::from_cmx(&cmx)));
+        let inputs = wallet
+            .ironwood_inputs_at(
+                BlockHeight::from_u32(height),
+                frontier.value().unwrap().clone(),
+            )
+            .unwrap();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].1.root(cmx).to_bytes(), frontier.root().to_bytes());
+        wallet.db.truncate_to_chain_state(prior.clone()).unwrap();
+        let replacement = CompactBlock {
+            height: u64::from(height),
+            hash: vec![9; 32],
+            prev_hash: vec![7; 32],
+            chain_metadata: Some(ChainMetadata::default()),
+            ..Default::default()
+        };
+        wallet.sync_blocks(&prior, &[replacement]).unwrap();
+        assert_eq!(wallet.scanned_hash(BlockHeight::from_u32(height)).unwrap(), BlockHash([9; 32]).to_string());
+        assert_eq!(wallet.mined_height(TxId::from_bytes([6; 32])).unwrap(), None);
+        assert_eq!(
+            wallet
+                .ironwood_note_count(BlockHeight::from_u32(height))
+                .unwrap(),
+            0
+        );
+        assert_eq!(wallet.ironwood_balance_zat().unwrap(), 0);
+        drop(wallet);
+        std::fs::remove_file(path).unwrap();
     }
 }

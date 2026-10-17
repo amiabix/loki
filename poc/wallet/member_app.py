@@ -1248,6 +1248,8 @@ class Wallet:
                          if chr(ord("A") + local["slot"] - 1) in item), None)
         if pair not in choices:
             raise ValueError(f"Choose {threshold} members of this vault")
+        if self.network == "testnet":
+            self.balance(vault)
         drafts = member_dir / "payments"
         drafts.mkdir(mode=0o700, exist_ok=True)
         work = Path(tempfile.mkdtemp(prefix="payment-", dir=drafts))
@@ -1324,7 +1326,7 @@ class Wallet:
                     if not (PAYMENT_WAITING.search(str(error)) or missing_early_package):
                         raise
             if phase == "confirmed":
-                # shortcut: recheck each confirmed payment until the wallet has an indexed chain store.
+                # Recheck the node and the indexed confirmation to catch reorgs.
                 try:
                     _, _, _, output = self.payment_command("verify", vault, attempt, status["txid"])
                     if not re.search(r"\bverified mined txid=" + re.escape(status["txid"]) +
@@ -1577,6 +1579,8 @@ class Wallet:
         _, local, _, manifest = self.payment(vault, attempt)
         if local["slot"] != selected_signers(manifest, local.get("threshold", 2), local["members"])[0]:
             raise ValueError("Only the first selected signer can build the package")
+        if self.network == "testnet":
+            self.balance(vault)
         _, work, _, _ = self.payment_command("package", vault, attempt)
         self.payment_status(work, "package")
         return {"phase": "package"}
@@ -1608,6 +1612,8 @@ class Wallet:
         return {"phase": "approval_pending_delivery"}
 
     def finish_payment(self, vault, attempt):
+        if self.network == "testnet":
+            self.balance(vault)
         _, work, _, output = self.payment_command("finish", vault, attempt, timeout=600)
         txid = re.search(r"\bbroadcast txid=([0-9a-f]{64})\b", output)
         if not txid:
@@ -1620,6 +1626,8 @@ class Wallet:
             txid = self.payment_phase(self.payment(vault, attempt)[2]).get("txid")
         if not isinstance(txid, str) or not re.fullmatch(r"[0-9a-f]{64}", txid):
             raise ValueError("Enter the broadcast transaction ID")
+        if self.network == "testnet":
+            self.balance(vault)
         _, work, _, output = self.payment_command("verify", vault, attempt, txid, timeout=120)
         match = re.search(r"\bverified mined txid=([0-9a-f]{64}) confirmations=([1-9][0-9]*)\b", output)
         if not match or match.group(1) != txid:

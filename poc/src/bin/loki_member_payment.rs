@@ -20,6 +20,7 @@ use loki_poc::{
     payment_manifest::validate_roster,
     rpc::Rpc,
     scan,
+    wallet_store::VaultWallet,
     signing_session::{
         aggregate_and_apply, commitments_from_message, AttemptId, Mailbox, MessageKind,
         OpenedMessage, PackagePayload, SessionContext, SigningSession,
@@ -28,12 +29,13 @@ use loki_poc::{
 };
 #[cfg(feature = "relay-communication")]
 use loki_relay_client::{ClientStore, OwnerInbox, RelayHttp, RelayRuntime};
-use orchard::{keys::Scope, Address};
+use orchard::{keys::Scope, note::Note, tree::MerklePath, Address};
 use reddsa_frost::frost::redpallas as frost;
 use serde_json::json;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use zcash_protocol::{consensus::Parameters, memo::MemoBytes, value::Zatoshis};
+use zcash_protocol::consensus::{BlockHeight, Network};
 use zeroize::{Zeroize, Zeroizing};
 
 fn signer_set_from_name(name: &str, threshold: u16) -> Result<Vec<u16>, String> {
@@ -86,18 +88,72 @@ fn member_rpc(member: &MemberState) -> Result<Rpc, String> {
     }
 }
 
-fn member_chain(member: &MemberState, rpc: &Rpc) -> Result<(Vec<scan::VaultNote>, u64), String> {
+struct SpendNote {
+    note: Note,
+    nullifier: [u8; 32],
+    value_zat: u64,
+    witness: Option<MerklePath>,
+}
+
+fn wallet(member: &MemberState, owner: &Path, pass: &str) -> Result<VaultWallet, String> {
+    VaultWallet::open_existing(
+        &owner.join("wallet.sqlite"), Network::TestNetwork, &member.fvk,
+        member.birth_height.ok_or("Testnet vault has no birth height")?, pass,
+    )
+}
+
+fn member_chain(
+    member: &MemberState, owner: &Path, pass: &str, rpc: &Rpc,
+) -> Result<(Vec<SpendNote>, u64, Option<[u8; 32]>), String> {
     match member.network {
         VaultNetwork::Regtest => {
             let chain = scan::scan_chain(rpc, &member.fvk)?;
-            Ok((chain.notes, chain.tip))
+            Ok((chain.notes.into_iter().map(|note| SpendNote {
+                note: note.note, nullifier: note.nullifier, value_zat: note.value_zat,
+                witness: None,
+            }).collect(), chain.tip, None))
         }
         VaultNetwork::Testnet => {
-            let birth = member
-                .birth_height
-                .ok_or("Testnet vault has no birth height")?;
-            let chain = scan::scan_chain_from_birth(rpc, &member.fvk, u64::from(birth))?;
-            Ok((chain.notes, chain.tip))
+            let wallet = wallet(member, owner, pass)?;
+            let height = wallet.scanned_height()?.ok_or("wallet has not scanned any blocks")?;
+            if rpc.json("getblockcount", "[]")?.as_u64() != Some(u64::from(height)) {
+                return Err("wallet scan is behind the node; run loki_wallet_sync again".into());
+            }
+            let block = BlockHeight::from_u32(height);
+            let saved_hash = wallet.scanned_hash(block)?;
+            let state = rpc.json("z_gettreestate", &format!("[\"{height}\"]"))?;
+            let bytes = hex::decode(state["ironwood"]["commitments"]["finalState"]
+                .as_str().ok_or("node has no Ironwood tree state")?)
+                .map_err(|e| format!("Ironwood tree state: {e}"))?;
+            let mut encoded = std::io::Cursor::new(&bytes);
+            let tree = zcash_primitives::merkle_tree::read_commitment_tree::<
+                orchard::tree::MerkleHashOrchard, _, 32,
+            >(&mut encoded).map_err(|e| format!("Ironwood tree state: {e}"))?;
+            if encoded.position() != bytes.len() as u64 {
+                return Err("Ironwood tree state has trailing bytes".into());
+            }
+            let frontier = tree.to_frontier().value().cloned()
+                .ok_or("scanned Ironwood tree is empty")?;
+            let anchor = tree.root().to_bytes();
+            if let Some(root) = state["ironwood"]["commitments"]["finalRoot"].as_str() {
+                if hex::decode(root).ok().as_deref() != Some(&anchor) {
+                    return Err("node Ironwood tree disagrees with its anchor".into());
+                }
+            }
+            if rpc.json("getblockhash", &format!("[{height}]"))?.as_str()
+                != Some(saved_hash.as_str()) {
+                return Err("wallet scan is on a different chain; run loki_wallet_sync again".into());
+            }
+            let notes = wallet.ironwood_inputs_at(block, frontier)?
+                .into_iter().map(|(received, witness)| {
+                    let note = *received.note();
+                    SpendNote {
+                        nullifier: note.nullifier(&member.fvk).to_bytes(),
+                        value_zat: note.value().inner(),
+                        note, witness: Some(witness),
+                    }
+                }).collect();
+            Ok((notes, u64::from(height), Some(anchor)))
         }
     }
 }
@@ -204,15 +260,25 @@ fn balance(args: &[String]) -> Result<(), String> {
         Path::new(&args[1]),
         Path::new(&args[2]),
     )?;
-    let (notes, tip) = member_chain(&member, &member_rpc(&member)?)?;
-    let balance_zat = notes
-        .iter()
-        .try_fold(0u64, |sum, note| sum.checked_add(note.value_zat))
-        .ok_or("vault balance exceeds u64")?;
+    let (balance_zat, tip, note_count) = match member.network {
+        VaultNetwork::Regtest => {
+            let (notes, tip, _) = member_chain(&member, Path::new(&args[0]), "", &member_rpc(&member)?)?;
+            let total = notes.iter().try_fold(0u64, |sum, note| sum.checked_add(note.value_zat))
+                .ok_or("vault balance exceeds u64")?;
+            (total, tip, notes.len())
+        }
+        VaultNetwork::Testnet => {
+            let pass = Zeroizing::new(fs::read_to_string(&args[1]).map_err(|e| e.to_string())?);
+            let wallet = wallet(&member, Path::new(&args[0]), pass.trim_end_matches(['\r', '\n']))?;
+            let height = wallet.scanned_height()?.ok_or("wallet has not scanned any blocks")?;
+            (wallet.ironwood_balance_zat()?, u64::from(height),
+             wallet.ironwood_note_count(BlockHeight::from_u32(height))?)
+        }
+    };
     println!(
         "{}",
         json!({"vault": hex::encode(member.vault), "network": member.network.label(),
-               "height": tip, "balance_zat": balance_zat, "unspent_notes": notes.len()})
+               "height": tip, "balance_zat": balance_zat, "unspent_notes": note_count})
     );
     Ok(())
 }
@@ -221,7 +287,7 @@ fn prepare(args: &[String]) -> Result<(), String> {
     if args.len() != 7 && args.len() != 8 {
         return Err("prepare <member-dir> <passphrase-file> <roster.json> <work-dir> <recipient-UA> <amount-zat> <memo> [selected member letters, e.g. AC or BCD]".into());
     }
-    let (member, _, _) = state(args)?;
+    let (member, owner, pass) = state(args)?;
     let default = if member.roster.threshold == 2 { "AB" } else { "ABC" };
     let signers = signer_set_from_name(args.get(7).map(String::as_str).unwrap_or(default), member.roster.threshold)?;
     if signers
@@ -233,7 +299,7 @@ fn prepare(args: &[String]) -> Result<(), String> {
     let work = Path::new(&args[3]);
     private_work(work)?;
     let rpc = member_rpc(&member)?;
-    let (notes, height) = member_chain(&member, &rpc)?;
+    let (notes, height, _) = member_chain(&member, &owner, &pass, &rpc)?;
     let tip: u32 = height.try_into().map_err(|_| "height overflow")?;
     let recipient = vault::orchard_receiver_from_ua(&args[4], member.network.network_type())?;
     let amount_zat: u64 = args[5].parse().map_err(|_| "invalid amount")?;
@@ -346,6 +412,8 @@ fn wait_message(
 
 fn candidate(
     member: &MemberState,
+    owner: &Path,
+    pass: &str,
     intent: &Intent,
     session: &SigningSession,
     context: &SessionContext,
@@ -359,7 +427,7 @@ fn candidate(
         return Err("candidate needs one commitment batch from each selected peer".into());
     }
     let rpc = member_rpc(member)?;
-    let (notes_found, _) = member_chain(member, &rpc)?;
+    let (notes_found, _, _) = member_chain(member, owner, pass, &rpc)?;
     let notes = intent
         .input_nullifiers
         .iter()
@@ -523,7 +591,7 @@ fn sign(args: &[String]) -> Result<(), String> {
             let commitment = wait_message(&mailbox, &member, &context, MessageKind::Commitment, id)?;
             peers.insert(id, commitments_from_message(&context, &commitment, intent.input_nullifiers.len())?);
         }
-        let payload = candidate(&member, &intent, &session, &context, &peers)?;
+        let payload = candidate(&member, &owner, &pass, &intent, &session, &context, &peers)?;
         session.publish_package_to_roster(&member.roster.members, &payload, &mailbox, &pass)?;
         let wires =
             SigningSession::saved_package_wires(&owner.join("signing"), &context, own, &pass)?;
@@ -656,7 +724,7 @@ fn next_message(
 
 #[cfg(feature = "relay-communication")]
 fn package(args: &[String]) -> Result<(), String> {
-    let (member, _owner, pass, context, intent, mailbox, session) = reopen_signer(args)?;
+    let (member, owner, pass, context, intent, mailbox, session) = reopen_signer(args)?;
     let own = member.identity.public().id;
     if own != context.signers[0] {
         return Err("only the selected proposer builds this package".into());
@@ -666,7 +734,7 @@ fn package(args: &[String]) -> Result<(), String> {
         let commitment = next_message(&mailbox, &member, &context, MessageKind::Commitment, peer_id)?;
         peers.insert(peer_id, commitments_from_message(&context, &commitment, intent.input_nullifiers.len())?);
     }
-    let payload = candidate(&member, &intent, &session, &context, &peers)?;
+    let payload = candidate(&member, &owner, &pass, &intent, &session, &context, &peers)?;
     session.publish_package_to_roster(&member.roster.members, &payload, &mailbox, &pass)?;
     println!("payment package published; members may review");
     Ok(())
@@ -1013,21 +1081,17 @@ fn finish(args: &[String], broadcast: bool) -> Result<(), String> {
             (witnesses, anchor)
         }
         VaultNetwork::Testnet => {
-            let birth = member
-                .birth_height
-                .ok_or("Testnet vault has no birth height")?;
-            let chain = scan::scan_chain_from_birth(&rpc, &member.fvk, u64::from(birth))?;
-            let anchor = chain.witnesses.root();
+            let (notes, _, anchor) = member_chain(&member, &owner, &pass, &rpc)?;
+            let anchor = anchor.ok_or("wallet has no Ironwood anchor")?;
             let witnesses = indices
                 .iter()
                 .zip(&intent.input_nullifiers)
                 .map(|(index, nf)| {
-                    let note = chain
-                        .notes
+                    let note = notes
                         .iter()
                         .find(|note| note.nullifier == *nf)
                         .ok_or_else(|| format!("finisher cannot find input {}", hex::encode(nf)))?;
-                    Ok((*index, chain.witnesses.path(note.position)?))
+                    Ok((*index, note.witness.clone().ok_or("wallet has no input witness")?))
                 })
                 .collect::<Result<Vec<_>, String>>()?;
             (witnesses, anchor)
@@ -1112,6 +1176,15 @@ fn verify(args: &[String]) -> Result<(), String> {
     .map_err(|e| format!("mined transaction parse: {e}"))?;
     if tx.txid().to_string() != *txid {
         return Err("mined transaction ID mismatch".into());
+    }
+    if member.network == VaultNetwork::Testnet {
+        let wallet = wallet(&member, &owner, &pass)?;
+        let height = wallet.mined_height(tx.txid())?
+            .ok_or("payment confirmation is not in the wallet index; run loki_wallet_sync")?;
+        let hash = wallet.scanned_hash(height)?;
+        if tx_json["blockhash"].as_str() != Some(hash.as_str()) {
+            return Err("payment confirmation was reorganized; run loki_wallet_sync".into());
+        }
     }
     let mailbox = Mailbox::new(&work.join("mailbox")).map_err(|e| e.to_string())?;
     let package_message = if member.identity.public().id == context.signers[0] {

@@ -51,18 +51,20 @@ RPC credentials in a URL or command argument.
    address only after the confirmations. The exact argument order and recovery
    sequence are exercised in `tests/setup_processes.rs` and `run-member-payment.py`.
 4. Fund a single Ironwood note with a small amount of Testnet ZEC from an external
-   wallet, then check `loki_member_payment balance <member-dir> <passphrase-file>
-   roster.json`. Run `prepare <member-dir> <passphrase-file> roster.json
+   wallet, then run `loki_wallet_sync <member-dir> <passphrase-file> roster.json
+   <lightwalletd-url>` and check `loki_member_payment balance <member-dir>
+   <passphrase-file> roster.json`. Run `prepare <member-dir> <passphrase-file> roster.json
    <shared-payment-dir> <recipient-Testnet-UA> <amount-zat> <memo> AB`.
    Members 1 and 2 each run `loki_member_payment sign <their-member-dir>
    <their-passphrase-file> roster.json <shared-payment-dir>` at the same time and
    explicitly approve the reviewed effects. Member 3 runs the same prefix with
-   `finish` in place of `sign`, then runs `verify` with the mined txid appended.
+   `finish` in place of `sign`, syncs the indexed wallet after mining, then runs
+   `verify` with the mined txid appended.
 
-Testnet vault state binds the network and birth height into the roster fingerprint;
-the scanner starts at the preceding Ironwood tree checkpoint and verifies the
-reconstructed root before proving. It rescans from birth for each command, so a
-long-lived vault still needs a persistent witness store. ZIP 2005 key derivation
+Testnet vault state binds the network and birth height into the roster fingerprint.
+Balance and spending use the same encrypted, indexed wallet database. Sync it before
+spending; the finisher checks its scanned block hash against the node and builds
+witnesses from the stored tree data. ZIP 2005 key derivation
 and the recovery tool still need independent review and a public Testnet recovery
 spend before real custody use.
 
