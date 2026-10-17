@@ -74,13 +74,17 @@ class THS:
                 "address": address, "amount_zatoshi": 100_000_000,
                 "idempotency_key": f"loki-{digest}-fund-{index}",
             }
+            # The faucet is asynchronous: it returns `preparing` until the funding
+            # transaction is mined. Re-post the idempotent request, mining a block
+            # between tries, until it confirms.
             deadline = time.monotonic() + 120
             while True:
                 result = post(self.app_url + "/api/v1/faucet/address", request)
                 if result.get("status") == "confirmed" and result.get("block_hash"):
                     break
-                if result.get("status") not in ("pending", "preparing", "prepared") or time.monotonic() >= deadline:
+                if time.monotonic() >= deadline:
                     raise RuntimeError(f"funding not confirmed; retry the same vault: {result}")
+                self.mine(1)
                 time.sleep(1)
             results.append(result)
         return results
