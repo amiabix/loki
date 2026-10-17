@@ -24,12 +24,12 @@ async function run() {
       let result = {};
       if (url.pathname === '/api/status') {
         result = url.searchParams.has('vault')
-          ? {phase: 'active', name: 'Gold', vault, slot: 1, threshold: 2, total_members: 3,
+          ? {phase: 'active', name: 'Gold', vault, slot: 1, threshold: 3, total_members: 4,
              profile: {name: 'Alice'}, account_linked: true}
-          : {phase: 'home', profile: {name: 'Alice'}, vaults: [{name: 'Gold', vault, slot: 1, threshold: 2, members: 3}]};
+          : {phase: 'home', profile: {name: 'Alice'}, vaults: [{name: 'Gold', vault, slot: 1, threshold: 3, members: 4}]};
       } else if (url.pathname === '/api/payments') result = paymentReady
         ? {payments: [{attempt: 'b'.repeat(64), payment: 'c'.repeat(64),
-            pair: [2, 3], phase: 'received', ready_to_send: true}],
+            signers: [2, 3, 4], phase: 'received', ready_to_send: true}],
            readiness: {relay_ready: true, relay_detail: 'Relay reachable.', scan_height: 104}}
         : {payments: []};
       else if (url.pathname === '/api/session/pending') result = {requests: []};
@@ -58,6 +58,7 @@ async function run() {
     paymentReady = true;
     await page.getByRole('button', {name: 'Check for updates'}).click();
     await page.getByRole('button', {name: 'Send this payment'}).waitFor();
+    await page.getByRole('heading', {name: '3 approvals verified'}).waitFor({timeout: 3000});
     assert.deepEqual(errors, []);
     console.log('PASS: payment relay errors stay beside payments; receiving and retry remain available');
   } finally { await browser.close(); }

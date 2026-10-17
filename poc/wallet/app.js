@@ -159,7 +159,7 @@ function vaultList(vaults) {
 const STAGES = [
   ['Propose', 'the proposal reaches every member'],
   ['Review', 'each signer checks the exact transaction'],
-  ['Approve', 'two members approve'],
+  ['Approve', 'selected members approve'],
   ['Ready to send', 'the signed transaction goes to the network'],
   ['Confirmed', 'mined on this device’s chain view'],
 ];
@@ -174,7 +174,7 @@ const PHASES = {
   package: [1, 'waiting', 'building the exact transaction to check'],
   approval_pending_delivery: [2, 'waiting', 'delivering your approval'],
   approval_interrupted: [2, 'differs', 'your saved approval could not be reopened — retrying it'],
-  approved: [2, 'waiting', 'your approval reached the relays; waiting for another member'],
+  approved: [2, 'waiting', 'your approval reached the relays; waiting for the other signers'],
   broadcast: [4, 'waiting', 'sent — waiting for a confirmation'],
   confirmation_needs_recheck: [4, 'waiting', 'checking this device’s chain view again'],
   confirmed: [4, 'agreed', 'confirmed on chain'],
@@ -269,13 +269,13 @@ function setPaymentActivity(card, did) {
 function statusHeadline(payment, review, readiness) {
   if (review && review.memo_utf8 != null) return 'Needs your approval';
   if (payment.ready_to_send) return readiness.relay_ready === true
-    ? 'Two approvals verified' : 'Ready — this device can’t send yet';
+    ? `${(payment.signers || payment.pair).length} approvals verified` : 'Ready — this device can’t send yet';
   switch (payment.phase) {
     case 'draft': return 'Draft on this device';
     case 'queued_for_delivery': return 'Sending proposal';
     case 'approval_pending_delivery': return 'Delivering your approval';
     case 'approval_interrupted': return 'Approval delivery needs attention';
-    case 'approved': return 'Approval delivered; waiting for the other member';
+    case 'approved': return 'Approval delivered; waiting for the other signers';
     case 'broadcast':
     case 'confirmation_needs_recheck': return 'Sent; waiting for confirmation on this device';
     case 'confirmed': return 'Confirmed on this device';
@@ -297,6 +297,7 @@ function payField(labelText, valueText, valueClass) {
 }
 
 function buildPaymentCard(payment, vault, {current, rowState, detail, isSigner, review, readiness}) {
+  const signers = payment.signers || payment.pair;
   const card = document.createElement('section');
   card.className = 'card';
   const head = document.createElement('h3');
@@ -362,7 +363,7 @@ function buildPaymentCard(payment, vault, {current, rowState, detail, isSigner, 
   sum.textContent = 'Payment details';
   details.append(sum,
     note(`Payment ${payment.payment?.slice(0, 16) || payment.attempt.slice(0, 16)}…`
-         + ` · signers: members ${payment.pair.join(' and ')}${isSigner ? ' (you are one)' : ''}`
+         + ` · signers: members ${signers.join(' and ')}${isSigner ? ' (you are one)' : ''}`
          + (payment.txid ? ` · tx ${payment.txid.slice(0, 16)}…` : '')),
     stageList(current, rowState, detail));
   const activity = note('', 'muted');
@@ -419,8 +420,9 @@ async function refreshPayments() {
   const seen = new Set();
   for (let index = 0; index < state.payments.length; index++) {
     const payment = state.payments[index];
+    const signers = payment.signers || payment.pair;
     if (!SETTLED.has(payment.phase)) midFlight.push(payment.attempt);
-    const isSigner = payment.pair.includes(memberSlot);
+    const isSigner = signers.includes(memberSlot);
     if (isSigner && ['commitments', 'package'].includes(payment.phase)
         && !paymentReviews.has(payment.attempt)) {
       try {
@@ -432,10 +434,10 @@ async function refreshPayments() {
     let [current, rowState, detail] =
       PHASES[payment.phase] || [0, 'waiting', payment.phase.replaceAll('_', ' ')];
     if (review && current === 1) [current, rowState, detail] = [2, 'waiting', 'your approval is the next step'];
-    if (payment.ready_to_send) [current, rowState, detail] = [3, 'agreed', 'two approvals verified; ready to send'];
+    if (payment.ready_to_send) [current, rowState, detail] = [3, 'agreed', `${signers.length} approvals verified; ready to send`];
     const readiness = state.readiness || {};
 
-    const sig = JSON.stringify([current, rowState, detail, payment.pair, isSigner,
+    const sig = JSON.stringify([current, rowState, detail, signers, isSigner,
       payment.phase, !!payment.ready_to_send, payment.payment, payment.attempt, payment.txid,
       review ? [review.recipient, review.amount_zat, review.memo_utf8, review.fee_zat,
                 review.change_zat, review.expiry_height, review.review_token] : null,
@@ -1033,7 +1035,7 @@ action('payment-draft', async (form) => {
   $('draft-result').textContent = `DRAFT · no member has approved or sent this payment\n`
     + `Payment ID: ${draft.payment}\n`
     + `Amount: ${zecFromZat(amount_zat)} ZEC (${amount_zat} zat)\n`
-    + `Signers: members ${draft.pair.join(' and ')}`;
+    + `Signers: members ${(draft.signers || draft.pair).join(' and ')}`;
   $('draft-result').hidden = false;
   $('amount-zat').textContent = 'Up to 8 decimal places.';
   await api('payment-publish', {vault, attempt: draft.attempt});

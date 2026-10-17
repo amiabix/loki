@@ -15,8 +15,10 @@ async function run() {
     page.on('pageerror', e => errors.push(e.message));
     const vault = 'a'.repeat(64);
     const attempt = 'b'.repeat(64);
+    const draftAttempt = 'e'.repeat(64);
     const recipient = 'uregtest1' + 'q'.repeat(90);
     let approveBody = null;
+    let published = null;
     await page.route('http://127.0.0.1:18801/**', async route => {
       const url = new URL(route.request().url());
       if (!url.pathname.startsWith('/api/')) {
@@ -26,12 +28,19 @@ async function run() {
       }
       let result = {};
       if (url.pathname === '/api/status') result = url.searchParams.has('vault')
-        ? {phase: 'active', name: 'Treasury', vault, slot: 1, threshold: 2, total_members: 3, profile: {name: 'Alice'}, account_linked: true}
-        : {phase: 'home', profile: {name: 'Alice'}, vaults: [{name: 'Treasury', vault, slot: 1, threshold: 2, members: 3}]};
-      else if (url.pathname === '/api/payments') result = {payments: [{attempt, payment: 'c'.repeat(64), pair: [1, 2], phase: 'package', ready_to_send: false}]};
+        ? {phase: 'active', name: 'Treasury', vault, slot: 1, threshold: 3, total_members: 4, profile: {name: 'Alice'}, account_linked: true}
+        : {phase: 'home', profile: {name: 'Alice'}, vaults: [{name: 'Treasury', vault, slot: 1, threshold: 3, members: 4}]};
+      else if (url.pathname === '/api/payments') result = {
+        payments: [{attempt, payment: 'c'.repeat(64), signers: [1, 2, 3], phase: 'package', ready_to_send: false}],
+        readiness: {relay_ready: true, relay_detail: 'Relay reachable.', scan_height: 104},
+      };
       else if (url.pathname === '/api/payment-review') result = {recipient, amount_zat: '40000000',
         memo_utf8: 'rent', fee_zat: '10000', change_zat: '459990000', expiry_height: 1234, review_token: 'tok-1'};
       else if (url.pathname === '/api/payment-approve') { approveBody = JSON.parse(route.request().postData()); result = {ok: true}; }
+      else if (url.pathname === '/api/payment-draft') result = {status: 'draft_only', attempt: draftAttempt,
+        payment: 'd'.repeat(64), recipient, amount_zat: '40000000', fee_zat: '10000',
+        change_zat: '459990000', expiry_height: 1234, signers: [1, 2, 3]};
+      else if (url.pathname === '/api/payment-publish') { published = JSON.parse(route.request().postData()); result = {ok: true}; }
       else if (url.pathname === '/api/payment-sync') result = {};
       else if (url.pathname === '/api/payment-advance') result = {did: []};
       else if (url.pathname === '/api/session/pending') result = {requests: []};
@@ -75,8 +84,17 @@ async function run() {
     assert.deepEqual(approveBody, {vault, attempt, review_token: 'tok-1'}, 'approve posts the exact review token');
     assert.equal(await page.locator('#active').isVisible(), true, 'returns to the overview after approving');
 
+    await page.locator('#payment-draft input[name=recipient]').fill(recipient);
+    await page.locator('#payment-draft input[name=amount_zec]').fill('0.4');
+    await page.locator('#payment-draft textarea[name=memo]').fill('rent');
+    await page.locator('#payment-draft button').click();
+    await page.locator('#draft-result').waitFor({state: 'visible', timeout: 3000});
+    assert.match(await page.locator('#draft-result').textContent(), /Signers: members 1 and 2 and 3/);
+    await page.waitForFunction(() => document.querySelector('#message')?.textContent?.includes('Proposal sent to the other members.'));
+    assert.deepEqual(published, {vault, attempt: draftAttempt}, 'the displayed draft is published');
+
     assert.deepEqual(errors, []);
-    console.log('PASS: compact summary → focused review → token-bound approve → back to overview');
+    console.log('PASS: 3-of-4 review, token-bound approval, and signers-only draft publication');
   } finally { await browser.close(); }
 }
 
