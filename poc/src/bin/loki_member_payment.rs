@@ -18,6 +18,7 @@ use loki_poc::{
     member_state::{self, MemberState, Roster},
     network::VaultNetwork,
     payment_manifest::validate_roster,
+    chain_cache,
     rpc::Rpc,
     scan,
     wallet_store::VaultWallet,
@@ -107,7 +108,7 @@ fn member_chain(
 ) -> Result<(Vec<SpendNote>, u64, Option<[u8; 32]>), String> {
     match member.network {
         VaultNetwork::Regtest => {
-            let chain = scan::scan_chain(rpc, &member.fvk)?;
+            let chain = chain_cache::scan(rpc, owner, &member.fvk, &member.vault)?;
             Ok((chain.notes.into_iter().map(|note| SpendNote {
                 note: note.note, nullifier: note.nullifier, value_zat: note.value_zat,
                 witness: None,
@@ -1112,7 +1113,7 @@ fn finish(args: &[String], broadcast: bool) -> Result<(), String> {
     let rpc = member_rpc(&member)?;
     let (witnesses, anchor) = match member.network {
         VaultNetwork::Regtest => {
-            let chain = scan::scan_chain(&rpc, &member.fvk)?;
+            let chain = chain_cache::scan(&rpc, &owner, &member.fvk, &member.vault)?;
             let anchor = scan::chain_anchor(&rpc, chain.tip)?;
             let witnesses = indices
                 .iter()
@@ -1352,11 +1353,46 @@ fn verify(args: &[String]) -> Result<(), String> {
     {
         return Err("mined amount or change differs from approved intent".into());
     }
+    // Where it was mined, so a later recheck can ask only whether that block is still
+    // on the chain (`chain-check`).
+    // A node that does not report the block leaves the recheck to a full `verify`.
+    let location = tx_json["blockhash"]
+        .as_str()
+        .filter(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .and_then(|block| {
+            let height = rpc
+                .json("getblock", &format!("[\"{block}\", 1]"))
+                .ok()?["height"]
+                .as_u64()?;
+            Some(format!(" block={block} height={height}"))
+        })
+        .unwrap_or_default();
     println!(
-        "verified mined txid={txid} confirmations={confirmations} amount={} fee={} change={} recipient_evidence={}",
+        "verified mined txid={txid} confirmations={confirmations} amount={} fee={} change={} recipient_evidence={}{location}",
         intent.amount_zat, fee, intent.change_zat,
         if paid.is_some() { "decrypted" } else { "candidate-opening-and-mined-sighash" }
     );
+    Ok(())
+}
+
+/// Whether block `hash` is still the chain's block at `height` (`getblockhash` only).
+fn chain_check(args: &[String]) -> Result<(), String> {
+    let [network, height, hash] = args else {
+        return Err("chain-check <regtest|testnet> <height> <block-hash>".into());
+    };
+    let rpc = match VaultNetwork::parse(network)? {
+        VaultNetwork::Regtest => Rpc::regtest(),
+        VaultNetwork::Testnet => Rpc::testnet()?,
+    };
+    let height: u64 = height.parse().map_err(|_| "chain-check height")?;
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("chain-check block hash must be 32 hexadecimal bytes".into());
+    }
+    let current = rpc.json("getblockhash", &format!("[{height}]"))?;
+    if current.as_str() != Some(hash.to_ascii_lowercase().as_str()) {
+        return Err("mined block is no longer on the chain".into());
+    }
+    println!("chain-check=ok height={height}");
     Ok(())
 }
 
@@ -1387,6 +1423,29 @@ fn mined_spend_in_block(
     Ok(None)
 }
 
+/// The one transaction that spent every input of a payment, at or after its creation.
+fn mined_spend_in_index(
+    spent: &BTreeMap<[u8; 32], (u32, String)>,
+    inputs: &[[u8; 32]],
+    created_height: u32,
+) -> Result<Option<String>, String> {
+    if inputs.is_empty() {
+        return Err("payment has no input nullifiers".into());
+    }
+    let mut found = None;
+    for input in inputs {
+        match spent.get(input) {
+            Some((height, txid)) if *height >= created_height => match &found {
+                None => found = Some(txid.clone()),
+                Some(seen) if seen == txid => {}
+                Some(_) => return Ok(None),
+            },
+            _ => return Ok(None),
+        }
+    }
+    Ok(found)
+}
+
 /// Chain-derived txid discovery is a hint only. `verify` checks the exact
 /// approved candidate against the mined transaction before the app confirms it.
 fn find_mined(args: &[String]) -> Result<(), String> {
@@ -1399,15 +1458,24 @@ fn find_mined(args: &[String]) -> Result<(), String> {
     let (context, intent) = manifest(&work.join("payment.json"), member.network)?;
     check_manifest_roster(&member.roster, &context, &intent)?;
     let rpc = member_rpc(&member)?;
-    let tip = rpc
-        .json("getblockcount", "[]")?
-        .as_u64()
-        .ok_or("getblockcount did not return a height")?;
-    for height in u64::from(intent.created_height)..=tip {
-        let block = rpc.json("getblock", &format!("[\"{height}\", 2]"))?;
-        if let Some(txid) = mined_spend_in_block(&block, &intent.input_nullifiers)? {
-            println!("mined txid={txid}");
-            return Ok(());
+    match member.network {
+        VaultNetwork::Regtest => {
+            let chain = chain_cache::scan_state(&rpc, Path::new(&args[0]), &member.fvk, &member.vault)?;
+            if let Some(txid) = mined_spend_in_index(&chain.spent, &intent.input_nullifiers, intent.created_height)? {
+                println!("mined txid={txid}");
+                return Ok(());
+            }
+        }
+        VaultNetwork::Testnet => {
+            let tip = rpc.json("getblockcount", "[]")?.as_u64()
+                .ok_or("getblockcount did not return a height")?;
+            for height in u64::from(intent.created_height)..=tip {
+                let block = rpc.json("getblock", &format!("[\"{height}\", 2]"))?;
+                if let Some(txid) = mined_spend_in_block(&block, &intent.input_nullifiers)? {
+                    println!("mined txid={txid}");
+                    return Ok(());
+                }
+            }
         }
     }
     println!("not mined");
@@ -1469,6 +1537,19 @@ fn receive(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The node's block height only (`getblockcount`), for expiry checks that need no scan.
+fn tip(args: &[String]) -> Result<(), String> {
+    if !args.is_empty() {
+        return Err("tip".into());
+    }
+    let height = Rpc::regtest()
+        .json("getblockcount", "[]")?
+        .as_u64()
+        .ok_or("getblockcount did not return a height")?;
+    println!("{}", serde_json::json!({ "height": height }));
+    Ok(())
+}
+
 fn main() {
     let args = env::args().collect::<Vec<_>>();
     let result = match args.get(1).map(String::as_str) {
@@ -1476,6 +1557,8 @@ fn main() {
         Some("prepare-sweep") => prepare(&args[2..], true),
         Some("local-wires") => local_wires(&args[2..]),
         Some("balance") => balance(&args[2..]),
+        Some("tip") => tip(&args[2..]),
+        Some("chain-check") => chain_check(&args[2..]),
         #[cfg(feature = "relay-communication")]
         Some("features") => {
             println!("relay-backed-signing=1");
@@ -1502,6 +1585,7 @@ fn main() {
             "loki_member_payment <balance|prepare|prepare-sweep|sign|resend|finish|verify|receive> ...".into(),
         ),
     };
+    loki_poc::seal_kdf::report();
     if let Err(error) = result {
         eprintln!("error: {error}");
         process::exit(1);
@@ -1515,19 +1599,23 @@ mod tests {
 
     #[test]
     fn mined_spend_discovery_requires_all_intent_inputs_in_one_transaction() {
-        let first = [1u8; 32];
-        let second = [2u8; 32];
-        let block = json!({"tx": [
-            {"txid": "unrelated", "ironwood": {"actions": [{"nullifier": hex::encode(first)}]}},
-            {"txid": "matching", "ironwood": {"actions": [
-                {"nullifier": hex::encode(first)}, {"nullifier": hex::encode(second)}]}},
-        ]});
+        let (first, second) = ([1u8; 32], [2u8; 32]);
+        let spent = BTreeMap::from([
+            (first, (40, "matching".to_string())),
+            (second, (40, "matching".to_string())),
+            ([3u8; 32], (41, "other".to_string())),
+            ([4u8; 32], (12, "early".to_string())),
+        ]);
         assert_eq!(
-            mined_spend_in_block(&block, &[first, second]).unwrap(),
+            mined_spend_in_index(&spent, &[first, second], 30).unwrap(),
             Some("matching".into())
         );
-        assert_eq!(mined_spend_in_block(&block, &[[3u8; 32]]).unwrap(), None);
-        assert!(mined_spend_in_block(&block, &[]).is_err());
+        // Inputs spent by different transactions, an unspent input, or a spend before
+        // the payment existed are not this payment.
+        assert_eq!(mined_spend_in_index(&spent, &[first, [3u8; 32]], 30).unwrap(), None);
+        assert_eq!(mined_spend_in_index(&spent, &[first, [5u8; 32]], 30).unwrap(), None);
+        assert_eq!(mined_spend_in_index(&spent, &[[4u8; 32]], 30).unwrap(), None);
+        assert!(mined_spend_in_index(&spent, &[], 30).is_err());
     }
 
     #[test]

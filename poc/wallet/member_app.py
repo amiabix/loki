@@ -28,13 +28,45 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 from local_relays import configure_member, ensure_network, network_root, save as save_relay_state
 from local_funding import fund_member, funding_status
+import timing
+from payment_worker import PaymentWorker, SETTLED as PAYMENT_SETTLED
 
 HERE = Path(__file__).resolve().parent
-SETUP = HERE.parent / "target" / "debug" / "loki_setup_member"
-PAYMENT = HERE.parent / "target" / "debug" / "loki_member_payment"
-RELAY = HERE.parent / "target" / "debug" / "loki_relay_member"
-SEED_WALLET = HERE.parent / "target" / "debug" / "loki_seed_wallet"
-WALLET_SYNC = HERE.parent / "target" / "debug" / "loki_wallet_sync"
+BINARIES = ("loki_setup_member", "loki_member_payment", "loki_relay_member", "loki_seed_wallet", "loki_wallet_sync")
+BUILD = "cd poc && cargo build --release --locked --bins --features relay-communication"
+
+
+def target_dir():
+    configured = os.environ.get("CARGO_TARGET_DIR")
+    return Path(configured).resolve() if configured else HERE.parent / "target"
+
+
+def binary_profile(requested=None):
+    """Release when every release binary is built, unless debug is requested explicitly.
+
+    Debug builds keep the development-only fault injection; they are several times
+    slower, so the default follows the README's release build."""
+    requested = requested or os.environ.get("LOKI_POC_BIN_PROFILE")
+    if requested:
+        if requested not in ("release", "debug"):
+            raise ValueError("Choose the release or debug binary profile")
+        return requested
+    release = target_dir() / "release"
+    return "release" if all((release / name).is_file() for name in BINARIES) else "debug"
+
+
+def binary(name, profile=None):
+    return target_dir() / (profile or PROFILE) / name
+
+
+def use_binaries(profile):
+    """Select the native binaries for this process; the paths are read at call time."""
+    global PROFILE, SETUP, PAYMENT, RELAY, SEED_WALLET, WALLET_SYNC
+    PROFILE = profile
+    SETUP, PAYMENT, RELAY, SEED_WALLET, WALLET_SYNC = (binary(name, profile) for name in BINARIES)
+
+
+use_binaries(binary_profile())
 
 # A peer's message that has not arrived yet, or a broadcast the node has not mined
 # yet, is a normal outcome of asking too early rather than a failure to report.
@@ -162,6 +194,18 @@ def check_origin(value):
                          "every request.")
     return f"{parts.scheme}://{parts.netloc}"
 
+
+# Routes whose native commands open the vault's transport store, which the payment
+# worker also opens. Payment-sync is absent: it waits for a worker pass instead.
+VAULT_STORE_ROUTES = frozenset((
+    "/api/payment-draft", "/api/payment-publish", "/api/payment-commit", "/api/payment-package",
+    "/api/payment-review", "/api/payment-approve", "/api/payment-resend", "/api/payment-finish",
+    "/api/payment-verify", "/api/payment-advance",
+    "/api/relay-provision", "/api/relay-export", "/api/relay-import", "/api/relay-status",
+))
+# Store routes that change nothing the payment worker acts on: no worker pass afterwards.
+# Not /api/relay-status: it can save phase "ready", which makes the vault eligible.
+READ_ONLY_STORE_ROUTES = frozenset(("/api/payment-review",))
 
 class Unreachable(ValueError):
     """The courier did not answer. Like Timeout, nothing is known to have
@@ -371,14 +415,18 @@ class SignerSessions:
 
 
 class Wallet:
-    def __init__(self, data, exchange, setup=SETUP, invite_origin=None, transport="local", operator_bundle=None, operator_key=None, enrollment_grant=None, development_http=False, enrollment_issuer=None, network="regtest", lightwalletd_url=None):
+    def __init__(self, data, exchange, setup=None, invite_origin=None, transport="local", operator_bundle=None, operator_key=None, enrollment_grant=None, development_http=False, enrollment_issuer=None, network="regtest", lightwalletd_url=None):
         if network not in ("regtest", "testnet"):
             raise ValueError("Choose regtest or testnet")
         self.network = network
         self.lightwalletd_url = lightwalletd_url
         self.data = data.resolve()
-        self.exchange = exchange.resolve()
-        if self.data == self.exchange or self.data in self.exchange.parents or self.exchange in self.data.parents:
+        # Hosted vaults never use the local courier; an exchange given for script
+        # compatibility is still checked and otherwise ignored.
+        if exchange is None and transport != "hosted":
+            raise ValueError("Local transport needs an --exchange directory")
+        self.exchange = exchange.resolve() if exchange is not None else None
+        if self.exchange and (self.data == self.exchange or self.data in self.exchange.parents or self.exchange in self.data.parents):
             raise ValueError("member data and exchange must be separate directories")
         if (self.data / "membership.json").exists():
             raise ValueError("Existing single-vault data root; keep using the previous setup app or choose a new root")
@@ -386,7 +434,8 @@ class Wallet:
             if read_json(saved).get("network", "regtest") != network:
                 raise ValueError("This profile has vaults on another network; use a separate member data directory")
         self.data.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self.exchange.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if self.exchange:
+            self.exchange.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.data, 0o700)
         self.process_lock = open(self.data / ".app.lock", "a+b")
         try:
@@ -394,7 +443,7 @@ class Wallet:
         except BlockingIOError as error:
             self.process_lock.close()
             raise ValueError("This member data root is already open in another app") from error
-        self.setup = setup
+        self.setup = setup or SETUP
         if transport not in ("local", "hosted"):
             raise ValueError("Choose local or hosted transport")
         self.transport = transport
@@ -403,6 +452,7 @@ class Wallet:
             from hosted_setup import HostedSetup
             self.hosted = HostedSetup(self, operator_bundle, operator_key, enrollment_grant, development_http, enrollment_issuer)
         self.invite_origin = check_origin(invite_origin) if invite_origin else None
+        self.payment_worker = PaymentWorker(self)
         self.lock = threading.Lock()
         self.claim_lock = threading.Lock()
         self.syncs = {}
@@ -424,8 +474,10 @@ class Wallet:
 
     def command(self, action, *args, passphrase=None, timeout=30, binary=None):
         binary = binary or self.setup
+        # The payment worker's allowlist; a no-op for every other caller.
+        self.payment_worker.check(binary.name, action)
         if not binary.is_file():
-            raise ValueError(f"Build {binary.name}: cd poc && cargo build --locked --bins")
+            raise ValueError(f"Build {binary.name}: {BUILD}")
         passfile = None
         try:
             argv = [str(binary), action]
@@ -438,14 +490,26 @@ class Wallet:
                     argv.append(name)
                 else:
                     argv.append(str(arg))
+            started = time.monotonic()
+            process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            tracked = self.payment_worker.track(process)
             try:
-                result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+                stdout, stderr = process.communicate(timeout=timeout)
             except subprocess.TimeoutExpired as error:
+                process.kill()
+                process.communicate()
+                timing.record(f"{binary.name} {action}", started, "timeout", *args)
                 raise Timeout(f"{action} did not finish within {timeout} seconds") from error
-            if result.returncode:
-                detail = result.stderr.strip() or result.stdout.strip() or f"{action} failed"
+            finally:
+                if tracked:
+                    self.payment_worker.untrack(process)
+            timing.record(f"{binary.name} {action}", started, process.returncode, *args, stderr=stderr)
+            if process.returncode:
+                if self.payment_worker.stop_event.is_set() and tracked:
+                    raise ValueError("Signer is locked")
+                detail = stderr.strip() or stdout.strip() or f"{action} failed"
                 raise ValueError(detail.removeprefix("error: "))
-            return result.stdout.strip()
+            return stdout.strip()
         finally:
             if passfile:
                 passfile.unlink(missing_ok=True)
@@ -461,6 +525,7 @@ class Wallet:
         self.passphrase, self.profile_data = passphrase, profile
         if self.hosted:
             self.hosted.start()
+        self.payment_worker.start()
         return {"profile": profile}
 
     def unlock(self, passphrase):
@@ -479,16 +544,36 @@ class Wallet:
         self.passphrase, self.profile_data = passphrase, profile
         if self.hosted:
             self.hosted.start()
+        self.payment_worker.start()
         return {"profile": profile}
 
     def lock_profile(self):
-        if self.hosted:
-            self.hosted.stop()
+        self.stop_workers()
         if any(worker.is_alive() for worker in self.workers.values()):
             raise ValueError("Wait for key creation to finish before locking")
         self.passphrase = None
         self.profile_data = None
         return {"locked": True}
+
+    def stop_workers(self):
+        failures = []
+        if self.hosted:
+            def stop_hosted():
+                try:
+                    self.hosted.stop()
+                except Exception as error:
+                    failures.append(error)
+            stopping = threading.Thread(target=stop_hosted, daemon=True)
+            stopping.start()
+        else:
+            stopping = None
+        try:
+            self.payment_worker.stop()
+        finally:
+            if stopping:
+                stopping.join()
+        if failures:
+            raise failures[0]
 
     def require_profile(self):
         if not self.profile_data:
@@ -496,7 +581,7 @@ class Wallet:
         return self.profile_data
 
     def vault_dir(self, vault):
-        folder = self.data / "vaults" / self.exchange_vault(vault).name
+        folder = self.data / "vaults" / self.checked_vault_id(vault)
         local = folder / "membership.json"
         if not local.is_file():
             raise ValueError("This profile is not a member of that vault")
@@ -601,6 +686,9 @@ class Wallet:
             native = self.hosted._cached(member)
             return {"phase": "ready" if native.get("handoff") == "ready" else "waiting", "available": False,
                     "detail": "Hosted relays are connected." if native.get("handoff") == "ready" else "Connecting hosted relays automatically."}
+        if self.exchange is None:
+            return {"phase": "unavailable", "available": False,
+                    "detail": "This local vault needs the app started with local transport and its exchange."}
         state_path = member / "relay-setup.json"
         state = read_json(state_path) if state_path.is_file() else {}
         if state.get("mode") == "operator":
@@ -623,9 +711,16 @@ class Wallet:
                                     "Available after this member checks the final backup."),
                 "available": available}
 
-    def exchange_vault(self, vault):
+    @staticmethod
+    def checked_vault_id(vault):
         if not isinstance(vault, str) or len(vault) != 64 or any(c not in "0123456789abcdef" for c in vault):
             raise ValueError("Invalid vault ID")
+        return vault
+
+    def exchange_vault(self, vault):
+        self.checked_vault_id(vault)
+        if self.exchange is None:
+            raise ValueError("Not available with hosted transport")
         return self.exchange / vault
 
     # ── the creator's courier, reachable by the other members ───────────────
@@ -674,7 +769,7 @@ class Wallet:
         return {"draft": draft}
 
     def courier_slot(self, vault, token):
-        claims = self.data / "vaults" / self.exchange_vault(vault).name / "claims.json"
+        claims = self.data / "vaults" / self.checked_vault_id(vault) / "claims.json"
         presented = hashlib.sha256((token or "").encode()).hexdigest()
         for slot, saved in (read_json(claims) if claims.is_file() else {}).items():
             if secrets.compare_digest(saved, presented):
@@ -711,7 +806,7 @@ class Wallet:
 
         The bytes are unchanged, so every signature, roster and ciphertext check
         the file courier already made happens exactly as before."""
-        transport = self.data / "vaults" / self.exchange_vault(vault).name / "transport.json"
+        transport = self.data / "vaults" / self.checked_vault_id(vault) / "transport.json"
         worker = self.syncs.get(vault)
         if vault in self.sync_done or not transport.is_file() or (worker and worker.is_alive()):
             return
@@ -1129,7 +1224,7 @@ class Wallet:
         return {"verified": True}
 
     def backup_reports(self, vault):
-        member_dir = self.data / "vaults" / self.exchange_vault(vault).name
+        member_dir = self.data / "vaults" / self.checked_vault_id(vault)
         return json.loads(self.command("backup-reports", member_dir / "roster.json",
                                        self.exchange_vault(vault)))
 
@@ -1296,54 +1391,149 @@ class Wallet:
         raise ValueError("Payment is not in this member's vault")
 
     def payments(self, vault):
+        """The payment list, read from saved state only: the payment worker runs the
+        native checks and records readiness, so a listing starts no process."""
         member_dir, local = self.vault_dir(vault)
         if not (member_dir / "final-backup-checked").is_file():
             raise ValueError("Vault is not active")
         items = []
-        for path in sorted((member_dir / "payments").glob("*/payment.json")):
-            manifest = read_json(path)
-            attempt = manifest.get("attempt")
-            if manifest.get("vault") != vault or not isinstance(attempt, str) \
-                    or not re.fullmatch(r"[0-9a-f]{64}", attempt):
-                continue
-            status = self.payment_phase(path.parent)
-            phase = status["phase"]
-            ready_to_send = False
+        for work, manifest in self._payment_works(member_dir, vault):
+            attempt = manifest["attempt"]
+            status = self.payment_phase(work)
             signers = selected_signers(manifest, local.get("threshold", 2), local["members"])
-            is_signer = local["slot"] in signers
-            if phase in ("published", "received", "commitments", "package", "approved") \
-                    and (not is_signer or phase == "approved"):
-                try:
-                    _, _, _, checked = self.payment_command("finish-check", vault, attempt, timeout=30)
-                    expected = r"\baggregate verified payment=" + re.escape(manifest["payment"]) + \
-                               r" sighash=[0-9a-f]{64}\b"
-                    if not re.search(expected, checked):
-                        raise ValueError("Verified aggregate differs from this payment")
-                    ready_to_send = True
-                except ValueError as error:
-                    missing_early_package = phase in ("published", "received", "commitments", "package") \
-                        and "No such file or directory (os error 2)" in str(error)
-                    if not (PAYMENT_WAITING.search(str(error)) or missing_early_package):
-                        raise
-            if phase == "confirmed":
-                # Recheck the node and the indexed confirmation to catch reorgs.
-                try:
-                    _, _, _, output = self.payment_command("verify", vault, attempt, status["txid"])
-                    if not re.search(r"\bverified mined txid=" + re.escape(status["txid"]) +
-                                     r" confirmations=[1-9][0-9]*\b", output):
-                        phase = "confirmation_needs_recheck"
-                except (KeyError, ValueError, subprocess.TimeoutExpired):
-                    phase = "confirmation_needs_recheck"
-                if phase == "confirmation_needs_recheck":
-                    self.payment_status(path.parent, phase, status.get("txid"))
             items.append({"attempt": attempt, "payment": manifest.get("payment"),
-                          "signers": signers, "phase": phase,
-                          "ready_to_send": ready_to_send,
+                          "signers": signers, "phase": status["phase"],
+                          "ready_to_send": self.payment_worker.is_ready(vault, attempt),
                           **({"txid": status["txid"]} if status.get("txid") else {})})
         relay_ready, relay_detail = self.payment_readiness()
         return {"payments": items,
                 "readiness": {"relay_ready": relay_ready, "relay_detail": relay_detail,
-                              "scan_height": self.scan_height.get(vault)}}
+                              "scan_height": self.scan_height.get(vault)},
+                "updates": {"running": self.payment_worker.running(),
+                            "error": self.payment_worker.error(vault)}}
+
+    def _payment_works(self, member_dir, vault):
+        for path in sorted((member_dir / "payments").glob("*/payment.json")):
+            manifest = read_json(path)
+            attempt = manifest.get("attempt")
+            if manifest.get("vault") == vault and isinstance(attempt, str) \
+                    and re.fullmatch(r"[0-9a-f]{64}", attempt):
+                yield path.parent, manifest
+
+    def payment_vaults(self):
+        """Vaults whose payments the worker advances: active, owned by this unlocked
+        profile, with relays ready (hosted: activation saved and handoff ready)."""
+        profile = self.profile_data
+        root = self.data / "vaults"
+        if not profile or not root.is_dir():
+            return []
+        vaults = []
+        for folder in sorted(root.iterdir()):
+            membership = folder / "membership.json"
+            if not re.fullmatch(r"[0-9a-f]{64}", folder.name) or not membership.is_file() \
+                    or not (folder / "final-backup-checked").is_file():
+                continue
+            local = read_json(membership)
+            if local.get("profile") != profile["id"] or local.get("threshold", 2) != 2 \
+                    or local.get("members") not in (3, 4):
+                continue
+            if local.get("transport") == "hosted":
+                if not self.hosted or not (folder / "secrets" / "activation.sealed").is_file() \
+                        or self.hosted._cached(folder).get("handoff") != "ready":
+                    continue
+            else:
+                state = folder / "relay-setup.json"
+                if not state.is_file() or read_json(state).get("phase") != "ready":
+                    continue
+            vaults.append(folder.name)
+        return vaults
+
+    def payments_mid_flight(self, vault):
+        member_dir = self.data / "vaults" / vault
+        return any(self.payment_phase(work)["phase"] not in PAYMENT_SETTLED
+                   for work, _ in self._payment_works(member_dir, vault))
+
+    def payment_pass(self, vault, worker):
+        """One worker pass: deliver and receive, advance every payment as far as it
+        goes without a human, then refresh readiness and chain checks. Returns whether
+        any payment changed phase."""
+        member_dir, local = self.vault_dir(vault)
+        phases = lambda: {work.name: self.payment_phase(work)["phase"]
+                          for work, _ in self._payment_works(member_dir, vault)}
+        before = phases()
+        self._sync_payments(vault)
+        for work, manifest in self._payment_works(member_dir, vault):
+            if worker.stop_event.is_set():
+                return False
+            worker.yield_to_user(vault)
+            if self.payment_phase(work)["phase"] not in PAYMENT_SETTLED:
+                self.advance_payment(vault, manifest["attempt"])
+        self.refresh_payment_checks(vault, worker)
+        return phases() != before
+
+    def refresh_payment_checks(self, vault, worker):
+        """Record which payments are ready to send (verified aggregate) and recheck
+        confirmed ones on the chain at most every 30 s each."""
+        member_dir, local = self.vault_dir(vault)
+        for work, manifest in self._payment_works(member_dir, vault):
+            if worker.stop_event.is_set():
+                return
+            worker.yield_to_user(vault)
+            attempt = manifest["attempt"]
+            phase = self.payment_phase(work)["phase"]
+            is_signer = local["slot"] in manifest["pair"]
+            if phase in ("published", "received", "commitments", "package", "approved") \
+                    and (not is_signer or phase == "approved"):
+                if not worker.is_ready(vault, attempt):
+                    worker.set_ready(vault, attempt, self._finish_ready(vault, attempt, manifest, phase))
+            else:
+                worker.set_ready(vault, attempt, False)
+            if phase == "confirmed" and worker.recheck_due(vault, attempt):
+                worker.rechecked(vault, attempt)
+                self._recheck_confirmed(vault, attempt, work)
+
+    def _recheck_confirmed(self, vault, attempt, work):
+        """Is a confirmed payment still mined? While its recorded block is still on the
+        chain (one `getblockhash`), yes; otherwise, or without a recorded block, the full
+        `verify` decides, and a failure marks it for a recheck."""
+        status = self.payment_phase(work)
+        if isinstance(status.get("mined_block"), str) and isinstance(status.get("mined_height"), int):
+            try:
+                self.command("chain-check", self.network, status["mined_height"], status["mined_block"], binary=PAYMENT, timeout=30)
+                return
+            except (ValueError, subprocess.TimeoutExpired):
+                pass
+        try:
+            _, _, _, output = self.payment_command("verify", vault, attempt, status["txid"])
+            confirmed = re.search(r"\bverified mined txid=" + re.escape(status["txid"]) +
+                                  r" confirmations=[1-9][0-9]*\b", output)
+        except (KeyError, ValueError, subprocess.TimeoutExpired):
+            confirmed = None
+        if not confirmed:
+            self.payment_status(work, "confirmation_needs_recheck", status.get("txid"))
+            return
+        # Save where it is mined now (after a reorg it may be another block), so the next
+        # recheck can use the one-RPC path again.
+        located = re.search(r"\bblock=([0-9a-f]{64}) height=([0-9]+)$", output.strip())
+        if located and (located.group(1), int(located.group(2))) != \
+                (status.get("mined_block"), status.get("mined_height")):
+            self.payment_status(work, "confirmed", status["txid"],
+                                {"mined_block": located.group(1), "mined_height": int(located.group(2))})
+
+    def _finish_ready(self, vault, attempt, manifest, phase):
+        try:
+            _, _, _, checked = self.payment_command("finish-check", vault, attempt, timeout=30)
+        except ValueError as error:
+            missing_early_package = phase in ("published", "received", "commitments", "package") \
+                and "No such file or directory (os error 2)" in str(error)
+            if PAYMENT_WAITING.search(str(error)) or missing_early_package:
+                return False
+            raise
+        expected = r"\baggregate verified payment=" + re.escape(manifest["payment"]) + \
+                   r" sighash=[0-9a-f]{64}\b"
+        if not re.search(expected, checked):
+            raise ValueError("Verified aggregate differs from this payment")
+        return True
 
     def payment_phase(self, work):
         state = work / "payment-status.json"
@@ -1456,12 +1646,13 @@ class Wallet:
         return {"configured": configured, "reachable": configured and live >= 2,
                 "inboxes": inboxes, "peers": peers, "live_relays": live}
 
-    def payment_status(self, work, phase, txid=None):
+    def payment_status(self, work, phase, txid=None, mined=None):
         # shortcut: this file is UI progress only; custody state remains in the Rust signer and chain.
         target = work / "payment-status.json"
         temporary = work / (".payment-status-" + secrets.token_hex(8))
         try:
-            write_new(temporary, json.dumps({"phase": phase, **({"txid": txid} if txid else {})}).encode())
+            write_new(temporary, json.dumps({"phase": phase, **({"txid": txid} if txid else {}),
+                                             **(mined or {})}).encode())
             os.replace(temporary, target)
         finally:
             temporary.unlink(missing_ok=True)
@@ -1487,74 +1678,58 @@ class Wallet:
         return {"phase": "queued_for_delivery"}
 
     def sync_payments(self, vault):
+        """"Check for updates": one worker pass for this vault now, then the list."""
+        self.payment_worker.sync_now(self.checked_vault_id(vault))
+        return self.payments(vault)
+
+    def _sync_payments(self, vault):
+        """Deliver queued proposals and saved signing messages, receive, import new
+        proposals and export received signing messages, in one relay process."""
         member_dir, local = self.vault_dir(vault)
         if not supported_policy(local.get("threshold", 2), local.get("members")) \
                 or not (member_dir / "final-backup-checked").is_file():
             raise ValueError("Relay payments require an active supported vault")
         if local.get("transport") == "hosted" and not (member_dir / "secrets" / "activation.sealed").is_file():
             raise ValueError("Hosted payment activation is still pending")
-        roster = member_dir / "roster.json"
-        common = ("--member-root", member_dir, "--passphrase-file", "@pass", "--roster", roster)
-
-        def relay(action, *args):
-            return self.command(action, *common, *args, binary=RELAY, timeout=120)
-
-        works = sorted((member_dir / "payments").glob("*/payment.json"))
-        proposals = {}
-        for path in works:
-            work = path.parent
-            status = work / "payment-status.json"
-            if status.is_file() and read_json(status).get("phase") == "queued_for_delivery":
-                attempt = work.name
-                published = relay("send-proposal", "--proposal-file", path)
-                match = re.search(r"\brequest message=([0-9a-f]{64})\b", published)
-                if not match:
-                    raise ValueError("Relay did not identify the proposal")
-                proposals[attempt] = match.group(1)
-        relay("upload")
-        relay("poll", "--once")
-        relay("import-proposals", "--payments-dir", member_dir / "payments")
-
-        works = sorted((member_dir / "payments").glob("*/payment.json"))
-        approvals = {}
-        for path in works:
-            attempt = path.parent.name
-            state = path.parent / "payment-status.json"
-            if state.is_file() and read_json(state).get("phase") == "approval_pending_delivery":
+        plan = {"proposals": [], "signing": [], "export": [], "import": True}
+        queued, approvals = [], []
+        for work, manifest in list(self._payment_works(member_dir, vault)):
+            attempt = manifest["attempt"]
+            phase = self.payment_phase(work)["phase"]
+            if phase == "queued_for_delivery":
+                plan["proposals"].append(str(work / "payment.json"))
+                queued.append(attempt)
+            if phase == "confirmed":
+                continue
+            if phase == "approval_pending_delivery":
                 try:
                     self.payment_command("resend", vault, attempt)
                 except ValueError:
                     # A consumed attempt with no saved share must not stall other payments.
-                    self.payment_status(path.parent, "approval_interrupted")
+                    self.payment_status(work, "approval_interrupted")
                     continue
-                approvals[attempt] = []
-            _, work, _, output = self.payment_command("local-wires", vault, attempt)
-            wires = json.loads(output)["wires"]
-            for wire in wires:
-                sent = relay("send-signing", "--payload-file", work / "mailbox" / wire,
-                             "--attempt", attempt)
-                if attempt in approvals:
-                    match = re.search(r"\brequest message=([0-9a-f]{64})\b", sent)
-                    if not match:
-                        raise ValueError("Relay did not identify the saved approval message")
-                    approvals[attempt].append(match.group(1))
-        relay("upload")
-        relay("poll", "--once")
-        for path in works:
-            relay("export-signing", "--work-dir", path.parent, "--attempt", path.parent.name)
-
-        if proposals or approvals:
-            report = relay("status")
-            lines = {match.group(1): line for line in report.splitlines()
-                     if (match := re.search(r"^message .*\bid=([0-9a-f]{64})\b", line))}
-            for attempt, message in proposals.items():
-                if re.search(r"\bstored_whole=1\b", lines.get(message, "")):
-                    self.payment_status(member_dir / "payments" / attempt, "published")
-            for attempt, messages in approvals.items():
-                if messages and all(re.search(r"\bstored_whole=1\b", lines.get(message, ""))
-                                    for message in messages):
-                    self.payment_status(member_dir / "payments" / attempt, "approved")
-        return self.payments(vault)
+                approvals.append(attempt)
+            _, _, _, output = self.payment_command("local-wires", vault, attempt)
+            for wire in json.loads(output)["wires"]:
+                plan["signing"].append({"attempt": attempt, "wire": str(work / "mailbox" / wire)})
+            plan["export"].append({"attempt": attempt, "work": str(work)})
+        descriptor, name = tempfile.mkstemp(prefix=".payment-sync-", dir=self.data)
+        try:
+            with os.fdopen(descriptor, "w") as output:
+                json.dump(plan, output)
+            report = json.loads(self.command(
+                "payment-sync", "--member-root", member_dir, "--passphrase-file", "@pass",
+                "--roster", member_dir / "roster.json", "--plan", name, binary=RELAY, timeout=120))
+        finally:
+            Path(name).unlink(missing_ok=True)
+        for attempt in queued:
+            if report["proposals"].get(attempt, {}).get("stored") is True:
+                self.payment_status(member_dir / "payments" / attempt, "published")
+        for attempt in approvals:
+            messages = report["signing"].get(attempt, [])
+            if messages and all(message.get("stored") is True for message in messages):
+                self.payment_status(member_dir / "payments" / attempt, "approved")
+        return report
 
     def commit_payment(self, vault, attempt):
         _, local, _, manifest = self.payment(vault, attempt)
@@ -1567,9 +1742,10 @@ class Wallet:
             if chain.get("vault") != vault:
                 raise ValueError("Payment chain scan returned another vault")
             self.scan_height[vault] = chain["height"]
+            height = chain["height"]
         else:
-            chain = self.balance(vault)
-        if chain["height"] >= manifest["expiry_height"]:
+            height = json.loads(self.command("tip", binary=PAYMENT, timeout=30))["height"]
+        if height >= manifest["expiry_height"]:
             raise ValueError("This payment has expired on this member's chain view")
         _, work, _, _ = self.payment_command("commit", vault, attempt)
         self.payment_status(work, "commitments")
@@ -1632,7 +1808,9 @@ class Wallet:
         match = re.search(r"\bverified mined txid=([0-9a-f]{64}) confirmations=([1-9][0-9]*)\b", output)
         if not match or match.group(1) != txid:
             raise ValueError("Chain verification did not confirm this payment")
-        self.payment_status(work, "confirmed", txid)
+        located = re.search(r"\bblock=([0-9a-f]{64}) height=([0-9]+)$", output.strip())
+        self.payment_status(work, "confirmed", txid, {"mined_block": located.group(1),
+                                                       "mined_height": int(located.group(2))} if located else None)
         return {"phase": "confirmed", "txid": txid, "confirmations": int(match.group(2))}
 
     def advance_payment(self, vault, attempt):
@@ -1646,7 +1824,7 @@ class Wallet:
             state = self.payment_phase(work)
             phase = state["phase"]
             if phase == "confirmed" and not did:
-                self.payments(vault)
+                self._recheck_confirmed(vault, attempt, work)
                 state = self.payment_phase(work)
                 phase = state["phase"]
             if phase in ("published", "received") and slot in pair:
@@ -1761,8 +1939,7 @@ class Wallet:
         return state
 
     def close(self):
-        if self.hosted:
-            self.hosted.stop()
+        self.stop_workers()
         self.relay_stop.set()
         self.relay_monitor.join(timeout=5)
         for worker in self.relay_jobs.values():
@@ -2024,8 +2201,16 @@ def make_signer_server(wallet, port, dashboard_port=None):
                             return self.reply(200, result)
                     sessions.disconnect(key, dashboard_origin)
                     return self.reply(200, {"disconnected": True})
-                if self.path == "/api/lock" and wallet.hosted:
-                    wallet.hosted.stop()
+                if self.path == "/api/lock":
+                    # Both workers stop (within 5 s) before the app lock is taken.
+                    wallet.stop_workers()
+                if self.path == "/api/payment-sync":
+                    # Waits for a worker pass (up to a minute) without holding the app
+                    # lock, so the 2 s list refresh and other routes keep answering.
+                    wallet.require_profile()
+                    wallet.payment_worker.sync_now(wallet.checked_vault_id(value.get("vault")))
+                    with wallet.lock:
+                        return self.reply(200, wallet.payments(value.get("vault")))
                 with wallet.lock:
                     if self.path == "/api/session/approve":
                         wallet.require_profile()
@@ -2107,7 +2292,14 @@ def make_signer_server(wallet, port, dashboard_port=None):
                     }
                     if self.path not in routes:
                         return self.reply(404, {"error": "Not found"})
-                    result = routes[self.path]()
+                    if self.path in VAULT_STORE_ROUTES:
+                        # Between payment worker steps on this vault, never during one: the
+                        # member's transport store admits one native process at a time.
+                        with wallet.payment_worker.user_action(wallet.checked_vault_id(value.get("vault")),
+                                                               poke=self.path not in READ_ONLY_STORE_ROUTES):
+                            result = routes[self.path]()
+                    else:
+                        result = routes[self.path]()
                     if self.path == "/api/lock":
                         sessions.clear()
                     self.reply(200, result)
@@ -2185,7 +2377,7 @@ if __name__ == "__main__":
     parser.add_argument("--network", choices=("regtest", "testnet"), default="regtest")
     parser.add_argument("--lightwalletd-url", help="HTTPS Testnet lightwalletd endpoint for the persistent vault scan")
     parser.add_argument("--data", type=Path, required=True, help="private directory for this member only")
-    parser.add_argument("--exchange", type=Path, required=True, help="shared untrusted local setup courier")
+    parser.add_argument("--exchange", type=Path, help="shared untrusted local setup courier (local transport only)")
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--dashboard-port", type=int, help="serve a separate dashboard origin")
     parser.add_argument("--invite-port", type=int,
@@ -2201,9 +2393,17 @@ if __name__ == "__main__":
     parser.add_argument("--enrollment-grant", type=Path)
     parser.add_argument("--enrollment-issuer", type=Path)
     parser.add_argument("--development-http", action="store_true")
+    parser.add_argument("--bin-profile", choices=("release", "debug"),
+                        help="native binary profile; defaults to release when it is built")
     args = parser.parse_args()
+    use_binaries(binary_profile(args.bin_profile))
+    print(f"Native binaries: {PROFILE} ({SETUP.parent})", flush=True)
+    if PROFILE == "debug":
+        print(f"Warning: debug binaries are slow; build release with: {BUILD}", flush=True)
     if args.transport == "hosted" and (not args.operator_bundle or not args.operator_key):
         parser.error("Hosted transport needs --operator-bundle and --operator-key")
+    if args.transport == "local" and not args.exchange:
+        parser.error("Local transport needs --exchange")
     if args.transport == "hosted" and args.invite_port:
         parser.error("Hosted setup uses the admission service rather than --invite-port")
     origin = args.invite_origin

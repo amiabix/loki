@@ -406,6 +406,9 @@ fn prerequisites_are_transitive_and_store_association_is_checked_on_every_commit
     std::fs::remove_dir_all(path).unwrap();
 }
 
+/// Relay request deadline in the operator bundle of the delivery test.
+const REQUEST_SECONDS: u64 = 3;
+
 #[tokio::test]
 async fn peers_arrive_independently_after_creator_offline_and_ack_survives_reopen() {
     use loki_relay_client::{
@@ -496,6 +499,9 @@ async fn peers_arrive_independently_after_creator_offline_and_ack_survives_reope
                     })
                     .collect(),
             );
+            if let Value::Array(limits) = &mut f[4] {
+                limits[4] = Value::Integer(REQUEST_SECONDS.into());
+            }
             f[2] = Value::Array(vec![
                 Value::Bytes(b"http://127.0.0.1:19999".to_vec()),
                 Value::Bytes(
@@ -598,7 +604,33 @@ async fn peers_arrive_independently_after_creator_offline_and_ack_survives_reope
         let unavailable = servers.remove(0);
         unavailable.abort();
         let _ = unavailable.await;
+        // With four members the first relay accepts connections but never answers: the
+        // drive must still finish within one relay deadline and store on the other two.
+        let hanging = if n == 4 {
+            let (_, endpoint, _) = routes.iter().find(|(_, _, index)| *index == 1).unwrap();
+            let listener = tokio::net::TcpListener::bind(endpoint.trim_start_matches("http://"))
+                .await
+                .unwrap();
+            Some(tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok((socket, _)) = listener.accept().await {
+                    held.push(socket);
+                }
+            }))
+        } else {
+            None
+        };
+        let started = std::time::Instant::now();
         let progress = t.drive_once(&mut store, &creator_routes).await.unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2 * REQUEST_SECONDS),
+            "a hanging relay held the drive for {:?}",
+            started.elapsed()
+        );
+        if let Some(hanging) = hanging {
+            hanging.abort();
+            let _ = hanging.await;
+        }
         assert_eq!(progress.stored_groups, 1);
         assert_eq!(progress.received_groups, 0);
         let retry_sql = rusqlite::Connection::open(parent.join("member1/setup.sqlite3")).unwrap();

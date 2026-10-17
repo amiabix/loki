@@ -12,7 +12,7 @@ async function run() {
     page.on('pageerror', error => errors.push(error.message));
     const vault = 'a'.repeat(64);
     const attempt = 'b'.repeat(64);
-    let advances = 0;
+    let syncs = 0;
     let phase = 'package';
     await page.route('http://127.0.0.1:18801/**', async route => {
       const url = new URL(route.request().url());
@@ -32,8 +32,7 @@ async function run() {
       } else if (url.pathname === '/api/payment-review') {
         result = {recipient: 'uregtest1xyz', amount_zat: '150000000', memo_utf8: 'lunch',
                   fee_zat: '10000', change_zat: '0', expiry_height: 500, review_token: 'tok-1'};
-      } else if (url.pathname === '/api/payment-sync') result = {};
-      else if (url.pathname === '/api/payment-advance') result = {did: [`advance ${++advances}`]};
+      } else if (url.pathname === '/api/payment-sync') { syncs++; result = {}; }
       else if (url.pathname === '/api/session/pending') result = {requests: []};
       else if (url.pathname === '/api/session/actions') result = {actions: []};
       return route.fulfill({json: result, status: result.error ? 400 : 200});
@@ -43,13 +42,15 @@ async function run() {
     const approve = page.getByRole('button', {name: 'Approve this exact transaction'});
     await approve.waitFor();
     await approve.evaluate(node => { node.dataset.probe = 'kept'; node.focus(); });
-    // Trigger a poll the way the 6s interval does — no click, so the act of
-    // polling does not move focus off the Approve button.
+    // A manual sync followed by a read must preserve the approval control.
+    const synced = page.waitForResponse(response => response.url().includes('/api/payment-sync'));
+    const refreshed = page.waitForResponse(response => response.url().includes('/api/payments?'));
     await page.evaluate(() => document.getElementById('refresh-payments').dispatchEvent(new MouseEvent('click', {bubbles: true})));
-    await page.waitForFunction(() => /advance/.test(document.querySelector('.payment-activity')?.textContent || ''));
-    assert.match(await page.locator('.payment-activity').textContent(), /advance/);
+    await synced;
+    await refreshed;
+    assert.equal(syncs, 1);
     assert.equal(await approve.getAttribute('data-probe'), 'kept',
-      'Approve button DOM node must survive a poll that only changed activity');
+      'Approve button DOM node must survive an unchanged payment read');
     assert.equal(await page.evaluate(() => document.activeElement?.dataset?.probe), 'kept',
       'focus must stay on the Approve button across a poll');
     phase = 'approved';

@@ -8,12 +8,29 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 from member_app import PAYMENT, SEED_WALLET, SETUP, WALLET_SYNC, Wallet, courier_name, decoded, make_signer_server
+
+
+def payment_sync_fake(stored, plans=None):
+    """A fake `loki_relay_member payment-sync`: reports every planned message as
+    stored (or not) and records each plan it was given."""
+    def run(args):
+        plan = json.loads(Path(args[args.index("--plan") + 1]).read_text())
+        if plans is not None:
+            plans.append(plan)
+        proposals = {Path(path).parent.name: {"message": "d" * 64, "stored": stored()} for path in plan["proposals"]}
+        signing = {}
+        for item in plan["signing"]:
+            signing.setdefault(item["attempt"], []).append({"message": "d" * 64, "stored": stored()})
+        return json.dumps({"proposals": proposals, "signing": signing, "imported": 0, "rejected": 0,
+                           "exported": {item["attempt"]: 0 for item in plan["export"]}})
+    return run
 
 
 class MemberWalletTest(unittest.TestCase):
@@ -180,25 +197,30 @@ class MemberWalletTest(unittest.TestCase):
             (work / "mailbox" / wire).write_bytes(b"own authenticated wire")
             wallet.payment_status(work, "queued_for_delivery")
             calls = []
+            plans = []
             stored = False
+            sync = payment_sync_fake(lambda: stored, plans)
 
             def command(action, *args, **_kwargs):
                 calls.append((action, args))
                 if action == "features": return "relay-backed-signing=1"
-                if action == "send-proposal": return f"request message={message} digest={'f' * 64} needs_route=0"
                 if action == "local-wires": return json.dumps({"wires": [wire]})
-                if action == "status":
-                    return f"message sender=1 id={message} stored_whole={int(stored)}"
+                if action == "payment-sync": return sync(args)
                 return "ok"
 
             with patch.object(wallet, "command", side_effect=command):
-                self.assertEqual(wallet.sync_payments(vault)["payments"][0]["phase"], "queued_for_delivery")
+                wallet._sync_payments(vault)
+                self.assertEqual(wallet.payments(vault)["payments"][0]["phase"], "queued_for_delivery")
                 stored = True
-                self.assertEqual(wallet.sync_payments(vault)["payments"][0]["phase"], "published")
-            self.assertEqual([action for action, _ in calls].count("send-signing"), 2)
-            self.assertEqual([action for action, _ in calls].count("export-signing"), 2)
-            self.assertTrue(any(args[-2:] == ("--attempt", attempt) for action, args in calls
-                                if action == "send-signing"))
+                wallet._sync_payments(vault)
+                self.assertEqual(wallet.payments(vault)["payments"][0]["phase"], "published")
+            # One relay process per sync carries the proposal, the own wire and the export.
+            self.assertEqual([action for action, _ in calls].count("payment-sync"), 2)
+            self.assertEqual([action for action, _ in calls if action not in ("features", "local-wires", "payment-sync")], [])
+            self.assertEqual([plan["proposals"] for plan in plans], [[str(work / "payment.json")]] * 2)
+            self.assertEqual([plan["signing"] for plan in plans],
+                             [[{"attempt": attempt, "wire": str(work / "mailbox" / wire)}]] * 2)
+            self.assertEqual([plan["export"] for plan in plans], [[{"attempt": attempt, "work": str(work)}]] * 2)
 
     def test_saved_approval_waits_for_relay_storage(self):
         with tempfile.TemporaryDirectory(prefix="loki-approval-sync-") as temp:
@@ -218,22 +240,22 @@ class MemberWalletTest(unittest.TestCase):
                 "version": 1, "vault": vault, "attempt": attempt, "payment": "e" * 64, "pair": [1, 2]}))
             wallet.payment_status(work, "approval_pending_delivery")
             stored = False
+            sync = payment_sync_fake(lambda: stored)
 
             def command(action, *args, **_kwargs):
                 if action == "features": return "relay-backed-signing=1"
                 if action == "local-wires": return json.dumps({"wires": [wire]})
-                if action == "send-signing": return f"request message={message} digest={'f' * 64} needs_route=0"
-                if action == "status":
-                    return f"message sender=1 id={message} stored_whole={int(stored)}"
+                if action == "payment-sync": return sync(args)
                 if action == "finish-check":
                     raise ValueError("waiting for member 2 Share; sync relay inbox and retry")
                 return "ok"
 
             with patch.object(wallet, "command", side_effect=command) as mocked:
-                self.assertEqual(wallet.sync_payments(vault)["payments"][0]["phase"],
-                                 "approval_pending_delivery")
+                wallet._sync_payments(vault)
+                self.assertEqual(wallet.payments(vault)["payments"][0]["phase"], "approval_pending_delivery")
                 stored = True
-                self.assertEqual(wallet.sync_payments(vault)["payments"][0]["phase"], "approved")
+                wallet._sync_payments(vault)
+                self.assertEqual(wallet.payments(vault)["payments"][0]["phase"], "approved")
             self.assertEqual([call.args[0] for call in mocked.call_args_list].count("resend"), 2)
 
     def test_interrupted_approval_does_not_block_other_payment_sync(self):
@@ -256,16 +278,18 @@ class MemberWalletTest(unittest.TestCase):
                     "version": 1, "vault": vault, "attempt": attempt, "payment": "e" * 64, "pair": [1, 2]}))
                 wallet.payment_status(work, phase)
 
+            sync = payment_sync_fake(lambda: True)
+
             def command(action, *args, **_kwargs):
                 if action == "features": return "relay-backed-signing=1"
                 if action == "resend": raise ValueError("attempt was interrupted")
                 if action == "local-wires": return json.dumps({"wires": []})
-                if action == "send-proposal": return f"request message={'d' * 64} digest={'f' * 64} needs_route=0"
-                if action == "status": return f"message sender=1 id={'d' * 64} stored_whole=1"
+                if action == "payment-sync": return sync(args)
                 return "ok"
 
             with patch.object(wallet, "command", side_effect=command):
-                phases = {item["attempt"]: item["phase"] for item in wallet.sync_payments(vault)["payments"]}
+                wallet._sync_payments(vault)
+                phases = {item["attempt"]: item["phase"] for item in wallet.payments(vault)["payments"]}
             self.assertEqual(phases, {bad: "approval_interrupted", good: "published"})
 
     def test_payment_draft_uses_only_active_members_own_vault(self):
@@ -362,11 +386,12 @@ class MemberWalletTest(unittest.TestCase):
                       "expiry_height": 9216, "review_token": "d" * 64,
                       "authorization_required": True}
             calls = []
+            tip = 100
 
             def command(action, *args, **_kwargs):
                 calls.append(action)
                 if action == "features": return "relay-backed-signing=1"
-                if action == "balance": return json.dumps({"vault": vault, "height": 100})
+                if action == "tip": return json.dumps({"height": tip})
                 if action == "send-proposal": return f"proposal={payment} attempt={attempt}"
                 if action == "review": return json.dumps(review)
                 if action == "finish": return "broadcast txid=" + "e" * 64 + " payment=" + payment
@@ -375,9 +400,10 @@ class MemberWalletTest(unittest.TestCase):
 
             with patch.object(alice, "command", side_effect=command):
                 self.assertEqual(alice.publish_payment(vault, attempt), {"phase": "queued_for_delivery"})
-                with patch.object(alice, "balance", return_value={"height": 9216}):
-                    with self.assertRaisesRegex(ValueError, "expired"):
-                        alice.commit_payment(vault, attempt)
+                tip = 9216
+                with self.assertRaisesRegex(ValueError, "expired"):
+                    alice.commit_payment(vault, attempt)
+                tip = 100
                 self.assertEqual(alice.commit_payment(vault, attempt), {"phase": "commitments"})
                 self.assertEqual(alice.package_payment(vault, attempt), {"phase": "package"})
                 self.assertEqual(alice.review_payment(vault, attempt), review)
@@ -394,10 +420,10 @@ class MemberWalletTest(unittest.TestCase):
             with patch.object(alice, "command", side_effect=command):
                 self.assertEqual(alice.payments(vault)["payments"][0]["phase"], "confirmed")
             with patch.object(alice, "payment_command", side_effect=ValueError("transaction is not mined")):
-                self.assertEqual(alice.payments(vault)["payments"][0]["phase"],
+                self.assertEqual(alice.advance_payment(vault, attempt)["phase"],
                                  "confirmation_needs_recheck")
                 self.assertEqual(alice.payment_phase(work)["phase"], "confirmation_needs_recheck")
-                self.assertEqual(alice.advance_payment(vault, attempt)["phase"],
+                self.assertEqual(alice.payments(vault)["payments"][0]["phase"],
                                  "confirmation_needs_recheck")
             with patch.object(alice, "command", side_effect=command):
                 self.assertEqual(alice.advance_payment(vault, attempt)["phase"], "confirmed")
@@ -599,7 +625,7 @@ class MemberWalletTest(unittest.TestCase):
             def command(action, *_args, **_kwargs):
                 calls.append(action)
                 if action == "features": return "relay-backed-signing=1"
-                if action == "balance": return json.dumps({"vault": vault, "height": 100})
+                if action == "tip": return json.dumps({"height": 100})
                 return "ok"
 
             with patch.object(wallet, "command", side_effect=command):
@@ -612,7 +638,9 @@ class MemberWalletTest(unittest.TestCase):
             self.assertEqual(report["readiness"], {
                 "relay_ready": True,
                 "relay_detail": "Payment build supports relay delivery. Check the relay connection above.",
-                "scan_height": 100})
+                "scan_height": None})
+            # The expiry check reads the tip only; it does not scan the chain.
+            self.assertNotIn("balance", calls)
             self.assertEqual(calls.count("commit"), 1)
             self.assertEqual(calls.count("package"), 1)
             for decision in ("review", "approve", "approve-reviewed"):
@@ -659,7 +687,14 @@ class MemberWalletTest(unittest.TestCase):
 
     def test_non_signer_sees_ready_only_after_verified_aggregate(self):
         with tempfile.TemporaryDirectory(prefix="loki-payment-ready-") as temp:
-            wallet, vault, _ = self.payment_fixture(temp, slot=3, phase="received")
+            wallet, vault, attempt = self.payment_fixture(temp, slot=3, phase="received")
+            worker = wallet.payment_worker
+
+            def ready(command):
+                worker.ready.clear()
+                with patch.object(wallet, "command", side_effect=command):
+                    wallet.refresh_payment_checks(vault, worker)
+                return wallet.payments(vault)["payments"][0]["ready_to_send"]
 
             def complete(action, *_args, **_kwargs):
                 if action == "features":
@@ -668,27 +703,31 @@ class MemberWalletTest(unittest.TestCase):
                     return "aggregate verified payment=" + "e" * 64 + " sighash=" + "f" * 64
                 raise AssertionError(action)
 
-            with patch.object(wallet, "command", side_effect=complete):
-                self.assertTrue(wallet.payments(vault)["payments"][0]["ready_to_send"])
+            self.assertTrue(ready(complete))
 
             def pending(action, *_args, **_kwargs):
                 if action == "finish-check":
                     raise ValueError("waiting for member 2 Share; sync relay inbox and retry")
                 raise AssertionError(action)
 
-            with patch.object(wallet, "command", side_effect=pending):
-                self.assertFalse(wallet.payments(vault)["payments"][0]["ready_to_send"])
+            self.assertFalse(ready(pending))
 
             def before_package(action, *_args, **_kwargs):
                 if action == "finish-check":
                     raise ValueError("error: No such file or directory (os error 2)")
                 raise AssertionError(action)
 
-            with patch.object(wallet, "command", side_effect=before_package):
-                self.assertFalse(wallet.payments(vault)["payments"][0]["ready_to_send"])
-            wallet.payment_status(wallet.payment(vault, "b" * 64)[2], "package")
-            with patch.object(wallet, "command", side_effect=before_package):
-                self.assertFalse(wallet.payments(vault)["payments"][0]["ready_to_send"])
+            self.assertFalse(ready(before_package))
+            wallet.payment_status(wallet.payment(vault, attempt)[2], "package")
+            self.assertFalse(ready(before_package))
+
+            def other(action, *_args, **_kwargs):
+                if action == "finish-check":
+                    return "aggregate verified payment=" + "9" * 64 + " sighash=" + "f" * 64
+                raise AssertionError(action)
+
+            with self.assertRaisesRegex(ValueError, "differs from this payment"):
+                ready(other)
 
     def test_non_finisher_finds_mined_spend_then_checks_exact_candidate(self):
         with tempfile.TemporaryDirectory(prefix="loki-chain-discovery-") as temp:
@@ -741,32 +780,83 @@ class MemberWalletTest(unittest.TestCase):
             work = wallet.data / "vaults" / vault / "payments" / attempt
             self.assertEqual(wallet.payment_phase(work)["phase"],
                              "confirmation_needs_recheck")
+            # Verify records where the payment was mined; later rechecks ask only whether
+            # that block is still on the chain, and a reorg falls back to the full verify.
+            block, calls, reorged = "b" * 64, [], []
 
-    def test_payment_get_holds_wallet_lock_while_rolling_back_confirmation(self):
-        with tempfile.TemporaryDirectory(prefix="loki-payment-get-reorg-") as temp:
+            def command(action, *args, **_kwargs):
+                calls.append(action)
+                if action == "features": return "relay-backed-signing=1"
+                if action == "verify":
+                    if reorged: raise ValueError(missing)
+                    return f"verified mined txid={'e' * 64} confirmations=3 amount=40000000 block={block} height=105"
+                if action == "chain-check":
+                    self.assertEqual(args, (wallet.network, 105, block))
+                    if reorged: raise ValueError("mined block is no longer on the chain")
+                    return "chain-check=ok height=105"
+                raise AssertionError(action)
+
+            with patch.object(wallet, "command", side_effect=command):
+                self.assertEqual(wallet.advance_payment(vault, attempt)["phase"], "confirmed")
+                self.assertEqual(wallet.payment_phase(work)["mined_height"], 105)
+                calls.clear()
+                self.assertEqual(wallet.advance_payment(vault, attempt)["phase"], "confirmed")
+                self.assertEqual([call for call in calls if call != "features"], ["chain-check"])
+                reorged.append(True)
+                self.assertEqual(wallet.advance_payment(vault, attempt)["phase"],
+                                 "confirmation_needs_recheck")
+                self.assertIn("verify", calls)
+
+    def test_payment_list_starts_no_process(self):
+        with tempfile.TemporaryDirectory(prefix="loki-payment-get-") as temp:
             wallet, vault, attempt = self.payment_fixture(temp, phase="confirmed", txid="e" * 64)
+            wallet.relay_payment_ready = True
             server, token = make_signer_server(wallet, 0)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             self.addCleanup(server.server_close)
             self.addCleanup(server.shutdown)
-            payments = wallet.payments
-
-            def checked(vault):
-                self.assertTrue(wallet.lock.locked())
-                return payments(vault)
-
-            with patch.object(wallet, "payments", side_effect=checked), \
-                 patch.object(wallet, "payment_command", side_effect=ValueError("transaction is not mined")):
+            with patch("subprocess.Popen", side_effect=AssertionError("listing started a process")), \
+                 patch("subprocess.run", side_effect=AssertionError("listing started a process")):
                 conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
                 conn.request("GET", f"/api/payments?vault={vault}", headers={"X-Loki-Token": token})
                 response = conn.getresponse()
                 result = json.loads(response.read())
                 conn.close()
             self.assertEqual(response.status, 200, result)
-            self.assertEqual(result["payments"][0]["phase"], "confirmation_needs_recheck")
-            work = wallet.data / "vaults" / vault / "payments" / attempt
-            self.assertEqual(wallet.payment_phase(work)["phase"], "confirmation_needs_recheck")
+            self.assertEqual(result["payments"][0]["phase"], "confirmed")
+            self.assertEqual(result["payments"][0]["ready_to_send"], False)
+
+    def test_relay_routes_wait_for_a_worker_step_on_the_vault(self):
+        # The transport store admits one native process; a user relay command must not
+        # race a background payment-sync for it.
+        with tempfile.TemporaryDirectory(prefix="loki-relay-route-lock-") as temp:
+            wallet, vault, _ = self.payment_fixture(temp, phase=None)
+            server, token = make_signer_server(wallet, 0)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+            held, released, ran = threading.Event(), [], []
+
+            def worker_step():
+                with wallet.payment_worker._lock(vault):
+                    held.set()
+                    threading.Event().wait(0.5)
+                    released.append(time.monotonic())
+            step = threading.Thread(target=worker_step)
+            step.start()
+            held.wait(5)
+            with patch.object(wallet, "relay_connection_status",
+                              side_effect=lambda _vault: ran.append(time.monotonic()) or {"configured": True}):
+                conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
+                conn.request("POST", "/api/relay-status", json.dumps({"vault": vault}),
+                             {"X-Loki-Token": token, "Content-Type": "application/json"})
+                response = conn.getresponse()
+                result = json.loads(response.read())
+                conn.close()
+            step.join(5)
+            self.assertEqual(response.status, 200, result)
+            self.assertGreaterEqual(ran[0], released[0])
 
     def test_payment_pair_defaults_to_one_holding_this_member(self):
         with tempfile.TemporaryDirectory(prefix="loki-default-pair-") as temp:
@@ -1156,6 +1246,45 @@ class MemberWalletTest(unittest.TestCase):
             (folder / "confirm-2.json").write_text("not json")
             self.assertEqual(wallet.confirmations(vault, mine)[1],
                              {"slot": 2, "confirmed": False, "matches": False, "at": None})
+
+    def test_binary_profile_prefers_complete_release_and_honors_override(self):
+        import member_app
+        with tempfile.TemporaryDirectory(prefix="loki-profile-") as temp, \
+                patch.dict(os.environ, {"CARGO_TARGET_DIR": temp}, clear=False):
+            os.environ.pop("LOKI_POC_BIN_PROFILE", None)
+            release = Path(temp).resolve() / "release"
+            release.mkdir()
+            self.assertEqual(member_app.binary_profile(), "debug")
+            for name in member_app.BINARIES[:-1]:
+                (release / name).touch()
+            self.assertEqual(member_app.binary_profile(), "debug", "a partial release build is not used")
+            (release / member_app.BINARIES[-1]).touch()
+            self.assertEqual(member_app.binary_profile(), "release")
+            self.assertEqual(member_app.binary("loki_relay_member", "release"), release / "loki_relay_member")
+            with patch.dict(os.environ, {"LOKI_POC_BIN_PROFILE": "debug"}):
+                self.assertEqual(member_app.binary_profile(), "debug")
+            self.assertEqual(member_app.binary_profile("debug"), "debug")
+            with self.assertRaisesRegex(ValueError, "release or debug"):
+                member_app.binary_profile("fast")
+            wallet = Wallet(Path(temp) / "member", Path(temp) / "exchange", setup=Path(temp) / "debug" / "loki_setup_member")
+            self.addCleanup(wallet.close)
+            with self.assertRaisesRegex(ValueError, "Build loki_setup_member: .*--release"):
+                wallet.command("profile-open")
+
+    def test_lock_stops_both_background_workers_together(self):
+        with tempfile.TemporaryDirectory() as temp:
+            wallet = Wallet(Path(temp) / "member", Path(temp) / "exchange")
+            self.addCleanup(wallet.close)
+            wallet.profile_data = {"id": "alice"}
+            wallet.passphrase = "test passphrase"
+            both_stopping = threading.Barrier(2)
+
+            def stop():
+                both_stopping.wait(timeout=1)
+
+            with patch.object(wallet, "hosted", type("Hosted", (), {"stop": staticmethod(stop)})()), \
+                 patch.object(wallet.payment_worker, "stop", side_effect=stop):
+                self.assertEqual(wallet.lock_profile(), {"locked": True})
 
     def test_rejects_exchange_inside_private_root(self):
         with tempfile.TemporaryDirectory() as temp:

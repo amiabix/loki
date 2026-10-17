@@ -596,7 +596,6 @@ use super::{
     bounded_read, member_root, private_directory, MAX_PASS, MAX_SEALED, SEAL_HEADER, SEAL_MAGIC,
 };
 use crate::state::MemberDir;
-use argon2::Argon2;
 use chacha20poly1305::{
     aead::{Aead, Payload},
     KeyInit, XChaCha20Poly1305, XNonce,
@@ -642,10 +641,7 @@ fn unseal(raw: &[u8], pass: &str) -> MemberResult<Zeroizing<Vec<u8>>> {
     if raw.len() < SEAL_HEADER + 16 || raw.len() > MAX_SEALED || &raw[..9] != SEAL_MAGIC {
         return Err(MemberError::Sealed);
     }
-    let mut key = Zeroizing::new([0u8; 32]);
-    Argon2::default()
-        .hash_password_into(pass.as_bytes(), &raw[9..25], key.as_mut())
-        .map_err(error)?;
+    let key = crate::seal_kdf::derive(pass, &raw[9..25]).map_err(|_| MemberError::Sealed)?;
     XChaCha20Poly1305::new_from_slice(key.as_ref())
         .map_err(error)?
         .decrypt(

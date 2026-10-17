@@ -17,13 +17,14 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use zeroize::Zeroizing;
 #[derive(Clone)]
 struct Service {
     store: Arc<Mutex<AdmissionStore>>,
     gate: Arc<Semaphore>,
     deadline: Duration,
+    provision: Arc<Notify>,
 }
 fn public_error(status: StatusCode, code: &str) -> Response {
     Response::builder()
@@ -45,6 +46,14 @@ async fn guard(State(service): State<Service>, mut request: Request, next: Next)
     }
 }
 pub fn router(store: Arc<Mutex<AdmissionStore>>) -> Router {
+    router_with_provisioning(store, Arc::new(Notify::new()))
+}
+/// As `router`, waking `provision` after every accepted mailbox command so the
+/// provisioner need not wait for its next tick.
+pub fn router_with_provisioning(
+    store: Arc<Mutex<AdmissionStore>>,
+    provision: Arc<Notify>,
+) -> Router {
     let deadline = Duration::from_secs(
         store
             .lock()
@@ -55,6 +64,7 @@ pub fn router(store: Arc<Mutex<AdmissionStore>>) -> Router {
         store,
         deadline,
         gate: Arc::new(Semaphore::new(16)),
+        provision,
     };
     Router::new()
         .route("/v1/setup", post(handle))
@@ -95,6 +105,7 @@ async fn handle(
         Ok(request) => request,
         Err(error) => return public_error(StatusCode::BAD_REQUEST, error.code()),
     };
+    let mailbox = matches!(request.command, admission::AdmissionCommand::Mailbox { .. });
     let (expected_method, path) = admission::request_target(&request.command);
     if method.as_str() != expected_method || uri.path() != path {
         return public_error(StatusCode::BAD_REQUEST, "malformed");
@@ -130,6 +141,7 @@ async fn handle(
         Ok(now) => now.as_secs(),
         Err(_) => return public_error(StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
     };
+    let provision = service.provision.clone();
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let mut store = service
@@ -139,6 +151,9 @@ async fn handle(
         store.execute(&body, credential.as_ref().map(|c| c.as_slice()), now)
     })
     .await;
+    if mailbox && matches!(result, Ok(Ok(_))) {
+        provision.notify_one();
+    }
     match result {
         Ok(Ok(reply)) => Response::builder()
             .status(StatusCode::OK)

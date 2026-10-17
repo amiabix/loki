@@ -13,7 +13,7 @@ use crate::{
 use loki_relay_client::{
     sign_admission_request, AdmissionHttp, AdmissionOutcome, CommIdentity, DescriptorRelay,
     OperatorSet, OwnerInbox, RelayRuntime, Secret32, SetupAuthority, SetupInboxDescriptor,
-    SetupInvite, SetupPolicy, SetupRoutes, SetupStore, SetupTransport,
+    SetupInvite, SetupNet, SetupPolicy, SetupRoutes, SetupStore, SetupTransport,
 };
 use loki_relay_protocol::{
     admission::{self, AdmissionCommand, AdmissionRequest},
@@ -690,6 +690,45 @@ impl CachedStatus {
     }
 }
 
+/// One runtime per process, so pooled relay and admission connections outlive a
+/// single operation (a long-lived member service reuses them across steps).
+fn shared_runtime() -> Result<&'static RelayRuntime, String> {
+    static RUNTIME: std::sync::OnceLock<RelayRuntime> = std::sync::OnceLock::new();
+    if let Some(runtime) = RUNTIME.get() {
+        return Ok(runtime);
+    }
+    let runtime = RelayRuntime::new().map_err(|_| ERROR)?;
+    let _ = RUNTIME.set(runtime);
+    RUNTIME.get().ok_or_else(|| ERROR.into())
+}
+/// How long a long-lived process reuses an admission state during DKG and backups.
+const RELAXED_STATE: std::time::Duration = std::time::Duration::from_secs(10);
+/// The last admission state fetched per setup root in this process.
+static RECENT_STATE: std::sync::Mutex<
+    BTreeMap<PathBuf, (std::time::Instant, loki_relay_client::VerifiedAdmissionReply)>,
+> = std::sync::Mutex::new(BTreeMap::new());
+type SharedClients = (std::sync::Arc<AdmissionHttp>, std::sync::Arc<SetupNet>);
+/// HTTP clients per verified operator bundle and development flag, shared by every
+/// setup opened in this process.
+fn shared_clients(operators: &OperatorSet, development: bool) -> Result<SharedClients, String> {
+    static CLIENTS: std::sync::Mutex<BTreeMap<([u8; 32], bool), SharedClients>> =
+        std::sync::Mutex::new(BTreeMap::new());
+    let key = (*operators.digest(), development);
+    let mut clients = CLIENTS.lock().map_err(|_| ERROR)?;
+    if let Some((http, net)) = clients.get(&key) {
+        return Ok((http.clone(), net.clone()));
+    }
+    let http = if development {
+        AdmissionHttp::development(operators)
+    } else {
+        AdmissionHttp::new(operators)
+    }
+    .map_err(|_| ERROR)?;
+    let net = SetupNet::new(operators, development).map_err(|_| ERROR)?;
+    let shared = (std::sync::Arc::new(http), std::sync::Arc::new(net));
+    clients.insert(key, shared.clone());
+    Ok(shared)
+}
 pub struct HostedSetup {
     root: PathBuf,
     context: Context,
@@ -698,8 +737,12 @@ pub struct HostedSetup {
     identity: CommIdentity,
     journal: Journal,
     approval: Journal,
-    runtime: RelayRuntime,
-    http: AdmissionHttp,
+    runtime: &'static RelayRuntime,
+    http: std::sync::Arc<AdmissionHttp>,
+    net: std::sync::Arc<SetupNet>,
+    /// The admission state read once per operation; claims and mailbox rows only
+    /// change between operations, and every caller re-validates the reply.
+    admission_state: std::sync::Mutex<Option<loki_relay_client::VerifiedAdmissionReply>>,
     retry: std::sync::Arc<crate::setup_retry::AdmissionRetry>,
     _member_lock: MemberLock,
     passphrase: Zeroizing<String>,
@@ -971,12 +1014,7 @@ impl HostedSetup {
             *approval_binding.finalize().as_bytes(),
             context.own_slot,
         )?;
-        let http = if context.development {
-            AdmissionHttp::development(&operators)
-        } else {
-            AdmissionHttp::new(&operators)
-        }
-        .map_err(|_| ERROR)?;
+        let (http, net) = shared_clients(&operators, context.development)?;
         let retry = std::sync::Arc::new(crate::setup_retry::AdmissionRetry::new(
             root,
             passphrase,
@@ -993,8 +1031,10 @@ impl HostedSetup {
             identity,
             journal,
             approval,
-            runtime: RelayRuntime::new().map_err(|_| ERROR)?,
+            runtime: shared_runtime()?,
             http,
+            net,
+            admission_state: std::sync::Mutex::new(None),
             retry,
             _member_lock: lock,
             passphrase: Zeroizing::new(passphrase.to_owned()),
@@ -1203,6 +1243,7 @@ impl HostedSetup {
         credential: Option<&[u8]>,
         authenticated: bool,
     ) -> loki_relay_client::ClientResult<loki_relay_client::VerifiedAdmissionReply> {
+        self.admission_changed();
         self.runtime.block_on(self.retry.execute(package, async {
             if authenticated {
                 self.http
@@ -1213,7 +1254,35 @@ impl HostedSetup {
             }
         }))
     }
+    /// Send several pre-signed, idempotent admission requests at once.
+    fn execute_admissions(
+        &self,
+        packages: &[&[u8]],
+    ) -> Vec<loki_relay_client::ClientResult<loki_relay_client::VerifiedAdmissionReply>> {
+        self.admission_changed();
+        self.runtime.block_on(loki_relay_client::join_all(
+            packages
+                .iter()
+                .map(|package| {
+                    self.retry
+                        .execute(package, async { self.http.execute(package, None).await })
+                })
+                .collect(),
+        ))
+    }
     fn state(&self) -> Result<Option<loki_relay_client::VerifiedAdmissionReply>, String> {
+        if let Some(reply) = self.admission_state.lock().map_err(|_| ERROR)?.as_ref() {
+            return Ok(Some(reply.clone()));
+        }
+        if self.relaxed_admission() {
+            let recent = RECENT_STATE.lock().map_err(|_| ERROR)?;
+            if let Some((at, reply)) = recent.get(&self.root) {
+                if at.elapsed() < RELAXED_STATE {
+                    *self.admission_state.lock().map_err(|_| ERROR)? = Some(reply.clone());
+                    return Ok(Some(reply.clone()));
+                }
+            }
+        }
         let request = sign_admission_request(
             &self.identity,
             &AdmissionRequest {
@@ -1227,9 +1296,42 @@ impl HostedSetup {
         )
         .map_err(|_| ERROR)?;
         match self.execute_admission(&request, None, false) {
-            Ok(reply) => Ok(Some(reply)),
+            Ok(reply) => {
+                *self.admission_state.lock().map_err(|_| ERROR)? = Some(reply.clone());
+                RECENT_STATE
+                    .lock()
+                    .map_err(|_| ERROR)?
+                    .insert(self.root.clone(), (std::time::Instant::now(), reply.clone()));
+                Ok(Some(reply))
+            }
             Err(loki_relay_client::ClientError::Transport) => Ok(None),
             Err(_) => Err("setup_admission".into()),
+        }
+    }
+    /// Whether this member's last step was in DKG or the provisional backups. The roster
+    /// is accepted then, so claims are immutable and the setup mailboxes provisioned;
+    /// the admission state only reports a terminal ceremony, which peers also announce
+    /// through the transport. A long-lived process asks at most every [`RELAXED_STATE`]
+    /// then; a CLI process asks once per step, as before.
+    fn relaxed_admission(&self) -> bool {
+        Self::cached_status(&self.root).is_ok_and(|status| {
+            matches!(
+                status["phase"].as_str(),
+                Some("round1_saved" | "round2_saved" | "certificate_saved" | "awaiting_backups")
+            )
+        })
+    }
+    /// Forget the memo of the current operation only.
+    fn begin_operation(&self) {
+        if let Ok(mut state) = self.admission_state.lock() {
+            *state = None;
+        }
+    }
+    /// Forget every remembered admission state after this process changed it.
+    fn admission_changed(&self) {
+        self.begin_operation();
+        if let Ok(mut recent) = RECENT_STATE.lock() {
+            recent.remove(&self.root);
         }
     }
     fn provision_step(&mut self) -> Result<SetupStatus, String> {
@@ -1334,20 +1436,40 @@ impl HostedSetup {
             return Ok(self.provisioning_status(false));
         }
         let mut inventory = Inventory::decode(raw, &self.context, &self.operators, &self.identity)?;
-        if let Some(index) = (0..3).find(|index| inventory.registered & (1 << index) == 0) {
-            let reply = match self.execute_admission(&inventory.requests[index], None, false) {
-                Ok(reply) => reply,
-                Err(loki_relay_client::ClientError::Transport) => {
-                    return Ok(self.provisioning_status(false))
+        let unregistered: Vec<usize> = (0..3)
+            .filter(|index| inventory.registered & (1 << index) == 0)
+            .collect();
+        if !unregistered.is_empty() {
+            let previous = inventory.registered;
+            // The requests are signed and saved in the inventory, and AdmissionRetry
+            // makes a re-send idempotent, so all of them go out at once and one journal
+            // generation records every success.
+            let packages: Vec<&[u8]> = unregistered
+                .iter()
+                .map(|index| inventory.requests[*index].as_slice())
+                .collect();
+            let replies = self.execute_admissions(&packages);
+            let mut failure = None;
+            for (index, reply) in unregistered.iter().zip(replies) {
+                match reply {
+                    Ok(reply) => {
+                        if !matches!(reply.outcome(),AdmissionOutcome::Accepted(Value::Bytes(mailbox)) if mailbox.as_slice()==inventory.inboxes[*index].route.mailbox)
+                        {
+                            failure = Some("setup_admission");
+                            continue;
+                        }
+                        inventory.registered |= 1 << index;
+                    }
+                    Err(loki_relay_client::ClientError::Transport) => {}
+                    Err(_) => failure = Some("setup_admission"),
                 }
-                Err(_) => return Err("setup_admission".into()),
-            };
-            if !matches!(reply.outcome(),AdmissionOutcome::Accepted(Value::Bytes(mailbox)) if mailbox.as_slice()==inventory.inboxes[index].route.mailbox)
-            {
-                return Err("setup_admission".into());
             }
-            inventory.registered |= 1 << index;
-            self.journal.append(&inventory.encode()?)?;
+            if inventory.registered != previous {
+                self.journal.append(&inventory.encode()?)?;
+            }
+            if let Some(error) = failure {
+                return Err(error.into());
+            }
             return Ok(self.provisioning_status(false));
         }
         let Value::Array(mailboxes) = &state[5] else {
@@ -1801,6 +1923,7 @@ impl HostedSetup {
         Ok(Some((roster, fingerprint, package.clone())))
     }
     pub fn agree(&mut self, expected: [u8; 32]) -> Result<SetupStatus, String> {
+        self.admission_changed();
         let status = self.agree_inner(expected)?;
         self.cache_status(&status)?;
         Ok(status)
@@ -1934,10 +2057,12 @@ impl HostedSetup {
                 revision: 1,
             }
         };
+        let key = self.acceptance_key()?;
+        // Commit this member's acceptance once its Join or proposal is stored and acked.
+        let commit_acceptance = |store: &mut SetupStore| -> Result<(), String> {
         let ready = store
             .progress_for(&transport, &routes, &previous)
             .map_err(|_| "setup_transport")?;
-        let key = self.acceptance_key()?;
         if ready.stored_groups == 1 && ready.received_groups == 1 {
             if let Some(record) = store
                 .receive(&transport, &key)
@@ -1986,6 +2111,9 @@ impl HostedSetup {
                     .map_err(|_| "setup_transport")?;
             }
         }
+        Ok(())
+        };
+        commit_acceptance(&mut store)?;
         if let Some(accepted) = self.accepted_from_store(&store, &transport, &roster)? {
             return self.ceremony_step(
                 &accepted,
@@ -1998,8 +2126,10 @@ impl HostedSetup {
             );
         }
         self.runtime
-            .block_on(transport.drive_once(&mut store, &routes))
+            .block_on(transport.drive_once_with(&mut store, &routes, &self.net))
             .map_err(|_| "setup_transport")?;
+        // The drive may have completed the gate; commit now rather than next step.
+        commit_acceptance(&mut store)?;
         if let Some(accepted) = self.accepted_from_store(&store, &transport, &roster)? {
             return self.ceremony_step(
                 &accepted,
@@ -2010,6 +2140,11 @@ impl HostedSetup {
                 fingerprint,
                 false,
             );
+        }
+        if store.has_due_uploads(&transport).map_err(|_| "setup_transport")? {
+            self.runtime
+                .block_on(transport.drive_once_with(&mut store, &routes, &self.net))
+                .map_err(|_| "setup_transport")?;
         }
         let progress = store
             .progress_for(&transport, &routes, &key)
@@ -2119,6 +2254,14 @@ impl HostedSetup {
             self.context.development,
         )
         .map_err(|_| "setup_transport")?;
+        // drive → process → drive: fetch what peers sent since the last step first, so
+        // it is processed now, and upload whatever processing produced before returning.
+        // `may_drive` is false when the caller has just driven.
+        if may_drive {
+            self.runtime
+                .block_on(transport.drive_once_with(store, routes, &self.net))
+                .map_err(|_| "setup_transport")?;
+        }
         let progress = store
             .progress_for(&transport, routes, &self.acceptance_key()?)
             .map_err(|_| "setup_transport")?;
@@ -2136,9 +2279,9 @@ impl HostedSetup {
             if self.root.join("setup-ceremony").exists() {
                 return Err("setup_transport".into());
             }
-            if may_drive {
+            if store.has_due_uploads(&transport).map_err(|_| "setup_transport")? {
                 self.runtime
-                    .block_on(transport.drive_once(store, routes))
+                    .block_on(transport.drive_once_with(store, routes, &self.net))
                     .map_err(|_| "setup_transport")?;
             }
             return Ok(status("acceptance_pending"));
@@ -2175,7 +2318,7 @@ impl HostedSetup {
                 &transport,
                 routes,
                 accepted,
-                may_drive,
+                true,
             )?;
             let mut result = status(if handoff.ready {
                 "active"
@@ -2332,9 +2475,9 @@ impl HostedSetup {
                 .commit_outgoing(&transport, &prepared)
                 .map_err(|_| "setup_transport")?;
         }
-        if may_drive {
+        if store.has_due_uploads(&transport).map_err(|_| "setup_transport")? {
             self.runtime
-                .block_on(transport.drive_once(store, routes))
+                .block_on(transport.drive_once_with(store, routes, &self.net))
                 .map_err(|_| "setup_transport")?;
         }
         let phase = match engine.phase() {
@@ -2756,17 +2899,30 @@ impl HostedSetup {
         .map_err(|_| "setup_transport")?;
         let mut store = SetupStore::open(&self.root.join("setup-relay-store"), &transport)
             .map_err(|_| "setup_transport")?;
-        let routes = SetupRoutes {
+        let mut routes = SetupRoutes {
             own: inventory.inboxes,
             peers: self.received_join_descriptors(&store, &transport, claimed)?,
         };
-        let proposal_prepared = routes.peers.len() + 1 == self.context.count as usize;
+        let mut proposal_prepared = routes.peers.len() + 1 == self.context.count as usize;
         if proposal_prepared {
             self.prepare_roster_proposal(&mut store, &transport, &routes, claimed)?;
         }
         self.runtime
-            .block_on(transport.drive_once(&mut store, &routes))
+            .block_on(transport.drive_once_with(&mut store, &routes, &self.net))
             .map_err(|_| "setup_transport")?;
+        if !proposal_prepared {
+            // The last Join may have arrived in this drive: propose now, not next step.
+            routes.peers = self.received_join_descriptors(&store, &transport, claimed)?;
+            if routes.peers.len() + 1 == self.context.count as usize {
+                self.prepare_roster_proposal(&mut store, &transport, &routes, claimed)?;
+                proposal_prepared = true;
+            }
+        }
+        if store.has_due_uploads(&transport).map_err(|_| "setup_transport")? {
+            self.runtime
+                .block_on(transport.drive_once_with(&mut store, &routes, &self.net))
+                .map_err(|_| "setup_transport")?;
+        }
         let proposal_progress = if proposal_prepared {
             Some(
                 store
@@ -2924,11 +3080,35 @@ impl HostedSetup {
             peers: vec![creator_descriptor],
         };
         self.runtime
-            .block_on(transport.drive_once(&mut store, &routes))
+            .block_on(transport.drive_once_with(&mut store, &routes, &self.net))
             .map_err(|_| "setup_transport")?;
+        if store.has_due_uploads(&transport).map_err(|_| "setup_transport")? {
+            // Acknowledge what that drive fetched (the creator's proposal) right away.
+            self.runtime
+                .block_on(transport.drive_once_with(&mut store, &routes, &self.net))
+                .map_err(|_| "setup_transport")?;
+        }
         let progress = store
             .progress_for(&transport, &routes, &key)
             .map_err(|_| "setup_transport")?;
+        // The drive above may have fetched the creator's proposal. Report it only after the
+        // full admitted roster is known, so a fresh partial claim list never reads as a mismatch.
+        if claimed.len() == self.context.count as usize && progress.stored_groups == 1 {
+            if let Some(proposal) =
+                self.authenticated_proposal(&store, &transport, claimed, &routes.own)?
+            {
+                return Ok(SetupStatus {
+                    agreed: self.saved_approval()?.map(|(_, fp, _)| fp),
+                    waiting: None,
+                    own_slot: self.context.own_slot,
+                    phase: "roster_proposed",
+                    threshold: self.threshold,
+                    count: self.context.count,
+                    joined: proposal.roster.members.iter().map(|peer| peer.id).collect(),
+                    retryable: false,
+                });
+            }
+        }
         Ok(SetupStatus {
             agreed: self.saved_approval()?.map(|(_, fp, _)| fp),
             waiting: None,
@@ -3290,6 +3470,7 @@ impl HostedSetup {
         Ok(self.terminal_status(kind, false))
     }
     pub fn abort(&mut self) -> Result<SetupStatus, String> {
+        self.admission_changed();
         let status = self.abort_inner()?;
         self.cache_status(&status)?;
         Ok(status)
@@ -3359,6 +3540,8 @@ impl HostedSetup {
         )
     }
     pub fn step(&mut self) -> Result<SetupStatus, String> {
+        // The admission state is memoized within one operation only.
+        self.begin_operation();
         let status = if matches!(self.journal.latest().ok_or(ERROR)?.payload[0], 0..=3)
             && self.transport_is_terminal()?
         {
@@ -3517,7 +3700,7 @@ fn private_file(path: &Path, limit: usize) -> Result<Zeroizing<Vec<u8>>, String>
     }
     Ok(bytes)
 }
-fn private_passphrase(path: &str) -> Result<Zeroizing<String>, String> {
+fn private_text(path: &str) -> Result<Zeroizing<String>, String> {
     let path = Path::new(path.strip_prefix('@').unwrap_or(path));
     let raw = private_file(path, 4098)?;
     let text = std::str::from_utf8(&raw)
@@ -3528,11 +3711,59 @@ fn private_passphrase(path: &str) -> Result<Zeroizing<String>, String> {
     }
     Ok(Zeroizing::new(text.to_owned()))
 }
+fn private_passphrase(path: &str) -> Result<Zeroizing<String>, String> {
+    let passphrase = private_text(path)?;
+    crate::seal_kdf::enable_session_cache(&passphrase);
+    Ok(passphrase)
+}
+/// Secret inputs a caller already holds in memory, used by the member service in
+/// place of the CLI's private files. An argument of `@session`, `@private` or
+/// `@words` selects the matching field; a caller with a session passphrase never
+/// has a passphrase read from a file.
+#[derive(Default)]
+pub struct Inputs {
+    pub passphrase: Option<Zeroizing<String>>,
+    pub private: Option<Zeroizing<Vec<u8>>>,
+    pub words: Option<Zeroizing<String>>,
+}
+impl Inputs {
+    fn passphrase(&self, arg: &str) -> Result<Zeroizing<String>, String> {
+        match (&self.passphrase, arg) {
+            (Some(passphrase), "@session") => Ok(passphrase.clone()),
+            (None, path) if path != "@session" => private_passphrase(path),
+            _ => Err("setup_arguments".into()),
+        }
+    }
+    fn file(&self, arg: &str, limit: usize) -> Result<Zeroizing<Vec<u8>>, String> {
+        match (&self.private, arg) {
+            (Some(private), "@private") if private.len() <= limit => Ok(private.clone()),
+            (_, "@private") => Err("setup_file".into()),
+            (_, path) => private_file(Path::new(path), limit),
+        }
+    }
+    fn words(&self, arg: &str) -> Result<Zeroizing<String>, String> {
+        match (&self.words, arg) {
+            (Some(words), "@words") if !words.is_empty() && words.len() <= 4096 => {
+                Ok(words.clone())
+            }
+            (_, "@words") => Err("setup_file".into()),
+            // Recovery words are never a session secret.
+            (_, path) => private_text(path),
+        }
+    }
+}
 pub enum BackupCommandOutput {
     Words(Zeroizing<String>),
     Public(ValueJson),
 }
 pub fn backup_command(command: &str, args: &[String]) -> Result<BackupCommandOutput, String> {
+    backup_command_with(command, args, &Inputs::default())
+}
+pub fn backup_command_with(
+    command: &str,
+    args: &[String],
+    inputs: &Inputs,
+) -> Result<BackupCommandOutput, String> {
     let count = match command {
         "setup-backup-create" => 3,
         "setup-backup-verify" => 4,
@@ -3553,7 +3784,7 @@ pub fn backup_command(command: &str, args: &[String]) -> Result<BackupCommandOut
         }
     };
     let root = absolute(&args[0])?;
-    let passphrase = private_passphrase(&args[1])?;
+    let passphrase = inputs.passphrase(&args[1])?;
     let setup = HostedSetup::open(&root, &passphrase)?;
     let card = absolute(&args[2])?;
     if command == "setup-backup-create" {
@@ -3576,7 +3807,7 @@ pub fn backup_command(command: &str, args: &[String]) -> Result<BackupCommandOut
                 .to_owned(),
         )
     } else {
-        private_passphrase(&args[count - 1])?
+        inputs.words(&args[count - 1])?
     };
     if command == "setup-backup-verify" {
         setup.backup_verify(&card, &words)?;
@@ -3593,6 +3824,13 @@ pub fn backup_command(command: &str, args: &[String]) -> Result<BackupCommandOut
     }
 }
 pub fn command(command: &str, args: &[String]) -> Result<serde_json::Value, String> {
+    command_with(command, args, &Inputs::default())
+}
+pub fn command_with(
+    command: &str,
+    args: &[String],
+    inputs: &Inputs,
+) -> Result<serde_json::Value, String> {
     let root = args.first().ok_or("setup_arguments")?;
     let root = Path::new(root);
     let root = if root.is_absolute() {
@@ -3625,7 +3863,7 @@ pub fn command(command: &str, args: &[String]) -> Result<serde_json::Value, Stri
             if args.len() != 2 {
                 return Err("setup_arguments".into());
             }
-            let passphrase = private_passphrase(&args[1])?;
+            let passphrase = inputs.passphrase(&args[1])?;
             let setup = HostedSetup::open(&root, &passphrase)?;
             setup.with_accepted_ceremony(|engine, authority, store, transport, routes, accepted| {
                 if engine.phase() != CeremonyPhase::Active { return Err("setup_payment_pending".into()); }
@@ -3639,7 +3877,7 @@ pub fn command(command: &str, args: &[String]) -> Result<serde_json::Value, Stri
             if args.len() != 2 {
                 return Err("setup_arguments".into());
             }
-            let passphrase = private_passphrase(&args[1])?;
+            let passphrase = inputs.passphrase(&args[1])?;
             let setup = HostedSetup::open(&root, &passphrase)?;
             let policy = setup.policy()?;
             let approved = setup.saved_approval()?;
@@ -3686,9 +3924,9 @@ pub fn command(command: &str, args: &[String]) -> Result<serde_json::Value, Stri
                 .map_err(|_| "setup_config")?
                 .try_into()
                 .map_err(|_| "setup_config")?;
-            let passphrase = private_passphrase(&args[1])?;
-            let bundle = private_file(Path::new(&args[2]), LIMIT)?;
-            let grant = private_file(Path::new(&args[3]), 4096)?;
+            let passphrase = inputs.passphrase(&args[1])?;
+            let bundle = inputs.file(&args[2], LIMIT)?;
+            let grant = inputs.file(&args[3], 4096)?;
             let mut setup = HostedSetup::create_with_policy(
                 &root,
                 &passphrase,
@@ -3721,9 +3959,9 @@ pub fn command(command: &str, args: &[String]) -> Result<serde_json::Value, Stri
                 .map_err(|_| "setup_config")?
                 .try_into()
                 .map_err(|_| "setup_config")?;
-            let passphrase = private_passphrase(&args[1])?;
-            let invitation = private_file(Path::new(&args[2]), 4096)?;
-            let bundle = private_file(Path::new(&args[3]), LIMIT)?;
+            let passphrase = inputs.passphrase(&args[1])?;
+            let invitation = inputs.file(&args[2], 4096)?;
+            let bundle = inputs.file(&args[3], LIMIT)?;
             let mut setup = HostedSetup::join(
                 &root,
                 &passphrase,
@@ -3740,7 +3978,7 @@ pub fn command(command: &str, args: &[String]) -> Result<serde_json::Value, Stri
                 return Err("setup_arguments".into());
             }
             let slot = args[2].parse::<u16>().map_err(|_| "setup_arguments")?;
-            let passphrase = private_passphrase(&args[1])?;
+            let passphrase = inputs.passphrase(&args[1])?;
             let setup = HostedSetup::open(&root, &passphrase)?;
             let output = Path::new(&args[3]);
             let output = if output.is_absolute() {
@@ -3757,7 +3995,7 @@ pub fn command(command: &str, args: &[String]) -> Result<serde_json::Value, Stri
             if args.len() != if command == "setup-agree" { 3 } else { 2 } {
                 return Err("setup_arguments".into());
             }
-            let passphrase = private_passphrase(&args[1])?;
+            let passphrase = inputs.passphrase(&args[1])?;
             let mut setup = HostedSetup::open(&root, &passphrase)?;
             if command == "setup-fingerprint" {
                 Ok(serde_json::json!({"fingerprint":hex::encode(setup.proposed_fingerprint()?)}))
@@ -3776,7 +4014,7 @@ pub fn command(command: &str, args: &[String]) -> Result<serde_json::Value, Stri
             if args.len() != 2 {
                 return Err("setup_arguments".into());
             }
-            let passphrase = private_passphrase(&args[1])?;
+            let passphrase = inputs.passphrase(&args[1])?;
             let mut setup = HostedSetup::open(&root, &passphrase)?;
             Ok(if command == "setup-abort" {
                 setup.abort()?
