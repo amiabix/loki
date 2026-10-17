@@ -31,14 +31,20 @@ sudo -u loki /opt/loki/bin/loki_operator_admin pubkey /var/lib/loki/admission/si
 
 ## 2. Sign the public operator configuration
 
-Do this on a trusted admin computer. Build `loki_operator_admin` there with the same pinned revision. Transfer only the three relay `manifest` files and `/var/lib/loki/admission/public-key` from the server to the admin computer. Keep the configuration and enrollment issuer seeds on the admin computer; **never** put either seed in the member app or the admission service.
+Do this on a trusted admin computer with the same pinned revision. Transfer only the three relay `manifest` files and `/var/lib/loki/admission/public-key` from the server to the admin computer. Keep the configuration seed offline after signing. The pilot issuer seed stays on the trusted creator/admin computer, whose member process can invoke the issuer; treat that whole computer as an operator trust boundary. Neither seed belongs on the service host or an invited member's computer. Build the admin command in the checkout, then move to a private directory **outside** the checkout for all keys and output:
 
 ```sh
+cargo +1.89.0 build --release --locked --manifest-path communication/Cargo.toml \
+  -p loki-setup-admission --bin loki_operator_admin
+export LOKI_REPO="$PWD"
+export LOKI_OPERATOR_ADMIN="$LOKI_REPO/communication/target/release/loki_operator_admin"
+mkdir -m 0700 "$HOME/loki-pilot-admin"
+cd "$HOME/loki-pilot-admin"
 umask 077
 openssl rand 32 > config.seed
 openssl rand 32 > issuer.seed
-./loki_operator_admin pubkey issuer.seed issuer-key
-./loki_operator_admin bundle config.seed admission-public-key https://admission.example.org \
+"$LOKI_OPERATOR_ADMIN" pubkey issuer.seed issuer-key
+"$LOKI_OPERATOR_ADMIN" bundle config.seed admission-public-key https://admission.example.org \
   relay-1.manifest relay-2.manifest relay-3.manifest bundle config-key relay-order
 ```
 
@@ -70,22 +76,23 @@ Use a member client with the pinned `bundle` and `config-key` to verify the sign
 For the first closed pilot, run the vault **creator** on the trusted admin computer. Copy `issuer-local.example` to a private executable there, set the four paths it reads, and pass it as `--enrollment-issuer` when starting that creator's member app. It grants only that app's newly generated device key, for one creation and one hour. Do not distribute this executable or the issuer seed to the invited members.
 
 ```sh
-install -m 0700 issuer-local.example issuer-local
-export LOKI_OPERATOR_ADMIN=/absolute/path/to/loki_operator_admin
-export LOKI_ISSUER_SEED=/absolute/path/to/issuer.seed
-export LOKI_OPERATOR_BUNDLE=/absolute/path/to/bundle
-export LOKI_CONFIG_KEY=/absolute/path/to/config-key
-cd poc
+install -m 0700 "$LOKI_REPO/communication/deploy/testnet-pilot/issuer-local.example" issuer-local
+export LOKI_ISSUER_SEED="$HOME/loki-pilot-admin/issuer.seed"
+export LOKI_OPERATOR_BUNDLE="$HOME/loki-pilot-admin/bundle"
+export LOKI_CONFIG_KEY="$HOME/loki-pilot-admin/config-key"
+export LOKI_TESTNET_RPC=127.0.0.1:18232
+export LOKI_TESTNET_COOKIE_FILE=/private/path/to/local-testnet-rpc.cookie
+cd "$LOKI_REPO/poc"
 cargo +1.91.0 build --locked --bins --features relay-communication
 python3 wallet/member_app.py --network testnet --transport hosted \
   --operator-bundle "$LOKI_OPERATOR_BUNDLE" \
   --operator-key "$(xxd -p -c 256 "$LOKI_CONFIG_KEY")" \
-  --enrollment-issuer /absolute/path/to/issuer-local \
+  --enrollment-issuer "$HOME/loki-pilot-admin/issuer-local" \
   --lightwalletd-url https://your-testnet-lightwalletd.example \
   --data /private/member-1 --exchange /private/unused-hosted --port 8801
 ```
 
-Set `LOKI_TESTNET_RPC` and `LOKI_TESTNET_COOKIE_FILE` to a synced Testnet node reachable on loopback before starting each member app. The member app and its browser must remain on the member's own machine. Give each invited member the public `bundle` and trusted `config-key`, but never the issuer seed or relay capabilities. They start their own app with the same `--network testnet --transport hosted` arguments and `--operator-bundle`/`--operator-key`, without `--enrollment-issuer`, then join from their private invitation. Each member compares the roster fingerprint and checks their own final backup card before funding.
+Set `LOKI_TESTNET_RPC` and `LOKI_TESTNET_COOKIE_FILE` to a synced Testnet node reachable on loopback before starting **each** member app. The member app and its browser must remain on the member's own machine. Give each invited member the public `bundle` and trusted `config-key`, but never the issuer seed or relay capabilities. They start their own app with the same `--network testnet --transport hosted` arguments and `--operator-bundle`/`--operator-key`, without `--enrollment-issuer`, then join from their private invitation. Each member compares the roster fingerprint and checks their own final backup card before funding.
 
 The local issuer wrapper is a pilot shortcut: code on the creator computer can request grants while it can invoke that executable. A public signup or independently hosted creator needs an authenticated enrollment provider. The bundle and grant command also supports operator-issued grants for a known device key, but the current member UI has no self-service enrollment-request screen.
 
