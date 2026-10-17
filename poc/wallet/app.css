@@ -103,6 +103,11 @@
   --card: 680px;
   --mono: "Geist Mono", ui-monospace, "SF Mono", Menlo, monospace;
   --serif: "Young Serif", ui-serif, "Iowan Old Style", Georgia, serif;
+  /* premium refresh: rounded shapes + soft depth replace the beveled HUD cuts */
+  --r-card: 16px;
+  --r-field: 10px;
+  --r-btn: 12px;
+  --shadow-card: 0 1px 2px rgba(0,0,0,.06), 0 18px 44px -24px rgba(0,0,0,.45);
   --bevel: polygon(0 0, calc(100% - 11px) 0, 100% 11px, 100% 100%, 11px 100%, 0 calc(100% - 11px));
   --bevel-sm: polygon(0 0, calc(100% - 7px) 0, 100% 7px, 100% 100%, 7px 100%, 0 calc(100% - 7px));
   font: 400 15px/1.6 Geist, "Helvetica Neue", Arial, sans-serif;
@@ -177,35 +182,17 @@ html {
 
 body { margin: 0; }
 
-/* Scanline and vignette go behind the content: they are ground texture, and
-   over the top they were dimming the corners of every card. */
+/* A single soft wash behind the content for depth — the scanlines and the
+   eight-hairline corner frame were the loudest part of the HUD skin and are
+   gone, leaving the cards to sit in clean, airy space. */
 body::before {
   content: "";
   position: fixed;
   inset: 0;
   z-index: -2;
   pointer-events: none;
-  background:
-    repeating-linear-gradient(0deg, var(--scan) 0 1px, transparent 1px 3px),
-    radial-gradient(ellipse at 50% 42%, transparent 55%, var(--vignette) 100%);
-}
-
-/* The corner frame stays above: eight hairlines dim nothing. */
-body::after {
-  content: "";
-  position: fixed;
-  inset: 10px;
-  z-index: 5;
-  pointer-events: none;
-  opacity: .5;
-  background-image:
-    linear-gradient(var(--faint),var(--faint)),linear-gradient(var(--faint),var(--faint)),
-    linear-gradient(var(--faint),var(--faint)),linear-gradient(var(--faint),var(--faint)),
-    linear-gradient(var(--faint),var(--faint)),linear-gradient(var(--faint),var(--faint)),
-    linear-gradient(var(--faint),var(--faint)),linear-gradient(var(--faint),var(--faint));
-  background-size: 14px 1px,1px 14px,14px 1px,1px 14px,14px 1px,1px 14px,14px 1px,1px 14px;
-  background-position: 0 0,0 0,100% 0,100% 0,0 100%,0 100%,100% 100%,100% 100%;
-  background-repeat: no-repeat;
+  background: radial-gradient(ellipse at 50% 0%, var(--accent-wash) 0%, transparent 60%);
+  opacity: .6;
 }
 
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
@@ -279,10 +266,10 @@ header:not(:has(.band)) {
 
 .brand {
   flex: none;
-  font-size: 15px;
-  font-weight: 700;
-  letter-spacing: .2em;
-  text-transform: uppercase;
+  font-family: var(--serif);
+  font-size: 19px;
+  font-weight: 400;
+  letter-spacing: .01em;
   color: var(--accent);
 }
 
@@ -291,10 +278,10 @@ header:not(:has(.band)) {
    browser cannot parse is dropped whole, and .brand must survive that. */
 header:not(:has(.band)) strong {
   flex: none;
-  font-size: 15px;
-  font-weight: 700;
-  letter-spacing: .2em;
-  text-transform: uppercase;
+  font-family: var(--serif);
+  font-size: 19px;
+  font-weight: 400;
+  letter-spacing: .01em;
   color: var(--accent);
 }
 
@@ -344,10 +331,9 @@ header:not(:has(.band)) span {
   margin: 0 0 12px;
   text-align: center;
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 18px;
-  letter-spacing: .22em;
-  text-transform: uppercase;
+  letter-spacing: .04em;
   color: var(--accent);
 }
 
@@ -399,7 +385,7 @@ main h1 {
   border: 1px solid var(--line);
   border-left: 2px solid var(--accent);
   color: var(--dim);
-  clip-path: var(--bevel-sm);
+  border-radius: var(--r-field);
 }
 #message.error {
   border-left-color: var(--danger);
@@ -413,26 +399,19 @@ main h1 {
   position: relative;
   max-width: var(--card);
   margin: 18px auto;
-  padding: 26px 28px;
+  padding: 30px 32px;
   background: var(--surface);
   border: 1px solid var(--line);
-  clip-path: var(--bevel);
-  /* corner brackets on the two square corners — the other two are bevel cuts */
-  background-image:
-    linear-gradient(var(--bracket),var(--bracket)), linear-gradient(var(--bracket),var(--bracket)),
-    linear-gradient(var(--bracket),var(--bracket)), linear-gradient(var(--bracket),var(--bracket));
-  background-size: 18px 2px, 2px 18px, 18px 2px, 2px 18px;
-  background-position: 0 0, 0 0, 100% 100%, 100% 100%;
-  background-repeat: no-repeat;
-  transition: border-color .22s ease;
+  border-radius: var(--r-card);
+  transition: border-color .22s ease, box-shadow .22s ease;
 }
 
 .card:hover { border-color: var(--hover-line); }
 
-/* the live card arrives, and sits in its own pool of light */
+/* the live card arrives, and sits in its own pool of soft light */
 .card:not([hidden]) {
   animation: rise .34s cubic-bezier(.2,.7,.3,1) both;
-  box-shadow: 0 32px 80px -40px var(--accent-edge);
+  box-shadow: var(--shadow-card);
 }
 
 @keyframes rise {
@@ -444,11 +423,10 @@ main h1 {
   align-items: center;
   gap: 10px;
   margin: 0 0 14px;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: .2em;
-  text-transform: uppercase;
-  color: var(--faint);
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: .005em;
+  color: var(--text);
 }
 /* a second section heading in the same card needs air above it */
 .card h2 ~ h2, .card h2 ~ h3 { margin-top: 32px; }
@@ -473,11 +451,10 @@ main h1 {
 details.card > summary {
   cursor: pointer;
   list-style: none;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: .2em;
-  text-transform: uppercase;
-  color: var(--faint);
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: .005em;
+  color: var(--text);
   transition: color .18s ease;
 }
 details.card > summary::-webkit-details-marker { display: none; }
@@ -500,11 +477,10 @@ details.card[open] > summary::before { transform: rotate(135deg); }
 label {
   display: block;
   margin: 18px 0 7px;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: .14em;
-  text-transform: uppercase;
-  color: var(--faint);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: normal;
+  color: var(--dim);
 }
 
 label small, small {
@@ -520,21 +496,23 @@ label small, small {
 
 input, textarea, select {
   width: 100%;
-  padding: 12px 14px;
+  padding: 13px 15px;
+  min-height: 46px;
   font: 400 14px/1.5 Geist, sans-serif;
   letter-spacing: normal;
   text-transform: none;
   color: var(--text);
   background: var(--inset);
   border: 1px solid var(--line);
-  transition: border-color .08s linear;
+  border-radius: var(--r-field);
+  transition: border-color .12s ease, box-shadow .12s ease;
 }
 input[type="password"], textarea { font-family: var(--mono); font-size: 13px; }
 textarea { min-height: 6rem; resize: vertical; }
 input:focus, textarea:focus, select:focus {
   outline: 0;
   border-color: var(--accent);
-  box-shadow: inset 0 0 0 1px var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-wash);
 }
 input::placeholder { color: var(--faint); }
 
@@ -565,20 +543,21 @@ option { color: var(--text); background: var(--inset); }
    document and every other element gets laid out past the viewport. */
 input[type="file"] {
   min-width: 0;
-  padding: 10px 12px;
+  padding: 11px 13px;
+  min-height: 46px;
   font-size: 12px;
   color: var(--dim);
   cursor: pointer;
 }
 input[type="file"]::file-selector-button {
   margin-right: 12px;
-  padding: 7px 13px;
-  font: 700 11px/1 Geist, sans-serif;
-  letter-spacing: .14em;
-  text-transform: uppercase;
+  padding: 8px 14px;
+  font: 600 12px/1 Geist, sans-serif;
+  letter-spacing: normal;
   color: var(--text);
   background: var(--raised);
   border: 1px solid var(--line);
+  border-radius: 8px;
   cursor: pointer;
 }
 input[type="file"]::file-selector-button:hover { border-color: var(--accent); }
@@ -587,55 +566,45 @@ button {
   position: relative;
   display: inline-flex;
   align-items: center;
-  gap: 12px;
+  justify-content: center;
+  gap: 10px;
   margin-top: 20px;
   margin-right: 10px;
-  padding: 13px 22px 13px 18px;
-  font: 700 11px/1 Geist, sans-serif;
-  letter-spacing: .16em;
-  text-transform: uppercase;
+  padding: 13px 22px;
+  font: 600 14px/1 Geist, sans-serif;
+  letter-spacing: normal;
   color: var(--on-accent);
-  background: linear-gradient(180deg, var(--accent-hi), var(--accent-lo));
-  border: 1px solid var(--accent-hi);
-  clip-path: var(--bevel-sm);
-  box-shadow: inset 0 1px 0 var(--sheen);
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: var(--r-btn);
+  box-shadow: 0 1px 2px rgba(0,0,0,.08);
   cursor: pointer;
-  transition: filter .08s linear, transform .06s ease;
+  transition: filter .12s ease, transform .12s ease, box-shadow .12s ease;
 }
-/* the kit's left glyph slot, and its corner tick */
-button::before {
-  content: "";
-  width: 7px;
-  height: 7px;
-  flex: none;
-  background: currentColor;
-  opacity: .75;
-  transform: rotate(45deg);
-}
-button::after {
-  content: "";
-  position: absolute;
-  right: 4px;
-  bottom: 4px;
-  width: 5px;
-  height: 5px;
-  border-right: 1px solid currentColor;
-  border-bottom: 1px solid currentColor;
-  opacity: .45;
-}
+/* the HUD diamond glyph and corner tick are gone — buttons are clean now */
+button::before, button::after { content: none; }
 button:hover:not(:disabled) {
-  filter: brightness(1.1);
-  box-shadow: inset 0 1px 0 var(--sheen), 0 0 22px var(--accent-edge);
+  filter: brightness(1.06);
+  transform: translateY(-1px);
+  box-shadow: 0 6px 18px -8px var(--accent-glow);
 }
-button:active:not(:disabled) { transform: translateY(1px); }
+button:active:not(:disabled) { transform: translateY(0); }
 button:disabled { opacity: .4; cursor: not-allowed; }
 
 button.secondary, #download-final, #download-challenge,
 #refresh-balance, #refresh-payments {
   color: var(--text);
-  background: linear-gradient(180deg, var(--raised-hi), var(--raised));
+  background: var(--raised);
   border-color: var(--line);
-  box-shadow: inset 0 1px 0 var(--sheen-soft);
+  box-shadow: none;
+}
+button.secondary:hover:not(:disabled), #download-final:hover:not(:disabled),
+#download-challenge:hover:not(:disabled), #refresh-balance:hover:not(:disabled),
+#refresh-payments:hover:not(:disabled) {
+  filter: none;
+  background: var(--raised-hi);
+  border-color: var(--accent-edge);
+  box-shadow: none;
 }
 
 /* a button that is working says so */
@@ -665,14 +634,13 @@ button.busy::after {
 .theme,
 button.quiet {
   margin: 0;
-  padding: 5px 10px;
-  font: 700 11px/1 Geist, sans-serif;
-  letter-spacing: .16em;
-  text-transform: uppercase;
+  padding: 7px 13px;
+  font: 600 12.5px/1 Geist, sans-serif;
+  letter-spacing: normal;
   color: var(--dim);
   background: none;
   border: 1px solid var(--line);
-  clip-path: none;
+  border-radius: 999px;
   box-shadow: none;
   transition: color .18s ease, border-color .18s ease;
 }
@@ -756,7 +724,7 @@ button.quiet:hover:not(:disabled) {
   padding: 18px 20px;
   background: var(--inset);
   border: 1px solid var(--line-soft);
-  clip-path: var(--bevel-sm);
+  border-radius: var(--r-field);
   background-image: none;
   box-shadow: none;
   animation: none;
@@ -908,10 +876,9 @@ pre:hover { border-color: var(--line); }
 main > .muted:last-child {
   margin: 28px 0 0;
   text-align: center;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: .14em;
-  text-transform: uppercase;
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: normal;
   color: var(--faint);
 }
 
@@ -1019,9 +986,8 @@ main > #transport-note {
 .invite-who strong { font-size: 13.5px; font-weight: 600; }
 
 .invite-state {
-  font: 700 10.5px/1 Geist, sans-serif;
-  letter-spacing: .18em;
-  text-transform: uppercase;
+  font: 700 11.5px/1 Geist, sans-serif;
+  letter-spacing: normal;
 }
 .invite-state.waiting { color: var(--warn-text); }
 .invite-state.joined { color: var(--accent); }
