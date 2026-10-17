@@ -113,6 +113,65 @@ class HostedControllerTests(unittest.TestCase):
                 fund_member(self.wallet, self.vault, 'd' * 32)
             endpoint.assert_not_called()
 
+    def _joiner_vault(self, phases, fingerprints):
+        """A joined slot-2 vault whose native step and info replay the given sequences."""
+        self.slot, self.count = 2, 3
+        invitation = 'loki-hosted-v1:' + base64.urlsafe_b64encode(b'signed invite').decode().rstrip('=')
+        self.wallet.join(invitation)
+        folder, _ = self.wallet.vault_dir(self.vault)
+        self.controller.information.clear()
+        steps, infos = iter(phases), iter(fingerprints)
+
+        def native(action, root, *args, **kwargs):
+            self.calls.append((action, root))
+            if action == 'setup-step':
+                phase = next(steps)
+                joined = [1, 2, 3] if phase == 'roster_proposed' else [2]
+                status = {'phase': phase, 'policy': '2-of-3', 'own_slot': 2, 'joined_slots': joined,
+                          'missing_slots': [slot for slot in (1, 2, 3) if slot not in joined],
+                          'agreed_fingerprint': None, 'retryable': False, 'handoff': 'pending'}
+                (root / 'setup-status.json').write_text(json.dumps(status))
+                return json.dumps(status)
+            if action == 'setup-info':
+                return json.dumps({'vault': self.vault, 'own_slot': 2, 'member_count': 3,
+                                   'fingerprint': next(infos), 'network': 'regtest', 'members': []})
+            raise AssertionError(action)
+        self.controller.native = native
+        return folder
+
+    def test_joiner_sees_fingerprint_when_proposal_arrives(self):
+        folder = self._joiner_vault(['join_published', 'join_published', 'roster_proposed'], [None, 'c' * 64])
+        for expected in ('waiting_for_members', 'waiting_for_members', 'compare_roster'):
+            self.controller.step_folder(folder, 'alice')
+            state = self.wallet.status(self.vault)
+            self.assertEqual(state['phase'], expected)
+        self.assertEqual(state['fingerprint'], 'c' * 64)
+        self.assertIsNone(state['error'])
+        self.assertEqual([action for action, _ in self.calls[-5:]],
+                         ['setup-step', 'setup-info', 'setup-step', 'setup-step', 'setup-info'])
+
+    def test_missing_fingerprint_is_refetched_without_a_phase_change(self):
+        folder = self._joiner_vault(['roster_proposed'] * 3, [None, 'c' * 64])
+        self.controller.step_folder(folder, 'alice')
+        self.assertIsNone(self.wallet.status(self.vault)['fingerprint'])
+        self.controller.step_folder(folder, 'alice')
+        self.assertIsNone(self.wallet.status(self.vault)['fingerprint'], 'refetch is rate limited')
+        self.controller.information_at[self.vault] -= 5
+        self.controller.step_folder(folder, 'alice')
+        state = self.wallet.status(self.vault)
+        self.assertEqual((state['phase'], state['fingerprint']), ('compare_roster', 'c' * 64))
+
+    def test_roster_mismatch_is_reported_as_stopped(self):
+        folder = self._joiner_vault([], [])
+
+        def native(action, root, *args, **kwargs):
+            raise ValueError('setup_roster')
+        self.controller.native = native
+        self.controller.step_folder(folder, 'alice')
+        state = self.wallet.status(self.vault)
+        self.assertEqual(state['phase'], 'stopped')
+        self.assertIn('does not match the admitted members', state['error'])
+
     def test_membership_publication_recovers_before_directory_rename(self):
         folder = self.controller._pending('Treasury', 'create', '2-of-4')
         with patch.object(Path, 'rename', side_effect=OSError('interrupted rename')):

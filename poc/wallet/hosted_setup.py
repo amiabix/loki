@@ -12,6 +12,9 @@ import time
 
 import timing
 
+FINGERPRINT_PHASES = ("roster_proposed", "agreement_saved", "acceptance_pending", "roster_accepted")
+ROSTER_MISMATCH = "The proposed roster does not match the admitted members. Do not confirm; contact the creator"
+
 
 class HostedSetup:
     def __init__(self, wallet, bundle, key, enrollment=None, development=False, issuer=None):
@@ -35,6 +38,7 @@ class HostedSetup:
         self.process = None
         self.worker = None
         self.information = {}
+        self.information_at = {}
         self.errors = {}
 
     def native(self, action, root, *args, private=None, unlocked=True):
@@ -130,28 +134,52 @@ class HostedSetup:
             for folder in folders:
                 if self.stop_event.is_set():
                     break
-                try:
-                    pending = folder / "pending.json"
-                    if folder.name.startswith(".hosted-") and pending.is_file():
-                        metadata = json.loads(pending.read_text())
-                        if metadata["profile"] == profile and (folder / "secrets" / "hosted-context.sealed").is_file():
-                            self._attach(folder, metadata["name"])
-                        continue
-                    membership = folder / "membership.json"
-                    if not membership.is_file():
-                        continue
-                    local = json.loads(membership.read_text())
-                    if local.get("transport") != "hosted" or local.get("profile") != profile:
-                        continue
-                    prior = self._cached(folder)
-                    if prior.get("handoff") == "ready":
-                        continue
-                    result = json.loads(self.native("setup-step", folder))
-                    if folder.name not in self.information or prior.get("phase") != result.get("phase"):
-                        self.information[folder.name] = json.loads(self.native("setup-info", folder))
-                    self.errors.pop(folder.name, None)
-                except (ValueError, OSError, KeyError, json.JSONDecodeError):
-                    self.errors[folder.name] = "Connection interrupted. Your saved setup will retry while unlocked."
+                self.step_folder(folder, profile)
+
+    def step_folder(self, folder, profile):
+        """Advance one saved setup by one native step; returns the native status or None."""
+        try:
+            pending = folder / "pending.json"
+            if folder.name.startswith(".hosted-") and pending.is_file():
+                metadata = json.loads(pending.read_text())
+                if metadata["profile"] == profile and (folder / "secrets" / "hosted-context.sealed").is_file():
+                    self._attach(folder, metadata["name"])
+                return None
+            membership = folder / "membership.json"
+            if not membership.is_file():
+                return None
+            local = json.loads(membership.read_text())
+            if local.get("transport") != "hosted" or local.get("profile") != profile:
+                return None
+            prior = self._cached(folder)
+            if prior.get("handoff") == "ready":
+                return None
+            result = json.loads(self.native("setup-step", folder))
+            if self._needs_information(folder.name, prior.get("phase"), result.get("phase")):
+                self._refresh_information(folder)
+            self.errors.pop(folder.name, None)
+            return result
+        except (ValueError, OSError, KeyError, json.JSONDecodeError) as error:
+            self.errors[folder.name] = self._error_message(error)
+            return None
+
+    def _needs_information(self, vault, before, after):
+        """The roster fingerprint arrives with a phase change, but a joiner whose first
+        info read raced the proposal still needs it; refetch that at most every 5 s."""
+        if vault not in self.information or before != after:
+            return True
+        return (after in FINGERPRINT_PHASES and self.information[vault].get("fingerprint") is None
+                and time.monotonic() - self.information_at.get(vault, 0) >= 5)
+
+    def _refresh_information(self, folder):
+        self.information_at[folder.name] = time.monotonic()
+        self.information[folder.name] = json.loads(self.native("setup-info", folder))
+
+    @staticmethod
+    def _error_message(error):
+        if "setup_roster" in str(error):
+            return ROSTER_MISMATCH
+        return "Connection interrupted. Your saved setup will retry while unlocked."
 
     def _configuration_args(self):
         return [self.bundle, "--operator-key", self.key, *(["--development-http"] if self.development else [])]
@@ -262,7 +290,7 @@ class HostedSetup:
         native = self._cached(folder)
         info = self.information.get(vault, {})
         phase = native["phase"]
-        if phase in ("aborted", "checkpoint_conflict", "expired", "admission_rejected"):
+        if phase in ("aborted", "checkpoint_conflict", "expired", "admission_rejected") or self.errors.get(vault) == ROSTER_MISMATCH:
             ui_phase = "stopped"
         elif phase in ("roster_proposed", "agreement_saved", "acceptance_pending", "roster_accepted"):
             ui_phase = "creating_keys" if native.get("agreed_fingerprint") else "compare_roster"

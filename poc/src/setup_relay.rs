@@ -2861,6 +2861,23 @@ impl HostedSetup {
         let progress = store
             .progress_for(&transport, &routes, &key)
             .map_err(|_| "setup_transport")?;
+        // The drive above may have fetched the creator's proposal. Report it only after the
+        // full admitted roster is known, so a fresh partial claim list never reads as a mismatch.
+        if claimed.len() == self.context.count as usize && progress.stored_groups == 1 {
+            if let Some(proposal) =
+                self.authenticated_proposal(&store, &transport, claimed, &routes.own)?
+            {
+                return Ok(SetupStatus {
+                    agreed: self.saved_approval()?.map(|(_, fp, _)| fp),
+                    waiting: None,
+                    own_slot: self.context.own_slot,
+                    phase: "roster_proposed",
+                    count: self.context.count,
+                    joined: proposal.roster.members.iter().map(|peer| peer.id).collect(),
+                    retryable: false,
+                });
+            }
+        }
         Ok(SetupStatus {
             agreed: self.saved_approval()?.map(|(_, fp, _)| fp),
             waiting: None,
