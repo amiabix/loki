@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 from member_app import Wallet, SignerSessions, make_signer_server
+from hosted_setup import HostedSetup
 from local_funding import fund_member, funding_status
 
 
@@ -30,6 +31,8 @@ class HostedControllerTests(unittest.TestCase):
         self.wallet.profile_data = {'id': 'alice', 'name': 'Alice'}
         self.wallet.passphrase = 'alice test passphrase'
         self.controller = self.wallet.hosted
+        # These cases cover the per-command path; test_member_service covers the service.
+        self.controller.service = None
         self.calls = []
         self.count = 4
         self.slot = 1
@@ -112,6 +115,190 @@ class HostedControllerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'hosted'):
                 fund_member(self.wallet, self.vault, 'd' * 32)
             endpoint.assert_not_called()
+
+    def _joiner_vault(self, phases, fingerprints):
+        """A joined slot-2 vault whose native step and info replay the given sequences."""
+        self.slot, self.count = 2, 3
+        invitation = 'loki-hosted-v1:' + base64.urlsafe_b64encode(b'signed invite').decode().rstrip('=')
+        self.wallet.join(invitation)
+        folder, _ = self.wallet.vault_dir(self.vault)
+        self.controller.information.clear()
+        steps, infos = iter(phases), iter(fingerprints)
+
+        def native(action, root, *args, **kwargs):
+            self.calls.append((action, root))
+            if action == 'setup-step':
+                phase = next(steps)
+                joined = [1, 2, 3] if phase == 'roster_proposed' else [2]
+                status = {'phase': phase, 'policy': '2-of-3', 'own_slot': 2, 'joined_slots': joined,
+                          'missing_slots': [slot for slot in (1, 2, 3) if slot not in joined],
+                          'agreed_fingerprint': None, 'retryable': False, 'handoff': 'pending'}
+                (root / 'setup-status.json').write_text(json.dumps(status))
+                return json.dumps(status)
+            if action == 'setup-info':
+                return json.dumps({'vault': self.vault, 'own_slot': 2, 'member_count': 3,
+                                   'fingerprint': next(infos), 'network': 'regtest', 'members': []})
+            raise AssertionError(action)
+        self.controller.native = native
+        return folder
+
+    def test_joiner_sees_fingerprint_when_proposal_arrives(self):
+        folder = self._joiner_vault(['join_published', 'join_published', 'roster_proposed'], [None, 'c' * 64])
+        for expected in ('waiting_for_members', 'waiting_for_members', 'compare_roster'):
+            self.controller.step_folder(folder, 'alice')
+            state = self.wallet.status(self.vault)
+            self.assertEqual(state['phase'], expected)
+        self.assertEqual(state['fingerprint'], 'c' * 64)
+        self.assertIsNone(state['error'])
+        self.assertEqual([action for action, _ in self.calls[-5:]],
+                         ['setup-step', 'setup-info', 'setup-step', 'setup-step', 'setup-info'])
+
+    def test_missing_fingerprint_is_refetched_without_a_phase_change(self):
+        folder = self._joiner_vault(['roster_proposed'] * 3, [None, 'c' * 64])
+        self.controller.step_folder(folder, 'alice')
+        self.assertIsNone(self.wallet.status(self.vault)['fingerprint'])
+        self.controller.step_folder(folder, 'alice')
+        self.assertIsNone(self.wallet.status(self.vault)['fingerprint'], 'refetch is rate limited')
+        self.controller.information_at[self.vault] -= 5
+        self.controller.step_folder(folder, 'alice')
+        state = self.wallet.status(self.vault)
+        self.assertEqual((state['phase'], state['fingerprint']), ('compare_roster', 'c' * 64))
+
+    def test_roster_mismatch_is_reported_as_stopped(self):
+        folder = self._joiner_vault([], [])
+
+        def native(action, root, *args, **kwargs):
+            raise ValueError('setup_roster')
+        self.controller.native = native
+        self.controller.step_folder(folder, 'alice')
+        state = self.wallet.status(self.vault)
+        self.assertEqual(state['phase'], 'stopped')
+        self.assertIn('does not match the admitted members', state['error'])
+
+    def test_hosted_wallet_needs_no_exchange_and_refuses_local_routes(self):
+        root = Path(self.temporary.name)
+        with self.assertRaisesRegex(ValueError, 'exchange'):
+            Wallet(root / 'local-member', None)
+        wallet = Wallet(root / 'hosted-member', None, transport='hosted', operator_bundle=root / 'operators',
+                        operator_key='a' * 64, enrollment_grant=root / 'grant')
+        self.addCleanup(wallet.close)
+        self.assertIsNone(wallet.exchange)
+        wallet.profile_data = {'id': 'alice', 'name': 'Alice'}
+        self.assertEqual(wallet.vaults(), [])
+        with self.assertRaisesRegex(ValueError, 'Invalid vault ID'):
+            wallet.vault_dir('../escape')
+        with self.assertRaisesRegex(ValueError, 'hosted transport'):
+            wallet.exchange_vault('a' * 64)
+        with self.assertRaisesRegex(ValueError, 'automatically'):
+            wallet.setup_all_relays()
+
+    def test_user_action_on_one_vault_does_not_wait_for_another(self):
+        started, release = threading.Event(), threading.Event()
+        blocked, free = Path(self.temporary.name) / 'vault-a', Path(self.temporary.name) / 'vault-b'
+        seen = []
+
+        def native(action, root, *args, **kwargs):
+            seen.append((action, root.name))
+            if root == blocked:
+                started.set()
+                release.wait(5)
+            return '{}'
+        del self.controller.native
+        self.controller._native = native
+        worker = threading.Thread(target=lambda: self.controller.native('setup-step', blocked))
+        worker.start()
+        self.assertTrue(started.wait(2))
+        begun = __import__('time').monotonic()
+        with self.controller.user_action(free):
+            self.controller.native('setup-agree', free, 'f' * 64)
+        self.assertLess(__import__('time').monotonic() - begun, 1)
+        waiter = threading.Thread(target=lambda: self.controller.native('setup-agree', blocked, 'f' * 64))
+        self.assertFalse(self.controller.user_pending(blocked))
+        waiter.start()
+        __import__('time').sleep(0.1)
+        self.assertEqual(seen.count(('setup-agree', 'vault-a')), 0, 'same-vault calls never overlap')
+        release.set()
+        worker.join(5)
+        waiter.join(5)
+        self.assertEqual(seen.count(('setup-agree', 'vault-a')), 1)
+
+    def test_worker_skips_vault_with_pending_user_action_and_retries_native_lock(self):
+        folder = Path(self.temporary.name) / 'vault-c'
+        calls = []
+
+        def native(action, root, *args, **kwargs):
+            calls.append(action)
+            if len(calls) < 3:
+                raise ValueError('setup_worker_locked')
+            return '{}'
+        del self.controller.native
+        self.controller._native = native
+        with self.controller.user_action(folder):
+            self.assertEqual(self.controller._background_step(folder, 'alice'), ('busy', None))
+            self.assertEqual(self.controller.native('setup-agree', folder, 'f' * 64), '{}')
+        self.assertEqual(calls, ['setup-agree'] * 3)
+        calls.clear()
+        self.controller._native = lambda *a, **k: (_ for _ in ()).throw(ValueError('setup_worker_locked'))
+        with self.controller.user_action(folder):
+            with self.assertRaisesRegex(ValueError, 'busy in another tool'):
+                self.controller.native('setup-agree', folder, 'f' * 64)
+        with self.assertRaisesRegex(ValueError, 'setup_worker_locked'):
+            self.controller.native('setup-step', folder)
+
+    def test_schedule_steps_again_after_progress_and_backs_off_when_idle(self):
+        name = 'd' * 64
+        self.controller._reschedule(name, ('progress', {}))
+        self.assertEqual(self.controller.schedule[name]['due'] <= __import__('time').monotonic(), True)
+        delays = []
+        for _ in range(5):
+            before = __import__('time').monotonic()
+            self.controller._reschedule(name, ('idle', {}))
+            delays.append(round(self.controller.schedule[name]['due'] - before, 2))
+        self.assertEqual(delays, [0.25, 0.5, 1.0, 2.0, 2.0])
+        before = __import__('time').monotonic()
+        self.controller._reschedule(name, ('human', {}))
+        self.assertAlmostEqual(self.controller.schedule[name]['due'] - before, 5, places=1)
+        errors = []
+        for _ in range(6):
+            before = __import__('time').monotonic()
+            self.controller._reschedule(name, ('error', None))
+            errors.append(round(self.controller.schedule[name]['due'] - before))
+        self.assertEqual(errors, [2, 4, 8, 16, 30, 30])
+        for _ in range(20):
+            self.controller._reschedule(name, ('progress', {}))
+        before = __import__('time').monotonic()
+        self.controller._reschedule(name, ('progress', {}))
+        self.assertGreater(self.controller.schedule[name]['due'] - before, 0.2, 'immediate re-steps are capped')
+
+    def test_lock_stops_a_blocked_step_within_five_seconds(self):
+        del self.controller.native
+        script = Path(self.temporary.name) / 'slow-native'
+        script.write_text('#!/bin/sh\nexec sleep 30\n')
+        script.chmod(0o700)
+        self.wallet.setup = script
+        worker = threading.Thread(target=lambda: self.assertRaises(ValueError, self.controller.native, 'setup-step', Path(self.temporary.name)))
+        worker.start()
+        __import__('time').sleep(0.5)
+        begun = __import__('time').monotonic()
+        self.controller.stop()
+        worker.join(6)
+        self.assertFalse(worker.is_alive())
+        self.assertLess(__import__('time').monotonic() - begun, 5)
+
+    def test_status_lists_backup_checks_from_native_receipts(self):
+        self.count = 3
+        result = self.wallet.create('Treasury', 3)
+        folder, _ = self.wallet.vault_dir(result['vault'])
+        (folder / 'setup-status.json').write_text(json.dumps({'phase': 'awaiting_backups', 'handoff': 'pending',
+                                                            'joined_slots': [1, 2, 3], 'missing_slots': [3]}))
+        self.assertEqual([(row['slot'], row['backup_checked']) for row in self.wallet.status(self.vault)['backups']],
+                         [(1, True), (2, True), (3, False)])
+        (folder / 'setup-status.json').write_text(json.dumps({'phase': 'certified', 'handoff': 'pending',
+                                                            'joined_slots': [1, 2, 3], 'missing_slots': []}))
+        self.assertTrue(all(row['backup_checked'] for row in self.wallet.status(self.vault)['backups']))
+        (folder / 'setup-status.json').write_text(json.dumps({'phase': 'round1_saved', 'handoff': 'pending',
+                                                            'joined_slots': [1, 2, 3], 'missing_slots': [2, 3]}))
+        self.assertEqual(self.wallet.status(self.vault)['backups'], [])
 
     def test_membership_publication_recovers_before_directory_rename(self):
         folder = self.controller._pending('Treasury', 'create', '2-of-4')

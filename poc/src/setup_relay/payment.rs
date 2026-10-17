@@ -553,7 +553,7 @@ impl HostedSetup {
             .map_err(|_| "setup_transport")?;
         if may_drive {
             self.runtime
-                .block_on(transport.drive_once(store, routes))
+                .block_on(transport.drive_once_with(store, routes, &self.net))
                 .map_err(|_| "setup_transport")?;
         }
         let key = SetupKey {
@@ -665,16 +665,22 @@ impl HostedSetup {
             }
         }
         if may_drive {
-            if let Some(index) = (0..3).find(|index| !registered.contains(index)) {
-                match self.execute_admission(&saved.intent.requests[index], None, false) {
-                    Ok(reply)
-                        if matches!(reply.outcome(), AdmissionOutcome::Accepted(Value::Bytes(mailbox))
-                        if mailbox.as_slice() == saved.intent.config.own[index].route.mailbox) =>
-                    {
-                        ()
+            // Every unregistered handoff mailbox in one step: the requests are saved and
+            // signed, and a re-send is idempotent.
+            let unregistered: Vec<usize> = (0..3).filter(|index| !registered.contains(index)).collect();
+            if !unregistered.is_empty() {
+                let packages: Vec<&[u8]> = unregistered
+                    .iter()
+                    .map(|index| saved.intent.requests[*index].as_slice())
+                    .collect();
+                for (index, reply) in unregistered.iter().zip(self.execute_admissions(&packages)) {
+                    match reply {
+                        Ok(reply)
+                            if matches!(reply.outcome(), AdmissionOutcome::Accepted(Value::Bytes(mailbox))
+                            if mailbox.as_slice() == saved.intent.config.own[*index].route.mailbox) => {}
+                        Err(loki_relay_client::ClientError::Transport) => {}
+                        _ => return Err("setup_admission".into()),
                     }
-                    Err(loki_relay_client::ClientError::Transport) => (),
-                    _ => return Err("setup_admission".into()),
                 }
                 return Ok(pending());
             }

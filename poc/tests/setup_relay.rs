@@ -745,13 +745,23 @@ fn run_owned_services_flow(mode: OwnedFlow) {
         }
         let mut reopened = HostedSetup::open(member.path(), "pass").unwrap();
         let public = reopened.step().unwrap().public_json();
-        assert_eq!(public["phase"], "joins_received");
+        // The step that receives the last Join also proposes the roster, so it reports
+        // the proposal unless publishing it is still pending.
+        assert!(
+            matches!(
+                public["phase"].as_str(),
+                Some("joins_received" | "roster_proposed")
+            ),
+            "unexpected creator phase {public}"
+        );
         assert_eq!(
             public["joined_slots"].as_array().unwrap().len(),
             usize::from(count)
         );
         assert!(public["missing_slots"].as_array().unwrap().is_empty());
-        assert!(reopened.proposed_fingerprint().is_err());
+        if public["phase"] == "joins_received" {
+            assert!(reopened.proposed_fingerprint().is_err());
+        }
         let limit = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             if reopened.step().unwrap().public_json()["phase"] == "roster_proposed" {
@@ -768,17 +778,41 @@ fn run_owned_services_flow(mode: OwnedFlow) {
             let path = services.root.join(format!("peer-{count}-{slot}"));
             let mut peer = HostedSetup::open(&path, "peer-pass").unwrap();
             let limit = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            // A joiner must report the proposal from its own step, not only through
+            // `setup-info`; the app refreshes the fingerprint on that phase change.
             loop {
-                peer.step().unwrap();
-                if let Ok(found) = peer.proposed_fingerprint() {
-                    assert_eq!(found, fingerprint);
+                let public = peer.step().unwrap().public_json();
+                if public["phase"] == "roster_proposed" {
+                    assert_eq!(
+                        public["joined_slots"],
+                        serde_json::json!((1..=count).collect::<Vec<_>>())
+                    );
                     break;
                 }
                 assert!(
+                    matches!(public["phase"].as_str(), Some("join_published" | "join_pending")),
+                    "unexpected joiner phase {public}"
+                );
+                assert!(
                     std::time::Instant::now() < limit,
-                    "peer did not authenticate the roster proposal"
+                    "joiner step never reported the authenticated roster proposal"
                 );
             }
+            assert_eq!(peer.proposed_fingerprint().unwrap(), fingerprint);
+            drop(peer);
+            assert_eq!(
+                HostedSetup::cached_status(&path).unwrap()["phase"],
+                "roster_proposed"
+            );
+            let passfile = path.join("info-pass");
+            private_input(&passfile, b"peer-pass");
+            let info = loki_poc::setup_relay::command(
+                "setup-info",
+                &[path.display().to_string(), passfile.display().to_string()],
+            )
+            .unwrap();
+            fs::remove_file(&passfile).unwrap();
+            assert_eq!(info["fingerprint"], hex::encode(fingerprint));
         }
         let mut reopened = HostedSetup::open(member.path(), "pass").unwrap();
         let before_approval = sealed_files(member.path());
@@ -912,12 +946,20 @@ fn run_owned_services_flow(mode: OwnedFlow) {
                 ));
                 return;
             }
-            assert_eq!(public["phase"], "round1_saved");
+            // Peers that already saved round 1 let the same step reach round 2.
+            assert!(matches!(
+                public["phase"].as_str(),
+                Some("round1_saved" | "round2_saved")
+            ));
         } else {
             let mut reopened = HostedSetup::open(member.path(), "pass").unwrap();
-            assert_eq!(
-                reopened.step().unwrap().public_json()["phase"],
-                "round1_saved"
+            let public = reopened.step().unwrap().public_json();
+            assert!(
+                matches!(
+                    public["phase"].as_str(),
+                    Some("round1_saved" | "round2_saved")
+                ),
+                "unexpected phase after acceptance {public}"
             );
         }
         let limit = std::time::Instant::now() + std::time::Duration::from_secs(300);

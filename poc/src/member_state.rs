@@ -153,6 +153,7 @@ pub fn open(owner: &Path, pass_file: &Path, roster_file: &Path) -> Result<Member
     if trimmed.is_empty() {
         return Err("empty passphrase".into());
     }
+    crate::seal_kdf::enable_session_cache(&trimmed);
     let dir = MemberDir::open(owner, "secrets");
     let state: serde_json::Value = serde_json::from_slice(
         &dir.read_sealed("vault.sealed", &trimmed)

@@ -1,8 +1,8 @@
 use ed25519_dalek::SigningKey;
 use loki_relay_client::{OperatorSet, Secret32};
 use loki_setup_admission::{
-    http::router, AdmissionError as Error, AdmissionResult as Result, AdmissionStore,
-    EnrollmentVerifier, OwnedProvisioner,
+    http::router_with_provisioning, AdmissionError as Error, AdmissionResult as Result,
+    AdmissionStore, EnrollmentVerifier, OwnedProvisioner,
 };
 use std::{
     collections::BTreeMap,
@@ -209,12 +209,18 @@ fn dispatch() -> Result<()> {
         let listener = tokio::net::TcpListener::bind(args.listen)
             .await
             .map_err(|_| Error::Unavailable)?;
-        let app = router(store.clone());
+        let provision = Arc::new(tokio::sync::Notify::new());
+        let app = router_with_provisioning(store.clone(), provision.clone());
         let worker = async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                interval.tick().await;
+                // A new mailbox command wakes the provisioner at once; the 1 s tick
+                // remains the fallback for retries and cleanup.
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = provision.notified() => {}
+                }
                 let now = now()?;
                 store.lock().map_err(|_| Error::Unavailable)?.cleanup(now)?;
                 provisioner.drive_once(&store, now).await?;

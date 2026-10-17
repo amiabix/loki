@@ -1,5 +1,4 @@
 use crate::{setup_transport::Identity, zip2005};
-use argon2::Argon2;
 use chacha20poly1305::{
     aead::{Aead, Payload},
     KeyInit, XChaCha20Poly1305, XNonce,
@@ -157,10 +156,7 @@ fn sealed(path: &Path, pass: &str) -> MemberResult<Zeroizing<Vec<u8>>> {
     if raw.len() < SEAL_HEADER + 16 || &raw[..9] != SEAL_MAGIC {
         return Err(MemberError::Sealed);
     }
-    let mut key = Zeroizing::new([0u8; 32]);
-    Argon2::default()
-        .hash_password_into(pass.as_bytes(), &raw[9..25], key.as_mut())
-        .map_err(|_| MemberError::Sealed)?;
+    let key = crate::seal_kdf::derive(pass, &raw[9..25]).map_err(|_| MemberError::Sealed)?;
     let cipher =
         XChaCha20Poly1305::new_from_slice(key.as_ref()).map_err(|_| MemberError::Sealed)?;
     cipher
@@ -300,6 +296,7 @@ pub fn load(root: &Path, pass_file: &Path, roster_path: &Path) -> MemberResult<L
     if pass.is_empty() {
         return Err(MemberError::Sealed);
     }
+    crate::seal_kdf::enable_session_cache(&pass);
     let identity_bytes = sealed(&root.join("secrets/identity.sealed"), &pass)?;
     let mut identity_raw = Zeroizing::new([0u8; 66]);
     if identity_bytes.len() != identity_raw.len() {

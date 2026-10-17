@@ -115,10 +115,10 @@ impl std::error::Error for ClientError {}
 
 mod store;
 pub use store::{
-    AckLink, ClientStore, CommitDisposition, ConfigReference, DiagnosticSample, DownloadRejection, EarlyReceived,
-    IncomingDependency, IncomingOriginal, JournalCapture, PendingDownload, RecoveryLogical,
-    RecoveryRecipient, RecoveryRequirement, RecoveryUpload, ReferencePhase, RouteCursor,
-    SourceRejection, StagedRequirement, StagedSource, StorePragmas,
+    AckLink, ClientStore, CommitDisposition, ConfigReference, DiagnosticSample, DownloadRejection,
+    EarlyReceived, IncomingDependency, IncomingOriginal, JournalCapture, PendingDownload,
+    RecoveryLogical, RecoveryRecipient, RecoveryRequirement, RecoveryUpload, ReferencePhase,
+    RouteCursor, SourceRejection, StagedRequirement, StagedSource, StorePragmas,
 };
 
 mod http;
@@ -133,26 +133,26 @@ pub use received::{prepare_received, received_status, reconcile_received, Receiv
 pub use tokio::runtime::Runtime as RelayRuntime;
 pub use tokio::time::timeout as relay_timeout;
 
-mod retry;
 mod outbox;
+mod retry;
 pub use outbox::{outbox_intent_digest, upload_pending, DeliveryReport, ThirdPass, UploadPass};
 
 mod setup;
+pub use setup::sign_admission_request;
 pub use setup::{
     sign_roster_acceptance, AcceptedSetupRoster, AuthenticatedSetupRecord, BootstrapContext,
     SetupInvite, SetupPolicy, SetupRecordIndex,
 };
-pub use setup::sign_admission_request;
-pub use setup::{AdmissionHttp, AdmissionOutcome, VerifiedAdmissionReply, verify_admission_reply};
+pub use setup::{verify_admission_reply, AdmissionHttp, AdmissionOutcome, VerifiedAdmissionReply};
 
 mod setup_delivery;
 mod setup_store;
-pub use setup_delivery::{SetupAuthority,SetupTransport,PreparedSetup};
+pub use setup_delivery::{PreparedSetup, SetupAuthority, SetupTransport};
 pub use setup_store::SetupStore;
 
 pub use setup::SetupInboxDescriptor;
 
 mod setup_network;
-pub use setup_network::{SetupRoutes,SetupProgress};
+pub use setup_network::{join_all, SetupNet, SetupProgress, SetupRoutes};
 
 pub use setup::{verify_terminal_notices, VerifiedTerminalNotices};

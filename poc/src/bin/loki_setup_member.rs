@@ -27,7 +27,15 @@ fn hex32(text: &str) -> Result<[u8; 32], String> {
         .map_err(|_| "expected 32 bytes".into())
 }
 
+/// Reads the member passphrase and keys the KDF session cache with it.
 fn passphrase(path: &Path) -> Result<String, String> {
+    let pass = secret_file(path)?;
+    loki_poc::seal_kdf::enable_session_cache(&pass);
+    Ok(pass)
+}
+
+/// Reads an owner-only secret file without touching the KDF session cache.
+fn secret_file(path: &Path) -> Result<String, String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -395,7 +403,7 @@ fn checked_receipts(
 }
 
 fn words(path: &Path) -> Result<String, String> {
-    let entered = passphrase(path)?;
+    let entered = secret_file(path)?;
     let mnemonic = Mnemonic::parse_in(Language::English, &entered)
         .map_err(|e| format!("invalid backup words: {e}"))?;
     if mnemonic.word_count() != 24 {
@@ -982,6 +990,7 @@ fn main() {
         Some("run") => run(&args[1..]),
         _ => Err("usage: loki_setup_member profile-create|profile-open|identity|identity-public|fingerprint|run|backup-create|backup-verify|backup-finalize|backup-report|backup-reports|address|validate-roster|restore ...".into()),
     };
+    loki_poc::seal_kdf::report();
     if let Err(error) = result {
         eprintln!("error: {error}");
         process::exit(1);

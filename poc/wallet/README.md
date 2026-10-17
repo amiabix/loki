@@ -28,10 +28,22 @@ signing API. Use a **regtest-only seed**. An address QR is not a proof of contro
 
 ```sh
 cd poc
-cargo build --locked --bins --features relay-communication
+cargo build --release --locked --bins --features relay-communication
 cargo build --locked --manifest-path ../communication/Cargo.toml -p loki-relay-server
 python3 wallet/member_app.py --data /tmp/loki-member-1 --exchange /tmp/loki-setup-exchange --port 8801
 ```
+
+The app uses the release binaries when all four are built and otherwise falls back
+to `target/debug` with a startup warning. Select one explicitly with
+`--bin-profile release|debug` or `LOKI_POC_BIN_PROFILE`; `CARGO_TARGET_DIR` is
+honored. Debug builds are for development and the setup fault-injection drills;
+their dependencies are optimized, but Loki's own code is not.
+
+With hosted transport, an unlocked profile runs its setup commands in one
+`loki_member_service` child (built with the other binaries). It receives the
+passphrase once over its stdin and keeps it, and the Argon2id keys it derives,
+only in memory; Lock stops it within 5 s. A missing service binary, or
+`LOKI_MEMBER_SERVICE=0`, keeps one `loki_setup_member` process per command.
 
 For the separate dashboard and signer flow, start the same member app with a
 second loopback port:
@@ -157,11 +169,19 @@ the proposal, publish commitments, build the package, review the transaction,
 approve that exact review, prove and broadcast, then verify it on chain. The
 review panel uses the Rust signer's verified transaction fields, not the
 proposal's annotation. Each member runs these controls in their own private
-signer window. **Refresh payments** uploads queued proposals and this member's
-authenticated signing messages, polls the relays, and imports messages for this
-member. The separate dashboard has no payment approval route. A local approval
+signer window. While the profile is unlocked, the app's payment worker does every
+step that needs no decision, whether or not a page is open: it delivers queued
+proposals and this member's authenticated signing messages, polls the relays,
+imports messages for this member, commits nonces, builds the package, retries
+saved approvals and checks the chain, in one relay process per pass (every 2 s
+while a payment is in flight, every 3 s otherwise). It can never review, approve
+or send; those stay buttons in the signer window, and a frozen allowlist refuses
+them on the worker thread. Lock stops the worker within 5 s. The page only reads
+the saved payment list; **Check for updates** asks the worker for one pass now.
+The separate dashboard has no payment approval route. A local approval
 remains pending delivery until every saved signing message has relay storage; confirmation is checked again against this member's
-chain view whenever the payment list is shown. If a signer closed after saving
+chain view at most every 10 s: one block-hash lookup confirms the block it was
+mined in is still on the chain, and the full verify runs again only after a reorg. If a signer closed after saving
 an approval, **Retry saved signing messages** republishes the same sealed share;
 it never creates another signature share.
 
@@ -253,8 +273,12 @@ the backup gate, relay connection, both transaction review panels, two approvals
 the third member's Send action, and confirmation in all three windows. Members
 discover the mined txid from its input nullifiers and then verify its exact
 approved effects; confirmation does not depend on the finisher announcing a txid.
-The chain lookup scans blocks from the proposal height on each pending check and
-is a test path, not the indexed sync a released wallet needs.
+Each member keeps a sealed scan cache (`chain/scan.sealed`, keyed by the vault's
+viewing key) with the notes, spends and block hashes it has scanned, so later
+scans read only new blocks; a cache that fails to open or no longer matches the
+chain is discarded and the scan starts over. The spend index answers the mined
+lookup without rereading blocks. It is still a regtest scan over RPC, not the
+light-client sync a released wallet needs.
 
 These tests run three private processes on one host and three relays under one
 test operator. They do not prove physical-device operation or independent relay
@@ -271,7 +295,7 @@ non-resumable DKG are development controls, not the planned relay transport.
 Data roots created by the previous one-vault app are left untouched and need an
 explicit migration before this version can open them; use a fresh root to test it.
 Separate directories under one OS account do not isolate a compromised account.
-There is no persistent chain cache or passkey UI in this app yet; use the existing
+There is no passkey UI in this app yet; use the existing
 separate-member CLI and harness for transaction testing. Do not use real funds.
 
 Verify the member flow:

@@ -51,6 +51,40 @@ async function run() {
       assert.deepEqual(errors, []);
       await page.close();
     }
+    const joiner = await browser.newPage();
+    const joinerErrors = [];
+    joiner.on('pageerror', error => joinerErrors.push(error.message));
+    const joinedVault = '2'.repeat(64);
+    const fingerprint = 'c'.repeat(64);
+    await joiner.route('http://127.0.0.1:18801/**', async route => {
+      const url = new URL(route.request().url());
+      if (!url.pathname.startsWith('/api/')) {
+        const file = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
+        return route.fulfill({body: await fs.readFile(path.join(__dirname, file)),
+          contentType: file.endsWith('.js') ? 'text/javascript' : file.endsWith('.css') ? 'text/css' : 'text/html'});
+      }
+      let result = {};
+      if (url.pathname === '/api/status') result = url.searchParams.has('vault')
+        ? {phase: 'compare_roster', setup_phase: 'roster_proposed', name: 'Joined vault', vault: joinedVault, slot: 2,
+           threshold: 2, total_members: 3, members: 3, missing_slots: [], transport: 'hosted', handoff: 'pending',
+           fingerprint, confirmations: [1, 2, 3].map(slot => ({slot, confirmed: false, matches: true})),
+           profile: {name: 'Bob'}, relay_setup: {phase: 'waiting', detail: 'Connecting hosted relays automatically.'},
+           funding: {available: false, phase: 'unavailable'}, invites: []}
+        : {phase: 'home', profile: {name: 'Bob'}, vaults: [{name: 'Joined vault', vault: joinedVault, slot: 2, threshold: 2, members: 3}],
+           relay_network: {transport: 'hosted', enabled: true, detail: 'Connecting automatically.'}};
+      else if (url.pathname === '/api/payments') result = {payments: []};
+      else if (url.pathname === '/api/session/pending') result = {requests: []};
+      else if (url.pathname === '/api/session/actions') result = {actions: []};
+      return route.fulfill({json: result});
+    });
+    await joiner.goto('http://127.0.0.1:18801/#test-token');
+    await joiner.locator('.vault-row').filter({hasText: 'Joined vault'}).click();
+    await joiner.waitForFunction(() => document.getElementById('headline').textContent === 'Compare the roster fingerprint');
+    assert.equal(await joiner.locator('#fingerprint').textContent(), fingerprint);
+    assert.equal(await joiner.locator('#agree').isVisible(), true);
+    assert.equal(await joiner.getByRole('button', {name: 'Create group keys'}).isVisible(), true);
+    assert.deepEqual(joinerErrors, []);
+    await joiner.close();
     const operator = await browser.newPage();
     const localVault = 'a'.repeat(64);
     let peerCount = 2;
@@ -105,7 +139,7 @@ async function run() {
     assert.equal(await dashboard.getByRole('button', {name: /Fund Vault/}).count(), 0);
     assert.match(await dashboard.locator('#vault-list').textContent(), /2 of 4/);
     assert.match(await dashboard.locator('#vault-list').textContent(), /Waiting for members 3/);
-    console.log('PASS: both hosted policies, pending member, automatic activation, reopening, and no local controls');
+    console.log('PASS: both hosted policies, joiner roster comparison, pending member, automatic activation, reopening, and no local controls');
   } finally { await browser.close(); }
 }
 run().catch(error => { console.error(error); process.exitCode = 1; });

@@ -15,6 +15,7 @@
 //! an isolated patch to vendored orchard; see vendor/README.md.
 
 pub mod candidate;
+pub mod chain_cache;
 #[cfg(test)]
 mod coordinator;
 pub mod distributed_setup;
@@ -30,6 +31,7 @@ pub mod relay_member;
 pub mod rpc;
 pub mod scan;
 pub mod scanstate;
+pub mod seal_kdf;
 pub mod setup_transport;
 pub mod setup_ceremony;
 pub mod signing_session;
@@ -250,6 +252,9 @@ mod checkpoint_1 {
 
 #[cfg(feature = "relay-communication")]
 pub mod setup_relay;
+
+#[cfg(feature = "relay-communication")]
+pub mod member_service;
 
 #[cfg(feature = "relay-communication")]
 pub(crate) mod setup_backup;

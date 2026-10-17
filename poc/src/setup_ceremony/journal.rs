@@ -1,4 +1,3 @@
-use argon2::Argon2;
 use chacha20poly1305::{
     aead::{Aead, Payload},
     KeyInit, XChaCha20Poly1305, XNonce,
@@ -159,10 +158,7 @@ pub(crate) fn lock_file(path: &Path) -> Result<MemberLock, String> {
     })
 }
 fn cipher(passphrase: &str, salt: &[u8]) -> Result<XChaCha20Poly1305, String> {
-    let mut key = Zeroizing::new([0u8; 32]);
-    Argon2::default()
-        .hash_password_into(passphrase.as_bytes(), salt, &mut *key)
-        .map_err(|_| ERROR)?;
+    let key = crate::seal_kdf::derive(passphrase, salt).map_err(|_| ERROR)?;
     Ok(XChaCha20Poly1305::new_from_slice(&*key).map_err(|_| ERROR)?)
 }
 fn temporary_final(name: &str) -> Option<String> {
