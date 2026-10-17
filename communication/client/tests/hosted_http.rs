@@ -161,7 +161,7 @@ fn operator_bundle_trust_and_routes() {
 #[test]
 fn operator_bundle_rejects_unusable_authenticated_config() {
     let signer = SigningKey::from_bytes(&[9; 32]);
-    for case in 0..7 {
+    for case in 0..8 {
         let raw = bundle(&signer, |fields| match case {
             0 => fields[0] = Value::Integer(2.into()),
             1 => {
@@ -186,6 +186,18 @@ fn operator_bundle_rejects_unusable_authenticated_config() {
                 }
             }
             6 => fields.push(Value::Null),
+            7 => {
+                if let Value::Array(routes) = &mut fields[1] {
+                    let Value::Array(first) = &routes[0] else {
+                        unreachable!()
+                    };
+                    let run = first[1].clone();
+                    let Value::Array(second) = &mut routes[1] else {
+                        unreachable!()
+                    };
+                    second[1] = run;
+                }
+            }
             _ => unreachable!(),
         });
         assert!(
