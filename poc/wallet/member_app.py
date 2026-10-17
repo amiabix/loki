@@ -34,6 +34,7 @@ SETUP = HERE.parent / "target" / "debug" / "loki_setup_member"
 PAYMENT = HERE.parent / "target" / "debug" / "loki_member_payment"
 RELAY = HERE.parent / "target" / "debug" / "loki_relay_member"
 SEED_WALLET = HERE.parent / "target" / "debug" / "loki_seed_wallet"
+WALLET_SYNC = HERE.parent / "target" / "debug" / "loki_wallet_sync"
 
 # A peer's message that has not arrived yet, or a broadcast the node has not mined
 # yet, is a normal outcome of asking too early rather than a failure to report.
@@ -370,10 +371,11 @@ class SignerSessions:
 
 
 class Wallet:
-    def __init__(self, data, exchange, setup=SETUP, invite_origin=None, transport="local", operator_bundle=None, operator_key=None, enrollment_grant=None, development_http=False, enrollment_issuer=None, network="regtest"):
+    def __init__(self, data, exchange, setup=SETUP, invite_origin=None, transport="local", operator_bundle=None, operator_key=None, enrollment_grant=None, development_http=False, enrollment_issuer=None, network="regtest", lightwalletd_url=None):
         if network not in ("regtest", "testnet"):
             raise ValueError("Choose regtest or testnet")
         self.network = network
+        self.lightwalletd_url = lightwalletd_url
         self.data = data.resolve()
         self.exchange = exchange.resolve()
         if self.data == self.exchange or self.data in self.exchange.parents or self.exchange in self.data.parents:
@@ -1199,11 +1201,23 @@ class Wallet:
 
     def balance(self, vault):
         member_dir, _ = self.vault_dir(vault)
-        result = json.loads(self.command("balance", member_dir, "@pass", member_dir / "roster.json",
-                                         binary=PAYMENT, timeout=120))
+        if self.network == "testnet":
+            if not self.lightwalletd_url:
+                raise ValueError("Set --lightwalletd-url to scan this Testnet vault")
+            self.scan_height.pop(vault, None)
+            result = json.loads(self.command(member_dir, "@pass", member_dir / "roster.json",
+                                             self.lightwalletd_url, binary=WALLET_SYNC, timeout=600))
+            if result.get("network") != "testnet" or type(result.get("height")) is not int \
+                    or type(result.get("chain_tip")) is not int or not 0 <= result["height"] <= result["chain_tip"] \
+                    or type(result.get("balance_zat")) is not int or result["balance_zat"] < 0:
+                raise ValueError("Wallet sync returned an invalid Testnet balance")
+            result["scan_ready"] = result["height"] == result["chain_tip"]
+        else:
+            result = json.loads(self.command("balance", member_dir, "@pass", member_dir / "roster.json",
+                                             binary=PAYMENT, timeout=120))
+            self.scan_height[vault] = result.get("height")
         if result.get("vault") != vault:
             raise ValueError("Chain scan returned another vault")
-        self.scan_height[vault] = result.get("height")
         return result
 
     def fund_vault(self, vault, request_id):
@@ -1544,7 +1558,16 @@ class Wallet:
         _, local, _, manifest = self.payment(vault, attempt)
         if local["slot"] not in selected_signers(manifest, local.get("threshold", 2), local["members"]):
             raise ValueError("This member is not in the selected signer set")
-        if self.balance(vault)["height"] >= manifest["expiry_height"]:
+        if self.network == "testnet":
+            member_dir, _ = self.vault_dir(vault)
+            chain = json.loads(self.command("balance", member_dir, "@pass", member_dir / "roster.json",
+                                            binary=PAYMENT, timeout=120))
+            if chain.get("vault") != vault:
+                raise ValueError("Payment chain scan returned another vault")
+            self.scan_height[vault] = chain["height"]
+        else:
+            chain = self.balance(vault)
+        if chain["height"] >= manifest["expiry_height"]:
             raise ValueError("This payment has expired on this member's chain view")
         _, work, _, _ = self.payment_command("commit", vault, attempt)
         self.payment_status(work, "commitments")
@@ -2152,6 +2175,7 @@ def serve(wallet, port, dashboard_port=None, invite_port=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="One member's vault app")
     parser.add_argument("--network", choices=("regtest", "testnet"), default="regtest")
+    parser.add_argument("--lightwalletd-url", help="HTTPS Testnet lightwalletd endpoint for the persistent vault scan")
     parser.add_argument("--data", type=Path, required=True, help="private directory for this member only")
     parser.add_argument("--exchange", type=Path, required=True, help="shared untrusted local setup courier")
     parser.add_argument("--port", type=int, required=True)
@@ -2182,5 +2206,6 @@ if __name__ == "__main__":
     serve(Wallet(args.data, args.exchange, invite_origin=origin, transport=args.transport,
                  operator_bundle=args.operator_bundle, operator_key=args.operator_key,
                  enrollment_grant=args.enrollment_grant, development_http=args.development_http,
-                 enrollment_issuer=args.enrollment_issuer, network=args.network), args.port,
+                 enrollment_issuer=args.enrollment_issuer, network=args.network,
+                 lightwalletd_url=args.lightwalletd_url), args.port,
           args.dashboard_port, args.invite_port)

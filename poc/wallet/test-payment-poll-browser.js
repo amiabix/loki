@@ -14,6 +14,7 @@ async function run() {
     const address = 'utest1' + 'q'.repeat(105);
     let relayFailure = true;
     let paymentReady = false;
+    let balanceFailure = false;
     await page.route('http://127.0.0.1:18801/**', async route => {
       const url = new URL(route.request().url());
       if (!url.pathname.startsWith('/api/')) {
@@ -36,6 +37,9 @@ async function run() {
       else if (url.pathname === '/api/session/pending') result = {requests: []};
       else if (url.pathname === '/api/session/actions') result = {actions: []};
       else if (url.pathname === '/api/address') result = {address};
+      else if (url.pathname === '/api/balance') result = balanceFailure
+        ? {error: 'lightwalletd unavailable'}
+        : {network: 'testnet', balance_zat: 400000, height: 4500010, chain_tip: 4500012, scan_ready: false};
       else if (url.pathname === '/api/payment-sync' && relayFailure) result = {error: 'member_sealed', surface: 'payment-sync', retry: false};
       return route.fulfill({json: result, status: result.error ? 400 : 200});
     });
@@ -59,6 +63,14 @@ async function run() {
     assert.match(await status.textContent(), /relay configuration/i);
     assert.doesNotMatch(await status.textContent(), /member_sealed/);
     assert.equal(await page.locator('#address').textContent(), address);
+    await page.getByRole('button', {name: 'Refresh balance'}).click();
+    await page.waitForFunction(() => document.getElementById('balance').textContent.includes('4500012'));
+    assert.match(await page.locator('#balance').textContent(), /0.00400000 ZEC.*4500010.*4500012/);
+    balanceFailure = true;
+    await page.getByRole('button', {name: 'Refresh balance'}).click();
+    await page.waitForFunction(() => document.getElementById('balance').textContent.includes('Scan failed'));
+    assert.match(await page.locator('#balance').textContent(), /Scan failed.*lightwalletd unavailable/);
+    assert.doesNotMatch(await page.locator('#balance').textContent(), /0.00400000 ZEC/);
     relayFailure = false;
     await page.getByRole('button', {name: 'Check for updates'}).click();
     await page.waitForFunction(() => !pumping);
@@ -66,6 +78,7 @@ async function run() {
     paymentReady = true;
     await page.getByRole('button', {name: 'Check for updates'}).click();
     await page.getByRole('button', {name: 'Send this payment'}).waitFor();
+    assert.match(await page.locator('#payment-list').textContent(), /Payment chain scan reached block 104/);
     assert.deepEqual(errors, []);
     console.log('PASS: payment relay errors stay beside payments; receiving and retry remain available');
   } finally { await browser.close(); }

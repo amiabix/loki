@@ -82,12 +82,22 @@ async fn sync(args: &[String]) -> Result<(), String> {
         .scanned_height()?
         .ok_or("wallet did not scan any blocks")?;
     let balance = wallet.ironwood_balance_zat()?;
+    let chain_tip = client
+        .get_lightd_info(Empty {})
+        .await
+        .map_err(|e| format!("lightwalletd info after scan: {e}"))?
+        .into_inner()
+        .block_height;
+    if chain_tip < u64::from(height) {
+        return Err("lightwalletd tip is behind the scanned wallet".into());
+    }
     println!(
         "{}",
         serde_json::json!({
             "vault": hex::encode(member.vault),
             "network": "testnet",
             "height": height,
+            "chain_tip": chain_tip,
             "balance_zat": balance,
         })
     );
