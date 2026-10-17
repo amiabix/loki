@@ -30,7 +30,7 @@ async function run() {
           : {phase: 'home', network: 'testnet', profile: {name: 'Alice'}, vaults: [{name: 'Gold', vault, slot: 1, threshold: 2, members: 3}]};
       } else if (url.pathname === '/api/payments') result = paymentReady
         ? {payments: [{attempt: 'b'.repeat(64), payment: 'c'.repeat(64),
-            pair: [2, 3], phase: 'received', ready_to_send: true}],
+            signers: [2, 3], phase: 'received', ready_to_send: true}],
            readiness: {relay_ready: true, relay_detail: 'Relay reachable.', scan_height: 104}}
         : {payments: []};
       else if (url.pathname === '/api/session/pending') result = {requests: []};

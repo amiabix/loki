@@ -25,6 +25,7 @@ const SEAL_HEADER: usize = 49;
 pub struct LoadedMember {
     pub identity: CommIdentity,
     pub roster: Roster,
+    pub threshold: u16,
 }
 pub type MemberResult<T> = Result<T, MemberError>;
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -234,15 +235,10 @@ fn hex32(value: &Value) -> MemberResult<[u8; 32]> {
     Ok(bytes)
 }
 fn roster(value: &Value) -> MemberResult<Roster> {
-    if value
-        .get("threshold")
-        .is_some_and(|threshold| threshold.as_u64() != Some(2))
-    {
-        return Err(MemberError::Roster);
-    }
     let vault = hex32(&value["vault"])?;
     let entries = value["members"].as_array().ok_or(MemberError::Roster)?;
-    if !matches!(entries.len(), 3 | 4) {
+    let threshold = value.get("threshold").map(Value::as_u64).unwrap_or(Some(2));
+    if !matches!((threshold, entries.len()), (Some(2), 3) | (Some(2), 4) | (Some(3), 4)) {
         return Err(MemberError::Roster);
     }
     let mut members = Vec::with_capacity(entries.len());
@@ -313,7 +309,7 @@ pub fn load(root: &Path, pass_file: &Path, roster_path: &Path) -> MemberResult<L
     if state.0["network"].as_str() != Some(certified.network.label())
         || state.0.get("birth_height").and_then(Value::as_u64)
             != certified.birth_height.map(u64::from)
-        || certified.threshold != 2
+        || !matches!((certified.threshold, certified.members.len()), (2, 3) | (2, 4) | (3, 4))
         || certified.vault != roster.vault
         || certified.members.len() != roster.members.len()
         || roster.members.iter().any(|member| {
@@ -330,7 +326,7 @@ pub fn load(root: &Path, pass_file: &Path, roster_path: &Path) -> MemberResult<L
     if hex32(&state.0["roster_fingerprint"])? != certified.fingerprint() {
         return Err(MemberError::Fingerprint);
     }
-    if state.0.get("threshold").is_some_and(|value| value.as_u64() != Some(2))
+    if state.0.get("threshold").map(Value::as_u64).unwrap_or(Some(2)) != Some(u64::from(certified.threshold))
         || state.0.get("members").is_some_and(|value| value.as_u64() != Some(roster.members.len() as u64))
     {
         return Err(MemberError::Roster);
@@ -349,7 +345,7 @@ pub fn load(root: &Path, pass_file: &Path, roster_path: &Path) -> MemberResult<L
         return Err(MemberError::Identity);
     }
     roster_digest(&roster).map_err(|_| MemberError::Roster)?;
-    Ok(LoadedMember { identity, roster })
+    Ok(LoadedMember { identity, roster, threshold: certified.threshold })
 }
 
 pub mod config;

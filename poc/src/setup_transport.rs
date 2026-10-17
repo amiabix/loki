@@ -23,7 +23,6 @@ const SIGNATURE: usize = 64;
 const SESSION_MAGIC: &[u8; 8] = b"LOKISGN1";
 const SESSION_INNER: &[u8; 8] = b"LOKISGIP";
 const SESSION_HEADER: usize = 8 + 1 + 24 + 4;
-const SESSION_INNER_HEADER: usize = 150;
 const SESSION_LIMIT: usize = SESSION_HEADER + 8 * 1024 * 1024 + 16;
 
 pub struct Identity {
@@ -319,28 +318,29 @@ impl Identity {
     ) -> Result<Vec<u8>, String> {
         context.validate()?;
         if self.id == recipient.id
-            || !context.pair.contains(&self.id)
+            || !context.signers.contains(&self.id)
             || !(1..=4).contains(&recipient.id)
-            || (!context.pair.contains(&recipient.id)
+            || (!context.signers.contains(&recipient.id)
                 && !matches!(kind, MessageKind::Package | MessageKind::Share))
             || body.len() > kind.max_body()
         {
             return Err("invalid signing sender, recipient, or body size".into());
         }
-        let mut inner = Vec::with_capacity(SESSION_INNER_HEADER + body.len() + SIGNATURE);
+        let version = if context.signers.len() == 2 { 1 } else { 2 };
+        let mut inner = Vec::with_capacity(146 + context.signers.len() * 2 + body.len() + SIGNATURE);
         inner.extend_from_slice(SESSION_INNER);
-        inner.push(1);
+        inner.push(version);
         inner.extend_from_slice(&context.vault);
         inner.extend_from_slice(&context.payment);
         inner.extend_from_slice(&context.attempt.0);
-        for id in context.pair {
+        for &id in &context.signers {
             inner.extend_from_slice(&id.to_be_bytes());
         }
         inner.extend_from_slice(&self.id.to_be_bytes());
         inner.extend_from_slice(&recipient.id.to_be_bytes());
         inner.push(kind as u8);
         inner.extend_from_slice(&(body.len() as u32).to_be_bytes());
-        let transcript = session_transcript(&inner[..118], body);
+        let transcript = session_transcript(&inner, body, version);
         inner.extend_from_slice(&transcript);
         inner.extend_from_slice(body);
         inner.extend_from_slice(&self.signing.sign(&inner).to_bytes());
@@ -351,7 +351,7 @@ impl Identity {
         inner.resize(bucket, 0);
         let mut header = Vec::with_capacity(SESSION_HEADER);
         header.extend_from_slice(SESSION_MAGIC);
-        header.push(1);
+        header.push(version);
         let mut nonce = [0; 24];
         OsRng.fill_bytes(&mut nonce);
         header.extend_from_slice(&nonce);
@@ -403,11 +403,15 @@ impl Identity {
     ) -> Result<OpenedMessage, String> {
         context.validate()?;
         session_envelope(wire)?;
+        let version = if context.signers.len() == 2 { 1 } else { 2 };
+        let signers_end = 105 + context.signers.len() * 2;
+        let meta_end = signers_end + 9;
+        let inner_header = meta_end + 32;
         if sender.id == recipient
-            || !context.pair.contains(&sender.id)
+            || !context.signers.contains(&sender.id)
             || !(1..=4).contains(&recipient)
         {
-            return Err("sender or recipient outside signing pair".into());
+            return Err("sender or recipient outside signing attempt".into());
         }
         let key = self.session_key(box_peer, context)?;
         let inner = XChaCha20Poly1305::new(&key.into())
@@ -419,35 +423,35 @@ impl Identity {
                 },
             )
             .map_err(|_| "signing message is not for this member and attempt")?;
-        if inner.len() < SESSION_INNER_HEADER + SIGNATURE
+        if wire[8] != version
+            || inner.len() < inner_header + SIGNATURE
             || &inner[..8] != SESSION_INNER
-            || inner[8] != 1
+            || inner[8] != version
             || inner[9..41] != context.vault
             || inner[41..73] != context.payment
             || inner[73..105] != context.attempt.0
-            || inner[105..107] != context.pair[0].to_be_bytes()
-            || inner[107..109] != context.pair[1].to_be_bytes()
-            || inner[109..111] != sender.id.to_be_bytes()
-            || inner[111..113] != recipient.to_be_bytes()
+            || inner[105..signers_end] != context.signers.iter().flat_map(|id| id.to_be_bytes()).collect::<Vec<_>>()
+            || inner[signers_end..signers_end + 2] != sender.id.to_be_bytes()
+            || inner[signers_end + 2..signers_end + 4] != recipient.to_be_bytes()
         {
             return Err("signing inner context mismatch".into());
         }
-        let kind = MessageKind::try_from(inner[113])?;
-        if !context.pair.contains(&recipient)
+        let kind = MessageKind::try_from(inner[signers_end + 4])?;
+        if !context.signers.contains(&recipient)
             && !matches!(kind, MessageKind::Package | MessageKind::Share)
         {
-            return Err("third member may receive only package or share copies".into());
+            return Err("non-signer may receive only package or share copies".into());
         }
-        let size = u32::from_be_bytes(inner[114..118].try_into().unwrap()) as usize;
-        if size > kind.max_body() || SESSION_INNER_HEADER + size + SIGNATURE > inner.len() {
+        let size = u32::from_be_bytes(inner[signers_end + 5..meta_end].try_into().unwrap()) as usize;
+        if size > kind.max_body() || inner_header + size + SIGNATURE > inner.len() {
             return Err("invalid signing body length".into());
         }
-        let body = &inner[SESSION_INNER_HEADER..SESSION_INNER_HEADER + size];
-        let transcript = session_transcript(&inner[..118], body);
-        if inner[118..150] != transcript {
+        let body = &inner[inner_header..inner_header + size];
+        let transcript = session_transcript(&inner[..meta_end], body, version);
+        if inner[meta_end..inner_header] != transcript {
             return Err("signing transcript mismatch".into());
         }
-        let signed_end = SESSION_INNER_HEADER + size;
+        let signed_end = inner_header + size;
         let signature = ed25519_dalek::Signature::from_bytes(
             inner[signed_end..signed_end + SIGNATURE]
                 .try_into()
@@ -485,12 +489,12 @@ impl Identity {
         }
         let mut hash = Params::new()
             .hash_length(32)
-            .personal(b"Loki_Sign_Box_v1")
+            .personal(if context.signers.len() == 2 { b"Loki_Sign_Box_v1" } else { b"Loki_Sign_Box_v2" })
             .to_state();
         hash.update(&context.vault);
         hash.update(&context.payment);
         hash.update(&context.attempt.0);
-        for id in context.pair {
+        for &id in &context.signers {
             hash.update(&id.to_be_bytes());
         }
         hash.update(shared.as_bytes());
@@ -498,8 +502,8 @@ impl Identity {
     }
 }
 
-fn session_transcript(meta: &[u8], body: &[u8]) -> [u8; 32] {
-    let mut hash = blake3::Hasher::new_derive_key("Loki signing message transcript v1");
+fn session_transcript(meta: &[u8], body: &[u8], version: u8) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new_derive_key(if version == 1 { "Loki signing message transcript v1" } else { "Loki signing message transcript v2" });
     hash.update(meta);
     hash.update(body);
     hash.finalize().into()
@@ -510,7 +514,7 @@ pub fn session_envelope(wire: &[u8]) -> Result<(), String> {
     if wire.len() < SESSION_HEADER + 1024 + 16
         || wire.len() > SESSION_LIMIT
         || &wire[..8] != SESSION_MAGIC
-        || wire[8] != 1
+        || !matches!(wire[8], 1 | 2)
     {
         return Err("invalid signing envelope or version".into());
     }

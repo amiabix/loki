@@ -20,7 +20,7 @@ def run(argv, env, timeout=180):
     return result.stdout.strip()
 
 
-def create_vault(root, vault_id, setup, env, member_count=3):
+def create_vault(root, vault_id, setup, env, member_count=3, threshold=2):
     root.mkdir(mode=0o700)
     exchange = root / "exchange"
     exchange.mkdir()
@@ -36,7 +36,7 @@ def create_vault(root, vault_id, setup, env, member_count=3):
         members.append((owner, password))
     roster = root / "roster.json"
     roster.write_text(json.dumps({"vault": f"{vault_id:02x}" * 32,
-                                  "threshold": 2, "members": publics}))
+                                  "threshold": threshold, "members": publics}))
     fingerprint = run([setup, "fingerprint", roster], env)
     with concurrent.futures.ThreadPoolExecutor(max_workers=member_count) as pool:
         futures = [pool.submit(run, [setup, "run", owner, password, roster, exchange, fingerprint], env)
@@ -65,18 +65,23 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--name", required=True, help="already running THS instance")
     parser.add_argument("--state", type=pathlib.Path, required=True, help="new, private test directory")
-    parser.add_argument("--manual", action="store_true", help="prepare, then print commands for two human signers")
+    parser.add_argument("--manual", action="store_true", help="prepare, then print commands for the selected signers")
     parser.add_argument("--members", type=int, choices=(3, 4), default=3,
-                        help="number of vault members; two approvals required")
+                        help="number of vault members")
+    parser.add_argument("--threshold", type=int, choices=(2, 3), default=2,
+                        help="number of approvals required; three requires four members")
     parser.add_argument("--stage", choices=("all", "setup", "fund", "prepare"), default="all",
                         help="run one step for the local member UI")
-    parser.add_argument("--pair", choices=("AB", "AC", "AD", "BC", "BD", "CD"), default="AB", help="members who approve this payment")
+    parser.add_argument("--pair", "--signers", choices=("AB", "AC", "AD", "BC", "BD", "CD", "ABC", "ABD", "ACD", "BCD"),
+                        help="selected members who approve this payment")
     parser.add_argument("--proposer", type=int, default=1, help="member creating the payment")
     parser.add_argument("--recipient", help="recipient unified address; defaults to the local test recipient")
     parser.add_argument("--finisher", type=int, help="member who proves and sends; defaults to a non-signer")
     parser.add_argument("--amount-zat", type=int, default=40_000_000, help="regtest payment amount")
     parser.add_argument("--memo", default="separate member payment", help="shielded payment memo")
     args = parser.parse_args()
+    if args.stage in ("all", "setup") and (args.threshold, args.members) not in ((2, 3), (2, 4), (3, 4)):
+        parser.error("supported policies are 2-of-3, 2-of-4, and 3-of-4")
     if not 0 < args.amount_zat < 100_000_000:
         parser.error("amount must be between 1 and 99,999,999 zat")
     if not args.memo or len(args.memo.encode()) > 512:
@@ -101,12 +106,12 @@ def main():
 
     if args.stage in ("all", "setup"):
         member_count = args.members
-        members, roster, vault = create_vault(root / "source", 7, setup, env, member_count)
-        recipient_members, recipient_roster, recipient_address = create_vault(root / "recipient", 8, setup, env, member_count)
+        members, roster, vault = create_vault(root / "source", 7, setup, env, member_count, args.threshold)
+        recipient_members, recipient_roster, recipient_address = create_vault(root / "recipient", 8, setup, env, member_count, args.threshold)
         if vault == recipient_address:
             raise RuntimeError("recipient has the sender's address")
         (root / "vaults.json").write_text(json.dumps({"source": vault, "recipient": recipient_address,
-                                                       "members": member_count, "funded": False}))
+                                                       "members": member_count, "threshold": args.threshold, "funded": False}))
         print("activated source and independent recipient vaults", flush=True)
         print(f"Source vault: {vault}", flush=True)
         print(f"Independent recipient: {recipient_address}", flush=True)
@@ -115,6 +120,7 @@ def main():
     else:
         vaults = json.loads((root / "vaults.json").read_text())
         member_count = vaults.get("members", 3)
+        args.threshold = vaults.get("threshold", 2)
         vault, recipient_address = vaults["source"], vaults["recipient"]
         members = [(root / "source" / f"member-{number}", root / "source" / f"member-{number}" / "pass.txt")
                    for number in range(1, member_count + 1)]
@@ -127,13 +133,16 @@ def main():
             raise RuntimeError("source vault is already funded")
         chain.fund(vault, 1)
         (root / "vaults.json").write_text(json.dumps({"source": vault, "recipient": recipient_address,
-                                                       "members": member_count, "funded": True}))
+                                                       "members": member_count, "threshold": args.threshold, "funded": True}))
         print("funded source vault on THS", flush=True)
         if args.stage == "fund":
             return
     elif not vaults["funded"]:
         raise RuntimeError("fund the source vault before preparing a payment")
 
+    args.pair = args.pair or ("ABC" if args.threshold == 3 else "AB")
+    if len(args.pair) != args.threshold or any(ord(c) - ord("A") + 1 > member_count for c in args.pair):
+        parser.error("the selected signers must match the vault policy")
     recovered_number = ord(args.pair[0]) - ord("A") + 1
     recovered = root / f"recovered-member-{recovered_number}"
     recovered.mkdir(mode=0o700)
@@ -161,9 +170,10 @@ def main():
     owner, password = members[args.proposer - 1]
     run([pay, "prepare", owner, password, roster, work, destination, str(args.amount_zat), args.memo, args.pair], env)
     manifest = json.loads((work / "payment.json").read_text())
-    signers = [members[number - 1] for number in manifest["pair"]]
+    signer_ids = manifest.get("signers", manifest.get("pair"))
+    signers = [members[number - 1] for number in signer_ids]
     finisher_id = args.finisher or next(number for number in range(1, member_count + 1)
-                                       if number not in manifest["pair"])
+                                       if number not in signer_ids)
     if finisher_id not in range(1, member_count + 1):
         parser.error("finisher is outside this vault")
     finisher = members[finisher_id - 1]
@@ -177,9 +187,9 @@ def main():
             f"Payment recipient: {destination}",
             f"Proposer: member {args.proposer}",
             f"Payment ID: {manifest['payment']}",
-            "Run the next two commands at the same time in separate terminals. Read each review, then type its exact APPROVE prompt:",
+            f"Run the next {args.threshold} commands at the same time in separate terminals. Read each review, then type its exact APPROVE prompt:",
             *(command([pay, "sign", *signer, roster, work]) for signer in signers),
-            "After both say approved, run:",
+            f"After all {args.threshold} say approved, run:",
             command([pay, "finish", *finisher, roster, work]),
             "Copy the txid from the finish output, then run:",
             shlex.join(["ths", "--name", args.name, "mine", "3"]),
@@ -202,8 +212,8 @@ def main():
             raise RuntimeError(f"member {number}: {result.stderr.strip()}\n{result.stdout.strip()}")
         return result.stdout.strip()
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [pool.submit(sign, number) for number in manifest["pair"]]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.threshold) as pool:
+        futures = [pool.submit(sign, number) for number in signer_ids]
         for future in futures:
             print(future.result().splitlines()[-1], flush=True)
 

@@ -3,12 +3,12 @@ use std::collections::BTreeMap;
 
 #[test]
 fn checkpoint_restores_exact_dkg_packages_for_both_policies() {
-    for count in [3u16, 4] {
+    for (threshold, count) in [(2, 3u16), (2, 4), (3, 4)] {
         let mut live = BTreeMap::new();
         let mut restored = BTreeMap::new();
         let mut round1 = BTreeMap::new();
         for id in 1..=count {
-            let (member, public) = Member::start_with_policy(id, 2, count).unwrap();
+            let (member, public) = Member::start_with_policy(id, threshold, count).unwrap();
             let checkpoint = member.checkpoint().unwrap();
             let recovered = Member::restore_checkpoint(&checkpoint).unwrap();
             assert_eq!(&*checkpoint, &*recovered.checkpoint().unwrap());
@@ -56,7 +56,7 @@ fn checkpoint_restores_exact_dkg_packages_for_both_policies() {
                 let peer = *shares.keys().find(|peer| **peer != own).unwrap();
                 shares.insert(peer, shares[&own]);
                 let changed =
-                    frost::keys::PublicKeyPackage::new(shares, *public.verifying_key(), Some(2))
+                    frost::keys::PublicKeyPackage::new(shares, *public.verifying_key(), Some(threshold))
                         .serialize()
                         .unwrap();
                 let mut corrupt = bytes[..public_offset].to_vec();
@@ -109,9 +109,9 @@ fn accepted_core_roster_requires_every_slot_and_exact_policy_signatures() {
     use loki_poc::{
         member_state::Roster, setup_ceremony::AcceptedCeremonyRoster, setup_transport::Identity,
     };
-    for count in [3u16, 4] {
+    for (threshold, count) in [(2u16, 3u16), (2, 4), (3, 4)] {
         let identities: Vec<_> = (1..=count).map(Identity::new).collect();
-        let document=serde_json::to_vec(&serde_json::json!({"vault":hex::encode([70;32]),"threshold":2,"members":identities.iter().map(|i|{let p=i.public();serde_json::json!({"id":p.id,"signing":hex::encode(p.signing),"encryption":hex::encode(p.encryption)})}).collect::<Vec<_>>()})).unwrap();
+        let document=serde_json::to_vec(&serde_json::json!({"vault":hex::encode([70;32]),"threshold":threshold,"members":identities.iter().map(|i|{let p=i.public();serde_json::json!({"id":p.id,"signing":hex::encode(p.signing),"encryption":hex::encode(p.encryption)})}).collect::<Vec<_>>()})).unwrap();
         let roster = Roster::from_bytes(&document).unwrap();
         let payload =
             AcceptedCeremonyRoster::agreement_payload(&roster, "regtest", &[77; 32]).unwrap();
@@ -202,13 +202,13 @@ fn ceremony_restarts_every_complete_phase_and_preserves_saved_ciphertext() {
             })
         }
     }
-    for count in [3u16, 4] {
+    for (threshold, count) in [(2u16, 3u16), (2, 4), (3, 4)] {
         let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "loki-engine-{}",
             hex::encode(Identity::new(1).public().signing)
         ));
         let identities: Vec<_> = (1..=count).map(Identity::new).collect();
-        let document=serde_json::to_vec(&serde_json::json!({"vault":hex::encode([78;32]),"threshold":2,"members":identities.iter().map(|i|{let p=i.public();serde_json::json!({"id":p.id,"signing":hex::encode(p.signing),"encryption":hex::encode(p.encryption)})}).collect::<Vec<_>>()})).unwrap();
+        let document=serde_json::to_vec(&serde_json::json!({"vault":hex::encode([78;32]),"threshold":threshold,"members":identities.iter().map(|i|{let p=i.public();serde_json::json!({"id":p.id,"signing":hex::encode(p.signing),"encryption":hex::encode(p.encryption)})}).collect::<Vec<_>>()})).unwrap();
         let payload = AcceptedCeremonyRoster::agreement_payload(
             &Roster::from_bytes(&document).unwrap(),
             "regtest",
@@ -323,6 +323,8 @@ fn ceremony_restarts_every_complete_phase_and_preserves_saved_ciphertext() {
         for id in 1..=count {
             let engine = engines.get_mut(&id).unwrap();
             let state = engine.certified_vault_state().unwrap();
+            let state_json: serde_json::Value = serde_json::from_slice(&state).unwrap();
+            assert_eq!(state_json["threshold"], threshold);
             let before = engine.checkpoint();
             let premature = (1..=count).map(|slot| (slot, vec![slot as u8; 32]))
                 .collect::<BTreeMap<_, _>>();

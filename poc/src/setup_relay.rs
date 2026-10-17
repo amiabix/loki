@@ -241,7 +241,7 @@ impl Context {
             if invite.slot() != self.own_slot
                 || policy.member_count != self.count
                 || VaultNetwork::parse(&policy.network).is_err()
-                || policy.threshold != 2
+                || !matches!((policy.threshold, policy.member_count), (2, 3) | (2, 4) | (3, 4))
                 || policy.config_digest != *operators.digest()
                 || invite.bootstrap_descriptor().is_none()
                 || request.device != identity.public()
@@ -282,7 +282,7 @@ impl Context {
         };
         if *ceremony == [0; 32]
             || VaultNetwork::parse(network).is_err()
-            || *threshold != 2
+            || !matches!((*threshold, *member_count), (2, 3) | (2, 4) | (3, 4))
             || *member_count != self.count
             || config_digest != operators.digest()
             || *grant_digest != <[u8; 32]>::from(Sha256::digest(&*self.grant))
@@ -477,7 +477,10 @@ impl Inventory {
                         AdmissionCommand::Create { network, .. } => network.clone(),
                         _ => return Err(ERROR.into()),
                     },
-                    threshold: 2,
+                    threshold: match &creation.command {
+                        AdmissionCommand::Create { threshold, .. } => *threshold,
+                        _ => return Err(ERROR.into()),
+                    },
                     member_count: context.count,
                     config_digest: *operators.digest(),
                 };
@@ -538,6 +541,7 @@ pub fn install_payment_configuration(
 pub struct SetupStatus {
     own_slot: u16,
     phase: &'static str,
+    threshold: u16,
     count: u16,
     joined: Vec<u16>,
     agreed: Option<[u8; 32]>,
@@ -546,7 +550,7 @@ pub struct SetupStatus {
 }
 impl SetupStatus {
     pub fn public_json(&self) -> ValueJson {
-        serde_json::json!({"phase":self.phase,"policy":format!("2-of-{}",self.count),"own_slot":self.own_slot,
+        serde_json::json!({"phase":self.phase,"policy":format!("{}-of-{}",self.threshold,self.count),"own_slot":self.own_slot,
             "joined_slots":self.joined,
             "missing_slots":self.waiting.clone().unwrap_or_else(|| (1..=self.count).filter(|slot| !self.joined.contains(slot)).collect::<Vec<_>>()),"agreed_fingerprint":self.agreed.map(hex::encode),
             "retryable":self.retryable,"handoff":if self.phase == "active" { "ready" } else { "pending" }})
@@ -611,6 +615,7 @@ impl CachedStatus {
         let count = match self.policy.as_str() {
             "2-of-3" => 3,
             "2-of-4" => 4,
+            "3-of-4" => 4,
             _ => return Err("setup_status".into()),
         };
         if !(1..=count).contains(&self.own_slot)
@@ -688,6 +693,7 @@ impl CachedStatus {
 pub struct HostedSetup {
     root: PathBuf,
     context: Context,
+    threshold: u16,
     operators: OperatorSet,
     identity: CommIdentity,
     journal: Journal,
@@ -709,7 +715,20 @@ impl HostedSetup {
         network: &str,
         development: bool,
     ) -> Result<Self, String> {
-        if !matches!(count, 3 | 4)
+        Self::create_with_policy(root, passphrase, bundle, key, grant, 2, count, network, development)
+    }
+    pub fn create_with_policy(
+        root: &Path,
+        passphrase: &str,
+        bundle: &[u8],
+        key: &[u8; 32],
+        grant: &[u8],
+        threshold: u16,
+        count: u16,
+        network: &str,
+        development: bool,
+    ) -> Result<Self, String> {
+        if !matches!((threshold, count), (2, 3) | (2, 4) | (3, 4))
             || VaultNetwork::parse(network).is_err()
             || grant.is_empty()
             || grant.len() > 4096
@@ -736,6 +755,7 @@ impl HostedSetup {
             if existing.context.bundle != bundle
                 || existing.context.key != *key
                 || existing.context.count != count
+                || existing.policy()?.threshold != threshold
                 || existing.policy()?.network != network
                 || existing.context.development != development
                 || existing.context.grant.as_slice() != grant
@@ -751,7 +771,7 @@ impl HostedSetup {
             command: AdmissionCommand::Create {
                 ceremony: random(),
                 network: network.into(),
-                threshold: 2,
+                threshold,
                 member_count: count,
                 config_digest: *operators.digest(),
                 grant_digest: Sha256::digest(grant).into(),
@@ -812,7 +832,7 @@ impl HostedSetup {
         let invite = verified_invite(invitation, bundle, key, development, now)?;
         let policy = invite.context().policy();
         if policy.network != expected_network
-            || policy.threshold != 2
+            || !matches!((policy.threshold, policy.member_count), (2, 3) | (2, 4) | (3, 4))
             || invite.bootstrap_descriptor().is_none()
             || invitation.len() > 4096
         {
@@ -901,7 +921,14 @@ impl HostedSetup {
         lock: MemberLock,
     ) -> Result<Self, String> {
         let operators = context.operators()?;
-        context.request(&identity, &operators)?;
+        let request = context.request(&identity, &operators)?;
+        let threshold = match request.command {
+            AdmissionCommand::Create { threshold, .. } => threshold,
+            AdmissionCommand::Claim { .. } => verified_invite(
+                &context.grant, &context.bundle, &context.key, context.development, 0,
+            )?.context().policy().threshold,
+            _ => return Err(ERROR.into()),
+        };
         let mut journal = Journal::open(
             &root.join("setup-bootstrap"),
             passphrase,
@@ -961,6 +988,7 @@ impl HostedSetup {
         let hosted = Self {
             root: root.to_owned(),
             context,
+            threshold,
             operators,
             identity,
             journal,
@@ -979,28 +1007,26 @@ impl HostedSetup {
     }
     fn policy(&self) -> Result<SetupPolicy, String> {
         let request = self.context.request(&self.identity, &self.operators)?;
-        let network = if self.context.own_slot == 1 {
+        let (network, threshold) = if self.context.own_slot == 1 {
             match &request.command {
-                AdmissionCommand::Create { network, .. } => network.clone(),
+                AdmissionCommand::Create { network, threshold, .. } => (network.clone(), *threshold),
                 _ => return Err(ERROR.into()),
             }
         } else {
-            verified_invite(
+            let invite = verified_invite(
                 &self.context.grant,
                 &self.context.bundle,
                 &self.context.key,
                 self.context.development,
                 0,
-            )?
-            .context()
-            .policy()
-            .network
-            .clone()
+            )?;
+            let policy = invite.context().policy();
+            (policy.network.clone(), policy.threshold)
         };
         Ok(SetupPolicy {
             ceremony: *request.command.ceremony(),
             network,
-            threshold: 2,
+            threshold,
             member_count: self.context.count,
             config_digest: *self.operators.digest(),
         })
@@ -1087,6 +1113,7 @@ impl HostedSetup {
             } else {
                 "provisioning"
             },
+            threshold: self.threshold,
             count: self.context.count,
             joined: vec![self.context.own_slot],
             retryable: !ready,
@@ -1532,7 +1559,7 @@ impl HostedSetup {
         if prerequisites.get(&self.context.own_slot) != Some(&record.body().prerequisites) {
             return Err("setup_roster".into());
         }
-        let native = Self::native_roster(&roster, &self.policy()?.network)?;
+        let native = Self::native_roster(&roster, &self.policy()?)?;
         Ok(Some(VerifiedProposal {
             body: SecretRecords(vec![record.body().clone()]),
             prerequisites,
@@ -1657,7 +1684,7 @@ impl HostedSetup {
                     revision: 1,
                 },
                 network: transport.context().policy().network.clone(),
-                threshold: 2,
+                threshold: transport.context().policy().threshold,
                 member_count: self.context.count,
                 roster_digest: Some(digest),
                 prerequisites,
@@ -1712,14 +1739,14 @@ impl HostedSetup {
     pub fn proposed_fingerprint(&self) -> Result<[u8; 32], String> {
         Ok(self.current_proposal()?.fingerprint)
     }
-    fn native_fingerprint(roster: &Roster, network: &str) -> Result<[u8; 32], String> {
-        Ok(Self::native_roster(roster, network)?.fingerprint())
+    fn native_fingerprint(roster: &Roster, policy: &SetupPolicy) -> Result<[u8; 32], String> {
+        Ok(Self::native_roster(roster, policy)?.fingerprint())
     }
-    fn native_roster(roster: &Roster, network: &str) -> Result<crate::member_state::Roster, String> {
-        let mut value = serde_json::json!({"vault":hex::encode(roster.vault), "threshold":2,
+    fn native_roster(roster: &Roster, policy: &SetupPolicy) -> Result<crate::member_state::Roster, String> {
+        let mut value = serde_json::json!({"vault":hex::encode(roster.vault), "threshold":policy.threshold,
             "members":roster.members.iter().map(|peer| serde_json::json!({"id":peer.id,
                 "signing":hex::encode(peer.signing), "encryption":hex::encode(peer.encryption)})).collect::<Vec<_>>()});
-        match VaultNetwork::parse(network)? {
+        match VaultNetwork::parse(&policy.network)? {
             VaultNetwork::Regtest => {}
             VaultNetwork::Testnet => {
                 value["network"] = serde_json::json!("testnet");
@@ -1757,7 +1784,7 @@ impl HostedSetup {
             .try_into()
             .map_err(|_| "setup_approval")?;
         if roster.members.len() != self.context.count as usize
-            || Self::native_fingerprint(&roster, &self.policy()?.network)? != fingerprint
+            || Self::native_fingerprint(&roster, &self.policy()?)? != fingerprint
         {
             return Err("setup_approval".into());
         }
@@ -1809,6 +1836,7 @@ impl HostedSetup {
         }
         Ok(SetupStatus {
             own_slot: self.context.own_slot,
+            threshold: self.threshold,
             count: self.context.count,
             phase: "agreement_saved",
             joined: proposal.roster.members.iter().map(|p| p.id).collect(),
@@ -1940,7 +1968,7 @@ impl HostedSetup {
                             ..key.clone()
                         },
                         network: context.policy().network.clone(),
-                        threshold: 2,
+                        threshold: context.policy().threshold,
                         member_count: self.context.count,
                         roster_digest: Some(
                             loki_relay_protocol::types::roster_digest(&roster)
@@ -2010,6 +2038,7 @@ impl HostedSetup {
         }
         Ok(SetupStatus {
             own_slot: self.context.own_slot,
+            threshold: self.threshold,
             count: self.context.count,
             joined: roster.members.iter().map(|p| p.id).collect(),
             agreed: Some(fingerprint),
@@ -2056,7 +2085,7 @@ impl HostedSetup {
                     revision: 1,
                 },
                 network: policy.network.clone(),
-                threshold: 2,
+                threshold: policy.threshold,
                 member_count: policy.member_count,
                 roster_digest: Some(digest),
                 prerequisites: prerequisites
@@ -2095,6 +2124,7 @@ impl HostedSetup {
             .map_err(|_| "setup_transport")?;
         let status = |phase: &'static str| SetupStatus {
             own_slot: self.context.own_slot,
+            threshold: self.threshold,
             count: self.context.count,
             phase,
             joined: accepted.roster().members.iter().map(|p| p.id).collect(),
@@ -2574,7 +2604,7 @@ impl HostedSetup {
             if !matches!(engine.phase(), CeremonyPhase::Certified | CeremonyPhase::PaymentHandoff | CeremonyPhase::Active) { return Err("setup_backups_pending".into()); }
             let state = engine.certified_vault_state()?;
             let private_state = crate::setup_backup::PrivateJson(serde_json::from_slice(&state).map_err(|_| "setup_backup")?);
-            let mut roster = serde_json::json!({"vault":hex::encode(accepted.roster().vault),"threshold":2,
+            let mut roster = serde_json::json!({"vault":hex::encode(accepted.roster().vault),"threshold":accepted.context().policy().threshold,
                 "members":accepted.roster().members.iter().map(|peer| serde_json::json!({
                     "id":peer.id,"signing":hex::encode(peer.signing),"encryption":hex::encode(peer.encryption)
                 })).collect::<Vec<_>>()});
@@ -2765,6 +2795,7 @@ impl HostedSetup {
             } else {
                 "waiting_joins"
             },
+            threshold: self.threshold,
             count: self.context.count,
             joined,
             retryable: proposal_progress
@@ -2907,6 +2938,7 @@ impl HostedSetup {
             } else {
                 "join_pending"
             },
+            threshold: self.threshold,
             count: self.context.count,
             joined: vec![self.context.own_slot],
             retryable: progress.stored_groups != 1,
@@ -2982,6 +3014,7 @@ impl HostedSetup {
             waiting: None,
             own_slot: self.context.own_slot,
             phase: "admission_rejected",
+            threshold: self.threshold,
             count: self.context.count,
             joined: Vec::new(),
             retryable: false,
@@ -3015,6 +3048,7 @@ impl HostedSetup {
                     _ => "activation_unverified",
                 }
             },
+            threshold: self.threshold,
             count: self.context.count,
             joined: vec![self.context.own_slot],
             retryable: pending,
@@ -3055,7 +3089,7 @@ impl HostedSetup {
         let (roster, _, _) = self.saved_approval()?.ok_or("setup_approval")?;
         let policy = self.policy()?;
         let digest = AcceptedCeremonyRoster::hosted_context_digest(
-            &Self::native_roster(&roster, &policy.network)?,
+            &Self::native_roster(&roster, &policy)?,
             &policy.network,
             &policy.config_digest,
         )?;
@@ -3387,6 +3421,7 @@ impl HostedSetup {
                 waiting: None,
                 own_slot: self.context.own_slot,
                 phase: "admission_pending",
+                threshold: self.threshold,
                 count: self.context.count,
                 joined: Vec::new(),
                 retryable: true,
@@ -3403,6 +3438,7 @@ impl HostedSetup {
                             waiting: None,
                             own_slot: self.context.own_slot,
                             phase: "admission_pending",
+                            threshold: self.threshold,
                             count: self.context.count,
                             joined: Vec::new(),
                             retryable: true,
@@ -3454,6 +3490,7 @@ impl HostedSetup {
                         waiting: None,
                         own_slot: self.context.own_slot,
                         phase: "provisioning",
+                        threshold: self.threshold,
                         count: self.context.count,
                         joined: vec![self.context.own_slot],
                         retryable: true,
@@ -3595,7 +3632,7 @@ pub fn command(command: &str, args: &[String]) -> Result<serde_json::Value, Stri
                 let handoff = setup.payment_handoff_step(engine, authority, store, transport, routes, accepted, false)?;
                 if !handoff.is_ready() { return Err("setup_payment_pending".into()); }
                 let (roster, fingerprint, _) = setup.saved_approval()?.ok_or("setup_approval")?;
-                Ok(serde_json::json!({"policy":format!("2-of-{}",setup.context.count),"vault":hex::encode(roster.vault),"own_slot":setup.context.own_slot,"fingerprint":hex::encode(fingerprint),"address":engine.certified_address()?,"group_ak":hex::encode(engine.certified_group_key()?),"handoff":"ready","development":setup.context.development,"configuration_digest":hex::encode(setup.operators.digest()),"native_checkpoint":hex::encode(engine.checkpoint().digest),"relays":setup.operators.relay_routes().iter().map(|route|serde_json::json!({"endpoint":route.endpoint,"receipt_key":hex::encode(route.pin.key),"run_id":hex::encode(route.pin.run)})).collect::<Vec<_>>()}))
+                Ok(serde_json::json!({"policy":format!("{}-of-{}",setup.threshold,setup.context.count),"vault":hex::encode(roster.vault),"own_slot":setup.context.own_slot,"fingerprint":hex::encode(fingerprint),"address":engine.certified_address()?,"group_ak":hex::encode(engine.certified_group_key()?),"handoff":"ready","development":setup.context.development,"configuration_digest":hex::encode(setup.operators.digest()),"native_checkpoint":hex::encode(engine.checkpoint().digest),"relays":setup.operators.relay_routes().iter().map(|route|serde_json::json!({"endpoint":route.endpoint,"receipt_key":hex::encode(route.pin.key),"run_id":hex::encode(route.pin.run)})).collect::<Vec<_>>()}))
             })
         }
         "setup-info" => {
@@ -3621,7 +3658,7 @@ pub fn command(command: &str, args: &[String]) -> Result<serde_json::Value, Stri
                 .or_else(|| proposal.as_ref().map(|proposal| proposal.fingerprint));
             Ok(
                 serde_json::json!({"vault":hex::encode(policy.ceremony),"own_slot":setup.context.own_slot,"member_count":policy.member_count,
-                "network":policy.network,"birth_height":(policy.network == "testnet").then_some(TESTNET_NU7_BIRTH),"fingerprint":fingerprint.map(hex::encode),"members":roster.map(|roster|roster.members.iter().map(|peer|serde_json::json!({"id":peer.id,"signing":hex::encode(peer.signing),"encryption":hex::encode(peer.encryption)})).collect::<Vec<_>>()).unwrap_or_default()}),
+                "network":policy.network,"threshold":policy.threshold,"birth_height":(policy.network == "testnet").then_some(TESTNET_NU7_BIRTH),"fingerprint":fingerprint.map(hex::encode),"members":roster.map(|roster|roster.members.iter().map(|peer|serde_json::json!({"id":peer.id,"signing":hex::encode(peer.signing),"encryption":hex::encode(peer.encryption)})).collect::<Vec<_>>()).unwrap_or_default()}),
             )
         }
         "setup-create" => {
@@ -3639,9 +3676,10 @@ pub fn command(command: &str, args: &[String]) -> Result<serde_json::Value, Stri
                 }
                 _ => return Err("setup_arguments".into()),
             };
-            let count = match args[4].as_str() {
-                "2-of-3" => 3,
-                "2-of-4" => 4,
+            let (threshold, count) = match args[4].as_str() {
+                "2-of-3" => (2, 3),
+                "2-of-4" => (2, 4),
+                "3-of-4" => (3, 4),
                 _ => return Err("setup_policy".into()),
             };
             let key: [u8; 32] = hex::decode(&args[6])
@@ -3651,12 +3689,13 @@ pub fn command(command: &str, args: &[String]) -> Result<serde_json::Value, Stri
             let passphrase = private_passphrase(&args[1])?;
             let bundle = private_file(Path::new(&args[2]), LIMIT)?;
             let grant = private_file(Path::new(&args[3]), 4096)?;
-            let mut setup = HostedSetup::create(
+            let mut setup = HostedSetup::create_with_policy(
                 &root,
                 &passphrase,
                 &bundle,
                 &key,
                 &grant,
+                threshold,
                 count,
                 network,
                 development,

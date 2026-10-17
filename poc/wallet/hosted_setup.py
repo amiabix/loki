@@ -152,8 +152,11 @@ class HostedSetup:
                 *(["--network", "testnet"] if self.wallet.network == "testnet" else []),
                 *(["--development-http"] if self.development else [])]
 
-    def _attach(self, folder, name):
+    def _attach(self, folder, name, expected_policy=None):
         info = json.loads(self.native("setup-info", folder))
+        policy = (info.get("threshold"), info.get("member_count"))
+        if policy not in ((2, 3), (2, 4), (3, 4)) or (expected_policy and policy != expected_policy):
+            raise ValueError("Native setup policy differs from the requested vault")
         if info.get("network") != self.wallet.network:
             raise ValueError("Hosted vault belongs to another network")
         if self.wallet.network == "testnet" and (type(info.get("birth_height")) is not int
@@ -166,7 +169,7 @@ class HostedSetup:
         membership = folder / "membership.json"
         value = {"vault": vault, "slot": info["own_slot"], "name": name,
                  "profile": self.wallet.require_profile()["id"], "members": info["member_count"],
-                 "threshold": 2, "transport": "hosted", "network": self.wallet.network}
+                 "threshold": info["threshold"], "transport": "hosted", "network": self.wallet.network}
         if self.wallet.network == "testnet":
             value["birth_height"] = info["birth_height"]
         if membership.exists():
@@ -206,7 +209,7 @@ class HostedSetup:
         return folder
 
     def create(self, policy, name):
-        if policy not in ("2-of-3", "2-of-4") or not isinstance(name, str) or not 1 <= len(name.strip().encode()) <= 80:
+        if policy not in ("2-of-3", "2-of-4", "3-of-4") or not isinstance(name, str) or not 1 <= len(name.strip().encode()) <= 80:
             raise ValueError("Choose a supported policy and a vault name")
         if not self.issuer and (not self.enrollment or not self.enrollment.is_file()):
             raise ValueError("A scoped enrollment grant or configured issuer is required")
@@ -215,7 +218,7 @@ class HostedSetup:
             self.native("identity", folder, 1)
         if (folder / "secrets" / "hosted-context.sealed").is_file():
             self.native("setup-step", folder)
-            return self._attach(folder, name.strip())
+            return self._attach(folder, name.strip(), tuple(map(int, policy.split("-of-"))))
         grant = self.enrollment
         if self.issuer:
             identity = json.loads(self.native("identity-public", folder))
@@ -237,7 +240,7 @@ class HostedSetup:
                         "--operator-key", self.key,
                         *(["--network", "testnet"] if self.wallet.network == "testnet" else []),
                         *(["--development-http"] if self.development else []))
-        return self._attach(folder, name.strip())
+        return self._attach(folder, name.strip(), tuple(map(int, policy.split("-of-"))))
 
     def join(self, invite):
         if not isinstance(invite, str) or not invite.startswith("loki-hosted-v1:") or len(invite) > 8192:
@@ -290,7 +293,7 @@ class HostedSetup:
         result = {"phase": ui_phase, "setup_phase": phase, "handoff": native.get("handoff", "pending"),
                   "transport": "hosted", "network": local.get("network", "regtest"),
                   "birth_height": local.get("birth_height"), "name": local["name"], "vault": vault,
-                  "slot": local["slot"], "threshold": 2, "total_members": local["members"],
+                  "slot": local["slot"], "threshold": local["threshold"], "total_members": local["members"],
                   "members": len(native.get("joined_slots", [])), "missing_slots": native.get("missing_slots", []),
                   "fingerprint": info.get("fingerprint"), "confirmations": confirmations, "profile": self.wallet.profile_data,
                   "error": self.errors.get(vault), "account_linked": False, "invites": [],

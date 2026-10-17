@@ -474,6 +474,7 @@ fn send_proposal(root: &Path, pass: &Path, roster: &Path, proposal: &Path) -> Re
     let mut session = open_session(root, pass, roster)?;
     payment_manifest::validate_roster(
         session.member.roster.vault,
+        session.member.threshold,
         session.member.roster.members.iter().map(|member| member.id),
         &context,
         &intent,
@@ -545,6 +546,7 @@ fn import_proposals(root: &Path, pass: &Path, roster: &Path, payments: &Path) ->
             };
             if payment_manifest::validate_roster(
                 session.member.roster.vault,
+                session.member.threshold,
                 session.member.roster.members.iter().map(|member| member.id),
                 &context,
                 &intent,

@@ -961,6 +961,7 @@ mod tests {
         LoadedMember {
             identity: identities.into_iter().next().unwrap(),
             roster,
+            threshold: 2,
         }
     }
     #[test]
@@ -987,6 +988,7 @@ mod tests {
                     )
                     .unwrap(),
                     roster: roster.clone(),
+                    threshold: 2,
                 };
                 let mut config = LocalConfig::empty();
                 for peer in &identities {
@@ -1052,6 +1054,7 @@ mod tests {
                         &keys[usize::from(owner.public().id - 1)],
                     ).unwrap(),
                     roster: roster.clone(),
+                    threshold: 2,
                 };
                 let mut config = LocalConfig::empty();
                 config.own = (1..=3u8).map(|i| OwnerInbox {

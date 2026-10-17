@@ -274,7 +274,7 @@ fn state_address(state: &serde_json::Value) -> Result<String, String> {
     let key = frost::keys::KeyPackage::deserialize(&key_bytes)
         .map_err(|e| format!("invalid member share: {e}"))?;
     let (threshold, members) = state_policy(state)?;
-    if !matches!((threshold, members), (2, 3) | (2, 4)) {
+    if !matches!((threshold, members), (2, 3) | (2, 4) | (3, 4)) {
         return Err("unsupported vault policy".into());
     }
     let id = frost::Identifier::try_from(state_identity(state)?.public().id)

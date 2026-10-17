@@ -22,8 +22,7 @@ impl AcceptedCeremonyRoster {
         if network != roster.network.label()
             || roster.vault == [0; 32]
             || *operator_digest == [0; 32]
-            || roster.threshold != 2
-            || !matches!(roster.members.len(), 3 | 4)
+            || !matches!((roster.threshold, roster.members.len()), (2, 3) | (2, 4) | (3, 4))
             || roster.members.keys().copied().collect::<Vec<_>>()
                 != (1..=roster.members.len() as u16).collect::<Vec<_>>()
         {
@@ -136,7 +135,7 @@ impl AcceptedCeremonyRoster {
         let policy = accepted.context().policy();
         let members = &accepted.roster().members;
         if accepted.roster().vault != policy.ceremony
-            || policy.threshold != 2
+            || !matches!((policy.threshold, policy.member_count), (2, 3) | (2, 4) | (3, 4))
             || members.len() != policy.member_count as usize
         {
             return Err("setup_agreement".into());

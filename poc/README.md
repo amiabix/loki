@@ -1,14 +1,13 @@
 # Loki research harness
 
-A research prototype for **threshold-signed shielded Zcash payments**: a 2-of-3 FROST
-account that spends an Ironwood note, where the signature is produced **before** the
-transaction has a proof or an anchor.
-The separate-member local courier path also exercises 2-of-4; the relay path remains 2-of-3.
+A research prototype for **threshold-signed shielded Zcash payments**. It supports
+2-of-3, 2-of-4, and 3-of-4 FROST vaults. Members sign an Ironwood payment
+**before** the transaction has a proof or an anchor. A 3-of-4 regtest payment
+has been mined through both the local courier and the separate member app relay flow.
 
 The separate-member `loki_setup_member` and `loki_member_payment` commands are the
 command-line vault path. The local member app also exposes Testnet setup and payment
-screens with operator-configured relays ([runbook](wallet/README.md)); hosted setup
-remains regtest only.
+screens with operator-configured relays ([runbook](wallet/README.md)).
 The older `loki` binary uses a fixed test viewing-key
 tail and refuses to run unless `LOKI_ALLOW_FIXED_VIEWING_KEY=1` is explicitly set.
 The terminal research harnesses set this flag themselves. The older account demo
@@ -71,12 +70,12 @@ spend before real custody use.
 
 | | |
 |---|---|
-| **G1-TX** | **demonstrated on regtest** — a real Ironwood payment, authorised by two of three FROST members, signed before its anchor and proof existed, mined |
+| **G1-TX** | **demonstrated on regtest** — real Ironwood payments authorized by 2-of-3 and 3-of-4 FROST groups, signed before an anchor or proof was installed, then mined |
 | **Full G1** | **BLOCKED**. Separate-member setup has a local ZIP 2005 `use_qsk` derivation with an independently calculated vector and a mined regtest payment, but the derivation has not been independently reviewed or upstreamed. The original transaction CLI still uses its documented **test-only** key splice |
 | **G3** (browser nonce safety) | **PARTIAL** and separate. 29/32 drills on Chromium, 6/8 on WebKit, Firefox would not launch, no physical device case tested |
 | **Second-device finishing** | seed-flow THS validation: a party holding none of the approvers' files completed both posted and re-proving paths with one and two inputs. Replicas carry confidential randomizer seeds ([evidence](FROST-RANDOMIZER-RESULTS.md)) |
-| **Separate-member setup** | three or four isolated processes complete threshold-two DKG; each member checks a 24-word and card backup before the regtest address appears. Activated 2-of-4 member stores fed a mined regtest payment through the local courier. A clean restore without the exchange directory was demonstrated on 2-of-3 ([details](SEPARATE-MEMBER-SETUP.md)) |
-| **Signing sessions** | a 2-of-3 relay attempt with explicit member review and independent finishing. The relay-backed `commit`/`package`/`approve` path seals nonces across invocations and requires two pinned relay nonce receipts before signing; a staged regtest payment was mined. The simultaneous local-courier `sign` command supports 2-of-3 and 2-of-4 but remains a RAM-only demo ([scope](SIGNING-SESSION.md)) |
+| **Separate-member setup** | three or four isolated processes complete DKG at threshold two or three; each member checks a 24-word and card backup before the regtest address appears. A restored 3-of-4 member signed a mined regtest payment ([details](SEPARATE-MEMBER-SETUP.md)) |
+| **Signing sessions** | the relay-backed `commit`/`package`/`approve` path seals nonces across invocations and requires two pinned relay nonce receipts before signing. A separate-member 3-of-4 relay journey confirmed a payment and rejected signing from restored old nonce state; all four signer triples passed exact-set tests. The simultaneous local-courier `sign` command also mined a 3-of-4 payment but remains a RAM-only demo ([scope](SIGNING-SESSION.md)) |
 | **Structured review** | the relay-enabled CLI can return a verified payment summary and exact-package review token, then recheck that token before `approve-reviewed` signs. The token binds bytes; an app still has to show the summary and obtain the member's explicit consent |
 | **Recovery, key rotation, custody** | local two-artifact restore demonstrated on regtest; independent spend, key rotation in the wallet, and custody readiness **not established** |
 

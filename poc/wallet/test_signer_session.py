@@ -78,12 +78,12 @@ class SessionHttpTests(unittest.TestCase):
             wallet.profile_data = {"id": "private-profile-id", "name": "Alice"}
             wallet.vaults = lambda: [{"vault": "abc", "name": "Treasury", "slot": 2,
                                       "profile": "private-profile-id", "invites": ["secret"]}]
-            wallet.status = lambda vault=None: {"phase": "active", "words": "secret"}
+            wallet.status = lambda vault=None: {"phase": "active", "network": "regtest", "words": "secret"}
             created = []
             relay_setups = []
             funding_calls = []
             wallet.fund_vault = lambda vault, request_id: funding_calls.append((vault, request_id)) or {"status": "confirmed", "amount_zatoshi": 500000000}
-            wallet.create = lambda name, members: created.append((name, members)) or {"vault": "new-vault", "invites": ["private-invite"]}
+            wallet.create = lambda name, members, threshold: created.append((name, members, threshold)) or {"vault": "new-vault", "invites": ["private-invite"]}
             wallet.setup_relays = lambda vault: relay_setups.append(vault) or {"vault": vault, "phase": "starting"}
             wallet.setup_all_relays = lambda: relay_setups.append("all") or {"relay_setup": True}
             relay_vault = "a" * 64
@@ -133,8 +133,8 @@ class SessionHttpTests(unittest.TestCase):
             status, result, _ = call("GET", "/api/session/vaults", headers={"Origin": origin,
                                       "X-Loki-Session": key})
             self.assertEqual(status, 200)
-            self.assertEqual(result, {"profile": "Alice", "vaults": [{"vault": "abc",
-                              "name": "Treasury", "slot": 2, "phase": "active"}],
+            self.assertEqual(result, {"profile": "Alice", "network": "regtest", "vaults": [{"vault": "abc",
+                              "name": "Treasury", "slot": 2, "phase": "active", "network": "regtest"}],
                               "relay_network": wallet.relay_network_status()})
             self.assertEqual(call("POST", "/api/session/fund", {"vault": "abc", "request_id": "d" * 32},
                                   {"Origin": "http://evil.example", "X-Loki-Session": key})[0], 403)
@@ -156,7 +156,7 @@ class SessionHttpTests(unittest.TestCase):
             self.assertEqual(pending_action[0]["members"], 4)
             self.assertEqual(call("POST", "/api/session/action-approve", {"action": action},
                                   {"X-Loki-Token": private_token})[0], 200)
-            self.assertEqual(created, [("New team", 4)])
+            self.assertEqual(created, [("New team", 4, 2)])
             self.assertEqual(call("POST", "/api/session/action-approve", {"action": action},
                                   {"X-Loki-Token": private_token})[0], 400)
             self.assertEqual(call("POST", "/api/session/action-poll", {"action": action},

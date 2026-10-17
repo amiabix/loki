@@ -106,7 +106,7 @@ class MemberWalletTest(unittest.TestCase):
             (member / "roster.json").write_text("{}")
             (member / "final-backup-checked").write_text("checked")
             (work / "payment.json").write_text(json.dumps({
-                "vault": vault, "attempt": attempt, "payment": "e" * 64, "pair": [1, 2]}))
+                "version": 1, "vault": vault, "attempt": attempt, "payment": "e" * 64, "pair": [1, 2]}))
             (work / "mailbox" / wire).write_bytes(b"own authenticated wire")
             wallet.payment_status(work, "queued_for_delivery")
             calls = []
@@ -145,7 +145,7 @@ class MemberWalletTest(unittest.TestCase):
             (member / "roster.json").write_text("{}")
             (member / "final-backup-checked").write_text("checked")
             (work / "payment.json").write_text(json.dumps({
-                "vault": vault, "attempt": attempt, "payment": "e" * 64, "pair": [1, 2]}))
+                "version": 1, "vault": vault, "attempt": attempt, "payment": "e" * 64, "pair": [1, 2]}))
             wallet.payment_status(work, "approval_pending_delivery")
             stored = False
 
@@ -183,7 +183,7 @@ class MemberWalletTest(unittest.TestCase):
                 work = member / "payments" / attempt
                 (work / "mailbox").mkdir(parents=True)
                 (work / "payment.json").write_text(json.dumps({
-                    "vault": vault, "attempt": attempt, "payment": "e" * 64, "pair": [1, 2]}))
+                    "version": 1, "vault": vault, "attempt": attempt, "payment": "e" * 64, "pair": [1, 2]}))
                 wallet.payment_status(work, phase)
 
             def command(action, *args, **_kwargs):
@@ -231,7 +231,7 @@ class MemberWalletTest(unittest.TestCase):
                 (work / "payment.json").write_text(json.dumps({
                     "vault": vault, "payment": "b" * 64, "attempt": "c" * 64, "amount_zat": 40000000,
                     "fee_zat": 10000, "change_zat": 59990000, "expiry_height": 9216,
-                    "pair": [1, 2]}))
+                    "version": 1, "pair": [1, 2]}))
                 return "payment created"
 
             with patch.object(alice, "command", side_effect=prepare) as command:
@@ -243,7 +243,7 @@ class MemberWalletTest(unittest.TestCase):
             self.assertEqual(len(list((folder / "payments").glob("*/payment.json"))), 1)
             self.assertTrue((folder / "payments" / ("c" * 64) / "payment.json").is_file())
             self.assertEqual(alice.payments(vault)["payments"][0]["phase"], "draft")
-            with self.assertRaisesRegex(ValueError, "Choose two members"):
+            with self.assertRaisesRegex(ValueError, "Choose 2 members"):
                 alice.prepare_payment(vault, "uregtest1recipient", "40000000", "test memo", "AD")
             with self.assertRaisesRegex(ValueError, "positive amount"):
                 alice.prepare_payment(vault, "uregtest1recipient", "0", "test memo", "AB")
@@ -278,7 +278,7 @@ class MemberWalletTest(unittest.TestCase):
                 (folder / "roster.json").write_text("{}")
             work = alice.data / "vaults" / vault / "payments" / attempt
             manifest = {"vault": vault, "attempt": attempt, "payment": payment,
-                        "pair": [1, 2], "expiry_height": 9216}
+                        "version": 1, "pair": [1, 2], "expiry_height": 9216}
             (work / "payment.json").write_text(json.dumps(manifest))
             with self.assertRaisesRegex(ValueError, "not in this member"):
                 bob.review_payment(vault, attempt)
@@ -337,7 +337,8 @@ class MemberWalletTest(unittest.TestCase):
                     alice.review_payment(vault, attempt)
                 self.assertEqual(command.call_count, 1)
 
-    def payment_fixture(self, temp, slot=1, phase="published", pair=(1, 2), txid=None):
+    def payment_fixture(self, temp, slot=1, phase="published", pair=(1, 2), txid=None,
+                        threshold=2, members=3):
         vault, attempt = "a" * 64, "b" * 64
         wallet = Wallet(Path(temp) / f"member-{slot}", Path(temp) / "exchange")
         self.addCleanup(wallet.close)
@@ -348,12 +349,14 @@ class MemberWalletTest(unittest.TestCase):
         (work / "mailbox").mkdir(parents=True)
         (member / "membership.json").write_text(json.dumps({
             "vault": vault, "profile": f"member-{slot}", "slot": slot,
-            "threshold": 2, "members": 3}))
+            "threshold": threshold, "members": members}))
         (member / "roster.json").write_text("{}")
         (member / "final-backup-checked").write_text("checked")
         (work / "payment.json").write_text(json.dumps({
             "vault": vault, "attempt": attempt, "payment": "e" * 64,
-            "pair": list(pair), "expiry_height": 9216}))
+            "version": 1 if threshold == 2 else 2,
+            **({"pair": list(pair)} if threshold == 2 else {"signers": list(pair)}),
+            "expiry_height": 9216}))
         if phase:
             wallet.payment_status(work, phase, txid)
         return wallet, vault, attempt
@@ -707,7 +710,7 @@ class MemberWalletTest(unittest.TestCase):
                         "vault": vault, "payment": "b" * 64, "attempt": format(len(chosen), "064x"),
                         "amount_zat": int(amount), "fee_zat": 10000, "change_zat": 59990000,
                         "expiry_height": 9216,
-                        "pair": [ord(letter) - ord("A") + 1 for letter in pair]}))
+                        "version": 1, "pair": [ord(letter) - ord("A") + 1 for letter in pair]}))
                     chosen.append(pair)
                     return "payment created"
 
@@ -717,6 +720,42 @@ class MemberWalletTest(unittest.TestCase):
                     self.assertIn(slot, draft["pair"])
                     wallet.prepare_payment(vault, "uregtest1recipient", "40000000", "memo", "BC")
                 self.assertEqual(chosen, [expected, "BC"])
+
+    def test_three_of_four_payment_uses_exact_selected_triple(self):
+        with tempfile.TemporaryDirectory(prefix="loki-triple-payment-") as temp:
+            wallet, vault, _ = self.payment_fixture(temp, slot=4, phase=None, pair=(1, 2, 4),
+                                                     threshold=3, members=4)
+            chosen = []
+
+            def prepare(_action, _member, _pass, _roster, work, _recipient, amount, _memo, signers,
+                        **_kwargs):
+                chosen.append(signers)
+                (work / "payment.json").write_text(json.dumps({
+                    "version": 2, "vault": vault, "payment": "c" * 64,
+                    "attempt": format(len(chosen), "064x"), "amount_zat": int(amount),
+                    "fee_zat": 10000, "change_zat": 59990000, "expiry_height": 9216,
+                    "signers": [ord(letter) - ord("A") + 1 for letter in signers]}))
+                return "payment created"
+
+            with patch.object(wallet, "command", side_effect=prepare):
+                for signers in ("ABC", "ABD", "ACD", "BCD"):
+                    draft = wallet.prepare_payment(vault, "uregtest1recipient", "40000000", "memo", signers)
+                    self.assertEqual(draft["signers"], [ord(letter) - ord("A") + 1 for letter in signers])
+                with self.assertRaisesRegex(ValueError, "Choose 3 members"):
+                    wallet.prepare_payment(vault, "uregtest1recipient", "40000000", "memo", "AB")
+            self.assertEqual(chosen, ["ABC", "ABD", "ACD", "BCD"])
+
+    def test_three_of_four_rejects_pair_manifest(self):
+        with tempfile.TemporaryDirectory(prefix="loki-triple-manifest-") as temp:
+            wallet, vault, attempt = self.payment_fixture(temp, threshold=3, members=4,
+                                                            pair=(1, 2, 3))
+            work = wallet.data / "vaults" / vault / "payments" / attempt
+            value = json.loads((work / "payment.json").read_text())
+            value["version"] = 1
+            value["pair"] = value.pop("signers")[:2]
+            (work / "payment.json").write_text(json.dumps(value))
+            with self.assertRaisesRegex(ValueError, "signer format differs"):
+                wallet.payment(vault, attempt)
 
     def test_four_member_vault_reaches_one_address_after_every_backup(self):
         if not SETUP.is_file():

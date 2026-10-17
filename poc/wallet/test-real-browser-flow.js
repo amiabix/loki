@@ -212,7 +212,7 @@ async function payment(browser, config) {
       await page.waitForFunction(() => {
         const status = document.querySelector('#payment-list').textContent;
         return status.includes('your approval reached the relays')
-          || status.includes('two approvals verified; ready to send');
+          || status.includes('2 approvals verified; ready to send');
       }, null, {timeout: 180000});
     }
     assert.equal(new Set(reviewedRecipients).size, 1, 'the two signers reviewed different recipients');

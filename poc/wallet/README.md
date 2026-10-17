@@ -181,15 +181,15 @@ If used, the account-control proof is verified locally and kept in the member's 
 store. It is not part of the group certificate, so other members do not learn a
 reusable account key. The ordinary wallet seed does not recover a Loki FROST
 share; the Loki 24 words and backup card are still required.
-The app can create 2-of-3 or 2-of-4 regtest vaults. The policy is included in
-the new roster fingerprint; old 2-of-3 roster files retain their original
-fingerprint. A four-member source vault completed a mined payment with members
-3 and 4 signing and member 2 finishing through `run-member-payment.py
---members 4 --pair CD --finisher 2`. This is the local courier test path; the
-relay adapter remains three-member-only. The 2-of-4 vault can show its balance
-when funded through the CLI test path, but the app hides its receive address
-and payment controls to avoid deposits it cannot spend. For a 2-of-3 vault, the private member
-app has controls for a fixed signing pair: create a local payment draft, send
+The app offers 2-of-3, 2-of-4, and 3-of-4 vaults. The selected policy is
+included in the roster fingerprint; an existing vault's policy does not change.
+The payment form selects the exact members who will sign this attempt. A different
+signer set requires a new attempt and new signing nonces. A 3-of-4 local regtest
+payment was mined with members 1, 2, and 3 signing and member 4 finishing;
+the recipient independently decrypted it. Member 1 restored from the final card
+and words before signing. The separate member app relay journey also mined a
+3-of-4 payment and checked that restored old nonce state could not approve again.
+The private member app can create a local payment draft, send
 the proposal, publish commitments, build the package, review the transaction,
 approve that exact review, prove and broadcast, then verify it on chain. The
 review panel uses the Rust signer's verified transaction fields, not the
@@ -202,7 +202,7 @@ chain view whenever the payment list is shown. If a signer closed after saving
 an approval, **Retry saved signing messages** republishes the same sealed share;
 it never creates another signature share.
 
-The dashboard offers **Fund Vault** beside each eligible 2-of-3 vault. Each new
+The dashboard offers **Fund Vault** beside each eligible local regtest vault. Each new
 click requests exactly 5 local test ZEC from the THS address faucet, then waits
 for a confirmed transaction. Dashboard access includes this incoming test-fund
 action; it cannot authorize spending from the vault. Set `LOKI_THS_INSTANCE` to
@@ -228,7 +228,7 @@ Each running member app automatically provisions its own inboxes and exchanges
 recipient-encrypted configurations through the shared courier. Locked apps
 wait until their owners unlock them; no additional relay setup click is needed.
 A vault connects after its final backup is checked, and each vault row shows
-connection progress. Shared-courier 2-of-3 and 2-of-4 vaults support this development flow.
+connection progress. Shared-courier 2-of-3, 2-of-4, and 3-of-4 vaults use this development flow.
 Payment review and approval still happen separately in each private signer.
 
 Saved relay roots, identities, operator access files, and encrypted couriers live
@@ -343,7 +343,7 @@ member's identity or claim is saved.
 
 The exchange placeholder is retained for compatibility with local startup arguments; hosted vault creation and payment handoff do not use a shared courier. Supply a scoped `--enrollment-grant` only when it belongs to the saved pending creator identity. A configured issuer receives the public creator key, selected policy and operator bundle path and returns the signed bounded grant on stdout. The product's production authentication/enrollment provider remains a deployment decision. Operator capabilities and issuer private keys stay off the signer. Development loopback requires explicit `--development-http`; production verifies HTTPS and the signed bundle.
 
-Both 2-of-3 and 2-of-4 policies use invitations delivered privately to the respective members, explicit fingerprint comparison and backup checks. Start every member with the same network; a mismatched invitation is refused. While unlocked, the native worker resumes the saved setup, registers scoped inboxes, installs all certified peer configurations and reconciles every signed activation vote. There is no additional per-vault relay approval. Lock stops the worker, terminates its native command and revokes dashboard sessions. A retry keeps the saved identity, exact requests, encrypted DKG state and payment descriptors. Creating again with the same pending name and policy reopens that setup; choose a distinct name for another vault.
+All three supported policies use invitations delivered privately to the respective members, explicit fingerprint comparison and backup checks. Start every member with the same network; a mismatched invitation is refused. While unlocked, the native worker resumes the saved setup, registers scoped inboxes, installs all certified peer configurations and reconciles every signed activation vote. There is no additional per-vault relay approval. Lock stops the worker, terminates its native command and revokes dashboard sessions. A retry keeps the saved identity, exact requests, encrypted DKG state and payment descriptors. Creating again with the same pending name and policy reopens that setup; choose a distinct name for another vault.
 
 Pending member slots appear beside the vault, separately from connection failures. Receiving and payment controls remain gated on checked backups and native payment activation. The dashboard receives public progress only and cannot retrieve keys, DKG packages, recovery words or capabilities. Hosted mode hides local relay-server setup and the local 5-ZEC faucet. Existing local vaults and their saved data retain the local path; there is no automatic migration or relay rotation.
 

@@ -108,8 +108,8 @@ fn wait_phase(setup: &mut HostedSetup, expected: &str) -> serde_json::Value {
     }
 }
 #[test]
-fn offline_creation_reopens_the_exact_saved_intent_for_both_policies() {
-    for count in [3u16, 4] {
+fn offline_creation_reopens_the_exact_saved_intent_for_each_policy() {
+    for (threshold, count) in [(2u16, 3u16), (2, 4), (3, 4)] {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
@@ -148,15 +148,16 @@ fn offline_creation_reopens_the_exact_saved_intent_for_both_policies() {
         .unwrap();
         let initial = sealed_files(member.path());
         assert!(
-            HostedSetup::create(member.path(), "pass", &bundle, &key, &grant, count, "regtest", false)
+            HostedSetup::create_with_policy(member.path(), "pass", &bundle, &key, &grant, threshold, count, "regtest", false)
                 .is_err()
         );
-        assert!(HostedSetup::create(
+        assert!(HostedSetup::create_with_policy(
             member.path(),
             "pass",
             &bundle,
             &[55; 32],
             &grant,
+            threshold,
             count,
             "regtest",
             true
@@ -164,10 +165,10 @@ fn offline_creation_reopens_the_exact_saved_intent_for_both_policies() {
         .is_err());
         assert_eq!(sealed_files(member.path()), initial);
         let mut hosted =
-            HostedSetup::create(member.path(), "pass", &bundle, &key, &grant, count, "regtest", true).unwrap();
+            HostedSetup::create_with_policy(member.path(), "pass", &bundle, &key, &grant, threshold, count, "regtest", true).unwrap();
         let status = hosted.step().unwrap();
         assert_eq!(status.public_json()["phase"], "admission_pending");
-        assert_eq!(status.public_json()["policy"], format!("2-of-{count}"));
+        assert_eq!(status.public_json()["policy"], format!("{threshold}-of-{count}"));
         let saved = sealed_files(member.path());
         assert!(saved.len() >= 2);
         drop(hosted);
@@ -197,7 +198,7 @@ fn offline_creation_reopens_the_exact_saved_intent_for_both_policies() {
             .arg(root.join("pass"))
             .arg(root.join("operators"))
             .arg(root.join("grant"))
-            .arg(format!("2-of-{count}"))
+            .arg(format!("{threshold}-of-{count}"))
             .arg("--operator-key")
             .arg(hex::encode(key))
             .arg("--development-http")
@@ -210,7 +211,7 @@ fn offline_creation_reopens_the_exact_saved_intent_for_both_policies() {
         );
         let public: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(public["phase"], "admission_pending");
-        assert_eq!(public["policy"], format!("2-of-{count}"));
+        assert_eq!(public["policy"], format!("{threshold}-of-{count}"));
         assert!(!String::from_utf8_lossy(&output.stdout).contains(&hex::encode(&grant)));
         assert_eq!(sealed_files(member.path()), saved);
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_loki_setup_member"))
@@ -241,7 +242,7 @@ fn offline_creation_reopens_the_exact_saved_intent_for_both_policies() {
         );
         let cached: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(cached["phase"], "admission_pending");
-        assert_eq!(cached["policy"], format!("2-of-{count}"));
+        assert_eq!(cached["policy"], format!("{threshold}-of-{count}"));
         assert_eq!(cached["agreed_fingerprint"], serde_json::Value::Null);
         assert_eq!(cached.as_object().unwrap().len(), 8);
         let mut tampered = cached.clone();
@@ -1210,7 +1211,7 @@ fn finish_owned_handoff(
                 raw.as_slice().try_into().unwrap(),
             )
             .unwrap();
-            let loaded = loki_poc::relay_member::LoadedMember { identity, roster };
+            let loaded = loki_poc::relay_member::LoadedMember { identity, roster, threshold: 2 };
             let db =
                 loki_relay_client::ClientStore::open(&path.join("transport"), &loaded.roster, slot)
                     .unwrap();

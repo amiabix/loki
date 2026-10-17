@@ -1062,7 +1062,7 @@ impl SetupCeremony {
             }
         }
         let mut value = PrivateJson(
-            serde_json::json!({"version":2,"backup_version":2,"network":self.accepted.roster().network.label(),"key_derivation":zip2005::VERSION,"vault":hex::encode(self.accepted.roster().vault),"threshold":2,"members":self.accepted.roster().members.len(),"roster_fingerprint":hex::encode(self.accepted.roster().fingerprint()),"identity_secret":hex::encode(&*identity),"key_package":hex::encode(&*secret),"vault_secret":hex::encode(&*self.snapshot.vs),"public_package":hex::encode(&certified.public_package),"group_ak":hex::encode(certified.group_ak),"address":address}),
+            serde_json::json!({"version":2,"backup_version":2,"network":self.accepted.roster().network.label(),"key_derivation":zip2005::VERSION,"vault":hex::encode(self.accepted.roster().vault),"threshold":self.accepted.roster().threshold,"members":self.accepted.roster().members.len(),"roster_fingerprint":hex::encode(self.accepted.roster().fingerprint()),"identity_secret":hex::encode(&*identity),"key_package":hex::encode(&*secret),"vault_secret":hex::encode(&*self.snapshot.vs),"public_package":hex::encode(&certified.public_package),"group_ak":hex::encode(certified.group_ak),"address":address}),
         );
         if let Some(height) = self.accepted.roster().birth_height {
             value.0["birth_height"] = serde_json::json!(height);

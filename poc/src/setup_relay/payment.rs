@@ -301,7 +301,7 @@ impl SavedPaymentHandoff {
                         revision: 1,
                     },
                     network: policy.network.clone(),
-                    threshold: 2,
+                    threshold: policy.threshold,
                     member_count: policy.member_count,
                     roster_digest: Some(*accepted.digest()),
                     prerequisites: parents.clone(),
@@ -479,6 +479,7 @@ impl HostedSetup {
         let member = LoadedMember {
             identity: Self::identity(&self.root, &self.passphrase)?,
             roster: accepted.roster().clone(),
+            threshold: accepted.context().policy().threshold,
         };
         if engine.phase() == CeremonyPhase::Certified {
             let certificate_parents = self.certificate_predecessors(transport, store)?;
@@ -500,7 +501,7 @@ impl HostedSetup {
                             revision: 1,
                         },
                         network: policy.network.clone(),
-                        threshold: 2,
+                        threshold: policy.threshold,
                         member_count: policy.member_count,
                         roster_digest: Some(*accepted.digest()),
                         prerequisites,
@@ -759,6 +760,7 @@ mod tests {
                     )
                     .unwrap(),
                     roster: roster.clone(),
+                    threshold: 2,
                 };
                 let intent = PaymentIntent::prepare(&member, &operators).unwrap();
                 let outgoing = intent.outgoing(&member).unwrap();
@@ -788,6 +790,7 @@ mod tests {
                     )
                     .unwrap(),
                     roster: roster.clone(),
+                    threshold: 2,
                 };
                 assert!(PaymentIntent::decode(&encoded, &wrong_owner, &operators).is_err());
                 let mut wrong_roster = roster.clone();
@@ -798,6 +801,7 @@ mod tests {
                     )
                     .unwrap(),
                     roster: wrong_roster,
+                    threshold: 2,
                 };
                 assert!(PaymentIntent::decode(&encoded, &wrong_context, &operators).is_err());
                 let mut wrong_bundle =
@@ -881,6 +885,7 @@ mod tests {
                     )
                     .unwrap(),
                     roster: roster.clone(),
+                    threshold: 2,
                 };
                 let transport = SetupTransport::new(
                     owner,

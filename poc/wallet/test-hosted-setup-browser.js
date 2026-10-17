@@ -7,13 +7,13 @@ async function run() {
   const browser = await chromium.launch({headless: true,
     ...(process.env.LOKI_BROWSER_EXECUTABLE ? {executablePath: process.env.LOKI_BROWSER_EXECUTABLE} : {})});
   try {
-    for (const count of [3, 4]) {
+    for (const [threshold, count] of [[2, 3], [2, 4], [3, 4]]) {
       const page = await browser.newPage();
       const errors = [];
       page.on('pageerror', error => errors.push(error.message));
-      const vault = String(count).repeat(64);
+      const vault = `${threshold}${count}`.repeat(32);
       let phase = 'connecting_relays';
-      const state = () => ({phase, name: 'Hosted Treasury', vault, slot: 1, threshold: 2, total_members: count,
+      const state = () => ({phase, name: 'Hosted Treasury', vault, slot: 1, threshold, total_members: count,
         transport: 'hosted', handoff: phase === 'active' ? 'ready' : 'pending', missing_slots: phase === 'active' ? [] : [count],
         profile: {name: 'Alice'}, relay_setup: {phase: phase === 'active' ? 'ready' : 'waiting',
           detail: 'Hosted relays connect automatically.'}, funding: {available: false, phase: 'unavailable'}, invites: []});
@@ -26,7 +26,7 @@ async function run() {
         }
         let result = {};
         if (url.pathname === '/api/status') result = url.searchParams.has('vault') ? state()
-          : {phase: 'home', profile: {name: 'Alice'}, vaults: [{name: 'Hosted Treasury', vault, slot: 1, threshold: 2, members: count}],
+          : {phase: 'home', profile: {name: 'Alice'}, vaults: [{name: 'Hosted Treasury', vault, slot: 1, threshold, members: count}],
              relay_network: {transport: 'hosted', enabled: true, detail: 'Connecting automatically.'}};
         else if (url.pathname === '/api/payments') result = {payments: []};
         else if (url.pathname === '/api/session/pending') result = {requests: []};
@@ -34,6 +34,7 @@ async function run() {
         return route.fulfill({json: result});
       });
       await page.goto('http://127.0.0.1:18801/#test-token');
+      assert.equal(await page.locator('#create [name=policy] option').count(), 3);
       assert.equal(await page.locator('#setup-relays').isHidden(), true);
       await page.locator('.vault-row').filter({hasText: 'Hosted Treasury'}).click();
       await page.waitForFunction(() => document.getElementById('headline').textContent === 'Connecting payment relays');
@@ -43,6 +44,8 @@ async function run() {
       phase = 'active';
       await page.waitForFunction(() => !document.getElementById('active').hidden);
       assert.equal(await page.locator('#payment-draft').isVisible(), true);
+      assert.equal(await page.locator('#payment-signers option').count(), threshold === 3 ? 4 : count === 4 ? 6 : 3);
+      assert.equal(await page.locator('#payment-signers').inputValue(), threshold === 3 ? 'ABC' : 'AB');
       assert.equal(await page.locator('#show-address').isVisible(), true);
       assert.equal(await page.locator('#payment-unavailable').isHidden(), true);
       assert.equal(await page.locator('#relay-setup').isHidden(), true);
@@ -105,7 +108,7 @@ async function run() {
     assert.equal(await dashboard.getByRole('button', {name: /Fund Vault/}).count(), 0);
     assert.match(await dashboard.locator('#vault-list').textContent(), /2 of 4/);
     assert.match(await dashboard.locator('#vault-list').textContent(), /Waiting for members 3/);
-    console.log('PASS: both hosted policies, pending member, automatic activation, reopening, and no local controls');
+    console.log('PASS: three vault policies, signer choices, automatic activation, reopening, and no local controls');
   } finally { await browser.close(); }
 }
 run().catch(error => { console.error(error); process.exitCode = 1; });

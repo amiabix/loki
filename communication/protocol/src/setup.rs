@@ -96,8 +96,7 @@ pub fn encode_record(record: &SetupRecord) -> WireResult<Vec<u8>> {
     if record.version != 1 {
         return Err(WireError::Version);
     }
-    if record.threshold != 2
-        || !matches!(record.member_count, 3 | 4)
+    if !matches!((record.threshold, record.member_count), (2, 3) | (2, 4) | (3, 4))
         || !(1..=record.member_count).contains(&record.key.author)
         || !(1..=record.member_count).contains(&record.key.recipient)
         || record.key.revision == 0

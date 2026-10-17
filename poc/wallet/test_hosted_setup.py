@@ -32,6 +32,7 @@ class HostedControllerTests(unittest.TestCase):
         self.controller = self.wallet.hosted
         self.calls = []
         self.count = 4
+        self.threshold = 2
         self.slot = 1
         self.vault = 'b' * 64
         self.fail_once = False
@@ -44,6 +45,9 @@ class HostedControllerTests(unittest.TestCase):
             (folder / 'secrets' / 'identity.sealed').write_bytes(b'saved identity')
             return '{}'
         if action in ('setup-create', 'setup-join'):
+            if action == 'setup-create':
+                policy = next(arg for arg in args if isinstance(arg, str) and '-of-' in arg)
+                self.threshold, self.count = map(int, policy.split('-of-'))
             (folder / 'secrets').mkdir(exist_ok=True)
             (folder / 'secrets' / 'hosted-context.sealed').write_bytes(b'exact saved native context')
             (folder / 'setup-status.json').write_text(json.dumps({'phase': 'waiting_joins',
@@ -53,6 +57,7 @@ class HostedControllerTests(unittest.TestCase):
                 raise ValueError('Lost response after saved context')
         if action == 'setup-info':
             return json.dumps({'vault': self.vault, 'own_slot': self.slot, 'member_count': self.count,
+                               'threshold': self.threshold,
                                'fingerprint': 'c' * 64, 'network': 'regtest', 'members': []})
         if action == 'setup-invite':
             args[1].write_bytes(b'private invitation')
@@ -73,6 +78,26 @@ class HostedControllerTests(unittest.TestCase):
             self.assertEqual(self.wallet.create(f'Vault {count}', count), result)
         self.assertEqual(sum(action == 'identity' for action, _ in self.calls), 2)
         self.assertEqual(sum(action == 'setup-create' for action, _ in self.calls), 2)
+
+    def test_three_of_four_policy_is_bound_to_native_setup(self):
+        with self.assertRaisesRegex(ValueError, 'supported vault policy'):
+            self.wallet.create('All must sign', 3, 3)
+        self.threshold = 3
+        result = self.wallet.create('Three member quorum', 4, 3)
+        _, local = self.wallet.vault_dir(result['vault'])
+        self.assertEqual((local['threshold'], local['members']), (3, 4))
+        self.assertIn('setup-create', [action for action, _ in self.calls])
+        native = self.controller.native
+
+        def mismatched(action, folder, *args, **kwargs):
+            result = native(action, folder, *args, **kwargs)
+            if action == 'setup-info':
+                return json.dumps({**json.loads(result), 'threshold': 2})
+            return result
+
+        self.controller.native = mismatched
+        with self.assertRaisesRegex(ValueError, 'policy differs'):
+            self.wallet.create('Mismatch', 4, 3)
 
     def test_join_is_native_verified_and_reuses_pending_slot_four(self):
         self.slot = 4

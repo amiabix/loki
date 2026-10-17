@@ -65,14 +65,17 @@ fn setup_rejects_malformed_and_out_of_range_fields() {
     assert!(decode_record(&canonical::encode(&Value::Array(fields)).unwrap()).is_err());
 }
 #[test]
-fn setup_payload_limit_and_both_policies() {
-    for count in [3, 4] {
+fn setup_payload_limit_and_supported_policies() {
+    for (threshold, count) in [(2, 3), (2, 4), (3, 4)] {
         let mut input = record();
+        input.threshold = threshold;
         input.member_count = count;
         input.key.recipient = count;
         input.payload = vec![23; 1048576];
         let encoded = encode_record(&input).unwrap();
-        assert_eq!(decode_record(&encoded).unwrap().payload.len(), 1048576);
+        let decoded = decode_record(&encoded).unwrap();
+        assert_eq!((decoded.threshold, decoded.member_count), (threshold, count));
+        assert_eq!(decoded.payload.len(), 1048576);
     }
 }
 #[test]

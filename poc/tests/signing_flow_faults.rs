@@ -151,7 +151,7 @@ fn run_review_and_rollback(member_count: u16, pair: [u16; 2]) {
         vault: ak,
         payment: intent.proposal_id(),
         attempt: AttemptId::random(),
-        pair,
+        signers: pair.to_vec(),
     };
     let alice_identity = Identity::new(first);
     let bob_identity = Identity::new(second);
@@ -342,7 +342,7 @@ fn run_review_and_rollback(member_count: u16, pair: [u16; 2]) {
     assert_eq!(reviewed.summary().vault, ak);
     assert_eq!(reviewed.summary().payment, intent.proposal_id());
     assert_eq!(reviewed.summary().attempt, ctx.attempt);
-    assert_eq!(reviewed.summary().pair, pair);
+    assert_eq!(reviewed.summary().signers, pair);
     assert_eq!(
         reviewed.summary().recipient,
         recipient.to_raw_address_bytes()

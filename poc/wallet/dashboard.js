@@ -167,9 +167,9 @@ $('create-vault').addEventListener('submit', async (event) => {
   button.disabled = true;
   try {
     const name = new FormData(event.target).get('name');
-    const members = Number(new FormData(event.target).get('members'));
-    const {action} = await call('action', {kind: 'create', name, members});
-    message(`Approve creation of the 2-of-${members} “${name}” vault in your signer window.`);
+    const [threshold, members] = new FormData(event.target).get('policy').split('-of-').map(Number);
+    const {action} = await call('action', {kind: 'create', name, members, threshold});
+    message(`Approve creation of the ${threshold}-of-${members} “${name}” vault in your signer window.`);
     for (let i = 0; i < 300; i++) {
       await new Promise(resolve => setTimeout(resolve, 1000));
       const result = await call('action-poll', {action});

@@ -59,6 +59,22 @@ pub fn manifest_pair(value: &Value) -> Result<[u16; 2], String> {
     Ok(pair)
 }
 
+fn manifest_signers(value: &Value) -> Result<Vec<u16>, String> {
+    match value["version"].as_u64() {
+        Some(1) if value.get("signers").is_none() => Ok(manifest_pair(value)?.to_vec()),
+        Some(2) if value.get("pair").is_none() => {
+            let ids = value["signers"].as_array().ok_or("payment needs three signer IDs")?;
+            if ids.len() != 3 {
+                return Err("payment needs three signer IDs".into());
+            }
+            ids.iter()
+                .map(|id| u16::try_from(id.as_u64().ok_or("invalid signer ID")?).map_err(|_| "invalid signer ID".into()))
+                .collect()
+        }
+        _ => Err("unsupported payment signer format".into()),
+    }
+}
+
 pub fn proposer_id(bytes: &[u8]) -> Result<u16, String> {
     (1u16..=4)
         .find(|id| frost::Identifier::try_from(*id).is_ok_and(|member| member.serialize() == bytes))
@@ -77,7 +93,7 @@ pub fn parse_for_network(
         return Err("payment manifest exceeds 8192 bytes".into());
     }
     let value: Value = serde_json::from_slice(raw).map_err(|e| format!("manifest: {e}"))?;
-    if value["version"] != 1 || value["network"] != network.label() {
+    if !matches!(value["version"].as_u64(), Some(1 | 2)) || value["network"] != network.label() {
         return Err("unsupported payment manifest".into());
     }
     let notes = value["input_nullifiers"]
@@ -118,7 +134,7 @@ pub fn parse_for_network(
         vault: hex(&value, "vault")?,
         payment: hex(&value, "payment")?,
         attempt: AttemptId(hex(&value, "attempt")?),
-        pair: manifest_pair(&value)?,
+        signers: manifest_signers(&value)?,
     };
     context.validate()?;
     if context.payment != intent.proposal_id() {
@@ -130,6 +146,7 @@ pub fn parse_for_network(
 
 pub fn validate_roster(
     vault: [u8; 32],
+    threshold: u16,
     member_ids: impl IntoIterator<Item = u16>,
     context: &SessionContext,
     intent: &Intent,
@@ -138,8 +155,10 @@ pub fn validate_roster(
     if context.vault != vault {
         return Err("manifest names another vault".into());
     }
-    if context.pair.iter().any(|id| !ids.contains(id)) {
-        return Err("payment pair includes a member outside this vault".into());
+    if context.signers.len() != usize::from(threshold)
+        || context.signers.iter().any(|id| !ids.contains(id))
+    {
+        return Err("payment signer set differs from certified vault policy".into());
     }
     if !ids.contains(&proposer_id(&intent.proposer)?) {
         return Err("payment proposer is not a vault member".into());
@@ -148,7 +167,7 @@ pub fn validate_roster(
 }
 
 pub fn encode_proposal(raw: &[u8]) -> Result<Vec<u8>, String> {
-    require_explicit_pair(raw)?;
+    require_explicit_signers(raw)?;
     parse(raw)?;
     let mut out = Vec::with_capacity(PROPOSAL_DOMAIN.len() + raw.len());
     out.extend_from_slice(PROPOSAL_DOMAIN);
@@ -160,18 +179,20 @@ pub fn decode_proposal(raw: &[u8]) -> Result<Option<&[u8]>, String> {
     let Some(manifest) = raw.strip_prefix(PROPOSAL_DOMAIN) else {
         return Ok(None);
     };
-    require_explicit_pair(manifest)?;
+    require_explicit_signers(manifest)?;
     parse(manifest)?;
     Ok(Some(manifest))
 }
 
-fn require_explicit_pair(raw: &[u8]) -> Result<(), String> {
+fn require_explicit_signers(raw: &[u8]) -> Result<(), String> {
     if raw.len() > MAX_MANIFEST {
         return Err("payment manifest exceeds 8192 bytes".into());
     }
     let value: Value = serde_json::from_slice(raw).map_err(|e| format!("manifest: {e}"))?;
-    if value.get("pair").is_none() {
-        return Err("relay proposal requires an explicit signing pair".into());
+    if (value["version"] == 1 && value.get("pair").is_none())
+        || (value["version"] == 2 && value.get("signers").is_none())
+    {
+        return Err("relay proposal requires an explicit signer set".into());
     }
     Ok(())
 }
@@ -233,10 +254,28 @@ mod tests {
     #[test]
     fn proposal_must_match_certified_vault_and_roster() {
         let (context, intent) = parse(&fixture()).unwrap();
-        assert!(validate_roster([9; 32], [1, 2, 3], &context, &intent).is_ok());
-        assert!(validate_roster([1; 32], [1, 2, 3], &context, &intent).is_err());
-        assert!(validate_roster([9; 32], [1, 2], &context, &intent).is_err());
+        assert!(validate_roster([9; 32], 2, [1, 2, 3], &context, &intent).is_ok());
+        assert!(validate_roster([1; 32], 2, [1, 2, 3], &context, &intent).is_err());
+        assert!(validate_roster([9; 32], 2, [1, 2], &context, &intent).is_err());
+        assert!(validate_roster([9; 32], 3, [1, 2, 3, 4], &context, &intent).is_err());
         assert_eq!(proposer_id(&intent.proposer).unwrap(), 1);
+    }
+
+    #[test]
+    fn three_signer_manifest_requires_exact_certified_threshold() {
+        let mut value: Value = serde_json::from_slice(&fixture()).unwrap();
+        value["version"] = json!(2);
+        value.as_object_mut().unwrap().remove("pair");
+        value["signers"] = json!([1, 2, 4]);
+        let raw = serde_json::to_vec(&value).unwrap();
+        let (context, intent) = parse(&raw).unwrap();
+        assert_eq!(context.signers, vec![1, 2, 4]);
+        assert!(validate_roster([9; 32], 3, [1, 2, 3, 4], &context, &intent).is_ok());
+        assert!(validate_roster([9; 32], 2, [1, 2, 3, 4], &context, &intent).is_err());
+        value["signers"] = json!([1, 2]);
+        assert!(parse(&serde_json::to_vec(&value).unwrap()).is_err());
+        value["signers"] = json!([1, 4, 2]);
+        assert!(parse(&serde_json::to_vec(&value).unwrap()).is_err());
     }
 
     #[test]

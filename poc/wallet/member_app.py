@@ -12,6 +12,7 @@ import fcntl
 import hashlib
 import http.client
 import ipaddress
+from itertools import combinations
 import json
 import os
 import re
@@ -38,6 +39,23 @@ SEED_WALLET = HERE.parent / "target" / "debug" / "loki_seed_wallet"
 # yet, is a normal outcome of asking too early rather than a failure to report.
 PAYMENT_WAITING = re.compile(r"\bwaiting for member \d+\b|\btransaction is not mined\b"
                              r"|\bTransaction not found in mempool or best chain\b")
+
+
+def supported_policy(threshold, members):
+    return type(threshold) is int and type(members) is int and (threshold, members) in ((2, 3), (2, 4), (3, 4))
+
+
+def selected_signers(manifest, threshold, members):
+    if manifest.get("version") == 1 and threshold == 2 and "signers" not in manifest:
+        ids = manifest.get("pair", [1, 2])
+    elif manifest.get("version") == 2 and threshold == 3 and "pair" not in manifest:
+        ids = manifest.get("signers")
+    else:
+        raise ValueError("Payment signer format differs from this vault")
+    if not isinstance(ids, list) or len(ids) != threshold or any(type(id) is not int for id in ids) \
+            or ids != sorted(set(ids)) or not all(1 <= id <= members for id in ids):
+        raise ValueError("Payment signer set differs from this vault")
+    return ids
 
 
 def encoded(value):
@@ -270,9 +288,9 @@ class SignerSessions:
         name = value["name"].strip()
         if not 1 <= len(name.encode()) <= 80:
             raise ValueError("Enter a vault name of 1 to 80 UTF-8 bytes")
-        members = value.get("members", 3)
-        if type(members) is not int or members not in (3, 4):
-            raise ValueError("Choose a 2-of-3 or 2-of-4 vault")
+        members, threshold = value.get("members", 3), value.get("threshold", 2)
+        if not supported_policy(threshold, members):
+            raise ValueError("Choose a supported vault policy")
         if kind == "relay-setup" and (not isinstance(value.get("vault"), str)
                 or not re.fullmatch(r"[0-9a-f]{64}", value["vault"])):
             raise ValueError("Invalid vault ID")
@@ -286,14 +304,14 @@ class SignerSessions:
             action = secrets.token_urlsafe(32)
             self.actions[action] = {"session": key, "origin": origin, "kind": kind,
                                     "name": name, **({"vault": value["vault"]} if kind == "relay-setup" else
-                                                     {"members": members}),
+                                                     {"members": members, "threshold": threshold}),
                                     "state": "pending", "expires": self.now() + 300}
             return action
 
     def pending_actions(self):
         with self.lock:
             return [{"action": action, "origin": item["origin"], "kind": item["kind"],
-                     "name": item["name"], **{field: item[field] for field in ("vault", "members") if field in item}}
+                     "name": item["name"], **{field: item[field] for field in ("vault", "members", "threshold") if field in item}}
                     for action, item in self.actions.items()
                     if item["state"] == "pending" and item["expires"] > self.now()
                     and self._valid(item["session"], item["origin"])]
@@ -306,7 +324,7 @@ class SignerSessions:
                 raise ValueError("Vault request missing or expired")
             item["state"] = "executing"
             return {"kind": item["kind"], "name": item["name"],
-                    **{field: item[field] for field in ("vault", "members") if field in item}}
+                    **{field: item[field] for field in ("vault", "members", "threshold") if field in item}}
 
     def finish_action(self, action, result=None, error=None):
         with self.lock:
@@ -506,7 +524,7 @@ class Wallet:
             raise ValueError("Use this vault's operator relay connection controls")
         if not (member / "final-backup-checked").is_file():
             raise ValueError("Check your final backup before setting up relays")
-        if local.get("members") not in (3, 4):
+        if not supported_policy(local.get("threshold", 2), local.get("members")):
             raise ValueError("Unsupported vault policy")
         if (member / "transport.json").exists():
             raise ValueError("Local test relays require all three apps to use the same local exchange directory")
@@ -751,14 +769,14 @@ class Wallet:
                 courier_request(origin, "PUT", f"/setup/{vault}/files/{name}", token,
                                 (folder / name).read_bytes())
 
-    def create(self, name, members=3):
+    def create(self, name, members=3, threshold=2):
+        if not supported_policy(threshold, members):
+            raise ValueError("Choose a supported vault policy")
         if self.hosted:
-            return self.hosted.create(f"2-of-{members}", name)
+            return self.hosted.create(f"{threshold}-of-{members}", name)
         profile = self.require_profile()
         if not isinstance(name, str) or not 1 <= len(name.strip()) <= 80:
             raise ValueError("Enter a vault name of 1 to 80 characters")
-        if type(members) is not int or members not in (3, 4):
-            raise ValueError("Choose a 2-of-3 or 2-of-4 vault")
         birth_height = None
         if self.network == "testnet":
             birth_height = json.loads(self.command("testnet-status"))["height"]
@@ -770,7 +788,7 @@ class Wallet:
         local = self.data / "vaults" / vault
         local.mkdir(mode=0o700, parents=True)
         tokens = {slot: secrets.token_urlsafe(24) for slot in range(2, members + 1)}
-        draft = {"vault": vault, "name": name.strip(), "threshold": 2,
+        draft = {"vault": vault, "name": name.strip(), "threshold": threshold,
                  "members": members,
                  "expires_at": int(time.time()) + INVITE_TTL,
                  "invites": {str(slot): hashlib.sha256(token.encode()).hexdigest() for slot, token in tokens.items()}}
@@ -781,7 +799,7 @@ class Wallet:
         write_new(folder / "join-1.json", json.dumps(identity).encode())
         write_new(local / "membership.json", json.dumps({"vault": vault, "slot": 1,
                                                           "name": name.strip(), "profile": profile["id"],
-                                                          "threshold": 2, "members": members,
+                                                          "threshold": threshold, "members": members,
                                                           "network": self.network,
                                                           "birth_height": birth_height}).encode())
         invites = [encoded({"vault": vault, "slot": slot, "secret": token,
@@ -818,7 +836,8 @@ class Wallet:
                                           or not 4_465_026 <= draft["birth_height"] <= 0xffffffff):
             raise ValueError("Testnet invite has no valid birth height")
         members = draft.get("members", 3)
-        if draft.get("threshold") != 2 or type(members) is not int or members not in (3, 4) \
+        threshold = draft.get("threshold")
+        if not supported_policy(threshold, members) \
                 or not isinstance(draft.get("name"), str) or not 1 <= len(draft["name"].encode()) <= 80:
             raise ValueError("Unsupported vault draft")
         if type(slot) is not int or slot not in range(2, members + 1) or not isinstance(secret, str) \
@@ -834,7 +853,7 @@ class Wallet:
         write_new(folder / f"join-{slot}.json", json.dumps(identity).encode())
         write_new(local / "membership.json", json.dumps({"vault": vault, "slot": slot,
                                                           "name": draft["name"], "profile": profile["id"],
-                                                          "threshold": 2, "members": members,
+                                                          "threshold": threshold, "members": members,
                                                           "network": self.network,
                                                           "birth_height": draft.get("birth_height")}).encode())
         if origin:
@@ -904,7 +923,7 @@ class Wallet:
             return {"members": members, "fingerprint": None}
         if [member["id"] for member in members] != list(range(1, total + 1)):
             raise ValueError("Member slots do not match the roster")
-        roster = {"vault": vault, "threshold": 2, "members": members}
+        roster = {"vault": vault, "threshold": local.get("threshold", 2), "members": members}
         if self.network == "testnet":
             roster.update(network="testnet", birth_height=local["birth_height"])
         write_path = member_dir / "roster.json"
@@ -1208,13 +1227,13 @@ class Wallet:
         if not isinstance(memo, str) or not memo or len(memo.encode()) > 512:
             raise ValueError("Enter a memo of 1 to 512 bytes")
         labels = "ABCD"[:local["members"]]
-        pairs = tuple(a + b for i, a in enumerate(labels) for b in labels[i + 1:])
+        threshold = local.get("threshold", 2)
+        choices = tuple("".join(items) for items in combinations(labels, threshold))
         if pair is None:
-            # The first pair that includes this member: no dropdown, same answer every time.
-            pair = next((item for item in pairs
+            pair = next((item for item in choices
                          if chr(ord("A") + local["slot"] - 1) in item), None)
-        if pair not in pairs:
-            raise ValueError("Choose two members of this vault")
+        if pair not in choices:
+            raise ValueError(f"Choose {threshold} members of this vault")
         drafts = member_dir / "payments"
         drafts.mkdir(mode=0o700, exist_ok=True)
         work = Path(tempfile.mkdtemp(prefix="payment-", dir=drafts))
@@ -1222,7 +1241,8 @@ class Wallet:
             self.command("prepare", member_dir, "@pass", member_dir / "roster.json", work,
                          recipient.strip(), amount_zat, memo, pair, binary=PAYMENT, timeout=120)
             manifest = read_json(work / "payment.json")
-            if manifest.get("vault") != vault or manifest.get("pair") != [ord(c) - ord("A") + 1 for c in pair] \
+            signers = selected_signers(manifest, threshold, local["members"])
+            if manifest.get("vault") != vault or signers != [ord(c) - ord("A") + 1 for c in pair] \
                     or manifest.get("amount_zat") != int(amount_zat):
                 raise ValueError("Payment draft does not match this vault and request")
             attempt = manifest.get("attempt")
@@ -1238,14 +1258,15 @@ class Wallet:
                     "attempt": attempt,
                     "recipient": recipient.strip(), "amount_zat": str(manifest["amount_zat"]),
                     "fee_zat": str(manifest["fee_zat"]), "change_zat": str(manifest["change_zat"]),
-                    "expiry_height": manifest["expiry_height"], "pair": manifest["pair"]}
+                    "expiry_height": manifest["expiry_height"], "signers": signers,
+                    **({"pair": signers} if threshold == 2 else {})}
         except Exception:
             shutil.rmtree(work)
             raise
 
     def payment(self, vault, attempt):
         member_dir, local = self.vault_dir(vault)
-        if local.get("threshold", 2) != 2 or local.get("members") not in (3, 4):
+        if not supported_policy(local.get("threshold", 2), local.get("members")):
             raise ValueError("Unsupported vault policy")
         if not (member_dir / "final-backup-checked").is_file():
             raise ValueError("Vault is not active")
@@ -1254,8 +1275,7 @@ class Wallet:
         for work in (member_dir / "payments").glob("*/payment.json"):
             manifest = read_json(work)
             if manifest.get("attempt") == attempt and manifest.get("vault") == vault:
-                if manifest.get("pair") not in ([a, b] for a in range(1, local["members"] + 1) for b in range(a + 1, local["members"] + 1)):
-                    raise ValueError("Invalid payment pair")
+                selected_signers(manifest, local.get("threshold", 2), local["members"])
                 return member_dir, local, work.parent, manifest
         raise ValueError("Payment is not in this member's vault")
 
@@ -1273,7 +1293,8 @@ class Wallet:
             status = self.payment_phase(path.parent)
             phase = status["phase"]
             ready_to_send = False
-            is_signer = local["slot"] in manifest["pair"]
+            signers = selected_signers(manifest, local.get("threshold", 2), local["members"])
+            is_signer = local["slot"] in signers
             if phase in ("published", "received", "commitments", "package", "approved") \
                     and (not is_signer or phase == "approved"):
                 try:
@@ -1300,7 +1321,7 @@ class Wallet:
                 if phase == "confirmation_needs_recheck":
                     self.payment_status(path.parent, phase, status.get("txid"))
             items.append({"attempt": attempt, "payment": manifest.get("payment"),
-                          "pair": manifest.get("pair"), "phase": phase,
+                          "signers": signers, "phase": phase,
                           "ready_to_send": ready_to_send,
                           **({"txid": status["txid"]} if status.get("txid") else {})})
         relay_ready, relay_detail = self.payment_readiness()
@@ -1330,9 +1351,9 @@ class Wallet:
         member_dir, local = self.vault_dir(vault)
         if self.transport == "hosted" or local.get("transport") == "hosted":
             raise ValueError("Hosted vaults attach to relays automatically")
-        if local.get("threshold", 2) != 2 or local.get("members") not in (3, 4) \
+        if not supported_policy(local.get("threshold", 2), local.get("members")) \
                 or not (member_dir / "final-backup-checked").is_file():
-            raise ValueError("Relay setup requires an active 2-of-3 or 2-of-4 vault")
+            raise ValueError("Relay setup requires an active supported vault")
         return member_dir, local, ("--member-root", member_dir, "--passphrase-file", "@pass",
                                    "--roster", member_dir / "roster.json")
 
@@ -1451,7 +1472,7 @@ class Wallet:
 
     def sync_payments(self, vault):
         member_dir, local = self.vault_dir(vault)
-        if local.get("threshold", 2) != 2 or local.get("members") not in (3, 4) \
+        if not supported_policy(local.get("threshold", 2), local.get("members")) \
                 or not (member_dir / "final-backup-checked").is_file():
             raise ValueError("Relay payments require an active supported vault")
         if local.get("transport") == "hosted" and not (member_dir / "secrets" / "activation.sealed").is_file():
@@ -1521,8 +1542,8 @@ class Wallet:
 
     def commit_payment(self, vault, attempt):
         _, local, _, manifest = self.payment(vault, attempt)
-        if local["slot"] not in manifest["pair"]:
-            raise ValueError("This member is not in the selected signing pair")
+        if local["slot"] not in selected_signers(manifest, local.get("threshold", 2), local["members"]):
+            raise ValueError("This member is not in the selected signer set")
         if self.balance(vault)["height"] >= manifest["expiry_height"]:
             raise ValueError("This payment has expired on this member's chain view")
         _, work, _, _ = self.payment_command("commit", vault, attempt)
@@ -1531,17 +1552,19 @@ class Wallet:
 
     def package_payment(self, vault, attempt):
         _, local, _, manifest = self.payment(vault, attempt)
-        if local["slot"] != manifest["pair"][0]:
+        if local["slot"] != selected_signers(manifest, local.get("threshold", 2), local["members"])[0]:
             raise ValueError("Only the first selected signer can build the package")
         _, work, _, _ = self.payment_command("package", vault, attempt)
         self.payment_status(work, "package")
         return {"phase": "package"}
 
     def review_payment(self, vault, attempt):
-        _, _, manifest, output = self.payment_command("review", vault, attempt)
+        local, _, manifest, output = self.payment_command("review", vault, attempt)
         review = json.loads(output)
+        signers = selected_signers(manifest, local.get("threshold", 2), local["members"])
         if review.get("vault") != vault or review.get("payment") != manifest.get("payment") \
-                or review.get("attempt") != attempt or review.get("pair") != manifest.get("pair") \
+                or review.get("attempt") != attempt \
+                or review.get("pair" if local.get("threshold", 2) == 2 else "signers") != signers \
                 or review.get("authorization_required") is not True:
             raise ValueError("Verified review differs from this payment")
         return review
@@ -1555,7 +1578,7 @@ class Wallet:
 
     def resend_payment(self, vault, attempt):
         _, local, work, manifest = self.payment(vault, attempt)
-        if local["slot"] not in manifest["pair"]:
+        if local["slot"] not in selected_signers(manifest, local.get("threshold", 2), local["members"]):
             raise ValueError("Only a selected signer can retry saved signing messages")
         self.payment_command("resend", vault, attempt)
         self.payment_status(work, "approval_pending_delivery")
@@ -1587,7 +1610,7 @@ class Wallet:
         step: it is this member's decision about the exact transaction bytes, so
         neither approve_payment nor an accepted review is ever reached from here."""
         _, local, work, manifest = self.payment(vault, attempt)
-        slot, pair, did = local["slot"], manifest["pair"], []
+        slot, pair, did = local["slot"], selected_signers(manifest, local.get("threshold", 2), local["members"]), []
         while True:
             state = self.payment_phase(work)
             phase = state["phase"]
@@ -1642,7 +1665,7 @@ class Wallet:
             total = local.get("members", 3)
             slot = local.get("slot")
             if saved.get("vault") != vault or saved.get("threshold") != local.get("threshold", 2) \
-                    or local.get("threshold", 2) != 2 or type(total) is not int or total not in (3, 4) \
+                    or not supported_policy(local.get("threshold", 2), total) \
                     or not isinstance(members, list) or len(members) != total \
                     or any(not isinstance(member, dict) for member in members) \
                     or [member.get("id") for member in members] != list(range(1, total + 1)) \
@@ -1991,7 +2014,7 @@ def make_signer_server(wallet, port, dashboard_port=None):
                                     raise ValueError("Vault name changed; request relay setup again")
                                 result = wallet.setup_relays(details["vault"])
                             else:
-                                result = wallet.create(details["name"], details["members"])
+                                result = wallet.create(details["name"], details["members"], details["threshold"])
                         except Exception as error:
                             sessions.finish_action(action, error=str(error))
                             raise
@@ -2004,7 +2027,8 @@ def make_signer_server(wallet, port, dashboard_port=None):
                         "/api/profile-create": lambda: wallet.create_profile(value.get("name"), value.get("passphrase")),
                         "/api/unlock": lambda: wallet.unlock(value.get("passphrase")),
                         "/api/lock": wallet.lock_profile,
-                        "/api/create": lambda: wallet.create(value.get("name"), value.get("members", 3)),
+                        "/api/create": lambda: wallet.create(value.get("name"), value.get("members", 3),
+                                                               value.get("threshold", 2)),
                         "/api/join": lambda: wallet.join(value.get("invite")),
                         "/api/begin-link": lambda: wallet.begin_link(value.get("vault")),
                         "/api/link": lambda: wallet.link(value.get("vault"), value.get("proof")),

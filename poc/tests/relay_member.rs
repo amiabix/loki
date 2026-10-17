@@ -542,6 +542,7 @@ fn config_members() -> Vec<loki_poc::relay_member::LoadedMember> {
         .map(|identity| loki_poc::relay_member::LoadedMember {
             identity,
             roster: roster.clone(),
+            threshold: 2,
         })
         .collect()
 }
@@ -605,6 +606,7 @@ fn sealed_revision_codec_authenticated_association() {
     let wrong = loki_poc::relay_member::LoadedMember {
         identity,
         roster: wrong_roster,
+        threshold: 2,
     };
     assert!(restored.authenticated(&wrong).is_err());
 }

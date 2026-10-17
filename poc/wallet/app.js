@@ -8,6 +8,7 @@ catch { selectedVault = null; }
 let linkChallenge = null;
 let memberSlot = null;
 let memberCount = null;
+let memberThreshold = null;
 let renderedPaymentVault = null;
 let midFlight = [];
 let pumping = false;
@@ -148,14 +149,14 @@ function vaultList(vaults) {
 /* ── one payment, five stages ───────────────────────────────────────────────
    A member is told where the payment is, never which protocol call comes next.
    Every mechanical step — publish, commit, package, resend, the on-chain
-   check — is performed by payment-advance on a poll. Exactly two
-   controls remain, because exactly two things are human decisions: approving
+   check — is performed by payment-advance on a poll. Two
+   controls remain, because the human decisions are approving
    an exact transaction that is on screen, and sending it. */
 
 const STAGES = [
   ['Propose', 'the proposal reaches every member'],
   ['Review', 'each signer checks the exact transaction'],
-  ['Approve', 'two members approve'],
+  ['Approve', 'the selected members approve'],
   ['Ready to send', 'the signed transaction goes to the network'],
   ['Confirmed', 'mined on this device’s chain view'],
 ];
@@ -230,7 +231,7 @@ function paymentButton(label, run) {
   return button;
 }
 
-function stageList(current, state, detail) {
+function stageList(current, state, detail, threshold) {
   const list = document.createElement('div');
   list.className = 'roster';
   STAGES.forEach(([name, says], index) => {
@@ -241,7 +242,7 @@ function stageList(current, state, detail) {
     const says_now = document.createElement('span');
     if (index < current) { row.classList.add('agreed'); says_now.textContent = 'done'; }
     else if (index === current) { row.classList.add(state); says_now.textContent = detail; }
-    else says_now.textContent = says;
+    else says_now.textContent = index === 2 ? `${threshold} selected members approve` : says;
     row.append(stage, says_now);
     list.append(row);
   });
@@ -267,7 +268,7 @@ async function refreshPayments() {
   if (!state.payments.length) { list.textContent = 'No payments in this member’s app.'; return; }
   for (const payment of state.payments) {
     if (!SETTLED.has(payment.phase)) midFlight.push(payment.attempt);
-    const isSigner = payment.pair.includes(memberSlot);
+    const isSigner = payment.signers.includes(memberSlot);
     /* the exact transaction is fetched as soon as it can be read: checking it
        is not a decision, so it is not a button */
     if (isSigner && ['commitments', 'package'].includes(payment.phase)
@@ -281,14 +282,14 @@ async function refreshPayments() {
     let [current, rowState, detail] =
       PHASES[payment.phase] || [0, 'waiting', payment.phase.replaceAll('_', ' ')];
     if (review && current === 1) [current, rowState, detail] = [2, 'waiting', 'your approval is the next step'];
-    if (payment.ready_to_send) [current, rowState, detail] = [3, 'agreed', 'two approvals verified; ready to send'];
+    if (payment.ready_to_send) [current, rowState, detail] = [3, 'agreed', `${payment.signers.length} approvals verified; ready to send`];
 
     const card = document.createElement('section');
     card.className = 'card';
     const title = document.createElement('h3');
     title.textContent = `Payment ${payment.payment?.slice(0, 12) || payment.attempt.slice(0, 12)}…`;
-    card.append(title, stageList(current, rowState, detail));
-    card.append(note(`Signers: members ${payment.pair.join(' and ')}${isSigner ? ' — you are one of them' : ''}`
+    card.append(title, stageList(current, rowState, detail, payment.signers.length));
+    card.append(note(`Signers: members ${payment.signers.join(', ')}${isSigner ? ' — you are one of them' : ''}`
                      + (payment.txid ? ` · transaction ${payment.txid.slice(0, 16)}…` : '')));
     const did = paymentActivity.get(payment.attempt);
     if (did?.length) card.append(note(`Just ran on this device: ${did.join(', ')}.`));
@@ -315,7 +316,7 @@ async function refreshPayments() {
       else card.append(paymentButton('Approve this exact transaction', async () => {
         await api('payment-approve', {vault, attempt: payment.attempt, review_token: review.review_token});
         paymentReviews.delete(payment.attempt);
-        message('Approved. Your approval is on its way to the other member.');
+        message('Approved. Your approval is on its way to the other members.');
       }));
     }
 
@@ -410,7 +411,7 @@ async function refreshSignerRequests(unlocked) {
     const relaySetup = action.kind === 'relay-setup';
     description.textContent = relaySetup
       ? `${action.origin} requests local test relay setup for “${action.name}”. This configures only your own membership; the other members do the same in their apps.`
-      : `${action.origin} requests a 2-of-${action.members} vault named “${action.name}” on ${currentNetwork}.`;
+      : `${action.origin} requests a ${action.threshold ?? 2}-of-${action.members} vault named “${action.name}” on ${currentNetwork}.`;
     const approve = document.createElement('button');
     approve.type = 'button';
     approve.textContent = relaySetup ? 'Set up local relays' : 'Create this vault';
@@ -736,8 +737,26 @@ async function refresh() {
       else if (state.phase === 'active') {
         $('active').hidden = false;
         memberSlot = state.slot;
-        const paymentAvailable = [3, 4].includes(state.total_members) && (state.transport !== 'hosted' || state.handoff === 'ready');
+        const paymentAvailable = [[2, 3], [2, 4], [3, 4]].some(([t, n]) => t === state.threshold && n === state.total_members)
+          && (state.transport !== 'hosted' || state.handoff === 'ready');
         memberCount = state.total_members;
+        memberThreshold = state.threshold;
+        const signerChoices = $('payment-signers');
+        if (signerChoices.dataset.policy !== `${memberThreshold}-of-${memberCount}-${memberSlot}`) {
+          signerChoices.replaceChildren();
+          const letters = 'ABCD'.slice(0, memberCount);
+          const pick = (start, chosen) => {
+            if (chosen.length === memberThreshold) {
+              const option = new Option(chosen.map(c => `Member ${letters.indexOf(c) + 1}`).join(', '), chosen.join(''));
+              signerChoices.add(option);
+              return;
+            }
+            for (let i = start; i < letters.length; i++) pick(i + 1, [...chosen, letters[i]]);
+          };
+          pick(0, []);
+          signerChoices.value = [...signerChoices.options].find(option => option.value.includes(letters[memberSlot - 1]))?.value || '';
+          signerChoices.dataset.policy = `${memberThreshold}-of-${memberCount}-${memberSlot}`;
+        }
         $('relay-setup').hidden = !paymentAvailable || state.transport === 'hosted';
         $('payment-unavailable').hidden = paymentAvailable;
         $('show-address').hidden = !paymentAvailable;
@@ -768,9 +787,10 @@ action('profile-create', async (form) => { await api('profile-create', fields(fo
 action('unlock', async (form) => { await api('unlock', fields(form)); message('Profile unlocked.'); });
 action('create', async (form) => {
   const inputs = fields(form);
-  const value = await api('create', {...inputs, members: Number(inputs.members)});
+  const [threshold, members] = inputs.policy.split('-of-').map(Number);
+  const value = await api('create', {name: inputs.name, threshold, members});
   selectVault(value.vault);
-  message(`Vault draft created. Invite the other ${inputs.members - 1} members.`);
+  message(`Vault draft created. Invite the other ${members - 1} members.`);
 });
 action('join', async (form) => {
   const value = await api('join', fields(form));
@@ -915,12 +935,12 @@ action('payment-draft', async (form) => {
   const vault = selectedVault;
   const value = fields(form);
   const amount_zat = zatFromZec(value.amount_zec);
-  const draft = await api('payment-draft', {vault, recipient: value.recipient, memo: value.memo, amount_zat});
+  const draft = await api('payment-draft', {vault, recipient: value.recipient, memo: value.memo, amount_zat, pair: value.pair});
   if (selectedVault !== vault) return;
   $('draft-result').textContent = `DRAFT · no member has approved or sent this payment\n`
     + `Payment ID: ${draft.payment}\n`
     + `Amount: ${zecFromZat(amount_zat)} ZEC (${amount_zat} zat)\n`
-    + `Signers: members ${draft.pair.join(' and ')}`;
+    + `Signers: members ${draft.signers.join(', ')}`;
   $('draft-result').hidden = false;
   $('amount-zat').textContent = 'Up to 8 decimal places.';
   await api('payment-publish', {vault, attempt: draft.attempt});

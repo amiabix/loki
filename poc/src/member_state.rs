@@ -96,12 +96,12 @@ impl Roster {
                 .map_err(|_| "invalid roster threshold")?
         };
         let count = members.len();
-        if !matches!((threshold, count), (2, 3) | (2, 4))
+        if !matches!((threshold, count), (2, 3) | (2, 4) | (3, 4))
             || (legacy && count != 3)
             || members.keys().copied().collect::<Vec<_>>() != (1..=count as u16).collect::<Vec<_>>()
         {
             return Err(
-                "supported rosters are 2-of-3 and 2-of-4 with consecutive member IDs".into(),
+                "supported rosters are 2-of-3, 2-of-4, and 3-of-4 with consecutive member IDs".into(),
             );
         }
         Ok(Self {
