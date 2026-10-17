@@ -11,6 +11,7 @@ use crate::{
 use rand_core::{OsRng, RngCore};
 use std::{collections::BTreeMap, path::Path};
 use zeroize::Zeroizing;
+use zcash_protocol::consensus::Parameters;
 
 const ERROR: &str = "setup_ceremony";
 const MAX_WIRE: usize = 66 * 1024;
@@ -997,7 +998,7 @@ impl SetupCeremony {
         let _secret = Zeroizing::new(std::mem::take(&mut certified.key_package));
         let key = zip2005::frost_viewing_key(&certified.group_ak, &self.snapshot.vs)
             .map_err(|_| ERROR)?;
-        Ok(vault::regtest_unified_address(&key))
+        Ok(vault::unified_address(&key, self.accepted.roster().network.network_type()))
     }
     pub(crate) fn certified_group_key(&self) -> Result<[u8; 32], String> {
         let mut certified = self.certified()?;
@@ -1028,7 +1029,7 @@ impl SetupCeremony {
         let _secret = Zeroizing::new(std::mem::take(&mut certified.key_package));
         let key = zip2005::frost_viewing_key(&certified.group_ak, &self.snapshot.vs)
             .map_err(|_| ERROR)?;
-        let address = vault::regtest_unified_address(&key);
+        let address = vault::unified_address(&key, self.accepted.roster().network.network_type());
         Ok(digest(
             b"Loki_bkup_v2",
             &[
@@ -1060,9 +1061,12 @@ impl SetupCeremony {
                 wipe(&mut self.0);
             }
         }
-        let value = PrivateJson(
-            serde_json::json!({"version":2,"backup_version":2,"network":"regtest","key_derivation":zip2005::VERSION,"vault":hex::encode(self.accepted.roster().vault),"threshold":2,"members":self.accepted.roster().members.len(),"roster_fingerprint":hex::encode(self.accepted.roster().fingerprint()),"identity_secret":hex::encode(&*identity),"key_package":hex::encode(&*secret),"vault_secret":hex::encode(&*self.snapshot.vs),"public_package":hex::encode(&certified.public_package),"group_ak":hex::encode(certified.group_ak),"address":address}),
+        let mut value = PrivateJson(
+            serde_json::json!({"version":2,"backup_version":2,"network":self.accepted.roster().network.label(),"key_derivation":zip2005::VERSION,"vault":hex::encode(self.accepted.roster().vault),"threshold":2,"members":self.accepted.roster().members.len(),"roster_fingerprint":hex::encode(self.accepted.roster().fingerprint()),"identity_secret":hex::encode(&*identity),"key_package":hex::encode(&*secret),"vault_secret":hex::encode(&*self.snapshot.vs),"public_package":hex::encode(&certified.public_package),"group_ak":hex::encode(certified.group_ak),"address":address}),
         );
+        if let Some(height) = self.accepted.roster().birth_height {
+            value.0["birth_height"] = serde_json::json!(height);
+        }
         Ok(Zeroizing::new(
             serde_json::to_vec(&value.0).map_err(|_| ERROR)?,
         ))

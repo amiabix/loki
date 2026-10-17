@@ -9,7 +9,7 @@ use zcash_protocol::consensus::Parameters;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
-    network::VaultNetwork,
+    network::{VaultNetwork, TESTNET_NU7_BIRTH},
     setup_transport::{Identity, PublicIdentity},
     state::MemberDir,
     vault, zip2005,
@@ -46,7 +46,7 @@ impl Roster {
                     .ok_or("Testnet roster needs a birth height")?
                     .try_into()
                     .map_err(|_| "invalid Testnet birth height")?;
-                if height < 4_465_026 {
+                if height < TESTNET_NU7_BIRTH {
                     return Err("Testnet birth height predates NU7".into());
                 }
                 Some(height)

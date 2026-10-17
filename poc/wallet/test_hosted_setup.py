@@ -102,6 +102,40 @@ class HostedControllerTests(unittest.TestCase):
             self.wallet.create('Treasury', 3)
         self.assertEqual(self.wallet.vaults(), [])
 
+    def test_testnet_creation_binds_native_policy_to_the_member_network(self):
+        self.wallet.network = 'testnet'
+        original = self.controller.native
+        create_args = []
+
+        def testnet_native(action, folder, *args, **kwargs):
+            if action == 'setup-create':
+                create_args.extend(args)
+            result = original(action, folder, *args, **kwargs)
+            if action == 'setup-info':
+                return json.dumps({**json.loads(result), 'network': 'testnet', 'birth_height': 4_465_026})
+            return result
+
+        self.controller.native = testnet_native
+        created = self.wallet.create('Testnet vault', 3)
+        self.assertEqual(self.wallet.vault_dir(created['vault'])[1]['network'], 'testnet')
+        self.assertEqual(self.wallet.status(created['vault'])['birth_height'], 4_465_026)
+        self.assertEqual(create_args[-2:], ['--network', 'testnet'])
+
+    def test_testnet_membership_requires_a_certified_scan_start(self):
+        self.wallet.network = 'testnet'
+        original = self.controller.native
+
+        def missing_birth(action, folder, *args, **kwargs):
+            result = original(action, folder, *args, **kwargs)
+            if action == 'setup-info':
+                return json.dumps({**json.loads(result), 'network': 'testnet'})
+            return result
+
+        self.controller.native = missing_birth
+        with self.assertRaisesRegex(ValueError, 'birth height'):
+            self.wallet.create('No scan start', 3)
+        self.assertEqual(self.wallet.vaults(), [])
+
     def test_existing_regtest_membership_without_network_can_resume(self):
         vault = self.wallet.create('Treasury', 3)['vault']
         membership = self.wallet.data / 'vaults' / vault / 'membership.json'

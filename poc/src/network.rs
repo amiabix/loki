@@ -4,6 +4,8 @@ use zcash_protocol::consensus::{
 
 use crate::candidate::Regtest;
 
+pub const TESTNET_NU7_BIRTH: u32 = 4_465_026;
+
 /// The only chains on which this research wallet may create vaults.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VaultNetwork {

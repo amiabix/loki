@@ -4,10 +4,10 @@
 
 The same member app can create a Testnet vault, check backups, receive, review,
 approve, and send. Start one process per member, with a separate private data
-directory and browser window. The app needs a synced NU7 Zcash Testnet node on
-loopback; it refuses vault creation while that node is behind. The node's RPC
-cookie must be an owner-only file. Testnet vaults have a certified creation
-block, so chain scans start there.
+directory and browser window. Balance and payment actions need a synced NU7
+Zcash Testnet node on loopback. Local courier creation also requires that node
+to choose the vault's birth block; hosted creation uses the fixed NU7 activation
+block. The node's RPC cookie must be an owner-only file.
 
 ```sh
 cd poc
@@ -29,8 +29,11 @@ their own app before proposing or approving. A dashboard is optional: pass
 For members on separate machines, each app needs its own local Testnet node or
 loopback RPC tunnel. The local setup courier needs a verified HTTPS front and
 `--invite-port` plus `--invite-origin` on the creator's app, as described below.
-Hosted setup is currently regtest only. Testnet payments through the browser
-have not yet been mined end to end; use disposable test funds.
+Hosted setup also accepts `--network testnet` with the signed operator bundle
+and enrollment issuer described below. Its certified roster uses the NU7
+activation block (4,465,026) as the scan start for every member. This is safe
+for deposits but can make the first scan slow. A hosted Testnet payment through
+the browser has not yet been mined end to end; use disposable test funds.
 
 ## Local regtest
 
@@ -333,9 +336,14 @@ Select hosted transport explicitly when starting the signer:
 python3 wallet/member_app.py --data /PRIVATE/NEW/MEMBER --exchange /PRIVATE/LOCAL/PLACEHOLDER --port 18801 --transport hosted --operator-bundle /PRIVATE/operators.cbor --operator-key TRUSTED_CONFIG_SIGNING_KEY_HEX --enrollment-issuer /PRIVATE/configured-issuer
 ```
 
+Add `--network testnet` for a hosted Testnet vault, and use it on every member's
+app. Each member still supplies their own loopback Testnet RPC settings for
+balance and payment actions. A wrong-network invitation is refused before the
+member's identity or claim is saved.
+
 The exchange placeholder is retained for compatibility with local startup arguments; hosted vault creation and payment handoff do not use a shared courier. Supply a scoped `--enrollment-grant` only when it belongs to the saved pending creator identity. A configured issuer receives the public creator key, selected policy and operator bundle path and returns the signed bounded grant on stdout. The product's production authentication/enrollment provider remains a deployment decision. Operator capabilities and issuer private keys stay off the signer. Development loopback requires explicit `--development-http`; production verifies HTTPS and the signed bundle.
 
-Both 2-of-3 and 2-of-4 policies use invitations delivered privately to the respective members, explicit fingerprint comparison and backup checks. While unlocked, the native worker resumes the saved setup, registers scoped inboxes, installs all certified peer configurations and reconciles every signed activation vote. There is no additional per-vault relay approval. Lock stops the worker, terminates its native command and revokes dashboard sessions. A retry keeps the saved identity, exact requests, encrypted DKG state and payment descriptors. Creating again with the same pending name and policy reopens that setup; choose a distinct name for another vault.
+Both 2-of-3 and 2-of-4 policies use invitations delivered privately to the respective members, explicit fingerprint comparison and backup checks. Start every member with the same network; a mismatched invitation is refused. While unlocked, the native worker resumes the saved setup, registers scoped inboxes, installs all certified peer configurations and reconciles every signed activation vote. There is no additional per-vault relay approval. Lock stops the worker, terminates its native command and revokes dashboard sessions. A retry keeps the saved identity, exact requests, encrypted DKG state and payment descriptors. Creating again with the same pending name and policy reopens that setup; choose a distinct name for another vault.
 
 Pending member slots appear beside the vault, separately from connection failures. Receiving and payment controls remain gated on checked backups and native payment activation. The dashboard receives public progress only and cannot retrieve keys, DKG packages, recovery words or capabilities. Hosted mode hides local relay-server setup and the local 5-ZEC faucet. Existing local vaults and their saved data retain the local path; there is no automatic migration or relay rotation.
 

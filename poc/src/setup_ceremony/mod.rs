@@ -8,7 +8,7 @@ pub use engine::{
     SavedCheckpoint, SetupCeremony,
 };
 pub(crate) mod journal;
-use crate::{member_state::Roster, setup_transport::Identity};
+use crate::{member_state::Roster, network::TESTNET_NU7_BIRTH, setup_transport::Identity};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub struct AcceptedCeremonyRoster {
@@ -19,7 +19,7 @@ pub struct AcceptedCeremonyRoster {
 }
 impl AcceptedCeremonyRoster {
     fn validate(roster: &Roster, network: &str, operator_digest: &[u8; 32]) -> Result<(), String> {
-        if network != "regtest"
+        if network != roster.network.label()
             || roster.vault == [0; 32]
             || *operator_digest == [0; 32]
             || roster.threshold != 2
@@ -141,7 +141,12 @@ impl AcceptedCeremonyRoster {
         {
             return Err("setup_agreement".into());
         }
-        let document=serde_json::to_vec(&serde_json::json!({"vault":hex::encode(policy.ceremony),"threshold":policy.threshold,"members":members.iter().map(|m|serde_json::json!({"id":m.id,"signing":hex::encode(m.signing),"encryption":hex::encode(m.encryption)})).collect::<Vec<_>>()})).map_err(|_|"setup_agreement")?;
+        let mut document = serde_json::json!({"vault":hex::encode(policy.ceremony),"threshold":policy.threshold,"members":members.iter().map(|m|serde_json::json!({"id":m.id,"signing":hex::encode(m.signing),"encryption":hex::encode(m.encryption)})).collect::<Vec<_>>()});
+        if policy.network == "testnet" {
+            document["network"] = serde_json::json!("testnet");
+            document["birth_height"] = serde_json::json!(TESTNET_NU7_BIRTH);
+        }
+        let document = serde_json::to_vec(&document).map_err(|_| "setup_agreement")?;
         let roster = Roster::from_bytes(&document).map_err(|_| "setup_agreement")?;
         Self::validate(&roster, &policy.network, &policy.config_digest)?;
         Ok(Self {

@@ -355,8 +355,6 @@ class Wallet:
     def __init__(self, data, exchange, setup=SETUP, invite_origin=None, transport="local", operator_bundle=None, operator_key=None, enrollment_grant=None, development_http=False, enrollment_issuer=None, network="regtest"):
         if network not in ("regtest", "testnet"):
             raise ValueError("Choose regtest or testnet")
-        if network == "testnet" and transport == "hosted":
-            raise ValueError("Hosted setup is not yet available on Testnet; use local courier setup")
         self.network = network
         self.data = data.resolve()
         self.exchange = exchange.resolve()
@@ -2152,8 +2150,6 @@ if __name__ == "__main__":
         parser.error("Hosted transport needs --operator-bundle and --operator-key")
     if args.transport == "hosted" and args.invite_port:
         parser.error("Hosted setup uses the admission service rather than --invite-port")
-    if args.network == "testnet" and args.transport == "hosted":
-        parser.error("Hosted setup is not yet available on Testnet")
     origin = args.invite_origin
     if args.invite_port and not origin:
         origin = f"http://127.0.0.1:{args.invite_port}"

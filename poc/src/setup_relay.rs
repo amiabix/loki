@@ -1,6 +1,7 @@
 mod activation;
 mod payment;
 use crate::{
+    network::{VaultNetwork, TESTNET_NU7_BIRTH},
     setup_ceremony::{
         journal::{self, Journal, MemberLock},
         AcceptedCeremonyRoster, AdmissionCheckpointAuthority, CeremonyPhase, CeremonyRecord,
@@ -239,7 +240,7 @@ impl Context {
             let request = signed_request(&self.create, identity)?;
             if invite.slot() != self.own_slot
                 || policy.member_count != self.count
-                || policy.network != "regtest"
+                || VaultNetwork::parse(&policy.network).is_err()
                 || policy.threshold != 2
                 || policy.config_digest != *operators.digest()
                 || invite.bootstrap_descriptor().is_none()
@@ -280,7 +281,7 @@ impl Context {
             return Err(ERROR.into());
         };
         if *ceremony == [0; 32]
-            || network != "regtest"
+            || VaultNetwork::parse(network).is_err()
             || *threshold != 2
             || *member_count != self.count
             || config_digest != operators.digest()
@@ -472,7 +473,10 @@ impl Inventory {
                 .map_err(|_| ERROR)?;
                 let policy = SetupPolicy {
                     ceremony: *creation.command.ceremony(),
-                    network: "regtest".into(),
+                    network: match &creation.command {
+                        AdmissionCommand::Create { network, .. } => network.clone(),
+                        _ => return Err(ERROR.into()),
+                    },
                     threshold: 2,
                     member_count: context.count,
                     config_digest: *operators.digest(),
@@ -702,9 +706,14 @@ impl HostedSetup {
         key: &[u8; 32],
         grant: &[u8],
         count: u16,
+        network: &str,
         development: bool,
     ) -> Result<Self, String> {
-        if !matches!(count, 3 | 4) || grant.is_empty() || grant.len() > 4096 {
+        if !matches!(count, 3 | 4)
+            || VaultNetwork::parse(network).is_err()
+            || grant.is_empty()
+            || grant.len() > 4096
+        {
             return Err(ERROR.into());
         }
         let operators = if development {
@@ -727,6 +736,7 @@ impl HostedSetup {
             if existing.context.bundle != bundle
                 || existing.context.key != *key
                 || existing.context.count != count
+                || existing.policy()?.network != network
                 || existing.context.development != development
                 || existing.context.grant.as_slice() != grant
             {
@@ -740,7 +750,7 @@ impl HostedSetup {
             device: identity.public(),
             command: AdmissionCommand::Create {
                 ceremony: random(),
-                network: "regtest".into(),
+                network: network.into(),
                 threshold: 2,
                 member_count: count,
                 config_digest: *operators.digest(),
@@ -772,8 +782,10 @@ impl HostedSetup {
         invitation: &[u8],
         bundle: &[u8],
         key: &[u8; 32],
+        expected_network: &str,
         development: bool,
     ) -> Result<Self, String> {
+        VaultNetwork::parse(expected_network)?;
         journal::check_private_root(root)?;
         if root
             .join("secrets")
@@ -785,6 +797,7 @@ impl HostedSetup {
             if existing.context.own_slot == 1
                 || existing.context.bundle != bundle
                 || existing.context.key != *key
+                || existing.policy()?.network != expected_network
                 || existing.context.development != development
                 || existing.context.grant.as_slice() != invitation
             {
@@ -798,7 +811,7 @@ impl HostedSetup {
             .as_secs();
         let invite = verified_invite(invitation, bundle, key, development, now)?;
         let policy = invite.context().policy();
-        if policy.network != "regtest"
+        if policy.network != expected_network
             || policy.threshold != 2
             || invite.bootstrap_descriptor().is_none()
             || invitation.len() > 4096
@@ -966,9 +979,27 @@ impl HostedSetup {
     }
     fn policy(&self) -> Result<SetupPolicy, String> {
         let request = self.context.request(&self.identity, &self.operators)?;
+        let network = if self.context.own_slot == 1 {
+            match &request.command {
+                AdmissionCommand::Create { network, .. } => network.clone(),
+                _ => return Err(ERROR.into()),
+            }
+        } else {
+            verified_invite(
+                &self.context.grant,
+                &self.context.bundle,
+                &self.context.key,
+                self.context.development,
+                0,
+            )?
+            .context()
+            .policy()
+            .network
+            .clone()
+        };
         Ok(SetupPolicy {
             ceremony: *request.command.ceremony(),
-            network: "regtest".into(),
+            network,
             threshold: 2,
             member_count: self.context.count,
             config_digest: *self.operators.digest(),
@@ -1501,13 +1532,7 @@ impl HostedSetup {
         if prerequisites.get(&self.context.own_slot) != Some(&record.body().prerequisites) {
             return Err("setup_roster".into());
         }
-        let native = serde_json::json!({"vault": hex::encode(roster.vault), "threshold": 2,
-            "members": roster.members.iter().map(|peer| serde_json::json!({"id":peer.id,
-                "signing":hex::encode(peer.signing), "encryption":hex::encode(peer.encryption)})).collect::<Vec<_>>()});
-        let native = crate::member_state::Roster::from_bytes(
-            &serde_json::to_vec(&native).map_err(|_| ERROR)?,
-        )
-        .map_err(|_| "setup_roster")?;
+        let native = Self::native_roster(&roster, &self.policy()?.network)?;
         Ok(Some(VerifiedProposal {
             body: SecretRecords(vec![record.body().clone()]),
             prerequisites,
@@ -1687,13 +1712,21 @@ impl HostedSetup {
     pub fn proposed_fingerprint(&self) -> Result<[u8; 32], String> {
         Ok(self.current_proposal()?.fingerprint)
     }
-    fn native_fingerprint(roster: &Roster) -> Result<[u8; 32], String> {
-        Ok(Self::native_roster(roster)?.fingerprint())
+    fn native_fingerprint(roster: &Roster, network: &str) -> Result<[u8; 32], String> {
+        Ok(Self::native_roster(roster, network)?.fingerprint())
     }
-    fn native_roster(roster: &Roster) -> Result<crate::member_state::Roster, String> {
-        let value = serde_json::json!({"vault":hex::encode(roster.vault), "threshold":2,
+    fn native_roster(roster: &Roster, network: &str) -> Result<crate::member_state::Roster, String> {
+        let mut value = serde_json::json!({"vault":hex::encode(roster.vault), "threshold":2,
             "members":roster.members.iter().map(|peer| serde_json::json!({"id":peer.id,
                 "signing":hex::encode(peer.signing), "encryption":hex::encode(peer.encryption)})).collect::<Vec<_>>()});
+        match VaultNetwork::parse(network)? {
+            VaultNetwork::Regtest => {}
+            VaultNetwork::Testnet => {
+                value["network"] = serde_json::json!("testnet");
+                // shortcut: scanning starts at NU7 activation; add a signed birth height if scans become too slow.
+                value["birth_height"] = serde_json::json!(TESTNET_NU7_BIRTH);
+            }
+        }
         crate::member_state::Roster::from_bytes(&serde_json::to_vec(&value).map_err(|_| ERROR)?)
             .map_err(|_| "setup_roster".into())
     }
@@ -1724,7 +1757,7 @@ impl HostedSetup {
             .try_into()
             .map_err(|_| "setup_approval")?;
         if roster.members.len() != self.context.count as usize
-            || Self::native_fingerprint(&roster)? != fingerprint
+            || Self::native_fingerprint(&roster, &self.policy()?.network)? != fingerprint
         {
             return Err("setup_approval".into());
         }
@@ -2541,10 +2574,14 @@ impl HostedSetup {
             if !matches!(engine.phase(), CeremonyPhase::Certified | CeremonyPhase::PaymentHandoff | CeremonyPhase::Active) { return Err("setup_backups_pending".into()); }
             let state = engine.certified_vault_state()?;
             let private_state = crate::setup_backup::PrivateJson(serde_json::from_slice(&state).map_err(|_| "setup_backup")?);
-            let roster = serde_json::json!({"vault":hex::encode(accepted.roster().vault),"threshold":2,
+            let mut roster = serde_json::json!({"vault":hex::encode(accepted.roster().vault),"threshold":2,
                 "members":accepted.roster().members.iter().map(|peer| serde_json::json!({
                     "id":peer.id,"signing":hex::encode(peer.signing),"encryption":hex::encode(peer.encryption)
                 })).collect::<Vec<_>>()});
+            if accepted.context().policy().network == "testnet" {
+                roster["network"] = serde_json::json!("testnet");
+                roster["birth_height"] = serde_json::json!(TESTNET_NU7_BIRTH);
+            }
             let receipts = engine.backup_receipts()?.iter().map(|(id,wire)| (id.to_string(),hex::encode(wire)))
                 .collect::<BTreeMap<_,_>>();
             let evidence = crate::setup_backup::PrivateJson(serde_json::json!({"recovery_version":2,
@@ -3018,7 +3055,7 @@ impl HostedSetup {
         let (roster, _, _) = self.saved_approval()?.ok_or("setup_approval")?;
         let policy = self.policy()?;
         let digest = AcceptedCeremonyRoster::hosted_context_digest(
-            &Self::native_roster(&roster)?,
+            &Self::native_roster(&roster, &policy.network)?,
             &policy.network,
             &policy.config_digest,
         )?;
@@ -3584,17 +3621,24 @@ pub fn command(command: &str, args: &[String]) -> Result<serde_json::Value, Stri
                 .or_else(|| proposal.as_ref().map(|proposal| proposal.fingerprint));
             Ok(
                 serde_json::json!({"vault":hex::encode(policy.ceremony),"own_slot":setup.context.own_slot,"member_count":policy.member_count,
-                "network":policy.network,"fingerprint":fingerprint.map(hex::encode),"members":roster.map(|roster|roster.members.iter().map(|peer|serde_json::json!({"id":peer.id,"signing":hex::encode(peer.signing),"encryption":hex::encode(peer.encryption)})).collect::<Vec<_>>()).unwrap_or_default()}),
+                "network":policy.network,"birth_height":(policy.network == "testnet").then_some(TESTNET_NU7_BIRTH),"fingerprint":fingerprint.map(hex::encode),"members":roster.map(|roster|roster.members.iter().map(|peer|serde_json::json!({"id":peer.id,"signing":hex::encode(peer.signing),"encryption":hex::encode(peer.encryption)})).collect::<Vec<_>>()).unwrap_or_default()}),
             )
         }
         "setup-create" => {
-            if !matches!(args.len(), 7 | 8)
-                || args[5] != "--operator-key"
-                || (args.len() == 8 && args[7] != "--development-http")
-                || args[6].len() != 64
-            {
+            if args.len() < 7 || args[5] != "--operator-key" || args[6].len() != 64 {
                 return Err("setup_arguments".into());
             }
+            let (network, development) = match &args[7..] {
+                [] => ("regtest", false),
+                [flag] if flag == "--development-http" => ("regtest", true),
+                [flag, network] if flag == "--network" => (network.as_str(), false),
+                [flag, network, development]
+                    if flag == "--network" && development == "--development-http" =>
+                {
+                    (network.as_str(), true)
+                }
+                _ => return Err("setup_arguments".into()),
+            };
             let count = match args[4].as_str() {
                 "2-of-3" => 3,
                 "2-of-4" => 4,
@@ -3614,18 +3658,26 @@ pub fn command(command: &str, args: &[String]) -> Result<serde_json::Value, Stri
                 &key,
                 &grant,
                 count,
-                args.len() == 8,
+                network,
+                development,
             )?;
             Ok(setup.step()?.public_json())
         }
         "setup-join" => {
-            if !matches!(args.len(), 6 | 7)
-                || args[4] != "--operator-key"
-                || args[5].len() != 64
-                || (args.len() == 7 && args[6] != "--development-http")
-            {
+            if args.len() < 6 || args[4] != "--operator-key" || args[5].len() != 64 {
                 return Err("setup_arguments".into());
             }
+            let (network, development) = match &args[6..] {
+                [] => ("regtest", false),
+                [flag] if flag == "--development-http" => ("regtest", true),
+                [flag, network] if flag == "--network" => (network.as_str(), false),
+                [flag, network, development]
+                    if flag == "--network" && development == "--development-http" =>
+                {
+                    (network.as_str(), true)
+                }
+                _ => return Err("setup_arguments".into()),
+            };
             let key: [u8; 32] = hex::decode(&args[5])
                 .map_err(|_| "setup_config")?
                 .try_into()
@@ -3639,7 +3691,8 @@ pub fn command(command: &str, args: &[String]) -> Result<serde_json::Value, Stri
                 &invitation,
                 &bundle,
                 &key,
-                args.len() == 7,
+                network,
+                development,
             )?;
             Ok(setup.step()?.public_json())
         }

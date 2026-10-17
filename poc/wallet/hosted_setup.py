@@ -148,12 +148,17 @@ class HostedSetup:
                     self.errors[folder.name] = "Connection interrupted. Your saved setup will retry while unlocked."
 
     def _configuration_args(self):
-        return [self.bundle, "--operator-key", self.key, *(["--development-http"] if self.development else [])]
+        return [self.bundle, "--operator-key", self.key,
+                *(["--network", "testnet"] if self.wallet.network == "testnet" else []),
+                *(["--development-http"] if self.development else [])]
 
     def _attach(self, folder, name):
         info = json.loads(self.native("setup-info", folder))
         if info.get("network") != self.wallet.network:
             raise ValueError("Hosted vault belongs to another network")
+        if self.wallet.network == "testnet" and (type(info.get("birth_height")) is not int
+                                                 or info["birth_height"] < 4_465_026):
+            raise ValueError("Hosted Testnet vault has no valid birth height")
         vault = info["vault"]
         target = self.wallet.data / "vaults" / vault
         if target.exists() and target != folder:
@@ -162,6 +167,8 @@ class HostedSetup:
         value = {"vault": vault, "slot": info["own_slot"], "name": name,
                  "profile": self.wallet.require_profile()["id"], "members": info["member_count"],
                  "threshold": 2, "transport": "hosted", "network": self.wallet.network}
+        if self.wallet.network == "testnet":
+            value["birth_height"] = info["birth_height"]
         if membership.exists():
             saved = json.loads(membership.read_text())
             if {**saved, "network": saved.get("network", "regtest")} != value:
@@ -182,6 +189,8 @@ class HostedSetup:
         root = self.wallet.data / "vaults"
         root.mkdir(mode=0o700, exist_ok=True)
         metadata = {"profile": self.wallet.require_profile()["id"], "name": name, "action": action, "binding": binding}
+        if self.wallet.network == "testnet":
+            metadata["network"] = "testnet"
         for folder in sorted(root.iterdir()):
             path = folder / "pending.json"
             if path.is_file() and json.loads(path.read_text()) == metadata:
@@ -220,10 +229,14 @@ class HostedSetup:
                 self.native("setup-step", folder)
             else:
                 self.native("setup-create", folder, self.bundle, "@private", policy,
-                            "--operator-key", self.key, *(["--development-http"] if self.development else []), private=raw)
+                            "--operator-key", self.key,
+                            *(["--network", "testnet"] if self.wallet.network == "testnet" else []),
+                            *(["--development-http"] if self.development else []), private=raw)
         else:
             self.native("setup-create", folder, self.bundle, grant, policy,
-                        "--operator-key", self.key, *(["--development-http"] if self.development else []))
+                        "--operator-key", self.key,
+                        *(["--network", "testnet"] if self.wallet.network == "testnet" else []),
+                        *(["--development-http"] if self.development else []))
         return self._attach(folder, name.strip())
 
     def join(self, invite):
@@ -275,7 +288,8 @@ class HostedSetup:
         confirmations = [{"slot": slot, "confirmed": all_agreed or (slot == local["slot"] and bool(native.get("agreed_fingerprint"))),
                           "matches": True} for slot in range(1, local["members"] + 1)]
         result = {"phase": ui_phase, "setup_phase": phase, "handoff": native.get("handoff", "pending"),
-                  "transport": "hosted", "network": local.get("network", "regtest"), "name": local["name"], "vault": vault,
+                  "transport": "hosted", "network": local.get("network", "regtest"),
+                  "birth_height": local.get("birth_height"), "name": local["name"], "vault": vault,
                   "slot": local["slot"], "threshold": 2, "total_members": local["members"],
                   "members": len(native.get("joined_slots", [])), "missing_slots": native.get("missing_slots", []),
                   "fingerprint": info.get("fingerprint"), "confirmations": confirmations, "profile": self.wallet.profile_data,

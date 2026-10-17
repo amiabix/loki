@@ -148,7 +148,7 @@ fn offline_creation_reopens_the_exact_saved_intent_for_both_policies() {
         .unwrap();
         let initial = sealed_files(member.path());
         assert!(
-            HostedSetup::create(member.path(), "pass", &bundle, &key, &grant, count, false)
+            HostedSetup::create(member.path(), "pass", &bundle, &key, &grant, count, "regtest", false)
                 .is_err()
         );
         assert!(HostedSetup::create(
@@ -158,12 +158,13 @@ fn offline_creation_reopens_the_exact_saved_intent_for_both_policies() {
             &[55; 32],
             &grant,
             count,
+            "regtest",
             true
         )
         .is_err());
         assert_eq!(sealed_files(member.path()), initial);
         let mut hosted =
-            HostedSetup::create(member.path(), "pass", &bundle, &key, &grant, count, true).unwrap();
+            HostedSetup::create(member.path(), "pass", &bundle, &key, &grant, count, "regtest", true).unwrap();
         let status = hosted.step().unwrap();
         assert_eq!(status.public_json()["phase"], "admission_pending");
         assert_eq!(status.public_json()["policy"], format!("2-of-{count}"));
@@ -310,15 +311,19 @@ fn offline_creation_reopens_the_exact_saved_intent_for_both_policies() {
 mod hosted_services;
 #[test]
 fn owned_real_services_provision_creator_inboxes_and_save_invites_for_both_policies() {
-    run_owned_services_flow(OwnedFlow::Full);
+    run_owned_services_flow(OwnedFlow::Full, "regtest");
+}
+#[test]
+fn owned_testnet_setup_certifies_the_network_and_recovery_card() {
+    run_owned_services_flow(OwnedFlow::Full, "testnet");
 }
 #[test]
 fn owned_private_invitation_exports_for_both_policies() {
-    run_owned_services_flow(OwnedFlow::InviteExport);
+    run_owned_services_flow(OwnedFlow::InviteExport, "regtest");
 }
 #[test]
 fn owned_pending_abort_reconciles_admission_before_any_provisioning_for_both_policies() {
-    run_owned_services_flow(OwnedFlow::PendingAbort);
+    run_owned_services_flow(OwnedFlow::PendingAbort, "regtest");
 }
 enum OwnedFlow {
     Full,
@@ -400,14 +405,14 @@ fn drive_owned_cli(path: &Path, pass: &str) -> std::process::Output {
     }
     child.wait_with_output().unwrap()
 }
-fn run_owned_services_flow(mode: OwnedFlow) {
+fn run_owned_services_flow(mode: OwnedFlow, network: &str) {
     let mut services = hosted_services::HostedServices::start();
     if let Ok(relay) = std::env::var("LOKI_HOSTED_OFFLINE_RELAY") {
         let index: usize = relay.parse().unwrap();
         assert!((1..=3).contains(&index));
         services.stop_relay(index - 1);
     }
-    for count in [3u16, 4] {
+    for count in if network == "testnet" { vec![3] } else { vec![3, 4] } {
         if std::env::var("LOKI_HOSTED_MEMBERS")
             .ok()
             .is_some_and(|selected| selected != count.to_string())
@@ -456,18 +461,19 @@ fn run_owned_services_flow(mode: OwnedFlow) {
             ] {
                 private_input(&member.path().join(name), bytes);
             }
-            let output = std::process::Command::new(env!("CARGO_BIN_EXE_loki_setup_member"))
-                .arg("setup-create")
+            let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_loki_setup_member"));
+            command.arg("setup-create")
                 .arg(member.path())
                 .arg(member.path().join("create-pass"))
                 .arg(member.path().join("operators"))
                 .arg(member.path().join("enrollment"))
                 .arg(format!("2-of-{count}"))
                 .arg("--operator-key")
-                .arg(hex::encode(services.config_key))
-                .arg("--development-http")
-                .output()
-                .unwrap();
+                .arg(hex::encode(services.config_key));
+            if network == "testnet" {
+                command.arg("--network").arg("testnet");
+            }
+            let output = command.arg("--development-http").output().unwrap();
             assert!(
                 output.status.success(),
                 "{}",
@@ -485,6 +491,7 @@ fn run_owned_services_flow(mode: OwnedFlow) {
                 &services.config_key,
                 &grant,
                 count,
+                network,
                 true,
             )
             .unwrap()
@@ -587,17 +594,27 @@ fn run_owned_services_flow(mode: OwnedFlow) {
             ] {
                 private_input(&peer.path().join(name), bytes);
             }
-            let output = std::process::Command::new(env!("CARGO_BIN_EXE_loki_setup_member"))
-                .arg("setup-join")
+            if network == "testnet" {
+                let wrong = MemberDir::create(&services.root, &format!("wrong-network-{slot}"))
+                    .unwrap();
+                assert!(HostedSetup::join(
+                    wrong.path(), "peer-pass", invitation, &services.bundle,
+                    &services.config_key, "regtest", true,
+                ).is_err());
+                assert!(!wrong.path().join("secrets/hosted-context.sealed").exists());
+            }
+            let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_loki_setup_member"));
+            command.arg("setup-join")
                 .arg(peer.path())
                 .arg(peer.path().join("join-pass"))
                 .arg(peer.path().join("invitation"))
                 .arg(peer.path().join("operators"))
                 .arg("--operator-key")
-                .arg(hex::encode(services.config_key))
-                .arg("--development-http")
-                .output()
-                .unwrap();
+                .arg(hex::encode(services.config_key));
+            if network == "testnet" {
+                command.arg("--network").arg("testnet");
+            }
+            let output = command.arg("--development-http").output().unwrap();
             assert!(
                 output.status.success(),
                 "{}",
@@ -734,6 +751,7 @@ fn run_owned_services_flow(mode: OwnedFlow) {
                     &forged,
                     &services.bundle,
                     &services.config_key,
+                    network,
                     true,
                 )
                 .unwrap();
@@ -1091,6 +1109,12 @@ fn run_owned_services_flow(mode: OwnedFlow) {
             );
             let evidence: serde_json::Value = serde_json::from_slice(&raw).unwrap();
             assert_eq!(evidence["recovery_version"], 2);
+            assert_eq!(evidence["state"]["network"], network);
+            if network == "testnet" {
+                assert_eq!(evidence["state"]["birth_height"], 4_465_026);
+                assert_eq!(evidence["roster"]["birth_height"], 4_465_026);
+                assert!(evidence["state"]["address"].as_str().unwrap().starts_with("utest"));
+            }
             assert_eq!(
                 evidence["receipts"].as_object().unwrap().len(),
                 count as usize
