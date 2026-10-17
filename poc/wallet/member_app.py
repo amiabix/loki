@@ -30,10 +30,41 @@ from local_funding import fund_member, funding_status
 import timing
 
 HERE = Path(__file__).resolve().parent
-SETUP = HERE.parent / "target" / "debug" / "loki_setup_member"
-PAYMENT = HERE.parent / "target" / "debug" / "loki_member_payment"
-RELAY = HERE.parent / "target" / "debug" / "loki_relay_member"
-SEED_WALLET = HERE.parent / "target" / "debug" / "loki_seed_wallet"
+BINARIES = ("loki_setup_member", "loki_member_payment", "loki_relay_member", "loki_seed_wallet")
+BUILD = "cd poc && cargo build --release --locked --bins --features relay-communication"
+
+
+def target_dir():
+    configured = os.environ.get("CARGO_TARGET_DIR")
+    return Path(configured).resolve() if configured else HERE.parent / "target"
+
+
+def binary_profile(requested=None):
+    """Release when every release binary is built, unless debug is requested explicitly.
+
+    Debug builds keep the development-only fault injection; they are several times
+    slower, so the default follows the README's release build."""
+    requested = requested or os.environ.get("LOKI_POC_BIN_PROFILE")
+    if requested:
+        if requested not in ("release", "debug"):
+            raise ValueError("Choose the release or debug binary profile")
+        return requested
+    release = target_dir() / "release"
+    return "release" if all((release / name).is_file() for name in BINARIES) else "debug"
+
+
+def binary(name, profile=None):
+    return target_dir() / (profile or PROFILE) / name
+
+
+def use_binaries(profile):
+    """Select the native binaries for this process; the paths are read at call time."""
+    global PROFILE, SETUP, PAYMENT, RELAY, SEED_WALLET
+    PROFILE = profile
+    SETUP, PAYMENT, RELAY, SEED_WALLET = (binary(name, profile) for name in BINARIES)
+
+
+use_binaries(binary_profile())
 
 # A peer's message that has not arrived yet, or a broadcast the node has not mined
 # yet, is a normal outcome of asking too early rather than a failure to report.
@@ -351,7 +382,7 @@ class SignerSessions:
 
 
 class Wallet:
-    def __init__(self, data, exchange, setup=SETUP, invite_origin=None, transport="local", operator_bundle=None, operator_key=None, enrollment_grant=None, development_http=False, enrollment_issuer=None):
+    def __init__(self, data, exchange, setup=None, invite_origin=None, transport="local", operator_bundle=None, operator_key=None, enrollment_grant=None, development_http=False, enrollment_issuer=None):
         self.data = data.resolve()
         self.exchange = exchange.resolve()
         if self.data == self.exchange or self.data in self.exchange.parents or self.exchange in self.data.parents:
@@ -367,7 +398,7 @@ class Wallet:
         except BlockingIOError as error:
             self.process_lock.close()
             raise ValueError("This member data root is already open in another app") from error
-        self.setup = setup
+        self.setup = setup or SETUP
         if transport not in ("local", "hosted"):
             raise ValueError("Choose local or hosted transport")
         self.transport = transport
@@ -398,7 +429,7 @@ class Wallet:
     def command(self, action, *args, passphrase=None, timeout=30, binary=None):
         binary = binary or self.setup
         if not binary.is_file():
-            raise ValueError(f"Build {binary.name}: cd poc && cargo build --locked --bins")
+            raise ValueError(f"Build {binary.name}: {BUILD}")
         passfile = None
         try:
             argv = [str(binary), action]
@@ -2101,7 +2132,13 @@ if __name__ == "__main__":
     parser.add_argument("--enrollment-grant", type=Path)
     parser.add_argument("--enrollment-issuer", type=Path)
     parser.add_argument("--development-http", action="store_true")
+    parser.add_argument("--bin-profile", choices=("release", "debug"),
+                        help="native binary profile; defaults to release when it is built")
     args = parser.parse_args()
+    use_binaries(binary_profile(args.bin_profile))
+    print(f"Native binaries: {PROFILE} ({SETUP.parent})", flush=True)
+    if PROFILE == "debug":
+        print(f"Warning: debug binaries are slow; build release with: {BUILD}", flush=True)
     if args.transport == "hosted" and (not args.operator_bundle or not args.operator_key):
         parser.error("Hosted transport needs --operator-bundle and --operator-key")
     if args.transport == "hosted" and args.invite_port:

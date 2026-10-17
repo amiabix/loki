@@ -28,10 +28,16 @@ signing API. Use a **regtest-only seed**. An address QR is not a proof of contro
 
 ```sh
 cd poc
-cargo build --locked --bins --features relay-communication
+cargo build --release --locked --bins --features relay-communication
 cargo build --locked --manifest-path ../communication/Cargo.toml -p loki-relay-server
 python3 wallet/member_app.py --data /tmp/loki-member-1 --exchange /tmp/loki-setup-exchange --port 8801
 ```
+
+The app uses the release binaries when all four are built and otherwise falls back
+to `target/debug` with a startup warning. Select one explicitly with
+`--bin-profile release|debug` or `LOKI_POC_BIN_PROFILE`; `CARGO_TARGET_DIR` is
+honored. Debug builds are for development and the setup fault-injection drills;
+their dependencies are optimized, but Loki's own code is not.
 
 For the separate dashboard and signer flow, start the same member app with a
 second loopback port:

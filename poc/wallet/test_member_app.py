@@ -999,6 +999,30 @@ class MemberWalletTest(unittest.TestCase):
             self.assertEqual(wallet.confirmations(vault, mine)[1],
                              {"slot": 2, "confirmed": False, "matches": False, "at": None})
 
+    def test_binary_profile_prefers_complete_release_and_honors_override(self):
+        import member_app
+        with tempfile.TemporaryDirectory(prefix="loki-profile-") as temp, \
+                patch.dict(os.environ, {"CARGO_TARGET_DIR": temp}, clear=False):
+            os.environ.pop("LOKI_POC_BIN_PROFILE", None)
+            release = Path(temp) / "release"
+            release.mkdir()
+            self.assertEqual(member_app.binary_profile(), "debug")
+            for name in member_app.BINARIES[:-1]:
+                (release / name).touch()
+            self.assertEqual(member_app.binary_profile(), "debug", "a partial release build is not used")
+            (release / member_app.BINARIES[-1]).touch()
+            self.assertEqual(member_app.binary_profile(), "release")
+            self.assertEqual(member_app.binary("loki_relay_member", "release"), release / "loki_relay_member")
+            with patch.dict(os.environ, {"LOKI_POC_BIN_PROFILE": "debug"}):
+                self.assertEqual(member_app.binary_profile(), "debug")
+            self.assertEqual(member_app.binary_profile("debug"), "debug")
+            with self.assertRaisesRegex(ValueError, "release or debug"):
+                member_app.binary_profile("fast")
+            wallet = Wallet(Path(temp) / "member", Path(temp) / "exchange", setup=Path(temp) / "debug" / "loki_setup_member")
+            self.addCleanup(wallet.close)
+            with self.assertRaisesRegex(ValueError, "Build loki_setup_member: .*--release"):
+                wallet.command("profile-open")
+
     def test_rejects_exchange_inside_private_root(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
