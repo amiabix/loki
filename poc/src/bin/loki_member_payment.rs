@@ -2,7 +2,7 @@
 //! The shared directory is a local test courier; it is not a wallet relay or durable inbox.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     io::{self, Write},
     path::{Path, PathBuf},
@@ -79,6 +79,31 @@ fn manifest(path: &Path, network: VaultNetwork) -> Result<(SessionContext, Inten
         &fs::read(path).map_err(|e| e.to_string())?,
         network,
     )
+}
+
+fn reserved_nullifiers(
+    payments: &Path, roster: &Roster, network: VaultNetwork, tip: u32,
+) -> Result<BTreeSet<[u8; 32]>, String> {
+    let mut reserved = BTreeSet::new();
+    for entry in fs::read_dir(payments).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if !entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+            continue;
+        }
+        let path = entry.path().join("payment.json");
+        if !path.exists() {
+            continue;
+        }
+        let (context, intent) = manifest(&path, network)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        if context.vault == roster.vault {
+            check_manifest_roster(roster, &context, &intent)?;
+            if intent.expiry_height > tip {
+                reserved.extend(intent.input_nullifiers);
+            }
+        }
+    }
+    Ok(reserved)
 }
 
 fn member_rpc(member: &MemberState) -> Result<Rpc, String> {
@@ -341,6 +366,20 @@ fn prepare(args: &[String], sweep: bool) -> Result<(), String> {
         .div_ceil(1_152)
         .checked_mul(1_152)
         .ok_or("expiry overflow")?;
+    // shortcut: only this member's payment directory is covered, add shared coordination for simultaneous proposals across devices.
+    let payments = owner.join("payments");
+    private_work(&payments)?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let _lock = options.open(payments.join(".prepare.lock"))
+        .map_err(|e| e.to_string())?;
+    _lock.lock().map_err(|e| e.to_string())?;
+    let reserved = reserved_nullifiers(&payments, &member.roster, member.network, tip)?;
+    if sweep && notes.iter().any(|note| reserved.contains(&note.nullifier)) {
+        return Err("sweep includes notes reserved by a pending payment".into());
+    }
     let (notes, amount_zat, fee_zat, change_zat) = if sweep {
         if notes.is_empty() || notes.len() > 8 {
             return Err("sweep needs 1 to 8 unspent notes".into());
@@ -373,6 +412,7 @@ fn prepare(args: &[String], sweep: bool) -> Result<(), String> {
         let (note, fee, change) = notes
             .iter()
             .rev()
+            .filter(|note| !reserved.contains(&note.nullifier))
             .find_map(|note| {
                 let inputs = CandidateInputs {
                     vault_fvk: &member.fvk,
@@ -388,7 +428,7 @@ fn prepare(args: &[String], sweep: bool) -> Result<(), String> {
                 let change = note.value_zat.checked_sub(amount_zat.checked_add(fee)?)?;
                 Some((note, fee, change))
             })
-            .ok_or("no single vault note covers the amount and fee")?;
+            .ok_or("no unreserved vault note covers the amount and fee")?;
         (vec![note], amount_zat, fee, change)
     };
     let intent = Intent {
@@ -1512,6 +1552,56 @@ fn main() {
 mod tests {
     use super::*;
     use loki_poc::payment_manifest::{manifest_pair, proposer_id};
+
+    #[test]
+    fn pending_payments_reserve_notes_until_expiry() {
+        use loki_poc::setup_transport::Identity;
+        let root = std::env::temp_dir().join(format!(
+            "loki-payment-reservations-{}-{}", process::id(),
+            hex::encode(AttemptId::random().0)
+        ));
+        let payments = root.join("payments");
+        fs::create_dir_all(&payments).unwrap();
+        let members: Vec<_> = (1..=3).map(|id| {
+            let public = Identity::new(id).public();
+            json!({"id": id, "signing": hex::encode(public.signing),
+                   "encryption": hex::encode(public.encryption)})
+        }).collect();
+        let roster_path = root.join("roster.json");
+        fs::write(&roster_path, json!({"vault": hex::encode([7; 32]),
+            "threshold": 2, "members": members}).to_string()).unwrap();
+        let roster = Roster::load(&roster_path).unwrap();
+        let intent = Intent {
+            proposer: frost::Identifier::try_from(1u16).unwrap().serialize(),
+            created_height: 10, input_nullifiers: vec![[3; 32], [4; 32]],
+            recipient: vec![5; 43], amount_zat: 1, memo: b"memo".to_vec(),
+            change_policy: ChangePolicy::VaultInternal, fee_zat: 1,
+            change_zat: 1, expiry_height: 100,
+        };
+        let draft = payments.join("draft");
+        fs::create_dir(&draft).unwrap();
+        let mut value = json!({
+            "version": 1, "network": "regtest", "vault": hex::encode(roster.vault),
+            "payment": hex::encode(intent.proposal_id()), "attempt": hex::encode([8; 32]),
+            "pair": [1, 2], "proposer": hex::encode(&intent.proposer),
+            "created_height": intent.created_height,
+            "input_nullifiers": intent.input_nullifiers.iter().map(hex::encode).collect::<Vec<_>>(),
+            "recipient": hex::encode(&intent.recipient), "amount_zat": intent.amount_zat,
+            "memo": hex::encode(&intent.memo), "change_policy": "vault_internal",
+            "fee_zat": intent.fee_zat, "change_zat": intent.change_zat,
+            "expiry_height": intent.expiry_height,
+        });
+        fs::write(draft.join("payment.json"), value.to_string()).unwrap();
+        assert_eq!(reserved_nullifiers(&payments, &roster, VaultNetwork::Regtest, 99).unwrap(),
+                   [[3; 32], [4; 32]].into_iter().collect());
+        assert!(reserved_nullifiers(&payments, &roster, VaultNetwork::Regtest, 100).unwrap().is_empty());
+        value["vault"] = json!(hex::encode([9; 32]));
+        fs::write(draft.join("payment.json"), value.to_string()).unwrap();
+        assert!(reserved_nullifiers(&payments, &roster, VaultNetwork::Regtest, 99).unwrap().is_empty());
+        fs::write(draft.join("payment.json"), b"{broken").unwrap();
+        assert!(reserved_nullifiers(&payments, &roster, VaultNetwork::Regtest, 99).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn mined_spend_discovery_requires_all_intent_inputs_in_one_transaction() {

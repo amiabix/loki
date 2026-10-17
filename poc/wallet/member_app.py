@@ -1265,9 +1265,11 @@ class Wallet:
             if not isinstance(attempt, str) or not re.fullmatch(r"[0-9a-f]{64}", attempt):
                 raise ValueError("Payment draft has no valid attempt ID")
             target = drafts / attempt
-            if target.exists():
-                raise ValueError("Payment attempt already exists")
-            work.rename(target)
+            with (drafts / ".prepare.lock").open("a+b") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                if target.exists():
+                    raise ValueError("Payment attempt already exists")
+                work.rename(target)
             work = target
             self.payment_status(work, "draft")
             return {"status": "draft_only", "payment": manifest["payment"],
