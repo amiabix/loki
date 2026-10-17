@@ -2,9 +2,9 @@
 //! The shared directory is a local test courier; it is not a wallet relay or durable inbox.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     env, fs,
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process, thread,
     time::{Duration, Instant},
@@ -197,6 +197,7 @@ fn balance(args: &[String]) -> Result<(), String> {
 
 fn select_notes<'a>(
     available: &'a [scan::VaultNote],
+    reserved: &HashSet<[u8; 32]>,
     fvk: &orchard::keys::FullViewingKey,
     recipient: Address,
     amount: Zatoshis,
@@ -204,7 +205,10 @@ fn select_notes<'a>(
     target_height: u32,
     expiry_height: u32,
 ) -> Result<(Vec<&'a scan::VaultNote>, u64), String> {
-    let mut by_value = available.iter().collect::<Vec<_>>();
+    let mut by_value = available
+        .iter()
+        .filter(|note| !reserved.contains(&note.nullifier))
+        .collect::<Vec<_>>();
     by_value.sort_by_key(|note| std::cmp::Reverse(note.value_zat));
     let mut selected = Vec::new();
     let mut total = 0u64;
@@ -233,7 +237,53 @@ fn select_notes<'a>(
             return Ok((selected, fee));
         }
     }
-    Err("vault notes do not cover the amount and fee (maximum eight inputs)".into())
+    Err(if reserved.is_empty() {
+        "vault notes do not cover the amount and fee (maximum eight inputs)"
+    } else {
+        "unreserved vault notes do not cover the amount and fee; wait for pending payments to mine or expire"
+    }.into())
+}
+
+fn reserved_nullifiers(
+    payments: &Path,
+    vault: [u8; 32],
+    proposer: &[u8],
+    tip: u32,
+) -> Result<HashSet<[u8; 32]>, String> {
+    let mut reserved = HashSet::new();
+    for entry in fs::read_dir(payments).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let kind = entry.file_type().map_err(|e| e.to_string())?;
+        if !kind.is_dir() {
+            if kind.is_symlink() {
+                return Err("payment reservation directory contains a symlink".into());
+            }
+            continue;
+        }
+        let path = entry.path().join("payment.json");
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        if !metadata.file_type().is_file() {
+            return Err(format!(
+                "{} is not a regular payment manifest",
+                path.display()
+            ));
+        }
+        let mut raw = Vec::new();
+        fs::File::open(&path)
+            .map_err(|e| e.to_string())?
+            .take((loki_poc::payment_manifest::MAX_MANIFEST + 1) as u64)
+            .read_to_end(&mut raw)
+            .map_err(|e| e.to_string())?;
+        let (context, intent) = loki_poc::payment_manifest::parse(&raw)?;
+        if context.vault == vault && intent.proposer == proposer && intent.expiry_height >= tip {
+            reserved.extend(intent.input_nullifiers);
+        }
+    }
+    Ok(reserved)
 }
 
 fn prepare(args: &[String]) -> Result<(), String> {
@@ -241,7 +291,7 @@ fn prepare(args: &[String]) -> Result<(), String> {
         return Err("prepare <member-dir> <passphrase-file> <roster.json> <work-dir> <recipient-UA> <amount-zat> <memo> [AB|AC|AD|BC|BD|CD]".into());
     }
     let pair = pair_from_name(args.get(7).map(String::as_str).unwrap_or("AB"))?;
-    let (member, _, _) = state(args)?;
+    let (member, owner, _) = state(args)?;
     if pair
         .iter()
         .any(|id| !member.roster.members.contains_key(id))
@@ -250,9 +300,21 @@ fn prepare(args: &[String]) -> Result<(), String> {
     }
     let work = Path::new(&args[3]);
     private_work(work)?;
+    let payments = owner.join("payments");
+    private_work(&payments)?;
+    let mut lock_options = fs::OpenOptions::new();
+    lock_options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    lock_options.mode(0o600);
+    let reservation_lock = lock_options
+        .open(payments.join("reservation.lock"))
+        .map_err(|e| e.to_string())?;
+    reservation_lock.lock().map_err(|e| e.to_string())?;
     let rpc = Rpc::regtest();
     let chain = scan::scan_chain(&rpc, &member.fvk)?;
     let tip: u32 = chain.tip.try_into().map_err(|_| "height overflow")?;
+    let proposer = member.key.identifier().serialize();
+    let reserved = reserved_nullifiers(&payments, member.vault, &proposer, tip)?;
     let recipient = vault::orchard_receiver_from_ua(&args[4], Regtest.network_type())?;
     let amount_zat: u64 = args[5].parse().map_err(|_| "invalid amount")?;
     if amount_zat == 0 {
@@ -271,6 +333,7 @@ fn prepare(args: &[String]) -> Result<(), String> {
         .ok_or("expiry overflow")?;
     let (notes, fee_zat) = select_notes(
         &chain.notes,
+        &reserved,
         &member.fvk,
         recipient,
         amount,
@@ -284,7 +347,7 @@ fn prepare(args: &[String]) -> Result<(), String> {
         .ok_or("vault balance exceeds u64")?;
     let change_zat = total - amount_zat - fee_zat;
     let intent = Intent {
-        proposer: member.key.identifier().serialize(),
+        proposer,
         created_height: tip,
         input_nullifiers: notes.iter().map(|note| note.nullifier).collect(),
         recipient: recipient.to_raw_address_bytes().to_vec(),
@@ -1373,6 +1436,7 @@ fn main() {
 mod tests {
     use super::*;
     use loki_poc::payment_manifest::{manifest_pair, proposer_id};
+    use std::collections::HashSet;
 
     #[test]
     fn payment_selection_combines_notes_when_no_single_note_covers_amount() {
@@ -1423,13 +1487,100 @@ mod tests {
         let amount = Zatoshis::from_u64(50_000_000).unwrap();
         let memo = MemoBytes::from_bytes(b"two notes").unwrap();
         let recipient = fvk.address_at(7u64, Scope::External);
-        let (selected, fee) =
-            select_notes(&notes, &fvk, recipient, amount, &memo, 20, 9_216).unwrap();
+        let (selected, fee) = select_notes(
+            &notes,
+            &HashSet::new(),
+            &fvk,
+            recipient,
+            amount,
+            &memo,
+            20,
+            9_216,
+        )
+        .unwrap();
         assert_eq!(
             selected.iter().map(|n| n.value_zat).collect::<Vec<_>>(),
             vec![35_000_000, 30_000_000]
         );
         assert!(65_000_000 >= 50_000_000 + fee);
+        let reserved = HashSet::from([notes[1].nullifier]);
+        let smaller_payment = Zatoshis::from_u64(20_000_000).unwrap();
+        let (selected, _) = select_notes(
+            &notes,
+            &reserved,
+            &fvk,
+            recipient,
+            smaller_payment,
+            &memo,
+            20,
+            9_216,
+        )
+        .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].nullifier, notes[0].nullifier);
+    }
+
+    #[test]
+    fn unexpired_local_proposals_reserve_notes_across_prepares() {
+        let root = std::env::temp_dir().join(format!(
+            "loki-payment-reservation-{}-{}",
+            process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let payments = root.join("payments");
+        let draft = payments.join("payment-first");
+        fs::create_dir_all(&draft).unwrap();
+        let proposer = frost::Identifier::try_from(1u16).unwrap().serialize();
+        let mut intent = Intent {
+            proposer: proposer.clone(),
+            created_height: 20,
+            input_nullifiers: vec![[3; 32]],
+            recipient: vec![4; 43],
+            amount_zat: 100_000,
+            memo: b"memo".to_vec(),
+            change_policy: ChangePolicy::VaultInternal,
+            fee_zat: 10_000,
+            change_zat: 200_000,
+            expiry_height: 1152,
+        };
+        let vault = [9; 32];
+        let mut manifest = json!({
+            "version": 1, "network": "regtest", "vault": hex::encode(vault),
+            "payment": hex::encode(intent.proposal_id()), "attempt": hex::encode([8; 32]),
+            "pair": [1, 2], "proposer": hex::encode(&proposer), "created_height": 20,
+            "input_nullifiers": [hex::encode([3; 32])], "recipient": hex::encode([4; 43]),
+            "amount_zat": 100_000, "memo": hex::encode(b"memo"),
+            "change_policy": "vault_internal", "fee_zat": 10_000,
+            "change_zat": 200_000, "expiry_height": 1152,
+        });
+        fs::write(draft.join("payment.json"), manifest.to_string()).unwrap();
+        assert_eq!(
+            reserved_nullifiers(&payments, vault, &proposer, 100).unwrap(),
+            HashSet::from([[3; 32]])
+        );
+        let saved = payments.join("first");
+        fs::rename(draft, &saved).unwrap();
+        assert_eq!(
+            reserved_nullifiers(&payments, vault, &proposer, 100).unwrap(),
+            HashSet::from([[3; 32]])
+        );
+        assert!(reserved_nullifiers(&payments, vault, &proposer, 1153)
+            .unwrap()
+            .is_empty());
+        assert!(reserved_nullifiers(&payments, [7; 32], &proposer, 100)
+            .unwrap()
+            .is_empty());
+        intent.proposer = frost::Identifier::try_from(2u16).unwrap().serialize();
+        manifest["proposer"] = json!(hex::encode(&intent.proposer));
+        manifest["payment"] = json!(hex::encode(intent.proposal_id()));
+        fs::write(saved.join("payment.json"), manifest.to_string()).unwrap();
+        assert!(reserved_nullifiers(&payments, vault, &proposer, 100)
+            .unwrap()
+            .is_empty());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

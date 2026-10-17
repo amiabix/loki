@@ -169,9 +169,13 @@ remains pending delivery until every saved signing message has relay storage; co
 chain view whenever the payment list is shown. If a signer closed after saving
 an approval, **Retry saved signing messages** republishes the same sealed share;
 it never creates another signature share.
-Payment preparation can combine up to eight confirmed notes. Separate pending
-proposals can still choose the same note; only one such spend can mine, and the
-other attempt needs a new proposal. The chosen pair is fixed for an attempt;
+Payment preparation can combine up to eight confirmed notes. This member's
+app excludes notes used by its own unexpired saved proposals, including after
+restart; mined spends leave the chain's unspent set, and expired proposals no
+longer reserve notes. A proposal made on another member's device may still use
+the same note. Only one conflicting spend can mine, so the other attempt needs
+a new proposal. An abandoned published proposal can keep its notes unavailable
+for a new local proposal until expiry. The chosen pair is fixed for an attempt;
 if either signer becomes unavailable, create a new attempt with another pair.
 
 The dashboard offers **Fund Vault** beside each eligible 2-of-3 vault. Each new
