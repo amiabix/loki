@@ -331,6 +331,34 @@ mod tests {
         zip2005::frost_viewing_key(&ak, &[42u8; 32]).expect("a derived test fvk")
     }
 
+    #[test]
+    fn deferred_ironwood_candidate_uses_testnet_nu7_branch() {
+        use zcash_protocol::consensus::{BranchId, TEST_NETWORK};
+
+        let fvk = a_test_fvk();
+        let mut inputs = CandidateInputs {
+            vault_fvk: &fvk,
+            notes: vec![vault_note_of(&fvk, 100_000_000, 44)],
+            recipient: fvk.address_at(7u64, orchard::keys::Scope::External),
+            amount: Zatoshis::const_from_u64(40_000_000),
+            memo: MemoBytes::empty(),
+            change: Zatoshis::ZERO,
+            target_height: 4_465_056,
+            expiry_height: 4_465_156,
+        };
+        let fee = quote_fee(&TEST_NETWORK, &inputs).unwrap();
+        inputs.change = Zatoshis::from_u64(60_000_000 - u64::from(fee)).unwrap();
+        let built = build_candidate(
+            &TEST_NETWORK,
+            &inputs,
+            &[pallas::Scalar::from(3)],
+            rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng),
+        )
+        .unwrap();
+        assert_eq!(built.pczt_parts.consensus_branch_id, BranchId::Nu7);
+        assert!(built.pczt_parts.ironwood.is_some());
+    }
+
     /// A vault note of a chosen value. `seed` distinguishes notes: rho must differ or
     /// two notes would be the same note.
     fn vault_note_of(fvk: &FullViewingKey, value: u64, seed: u8) -> Note {
