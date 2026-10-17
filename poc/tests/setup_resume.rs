@@ -267,6 +267,12 @@ fn ceremony_restarts_every_complete_phase_and_preserves_saved_ciphertext() {
             assert_eq!(engine.checkpoint(), pending);
             engine.synchronize(&mut anchor).unwrap();
             assert_eq!(engine.phase(), CeremonyPhase::Round1Saved);
+            let round1 = engine.outgoing().unwrap().get(&id).unwrap();
+            let body = identity
+                .verify_round1(&identity.public(), &[78; 32], round1)
+                .unwrap();
+            let package = reddsa_frost::frost::redpallas::keys::dkg::round1::Package::deserialize(&body[32..]).unwrap();
+            assert_eq!(package.commitment().serialize().unwrap().len(), threshold as usize);
             let checkpoint = engine.checkpoint();
             let ciphertext = engine.prepared_delivery().unwrap().to_vec();
             drop(engine);
@@ -325,6 +331,14 @@ fn ceremony_restarts_every_complete_phase_and_preserves_saved_ciphertext() {
             let state = engine.certified_vault_state().unwrap();
             let state_json: serde_json::Value = serde_json::from_slice(&state).unwrap();
             assert_eq!(state_json["threshold"], threshold);
+            let key = reddsa_frost::frost::redpallas::keys::KeyPackage::deserialize(
+                &hex::decode(state_json["key_package"].as_str().unwrap()).unwrap(),
+            ).unwrap();
+            let public = reddsa_frost::frost::redpallas::keys::PublicKeyPackage::deserialize(
+                &hex::decode(state_json["public_package"].as_str().unwrap()).unwrap(),
+            ).unwrap();
+            assert_eq!(*key.min_signers(), threshold);
+            assert_eq!(public.min_signers(), Some(threshold));
             let before = engine.checkpoint();
             let premature = (1..=count).map(|slot| (slot, vec![slot as u8; 32]))
                 .collect::<BTreeMap<_, _>>();

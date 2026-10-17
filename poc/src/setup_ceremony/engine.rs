@@ -748,7 +748,7 @@ impl SetupCeremony {
             let mut next = Snapshot::ready();
             next.phase = CeremonyPhase::Round1Saved;
             OsRng.fill_bytes(&mut *next.contribution);
-            let (member, public) = Member::start_with_policy(own, 2, roster.members.len() as u16)?;
+            let (member, public) = Member::start_with_policy(own, roster.threshold, roster.members.len() as u16)?;
             next.dkg = member.checkpoint()?;
             let mut body = digest(
                 b"Loki_vs_commit1",

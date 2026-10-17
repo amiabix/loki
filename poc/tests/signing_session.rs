@@ -597,6 +597,17 @@ fn three_of_four_signer_attempt(signers: [u16; 3]) {
         candidate: candidate.serialize().unwrap(), commitments: vec![set], seeds: vec![seed.try_into().unwrap()],
     };
     sessions[&driver].publish_package_to_roster(&roster, &payload, &relay, "pass").unwrap();
+    drop(sessions);
+    let mut sessions = BTreeMap::new();
+    for &id in &signers {
+        let signer = frost::Identifier::try_from(id).unwrap();
+        sessions.insert(id, SigningSession::reopen_sealed(
+            &root.join(format!("member-{id}")), context.clone(), &context.vault,
+            intent.clone(), Identity::from_secret_bytes(&identities[&id].to_secret_bytes()).unwrap(),
+            frost::keys::KeyPackage::try_from(shares[&signer].clone()).unwrap(),
+            public.clone(), fvk.clone(), "pass",
+        ).unwrap());
+    }
     for &id in &signers {
         let packet = if id == driver {
             let saved = SigningSession::saved_package_wires(
