@@ -122,7 +122,7 @@ function action(id, task) {
 function vaultList(vaults) {
   const list = $('vault-list');
   list.replaceChildren();
-  if (!vaults.length) { list.textContent = 'No vaults yet.'; return; }
+  if (!vaults.length) { list.textContent = 'No vaults on this device. Create one or paste an invite.'; return; }
   for (const vault of vaults) {
     const button = document.createElement('button');
     button.type = 'button';

@@ -157,31 +157,8 @@ $('disconnect').addEventListener('click', async () => {
   } catch (error) { message(error.message, true); }
 });
 
-$('create-vault').addEventListener('submit', async (event) => {
-  event.preventDefault();
-  const button = event.target.querySelector('button');
-  button.disabled = true;
-  try {
-    const name = new FormData(event.target).get('name');
-    const members = Number(new FormData(event.target).get('members'));
-    const {action} = await call('action', {kind: 'create', name, members});
-    message(`Approve creation of the 2-of-${members} “${name}” vault in your signer window.`);
-    for (let i = 0; i < 300; i++) {
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      const result = await call('action-poll', {action});
-      if (result.state === 'done') {
-        message('Vault draft created. Continue invites and setup in your signer window.');
-        event.target.reset();
-        await refresh();
-        return;
-      }
-      if (result.state !== 'pending' && result.state !== 'executing')
-        throw new Error(result.error || `Vault request ${result.state}.`);
-    }
-    throw new Error('Vault request expired. Try again.');
-  } catch (error) { message(error.message, true); }
-  finally { button.disabled = false; }
-});
+/* Vault creation lives only in the private signer now; the dashboard shows
+   status and test funding. The signer's create-action route is unchanged. */
 
 refresh();
 setInterval(() => { if (session) refresh(); }, 5000);

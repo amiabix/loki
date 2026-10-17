@@ -36,7 +36,7 @@ async function run() {
     await joinAside.locator('summary').click();
     assert.equal(await joinBody.isVisible(), true, 'expanding shows the prose');
     // A short instruction we did NOT collapse stays plainly visible.
-    assert.equal(await page.getByText('Each member joins from their own app.').isVisible(), true,
+    assert.equal(await page.getByText('2 of 3 members must approve a payment.').isVisible(), true,
       'short instructions must not be collapsed');
     console.log('PASS: educational asides collapse by default; instructions stay visible');
   } finally { await browser.close(); }
