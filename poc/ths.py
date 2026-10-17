@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -69,12 +70,18 @@ class THS:
         results = []
         digest = hashlib.sha256(address.encode()).hexdigest()[:32]
         for index in range(count):
-            result = post(self.app_url + "/api/v1/faucet/address", {
+            request = {
                 "address": address, "amount_zatoshi": 100_000_000,
                 "idempotency_key": f"loki-{digest}-fund-{index}",
-            })
-            if result.get("status") != "confirmed" or not result.get("block_hash"):
-                raise RuntimeError(f"funding not confirmed; retry the same vault: {result}")
+            }
+            deadline = time.monotonic() + 120
+            while True:
+                result = post(self.app_url + "/api/v1/faucet/address", request)
+                if result.get("status") == "confirmed" and result.get("block_hash"):
+                    break
+                if result.get("status") not in ("pending", "preparing", "prepared") or time.monotonic() >= deadline:
+                    raise RuntimeError(f"funding not confirmed; retry the same vault: {result}")
+                time.sleep(1)
             results.append(result)
         return results
 

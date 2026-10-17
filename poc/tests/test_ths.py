@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import ths
 from ths import THS, loopback_url
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "demo"))
 import runner
@@ -33,15 +34,30 @@ class EndpointTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "NU6.3"):
             chain.check()
 
-    def test_funding_retries_use_same_key_and_pending_is_refused(self):
+    def test_funding_waits_for_confirmation_with_the_same_key(self):
         chain = THS.__new__(THS)
         chain.app_url = "http://127.0.0.1:32815"
-        with patch("ths.post", return_value={"status": "pending"}) as request:
-            for _ in range(2):
-                with self.assertRaisesRegex(RuntimeError, "funding not confirmed"):
-                    chain.fund("test-vault")
+        pending = {"status": "preparing"}
+        prepared = {"status": "prepared", "txid": "transaction"}
+        confirmed = {"status": "confirmed", "block_hash": "block"}
+        with patch("ths.post", side_effect=[pending, prepared, confirmed]) as request, \
+                patch.object(ths, "time", create=True) as clock:
+            clock.monotonic.return_value = 0
+            self.assertEqual(chain.fund("test-vault"), [confirmed])
             self.assertEqual(request.call_args_list[0], request.call_args_list[1])
+            self.assertEqual(request.call_args_list[1], request.call_args_list[2])
             self.assertGreaterEqual(len(request.call_args.args[1]["idempotency_key"]), 8)
+            self.assertEqual(clock.sleep.call_count, 2)
+
+    def test_funding_pending_has_a_deadline(self):
+        chain = THS.__new__(THS)
+        chain.app_url = "http://127.0.0.1:32815"
+        with patch("ths.post", return_value={"status": "pending"}), \
+                patch.object(ths, "time", create=True) as clock:
+            clock.monotonic.side_effect = [0, 121]
+            with self.assertRaisesRegex(RuntimeError, "funding not confirmed"):
+                chain.fund("test-vault")
+            clock.sleep.assert_not_called()
 
 
 class RunnerTests(unittest.TestCase):
