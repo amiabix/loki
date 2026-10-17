@@ -80,6 +80,140 @@ class MemberWalletTest(unittest.TestCase):
                     timer.cancel()
                     syncing.join(2)
 
+    def test_lock_prevents_inflight_backup_words_from_being_returned(self):
+        with tempfile.TemporaryDirectory(prefix="loki-lock-backup-reply-") as temp:
+            wallet = Wallet(Path(temp) / "member", Path(temp) / "exchange")
+            self.addCleanup(wallet.close)
+            wallet.profile_data = {"id": "profile"}
+            wallet.passphrase = "example passphrase"
+            started, release = threading.Event(), threading.Event()
+            server, token = make_signer_server(wallet, 0)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+
+            def request(path):
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=3)
+                connection.request("POST", path, b"{}", {"X-Loki-Token": token})
+                response = connection.getresponse()
+                result = response.status, json.loads(response.read())
+                connection.close()
+                return result
+
+            def backup(_vault):
+                started.set()
+                release.wait(3)
+                return {"words": "private recovery words"}
+
+            result = []
+            with patch.object(wallet, "backup", side_effect=backup):
+                worker = threading.Thread(target=lambda: result.append(request("/api/backup")), daemon=True)
+                worker.start()
+                self.assertTrue(started.wait(1))
+                try:
+                    self.assertEqual(request("/api/lock")[0], 200)
+                finally:
+                    release.set()
+                    worker.join(3)
+            self.assertEqual(len(result), 1)
+            self.assertNotIn("private recovery words", json.dumps(result[0]))
+
+    def test_lock_prevents_inflight_recovery_card_from_being_returned(self):
+        with tempfile.TemporaryDirectory(prefix="loki-lock-card-reply-") as temp:
+            wallet = Wallet(Path(temp) / "member", Path(temp) / "exchange")
+            self.addCleanup(wallet.close)
+            wallet.profile_data = {"id": "profile"}
+            wallet.passphrase = "example passphrase"
+            vault = "a" * 64
+            member = wallet.data / "vaults" / vault
+            (member / "card").mkdir(parents=True)
+            (member / "card" / "vault.card").write_bytes(b"private recovery card")
+            started, release = threading.Event(), threading.Event()
+            server, token = make_signer_server(wallet, 0)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+            result = []
+
+            def member_dir(_vault):
+                started.set()
+                release.wait(3)
+                return member, {"slot": 1}
+
+            def read_card():
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=3)
+                connection.request("GET", f"/api/card?vault={vault}", headers={"X-Loki-Token": token})
+                response = connection.getresponse()
+                result.append((response.status, response.read()))
+                connection.close()
+
+            with patch.object(wallet, "vault_dir", side_effect=member_dir):
+                worker = threading.Thread(target=read_card, daemon=True)
+                worker.start()
+                self.assertTrue(started.wait(1))
+                try:
+                    connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=3)
+                    connection.request("POST", "/api/lock", b"{}", {"X-Loki-Token": token})
+                    self.assertEqual(connection.getresponse().status, 200)
+                    connection.close()
+                finally:
+                    release.set()
+                    worker.join(3)
+            self.assertEqual(len(result), 1)
+            self.assertNotIn(base64.b64encode(b"private recovery card"), result[0][1])
+
+    def test_lock_waits_for_a_recovery_card_reply_already_being_sent(self):
+        with tempfile.TemporaryDirectory(prefix="loki-lock-card-send-") as temp:
+            wallet = Wallet(Path(temp) / "member", Path(temp) / "exchange")
+            self.addCleanup(wallet.close)
+            wallet.profile_data = {"id": "profile"}
+            wallet.passphrase = "example passphrase"
+            member = wallet.data / "vaults" / ("a" * 64)
+            (member / "card").mkdir(parents=True)
+            (member / "card" / "vault.card").write_bytes(b"private recovery card")
+            server, token = make_signer_server(wallet, 0)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+            sending, release, locked = threading.Event(), threading.Event(), threading.Event()
+            card_status, lock_status = [], []
+            original_reply = server.RequestHandlerClass.reply
+
+            def paused_reply(handler, status, value):
+                if status == 200 and isinstance(value, dict) and "card" in value:
+                    sending.set()
+                    release.wait(3)
+                return original_reply(handler, status, value)
+
+            def request(method, path):
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=4)
+                connection.request(method, path, b"{}" if method == "POST" else None,
+                                   {"X-Loki-Token": token})
+                response = connection.getresponse()
+                result = response.status
+                response.read()
+                connection.close()
+                return result
+
+            with patch.object(wallet, "vault_dir", return_value=(member, {"slot": 1})), \
+                 patch.object(server.RequestHandlerClass, "reply", paused_reply):
+                card = threading.Thread(target=lambda: card_status.append(
+                    request("GET", "/api/card?vault=" + "a" * 64)), daemon=True)
+                card.start()
+                self.assertTrue(sending.wait(1))
+                lock = threading.Thread(target=lambda: (lock_status.append(
+                    request("POST", "/api/lock")), locked.set()), daemon=True)
+                lock.start()
+                try:
+                    self.assertFalse(locked.wait(0.5))
+                finally:
+                    release.set()
+                    card.join(4)
+                    lock.join(4)
+            self.assertTrue(locked.is_set())
+            self.assertEqual(card_status, [200])
+            self.assertEqual(lock_status, [200])
+
     def test_lock_terminates_running_native_command(self):
         with tempfile.TemporaryDirectory(prefix="loki-lock-command-") as temp:
             root = Path(temp)
@@ -283,6 +417,67 @@ class MemberWalletTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "symbolic link"):
                     wallet.join(encoded({"vault": vault, "slot": 2, "secret": secret}))
             self.assertEqual(list(outside.iterdir()), [])
+
+    def test_setup_courier_refuses_symlinked_and_oversized_files(self):
+        with tempfile.TemporaryDirectory(prefix="loki-courier-files-") as temp:
+            root = Path(temp)
+            wallet = Wallet(root / "member", root / "exchange")
+            self.addCleanup(wallet.close)
+            vault = "a" * 64
+            folder = wallet.exchange_vault(vault)
+            folder.mkdir()
+            (folder / "draft.json").write_text("{}")
+            private = wallet.data / "private-secret"
+            private.write_bytes(b"private signer data")
+            record = folder / "confirm-2.json"
+            record.symlink_to(private)
+            with self.assertRaises((OSError, ValueError)):
+                wallet.courier_read(vault, record.name)
+            with self.assertRaises((OSError, ValueError)):
+                wallet.courier_list(vault)
+            record.unlink()
+            record.write_bytes(b"x" * (member_app.COURIER_LIMIT + 1))
+            with self.assertRaises((OSError, ValueError)):
+                wallet.courier_read(vault, record.name)
+            with self.assertRaises((OSError, ValueError)):
+                wallet.courier_list(vault)
+
+    def test_setup_courier_refuses_symlinked_vault_directory(self):
+        with tempfile.TemporaryDirectory(prefix="loki-courier-folder-") as temp:
+            root = Path(temp)
+            wallet = Wallet(root / "member", root / "exchange")
+            self.addCleanup(wallet.close)
+            vault = "a" * 64
+            outside = root / "outside"
+            outside.mkdir()
+            (outside / "draft.json").write_bytes(b"private signer data")
+            (wallet.exchange / vault).symlink_to(outside)
+            with self.assertRaises((OSError, ValueError)):
+                wallet.courier_read(vault, "draft.json")
+
+    def test_setup_courier_does_not_follow_a_directory_swapped_after_validation(self):
+        with tempfile.TemporaryDirectory(prefix="loki-courier-race-") as temp:
+            root = Path(temp)
+            wallet = Wallet(root / "member", root / "exchange")
+            self.addCleanup(wallet.close)
+            vault = "a" * 64
+            folder = wallet.exchange_vault(vault)
+            folder.mkdir()
+            (folder / "draft.json").write_bytes(b"{}")
+            outside = root / "outside"
+            outside.mkdir()
+            (outside / "draft.json").write_bytes(b"private signer data")
+            original_exchange_vault = wallet.exchange_vault
+
+            def swap_after_check(value):
+                checked = original_exchange_vault(value)
+                checked.rename(wallet.exchange / "saved")
+                checked.symlink_to(outside)
+                return checked
+
+            with patch.object(wallet, "exchange_vault", side_effect=swap_after_check):
+                with self.assertRaises((OSError, ValueError)):
+                    wallet.courier_read(vault, "draft.json")
 
     def test_sync_stops_after_all_final_reports(self):
         with tempfile.TemporaryDirectory(prefix="loki-sync-done-") as temp:

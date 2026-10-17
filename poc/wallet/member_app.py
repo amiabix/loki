@@ -18,6 +18,7 @@ import re
 import secrets
 import shutil
 import ssl
+import stat
 import subprocess
 import tempfile
 import threading
@@ -108,8 +109,24 @@ def courier_write(folder, name, body):
     (write_replace if courier_replaceable(name) else write_new)(folder / name, body)
 
 
+def courier_bytes(folder, name):
+    # The shared courier may contain links or large files written by another app.
+    directory = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    finally:
+        os.close(directory)
+    with os.fdopen(fd, "rb") as source:
+        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+            raise ValueError("Invalid setup file")
+        body = source.read(COURIER_LIMIT + 1)
+        if len(body) > COURIER_LIMIT:
+            raise ValueError("Setup file too large")
+        return body
+
+
 def courier_digests(folder, vault):
-    return {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+    return {path.name: hashlib.sha256(courier_bytes(folder, path.name)).hexdigest()
             for path in folder.iterdir() if courier_carries(vault, path.name)}
 
 
@@ -629,7 +646,10 @@ class Wallet:
     def exchange_vault(self, vault):
         if not isinstance(vault, str) or len(vault) != 64 or any(c not in "0123456789abcdef" for c in vault):
             raise ValueError("Invalid vault ID")
-        return self.exchange / vault
+        folder = self.exchange / vault
+        if folder.is_symlink():
+            raise ValueError("Setup courier directory must not be a symbolic link")
+        return folder
 
     # ── the creator's courier, reachable by the other members ───────────────
     # The same opaque files the local courier directory carried, served over
@@ -640,6 +660,7 @@ class Wallet:
         folder = self.exchange_vault(vault)
         if not (folder / "draft.json").is_file():
             raise ValueError("No vault setup is open for that ID")
+        courier_bytes(folder, "draft.json")
         return folder
 
     def claim_invite(self, vault, slot, secret, token):
@@ -651,7 +672,7 @@ class Wallet:
         on a second device arrives with a different token and is refused."""
         if not isinstance(token, str) or len(token) < 32 or len(token) > 256:
             raise ValueError("The joining app did not present a courier token")
-        draft = read_json(self.courier_folder(vault) / "draft.json")
+        draft = json.loads(courier_bytes(self.courier_folder(vault), "draft.json"))
         if type(slot) is not int or slot not in range(2, int(draft["members"]) + 1) \
                 or not isinstance(secret, str) or not secrets.compare_digest(
                     draft["invites"].get(str(slot), ""),
@@ -691,7 +712,7 @@ class Wallet:
         folder = self.courier_folder(vault)
         if not (folder / name).is_file():
             raise ValueError("Unknown setup file")
-        return (folder / name).read_bytes()
+        return courier_bytes(folder, name)
 
     def courier_publish(self, vault, slot, name, body):
         """A member may publish only the files their own slot owns."""
@@ -770,7 +791,7 @@ class Wallet:
             if courier_name(vault, name, str(slot)) and (
                     name not in remote or (courier_replaceable(name) and remote[name] != digest)):
                 courier_request(origin, "PUT", f"/setup/{vault}/files/{name}", token,
-                                (folder / name).read_bytes())
+                                courier_bytes(folder, name))
 
     def create(self, name, members=3):
         if self.hosted:
@@ -1860,6 +1881,14 @@ def make_signer_server(wallet, port, dashboard_port=None):
             self.end_headers()
             self.wfile.write(body)
 
+        def private_reply(self, generation, value):
+            with wallet.native_lock:
+                if generation == wallet.lock_epoch:
+                    # Bound a slow client so Lock cannot wait forever for this reply.
+                    self.connection.settimeout(2)
+                    return self.reply(200, value)
+            return self.reply(409, {"error": "Signer was locked during the request"})
+
         def authorized(self):
             return secrets.compare_digest(self.headers.get("X-Loki-Token", ""), token)
 
@@ -1908,6 +1937,7 @@ def make_signer_server(wallet, port, dashboard_port=None):
                 self.wfile.write((HERE / path.lstrip("/")).read_bytes())
                 return
             if path == "/api/session/vaults":
+                generation = wallet.lock_epoch
                 key = self.headers.get("X-Loki-Session", "")
                 if not self.dashboard_origin() or not sessions.valid(key, dashboard_origin):
                     return self.reply(403, {"error": "Connect your signer"})
@@ -1922,33 +1952,34 @@ def make_signer_server(wallet, port, dashboard_port=None):
                                            **{key: state[key] for key in ("total_members", "transport", "handoff", "missing_slots", "error") if key in state},
                                            **({"funding": state["funding"]} if "funding" in state else {}),
                                            **({"relay_setup": state["relay_setup"]} if "relay_setup" in state else {})})
-                    return self.reply(200, {"profile": profile["name"], "vaults": vaults,
-                                            "relay_network": wallet.relay_network_status()})
+                    return self.private_reply(generation, {"profile": profile["name"], "vaults": vaults,
+                                                           "relay_network": wallet.relay_network_status()})
                 except Exception as error:
                     return self.reply(400, {"error": str(error)})
             if not self.authorized():
                 return self.reply(403, {"error": "Open the private local app link"})
+            generation = wallet.lock_epoch
             try:
                 if path == "/api/session/pending":
-                    return self.reply(200, {"requests": sessions.pending()})
+                    return self.private_reply(generation, {"requests": sessions.pending()})
                 if path == "/api/session/actions":
-                    return self.reply(200, {"actions": sessions.pending_actions()})
+                    return self.private_reply(generation, {"actions": sessions.pending_actions()})
                 values = parse_qs(query)
                 vault = values.get("vault", [None])[0]
                 if path == "/api/status":
-                    return self.reply(200, wallet.status(vault))
+                    return self.private_reply(generation, wallet.status(vault))
                 if path == "/api/payments":
                     with wallet.lock:
                         payments = wallet.payments(vault)
-                    return self.reply(200, payments)
+                    return self.private_reply(generation, payments)
                 if path == "/api/card":
                     member_dir, _ = wallet.vault_dir(vault)
                     card = (member_dir / "card" / "vault.card").read_bytes()
-                    return self.reply(200, {"card": base64.b64encode(card).decode()})
+                    return self.private_reply(generation, {"card": base64.b64encode(card).decode()})
                 if path == "/api/final-card":
                     member_dir, _ = wallet.vault_dir(vault)
                     card = (member_dir / "final-card" / "vault.card").read_bytes()
-                    return self.reply(200, {"card": base64.b64encode(card).decode()})
+                    return self.private_reply(generation, {"card": base64.b64encode(card).decode()})
             except Exception as error:
                 return self.reply(400, {"error": str(error)})
             self.reply(404, {"error": "Not found"})
@@ -1966,6 +1997,7 @@ def make_signer_server(wallet, port, dashboard_port=None):
             elif not self.authorized() or self.headers.get("Origin") not in (
                 None, f"http://127.0.0.1:{self.server.server_address[1]}"):
                 return self.reply(403, {"error": "Unauthorized"})
+            generation = wallet.lock_epoch
             try:
                 size = int(self.headers.get("Content-Length", "0"))
                 if not 0 < size <= (4096 if is_dashboard else 128 * 1024):
@@ -2078,7 +2110,7 @@ def make_signer_server(wallet, port, dashboard_port=None):
                     if self.path not in routes:
                         return self.reply(404, {"error": "Not found"})
                     result = routes[self.path]()
-                    self.reply(200, result)
+                    self.private_reply(generation, result)
             except Exception as error:
                 surface = self.path.rsplit("/", 1)[-1] if self.path.startswith("/api/") else ""
                 self.reply(400, {"error": str(error), "surface": surface,
