@@ -778,10 +778,12 @@ pub fn sign_admission_request(
     )
 }
 
+#[derive(Clone)]
 pub enum AdmissionOutcome {
     Accepted(Value),
     Rejected(&'static str),
 }
+#[derive(Clone)]
 pub struct VerifiedAdmissionReply {
     outcome: AdmissionOutcome,
     package: Vec<u8>,

@@ -180,26 +180,23 @@ impl SetupTransport<'_> {
         store: &mut SetupStore,
         routes: &SetupRoutes,
     ) -> ClientResult<SetupProgress> {
+        let net = SetupNet::new(self.operators, self.development)?;
+        self.drive_once_with(store, routes, &net).await
+    }
+    /// One drive over all three relays at once, reusing `net`'s connections and
+    /// endpoint checks. Each network phase has a `request_seconds` deadline: a slow or
+    /// failing relay defers only its own route.
+    pub async fn drive_once_with(
+        &self,
+        store: &mut SetupStore,
+        routes: &SetupRoutes,
+        net: &SetupNet,
+    ) -> ClientResult<SetupProgress> {
         store.check_transport(self)?;
         store.active()?;
         self.check_routes(routes)?;
-        let http = RelayHttp::for_setup(self.operators, self.development)?;
         let mut retries = 0;
-        let drive = self.drive_bounded(store, routes, &http, &mut retries);
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(self.operators.limits().request_seconds),
-            drive,
-        )
-        .await
-        {
-            Ok(result) => result?,
-            Err(_) => {
-                for r in self.operators.relay_routes() {
-                    store.defer_route(self, &r.pin.key)?;
-                }
-                retries = 3;
-            }
-        }
+        self.drive_bounded(store, routes, net, &mut retries).await?;
         let mut progress = store.progress(self, routes)?;
         progress.retryable_routes = retries;
         Ok(progress)
@@ -208,80 +205,213 @@ impl SetupTransport<'_> {
         &self,
         store: &mut SetupStore,
         routes: &SetupRoutes,
-        http: &RelayHttp,
+        net: &SetupNet,
         retries: &mut usize,
     ) -> ClientResult<()> {
         store.reconcile_deferred(self)?;
-        let mut verified_pins = BTreeSet::new();
-        for index in 0..3 {
+        // Plan: everything that needs the store, before any request.
+        // Every network phase gets its own deadline: a relay that hangs through the
+        // first phase is dropped from the later ones and must not use up their time.
+        let limit = std::time::Duration::from_secs(self.operators.limits().request_seconds);
+        let phase_deadline = || tokio::time::Instant::now() + limit;
+        let mut plans = Vec::new();
+        for (index, own) in routes.own.iter().enumerate() {
             let pin = self.operators.relay_routes()[index].pin.key;
             if !store.route_due(&pin)? {
                 *retries += 1;
                 continue;
             }
-            let uploads = store.uploads(&pin, 64)?;
-            let mut authenticated = false;
-            for (key, recipient, object, ack) in uploads {
-                let Some((route, cap)) = self.append_route(routes, recipient, index) else {
-                    continue;
-                };
-                if !authenticated {
-                    if http
-                        .authenticate_endpoint(&route.pin, &route.endpoint)
-                        .await
-                        .is_err()
-                    {
-                        *retries += 1;
-                        store.defer_route(self, &pin)?;
-                        break;
-                    }
-                    authenticated = true;
-                    verified_pins.insert(pin);
+            let mut uploads = Vec::new();
+            for (key, recipient, object, ack) in store.uploads(&pin, 64)? {
+                if let Some((route, cap)) = self.append_route(routes, recipient, index) {
+                    uploads.push(Upload {
+                        key,
+                        object,
+                        ack,
+                        route,
+                        cap,
+                    });
                 }
-                match http.put(route, cap, &object).await {
-                    Ok(receipt) => {
-                        store.save_receipt(&key, &pin, &object.hash, receipt.bytes(), ack)?
-                    }
-                    Err(_) => {
-                        *retries += 1;
-                        store.defer_route(self, &pin)?;
-                        break;
+            }
+            plans.push(RelayPlan {
+                pin,
+                own,
+                after: store.cursor(&own.route)?,
+                uploads,
+            });
+        }
+        // Network, first half: endpoint check, uploads and the inbox page, all relays at once.
+        let deadline = phase_deadline();
+        let first = join_all(
+            plans
+                .iter()
+                .map(|plan| async move {
+                    tokio::time::timeout_at(deadline, self.upload_and_list(net, plan))
+                        .await
+                        .unwrap_or(Err(RelayFailure {
+                            receipts: Vec::new(),
+                        }))
+                })
+                .collect(),
+        )
+        .await;
+        // Objects already held locally are not downloaded again.
+        let mut held = BTreeMap::new();
+        for listed in first.iter().flatten() {
+            for entry in listed.page.entries() {
+                if !held.contains_key(entry.hash()) {
+                    if let Some(object) = store.object(entry.hash())? {
+                        held.insert(*entry.hash(), object);
                     }
                 }
             }
         }
-        for own in &routes.own {
-            if !store.route_due(&own.route.pin.key)? {
-                continue;
-            }
-            if !verified_pins.contains(&own.route.pin.key) {
-                if http
-                    .authenticate_endpoint(&own.route.pin, &own.route.endpoint)
-                    .await
-                    .is_err()
-                {
-                    *retries += 1;
-                    store.defer_route(self, &own.route.pin.key)?;
-                    continue;
+        // Network, second half: each missing object from the first relay that lists it,
+        // then (only after a failure) from every other relay that lists it.
+        let mut owner = BTreeMap::new();
+        for (index, listed) in first.iter().enumerate() {
+            if let Ok(listed) = listed {
+                for entry in listed.page.entries() {
+                    if !held.contains_key(entry.hash()) {
+                        owner.entry(*entry.hash()).or_insert(index);
+                    }
                 }
-                verified_pins.insert(own.route.pin.key);
             }
-            let after = store.cursor(&own.route)?;
-            let page = match http.entries(&own.route, &own.read, after, Some(32)).await {
-                Ok(p) => p,
-                Err(_) => {
+        }
+        let deadline = phase_deadline();
+        let fetched = join_all(
+            plans
+                .iter()
+                .zip(&first)
+                .enumerate()
+                .map(|(index, (plan, listed))| {
+                    let wanted: Vec<_> = match listed {
+                        Ok(listed) => listed
+                            .page
+                            .entries()
+                            .iter()
+                            .filter(|e| owner.get(e.hash()) == Some(&index))
+                            .map(|e| *e.hash())
+                            .collect(),
+                        Err(_) => Vec::new(),
+                    };
+                    async move {
+                        tokio::time::timeout_at(deadline, fetch_objects(net, plan.own, wanted))
+                            .await
+                            .unwrap_or_default()
+                    }
+                })
+                .collect(),
+        )
+        .await;
+        for objects in fetched {
+            held.extend(objects);
+        }
+        let deadline = phase_deadline();
+        let retry = join_all(
+            plans
+                .iter()
+                .zip(&first)
+                .map(|(plan, listed)| {
+                    let wanted: Vec<_> = match listed {
+                        Ok(listed) => listed
+                            .page
+                            .entries()
+                            .iter()
+                            .filter(|e| !held.contains_key(e.hash()))
+                            .map(|e| *e.hash())
+                            .collect(),
+                        Err(_) => Vec::new(),
+                    };
+                    async move {
+                        tokio::time::timeout_at(deadline, fetch_objects(net, plan.own, wanted))
+                            .await
+                            .unwrap_or_default()
+                    }
+                })
+                .collect(),
+        )
+        .await;
+        for objects in retry {
+            held.extend(objects);
+        }
+        // Chunked records name further objects; fetch those per relay the same way.
+        let deadline = phase_deadline();
+        let required = join_all(
+            plans
+                .iter()
+                .zip(&first)
+                .map(|(plan, listed)| {
+                    let mut wanted = BTreeSet::new();
+                    if let Ok(listed) = listed {
+                        for entry in listed.page.entries() {
+                            if let Some(object) = held.get(entry.hash()) {
+                                if let Ok(requirements) = self.inspect(object) {
+                                    wanted.extend(
+                                        requirements
+                                            .into_iter()
+                                            .map(|(hash, _)| hash)
+                                            .filter(|hash| !held.contains_key(hash)),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    let wanted: Vec<_> = wanted.into_iter().collect();
+                    async move {
+                        tokio::time::timeout_at(deadline, fetch_objects(net, plan.own, wanted))
+                            .await
+                            .unwrap_or_default()
+                    }
+                })
+                .collect(),
+        )
+        .await;
+        for objects in required {
+            for (hash, object) in objects {
+                held.entry(hash).or_insert(object);
+            }
+        }
+        // Apply, in relay order: receipts, then the page exactly as a sequential drive would.
+        for (plan, listed) in plans.iter().zip(first) {
+            let listed = match listed {
+                Ok(listed) => listed,
+                Err(failure) => {
+                    for (upload, receipt) in failure.receipts {
+                        let upload = &plan.uploads[upload];
+                        store.save_receipt(
+                            &upload.key,
+                            &plan.pin,
+                            &upload.object.hash,
+                            receipt.bytes(),
+                            upload.ack,
+                        )?;
+                    }
+                    net.forget(&plan.pin);
                     *retries += 1;
-                    store.defer_route(self, &own.route.pin.key)?;
+                    store.defer_route(self, &plan.pin)?;
                     continue;
                 }
             };
+            for (upload, receipt) in &listed.receipts {
+                let upload = &plan.uploads[*upload];
+                store.save_receipt(
+                    &upload.key,
+                    &plan.pin,
+                    &upload.object.hash,
+                    receipt.bytes(),
+                    upload.ack,
+                )?;
+            }
+            let own = plan.own;
+            let page = &listed.page;
             let mut cached = BTreeMap::new();
             let mut acknowledgements = Vec::new();
             let mut rejected = Vec::new();
             let mut incomplete = false;
             for entry in page.entries() {
-                let object = match http.get(&own.route, &own.read, entry.hash()).await {
-                    Ok(o) if o.wire.len() as u64 == entry.wire_length() => o,
+                let object = match held.get(entry.hash()) {
+                    Some(o) if o.wire.len() as u64 == entry.wire_length() => o.clone(),
                     _ => {
                         *retries += 1;
                         incomplete = true;
@@ -312,11 +442,11 @@ impl SetupTransport<'_> {
                     if cached.contains_key(&hash) {
                         continue;
                     }
-                    match http.get(&own.route, &own.read, &hash).await {
-                        Ok(o) => {
-                            cached.insert(hash, o);
+                    match held.get(&hash) {
+                        Some(o) => {
+                            cached.insert(hash, o.clone());
                         }
-                        Err(_) => {
+                        None => {
                             *retries += 1;
                             incomplete = true;
                             break;
@@ -337,11 +467,10 @@ impl SetupTransport<'_> {
             }
             if incomplete {
                 store.defer_route(self, &own.route.pin.key)?;
-            }
-            if !incomplete {
+            } else {
                 store.capture_page(
                     &own.route,
-                    after,
+                    plan.after,
                     page.next(),
                     &cached,
                     &acknowledgements,
@@ -355,6 +484,163 @@ impl SetupTransport<'_> {
         }
         Ok(())
     }
+    async fn upload_and_list(
+        &self,
+        net: &SetupNet,
+        plan: &RelayPlan<'_>,
+    ) -> Result<Listed, RelayFailure> {
+        let own = plan.own;
+        if net
+            .authenticate(&own.route.pin, &own.route.endpoint)
+            .await
+            .is_err()
+        {
+            return Err(RelayFailure {
+                receipts: Vec::new(),
+            });
+        }
+        let mut receipts = Vec::new();
+        for (chunk, uploads) in plan.uploads.chunks(IN_FLIGHT).enumerate() {
+            let results = join_all(
+                uploads
+                    .iter()
+                    .map(|upload| net.http.put(upload.route, upload.cap, &upload.object))
+                    .collect(),
+            )
+            .await;
+            let mut failed = false;
+            for (offset, result) in results.into_iter().enumerate() {
+                match result {
+                    Ok(receipt) => receipts.push((chunk * IN_FLIGHT + offset, receipt)),
+                    Err(_) => failed = true,
+                }
+            }
+            if failed {
+                return Err(RelayFailure { receipts });
+            }
+        }
+        match net
+            .http
+            .entries(&own.route, &own.read, plan.after, Some(32))
+            .await
+        {
+            Ok(page) => Ok(Listed { receipts, page }),
+            Err(_) => Err(RelayFailure { receipts }),
+        }
+    }
+}
+/// At most this many requests are in flight to one relay from one drive.
+const IN_FLIGHT: usize = 4;
+/// A relay endpoint check is reused for this long; any failure on that relay clears it.
+const ENDPOINT_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+/// Connections and endpoint checks shared by consecutive setup drives.
+pub struct SetupNet {
+    http: RelayHttp,
+    verified: std::sync::Mutex<BTreeMap<(Id32, String), std::time::Instant>>,
+}
+impl SetupNet {
+    pub fn new(operators: &crate::OperatorSet, development: bool) -> ClientResult<Self> {
+        Ok(Self {
+            http: RelayHttp::for_setup(operators, development)?,
+            verified: std::sync::Mutex::new(BTreeMap::new()),
+        })
+    }
+    /// `authenticate_endpoint` is a reachability and pin check that does not
+    /// authenticate later requests (every receipt, page and object is verified on
+    /// its own), so a recent success can be reused.
+    async fn authenticate(
+        &self,
+        pin: &loki_relay_protocol::types::RelayPin,
+        endpoint: &str,
+    ) -> ClientResult<()> {
+        crate::validate_endpoint(endpoint, self.http.development())?;
+        let key = (pin.key, endpoint.to_owned());
+        if let Some(at) = self
+            .verified
+            .lock()
+            .map_err(|_| ClientError::Storage)?
+            .get(&key)
+        {
+            if at.elapsed() < ENDPOINT_TTL {
+                return Ok(());
+            }
+        }
+        self.http.authenticate_endpoint(pin, endpoint).await?;
+        self.verified
+            .lock()
+            .map_err(|_| ClientError::Storage)?
+            .insert(key, std::time::Instant::now());
+        Ok(())
+    }
+    fn forget(&self, pin: &Id32) {
+        if let Ok(mut verified) = self.verified.lock() {
+            verified.retain(|(key, _), _| key != pin);
+        }
+    }
+}
+struct Upload<'a> {
+    key: Vec<u8>,
+    object: Object,
+    ack: bool,
+    route: &'a RelayRoute,
+    cap: &'a Secret32,
+}
+struct RelayPlan<'a> {
+    pin: Id32,
+    own: &'a OwnerInbox,
+    after: u64,
+    uploads: Vec<Upload<'a>>,
+}
+struct Listed {
+    receipts: Vec<(usize, crate::VerifiedReceipt)>,
+    page: crate::VerifiedPage,
+}
+struct RelayFailure {
+    receipts: Vec<(usize, crate::VerifiedReceipt)>,
+}
+async fn fetch_objects(net: &SetupNet, own: &OwnerInbox, wanted: Vec<Id32>) -> Vec<(Id32, Object)> {
+    let mut out = Vec::new();
+    for hashes in wanted.chunks(IN_FLIGHT) {
+        let results = join_all(
+            hashes
+                .iter()
+                .map(|hash| net.http.get(&own.route, &own.read, hash))
+                .collect(),
+        )
+        .await;
+        for (hash, result) in hashes.iter().zip(results) {
+            if let Ok(object) = result {
+                out.push((*hash, object));
+            }
+        }
+    }
+    out
+}
+/// Poll every future to completion on the current task; output order matches input.
+pub async fn join_all<F: std::future::Future>(futures: Vec<F>) -> Vec<F::Output> {
+    let mut pending: Vec<_> = futures.into_iter().map(|f| Some(Box::pin(f))).collect();
+    let mut output: Vec<Option<F::Output>> = pending.iter().map(|_| None).collect();
+    std::future::poll_fn(|cx| {
+        let mut done = true;
+        for (slot, result) in pending.iter_mut().zip(output.iter_mut()) {
+            if let Some(future) = slot {
+                match future.as_mut().poll(cx) {
+                    std::task::Poll::Ready(value) => {
+                        *result = Some(value);
+                        *slot = None;
+                    }
+                    std::task::Poll::Pending => done = false,
+                }
+            }
+        }
+        if done {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await;
+    output.into_iter().flatten().collect()
 }
 fn now_ms() -> ClientResult<u64> {
     let ms = std::time::SystemTime::now()
@@ -364,6 +650,27 @@ fn now_ms() -> ClientResult<u64> {
     u64::try_from(ms).map_err(|_| ClientError::Capacity)
 }
 impl SetupStore {
+    /// Whether a drive now would upload anything: a saved record or acknowledgement
+    /// not yet stored on a relay whose retry time has come.
+    pub fn has_due_uploads(&self, t: &SetupTransport<'_>) -> ClientResult<bool> {
+        for route in t.operators.relay_routes() {
+            if self.route_due(&route.pin.key)? && !self.uploads(&route.pin.key, 1)?.is_empty() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    fn object(&self, hash: &Id32) -> ClientResult<Option<Object>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT wire FROM objects WHERE hash=?1",
+                [hash.as_slice()],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .map(|wire| Object { hash: *hash, wire }))
+    }
     fn route_due(&self, pin: &Id32) -> ClientResult<bool> {
         let next: Option<u64> = self
             .connection

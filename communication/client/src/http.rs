@@ -100,6 +100,9 @@ impl RelayHttp {
         Self::build(false)
     }
 
+    pub(crate) fn development(&self) -> bool {
+        self.development
+    }
     pub fn for_setup(operators: &crate::OperatorSet, development: bool) -> ClientResult<Self> {
         Ok(Self {
             development,
