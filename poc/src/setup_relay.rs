@@ -692,6 +692,12 @@ fn shared_runtime() -> Result<&'static RelayRuntime, String> {
     let _ = RUNTIME.set(runtime);
     RUNTIME.get().ok_or_else(|| ERROR.into())
 }
+/// How long a long-lived process reuses an admission state during DKG and backups.
+const RELAXED_STATE: std::time::Duration = std::time::Duration::from_secs(10);
+/// The last admission state fetched per setup root in this process.
+static RECENT_STATE: std::sync::Mutex<
+    BTreeMap<PathBuf, (std::time::Instant, loki_relay_client::VerifiedAdmissionReply)>,
+> = std::sync::Mutex::new(BTreeMap::new());
 type SharedClients = (std::sync::Arc<AdmissionHttp>, std::sync::Arc<SetupNet>);
 /// HTTP clients per verified operator bundle and development flag, shared by every
 /// setup opened in this process.
@@ -1210,6 +1216,15 @@ impl HostedSetup {
         if let Some(reply) = self.admission_state.lock().map_err(|_| ERROR)?.as_ref() {
             return Ok(Some(reply.clone()));
         }
+        if self.relaxed_admission() {
+            let recent = RECENT_STATE.lock().map_err(|_| ERROR)?;
+            if let Some((at, reply)) = recent.get(&self.root) {
+                if at.elapsed() < RELAXED_STATE {
+                    *self.admission_state.lock().map_err(|_| ERROR)? = Some(reply.clone());
+                    return Ok(Some(reply.clone()));
+                }
+            }
+        }
         let request = sign_admission_request(
             &self.identity,
             &AdmissionRequest {
@@ -1225,17 +1240,40 @@ impl HostedSetup {
         match self.execute_admission(&request, None, false) {
             Ok(reply) => {
                 *self.admission_state.lock().map_err(|_| ERROR)? = Some(reply.clone());
+                RECENT_STATE
+                    .lock()
+                    .map_err(|_| ERROR)?
+                    .insert(self.root.clone(), (std::time::Instant::now(), reply.clone()));
                 Ok(Some(reply))
             }
             Err(loki_relay_client::ClientError::Transport) => Ok(None),
             Err(_) => Err("setup_admission".into()),
         }
     }
-    /// Forget the memoized admission state: after this process changed it, and at the
-    /// start of every step, so a setup held open across steps sees later changes.
-    fn admission_changed(&self) {
+    /// Whether this member's last step was in DKG or the provisional backups. The roster
+    /// is accepted then, so claims are immutable and the setup mailboxes provisioned;
+    /// the admission state only reports a terminal ceremony, which peers also announce
+    /// through the transport. A long-lived process asks at most every [`RELAXED_STATE`]
+    /// then; a CLI process asks once per step, as before.
+    fn relaxed_admission(&self) -> bool {
+        Self::cached_status(&self.root).is_ok_and(|status| {
+            matches!(
+                status["phase"].as_str(),
+                Some("round1_saved" | "round2_saved" | "certificate_saved" | "awaiting_backups")
+            )
+        })
+    }
+    /// Forget the memo of the current operation only.
+    fn begin_operation(&self) {
         if let Ok(mut state) = self.admission_state.lock() {
             *state = None;
+        }
+    }
+    /// Forget every remembered admission state after this process changed it.
+    fn admission_changed(&self) {
+        self.begin_operation();
+        if let Ok(mut recent) = RECENT_STATE.lock() {
+            recent.remove(&self.root);
         }
     }
     fn provision_step(&mut self) -> Result<SetupStatus, String> {
@@ -3431,7 +3469,7 @@ impl HostedSetup {
     }
     pub fn step(&mut self) -> Result<SetupStatus, String> {
         // The admission state is memoized within one operation only.
-        self.admission_changed();
+        self.begin_operation();
         let status = if matches!(self.journal.latest().ok_or(ERROR)?.payload[0], 0..=3)
             && self.transport_is_terminal()?
         {
