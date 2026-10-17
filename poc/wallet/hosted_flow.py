@@ -71,6 +71,11 @@ def poc_binary(profile, name):
 
 
 def communication_binary(profile, name):
+    # LOKI_HOSTED_FLOW_COMM_BIN points at a directory of saved operator binaries (for
+    # comparing runs against another build); otherwise the communication workspace target.
+    saved = os.environ.get("LOKI_HOSTED_FLOW_COMM_BIN")
+    if saved:
+        return Path(saved) / name
     return REPO / "communication" / "target" / profile / name
 
 
