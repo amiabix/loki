@@ -58,16 +58,20 @@ async def pipe(reader, writer, delay, log=None, name=None, connection=None):
         except Exception:
             pass
     task = asyncio.create_task(sender())
+    partial = b""  # an unterminated line carried to the next read
     try:
         while True:
             data = await reader.read(65536)
             if not data:
                 break
             if log is not None:
-                for match in REQUEST.finditer(data):
-                    log.write(json.dumps({"t": time.time(), "svc": name, "conn": connection,
-                                          "m": match.group(1).decode(),
-                                          "p": short(match.group(2).decode(errors="replace"))}) + "\n")
+                lines = (partial + data).split(b"\n")
+                partial = lines.pop()[-8192:]
+                for line in lines:
+                    for match in REQUEST.finditer(line):
+                        log.write(json.dumps({"t": time.time(), "svc": name, "conn": connection,
+                                              "m": match.group(1).decode(),
+                                              "p": short(match.group(2).decode(errors="replace"))}) + "\n")
                 log.flush()
             queue.put_nowait((time.monotonic() + delay, data))
     except Exception:

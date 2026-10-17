@@ -1,0 +1,6 @@
+{
+  "servicePorts": {
+    "dockerd": 32417,
+    "ths": 31258
+  }
+}

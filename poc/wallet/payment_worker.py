@@ -72,8 +72,9 @@ class PaymentWorker:
             return self.vault_locks.setdefault(vault, threading.RLock())
 
     @contextlib.contextmanager
-    def user_action(self, vault):
-        """Run a signer-window payment action on `vault` between worker steps."""
+    def user_action(self, vault, poke=True):
+        """Run a signer-window payment action on `vault` between worker steps.
+        Read-only actions pass poke=False so they do not start a worker pass."""
         with self.meta_lock:
             self.user_waiting[vault] += 1
         try:
@@ -84,7 +85,8 @@ class PaymentWorker:
                 self.user_waiting[vault] -= 1
                 if not self.user_waiting[vault]:
                     del self.user_waiting[vault]
-            self.poke(vault)
+            if poke:
+                self.poke(vault)
 
     def user_pending(self, vault):
         with self.meta_lock:

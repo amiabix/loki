@@ -230,7 +230,13 @@ class HostedSetup:
                 for folder, future in list(running.items()):
                     if future.done():
                         del running[folder]
-                        self._reschedule(folder, future.result())
+                        try:
+                            outcome = future.result()
+                        except Exception as error:
+                            # An unexpected failure stops only this vault's step, not the scheduler.
+                            self.errors[folder] = self._error_message(error)
+                            outcome = ("error", None)
+                        self._reschedule(folder, outcome)
                 for folder in folders:
                     if len(running) >= 2 or self.stop_event.is_set():
                         break

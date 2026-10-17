@@ -13,6 +13,9 @@ let paymentsLive = false;
 let refreshingPayments = false;
 let relaySetupPhase = null;
 const paymentReviews = new Map();
+/* last failed review read per attempt: the 2 s list refresh retries at most every 10 s */
+const reviewTried = new Map();
+const REVIEW_RETRY_MS = 10000;
 
 function selectVault(vault) {
   selectedVault = vault;
@@ -26,6 +29,7 @@ function selectVault(vault) {
   renderedPaymentVault = null;
   relaySetupPhase = null;
   paymentReviews.clear();
+  reviewTried.clear();
   $('address').textContent = 'Open this vault to view the address.';
   $('balance').textContent = "Scan this device's chain view to see the balance.";
   $('words').textContent = '';
@@ -264,10 +268,14 @@ async function refreshPayments() {
     /* the exact transaction is fetched as soon as it can be read: checking it
        is not a decision, so it is not a button */
     if (isSigner && ['commitments', 'package'].includes(payment.phase)
-        && !paymentReviews.has(payment.attempt)) {
+        && !paymentReviews.has(payment.attempt)
+        && Date.now() - (reviewTried.get(payment.attempt) || 0) >= REVIEW_RETRY_MS) {
       try {
         paymentReviews.set(payment.attempt, await api('payment-review', {vault, attempt: payment.attempt}));
-      } catch { /* the package is not readable yet; the next pass tries again */ }
+        reviewTried.delete(payment.attempt);
+      } catch { /* the package is not readable yet; retried after REVIEW_RETRY_MS */
+        reviewTried.set(payment.attempt, Date.now());
+      }
       if (selectedVault !== vault) return;
     }
     const review = isSigner ? paymentReviews.get(payment.attempt) : null;

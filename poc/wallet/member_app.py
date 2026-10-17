@@ -185,6 +185,8 @@ VAULT_STORE_ROUTES = frozenset((
     "/api/payment-verify", "/api/payment-advance",
     "/api/relay-provision", "/api/relay-export", "/api/relay-import", "/api/relay-status",
 ))
+# Store routes that change nothing the payment worker acts on: no worker pass afterwards.
+READ_ONLY_STORE_ROUTES = frozenset(("/api/payment-review", "/api/relay-status"))
 
 class Unreachable(ValueError):
     """The courier did not answer. Like Timeout, nothing is known to have
@@ -1410,6 +1412,14 @@ class Wallet:
             confirmed = None
         if not confirmed:
             self.payment_status(work, "confirmation_needs_recheck", status.get("txid"))
+            return
+        # Save where it is mined now (after a reorg it may be another block), so the next
+        # recheck can use the one-RPC path again.
+        located = re.search(r"\bblock=([0-9a-f]{64}) height=([0-9]+)$", output.strip())
+        if located and (located.group(1), int(located.group(2))) != \
+                (status.get("mined_block"), status.get("mined_height")):
+            self.payment_status(work, "confirmed", status["txid"],
+                                {"mined_block": located.group(1), "mined_height": int(located.group(2))})
 
     def _finish_ready(self, vault, attempt, manifest, phase):
         try:
@@ -2079,6 +2089,13 @@ def make_signer_server(wallet, port, dashboard_port=None):
                     if wallet.hosted:
                         wallet.hosted.stop()
                     wallet.payment_worker.stop()
+                if self.path == "/api/payment-sync":
+                    # Waits for a worker pass (up to a minute) without holding the app
+                    # lock, so the 2 s list refresh and other routes keep answering.
+                    wallet.require_profile()
+                    wallet.payment_worker.sync_now(wallet.checked_vault_id(value.get("vault")))
+                    with wallet.lock:
+                        return self.reply(200, wallet.payments(value.get("vault")))
                 with wallet.lock:
                     if self.path == "/api/session/approve":
                         wallet.require_profile()
@@ -2162,7 +2179,8 @@ def make_signer_server(wallet, port, dashboard_port=None):
                     if self.path in VAULT_STORE_ROUTES:
                         # Between payment worker steps on this vault, never during one: the
                         # member's transport store admits one native process at a time.
-                        with wallet.payment_worker.user_action(wallet.checked_vault_id(value.get("vault"))):
+                        with wallet.payment_worker.user_action(wallet.checked_vault_id(value.get("vault")),
+                                                               poke=self.path not in READ_ONLY_STORE_ROUTES):
                             result = routes[self.path]()
                     else:
                         result = routes[self.path]()

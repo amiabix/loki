@@ -245,13 +245,7 @@ impl SetupTransport<'_> {
         let first = join_all(
             plans
                 .iter()
-                .map(|plan| async move {
-                    tokio::time::timeout_at(deadline, self.upload_and_list(net, plan))
-                        .await
-                        .unwrap_or(Err(RelayFailure {
-                            receipts: Vec::new(),
-                        }))
-                })
+                .map(|plan| self.upload_and_list(net, plan, deadline))
                 .collect(),
         )
         .await;
@@ -488,26 +482,35 @@ impl SetupTransport<'_> {
         &self,
         net: &SetupNet,
         plan: &RelayPlan<'_>,
+        deadline: tokio::time::Instant,
     ) -> Result<Listed, RelayFailure> {
+        // The deadline applies to each request here, so receipts from uploads that
+        // finished before it expires are returned and saved rather than dropped.
         let own = plan.own;
-        if net
-            .authenticate(&own.route.pin, &own.route.endpoint)
-            .await
-            .is_err()
-        {
+        if !matches!(
+            tokio::time::timeout_at(deadline, net.authenticate(&own.route.pin, &own.route.endpoint))
+                .await,
+            Ok(Ok(_))
+        ) {
             return Err(RelayFailure {
                 receipts: Vec::new(),
             });
         }
         let mut receipts = Vec::new();
         for (chunk, uploads) in plan.uploads.chunks(IN_FLIGHT).enumerate() {
-            let results = join_all(
-                uploads
-                    .iter()
-                    .map(|upload| net.http.put(upload.route, upload.cap, &upload.object))
-                    .collect(),
+            let Ok(results) = tokio::time::timeout_at(
+                deadline,
+                join_all(
+                    uploads
+                        .iter()
+                        .map(|upload| net.http.put(upload.route, upload.cap, &upload.object))
+                        .collect(),
+                ),
             )
-            .await;
+            .await
+            else {
+                return Err(RelayFailure { receipts });
+            };
             let mut failed = false;
             for (offset, result) in results.into_iter().enumerate() {
                 match result {
@@ -519,13 +522,14 @@ impl SetupTransport<'_> {
                 return Err(RelayFailure { receipts });
             }
         }
-        match net
-            .http
-            .entries(&own.route, &own.read, plan.after, Some(32))
-            .await
+        match tokio::time::timeout_at(
+            deadline,
+            net.http.entries(&own.route, &own.read, plan.after, Some(32)),
+        )
+        .await
         {
-            Ok(page) => Ok(Listed { receipts, page }),
-            Err(_) => Err(RelayFailure { receipts }),
+            Ok(Ok(page)) => Ok(Listed { receipts, page }),
+            _ => Err(RelayFailure { receipts }),
         }
     }
 }
