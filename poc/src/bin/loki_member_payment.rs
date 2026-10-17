@@ -195,11 +195,35 @@ fn balance(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn prepare(args: &[String]) -> Result<(), String> {
-    if args.len() != 7 && args.len() != 8 {
-        return Err("prepare <member-dir> <passphrase-file> <roster.json> <work-dir> <recipient-UA> <amount-zat> <memo> [AB|AC|AD|BC|BD|CD]".into());
+fn sweep_amount(values: &[u64], fee: u64) -> Result<u64, String> {
+    if values.is_empty() || values.len() > 8 {
+        return Err("sweep needs 1 to 8 unspent notes".into());
     }
-    let pair = pair_from_name(args.get(7).map(String::as_str).unwrap_or("AB"))?;
+    let total = values
+        .iter()
+        .try_fold(0u64, |sum, value| sum.checked_add(*value))
+        .ok_or("vault balance exceeds u64")?;
+    total
+        .checked_sub(fee)
+        .filter(|amount| *amount > 0)
+        .ok_or_else(|| "vault balance does not cover the sweep fee".into())
+}
+
+fn prepare(args: &[String], sweep: bool) -> Result<(), String> {
+    if (sweep && args.len() != 6 && args.len() != 7)
+        || (!sweep && args.len() != 7 && args.len() != 8)
+    {
+        return Err(if sweep {
+            "prepare-sweep <member-dir> <passphrase-file> <roster.json> <work-dir> <recipient-UA> <memo> [AB|AC|AD|BC|BD|CD]".into()
+        } else {
+            "prepare <member-dir> <passphrase-file> <roster.json> <work-dir> <recipient-UA> <amount-zat> <memo> [AB|AC|AD|BC|BD|CD]".into()
+        });
+    }
+    let pair = pair_from_name(
+        args.get(if sweep { 6 } else { 7 })
+            .map(String::as_str)
+            .unwrap_or("AB"),
+    )?;
     let (member, _, _) = state(args)?;
     if pair
         .iter()
@@ -213,13 +237,9 @@ fn prepare(args: &[String]) -> Result<(), String> {
     let chain = scan::scan_chain(&rpc, &member.fvk)?;
     let tip: u32 = chain.tip.try_into().map_err(|_| "height overflow")?;
     let recipient = vault::orchard_receiver_from_ua(&args[4], Regtest.network_type())?;
-    let amount_zat: u64 = args[5].parse().map_err(|_| "invalid amount")?;
-    if amount_zat == 0 {
-        return Err("amount must exceed zero".into());
-    }
-    let amount = Zatoshis::from_u64(amount_zat).map_err(|e| format!("amount: {e:?}"))?;
-    let memo = MemoBytes::from_bytes(args[6].as_bytes()).map_err(|e| format!("memo: {e:?}"))?;
-    if args[6].is_empty() {
+    let memo_text = &args[if sweep { 5 } else { 6 }];
+    let memo = MemoBytes::from_bytes(memo_text.as_bytes()).map_err(|e| format!("memo: {e:?}"))?;
+    if memo_text.is_empty() {
         return Err("memo must be nonempty".into());
     }
     let expiry = tip
@@ -228,34 +248,65 @@ fn prepare(args: &[String]) -> Result<(), String> {
         .div_ceil(1_152)
         .checked_mul(1_152)
         .ok_or("expiry overflow")?;
-    // shortcut: this bridge selects one fresh covering note; a wallet needs spentness and coin selection.
-    let (note, fee_zat, change_zat) = chain
-        .notes
-        .iter()
-        .rev()
-        .find_map(|note| {
-            let inputs = CandidateInputs {
-                vault_fvk: &member.fvk,
-                notes: vec![note.note],
-                recipient,
-                amount,
-                memo: memo.clone(),
-                change: Zatoshis::ZERO,
-                target_height: tip,
-                expiry_height: expiry,
-            };
-            let fee = u64::from(quote_fee(&Regtest, &inputs).ok()?);
-            let change = note.value_zat.checked_sub(amount_zat.checked_add(fee)?)?;
-            Some((note, fee, change))
-        })
-        .ok_or("no single vault note covers the amount and fee")?;
+    let (notes, amount_zat, fee_zat, change_zat) = if sweep {
+        if chain.notes.is_empty() || chain.notes.len() > 8 {
+            return Err("sweep needs 1 to 8 unspent notes".into());
+        }
+        let inputs = CandidateInputs {
+            vault_fvk: &member.fvk,
+            notes: chain.notes.iter().map(|note| note.note).collect(),
+            recipient,
+            amount: Zatoshis::from_u64(1).map_err(|e| format!("amount: {e:?}"))?,
+            memo: memo.clone(),
+            change: Zatoshis::ZERO,
+            target_height: tip,
+            expiry_height: expiry,
+        };
+        let fee = u64::from(quote_fee(&Regtest, &inputs)?);
+        let values = chain
+            .notes
+            .iter()
+            .map(|note| note.value_zat)
+            .collect::<Vec<_>>();
+        let amount = sweep_amount(&values, fee)?;
+        Zatoshis::from_u64(amount).map_err(|e| format!("amount: {e:?}"))?;
+        (chain.notes.iter().collect::<Vec<_>>(), amount, fee, 0)
+    } else {
+        let amount_zat: u64 = args[5].parse().map_err(|_| "invalid amount")?;
+        if amount_zat == 0 {
+            return Err("amount must exceed zero".into());
+        }
+        let amount = Zatoshis::from_u64(amount_zat).map_err(|e| format!("amount: {e:?}"))?;
+        // shortcut: ordinary payments select one covering note; use prepare-sweep to empty a vault.
+        let (note, fee, change) = chain
+            .notes
+            .iter()
+            .rev()
+            .find_map(|note| {
+                let inputs = CandidateInputs {
+                    vault_fvk: &member.fvk,
+                    notes: vec![note.note],
+                    recipient,
+                    amount,
+                    memo: memo.clone(),
+                    change: Zatoshis::ZERO,
+                    target_height: tip,
+                    expiry_height: expiry,
+                };
+                let fee = u64::from(quote_fee(&Regtest, &inputs).ok()?);
+                let change = note.value_zat.checked_sub(amount_zat.checked_add(fee)?)?;
+                Some((note, fee, change))
+            })
+            .ok_or("no single vault note covers the amount and fee")?;
+        (vec![note], amount_zat, fee, change)
+    };
     let intent = Intent {
         proposer: member.key.identifier().serialize(),
         created_height: tip,
-        input_nullifiers: vec![note.nullifier],
+        input_nullifiers: notes.iter().map(|note| note.nullifier).collect(),
         recipient: recipient.to_raw_address_bytes().to_vec(),
         amount_zat,
-        memo: args[6].as_bytes().to_vec(),
+        memo: memo_text.as_bytes().to_vec(),
         change_policy: ChangePolicy::VaultInternal,
         fee_zat,
         change_zat,
@@ -1227,7 +1278,8 @@ fn receive(args: &[String]) -> Result<(), String> {
 fn main() {
     let args = env::args().collect::<Vec<_>>();
     let result = match args.get(1).map(String::as_str) {
-        Some("prepare") => prepare(&args[2..]),
+        Some("prepare") => prepare(&args[2..], false),
+        Some("prepare-sweep") => prepare(&args[2..], true),
         Some("local-wires") => local_wires(&args[2..]),
         Some("balance") => balance(&args[2..]),
         #[cfg(feature = "relay-communication")]
@@ -1251,7 +1303,7 @@ fn main() {
         Some("verify") => verify(&args[2..]),
         Some("receive") => receive(&args[2..]),
         _ => Err(
-            "loki_member_payment <balance|prepare|sign|resend|finish|verify|receive> ... (regtest only)"
+            "loki_member_payment <balance|prepare|prepare-sweep|sign|resend|finish|verify|receive> ... (regtest only)"
                 .into(),
         ),
     };
@@ -1265,6 +1317,18 @@ fn main() {
 mod tests {
     use super::*;
     use loki_poc::payment_manifest::{manifest_pair, proposer_id};
+
+    #[test]
+    fn sweep_uses_every_note_and_leaves_only_the_quoted_fee() {
+        assert_eq!(
+            sweep_amount(&[30_000_000, 70_000_000], 15_000).unwrap(),
+            99_985_000
+        );
+        assert!(sweep_amount(&[], 10_000).is_err());
+        assert!(sweep_amount(&[10_000], 10_000).is_err());
+        assert!(sweep_amount(&[1; 9], 1).is_err());
+        assert!(sweep_amount(&[u64::MAX, 1], 1).is_err());
+    }
 
     #[test]
     fn local_wires_excludes_received_and_other_attempts() {

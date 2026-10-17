@@ -127,6 +127,40 @@ An active vault can scan the regtest chain for its unspent balance at a named
 block height. Set `LOKI_RPC=host:port` when starting each app if the local node
 is not on the default `127.0.0.1:18232`; the app does not fund or mine blocks.
 
+## Emergency recovery and exit (regtest beta)
+
+Two members who each saved a **final** `loki-vault.card` and their 24 words can
+spend without the old devices, old unlock passphrases, setup courier, or payment
+relays. Use one trusted recovery computer together. Each member enters their
+own words and chooses a new local unlock passphrase; each checks and approves
+the full transaction review independently. The tool erases its temporary
+restored stores when it exits normally.
+
+To replace a departing member, first create a **new** 2-of-3 vault in the
+member app with the continuing members, complete its backup checks, and copy
+its receive address. Then run:
+
+```sh
+cd poc
+cargo build --locked --bins
+python3 wallet/recovery_tool.py --rpc 127.0.0.1:18232
+```
+
+Enter each member's final card **file** and 24 words when prompted, then the
+new vault's receive address. The tool restores both members, scans the regtest
+chain, creates a sweep of all currently unspent source notes, displays the
+Rust signer's exact review to each member, and broadcasts only after both
+approve. Check the transaction ID and the new vault's balance after it is
+mined. A relay outage does not affect this path; a reachable regtest node is
+still required. No old passphrase or developer-run Rust command is needed.
+The new vault must have a different address. Compare the displayed recipient
+with the new vault's address before either member approves.
+
+The current payment manifest supports at most eight source notes. If the
+source vault has more, the tool stops before signing. See
+[Step 4 status](../../STEP4-STATUS.md) for the live regtest evidence still
+needed before this is considered a verified release journey.
+
 The server binds to loopback and uses a private URL token. The passphrase unlocks
 the sealed profile and stays in this process's memory until Lock or shutdown; it
 is not saved as plaintext in the member directory. The profile ID is local and
