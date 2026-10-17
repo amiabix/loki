@@ -34,6 +34,8 @@ pub struct Found {
 /// Everything a scan carries forward to the next one.
 #[derive(Default)]
 pub struct ScanState {
+    /// Digest of the viewing key that selected `found`; absent in older cache files.
+    pub vault_tag: Option<[u8; 32]>,
     /// The last block height whose actions are already recorded here. `0` means nothing
     /// has been scanned, which is also what the first run sees.
     pub tip: u64,
@@ -130,6 +132,7 @@ impl ScanState {
             let mut f = line.split_whitespace();
             match f.next() {
                 None => continue,
+                Some("vault") => state.vault_tag = Some(field(&mut f).ok_or_else(bad)?),
                 Some("tip") => {
                     state.tip = f.next().and_then(|v| v.parse().ok()).ok_or_else(bad)?;
                     state.tip_hash = match f.next() {
@@ -195,6 +198,9 @@ impl ScanState {
             let f = options.open(&temp).map_err(io)?;
             let mut out = std::io::BufWriter::new(f);
 
+            if let Some(tag) = self.vault_tag {
+                writeln!(out, "vault {}", hex::encode(tag)).map_err(io)?;
+            }
             if let Some(hash) = self.tip_hash {
                 writeln!(out, "tip {} {}", self.tip, hex::encode(hash)).map_err(io)?;
             } else {
@@ -386,6 +392,43 @@ mod tests {
         let chain = canned_chain(&vault, &decoy);
         let path = std::env::temp_dir().join(format!("loki-legacy-{}.txt", std::process::id()));
         std::fs::write(&path, "tip 6\n").unwrap();
+        let mut state = ScanState::load(&path).unwrap();
+        scan_blocks(&vault, &mut state, 6, |h| Ok(chain[h as usize - 1].clone())).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(state.notes(&vault).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn legacy_cache_with_tip_hash_but_no_vault_tag_is_rescanned() {
+        let vault = a_fvk(3);
+        let decoy = a_fvk(9);
+        let chain = canned_chain(&vault, &decoy);
+        let path = std::env::temp_dir().join(format!("loki-old-cache-{}.txt", std::process::id()));
+        std::fs::write(&path, format!("tip 6 {:064x}\n", 6)).unwrap();
+
+        let mut state = ScanState::load(&path).unwrap();
+        scan_blocks(&vault, &mut state, 6, |h| Ok(chain[h as usize - 1].clone())).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(state.notes(&vault).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn cache_from_another_vault_is_rescanned() {
+        let vault = a_fvk(3);
+        let decoy = a_fvk(9);
+        let unrelated = a_fvk(7);
+        let chain = canned_chain(&vault, &decoy);
+        let path =
+            std::env::temp_dir().join(format!("loki-other-vault-{}.txt", std::process::id()));
+
+        let mut state = ScanState::default();
+        scan_blocks(&unrelated, &mut state, 6, |h| {
+            Ok(chain[h as usize - 1].clone())
+        })
+        .unwrap();
+        assert!(state.found.is_empty());
+        state.save(&path).unwrap();
+
         let mut state = ScanState::load(&path).unwrap();
         scan_blocks(&vault, &mut state, 6, |h| Ok(chain[h as usize - 1].clone())).unwrap();
         std::fs::remove_file(&path).unwrap();

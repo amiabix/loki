@@ -186,9 +186,9 @@ pub fn scan_chain(rpc: &crate::rpc::Rpc, fvk: &FullViewingKey) -> Result<Chain, 
 /// [`crate::witness::witness_for`] needs to rebuild
 /// the tree and check its root against the node's anchor.
 ///
-/// A shorter chain, a changed saved-tip block, or a legacy cache without a block hash
-/// is rescanned from scratch. A disconnected chain or a tip that changes during the
-/// scan is refused without replacing the saved state.
+/// A different vault, a shorter chain, a changed saved-tip block, or a legacy cache
+/// without a block hash or vault tag is rescanned from scratch. A disconnected chain
+/// or a tip that changes during the scan is refused without replacing the saved state.
 pub fn scan_chain_cached(
     rpc: &crate::rpc::Rpc,
     fvk: &FullViewingKey,
@@ -235,14 +235,17 @@ pub fn scan_blocks<F>(
 where
     F: Fn(u64) -> Result<serde_json::Value, String>,
 {
+    let vault_tag = blake3::derive_key("loki cached chain scan viewing key v1", &fvk.to_bytes());
     // A saved height alone cannot identify a chain after a reorg.
-    if to < state.tip
+    if state.vault_tag != Some(vault_tag)
+        || to < state.tip
         || (state.tip > 0
             && (state.tip_hash.is_none()
                 || Some(block_hash(&get_block(state.tip)?, state.tip)?) != state.tip_hash))
     {
         *state = ScanState::default();
     }
+    state.vault_tag = Some(vault_tag);
 
     let ivks = vault_ivks(fvk);
     for height in state.tip + 1..=to {
