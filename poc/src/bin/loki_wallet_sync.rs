@@ -1,7 +1,7 @@
 use std::{env, fs, path::Path, time::Duration};
 
 use loki_poc::{member_state, network::VaultNetwork, wallet_store::VaultWallet};
-use tonic::transport::Endpoint;
+use tonic::transport::{ClientTlsConfig, Endpoint};
 use zcash_client_backend::{
     data_api::AccountBirthday,
     proto::service::{compact_tx_streamer_client::CompactTxStreamerClient, BlockId, Empty},
@@ -18,6 +18,13 @@ fn lightwalletd_endpoint(url: String) -> Result<Endpoint, String> {
     {
         return Err("lightwalletd must use HTTPS, except on localhost".into());
     }
+    // A public lightwalletd is reached over TLS; tonic needs the webpki roots configured
+    // explicitly (it does not enable TLS from the https scheme alone).
+    if uri.scheme_str() == Some("https") {
+        return endpoint
+            .tls_config(ClientTlsConfig::new().with_webpki_roots())
+            .map_err(|e| format!("lightwalletd TLS: {e}"));
+    }
     Ok(endpoint)
 }
 
@@ -25,6 +32,8 @@ async fn sync(args: &[String]) -> Result<(), String> {
     if args.len() != 4 {
         return Err("usage: loki_wallet_sync <member-dir> <passphrase-file> <roster.json> <lightwalletd-url>".into());
     }
+    // rustls 0.23 has no default crypto provider; install one before any TLS handshake.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let member = member_state::open(
         Path::new(&args[0]),
         Path::new(&args[1]),
@@ -115,6 +124,28 @@ mod tests {
         assert!(lightwalletd_endpoint("http://127.0.0.1:9067".into()).is_ok());
         assert!(lightwalletd_endpoint("http://wallet.example".into()).is_err());
         assert!(lightwalletd_endpoint("http://127.0.0.1.evil.example".into()).is_err());
+    }
+
+    /// Live, network-gated: the configured endpoint reaches a real public Testnet
+    /// lightwalletd over TLS and reports the Testnet chain. `LOKI_TEST_LIGHTWALLETD`
+    /// overrides the default server. Ignored by default so the suite stays offline.
+    #[tokio::test]
+    #[ignore = "network: hits a public Testnet lightwalletd"]
+    async fn reaches_public_testnet_lightwalletd() {
+        use zcash_client_backend::proto::service::{
+            compact_tx_streamer_client::CompactTxStreamerClient, Empty,
+        };
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let url = std::env::var("LOKI_TEST_LIGHTWALLETD")
+            .unwrap_or_else(|_| "https://testnet.zec.rocks:443".into());
+        let channel = lightwalletd_endpoint(url).unwrap().connect().await.unwrap();
+        let info = CompactTxStreamerClient::new(channel)
+            .get_lightd_info(Empty {})
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(info.chain_name, "test");
+        assert!(info.block_height > 4_465_026);
     }
 }
 

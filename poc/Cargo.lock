@@ -1869,6 +1869,7 @@ dependencies = [
  "rand_core 0.10.1",
  "rand_core 0.6.4",
  "rusqlite",
+ "rustls",
  "serde_json",
  "sha2 0.10.9",
  "tokio",

@@ -48,6 +48,7 @@ zcash_keys = { package = "zakura-keys", version = "=2.2.0", features = ["orchard
 rusqlite = { version = "=0.37.0", features = ["bundled-sqlcipher-vendored-openssl"] }
 async-trait = "0.1"
 tonic = { version = "0.14.6", features = ["transport", "tls-webpki-roots"] }
+rustls = { version = "0.23", features = ["aws_lc_rs"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 zcash_note_encryption = "0.4.2"
 # Only for the forbidden-pool tamper fixtures: these build a transparent / Sapling
