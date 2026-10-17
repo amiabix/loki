@@ -1043,3 +1043,18 @@ main > #transport-note {
   .step-title { margin-bottom: 20px; max-width: 24ch; font-size: clamp(26px, 7vw, 34px); }
   .invite-actions button { flex: 1 1 auto; justify-content: center; }
 }
+
+/* Educational prose collapses behind a disclosure; warnings never do. */
+details.aside { margin: 0 0 .75rem; }
+details.aside > summary {
+  cursor: pointer;
+  color: var(--dim);
+  font: inherit;
+  font-size: .85rem;
+  list-style: none;
+  user-select: none;
+}
+details.aside > summary::-webkit-details-marker { display: none; }
+details.aside > summary::before { content: "▸ "; color: var(--faint); }
+details.aside[open] > summary::before { content: "▾ "; }
+details.aside > p { color: var(--dim); margin: .4rem 0 0; }
