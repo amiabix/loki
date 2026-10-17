@@ -17,6 +17,7 @@ import unittest
 
 import test_remote_join as join
 from member_app import PAYMENT
+from local_relays import SERVER
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
@@ -30,15 +31,14 @@ class RealBrowserPaymentFlow(unittest.TestCase):
         name = os.environ.get("LOKI_THS_INSTANCE")
         if not name:
             self.skipTest("set LOKI_THS_INSTANCE to a disposable THS instance")
-        server = HERE.parents[1] / "communication" / "target" / "debug" / "loki-relay-server"
-        if not server.is_file():
+        if not SERVER.is_file():
             self.skipTest("build communication's loki-relay-server first")
         if not PAYMENT.is_file():
             self.fail("Build poc binaries with --features relay-communication before this test")
         feature = subprocess.run([str(PAYMENT), "features"], text=True, capture_output=True)
         if feature.returncode or feature.stdout.strip() != "relay-backed-signing=1":
             self.fail("Build poc binaries with --features relay-communication before this test")
-        self.server = server
+        self.server = SERVER
         self.chain = THS(name)
         self.chain.check()
         self.root = Path(tempfile.mkdtemp(prefix="loki-browser-flow-", dir="/private/tmp"))

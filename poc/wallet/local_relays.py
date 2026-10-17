@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SERVER = HERE.parents[1] / 'communication' / 'target' / 'debug' / 'loki-relay-server'
+SERVER = HERE.parents[1] / 'communication' / 'target' / os.environ.get('LOKI_POC_BIN_PROFILE', 'debug') / 'loki-relay-server'
 
 
 def save(path, value):

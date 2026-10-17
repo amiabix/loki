@@ -1,0 +1,13 @@
+[Unit]
+Description=Loki owned Testnet relay %i
+
+[Service]
+Type=simple
+ExecStart=%h/loki-deployment-session/src/communication/target/release/loki-relay-server serve --root %h/.local/share/loki-hosted-testnet/relay-%i --listen 127.0.0.1:3910%i
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

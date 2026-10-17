@@ -1,0 +1,15 @@
+[Unit]
+Description=Loki owned Testnet setup admission
+After=loki-relay@1.service loki-relay@2.service loki-relay@3.service
+Requires=loki-relay@1.service loki-relay@2.service loki-relay@3.service
+
+[Service]
+Type=simple
+ExecStart=%h/loki-deployment-session/src/communication/target/release/loki-setup-admission serve --root %h/.local/share/loki-hosted-testnet/admission --bundle-file %h/.local/share/loki-hosted-testnet/operator.cbor --config-key-file %h/.local/share/loki-hosted-testnet/config.key --signing-key-file %h/.local/share/loki-hosted-testnet/signing.seed --issuer-key-file %h/.local/share/loki-hosted-testnet/issuer.key --relay-1-provision-file %h/.local/share/loki-hosted-testnet/ordered-relay-1.secret --relay-2-provision-file %h/.local/share/loki-hosted-testnet/ordered-relay-2.secret --relay-3-provision-file %h/.local/share/loki-hosted-testnet/ordered-relay-3.secret --listen 127.0.0.1:39104
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

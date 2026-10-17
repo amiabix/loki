@@ -16,6 +16,7 @@ import time
 import unittest
 
 import test_remote_join as join
+from local_relays import SERVER
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
@@ -29,10 +30,9 @@ class RelayPaymentFlowTest(unittest.TestCase):
         name = os.environ.get("LOKI_THS_INSTANCE")
         if not name:
             self.skipTest("set LOKI_THS_INSTANCE to a disposable THS regtest instance")
-        server = HERE.parents[1] / "communication" / "target" / "debug" / "loki-relay-server"
-        if not server.is_file():
+        if not SERVER.is_file():
             self.skipTest("build communication's loki-relay-server first")
-        self.server = server
+        self.server = SERVER
         self.chain = THS(name)
         self.chain.check()
         self.temp = tempfile.TemporaryDirectory(prefix="loki-app-payment-", dir="/private/tmp")

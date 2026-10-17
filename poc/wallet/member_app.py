@@ -30,11 +30,12 @@ from local_relays import configure_member, ensure_network, network_root, save as
 from local_funding import fund_member, funding_status
 
 HERE = Path(__file__).resolve().parent
-SETUP = HERE.parent / "target" / "debug" / "loki_setup_member"
-PAYMENT = HERE.parent / "target" / "debug" / "loki_member_payment"
-RELAY = HERE.parent / "target" / "debug" / "loki_relay_member"
-SEED_WALLET = HERE.parent / "target" / "debug" / "loki_seed_wallet"
-WALLET_SYNC = HERE.parent / "target" / "debug" / "loki_wallet_sync"
+BIN_DIR = HERE.parent / "target" / os.environ.get("LOKI_POC_BIN_PROFILE", "debug")
+SETUP = BIN_DIR / "loki_setup_member"
+PAYMENT = BIN_DIR / "loki_member_payment"
+RELAY = BIN_DIR / "loki_relay_member"
+SEED_WALLET = BIN_DIR / "loki_seed_wallet"
+WALLET_SYNC = BIN_DIR / "loki_wallet_sync"
 
 # A peer's message that has not arrived yet, or a broadcast the node has not mined
 # yet, is a normal outcome of asking too early rather than a failure to report.

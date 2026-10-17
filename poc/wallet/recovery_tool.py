@@ -13,8 +13,9 @@ from pathlib import Path
 
 
 HERE = Path(__file__).resolve().parent
-SETUP = HERE.parent / "target/debug/loki_setup_member"
-PAYMENT = HERE.parent / "target/debug/loki_member_payment"
+BIN_DIR = HERE.parent / "target" / os.environ.get("LOKI_POC_BIN_PROFILE", "debug")
+SETUP = BIN_DIR / "loki_setup_member"
+PAYMENT = BIN_DIR / "loki_member_payment"
 
 
 class RecoveryTool:

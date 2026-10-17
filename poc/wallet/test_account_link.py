@@ -9,10 +9,9 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from member_app import HERE, Wallet
+from member_app import SEED_WALLET, Wallet
 
 
-SEED_WALLET = HERE.parent / "target" / "debug" / "loki_seed_wallet"
 WORDS = "abandon " * 23 + "art"
 
 
