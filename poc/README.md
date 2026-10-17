@@ -79,7 +79,7 @@ spend before real custody use.
 | **Separate-member setup** | three or four isolated processes complete DKG at threshold two or three; each member checks a 24-word and card backup before the regtest address appears. A restored 3-of-4 member signed a mined regtest payment ([details](SEPARATE-MEMBER-SETUP.md)) |
 | **Signing sessions** | the relay-backed `commit`/`package`/`approve` path seals nonces across invocations and requires two pinned relay nonce receipts before signing. A separate-member 3-of-4 relay journey confirmed a payment and rejected signing from restored old nonce state; all four signer triples passed exact-set tests. The simultaneous local-courier `sign` command also mined a 3-of-4 payment but remains a RAM-only demo ([scope](SIGNING-SESSION.md)) |
 | **Structured review** | the relay-enabled CLI can return a verified payment summary and exact-package review token, then recheck that token before `approve-reviewed` signs. The token binds bytes; an app still has to show the summary and obtain the member's explicit consent |
-| **Recovery, key rotation, custody** | local two-artifact restore demonstrated on regtest; independent spend, key rotation in the wallet, and custody readiness **not established** |
+| **Recovery, key rotation, custody** | guided two-card relay-free regtest sweep added with offline scenario tests; live member journey, key rotation in the wallet, and custody readiness **not established** ([Step 4 status](../STEP4-STATUS.md)) |
 
 ## Quick start
 

@@ -47,7 +47,7 @@ def create_vault(root, vault_id, setup, env, member_count=3, threshold=2):
     for number, (owner, password) in enumerate(members, 1):
         card = root / f"card-{number}"
         words = run([setup, "backup-create", owner, password, card], env)
-        words_file = owner / "words.txt"
+        words_file = root / f"words-{number}.txt"
         words_file.write_text(words + "\n")
         words_file.chmod(0o600)
         run([setup, "backup-verify", owner, password, card, words_file, roster, exchange], env)
@@ -57,8 +57,26 @@ def create_vault(root, vault_id, setup, env, member_count=3, threshold=2):
         raise RuntimeError("members derived different vault addresses")
     for number, (owner, password) in enumerate(members, 1):
         run([setup, "backup-finalize", owner, password, root / f"card-{number}",
-             root / f"final-card-{number}", owner / "words.txt", roster, exchange], env)
+             root / f"final-card-{number}", root / f"words-{number}.txt", roster, exchange], env)
     return members, roster, addresses[0]
+
+
+def restore_pair(root, setup, env, numbers, vault):
+    signers = []
+    for number in numbers:
+        recovered = root / f"recovered-member-{number}"
+        recovered.mkdir(mode=0o700)
+        password = recovered / "pass.txt"
+        password.write_text(f"new regtest passphrase for member {number}\n")
+        password.chmod(0o600)
+        owner = recovered / "member"
+        card = root / "source" / f"final-card-{number}"
+        words = root / "source" / f"words-{number}.txt"
+        if run([setup, "restore", owner, password, card, words], env) != vault:
+            raise RuntimeError("recovered signer derived another vault address")
+        signers.append((owner, password))
+        print(f"restored signing member {number} from exported final card and words", flush=True)
+    return signers, signers[0][0] / "roster.json"
 
 
 def main():
@@ -66,6 +84,7 @@ def main():
     parser.add_argument("--name", required=True, help="already running THS instance")
     parser.add_argument("--state", type=pathlib.Path, required=True, help="new, private test directory")
     parser.add_argument("--manual", action="store_true", help="prepare, then print commands for the selected signers")
+    parser.add_argument("--recover-signers", action="store_true", help="spend using only the selected restored signers and their exported final cards and words")
     parser.add_argument("--members", type=int, choices=(3, 4), default=3,
                         help="number of vault members")
     parser.add_argument("--threshold", type=int, choices=(2, 3), default=2,
@@ -74,9 +93,9 @@ def main():
                         help="run one step for the local member UI")
     parser.add_argument("--pair", "--signers", choices=("AB", "AC", "AD", "BC", "BD", "CD", "ABC", "ABD", "ACD", "BCD"),
                         help="selected members who approve this payment")
-    parser.add_argument("--proposer", type=int, default=1, help="member creating the payment")
+    parser.add_argument("--proposer", type=int, help="member creating the payment; defaults to member 1, or the first restored signer in recovery mode")
     parser.add_argument("--recipient", help="recipient unified address; defaults to the local test recipient")
-    parser.add_argument("--finisher", type=int, help="member who proves and sends; defaults to a non-signer")
+    parser.add_argument("--finisher", type=int, help="member who proves and sends; first signer in recovery mode")
     parser.add_argument("--amount-zat", type=int, default=40_000_000, help="regtest payment amount")
     parser.add_argument("--memo", default="separate member payment", help="shielded payment memo")
     args = parser.parse_args()
@@ -143,39 +162,26 @@ def main():
     args.pair = args.pair or ("ABC" if args.threshold == 3 else "AB")
     if len(args.pair) != args.threshold or any(ord(c) - ord("A") + 1 > member_count for c in args.pair):
         parser.error("the selected signers must match the vault policy")
-    recovered_number = ord(args.pair[0]) - ord("A") + 1
-    recovered = root / f"recovered-member-{recovered_number}"
-    recovered.mkdir(mode=0o700)
-    recovered_card = recovered / "card"
-    recovered_card.mkdir(mode=0o700)
-    (recovered_card / "vault.card").write_bytes(
-        (root / "source" / f"final-card-{recovered_number}" / "vault.card").read_bytes())
-    (recovered_card / "vault.card").chmod(0o600)
-    recovered_words = recovered / "words.txt"
-    recovered_words.write_bytes((root / "source" / f"member-{recovered_number}" / "words.txt").read_bytes())
-    recovered_words.chmod(0o600)
-    recovered_pass = recovered / "pass.txt"
-    recovered_pass.write_text(f"new regtest passphrase for member {recovered_number}\n")
-    recovered_pass.chmod(0o600)
-    recovered_owner = recovered / "member"
-    if run([setup, "restore", recovered_owner, recovered_pass, recovered_card, recovered_words], env) != vault:
-        raise RuntimeError("recovered signer derived another vault address")
-    members[recovered_number - 1] = (recovered_owner, recovered_pass)
-    roster = recovered_owner / "roster.json"
-    print(f"restored signing member {recovered_number} from the final card and words at {recovered}", flush=True)
+    pair = tuple(ord(letter) - ord("A") + 1 for letter in args.pair)
+    proposer_id = args.proposer if args.proposer is not None else (pair[0] if args.recover_signers else 1)
+    if args.recover_signers and (proposer_id not in pair or (args.finisher is not None and args.finisher not in pair)):
+        parser.error("recovery proposer and finisher must be restored signers")
+    if proposer_id not in range(1, member_count + 1) or (args.finisher is not None and args.finisher not in range(1, member_count + 1)):
+        parser.error("proposer or finisher is outside this vault")
+    restored, roster = restore_pair(root, setup, env, pair if args.recover_signers else pair[:1], vault)
+    if args.recover_signers:
+        members = [None] * member_count
+    for number, signer in zip(pair, restored):
+        members[number - 1] = signer
 
     destination = args.recipient or recipient_address
-    if args.proposer not in range(1, member_count + 1):
-        parser.error("proposer is outside this vault")
-    owner, password = members[args.proposer - 1]
+    owner, password = members[proposer_id - 1]
     run([pay, "prepare", owner, password, roster, work, destination, str(args.amount_zat), args.memo, args.pair], env)
     manifest = json.loads((work / "payment.json").read_text())
     signer_ids = manifest.get("signers", manifest.get("pair"))
     signers = [members[number - 1] for number in signer_ids]
-    finisher_id = args.finisher or next(number for number in range(1, member_count + 1)
-                                       if number not in signer_ids)
-    if finisher_id not in range(1, member_count + 1):
-        parser.error("finisher is outside this vault")
+    finisher_id = args.finisher if args.finisher is not None else (signer_ids[0] if args.recover_signers else next(
+        number for number in range(1, member_count + 1) if number not in signer_ids))
     finisher = members[finisher_id - 1]
     if args.manual:
         def command(argv):
@@ -185,7 +191,7 @@ def main():
             f"Source vault: {vault}",
             f"Independent recipient: {recipient_address}",
             f"Payment recipient: {destination}",
-            f"Proposer: member {args.proposer}",
+            f"Proposer: member {proposer_id}",
             f"Payment ID: {manifest['payment']}",
             f"Run the next {args.threshold} commands at the same time in separate terminals. Read each review, then type its exact APPROVE prompt:",
             *(command([pay, "sign", *signer, roster, work]) for signer in signers),

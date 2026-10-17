@@ -501,6 +501,7 @@ fn three_processes_create_one_vault_without_sharing_secrets() {
             "backup verify: {}",
             String::from_utf8_lossy(&checked.stderr)
         );
+        // The member can reopen the words until the final card has been made.
         assert!(member.join("secrets/backup-words.sealed").exists());
         if id < 3 {
             let pending = Command::new(exe)
