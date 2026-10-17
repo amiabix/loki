@@ -143,10 +143,14 @@ class PaymentWorker:
         if not self.on_worker():
             return False
         with self.process_lock:
-            if self.stop_event.is_set():
+            stopped = self.stop_event.is_set()
+            if not stopped:
+                self.processes.add(process)
+        if stopped:
+            if process.poll() is None:
                 process.kill()
-                raise ValueError("Signer is locked")
-            self.processes.add(process)
+            process.communicate()
+            raise ValueError("Signer is locked")
         return True
 
     def untrack(self, process):

@@ -165,6 +165,27 @@ fn certified_threshold_two_roster_loads_for_relay() {
     assert_eq!(load(&member, &member.join("pass"), &base.join("roster.json"))
         .unwrap().identity.public().id, 2);
 }
+
+#[test]
+fn relay_loads_testnet_roster_and_binds_birth_height() {
+    let f = Fixture::with_policy(true);
+    let mut roster: Value = serde_json::from_slice(&fs::read(&f.roster).unwrap()).unwrap();
+    roster["network"] = Value::from("testnet");
+    roster["birth_height"] = Value::from(4_500_000);
+    let bytes = serde_json::to_vec(&roster).unwrap();
+    fs::write(&f.roster, &bytes).unwrap();
+    let fingerprint = loki_poc::member_state::Roster::from_bytes(&bytes).unwrap().fingerprint();
+    let mut state = f.state();
+    state["network"] = Value::from("testnet");
+    state["birth_height"] = Value::from(4_500_000);
+    state["roster_fingerprint"] = Value::from(hex::encode(fingerprint));
+    f.seal(&state);
+    assert!(f.loaded().is_ok());
+
+    state["birth_height"] = Value::from(4_500_001);
+    f.seal(&state);
+    refuses(&f, "member_roster");
+}
 struct Fixture {
     root: PathBuf,
     pass: PathBuf,
@@ -521,6 +542,7 @@ fn config_members() -> Vec<loki_poc::relay_member::LoadedMember> {
         .map(|identity| loki_poc::relay_member::LoadedMember {
             identity,
             roster: roster.clone(),
+            threshold: 2,
         })
         .collect()
 }
@@ -584,6 +606,7 @@ fn sealed_revision_codec_authenticated_association() {
     let wrong = loki_poc::relay_member::LoadedMember {
         identity,
         roster: wrong_roster,
+        threshold: 2,
     };
     assert!(restored.authenticated(&wrong).is_err());
 }

@@ -96,7 +96,8 @@ class App:
             if check(state):
                 return state
             time.sleep(0.5)
-        raise AssertionError(f"member {self.port} never reached {what}: {self.status(vault)}")
+        state = self.status(vault)
+        raise AssertionError(f"member {self.port} never reached {what}: phase={state.get('phase')} error={state.get('error')}")
 
     def stop(self):
         self.process.terminate()
@@ -219,12 +220,13 @@ def make_certificates(folder):
     ca, ca_key = folder / "ca.pem", folder / "ca.key"
     leaf, leaf_key, csr = folder / "leaf.pem", folder / "leaf.key", folder / "leaf.csr"
     extensions = folder / "leaf.ext"
-    extensions.write_text("subjectAltName=DNS:localhost\n")
+    extensions.write_text("subjectAltName=DNS:localhost\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid:always\n")
     run = lambda *argv: subprocess.run(argv, check=True, capture_output=True)
     run("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(ca_key),
         "-out", str(ca), "-days", "1", "-subj", "/CN=Loki setup test CA",
         "-addext", "basicConstraints=critical,CA:TRUE",
-        "-addext", "keyUsage=critical,keyCertSign,cRLSign")
+        "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+        "-addext", "subjectKeyIdentifier=hash")
     run("openssl", "req", "-newkey", "rsa:2048", "-nodes", "-keyout", str(leaf_key),
         "-out", str(csr), "-subj", "/CN=localhost")
     run("openssl", "x509", "-req", "-in", str(csr), "-CA", str(ca), "-CAkey", str(ca_key),
@@ -329,17 +331,20 @@ class RemoteJoinTest(unittest.TestCase):
         return app
 
     def finish_setup(self, creator, second, third, vault, invites):
+        self.finish_setup_members([creator, second, third], vault, invites)
+
+    def finish_setup_members(self, apps, vault, invites):
         """Complete the same ceremony over loopback HTTP or verified HTTPS."""
+        creator = apps[0]
         # the creator's rows, from real state: both other members published an
         # identity, and the page can say "Joined" because of that and nothing else
         state = creator.until(vault, lambda s: all(row["joined"] for row in s.get("invites", [{}])),
-                              what="both members joined")
-        self.assertEqual([row["slot"] for row in state["invites"]], [2, 3])
+                              what="all members joined")
+        self.assertEqual([row["slot"] for row in state["invites"]], list(range(2, len(apps) + 1)))
         self.assertEqual([row["origin"] for row in state["invites"]],
                          [decoded(code)["url"] for code in invites])
         self.assertGreater(state["invites_expire_at"], time.time())
 
-        apps = [creator, second, third]
         fingerprints = [app.until(vault, lambda s: s["fingerprint"], what="a roster fingerprint")
                         ["fingerprint"] for app in apps]
         self.assertEqual(len(set(fingerprints)), 1)
@@ -348,7 +353,7 @@ class RemoteJoinTest(unittest.TestCase):
             self.assertIsNone(app.status(vault)["transport_error"])
 
         # no directory is shared, and each app holds its own copy of the courier
-        self.assertEqual(len({app.exchange.resolve() for app in apps}), 3)
+        self.assertEqual(len({app.exchange.resolve() for app in apps}), len(apps))
         for app in apps:
             self.assertTrue((app.exchange / vault / "draft.json").is_file())
 
@@ -356,7 +361,8 @@ class RemoteJoinTest(unittest.TestCase):
             self.assertEqual(app.api("agree", {"vault": vault, "fingerprint": fingerprints[0]}),
                              {"started": True})
         for app in apps:
-            app.until(vault, lambda s: s["phase"] != "creating_keys", what="finished key creation")
+            app.until(vault, lambda s: s["phase"] != "creating_keys",
+                      limit=240 if len(apps) == 4 else 120, what="finished key creation")
             self.assertEqual(app.status(vault)["phase"], "back_up")
             with self.assertRaisesRegex(Refused, "Check your final backup card"):
                 app.api("address", {"vault": vault})
@@ -371,7 +377,7 @@ class RemoteJoinTest(unittest.TestCase):
             # every member's signed backup check has to arrive over the courier
             # before any of them can move to the final card
             deadline = time.time() + 120
-            while len(list((app.exchange / vault).glob(f"{vault}-backup-*.bin"))) < 3:
+            while len(list((app.exchange / vault).glob(f"{vault}-backup-*.bin"))) < len(apps):
                 self.assertLess(time.time(), deadline, "backup checks never arrived")
                 time.sleep(0.5)
             app.api("activate", {"vault": vault})
@@ -390,7 +396,7 @@ class RemoteJoinTest(unittest.TestCase):
             self.assertEqual(app.status(vault)["phase"], "active")
             reports = app.until(vault, lambda s: all(r["reported"] for r in s["backups"]),
                                 what="all signed final backup reports")["backups"]
-            self.assertEqual([r["slot"] for r in reports], [1, 2, 3])
+            self.assertEqual([r["slot"] for r in reports], list(range(1, len(apps) + 1)))
 
     def test_three_apps_certify_a_vault_with_no_shared_directory(self):
         """The whole setup, end to end, with the courier as the only channel."""

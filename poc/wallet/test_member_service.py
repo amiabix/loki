@@ -75,16 +75,16 @@ class MemberServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "setup_worker_locked"):
             self.service.call("setup-step", [self.root / "refuse", "@session"])
 
-    def test_timeout_kills_the_child_and_a_death_fails_the_waiting_call(self):
+    def test_timeout_leaves_other_vault_calls_running_and_a_death_fails_waiters(self):
         self.service.start("right pass")
         first = self.service.process
         begun = time.monotonic()
         with self.assertRaisesRegex(member_service.ServiceError, "timed out"):
             self.service.call("setup-step", [self.root / "hang", "@session"], timeout=0.5)
         self.assertLess(time.monotonic() - begun, 3)
-        self.assertFalse(self.service.running())
-        self.assertIsNotNone(first.poll())
-        self.service.start("right pass")
+        self.assertTrue(self.service.running())
+        self.assertIsNone(first.poll())
+        self.assertEqual(self.service.call("setup-step", [self.root / "other", "@session"])["pid"], first.pid)
         with self.assertRaisesRegex(member_service.ServiceError, "stopped"):
             self.service.call("setup-step", [self.root / "die", "@session"], timeout=10)
 

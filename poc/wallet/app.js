@@ -8,14 +8,17 @@ catch { selectedVault = null; }
 let linkChallenge = null;
 let memberSlot = null;
 let memberCount = null;
+let memberThreshold = null;
 let renderedPaymentVault = null;
 let paymentsLive = false;
 let refreshingPayments = false;
 let relaySetupPhase = null;
+let currentNetwork = 'regtest';
 const paymentReviews = new Map();
 /* last failed review read per attempt: the 2 s list refresh retries at most every 10 s */
 const reviewTried = new Map();
 const REVIEW_RETRY_MS = 10000;
+const paymentCards = new Map();   /* attempt → {card, sig}; rebuilt only when sig changes */
 
 function selectVault(vault) {
   selectedVault = vault;
@@ -30,6 +33,7 @@ function selectVault(vault) {
   relaySetupPhase = null;
   paymentReviews.clear();
   reviewTried.clear();
+  paymentCards.clear();
   $('address').textContent = 'Open this vault to view the address.';
   $('balance').textContent = "Scan this device's chain view to see the balance.";
   $('words').textContent = '';
@@ -146,14 +150,13 @@ function vaultList(vaults) {
    A member is told where the payment is, never which protocol call comes next.
    Every mechanical step — delivery, commit, package, resend, the on-chain
    check — is performed by the app's payment worker while the profile is
-   unlocked, whether or not this page is open. Exactly two
-   controls remain, because exactly two things are human decisions: approving
+   unlocked, whether or not this page is open. The human decisions are approving
    an exact transaction that is on screen, and sending it. */
 
 const STAGES = [
   ['Propose', 'the proposal reaches every member'],
   ['Review', 'each signer checks the exact transaction'],
-  ['Approve', 'two members approve'],
+  ['Approve', 'the selected members approve'],
   ['Ready to send', 'the signed transaction goes to the network'],
   ['Confirmed', 'mined on this device’s chain view'],
 ];
@@ -226,7 +229,7 @@ function paymentButton(label, run) {
   return button;
 }
 
-function stageList(current, state, detail) {
+function stageList(current, state, detail, threshold) {
   const list = document.createElement('div');
   list.className = 'roster';
   STAGES.forEach(([name, says], index) => {
@@ -237,7 +240,7 @@ function stageList(current, state, detail) {
     const says_now = document.createElement('span');
     if (index < current) { row.classList.add('agreed'); says_now.textContent = 'done'; }
     else if (index === current) { row.classList.add(state); says_now.textContent = detail; }
-    else says_now.textContent = says;
+    else says_now.textContent = index === 2 ? `${threshold} selected members approve` : says;
     row.append(stage, says_now);
     list.append(row);
   });
@@ -251,6 +254,56 @@ function note(text, className = 'muted') {
   return line;
 }
 
+function buildPaymentCard(payment, vault, {current, rowState, detail, isSigner, review, readiness}) {
+  const card = document.createElement('section');
+  card.className = 'card';
+  const title = document.createElement('h3');
+  title.textContent = `Payment ${payment.payment?.slice(0, 12) || payment.attempt.slice(0, 12)}…`;
+  const signers = payment.signers || payment.pair;
+  card.append(title, stageList(current, rowState, detail, signers.length));
+  card.append(note(`Signers: members ${signers.join(', ')}${isSigner ? ' — you are one of them' : ''}`
+                   + (payment.txid ? ` · transaction ${payment.txid.slice(0, 16)}…` : '')));
+  if (payment.phase === 'draft') {
+    card.append(paymentButton('Send this proposal', async () => {
+      await api('payment-publish', {vault, attempt: payment.attempt});
+      message('Proposal sent to the other members.');
+    }));
+  }
+
+  if (review) {
+    const summary = document.createElement('pre');
+    summary.textContent = `Recipient: ${review.recipient}\n`
+      + `Amount: ${zecFromZat(review.amount_zat)} ZEC (${review.amount_zat} zat)\n`
+      + `Memo: ${review.memo_utf8 == null ? 'Cannot display memo bytes' : JSON.stringify(review.memo_utf8)}\n`
+      + `Network fee: ${review.fee_zat} zat\n`
+      + `Change back to the vault: ${review.change_zat} zat\n`
+      + `Expires at block: ${review.expiry_height}`;
+    card.append(summary);
+    if (review.memo_utf8 == null) card.append(note('This memo does not render as text, so this payment cannot be approved here.', 'warning'));
+    else card.append(paymentButton('Approve this exact transaction', async () => {
+      await api('payment-approve', {vault, attempt: payment.attempt, review_token: review.review_token});
+      paymentReviews.delete(payment.attempt);
+      message('Approved. Your approval is on its way to the other members.');
+    }));
+  }
+
+  if (payment.ready_to_send) {
+    const scanned = readiness.scan_height == null
+      ? 'Payment chain scan has not run on this device yet.'
+      : `Payment chain scan reached block ${readiness.scan_height}.`;
+    if (readiness.relay_ready === true) {
+      card.append(note(`${readiness.relay_detail || 'The relay is reachable.'} ${scanned}`));
+      card.append(paymentButton('Send this payment', async () => {
+        await api('payment-finish', {vault, attempt: payment.attempt});
+        message('Sent. Waiting for a confirmation on this device’s chain view.');
+      }));
+    } else {
+      card.append(note(`Cannot send yet. ${readiness.relay_detail || 'This device cannot reach the relay.'} ${scanned}`, 'warning'));
+    }
+  }
+  return card;
+}
+
 async function refreshPayments() {
   if (!selectedVault) return;
   const vault = selectedVault;
@@ -261,10 +314,18 @@ async function refreshPayments() {
   $('payment-updates').textContent = updates.error ? `Payment updates failed: ${updates.error} Retrying automatically; Check for updates to retry now.` : '';
   $('payment-updates').hidden = !updates.error;
   const list = $('payment-list');
-  list.replaceChildren();
-  if (!state.payments.length) { list.textContent = 'No payments in this member’s app.'; return; }
-  for (const payment of state.payments) {
-    const isSigner = payment.pair.includes(memberSlot);
+  if (!state.payments.length) {
+    list.replaceChildren();
+    paymentCards.clear();
+    list.textContent = 'No payments in this member’s app.';
+    return;
+  }
+  if (!paymentCards.size) list.replaceChildren();   /* drop the empty-state text node */
+  const seen = new Set();
+  for (let index = 0; index < state.payments.length; index++) {
+    const payment = state.payments[index];
+    const signers = payment.signers || payment.pair;
+    const isSigner = signers.includes(memberSlot);
     /* the exact transaction is fetched as soon as it can be read: checking it
        is not a decision, so it is not a button */
     if (isSigner && ['commitments', 'package'].includes(payment.phase)
@@ -282,58 +343,26 @@ async function refreshPayments() {
     let [current, rowState, detail] =
       PHASES[payment.phase] || [0, 'waiting', payment.phase.replaceAll('_', ' ')];
     if (review && current === 1) [current, rowState, detail] = [2, 'waiting', 'your approval is the next step'];
-    if (payment.ready_to_send) [current, rowState, detail] = [3, 'agreed', 'two approvals verified; ready to send'];
+    if (payment.ready_to_send) [current, rowState, detail] = [3, 'agreed', `${signers.length} approvals verified; ready to send`];
+    const readiness = state.readiness || {};
 
-    const card = document.createElement('section');
-    card.className = 'card';
-    const title = document.createElement('h3');
-    title.textContent = `Payment ${payment.payment?.slice(0, 12) || payment.attempt.slice(0, 12)}…`;
-    card.append(title, stageList(current, rowState, detail));
-    card.append(note(`Signers: members ${payment.pair.join(' and ')}${isSigner ? ' — you are one of them' : ''}`
-                     + (payment.txid ? ` · transaction ${payment.txid.slice(0, 16)}…` : '')));
+    const sig = JSON.stringify([current, rowState, detail, signers, isSigner,
+      payment.phase, !!payment.ready_to_send, payment.payment, payment.attempt, payment.txid,
+      review ? [review.recipient, review.amount_zat, review.memo_utf8, review.fee_zat,
+                review.change_zat, review.expiry_height, review.review_token] : null,
+      payment.ready_to_send ? [readiness.relay_ready, readiness.relay_detail, readiness.scan_height] : null]);
 
-    if (payment.phase === 'draft') {
-      card.append(paymentButton('Send this proposal', async () => {
-        await api('payment-publish', {vault, attempt: payment.attempt});
-        message('Proposal sent to the other members.');
-      }));
+    let entry = paymentCards.get(payment.attempt);
+    if (!entry || entry.sig !== sig) {
+      entry?.card.remove();
+      entry = {card: buildPaymentCard(payment, vault, {current, rowState, detail, isSigner, review, readiness}), sig};
+      paymentCards.set(payment.attempt, entry);
     }
-
-    if (review) {
-      const summary = document.createElement('pre');
-      summary.textContent = `Recipient: ${review.recipient}\n`
-        + `Amount: ${zecFromZat(review.amount_zat)} ZEC (${review.amount_zat} zat)\n`
-        + `Memo: ${review.memo_utf8 == null ? 'Cannot display memo bytes' : JSON.stringify(review.memo_utf8)}\n`
-        + `Network fee: ${review.fee_zat} zat\n`
-        + `Change back to the vault: ${review.change_zat} zat\n`
-        + `Expires at block: ${review.expiry_height}`;
-      card.append(summary);
-      /* a memo that does not render is a transaction this member cannot read,
-         and an unreadable transaction is never approvable */
-      if (review.memo_utf8 == null) card.append(note('This memo does not render as text, so this payment cannot be approved here.', 'warning'));
-      else card.append(paymentButton('Approve this exact transaction', async () => {
-        await api('payment-approve', {vault, attempt: payment.attempt, review_token: review.review_token});
-        paymentReviews.delete(payment.attempt);
-        message('Approved. Your approval is on its way to the other member.');
-      }));
-    }
-
-    if (payment.ready_to_send) {
-      const readiness = state.readiness || {};
-      const scanned = readiness.scan_height == null
-        ? 'This device has not scanned the chain yet.'
-        : `This device has scanned the chain to block ${readiness.scan_height}.`;
-      if (readiness.relay_ready === true) {
-        card.append(note(`${readiness.relay_detail || 'The relay is reachable.'} ${scanned}`));
-        card.append(paymentButton('Send this payment', async () => {
-          await api('payment-finish', {vault, attempt: payment.attempt});
-          message('Sent. Waiting for a confirmation on this device’s chain view.');
-        }));
-      } else {
-        card.append(note(`Cannot send yet. ${readiness.relay_detail || 'This device cannot reach the relay.'} ${scanned}`, 'warning'));
-      }
-    }
-    list.append(card);
+    if (list.children[index] !== entry.card) list.insertBefore(entry.card, list.children[index] || null);
+    seen.add(payment.attempt);
+  }
+  for (const [attempt, entry] of [...paymentCards]) {
+    if (!seen.has(attempt)) { entry.card.remove(); paymentCards.delete(attempt); }
   }
 }
 
@@ -387,7 +416,7 @@ async function refreshSignerRequests(unlocked) {
     const relaySetup = action.kind === 'relay-setup';
     description.textContent = relaySetup
       ? `${action.origin} requests local test relay setup for “${action.name}”. This configures only your own membership; the other members do the same in their apps.`
-      : `${action.origin} requests a 2-of-${action.members} vault named “${action.name}” on regtest.`;
+      : `${action.origin} requests a ${action.threshold ?? 2}-of-${action.members} vault named “${action.name}” on ${currentNetwork}.`;
     const approve = document.createElement('button');
     approve.type = 'button';
     approve.textContent = relaySetup ? 'Set up local relays' : 'Create this vault';
@@ -638,6 +667,12 @@ async function refresh() {
       state = home;
     }
     if ((state.phase === 'new_profile' || state.phase === 'locked') && selectedVault) selectVault(null);
+    currentNetwork = state.network || 'regtest';
+    const testnet = currentNetwork === 'testnet';
+    $('network-chip').textContent = testnet ? 'ZCASH TESTNET' : 'REGTEST';
+    $('build-note').textContent = testnet
+      ? 'Testnet research build. Use disposable test funds only. Each member needs their own app and a synced Testnet node; payments need configured relays.'
+      : 'Regtest test build. No real funds. Payment delivery and signing require configured relays.';
     paymentsLive = false;
     for (const id of ['new-profile', 'locked', 'home', 'invites', 'connect-account', 'setup', 'backup', 'waiting', 'final-backup', 'backup-status', 'active', 'relay-setup']) $(id).hidden = true;
     const inVault = !!selectedVault;
@@ -647,11 +682,20 @@ async function refresh() {
     if (inVault) $('vault-chip').textContent = `MEMBER ${state.slot}`;
     $('title').textContent = state.name || state.profile?.name || 'Your signer';
     if (state.phase === 'home') {
+      $('home-relays').hidden = !state.vaults?.length;
       $('setup-relays').hidden = state.relay_network?.transport === 'hosted';
       $('setup-relays').textContent = state.relay_network?.enabled ? 'Retry connections' : 'Set up relays';
       $('relay-network-detail').textContent = state.relay_network?.detail || '';
     }
-    $('subtitle').textContent = inVault ? `${state.threshold} of ${state.total_members} · regtest` : 'One local profile, separate keys for each vault.';
+    $('subtitle').textContent = inVault
+      ? `${state.threshold} of ${state.total_members} · ${testnet ? 'Testnet' : 'Regtest'}`
+      : 'One local profile, separate keys for each vault.';
+    $('vault-network-detail').textContent = testnet
+      ? `Zcash Testnet · vault starts at block ${state.birth_height}. This chain and block are part of the roster you compare.`
+      : 'Local regtest vault.';
+    $('receive-note').textContent = testnet
+      ? `Zcash Testnet address. Fund it from a wallet that can send to the Ironwood pool. Scan begins at block ${state.birth_height}.`
+      : 'Local regtest address. Fund it from the local test faucet or another regtest wallet.';
     const [kicker, headline] = steps[state.phase] || ['', ''];
     $('kicker').textContent = kicker;
     $('kicker').hidden = !kicker;
@@ -675,7 +719,7 @@ async function refresh() {
       $('home').hidden = false;
       vaultList(state.vaults);
     } else {
-      $('connect-account').hidden = state.account_linked || state.transport === 'hosted';
+      $('connect-account').hidden = testnet || state.account_linked || state.transport === 'hosted';
       if (state.invites) {
         inviteRows(state);
         $('invites').hidden = state.phase !== 'waiting_for_members';
@@ -706,8 +750,26 @@ async function refresh() {
       else if (state.phase === 'active') {
         $('active').hidden = false;
         memberSlot = state.slot;
-        const paymentAvailable = [3, 4].includes(state.total_members) && (state.transport !== 'hosted' || state.handoff === 'ready');
+        const paymentAvailable = [[2, 3], [2, 4], [3, 4]].some(([t, n]) => t === state.threshold && n === state.total_members)
+          && (state.transport !== 'hosted' || state.handoff === 'ready');
         memberCount = state.total_members;
+        memberThreshold = state.threshold;
+        const signerChoices = $('payment-signers');
+        if (signerChoices.dataset.policy !== `${memberThreshold}-of-${memberCount}-${memberSlot}`) {
+          signerChoices.replaceChildren();
+          const letters = 'ABCD'.slice(0, memberCount);
+          const pick = (start, chosen) => {
+            if (chosen.length === memberThreshold) {
+              const option = new Option(chosen.map(c => `Member ${letters.indexOf(c) + 1}`).join(', '), chosen.join(''));
+              signerChoices.add(option);
+              return;
+            }
+            for (let i = start; i < letters.length; i++) pick(i + 1, [...chosen, letters[i]]);
+          };
+          pick(0, []);
+          signerChoices.value = [...signerChoices.options].find(option => option.value.includes(letters[memberSlot - 1]))?.value || '';
+          signerChoices.dataset.policy = `${memberThreshold}-of-${memberCount}-${memberSlot}`;
+        }
         $('relay-setup').hidden = !paymentAvailable || state.transport === 'hosted';
         $('payment-unavailable').hidden = paymentAvailable;
         $('show-address').hidden = !paymentAvailable;
@@ -738,9 +800,10 @@ action('profile-create', async (form) => { await api('profile-create', fields(fo
 action('unlock', async (form) => { await api('unlock', fields(form)); message('Profile unlocked.'); });
 action('create', async (form) => {
   const inputs = fields(form);
-  const value = await api('create', {...inputs, members: Number(inputs.members)});
+  const [threshold, members] = inputs.policy.split('-of-').map(Number);
+  const value = await api('create', {name: inputs.name, threshold, members});
   selectVault(value.vault);
-  message(`Vault draft created. Invite the other ${inputs.members - 1} members.`);
+  message(`Vault draft created. Invite the other ${members - 1} members.`);
 });
 action('join', async (form) => {
   const value = await api('join', fields(form));
@@ -874,23 +937,30 @@ action('show-address', async () => {
 });
 $('refresh-balance').addEventListener('click', async () => {
   const button = $('refresh-balance');
+  const vault = selectedVault;
   button.disabled = true;
   try {
-    const value = await api('balance', {vault: selectedVault});
-    $('balance').textContent = `${zecFromZat(value.balance_zat)} ZEC · ${value.unspent_notes} unspent notes · block ${value.height}`;
-  } catch (error) { message(error.message, true); }
+    const value = await api('balance', {vault});
+    if (selectedVault !== vault) return;
+    $('balance').textContent = value.network === 'testnet'
+      ? `${zecFromZat(value.balance_zat)} ZEC · scanned block ${value.height} of ${value.chain_tip}`
+        + (value.scan_ready ? ' · scan caught up' : ' · scan still catching up; balance may be incomplete')
+      : `${zecFromZat(value.balance_zat)} ZEC · ${value.unspent_notes} unspent notes · block ${value.height}`;
+  } catch (error) {
+    if (selectedVault === vault) $('balance').textContent = `Scan failed: ${error.message}. Balance unavailable.`;
+  }
   finally { button.disabled = false; }
 });
 action('payment-draft', async (form) => {
   const vault = selectedVault;
   const value = fields(form);
   const amount_zat = zatFromZec(value.amount_zec);
-  const draft = await api('payment-draft', {vault, recipient: value.recipient, memo: value.memo, amount_zat});
+  const draft = await api('payment-draft', {vault, recipient: value.recipient, memo: value.memo, amount_zat, pair: value.pair});
   if (selectedVault !== vault) return;
   $('draft-result').textContent = `DRAFT · no member has approved or sent this payment\n`
     + `Payment ID: ${draft.payment}\n`
     + `Amount: ${zecFromZat(amount_zat)} ZEC (${amount_zat} zat)\n`
-    + `Signers: members ${draft.pair.join(' and ')}`;
+    + `Signers: members ${draft.signers.join(', ')}`;
   $('draft-result').hidden = false;
   $('amount-zat').textContent = 'Up to 8 decimal places.';
   await api('payment-publish', {vault, attempt: draft.attempt});

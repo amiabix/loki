@@ -1,4 +1,4 @@
-//! Two-member signing attempt and its encrypted courier mailbox.
+//! One exact signer set per attempt and its encrypted courier mailbox.
 //! A caller must review the full exact PCZT and its locally derived sighash before `sign`.
 
 use crate::{
@@ -32,14 +32,18 @@ pub struct SessionContext {
     pub vault: [u8; 32],
     pub payment: [u8; 32],
     pub attempt: AttemptId,
-    /// Exactly one pair, sorted by roster member ID.
-    pub pair: [u16; 2],
+    /// The exact two or three signers, sorted by roster member ID.
+    pub signers: Vec<u16>,
 }
 
 impl SessionContext {
     pub fn validate(&self) -> Result<(), String> {
-        if self.pair[0] < 1 || self.pair[1] > 4 || self.pair[0] >= self.pair[1] {
-            return Err("signing attempt needs one distinct supported pair".into());
+        if !matches!(self.signers.len(), 2 | 3)
+            || self.signers[0] < 1
+            || self.signers.last() > Some(&4)
+            || self.signers.windows(2).any(|ids| ids[0] >= ids[1])
+        {
+            return Err("signing attempt needs two or three sorted distinct members".into());
         }
         if self.attempt.0 == [0; 32] {
             return Err("zero signing attempt ID".into());
@@ -95,7 +99,7 @@ pub struct OpenedMessage {
     pub(crate) body: Vec<u8>,
     /// Hash of the exact authenticated envelope. A retry resends those same bytes.
     pub(crate) wire_hash: [u8; 32],
-    /// Hash of vault/payment/attempt/pair/sender/recipient/type and exact plaintext.
+    /// Hash of vault/payment/attempt/signers/sender/recipient/type and exact plaintext.
     pub(crate) transcript_hash: [u8; 32],
 }
 
@@ -195,7 +199,7 @@ impl Mailbox {
             }
             for peer in roster
                 .values()
-                .filter(|p| p.id != own.public().id && context.pair.contains(&p.id))
+                .filter(|p| p.id != own.public().id && context.signers.contains(&p.id))
             {
                 if let Ok(opened) = own.open_session(peer, context, &wire) {
                     if seen.insert(opened.wire_hash) {
@@ -261,7 +265,10 @@ pub fn review_batch(
     let own: u16 = (1..=4)
         .find(|n| frost::Identifier::try_from(*n).ok() == Some(*key.identifier()))
         .ok_or("unknown signer identifier")?;
-    if !context.pair.contains(&own) {
+    if usize::from(*key.min_signers()) != context.signers.len()
+        || public.min_signers().map(usize::from) != Some(context.signers.len())
+        || !context.signers.contains(&own)
+    {
         return Err("signer outside chosen pair".into());
     }
     review_public_candidate(
@@ -293,6 +300,9 @@ fn review_public_candidate(
         verifier::{OrchardError, Verifier},
     };
     context.validate()?;
+    if public.min_signers().map(usize::from) != Some(context.signers.len()) {
+        return Err("signer count differs from certified FROST threshold".into());
+    }
     if context.vault != *known_vault || context.payment != intent.proposal_id() {
         return Err("vault or payment differs from member-approved intent".into());
     }
@@ -324,7 +334,7 @@ fn review_public_candidate(
         return Err("public package and vault viewing key differ".into());
     }
     let pair: BTreeSet<_> = context
-        .pair
+        .signers
         .iter()
         .map(|n| frost::Identifier::try_from(*n).unwrap())
         .collect();
@@ -477,7 +487,7 @@ impl LiveAttempt {
         let id: u16 = (1..=4)
             .find(|n| frost::Identifier::try_from(*n).ok() == Some(*key.identifier()))
             .ok_or("key package has unknown member ID")?;
-        if !context.pair.contains(&id) {
+        if !context.signers.contains(&id) {
             return Err("member is not in selected pair".into());
         }
         let mut nonces = Vec::with_capacity(spends);
@@ -520,7 +530,7 @@ impl LiveAttempt {
         }
         let pair: BTreeSet<_> = self
             .context
-            .pair
+            .signers
             .iter()
             .map(|n| frost::Identifier::try_from(*n).unwrap())
             .collect();
@@ -566,7 +576,7 @@ pub struct ReviewSummary {
     pub vault: [u8; 32],
     pub payment: [u8; 32],
     pub attempt: AttemptId,
-    pub pair: [u16; 2],
+    pub signers: Vec<u16>,
     pub recipient: [u8; 43],
     pub amount_zat: u64,
     pub memo: Vec<u8>,
@@ -593,11 +603,11 @@ impl ReviewedPackage {
     /// Binds a displayed review to this exact member package; it is not member consent.
     pub fn review_token(&self) -> [u8; 32] {
         let mut hash = blake3::Hasher::new();
-        hash.update(b"Loki_review_token_v1\0");
+        hash.update(if self.summary.signers.len() == 2 { b"Loki_review_token_v1\0" } else { b"Loki_review_token_v2\0" });
         hash.update(&self.summary.vault);
         hash.update(&self.summary.payment);
         hash.update(&self.summary.attempt.0);
-        for member in self.summary.pair {
+        for &member in &self.summary.signers {
             hash.update(&member.to_be_bytes());
         }
         hash.update(&self.peer.to_be_bytes());
@@ -626,16 +636,16 @@ impl PackagePayload {
             return Err("invalid signing package batch".into());
         }
         let mut out = Vec::new();
-        out.push(1);
+        out.push(if context.signers.len() == 2 { 1 } else { 2 });
         out.extend_from_slice(&(self.candidate.len() as u32).to_be_bytes());
         out.extend_from_slice(&self.candidate);
         out.extend_from_slice(&(self.commitments.len() as u16).to_be_bytes());
         for (set, seed) in self.commitments.iter().zip(&self.seeds) {
-            if set.len() != 2 {
-                return Err("package must name exactly two commitments".into());
+            if set.len() != context.signers.len() {
+                return Err("package must name exactly the selected signers".into());
             }
             out.extend_from_slice(seed);
-            for member in context.pair {
+            for &member in &context.signers {
                 let id = frost::Identifier::try_from(member).map_err(|e| e.to_string())?;
                 let raw = set
                     .get(&id)
@@ -657,7 +667,8 @@ impl PackagePayload {
 
     pub fn decode(context: &SessionContext, body: &[u8]) -> Result<Self, String> {
         context.validate()?;
-        if body.len() < 7 || body.len() > MessageKind::Package.max_body() || body[0] != 1 {
+        if body.len() < 7 || body.len() > MessageKind::Package.max_body()
+            || body[0] != if context.signers.len() == 2 { 1 } else { 2 } {
             return Err("invalid signing package version or length".into());
         }
         let mut at = 1;
@@ -682,7 +693,7 @@ impl PackagePayload {
             seeds.push(body[at..at + 32].try_into().unwrap());
             at += 32;
             let mut set = BTreeMap::new();
-            for member in context.pair {
+            for &member in &context.signers {
                 if at + 2 > body.len() {
                     return Err("truncated commitment length".into());
                 }
@@ -720,8 +731,8 @@ pub fn commitments_from_message(
 ) -> Result<Vec<frost::round1::SigningCommitments>, String> {
     if message.context != *context
         || message.kind != MessageKind::Commitment
-        || !context.pair.contains(&message.sender)
-        || !context.pair.contains(&message.recipient)
+        || !context.signers.contains(&message.sender)
+        || !context.signers.contains(&message.recipient)
         || message.sender == message.recipient
         || message.body.len() < 3
         || message.body[0] != 1
@@ -807,6 +818,11 @@ impl SigningSession {
         if frost::Identifier::try_from(id).map_err(|e| e.to_string())? != *key.identifier() {
             return Err("identity and FROST key belong to different members".into());
         }
+        if usize::from(*key.min_signers()) != context.signers.len()
+            || public.min_signers().map(usize::from) != Some(context.signers.len())
+        {
+            return Err("signer set differs from certified FROST threshold".into());
+        }
         let live = LiveAttempt::new(context.clone(), &key, spends)?;
         let store = AttemptStore::new(root, &context, id)?;
         Ok(Self {
@@ -870,6 +886,8 @@ impl SigningSession {
     ) -> Result<Self, String> {
         if context.vault != *known_vault
             || context.payment != approved_intent.proposal_id()
+            || usize::from(*key.min_signers()) != context.signers.len()
+            || public.min_signers().map(usize::from) != Some(context.signers.len())
             || frost::Identifier::try_from(own.public().id).map_err(|e| e.to_string())?
                 != *key.identifier()
         {
@@ -914,7 +932,7 @@ impl SigningSession {
         if !matches!(roster.len(), 3 | 4)
             || roster.keys().copied().collect::<Vec<_>>()
                 != (1..=roster.len() as u16).collect::<Vec<_>>()
-            || self.context.pair.iter().any(|id| !roster.contains_key(id))
+            || self.context.signers.iter().any(|id| !roster.contains_key(id))
             || roster.get(&own.id) != Some(&own)
         {
             return Err("package publisher differs from certified roster".into());
@@ -946,18 +964,9 @@ impl SigningSession {
                 ));
             }
         }
-        let peer_id = self
-            .context
-            .pair
-            .iter()
-            .copied()
-            .find(|id| *id != own.id)
-            .unwrap();
-        let peers = std::iter::once(roster.get(&peer_id).unwrap()).chain(
-            roster
-                .values()
-                .filter(|p| !self.context.pair.contains(&p.id)),
-        );
+        let peers = self.context.signers.iter().filter(|id| **id != own.id)
+            .map(|id| &roster[id])
+            .chain(roster.values().filter(|p| !self.context.signers.contains(&p.id)));
         let wires = peers
             .map(|peer| {
                 self.own
@@ -973,7 +982,7 @@ impl SigningSession {
         peer: &PublicIdentity,
         mailbox: &Mailbox,
     ) -> Result<[u8; 32], String> {
-        if !self.context.pair.contains(&peer.id) || peer.id == self.own.public().id {
+        if !self.context.signers.contains(&peer.id) || peer.id == self.own.public().id {
             return Err("commitment recipient is not selected peer".into());
         }
         let mut body = Vec::new();
@@ -1002,7 +1011,7 @@ impl SigningSession {
             || package_message.kind != MessageKind::Package
             || !(from_peer || own_outbound)
             || peer.id == self.own.public().id
-            || !self.context.pair.contains(&peer.id)
+            || !self.context.signers.contains(&peer.id)
         {
             return Err("package is not from selected peer for this attempt".into());
         }
@@ -1028,7 +1037,7 @@ impl SigningSession {
             vault: self.context.vault,
             payment: self.context.payment,
             attempt: self.context.attempt,
-            pair: self.context.pair,
+            signers: self.context.signers.clone(),
             recipient,
             amount_zat: self.approved_intent.amount_zat,
             memo: self.approved_intent.memo.clone(),
@@ -1063,10 +1072,10 @@ impl SigningSession {
         if reviewed.batch.context != self.context
             || reviewed.peer != peer.id
             || peer.id == self.own.public().id
-            || !self.context.pair.contains(&peer.id)
+            || !self.context.signers.contains(&peer.id)
             || !matches!(finishers.len(), 1 | 2)
             || finishers.iter().any(|finisher| {
-                !(1..=4).contains(&finisher.id) || self.context.pair.contains(&finisher.id)
+                !(1..=4).contains(&finisher.id) || finisher.id == self.own.public().id || finisher.id == peer.id
             })
             || finishers
                 .iter()
@@ -1154,7 +1163,7 @@ impl SigningSession {
                 != (1..=roster.len() as u16).collect::<Vec<_>>()
             || roster.get(&own.id) != Some(&own)
             || roster.get(&peer.id) != Some(peer)
-            || self.context.pair.iter().any(|id| !roster.contains_key(id))
+            || self.context.signers.iter().any(|id| !roster.contains_key(id))
             || roster.iter().any(|(id, identity)| {
                 *id != identity.id || identity.signing == [0; 32] || identity.encryption == [0; 32]
             })
@@ -1172,7 +1181,7 @@ impl SigningSession {
             return Err("approval audience differs from certified roster".into());
         }
         let finishers = roster.values()
-            .filter(|identity| !self.context.pair.contains(&identity.id))
+            .filter(|identity| identity.id != own.id && identity.id != peer.id)
             .cloned().collect::<Vec<_>>();
         self.publish_approved_secured_to_finishers(
             reviewed, peer, &finishers, mailbox, passphrase, witness,
@@ -1193,10 +1202,10 @@ impl SigningSession {
             || reviewed.batch.context != self.context
             || reviewed.peer != peer.id
             || peer.id == self.own.public().id
-            || !self.context.pair.contains(&peer.id)
+            || !self.context.signers.contains(&peer.id)
             || !matches!(finishers.len(), 1 | 2)
             || finishers.iter().any(|finisher| {
-                !(1..=4).contains(&finisher.id) || self.context.pair.contains(&finisher.id)
+                !(1..=4).contains(&finisher.id) || finisher.id == self.own.public().id || finisher.id == peer.id
             })
         {
             return Err("invalid persisted signing attempt or peer".into());
@@ -1349,7 +1358,7 @@ pub fn aggregate_and_apply(
     public: &frost::keys::PublicKeyPackage,
     fvk: &orchard::keys::FullViewingKey,
     package: &PackagePayload,
-    share_messages: &[OpenedMessage; 2],
+    share_messages: &[OpenedMessage],
 ) -> Result<(pczt::Pczt, [u8; 32], Vec<usize>), String> {
     use pczt::roles::signer::Signer;
     let reviewed = review_public_candidate(
@@ -1366,7 +1375,7 @@ pub fn aggregate_and_apply(
     for message in share_messages {
         if message.context != *context
             || message.kind != MessageKind::Share
-            || !context.pair.contains(&message.sender)
+            || !context.signers.contains(&message.sender)
         {
             return Err("share comes from another attempt or signer".into());
         }
@@ -1381,8 +1390,8 @@ pub fn aggregate_and_apply(
             return Err("duplicate share sender".into());
         }
     }
-    if by_member.keys().copied().collect::<Vec<_>>() != context.pair {
-        return Err("incomplete selected signer pair".into());
+    if by_member.keys().copied().collect::<Vec<_>>() != context.signers {
+        return Err("incomplete selected signer set".into());
     }
     let candidate =
         pczt::Pczt::parse(&package.candidate).map_err(|e| format!("candidate parse: {e:?}"))?;
@@ -1396,7 +1405,7 @@ pub fn aggregate_and_apply(
         .enumerate()
     {
         let mut shares = BTreeMap::new();
-        for member in context.pair {
+        for &member in &context.signers {
             let id = frost::Identifier::try_from(member).map_err(|e| e.to_string())?;
             shares.insert(id, by_member[&member][i].clone());
         }
@@ -1413,7 +1422,7 @@ pub fn aggregate_and_apply(
                     .iter()
                     .filter_map(|id| {
                         context
-                            .pair
+                            .signers
                             .iter()
                             .find(|n| frost::Identifier::try_from(**n).ok() == Some(*id))
                     })
@@ -1568,7 +1577,7 @@ impl AttemptStore {
         }
         let own_id = *key.identifier();
         if !context
-            .pair
+            .signers
             .iter()
             .any(|id| frost::Identifier::try_from(*id).ok() == Some(own_id))
         {
@@ -1593,7 +1602,7 @@ impl AttemptStore {
     }
     fn new(root: &Path, context: &SessionContext, own: u16) -> Result<Self, String> {
         context.validate()?;
-        if !context.pair.contains(&own) {
+        if !context.signers.contains(&own) {
             return Err("member is not in selected pair".into());
         }
         let parent = root.join(hex::encode(context.payment));
@@ -1606,11 +1615,13 @@ impl AttemptStore {
             .create_new(true)
             .open(state)
             .map_err(|e| format!("attempt already exists: {e}"))?;
+        if context.signers.len() == 3 {
+            file.write_all(&[2]).map_err(|e| e.to_string())?;
+        }
         file.write_all(&context.vault).map_err(|e| e.to_string())?;
-        file.write_all(&context.pair[0].to_be_bytes())
-            .map_err(|e| e.to_string())?;
-        file.write_all(&context.pair[1].to_be_bytes())
-            .map_err(|e| e.to_string())?;
+        for &id in &context.signers {
+            file.write_all(&id.to_be_bytes()).map_err(|e| e.to_string())?;
+        }
         file.write_all(&own.to_be_bytes())
             .map_err(|e| e.to_string())?;
         file.sync_all().map_err(|e| e.to_string())?;
@@ -1619,16 +1630,19 @@ impl AttemptStore {
 
     fn reopen(root: &Path, context: &SessionContext, own: u16) -> Result<Self, String> {
         context.validate()?;
-        if !context.pair.contains(&own) {
+        if !context.signers.contains(&own) {
             return Err("member is not in selected pair".into());
         }
         let dir = MemberDir::open(
             &root.join(hex::encode(context.payment)),
             &hex::encode(context.attempt.0),
         );
-        let mut expected = Vec::with_capacity(38);
+        let mut expected = Vec::with_capacity(35 + 2 * context.signers.len());
+        if context.signers.len() == 3 {
+            expected.push(2);
+        }
         expected.extend_from_slice(&context.vault);
-        for id in context.pair {
+        for &id in &context.signers {
             expected.extend_from_slice(&id.to_be_bytes());
         }
         expected.extend_from_slice(&own.to_be_bytes());

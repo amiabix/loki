@@ -887,7 +887,8 @@ def provision_members(owner, relays, members, roster, vault, fingerprint, member
     return context
 
 
-def _init_relay(owner, index, port, server, deadline, mailbox_bytes, total_bytes):
+def _init_relay(owner, index, port, server, deadline, mailbox_bytes, total_bytes,
+                mailbox_count=3):
     endpoint = f'http://127.0.0.1:{port}'
     relay_root = owner.root / 'relays' / str(index)
     projection = owner.root / 'public-manifests' / str(index)
@@ -901,7 +902,7 @@ def _init_relay(owner, index, port, server, deadline, mailbox_bytes, total_bytes
         text = _command_text(owner, [
             str(server), 'init', '--root', str(relay_root), '--provision-capability-file',
             str(staging), '--total-bytes', str(total_bytes), '--mailbox-bytes',
-            str(mailbox_bytes), '--mailbox-count', '3', '--listen', _listen(endpoint),
+            str(mailbox_bytes), '--mailbox-count', str(mailbox_count), '--listen', _listen(endpoint),
         ], owner.root, deadline)
         if text != '':
             raise OwnershipError('Relay init returned unexpected output')

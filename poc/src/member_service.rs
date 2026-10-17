@@ -62,6 +62,31 @@ pub struct Service {
     data: PathBuf,
 }
 
+fn wipe(value: &mut Value) {
+    match value {
+        Value::String(text) => text.zeroize(),
+        Value::Array(items) => items.iter_mut().for_each(wipe),
+        Value::Object(fields) => {
+            for (mut name, mut field) in std::mem::take(fields) {
+                name.zeroize();
+                wipe(&mut field);
+            }
+        }
+        _ => {}
+    }
+}
+
+struct SensitiveFrame(serde_json::Map<String, Value>);
+
+impl Drop for SensitiveFrame {
+    fn drop(&mut self) {
+        for (mut name, mut value) in std::mem::take(&mut self.0) {
+            name.zeroize();
+            wipe(&mut value);
+        }
+    }
+}
+
 fn take_string(frame: &mut serde_json::Map<String, Value>, name: &str) -> Option<String> {
     match frame.remove(name) {
         Some(Value::String(text)) => Some(text),
@@ -73,17 +98,18 @@ impl Service {
     /// Check an unlock frame against the profile and enable the session key cache.
     pub fn unlock(line: &str) -> Result<Self, String> {
         let mut frame = match serde_json::from_str(line) {
-            Ok(Value::Object(frame)) => frame,
+            Ok(Value::Object(frame)) => SensitiveFrame(frame),
             _ => return Err("service_frame".into()),
         };
-        let passphrase = Zeroizing::new(take_string(&mut frame, "passphrase").unwrap_or_default());
-        if frame.get("op").and_then(Value::as_str) != Some("unlock")
+        let passphrase =
+            Zeroizing::new(take_string(&mut frame.0, "passphrase").unwrap_or_default());
+        if frame.0.get("op").and_then(Value::as_str) != Some("unlock")
             || passphrase.is_empty()
             || passphrase.len() > 4096
         {
             return Err("service_frame".into());
         }
-        let data = PathBuf::from(take_string(&mut frame, "data").ok_or("service_frame")?);
+        let data = PathBuf::from(take_string(&mut frame.0, "data").ok_or("service_frame")?);
         if !data.is_absolute() {
             return Err("service_frame".into());
         }
@@ -109,15 +135,16 @@ impl Service {
     /// Run one request frame and return its reply.
     pub fn handle(&self, line: &str) -> Value {
         let mut frame = match serde_json::from_str(line) {
-            Ok(Value::Object(frame)) => frame,
+            Ok(Value::Object(frame)) => SensitiveFrame(frame),
             _ => return json!({"id":Value::Null,"ok":false,"error":"service_frame"}),
         };
-        let id = frame.get("id").cloned().unwrap_or(Value::Null);
+        let id = frame.0.remove("id").unwrap_or(Value::Null);
         let reply = |result: Result<Value, String>| match result {
             Ok(result) => json!({"id":id,"ok":true,"result":result}),
             Err(error) => json!({"id":id,"ok":false,"error":error}),
         };
         let op = frame
+            .0
             .get("op")
             .and_then(Value::as_str)
             .unwrap_or_default()
@@ -125,7 +152,7 @@ impl Service {
         if !ALLOWED.contains(&op.as_str()) {
             return reply(Err("service_command".into()));
         }
-        let args = match frame.get("args") {
+        let args = match frame.0.get("args") {
             Some(Value::Array(args)) => args
                 .iter()
                 .map(|arg| arg.as_str().map(str::to_owned))
@@ -135,8 +162,8 @@ impl Service {
         let Some(args) = args else {
             return reply(Err("setup_arguments".into()));
         };
-        let words = take_string(&mut frame, "words").map(Zeroizing::new);
-        let private = match take_string(&mut frame, "private_hex").map(Zeroizing::new) {
+        let words = take_string(&mut frame.0, "words").map(Zeroizing::new);
+        let private = match take_string(&mut frame.0, "private_hex").map(Zeroizing::new) {
             Some(text) => match hex::decode(text.as_bytes()) {
                 Ok(bytes) => Some(Zeroizing::new(bytes)),
                 Err(_) => return reply(Err("setup_file".into())),
@@ -180,8 +207,9 @@ fn read_frame(input: &mut impl BufRead) -> Option<Zeroizing<String>> {
     }
 }
 
-fn write_frame(output: &Mutex<Box<dyn Write + Send>>, value: &Value) {
+fn write_frame(output: &Mutex<Box<dyn Write + Send>>, mut value: Value) {
     let mut text = Zeroizing::new(value.to_string());
+    wipe(&mut value);
     text.push('\n');
     if let Ok(mut output) = output.lock() {
         let _ = output.write_all(text.as_bytes());
@@ -199,12 +227,12 @@ pub fn serve(mut input: impl BufRead, output: Box<dyn Write + Send>) -> Result<(
     let service = match Service::unlock(&first) {
         Ok(service) => Arc::new(service),
         Err(error) => {
-            write_frame(&output, &json!({"unlocked":false,"error":error}));
+            write_frame(&output, json!({"unlocked":false,"error":error}));
             return Err(error);
         }
     };
     drop(first);
-    write_frame(&output, &json!({"unlocked":true}));
+    write_frame(&output, json!({"unlocked":true}));
     let running = Arc::new((Mutex::new(0usize), Condvar::new()));
     while let Some(line) = read_frame(&mut input) {
         if serde_json::from_str::<Value>(&line)
@@ -222,7 +250,7 @@ pub fn serve(mut input: impl BufRead, output: Box<dyn Write + Send>) -> Result<(
                     .ok()
                     .and_then(|frame| frame.get("id").cloned())
                     .unwrap_or(Value::Null);
-                write_frame(&output, &json!({"id":id,"ok":false,"error":"service_busy"}));
+                write_frame(&output, json!({"id":id,"ok":false,"error":"service_busy"}));
                 continue;
             }
             *count += 1;
@@ -231,7 +259,7 @@ pub fn serve(mut input: impl BufRead, output: Box<dyn Write + Send>) -> Result<(
         std::thread::spawn(move || {
             let reply = service.handle(&line);
             drop(line);
-            write_frame(&output, &reply);
+            write_frame(&output, reply);
             if let Ok(mut count) = running.0.lock() {
                 *count -= 1;
                 running.1.notify_all();
@@ -262,6 +290,13 @@ pub fn serve(mut input: impl BufRead, output: Box<dyn Write + Send>) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_frames_discard_nested_private_strings() {
+        let mut frame = json!({"words":"abandon art", "extra":[{"private_hex":"deadbeef"}]});
+        wipe(&mut frame);
+        assert_eq!(frame, json!({}));
+    }
 
     struct Shared(Arc<Mutex<Vec<u8>>>);
     impl Write for Shared {
@@ -303,7 +338,9 @@ mod tests {
         let text = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
         (
             result,
-            text.lines().map(|l| serde_json::from_str(l).unwrap()).collect(),
+            text.lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect(),
         )
     }
 
@@ -325,7 +362,10 @@ mod tests {
             json!({"id":1,"op":"setup-status","args":["x"]}).to_string(),
         ]);
         assert_eq!(result, Err("service_unlock".into()));
-        assert_eq!(replies, vec![json!({"unlocked":false,"error":"service_unlock"})]);
+        assert_eq!(
+            replies,
+            vec![json!({"unlocked":false,"error":"service_unlock"})]
+        );
         assert_eq!(crate::seal_kdf::cache_len(), 0);
 
         // Unlock caches the profile key; dropping the service clears it.
@@ -352,12 +392,25 @@ mod tests {
         let mut replies = replies[1..].to_vec();
         replies.sort_by_key(|reply| reply["id"].as_u64());
         assert_eq!(replies.len(), 4, "nothing runs after Lock: {replies:?}");
-        assert_eq!(replies[0], json!({"id":1,"ok":false,"error":"service_command"}));
+        assert_eq!(
+            replies[0],
+            json!({"id":1,"ok":false,"error":"service_command"})
+        );
         // The service never reads a passphrase file.
-        assert_eq!(replies[1], json!({"id":2,"ok":false,"error":"setup_arguments"}));
+        assert_eq!(
+            replies[1],
+            json!({"id":2,"ok":false,"error":"setup_arguments"})
+        );
         assert_eq!(replies[2]["ok"], false);
-        assert_eq!(replies[3], json!({"id":4,"ok":false,"error":"setup_arguments"}));
-        assert_eq!(crate::seal_kdf::cache_len(), 0, "Lock zeroizes the key cache");
+        assert_eq!(
+            replies[3],
+            json!({"id":4,"ok":false,"error":"setup_arguments"})
+        );
+        assert_eq!(
+            crate::seal_kdf::cache_len(),
+            0,
+            "Lock zeroizes the key cache"
+        );
 
         // End of input stops the service the same way.
         let (result, replies) = run(&[unlock("service pass")]);

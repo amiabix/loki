@@ -55,9 +55,10 @@ impl Member {
         threshold: u16,
         members: u16,
     ) -> Result<(Self, Vec<u8>), String> {
-        if !matches!((threshold, members), (2, 3) | (2, 4)) || !expected_ids(members).contains(&id)
+        if !matches!((threshold, members), (2, 3) | (2, 4) | (3, 4))
+            || !expected_ids(members).contains(&id)
         {
-            return Err("supported DKG policies are 2-of-3 and 2-of-4".into());
+            return Err("supported DKG policies are 2-of-3, 2-of-4, and 3-of-4".into());
         }
         let identifier = frost::Identifier::try_from(id).map_err(|e| e.to_string())?;
         let (secret, public) =
@@ -270,7 +271,11 @@ impl<'a> CheckpointReader<'a> {
         }
     }
 }
-fn checked_round1(number: u16, raw: &[u8]) -> Result<frost::keys::dkg::round1::Package, String> {
+fn checked_round1(
+    number: u16,
+    threshold: u16,
+    raw: &[u8],
+) -> Result<frost::keys::dkg::round1::Package, String> {
     let public =
         frost::keys::dkg::round1::Package::deserialize(raw).map_err(|_| CHECKPOINT_ERROR)?;
     if public.serialize().map_err(|_| CHECKPOINT_ERROR)? != raw
@@ -279,7 +284,7 @@ fn checked_round1(number: u16, raw: &[u8]) -> Result<frost::keys::dkg::round1::P
             .serialize()
             .map_err(|_| CHECKPOINT_ERROR)?
             .len()
-            != 2
+            != usize::from(threshold)
     {
         return Err(CHECKPOINT_ERROR.into());
     }
@@ -319,12 +324,13 @@ impl Member {
             .map_err(|_| CHECKPOINT_ERROR)?;
         let own_round1 = reader.field()?.to_vec();
         reader.finish()?;
-        let public = checked_round1(number, &own_round1)?;
+        let threshold = *secret.min_signers();
+        let public = checked_round1(number, threshold, &own_round1)?;
         let roundtrip = zeroize::Zeroizing::new(secret.serialize().map_err(|_| CHECKPOINT_ERROR)?);
         if *roundtrip != encoded
             || *secret.identifier()
                 != frost::Identifier::try_from(number).map_err(|_| CHECKPOINT_ERROR)?
-            || *secret.min_signers() != 2
+            || !matches!((threshold, members), (2, 3) | (2, 4) | (3, 4))
             || *secret.max_signers() != members
             || secret.commitment() != public.commitment()
         {
@@ -388,13 +394,14 @@ impl Round2Member {
         let secret = frost::keys::dkg::round2::SecretPackage::deserialize(encoded)
             .map_err(|_| CHECKPOINT_ERROR)?;
         let own_round1 = reader.field()?.to_vec();
-        let public = checked_round1(number, &own_round1)?;
+        let threshold = *secret.min_signers();
+        let public = checked_round1(number, threshold, &own_round1)?;
         let transcript: [u8; 32] = reader.field()?.try_into().map_err(|_| CHECKPOINT_ERROR)?;
         let identifier = frost::Identifier::try_from(number).map_err(|_| CHECKPOINT_ERROR)?;
         let roundtrip = zeroize::Zeroizing::new(secret.serialize().map_err(|_| CHECKPOINT_ERROR)?);
         if *roundtrip != encoded
             || *secret.identifier() != identifier
-            || *secret.min_signers() != 2
+            || !matches!((threshold, members), (2, 3) | (2, 4) | (3, 4))
             || *secret.max_signers() != members
             || secret.commitment() != public.commitment()
         {
@@ -424,7 +431,7 @@ impl Round2Member {
                 let bytes = reader.field()?;
                 peer_round1.insert(
                     frost::Identifier::try_from(peer).map_err(|_| CHECKPOINT_ERROR)?,
-                    checked_round1(peer, bytes)?,
+                    checked_round1(peer, threshold, bytes)?,
                 );
                 bytes
             };
@@ -469,11 +476,12 @@ impl Completed {
             .map_err(|_| CHECKPOINT_ERROR)?;
         let identifier = frost::Identifier::try_from(number).map_err(|_| CHECKPOINT_ERROR)?;
         let key_roundtrip = zeroize::Zeroizing::new(key.serialize().map_err(|_| CHECKPOINT_ERROR)?);
+        let threshold = *key.min_signers();
         if *key_roundtrip != *key_package
             || public.serialize().map_err(|_| CHECKPOINT_ERROR)? != public_package
             || *key.identifier() != identifier
-            || *key.min_signers() != 2
-            || public.min_signers() != Some(2)
+            || !matches!((threshold, members), (2, 3) | (2, 4) | (3, 4))
+            || public.min_signers() != Some(threshold)
             || public
                 .verifying_shares()
                 .keys()
@@ -496,7 +504,7 @@ impl Completed {
             return Err(CHECKPOINT_ERROR.into());
         }
         let basis: std::collections::BTreeSet<_> =
-            public.verifying_shares().keys().take(2).copied().collect();
+            public.verifying_shares().keys().take(usize::from(threshold)).copied().collect();
         for target in
             std::iter::once(None).chain(public.verifying_shares().keys().copied().map(Some))
         {

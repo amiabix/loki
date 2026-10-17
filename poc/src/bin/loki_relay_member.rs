@@ -503,6 +503,7 @@ fn save_proposal(
         payment_manifest::parse(manifest).map_err(|_| Exit::Member(MemberError::Markers))?;
     payment_manifest::validate_roster(
         session.member.roster.vault,
+        session.member.threshold,
         session.member.roster.members.iter().map(|member| member.id),
         &context,
         &intent,
@@ -578,6 +579,7 @@ fn import_saved_proposals(
             };
             if payment_manifest::validate_roster(
                 session.member.roster.vault,
+                session.member.threshold,
                 session.member.roster.members.iter().map(|member| member.id),
                 &context,
                 &intent,

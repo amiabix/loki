@@ -51,7 +51,7 @@ impl SavedActivation {
                             revision: 1,
                         },
                         network: policy.network.clone(),
-                        threshold: 2,
+                        threshold: policy.threshold,
                         member_count: policy.member_count,
                         roster_digest: Some(*accepted.digest()),
                         prerequisites: vec![prepared
@@ -201,6 +201,7 @@ impl HostedSetup {
         let member = LoadedMember {
             identity: Self::identity(&self.root, &self.passphrase)?,
             roster: accepted.roster().clone(),
+            threshold: accepted.context().policy().threshold,
         };
         let saved = SavedActivation::decode(
             engine.prepared_delivery()?,
@@ -422,6 +423,9 @@ impl HostedSetup {
             }
         }
         self.install_activated_state(engine, accepted)?;
+        store
+            .clear_retries_for_stored_routes()
+            .map_err(|_| "setup_transport")?;
         Ok(HandoffStatus {
             ready: true,
             missing_slots: Vec::new(),
@@ -454,7 +458,7 @@ impl HostedSetup {
                     .map_err(|_| ERROR)?;
             }
         }
-        let roster=serde_json::to_vec(&serde_json::json!({"vault":hex::encode(accepted.roster().vault),"threshold":2,"members":accepted.roster().members.iter().map(|peer|serde_json::json!({"id":peer.id,"signing":hex::encode(peer.signing),"encryption":hex::encode(peer.encryption)})).collect::<Vec<_>>()})).map_err(|_| ERROR)?;
+        let roster=serde_json::to_vec(&serde_json::json!({"vault":hex::encode(accepted.roster().vault),"threshold":accepted.context().policy().threshold,"members":accepted.roster().members.iter().map(|peer|serde_json::json!({"id":peer.id,"signing":hex::encode(peer.signing),"encryption":hex::encode(peer.encryption)})).collect::<Vec<_>>()})).map_err(|_| ERROR)?;
         crate::relay_member::exchange::atomic_publish(&self.root, "roster.json", &roster)
             .map_err(|_| ERROR)?;
         Ok(())

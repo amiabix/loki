@@ -3,7 +3,7 @@
 The child gets the passphrase once, in its first stdin frame, and keeps it only in its
 memory; nothing secret is written to a file, argv or the environment. Each call is one
 JSON line on stdin and one reply line on stdout. The app keeps its own copy of the
-passphrase so it can restart a service that died or timed out.
+passphrase so it can restart a service that died.
 """
 import json
 import os
@@ -129,8 +129,6 @@ class MemberService:
             timing.record(f"service {op}", started, "timeout", *args[:1])
             with self.lock:
                 waiting.pop(ident, None)
-                if self.waiting is waiting:
-                    self._kill()
             raise ServiceError("Hosted setup timed out; its saved state can be retried")
         with self.lock:
             reply = replies.pop(ident, None)

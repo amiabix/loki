@@ -7,7 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 import member_app  # noqa: E402
@@ -68,7 +68,7 @@ class PaymentWorkerTest(unittest.TestCase):
         (member / "final-backup-checked").write_text("checked")
         (member / "relay-setup.json").write_text(json.dumps({"phase": "ready"}))
         (self.work / "payment.json").write_text(json.dumps({
-            "vault": self.vault, "attempt": self.attempt, "payment": "e" * 64,
+            "version": 1, "vault": self.vault, "attempt": self.attempt, "payment": "e" * 64,
             "pair": [1, 2], "expiry_height": 9216}))
         self.calls = []
         check = self.wallet.payment_worker.check
@@ -85,6 +85,17 @@ class PaymentWorkerTest(unittest.TestCase):
                 return
             time.sleep(0.05)
         self.fail(f"payment never reached {phase}: {self.wallet.payment_phase(self.work)}")
+
+    def test_lock_reaps_a_child_started_during_shutdown(self):
+        worker = self.wallet.payment_worker
+        worker.local.worker = True
+        worker.stop_event.set()
+        process = Mock()
+        process.poll.return_value = None
+        with self.assertRaisesRegex(ValueError, "locked"):
+            worker.track(process)
+        process.kill.assert_called_once()
+        process.communicate.assert_called_once()
 
     def test_worker_advances_without_a_page_and_never_decides(self):
         self.wallet.payment_status(self.work, "queued_for_delivery")

@@ -37,10 +37,19 @@ argon2             = { version = "0.5", default-features = false, features = ["a
 ed25519-dalek      = { version = "2.2", features = ["rand_core"] }
 x25519-dalek       = { version = "2.0", features = ["static_secrets"] }
 hex                = "0.4"
+base64             = "0.22"
 ciborium           = "0.2"
 serde_json         = "1"
 zcash_address = { package = "zakura-address", version = "=2.2.0" }
 zcash_protocol = { package = "zakura-protocol", version = "=2.2.0" }
+zcash_client_backend = { package = "zakura-client-backend", version = "=0.1.0-rc7", features = ["orchard", "sync", "lightwalletd-tonic-transport", "lightwalletd-tonic-tls-webpki-roots"] }
+zcash_client_sqlite = { package = "zakura-client-sqlite", version = "=0.1.0-rc7", features = ["orchard"] }
+zcash_keys = { package = "zakura-keys", version = "=2.2.0", features = ["orchard", "unstable-frost"] }
+rusqlite = { version = "=0.37.0", features = ["bundled-sqlcipher-vendored-openssl"] }
+async-trait = "0.1"
+tonic = { version = "0.14.6", features = ["transport", "tls-webpki-roots"] }
+rustls = { version = "0.23", features = ["aws_lc_rs"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
 zcash_note_encryption = "0.4.2"
 # Only for the forbidden-pool tamper fixtures: these build a transparent / Sapling
 # PCZT component directly through the public `pczt::parse` constructors, which is the

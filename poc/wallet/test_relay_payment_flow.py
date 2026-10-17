@@ -1,4 +1,4 @@
-"""Opt-in regtest journey through three private member apps and three relays.
+"""Opt-in regtest journey through private member apps and three relays.
 
 Run with LOKI_THS_INSTANCE set to an already running disposable THS instance.
 The apps are separate processes on one host; this is not a physical-device test.
@@ -59,14 +59,20 @@ class RelayPaymentFlowTest(unittest.TestCase):
         self.fail(f"Timed out waiting for {what}: {last}")
 
     def test_vault_to_confirmed_payment_across_member_apps(self):
+        self.payment_journey(2, 3)
+
+    def test_three_of_four_payment_across_member_apps(self):
+        self.payment_journey(3, 4)
+
+    def payment_journey(self, threshold, count):
         creator = self.member("creator", invite_port=join.free_port())
-        made = creator.api("create", {"name": "Relay payment", "members": 3})
+        made = creator.api("create", {"name": "Relay payment", "members": count,
+                                        "threshold": threshold})
         vault, invites = made["vault"], made["invites"]
-        second, third = self.member("second"), self.member("third")
-        for app, invite in ((second, invites[0]), (third, invites[1])):
+        apps = (creator, *(self.member(f"member-{slot}") for slot in range(2, count + 1)))
+        for app, invite in zip(apps[1:], invites):
             self.assertTrue(app.api("join", {"invite": invite})["joined"])
-        apps = (creator, second, third)
-        join.RemoteJoinTest.finish_setup(self, creator, second, third, vault, invites)
+        join.RemoteJoinTest.finish_setup_members(self, apps, vault, invites)
 
         owner = run.OwnedRun.create(self.root / "operator-run")
         self.addCleanup(owner.close)
@@ -74,7 +80,8 @@ class RelayPaymentFlowTest(unittest.TestCase):
             run._mkdir(owner.root / folder)
         deadline = time.monotonic() + 600
         relays = [run._init_relay(owner, index, join.free_port(), self.server, deadline,
-                                  1048576, 8388608) for index in (1, 2, 3)]
+                                  1048576, 8388608, mailbox_count=count)
+                  for index in (1, 2, 3)]
         for relay in relays:
             relay.child = owner.start([str(self.server), "serve", "--root", str(relay.root),
                                        "--listen", run._listen(relay.endpoint)], cwd=relay.root)
@@ -105,6 +112,9 @@ class RelayPaymentFlowTest(unittest.TestCase):
             try:
                 return self.chain.fund(source)
             except RuntimeError as error:
+                if "'status': 'broadcast'" in str(error):
+                    self.chain.mine(1)
+                    return []
                 if not any(f"'status': '{status}'" in str(error)
                            for status in ("preparing", "prepared")):
                     raise
@@ -124,9 +134,10 @@ class RelayPaymentFlowTest(unittest.TestCase):
         received_before = receiver["ironwood_zatoshi"]
         amount = 40_000_000
         draft = creator.api("payment-draft", {"vault": vault, "recipient": recipient,
-                                              "amount_zat": str(amount), "memo": "member app journey"})
+                                              "amount_zat": str(amount), "memo": "member app journey",
+                                              "pair": "ABC" if threshold == 3 else "AB"})
         self.assertEqual(draft["status"], "draft_only")
-        self.assertEqual(draft["pair"], [1, 2])
+        self.assertEqual(draft["signers"], list(range(1, threshold + 1)))
         attempt = draft["attempt"]
         self.assertEqual(creator.api("payment-publish", {"vault": vault, "attempt": attempt})["phase"],
                          "queued_for_delivery")
@@ -134,14 +145,14 @@ class RelayPaymentFlowTest(unittest.TestCase):
         def ready_to_review():
             for app in apps:
                 app.api("payment-sync", {"vault": vault})
-            for app in apps[:2]:
+            for app in apps[:threshold]:
                 app.api("payment-advance", {"vault": vault, "attempt": attempt})
             return [app.api("payment-review", {"vault": vault, "attempt": attempt})
-                    for app in apps[:2]]
+                    for app in apps[:threshold]]
 
-        reviews = self.wait_for(ready_to_review, lambda rows: len(rows) == 2,
-                                "two independent transaction reviews")
-        signer_attempt = (second.data / "vaults" / vault / "signing" /
+        reviews = self.wait_for(ready_to_review, lambda rows: len(rows) == threshold,
+                                "independent transaction reviews", seconds=300)
+        signer_attempt = (apps[1].data / "vaults" / vault / "signing" /
                           draft["payment"] / attempt)
         old_signer_attempt = self.root / "old-second-signing-attempt"
         self.assertTrue((signer_attempt / "nonces.sealed").is_file())
@@ -153,26 +164,28 @@ class RelayPaymentFlowTest(unittest.TestCase):
             self.assertEqual(review["memo_utf8"], "member app journey")
             self.assertEqual(review["change_zat"], int(draft["change_zat"]))
             self.assertEqual(review["fee_zat"], int(draft["fee_zat"]))
-        for app, review in zip(apps[:2], reviews):
+        for app, review in zip(apps[:threshold], reviews):
             self.assertEqual(app.api("payment-approve", {"vault": vault, "attempt": attempt,
                                                           "review_token": review["review_token"]})["phase"],
                              "approval_pending_delivery")
 
-        def finish_from_third():
+        finisher = apps[threshold]
+
+        def finish_from_non_signer():
             for app in apps:
                 app.api("payment-sync", {"vault": vault})
-            return third.api("payment-finish", {"vault": vault, "attempt": attempt})
+            return finisher.api("payment-finish", {"vault": vault, "attempt": attempt})
 
-        sent = self.wait_for(finish_from_third, lambda result: result["phase"] == "broadcast",
-                             "third member broadcast", seconds=180)
+        sent = self.wait_for(finish_from_non_signer, lambda result: result["phase"] == "broadcast",
+                             "non-signer broadcast", seconds=180)
         self.chain.mine(3)
-        verified = self.wait_for(lambda: third.api("payment-verify", {"vault": vault,
+        verified = self.wait_for(lambda: finisher.api("payment-verify", {"vault": vault,
                                                                        "attempt": attempt,
                                                                        "txid": sent["txid"]}),
                                  lambda result: result["phase"] == "confirmed",
                                  "mined payment confirmation")
         self.assertGreaterEqual(verified["confirmations"], 1)
-        self.assertEqual(third.api(f"payments?vault={vault}")["payments"][0]["phase"], "confirmed")
+        self.assertEqual(finisher.api(f"payments?vault={vault}")["payments"][0]["phase"], "confirmed")
         self.wait_for(recipient_account,
                       lambda account: account["ironwood_zatoshi"] >= received_before + amount,
                       "independent recipient balance")
@@ -186,7 +199,7 @@ class RelayPaymentFlowTest(unittest.TestCase):
         shutil.rmtree(signer_attempt)
         shutil.copytree(old_signer_attempt, signer_attempt)
         with self.assertRaises(join.Refused) as refused:
-            second.api("payment-approve", {"vault": vault, "attempt": attempt,
+            apps[1].api("payment-approve", {"vault": vault, "attempt": attempt,
                                            "review_token": reviews[1]["review_token"]})
         self.assertIn("nonce relay claim", str(refused.exception))
         self.assertFalse((signer_attempt / "decision").exists())

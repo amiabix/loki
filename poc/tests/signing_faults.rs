@@ -12,7 +12,7 @@ fn context() -> SessionContext {
         vault: [11; 32],
         payment: [22; 32],
         attempt: AttemptId::random(),
-        pair: [1, 2],
+        signers: vec![1, 2],
     }
 }
 
@@ -73,7 +73,7 @@ fn relay_retry_and_reordering_preserve_two_authenticated_messages() {
             ..ctx.clone()
         },
         SessionContext {
-            pair: [1, 3],
+            signers: vec![1, 3],
             ..ctx.clone()
         },
     ] {

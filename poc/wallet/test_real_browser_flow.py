@@ -1,8 +1,8 @@
 """Opt-in real Chromium journey through three member apps and relay processes.
 
 Run with LOKI_THS_INSTANCE set to an already running disposable THS regtest.
-This exercises the local courier and operator-kit path on one host, not hosted
-HTTPS setup or physical-device isolation.
+This exercises a verified HTTPS setup courier and operator-kit path on one host,
+not the hosted admission service or physical-device isolation.
 """
 
 import json
@@ -71,10 +71,18 @@ class RealBrowserPaymentFlow(unittest.TestCase):
         self.fail(f"Timed out waiting for {label}")
 
     def test_create_pay_and_confirm_in_three_member_browsers(self):
-        apps = [join.App(self.root / "member-1", invite_port=join.free_port(),
+        if not shutil.which("openssl"):
+            self.skipTest("openssl is needed for verified HTTPS setup")
+        ca, leaf, leaf_key = join.make_certificates(self.root)
+        invite_port, front_port = join.free_port(), join.free_port()
+        apps = [join.App(self.root / "member-1", invite_port=invite_port,
+                         invite_origin=f"https://localhost:{front_port}",
                          env={"LOKI_RPC": self.chain.rpc_address})]
+        front = join.tls_front(front_port, ("127.0.0.1", invite_port), leaf, leaf_key)
+        self.addCleanup(front.close)
         apps.extend(join.App(self.root / f"member-{slot}",
-                             env={"LOKI_RPC": self.chain.rpc_address}) for slot in (2, 3))
+                             env={"LOKI_RPC": self.chain.rpc_address, "SSL_CERT_FILE": str(ca)})
+                    for slot in (2, 3))
         for app in apps:
             self.addCleanup(app.stop)
         self.urls = [f"http://127.0.0.1:{app.port}/#{app.token}" for app in apps]

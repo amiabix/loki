@@ -1,11 +1,8 @@
-//! A narrow regtest fixture: find the vault's Ironwood notes.
+//! Narrow Ironwood note scanning for the CLI wallet path.
 //!
-//! This is deliberately not a wallet. It trial-decrypts the Ironwood actions that the
-//! node already hands us as JSON, keeps the ones addressed to the vault, and records
-//! what checkpoint 3 needs: value, nullifier, commitment and tree position.
-//!
-//! The brief allows exactly this ("a narrow test fixture is fine; implementing a general
-//! scanner is outside G1").
+//! It trial-decrypts verbose block actions, keeping vault notes and witnesses.
+//! Testnet starts at the vault's certified birth checkpoint; regtest retains its
+//! short-chain scan. This is still a CLI research scanner, not a durable wallet store.
 
 use orchard::{
     keys::{FullViewingKey, IncomingViewingKey, PreparedIncomingViewingKey, Scope},
@@ -18,6 +15,7 @@ use orchard::{
 use zcash_note_encryption::try_note_decryption;
 
 use crate::scanstate::ScanState;
+use crate::witness::BirthWitnesses;
 
 /// One Ironwood action as the node reports it.
 #[derive(Clone, Debug)]
@@ -166,6 +164,118 @@ pub struct Chain {
     pub tip: u64,
 }
 
+/// A fresh vault's notes and witnesses, scanned from its certified birth block.
+pub struct BirthChain {
+    pub notes: Vec<VaultNote>,
+    pub witnesses: BirthWitnesses,
+    pub tip: u64,
+}
+
+pub fn scan_birth_blocks<F>(
+    fvk: &FullViewingKey,
+    checkpoint_tree: &[u8],
+    checkpoint_hash: [u8; 32],
+    birth_height: u64,
+    tip: u64,
+    get_block: F,
+) -> Result<BirthChain, String>
+where
+    F: Fn(u64) -> Result<serde_json::Value, String>,
+{
+    if birth_height == 0 || tip < birth_height - 1 {
+        return Err("invalid vault birth height".into());
+    }
+    let mut witnesses = BirthWitnesses::from_state(checkpoint_tree)?;
+    let ivks = vault_ivks(fvk);
+    let mut notes = Vec::new();
+    let mut spent = std::collections::HashSet::new();
+    let mut previous = checkpoint_hash;
+    for height in birth_height..=tip {
+        let block = get_block(height)?;
+        if hex32(&block, "previousblockhash") != Some(previous) {
+            return Err(format!(
+                "block {height} does not extend the birth checkpoint"
+            ));
+        }
+        previous = block_hash(&block, height)?;
+        for tx in block["tx"].as_array().ok_or("block has no tx array")? {
+            let txid = tx["txid"].as_str().ok_or("transaction has no txid")?;
+            if let Some(actions) = tx["ironwood"]["actions"].as_array() {
+                for raw in parse_actions(actions, txid)? {
+                    let position = witnesses.append(raw.cmx)?;
+                    if let Some(note) = vault_note_at(
+                        fvk,
+                        &ivks,
+                        u32::try_from(height).map_err(|_| "block height overflow")?,
+                        txid,
+                        position,
+                        &raw,
+                    ) {
+                        witnesses.track_latest()?;
+                        notes.push(note);
+                    }
+                    spent.insert(raw.nullifier);
+                }
+            }
+        }
+    }
+    if tip >= birth_height && block_hash(&get_block(tip)?, tip)? != previous {
+        return Err(format!("block {tip} changed during the scan"));
+    }
+    notes.retain(|note| !spent.contains(&note.nullifier));
+    Ok(BirthChain {
+        notes,
+        witnesses,
+        tip,
+    })
+}
+
+/// Scan a newly created vault from the block after its saved tree checkpoint.
+/// shortcut: rescans from birth on each command; persist witnesses once Testnet
+/// vaults routinely span more than a few days of blocks.
+pub fn scan_chain_from_birth(
+    rpc: &crate::rpc::Rpc,
+    fvk: &FullViewingKey,
+    birth_height: u64,
+) -> Result<BirthChain, String> {
+    let checkpoint_height = birth_height
+        .checked_sub(1)
+        .ok_or("invalid vault birth height")?;
+    let checkpoint = rpc.json("z_gettreestate", &format!("[\"{checkpoint_height}\"]"))?;
+    if checkpoint["height"].as_u64() != Some(checkpoint_height) {
+        return Err("birth checkpoint height differs from the node response".into());
+    }
+    let hash = hex32(&checkpoint, "hash").ok_or("birth checkpoint has no block hash")?;
+    let encoded = hex::decode(
+        checkpoint["ironwood"]["commitments"]["finalState"]
+            .as_str()
+            .ok_or("birth checkpoint has no Ironwood tree state")?,
+    )
+    .map_err(|e| format!("birth checkpoint tree: {e}"))?;
+    let expected = anchor_from_treestate(&checkpoint)?;
+    if BirthWitnesses::from_state(&encoded)?.root() != expected {
+        return Err("birth checkpoint tree disagrees with its root".into());
+    }
+    let tip = rpc
+        .json("getblockcount", "[]")?
+        .as_u64()
+        .ok_or("getblockcount did not return a number")?;
+    let chain = scan_birth_blocks(fvk, &encoded, hash, birth_height, tip, |height| {
+        rpc.json("getblock", &format!("[\"{height}\", 2]"))
+    })?;
+    if rpc
+        .json("getblockhash", &format!("[{checkpoint_height}]"))?
+        .as_str()
+        != checkpoint["hash"].as_str()
+    {
+        return Err("birth checkpoint changed during the scan".into());
+    }
+    if chain.witnesses.root() != chain_anchor(rpc, chain.tip)? {
+        return Err("scanned Ironwood tree disagrees with the node's anchor".into());
+    }
+    Ok(chain)
+}
+
 /// Scan every block for the vault's Ironwood notes and collect the commitment stream.
 ///
 /// This is what makes a second device independent: a finisher that runs this derives the
@@ -310,14 +420,57 @@ pub fn parse_actions(actions: &[serde_json::Value], txid: &str) -> Result<Vec<Ra
 /// The node's own Ironwood anchor at `height`.
 pub fn chain_anchor(rpc: &crate::rpc::Rpc, height: u64) -> Result<[u8; 32], String> {
     let state = rpc.json("z_gettreestate", &format!("[\"{height}\"]"))?;
-    hex::decode(
-        state["ironwood"]["commitments"]["finalRoot"]
-            .as_str()
-            .ok_or("z_gettreestate has no ironwood finalRoot")?,
-    )
-    .map_err(|e| format!("anchor hex: {e}"))?
-    .try_into()
-    .map_err(|_| "anchor is not 32 bytes".to_string())
+    anchor_from_treestate(&state)
+}
+
+fn anchor_from_treestate(state: &serde_json::Value) -> Result<[u8; 32], String> {
+    let commitments = &state["ironwood"]["commitments"];
+    let root = commitments["finalRoot"]
+        .as_str()
+        .map(|s| {
+            hex::decode(s)
+                .map_err(|e| format!("anchor hex: {e}"))?
+                .try_into()
+                .map_err(|_| "anchor is not 32 bytes".to_string())
+        })
+        .transpose()?;
+    let state_root = commitments["finalState"]
+        .as_str()
+        .map(|s| {
+            BirthWitnesses::from_state(&hex::decode(s).map_err(|e| e.to_string())?)
+                .map(|tree| tree.root())
+        })
+        .transpose()?;
+    match (root, state_root) {
+        (Some(a), Some(b)) if a != b => Err("Ironwood finalRoot differs from finalState".into()),
+        (Some(root), _) | (_, Some(root)) => Ok(root),
+        _ => Err("z_gettreestate has no Ironwood root or state".into()),
+    }
+}
+
+#[cfg(test)]
+mod birth_tests {
+    use super::*;
+    use incrementalmerkletree::frontier::CommitmentTree;
+    use orchard::tree::MerkleHashOrchard;
+    use zcash_primitives::merkle_tree::write_commitment_tree;
+
+    #[test]
+    fn treestate_accepts_zebra_state_and_rejects_conflicting_root() {
+        let mut bytes = Vec::new();
+        write_commitment_tree(
+            &CommitmentTree::<MerkleHashOrchard, 32>::empty(),
+            &mut bytes,
+        )
+        .unwrap();
+        let root = BirthWitnesses::from_state(&bytes).unwrap().root();
+        let mut response = serde_json::json!({"ironwood": {"commitments": {
+            "finalState": hex::encode(bytes), "finalRoot": hex::encode(root)
+        }}});
+        assert_eq!(anchor_from_treestate(&response).unwrap(), root);
+        response["ironwood"]["commitments"]["finalRoot"] = serde_json::json!(hex::encode([7; 32]));
+        assert!(anchor_from_treestate(&response).is_err());
+    }
 }
 
 /// Trial-decrypt one action, keeping the memo as well as the note.

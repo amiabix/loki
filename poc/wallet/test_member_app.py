@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
-from member_app import SEED_WALLET, SETUP, Wallet, courier_name, make_signer_server
+from member_app import PAYMENT, SEED_WALLET, SETUP, WALLET_SYNC, Wallet, courier_name, decoded, make_signer_server
 
 
 def payment_sync_fake(stored, plans=None):
@@ -34,6 +34,125 @@ def payment_sync_fake(stored, plans=None):
 
 
 class MemberWalletTest(unittest.TestCase):
+    def test_testnet_balance_uses_persistent_wallet_and_reports_scan_progress(self):
+        with tempfile.TemporaryDirectory(prefix="loki-indexed-balance-") as temp:
+            root = Path(temp)
+            wallet = Wallet(root / "member", root / "courier", network="testnet",
+                            lightwalletd_url="https://wallet.example")
+            self.addCleanup(wallet.close)
+            vault = "a" * 64
+            member = wallet.data / "vaults" / vault
+            member.mkdir(parents=True)
+            (member / "membership.json").write_text(json.dumps({
+                "vault": vault, "profile": "profile", "slot": 1, "network": "testnet"}))
+            wallet.profile_data = {"id": "profile"}
+            wallet.passphrase = "a long passphrase"
+            indexed = {"vault": vault, "network": "testnet", "height": 4500010,
+                       "chain_tip": 4500012, "balance_zat": 400000}
+            with patch.object(wallet, "command", return_value=json.dumps(indexed)) as command:
+                result = wallet.balance(vault)
+            self.assertEqual(result["balance_zat"], 400000)
+            self.assertEqual(result["scan_ready"], False)
+            self.assertEqual(result["height"], 4500010)
+            self.assertEqual(command.call_args.args,
+                             (member, "@pass", member / "roster.json", "https://wallet.example"))
+            self.assertEqual(command.call_args.kwargs["binary"], WALLET_SYNC)
+            indexed["height"] = indexed["chain_tip"]
+            with patch.object(wallet, "command", return_value=json.dumps(indexed)):
+                self.assertTrue(wallet.balance(vault)["scan_ready"])
+            indexed["height"] = -1
+            with patch.object(wallet, "command", return_value=json.dumps(indexed)):
+                with self.assertRaisesRegex(ValueError, "invalid Testnet balance"):
+                    wallet.balance(vault)
+            with patch.object(wallet, "command", side_effect=ValueError("lightwalletd unavailable")):
+                with self.assertRaisesRegex(ValueError, "lightwalletd unavailable"):
+                    wallet.balance(vault)
+            self.assertIsNone(wallet.scan_height.get(vault))
+
+    def test_testnet_payment_expiry_keeps_its_payment_chain_view(self):
+        with tempfile.TemporaryDirectory(prefix="loki-testnet-expiry-") as temp:
+            wallet, vault, attempt = self.payment_fixture(temp)
+            wallet.network = "testnet"
+            member = wallet.data / "vaults" / vault
+            membership = json.loads((member / "membership.json").read_text())
+            membership["network"] = "testnet"
+            (member / "membership.json").write_text(json.dumps(membership))
+            with patch.object(wallet, "command", return_value=json.dumps({
+                    "vault": vault, "height": 9216})) as command:
+                with self.assertRaisesRegex(ValueError, "expired"):
+                    wallet.commit_payment(vault, attempt)
+            self.assertEqual(command.call_args.args[0], "balance")
+            self.assertEqual(command.call_args.kwargs["binary"], PAYMENT)
+            self.assertEqual(wallet.scan_height[vault], 9216)
+
+    def test_testnet_payment_stages_stop_when_wallet_sync_fails(self):
+        with tempfile.TemporaryDirectory(prefix="loki-testnet-payment-sync-") as temp:
+            wallet, vault, attempt = self.payment_fixture(temp)
+            wallet.network = "testnet"
+            member = wallet.data / "vaults" / vault
+            membership = json.loads((member / "membership.json").read_text())
+            membership["network"] = "testnet"
+            (member / "membership.json").write_text(json.dumps(membership))
+            with patch.object(wallet, "balance", side_effect=ValueError("wallet sync failed")), \
+                    patch.object(wallet, "payment_command") as command:
+                for stage in (
+                    lambda: wallet.package_payment(vault, attempt),
+                    lambda: wallet.finish_payment(vault, attempt),
+                    lambda: wallet.verify_payment(vault, attempt, "c" * 64),
+                ):
+                    with self.assertRaisesRegex(ValueError, "wallet sync failed"):
+                        stage()
+                command.assert_not_called()
+
+    def test_testnet_vault_records_chain_and_birth_before_inviting(self):
+        with tempfile.TemporaryDirectory(prefix="loki-testnet-ui-") as temp:
+            root = Path(temp)
+            wallet = Wallet(root / "creator", root / "courier", network="testnet")
+            self.addCleanup(wallet.close)
+            wallet.profile_data = {"id": "profile"}
+            wallet.passphrase = "a long passphrase"
+
+            def command(action, *_args, **_kwargs):
+                if action == "testnet-status":
+                    return json.dumps({"network": "testnet", "height": 4_500_000})
+                if action == "identity":
+                    return json.dumps({"id": 1, "signing": "a" * 64, "encryption": "b" * 64})
+                raise AssertionError(action)
+
+            with patch.object(wallet, "command", side_effect=command):
+                created = wallet.create("Treasury")
+            draft = json.loads((wallet.exchange / created["vault"] / "draft.json").read_text())
+            membership = json.loads((wallet.data / "vaults" / created["vault"] / "membership.json").read_text())
+            self.assertEqual((draft["network"], draft["birth_height"]), ("testnet", 4_500_000))
+            self.assertEqual((membership["network"], membership["birth_height"]), ("testnet", 4_500_000))
+            self.assertEqual(wallet.status()["network"], "testnet")
+            with self.assertRaisesRegex(ValueError, "another network"):
+                Wallet(wallet.data, wallet.exchange, network="regtest")
+            invite = decoded(created["invites"][0])
+            with self.assertRaisesRegex(ValueError, "another network"):
+                wallet.claim_invite(created["vault"], 2, invite["secret"], "t" * 32, "regtest")
+            self.assertFalse((wallet.data / "vaults" / created["vault"] / "claims.json").exists())
+
+            wrong_network = Wallet(root / "other", root / "courier")
+            self.addCleanup(wrong_network.close)
+            wrong_network.profile_data = {"id": "other"}
+            with self.assertRaisesRegex(ValueError, "another network"):
+                wrong_network.join(created["invites"][0])
+            self.assertFalse((wrong_network.data / "vaults" / created["vault"]).exists())
+            with self.assertRaisesRegex(ValueError, "local faucet"):
+                wallet.fund_vault(created["vault"], "a" * 32)
+
+    def test_testnet_creation_waits_for_synced_node_before_writing_vault(self):
+        with tempfile.TemporaryDirectory(prefix="loki-testnet-gate-") as temp:
+            root = Path(temp)
+            wallet = Wallet(root / "member", root / "courier", network="testnet")
+            self.addCleanup(wallet.close)
+            wallet.profile_data = {"id": "profile"}
+            with patch.object(wallet, "command", side_effect=ValueError("Testnet node has not reached the NU7 branch")):
+                with self.assertRaisesRegex(ValueError, "NU7"):
+                    wallet.create("Treasury")
+            self.assertFalse((wallet.data / "vaults").exists())
+
     def test_sync_stops_after_all_final_reports(self):
         with tempfile.TemporaryDirectory(prefix="loki-sync-done-") as temp:
             wallet = Wallet(Path(temp) / "member", Path(temp) / "exchange")
@@ -74,7 +193,7 @@ class MemberWalletTest(unittest.TestCase):
             (member / "roster.json").write_text("{}")
             (member / "final-backup-checked").write_text("checked")
             (work / "payment.json").write_text(json.dumps({
-                "vault": vault, "attempt": attempt, "payment": "e" * 64, "pair": [1, 2]}))
+                "version": 1, "vault": vault, "attempt": attempt, "payment": "e" * 64, "pair": [1, 2]}))
             (work / "mailbox" / wire).write_bytes(b"own authenticated wire")
             wallet.payment_status(work, "queued_for_delivery")
             calls = []
@@ -118,7 +237,7 @@ class MemberWalletTest(unittest.TestCase):
             (member / "roster.json").write_text("{}")
             (member / "final-backup-checked").write_text("checked")
             (work / "payment.json").write_text(json.dumps({
-                "vault": vault, "attempt": attempt, "payment": "e" * 64, "pair": [1, 2]}))
+                "version": 1, "vault": vault, "attempt": attempt, "payment": "e" * 64, "pair": [1, 2]}))
             wallet.payment_status(work, "approval_pending_delivery")
             stored = False
             sync = payment_sync_fake(lambda: stored)
@@ -156,7 +275,7 @@ class MemberWalletTest(unittest.TestCase):
                 work = member / "payments" / attempt
                 (work / "mailbox").mkdir(parents=True)
                 (work / "payment.json").write_text(json.dumps({
-                    "vault": vault, "attempt": attempt, "payment": "e" * 64, "pair": [1, 2]}))
+                    "version": 1, "vault": vault, "attempt": attempt, "payment": "e" * 64, "pair": [1, 2]}))
                 wallet.payment_status(work, phase)
 
             sync = payment_sync_fake(lambda: True)
@@ -206,7 +325,7 @@ class MemberWalletTest(unittest.TestCase):
                 (work / "payment.json").write_text(json.dumps({
                     "vault": vault, "payment": "b" * 64, "attempt": "c" * 64, "amount_zat": 40000000,
                     "fee_zat": 10000, "change_zat": 59990000, "expiry_height": 9216,
-                    "pair": [1, 2]}))
+                    "version": 1, "pair": [1, 2]}))
                 return "payment created"
 
             with patch.object(alice, "command", side_effect=prepare) as command:
@@ -218,7 +337,7 @@ class MemberWalletTest(unittest.TestCase):
             self.assertEqual(len(list((folder / "payments").glob("*/payment.json"))), 1)
             self.assertTrue((folder / "payments" / ("c" * 64) / "payment.json").is_file())
             self.assertEqual(alice.payments(vault)["payments"][0]["phase"], "draft")
-            with self.assertRaisesRegex(ValueError, "Choose two members"):
+            with self.assertRaisesRegex(ValueError, "Choose 2 members"):
                 alice.prepare_payment(vault, "uregtest1recipient", "40000000", "test memo", "AD")
             with self.assertRaisesRegex(ValueError, "positive amount"):
                 alice.prepare_payment(vault, "uregtest1recipient", "0", "test memo", "AB")
@@ -253,7 +372,7 @@ class MemberWalletTest(unittest.TestCase):
                 (folder / "roster.json").write_text("{}")
             work = alice.data / "vaults" / vault / "payments" / attempt
             manifest = {"vault": vault, "attempt": attempt, "payment": payment,
-                        "pair": [1, 2], "expiry_height": 9216}
+                        "version": 1, "pair": [1, 2], "expiry_height": 9216}
             (work / "payment.json").write_text(json.dumps(manifest))
             with self.assertRaisesRegex(ValueError, "not in this member"):
                 bob.review_payment(vault, attempt)
@@ -314,7 +433,8 @@ class MemberWalletTest(unittest.TestCase):
                     alice.review_payment(vault, attempt)
                 self.assertEqual(command.call_count, 1)
 
-    def payment_fixture(self, temp, slot=1, phase="published", pair=(1, 2), txid=None):
+    def payment_fixture(self, temp, slot=1, phase="published", pair=(1, 2), txid=None,
+                        threshold=2, members=3):
         vault, attempt = "a" * 64, "b" * 64
         wallet = Wallet(Path(temp) / f"member-{slot}", Path(temp) / "exchange")
         self.addCleanup(wallet.close)
@@ -325,12 +445,14 @@ class MemberWalletTest(unittest.TestCase):
         (work / "mailbox").mkdir(parents=True)
         (member / "membership.json").write_text(json.dumps({
             "vault": vault, "profile": f"member-{slot}", "slot": slot,
-            "threshold": 2, "members": 3}))
+            "threshold": threshold, "members": members}))
         (member / "roster.json").write_text("{}")
         (member / "final-backup-checked").write_text("checked")
         (work / "payment.json").write_text(json.dumps({
             "vault": vault, "attempt": attempt, "payment": "e" * 64,
-            "pair": list(pair), "expiry_height": 9216}))
+            "version": 1 if threshold == 2 else 2,
+            **({"pair": list(pair)} if threshold == 2 else {"signers": list(pair)}),
+            "expiry_height": 9216}))
         if phase:
             wallet.payment_status(work, phase, txid)
         return wallet, vault, attempt
@@ -669,7 +791,7 @@ class MemberWalletTest(unittest.TestCase):
                     if reorged: raise ValueError(missing)
                     return f"verified mined txid={'e' * 64} confirmations=3 amount=40000000 block={block} height=105"
                 if action == "chain-check":
-                    self.assertEqual(args, (105, block))
+                    self.assertEqual(args, (wallet.network, 105, block))
                     if reorged: raise ValueError("mined block is no longer on the chain")
                     return "chain-check=ok height=105"
                 raise AssertionError(action)
@@ -748,7 +870,7 @@ class MemberWalletTest(unittest.TestCase):
                         "vault": vault, "payment": "b" * 64, "attempt": format(len(chosen), "064x"),
                         "amount_zat": int(amount), "fee_zat": 10000, "change_zat": 59990000,
                         "expiry_height": 9216,
-                        "pair": [ord(letter) - ord("A") + 1 for letter in pair]}))
+                        "version": 1, "pair": [ord(letter) - ord("A") + 1 for letter in pair]}))
                     chosen.append(pair)
                     return "payment created"
 
@@ -758,6 +880,42 @@ class MemberWalletTest(unittest.TestCase):
                     self.assertIn(slot, draft["pair"])
                     wallet.prepare_payment(vault, "uregtest1recipient", "40000000", "memo", "BC")
                 self.assertEqual(chosen, [expected, "BC"])
+
+    def test_three_of_four_payment_uses_exact_selected_triple(self):
+        with tempfile.TemporaryDirectory(prefix="loki-triple-payment-") as temp:
+            wallet, vault, _ = self.payment_fixture(temp, slot=4, phase=None, pair=(1, 2, 4),
+                                                     threshold=3, members=4)
+            chosen = []
+
+            def prepare(_action, _member, _pass, _roster, work, _recipient, amount, _memo, signers,
+                        **_kwargs):
+                chosen.append(signers)
+                (work / "payment.json").write_text(json.dumps({
+                    "version": 2, "vault": vault, "payment": "c" * 64,
+                    "attempt": format(len(chosen), "064x"), "amount_zat": int(amount),
+                    "fee_zat": 10000, "change_zat": 59990000, "expiry_height": 9216,
+                    "signers": [ord(letter) - ord("A") + 1 for letter in signers]}))
+                return "payment created"
+
+            with patch.object(wallet, "command", side_effect=prepare):
+                for signers in ("ABC", "ABD", "ACD", "BCD"):
+                    draft = wallet.prepare_payment(vault, "uregtest1recipient", "40000000", "memo", signers)
+                    self.assertEqual(draft["signers"], [ord(letter) - ord("A") + 1 for letter in signers])
+                with self.assertRaisesRegex(ValueError, "Choose 3 members"):
+                    wallet.prepare_payment(vault, "uregtest1recipient", "40000000", "memo", "AB")
+            self.assertEqual(chosen, ["ABC", "ABD", "ACD", "BCD"])
+
+    def test_three_of_four_rejects_pair_manifest(self):
+        with tempfile.TemporaryDirectory(prefix="loki-triple-manifest-") as temp:
+            wallet, vault, attempt = self.payment_fixture(temp, threshold=3, members=4,
+                                                            pair=(1, 2, 3))
+            work = wallet.data / "vaults" / vault / "payments" / attempt
+            value = json.loads((work / "payment.json").read_text())
+            value["version"] = 1
+            value["pair"] = value.pop("signers")[:2]
+            (work / "payment.json").write_text(json.dumps(value))
+            with self.assertRaisesRegex(ValueError, "signer format differs"):
+                wallet.payment(vault, attempt)
 
     def test_four_member_vault_reaches_one_address_after_every_backup(self):
         if not SETUP.is_file():
@@ -1094,7 +1252,7 @@ class MemberWalletTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="loki-profile-") as temp, \
                 patch.dict(os.environ, {"CARGO_TARGET_DIR": temp}, clear=False):
             os.environ.pop("LOKI_POC_BIN_PROFILE", None)
-            release = Path(temp) / "release"
+            release = Path(temp).resolve() / "release"
             release.mkdir()
             self.assertEqual(member_app.binary_profile(), "debug")
             for name in member_app.BINARIES[:-1]:
@@ -1112,6 +1270,21 @@ class MemberWalletTest(unittest.TestCase):
             self.addCleanup(wallet.close)
             with self.assertRaisesRegex(ValueError, "Build loki_setup_member: .*--release"):
                 wallet.command("profile-open")
+
+    def test_lock_stops_both_background_workers_together(self):
+        with tempfile.TemporaryDirectory() as temp:
+            wallet = Wallet(Path(temp) / "member", Path(temp) / "exchange")
+            self.addCleanup(wallet.close)
+            wallet.profile_data = {"id": "alice"}
+            wallet.passphrase = "test passphrase"
+            both_stopping = threading.Barrier(2)
+
+            def stop():
+                both_stopping.wait(timeout=1)
+
+            with patch.object(wallet, "hosted", type("Hosted", (), {"stop": staticmethod(stop)})()), \
+                 patch.object(wallet.payment_worker, "stop", side_effect=stop):
+                self.assertEqual(wallet.lock_profile(), {"locked": True})
 
     def test_rejects_exchange_inside_private_root(self):
         with tempfile.TemporaryDirectory() as temp:

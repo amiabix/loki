@@ -41,6 +41,63 @@ fn same_claim_is_retrievable_after_first_claim_window_and_reopen() {
     }
 }
 #[test]
+fn three_members_resume_checkpoints_days_apart_after_claiming() {
+    let db = OwnedDb::new();
+    let grant = grant(1, 24);
+    let start = 100;
+    let ceremony = [79; 32];
+    let mut store = db.open();
+    store
+        .apply(&create(1, ceremony, 3, &grant), Some(&grant), start)
+        .unwrap();
+    for slot in 2..=3 {
+        store
+            .apply(
+                &claim(slot as u8, ceremony, slot, slot as u8),
+                Some(&[slot as u8; 32]),
+                start + 60,
+            )
+            .unwrap();
+    }
+    drop(store);
+
+    for (slot, day) in [(1, 1), (2, 3), (3, 5)] {
+        let mut store = db.open();
+        let checkpoint = request(
+            slot as u8 + 3,
+            &identity(slot, slot as u8),
+            AdmissionCommand::Checkpoint {
+                ceremony,
+                slot,
+                generation: 1,
+                predecessor: [0; 32],
+                checkpoint: [slot as u8; 32],
+            },
+        );
+        let at = start + day * 86400;
+        let saved = store.apply(&checkpoint, None, at).unwrap();
+        drop(store);
+        let mut store = db.open();
+        assert_eq!(store.apply(&checkpoint, None, at + 1).unwrap(), saved);
+    }
+    let mut store = db.open();
+    let late = request(
+        9,
+        &identity(1, 1),
+        AdmissionCommand::Checkpoint {
+            ceremony,
+            slot: 1,
+            generation: 2,
+            predecessor: [1; 32],
+            checkpoint: [9; 32],
+        },
+    );
+    assert_eq!(
+        store.apply(&late, None, start + 30 * 86400).unwrap_err(),
+        AdmissionError::Expired
+    );
+}
+#[test]
 fn scoped_creation_budget_consumption_is_durable() {
     let db = OwnedDb::new();
     let mut store = db.open();

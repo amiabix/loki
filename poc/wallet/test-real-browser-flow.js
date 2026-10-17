@@ -64,6 +64,7 @@ async function setup(browser, config) {
       await row.getByRole('button', {name: 'Show code'}).click();
       const code = await row.locator('.invite-code').textContent();
       const page = members[i].page;
+      await page.getByText('Join a vault', {exact: true}).click();
       await page.locator('#join textarea[name=invite]').fill(code.trim());
       await page.locator('#join button').click();
     }
@@ -211,7 +212,7 @@ async function payment(browser, config) {
       await page.waitForFunction(() => {
         const status = document.querySelector('#payment-list').textContent;
         return status.includes('your approval reached the relays')
-          || status.includes('two approvals verified; ready to send');
+          || status.includes('2 approvals verified; ready to send');
       }, null, {timeout: 180000});
     }
     assert.equal(new Set(reviewedRecipients).size, 1, 'the two signers reviewed different recipients');

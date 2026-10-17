@@ -280,7 +280,7 @@ fn field<'a, const N: usize>(f: &mut impl Iterator<Item = &'a str>) -> Option<[u
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::scan::scan_blocks;
+    use crate::scan::{scan_birth_blocks, scan_blocks};
     use orchard::{
         keys::{Scope, SpendingKey},
         note::{ExtractedNoteCommitment, RandomSeed, Rho},
@@ -368,6 +368,57 @@ pub(crate) mod tests {
             chain[i]["hash"] = serde_json::json!(format!("{:064x}", i + 101));
             chain[i]["previousblockhash"] =
                 serde_json::json!(format!("{:064x}", if i == from { i } else { i + 100 }));
+        }
+    }
+
+    #[test]
+    fn birth_checkpoint_scans_only_later_blocks_and_keeps_real_positions() {
+        use incrementalmerkletree::frontier::CommitmentTree;
+        use orchard::tree::MerkleHashOrchard;
+        use zcash_primitives::merkle_tree::write_commitment_tree;
+
+        let vault = a_fvk(3);
+        let decoy = a_fvk(9);
+        let chain = canned_chain(&vault, &decoy);
+        let mut checkpoint = CommitmentTree::<MerkleHashOrchard, 32>::empty();
+        for action in chain[1]["tx"][0]["ironwood"]["actions"].as_array().unwrap() {
+            let cmx = crate::scan::hex32(action, "cmx").unwrap();
+            let note = ExtractedNoteCommitment::from_bytes(&cmx)
+                .into_option()
+                .unwrap();
+            checkpoint
+                .append(MerkleHashOrchard::from_cmx(&note))
+                .unwrap();
+        }
+        let mut encoded = Vec::new();
+        write_commitment_tree(&checkpoint, &mut encoded).unwrap();
+        let scanned = scan_birth_blocks(
+            &vault,
+            &encoded,
+            crate::scan::hex32(&chain[1], "hash").unwrap(),
+            3,
+            6,
+            |height| Ok(chain[height as usize - 1].clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            scanned.notes.iter().map(|n| n.position).collect::<Vec<_>>(),
+            vec![3, 5]
+        );
+        for note in &scanned.notes {
+            assert_eq!(
+                scanned
+                    .witnesses
+                    .path(note.position)
+                    .unwrap()
+                    .root(
+                        ExtractedNoteCommitment::from_bytes(&note.cmx)
+                            .into_option()
+                            .unwrap()
+                    )
+                    .to_bytes(),
+                scanned.witnesses.root()
+            );
         }
     }
 

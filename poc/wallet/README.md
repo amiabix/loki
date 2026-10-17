@@ -1,4 +1,41 @@
-# Member setup app
+# Member app
+
+## Public Testnet UI
+
+The same member app can create a Testnet vault, check backups, receive, review,
+approve, and send. Start one process per member, with a separate private data
+directory and browser window. Balance and payment actions need a synced NU7
+Zcash Testnet node on loopback. Local courier creation also requires that node
+to choose the vault's birth block; hosted creation uses the fixed NU7 activation
+block. The node's RPC cookie must be an owner-only file.
+
+```sh
+cd poc
+cargo build --locked --bins --features relay-communication
+export LOKI_TESTNET_RPC=127.0.0.1:18232
+export LOKI_TESTNET_COOKIE_FILE=/path/to/your/testnet-rpc.cookie
+python3 wallet/member_app.py --network testnet \
+  --data /path/to/member-1 --exchange /path/to/setup-courier --port 8801
+```
+
+Open the private signer URL printed by the app. Create or unlock your profile,
+create a vault, and share each member's invite. Every member compares the roster
+fingerprint out of band and checks their final recovery card before anyone
+deposits. Use a Testnet wallet able to send to the Ironwood pool for funding;
+there is no Testnet faucet button. Each member connects the payment relays in
+their own app before proposing or approving. A dashboard is optional: pass
+`--dashboard-port 8901` to this same command if you want one. It does not sign.
+
+For members on separate machines, each app needs its own local Testnet node or
+loopback RPC tunnel. The local setup courier needs a verified HTTPS front and
+`--invite-port` plus `--invite-origin` on the creator's app, as described below.
+Hosted setup also accepts `--network testnet` with the signed operator bundle
+and enrollment issuer described below. Its certified roster uses the NU7
+activation block (4,465,026) as the scan start for every member. This is safe
+for deposits but can make the first scan slow. A hosted Testnet payment through
+the browser has not yet been mined end to end; use disposable test funds.
+
+## Local regtest
 
 This is the first member-owned regtest path. Run one app process per person, each
 with its own `--data` directory. The shared `--exchange` directory carries only
@@ -146,6 +183,40 @@ block height. Set `LOKI_RPC=host:port` when starting each app if the local node
 is not on the default `127.0.0.1:18232`. **Refresh balance** only scans the chain;
 the local **Fund Vault** action uses the separate THS faucet described below.
 
+## Emergency recovery and exit (regtest beta)
+
+Two members who each saved a **final** `loki-vault.card` and their 24 words can
+spend without the old devices, old unlock passphrases, setup courier, or payment
+relays. Use one trusted recovery computer together. Each member enters their
+own words and chooses a new local unlock passphrase; each checks and approves
+the full transaction review independently. The tool erases its temporary
+restored stores when it exits normally.
+
+To replace a departing member, first create a **new** 2-of-3 vault in the
+member app with the continuing members, complete its backup checks, and copy
+its receive address. Then run:
+
+```sh
+cd poc
+cargo build --locked --bins
+python3 wallet/recovery_tool.py --rpc 127.0.0.1:18232
+```
+
+Enter each member's final card **file** and 24 words when prompted, then the
+new vault's receive address. The tool restores both members, scans the regtest
+chain, creates a sweep of all currently unspent source notes, displays the
+Rust signer's exact review to each member, and broadcasts only after both
+approve. Check the transaction ID and the new vault's balance after it is
+mined. A relay outage does not affect this path; a reachable regtest node is
+still required. No old passphrase or developer-run Rust command is needed.
+The new vault must have a different address. Compare the displayed recipient
+with the new vault's address before either member approves.
+
+The current payment manifest supports at most eight source notes. If the
+source vault has more, the tool stops before signing. See
+[Step 4 status](../../STEP4-STATUS.md) for the live regtest evidence still
+needed before this is considered a verified release journey.
+
 The server binds to loopback and uses a private URL token. The passphrase unlocks
 the sealed profile and stays in this process's memory until Lock or shutdown; it
 is not saved as plaintext in the member directory. The profile ID is local and
@@ -156,15 +227,15 @@ If used, the account-control proof is verified locally and kept in the member's 
 store. It is not part of the group certificate, so other members do not learn a
 reusable account key. The ordinary wallet seed does not recover a Loki FROST
 share; the Loki 24 words and backup card are still required.
-The app can create 2-of-3 or 2-of-4 regtest vaults. The policy is included in
-the new roster fingerprint; old 2-of-3 roster files retain their original
-fingerprint. A four-member source vault completed a mined payment with members
-3 and 4 signing and member 2 finishing through `run-member-payment.py
---members 4 --pair CD --finisher 2`. This is the local courier test path; the
-relay adapter remains three-member-only. The 2-of-4 vault can show its balance
-when funded through the CLI test path, but the app hides its receive address
-and payment controls to avoid deposits it cannot spend. For a 2-of-3 vault, the private member
-app has controls for a fixed signing pair: create a local payment draft, send
+The app offers 2-of-3, 2-of-4, and 3-of-4 vaults. The selected policy is
+included in the roster fingerprint; an existing vault's policy does not change.
+The payment form selects the exact members who will sign this attempt. A different
+signer set requires a new attempt and new signing nonces. A 3-of-4 local regtest
+payment was mined with members 1, 2, and 3 signing and member 4 finishing;
+the recipient independently decrypted it. Member 1 restored from the final card
+and words before signing. The separate member app relay journey also mined a
+3-of-4 payment and checked that restored old nonce state could not approve again.
+The private member app can create a local payment draft, send
 the proposal, publish commitments, build the package, review the transaction,
 approve that exact review, prove and broadcast, then verify it on chain. The
 review panel uses the Rust signer's verified transaction fields, not the
@@ -185,7 +256,7 @@ mined in is still on the chain, and the full verify runs again only after a reor
 an approval, **Retry saved signing messages** republishes the same sealed share;
 it never creates another signature share.
 
-The dashboard offers **Fund Vault** beside each eligible 2-of-3 vault. Each new
+The dashboard offers **Fund Vault** beside each eligible local regtest vault. Each new
 click requests exactly 5 local test ZEC from the THS address faucet, then waits
 for a confirmed transaction. Dashboard access includes this incoming test-fund
 action; it cannot authorize spending from the vault. Set `LOKI_THS_INSTANCE` to
@@ -211,7 +282,7 @@ Each running member app automatically provisions its own inboxes and exchanges
 recipient-encrypted configurations through the shared courier. Locked apps
 wait until their owners unlock them; no additional relay setup click is needed.
 A vault connects after its final backup is checked, and each vault row shows
-connection progress. Shared-courier 2-of-3 and 2-of-4 vaults support this development flow.
+connection progress. Shared-courier 2-of-3, 2-of-4, and 3-of-4 vaults use this development flow.
 Payment review and approval still happen separately in each private signer.
 
 Saved relay roots, identities, operator access files, and encrypted couriers live
@@ -268,9 +339,11 @@ npm ci --prefix poc/g3
 LOKI_THS_INSTANCE=loki-app-flow python3 poc/wallet/test_real_browser_flow.py -v
 ```
 
-Each browser controls a different private app process. The browser test checks
-the backup gate, relay connection, both transaction review panels, two approvals,
-the third member's Send action, and confirmation in all three windows. Members
+Each browser controls a different private app process. The setup courier uses
+verified HTTPS; the companion HTTPS join test checks wrong-hostname refusal.
+The browser test checks the backup gate, relay connection, both transaction
+review panels, two approvals, the third member's Send action, and confirmation
+in all three windows. Members
 discover the mined txid from its input nullifiers and then verify its exact
 approved effects; confirmation does not depend on the finisher announcing a txid.
 Each member keeps a sealed scan cache (`chain/scan.sealed`, keyed by the vault's
@@ -321,9 +394,14 @@ Select hosted transport explicitly when starting the signer:
 python3 wallet/member_app.py --data /PRIVATE/NEW/MEMBER --exchange /PRIVATE/LOCAL/PLACEHOLDER --port 18801 --transport hosted --operator-bundle /PRIVATE/operators.cbor --operator-key TRUSTED_CONFIG_SIGNING_KEY_HEX --enrollment-issuer /PRIVATE/configured-issuer
 ```
 
+Add `--network testnet` for a hosted Testnet vault, and use it on every member's
+app. Each member still supplies their own loopback Testnet RPC settings for
+balance and payment actions. A wrong-network invitation is refused before the
+member's identity or claim is saved.
+
 The exchange placeholder is retained for compatibility with local startup arguments; hosted vault creation and payment handoff do not use a shared courier. Supply a scoped `--enrollment-grant` only when it belongs to the saved pending creator identity. A configured issuer receives the public creator key, selected policy and operator bundle path and returns the signed bounded grant on stdout. The product's production authentication/enrollment provider remains a deployment decision. Operator capabilities and issuer private keys stay off the signer. Development loopback requires explicit `--development-http`; production verifies HTTPS and the signed bundle.
 
-Both 2-of-3 and 2-of-4 policies use invitations delivered privately to the respective members, explicit fingerprint comparison and backup checks. While unlocked, the native worker resumes the saved setup, registers scoped inboxes, installs all certified peer configurations and reconciles every signed activation vote. There is no additional per-vault relay approval. Lock stops the worker, terminates its native command and revokes dashboard sessions. A retry keeps the saved identity, exact requests, encrypted DKG state and payment descriptors. Creating again with the same pending name and policy reopens that setup; choose a distinct name for another vault.
+All three supported policies use invitations delivered privately to the respective members, explicit fingerprint comparison and backup checks. Start every member with the same network; a mismatched invitation is refused. While unlocked, the native worker resumes the saved setup, registers scoped inboxes, installs all certified peer configurations and reconciles every signed activation vote. There is no additional per-vault relay approval. Lock stops the worker, terminates its native command and revokes dashboard sessions. A retry keeps the saved identity, exact requests, encrypted DKG state and payment descriptors. Creating again with the same pending name and policy reopens that setup; choose a distinct name for another vault.
 
 Pending member slots appear beside the vault, separately from connection failures. Receiving and payment controls remain gated on checked backups and native payment activation. The dashboard receives public progress only and cannot retrieve keys, DKG packages, recovery words or capabilities. Hosted mode hides local relay-server setup and the local 5-ZEC faucet. Existing local vaults and their saved data retain the local path; there is no automatic migration or relay rotation.
 

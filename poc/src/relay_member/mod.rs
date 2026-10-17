@@ -1,4 +1,4 @@
-use crate::{setup_transport::Identity, zip2005};
+use crate::{member_state, network::VaultNetwork, setup_transport::Identity, zip2005};
 use chacha20poly1305::{
     aead::{Aead, Payload},
     KeyInit, XChaCha20Poly1305, XNonce,
@@ -24,6 +24,7 @@ const SEAL_HEADER: usize = 49;
 pub struct LoadedMember {
     pub identity: CommIdentity,
     pub roster: Roster,
+    pub threshold: u16,
 }
 pub type MemberResult<T> = Result<T, MemberError>;
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -230,15 +231,10 @@ fn hex32(value: &Value) -> MemberResult<[u8; 32]> {
     Ok(bytes)
 }
 fn roster(value: &Value) -> MemberResult<Roster> {
-    if value
-        .get("threshold")
-        .is_some_and(|threshold| threshold.as_u64() != Some(2))
-    {
-        return Err(MemberError::Roster);
-    }
     let vault = hex32(&value["vault"])?;
     let entries = value["members"].as_array().ok_or(MemberError::Roster)?;
-    if !matches!(entries.len(), 3 | 4) {
+    let threshold = value.get("threshold").map(Value::as_u64).unwrap_or(Some(2));
+    if !matches!((threshold, entries.len()), (Some(2), 3) | (Some(2), 4) | (Some(3), 4)) {
         return Err(MemberError::Roster);
     }
     let mut members = Vec::with_capacity(entries.len());
@@ -260,28 +256,6 @@ fn roster(value: &Value) -> MemberResult<Roster> {
     }
     Ok(Roster { vault, members })
 }
-fn fingerprint(roster: &Roster, policy: bool) -> [u8; 32] {
-    let mut h = blake2b_simd::Params::new()
-        .hash_length(32)
-        .personal(if policy {
-            b"Loki_roster_v2"
-        } else {
-            b"Loki_roster_v1"
-        })
-        .to_state();
-    h.update(&roster.vault);
-    if policy {
-        h.update(&2u16.to_be_bytes());
-        h.update(&(roster.members.len() as u16).to_be_bytes());
-    }
-    for m in &roster.members {
-        h.update(&m.id.to_be_bytes());
-        h.update(&m.signing);
-        h.update(&m.encryption);
-    }
-    h.finalize().as_bytes().try_into().unwrap()
-}
-
 pub fn load(root: &Path, pass_file: &Path, roster_path: &Path) -> MemberResult<LoadedMember> {
     member_root(root)?;
     private_directory(&root.join("secrets"))?;
@@ -306,7 +280,9 @@ pub fn load(root: &Path, pass_file: &Path, roster_path: &Path) -> MemberResult<L
     let state_bytes = sealed(&root.join("secrets/vault.sealed"), &pass)?;
     let state = json(&state_bytes)?;
     if state.0["version"].as_u64() != Some(2)
-        || state.0["network"].as_str() != Some("regtest")
+        || state.0["network"]
+            .as_str()
+            .is_none_or(|value| VaultNetwork::parse(value).is_err())
         || state.0["key_derivation"].as_str() != Some(zip2005::VERSION)
     {
         return Err(MemberError::Markers);
@@ -325,15 +301,29 @@ pub fn load(root: &Path, pass_file: &Path, roster_path: &Path) -> MemberResult<L
     let roster_bytes = bounded_read(roster_path, MAX_JSON, false)?;
     let parsed_roster = json(&roster_bytes)?;
     let roster = roster(&parsed_roster.0)?;
+    let certified =
+        member_state::Roster::from_bytes(&roster_bytes).map_err(|_| MemberError::Roster)?;
+    if state.0["network"].as_str() != Some(certified.network.label())
+        || state.0.get("birth_height").and_then(Value::as_u64)
+            != certified.birth_height.map(u64::from)
+        || !matches!((certified.threshold, certified.members.len()), (2, 3) | (2, 4) | (3, 4))
+        || certified.vault != roster.vault
+        || certified.members.len() != roster.members.len()
+        || roster.members.iter().any(|member| {
+            certified.members.get(&member.id).is_none_or(|saved| {
+                saved.signing != member.signing || saved.encryption != member.encryption
+            })
+        })
+    {
+        return Err(MemberError::Roster);
+    }
     if hex32(&state.0["vault"])? != roster.vault {
         return Err(MemberError::Vault);
     }
-    if hex32(&state.0["roster_fingerprint"])?
-        != fingerprint(&roster, parsed_roster.0.get("threshold").is_some())
-    {
+    if hex32(&state.0["roster_fingerprint"])? != certified.fingerprint() {
         return Err(MemberError::Fingerprint);
     }
-    if state.0.get("threshold").is_some_and(|value| value.as_u64() != Some(2))
+    if state.0.get("threshold").map(Value::as_u64).unwrap_or(Some(2)) != Some(u64::from(certified.threshold))
         || state.0.get("members").is_some_and(|value| value.as_u64() != Some(roster.members.len() as u64))
     {
         return Err(MemberError::Roster);
@@ -352,7 +342,7 @@ pub fn load(root: &Path, pass_file: &Path, roster_path: &Path) -> MemberResult<L
         return Err(MemberError::Identity);
     }
     roster_digest(&roster).map_err(|_| MemberError::Roster)?;
-    Ok(LoadedMember { identity, roster })
+    Ok(LoadedMember { identity, roster, threshold: certified.threshold })
 }
 
 pub mod config;

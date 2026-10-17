@@ -91,7 +91,8 @@ class HostedSetup:
             self.poke(key.name)
 
     def poke(self, name):
-        self.schedule.setdefault(name, {"due": 0.0})["due"] = 0.0
+        with self.meta_lock:
+            self.schedule.setdefault(name, {"due": 0.0})["due"] = 0.0
         self.wake.set()
 
     def user_pending(self, root):
@@ -166,7 +167,7 @@ class HostedSetup:
 
     def _service_call(self, action, root, args, private, words):
         """Run an allowed setup command in the member service, restarting it (with the
-        passphrase this app still holds) after it died or timed out."""
+        passphrase this app still holds) after it died."""
         with self.service_lock:
             if self.stop_event.is_set():
                 raise ValueError("Signer is locked")
@@ -216,7 +217,8 @@ class HostedSetup:
         if stopping is not None:
             stopping.join(timeout=member_service.STOP_SECONDS + 1)
         self.information.clear()
-        self.schedule.clear()
+        with self.meta_lock:
+            self.schedule.clear()
 
     def run(self):
         """Step each saved setup on its own timer, at most two vaults at a time."""
@@ -240,11 +242,14 @@ class HostedSetup:
                 for folder in folders:
                     if len(running) >= 2 or self.stop_event.is_set():
                         break
-                    entry = self.schedule.setdefault(folder.name, {"due": 0.0})
-                    if folder.name in running or entry["due"] > now or self.user_pending(folder):
+                    with self.meta_lock:
+                        due_at = self.schedule.setdefault(folder.name, {"due": 0.0})["due"]
+                    if folder.name in running or due_at > now or self.user_pending(folder):
                         continue
                     running[folder.name] = pool.submit(self._background_step, folder, profile)
-                due = [self.schedule[name]["due"] for name in self.schedule
+                with self.meta_lock:
+                    due = [(name, entry["due"]) for name, entry in self.schedule.items()]
+                due = [when for name, when in due
                        if name not in running and (self.wallet.data / "vaults" / name).exists()]
                 wait = min([0.25, *(max(0.0, value - time.monotonic()) for value in due)])
                 self.wake.wait(max(wait, 0.01) if running or due else 0.25)
@@ -267,28 +272,29 @@ class HostedSetup:
         """The Finding 3 cadence: immediate after progress, short backoff while peers work,
         5 s while this member's own action is pending, and 2 → 30 s after errors."""
         kind, _ = outcome
-        entry = self.schedule.setdefault(name, {"due": 0.0})
-        now = time.monotonic()
-        if kind == "error":
-            entry["error"] = min(30.0, entry.get("error", 1.0) * 2)
-            entry["due"] = now + entry["error"]
-            return
-        entry.pop("error", None)
-        if kind == "progress" and entry.get("burst", 0) < 20:
-            entry["burst"] = entry.get("burst", 0) + 1
-            entry["idle"] = 0.125
-            entry["due"] = now
-            return
-        entry["burst"] = 0
-        if kind == "busy":
-            entry["due"] = now + 0.1
-        elif kind == "human":
-            entry["due"] = now + 5
-        elif kind in ("skip", "ready"):
-            entry["due"] = now + 5
-        else:
-            entry["idle"] = min(2.0, entry.get("idle", 0.125) * 2) if kind == "idle" else 0.25
-            entry["due"] = now + entry["idle"]
+        with self.meta_lock:
+            entry = self.schedule.setdefault(name, {"due": 0.0})
+            now = time.monotonic()
+            if kind == "error":
+                entry["error"] = min(30.0, entry.get("error", 1.0) * 2)
+                entry["due"] = now + entry["error"]
+                return
+            entry.pop("error", None)
+            if kind == "progress" and entry.get("burst", 0) < 20:
+                entry["burst"] = entry.get("burst", 0) + 1
+                entry["idle"] = 0.125
+                entry["due"] = now
+                return
+            entry["burst"] = 0
+            if kind == "busy":
+                entry["due"] = now + 0.1
+            elif kind == "human":
+                entry["due"] = now + 5
+            elif kind in ("skip", "ready"):
+                entry["due"] = now + 5
+            else:
+                entry["idle"] = min(2.0, entry.get("idle", 0.125) * 2) if kind == "idle" else 0.25
+                entry["due"] = now + entry["idle"]
 
     def step_folder(self, folder, profile, classify=False):
         """Advance one saved setup by one native step.
@@ -350,10 +356,20 @@ class HostedSetup:
         return "Connection interrupted. Your saved setup will retry while unlocked."
 
     def _configuration_args(self):
-        return [self.bundle, "--operator-key", self.key, *(["--development-http"] if self.development else [])]
+        return [self.bundle, "--operator-key", self.key,
+                *(["--network", "testnet"] if self.wallet.network == "testnet" else []),
+                *(["--development-http"] if self.development else [])]
 
-    def _attach(self, folder, name):
+    def _attach(self, folder, name, expected_policy=None):
         info = json.loads(self.native("setup-info", folder))
+        policy = (info.get("threshold"), info.get("member_count"))
+        if policy not in ((2, 3), (2, 4), (3, 4)) or (expected_policy and policy != expected_policy):
+            raise ValueError("Native setup policy differs from the requested vault")
+        if info.get("network") != self.wallet.network:
+            raise ValueError("Hosted vault belongs to another network")
+        if self.wallet.network == "testnet" and (type(info.get("birth_height")) is not int
+                                                 or info["birth_height"] < 4_465_026):
+            raise ValueError("Hosted Testnet vault has no valid birth height")
         vault = info["vault"]
         target = self.wallet.data / "vaults" / vault
         if target.exists() and target != folder:
@@ -361,9 +377,12 @@ class HostedSetup:
         membership = folder / "membership.json"
         value = {"vault": vault, "slot": info["own_slot"], "name": name,
                  "profile": self.wallet.require_profile()["id"], "members": info["member_count"],
-                 "threshold": 2, "transport": "hosted"}
+                 "threshold": info["threshold"], "transport": "hosted", "network": self.wallet.network}
+        if self.wallet.network == "testnet":
+            value["birth_height"] = info["birth_height"]
         if membership.exists():
-            if json.loads(membership.read_text()) != value:
+            saved = json.loads(membership.read_text())
+            if {**saved, "network": saved.get("network", "regtest")} != value:
                 raise ValueError("Saved hosted membership differs from native setup")
         else:
             self._write(membership, json.dumps(value).encode())
@@ -382,6 +401,8 @@ class HostedSetup:
         root = self.wallet.data / "vaults"
         root.mkdir(mode=0o700, exist_ok=True)
         metadata = {"profile": self.wallet.require_profile()["id"], "name": name, "action": action, "binding": binding}
+        if self.wallet.network == "testnet":
+            metadata["network"] = "testnet"
         for folder in sorted(root.iterdir()):
             path = folder / "pending.json"
             if path.is_file() and json.loads(path.read_text()) == metadata:
@@ -397,7 +418,7 @@ class HostedSetup:
         return folder
 
     def create(self, policy, name):
-        if policy not in ("2-of-3", "2-of-4") or not isinstance(name, str) or not 1 <= len(name.strip().encode()) <= 80:
+        if policy not in ("2-of-3", "2-of-4", "3-of-4") or not isinstance(name, str) or not 1 <= len(name.strip().encode()) <= 80:
             raise ValueError("Choose a supported policy and a vault name")
         if not self.issuer and (not self.enrollment or not self.enrollment.is_file()):
             raise ValueError("A scoped enrollment grant or configured issuer is required")
@@ -407,7 +428,7 @@ class HostedSetup:
                 self.native("identity", folder, 1)
             if (folder / "secrets" / "hosted-context.sealed").is_file():
                 self.native("setup-step", folder)
-                return self._attach(folder, name.strip())
+                return self._attach(folder, name.strip(), tuple(map(int, policy.split("-of-"))))
             grant = self.enrollment
             if self.issuer:
                 identity = json.loads(self.native("identity-public", folder))
@@ -417,15 +438,16 @@ class HostedSetup:
                 if result.returncode or not 1 <= len(result.stdout) <= 4096:
                     raise ValueError("Enrollment is unavailable; the saved identity is retained")
                 raw = result.stdout
-                if (folder / "secrets" / "hosted-context.sealed").is_file():
-                    self.native("setup-step", folder)
-                else:
-                    self.native("setup-create", folder, self.bundle, "@private", policy,
-                                "--operator-key", self.key, *(["--development-http"] if self.development else []), private=raw)
+                self.native("setup-create", folder, self.bundle, "@private", policy,
+                            "--operator-key", self.key,
+                            *(["--network", "testnet"] if self.wallet.network == "testnet" else []),
+                            *(["--development-http"] if self.development else []), private=raw)
             else:
                 self.native("setup-create", folder, self.bundle, grant, policy,
-                            "--operator-key", self.key, *(["--development-http"] if self.development else []))
-            return self._attach(folder, name.strip())
+                            "--operator-key", self.key,
+                            *(["--network", "testnet"] if self.wallet.network == "testnet" else []),
+                            *(["--development-http"] if self.development else []))
+            return self._attach(folder, name.strip(), tuple(map(int, policy.split("-of-"))))
 
     def join(self, invite):
         if not isinstance(invite, str) or not invite.startswith("loki-hosted-v1:") or len(invite) > 8192:
@@ -497,8 +519,9 @@ class HostedSetup:
         confirmations = [{"slot": slot, "confirmed": all_agreed or (slot == local["slot"] and bool(native.get("agreed_fingerprint"))),
                           "matches": True} for slot in range(1, local["members"] + 1)]
         result = {"phase": ui_phase, "setup_phase": phase, "handoff": native.get("handoff", "pending"),
-                  "transport": "hosted", "network": "regtest", "name": local["name"], "vault": vault,
-                  "slot": local["slot"], "threshold": 2, "total_members": local["members"],
+                  "transport": "hosted", "network": local.get("network", "regtest"),
+                  "birth_height": local.get("birth_height"), "name": local["name"], "vault": vault,
+                  "slot": local["slot"], "threshold": local["threshold"], "total_members": local["members"],
                   "members": len(native.get("joined_slots", [])), "missing_slots": native.get("missing_slots", []),
                   "fingerprint": info.get("fingerprint"), "confirmations": confirmations, "profile": self.wallet.profile_data,
                   "error": self.errors.get(vault), "account_linked": False, "invites": [],

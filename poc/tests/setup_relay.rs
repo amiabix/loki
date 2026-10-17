@@ -108,8 +108,8 @@ fn wait_phase(setup: &mut HostedSetup, expected: &str) -> serde_json::Value {
     }
 }
 #[test]
-fn offline_creation_reopens_the_exact_saved_intent_for_both_policies() {
-    for count in [3u16, 4] {
+fn offline_creation_reopens_the_exact_saved_intent_for_each_policy() {
+    for (threshold, count) in [(2u16, 3u16), (2, 4), (3, 4)] {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
@@ -148,25 +148,27 @@ fn offline_creation_reopens_the_exact_saved_intent_for_both_policies() {
         .unwrap();
         let initial = sealed_files(member.path());
         assert!(
-            HostedSetup::create(member.path(), "pass", &bundle, &key, &grant, count, false)
+            HostedSetup::create_with_policy(member.path(), "pass", &bundle, &key, &grant, threshold, count, "regtest", false)
                 .is_err()
         );
-        assert!(HostedSetup::create(
+        assert!(HostedSetup::create_with_policy(
             member.path(),
             "pass",
             &bundle,
             &[55; 32],
             &grant,
+            threshold,
             count,
+            "regtest",
             true
         )
         .is_err());
         assert_eq!(sealed_files(member.path()), initial);
         let mut hosted =
-            HostedSetup::create(member.path(), "pass", &bundle, &key, &grant, count, true).unwrap();
+            HostedSetup::create_with_policy(member.path(), "pass", &bundle, &key, &grant, threshold, count, "regtest", true).unwrap();
         let status = hosted.step().unwrap();
         assert_eq!(status.public_json()["phase"], "admission_pending");
-        assert_eq!(status.public_json()["policy"], format!("2-of-{count}"));
+        assert_eq!(status.public_json()["policy"], format!("{threshold}-of-{count}"));
         let saved = sealed_files(member.path());
         assert!(saved.len() >= 2);
         drop(hosted);
@@ -196,7 +198,7 @@ fn offline_creation_reopens_the_exact_saved_intent_for_both_policies() {
             .arg(root.join("pass"))
             .arg(root.join("operators"))
             .arg(root.join("grant"))
-            .arg(format!("2-of-{count}"))
+            .arg(format!("{threshold}-of-{count}"))
             .arg("--operator-key")
             .arg(hex::encode(key))
             .arg("--development-http")
@@ -209,7 +211,7 @@ fn offline_creation_reopens_the_exact_saved_intent_for_both_policies() {
         );
         let public: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(public["phase"], "admission_pending");
-        assert_eq!(public["policy"], format!("2-of-{count}"));
+        assert_eq!(public["policy"], format!("{threshold}-of-{count}"));
         assert!(!String::from_utf8_lossy(&output.stdout).contains(&hex::encode(&grant)));
         assert_eq!(sealed_files(member.path()), saved);
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_loki_setup_member"))
@@ -240,7 +242,7 @@ fn offline_creation_reopens_the_exact_saved_intent_for_both_policies() {
         );
         let cached: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(cached["phase"], "admission_pending");
-        assert_eq!(cached["policy"], format!("2-of-{count}"));
+        assert_eq!(cached["policy"], format!("{threshold}-of-{count}"));
         assert_eq!(cached["agreed_fingerprint"], serde_json::Value::Null);
         assert_eq!(cached.as_object().unwrap().len(), 8);
         let mut tampered = cached.clone();
@@ -310,18 +312,27 @@ fn offline_creation_reopens_the_exact_saved_intent_for_both_policies() {
 mod hosted_services;
 #[test]
 fn owned_real_services_provision_creator_inboxes_and_save_invites_for_both_policies() {
-    run_owned_services_flow(OwnedFlow::Full);
+    run_owned_services_flow(OwnedFlow::Full, "regtest");
+}
+#[test]
+fn owned_testnet_setup_certifies_the_network_and_recovery_card() {
+    run_owned_services_flow(OwnedFlow::Full, "testnet");
+}
+#[test]
+fn staggered_testnet_members_resume_with_one_relay_offline() {
+    run_owned_services_flow(OwnedFlow::StaggeredOutage, "testnet");
 }
 #[test]
 fn owned_private_invitation_exports_for_both_policies() {
-    run_owned_services_flow(OwnedFlow::InviteExport);
+    run_owned_services_flow(OwnedFlow::InviteExport, "regtest");
 }
 #[test]
 fn owned_pending_abort_reconciles_admission_before_any_provisioning_for_both_policies() {
-    run_owned_services_flow(OwnedFlow::PendingAbort);
+    run_owned_services_flow(OwnedFlow::PendingAbort, "regtest");
 }
 enum OwnedFlow {
     Full,
+    StaggeredOutage,
     InviteExport,
     PendingAbort,
 }
@@ -400,14 +411,17 @@ fn drive_owned_cli(path: &Path, pass: &str) -> std::process::Output {
     }
     child.wait_with_output().unwrap()
 }
-fn run_owned_services_flow(mode: OwnedFlow) {
+fn run_owned_services_flow(mode: OwnedFlow, network: &str) {
     let mut services = hosted_services::HostedServices::start();
+    if matches!(mode, OwnedFlow::StaggeredOutage) {
+        services.stop_relay(0);
+    }
     if let Ok(relay) = std::env::var("LOKI_HOSTED_OFFLINE_RELAY") {
         let index: usize = relay.parse().unwrap();
         assert!((1..=3).contains(&index));
         services.stop_relay(index - 1);
     }
-    for count in [3u16, 4] {
+    for count in if network == "testnet" { vec![3] } else { vec![3, 4] } {
         if std::env::var("LOKI_HOSTED_MEMBERS")
             .ok()
             .is_some_and(|selected| selected != count.to_string())
@@ -448,7 +462,7 @@ fn run_owned_services_flow(mode: OwnedFlow) {
             Value::Bytes(signature.to_bytes().to_vec()),
         ]))
         .unwrap();
-        let mut setup = if matches!(mode, OwnedFlow::Full) {
+        let mut setup = if matches!(mode, OwnedFlow::Full | OwnedFlow::StaggeredOutage) {
             for (name, bytes) in [
                 ("create-pass", b"pass".as_slice()),
                 ("operators", services.bundle.as_slice()),
@@ -456,18 +470,19 @@ fn run_owned_services_flow(mode: OwnedFlow) {
             ] {
                 private_input(&member.path().join(name), bytes);
             }
-            let output = std::process::Command::new(env!("CARGO_BIN_EXE_loki_setup_member"))
-                .arg("setup-create")
+            let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_loki_setup_member"));
+            command.arg("setup-create")
                 .arg(member.path())
                 .arg(member.path().join("create-pass"))
                 .arg(member.path().join("operators"))
                 .arg(member.path().join("enrollment"))
                 .arg(format!("2-of-{count}"))
                 .arg("--operator-key")
-                .arg(hex::encode(services.config_key))
-                .arg("--development-http")
-                .output()
-                .unwrap();
+                .arg(hex::encode(services.config_key));
+            if network == "testnet" {
+                command.arg("--network").arg("testnet");
+            }
+            let output = command.arg("--development-http").output().unwrap();
             assert!(
                 output.status.success(),
                 "{}",
@@ -485,6 +500,7 @@ fn run_owned_services_flow(mode: OwnedFlow) {
                 &services.config_key,
                 &grant,
                 count,
+                network,
                 true,
             )
             .unwrap()
@@ -587,17 +603,27 @@ fn run_owned_services_flow(mode: OwnedFlow) {
             ] {
                 private_input(&peer.path().join(name), bytes);
             }
-            let output = std::process::Command::new(env!("CARGO_BIN_EXE_loki_setup_member"))
-                .arg("setup-join")
+            if network == "testnet" {
+                let wrong = MemberDir::create(&services.root, &format!("wrong-network-{slot}"))
+                    .unwrap();
+                assert!(HostedSetup::join(
+                    wrong.path(), "peer-pass", invitation, &services.bundle,
+                    &services.config_key, "regtest", true,
+                ).is_err());
+                assert!(!wrong.path().join("secrets/hosted-context.sealed").exists());
+            }
+            let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_loki_setup_member"));
+            command.arg("setup-join")
                 .arg(peer.path())
                 .arg(peer.path().join("join-pass"))
                 .arg(peer.path().join("invitation"))
                 .arg(peer.path().join("operators"))
                 .arg("--operator-key")
-                .arg(hex::encode(services.config_key))
-                .arg("--development-http")
-                .output()
-                .unwrap();
+                .arg(hex::encode(services.config_key));
+            if network == "testnet" {
+                command.arg("--network").arg("testnet");
+            }
+            let output = command.arg("--development-http").output().unwrap();
             assert!(
                 output.status.success(),
                 "{}",
@@ -734,6 +760,7 @@ fn run_owned_services_flow(mode: OwnedFlow) {
                     &forged,
                     &services.bundle,
                     &services.config_key,
+                    network,
                     true,
                 )
                 .unwrap();
@@ -874,6 +901,9 @@ fn run_owned_services_flow(mode: OwnedFlow) {
             assert!(!peer.roster_accepted().unwrap());
             peer.agree(fingerprint).unwrap();
             peer.step().unwrap();
+            if matches!(mode, OwnedFlow::StaggeredOutage) {
+                assert_eq!(sealed_files(member.path()), approved_files);
+            }
             if slot != count {
                 assert!(
                     !peer.roster_accepted().unwrap(),
@@ -894,7 +924,9 @@ fn run_owned_services_flow(mode: OwnedFlow) {
                 };
                 let mut peer =
                     HostedSetup::open(&path, if slot == 1 { "pass" } else { "peer-pass" }).unwrap();
-                if std::env::var_os("LOKI_HOSTED_KILL_PHASE").is_some() {
+                if std::env::var_os("LOKI_HOSTED_KILL_PHASE").is_some()
+                    || matches!(mode, OwnedFlow::StaggeredOutage)
+                {
                     drop(peer);
                     let output =
                         drive_owned_cli(&path, if slot == 1 { "pass" } else { "peer-pass" });
@@ -1061,7 +1093,9 @@ fn run_owned_services_flow(mode: OwnedFlow) {
                 };
                 let mut peer =
                     HostedSetup::open(&path, if slot == 1 { "pass" } else { "peer-pass" }).unwrap();
-                let public = if std::env::var_os("LOKI_HOSTED_KILL_PHASE").is_some() {
+                let public = if std::env::var_os("LOKI_HOSTED_KILL_PHASE").is_some()
+                    || matches!(mode, OwnedFlow::StaggeredOutage)
+                {
                     drop(peer);
                     let output =
                         drive_owned_cli(&path, if slot == 1 { "pass" } else { "peer-pass" });
@@ -1133,6 +1167,12 @@ fn run_owned_services_flow(mode: OwnedFlow) {
             );
             let evidence: serde_json::Value = serde_json::from_slice(&raw).unwrap();
             assert_eq!(evidence["recovery_version"], 2);
+            assert_eq!(evidence["state"]["network"], network);
+            if network == "testnet" {
+                assert_eq!(evidence["state"]["birth_height"], 4_465_026);
+                assert_eq!(evidence["roster"]["birth_height"], 4_465_026);
+                assert!(evidence["state"]["address"].as_str().unwrap().starts_with("utest"));
+            }
             assert_eq!(
                 evidence["receipts"].as_object().unwrap().len(),
                 count as usize
@@ -1148,6 +1188,23 @@ fn run_owned_services_flow(mode: OwnedFlow) {
             }
         }
         finish_owned_handoff(&mut services, count, &member, &backup_words, &group);
+        if matches!(mode, OwnedFlow::StaggeredOutage) {
+            let database = rusqlite::Connection::open(
+                member.path().join("setup-relay-store/setup.sqlite3"),
+            )
+            .unwrap();
+            let stored_relays: u64 = database
+                .query_row("SELECT count(DISTINCT pin) FROM stored", [], |row| row.get(0))
+                .unwrap();
+            let deferred_relays: u64 = database
+                .query_row("SELECT count(*) FROM retries", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(stored_relays, 2, "setup needs two independent relay receipts");
+            assert_eq!(deferred_relays, 1, "the unavailable relay must remain retryable");
+            for index in 1..=3 {
+                assert!(services.root.join(format!("relay-{index}/relay.sqlite3")).is_file());
+            }
+        }
     }
 }
 
@@ -1228,7 +1285,7 @@ fn finish_owned_handoff(
                 raw.as_slice().try_into().unwrap(),
             )
             .unwrap();
-            let loaded = loki_poc::relay_member::LoadedMember { identity, roster };
+            let loaded = loki_poc::relay_member::LoadedMember { identity, roster, threshold: 2 };
             let db =
                 loki_relay_client::ClientStore::open(&path.join("transport"), &loaded.roster, slot)
                     .unwrap();

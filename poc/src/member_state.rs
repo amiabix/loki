@@ -1,13 +1,15 @@
-//! Validated regtest state produced by the separate-member setup ceremony.
+//! Validated state produced by the separate-member setup ceremony.
 
 use std::{collections::BTreeMap, fs, path::Path};
 
 use blake2b_simd::Params;
 use orchard::keys::FullViewingKey;
 use reddsa_frost::frost::redpallas as frost;
+use zcash_protocol::consensus::Parameters;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
+    network::{VaultNetwork, TESTNET_NU7_BIRTH},
     setup_transport::{Identity, PublicIdentity},
     state::MemberDir,
     vault, zip2005,
@@ -16,8 +18,11 @@ use crate::{
 pub struct Roster {
     pub vault: [u8; 32],
     pub threshold: u16,
+    pub network: VaultNetwork,
+    pub birth_height: Option<u32>,
     pub members: BTreeMap<u16, PublicIdentity>,
     legacy: bool,
+    explicit_network: bool,
 }
 
 impl Roster {
@@ -27,6 +32,32 @@ impl Roster {
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
         let data: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+        let explicit_network = data.get("network").is_some();
+        let network =
+            VaultNetwork::parse(data["network"].as_str().unwrap_or(if explicit_network {
+                ""
+            } else {
+                "regtest"
+            }))?;
+        let birth_height = match network {
+            VaultNetwork::Testnet => {
+                let height: u32 = data["birth_height"]
+                    .as_u64()
+                    .ok_or("Testnet roster needs a birth height")?
+                    .try_into()
+                    .map_err(|_| "invalid Testnet birth height")?;
+                if height < TESTNET_NU7_BIRTH {
+                    return Err("Testnet birth height predates NU7".into());
+                }
+                Some(height)
+            }
+            VaultNetwork::Regtest => {
+                if data.get("birth_height").is_some() {
+                    return Err("regtest roster cannot have a birth height".into());
+                }
+                None
+            }
+        };
         let vault = hex32(&data, "vault")?;
         let entries = data["members"].as_array().ok_or("missing members")?;
         let mut members = BTreeMap::new();
@@ -65,32 +96,43 @@ impl Roster {
                 .map_err(|_| "invalid roster threshold")?
         };
         let count = members.len();
-        if !matches!((threshold, count), (2, 3) | (2, 4))
+        if !matches!((threshold, count), (2, 3) | (2, 4) | (3, 4))
             || (legacy && count != 3)
             || members.keys().copied().collect::<Vec<_>>() != (1..=count as u16).collect::<Vec<_>>()
         {
             return Err(
-                "supported rosters are 2-of-3 and 2-of-4 with consecutive member IDs".into(),
+                "supported rosters are 2-of-3, 2-of-4, and 3-of-4 with consecutive member IDs".into(),
             );
         }
         Ok(Self {
             vault,
             threshold,
+            network,
+            birth_height,
             members,
             legacy,
+            explicit_network,
         })
     }
 
     pub fn fingerprint(&self) -> [u8; 32] {
         let mut hash = Params::new()
             .hash_length(32)
-            .personal(if self.legacy {
+            .personal(if self.explicit_network {
+                b"Loki_roster_v3"
+            } else if self.legacy {
                 b"Loki_roster_v1"
             } else {
                 b"Loki_roster_v2"
             })
             .to_state();
         hash.update(&self.vault);
+        if self.explicit_network {
+            hash.update(self.network.label().as_bytes());
+            if let Some(height) = self.birth_height {
+                hash.update(&height.to_be_bytes());
+            }
+        }
         if !self.legacy {
             hash.update(&self.threshold.to_be_bytes());
             hash.update(&(self.members.len() as u16).to_be_bytes());
@@ -106,6 +148,8 @@ impl Roster {
 
 pub struct MemberState {
     pub vault: [u8; 32],
+    pub network: VaultNetwork,
+    pub birth_height: Option<u32>,
     pub roster: Roster,
     pub identity: Identity,
     pub key: frost::keys::KeyPackage,
@@ -160,15 +204,17 @@ pub fn open(owner: &Path, pass_file: &Path, roster_file: &Path) -> Result<Member
             .map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    if state["version"] != 2
-        || state["network"] != "regtest"
-        || state["key_derivation"] != zip2005::VERSION
-    {
-        return Err("unsupported separate-member regtest vault state".into());
+    if state["version"] != 2 || state["key_derivation"] != zip2005::VERSION {
+        return Err("unsupported separate-member vault state".into());
     }
+    let network = VaultNetwork::parse(state["network"].as_str().ok_or("missing vault network")?)?;
     let vault = hex32(&state, "vault")?;
     let roster = Roster::load(roster_file)?;
-    if roster.vault != vault || roster.fingerprint() != hex32(&state, "roster_fingerprint")? {
+    if roster.vault != vault
+        || roster.network != network
+        || state.get("birth_height").and_then(|v| v.as_u64()) != roster.birth_height.map(u64::from)
+        || roster.fingerprint() != hex32(&state, "roster_fingerprint")?
+    {
         return Err("roster differs from sealed vault certificate".into());
     }
     if state
@@ -193,7 +239,7 @@ pub fn open(owner: &Path, pass_file: &Path, roster_file: &Path) -> Result<Member
     let secret = hex32(&state, "vault_secret")?;
     let fvk = zip2005::frost_viewing_key(&ak, &secret)
         .map_err(|e| format!("ZIP 2005 derivation: {e:?}"))?;
-    if state["address"].as_str() != Some(&vault::regtest_unified_address(&fvk)) {
+    if state["address"].as_str() != Some(&vault::unified_address(&fvk, network.network_type())) {
         return Err("stored address differs from derived vault address".into());
     }
     let public = frost::keys::PublicKeyPackage::deserialize(&hex_bytes(&state, "public_package")?)
@@ -243,6 +289,8 @@ pub fn open(owner: &Path, pass_file: &Path, roster_file: &Path) -> Result<Member
     }
     Ok(MemberState {
         vault,
+        network,
+        birth_height: roster.birth_height,
         roster,
         identity,
         key,

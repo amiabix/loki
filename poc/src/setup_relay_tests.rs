@@ -23,6 +23,7 @@ fn authenticated_transport_conflict_notifies_admission_for_both_policies() {
             &services.config_key,
             &grant,
             count,
+            "regtest",
             true,
         )
         .unwrap();
@@ -160,6 +161,7 @@ fn signed_ceremony_expiry_reconciles_and_notifies_for_both_policies() {
             &services.config_key,
             &grant,
             count,
+            "regtest",
             true,
         )
         .unwrap();
@@ -208,6 +210,7 @@ fn signed_checkpoint_conflict_reconciles_and_notifies_for_both_policies() {
             &services.config_key,
             &grant,
             count,
+            "regtest",
             true,
         )
         .unwrap();
@@ -271,6 +274,7 @@ fn creator_provisions_two_relays_with_one_offline_for_both_policies() {
             &services.config_key,
             &grant,
             count,
+            "regtest",
             true,
         )
         .unwrap();
@@ -331,6 +335,7 @@ fn rejected_expired_enrollment_stops_a_pending_abort_without_claiming_remote_ter
             &services.config_key,
             &grant,
             count,
+            "regtest",
             true,
         )
         .unwrap();

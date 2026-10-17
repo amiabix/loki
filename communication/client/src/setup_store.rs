@@ -75,6 +75,15 @@ pub(crate) fn add_object(c: &Connection, o: &Object) -> ClientResult<()> {
     Ok(())
 }
 impl SetupStore {
+    /// Completed setup retires inboxes that already returned a stored receipt.
+    pub fn clear_retries_for_stored_routes(&self) -> ClientResult<()> {
+        self.connection.execute(
+            "DELETE FROM retries WHERE pin IN (SELECT DISTINCT pin FROM stored)",
+            [],
+        )?;
+        Ok(())
+    }
+
     pub fn open(path: &Path, transport: &SetupTransport<'_>) -> ClientResult<Self> {
         let path = crate::store::root_path(path)?;
         let fresh = match fs::symlink_metadata(&path) {

@@ -62,6 +62,7 @@ use loki_relay_protocol::{
     types::{Id32, RelayPin, RelayRoute},
 };
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 
 const BUNDLE_LIMIT: usize = 16384;
 const CONFIG_DOMAIN: &[u8] = b"Loki_Operator_Config_v1\0";
@@ -164,6 +165,12 @@ impl OperatorSet {
         if relays
             .windows(2)
             .any(|pair| pair[0].pin.key >= pair[1].pin.key)
+            || relays
+                .iter()
+                .map(|relay| relay.pin.run)
+                .collect::<HashSet<_>>()
+                .len()
+                != relays.len()
         {
             return Err(ClientError::Config);
         }
