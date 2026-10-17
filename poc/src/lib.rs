@@ -37,6 +37,7 @@ pub mod signing_session;
 pub mod state;
 pub mod vault;
 pub mod verify;
+pub mod wallet_store;
 pub mod witness;
 pub mod zip2005;
 
