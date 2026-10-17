@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 
+import member_service
 import timing
 
 FINGERPRINT_PHASES = ("roster_proposed", "agreement_saved", "acceptance_pending", "roster_accepted")
@@ -53,6 +54,14 @@ class HostedSetup:
         self.local = threading.local()
         self.schedule = {}
         self.wake = threading.Event()
+        # Setup commands run in one native child per unlocked profile when its binary
+        # is built; LOKI_MEMBER_SERVICE=0 keeps one process per command.
+        self.service = None
+        self.service_lock = threading.Lock()
+        if member_service.enabled():
+            service = member_service.MemberService(Path(wallet.setup).with_name("loki_member_service"), wallet.data)
+            if service.available():
+                self.service = service
 
     def _key(self, root):
         return Path(root).resolve()
@@ -89,11 +98,11 @@ class HostedSetup:
         with self.meta_lock:
             return self.user_waiting.get(self._key(root), 0) > 0
 
-    def native(self, action, root, *args, private=None, unlocked=True):
+    def native(self, action, root, *args, private=None, words=None, unlocked=True):
         with self._vault_lock(root):
             for attempt in range(4):
                 try:
-                    return self._native(action, root, *args, private=private, unlocked=unlocked)
+                    return self._native(action, root, *args, private=private, words=words, unlocked=unlocked)
                 except ValueError as error:
                     # Another tool (or a stale worker) holds the vault's native lock.
                     if "setup_worker_locked" not in str(error) or not getattr(self.local, "user", 0):
@@ -102,13 +111,15 @@ class HostedSetup:
                         raise ValueError("This vault is busy in another tool; try again shortly") from error
                     time.sleep(0.2 * (attempt + 1))
 
-    def _native(self, action, root, *args, private=None, unlocked=True):
+    def _native(self, action, root, *args, private=None, words=None, unlocked=True):
         if self.stop_event.is_set():
             raise ValueError("Signer is locked")
         if unlocked:
             self.wallet.require_profile()
             if not isinstance(self.wallet.passphrase, str):
                 raise ValueError("Signer is locked")
+        if self.service is not None and unlocked and action in member_service.ALLOWED:
+            return self._service_call(action, root, args, private, words)
         with tempfile.TemporaryDirectory(prefix=".hosted-command-", dir=self.wallet.data) as temporary:
             folder = Path(temporary)
             argv = [str(self.wallet.setup), action, str(root)]
@@ -123,11 +134,12 @@ class HostedSetup:
                 else:
                     argv.append(str(passfile))
             for arg in args:
-                if arg == "@private":
-                    if private is None:
+                if arg in ("@private", "@words"):
+                    raw = private if arg == "@private" else (words.encode() if words is not None else None)
+                    if raw is None:
                         raise ValueError("Missing private setup input")
-                    path = folder / "private"
-                    self._write(path, private, durable=False)
+                    path = folder / arg[1:]
+                    self._write(path, raw, durable=False)
                     argv.append(str(path))
                 else:
                     argv.append(str(arg))
@@ -152,6 +164,20 @@ class HostedSetup:
                 with self.process_lock:
                     self.processes.discard(process)
 
+    def _service_call(self, action, root, args, private, words):
+        """Run an allowed setup command in the member service, restarting it (with the
+        passphrase this app still holds) after it died or timed out."""
+        with self.service_lock:
+            if self.stop_event.is_set():
+                raise ValueError("Signer is locked")
+            if not self.service.running():
+                self.service.start(self.wallet.passphrase)
+        result = self.service.call(action, [root, "@session", *args], private=private, words=words,
+                                   timeout=600 if action == "setup-backup-finalize" else 120)
+        if action == "setup-backup-create":
+            return result["words"]
+        return json.dumps(result)
+
     @staticmethod
     def _write(path, raw, durable=True):
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -171,6 +197,12 @@ class HostedSetup:
     def stop(self):
         self.stop_event.set()
         self.wake.set()
+        # The service gets the same 5 s as the worker, in parallel with it.
+        stopping = None
+        if self.service is not None:
+            with self.service_lock:
+                stopping = threading.Thread(target=self.service.stop, daemon=True)
+                stopping.start()
         with self.process_lock:
             for process in self.processes:
                 if process.poll() is None:
@@ -181,6 +213,8 @@ class HostedSetup:
             for process in self.processes:
                 if process.poll() is None:
                     process.kill()
+        if stopping is not None:
+            stopping.join(timeout=member_service.STOP_SECONDS + 1)
         self.information.clear()
         self.schedule.clear()
 
@@ -498,11 +532,10 @@ class HostedSetup:
                 if not 1 <= len(raw) <= 64 * 1024 or not raw.startswith(b"LOKISEAL\x01"):
                     raise ValueError("Invalid recovery card")
                 self._write(card / "vault.card", raw)
-                self._write(check / "words", words.encode())
                 if final:
-                    self.native("setup-backup-finalize", folder, folder / "card", card, check / "words")
+                    self.native("setup-backup-finalize", folder, folder / "card", card, "@words", words=words)
                 else:
-                    self.native("setup-backup-verify", folder, card, check / "words")
+                    self.native("setup-backup-verify", folder, card, "@words", words=words)
             marker = folder / ("final-backup-checked" if final else "backup-checked")
             if not marker.exists():
                 self._write(marker, b"checked\n")
@@ -514,7 +547,7 @@ class HostedSetup:
             if words is not None and not isinstance(words, str):
                 raise ValueError("Enter your recovery words")
             if words:
-                self.native("setup-backup-finalize", folder, folder / "card", folder / "final-card", "@private", private=words.encode())
+                self.native("setup-backup-finalize", folder, folder / "card", folder / "final-card", "@words", words=words)
             else:
                 self.native("setup-backup-finalize", folder, folder / "card", folder / "final-card", "-")
             return {"created": True}

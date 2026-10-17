@@ -253,6 +253,9 @@ mod checkpoint_1 {
 pub mod setup_relay;
 
 #[cfg(feature = "relay-communication")]
+pub mod member_service;
+
+#[cfg(feature = "relay-communication")]
 pub(crate) mod setup_backup;
 
 #[cfg(feature = "relay-communication")]

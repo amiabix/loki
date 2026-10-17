@@ -31,6 +31,8 @@ class HostedControllerTests(unittest.TestCase):
         self.wallet.profile_data = {'id': 'alice', 'name': 'Alice'}
         self.wallet.passphrase = 'alice test passphrase'
         self.controller = self.wallet.hosted
+        # These cases cover the per-command path; test_member_service covers the service.
+        self.controller.service = None
         self.calls = []
         self.count = 4
         self.slot = 1

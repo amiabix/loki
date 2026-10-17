@@ -39,6 +39,12 @@ to `target/debug` with a startup warning. Select one explicitly with
 honored. Debug builds are for development and the setup fault-injection drills;
 their dependencies are optimized, but Loki's own code is not.
 
+With hosted transport, an unlocked profile runs its setup commands in one
+`loki_member_service` child (built with the other binaries). It receives the
+passphrase once over its stdin and keeps it, and the Argon2id keys it derives,
+only in memory; Lock stops it within 5 s. A missing service binary, or
+`LOKI_MEMBER_SERVICE=0`, keeps one `loki_setup_member` process per command.
+
 For the separate dashboard and signer flow, start the same member app with a
 second loopback port:
 

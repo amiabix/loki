@@ -73,6 +73,12 @@ optional = true
 path = "../communication/protocol"
 optional = true
 
+[[bin]]
+# Hosted setup commands in one long-lived process per unlocked profile; see
+# `src/member_service.rs` for the stdin/stdout protocol.
+name = "loki_member_service"
+required-features = ["relay-communication"]
+
 [[example]]
 # Test-only fixture: stands up owned development relay operators and issues grants
 # with fixed keys for the hosted app flow (`wallet/test_hosted_app_flow.py`).
