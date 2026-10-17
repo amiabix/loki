@@ -1,0 +1,16 @@
+# Replace these four names with DNS records pointing at this server.
+relay1.example.org {
+    reverse_proxy 127.0.0.1:39101
+}
+
+relay2.example.org {
+    reverse_proxy 127.0.0.1:39102
+}
+
+relay3.example.org {
+    reverse_proxy 127.0.0.1:39103
+}
+
+admission.example.org {
+    reverse_proxy 127.0.0.1:39104
+}

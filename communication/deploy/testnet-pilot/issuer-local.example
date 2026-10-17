@@ -1,0 +1,15 @@
+#!/bin/sh
+# Closed-pilot creator only. Keep the issuer seed on this trusted computer.
+set -eu
+test "$#" -eq 6
+test "$1" = --device-key
+test "$3" = --operator-bundle
+test "$5" = --policy
+test "$4" = "$LOKI_OPERATOR_BUNDLE"
+case "$6" in
+  2-of-3|2-of-4|3-of-4) ;;
+  *) exit 1 ;;
+esac
+exec "$LOKI_OPERATOR_ADMIN" grant "$LOKI_ISSUER_SEED" "$LOKI_OPERATOR_BUNDLE" \
+  "$LOKI_CONFIG_KEY" "$2" \
+  "$(python3 -c 'import time; print(int(time.time()) + 3600)')" 1 50 -

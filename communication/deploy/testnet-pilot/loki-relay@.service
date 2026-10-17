@@ -1,0 +1,20 @@
+[Unit]
+Description=Loki Testnet relay %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=loki
+Group=loki
+ExecStart=/opt/loki/bin/loki-relay-server serve --root /var/lib/loki/relay-%i --listen 127.0.0.1:3910%i
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/loki/relay-%i
+
+[Install]
+WantedBy=multi-user.target

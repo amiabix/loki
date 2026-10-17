@@ -1,0 +1,22 @@
+[Unit]
+Description=Loki Testnet setup admission
+After=network-online.target loki-relay@1.service loki-relay@2.service loki-relay@3.service
+Wants=network-online.target
+Requires=loki-relay@1.service loki-relay@2.service loki-relay@3.service
+
+[Service]
+Type=simple
+User=loki
+Group=loki
+EnvironmentFile=/etc/loki/operator/relay-order.env
+ExecStart=/opt/loki/bin/loki-setup-admission serve --root /var/lib/loki/admission --bundle-file /etc/loki/operator/bundle --config-key-file /etc/loki/operator/config-key --signing-key-file /var/lib/loki/admission/signing-key --issuer-key-file /etc/loki/operator/issuer-key --relay-1-provision-file ${LOKI_RELAY_CAP_1} --relay-2-provision-file ${LOKI_RELAY_CAP_2} --relay-3-provision-file ${LOKI_RELAY_CAP_3} --listen 127.0.0.1:39104
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/loki/admission
+
+[Install]
+WantedBy=multi-user.target
