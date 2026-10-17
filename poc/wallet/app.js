@@ -38,6 +38,7 @@ function selectVault(vault) {
   $('balance').textContent = "Scan this device's chain view to see the balance.";
   $('words').textContent = '';
   $('backup-made').hidden = true;
+  $('check-backup').hidden = true;
   $('download-final').hidden = true;
   $('draft-result').hidden = true;
   $('payment-draft').reset();
@@ -828,6 +829,7 @@ action('make-backup', async () => {
   const result = await api('backup', {vault: selectedVault});
   $('words').textContent = result.words;
   $('backup-made').hidden = false;
+  $('check-backup').hidden = false;
   message('Write down these words, then enter them below to check your copy. The final recovery card follows after the other members finish.');
 });
 async function downloadCard(path, filename) {
