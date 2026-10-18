@@ -345,8 +345,6 @@ fn prepare(args: &[String], sweep: bool) -> Result<(), String> {
     });
     if signers.len() == 2 { value["pair"] = json!(signers); }
     else { value["signers"] = json!(signers); }
-    // Hold the inputs for this attempt so this member's next draft funds itself elsewhere.
-    wallet.reserve_inputs(LockOwner::new(attempt.0), &intent.input_nullifiers, expiry)?;
     let target = work.join("payment.json");
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -355,9 +353,23 @@ fn prepare(args: &[String], sweep: bool) -> Result<(), String> {
     let mut file = options
         .open(&target)
         .map_err(|e| format!("{}: {e}", target.display()))?;
-    file.write_all(serde_json::to_string_pretty(&value).unwrap().as_bytes())
-        .map_err(|e| e.to_string())?;
-    file.sync_all().map_err(|e| e.to_string())?;
+    // Hold the inputs for this attempt so this member's next draft funds itself elsewhere.
+    // Only a saved manifest can release them later, so undo both if either step fails.
+    let owner = LockOwner::new(attempt.0);
+    let saved = wallet
+        .reserve_inputs(owner, &intent.input_nullifiers, expiry)
+        .and_then(|()| {
+            file.write_all(serde_json::to_string_pretty(&value).unwrap().as_bytes())
+                .and_then(|()| file.sync_all())
+                .map_err(|e| {
+                    let _ = wallet.release_inputs(owner, &intent.input_nullifiers);
+                    format!("{}: {e}", target.display())
+                })
+        });
+    if let Err(e) = saved {
+        let _ = fs::remove_file(&target);
+        return Err(e);
+    }
     println!(
         "payment={} attempt={} inputs={} amount={} fee={} change={}",
         hex::encode(payment),
