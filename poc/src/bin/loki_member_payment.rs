@@ -983,7 +983,7 @@ fn finish(args: &[String], broadcast: bool) -> Result<(), String> {
     }
     let (member, owner, pass) = state(args)?;
     let url = args.get(4).cloned().or_else(|| lightwalletd_url(member.network));
-    if broadcast && url.is_none() {
+    if broadcast && member.network == VaultNetwork::Testnet && url.is_none() {
         return Err("Testnet finish requires a lightwalletd URL".into());
     }
     let work = Path::new(&args[3]);
@@ -1046,28 +1046,37 @@ fn finish(args: &[String], broadcast: bool) -> Result<(), String> {
         );
         return Ok(());
     }
-    let runtime = runtime()?;
-    let url = url.ok_or("Testnet finish requires a lightwalletd URL")?;
-    let (mut wallet, mut client) = runtime.block_on(sync_member_wallet(&member, &owner, &pass, &url))?;
-    let height = wallet.scanned_height()?.ok_or("wallet has not scanned any blocks")?;
-    let info = runtime.block_on(client.get_lightd_info(Empty {}))
-        .map_err(|e| format!("lightwalletd info: {e}"))?.into_inner();
-    if info.block_height != u64::from(height) {
-        return Err("wallet scan is behind lightwalletd; finish again".into());
-    }
-    let tree_state = runtime.block_on(client.get_tree_state(BlockId {
-        height: u64::from(height), hash: vec![],
-    })).map_err(|e| format!("lightwalletd tree state: {e}"))?.into_inner();
-    if tree_state.network != info.chain_name || tree_state.height != u64::from(height)
-        || tree_state.hash != wallet.scanned_hash(BlockHeight::from_u32(height))?
-    {
-        return Err("wallet scan is on a different chain; finish again".into());
-    }
-    let tree = tree_state.ironwood_tree()
-        .map_err(|e| format!("Ironwood tree state: {e}"))?;
-    let anchor = tree.root().to_bytes();
-    let frontier = tree.to_frontier().value().cloned()
-        .ok_or("scanned Ironwood tree is empty")?;
+    let (mut wallet, height, frontier, lightwalletd) = match member.network {
+        VaultNetwork::Regtest => {
+            let (wallet, height, frontier) = synced_wallet(&member, &owner, &pass, &Rpc::regtest())?;
+            (wallet, height, frontier, None)
+        }
+        VaultNetwork::Testnet => {
+            let runtime = runtime()?;
+            let url = url.ok_or("Testnet finish requires a lightwalletd URL")?;
+            let (wallet, mut client) = runtime.block_on(sync_member_wallet(&member, &owner, &pass, &url))?;
+            let height = wallet.scanned_height()?.ok_or("wallet has not scanned any blocks")?;
+            let info = runtime.block_on(client.get_lightd_info(Empty {}))
+                .map_err(|e| format!("lightwalletd info: {e}"))?.into_inner();
+            if info.block_height != u64::from(height) {
+                return Err("wallet scan is behind lightwalletd; finish again".into());
+            }
+            let tree_state = runtime.block_on(client.get_tree_state(BlockId {
+                height: u64::from(height), hash: vec![],
+            })).map_err(|e| format!("lightwalletd tree state: {e}"))?.into_inner();
+            if tree_state.network != info.chain_name || tree_state.height != u64::from(height)
+                || tree_state.hash != wallet.scanned_hash(BlockHeight::from_u32(height))?
+            {
+                return Err("wallet scan is on a different chain; finish again".into());
+            }
+            let tree = tree_state.ironwood_tree()
+                .map_err(|e| format!("Ironwood tree state: {e}"))?;
+            let frontier = tree.to_frontier().value().cloned()
+                .ok_or("scanned Ironwood tree is empty")?;
+            (wallet, height, frontier, Some((runtime, client)))
+        }
+    };
+    let anchor = frontier.root().to_bytes();
     let witnesses = indices
         .iter()
         .copied()
@@ -1083,13 +1092,19 @@ fn finish(args: &[String], broadcast: bool) -> Result<(), String> {
     wallet.release_inputs(LockOwner::new(context.attempt.0), &intent.input_nullifiers)?;
     // shortcut: ambiguous broadcast failures keep inputs locked until expiry; add mempool reconciliation for early release.
     wallet.reserve_inputs(txid.into(), &intent.input_nullifiers, intent.expiry_height)?;
-    let sent = runtime.block_on(client.send_transaction(RawTransaction {
-        data: raw.clone(), height: 0,
-    })).map_err(|e| format!("lightwalletd send transaction: {e}"))?.into_inner();
-    if sent.error_code != 0 {
-        // The node refused the transaction, so it can never be mined: free its inputs.
-        wallet.release_inputs(txid.into(), &intent.input_nullifiers)?;
-        return Err(format!("lightwalletd rejected transaction ({}): {}", sent.error_code, sent.error_message));
+    if let Some((runtime, mut client)) = lightwalletd {
+        let sent = runtime.block_on(client.send_transaction(RawTransaction {
+            data: raw.clone(), height: 0,
+        })).map_err(|e| format!("lightwalletd send transaction: {e}"))?.into_inner();
+        if sent.error_code != 0 {
+            wallet.release_inputs(txid.into(), &intent.input_nullifiers)?;
+            return Err(format!("lightwalletd rejected transaction ({}): {}", sent.error_code, sent.error_message));
+        }
+    } else {
+        let sent = Rpc::regtest().json("sendrawtransaction", &format!("[\"{}\"]", hex::encode(&raw)))?;
+        if sent.as_str() != Some(txid.to_string().as_str()) {
+            return Err(format!("node returned a different txid: {sent}"));
+        }
     }
     let txid = txid.to_string();
     fs::write(work.join("final.hex"), hex::encode(&raw)).map_err(|e| e.to_string())?;
@@ -1308,6 +1323,27 @@ fn verify(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn confirm_mined(args: &[String]) -> Result<(), String> {
+    if args.len() != 5 {
+        return Err("confirm-mined <member-dir> <passphrase-file> <roster.json> <work-dir> <txid>".into());
+    }
+    let (member, owner, pass) = state(args)?;
+    if member.network != VaultNetwork::Testnet {
+        return Err("confirm-mined requires a Testnet wallet".into());
+    }
+    let mut bytes: [u8; 32] = hex::decode(&args[4]).map_err(|_| "invalid txid")?
+        .try_into().map_err(|_| "txid must be 32 bytes")?;
+    bytes.reverse();
+    let txid = TxId::from_bytes(bytes);
+    let wallet = wallet(&member, &owner, &pass)?;
+    let height = wallet.mined_height(txid)?.ok_or("transaction is not mined in this wallet")?;
+    let tip = wallet.scanned_height()?.ok_or("wallet has not scanned any blocks")?;
+    let confirmations = tip.checked_sub(u32::from(height))
+        .ok_or("wallet scan is behind the mined transaction")? + 1;
+    println!("confirmed txid={txid} confirmations={confirmations} height={height}");
+    Ok(())
+}
+
 /// Whether block `hash` is still the chain's block at `height` (`getblockhash` only).
 fn chain_check(args: &[String]) -> Result<(), String> {
     let [network, height, hash] = args else {
@@ -1479,6 +1515,7 @@ fn main() {
         Some("finish-check") => finish(&args[2..], false),
         Some("find-mined") => find_mined(&args[2..]),
         Some("verify") => verify(&args[2..]),
+        Some("confirm-mined") => confirm_mined(&args[2..]),
         Some("receive") => receive(&args[2..]),
         _ => Err(
             "loki_member_payment <balance|prepare|prepare-sweep|sign|resend|finish|verify|receive> ...".into(),

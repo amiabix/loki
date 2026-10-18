@@ -25,6 +25,7 @@ pub struct LoadedMember {
     pub identity: CommIdentity,
     pub roster: Roster,
     pub threshold: u16,
+    pub network: VaultNetwork,
 }
 pub type MemberResult<T> = Result<T, MemberError>;
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -342,7 +343,7 @@ pub fn load(root: &Path, pass_file: &Path, roster_path: &Path) -> MemberResult<L
         return Err(MemberError::Identity);
     }
     roster_digest(&roster).map_err(|_| MemberError::Roster)?;
-    Ok(LoadedMember { identity, roster, threshold: certified.threshold })
+    Ok(LoadedMember { identity, roster, threshold: certified.threshold, network: certified.network })
 }
 
 pub mod config;

@@ -5,7 +5,7 @@ use loki_poc::relay_member::{
     load, ConfigStore, CourierImport, LoadedMember, MemberError, ProvisionTarget,
 };
 use loki_poc::{
-    payment_manifest::{self, decode_proposal, encode_proposal},
+    payment_manifest::{self, decode_proposal_for_network, encode_proposal_for_network},
     setup_transport::session_envelope,
     signing_session::Mailbox,
 };
@@ -500,7 +500,8 @@ fn save_proposal(
     manifest: &[u8],
 ) -> Result<(Id32, Id32, RecoveryLogical), Exit> {
     let (context, intent) =
-        payment_manifest::parse(manifest).map_err(|_| Exit::Member(MemberError::Markers))?;
+        payment_manifest::parse_for_network(manifest, session.member.network)
+            .map_err(|_| Exit::Member(MemberError::Markers))?;
     payment_manifest::validate_roster(
         session.member.roster.vault,
         session.member.threshold,
@@ -516,7 +517,8 @@ fn save_proposal(
         return Err(Exit::Member(MemberError::Identity));
     }
     let payload =
-        Zeroizing::new(encode_proposal(manifest).map_err(|_| Exit::Member(MemberError::Markers))?);
+        Zeroizing::new(encode_proposal_for_network(manifest, session.member.network)
+            .map_err(|_| Exit::Member(MemberError::Markers))?);
     let saved = save_payload(session, &payload, context.attempt.0, Some(context.attempt.0))?;
     Ok((context.payment, context.attempt.0, saved))
 }
@@ -565,7 +567,7 @@ fn import_saved_proposals(
             let Payload::Test(payload) = &body.payload else {
                 return Ok(());
             };
-            let manifest = match decode_proposal(payload) {
+            let manifest = match decode_proposal_for_network(payload, session.member.network) {
                 Ok(Some(manifest)) => manifest,
                 Ok(None) => return Ok(()),
                 Err(_) => {
@@ -573,7 +575,7 @@ fn import_saved_proposals(
                     return Ok(());
                 }
             };
-            let Ok((context, intent)) = payment_manifest::parse(manifest) else {
+            let Ok((context, intent)) = payment_manifest::parse_for_network(manifest, session.member.network) else {
                 rejected += 1;
                 return Ok(());
             };
@@ -793,7 +795,7 @@ fn export_saved_signing(session: &Session, work: &Path, attempt: Id32) -> Result
             let Payload::Test(wire) = &opened.message().body().payload else {
                 return Ok(());
             };
-            match decode_proposal(wire) {
+            match decode_proposal_for_network(wire, session.member.network) {
                 Ok(Some(_)) | Err(_) => return Ok(()),
                 Ok(None) => {}
             }
