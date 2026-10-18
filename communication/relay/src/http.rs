@@ -213,6 +213,7 @@ pub fn router(db: DbHandle) -> Router {
         )
         .route("/v1/mailboxes/{mailbox}/entries", get(page_route))
         .route("/v1/identity", get(identity_route))
+        .route("/health", get(|| async { StatusCode::OK }))
         .fallback(malformed)
         .method_not_allowed_fallback(malformed)
         .layer(DefaultBodyLimit::max(MAX_WIRE_LEN))

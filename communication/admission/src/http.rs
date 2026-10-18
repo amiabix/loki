@@ -67,6 +67,7 @@ pub fn router_with_provisioning(
         provision,
     };
     Router::new()
+        .route("/health", get(|| async { StatusCode::OK }))
         .route("/v1/setup", post(handle))
         .route("/v1/setup/{ceremony}", get(handle))
         .route("/v1/setup/{ceremony}/claims/{slot}", post(handle))
