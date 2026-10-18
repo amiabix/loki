@@ -1802,8 +1802,6 @@ class Wallet:
         return {"phase": "approval_pending_delivery"}
 
     def finish_payment(self, vault, attempt):
-        if self.network == "testnet":
-            self.balance(vault)
         endpoint = (self.lightwalletd_url,) if self.network == "testnet" else ()
         _, work, _, output = self.payment_command(
             "finish", vault, attempt, *endpoint, timeout=600)

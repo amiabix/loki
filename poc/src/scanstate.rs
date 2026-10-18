@@ -50,11 +50,6 @@ pub struct ScanState {
     pub nfs: Vec<[u8; 32]>,
     /// The vault's own actions, in the same order.
     pub found: Vec<Found>,
-    /// For each vault note already spent on the chain: the height and txid of the
-    /// transaction that revealed its nullifier.
-    pub spent: std::collections::BTreeMap<[u8; 32], (u32, String)>,
-    /// Nullifiers of the vault notes in `found`; rebuilt from them, never stored.
-    own: std::collections::HashSet<[u8; 32]>,
 }
 
 impl ScanState {
@@ -113,13 +108,7 @@ impl ScanState {
             let position = self.position_offset + self.cmxs.len() as u64;
             self.cmxs.push(raw.cmx);
             self.nfs.push(raw.nullifier);
-            if self.own.contains(&raw.nullifier) {
-                self.spent
-                    .entry(raw.nullifier)
-                    .or_insert_with(|| (height, txid.to_string()));
-            }
-            if let Some(note) = vault_note_at(fvk, ivks, height, txid, position, raw) {
-                self.own.insert(note.nullifier);
+            if vault_note_at(fvk, ivks, height, txid, position, raw).is_some() {
                 self.found.push(Found {
                     height,
                     txid: txid.to_string(),
@@ -173,17 +162,6 @@ impl ScanState {
         })
     }
 
-    /// Rebuild the nullifier set of the vault's own notes after [`ScanState::decode`].
-    pub fn rebuild_own(&mut self, fvk: &FullViewingKey) {
-        let ivks = vault_ivks(fvk);
-        self.own = self
-            .found
-            .iter()
-            .filter_map(|f| vault_note_at(fvk, &ivks, f.height, &f.txid, f.position, &f.action))
-            .map(|note| note.nullifier)
-            .collect();
-    }
-
     /// Read state left by an earlier scan. A missing file is the first scan, not an error.
     pub fn load(path: &Path) -> Result<Self, String> {
         let text = match std::fs::read_to_string(path) {
@@ -232,12 +210,8 @@ impl ScanState {
                     state.cmxs.push(field(&mut f).ok_or_else(bad)?);
                     state.nfs.push(field(&mut f).ok_or_else(bad)?);
                 }
-                Some("s") => {
-                    let nf = field(&mut f).ok_or_else(bad)?;
-                    let height = f.next().and_then(|v| v.parse().ok()).ok_or_else(bad)?;
-                    let txid = f.next().ok_or_else(bad)?.to_string();
-                    state.spent.insert(nf, (height, txid));
-                }
+                // Spend records written by an older chain cache; nothing reads them now.
+                Some("s") => {}
                 Some("n") => {
                     let height = f.next().and_then(|v| v.parse().ok()).ok_or_else(bad)?;
                     let position = f.next().and_then(|v| v.parse().ok()).ok_or_else(bad)?;
@@ -291,9 +265,6 @@ impl ScanState {
         }
         for (c, nf) in self.cmxs.iter().zip(self.nfs.iter()) {
             let _ = writeln!(out, "c {} {}", hex::encode(c), hex::encode(nf));
-        }
-        for (nf, (height, txid)) in &self.spent {
-            let _ = writeln!(out, "s {} {height} {txid}", hex::encode(nf));
         }
         for n in &self.found {
             let a = &n.action;
@@ -350,7 +321,7 @@ fn field<'a, const N: usize>(f: &mut impl Iterator<Item = &'a str>) -> Option<[u
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
     use crate::scan::{scan_birth_blocks, scan_blocks};
     use orchard::{
@@ -362,7 +333,7 @@ pub(crate) mod tests {
     };
     use zcash_note_encryption::Domain;
 
-    pub(crate) fn a_fvk(seed: u8) -> FullViewingKey {
+    fn a_fvk(seed: u8) -> FullViewingKey {
         FullViewingKey::from(&SpendingKey::from_bytes([seed; 32]).unwrap())
     }
 
@@ -370,7 +341,7 @@ pub(crate) mod tests {
     ///
     /// `cv` and `rk` only have to be structurally valid points for the action to be
     /// rebuilt; `ak` is one, so it stands in for both.
-    pub(crate) fn action_json(fvk: &FullViewingKey, value: u64, seed: u8) -> serde_json::Value {
+    fn action_json(fvk: &FullViewingKey, value: u64, seed: u8) -> serde_json::Value {
         // The action's rho IS its nullifier field, so the note has to be built from the
         // same bytes or the domain the scanner derives would not decrypt it.
         let nf = [seed; 32];
@@ -398,7 +369,7 @@ pub(crate) mod tests {
         })
     }
 
-    pub(crate) fn tx(txid: &str, actions: Vec<serde_json::Value>) -> serde_json::Value {
+    fn tx(txid: &str, actions: Vec<serde_json::Value>) -> serde_json::Value {
         serde_json::json!({ "txid": txid, "ironwood": { "actions": actions } })
     }
 
@@ -406,7 +377,7 @@ pub(crate) mod tests {
     ///
     /// Vault notes sit behind decoys, in more than one block and more than one
     /// transaction, so a wrong position would not survive by luck.
-    pub(crate) fn canned_chain(
+    fn canned_chain(
         vault: &FullViewingKey,
         decoy: &FullViewingKey,
     ) -> Vec<serde_json::Value> {
@@ -438,7 +409,7 @@ pub(crate) mod tests {
         ]
     }
 
-    pub(crate) fn rebranch(chain: &mut [serde_json::Value], from: usize) {
+    fn rebranch(chain: &mut [serde_json::Value], from: usize) {
         for i in from..chain.len() {
             chain[i]["hash"] = serde_json::json!(format!("{:064x}", i + 101));
             chain[i]["previousblockhash"] =

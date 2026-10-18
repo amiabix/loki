@@ -3,6 +3,7 @@
 
 use crate::{
     intent::Intent,
+    payment_manifest::MAX_INPUTS,
     setup_transport::{Identity, PublicIdentity},
     state::MemberDir,
 };
@@ -307,7 +308,7 @@ fn review_public_candidate(
         return Err("vault or payment differs from member-approved intent".into());
     }
     if intent.input_nullifiers.is_empty()
-        || intent.input_nullifiers.len() > 64
+        || intent.input_nullifiers.len() > MAX_INPUTS
         || intent
             .input_nullifiers
             .iter()
@@ -481,8 +482,8 @@ impl LiveAttempt {
         spends: usize,
     ) -> Result<Self, String> {
         context.validate()?;
-        if spends == 0 || spends > 64 {
-            return Err("signing attempt must have 1..=64 spends".into());
+        if spends == 0 || spends > MAX_INPUTS {
+            return Err(format!("signing attempt must have 1..={} spends", MAX_INPUTS));
         }
         let id: u16 = (1..=4)
             .find(|n| frost::Identifier::try_from(*n).ok() == Some(*key.identifier()))
@@ -630,7 +631,7 @@ impl PackagePayload {
         context.validate()?;
         if self.candidate.is_empty()
             || self.commitments.is_empty()
-            || self.commitments.len() > 64
+            || self.commitments.len() > MAX_INPUTS
             || self.commitments.len() != self.seeds.len()
         {
             return Err("invalid signing package batch".into());
@@ -681,7 +682,7 @@ impl PackagePayload {
         at += candidate_len;
         let count = u16::from_be_bytes(body[at..at + 2].try_into().unwrap()) as usize;
         at += 2;
-        if count == 0 || count > 64 {
+        if count == 0 || count > MAX_INPUTS {
             return Err("invalid spend count".into());
         }
         let mut commitments = Vec::with_capacity(count);

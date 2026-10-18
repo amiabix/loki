@@ -17,11 +17,10 @@ use loki_poc::{
     intent::{ChangePolicy, Intent},
     member_state::{self, MemberState, Roster},
     network::VaultNetwork,
-    payment_manifest::validate_roster,
-    chain_cache,
+    payment_manifest::{validate_roster, MAX_INPUTS},
     rpc::Rpc,
     scan,
-    wallet_store::VaultWallet,
+    wallet_store::{lightwalletd_url, sync_member_wallet, VaultWallet},
     signing_session::{
         aggregate_and_apply, commitments_from_message, AttemptId, Mailbox, MessageKind,
         OpenedMessage, PackagePayload, SessionContext, SigningSession,
@@ -30,17 +29,16 @@ use loki_poc::{
 };
 #[cfg(feature = "relay-communication")]
 use loki_relay_client::{ClientStore, OwnerInbox, RelayHttp, RelayRuntime};
-use orchard::{keys::Scope, note::Note, Address};
+use incrementalmerkletree::frontier::NonEmptyFrontier;
+use orchard::{keys::Scope, tree::MerkleHashOrchard, Address};
 use reddsa_frost::frost::redpallas as frost;
 use serde_json::json;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
-use tonic::transport::{ClientTlsConfig, Endpoint};
-use zcash_client_backend::proto::service::{
-    compact_tx_streamer_client::CompactTxStreamerClient, BlockId, Empty, RawTransaction,
-};
+use zcash_client_backend::proto::service::{BlockId, Empty, RawTransaction};
 use zcash_primitives::transaction::TxId;
-use zcash_protocol::consensus::{BlockHeight, Network};
+use zcash_client_backend::wallet::LockOwner;
+use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::{consensus::Parameters, memo::MemoBytes, value::Zatoshis};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -94,100 +92,57 @@ fn member_rpc(member: &MemberState) -> Result<Rpc, String> {
     }
 }
 
-fn broadcast_endpoint(network: VaultNetwork, url: Option<&str>) -> Result<Option<Endpoint>, String> {
-    if network == VaultNetwork::Regtest {
-        return Ok(None);
-    }
-    let endpoint = Endpoint::from_shared(
-        url.ok_or("Testnet finish requires a lightwalletd URL")?.to_owned(),
-    ).map_err(|e| format!("lightwalletd URL: {e}"))?;
-    let uri = endpoint.uri();
-    if uri.scheme_str() != Some("https")
-        && !(uri.scheme_str() == Some("http")
-            && matches!(uri.host(), Some("localhost" | "127.0.0.1" | "[::1]")))
-    {
-        return Err("lightwalletd must use HTTPS, except on localhost".into());
-    }
-    if uri.scheme_str() == Some("https") {
-        return endpoint
-            .tls_config(ClientTlsConfig::new().with_webpki_roots())
-            .map(Some)
-            .map_err(|e| format!("lightwalletd TLS: {e}"));
-    }
-    Ok(Some(endpoint))
-}
-
-struct SpendNote {
-    note: Note,
-    nullifier: [u8; 32],
-    value_zat: u64,
-}
-
+/// This member's wallet, first synced from lightwalletd when one is configured.
 fn wallet(member: &MemberState, owner: &Path, pass: &str) -> Result<VaultWallet, String> {
-    VaultWallet::open_existing(
-        &owner.join("wallet.sqlite"), Network::TestNetwork, &member.fvk,
-        member.birth_height.ok_or("Testnet vault has no birth height")?, pass,
-    )
+    match lightwalletd_url(member.network) {
+        Some(url) => Ok(runtime()?.block_on(sync_member_wallet(member, owner, pass, &url))?.0),
+        None => VaultWallet::open_existing(
+            &owner.join("wallet.sqlite"), member.network, &member.fvk, member.wallet_birth(), pass,
+        ),
+    }
 }
 
-fn member_chain(
-    member: &MemberState, owner: &Path, pass: &str, rpc: &Rpc, include_reserved: bool,
-) -> Result<(Vec<SpendNote>, u64, Option<[u8; 32]>), String> {
-    match member.network {
-        VaultNetwork::Regtest => {
-            let chain = chain_cache::scan(rpc, owner, &member.fvk, &member.vault)?;
-            Ok((chain.notes.into_iter().map(|note| SpendNote {
-                note: note.note, nullifier: note.nullifier, value_zat: note.value_zat,
-            }).collect(), chain.tip, None))
-        }
-        VaultNetwork::Testnet => {
-            let wallet = wallet(member, owner, pass)?;
-            let height = wallet.scanned_height()?.ok_or("wallet has not scanned any blocks")?;
-            if rpc.json("getblockcount", "[]")?.as_u64() != Some(u64::from(height)) {
-                return Err("wallet scan is behind the node; run loki_wallet_sync again".into());
-            }
-            let block = BlockHeight::from_u32(height);
-            let saved_hash = wallet.scanned_hash(block)?;
-            let state = rpc.json("z_gettreestate", &format!("[\"{height}\"]"))?;
-            let bytes = hex::decode(state["ironwood"]["commitments"]["finalState"]
-                .as_str().ok_or("node has no Ironwood tree state")?)
-                .map_err(|e| format!("Ironwood tree state: {e}"))?;
-            let mut encoded = std::io::Cursor::new(&bytes);
-            let tree = zcash_primitives::merkle_tree::read_commitment_tree::<
-                orchard::tree::MerkleHashOrchard, _, 32,
-            >(&mut encoded).map_err(|e| format!("Ironwood tree state: {e}"))?;
-            if encoded.position() != bytes.len() as u64 {
-                return Err("Ironwood tree state has trailing bytes".into());
-            }
-            let frontier = tree.to_frontier().value().cloned()
-                .ok_or("scanned Ironwood tree is empty")?;
-            let anchor = tree.root().to_bytes();
-            if let Some(root) = state["ironwood"]["commitments"]["finalRoot"].as_str() {
-                if hex::decode(root).ok().as_deref() != Some(&anchor) {
-                    return Err("node Ironwood tree disagrees with its anchor".into());
-                }
-            }
-            if rpc.json("getblockhash", &format!("[{height}]"))?.as_str()
-                != Some(saved_hash.as_str()) {
-                return Err("wallet scan is on a different chain; run loki_wallet_sync again".into());
-            }
-            let inputs = if include_reserved {
-                wallet.ironwood_inputs_at(block, frontier)?
-            } else {
-                wallet.spendable_ironwood_inputs_at(block, frontier)?
-            };
-            let notes = inputs
-                .into_iter().map(|(received, _)| {
-                    let note = *received.note();
-                    SpendNote {
-                        nullifier: note.nullifier(&member.fvk).to_bytes(),
-                        value_zat: note.value().inner(),
-                        note,
-                    }
-                }).collect();
-            Ok((notes, u64::from(height), Some(anchor)))
+fn runtime() -> Result<tokio::runtime::Runtime, String> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("start lightwalletd client: {e}"))
+}
+
+/// The wallet scan at the node's tip, checked against the node's own tree and block hash.
+fn synced_wallet(
+    member: &MemberState, owner: &Path, pass: &str, rpc: &Rpc,
+) -> Result<(VaultWallet, u32, NonEmptyFrontier<MerkleHashOrchard>), String> {
+    let wallet = wallet(member, owner, pass)?;
+    let height = wallet.scanned_height()?.ok_or("wallet has not scanned any blocks")?;
+    if rpc.json("getblockcount", "[]")?.as_u64() != Some(u64::from(height)) {
+        return Err("wallet scan is behind the node; run loki_wallet_sync again".into());
+    }
+    let saved_hash = wallet.scanned_hash(BlockHeight::from_u32(height))?;
+    let state = rpc.json("z_gettreestate", &format!("[\"{height}\"]"))?;
+    let bytes = hex::decode(state["ironwood"]["commitments"]["finalState"]
+        .as_str().ok_or("node has no Ironwood tree state")?)
+        .map_err(|e| format!("Ironwood tree state: {e}"))?;
+    let mut encoded = std::io::Cursor::new(&bytes);
+    let tree = zcash_primitives::merkle_tree::read_commitment_tree::<MerkleHashOrchard, _, 32>(
+        &mut encoded,
+    ).map_err(|e| format!("Ironwood tree state: {e}"))?;
+    if encoded.position() != bytes.len() as u64 {
+        return Err("Ironwood tree state has trailing bytes".into());
+    }
+    let frontier = tree.to_frontier().value().cloned()
+        .ok_or("scanned Ironwood tree is empty")?;
+    let anchor = tree.root().to_bytes();
+    if let Some(root) = state["ironwood"]["commitments"]["finalRoot"].as_str() {
+        if hex::decode(root).ok().as_deref() != Some(&anchor) {
+            return Err("node Ironwood tree disagrees with its anchor".into());
         }
     }
+    if rpc.json("getblockhash", &format!("[{height}]"))?.as_str()
+        != Some(saved_hash.as_str()) {
+        return Err("wallet scan is on a different chain; run loki_wallet_sync again".into());
+    }
+    Ok((wallet, height, frontier))
 }
 
 fn check_manifest_roster(
@@ -292,41 +247,17 @@ fn balance(args: &[String]) -> Result<(), String> {
         Path::new(&args[1]),
         Path::new(&args[2]),
     )?;
-    let (balance_zat, tip, note_count) = match member.network {
-        VaultNetwork::Regtest => {
-            let (notes, tip, _) = member_chain(&member, Path::new(&args[0]), "", &member_rpc(&member)?, false)?;
-            let total = notes.iter().try_fold(0u64, |sum, note| sum.checked_add(note.value_zat))
-                .ok_or("vault balance exceeds u64")?;
-            (total, tip, notes.len())
-        }
-        VaultNetwork::Testnet => {
-            let pass = Zeroizing::new(fs::read_to_string(&args[1]).map_err(|e| e.to_string())?);
-            let wallet = wallet(&member, Path::new(&args[0]), pass.trim_end_matches(['\r', '\n']))?;
-            let height = wallet.scanned_height()?.ok_or("wallet has not scanned any blocks")?;
-            (wallet.ironwood_balance_zat()?, u64::from(height),
-             wallet.ironwood_note_count(BlockHeight::from_u32(height))?)
-        }
-    };
+    let pass = Zeroizing::new(fs::read_to_string(&args[1]).map_err(|e| e.to_string())?);
+    let mut wallet = wallet(&member, Path::new(&args[0]), pass.trim_end_matches(['\r', '\n']))?;
+    let height = wallet.scanned_height()?.ok_or("wallet has not scanned any blocks")?;
     println!(
         "{}",
         json!({"vault": hex::encode(member.vault), "network": member.network.label(),
-               "height": tip, "balance_zat": balance_zat, "unspent_notes": note_count})
+               "height": height, "balance_zat": wallet.ironwood_balance_zat()?,
+               "unspent_notes": wallet.ironwood_note_count(BlockHeight::from_u32(height))?,
+               "max_spendable_zat": wallet.max_spendable(MAX_INPUTS)})
     );
     Ok(())
-}
-
-fn sweep_amount(values: &[u64], fee: u64) -> Result<u64, String> {
-    if values.is_empty() || values.len() > 8 {
-        return Err("sweep needs 1 to 8 unspent notes".into());
-    }
-    let total = values
-        .iter()
-        .try_fold(0u64, |sum, value| sum.checked_add(*value))
-        .ok_or("vault balance exceeds u64")?;
-    total
-        .checked_sub(fee)
-        .filter(|amount| *amount > 0)
-        .ok_or_else(|| "vault balance does not cover the sweep fee".into())
 }
 
 fn prepare(args: &[String], sweep: bool) -> Result<(), String> {
@@ -356,8 +287,7 @@ fn prepare(args: &[String], sweep: bool) -> Result<(), String> {
     let work = Path::new(&args[3]);
     private_work(work)?;
     let rpc = member_rpc(&member)?;
-    let (notes, height, _) = member_chain(&member, &owner, &pass, &rpc, false)?;
-    let tip: u32 = height.try_into().map_err(|_| "height overflow")?;
+    let (mut wallet, tip, _) = synced_wallet(&member, &owner, &pass, &rpc)?;
     let recipient = vault::orchard_receiver_from_ua(&args[4], member.network.network_type())?;
     let memo_text = &args[if sweep { 5 } else { 6 }];
     let memo = MemoBytes::from_bytes(memo_text.as_bytes()).map_err(|e| format!("memo: {e:?}"))?;
@@ -373,60 +303,27 @@ fn prepare(args: &[String], sweep: bool) -> Result<(), String> {
         .div_ceil(1_152)
         .checked_mul(1_152)
         .ok_or("expiry overflow")?;
-    let (notes, amount_zat, fee_zat, change_zat) = if sweep {
-        if notes.is_empty() || notes.len() > 8 {
-            return Err("sweep needs 1 to 8 unspent notes".into());
-        }
-        let inputs = CandidateInputs {
-            vault_fvk: &member.fvk,
-            notes: notes.iter().map(|note| note.note).collect(),
-            recipient,
-            amount: Zatoshis::from_u64(1).map_err(|e| format!("amount: {e:?}"))?,
-            memo: memo.clone(),
-            change: Zatoshis::ZERO,
-            target_height: tip,
-            expiry_height: expiry,
-        };
-        let fee = u64::from(quote_fee(&member.network, &inputs)?);
-        let values = notes
-            .iter()
-            .map(|note| note.value_zat)
-            .collect::<Vec<_>>();
-        let amount = sweep_amount(&values, fee)?;
-        Zatoshis::from_u64(amount).map_err(|e| format!("amount: {e:?}"))?;
-        (notes.iter().collect::<Vec<_>>(), amount, fee, 0)
+    let amount = if sweep {
+        None
     } else {
         let amount_zat: u64 = args[5].parse().map_err(|_| "invalid amount")?;
         if amount_zat == 0 {
             return Err("amount must exceed zero".into());
         }
-        let amount = Zatoshis::from_u64(amount_zat).map_err(|e| format!("amount: {e:?}"))?;
-        // shortcut: ordinary payments select one covering note; use prepare-sweep to empty a vault.
-        let (note, fee, change) = notes
-            .iter()
-            .rev()
-            .find_map(|note| {
-                let inputs = CandidateInputs {
-                    vault_fvk: &member.fvk,
-                    notes: vec![note.note],
-                    recipient,
-                    amount,
-                    memo: memo.clone(),
-                    change: Zatoshis::ZERO,
-                    target_height: tip,
-                    expiry_height: expiry,
-                };
-                let fee = u64::from(quote_fee(&member.network, &inputs).ok()?);
-                let change = note.value_zat.checked_sub(amount_zat.checked_add(fee)?)?;
-                Some((note, fee, change))
-            })
-            .ok_or("no single vault note covers the amount and fee")?;
-        (vec![note], amount_zat, fee, change)
+        Some(Zatoshis::from_u64(amount_zat).map_err(|e| format!("amount: {e:?}"))?)
     };
+    let funding = wallet.propose(recipient, amount, memo)?;
+    if funding.notes.len() > MAX_INPUTS {
+        return Err(format!(
+            "this payment needs {} vault notes, but one payment can spend at most {MAX_INPUTS}; send a smaller amount first",
+            funding.notes.len()
+        ));
+    }
+    let (amount_zat, fee_zat, change_zat) = (funding.amount_zat, funding.fee_zat, funding.change_zat);
     let intent = Intent {
         proposer: member.key.identifier().serialize(),
         created_height: tip,
-        input_nullifiers: notes.iter().map(|note| note.nullifier).collect(),
+        input_nullifiers: funding.notes.iter().map(|note| note.nullifier(&member.fvk).to_bytes()).collect(),
         recipient: recipient.to_raw_address_bytes().to_vec(),
         amount_zat,
         memo: memo_text.as_bytes().to_vec(),
@@ -456,13 +353,28 @@ fn prepare(args: &[String], sweep: bool) -> Result<(), String> {
     let mut file = options
         .open(&target)
         .map_err(|e| format!("{}: {e}", target.display()))?;
-    file.write_all(serde_json::to_string_pretty(&value).unwrap().as_bytes())
-        .map_err(|e| e.to_string())?;
-    file.sync_all().map_err(|e| e.to_string())?;
+    // Hold the inputs for this attempt so this member's next draft funds itself elsewhere.
+    // Only a saved manifest can release them later, so undo both if either step fails.
+    let owner = LockOwner::new(attempt.0);
+    let saved = wallet
+        .reserve_inputs(owner, &intent.input_nullifiers, expiry)
+        .and_then(|()| {
+            file.write_all(serde_json::to_string_pretty(&value).unwrap().as_bytes())
+                .and_then(|()| file.sync_all())
+                .map_err(|e| {
+                    let _ = wallet.release_inputs(owner, &intent.input_nullifiers);
+                    format!("{}: {e}", target.display())
+                })
+        });
+    if let Err(e) = saved {
+        let _ = fs::remove_file(&target);
+        return Err(e);
+    }
     println!(
-        "payment={} attempt={} amount={} fee={} change={}",
+        "payment={} attempt={} inputs={} amount={} fee={} change={}",
         hex::encode(payment),
         hex::encode(attempt.0),
+        intent.input_nullifiers.len(),
         amount_zat,
         fee_zat,
         change_zat
@@ -510,23 +422,12 @@ fn candidate(
         return Err("candidate needs one commitment batch from each selected peer".into());
     }
     let rpc = member_rpc(member)?;
-    let (notes_found, _, _) = member_chain(member, owner, pass, &rpc, true)?;
-    let notes = intent
-        .input_nullifiers
-        .iter()
-        .map(|nf| {
-            notes_found
-                .iter()
-                .find(|note| note.nullifier == *nf)
-                .map(|note| note.note)
-                .ok_or_else(|| {
-                    format!(
-                        "input {} is absent from this member's chain scan",
-                        hex::encode(nf)
-                    )
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let (wallet, height, frontier) = synced_wallet(member, owner, pass, &rpc)?;
+    let notes = wallet
+        .ironwood_inputs_at(BlockHeight::from_u32(height), frontier, &intent.input_nullifiers)?
+        .into_iter()
+        .map(|(note, _)| note)
+        .collect();
     let recipient = Address::from_raw_address_bytes(&intent.recipient.clone().try_into().unwrap())
         .into_option()
         .ok_or("invalid recipient")?;
@@ -1081,11 +982,10 @@ fn finish(args: &[String], broadcast: bool) -> Result<(), String> {
         return Err("finish <member-dir> <passphrase-file> <roster.json> <work-dir> [lightwalletd-url]".into());
     }
     let (member, owner, pass) = state(args)?;
-    let endpoint = if broadcast {
-        broadcast_endpoint(member.network, args.get(4).map(String::as_str))?
-    } else {
-        None
-    };
+    let url = args.get(4).cloned().or_else(|| lightwalletd_url(member.network));
+    if broadcast && url.is_none() {
+        return Err("Testnet finish requires a lightwalletd URL".into());
+    }
     let work = Path::new(&args[3]);
     private_work(work)?;
     let (context, intent) = manifest(&work.join("payment.json"), member.network)?;
@@ -1146,101 +1046,52 @@ fn finish(args: &[String], broadcast: bool) -> Result<(), String> {
         );
         return Ok(());
     }
-    let mut rpc = None;
-    let mut lightwalletd = None;
-    let (witnesses, anchor) = match member.network {
-        VaultNetwork::Regtest => {
-            let node = Rpc::regtest();
-            let chain = chain_cache::scan(&node, &owner, &member.fvk, &member.vault)?;
-            let anchor = scan::chain_anchor(&node, chain.tip)?;
-            let witnesses = indices
-                .iter()
-                .zip(&intent.input_nullifiers)
-                .map(|(index, nf)| {
-                    let note = chain
-                        .notes
-                        .iter()
-                        .find(|note| note.nullifier == *nf)
-                        .ok_or_else(|| format!("finisher cannot find input {}", hex::encode(nf)))?;
-                    Ok((
-                        *index,
-                        loki_poc::witness::witness_for(&chain.cmxs, note.position, &anchor)?,
-                    ))
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            rpc = Some(node);
-            (witnesses, anchor)
-        }
-        VaultNetwork::Testnet => {
-            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .enable_all().build().map_err(|e| format!("start lightwalletd: {e}"))?;
-            let channel = runtime.block_on(
-                endpoint.ok_or("Testnet finish requires a lightwalletd URL")?
-                    .connect_timeout(Duration::from_secs(10))
-                    .timeout(Duration::from_secs(30))
-                    .connect(),
-            ).map_err(|e| format!("connect to lightwalletd: {e}"))?;
-            let mut client = CompactTxStreamerClient::new(channel);
-            let wallet = wallet(&member, &owner, &pass)?;
-            let height = wallet.scanned_height()?.ok_or("wallet has not scanned any blocks")?;
-            let info = runtime.block_on(client.get_lightd_info(Empty {}))
-                .map_err(|e| format!("lightwalletd info: {e}"))?.into_inner();
-            if info.chain_name != "test" || info.block_height != u64::from(height) {
-                return Err("wallet scan is behind lightwalletd; run loki_wallet_sync again".into());
-            }
-            let tree_state = runtime.block_on(client.get_tree_state(BlockId {
-                height: u64::from(height), hash: vec![],
-            })).map_err(|e| format!("lightwalletd tree state: {e}"))?.into_inner();
-            if tree_state.network != "test" || tree_state.height != u64::from(height)
-                || tree_state.hash != wallet.scanned_hash(BlockHeight::from_u32(height))?
-            {
-                return Err("wallet scan is on a different chain; run loki_wallet_sync again".into());
-            }
-            let tree = tree_state.ironwood_tree()
-                .map_err(|e| format!("Ironwood tree state: {e}"))?;
-            let anchor = tree.root().to_bytes();
-            let frontier = tree.to_frontier().value().cloned()
-                .ok_or("scanned Ironwood tree is empty")?;
-            let notes = wallet.ironwood_inputs_at(BlockHeight::from_u32(height), frontier)?;
-            let witnesses = indices
-                .iter()
-                .zip(&intent.input_nullifiers)
-                .map(|(index, nf)| {
-                    let note = notes
-                        .iter()
-                        .find(|(note, _)| note.note().nullifier(&member.fvk).to_bytes() == *nf)
-                        .ok_or_else(|| format!("finisher cannot find input {}", hex::encode(nf)))?;
-                    Ok((*index, note.1.clone()))
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            lightwalletd = Some((runtime, client));
-            (witnesses, anchor)
-        }
-    };
+    let runtime = runtime()?;
+    let url = url.ok_or("Testnet finish requires a lightwalletd URL")?;
+    let (mut wallet, mut client) = runtime.block_on(sync_member_wallet(&member, &owner, &pass, &url))?;
+    let height = wallet.scanned_height()?.ok_or("wallet has not scanned any blocks")?;
+    let info = runtime.block_on(client.get_lightd_info(Empty {}))
+        .map_err(|e| format!("lightwalletd info: {e}"))?.into_inner();
+    if info.block_height != u64::from(height) {
+        return Err("wallet scan is behind lightwalletd; finish again".into());
+    }
+    let tree_state = runtime.block_on(client.get_tree_state(BlockId {
+        height: u64::from(height), hash: vec![],
+    })).map_err(|e| format!("lightwalletd tree state: {e}"))?.into_inner();
+    if tree_state.network != info.chain_name || tree_state.height != u64::from(height)
+        || tree_state.hash != wallet.scanned_hash(BlockHeight::from_u32(height))?
+    {
+        return Err("wallet scan is on a different chain; finish again".into());
+    }
+    let tree = tree_state.ironwood_tree()
+        .map_err(|e| format!("Ironwood tree state: {e}"))?;
+    let anchor = tree.root().to_bytes();
+    let frontier = tree.to_frontier().value().cloned()
+        .ok_or("scanned Ironwood tree is empty")?;
+    let witnesses = indices
+        .iter()
+        .copied()
+        .zip(
+            wallet
+                .ironwood_inputs_at(BlockHeight::from_u32(height), frontier, &intent.input_nullifiers)?
+                .into_iter()
+                .map(|(_, path)| path),
+        )
+        .collect();
     let (raw, txid) = prove(signed, sighash, witnesses, anchor)?;
-    if member.network == VaultNetwork::Testnet {
-        // shortcut: ambiguous broadcast failures keep inputs locked until expiry; add mempool reconciliation for early release.
-        wallet(&member, &owner, &pass)?
-            .reserve_broadcast_inputs(txid, &intent.input_nullifiers, intent.expiry_height)?;
+    // A draft reservation this device holds passes to the broadcast transaction.
+    wallet.release_inputs(LockOwner::new(context.attempt.0), &intent.input_nullifiers)?;
+    // shortcut: ambiguous broadcast failures keep inputs locked until expiry; add mempool reconciliation for early release.
+    wallet.reserve_inputs(txid.into(), &intent.input_nullifiers, intent.expiry_height)?;
+    let sent = runtime.block_on(client.send_transaction(RawTransaction {
+        data: raw.clone(), height: 0,
+    })).map_err(|e| format!("lightwalletd send transaction: {e}"))?.into_inner();
+    if sent.error_code != 0 {
+        // The node refused the transaction, so it can never be mined: free its inputs.
+        wallet.release_inputs(txid.into(), &intent.input_nullifiers)?;
+        return Err(format!("lightwalletd rejected transaction ({}): {}", sent.error_code, sent.error_message));
     }
     let txid = txid.to_string();
-    if let Some((runtime, mut client)) = lightwalletd {
-        let sent = runtime.block_on(client.send_transaction(RawTransaction {
-            data: raw.clone(), height: 0,
-        })).map_err(|e| format!("lightwalletd send transaction: {e}"))?.into_inner();
-        if sent.error_code != 0 {
-            return Err(format!("lightwalletd rejected transaction ({}): {}", sent.error_code, sent.error_message));
-        }
-    } else {
-        let sent = rpc.ok_or("Regtest node unavailable")?.json(
-            "sendrawtransaction",
-            &format!("[\"{}\"]", hex::encode(&raw)),
-        )?;
-        if sent.as_str() != Some(&txid) {
-            return Err(format!("node returned a different txid: {sent}"));
-        }
-    }
     fs::write(work.join("final.hex"), hex::encode(&raw)).map_err(|e| e.to_string())?;
     println!(
         "broadcast txid={txid} payment={}",
@@ -1313,14 +1164,12 @@ fn verify(args: &[String]) -> Result<(), String> {
     if tx.txid().to_string() != *txid {
         return Err("mined transaction ID mismatch".into());
     }
-    if member.network == VaultNetwork::Testnet {
-        let wallet = wallet(&member, &owner, &pass)?;
-        let height = wallet.mined_height(tx.txid())?
-            .ok_or("payment confirmation is not in the wallet index; run loki_wallet_sync")?;
-        let hash = wallet.scanned_hash(height)?;
-        if tx_json["blockhash"].as_str() != Some(hash.as_str()) {
-            return Err("payment confirmation was reorganized; run loki_wallet_sync".into());
-        }
+    let wallet = wallet(&member, &owner, &pass)?;
+    let height = wallet.mined_height(tx.txid())?
+        .ok_or("payment confirmation is not in the wallet index; run loki_wallet_sync")?;
+    let hash = wallet.scanned_hash(height)?;
+    if tx_json["blockhash"].as_str() != Some(hash.as_str()) {
+        return Err("payment confirmation was reorganized; run loki_wallet_sync".into());
     }
     let mailbox = Mailbox::new(&work.join("mailbox")).map_err(|e| e.to_string())?;
     let package_message = if member.identity.public().id == context.signers[0] {
@@ -1507,29 +1356,6 @@ fn mined_spend_in_block(
     Ok(None)
 }
 
-/// The one transaction that spent every input of a payment, at or after its creation.
-fn mined_spend_in_index(
-    spent: &BTreeMap<[u8; 32], (u32, String)>,
-    inputs: &[[u8; 32]],
-    created_height: u32,
-) -> Result<Option<String>, String> {
-    if inputs.is_empty() {
-        return Err("payment has no input nullifiers".into());
-    }
-    let mut found = None;
-    for input in inputs {
-        match spent.get(input) {
-            Some((height, txid)) if *height >= created_height => match &found {
-                None => found = Some(txid.clone()),
-                Some(seen) if seen == txid => {}
-                Some(_) => return Ok(None),
-            },
-            _ => return Ok(None),
-        }
-    }
-    Ok(found)
-}
-
 /// Chain-derived txid discovery is a hint only. `verify` checks the exact
 /// approved candidate against the mined transaction before the app confirms it.
 fn find_mined(args: &[String]) -> Result<(), String> {
@@ -1542,24 +1368,13 @@ fn find_mined(args: &[String]) -> Result<(), String> {
     let (context, intent) = manifest(&work.join("payment.json"), member.network)?;
     check_manifest_roster(&member.roster, &context, &intent)?;
     let rpc = member_rpc(&member)?;
-    match member.network {
-        VaultNetwork::Regtest => {
-            let chain = chain_cache::scan_state(&rpc, Path::new(&args[0]), &member.fvk, &member.vault)?;
-            if let Some(txid) = mined_spend_in_index(&chain.spent, &intent.input_nullifiers, intent.created_height)? {
-                println!("mined txid={txid}");
-                return Ok(());
-            }
-        }
-        VaultNetwork::Testnet => {
-            let tip = rpc.json("getblockcount", "[]")?.as_u64()
-                .ok_or("getblockcount did not return a height")?;
-            for height in u64::from(intent.created_height)..=tip {
-                let block = rpc.json("getblock", &format!("[\"{height}\", 2]"))?;
-                if let Some(txid) = mined_spend_in_block(&block, &intent.input_nullifiers)? {
-                    println!("mined txid={txid}");
-                    return Ok(());
-                }
-            }
+    let tip = rpc.json("getblockcount", "[]")?.as_u64()
+        .ok_or("getblockcount did not return a height")?;
+    for height in u64::from(intent.created_height)..=tip {
+        let block = rpc.json("getblock", &format!("[\"{height}\", 2]"))?;
+        if let Some(txid) = mined_spend_in_block(&block, &intent.input_nullifiers)? {
+            println!("mined txid={txid}");
+            return Ok(());
         }
     }
     println!("not mined");
@@ -1677,62 +1492,9 @@ fn main() {
 }
 
 #[cfg(test)]
-mod broadcast_tests {
-    use super::*;
-
-    #[test]
-    fn endpoint_selection_and_plaintext_policy() {
-        assert!(broadcast_endpoint(VaultNetwork::Regtest, None).unwrap().is_none());
-        assert_eq!(
-            broadcast_endpoint(VaultNetwork::Testnet, Some("https://wallet.example"))
-                .unwrap().unwrap().uri().to_string(),
-            "https://wallet.example/"
-        );
-        assert!(broadcast_endpoint(VaultNetwork::Testnet, None).is_err());
-        assert!(broadcast_endpoint(VaultNetwork::Testnet, Some("http://localhost:9067")).is_ok());
-        assert!(broadcast_endpoint(VaultNetwork::Testnet, Some("http://127.0.0.1:9067")).is_ok());
-        assert!(broadcast_endpoint(VaultNetwork::Testnet, Some("http://wallet.example")).is_err());
-        assert!(broadcast_endpoint(VaultNetwork::Testnet, Some("http://127.0.0.1.evil.example")).is_err());
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use loki_poc::payment_manifest::{manifest_pair, proposer_id};
-
-    #[test]
-    fn mined_spend_discovery_requires_all_intent_inputs_in_one_transaction() {
-        let (first, second) = ([1u8; 32], [2u8; 32]);
-        let spent = BTreeMap::from([
-            (first, (40, "matching".to_string())),
-            (second, (40, "matching".to_string())),
-            ([3u8; 32], (41, "other".to_string())),
-            ([4u8; 32], (12, "early".to_string())),
-        ]);
-        assert_eq!(
-            mined_spend_in_index(&spent, &[first, second], 30).unwrap(),
-            Some("matching".into())
-        );
-        // Inputs spent by different transactions, an unspent input, or a spend before
-        // the payment existed are not this payment.
-        assert_eq!(mined_spend_in_index(&spent, &[first, [3u8; 32]], 30).unwrap(), None);
-        assert_eq!(mined_spend_in_index(&spent, &[first, [5u8; 32]], 30).unwrap(), None);
-        assert_eq!(mined_spend_in_index(&spent, &[[4u8; 32]], 30).unwrap(), None);
-        assert!(mined_spend_in_index(&spent, &[], 30).is_err());
-    }
-
-    #[test]
-    fn sweep_uses_every_note_and_leaves_only_the_quoted_fee() {
-        assert_eq!(
-            sweep_amount(&[30_000_000, 70_000_000], 15_000).unwrap(),
-            99_985_000
-        );
-        assert!(sweep_amount(&[], 10_000).is_err());
-        assert!(sweep_amount(&[10_000], 10_000).is_err());
-        assert!(sweep_amount(&[1; 9], 1).is_err());
-        assert!(sweep_amount(&[u64::MAX, 1], 1).is_err());
-    }
 
     #[test]
     fn local_wires_excludes_received_and_other_attempts() {

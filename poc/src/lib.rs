@@ -15,7 +15,6 @@
 //! an isolated patch to vendored orchard; see vendor/README.md.
 
 pub mod candidate;
-pub mod chain_cache;
 #[cfg(test)]
 mod coordinator;
 pub mod distributed_setup;
