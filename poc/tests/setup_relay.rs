@@ -1168,10 +1168,28 @@ fn run_owned_services_flow(mode: OwnedFlow, network: &str) {
             let evidence: serde_json::Value = serde_json::from_slice(&raw).unwrap();
             assert_eq!(evidence["recovery_version"], 2);
             assert_eq!(evidence["state"]["network"], network);
+            let ak: [u8; 32] = hex::decode(evidence["state"]["group_ak"].as_str().unwrap())
+                .unwrap().try_into().unwrap();
+            let sk: [u8; 32] = hex::decode(evidence["state"]["vault_secret"].as_str().unwrap())
+                .unwrap().try_into().unwrap();
+            let fvk = loki_poc::zip2005::frost_viewing_key(&ak, &sk).unwrap();
+            let network_type = zcash_protocol::consensus::Parameters::network_type(
+                &loki_poc::network::VaultNetwork::parse(network).unwrap(),
+            );
+            assert_eq!(
+                evidence["state"]["address"],
+                loki_poc::vault::unified_address(&fvk, network_type)
+            );
             if network == "testnet" {
                 assert_eq!(evidence["state"]["birth_height"], 4_465_026);
                 assert_eq!(evidence["roster"]["birth_height"], 4_465_026);
                 assert!(evidence["state"]["address"].as_str().unwrap().starts_with("utest"));
+                let fixed = loki_poc::vault::test_only_fvk(&ak).unwrap();
+                assert_ne!(fvk.to_bytes(), fixed.to_bytes());
+                assert_ne!(
+                    evidence["state"]["address"],
+                    loki_poc::vault::unified_address(&fixed, network_type)
+                );
             }
             assert_eq!(
                 evidence["receipts"].as_object().unwrap().len(),
