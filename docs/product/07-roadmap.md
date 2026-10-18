@@ -61,6 +61,24 @@ and refuses mainnet (release boundary).
 
 ---
 
+## WS7 — General t-of-n (de-hardcode) — FIRST task after round 2 merges
+
+Non-negotiable: Loki must be general **t-of-n**, not stuck at 2-of-3. The crypto was
+never the limit (`frost::keys::dkg::part1` + `zf_spine` are general); three Loki
+scaffolding limits must die:
+
+1. **DKG allow-list** — replace `matches!((threshold, members), (2,3)|(2,4)|(3,4))`
+   (`distributed_setup.rs:58`, also `:333/:404/:483`) with a general
+   `1 <= threshold <= members` check.
+2. **Pair-based payment** — generalize the "pair" model (`candidate.rs` "three pair
+   candidates", `signing_session.rs` "pair") to any size-`t` quorum (combinations), so
+   threshold ≠ 2 works (e.g. 3-of-5).
+3. **3-member relay** — removed by adopting `frostd` (arbitrary participant count; WS3).
+
+Gate: a 3-of-5 (and 2-of-5) testnet vault creates, funds, and completes a confirmed
+payment — proving no hardcoded N remains. Deferred only to avoid colliding with round 2,
+which is actively editing `candidate.rs`/`signing_session.rs`/the coordinator loop.
+
 ## Parallelization for an agent fleet
 
 | Track | Can start | Owns |
