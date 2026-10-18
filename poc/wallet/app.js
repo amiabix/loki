@@ -257,6 +257,14 @@ function zecFromZat(amount) {
   return `${zat / ZAT}.${(zat % ZAT).toString().padStart(8, '0')}`;
 }
 
+function balanceText(value) {
+  return value.network === 'testnet'
+    ? `${zecFromZat(value.balance_zat)} ZEC · scanned block ${value.height} of ${value.chain_tip}`
+      + (value.scan_ready ? ' · scan caught up' : ' · scan still catching up; balance may be incomplete')
+      + ` · last synced ${new Date(value.synced_at * 1000).toLocaleTimeString()}`
+    : `${zecFromZat(value.balance_zat)} ZEC`;
+}
+
 function amountEcho() {
   const slot = $('amount-zat');
   const raw = $('payment-draft').elements.amount_zec.value.trim();
@@ -813,6 +821,9 @@ async function refresh() {
       }
       else if (state.phase === 'active') {
         $('active').hidden = false;
+        if (testnet) $('balance').textContent = state.synced_balance
+          ? balanceText(state.synced_balance) + (state.sync_error ? ` · latest scan failed: ${state.sync_error}` : '')
+          : state.sync_error ? `Scan failed: ${state.sync_error}. Balance unavailable.` : 'Scanning this vault in the background…';
         memberSlot = state.slot;
         const paymentAvailable = [[2, 3], [2, 4], [3, 4]].some(([t, n]) => t === state.threshold && n === state.total_members)
           && (state.transport !== 'hosted' || state.handoff === 'ready');
@@ -845,7 +856,7 @@ async function refresh() {
         $('relay-note').textContent = state.relay_setup?.detail || '';
         $('relay-note').hidden = !state.relay_setup;
         relaySetupPhase = relayPhase;
-        paymentsLive = paymentAvailable && (!state.relay_setup || relayPhase === 'ready');
+        paymentsLive = paymentAvailable && (testnet || !state.relay_setup || relayPhase === 'ready');
         if (paymentAvailable && renderedPaymentVault !== selectedVault) await refreshPayments();
       }
       else if (state.phase === 'stopped') message('Setup stopped: ' + state.error + '. Start a fresh vault session.', true);
@@ -1012,10 +1023,7 @@ $('refresh-balance').addEventListener('click', async () => {
   try {
     const value = await api('balance', {vault});
     if (selectedVault !== vault) return;
-    $('balance').textContent = value.network === 'testnet'
-      ? `${zecFromZat(value.balance_zat)} ZEC · scanned block ${value.height} of ${value.chain_tip}`
-        + (value.scan_ready ? ' · scan caught up' : ' · scan still catching up; balance may be incomplete')
-      : `${zecFromZat(value.balance_zat)} ZEC`;
+    $('balance').textContent = balanceText(value);
     if (value.network === 'testnet' && !$('payment-list').hidden) refreshPaymentsQuietly(true);
   } catch (error) {
     if (selectedVault === vault) $('balance').textContent = `Scan failed: ${error.message}. Balance unavailable.`;

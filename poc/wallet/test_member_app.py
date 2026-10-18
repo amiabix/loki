@@ -213,6 +213,86 @@ class MemberWalletTest(unittest.TestCase):
                     wallet.balance(vault)
             self.assertIsNone(wallet.scan_height.get(vault))
 
+    def test_open_testnet_vault_syncs_in_background_without_overlap_and_stops_on_close(self):
+        with tempfile.TemporaryDirectory(prefix="loki-auto-sync-") as temp:
+            root = Path(temp)
+            vault = "a" * 64
+            wallet = Wallet(root / "member", root / "courier", network="testnet",
+                            lightwalletd_url="https://wallet.example", auto_sync_interval=0.05)
+            self.addCleanup(wallet.close)
+            member = wallet.data / "vaults" / vault
+            member.mkdir(parents=True)
+            (member / "membership.json").write_text(json.dumps({
+                "vault": vault, "profile": "profile", "slot": 1, "network": "testnet"}))
+            (member / "final-backup-checked").write_text("checked")
+            wallet.profile_data = {"id": "profile"}
+            wallet.passphrase = "a long passphrase"
+            calls, release, second_release = root / "calls", root / "release", root / "release-two"
+            fake = root / "loki_wallet_sync"
+            fake.write_text("#!/usr/bin/env python3\nimport json, pathlib, sys, time\n"
+                            f"assert sys.argv[1] == {str(member)!r}\n"
+                            f"assert sys.argv[3:] == [{str(member / 'roster.json')!r}, 'https://wallet.example']\n"
+                            "assert pathlib.Path(sys.argv[2]).is_file()\n"
+                            f"calls = pathlib.Path({str(calls)!r})\n"
+                            "with calls.open('a') as out: out.write('scan\\n')\n"
+                            f"release = pathlib.Path({str(release)!r} if len(calls.read_text().splitlines()) == 1 "
+                            f"else {str(second_release)!r})\n"
+                            "deadline = time.monotonic() + 5\n"
+                            "while not release.exists() and time.monotonic() < deadline: time.sleep(.01)\n"
+                            "print(json.dumps({" + f"'vault': {vault!r}, "
+                            "'network': 'testnet', 'height': 4500010, 'chain_tip': 4500012, "
+                            "'balance_zat': 400000}))\n")
+            fake.chmod(0o700)
+            with patch.object(member_app, "WALLET_SYNC", fake), \
+                 patch.object(wallet, "status", side_effect=lambda name=None: {
+                     "phase": "active" if name else "home", "network": "testnet"}):
+                server, token = make_signer_server(wallet, 0)
+                threading.Thread(target=server.serve_forever, daemon=True).start()
+                self.addCleanup(server.server_close)
+                self.addCleanup(server.shutdown)
+
+                def status(path):
+                    conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=2)
+                    conn.request("GET", path, headers={"X-Loki-Token": token})
+                    response = conn.getresponse()
+                    result = response.status, json.loads(response.read())
+                    conn.close()
+                    return result
+
+                self.assertEqual(status("/api/status?vault=" + vault)[0], 200)
+                deadline = time.monotonic() + 2
+                while not calls.exists() and time.monotonic() < deadline:
+                    time.sleep(.01)
+                self.assertTrue(calls.exists(), f"opening the vault starts a scan: {wallet.sync_errors}")
+                time.sleep(.15)
+                self.assertEqual(calls.read_text().splitlines(), ["scan"])
+                self.assertEqual(status("/api/status?vault=" + vault)[0], 200,
+                                 "a long scan must not block status")
+                release.touch()
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    code, state = status("/api/status?vault=" + vault)
+                    if (state.get("synced_balance") or {}).get("balance_zat") == 400000:
+                        break
+                    time.sleep(.01)
+                self.assertEqual(code, 200)
+                self.assertEqual(state["synced_balance"]["height"], 4500010)
+                self.assertGreater(state["synced_balance"]["synced_at"], 0)
+                self.assertEqual(wallet.scan_height[vault], 4500010)
+                deadline = time.monotonic() + 2
+                while len(calls.read_text().splitlines()) < 2 and time.monotonic() < deadline:
+                    time.sleep(.01)
+                self.assertGreaterEqual(len(calls.read_text().splitlines()), 2,
+                                        "the next interval starts another scan")
+                process = wallet.auto_sync_process[1]
+                self.assertIsNone(process.poll())
+                self.assertEqual(status("/api/status")[0], 200)
+                self.assertIsNotNone(process.poll(), "closing the vault stops its running scan")
+                count = len(calls.read_text().splitlines())
+                self.assertFalse(second_release.exists(), "the second scan was still running on close")
+                time.sleep(.15)
+                self.assertEqual(len(calls.read_text().splitlines()), count)
+
     def test_testnet_refresh_labels_payments_from_synced_wallet(self):
         with tempfile.TemporaryDirectory(prefix="loki-testnet-confirmations-") as temp:
             wallet, vault, attempt = self.payment_fixture(temp, phase="broadcast", txid="01" + "23" * 30 + "45")

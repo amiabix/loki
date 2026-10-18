@@ -16,6 +16,7 @@ import http.client
 import ipaddress
 from itertools import combinations
 import json
+import math
 import os
 import re
 import secrets
@@ -418,11 +419,14 @@ class SignerSessions:
 
 
 class Wallet:
-    def __init__(self, data, exchange, setup=None, invite_origin=None, transport="local", operator_bundle=None, operator_key=None, enrollment_grant=None, development_http=False, enrollment_issuer=None, network="regtest", lightwalletd_url=None):
+    def __init__(self, data, exchange, setup=None, invite_origin=None, transport="local", operator_bundle=None, operator_key=None, enrollment_grant=None, development_http=False, enrollment_issuer=None, network="regtest", lightwalletd_url=None, auto_sync_interval=60):
         if network not in ("regtest", "testnet"):
             raise ValueError("Choose regtest or testnet")
+        if not isinstance(auto_sync_interval, (int, float)) or not math.isfinite(auto_sync_interval) or auto_sync_interval <= 0:
+            raise ValueError("Wallet sync interval must be positive")
         self.network = network
         self.lightwalletd_url = lightwalletd_url
+        self.auto_sync_interval = auto_sync_interval
         self.data = data.resolve()
         # Hosted vaults never use the local courier; an exchange given for script
         # compatibility is still checked and otherwise ignored.
@@ -468,6 +472,16 @@ class Wallet:
         self.setup_errors = {}
         self.relay_payment_ready = False
         self.scan_height = {}
+        self.synced_balance = {}
+        self.sync_errors = {}
+        self.wallet_sync_lock = threading.Lock()
+        self.auto_sync_state_lock = threading.RLock()
+        self.auto_sync_stop = None
+        self.auto_sync_thread = None
+        self.auto_sync_vault = None
+        self.auto_sync_local = threading.local()
+        self.auto_sync_process_lock = threading.Lock()
+        self.auto_sync_process = None
         self.relay_jobs = {}
         self.relay_binary = RELAY
         self.relay_attempts = {}
@@ -495,6 +509,12 @@ class Wallet:
                     argv.append(str(arg))
             started = time.monotonic()
             process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            sync_stop = getattr(self.auto_sync_local, "stop", None)
+            if sync_stop is not None and binary == WALLET_SYNC:
+                with self.auto_sync_process_lock:
+                    self.auto_sync_process = (sync_stop, process)
+                    if sync_stop.is_set():
+                        process.terminate()
             tracked = self.payment_worker.track(process)
             try:
                 stdout, stderr = process.communicate(timeout=timeout)
@@ -506,6 +526,10 @@ class Wallet:
             finally:
                 if tracked:
                     self.payment_worker.untrack(process)
+                if sync_stop is not None and binary == WALLET_SYNC:
+                    with self.auto_sync_process_lock:
+                        if self.auto_sync_process == (sync_stop, process):
+                            self.auto_sync_process = None
             timing.record(f"{binary.name} {action}", started, process.returncode, *args, stderr=stderr)
             if process.returncode:
                 if self.payment_worker.stop_event.is_set() and tracked:
@@ -559,6 +583,7 @@ class Wallet:
         return {"locked": True}
 
     def stop_workers(self):
+        self.stop_auto_sync()
         failures = []
         if self.hosted:
             def stop_hosted():
@@ -1297,7 +1322,65 @@ class Wallet:
             raise ValueError("Hosted payment activation is pending")
         return self.command("address", member_dir, "@pass")
 
-    def balance(self, vault):
+    def watch_vault(self, vault):
+        with self.auto_sync_state_lock:
+            if self.network != "testnet" or not self.lightwalletd_url:
+                return
+            if vault == self.auto_sync_vault and self.auto_sync_thread and self.auto_sync_thread.is_alive():
+                return
+            self.stop_auto_sync()
+            if vault is None:
+                return
+            self.vault_dir(vault)
+            stop = threading.Event()
+            self.auto_sync_stop = stop
+            self.auto_sync_vault = vault
+
+            def run():
+                self.auto_sync_local.stop = stop
+                while not stop.is_set():
+                    try:
+                        self.balance(vault, stop_event=stop)
+                    except Exception as error:
+                        if not stop.is_set():
+                            self.sync_errors[vault] = str(error)
+                    if stop.wait(self.auto_sync_interval):
+                        break
+
+            self.auto_sync_thread = threading.Thread(target=run, daemon=True, name="wallet-auto-sync")
+            self.auto_sync_thread.start()
+
+    def stop_auto_sync(self):
+        with self.auto_sync_state_lock:
+            stop, thread = self.auto_sync_stop, self.auto_sync_thread
+            if stop is None:
+                return
+            stop.set()
+            with self.auto_sync_process_lock:
+                if self.auto_sync_process and self.auto_sync_process[0] is stop:
+                    process = self.auto_sync_process[1]
+                    if process.poll() is None:
+                        process.terminate()
+            if thread is not threading.current_thread():
+                thread.join(timeout=2)
+                if thread.is_alive():
+                    with self.auto_sync_process_lock:
+                        if self.auto_sync_process and self.auto_sync_process[0] is stop:
+                            process = self.auto_sync_process[1]
+                            if process.poll() is None:
+                                process.kill()
+                    thread.join(timeout=2)
+            self.auto_sync_stop = None
+            self.auto_sync_thread = None
+            self.auto_sync_vault = None
+
+    def balance(self, vault, stop_event=None):
+        with self.wallet_sync_lock:
+            if stop_event is not None and stop_event.is_set():
+                return None
+            return self._balance(vault)
+
+    def _balance(self, vault):
         member_dir, _ = self.vault_dir(vault)
         if self.network == "testnet":
             if not self.lightwalletd_url:
@@ -1318,6 +1401,9 @@ class Wallet:
             raise ValueError("Chain scan returned another vault")
         if self.network == "testnet":
             self.scan_height[vault] = result["height"]
+            result["synced_at"] = int(time.time())
+            self.synced_balance[vault] = result
+            self.sync_errors.pop(vault, None)
         return result
 
     def fund_vault(self, vault, request_id):
@@ -2301,7 +2387,14 @@ def make_signer_server(wallet, port, dashboard_port=None):
                 if path == "/api/accounts" and isinstance(wallet, Accounts):
                     return self.reply(200, wallet.accounts())
                 if path == "/api/status":
-                    return self.reply(200, wallet.status(vault))
+                    state = wallet.status(vault)
+                    with wallet.lock:
+                        wallet.watch_vault(vault if state["phase"] == "active" and wallet.profile_data else None)
+                    if vault and wallet.network == "testnet":
+                        state["synced_balance"] = wallet.synced_balance.get(vault)
+                        state["sync_error"] = (wallet.sync_errors.get(vault) if wallet.lightwalletd_url else
+                                               "Set --lightwalletd-url to scan this Testnet vault")
+                    return self.reply(200, state)
                 if path == "/api/payments":
                     with wallet.lock:
                         payments = wallet.payments(vault)
@@ -2374,6 +2467,8 @@ def make_signer_server(wallet, port, dashboard_port=None):
                     wallet.payment_worker.sync_now(wallet.checked_vault_id(value.get("vault")))
                     with wallet.lock:
                         return self.reply(200, wallet.payments(value.get("vault")))
+                if self.path == "/api/balance" and wallet.network == "testnet":
+                    return self.reply(200, wallet.balance(value.get("vault")))
                 with wallet.lock:
                     if self.path == "/api/session/approve":
                         wallet.require_profile()
@@ -2539,6 +2634,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Member vault app")
     parser.add_argument("--network", choices=("regtest", "testnet"), default="regtest")
     parser.add_argument("--lightwalletd-url", help="HTTPS Testnet lightwalletd endpoint for vault scan and broadcast")
+    parser.add_argument("--wallet-sync-interval", type=float, default=60,
+                        help="seconds between background Testnet wallet scans (default: 60)")
     parser.add_argument("--data", type=Path, required=True, help="private app data directory")
     parser.add_argument("--exchange", type=Path, help="shared untrusted local setup courier (local transport only)")
     parser.add_argument("--port", type=int, required=True)
@@ -2578,5 +2675,6 @@ if __name__ == "__main__":
                    operator_bundle=args.operator_bundle, operator_key=args.operator_key,
                    enrollment_grant=args.enrollment_grant, development_http=args.development_http,
                    enrollment_issuer=args.enrollment_issuer, network=args.network,
-                   lightwalletd_url=args.lightwalletd_url), args.port,
+                   lightwalletd_url=args.lightwalletd_url,
+                   auto_sync_interval=args.wallet_sync_interval), args.port,
           args.dashboard_port, args.invite_port)
