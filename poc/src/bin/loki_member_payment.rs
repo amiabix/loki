@@ -37,6 +37,7 @@ use serde_json::json;
 use std::os::unix::fs::OpenOptionsExt;
 use zcash_protocol::{consensus::Parameters, memo::MemoBytes, value::Zatoshis};
 use zcash_protocol::consensus::{BlockHeight, Network};
+use zcash_primitives::transaction::TxId;
 use zeroize::{Zeroize, Zeroizing};
 
 fn signer_set_from_name(name: &str, threshold: u16) -> Result<Vec<u16>, String> {
@@ -104,7 +105,7 @@ fn wallet(member: &MemberState, owner: &Path, pass: &str) -> Result<VaultWallet,
 }
 
 fn member_chain(
-    member: &MemberState, owner: &Path, pass: &str, rpc: &Rpc,
+    member: &MemberState, owner: &Path, pass: &str, rpc: &Rpc, include_reserved: bool,
 ) -> Result<(Vec<SpendNote>, u64, Option<[u8; 32]>), String> {
     match member.network {
         VaultNetwork::Regtest => {
@@ -145,7 +146,12 @@ fn member_chain(
                 != Some(saved_hash.as_str()) {
                 return Err("wallet scan is on a different chain; run loki_wallet_sync again".into());
             }
-            let notes = wallet.ironwood_inputs_at(block, frontier)?
+            let inputs = if include_reserved {
+                wallet.ironwood_inputs_at(block, frontier)?
+            } else {
+                wallet.spendable_ironwood_inputs_at(block, frontier)?
+            };
+            let notes = inputs
                 .into_iter().map(|(received, witness)| {
                     let note = *received.note();
                     SpendNote {
@@ -263,7 +269,7 @@ fn balance(args: &[String]) -> Result<(), String> {
     )?;
     let (balance_zat, tip, note_count) = match member.network {
         VaultNetwork::Regtest => {
-            let (notes, tip, _) = member_chain(&member, Path::new(&args[0]), "", &member_rpc(&member)?)?;
+            let (notes, tip, _) = member_chain(&member, Path::new(&args[0]), "", &member_rpc(&member)?, false)?;
             let total = notes.iter().try_fold(0u64, |sum, note| sum.checked_add(note.value_zat))
                 .ok_or("vault balance exceeds u64")?;
             (total, tip, notes.len())
@@ -325,7 +331,7 @@ fn prepare(args: &[String], sweep: bool) -> Result<(), String> {
     let work = Path::new(&args[3]);
     private_work(work)?;
     let rpc = member_rpc(&member)?;
-    let (notes, height, _) = member_chain(&member, &owner, &pass, &rpc)?;
+    let (notes, height, _) = member_chain(&member, &owner, &pass, &rpc, false)?;
     let tip: u32 = height.try_into().map_err(|_| "height overflow")?;
     let recipient = vault::orchard_receiver_from_ua(&args[4], member.network.network_type())?;
     let memo_text = &args[if sweep { 5 } else { 6 }];
@@ -479,7 +485,7 @@ fn candidate(
         return Err("candidate needs one commitment batch from each selected peer".into());
     }
     let rpc = member_rpc(member)?;
-    let (notes_found, _, _) = member_chain(member, owner, pass, &rpc)?;
+    let (notes_found, _, _) = member_chain(member, owner, pass, &rpc, true)?;
     let notes = intent
         .input_nullifiers
         .iter()
@@ -1002,7 +1008,7 @@ fn prove(
     sighash: [u8; 32],
     witnesses: Vec<(usize, orchard::tree::MerklePath)>,
     anchor: [u8; 32],
-) -> Result<(Vec<u8>, String), String> {
+) -> Result<(Vec<u8>, TxId), String> {
     use pczt::roles::{
         prover::Prover, signer::Signer, spend_finalizer::SpendFinalizer,
         tx_extractor::TransactionExtractor, updater::Updater,
@@ -1042,7 +1048,7 @@ fn prove(
     let mut raw = Vec::new();
     tx.write(&mut raw)
         .map_err(|e| format!("serialize transaction: {e}"))?;
-    Ok((raw, tx.txid().to_string()))
+    Ok((raw, tx.txid()))
 }
 
 fn finish(args: &[String], broadcast: bool) -> Result<(), String> {
@@ -1133,7 +1139,7 @@ fn finish(args: &[String], broadcast: bool) -> Result<(), String> {
             (witnesses, anchor)
         }
         VaultNetwork::Testnet => {
-            let (notes, _, anchor) = member_chain(&member, &owner, &pass, &rpc)?;
+            let (notes, _, anchor) = member_chain(&member, &owner, &pass, &rpc, true)?;
             let anchor = anchor.ok_or("wallet has no Ironwood anchor")?;
             let witnesses = indices
                 .iter()
@@ -1150,6 +1156,12 @@ fn finish(args: &[String], broadcast: bool) -> Result<(), String> {
         }
     };
     let (raw, txid) = prove(signed, sighash, witnesses, anchor)?;
+    if member.network == VaultNetwork::Testnet {
+        // shortcut: ambiguous RPC failures keep inputs locked until expiry; add mempool reconciliation for early release.
+        wallet(&member, &owner, &pass)?
+            .reserve_broadcast_inputs(txid, &intent.input_nullifiers, intent.expiry_height)?;
+    }
+    let txid = txid.to_string();
     let sent = rpc.json(
         "sendrawtransaction",
         &format!("[\"{}\"]", hex::encode(&raw)),

@@ -12,14 +12,14 @@ use rand_zp::{rand_core::UnwrapErr, rngs::SysRng};
 use rusqlite::{Connection, OptionalExtension};
 use zcash_client_backend::{
     data_api::{
-        AccountBirthday, AccountPurpose, WalletRead, WalletWrite,
+        AccountBirthday, AccountPurpose, OutputLockStore, WalletRead, WalletWrite,
         chain::{
             BlockCache, BlockSource, ChainState, error::Error as ScanError, scan_cached_blocks,
         },
         scanning::ScanRange,
     },
     proto::compact_formats::CompactBlock,
-    wallet::ReceivedNote,
+    wallet::{LockOwner, OutputRef, ReceivedNote},
 };
 use zcash_client_sqlite::{
     ReceivedNoteId, WalletDb, util::SystemClock, wallet::init::init_wallet_db,
@@ -27,6 +27,7 @@ use zcash_client_sqlite::{
 use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_primitives::transaction::TxId;
 use zcash_protocol::consensus::{BlockHeight, Network};
+use zcash_protocol::PoolType;
 use zeroize::Zeroizing;
 
 type Database = WalletDb<Connection, Network, SystemClock, UnwrapErr<SysRng>>;
@@ -171,7 +172,8 @@ impl VaultWallet {
             100,
         )
         .await
-        .map_err(|e| format!("sync Testnet wallet: {e}"))
+        .map_err(|e| format!("sync Testnet wallet: {e}"))?;
+        self.release_confirmed_reservations()
     }
 
     pub fn open(
@@ -349,7 +351,7 @@ impl VaultWallet {
                 BlockHeight::try_from(last.height).map_err(|_| "block height overflow")?,
             )
             .map_err(|e| format!("save chain tip: {e}"))?;
-        Ok(())
+        self.release_confirmed_reservations()
     }
 
     pub fn scanned_height(&self) -> Result<Option<u32>, String> {
@@ -443,6 +445,122 @@ impl VaultWallet {
             .zip(witnesses.into_iter().map(MerklePath::from))
             .collect())
     }
+
+    pub fn spendable_ironwood_inputs_at(
+        &self,
+        height: BlockHeight,
+        frontier: NonEmptyFrontier<MerkleHashOrchard>,
+    ) -> Result<Vec<(ReceivedNote<ReceivedNoteId, Note>, MerklePath)>, String> {
+        let account = self
+            .db
+            .get_account_ids()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .next()
+            .ok_or("wallet has no vault account")?;
+        let locked = self
+            .db
+            .get_locked_outputs(account)
+            .map_err(|e| format!("read reserved inputs: {e}"))?;
+        Ok(self
+            .ironwood_inputs_at(height, frontier)?
+            .into_iter()
+            .filter(|(note, _)| {
+                !locked.contains(&OutputRef::new(
+                    *note.txid(),
+                    PoolType::IRONWOOD,
+                    note.output_index().into(),
+                ))
+            })
+            .collect())
+    }
+
+    pub fn reserve_broadcast_inputs(
+        &mut self,
+        txid: TxId,
+        nullifiers: &[[u8; 32]],
+        expiry_height: u32,
+    ) -> Result<(), String> {
+        let height = self
+            .scanned_height()?
+            .ok_or("wallet has not scanned any blocks")?;
+        if nullifiers.is_empty() || expiry_height <= height {
+            return Err("payment has no inputs or has expired".into());
+        }
+        let account = self
+            .db
+            .get_account_ids()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .next()
+            .ok_or("wallet has no vault account")?;
+        let fvk = self.viewing_key()?;
+        let notes = self
+            .db
+            .get_unspent_ironwood_notes_at_historical_height(account, BlockHeight::from_u32(height))
+            .map_err(|e| format!("read Ironwood notes: {e}"))?;
+        let outputs = nullifiers
+            .iter()
+            .map(|nf| {
+                notes
+                    .iter()
+                    .find(|note| note.note().nullifier(&fvk).to_bytes() == *nf)
+                    .map(|note| {
+                        OutputRef::new(*note.txid(), PoolType::IRONWOOD, note.output_index().into())
+                    })
+                    .ok_or_else(|| format!("payment input {} is not unspent", hex::encode(nf)))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.db
+            .lock_outputs(&outputs, txid.into(), BlockHeight::from_u32(expiry_height))
+            .map_err(|e| format!("reserve payment inputs: {e}"))?;
+        Ok(())
+    }
+
+    fn release_confirmed_reservations(&mut self) -> Result<(), String> {
+        let account = self
+            .db
+            .get_account_ids()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .next()
+            .ok_or("wallet has no vault account")?;
+        let locked = self
+            .db
+            .get_locked_outputs(account)
+            .map_err(|e| format!("read reserved inputs: {e}"))?;
+        if locked.is_empty() {
+            return Ok(());
+        }
+        self.db
+            .transactionally_with_extension(|db, ext| {
+                for output in locked
+                    .iter()
+                    .filter(|output| output.pool() == PoolType::IRONWOOD)
+                {
+                    let owner: Option<Vec<u8>> = ext
+                        .query_row(
+                            "SELECT rn.lock_owner FROM ironwood_received_notes rn \
+                     JOIN transactions t ON t.id_tx = rn.transaction_id \
+                     WHERE t.txid = ?1 AND rn.action_index = ?2",
+                            rusqlite::params![output.txid().as_ref(), output.output_index()],
+                            |row| row.get(0),
+                        )
+                        .optional()?
+                        .flatten();
+                    if let Some(owner) = owner {
+                        let owner: [u8; 32] = owner
+                            .try_into()
+                            .map_err(|_| io::Error::other("invalid payment reservation owner"))?;
+                        if db.get_tx_height(TxId::from_bytes(owner))?.is_some() {
+                            db.unlock_output(output, LockOwner::new(owner))?;
+                        }
+                    }
+                }
+                Ok::<(), Box<dyn std::error::Error>>(())
+            })
+            .map_err(|e| format!("release confirmed payment inputs: {e}"))
+    }
 }
 
 #[cfg(test)]
@@ -514,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn reorg_removes_confirmed_note_from_reopened_wallet() {
+    fn broadcast_reservation_expires_and_reorg_releases_confirmed_spend() {
         let fvk = FullViewingKey::from(&SpendingKey::from_bytes([3; 32]).unwrap());
         let height = crate::network::TESTNET_NU7_BIRTH;
         let prior = ChainState::empty(BlockHeight::from_u32(height - 1), BlockHash([7; 32]));
@@ -566,8 +684,14 @@ mod tests {
         drop(wallet);
         let mut wallet =
             VaultWallet::open_existing(&path, Network::TestNetwork, &fvk, height, "pass").unwrap();
-        assert_eq!(wallet.scanned_hash(BlockHeight::from_u32(height)).unwrap(), BlockHash([8; 32]).to_string());
-        assert_eq!(wallet.mined_height(TxId::from_bytes([6; 32])).unwrap(), Some(BlockHeight::from_u32(height)));
+        assert_eq!(
+            wallet.scanned_hash(BlockHeight::from_u32(height)).unwrap(),
+            BlockHash([8; 32]).to_string()
+        );
+        assert_eq!(
+            wallet.mined_height(TxId::from_bytes([6; 32])).unwrap(),
+            Some(BlockHeight::from_u32(height))
+        );
         assert_eq!(wallet.ironwood_balance_zat().unwrap(), 50_000);
         assert_eq!(
             wallet
@@ -585,6 +709,139 @@ mod tests {
             .unwrap();
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].1.root(cmx).to_bytes(), frontier.root().to_bytes());
+        let nullifier = note.nullifier(&fvk).to_bytes();
+        let payment_txid = TxId::from_bytes([10; 32]);
+        wallet
+            .reserve_broadcast_inputs(payment_txid, &[nullifier], height + 1)
+            .unwrap();
+        assert!(wallet
+            .reserve_broadcast_inputs(TxId::from_bytes([11; 32]), &[nullifier], height + 1)
+            .is_err());
+        drop(wallet);
+        let mut wallet =
+            VaultWallet::open_existing(&path, Network::TestNetwork, &fvk, height, "pass").unwrap();
+        assert!(wallet
+            .spendable_ironwood_inputs_at(
+                BlockHeight::from_u32(height),
+                frontier.value().unwrap().clone()
+            )
+            .unwrap()
+            .is_empty());
+
+        let funded_state = ChainState::new(
+            BlockHeight::from_u32(height),
+            BlockHash([8; 32]),
+            Frontier::empty(),
+            Frontier::empty(),
+            frontier.clone(),
+        );
+        let empty = CompactBlock {
+            height: u64::from(height + 1),
+            hash: vec![9; 32],
+            prev_hash: vec![8; 32],
+            chain_metadata: Some(ChainMetadata {
+                ironwood_commitment_tree_size: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        wallet.sync_blocks(&funded_state, &[empty]).unwrap();
+        assert_eq!(
+            wallet
+                .spendable_ironwood_inputs_at(
+                    BlockHeight::from_u32(height + 1),
+                    frontier.value().unwrap().clone()
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+
+        wallet
+            .reserve_broadcast_inputs(payment_txid, &[nullifier], height + 10)
+            .unwrap();
+        assert!(wallet
+            .spendable_ironwood_inputs_at(
+                BlockHeight::from_u32(height + 1),
+                frontier.value().unwrap().clone()
+            )
+            .unwrap()
+            .is_empty());
+        let before_spend = ChainState::new(
+            BlockHeight::from_u32(height + 1),
+            BlockHash([9; 32]),
+            Frontier::empty(),
+            Frontier::empty(),
+            frontier.clone(),
+        );
+        let spent = CompactBlock {
+            height: u64::from(height + 2),
+            hash: vec![10; 32],
+            prev_hash: vec![9; 32],
+            vtx: vec![CompactTx {
+                txid: payment_txid.as_ref().to_vec(),
+                index: 1,
+                ironwood_actions: vec![CompactOrchardAction {
+                    nullifier: nullifier.to_vec(),
+                    cmx: vec![0; 32],
+                    ephemeral_key: vec![0; 32],
+                    ciphertext: vec![0; 52],
+                }],
+                ..Default::default()
+            }],
+            chain_metadata: Some(ChainMetadata {
+                ironwood_commitment_tree_size: 2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        wallet.sync_blocks(&before_spend, &[spent]).unwrap();
+        assert_eq!(
+            wallet.mined_height(payment_txid).unwrap(),
+            Some(BlockHeight::from_u32(height + 2))
+        );
+        assert_eq!(
+            wallet
+                .ironwood_note_count(BlockHeight::from_u32(height + 2))
+                .unwrap(),
+            0
+        );
+        assert!(wallet
+            .spendable_ironwood_inputs_at(
+                BlockHeight::from_u32(height + 2),
+                frontier.value().unwrap().clone()
+            )
+            .unwrap()
+            .is_empty());
+        wallet
+            .db
+            .truncate_to_chain_state(before_spend.clone())
+            .unwrap();
+        let replacement_spend = CompactBlock {
+            height: u64::from(height + 2),
+            hash: vec![11; 32],
+            prev_hash: vec![9; 32],
+            chain_metadata: Some(ChainMetadata {
+                ironwood_commitment_tree_size: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        wallet
+            .sync_blocks(&before_spend, &[replacement_spend])
+            .unwrap();
+        assert_eq!(wallet.mined_height(payment_txid).unwrap(), None);
+        assert_eq!(
+            wallet
+                .spendable_ironwood_inputs_at(
+                    BlockHeight::from_u32(height + 2),
+                    frontier.value().unwrap().clone()
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+
         wallet.db.truncate_to_chain_state(prior.clone()).unwrap();
         let replacement = CompactBlock {
             height: u64::from(height),
@@ -594,8 +851,14 @@ mod tests {
             ..Default::default()
         };
         wallet.sync_blocks(&prior, &[replacement]).unwrap();
-        assert_eq!(wallet.scanned_hash(BlockHeight::from_u32(height)).unwrap(), BlockHash([9; 32]).to_string());
-        assert_eq!(wallet.mined_height(TxId::from_bytes([6; 32])).unwrap(), None);
+        assert_eq!(
+            wallet.scanned_hash(BlockHeight::from_u32(height)).unwrap(),
+            BlockHash([9; 32]).to_string()
+        );
+        assert_eq!(
+            wallet.mined_height(TxId::from_bytes([6; 32])).unwrap(),
+            None
+        );
         assert_eq!(
             wallet
                 .ironwood_note_count(BlockHeight::from_u32(height))
