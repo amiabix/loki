@@ -2,9 +2,13 @@
 const token = location.hash.slice(1);
 const $ = (id) => document.getElementById(id);
 const OPEN_VAULT = 'loki-open-vault';
+const OPEN_ACCOUNT = 'loki-open-account';
 let selectedVault;
 try { selectedVault = sessionStorage.getItem(OPEN_VAULT); }
 catch { selectedVault = null; }
+let activeAccount = null;
+let renderedAccounts = null;
+let refreshVersion = 0;
 let linkChallenge = null;
 let memberSlot = null;
 let memberCount = null;
@@ -47,6 +51,9 @@ function selectVault(vault) {
   $('payment-updates').textContent = '';
   $('relay-state').textContent = 'Relay connection has not been checked on this device.';
   $('relay-downloads').replaceChildren();
+  $('link-challenge').textContent = '';
+  $('link-challenge').hidden = true;
+  $('download-challenge').hidden = true;
   renderedInvites = null;
 }
 
@@ -74,6 +81,7 @@ function clearFailures() {
 }
 
 function failure(error) {
+  if (error.stale) return;
   clearFailures();
   const slot = error.surface && document.getElementById(`fail-${error.surface}`);
   if (!slot) { message(error.message, true); return; }
@@ -86,6 +94,7 @@ function failure(error) {
 }
 async function api(path, body) {
   if (!token) throw new Error('Open the private local app link printed by the server.');
+  const version = refreshVersion;
   const response = await fetch(`/api/${path}`, {
     method: body === undefined ? 'GET' : 'POST',
     headers: {'X-Loki-Token': token, ...(body === undefined ? {} : {'Content-Type': 'application/json'})},
@@ -93,6 +102,11 @@ async function api(path, body) {
     cache: 'no-store',
   });
   const result = await response.json();
+  if (version !== refreshVersion && !['accounts', 'account-create', 'account-switch'].includes(path)) {
+    const stale = new Error('Account changed');
+    stale.stale = true;
+    throw stale;
+  }
   if (!response.ok) {
     const failure = new Error(result.error || 'Request failed');
     failure.surface = result.surface || '';   /* which action raised it */
@@ -145,6 +159,44 @@ function vaultList(vaults) {
     item.append(button, detail);
     list.append(item);
   }
+}
+
+async function refreshAccounts(version) {
+  const {active, accounts} = await api('accounts');
+  if (version !== refreshVersion) return;
+  let previous = null;
+  try { previous = sessionStorage.getItem(OPEN_ACCOUNT); }
+  catch { /* Private browsing may disable session storage. */ }
+  if (active !== activeAccount) {
+    ++refreshVersion;
+    if (activeAccount !== null || previous !== active) selectVault(null);
+    activeAccount = active;
+    try { sessionStorage.setItem(OPEN_ACCOUNT, active); }
+    catch { /* Private browsing may disable session storage. */ }
+  }
+  const shown = JSON.stringify([active, accounts]);
+  if (shown === renderedAccounts) return refreshVersion;
+  renderedAccounts = shown;
+  const list = $('account-list');
+  list.replaceChildren();
+  for (const account of accounts) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'vault-row';
+    button.textContent = account.name + (account.id === active ? ' · Active' : '');
+    button.disabled = account.id === active;
+    button.addEventListener('click', async () => {
+      button.disabled = true;
+      try {
+        ++refreshVersion;
+        selectVault(null);
+        await api('account-switch', {account: account.id});
+        await refresh();
+      } catch (error) { failure(error); button.disabled = false; }
+    });
+    list.append(button);
+  }
+  return refreshVersion;
 }
 /* ── one payment, five stages ───────────────────────────────────────────────
    A member is told where the payment is, never which protocol call comes next.
@@ -655,7 +707,10 @@ function backupList(state) {
 }
 
 async function refresh() {
+  let version = refreshVersion;
   try {
+    version = await refreshAccounts(version);
+    if (version === undefined) return;
     let state;
     try {
       state = await api('status' + (selectedVault ? `?vault=${encodeURIComponent(selectedVault)}` : ''));
@@ -666,6 +721,7 @@ async function refresh() {
       selectVault(null);
       state = home;
     }
+    if (version !== refreshVersion) return;
     if ((state.phase === 'new_profile' || state.phase === 'locked') && selectedVault) selectVault(null);
     currentNetwork = state.network || 'regtest';
     const testnet = currentNetwork === 'testnet';
@@ -794,9 +850,15 @@ async function refresh() {
     if (state.error) message(state.error, true);
     else if (state.account_link_error) message(`${state.account_link_error}. Vault keys are unaffected.`, true);
     await refreshSignerRequests(!!state.profile);
-  } catch (error) { message(error.message, true); }
+  } catch (error) { if (!error.stale) message(error.message, true); }
 }
 action('profile-create', async (form) => { await api('profile-create', fields(form)); message('Profile created. You can now create or join vaults.'); });
+action('account-create', async (form) => {
+  ++refreshVersion;
+  selectVault(null);
+  await api('account-create', fields(form));
+  message('Account created. This profile has its own vaults and key store.');
+});
 action('unlock', async (form) => { await api('unlock', fields(form)); message('Profile unlocked.'); });
 action('create', async (form) => {
   const inputs = fields(form);

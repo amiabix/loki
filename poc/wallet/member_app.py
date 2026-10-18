@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-member, loopback-only vault app. The exchange is an untrusted local courier."""
+"""Loopback-only member vault app. The exchange is an untrusted local courier."""
 
 # shortcut: timed local courier and passphrase held in this process; use resumable relays and a native key handle before custody.
 
@@ -8,7 +8,9 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+from contextlib import contextmanager
 import fcntl
+from functools import wraps
 import hashlib
 import http.client
 import ipaddress
@@ -1948,6 +1950,142 @@ class Wallet:
         self.process_lock.close()
 
 
+class Accounts:
+    """One app installation, with one existing Wallet data-root open at a time."""
+
+    def __init__(self, data, exchange, **options):
+        self.data = data.resolve()
+        self.data.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(self.data, 0o700)
+        if (self.data / "accounts").is_symlink():
+            raise ValueError("Account directory cannot be a link")
+        self.process_lock = open(self.data / ".accounts.lock", "a+b")
+        try:
+            fcntl.flock(self.process_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.exchange, self.options = exchange, options
+            self.gate = threading.Condition()
+            self.readers = 0
+            self.changing = False
+            saved = self.data / "active-account"
+            selected = saved.read_text().strip() if saved.is_file() else "default"
+            self.active = selected if selected in self.account_ids() else "default"
+            self.wallet = Wallet(self.account_dir(self.active), exchange, **options)
+        except BlockingIOError as error:
+            self.process_lock.close()
+            raise ValueError("This member data root is already open in another app") from error
+        except Exception:
+            self.process_lock.close()
+            raise
+
+    def __getattr__(self, name):
+        return getattr(self.wallet, name)
+
+    def account_dir(self, account):
+        return self.data if account == "default" else self.data / "accounts" / account
+
+    def account_ids(self):
+        root = self.data / "accounts"
+        others = sorted(path.name for path in root.iterdir()
+                        if not path.is_symlink() and re.fullmatch(r"[0-9a-f]{16}", path.name)
+                        and (path / "profile" / "profile.sealed").is_file()) if root.is_dir() else []
+        return (["default"] if (self.data / "profile" / "profile.sealed").is_file() else []) + others
+
+    def accounts(self):
+        ids = self.account_ids()
+        if self.active == "default" and "default" not in ids:
+            ids.insert(0, "default")
+        # Profile names are sealed; locked accounts get stable generic labels.
+        return {"active": self.active, "accounts": [
+            {"id": account, "name": "Existing account" if account == "default" else f"Account {account[:8]}"}
+            for account in ids]}
+
+    @contextmanager
+    def request(self):
+        with self.gate:
+            while self.changing:
+                self.gate.wait()
+            self.readers += 1
+        try:
+            yield
+        finally:
+            with self.gate:
+                self.readers -= 1
+                self.gate.notify_all()
+
+    @contextmanager
+    def exclusive(self):
+        with self.gate:
+            while self.changing:
+                self.gate.wait()
+            self.changing = True
+            while self.readers:
+                self.gate.wait()
+        try:
+            yield
+        finally:
+            with self.gate:
+                self.changing = False
+                self.gate.notify_all()
+
+    def select(self, account):
+        if not isinstance(account, str) or account not in self.account_ids():
+            raise ValueError("Choose an existing account")
+        if account == self.active:
+            return self.accounts()
+        next_wallet = Wallet(self.account_dir(account), self.exchange, **self.options)
+        try:
+            self.wallet.lock_profile()
+            write_replace(self.data / "active-account", account.encode())
+        except Exception:
+            next_wallet.close()
+            raise
+        self.wallet.close()
+        self.wallet, self.active = next_wallet, account
+        return self.accounts()
+
+    def create_account(self, name, passphrase):
+        root = self.data / "accounts"
+        root.mkdir(mode=0o700, exist_ok=True)
+        while True:
+            account = secrets.token_hex(8)
+            folder = root / account
+            try:
+                folder.mkdir(mode=0o700)
+                break
+            except FileExistsError:
+                continue
+        new_wallet = Wallet(folder, self.exchange, **self.options)
+        try:
+            new_wallet.create_profile(name, passphrase)
+            self.wallet.lock_profile()
+            write_replace(self.data / "active-account", account.encode())
+        except Exception:
+            # shortcut: keep partial profile data after a failed create; add recovery before deleting it.
+            new_wallet.close()
+            raise
+        self.wallet.close()
+        self.wallet, self.active = new_wallet, account
+        return self.accounts()
+
+    def close(self):
+        try:
+            self.wallet.close()
+        finally:
+            self.process_lock.close()
+
+
+def account_request_guard(wallet, exclusive_routes=()):
+    def decorate(handler):
+        @wraps(handler)
+        def guarded(self):
+            if not isinstance(wallet, Accounts) or self.path.split("?", 1)[0] in exclusive_routes:
+                return handler(self)
+            with wallet.request():
+                return handler(self)
+        return guarded
+    return decorate
+
+
 def make_setup_server(wallet, port):
     """The creator's setup courier, for the other members' apps only.
 
@@ -2006,6 +2144,7 @@ def make_setup_server(wallet, port):
         def slot(self, vault):
             return wallet.courier_slot(vault, self.headers.get("X-Loki-Setup", ""))
 
+        @account_request_guard(wallet)
         def do_POST(self):
             def run():
                 vault, _, name = self.route(("claim",))
@@ -2016,6 +2155,7 @@ def make_setup_server(wallet, port):
                                             value.get("token"), value.get("network", "regtest")),)
             self.answer(run)
 
+        @account_request_guard(wallet)
         def do_GET(self):
             def run():
                 vault, _, name = self.route(("files",))
@@ -2025,6 +2165,7 @@ def make_setup_server(wallet, port):
                 return (None, wallet.courier_read(vault, name))
             self.answer(run)
 
+        @account_request_guard(wallet)
         def do_PUT(self):
             def run():
                 vault, _, name = self.route(("files",))
@@ -2081,6 +2222,7 @@ def make_signer_server(wallet, port, dashboard_port=None):
             self.send_header("Access-Control-Max-Age", "300")
             self.end_headers()
 
+        @account_request_guard(wallet)
         def do_GET(self):
             if not self.trusted_host():
                 return self.reply(403, {"error": "Unauthorized host"})
@@ -2144,6 +2286,8 @@ def make_signer_server(wallet, port, dashboard_port=None):
                     return self.reply(200, {"actions": sessions.pending_actions()})
                 values = parse_qs(query)
                 vault = values.get("vault", [None])[0]
+                if path == "/api/accounts" and isinstance(wallet, Accounts):
+                    return self.reply(200, wallet.accounts())
                 if path == "/api/status":
                     return self.reply(200, wallet.status(vault))
                 if path == "/api/payments":
@@ -2162,6 +2306,7 @@ def make_signer_server(wallet, port, dashboard_port=None):
                 return self.reply(400, {"error": str(error)})
             self.reply(404, {"error": "Not found"})
 
+        @account_request_guard(wallet, ("/api/account-create", "/api/account-switch"))
         def do_POST(self):
             if not self.trusted_host():
                 return self.reply(403, {"error": "Unauthorized host"})
@@ -2180,6 +2325,12 @@ def make_signer_server(wallet, port, dashboard_port=None):
                 if not 0 < size <= (4096 if is_dashboard else 128 * 1024):
                     raise ValueError("Invalid request size")
                 value = json.loads(self.rfile.read(size))
+                if isinstance(wallet, Accounts) and self.path in ("/api/account-create", "/api/account-switch"):
+                    with wallet.exclusive():
+                        result = wallet.create_account(value.get("name"), value.get("passphrase")) \
+                            if self.path == "/api/account-create" else wallet.select(value.get("account"))
+                        sessions.clear()
+                        return self.reply(200, result)
                 if is_dashboard:
                     if self.path == "/api/session/request":
                         return self.reply(200, {"request": sessions.request(dashboard_origin)})
@@ -2373,10 +2524,10 @@ def serve(wallet, port, dashboard_port=None, invite_port=None):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="One member's vault app")
+    parser = argparse.ArgumentParser(description="Member vault app")
     parser.add_argument("--network", choices=("regtest", "testnet"), default="regtest")
     parser.add_argument("--lightwalletd-url", help="HTTPS Testnet lightwalletd endpoint for the persistent vault scan")
-    parser.add_argument("--data", type=Path, required=True, help="private directory for this member only")
+    parser.add_argument("--data", type=Path, required=True, help="private app data directory")
     parser.add_argument("--exchange", type=Path, help="shared untrusted local setup courier (local transport only)")
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--dashboard-port", type=int, help="serve a separate dashboard origin")
@@ -2411,9 +2562,9 @@ if __name__ == "__main__":
         origin = f"http://127.0.0.1:{args.invite_port}"
     if origin and not args.invite_port:
         parser.error("--invite-origin needs --invite-port to serve")
-    serve(Wallet(args.data, args.exchange, invite_origin=origin, transport=args.transport,
-                 operator_bundle=args.operator_bundle, operator_key=args.operator_key,
-                 enrollment_grant=args.enrollment_grant, development_http=args.development_http,
-                 enrollment_issuer=args.enrollment_issuer, network=args.network,
-                 lightwalletd_url=args.lightwalletd_url), args.port,
+    serve(Accounts(args.data, args.exchange, invite_origin=origin, transport=args.transport,
+                   operator_bundle=args.operator_bundle, operator_key=args.operator_key,
+                   enrollment_grant=args.enrollment_grant, development_http=args.development_http,
+                   enrollment_issuer=args.enrollment_issuer, network=args.network,
+                   lightwalletd_url=args.lightwalletd_url), args.port,
           args.dashboard_port, args.invite_port)

@@ -10,9 +10,11 @@ custody.
 
 ## Product direction
 
-The setup app now starts with **one member, one app, one private key store**.
-It lets three independently launched members create and join a vault, compare
-their roster, run dealerless key creation, and check their own backups. See
+The setup app supports multiple independent accounts in one installation. Each
+account has one private profile and can belong to several vaults; switching
+accounts locks the previous profile. It lets three independent members create
+and join a vault, compare their roster, run dealerless key creation, and check
+their own backups. See
 [the setup app](poc/wallet/README.md) for how to run it and its limits. A member's
 app must still create or restore only that member's share, review
 the transaction itself, and release an approval only after that member acts.
