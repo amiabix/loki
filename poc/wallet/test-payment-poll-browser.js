@@ -25,7 +25,8 @@ async function run() {
           contentType: file.endsWith('.js') ? 'text/javascript' : file.endsWith('.css') ? 'text/css' : file.endsWith('.woff2') ? 'font/woff2' : 'text/html'});
       }
       let result = {};
-      if (url.pathname === '/api/status') {
+      if (url.pathname === '/api/accounts') result = {active: 'default', accounts: [{id: 'default', name: 'Alice'}]};
+      else if (url.pathname === '/api/status') {
         result = url.searchParams.has('vault')
           ? {phase: 'active', network: 'testnet', birth_height: 4500000,
              name: 'Gold', vault, slot: 1, threshold: 2, total_members: 3,
@@ -54,6 +55,7 @@ async function run() {
     assert.equal(await page.locator('#join textarea').isVisible(), true);
     await page.locator('.vault-row').filter({hasText: 'Gold'}).click();
     await page.locator('#active').waitFor({state: 'visible'});
+    assert.equal(await page.locator('.journey [data-step=wallet]').getAttribute('aria-current'), 'step');
     assert.equal(await page.locator('#network-chip').textContent(), 'ZCASH TESTNET');
     assert.match(await page.locator('#receive-note').textContent(), /block 4500000/);
     assert.equal(await page.locator('#connect-account').isVisible(), false);
