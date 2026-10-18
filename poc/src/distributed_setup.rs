@@ -575,4 +575,12 @@ impl Completed {
     pub(crate) fn public_package(&self) -> &[u8] {
         &self.public_package
     }
+    /// This member's serialized `KeyPackage` (the share). Crate-internal: the signer seals
+    /// it with the secure element immediately and never lets it cross the public boundary.
+    pub(crate) fn key_package_bytes(&self) -> &[u8] {
+        &self.key_package
+    }
+    pub(crate) fn members(&self) -> u16 {
+        self.members
+    }
 }

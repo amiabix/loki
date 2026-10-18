@@ -38,6 +38,12 @@ pub struct PaymentView {
     pub memo: Vec<u8>,
     /// Consensus branch id the PCZT commits to (e.g. NU7). The binding network fact.
     pub network_branch_id: u32,
+    /// `true` iff every action's declared spend/output value was bound to its `cv_net`
+    /// value commitment (`verify_cv_net`), so the rendered fee is the one the sighash
+    /// commits to — not a forgeable, self-declared number. `false` when any action is
+    /// missing its `rcv` trapdoor (e.g. a not-yet-IO-finalized PCZT); the fee is then
+    /// `amount_in - amount_out` of UNVERIFIED openings and MUST be shown as such.
+    pub fee_verified: bool,
 }
 
 /// Parse `pczt_bytes` with the vault's viewing key and return what the member will sign.
@@ -58,6 +64,12 @@ pub fn describe_pczt(pczt_bytes: &[u8], vault_fvk: &FullViewingKey) -> Result<Pa
     let mut change_zat: u64 = 0;
     let mut total_in: u64 = 0;
     let mut total_out: u64 = 0;
+    // Fee integrity: a spend's declared value is only trustworthy once it is bound to the
+    // action's `cv_net` value commitment (the thing the sighash commits to). We start
+    // "verified" and clear it the moment any action lacks its `rcv` trapdoor or fails the
+    // binding — so a PCZT that hands us self-declared, uncommitted values renders an
+    // explicitly UNVERIFIED fee rather than a forgeable one.
+    let mut fee_verified = true;
     let mut inner: Result<(), String> = Ok(());
 
     // The Verifier yields the parsed `orchard::pczt::Bundle`, whose actions carry the
@@ -67,6 +79,13 @@ pub fn describe_pczt(pczt_bytes: &[u8], vault_fvk: &FullViewingKey) -> Result<Pa
         .with_ironwood::<String, _>(|bundle| {
             let mut run = || -> Result<(), String> {
                 for action in bundle.actions() {
+                    // Bind this action's declared values to its value commitment. If the
+                    // trapdoor is absent or the commitment disagrees, the declared spend
+                    // value is not something the sighash commits to: keep reading for the
+                    // render but mark the fee unverified.
+                    if action.verify_cv_net().is_err() {
+                        fee_verified = false;
+                    }
                     if let Some(v) = action.spend().value() {
                         total_in =
                             total_in.checked_add(v.inner()).ok_or("input value overflow")?;
@@ -115,7 +134,51 @@ pub fn describe_pczt(pczt_bytes: &[u8], vault_fvk: &FullViewingKey) -> Result<Pa
         change_zat,
         memo,
         network_branch_id,
+        fee_verified,
     })
+}
+
+/// Independently recompute the FROST signing message (shielded sighash) from the PCZT
+/// bytes — the exact value a correct `SigningPackage.message()` must equal.
+///
+/// This is the WYSIWYS-to-signature binding: the member approves what [`describe_pczt`]
+/// rendered; this proves the `SigningPackage` the coordinator asks us to sign actually
+/// commits to THOSE bytes. It re-runs the same value/nullifier/rk bindings the live
+/// signing path uses (`signing_session`), so the sighash is only produced for a PCZT
+/// whose openings match its commitments for this vault's key.
+pub fn sighash_of_pczt(pczt_bytes: &[u8], vault_fvk: &FullViewingKey) -> Result<[u8; 32], String> {
+    use pczt::roles::signer::Signer;
+    let parsed = pczt::Pczt::parse(pczt_bytes).map_err(|e| format!("pczt parse: {e:?}"))?;
+    let mut err: Option<String> = None;
+    let checked = Verifier::new(parsed)
+        .with_ironwood::<String, _>(|bundle| {
+            let mut run = || -> Result<(), String> {
+                for (i, action) in bundle.actions().iter().enumerate() {
+                    action
+                        .verify_cv_net()
+                        .map_err(|e| format!("action {i} value commitment: {e:?}"))?;
+                    action
+                        .spend()
+                        .verify_nullifier(Some(vault_fvk))
+                        .map_err(|e| format!("action {i} spend nullifier: {e:?}"))?;
+                    action
+                        .spend()
+                        .verify_rk(Some(vault_fvk))
+                        .map_err(|e| format!("action {i} rk: {e:?}"))?;
+                }
+                Ok(())
+            };
+            err = run().err();
+            Ok(())
+        })
+        .map_err(|e: OrchardError<String>| format!("ironwood verify: {e:?}"))?
+        .finish();
+    if let Some(e) = err {
+        return Err(e);
+    }
+    Ok(Signer::new(checked)
+        .map_err(|e| format!("sighash: {e:?}"))?
+        .shielded_sighash())
 }
 
 /// Rebuild the on-chain action and recover the note plaintext (incl. memo) as the sender.
