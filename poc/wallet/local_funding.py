@@ -90,6 +90,11 @@ def fund_member(wallet, vault, request_id):
                 or any(not isinstance(result.get(field), str) or not re.fullmatch(r'[0-9a-f]{64}', result[field])
                        for field in ('txid', 'block_hash')):
             raise ValueError('Funding has not been confirmed. Retry the same request to check it.')
+        # Vault wallets spend a received note only after ten confirmations.
+        mined = subprocess.run(['ths', '--name', instance, 'mine', '9', '--json'],
+                               capture_output=True, text=True, timeout=600)
+        if mined.returncode:
+            raise ValueError(f'Funding confirmed, but mining the blocks it needs to be spendable failed: {mined.stderr.strip()}')
         record.update(phase='confirmed', detail='5 test ZEC confirmed.', result=result)
         save(path, record)
         return result

@@ -1,92 +1,31 @@
-use std::{env, fs, path::Path, time::Duration};
+use std::{env, fs, path::Path};
 
-use loki_poc::{member_state, network::VaultNetwork, wallet_store::VaultWallet};
-use tonic::transport::{ClientTlsConfig, Endpoint};
-use zcash_client_backend::{
-    data_api::AccountBirthday,
-    proto::service::{compact_tx_streamer_client::CompactTxStreamerClient, BlockId, Empty},
+use loki_poc::{
+    member_state,
+    payment_manifest::MAX_INPUTS,
+    wallet_store::sync_member_wallet,
 };
-use zcash_protocol::consensus::Network;
+use zcash_client_backend::proto::service::Empty;
 use zeroize::Zeroizing;
-
-fn lightwalletd_endpoint(url: String) -> Result<Endpoint, String> {
-    let endpoint = Endpoint::from_shared(url).map_err(|e| format!("lightwalletd URL: {e}"))?;
-    let uri = endpoint.uri();
-    if uri.scheme_str() != Some("https")
-        && !(uri.scheme_str() == Some("http")
-            && matches!(uri.host(), Some("localhost" | "127.0.0.1" | "[::1]")))
-    {
-        return Err("lightwalletd must use HTTPS, except on localhost".into());
-    }
-    // A public lightwalletd is reached over TLS; tonic needs the webpki roots configured
-    // explicitly (it does not enable TLS from the https scheme alone).
-    if uri.scheme_str() == Some("https") {
-        return endpoint
-            .tls_config(ClientTlsConfig::new().with_webpki_roots())
-            .map_err(|e| format!("lightwalletd TLS: {e}"));
-    }
-    Ok(endpoint)
-}
 
 async fn sync(args: &[String]) -> Result<(), String> {
     if args.len() != 4 {
         return Err("usage: loki_wallet_sync <member-dir> <passphrase-file> <roster.json> <lightwalletd-url>".into());
     }
-    // rustls 0.23 has no default crypto provider; install one before any TLS handshake.
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let member = member_state::open(
         Path::new(&args[0]),
         Path::new(&args[1]),
         Path::new(&args[2]),
     )?;
-    if member.network != VaultNetwork::Testnet {
-        return Err("persistent wallet sync currently supports Testnet vaults only".into());
-    }
-    let birth = member
-        .birth_height
-        .ok_or("Testnet vault has no birth height")?;
-    let endpoint = lightwalletd_endpoint(args[3].clone())?;
-    let channel = endpoint
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
-        .connect()
-        .await
-        .map_err(|e| format!("connect to lightwalletd: {e}"))?;
-    let mut client = CompactTxStreamerClient::new(channel);
-    let info = client
-        .get_lightd_info(Empty {})
-        .await
-        .map_err(|e| format!("lightwalletd info: {e}"))?
-        .into_inner();
-    if info.chain_name != "test" || info.block_height < u64::from(birth) {
-        return Err(format!(
-            "lightwalletd is not at this Testnet vault's birth height (chain {})",
-            info.chain_name
-        ));
-    }
-    let prior = client
-        .get_tree_state(BlockId {
-            height: u64::from(birth - 1),
-            hash: vec![],
-        })
-        .await
-        .map_err(|e| format!("birth tree state: {e}"))?
-        .into_inner();
-    if prior.height != u64::from(birth - 1) || prior.network != "test" {
-        return Err("lightwalletd returned a different birth checkpoint".into());
-    }
-    let birthday = AccountBirthday::from_treestate(prior, None)
-        .map_err(|e| format!("parse birth tree state: {e}"))?;
     let passphrase =
         Zeroizing::new(fs::read_to_string(&args[1]).map_err(|e| format!("read passphrase: {e}"))?);
-    let mut wallet = VaultWallet::open(
-        &Path::new(&args[0]).join("wallet.sqlite"),
-        Network::TestNetwork,
-        &member.fvk,
-        &birthday,
+    let (mut wallet, mut client) = sync_member_wallet(
+        &member,
+        Path::new(&args[0]),
         passphrase.trim_end_matches(['\r', '\n']),
-    )?;
-    wallet.sync_testnet(&mut client).await?;
+        &args[3],
+    )
+    .await?;
     let height = wallet
         .scanned_height()?
         .ok_or("wallet did not scan any blocks")?;
@@ -104,10 +43,11 @@ async fn sync(args: &[String]) -> Result<(), String> {
         "{}",
         serde_json::json!({
             "vault": hex::encode(member.vault),
-            "network": "testnet",
+            "network": member.network.label(),
             "height": height,
             "chain_tip": chain_tip,
             "balance_zat": balance,
+            "max_spendable_zat": wallet.max_spendable(MAX_INPUTS),
         })
     );
     Ok(())
@@ -115,16 +55,7 @@ async fn sync(args: &[String]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::lightwalletd_endpoint;
-
-    #[test]
-    fn plaintext_is_only_allowed_on_loopback() {
-        assert!(lightwalletd_endpoint("https://wallet.example".into()).is_ok());
-        assert!(lightwalletd_endpoint("http://localhost:9067".into()).is_ok());
-        assert!(lightwalletd_endpoint("http://127.0.0.1:9067".into()).is_ok());
-        assert!(lightwalletd_endpoint("http://wallet.example".into()).is_err());
-        assert!(lightwalletd_endpoint("http://127.0.0.1.evil.example".into()).is_err());
-    }
+    use loki_poc::wallet_store::lightwalletd_endpoint;
 
     /// Live, network-gated: the configured endpoint reaches a real public Testnet
     /// lightwalletd over TLS and reports the Testnet chain. `LOKI_TEST_LIGHTWALLETD`
@@ -138,7 +69,7 @@ mod tests {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let url = std::env::var("LOKI_TEST_LIGHTWALLETD")
             .unwrap_or_else(|_| "https://testnet.zec.rocks:443".into());
-        let channel = lightwalletd_endpoint(url).unwrap().connect().await.unwrap();
+        let channel = lightwalletd_endpoint(&url).unwrap().connect().await.unwrap();
         let info = CompactTxStreamerClient::new(channel)
             .get_lightd_info(Empty {})
             .await

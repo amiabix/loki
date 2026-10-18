@@ -1448,8 +1448,8 @@ class Wallet:
                     or not (folder / "final-backup-checked").is_file():
                 continue
             local = read_json(membership)
-            if local.get("profile") != profile["id"] or local.get("threshold", 2) != 2 \
-                    or local.get("members") not in (3, 4):
+            if local.get("profile") != profile["id"] \
+                    or not supported_policy(local.get("threshold", 2), local.get("members")):
                 continue
             if local.get("transport") == "hosted":
                 if not self.hosted or not (folder / "secrets" / "activation.sealed").is_file() \
@@ -1495,7 +1495,7 @@ class Wallet:
             worker.yield_to_user(vault)
             attempt = manifest["attempt"]
             phase = self.payment_phase(work)["phase"]
-            is_signer = local["slot"] in manifest["pair"]
+            is_signer = local["slot"] in selected_signers(manifest, local.get("threshold", 2), local["members"])
             if phase in ("published", "received", "commitments", "package", "approved") \
                     and (not is_signer or phase == "approved"):
                 if not worker.is_ready(vault, attempt):
@@ -1802,8 +1802,6 @@ class Wallet:
         return {"phase": "approval_pending_delivery"}
 
     def finish_payment(self, vault, attempt):
-        if self.network == "testnet":
-            self.balance(vault)
         endpoint = (self.lightwalletd_url,) if self.network == "testnet" else ()
         _, work, _, output = self.payment_command(
             "finish", vault, attempt, *endpoint, timeout=600)

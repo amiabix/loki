@@ -41,6 +41,8 @@ print(json.dumps({"proposals": {p.split("/")[-2]: {"message": "d" * 64, "stored"
 
 
 class PaymentWorkerTest(unittest.TestCase):
+    threshold, members = 2, 3
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -63,13 +65,15 @@ class PaymentWorkerTest(unittest.TestCase):
         self.work = member / "payments" / self.attempt
         (self.work / "mailbox").mkdir(parents=True)
         (member / "membership.json").write_text(json.dumps({
-            "vault": self.vault, "profile": "alice", "slot": 1, "threshold": 2, "members": 3}))
+            "vault": self.vault, "profile": "alice", "slot": 1,
+            "threshold": self.threshold, "members": self.members}))
         (member / "roster.json").write_text("{}")
         (member / "final-backup-checked").write_text("checked")
         (member / "relay-setup.json").write_text(json.dumps({"phase": "ready"}))
         (self.work / "payment.json").write_text(json.dumps({
-            "version": 1, "vault": self.vault, "attempt": self.attempt, "payment": "e" * 64,
-            "pair": [1, 2], "expiry_height": 9216}))
+            "version": 1 if self.threshold == 2 else 2, "vault": self.vault, "attempt": self.attempt,
+            "payment": "e" * 64, ("pair" if self.threshold == 2 else "signers"): list(range(1, self.threshold + 1)),
+            "expiry_height": 9216}))
         self.calls = []
         check = self.wallet.payment_worker.check
 
@@ -160,6 +164,11 @@ class PaymentWorkerTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "member_sealed"):
             self.wallet.sync_payments(self.vault)
         self.assertEqual(self.wallet.payments(self.vault)["updates"]["error"], "member_sealed")
+
+
+class ThreeOfFourPaymentWorkerTest(PaymentWorkerTest):
+    """The same worker steps for a 3-of-4 vault, whose manifests name `signers`."""
+    threshold, members = 3, 4
 
 
 if __name__ == "__main__":

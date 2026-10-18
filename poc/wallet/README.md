@@ -186,8 +186,9 @@ the internal provisional card, restores the same receive address, and needs neit
 the setup courier nor a relay. The old device remains capable of signing;
 restoring is not revocation.
 An active vault can scan the regtest chain for its unspent balance at a named
-block height. Set `LOKI_RPC=host:port` when starting each app if the local node
-is not on the default `127.0.0.1:18232`. **Refresh balance** only scans the chain;
+block height. Set `LOKI_RPC=host:port` when starting each app if the local node is not
+on THS's default `127.0.0.1:18232`; the app then uses the lightwalletd THS runs beside
+that node unless `LOKI_LIGHTWALLETD=http://host:port` names another. **Refresh balance** only scans the chain;
 the local **Fund Vault** action uses the separate THS faucet described below.
 
 ## Emergency recovery and exit (regtest beta)
@@ -353,12 +354,12 @@ review panels, two approvals, the third member's Send action, and confirmation
 in all three windows. Members
 discover the mined txid from its input nullifiers and then verify its exact
 approved effects; confirmation does not depend on the finisher announcing a txid.
-Each member keeps a sealed scan cache (`chain/scan.sealed`, keyed by the vault's
-viewing key) with the notes, spends and block hashes it has scanned, so later
-scans read only new blocks; a cache that fails to open or no longer matches the
-chain is discarded and the scan starts over. The spend index answers the mined
-lookup without rereading blocks. It is still a regtest scan over RPC, not the
-light-client sync a released wallet needs.
+Each member keeps the same encrypted wallet database on regtest as on Testnet
+(`wallet.sqlite`), synced before every chain read from the lightwalletd THS runs beside
+`LOKI_RPC` (THS shifts both ports by the same offset), or from `LOKI_LIGHTWALLETD`. The
+wallet library chooses a payment's notes, so one payment can combine up to 64 notes;
+received notes become spendable after 10 confirmations and the vault's own change after 3,
+so **Fund Vault** mines the extra blocks a funded note needs.
 
 These tests run three private processes on one host and three relays under one
 test operator. They do not prove physical-device operation or independent relay

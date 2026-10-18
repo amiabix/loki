@@ -157,6 +157,15 @@ pub struct MemberState {
     pub fvk: FullViewingKey,
 }
 
+impl MemberState {
+    /// The first block the wallet scans: the certified birth on Testnet, block 2 on regtest.
+    /// Light-client sync starts from the tree state before the birth, and lightwalletd cannot
+    /// serve height 0; a regtest vault cannot be paid in block 1, mined before it existed.
+    pub fn wallet_birth(&self) -> u32 {
+        self.birth_height.unwrap_or(2)
+    }
+}
+
 fn hex32(value: &serde_json::Value, field: &str) -> Result<[u8; 32], String> {
     hex::decode(
         value[field]

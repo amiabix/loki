@@ -12,7 +12,8 @@ use zcash_client_backend::{
 };
 use zcash_note_encryption::Domain;
 use zcash_primitives::block::BlockHash;
-use zcash_protocol::consensus::{BlockHeight, Network};
+use loki_poc::network::VaultNetwork;
+use zcash_protocol::consensus::BlockHeight;
 
 #[test]
 fn a_vault_viewing_account_survives_restart_without_duplication() {
@@ -32,7 +33,7 @@ fn a_vault_viewing_account_survives_restart_without_duplication() {
 
     let first = loki_poc::wallet_store::VaultWallet::open(
         &path,
-        Network::TestNetwork,
+        VaultNetwork::Testnet,
         &fvk,
         &birthday,
         "correct horse",
@@ -46,7 +47,7 @@ fn a_vault_viewing_account_survives_restart_without_duplication() {
 
     assert!(loki_poc::wallet_store::VaultWallet::open(
         &path,
-        Network::TestNetwork,
+        VaultNetwork::Testnet,
         &fvk,
         &birthday,
         "wrong passphrase",
@@ -54,7 +55,7 @@ fn a_vault_viewing_account_survives_restart_without_duplication() {
     .is_err());
     assert!(loki_poc::wallet_store::VaultWallet::open(
         &path,
-        Network::MainNetwork,
+        VaultNetwork::Regtest,
         &fvk,
         &birthday,
         "correct horse",
@@ -66,7 +67,7 @@ fn a_vault_viewing_account_survives_restart_without_duplication() {
     );
     assert!(loki_poc::wallet_store::VaultWallet::open(
         &path,
-        Network::TestNetwork,
+        VaultNetwork::Testnet,
         &fvk,
         &later_birthday,
         "correct horse",
@@ -74,7 +75,7 @@ fn a_vault_viewing_account_survives_restart_without_duplication() {
     .is_err());
     let second = loki_poc::wallet_store::VaultWallet::open(
         &path,
-        Network::TestNetwork,
+        VaultNetwork::Testnet,
         &fvk,
         &birthday,
         "correct horse",
@@ -114,7 +115,7 @@ fn scanned_ironwood_height_survives_restart() {
     };
     let mut wallet = loki_poc::wallet_store::VaultWallet::open(
         &path,
-        Network::TestNetwork,
+        VaultNetwork::Testnet,
         &fvk,
         &birthday,
         "correct horse",
@@ -125,7 +126,7 @@ fn scanned_ironwood_height_survives_restart() {
     drop(wallet);
     let wallet = loki_poc::wallet_store::VaultWallet::open(
         &path,
-        Network::TestNetwork,
+        VaultNetwork::Testnet,
         &fvk,
         &birthday,
         "correct horse",
@@ -187,7 +188,7 @@ fn received_ironwood_note_updates_persistent_vault_balance() {
     };
     let mut wallet = loki_poc::wallet_store::VaultWallet::open(
         &path,
-        Network::TestNetwork,
+        VaultNetwork::Testnet,
         &fvk,
         &birthday,
         "correct horse",
@@ -198,7 +199,7 @@ fn received_ironwood_note_updates_persistent_vault_balance() {
     drop(wallet);
     let wallet = loki_poc::wallet_store::VaultWallet::open(
         &path,
-        Network::TestNetwork,
+        VaultNetwork::Testnet,
         &fvk,
         &birthday,
         "correct horse",
@@ -208,10 +209,14 @@ fn received_ironwood_note_updates_persistent_vault_balance() {
     let cmx = ExtractedNoteCommitment::from(note.commitment());
     let frontier = NonEmptyFrontier::new(orchard::tree::MerkleHashOrchard::from_cmx(&cmx));
     let inputs = wallet
-        .ironwood_inputs_at(BlockHeight::from_u32(height), frontier.clone())
+        .ironwood_inputs_at(
+            BlockHeight::from_u32(height),
+            frontier.clone(),
+            &[note.nullifier(&fvk).to_bytes()],
+        )
         .unwrap();
     assert_eq!(inputs.len(), 1);
-    assert_eq!(inputs[0].0.note().value().inner(), 400_000);
+    assert_eq!(inputs[0].0.value().inner(), 400_000);
     assert_eq!(inputs[0].1.position(), 0);
     assert_eq!(
         inputs[0].1.root(cmx).to_bytes(),
