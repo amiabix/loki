@@ -4,6 +4,7 @@ import base64
 import http.client
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -211,6 +212,55 @@ class MemberWalletTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "lightwalletd unavailable"):
                     wallet.balance(vault)
             self.assertIsNone(wallet.scan_height.get(vault))
+
+    def test_testnet_refresh_labels_payments_from_synced_wallet(self):
+        with tempfile.TemporaryDirectory(prefix="loki-testnet-confirmations-") as temp:
+            wallet, vault, attempt = self.payment_fixture(temp, phase="broadcast", txid="01" + "23" * 30 + "45")
+            wallet.network = "testnet"
+            wallet.lightwalletd_url = "https://wallet.example"
+            wallet.relay_payment_ready = True
+            member = wallet.data / "vaults" / vault
+            membership = json.loads((member / "membership.json").read_text())
+            membership["network"] = "testnet"
+            (member / "membership.json").write_text(json.dumps(membership))
+            pending_attempt = "c" * 64
+            pending = member / "payments" / pending_attempt
+            pending.mkdir()
+            manifest = json.loads((member / "payments" / attempt / "payment.json").read_text())
+            (pending / "payment.json").write_text(json.dumps({**manifest, "attempt": pending_attempt}))
+            wallet.payment_status(pending, "confirmed", "67" + "89" * 30 + "ab")
+
+            db = sqlite3.connect(member / "wallet.sqlite")
+            db.execute("CREATE TABLE transactions (txid BLOB, mined_height INTEGER)")
+            db.executemany("INSERT INTO transactions VALUES (?, ?)", [
+                (bytes.fromhex("01" + "23" * 30 + "45")[::-1], 4500010),
+                (bytes.fromhex("67" + "89" * 30 + "ab")[::-1], None),
+            ])
+            db.commit()
+            db.close()
+
+            fake = Path(temp) / "loki_wallet_sync"
+            fake.write_text("#!/usr/bin/env python3\nimport os, sys\n"
+                            f"assert len(sys.argv) == 5 and sys.argv[1] == {str(member)!r}\n"
+                            f"assert sys.argv[3:] == [{str(member / 'roster.json')!r}, 'https://wallet.example']\n"
+                            "assert os.path.isfile(sys.argv[2])\nprint(" + repr(json.dumps({
+                "vault": vault, "network": "testnet", "height": 4500010,
+                "chain_tip": 4500012, "balance_zat": 400000,
+            })) + ")\n")
+            fake.chmod(0o700)
+            with patch.object(member_app, "WALLET_SYNC", fake):
+                self.assertEqual([item["phase"] for item in wallet.payments(vault)["payments"]],
+                                 ["broadcast", "broadcast"])
+                balance = wallet.balance(vault)
+                self.assertEqual((balance["balance_zat"], balance["height"], balance["chain_tip"]),
+                                 (400000, 4500010, 4500012))
+                phases = {item["attempt"]: item["phase"] for item in wallet.payments(vault)["payments"]}
+                self.assertEqual(phases, {attempt: "confirmed", pending_attempt: "broadcast"})
+            with patch.object(wallet, "command", side_effect=ValueError("lightwalletd unavailable")):
+                with self.assertRaisesRegex(ValueError, "lightwalletd unavailable"):
+                    wallet.balance(vault)
+            self.assertEqual([item["phase"] for item in wallet.payments(vault)["payments"]],
+                             ["broadcast", "broadcast"])
 
     def test_testnet_payment_expiry_keeps_its_payment_chain_view(self):
         with tempfile.TemporaryDirectory(prefix="loki-testnet-expiry-") as temp:

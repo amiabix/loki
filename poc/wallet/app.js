@@ -421,8 +421,8 @@ async function refreshPayments() {
 /* ── payment updates ─────────────────────────────────────────────────────────
    The page only reads: the list is cheap saved state, refreshed every 2 s while
    payments are live. "Check for updates" asks the worker for one pass now. */
-async function refreshPaymentsQuietly() {
-  if (refreshingPayments || !paymentsLive || !selectedVault) return;
+async function refreshPaymentsQuietly(force = false) {
+  if (refreshingPayments || (!paymentsLive && !force) || !selectedVault) return;
   refreshingPayments = true;
   try { await refreshPayments(); } catch { /* the next refresh tries again */ }
   finally { refreshingPayments = false; }
@@ -1008,6 +1008,7 @@ $('refresh-balance').addEventListener('click', async () => {
       ? `${zecFromZat(value.balance_zat)} ZEC · scanned block ${value.height} of ${value.chain_tip}`
         + (value.scan_ready ? ' · scan caught up' : ' · scan still catching up; balance may be incomplete')
       : `${zecFromZat(value.balance_zat)} ZEC · ${value.unspent_notes} unspent notes · block ${value.height}`;
+    if (value.network === 'testnet' && !$('payment-list').hidden) refreshPaymentsQuietly(true);
   } catch (error) {
     if (selectedVault === vault) $('balance').textContent = `Scan failed: ${error.message}. Balance unavailable.`;
   }
