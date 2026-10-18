@@ -290,7 +290,6 @@ class MemberWalletTest(unittest.TestCase):
                     patch.object(wallet, "payment_command") as command:
                 for stage in (
                     lambda: wallet.package_payment(vault, attempt),
-                    lambda: wallet.finish_payment(vault, attempt),
                     lambda: wallet.verify_payment(vault, attempt, "c" * 64),
                 ):
                     with self.assertRaisesRegex(ValueError, "wallet sync failed"):

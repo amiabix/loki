@@ -9,6 +9,8 @@ use reddsa_frost::frost::redpallas as frost;
 use serde_json::{json, Value};
 
 pub const MAX_MANIFEST: usize = 8192;
+/// Notes one payment may spend: each is one Ironwood action and one FROST signature.
+pub const MAX_INPUTS: usize = 64;
 pub const PROPOSAL_DOMAIN: &[u8] = b"Loki_Proposal_v1\0";
 
 fn hex<const N: usize>(value: &Value, field: &str) -> Result<[u8; N], String> {
@@ -102,8 +104,8 @@ pub fn parse_for_network(
         .iter()
         .map(|entry| hex::<32>(&json!({"nf": entry}), "nf"))
         .collect::<Result<Vec<_>, _>>()?;
-    if notes.is_empty() || notes.len() > 8 {
-        return Err("payment needs 1 to 8 input notes".into());
+    if notes.is_empty() || notes.len() > MAX_INPUTS {
+        return Err(format!("payment needs 1 to {MAX_INPUTS} input notes"));
     }
     let intent = Intent {
         proposer: bytes(&value, "proposer")?,
