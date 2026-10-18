@@ -8,7 +8,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
-from contextlib import contextmanager
+from contextlib import closing, contextmanager, nullcontext
 import fcntl
 from functools import wraps
 import hashlib
@@ -20,6 +20,7 @@ import os
 import re
 import secrets
 import shutil
+import sqlite3
 import ssl
 import subprocess
 import tempfile
@@ -1315,6 +1316,8 @@ class Wallet:
             self.scan_height[vault] = result.get("height")
         if result.get("vault") != vault:
             raise ValueError("Chain scan returned another vault")
+        if self.network == "testnet":
+            self.scan_height[vault] = result["height"]
         return result
 
     def fund_vault(self, vault, request_id):
@@ -1398,15 +1401,24 @@ class Wallet:
         member_dir, local = self.vault_dir(vault)
         if not (member_dir / "final-backup-checked").is_file():
             raise ValueError("Vault is not active")
+        indexed = (closing(sqlite3.connect(f"{(member_dir / 'wallet.sqlite').as_uri()}?mode=ro", uri=True))
+                   if self.network == "testnet" and self.scan_height.get(vault) is not None else nullcontext(None))
         items = []
-        for work, manifest in self._payment_works(member_dir, vault):
-            attempt = manifest["attempt"]
-            status = self.payment_phase(work)
-            signers = selected_signers(manifest, local.get("threshold", 2), local["members"])
-            items.append({"attempt": attempt, "payment": manifest.get("payment"),
-                          "signers": signers, "phase": status["phase"],
-                          "ready_to_send": self.payment_worker.is_ready(vault, attempt),
-                          **({"txid": status["txid"]} if status.get("txid") else {})})
+        with indexed as db:
+            for work, manifest in self._payment_works(member_dir, vault):
+                attempt = manifest["attempt"]
+                status = self.payment_phase(work)
+                phase = status["phase"]
+                if self.network == "testnet" and status.get("txid") and phase in (
+                        "broadcast", "confirmation_needs_recheck", "confirmed"):
+                    row = db.execute("SELECT mined_height FROM transactions WHERE txid = ?",
+                                     (bytes.fromhex(status["txid"])[::-1],)).fetchone() if db else None
+                    phase = "confirmed" if row and row[0] is not None and row[0] <= self.scan_height[vault] else "broadcast"
+                signers = selected_signers(manifest, local.get("threshold", 2), local["members"])
+                items.append({"attempt": attempt, "payment": manifest.get("payment"),
+                              "signers": signers, "phase": phase,
+                              "ready_to_send": self.payment_worker.is_ready(vault, attempt),
+                              **({"txid": status["txid"]} if status.get("txid") else {})})
         relay_ready, relay_detail = self.payment_readiness()
         return {"payments": items,
                 "readiness": {"relay_ready": relay_ready, "relay_detail": relay_detail,
