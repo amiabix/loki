@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
+import member_app
 from member_app import PAYMENT, SEED_WALLET, SETUP, WALLET_SYNC, Wallet, courier_name, decoded, make_signer_server
 
 
@@ -34,6 +35,148 @@ def payment_sync_fake(stored, plans=None):
 
 
 class MemberWalletTest(unittest.TestCase):
+    def test_accounts_keep_profiles_and_vaults_separate_across_switches(self):
+        with tempfile.TemporaryDirectory(prefix="loki-accounts-") as temp:
+            root = Path(temp)
+            app_data = (root / "member").resolve()
+            created = []
+
+            def profile_command(wallet, action, *args, **_kwargs):
+                if action == "profile-open":
+                    return (wallet.data / "profile" / "profile.sealed").read_text()
+                if action != "profile-create": raise AssertionError(action)
+                profile = {"id": f"profile-{len(created) + 1}", "name": args[2]}
+                sealed = wallet.data / "profile" / "profile.sealed"
+                sealed.parent.mkdir(parents=True)
+                sealed.write_text(json.dumps(profile))
+                created.append(wallet.data)
+                return json.dumps(profile)
+
+            with patch.object(Wallet, "command", profile_command), \
+                 patch.object(Wallet, "relay_network_status", return_value={}), \
+                 patch.object(Wallet, "relay_status", return_value={}):
+                accounts = member_app.Accounts(app_data, root / "exchange")
+                self.addCleanup(accounts.close)
+                server, token = make_signer_server(accounts, 0)
+                threading.Thread(target=server.serve_forever, daemon=True).start()
+                self.addCleanup(server.server_close)
+                self.addCleanup(server.shutdown)
+
+                def request(method, path, value=None, key=token):
+                    conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
+                    conn.request(method, path, json.dumps(value) if value is not None else None,
+                                 {"X-Loki-Token": key, "Content-Type": "application/json"})
+                    response = conn.getresponse()
+                    result = response.status, json.loads(response.read())
+                    conn.close()
+                    return result
+
+                self.assertEqual(request("GET", "/api/accounts", key="wrong")[0], 403)
+                self.assertEqual(request("POST", "/api/account-create",
+                                         {"name": "Eve", "passphrase": "wrong passphrase"}, key="wrong")[0], 403)
+                first = request("POST", "/api/account-create", {"name": "Alice", "passphrase": "alice passphrase"})
+                self.assertEqual(first[0], 200, first)
+                first_id = first[1]["active"]
+                first_dir = app_data / "accounts" / first_id
+                self.assertEqual(created, [first_dir])
+                self.assertTrue((first_dir / "profile" / "profile.sealed").is_file())
+                vault_a = "a" * 64
+                member_a = first_dir / "vaults" / vault_a
+                member_a.mkdir(parents=True)
+                (member_a / "membership.json").write_text(json.dumps({
+                    "vault": vault_a, "profile": "profile-1", "name": "Alice vault",
+                    "slot": 1, "network": "regtest"}))
+                self.assertEqual(request("GET", "/api/status")[1]["vaults"][0]["name"], "Alice vault")
+
+                second = request("POST", "/api/account-create", {"name": "Bob", "passphrase": "bob passphrase"})
+                self.assertEqual(second[0], 200, second)
+                second_id = second[1]["active"]
+                second_dir = app_data / "accounts" / second_id
+                self.assertNotEqual(first_id, second_id)
+                self.assertTrue((second_dir / "profile" / "profile.sealed").is_file())
+                self.assertEqual(request("GET", "/api/status")[1]["vaults"], [])
+                vault_b = "b" * 64
+                member_b = second_dir / "vaults" / vault_b
+                member_b.mkdir(parents=True)
+                (member_b / "membership.json").write_text(json.dumps({
+                    "vault": vault_b, "profile": "profile-2", "name": "Bob vault",
+                    "slot": 1, "network": "regtest"}))
+                self.assertEqual(request("GET", "/api/status")[1]["vaults"][0]["name"], "Bob vault")
+                self.assertEqual(request("POST", "/api/account-switch", {"account": first_id})[0], 200)
+                self.assertEqual(request("GET", "/api/status")[1]["phase"], "locked")
+                self.assertEqual(request("GET", "/api/accounts")[1]["active"], first_id)
+                self.assertCountEqual(request("GET", "/api/accounts")[1]["accounts"], [
+                    {"id": first_id, "name": "Account " + first_id[:8]},
+                    {"id": second_id, "name": "Account " + second_id[:8]}])
+                self.assertEqual(request("POST", "/api/unlock", {"passphrase": "alice passphrase"})[0], 200)
+                self.assertEqual([v["vault"] for v in request("GET", "/api/status")[1]["vaults"]], [vault_a])
+                self.assertEqual(request("GET", "/api/status?vault=" + vault_b)[0], 400)
+                self.assertEqual(request("POST", "/api/account-switch", {"account": "../other"})[0], 400)
+                self.assertEqual(request("GET", "/api/accounts")[1]["active"], first_id)
+                entered, release, switched = threading.Event(), threading.Event(), threading.Event()
+                old_status = Wallet.status
+                results = {}
+
+                def slow_status(wallet, vault=None):
+                    if wallet.data == first_dir:
+                        entered.set()
+                        release.wait(5)
+                    return old_status(wallet, vault)
+
+                with patch.object(Wallet, "status", slow_status):
+                    reader = threading.Thread(target=lambda: results.update(read=request("GET", "/api/status")))
+                    reader.start()
+                    self.assertTrue(entered.wait(2))
+                    def switch():
+                        results["switch"] = request("POST", "/api/account-switch", {"account": second_id})
+                        switched.set()
+                    writer = threading.Thread(target=switch)
+                    writer.start()
+                    self.assertFalse(switched.wait(0.1), "switch must wait for the old account's response")
+                    release.set()
+                    reader.join(2)
+                    writer.join(2)
+                self.assertEqual(results["read"][1]["vaults"][0]["vault"], vault_a)
+                self.assertEqual(results["switch"][0], 200)
+                self.assertEqual(request("POST", "/api/unlock", {"passphrase": "bob passphrase"})[0], 200)
+                self.assertEqual([v["vault"] for v in request("GET", "/api/status")[1]["vaults"]], [vault_b])
+                self.assertEqual((app_data / "active-account").read_text(), second_id)
+
+    def test_existing_data_root_remains_default_account(self):
+        with tempfile.TemporaryDirectory(prefix="loki-existing-account-") as temp:
+            root = Path(temp)
+            data = root / "member"
+            profile = data / "profile" / "profile.sealed"
+            profile.parent.mkdir(parents=True)
+            profile.write_text("sealed")
+            with patch.object(Wallet, "command", return_value=json.dumps({"id": "old", "name": "Existing"})), \
+                 patch.object(Wallet, "relay_network_status", return_value={}), \
+                 patch.object(Wallet, "relay_status", return_value={}):
+                accounts = member_app.Accounts(data, root / "exchange")
+                try:
+                    self.assertEqual(accounts.accounts(), {"active": "default", "accounts": [
+                        {"id": "default", "name": "Existing account"}]})
+                    self.assertEqual(accounts.wallet.status()["phase"], "locked")
+                    accounts.wallet.unlock("existing passphrase")
+                    self.assertEqual(accounts.wallet.status()["profile"]["id"], "old")
+                    self.assertEqual(accounts.wallet.data, data.resolve())
+                finally:
+                    accounts.close()
+                self.assertTrue(profile.is_file())
+                account = "c" * 16
+                other = data / "accounts" / account / "profile" / "profile.sealed"
+                other.parent.mkdir(parents=True)
+                other.write_text("sealed")
+                (data / "active-account").write_text(account)
+                reopened = member_app.Accounts(data, root / "exchange")
+                try:
+                    self.assertEqual(reopened.active, account)
+                    self.assertEqual(reopened.wallet.data, other.parent.parent.resolve())
+                    self.assertEqual(reopened.wallet.status()["phase"], "locked")
+                finally:
+                    reopened.close()
+                self.assertTrue(profile.is_file())
+
     def test_testnet_balance_uses_persistent_wallet_and_reports_scan_progress(self):
         with tempfile.TemporaryDirectory(prefix="loki-indexed-balance-") as temp:
             root = Path(temp)

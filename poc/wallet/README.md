@@ -3,8 +3,8 @@
 ## Public Testnet UI
 
 The same member app can create a Testnet vault, check backups, receive, review,
-approve, and send. Start one process per member, with a separate private data
-directory and browser window. Balance and payment actions need a synced NU7
+approve, and send. Start one process per installation, with a separate private
+data directory and browser window. Balance and payment actions need a synced NU7
 Zcash Testnet node on loopback. Local courier creation also requires that node
 to choose the vault's birth block; hosted creation uses the fixed NU7 activation
 block. The node's RPC cookie must be an owner-only file.
@@ -26,6 +26,13 @@ there is no Testnet faucet button. Each member connects the payment relays in
 their own app before proposing or approving. A dashboard is optional: pass
 `--dashboard-port 8901` to this same command if you want one. It does not sign.
 
+The Accounts section can create another profile with its own key store and
+vaults, then switch between accounts. The existing `--data` profile remains the
+**Existing account**; new accounts live in `--data/accounts/<id>/`. Switching
+locks the previous profile, so unlock an account to use its vaults. All accounts
+in one app use the app's selected network. Renaming, deleting, and moving
+accounts between networks are not available yet.
+
 For members on separate machines, each app needs its own local Testnet node or
 loopback RPC tunnel. The local setup courier needs a verified HTTPS front and
 `--invite-port` plus `--invite-origin` on the creator's app, as described below.
@@ -37,11 +44,11 @@ the browser has not yet been mined end to end; use disposable test funds.
 
 ## Local regtest
 
-This is the first member-owned regtest path. Run one app process per person, each
+This is the first member-owned regtest path. Run one app process per device, each
 with its own `--data` directory. The shared `--exchange` directory carries only
 public join records and the existing signed or encrypted setup messages. Each
-process calls `loki_setup_member` for its own identity, DKG and backup. It has
-no route that creates another member's identity or unlocks another share.
+account calls `loki_setup_member` for its own identity, DKG and backup. The
+setup courier exposes no profile, passphrase, or key material.
 
 Vault creation needs only each member's Loki signer. A personal Zcash wallet is
 not required. An optional regtest account link can be added before or after
