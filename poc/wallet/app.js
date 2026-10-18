@@ -1004,11 +1004,10 @@ $('refresh-balance').addEventListener('click', async () => {
   try {
     const value = await api('balance', {vault});
     if (selectedVault !== vault) return;
-    $('balance').textContent = (value.network === 'testnet'
+    $('balance').textContent = value.network === 'testnet'
       ? `${zecFromZat(value.balance_zat)} ZEC · scanned block ${value.height} of ${value.chain_tip}`
         + (value.scan_ready ? ' · scan caught up' : ' · scan still catching up; balance may be incomplete')
-      : `${zecFromZat(value.balance_zat)} ZEC · ${value.unspent_notes} unspent notes · block ${value.height}`)
-      + (Number.isInteger(value.max_spendable_zat) ? ` · ${zecFromZat(value.max_spendable_zat)} ZEC spendable now` : '');
+      : `${zecFromZat(value.balance_zat)} ZEC`;
     if (value.network === 'testnet' && !$('payment-list').hidden) refreshPaymentsQuietly(true);
   } catch (error) {
     if (selectedVault === vault) $('balance').textContent = `Scan failed: ${error.message}. Balance unavailable.`;
