@@ -17,6 +17,7 @@
 pub mod candidate;
 #[cfg(test)]
 mod coordinator;
+pub mod coordinator_boundary;
 pub mod distributed_setup;
 pub mod intent;
 pub mod member_state;
@@ -34,6 +35,7 @@ pub mod scanstate;
 pub mod seal_kdf;
 pub mod setup_transport;
 pub mod setup_ceremony;
+pub mod signer;
 pub mod signing_session;
 pub mod state;
 pub mod vault;
