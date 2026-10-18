@@ -76,6 +76,10 @@ impl BirthWitnesses {
     pub fn root(&self) -> [u8; 32] {
         self.tree.root().to_bytes()
     }
+
+    pub fn size(&self) -> u64 {
+        self.tree.size() as u64
+    }
 }
 
 #[cfg(test)]

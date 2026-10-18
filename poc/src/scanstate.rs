@@ -1,15 +1,12 @@
 //! What a scan remembers between runs.
 //!
 //! A scan that starts at genesis every time is fine on a 70-block regtest chain and
-//! impossible at mainnet height. This is the smallest state that lets the next scan skip
-//! the blocks the last one already read: how far it got, every Ironwood commitment it
-//! saw, and the vault's own actions.
+//! impossible at mainnet height. This state remembers how far it got, the Ironwood
+//! commitments it saw, and the vault's own actions. A birth scan also stores the node's
+//! frontier before its first block, so it never needs earlier commitments.
 //!
-//! The commitment stream is kept in full because that is what [`crate::witness`] needs to
-//! rebuild the tree and check its root against the node's anchor. It is bounded by the
-//! number of Ironwood actions on the chain, not by the number of blocks, and it is the
-//! part that would have to become a frontier plus tracked witnesses before this is a real
-//! wallet.
+//! The scanned commitment stream is kept because [`crate::witness`] needs it to
+//! rebuild the tree and check its root against the node's anchor.
 
 use std::io::Write as _;
 use std::path::Path;
@@ -18,6 +15,7 @@ use orchard::keys::{FullViewingKey, PreparedIncomingViewingKey};
 use rand_core::{OsRng, RngCore};
 
 use crate::scan::{vault_ivks, vault_note_at, Chain, RawAction, VaultNote};
+use crate::witness::BirthWitnesses;
 
 /// One Ironwood action the vault owns, kept exactly as the node reported it.
 ///
@@ -39,9 +37,14 @@ pub struct ScanState {
     pub tip: u64,
     /// The canonical hash of `tip`; absent in legacy cache files.
     pub tip_hash: Option<[u8; 32]>,
-    /// Every Ironwood commitment up to `tip`, in append order.
+    /// A node frontier at the block before this vault's birth, when this is a birth scan.
+    pub birth_height: Option<u64>,
+    pub checkpoint_hash: Option<[u8; 32]>,
+    pub checkpoint_tree: Option<Vec<u8>>,
+    position_offset: u64,
+    /// Ironwood commitments scanned after genesis or the birth checkpoint, in append order.
     pub cmxs: Vec<[u8; 32]>,
-    /// Every nullifier revealed up to `tip`, in the same order as `cmxs`. A vault note
+    /// Every nullifier in the scanned blocks, in the same order as `cmxs`. A vault note
     /// whose nullifier appears here has already been spent, by this vault or by anyone
     /// else holding the key, and must not be offered as an input again.
     pub nfs: Vec<[u8; 32]>,
@@ -55,6 +58,46 @@ pub struct ScanState {
 }
 
 impl ScanState {
+    pub fn from_birth(
+        birth_height: u64,
+        checkpoint_hash: [u8; 32],
+        checkpoint_tree: Vec<u8>,
+    ) -> Result<Self, String> {
+        if birth_height == 0 {
+            return Err("invalid vault birth height".into());
+        }
+        let position_offset = BirthWitnesses::from_state(&checkpoint_tree)?.size();
+        Ok(Self {
+            tip: birth_height - 1,
+            tip_hash: Some(checkpoint_hash),
+            birth_height: Some(birth_height),
+            checkpoint_hash: Some(checkpoint_hash),
+            checkpoint_tree: Some(checkpoint_tree),
+            position_offset,
+            ..Self::default()
+        })
+    }
+
+    pub fn birth_witnesses(&self) -> Result<BirthWitnesses, String> {
+        let mut witnesses = BirthWitnesses::from_state(
+            self.checkpoint_tree
+                .as_deref()
+                .ok_or("scan has no birth checkpoint")?,
+        )?;
+        let mut found = self.found.iter().map(|note| note.position).peekable();
+        for cmx in &self.cmxs {
+            let position = witnesses.append(*cmx)?;
+            if found.peek().copied() == Some(position) {
+                witnesses.track_latest()?;
+                found.next();
+            }
+        }
+        if found.next().is_some() {
+            return Err("vault note position is outside the scanned tree".into());
+        }
+        Ok(witnesses)
+    }
+
     /// Record one transaction's Ironwood actions, keeping the vault's own.
     pub fn push(
         &mut self,
@@ -67,7 +110,7 @@ impl ScanState {
         for raw in actions {
             // A commitment's position is the number of commitments appended before it,
             // which is exactly what the note commitment tree does.
-            let position = self.cmxs.len() as u64;
+            let position = self.position_offset + self.cmxs.len() as u64;
             self.cmxs.push(raw.cmx);
             self.nfs.push(raw.nullifier);
             if self.own.contains(&raw.nullifier) {
@@ -119,6 +162,9 @@ impl ScanState {
 
     /// The same value a full chain scan returns, without having read the chain again.
     pub fn into_chain(self, fvk: &FullViewingKey) -> Result<Chain, String> {
+        if self.birth_height.is_some() {
+            return Err("birth scan has no genesis commitment stream".into());
+        }
         let notes = self.notes(fvk)?;
         Ok(Chain {
             notes,
@@ -145,7 +191,8 @@ impl ScanState {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(e) => return Err(format!("{}: {e}", path.display())),
         };
-        Self::decode(&text).map_err(|line| format!("{}:{line}: malformed scan state", path.display()))
+        Self::decode(&text)
+            .map_err(|line| format!("{}:{line}: malformed scan state", path.display()))
     }
 
     /// Parse [`ScanState::encode`]'s text; the error is the 1-based bad line.
@@ -167,6 +214,19 @@ impl ScanState {
                         ),
                         None => None,
                     };
+                }
+                Some("b") => {
+                    if state.birth_height.is_some() {
+                        return Err(bad());
+                    }
+                    let height = f.next().and_then(|v| v.parse().ok()).ok_or_else(bad)?;
+                    let hash = field(&mut f).ok_or_else(bad)?;
+                    let tree = f.next().and_then(|s| hex::decode(s).ok()).ok_or_else(bad)?;
+                    let birth = Self::from_birth(height, hash, tree).map_err(|_| bad())?;
+                    state.birth_height = birth.birth_height;
+                    state.checkpoint_hash = birth.checkpoint_hash;
+                    state.checkpoint_tree = birth.checkpoint_tree;
+                    state.position_offset = birth.position_offset;
                 }
                 Some("c") => {
                     state.cmxs.push(field(&mut f).ok_or_else(bad)?);
@@ -216,6 +276,18 @@ impl ScanState {
             let _ = writeln!(out, "tip {} {}", self.tip, hex::encode(hash));
         } else {
             let _ = writeln!(out, "tip {}", self.tip);
+        }
+        if let (Some(height), Some(hash), Some(tree)) = (
+            self.birth_height,
+            self.checkpoint_hash,
+            self.checkpoint_tree.as_ref(),
+        ) {
+            let _ = writeln!(
+                out,
+                "b {height} {} {}",
+                hex::encode(hash),
+                hex::encode(tree)
+            );
         }
         for (c, nf) in self.cmxs.iter().zip(self.nfs.iter()) {
             let _ = writeln!(out, "c {} {}", hex::encode(c), hex::encode(nf));
@@ -334,7 +406,10 @@ pub(crate) mod tests {
     ///
     /// Vault notes sit behind decoys, in more than one block and more than one
     /// transaction, so a wrong position would not survive by luck.
-    pub(crate) fn canned_chain(vault: &FullViewingKey, decoy: &FullViewingKey) -> Vec<serde_json::Value> {
+    pub(crate) fn canned_chain(
+        vault: &FullViewingKey,
+        decoy: &FullViewingKey,
+    ) -> Vec<serde_json::Value> {
         let mut height = 0u8;
         let mut block = |txs: Vec<serde_json::Value>| {
             height += 1;
@@ -372,16 +447,21 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn birth_checkpoint_scans_only_later_blocks_and_keeps_real_positions() {
+    fn birth_checkpoint_matches_genesis_positions_root_and_witnesses() {
         use incrementalmerkletree::frontier::CommitmentTree;
         use orchard::tree::MerkleHashOrchard;
         use zcash_primitives::merkle_tree::write_commitment_tree;
 
         let vault = a_fvk(3);
         let decoy = a_fvk(9);
-        let chain = canned_chain(&vault, &decoy);
+        let mut chain = canned_chain(&vault, &decoy);
         let mut checkpoint = CommitmentTree::<MerkleHashOrchard, 32>::empty();
-        for action in chain[1]["tx"][0]["ironwood"]["actions"].as_array().unwrap() {
+        let pre_birth = chain[1]["tx"][0]["ironwood"]["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(chain[3]["tx"][0]["ironwood"]["actions"].as_array().unwrap());
+        for action in pre_birth {
             let cmx = crate::scan::hex32(action, "cmx").unwrap();
             let note = ExtractedNoteCommitment::from_bytes(&cmx)
                 .into_option()
@@ -392,25 +472,61 @@ pub(crate) mod tests {
         }
         let mut encoded = Vec::new();
         write_commitment_tree(&checkpoint, &mut encoded).unwrap();
-        let scanned = scan_birth_blocks(
-            &vault,
-            &encoded,
-            crate::scan::hex32(&chain[1], "hash").unwrap(),
-            3,
-            6,
-            |height| Ok(chain[height as usize - 1].clone()),
-        )
+        let checkpoint_hash = crate::scan::hex32(&chain[3], "hash").unwrap();
+        let mut full = ScanState::default();
+        scan_blocks(&vault, &mut full, 6, |height| {
+            Ok(chain[height as usize - 1].clone())
+        })
+        .unwrap();
+        let full_tree = crate::witness::CommitmentTree::build(&full.cmxs).unwrap();
+        let full_root = full_tree.root().to_bytes();
+        let scanned = scan_birth_blocks(&vault, &encoded, checkpoint_hash, 5, 6, |height| {
+            Ok(chain[height as usize - 1].clone())
+        })
         .unwrap();
         assert_eq!(
             scanned.notes.iter().map(|n| n.position).collect::<Vec<_>>(),
             vec![3, 5]
         );
+        assert_eq!(scanned.witnesses.root(), full_root);
+        let mut cached = ScanState::from_birth(5, checkpoint_hash, encoded).unwrap();
+        scan_blocks(&vault, &mut cached, 5, |height| {
+            assert!(
+                height >= 4,
+                "birth scan may only recheck its checkpoint block"
+            );
+            Ok(chain[height as usize - 1].clone())
+        })
+        .unwrap();
+        cached = ScanState::decode(&cached.encode()).unwrap();
+        scan_blocks(&vault, &mut cached, 6, |height| {
+            assert!(
+                height >= 4,
+                "birth scan must not read pre-checkpoint blocks"
+            );
+            Ok(chain[height as usize - 1].clone())
+        })
+        .unwrap();
+        let cached_witnesses = cached.birth_witnesses().unwrap();
+        assert_eq!(cached_witnesses.root(), full_root);
+        assert!(ScanState::decode(&cached.encode())
+            .unwrap()
+            .into_chain(&vault)
+            .is_err());
+        let cached_notes = cached.notes(&vault).unwrap();
+        assert_eq!(
+            cached_notes.iter().map(|n| n.position).collect::<Vec<_>>(),
+            vec![3, 5]
+        );
         for note in &scanned.notes {
+            let full_path = full_tree.path(note.position).unwrap();
+            let birth_path = scanned.witnesses.path(note.position).unwrap();
+            let cached_path = cached_witnesses.path(note.position).unwrap();
+            assert_eq!(birth_path.position(), full_path.position());
+            assert_eq!(birth_path.auth_path(), full_path.auth_path());
+            assert_eq!(cached_path.auth_path(), full_path.auth_path());
             assert_eq!(
-                scanned
-                    .witnesses
-                    .path(note.position)
-                    .unwrap()
+                birth_path
                     .root(
                         ExtractedNoteCommitment::from_bytes(&note.cmx)
                             .into_option()
@@ -420,6 +536,26 @@ pub(crate) mod tests {
                 scanned.witnesses.root()
             );
         }
+        chain[4]["tx"][0]["ironwood"]["actions"][0] = action_json(&vault, 250, 18);
+        rebranch(&mut chain, 4);
+        scan_blocks(&vault, &mut cached, 6, |height| {
+            assert!(height >= 4, "a reorg must restart at the birth checkpoint");
+            Ok(chain[height as usize - 1].clone())
+        })
+        .unwrap();
+        let mut reorg_full = ScanState::default();
+        scan_blocks(&vault, &mut reorg_full, 6, |height| {
+            Ok(chain[height as usize - 1].clone())
+        })
+        .unwrap();
+        assert_eq!(
+            cached.birth_witnesses().unwrap().root(),
+            crate::witness::CommitmentTree::build(&reorg_full.cmxs)
+                .unwrap()
+                .root()
+                .to_bytes()
+        );
+        assert_eq!(cached.notes(&vault).unwrap()[0].value_zat, 250);
     }
 
     #[test]

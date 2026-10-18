@@ -159,6 +159,11 @@ poc/
   g3/G3-RESULTS.md            the browser drills, per engine
 ```
 
+The regtest indexer accepts `loki_indexer <state-dir> [cache-file] --from-height N`.
+It seeds its cache from the node's Ironwood tree at block `N-1`, then scans from
+block `N`. Omit the flag for the existing genesis scan. The reported `actions`
+count includes commitments before `N`.
+
 ## The claim this exists to test
 
 A FROST signature is normally produced over a finished transaction. ZIP 229 allows the

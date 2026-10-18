@@ -238,21 +238,7 @@ pub fn scan_chain_from_birth(
     fvk: &FullViewingKey,
     birth_height: u64,
 ) -> Result<BirthChain, String> {
-    let checkpoint_height = birth_height
-        .checked_sub(1)
-        .ok_or("invalid vault birth height")?;
-    let checkpoint = rpc.json("z_gettreestate", &format!("[\"{checkpoint_height}\"]"))?;
-    if checkpoint["height"].as_u64() != Some(checkpoint_height) {
-        return Err("birth checkpoint height differs from the node response".into());
-    }
-    let hash = hex32(&checkpoint, "hash").ok_or("birth checkpoint has no block hash")?;
-    let encoded = hex::decode(
-        checkpoint["ironwood"]["commitments"]["finalState"]
-            .as_str()
-            .ok_or("birth checkpoint has no Ironwood tree state")?,
-    )
-    .map_err(|e| format!("birth checkpoint tree: {e}"))?;
-    let expected = anchor_from_treestate(&checkpoint)?;
+    let (hash, encoded, expected) = birth_checkpoint(rpc, birth_height)?;
     if BirthWitnesses::from_state(&encoded)?.root() != expected {
         return Err("birth checkpoint tree disagrees with its root".into());
     }
@@ -264,9 +250,9 @@ pub fn scan_chain_from_birth(
         rpc.json("getblock", &format!("[\"{height}\", 2]"))
     })?;
     if rpc
-        .json("getblockhash", &format!("[{checkpoint_height}]"))?
+        .json("getblockhash", &format!("[{}]", birth_height - 1))?
         .as_str()
-        != checkpoint["hash"].as_str()
+        != Some(hex::encode(hash).as_str())
     {
         return Err("birth checkpoint changed during the scan".into());
     }
@@ -274,6 +260,28 @@ pub fn scan_chain_from_birth(
         return Err("scanned Ironwood tree disagrees with the node's anchor".into());
     }
     Ok(chain)
+}
+
+fn birth_checkpoint(
+    rpc: &crate::rpc::Rpc,
+    birth_height: u64,
+) -> Result<([u8; 32], Vec<u8>, [u8; 32]), String> {
+    let height = birth_height
+        .checked_sub(1)
+        .ok_or("invalid vault birth height")?;
+    let state = rpc.json("z_gettreestate", &format!("[\"{height}\"]"))?;
+    if state["height"].as_u64() != Some(height) {
+        return Err("birth checkpoint height differs from the node response".into());
+    }
+    let hash = hex32(&state, "hash").ok_or("birth checkpoint has no block hash")?;
+    let tree = hex::decode(
+        state["ironwood"]["commitments"]["finalState"]
+            .as_str()
+            .ok_or("birth checkpoint has no Ironwood tree state")?,
+    )
+    .map_err(|e| format!("birth checkpoint tree: {e}"))?;
+    let root = anchor_from_treestate(&state)?;
+    Ok((hash, tree, root))
 }
 
 /// Scan every block for the vault's Ironwood notes and collect the commitment stream.
@@ -305,12 +313,79 @@ pub fn scan_chain_cached(
     path: &std::path::Path,
 ) -> Result<Chain, String> {
     let mut state = ScanState::load(path)?;
+    if state.birth_height.is_some() {
+        state = ScanState::default();
+    }
     scan_to_tip(rpc, fvk, &mut state)?;
     let notes = state.notes(fvk)?;
     state.save(path)?;
     Ok(Chain {
         notes,
         cmxs: state.cmxs,
+        tip: state.tip,
+    })
+}
+
+/// Cache only the commitments after `birth_height`, using the node's frontier before it.
+/// shortcut: witnesses replay the cached suffix each run; persist them when that grows large.
+pub fn scan_chain_cached_from_birth(
+    rpc: &crate::rpc::Rpc,
+    fvk: &FullViewingKey,
+    path: &std::path::Path,
+    birth_height: u64,
+) -> Result<BirthChain, String> {
+    let (hash, tree, root) = birth_checkpoint(rpc, birth_height)?;
+    let mut state = ScanState::load(path)?;
+    if state.birth_height != Some(birth_height) || state.checkpoint_hash != Some(hash) {
+        state = ScanState::from_birth(birth_height, hash, tree)?;
+    }
+    if BirthWitnesses::from_state(
+        state
+            .checkpoint_tree
+            .as_deref()
+            .ok_or("scan has no birth checkpoint")?,
+    )?
+    .root()
+        != root
+    {
+        return Err("birth checkpoint tree disagrees with the node's root".into());
+    }
+    scan_to_tip(rpc, fvk, &mut state)?;
+    if rpc
+        .json("getblockhash", &format!("[{}]", birth_height - 1))?
+        .as_str()
+        != Some(hex::encode(hash).as_str())
+    {
+        return Err("birth checkpoint changed during the scan".into());
+    }
+    let notes = state.notes(fvk)?;
+    let witnesses = state.birth_witnesses()?;
+    let anchor = chain_anchor(rpc, state.tip)?;
+    if rpc
+        .json("getblockhash", &format!("[{}]", state.tip))?
+        .as_str()
+        != state.tip_hash.map(hex::encode).as_deref()
+    {
+        return Err("scanned tip changed while checking the Ironwood anchor".into());
+    }
+    if witnesses.root() != anchor {
+        return Err("scanned Ironwood tree disagrees with the node's anchor".into());
+    }
+    for note in &notes {
+        let cmx = ExtractedNoteCommitment::from_bytes(&note.cmx)
+            .into_option()
+            .ok_or("vault note has invalid Ironwood commitment")?;
+        if witnesses.path(note.position)?.root(cmx).to_bytes() != anchor {
+            return Err(format!(
+                "witness at position {} disagrees with the node's anchor",
+                note.position
+            ));
+        }
+    }
+    state.save(path)?;
+    Ok(BirthChain {
+        notes,
+        witnesses,
         tip: state.tip,
     })
 }
@@ -351,7 +426,14 @@ where
             && (state.tip_hash.is_none()
                 || Some(block_hash(&get_block(state.tip)?, state.tip)?) != state.tip_hash))
     {
-        *state = ScanState::default();
+        *state = match (
+            state.birth_height,
+            state.checkpoint_hash,
+            state.checkpoint_tree.clone(),
+        ) {
+            (Some(height), Some(hash), Some(tree)) => ScanState::from_birth(height, hash, tree)?,
+            _ => ScanState::default(),
+        };
     }
 
     let ivks = vault_ivks(fvk);
