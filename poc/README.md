@@ -58,12 +58,13 @@ RPC credentials in a URL or command argument.
    Members 1 and 2 each run `loki_member_payment sign <their-member-dir>
    <their-passphrase-file> roster.json <shared-payment-dir>` at the same time and
    explicitly approve the reviewed effects. Member 3 runs the same prefix with
-   `finish` in place of `sign`, syncs the indexed wallet after mining, then runs
-   `verify` with the mined txid appended.
+   `finish` in place of `sign` and appends the same `<lightwalletd-url>`.
+   After mining, member 3 syncs the indexed wallet and runs `verify` with
+   the mined txid appended.
 
 Testnet vault state binds the network and birth height into the roster fingerprint.
 Balance and spending use the same encrypted, indexed wallet database. Sync it before
-spending; the finisher checks its scanned block hash against the node and builds
+spending; the finisher checks its scanned block hash against lightwalletd and builds
 witnesses from the stored tree data. ZIP 2005 key derivation
 and the recovery tool still need independent review and a public Testnet recovery
 spend before real custody use.

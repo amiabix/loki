@@ -30,14 +30,18 @@ use loki_poc::{
 };
 #[cfg(feature = "relay-communication")]
 use loki_relay_client::{ClientStore, OwnerInbox, RelayHttp, RelayRuntime};
-use orchard::{keys::Scope, note::Note, tree::MerklePath, Address};
+use orchard::{keys::Scope, note::Note, Address};
 use reddsa_frost::frost::redpallas as frost;
 use serde_json::json;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
-use zcash_protocol::{consensus::Parameters, memo::MemoBytes, value::Zatoshis};
-use zcash_protocol::consensus::{BlockHeight, Network};
+use tonic::transport::{ClientTlsConfig, Endpoint};
+use zcash_client_backend::proto::service::{
+    compact_tx_streamer_client::CompactTxStreamerClient, BlockId, Empty, RawTransaction,
+};
 use zcash_primitives::transaction::TxId;
+use zcash_protocol::consensus::{BlockHeight, Network};
+use zcash_protocol::{consensus::Parameters, memo::MemoBytes, value::Zatoshis};
 use zeroize::{Zeroize, Zeroizing};
 
 fn signer_set_from_name(name: &str, threshold: u16) -> Result<Vec<u16>, String> {
@@ -90,11 +94,33 @@ fn member_rpc(member: &MemberState) -> Result<Rpc, String> {
     }
 }
 
+fn broadcast_endpoint(network: VaultNetwork, url: Option<&str>) -> Result<Option<Endpoint>, String> {
+    if network == VaultNetwork::Regtest {
+        return Ok(None);
+    }
+    let endpoint = Endpoint::from_shared(
+        url.ok_or("Testnet finish requires a lightwalletd URL")?.to_owned(),
+    ).map_err(|e| format!("lightwalletd URL: {e}"))?;
+    let uri = endpoint.uri();
+    if uri.scheme_str() != Some("https")
+        && !(uri.scheme_str() == Some("http")
+            && matches!(uri.host(), Some("localhost" | "127.0.0.1" | "[::1]")))
+    {
+        return Err("lightwalletd must use HTTPS, except on localhost".into());
+    }
+    if uri.scheme_str() == Some("https") {
+        return endpoint
+            .tls_config(ClientTlsConfig::new().with_webpki_roots())
+            .map(Some)
+            .map_err(|e| format!("lightwalletd TLS: {e}"));
+    }
+    Ok(Some(endpoint))
+}
+
 struct SpendNote {
     note: Note,
     nullifier: [u8; 32],
     value_zat: u64,
-    witness: Option<MerklePath>,
 }
 
 fn wallet(member: &MemberState, owner: &Path, pass: &str) -> Result<VaultWallet, String> {
@@ -112,7 +138,6 @@ fn member_chain(
             let chain = chain_cache::scan(rpc, owner, &member.fvk, &member.vault)?;
             Ok((chain.notes.into_iter().map(|note| SpendNote {
                 note: note.note, nullifier: note.nullifier, value_zat: note.value_zat,
-                witness: None,
             }).collect(), chain.tip, None))
         }
         VaultNetwork::Testnet => {
@@ -152,12 +177,12 @@ fn member_chain(
                 wallet.spendable_ironwood_inputs_at(block, frontier)?
             };
             let notes = inputs
-                .into_iter().map(|(received, witness)| {
+                .into_iter().map(|(received, _)| {
                     let note = *received.note();
                     SpendNote {
                         nullifier: note.nullifier(&member.fvk).to_bytes(),
                         value_zat: note.value().inner(),
-                        note, witness: Some(witness),
+                        note,
                     }
                 }).collect();
             Ok((notes, u64::from(height), Some(anchor)))
@@ -1052,10 +1077,15 @@ fn prove(
 }
 
 fn finish(args: &[String], broadcast: bool) -> Result<(), String> {
-    if args.len() != 4 {
-        return Err("finish <member-dir> <passphrase-file> <roster.json> <work-dir>".into());
+    if args.len() != 4 && !(broadcast && args.len() == 5) {
+        return Err("finish <member-dir> <passphrase-file> <roster.json> <work-dir> [lightwalletd-url]".into());
     }
     let (member, owner, pass) = state(args)?;
+    let endpoint = if broadcast {
+        broadcast_endpoint(member.network, args.get(4).map(String::as_str))?
+    } else {
+        None
+    };
     let work = Path::new(&args[3]);
     private_work(work)?;
     let (context, intent) = manifest(&work.join("payment.json"), member.network)?;
@@ -1116,11 +1146,13 @@ fn finish(args: &[String], broadcast: bool) -> Result<(), String> {
         );
         return Ok(());
     }
-    let rpc = member_rpc(&member)?;
+    let mut rpc = None;
+    let mut lightwalletd = None;
     let (witnesses, anchor) = match member.network {
         VaultNetwork::Regtest => {
-            let chain = chain_cache::scan(&rpc, &owner, &member.fvk, &member.vault)?;
-            let anchor = scan::chain_anchor(&rpc, chain.tip)?;
+            let node = Rpc::regtest();
+            let chain = chain_cache::scan(&node, &owner, &member.fvk, &member.vault)?;
+            let anchor = scan::chain_anchor(&node, chain.tip)?;
             let witnesses = indices
                 .iter()
                 .zip(&intent.input_nullifiers)
@@ -1136,38 +1168,78 @@ fn finish(args: &[String], broadcast: bool) -> Result<(), String> {
                     ))
                 })
                 .collect::<Result<Vec<_>, String>>()?;
+            rpc = Some(node);
             (witnesses, anchor)
         }
         VaultNetwork::Testnet => {
-            let (notes, _, anchor) = member_chain(&member, &owner, &pass, &rpc, true)?;
-            let anchor = anchor.ok_or("wallet has no Ironwood anchor")?;
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all().build().map_err(|e| format!("start lightwalletd: {e}"))?;
+            let channel = runtime.block_on(
+                endpoint.ok_or("Testnet finish requires a lightwalletd URL")?
+                    .connect_timeout(Duration::from_secs(10))
+                    .timeout(Duration::from_secs(30))
+                    .connect(),
+            ).map_err(|e| format!("connect to lightwalletd: {e}"))?;
+            let mut client = CompactTxStreamerClient::new(channel);
+            let wallet = wallet(&member, &owner, &pass)?;
+            let height = wallet.scanned_height()?.ok_or("wallet has not scanned any blocks")?;
+            let info = runtime.block_on(client.get_lightd_info(Empty {}))
+                .map_err(|e| format!("lightwalletd info: {e}"))?.into_inner();
+            if info.chain_name != "test" || info.block_height != u64::from(height) {
+                return Err("wallet scan is behind lightwalletd; run loki_wallet_sync again".into());
+            }
+            let tree_state = runtime.block_on(client.get_tree_state(BlockId {
+                height: u64::from(height), hash: vec![],
+            })).map_err(|e| format!("lightwalletd tree state: {e}"))?.into_inner();
+            if tree_state.network != "test" || tree_state.height != u64::from(height)
+                || tree_state.hash != wallet.scanned_hash(BlockHeight::from_u32(height))?
+            {
+                return Err("wallet scan is on a different chain; run loki_wallet_sync again".into());
+            }
+            let tree = tree_state.ironwood_tree()
+                .map_err(|e| format!("Ironwood tree state: {e}"))?;
+            let anchor = tree.root().to_bytes();
+            let frontier = tree.to_frontier().value().cloned()
+                .ok_or("scanned Ironwood tree is empty")?;
+            let notes = wallet.ironwood_inputs_at(BlockHeight::from_u32(height), frontier)?;
             let witnesses = indices
                 .iter()
                 .zip(&intent.input_nullifiers)
                 .map(|(index, nf)| {
                     let note = notes
                         .iter()
-                        .find(|note| note.nullifier == *nf)
+                        .find(|(note, _)| note.note().nullifier(&member.fvk).to_bytes() == *nf)
                         .ok_or_else(|| format!("finisher cannot find input {}", hex::encode(nf)))?;
-                    Ok((*index, note.witness.clone().ok_or("wallet has no input witness")?))
+                    Ok((*index, note.1.clone()))
                 })
                 .collect::<Result<Vec<_>, String>>()?;
+            lightwalletd = Some((runtime, client));
             (witnesses, anchor)
         }
     };
     let (raw, txid) = prove(signed, sighash, witnesses, anchor)?;
     if member.network == VaultNetwork::Testnet {
-        // shortcut: ambiguous RPC failures keep inputs locked until expiry; add mempool reconciliation for early release.
+        // shortcut: ambiguous broadcast failures keep inputs locked until expiry; add mempool reconciliation for early release.
         wallet(&member, &owner, &pass)?
             .reserve_broadcast_inputs(txid, &intent.input_nullifiers, intent.expiry_height)?;
     }
     let txid = txid.to_string();
-    let sent = rpc.json(
-        "sendrawtransaction",
-        &format!("[\"{}\"]", hex::encode(&raw)),
-    )?;
-    if sent.as_str() != Some(&txid) {
-        return Err(format!("node returned a different txid: {sent}"));
+    if let Some((runtime, mut client)) = lightwalletd {
+        let sent = runtime.block_on(client.send_transaction(RawTransaction {
+            data: raw.clone(), height: 0,
+        })).map_err(|e| format!("lightwalletd send transaction: {e}"))?.into_inner();
+        if sent.error_code != 0 {
+            return Err(format!("lightwalletd rejected transaction ({}): {}", sent.error_code, sent.error_message));
+        }
+    } else {
+        let sent = rpc.ok_or("Regtest node unavailable")?.json(
+            "sendrawtransaction",
+            &format!("[\"{}\"]", hex::encode(&raw)),
+        )?;
+        if sent.as_str() != Some(&txid) {
+            return Err(format!("node returned a different txid: {sent}"));
+        }
     }
     fs::write(work.join("final.hex"), hex::encode(&raw)).map_err(|e| e.to_string())?;
     println!(
@@ -1601,6 +1673,26 @@ fn main() {
     if let Err(error) = result {
         eprintln!("error: {error}");
         process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod broadcast_tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_selection_and_plaintext_policy() {
+        assert!(broadcast_endpoint(VaultNetwork::Regtest, None).unwrap().is_none());
+        assert_eq!(
+            broadcast_endpoint(VaultNetwork::Testnet, Some("https://wallet.example"))
+                .unwrap().unwrap().uri().to_string(),
+            "https://wallet.example/"
+        );
+        assert!(broadcast_endpoint(VaultNetwork::Testnet, None).is_err());
+        assert!(broadcast_endpoint(VaultNetwork::Testnet, Some("http://localhost:9067")).is_ok());
+        assert!(broadcast_endpoint(VaultNetwork::Testnet, Some("http://127.0.0.1:9067")).is_ok());
+        assert!(broadcast_endpoint(VaultNetwork::Testnet, Some("http://wallet.example")).is_err());
+        assert!(broadcast_endpoint(VaultNetwork::Testnet, Some("http://127.0.0.1.evil.example")).is_err());
     }
 }
 

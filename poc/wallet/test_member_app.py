@@ -892,6 +892,24 @@ class MemberWalletTest(unittest.TestCase):
             self.assertIn("find-mined", called)
             self.assertIn("verify", called)
 
+    def test_testnet_finish_passes_lightwalletd_url(self):
+        with tempfile.TemporaryDirectory(prefix="loki-testnet-finish-") as temp:
+            wallet, vault, attempt = self.payment_fixture(temp, slot=3, phase="approved")
+            wallet.network = "testnet"
+            wallet.lightwalletd_url = "https://wallet.example"
+            wallet.relay_payment_ready = True
+            member = wallet.data / "vaults" / vault
+            membership = member / "membership.json"
+            membership.write_text(json.dumps({**json.loads(membership.read_text()), "network": "testnet"}))
+
+            def command(action, *args, **_kwargs):
+                self.assertEqual(action, "finish")
+                self.assertEqual(args[-1], "https://wallet.example")
+                return "broadcast txid=" + "e" * 64
+
+            with patch.object(wallet, "balance"), patch.object(wallet, "command", side_effect=command):
+                self.assertEqual(wallet.finish_payment(vault, attempt)["phase"], "broadcast")
+
     def test_payment_advance_verifies_with_the_recorded_txid(self):
         with tempfile.TemporaryDirectory(prefix="loki-advance-verify-") as temp:
             txid = "e" * 64

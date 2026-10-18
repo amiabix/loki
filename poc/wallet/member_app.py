@@ -1792,7 +1792,9 @@ class Wallet:
     def finish_payment(self, vault, attempt):
         if self.network == "testnet":
             self.balance(vault)
-        _, work, _, output = self.payment_command("finish", vault, attempt, timeout=600)
+        endpoint = (self.lightwalletd_url,) if self.network == "testnet" else ()
+        _, work, _, output = self.payment_command(
+            "finish", vault, attempt, *endpoint, timeout=600)
         txid = re.search(r"\bbroadcast txid=([0-9a-f]{64})\b", output)
         if not txid:
             raise ValueError("Finisher did not return a broadcast transaction ID")
@@ -2526,7 +2528,7 @@ def serve(wallet, port, dashboard_port=None, invite_port=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Member vault app")
     parser.add_argument("--network", choices=("regtest", "testnet"), default="regtest")
-    parser.add_argument("--lightwalletd-url", help="HTTPS Testnet lightwalletd endpoint for the persistent vault scan")
+    parser.add_argument("--lightwalletd-url", help="HTTPS Testnet lightwalletd endpoint for vault scan and broadcast")
     parser.add_argument("--data", type=Path, required=True, help="private app data directory")
     parser.add_argument("--exchange", type=Path, help="shared untrusted local setup courier (local transport only)")
     parser.add_argument("--port", type=int, required=True)
