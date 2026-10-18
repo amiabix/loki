@@ -17,7 +17,8 @@ async function run() {
           contentType: file.endsWith('.js') ? 'text/javascript' : file.endsWith('.css') ? 'text/css' : file.endsWith('.woff2') ? 'font/woff2' : 'text/html'});
       }
       let result = {};
-      if (url.pathname === '/api/status') result = {phase: 'home', profile: {name: 'Alice'},
+      if (url.pathname === '/api/accounts') result = {active: 'default', accounts: [{id: 'default', name: 'Alice'}]};
+      else if (url.pathname === '/api/status') result = {phase: 'home', profile: {name: 'Alice'},
         vaults: [{name: 'Gold', vault, slot: 1, threshold: 2, members: 3}]};
       else if (url.pathname === '/api/session/pending') result = {requests: []};
       else if (url.pathname === '/api/session/actions') result = {actions: []};
@@ -25,9 +26,10 @@ async function run() {
     });
     await page.goto('http://127.0.0.1:18801/#test-token');
     await page.locator('#home').waitFor({state: 'visible'});
+    assert.equal(await page.locator('.journey [data-step=vault]').getAttribute('aria-current'), 'step');
     // The "Join a vault" explanation is collapsed behind a disclosure by default.
     // (The details sits in the card section, a sibling of #join, so locate it by content.)
-    const joinAside = page.locator('details.aside').filter({hasText: 'Paste the invite'});
+    const joinAside = page.locator('details.aside').filter({hasText: 'Each invite is for one member'});
     assert.equal(await joinAside.count(), 1, 'join explanation must be wrapped in details.aside');
     const joinBody = joinAside.locator('p');
     assert.equal(await joinBody.isVisible(), false, 'educational prose must be hidden until expanded');
@@ -36,7 +38,7 @@ async function run() {
     await joinAside.locator('summary').click();
     assert.equal(await joinBody.isVisible(), true, 'expanding shows the prose');
     // A short instruction we did NOT collapse stays plainly visible.
-    assert.equal(await page.getByText('Each member joins from their own app.').isVisible(), true,
+    assert.equal(await page.getByText('Start a new group, then invite each member from their own app.').isVisible(), true,
       'short instructions must not be collapsed');
     console.log('PASS: educational asides collapse by default; instructions stay visible');
   } finally { await browser.close(); }

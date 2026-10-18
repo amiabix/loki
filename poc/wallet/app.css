@@ -1058,3 +1058,127 @@ details.aside > summary::-webkit-details-marker { display: none; }
 details.aside > summary::before { content: "▸ "; color: var(--faint); }
 details.aside[open] > summary::before { content: "▾ "; }
 details.aside > p { color: var(--dim); margin: .4rem 0 0; }
+
+/* Member wallet: the path is the visual anchor. The dashboard keeps its own sheet rules above. */
+html:has(.member-app) { background: var(--bg); }
+.member-app::before, .member-app::after { content: none; }
+.member-app .top { background: var(--rail); }
+.member-app .band { max-width: 1240px; }
+.member-app .top-row { align-items: center; padding-block: 18px; }
+.member-app .brand { letter-spacing: .04em; text-transform: none; font-size: 21px; }
+.member-app .who { align-items: center; gap: 6px 12px; }
+.member-app .who h1 { font: 600 15px/1.3 Geist, sans-serif; }
+.member-app .who #subtitle { flex-basis: 100%; }
+.member-app .header-actions { display: flex; align-items: center; gap: 8px; }
+.member-app .header-actions button { white-space: nowrap; }
+.member-app .vault-chip { font-size: 10px; letter-spacing: .04em; }
+
+.member-app .member-layout {
+  display: grid;
+  grid-template-columns: 210px minmax(0, 1fr);
+  gap: clamp(28px, 5vw, 72px);
+  padding-top: 48px;
+  padding-bottom: 64px;
+}
+.member-app .member-content { min-width: 0; }
+.member-app .journey { align-self: start; position: sticky; top: 28px; }
+.member-app .journey-title { margin: 0 0 18px; font-size: 13px; font-weight: 700; color: var(--text); }
+.member-app .journey ol { margin: 0; padding: 0; list-style: none; border-left: 1px solid var(--line); }
+.member-app .journey li {
+  display: flex; align-items: baseline; gap: 13px;
+  margin-left: -1px; padding: 12px 8px 12px 15px;
+  border-left: 2px solid transparent;
+  color: var(--dim); font-size: 13px; line-height: 1.4;
+}
+.member-app .journey li span { color: var(--faint); font: 500 11px/1 var(--mono); }
+.member-app .journey li[aria-current="step"] { color: var(--text); border-color: var(--accent); font-weight: 700; }
+.member-app .journey li[aria-current="step"] span { color: var(--accent); }
+.member-app .journey-note { max-width: 24ch; margin: 24px 0 0; font-size: 12px; line-height: 1.6; color: var(--dim); }
+
+.member-app .step-kicker, .member-app .step-title { text-align: left; margin-left: 0; }
+.member-app .step-kicker { margin-bottom: 8px; letter-spacing: .04em; text-transform: none; font: 600 12px/1.4 Geist, sans-serif; }
+.member-app .step-title { max-width: none; margin-bottom: 24px; font: 400 clamp(30px, 4vw, 44px)/1.14 var(--serif); }
+.member-app .step-progress, .member-app #transport-note, .member-app #message { max-width: none; text-align: left; margin-inline: 0; }
+.member-app .step-progress { margin-bottom: 20px; }
+.member-app .card {
+  max-width: none; margin: 0 0 16px; padding: clamp(22px, 3vw, 32px);
+  background: var(--surface); background-image: none; border: 1px solid var(--line);
+  clip-path: none; box-shadow: none; animation: none; transition: none;
+}
+.member-app .card:not([hidden]) { animation: none; box-shadow: none; }
+.member-app .card:hover { border-color: var(--line); }
+.member-app .card h2, .member-app .card h3 {
+  display: block; margin: 0 0 10px; color: var(--text);
+  font: 600 18px/1.3 Geist, sans-serif; letter-spacing: -.015em; text-transform: none;
+}
+.member-app .card h3 { font-size: 14px; }
+.member-app .card h2::before, .member-app .card h2::after,
+.member-app .card h3::before, .member-app .card h3::after { content: none; }
+.member-app .card h2 ~ h2, .member-app .card h2 ~ h3 { margin-top: 0; }
+.member-app .card p { font-size: 13px; line-height: 1.6; }
+.member-app label { margin-top: 20px; color: var(--text); font-size: 12px; letter-spacing: 0; text-transform: none; }
+.member-app label small { font-size: 11px; line-height: 1.5; color: var(--dim); }
+.member-app input, .member-app textarea, .member-app select { margin-top: 7px; border-radius: 3px; }
+.member-app button { clip-path: none; border-radius: 3px; letter-spacing: 0; text-transform: none; font-size: 12px; padding: 12px 18px; box-shadow: none; }
+.member-app button::before, .member-app button::after { content: none; }
+.member-app button.quiet, .member-app button.theme { padding: 7px 10px; }
+.member-app details.card > summary { font-size: 14px; letter-spacing: 0; text-transform: none; color: var(--text); }
+.member-app details.card > summary::before { width: 6px; height: 6px; margin-right: 10px; }
+.member-app details.aside { margin-top: 16px; }
+.member-app .warning { margin-top: 20px; }
+.member-app .build-note { margin: 30px 0 0; text-align: left; font-size: 11px; line-height: 1.5; letter-spacing: 0; text-transform: none; }
+
+.member-app #accounts { padding-block: 18px; }
+.member-app #accounts > h2 { font-size: 14px; }
+.member-app #accounts > p { margin-bottom: 14px; }
+.member-app #account-list { display: flex; flex-wrap: wrap; gap: 8px; }
+.member-app #account-list .vault-row { width: auto; margin: 0; padding: 8px 12px; font-size: 12px; }
+.member-app #account-list .vault-row:disabled { border-color: var(--accent-edge); color: var(--accent); opacity: 1; }
+.member-app #accounts details.aside { margin: 14px 0 0; }
+.member-app #vault-list { margin-top: 20px; }
+.member-app #vault-list .vault-item + .vault-item { margin-top: 10px; }
+.member-app #vault-list .vault-row { padding: 14px 16px; }
+.member-app #vault-list .relay-detail { padding: 0 16px 8px; }
+.member-app .choice-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.member-app .choice-grid .card { margin-bottom: 16px; }
+.member-app .choice-grid form { display: flex; flex-direction: column; align-items: start; }
+.member-app .choice-grid label { width: 100%; }
+.member-app .choice-grid button { margin-top: auto; }
+.member-app #home-relays .row { max-width: none; align-items: center; justify-content: space-between; margin: 0 0 10px; }
+.member-app #home-relays .row h2 { margin: 0; }
+.member-app #home-relays .row button { margin: 0; }
+
+.member-app .wallet-grid { display: grid; grid-template-columns: minmax(0, .85fr) minmax(0, 1.15fr); gap: 16px; }
+.member-app .wallet-panel { min-width: 0; }
+.member-app .panel-number { margin: 0 0 9px !important; color: var(--accent) !important; font: 600 11px/1.4 var(--mono) !important; }
+.member-app #address { margin-top: 20px; padding: 15px; background: var(--inset); border: 1px solid var(--line); font-size: 12px; }
+.member-app #address:not(.muted) { animation: none; }
+.member-app .balance-block { margin-top: 28px; padding-top: 24px; border-top: 1px solid var(--line); }
+.member-app .balance-block h3 { margin: 0 0 8px; }
+.member-app .balance-block button { margin-top: 14px; }
+.member-app #payment-draft button { margin-top: 24px; }
+.member-app .payment-workflow { margin-top: 0; }
+.member-app .payment-workflow > button { margin: 22px 0; }
+.member-app #payment-list { margin-top: 8px; }
+.member-app #payment-list > .card { padding: 22px; background: var(--inset); }
+.member-app #payment-list .roster { margin-block: 18px; }
+.member-app #payment-list .roster-row { gap: 8px 24px; }
+.member-app #payment-list pre { margin-top: 18px; }
+.member-app #draft-result { margin-top: 18px; }
+
+@media (max-width: 900px) {
+  .member-app .member-layout { grid-template-columns: 1fr; gap: 28px; padding-top: 28px; }
+  .member-app .journey { position: static; }
+  .member-app .journey-title, .member-app .journey-note { display: none; }
+  .member-app .journey ol { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-left: 0; border-bottom: 1px solid var(--line); }
+  .member-app .journey li { display: block; margin: 0 0 -1px; padding: 8px 6px 12px; border-left: 0; border-bottom: 2px solid transparent; font-size: 11px; }
+  .member-app .journey li[aria-current="step"] { border-bottom-color: var(--accent); }
+  .member-app .journey li span { display: block; margin-bottom: 5px; }
+}
+@media (max-width: 680px) {
+  .member-app .top-row { align-items: flex-start; flex-wrap: wrap; }
+  .member-app .header-actions { width: 100%; }
+  .member-app .choice-grid, .member-app .wallet-grid { grid-template-columns: 1fr; gap: 0; }
+  .member-app .card { padding: 20px; }
+  .member-app .step-title { font-size: 30px; }
+}

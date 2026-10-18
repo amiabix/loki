@@ -136,7 +136,7 @@ function action(id, task) {
 function vaultList(vaults) {
   const list = $('vault-list');
   list.replaceChildren();
-  if (!vaults.length) { list.textContent = 'No vaults yet.'; return; }
+  if (!vaults.length) { list.textContent = 'No vaults yet. Create one below or join with an invite.'; return; }
   for (const vault of vaults) {
     const button = document.createElement('button');
     button.type = 'button';
@@ -369,7 +369,7 @@ async function refreshPayments() {
   if (!state.payments.length) {
     list.replaceChildren();
     paymentCards.clear();
-    list.textContent = 'No payments in this member’s app.';
+    list.textContent = 'No payments yet. Propose one above to begin.';
     return;
   }
   if (!paymentCards.size) list.replaceChildren();   /* drop the empty-state text node */
@@ -723,6 +723,14 @@ async function refresh() {
     }
     if (version !== refreshVersion) return;
     if ((state.phase === 'new_profile' || state.phase === 'locked') && selectedVault) selectVault(null);
+    const journey = ['new_profile', 'locked'].includes(state.phase) ? 'account'
+      : state.phase === 'home' ? 'vault'
+      : ['back_up', 'waiting_for_backups', 'final_backup', 'connecting_relays'].includes(state.phase) ? 'backup'
+      : state.phase === 'active' ? 'wallet' : 'vault';
+    for (const step of document.querySelectorAll('.journey [data-step]')) {
+      if (step.dataset.step === journey) step.setAttribute('aria-current', 'step');
+      else step.removeAttribute('aria-current');
+    }
     currentNetwork = state.network || 'regtest';
     const testnet = currentNetwork === 'testnet';
     $('network-chip').textContent = testnet ? 'ZCASH TESTNET' : 'REGTEST';
