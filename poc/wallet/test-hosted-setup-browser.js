@@ -25,7 +25,8 @@ async function run() {
             contentType: file.endsWith('.js') ? 'text/javascript' : file.endsWith('.css') ? 'text/css' : 'text/html'});
         }
         let result = {};
-        if (url.pathname === '/api/status') result = url.searchParams.has('vault') ? state()
+        if (url.pathname === '/api/accounts') result = {active: 'alice', accounts: [{id: 'alice', name: 'Alice'}]};
+        else if (url.pathname === '/api/status') result = url.searchParams.has('vault') ? state()
           : {phase: 'home', profile: {name: 'Alice'}, vaults: [{name: 'Hosted Treasury', vault, slot: 1, threshold, members: count}],
              relay_network: {transport: 'hosted', enabled: true, detail: 'Connecting automatically.'}};
         else if (url.pathname === '/api/payments') result = {payments: []};
@@ -51,6 +52,23 @@ async function run() {
       assert.equal(await page.locator('#relay-setup').isHidden(), true);
       await page.reload();
       await page.waitForFunction(() => !document.getElementById('active').hidden);
+      await page.evaluate(() => {
+        for (const id of ['restore-vault', 'check-backup', 'make-final-backup', 'check-final-backup']) {
+          document.querySelector(`#${id} [name=words]`).value = 'private recovery words';
+        }
+        document.getElementById('words').textContent = 'private recovery words';
+      });
+      await page.locator('#back').click();
+      for (const id of ['restore-vault', 'check-backup', 'make-final-backup', 'check-final-backup']) {
+        assert.equal(await page.locator(`#${id} [name=words]`).inputValue(), '');
+      }
+      assert.equal(await page.locator('#words').textContent(), '');
+      await page.evaluate(() => {
+        document.querySelector('#restore-vault [name=words]').value = 'private recovery words';
+        document.getElementById('lock').click();
+      });
+      await page.waitForFunction(() => !document.querySelector('#restore-vault [name=words]').value);
+      assert.equal(await page.locator('#restore-vault [name=words]').inputValue(), '');
       assert.deepEqual(errors, []);
       await page.close();
     }
@@ -67,7 +85,8 @@ async function run() {
           contentType: file.endsWith('.js') ? 'text/javascript' : file.endsWith('.css') ? 'text/css' : 'text/html'});
       }
       let result = {};
-      if (url.pathname === '/api/status') result = url.searchParams.has('vault')
+      if (url.pathname === '/api/accounts') result = {active: 'bob', accounts: [{id: 'bob', name: 'Bob'}]};
+      else if (url.pathname === '/api/status') result = url.searchParams.has('vault')
         ? {phase: 'compare_roster', setup_phase: 'roster_proposed', name: 'Joined vault', vault: joinedVault, slot: 2,
            threshold: 2, total_members: 3, members: 3, missing_slots: [], transport: 'hosted', handoff: 'pending',
            fingerprint, confirmations: [1, 2, 3].map(slot => ({slot, confirmed: false, matches: true})),
