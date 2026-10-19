@@ -1,5 +1,7 @@
 require 'xcodeproj'
-proj_path = '/tmp/LokiSignerApp/LokiSigner.xcodeproj'
+# Generate the project IN this directory (poc/signer-app/), referencing Sources/main.swift here.
+Dir.chdir(__dir__)
+proj_path = File.join(__dir__, 'LokiSigner.xcodeproj')
 project = Xcodeproj::Project.new(proj_path)
 target = project.new_target(:application, 'LokiSigner', :osx, '13.0')
 src = project.new_file('Sources/main.swift')
