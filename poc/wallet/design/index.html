@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Loki — redesign prototype</title>
+  <link rel="stylesheet" href="tokens.css">
+  <link rel="stylesheet" href="app.css">
+  <script src="proto.js" defer></script>
+</head>
+<body>
+<div class="netstrip" aria-hidden="true"></div>
+<div class="app" id="app">
+
+  <!-- ─── sidebar ─────────────────────────────────────────────────────────── -->
+  <aside class="rail">
+    <div class="brand"><span class="glyph">◇</span> Loki</div>
+    <span class="testnet-badge">Testnet · no real funds</span>
+    <p class="rail-label">Member journey</p>
+    <nav class="nav" aria-label="Prototype screens"></nav>
+    <div class="rail-foot">
+      <div class="seg" role="group" aria-label="Theme">
+        <button data-theme-btn="dark">Dark</button>
+        <button data-theme-btn="light">Light</button>
+        <button data-theme-btn="system">System</button>
+      </div>
+      <p class="toolbar-note">Static prototype. No keys, no network. Click the journey to walk every screen and state.</p>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <span class="testnet-badge">TESTNET</span>
+      <span class="pill"><span class="dot"></span> Signer connected · Alice</span>
+      <span class="spacer"></span>
+      <button class="btn btn-quiet" data-nav="connect">Disconnect</button>
+    </header>
+
+    <!-- ═══ 01 · Connect signer ═════════════════════════════════════════════ -->
+    <section class="stage screen" data-screen="connect">
+      <div class="screen-head">
+        <p class="kicker">01 · Connect</p>
+        <h1 class="screen-title read">Connect your Loki signer</h1>
+        <p class="screen-sub">This page holds no keys. Your signer holds your share and approves on its own device. Check the origin, network and challenge there before you approve.</p>
+      </div>
+      <div class="grid grid-2">
+        <div class="card card-pad-lg stack">
+          <div class="row"><span class="biometric">⚷</span>
+            <div><h2>Waiting for your signer</h2><p class="muted">Approve the request in your native signer app.</p></div>
+          </div>
+          <div class="kv card" style="background:var(--surface-2)">
+            <div class="kv-row"><span class="kv-key">Origin</span><span class="kv-val">coordinator.loki.local</span></div>
+            <div class="kv-row"><span class="kv-key">Network</span><span class="kv-val" style="color:var(--warn-text)">TESTNET</span></div>
+            <div class="kv-row"><span class="kv-key">Requested access</span><span class="kv-val">vault list · public metadata</span></div>
+            <div class="kv-row"><span class="kv-key">Challenge</span><span class="kv-val">loki/connect · 7f3a·c901 · exp 4m32s</span></div>
+          </div>
+          <div class="callout callout-info"><span class="ico">ℹ</span><span>The signer shows this exact origin and a short-lived challenge. Approving here only lets the coordinator read public vault data — never a share.</span></div>
+          <button class="btn btn-primary btn-lg btn-block" data-nav="vaults">Approve on signer (demo) →</button>
+        </div>
+        <div class="card stack">
+          <h3>What connecting means</h3>
+          <p class="muted">Like connecting a signer wallet to Safe: the connected signer — not this page — approves the eventual transaction. Disconnecting ends this browser session; it does not remove you from a vault or delete your share.</p>
+          <div class="divider"></div>
+          <div class="stack-sm">
+            <span class="pill pill-ok"><span class="dot"></span> No key ever enters this page</span>
+            <span class="pill pill-info"><span class="dot"></span> Share is secure-element wrapped at rest</span>
+            <span class="pill pill-warn"><span class="dot"></span> Test network — refuses real funds</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══ 02 · Vault list / dashboard ═════════════════════════════════════ -->
+    <section class="stage screen hidden" data-screen="vaults">
+      <div class="screen-head row-between wrap">
+        <div>
+          <p class="kicker">02 · Dashboard</p>
+          <h1 class="screen-title read">Your vaults</h1>
+          <p class="screen-sub">Only vaults this signer is a member of. Each has its own identity and share on this device.</p>
+        </div>
+        <div class="row">
+          <button class="btn btn-ghost" data-nav="join">Join a vault</button>
+          <button class="btn btn-primary" data-nav="create">Create vault</button>
+        </div>
+      </div>
+      <div class="stack">
+        <div class="vault-item" data-nav="overview">
+          <div class="vault-avatar">TR</div>
+          <div class="meta"><div class="name">Treasury Reserve</div><p class="muted">3-of-5 · 5 members · funded</p></div>
+          <div class="stat" style="text-align:right"><span class="n">4.2010 <small class="dim" style="font-size:var(--fs-sm)">TAZ</small></span><span class="l">at height 1,284,902</span></div>
+          <span class="pill pill-ok"><span class="dot"></span> Active</span>
+        </div>
+        <div class="vault-item" data-nav="setup">
+          <div class="vault-avatar">OF</div>
+          <div class="meta"><div class="name">Ops Float</div><p class="muted">2-of-3 · 3 members</p></div>
+          <span class="pill pill-warn"><span class="dot"></span> Creating keys</span>
+        </div>
+        <div class="vault-item" data-nav="setup">
+          <div class="vault-avatar">GR</div>
+          <div class="meta"><div class="name">Grants Round 4</div><p class="muted">3-of-4 · waiting for 1 member</p></div>
+          <span class="pill"><span class="dot"></span> Waiting for members</span>
+        </div>
+      </div>
+      <div class="divider"></div>
+      <details class="card"><summary class="row"><strong>Restore a membership on this device</strong></summary>
+        <p class="muted" style="margin-top:var(--sp-3)">Use your 24 words and final recovery card. This restores your own share and the same vault address. It does not remove your old device.</p>
+        <button class="btn btn-ghost" style="margin-top:var(--sp-3)" data-nav="recover">Open recovery →</button>
+      </details>
+    </section>
+
+    <!-- ═══ 03 · Create vault (general t-of-n) ══════════════════════════════ -->
+    <section class="stage screen hidden" data-screen="create">
+      <div class="screen-head">
+        <p class="kicker">03 · Create</p>
+        <h1 class="screen-title read">Create a vault</h1>
+        <p class="screen-sub">Pick a threshold and the number of members. The roster and threshold become immutable once setup begins — changing a member later starts a fresh vault.</p>
+      </div>
+      <div class="grid grid-2">
+        <div class="card stack">
+          <label class="field"><span class="lbl">Vault name</span><input value="Ops Float" maxlength="80"></label>
+          <div class="grid grid-2" style="gap:var(--sp-3)">
+            <label class="field"><span class="lbl">Threshold (t)</span>
+              <select id="t-sel"><option>2</option><option selected>3</option><option>4</option></select>
+              <small>Members needed to approve a payment.</small></label>
+            <label class="field"><span class="lbl">Members (n)</span>
+              <select id="n-sel"><option>3</option><option>4</option><option selected>5</option></select>
+              <small>Total members in the roster.</small></label>
+          </div>
+          <div class="callout callout-accent"><span class="ico">◇</span><span>This vault needs <strong>3 of 5</strong> members to approve any payment. Any 3 eligible members can complete a proposal.</span></div>
+          <button class="btn btn-primary btn-lg btn-block" data-nav="setup">Create &amp; generate invites →</button>
+        </div>
+        <div class="card stack">
+          <h3>Invites</h3>
+          <p class="muted">The creator is member 1 by default. Send each invite privately. Each invite is for one member and one app and expires in 24 hours.</p>
+          <div class="stack-sm">
+            <div class="row-between card" style="background:var(--surface-2);padding:var(--sp-3)"><span class="mono">You · slot 1</span><span class="pill pill-ok"><span class="dot"></span> You</span></div>
+            <div class="row-between card" style="background:var(--surface-2);padding:var(--sp-3)"><span class="mono">loki/invite · bd71…9f02</span><button class="btn btn-quiet">Copy</button></div>
+            <div class="row-between card" style="background:var(--surface-2);padding:var(--sp-3)"><span class="mono">loki/invite · 4a0c…7731</span><button class="btn btn-quiet">Copy</button></div>
+            <div class="row-between card" style="background:var(--surface-2);padding:var(--sp-3)"><span class="mono">loki/invite · e22d…1c48</span><button class="btn btn-quiet">Copy</button></div>
+            <div class="row-between card" style="background:var(--surface-2);padding:var(--sp-3)"><span class="mono">loki/invite · 90fa…55ab</span><button class="btn btn-quiet">Copy</button></div>
+          </div>
+          <p class="muted">The vault is a draft with no receive address until every member joins, the roster matches, and all back up.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══ 04 · Join vault ═════════════════════════════════════════════════ -->
+    <section class="stage screen hidden" data-screen="join">
+      <div class="screen-head">
+        <p class="kicker">04 · Join</p>
+        <h1 class="screen-title read">Join a vault</h1>
+        <p class="screen-sub">Open the invite sent to you, see the vault, and compare the roster fingerprint with the other members before you accept.</p>
+      </div>
+      <div class="grid grid-2">
+        <div class="card stack">
+          <label class="field"><span class="lbl">Invite code</span><textarea placeholder="Paste the whole code">loki/invite:ops-float:4a0c7731:slot3:exp2026-10-19…</textarea></label>
+          <div class="kv card" style="background:var(--surface-2)">
+            <div class="kv-row"><span class="kv-key">Vault</span><span class="kv-val">Ops Float</span></div>
+            <div class="kv-row"><span class="kv-key">Threshold</span><span class="kv-val">2 of 3</span></div>
+            <div class="kv-row"><span class="kv-key">Inviter</span><span class="kv-val">alice · 7f3a…c901</span></div>
+            <div class="kv-row"><span class="kv-key">Your slot</span><span class="kv-val">3</span></div>
+          </div>
+          <button class="btn btn-primary btn-block" data-nav="setup">Accept &amp; continue →</button>
+        </div>
+        <div class="card stack">
+          <h3>Compare the roster fingerprint</h3>
+          <p class="muted">Each member's app shows the same fingerprint once all slots fill. Compare it through a channel you trust — a call, in person. Stop if any character differs.</p>
+          <div class="codeblocks"><span class="codeblock">K7F2</span><span class="codeblock">9QX4</span><span class="codeblock">LM08</span></div>
+          <div class="callout callout-warn"><span class="ico">⚠</span><span>These are claims each app published. Agreement shows readiness — it does not by itself prove everyone saw the same roster. If a slot was claimed by the wrong person, the comparison reveals it and setup stops.</span></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══ 05 · Setup & backup ═════════════════════════════════════════════ -->
+    <section class="stage screen hidden" data-screen="setup">
+      <div class="screen-head">
+        <p class="kicker">05 · Setup &amp; backup</p>
+        <h1 class="screen-title read">Set up the vault</h1>
+        <p class="screen-sub">Setup survives app restarts — each app advances the ceremony when it opens. The vault activates and reveals its address only when every member confirms.</p>
+      </div>
+      <div class="grid" style="grid-template-columns:260px 1fr">
+        <div class="card">
+          <div class="steps">
+            <div class="step done"><span class="marker">✓</span><div class="body"><h4>Members joined</h4><p class="muted">3 of 3 slots filled</p></div></div>
+            <div class="step done"><span class="marker">✓</span><div class="body"><h4>Roster verified</h4><p class="muted">Short-code matched</p></div></div>
+            <div class="step active"><span class="marker">3</span><div class="body"><h4>Creating keys (DKG)</h4><p class="muted">Dealerless, resumable</p></div></div>
+            <div class="step pending"><span class="marker">4</span><div class="body"><h4>Back up</h4><p class="muted">Words + prove restore</p></div></div>
+            <div class="step pending"><span class="marker">5</span><div class="body"><h4>Active</h4><p class="muted">Address revealed</p></div></div>
+          </div>
+        </div>
+        <div class="stack">
+          <div class="card stack">
+            <h3>Compare the short code</h3>
+            <p class="muted">Every member's app shows the same code. Confirm it matches through a trusted channel before keys are created.</p>
+            <div class="codeblocks"><span class="codeblock">K7F2</span><span class="codeblock">9QX4</span><span class="codeblock">LM08</span></div>
+          </div>
+          <div class="card stack">
+            <div class="row-between"><h3 id="dkg-label">Creating keys… 40%</h3><button class="btn btn-ghost" id="dkg-run">Advance (demo)</button></div>
+            <div class="progress"><span id="dkg-bar" data-p="40" style="width:40%"></span></div>
+            <p class="muted">A crash or closed tab is safe — reopening resumes from here. A mismatch or timeout stops setup and names the fix; it never publishes an address.</p>
+          </div>
+          <div class="card stack">
+            <h3>Back up your share</h3>
+            <div class="grid grid-2" style="gap:var(--sp-3)">
+              <div class="card" style="background:var(--surface-2)">
+                <p class="kicker" style="color:var(--dim)">Recovery card</p>
+                <p class="mono" style="margin-top:var(--sp-2)">loki-card · ops-float · epoch 1</p>
+                <button class="btn btn-ghost" style="margin-top:var(--sp-3)">Download card</button>
+              </div>
+              <div class="card" style="background:var(--surface-2)">
+                <p class="kicker" style="color:var(--dim)">24 words</p>
+                <p class="mono faint" style="margin-top:var(--sp-2)">forest · amber · tide · … · quartz</p>
+                <button class="btn btn-ghost" style="margin-top:var(--sp-3)">Reveal words</button>
+              </div>
+            </div>
+            <div class="callout callout-warn"><span class="ico">⚠</span><span>You must prove you can restore from your words and card before this vault can activate. The address stays hidden until every member confirms their backup.</span></div>
+            <button class="btn btn-primary btn-block" data-nav="overview">Prove restore &amp; confirm backup →</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══ 06 · Vault overview ═════════════════════════════════════════════ -->
+    <section class="stage screen hidden" data-screen="overview">
+      <div class="screen-head row-between wrap">
+        <div>
+          <p class="kicker">06 · Overview</p>
+          <h1 class="screen-title read">Treasury Reserve</h1>
+          <p class="screen-sub">3-of-5 · balance shown at a named chain height from this device's own scan.</p>
+        </div>
+        <button class="btn btn-primary" data-nav="propose">Propose payment</button>
+      </div>
+      <div class="grid grid-3">
+        <div class="card stat"><span class="l">Balance · height 1,284,902</span><span class="n">4.2010 TAZ</span><span class="muted">synced 2 min ago</span></div>
+        <div class="card stat"><span class="l">Pending</span><span class="n">1</span><span class="muted">awaiting approvals</span></div>
+        <div class="card stat"><span class="l">Members</span><span class="n">5</span><span class="muted">threshold 3</span></div>
+      </div>
+      <div class="grid grid-2" style="margin-top:var(--sp-4)">
+        <div class="card stack">
+          <h3>Receive</h3>
+          <div class="row wrap"><div class="qr" aria-hidden="true"></div>
+            <div class="stack-sm" style="flex:1">
+              <p id="addr-hidden" class="muted">The address appears only after the vault is active and all backups are confirmed.</p>
+              <div id="addr-shown" class="hidden stack-sm"><span class="pill pill-ok"><span class="dot"></span> Unified Address (Orchard)</span><div class="addr">utest1q9f3a…k2m7x8c901pqz6rltvn4hd0 s9w2…9f02</div></div>
+              <button class="btn btn-ghost" id="reveal-addr">Show receive address</button>
+            </div>
+          </div>
+        </div>
+        <div class="card stack">
+          <div class="row-between"><h3>Members</h3><span class="muted">roster locked</span></div>
+          <div class="kv">
+            <div class="member"><span class="dot-avatar">A</span><div style="flex:1"><strong>alice</strong> <span class="muted">· you · slot 1</span></div><span class="pill pill-ok"><span class="dot"></span> backed up</span></div>
+            <div class="member"><span class="dot-avatar">B</span><div style="flex:1"><strong>bob</strong> <span class="muted">· slot 2</span></div><span class="pill pill-ok"><span class="dot"></span> backed up</span></div>
+            <div class="member"><span class="dot-avatar">C</span><div style="flex:1"><strong>carol</strong> <span class="muted">· slot 3</span></div><span class="pill pill-ok"><span class="dot"></span> backed up</span></div>
+            <div class="member"><span class="dot-avatar">D</span><div style="flex:1"><strong>dave</strong> <span class="muted">· slot 4</span></div><span class="pill pill-ok"><span class="dot"></span> backed up</span></div>
+            <div class="member"><span class="dot-avatar">E</span><div style="flex:1"><strong>erin</strong> <span class="muted">· slot 5</span></div><span class="pill pill-ok"><span class="dot"></span> backed up</span></div>
+          </div>
+        </div>
+      </div>
+      <div class="card stack" style="margin-top:var(--sp-4)">
+        <div class="row-between"><h3>Payments</h3><span class="muted">this device's view · refreshes automatically</span></div>
+        <div class="kv">
+          <div class="kv-row" data-nav="send" style="cursor:pointer"><span>Pay <span class="mono">utest1q…r4x9</span> · 0.5000 TAZ <span class="muted read">“vendor invoice #214”</span></span><span class="pill pill-warn"><span class="dot"></span> Waiting for approvals · 1 of 3</span></div>
+          <div class="kv-row"><span>Pay <span class="mono">utest1q…8m2k</span> · 1.2000 TAZ</span><span class="pill pill-ok"><span class="dot"></span> Confirmed · height 1,284,771</span></div>
+          <div class="kv-row"><span>Pay <span class="mono">utest1q…0ab3</span> · 0.1000 TAZ</span><span class="pill pill-danger"><span class="dot"></span> Expired</span></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══ 07 · Propose payment ════════════════════════════════════════════ -->
+    <section class="stage screen hidden" data-screen="propose">
+      <div class="screen-head">
+        <p class="kicker">07 · Propose</p>
+        <h1 class="screen-title read">Propose a payment</h1>
+        <p class="screen-sub">You fix one payment intent — recipient, amount, memo. You do not pick which members sign; any eligible quorum can approve it.</p>
+      </div>
+      <div class="grid grid-2">
+        <div class="card stack">
+          <label class="field"><span class="lbl">Recipient unified address</span><input value="utest1q9r4x9…k2m7x8" ><small>Confirm the full address with your recipient.</small></label>
+          <label class="field"><span class="lbl">Amount (TAZ)</span><input value="0.5000" inputmode="decimal"><small>Up to 8 decimal places.</small></label>
+          <label class="field"><span class="lbl">Memo</span><textarea>vendor invoice #214</textarea><small>Every approving member sees this memo on their signer.</small></label>
+          <button class="btn btn-primary btn-lg btn-block" data-nav="send">Create proposal →</button>
+          <p class="muted">Proposing does not move funds. It publishes a commitment and is labelled <strong>Preparing</strong>, not Approved.</p>
+        </div>
+        <div class="card stack">
+          <h3>Effects</h3>
+          <div class="kv">
+            <div class="kv-row"><span class="kv-key">Pay</span><span class="kv-val">0.5000 TAZ</span></div>
+            <div class="kv-row"><span class="kv-key">Network fee</span><span class="kv-val">0.00001 TAZ</span></div>
+            <div class="kv-row"><span class="kv-key">Change back to vault</span><span class="kv-val">3.70099 TAZ</span></div>
+            <div class="kv-row"><span class="kv-key">Expires</span><span class="kv-val">height 1,284,980 · ~2h</span></div>
+            <div class="kv-row"><span class="kv-key">Approvals required</span><span class="kv-val">3 of 5</span></div>
+          </div>
+          <div class="callout callout-info"><span class="ico">ℹ</span><span>No pair selector. A candidate is built for every eligible quorum so no member can be locked out. Each is bound to this one intent.</span></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══ 08 · SIGNER APPROVAL — HERO ═════════════════════════════════════ -->
+    <section class="screen hidden" data-screen="approve">
+      <div class="hero-sign">
+        <div class="hero-top">
+          <div class="brand"><span class="glyph">◇</span> Loki signer</div>
+          <span class="testnet-badge">TESTNET</span>
+          <button class="btn btn-quiet" data-nav="send">Close</button>
+        </div>
+        <div class="hero-body">
+          <div class="hero-eyebrow">
+            <span class="parsed-tag">◉ Parsed from the transaction bytes</span>
+            <h2>This is exactly what you are signing</h2>
+            <p class="wysiwys-note">Rendered on your device from the PCZT — not from anything the coordinator says.</p>
+          </div>
+
+          <div class="sign-amount">
+            <span class="big">0.5000 <small>TAZ</small></span>
+          </div>
+
+          <div class="sign-card kv">
+            <div class="kv-row"><span class="kv-key">To</span><span class="kv-val">utest1q9r4x9 k2m7 x8c9 01pq z6rl tvn4 hd0s r4x9</span></div>
+            <div class="kv-row"><span class="kv-key">Amount</span><span class="kv-val big">0.5000 TAZ</span></div>
+            <div class="kv-row"><span class="kv-key">Fee</span><span class="kv-val">0.00001 TAZ</span></div>
+            <div class="kv-row"><span class="kv-key">Change</span><span class="kv-val">3.70099 TAZ → vault</span></div>
+            <div class="kv-row"><span class="kv-key">Memo</span><span class="kv-val read">vendor invoice #214</span></div>
+            <div class="kv-row"><span class="kv-key">Network</span><span class="kv-val" style="color:var(--warn-text)">TESTNET</span></div>
+          </div>
+
+          <div class="callout callout-warn"><span class="ico">⚠</span><span>A malicious coordinator can only make you <em>refuse</em> — never sign the wrong thing. If any field above looks wrong, refuse. Your share is released only for this exact, checked package.</span></div>
+          <p id="sign-outcome" class="callout hidden"></p>
+        </div>
+        <div class="hero-actions">
+          <button class="btn btn-danger btn-lg" id="do-refuse" style="flex:1">Refuse</button>
+          <button class="btn btn-primary btn-lg" id="do-approve" style="flex:2"><span class="biometric" style="width:28px;height:28px;font-size:16px;border:none;background:transparent;color:inherit">⚷</span> Approve with Face ID</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══ 09 · Send & confirm ═════════════════════════════════════════════ -->
+    <section class="stage screen hidden" data-screen="send">
+      <div class="screen-head row-between wrap">
+        <div>
+          <p class="kicker">09 · Send &amp; confirm</p>
+          <h1 class="screen-title read">Pay 0.5000 TAZ</h1>
+          <p class="screen-sub"><span class="mono">utest1q…r4x9</span> · <span class="read">“vendor invoice #214”</span></p>
+        </div>
+        <span id="send-badge" class="pill pill-warn"><span class="dot"></span> PREPARING</span>
+      </div>
+      <div class="grid" style="grid-template-columns:260px 1fr">
+        <div class="card">
+          <div class="steps">
+            <div class="step active" data-sendstate="preparing"><span class="marker">1</span><div class="body"><h4>Preparing</h4><p class="muted">Sealing commitments</p></div></div>
+            <div class="step pending" data-sendstate="collecting"><span class="marker">2</span><div class="body"><h4>Collecting commitments</h4><p class="muted">Building candidates</p></div></div>
+            <div class="step pending" data-sendstate="ready"><span class="marker">3</span><div class="body"><h4>Ready to send</h4><p class="muted">Two valid shares</p></div></div>
+            <div class="step pending" data-sendstate="broadcast"><span class="marker">4</span><div class="body"><h4>Broadcast</h4><p class="muted">Sent to the network</p></div></div>
+            <div class="step pending" data-sendstate="confirmed"><span class="marker">5</span><div class="body"><h4>Confirmed</h4><p class="muted">Seen on this chain</p></div></div>
+          </div>
+        </div>
+        <div class="stack">
+          <div class="card stack">
+            <p id="send-caption" class="read" style="font-size:var(--fs-md)">Fresh signing commitments are being sealed in each signer. Nothing is approved yet.</p>
+            <div class="row wrap">
+              <button class="btn btn-ghost" id="send-advance">Advance state (demo)</button>
+              <button class="btn btn-quiet" id="send-rollback">Simulate reorg rollback</button>
+            </div>
+          </div>
+          <div class="card stack">
+            <h3>Approvals · 1 of 3</h3>
+            <div class="kv">
+              <div class="member"><span class="dot-avatar">A</span><div style="flex:1"><strong>alice</strong> <span class="muted">· you</span></div><span class="pill pill-ok"><span class="dot"></span> approved</span></div>
+              <div class="member"><span class="dot-avatar">B</span><div style="flex:1"><strong>bob</strong></div><button class="btn btn-ghost" data-nav="approve">Review on signer →</button></div>
+              <div class="member"><span class="dot-avatar">C</span><div style="flex:1"><strong>carol</strong></div><span class="pill"><span class="dot"></span> not yet opened</span></div>
+            </div>
+            <div class="divider"></div>
+            <p class="muted">Any synced member can finish and broadcast once two valid shares are in — even one who did not approve. Each app marks <strong>Confirmed</strong> only after its own scan sees the block.</p>
+            <button class="btn btn-primary btn-block" id="send-advance-2" data-nav="overview">Back to vault</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══ 10 · Recover / leave ════════════════════════════════════════════ -->
+    <section class="stage screen hidden" data-screen="recover">
+      <div class="screen-head">
+        <p class="kicker">10 · Recover &amp; leave</p>
+        <h1 class="screen-title read">Recover or leave</h1>
+        <p class="screen-sub">Restore your own share on a new device, or remove a member. Changing a label never changes the cryptographic roster.</p>
+      </div>
+      <div class="grid grid-2">
+        <div class="card stack">
+          <h3>Restore on a new device</h3>
+          <p class="muted">Needs both your 24 words and your final recovery card. The personal-wallet seed alone cannot restore a Loki share.</p>
+          <label class="field"><span class="lbl">Vault name on this device</span><input placeholder="Treasury Reserve"></label>
+          <label class="field"><span class="lbl">Your 24 backup words</span><input placeholder="forest amber tide …"></label>
+          <label class="field"><span class="lbl">Final recovery card</span><input type="file"></label>
+          <button class="btn btn-primary btn-block" data-nav="overview">Restore membership →</button>
+          <div class="callout callout-info"><span class="ico">ℹ</span><span>Restore resets to a fresh nonce epoch and restores the same vault address. It does not remove or disable your old device.</span></div>
+        </div>
+        <div class="card stack">
+          <h3>Leave or remove a member</h3>
+          <p class="muted">Leaving, or removing a compromised member, creates a new vault and sweeps funds into it. The old roster cannot be edited in place.</p>
+          <div class="kv">
+            <div class="member"><span class="dot-avatar">B</span><div style="flex:1"><strong>bob</strong> <span class="muted">· slot 2</span></div><button class="btn btn-danger">Remove</button></div>
+            <div class="member"><span class="dot-avatar">C</span><div style="flex:1"><strong>carol</strong> <span class="muted">· slot 3</span></div><button class="btn btn-danger">Remove</button></div>
+          </div>
+          <div class="callout callout-danger"><span class="ico">⚠</span><span>This is permanent. A new vault is created with a new group key; funds are swept and the old address stops being used.</span></div>
+          <button class="btn btn-ghost btn-block">Leave this vault</button>
+        </div>
+      </div>
+    </section>
+
+  </div>
+</div>
+</body>
+</html>
