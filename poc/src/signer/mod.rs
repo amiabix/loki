@@ -16,6 +16,7 @@
 //! `coordinator_boundary` now re-exports this trait instead of defining its own.
 
 pub mod backup;
+pub mod coordination;
 pub mod local;
 pub mod nonce;
 pub mod secure_element;
