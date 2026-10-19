@@ -68,12 +68,13 @@ pub struct CandidateRef {
 }
 
 /// The ONE keyless signer seam (ws1-signer §7). Every parameter and return type is
-/// PUBLIC FROST/PCZT data: session handles, public vault metadata, public DKG round
-/// messages, signing commitments, and signature shares (public partial signatures).
+/// FROST/PCZT artifacts: session handles, vault metadata, authenticated DKG round-one
+/// messages, recipient-encrypted DKG round-two messages, signing commitments, and
+/// signature shares (public partial signatures).
 ///
 /// There is deliberately NO method that takes or returns a FROST share, a secret nonce,
-/// a viewing key, or a spend authorization (invariants #1/#4). The `PublicArtifact`
-/// compile-time guard in `tests` proves it.
+/// a viewing key, or a spend authorization (invariants #1/#4). Opaque byte vectors need
+/// separate tests to verify that secret material is encrypted before it crosses this seam.
 ///
 /// Implemented by [`local::LocalSigner`] (in-app, secure-element-wrapped share) today and
 /// by a FROST hardware participant later, behind this exact interface (ws1-signer §4
@@ -93,9 +94,9 @@ pub trait Signer {
     /// Public vault metadata the member holds a share for.
     fn list_vaults(&self, session: &Session) -> Result<Vec<VaultRef>, Self::Error>;
 
-    /// Advance the dealerless group DKG by one step, returning the PUBLIC outbound round
-    /// messages. The member's share is born INSIDE the signer and sealed via the secure
-    /// element on completion; it is never returned.
+    /// Advance the dealerless group DKG by one step, returning signed round-one messages
+    /// or recipient-encrypted round-two messages. The member's share is born INSIDE the
+    /// signer and sealed via the secure element on completion; it is never returned.
     fn dkg_step(
         &mut self,
         session: &Session,
@@ -140,12 +141,11 @@ pub trait Signer {
 
 #[cfg(test)]
 mod tests {
-    //! Compile-time proof the seam exposes no secret-returning method (acceptance test 2).
+    //! Type guard for the named return types of the signer seam.
     //!
     //! Every `Signer` success type is asserted to implement `PublicArtifact`, a marker
-    //! deliberately NOT implemented for any secret type. Adding a method that returns a
-    //! `KeyPackage`/`SigningShare`/`SigningNonces`/`FullViewingKey` fails to compile here
-    //! because those types do not implement `PublicArtifact`.
+    //! deliberately NOT implemented for any secret type. This cannot inspect the contents
+    //! of opaque `Vec<u8>` messages; the local signer DKG test checks that boundary.
 
     use super::*;
 
@@ -161,14 +161,14 @@ mod tests {
     impl PublicArtifact for frost::round2::SignatureShare {}
     impl<T: PublicArtifact> PublicArtifact for Vec<T> {}
     impl PublicArtifact for VaultRef {}
-    impl PublicArtifact for Vec<u8> {} // opaque public round messages
+    impl PublicArtifact for Vec<u8> {} // opacity requires separate DKG boundary tests
 
     fn assert_public<T: PublicArtifact>() {}
 
     #[test]
-    fn every_signer_return_type_is_a_public_artifact() {
-        // Each line pins one `Signer` method's success type. If any method ever returns a
-        // secret, its type will not implement `PublicArtifact` and this will not compile.
+    fn known_signer_return_types_are_public_artifacts() {
+        // Each line pins one `Signer` method's current success type. Opaque bytes need
+        // separate content checks; this cannot inspect newly added methods automatically.
         assert_public::<Connection>(); // connect
         assert_public::<Vec<VaultRef>>(); // list_vaults
         assert_public::<Vec<Vec<u8>>>(); // dkg_step

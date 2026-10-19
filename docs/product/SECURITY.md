@@ -5,38 +5,30 @@ Audience: a decision-maker who is not a cryptographer and needs to know what is
 proven, what is still dangerous, and exactly what to arrange before any mainnet
 money is at risk.
 
-Scope of this brief: the round-2 signer work on branch `pr2/signer`
-(`poc/src/signer/` + `poc/src/coordinator_boundary.rs`), audited against the threat
-model (`00-architecture.md` §5) and invariants (§7), `ws1-signer.md`, and
-`ws6-standards-and-audit.md`. The companion coordinator-demo branch
-(`pr2/coordinator-demo`) **does not exist in this repository** at audit time; its
-end-to-end coordination loop is therefore **not reviewed and not proven here** — the
-demo claims below cover only what the signer code demonstrates.
+Scope of this brief: the round-2 signer work (`poc/src/signer/` +
+`poc/src/coordinator_boundary.rs`), audited against the threat model
+(`00-architecture.md` §5) and invariants (§7), `ws1-signer.md`, and
+`ws6-standards-and-audit.md`. The companion `pr2/coordinator-demo` branch exists,
+but its end-to-end coordination loop has not been reviewed here.
 
-Verification note: the author reports the full suite passing on the `omarchy`
-build host (cargo 1.98, "101 passed; 0 failed", signer module 11/11). This brief
-was written against the source read in full on `pr2/signer`; the suite was **not
-re-run locally** (local toolchain is cargo 1.95). Treat the pass as reported, not
-as independently re-executed here.
+Verification note: this review reproduced a plaintext DKG share leak in the signer
+test, then reran the test and the library suite after moving round-two sealing
+inside the signer. These tests do not establish production custody safety.
 
 ---
 
 ## 1. What the demo proves
 
-The demo shows a **split-custody** shielded Zcash multisig where the secret-holding
-part and the convenience part are different modules, and the secret never crosses
-between them.
+The demo separates the secret-holding signer from the coordinator. The DKG
+round-two boundary required a fix: it previously returned plaintext share packages.
 
 - **No spend key in the coordinator.** The coordinator (the part that would be a web
   app) talks to a member only through one narrow trait, `Signer`
-  (`poc/src/signer/mod.rs`), whose every method takes and returns **public**
-  FROST/PCZT data — session handles, public DKG round messages, signing commitments,
-  partial signatures. There is deliberately no method that returns a share, a nonce, a
-  viewing key, or a spend authorization. A compile-time guard
-  (`every_signer_return_type_is_a_public_artifact`, `mod.rs` tests) refuses to build if
-  anyone adds a secret-returning method, and a source deny-list test
-  (`coordinator_source_links_no_secret_type`, `coordinator_boundary.rs`) fails if the
-  coordinator ever even *names* a share/nonce/spend-key type.
+  (`poc/src/signer/mod.rs`). Round one is signed, and round two is encrypted to its
+  intended member before the coordinator sees it (`local.rs`). The type guard
+  (`known_signer_return_types_are_public_artifacts`) checks named return types but
+  cannot inspect `Vec<u8>` contents or detect an unlisted new trait method. The
+  coordinator source deny-list checks one file, not the whole process.
 - **Audited FROST crypto.** The threshold math is the ZF `frost-rerandomized` /
   `reddsa` RedPallas stack (`ADOPTION.md` §1–2, 4); Loki writes the signer shell, not
   new threshold crypto. The partial signature is produced by
@@ -52,17 +44,16 @@ between them.
 
 | Invariant (§7) | Upheld? | Evidence |
 |---|---|---|
-| #1 No key in the browser/coordinator | **Yes (structural)** | `Signer` trait exposes only public types; `PublicArtifact` compile-time guard + `coordinator_source_links_no_secret_type` deny-list (`mod.rs`, `coordinator_boundary.rs`). |
+| #1 No key in the browser/coordinator | **Partial** | `LocalSigner::dkg_step` now signs round one and encrypts round-two shares to a preapproved roster. The opaque-byte trait and one-file deny-list do not prove the whole coordinator stays keyless. |
 | #3 Confirm on the signer (WYSIWYS) | **Yes — the round-1 BLOCKER is closed** | `sign_approve` recomputes the sighash from the same bytes it rendered and **refuses with `SighashMismatch` before the nonce/share is touched** if `pkg.message()` differs. Test `sign_approve_binds_package_message_to_rendered_sighash` proves a tampered package is refused *and* the nonce stays `Committed`. |
-| #4 Only public data crosses the boundary | **Yes** | Same trait/guard as #1; the coordinator links none of the share-holding modules. |
+| #4 Only public data crosses the boundary | **Partial** | The coordinator receives encrypted DKG shares and a viewing key. The viewing key does not authorize spends, but reveals wallet activity and needs a separate privacy review. |
 | #5 Audited crypto only | **Yes** | FROST math is `frost-rerandomized`/`reddsa`; `nonce.rs` calls the audited signer, no bespoke threshold code. |
 | Nonce single-use + crash-safety | **Yes (in `nonce.rs`)** | Persist-before-emit (round 1), atomic burn-before-nonce-removal with fsync (round 2), reuse-for-different-message hard-refused. Tests `crash_after_burn_leaves_no_stranded_or_duplicated_nonce` and `reuse_for_a_different_message_is_hard_refused` (`nonce.rs`). |
-| Share born in the signer (DKG) | **Partially** | `dkg_step` drives the existing dealerless `distributed_setup` as a 3-call typestate machine; the share is born inside the signer and sealed immediately (`local.rs`). Test `dkg_step_produces_sealed_share_that_can_sign`. See §3 for what is *not* yet covered (backup/restore, epoch reset). |
+| Share born in the signer (DKG) | **Partially** | `dkg_step` seals the resulting share and encrypts each outbound round-two package inside the signer. The regression test rejects plaintext packages and checks recipient isolation. Roster approval, backup/restore, and epoch reset still need work. |
 
-What a malicious coordinator can do at the demo stage: cause a **refused** signature.
-What it cannot do: make a member sign a payment different from what their own signer
-rendered. That is the one property that makes the "web app you don't fully trust"
-shape defensible, and in this code it holds.
+The signer rejects a signing package whose message differs from its recomputed
+transaction hash. The simulated approval callback and unreviewed coordinator loop
+limit what this demo establishes about a malicious coordinator.
 
 ---
 
@@ -86,14 +77,18 @@ shape defensible, and in this code it holds.
   exercised end-to-end from a test. The guard is defensive but **unproven against a real
   adversarial PCZT**. Dangerous: a fee/value substitution path could exist that the test
   suite cannot currently reach.
+- **DKG roster approval is assumed.** `for_dkg` accepts a roster from its caller and
+  checks its shape and own identity. A trusted signer-side workflow must bind every
+  peer key to the intended person before DKG; if a malicious coordinator can choose
+  those keys, it can decrypt shares addressed to its own keys.
 - **DKG: no backup/restore, no epoch reset proven.** `dkg_step` generates and seals the
   share, but this round does not demonstrate backup, restore-to-new-device, or the
   nonce-epoch reset on restore that `ws1-signer.md` §8 requires. A real custody flow must
   recover a share without replaying an old nonce; that is not shown here.
-- **No end-to-end coordination / broadcast proven.** The `pr2/coordinator-demo` branch is
-  absent; there is no reviewed 2-of-3 testnet payment that aggregates partials, applies
-  them to a PCZT, and broadcasts (ws1 §11 acceptance #6). The signer half is proven in
-  isolation only.
+- **No end-to-end coordination / broadcast proven.** The `pr2/coordinator-demo` branch
+  exists but has not been reviewed here; there is no reviewed 2-of-3 testnet payment
+  that aggregates partials, applies them to a PCZT, and broadcasts (ws1 §11
+  acceptance #6). The signer half is proven in isolation only.
 - **No external security audit yet.** All assurances above are self-review + Loki's own
   tests. The highest-value target (the signer shell) has not been looked at by an
   independent auditor (`ws6` §3).
@@ -133,12 +128,13 @@ Each item is tagged with who must do it: **loki-eng** (Loki engineering),
    runs/witnesses the recovery drill.
 5. **End-to-end split-architecture payment** — a 2-of-3 testnet payment signed via two
    isolated signers + a keyless coordinator, aggregated, applied, broadcast, confirmed;
-   print the txid (ws1 §11 #6). Requires the missing coordinator loop. — **loki-eng**
+   print the txid (ws1 §11 #6). Verify each signer approved the actual peer roster
+   independently of the coordinator. Requires review of the coordinator loop. — **loki-eng**
 6. **External security audit** with this explicit scope: the **signer shell** (at-rest
    sealing / KEK wrapping / nonce single-use + crash-safety), the **WYSIWYS→sighash
    binding** (`sign_approve` + `wysiwys::sighash_of_pczt`), the **keyless coordinator
-   boundary** (`Signer` trait + `coordinator_boundary.rs` guards), and **ZIP-2005 FVK
-   derivation #1094** (`zip2005.rs`). — **external-auditor** (scoped by **loki-eng**,
+   boundary** (including DKG roster binding and round-two encryption), and
+   **ZIP-2005 FVK derivation #1094** (`zip2005.rs`). — **external-auditor** (scoped by **loki-eng**,
    commissioned by **user**).
 7. **ZIP-2005 #1094 upstream review** — drive the vector-matched `use_qsk` derivation
    through ZF `frost#1094` and either land it reviewed or switch to an audited derivation.
@@ -175,5 +171,6 @@ recipe), the mainnet-refuse guard (#9), and the #1094 upstream engagement (#7).
   supply-chain protection regardless of what the code does.
 - **Give the final mainnet go-live sign-off** (#9) jointly with the external auditor.
 
-Everything in §1–2 is demonstrated. Everything in §3 is a reason real money would be at
-risk today. The §4 checklist, with §5 ownership, is the path from demo to custody.
+The tests in §1–2 cover specific signer behavior; they do not prove the entire
+coordinator boundary. Every gap in §3 is a reason real money would be at risk today.
+The §4 checklist, with §5 ownership, is the path from demo to custody.

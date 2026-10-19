@@ -14,14 +14,16 @@
 //!   4. only then produce the rerandomized round-2 share under the single-use nonce rules.
 
 use crate::distributed_setup::{Completed, Member, Round2Member};
+use crate::setup_transport::{Identity, PublicIdentity};
 use crate::signer::nonce::NonceStore;
 use crate::signer::secure_element::{SealedShare, SecureElement};
 use crate::signer::wysiwys::{self, PaymentView};
 use crate::signer::{CandidateRef, Connection, MemberIdentity, Network, Session, Signer, VaultRef};
 use orchard::keys::FullViewingKey;
 use reddsa_frost::frost::redpallas as frost;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use zeroize::Zeroize;
 
 /// The member's on-device approval decision for a rendered payment. In a real signer this
 /// is a full-screen confirmation + biometric prompt; here it is a policy callback so the
@@ -71,9 +73,20 @@ impl From<String> for SignerError {
 enum Dkg {
     /// Not started; the next `dkg_step` (with empty `in_msgs`) runs round 1.
     Idle,
+    Aborted,
     AfterRound1(Member),
     AfterRound2(Round2Member),
     Done(Completed),
+}
+
+struct SecretRound2(BTreeMap<u16, Vec<u8>>);
+
+impl Drop for SecretRound2 {
+    fn drop(&mut self) {
+        for package in self.0.values_mut() {
+            package.zeroize();
+        }
+    }
 }
 
 /// One member's signer. Holds the sealed share + the public key package + the vault FVK
@@ -96,6 +109,8 @@ pub struct LocalSigner<SE: SecureElement> {
     vault_fvk: FullViewingKey,
     nonces: NonceStore,
     approval: ApprovalPolicy,
+    dkg_identity: Option<Identity>,
+    approved_roster: BTreeMap<u16, PublicIdentity>,
     dkg: Dkg,
     session: Option<Session>,
     /// Last rendered payment, keyed by candidate attempt id, for `rendered_payment`.
@@ -135,13 +150,16 @@ impl<SE: SecureElement> LocalSigner<SE> {
             vault_fvk,
             nonces: NonceStore::open(&nonce_dir).map_err(|e| SignerError::Other(e.to_string()))?,
             approval,
+            dkg_identity: None,
+            approved_roster: BTreeMap::new(),
             dkg: Dkg::Idle,
             session: None,
             rendered: BTreeMap::new(),
         })
     }
 
-    /// Construct a signer with NO share yet; it is born via [`Signer::dkg_step`].
+    /// Construct a signer with NO share yet, after this device has approved the exact
+    /// public DKG roster out of band. The coordinator must not choose these keys.
     #[allow(clippy::too_many_arguments)]
     pub fn for_dkg(
         member_id: u16,
@@ -151,10 +169,38 @@ impl<SE: SecureElement> LocalSigner<SE> {
         label: String,
         network: Network,
         se: SE,
+        identity: Identity,
+        approved_roster: Vec<PublicIdentity>,
         vault_fvk: FullViewingKey,
         nonce_dir: PathBuf,
         approval: ApprovalPolicy,
     ) -> Result<Self, SignerError> {
+        let roster: BTreeMap<_, _> = approved_roster
+            .iter()
+            .cloned()
+            .map(|peer| (peer.id, peer))
+            .collect();
+        if roster.len() != usize::from(members)
+            || approved_roster.len() != roster.len()
+            || roster.keys().copied().collect::<Vec<_>>() != (1..=members).collect::<Vec<_>>()
+            || roster.get(&member_id) != Some(&identity.public())
+            || roster
+                .values()
+                .map(|peer| peer.signing)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != roster.len()
+            || roster
+                .values()
+                .map(|peer| peer.encryption)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != roster.len()
+        {
+            return Err(SignerError::Other(
+                "DKG roster is not this member's approved roster".into(),
+            ));
+        }
         Ok(Self {
             member_id,
             threshold,
@@ -168,6 +214,8 @@ impl<SE: SecureElement> LocalSigner<SE> {
             vault_fvk,
             nonces: NonceStore::open(&nonce_dir).map_err(|e| SignerError::Other(e.to_string()))?,
             approval,
+            dkg_identity: Some(identity),
+            approved_roster: roster,
             dkg: Dkg::Idle,
             session: None,
             rendered: BTreeMap::new(),
@@ -218,18 +266,24 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
         sid.copy_from_slice(h.as_bytes());
         let session = Session(sid);
         self.session = Some(session.clone());
-        // Public member identity from the sealed key, if present (post-DKG).
-        let (signing, encryption) = match self.open_key() {
-            Ok(kp) => {
-                let vs: [u8; 32] = kp
-                    .verifying_share()
-                    .serialize()
-                    .map_err(|e| SignerError::Other(e.to_string()))?
-                    .try_into()
-                    .map_err(|_| SignerError::Other("verifying share not 32 bytes".into()))?;
-                (vs, [0u8; 32])
+        // The DKG identity is the approved roster key; a restored share has only
+        // its verifying share available here.
+        let (signing, encryption) = if let Some(identity) = &self.dkg_identity {
+            let public = identity.public();
+            (public.signing, public.encryption)
+        } else {
+            match self.open_key() {
+                Ok(kp) => {
+                    let vs: [u8; 32] = kp
+                        .verifying_share()
+                        .serialize()
+                        .map_err(|e| SignerError::Other(e.to_string()))?
+                        .try_into()
+                        .map_err(|_| SignerError::Other("verifying share not 32 bytes".into()))?;
+                    (vs, [0u8; 32])
+                }
+                Err(_) => ([0u8; 32], [0u8; 32]),
             }
-            Err(_) => ([0u8; 32], [0u8; 32]),
         };
         Ok(Connection {
             session,
@@ -257,26 +311,45 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
     fn dkg_step(
         &mut self,
         session: &Session,
-        _vault: &VaultRef,
+        vault: &VaultRef,
         in_msgs: &[Vec<u8>],
     ) -> Result<Vec<Vec<u8>>, Self::Error> {
         if self.session.as_ref() != Some(session) {
             return Err(SignerError::NoSession);
         }
+        if vault.vault_id != self.vault_id
+            || vault.threshold != self.threshold
+            || vault.members != self.members
+        {
+            return Err(SignerError::Other(
+                "DKG vault differs from this signer".into(),
+            ));
+        }
+        let identity = self
+            .dkg_identity
+            .as_ref()
+            .ok_or_else(|| SignerError::Other("DKG requires an approved signer roster".into()))?;
         // The dealerless DKG from `distributed_setup` is a 3-call typestate machine. The
-        // coordinator passes PUBLIC round messages in roster order (member 1..=N):
+        // coordinator passes signed round-one wires or encrypted round-two wires
+        // in roster order (member 1..=N):
         //   call 0: in_msgs empty            -> run part1, emit [own round1 package]
         //   call 1: in_msgs = all round1 pkgs (roster order) -> part2, emit round2 pkgs
         //                                                        for each peer (roster order)
         //   call 2: in_msgs = peers' round2 pkgs to this member (roster order)
         //                                      -> part3; SEAL the share internally, emit []
-        match std::mem::replace(&mut self.dkg, Dkg::Idle) {
+        match std::mem::replace(&mut self.dkg, Dkg::Aborted) {
             Dkg::Idle => {
+                if !in_msgs.is_empty() {
+                    return Err(SignerError::Other("round-1 start needs no packages".into()));
+                }
                 let (member, own_r1) =
                     Member::start_with_policy(self.member_id, self.threshold, self.members)
                         .map_err(SignerError::Other)?;
+                let signed = identity
+                    .sign_round1(&self.vault_id, &own_r1)
+                    .map_err(SignerError::Other)?;
                 self.dkg = Dkg::AfterRound1(member);
-                Ok(vec![own_r1])
+                Ok(vec![signed])
             }
             Dkg::AfterRound1(member) => {
                 if in_msgs.len() != usize::from(self.members) {
@@ -287,12 +360,27 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
                     )));
                 }
                 let round1: BTreeMap<u16, Vec<u8>> = (1..=self.members)
-                    .zip(in_msgs.iter().cloned())
-                    .collect();
+                    .zip(in_msgs)
+                    .map(|(id, wire)| {
+                        let peer = self.approved_roster.get(&id).expect("complete DKG roster");
+                        identity
+                            .verify_round1(peer, &self.vault_id, wire)
+                            .map(|payload| (id, payload))
+                            .map_err(SignerError::Other)
+                    })
+                    .collect::<Result<_, _>>()?;
                 let (r2member, wire) = member.advance(&round1).map_err(SignerError::Other)?;
+                let wire = SecretRound2(wire);
+                let mut outgoing = Vec::with_capacity(wire.0.len());
+                for (id, payload) in &wire.0 {
+                    let peer = self.approved_roster.get(id).expect("complete DKG roster");
+                    let sealed = identity
+                        .seal_round2(peer, &self.vault_id, payload)
+                        .map_err(SignerError::Other)?;
+                    outgoing.push(sealed);
+                }
                 self.dkg = Dkg::AfterRound2(r2member);
-                // Emit this member's outgoing round-2 packages in peer-id order.
-                Ok(wire.into_values().collect())
+                Ok(outgoing)
             }
             Dkg::AfterRound2(r2member) => {
                 let peers: Vec<u16> = (1..=self.members)
@@ -305,9 +393,15 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
                         in_msgs.len()
                     )));
                 }
-                let incoming: BTreeMap<u16, Vec<u8>> =
-                    peers.into_iter().zip(in_msgs.iter().cloned()).collect();
-                let completed = r2member.finish(&incoming).map_err(SignerError::Other)?;
+                let mut incoming = SecretRound2(BTreeMap::new());
+                for (id, wire) in peers.into_iter().zip(in_msgs) {
+                    let peer = self.approved_roster.get(&id).expect("complete DKG roster");
+                    let payload = identity
+                        .open_round2(peer, &self.vault_id, wire)
+                        .map_err(SignerError::Other)?;
+                    incoming.0.insert(id, payload);
+                }
+                let completed = r2member.finish(&incoming.0).map_err(SignerError::Other)?;
                 // The share is BORN here, inside the signer. Seal it immediately with the
                 // secure element and keep only the sealed blob + the public key package.
                 self.sealed_share = Some(
@@ -322,6 +416,9 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
                 self.dkg = Dkg::Done(c);
                 Err(SignerError::Other("DKG already complete".into()))
             }
+            Dkg::Aborted => Err(SignerError::Other(
+                "DKG aborted after an earlier error".into(),
+            )),
         }
     }
 
@@ -684,21 +781,56 @@ mod tests {
     // (b) dkg_step runs the real dealerless DKG, the share is born+sealed inside the
     //     signer, and the signer can then sign a candidate for the group key.
     #[test]
+    fn rejected_dkg_input_cannot_silently_restart_the_ceremony() {
+        let identities: Vec<_> = (1..=3).map(Identity::new).collect();
+        let roster = identities.iter().map(Identity::public).collect();
+        let mut signer = LocalSigner::for_dkg(
+            1,
+            2,
+            3,
+            [1u8; 32],
+            "dkg vault".into(),
+            Network::Regtest,
+            SoftwareSecureElement::generate(),
+            identities.into_iter().next().unwrap(),
+            roster,
+            placeholder_fvk(),
+            tempdir("dkg-abort"),
+            Box::new(|_| true),
+        )
+        .unwrap();
+        let session = signer
+            .connect("http://coordinator.test", Network::Regtest, b"challenge")
+            .unwrap()
+            .session;
+        let vault = signer.list_vaults(&session).unwrap().remove(0);
+        signer.dkg_step(&session, &vault, &[]).unwrap();
+        assert!(signer.dkg_step(&session, &vault, &[]).is_err());
+        assert!(signer.dkg_step(&session, &vault, &[]).is_err());
+    }
+
+    #[test]
     fn dkg_step_produces_sealed_share_that_can_sign() {
         let challenge = b"dkg-challenge";
         // Three signers (members 1..=3). FVK is filled in once DKG yields the group key;
         // for connect/dkg we only need a placeholder FVK, so derive a throwaway now and
         // rebuild once the group ak is known.
+        let identities: Vec<Identity> = (1..=3u16).map(Identity::new).collect();
+        let roster: Vec<PublicIdentity> = identities.iter().map(Identity::public).collect();
+        let vault_id = [1u8; 32];
         let mut signers: Vec<LocalSigner<SoftwareSecureElement>> = (1..=3u16)
-            .map(|id| {
+            .zip(identities)
+            .map(|(id, identity)| {
                 LocalSigner::for_dkg(
                     id,
                     2,
                     3,
-                    [id as u8; 32],
+                    vault_id,
                     "dkg vault".into(),
                     Network::Regtest,
                     SoftwareSecureElement::generate(),
+                    identity,
+                    roster.clone(),
                     placeholder_fvk(),
                     tempdir(&format!("dkg-m{id}")),
                     Box::new(|_v| true),
@@ -729,6 +861,23 @@ mod tests {
         let r2: Vec<Vec<Vec<u8>>> = (0..3)
             .map(|i| signers[i].dkg_step(&sessions[i], &vault, &r1).unwrap())
             .collect();
+        for outgoing in &r2 {
+            for wire in outgoing {
+                assert!(
+                    frost::keys::dkg::round2::Package::deserialize(wire).is_err(),
+                    "the coordinator must not receive a plaintext DKG share"
+                );
+            }
+        }
+        assert!(
+            signers[2]
+                .dkg_identity
+                .as_ref()
+                .unwrap()
+                .open_round2(&roster[0], &vault_id, &r2[0][0])
+                .is_err(),
+            "another member must not open this recipient's DKG share"
+        );
         // Route round-2 packages: member `i` must receive, in roster order, the package
         // each OTHER member produced for `i`. Member j's r2 output is ordered by its peer
         // ids ascending; map it back to (sender=j+1, receiver).
