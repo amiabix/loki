@@ -45,6 +45,11 @@ fn expected_ids(members: u16) -> Vec<u16> {
     (1..=members).collect()
 }
 
+/// Any general t-of-n: at least one signer, threshold no larger than the roster.
+fn valid_policy(threshold: u16, members: u16) -> bool {
+    1 <= threshold && threshold <= members
+}
+
 impl Member {
     pub fn start(id: u16) -> Result<(Self, Vec<u8>), String> {
         Self::start_with_policy(id, 2, 3)
@@ -55,10 +60,8 @@ impl Member {
         threshold: u16,
         members: u16,
     ) -> Result<(Self, Vec<u8>), String> {
-        if !matches!((threshold, members), (2, 3) | (2, 4) | (3, 4))
-            || !expected_ids(members).contains(&id)
-        {
-            return Err("supported DKG policies are 2-of-3, 2-of-4, and 3-of-4".into());
+        if !valid_policy(threshold, members) || !expected_ids(members).contains(&id) {
+            return Err("DKG needs 1 <= threshold <= members".into());
         }
         let identifier = frost::Identifier::try_from(id).map_err(|e| e.to_string())?;
         let (secret, public) =
@@ -243,7 +246,7 @@ impl<'a> CheckpointReader<'a> {
         }
         let number = u16::from_be_bytes(raw[9..11].try_into().map_err(|_| CHECKPOINT_ERROR)?);
         let members = u16::from_be_bytes(raw[11..13].try_into().map_err(|_| CHECKPOINT_ERROR)?);
-        if !matches!(members, 3 | 4) || !(1..=members).contains(&number) {
+        if members < 1 || !(1..=members).contains(&number) {
             return Err(CHECKPOINT_ERROR.into());
         }
         Ok((Self { raw, offset: 13 }, number, members))
@@ -330,7 +333,7 @@ impl Member {
         if *roundtrip != encoded
             || *secret.identifier()
                 != frost::Identifier::try_from(number).map_err(|_| CHECKPOINT_ERROR)?
-            || !matches!((threshold, members), (2, 3) | (2, 4) | (3, 4))
+            || !valid_policy(threshold, members)
             || *secret.max_signers() != members
             || secret.commitment() != public.commitment()
         {
@@ -401,7 +404,7 @@ impl Round2Member {
         let roundtrip = zeroize::Zeroizing::new(secret.serialize().map_err(|_| CHECKPOINT_ERROR)?);
         if *roundtrip != encoded
             || *secret.identifier() != identifier
-            || !matches!((threshold, members), (2, 3) | (2, 4) | (3, 4))
+            || !valid_policy(threshold, members)
             || *secret.max_signers() != members
             || secret.commitment() != public.commitment()
         {
@@ -480,7 +483,7 @@ impl Completed {
         if *key_roundtrip != *key_package
             || public.serialize().map_err(|_| CHECKPOINT_ERROR)? != public_package
             || *key.identifier() != identifier
-            || !matches!((threshold, members), (2, 3) | (2, 4) | (3, 4))
+            || !valid_policy(threshold, members)
             || public.min_signers() != Some(threshold)
             || public
                 .verifying_shares()
@@ -582,5 +585,123 @@ impl Completed {
     }
     pub(crate) fn members(&self) -> u16 {
         self.members
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drive the dealerless DKG end to end for a general t-of-n roster and return every
+    /// member's certified result. No hardcoded shape: this exercises the general path.
+    fn run_dkg(threshold: u16, members: u16) -> Vec<Certified> {
+        // Round 1: each member starts and broadcasts its round-one package.
+        let mut starting = Vec::new();
+        let mut round1 = BTreeMap::new();
+        for id in 1..=members {
+            let (member, public) = Member::start_with_policy(id, threshold, members).unwrap();
+            round1.insert(id, public);
+            starting.push(member);
+        }
+
+        // Round 2: each member advances, producing one round-two package per peer.
+        let mut round2_members = Vec::new();
+        let mut outgoing = Vec::new();
+        for member in starting {
+            let (r2, wire) = member.advance(&round1).unwrap();
+            outgoing.push(wire);
+            round2_members.push(r2);
+        }
+
+        // Deliver to each member the round-two package addressed to it from every peer.
+        let mut completed = Vec::new();
+        for (i, r2) in round2_members.iter().enumerate() {
+            let own = (i as u16) + 1;
+            let mut incoming = BTreeMap::new();
+            for (sender, wire) in outgoing.iter().enumerate() {
+                let sender_id = (sender as u16) + 1;
+                if sender_id != own {
+                    incoming.insert(sender_id, wire[&own].clone());
+                }
+            }
+            completed.push(r2.finish(&incoming).unwrap());
+        }
+
+        // Certify: every member must agree on the transcript and group key.
+        let digests: BTreeMap<u16, [u8; 32]> = (1..=members)
+            .zip(completed.iter().map(|c| c.certificate_digest()))
+            .collect();
+        completed
+            .into_iter()
+            .map(|c| c.certify(&digests).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn general_dkg_sign_aggregate_verify() {
+        use reddsa_frost::frost::redpallas as frost;
+        for (t, n) in [(2u16, 3u16), (2, 5), (3, 5), (4, 7)] {
+            let certified = run_dkg(t, n);
+            assert_eq!(certified.len(), usize::from(n));
+
+            // Every member derived the same group key.
+            let group_ak = certified[0].group_ak;
+            assert!(certified.iter().all(|c| c.group_ak == group_ak));
+
+            let public =
+                frost::keys::PublicKeyPackage::deserialize(&certified[0].public_package).unwrap();
+            assert_eq!(public.min_signers(), Some(t));
+            assert_eq!(public.verifying_shares().len(), usize::from(n));
+
+            // The DKG-produced shares sign, aggregate, and verify for a size-t quorum.
+            let keys: BTreeMap<_, _> = certified
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let key =
+                        frost::keys::KeyPackage::deserialize(&c.key_package).unwrap();
+                    (frost::Identifier::try_from((i as u16) + 1).unwrap(), key)
+                })
+                .collect();
+            let quorum: Vec<_> = keys.keys().take(usize::from(t)).copied().collect();
+
+            let mut rng = rand_core::OsRng;
+            let mut nonces = BTreeMap::new();
+            let mut commitments = BTreeMap::new();
+            for id in &quorum {
+                let (nonce, commitment) =
+                    frost::round1::commit(keys[id].signing_share(), &mut rng);
+                nonces.insert(*id, nonce);
+                commitments.insert(*id, commitment);
+            }
+            let (params, seed) = frost_rerandomized::RandomizedParams::new_from_commitments(
+                public.verifying_key(),
+                &commitments,
+                rng,
+            )
+            .unwrap();
+            let msg = b"loki ws7 dkg roundtrip";
+            let package = frost::SigningPackage::new(commitments, msg);
+            let mut shares = BTreeMap::new();
+            for id in &quorum {
+                shares.insert(
+                    *id,
+                    frost_rerandomized::sign_with_randomizer_seed(
+                        &package, &nonces[id], &keys[id], &seed,
+                    )
+                    .unwrap(),
+                );
+            }
+            let sig =
+                frost_rerandomized::aggregate(&package, &shares, &public, &params).unwrap();
+            params.randomized_verifying_key().verify(msg, &sig).unwrap();
+        }
+    }
+
+    #[test]
+    fn dkg_rejects_degenerate_policies() {
+        assert!(Member::start_with_policy(1, 0, 3).is_err());
+        assert!(Member::start_with_policy(1, 4, 3).is_err());
+        assert!(Member::start_with_policy(5, 2, 4).is_err());
     }
 }

@@ -16,6 +16,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Upper bound on sealed outbox copies (one per other roster member). Rosters fit u16,
+/// but this bounds reads of a possibly corrupt sealed file.
+const MAX_OUTBOX_COPIES: usize = u16::MAX as usize;
+
 /// Random per retry. The payment ID remains the canonical intent ID.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AttemptId(pub [u8; 32]);
@@ -39,12 +43,11 @@ pub struct SessionContext {
 
 impl SessionContext {
     pub fn validate(&self) -> Result<(), String> {
-        if !matches!(self.signers.len(), 2 | 3)
+        if self.signers.is_empty()
             || self.signers[0] < 1
-            || self.signers.last() > Some(&4)
             || self.signers.windows(2).any(|ids| ids[0] >= ids[1])
         {
-            return Err("signing attempt needs two or three sorted distinct members".into());
+            return Err("signing attempt needs sorted distinct members, each >= 1".into());
         }
         if self.attempt.0 == [0; 32] {
             return Err("zero signing attempt ID".into());
@@ -263,9 +266,11 @@ pub fn review_batch(
     {
         return Err("member key differs from vault group key".into());
     }
-    let own: u16 = (1..=4)
-        .find(|n| frost::Identifier::try_from(*n).ok() == Some(*key.identifier()))
-        .ok_or("unknown signer identifier")?;
+    let own: u16 = *context
+        .signers
+        .iter()
+        .find(|n| frost::Identifier::try_from(**n).ok() == Some(*key.identifier()))
+        .ok_or("signer outside chosen pair")?;
     if usize::from(*key.min_signers()) != context.signers.len()
         || public.min_signers().map(usize::from) != Some(context.signers.len())
         || !context.signers.contains(&own)
@@ -485,10 +490,11 @@ impl LiveAttempt {
         if spends == 0 || spends > MAX_INPUTS {
             return Err(format!("signing attempt must have 1..={} spends", MAX_INPUTS));
         }
-        let id: u16 = (1..=4)
-            .find(|n| frost::Identifier::try_from(*n).ok() == Some(*key.identifier()))
-            .ok_or("key package has unknown member ID")?;
-        if !context.signers.contains(&id) {
+        if !context
+            .signers
+            .iter()
+            .any(|n| frost::Identifier::try_from(*n).ok() == Some(*key.identifier()))
+        {
             return Err("member is not in selected pair".into());
         }
         let mut nonces = Vec::with_capacity(spends);
@@ -930,7 +936,7 @@ impl SigningSession {
         passphrase: &str,
     ) -> Result<Vec<[u8; 32]>, String> {
         let own = self.own.public();
-        if !matches!(roster.len(), 3 | 4)
+        if roster.len() < 2
             || roster.keys().copied().collect::<Vec<_>>()
                 != (1..=roster.len() as u16).collect::<Vec<_>>()
             || self.context.signers.iter().any(|id| !roster.contains_key(id))
@@ -1074,9 +1080,9 @@ impl SigningSession {
             || reviewed.peer != peer.id
             || peer.id == self.own.public().id
             || !self.context.signers.contains(&peer.id)
-            || !matches!(finishers.len(), 1 | 2)
+            || finishers.is_empty()
             || finishers.iter().any(|finisher| {
-                !(1..=4).contains(&finisher.id) || finisher.id == self.own.public().id || finisher.id == peer.id
+                finisher.id < 1 || finisher.id == self.own.public().id || finisher.id == peer.id
             })
             || finishers
                 .iter()
@@ -1159,7 +1165,7 @@ impl SigningSession {
         witness: &mut impl NonceWitness,
     ) -> Result<[u8; 32], String> {
         let own = self.own.public();
-        if !matches!(roster.len(), 3 | 4)
+        if roster.len() < 2
             || roster.keys().copied().collect::<Vec<_>>()
                 != (1..=roster.len() as u16).collect::<Vec<_>>()
             || roster.get(&own.id) != Some(&own)
@@ -1204,9 +1210,9 @@ impl SigningSession {
             || reviewed.peer != peer.id
             || peer.id == self.own.public().id
             || !self.context.signers.contains(&peer.id)
-            || !matches!(finishers.len(), 1 | 2)
+            || finishers.is_empty()
             || finishers.iter().any(|finisher| {
-                !(1..=4).contains(&finisher.id) || finisher.id == self.own.public().id || finisher.id == peer.id
+                finisher.id < 1 || finisher.id == self.own.public().id || finisher.id == peer.id
             })
         {
             return Err("invalid persisted signing attempt or peer".into());
@@ -1659,7 +1665,7 @@ impl AttemptStore {
         digest: &[u8; 32],
         passphrase: &str,
     ) -> Result<(), String> {
-        if !matches!(wires.len(), 2 | 3) {
+        if wires.len() < 2 {
             return Err("package needs one copy for each other member".into());
         }
         let mut out = Vec::with_capacity(40 + wires.iter().map(Vec::len).sum::<usize>());
@@ -1684,10 +1690,10 @@ impl AttemptStore {
         }
         let mut at = 32;
         let mut wires = Vec::new();
-        while at < raw.len() && wires.len() < 4 {
+        while at < raw.len() && wires.len() < MAX_OUTBOX_COPIES {
             wires.push(read_saved_wire(&raw, &mut at)?);
         }
-        if at != raw.len() || !matches!(wires.len(), 2 | 3) {
+        if at != raw.len() || wires.len() < 2 {
             return Err("invalid sealed package copy count".into());
         }
         Ok((raw[..32].try_into().unwrap(), wires))
@@ -1728,7 +1734,7 @@ impl AttemptStore {
         package_hash: &[u8; 32],
         passphrase: &str,
     ) -> Result<(), String> {
-        if !matches!(wires.len(), 2 | 3) {
+        if wires.len() < 2 {
             return Err("share needs one copy for the peer and each finisher".into());
         }
         let mut out = Vec::with_capacity(72 + wires.iter().map(Vec::len).sum::<usize>());
@@ -1754,10 +1760,10 @@ impl AttemptStore {
         }
         let mut at = 64;
         let mut wires = Vec::new();
-        while at < raw.len() && wires.len() < 4 {
+        while at < raw.len() && wires.len() < MAX_OUTBOX_COPIES {
             wires.push(read_saved_wire(&raw, &mut at)?);
         }
-        if at != raw.len() || !matches!(wires.len(), 2 | 3) {
+        if at != raw.len() || wires.len() < 2 {
             return Err("invalid sealed share copy count".into());
         }
         Ok((

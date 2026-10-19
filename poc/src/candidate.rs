@@ -58,6 +58,35 @@ pub fn alpha_from_canonical_bytes(bytes: &[u8; 32]) -> Option<pallas::Scalar> {
     Option::from(pallas::Scalar::from_repr(*bytes))
 }
 
+/// Every size-`threshold` quorum of a roster `1..=members`, each sorted ascending.
+///
+/// One candidate is built per quorum: each has its own signing set, hence its own
+/// derived alpha and `rk`. General t-of-n, so this is `C(members, threshold)` subsets.
+pub fn quorums(threshold: u16, members: u16) -> Vec<Vec<u16>> {
+    if threshold < 1 || threshold > members {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut pick = Vec::with_capacity(usize::from(threshold));
+    fn walk(next: u16, members: u16, threshold: u16, pick: &mut Vec<u16>, out: &mut Vec<Vec<u16>>) {
+        if pick.len() == usize::from(threshold) {
+            out.push(pick.clone());
+            return;
+        }
+        // Stop once too few members remain to complete a quorum.
+        for id in next..=members {
+            if pick.len() as u16 + (members - id + 1) < threshold {
+                break;
+            }
+            pick.push(id);
+            walk(id + 1, members, threshold, pick, out);
+            pick.pop();
+        }
+    }
+    walk(1, members, threshold, &mut pick, &mut out);
+    out
+}
+
 /// What a candidate needs besides the intent.
 pub struct CandidateInputs<'a> {
     pub vault_fvk: &'a FullViewingKey,
@@ -701,5 +730,157 @@ mod tests {
         assert_ne!(rks[0], rks[1]);
         assert_ne!(rks[1], rks[2]);
         assert_ne!(rks[0], rks[2]);
+    }
+
+    /// `quorums` must enumerate exactly the C(n, t) sorted size-t subsets, with no
+    /// duplicates and every id in 1..=n.
+    #[test]
+    fn quorums_enumerate_all_t_of_n_combinations() {
+        fn binom(n: u64, k: u64) -> u64 {
+            (0..k).fold(1u64, |acc, i| acc * (n - i) / (i + 1))
+        }
+        for (t, n) in [(1u16, 1u16), (2, 3), (2, 5), (3, 5), (4, 7), (7, 7)] {
+            let qs = quorums(t, n);
+            assert_eq!(
+                qs.len() as u64,
+                binom(u64::from(n), u64::from(t)),
+                "{t}-of-{n} must give C(n,t) quorums"
+            );
+            let unique: std::collections::BTreeSet<_> = qs.iter().cloned().collect();
+            assert_eq!(unique.len(), qs.len(), "{t}-of-{n} has a duplicate quorum");
+            for q in &qs {
+                assert_eq!(q.len(), usize::from(t), "quorum has the wrong size");
+                assert!(q.windows(2).all(|w| w[0] < w[1]), "quorum not sorted distinct");
+                assert!(q.iter().all(|&id| (1..=n).contains(&id)), "id out of roster");
+            }
+        }
+        // Degenerate shapes produce nothing.
+        assert!(quorums(0, 3).is_empty());
+        assert!(quorums(4, 3).is_empty());
+    }
+
+    /// For each quorum of a certified t-of-n roster: derive the quorum's randomizer from
+    /// its own commitments, build its candidate under that alpha, have every signer sign,
+    /// aggregate, and verify against the randomized group key. This is the general
+    /// DKG(dealer)->sign->aggregate->verify path, parameterized over the roster shape.
+    fn roundtrip_every_quorum(threshold: u16, members: u16) {
+        let mut rng = rand_core::OsRng;
+        let (shares, pubkeys) = frost::keys::generate_with_dealer(
+            members,
+            threshold,
+            frost::keys::IdentifierList::Default,
+            rng,
+        )
+        .expect("dealer keygen");
+        let keys: BTreeMap<_, _> = shares
+            .into_iter()
+            .map(|(id, ss)| (id, frost::keys::KeyPackage::try_from(ss).unwrap()))
+            .collect();
+
+        let ak: [u8; 32] = pubkeys
+            .verifying_key()
+            .serialize()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let fvk = zip2005::frost_viewing_key(&ak, &[9u8; 32]).unwrap();
+        let note = vault_note(&fvk);
+
+        let mut rks = std::collections::BTreeSet::new();
+        for quorum in quorums(threshold, members) {
+            let ids: Vec<_> = quorum
+                .iter()
+                .map(|n| frost::Identifier::try_from(*n).unwrap())
+                .collect();
+
+            // Round 1: every signer in this quorum commits.
+            let mut nonces = BTreeMap::new();
+            let mut commitments = BTreeMap::new();
+            for id in &ids {
+                let (nonce, commitment) =
+                    frost::round1::commit(keys[id].signing_share(), &mut rng);
+                nonces.insert(*id, nonce);
+                commitments.insert(*id, commitment);
+            }
+
+            // The randomizer is bound to this quorum's commitments.
+            let (params, seed) = frost_rerandomized::RandomizedParams::new_from_commitments(
+                pubkeys.verifying_key(),
+                &commitments,
+                rng,
+            )
+            .unwrap();
+            let alpha_arr: [u8; 32] = params.randomizer().serialize().as_slice().try_into().unwrap();
+            let alpha = alpha_from_canonical_bytes(&alpha_arr).expect("canonical alpha");
+
+            let mut inputs = CandidateInputs {
+                vault_fvk: &fvk,
+                notes: vec![note],
+                recipient: fvk.address_at(7u64, orchard::keys::Scope::External),
+                amount: Zatoshis::const_from_u64(40_000_000),
+                memo: MemoBytes::from_bytes(b"loki ws7").unwrap(),
+                change: Zatoshis::ZERO,
+                target_height: 700,
+                expiry_height: 1_152,
+            };
+            let fee = quote_fee(&Regtest, &inputs).unwrap();
+            inputs.change =
+                Zatoshis::const_from_u64(625_000_000 - 40_000_000 - u64::from(fee));
+            let built = build_candidate(
+                &Regtest,
+                &inputs,
+                &[alpha],
+                rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng),
+            )
+            .expect("candidate builds for this quorum");
+
+            // Sign -> aggregate -> verify over the exact sighash this candidate commits to.
+            let candidate = pczt::roles::creator::Creator::build_from_parts(built.pczt_parts)
+                .expect("create PCZT from parts");
+            let checked = pczt::roles::signer::Signer::new(candidate).unwrap();
+            let sighash = checked.shielded_sighash();
+            let package = frost::SigningPackage::new(commitments.clone(), &sighash);
+            let mut sig_shares = BTreeMap::new();
+            for id in &ids {
+                let share = frost_rerandomized::sign_with_randomizer_seed(
+                    &package,
+                    &nonces[id],
+                    &keys[id],
+                    &seed,
+                )
+                .unwrap();
+                sig_shares.insert(*id, share);
+            }
+            let sig =
+                frost_rerandomized::aggregate(&package, &sig_shares, &pubkeys, &params).unwrap();
+            params
+                .randomized_verifying_key()
+                .verify(&sighash, &sig)
+                .expect("aggregate signature verifies against randomized group key");
+
+            // Each quorum's randomized rk is distinct.
+            let rk: [u8; 32] = params.randomized_verifying_key().serialize().unwrap().as_slice().try_into().unwrap();
+            assert!(rks.insert(rk), "two quorums shared a randomized key");
+        }
+    }
+
+    #[test]
+    fn dkg_sign_aggregate_verify_2_of_3() {
+        roundtrip_every_quorum(2, 3);
+    }
+
+    #[test]
+    fn dkg_sign_aggregate_verify_2_of_5() {
+        roundtrip_every_quorum(2, 5);
+    }
+
+    #[test]
+    fn dkg_sign_aggregate_verify_3_of_5() {
+        roundtrip_every_quorum(3, 5);
+    }
+
+    #[test]
+    fn dkg_sign_aggregate_verify_4_of_7() {
+        roundtrip_every_quorum(4, 7);
     }
 }
