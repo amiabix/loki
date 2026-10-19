@@ -1,30 +1,28 @@
 //! Keyless coordinator boundary (WS2 §4, architecture invariant #1).
 //!
 //! The coordinator proposes transactions, scans the chain, drives the FROST rounds,
-//! aggregates partials, and broadcasts. It touches only **public** data: viewing keys,
-//! addresses, PCZTs, and protocol messages. It must never read a FROST share, a signing
-//! nonce, or a spend authorization.
+//! aggregates partials, and broadcasts. It handles viewing keys, addresses, PCZTs,
+//! public protocol messages, and encrypted DKG messages. It must never read a FROST
+//! share, a signing nonce, or a spend authorization.
 //!
 //! There is exactly ONE signer seam in this codebase — [`crate::signer::Signer`] — and the
 //! coordinator talks to members only through it. This module used to define a separate
 //! `SignerClient` trait for the coordinator's view; that duplicate is gone. The seam is
 //! re-exported here so coordinator code keeps a single import path, and the keyless rule is
-//! enforced two ways (acceptance §b):
+//! checked in two narrow ways (acceptance §b):
 //!   * a source deny-list test (`coordinator_source_links_no_secret_type`) fails if this
 //!     file ever references a share/nonce/spend-key type, and
-//!   * [`assert_keyless`] is a runtime assertion the coordinator calls on start-up.
+//!   * [`assert_keyless`] queries only public vault metadata at start-up.
 
 /// The one signer seam. The coordinator sees members only as `dyn Signer`; every method on
-/// it takes and returns public FROST/PCZT artifacts (see `signer::Signer`'s `PublicArtifact`
-/// compile-time guard). No share, nonce, or spend-key type is named here.
+/// it takes and returns FROST/PCZT artifacts and encrypted DKG messages (see
+/// `signer::Signer`). No share, nonce, or spend-key type is named here.
 pub use crate::signer::{CandidateRef, Connection, Network, Session, Signer, VaultRef};
 
-/// Runtime keyless assertion (acceptance §b): states, at start-up, that nothing reachable
-/// from the coordinator carries a share, a nonce, or a spend key.
+/// Checks that the coordinator can query public vault metadata through the signer seam.
 ///
-/// A signer is an opaque peer behind the trait object; the coordinator can only read its
-/// PUBLIC vault metadata through the seam. This is the single runtime point where a future
-/// share/nonce accessor added to `Signer` would surface, so the guard lives here.
+/// This does not inspect opaque protocol bytes or prove that the coordinator process
+/// cannot access secret-bearing modules through another path.
 pub fn assert_keyless<E>(signers: &[&dyn Signer<Error = E>], session: &Session) {
     for s in signers {
         // Only the public surface is reachable: vault metadata, never a secret.

@@ -8,7 +8,9 @@ pub use engine::{
     SavedCheckpoint, SetupCeremony,
 };
 pub(crate) mod journal;
-use crate::{member_state::Roster, network::TESTNET_NU7_BIRTH, setup_transport::Identity};
+use crate::{member_state::Roster, setup_transport::Identity};
+#[cfg(feature = "relay-communication")]
+use crate::network::TESTNET_NU7_BIRTH;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub struct AcceptedCeremonyRoster {
@@ -108,6 +110,7 @@ impl AcceptedCeremonyRoster {
         )
     }
     // This digest identifies an existing hosted journal; it grants no ceremony authority.
+    #[cfg(any(feature = "relay-communication", test))]
     pub(crate) fn hosted_context_digest(
         roster: &Roster,
         network: &str,

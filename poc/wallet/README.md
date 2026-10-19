@@ -1,5 +1,35 @@
 # Member app
 
+## Wired redesign UI (first functional slice)
+
+The redesign prototype in `design/` is wired to the real member command host.
+It runs alongside the shipping app on the **same** server and token — no extra
+process, no build step, no framework. Start the app as usual, then open the
+printed signer link with `/ui` before the `#token`:
+
+```sh
+python3 wallet/member_app.py --network regtest \
+  --data /path/to/member-1 --exchange /path/to/setup-courier --port 8801
+# printed:  Signer: http://127.0.0.1:8801/#<token>
+# wired UI: http://127.0.0.1:8801/ui#<token>   ← same token, redesign look
+```
+
+Five screens are wired to real commands: connect (`/api/status`), vault list
+(`/api/status`), create vault (`/api/create`, general t-of-n), propose payment
+(`/api/payment-draft` + `payment-publish`), and signer approval / WYSIWYS
+(`/api/payment-review` → `payment-approve`). The page serves `design/tokens.css`
+and `design/app.css` at `/ui/tokens.css` and `/ui/app.css`; fonts resolve to the
+app's existing `/fonts/*`. The share never enters the page — approval releases
+it only for the exact reviewed package. `index.html`/`app.js` are untouched.
+
+Acceptance tests (no native binaries, mock/regtest data) prove the vault-list
+and create-vault screens hit real routes end to end:
+
+```sh
+cd poc/wallet
+python3 -m unittest test_member_app test_wired_ui
+```
+
 ## Public Testnet UI
 
 The same member app can create a Testnet vault, check backups, receive, review,

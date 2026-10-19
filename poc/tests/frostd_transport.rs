@@ -5,12 +5,31 @@
 //! and the signature shares) is serialized and pushed through `transport::FrostdTransport`
 //! — nothing is handed between members in-process.
 //!
+//! SECURITY: a DKG round-2 package (`frost::keys::dkg::round2::Package`) is SECRET — it is
+//! that recipient's signing-share contribution. A relay observer who collects a threshold
+//! of round-2 packages reconstructs the vault key. So round-2 is NEVER sent raw: each
+//! package is sealed to its recipient's X25519 encryption key with the existing Loki
+//! `Identity::seal_round2` primitive (`setup_transport.rs`) BEFORE it reaches the relay,
+//! and `open_round2` after `recv`. The relay only ever carries ciphertext. This is the
+//! same sealed-round-2 model the production ceremony uses (`setup_ceremony/engine.rs`).
+//!
+//! `frostd` itself is run insecure here (`--no-tls-very-insecure`) only for the test;
+//! real deployments MUST run frostd with TLS. The insecure relay is acceptable ONLY
+//! because every secret-bearing payload is already sealed before it is handed to the relay.
+//!
 //! The test asserts invariant 4 directly: it records every raw byte string `frostd`
-//! carried and proves none of them is a secret (a DKG secret package, a FROST share /
-//! `KeyPackage`, or a signing nonce). Only public FROST artifacts cross.
+//! carried and proves none of them is a secret — not a DKG secret package, not a FROST
+//! share / `KeyPackage`, not a signing nonce, not a plaintext round-2 package — and (the
+//! regression) that every sealed round-2 blob on the wire is opaque ciphertext that does
+//! NOT decode as a round-2 package. Only public FROST artifacts and sealed ciphertext
+//! cross. (The check is scoped to the round-2 blobs, not every wire byte: a round-2
+//! package and a public `SignatureShare` share the same `Header`+scalar wire shape, so a
+//! blanket "nothing decodes as round2" would false-positive on the public signature share.)
 //!
 //! Requires a running frostd. Set `FROSTD_URL` (e.g. `http://127.0.0.1:2744`). If unset
 //! the test prints how to start one and returns, so `cargo test` stays green offline.
+//! The seal/transport regression (`relay_observer_cannot_recover_round2`) is OFFLINE and
+//! always runs.
 //!
 //! Start a local insecure relay on omarchy:
 //!   frostd --no-tls-very-insecure -p 2744
@@ -19,27 +38,36 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use loki_poc::setup_transport::{Identity, PublicIdentity};
 use loki_poc::transport::{FrostdTransport, Incoming, Peer, Transport};
 use reddsa_frost::frost::redpallas as frost;
 use uuid::Uuid;
 
-/// Member X25519 (frostd/snow `Noise_K`) keypair. The public key is the frostd address;
-/// the secret only ever signs the login challenge (never a FROST share).
-struct Kp {
-    public: Peer,
+/// A test member. Its Loki `Identity` carries the X25519 encryption key that frostd uses
+/// as the member's address (`transport.rs` doc: frostd pubkey == `PublicIdentity::encryption`)
+/// AND seals DKG round-2 packages to peers. The frostd login secret is that same X25519
+/// secret; it never signs a FROST share.
+struct Member {
+    id: u16,
+    identity: Identity,
+    public: PublicIdentity,
+    peer: Peer,
     secret: [u8; 32],
 }
 
-fn gen_kp() -> Kp {
-    // frostd's login pubkey is a raw X25519 public key (snow `Noise_K` uses X25519);
-    // XEdDSA over the challenge proves possession of the matching secret. x25519-dalek
-    // (already a poc dep) produces exactly that keypair — no need for snow in the test.
-    use x25519_dalek::{PublicKey, StaticSecret};
-    let secret = StaticSecret::random_from_rng(rand_core::OsRng);
-    let public = PublicKey::from(&secret);
-    Kp {
-        public: Peer(public.to_bytes()),
-        secret: secret.to_bytes(),
+fn gen_member(id: u16) -> Member {
+    let identity = Identity::new(id);
+    let public = identity.public();
+    // frostd addresses a member by its 32-byte X25519 encryption pubkey (transport.rs §
+    // Addressing); the matching secret logs in via XEdDSA. to_secret_bytes()[34..] is that
+    // X25519 secret (see Identity::to_secret_bytes layout in setup_transport.rs).
+    let secret: [u8; 32] = identity.to_secret_bytes()[34..].try_into().unwrap();
+    Member {
+        id,
+        identity,
+        peer: Peer(public.encryption),
+        public,
+        secret,
     }
 }
 
@@ -81,13 +109,14 @@ fn two_of_three_dkg_and_sign_over_real_frostd() {
     };
 
     // Three members + a coordinator, each a logged-in frostd client over the real relay.
-    let members: Vec<Kp> = (0..3).map(|_| gen_kp()).collect();
-    let coord_kp = gen_kp();
+    // Members carry Loki identities (id 1..=3) so round-2 packages can be sealed to peers.
+    let members: Vec<Member> = (1u16..=3).map(gen_member).collect();
+    let coord_kp = gen_member(4);
     let mut m_tx: Vec<FrostdTransport> = members
         .iter()
-        .map(|k| FrostdTransport::new(&url, k.public.clone(), k.secret).expect("member login"))
+        .map(|k| FrostdTransport::new(&url, k.peer.clone(), k.secret).expect("member login"))
         .collect();
-    let mut coord = FrostdTransport::new(&url, coord_kp.public.clone(), coord_kp.secret)
+    let mut coord = FrostdTransport::new(&url, coord_kp.peer.clone(), coord_kp.secret)
         .expect("coordinator login");
     eprintln!("[WS3] 3 members + coordinator authenticated to frostd at {url}");
 
@@ -96,11 +125,20 @@ fn two_of_three_dkg_and_sign_over_real_frostd() {
         .map(|i| frost::Identifier::try_from(i).unwrap())
         .collect();
     let peer_of: BTreeMap<frost::Identifier, Peer> =
-        ids.iter().cloned().zip(members.iter().map(|k| k.public.clone())).collect();
+        ids.iter().cloned().zip(members.iter().map(|k| k.peer.clone())).collect();
+    // FROST id <-> Loki member id (1..=3) and the roster of public identities, so a member
+    // can seal round-2 to the recipient's encryption key and verify the sender's signature.
+    let loki_id = |id: &frost::Identifier| -> u16 {
+        (ids.iter().position(|o| o == id).unwrap() + 1) as u16
+    };
+    let roster: BTreeMap<u16, PublicIdentity> =
+        members.iter().map(|m| (m.id, m.public.clone())).collect();
+    // Shared vault binding for the sealed round-2 envelopes (AAD). Fixed for this ceremony.
+    let vault = [7u8; 32];
 
     // Coordinator opens one session listing all three member pubkeys. message_count is a
     // per-participant sizing hint; the DKG + signing flow sends well under this many.
-    let member_peers: Vec<Peer> = members.iter().map(|k| k.public.clone()).collect();
+    let member_peers: Vec<Peer> = members.iter().map(|k| k.peer.clone()).collect();
     let coord_ch = coord.open(&member_peers, 16).expect("create_new_session");
     let session: Uuid = coord_ch.session_id();
     let m_ch: Vec<_> = m_tx.iter_mut().map(|t| t.join(session).expect("join")).collect();
@@ -149,24 +187,33 @@ fn two_of_three_dkg_and_sign_over_real_frostd() {
         r1_received.insert(*id, map);
     }
 
-    // ---- DKG round 2: each member sends a per-recipient targeted package ----
+    // ---- DKG round 2: each member SEALS its per-recipient package to that recipient's
+    // X25519 encryption key before handing it to the relay. round2::Package is SECRET;
+    // only sealed ciphertext ever crosses frostd. ----
     let mut r2_secret = BTreeMap::new();
-    // Hold serialized outgoing r2 packages: sender -> (recipient -> bytes).
-    let mut r2_out: BTreeMap<frost::Identifier, BTreeMap<frost::Identifier, Vec<u8>>> = BTreeMap::new();
+    // The plaintext round-2 packages (SECRET) and the exact sealed blobs we hand the relay,
+    // captured so the invariant-4 audit below can prove: no plaintext round-2 package ever
+    // crosses, and every sealed round-2 blob is opaque ciphertext (does not decode).
+    let mut r2_plaintext: Vec<Vec<u8>> = Vec::new();
+    let mut r2_sealed: Vec<Vec<u8>> = Vec::new();
     for (idx, id) in ids.iter().enumerate() {
         let sp = r1_secret.remove(id).unwrap();
         let (sp2, pkgs) = frost::keys::dkg::part2(sp, &r1_received[id]).expect("dkg part2");
         r2_secret.insert(*id, sp2);
-        let mut per = BTreeMap::new();
         for (rcpt, pkg) in pkgs {
-            let bytes = pkg.serialize().expect("ser r2 pkg");
-            send_taped(&m_tx[idx], &m_ch[idx], &[peer_of[&rcpt].clone()], &bytes, &tape);
-            per.insert(rcpt, bytes);
+            let plaintext = pkg.serialize().expect("ser r2 pkg");
+            let sealed = members[idx]
+                .identity
+                .seal_round2(&roster[&loki_id(&rcpt)], &vault, &plaintext)
+                .expect("seal round2");
+            r2_plaintext.push(plaintext);
+            r2_sealed.push(sealed.clone());
+            send_taped(&m_tx[idx], &m_ch[idx], &[peer_of[&rcpt].clone()], &sealed, &tape);
         }
-        r2_out.insert(*id, per);
     }
 
-    // Each member collects the two round-2 packages addressed to it.
+    // Each member collects the two sealed round-2 packages addressed to it, unseals each
+    // (verifying the sender's signature + recipient binding), then deserializes.
     let mut r2_received: BTreeMap<frost::Identifier, BTreeMap<frost::Identifier, frost::keys::dkg::round2::Package>> =
         BTreeMap::new();
     for (idx, id) in ids.iter().enumerate() {
@@ -174,9 +221,13 @@ fn two_of_three_dkg_and_sign_over_real_frostd() {
         let mut map = BTreeMap::new();
         for inc in got {
             let sender = ids.iter().find(|o| peer_of[o] == inc.from).copied().expect("r2 sender");
+            let plaintext = members[idx]
+                .identity
+                .open_round2(&roster[&loki_id(&sender)], &vault, &inc.message)
+                .expect("open round2");
             map.insert(
                 sender,
-                frost::keys::dkg::round2::Package::deserialize(&inc.message).expect("de r2 pkg"),
+                frost::keys::dkg::round2::Package::deserialize(&plaintext).expect("de r2 pkg"),
             );
         }
         assert_eq!(map.len(), 2, "member {id:?} must get 2 round-2 packages");
@@ -272,6 +323,9 @@ fn two_of_three_dkg_and_sign_over_real_frostd() {
     coord.close(coord_ch).ok();
 
     // ---- Invariant 4: prove no secret crossed the relay ----
+    // SECRET = DKG secret packages, FROST shares / key packages, signing nonces, AND
+    // DKG round-2 packages (each is a recipient's share contribution). The old audit
+    // mis-classified round2::Package as public; it is not.
     let tape = tape.lock().unwrap();
     let mut secret_blobs: Vec<Vec<u8>> = Vec::new();
     for id in &ids {
@@ -279,17 +333,142 @@ fn two_of_three_dkg_and_sign_over_real_frostd() {
             secret_blobs.push(kp.serialize().expect("ser keypkg"));
             secret_blobs.push(kp.signing_share().serialize());
         }
+        if let Some(sp2) = r2_secret.get(id) {
+            secret_blobs.push(sp2.serialize().expect("ser dkg r2 secret"));
+        }
+        // Signing nonces are secret: leaking one forges a signature for that signer.
+        if let Some(n) = nonces.get(id) {
+            secret_blobs.push(n.serialize().expect("ser nonce"));
+        }
     }
+    // A plaintext DKG round-2 package is a recipient's share contribution: a threshold of
+    // them reconstructs the vault key, so it is secret too.
+    secret_blobs.extend(r2_plaintext.iter().cloned());
     for carried in tape.iter() {
         for secret in &secret_blobs {
             assert!(
                 carried != secret,
-                "a FROST share / key package crossed the relay — invariant 4 violated"
+                "a secret (share / key package / dkg r2 secret / nonce / plaintext round-2 package) crossed the relay — invariant 4 violated"
             );
         }
     }
+    // Regression (relay_observer_cannot_recover_round2, live): every round-2 blob that
+    // crossed the relay is sealed ciphertext — none decodes as a round-2 package, so a
+    // relay observer collecting them cannot reconstruct the vault key. The blanket
+    // "no wire byte decodes as round2" check cannot be used here: a round-2 package and a
+    // public `SignatureShare` share the same wire shape (`Header` + one 32-byte scalar in
+    // frost-core 3.0.0), so a legitimately-public signature share also deserializes as a
+    // round-2 package. The security property is about the round-2 payloads specifically.
+    for sealed in &r2_sealed {
+        assert!(
+            frost::keys::dkg::round2::Package::deserialize(sealed).is_err(),
+            "a sealed round-2 blob decoded as a plaintext round-2 package — the vault key is leakable"
+        );
+    }
     eprintln!(
-        "[WS3] audited {} relayed payloads; none equals a share or key package (invariant 4 holds)",
-        tape.len()
+        "[WS3] audited {} relayed payloads; no secret crossed and all {} round-2 blobs are opaque ciphertext (invariant 4 holds)",
+        tape.len(),
+        r2_sealed.len()
     );
+}
+
+/// OFFLINE regression (no frostd): a relay observer who records every byte that crossed
+/// the transport during DKG round-2 CANNOT recover any `round2::Package`, ONLY the intended
+/// recipient can unseal its package, and DKG still completes to the same group key with the
+/// sealed round-2. This is the proof that the plaintext-round-2 leak is closed.
+#[test]
+fn relay_observer_cannot_recover_round2() {
+    let ids: Vec<frost::Identifier> = (1u16..=3)
+        .map(|i| frost::Identifier::try_from(i).unwrap())
+        .collect();
+    let members: Vec<Member> = (1u16..=3).map(gen_member).collect();
+    let roster: BTreeMap<u16, PublicIdentity> =
+        members.iter().map(|m| (m.id, m.public.clone())).collect();
+    let loki_id = |id: &frost::Identifier| -> u16 {
+        (ids.iter().position(|o| o == id).unwrap() + 1) as u16
+    };
+    let vault = [9u8; 32];
+
+    // Round 1 (public; exchanged in-process here — the leak under test is round 2).
+    let mut r1_secret = BTreeMap::new();
+    let mut r1_pkg = BTreeMap::new();
+    for id in &ids {
+        let (sp, pkg) = frost::keys::dkg::part1(*id, 3, 2, rand_core::OsRng).expect("part1");
+        r1_secret.insert(*id, sp);
+        r1_pkg.insert(*id, pkg);
+    }
+    let mut r1_received: BTreeMap<frost::Identifier, BTreeMap<frost::Identifier, frost::keys::dkg::round1::Package>> =
+        BTreeMap::new();
+    for id in &ids {
+        let map: BTreeMap<_, _> = ids
+            .iter()
+            .filter(|o| *o != id)
+            .map(|o| (*o, r1_pkg[o].clone()))
+            .collect();
+        r1_received.insert(*id, map);
+    }
+
+    // Round 2: seal every package to its recipient. The "wire" is what the relay observer
+    // holds: sealed bytes only, tagged with (sender, recipient) so each can be routed.
+    let mut r2_secret = BTreeMap::new();
+    let mut wire: Vec<(frost::Identifier, frost::Identifier, Vec<u8>)> = Vec::new();
+    for (idx, id) in ids.iter().enumerate() {
+        let sp = r1_secret.remove(id).unwrap();
+        let (sp2, pkgs) = frost::keys::dkg::part2(sp, &r1_received[id]).expect("part2");
+        r2_secret.insert(*id, sp2);
+        for (rcpt, pkg) in pkgs {
+            let sealed = members[idx]
+                .identity
+                .seal_round2(&roster[&loki_id(&rcpt)], &vault, &pkg.serialize().unwrap())
+                .expect("seal round2");
+            wire.push((*id, rcpt, sealed));
+        }
+    }
+
+    // 1) The observer CANNOT deserialize any round-2 package from any wire byte string.
+    for (_, _, sealed) in &wire {
+        assert!(
+            frost::keys::dkg::round2::Package::deserialize(sealed).is_err(),
+            "observer recovered a plaintext round-2 package from the wire"
+        );
+    }
+
+    // 2) ONLY the intended recipient can unseal; a non-recipient fails.
+    let mut r2_received: BTreeMap<frost::Identifier, BTreeMap<frost::Identifier, frost::keys::dkg::round2::Package>> =
+        ids.iter().map(|id| (*id, BTreeMap::new())).collect();
+    for (sender, rcpt, sealed) in &wire {
+        let rcpt_idx = ids.iter().position(|o| o == rcpt).unwrap();
+        // A non-recipient member cannot open it.
+        let wrong = ids.iter().find(|o| *o != rcpt && *o != sender).unwrap();
+        let wrong_idx = ids.iter().position(|o| o == wrong).unwrap();
+        assert!(
+            members[wrong_idx]
+                .identity
+                .open_round2(&roster[&loki_id(sender)], &vault, sealed)
+                .is_err(),
+            "a non-recipient unsealed a round-2 package"
+        );
+        // The intended recipient opens it.
+        let plaintext = members[rcpt_idx]
+            .identity
+            .open_round2(&roster[&loki_id(sender)], &vault, sealed)
+            .expect("recipient opens round2");
+        r2_received.get_mut(rcpt).unwrap().insert(
+            *sender,
+            frost::keys::dkg::round2::Package::deserialize(&plaintext).expect("de r2"),
+        );
+    }
+
+    // 3) DKG still completes to ONE shared group key despite the sealed round-2.
+    let mut group_key = None;
+    for id in &ids {
+        let (_kp, pubkeys) =
+            frost::keys::dkg::part3(&r2_secret[id], &r1_received[id], &r2_received[id]).expect("part3");
+        let vk = pubkeys.verifying_key().serialize().unwrap();
+        match &group_key {
+            None => group_key = Some(vk),
+            Some(prev) => assert_eq!(prev, &vk, "DKG produced divergent group keys"),
+        }
+    }
+    assert!(group_key.is_some(), "DKG did not complete");
 }

@@ -583,9 +583,6 @@ impl Completed {
     pub(crate) fn key_package_bytes(&self) -> &[u8] {
         &self.key_package
     }
-    pub(crate) fn members(&self) -> u16 {
-        self.members
-    }
 }
 
 #[cfg(test)]

@@ -2348,6 +2348,30 @@ def make_signer_server(wallet, port, dashboard_port=None):
                 self.end_headers()
                 self.wfile.write((HERE / "app.css").read_bytes())
                 return
+            # Wired redesign UI (first functional slice): the design/ prototype's
+            # look served over the real /api/* routes. Its markup uses inline
+            # style= attributes, so this page alone allows style-src 'unsafe-inline'.
+            UI_ASSETS = {
+                "/ui.js": ("ui.js", "text/javascript; charset=utf-8"),
+                "/ui/tokens.css": ("design/tokens.css", "text/css; charset=utf-8"),
+                "/ui/app.css": ("design/app.css", "text/css; charset=utf-8"),
+            }
+            if path == "/ui":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src 'self'")
+                self.end_headers()
+                self.wfile.write((HERE / "ui.html").read_bytes())
+                return
+            if path in UI_ASSETS:
+                name, mime = UI_ASSETS[path]
+                self.send_response(200)
+                self.send_header("Content-Type", mime)
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write((HERE / name).read_bytes())
+                return
             if path in FONTS:
                 self.send_response(200)
                 self.send_header("Content-Type", "font/woff2")
