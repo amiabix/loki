@@ -120,25 +120,19 @@
           <label class="field"><span class="lbl">Vault name</span><input value="Ops Float" maxlength="80"></label>
           <div class="grid grid-2" style="gap:var(--sp-3)">
             <label class="field"><span class="lbl">Threshold (t)</span>
-              <select id="t-sel"><option>2</option><option selected>3</option><option>4</option></select>
+              <select id="t-sel"></select>
               <small>Members needed to approve a payment.</small></label>
             <label class="field"><span class="lbl">Members (n)</span>
-              <select id="n-sel"><option>3</option><option>4</option><option selected>5</option></select>
+              <select id="n-sel"></select>
               <small>Total members in the roster.</small></label>
           </div>
-          <div class="callout callout-accent"><span class="ico">◇</span><span>This vault needs <strong>3 of 5</strong> members to approve any payment. Any 3 eligible members can complete a proposal.</span></div>
+          <div class="callout callout-accent"><span class="ico">◇</span><span id="ton-preview">This vault needs <strong>3 of 5</strong> members to approve any payment. Any 3 eligible members can complete a proposal.</span></div>
           <button class="btn btn-primary btn-lg btn-block" data-nav="setup">Create &amp; generate invites →</button>
         </div>
         <div class="card stack">
           <h3>Invites</h3>
           <p class="muted">The creator is member 1 by default. Send each invite privately. Each invite is for one member and one app and expires in 24 hours.</p>
-          <div class="stack-sm">
-            <div class="row-between card" style="background:var(--surface-2);padding:var(--sp-3)"><span class="mono">You · slot 1</span><span class="pill pill-ok"><span class="dot"></span> You</span></div>
-            <div class="row-between card" style="background:var(--surface-2);padding:var(--sp-3)"><span class="mono">loki/invite · bd71…9f02</span><button class="btn btn-quiet">Copy</button></div>
-            <div class="row-between card" style="background:var(--surface-2);padding:var(--sp-3)"><span class="mono">loki/invite · 4a0c…7731</span><button class="btn btn-quiet">Copy</button></div>
-            <div class="row-between card" style="background:var(--surface-2);padding:var(--sp-3)"><span class="mono">loki/invite · e22d…1c48</span><button class="btn btn-quiet">Copy</button></div>
-            <div class="row-between card" style="background:var(--surface-2);padding:var(--sp-3)"><span class="mono">loki/invite · 90fa…55ab</span><button class="btn btn-quiet">Copy</button></div>
-          </div>
+          <div class="stack-sm" id="invite-list"></div>
           <p class="muted">The vault is a draft with no receive address until every member joins, the roster matches, and all back up.</p>
         </div>
       </div>
