@@ -3,15 +3,13 @@ use super::{
     AcceptedCeremonyRoster,
 };
 use crate::{
-    distributed_setup::{Completed, Member, Round2Member},
+    dkg_core::{encode_map, DkgCore, DkgPhase, DkgState, Reader},
     setup_transport::Identity,
     state::MemberDir,
-    vault, zip2005,
+    zip2005,
 };
-use rand_core::{OsRng, RngCore};
 use std::{collections::BTreeMap, path::Path};
 use zeroize::Zeroizing;
-use zcash_protocol::consensus::Parameters;
 
 const ERROR: &str = "setup_ceremony";
 const MAX_WIRE: usize = 66 * 1024;
@@ -77,24 +75,13 @@ pub struct CeremonyStep {
     pub missing_slots: Vec<u16>,
     pub checkpoint: SavedCheckpoint,
 }
-struct PrivateShares(BTreeMap<u16, Vec<u8>>);
-impl Drop for PrivateShares {
-    fn drop(&mut self) {
-        for bytes in self.0.values_mut() {
-            zeroize::Zeroize::zeroize(bytes);
-        }
-    }
-}
 struct Snapshot {
     phase: CeremonyPhase,
-    contribution: Zeroizing<[u8; 32]>,
-    dkg: Zeroizing<Vec<u8>>,
-    round1: BTreeMap<u16, Vec<u8>>,
-    round2: BTreeMap<u16, Vec<u8>>,
+    /// The shared DKG core state: contribution, fresh key (rounds one and two only),
+    /// FROST checkpoint, received messages, certificates and `vs`.
+    core: DkgState,
     outgoing: BTreeMap<u16, Vec<u8>>,
-    certificates: BTreeMap<u16, Vec<u8>>,
     backups: BTreeMap<u16, Vec<u8>>,
-    vs: Zeroizing<[u8; 32]>,
     prepared: Vec<u8>,
 }
 pub struct SetupCeremony {
@@ -107,19 +94,6 @@ pub struct SetupCeremony {
     poisoned: bool,
     _member_lock: MemberLock,
 }
-fn digest(personal: &[u8], parts: &[&[u8]]) -> [u8; 32] {
-    let mut hash = blake2b_simd::Params::new()
-        .hash_length(32)
-        .personal(personal)
-        .to_state();
-    for part in parts {
-        hash.update(part);
-    }
-    hash.finalize()
-        .as_bytes()
-        .try_into()
-        .expect("32 byte digest")
-}
 fn field(out: &mut Vec<u8>, value: &[u8]) -> Result<(), String> {
     if value.len() > MAX_PREPARED || out.len().saturating_add(value.len() + 4) > 16 * 1024 * 1024 {
         return Err(ERROR.into());
@@ -128,119 +102,78 @@ fn field(out: &mut Vec<u8>, value: &[u8]) -> Result<(), String> {
     out.extend_from_slice(value);
     Ok(())
 }
-fn map(out: &mut Vec<u8>, values: &BTreeMap<u16, Vec<u8>>) -> Result<(), String> {
-    if values.len() > 4 {
-        return Err(ERROR.into());
-    }
-    out.push(values.len() as u8);
-    for (id, bytes) in values {
-        if !(1..=4).contains(id) || bytes.len() > MAX_WIRE {
-            return Err(ERROR.into());
+/// The core phase each engine phase must carry.
+fn core_phase(phase: CeremonyPhase) -> DkgPhase {
+    match phase {
+        CeremonyPhase::AwaitingRoster | CeremonyPhase::Starting | CeremonyPhase::Aborted => {
+            DkgPhase::Empty
         }
-        out.extend_from_slice(&id.to_be_bytes());
-        field(out, bytes)?;
-    }
-    Ok(())
-}
-struct Reader<'a> {
-    raw: &'a [u8],
-    offset: usize,
-}
-impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
-        let end = self
-            .offset
-            .checked_add(n)
-            .filter(|n| *n <= self.raw.len())
-            .ok_or(ERROR)?;
-        let bytes = &self.raw[self.offset..end];
-        self.offset = end;
-        Ok(bytes)
-    }
-    fn field(&mut self, limit: usize) -> Result<&'a [u8], String> {
-        let size = u32::from_be_bytes(self.take(4)?.try_into().map_err(|_| ERROR)?) as usize;
-        if size > limit {
-            return Err(ERROR.into());
-        }
-        self.take(size)
-    }
-    fn map(&mut self) -> Result<BTreeMap<u16, Vec<u8>>, String> {
-        let count = self.take(1)?[0];
-        if count > 4 {
-            return Err(ERROR.into());
-        }
-        let mut map = BTreeMap::new();
-        let mut previous = 0;
-        for _ in 0..count {
-            let id = u16::from_be_bytes(self.take(2)?.try_into().map_err(|_| ERROR)?);
-            if id <= previous || id > 4 {
-                return Err(ERROR.into());
-            }
-            previous = id;
-            map.insert(id, self.field(MAX_WIRE)?.to_vec());
-        }
-        Ok(map)
+        CeremonyPhase::Round1Saved => DkgPhase::Round1,
+        CeremonyPhase::Round2Saved => DkgPhase::Round2,
+        CeremonyPhase::CertificateSaved => DkgPhase::Certificate,
+        CeremonyPhase::AwaitingBackups
+        | CeremonyPhase::Certified
+        | CeremonyPhase::PaymentHandoff
+        | CeremonyPhase::Active => DkgPhase::Certified,
     }
 }
 impl Snapshot {
     fn ready() -> Self {
         Self {
             phase: CeremonyPhase::AwaitingRoster,
-            contribution: Zeroizing::new([0; 32]),
-            dkg: Zeroizing::new(Vec::new()),
-            round1: BTreeMap::new(),
-            round2: BTreeMap::new(),
+            core: DkgState::empty(),
             outgoing: BTreeMap::new(),
-            certificates: BTreeMap::new(),
             backups: BTreeMap::new(),
-            vs: Zeroizing::new([0; 32]),
             prepared: Vec::new(),
         }
     }
     fn encode(&self) -> Result<Zeroizing<Vec<u8>>, String> {
-        let mut out = Zeroizing::new(b"LOKIENG1".to_vec());
+        let mut out = Zeroizing::new(b"LOKIENG2".to_vec());
         out.push(self.phase as u8);
-        out.extend_from_slice(&*self.contribution);
-        field(&mut out, &self.dkg)?;
-        map(&mut out, &self.round1)?;
-        map(&mut out, &self.round2)?;
-        map(&mut out, &self.outgoing)?;
-        map(&mut out, &self.certificates)?;
-        map(&mut out, &self.backups)?;
-        out.extend_from_slice(&*self.vs);
+        field(&mut out, &self.core.encode()?)?;
+        encode_map(&mut out, &self.outgoing)?;
+        encode_map(&mut out, &self.backups)?;
         field(&mut out, &self.prepared)?;
         Ok(out)
     }
     fn decode(raw: &[u8]) -> Result<Self, String> {
-        let mut reader = Reader { raw, offset: 0 };
-        if reader.take(8)? != b"LOKIENG1" {
+        let mut reader = Reader::new(raw);
+        if reader.take(8)? != b"LOKIENG2" {
             return Err(ERROR.into());
         }
         let phase = CeremonyPhase::decode(reader.take(1)?[0])?;
-        let contribution = Zeroizing::new(reader.take(32)?.try_into().map_err(|_| ERROR)?);
-        let dkg = Zeroizing::new(reader.field(64 * 1024)?.to_vec());
-        let round1 = reader.map()?;
-        let round2 = reader.map()?;
+        let core = DkgState::decode(&Zeroizing::new(reader.field(MAX_PREPARED)?.to_vec()))?;
         let outgoing = reader.map()?;
-        let certificates = reader.map()?;
         let backups = reader.map()?;
-        let vs = Zeroizing::new(reader.take(32)?.try_into().map_err(|_| ERROR)?);
         let prepared = reader.field(MAX_PREPARED)?.to_vec();
-        if reader.offset != raw.len() {
+        reader.finish()?;
+        if core.phase() != core_phase(phase) {
             return Err(ERROR.into());
         }
         Ok(Self {
             phase,
-            contribution,
-            dkg,
-            round1,
-            round2,
+            core,
             outgoing,
-            certificates,
             backups,
-            vs,
             prepared,
         })
+    }
+    /// A deep copy to build the next generation from.
+    fn duplicate(&self) -> Self {
+        Self {
+            phase: self.phase,
+            core: self.core.duplicate(),
+            outgoing: self.outgoing.clone(),
+            backups: self.backups.clone(),
+            prepared: self.prepared.clone(),
+        }
+    }
+    /// Terminal state: keep the received history, drop every secret and the fresh key.
+    fn retire(&mut self) {
+        self.phase = CeremonyPhase::Aborted;
+        self.outgoing.clear();
+        self.prepared.clear();
+        self.core.wipe();
     }
 }
 impl SetupCeremony {
@@ -357,12 +290,7 @@ impl SetupCeremony {
                 return Err("setup_already_active".into());
             }
         }
-        snapshot.phase = CeremonyPhase::Aborted;
-        snapshot.outgoing.clear();
-        snapshot.prepared.clear();
-        zeroize::Zeroize::zeroize(&mut *snapshot.dkg);
-        zeroize::Zeroize::zeroize(&mut *snapshot.contribution);
-        zeroize::Zeroize::zeroize(&mut *snapshot.vs);
+        snapshot.retire();
         journal.append(&snapshot.encode()?)?;
         Ok(())
     }
@@ -409,126 +337,11 @@ impl SetupCeremony {
         self.outgoing()?;
         Ok(&self.snapshot.prepared)
     }
-    fn certificate_body(&self) -> Result<Vec<u8>, String> {
-        let completed = Completed::restore_checkpoint(&self.snapshot.dkg)?;
-        let mut body = completed.certificate_digest().to_vec();
-        body.extend_from_slice(&digest(b"Loki_vs_cert_v1", &[&*self.snapshot.vs]));
-        body.extend_from_slice(&self.accepted.roster().fingerprint());
-        body.extend_from_slice(zip2005::VERSION.as_bytes());
-        Ok(body)
-    }
-    fn authenticated_round1(&self) -> Result<BTreeMap<u16, Vec<u8>>, String> {
-        let mut packages = BTreeMap::new();
-        for (id, wire) in &self.snapshot.round1 {
-            let member = self.accepted.roster().members.get(id).ok_or(ERROR)?;
-            let body = self
-                .identity
-                .verify_round1(member, &self.accepted.roster().vault, wire)
-                .map_err(|_| ERROR)?;
-            if body.len() <= 32 {
-                return Err(ERROR.into());
-            }
-            packages.insert(*id, body[32..].to_vec());
-        }
-        Ok(packages)
-    }
-
-    fn validate_completed_inputs(
-        &self,
-        completed: &Completed,
-        packages: &BTreeMap<u16, Vec<u8>>,
-    ) -> Result<(), String> {
-        use reddsa_frost::frost::redpallas::{self as frost, keys::EvenY};
-        let own = self.identity.public().id;
-        let roster = self.accepted.roster();
-        let expected: Vec<_> = roster
-            .members
-            .keys()
-            .filter(|id| **id != own)
-            .copied()
-            .collect();
-        if self.snapshot.round2.keys().copied().collect::<Vec<_>>() != expected {
-            return Err(ERROR.into());
-        }
-        let mut decoded = BTreeMap::new();
-        for (&id, bytes) in packages {
-            decoded.insert(
-                frost::Identifier::try_from(id).map_err(|_| ERROR)?,
-                frost::keys::dkg::round1::Package::deserialize(bytes).map_err(|_| ERROR)?,
-            );
-        }
-        let commitments = decoded
-            .iter()
-            .map(|(id, p)| (*id, p.commitment()))
-            .collect();
-        let public = frost::keys::PublicKeyPackage::from_dkg_commitments(&commitments)
-            .map_err(|_| ERROR)?
-            .into_even_y(None);
-        if public.serialize().map_err(|_| ERROR)?.as_slice() != completed.public_package() {
-            return Err(ERROR.into());
-        }
-        let mut contributions = BTreeMap::new();
-        contributions.insert(own, Zeroizing::new(*self.snapshot.contribution));
-        for (&id, wire) in &self.snapshot.round2 {
-            let body = Zeroizing::new(
-                self.identity
-                    .open_round2(&roster.members[&id], &roster.vault, wire)
-                    .map_err(|_| ERROR)?,
-            );
-            if body.len() <= 32 {
-                return Err(ERROR.into());
-            }
-            let contribution =
-                Zeroizing::new(<[u8; 32]>::try_from(&body[..32]).map_err(|_| ERROR)?);
-            let round1 = self
-                .identity
-                .verify_round1(
-                    &roster.members[&id],
-                    &roster.vault,
-                    &self.snapshot.round1[&id],
-                )
-                .map_err(|_| ERROR)?;
-            if round1[..32]
-                != digest(
-                    b"Loki_vs_commit1",
-                    &[&roster.vault, &id.to_be_bytes(), &*contribution],
-                )
-            {
-                return Err(ERROR.into());
-            }
-            let share =
-                frost::keys::dkg::round2::Package::deserialize(&body[32..]).map_err(|_| ERROR)?;
-            let encoded = Zeroizing::new(share.serialize().map_err(|_| ERROR)?);
-            if encoded.as_slice() != &body[32..] {
-                return Err(ERROR.into());
-            }
-            frost::keys::SecretShare::new(
-                frost::Identifier::try_from(own).map_err(|_| ERROR)?,
-                *share.signing_share(),
-                decoded[&frost::Identifier::try_from(id).map_err(|_| ERROR)?]
-                    .commitment()
-                    .clone(),
-            )
-            .verify()
-            .map_err(|_| ERROR)?;
-            contributions.insert(id, contribution);
-        }
-        let mut hash = blake2b_simd::Params::new()
-            .hash_length(32)
-            .personal(b"Loki_vs_v1")
-            .to_state();
-        hash.update(&completed.certificate_digest());
-        for contribution in contributions.values() {
-            hash.update(&**contribution);
-        }
-        if hash.finalize().as_bytes() != *self.snapshot.vs {
-            return Err(ERROR.into());
-        }
-        Ok(())
+    fn core(&self) -> Result<DkgCore<'_>, String> {
+        DkgCore::new(self.accepted.validated(), &self.identity)
     }
     fn validate_snapshot(&self) -> Result<(), String> {
         let s = &self.snapshot;
-        let own = self.identity.public().id;
         let roster = self.accepted.roster();
         if self.accepted.transport_required && !s.outgoing.is_empty() && s.prepared.is_empty() {
             return Err(ERROR.into());
@@ -542,88 +355,25 @@ impl SetupCeremony {
         {
             return Err(ERROR.into());
         }
-        for values in [
-            &s.round1,
-            &s.round2,
-            &s.outgoing,
-            &s.certificates,
-            &s.backups,
-        ] {
+        for values in [&s.outgoing, &s.backups] {
             if values.keys().any(|id| !roster.members.contains_key(id)) {
                 return Err(ERROR.into());
             }
         }
-        if s.phase as u8 >= CeremonyPhase::Round1Saved as u8
-            && (s.dkg.len() < 13
-                || s.dkg[9..11] != own.to_be_bytes()
-                || s.dkg[11..13] != (roster.members.len() as u16).to_be_bytes())
-        {
-            return Err(ERROR.into());
-        }
         match s.phase {
             CeremonyPhase::AwaitingRoster => {
-                if !s.dkg.is_empty()
-                    || !s.round1.is_empty()
-                    || !s.round2.is_empty()
-                    || !s.outgoing.is_empty()
-                    || *s.contribution != [0; 32]
-                    || *s.vs != [0; 32]
-                    || !s.certificates.is_empty()
-                    || !s.backups.is_empty()
-                    || !s.prepared.is_empty()
-                {
+                if !s.outgoing.is_empty() || !s.backups.is_empty() || !s.prepared.is_empty() {
                     return Err(ERROR.into());
                 }
             }
-            CeremonyPhase::Starting => return Err("setup_fresh_vault_required".into()),
-            CeremonyPhase::Round1Saved => {
-                let member = Member::restore_checkpoint(&s.dkg)?;
-                if self.authenticated_round1()?.get(&own).map(Vec::as_slice)
-                    != Some(member.own_round1())
-                {
-                    return Err(ERROR.into());
-                }
+            CeremonyPhase::Starting | CeremonyPhase::Aborted => {
+                return Err("setup_fresh_vault_required".into())
             }
-            CeremonyPhase::Round2Saved => {
-                let member = Round2Member::restore_checkpoint(&s.dkg)?;
-                if member.round1_packages()? != self.authenticated_round1()? {
-                    return Err(ERROR.into());
-                }
-            }
-            _ => {
-                let completed = Completed::restore_checkpoint(&s.dkg)?;
-                let packages = self.authenticated_round1()?;
-                self.validate_completed_inputs(&completed, &packages)?;
-                let mut hash = blake2b_simd::Params::new()
-                    .hash_length(32)
-                    .personal(b"Loki_dkg_r1_v1")
-                    .to_state();
-                for (id, package) in packages {
-                    hash.update(&id.to_be_bytes());
-                    hash.update(&(package.len() as u32).to_be_bytes());
-                    hash.update(&package);
-                }
-                if hash.finalize().as_bytes() != completed.transcript() {
-                    return Err(ERROR.into());
-                }
-                let body = self.certificate_body()?;
-                for (id, wire) in &s.certificates {
-                    if self
-                        .identity
-                        .verify_certificate(&roster.members[id], &roster.vault, wire)
-                        .map_err(|_| ERROR)?
-                        != body
-                    {
-                        return Err(ERROR.into());
-                    }
-                }
-                if s.phase as u8 >= CeremonyPhase::AwaitingBackups as u8
-                    && s.certificates.len() != roster.members.len()
-                {
-                    return Err(ERROR.into());
-                }
-            }
+            _ => {}
         }
+        // Rounds, transcript, envelopes, certificates, even-Y group key and the fresh key's
+        // presence (rounds one and two) or absence (from the certificate state on).
+        self.core()?.validate(&s.core)?;
         if s.phase as u8 >= CeremonyPhase::AwaitingBackups as u8 {
             let expected = self.backup_body()?;
             for (id, wire) in &s.backups {
@@ -642,38 +392,8 @@ impl SetupCeremony {
             {
                 return Err(ERROR.into());
             }
-        }
-        if s.phase as u8 >= CeremonyPhase::Round1Saved as u8 {
-            let own_wire = s.round1.get(&own).ok_or(ERROR)?;
-            let body = self
-                .identity
-                .verify_round1(&self.identity.public(), &roster.vault, own_wire)
-                .map_err(|_| ERROR)?;
-            if body.len() <= 32
-                || body[..32]
-                    != digest(
-                        b"Loki_vs_commit1",
-                        &[&roster.vault, &own.to_be_bytes(), &*s.contribution],
-                    )
-            {
-                return Err(ERROR.into());
-            }
-            if s.phase as u8 >= CeremonyPhase::Round2Saved as u8
-                && s.round1.len() != roster.members.len()
-            {
-                return Err(ERROR.into());
-            }
-            for (id, wire) in &s.round1 {
-                if self
-                    .identity
-                    .verify_round1(&roster.members[id], &roster.vault, wire)
-                    .map_err(|_| ERROR)?
-                    .len()
-                    <= 32
-                {
-                    return Err(ERROR.into());
-                }
-            }
+        } else if !s.backups.is_empty() {
+            return Err(ERROR.into());
         }
         Ok(())
     }
@@ -681,13 +401,8 @@ impl SetupCeremony {
         self.anchored = false;
         self.poisoned = true;
         self.live_start = false;
-        let mut next = Snapshot::decode(&self.snapshot.encode()?)?;
-        next.phase = CeremonyPhase::Aborted;
-        next.outgoing.clear();
-        next.prepared.clear();
-        zeroize::Zeroize::zeroize(&mut *next.dkg);
-        zeroize::Zeroize::zeroize(&mut *next.contribution);
-        zeroize::Zeroize::zeroize(&mut *next.vs);
+        let mut next = self.snapshot.duplicate();
+        next.retire();
         self.journal.append(&next.encode()?)?;
         self.snapshot = next;
         Ok(())
@@ -749,23 +464,11 @@ impl SetupCeremony {
             self.poisoned = true;
             let mut next = Snapshot::ready();
             next.phase = CeremonyPhase::Round1Saved;
-            OsRng.fill_bytes(&mut *next.contribution);
-            let (member, public) = Member::start_with_policy(own, roster.threshold, roster.members.len() as u16)?;
-            next.dkg = member.checkpoint()?;
-            let mut body = digest(
-                b"Loki_vs_commit1",
-                &[&roster.vault, &own.to_be_bytes(), &*next.contribution],
-            )
-            .to_vec();
-            body.extend_from_slice(&public);
-            let wire = self
-                .identity
-                .sign_round1(&roster.vault, &body)
-                .map_err(|_| ERROR)?;
-            next.round1.insert(own, wire.clone());
-            for id in roster.members.keys() {
-                next.outgoing.insert(*id, wire.clone());
-            }
+            // The fresh key is created here and saved in the same generation as our signed
+            // round one, so both are saved or neither is.
+            let (core, outgoing) = self.core()?.start()?;
+            next.core = core;
+            next.outgoing = outgoing;
             let result = self.save(next, prepare)?;
             self.poisoned = false;
             return Ok(result);
@@ -826,132 +529,25 @@ impl SetupCeremony {
             }
         }
         let transition = (|| -> Result<Snapshot, String> {
-            let mut next = Snapshot::decode(&self.snapshot.encode()?)?;
+            let mut next = self.snapshot.duplicate();
             next.outgoing.clear();
             next.prepared.clear();
             match phase {
-                CeremonyPhase::Round1Saved => {
-                    for (id, wire) in &records {
-                        if *id != own {
-                            next.round1.insert(*id, wire.to_vec());
-                        }
-                    }
-                    let mut round1 = BTreeMap::new();
-                    for (id, wire) in &next.round1 {
-                        let body = self
-                            .identity
-                            .verify_round1(&roster.members[id], &roster.vault, wire)
-                            .map_err(|_| ERROR)?;
-                        if body.len() <= 32 {
-                            return Err(ERROR.into());
-                        }
-                        round1.insert(*id, body[32..].to_vec());
-                    }
-                    let (member, outgoing) =
-                        Member::restore_checkpoint(&next.dkg)?.advance(&round1)?;
-                    next.dkg = member.checkpoint()?;
-                    let outgoing = PrivateShares(outgoing);
-                    for (&id, bytes) in &outgoing.0 {
-                        let mut body = Zeroizing::new(next.contribution.to_vec());
-                        body.extend_from_slice(&bytes);
-                        next.outgoing.insert(
-                            id,
-                            self.identity
-                                .seal_round2(&roster.members[&id], &roster.vault, &body)
-                                .map_err(|_| ERROR)?,
-                        );
-                    }
-                    next.outgoing.insert(
-                        own,
-                        self.identity
-                            .sign_round2_self(&roster.vault, &member.transcript)
-                            .map_err(|_| ERROR)?,
-                    );
-                    next.phase = CeremonyPhase::Round2Saved;
-                }
-                CeremonyPhase::Round2Saved => {
-                    let member = Round2Member::restore_checkpoint(&next.dkg)?;
-                    let mut incoming = PrivateShares(BTreeMap::new());
-                    let mut contributions = BTreeMap::new();
-                    contributions.insert(own, Zeroizing::new(*next.contribution));
-                    for (&id, wire) in &records {
-                        if id == own {
-                            continue;
-                        }
-                        let body = Zeroizing::new(
-                            self.identity
-                                .open_round2(&roster.members[&id], &roster.vault, wire)
-                                .map_err(|_| ERROR)?,
-                        );
-                        if body.len() <= 32 {
-                            return Err(ERROR.into());
-                        }
-                        let contribution =
-                            Zeroizing::new(<[u8; 32]>::try_from(&body[..32]).map_err(|_| ERROR)?);
-                        let commitment = digest(
-                            b"Loki_vs_commit1",
-                            &[&roster.vault, &id.to_be_bytes(), &*contribution],
-                        );
-                        let r1 = self
-                            .identity
-                            .verify_round1(&roster.members[&id], &roster.vault, &next.round1[&id])
-                            .map_err(|_| ERROR)?;
-                        if r1[..32] != commitment {
-                            return Err("setup_contribution".into());
-                        }
-                        contributions.insert(id, contribution);
-                        incoming.0.insert(id, body[32..].to_vec());
-                        next.round2.insert(id, wire.to_vec());
-                    }
-                    let completed = member.finish(&incoming.0)?;
-                    let mut hash = blake2b_simd::Params::new()
-                        .hash_length(32)
-                        .personal(b"Loki_vs_v1")
-                        .to_state();
-                    hash.update(&completed.certificate_digest());
-                    for contribution in contributions.values() {
-                        hash.update(&**contribution);
-                    }
-                    next.vs =
-                        Zeroizing::new(hash.finalize().as_bytes().try_into().map_err(|_| ERROR)?);
-                    next.dkg = completed.checkpoint()?;
-                    let mut body = completed.certificate_digest().to_vec();
-                    body.extend_from_slice(&digest(b"Loki_vs_cert_v1", &[&*next.vs]));
-                    body.extend_from_slice(&roster.fingerprint());
-                    body.extend_from_slice(zip2005::VERSION.as_bytes());
-                    let wire = self
-                        .identity
-                        .sign_certificate(&roster.vault, &body)
-                        .map_err(|_| ERROR)?;
-                    next.certificates.insert(own, wire.clone());
-                    for id in roster.members.keys() {
-                        next.outgoing.insert(*id, wire.clone());
-                    }
-                    next.phase = CeremonyPhase::CertificateSaved;
-                }
-                CeremonyPhase::CertificateSaved => {
-                    let expected = self.certificate_body()?;
-                    let mut digests = BTreeMap::new();
-                    digests.insert(
-                        own,
-                        Completed::restore_checkpoint(&next.dkg)?.certificate_digest(),
-                    );
-                    for (&id, wire) in &records {
-                        if self
-                            .identity
-                            .verify_certificate(&roster.members[&id], &roster.vault, wire)
-                            .map_err(|_| ERROR)?
-                            != expected
-                        {
-                            return Err("setup_certificate".into());
-                        }
-                        next.certificates.insert(id, wire.to_vec());
-                        digests.insert(id, expected[..32].try_into().map_err(|_| ERROR)?);
-                    }
-                    let mut certified =
-                        Completed::restore_checkpoint(&next.dkg)?.certify(&digests)?;
-                    let _secret = Zeroizing::new(std::mem::take(&mut certified.key_package));
-                    next.phase = CeremonyPhase::AwaitingBackups;
+                CeremonyPhase::Round1Saved
+                | CeremonyPhase::Round2Saved
+                | CeremonyPhase::CertificateSaved => {
+                    let records: BTreeMap<u16, Vec<u8>> = records
+                        .iter()
+                        .map(|(id, wire)| (*id, wire.to_vec()))
+                        .collect();
+                    let (core, outgoing) = self.core()?.advance(&self.snapshot.core, &records)?;
+                    next.core = core;
+                    next.outgoing = outgoing;
+                    next.phase = match phase {
+                        CeremonyPhase::Round1Saved => CeremonyPhase::Round2Saved,
+                        CeremonyPhase::Round2Saved => CeremonyPhase::CertificateSaved,
+                        _ => CeremonyPhase::AwaitingBackups,
+                    };
                 }
                 CeremonyPhase::AwaitingBackups => {
                     let expected = self.backup_body()?;
@@ -991,16 +587,7 @@ impl SetupCeremony {
         {
             return Err("setup_certificates_pending".into());
         }
-        let completed = Completed::restore_checkpoint(&self.snapshot.dkg)?;
-        let mut digests = BTreeMap::new();
-        for id in self.accepted.roster().members.keys() {
-            digests.insert(*id, completed.certificate_digest());
-        }
-        let mut certified = completed.certify(&digests)?;
-        let _secret = Zeroizing::new(std::mem::take(&mut certified.key_package));
-        let key = zip2005::frost_viewing_key(&certified.group_ak, &self.snapshot.vs)
-            .map_err(|_| ERROR)?;
-        Ok(vault::unified_address(&key, self.accepted.roster().network.network_type()))
+        self.core()?.address(&self.snapshot.core)
     }
     #[cfg(feature = "relay-communication")]
     pub(crate) fn certified_group_key(&self) -> Result<[u8; 32], String> {
@@ -1015,35 +602,10 @@ impl SetupCeremony {
         {
             return Err("setup_certificates_pending".into());
         }
-        let completed = Completed::restore_checkpoint(&self.snapshot.dkg)?;
-        let mut digests = BTreeMap::new();
-        for id in self.accepted.roster().members.keys() {
-            digests.insert(*id, completed.certificate_digest());
-        }
-        completed.certify(&digests)
+        self.core()?.certified(&self.snapshot.core)
     }
     fn backup_body(&self) -> Result<[u8; 32], String> {
-        let completed = Completed::restore_checkpoint(&self.snapshot.dkg)?;
-        let mut digests = BTreeMap::new();
-        for id in self.accepted.roster().members.keys() {
-            digests.insert(*id, completed.certificate_digest());
-        }
-        let mut certified = completed.certify(&digests)?;
-        let _secret = Zeroizing::new(std::mem::take(&mut certified.key_package));
-        let key = zip2005::frost_viewing_key(&certified.group_ak, &self.snapshot.vs)
-            .map_err(|_| ERROR)?;
-        let address = vault::unified_address(&key, self.accepted.roster().network.network_type());
-        Ok(digest(
-            b"Loki_bkup_v2",
-            &[
-                &self.accepted.roster().vault,
-                &self.accepted.roster().fingerprint(),
-                &certified.group_ak,
-                zip2005::VERSION.as_bytes(),
-                &*self.snapshot.vs,
-                address.as_bytes(),
-            ],
-        ))
+        self.core()?.backup_body(&self.snapshot.core)
     }
     pub fn certified_vault_state(&self) -> Result<Zeroizing<Vec<u8>>, String> {
         let mut certified = self.certified()?;
@@ -1065,7 +627,7 @@ impl SetupCeremony {
             }
         }
         let mut value = PrivateJson(
-            serde_json::json!({"version":2,"backup_version":2,"network":self.accepted.roster().network.label(),"key_derivation":zip2005::VERSION,"vault":hex::encode(self.accepted.roster().vault),"threshold":self.accepted.roster().threshold,"members":self.accepted.roster().members.len(),"roster_fingerprint":hex::encode(self.accepted.roster().fingerprint()),"identity_secret":hex::encode(&*identity),"key_package":hex::encode(&*secret),"vault_secret":hex::encode(&*self.snapshot.vs),"public_package":hex::encode(&certified.public_package),"group_ak":hex::encode(certified.group_ak),"address":address}),
+            serde_json::json!({"version":2,"backup_version":2,"network":self.accepted.roster().network.label(),"key_derivation":zip2005::VERSION,"vault":hex::encode(self.accepted.roster().vault),"threshold":self.accepted.roster().threshold,"members":self.accepted.roster().members.len(),"roster_fingerprint":hex::encode(self.accepted.roster().fingerprint()),"identity_secret":hex::encode(&*identity),"key_package":hex::encode(&*secret),"vault_secret":hex::encode(self.snapshot.core.vault_secret()),"public_package":hex::encode(&certified.public_package),"group_ak":hex::encode(certified.group_ak),"address":address}),
         );
         if let Some(height) = self.accepted.roster().birth_height {
             value.0["birth_height"] = serde_json::json!(height);
@@ -1101,7 +663,7 @@ impl SetupCeremony {
             .identity
             .sign_backup(&self.accepted.roster().vault, &self.backup_body()?)
             .map_err(|_| ERROR)?;
-        let mut next = Snapshot::decode(&self.snapshot.encode()?)?;
+        let mut next = self.snapshot.duplicate();
         next.outgoing.clear();
         next.backups.insert(own, wire.clone());
         for id in self.accepted.roster().members.keys() {
@@ -1150,7 +712,7 @@ impl SetupCeremony {
             return Err("setup_backups_pending".into());
         }
         self.backup_receipts()?;
-        let mut next = Snapshot::decode(&self.snapshot.encode()?)?;
+        let mut next = self.snapshot.duplicate();
         next.phase = CeremonyPhase::PaymentHandoff;
         next.outgoing = outgoing.clone();
         self.save(next, |phase, copies| {
@@ -1201,7 +763,7 @@ impl SetupCeremony {
             return Err("setup_payment_pending".into());
         }
         self.backup_receipts()?;
-        let mut next = Snapshot::decode(&self.snapshot.encode()?)?;
+        let mut next = self.snapshot.duplicate();
         next.phase = CeremonyPhase::Active;
         next.outgoing = outgoing.clone();
         self.save(next, |phase, copies| {
@@ -1246,9 +808,7 @@ mod tests {
                 let context = [count as u8; 32];
                 let mut snapshot = Snapshot::ready();
                 snapshot.phase = CeremonyPhase::Active;
-                snapshot.contribution.fill(37);
-                snapshot.vs.fill(41);
-                snapshot.dkg.extend_from_slice(&[43; 32]);
+                snapshot.core = DkgState::filled_for_tests(DkgPhase::Certified, 37);
                 snapshot.outgoing.insert(1, vec![47; 32]);
                 snapshot.prepared = vec![53; 32];
                 let journal_root = member.path().join("setup-ceremony");
@@ -1302,12 +862,10 @@ mod tests {
                 let journal = Journal::open(&journal_root, "pass", context, 1).unwrap();
                 let retired = Snapshot::decode(&journal.latest().unwrap().payload).unwrap();
                 assert!(
-                    retired.dkg.is_empty()
+                    retired.core.is_wiped()
                         && retired.outgoing.is_empty()
                         && retired.prepared.is_empty()
                 );
-                assert_eq!(*retired.vs, [0; 32]);
-                assert_eq!(*retired.contribution, [0; 32]);
                 drop(journal);
                 SetupCeremony::abort_saved_checkpoint(
                     member.path(),
@@ -1335,7 +893,10 @@ mod tests {
                 })}).collect::<Vec<_>>()
             })).unwrap();
             let accepted = || AcceptedCeremonyRoster {
-                roster: crate::member_state::Roster::from_bytes(&document).unwrap(),
+                roster: crate::member_state::ValidatedRoster::new(
+                    crate::member_state::Roster::from_bytes(&document).unwrap(),
+                )
+                .unwrap(),
                 network: "regtest".into(),
                 operator_digest: [73; 32],
                 transport_required: false,
@@ -1392,7 +953,10 @@ mod tests {
             let identities: Vec<_> = (1..=count).map(Identity::new).collect();
             let document=serde_json::to_vec(&serde_json::json!({"vault":hex::encode([71;32]),"threshold":2,"members":identities.iter().map(|i|{let p=i.public();serde_json::json!({"id":p.id,"signing":hex::encode(p.signing),"encryption":hex::encode(p.encryption)})}).collect::<Vec<_>>()})).unwrap();
             let accepted = AcceptedCeremonyRoster {
-                roster: crate::member_state::Roster::from_bytes(&document).unwrap(),
+                roster: crate::member_state::ValidatedRoster::new(
+                    crate::member_state::Roster::from_bytes(&document).unwrap(),
+                )
+                .unwrap(),
                 network: "regtest".into(),
                 operator_digest: [73; 32],
                 transport_required: true,
@@ -1450,11 +1014,9 @@ mod tests {
             assert_eq!(latest.number, generation + 1);
             let saved = Snapshot::decode(&latest.payload).unwrap();
             assert_eq!(saved.phase, CeremonyPhase::Aborted);
-            assert!(saved.dkg.is_empty());
+            assert!(saved.core.is_wiped());
             assert!(saved.outgoing.is_empty());
             assert!(saved.prepared.is_empty());
-            assert!(*saved.vs == [0; 32]);
-            assert!(*saved.contribution == [0; 32]);
             drop(terminal);
             SetupCeremony::abort_saved_checkpoint(member.path(), "pass", context, 1, &lock, None)
                 .unwrap();
@@ -1476,7 +1038,10 @@ mod tests {
         let identities: Vec<_> = (1..=3).map(Identity::new).collect();
         let document=serde_json::to_vec(&serde_json::json!({"vault":hex::encode([71;32]),"threshold":2,"members":identities.iter().map(|i|{let p=i.public();serde_json::json!({"id":p.id,"signing":hex::encode(p.signing),"encryption":hex::encode(p.encryption)})}).collect::<Vec<_>>()})).unwrap();
         let accepted = AcceptedCeremonyRoster {
-            roster: crate::member_state::Roster::from_bytes(&document).unwrap(),
+            roster: crate::member_state::ValidatedRoster::new(
+                crate::member_state::Roster::from_bytes(&document).unwrap(),
+            )
+            .unwrap(),
             network: "regtest".into(),
             operator_digest: [73; 32],
             transport_required: false,
@@ -1506,14 +1071,23 @@ mod tests {
         engine.step(&[]).unwrap();
         engine.synchronize(&mut authority).unwrap();
         engine.step(&[]).unwrap();
-        let (different, _) = Member::start_with_policy(1, 2, 3).unwrap();
-        engine.snapshot.dkg = different.checkpoint().unwrap();
+        let (different, _) =
+            crate::distributed_setup::Member::start_with_policy(1, 2, 3).unwrap();
+        engine
+            .snapshot
+            .core
+            .replace_dkg_for_tests(different.checkpoint().unwrap());
         assert!(engine.validate_snapshot().is_err());
         drop(engine);
         std::fs::remove_dir_all(root).unwrap();
     }
+    /// Reopen from the certificate state recomputes the group key from the signed
+    /// round-one commitments without decrypting anything. Part 3 normalizes the key to
+    /// even Y, so the recomputation must too: cover vaults whose key needed the flip and
+    /// vaults whose key did not.
     #[test]
-    fn completed_restart_accepts_sdk_even_y_normalization_for_both_policies() {
+    fn certificate_reopen_without_decryption_accepts_both_even_y_parities() {
+        use crate::dkg_core::{DkgCore, DkgPhase};
         use reddsa_frost::frost::redpallas::{self as frost, keys::EvenY};
         for count in [3u16, 4] {
             let identities: Vec<_> = (1..=count).map(Identity::new).collect();
@@ -1524,110 +1098,88 @@ mod tests {
                     serde_json::json!({"id":p.id,"signing":hex::encode(p.signing),"encryption":hex::encode(p.encryption)})
                 }).collect::<Vec<_>>()
             })).unwrap();
-            let accepted = AcceptedCeremonyRoster {
-                roster: crate::member_state::Roster::from_bytes(&document).unwrap(),
-                network: "regtest".into(),
-                operator_digest: [83; 32],
-                transport_required: false,
+            let roster = || {
+                crate::member_state::ValidatedRoster::new(
+                    crate::member_state::Roster::from_bytes(&document).unwrap(),
+                )
+                .unwrap()
             };
-            let mut chosen = None;
-            for _ in 0..128 {
-                let mut members = BTreeMap::new();
-                let mut round1 = BTreeMap::new();
-                for id in 1..=count {
-                    let (member, public) = Member::start_with_policy(id, 2, count).unwrap();
-                    members.insert(id, member);
-                    round1.insert(id, public);
+            let validated = roster();
+            let mut seen = [false; 2];
+            for _ in 0..256 {
+                if seen == [true, true] {
+                    break;
                 }
-                let decoded: BTreeMap<_, _> = round1
+                let cores: Vec<_> = identities
                     .iter()
-                    .map(|(&id, bytes)| {
-                        (
-                            frost::Identifier::try_from(id).unwrap(),
-                            frost::keys::dkg::round1::Package::deserialize(bytes).unwrap(),
-                        )
-                    })
+                    .map(|identity| DkgCore::new(&validated, identity).unwrap())
                     .collect();
-                let commitments = decoded
+                let mut states = Vec::new();
+                let mut round1 = BTreeMap::new();
+                for (i, core) in cores.iter().enumerate() {
+                    let (state, out) = core.start().unwrap();
+                    round1.insert(i as u16 + 1, out[&1].clone());
+                    states.push(state);
+                }
+                let mut commitments = BTreeMap::new();
+                for (id, wire) in &round1 {
+                    let body = identities[0]
+                        .verify_round1(&identities[*id as usize - 1].public(), &[81; 32], wire)
+                        .unwrap();
+                    commitments.insert(
+                        frost::Identifier::try_from(*id).unwrap(),
+                        frost::keys::dkg::round1::Package::deserialize(&body[64..]).unwrap(),
+                    );
+                }
+                let commitments = commitments
                     .iter()
                     .map(|(id, p)| (*id, p.commitment()))
                     .collect();
-                let public =
-                    frost::keys::PublicKeyPackage::from_dkg_commitments(&commitments).unwrap();
-                if !public.has_even_y() {
-                    chosen = Some((members, round1));
-                    break;
+                let odd = !frost::keys::PublicKeyPackage::from_dkg_commitments(&commitments)
+                    .unwrap()
+                    .has_even_y();
+                if seen[usize::from(odd)] {
+                    continue;
                 }
-            }
-            let (members, round1) =
-                chosen.expect("fixture must exercise an odd pre-normalization group key");
-            let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
-                "loki-even-y-restart-{}",
-                hex::encode(identities[0].public().signing)
-            ));
-            let member = MemberDir::create(&root, "member").unwrap();
-            MemberDir::create(member.path(), "secrets")
-                .unwrap()
-                .write_sealed("identity.sealed", &identities[0].to_secret_bytes(), "pass")
-                .unwrap();
-            let mut engine = SetupCeremony::open(member.path(), "pass", accepted).unwrap();
-            let mut snapshot = Snapshot::ready();
-            snapshot.phase = CeremonyPhase::CertificateSaved;
-            snapshot.contribution = Zeroizing::new([1; 32]);
-            let mut own = None;
-            let mut peer_shares = BTreeMap::new();
-            for (id, member) in members {
-                let contribution = [id as u8; 32];
-                let mut body = digest(
-                    b"Loki_vs_commit1",
-                    &[
-                        &engine.accepted.roster().vault,
-                        &id.to_be_bytes(),
-                        &contribution,
-                    ],
-                )
-                .to_vec();
-                body.extend_from_slice(&round1[&id]);
-                snapshot.round1.insert(
-                    id,
-                    identities[id as usize - 1]
-                        .sign_round1(&engine.accepted.roster().vault, &body)
-                        .unwrap(),
-                );
-                let (member, shares) = member.advance(&round1).unwrap();
-                if id == 1 {
-                    own = Some(member);
-                } else {
-                    peer_shares.insert(id, shares[&1].clone());
-                    let mut body = contribution.to_vec();
-                    body.extend_from_slice(&shares[&1]);
-                    snapshot.round2.insert(
-                        id,
-                        identities[id as usize - 1]
-                            .seal_round2(
-                                &identities[0].public(),
-                                &engine.accepted.roster().vault,
-                                &body,
-                            )
-                            .unwrap(),
-                    );
+                seen[usize::from(odd)] = true;
+                let mut round2 = Vec::new();
+                for (core, state) in cores.iter().zip(&states) {
+                    round2.push(core.advance(state, &round1).unwrap());
                 }
+                let to_first: BTreeMap<u16, Vec<u8>> = round2
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (_, out))| (i as u16 + 1, out[&1].clone()))
+                    .collect();
+                let (certificate, _) = cores[0].advance(&round2[0].0, &to_first).unwrap();
+                assert_eq!(certificate.phase(), DkgPhase::Certificate);
+                assert!(!certificate.has_fresh_key());
+
+                let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+                    "loki-even-y-restart-{}-{odd}",
+                    hex::encode(identities[0].public().signing)
+                ));
+                let member = MemberDir::create(&root, "member").unwrap();
+                MemberDir::create(member.path(), "secrets")
+                    .unwrap()
+                    .write_sealed("identity.sealed", &identities[0].to_secret_bytes(), "pass")
+                    .unwrap();
+                let accepted = AcceptedCeremonyRoster {
+                    roster: roster(),
+                    network: "regtest".into(),
+                    operator_digest: [83; 32],
+                    transport_required: false,
+                };
+                let mut engine = SetupCeremony::open(member.path(), "pass", accepted).unwrap();
+                let mut snapshot = Snapshot::ready();
+                snapshot.phase = CeremonyPhase::CertificateSaved;
+                snapshot.core = certificate;
+                engine.snapshot = snapshot;
+                engine.validate_snapshot().unwrap();
+                drop(engine);
+                std::fs::remove_dir_all(root).unwrap();
             }
-            let completed = own.unwrap().finish(&peer_shares).unwrap();
-            snapshot.dkg = completed.checkpoint().unwrap();
-            let mut hash = blake2b_simd::Params::new()
-                .hash_length(32)
-                .personal(b"Loki_vs_v1")
-                .to_state();
-            hash.update(&completed.certificate_digest());
-            for id in 1..=count {
-                hash.update(&[id as u8; 32]);
-            }
-            snapshot.vs = Zeroizing::new(hash.finalize().as_bytes().try_into().unwrap());
-            engine.snapshot = snapshot;
-            engine.validate_snapshot().unwrap();
-            drop(engine);
-            std::fs::remove_dir_all(root).unwrap();
+            assert_eq!(seen, [true, true], "both group-key parities must be exercised");
         }
     }
     #[test]
@@ -1635,7 +1187,10 @@ mod tests {
         let identities: Vec<_> = (1..=3).map(Identity::new).collect();
         let document=serde_json::to_vec(&serde_json::json!({"vault":hex::encode([71;32]),"threshold":2,"members":identities.iter().map(|i|{let p=i.public();serde_json::json!({"id":p.id,"signing":hex::encode(p.signing),"encryption":hex::encode(p.encryption)})}).collect::<Vec<_>>()})).unwrap();
         let accepted = || AcceptedCeremonyRoster {
-            roster: crate::member_state::Roster::from_bytes(&document).unwrap(),
+            roster: crate::member_state::ValidatedRoster::new(
+                crate::member_state::Roster::from_bytes(&document).unwrap(),
+            )
+            .unwrap(),
             network: "regtest".into(),
             operator_digest: [73; 32],
             transport_required: false,

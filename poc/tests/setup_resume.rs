@@ -271,7 +271,7 @@ fn ceremony_restarts_every_complete_phase_and_preserves_saved_ciphertext() {
             let body = identity
                 .verify_round1(&identity.public(), &[78; 32], round1)
                 .unwrap();
-            let package = reddsa_frost::frost::redpallas::keys::dkg::round1::Package::deserialize(&body[32..]).unwrap();
+            let package = reddsa_frost::frost::redpallas::keys::dkg::round1::Package::deserialize(&body[64..]).unwrap();
             assert_eq!(package.commitment().serialize().unwrap().len(), threshold as usize);
             let checkpoint = engine.checkpoint();
             let ciphertext = engine.prepared_delivery().unwrap().to_vec();

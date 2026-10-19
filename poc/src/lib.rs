@@ -19,6 +19,7 @@ pub mod candidate;
 mod coordinator;
 pub mod coordinator_boundary;
 pub mod distributed_setup;
+pub mod dkg_core;
 pub mod intent;
 pub mod member_state;
 pub mod network;
