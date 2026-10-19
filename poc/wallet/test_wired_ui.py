@@ -141,5 +141,91 @@ class WiredUiTest(unittest.TestCase):
             self.assertEqual(status, 403)
 
 
+    def test_setup_screen_reads_status_fingerprint_and_confirmations(self):
+        """The 06 Setup screen fetches /api/status?vault=<id> and renders the
+        roster short-code (fingerprint) plus each member's confirmation — exactly
+        the fields ui.js:loadSetup reads. Native DKG state is stubbed; the route,
+        the shape the screen reads, and token auth are real."""
+        with tempfile.TemporaryDirectory(prefix="loki-ui-setup-") as temp:
+            wallet, vault = make_vault(temp)
+            self.addCleanup(wallet.close)
+            token, request = serve(self, wallet)
+
+            state = {"phase": "compare_roster", "network": "regtest", "name": "Treasury Reserve",
+                     "slot": 1, "vault": vault, "members": 3, "threshold": 2, "total_members": 3,
+                     "fingerprint": "K7F29QX4LM08ZZ11", "profile": {"name": "Alice"}, "vaults": [],
+                     "confirmations": [{"slot": 1, "confirmed": True, "matches": True, "at": 1},
+                                       {"slot": 2, "confirmed": True, "matches": False, "at": 2},
+                                       {"slot": 3, "confirmed": False, "matches": None, "at": None}]}
+            with patch.object(wallet, "status", return_value=state):
+                status, body = request("GET", f"/api/status?vault={vault}",
+                                       headers={"X-Loki-Token": token})
+            self.assertEqual(status, 200)
+            got = json.loads(body)
+            self.assertEqual(got["phase"], "compare_roster")
+            self.assertEqual(got["fingerprint"], "K7F29QX4LM08ZZ11")
+            self.assertEqual([c["matches"] for c in got["confirmations"]], [True, False, None])
+
+            status, _ = request("GET", f"/api/status?vault={vault}",
+                                headers={"X-Loki-Token": "wrong"})
+            self.assertEqual(status, 403)
+
+    def test_overview_screen_reads_balance_route(self):
+        """The 07 Overview screen posts /api/balance {vault} and reads
+        {balance_zat, height} — what ui.js:loadBalance renders. Chain scan is
+        stubbed; route, payload shape and token auth are real."""
+        with tempfile.TemporaryDirectory(prefix="loki-ui-balance-") as temp:
+            wallet, vault = make_vault(temp)
+            self.addCleanup(wallet.close)
+            token, request = serve(self, wallet)
+
+            seen = {}
+
+            def fake_balance(got):
+                seen["vault"] = got
+                return {"vault": got, "balance_zat": 420100000, "height": 1284902}
+
+            with patch.object(wallet, "balance", side_effect=fake_balance):
+                status, body = request("POST", "/api/balance", {"vault": vault},
+                                       {"X-Loki-Token": token})
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body)["balance_zat"], 420100000)
+            self.assertEqual(json.loads(body)["height"], 1284902)
+            self.assertEqual(seen["vault"], vault)
+
+            status, _ = request("POST", "/api/balance", {"vault": vault},
+                                {"X-Loki-Token": "wrong"})
+            self.assertEqual(status, 403)
+
+    def test_history_screen_reads_payments_route(self):
+        """The 08 History screen fetches /api/payments?vault=<id> and reads the
+        per-payment {phase, signers, txid} the status pills render. Saved payment
+        state is stubbed; route, list shape and token auth are real."""
+        with tempfile.TemporaryDirectory(prefix="loki-ui-history-") as temp:
+            wallet, vault = make_vault(temp)
+            self.addCleanup(wallet.close)
+            token, request = serve(self, wallet)
+
+            payments = {"payments": [
+                {"attempt": "a" * 64, "payment": "pay-1", "signers": [1, 2], "phase": "confirmed",
+                 "ready_to_send": False, "txid": "f" * 64},
+                {"attempt": "b" * 64, "payment": "pay-2", "signers": [2, 3], "phase": "package",
+                 "ready_to_send": True},
+            ], "readiness": {"relay_ready": True, "relay_detail": "", "scan_height": None},
+                "updates": {"running": False, "error": None}}
+
+            with patch.object(wallet, "payments", return_value=payments):
+                status, body = request("GET", f"/api/payments?vault={vault}",
+                                       headers={"X-Loki-Token": token})
+            self.assertEqual(status, 200)
+            rows = json.loads(body)["payments"]
+            self.assertEqual([p["phase"] for p in rows], ["confirmed", "package"])
+            self.assertEqual(rows[0]["txid"], "f" * 64)
+
+            status, _ = request("GET", f"/api/payments?vault={vault}",
+                                headers={"X-Loki-Token": "wrong"})
+            self.assertEqual(status, 403)
+
+
 if __name__ == "__main__":
     unittest.main()
