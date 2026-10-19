@@ -1,0 +1,31 @@
+# LokiSigner — minimal signer app (Secure Enclave persistence proof + seed of the native signer)
+
+Proves a **persistent** Secure Enclave key wrapping/unwrapping the signer DEK, inside a
+provisioned macOS app (the only place macOS allows persistent SE keys — a bare CLI gets
+`errSecMissingEntitlement` / SIGKILL). This is the seed of the native signer shell.
+
+## One-time setup (done)
+- Apple ID in Xcode → Settings → Accounts.
+- **Apple WWDR intermediate** installed (otherwise the Dev cert is "invalid"):
+  `curl -O https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer && security import AppleWWDRCAG3.cer -k ~/Library/Keychains/login.keychain-db`
+- Team: `B399KAT22M`. Touch ID present (biometric mode works).
+
+## Build + run (the one GUI step that provisions a free-team profile)
+```sh
+cd poc/signer-app && ruby gen.rb        # regenerates LokiSigner.xcodeproj (needs the xcodeproj gem)
+open LokiSigner.xcodeproj               # in Xcode: select the LokiSigner scheme, Product → Run (⌘R)
+```
+The first GUI **Run** registers this Mac as a dev device and generates the provisioning
+profile (free teams can't do this headlessly). The console prints:
+```
+SIGNER-APP ENCLAVE PASS: persistent wrap/unwrap of a signer DEK
+```
+After that first run the profile exists; subsequent `xcodebuild … -allowProvisioningUpdates`
+builds work headlessly.
+
+- `LokiSigner persist`   — create + reload a persistent SE key, wrap/unwrap (no biometric).
+- `LokiSigner biometric` — same, gated by **Touch ID** on unwrap (interactive).
+
+## Next
+Wire `poc/src/signer/secure_element_apple.rs` (the `AppleSecureElement` trait impl) as
+this app's SecureElement backend; that is the real native signer.
