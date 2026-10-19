@@ -161,3 +161,60 @@ upholding invariant 5.
 bins). The one-line fix is `root(None)`; it is unrelated to this workstream and is left
 for the owner of that bin. The ZF tests above were run with the lib + the two test
 targets.
+
+## 5. WS3 transport — `frostd` adopted (omarchy, 2026-10-18)
+
+**Decision:** route the public protocol messages through the audited ZF `frostd` relay;
+the bespoke Loki relay stack is marked for retirement.
+
+### 5.1 frostd bring-up
+`ZcashFoundation/frost-tools @ 53df99c`, `cargo build -p frostd` (cargo 1.98.0), then:
+
+```
+./target/debug/frostd --no-tls-very-insecure -p 2744   # frostd 0.1.0
+INFO frostd: server running
+WARN frostd: starting an INSECURE HTTP server at 0.0.0.0:2744   # local test only; TLS in prod (ws3 §6)
+```
+
+The relay is a pure store-and-forward of opaque bytes: `send { session_id, recipients,
+msg }` queues `Msg { sender, msg }`; `receive { session_id, as_coordinator }` drains it.
+It never inspects `msg` (`frostd/src/functions.rs`). Login is XEdDSA over a server
+challenge (`functions.rs::login`, `xeddsa`), with the member's X25519 key as its address.
+
+### 5.2 Mode-A at the transport layer (not the full `frost-client` crate)
+`poc` speaks the eight frostd JSON endpoints directly from `poc/src/transport.rs`
+(`Transport` trait per ws3 §5 + `FrostdTransport`), reusing the audited relay binary and
+its wire contract. It does **not** take `frost-client` as a crate dependency: that crate
+is on `frost-core`/`reddsa` 2.x while `poc` is on 3.0.0 (§2 skew), so embedding it would
+pull a conflicting second copy of the crypto crates. The FROST math stays on `poc`'s
+audited `reddsa_frost`/`frost-core`; only the thin client orchestration is local. (If the
+§2 pin-alignment lands in WS6, the full `frost-client` participant/coordinator API can
+replace this orchestration behind the same `Transport` seam.)
+
+### 5.3 Live acceptance (ws3 §7.1 / §7.3)
+`FROSTD_URL=http://127.0.0.1:2744 cargo test --test frostd_transport -- --nocapture` — a
+2-of-3 **dealerless DKG** (`frost::keys::dkg` part1/2/3) **and** a rerandomized signing
+round-trip, every message carried over the running frostd:
+
+```
+[WS3] 3 members + coordinator authenticated to frostd at http://127.0.0.1:2744
+[WS3] session 9d6c5953-711f-4931-b904-c4ab3df8a9fc created; members joined
+[WS3] DKG complete over frostd — group verifying key = 9eef7a2c5bebbf935ae50eff3ae49d487b8d02df68e62db76db2a7436f368131
+[WS3] 2-of-3 rerandomized signature over frostd VERIFIES
+[WS3] audited 15 relayed payloads; none equals a share or key package (invariant 4 holds)
+test two_of_three_dkg_and_sign_over_real_frostd ... ok
+```
+
+The test records every byte string frostd actually carried and asserts none equals a DKG
+secret package, a FROST share / `KeyPackage`, or a signing nonce — invariant 4 ("only
+public data crosses") proven directly, not asserted. Without `FROSTD_URL` the test
+self-skips so `cargo test` stays green offline.
+
+### 5.4 Retirement
+Loki's bespoke relay stack — `relay_member`, `setup_relay`, `member_service`, and the
+`setup_backup`/`setup_retry` helpers — is already behind the off-by-default
+`relay-communication` feature and is now annotated in `poc/src/lib.rs` as retiring in
+favor of `transport::FrostdTransport`. It still compiles; no new callers should be added.
+What stays is the thin roster/admission layer frostd does not provide (ws3 §4):
+`setup_ceremony` (invitations, `AdmissionCheckpointAuthority`, the `VaultCertificate`,
+network/birth-height tagging). frostd replaces message *passing*, not *who is in a vault*.
