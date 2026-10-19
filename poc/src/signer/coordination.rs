@@ -9,7 +9,10 @@
 //! The loop is, for a one-note candidate:
 //!   1. round 1: [`Signer::sign_commit`] on each quorum member → public commitments,
 //!   2. derive the rerandomizer from those commitments and the candidate's `alpha` from it,
-//!   3. build the unproved candidate PCZT under that alpha ([`crate::candidate`]),
+//!   3. ASK THE PROPOSER SIGNER to build the unproved candidate PCZT under that alpha
+//!      ([`Signer::build_candidate`]) — using ITS own viewing key and ITS own selected note.
+//!      The coordinator passes only the public payment effects + alpha and never sees the
+//!      viewing key, the note, or selects a note.
 //!   4. assemble the FROST [`SigningPackage`] from the commitments + the candidate sighash,
 //!   5. round 2: [`Signer::sign_approve`] on each member (pczt + package + randomizer seed),
 //!   6. aggregate the shares ([`frost_rerandomized::aggregate`]), apply the signature to the
@@ -17,24 +20,14 @@
 //!
 //! It stops at the signed PCZT: no prove, broadcast, scan, or chain contact.
 
-use crate::candidate::{alpha_from_canonical_bytes, build_candidate, quote_fee, CandidateInputs};
-use crate::signer::{CandidateRef, Session, Signer};
-use orchard::keys::FullViewingKey;
+use crate::signer::{CandidateRef, PublicPaymentParams, Session, Signer};
 use reddsa_frost::frost::redpallas as frost;
 use std::collections::BTreeMap;
-use zcash_protocol::consensus::Parameters;
 
-/// What the coordinator knows to build the candidate: the public vault key, the single note
-/// being spent, and the payment effects. All public — no share, nonce, or spend authority.
-pub struct PaymentIntent<'a> {
-    pub vault_fvk: &'a FullViewingKey,
-    pub note: orchard::Note,
-    pub recipient: orchard::Address,
-    pub amount: zcash_protocol::value::Zatoshis,
-    pub memo: zcash_protocol::memo::MemoBytes,
-    pub target_height: u32,
-    pub expiry_height: u32,
-}
+/// What the coordinator knows to drive the payment: the PUBLIC effects only. No viewing
+/// key, no note, no share, no nonce, no spend authority. The signer selects its own note
+/// and builds under its own viewing key.
+pub type PaymentIntent = PublicPaymentParams;
 
 /// One quorum member as the coordinator sees it: its FROST identifier, the session handle
 /// returned by [`Signer::connect`], and the signer itself. No key material.
@@ -49,15 +42,13 @@ pub struct QuorumMember<'a, S: Signer> {
 ///
 /// Returns the signed PCZT bytes. Errors are plain strings: this is a coordinator, it has
 /// no secrets to leak in a message.
-pub fn drive_to_signed_pczt<P, S>(
-    params: &P,
+pub fn drive_to_signed_pczt<S>(
     public: &frost::keys::PublicKeyPackage,
-    intent: &PaymentIntent<'_>,
+    intent: &PaymentIntent,
     cand: &CandidateRef,
     quorum: &mut [QuorumMember<'_, S>],
 ) -> Result<Vec<u8>, String>
 where
-    P: Parameters + Clone,
     S: Signer,
     S::Error: std::fmt::Display,
 {
@@ -93,45 +84,25 @@ where
         .as_slice()
         .try_into()
         .map_err(|_| "randomizer alpha is not 32 bytes")?;
-    let alpha = alpha_from_canonical_bytes(&alpha_bytes).ok_or("noncanonical alpha")?;
 
-    // 3. Build the unproved candidate under that alpha. Fee is what the builder quotes;
-    //    change is the remainder of the single note.
-    let mut inputs = CandidateInputs {
-        vault_fvk: intent.vault_fvk,
-        notes: vec![intent.note],
-        recipient: intent.recipient,
-        amount: intent.amount,
-        memo: intent.memo.clone(),
-        change: zcash_protocol::value::Zatoshis::ZERO,
-        target_height: intent.target_height,
-        expiry_height: intent.expiry_height,
+    // 3. Ask the PROPOSER signer (quorum member 0) to build the unproved candidate under
+    //    this alpha. It uses its OWN viewing key and OWN selected note; the coordinator
+    //    hands over only the public effects + alpha (canonical bytes). The coordinator never
+    //    sees the viewing key or the note and never selects one.
+    let pczt_bytes = {
+        let proposer = &quorum[0];
+        proposer
+            .signer
+            .build_candidate(&proposer.session, cand, intent, &alpha_bytes)
+            .map_err(|e| format!("proposer {:?} build_candidate: {e}", proposer.id))?
     };
-    let fee = u64::from(quote_fee(params, &inputs)?);
-    let spend = intent.note.value().inner();
-    let amount = u64::from(intent.amount);
-    let change = spend
-        .checked_sub(amount)
-        .and_then(|r| r.checked_sub(fee))
-        .ok_or("note does not cover amount + fee")?;
-    inputs.change = zcash_protocol::value::Zatoshis::from_u64(change).map_err(|e| format!("{e:?}"))?;
-    let built = build_candidate(
-        params,
-        &inputs,
-        &[alpha],
-        rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng),
-    )?;
 
-    // Serialize the candidate and compute the sighash the signers will independently redo.
-    let candidate = pczt::roles::creator::Creator::build_from_parts(built.pczt_parts)
-        .ok_or("create pczt: build_from_parts returned None")?;
-    let candidate = pczt::roles::io_finalizer::IoFinalizer::new(candidate)
-        .finalize_io()
-        .map_err(|e| format!("io finalize: {e:?}"))?;
-    let sighash = pczt::roles::signer::Signer::new(candidate.clone())
+    // Recompute the sighash from the bytes the proposer returned — the signers redo this
+    // independently in round 2 (WYSIWYS binding).
+    let candidate = pczt::Pczt::parse(&pczt_bytes).map_err(|e| format!("parse candidate: {e:?}"))?;
+    let sighash = pczt::roles::signer::Signer::new(candidate)
         .map_err(|e| format!("signer: {e:?}"))?
         .shielded_sighash();
-    let pczt_bytes = candidate.serialize().map_err(|e| format!("serialize: {e:?}"))?;
 
     // 4. Assemble the FROST signing package from the commitments + the candidate sighash.
     let package = frost::SigningPackage::new(commitments.clone(), &sighash);
@@ -163,14 +134,23 @@ where
         orchard::primitives::redpallas::SpendAuth,
     >::from(sig_bytes);
 
+    // Keyless action selection: the signed spend is the one whose `rk` equals the group's
+    // randomized verifying key (ak·alpha). Padding actions carry independent dummy `rk`s.
+    // The coordinator has no viewing key and no note, so it CANNOT match by nullifier.
     let parsed = pczt::Pczt::parse(&pczt_bytes).map_err(|e| format!("reparse: {e:?}"))?;
-    let want_nf = intent.note.nullifier(intent.vault_fvk).to_bytes();
+    let want_rk: [u8; 32] = fparams
+        .randomized_verifying_key()
+        .serialize()
+        .map_err(|e| format!("{e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| "randomized vk is not 32 bytes")?;
     let index = parsed
         .ironwood()
         .actions()
         .iter()
-        .position(|a| a.spend().nullifier() == &want_nf)
-        .ok_or("candidate does not spend the intended note")?;
+        .position(|a| a.spend().rk() == &want_rk)
+        .ok_or("candidate has no spend under the randomized group key")?;
     let mut signer =
         pczt::roles::signer::Signer::new(parsed).map_err(|e| format!("signer: {e:?}"))?;
     signer
@@ -185,12 +165,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::candidate::Regtest;
     use crate::signer::local::LocalSigner;
     use crate::signer::secure_element::SoftwareSecureElement;
     use crate::signer::Network;
     use crate::zip2005;
-    use orchard::keys::Scope;
+    use orchard::keys::{FullViewingKey, Scope};
     use orchard::note::{RandomSeed, Rho};
     use orchard::value::NoteValue;
     use orchard::NoteVersion;
@@ -268,6 +247,12 @@ mod tests {
             })
             .collect();
 
+        // Each signer scans its own note member-side; give it to the signer, NOT the
+        // coordinator. The proposer (member 0) builds the candidate from its own note.
+        for s in signers.iter_mut() {
+            s.set_candidate_notes(vec![note]);
+        }
+
         let sessions: Vec<Session> = signers
             .iter_mut()
             .map(|s| {
@@ -277,9 +262,8 @@ mod tests {
             })
             .collect();
 
+        // PUBLIC effects only: no fvk, no note. The coordinator never learns either.
         let intent = PaymentIntent {
-            vault_fvk: &fvk,
-            note,
             recipient: fvk.address_at(7u64, Scope::External),
             amount: Zatoshis::const_from_u64(AMOUNT),
             memo: MemoBytes::from_bytes(b"loki u2").unwrap(),
@@ -303,7 +287,7 @@ mod tests {
             })
             .collect();
 
-        let signed = drive_to_signed_pczt(&Regtest, &public, &intent, &cand, &mut quorum)
+        let signed = drive_to_signed_pczt(&public, &intent, &cand, &mut quorum)
             .expect("the keyless loop produces a verified signed PCZT");
 
         // The returned bytes parse and the intended spend now carries a spend-auth sig.
