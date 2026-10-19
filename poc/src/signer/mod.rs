@@ -69,6 +69,19 @@ pub struct CandidateRef {
     pub attempt_id: [u8; 32],
 }
 
+/// The PUBLIC payment effects the coordinator hands a signer to build an unsigned
+/// candidate. No viewing key, no note, no spend authority — just where the money goes,
+/// how much, the memo, and the validity window. The signer selects its own notes and
+/// uses its own held viewing key to build.
+#[derive(Clone)]
+pub struct PublicPaymentParams {
+    pub recipient: orchard::Address,
+    pub amount: zcash_protocol::value::Zatoshis,
+    pub memo: zcash_protocol::memo::MemoBytes,
+    pub target_height: u32,
+    pub expiry_height: u32,
+}
+
 /// The ONE keyless signer seam (ws1-signer §7). Every parameter and return type is
 /// FROST/PCZT artifacts: session handles, vault metadata, authenticated DKG round-one
 /// messages, recipient-encrypted DKG round-two messages, signing commitments, and
@@ -113,6 +126,20 @@ pub trait Signer {
         session: &Session,
         cand: &CandidateRef,
     ) -> Result<frost::round1::SigningCommitments, Self::Error>;
+
+    /// Build the UNSIGNED candidate PCZT for this payment, under the coordinator-supplied
+    /// rerandomizer `alpha` (its canonical 32-byte encoding, derived from the round-1
+    /// commitments). The signer uses its OWN held viewing key and selects its OWN notes;
+    /// the coordinator supplies only the public effects (`params`) and `alpha`. Returns the
+    /// serialized, IO-finalized candidate bytes that round 2 then renders and signs. The
+    /// coordinator never sees the viewing key or chooses the note.
+    fn build_candidate(
+        &self,
+        session: &Session,
+        cand: &CandidateRef,
+        params: &PublicPaymentParams,
+        alpha: &[u8; 32],
+    ) -> Result<Vec<u8>, Self::Error>;
 
     /// Round 2 (rerandomized): BLOCKS on in-signer parse + render + approval + sighash
     /// binding. The signer independently parses `pczt`, renders it (WYSIWYS), requires an

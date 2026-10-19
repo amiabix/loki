@@ -116,6 +116,10 @@ pub struct LocalSigner<SE: SecureElement> {
     session: Option<Session>,
     /// Last rendered payment, keyed by candidate attempt id, for `rendered_payment`.
     rendered: BTreeMap<[u8; 32], PaymentView>,
+    /// This signer's own spendable vault notes (scanned member-side with its own fvk). The
+    /// proposer selects from these when it builds a candidate; the coordinator never sees
+    /// them. Empty until set by the signer's owner (`set_candidate_notes`).
+    candidate_notes: Vec<orchard::Note>,
 }
 
 impl<SE: SecureElement> LocalSigner<SE> {
@@ -156,6 +160,7 @@ impl<SE: SecureElement> LocalSigner<SE> {
             dkg: Dkg::Idle,
             session: None,
             rendered: BTreeMap::new(),
+            candidate_notes: Vec::new(),
         })
     }
 
@@ -230,6 +235,7 @@ impl<SE: SecureElement> LocalSigner<SE> {
             dkg: Dkg::Idle,
             session: None,
             rendered: BTreeMap::new(),
+            candidate_notes: Vec::new(),
         })
     }
 
@@ -282,12 +288,74 @@ impl<SE: SecureElement> LocalSigner<SE> {
             dkg: Dkg::Idle,
             session: None,
             rendered: BTreeMap::new(),
+            candidate_notes: Vec::new(),
         })
     }
 
     /// The group verifying (public) key package, once DKG has completed. Public.
     pub fn public_package_bytes(&self) -> Option<&[u8]> {
         self.public_package.as_deref()
+    }
+
+    /// Give this signer the vault notes it may spend. These are scanned member-side with
+    /// this signer's own fvk (`wallet_store::sync_member_wallet`); they never cross the
+    /// coordinator seam. The proposer signer selects from them in `build_candidate`.
+    pub fn set_candidate_notes(&mut self, notes: Vec<orchard::Note>) {
+        self.candidate_notes = notes;
+    }
+
+    /// Build the IO-finalized, unsigned single-note candidate under `params`, the signer's
+    /// OWN fvk, its OWN selected note, and the coordinator-supplied `alpha`. The `P` is the
+    /// signer's own network parameters — never supplied by the coordinator.
+    fn build_single_note_pczt<P: zcash_protocol::consensus::Parameters + Clone>(
+        &self,
+        params_net: &P,
+        params: &crate::signer::PublicPaymentParams,
+        alpha: &[u8; 32],
+    ) -> Result<Vec<u8>, SignerError> {
+        use crate::candidate::{alpha_from_canonical_bytes, build_candidate, quote_fee, CandidateInputs};
+        // ponytail: first-note selection; swap for real coin selection when multi-note lands.
+        let note = *self
+            .candidate_notes
+            .first()
+            .ok_or_else(|| SignerError::Other("signer holds no spendable note".into()))?;
+        let alpha = alpha_from_canonical_bytes(alpha)
+            .ok_or_else(|| SignerError::Other("noncanonical alpha".into()))?;
+
+        let mut inputs = CandidateInputs {
+            vault_fvk: &self.vault_fvk,
+            notes: vec![note],
+            recipient: params.recipient,
+            amount: params.amount,
+            memo: params.memo.clone(),
+            change: zcash_protocol::value::Zatoshis::ZERO,
+            target_height: params.target_height,
+            expiry_height: params.expiry_height,
+        };
+        let fee = u64::from(quote_fee(params_net, &inputs).map_err(SignerError::Other)?);
+        let spend = note.value().inner();
+        let amount = u64::from(params.amount);
+        let change = spend
+            .checked_sub(amount)
+            .and_then(|r| r.checked_sub(fee))
+            .ok_or_else(|| SignerError::Other("note does not cover amount + fee".into()))?;
+        inputs.change = zcash_protocol::value::Zatoshis::from_u64(change)
+            .map_err(|e| SignerError::Other(format!("{e:?}")))?;
+        let built = build_candidate(
+            params_net,
+            &inputs,
+            &[alpha],
+            rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng),
+        )
+        .map_err(SignerError::Other)?;
+        let candidate = pczt::roles::creator::Creator::build_from_parts(built.pczt_parts)
+            .ok_or_else(|| SignerError::Other("build_from_parts returned None".into()))?;
+        let candidate = pczt::roles::io_finalizer::IoFinalizer::new(candidate)
+            .finalize_io()
+            .map_err(|e| SignerError::Other(format!("io finalize: {e:?}")))?;
+        candidate
+            .serialize()
+            .map_err(|e| SignerError::Other(format!("serialize: {e:?}")))
     }
 
     /// Unseal the member's `KeyPackage` into memory. Caller drops it promptly.
@@ -482,6 +550,26 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
             Dkg::Aborted => Err(SignerError::Other(
                 "DKG aborted after an earlier error".into(),
             )),
+        }
+    }
+
+    fn build_candidate(
+        &self,
+        session: &Session,
+        _cand: &CandidateRef,
+        params: &crate::signer::PublicPaymentParams,
+        alpha: &[u8; 32],
+    ) -> Result<Vec<u8>, Self::Error> {
+        if self.session.as_ref() != Some(session) {
+            return Err(SignerError::NoSession);
+        }
+        // Build under the signer's OWN network parameters: the coordinator supplied neither
+        // the fvk nor a `Parameters` instance.
+        match self.network {
+            Network::Regtest => self.build_single_note_pczt(&crate::candidate::Regtest, params, alpha),
+            Network::Testnet => {
+                self.build_single_note_pczt(&zcash_protocol::consensus::TEST_NETWORK, params, alpha)
+            }
         }
     }
 

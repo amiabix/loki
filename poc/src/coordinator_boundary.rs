@@ -78,6 +78,52 @@ mod tests {
         }
     }
 
+    /// Viewing-key-less coordinator path (vk-less rework acceptance).
+    ///
+    /// The coordinator drive loop (`signer::coordination`) must build a candidate by ASKING
+    /// a signer, never by holding a viewing key or selecting a note. So its shipped code must
+    /// name no `FullViewingKey` / viewing-key type and must not call the note-building
+    /// surface directly. Tests (below `#[cfg(test)]`) legitimately know the fvk to assert on
+    /// the result, so they are stripped first — only live coordinator code counts.
+    #[test]
+    fn coordinator_drive_loop_is_viewing_key_less() {
+        let src = std::fs::read_to_string(Path::new("src/signer/coordination.rs"))
+            .or_else(|_| std::fs::read_to_string("poc/src/signer/coordination.rs"))
+            .or_else(|_| {
+                std::fs::read_to_string(
+                    Path::new(file!())
+                        .parent()
+                        .unwrap()
+                        .join("signer/coordination.rs"),
+                )
+            })
+            .expect("read coordination.rs");
+        let shipped = src.split("#[cfg(test)]").next().unwrap_or("");
+        let code: String = shipped
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // A viewing key or direct note-build on the coordinator path would mean the
+        // coordinator is back to holding the fvk and selecting notes.
+        let forbidden = [
+            "FullViewingKey",   // the vault viewing key — must live only in the signer
+            "IncomingViewingKey",
+            "OutgoingViewingKey",
+            "CandidateInputs",  // coordinator never assembles builder inputs itself
+            "quote_fee",        // nor quotes a fee from a note it does not hold
+            "intent.note",      // no note on the intent
+            "vault_fvk",        // no viewing-key field anywhere on the coordinator path
+        ];
+        for needle in forbidden {
+            assert!(
+                !code.contains(needle),
+                "coordinator drive loop must be viewing-key-less: found `{needle}`"
+            );
+        }
+    }
+
     /// The runtime keyless assertion compiles and runs over an empty signer set: the public
     /// surface is the only thing reachable through the seam.
     #[test]
@@ -105,6 +151,15 @@ mod tests {
                 _: &[Vec<u8>],
             ) -> Result<Vec<Vec<u8>>, ()> {
                 Ok(vec![])
+            }
+            fn build_candidate(
+                &self,
+                _: &Session,
+                _: &crate::signer::CandidateRef,
+                _: &crate::signer::PublicPaymentParams,
+                _: &[u8; 32],
+            ) -> Result<Vec<u8>, ()> {
+                Err(())
             }
             fn sign_commit(
                 &mut self,
