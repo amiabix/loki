@@ -49,6 +49,27 @@ async function run() {
       assert.equal(await page.locator('#show-address').isVisible(), true);
       assert.equal(await page.locator('#payment-unavailable').isHidden(), true);
       assert.equal(await page.locator('#relay-setup').isHidden(), true);
+      // Recovery words are a secret: leaving the vault or locking must clear them from the DOM.
+      const recoveryForms = ['restore-vault', 'check-backup', 'make-final-backup', 'check-final-backup'];
+      const seedRecoveryWords = () => page.evaluate(ids => {
+        for (const id of ids) document.querySelector(`#${id} [name=words]`).value = 'private recovery words';
+        document.getElementById('words').textContent = 'private recovery words';
+      }, recoveryForms);
+      await seedRecoveryWords();
+      await page.locator('#back').click();
+      for (const id of recoveryForms) {
+        assert.equal(await page.locator(`#${id} [name=words]`).inputValue(), '');
+      }
+      assert.equal(await page.locator('#words').textContent(), '');
+      await page.locator('.vault-row').filter({hasText: 'Hosted Treasury'}).click();
+      await page.waitForFunction(() => !document.getElementById('active').hidden);
+      await seedRecoveryWords();
+      await page.locator('#lock').click();
+      await page.waitForFunction(() => !document.querySelector('#restore-vault [name=words]').value);
+      for (const id of recoveryForms) {
+        assert.equal(await page.locator(`#${id} [name=words]`).inputValue(), '');
+      }
+      assert.equal(await page.locator('#words').textContent(), '');
       await page.reload();
       await page.waitForFunction(() => !document.getElementById('active').hidden);
       assert.deepEqual(errors, []);
