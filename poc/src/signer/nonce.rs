@@ -36,6 +36,11 @@ pub enum NonceError {
     /// The same nonce id was asked to sign a DIFFERENT message than it burned for.
     /// FROST security breaks on nonce reuse; this is never recoverable.
     Reuse,
+    /// A nonce committed under an earlier backup/nonce epoch was presented after a
+    /// restore bumped the epoch (ws1-signer §8: "restore resets to a fresh nonce
+    /// epoch and must not replay an old one"). Never recoverable — the member must
+    /// re-commit under the current epoch.
+    StaleEpoch,
     Io(String),
     Other(String),
 }
@@ -44,6 +49,10 @@ impl std::fmt::Display for NonceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             NonceError::Reuse => write!(f, "HARD REFUSE: nonce reuse for a different message"),
+            NonceError::StaleEpoch => write!(
+                f,
+                "HARD REFUSE: nonce from a pre-restore epoch (replay across restore)"
+            ),
             NonceError::Io(e) => write!(f, "nonce io: {e}"),
             NonceError::Other(e) => write!(f, "{e}"),
         }
@@ -58,8 +67,15 @@ impl From<io::Error> for NonceError {
 
 /// A crash-safe store for one signing attempt's single-use nonces, under `dir`.
 /// The secret nonce is sealed by the secure element exactly like the share at rest.
+///
+/// `epoch` is the current backup/nonce epoch. Every nonce is stamped with it when
+/// committed (into the sealed blob's `backup_epoch`). A restore reconstructs the store
+/// at a HIGHER epoch (see [`NonceStore::open_at_epoch`]); any nonce stamped with an
+/// older epoch is hard-refused, so a nonce committed before the restore can never be
+/// replayed afterwards (ws1-signer §8).
 pub struct NonceStore {
     dir: PathBuf,
+    epoch: u64,
 }
 
 /// fsync a freshly written file via a temp + atomic hardlink, then fsync the directory.
@@ -85,10 +101,19 @@ fn write_durable(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
 }
 
 impl NonceStore {
+    /// Open at epoch 0 (a store that was never restored).
     pub fn open(dir: &Path) -> io::Result<Self> {
+        Self::open_at_epoch(dir, 0)
+    }
+
+    /// Open at an explicit epoch. A restore bumps the share's `backup_epoch` and opens the
+    /// (fresh) nonce dir at that same epoch, so nonces stamped with any lower epoch are
+    /// refused by [`NonceStore::sign_and_burn`].
+    pub fn open_at_epoch(dir: &Path, epoch: u64) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
         Ok(Self {
             dir: dir.to_path_buf(),
+            epoch,
         })
     }
 
@@ -120,8 +145,9 @@ impl NonceStore {
         let serialized = nonces
             .serialize()
             .map_err(|e| NonceError::Other(e.to_string()))?;
-        // Seal the secret nonce with the same at-rest hierarchy as the share.
-        let sealed = SealedShare::seal(se, 0, &serialized).map_err(NonceError::Other)?;
+        // Seal the secret nonce with the same at-rest hierarchy as the share, STAMPED with
+        // the current epoch so a restore (which bumps the epoch) refuses this nonce.
+        let sealed = SealedShare::seal(se, self.epoch, &serialized).map_err(NonceError::Other)?;
         write_durable(&self.dir, &format!("{id}.nonce"), &sealed.to_bytes())?;
         Ok(commitment)
     }
@@ -133,6 +159,12 @@ impl NonceStore {
     ) -> Result<(frost::round1::SigningNonces, frost::round1::SigningCommitments), NonceError> {
         let raw = fs::read(self.nonce_path(id))?;
         let sealed = SealedShare::from_bytes(&raw).map_err(NonceError::Other)?;
+        // A nonce stamped with an older epoch than this store survived across a restore
+        // (the dir is normally fresh after restore, but a leftover/rolled-back file must
+        // still be refused, not signed with). ws1-signer §8.
+        if sealed.backup_epoch != self.epoch {
+            return Err(NonceError::StaleEpoch);
+        }
         let plain = sealed.open(se).map_err(NonceError::Other)?;
         let nonces = frost::round1::SigningNonces::deserialize(&plain)
             .map_err(|e| NonceError::Other(e.to_string()))?;
