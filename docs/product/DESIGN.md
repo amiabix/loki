@@ -11,6 +11,22 @@ a **keyless coordinator** (this UI — only public data) and an **isolated signe
 (holds the share, approves on-device). The signer-approval screen is the hero and
 is the UI expression of invariant 3 and §5.4, "what you see is what you sign."
 
+## How to view
+
+Serve it (fonts resolve cleanly, clipboard works):
+
+```sh
+poc/wallet/design/serve.sh        # defaults to port 8080
+# then open http://localhost:8080/design/
+```
+
+Or just open `poc/wallet/design/index.html` directly (`file://`) — it still runs;
+fonts fall back to the system stack if the browser blocks local font fetches.
+
+Every screen is reachable from the sidebar journey nav and by URL hash, e.g.
+`…/design/#approve` opens the signer hero directly. Pass a port as the first arg
+to `serve.sh` if 8080 is taken.
+
 ## Design direction
 
 Clean and modern, Safe/Linear-inspired, privacy-forward, **dark-mode-first** with a

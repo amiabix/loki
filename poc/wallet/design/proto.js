@@ -43,10 +43,63 @@ function buildNav() {
 
 function theme(mode) {
   const root = document.documentElement;
-  if (mode) root.setAttribute("data-theme", mode);
+  if (mode === "system" || mode == null) {
+    root.removeAttribute("data-theme");
+    try { localStorage.removeItem("loki-theme"); } catch (e) {}
+  } else {
+    root.setAttribute("data-theme", mode);
+    try { localStorage.setItem("loki-theme", mode); } catch (e) {}
+  }
+  const cur = root.getAttribute("data-theme") || "system";
   document.querySelectorAll(".seg [data-theme-btn]").forEach((b) => {
-    b.setAttribute("aria-pressed", String(b.dataset.themeBtn === (root.getAttribute("data-theme") || "system")));
+    b.setAttribute("aria-pressed", String(b.dataset.themeBtn === cur));
   });
+}
+
+/* General t-of-n picker: live preview + one invite row per non-creator slot. */
+function wireTofN() {
+  const tSel = document.getElementById("t-sel");
+  const nSel = document.getElementById("n-sel");
+  const preview = document.getElementById("ton-preview");
+  const invites = document.getElementById("invite-list");
+  if (!tSel || !nSel || !preview || !invites) return;
+
+  const MIN = 2, MAX = 9;
+  const codes = ["bd71…9f02", "4a0c…7731", "e22d…1c48", "90fa…55ab", "1c7e…a3d5",
+                 "77b0…e14f", "3ad9…0c82", "c5f1…6b90"];
+
+  for (let v = MIN; v <= MAX; v++) {
+    nSel.appendChild(new Option(String(v), v, false, v === 5));
+  }
+
+  function fillT(n, keep) {
+    const want = keep != null ? keep : Math.min(parseInt(tSel.value || "3", 10), n);
+    tSel.innerHTML = "";
+    for (let v = MIN; v <= n; v++) tSel.appendChild(new Option(String(v), v));
+    tSel.value = String(Math.min(Math.max(want, MIN), n));
+  }
+
+  function render() {
+    const n = parseInt(nSel.value, 10);
+    const t = parseInt(tSel.value, 10);
+    preview.innerHTML =
+      `This vault needs <strong>${t} of ${n}</strong> members to approve any payment. ` +
+      `Any ${t} eligible members can complete a proposal.`;
+    invites.innerHTML =
+      `<div class="row-between card" style="background:var(--surface-2);padding:var(--sp-3)">` +
+      `<span class="mono">You · slot 1</span><span class="pill pill-ok"><span class="dot"></span> You</span></div>`;
+    for (let slot = 2; slot <= n; slot++) {
+      invites.insertAdjacentHTML("beforeend",
+        `<div class="row-between card" style="background:var(--surface-2);padding:var(--sp-3)">` +
+        `<span class="mono">loki/invite · ${codes[slot - 2]}</span>` +
+        `<button class="btn btn-quiet" data-copy="loki/invite:${codes[slot - 2]}">Copy</button></div>`);
+    }
+  }
+
+  nSel.addEventListener("change", () => { fillT(parseInt(nSel.value, 10)); render(); });
+  tSel.addEventListener("change", render);
+  fillT(5, 3);
+  render();
 }
 
 /* tiny demo interactions, each guarded so a missing element is a no-op */
@@ -123,18 +176,38 @@ function wireDemos() {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
+  // restore a saved theme before first paint of the toggle state
+  let saved = null;
+  try { saved = localStorage.getItem("loki-theme"); } catch (e) {}
+  if (saved) document.documentElement.setAttribute("data-theme", saved);
+
   buildNav();
   wireDemos();
+  wireTofN();
+
   document.querySelectorAll("[data-theme-btn]").forEach((b) =>
-    b.addEventListener("click", () => theme(b.dataset.themeBtn === "system" ? null : b.dataset.themeBtn)));
-  // remove explicit attr for system
-  document.querySelector('[data-theme-btn="system"]')?.addEventListener("click", () => document.documentElement.removeAttribute("data-theme"));
-  // cross-screen links
+    b.addEventListener("click", () => theme(b.dataset.themeBtn)));
+
+  // cross-screen links + copy buttons (clipboard degrades to a label flash on file://)
   document.body.addEventListener("click", (e) => {
     const go = e.target.closest("[data-nav]");
-    if (go) { e.preventDefault(); show(go.dataset.nav); }
+    if (go) { e.preventDefault(); show(go.dataset.nav); return; }
+    const cp = e.target.closest("[data-copy]");
+    if (cp) {
+      const prev = cp.textContent;
+      navigator.clipboard?.writeText(cp.dataset.copy).catch(() => {});
+      cp.textContent = "Copied";
+      setTimeout(() => { cp.textContent = prev; }, 1100);
+    }
   });
-  theme(document.documentElement.getAttribute("data-theme"));
+
+  theme(saved || "system");
   const start = location.hash.slice(1);
   show(screens.some(([id]) => id === start) ? start : "connect");
+});
+
+// deep-link: respond to back/forward and manual hash edits
+window.addEventListener("hashchange", () => {
+  const id = location.hash.slice(1);
+  if (screens.some(([s]) => s === id)) show(id);
 });
