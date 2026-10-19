@@ -22,7 +22,6 @@ use loki_poc::wallet_store::{sync_member_wallet, Lightwalletd};
 use orchard::keys::Scope;
 use reddsa_frost::frost::redpallas as frost;
 use zcash_client_backend::proto::service::{BlockId, Empty, RawTransaction};
-use zcash_primitives::transaction::TxId;
 use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::memo::MemoBytes;
 use zcash_protocol::value::Zatoshis;
@@ -32,53 +31,7 @@ const AMOUNT: u64 = 2_000_000;
 
 /// Copied verbatim from `loki_member_payment::prove` (lines 932-979): apply anchor +
 /// witnesses, re-check the sighash is unchanged, prove, finalize, extract.
-fn prove(
-    signed: pczt::Pczt,
-    sighash: [u8; 32],
-    witnesses: Vec<(usize, orchard::tree::MerklePath)>,
-    anchor: [u8; 32],
-) -> Result<(Vec<u8>, TxId), String> {
-    use pczt::roles::{
-        prover::Prover, signer::Signer as PcztSigner, spend_finalizer::SpendFinalizer,
-        tx_extractor::TransactionExtractor, updater::Updater,
-    };
-    let updated = Updater::new(signed)
-        .set_ironwood_anchor(
-            orchard::Anchor::from_bytes(anchor)
-                .into_option()
-                .ok_or("invalid chain anchor")?,
-        )
-        .map_err(|e| format!("anchor: {e:?}"))?
-        .set_ironwood_spend_witnesses(witnesses)
-        .map_err(|e| format!("witness: {e:?}"))?
-        .finish();
-    if PcztSigner::new(updated.clone())
-        .map_err(|e| format!("sighash: {e:?}"))?
-        .shielded_sighash()
-        != sighash
-    {
-        return Err("anchor or witnesses changed the approved transaction effects".into());
-    }
-    let pk =
-        orchard::circuit::ProvingKey::build(orchard::circuit::OrchardCircuitVersion::PostNu6_3);
-    let proved = Prover::new(updated)
-        .create_ironwood_proof(&pk)
-        .map_err(|e| format!("proof: {e:?}"))?
-        .finish();
-    let finalized = SpendFinalizer::new(proved)
-        .finalize_spends()
-        .map_err(|e| format!("spend finalizer: {e:?}"))?;
-    let vk =
-        orchard::circuit::VerifyingKey::build(orchard::circuit::OrchardCircuitVersion::PostNu6_3);
-    let tx = TransactionExtractor::new(finalized)
-        .with_orchard(&vk)
-        .extract()
-        .map_err(|e| format!("extract transaction: {e:?}"))?;
-    let mut raw = Vec::new();
-    tx.write(&mut raw)
-        .map_err(|e| format!("serialize transaction: {e}"))?;
-    Ok((raw, tx.txid()))
-}
+use loki_poc::tx_finalize::prove;
 
 /// Build a signer holding this member's real vault share, sealed in a software SE.
 fn signer_for(

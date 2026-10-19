@@ -47,6 +47,7 @@ pub mod signer;
 pub mod signing_session;
 pub mod state;
 pub mod transport;
+pub mod tx_finalize;
 pub mod vault;
 pub mod verify;
 pub mod wallet_store;
