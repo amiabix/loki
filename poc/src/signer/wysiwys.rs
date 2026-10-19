@@ -152,7 +152,7 @@ pub fn sighash_of_pczt(pczt_bytes: &[u8], vault_fvk: &FullViewingKey) -> Result<
     let mut err: Option<String> = None;
     let checked = Verifier::new(parsed)
         .with_ironwood::<String, _>(|bundle| {
-            let mut run = || -> Result<(), String> {
+            let run = || -> Result<(), String> {
                 for (i, action) in bundle.actions().iter().enumerate() {
                     action
                         .verify_cv_net()
