@@ -14,6 +14,7 @@
 //!   4. only then produce the rerandomized round-2 share under the single-use nonce rules.
 
 use crate::distributed_setup::{Completed, Member, Round2Member};
+use crate::setup_ceremony::AcceptedCeremonyRoster;
 use crate::setup_transport::{Identity, PublicIdentity};
 use crate::signer::nonce::NonceStore;
 use crate::signer::secure_element::{SealedShare, SecureElement};
@@ -21,7 +22,7 @@ use crate::signer::wysiwys::{self, PaymentView};
 use crate::signer::{CandidateRef, Connection, MemberIdentity, Network, Session, Signer, VaultRef};
 use orchard::keys::FullViewingKey;
 use reddsa_frost::frost::redpallas as frost;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use zeroize::Zeroize;
 
@@ -158,8 +159,7 @@ impl<SE: SecureElement> LocalSigner<SE> {
         })
     }
 
-    /// Construct a signer with NO share yet, after this device has approved the exact
-    /// public DKG roster out of band. The coordinator must not choose these keys.
+    /// Construct a signer with NO share yet from the member's accepted setup roster.
     #[allow(clippy::too_many_arguments)]
     pub fn for_dkg(
         member_id: u16,
@@ -170,32 +170,21 @@ impl<SE: SecureElement> LocalSigner<SE> {
         network: Network,
         se: SE,
         identity: Identity,
-        approved_roster: Vec<PublicIdentity>,
+        accepted: &AcceptedCeremonyRoster,
         vault_fvk: FullViewingKey,
         nonce_dir: PathBuf,
         approval: ApprovalPolicy,
     ) -> Result<Self, SignerError> {
-        let roster: BTreeMap<_, _> = approved_roster
-            .iter()
-            .cloned()
-            .map(|peer| (peer.id, peer))
-            .collect();
-        if roster.len() != usize::from(members)
-            || approved_roster.len() != roster.len()
-            || roster.keys().copied().collect::<Vec<_>>() != (1..=members).collect::<Vec<_>>()
-            || roster.get(&member_id) != Some(&identity.public())
-            || roster
-                .values()
-                .map(|peer| peer.signing)
-                .collect::<BTreeSet<_>>()
-                .len()
-                != roster.len()
-            || roster
-                .values()
-                .map(|peer| peer.encryption)
-                .collect::<BTreeSet<_>>()
-                .len()
-                != roster.len()
+        let approved = accepted.roster();
+        if approved.vault != vault_id
+            || approved.threshold != threshold
+            || approved.members.len() != usize::from(members)
+            || approved.network.label()
+                != match network {
+                    Network::Regtest => "regtest",
+                    Network::Testnet => "testnet",
+                }
+            || approved.members.get(&member_id) != Some(&identity.public())
         {
             return Err(SignerError::Other(
                 "DKG roster is not this member's approved roster".into(),
@@ -215,7 +204,7 @@ impl<SE: SecureElement> LocalSigner<SE> {
             nonces: NonceStore::open(&nonce_dir).map_err(|e| SignerError::Other(e.to_string()))?,
             approval,
             dkg_identity: Some(identity),
-            approved_roster: roster,
+            approved_roster: approved.members.clone(),
             dkg: Dkg::Idle,
             session: None,
             rendered: BTreeMap::new(),
@@ -512,6 +501,7 @@ mod tests {
     use crate::candidate::{
         alpha_from_canonical_bytes, build_candidate, quote_fee, CandidateInputs, Regtest,
     };
+    use crate::member_state::Roster;
     use crate::signer::secure_element::SoftwareSecureElement;
     use crate::zip2005;
     use orchard::keys::Scope;
@@ -778,12 +768,64 @@ mod tests {
         );
     }
 
+    fn accepted_roster(
+        identities: &[Identity],
+        own: &Identity,
+        vault: [u8; 32],
+    ) -> AcceptedCeremonyRoster {
+        let members: Vec<_> = identities
+            .iter()
+            .map(|identity| {
+                let peer = identity.public();
+                serde_json::json!({"id": peer.id, "signing": hex::encode(peer.signing), "encryption": hex::encode(peer.encryption)})
+            })
+            .collect();
+        let document = serde_json::to_vec(
+            &serde_json::json!({"vault": hex::encode(vault), "threshold": 2, "members": members}),
+        )
+        .unwrap();
+        let roster = Roster::from_bytes(&document).unwrap();
+        let payload =
+            AcceptedCeremonyRoster::agreement_payload(&roster, "regtest", &[77u8; 32]).unwrap();
+        let votes = identities
+            .iter()
+            .map(|identity| {
+                (
+                    identity.public().id,
+                    identity.sign_setup_agreement(&vault, &payload).unwrap(),
+                )
+            })
+            .collect();
+        AcceptedCeremonyRoster::verify(roster, "regtest", [77u8; 32], own, &votes).unwrap()
+    }
+
     // (b) dkg_step runs the real dealerless DKG, the share is born+sealed inside the
     //     signer, and the signer can then sign a candidate for the group key.
     #[test]
+    fn dkg_signer_rejects_roster_for_a_different_vault() {
+        let identities: Vec<_> = (1..=3).map(Identity::new).collect();
+        let accepted = accepted_roster(&identities, &identities[0], [1u8; 32]);
+        let signer = LocalSigner::for_dkg(
+            1,
+            2,
+            3,
+            [2u8; 32],
+            "dkg vault".into(),
+            Network::Regtest,
+            SoftwareSecureElement::generate(),
+            identities.into_iter().next().unwrap(),
+            &accepted,
+            placeholder_fvk(),
+            tempdir("dkg-wrong-vault"),
+            Box::new(|_| true),
+        );
+        assert!(signer.is_err());
+    }
+
+    #[test]
     fn rejected_dkg_input_cannot_silently_restart_the_ceremony() {
         let identities: Vec<_> = (1..=3).map(Identity::new).collect();
-        let roster = identities.iter().map(Identity::public).collect();
+        let accepted = accepted_roster(&identities, &identities[0], [1u8; 32]);
         let mut signer = LocalSigner::for_dkg(
             1,
             2,
@@ -793,7 +835,7 @@ mod tests {
             Network::Regtest,
             SoftwareSecureElement::generate(),
             identities.into_iter().next().unwrap(),
-            roster,
+            &accepted,
             placeholder_fvk(),
             tempdir("dkg-abort"),
             Box::new(|_| true),
@@ -818,9 +860,14 @@ mod tests {
         let identities: Vec<Identity> = (1..=3u16).map(Identity::new).collect();
         let roster: Vec<PublicIdentity> = identities.iter().map(Identity::public).collect();
         let vault_id = [1u8; 32];
+        let accepted: Vec<_> = identities
+            .iter()
+            .map(|own| accepted_roster(&identities, own, vault_id))
+            .collect();
         let mut signers: Vec<LocalSigner<SoftwareSecureElement>> = (1..=3u16)
             .zip(identities)
-            .map(|(id, identity)| {
+            .zip(accepted)
+            .map(|((id, identity), accepted)| {
                 LocalSigner::for_dkg(
                     id,
                     2,
@@ -830,7 +877,7 @@ mod tests {
                     Network::Regtest,
                     SoftwareSecureElement::generate(),
                     identity,
-                    roster.clone(),
+                    &accepted,
                     placeholder_fvk(),
                     tempdir(&format!("dkg-m{id}")),
                     Box::new(|_v| true),

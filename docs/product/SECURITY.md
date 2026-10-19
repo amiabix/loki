@@ -49,7 +49,7 @@ round-two boundary required a fix: it previously returned plaintext share packag
 | #4 Only public data crosses the boundary | **Partial** | The coordinator receives encrypted DKG shares and a viewing key. The viewing key does not authorize spends, but reveals wallet activity and needs a separate privacy review. |
 | #5 Audited crypto only | **Yes** | FROST math is `frost-rerandomized`/`reddsa`; `nonce.rs` calls the audited signer, no bespoke threshold code. |
 | Nonce single-use + crash-safety | **Yes (in `nonce.rs`)** | Persist-before-emit (round 1), atomic burn-before-nonce-removal with fsync (round 2), reuse-for-different-message hard-refused. Tests `crash_after_burn_leaves_no_stranded_or_duplicated_nonce` and `reuse_for_a_different_message_is_hard_refused` (`nonce.rs`). |
-| Share born in the signer (DKG) | **Partially** | `dkg_step` seals the resulting share and encrypts each outbound round-two package inside the signer. The regression test rejects plaintext packages and checks recipient isolation. Roster approval, backup/restore, and epoch reset still need work. |
+| Share born in the signer (DKG) | **Partially** | `dkg_step` seals the resulting share and encrypts each outbound round-two package inside the signer. The signer now requires a signed `AcceptedCeremonyRoster` and checks its vault, policy, network, and own identity. Human roster review, backup/restore, and epoch reset still need work. |
 
 The signer rejects a signing package whose message differs from its recomputed
 transaction hash. The simulated approval callback and unreviewed coordinator loop
@@ -77,10 +77,11 @@ limit what this demo establishes about a malicious coordinator.
   exercised end-to-end from a test. The guard is defensive but **unproven against a real
   adversarial PCZT**. Dangerous: a fee/value substitution path could exist that the test
   suite cannot currently reach.
-- **DKG roster approval is assumed.** `for_dkg` accepts a roster from its caller and
-  checks its shape and own identity. A trusted signer-side workflow must bind every
-  peer key to the intended person before DKG; if a malicious coordinator can choose
-  those keys, it can decrypt shares addressed to its own keys.
+- **Human DKG roster review is not proven.** `for_dkg` now requires the signed
+  `AcceptedCeremonyRoster` and rejects mismatched vault or signer metadata. The
+  setup agreement proves the listed keys voted; a trusted signer-side workflow must
+  still show the fingerprint and bind each peer key to its intended person. A member
+  who approves attacker-controlled peer keys can send decryptable shares to them.
 - **DKG: no backup/restore, no epoch reset proven.** `dkg_step` generates and seals the
   share, but this round does not demonstrate backup, restore-to-new-device, or the
   nonce-epoch reset on restore that `ws1-signer.md` §8 requires. A real custody flow must
