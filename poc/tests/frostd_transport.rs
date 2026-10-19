@@ -19,8 +19,12 @@
 //!
 //! The test asserts invariant 4 directly: it records every raw byte string `frostd`
 //! carried and proves none of them is a secret — not a DKG secret package, not a FROST
-//! share / `KeyPackage`, not a signing nonce, and (the regression) not a decodable
-//! round-2 package. Only public FROST artifacts and sealed ciphertext cross.
+//! share / `KeyPackage`, not a signing nonce, not a plaintext round-2 package — and (the
+//! regression) that every sealed round-2 blob on the wire is opaque ciphertext that does
+//! NOT decode as a round-2 package. Only public FROST artifacts and sealed ciphertext
+//! cross. (The check is scoped to the round-2 blobs, not every wire byte: a round-2
+//! package and a public `SignatureShare` share the same `Header`+scalar wire shape, so a
+//! blanket "nothing decodes as round2" would false-positive on the public signature share.)
 //!
 //! Requires a running frostd. Set `FROSTD_URL` (e.g. `http://127.0.0.1:2744`). If unset
 //! the test prints how to start one and returns, so `cargo test` stays green offline.
@@ -187,6 +191,11 @@ fn two_of_three_dkg_and_sign_over_real_frostd() {
     // X25519 encryption key before handing it to the relay. round2::Package is SECRET;
     // only sealed ciphertext ever crosses frostd. ----
     let mut r2_secret = BTreeMap::new();
+    // The plaintext round-2 packages (SECRET) and the exact sealed blobs we hand the relay,
+    // captured so the invariant-4 audit below can prove: no plaintext round-2 package ever
+    // crosses, and every sealed round-2 blob is opaque ciphertext (does not decode).
+    let mut r2_plaintext: Vec<Vec<u8>> = Vec::new();
+    let mut r2_sealed: Vec<Vec<u8>> = Vec::new();
     for (idx, id) in ids.iter().enumerate() {
         let sp = r1_secret.remove(id).unwrap();
         let (sp2, pkgs) = frost::keys::dkg::part2(sp, &r1_received[id]).expect("dkg part2");
@@ -197,6 +206,8 @@ fn two_of_three_dkg_and_sign_over_real_frostd() {
                 .identity
                 .seal_round2(&roster[&loki_id(&rcpt)], &vault, &plaintext)
                 .expect("seal round2");
+            r2_plaintext.push(plaintext);
+            r2_sealed.push(sealed.clone());
             send_taped(&m_tx[idx], &m_ch[idx], &[peer_of[&rcpt].clone()], &sealed, &tape);
         }
     }
@@ -330,23 +341,34 @@ fn two_of_three_dkg_and_sign_over_real_frostd() {
             secret_blobs.push(n.serialize().expect("ser nonce"));
         }
     }
+    // A plaintext DKG round-2 package is a recipient's share contribution: a threshold of
+    // them reconstructs the vault key, so it is secret too.
+    secret_blobs.extend(r2_plaintext.iter().cloned());
     for carried in tape.iter() {
         for secret in &secret_blobs {
             assert!(
                 carried != secret,
-                "a secret (share / key package / dkg r2 secret / nonce) crossed the relay — invariant 4 violated"
+                "a secret (share / key package / dkg r2 secret / nonce / plaintext round-2 package) crossed the relay — invariant 4 violated"
             );
         }
-        // Regression: NO byte string on the wire may decode as a round-2 package. Every
-        // round-2 is sealed ciphertext; a relay observer cannot deserialize any of them.
+    }
+    // Regression (relay_observer_cannot_recover_round2, live): every round-2 blob that
+    // crossed the relay is sealed ciphertext — none decodes as a round-2 package, so a
+    // relay observer collecting them cannot reconstruct the vault key. The blanket
+    // "no wire byte decodes as round2" check cannot be used here: a round-2 package and a
+    // public `SignatureShare` share the same wire shape (`Header` + one 32-byte scalar in
+    // frost-core 3.0.0), so a legitimately-public signature share also deserializes as a
+    // round-2 package. The security property is about the round-2 payloads specifically.
+    for sealed in &r2_sealed {
         assert!(
-            frost::keys::dkg::round2::Package::deserialize(carried).is_err(),
-            "a plaintext DKG round-2 package crossed the relay — the vault key is leakable"
+            frost::keys::dkg::round2::Package::deserialize(sealed).is_err(),
+            "a sealed round-2 blob decoded as a plaintext round-2 package — the vault key is leakable"
         );
     }
     eprintln!(
-        "[WS3] audited {} relayed payloads; none is a secret and none decodes as a round-2 package (invariant 4 holds)",
-        tape.len()
+        "[WS3] audited {} relayed payloads; no secret crossed and all {} round-2 blobs are opaque ciphertext (invariant 4 holds)",
+        tape.len(),
+        r2_sealed.len()
     );
 }
 
