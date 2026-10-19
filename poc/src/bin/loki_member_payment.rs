@@ -1076,7 +1076,7 @@ fn finish(args: &[String], broadcast: bool) -> Result<(), String> {
             (wallet, height, frontier, Some((runtime, client)))
         }
     };
-    let anchor = frontier.root().to_bytes();
+    let anchor = frontier.root(None).to_bytes();
     let witnesses = indices
         .iter()
         .copied()

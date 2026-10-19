@@ -105,7 +105,7 @@ impl std::fmt::Display for Refusal {
 ///
 /// An action's output rho is the nullifier of the note that action spends. Returns the
 /// reconstructed note, or a refusal naming the missing or inconsistent part.
-fn open_output(
+pub(crate) fn open_output(
     action: &orchard::pczt::Action,
     label: &str,
 ) -> Result<(Note, [u8; 43], u64), Refusal> {

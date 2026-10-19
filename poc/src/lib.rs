@@ -17,6 +17,7 @@
 pub mod candidate;
 #[cfg(test)]
 mod coordinator;
+pub mod coordinator_boundary;
 pub mod distributed_setup;
 pub mod intent;
 pub mod member_state;
@@ -26,6 +27,14 @@ mod nonce_binding;
 pub mod payment_manifest;
 pub mod randomizer;
 pub mod refresh;
+// RETIRING (WS3/WS4): Loki's bespoke relay stack — `relay_member`, `setup_relay`,
+// `member_service`, and their `setup_backup`/`setup_retry` helpers — is being replaced
+// by the audited ZF `frostd` relay via `transport::FrostdTransport` (ws3 §2, ws4 §4).
+// It is already behind the off-by-default `relay-communication` feature and kept only so
+// the old flow still compiles during migration; the product build routes DKG + signing
+// messages through `transport` instead. The thin roster/admission layer (`setup_ceremony`,
+// invitations, the `VaultCertificate`) stays — that is what frostd does NOT provide
+// (ws3 §4). Do not add new callers of the modules below.
 #[cfg(feature = "relay-communication")]
 pub mod relay_member;
 pub mod rpc;
@@ -34,8 +43,10 @@ pub mod scanstate;
 pub mod seal_kdf;
 pub mod setup_transport;
 pub mod setup_ceremony;
+pub mod signer;
 pub mod signing_session;
 pub mod state;
+pub mod transport;
 pub mod vault;
 pub mod verify;
 pub mod wallet_store;

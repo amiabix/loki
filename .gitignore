@@ -31,3 +31,5 @@ __pycache__/
 
 /docs/superpowers/
 /docs/**/*.md
+!/docs/product/
+!/docs/product/**/*.md

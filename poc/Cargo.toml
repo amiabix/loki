@@ -51,6 +51,14 @@ async-trait = "0.1"
 tonic = { version = "0.14.6", features = ["transport", "tls-webpki-roots"] }
 rustls = { version = "0.23", features = ["aws_lc_rs"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
+# WS3 frostd transport: speak the audited relay's JSON-over-HTTP contract directly
+# (the 8 endpoints in `frostd/src/lib.rs`). xeddsa signs the login challenge exactly as
+# frostd verifies it. reqwest/uuid are already in the graph transitively; named here so
+# the transport module can use them as direct deps.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+serde = { version = "1", features = ["derive"] }
+xeddsa = "1"
 zcash_note_encryption = "0.4.2"
 # Only for the forbidden-pool tamper fixtures: these build a transparent / Sapling
 # PCZT component directly through the public `pczt::parse` constructors, which is the
