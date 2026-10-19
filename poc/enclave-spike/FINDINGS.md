@@ -41,3 +41,7 @@ your own device. No paid ($99/yr) membership is needed for local Enclave develop
   add `.biometryCurrentSet` to the access control for the Face/Touch-ID gate on
   `unwrap_dek`, and swap `AppleSecureElement` in behind the trait in
   `poc/src/signer/secure_element.rs` (plus the Rust FFI build path for the main crate).
+
+The proper `AppleSecureElement` backend (real trait impl + C-ABI + offline round-trip) now
+lives alongside this spike — see **`BACKEND.md`**. The persistent/biometric code and both
+remaining gates (signing cert, crates.io/vendored crate build) are documented there.

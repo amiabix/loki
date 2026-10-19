@@ -14,7 +14,18 @@ swiftc -emit-library -o libse_bridge.dylib se_bridge.swift -framework Security -
 rustc --edition 2021 ffi_demo.rs -L "$PWD" -lse_bridge -C link-arg=-Wl,-rpath,"$PWD" -o /tmp/ffi_demo_bin
 /tmp/ffi_demo_bin
 
-echo "== 3. persistent-key spike (REQUIRES a signing identity) =="
+echo "== 3. real AppleSecureElement backend FFI round-trip (ephemeral; rustc, offline) =="
+echo "   Builds the SHIPPED module poc/src/signer/secure_element_apple.rs against the"
+echo "   Swift C-ABI backend and round-trips a signer DEK through the Secure Enclave."
+swiftc -emit-library -o libse_backend.dylib \
+    -Xlinker -install_name -Xlinker "@rpath/libse_backend.dylib" \
+    se_backend.swift -framework Security -framework Foundation
+rustc --edition 2021 --crate-type rlib zeroize_shim.rs -o libzeroize.rlib
+rustc --edition 2021 apple_ffi_verify.rs --extern zeroize=libzeroize.rlib \
+    -L "$PWD" -lse_backend -C link-arg=-Wl,-rpath,"$PWD" -o /tmp/apple_ffi_verify
+/tmp/apple_ffi_verify
+
+echo "== 4. persistent-key spike (REQUIRES a signing identity) =="
 echo "   Unsigned this fails with errSecMissingEntitlement (-34018)."
 echo "   With a free Apple ID personal team in Xcode, sign the built binary with that"
 echo "   identity (codesign -s 'Apple Development: <you>' ...) and it passes."
