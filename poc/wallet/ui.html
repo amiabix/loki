@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Loki — wired signer UI</title>
+  <link rel="stylesheet" href="/ui/tokens.css">
+  <link rel="stylesheet" href="/ui/app.css">
+  <script src="/ui.js" defer></script>
+</head>
+<body>
+<div class="netstrip" aria-hidden="true"></div>
+<div class="app" id="app">
+
+  <aside class="rail">
+    <div class="brand"><span class="glyph">◇</span> Loki</div>
+    <span class="testnet-badge">Wired to member_app</span>
+    <p class="rail-label">First functional slice</p>
+    <nav class="nav" aria-label="Screens"></nav>
+    <div class="rail-foot">
+      <p class="toolbar-note">Real signer routes. Share never enters this page; approval releases it only for the exact reviewed package.</p>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <span class="testnet-badge">LOCAL</span>
+      <span class="pill"><span class="dot"></span> Signer link via URL token</span>
+      <span class="spacer"></span>
+      <button class="btn btn-quiet" data-go-screen="connect">Reconnect</button>
+    </header>
+
+    <!-- 01 Connect -->
+    <section class="stage screen" data-screen="connect">
+      <div class="screen-head">
+        <p class="kicker">01 · Connect</p>
+        <h1 class="screen-title read">Connect your Loki signer</h1>
+        <p class="screen-sub">This page holds no keys. It proves the local token by reading your profile status from the real command host.</p>
+      </div>
+      <div class="card card-pad-lg stack">
+        <p class="muted">Opens <span class="mono">/api/status</span> on the member command host using the token in this page's URL.</p>
+        <button class="btn btn-primary btn-lg btn-block" id="connect-go">Connect →</button>
+        <p id="connect-out" class="callout hidden"></p>
+      </div>
+    </section>
+
+    <!-- 02 Vaults -->
+    <section class="stage screen hidden" data-screen="vaults">
+      <div class="screen-head row-between wrap">
+        <div>
+          <p class="kicker">02 · Dashboard</p>
+          <h1 class="screen-title read">Your vaults</h1>
+          <p class="screen-sub">Live from <span class="mono">/api/status</span>. Only vaults this signer is a member of.</p>
+        </div>
+        <div class="row">
+          <button class="btn btn-primary" data-go-screen="create">Create vault</button>
+        </div>
+      </div>
+      <div class="stack" id="vault-list">Loading…</div>
+    </section>
+
+    <!-- 03 Create vault -->
+    <section class="stage screen hidden" data-screen="create">
+      <div class="screen-head">
+        <p class="kicker">03 · Create</p>
+        <h1 class="screen-title read">Create a vault</h1>
+        <p class="screen-sub">General t-of-n via <span class="mono">/api/create</span>. Roster and threshold become immutable once setup begins.</p>
+      </div>
+      <div class="card stack">
+        <label class="field"><span class="lbl">Vault name</span><input id="create-name" value="Ops Float" maxlength="80"></label>
+        <div class="grid grid-2" style="gap:var(--sp-3)">
+          <label class="field"><span class="lbl">Threshold (t)</span><select id="t-sel"></select><small>Members needed to approve.</small></label>
+          <label class="field"><span class="lbl">Members (n)</span><select id="n-sel"></select><small>Total roster size.</small></label>
+        </div>
+        <div class="callout callout-accent"><span class="ico">◇</span><span id="ton-preview"></span></div>
+        <button class="btn btn-primary btn-lg btn-block" id="create-go">Create &amp; generate invites →</button>
+        <p id="create-out" class="callout hidden"></p>
+      </div>
+    </section>
+
+    <!-- 04 Propose payment -->
+    <section class="stage screen hidden" data-screen="propose">
+      <div class="screen-head">
+        <p class="kicker">04 · Propose</p>
+        <h1 class="screen-title read">Propose a payment</h1>
+        <p class="screen-sub">One intent via <span class="mono">/api/payment-draft</span> + <span class="mono">payment-publish</span>. Any eligible quorum can approve it.</p>
+      </div>
+      <div class="card stack">
+        <label class="field"><span class="lbl">Vault</span><select id="propose-vault"></select></label>
+        <label class="field"><span class="lbl">Recipient unified address</span><input id="propose-recipient" placeholder="utest1…"></label>
+        <label class="field"><span class="lbl">Amount (ZEC)</span><input id="propose-amount" value="0.5" inputmode="decimal"><small>Up to 8 decimals.</small></label>
+        <label class="field"><span class="lbl">Memo</span><textarea id="propose-memo">vendor invoice #214</textarea></label>
+        <button class="btn btn-primary btn-lg btn-block" id="propose-go">Create proposal →</button>
+        <p id="propose-out" class="callout hidden"></p>
+      </div>
+    </section>
+
+    <!-- 05 Signer approval (WYSIWYS) -->
+    <section class="screen hidden" data-screen="approve">
+      <div class="hero-sign">
+        <div class="hero-top">
+          <div class="brand"><span class="glyph">◇</span> Loki signer</div>
+          <span class="testnet-badge">WYSIWYS</span>
+          <button class="btn btn-quiet" data-go-screen="propose">Close</button>
+        </div>
+        <div class="hero-body">
+          <div class="hero-eyebrow">
+            <span class="parsed-tag">◉ Parsed from the transaction</span>
+            <h2>This is exactly what you are signing</h2>
+            <p class="wysiwys-note">Rendered from <span class="mono">/api/payment-review</span> — the coordinator cannot change these fields.</p>
+          </div>
+          <button class="btn btn-ghost" id="approve-load">Load the pending payment →</button>
+          <p id="approve-out" class="callout hidden"></p>
+          <div id="approve-body" class="hidden stack">
+            <div class="sign-amount"><span class="big" id="sign-amount">—</span> <small>ZEC</small></div>
+            <div class="sign-card kv">
+              <div class="kv-row"><span class="kv-key">To</span><span class="kv-val" id="sign-to"></span></div>
+              <div class="kv-row"><span class="kv-key">Fee</span><span class="kv-val" id="sign-fee"></span></div>
+              <div class="kv-row"><span class="kv-key">Change</span><span class="kv-val" id="sign-change"></span></div>
+              <div class="kv-row"><span class="kv-key">Memo</span><span class="kv-val read" id="sign-memo"></span></div>
+              <div class="kv-row"><span class="kv-key">Expires</span><span class="kv-val" id="sign-expiry"></span></div>
+            </div>
+            <div class="callout callout-warn"><span class="ico">⚠</span><span>If any field looks wrong, refuse. Your share is released only for this exact, checked package.</span></div>
+          </div>
+        </div>
+        <div class="hero-actions">
+          <button class="btn btn-danger btn-lg" id="do-refuse" style="flex:1">Refuse</button>
+          <button class="btn btn-primary btn-lg" id="do-approve" style="flex:2">Approve →</button>
+        </div>
+      </div>
+    </section>
+
+  </div>
+</div>
+</body>
+</html>
