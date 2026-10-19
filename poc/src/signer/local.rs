@@ -141,6 +141,47 @@ impl<SE: SecureElement> LocalSigner<SE> {
         })
     }
 
+    /// Reconstruct a signer from a verified backup on a FRESH data root
+    /// ([`crate::signer::backup::restore`]). The share is re-sealed under this device's
+    /// `se`; `nonces` is a nonce store already opened at the bumped epoch, so any nonce
+    /// committed before the restore is hard-refused (ws1-signer §8). `epoch` is carried so
+    /// subsequent `sign_commit`s stamp the fresh epoch too.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_restored(
+        member_id: u16,
+        threshold: u16,
+        members: u16,
+        vault_id: [u8; 32],
+        label: String,
+        network: Network,
+        se: SE,
+        key_package_bytes: &[u8],
+        public_package_bytes: Vec<u8>,
+        vault_fvk: FullViewingKey,
+        epoch: u64,
+        nonces: NonceStore,
+        approval: ApprovalPolicy,
+    ) -> Result<Self, SignerError> {
+        let sealed = SealedShare::seal(&se, epoch, key_package_bytes).map_err(SignerError::Other)?;
+        Ok(Self {
+            member_id,
+            threshold,
+            members,
+            vault_id,
+            label,
+            network,
+            se,
+            sealed_share: Some(sealed),
+            public_package: Some(public_package_bytes),
+            vault_fvk,
+            nonces,
+            approval,
+            dkg: Dkg::Idle,
+            session: None,
+            rendered: BTreeMap::new(),
+        })
+    }
+
     /// Construct a signer with NO share yet; it is born via [`Signer::dkg_step`].
     #[allow(clippy::too_many_arguments)]
     pub fn for_dkg(
@@ -410,7 +451,7 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::candidate::{
         alpha_from_canonical_bytes, build_candidate, quote_fee, CandidateInputs, Regtest,
@@ -443,7 +484,7 @@ mod tests {
     /// Returns (pczt_bytes, signing_package, seed) where the package's message is the real
     /// sighash of the bytes.
     #[allow(clippy::type_complexity)]
-    fn candidate_and_package(
+    pub(crate) fn candidate_and_package(
         fvk: &FullViewingKey,
         key: &frost::keys::KeyPackage,
         public: &frost::keys::PublicKeyPackage,
