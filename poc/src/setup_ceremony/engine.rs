@@ -308,6 +308,7 @@ impl SetupCeremony {
         engine.validate_snapshot()?;
         Ok(engine)
     }
+    #[cfg(any(feature = "relay-communication", test))]
     pub(crate) fn saved_phase(
         member_root: &Path,
         passphrase: &str,
@@ -326,6 +327,7 @@ impl SetupCeremony {
             Snapshot::decode(&journal.latest().ok_or(ERROR)?.payload)?.phase,
         ))
     }
+    #[cfg(any(feature = "relay-communication", test))]
     pub(crate) fn abort_saved_checkpoint(
         member_root: &Path,
         passphrase: &str,
@@ -1000,6 +1002,7 @@ impl SetupCeremony {
             .map_err(|_| ERROR)?;
         Ok(vault::unified_address(&key, self.accepted.roster().network.network_type()))
     }
+    #[cfg(feature = "relay-communication")]
     pub(crate) fn certified_group_key(&self) -> Result<[u8; 32], String> {
         let mut certified = self.certified()?;
         let _secret = Zeroizing::new(std::mem::take(&mut certified.key_package));
@@ -1158,6 +1161,7 @@ impl SetupCeremony {
             Ok(prepared)
         })
     }
+    #[cfg(feature = "relay-communication")]
     pub(crate) fn begin_activation<F>(
         &mut self,
         outgoing: &BTreeMap<u16, Vec<u8>>,
@@ -1208,6 +1212,7 @@ impl SetupCeremony {
             Ok(bytes)
         })
     }
+    #[cfg(feature = "relay-communication")]
     pub(crate) fn activation_marker(&self) -> Result<[u8; 32], String> {
         self.backup_receipts()?;
         self.backup_body()
