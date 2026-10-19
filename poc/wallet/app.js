@@ -41,6 +41,8 @@ function selectVault(vault) {
   $('address').textContent = 'Open this vault to view the address.';
   $('balance').textContent = "Scan this device's chain view to see the balance.";
   $('words').textContent = '';
+  for (const id of ['profile-create', 'unlock', 'join', 'restore-vault', 'check-backup',
+                    'make-final-backup', 'check-final-backup', 'link-account']) $(id).reset();
   $('backup-made').hidden = true;
   $('download-final').hidden = true;
   $('draft-result').hidden = true;
