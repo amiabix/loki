@@ -494,11 +494,16 @@ fn three_signer_attempt_binds_the_exact_sorted_set() {
     let wire = alice.seal_session(&bob.public(), &context, MessageKind::Commitment, b"three-signers").unwrap();
     assert_eq!(wire[8], 2);
     assert_eq!(bob.open_session(&alice.public(), &context, &wire).unwrap().body(), b"three-signers");
-    for signers in [vec![1], vec![1, 2, 2], vec![1, 4, 2], vec![1, 2, 5]] {
+    // Empty, zero-id, duplicate, and unsorted sets are still refused; a general t-of-n
+    // set with a larger id (e.g. member 5) is now accepted.
+    for signers in [vec![], vec![0, 1], vec![1, 2, 2], vec![1, 4, 2]] {
         let mut changed = context.clone();
         changed.signers = signers;
         assert!(changed.validate().is_err());
     }
+    let mut larger = context.clone();
+    larger.signers = vec![1, 2, 5];
+    larger.validate().unwrap();
     let mut changed = context.clone();
     changed.signers = vec![1, 2, 3];
     assert!(bob.open_session(&alice.public(), &changed, &wire).is_err());
