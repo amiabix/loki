@@ -1,0 +1,41 @@
+name: Checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Reject committed member secrets
+        run: |
+          if git ls-files | grep -E '(^|/)(passphrase|[^/]+\.passphrase|profile\.sealed|vault\.card|wallet\.sqlite(-wal|-shm|-journal)?|\.unlock-[^/]*)$'; then
+            echo 'Member secrets must not be committed.' >&2
+            exit 1
+          fi
+      - name: Check secret ignore patterns
+        run: |
+          for candidate in member/passphrase member/operator.passphrase member/profile/profile.sealed member/card/vault.card member/wallet.sqlite member/wallet.sqlite-wal member/wallet.sqlite-shm member/wallet.sqlite-journal member/.unlock-test; do
+            git check-ignore -q --no-index "$candidate"
+          done
+          for candidate in communication/client/tests/fixtures/hosted-tls/server-key.pem poc/tests/zip2005_keys.rs poc/wallet/test_member_app.py poc/wallet/fonts/geist.woff2; do
+            ! git check-ignore -q --no-index "$candidate"
+          done
+      - name: Test member app
+        working-directory: poc/wallet
+        run: python3 -m unittest -q test_member_app test_signer_session test_member_service test_wired_ui
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal
+      - name: Test Rust library
+        working-directory: poc
+        run: cargo +1.95.0 test --locked --lib

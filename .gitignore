@@ -21,6 +21,15 @@ loki-state/
 # Separate-member setup stores and operator passphrase files.
 **/secrets/
 *.passphrase
+# Member app state can live under any chosen data directory.
+passphrase
+profile.sealed
+vault.card
+wallet.sqlite
+wallet.sqlite-wal
+wallet.sqlite-shm
+wallet.sqlite-journal
+.unlock-*
 
 # Python
 __pycache__/
