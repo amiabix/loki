@@ -7,12 +7,43 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
 
 use serde_json::Value;
 use zeroize::Zeroizing;
+
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn mark_interrupted(_: libc::c_int) {
+    INTERRUPTED.store(true, Ordering::Relaxed);
+}
+
+fn install_interrupt_handlers() -> Result<(), String> {
+    // SAFETY: The handler only stores to an atomic flag. Caught dispositions are
+    // reset to default when the native child commands exec.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = mark_interrupted as *const () as libc::sighandler_t;
+        if libc::sigemptyset(&mut action.sa_mask) != 0
+            || libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut()) != 0
+            || libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut()) != 0
+        {
+            return Err(io::Error::last_os_error().to_string());
+        }
+    }
+    Ok(())
+}
+
+fn check_interrupted() -> Result<(), String> {
+    if INTERRUPTED.load(Ordering::Relaxed) {
+        Err("recovery interrupted".into())
+    } else {
+        Ok(())
+    }
+}
 
 struct EchoGuard(Option<libc::termios>);
 
@@ -57,22 +88,60 @@ fn input(prompt: &str, hidden: bool) -> Result<Zeroizing<String>, String> {
     } else {
         None
     };
-    let mut line = Zeroizing::new(String::new());
-    let count = io::stdin()
-        .lock()
-        .take(4097)
-        .read_line(&mut line)
-        .map_err(|e| e.to_string())?;
-    if count == 0 {
-        return Err("recovery input ended".into());
-    }
-    if count > 4096 {
-        return Err("recovery input is too long".into());
+    let mut bytes = Zeroizing::new(Vec::new());
+    loop {
+        check_interrupted()?;
+        let mut ready = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `ready` is valid writable pollfd storage for one descriptor.
+        let polled = unsafe { libc::poll(&mut ready, 1, 100) };
+        if polled < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(io::Error::last_os_error().to_string());
+        }
+        if polled == 0 {
+            continue;
+        }
+        let mut byte = 0u8;
+        // SAFETY: `byte` is valid writable storage for a one-byte stdin read.
+        let read = unsafe {
+            libc::read(
+                libc::STDIN_FILENO,
+                &mut byte as *mut u8 as *mut libc::c_void,
+                1,
+            )
+        };
+        if read < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(io::Error::last_os_error().to_string());
+        }
+        if read == 0 {
+            return Err("recovery input ended".into());
+        }
+        if bytes.len() >= 4096 {
+            return Err("recovery input is too long".into());
+        }
+        bytes.push(byte);
+        if byte == b'\n' {
+            break;
+        }
     }
     drop(echo);
     if hidden {
         println!();
     }
+    let mut line = Zeroizing::new(
+        std::str::from_utf8(&bytes)
+            .map_err(|_| "recovery input is not UTF-8")?
+            .to_owned(),
+    );
     while line.ends_with(['\r', '\n']) {
         line.pop();
     }
@@ -177,6 +246,13 @@ fn output(mut child: Child, timeout: Duration, action: &str) -> Result<String, S
     });
     let started = std::time::Instant::now();
     let status = loop {
+        if let Err(error) = check_interrupted() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = out_reader.join();
+            let _ = err_reader.join();
+            return Err(error);
+        }
         let status = match child.try_wait() {
             Ok(status) => status,
             Err(error) => {
@@ -429,6 +505,7 @@ fn sign(payment: &Path, member: &Member, work: &Path, payment_id: &str) -> Resul
 fn wait_signer(signer: &mut Signer) -> Result<(), String> {
     let started = std::time::Instant::now();
     loop {
+        check_interrupted()?;
         if let Some(status) = signer.child.try_wait().map_err(|e| e.to_string())? {
             if status.success() {
                 return Ok(());
@@ -451,6 +528,25 @@ fn wait_signer(signer: &mut Signer) -> Result<(), String> {
             return Err(format!("Member {} signing timed out", signer.slot));
         }
         thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn signer_review(signer: &Signer) -> Result<String, String> {
+    let started = std::time::Instant::now();
+    loop {
+        check_interrupted()?;
+        match signer.review.recv_timeout(Duration::from_millis(100)) {
+            Ok(review) => return review,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("Signer review channel closed".into())
+            }
+            Err(mpsc::RecvTimeoutError::Timeout)
+                if started.elapsed() >= Duration::from_secs(300) =>
+            {
+                return Err("Signer review timed out".into());
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
     }
 }
 
@@ -530,10 +626,7 @@ fn sweep(setup: &Path, payment: &Path) -> Result<(), String> {
         .map(|member| sign(payment, member, &work, payment_id))
         .collect::<Result<_, _>>()?;
     for signer in &signers {
-        let review = signer
-            .review
-            .recv_timeout(Duration::from_secs(300))
-            .map_err(|_| "Signer review timed out")??;
+        let review = signer_review(signer)?;
         println!(
             "\nMember {}, check this verified transaction:\n{review}",
             signer.slot
@@ -587,6 +680,10 @@ fn sweep(setup: &Path, payment: &Path) -> Result<(), String> {
 }
 
 fn main() {
+    if let Err(error) = install_interrupt_handlers() {
+        eprintln!("Recovery stopped: cannot install interrupt handlers: {error}");
+        std::process::exit(1);
+    }
     let args: Vec<_> = std::env::args().skip(1).collect();
     if !args.is_empty() && !(args.len() == 2 && args[0] == "--rpc") {
         eprintln!("usage: loki_recover [--rpc host:port]");

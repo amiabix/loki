@@ -2,9 +2,11 @@
 
 import json
 import os
+import signal
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -44,6 +46,8 @@ elif action == "prepare-sweep":
         "amount_zat": 99000000, "fee_zat": 1000000, "change_zat": 0}))
     print("prepared")
 elif action == "sign":
+    if os.environ.get("LOKI_TEST_SIGNER_PID_DIR"):
+        (pathlib.Path(os.environ["LOKI_TEST_SIGNER_PID_DIR"]) / str(os.getpid())).write_text("signer")
     print("Vault: " + json.loads(pathlib.Path(args[2]).read_text())["vault"])
     recipient = json.loads((pathlib.Path(args[3]) / "payment.json").read_text())["recipient"]
     if recipient == "uregtest-long-review":
@@ -158,6 +162,41 @@ class NativeRecoveryCliTest(unittest.TestCase):
         result = self.run_recovery(recipient="uregtest-long-review")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("review exceeded", result.stderr)
+
+    def assert_interrupt_reaps_signers(self, sent_signal):
+        artifacts = self.artifacts()
+        answers = [value for card, words, passphrase in artifacts
+                   for value in (str(card), words, passphrase)] + ["uregtest-new-vault"]
+        process = subprocess.Popen([str(self.root / "loki_recover")], stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                   env={**os.environ, "LOKI_TEST_NATIVE_RECOVERY": "1",
+                                        "LOKI_TEST_SIGNER_PID_DIR": str(self.root), "TMPDIR": str(self.root)})
+        try:
+            process.stdin.write("\n".join(answers) + "\n")
+            process.stdin.flush()
+            deadline = time.monotonic() + 5
+            while len(list(self.root.glob("[0-9]*"))) != 2 and time.monotonic() < deadline:
+                time.sleep(0.05)
+            pids = [int(path.name) for path in self.root.glob("[0-9]*")]
+            self.assertEqual(len(pids), 2, "both signer children must be waiting for approval")
+            process.send_signal(sent_signal)
+            stdout, stderr = process.communicate(timeout=5)
+            self.assertNotEqual(process.returncode, 0)
+            self.assertIn("recovery interrupted", stderr)
+            self.assertFalse(list(self.root.glob("loki-recovery-*")), "private recovery store remained")
+            for pid in pids:
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=5)
+
+    def test_sigint_during_approval_reaps_signers_and_removes_temp_store(self):
+        self.assert_interrupt_reaps_signers(signal.SIGINT)
+
+    def test_sigterm_during_approval_reaps_signers_and_removes_temp_store(self):
+        self.assert_interrupt_reaps_signers(signal.SIGTERM)
 
 
 if __name__ == "__main__":
