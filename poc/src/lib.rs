@@ -20,6 +20,8 @@ mod coordinator;
 pub mod coordinator_boundary;
 pub mod distributed_setup;
 pub mod dkg_core;
+#[cfg(all(feature = "apple-enclave", target_os = "macos"))]
+pub mod enclave_ffi;
 pub mod intent;
 pub mod member_state;
 pub mod network;

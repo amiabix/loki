@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+# `staticlib` so the native signer app (poc/signer-app) can link the Rust signer and call
+# its C-ABI (src/enclave_ffi.rs). `lib` keeps the normal crate/tests working.
+[lib]
+crate-type = ["lib", "staticlib"]
+
 # One Zakura family serves transaction construction, proving, scanning and FROST.
 [dependencies]
 orchard            = { package = "zakura-orchard", version = "=2.2.0" }
@@ -71,6 +76,8 @@ ciborium-io        = "0.2"
 # Compile probes that reproduce the two blocked checkpoint-1 requirements.
 # Each FAILS TO COMPILE on purpose; the compiler error is the blocker report.
 probe-zip2005 = []
+# Apple Secure Enclave backend (macOS only): build.rs links enclave-spike/se_backend.swift.
+apple-enclave = []
 setup-fault-injection = ["relay-communication"]
 relay-communication = ["dep:loki-relay-client", "dep:loki-relay-protocol"]
 # Counts Argon2id derivations and prints `kdf_derivations=N` to stderr at exit.

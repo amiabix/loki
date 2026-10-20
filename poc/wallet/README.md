@@ -14,16 +14,23 @@ python3 wallet/member_app.py --network regtest \
 # wired UI: http://127.0.0.1:8801/ui#<token>   ← same token, redesign look
 ```
 
-Five screens are wired to real commands: connect (`/api/status`), vault list
-(`/api/status`), create vault (`/api/create`, general t-of-n), propose payment
-(`/api/payment-draft` + `payment-publish`), and signer approval / WYSIWYS
-(`/api/payment-review` → `payment-approve`). The page serves `design/tokens.css`
-and `design/app.css` at `/ui/tokens.css` and `/ui/app.css`; fonts resolve to the
-app's existing `/fonts/*`. The share never enters the page — approval releases
-it only for the exact reviewed package. `index.html`/`app.js` are untouched.
+Eight screens are wired to real commands: connect (`/api/status`), vault list
+(`/api/status`), create vault (`/api/create`, general t-of-n), setup & backup
+(`/api/status` steps + roster short-code + confirmations, then `/api/agree`,
+`/api/backup`, `/api/verify`, `/api/activate`), vault overview (`/api/status`
+roster/members, `/api/balance`, `/api/address`, `/api/payments`), propose payment
+(`/api/payment-draft` + `payment-publish`), signer approval / WYSIWYS
+(`/api/payment-review` → `payment-approve`), and history (`/api/payments`, status
+pills Preparing → approved → broadcast → confirmed, with the reorg recheck shown).
+No new endpoints were added — every screen reads routes the app already exposes.
+The page serves `design/tokens.css` and `design/app.css` at `/ui/tokens.css` and
+`/ui/app.css`; fonts resolve to the app's existing `/fonts/*`. The share never
+enters the page — approval releases it only for the exact reviewed package.
+`index.html`/`app.js` are untouched.
 
-Acceptance tests (no native binaries, mock/regtest data) prove the vault-list
-and create-vault screens hit real routes end to end:
+Acceptance tests (no native binaries, mock/regtest data) prove the vault-list,
+create-vault, setup-status, overview-balance and history screens hit real routes
+end to end (served 200 with the shape each screen reads, 403 without the token):
 
 ```sh
 cd poc/wallet

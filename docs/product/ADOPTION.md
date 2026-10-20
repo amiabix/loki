@@ -2,9 +2,9 @@
 
 Parent: `00-architecture.md` (invariant 5, audited crypto only). Resolves the WS4
 Mode-A/B decision gate and the WS5 recoverable-vs-not determination. Every claim below
-is backed by code read on omarchy and a passing test; see `poc/tests/zf_spine.rs`.
+is backed by code read on the build host and a passing test; see `poc/tests/zf_spine.rs`.
 
-Evidence snapshot (omarchy, 2026-10-18):
+Evidence snapshot (the build host, 2026-10-18):
 - `ZcashFoundation/frost-tools` @ `53df99c` (contains `frost-client`, `frostd`, `zcash-sign`)
 - `ZcashFoundation/frost` @ `0966bd1` (issue #1094 repo)
 - orchard fork used by `zcash-sign`: `conradoplg/orchard` rev `42015f1` (v0.15.5, `unstable-frost`)
@@ -133,7 +133,7 @@ two paths are not interchangeable.
   pursue ZF `frost#1094` review with the matched vectors (WS6). Revisit Option B only if
   `zcash-sign generate` moves to a deterministic `use_qsk` derivation upstream.
 
-## 4. Verification run (omarchy, cargo 1.98.0)
+## 4. Verification run (the build host, cargo 1.98.0)
 
 `cargo test --locked --test zf_spine --test zip2005_keys -- --nocapture`:
 
@@ -162,7 +162,7 @@ bins). The one-line fix is `root(None)`; it is unrelated to this workstream and 
 for the owner of that bin. The ZF tests above were run with the lib + the two test
 targets.
 
-## 5. WS3 transport — `frostd` adopted (omarchy, 2026-10-18)
+## 5. WS3 transport — `frostd` adopted (the build host, 2026-10-18)
 
 **Decision:** route the public protocol messages through the audited ZF `frostd` relay;
 the bespoke Loki relay stack is marked for retirement.

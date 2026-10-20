@@ -112,3 +112,21 @@ impl SecureElement for AppleSecureElement {
         Ok(dek)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Exercises the REAL Secure Enclave through the FFI (ephemeral key — no signing
+    // identity / keychain needed, so it runs in a bare test binary). Persistence +
+    // biometrics need the provisioned app context (see poc/signer-app/).
+    #[test]
+    fn apple_enclave_wraps_and_unwraps_a_dek() {
+        let se = AppleSecureElement::ephemeral().expect("open ephemeral Secure Enclave");
+        let dek = [7u8; 32];
+        let wrapped = se.wrap_dek(&dek).expect("wrap_dek via the Enclave");
+        assert!(wrapped.0.len() > 32, "ECIES ciphertext is larger than the DEK");
+        let back = se.unwrap_dek(&wrapped).expect("unwrap_dek via the Enclave");
+        assert_eq!(&*back, &dek, "DEK round-trips through the Secure Enclave");
+    }
+}

@@ -130,7 +130,7 @@ RUSTFLAGS="--remap-path-prefix=$HOME=/build -C codegen-units=1" \
 sha256sum target/release/loki_member_payment
 ```
 
-**Verification (two clean builds, omarchy, rustc 1.98.0):**
+**Verification (two clean builds, the build host, rustc 1.98.0):**
 ```
 b6e63b82c6a00cc4e4aabf604287148ffb7c199976cdb318406c5bc01c700a5d  target/release/loki_member_payment
 b6e63b82c6a00cc4e4aabf604287148ffb7c199976cdb318406c5bc01c700a5d  target/release/loki_member_payment

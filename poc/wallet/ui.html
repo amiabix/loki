@@ -130,6 +130,101 @@
       </div>
     </section>
 
+    <!-- 06 Setup & backup -->
+    <section class="stage screen hidden" data-screen="setup">
+      <div class="screen-head row-between wrap">
+        <div>
+          <p class="kicker">06 · Setup &amp; backup</p>
+          <h1 class="screen-title read">Set up the vault</h1>
+          <p class="screen-sub">Resumable — each app advances the ceremony from <span class="mono">/api/status</span>. The address stays hidden until every member confirms a matching roster and backup.</p>
+        </div>
+        <div class="row">
+          <select id="setup-vault" class="field" style="min-width:220px"></select>
+        </div>
+      </div>
+      <div class="grid" style="grid-template-columns:260px 1fr">
+        <div class="card"><div class="steps" id="setup-steps">Loading…</div></div>
+        <div class="stack">
+          <div class="card stack">
+            <h3>Compare the short code</h3>
+            <p class="muted">Every member's app shows this fingerprint. Confirm it matches out of band, then confirm to start key creation.</p>
+            <div class="codeblocks" id="setup-code"></div>
+            <div class="kv" id="setup-confirms"></div>
+            <button class="btn btn-primary btn-block" id="setup-agree">Confirm roster &amp; create keys →</button>
+            <p id="setup-agree-out" class="callout hidden"></p>
+          </div>
+          <div class="card stack">
+            <h3>Back up your share</h3>
+            <div class="grid grid-2" style="gap:var(--sp-3)">
+              <div class="card" style="background:var(--surface-2)">
+                <p class="kicker" style="color:var(--dim)">Recovery card</p>
+                <button class="btn btn-ghost" id="setup-backup" style="margin-top:var(--sp-3)">Reveal 24 words</button>
+                <p class="mono faint" id="setup-words" style="margin-top:var(--sp-2);word-break:break-word"></p>
+              </div>
+              <div class="card" style="background:var(--surface-2)">
+                <p class="kicker" style="color:var(--dim)">Prove restore</p>
+                <label class="field"><span class="lbl">Re-enter your 24 words</span><textarea id="setup-verify-words" placeholder="forest amber tide …"></textarea></label>
+                <button class="btn btn-ghost" id="setup-verify" style="margin-top:var(--sp-2)">Prove restore &amp; confirm backup</button>
+              </div>
+            </div>
+            <div class="callout callout-warn"><span class="ico">⚠</span><span>You must prove you can restore from your words and card before this vault activates. A mismatch stops setup and never publishes an address.</span></div>
+            <p id="setup-backup-out" class="callout hidden"></p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 07 Vault overview -->
+    <section class="stage screen hidden" data-screen="overview">
+      <div class="screen-head row-between wrap">
+        <div>
+          <p class="kicker">07 · Overview</p>
+          <h1 class="screen-title read" id="ov-name">Vault</h1>
+          <p class="screen-sub" id="ov-policy">Balance at a named chain height from this device's own scan.</p>
+        </div>
+        <select id="overview-vault" class="field" style="min-width:220px"></select>
+      </div>
+      <div class="grid grid-3">
+        <div class="card stat"><span class="l" id="ov-height">Balance</span><span class="n" id="ov-balance">—</span><span class="muted" id="ov-synced"></span></div>
+        <div class="card stat"><span class="l">Pending</span><span class="n" id="ov-pending">—</span><span class="muted">awaiting approvals</span></div>
+        <div class="card stat"><span class="l">Members</span><span class="n" id="ov-members">—</span><span class="muted" id="ov-threshold"></span></div>
+      </div>
+      <div class="grid grid-2" style="margin-top:var(--sp-4)">
+        <div class="card stack">
+          <h3>Receive</h3>
+          <div class="stack-sm">
+            <p id="ov-addr-hidden" class="muted hidden">The address appears only after the vault is active and all backups are confirmed.</p>
+            <div id="ov-addr-shown" class="hidden stack-sm"><span class="pill pill-ok"><span class="dot"></span> Unified Address</span><div class="addr" id="ov-addr"></div></div>
+            <button class="btn btn-ghost" id="ov-reveal">Show receive address</button>
+          </div>
+        </div>
+        <div class="card stack">
+          <div class="row-between"><h3>Members</h3><span class="muted">roster locked</span></div>
+          <div class="kv" id="ov-roster"></div>
+        </div>
+      </div>
+      <div class="card stack" style="margin-top:var(--sp-4)">
+        <div class="row-between"><h3>Payments</h3><button class="btn btn-ghost" data-go-screen="history">Full history →</button></div>
+        <div class="kv" id="ov-payments">No payments yet.</div>
+      </div>
+    </section>
+
+    <!-- 08 History -->
+    <section class="stage screen hidden" data-screen="history">
+      <div class="screen-head row-between wrap">
+        <div>
+          <p class="kicker">08 · History</p>
+          <h1 class="screen-title read">Payment history</h1>
+          <p class="screen-sub">Every payment this device knows, from <span class="mono">/api/payments</span>. Preparing → approved → broadcast → confirmed; a reorg rolls a confirmed payment back to broadcast.</p>
+        </div>
+        <select id="history-vault" class="field" style="min-width:220px"></select>
+      </div>
+      <div class="card stack">
+        <div class="kv" id="history-list">Loading…</div>
+        <p id="history-out" class="callout hidden"></p>
+      </div>
+    </section>
+
   </div>
 </div>
 </body>
