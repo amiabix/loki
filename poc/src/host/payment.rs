@@ -666,7 +666,10 @@ fn sign(st: &Shared, data: &Path, pass: &str, p: &Payment, v: &Vault) -> Result<
     let mut owned = None;
     if p.proposer == v.slot {
         let (w, mut client, rt) = wallet(data, pass, &p.vault, v, url(st)?)?;
-        let height = w.scanned_height()?.ok_or("wallet has no scanned blocks")?;
+        // Build witnesses at the candidate's ANCHOR height (fixed at draft), not the current
+        // tip. The chain advances between draft and signing, and a witness at a later height
+        // would not root to the candidate's anchor (WitnessDoesNotRootToAnchor at prove time).
+        let height = p.target_height;
         let frontier = frontier(&w, &mut client, &rt, height)?;
         let selected = [hex32(&p.note_selection[0])?];
         let notes = w
@@ -721,8 +724,10 @@ fn frontier(
         .block_on(client.get_lightd_info(Empty {}))
         .map_err(|e| format!("lightwalletd info: {e}"))?
         .into_inner();
-    if info.block_height != u64::from(height) {
-        return Err("wallet scan is behind lightwalletd".into());
+    // `height` is the candidate anchor (may be below the tip once the chain advances); only
+    // fail if the node has not reached it yet. get_tree_state fetches the tree at that height.
+    if info.block_height < u64::from(height) {
+        return Err("lightwalletd is behind the payment anchor height".into());
     }
     let state = rt
         .block_on(client.get_tree_state(BlockId {
