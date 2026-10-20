@@ -354,20 +354,19 @@ fn prepare(args: &[String], sweep: bool) -> Result<(), String> {
     let mut file = options
         .open(&target)
         .map_err(|e| format!("{}: {e}", target.display()))?;
-    // Hold the inputs for this attempt so this member's next draft funds itself elsewhere.
-    // Only a saved manifest can release them later, so undo both if either step fails.
-    let owner = LockOwner::new(attempt.0);
-    let saved = wallet
-        .reserve_inputs(owner, &intent.input_nullifiers, expiry)
-        .and_then(|()| {
-            file.write_all(serde_json::to_string_pretty(&value).unwrap().as_bytes())
-                .and_then(|()| file.sync_all())
-                .map_err(|e| {
-                    let _ = wallet.release_inputs(owner, &intent.input_nullifiers);
-                    format!("{}: {e}", target.display())
-                })
-        });
-    if let Err(e) = saved {
+    // Make the recovery manifest durable before reserving inputs: a killed helper must
+    // never leave a reservation whose owner and nullifiers were lost.
+    if let Err(e) = file
+        .write_all(serde_json::to_string_pretty(&value).unwrap().as_bytes())
+        .and_then(|()| file.sync_all())
+        .and_then(|()| fs::File::open(work)?.sync_all())
+    {
+        let _ = fs::remove_file(&target);
+        return Err(format!("{}: {e}", target.display()));
+    }
+    if let Err(e) =
+        wallet.reserve_inputs(LockOwner::new(attempt.0), &intent.input_nullifiers, expiry)
+    {
         let _ = fs::remove_file(&target);
         return Err(e);
     }
@@ -379,6 +378,33 @@ fn prepare(args: &[String], sweep: bool) -> Result<(), String> {
         amount_zat,
         fee_zat,
         change_zat
+    );
+    Ok(())
+}
+
+fn cancel_draft(args: &[String]) -> Result<(), String> {
+    if args.len() != 4 {
+        return Err("cancel-draft <member-dir> <passphrase-file> <roster.json> <work-dir>".into());
+    }
+    let (member, owner, pass) = state(args)?;
+    let work = Path::new(&args[3]);
+    private_work(work)?;
+    let (context, intent) = manifest(&work.join("payment.json"), member.network)?;
+    check_manifest_roster(&member.roster, &context, &intent)?;
+    if intent.proposer != member.key.identifier().serialize() {
+        return Err("only this payment's proposer may release its draft reservation".into());
+    }
+    let mut wallet = VaultWallet::open_existing(
+        &owner.join("wallet.sqlite"),
+        member.network,
+        &member.fvk,
+        member.wallet_birth(),
+        &pass,
+    )?;
+    wallet.release_inputs(LockOwner::new(context.attempt.0), &intent.input_nullifiers)?;
+    println!(
+        "draft reservation released for payment {}",
+        hex::encode(context.payment)
     );
     Ok(())
 }
@@ -1445,6 +1471,7 @@ fn main() {
     let result = match args.get(1).map(String::as_str) {
         Some("prepare") => prepare(&args[2..], false),
         Some("prepare-sweep") => prepare(&args[2..], true),
+        Some("cancel-draft") => cancel_draft(&args[2..]),
         Some("local-wires") => local_wires(&args[2..]),
         Some("balance") => balance(&args[2..]),
         Some("tip") => tip(&args[2..]),

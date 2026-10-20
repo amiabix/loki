@@ -1462,7 +1462,20 @@ class Wallet:
                     "fee_zat": str(manifest["fee_zat"]), "change_zat": str(manifest["change_zat"]),
                     "expiry_height": manifest["expiry_height"], "signers": signers,
                     **({"pair": signers} if threshold == 2 else {})}
-        except Exception:
+        except Exception as error:
+            if (work / "payment.json").is_file():
+                try:
+                    self.command("cancel-draft", member_dir, "@pass", member_dir / "roster.json",
+                                 work, binary=PAYMENT, timeout=120)
+                except Exception as cleanup_error:
+                    recovery = member_dir / "payment-recovery"
+                    recovery.mkdir(mode=0o700, exist_ok=True)
+                    try:
+                        work = work.rename(recovery / work.name)
+                    except OSError:
+                        pass
+                    raise ValueError(f"Payment draft failed ({error}); reservation cleanup failed "
+                                     f"({cleanup_error}). Keep {work} for recovery.") from error
             shutil.rmtree(work)
             raise
 

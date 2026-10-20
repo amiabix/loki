@@ -622,6 +622,55 @@ class MemberWalletTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "does not belong"):
                 alice.prepare_payment(vault, "uregtest1recipient", "40000000", "test memo", "AB")
 
+    def test_failed_payment_draft_releases_reservation_before_removing_manifest(self):
+        with tempfile.TemporaryDirectory(prefix="loki-draft-cleanup-") as temp:
+            wallet, vault, _ = self.payment_fixture(temp)
+            calls = []
+            def command(action, _member, _pass, _roster, work, *_args, **_kwargs):
+                calls.append(action)
+                if action == "prepare":
+                    (work / "payment.json").write_text(json.dumps({
+                        "vault": vault, "payment": "c" * 64, "attempt": "d" * 64,
+                        "amount_zat": 1, "fee_zat": 10000, "change_zat": 0,
+                        "expiry_height": 9216, "version": 1, "pair": [1, 2]}))
+                elif action == "cancel-draft":
+                    self.assertTrue((work / "payment.json").is_file())
+                    raise ValueError("wallet database unavailable")
+                else:
+                    self.fail(f"unexpected native command {action}")
+                return "ok"
+
+            with patch.object(wallet, "command", side_effect=command):
+                with self.assertRaisesRegex(ValueError, "wallet database unavailable"):
+                    wallet.prepare_payment(vault, "uregtest1recipient", "40000000", "memo", "AB")
+            self.assertEqual(calls, ["prepare", "cancel-draft"])
+            member = wallet.data / "vaults" / vault
+            self.assertEqual(len(list((member / "payments").glob("payment-*/payment.json"))), 0)
+            self.assertEqual(len(list((member / "payment-recovery").glob("payment-*/payment.json"))), 1)
+
+    def test_failed_payment_draft_removes_manifest_after_reservation_release(self):
+        with tempfile.TemporaryDirectory(prefix="loki-draft-release-") as temp:
+            wallet, vault, _ = self.payment_fixture(temp)
+            calls = []
+            def command(action, _member, _pass, _roster, work, *_args, **_kwargs):
+                calls.append(action)
+                if action == "prepare":
+                    (work / "payment.json").write_text(json.dumps({
+                        "vault": vault, "payment": "c" * 64, "attempt": "d" * 64,
+                        "amount_zat": 1, "fee_zat": 10000, "change_zat": 0,
+                        "expiry_height": 9216, "version": 1, "pair": [1, 2]}))
+                elif action == "cancel-draft":
+                    self.assertTrue((work / "payment.json").is_file())
+                else:
+                    self.fail(f"unexpected native command {action}")
+                return "ok"
+
+            with patch.object(wallet, "command", side_effect=command):
+                with self.assertRaisesRegex(ValueError, "does not match this vault and request"):
+                    wallet.prepare_payment(vault, "uregtest1recipient", "40000000", "memo", "AB")
+            self.assertEqual(calls, ["prepare", "cancel-draft"])
+            self.assertEqual(len(list((wallet.data / "vaults" / vault / "payments").glob("payment-*/payment.json"))), 0)
+
     def test_payment_stages_use_only_own_vault_and_verified_review(self):
         with tempfile.TemporaryDirectory(prefix="loki-payment-stages-") as temp:
             root = Path(temp)
