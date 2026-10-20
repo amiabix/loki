@@ -149,6 +149,36 @@ fn save(data: &Path, pass: &str, c: &Ceremony) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Summaries of every vault this member belongs to, for the home screen. Best-effort: a vault
+/// whose ceremony file won't open (or isn't a 32-byte id) is skipped, not fatal to the list.
+pub(super) fn vault_summaries(data: &Path, pass: &str) -> Result<Vec<Value>, String> {
+    let root = data.join("vaults");
+    let entries = match std::fs::read_dir(&root) {
+        Ok(e) => e,
+        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let Some(vault) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if vault_bytes(&vault).is_err() {
+            continue;
+        }
+        if let Ok(c) = load(data, pass, &vault) {
+            out.push(json!({
+                "vault": c.vault,
+                "name": c.name,
+                "members": c.members,
+                "threshold": c.threshold,
+                "policy": format!("{}-of-{}", c.threshold, c.members),
+            }));
+        }
+    }
+    Ok(out)
+}
+
 fn identity(data: &Path, pass: &str, slot: u16) -> Result<Identity, String> {
     let d = MemberDir::create(data, ".").map_err(|e| e.to_string())?;
     match d.read_sealed("identity.sealed", pass) {

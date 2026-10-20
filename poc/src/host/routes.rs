@@ -156,10 +156,14 @@ async fn status(
         };
         return ok(json!({ "phase": phase, "network": network }));
     };
-    // Unlocked: re-read the profile for its name/id. Vault enumeration lands in P2.
+    // Unlocked: re-read the profile for its name/id and list the member's vaults.
     match crate::profile::open(&session.data, &session.passphrase) {
         Ok(profile) => {
-            ok(json!({ "phase": "home", "network": network, "profile": profile, "vaults": [] }))
+            let vaults = match ceremony::vault_summaries(&session.data, &session.passphrase) {
+                Ok(v) => v,
+                Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+            };
+            ok(json!({ "phase": "home", "network": network, "profile": profile, "vaults": vaults }))
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
     }

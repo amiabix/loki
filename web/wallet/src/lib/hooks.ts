@@ -45,21 +45,21 @@ function usePoll<T>(
   return { data, error, refresh: run };
 }
 
-export function useStatus(member: number) {
+export function useStatus(member: string) {
   return usePoll<StatusResponse>(
     () => api<StatusResponse>(member, "status"),
     true,
   );
 }
 
-export function useCeremonyStatus(member: number, vault: string, active: boolean) {
+export function useCeremonyStatus(member: string, vault: string, active: boolean) {
   return usePoll<CeremonyStatus>(
     () => api<CeremonyStatus>(member, `status?vault=${encodeURIComponent(vault)}`),
     active,
   );
 }
 
-export function usePayments(member: number, vault: string, active: boolean) {
+export function usePayments(member: string, vault: string, active: boolean) {
   return usePoll<{ payments: Payment[] }>(
     () => api<{ payments: Payment[] }>(member, `payments?vault=${encodeURIComponent(vault)}`),
     active,

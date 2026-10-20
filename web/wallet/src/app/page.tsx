@@ -38,7 +38,11 @@ type View =
 // ─── root ─────────────────────────────────────────────────────────────────────
 
 export default function App() {
-  const [member, setMember] = useState(1);
+  // The tester's capability slug comes from the URL fragment (never sent to the server except
+  // as the X-Loki-Access header by api()). It fixes which single signer this browser controls.
+  const [member] = useState(() =>
+    typeof window === "undefined" ? "" : window.location.hash.replace(/^#/, "").trim(),
+  );
   const [view, setView] = useState<View>({ id: "account" });
   const { data: status, error: statusError, refresh: refreshStatus } = useStatus(member);
 
@@ -50,12 +54,19 @@ export default function App() {
     }
   }, [status, view.id]);
 
-  // When member switches, go back to account gate.
-  const switchMember = (m: number) => {
-    setMember(m);
-    setView({ id: "account" });
-    refreshStatus();
-  };
+  if (!member) {
+    return (
+      <>
+        <BlackHoleBackground />
+        <div className="scrim pointer-events-none fixed inset-0 -z-[5]" />
+        <main className="flex h-dvh w-screen items-center justify-center px-6">
+          <p className="max-w-md text-center text-sm text-white/70">
+            Open your personal access link to sign in to your Loki signer.
+          </p>
+        </main>
+      </>
+    );
+  }
 
   const network = status?.network ?? "testnet";
   const profile = status?.profile;
@@ -77,7 +88,6 @@ export default function App() {
           <span className="rounded-full border border-amber/40 bg-amber/10 px-2.5 py-0.5 text-[11px] font-medium uppercase tracking-wider text-amber">
             {network} — not real funds
           </span>
-          <MemberSwitcher active={member} onChange={switchMember} />
         </div>
       </header>
 
@@ -96,28 +106,6 @@ export default function App() {
         </Screen>
       </main>
     </>
-  );
-}
-
-// ─── member switcher ──────────────────────────────────────────────────────────
-
-function MemberSwitcher({ active, onChange }: { active: number; onChange: (m: number) => void }) {
-  return (
-    <div className="flex gap-1 rounded-full border border-white/10 bg-black/30 p-0.5 backdrop-blur">
-      {[1, 2, 3].map((m) => (
-        <button
-          key={m}
-          onClick={() => onChange(m)}
-          className={`rounded-full px-3 py-1 text-xs font-medium transition ${
-            m === active
-              ? "bg-mint text-black"
-              : "text-white/60 hover:text-white"
-          }`}
-        >
-          M{m}
-        </button>
-      ))}
-    </div>
   );
 }
 
@@ -148,7 +136,7 @@ function ViewRouter({
   onStatusRefresh,
 }: {
   view: View;
-  member: number;
+  member: string;
   status: StatusResponse | undefined;
   statusError: string | null;
   profile: { name: string; id: string } | undefined;
@@ -311,14 +299,14 @@ function AccountGate({
   onUnlocked,
 }: {
   status: StatusResponse | undefined;
-  member: number;
+  member: string;
   onUnlocked: () => void;
 }) {
   if (!status) {
     return (
       <div className="on-shader text-center">
         <h1 className="text-6xl font-semibold tracking-tight">Loki</h1>
-        <p className="mt-6 text-sm text-muted animate-pulse">Connecting to member {member}…</p>
+        <p className="mt-6 text-sm text-muted animate-pulse">Connecting…</p>
       </div>
     );
   }
@@ -328,7 +316,7 @@ function AccountGate({
   return null;
 }
 
-function CreateProfile({ member, onCreated }: { member: number; onCreated: () => void }) {
+function CreateProfile({ member, onCreated }: { member: string; onCreated: () => void }) {
   const [name, setName] = useState("");
   const [passphrase, setPassphrase] = useState("");
   const [busy, setBusy] = useState(false);
@@ -346,7 +334,7 @@ function CreateProfile({ member, onCreated }: { member: number; onCreated: () =>
   return (
     <div className="on-shader text-center">
       <h1 className="text-6xl font-semibold tracking-tight">Loki</h1>
-      <p className="mt-3 text-muted">Member {member} — create your profile</p>
+      <p className="mt-3 text-muted">Create your profile</p>
       <div className="mx-auto mt-8 max-w-sm space-y-3">
         <input
           autoFocus
@@ -372,7 +360,7 @@ function CreateProfile({ member, onCreated }: { member: number; onCreated: () =>
   );
 }
 
-function UnlockProfile({ member, onUnlocked }: { member: number; onUnlocked: () => void }) {
+function UnlockProfile({ member, onUnlocked }: { member: string; onUnlocked: () => void }) {
   const [passphrase, setPassphrase] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -389,7 +377,7 @@ function UnlockProfile({ member, onUnlocked }: { member: number; onUnlocked: () 
   return (
     <div className="on-shader text-center">
       <h1 className="text-6xl font-semibold tracking-tight">Loki</h1>
-      <p className="mt-3 text-muted">Member {member} — unlock your wallet</p>
+      <p className="mt-3 text-muted">Unlock your wallet</p>
       <div className="mx-auto mt-8 max-w-sm space-y-3">
         <input
           type="password"
@@ -418,7 +406,7 @@ function Home({
   onNavigate,
   onRefresh,
 }: {
-  member: number;
+  member: string;
   profile: { name: string; id: string } | undefined;
   vaults: VaultSummary[];
   onNavigate: (v: View) => void;
@@ -439,7 +427,6 @@ function Home({
       <div className="mb-6 flex items-center justify-between">
         <div>
           <h2 className="text-2xl font-semibold">{profile?.name ?? "Wallet"}</h2>
-          <p className="text-sm text-muted">Member {member}</p>
         </div>
         <button onClick={lock} disabled={locking} className="text-xs text-muted hover:text-danger transition">
           {locking ? "Locking…" : "Lock"}
@@ -487,7 +474,7 @@ function CreateVault({
   onBack,
   onCreated,
 }: {
-  member: number;
+  member: string;
   onBack: () => void;
   onCreated: (vault: string) => void;
 }) {
@@ -538,7 +525,7 @@ function JoinVault({
   onBack,
   onJoined,
 }: {
-  member: number;
+  member: string;
   onBack: () => void;
   onJoined: (vault: string) => void;
 }) {
@@ -608,7 +595,7 @@ function CeremonyView({
   vault,
   onDone,
 }: {
-  member: number;
+  member: string;
   vault: string;
   onDone: () => void;
 }) {
@@ -640,7 +627,7 @@ function CeremonyView({
 
   return (
     <div>
-      <h2 className="mb-4 text-xl font-semibold">Ceremony — Member {member}</h2>
+      <h2 className="mb-4 text-xl font-semibold">Ceremony</h2>
       <PhaseLadder current={cs.phase} />
 
       <div className="mt-6">
@@ -730,7 +717,7 @@ function CompareRoster({
   fingerprint,
   confirmations,
 }: {
-  member: number;
+  member: string;
   vault: string;
   fingerprint: string | undefined;
   confirmations: { slot: number; confirmed: boolean; matches: boolean }[];
@@ -788,7 +775,7 @@ function BackupPhase({
   vault,
   finalStep,
 }: {
-  member: number;
+  member: string;
   vault: string;
   finalStep: boolean;
 }) {
@@ -911,7 +898,7 @@ function VaultOverview({
   onHistory,
   onBack,
 }: {
-  member: number;
+  member: string;
   vault: VaultSummary;
   onSend: () => void;
   onHistory: () => void;
@@ -996,7 +983,7 @@ function Send({
   onBack,
   onDraft,
 }: {
-  member: number;
+  member: string;
   vault: VaultSummary;
   onBack: () => void;
   onDraft: (attempt: string) => void;
@@ -1089,7 +1076,7 @@ function ReviewApprove({
   attempt,
   onBack,
 }: {
-  member: number;
+  member: string;
   vault: VaultSummary;
   attempt: string;
   onBack: () => void;
@@ -1155,7 +1142,7 @@ function ReviewApprove({
     <div>
       <BackLink onClick={onBack} />
       <h2 className="mb-2 text-2xl font-semibold">Review payment</h2>
-      <p className="text-xs text-amber mb-4 uppercase tracking-wider">Member {member} — sign this payment</p>
+      <p className="text-xs text-amber mb-4 uppercase tracking-wider">Sign this payment</p>
       <GlassCard className="mb-4">
         <Row label="To" value={<span className="font-mono text-xs break-all">{review.recipient}</span>} />
         <Row label="Amount" value={`${zatToTaz(review.amount_zat)} TAZ`} />
@@ -1185,7 +1172,7 @@ function History({
   onReview,
   onBack,
 }: {
-  member: number;
+  member: string;
   vault: VaultSummary;
   onReview: (attempt: string) => void;
   onBack: () => void;
