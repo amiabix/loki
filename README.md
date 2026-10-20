@@ -1,92 +1,70 @@
 # Loki
 
-Loki is a **shielded Zcash FROST multisig wallet**. It splits, Safe-style, into a
-**keyless coordinator** that builds and tracks transactions and an **isolated signer**
-that holds a member's key share and approves on-device. The share is **born in the
-signer during DKG, never enters the browser**, and every member **confirms the real
-transaction on their own device** before signing. Threshold signing and coordination
-run on the audited Zcash Foundation FROST stack.
+Loki is a research prototype for shielded Zcash threshold payments. It has
+separate-member command-line and local browser-app flows, plus a newer
+coordinator / signer interface. **It is not a custody wallet. Use only disposable
+regtest or Testnet funds.** The [research harness](poc/README.md) describes the
+runs completed so far; the [security brief](docs/product/SECURITY.md) describes
+the trust boundaries and work remaining before custody use.
 
-> Status: **test-network only, not custody.** Every build shows its network and refuses
-> mainnet funds. See [`docs/product/SECURITY.md`](docs/product/SECURITY.md) for the
-> pre-custody checklist.
+## What runs today
 
-## Architecture
-
-```mermaid
-flowchart TB
-  subgraph C["Coordinator — keyless (may be a web app)"]
-    UI["Wallet UI · vaults · propose · track"]
-    BUILD["Scan · balance · build unsigned PCZT"]
-    AGG["Aggregate partials · apply · broadcast"]
-  end
-  subgraph S["Signer — isolated, one per member"]
-    SHARE[("FROST share<br/>secure-element-wrapped")]
-    WYS["WYSIWYS: parse PCZT →<br/>render → approve → sign"]
-  end
-  CHAIN[("Zcash chain<br/>via lightwalletd")]
-
-  C <-->|"frostd — public FROST messages only"| S
-  BUILD <--> CHAIN
-  AGG --> CHAIN
-
-  classDef keyless fill:#0b3,stroke:#063,color:#fff;
-  classDef secret fill:#915,stroke:#508,color:#fff;
-  class C keyless
-  class S secret
-```
-
-The coordinator holds the vault **viewing key and public protocol messages** — never a
-share, nonce, or spend key. The signer holds exactly **one share**, wrapped by the
-device secure element (Secure Enclave / StrongBox / TPM; software fallback for dev).
-`frostd` relays only public FROST messages. Any `t`-of-`n` threshold is supported.
-
-Full design, threat model, and invariants: [`docs/product/`](docs/product/).
-
-## What works today
-
-| Area | State |
+| Path | Evidence and limit |
 |---|---|
-| General **t-of-n** DKG → sign → aggregate → verify | ✅ `(2,3) (2,5) (3,5) (4,7)` tested |
-| Keyless coordinator boundary (no share/nonce/spend key) | ✅ compile-time + deny-list enforced |
-| Signer: **WYSIWYS→sighash binding**, single-use crash-safe nonces, fee integrity | ✅ tested |
-| Share born-in-signer (DKG) + **backup / restore** with nonce-epoch reset | ✅ tested |
-| Transport over audited **`frostd`** | ✅ live 2-of-3 round-trip |
-| Secure Enclave backend (wrap/unwrap the share key) | 🔬 spike proven ([`poc/enclave-spike`](poc/enclave-spike)) |
+| Separate-member CLI and local member app | A 3-of-4 payment has been mined on regtest. The local app exposes Testnet setup and payment screens, but a public Testnet payment through the browser has not yet been mined end to end. See the [research results](poc/README.md) and [member-app runbook](poc/wallet/README.md). |
+| `Signer` / `LocalSigner` seam | DKG encrypts round-two packages for roster members and seals the resulting share. The coordinator loop asks a signer to build one unsigned candidate, gathers partial signatures, and returns a signed PCZT. That loop stops before proof, broadcast, and chain confirmation ([code](poc/src/signer/coordination.rs)). |
+| `frostd` transport | The relay adapter has a live 2-of-3 DKG and signature round-trip. This transport test does not establish an end-to-end payment through the newer signer seam ([adoption notes](docs/product/ADOPTION.md)). |
+| Native signer | A provisioned macOS app proves persistent Secure Enclave wrapping and a Rust share-sealing self-test. It is not yet a delivered signing and approval app ([signer-app notes](poc/signer-app/README.md)). |
 
-## Pending (pre-custody)
+The newer coordinator loop does not request a share or secret nonce through its
+`Signer` interface. Its request passes payment details to the proposer signer,
+which builds a PCZT with its own viewing key and selected note. **The current
+serialized PCZT carries the vault full viewing key in its spend data**, so the
+coordinator that receives that PCZT can learn the viewing key and wallet activity.
+Keyless here means no spend authority through the interface; viewing-key privacy
+needs a PCZT redaction and verification fix ([candidate builder](poc/src/candidate.rs),
+[PCZT spend data](poc/vendor/zakura-orchard/src/pczt.rs)). The `frostd` relay also
+sees routing and session metadata.
 
-Real Secure Enclave / StrongBox backend + biometric gate; native app shell + web
-coordinator deployment; retire the bespoke relays; external security audit; reorg/crash
-and recovery-spend drills. Tracked in [`docs/product/07-roadmap.md`](docs/product/07-roadmap.md).
+The interface tests do not establish process isolation: `LocalSigner` is an
+in-process implementation with a software key wrapper and an approval callback
+([interface](poc/src/signer/mod.rs), [implementation](poc/src/signer/local.rs)).
+The local Python member app holds the unlock passphrase while unlocked and can
+pass it through a short-lived file to native commands ([app](poc/wallet/member_app.py)).
+The separate [Testnet split-payment binary](poc/src/bin/loki_split_payment.rs)
+is a research harness: it opens two members' state in one process and
+auto-approves. It does not demonstrate independent signer approval.
+
+## Before custody use
+
+Prevent viewing-key disclosure through coordinator-visible PCZTs; finish and
+test separate signer delivery and a real member confirmation and unlock gate;
+validate hostile PCZTs; complete independent-device, recovery, crash, and public
+Testnet payment drills; independently review Loki's ZIP-2005 viewing-key
+derivation and signer/coordinator integration; and arrange an external security
+audit. The [security brief](docs/product/SECURITY.md) tracks these boundaries.
+The rest of [docs/product](docs/product/) includes target architecture and
+workstream designs; those designs are not claims that their acceptance gates
+have passed.
 
 ## Repository layout
 
-| Path | What |
+| Path | What it contains |
 |---|---|
-| `poc/src/signer/` | The isolated signer: `Signer` trait, `LocalSigner`, sealing, nonces, WYSIWYS, backup |
-| `poc/src/coordinator_boundary.rs` | The keyless coordinator↔signer seam |
-| `poc/src/transport.rs` | `frostd` transport |
-| `poc/src/distributed_setup.rs`, `candidate.rs`, `signing_session.rs` | General t-of-n DKG + signing |
-| `poc/src/scan.rs`, `witness.rs`, `loki_wallet_sync` | Chain scan / balance (coordinator) |
-| `poc/wallet/design/` | Wallet UI design prototype |
-| `poc/enclave-spike/` | Secure Enclave feasibility spike |
-| `communication/` | Bespoke relay stack (being retired in favour of `frostd`) |
-| `docs/product/` | Architecture, per-workstream specs, security, roadmap, design |
+| `poc/src/signer/` | Signer interface, local implementation, sealing, nonces, payment review, backup, and coordination loop |
+| `poc/src/transport.rs` | `frostd` adapter |
+| `poc/src/distributed_setup.rs`, `candidate.rs`, `signing_session.rs` | Earlier separate-member DKG and signing path |
+| `poc/wallet/` | Local member app and browser UI |
+| `poc/signer-app/` | macOS Secure Enclave self-test app |
+| `communication/` | Bespoke relay stack used by research flows |
+| `docs/product/` | Design, adoption notes, security brief, and roadmap |
 
-## Build & test
-
-The crypto core builds with Cargo; threshold tests exercise the audited FROST crates.
+## Build and test
 
 ```sh
 cd poc
 cargo test --locked
 ```
 
-Preview the wallet UI design prototype:
-
-```sh
-poc/wallet/design/serve.sh   # then open http://localhost:8080/design/
-```
-
-Use only disposable test-network funds.
+The [research harness](poc/README.md) gives the demo commands and
+network-specific precautions.
