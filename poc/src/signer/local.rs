@@ -624,6 +624,22 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
                 "candidate payment differs from requested payment".into(),
             ));
         }
+        if !view.fee_verified {
+            return Err(SignerError::Other("candidate fee is unverified".into()));
+        }
+        let parsed = pczt::Pczt::parse(pczt)
+            .map_err(|e| SignerError::Other(format!("pczt parse: {e:?}")))?;
+        let actions = parsed.ironwood().actions().len();
+        use zcash_primitives::transaction::fees::zip317::{GRACE_ACTIONS, MARGINAL_FEE};
+        let zip317_fee = u64::try_from(actions.max(GRACE_ACTIONS))
+            .ok()
+            .and_then(|count| u64::from(MARGINAL_FEE).checked_mul(count))
+            .ok_or_else(|| SignerError::Other("candidate action count is too large".into()))?;
+        if view.fee_zat != zip317_fee {
+            return Err(SignerError::Other(
+                "candidate fee differs from ZIP-317 fee".into(),
+            ));
+        }
         self.rendered.insert(cand.attempt_id, view.clone());
 
         // 2. The member decides on THAT render (policy/biometric). Refusal is first-class.
@@ -697,6 +713,26 @@ pub(crate) mod tests {
     const SPEND_VALUE: u64 = 625_000_000;
     const AMOUNT: u64 = 40_000_000;
 
+    struct FixedFee(Zatoshis);
+
+    impl zcash_primitives::transaction::fees::FeeRule for FixedFee {
+        type Error = std::convert::Infallible;
+
+        fn fee_required<P: zcash_protocol::consensus::Parameters>(
+            &self,
+            _params: &P,
+            _target_height: zcash_protocol::consensus::BlockHeight,
+            _transparent_inputs: impl IntoIterator<Item = zcash_primitives::transaction::fees::transparent::InputSize>,
+            _transparent_outputs: impl IntoIterator<Item = usize>,
+            _sapling_inputs: usize,
+            _sapling_outputs: usize,
+            _orchard_actions: usize,
+            _ironwood_actions: usize,
+        ) -> Result<Zatoshis, Self::Error> {
+            Ok(self.0)
+        }
+    }
+
     fn tempdir(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
             "loki-local-{tag}-{}-{}",
@@ -722,6 +758,7 @@ pub(crate) mod tests {
         peer_commit: frost::round1::SigningCommitments,
         own_commit: frost::round1::SigningCommitments,
         finalize: bool,
+        extra_fee_zat: u64,
     ) -> (Vec<u8>, frost::SigningPackage, [u8; 32]) {
         // Commitment set drives the seed-derived alpha used to randomize the single spend.
         let mut set = BTreeMap::new();
@@ -760,14 +797,54 @@ pub(crate) mod tests {
             expiry_height: params.expiry_height,
         };
         let fee = u64::from(quote_fee(&Regtest, &inputs).unwrap());
-        inputs.change = Zatoshis::const_from_u64(SPEND_VALUE - AMOUNT - fee);
-        let built = build_candidate(
-            &Regtest,
-            &inputs,
-            &[alpha],
-            rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng),
-        )
-        .unwrap();
+        inputs.change = Zatoshis::const_from_u64(SPEND_VALUE - AMOUNT - fee - extra_fee_zat);
+        let built = if extra_fee_zat == 0 {
+            build_candidate(
+                &Regtest,
+                &inputs,
+                &[alpha],
+                rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng),
+            )
+            .unwrap()
+        } else {
+            use zcash_primitives::transaction::builder::{BundlePadding, DeferredPcztBuilder};
+            use zcash_protocol::consensus::BlockHeight;
+
+            // A proposer can build a balanced PCZT with an arbitrary fixed fee.
+            let mut builder = DeferredPcztBuilder::new::<std::convert::Infallible>(
+                Regtest,
+                BlockHeight::from_u32(inputs.target_height),
+                BundlePadding::DEFAULT,
+                BundlePadding::DEFAULT,
+            )
+            .unwrap()
+            .with_expiry_height(BlockHeight::from_u32(inputs.expiry_height));
+            builder
+                .add_ironwood_spend_with_alpha::<std::convert::Infallible>(fvk.clone(), note, alpha)
+                .unwrap();
+            builder
+                .add_ironwood_output::<std::convert::Infallible>(
+                    None,
+                    inputs.recipient,
+                    inputs.amount,
+                    inputs.memo,
+                )
+                .unwrap();
+            builder
+                .add_ironwood_output::<std::convert::Infallible>(
+                    None,
+                    fvk.address_at(0u64, Scope::Internal),
+                    inputs.change,
+                    MemoBytes::empty(),
+                )
+                .unwrap();
+            builder
+                .build_for_pczt(
+                    rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng),
+                    &FixedFee(Zatoshis::const_from_u64(fee + extra_fee_zat)),
+                )
+                .unwrap()
+        };
         let pczt = pczt::roles::creator::Creator::build_from_parts(built.pczt_parts).unwrap();
         let pczt = if finalize {
             pczt::roles::io_finalizer::IoFinalizer::new(pczt)
@@ -843,7 +920,7 @@ pub(crate) mod tests {
         .unwrap();
         let (_peer_nonce, peer) = frost::round1::commit(key2.signing_share(), &mut rand_core::OsRng);
         let (pczt, pkg, seed) =
-            candidate_and_package(&fvk, &key1, &public, *key2.identifier(), peer, own, true);
+            candidate_and_package(&fvk, &key1, &public, *key2.identifier(), peer, own, true, 0);
         let expected = payment_params(&fvk);
         let mismatches = [
             crate::signer::PublicPaymentParams {
@@ -880,6 +957,100 @@ pub(crate) mod tests {
         }
         signer.sign_approve(&session, &cand, &expected, &pczt, &pkg, &seed)
             .expect("matching request may sign");
+    }
+
+    #[test]
+    fn sign_approve_refuses_valid_high_fee_before_approval_or_nonce_use() {
+        let (shares, public, fvk) = dealer_vault();
+        let (mut signer, key1) = signer_with_dealer_share(1, &shares, &public, &fvk);
+        let session = connect_signer(&mut signer);
+        let cand = CandidateRef {
+            vault_id: [1u8; 32],
+            payment_id: [7u8; 32],
+            attempt_id: [18u8; 32],
+        };
+        let own = signer.sign_commit(&session, &cand).unwrap();
+        let key2 = frost::keys::KeyPackage::try_from(
+            shares
+                .get(&frost::Identifier::try_from(2u16).unwrap())
+                .unwrap()
+                .clone(),
+        )
+        .unwrap();
+        let (_peer_nonce, peer) = frost::round1::commit(key2.signing_share(), &mut rand_core::OsRng);
+        let (pczt, pkg, seed) = candidate_and_package(
+            &fvk,
+            &key1,
+            &public,
+            *key2.identifier(),
+            peer,
+            own,
+            true,
+            1_000_000,
+        );
+        let view = wysiwys::describe_pczt(&pczt, &fvk).unwrap();
+        assert!(view.fee_verified);
+        assert_eq!(view.fee_zat, 1_010_000);
+        signer.approval = Box::new(|_| panic!("high fee reached approval"));
+
+        let result = signer.sign_approve(&session, &cand, &payment_params(&fvk), &pczt, &pkg, &seed);
+        assert!(
+            matches!(&result, Err(SignerError::Other(message)) if message == "candidate fee differs from ZIP-317 fee"),
+            "got {result:?}"
+        );
+        assert_eq!(
+            signer.nonces.state(&signer.nonce_id(&cand)),
+            crate::signer::nonce::NonceState::Committed
+        );
+    }
+
+    #[test]
+    fn sign_approve_refuses_unverified_fee_before_approval_or_nonce_use() {
+        let (shares, public, fvk) = dealer_vault();
+        let (mut signer, key1) = signer_with_dealer_share(1, &shares, &public, &fvk);
+        let session = connect_signer(&mut signer);
+        let cand = CandidateRef {
+            vault_id: [1u8; 32],
+            payment_id: [7u8; 32],
+            attempt_id: [19u8; 32],
+        };
+        let own = signer.sign_commit(&session, &cand).unwrap();
+        let key2 = frost::keys::KeyPackage::try_from(
+            shares
+                .get(&frost::Identifier::try_from(2u16).unwrap())
+                .unwrap()
+                .clone(),
+        )
+        .unwrap();
+        let (_peer_nonce, peer) = frost::round1::commit(key2.signing_share(), &mut rand_core::OsRng);
+        let (pczt, pkg, seed) = candidate_and_package(
+            &fvk,
+            &key1,
+            &public,
+            *key2.identifier(),
+            peer,
+            own,
+            true,
+            0,
+        );
+        let pczt = pczt::roles::redactor::Redactor::new(pczt::Pczt::parse(&pczt).unwrap())
+            .redact_ironwood_with(|mut bundle| bundle.redact_actions(|mut action| action.clear_rcv()))
+            .finish()
+            .serialize()
+            .unwrap();
+        let view = wysiwys::describe_pczt(&pczt, &fvk).unwrap();
+        assert!(!view.fee_verified);
+        signer.approval = Box::new(|_| panic!("unverified fee reached approval"));
+
+        let result = signer.sign_approve(&session, &cand, &payment_params(&fvk), &pczt, &pkg, &seed);
+        assert!(
+            matches!(&result, Err(SignerError::Other(message)) if message == "candidate fee is unverified"),
+            "got {result:?}"
+        );
+        assert_eq!(
+            signer.nonces.state(&signer.nonce_id(&cand)),
+            crate::signer::nonce::NonceState::Committed
+        );
     }
 
     fn signer_with_dealer_share(
@@ -942,6 +1113,7 @@ pub(crate) mod tests {
             peer_commit,
             own_commit,
             true,
+            0,
         );
         let params = payment_params(&fvk);
 
@@ -1014,6 +1186,7 @@ pub(crate) mod tests {
             peer_commit,
             own_commit,
             true,
+            0,
         );
         let params = payment_params(&fvk);
         let out = signer.sign_approve(&session, &cand, &params, &pczt, &pkg, &seed);
@@ -1238,6 +1411,7 @@ pub(crate) mod tests {
             peer_commit,
             own_commit,
             true,
+            0,
         );
         let params = payment_params(&fvk);
         let share = signers[0]
@@ -1278,7 +1452,7 @@ pub(crate) mod tests {
         let own = signer.sign_commit(&session, &cand).unwrap();
         let (_a, peer) = frost::round1::commit(key2.signing_share(), &mut rand_core::OsRng);
         let (pczt, _pkg, _seed) =
-            candidate_and_package(&fvk, &key1, &public, *key2.identifier(), peer, own, true);
+            candidate_and_package(&fvk, &key1, &public, *key2.identifier(), peer, own, true, 0);
 
         let view = wysiwys::describe_pczt(&pczt, &fvk).unwrap();
         assert!(
@@ -1385,6 +1559,7 @@ pub(crate) mod tests {
             peer_commit,
             own_commit,
             true,
+            0,
         );
         let params = payment_params(&fvk);
         let share = signer

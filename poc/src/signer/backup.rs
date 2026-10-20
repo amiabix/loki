@@ -387,6 +387,7 @@ mod tests {
             frost::round1::commit(key2.signing_share(), &mut rand_core::OsRng).1,
             own,
             true,
+            0,
         );
         let params = crate::signer::local::tests::payment_params(&fvk);
         let share = signer
