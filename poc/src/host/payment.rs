@@ -800,7 +800,9 @@ pub(super) async fn finish(State(st): State<Shared>, Json(body): Json<Value>) ->
             let sighash = pczt::roles::signer::Signer::new(pczt.clone())
                 .map_err(|e| format!("sighash: {e:?}"))?
                 .shielded_sighash();
-            let height = w.scanned_height()?.ok_or("wallet has no scanned blocks")?;
+            // Prove against the candidate's anchor (target_height), not the current tip — the
+            // sighash the quorum signed is bound to that anchor, and the witness must root to it.
+            let height = p.target_height;
             let tree = frontier(&w, &mut client, &rt, height)?;
             let anchor = tree.root(None).to_bytes();
             let selected = [hex32(&p.note_selection[0])?];
