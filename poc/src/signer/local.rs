@@ -592,6 +592,7 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
         &mut self,
         session: &Session,
         cand: &CandidateRef,
+        params: &crate::signer::PublicPaymentParams,
         pczt: &[u8],
         pkg: &frost::SigningPackage,
         randomizer: &[u8],
@@ -602,6 +603,27 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
 
         // 1. INDEPENDENTLY render what this PCZT pays — from the bytes, not any claim.
         let view = wysiwys::describe_pczt(pczt, &self.vault_fvk).map_err(SignerError::Other)?;
+        // The PCZT carries a branch ID, not the requested target height itself.
+        let height = zcash_protocol::consensus::BlockHeight::from_u32(params.target_height);
+        let branch = match self.network {
+            Network::Regtest => {
+                zcash_protocol::consensus::BranchId::for_height(&crate::candidate::Regtest, height)
+            }
+            Network::Testnet => zcash_protocol::consensus::BranchId::for_height(
+                &zcash_protocol::consensus::TEST_NETWORK,
+                height,
+            ),
+        };
+        if view.to != params.recipient.to_raw_address_bytes()
+            || view.amount_zat != u64::from(params.amount)
+            || view.memo.as_slice() != params.memo.as_array().as_slice()
+            || view.expiry_height != params.expiry_height
+            || view.network_branch_id != u32::from(branch)
+        {
+            return Err(SignerError::Other(
+                "candidate payment differs from requested payment".into(),
+            ));
+        }
         self.rendered.insert(cand.attempt_id, view.clone());
 
         // 2. The member decides on THAT render (policy/biometric). Refusal is first-class.
@@ -726,15 +748,16 @@ pub(crate) mod tests {
             NoteVersion::V3,
         )
         .unwrap();
+        let params = payment_params(fvk);
         let mut inputs = CandidateInputs {
             vault_fvk: fvk,
             notes: vec![note],
-            recipient: fvk.address_at(7u64, Scope::External),
-            amount: Zatoshis::const_from_u64(AMOUNT),
-            memo: MemoBytes::from_bytes(b"loki bind").unwrap(),
+            recipient: params.recipient,
+            amount: params.amount,
+            memo: params.memo,
             change: Zatoshis::ZERO,
-            target_height: 700,
-            expiry_height: 1_152,
+            target_height: params.target_height,
+            expiry_height: params.expiry_height,
         };
         let fee = u64::from(quote_fee(&Regtest, &inputs).unwrap());
         inputs.change = Zatoshis::const_from_u64(SPEND_VALUE - AMOUNT - fee);
@@ -788,6 +811,75 @@ pub(crate) mod tests {
             .connect("http://coordinator.test", Network::Regtest, b"challenge-1")
             .unwrap()
             .session
+    }
+
+    pub(crate) fn payment_params(fvk: &FullViewingKey) -> crate::signer::PublicPaymentParams {
+        crate::signer::PublicPaymentParams {
+            recipient: fvk.address_at(7u64, Scope::External),
+            amount: Zatoshis::const_from_u64(AMOUNT),
+            memo: MemoBytes::from_bytes(b"loki bind").unwrap(),
+            target_height: 700,
+            expiry_height: 1_152,
+        }
+    }
+
+    #[test]
+    fn sign_approve_refuses_payment_request_mismatch_without_burning_nonce() {
+        let (shares, public, fvk) = dealer_vault();
+        let (mut signer, key1) = signer_with_dealer_share(1, &shares, &public, &fvk);
+        let session = connect_signer(&mut signer);
+        let cand = CandidateRef {
+            vault_id: [1u8; 32],
+            payment_id: [7u8; 32],
+            attempt_id: [8u8; 32],
+        };
+        let own = signer.sign_commit(&session, &cand).unwrap();
+        let key2 = frost::keys::KeyPackage::try_from(
+            shares
+                .get(&frost::Identifier::try_from(2u16).unwrap())
+                .unwrap()
+                .clone(),
+        )
+        .unwrap();
+        let (_peer_nonce, peer) = frost::round1::commit(key2.signing_share(), &mut rand_core::OsRng);
+        let (pczt, pkg, seed) =
+            candidate_and_package(&fvk, &key1, &public, *key2.identifier(), peer, own, true);
+        let expected = payment_params(&fvk);
+        let mismatches = [
+            crate::signer::PublicPaymentParams {
+                recipient: fvk.address_at(8u64, Scope::External),
+                ..expected.clone()
+            },
+            crate::signer::PublicPaymentParams {
+                amount: Zatoshis::const_from_u64(AMOUNT + 1),
+                ..expected.clone()
+            },
+            crate::signer::PublicPaymentParams {
+                memo: MemoBytes::from_bytes(b"different memo").unwrap(),
+                ..expected.clone()
+            },
+            crate::signer::PublicPaymentParams {
+                expiry_height: expected.expiry_height + 1,
+                ..expected.clone()
+            },
+            crate::signer::PublicPaymentParams {
+                target_height: 0,
+                ..expected.clone()
+            },
+        ];
+        for params in &mismatches {
+            let refused = signer.sign_approve(&session, &cand, params, &pczt, &pkg, &seed);
+            assert!(
+                matches!(&refused, Err(SignerError::Other(message)) if message == "candidate payment differs from requested payment"),
+                "got {refused:?}"
+            );
+            assert_eq!(
+                signer.nonces.state(&signer.nonce_id(&cand)),
+                crate::signer::nonce::NonceState::Committed
+            );
+        }
+        signer.sign_approve(&session, &cand, &expected, &pczt, &pkg, &seed)
+            .expect("matching request may sign");
     }
 
     fn signer_with_dealer_share(
@@ -851,13 +943,14 @@ pub(crate) mod tests {
             own_commit,
             true,
         );
+        let params = payment_params(&fvk);
 
         // Tampered package: same commitments, WRONG message (not the pczt's sighash).
         let bad_pkg = frost::SigningPackage::new(
             good_pkg.signing_commitments().clone(),
             &[0xabu8; 32],
         );
-        let refused = signer.sign_approve(&session, &cand, &pczt, &bad_pkg, &seed);
+        let refused = signer.sign_approve(&session, &cand, &params, &pczt, &bad_pkg, &seed);
         assert!(
             matches!(refused, Err(SignerError::SighashMismatch)),
             "a package naming a different sighash must be REFUSED, got {refused:?}"
@@ -871,7 +964,7 @@ pub(crate) mod tests {
 
         // Matching package: binding passes, a real partial signature is produced.
         let share = signer
-            .sign_approve(&session, &cand, &pczt, &good_pkg, &seed)
+            .sign_approve(&session, &cand, &params, &pczt, &good_pkg, &seed)
             .expect("matching sighash must sign");
         assert_eq!(share.serialize().len(), 32);
     }
@@ -922,7 +1015,8 @@ pub(crate) mod tests {
             own_commit,
             true,
         );
-        let out = signer.sign_approve(&session, &cand, &pczt, &pkg, &seed);
+        let params = payment_params(&fvk);
+        let out = signer.sign_approve(&session, &cand, &params, &pczt, &pkg, &seed);
         assert!(matches!(out, Err(SignerError::MemberRefused)));
         assert_eq!(
             signer.nonces.state(&signer.nonce_id(&cand)),
@@ -1145,8 +1239,9 @@ pub(crate) mod tests {
             own_commit,
             true,
         );
+        let params = payment_params(&fvk);
         let share = signers[0]
-            .sign_approve(&sessions[0], &cand, &pczt, &pkg, &seed)
+            .sign_approve(&sessions[0], &cand, &params, &pczt, &pkg, &seed)
             .expect("DKG-born share must sign a candidate for its group key");
         assert_eq!(share.serialize().len(), 32);
     }
@@ -1291,8 +1386,9 @@ pub(crate) mod tests {
             own_commit,
             true,
         );
+        let params = payment_params(&fvk);
         let share = signer
-            .sign_approve(&session, &cand, &pczt, &pkg, &seed)
+            .sign_approve(&session, &cand, &params, &pczt, &pkg, &seed)
             .expect("vault-member signer must produce a partial signature");
         assert_eq!(share.serialize().len(), 32);
     }

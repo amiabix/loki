@@ -388,8 +388,9 @@ mod tests {
             own,
             true,
         );
+        let params = crate::signer::local::tests::payment_params(&fvk);
         let share = signer
-            .sign_approve(&session, &cand, &pczt, &pkg, &seed)
+            .sign_approve(&session, &cand, &params, &pczt, &pkg, &seed)
             .expect("restored share must sign a candidate for its group key");
         assert_eq!(share.serialize().len(), 32);
 
@@ -410,7 +411,7 @@ mod tests {
             s
         };
         std::fs::write(fresh_nonce_dir.join(format!("{nonce_id2}.nonce")), &stale).unwrap();
-        let refused = signer.sign_approve(&session, &cand2, &pczt, &pkg, &seed);
+        let refused = signer.sign_approve(&session, &cand2, &params, &pczt, &pkg, &seed);
         assert!(
             matches!(&refused, Err(SignerError::Other(m)) if m.contains("pre-restore epoch")),
             "a pre-restore-epoch nonce must be hard-refused after restore, got {refused:?}"

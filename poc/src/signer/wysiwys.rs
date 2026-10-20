@@ -38,7 +38,7 @@ pub struct PaymentView {
     pub memo: Vec<u8>,
     /// Height after which the transaction cannot be mined, from the signed PCZT.
     pub expiry_height: u32,
-    /// Consensus branch id the PCZT commits to (e.g. NU7). The binding network fact.
+    /// Consensus branch id the PCZT commits to (e.g. NU7); several networks can share it.
     pub network_branch_id: u32,
     /// `true` iff every action's declared spend/output value was bound to its `cv_net`
     /// value commitment (`verify_cv_net`), so the rendered fee is the one the sighash
