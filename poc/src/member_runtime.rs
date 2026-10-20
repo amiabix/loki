@@ -1,7 +1,7 @@
 //! JSON-only Rust member-runtime migration slice: profiles, accounts, and vault inventory.
 //! It does not run setup, sign, approve, send, or serve the wallet UI.
 
-use crate::{network::VaultNetwork, seal_kdf, state::MemberDir};
+use crate::{network::VaultNetwork, seal_kdf, setup_ceremony::journal, state::MemberDir};
 use axum::{
     extract::{DefaultBodyLimit, Query, Request, State},
     http::{header, HeaderValue, StatusCode},
@@ -10,6 +10,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use base64::Engine;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -156,8 +157,8 @@ fn read_membership(path: &Path, id: &str, network: VaultNetwork) -> Result<Value
         return Err("Missing vault membership".into());
     }
     let mut bytes = Vec::new();
-    File::open(path)
-        .map_err(|e| e.to_string())?
+    journal::checked_file(path)
+        .map_err(|_| "Unsafe vault membership")?
         .take(4097)
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
@@ -486,6 +487,42 @@ async fn status(
     ))
 }
 
+async fn final_card(
+    State(app): State<Arc<Installation>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let id = query.get("vault").ok_or_else(|| bad("Invalid vault ID"))?;
+    if !id64(id) {
+        return Err(bad("Invalid vault ID"));
+    }
+    let account = app.account.lock().map_err(|_| bad("Account lock failed"))?;
+    let unlocked = account
+        .unlocked
+        .as_ref()
+        .ok_or_else(|| bad("Unlock your profile first"))?;
+    let vault = account.root.join("vaults").join(id);
+    journal::check_private_root(&vault).map_err(|_| bad("Unsafe vault directory"))?;
+    let membership =
+        read_membership(&vault.join("membership.json"), id, app.network).map_err(|e| bad(&e))?;
+    if membership["profile"] != unlocked.profile.id || membership["transport"] == "hosted" {
+        return Err(bad("This profile cannot download that vault card"));
+    }
+    let card_dir = vault.join("final-card");
+    journal::check_private_root(&card_dir).map_err(|_| bad("Final recovery card unavailable"))?;
+    let card = journal::checked_file(&card_dir.join("vault.card"))
+        .map_err(|_| bad("Final recovery card unavailable"))?;
+    let mut bytes = Vec::new();
+    card.take(65_537)
+        .read_to_end(&mut bytes)
+        .map_err(|_| bad("Could not read final recovery card"))?;
+    if bytes.len() > 65_536 {
+        return Err(bad("Final recovery card is too large"));
+    }
+    Ok(Json(
+        json!({"card":base64::engine::general_purpose::STANDARD.encode(bytes)}),
+    ))
+}
+
 async fn create_profile(
     State(app): State<Arc<Installation>>,
     Json(input): Json<Credentials>,
@@ -651,6 +688,7 @@ pub async fn serve(root: PathBuf, network: VaultNetwork, port: u16) -> Result<()
     let router = Router::new()
         .route("/api/accounts", get(accounts))
         .route("/api/status", get(status))
+        .route("/api/final-card", get(final_card))
         .route("/api/profile-create", post(create_profile))
         .route("/api/unlock", post(unlock))
         .route("/api/lock", post(lock))

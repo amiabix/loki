@@ -1,5 +1,7 @@
 //! Real HTTP checks for the Rust member-runtime migration slice.
 
+use base64::Engine;
+use loki_poc::state::MemberDir;
 use rand_core::{OsRng, RngCore};
 use serde_json::{json, Value};
 use std::{
@@ -94,6 +96,13 @@ impl Fixture {
         };
         let folder = root.join("vaults").join(vault);
         fs::create_dir_all(&folder).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(folder.parent().unwrap(), fs::Permissions::from_mode(0o700))
+                .unwrap();
+            fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).unwrap();
+        }
         fs::write(
             folder.join("membership.json"),
             serde_json::to_vec(&json!({
@@ -103,6 +112,32 @@ impl Fixture {
             .unwrap(),
         )
         .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                folder.join("membership.json"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+    }
+
+    fn final_card(&self, account: &str, vault: &str) -> Vec<u8> {
+        let root = if account == "default" {
+            self.0.clone()
+        } else {
+            self.0.join("accounts").join(account)
+        };
+        let vault = root.join("vaults").join(vault);
+        let card = MemberDir::create(&vault, "final-card").unwrap();
+        card.write_sealed(
+            "vault.card",
+            b"final recovery evidence",
+            "test backup words",
+        )
+        .unwrap();
+        fs::read(card.path().join("vault.card")).unwrap()
     }
 }
 
@@ -267,6 +302,176 @@ fn opens_legacy_profiles_and_keeps_vaults_bound_to_the_selected_account() {
         json!({"locked":true})
     );
     assert_eq!(server.get("/api/status").1["phase"], "locked");
+}
+
+#[test]
+fn serves_only_the_selected_unlocked_accounts_encrypted_final_card() {
+    let root = Fixture::new();
+    let alice_id = root.profile("default", "Alice", "alice passphrase");
+    let bob_id = root.profile(OTHER, "Bob", "bob passphrase");
+    root.vault("default", ALICE_VAULT, &alice_id);
+    root.vault(OTHER, BOB_VAULT, &bob_id);
+    let expected = root.final_card("default", ALICE_VAULT);
+    let server = Server::start(&root.0);
+    let route = format!("/api/final-card?vault={ALICE_VAULT}");
+
+    assert_eq!(server.get(&route).0, 400);
+    assert_eq!(
+        server
+            .post("/api/unlock", json!({"passphrase":"alice passphrase"}))
+            .0,
+        200
+    );
+    let (status, body) = server.get(&route);
+    assert_eq!(status, 200);
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(body["card"].as_str().unwrap())
+            .unwrap(),
+        expected
+    );
+    assert!(expected.starts_with(b"LOKISEAL\x01"));
+    assert_eq!(
+        server.get(&format!("/api/final-card?vault={BOB_VAULT}")).0,
+        400
+    );
+    assert_eq!(server.get("/api/final-card?vault=../profile").0, 400);
+
+    assert_eq!(
+        server
+            .post("/api/account-switch", json!({"account":OTHER}))
+            .0,
+        200
+    );
+    assert_eq!(server.get(&route).0, 400);
+    assert_eq!(
+        server
+            .post("/api/unlock", json!({"passphrase":"bob passphrase"}))
+            .0,
+        200
+    );
+    assert_eq!(server.get(&route).0, 400);
+}
+
+#[test]
+fn final_card_download_rejects_untrusted_card_paths_and_oversized_files() {
+    let root = Fixture::new();
+    let id = root.profile("default", "Alice", "alice passphrase");
+    root.vault("default", ALICE_VAULT, &id);
+    let card = root.0.join("vaults").join(ALICE_VAULT).join("final-card");
+    fs::create_dir(&card).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&card, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let file = card.join("vault.card");
+    let server = Server::start(&root.0);
+    assert_eq!(
+        server
+            .post("/api/unlock", json!({"passphrase":"alice passphrase"}))
+            .0,
+        200
+    );
+    let route = format!("/api/final-card?vault={ALICE_VAULT}");
+
+    fs::write(&file, vec![0u8; 65_537]).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    assert_eq!(server.get(&route).0, 400);
+    fs::remove_file(&file).unwrap();
+    #[cfg(unix)]
+    {
+        let elsewhere = root.0.join("outside.card");
+        fs::write(&elsewhere, b"secret outside the card directory").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &file).unwrap();
+        assert_eq!(server.get(&route).0, 400);
+        fs::remove_file(&file).unwrap();
+        fs::remove_dir(&card).unwrap();
+        let other_card = MemberDir::create(&root.0, "outside-card").unwrap();
+        other_card
+            .write_sealed(
+                "vault.card",
+                b"other recovery evidence",
+                "test backup words",
+            )
+            .unwrap();
+        std::os::unix::fs::symlink(other_card.path(), &card).unwrap();
+        assert_eq!(server.get(&route).0, 400);
+        fs::remove_file(&card).unwrap();
+        let vault = root.0.join("vaults").join(ALICE_VAULT);
+        let moved = root.0.join("moved-vault");
+        fs::rename(&vault, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &vault).unwrap();
+        assert_eq!(server.get(&route).0, 400);
+    }
+}
+
+#[test]
+fn final_card_download_rejects_hosted_or_other_profile_membership() {
+    let root = Fixture::new();
+    let alice_id = root.profile("default", "Alice", "alice passphrase");
+    let bob_id = root.profile(OTHER, "Bob", "bob passphrase");
+    root.vault("default", ALICE_VAULT, &alice_id);
+    root.final_card("default", ALICE_VAULT);
+    let membership = root
+        .0
+        .join("vaults")
+        .join(ALICE_VAULT)
+        .join("membership.json");
+    let server = Server::start(&root.0);
+    assert_eq!(
+        server
+            .post("/api/unlock", json!({"passphrase":"alice passphrase"}))
+            .0,
+        200
+    );
+    let route = format!("/api/final-card?vault={ALICE_VAULT}");
+
+    let mut saved: Value = serde_json::from_slice(&fs::read(&membership).unwrap()).unwrap();
+    saved["profile"] = json!(bob_id);
+    fs::write(&membership, saved.to_string()).unwrap();
+    assert_eq!(server.get(&route).0, 400);
+    saved["profile"] = json!(alice_id);
+    saved["transport"] = json!("hosted");
+    fs::write(&membership, saved.to_string()).unwrap();
+    assert_eq!(server.get(&route).0, 400);
+    saved["transport"] = json!("local");
+    saved["network"] = json!("testnet");
+    fs::write(&membership, saved.to_string()).unwrap();
+    assert_eq!(server.get(&route).0, 400);
+}
+
+#[cfg(unix)]
+#[test]
+fn final_card_download_rejects_public_membership_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = Fixture::new();
+    let profile = root.profile("default", "Alice", "alice passphrase");
+    root.vault("default", ALICE_VAULT, &profile);
+    root.final_card("default", ALICE_VAULT);
+    let server = Server::start(&root.0);
+    assert_eq!(
+        server
+            .post("/api/unlock", json!({"passphrase":"alice passphrase"}))
+            .0,
+        200
+    );
+    let route = format!("/api/final-card?vault={ALICE_VAULT}");
+    assert_eq!(server.get(&route).0, 200);
+    let membership = root
+        .0
+        .join("vaults")
+        .join(ALICE_VAULT)
+        .join("membership.json");
+    fs::set_permissions(&membership, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(server.get(&route).0, 400);
 }
 
 #[test]
