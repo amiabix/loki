@@ -5,6 +5,7 @@ end to end without native binaries: the token-authed routes the UI fetches
 new /ui assets are served alongside the shipping app.
 """
 
+import base64
 import http.client
 import json
 import sys
@@ -61,6 +62,33 @@ import unittest
 
 
 class WiredUiTest(unittest.TestCase):
+    def test_final_card_routes_require_signer_token_and_forward_saved_card(self):
+        with tempfile.TemporaryDirectory(prefix="loki-ui-final-card-") as temp:
+            wallet, vault = make_vault(temp)
+            self.addCleanup(wallet.close)
+            token, request = serve(self, wallet)
+            auth = {"X-Loki-Token": token}
+            card = b"LOKISEAL\x01saved final recovery card"
+            final = wallet.data / "vaults" / vault / "final-card"
+            final.mkdir()
+            (final / "vault.card").write_bytes(card)
+
+            self.assertEqual(request("GET", f"/api/final-card?vault={vault}")[0], 403)
+            self.assertEqual(request("POST", "/api/finalize-backup", {"vault": vault})[0], 403)
+            self.assertEqual(request("POST", "/api/verify-final-backup",
+                                     {"vault": vault, "words": "saved words", "card": "ignored"})[0], 403)
+            status, body = request("GET", f"/api/final-card?vault={vault}", headers=auth)
+            self.assertEqual(status, 200)
+            self.assertEqual(base64.b64decode(json.loads(body)["card"]), card)
+
+            with patch.object(wallet, "finalize_backup", return_value={"created": True}) as finalize, \
+                 patch.object(wallet, "verify_final_backup", return_value={"verified": True}) as verify:
+                self.assertEqual(request("POST", "/api/finalize-backup", {"vault": vault}, auth)[0], 200)
+                self.assertEqual(request("POST", "/api/verify-final-backup",
+                                         {"vault": vault, "words": "saved words", "card": "encoded"}, auth)[0], 200)
+                finalize.assert_called_once_with(vault, None)
+                verify.assert_called_once_with(vault, "saved words", "encoded")
+
     def test_ui_assets_are_served_alongside_the_shipping_app(self):
         with tempfile.TemporaryDirectory(prefix="loki-ui-assets-") as temp:
             wallet, _ = make_vault(temp)

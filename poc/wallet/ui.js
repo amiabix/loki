@@ -65,7 +65,15 @@ function flash(el, text, kind = "info") {
   el.classList.remove("hidden");
 }
 
+function clearSetupInputs() {
+  $("setup-words").textContent = "";
+  for (const id of ["setup-fingerprint", "setup-verify-words", "setup-final-create-words", "setup-final-words", "setup-final-card"]) {
+    $(id).value = "";
+  }
+}
+
 function show(id) {
+  if (id !== "setup") clearSetupInputs();
   document.querySelectorAll("[data-screen]").forEach((s) => {
     s.classList.toggle("hidden", s.dataset.screen !== id);
   });
@@ -167,13 +175,12 @@ async function loadVaults() {
 /* ── 03 Create vault: general t-of-n via real /api/create ───────────────── */
 function wireTofN() {
   const tSel = $("t-sel"), nSel = $("n-sel"), preview = $("ton-preview");
-  const MIN = 2, MAX = 9;
-  for (let v = MIN; v <= MAX; v++) nSel.appendChild(new Option(String(v), v, false, v === 3));
-  const fillT = (n, keep) => {
-    const want = keep != null ? keep : Math.min(parseInt(tSel.value || "2", 10), n);
+  for (const n of [3, 4]) nSel.appendChild(new Option(String(n), n, false, n === 3));
+  const fillT = (n) => {
+    const want = parseInt(tSel.value || "2", 10);
     tSel.innerHTML = "";
-    for (let v = MIN; v <= n; v++) tSel.appendChild(new Option(String(v), v));
-    tSel.value = String(Math.min(Math.max(want, MIN), n));
+    for (const t of n === 3 ? [2] : [2, 3]) tSel.appendChild(new Option(String(t), t));
+    tSel.value = String(n === 3 ? 2 : Math.min(want, 3));
   };
   const render = () => {
     const n = parseInt(nSel.value, 10), t = parseInt(tSel.value, 10);
@@ -181,7 +188,7 @@ function wireTofN() {
   };
   nSel.addEventListener("change", () => { fillT(parseInt(nSel.value, 10)); render(); });
   tSel.addEventListener("change", render);
-  fillT(3, 2); render();
+  fillT(3); render();
 }
 
 async function createVault() {
@@ -317,15 +324,21 @@ async function loadSetup() {
   if (!selectedVault) await fillVaultSelect($("setup-vault"), loadSetup).catch(() => {});
   else { const s = $("setup-vault"); if (s.value !== selectedVault) await fillVaultSelect(s, loadSetup).catch(() => {}); }
   const vault = selectedVault;
+  clearSetupInputs();
   if (!vault) { $("setup-steps").textContent = "No vault to set up."; return; }
-  $("setup-words").textContent = "";
   try {
     const state = await api(`status?vault=${encodeURIComponent(vault)}`);
+    if (vault !== selectedVault) return;
     renderSteps(state.phase);
+    $("setup-final-section").classList.toggle("hidden", !["final_backup", "connecting_relays", "active"].includes(state.phase));
+    $("setup-final-create-label").classList.toggle("hidden", !state.final_card_needs_words);
+    $("setup-finalize").disabled = !!state.final_card_created;
+    $("setup-download-final").disabled = !state.final_card_created;
+    $("setup-verify-final").disabled = !state.final_card_created;
     const code = $("setup-code");
     code.replaceChildren();
     const fp = state.fingerprint || "";
-    (fp ? fp.match(/.{1,4}/g).slice(0, 4) : ["—"]).forEach((chunk) => {
+    (fp ? fp.match(/.{1,4}/g) : ["—"]).forEach((chunk) => {
       const b = document.createElement("span"); b.className = "codeblock";
       b.textContent = chunk.toUpperCase(); code.appendChild(b);
     });
@@ -348,9 +361,13 @@ async function loadSetup() {
 async function setupAgree() {
   const out = $("setup-agree-out");
   try {
-    const state = await api(`status?vault=${encodeURIComponent(selectedVault)}`);
+    const vault = selectedVault;
+    const entered = $("setup-fingerprint").value.trim().toLowerCase();
+    const state = await api(`status?vault=${encodeURIComponent(vault)}`);
+    if (vault !== selectedVault) throw new Error("Vault changed. Compare its fingerprint before confirming.");
     if (!state.fingerprint) throw new Error("Wait for all members to publish their roster answer.");
-    await api("agree", { vault: selectedVault, fingerprint: state.fingerprint });
+    if (entered !== state.fingerprint) throw new Error("Type the full fingerprint after comparing it with every member outside this app.");
+    await api("agree", { vault, fingerprint: entered });
     flash(out, "Roster confirmed. Key creation started — this screen resumes if the app restarts.", "accent");
     setTimeout(loadSetup, 800);
   } catch (error) { flash(out, error.message, "danger"); }
@@ -372,6 +389,60 @@ async function setupVerify() {
     await api("activate", { vault: selectedVault });
     flash(out, "Restore proven. Backup confirmed; the vault activates when every member confirms.", "accent");
     setTimeout(loadSetup, 800);
+  } catch (error) { flash(out, error.message, "danger"); }
+}
+
+async function setupFinalize() {
+  const out = $("setup-final-out");
+  try {
+    const vault = selectedVault;
+    const words = $("setup-final-create-words").value.trim();
+    if (!$("setup-final-create-label").classList.contains("hidden") && !words) {
+      throw new Error("Enter your 24 words to create the final card.");
+    }
+    await api("finalize-backup", { vault, ...(words ? { words } : {}) });
+    if (vault !== selectedVault) return;
+    $("setup-final-create-words").value = "";
+    $("setup-download-final").disabled = false;
+    $("setup-verify-final").disabled = false;
+    flash(out, "Final card created. Download it, then load that saved file to check it.", "accent");
+  } catch (error) { flash(out, error.message, "danger"); }
+}
+
+async function setupDownloadFinal() {
+  const out = $("setup-final-out");
+  try {
+    const vault = selectedVault;
+    const result = await api(`final-card?vault=${encodeURIComponent(vault)}`);
+    if (vault !== selectedVault) return;
+    const bytes = Uint8Array.from(atob(result.card), c => c.charCodeAt(0));
+    const url = URL.createObjectURL(new Blob([bytes], { type: "application/octet-stream" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "loki-vault.card";
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (error) { flash(out, error.message, "danger"); }
+}
+
+async function setupVerifyFinal() {
+  const out = $("setup-final-out");
+  try {
+    const vault = selectedVault;
+    const words = $("setup-final-words").value.trim();
+    const file = $("setup-final-card").files[0];
+    if (!words || !file || !file.size || file.size > 64 * 1024) {
+      throw new Error("Enter your 24 words and load the final card you saved.");
+    }
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    if (vault !== selectedVault) throw new Error("Vault changed. Load the saved card for the selected vault.");
+    let raw = "";
+    for (const byte of bytes) raw += String.fromCharCode(byte);
+    await api("verify-final-backup", { vault, words, card: btoa(raw) });
+    $("setup-final-words").value = "";
+    $("setup-final-card").value = "";
+    flash(out, "Final recovery card checked. Ask every member to do the same before depositing.", "accent");
+    await loadSetup();
   } catch (error) { flash(out, error.message, "danger"); }
 }
 
@@ -490,6 +561,9 @@ document.addEventListener("DOMContentLoaded", () => {
   $("setup-agree").addEventListener("click", setupAgree);
   $("setup-backup").addEventListener("click", setupBackup);
   $("setup-verify").addEventListener("click", setupVerify);
+  $("setup-finalize").addEventListener("click", setupFinalize);
+  $("setup-download-final").addEventListener("click", setupDownloadFinal);
+  $("setup-verify-final").addEventListener("click", setupVerifyFinal);
   $("ov-reveal").addEventListener("click", async () => {
     try {
       const r = await api("address", { vault: selectedVault });

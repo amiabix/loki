@@ -64,7 +64,7 @@
       <div class="screen-head">
         <p class="kicker">03 · Create</p>
         <h1 class="screen-title read">Create a vault</h1>
-        <p class="screen-sub">General t-of-n via <span class="mono">/api/create</span>. Roster and threshold become immutable once setup begins.</p>
+        <p class="screen-sub">Create a 2-of-3, 2-of-4, or 3-of-4 vault. Roster and threshold become immutable once setup begins.</p>
       </div>
       <div class="card stack">
         <label class="field"><span class="lbl">Vault name</span><input id="create-name" value="Ops Float" maxlength="80"></label>
@@ -146,10 +146,11 @@
         <div class="card"><div class="steps" id="setup-steps">Loading…</div></div>
         <div class="stack">
           <div class="card stack">
-            <h3>Compare the short code</h3>
-            <p class="muted">Every member's app shows this fingerprint. Confirm it matches out of band, then confirm to start key creation.</p>
+            <h3>Compare the full roster fingerprint</h3>
+            <p class="muted">Compare all characters with every other member over a trusted channel outside this app. Stop if any character differs.</p>
             <div class="codeblocks" id="setup-code"></div>
             <div class="kv" id="setup-confirms"></div>
+            <label class="field"><span class="lbl">Type the full matching fingerprint</span><input id="setup-fingerprint" autocomplete="off" maxlength="64" spellcheck="false"></label>
             <button class="btn btn-primary btn-block" id="setup-agree">Confirm roster &amp; create keys →</button>
             <p id="setup-agree-out" class="callout hidden"></p>
           </div>
@@ -169,6 +170,17 @@
             </div>
             <div class="callout callout-warn"><span class="ico">⚠</span><span>You must prove you can restore from your words and card before this vault activates. A mismatch stops setup and never publishes an address.</span></div>
             <p id="setup-backup-out" class="callout hidden"></p>
+          </div>
+          <div class="card stack hidden" id="setup-final-section">
+            <h3>Save and check the final recovery card</h3>
+            <p class="muted">The final card includes the agreed roster and backup checks. Save it separately from your 24 words, then load your saved copy to prove recovery.</p>
+            <label class="field hidden" id="setup-final-create-label"><span class="lbl">24 words from an earlier setup</span><input id="setup-final-create-words" autocomplete="off"></label>
+            <button class="btn btn-primary" id="setup-finalize">Create final card</button>
+            <button class="btn btn-ghost" id="setup-download-final" disabled>Download final card</button>
+            <label class="field"><span class="lbl">Re-enter your 24 words</span><input id="setup-final-words" autocomplete="off"></label>
+            <label class="field"><span class="lbl">Load the final card you saved</span><input id="setup-final-card" type="file"></label>
+            <button class="btn btn-primary" id="setup-verify-final" disabled>Check saved card</button>
+            <p id="setup-final-out" class="callout hidden"></p>
           </div>
         </div>
       </div>
