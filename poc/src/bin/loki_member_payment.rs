@@ -1043,26 +1043,32 @@ fn finish(args: &[String], broadcast: bool) -> Result<(), String> {
         )
         .collect();
     let (raw, txid) = prove(signed, sighash, witnesses, anchor)?;
-    // A draft reservation this device holds passes to the broadcast transaction.
-    wallet.release_inputs(LockOwner::new(context.attempt.0), &intent.input_nullifiers)?;
+    // For v6 Ironwood, the txid commits to bundle effects while the anchor,
+    // proof and signatures commit to the authorizing digest. See
+    // zakura-orchard 2.2.0 Bundle::commitment and zakura-primitives 2.2.0
+    // TxIdDigester. A retry can prove against the current tree and retain txid.
+    let proposer = loki_poc::payment_manifest::proposer_id(&intent.proposer)?;
+    wallet.transfer_inputs(
+        LockOwner::new(context.attempt.0), txid.into(), &intent.input_nullifiers,
+        intent.expiry_height, member.identity.public().id != proposer, &pass,
+    )?;
     // shortcut: ambiguous broadcast failures keep inputs locked until expiry; add mempool reconciliation for early release.
-    wallet.reserve_inputs(txid.into(), &intent.input_nullifiers, intent.expiry_height)?;
     if let Some((runtime, mut client)) = lightwalletd {
         let sent = runtime.block_on(client.send_transaction(RawTransaction {
             data: raw.clone(), height: 0,
-        })).map_err(|e| format!("lightwalletd send transaction: {e}"))?.into_inner();
+        })).map_err(|e| format!("broadcast status unknown for txid={txid}: {e}"))?.into_inner();
         if sent.error_code != 0 {
-            wallet.release_inputs(txid.into(), &intent.input_nullifiers)?;
-            return Err(format!("lightwalletd rejected transaction ({}): {}", sent.error_code, sent.error_message));
+            return Err(format!("broadcast status unknown for txid={txid}: lightwalletd returned {}: {}",
+                               sent.error_code, sent.error_message));
         }
     } else {
-        let sent = Rpc::regtest().json("sendrawtransaction", &format!("[\"{}\"]", hex::encode(&raw)))?;
+        let sent = Rpc::regtest().json("sendrawtransaction", &format!("[\"{}\"]", hex::encode(&raw)))
+            .map_err(|e| format!("broadcast status unknown for txid={txid}: {e}"))?;
         if sent.as_str() != Some(txid.to_string().as_str()) {
-            return Err(format!("node returned a different txid: {sent}"));
+            return Err(format!("broadcast status unknown for txid={txid}: node returned {sent}"));
         }
     }
     let txid = txid.to_string();
-    fs::write(work.join("final.hex"), hex::encode(&raw)).map_err(|e| e.to_string())?;
     println!(
         "broadcast txid={txid} payment={}",
         hex::encode(context.payment)

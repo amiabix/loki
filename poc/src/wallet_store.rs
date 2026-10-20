@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, convert::Infallible, fs, io, path::Path, sync::Mutex};
+use std::{collections::BTreeMap, convert::Infallible, fs, io, path::{Path, PathBuf}, sync::Mutex};
 
 use argon2::Argon2;
 use async_trait::async_trait;
@@ -9,7 +9,7 @@ use orchard::{
     tree::{MerkleHashOrchard, MerklePath},
 };
 use rand_zp::{rand_core::UnwrapErr, rngs::SysRng};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use zcash_address::ZcashAddress;
 use zcash_client_backend::{
     data_api::{
@@ -46,6 +46,7 @@ type Database = WalletDb<Connection, VaultNetwork, SystemClock, UnwrapErr<SysRng
 pub struct VaultWallet {
     db: Database,
     network: VaultNetwork,
+    path: PathBuf,
 }
 
 /// What the wallet's input selector chose to fund one payment.
@@ -212,6 +213,26 @@ pub fn lightwalletd_url(network: VaultNetwork) -> Option<String> {
     Some(format!("http://{host}:{port}"))
 }
 
+fn encrypted_connection(path: &Path, fvk: &FullViewingKey, passphrase: &str) -> Result<Connection, String> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .map_err(|e| format!("open wallet database: {e}"))?;
+    let salt = blake3::derive_key("Loki wallet database salt v1", &fvk.to_bytes());
+    let mut key = Zeroizing::new([0u8; 32]);
+    Argon2::default()
+        .hash_password_into(passphrase.as_bytes(), &salt[..16], key.as_mut())
+        .map_err(|e| format!("derive wallet database key: {e}"))?;
+    let pragma = Zeroizing::new(format!("PRAGMA key = \"x'{}'\";", hex::encode(*key)));
+    conn.execute_batch(&pragma)
+        .map_err(|e| format!("unlock wallet database: {e}"))?;
+    let _: String = conn
+        .query_row("PRAGMA cipher_version", [], |row| row.get(0))
+        .map_err(|e| format!("SQLCipher unavailable: {e}"))?;
+    conn.query_row("SELECT name FROM sqlite_master LIMIT 1", [], |row| row.get::<_, String>(0))
+        .optional()
+        .map_err(|e| format!("wrong wallet passphrase or damaged database: {e}"))?;
+    Ok(conn)
+}
+
 /// Opens this member's wallet, creating it at the vault's birth if needed, and scans it to
 /// lightwalletd's tip.
 pub async fn sync_member_wallet(
@@ -338,23 +359,7 @@ impl VaultWallet {
                 .open(path)
                 .map_err(|e| format!("create wallet database: {e}"))?;
         }
-        let conn = Connection::open(path).map_err(|e| format!("open wallet database: {e}"))?;
-        let salt = blake3::derive_key("Loki wallet database salt v1", &fvk.to_bytes());
-        let mut key = Zeroizing::new([0u8; 32]);
-        Argon2::default()
-            .hash_password_into(passphrase.as_bytes(), &salt[..16], key.as_mut())
-            .map_err(|e| format!("derive wallet database key: {e}"))?;
-        let pragma = Zeroizing::new(format!("PRAGMA key = \"x'{}'\";", hex::encode(*key)));
-        conn.execute_batch(&pragma)
-            .map_err(|e| format!("unlock wallet database: {e}"))?;
-        let _: String = conn
-            .query_row("PRAGMA cipher_version", [], |row| row.get(0))
-            .map_err(|e| format!("SQLCipher unavailable: {e}"))?;
-        conn.query_row("SELECT name FROM sqlite_master LIMIT 1", [], |row| {
-            row.get::<_, String>(0)
-        })
-        .optional()
-        .map_err(|e| format!("wrong wallet passphrase or damaged database: {e}"))?;
+        let conn = encrypted_connection(path, fvk, passphrase)?;
         rusqlite::vtab::array::load_module(&conn)
             .map_err(|e| format!("initialize wallet array queries: {e}"))?;
 
@@ -400,7 +405,7 @@ impl VaultWallet {
                 return Err("wallet database has a different vault birth height".into());
             }
         }
-        Ok(Self { db, network })
+        Ok(Self { db, network, path: path.to_path_buf() })
     }
 
     pub fn viewing_key(&self) -> Result<FullViewingKey, String> {
@@ -677,6 +682,68 @@ impl VaultWallet {
                 .map_err(|e| format!("release payment inputs: {e}"))?;
         }
         Ok(())
+    }
+
+    /// Reserve the proved transaction before broadcast. The proposer must own the exact
+    /// draft lock; another member must have no lock. Repeating a completed transfer is safe.
+    pub fn transfer_inputs(
+        &mut self,
+        draft: LockOwner,
+        transaction: LockOwner,
+        nullifiers: &[[u8; 32]],
+        expiry_height: u32,
+        allow_unreserved: bool,
+        passphrase: &str,
+    ) -> Result<(), String> {
+        let height = self.scanned_height()?.ok_or("wallet has not scanned any blocks")?;
+        if draft == transaction || nullifiers.is_empty() || expiry_height <= height {
+            return Err("payment reservation is invalid or expired".into());
+        }
+        let outputs = self.input_refs(nullifiers)?;
+        if outputs.len() != nullifiers.len() {
+            return Err("payment inputs differ from this wallet's unspent notes".into());
+        }
+        let mut conn = encrypted_connection(&self.path, &self.viewing_key()?, passphrase)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| format!("begin payment reservation transfer: {e}"))?;
+        let mut already_transferred = None;
+        for output in outputs {
+            let (owner, expiry): (Option<Vec<u8>>, Option<u32>) = tx.query_row(
+                "SELECT rn.lock_owner, rn.lock_expiry_height FROM ironwood_received_notes rn \
+                 JOIN transactions t ON t.id_tx = rn.transaction_id \
+                 WHERE t.txid = ?1 AND rn.action_index = ?2",
+                rusqlite::params![output.txid().as_ref(), output.output_index()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).map_err(|e| format!("read payment reservation: {e}"))?;
+            let transferred = owner.as_deref() == Some(transaction.as_bytes())
+                && expiry == Some(expiry_height);
+            let expected = if allow_unreserved {
+                owner.is_none() && expiry.is_none()
+            } else {
+                owner.as_deref() == Some(draft.as_bytes()) && expiry == Some(expiry_height)
+            };
+            if !transferred && !expected || already_transferred.is_some_and(|seen| seen != transferred) {
+                return Err("payment reservation changed or disappeared; do not broadcast".into());
+            }
+            already_transferred = Some(transferred);
+            if transferred {
+                continue;
+            }
+            let changed = tx.execute(
+                "UPDATE ironwood_received_notes SET lock_owner = ?1, lock_expiry_height = ?4 \
+                 WHERE transaction_id = (SELECT id_tx FROM transactions WHERE txid = ?2) \
+                 AND action_index = ?3 AND ((?6 = 0 AND lock_expiry_height = ?4 \
+                 AND lock_owner = ?5) OR (?6 = 1 AND lock_owner IS NULL \
+                 AND lock_expiry_height IS NULL))",
+                rusqlite::params![transaction.as_bytes().as_slice(), output.txid().as_ref(),
+                                  output.output_index(), expiry_height, draft.as_bytes().as_slice(),
+                                  allow_unreserved],
+            ).map_err(|e| format!("transfer payment reservation: {e}"))?;
+            if changed != 1 {
+                return Err("payment reservation changed or disappeared; do not broadcast".into());
+            }
+        }
+        tx.commit().map_err(|e| format!("commit payment reservation transfer: {e}"))
     }
 
     fn input_refs(&self, nullifiers: &[[u8; 32]]) -> Result<Vec<OutputRef>, String> {
@@ -1113,8 +1180,44 @@ mod tests {
         let funding = pay(&mut wallet, 60_000).unwrap();
         assert_eq!(funding.notes.len(), 2);
         assert!(funding.notes.iter().all(|note| note.nullifier(&fvk).to_bytes() != reserved));
-        wallet.release_inputs(draft, &[reserved]).unwrap();
+        let other = notes[1].nullifier(&fvk).to_bytes();
+        wallet.reserve_inputs(LockOwner::new([2; 32]), &[other], height + 100).unwrap();
+        let broadcast = LockOwner::new([3; 32]);
+        assert!(wallet.transfer_inputs(draft, broadcast, &[reserved, other], height + 100, false, "pass").is_err());
+        wallet.transfer_inputs(draft, broadcast, &[reserved], height + 100, false, "pass").unwrap();
+        wallet.transfer_inputs(draft, broadcast, &[reserved], height + 100, false, "pass").unwrap();
+        drop(wallet);
+        let mut wallet = VaultWallet::open_existing(&path, VaultNetwork::Testnet, &fvk, height, "pass").unwrap();
+        assert!(pay(&mut wallet, 100_000).is_err());
+        assert!(wallet.transfer_inputs(draft, LockOwner::new([4; 32]), &[reserved], height + 100, false, "pass").is_err());
+        wallet.release_inputs(broadcast, &[reserved]).unwrap();
+        wallet.release_inputs(LockOwner::new([2; 32]), &[other]).unwrap();
         assert_eq!(pay(&mut wallet, 100_000).unwrap().notes.len(), 3);
+        assert!(wallet.transfer_inputs(draft, broadcast, &[reserved], height + 100, false, "pass").is_err());
+        wallet.reserve_inputs(draft, &[other], height + 100).unwrap();
+        assert!(wallet.transfer_inputs(draft, broadcast, &[other], height + 100, true, "pass").is_err());
+        wallet.release_inputs(draft, &[other]).unwrap();
+        wallet.transfer_inputs(draft, broadcast, &[reserved], height + 100, true, "pass").unwrap();
+        drop(wallet);
+        let mut wallet = VaultWallet::open_existing(&path, VaultNetwork::Testnet, &fvk, height, "pass").unwrap();
+        wallet.transfer_inputs(draft, broadcast, &[reserved], height + 100, true, "pass").unwrap();
+        assert!(wallet.transfer_inputs(draft, LockOwner::new([4; 32]), &[reserved], height + 100, true, "pass").is_err());
+        wallet.release_inputs(broadcast, &[reserved]).unwrap();
+        wallet.reserve_inputs(draft, &[reserved, other], height + 100).unwrap();
+        let outputs = wallet.input_refs(&[reserved, other]).unwrap();
+        let conn = encrypted_connection(&path, &fvk, "pass").unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER fail_second_transfer BEFORE UPDATE OF lock_owner ON ironwood_received_notes \
+             WHEN OLD.action_index = {} BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+            outputs[1].output_index(),
+        )).unwrap();
+        assert!(wallet.transfer_inputs(draft, broadcast, &[reserved, other], height + 100, false, "pass").is_err());
+        conn.execute_batch("DROP TRIGGER fail_second_transfer").unwrap();
+        wallet.transfer_inputs(draft, broadcast, &[reserved, other], height + 100, false, "pass").unwrap();
+        drop(wallet);
+        let mut wallet = VaultWallet::open_existing(&path, VaultNetwork::Testnet, &fvk, height, "pass").unwrap();
+        wallet.transfer_inputs(draft, broadcast, &[reserved, other], height + 100, false, "pass").unwrap();
+        wallet.release_inputs(broadcast, &[reserved, other]).unwrap();
         drop(wallet);
         std::fs::remove_file(path).unwrap();
     }
