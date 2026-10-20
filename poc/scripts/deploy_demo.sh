@@ -100,7 +100,7 @@ echo "{\"access\": $acc}" | jq . > "$WEB/.access.json"
 for i in $(seq 1 $N); do echo "Member $i  $PUBLIC/#${SLUG[$i]}" >> "$DATA/links.txt"; done
 
 cd "$WEB"
-[ -d node_modules ] || npm install --silent
+[ -d node_modules/@webgpu/types ] || npm install --no-audit --no-fund --silent
 npm run build >"$DATA/web-build.log" 2>&1 || { echo "web build failed; see $DATA/web-build.log"; tail -20 "$DATA/web-build.log"; exit 1; }
 pkill -f "next start" 2>/dev/null; pkill -f "next-server" 2>/dev/null; sleep 1
 setsid npx next start -p 3001 >"$DATA/web.log" 2>&1 &
