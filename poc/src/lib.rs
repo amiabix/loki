@@ -24,6 +24,7 @@ pub mod dkg_core;
 pub mod enclave_ffi;
 pub mod intent;
 pub mod member_state;
+pub mod member_runtime;
 pub mod network;
 #[cfg(test)]
 mod nonce_binding;

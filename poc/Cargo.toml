@@ -63,6 +63,7 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 serde = { version = "1", features = ["derive"] }
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
 xeddsa = "1"
 zcash_note_encryption = "0.4.2"
 # Only for the forbidden-pool tamper fixtures: these build a transparent / Sapling
@@ -103,6 +104,10 @@ optional = true
 # `src/member_service.rs` for the stdin/stdout protocol.
 name = "loki_member_service"
 required-features = ["relay-communication"]
+
+[[bin]]
+name = "loki_member_runtime"
+path = "src/bin/loki_member_runtime.rs"
 
 [[example]]
 # Test-only fixture: stands up owned development relay operators and issues grants
