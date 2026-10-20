@@ -194,7 +194,7 @@ audited `reddsa_frost`/`frost-core`; only the thin client orchestration is local
 replace this orchestration behind the same `Transport` seam.)
 
 ### 5.3 Live acceptance (ws3 §7.1 / §7.3)
-`FROSTD_URL=http://127.0.0.1:2744 cargo test --features relay-communication --test frostd_transport -- --nocapture`
+`FROSTD_URL=http://127.0.0.1:2744 cargo test --test frostd_transport -- --nocapture`
 runs the new signer's setup and a payment signature over the running frostd. Three
 storage-backed `LocalSigner`s confirm the roster code, run the **v2 dealerless DKG**
 through the shared core (`poc/src/dkg_core.rs`), save backups and reach ready; members

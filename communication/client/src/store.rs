@@ -800,9 +800,10 @@ impl ClientStore {
     }
 
     pub fn recover_recipients(&self, key: &LogicalKey) -> ClientResult<Vec<RecoveryRecipient>> {
-        let mut statement = self.connection.prepare(
-            "SELECT recipient,transfer,root_hash,state FROM outgoing_recipients WHERE vault=?1 AND roster=?2 AND sender=?3 AND message_id=?4 ORDER BY recipient LIMIT 5"
-        )?;
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT recipient,transfer,root_hash,state FROM outgoing_recipients WHERE vault=?1 AND roster=?2 AND sender=?3 AND message_id=?4 ORDER BY recipient LIMIT {}",
+            loki_relay_protocol::types::MAX_MEMBERS
+        ))?;
         let rows = statement.query_map(
             params![key.vault, key.roster, key.sender, key.message],
             |r| {
@@ -2725,7 +2726,13 @@ impl ClientStore {
         if stored != owner {
             return Err(ClientError::Identity);
         }
-        let mut statement = self.connection.prepare(
+        // Every roster member, as integer literals: the roster has up to 16 members.
+        let members = members
+            .iter()
+            .map(MemberId::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut statement = self.connection.prepare(&format!(
             "SELECT rowid,vault,roster,sender,message_id,digest,session,from_member,source_root,phase FROM (
                 SELECT e.rowid,e.vault,e.roster,e.sender,e.message_id,e.digest,e.session,e.from_member,e.source_root,
                 CASE
@@ -2734,21 +2741,21 @@ impl ClientStore {
                         WHERE j.vault=e.vault AND j.roster=e.roster AND j.sender=e.sender
                         AND j.message_id=e.message_id AND j.digest=e.digest AND j.from_member=e.from_member
                     ) THEN 'rejected'
-                    WHEN e.from_member NOT IN (?3,?4,?5,?7) OR e.from_member=e.sender OR e.from_member=?6 THEN 'not_actionable'
+                    WHEN e.from_member NOT IN ({members}) OR e.from_member=e.sender OR e.from_member=?3 THEN 'not_actionable'
                     WHEN NOT EXISTS (
                         SELECT 1 FROM logical_records l
-                        WHERE e.sender=?6 AND l.vault=e.vault AND l.roster=e.roster AND l.sender=e.sender AND l.message_id=e.message_id
+                        WHERE e.sender=?3 AND l.vault=e.vault AND l.roster=e.roster AND l.sender=e.sender AND l.message_id=e.message_id
                     ) AND NOT EXISTS (
                         SELECT 1 FROM incoming_originals i
-                        WHERE e.sender<>?6 AND i.vault=e.vault AND i.roster=e.roster AND i.sender=e.sender AND i.message_id=e.message_id
+                        WHERE e.sender<>?3 AND i.vault=e.vault AND i.roster=e.roster AND i.sender=e.sender AND i.message_id=e.message_id
                     ) THEN 'pending'
                     WHEN NOT EXISTS (
                         SELECT 1 FROM logical_records l
-                        WHERE e.sender=?6 AND l.vault=e.vault AND l.roster=e.roster AND l.sender=e.sender AND l.message_id=e.message_id
+                        WHERE e.sender=?3 AND l.vault=e.vault AND l.roster=e.roster AND l.sender=e.sender AND l.message_id=e.message_id
                         AND l.digest=e.digest AND l.session IS e.session AND l.kind=1
                     ) AND NOT EXISTS (
                         SELECT 1 FROM incoming_originals i
-                        WHERE e.sender<>?6 AND i.vault=e.vault AND i.roster=e.roster AND i.sender=e.sender AND i.message_id=e.message_id
+                        WHERE e.sender<>?3 AND i.vault=e.vault AND i.roster=e.roster AND i.sender=e.sender AND i.message_id=e.message_id
                         AND i.digest=e.digest AND i.session IS e.session AND i.kind=1
                     ) THEN 'not_actionable'
                     WHEN EXISTS (
@@ -2758,10 +2765,10 @@ impl ClientStore {
                     ELSE 'ready'
                 END AS phase
                 FROM early_received_refs e
-            ) WHERE rowid>?1 ORDER BY rowid LIMIT ?2",
-        )?;
+            ) WHERE rowid>?1 ORDER BY rowid LIMIT ?2"
+        ))?;
         let rows = statement.query_map(
-            params![after, limit, members[0], members[1], members[2], owner, members.get(3).copied().unwrap_or(0)],
+            params![after, limit, owner],
             |row| {
                 Ok(EarlyReceived {
                     cursor: row.get(0)?,

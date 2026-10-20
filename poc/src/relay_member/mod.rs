@@ -235,7 +235,10 @@ fn roster(value: &Value) -> MemberResult<Roster> {
     let vault = hex32(&value["vault"])?;
     let entries = value["members"].as_array().ok_or(MemberError::Roster)?;
     let threshold = value.get("threshold").map(Value::as_u64).unwrap_or(Some(2));
-    if !matches!((threshold, entries.len()), (Some(2), 3) | (Some(2), 4) | (Some(3), 4)) {
+    let threshold = threshold
+        .and_then(|t| u16::try_from(t).ok())
+        .ok_or(MemberError::Roster)?;
+    if !member_state::valid_policy(threshold, entries.len()) {
         return Err(MemberError::Roster);
     }
     let mut members = Vec::with_capacity(entries.len());
@@ -350,3 +353,33 @@ pub mod config;
 pub mod exchange;
 pub use config::{ConfigStore, LocalConfig, PendingRequest, ProvisionTarget};
 pub use exchange::{CourierFile, CourierImport};
+
+#[cfg(test)]
+mod roster_tests {
+    use super::*;
+
+    fn document(threshold: u16, count: u16) -> Value {
+        let members: Vec<Value> = (1..=count)
+            .map(|id| {
+                let public = Identity::new(id).public();
+                serde_json::json!({
+                    "id": id,
+                    "signing": hex::encode(public.signing),
+                    "encryption": hex::encode(public.encryption),
+                })
+            })
+            .collect();
+        serde_json::json!({"vault": hex::encode([7u8; 32]), "threshold": threshold, "members": members})
+    }
+
+    #[test]
+    fn roster_accepts_every_general_policy_and_nothing_else() {
+        for (threshold, count) in [(2, 3), (3, 4), (2, 5), (3, 5), (15, 16)] {
+            let parsed = roster(&document(threshold, count)).unwrap();
+            assert_eq!(parsed.members.len(), usize::from(count));
+        }
+        for (threshold, count) in [(1, 3), (3, 3), (5, 5), (2, 17)] {
+            assert!(roster(&document(threshold, count)).is_err(), "{threshold}-of-{count}");
+        }
+    }
+}
