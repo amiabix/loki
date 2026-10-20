@@ -17,9 +17,8 @@
 //!   6. aggregate the shares ([`frost_rerandomized::aggregate`]), apply the signature to the
 //!      PCZT, and return the signed bytes.
 //!
-//! It stops at the signed PCZT: no prove, broadcast, scan, or chain contact. The
-//! existing prover needs the redacted FVK, so broadcasting this path requires a
-//! trusted signer-side proving handoff.
+//! The loop stops at the signed PCZT; the proposer signer can prove it through
+//! [`Signer::prove_signed`] without revealing its viewing key to the coordinator.
 
 use crate::signer::{CandidateRef, PublicPaymentParams, Session, Signer};
 use reddsa_frost::frost::redpallas as frost;
@@ -91,7 +90,7 @@ where
     //    hands over only the public effects + alpha (canonical bytes). The coordinator
     //    never selects a note; the returned PCZT contains note openings but no vault FVK.
     let pczt_bytes = {
-        let proposer = &quorum[0];
+        let proposer = &mut quorum[0];
         proposer
             .signer
             .build_candidate(&proposer.session, cand, intent, &alpha_bytes)
@@ -222,7 +221,7 @@ mod tests {
     /// (members 1..=t) through the keyless loop. The loop itself verifies the aggregated
     /// signature under the randomized group key before returning — the exact bytes a prover
     /// would accept — so a non-error return IS the acceptance.
-    fn roundtrip(threshold: u16, members: u16) {
+    fn roundtrip(threshold: u16, members: u16, prove: bool) {
         let (shares, public) = frost::keys::generate_with_dealer(
             members,
             threshold,
@@ -279,7 +278,8 @@ mod tests {
             })
             .collect();
 
-        // PUBLIC effects only: no fvk, no note. The coordinator never learns either.
+        // Public effects only: the coordinator never receives the FVK, but the PCZT
+        // still contains private note openings and must be handled as wallet data.
         let intent = PaymentIntent {
             recipient: fvk.address_at(7u64, Scope::External),
             amount: Zatoshis::const_from_u64(AMOUNT),
@@ -334,15 +334,104 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+
+        if prove {
+            let empty = orchard::tree::MerkleHashOrchard::from_bytes(&[0u8; 32]).unwrap();
+            let path = orchard::tree::MerklePath::from_parts(0, [empty; 32]);
+            let anchor = path.root(note.commitment().into()).to_bytes();
+            let spend_index = pczt::Pczt::parse(&signed)
+                .unwrap()
+                .ironwood()
+                .actions()
+                .iter()
+                .position(|action| action.spend().nullifier() == &nf)
+                .unwrap();
+            let proposer = &mut quorum[0];
+            let wrong_cand = CandidateRef {
+                attempt_id: [8u8; 32],
+                ..cand.clone()
+            };
+            assert!(proposer
+                .signer
+                .prove_signed(&proposer.session, &wrong_cand, &signed, vec![(spend_index, path.clone())], anchor)
+                .is_err());
+            assert!(proposer
+                .signer
+                .prove_signed(&Session([8u8; 32]), &cand, &signed, vec![(spend_index, path.clone())], anchor)
+                .is_err());
+            let unsigned = pczt::roles::redactor::Redactor::new(pczt::Pczt::parse(&signed).unwrap())
+                .redact_ironwood_with(|mut bundle| {
+                    bundle.redact_action(spend_index, |mut action| action.clear_spend_auth_sig());
+                })
+                .finish()
+                .serialize()
+                .unwrap();
+            assert!(proposer
+                .signer
+                .prove_signed(&proposer.session, &cand, &unsigned, vec![(spend_index, path.clone())], anchor)
+                .is_err());
+            let altered = pczt::roles::updater::Updater::new(pczt::Pczt::parse(&signed).unwrap())
+                .set_ironwood_anchor(orchard::Anchor::from_bytes(anchor).unwrap())
+                .unwrap()
+                .finish()
+                .serialize()
+                .unwrap();
+            assert!(proposer
+                .signer
+                .prove_signed(&proposer.session, &cand, &altered, vec![(spend_index, path.clone())], anchor)
+                .is_err());
+            assert!(proposer.signer.prove_signed(&proposer.session, &cand, &signed, vec![], anchor).is_err());
+            let (raw, _txid) = proposer
+                .signer
+                .prove_signed(
+                    &proposer.session,
+                    &cand,
+                    &signed,
+                    vec![(spend_index, path)],
+                    anchor,
+                )
+                .expect("the proposer proves without releasing its viewing key");
+            assert!(!raw.is_empty(), "proving returns a broadcastable transaction");
+            assert!(proposer
+                .signer
+                .prove_signed(
+                    &proposer.session,
+                    &cand,
+                    &signed,
+                    vec![(spend_index, orchard::tree::MerklePath::from_parts(0, [empty; 32]))],
+                    anchor,
+                )
+                .is_err());
+        } else {
+            let proposer = &mut quorum[0];
+            assert!(proposer.signer.abort_candidate(&Session([8u8; 32]), &cand).is_err());
+            proposer.signer.abort_candidate(&proposer.session, &cand).unwrap();
+            let retry = CandidateRef {
+                attempt_id: [10u8; 32],
+                ..cand.clone()
+            };
+            let second = drive_to_signed_pczt(&public, &intent, &retry, &mut quorum)
+                .expect("a fresh attempt succeeds after the proposer aborts");
+            assert!(!second.is_empty());
+            let proposer = &mut quorum[0];
+            let fresh = proposer
+                .signer
+                .connect("http://coordinator.test", Network::Regtest, b"u2-challenge")
+                .unwrap()
+                .session;
+            assert_ne!(fresh, proposer.session, "repeated challenges get fresh sessions");
+            assert!(proposer.signer.prove_signed(&proposer.session, &retry, &second, vec![], [0; 32]).is_err());
+            assert!(proposer.signer.prove_signed(&fresh, &retry, &second, vec![], [0; 32]).is_err());
+        }
     }
 
     #[test]
     fn keyless_loop_signs_2_of_3() {
-        roundtrip(2, 3);
+        roundtrip(2, 3, true);
     }
 
     #[test]
-    fn keyless_loop_signs_3_of_5() {
-        roundtrip(3, 5);
+    fn keyless_loop_retries_3_of_5() {
+        roundtrip(3, 5, false);
     }
 }

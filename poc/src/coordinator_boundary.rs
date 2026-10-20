@@ -153,7 +153,7 @@ mod tests {
                 Ok(vec![])
             }
             fn build_candidate(
-                &self,
+                &mut self,
                 _: &Session,
                 _: &crate::signer::CandidateRef,
                 _: &crate::signer::PublicPaymentParams,
@@ -176,6 +176,23 @@ mod tests {
                 _: &reddsa_frost::frost::redpallas::SigningPackage,
                 _: &[u8],
             ) -> Result<reddsa_frost::frost::redpallas::round2::SignatureShare, ()> {
+                Err(())
+            }
+            fn prove_signed(
+                &mut self,
+                _: &Session,
+                _: &crate::signer::CandidateRef,
+                _: &[u8],
+                _: Vec<(usize, orchard::tree::MerklePath)>,
+                _: [u8; 32],
+            ) -> Result<(Vec<u8>, zcash_primitives::transaction::TxId), ()> {
+                Err(())
+            }
+            fn abort_candidate(
+                &mut self,
+                _: &Session,
+                _: &crate::signer::CandidateRef,
+            ) -> Result<(), ()> {
                 Err(())
             }
             fn rendered_payment(

@@ -64,7 +64,7 @@ pub struct Connection {
 }
 
 /// Names a candidate the coordinator wants this member to commit/sign to. Public.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CandidateRef {
     pub vault_id: [u8; 32],
     pub payment_id: [u8; 32],
@@ -87,10 +87,10 @@ pub struct PublicPaymentParams {
 /// The ONE keyless signer seam (ws1-signer §7). Every parameter and return type is
 /// FROST/PCZT artifacts: session handles, vault metadata, authenticated DKG round-one
 /// messages, recipient-encrypted DKG round-two messages, signing commitments, and
-/// signature shares (public partial signatures).
+/// signature shares (public partial signatures), and a proved transaction.
 ///
 /// There is deliberately NO method that takes or returns a FROST share, a secret nonce,
-/// a viewing key, or a spend authorization (invariants #1/#4). Opaque byte vectors need
+/// or a viewing key (invariants #1/#4). Opaque byte vectors need
 /// separate tests to verify that secret material is encrypted before it crosses this seam.
 ///
 /// Implemented by [`local::LocalSigner`] (in-app, secure-element-wrapped share) today and
@@ -136,7 +136,7 @@ pub trait Signer {
     /// serialized, IO-finalized candidate bytes that round 2 then renders and signs. The
     /// coordinator never sees the viewing key or chooses the note.
     fn build_candidate(
-        &self,
+        &mut self,
         session: &Session,
         cand: &CandidateRef,
         params: &PublicPaymentParams,
@@ -158,6 +158,21 @@ pub trait Signer {
         pkg: &frost::SigningPackage,
         randomizer: &[u8],
     ) -> Result<frost::round2::SignatureShare, Self::Error>;
+
+    /// The proposer restores its private candidate, verifies that the coordinator added
+    /// only the approved spend signature, and returns broadcastable transaction bytes.
+    fn prove_signed(
+        &mut self,
+        session: &Session,
+        cand: &CandidateRef,
+        signed: &[u8],
+        witnesses: Vec<(usize, orchard::tree::MerklePath)>,
+        anchor: [u8; 32],
+    ) -> Result<(Vec<u8>, zcash_primitives::transaction::TxId), Self::Error>;
+
+    /// Drop an unfinished private candidate so a new attempt can be built. Any nonce
+    /// already consumed for this attempt remains burned.
+    fn abort_candidate(&mut self, session: &Session, cand: &CandidateRef) -> Result<(), Self::Error>;
 
     /// What the member saw on-device for this candidate (for the coordinator's UI/audit).
     /// Public facts only, derived from the PCZT.
@@ -193,6 +208,7 @@ mod tests {
     impl<T: PublicArtifact> PublicArtifact for Vec<T> {}
     impl PublicArtifact for VaultRef {}
     impl PublicArtifact for Vec<u8> {} // opacity requires separate DKG boundary tests
+    impl PublicArtifact for (Vec<u8>, zcash_primitives::transaction::TxId) {}
 
     fn assert_public<T: PublicArtifact>() {}
 
@@ -206,6 +222,7 @@ mod tests {
         assert_public::<frost::round1::SigningCommitments>(); // sign_commit
         assert_public::<frost::round2::SignatureShare>(); // sign_approve
         assert_public::<PaymentView>(); // rendered_payment
+        assert_public::<(Vec<u8>, zcash_primitives::transaction::TxId)>(); // prove_signed
                                         // disconnect returns ()
 
         // Negative guard, stated in the type system: the secret types are NOT artifacts.

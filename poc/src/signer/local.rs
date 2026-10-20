@@ -90,8 +90,15 @@ impl Drop for SecretRound2 {
     }
 }
 
+struct PrivateCandidate {
+    original: pczt::Pczt,
+    redacted: Vec<u8>,
+    spend_index: usize,
+    approved_sighash: Option<[u8; 32]>,
+}
+
 /// One member's signer. Holds the sealed share + the public key package + the vault FVK
-/// (public: used only to render PCZTs and verify openings), a secure element, a crash-safe
+/// (privacy-sensitive: used to render PCZTs and verify openings), a secure element, a crash-safe
 /// nonce store, and an approval policy.
 pub struct LocalSigner<SE: SecureElement> {
     member_id: u16,
@@ -106,7 +113,7 @@ pub struct LocalSigner<SE: SecureElement> {
     sealed_share: Option<SealedShare>,
     /// The group `PublicKeyPackage`, serialized. Public.
     public_package: Option<Vec<u8>>,
-    /// The vault viewing key. PUBLIC — used to render payments and verify openings.
+    /// The vault viewing key. Privacy-sensitive; never returned to the coordinator.
     vault_fvk: FullViewingKey,
     nonces: NonceStore,
     approval: ApprovalPolicy,
@@ -120,6 +127,7 @@ pub struct LocalSigner<SE: SecureElement> {
     /// proposer selects from these when it builds a candidate; the coordinator never sees
     /// them. Empty until set by the signer's owner (`set_candidate_notes`).
     candidate_notes: Vec<orchard::Note>,
+    private_candidates: BTreeMap<CandidateRef, PrivateCandidate>,
 }
 
 impl<SE: SecureElement> LocalSigner<SE> {
@@ -161,6 +169,7 @@ impl<SE: SecureElement> LocalSigner<SE> {
             session: None,
             rendered: BTreeMap::new(),
             candidate_notes: Vec::new(),
+            private_candidates: BTreeMap::new(),
         })
     }
 
@@ -236,6 +245,7 @@ impl<SE: SecureElement> LocalSigner<SE> {
             session: None,
             rendered: BTreeMap::new(),
             candidate_notes: Vec::new(),
+            private_candidates: BTreeMap::new(),
         })
     }
 
@@ -289,6 +299,7 @@ impl<SE: SecureElement> LocalSigner<SE> {
             session: None,
             rendered: BTreeMap::new(),
             candidate_notes: Vec::new(),
+            private_candidates: BTreeMap::new(),
         })
     }
 
@@ -312,7 +323,7 @@ impl<SE: SecureElement> LocalSigner<SE> {
         params_net: &P,
         params: &crate::signer::PublicPaymentParams,
         alpha: &[u8; 32],
-    ) -> Result<Vec<u8>, SignerError> {
+    ) -> Result<(pczt::Pczt, Vec<u8>, usize), SignerError> {
         use crate::candidate::{alpha_from_canonical_bytes, build_candidate, quote_fee, CandidateInputs};
         // ponytail: first-note selection; swap for real coin selection when multi-note lands.
         let note = *self
@@ -357,14 +368,15 @@ impl<SE: SecureElement> LocalSigner<SE> {
         let candidate = pczt::roles::io_finalizer::IoFinalizer::new(candidate)
             .finalize_io()
             .map_err(|e| SignerError::Other(format!("io finalize: {e:?}")))?;
-        let candidate = pczt::roles::redactor::Redactor::new(candidate)
+        let redacted = pczt::roles::redactor::Redactor::new(candidate.clone())
             .redact_ironwood_with(|mut bundle| {
                 bundle.redact_action(spend_index, |mut action| action.clear_spend_fvk());
             })
             .finish();
-        candidate
+        let bytes = redacted
             .serialize()
-            .map_err(|e| SignerError::Other(format!("serialize: {e:?}")))
+            .map_err(|e| SignerError::Other(format!("serialize: {e:?}")))?;
+        Ok((candidate, bytes, spend_index))
     }
 
     /// Unseal the member's `KeyPackage` into memory. Caller drops it promptly.
@@ -400,11 +412,14 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
                 network, self.network
             )));
         }
-        // Session id binds the challenge so a replayed connect gets a distinct handle.
-        let mut sid = [0u8; 32];
-        let h = blake3::hash(challenge);
-        sid.copy_from_slice(h.as_bytes());
-        let session = Session(sid);
+        // A fresh random session prevents a repeated challenge from reviving an old handle.
+        let mut nonce = [0u8; 32];
+        rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut nonce);
+        let mut h = blake3::Hasher::new();
+        h.update(challenge);
+        h.update(&nonce);
+        let session = Session(*h.finalize().as_bytes());
+        self.private_candidates.clear();
         self.session = Some(session.clone());
         // The DKG identity is the approved roster key; a restored share has only
         // its verifying share available here.
@@ -563,23 +578,33 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
     }
 
     fn build_candidate(
-        &self,
+        &mut self,
         session: &Session,
-        _cand: &CandidateRef,
+        cand: &CandidateRef,
         params: &crate::signer::PublicPaymentParams,
         alpha: &[u8; 32],
     ) -> Result<Vec<u8>, Self::Error> {
         if self.session.as_ref() != Some(session) {
             return Err(SignerError::NoSession);
         }
+        if cand.vault_id != self.vault_id || !self.private_candidates.is_empty() {
+            return Err(SignerError::Other("wrong vault or private candidate already pending".into()));
+        }
         // Build under the signer's OWN network parameters: the coordinator supplied neither
         // the fvk nor a `Parameters` instance.
-        match self.network {
+        let (original, redacted, spend_index) = match self.network {
             Network::Regtest => self.build_single_note_pczt(&crate::candidate::Regtest, params, alpha),
             Network::Testnet => {
                 self.build_single_note_pczt(&zcash_protocol::consensus::TEST_NETWORK, params, alpha)
             }
-        }
+        }?;
+        self.private_candidates.insert(cand.clone(), PrivateCandidate {
+            original,
+            redacted: redacted.clone(),
+            spend_index,
+            approved_sighash: None,
+        });
+        Ok(redacted)
     }
 
     fn sign_commit(
@@ -608,6 +633,11 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
         if self.session.as_ref() != Some(session) {
             return Err(SignerError::NoSession);
         }
+        if let Some(private) = self.private_candidates.get(cand) {
+            if pczt != private.redacted {
+                return Err(SignerError::Other("candidate differs from the one built by this signer".into()));
+            }
+        }
 
         // 1. INDEPENDENTLY render what this PCZT pays — from the bytes, not any claim.
         let view = wysiwys::describe_pczt(pczt, &self.vault_fvk).map_err(SignerError::Other)?;
@@ -634,14 +664,90 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
             .map_err(|_| SignerError::Other("randomizer seed is not 32 bytes".into()))?;
         let kp = self.open_key()?;
         let id = self.nonce_id(cand);
-        self.nonces
+        let share = self.nonces
             .sign_and_burn(&id, &self.se, pkg, &kp, &seed, &|| false)
             .map_err(|e| match e {
                 crate::signer::nonce::NonceError::Reuse => {
                     SignerError::Other(crate::signer::nonce::NonceError::Reuse.to_string())
                 }
                 other => SignerError::Other(other.to_string()),
+            })?;
+        if let Some(private) = self.private_candidates.get_mut(cand) {
+            private.approved_sighash = Some(local_sighash);
+        }
+        Ok(share)
+    }
+
+    fn prove_signed(
+        &mut self,
+        session: &Session,
+        cand: &CandidateRef,
+        signed: &[u8],
+        witnesses: Vec<(usize, orchard::tree::MerklePath)>,
+        anchor: [u8; 32],
+    ) -> Result<(Vec<u8>, zcash_primitives::transaction::TxId), Self::Error> {
+        if self.session.as_ref() != Some(session) {
+            return Err(SignerError::NoSession);
+        }
+        let private = self.private_candidates.get(cand)
+            .ok_or_else(|| SignerError::Other("unknown private candidate".into()))?;
+        let approved = private.approved_sighash
+            .ok_or_else(|| SignerError::Other("candidate was not approved by this signer".into()))?;
+        if witnesses.len() != 1 || witnesses[0].0 != private.spend_index {
+            return Err(SignerError::Other("witness does not identify the vault spend".into()));
+        }
+        if signed.len() > private.redacted.len().saturating_add(128) {
+            return Err(SignerError::Other("signed candidate is too large".into()));
+        }
+        let signed_pczt = pczt::Pczt::parse(signed)
+            .map_err(|e| SignerError::Other(format!("parse signed candidate: {e:?}")))?;
+        let sig = signed_pczt.ironwood().actions()
+            .get(private.spend_index)
+            .and_then(|action| action.spend().spend_auth_sig().as_ref())
+            .ok_or_else(|| SignerError::Other("vault spend signature missing".into()))?;
+        let signature = orchard::primitives::redpallas::Signature::<
+            orchard::primitives::redpallas::SpendAuth,
+        >::from(*sig);
+        let mut verified = false;
+        pczt::roles::verifier::Verifier::new(signed_pczt.clone())
+            .with_ironwood::<String, _>(|bundle| {
+                if let Some(action) = bundle.actions().get(private.spend_index) {
+                    verified = action.spend().rk().verify(&approved, &signature).is_ok();
+                }
+                Ok(())
             })
+            .map_err(|e| SignerError::Other(format!("verify signature: {e:?}")))?;
+        if !verified {
+            return Err(SignerError::Other("vault spend signature is invalid".into()));
+        }
+        let unsigned = pczt::roles::redactor::Redactor::new(signed_pczt.clone())
+            .redact_ironwood_with(|mut bundle| {
+                bundle.redact_action(private.spend_index, |mut action| action.clear_spend_auth_sig());
+            })
+            .finish()
+            .serialize()
+            .map_err(|e| SignerError::Other(format!("serialize unsigned candidate: {e:?}")))?;
+        if unsigned != private.redacted {
+            return Err(SignerError::Other("signed candidate changed beyond its signature".into()));
+        }
+        let combined = pczt::roles::combiner::Combiner::new(vec![private.original.clone(), signed_pczt])
+            .combine()
+            .map_err(|e| SignerError::Other(format!("restore private candidate: {e:?}")))?;
+        let transaction = crate::tx_finalize::prove(combined, approved, witnesses, anchor)
+            .map_err(SignerError::Other)?;
+        self.private_candidates.remove(cand);
+        Ok(transaction)
+    }
+
+    fn abort_candidate(&mut self, session: &Session, cand: &CandidateRef) -> Result<(), Self::Error> {
+        if self.session.as_ref() != Some(session) {
+            return Err(SignerError::NoSession);
+        }
+        if self.private_candidates.remove(cand).is_none() {
+            return Err(SignerError::Other("unknown private candidate".into()));
+        }
+        self.rendered.remove(&cand.attempt_id);
+        Ok(())
     }
 
     fn rendered_payment(
@@ -661,6 +767,7 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
     fn disconnect(&mut self, session: Session) -> Result<(), Self::Error> {
         if self.session.as_ref() == Some(&session) {
             self.session = None;
+            self.private_candidates.clear();
         }
         Ok(())
     }
