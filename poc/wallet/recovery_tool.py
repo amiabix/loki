@@ -9,12 +9,17 @@ import re
 import shutil
 import subprocess
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 
 HERE = Path(__file__).resolve().parent
 SETUP = HERE.parent / "target/debug/loki_setup_member"
 PAYMENT = HERE.parent / "target/debug/loki_member_payment"
+
+
+class _Secret(str):
+    pass
 
 
 class RecoveryTool:
@@ -33,9 +38,30 @@ class RecoveryTool:
     def __exit__(self, *_):
         self.temporary.cleanup()
 
+    @contextmanager
+    def _argv(self, binary, action, args):
+        argv = [str(binary), action]
+        secrets = []
+        try:
+            for arg in args:
+                if isinstance(arg, _Secret):
+                    # The file is unlinked immediately, even if recovery is later killed.
+                    secret = tempfile.TemporaryFile(dir=self.root)
+                    secrets.append(secret)
+                    secret.write(arg.encode())
+                    secret.seek(0)
+                    argv.append(f"/dev/fd/{secret.fileno()}")
+                else:
+                    argv.append(str(arg))
+            yield argv, [secret.fileno() for secret in secrets]
+        finally:
+            for secret in secrets:
+                secret.close()
+
     def command(self, binary, action, *args, timeout=180):
-        result = subprocess.run([str(binary), action, *map(str, args)], env=self.env,
-                                text=True, capture_output=True, timeout=timeout)
+        with self._argv(binary, action, args) as (argv, readers):
+            result = subprocess.run(argv, env=self.env, pass_fds=readers,
+                                    text=True, capture_output=True, timeout=timeout)
         if result.returncode:
             raise ValueError(result.stderr.strip() or result.stdout.strip() or f"{action} failed")
         return result.stdout.strip()
@@ -50,7 +76,7 @@ class RecoveryTool:
             for index, (card_file, words, passphrase) in enumerate(artifacts):
                 if not isinstance(words, str) or len(words.encode()) > 1024 or len(words.split()) != 24:
                     raise ValueError("Enter exactly 24 backup words for each member")
-                if not isinstance(passphrase, str) or not 12 <= len(passphrase) <= 1024:
+                if not isinstance(passphrase, str) or len(passphrase) < 12 or len(passphrase.encode()) > 1024:
                     raise ValueError("Choose a new passphrase of at least 12 characters")
                 folder = session / f"member-{index + 1}"
                 folder.mkdir(mode=0o700)
@@ -63,20 +89,17 @@ class RecoveryTool:
                     raise ValueError("Final recovery card is too large")
                 with os.fdopen(os.open(card / "vault.card", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as out:
                     out.write(raw_card)
-                password = folder / "passphrase"
-                words_file = folder / "words"
-                for path, value in ((password, passphrase), (words_file, words)):
-                    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as out:
-                        out.write(value)
                 owner = folder / "restored"
-                address = self.command(self.setup, "restore", owner, password, card, words_file)
+                address = self.command(self.setup, "restore", owner, _Secret(passphrase), card,
+                                       _Secret(words))
                 if not (owner / "roster.json").is_file() or not (owner / "secrets" / "activation.sealed").is_file():
                     raise ValueError("Use each member's final spend recovery card")
                 roster = json.loads((owner / "roster.json").read_text())
-                identity = json.loads(self.command(self.setup, "identity-public", owner, password))
+                identity = json.loads(self.command(self.setup, "identity-public", owner,
+                                                   _Secret(passphrase)))
                 if identity not in roster.get("members", []):
                     raise ValueError("Restored member is absent from the certified roster")
-                restored.append((identity["id"], owner, password, roster, address))
+                restored.append((identity["id"], owner, passphrase, roster, address))
             first, second = restored
             if first[0] == second[0]:
                 raise ValueError("Recovery needs two distinct members")
@@ -88,7 +111,7 @@ class RecoveryTool:
                 raise ValueError("Enter the receive address of a different vault")
             pair = "".join(chr(64 + slot) for slot in sorted((first[0], second[0])))
             work = session / "payment"
-            self.command(self.payment, "prepare-sweep", first[1], first[2],
+            self.command(self.payment, "prepare-sweep", first[1], _Secret(first[2]),
                          first[1] / "roster.json", work, recipient, "sweep", pair, timeout=300)
             manifest = json.loads((work / "payment.json").read_text())
             if manifest.get("vault") != first[3]["vault"] or manifest.get("pair") != sorted((first[0], second[0])) \
@@ -96,10 +119,11 @@ class RecoveryTool:
                 raise ValueError("Sweep proposal differs from the recovered vault")
             payment_id = manifest["payment"]
             for slot, owner, password, *_ in restored:
-                process = subprocess.Popen([str(self.payment), "sign", str(owner), str(password),
-                                            str(owner / "roster.json"), str(work)], env=self.env,
-                                           text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                           stderr=subprocess.STDOUT, bufsize=1)
+                with self._argv(self.payment, "sign", (owner, _Secret(password),
+                                                        owner / "roster.json", work)) as (argv, readers):
+                    process = subprocess.Popen(argv, env=self.env, pass_fds=readers,
+                                               text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                               stderr=subprocess.STDOUT, bufsize=1)
                 processes.append((slot, process))
             reviews = []
             for slot, process in processes:
@@ -121,7 +145,7 @@ class RecoveryTool:
                 output = process.stdout.read()
                 if process.wait(timeout=180):
                     raise ValueError(f"Member {slot} signing failed: {output.strip()}")
-            output = self.command(self.payment, "finish", first[1], first[2],
+            output = self.command(self.payment, "finish", first[1], _Secret(first[2]),
                                   first[1] / "roster.json", work, timeout=900)
             match = re.search(r"\bbroadcast txid=([0-9a-f]{64})\b", output)
             if not match:
@@ -129,7 +153,7 @@ class RecoveryTool:
             txid = match.group(1)
             verification_error = None
             try:
-                verified = self.command(self.payment, "verify", first[1], first[2],
+                verified = self.command(self.payment, "verify", first[1], _Secret(first[2]),
                                         first[1] / "roster.json", work, txid, timeout=180)
             except (ValueError, OSError, subprocess.TimeoutExpired) as error:
                 verified = ""

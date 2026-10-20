@@ -310,6 +310,11 @@ fn hex_bytes(value: &serde_json::Value, field: &str) -> Result<Vec<u8>, String> 
 }
 
 pub fn open(owner: &Path, pass_file: &Path, roster_file: &Path) -> Result<MemberState, String> {
+    let pass = read_passphrase(pass_file)?;
+    open_with_passphrase(owner, &pass, roster_file)
+}
+
+pub fn read_passphrase(pass_file: &Path) -> Result<Zeroizing<String>, String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -326,6 +331,17 @@ pub fn open(owner: &Path, pass_file: &Path, roster_file: &Path) -> Result<Member
     let mut pass = fs::read_to_string(pass_file).map_err(|e| e.to_string())?;
     let trimmed = Zeroizing::new(pass.trim_end_matches(['\r', '\n']).to_string());
     pass.zeroize();
+    if trimmed.is_empty() {
+        return Err("empty passphrase".into());
+    }
+    Ok(trimmed)
+}
+
+pub fn open_with_passphrase(
+    owner: &Path,
+    trimmed: &str,
+    roster_file: &Path,
+) -> Result<MemberState, String> {
     if trimmed.is_empty() {
         return Err("empty passphrase".into());
     }

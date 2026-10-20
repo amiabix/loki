@@ -86,11 +86,31 @@ class RecoveryToolTest(unittest.TestCase):
             work = tool.root
         self.assertFalse(work.exists())
 
+    def test_recovery_inputs_are_absent_from_files_while_waiting_for_approval(self):
+        artifacts = self.artifacts()
+        with RecoveryTool(self.binary, self.binary) as tool:
+            def approve(*_):
+                files = [path.read_bytes() for path in tool.root.rglob("*")
+                         if path.is_file() and "card" not in path.parts]
+                for _, words, passphrase in artifacts:
+                    self.assertFalse(any(words.encode() in data for data in files))
+                    self.assertFalse(any(passphrase.encode() in data for data in files))
+                return True
+
+            self.assertTrue(tool.sweep(artifacts, "uregtest-new-vault", approve)["verified"])
+
     def test_lost_passphrase_needs_only_new_passphrases(self):
         with RecoveryTool(self.binary, self.binary) as tool:
             result = tool.sweep(self.artifacts((2, 3)), "uregtest-new-vault", lambda *_: True)
             self.assertEqual(result["pair"], "BC")
             self.assertTrue(result["verified"])
+
+    def test_short_multibyte_passphrase_is_rejected(self):
+        artifacts = self.artifacts()
+        artifacts[0] = (artifacts[0][0], artifacts[0][1], "😀😀😀")
+        with RecoveryTool(self.binary, self.binary) as tool:
+            with self.assertRaisesRegex(ValueError, "at least 12 characters"):
+                tool.sweep(artifacts, "uregtest-new-vault", lambda *_: True)
 
     def test_relay_outage_uses_no_relay_command(self):
         with RecoveryTool(self.binary, self.binary, env={"LOKI_RPC": "127.0.0.1:18232"}) as tool:
