@@ -112,6 +112,10 @@ struct Invite {
     name: String,
 }
 
+/// Upper bound on vault members. Not a protocol limit (FROST ids are u16, t-of-n is general) —
+/// just a sanity cap so a typo can't kick off an enormous DKG.
+const MAX_MEMBERS: u16 = 64;
+
 fn vault_bytes(vault: &str) -> Result<[u8; 32], String> {
     hex::decode(vault)
         .map_err(|e| e.to_string())?
@@ -296,13 +300,13 @@ pub(super) async fn create(State(st): State<Shared>, Json(body): Json<Value>) ->
         .unwrap_or(0);
     if name.is_empty()
         || name.len() > 80
-        || !(2..=4).contains(&members)
+        || !(2..=MAX_MEMBERS).contains(&members)
         || threshold < 2
         || threshold > members
     {
         return err(
             StatusCode::BAD_REQUEST,
-            "name must be 1 to 80 bytes; use 2 to 4 members and a valid threshold",
+            "name must be 1 to 80 bytes; use 2 to 64 members and a valid threshold",
         );
     }
     let (data, pass) = match unlocked(&st).await {
@@ -375,7 +379,7 @@ pub(super) async fn join(State(st): State<Shared>, Json(body): Json<Value>) -> R
         Err(e) => return err(StatusCode::BAD_REQUEST, e),
     };
     if vault_bytes(&invite.vault).is_err()
-        || !(2..=4).contains(&invite.members)
+        || !(2..=MAX_MEMBERS).contains(&invite.members)
         || !(2..=invite.members).contains(&invite.slot)
         || invite.threshold < 2
         || invite.threshold > invite.members

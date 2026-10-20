@@ -69,11 +69,9 @@ impl Identity {
             return Err("invalid DKG identity length".into());
         }
         let id = u16::from_be_bytes(bytes[..2].try_into().unwrap());
-        // 1..=4 are vault members; 0 is the ephemeral frostd session coordinator (never a
-        // FROST participant), which the payment flow seals and reloads across requests.
-        if !(0..=4).contains(&id) {
-            return Err("invalid DKG member id".into());
-        }
+        // Member ids are the FROST identifiers 1..=N (general t-of-n, no fixed N); id 0 is the
+        // ephemeral frostd session coordinator (never a FROST participant), which the payment
+        // flow seals and reloads across requests. Any u16 is structurally valid.
         Ok(Self {
             id,
             signing: SigningKey::from_bytes(bytes[2..34].try_into().unwrap()),
@@ -329,7 +327,7 @@ impl Identity {
         context.validate()?;
         if self.id == recipient.id
             || !context.signers.contains(&self.id)
-            || !(1..=4).contains(&recipient.id)
+            || recipient.id == 0
             || (!context.signers.contains(&recipient.id)
                 && !matches!(kind, MessageKind::Package | MessageKind::Share))
             || body.len() > kind.max_body()
@@ -419,7 +417,7 @@ impl Identity {
         let inner_header = meta_end + 32;
         if sender.id == recipient
             || !context.signers.contains(&sender.id)
-            || !(1..=4).contains(&recipient)
+            || recipient == 0
         {
             return Err("sender or recipient outside signing attempt".into());
         }
