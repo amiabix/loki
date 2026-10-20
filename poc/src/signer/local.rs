@@ -348,11 +348,20 @@ impl<SE: SecureElement> LocalSigner<SE> {
             rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng),
         )
         .map_err(SignerError::Other)?;
+        let spend_index = built
+            .ironwood_meta
+            .spend_action_index(0)
+            .ok_or_else(|| SignerError::Other("candidate has no vault spend".into()))?;
         let candidate = pczt::roles::creator::Creator::build_from_parts(built.pczt_parts)
             .ok_or_else(|| SignerError::Other("build_from_parts returned None".into()))?;
         let candidate = pczt::roles::io_finalizer::IoFinalizer::new(candidate)
             .finalize_io()
             .map_err(|e| SignerError::Other(format!("io finalize: {e:?}")))?;
+        let candidate = pczt::roles::redactor::Redactor::new(candidate)
+            .redact_ironwood_with(|mut bundle| {
+                bundle.redact_action(spend_index, |mut action| action.clear_spend_fvk());
+            })
+            .finish();
         candidate
             .serialize()
             .map_err(|e| SignerError::Other(format!("serialize: {e:?}")))

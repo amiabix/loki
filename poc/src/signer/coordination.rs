@@ -1,24 +1,25 @@
 //! UNIT U2: the keyless coordination loop.
 //!
 //! [`drive_to_signed_pczt`] drives a quorum of [`Signer`]s from a payment intent to a
-//! signed PCZT. It links NO share/nonce code: every secret stays inside the signers, and
-//! the coordinator only ever moves PUBLIC artifacts (commitments, a `SigningPackage`, a
-//! randomizer seed, signature shares) between them — the same seam the `PublicArtifact`
-//! guard in [`crate::signer`] pins.
+//! signed PCZT. It links no share/nonce code; the coordinator moves public FROST
+//! artifacts but also handles a PCZT with private note and output openings. The
+//! PCZT must be treated as private wallet data even after its vault FVK is redacted.
 //!
 //! The loop is, for a one-note candidate:
 //!   1. round 1: [`Signer::sign_commit`] on each quorum member → public commitments,
 //!   2. derive the rerandomizer from those commitments and the candidate's `alpha` from it,
 //!   3. ASK THE PROPOSER SIGNER to build the unproved candidate PCZT under that alpha
 //!      ([`Signer::build_candidate`]) — using ITS own viewing key and ITS own selected note.
-//!      The coordinator passes only the public payment effects + alpha and never sees the
-//!      viewing key, the note, or selects a note.
+//!      The coordinator passes only the public payment effects + alpha and never selects
+//!      a note. The signer redacts its viewing key before returning the PCZT.
 //!   4. assemble the FROST [`SigningPackage`] from the commitments + the candidate sighash,
 //!   5. round 2: [`Signer::sign_approve`] on each member (pczt + package + randomizer seed),
 //!   6. aggregate the shares ([`frost_rerandomized::aggregate`]), apply the signature to the
 //!      PCZT, and return the signed bytes.
 //!
-//! It stops at the signed PCZT: no prove, broadcast, scan, or chain contact.
+//! It stops at the signed PCZT: no prove, broadcast, scan, or chain contact. The
+//! existing prover needs the redacted FVK, so broadcasting this path requires a
+//! trusted signer-side proving handoff.
 
 use crate::signer::{CandidateRef, PublicPaymentParams, Session, Signer};
 use reddsa_frost::frost::redpallas as frost;
@@ -87,8 +88,8 @@ where
 
     // 3. Ask the PROPOSER signer (quorum member 0) to build the unproved candidate under
     //    this alpha. It uses its OWN viewing key and OWN selected note; the coordinator
-    //    hands over only the public effects + alpha (canonical bytes). The coordinator never
-    //    sees the viewing key or the note and never selects one.
+    //    hands over only the public effects + alpha (canonical bytes). The coordinator
+    //    never selects a note; the returned PCZT contains note openings but no vault FVK.
     let pczt_bytes = {
         let proposer = &quorum[0];
         proposer
@@ -136,7 +137,7 @@ where
 
     // Keyless action selection: the signed spend is the one whose `rk` equals the group's
     // randomized verifying key (ak·alpha). Padding actions carry independent dummy `rk`s.
-    // The coordinator has no viewing key and no note, so it CANNOT match by nullifier.
+    // The coordinator has no viewing key, so it CANNOT identify the vault spend by nullifier.
     let parsed = pczt::Pczt::parse(&pczt_bytes).map_err(|e| format!("reparse: {e:?}"))?;
     let want_rk: [u8; 32] = fparams
         .randomized_verifying_key()
@@ -151,11 +152,27 @@ where
         .iter()
         .position(|a| a.spend().rk() == &want_rk)
         .ok_or("candidate has no spend under the randomized group key")?;
-    let mut signer =
-        pczt::roles::signer::Signer::new(parsed).map_err(|e| format!("signer: {e:?}"))?;
-    signer
-        .apply_ironwood_signature(index, orchard_sig)
-        .map_err(|e| format!("apply signature: {e:?}"))?;
+    // The real spend's viewing key is redacted on the wire. Its signature needs only rk.
+    let mut apply_error = None;
+    let signer = pczt::roles::low_level_signer::Signer::new(parsed)
+        .sign_ironwood_with::<pczt::roles::low_level_signer::OrchardParseError, _>(
+            |_, bundle, _| {
+                apply_error = Some(
+                    bundle
+                        .actions_mut()
+                        .get_mut(index)
+                        .ok_or_else(|| "signed action missing".to_string())
+                        .and_then(|action| {
+                            action
+                                .apply_signature(sighash, orchard_sig)
+                                .map_err(|e| format!("apply signature: {e:?}"))
+                        }),
+                );
+                Ok(())
+            },
+        )
+        .map_err(|e| format!("signer: {e:?}"))?;
+    apply_error.ok_or("signature was not applied")??;
     signer
         .finish()
         .serialize()
@@ -303,6 +320,20 @@ mod tests {
             action.spend().spend_auth_sig().is_some(),
             "the aggregated signature must be applied to the spend"
         );
+        pczt::roles::verifier::Verifier::new(parsed)
+            .with_ironwood::<String, _>(|bundle| {
+                let vault_spend = bundle
+                    .actions()
+                    .iter()
+                    .find(|a| a.spend().nullifier().to_bytes() == nf)
+                    .expect("vault spend remains in the PCZT");
+                assert!(
+                    vault_spend.spend().fvk().is_none(),
+                    "the coordinator must not receive the vault viewing key in the PCZT"
+                );
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]
