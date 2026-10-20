@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[workspace]
+members = ["harness"]
+default-members = [".", "harness"]
+
 # `staticlib` so the native signer app (poc/signer-app) can link the Rust signer and call
 # its C-ABI (src/enclave_ffi.rs). `lib` keeps the normal crate/tests working.
 [lib]

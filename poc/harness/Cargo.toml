@@ -1,0 +1,17 @@
+[package]
+name = "loki-harness"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+hex = "0.4"
+loki-poc = { path = ".." }
+orchard = { package = "zakura-orchard", version = "=2.2.0" }
+pczt = { package = "zakura-pczt", version = "=0.1.0-rc4", features = ["orchard"] }
+reddsa_frost = { package = "zakura-reddsa", version = "=2.2.0", features = ["frost"] }
+serde_json = "1"
+tempfile = "3"
+uuid = { version = "1", features = ["v4"] }
+zcash_protocol = { package = "zakura-protocol", version = "=2.2.0" }
+zeroize = "1"
