@@ -1113,7 +1113,17 @@ mod tests {
         let funding = pay(&mut wallet, 60_000).unwrap();
         assert_eq!(funding.notes.len(), 2);
         assert!(funding.notes.iter().all(|note| note.nullifier(&fvk).to_bytes() != reserved));
-        wallet.release_inputs(draft, &[reserved]).unwrap();
+        let second = notes[1].nullifier(&fvk).to_bytes();
+        let other = LockOwner::new([2; 32]);
+        let txid = LockOwner::new([3; 32]);
+        wallet.reserve_inputs(other, &[second], height + 100).unwrap();
+        assert!(wallet.transfer_inputs(draft, txid, &[reserved, second], height + 100).is_err());
+        assert!(wallet.reserve_inputs(other, &[reserved], height + 100).is_err());
+        wallet.release_inputs(other, &[second]).unwrap();
+        wallet.transfer_inputs(draft, txid, &[reserved], height + 100).unwrap();
+        wallet.transfer_inputs(draft, txid, &[reserved], height + 100).unwrap();
+        assert!(wallet.reserve_inputs(other, &[reserved], height + 100).is_err());
+        wallet.release_inputs(txid, &[reserved]).unwrap();
         assert_eq!(pay(&mut wallet, 100_000).unwrap().notes.len(), 3);
         drop(wallet);
         std::fs::remove_file(path).unwrap();

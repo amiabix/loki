@@ -645,8 +645,11 @@ pub(super) async fn status(st: Shared, vault: String) -> Reply {
             }
         }
         let active = dir(&data, &vault)?.exists("vault.sealed");
+        let running_here = st.active_dkgs.lock().map_err(|e| e.to_string())?.contains(&vault);
         let phase = if active {
             "active"
+        } else if c.dkg_started && !running_here {
+            "setup_interrupted"
         } else if c.dkg_started || (c.my_slot == 1 && c.agreed.len() == usize::from(c.members)) {
             "creating_keys"
         } else if c.fingerprint.is_some() {
@@ -661,6 +664,8 @@ pub(super) async fn status(st: Shared, vault: String) -> Reply {
         }
         if let Some(error) = c.error {
             value["error"] = json!(error);
+        } else if phase == "setup_interrupted" {
+            value["error"] = json!("DKG interrupted; create a fresh vault");
         }
         Ok(value)
     })
@@ -669,7 +674,12 @@ pub(super) async fn status(st: Shared, vault: String) -> Reply {
 
 fn spawn_dkg(st: Shared, vault: String, data: std::path::PathBuf, pass: Zeroizing<String>) {
     tokio::spawn(async move {
+        let running = st.clone();
+        let finished_vault = vault.clone();
         let result = blocking(move || run_background(st, &data, &pass, &vault)).await;
+        if let Ok(mut active) = running.active_dkgs.lock() {
+            active.remove(&finished_vault);
+        }
         if result.0 != StatusCode::OK {
             eprintln!("ceremony DKG: {}", result.1 .0);
         }
@@ -693,6 +703,9 @@ pub(super) async fn agree(State(st): State<Shared>, Json(body): Json<Value>) -> 
     let reply = blocking(move || {
         let _guard = work_st.ceremony.lock().map_err(|e| e.to_string())?;
         let mut c = load(&work_data, &work_pass, &work_vault)?;
+        if c.dkg_started {
+            return Err("DKG interrupted or already running; create a fresh vault if interrupted".into());
+        }
         refresh_roster(&mut c)?;
         if c.fingerprint.as_deref() != Some(&fingerprint) {
             return Err("roster fingerprint mismatch".into());
@@ -839,6 +852,7 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
         }
         c.dkg_started = true;
         save(data, pass, &c)?;
+        st.active_dkgs.lock().map_err(|e| e.to_string())?.insert(vault_id.to_owned());
         c
     };
     let outcome: Result<Value, String> = (|| {
@@ -1022,7 +1036,6 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
     if let Err(ref error) = outcome {
         let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
         c.error = Some(error.clone());
-        c.dkg_started = false;
         save(data, pass, &c)?;
     }
     outcome
@@ -1068,6 +1081,42 @@ mod tests {
         assert!(roster_of(&c).is_err());
         assert!(token_eq("secret", "secret"));
         assert!(!token_eq("secret", "secreu"));
+    }
+
+    #[tokio::test]
+    async fn interrupted_dkg_cannot_be_restarted_by_agreeing_again() {
+        let data = std::env::temp_dir().join(format!("loki-interrupted-dkg-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&data).unwrap();
+        let vault = hex::encode([8u8; 32]);
+        let slots = (1..=3)
+            .map(|slot| (slot, Slot { identity: None, pending_token: Some("token".into()) }))
+            .collect();
+        let ceremony = Ceremony {
+            vault: vault.clone(), name: "test".into(), members: 3, threshold: 2,
+            my_slot: 1, creator_base_url: String::new(), frostd_url: String::new(),
+            slots, fingerprint: Some("fingerprint".into()), agreed: BTreeSet::new(),
+            session_id: None, coordinator_peer: None, vs_session_id: None,
+            dkg_started: true, error: None,
+        };
+        save(&data, "pass", &ceremony).unwrap();
+        let st = std::sync::Arc::new(AppState::new(Config {
+            data: data.clone(), port: 3001, network: "regtest".into(),
+            lightwalletd: None, transport: "local".into(), operator_bundle: None,
+            operator_key: None, enrollment_issuer: None, development_http: false,
+            token: "test".into(), frostd_url: "http://127.0.0.1:2744".into(),
+            peers: BTreeMap::new(),
+        }));
+        *st.session.write().await = Some(Session {
+            passphrase: Zeroizing::new("pass".into()), data: data.clone(),
+        });
+
+        let reply = status(st.clone(), vault.clone()).await;
+        assert_eq!(reply.1 .0["phase"], "setup_interrupted");
+        let reply = agree(State(st), Json(json!({"vault":vault,"fingerprint":"fingerprint"}))).await;
+        assert_eq!(reply.0, StatusCode::BAD_REQUEST);
+        assert!(reply.1 .0["error"].as_str().unwrap().contains("interrupted"));
+        assert!(load(&data, "pass", &vault).unwrap().dkg_started);
+        std::fs::remove_dir_all(data).unwrap();
     }
 
     #[tokio::test]
