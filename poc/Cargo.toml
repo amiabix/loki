@@ -74,8 +74,6 @@ zcash_note_encryption = "0.4.2"
 zcash_transparent = { package = "zakura-transparent", version = "=2.2.0" }
 sapling-crypto = { package = "zakura-sapling-crypto", version = "=2.2.0" }
 ciborium-io        = "0.2"
-# loki_serve: a tiny localhost HTTP server that fronts a view-only wallet for the web UI.
-tiny_http          = "0.12"
 
 [features]
 # Compile probes that reproduce the two blocked checkpoint-1 requirements.
