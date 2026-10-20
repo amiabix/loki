@@ -89,6 +89,17 @@ pub(crate) fn checked_file(path: &Path) -> Result<File, String> {
     checked(&file.metadata().map_err(|_| ERROR)?, false)?;
     Ok(file)
 }
+pub(crate) fn checked_anonymous_file(path: &Path) -> Result<File, String> {
+    let descriptor = path.strip_prefix("/dev/fd").map_err(|_| ERROR)?;
+    descriptor
+        .to_str()
+        .ok_or(ERROR)?
+        .parse::<u32>()
+        .map_err(|_| ERROR)?;
+    let file = File::open(path).map_err(|_| ERROR)?;
+    checked_links(&file.metadata().map_err(|_| ERROR)?, false, 0)?;
+    Ok(file)
+}
 pub(crate) fn check_private_root(path: &Path) -> Result<(), String> {
     let mut prefix = PathBuf::new();
     if !path.is_absolute() {
@@ -530,6 +541,23 @@ mod tests {
             fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         }
         root
+    }
+    #[cfg(unix)]
+    #[test]
+    fn anonymous_secret_file_is_checked_without_a_directory_entry() {
+        use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+
+        let root = root("anonymous-secret");
+        let path = root.join("secret");
+        let mut file = OpenOptions::new().write(true).read(true).create_new(true)
+            .mode(0o600).open(&path).unwrap();
+        file.write_all(b"secret").unwrap();
+        let inherited = PathBuf::from(format!("/dev/fd/{}", file.as_raw_fd()));
+        assert!(checked_anonymous_file(&inherited).is_err());
+        fs::remove_file(&path).unwrap();
+        assert!(checked_file(&inherited).is_err());
+        assert!(checked_anonymous_file(&inherited).is_ok());
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn released_owner_unlocks_even_with_an_inherited_descriptor() {

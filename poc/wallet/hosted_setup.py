@@ -121,33 +121,38 @@ class HostedSetup:
                 raise ValueError("Signer is locked")
         if self.service is not None and unlocked and action in member_service.ALLOWED:
             return self._service_call(action, root, args, private, words)
-        with tempfile.TemporaryDirectory(prefix=".hosted-command-", dir=self.wallet.data) as temporary:
-            folder = Path(temporary)
+        with contextlib.ExitStack() as secrets:
+            pass_fds = []
+
+            def secret_path(raw):
+                secret = secrets.enter_context(tempfile.TemporaryFile(dir=self.wallet.data))
+                secret.write(raw)
+                secret.flush()
+                secret.seek(0)
+                pass_fds.append(secret.fileno())
+                return f"/dev/fd/{secret.fileno()}"
+
             argv = [str(self.wallet.setup), action, str(root)]
             if unlocked:
-                passfile = folder / "pass"
-                # Consumed at once and unlinked with its directory: no fsync, so the
-                # passphrase is not pushed to stable storage on every native call.
-                self._write(passfile, self.wallet.passphrase.encode(), durable=False)
+                passfile = secret_path(self.wallet.passphrase.encode())
                 if action == "identity":
-                    argv.extend([str(args[0]), str(passfile)])
+                    argv.extend([str(args[0]), passfile])
                     args = args[1:]
                 else:
-                    argv.append(str(passfile))
+                    argv.append(passfile)
             for arg in args:
                 if arg in ("@private", "@words"):
                     raw = private if arg == "@private" else (words.encode() if words is not None else None)
                     if raw is None:
                         raise ValueError("Missing private setup input")
-                    path = folder / arg[1:]
-                    self._write(path, raw, durable=False)
-                    argv.append(str(path))
+                    argv.append(secret_path(raw))
                 else:
                     argv.append(str(arg))
             with self.process_lock:
                 if self.stop_event.is_set():
                     raise ValueError("Signer is locked")
-                process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                           pass_fds=tuple(pass_fds))
                 self.processes.add(process)
             started = time.monotonic()
             try:

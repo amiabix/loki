@@ -8,7 +8,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
-from contextlib import closing, contextmanager, nullcontext
+from contextlib import ExitStack, closing, contextmanager, nullcontext
 import fcntl
 from functools import wraps
 import hashlib
@@ -495,20 +495,22 @@ class Wallet:
         self.payment_worker.check(binary.name, action)
         if not binary.is_file():
             raise ValueError(f"Build {binary.name}: {BUILD}")
-        passfile = None
-        try:
+        with ExitStack() as secrets:
             argv = [str(binary), action]
+            pass_fds = []
             for arg in args:
                 if arg == "@pass":
-                    fd, name = tempfile.mkstemp(prefix=".unlock-", dir=self.data)
-                    passfile = Path(name)
-                    with os.fdopen(fd, "w") as out:
-                        out.write(check_passphrase(passphrase if passphrase is not None else self.passphrase))
-                    argv.append(name)
+                    secret = secrets.enter_context(tempfile.TemporaryFile(dir=self.data))
+                    secret.write(check_passphrase(passphrase if passphrase is not None else self.passphrase).encode())
+                    secret.flush()
+                    secret.seek(0)
+                    pass_fds.append(secret.fileno())
+                    argv.append(f"/dev/fd/{secret.fileno()}")
                 else:
                     argv.append(str(arg))
             started = time.monotonic()
-            process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       text=True, pass_fds=tuple(pass_fds))
             sync_stop = getattr(self.auto_sync_local, "stop", None)
             if sync_stop is not None and binary == WALLET_SYNC:
                 with self.auto_sync_process_lock:
@@ -537,10 +539,6 @@ class Wallet:
                 detail = stderr.strip() or stdout.strip() or f"{action} failed"
                 raise ValueError(detail.removeprefix("error: "))
             return stdout.strip()
-        finally:
-            if passfile:
-                passfile.unlink(missing_ok=True)
-
     def create_profile(self, name, passphrase):
         if (self.data / "profile" / "profile.sealed").exists():
             raise ValueError("This profile already exists; unlock it")

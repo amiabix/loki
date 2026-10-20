@@ -16,6 +16,32 @@ from local_funding import fund_member, funding_status
 
 
 class HostedControllerTests(unittest.TestCase):
+    def test_fallback_native_secrets_have_no_visible_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            binary = Path(temp) / "read-secrets"
+            binary.write_text("#!/usr/bin/env python3\n"
+                              "import json, pathlib, sys\n"
+                              "passfile, private, words = map(pathlib.Path, sys.argv[3:6])\n"
+                              "with passfile.open() as source:\n"
+                              "    pass1 = source.read()\n"
+                              "    source.seek(0)\n"
+                              "    pass2 = source.read()\n"
+                              "print(json.dumps({'pass1': pass1, "
+                              "'pass2': pass2, 'private': private.read_bytes().hex(), "
+                              "'words': words.read_text(), "
+                              "'visible': [p.name for p in pathlib.Path(sys.argv[2]).parent.iterdir() "
+                              "if p.name.startswith('.hosted-command-')]}))\n")
+            binary.chmod(0o700)
+            self.wallet.setup = binary
+            vault = self.wallet.data / "vault"
+            result = json.loads(self.controller._native("setup-join", vault, "@private", "@words",
+                                                         private=b"secret", words="backup words"))
+            self.assertEqual(result["pass1"], self.wallet.passphrase)
+            self.assertEqual(result["pass2"], self.wallet.passphrase)
+            self.assertEqual(result["private"], b"secret".hex())
+            self.assertEqual(result["words"], "backup words")
+            self.assertEqual(result["visible"], [])
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)

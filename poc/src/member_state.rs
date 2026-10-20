@@ -1,6 +1,11 @@
 //! Validated state produced by the separate-member setup ceremony.
 
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::{Read, Seek, SeekFrom},
+    path::Path,
+};
 
 use blake2b_simd::Params;
 use orchard::keys::FullViewingKey;
@@ -309,6 +314,15 @@ fn hex_bytes(value: &serde_json::Value, field: &str) -> Result<Vec<u8>, String> 
     .map_err(|e| format!("{field}: {e}"))
 }
 
+/// Rewind inherited anonymous files before each read; /dev/fd shares the cursor on macOS.
+pub fn read_from_start(path: &Path) -> Result<String, String> {
+    let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
+    file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+    let mut value = String::new();
+    file.read_to_string(&mut value).map_err(|e| e.to_string())?;
+    Ok(value)
+}
+
 pub fn open(owner: &Path, pass_file: &Path, roster_file: &Path) -> Result<MemberState, String> {
     #[cfg(unix)]
     {
@@ -323,7 +337,7 @@ pub fn open(owner: &Path, pass_file: &Path, roster_file: &Path) -> Result<Member
             return Err("passphrase file must be owner-only (mode 0600)".into());
         }
     }
-    let mut pass = fs::read_to_string(pass_file).map_err(|e| e.to_string())?;
+    let mut pass = read_from_start(pass_file)?;
     let trimmed = Zeroizing::new(pass.trim_end_matches(['\r', '\n']).to_string());
     pass.zeroize();
     if trimmed.is_empty() {

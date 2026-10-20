@@ -36,6 +36,31 @@ def payment_sync_fake(stored, plans=None):
 
 
 class MemberWalletTest(unittest.TestCase):
+    def test_native_unlock_uses_anonymous_owner_only_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            binary = root / "read-pass"
+            binary.write_text("#!/usr/bin/env python3\n"
+                              "import json, os, pathlib, sys\n"
+                              "path = pathlib.Path(sys.argv[2])\n"
+                              "with path.open() as source:\n"
+                              "    first = source.read()\n"
+                              "    source.seek(0)\n"
+                              "    second = source.read()\n"
+                              "print(json.dumps({'first': first, 'second': second, "
+                              "'mode': os.stat(path).st_mode & 0o777, "
+                              "'visible': [p.name for p in pathlib.Path(sys.argv[3]).iterdir() "
+                              "if p.name.startswith('.unlock-')]}))\n")
+            binary.chmod(0o700)
+            wallet = Wallet(root / "member", root / "exchange")
+            self.addCleanup(wallet.close)
+            wallet.passphrase = "long test passphrase"
+            result = json.loads(wallet.command("read", "@pass", wallet.data, binary=binary))
+            self.assertEqual(result["first"], wallet.passphrase)
+            self.assertEqual(result["second"], wallet.passphrase)
+            self.assertEqual(result["mode"], 0o600)
+            self.assertEqual(result["visible"], [])
+
     def test_accounts_keep_profiles_and_vaults_separate_across_switches(self):
         with tempfile.TemporaryDirectory(prefix="loki-accounts-") as temp:
             root = Path(temp)

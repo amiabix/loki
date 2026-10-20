@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 use zeroize::{Zeroize, Zeroizing};
@@ -3698,10 +3698,16 @@ impl HostedSetup {
 }
 
 fn private_file(path: &Path, limit: usize) -> Result<Zeroizing<Vec<u8>>, String> {
-    let file = journal::checked_file(path).map_err(|_| "setup_file")?;
+    let mut file = if path.starts_with("/dev/fd/") {
+        journal::checked_anonymous_file(path)
+    } else {
+        journal::checked_file(path)
+    }
+    .map_err(|_| "setup_file")?;
     if file.metadata().map_err(|_| "setup_file")?.len() > limit as u64 {
         return Err("setup_file".into());
     }
+    file.seek(SeekFrom::Start(0)).map_err(|_| "setup_file")?;
     let mut bytes = Zeroizing::new(Vec::new());
     file.take(limit as u64 + 1)
         .read_to_end(&mut bytes)

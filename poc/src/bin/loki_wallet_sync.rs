@@ -1,4 +1,4 @@
-use std::{env, fs, path::Path};
+use std::{env, path::Path};
 
 use loki_poc::{
     member_state,
@@ -17,8 +17,8 @@ async fn sync(args: &[String]) -> Result<(), String> {
         Path::new(&args[1]),
         Path::new(&args[2]),
     )?;
-    let passphrase =
-        Zeroizing::new(fs::read_to_string(&args[1]).map_err(|e| format!("read passphrase: {e}"))?);
+    let passphrase = Zeroizing::new(member_state::read_from_start(Path::new(&args[1]))
+        .map_err(|e| format!("read passphrase: {e}"))?);
     let (mut wallet, mut client) = sync_member_wallet(
         &member,
         Path::new(&args[0]),

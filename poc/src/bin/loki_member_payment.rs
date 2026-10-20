@@ -172,7 +172,7 @@ fn state(args: &[String]) -> Result<(MemberState, PathBuf, Zeroizing<String>), S
     }
     let owner = PathBuf::from(&args[0]);
     let loaded = member_state::open(&owner, Path::new(&args[1]), Path::new(&args[2]))?;
-    let mut pass = fs::read_to_string(&args[1]).map_err(|e| e.to_string())?;
+    let mut pass = member_state::read_from_start(Path::new(&args[1]))?;
     let trimmed = Zeroizing::new(pass.trim_end_matches(['\r', '\n']).to_string());
     pass.zeroize();
     Ok((loaded, owner, trimmed))
@@ -248,7 +248,7 @@ fn balance(args: &[String]) -> Result<(), String> {
         Path::new(&args[1]),
         Path::new(&args[2]),
     )?;
-    let pass = Zeroizing::new(fs::read_to_string(&args[1]).map_err(|e| e.to_string())?);
+    let pass = Zeroizing::new(member_state::read_from_start(Path::new(&args[1]))?);
     let mut wallet = wallet(&member, Path::new(&args[0]), pass.trim_end_matches(['\r', '\n']))?;
     let height = wallet.scanned_height()?.ok_or("wallet has not scanned any blocks")?;
     println!(

@@ -50,7 +50,7 @@ fn secret_file(path: &Path) -> Result<String, String> {
             return Err("passphrase file must be owner-only (mode 0600)".into());
         }
     }
-    let pass = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let pass = loki_poc::member_state::read_from_start(path)?;
     let pass = pass.trim_end_matches(['\r', '\n']);
     if pass.is_empty() {
         return Err("empty passphrase".into());

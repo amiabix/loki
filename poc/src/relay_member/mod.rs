@@ -9,7 +9,7 @@ use serde_json::Value;
 use std::{
     fmt,
     fs::{self, File},
-    io::Read,
+    io::{Read, Seek, SeekFrom},
     path::Path,
 };
 use zeroize::{Zeroize, Zeroizing};
@@ -121,11 +121,28 @@ fn private_directory(path: &Path) -> MemberResult<()> {
     private_metadata(&m)
 }
 fn bounded_read(path: &Path, limit: usize, private: bool) -> MemberResult<Zeroizing<Vec<u8>>> {
-    let before = fs::symlink_metadata(path).map_err(|_| MemberError::Io)?;
-    if !before.is_file() {
-        return Err(MemberError::Permissions);
-    }
-    let file = File::open(path).map_err(|_| MemberError::Io)?;
+    let inherited = private
+        && path
+            .strip_prefix("/dev/fd")
+            .ok()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.parse::<u32>().ok())
+            .is_some();
+    let before = if inherited {
+        None
+    } else {
+        let metadata = fs::symlink_metadata(path).map_err(|_| MemberError::Io)?;
+        if !metadata.is_file() {
+            return Err(MemberError::Permissions);
+        }
+        Some(metadata)
+    };
+    let mut file = if inherited {
+        crate::setup_ceremony::journal::checked_anonymous_file(path)
+            .map_err(|_| MemberError::Permissions)?
+    } else {
+        File::open(path).map_err(|_| MemberError::Io)?
+    };
     let after = file.metadata().map_err(|_| MemberError::Io)?;
     if !after.is_file() {
         return Err(MemberError::Permissions);
@@ -133,8 +150,10 @@ fn bounded_read(path: &Path, limit: usize, private: bool) -> MemberResult<Zeroiz
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if before.dev() != after.dev() || before.ino() != after.ino() {
-            return Err(MemberError::Permissions);
+        if let Some(before) = before.as_ref() {
+            if before.dev() != after.dev() || before.ino() != after.ino() {
+                return Err(MemberError::Permissions);
+            }
         }
     }
     if private {
@@ -143,6 +162,7 @@ fn bounded_read(path: &Path, limit: usize, private: bool) -> MemberResult<Zeroiz
     if after.len() > limit as u64 {
         return Err(MemberError::Bounds);
     }
+    file.seek(SeekFrom::Start(0)).map_err(|_| MemberError::Io)?;
     let mut bytes = Zeroizing::new(Vec::new());
     file.take((limit + 1) as u64)
         .read_to_end(&mut bytes)
@@ -357,6 +377,33 @@ pub use exchange::{CourierFile, CourierImport};
 #[cfg(test)]
 mod roster_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_passphrase_can_be_read_twice_without_a_visible_file() {
+        use std::{
+            io::Write,
+            os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
+        };
+
+        use rand_core::{OsRng, RngCore};
+        let mut suffix = [0u8; 16];
+        OsRng.fill_bytes(&mut suffix);
+        let path = std::env::temp_dir().join(format!("loki-relay-pass-{}", hex::encode(suffix)));
+        let mut file = fs::OpenOptions::new()
+            .read(true).write(true).create_new(true)
+            .mode(0o600).open(&path).unwrap();
+        file.write_all(b"private passphrase").unwrap();
+        fs::remove_file(&path).unwrap();
+        let inherited = format!("/dev/fd/{}", file.as_raw_fd());
+        let inherited = Path::new(&inherited);
+        for _ in 0..2 {
+            assert_eq!(
+                bounded_read(inherited, MAX_PASS, true).unwrap().as_slice(),
+                b"private passphrase"
+            );
+        }
+    }
 
     fn document(threshold: u16, count: u16) -> Value {
         let members: Vec<Value> = (1..=count)

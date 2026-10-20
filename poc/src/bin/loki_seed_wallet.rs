@@ -93,9 +93,8 @@ fn secret(path: &Path) -> Result<String, String> {
             return Err("secret file must be owner-only (mode 0600)".into());
         }
     }
-    fs::read_to_string(path)
+    loki_poc::member_state::read_from_start(path)
         .map(|s| s.trim_end_matches(['\r', '\n']).to_string())
-        .map_err(|e| e.to_string())
 }
 
 fn prove(args: &[String]) -> Result<(), String> {
