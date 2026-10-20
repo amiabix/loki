@@ -3,9 +3,14 @@ pub use admission_checkpoint::AdmissionCheckpointAuthority;
 #[cfg(feature = "relay-communication")]
 mod admission_checkpoint;
 mod engine;
+mod local_agreement;
 pub use engine::{
     CeremonyPhase, CeremonyRecord, CeremonyStep, CheckpointAuthority, CheckpointState,
     SavedCheckpoint, SetupCeremony,
+};
+pub use local_agreement::{
+    generate_local_context, local_roster_vote, verify_local_roster, LocalAcceptedRoster,
+    LocalRosterVote,
 };
 pub(crate) mod journal;
 use crate::{
