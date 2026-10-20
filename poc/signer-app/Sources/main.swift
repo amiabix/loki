@@ -12,6 +12,21 @@ let mode = CommandLine.arguments.dropFirst().first ?? "persist"
 let biometric = (mode == "biometric")
 let tag = "cash.loki.signer.kek.app".data(using: .utf8)!
 
+// `rust` mode: the ACTUAL loki signer (linked as libloki_poc.a) seals its FROST share under
+// a PERSISTENT Secure Enclave key and reloads it — the real native-signer path.
+@_silgen_name("loki_signer_enclave_selftest")
+func loki_signer_enclave_selftest() -> Int32
+
+if mode == "rust" {
+    let rc = loki_signer_enclave_selftest()
+    if rc == 0 {
+        print("RUST SIGNER ENCLAVE PASS: FROST share sealed + reloaded under the persistent Secure Enclave key")
+        exit(0)
+    }
+    FileHandle.standardError.write("RUST SELFTEST FAILED (code \(rc))\n".data(using: .utf8)!)
+    exit(rc)
+}
+
 func fail(_ m: String) -> Never { FileHandle.standardError.write(("FAIL: "+m+"\n").data(using:.utf8)!); exit(1) }
 
 func wipe() {

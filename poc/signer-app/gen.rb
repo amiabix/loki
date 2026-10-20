@@ -17,6 +17,14 @@ target.build_configurations.each do |c|
   bs['MACOSX_DEPLOYMENT_TARGET'] = '13.0'
   bs['GENERATE_INFOPLIST_FILE'] = 'YES'
   bs['CODE_SIGN_IDENTITY'] = 'Apple Development'
+  # Link the Rust signer static lib (libloki_poc.a) + the Swift Enclave backend
+  # (libse_backend.dylib), both staged in libs/ by the build step.
+  libs = File.join(__dir__, 'libs')
+  bs['LIBRARY_SEARCH_PATHS'] = libs
+  bs['LD_RUNPATH_SEARCH_PATHS'] = libs
+  bs['OTHER_LDFLAGS'] = '-lloki_poc -lse_backend -framework Security -framework Foundation ' \
+                        '-framework CoreFoundation -framework SystemConfiguration ' \
+                        '-lc++ -lresolv -liconv'
 end
 project.save
 puts "project generated"
