@@ -14,6 +14,30 @@ const OTHER: &str = "a1b2c3d4e5f60708";
 const ALICE_VAULT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const BOB_VAULT: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
+#[cfg(unix)]
+#[test]
+fn a_committed_account_switch_survives_a_directory_sync_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = Fixture::new();
+    root.profile("default", "Alice", "alice passphrase");
+    root.profile(OTHER, "Bob", "bob passphrase");
+    let server = Server::start(&root.0);
+    fs::set_permissions(&root.0, fs::Permissions::from_mode(0o300)).unwrap();
+    if fs::File::open(&root.0).is_ok() {
+        fs::set_permissions(&root.0, fs::Permissions::from_mode(0o700)).unwrap();
+        return; // A privileged test runner cannot induce this permission failure.
+    }
+    let (status, accounts) = server.post("/api/account-switch", json!({"account":OTHER}));
+    fs::set_permissions(&root.0, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(accounts["active"], OTHER);
+    assert_eq!(
+        fs::read_to_string(root.0.join("active-account")).unwrap(),
+        OTHER
+    );
+}
+
 struct Fixture(PathBuf);
 
 impl Fixture {
