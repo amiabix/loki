@@ -63,7 +63,7 @@ pub struct SetupPolicy {
 impl SetupPolicy {
     fn validate(&self) -> ClientResult<()> {
         setup::encode_record(&SetupRecord {
-            version: 1,
+            version: setup::SETUP_VERSION,
             key: SetupKey {
                 ceremony: self.ceremony,
                 phase: SetupPhase::Join,
@@ -104,7 +104,7 @@ impl BootstrapContext {
         policy.validate()?;
         if creator.id != 1
             || policy.config_digest != *operators.digest()
-            || !operators.setup_versions().contains(&1)
+            || !operators.setup_versions().contains(&setup::SETUP_VERSION)
         {
             return Err(ClientError::Config);
         }
@@ -532,7 +532,7 @@ impl SetupInvite {
 }
 
 fn acceptance_payload(roster: &Roster, capabilities: &SetupCapabilities) -> ClientResult<Vec<u8>> {
-    capabilities.require(1, roster.members.len() as u16)?;
+    capabilities.require(setup::SETUP_VERSION, roster.members.len() as u16)?;
     if capabilities.versions.len() > 8
         || capabilities.member_counts.len() > 4
         || capabilities.versions.windows(2).any(|w| w[0] >= w[1])
@@ -567,7 +567,7 @@ pub fn sign_roster_acceptance(
         return Err(ClientError::Identity);
     }
     let body = SetupRecord {
-        version: 1,
+        version: setup::SETUP_VERSION,
         key: SetupKey {
             ceremony: ctx.policy.ceremony,
             phase: SetupPhase::RosterAccept,

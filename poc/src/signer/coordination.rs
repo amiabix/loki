@@ -95,6 +95,7 @@ where
             .signer
             .build_candidate(&proposer.session, cand, intent, &alpha_bytes)
             .map_err(|e| format!("proposer {:?} build_candidate: {e}", proposer.id))?
+            .0
     };
 
     // Recompute the sighash from the bytes the proposer returned — the signers redo this

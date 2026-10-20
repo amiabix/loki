@@ -1797,7 +1797,7 @@ impl HostedSetup {
         for recipient in 1..=self.context.count {
             let prerequisites = table.get(&recipient).ok_or(ERROR)?.clone();
             records.0.push(SetupRecord {
-                version: 1,
+                version: loki_relay_protocol::setup::SETUP_VERSION,
                 key: SetupKey {
                     ceremony: roster.vault,
                     phase: SetupPhase::RosterProposal,
@@ -2087,7 +2087,7 @@ impl HostedSetup {
                     );
                     let predecessor = Sha256::digest(&*encoded).into();
                     records.0.push(SetupRecord {
-                        version: 1,
+                        version: loki_relay_protocol::setup::SETUP_VERSION,
                         key: SetupKey {
                             recipient,
                             ..key.clone()
@@ -2211,7 +2211,7 @@ impl HostedSetup {
         let mut records = SecretRecords(Vec::new());
         for (&recipient, wire) in outgoing {
             records.0.push(SetupRecord {
-                version: 1,
+                version: loki_relay_protocol::setup::SETUP_VERSION,
                 key: SetupKey {
                     ceremony: policy.ceremony,
                     phase,
@@ -2862,7 +2862,7 @@ impl HostedSetup {
                 versions: list(&fields[1])?,
                 member_counts: list(&fields[2])?,
             }
-            .require(1, policy.member_count)
+            .require(loki_relay_protocol::setup::SETUP_VERSION, policy.member_count)
             .map_err(|_| "setup_capabilities")?;
             let Value::Bytes(package) = &fields[3] else {
                 return Err("setup_join".into());
@@ -3008,7 +3008,7 @@ impl HostedSetup {
         .map_err(|_| ERROR)?;
         let capabilities = SetupCapabilities::current();
         capabilities
-            .require(1, policy.member_count)
+            .require(loki_relay_protocol::setup::SETUP_VERSION, policy.member_count)
             .map_err(|_| ERROR)?;
         let value = PrivateValue(Value::Array(vec![
             Value::Integer(1.into()),
@@ -3050,7 +3050,7 @@ impl HostedSetup {
                 [1, self.context.own_slot]
                     .into_iter()
                     .map(|recipient| SetupRecord {
-                        version: 1,
+                        version: loki_relay_protocol::setup::SETUP_VERSION,
                         key: SetupKey {
                             recipient,
                             ..key.clone()

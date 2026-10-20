@@ -37,7 +37,7 @@ fn operator_bundle(admission_origin: &str) -> (Vec<u8>, [u8; 32]) {
                     .to_vec(),
             ),
         ]),
-        Value::Array(vec![Value::Integer(1.into())]),
+        Value::Array(vec![Value::Integer(2.into())]),
         Value::Array(
             [86400u64, 2592000, 1048576, 67108864, 1, 1, 60]
                 .into_iter()
@@ -1303,7 +1303,7 @@ fn finish_owned_handoff(
                 raw.as_slice().try_into().unwrap(),
             )
             .unwrap();
-            let loaded = loki_poc::relay_member::LoadedMember { identity, roster, threshold: 2 };
+            let loaded = loki_poc::relay_member::LoadedMember { identity, roster, threshold: 2, network: loki_poc::network::VaultNetwork::Regtest };
             let db =
                 loki_relay_client::ClientStore::open(&path.join("transport"), &loaded.roster, slot)
                     .unwrap();
@@ -1600,7 +1600,7 @@ fn saved_join_objects(
     };
     assert_eq!(payload.len(), 4);
     assert_eq!(payload[0], Value::Integer(1.into()));
-    assert_eq!(payload[1], Value::Array(vec![Value::Integer(1.into())]));
+    assert_eq!(payload[1], Value::Array(vec![Value::Integer(2.into())]));
     assert_eq!(
         payload[2],
         Value::Array(vec![Value::Integer(3.into()), Value::Integer(4.into())])

@@ -28,7 +28,7 @@ use crate::zip2005;
 use std::path::PathBuf;
 use zeroize::Zeroizing;
 
-const BACKUP_MAGIC: &[u8; 8] = b"LOKIBAK1";
+const BACKUP_MAGIC: &[u8; 8] = b"LOKIBAK2";
 
 fn network_tag(n: Network) -> u8 {
     match n {
@@ -83,6 +83,15 @@ pub struct BackupMaterial {
     pub public_package: Vec<u8>,
     /// The epoch this backup was taken at. [`restore`] bumps past it.
     pub backup_epoch: u64,
+    /// The member's setup identity (`Identity::to_secret_bytes`), so a restored device
+    /// holds an identity that is in its own roster. Empty for a bare-share backup.
+    pub identity: Zeroizing<Vec<u8>>,
+    /// The confirmed roster document. Empty for a bare-share backup.
+    pub roster: Vec<u8>,
+    /// Fingerprint of `roster`; all zero for a bare-share backup.
+    pub roster_fingerprint: [u8; 32],
+    /// The vault's birth height on Testnet.
+    pub birth_height: Option<u32>,
 }
 
 impl BackupMaterial {
@@ -101,8 +110,8 @@ impl BackupMaterial {
             .map_err(|_| "group verifying key is not 32 bytes".to_string())
     }
 
-    fn encode_plaintext(&self) -> Vec<u8> {
-        let mut out = Vec::new();
+    fn encode_plaintext(&self) -> Zeroizing<Vec<u8>> {
+        let mut out = Zeroizing::new(Vec::new());
         out.extend_from_slice(&self.member_id.to_be_bytes());
         out.extend_from_slice(&self.threshold.to_be_bytes());
         out.extend_from_slice(&self.members.to_be_bytes());
@@ -113,6 +122,16 @@ impl BackupMaterial {
         put_bytes(&mut out, self.label.as_bytes());
         put_bytes(&mut out, &self.key_package);
         put_bytes(&mut out, &self.public_package);
+        put_bytes(&mut out, &self.identity);
+        put_bytes(&mut out, &self.roster);
+        out.extend_from_slice(&self.roster_fingerprint);
+        match self.birth_height {
+            Some(height) => {
+                out.push(1);
+                out.extend_from_slice(&height.to_be_bytes());
+            }
+            None => out.push(0),
+        }
         out
     }
 
@@ -132,6 +151,21 @@ impl BackupMaterial {
             .map_err(|_| "backup label is not utf-8")?;
         let key_package = Zeroizing::new(take_bytes(raw, &mut at)?.to_vec());
         let public_package = take_bytes(raw, &mut at)?.to_vec();
+        let identity = Zeroizing::new(take_bytes(raw, &mut at)?.to_vec());
+        let roster = take_bytes(raw, &mut at)?.to_vec();
+        let roster_fingerprint: [u8; 32] = raw
+            .get(at..at + 32)
+            .ok_or("truncated backup fingerprint")?
+            .try_into()
+            .unwrap();
+        at += 32;
+        let birth_height = match raw.get(at) {
+            Some(0) if raw.len() == at + 1 => None,
+            Some(1) if raw.len() == at + 5 => Some(u32::from_be_bytes(
+                raw[at + 1..at + 5].try_into().unwrap(),
+            )),
+            _ => return Err("invalid backup birth height".into()),
+        };
         Ok(Self {
             member_id,
             threshold,
@@ -143,6 +177,10 @@ impl BackupMaterial {
             key_package,
             public_package,
             backup_epoch,
+            identity,
+            roster,
+            roster_fingerprint,
+            birth_height,
         })
     }
 }
@@ -200,6 +238,20 @@ pub fn verify(
     let ak = material.group_ak()?;
     zip2005::frost_viewing_key(&ak, &material.group_sk)
         .map_err(|e| format!("backup cannot derive the vault FVK: {e:?}"))?;
+    if !material.roster.is_empty() {
+        // The restored identity must be the one its own roster names.
+        let roster = crate::member_state::Roster::from_bytes(&material.roster)?;
+        let identity = crate::setup_transport::Identity::from_secret_bytes(&material.identity)?;
+        if roster.fingerprint() != material.roster_fingerprint
+            || roster.vault != material.vault_id
+            || roster.birth_height != material.birth_height
+            || roster.members.get(&material.member_id) != Some(&identity.public())
+        {
+            return Err("backup identity or roster does not match".into());
+        }
+    } else if !material.identity.is_empty() || material.roster_fingerprint != [0; 32] {
+        return Err("backup identity without its roster".into());
+    }
     Ok(material)
 }
 
@@ -226,6 +278,14 @@ pub fn restore<SE: SecureElement>(
     let next_epoch = material.backup_epoch + 1;
     let nonces = NonceStore::open_at_epoch(&nonce_dir, next_epoch)
         .map_err(|e| SignerError::Other(e.to_string()))?;
+    let identity = if material.identity.is_empty() {
+        None
+    } else {
+        Some(
+            crate::setup_transport::Identity::from_secret_bytes(&material.identity)
+                .map_err(SignerError::Other)?,
+        )
+    };
     LocalSigner::from_restored(
         material.member_id,
         material.threshold,
@@ -240,6 +300,7 @@ pub fn restore<SE: SecureElement>(
         next_epoch,
         nonces,
         approval,
+        identity,
     )
 }
 
@@ -284,6 +345,10 @@ mod tests {
             key_package: Zeroizing::new(kp1.serialize().unwrap()),
             public_package: public.serialize().unwrap(),
             backup_epoch: 3,
+            identity: Zeroizing::new(Vec::new()),
+            roster: Vec::new(),
+            roster_fingerprint: [0; 32],
+            birth_height: None,
         };
         (material, public)
     }

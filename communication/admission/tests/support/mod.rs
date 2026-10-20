@@ -39,7 +39,7 @@ pub fn bundle(signer: &SigningKey, change: impl FnOnce(&mut Vec<Value>)) -> Vec<
                     .to_vec(),
             ),
         ]),
-        Value::Array(vec![Value::Integer(1.into())]),
+        Value::Array(vec![Value::Integer(2.into())]),
         Value::Array(vec![
             Value::Integer(86400.into()),
             Value::Integer(2592000.into()),

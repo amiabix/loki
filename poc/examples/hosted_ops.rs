@@ -57,7 +57,7 @@ fn main() {
                 Value::Array(routes.iter().map(|(r, _)| r.clone()).collect()),
                 Value::Array(vec![Value::Bytes(origin.into_bytes()),
                     Value::Bytes(SigningKey::from_bytes(&[8; 32]).verifying_key().to_bytes().to_vec())]),
-                Value::Array(vec![Value::Integer(1.into())]),
+                Value::Array(vec![Value::Integer(2.into())]),
                 Value::Array([86400u64, 2592000, 1048576, 67108864, 5, 1, 60].into_iter()
                     .map(|n| Value::Integer(n.into())).collect()),
             ])).unwrap();

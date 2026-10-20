@@ -144,13 +144,25 @@ mod tests {
             fn list_vaults(&self, _: &Session) -> Result<Vec<VaultRef>, ()> {
                 Ok(vec![])
             }
+            fn dkg_begin(&mut self, _: &Session, _: &[u8]) -> Result<VaultRef, ()> {
+                Err(())
+            }
             fn dkg_step(
                 &mut self,
                 _: &Session,
                 _: &VaultRef,
-                _: &[Vec<u8>],
-            ) -> Result<Vec<Vec<u8>>, ()> {
+                _: &[crate::signer::DkgInput],
+            ) -> Result<Vec<crate::signer::DkgWire>, ()> {
                 Ok(vec![])
+            }
+            fn backup(&mut self, _: &Session) -> Result<Vec<crate::signer::DkgWire>, ()> {
+                Err(())
+            }
+            fn release_address(
+                &mut self,
+                _: &Session,
+            ) -> Result<crate::signer::ReleasedAddress, ()> {
+                Err(())
             }
             fn build_candidate(
                 &self,
@@ -158,7 +170,7 @@ mod tests {
                 _: &crate::signer::CandidateRef,
                 _: &crate::signer::PublicPaymentParams,
                 _: &[u8; 32],
-            ) -> Result<Vec<u8>, ()> {
+            ) -> Result<crate::signer::CandidatePczt, ()> {
                 Err(())
             }
             fn sign_commit(

@@ -127,7 +127,7 @@ pub fn encode_request(request: &AdmissionRequest) -> WireResult<Vec<u8>> {
             invite_hashes,
         } => {
             setup::encode_record(&SetupRecord {
-                version: 1,
+                version: setup::SETUP_VERSION,
                 key: SetupKey {
                     ceremony: *ceremony,
                     phase: SetupPhase::Join,

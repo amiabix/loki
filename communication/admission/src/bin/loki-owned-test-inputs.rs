@@ -124,7 +124,7 @@ fn init(root: &Path, relay_bin: &Path) -> Result<(), Box<dyn std::error::Error>>
             Value::Bytes(b"http://127.0.0.1:39104".to_vec()),
             Value::Bytes(admission.verifying_key().to_bytes().to_vec()),
         ]),
-        Value::Array(vec![Value::Integer(1.into())]),
+        Value::Array(vec![Value::Integer(2.into())]),
         Value::Array(
             [86400u64, 2592000, 1048576, 67108864, 5, 1, 60]
                 .into_iter()

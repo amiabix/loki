@@ -292,7 +292,7 @@ impl SavedPaymentHandoff {
                     return Err(ERROR.into());
                 }
                 Ok(SetupRecord {
-                    version: 1,
+                    version: loki_relay_protocol::setup::SETUP_VERSION,
                     key: SetupKey {
                         ceremony: policy.ceremony,
                         phase: SetupPhase::PaymentDescriptor,
@@ -493,7 +493,7 @@ impl HostedSetup {
                 .into_iter()
                 .map(|(recipient, prerequisites)| {
                     let record = SecretRecords(vec![SetupRecord {
-                        version: 1,
+                        version: loki_relay_protocol::setup::SETUP_VERSION,
                         key: SetupKey {
                             ceremony: policy.ceremony,
                             phase: SetupPhase::BackupReceipt,

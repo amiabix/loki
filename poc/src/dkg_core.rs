@@ -215,6 +215,14 @@ impl DkgState {
         &self.certificates
     }
 
+    /// The FROST `Completed` checkpoint (share and group key), from the certificate phase on.
+    pub(crate) fn completed_checkpoint(&self) -> Result<Zeroizing<Vec<u8>>, String> {
+        if (self.phase as u8) < DkgPhase::Certificate as u8 {
+            return Err(ERROR.into());
+        }
+        Ok(self.dkg.clone())
+    }
+
     /// The vault viewing secret agreed at finish. Zero before then.
     pub fn vault_secret(&self) -> &[u8; 32] {
         &self.vs
@@ -270,8 +278,10 @@ impl DkgState {
             return Err(ERROR.into());
         }
         let phase = DkgPhase::decode(reader.take(1)?[0])?;
-        let contribution = Zeroizing::new(<[u8; 32]>::try_from(reader.take(32)?).map_err(|_| ERROR)?);
-        let fresh_bytes = Zeroizing::new(<[u8; 32]>::try_from(reader.take(32)?).map_err(|_| ERROR)?);
+        let contribution =
+            Zeroizing::new(<[u8; 32]>::try_from(reader.take(32)?).map_err(|_| ERROR)?);
+        let fresh_bytes =
+            Zeroizing::new(<[u8; 32]>::try_from(reader.take(32)?).map_err(|_| ERROR)?);
         // An all-zero field means the fresh key was removed (or never created).
         let fresh = (*fresh_bytes != [0; 32]).then(|| FreshKey::from_secret_bytes(&fresh_bytes));
         let dkg = Zeroizing::new(reader.field(64 * 1024)?.to_vec());
@@ -355,7 +365,12 @@ impl<'a> DkgCore<'a> {
 
     fn peers(&self) -> Vec<u16> {
         let own = self.own();
-        self.roster.members.keys().copied().filter(|id| *id != own).collect()
+        self.roster
+            .members
+            .keys()
+            .copied()
+            .filter(|id| *id != own)
+            .collect()
     }
 
     fn broadcast(&self, wire: &[u8]) -> Outgoing {
@@ -530,7 +545,8 @@ impl<'a> DkgCore<'a> {
             if body.len() <= 32 {
                 return Err(ERROR.into());
             }
-            let contribution = Zeroizing::new(<[u8; 32]>::try_from(&body[..32]).map_err(|_| ERROR)?);
+            let contribution =
+                Zeroizing::new(<[u8; 32]>::try_from(&body[..32]).map_err(|_| ERROR)?);
             if self.commitment(id, &contribution) != bodies[&id].commitment {
                 return Err("setup_contribution".into());
             }
@@ -563,7 +579,11 @@ impl<'a> DkgCore<'a> {
         Ok((next, self.broadcast(&wire)))
     }
 
-    fn certify(&self, state: &DkgState, records: &BTreeMap<u16, &[u8]>) -> Result<DkgState, String> {
+    fn certify(
+        &self,
+        state: &DkgState,
+        records: &BTreeMap<u16, &[u8]>,
+    ) -> Result<DkgState, String> {
         let expected = self.certificate_body(state)?;
         let completed = Completed::restore_checkpoint(&state.dkg)?;
         let mut digests = BTreeMap::new();
@@ -621,7 +641,10 @@ impl<'a> DkgCore<'a> {
         let mut certified = self.certified(state)?;
         let _secret = Zeroizing::new(std::mem::take(&mut certified.key_package));
         let key = zip2005::frost_viewing_key(&certified.group_ak, &state.vs).map_err(|_| ERROR)?;
-        Ok(vault::unified_address(&key, self.roster.network.network_type()))
+        Ok(vault::unified_address(
+            &key,
+            self.roster.network.network_type(),
+        ))
     }
 
     /// The 32-byte body each member signs as its backup receipt (`sign_backup`): vault,
@@ -648,7 +671,10 @@ impl<'a> DkgCore<'a> {
     pub fn validate(&self, state: &DkgState) -> Result<(), String> {
         let own = self.own();
         for values in [&state.round1, &state.round2, &state.certificates] {
-            if values.keys().any(|id| !self.roster.members.contains_key(id)) {
+            if values
+                .keys()
+                .any(|id| !self.roster.members.contains_key(id))
+            {
                 return Err(ERROR.into());
             }
         }
@@ -730,8 +756,7 @@ impl<'a> DkgCore<'a> {
                 let public = frost::keys::PublicKeyPackage::from_dkg_commitments(&commitments)
                     .map_err(|_| ERROR)?
                     .into_even_y(None);
-                if public.serialize().map_err(|_| ERROR)?.as_slice() != completed.public_package()
-                {
+                if public.serialize().map_err(|_| ERROR)?.as_slice() != completed.public_package() {
                     return Err(ERROR.into());
                 }
                 let transcript = round1_transcript(&frost_packages);
@@ -742,8 +767,14 @@ impl<'a> DkgCore<'a> {
                     return Err(ERROR.into());
                 }
                 for (&id, wire) in &state.round2 {
-                    Identity::verify_round2_v2(self.member(id)?, own, self.vault(), &transcript, wire)
-                        .map_err(|_| ERROR)?;
+                    Identity::verify_round2_v2(
+                        self.member(id)?,
+                        own,
+                        self.vault(),
+                        &transcript,
+                        wire,
+                    )
+                    .map_err(|_| ERROR)?;
                 }
                 let body = self.certificate_body_for(&completed, &state.vs);
                 if !state.certificates.contains_key(&own) {
@@ -781,7 +812,10 @@ fn round1_transcript(packages: &BTreeMap<u16, Vec<u8>>) -> [u8; 32] {
         hash.update(&(package.len() as u32).to_be_bytes());
         hash.update(package);
     }
-    hash.finalize().as_bytes().try_into().expect("32 byte digest")
+    hash.finalize()
+        .as_bytes()
+        .try_into()
+        .expect("32 byte digest")
 }
 
 /// Plaintext FROST round-two packages, wiped on drop.

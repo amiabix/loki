@@ -17,11 +17,14 @@
 
 pub mod backup;
 pub mod coordination;
+pub(crate) mod durable;
 pub mod local;
 pub mod nonce;
 pub mod secure_element;
+pub(crate) mod store;
 pub mod wysiwys;
 
+pub use crate::setup_transport::{DkgWire, DkgWireKind};
 use crate::signer::wysiwys::PaymentView;
 use reddsa_frost::frost::redpallas as frost;
 
@@ -46,7 +49,9 @@ pub struct VaultRef {
     pub ready: bool,
 }
 
-/// Public identity of the connected member (its roster id + public keys).
+/// Public identity of the connected member: its roster id, Ed25519 setup signing key and
+/// long-lived X25519 encryption key (`setup_transport::Identity`). All zero for a signer
+/// built from a bare share with no setup identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemberIdentity {
     pub id: u16,
@@ -60,6 +65,28 @@ pub struct Connection {
     pub session: Session,
     pub member: MemberIdentity,
 }
+
+/// One setup message handed to a signer, tagged with the member the coordinator says sent
+/// it. The tag is untrusted: the signer checks it against the message's own header and
+/// the sender's signature.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DkgInput {
+    pub sender: u16,
+    pub bytes: Vec<u8>,
+}
+
+/// The vault's receive address, released by a ready signer over a session the member
+/// approved on-device. Only [`Signer::release_address`] produces it. It carries no viewing
+/// key: the coordinator stays viewing-key-less.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReleasedAddress {
+    pub vault_id: [u8; 32],
+    pub address: String,
+}
+
+/// An unsigned, IO-finalized candidate PCZT built by the proposer signer. Public.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CandidatePczt(pub Vec<u8>);
 
 /// Names a candidate the coordinator wants this member to commit/sign to. Public.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -83,13 +110,22 @@ pub struct PublicPaymentParams {
 }
 
 /// The ONE keyless signer seam (ws1-signer §7). Every parameter and return type is
-/// FROST/PCZT artifacts: session handles, vault metadata, authenticated DKG round-one
-/// messages, recipient-encrypted DKG round-two messages, signing commitments, and
-/// signature shares (public partial signatures).
+/// FROST/PCZT artifacts: session handles, vault metadata, setup messages ([`DkgWire`]:
+/// signed round-one bodies, certificates and backup receipts, and recipient-encrypted v2
+/// round-two envelopes), signing commitments, signature shares (public partial
+/// signatures), and the released receive address.
 ///
 /// There is deliberately NO method that takes or returns a FROST share, a secret nonce,
-/// a viewing key, or a spend authorization (invariants #1/#4). Opaque byte vectors need
-/// separate tests to verify that secret material is encrypted before it crosses this seam.
+/// a viewing key, or a spend authorization (invariants #1/#4). No method returns raw
+/// bytes: setup messages are [`DkgWire`], which only `setup_transport` constructs.
+///
+/// On-device decisions (roster code comparison, payment approval, connect approval,
+/// backup passphrase) are callbacks supplied when the signer is created, never arguments
+/// from the coordinator, so the trait stays object-safe and the coordinator cannot
+/// confirm or cancel for the member.
+///
+/// When you add a method, add its return type to the `PublicArtifact` guard in the tests
+/// below by hand.
 ///
 /// Implemented by [`local::LocalSigner`] (in-app, secure-element-wrapped share) today and
 /// by a FROST hardware participant later, behind this exact interface (ws1-signer §4
@@ -109,15 +145,36 @@ pub trait Signer {
     /// Public vault metadata the member holds a share for.
     fn list_vaults(&self, session: &Session) -> Result<Vec<VaultRef>, Self::Error>;
 
-    /// Advance the dealerless group DKG by one step, returning signed round-one messages
-    /// or recipient-encrypted round-two messages. The member's share is born INSIDE the
-    /// signer and sealed via the secure element on completion; it is never returned.
+    /// Start a vault setup from the coordinator's roster document. The signer refuses a
+    /// roster without `"setup_version": 2` before anything else, runs the roster gate
+    /// (its own network and its full identity under its member number), then shows a
+    /// 24-digit code derived from the roster fingerprint on the device and blocks on the
+    /// member's match / no match / cancel decision under a deadline. Only a match saves
+    /// the roster. The coordinator never displays, confirms or cancels.
+    fn dkg_begin(&mut self, session: &Session, roster: &[u8]) -> Result<VaultRef, Self::Error>;
+
+    /// Advance the confirmed setup with whatever peer messages have arrived, and return
+    /// this member's current outgoing messages. Each step saves its state, including the
+    /// exact outgoing bytes, before returning them, and a repeated call returns the saved
+    /// bytes again. The share is born INSIDE the signer and sealed before the certificate
+    /// is released; it is never returned. Any mismatch is final: the setup aborts and its
+    /// secrets are wiped.
     fn dkg_step(
         &mut self,
         session: &Session,
         vault: &VaultRef,
-        in_msgs: &[Vec<u8>],
-    ) -> Result<Vec<Vec<u8>>, Self::Error>;
+        in_msgs: &[DkgInput],
+    ) -> Result<Vec<DkgWire>, Self::Error>;
+
+    /// Run the on-device backup flow once every certificate matched: create the backup,
+    /// have the member store it and prove it reloads, then return this member's signed
+    /// backup receipt. The backup itself never crosses this seam. The vault is `ready`
+    /// only once every member's receipt has arrived through [`Signer::dkg_step`].
+    fn backup(&mut self, session: &Session) -> Result<Vec<DkgWire>, Self::Error>;
+
+    /// The vault's receive address, once the vault is ready, over a session the member
+    /// approved on-device at [`Signer::connect`].
+    fn release_address(&mut self, session: &Session) -> Result<ReleasedAddress, Self::Error>;
 
     /// Round 1: after the member's on-device "prepare" ack, return PUBLIC commitments.
     /// The secret nonce is persisted internally (crash-safe) and never returned.
@@ -139,7 +196,7 @@ pub trait Signer {
         cand: &CandidateRef,
         params: &PublicPaymentParams,
         alpha: &[u8; 32],
-    ) -> Result<Vec<u8>, Self::Error>;
+    ) -> Result<CandidatePczt, Self::Error>;
 
     /// Round 2 (rerandomized): BLOCKS on in-signer parse + render + approval + sighash
     /// binding. The signer independently parses `pczt`, renders it (WYSIWYS), requires an
@@ -173,8 +230,9 @@ mod tests {
     //! Type guard for the named return types of the signer seam.
     //!
     //! Every `Signer` success type is asserted to implement `PublicArtifact`, a marker
-    //! deliberately NOT implemented for any secret type. This cannot inspect the contents
-    //! of opaque `Vec<u8>` messages; the local signer DKG test checks that boundary.
+    //! deliberately NOT implemented for any secret type, nor for raw bytes. Setup
+    //! messages cross as `DkgWire`, which only `setup_transport` constructs from a valid
+    //! setup-message frame.
 
     use super::*;
 
@@ -190,7 +248,9 @@ mod tests {
     impl PublicArtifact for frost::round2::SignatureShare {}
     impl<T: PublicArtifact> PublicArtifact for Vec<T> {}
     impl PublicArtifact for VaultRef {}
-    impl PublicArtifact for Vec<u8> {} // opacity requires separate DKG boundary tests
+    impl PublicArtifact for DkgWire {}
+    impl PublicArtifact for ReleasedAddress {}
+    impl PublicArtifact for CandidatePczt {}
 
     fn assert_public<T: PublicArtifact>() {}
 
@@ -200,7 +260,11 @@ mod tests {
         // separate content checks; this cannot inspect newly added methods automatically.
         assert_public::<Connection>(); // connect
         assert_public::<Vec<VaultRef>>(); // list_vaults
-        assert_public::<Vec<Vec<u8>>>(); // dkg_step
+        assert_public::<VaultRef>(); // dkg_begin
+        assert_public::<Vec<DkgWire>>(); // dkg_step
+        assert_public::<Vec<DkgWire>>(); // backup
+        assert_public::<ReleasedAddress>(); // release_address
+        assert_public::<CandidatePczt>(); // build_candidate
         assert_public::<frost::round1::SigningCommitments>(); // sign_commit
         assert_public::<frost::round2::SignatureShare>(); // sign_approve
         assert_public::<PaymentView>(); // rendered_payment
@@ -212,5 +276,6 @@ mod tests {
         //   assert_public::<frost::keys::SigningShare>();
         //   assert_public::<frost::round1::SigningNonces>();
         //   assert_public::<orchard::keys::FullViewingKey>();
+        //   assert_public::<Vec<u8>>();
     }
 }
