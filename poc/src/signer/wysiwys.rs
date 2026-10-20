@@ -34,8 +34,10 @@ pub struct PaymentView {
     pub amount_zat: u64,
     pub fee_zat: u64,
     pub change_zat: u64,
-    /// The payee's memo, recovered from the ciphertext (empty if none/unrecoverable).
+    /// The payee's memo, recovered from the ciphertext.
     pub memo: Vec<u8>,
+    /// Height after which the transaction cannot be mined, from the signed PCZT.
+    pub expiry_height: u32,
     /// Consensus branch id the PCZT commits to (e.g. NU7). The binding network fact.
     pub network_branch_id: u32,
     /// `true` iff every action's declared spend/output value was bound to its `cv_net`
@@ -47,14 +49,25 @@ pub struct PaymentView {
 }
 
 /// Parse `pczt_bytes` with the vault's viewing key and return what the member will sign.
-/// Errors on a structurally invalid PCZT or one whose outputs cannot be opened.
+/// Errors on a structurally invalid PCZT or one whose payment cannot be fully reviewed.
 pub fn describe_pczt(pczt_bytes: &[u8], vault_fvk: &FullViewingKey) -> Result<PaymentView, String> {
-    // Branch id commits the network; read it from the bytes before the Verifier consumes
-    // the parsed PCZT.
-    let network_branch_id = *pczt::Pczt::parse(pczt_bytes)
-        .map_err(|e| format!("pczt parse: {e:?}"))?
-        .global()
-        .consensus_branch_id();
+    let parsed = pczt::Pczt::parse(pczt_bytes).map_err(|e| format!("pczt parse: {e:?}"))?;
+    if *parsed.global().tx_version() != zcash_protocol::constants::V6_TX_VERSION {
+        return Err("unsupported transaction version".into());
+    }
+    if !parsed.orchard().actions().is_empty()
+        || !parsed.transparent().inputs().is_empty()
+        || !parsed.transparent().outputs().is_empty()
+        || !parsed.sapling().spends().is_empty()
+        || !parsed.sapling().outputs().is_empty()
+    {
+        return Err("pczt includes an unsupported pool".into());
+    }
+    if parsed.ironwood().anchor().is_some() {
+        return Err("pczt already carries an Ironwood anchor".into());
+    }
+    let network_branch_id = *parsed.global().consensus_branch_id();
+    let expiry_height = *parsed.global().expiry_height();
 
     let change_address = vault_fvk
         .address_at(0u64, orchard::keys::Scope::Internal)
@@ -74,11 +87,18 @@ pub fn describe_pczt(pczt_bytes: &[u8], vault_fvk: &FullViewingKey) -> Result<Pa
 
     // The Verifier yields the parsed `orchard::pczt::Bundle`, whose actions carry the
     // openings `open_output` needs. We only read; `check_candidate` uses the same path.
-    let parsed = pczt::Pczt::parse(pczt_bytes).map_err(|e| format!("pczt parse: {e:?}"))?;
     Verifier::new(parsed)
         .with_ironwood::<String, _>(|bundle| {
             let mut run = || -> Result<(), String> {
                 for action in bundle.actions() {
+                    if action.spend().witness().is_some()
+                        && action
+                            .spend()
+                            .value()
+                            .is_some_and(|value| value.inner() > 0)
+                    {
+                        return Err("pczt already carries a spend witness".into());
+                    }
                     // Bind this action's declared values to its value commitment. If the
                     // trapdoor is absent or the commitment disagrees, the declared spend
                     // value is not something the sighash commits to: keep reading for the
@@ -87,20 +107,21 @@ pub fn describe_pczt(pczt_bytes: &[u8], vault_fvk: &FullViewingKey) -> Result<Pa
                         fee_verified = false;
                     }
                     if let Some(v) = action.spend().value() {
-                        total_in =
-                            total_in.checked_add(v.inner()).ok_or("input value overflow")?;
+                        total_in = total_in
+                            .checked_add(v.inner())
+                            .ok_or("input value overflow")?;
                     }
                 }
                 for (i, action) in bundle.actions().iter().enumerate() {
                     let label = format!("output {i}");
                     let (note, recipient, value) =
                         open_output(action, &label).map_err(|e| format!("{e:?}"))?;
-                    total_out =
-                        total_out.checked_add(value).ok_or("output value overflow")?;
+                    total_out = total_out
+                        .checked_add(value)
+                        .ok_or("output value overflow")?;
 
                     if recipient == change_address {
-                        change_zat =
-                            change_zat.checked_add(value).ok_or("change overflow")?;
+                        change_zat = change_zat.checked_add(value).ok_or("change overflow")?;
                         continue;
                     }
                     if value == 0 {
@@ -111,7 +132,8 @@ pub fn describe_pczt(pczt_bytes: &[u8], vault_fvk: &FullViewingKey) -> Result<Pa
                     }
                     // Recover the payee memo from the ciphertext as the SENDER (vault):
                     // the reconstructed note's esk/pk_d decrypt enc_ciphertext.
-                    let memo = recover_memo(action, &note).unwrap_or_default();
+                    let memo = recover_memo(action, &note)
+                        .ok_or_else(|| format!("output {i} memo cannot be recovered"))?;
                     payee = Some((recipient, value, memo));
                 }
                 Ok(())
@@ -133,6 +155,7 @@ pub fn describe_pczt(pczt_bytes: &[u8], vault_fvk: &FullViewingKey) -> Result<Pa
         fee_zat,
         change_zat,
         memo,
+        expiry_height,
         network_branch_id,
         fee_verified,
     })
@@ -226,12 +249,21 @@ mod tests {
     const AMOUNT: u64 = 40_000_000;
 
     /// A real serialized regtest PCZT paying `recipient` with `memo`, sent by `fvk`.
-    fn sample_pczt(recipient: orchard::Address, memo: &[u8]) -> (Vec<u8>, FullViewingKey, u64) {
+    fn sample_pczt_with(
+        recipient: orchard::Address,
+        memo: &[u8],
+        tamper: impl FnOnce(&mut zcash_primitives::transaction::builder::PcztParts<Regtest>),
+    ) -> (Vec<u8>, FullViewingKey, u64) {
         let rng = rand_core::OsRng;
         let (_shares, pubkeys) =
             frost::keys::generate_with_dealer(3, 2, frost::keys::IdentifierList::Default, rng)
                 .unwrap();
-        let ak: [u8; 32] = pubkeys.verifying_key().serialize().unwrap().try_into().unwrap();
+        let ak: [u8; 32] = pubkeys
+            .verifying_key()
+            .serialize()
+            .unwrap()
+            .try_into()
+            .unwrap();
         let fvk = zip2005::frost_viewing_key(&ak, &[42u8; 32]).unwrap();
 
         let rho = Rho::from_bytes(&[1u8; 32]).unwrap();
@@ -271,9 +303,138 @@ mod tests {
             rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng),
         )
         .unwrap();
-        let pczt = pczt::roles::creator::Creator::build_from_parts(built.pczt_parts)
-            .expect("assemble PCZT");
+        let mut parts = built.pczt_parts;
+        tamper(&mut parts);
+        let pczt = pczt::roles::creator::Creator::build_from_parts(parts).expect("assemble PCZT");
         (pczt.serialize().unwrap(), fvk, SPEND_VALUE - AMOUNT - fee)
+    }
+
+    fn sample_pczt(recipient: orchard::Address, memo: &[u8]) -> (Vec<u8>, FullViewingKey, u64) {
+        sample_pczt_with(recipient, memo, |_| {})
+    }
+
+    fn payee_address() -> orchard::Address {
+        let (_, key) = frost::keys::generate_with_dealer(
+            3,
+            2,
+            frost::keys::IdentifierList::Default,
+            rand_core::OsRng,
+        )
+        .unwrap();
+        let ak: [u8; 32] = key.verifying_key().serialize().unwrap().try_into().unwrap();
+        zip2005::frost_viewing_key(&ak, &[1u8; 32])
+            .unwrap()
+            .address_at(7u64, Scope::External)
+    }
+
+    #[test]
+    fn describe_rejects_unrecoverable_payee_memo() {
+        let payee = payee_address();
+        let (mut bytes, fvk, _) = sample_pczt(payee, b"memo must be read");
+        let parsed = pczt::Pczt::parse(&bytes).unwrap();
+        let ciphertext = parsed
+            .ironwood()
+            .actions()
+            .iter()
+            .find(|action| action.output().recipient() == &Some(payee.to_raw_address_bytes()))
+            .map(|action| action.output().enc_ciphertext())
+            .and_then(|ciphertext| match ciphertext {
+                pczt::orchard::EncCiphertext::Encrypted(bytes) => Some(bytes),
+                _ => None,
+            })
+            .unwrap();
+        let offset = bytes
+            .windows(ciphertext.len())
+            .position(|window| window == ciphertext.as_slice())
+            .unwrap();
+        bytes[offset + 100] ^= 1;
+        assert!(
+            pczt::Pczt::parse(&bytes).is_ok(),
+            "tamper remains a serialized PCZT"
+        );
+        assert!(
+            describe_pczt(&bytes, &fvk).is_err(),
+            "unreadable memo must not display as empty"
+        );
+    }
+
+    #[test]
+    fn describe_rejects_other_pool_outputs() {
+        let recipient = payee_address();
+        let (bytes, fvk, _) = sample_pczt_with(recipient, b"pool guard", |parts| {
+            parts.transparent = Some(crate::candidate::forbidden_transparent_bundle().unwrap());
+        });
+        assert!(pczt::Pczt::parse(&bytes).is_ok());
+        assert!(
+            describe_pczt(&bytes, &fvk).is_err(),
+            "transparent output must be rejected"
+        );
+
+        let (bytes, fvk, _) = sample_pczt_with(recipient, b"pool guard", |parts| {
+            parts.sapling = Some(crate::candidate::forbidden_sapling_bundle().unwrap());
+        });
+        assert!(pczt::Pczt::parse(&bytes).is_ok());
+        assert!(
+            describe_pczt(&bytes, &fvk).is_err(),
+            "Sapling output must be rejected"
+        );
+    }
+
+    #[test]
+    fn describe_rejects_spend_witness_before_approval() {
+        let (bytes, fvk, _) = sample_pczt(payee_address(), b"witness guard");
+        let empty = orchard::tree::MerkleHashOrchard::from_bytes(&[0u8; 32]).unwrap();
+        let path = orchard::tree::MerklePath::from_parts(0, [empty; 32]);
+        let parsed = pczt::Pczt::parse(&bytes).unwrap();
+        let mut funded_spend = None;
+        Verifier::new(parsed.clone())
+            .with_ironwood::<String, _>(|bundle| {
+                funded_spend = bundle.actions().iter().position(|action| {
+                    action
+                        .spend()
+                        .value()
+                        .is_some_and(|value| value.inner() > 0)
+                });
+                Ok(())
+            })
+            .unwrap();
+        let with_witness = pczt::roles::updater::Updater::new(parsed)
+            .set_ironwood_spend_witnesses([(funded_spend.unwrap(), path)])
+            .unwrap()
+            .finish()
+            .serialize()
+            .unwrap();
+        assert!(pczt::Pczt::parse(&with_witness).is_ok());
+        assert!(
+            describe_pczt(&with_witness, &fvk).is_err(),
+            "pre-approval witness must be refused"
+        );
+    }
+
+    #[test]
+    fn describe_rejects_anchor_before_approval() {
+        let (bytes, fvk, _) = sample_pczt(payee_address(), b"anchor guard");
+        let anchored = pczt::roles::updater::Updater::new(pczt::Pczt::parse(&bytes).unwrap())
+            .set_ironwood_anchor(orchard::Anchor::empty_tree())
+            .unwrap()
+            .finish()
+            .serialize()
+            .unwrap();
+        assert!(pczt::Pczt::parse(&anchored).is_ok());
+        assert!(
+            describe_pczt(&anchored, &fvk).is_err(),
+            "pre-approval anchor must be refused"
+        );
+    }
+
+    #[test]
+    fn describe_rejects_unsupported_transaction_version() {
+        let (bytes, fvk, _) = sample_pczt_with(payee_address(), b"version guard", |parts| {
+            parts.version = zcash_primitives::transaction::TxVersion::V5;
+        });
+        assert!(pczt::Pczt::parse(&bytes).is_ok());
+        let err = describe_pczt(&bytes, &fvk).unwrap_err();
+        assert!(err.contains("unsupported transaction version"), "got {err}");
     }
 
     // describe_pczt reports the TRUE recipient derived from the bytes, defeating a
@@ -310,6 +471,7 @@ mod tests {
         assert_eq!(view.amount_zat, AMOUNT);
         assert_eq!(view.change_zat, change);
         assert!(view.fee_zat > 0);
+        assert_eq!(view.expiry_height, 1_152);
         // Memo recovered from the ciphertext, padded to 512 bytes.
         assert!(view.memo.starts_with(b"loki wysiwys"));
     }
