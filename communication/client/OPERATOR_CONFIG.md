@@ -10,7 +10,7 @@ Body: `[1, relays, admission, setup_versions, limits]`.
 
 - `relays`: exactly three `[signing_key:bytes32, run:bytes32, https_origin:bytes]` entries in increasing signing-key order.
 - `admission`: `[https_origin:bytes, signing_key:bytes32]`.
-- `setup_versions`: `[1]`; unsupported versions are refused.
+- `setup_versions`: `[2]`; unsupported versions are refused. Version 2 is the fresh-key round-two DKG format.
 - `limits`: `[first_claim_seconds, ceremony_seconds, payload_bytes, storage_bytes_per_relay, request_seconds, retry_min_seconds, retry_max_seconds]`. All values are positive and bounded by `[86400, 2592000, 1048576, 67108864, 30, 60, 60]`; retry minimum cannot exceed maximum.
 
 Origins may contain only an HTTPS scheme, host, optional nonzero port and optional single trailing slash. Credentials, queries, fragments, additional paths, control characters and parser-normalized path spellings are rejected. The route placeholders exposed by the bundle use mailbox zero and revision one; admission supplies each owner's actual mailbox, so bundle routes alone confer no mailbox authority.

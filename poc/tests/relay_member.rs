@@ -543,6 +543,7 @@ fn config_members() -> Vec<loki_poc::relay_member::LoadedMember> {
             identity,
             roster: roster.clone(),
             threshold: 2,
+            network: loki_poc::network::VaultNetwork::Regtest,
         })
         .collect()
 }
@@ -607,6 +608,7 @@ fn sealed_revision_codec_authenticated_association() {
         identity,
         roster: wrong_roster,
         threshold: 2,
+        network: loki_poc::network::VaultNetwork::Regtest,
     };
     assert!(restored.authenticated(&wrong).is_err());
 }

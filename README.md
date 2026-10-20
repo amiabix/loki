@@ -36,10 +36,12 @@ flowchart TB
   class S secret
 ```
 
-The coordinator holds the vault **viewing key and public protocol messages** — never a
-share, nonce, or spend key. The signer holds exactly **one share**, wrapped by the
-device secure element (Secure Enclave / StrongBox / TPM; software fallback for dev).
-`frostd` relays only public FROST messages. Any `t`-of-`n` threshold is supported.
+The coordinator holds **public protocol messages and the vault address** — never a
+share, nonce, viewing key, or spend key; the signer builds the candidate PCZT. The
+signer holds exactly **one share**, wrapped by the device secure element (Secure Enclave
+/ StrongBox / TPM; software fallback for dev). `frostd` relays only public FROST
+messages and DKG round-two envelopes sealed under one-setup fresh keys. Any `t`-of-`n`
+policy with 2 ≤ t < n ≤ 16 is supported.
 
 Full design, threat model, and invariants: [`docs/product/`](docs/product/).
 
@@ -47,11 +49,11 @@ Full design, threat model, and invariants: [`docs/product/`](docs/product/).
 
 | Area | State |
 |---|---|
-| General **t-of-n** DKG → sign → aggregate → verify | ✅ `(2,3) (2,5) (3,5) (4,7)` tested |
+| General **t-of-n** DKG → sign → aggregate → verify (2 ≤ t < n ≤ 16) | ✅ `(2,3) (3,5) (15,16)` on the hosted engine and the new signer; 2-of-5 over the real relay stack |
 | Keyless coordinator boundary (no share/nonce/spend key) | ✅ compile-time + deny-list enforced |
 | Signer: **WYSIWYS→sighash binding**, single-use crash-safe nonces, fee integrity | ✅ tested |
-| Share born-in-signer (DKG) + **backup / restore** with nonce-epoch reset | ✅ tested |
-| Transport over audited **`frostd`** | ✅ live 2-of-3 round-trip |
+| Share born-in-signer (v2 DKG: on-device roster code, fresh-key round two, ready after every backup) + **backup / restore** with nonce-epoch reset | ✅ tested |
+| Transport over audited **`frostd`** (typed sends, coordinator relay log) | ✅ live 2-of-3 setup + signing through `LocalSigner` |
 | Secure Enclave backend (wrap/unwrap the share key) | 🔬 spike proven ([`poc/enclave-spike`](poc/enclave-spike)) |
 
 ## Pending (pre-custody)

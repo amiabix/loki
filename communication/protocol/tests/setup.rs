@@ -4,7 +4,7 @@ use loki_relay_protocol::{
 };
 fn record() -> SetupRecord {
     SetupRecord {
-        version: 1,
+        version: loki_relay_protocol::setup::SETUP_VERSION,
         key: SetupKey {
             ceremony: [7; 32],
             phase: SetupPhase::Round1,
@@ -43,9 +43,9 @@ fn setup_rejects_malformed_and_out_of_range_fields() {
     for case in 0..10 {
         let mut input = record();
         match case {
-            0 => input.version = 2,
+            0 => input.version = 1,
             1 => input.threshold = 1,
-            2 => input.member_count = 5,
+            2 => input.member_count = 17,
             3 => input.key.author = 0,
             4 => input.key.recipient = 5,
             5 => input.key.revision = 0,
@@ -80,13 +80,17 @@ fn setup_payload_limit_and_supported_policies() {
 }
 #[test]
 fn setup_negotiation_rejects_incapable_peer_before_dkg() {
-    assert!(SetupCapabilities::current().supports(1, 3));
-    assert!(SetupCapabilities::current().supports(1, 4));
-    assert!(!SetupCapabilities::current().supports(2, 4));
+    use loki_relay_protocol::setup::SETUP_VERSION;
+    assert_eq!(SETUP_VERSION, 2);
+    assert!(SetupCapabilities::current().supports(SETUP_VERSION, 3));
+    assert!(SetupCapabilities::current().supports(SETUP_VERSION, 4));
+    // A peer on the v1 DKG format is refused before any key generation.
+    assert!(!SetupCapabilities::current().supports(1, 4));
+    assert!(!SetupCapabilities::current().supports(3, 4));
     let legacy = SetupCapabilities {
         versions: vec![1],
-        member_counts: vec![3],
+        member_counts: vec![3, 4],
     };
     assert!(!legacy.supports(1, 4));
-    assert!(legacy.require(1, 4).is_err());
+    assert!(legacy.require(SETUP_VERSION, 4).is_err());
 }

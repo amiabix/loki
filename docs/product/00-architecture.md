@@ -101,7 +101,7 @@ the design keeps that upgrade path open (ws1 §Hardware).
 |---|---|---|---|---|
 | **Coordinator** | Untrusted terminal | No | Web app (or bundled native shell) | PWA / native |
 | **Signer** | Trusted, isolated | **Yes (one share)** | Native app, Enclave-wrapped share | FROST hardware (Keystone/Frostsnap) |
-| **Transport** | Honest-but-curious; sees only ciphertext | No | `frostd` (self-hostable) | serverless Zcash-memo option |
+| **Transport** | Honest-but-curious; sees signed public DKG messages, round-two envelopes it cannot open, public signing artifacts, and who sends to whom | No | `frostd` (self-hostable) | serverless Zcash-memo option |
 
 A single device may run both the coordinator and signer in one installed native app
 (simplest shippable v1). "Keyless coordinator" is a **logical** boundary enforced by
@@ -113,9 +113,14 @@ share across the boundary — not necessarily two machines.
 ## 4. Key lifecycle (where the secret is, at every moment)
 
 1. **Creation (DKG).** Each member's share is generated **inside their signer** during
-   the dealerless group ceremony. No share ever exists as a whole key anywhere; no
-   coordinator or relay sees any share. Only **public** DKG messages cross the
-   transport.
+   the dealerless group ceremony (any t-of-n with 2 ≤ t < n ≤ 16), after the member
+   confirms a 24-digit roster code on the device. No share ever exists as a whole key
+   anywhere; no coordinator or relay sees any share. Round one is signed and public;
+   each round-two package crosses the transport only inside a v2 envelope sealed under
+   the two members' one-setup fresh keys, which the signers erase once the certificate
+   state is saved, so recorded traffic does not open later even with the members'
+   long-lived identity keys. The vault becomes ready only after every member has saved
+   a backup.
 2. **At rest.** The share is sealed with a data key that is **wrapped by a secure
    element key** (Secure Enclave on iOS/macOS, StrongBox/Keystore on Android, TPM or
    OS keychain on desktop), unlockable only with the member's biometric/passphrase.

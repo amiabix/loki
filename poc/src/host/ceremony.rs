@@ -112,9 +112,8 @@ struct Invite {
     name: String,
 }
 
-/// Upper bound on vault members. Not a protocol limit (FROST ids are u16, t-of-n is general) —
-/// just a sanity cap so a typo can't kick off an enormous DKG.
-const MAX_MEMBERS: u16 = 64;
+/// Upper bound on vault members — the shared protocol cap from `member_state`.
+use crate::member_state::MAX_MEMBERS;
 
 fn vault_bytes(vault: &str) -> Result<[u8; 32], String> {
     hex::decode(vault)
@@ -306,7 +305,7 @@ pub(super) async fn create(State(st): State<Shared>, Json(body): Json<Value>) ->
     {
         return err(
             StatusCode::BAD_REQUEST,
-            "name must be 1 to 80 bytes; use 2 to 64 members and a valid threshold",
+            "name must be 1 to 80 bytes; use 2 to 16 members and a valid threshold",
         );
     }
     let (data, pass) = match unlocked(&st).await {

@@ -56,7 +56,7 @@ pub struct SealContext {
 }
 
 fn encode_seal_info(ctx: &SealContext) -> ClientResult<Vec<u8>> {
-    if !(1..=4).contains(&ctx.recipient.id) {
+    if !(1..=loki_relay_protocol::types::MAX_MEMBERS).contains(&ctx.recipient.id) {
         return Err(ClientError::Identity);
     }
     Ok(canonical::encode(&Value::Array(vec![

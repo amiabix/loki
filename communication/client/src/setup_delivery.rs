@@ -590,7 +590,7 @@ impl SetupTransport<'_> {
         let Value::Array(encoded) = &value[4] else {
             return Err(ClientError::Config);
         };
-        if encoded.len() > 4 {
+        if encoded.len() > usize::from(loki_relay_protocol::types::MAX_MEMBERS) {
             return Err(ClientError::Capacity);
         }
         let mut copies = Vec::new();

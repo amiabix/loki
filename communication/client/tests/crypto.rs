@@ -60,8 +60,8 @@ fn identity_import_rejects_zero() {
 }
 
 #[test]
-fn identity_import_rejects_five() {
-    assert_invalid_id(5);
+fn identity_import_rejects_seventeen() {
+    assert_invalid_id(17);
 }
 
 #[test]
@@ -492,8 +492,8 @@ fn hpke_binding_member_zero() {
     invalid_member(0);
 }
 #[test]
-fn hpke_binding_member_five() {
-    invalid_member(5);
+fn hpke_binding_member_seventeen() {
+    invalid_member(17);
 }
 fn invalid_member(id: u16) {
     for domain in domains() {

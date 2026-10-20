@@ -37,7 +37,7 @@ fn operator_bundle(admission_origin: &str) -> (Vec<u8>, [u8; 32]) {
                     .to_vec(),
             ),
         ]),
-        Value::Array(vec![Value::Integer(1.into())]),
+        Value::Array(vec![Value::Integer(2.into())]),
         Value::Array(
             [86400u64, 2592000, 1048576, 67108864, 1, 1, 60]
                 .into_iter()
@@ -421,7 +421,7 @@ fn run_owned_services_flow(mode: OwnedFlow, network: &str) {
         assert!((1..=3).contains(&index));
         services.stop_relay(index - 1);
     }
-    for count in if network == "testnet" { vec![3] } else { vec![3, 4] } {
+    for count in if network == "testnet" { vec![3] } else { vec![3, 4, 5] } {
         if std::env::var("LOKI_HOSTED_MEMBERS")
             .ok()
             .is_some_and(|selected| selected != count.to_string())
@@ -451,7 +451,8 @@ fn run_owned_services_flow(mode: OwnedFlow, network: &str) {
             Value::Bytes(identity.public().signing.to_vec()),
             Value::Integer((now + 3600).into()),
             Value::Integer(1.into()),
-            Value::Integer(24.into()),
+            // A setup and a handoff mailbox per member on each of the three relays.
+            Value::Integer((6 * u64::from(count)).max(24).into()),
             Value::Bytes(operators.digest().to_vec()),
         ]))
         .unwrap();
@@ -1303,7 +1304,7 @@ fn finish_owned_handoff(
                 raw.as_slice().try_into().unwrap(),
             )
             .unwrap();
-            let loaded = loki_poc::relay_member::LoadedMember { identity, roster, threshold: 2 };
+            let loaded = loki_poc::relay_member::LoadedMember { identity, roster, threshold: 2, network: loki_poc::network::VaultNetwork::Regtest };
             let db =
                 loki_relay_client::ClientStore::open(&path.join("transport"), &loaded.roster, slot)
                     .unwrap();
@@ -1600,10 +1601,10 @@ fn saved_join_objects(
     };
     assert_eq!(payload.len(), 4);
     assert_eq!(payload[0], Value::Integer(1.into()));
-    assert_eq!(payload[1], Value::Array(vec![Value::Integer(1.into())]));
+    assert_eq!(payload[1], Value::Array(vec![Value::Integer(2.into())]));
     assert_eq!(
         payload[2],
-        Value::Array(vec![Value::Integer(3.into()), Value::Integer(4.into())])
+        Value::Array((3u16..=16).map(|n| Value::Integer(n.into())).collect())
     );
     let Value::Bytes(package) = &payload[3] else {
         panic!()

@@ -36,7 +36,7 @@ fn bundle(signer: &SigningKey, change: impl FnOnce(&mut Vec<Value>)) -> Vec<u8> 
                     .to_vec(),
             ),
         ]),
-        Value::Array(vec![Value::Integer(1.into())]),
+        Value::Array(vec![Value::Integer(2.into())]),
         Value::Array(vec![
             Value::Integer(86400.into()),
             Value::Integer(2592000.into()),
@@ -103,7 +103,7 @@ fn root() -> std::path::PathBuf {
 }
 fn join(p: &SetupPolicy, recipient: u16, payload: Vec<u8>) -> SetupRecord {
     SetupRecord {
-        version: 1,
+        version: loki_relay_protocol::setup::SETUP_VERSION,
         key: SetupKey {
             ceremony: p.ceremony,
             phase: SetupPhase::Join,
@@ -566,7 +566,7 @@ async fn peers_arrive_independently_after_creator_offline_and_ack_survives_reope
         let creator_routes = make_routes(1);
         let records: Vec<_> = (1..=n)
             .map(|recipient| SetupRecord {
-                version: 1,
+                version: loki_relay_protocol::setup::SETUP_VERSION,
                 key: SetupKey {
                     ceremony: p.ceremony,
                     phase: SetupPhase::RosterProposal,
@@ -729,7 +729,7 @@ fn acceptance_transport_requires_inner_agreement_and_keeps_history_after_accepta
     let inner = sign_roster_acceptance(&id, &ctx, &r, &SetupCapabilities::current()).unwrap();
     let records: Vec<_> = (1..=4)
         .map(|recipient| SetupRecord {
-            version: 1,
+            version: loki_relay_protocol::setup::SETUP_VERSION,
             key: SetupKey {
                 ceremony: p.ceremony,
                 phase: SetupPhase::RosterAccept,
@@ -802,7 +802,7 @@ fn signed_changed_roster_is_terminal_but_unauthenticated_noise_is_not() {
         SetupTransport::new(&member, &op, SetupAuthority::Accepted(&accepted), false).unwrap();
     let records: Vec<_> = (1..=4)
         .map(|recipient| SetupRecord {
-            version: 1,
+            version: loki_relay_protocol::setup::SETUP_VERSION,
             key: SetupKey {
                 ceremony: p.ceremony,
                 phase: SetupPhase::RosterProposal,
@@ -1032,7 +1032,7 @@ fn bootstrap_abort_remains_authenticated_after_roster_acceptance() {
         SetupTransport::new(&member, &op, SetupAuthority::Accepted(&accepted), false).unwrap();
     let records: Vec<_> = (1..=4)
         .map(|recipient| SetupRecord {
-            version: 1,
+            version: loki_relay_protocol::setup::SETUP_VERSION,
             key: SetupKey {
                 ceremony: p.ceremony,
                 phase: SetupPhase::Abort,
@@ -1144,7 +1144,7 @@ fn early_native_round_is_saved_until_all_member_acceptance_is_available() {
         .unwrap();
         let records: Vec<_> = (1..=n)
             .map(|recipient| SetupRecord {
-                version: 1,
+                version: loki_relay_protocol::setup::SETUP_VERSION,
                 key: SetupKey {
                     ceremony: p.ceremony,
                     phase: SetupPhase::Round1,
@@ -1233,9 +1233,27 @@ fn setup_store_migrates_only_the_exact_legacy_catalog() {
         let path = root();
         drop(SetupStore::open(&path, &transport).unwrap());
         let sql = rusqlite::Connection::open(path.join("setup.sqlite3")).unwrap();
-        sql.execute_batch("DROP TABLE deferred;").unwrap();
+        // The oldest catalog: no `deferred` table and recipients bounded at 4.
+        let version: i64 = sql.query_row("PRAGMA schema_version", [], |r| r.get(0)).unwrap();
+        sql.execute_batch("DROP TABLE deferred; PRAGMA writable_schema=ON;").unwrap();
+        sql.execute(
+            "UPDATE sqlite_master SET sql=replace(sql,'recipient BETWEEN 1 AND 16)','recipient BETWEEN 1 AND 4)') WHERE type='table'",
+            [],
+        )
+        .unwrap();
+        sql.execute_batch(&format!(
+            "PRAGMA schema_version={}; PRAGMA writable_schema=OFF;",
+            version + 2
+        ))
+        .unwrap();
         drop(sql);
         drop(SetupStore::open(&path, &transport).unwrap());
+        let sql = rusqlite::Connection::open(path.join("setup.sqlite3")).unwrap();
+        let widened: String = sql
+            .query_row("SELECT sql FROM sqlite_master WHERE name='outgoing'", [], |r| r.get(0))
+            .unwrap();
+        assert!(widened.contains("recipient BETWEEN 1 AND 16)"));
+        drop(sql);
         let sql = rusqlite::Connection::open(path.join("setup.sqlite3")).unwrap();
         assert_eq!(
             sql.query_row("SELECT count(*) FROM deferred", [], |r| r.get::<_, u64>(0))

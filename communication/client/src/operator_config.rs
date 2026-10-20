@@ -182,7 +182,7 @@ impl OperatorSet {
             return Err(ClientError::Config);
         }
         let versions = fields(&config[3], 1)?;
-        if number(&versions[0])? != 1 {
+        if number(&versions[0])? != u64::from(loki_relay_protocol::setup::SETUP_VERSION) {
             return Err(WireError::Version.into());
         }
         let policy = fields(&config[4], 7)?;
@@ -205,7 +205,7 @@ impl OperatorSet {
             relays: relays.try_into().map_err(|_| ClientError::Config)?,
             admission_origin,
             admission_key,
-            setup_versions: vec![1],
+            setup_versions: vec![loki_relay_protocol::setup::SETUP_VERSION],
             limits: ServiceLimits {
                 first_claim_seconds: values[0],
                 ceremony_seconds: values[1],

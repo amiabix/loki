@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 
 #[test]
 fn checkpoint_restores_exact_dkg_packages_for_both_policies() {
-    for (threshold, count) in [(2, 3u16), (2, 4), (3, 4)] {
+    for (threshold, count) in [(2, 3u16), (2, 4), (3, 4), (3, 5), (15, 16)] {
         let mut live = BTreeMap::new();
         let mut restored = BTreeMap::new();
         let mut round1 = BTreeMap::new();
@@ -109,7 +109,7 @@ fn accepted_core_roster_requires_every_slot_and_exact_policy_signatures() {
     use loki_poc::{
         member_state::Roster, setup_ceremony::AcceptedCeremonyRoster, setup_transport::Identity,
     };
-    for (threshold, count) in [(2u16, 3u16), (2, 4), (3, 4)] {
+    for (threshold, count) in [(2u16, 3u16), (2, 4), (3, 4), (3, 5), (15, 16)] {
         let identities: Vec<_> = (1..=count).map(Identity::new).collect();
         let document=serde_json::to_vec(&serde_json::json!({"vault":hex::encode([70;32]),"threshold":threshold,"members":identities.iter().map(|i|{let p=i.public();serde_json::json!({"id":p.id,"signing":hex::encode(p.signing),"encryption":hex::encode(p.encryption)})}).collect::<Vec<_>>()})).unwrap();
         let roster = Roster::from_bytes(&document).unwrap();
@@ -202,7 +202,7 @@ fn ceremony_restarts_every_complete_phase_and_preserves_saved_ciphertext() {
             })
         }
     }
-    for (threshold, count) in [(2u16, 3u16), (2, 4), (3, 4)] {
+    for (threshold, count) in [(2u16, 3u16), (2, 4), (3, 4), (3, 5), (15, 16)] {
         let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "loki-engine-{}",
             hex::encode(Identity::new(1).public().signing)
@@ -271,7 +271,7 @@ fn ceremony_restarts_every_complete_phase_and_preserves_saved_ciphertext() {
             let body = identity
                 .verify_round1(&identity.public(), &[78; 32], round1)
                 .unwrap();
-            let package = reddsa_frost::frost::redpallas::keys::dkg::round1::Package::deserialize(&body[32..]).unwrap();
+            let package = reddsa_frost::frost::redpallas::keys::dkg::round1::Package::deserialize(&body[64..]).unwrap();
             assert_eq!(package.commitment().serialize().unwrap().len(), threshold as usize);
             let checkpoint = engine.checkpoint();
             let ciphertext = engine.prepared_delivery().unwrap().to_vec();
@@ -326,6 +326,8 @@ fn ceremony_restarts_every_complete_phase_and_preserves_saved_ciphertext() {
             .map(|e| e.certified_address().unwrap())
             .collect();
         assert!(addresses.iter().all(|a| a == &addresses[0]));
+        let mut keys = BTreeMap::new();
+        let mut group = None;
         for id in 1..=count {
             let engine = engines.get_mut(&id).unwrap();
             let state = engine.certified_vault_state().unwrap();
@@ -339,6 +341,8 @@ fn ceremony_restarts_every_complete_phase_and_preserves_saved_ciphertext() {
             ).unwrap();
             assert_eq!(*key.min_signers(), threshold);
             assert_eq!(public.min_signers(), Some(threshold));
+            keys.insert(id, key);
+            group = Some(public);
             let before = engine.checkpoint();
             let premature = (1..=count).map(|slot| (slot, vec![slot as u8; 32]))
                 .collect::<BTreeMap<_, _>>();
@@ -419,7 +423,55 @@ fn ceremony_restarts_every_complete_phase_and_preserves_saved_ciphertext() {
         }
         drop(engines);
         std::fs::remove_dir_all(root).unwrap();
+        // The DKG-born shares sign: a quorum of exactly `threshold` members (the last ones)
+        // produces a rerandomized signature that verifies under the group key.
+        sign_with_quorum(&keys, &group.unwrap(), threshold, count);
     }
+}
+
+fn sign_with_quorum(
+    keys: &BTreeMap<u16, reddsa_frost::frost::redpallas::keys::KeyPackage>,
+    public: &reddsa_frost::frost::redpallas::keys::PublicKeyPackage,
+    threshold: u16,
+    count: u16,
+) {
+    use reddsa_frost::frost::redpallas as frost;
+    let quorum: Vec<u16> = (count - threshold + 1..=count).collect();
+    let mut nonces = BTreeMap::new();
+    let mut commitments = BTreeMap::new();
+    for id in &quorum {
+        let (nonce, commitment) = frost::round1::commit(keys[id].signing_share(), &mut rand_core::OsRng);
+        let identifier = frost::Identifier::try_from(*id).unwrap();
+        nonces.insert(identifier, nonce);
+        commitments.insert(identifier, commitment);
+    }
+    let message = b"hosted t-of-n signing";
+    let package = frost::SigningPackage::new(commitments.clone(), message);
+    let (params, seed) = frost_rerandomized::RandomizedParams::new_from_commitments(
+        public.verifying_key(),
+        &commitments,
+        rand_core::OsRng,
+    )
+    .unwrap();
+    let shares: BTreeMap<_, _> = quorum
+        .iter()
+        .map(|id| {
+            let identifier = frost::Identifier::try_from(*id).unwrap();
+            let share = frost_rerandomized::sign_with_randomizer_seed(
+                &package,
+                &nonces[&identifier],
+                &keys[id],
+                &seed,
+            )
+            .unwrap();
+            (identifier, share)
+        })
+        .collect();
+    let signature = frost_rerandomized::aggregate(&package, &shares, public, &params).unwrap();
+    params
+        .randomized_verifying_key()
+        .verify(message, &signature)
+        .unwrap_or_else(|e| panic!("{threshold}-of-{count} signature: {e}"));
 }
 
 #[test]

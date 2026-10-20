@@ -35,7 +35,7 @@ use crate::{
     payment_transport::{coordinate, signer_loop},
     setup_transport::Identity,
     state::MemberDir,
-    transport::{FrostdChannel, FrostdTransport, Incoming, Peer, Transport},
+    transport::{FrostdChannel, FrostdLoginKey, FrostdTransport, Incoming, Outbound, Peer, Transport},
     tx_finalize::prove,
     vault,
     verify::{check_candidate, Expectations, Refusal},
@@ -300,7 +300,10 @@ fn wallet(
 fn relay(identity: &Identity, url: &str) -> Result<FrostdTransport, String> {
     let raw = Zeroizing::new(identity.to_secret_bytes());
     let secret: [u8; 32] = raw[34..].try_into().map_err(|_| "identity secret length")?;
-    FrostdTransport::new(url, Peer(identity.public().encryption), secret).map_err(|e| e.to_string())
+    // Log in to the relay with the member's own X25519 key, so its relay address matches the
+    // encryption pubkey the roster already maps it to. (A dedicated login key is a later
+    // hardening; here reuse keeps the roster addressing unchanged.)
+    FrostdTransport::new(url, FrostdLoginKey::from_secret_bytes(secret)).map_err(|e| e.to_string())
 }
 
 struct ReviewedTransport<'a> {
@@ -318,7 +321,7 @@ impl Transport for ReviewedTransport<'_> {
     fn join(&mut self, _session: Uuid) -> Result<FrostdChannel, String> {
         Err("signer session already joined".into())
     }
-    fn send(&self, channel: &FrostdChannel, to: &[Peer], message: &[u8]) -> Result<(), String> {
+    fn send(&self, channel: &FrostdChannel, to: &[Peer], message: &Outbound) -> Result<(), String> {
         self.inner
             .send(channel, to, message)
             .map_err(|e| e.to_string())

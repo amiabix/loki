@@ -43,7 +43,7 @@ fn authenticated_transport_conflict_notifies_admission_for_both_policies() {
         let mut store =
             SetupStore::open(&member.path().join("setup-relay-store"), &transport).unwrap();
         let record = |payload| SetupRecord {
-            version: 1,
+            version: loki_relay_protocol::setup::SETUP_VERSION,
             key: SetupKey {
                 ceremony: context.policy().ceremony,
                 phase: SetupPhase::Join,

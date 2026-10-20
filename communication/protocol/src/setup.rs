@@ -1,6 +1,6 @@
 use crate::{
     canonical::{self, Value},
-    types::{Id32, MemberId},
+    types::{self, Id32, MemberId},
     WireError, WireResult,
 };
 
@@ -60,6 +60,9 @@ pub struct SetupRecord {
     pub prerequisites: Vec<Id32>,
     pub payload: Vec<u8>,
 }
+/// Setup record format version. Version 2 is the fresh-key round-two DKG format; a member
+/// or operator on another version is refused before any key generation.
+pub const SETUP_VERSION: u16 = 2;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SetupCapabilities {
     pub versions: Vec<u16>,
@@ -68,13 +71,13 @@ pub struct SetupCapabilities {
 impl SetupCapabilities {
     pub fn current() -> Self {
         Self {
-            versions: vec![1],
-            member_counts: vec![3, 4],
+            versions: vec![SETUP_VERSION],
+            member_counts: (3..=types::MAX_MEMBERS).collect(),
         }
     }
     pub fn supports(&self, version: u16, count: u16) -> bool {
-        version == 1
-            && matches!(count, 3 | 4)
+        version == SETUP_VERSION
+            && types::valid_member_count(usize::from(count))
             && self.versions.contains(&version)
             && self.member_counts.contains(&count)
     }
@@ -93,10 +96,10 @@ fn bytes(n: &Id32) -> Value {
     Value::Bytes(n.to_vec())
 }
 pub fn encode_record(record: &SetupRecord) -> WireResult<Vec<u8>> {
-    if record.version != 1 {
+    if record.version != SETUP_VERSION {
         return Err(WireError::Version);
     }
-    if !matches!((record.threshold, record.member_count), (2, 3) | (2, 4) | (3, 4))
+    if !types::valid_policy(record.threshold, record.member_count)
         || !(1..=record.member_count).contains(&record.key.author)
         || !(1..=record.member_count).contains(&record.key.recipient)
         || record.key.revision == 0

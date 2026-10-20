@@ -15,6 +15,9 @@ const SCHEMA: &str = include_str!("setup_store.sql");
 const DEFERRED_SCHEMA: &str =
     "CREATE TABLE deferred (hash BLOB PRIMARY KEY REFERENCES objects(hash)) STRICT;\n";
 const BUDGET: u64 = 256 * 1024 * 1024;
+/// Stores made before vaults grew past 4 members bound recipients at 4.
+const NARROW_RECIPIENT: &str = "recipient BETWEEN 1 AND 4)";
+const WIDE_RECIPIENT: &str = "recipient BETWEEN 1 AND 16)";
 pub struct SetupStore {
     pub(crate) connection: Connection,
     _lock: File,
@@ -146,10 +149,22 @@ impl SetupStore {
             File::open(&path)?.sync_all()?;
         }
         if crate::store::validate_schema(&c, SCHEMA).is_err() {
-            let legacy = SCHEMA
-                .strip_suffix(DEFERRED_SCHEMA)
-                .ok_or(ClientError::Storage)?;
-            crate::store::validate_schema(&c, legacy)?;
+            // Earlier stores: recipients bounded at 4 members, and before that no
+            // `deferred` table. Check the association before changing anything.
+            let narrow = SCHEMA.replace(WIDE_RECIPIENT, NARROW_RECIPIENT);
+            let without_deferred =
+                |schema: &str| schema.strip_suffix(DEFERRED_SCHEMA).map(str::to_owned);
+            let (deferred, widen) = if crate::store::validate_schema(&c, &narrow).is_ok() {
+                (true, true)
+            } else if without_deferred(&narrow)
+                .is_some_and(|legacy| crate::store::validate_schema(&c, &legacy).is_ok())
+            {
+                (false, true)
+            } else {
+                let legacy = without_deferred(SCHEMA).ok_or(ClientError::Storage)?;
+                crate::store::validate_schema(&c, &legacy)?;
+                (false, false)
+            };
             let saved: Vec<u8> = c.query_row(
                 "SELECT association FROM metadata WHERE singleton=1",
                 [],
@@ -158,9 +173,14 @@ impl SetupStore {
             if saved != association(transport)? {
                 return Err(ClientError::Identity);
             }
-            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            tx.execute_batch(DEFERRED_SCHEMA)?;
-            tx.commit()?;
+            if !deferred {
+                let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                tx.execute_batch(DEFERRED_SCHEMA)?;
+                tx.commit()?;
+            }
+            if widen {
+                crate::store::widen_checks(&mut c, NARROW_RECIPIENT, WIDE_RECIPIENT)?;
+            }
             crate::store::validate_schema(&c, SCHEMA)?;
         }
         let saved: Vec<u8> = c.query_row(
