@@ -12,6 +12,14 @@ use rand_core::{OsRng, RngCore};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 const MAGIC: &[u8; 8] = b"LOKIDKG1";
+
+/// Whether `bytes` is a sealed DKG round-2 package (as opposed to a public round-1 package).
+/// A driver multiplexing both rounds over one relay channel uses this to keep them apart when
+/// they interleave under timing skew (a fast peer's round 2 can arrive mid round-1 collection).
+pub fn is_sealed_round2(bytes: &[u8]) -> bool {
+    bytes.starts_with(MAGIC)
+}
+
 const ROUND1_MAGIC: &[u8; 8] = b"LOKIR1V1";
 const AGREEMENT_MAGIC: &[u8; 8] = b"LOKIAGV1";
 const CERT_MAGIC: &[u8; 8] = b"LOKICRV1";

@@ -1,0 +1,19 @@
+{
+  "members": [
+    {
+      "id": 1,
+      "port": 39120,
+      "token": "7fUmh-Rk46wwqOIdcg1LWngAQcAtvvCwzFwT7ZHUnSM"
+    },
+    {
+      "id": 2,
+      "port": 39121,
+      "token": "FRXN4RbrAS-eZsKdOwCTAPI3wKTbVb52lDAEVRMUF2U"
+    },
+    {
+      "id": 3,
+      "port": 39122,
+      "token": "ZWUjCfYhfNDPB6nozPQDtFe24Nb9-AnKMl9yC0KOh0k"
+    }
+  ]
+}

@@ -19,16 +19,26 @@ pub mod candidate;
 mod coordinator;
 pub mod coordinator_boundary;
 pub mod distributed_setup;
+// Reusable FROST DKG driver over a WS3 Transport (frostd) — the productionised form of the
+// hand-wired flow in tests/frostd_transport.rs.
+pub mod dkg_transport;
 #[cfg(all(feature = "apple-enclave", target_os = "macos"))]
 pub mod enclave_ffi;
 pub mod intent;
+pub mod frost_roster;
 pub mod member_state;
 pub mod network;
 #[cfg(test)]
 mod nonce_binding;
 pub mod payment_manifest;
+pub mod payment_transport;
+pub mod profile;
 pub mod randomizer;
 pub mod refresh;
+// The per-member HTTP coordinator (axum) that fronts the account + hosted-vault ceremony
+// for the web UI, driving the library in-process. Gated with the hosted relay stack.
+#[cfg(feature = "relay-communication")]
+pub mod host;
 // RETIRING (WS3/WS4): Loki's bespoke relay stack — `relay_member`, `setup_relay`,
 // `member_service`, and their `setup_backup`/`setup_retry` helpers — is being replaced
 // by the audited ZF `frostd` relay via `transport::FrostdTransport` (ws3 §2, ws4 §4).
@@ -47,10 +57,13 @@ pub mod setup_transport;
 pub mod setup_ceremony;
 pub mod signer;
 pub mod signing_session;
+// Reusable rerandomized FROST signing driver over a WS3 Transport (frostd).
+pub mod sign_transport;
 pub mod state;
 pub mod transport;
 pub mod tx_finalize;
 pub mod vault;
+pub mod vault_secret;
 pub mod verify;
 pub mod wallet_store;
 pub mod witness;
