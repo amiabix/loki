@@ -666,11 +666,10 @@ fn sign(st: &Shared, data: &Path, pass: &str, p: &Payment, v: &Vault) -> Result<
     let mut owned = None;
     if p.proposer == v.slot {
         let (w, mut client, rt) = wallet(data, pass, &p.vault, v, url(st)?)?;
-        // Build witnesses at the candidate's ANCHOR height (fixed at draft), not the current
-        // tip. The chain advances between draft and signing, and a witness at a later height
-        // would not root to the candidate's anchor (WitnessDoesNotRootToAnchor at prove time).
+        // Select the candidate's input notes at its fixed draft height (target_height), so the
+        // proposer rebuilds the same candidate the quorum reviewed; the witness here is unused.
         let height = p.target_height;
-        let frontier = frontier(&w, &mut client, &rt, height)?;
+        let (frontier, _) = frontier(&w, &mut client, &rt, height)?;
         let selected = [hex32(&p.note_selection[0])?];
         let notes = w
             .ironwood_inputs_at(BlockHeight::from_u32(height), frontier, &selected)?
@@ -717,7 +716,10 @@ fn frontier(
     rt: &tokio::runtime::Runtime,
     height: u32,
 ) -> Result<
-    incrementalmerkletree::frontier::NonEmptyFrontier<orchard::tree::MerkleHashOrchard>,
+    (
+        incrementalmerkletree::frontier::NonEmptyFrontier<orchard::tree::MerkleHashOrchard>,
+        [u8; 32],
+    ),
     String,
 > {
     let info = rt
@@ -742,13 +744,18 @@ fn frontier(
     {
         return Err("wallet scan is on a different chain".into());
     }
-    state
+    let tree = state
         .ironwood_tree()
-        .map_err(|e| format!("Ironwood tree state: {e}"))?
+        .map_err(|e| format!("Ironwood tree state: {e}"))?;
+    // Witnesses from `ironwood_inputs_at` root to the depth-padded commitment-tree root
+    // (`tree.root()`), NOT the natural-level `frontier.root(None)`; use it as the prove anchor.
+    let anchor = tree.root().to_bytes();
+    let frontier = tree
         .to_frontier()
         .value()
         .cloned()
-        .ok_or("scanned Ironwood tree is empty".into())
+        .ok_or("scanned Ironwood tree is empty")?;
+    Ok((frontier, anchor))
 }
 
 pub(super) async fn finish(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
@@ -800,11 +807,11 @@ pub(super) async fn finish(State(st): State<Shared>, Json(body): Json<Value>) ->
             let sighash = pczt::roles::signer::Signer::new(pczt.clone())
                 .map_err(|e| format!("sighash: {e:?}"))?
                 .shielded_sighash();
-            // Prove against the candidate's anchor (target_height), not the current tip — the
-            // sighash the quorum signed is bound to that anchor, and the witness must root to it.
+            // Anchor and witness are installed here (deferred at candidate build). Both come
+            // from the tree at target_height so the witness roots to the anchor; the signed
+            // sighash is anchor-independent, so the height need only hold the unspent note.
             let height = p.target_height;
-            let tree = frontier(&w, &mut client, &rt, height)?;
-            let anchor = tree.root(None).to_bytes();
+            let (tree, anchor) = frontier(&w, &mut client, &rt, height)?;
             let selected = [hex32(&p.note_selection[0])?];
             let witness = w
                 .ironwood_inputs_at(BlockHeight::from_u32(height), tree, &selected)?
