@@ -1,9 +1,10 @@
 //! Keyless coordinator boundary (WS2 §4, architecture invariant #1).
 //!
 //! The coordinator proposes transactions, scans the chain, drives the FROST rounds,
-//! aggregates partials, and broadcasts. It handles viewing keys, addresses, PCZTs,
-//! public protocol messages, and encrypted DKG messages. It must never read a FROST
-//! share, a signing nonce, or a spend authorization.
+//! aggregates partials, and broadcasts. It handles the vault address, PCZTs the signer
+//! built, public protocol messages, and the signer's DKG wires (round two only as v2
+//! envelopes under one-setup fresh keys it cannot open). It must never read a FROST
+//! share, a signing nonce, a viewing key, or a spend authorization.
 //!
 //! There is exactly ONE signer seam in this codebase — [`crate::signer::Signer`] — and the
 //! coordinator talks to members only through it. This module used to define a separate
@@ -15,7 +16,7 @@
 //!   * [`assert_keyless`] queries only public vault metadata at start-up.
 
 /// The one signer seam. The coordinator sees members only as `dyn Signer`; every method on
-/// it takes and returns FROST/PCZT artifacts and encrypted DKG messages (see
+/// it takes and returns FROST/PCZT artifacts, DKG wires and the released address (see
 /// `signer::Signer`). No share, nonce, or spend-key type is named here.
 pub use crate::signer::{CandidateRef, Connection, Network, Session, Signer, VaultRef};
 

@@ -285,7 +285,7 @@ impl SavedPaymentHandoff {
             .map(|(recipient, payload)| {
                 let parents = &self.parents[&recipient];
                 if parents.is_empty()
-                    || parents.len() > 4
+                    || parents.len() > usize::from(crate::member_state::MAX_MEMBERS)
                     || parents.contains(&[0; 32])
                     || parents.windows(2).any(|p| p[0] >= p[1])
                 {
@@ -431,7 +431,7 @@ impl SavedPaymentHandoff {
                 return Err(ERROR.into());
             };
             let recipient = u16::try_from(*recipient).map_err(|_| ERROR)?;
-            if values.len() > 4 {
+            if values.len() > usize::from(crate::member_state::MAX_MEMBERS) {
                 return Err(ERROR.into());
             }
             let values = values

@@ -1,6 +1,6 @@
 use crate::{
     canonical::{self, Value},
-    types::{Id32, MemberId},
+    types::{self, Id32, MemberId},
     WireError, WireResult,
 };
 
@@ -72,12 +72,12 @@ impl SetupCapabilities {
     pub fn current() -> Self {
         Self {
             versions: vec![SETUP_VERSION],
-            member_counts: vec![3, 4],
+            member_counts: (3..=types::MAX_MEMBERS).collect(),
         }
     }
     pub fn supports(&self, version: u16, count: u16) -> bool {
         version == SETUP_VERSION
-            && matches!(count, 3 | 4)
+            && types::valid_member_count(usize::from(count))
             && self.versions.contains(&version)
             && self.member_counts.contains(&count)
     }
@@ -99,7 +99,7 @@ pub fn encode_record(record: &SetupRecord) -> WireResult<Vec<u8>> {
     if record.version != SETUP_VERSION {
         return Err(WireError::Version);
     }
-    if !matches!((record.threshold, record.member_count), (2, 3) | (2, 4) | (3, 4))
+    if !types::valid_policy(record.threshold, record.member_count)
         || !(1..=record.member_count).contains(&record.key.author)
         || !(1..=record.member_count).contains(&record.key.recipient)
         || record.key.revision == 0

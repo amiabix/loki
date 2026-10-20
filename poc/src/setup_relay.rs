@@ -32,6 +32,19 @@ use std::{
 };
 use zeroize::{Zeroize, Zeroizing};
 const ERROR: &str = "setup_hosted";
+
+/// A hosted setup policy: t-of-n with 2 <= t < n <= 16.
+fn supported_policy(threshold: u16, count: u16) -> bool {
+    crate::member_state::valid_policy(threshold, usize::from(count))
+}
+
+/// Parse a "t-of-n" policy label.
+fn parse_policy(label: &str) -> Option<(u16, u16)> {
+    let (threshold, count) = label.split_once("-of-")?;
+    let (threshold, count) = (threshold.parse().ok()?, count.parse().ok()?);
+    supported_policy(threshold, count).then_some((threshold, count))
+}
+
 const CONTEXT: &str = "hosted-context.sealed";
 const LIMIT: usize = 65536;
 fn random() -> [u8; 32] {
@@ -185,7 +198,10 @@ impl Context {
             _ => return Err(ERROR.into()),
         };
         let count = u16::from_be_bytes(reader.take(2)?.try_into().map_err(|_| ERROR)?);
-        if !matches!(count, 3 | 4) || own_slot == 0 || own_slot > count {
+        if !(3..=crate::member_state::MAX_MEMBERS).contains(&count)
+            || own_slot == 0
+            || own_slot > count
+        {
             return Err(ERROR.into());
         }
         let development = match reader.take(1)?[0] {
@@ -241,7 +257,7 @@ impl Context {
             if invite.slot() != self.own_slot
                 || policy.member_count != self.count
                 || VaultNetwork::parse(&policy.network).is_err()
-                || !matches!((policy.threshold, policy.member_count), (2, 3) | (2, 4) | (3, 4))
+                || !supported_policy(policy.threshold, policy.member_count)
                 || policy.config_digest != *operators.digest()
                 || invite.bootstrap_descriptor().is_none()
                 || request.device != identity.public()
@@ -282,7 +298,7 @@ impl Context {
         };
         if *ceremony == [0; 32]
             || VaultNetwork::parse(network).is_err()
-            || !matches!((*threshold, *member_count), (2, 3) | (2, 4) | (3, 4))
+            || !supported_policy(*threshold, *member_count)
             || *member_count != self.count
             || config_digest != operators.digest()
             || *grant_digest != <[u8; 32]>::from(Sha256::digest(&*self.grant))
@@ -612,12 +628,7 @@ impl CachedStatus {
         })
     }
     fn validate(&self) -> Result<(), String> {
-        let count = match self.policy.as_str() {
-            "2-of-3" => 3,
-            "2-of-4" => 4,
-            "3-of-4" => 4,
-            _ => return Err("setup_status".into()),
-        };
+        let (_, count) = parse_policy(&self.policy).ok_or("setup_status")?;
         if !(1..=count).contains(&self.own_slot)
             || self.handoff
                 != if self.phase == "active" {
@@ -771,7 +782,7 @@ impl HostedSetup {
         network: &str,
         development: bool,
     ) -> Result<Self, String> {
-        if !matches!((threshold, count), (2, 3) | (2, 4) | (3, 4))
+        if !supported_policy(threshold, count)
             || VaultNetwork::parse(network).is_err()
             || grant.is_empty()
             || grant.len() > 4096
@@ -875,7 +886,7 @@ impl HostedSetup {
         let invite = verified_invite(invitation, bundle, key, development, now)?;
         let policy = invite.context().policy();
         if policy.network != expected_network
-            || !matches!((policy.threshold, policy.member_count), (2, 3) | (2, 4) | (3, 4))
+            || !supported_policy(policy.threshold, policy.member_count)
             || invite.bootstrap_descriptor().is_none()
             || invitation.len() > 4096
         {
@@ -3914,12 +3925,7 @@ pub fn command_with(
                 }
                 _ => return Err("setup_arguments".into()),
             };
-            let (threshold, count) = match args[4].as_str() {
-                "2-of-3" => (2, 3),
-                "2-of-4" => (2, 4),
-                "3-of-4" => (3, 4),
-                _ => return Err("setup_policy".into()),
-            };
+            let (threshold, count) = parse_policy(&args[4]).ok_or("setup_policy")?;
             let key: [u8; 32] = hex::decode(&args[6])
                 .map_err(|_| "setup_config")?
                 .try_into()

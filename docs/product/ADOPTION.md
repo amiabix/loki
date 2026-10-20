@@ -179,7 +179,9 @@ WARN frostd: starting an INSECURE HTTP server at 0.0.0.0:2744   # local test onl
 The relay is a pure store-and-forward of opaque bytes: `send { session_id, recipients,
 msg }` queues `Msg { sender, msg }`; `receive { session_id, as_coordinator }` drains it.
 It never inspects `msg` (`frostd/src/functions.rs`). Login is XEdDSA over a server
-challenge (`functions.rs::login`, `xeddsa`), with the member's X25519 key as its address.
+challenge (`functions.rs::login`, `xeddsa`). Loki logs in with a dedicated
+`FrostdLoginKey` per app; it is not the member's setup encryption key, which stays in
+the signer.
 
 ### 5.2 Mode-A at the transport layer (not the full `frost-client` crate)
 `poc` speaks the eight frostd JSON endpoints directly from `poc/src/transport.rs`
@@ -192,23 +194,29 @@ audited `reddsa_frost`/`frost-core`; only the thin client orchestration is local
 replace this orchestration behind the same `Transport` seam.)
 
 ### 5.3 Live acceptance (ws3 §7.1 / §7.3)
-`FROSTD_URL=http://127.0.0.1:2744 cargo test --test frostd_transport -- --nocapture` — a
-2-of-3 **dealerless DKG** (`frost::keys::dkg` part1/2/3) **and** a rerandomized signing
-round-trip, every message carried over the running frostd:
+`FROSTD_URL=http://127.0.0.1:2744 cargo test --features relay-communication --test frostd_transport -- --nocapture`
+runs the new signer's setup and a payment signature over the running frostd. Three
+storage-backed `LocalSigner`s confirm the roster code, run the **v2 dealerless DKG**
+through the shared core (`poc/src/dkg_core.rs`), save backups and reach ready; members
+send their `DkgWire`s to the coordinator, which logs each one in its `RelayLog` before
+forwarding it. A 2-of-3 quorum then signs the proposer's candidate PCZT; every message
+is a typed `Outbound` (commitments, candidate, signing package, randomizer seed,
+signature shares):
 
 ```
-[WS3] 3 members + coordinator authenticated to frostd at http://127.0.0.1:2744
-[WS3] session 9d6c5953-711f-4931-b904-c4ab3df8a9fc created; members joined
-[WS3] DKG complete over frostd — group verifying key = 9eef7a2c5bebbf935ae50eff3ae49d487b8d02df68e62db76db2a7436f368131
-[WS3] 2-of-3 rerandomized signature over frostd VERIFIES
-[WS3] audited 15 relayed payloads; none equals a share or key package (invariant 4 holds)
-test two_of_three_dkg_and_sign_over_real_frostd ... ok
+test new_signer_setup_and_signing_over_an_in_memory_relay ... ok
+[WS3] v2 DKG and 2-of-3 signing over frostd at http://127.0.0.1:2744: vault uregtest1q5ej5mfwk48…
+test new_signer_setup_and_signing_over_real_frostd ... ok
 ```
 
-The test records every byte string frostd actually carried and asserts none equals a DKG
-secret package, a FROST share / `KeyPackage`, or a signing nonce — invariant 4 ("only
-public data crosses") proven directly, not asserted. Without `FROSTD_URL` the test
-self-skips so `cargo test` stays green offline.
+The in-memory run also restarts the coordinator after the relay drops its queues, so
+the members finish only from `RelayLog` redelivery. Every round-two message that
+crossed the relay is a `LOKIDKG2` envelope sealed under one-setup fresh keys; none
+decodes as a round-two package, and
+`signer::local::setup_tests::recorded_relay_traffic_cannot_rebuild_the_group_key` shows
+recorded traffic plus every member's long-lived identity keys still cannot rebuild the
+group key (the same attacker does rebuild it from plaintext and v1 envelopes). Without
+`FROSTD_URL` the live test self-skips so `cargo test` stays green offline.
 
 ### 5.4 Retirement
 Loki's bespoke relay stack — `relay_member`, `setup_relay`, `member_service`, and the

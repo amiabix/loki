@@ -134,7 +134,7 @@ impl AcceptedCeremonyRoster {
         let policy = accepted.context().policy();
         let members = &accepted.roster().members;
         if accepted.roster().vault != policy.ceremony
-            || !matches!((policy.threshold, policy.member_count), (2, 3) | (2, 4) | (3, 4))
+            || !crate::member_state::valid_policy(policy.threshold, usize::from(policy.member_count))
             || members.len() != policy.member_count as usize
         {
             return Err("setup_agreement".into());

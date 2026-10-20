@@ -24,11 +24,17 @@ round-two boundary required a fix: it previously returned plaintext share packag
 
 - **No spend key in the coordinator.** The coordinator (the part that would be a web
   app) talks to a member only through one narrow trait, `Signer`
-  (`poc/src/signer/mod.rs`). Round one is signed, and round two is encrypted to its
-  intended member before the coordinator sees it (`local.rs`). The type guard
-  (`known_signer_return_types_are_public_artifacts`) checks named return types but
-  cannot inspect `Vec<u8>` contents or detect an unlisted new trait method. The
-  coordinator source deny-list checks one file, not the whole process.
+  (`poc/src/signer/mod.rs`). The DKG runs inside the signer through the shared core
+  (`poc/src/dkg_core.rs`): round one is signed, and each round-two package is sealed in
+  a v2 envelope under the two members' one-setup fresh X25519 keys, which are erased
+  once the certificate state is saved. Recorded relay traffic therefore does not open
+  round two even after a later compromise of the members' long-lived identity keys
+  (test `recorded_relay_traffic_cannot_rebuild_the_group_key`). The signer returns only
+  `DkgWire` values, and `Transport::send` takes only a typed `Outbound`, so raw bytes
+  cannot be handed to the relay (compile-fail doc tests in `transport.rs`). The type
+  guard (`known_signer_return_types_are_public_artifacts`) has no `Vec<u8>` entry but
+  still cannot detect an unlisted new trait method. The coordinator source deny-list
+  checks one file, not the whole process.
 - **Audited FROST crypto.** The threshold math is the ZF `frost-rerandomized` /
   `reddsa` RedPallas stack (`ADOPTION.md` §1–2, 4); Loki writes the signer shell, not
   new threshold crypto. The partial signature is produced by
@@ -44,12 +50,12 @@ round-two boundary required a fix: it previously returned plaintext share packag
 
 | Invariant (§7) | Upheld? | Evidence |
 |---|---|---|
-| #1 No key in the browser/coordinator | **Partial** | `LocalSigner::dkg_step` now signs round one and encrypts round-two shares to a preapproved roster. The opaque-byte trait and one-file deny-list do not prove the whole coordinator stays keyless. |
+| #1 No key in the browser/coordinator | **Partial** | `LocalSigner` runs the v2 DKG from its own sealed storage and returns only `DkgWire`s; the coordinator relays (and logs) wires it cannot open. The one-file deny-list does not prove the whole coordinator process stays keyless. |
 | #3 Confirm on the signer (WYSIWYS) | **Yes — the round-1 BLOCKER is closed** | `sign_approve` recomputes the sighash from the same bytes it rendered and **refuses with `SighashMismatch` before the nonce/share is touched** if `pkg.message()` differs. Test `sign_approve_binds_package_message_to_rendered_sighash` proves a tampered package is refused *and* the nonce stays `Committed`. |
-| #4 Only public data crosses the boundary | **Partial** | The coordinator receives encrypted DKG shares and a viewing key. The viewing key does not authorize spends, but reveals wallet activity and needs a separate privacy review. |
+| #4 Only public data crosses the boundary | **Partial** | The coordinator receives v2 round-two envelopes it cannot open, public signing artifacts and, once the vault is ready, only its receive address (`release_address`; no viewing key since #18). The relay still sees who sends to whom and the message type, and transactions travel in clear (follow-up). |
 | #5 Audited crypto only | **Yes** | FROST math is `frost-rerandomized`/`reddsa`; `nonce.rs` calls the audited signer, no bespoke threshold code. |
 | Nonce single-use + crash-safety | **Yes (in `nonce.rs`)** | Persist-before-emit (round 1), atomic burn-before-nonce-removal with fsync (round 2), reuse-for-different-message hard-refused. Tests `crash_after_burn_leaves_no_stranded_or_duplicated_nonce` and `reuse_for_a_different_message_is_hard_refused` (`nonce.rs`). |
-| Share born in the signer (DKG) | **Partially** | `dkg_step` seals the resulting share and encrypts each outbound round-two package inside the signer. The signer now requires a signed `AcceptedCeremonyRoster` and checks its vault, policy, network, and own identity. Human roster review, backup/restore, and epoch reset still need work. |
+| Share born in the signer (DKG) | **Mostly** | The share is born in `LocalSigner` and sealed before its certificate is released. The roster passes the shared gate (keys, policy 2 ≤ t < n ≤ 16, network, own identity, `setup_version` 2) before the member compares a 24-digit roster code on the device. Every released message is saved first and resent byte-identically; any mismatch ends the setup and wipes it. The vault is ready only after every member's backup receipt. The KEK is still software (§3). |
 
 The signer rejects a signing package whose message differs from its recomputed
 transaction hash. The simulated approval callback and unreviewed coordinator loop
@@ -59,11 +65,12 @@ limit what this demo establishes about a malicious coordinator.
 
 ## 3. NOT safe for real funds yet — each gap and why it is dangerous
 
-- **Software KEK (share-at-rest).** `SoftwareSecureElement` holds the wrapping key in
-  process memory and even exposes `from_kek` to reconstruct it
-  (`poc/src/signer/secure_element.rs`). A stolen/imaged device yields the share — the
-  at-rest protection is only as strong as file permissions until a real Secure Enclave
-  / StrongBox / TPM backend replaces it. This defeats threat **A3 (stolen device)**.
+- **Software KEK (share-at-rest).** `SoftwareSecureElement::persistent` keeps the
+  wrapping key in `kek.sealed` under the member passphrase and in process memory while
+  running, and `from_kek` can still reconstruct it (`poc/src/signer/secure_element.rs`).
+  A stolen/imaged device plus the passphrase yields the share, and a removed or replaced
+  sealed file is only unlinked, not securely erased, until a real Secure Enclave /
+  StrongBox / TPM backend replaces it. This weakens threat **A3 (stolen device)**.
 - **No biometric / no human unlock gate.** Approval is a code callback
   (`ApprovalPolicy = FnMut(&PaymentView) -> bool`) and `connect` takes no biometric
   (`local.rs`). The "member approves on device" step is simulated; there is no actual
@@ -77,15 +84,17 @@ limit what this demo establishes about a malicious coordinator.
   exercised end-to-end from a test. The guard is defensive but **unproven against a real
   adversarial PCZT**. Dangerous: a fee/value substitution path could exist that the test
   suite cannot currently reach.
-- **Human DKG roster review is not proven.** `for_dkg` now requires the signed
-  `AcceptedCeremonyRoster` and rejects mismatched vault or signer metadata. The
-  setup agreement proves the listed keys voted; a trusted signer-side workflow must
-  still show the fingerprint and bind each peer key to its intended person. A member
-  who approves attacker-controlled peer keys can send decryptable shares to them.
-- **DKG: no backup/restore, no epoch reset proven.** `dkg_step` generates and seals the
-  share, but this round does not demonstrate backup, restore-to-new-device, or the
-  nonce-epoch reset on restore that `ws1-signer.md` §8 requires. A real custody flow must
-  recover a share without replaying an old nonce; that is not shown here.
+- **The roster code tap is the only gate.** The new signer shows a 24-digit (~80-bit)
+  code derived from the full roster and saves nothing unless the member answers that
+  the codes match. A member who taps "match" without comparing with the other members
+  has no backstop: there are no setup votes on this path. A coordinator that swaps a
+  peer's keys changes the code (test
+  `coordinator_key_swap_changes_the_code_and_the_signer_refuses`).
+- **DKG backup is proven; restore to a new device only in unit tests.** Ready requires
+  every member's signed backup receipt, and the backup carries the share, the vault
+  secret, the setup identity, the roster and its fingerprint. Restore with the
+  nonce-epoch reset is tested (`restore_on_clean_root_signs_and_refuses_pre_restore_nonce`),
+  but not yet as an end-to-end device-replacement flow.
 - **No end-to-end coordination / broadcast proven.** The `pr2/coordinator-demo` branch
   exists but has not been reviewed here; there is no reviewed 2-of-3 testnet payment
   that aggregates partials, applies them to a PCZT, and broadcasts (ws1 §11

@@ -1025,3 +1025,63 @@ fn address_release_needs_ready_and_an_approved_session() {
     // A wrong passphrase cannot open the signer's KEK.
     assert!(SoftwareSecureElement::persistent(&members[0].dir, "wrong").is_err());
 }
+
+/// General t-of-n on the new signer path: a DKG to ready, then a quorum of exactly `t`
+/// DKG-born signers drives the keyless loop to a signed candidate.
+#[test]
+fn general_policies_run_the_dkg_and_sign() {
+    use crate::signer::coordination::{drive_to_signed_pczt, PaymentIntent, QuorumMember};
+    for (threshold, count) in [(2u16, 3u16), (3, 5), (15, 16)] {
+        let vault = [count as u8 + 80; 32];
+        let (mut members, document) = setup_members(threshold, count, vault);
+        let vault_ref = begin(&mut members, &document);
+        let mut tape = Vec::new();
+        complete(&mut members, &vault_ref, &mut tape);
+        let addresses: Vec<String> = members.iter_mut().map(|m| m.release().unwrap().address).collect();
+        assert!(addresses.iter().all(|a| a == &addresses[0]));
+        let recipient = crate::vault::orchard_receiver_from_ua(
+            &addresses[0],
+            zcash_protocol::consensus::NetworkType::Regtest,
+        )
+        .unwrap();
+        let rho = orchard::note::Rho::from_bytes(&[1u8; 32]).unwrap();
+        let note = orchard::Note::from_parts(
+            recipient,
+            orchard::value::NoteValue::from_raw(625_000_000),
+            rho,
+            orchard::note::RandomSeed::from_bytes([2u8; 32], &rho).unwrap(),
+            orchard::NoteVersion::V3,
+        )
+        .unwrap();
+        let public =
+            frost::keys::PublicKeyPackage::deserialize(members[0].signer.public_package_bytes().unwrap())
+                .unwrap();
+        // The quorum is the last `threshold` members, so member 1 is not always in it.
+        let mut quorum: Vec<QuorumMember<'_, _>> = members
+            .iter_mut()
+            .skip(usize::from(count - threshold))
+            .map(|m| {
+                m.signer.set_candidate_notes(vec![note]);
+                QuorumMember {
+                    id: frost::Identifier::try_from(m.id).unwrap(),
+                    session: m.session.clone(),
+                    signer: &mut m.signer,
+                }
+            })
+            .collect();
+        let intent = PaymentIntent {
+            recipient,
+            amount: zcash_protocol::value::Zatoshis::const_from_u64(40_000_000),
+            memo: zcash_protocol::memo::MemoBytes::from_bytes(b"t-of-n").unwrap(),
+            target_height: 700,
+            expiry_height: 1_152,
+        };
+        let cand = CandidateRef {
+            vault_id: vault,
+            payment_id: [7; 32],
+            attempt_id: [9; 32],
+        };
+        drive_to_signed_pczt(&public, &intent, &cand, &mut quorum)
+            .unwrap_or_else(|e| panic!("{threshold}-of-{count}: {e}"));
+    }
+}

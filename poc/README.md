@@ -1,7 +1,8 @@
 # Loki research harness
 
 A research prototype for **threshold-signed shielded Zcash payments**. It supports
-2-of-3, 2-of-4, and 3-of-4 FROST vaults. Members sign an Ironwood payment
+t-of-n FROST vaults with 2 ≤ t < n ≤ 16 (the member app's screens offer 2-of-3,
+2-of-4, and 3-of-4). Members sign an Ironwood payment
 **before** the transaction has a proof or an anchor. A 3-of-4 regtest payment
 has been mined through both the local courier and the separate member app relay flow.
 

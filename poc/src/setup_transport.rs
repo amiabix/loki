@@ -191,7 +191,7 @@ impl Identity {
             return Err("invalid DKG identity length".into());
         }
         let id = u16::from_be_bytes(bytes[..2].try_into().unwrap());
-        if !(1..=4).contains(&id) {
+        if !(1..=crate::member_state::MAX_MEMBERS).contains(&id) {
             return Err("invalid DKG member id".into());
         }
         Ok(Self {
@@ -555,7 +555,7 @@ impl Identity {
         context.validate()?;
         if self.id == recipient.id
             || !context.signers.contains(&self.id)
-            || !(1..=4).contains(&recipient.id)
+            || !(1..=crate::member_state::MAX_MEMBERS).contains(&recipient.id)
             || (!context.signers.contains(&recipient.id)
                 && !matches!(kind, MessageKind::Package | MessageKind::Share))
             || body.len() > kind.max_body()
@@ -645,7 +645,7 @@ impl Identity {
         let inner_header = meta_end + 32;
         if sender.id == recipient
             || !context.signers.contains(&sender.id)
-            || !(1..=4).contains(&recipient)
+            || !(1..=crate::member_state::MAX_MEMBERS).contains(&recipient)
         {
             return Err("sender or recipient outside signing attempt".into());
         }

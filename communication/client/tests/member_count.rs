@@ -32,10 +32,10 @@ fn body(roster: &Roster) -> MessageBody {
 }
 
 #[test]
-fn fourth_identity_is_supported_but_fifth_is_not() {
-    assert_eq!(identity(4).public().id, 4);
-    let mut raw = [5; 66];
-    raw[..2].copy_from_slice(&5u16.to_be_bytes());
+fn sixteenth_identity_is_supported_but_seventeenth_is_not() {
+    assert_eq!(identity(16).public().id, 16);
+    let mut raw = [17; 66];
+    raw[..2].copy_from_slice(&17u16.to_be_bytes());
     assert!(CommIdentity::from_serialized(&raw).is_err());
 }
 

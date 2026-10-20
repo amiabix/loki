@@ -112,7 +112,7 @@ fn positive(value: u64) -> WireResult<()> {
 pub fn encode_request(request: &AdmissionRequest) -> WireResult<Vec<u8>> {
     if request.operation == [0; 32]
         || request.command.ceremony() == &[0; 32]
-        || !(1..=4).contains(&request.device.id)
+        || !(1..=crate::types::MAX_MEMBERS).contains(&request.device.id)
     {
         return Err(WireError::Schema);
     }
@@ -167,7 +167,10 @@ pub fn encode_request(request: &AdmissionRequest) -> WireResult<Vec<u8>> {
             slot,
             invite_hash,
         } => {
-            if !(2..=4).contains(slot) || *slot != request.device.id || *invite_hash == [0; 32] {
+            if !(2..=crate::types::MAX_MEMBERS).contains(slot)
+                || *slot != request.device.id
+                || *invite_hash == [0; 32]
+            {
                 return Err(WireError::Schema);
             }
             vec![n(2u16), b(ceremony), n(*slot), b(invite_hash)]

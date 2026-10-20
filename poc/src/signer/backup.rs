@@ -311,7 +311,6 @@ mod tests {
     use crate::signer::secure_element::SoftwareSecureElement;
     use crate::signer::{CandidateRef, Signer};
     use reddsa_frost::frost::redpallas as frost;
-    use std::collections::BTreeMap;
 
     fn tempdir(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(

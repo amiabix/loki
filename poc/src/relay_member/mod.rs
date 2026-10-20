@@ -307,7 +307,7 @@ pub fn load(root: &Path, pass_file: &Path, roster_path: &Path) -> MemberResult<L
     if state.0["network"].as_str() != Some(certified.network.label())
         || state.0.get("birth_height").and_then(Value::as_u64)
             != certified.birth_height.map(u64::from)
-        || !matches!((certified.threshold, certified.members.len()), (2, 3) | (2, 4) | (3, 4))
+        || !member_state::valid_policy(certified.threshold, certified.members.len())
         || certified.vault != roster.vault
         || certified.members.len() != roster.members.len()
         || roster.members.iter().any(|member| {

@@ -104,8 +104,22 @@ fn relay_retry_and_reordering_preserve_two_authenticated_messages() {
             .body(),
         b"x"
     );
+    // Any vault member up to 16 can receive the package; member 17 cannot exist.
+    let sixteenth = Identity::new(16);
+    let sixteenth_copy = alice
+        .seal_session(&sixteenth.public(), &ctx, MessageKind::Package, b"x")
+        .unwrap();
+    assert_eq!(
+        sixteenth
+            .open_session(&alice.public(), &ctx, &sixteenth_copy)
+            .unwrap()
+            .body(),
+        b"x"
+    );
+    let mut seventeenth = Identity::new(16).public();
+    seventeenth.id = 17;
     assert!(alice
-        .seal_session(&Identity::new(5).public(), &ctx, MessageKind::Package, b"x")
+        .seal_session(&seventeenth, &ctx, MessageKind::Package, b"x")
         .is_err());
     fs::remove_dir_all(path).unwrap();
 }

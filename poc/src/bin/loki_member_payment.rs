@@ -44,8 +44,9 @@ use zeroize::{Zeroize, Zeroizing};
 
 fn signer_set_from_name(name: &str, threshold: u16) -> Result<Vec<u16>, String> {
     let signers = name.bytes().map(|label| match label {
-        b'A'..=b'D' => Ok(u16::from(label - b'A' + 1)),
-        _ => Err("signer set must use member letters A through D".to_owned()),
+        // Members 1 to 16 are letters A to P.
+        b'A'..=b'P' => Ok(u16::from(label - b'A' + 1)),
+        _ => Err("signer set must use member letters A through P".to_owned()),
     }).collect::<Result<Vec<_>, _>>()?;
     if signers.len() != usize::from(threshold) || signers.windows(2).any(|ids| ids[0] >= ids[1]) {
         return Err("select exactly the vault threshold in member order".into());
@@ -1572,7 +1573,7 @@ mod tests {
         for pair in [
             json!([2, 1]),
             json!([1, 1]),
-            json!([4, 5]),
+            json!([16, 17]),
             json!([1]),
             json!("AC"),
         ] {
@@ -1586,7 +1587,8 @@ mod tests {
             let bytes = frost::Identifier::try_from(id).unwrap().serialize();
             assert_eq!(proposer_id(&bytes).unwrap(), id);
         }
-        assert!(proposer_id(&frost::Identifier::try_from(5u16).unwrap().serialize()).is_err());
+        assert_eq!(proposer_id(&frost::Identifier::try_from(16u16).unwrap().serialize()).unwrap(), 16);
+        assert!(proposer_id(&frost::Identifier::try_from(17u16).unwrap().serialize()).is_err());
         assert!(proposer_id(&[0u8; 32]).is_err());
     }
 

@@ -1233,9 +1233,27 @@ fn setup_store_migrates_only_the_exact_legacy_catalog() {
         let path = root();
         drop(SetupStore::open(&path, &transport).unwrap());
         let sql = rusqlite::Connection::open(path.join("setup.sqlite3")).unwrap();
-        sql.execute_batch("DROP TABLE deferred;").unwrap();
+        // The oldest catalog: no `deferred` table and recipients bounded at 4.
+        let version: i64 = sql.query_row("PRAGMA schema_version", [], |r| r.get(0)).unwrap();
+        sql.execute_batch("DROP TABLE deferred; PRAGMA writable_schema=ON;").unwrap();
+        sql.execute(
+            "UPDATE sqlite_master SET sql=replace(sql,'recipient BETWEEN 1 AND 16)','recipient BETWEEN 1 AND 4)') WHERE type='table'",
+            [],
+        )
+        .unwrap();
+        sql.execute_batch(&format!(
+            "PRAGMA schema_version={}; PRAGMA writable_schema=OFF;",
+            version + 2
+        ))
+        .unwrap();
         drop(sql);
         drop(SetupStore::open(&path, &transport).unwrap());
+        let sql = rusqlite::Connection::open(path.join("setup.sqlite3")).unwrap();
+        let widened: String = sql
+            .query_row("SELECT sql FROM sqlite_master WHERE name='outgoing'", [], |r| r.get(0))
+            .unwrap();
+        assert!(widened.contains("recipient BETWEEN 1 AND 16)"));
+        drop(sql);
         let sql = rusqlite::Connection::open(path.join("setup.sqlite3")).unwrap();
         assert_eq!(
             sql.query_row("SELECT count(*) FROM deferred", [], |r| r.get::<_, u64>(0))

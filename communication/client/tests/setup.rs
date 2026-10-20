@@ -316,7 +316,7 @@ fn private_invite_rejects_secret_policy_and_version_substitution() {
     for (field, replacement) in [
         (0, Value::Integer(2.into())),
         (3, Value::Integer(1.into())),
-        (4, Value::Integer(5.into())),
+        (4, Value::Integer(17.into())),
         (5, Value::Integer(1.into())),
         (8, Value::Bytes(vec![8; 32])),
     ] {

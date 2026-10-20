@@ -534,7 +534,7 @@ impl SetupInvite {
 fn acceptance_payload(roster: &Roster, capabilities: &SetupCapabilities) -> ClientResult<Vec<u8>> {
     capabilities.require(setup::SETUP_VERSION, roster.members.len() as u16)?;
     if capabilities.versions.len() > 8
-        || capabilities.member_counts.len() > 4
+        || capabilities.member_counts.len() > usize::from(types::MAX_MEMBERS)
         || capabilities.versions.windows(2).any(|w| w[0] >= w[1])
         || capabilities.member_counts.windows(2).any(|w| w[0] >= w[1])
     {
@@ -877,12 +877,15 @@ pub fn verify_terminal_notices(
     reply: &VerifiedAdmissionReply,
 ) -> ClientResult<VerifiedTerminalNotices> {
     use loki_relay_protocol::admission::AdmissionCommand;
-    if claimed.is_empty() || claimed.len() > 4 || *ceremony == [0; 32] {
+    if claimed.is_empty()
+        || claimed.len() > usize::from(types::MAX_MEMBERS)
+        || *ceremony == [0; 32]
+    {
         return Err(ClientError::Config);
     }
     let mut peers = BTreeMap::new();
     for peer in claimed {
-        if !(1..=4).contains(&peer.id) || peers.insert(peer.id, peer).is_some() {
+        if !(1..=types::MAX_MEMBERS).contains(&peer.id) || peers.insert(peer.id, peer).is_some() {
             return Err(ClientError::Config);
         }
     }

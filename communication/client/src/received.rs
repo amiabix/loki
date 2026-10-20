@@ -207,7 +207,7 @@ impl ReceivedStatus {
     /// This does not read relay receipts and does not release Stored capacity.
     pub fn whole_vault(&self) -> bool {
         self.author_committed
-            && matches!(self.audience.len(), 3 | 4)
+            && loki_relay_protocol::types::valid_member_count(self.audience.len())
             && self.audience.contains(&self.key.sender)
             && self
                 .audience

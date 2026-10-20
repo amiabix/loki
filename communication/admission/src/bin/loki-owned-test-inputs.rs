@@ -144,13 +144,18 @@ fn grant(root: &Path, args: &[String]) -> Result<(), Box<dyn std::error::Error>>
         || args[0] != "--device-key"
         || args[2] != "--operator-bundle"
         || args[4] != "--policy"
-        || !matches!(args[5].as_str(), "2-of-3" | "2-of-4" | "3-of-4")
     {
         return Err(io::Error::other(
-            "expected --device-key HEX --operator-bundle PATH --policy 2-of-N",
+            "expected --device-key HEX --operator-bundle PATH --policy T-of-N",
         )
         .into());
     }
+    let members = args[5]
+        .split_once("-of-")
+        .and_then(|(t, n)| Some((t.parse::<u16>().ok()?, n.parse::<u16>().ok()?)))
+        .filter(|(t, n)| loki_relay_protocol::types::valid_policy(*t, *n))
+        .map(|(_, n)| n)
+        .ok_or_else(|| io::Error::other("policy must be T-of-N with 2 <= T < N <= 16"))?;
     let device: [u8; 32] = hex::decode(&args[1])?
         .try_into()
         .map_err(|_| io::Error::other("invalid device key"))?;
@@ -170,7 +175,8 @@ fn grant(root: &Path, args: &[String]) -> Result<(), Box<dyn std::error::Error>>
         Value::Bytes(device.to_vec()),
         Value::Integer((now + 3600).into()),
         Value::Integer(1.into()),
-        Value::Integer(24.into()),
+        // One setup and one message mailbox per member on each of the three relays.
+        Value::Integer((6 * u64::from(members)).max(24).into()),
         Value::Bytes(operators.digest().to_vec()),
     ]))?;
     let bytes = signed(
@@ -194,6 +200,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match args.as_slice() {
         [command, root, relay] if command == "init" => init(Path::new(root), Path::new(relay)),
         [command, root, rest @ ..] if command == "grant" => grant(Path::new(root), rest),
-        _ => Err(io::Error::other("usage: loki-owned-test-inputs init ROOT RELAY_BIN | grant ROOT --device-key HEX --operator-bundle PATH --policy 2-of-N").into()),
+        _ => Err(io::Error::other("usage: loki-owned-test-inputs init ROOT RELAY_BIN | grant ROOT --device-key HEX --operator-bundle PATH --policy T-of-N").into()),
     }
 }

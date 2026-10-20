@@ -223,7 +223,7 @@ impl Journal {
         if passphrase.is_empty()
             || passphrase.len() > 4096
             || context == [0; 32]
-            || !(1..=4).contains(&member)
+            || !(1..=crate::member_state::MAX_MEMBERS).contains(&member)
         {
             return Err(ERROR.into());
         }

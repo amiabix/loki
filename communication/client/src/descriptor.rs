@@ -232,7 +232,9 @@ pub(crate) fn endpoint(endpoint: &str) -> ClientResult<()> {
 }
 
 fn validate(descriptor: &Descriptor) -> ClientResult<()> {
-    if !(1..=4).contains(&descriptor.owner) || descriptor.relays.len() != 3 {
+    if !(1..=loki_relay_protocol::types::MAX_MEMBERS).contains(&descriptor.owner)
+        || descriptor.relays.len() != 3
+    {
         return Err(WireError::Schema.into());
     }
     revision(descriptor.revision)?;

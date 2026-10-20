@@ -421,7 +421,7 @@ fn run_owned_services_flow(mode: OwnedFlow, network: &str) {
         assert!((1..=3).contains(&index));
         services.stop_relay(index - 1);
     }
-    for count in if network == "testnet" { vec![3] } else { vec![3, 4] } {
+    for count in if network == "testnet" { vec![3] } else { vec![3, 4, 5] } {
         if std::env::var("LOKI_HOSTED_MEMBERS")
             .ok()
             .is_some_and(|selected| selected != count.to_string())
@@ -451,7 +451,8 @@ fn run_owned_services_flow(mode: OwnedFlow, network: &str) {
             Value::Bytes(identity.public().signing.to_vec()),
             Value::Integer((now + 3600).into()),
             Value::Integer(1.into()),
-            Value::Integer(24.into()),
+            // A setup and a handoff mailbox per member on each of the three relays.
+            Value::Integer((6 * u64::from(count)).max(24).into()),
             Value::Bytes(operators.digest().to_vec()),
         ]))
         .unwrap();
@@ -1603,7 +1604,7 @@ fn saved_join_objects(
     assert_eq!(payload[1], Value::Array(vec![Value::Integer(2.into())]));
     assert_eq!(
         payload[2],
-        Value::Array(vec![Value::Integer(3.into()), Value::Integer(4.into())])
+        Value::Array((3u16..=16).map(|n| Value::Integer(n.into())).collect())
     );
     let Value::Bytes(package) = &payload[3] else {
         panic!()

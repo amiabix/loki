@@ -12,7 +12,21 @@ use std::{
 };
 
 pub(crate) const SCHEMA: &str = include_str!("schema.sql");
-const FOUR_SCHEMA: &str = include_str!("schema4.sql");
+
+/// The transport schema for a vault of `count` members: the 3-member schema with every
+/// member-number bound raised to `count`.
+fn member_schema(count: usize) -> &'static str {
+    static SCHEMAS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    if count == 3 {
+        return SCHEMA;
+    }
+    let schemas = SCHEMAS.get_or_init(|| {
+        (0..=usize::from(loki_relay_protocol::types::MAX_MEMBERS))
+            .map(|n| SCHEMA.replace("BETWEEN 1 AND 3)", &format!("BETWEEN 1 AND {n})")))
+            .collect()
+    });
+    &schemas[count]
+}
 const STORAGE_BUDGET: u64 = 512 * 1024 * 1024;
 const PENDING_TRANSFERS: u64 = 128;
 
@@ -80,6 +94,32 @@ fn recovery_parts() -> (&'static str, &'static str) {
 }
 
 const CURRENT_CATALOG: u8 = 6;
+
+/// Widen CHECK constraints in place by rewriting the schema text: every saved row already
+/// satisfies the wider bound, so the file content does not change (SQLite's documented
+/// `writable_schema` procedure for constraint changes). Checks integrity afterwards.
+pub(crate) fn widen_checks(connection: &mut Connection, narrow: &str, wide: &str) -> ClientResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let version: i64 = transaction.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
+    transaction.execute_batch("PRAGMA writable_schema=ON;")?;
+    let changed = transaction.execute(
+        "UPDATE sqlite_master SET sql=replace(sql,?1,?2) WHERE type='table' AND instr(sql,?1)>0",
+        params![narrow, wide],
+    )?;
+    transaction.execute_batch(&format!(
+        "PRAGMA schema_version={}; PRAGMA writable_schema=OFF;",
+        version + 1
+    ))?;
+    if changed == 0 {
+        return Err(ClientError::Storage);
+    }
+    let integrity: String = transaction.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+    if integrity != "ok" {
+        return Err(ClientError::Storage);
+    }
+    transaction.commit()?;
+    Ok(())
+}
 
 pub(crate) fn validate_schema(connection: &Connection, schema: &str) -> ClientResult<()> {
     let count: usize = connection.query_row(
@@ -310,8 +350,8 @@ fn validate_metadata(
     if vault != roster.vault || saved_roster != digest || saved_owner != i64::from(owner) {
         return Err(ClientError::Identity);
     }
-    let catalog = if roster.members.len() == 4 {
-        validate_schema(connection, FOUR_SCHEMA)?;
+    let catalog = if roster.members.len() != 3 {
+        validate_schema(connection, member_schema(roster.members.len()))?;
         CURRENT_CATALOG
     } else if validate_schema(connection, schema_parts().0).is_ok() {
         0
@@ -343,7 +383,7 @@ fn validate_metadata(
 
 impl ClientStore {
     pub(crate) fn schema(&self) -> &'static str {
-        if self.member_count == 4 { FOUR_SCHEMA } else { SCHEMA }
+        member_schema(self.member_count)
     }
 
     /// Creates a new dedicated transport root, or validates an existing complete root.
@@ -428,7 +468,7 @@ impl ClientStore {
         if fresh {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction.execute_batch(if roster.members.len() == 4 { FOUR_SCHEMA } else { SCHEMA })?;
+            transaction.execute_batch(member_schema(roster.members.len()))?;
             seed_diagnostic_ids(&transaction)?;
             transaction.execute(
                 "INSERT INTO metadata VALUES(1,1,?1,?2,?3)",

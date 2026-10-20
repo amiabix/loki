@@ -1348,7 +1348,6 @@ pub(crate) mod tests {
     use crate::candidate::{
         alpha_from_canonical_bytes, build_candidate, quote_fee, CandidateInputs, Regtest,
     };
-    use crate::member_state::Roster;
     use crate::signer::secure_element::SoftwareSecureElement;
     use crate::zip2005;
     use orchard::keys::Scope;
@@ -1684,7 +1683,6 @@ pub(crate) mod tests {
         use crate::network::VaultNetwork;
 
         let (shares, public, fvk) = dealer_vault();
-        let ak_hex = hex::encode(public.verifying_key().serialize().unwrap());
         let id1 = frost::Identifier::try_from(1u16).unwrap();
         let id2 = frost::Identifier::try_from(2u16).unwrap();
         let key1 = frost::keys::KeyPackage::try_from(shares.get(&id1).unwrap().clone()).unwrap();

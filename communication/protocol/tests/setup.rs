@@ -45,7 +45,7 @@ fn setup_rejects_malformed_and_out_of_range_fields() {
         match case {
             0 => input.version = 1,
             1 => input.threshold = 1,
-            2 => input.member_count = 5,
+            2 => input.member_count = 17,
             3 => input.key.author = 0,
             4 => input.key.recipient = 5,
             5 => input.key.revision = 0,
