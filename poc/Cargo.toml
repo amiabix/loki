@@ -71,6 +71,8 @@ ciborium-io        = "0.2"
 # Compile probes that reproduce the two blocked checkpoint-1 requirements.
 # Each FAILS TO COMPILE on purpose; the compiler error is the blocker report.
 probe-zip2005 = []
+# Apple Secure Enclave backend (macOS only): build.rs links enclave-spike/se_backend.swift.
+apple-enclave = []
 setup-fault-injection = ["relay-communication"]
 relay-communication = ["dep:loki-relay-client", "dep:loki-relay-protocol"]
 # Counts Argon2id derivations and prints `kdf_derivations=N` to stderr at exit.
