@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# Prod-ish demo deploy on omarchy regtest. Ten isolated member coordinators sit behind the
+# Regtest demo on one host. Ten member processes sit behind the
 # web wallet; each tester reaches EXACTLY ONE signer via an unguessable capability link
 # (https://<public>/#<slug>). Brings a 2-of-10 vault to `active`, funds it, then builds and
 # serves the web wallet. Everything runs under setsid so it survives SSH logout.
 #
 #   PUBLIC_URL=https://<ngrok-host> bash deploy_demo.sh
 #
-# Re-run to reset from scratch (fresh data, fresh slugs). ngrok is started separately.
-set -uo pipefail
+# This is not independent signer custody. Use a fresh data directory for each run.
+set -euo pipefail
+umask 077
 
 ROOT="$HOME/loki-frostd"
 BIN="$ROOT/poc/target/release/loki_member_app"
@@ -18,7 +19,10 @@ LWD=http://127.0.0.1:9067
 THS=http://127.0.0.1:32805
 RPC=http://127.0.0.1:18232
 N=10 BASE=3600 THRESHOLD=2
-PUBLIC="${PUBLIC_URL:-http://100.83.113.38:3001}"
+PUBLIC="${PUBLIC_URL:?set PUBLIC_URL to the HTTPS address of the web wallet}"
+[[ "$PUBLIC" == https://* ]] || { echo "PUBLIC_URL must use HTTPS" >&2; exit 1; }
+[[ ! -e "$DATA" ]] || { echo "refusing to replace existing vault data: $DATA" >&2; exit 1; }
+[[ -x "$BIN" ]] || { echo "missing member app binary: $BIN" >&2; exit 1; }
 
 declare -a TOK SLUG
 
@@ -28,16 +32,15 @@ mine() { curl -s -u unused:unused -H 'Content-Type: application/json' \
 api() { # api <member> <GET|POST> <path> [body]
   local i=$1 m=$2 p=$3 b=${4:-} port=$((BASE+$1))
   if [ "$m" = POST ]; then
-    curl -sS -m 300 -X POST "http://127.0.0.1:$port$p" \
+    curl -fsS -m 300 -X POST "http://127.0.0.1:$port$p" \
       -H "X-Loki-Token: ${TOK[$i]}" -H 'Content-Type: application/json' -d "$b"
   else
-    curl -sS -m 300 "http://127.0.0.1:$port$p" -H "X-Loki-Token: ${TOK[$i]}"
+    curl -fsS -m 300 "http://127.0.0.1:$port$p" -H "X-Loki-Token: ${TOK[$i]}"
   fi
 }
 
 echo "[1/6] starting $N member coordinators"
-pkill -f loki_member_app 2>/dev/null; sleep 1
-rm -rf "$DATA"; mkdir -p "$DATA"
+mkdir -p "$DATA"
 peers=""; for i in $(seq 1 $N); do peers="$peers --peer $i=http://127.0.0.1:$((BASE+i))"; done
 for i in $(seq 1 $N); do
   setsid "$BIN" --data "$DATA/$i" --port $((BASE+i)) --network regtest \
@@ -50,7 +53,11 @@ for i in $(seq 1 $N); do
 done
 
 echo "[2/6] profiles + vault ($THRESHOLD-of-$N)"
-for i in $(seq 1 $N); do api $i POST /api/profile-create "{\"name\":\"Member $i\",\"passphrase\":\"pw$i\"}" >/dev/null; done
+for i in $(seq 1 $N); do
+  pass=$(openssl rand -hex 32)
+  printf 'Member %s %s\n' "$i" "$pass" >> "$DATA/passphrases.txt"
+  api $i POST /api/profile-create "{\"name\":\"Member $i\",\"passphrase\":\"$pass\"}" >/dev/null
+done
 C=$(api 1 POST /api/create "{\"name\":\"Loki Test Vault\",\"members\":$N,\"threshold\":$THRESHOLD}")
 V=$(echo "$C" | jq -r .vault)
 [ "$V" = null ] && { echo "create failed: $C"; exit 1; }
@@ -84,7 +91,7 @@ ADDR=$(api 1 GET "/api/address?vault=$V" | jq -r .address)
 echo "      active, address=$ADDR"
 
 echo "[5/6] funding the vault"
-curl -s -X POST "$THS/api/v1/faucet/address" -H 'Content-Type: application/json' \
+curl -fsS -X POST "$THS/api/v1/faucet/address" -H 'Content-Type: application/json' \
   -d "{\"address\":\"$ADDR\",\"amount_zatoshi\":500000000}" >/dev/null
 mine 12
 
@@ -102,11 +109,9 @@ for i in $(seq 1 $N); do echo "Member $i  $PUBLIC/#${SLUG[$i]}" >> "$DATA/links.
 cd "$WEB"
 [ -d node_modules/@webgpu/types ] || npm install --no-audit --no-fund --silent
 npm run build >"$DATA/web-build.log" 2>&1 || { echo "web build failed; see $DATA/web-build.log"; tail -20 "$DATA/web-build.log"; exit 1; }
-pkill -f "next start" 2>/dev/null; pkill -f "next-server" 2>/dev/null; sleep 1
 setsid npx next start -p 3001 >"$DATA/web.log" 2>&1 &
 sleep 4
 
 echo
-echo "=== DEPLOYED. Access links ($PUBLIC) ==="
-cat "$DATA/links.txt"
+echo "=== DEPLOYED. Access links: $DATA/links.txt ==="
 echo "=== vault $V funded; web wallet on :3001 ==="

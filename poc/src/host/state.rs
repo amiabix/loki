@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use tokio::sync::RwLock;
@@ -45,6 +45,7 @@ pub struct AppState {
     pub config: Config,
     pub session: RwLock<Option<Session>>,
     pub ceremony: std::sync::Mutex<()>,
+    pub active_dkgs: std::sync::Mutex<BTreeSet<String>>,
 }
 
 impl AppState {
@@ -53,6 +54,7 @@ impl AppState {
             config,
             session: RwLock::new(None),
             ceremony: std::sync::Mutex::new(()),
+            active_dkgs: std::sync::Mutex::new(BTreeSet::new()),
         }
     }
 }
