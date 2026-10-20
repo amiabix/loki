@@ -75,6 +75,18 @@ pub struct DkgInput {
     pub bytes: Vec<u8>,
 }
 
+impl DkgInput {
+    /// A setup message the coordinator relayed, tagged with the sender its header names
+    /// (the relay's own sender is the coordinator).
+    pub fn from_relay(bytes: Vec<u8>) -> Result<Self, String> {
+        let wire = DkgWire::parse(bytes)?;
+        Ok(Self {
+            sender: wire.sender(),
+            bytes: wire.into_bytes(),
+        })
+    }
+}
+
 /// The vault's receive address, released by a ready signer over a session the member
 /// approved on-device. Only [`Signer::release_address`] produces it. It carries no viewing
 /// key: the coordinator stays viewing-key-less.
@@ -84,9 +96,20 @@ pub struct ReleasedAddress {
     pub address: String,
 }
 
-/// An unsigned, IO-finalized candidate PCZT built by the proposer signer. Public.
+/// An unsigned, IO-finalized candidate PCZT built by the proposer signer. Public. Only a
+/// signer makes one, so it cannot carry arbitrary bytes onto the transport.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CandidatePczt(pub Vec<u8>);
+pub struct CandidatePczt(pub(crate) Vec<u8>);
+
+impl CandidatePczt {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+}
 
 /// Names a candidate the coordinator wants this member to commit/sign to. Public.
 #[derive(Clone, Debug, PartialEq, Eq)]

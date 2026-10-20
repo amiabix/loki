@@ -15,14 +15,15 @@
 //! Every `.sealed` file except the KEK is a [`SealedShare`] under the secure element,
 //! bound by its associated data to the file type, the vault and the member, so a file
 //! moved between types, vaults or members fails to open. Writes are atomic (temporary
-//! file, fsync, rename, directory fsync). With the software KEK a removed file is only
-//! unlinked, not securely erased; real erasure depends on a hardware KEK.
+//! file, fsync, rename, directory fsync). An abandoned setup is wiped by replacing its
+//! checkpoint; with the software KEK the replaced file is only unlinked, not securely
+//! erased, and real erasure depends on a hardware KEK.
 
 use std::path::{Path, PathBuf};
 
 use zeroize::Zeroizing;
 
-use crate::signer::durable::{remove_durable, replace_durable, write_durable};
+use crate::signer::durable::{replace_durable, write_durable};
 use crate::signer::secure_element::{file_binding, SealedShare, SecureElement};
 use crate::signer::Network;
 
@@ -184,10 +185,5 @@ impl SignerStore {
             .open_bound(se, &self.binding(kind))
             .map_err(|_| format!("signer {} file does not belong to this signer", kind.name()))?;
         Ok(Some((sealed.backup_epoch, plain)))
-    }
-
-    pub(crate) fn remove(&self, kind: FileKind) -> Result<(), String> {
-        remove_durable(&self.dir, &kind.file())
-            .map_err(|e| format!("signer {} file: {e}", kind.name()))
     }
 }

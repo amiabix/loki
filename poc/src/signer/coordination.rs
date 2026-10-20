@@ -19,8 +19,14 @@
 //!      PCZT, and return the signed bytes.
 //!
 //! It stops at the signed PCZT: no prove, broadcast, scan, or chain contact.
+//!
+//! The setup drivers [`member_dkg_step`], [`relay_dkg`] and [`redeliver_dkg`] carry the
+//! signer's DKG wires over a [`Transport`]: members send to the coordinator, which logs
+//! each wire in its [`RelayLog`] before forwarding it, and redelivers from the log after a
+//! restart. The coordinator only moves wires; it cannot open round two.
 
-use crate::signer::{CandidateRef, PublicPaymentParams, Session, Signer};
+use crate::signer::{CandidateRef, DkgInput, PublicPaymentParams, Session, Signer, VaultRef};
+use crate::transport::{Outbound, Peer, RelayLog, Transport};
 use reddsa_frost::frost::redpallas as frost;
 use std::collections::BTreeMap;
 
@@ -161,6 +167,103 @@ where
         .finish()
         .serialize()
         .map_err(|e| format!("serialize signed: {e:?}"))
+}
+
+/// Member side of one setup pass: hand the signer what the coordinator relayed, then
+/// send every setup message the signer returns to the coordinator. Returns how many
+/// messages it sent.
+pub fn member_dkg_step<S, T>(
+    signer: &mut S,
+    session: &Session,
+    vault: &VaultRef,
+    transport: &T,
+    channel: &T::Channel,
+) -> Result<usize, String>
+where
+    S: Signer,
+    S::Error: std::fmt::Display,
+    T: Transport,
+    T::Error: std::fmt::Display,
+{
+    let inputs = transport
+        .recv(channel, false)
+        .map_err(|e| format!("recv: {e}"))?
+        .into_iter()
+        .map(|incoming| DkgInput::from_relay(incoming.message))
+        .collect::<Result<Vec<_>, _>>()?;
+    let wires = signer
+        .dkg_step(session, vault, &inputs)
+        .map_err(|e| format!("dkg_step: {e}"))?;
+    let sent = wires.len();
+    for wire in wires {
+        transport
+            .send(channel, &[], &Outbound::Dkg(wire))
+            .map_err(|e| format!("send: {e}"))?;
+    }
+    Ok(sent)
+}
+
+/// Coordinator side of one setup pass: log each wire a member sent, then forward it to
+/// its recipients. A message from outside the roster, or one that is not a well-formed
+/// wire from its relay sender, is dropped. Returns how many new wires it forwarded.
+pub fn relay_dkg<T>(
+    log: &mut RelayLog,
+    transport: &T,
+    channel: &T::Channel,
+    members: &BTreeMap<u16, Peer>,
+) -> Result<usize, String>
+where
+    T: Transport,
+    T::Error: std::fmt::Display,
+{
+    let mut forwarded = 0;
+    for incoming in transport
+        .recv(channel, true)
+        .map_err(|e| format!("recv: {e}"))?
+    {
+        let Some(from) = members
+            .iter()
+            .find(|(_, peer)| **peer == incoming.from)
+            .map(|(id, _)| *id)
+        else {
+            continue;
+        };
+        let Ok(relayed) = log.relay(from, incoming.message) else {
+            continue;
+        };
+        if let Some((wire, recipients)) = relayed {
+            let to: Vec<Peer> = recipients.iter().map(|id| members[id].clone()).collect();
+            transport
+                .send(channel, &to, &Outbound::Dkg(wire))
+                .map_err(|e| format!("send: {e}"))?;
+            forwarded += 1;
+        }
+    }
+    Ok(forwarded)
+}
+
+/// After a coordinator restart: send every logged wire to its recipients again. Members
+/// ignore exact repeats.
+pub fn redeliver_dkg<T>(
+    log: &RelayLog,
+    transport: &T,
+    channel: &T::Channel,
+    members: &BTreeMap<u16, Peer>,
+) -> Result<usize, String>
+where
+    T: Transport,
+    T::Error: std::fmt::Display,
+{
+    let mut sent = 0;
+    for (id, peer) in members {
+        for wire in log.for_member(*id) {
+            transport
+                .send(channel, std::slice::from_ref(peer), &Outbound::Dkg(wire))
+                .map_err(|e| format!("send: {e}"))?;
+            sent += 1;
+        }
+    }
+    Ok(sent)
 }
 
 #[cfg(test)]
