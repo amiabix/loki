@@ -590,7 +590,7 @@ class MemberWalletTest(unittest.TestCase):
             def prepare(_action, member, _pass, roster, work, _recipient, amount, memo, pair, **kwargs):
                 self.assertEqual(member, folder)
                 self.assertEqual(roster, folder / "roster.json")
-                self.assertEqual(work.parent, folder / "payments")
+                self.assertEqual(work.parent, folder / "payment-staging")
                 self.assertEqual(work.stat().st_mode & 0o777, 0o700)
                 self.assertEqual((amount, memo, pair), ("40000000", "test memo", "AB"))
                 self.assertEqual(kwargs["binary"], Path(SETUP).with_name("loki_member_payment"))
@@ -670,6 +670,33 @@ class MemberWalletTest(unittest.TestCase):
                     wallet.prepare_payment(vault, "uregtest1recipient", "40000000", "memo", "AB")
             self.assertEqual(calls, ["prepare", "cancel-draft"])
             self.assertEqual(len(list((wallet.data / "vaults" / vault / "payments").glob("payment-*/payment.json"))), 0)
+
+    def test_prepared_draft_is_marked_before_entering_payments(self):
+        with tempfile.TemporaryDirectory(prefix="loki-draft-publish-") as temp:
+            wallet, vault, _ = self.payment_fixture(temp)
+            attempt = "d" * 64
+            member = wallet.data / "vaults" / vault
+            status = wallet.payment_status
+
+            def command(action, _member, _pass, _roster, work, *_args, **_kwargs):
+                self.assertEqual(action, "prepare")
+                self.assertEqual(work.parent, member / "payment-staging")
+                (work / "payment.json").write_text(json.dumps({
+                    "vault": vault, "payment": "c" * 64, "attempt": attempt,
+                    "amount_zat": 40000000, "fee_zat": 10000, "change_zat": 0,
+                    "expiry_height": 9216, "version": 1, "pair": [1, 2]}))
+                return "ok"
+
+            def record_status(work, phase, *args, **kwargs):
+                self.assertEqual(work.parent, member / "payment-staging")
+                return status(work, phase, *args, **kwargs)
+
+            with patch.object(wallet, "command", side_effect=command), \
+                    patch.object(wallet, "payment_status", side_effect=record_status):
+                self.assertEqual(wallet.prepare_payment(
+                    vault, "uregtest1recipient", "40000000", "memo", "AB")["status"], "draft_only")
+            self.assertEqual(wallet.payment_phase(member / "payments" / attempt)["phase"], "draft")
+            self.assertEqual(list((member / "payment-staging").glob("payment-*/payment.json")), [])
 
     def test_payment_stages_use_only_own_vault_and_verified_review(self):
         with tempfile.TemporaryDirectory(prefix="loki-payment-stages-") as temp:

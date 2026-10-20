@@ -287,6 +287,7 @@ fn prepare(args: &[String], sweep: bool) -> Result<(), String> {
     }
     let work = Path::new(&args[3]);
     private_work(work)?;
+    let work_parent = work.parent().ok_or("payment work directory has no parent")?;
     let rpc = member_rpc(&member)?;
     let (mut wallet, tip, _) = synced_wallet(&member, &owner, &pass, &rpc)?;
     let recipient = vault::orchard_receiver_from_ua(&args[4], member.network.network_type())?;
@@ -360,6 +361,7 @@ fn prepare(args: &[String], sweep: bool) -> Result<(), String> {
         .write_all(serde_json::to_string_pretty(&value).unwrap().as_bytes())
         .and_then(|()| file.sync_all())
         .and_then(|()| fs::File::open(work)?.sync_all())
+        .and_then(|()| fs::File::open(work_parent)?.sync_all())
     {
         let _ = fs::remove_file(&target);
         return Err(format!("{}: {e}", target.display()));

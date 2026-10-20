@@ -120,6 +120,27 @@ class PaymentWorkerTest(unittest.TestCase):
         self.assertFalse(worker_actions & {"review", "approve-reviewed", "finish"})
         self.assertIn((False, "loki_member_payment", "approve-reviewed"), self.calls)
 
+    def test_interrupted_staging_draft_is_not_advanced_after_restart(self):
+        staged = self.work.with_name("payment-interrupted")
+        self.work.rename(staged)
+        self.work = staged
+        self.wallet.payment_worker.start()
+        self.wallet.sync_payments(self.vault)
+        worker_actions = {action for on_worker, _, action in self.calls if on_worker}
+        self.assertNotIn("commit", worker_actions)
+        self.assertFalse((staged / "payment-status.json").exists())
+        with self.assertRaisesRegex(ValueError, "not in this member's vault"):
+            self.wallet.payment(self.vault, self.attempt)
+
+    def test_saved_draft_is_not_sent_to_relay_worker(self):
+        self.wallet.payment_status(self.work, "draft")
+        self.wallet.payment_worker.start()
+        self.wallet.sync_payments(self.vault)
+        worker_actions = {action for on_worker, _, action in self.calls if on_worker}
+        self.assertNotIn("local-wires", worker_actions)
+        self.assertNotIn("commit", worker_actions)
+        self.assertEqual(self.wallet.payment_phase(self.work)["phase"], "draft")
+
     def test_worker_thread_cannot_review_approve_or_send(self):
         worker = self.wallet.payment_worker
         refused = []

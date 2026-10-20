@@ -111,6 +111,14 @@ def write_new(path, value, mode=0o600):
         os.fsync(out.fileno())
 
 
+def sync_directory(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def write_replace(path, value, mode=0o600):
     """Write a file that may already exist, atomically. write_new refuses to
     overwrite, which is right for material that must never be rewritten; a
@@ -1437,8 +1445,11 @@ class Wallet:
         if self.network == "testnet":
             self.balance(vault)
         drafts = member_dir / "payments"
+        staging = member_dir / "payment-staging"
         drafts.mkdir(mode=0o700, exist_ok=True)
-        work = Path(tempfile.mkdtemp(prefix="payment-", dir=drafts))
+        staging.mkdir(mode=0o700, exist_ok=True)
+        sync_directory(member_dir)
+        work = Path(tempfile.mkdtemp(prefix="payment-", dir=staging))
         try:
             self.command("prepare", member_dir, "@pass", member_dir / "roster.json", work,
                          recipient.strip(), amount_zat, memo, pair, binary=PAYMENT, timeout=120)
@@ -1453,9 +1464,11 @@ class Wallet:
             target = drafts / attempt
             if target.exists():
                 raise ValueError("Payment attempt already exists")
+            # The worker must never see an unpublished draft as a received proposal.
+            self.payment_status(work, "draft")
+            sync_directory(work)
             work.rename(target)
             work = target
-            self.payment_status(work, "draft")
             return {"status": "draft_only", "payment": manifest["payment"],
                     "attempt": attempt,
                     "recipient": recipient.strip(), "amount_zat": str(manifest["amount_zat"]),
@@ -1487,11 +1500,13 @@ class Wallet:
             raise ValueError("Vault is not active")
         if not isinstance(attempt, str) or not re.fullmatch(r"[0-9a-f]{64}", attempt):
             raise ValueError("Invalid payment attempt")
-        for work in (member_dir / "payments").glob("*/payment.json"):
-            manifest = read_json(work)
+        work = member_dir / "payments" / attempt
+        path = work / "payment.json"
+        if path.is_file():
+            manifest = read_json(path)
             if manifest.get("attempt") == attempt and manifest.get("vault") == vault:
                 selected_signers(manifest, local.get("threshold", 2), local["members"])
-                return member_dir, local, work.parent, manifest
+                return member_dir, local, work, manifest
         raise ValueError("Payment is not in this member's vault")
 
     def payments(self, vault):
@@ -1527,10 +1542,12 @@ class Wallet:
 
     def _payment_works(self, member_dir, vault):
         for path in sorted((member_dir / "payments").glob("*/payment.json")):
+            # Ignore staging directories left by older interrupted preparations.
+            if not re.fullmatch(r"[0-9a-f]{64}", path.parent.name):
+                continue
             manifest = read_json(path)
             attempt = manifest.get("attempt")
-            if manifest.get("vault") == vault and isinstance(attempt, str) \
-                    and re.fullmatch(r"[0-9a-f]{64}", attempt):
+            if manifest.get("vault") == vault and attempt == path.parent.name:
                 yield path.parent, manifest
 
     def payment_vaults(self):
@@ -1812,7 +1829,7 @@ class Wallet:
             if phase == "queued_for_delivery":
                 plan["proposals"].append(str(work / "payment.json"))
                 queued.append(attempt)
-            if phase == "confirmed":
+            if phase in ("confirmed", "draft"):
                 continue
             if phase == "approval_pending_delivery":
                 try:
