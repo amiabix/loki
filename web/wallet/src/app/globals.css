@@ -1,0 +1,64 @@
+@import "tailwindcss";
+
+:root {
+  --background: #050507;
+  --foreground: #e8eaf0;
+  --mint: #3ee6a0;        /* the one safe action */
+  --amber: #f4b942;       /* irreversible steps */
+  --danger: #ff5d5d;      /* refuse / destructive */
+  --muted: #9aa0ad;
+  --border: rgba(255, 255, 255, 0.1);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-mint: var(--mint);
+  --color-amber: var(--amber);
+  --color-danger: var(--danger);
+  --color-muted: var(--muted);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-geist-sans), system-ui, sans-serif;
+  overflow: hidden; /* the horizontal rail owns scrolling */
+}
+
+/* hide the rail's scrollbar — navigation is wheel + dots */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  scrollbar-width: none;
+}
+
+/* glass panel over the Black Hole */
+.glass {
+  background: rgba(10, 11, 15, 0.55);
+  border: 1px solid var(--border);
+  backdrop-filter: blur(14px);
+}
+
+/* center-weighted scrim so content stays legible over the bright swirl */
+.scrim {
+  background: radial-gradient(
+    58% 54% at 50% 50%,
+    rgba(5, 5, 7, 0.82) 0%,
+    rgba(5, 5, 7, 0.45) 46%,
+    transparent 78%
+  );
+}
+
+/* legibility for text that sits directly on the shader (the hero) */
+.on-shader {
+  text-shadow: 0 2px 18px rgba(0, 0, 0, 0.75), 0 1px 3px rgba(0, 0, 0, 0.9);
+}

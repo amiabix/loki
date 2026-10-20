@@ -503,11 +503,28 @@ impl<SE: SecureElement> LocalSigner<SE> {
         label: String,
         prompts: DevicePrompts,
     ) -> Result<Self, SignerError> {
+        Self::create_with_identity(dir, se, network, vault_id, member_id, label, prompts, Identity::new(member_id))
+    }
+
+    /// Use an identity enrolled before the hosted ceremony starts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_with_identity(
+        dir: &Path,
+        se: SE,
+        network: Network,
+        vault_id: [u8; 32],
+        member_id: u16,
+        label: String,
+        prompts: DevicePrompts,
+        identity: Identity,
+    ) -> Result<Self, SignerError> {
         if vault_id == [0; 32] || !(1..=crate::member_state::MAX_MEMBERS).contains(&member_id) {
             return Err(SignerError::Other("invalid vault id or member number".into()));
         }
+        if identity.public().id != member_id {
+            return Err(SignerError::Other("signer identity is for another member".into()));
+        }
         let store = SignerStore::create(dir, network, vault_id, member_id)?;
-        let identity = Identity::new(member_id);
         store.write(
             &se,
             FileKind::Identity,
@@ -630,6 +647,16 @@ impl<SE: SecureElement> LocalSigner<SE> {
     /// The group verifying (public) key package, once DKG has completed. Public.
     pub fn public_package_bytes(&self) -> Option<&[u8]> {
         self.public_package.as_deref()
+    }
+
+    /// Material for the hosted vault's existing sealed file after every receipt arrived.
+    pub fn hosted_material(&self) -> Result<(frost::keys::KeyPackage, frost::keys::PublicKeyPackage, Zeroizing<[u8; 32]>), SignerError> {
+        self.require_ready()?;
+        let setup = self.setup.as_ref().ok_or(SignerError::NotReady)?;
+        let public = frost::keys::PublicKeyPackage::deserialize(
+            self.public_package.as_deref().ok_or(SignerError::NoShare)?
+        ).map_err(|e| SignerError::Other(e.to_string()))?;
+        Ok((self.open_key()?, public, Zeroizing::new(*setup.core.vault_secret())))
     }
 
     /// The device-side "abandon this setup" action: wipe the setup's fresh key, FROST

@@ -55,7 +55,10 @@ rusqlite = { version = "=0.37.0", features = ["bundled-sqlcipher-vendored-openss
 async-trait = "0.1"
 tonic = { version = "0.14.6", features = ["transport", "tls-webpki-roots"] }
 rustls = { version = "0.23", features = ["aws_lc_rs"] }
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+# loki_member_app: the Rust HTTP coordinator (one per member). Optional, gated on
+# relay-communication; hyper/tower come in transitively via tonic/reqwest.
+axum = { version = "0.8", optional = true }
 # WS3 frostd transport: speak the audited relay's JSON-over-HTTP contract directly
 # (the 8 endpoints in `frostd/src/lib.rs`). xeddsa signs the login challenge exactly as
 # frostd verifies it. reqwest/uuid are already in the graph transitively; named here so
@@ -71,6 +74,8 @@ zcash_note_encryption = "0.4.2"
 zcash_transparent = { package = "zakura-transparent", version = "=2.2.0" }
 sapling-crypto = { package = "zakura-sapling-crypto", version = "=2.2.0" }
 ciborium-io        = "0.2"
+# loki_serve: a tiny localhost HTTP server that fronts a view-only wallet for the web UI.
+tiny_http          = "0.12"
 
 [features]
 # Compile probes that reproduce the two blocked checkpoint-1 requirements.
@@ -79,7 +84,7 @@ probe-zip2005 = []
 # Apple Secure Enclave backend (macOS only): build.rs links enclave-spike/se_backend.swift.
 apple-enclave = []
 setup-fault-injection = ["relay-communication"]
-relay-communication = ["dep:loki-relay-client", "dep:loki-relay-protocol"]
+relay-communication = ["dep:loki-relay-client", "dep:loki-relay-protocol", "dep:axum"]
 # Counts Argon2id derivations and prints `kdf_derivations=N` to stderr at exit.
 # Measurement only: never in builds used for timing or acceptance.
 kdf-stats = []
@@ -102,6 +107,12 @@ optional = true
 # Hosted setup commands in one long-lived process per unlocked profile; see
 # `src/member_service.rs` for the stdin/stdout protocol.
 name = "loki_member_service"
+required-features = ["relay-communication"]
+
+[[bin]]
+# The per-member HTTP coordinator (axum): account + hosted vault ceremony + multi-party
+# payment, driving the audited library in-process. Served to the web UI. See `src/host/`.
+name = "loki_member_app"
 required-features = ["relay-communication"]
 
 [[example]]

@@ -1,0 +1,277 @@
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+    thread,
+};
+
+use loki_poc::candidate::{quote_fee, CandidateInputs};
+use loki_poc::network::VaultNetwork;
+use loki_poc::payment_transport::{coordinate, signer_loop};
+use loki_poc::setup_transport::Identity;
+use loki_poc::signer::{
+    local::LocalSigner, secure_element::SoftwareSecureElement, CandidateRef, Network,
+    PublicPaymentParams, Signer,
+};
+use loki_poc::transport::{FrostdLoginKey, FrostdTransport, Incoming, Outbound, Peer, Transport};
+use loki_poc::zip2005;
+use orchard::{
+    keys::{FullViewingKey, Scope},
+    note::{RandomSeed, Rho},
+    value::NoteValue,
+    NoteVersion,
+};
+use reddsa_frost::frost::redpallas as frost;
+use uuid::Uuid;
+use zcash_protocol::{memo::MemoBytes, value::Zatoshis};
+
+#[derive(Clone)]
+struct MemoryTransport {
+    me: Peer,
+    coordinator: Peer,
+    inboxes: Arc<Mutex<BTreeMap<[u8; 32], Vec<Incoming>>>>,
+}
+
+impl Transport for MemoryTransport {
+    type Error = String;
+    type Channel = Uuid;
+
+    fn open(&mut self, _peers: &[Peer], _message_count: u8) -> Result<Uuid, String> {
+        Ok(Uuid::new_v4())
+    }
+    fn join(&mut self, session: Uuid) -> Result<Uuid, String> {
+        Ok(session)
+    }
+    fn send(&self, _channel: &Uuid, to: &[Peer], message: &Outbound) -> Result<(), String> {
+        let message = message.to_bytes().map_err(|e| e.to_string())?;
+        let recipients = if to.is_empty() {
+            std::slice::from_ref(&self.coordinator)
+        } else {
+            to
+        };
+        let mut inboxes = self.inboxes.lock().unwrap();
+        for recipient in recipients {
+            inboxes.entry(recipient.0).or_default().push(Incoming {
+                from: self.me.clone(),
+                message: message.clone(),
+            });
+        }
+        Ok(())
+    }
+    fn recv(&self, _channel: &Uuid, _as_coordinator: bool) -> Result<Vec<Incoming>, String> {
+        Ok(self
+            .inboxes
+            .lock()
+            .unwrap()
+            .remove(&self.me.0)
+            .unwrap_or_default())
+    }
+    fn close(&self, _channel: Uuid) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+fn vault_note(fvk: &FullViewingKey) -> orchard::Note {
+    let rho = Rho::from_bytes(&[1u8; 32]).unwrap();
+    let rseed = RandomSeed::from_bytes([2u8; 32], &rho).unwrap();
+    orchard::Note::from_parts(
+        fvk.address_at(0u64, Scope::External),
+        NoteValue::from_raw(625_000_000),
+        rho,
+        rseed,
+        NoteVersion::V3,
+    )
+    .unwrap()
+}
+
+#[test]
+fn two_of_three_payment_pczt_verifies_over_frostd() {
+    let url = std::env::var("FROSTD_URL").expect("set FROSTD_URL to the running frostd relay");
+    roundtrip(
+        Identity::new(9),
+        VaultNetwork::Regtest,
+        |identity| {
+            let secret: [u8; 32] = identity.to_secret_bytes()[34..].try_into().unwrap();
+            FrostdTransport::new(&url, FrostdLoginKey::from_secret_bytes(secret)).unwrap()
+        },
+        |channel| channel.session_id(),
+    );
+    eprintln!("payment over frostd: 2-of-3 PCZT signature verifies under randomized group key");
+}
+
+#[test]
+fn two_of_three_payment_pczt_verifies_in_memory() {
+    let inboxes = Arc::new(Mutex::new(BTreeMap::new()));
+    let coordinator = Identity::new(9);
+    let coordinator_peer = Peer(coordinator.public().encryption);
+    roundtrip(
+        coordinator,
+        VaultNetwork::Regtest,
+        |identity| MemoryTransport {
+            me: Peer(identity.public().encryption),
+            coordinator: coordinator_peer.clone(),
+            inboxes: inboxes.clone(),
+        },
+        |channel| *channel,
+    );
+}
+
+#[test]
+fn testnet_payment_uses_nu7_over_in_memory_transport() {
+    let inboxes = Arc::new(Mutex::new(BTreeMap::new()));
+    let coordinator = Identity::new(9);
+    let coordinator_peer = Peer(coordinator.public().encryption);
+    roundtrip(
+        coordinator,
+        VaultNetwork::Testnet,
+        |identity| MemoryTransport {
+            me: Peer(identity.public().encryption),
+            coordinator: coordinator_peer.clone(),
+            inboxes: inboxes.clone(),
+        },
+        |channel| *channel,
+    );
+}
+
+fn roundtrip<T: Transport + Send>(
+    coordinator: Identity,
+    network: VaultNetwork,
+    make_transport: impl Fn(&Identity) -> T,
+    session_id: impl Fn(&T::Channel) -> Uuid,
+) where
+    T::Channel: Send,
+    T::Error: std::fmt::Debug + std::fmt::Display,
+{
+    let (shares, public) = frost::keys::generate_with_dealer(
+        3,
+        2,
+        frost::keys::IdentifierList::Default,
+        &mut rand_core::OsRng,
+    )
+    .unwrap();
+    let keys: BTreeMap<_, _> = shares
+        .into_iter()
+        .map(|(id, share)| (id, frost::keys::KeyPackage::try_from(share).unwrap()))
+        .collect();
+    let ak: [u8; 32] = public
+        .verifying_key()
+        .serialize()
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let fvk = zip2005::frost_viewing_key(&ak, &[42u8; 32]).unwrap();
+    let note = vault_note(&fvk);
+    let mut inputs = CandidateInputs {
+        vault_fvk: &fvk,
+        notes: vec![note],
+        recipient: fvk.address_at(7u64, Scope::External),
+        amount: Zatoshis::const_from_u64(40_000_000),
+        memo: MemoBytes::from_bytes(b"loki u2").unwrap(),
+        change: Zatoshis::ZERO,
+        target_height: if network == VaultNetwork::Testnet {
+            4_465_056
+        } else {
+            700
+        },
+        expiry_height: if network == VaultNetwork::Testnet {
+            4_466_208
+        } else {
+            1_152
+        },
+    };
+    let fee = quote_fee(&network, &inputs).unwrap();
+    inputs.change = Zatoshis::const_from_u64(625_000_000 - 40_000_000 - u64::from(fee));
+
+    let ids: Vec<_> = (1u16..=2)
+        .map(|id| frost::Identifier::try_from(id).unwrap())
+        .collect();
+    let identities: Vec<_> = (1u16..=2).map(Identity::new).collect();
+    let peer_of: BTreeMap<_, _> = ids
+        .iter()
+        .copied()
+        .zip(
+            identities
+                .iter()
+                .map(|identity| Peer(identity.public().encryption)),
+        )
+        .collect();
+    let mut tx = make_transport(&coordinator);
+    let peers: Vec<_> = ids.iter().map(|id| peer_of[id].clone()).collect();
+    let channel = tx.open(&peers, 4).unwrap();
+    let session = session_id(&channel);
+    let member_transports: Vec<_> = identities.iter().map(make_transport).collect();
+    let signer_network = if network == VaultNetwork::Testnet { Network::Testnet } else { Network::Regtest };
+    let candidate = CandidateRef { vault_id: [1; 32], payment_id: [7; 32], attempt_id: [9; 32] };
+    let params = PublicPaymentParams {
+        recipient: inputs.recipient, amount: inputs.amount, memo: inputs.memo.clone(),
+        target_height: inputs.target_height, expiry_height: inputs.expiry_height,
+    };
+
+    thread::scope(|scope| {
+        let handles: Vec<_> = identities
+            .into_iter()
+            .zip(member_transports)
+            .zip(ids.iter().copied())
+            .map(|((identity, mut member_tx), id)| {
+                let key = keys[&id].clone();
+                let proposer_inputs = if id == ids[0] { Some(&params) } else { None };
+                let other_signers: Vec<_> = if proposer_inputs.is_some() { peers.iter().skip(1).cloned().collect() } else { Vec::new() };
+                let proposer_peer = peer_of[&ids[0]].clone();
+                let public_bytes = public.serialize().unwrap();
+                let signer_public = public.clone();
+                let signer_fvk = fvk.clone();
+                let candidate = candidate.clone();
+                scope.spawn(move || {
+                    let channel = member_tx.join(session).unwrap();
+                    let nonce_dir = std::env::temp_dir().join(format!("loki-payment-{}-{}", std::process::id(), rand_core::RngCore::next_u64(&mut rand_core::OsRng)));
+                    let mut signer = LocalSigner::with_sealed_share(
+                        identity.public().id, 2, 3, [1; 32], "payment test".into(), signer_network,
+                        SoftwareSecureElement::generate(), &key.serialize().unwrap(),
+                        public_bytes, signer_fvk, nonce_dir, Box::new(|_| true),
+                    ).unwrap();
+                    signer.set_candidate_notes(vec![note]);
+                    let signer_session = signer.connect("payment test", signer_network, b"test").unwrap().session;
+                    signer_loop(
+                        &member_tx,
+                        &channel,
+                        &mut signer, &signer_session, &candidate, &signer_public, id,
+                        proposer_inputs, &proposer_peer, &other_signers,
+                    )
+                    .unwrap();
+                })
+            })
+            .collect();
+        let signed =
+            coordinate(&tx, &channel, &public, &ids, &peer_of, 2, rand_core::OsRng).unwrap();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        tx.close(channel).unwrap();
+
+        let parsed = pczt::Pczt::parse(&signed).unwrap();
+        let branch = if network == VaultNetwork::Testnet {
+            zcash_protocol::consensus::BranchId::Nu7
+        } else {
+            zcash_protocol::consensus::BranchId::Nu6_3
+        };
+        assert_eq!(*parsed.global().consensus_branch_id(), u32::from(branch));
+        let sighash = pczt::roles::signer::Signer::new(parsed.clone())
+            .unwrap()
+            .shielded_sighash();
+        let action = parsed
+            .ironwood()
+            .actions()
+            .iter()
+            .find(|action| action.spend().nullifier() == &note.nullifier(&fvk).to_bytes())
+            .unwrap();
+        let signature = action.spend().spend_auth_sig().expect("signed spend");
+        let rk = orchard::primitives::redpallas::VerificationKey::<
+            orchard::primitives::redpallas::SpendAuth,
+        >::try_from(*action.spend().rk())
+        .unwrap();
+        rk.verify(
+            &sighash,
+            &orchard::primitives::redpallas::Signature::from(signature),
+        )
+        .unwrap();
+    });
+}

@@ -1,0 +1,170 @@
+use axum::{
+    extract::{Request, State},
+    http::StatusCode,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
+use serde_json::{json, Value};
+use zeroize::Zeroizing;
+
+use super::{
+    ceremony, payment,
+    state::{Session, Shared},
+};
+
+type Reply = (StatusCode, Json<Value>);
+
+pub(super) fn ok(v: Value) -> Reply {
+    (StatusCode::OK, Json(v))
+}
+
+pub(super) fn err(code: StatusCode, message: impl Into<String>) -> Reply {
+    (code, Json(json!({ "error": message.into() })))
+}
+
+/// Run a blocking library call (which drives the relay runtime via `block_on`) off the
+/// async worker threads — calling it inline would panic (runtime-within-runtime).
+pub(super) async fn blocking<F>(f: F) -> Reply
+where
+    F: FnOnce() -> Result<Value, String> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(Ok(v)) => ok(v),
+        Ok(Err(e)) => err(StatusCode::BAD_REQUEST, e),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("task join: {e}")),
+    }
+}
+
+pub fn router(state: Shared) -> Router {
+    Router::new()
+        .route("/api/profile-create", post(profile_create))
+        .route("/api/unlock", post(unlock))
+        .route("/api/lock", post(lock))
+        .route("/api/status", get(status))
+        .route("/api/create", post(ceremony::create))
+        .route("/api/join", post(ceremony::join))
+        .route("/api/enroll", post(ceremony::enroll))
+        .route("/api/roster", get(ceremony::roster))
+        .route("/api/agree", post(ceremony::agree))
+        .route("/api/agreed", post(ceremony::agreed))
+        .route("/api/session", get(ceremony::session))
+        .route("/api/address", get(ceremony::address))
+        .route("/api/balance", post(payment::balance))
+        .route("/api/payment-draft", post(payment::draft))
+        .route("/api/payment-publish", post(payment::publish))
+        .route("/api/payment-session", get(payment::session))
+        .route("/api/payment-review", post(payment::review))
+        .route("/api/payment-approve", post(payment::approve))
+        .route("/api/payment-finish", post(payment::finish))
+        .route("/api/payment-verify", post(payment::verify))
+        .route("/api/payments", get(payment::payments))
+        .layer(middleware::from_fn_with_state(state.clone(), auth))
+        .with_state(state)
+}
+
+/// Every `/api/*` request must carry the process token (the web proxy injects it).
+async fn auth(State(st): State<Shared>, req: Request, next: Next) -> Result<Response, Response> {
+    if matches!(
+        req.uri().path(),
+        "/api/enroll" | "/api/agreed" | "/api/roster" | "/api/session" | "/api/payment-session"
+    ) {
+        return Ok(next.run(req).await);
+    }
+    let presented = req
+        .headers()
+        .get("x-loki-token")
+        .and_then(|v| v.to_str().ok());
+    if presented == Some(st.config.token.as_str()) {
+        Ok(next.run(req).await)
+    } else {
+        Err(err(StatusCode::UNAUTHORIZED, "invalid process token").into_response())
+    }
+}
+
+fn str_field(body: &Value, name: &str) -> Result<String, Reply> {
+    body.get(name)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, format!("missing {name}")))
+}
+
+async fn set_session(st: &Shared, passphrase: Zeroizing<String>) {
+    crate::seal_kdf::enable_session_cache(&passphrase);
+    *st.session.write().await = Some(Session {
+        passphrase,
+        data: st.config.data.clone(),
+    });
+}
+
+async fn profile_create(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
+    let (name, pass) = match (str_field(&body, "name"), str_field(&body, "passphrase")) {
+        (Ok(n), Ok(p)) => (n, p),
+        (Err(e), _) | (_, Err(e)) => return e,
+    };
+    let data = st.config.data.clone();
+    let passphrase = Zeroizing::new(pass);
+    let for_block = passphrase.clone();
+    let reply = blocking(move || crate::profile::create(&data, &for_block, &name)).await;
+    if reply.0 == StatusCode::OK {
+        // Creating a profile unlocks it (the prototype's behaviour).
+        set_session(&st, passphrase).await;
+    }
+    reply
+}
+
+async fn unlock(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
+    let pass = match str_field(&body, "passphrase") {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let data = st.config.data.clone();
+    let passphrase = Zeroizing::new(pass);
+    let for_block = passphrase.clone();
+    match tokio::task::spawn_blocking(move || Session::unlock(data, for_block)).await {
+        Ok(Ok((session, profile))) => {
+            *st.session.write().await = Some(session);
+            ok(json!({ "unlocked": true, "profile": profile }))
+        }
+        Ok(Err(e)) => err(StatusCode::UNAUTHORIZED, e),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("task join: {e}")),
+    }
+}
+
+async fn lock(State(st): State<Shared>) -> Reply {
+    *st.session.write().await = None;
+    crate::seal_kdf::clear_session_cache();
+    ok(json!({ "locked": true }))
+}
+
+async fn status(
+    State(st): State<Shared>,
+    axum::extract::Query(query): axum::extract::Query<std::collections::BTreeMap<String, String>>,
+) -> Reply {
+    if let Some(vault) = query.get("vault") {
+        return ceremony::status(st, vault.clone()).await;
+    }
+    let network = st.config.network.clone();
+    let session = st.session.read().await;
+    let Some(session) = session.as_ref() else {
+        let phase = if crate::profile::exists(&st.config.data) {
+            "locked"
+        } else {
+            "new_profile"
+        };
+        return ok(json!({ "phase": phase, "network": network }));
+    };
+    // Unlocked: re-read the profile for its name/id and list the member's vaults.
+    match crate::profile::open(&session.data, &session.passphrase) {
+        Ok(profile) => {
+            let vaults = match ceremony::vault_summaries(&session.data, &session.passphrase) {
+                Ok(v) => v,
+                Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+            };
+            ok(json!({ "phase": "home", "network": network, "profile": profile, "vaults": vaults }))
+        }
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}

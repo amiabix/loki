@@ -20,6 +20,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
 const MAGIC: &[u8; 8] = b"LOKIDKG1";
+
 const MAGIC_V2: &[u8; 8] = b"LOKIDKG2";
 /// v2 header: magic, vault, sender, recipient, round-one transcript, nonce, length.
 const HEADER_V2: usize = 8 + 32 + 2 + 2 + 32 + 24 + 4;
@@ -191,7 +192,9 @@ impl Identity {
             return Err("invalid DKG identity length".into());
         }
         let id = u16::from_be_bytes(bytes[..2].try_into().unwrap());
-        if !(1..=crate::member_state::MAX_MEMBERS).contains(&id) {
+        // 1..=MAX_MEMBERS are vault members; id 0 is the ephemeral frostd session coordinator
+        // (never a FROST participant), which the hosted payment flow seals and reloads.
+        if id != 0 && !(1..=crate::member_state::MAX_MEMBERS).contains(&id) {
             return Err("invalid DKG member id".into());
         }
         Ok(Self {
