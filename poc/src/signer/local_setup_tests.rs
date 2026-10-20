@@ -620,13 +620,78 @@ fn swapped_or_rolled_back_files_are_rejected_or_only_abort() {
     std::fs::write(members[0].dir.join("setup.sealed"), &early).unwrap();
     assert!(members[0].try_reopen().is_err());
     std::fs::write(members[0].dir.join("setup.sealed"), &own).unwrap();
-    // A missing share behind a certified checkpoint.
+    // A crash after the certified checkpoint was saved but before the share file was
+    // written: the checkpoint holds the share, so reopening writes the same share again.
     let share = std::fs::read(members[0].dir.join("share.sealed")).unwrap();
     std::fs::remove_file(members[0].dir.join("share.sealed")).unwrap();
-    assert!(members[0].try_reopen().is_err());
-    std::fs::write(members[0].dir.join("share.sealed"), &share).unwrap();
     members[0].reopen();
+    assert!(members[0].dir.join("share.sealed").exists());
     assert!(members[0].signer.list_vaults(&members[0].session).unwrap()[0].ready);
+    assert_eq!(
+        members[0].signer.open_key().unwrap().serialize().unwrap(),
+        {
+            std::fs::write(members[0].dir.join("share.sealed"), &share).unwrap();
+            members[0].reopen();
+            members[0].signer.open_key().unwrap().serialize().unwrap()
+        }
+    );
+
+    // A crash between saving the confirmed roster and its empty setup.
+    let (mut members, document) = setup_members(2, 3, [65u8; 32]);
+    let vault_ref = begin(&mut members, &document);
+    std::fs::remove_file(members[0].dir.join("setup.sealed")).unwrap();
+    members[0].reopen();
+    assert_eq!(phase(&members[0]), DkgPhase::Empty);
+    complete(&mut members, &vault_ref, &mut tape);
+}
+
+#[test]
+fn a_bad_message_after_the_share_exists_is_refused_and_the_share_kept() {
+    let vault = [66u8; 32];
+    let (mut members, document) = setup_members(2, 3, vault);
+    let vault_ref = begin(&mut members, &document);
+    let mut inbox = Inbox::new();
+    let mut tape = Vec::new();
+    for _ in 0..6 {
+        exchange(&mut members, &vault_ref, &mut inbox, &mut tape).unwrap();
+    }
+    assert!(members.iter().all(|m| phase(m) == DkgPhase::Certified));
+
+    // Member 2 signs messages that differ from what member 1 saved: a backup receipt
+    // over another body, and a second certificate.
+    let liar = members[1].signer.identity.as_ref().unwrap();
+    let forged = [
+        liar.sign_backup(&vault, b"a different backup body")
+            .unwrap(),
+        liar.sign_certificate(&vault, b"a different certificate")
+            .unwrap(),
+    ];
+    for bytes in forged {
+        let input = DkgInput { sender: 2, bytes };
+        match members[0].step(&vault_ref, &[input]) {
+            Err(SignerError::MessageRefused(_)) => {}
+            other => panic!("a bad message after the share must be refused, got {other:?}"),
+        }
+        assert_eq!(phase(&members[0]), DkgPhase::Certified);
+        members[0].try_reopen().expect("the signer still opens");
+    }
+    // The setup carries on: backups, every real receipt, ready, and the same group key.
+    let before = group_key(&members[0]);
+    members[0].reopen();
+    let count = members.len() as u16;
+    for m in members.iter_mut() {
+        let receipt = m.signer.backup(&m.session).unwrap();
+        route(m.id, receipt, count, &mut inbox, &mut tape);
+    }
+    exchange(&mut members, &vault_ref, &mut inbox, &mut tape).unwrap();
+    for m in &members {
+        assert!(
+            m.signer.list_vaults(&m.session).unwrap()[0].ready,
+            "member {}",
+            m.id
+        );
+    }
+    assert_eq!(group_key(&members[0]), before);
 }
 
 #[test]
@@ -1037,7 +1102,10 @@ fn general_policies_run_the_dkg_and_sign() {
         let vault_ref = begin(&mut members, &document);
         let mut tape = Vec::new();
         complete(&mut members, &vault_ref, &mut tape);
-        let addresses: Vec<String> = members.iter_mut().map(|m| m.release().unwrap().address).collect();
+        let addresses: Vec<String> = members
+            .iter_mut()
+            .map(|m| m.release().unwrap().address)
+            .collect();
         assert!(addresses.iter().all(|a| a == &addresses[0]));
         let recipient = crate::vault::orchard_receiver_from_ua(
             &addresses[0],
@@ -1053,9 +1121,10 @@ fn general_policies_run_the_dkg_and_sign() {
             orchard::NoteVersion::V3,
         )
         .unwrap();
-        let public =
-            frost::keys::PublicKeyPackage::deserialize(members[0].signer.public_package_bytes().unwrap())
-                .unwrap();
+        let public = frost::keys::PublicKeyPackage::deserialize(
+            members[0].signer.public_package_bytes().unwrap(),
+        )
+        .unwrap();
         // The quorum is the last `threshold` members, so member 1 is not always in it.
         let mut quorum: Vec<QuorumMember<'_, _>> = members
             .iter_mut()

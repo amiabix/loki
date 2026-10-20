@@ -29,7 +29,9 @@ round-two boundary required a fix: it previously returned plaintext share packag
   a v2 envelope under the two members' one-setup fresh X25519 keys, which are erased
   once the certificate state is saved. Recorded relay traffic therefore does not open
   round two even after a later compromise of the members' long-lived identity keys
-  (test `recorded_relay_traffic_cannot_rebuild_the_group_key`). The signer returns only
+  (test `recorded_relay_traffic_cannot_rebuild_the_group_key`). The hosted engine's
+  journal is append-only, so there earlier generations keep the fresh key on disk,
+  sealed under the same member passphrase that seals the share. The signer returns only
   `DkgWire` values, and `Transport::send` takes only a typed `Outbound`, so raw bytes
   cannot be handed to the relay (compile-fail doc tests in `transport.rs`). The type
   guard (`known_signer_return_types_are_public_artifacts`) has no `Vec<u8>` entry but

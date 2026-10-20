@@ -105,6 +105,9 @@ pub enum SignerError {
     TimedOut,
     /// The setup hit a mismatch or a bad message. Final: its secrets are wiped.
     SetupAborted(String),
+    /// After the share exists, a setup message was refused. The saved setup and the
+    /// share are kept; the step's progress is saved.
+    MessageRefused(String),
     /// The vault is not ready: certificates or backup receipts are missing.
     NotReady,
     /// A protocol/parse/io failure, carried as text.
@@ -127,6 +130,9 @@ impl std::fmt::Display for SignerError {
             SignerError::Cancelled => write!(f, "member cancelled on the device"),
             SignerError::TimedOut => write!(f, "member did not decide before the deadline"),
             SignerError::SetupAborted(e) => write!(f, "setup aborted: {e}"),
+            SignerError::MessageRefused(e) => {
+                write!(f, "setup message refused (setup and share kept): {e}")
+            }
             SignerError::NotReady => write!(f, "vault not ready: certificates or backups missing"),
             SignerError::Other(e) => write!(f, "{e}"),
         }
@@ -564,7 +570,17 @@ impl<SE: SecureElement> LocalSigner<SE> {
             None => None,
         };
         let share = store.read(&signer.se, FileKind::Share)?;
+        signer.store = Some(store);
         let mut installed = None;
+        let setup = match (&signer.roster, setup) {
+            // A crash between saving the confirmed roster and its empty setup.
+            (Some(_), None) if share.is_none() => {
+                let setup = SetupCheckpoint::new();
+                signer.save_setup(&setup)?;
+                Some(setup)
+            }
+            (_, setup) => setup,
+        };
         match (&signer.roster, &setup) {
             (None, None) if share.is_none() => {}
             (Some((roster, _)), Some(setup)) => {
@@ -581,8 +597,16 @@ impl<SE: SecureElement> LocalSigner<SE> {
                             Some(signer.checked_share(&core, &setup.core, &key, public, &vs, *epoch)?);
                     }
                     (None, false) => {}
-                    // A share without a certified setup, or a certified setup without its
-                    // share: a file was rolled back or swapped.
+                    // A crash after the certificate-phase setup was saved but before its
+                    // share file was written: the setup holds the share.
+                    (None, true) => {
+                        installed = Some(
+                            signer
+                                .restore_share(&core, &setup.core)
+                                .map_err(SignerError::Other)?,
+                        );
+                    }
+                    // A share without a certified setup: a file was rolled back or swapped.
                     _ => {
                         return Err(SignerError::Other(
                             "signer files are inconsistent (rolled back?)".into(),
@@ -600,7 +624,6 @@ impl<SE: SecureElement> LocalSigner<SE> {
             signer.install(share);
         }
         signer.setup = setup;
-        signer.store = Some(store);
         Ok(signer)
     }
 
@@ -611,7 +634,7 @@ impl<SE: SecureElement> LocalSigner<SE> {
 
     /// The device-side "abandon this setup" action: wipe the setup's fresh key, FROST
     /// state and saved messages, and refuse to continue it. Also done automatically on
-    /// any mismatch.
+    /// any mismatch before the share exists.
     pub fn abandon_setup(&mut self) -> Result<(), SignerError> {
         let mut setup = self
             .setup
@@ -821,84 +844,75 @@ impl<SE: SecureElement> LocalSigner<SE> {
     }
 
     /// One `dkg_step`: start round one if needed, accept the inputs, then advance through
-    /// every phase whose messages are complete. Each advance is saved before the next.
+    /// every phase whose messages are complete. Each advance is saved before the next, and
+    /// `setup` always equals the last saved state, even when this returns an error.
     fn advance_setup(
         &mut self,
         setup: &mut SetupCheckpoint,
         inputs: &[DkgInput],
-    ) -> Result<(), String> {
-        let (roster, _) = self.roster.as_ref().ok_or("no confirmed roster")?;
-        let identity = self.identity.as_ref().ok_or("no setup identity")?;
-        let core = DkgCore::new(roster, identity)?;
+    ) -> Result<(), StepError> {
+        let mut share = None;
+        let outcome = self.progress_setup(setup, inputs, &mut share);
+        if let Some(share) = share {
+            self.install(share);
+        }
+        outcome
+    }
+
+    fn progress_setup(
+        &self,
+        setup: &mut SetupCheckpoint,
+        inputs: &[DkgInput],
+        share: &mut Option<InstalledShare>,
+    ) -> Result<(), StepError> {
+        // Before the share exists a failure is final; after it, the saved setup is kept.
+        let fail = |state: &SetupCheckpoint, error: String| {
+            if holds_share(state) {
+                StepError::Kept(error)
+            } else {
+                StepError::Abort(error)
+            }
+        };
+        let (roster, _) = self
+            .roster
+            .as_ref()
+            .ok_or_else(|| fail(setup, "no confirmed roster".into()))?;
+        let identity = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| fail(setup, "no setup identity".into()))?;
+        let core = DkgCore::new(roster, identity).map_err(|e| fail(setup, e))?;
         let own = self.member_id;
-        let vault = roster.vault;
+        if holds_share(setup) && self.sealed_share.is_none() {
+            // A write of the share file failed after its setup was saved: finish it now.
+            *share = Some(self.restore_share(&core, &setup.core).map_err(|e| fail(setup, e))?);
+        }
         if setup.core.phase() == DkgPhase::Empty {
-            let (state, outgoing) = core.start()?;
+            let (state, outgoing) = core.start().map_err(|e| fail(setup, e))?;
             let mut next = setup.duplicate();
             next.core = state;
             next.outgoing = released(&outgoing, own);
-            self.save_setup(&next).map_err(|e| e.to_string())?;
+            self.save_setup(&next).map_err(|e| fail(setup, e.to_string()))?;
             *setup = next;
         }
         let mut next = setup.duplicate();
+        let mut refused = Vec::new();
         for input in inputs {
-            let wire = DkgWire::parse(input.bytes.clone())?;
-            if wire.sender() != input.sender || !roster.members.contains_key(&wire.sender()) {
-                return Err("setup message sender does not match its tag".into());
-            }
-            if wire.sender() == own {
-                if !next.outgoing.contains(&input.bytes) {
-                    return Err("a setup message claims to be ours but is not".into());
+            if let Err(error) = accept_input(roster, identity, own, &mut next, input) {
+                if !holds_share(&next) {
+                    return Err(StepError::Abort(error));
                 }
-                continue;
-            }
-            if wire.kind() == DkgWireKind::Round2 && wire.recipient() != Some(own) {
-                return Err("round-two envelope addressed to another member".into());
-            }
-            let peer = &roster.members[&wire.sender()];
-            let past = match wire.kind() {
-                DkgWireKind::Round1 => next.core.round1().get(&wire.sender()),
-                DkgWireKind::Round2 => next.core.round2().get(&wire.sender()),
-                DkgWireKind::Certificate => next.core.certificates().get(&wire.sender()),
-                DkgWireKind::BackupReceipt => next.backups.get(&wire.sender()),
-            };
-            if let Some(saved) = past {
-                if saved != &input.bytes {
-                    return Err("a member sent two different messages for one phase".into());
-                }
-                continue;
-            }
-            match wire.kind() {
-                DkgWireKind::Round1 => {
-                    identity.verify_round1(peer, &vault, &input.bytes)?;
-                }
-                DkgWireKind::Certificate => {
-                    identity.verify_certificate(peer, &vault, &input.bytes)?;
-                }
-                DkgWireKind::BackupReceipt => {
-                    identity.verify_backup(peer, &vault, &input.bytes)?;
-                }
-                // Checked against our transcript when round two is consumed.
-                DkgWireKind::Round2 => {}
-            }
-            let key = (kind_code(wire.kind()), wire.sender());
-            match next.pending.get(&key) {
-                Some(saved) if saved != &input.bytes => {
-                    return Err("a member sent two different messages for one phase".into());
-                }
-                _ => {
-                    next.pending.insert(key, input.bytes.clone());
-                }
+                // One bad message must not cost a member the share it already holds.
+                refused.push(error);
             }
         }
         let peers: Vec<u16> = roster.members.keys().copied().filter(|id| *id != own).collect();
-        let mut share = None;
         loop {
             let Some(kind) = expected_kind(next.core.phase()) else {
                 break;
             };
             if kind == DkgWireKind::BackupReceipt {
-                let expected = core.backup_body(&next.core)?;
+                let expected = core.backup_body(&next.core).map_err(|e| fail(&next, e))?;
                 let receipts: Vec<(u16, Vec<u8>)> = next
                     .pending
                     .iter()
@@ -906,13 +920,16 @@ impl<SE: SecureElement> LocalSigner<SE> {
                     .map(|((_, sender), wire)| (*sender, wire.clone()))
                     .collect();
                 for (sender, wire) in receipts {
-                    if identity.verify_backup(&roster.members[&sender], &vault, &wire)?.as_slice()
-                        != expected
-                    {
-                        return Err("a member's backup receipt is for a different vault".into());
-                    }
                     next.pending.remove(&(kind_code(kind), sender));
-                    next.backups.insert(sender, wire);
+                    match identity.verify_backup(&roster.members[&sender], &roster.vault, &wire) {
+                        Ok(body) if body.as_slice() == expected => {
+                            next.backups.insert(sender, wire);
+                        }
+                        // Dropped, so the member's real receipt can still arrive.
+                        _ => refused.push(format!(
+                            "member {sender}'s backup receipt is for a different vault"
+                        )),
+                    }
                 }
                 break;
             }
@@ -927,28 +944,18 @@ impl<SE: SecureElement> LocalSigner<SE> {
             if records.len() != peers.len() {
                 break;
             }
-            let (state, outgoing) = core.advance(&next.core, &records)?;
+            let (state, outgoing) = match core.advance(&next.core, &records) {
+                Ok(advanced) => advanced,
+                Err(error) if holds_share(&next) => {
+                    // The certificates disagree. The vault never becomes ready, but the
+                    // share and the saved setup stay for the member to inspect.
+                    refused.push(error);
+                    break;
+                }
+                Err(error) => return Err(StepError::Abort(error)),
+            };
             for id in &peers {
                 next.pending.remove(&(kind_code(kind), *id));
-            }
-            if state.phase() == DkgPhase::Certificate {
-                // The share is born here. Save it before the certificate is released.
-                let completed = crate::distributed_setup::Completed::restore_checkpoint(
-                    &state.completed_checkpoint()?,
-                )?;
-                let key_package = Zeroizing::new(completed.key_package_bytes().to_vec());
-                let public = completed.public_package().to_vec();
-                let store = self.store.as_ref().ok_or("no data directory")?;
-                store.write(
-                    &self.se,
-                    FileKind::Share,
-                    0,
-                    &encode_share(&key_package, &public, state.vault_secret()),
-                )?;
-                share = Some(
-                    self.checked_share(&core, &state, &key_package, public, state.vault_secret(), 0)
-                        .map_err(|e| e.to_string())?,
-                );
             }
             next.core = state;
             // Keep earlier phases' messages: a peer may not have them yet when this
@@ -958,14 +965,112 @@ impl<SE: SecureElement> LocalSigner<SE> {
                     next.outgoing.push(wire);
                 }
             }
-            self.save_setup(&next).map_err(|e| e.to_string())?;
+            // The certificate-phase setup holds the share, so it is saved before the share
+            // file is written; `open` rebuilds a missing share file from it. Nothing is
+            // released until this step returns.
+            self.save_setup(&next).map_err(|e| fail(setup, e.to_string()))?;
+            *setup = next.duplicate();
+            if next.core.phase() == DkgPhase::Certificate {
+                *share = Some(self.restore_share(&core, &next.core).map_err(|e| fail(&next, e))?);
+            }
         }
-        self.save_setup(&next).map_err(|e| e.to_string())?;
-        if let Some(share) = share {
-            self.install(share);
-        }
+        self.save_setup(&next).map_err(|e| fail(setup, e.to_string()))?;
         *setup = next;
-        Ok(())
+        if refused.is_empty() {
+            Ok(())
+        } else {
+            Err(StepError::Kept(refused.join("; ")))
+        }
+    }
+
+    /// Write the share file from a certificate-phase setup and check it against that setup.
+    fn restore_share(&self, core: &DkgCore<'_>, state: &DkgState) -> Result<InstalledShare, String> {
+        let completed =
+            crate::distributed_setup::Completed::restore_checkpoint(&state.completed_checkpoint()?)?;
+        let key_package = Zeroizing::new(completed.key_package_bytes().to_vec());
+        let public = completed.public_package().to_vec();
+        let store = self.store.as_ref().ok_or("no data directory")?;
+        store.write(
+            &self.se,
+            FileKind::Share,
+            0,
+            &encode_share(&key_package, &public, state.vault_secret()),
+        )?;
+        self.checked_share(core, state, &key_package, public, state.vault_secret(), 0)
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// How a `dkg_step` failed.
+enum StepError {
+    /// Before the share exists: final, the setup is wiped.
+    Abort(String),
+    /// After the share exists: the bad messages are refused and the saved setup is kept.
+    Kept(String),
+}
+
+/// Whether the share has been born in this setup (certificate phase or later).
+fn holds_share(setup: &SetupCheckpoint) -> bool {
+    !setup.aborted && (setup.core.phase() as u8) >= DkgPhase::Certificate as u8
+}
+
+/// Check one tagged input and queue it as pending, or drop it as a repeat.
+fn accept_input(
+    roster: &ValidatedRoster,
+    identity: &Identity,
+    own: u16,
+    next: &mut SetupCheckpoint,
+    input: &DkgInput,
+) -> Result<(), String> {
+    let vault = roster.vault;
+    let wire = DkgWire::parse(input.bytes.clone())?;
+    if wire.sender() != input.sender || !roster.members.contains_key(&wire.sender()) {
+        return Err("setup message sender does not match its tag".into());
+    }
+    if wire.sender() == own {
+        if !next.outgoing.contains(&input.bytes) {
+            return Err("a setup message claims to be ours but is not".into());
+        }
+        return Ok(());
+    }
+    if wire.kind() == DkgWireKind::Round2 && wire.recipient() != Some(own) {
+        return Err("round-two envelope addressed to another member".into());
+    }
+    let peer = &roster.members[&wire.sender()];
+    let past = match wire.kind() {
+        DkgWireKind::Round1 => next.core.round1().get(&wire.sender()),
+        DkgWireKind::Round2 => next.core.round2().get(&wire.sender()),
+        DkgWireKind::Certificate => next.core.certificates().get(&wire.sender()),
+        DkgWireKind::BackupReceipt => next.backups.get(&wire.sender()),
+    };
+    if let Some(saved) = past {
+        if saved != &input.bytes {
+            return Err("a member sent two different messages for one phase".into());
+        }
+        return Ok(());
+    }
+    match wire.kind() {
+        DkgWireKind::Round1 => {
+            identity.verify_round1(peer, &vault, &input.bytes)?;
+        }
+        DkgWireKind::Certificate => {
+            identity.verify_certificate(peer, &vault, &input.bytes)?;
+        }
+        DkgWireKind::BackupReceipt => {
+            identity.verify_backup(peer, &vault, &input.bytes)?;
+        }
+        // Checked against our transcript when round two is consumed.
+        DkgWireKind::Round2 => {}
+    }
+    let key = (kind_code(wire.kind()), wire.sender());
+    match next.pending.get(&key) {
+        Some(saved) if saved != &input.bytes => {
+            Err("a member sent two different messages for one phase".into())
+        }
+        _ => {
+            next.pending.insert(key, input.bytes.clone());
+            Ok(())
+        }
     }
 }
 
@@ -1131,13 +1236,20 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
             self.setup = Some(setup);
             return Err(SignerError::SetupAborted("an earlier mismatch ended this setup".into()));
         }
-        if let Err(error) = self.advance_setup(&mut setup, in_msgs) {
-            // Any mismatch is final: wipe the setup's secrets and saved messages, never
-            // re-fetch and retry.
-            setup.wipe();
-            let _ = self.save_setup(&setup);
-            self.setup = Some(setup);
-            return Err(SignerError::SetupAborted(error));
+        match self.advance_setup(&mut setup, in_msgs) {
+            Ok(()) => {}
+            Err(StepError::Abort(error)) => {
+                // Any mismatch before the share exists is final: wipe the setup's secrets
+                // and saved messages, never re-fetch and retry.
+                setup.wipe();
+                let _ = self.save_setup(&setup);
+                self.setup = Some(setup);
+                return Err(SignerError::SetupAborted(error));
+            }
+            Err(StepError::Kept(error)) => {
+                self.setup = Some(setup);
+                return Err(SignerError::MessageRefused(error));
+            }
         }
         let wires = setup
             .outgoing

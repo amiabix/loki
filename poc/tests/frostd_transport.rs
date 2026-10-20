@@ -241,6 +241,7 @@ where
 fn setup_and_sign<T>(
     members_tx: Vec<(T, T::Channel)>,
     member_peers: Vec<Peer>,
+    coordinator_peer: Peer,
     coordinator: (T, T::Channel),
     lose_queues: impl Fn(),
 ) -> Vec<String>
@@ -282,7 +283,7 @@ where
     let mut backed_up = vec![false; usize::from(count)];
     for pass in 0..12 {
         for (m, (t, ch)) in members.iter_mut().zip(&members_tx) {
-            member_dkg_step(&mut m.signer, &m.session, &vault_ref, t, ch).unwrap();
+            member_dkg_step(&mut m.signer, &m.session, &vault_ref, t, ch, &coordinator_peer).unwrap();
             if !backed_up[usize::from(m.id - 1)] {
                 if let Ok(receipt) = m.signer.backup(&m.session) {
                     for wire in receipt {
@@ -473,7 +474,7 @@ fn new_signer_setup_and_signing_over_an_in_memory_relay() {
         })
         .collect();
     let lose = relay.clone();
-    setup_and_sign(members, member_peers, (coordinator, ()), move || {
+    setup_and_sign(members, member_peers, login[3].peer(), (coordinator, ()), move || {
         lose.drop_member_queues()
     });
     audit(&relay.tape());
@@ -494,6 +495,7 @@ fn new_signer_setup_and_signing_over_real_frostd() {
     };
     let login: Vec<FrostdLoginKey> = (0..4).map(|_| FrostdLoginKey::generate()).collect();
     let member_peers: Vec<Peer> = login[..3].iter().map(FrostdLoginKey::peer).collect();
+    let coordinator_peer = login[3].peer();
     let mut login = login.into_iter();
     let members: Vec<FrostdTransport> = (0..3)
         .map(|_| FrostdTransport::new(&url, login.next().unwrap()).expect("member login"))
@@ -510,6 +512,12 @@ fn new_signer_setup_and_signing_over_real_frostd() {
         })
         .collect();
     // frostd keeps queued messages across a coordinator restart, so nothing is lost.
-    let addresses = setup_and_sign(members, member_peers, (coordinator, channel), || {});
+    let addresses = setup_and_sign(
+        members,
+        member_peers,
+        coordinator_peer,
+        (coordinator, channel),
+        || {},
+    );
     eprintln!("[WS3] v2 DKG and 2-of-3 signing over frostd at {url}: vault {}", addresses[0]);
 }

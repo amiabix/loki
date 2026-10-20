@@ -180,8 +180,9 @@ pub trait Signer {
     /// this member's current outgoing messages. Each step saves its state, including the
     /// exact outgoing bytes, before returning them, and a repeated call returns the saved
     /// bytes again. The share is born INSIDE the signer and sealed before the certificate
-    /// is released; it is never returned. Any mismatch is final: the setup aborts and its
-    /// secrets are wiped.
+    /// is released; it is never returned. Before the share exists any mismatch is final:
+    /// the setup aborts and its secrets are wiped. After it, a bad message is refused and
+    /// the saved setup and share are kept.
     fn dkg_step(
         &mut self,
         session: &Session,

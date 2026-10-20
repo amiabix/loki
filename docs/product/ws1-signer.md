@@ -95,7 +95,9 @@ The signer wraps `frost-client`'s participant functionality (WS4) and performs:
      round-one equivocation is caught. The fresh key is erased once the certificate
      state is saved; the group key is normalized to even Y.
    - Every outgoing message is saved before release and resent byte-identically after
-     a restart. Any mismatch is final: the setup is wiped and never retried.
+     a restart. Before the share exists any mismatch is final: the setup is wiped
+     and never retried. Once the share exists a bad message is only refused, so one
+     faulty or malicious member cannot destroy the shares the others already hold.
    - The share is sealed before the certificate is released. The vault is ready only
      after every member's backup receipt.
 2. **Signing round 1**: generate single-use `SigningNonces`, emit `SigningCommitments`

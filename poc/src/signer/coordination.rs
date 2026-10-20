@@ -170,14 +170,18 @@ where
 }
 
 /// Member side of one setup pass: hand the signer what the coordinator relayed, then
-/// send every setup message the signer returns to the coordinator. Returns how many
-/// messages it sent.
+/// send every setup message the signer returns to the coordinator. Only messages from
+/// `coordinator` are taken: frostd lets any session participant write to a member, and
+/// the coordinator's relay log is what checks each wire against its real sender. If the
+/// signer refuses an input it still re-sends what it has saved, then the refusal is
+/// returned. Returns how many messages it sent.
 pub fn member_dkg_step<S, T>(
     signer: &mut S,
     session: &Session,
     vault: &VaultRef,
     transport: &T,
     channel: &T::Channel,
+    coordinator: &Peer,
 ) -> Result<usize, String>
 where
     S: Signer,
@@ -189,18 +193,26 @@ where
         .recv(channel, false)
         .map_err(|e| format!("recv: {e}"))?
         .into_iter()
-        .map(|incoming| DkgInput::from_relay(incoming.message))
-        .collect::<Result<Vec<_>, _>>()?;
-    let wires = signer
-        .dkg_step(session, vault, &inputs)
-        .map_err(|e| format!("dkg_step: {e}"))?;
+        .filter(|incoming| incoming.from == *coordinator)
+        .filter_map(|incoming| DkgInput::from_relay(incoming.message).ok())
+        .collect::<Vec<_>>();
+    let (wires, refused) = match signer.dkg_step(session, vault, &inputs) {
+        Ok(wires) => (wires, None),
+        Err(error) => match signer.dkg_step(session, vault, &[]) {
+            Ok(wires) => (wires, Some(error)),
+            Err(_) => return Err(format!("dkg_step: {error}")),
+        },
+    };
     let sent = wires.len();
     for wire in wires {
         transport
             .send(channel, &[], &Outbound::Dkg(wire))
             .map_err(|e| format!("send: {e}"))?;
     }
-    Ok(sent)
+    match refused {
+        Some(error) => Err(format!("dkg_step: {error}")),
+        None => Ok(sent),
+    }
 }
 
 /// Coordinator side of one setup pass: log each wire a member sent, then forward it to
