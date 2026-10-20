@@ -20,6 +20,8 @@ pub mod coordination;
 pub mod local;
 pub mod nonce;
 pub mod secure_element;
+#[cfg(all(feature = "apple-enclave", target_os = "macos"))]
+pub mod secure_element_apple;
 pub mod wysiwys;
 
 use crate::signer::wysiwys::PaymentView;
