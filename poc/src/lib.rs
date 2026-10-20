@@ -19,6 +19,7 @@ pub mod candidate;
 mod coordinator;
 pub mod coordinator_boundary;
 pub mod distributed_setup;
+pub mod dkg_core;
 #[cfg(all(feature = "apple-enclave", target_os = "macos"))]
 pub mod enclave_ffi;
 pub mod intent;
@@ -34,7 +35,10 @@ pub mod refresh;
 // by the audited ZF `frostd` relay via `transport::FrostdTransport` (ws3 §2, ws4 §4).
 // It is already behind the off-by-default `relay-communication` feature and kept only so
 // the old flow still compiles during migration; the product build routes DKG + signing
-// messages through `transport` instead. The thin roster/admission layer (`setup_ceremony`,
+// messages through `transport` instead (typed `Outbound` sends; the signer's v2 DKG wires
+// via the `signer::coordination` drivers and the coordinator's `RelayLog`). The old flow
+// is on the same v2 round two and setup version 2, so it never sends round two under the
+// long-lived identity keys. The thin roster/admission layer (`setup_ceremony`,
 // invitations, the `VaultCertificate`) stays — that is what frostd does NOT provide
 // (ws3 §4). Do not add new callers of the modules below.
 #[cfg(feature = "relay-communication")]

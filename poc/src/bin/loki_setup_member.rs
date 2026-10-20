@@ -141,8 +141,8 @@ fn identity(args: &[String]) -> Result<(), String> {
         return Err("identity already exists".into());
     }
     let id: u16 = args[1].parse().map_err(|_| "invalid member id")?;
-    if !(1..=4).contains(&id) {
-        return Err("member id must be 1, 2, 3 or 4".into());
+    if !(1..=loki_poc::member_state::MAX_MEMBERS).contains(&id) {
+        return Err("member id must be 1 to 16".into());
     }
     let secret = Identity::new(id);
     dir.write_sealed(
@@ -282,7 +282,11 @@ fn state_address(state: &serde_json::Value) -> Result<String, String> {
     let key = frost::keys::KeyPackage::deserialize(&key_bytes)
         .map_err(|e| format!("invalid member share: {e}"))?;
     let (threshold, members) = state_policy(state)?;
-    if !matches!((threshold, members), (2, 3) | (2, 4) | (3, 4)) {
+    if !u16::try_from(threshold)
+        .ok()
+        .zip(usize::try_from(members).ok())
+        .is_some_and(|(t, n)| loki_poc::member_state::valid_policy(t, n))
+    {
         return Err("unsupported vault policy".into());
     }
     let id = frost::Identifier::try_from(state_identity(state)?.public().id)

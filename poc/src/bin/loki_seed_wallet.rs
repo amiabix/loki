@@ -41,7 +41,7 @@ fn challenge(raw: &[u8], fresh: bool) -> Result<Value, String> {
         || value["network"] != "regtest"
         || value["member"]
             .as_u64()
-            .is_none_or(|id| !(1..=4).contains(&id))
+            .is_none_or(|id| !(1..=u64::from(loki_poc::member_state::MAX_MEMBERS)).contains(&id))
     {
         return Err("unsupported account-link challenge".into());
     }

@@ -6,9 +6,12 @@ Parent: `00-architecture.md`. Upholds invariant 4 (only public data crosses).
 
 ## 1. Goal
 
-Move the public protocol messages (DKG rounds, signing commitments, signing packages,
-signature shares) between the coordinator and the signers, with authentication,
-confidentiality, and delivery receipts — **without** any component learning a share.
+Move the public protocol messages (the signer's DKG wires, signing commitments, the
+candidate PCZT, signing packages, randomizer seeds, signature shares) between the
+coordinator and the signers, with authentication, confidentiality, and delivery
+receipts — **without** any component learning a share. DKG round two crosses only as
+v2 envelopes sealed under one-setup fresh keys (ws1 §6), so recorded traffic stays
+closed even if a member's long-lived identity keys leak later.
 Retire Loki's bespoke relay/admission/courier stack in favor of the **audited
 `frostd`** relay, keeping an optional **serverless Zcash-memo** transport as a
 censorship-resistant alternative.
@@ -55,16 +58,23 @@ This layer carries **no secrets** and can be a small service or peer-to-peer ove
 ## 5. Transport interface (stable across frostd / memo)
 
 ```
-open(vaultRef, memberIdentity) -> channel      # authenticated, encrypted
-send(channel, to, publicMessage)               # opaque bytes; relay sees ciphertext
-recv(channel) -> [(from, publicMessage, receipt)]
+open(peers, messageCount) -> channel           # coordinator; logged in with a dedicated frostd login key
+join(session) -> channel                       # participant
+send(channel, to, Outbound)                    # typed: Dkg(DkgWire) | Commitments | Candidate | Package | RandomizerSeed | Share
+recv(channel, asCoordinator) -> [(from, bytes)]
 close(channel)
 ```
 
-Messages are already end-to-end authenticated+encrypted between members (reuse Loki's
-`setup_transport` authenticated-sealed-message model); the relay is untrusted for
-confidentiality and integrity, trusted only for best-effort delivery. Receipts support
-the existing relay-receipt rules in `signing_session`.
+`send` takes only an `Outbound` (`poc/src/transport.rs`), so raw bytes — a plaintext
+round-two package, a share, a nonce — do not compile as a payload; `DkgWire` and
+`CandidatePczt` are made only by the signer. Each app logs in to frostd with its own
+`FrostdLoginKey`, not with the member's setup encryption key. The DKG wires are
+authenticated end to end (signed round one, certificates and receipts; round-two
+envelopes signed and sealed to the recipient), so the relay is untrusted for
+confidentiality and integrity, trusted only for best-effort delivery. During setup the
+members send to the coordinator, which records each wire in its `RelayLog` before
+forwarding it, redelivers from the log after a restart, and deletes the log once every
+member's backup receipt has been relayed (the vault is active).
 
 ## 6. Security requirements
 
@@ -72,7 +82,11 @@ the existing relay-receipt rules in `signing_session`.
   auth+encryption between members defends confidentiality/integrity; sequence numbers +
   receipts defend against replay/reorder for the signing protocol.
 - No share, nonce, viewing key, or spend authorization is ever a message payload
-  (enforced by WS1's API shape — those are never produced for transport).
+  (enforced by WS1's API shape and the typed `Outbound` — those are never produced for
+  transport, and raw bytes cannot be sent).
+- The relay still sees who sends to whom, when, and each message's type, and payment
+  transactions travel in clear between coordinator and signers; transport privacy is a
+  follow-up.
 - TLS everywhere for `frostd`; pin/verify server identity for self-hosted instances.
 
 ## 7. Acceptance criteria
@@ -84,7 +98,10 @@ the existing relay-receipt rules in `signing_session`.
    wrong signature or a stranded nonce (ties to ws1 §8); the protocol detects and
    recovers or safely aborts.
 3. Capture `frostd` traffic and confirm no secret material appears (only public
-   protocol messages / ciphertext).
+   protocol messages / ciphertext), and that recorded setup traffic cannot rebuild the
+   group key even with every member's long-lived identity keys (done:
+   `tests/frostd_transport.rs` and
+   `recorded_relay_traffic_cannot_rebuild_the_group_key`; ADOPTION §5.3).
 4. (Stretch) the same signing flow completes over the memo transport on testnet.
 
 ## 8. Dependencies

@@ -82,9 +82,24 @@ Biometric/passphrase unlock
 ## 6. FROST responsibilities (ZF participant role)
 
 The signer wraps `frost-client`'s participant functionality (WS4) and performs:
-1. **DKG**: round 1/2/3 as a participant; outputs this member's `KeyPackage` (the
-   share) + the shared `PublicKeyPackage` (group verifying key). Only public round
-   messages leave the signer.
+1. **DKG** (v2, shared core `poc/src/dkg_core.rs`, any 2 ≤ t < n ≤ 16): round 1/2/3
+   as a participant; outputs this member's `KeyPackage` (the share) + the shared
+   `PublicKeyPackage` (group verifying key) + the vault secret `vs`.
+   - Before anything is generated, the roster passes the shared gate (vault, policy,
+     network, distinct non-weak keys, own identity, `setup_version` 2) and the member
+     compares a 24-digit roster code on the device. Nothing is saved on a mismatch,
+     cancel or timeout.
+   - Round one is signed and carries a commitment to the member's contribution and a
+     one-setup fresh X25519 key. Round two is sealed per recipient in a v2 envelope
+     under the two fresh keys and bound to the round-one transcript, so FROST
+     round-one equivocation is caught. The fresh key is erased once the certificate
+     state is saved; the group key is normalized to even Y.
+   - Every outgoing message is saved before release and resent byte-identically after
+     a restart. Before the share exists any mismatch is final: the setup is wiped
+     and never retried. Once the share exists a bad message is only refused, so one
+     faulty or malicious member cannot destroy the shares the others already hold.
+   - The share is sealed before the certificate is released. The vault is ready only
+     after every member's backup receipt.
 2. **Signing round 1**: generate single-use `SigningNonces`, emit `SigningCommitments`
    (public). Persist nonce state crash-safely **before** emitting (§8).
 3. **Signing round 2 (rerandomized)**: given the coordinator's `SigningPackage` +
@@ -104,8 +119,10 @@ the primary audit surface for the coordinator boundary.
 ```
 connect(origin, network, challenge) -> session            # shows origin+network, biometric, returns session + member identity (public)
 listVaults(session)                 -> [VaultRef]          # names, slots, setup status (public metadata only)
-dkgStep(session, vaultRef, inMsgs)  -> outMsgs             # advances DKG; persists share internally on completion
-backupStatus / backupCreate / backupVerify                 # member proves own backup; publishes signed confirmation only
+dkgBegin(session, roster)           -> VaultRef            # roster gate, then the on-device roster code; saves the confirmed roster
+dkgStep(session, vaultRef, inMsgs)  -> [DkgWire]           # sender-tagged inputs; returns every saved setup message (rounds, certificate, receipts)
+backup(session)                     -> [DkgWire]           # saves and reloads the backup on the device; returns only the signed receipt
+releaseAddress(session)             -> ReleasedAddress     # once ready, over a session the member approved on-device; address only
 signCommit(session, candidateRef)   -> SigningCommitments  # round 1; after on-device "prepare" ack
 signApprove(session, candidateRef, pczt, signingPackage, randomizer)
                                     -> SignatureShare | REFUSED
@@ -122,7 +139,9 @@ Rules enforced inside `signApprove`, not by the caller:
 - A refusal is a member decision, not a protocol veto (`WALLET_BUILD.md` §8).
 
 The API exposes **no** method that returns a share, a nonce, a viewing key, or a
-spend authorization. There is no "export key" path except the member's own guarded
+spend authorization. Its return types are pinned by the type guard
+(`known_signer_return_types_are_public_artifacts`): `DkgWire`, `ReleasedAddress` and
+`CandidatePczt` can be made only inside the crate. There is no "export key" path except the member's own guarded
 backup flow.
 
 ## 8. Nonce safety (crash-safe approval)

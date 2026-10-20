@@ -138,11 +138,38 @@ fn setup_storage_quota_is_per_relay_and_purpose() {
     assert!(store.apply(&state, None, 2592101).is_ok());
 }
 
+/// Rewrite a current root's schema back to the version-1 bounds (at most 4 members).
+fn narrow_to_version_one(external: &rusqlite::Connection) {
+    let version: i64 = external
+        .query_row("PRAGMA schema_version", [], |r| r.get(0))
+        .unwrap();
+    external.execute_batch("PRAGMA writable_schema=ON;").unwrap();
+    for (narrow, wide) in [
+        ("CHECK(member_count IN(3,4))", "CHECK(member_count BETWEEN 3 AND 16)"),
+        ("CHECK(slot BETWEEN 2 AND 4)", "CHECK(slot BETWEEN 2 AND 16)"),
+        ("CHECK(slot BETWEEN 1 AND 4)", "CHECK(slot BETWEEN 1 AND 16)"),
+    ] {
+        external
+            .execute(
+                "UPDATE sqlite_master SET sql=replace(sql,?1,?2) WHERE type='table'",
+                [wide, narrow],
+            )
+            .unwrap();
+    }
+    external
+        .execute_batch(&format!(
+            "PRAGMA schema_version={}; PRAGMA writable_schema=OFF; PRAGMA user_version=1;",
+            version + 1
+        ))
+        .unwrap();
+}
+
 #[test]
 fn terminal_notice_schema_migrates_only_unversioned_legacy_roots() {
     let db = OwnedDb::new();
     drop(db.open());
     let external = rusqlite::Connection::open(db.root.join("admission.sqlite")).unwrap();
+    narrow_to_version_one(&external);
     external
         .execute_batch("DROP TABLE terminal_notices; PRAGMA user_version=0;")
         .unwrap();
@@ -150,7 +177,7 @@ fn terminal_notice_schema_migrates_only_unversioned_legacy_roots() {
     let version: u64 = external
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 1);
+    assert_eq!(version, 2);
     external
         .execute_batch("DROP TABLE terminal_notices;")
         .unwrap();
@@ -167,6 +194,53 @@ fn terminal_notice_schema_migrates_only_unversioned_legacy_roots() {
         ),
         Err(AdmissionError::Storage)
     ));
+}
+
+/// A version-1 root (bounded at 4 members) keeps its ceremonies and accepts larger
+/// vaults after the in-place widening.
+#[test]
+fn version_one_root_widens_in_place_for_larger_vaults() {
+    let db = OwnedDb::new();
+    let grant = grant(3, 120);
+    {
+        let mut store = db.open();
+        store
+            .apply(&create(91, [91; 32], 4, &grant), Some(&grant), 100)
+            .unwrap();
+    }
+    let external = rusqlite::Connection::open(db.root.join("admission.sqlite")).unwrap();
+    narrow_to_version_one(&external);
+    assert!(external
+        .execute(
+            "UPDATE ceremonies SET member_count=5 WHERE id=?1",
+            [[91u8; 32].as_slice()],
+        )
+        .is_err());
+    let mut store = db.open();
+    let version: u64 = external
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 2);
+    let kept: u16 = external
+        .query_row(
+            "SELECT member_count FROM ceremonies WHERE id=?1",
+            [[91u8; 32].as_slice()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(kept, 4);
+    store
+        .apply(&create(92, [92; 32], 16, &grant), Some(&grant), 100)
+        .unwrap();
+    for slot in 2..=16 {
+        store
+            .apply(
+                &claim(slot as u8 + 100, [92; 32], slot, slot as u8),
+                Some(&[slot as u8; 32]),
+                101,
+            )
+            .unwrap();
+    }
 }
 
 #[test]

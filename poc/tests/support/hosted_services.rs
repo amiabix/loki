@@ -280,7 +280,7 @@ impl HostedServices {
                         .to_vec(),
                 ),
             ]),
-            Value::Array(vec![Value::Integer(1.into())]),
+            Value::Array(vec![Value::Integer(2.into())]),
             Value::Array(
                 [
                     first_claim_seconds,

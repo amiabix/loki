@@ -63,10 +63,50 @@ impl SoftwareSecureElement {
         }
     }
 
+    /// The persistent software KEK for a signer data directory (A5). The first call for a
+    /// directory draws a random KEK and stores it once in `kek.sealed`, encrypted under the
+    /// member passphrase (`MemberDir::write_sealed`: Argon2id, write-once, fsync'd); later
+    /// calls reopen it. A Secure Enclave backend replaces this behind the same trait.
+    pub fn persistent(dir: &std::path::Path, passphrase: &str) -> Result<Self, String> {
+        if !dir.join(KEK_FILE).exists() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(dir)
+                    .map_err(|e| format!("signer directory: {e}"))?;
+            }
+            #[cfg(not(unix))]
+            std::fs::create_dir_all(dir).map_err(|e| format!("signer directory: {e}"))?;
+        }
+        let store = crate::state::MemberDir::open(dir, "");
+        if !dir.join(KEK_FILE).exists() {
+            let mut kek = Zeroizing::new([0u8; 32]);
+            OsRng.fill_bytes(&mut *kek);
+            store
+                .write_sealed(KEK_FILE, &*kek, passphrase)
+                .map_err(|e| format!("signer KEK: {e}"))?;
+        }
+        let raw = Zeroizing::new(
+            store
+                .read_sealed(KEK_FILE, passphrase)
+                .map_err(|_| "signer KEK: wrong passphrase or tampered file".to_string())?,
+        );
+        let kek: [u8; 32] = raw
+            .as_slice()
+            .try_into()
+            .map_err(|_| "signer KEK is not 32 bytes".to_string())?;
+        Ok(Self::from_kek(kek))
+    }
+
     fn cipher(&self) -> XChaCha20Poly1305 {
         XChaCha20Poly1305::new_from_slice(&*self.kek).expect("32-byte KEK")
     }
 }
+
+const KEK_FILE: &str = "kek.sealed";
 
 const WRAP_AAD: &[u8] = b"Loki_signer_dek_wrap_v1";
 
@@ -114,6 +154,16 @@ impl SecureElement for SoftwareSecureElement {
 const SHARE_MAGIC: &[u8; 8] = b"LOKISHR1";
 const SHARE_AAD: &[u8] = b"Loki_signer_share_seal_v1";
 
+/// The associated data binding one signer file to its type, vault and member.
+pub fn file_binding(kind: &str, vault: &[u8; 32], member: u16) -> Vec<u8> {
+    let mut out = b"Loki_signer_file_v2".to_vec();
+    out.push(kind.len() as u8);
+    out.extend_from_slice(kind.as_bytes());
+    out.extend_from_slice(vault);
+    out.extend_from_slice(&member.to_be_bytes());
+    out
+}
+
 /// A FROST share at rest: ciphertext under a DEK, DEK wrapped by the secure element.
 /// The blob written to disk is `magic || backup_epoch || wrapped_dek || nonce || ct`.
 /// There is no path that returns the plaintext share except [`SealedShare::open`],
@@ -135,6 +185,26 @@ impl SealedShare {
         backup_epoch: u64,
         share: &[u8],
     ) -> Result<Self, String> {
+        Self::seal_with_aad(se, backup_epoch, share, SHARE_AAD)
+    }
+
+    /// Seal under a caller-supplied binding, so the blob opens only for the same binding.
+    /// Signer storage binds each file to its type, vault and member ([`file_binding`]).
+    pub fn seal_bound(
+        se: &impl SecureElement,
+        backup_epoch: u64,
+        plaintext: &[u8],
+        binding: &[u8],
+    ) -> Result<Self, String> {
+        Self::seal_with_aad(se, backup_epoch, plaintext, binding)
+    }
+
+    fn seal_with_aad(
+        se: &impl SecureElement,
+        backup_epoch: u64,
+        share: &[u8],
+        aad: &[u8],
+    ) -> Result<Self, String> {
         let mut dek = Zeroizing::new([0u8; 32]);
         OsRng.fill_bytes(&mut *dek);
         let wrapped_dek = se.wrap_dek(&dek)?;
@@ -144,10 +214,7 @@ impl SealedShare {
         let ciphertext = cipher
             .encrypt(
                 XNonce::from_slice(&nonce),
-                Payload {
-                    msg: share,
-                    aad: SHARE_AAD,
-                },
+                Payload { msg: share, aad },
             )
             .map_err(|_| "share seal failed".to_string())?;
         Ok(Self {
@@ -160,6 +227,20 @@ impl SealedShare {
 
     /// Unwrap the DEK via `se`, then AEAD-decrypt the share. Caller zeroizes the result.
     pub fn open(&self, se: &impl SecureElement) -> Result<Zeroizing<Vec<u8>>, String> {
+        self.open_with_aad(se, SHARE_AAD)
+    }
+
+    /// Open a blob sealed with [`SealedShare::seal_bound`] under the same `binding`. A blob
+    /// moved to another file type, vault or member fails authentication.
+    pub fn open_bound(
+        &self,
+        se: &impl SecureElement,
+        binding: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, String> {
+        self.open_with_aad(se, binding)
+    }
+
+    fn open_with_aad(&self, se: &impl SecureElement, aad: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
         let dek = se.unwrap_dek(&self.wrapped_dek)?;
         let cipher = XChaCha20Poly1305::new_from_slice(&*dek).expect("32-byte DEK");
         let plain = cipher
@@ -167,7 +248,7 @@ impl SealedShare {
                 XNonce::from_slice(&self.nonce),
                 Payload {
                     msg: &self.ciphertext,
-                    aad: SHARE_AAD,
+                    aad,
                 },
             )
             .map_err(|_| "share open failed (wrong element or tampered blob)".to_string())?;

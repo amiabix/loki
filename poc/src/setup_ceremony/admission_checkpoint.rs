@@ -418,7 +418,7 @@ mod tests {
                     Value::Bytes(origin.as_bytes().to_vec()),
                     Value::Bytes(admission_key.verifying_key().to_bytes().to_vec()),
                 ]),
-                Value::Array(vec![Value::Integer(1.into())]),
+                Value::Array(vec![Value::Integer(2.into())]),
                 Value::Array(
                     [86400u64, 2592000, 1048576, 67108864, 2, 1, 60]
                         .into_iter()

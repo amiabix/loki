@@ -63,6 +63,16 @@ and refuses mainnet (release boundary).
 
 ## WS7 — General t-of-n (de-hardcode) — FIRST task after round 2 merges
 
+> **Status: pulled into the DKG round-two fix (v2).** Every policy with 2 ≤ t < n ≤ 16
+> is accepted on both paths: the shared roster gate and parser, setup identities and
+> signing-session recipients, the hosted engine and journal, the relay protocol,
+> admission and client stores (CHECK constraints widened in place for existing
+> databases), setup relay policies and invitations, payment manifests (any `t`
+> signers), and the member CLIs. DKG plus signing is tested at (2,3), (3,5) and
+> (15,16) on the hosted engine and the new signer, and 2-of-5 runs over the real relay
+> and admission processes. The testnet gate below (a funded 3-of-5 payment) is still
+> open.
+
 Non-negotiable: Loki must be general **t-of-n**, not stuck at 2-of-3. The crypto was
 never the limit (`frost::keys::dkg::part1` + `zf_spine` are general); three Loki
 scaffolding limits must die:

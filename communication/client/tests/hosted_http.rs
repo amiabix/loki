@@ -113,7 +113,7 @@ fn bundle(signer: &SigningKey, change: impl FnOnce(&mut Vec<Value>)) -> Vec<u8> 
                     .to_vec(),
             ),
         ]),
-        Value::Array(vec![Value::Integer(1.into())]),
+        Value::Array(vec![Value::Integer(2.into())]),
         Value::Array(vec![
             Value::Integer(86400.into()),
             Value::Integer(2592000.into()),
@@ -146,7 +146,7 @@ fn operator_bundle_trust_and_routes() {
     let config = OperatorSet::verify(&raw, &signer.verifying_key().to_bytes()).unwrap();
     assert_eq!(config.relay_routes().len(), 3);
     assert_eq!(config.admission_origin(), "https://admission.example");
-    assert_eq!(config.setup_versions(), &[1]);
+    assert_eq!(config.setup_versions(), &[2]);
     assert!(OperatorSet::verify(
         &raw,
         &SigningKey::from_bytes(&[10; 32]).verifying_key().to_bytes()
@@ -179,7 +179,7 @@ fn operator_bundle_rejects_unusable_authenticated_config() {
                     admission[0] = Value::Bytes(b"http://127.0.0.1:8000".to_vec());
                 }
             }
-            4 => fields[3] = Value::Array(vec![Value::Integer(2.into())]),
+            4 => fields[3] = Value::Array(vec![Value::Integer(1.into())]),
             5 => {
                 if let Value::Array(limits) = &mut fields[4] {
                     limits[2] = Value::Integer(1048577.into());
