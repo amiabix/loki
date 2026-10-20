@@ -25,6 +25,7 @@ const screens = [
 let selectedVault = null;      // vault id the propose/approve screens act on
 let reviewToken = null;        // WYSIWYS review_token for the approval screen
 let reviewAttempt = null;
+let setupViewVersion = 0;
 
 async function api(path, body) {
   if (!token) throw new Error("Open the private local app link printed by the server (ends in /ui#…).");
@@ -73,6 +74,7 @@ function clearSetupInputs() {
 }
 
 function show(id) {
+  setupViewVersion++;
   if (id !== "setup") clearSetupInputs();
   document.querySelectorAll("[data-screen]").forEach((s) => {
     s.classList.toggle("hidden", s.dataset.screen !== id);
@@ -101,7 +103,7 @@ async function fillVaultSelect(sel, after) {
   for (const v of vaults) sel.appendChild(new Option(v.name || v.vault, v.vault));
   if (selectedVault && vaults.some((v) => v.vault === selectedVault)) sel.value = selectedVault;
   else selectedVault = sel.value;
-  sel.onchange = () => { selectedVault = sel.value; if (after) after(); };
+  sel.onchange = () => { setupViewVersion++; selectedVault = sel.value; if (after) after(); };
   return vaults;
 }
 
@@ -375,21 +377,28 @@ async function setupAgree() {
 
 async function setupBackup() {
   const out = $("setup-backup-out");
+  const vault = selectedVault, view = setupViewVersion;
   try {
-    const result = await api("backup", { vault: selectedVault });
+    const result = await api("backup", { vault });
+    if (vault !== selectedVault || view !== setupViewVersion) return;
     $("setup-words").textContent = result.words;
     flash(out, "Words revealed. Write them down, then prove restore to confirm your backup.", "info");
-  } catch (error) { flash(out, error.message, "danger"); }
+  } catch (error) { if (vault === selectedVault && view === setupViewVersion) flash(out, error.message, "danger"); }
 }
 
 async function setupVerify() {
   const out = $("setup-backup-out");
+  const vault = selectedVault, view = setupViewVersion;
   try {
-    await api("verify", { vault: selectedVault, words: $("setup-verify-words").value.trim() });
-    await api("activate", { vault: selectedVault });
+    await api("verify", { vault, words: $("setup-verify-words").value.trim() });
+    if (vault !== selectedVault || view !== setupViewVersion) return;
+    $("setup-words").textContent = "";
+    $("setup-verify-words").value = "";
+    await api("activate", { vault });
+    if (vault !== selectedVault || view !== setupViewVersion) return;
     flash(out, "Restore proven. Backup confirmed; the vault activates when every member confirms.", "accent");
     setTimeout(loadSetup, 800);
-  } catch (error) { flash(out, error.message, "danger"); }
+  } catch (error) { if (vault === selectedVault && view === setupViewVersion) flash(out, error.message, "danger"); }
 }
 
 async function setupFinalize() {

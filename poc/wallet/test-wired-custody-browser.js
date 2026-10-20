@@ -8,10 +8,19 @@ async function main() {
   const page = await browser.newPage({acceptDownloads: true});
   page.setDefaultTimeout(3000);
   const vault = 'a'.repeat(64);
+  const otherVault = 'c'.repeat(64);
   const fingerprint = 'b'.repeat(64);
   const posts = [];
   let phase = 'compare_roster';
   let finalCardCreated = false;
+  let holdBackup = false;
+  let backupStarted;
+  let signalBackup;
+  let releaseBackup;
+  let holdVerify = false;
+  let verifyStarted;
+  let signalVerify;
+  let releaseVerify;
   const finalCard = Buffer.from('LOKISEAL\x01test card');
   try {
     await page.route('http://127.0.0.1:18801/**', async route => {
@@ -27,11 +36,25 @@ async function main() {
       if (request.method() === 'POST') posts.push({path: url.pathname, body: request.postDataJSON()});
       let result = {};
       if (url.pathname === '/api/status') result = url.searchParams.has('vault')
-        ? {phase, vault, name: 'Treasury', slot: 1, threshold: 2, total_members: 3,
+        ? {phase, vault: url.searchParams.get('vault'), name: 'Treasury', slot: 1, threshold: 2, total_members: 3,
            fingerprint, confirmations: [], final_card_created: finalCardCreated,
            final_card_needs_words: false, profile: {name: 'Alice'}}
-        : {phase: 'home', profile: {name: 'Alice'}, vaults: [{vault, name: 'Treasury', slot: 1, threshold: 2, members: 3}]};
-      else if (url.pathname === '/api/finalize-backup') {
+        : {phase: 'home', profile: {name: 'Alice'}, vaults: [
+          {vault, name: 'Treasury', slot: 1, threshold: 2, members: 3},
+          {vault: otherVault, name: 'Operations', slot: 1, threshold: 2, members: 3},
+        ]};
+      else if (url.pathname === '/api/backup') {
+        if (holdBackup) {
+          signalBackup();
+          await new Promise(resolve => { releaseBackup = resolve; });
+        }
+        result = {words: `private words for ${request.postDataJSON().vault}`};
+      } else if (url.pathname === '/api/verify') {
+        if (holdVerify) {
+          signalVerify();
+          await new Promise(resolve => { releaseVerify = resolve; });
+        }
+      } else if (url.pathname === '/api/finalize-backup') {
         finalCardCreated = true;
         result = {created: true};
       } else if (url.pathname === '/api/final-card') result = {card: finalCard.toString('base64')};
@@ -87,6 +110,47 @@ async function main() {
     await page.waitForFunction(() => document.getElementById('setup-final-out').textContent.includes('Final recovery card checked'));
     assert.deepEqual(posts.filter(p => p.path === '/api/verify-final-backup').map(p => p.body),
       [{vault, words: 'valid private recovery words', card: finalCard.toString('base64')}]);
+
+    phase = 'back_up';
+    holdBackup = true;
+    backupStarted = new Promise(resolve => { signalBackup = resolve; });
+    const backupAfterLeave = page.evaluate(() => setupBackup());
+    await backupStarted;
+    await page.locator('[data-go="vaults"]').click();
+    releaseBackup();
+    await backupAfterLeave;
+    assert.equal(await page.locator('#setup-words').textContent(), '', 'late backup response must not reveal words after leaving setup');
+
+    await page.locator('[data-go="setup"]').click();
+    backupStarted = new Promise(resolve => { signalBackup = resolve; });
+    const backupAfterSwitch = page.evaluate(() => setupBackup());
+    await backupStarted;
+    await page.locator('#setup-vault').selectOption(otherVault);
+    releaseBackup();
+    await backupAfterSwitch;
+    assert.equal(await page.locator('#setup-words').textContent(), '', 'late backup response must not show another vault’s words');
+    holdBackup = false;
+
+    await page.locator('#setup-vault').selectOption(vault);
+    await page.locator('#setup-verify-words').fill('private words for first vault');
+    holdVerify = true;
+    verifyStarted = new Promise(resolve => { signalVerify = resolve; });
+    const verifyAfterSwitch = page.evaluate(() => setupVerify());
+    await verifyStarted;
+    await page.locator('#setup-vault').selectOption(otherVault);
+    releaseVerify();
+    await verifyAfterSwitch;
+    assert.equal(posts.filter(p => p.path === '/api/activate').length, 0,
+      'late verify response must not activate a different vault');
+    holdVerify = false;
+
+    await page.locator('#setup-vault').selectOption(vault);
+    await page.evaluate(() => setupBackup());
+    assert.equal(await page.locator('#setup-words').textContent(), `private words for ${vault}`);
+    await page.locator('#setup-verify-words').fill('private words for first vault');
+    await page.evaluate(() => setupVerify());
+    assert.equal(await page.locator('#setup-words').textContent(), '', 'verified words must be cleared immediately');
+    assert.deepEqual(posts.filter(p => p.path === '/api/activate').map(p => p.body), [{vault}]);
   } finally {
     await browser.close();
   }
