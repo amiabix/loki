@@ -2,6 +2,7 @@
 
 use crate::{
     intent::{ChangePolicy, Intent},
+    member_state::MAX_MEMBERS,
     network::VaultNetwork,
     signing_session::{AttemptId, SessionContext},
 };
@@ -55,7 +56,7 @@ pub fn manifest_pair(value: &Value) -> Result<[u16; 2], String> {
         u16::try_from(first).map_err(|_| "invalid payment pair")?,
         u16::try_from(second).map_err(|_| "invalid payment pair")?,
     ];
-    if pair[0] < 1 || pair[1] > 4 || pair[0] >= pair[1] {
+    if pair[0] < 1 || pair[1] > MAX_MEMBERS || pair[0] >= pair[1] {
         return Err("payment pair must be a supported sorted pair".into());
     }
     Ok(pair)
@@ -65,20 +66,27 @@ fn manifest_signers(value: &Value) -> Result<Vec<u16>, String> {
     match value["version"].as_u64() {
         Some(1) if value.get("signers").is_none() => Ok(manifest_pair(value)?.to_vec()),
         Some(2) if value.get("pair").is_none() => {
-            let ids = value["signers"].as_array().ok_or("payment needs three signer IDs")?;
-            if ids.len() != 3 {
-                return Err("payment needs three signer IDs".into());
+            // One signer per threshold share. Two signers use the version 1 pair, so a
+            // signer list has 3 to 15 IDs (a vault has at most 16 members).
+            let ids = value["signers"].as_array().ok_or("payment needs its signer IDs")?;
+            if !(3..usize::from(MAX_MEMBERS)).contains(&ids.len()) {
+                return Err("payment needs 3 to 15 signer IDs".into());
             }
-            ids.iter()
-                .map(|id| u16::try_from(id.as_u64().ok_or("invalid signer ID")?).map_err(|_| "invalid signer ID".into()))
-                .collect()
+            let ids: Vec<u16> = ids
+                .iter()
+                .map(|id| u16::try_from(id.as_u64().ok_or("invalid signer ID")?).map_err(|_| "invalid signer ID".to_string()))
+                .collect::<Result<_, _>>()?;
+            if ids.iter().any(|id| !(1..=MAX_MEMBERS).contains(id)) {
+                return Err("invalid signer ID".into());
+            }
+            Ok(ids)
         }
         _ => Err("unsupported payment signer format".into()),
     }
 }
 
 pub fn proposer_id(bytes: &[u8]) -> Result<u16, String> {
-    (1u16..=4)
+    (1u16..=MAX_MEMBERS)
         .find(|id| frost::Identifier::try_from(*id).is_ok_and(|member| member.serialize() == bytes))
         .ok_or_else(|| "payment proposer is not a vault member".into())
 }
@@ -296,6 +304,12 @@ mod tests {
         value["signers"] = json!([1, 2]);
         assert!(parse(&serde_json::to_vec(&value).unwrap()).is_err());
         value["signers"] = json!([1, 4, 2]);
+        assert!(parse(&serde_json::to_vec(&value).unwrap()).is_err());
+        // 15-of-16: fifteen signers parse and match the certified policy; sixteen do not.
+        value["signers"] = json!((1..=15).collect::<Vec<u16>>());
+        let (context, intent) = parse(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(validate_roster([9; 32], 15, 1..=16, &context, &intent).is_ok());
+        value["signers"] = json!((1..=16).collect::<Vec<u16>>());
         assert!(parse(&serde_json::to_vec(&value).unwrap()).is_err());
     }
 

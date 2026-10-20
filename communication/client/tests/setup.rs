@@ -36,7 +36,7 @@ fn bundle(signer: &SigningKey, change: impl FnOnce(&mut Vec<Value>)) -> Vec<u8> 
                     .to_vec(),
             ),
         ]),
-        Value::Array(vec![Value::Integer(1.into())]),
+        Value::Array(vec![Value::Integer(2.into())]),
         Value::Array(vec![
             Value::Integer(86400.into()),
             Value::Integer(2592000.into()),
@@ -93,7 +93,7 @@ fn roster(count: u16) -> Roster {
 }
 fn record(p: &SetupPolicy, r: &Roster) -> SetupRecord {
     SetupRecord {
-        version: 1,
+        version: loki_relay_protocol::setup::SETUP_VERSION,
         key: SetupKey {
             ceremony: p.ceremony,
             phase: SetupPhase::Round1,
@@ -255,7 +255,7 @@ fn receiver_rejects_signed_wrong_context_unsupported_and_cross_domain() {
     let body = record(&p, &r);
     let encoded = loki_relay_protocol::setup::encode_record(&body).unwrap();
     for (field, replacement) in [
-        (0, Value::Integer(2.into())),
+        (0, Value::Integer(1.into())),
         (1, Value::Bytes(vec![90; 32])),
         (2, Value::Text("mainnet".into())),
         (3, Value::Integer(1.into())),
@@ -316,7 +316,7 @@ fn private_invite_rejects_secret_policy_and_version_substitution() {
     for (field, replacement) in [
         (0, Value::Integer(2.into())),
         (3, Value::Integer(1.into())),
-        (4, Value::Integer(5.into())),
+        (4, Value::Integer(17.into())),
         (5, Value::Integer(1.into())),
         (8, Value::Bytes(vec![8; 32])),
     ] {

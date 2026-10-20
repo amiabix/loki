@@ -60,6 +60,48 @@ impl ProvisionIntent {
 }
 const SCHEMA: &str = include_str!("schema.sql");
 const TERMINAL_NOTICES: &str = include_str!("terminal_notices.sql");
+/// Databases made before vaults grew past 4 members (user_version 0 and 1) bound member
+/// counts and slots at 4. Each pair is (narrow, wide) and appears in exactly one table.
+const WIDENED: [(&str, &str); 3] = [
+    ("CHECK(member_count IN(3,4))", "CHECK(member_count BETWEEN 3 AND 16)"),
+    ("CHECK(slot BETWEEN 2 AND 4)", "CHECK(slot BETWEEN 2 AND 16)"),
+    ("CHECK(slot BETWEEN 1 AND 4)", "CHECK(slot BETWEEN 1 AND 16)"),
+];
+const SCHEMA_VERSION: u64 = 2;
+
+fn narrow_schema() -> String {
+    WIDENED
+        .iter()
+        .fold(SCHEMA.to_owned(), |schema, (narrow, wide)| schema.replace(wide, narrow))
+}
+
+/// Widen the version-1 CHECK constraints in place. Every saved row already satisfies the
+/// wider bound, so only the schema text changes (SQLite's documented `writable_schema`
+/// procedure for constraint changes); integrity is checked before committing.
+fn widen_checks(connection: &mut Connection) -> Result<()> {
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let version: i64 = tx.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
+    tx.execute_batch("PRAGMA writable_schema=ON;")?;
+    for (narrow, wide) in WIDENED {
+        let changed = tx.execute(
+            "UPDATE sqlite_master SET sql=replace(sql,?1,?2) WHERE type='table' AND instr(sql,?1)>0",
+            params![narrow, wide],
+        )?;
+        if changed != 1 {
+            return Err(Error::Storage);
+        }
+    }
+    tx.execute_batch(&format!(
+        "PRAGMA schema_version={}; PRAGMA writable_schema=OFF; PRAGMA user_version={SCHEMA_VERSION};",
+        version + 1
+    ))?;
+    let integrity: String = tx.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        return Err(Error::Storage);
+    }
+    tx.commit()?;
+    Ok(())
+}
 pub struct AdmissionStore {
     connection: Connection,
     enrollment: EnrollmentVerifier,
@@ -202,6 +244,8 @@ impl AdmissionStore {
         if fresh {
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute_batch(SCHEMA)?;
+            tx.execute_batch(TERMINAL_NOTICES)?;
+            tx.execute_batch(&format!("PRAGMA user_version={SCHEMA_VERSION};"))?;
             tx.execute(
                 "INSERT INTO metadata VALUES(1,?1,?2)",
                 params![
@@ -213,16 +257,26 @@ impl AdmissionStore {
             fs::File::open(root)?.sync_all()?;
         }
         let catalog = Connection::open_in_memory()?;
-        catalog.execute_batch(SCHEMA)?;
+        catalog.execute_batch(&narrow_schema())?;
         let legacy_catalog = schema_catalog(&catalog)?;
         catalog.execute_batch(TERMINAL_NOTICES)?;
-        let current_catalog = schema_catalog(&connection)?;
-        let legacy = current_catalog == legacy_catalog;
+        let narrow_catalog = schema_catalog(&catalog)?;
+        let current = Connection::open_in_memory()?;
+        current.execute_batch(SCHEMA)?;
+        current.execute_batch(TERMINAL_NOTICES)?;
+        let current_catalog = schema_catalog(&current)?;
+        let found = schema_catalog(&connection)?;
         let version: u64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if (legacy && version != 0) || (!legacy && version != 1) {
+        let found_version = if found == legacy_catalog {
+            0
+        } else if found == narrow_catalog {
+            1
+        } else if found == current_catalog {
+            SCHEMA_VERSION
+        } else {
             return Err(Error::Storage);
-        }
-        if !legacy && current_catalog != schema_catalog(&catalog)? {
+        };
+        if version != found_version {
             return Err(Error::Storage);
         }
         let metadata: (Vec<u8>, Vec<u8>) = connection.query_row(
@@ -233,11 +287,17 @@ impl AdmissionStore {
         if metadata.0 != operators.digest() || metadata.1 != operators.admission_key() {
             return Err(Error::Storage);
         }
-        if legacy {
+        if version == 0 {
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute_batch(TERMINAL_NOTICES)?;
             tx.execute_batch("PRAGMA user_version=1;")?;
             tx.commit()?;
+        }
+        if version < SCHEMA_VERSION {
+            widen_checks(&mut connection)?;
+            if schema_catalog(&connection)? != current_catalog {
+                return Err(Error::Storage);
+            }
         }
         Ok(Self {
             connection,

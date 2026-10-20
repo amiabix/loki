@@ -12,7 +12,45 @@ use std::{
 };
 
 pub(crate) const SCHEMA: &str = include_str!("schema.sql");
-const FOUR_SCHEMA: &str = include_str!("schema4.sql");
+
+/// The transport schema for a vault of `count` members: the 3-member schema with every
+/// member-number bound raised to `count`.
+fn member_schema(count: usize) -> &'static str {
+    static SCHEMAS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    if count == 3 {
+        return SCHEMA;
+    }
+    let schemas = SCHEMAS.get_or_init(|| {
+        // Without the template text `replace` would return the 3-member schema unchanged,
+        // and the stored schema would still validate against it.
+        assert!(
+            SCHEMA.contains(MEMBER_BOUND),
+            "schema.sql lost its member-number bound"
+        );
+        (0..=usize::from(loki_relay_protocol::types::MAX_MEMBERS))
+            .map(|n| SCHEMA.replace(MEMBER_BOUND, &format!("BETWEEN 1 AND {n})")))
+            .collect()
+    });
+    &schemas[count]
+}
+const MEMBER_BOUND: &str = "BETWEEN 1 AND 3)";
+
+#[cfg(test)]
+mod member_schema_tests {
+    #[test]
+    fn every_member_count_raises_every_bound() {
+        let bounds = super::SCHEMA.matches(super::MEMBER_BOUND).count();
+        assert!(bounds > 0);
+        for count in 3..=usize::from(loki_relay_protocol::types::MAX_MEMBERS) {
+            let schema = super::member_schema(count);
+            let wanted = format!("BETWEEN 1 AND {count})");
+            assert_eq!(schema.matches(wanted.as_str()).count(), bounds, "{count}");
+            if count != 3 {
+                assert!(!schema.contains(super::MEMBER_BOUND), "{count}");
+            }
+        }
+    }
+}
 const STORAGE_BUDGET: u64 = 512 * 1024 * 1024;
 const PENDING_TRANSFERS: u64 = 128;
 
@@ -80,6 +118,32 @@ fn recovery_parts() -> (&'static str, &'static str) {
 }
 
 const CURRENT_CATALOG: u8 = 6;
+
+/// Widen CHECK constraints in place by rewriting the schema text: every saved row already
+/// satisfies the wider bound, so the file content does not change (SQLite's documented
+/// `writable_schema` procedure for constraint changes). Checks integrity afterwards.
+pub(crate) fn widen_checks(connection: &mut Connection, narrow: &str, wide: &str) -> ClientResult<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let version: i64 = transaction.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
+    transaction.execute_batch("PRAGMA writable_schema=ON;")?;
+    let changed = transaction.execute(
+        "UPDATE sqlite_master SET sql=replace(sql,?1,?2) WHERE type='table' AND instr(sql,?1)>0",
+        params![narrow, wide],
+    )?;
+    transaction.execute_batch(&format!(
+        "PRAGMA schema_version={}; PRAGMA writable_schema=OFF;",
+        version + 1
+    ))?;
+    if changed == 0 {
+        return Err(ClientError::Storage);
+    }
+    let integrity: String = transaction.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+    if integrity != "ok" {
+        return Err(ClientError::Storage);
+    }
+    transaction.commit()?;
+    Ok(())
+}
 
 pub(crate) fn validate_schema(connection: &Connection, schema: &str) -> ClientResult<()> {
     let count: usize = connection.query_row(
@@ -310,8 +374,8 @@ fn validate_metadata(
     if vault != roster.vault || saved_roster != digest || saved_owner != i64::from(owner) {
         return Err(ClientError::Identity);
     }
-    let catalog = if roster.members.len() == 4 {
-        validate_schema(connection, FOUR_SCHEMA)?;
+    let catalog = if roster.members.len() != 3 {
+        validate_schema(connection, member_schema(roster.members.len()))?;
         CURRENT_CATALOG
     } else if validate_schema(connection, schema_parts().0).is_ok() {
         0
@@ -343,7 +407,7 @@ fn validate_metadata(
 
 impl ClientStore {
     pub(crate) fn schema(&self) -> &'static str {
-        if self.member_count == 4 { FOUR_SCHEMA } else { SCHEMA }
+        member_schema(self.member_count)
     }
 
     /// Creates a new dedicated transport root, or validates an existing complete root.
@@ -428,7 +492,7 @@ impl ClientStore {
         if fresh {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction.execute_batch(if roster.members.len() == 4 { FOUR_SCHEMA } else { SCHEMA })?;
+            transaction.execute_batch(member_schema(roster.members.len()))?;
             seed_diagnostic_ids(&transaction)?;
             transaction.execute(
                 "INSERT INTO metadata VALUES(1,1,?1,?2,?3)",
@@ -760,9 +824,10 @@ impl ClientStore {
     }
 
     pub fn recover_recipients(&self, key: &LogicalKey) -> ClientResult<Vec<RecoveryRecipient>> {
-        let mut statement = self.connection.prepare(
-            "SELECT recipient,transfer,root_hash,state FROM outgoing_recipients WHERE vault=?1 AND roster=?2 AND sender=?3 AND message_id=?4 ORDER BY recipient LIMIT 5"
-        )?;
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT recipient,transfer,root_hash,state FROM outgoing_recipients WHERE vault=?1 AND roster=?2 AND sender=?3 AND message_id=?4 ORDER BY recipient LIMIT {}",
+            loki_relay_protocol::types::MAX_MEMBERS
+        ))?;
         let rows = statement.query_map(
             params![key.vault, key.roster, key.sender, key.message],
             |r| {
@@ -2685,7 +2750,13 @@ impl ClientStore {
         if stored != owner {
             return Err(ClientError::Identity);
         }
-        let mut statement = self.connection.prepare(
+        // Every roster member, as integer literals: the roster has up to 16 members.
+        let members = members
+            .iter()
+            .map(MemberId::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut statement = self.connection.prepare(&format!(
             "SELECT rowid,vault,roster,sender,message_id,digest,session,from_member,source_root,phase FROM (
                 SELECT e.rowid,e.vault,e.roster,e.sender,e.message_id,e.digest,e.session,e.from_member,e.source_root,
                 CASE
@@ -2694,21 +2765,21 @@ impl ClientStore {
                         WHERE j.vault=e.vault AND j.roster=e.roster AND j.sender=e.sender
                         AND j.message_id=e.message_id AND j.digest=e.digest AND j.from_member=e.from_member
                     ) THEN 'rejected'
-                    WHEN e.from_member NOT IN (?3,?4,?5,?7) OR e.from_member=e.sender OR e.from_member=?6 THEN 'not_actionable'
+                    WHEN e.from_member NOT IN ({members}) OR e.from_member=e.sender OR e.from_member=?3 THEN 'not_actionable'
                     WHEN NOT EXISTS (
                         SELECT 1 FROM logical_records l
-                        WHERE e.sender=?6 AND l.vault=e.vault AND l.roster=e.roster AND l.sender=e.sender AND l.message_id=e.message_id
+                        WHERE e.sender=?3 AND l.vault=e.vault AND l.roster=e.roster AND l.sender=e.sender AND l.message_id=e.message_id
                     ) AND NOT EXISTS (
                         SELECT 1 FROM incoming_originals i
-                        WHERE e.sender<>?6 AND i.vault=e.vault AND i.roster=e.roster AND i.sender=e.sender AND i.message_id=e.message_id
+                        WHERE e.sender<>?3 AND i.vault=e.vault AND i.roster=e.roster AND i.sender=e.sender AND i.message_id=e.message_id
                     ) THEN 'pending'
                     WHEN NOT EXISTS (
                         SELECT 1 FROM logical_records l
-                        WHERE e.sender=?6 AND l.vault=e.vault AND l.roster=e.roster AND l.sender=e.sender AND l.message_id=e.message_id
+                        WHERE e.sender=?3 AND l.vault=e.vault AND l.roster=e.roster AND l.sender=e.sender AND l.message_id=e.message_id
                         AND l.digest=e.digest AND l.session IS e.session AND l.kind=1
                     ) AND NOT EXISTS (
                         SELECT 1 FROM incoming_originals i
-                        WHERE e.sender<>?6 AND i.vault=e.vault AND i.roster=e.roster AND i.sender=e.sender AND i.message_id=e.message_id
+                        WHERE e.sender<>?3 AND i.vault=e.vault AND i.roster=e.roster AND i.sender=e.sender AND i.message_id=e.message_id
                         AND i.digest=e.digest AND i.session IS e.session AND i.kind=1
                     ) THEN 'not_actionable'
                     WHEN EXISTS (
@@ -2718,10 +2789,10 @@ impl ClientStore {
                     ELSE 'ready'
                 END AS phase
                 FROM early_received_refs e
-            ) WHERE rowid>?1 ORDER BY rowid LIMIT ?2",
-        )?;
+            ) WHERE rowid>?1 ORDER BY rowid LIMIT ?2"
+        ))?;
         let rows = statement.query_map(
-            params![after, limit, members[0], members[1], members[2], owner, members.get(3).copied().unwrap_or(0)],
+            params![after, limit, owner],
             |row| {
                 Ok(EarlyReceived {
                     cursor: row.get(0)?,

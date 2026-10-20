@@ -8,54 +8,47 @@ pub use engine::{
     SavedCheckpoint, SetupCeremony,
 };
 pub(crate) mod journal;
-use crate::{member_state::Roster, setup_transport::Identity};
+use crate::{
+    member_state::{Roster, ValidatedRoster},
+    setup_transport::Identity,
+};
 #[cfg(feature = "relay-communication")]
 use crate::network::TESTNET_NU7_BIRTH;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+
+/// Setup format version carried in the agreement payload (C9). A member on another
+/// format computes a different payload, so agreement fails before any key generation.
+pub const SETUP_VERSION: u8 = 2;
 
 pub struct AcceptedCeremonyRoster {
-    roster: Roster,
+    roster: ValidatedRoster,
     network: String,
     operator_digest: [u8; 32],
     transport_required: bool,
 }
 impl AcceptedCeremonyRoster {
-    fn validate(roster: &Roster, network: &str, operator_digest: &[u8; 32]) -> Result<(), String> {
-        if network != roster.network.label()
-            || roster.vault == [0; 32]
-            || *operator_digest == [0; 32]
-            || !matches!((roster.threshold, roster.members.len()), (2, 3) | (2, 4) | (3, 4))
-            || roster.members.keys().copied().collect::<Vec<_>>()
-                != (1..=roster.members.len() as u16).collect::<Vec<_>>()
-        {
+    /// The shared roster gate plus the hosted-only checks: the network label and a
+    /// non-zero operator digest.
+    fn validate(
+        roster: Roster,
+        network: &str,
+        operator_digest: &[u8; 32],
+    ) -> Result<ValidatedRoster, String> {
+        if network != roster.network.label() || *operator_digest == [0; 32] {
             return Err("setup_policy".into());
         }
-        let mut signing = BTreeSet::new();
-        let mut encryption = BTreeSet::new();
-        for (&id, member) in &roster.members {
-            let key = ed25519_dalek::VerifyingKey::from_bytes(&member.signing)
-                .map_err(|_| "setup_identity")?;
-            let probe = x25519_dalek::StaticSecret::from([1; 32]);
-            if member.id != id
-                || key.is_weak()
-                || !signing.insert(member.signing)
-                || !encryption.insert(member.encryption)
-                || !probe
-                    .diffie_hellman(&x25519_dalek::PublicKey::from(member.encryption))
-                    .was_contributory()
-            {
-                return Err("setup_identity".into());
-            }
-        }
-        Ok(())
+        ValidatedRoster::new(roster).map_err(|e| e.to_string())
     }
     pub fn agreement_payload(
         roster: &Roster,
         network: &str,
         operator_digest: &[u8; 32],
     ) -> Result<Vec<u8>, String> {
-        Self::validate(roster, network, operator_digest)?;
-        let mut out = vec![1, network.len() as u8];
+        if network != roster.network.label() || *operator_digest == [0; 32] {
+            return Err("setup_policy".into());
+        }
+        ValidatedRoster::check(roster).map_err(|e| e.to_string())?;
+        let mut out = vec![SETUP_VERSION, network.len() as u8];
         out.extend_from_slice(network.as_bytes());
         out.extend_from_slice(&roster.threshold.to_be_bytes());
         out.extend_from_slice(&(roster.members.len() as u16).to_be_bytes());
@@ -87,13 +80,16 @@ impl AcceptedCeremonyRoster {
             }
         }
         Ok(Self {
-            roster,
+            roster: Self::validate(roster, network, &operator_digest)?,
             network: network.to_owned(),
             operator_digest,
             transport_required: false,
         })
     }
     pub fn roster(&self) -> &Roster {
+        &self.roster
+    }
+    pub fn validated(&self) -> &ValidatedRoster {
         &self.roster
     }
     pub fn network(&self) -> &str {
@@ -138,7 +134,7 @@ impl AcceptedCeremonyRoster {
         let policy = accepted.context().policy();
         let members = &accepted.roster().members;
         if accepted.roster().vault != policy.ceremony
-            || !matches!((policy.threshold, policy.member_count), (2, 3) | (2, 4) | (3, 4))
+            || !crate::member_state::valid_policy(policy.threshold, usize::from(policy.member_count))
             || members.len() != policy.member_count as usize
         {
             return Err("setup_agreement".into());
@@ -150,9 +146,8 @@ impl AcceptedCeremonyRoster {
         }
         let document = serde_json::to_vec(&document).map_err(|_| "setup_agreement")?;
         let roster = Roster::from_bytes(&document).map_err(|_| "setup_agreement")?;
-        Self::validate(&roster, &policy.network, &policy.config_digest)?;
         Ok(Self {
-            roster,
+            roster: Self::validate(roster, &policy.network, &policy.config_digest)?,
             network: policy.network.clone(),
             operator_digest: policy.config_digest,
             transport_required: true,

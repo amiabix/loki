@@ -22,11 +22,11 @@
 //! "burned but lost" is impossible: the partial is in `.burn` before `.nonce` is removed,
 //! and `.burn` is fsync'd before the removal.
 
+use crate::signer::durable::write_durable;
 use crate::signer::secure_element::{SealedShare, SecureElement};
 use reddsa_frost::frost::redpallas as frost;
 use std::{
-    fs,
-    io::{self, Write},
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -76,28 +76,6 @@ impl From<io::Error> for NonceError {
 pub struct NonceStore {
     dir: PathBuf,
     epoch: u64,
-}
-
-/// fsync a freshly written file via a temp + atomic hardlink, then fsync the directory.
-/// Mirrors `signing_session`'s append/decide durability.
-fn write_durable(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
-    let final_path = dir.join(name);
-    let temp = dir.join(format!(".{name}.tmp"));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&temp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    match fs::hard_link(&temp, &final_path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e),
-    }
-    fs::remove_file(&temp)?;
-    fs::File::open(dir)?.sync_all()
 }
 
 impl NonceStore {

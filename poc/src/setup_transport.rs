@@ -1,5 +1,12 @@
 //! Signed, recipient-only transport for one DKG round-two share.
 //! A public identity must be checked against the group's out-of-band roster first.
+//!
+//! Two round-two formats exist:
+//! - v1 (`LOKIDKG1`, [`Identity::seal_round2`]) encrypts to the recipient's long-lived
+//!   encryption key. Only the local transport (`loki_setup_member run`) still uses it.
+//! - v2 (`LOKIDKG2`, [`Identity::seal_round2_v2`]) encrypts between two one-setup
+//!   [`FreshKey`]s announced in the signed round-one bodies and binds the round-one
+//!   transcript. The hosted engine and the new signer use only v2 (`crate::dkg_core`).
 
 use crate::signing_session::{MessageKind, OpenedMessage, SessionContext};
 use blake2b_simd::Params;
@@ -10,8 +17,12 @@ use chacha20poly1305::{
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rand_core::{OsRng, RngCore};
 use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::Zeroizing;
 
 const MAGIC: &[u8; 8] = b"LOKIDKG1";
+const MAGIC_V2: &[u8; 8] = b"LOKIDKG2";
+/// v2 header: magic, vault, sender, recipient, round-one transcript, nonce, length.
+const HEADER_V2: usize = 8 + 32 + 2 + 2 + 32 + 24 + 4;
 const ROUND1_MAGIC: &[u8; 8] = b"LOKIR1V1";
 const AGREEMENT_MAGIC: &[u8; 8] = b"LOKIAGV1";
 const CERT_MAGIC: &[u8; 8] = b"LOKICRV1";
@@ -24,6 +35,125 @@ const SESSION_MAGIC: &[u8; 8] = b"LOKISGN1";
 const SESSION_INNER: &[u8; 8] = b"LOKISGIP";
 const SESSION_HEADER: usize = 8 + 1 + 24 + 4;
 const SESSION_LIMIT: usize = SESSION_HEADER + 8 * 1024 * 1024 + 16;
+
+/// A member's one-setup X25519 key for v2 round-two envelopes. Created with the
+/// round-one contribution, announced in the signed round-one body, and removed once the
+/// certificate state is saved.
+pub struct FreshKey(StaticSecret);
+
+impl FreshKey {
+    pub fn generate() -> Self {
+        Self(StaticSecret::random_from_rng(OsRng))
+    }
+
+    pub fn public(&self) -> [u8; 32] {
+        PublicKey::from(&self.0).to_bytes()
+    }
+
+    /// These bytes must only be written inside a sealed checkpoint.
+    pub fn to_secret_bytes(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(self.0.to_bytes())
+    }
+
+    pub fn from_secret_bytes(bytes: &[u8; 32]) -> Self {
+        Self(StaticSecret::from(*bytes))
+    }
+}
+
+/// What a setup message is, read from its marker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DkgWireKind {
+    /// Signed round-one body (`LOKIR1V1`), sent to every member.
+    Round1,
+    /// v2 recipient-encrypted, signed round-two envelope (`LOKIDKG2`).
+    Round2,
+    /// Signed certificate (`LOKICRV1`), sent to every member.
+    Certificate,
+    /// Signed backup receipt (`LOKIBKV1`), sent to every member.
+    BackupReceipt,
+}
+
+/// A setup message as it leaves a signer: signed (round one, certificate, backup
+/// receipt) or recipient-encrypted (round two). Only this module constructs it, and only
+/// from bytes with a valid setup-message frame, so a signer cannot hand raw secret bytes
+/// to the coordinator through the `Signer` seam.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DkgWire {
+    kind: DkgWireKind,
+    sender: u16,
+    recipient: Option<u16>,
+    bytes: Vec<u8>,
+}
+
+impl DkgWire {
+    /// Frame-check `bytes` as a setup message. Signatures are not checked here; the
+    /// receiving member verifies them against its roster.
+    pub(crate) fn parse(bytes: Vec<u8>) -> Result<Self, String> {
+        let kind = wire_kind(&bytes).ok_or("not a setup message")?;
+        let sender = u16::from_be_bytes(bytes[40..42].try_into().unwrap());
+        let recipient = if kind == DkgWireKind::Round2 {
+            if bytes.len() < HEADER_V2 + 16 + SIGNATURE {
+                return Err("invalid DKG envelope".into());
+            }
+            let size = u32::from_be_bytes(bytes[HEADER_V2 - 4..HEADER_V2].try_into().unwrap())
+                as usize;
+            if size > 64 * 1024 + 16 || bytes.len() != HEADER_V2 + size + SIGNATURE {
+                return Err("invalid DKG envelope length".into());
+            }
+            Some(u16::from_be_bytes(bytes[42..44].try_into().unwrap()))
+        } else {
+            if bytes.len() < PUBLIC_HEADER + SIGNATURE {
+                return Err("invalid setup message".into());
+            }
+            let size = u32::from_be_bytes(bytes[42..46].try_into().unwrap()) as usize;
+            if size > 64 * 1024 || bytes.len() != PUBLIC_HEADER + size + SIGNATURE {
+                return Err("invalid setup message length".into());
+            }
+            None
+        };
+        Ok(Self {
+            kind,
+            sender,
+            recipient,
+            bytes,
+        })
+    }
+
+    pub fn kind(&self) -> DkgWireKind {
+        self.kind
+    }
+
+    pub fn sender(&self) -> u16 {
+        self.sender
+    }
+
+    /// `None` for messages sent to every member.
+    pub fn recipient(&self) -> Option<u16> {
+        self.recipient
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+/// The setup-message kind named by `bytes`' marker, if any.
+pub fn wire_kind(bytes: &[u8]) -> Option<DkgWireKind> {
+    if bytes.len() < PUBLIC_HEADER {
+        return None;
+    }
+    match bytes[..8].try_into().ok()? {
+        ROUND1_MAGIC => Some(DkgWireKind::Round1),
+        MAGIC_V2 => Some(DkgWireKind::Round2),
+        CERT_MAGIC => Some(DkgWireKind::Certificate),
+        BACKUP_MAGIC => Some(DkgWireKind::BackupReceipt),
+        _ => None,
+    }
+}
 
 pub struct Identity {
     id: u16,
@@ -61,7 +191,7 @@ impl Identity {
             return Err("invalid DKG identity length".into());
         }
         let id = u16::from_be_bytes(bytes[..2].try_into().unwrap());
-        if !(1..=4).contains(&id) {
+        if !(1..=crate::member_state::MAX_MEMBERS).contains(&id) {
             return Err("invalid DKG member id".into());
         }
         Ok(Self {
@@ -307,6 +437,112 @@ impl Identity {
             .expect("BLAKE2b output is 32 bytes"))
     }
 
+    /// v2 round-two envelope. `plaintext` is encrypted under a key derived from the two
+    /// members' one-setup [`FreshKey`]s, the vault, both member ids and the round-one
+    /// `transcript`. The header (vault, sender, recipient, transcript, nonce, length) is
+    /// the AEAD associated data, and the whole envelope is signed with the identity key.
+    pub fn seal_round2_v2(
+        &self,
+        fresh: &FreshKey,
+        recipient: &PublicIdentity,
+        recipient_fresh: &[u8; 32],
+        vault: &[u8; 32],
+        transcript: &[u8; 32],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        if recipient.id == self.id || plaintext.len() > 64 * 1024 {
+            return Err("invalid DKG recipient or oversized share".into());
+        }
+        let key = fresh_box_key(fresh, self.id, recipient.id, recipient_fresh, vault, transcript)?;
+        let mut header = Vec::with_capacity(HEADER_V2);
+        header.extend_from_slice(MAGIC_V2);
+        header.extend_from_slice(vault);
+        header.extend_from_slice(&self.id.to_be_bytes());
+        header.extend_from_slice(&recipient.id.to_be_bytes());
+        header.extend_from_slice(transcript);
+        let mut nonce = [0u8; 24];
+        OsRng.fill_bytes(&mut nonce);
+        header.extend_from_slice(&nonce);
+        header.extend_from_slice(&((plaintext.len() + 16) as u32).to_be_bytes());
+        let ciphertext = XChaCha20Poly1305::new(&(*key).into())
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext,
+                    aad: &header,
+                },
+            )
+            .map_err(|_| "DKG encryption failed")?;
+        header.extend_from_slice(&ciphertext);
+        let signature = self.signing.sign(&header);
+        header.extend_from_slice(&signature.to_bytes());
+        Ok(header)
+    }
+
+    /// Check a v2 envelope's frame, header and sender signature without decrypting it.
+    /// Reopen uses this once the fresh key is gone.
+    pub fn verify_round2_v2(
+        sender: &PublicIdentity,
+        recipient: u16,
+        vault: &[u8; 32],
+        transcript: &[u8; 32],
+        wire: &[u8],
+    ) -> Result<(), String> {
+        if wire.len() < HEADER_V2 + 16 + SIGNATURE || &wire[..8] != MAGIC_V2 {
+            return Err("invalid DKG envelope".into());
+        }
+        if &wire[8..40] != vault
+            || u16::from_be_bytes(wire[40..42].try_into().unwrap()) != sender.id
+            || u16::from_be_bytes(wire[42..44].try_into().unwrap()) != recipient
+        {
+            return Err("DKG envelope belongs to another vault or member".into());
+        }
+        if &wire[44..76] != transcript {
+            return Err("DKG envelope round-one transcript differs".into());
+        }
+        let size =
+            u32::from_be_bytes(wire[HEADER_V2 - 4..HEADER_V2].try_into().unwrap()) as usize;
+        if size > 64 * 1024 + 16 || wire.len() != HEADER_V2 + size + SIGNATURE {
+            return Err("invalid DKG envelope length".into());
+        }
+        let verify = VerifyingKey::from_bytes(&sender.signing).map_err(|_| "invalid sender key")?;
+        let signature = ed25519_dalek::Signature::from_bytes(
+            wire[HEADER_V2 + size..]
+                .try_into()
+                .map_err(|_| "invalid DKG signature length")?,
+        );
+        verify
+            .verify_strict(&wire[..HEADER_V2 + size], &signature)
+            .map_err(|_| "DKG sender signature failed")?;
+        Ok(())
+    }
+
+    /// Open a v2 envelope addressed to this member: verify the signature and header
+    /// (including that its transcript equals ours), then decrypt.
+    pub fn open_round2_v2(
+        &self,
+        fresh: &FreshKey,
+        sender: &PublicIdentity,
+        sender_fresh: &[u8; 32],
+        vault: &[u8; 32],
+        transcript: &[u8; 32],
+        wire: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, String> {
+        Self::verify_round2_v2(sender, self.id, vault, transcript, wire)?;
+        let size = wire.len() - HEADER_V2 - SIGNATURE;
+        let key = fresh_box_key(fresh, self.id, sender.id, sender_fresh, vault, transcript)?;
+        XChaCha20Poly1305::new(&(*key).into())
+            .decrypt(
+                XNonce::from_slice(&wire[76..100]),
+                Payload {
+                    msg: &wire[HEADER_V2..HEADER_V2 + size],
+                    aad: &wire[..HEADER_V2],
+                },
+            )
+            .map(Zeroizing::new)
+            .map_err(|_| "DKG decryption failed".into())
+    }
+
     /// Encrypt a signing packet. All context, member IDs, type, and body are inside
     /// the AEAD. The outer envelope exposes only a version, nonce, and length bucket.
     pub fn seal_session(
@@ -319,7 +555,7 @@ impl Identity {
         context.validate()?;
         if self.id == recipient.id
             || !context.signers.contains(&self.id)
-            || !(1..=4).contains(&recipient.id)
+            || !(1..=crate::member_state::MAX_MEMBERS).contains(&recipient.id)
             || (!context.signers.contains(&recipient.id)
                 && !matches!(kind, MessageKind::Package | MessageKind::Share))
             || body.len() > kind.max_body()
@@ -409,7 +645,7 @@ impl Identity {
         let inner_header = meta_end + 32;
         if sender.id == recipient
             || !context.signers.contains(&sender.id)
-            || !(1..=4).contains(&recipient)
+            || !(1..=crate::member_state::MAX_MEMBERS).contains(&recipient)
         {
             return Err("sender or recipient outside signing attempt".into());
         }
@@ -500,6 +736,40 @@ impl Identity {
         hash.update(shared.as_bytes());
         Ok(hash.finalize().as_bytes().try_into().unwrap())
     }
+}
+
+/// BLAKE2b key derivation for v2 round-two envelopes, over the fresh-key DH, the vault,
+/// both member ids (low first) and the round-one transcript.
+fn fresh_box_key(
+    own: &FreshKey,
+    own_id: u16,
+    peer_id: u16,
+    peer_fresh: &[u8; 32],
+    vault: &[u8; 32],
+    transcript: &[u8; 32],
+) -> Result<Zeroizing<[u8; 32]>, String> {
+    let shared = own.0.diffie_hellman(&PublicKey::from(*peer_fresh));
+    if !shared.was_contributory() {
+        return Err("invalid DKG fresh public key".into());
+    }
+    let (low, high) = if own_id < peer_id {
+        (own_id, peer_id)
+    } else {
+        (peer_id, own_id)
+    };
+    let hash = Params::new()
+        .hash_length(32)
+        .personal(b"Loki_Dkg_Box_v2")
+        .to_state()
+        .update(vault)
+        .update(&low.to_be_bytes())
+        .update(&high.to_be_bytes())
+        .update(transcript)
+        .update(shared.as_bytes())
+        .finalize();
+    Ok(Zeroizing::new(
+        hash.as_bytes().try_into().expect("BLAKE2b output is 32 bytes"),
+    ))
 }
 
 fn session_transcript(meta: &[u8], body: &[u8], version: u8) -> [u8; 32] {

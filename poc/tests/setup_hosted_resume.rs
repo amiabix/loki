@@ -47,7 +47,7 @@ fn operators() -> OperatorSet {
                     .to_vec(),
             ),
         ]),
-        Value::Array(vec![Value::Integer(1.into())]),
+        Value::Array(vec![Value::Integer(2.into())]),
         Value::Array(
             [86400u64, 2592000, 1048576, 67108864, 30, 1, 60]
                 .into_iter()
@@ -94,7 +94,7 @@ fn prepare(
     let records: Vec<_> = outgoing
         .iter()
         .map(|(recipient, payload)| SetupRecord {
-            version: 1,
+            version: loki_relay_protocol::setup::SETUP_VERSION,
             key: SetupKey {
                 ceremony: p.ceremony,
                 phase: phase(phase_native),

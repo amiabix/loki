@@ -74,7 +74,7 @@ fn four_member_roster_and_audience_roundtrip() {
 
 #[test]
 fn roster_rejects_gaps_extra_slots_and_duplicate_keys() {
-    for n in [0, 1, 2, 5] {
+    for n in [0, 1, 2, 17] {
         assert!(encode_roster(&roster(n)).is_err());
     }
     for case in 0..5 {
@@ -103,3 +103,18 @@ const ROSTER4_DIGEST: [u8; 32] = [
     152, 29, 71, 76, 73, 35, 223, 33, 5, 19, 25, 86, 120, 233, 214, 113, 211, 6, 73, 44, 201, 6, 3,
     219, 184, 237, 1, 50, 229, 113, 219, 226,
 ];
+
+#[test]
+fn rosters_and_setup_policies_cover_three_to_sixteen_members() {
+    use loki_relay_protocol::setup::{SetupCapabilities, SETUP_VERSION};
+    use loki_relay_protocol::types::valid_policy;
+    for n in [3, 5, 16] {
+        assert!(encode_roster(&roster(n)).is_ok(), "{n} members");
+        assert!(SetupCapabilities::current().supports(SETUP_VERSION, n));
+    }
+    assert!(!SetupCapabilities::current().supports(SETUP_VERSION, 17));
+    assert!(valid_policy(2, 3) && valid_policy(3, 5) && valid_policy(15, 16));
+    for (t, n) in [(1, 3), (3, 3), (16, 16), (2, 17), (0, 2)] {
+        assert!(!valid_policy(t, n), "{t}-of-{n}");
+    }
+}
