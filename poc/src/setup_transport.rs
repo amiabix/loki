@@ -21,12 +21,6 @@ use zeroize::Zeroizing;
 
 const MAGIC: &[u8; 8] = b"LOKIDKG1";
 
-/// Whether `bytes` is a sealed v1 DKG round-2 package. The hosted `dkg_transport` driver (v1)
-/// multiplexes both rounds over one channel and uses this to separate them under timing skew.
-pub fn is_sealed_round2(bytes: &[u8]) -> bool {
-    bytes.starts_with(MAGIC)
-}
-
 const MAGIC_V2: &[u8; 8] = b"LOKIDKG2";
 /// v2 header: magic, vault, sender, recipient, round-one transcript, nonce, length.
 const HEADER_V2: usize = 8 + 32 + 2 + 2 + 32 + 24 + 4;

@@ -8,7 +8,11 @@ use loki_poc::candidate::{quote_fee, CandidateInputs};
 use loki_poc::network::VaultNetwork;
 use loki_poc::payment_transport::{coordinate, signer_loop};
 use loki_poc::setup_transport::Identity;
-use loki_poc::transport::{FrostdTransport, Incoming, Peer, Transport};
+use loki_poc::signer::{
+    local::LocalSigner, secure_element::SoftwareSecureElement, CandidateRef, Network,
+    PublicPaymentParams, Signer,
+};
+use loki_poc::transport::{FrostdLoginKey, FrostdTransport, Incoming, Outbound, Peer, Transport};
 use loki_poc::zip2005;
 use orchard::{
     keys::{FullViewingKey, Scope},
@@ -37,7 +41,8 @@ impl Transport for MemoryTransport {
     fn join(&mut self, session: Uuid) -> Result<Uuid, String> {
         Ok(session)
     }
-    fn send(&self, _channel: &Uuid, to: &[Peer], message: &[u8]) -> Result<(), String> {
+    fn send(&self, _channel: &Uuid, to: &[Peer], message: &Outbound) -> Result<(), String> {
+        let message = message.to_bytes().map_err(|e| e.to_string())?;
         let recipients = if to.is_empty() {
             std::slice::from_ref(&self.coordinator)
         } else {
@@ -47,7 +52,7 @@ impl Transport for MemoryTransport {
         for recipient in recipients {
             inboxes.entry(recipient.0).or_default().push(Incoming {
                 from: self.me.clone(),
-                message: message.to_vec(),
+                message: message.clone(),
             });
         }
         Ok(())
@@ -86,7 +91,7 @@ fn two_of_three_payment_pczt_verifies_over_frostd() {
         VaultNetwork::Regtest,
         |identity| {
             let secret: [u8; 32] = identity.to_secret_bytes()[34..].try_into().unwrap();
-            FrostdTransport::new(&url, Peer(identity.public().encryption), secret).unwrap()
+            FrostdTransport::new(&url, FrostdLoginKey::from_secret_bytes(secret)).unwrap()
         },
         |channel| channel.session_id(),
     );
@@ -194,6 +199,12 @@ fn roundtrip<T: Transport + Send>(
     let channel = tx.open(&peers, 4).unwrap();
     let session = session_id(&channel);
     let member_transports: Vec<_> = identities.iter().map(make_transport).collect();
+    let signer_network = if network == VaultNetwork::Testnet { Network::Testnet } else { Network::Regtest };
+    let candidate = CandidateRef { vault_id: [1; 32], payment_id: [7; 32], attempt_id: [9; 32] };
+    let params = PublicPaymentParams {
+        recipient: inputs.recipient, amount: inputs.amount, memo: inputs.memo.clone(),
+        target_height: inputs.target_height, expiry_height: inputs.expiry_height,
+    };
 
     thread::scope(|scope| {
         let handles: Vec<_> = identities
@@ -202,17 +213,28 @@ fn roundtrip<T: Transport + Send>(
             .zip(ids.iter().copied())
             .map(|((identity, mut member_tx), id)| {
                 let key = keys[&id].clone();
-                let proposer_inputs = if id == ids[0] { Some(&inputs) } else { None };
+                let proposer_inputs = if id == ids[0] { Some(&params) } else { None };
+                let other_signers: Vec<_> = if proposer_inputs.is_some() { peers.iter().skip(1).cloned().collect() } else { Vec::new() };
+                let proposer_peer = peer_of[&ids[0]].clone();
+                let public_bytes = public.serialize().unwrap();
+                let signer_public = public.clone();
+                let signer_fvk = fvk.clone();
+                let candidate = candidate.clone();
                 scope.spawn(move || {
                     let channel = member_tx.join(session).unwrap();
+                    let nonce_dir = std::env::temp_dir().join(format!("loki-payment-{}-{}", std::process::id(), rand_core::RngCore::next_u64(&mut rand_core::OsRng)));
+                    let mut signer = LocalSigner::with_sealed_share(
+                        identity.public().id, 2, 3, [1; 32], "payment test".into(), signer_network,
+                        SoftwareSecureElement::generate(), &key.serialize().unwrap(),
+                        public_bytes, signer_fvk, nonce_dir, Box::new(|_| true),
+                    ).unwrap();
+                    signer.set_candidate_notes(vec![note]);
+                    let signer_session = signer.connect("payment test", signer_network, b"test").unwrap().session;
                     signer_loop(
                         &member_tx,
                         &channel,
-                        &identity,
-                        &key,
-                        network,
-                        id == frost::Identifier::try_from(1u16).unwrap(),
-                        proposer_inputs,
+                        &mut signer, &signer_session, &candidate, &signer_public, id,
+                        proposer_inputs, &proposer_peer, &other_signers,
                     )
                     .unwrap();
                 })

@@ -181,7 +181,7 @@ impl Member {
         let dir = tempdir(&format!("m{id}"));
         let codes = Arc::new(Mutex::new(Vec::new()));
         let se = SoftwareSecureElement::persistent(&dir, "member pass").unwrap();
-        let mut signer = LocalSigner::create(
+        let mut signer = LocalSigner::create_with_identity(
             &dir,
             se,
             Network::Regtest,
@@ -189,6 +189,7 @@ impl Member {
             id,
             "ws3 vault".into(),
             prompts(codes.clone()),
+            loki_poc::setup_transport::Identity::new(id),
         )
         .unwrap();
         let session = signer.connect(ORIGIN, Network::Regtest, b"ws3").unwrap().session;
@@ -314,6 +315,8 @@ where
     for m in &members {
         assert!(m.ready(), "member {} must be ready after every receipt", m.id);
     }
+    let secrets: Vec<_> = members.iter().map(|m| *m.signer.hosted_material().unwrap().2).collect();
+    assert!(secrets.iter().all(|secret| *secret == secrets[0]));
     // Active: the coordinator deletes its relay log.
     assert!(log.active());
     log.delete().unwrap();

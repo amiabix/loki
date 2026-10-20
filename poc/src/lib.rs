@@ -20,9 +20,6 @@ mod coordinator;
 pub mod coordinator_boundary;
 pub mod distributed_setup;
 pub mod dkg_core;
-// Reusable FROST DKG driver over a WS3 Transport (frostd) — the productionised form of the
-// hand-wired flow in tests/frostd_transport.rs.
-pub mod dkg_transport;
 #[cfg(all(feature = "apple-enclave", target_os = "macos"))]
 pub mod enclave_ffi;
 pub mod intent;
@@ -67,7 +64,6 @@ pub mod state;
 pub mod transport;
 pub mod tx_finalize;
 pub mod vault;
-pub mod vault_secret;
 pub mod verify;
 pub mod wallet_store;
 pub mod witness;

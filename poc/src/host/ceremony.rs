@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::Path,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -25,16 +25,47 @@ use super::{
     state::Shared,
 };
 use crate::{
-    dkg_transport::run_dkg,
     frost_roster::FrostRoster,
     network::VaultNetwork,
     setup_transport::{Identity, PublicIdentity},
+    signer::{
+        backup::BackupArtifact,
+        coordination::{member_dkg_step, redeliver_dkg, relay_dkg},
+        local::{BackupDevice, DevicePrompts, LocalSigner, RosterDecision, SignerError},
+        secure_element::SoftwareSecureElement,
+        Network, Signer,
+    },
     state::MemberDir,
-    transport::{FrostdTransport, Peer, Transport},
+    transport::{FrostdLoginKey, FrostdTransport, Outbound, Peer, RelayLog, Transport},
     vault, zip2005,
 };
 
 type Reply = (StatusCode, Json<Value>);
+
+struct HostedBackup {
+    dir: PathBuf,
+    pass: Zeroizing<String>,
+}
+
+impl BackupDevice for HostedBackup {
+    fn passphrase(&mut self) -> Option<Zeroizing<String>> {
+        Some(self.pass.clone())
+    }
+    fn save(&mut self, artifact: &BackupArtifact) -> Result<(), String> {
+        let store = MemberDir::open(&self.dir, "");
+        if store.exists("backup.sealed") {
+            return Ok(());
+        }
+        store.write_sealed("backup.sealed", &artifact.0, &self.pass)
+            .map_err(|e| e.to_string())
+    }
+    fn load(&mut self) -> Result<BackupArtifact, String> {
+        MemberDir::open(&self.dir, "")
+            .read_sealed("backup.sealed", &self.pass)
+            .map(BackupArtifact)
+            .map_err(|e| e.to_string())
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct WireIdentity {
@@ -96,6 +127,8 @@ struct Ceremony {
     agreed: BTreeSet<u16>,
     session_id: Option<Uuid>,
     #[serde(default)]
+    coordinator_peer: Option<String>,
+    #[serde(default)]
     vs_session_id: Option<Uuid>,
     dkg_started: bool,
     error: Option<String>,
@@ -112,8 +145,8 @@ struct Invite {
     name: String,
 }
 
-/// Upper bound on vault members — the shared protocol cap from `member_state`.
-use crate::member_state::MAX_MEMBERS;
+/// Shared roster policy, including the member cap.
+use crate::member_state::valid_policy;
 
 fn vault_bytes(vault: &str) -> Result<[u8; 32], String> {
     hex::decode(vault)
@@ -299,13 +332,11 @@ pub(super) async fn create(State(st): State<Shared>, Json(body): Json<Value>) ->
         .unwrap_or(0);
     if name.is_empty()
         || name.len() > 80
-        || !(2..=MAX_MEMBERS).contains(&members)
-        || threshold < 2
-        || threshold > members
+        || !valid_policy(threshold, usize::from(members))
     {
         return err(
             StatusCode::BAD_REQUEST,
-            "name must be 1 to 80 bytes; use 2 to 16 members and a valid threshold",
+            "name must be 1 to 80 bytes; use 2 <= t < n <= 16",
         );
     }
     let (data, pass) = match unlocked(&st).await {
@@ -355,6 +386,7 @@ pub(super) async fn create(State(st): State<Shared>, Json(body): Json<Value>) ->
             fingerprint: None,
             agreed: BTreeSet::new(),
             session_id: None,
+            coordinator_peer: None,
             vs_session_id: None,
             dkg_started: false,
             error: None,
@@ -378,10 +410,8 @@ pub(super) async fn join(State(st): State<Shared>, Json(body): Json<Value>) -> R
         Err(e) => return err(StatusCode::BAD_REQUEST, e),
     };
     if vault_bytes(&invite.vault).is_err()
-        || !(2..=MAX_MEMBERS).contains(&invite.members)
+        || !valid_policy(invite.threshold, usize::from(invite.members))
         || !(2..=invite.members).contains(&invite.slot)
-        || invite.threshold < 2
-        || invite.threshold > invite.members
         || invite.name.trim().is_empty()
         || invite.name.len() > 80
         || !(invite.creator_base_url.starts_with("http://")
@@ -427,6 +457,7 @@ pub(super) async fn join(State(st): State<Shared>, Json(body): Json<Value>) -> R
             fingerprint: None,
             agreed: BTreeSet::new(),
             session_id: None,
+            coordinator_peer: None,
             vs_session_id: None,
             dkg_started: false,
             error: None,
@@ -757,6 +788,7 @@ pub(super) async fn session(
         }
         Ok(json!({
             "session_id": c.session_id.ok_or("session pending")?,
+            "coordinator_peer": c.coordinator_peer,
             "vs_session_id": c.vs_session_id,
         }))
     })
@@ -812,137 +844,7 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
     let outcome: Result<Value, String> = (|| {
         let me = identity(data, pass, c.my_slot)?;
         let roster = roster_of(&c)?;
-        let peers: BTreeMap<_, _> = roster
-            .members
-            .keys()
-            .map(|id| (*id, roster.peer_of(id).unwrap()))
-            .collect();
-        let identity_secret = Zeroizing::new(me.to_secret_bytes());
-        let secret: [u8; 32] = identity_secret[34..]
-            .try_into()
-            .map_err(|_| "identity secret length")?;
-        let mut transport =
-            FrostdTransport::new(&c.frostd_url, Peer(me.public().encryption), secret)
-                .map_err(|e| e.to_string())?;
-        let (session_id, coordinator) = if c.my_slot == 1 {
-            // frostd needs the session opener (coordinator) to be DISTINCT from the
-            // participants — a member cannot both open and join the same session. Open with
-            // a fresh ephemeral identity and hold it alive until the DKG completes.
-            let coord = crate::setup_transport::Identity::new(0);
-            let coord_secret: [u8; 32] = coord.to_secret_bytes()[34..]
-                .try_into()
-                .map_err(|_| "coordinator secret length")?;
-            let mut coord_tx =
-                FrostdTransport::new(&c.frostd_url, Peer(coord.public().encryption), coord_secret)
-                    .map_err(|e| e.to_string())?;
-            let coord_ch = coord_tx
-                .open(&roster.peer_list(), 16)
-                .map_err(|e| e.to_string())?;
-            let id = coord_ch.session_id();
-            c.session_id = Some(id);
-            {
-                let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
-                save(data, pass, &c)?;
-            }
-            (id, Some((coord_tx, coord_ch)))
-        } else {
-            let mut found = None;
-            for _ in 0..200 {
-                if let Ok(response) = peer_request(
-                    "GET",
-                    &format!("{}/api/session?vault={}", c.creator_base_url, c.vault),
-                    None,
-                ) {
-                    found = response["session_id"]
-                        .as_str()
-                        .and_then(|s| Uuid::parse_str(s).ok());
-                    if found.is_some() {
-                        break;
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            (found.ok_or("creator session not available")?, None)
-        };
-        let channel = transport.join(session_id).map_err(|e| e.to_string())?;
-        let my_id = frost::Identifier::try_from(c.my_slot).map_err(|e| e.to_string())?;
-        let (key, public) = run_dkg(
-            &transport,
-            &channel,
-            &me,
-            my_id,
-            &roster.members,
-            &peers,
-            &roster.vault_id,
-            c.threshold,
-        )?;
-        // Do NOT close the session here. Member 1 can finish before the slower peers, and
-        // close_session would delete it out from under them (frostd 500 SessionNotFound). The
-        // relay reaps the session by TTL (24h), refreshed by participant activity; dropping the
-        // coordinator's connection does not remove it.
-        let ak: [u8; 32] = public
-            .verifying_key()
-            .serialize()
-            .map_err(|e| e.to_string())?
-            .try_into()
-            .map_err(|_| "group key length")?;
-        // The vault-secret contribution is a separate commit-reveal protocol. Its sealed
-        // reveals share the DKG round-2 envelope magic, so running it on the DKG session would
-        // corrupt both when they interleave. Open a SECOND session for it (same pattern).
-        let (vs_session_id, vs_coordinator) = if c.my_slot == 1 {
-            let coord = crate::setup_transport::Identity::new(0);
-            let coord_secret: [u8; 32] = coord.to_secret_bytes()[34..]
-                .try_into()
-                .map_err(|_| "coordinator secret length")?;
-            let mut coord_tx =
-                FrostdTransport::new(&c.frostd_url, Peer(coord.public().encryption), coord_secret)
-                    .map_err(|e| e.to_string())?;
-            let coord_ch = coord_tx
-                .open(&roster.peer_list(), 16)
-                .map_err(|e| e.to_string())?;
-            let id = coord_ch.session_id();
-            c.vs_session_id = Some(id);
-            {
-                let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
-                save(data, pass, &c)?;
-            }
-            (id, Some((coord_tx, coord_ch)))
-        } else {
-            let mut found = None;
-            for _ in 0..200 {
-                if let Ok(response) = peer_request(
-                    "GET",
-                    &format!("{}/api/session?vault={}", c.creator_base_url, c.vault),
-                    None,
-                ) {
-                    found = response["vs_session_id"]
-                        .as_str()
-                        .and_then(|s| Uuid::parse_str(s).ok());
-                    if found.is_some() {
-                        break;
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            (found.ok_or("creator vault-secret session not available")?, None)
-        };
-        let vs_channel = transport.join(vs_session_id).map_err(|e| e.to_string())?;
-        let vault_secret = Zeroizing::new(crate::vault_secret::contribute(
-            &transport,
-            &vs_channel,
-            &me,
-            my_id,
-            &roster.members,
-            &peers,
-            &roster.vault_id,
-            &ak,
-        )?);
-        drop(coordinator);
-        drop(vs_coordinator);
-        let fvk = zip2005::frost_viewing_key(&ak, &vault_secret)
-            .map_err(|e| format!("group viewing key: {e:?}"))?;
         let network = VaultNetwork::parse(&st.config.network)?;
-        let group_address = vault::unified_address(&fvk, network.network_type());
         let birth_height = match network {
             VaultNetwork::Regtest => 2,
             VaultNetwork::Testnet => {
@@ -960,6 +862,146 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
                 u32::try_from(info.block_height).map_err(|_| "chain height overflow")?
             }
         };
+        let peers: BTreeMap<u16, Peer> = roster.members.values()
+            .map(|identity| (identity.id, Peer(identity.encryption))).collect();
+        let identity_secret = Zeroizing::new(me.to_secret_bytes());
+        let secret: [u8; 32] = identity_secret[34..]
+            .try_into().map_err(|_| "identity secret length")?;
+        let mut transport = FrostdTransport::new(
+            &c.frostd_url, FrostdLoginKey::from_secret_bytes(secret),
+        ).map_err(|e| e.to_string())?;
+        let (session_id, coordinator, coordinator_peer) = if c.my_slot == 1 {
+            // frostd requires a distinct session opener; id 0 is not a DKG member.
+            let coord = Identity::new(0);
+            let raw = Zeroizing::new(coord.to_secret_bytes());
+            let coord_secret: [u8; 32] = raw[34..].try_into()
+                .map_err(|_| "coordinator secret length")?;
+            let mut coord_tx = FrostdTransport::new(
+                &c.frostd_url, FrostdLoginKey::from_secret_bytes(coord_secret),
+            ).map_err(|e| e.to_string())?;
+            let coord_ch = coord_tx.open(&roster.peer_list(), 255)
+                .map_err(|e| e.to_string())?;
+            let id = coord_ch.session_id();
+            let peer = Peer(coord.public().encryption);
+            c.session_id = Some(id);
+            c.coordinator_peer = Some(hex::encode(peer.0));
+            {
+                let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
+                save(data, pass, &c)?;
+            }
+            (id, Some((coord_tx, coord_ch)), peer)
+        } else {
+            let mut found = None;
+            for _ in 0..200 {
+                if let Ok(response) = peer_request(
+                    "GET", &format!("{}/api/session?vault={}", c.creator_base_url, c.vault), None,
+                ) {
+                    if let (Some(id), Some(peer)) = (
+                        response["session_id"].as_str().and_then(|s| Uuid::parse_str(s).ok()),
+                        response["coordinator_peer"].as_str().and_then(|s| hex::decode(s).ok())
+                            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok()),
+                    ) {
+                        found = Some((id, Peer(peer)));
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            let (id, peer) = found.ok_or("creator session not available")?;
+            (id, None, peer)
+        };
+        let channel = transport.join(session_id).map_err(|e| e.to_string())?;
+        let signer_dir = dir(data, vault_id)?.path().join("signer");
+        let se = SoftwareSecureElement::persistent(&signer_dir, pass)?;
+        let signer_network = match network {
+            VaultNetwork::Regtest => Network::Regtest,
+            VaultNetwork::Testnet => Network::Testnet,
+        };
+        let prompts = DevicePrompts {
+            connect: Box::new(|_, _| true),
+            // The hosted flow already required this member's roster agreement.
+            roster: Box::new(|_| RosterDecision::Match),
+            roster_deadline: Duration::from_secs(60),
+            backup: Box::new(HostedBackup { dir: signer_dir.clone(), pass: Zeroizing::new(pass.to_owned()) }),
+            approval: Box::new(|_| true),
+        };
+        let mut signer = if signer_dir.join("signer.meta").exists() {
+            LocalSigner::open(&signer_dir, se, c.name.clone(), prompts)
+        } else {
+            LocalSigner::create_with_identity(
+                &signer_dir, se, signer_network, roster.vault_id, c.my_slot,
+                c.name.clone(), prompts, Identity::from_secret_bytes(&identity_secret[..])?,
+            )
+        }.map_err(|e| e.to_string())?;
+        let connection = signer.connect(&c.creator_base_url, signer_network, b"hosted DKG")
+            .map_err(|e| e.to_string())?;
+        if connection.member.encryption != me.public().encryption {
+            return Err("signer identity differs from enrolled member".into());
+        }
+        let session = connection.session;
+        let document = json!({
+            "vault": c.vault, "threshold": c.threshold, "setup_version": 2,
+            "network": network.label(),
+            "members": roster.members.values().map(|p| json!({
+                "id": p.id, "signing": hex::encode(p.signing),
+                "encryption": hex::encode(p.encryption),
+            })).collect::<Vec<_>>(),
+        });
+        let mut document = document;
+        if network == VaultNetwork::Testnet {
+            document["birth_height"] = json!(birth_height);
+        }
+        let vault_ref = if signer.list_vaults(&session).map_err(|e| e.to_string())?.is_empty() {
+            signer.dkg_begin(&session, &serde_json::to_vec(&document).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?
+        } else {
+            signer.list_vaults(&session).map_err(|e| e.to_string())?.remove(0)
+        };
+        let mut log = if c.my_slot == 1 {
+            Some(RelayLog::open(&dir(data, vault_id)?.path().join("dkg-relay"), c.members)
+                .map_err(|e| e.to_string())?)
+        } else { None };
+        if let (Some((coord_tx, coord_ch)), Some(log)) = (&coordinator, &log) {
+            redeliver_dkg(log, coord_tx, coord_ch, &peers)?;
+        }
+        let mut backed_up = false;
+        let mut ready = false;
+        for _ in 0..1200 {
+            if let (Some((coord_tx, coord_ch)), Some(log)) = (&coordinator, &mut log) {
+                relay_dkg(log, coord_tx, coord_ch, &peers)?;
+            }
+            member_dkg_step(&mut signer, &session, &vault_ref, &transport, &channel, &coordinator_peer)?;
+            if !backed_up {
+                match signer.backup(&session) {
+                    Ok(wires) => {
+                        for wire in wires {
+                            transport.send(&channel, &[], &Outbound::Dkg(wire))
+                                .map_err(|e| e.to_string())?;
+                        }
+                        backed_up = true;
+                    }
+                    Err(SignerError::NotReady) => {}
+                    Err(e) => return Err(format!("backup: {e}")),
+                }
+            }
+            if let (Some((coord_tx, coord_ch)), Some(log)) = (&coordinator, &mut log) {
+                relay_dkg(log, coord_tx, coord_ch, &peers)?;
+            }
+            ready = signer.list_vaults(&session).map_err(|e| e.to_string())?[0].ready;
+            if ready { break; }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if !ready { return Err("DKG receipts did not complete".into()); }
+        if let Some(log) = log {
+            if log.active() { log.delete().map_err(|e| e.to_string())?; }
+        }
+        // Keep the frostd session open until the relay's TTL; peers may still be finishing.
+        let (key, public, vault_secret) = signer.hosted_material().map_err(|e| e.to_string())?;
+        let ak: [u8; 32] = public.verifying_key().serialize()
+            .map_err(|e| e.to_string())?.try_into().map_err(|_| "group key length")?;
+        let fvk = zip2005::frost_viewing_key(&ak, &vault_secret)
+            .map_err(|e| format!("group viewing key: {e:?}"))?;
+        let group_address = vault::unified_address(&fvk, network.network_type());
         let sealed = json!({
             "vault":c.vault,"threshold":c.threshold,"members":c.members,
             "roster_fingerprint":c.fingerprint,"key_package":hex::encode(key.serialize().map_err(|e| e.to_string())?),
@@ -1015,6 +1057,7 @@ mod tests {
             fingerprint: None,
             agreed: BTreeSet::new(),
             session_id: None,
+            coordinator_peer: None,
             vs_session_id: None,
             dkg_started: false,
             error: None,

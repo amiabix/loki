@@ -34,6 +34,10 @@ use crate::{
     network::{VaultNetwork, TESTNET_NU7_BIRTH},
     payment_transport::{coordinate, signer_loop},
     setup_transport::Identity,
+    signer::{
+        local::LocalSigner, secure_element::SoftwareSecureElement, CandidateRef, Network,
+        PublicPaymentParams, Signer,
+    },
     state::MemberDir,
     transport::{FrostdChannel, FrostdLoginKey, FrostdTransport, Incoming, Outbound, Peer, Transport},
     tx_finalize::prove,
@@ -322,6 +326,9 @@ impl Transport for ReviewedTransport<'_> {
         Err("signer session already joined".into())
     }
     fn send(&self, channel: &FrostdChannel, to: &[Peer], message: &Outbound) -> Result<(), String> {
+        if let Outbound::Candidate(candidate) = message {
+            review_candidate(candidate.as_bytes(), self.payment, self.vault)?;
+        }
         self.inner
             .send(channel, to, message)
             .map_err(|e| e.to_string())
@@ -702,14 +709,37 @@ fn sign(st: &Shared, data: &Path, pass: &str, p: &Payment, v: &Vault) -> Result<
         payment: p,
         vault: v,
     };
+    let signer_network = match v.network {
+        VaultNetwork::Regtest => Network::Regtest,
+        VaultNetwork::Testnet => Network::Testnet,
+    };
+    let mut signer = LocalSigner::with_sealed_share(
+        v.slot, v.threshold, v.peers.len() as u16, hex32(&p.vault)?,
+        p.vault.clone(), signer_network, SoftwareSecureElement::generate(),
+        &v.key.serialize().map_err(|e| e.to_string())?,
+        v.public.serialize().map_err(|e| e.to_string())?, v.fvk.clone(),
+        member_dir(data, &p.vault)?.path().join("signer-nonces"), Box::new(|_| true),
+    ).map_err(|e| e.to_string())?;
+    if let Some(inputs) = &owned {
+        signer.set_candidate_notes(inputs.notes.clone());
+    }
+    let session = signer.connect("hosted payment", signer_network, p.attempt.as_bytes())
+        .map_err(|e| e.to_string())?.session;
+    let candidate = CandidateRef {
+        vault_id: hex32(&p.vault)?, payment_id: hex32(&p.attempt)?, attempt_id: hex32(&p.attempt)?,
+    };
+    let params = owned.as_ref().map(|inputs| PublicPaymentParams {
+        recipient: inputs.recipient, amount: inputs.amount, memo: inputs.memo.clone(),
+        target_height: inputs.target_height, expiry_height: inputs.expiry_height,
+    });
+    let other_signers = p.signers.iter().filter(|id| **id != v.slot)
+        .map(|id| v.peers[id].clone()).collect::<Vec<_>>();
     signer_loop(
         &reviewed,
         &ch,
-        &v.identity,
-        &v.key,
-        v.network,
-        p.proposer == v.slot,
-        owned.as_ref(),
+        &mut signer, &session, &candidate, &v.public,
+        frost::Identifier::try_from(v.slot).map_err(|e| e.to_string())?,
+        params.as_ref(), &v.peers[&p.proposer], &other_signers,
     )
 }
 

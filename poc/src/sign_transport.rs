@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use reddsa_frost::frost::redpallas as frost;
 
-use crate::transport::{Incoming, Peer, Transport};
+use crate::transport::{Incoming, Outbound, Peer, Transport};
 
 const POLL_TRIES: usize = 400;
 const POLL_WAIT: Duration = Duration::from_millis(25);
@@ -52,7 +52,7 @@ where
 {
     let (nonce, commitment) = frost::round1::commit(key_package.signing_share(), &mut rand_core::OsRng);
     transport
-        .send(channel, &[], &commitment.serialize().map_err(|e| format!("serialize commitment: {e}"))?)
+        .send(channel, &[], &Outbound::Commitments(commitment))
         .map_err(|e| format!("send commitment: {e}"))?;
 
     let got = recv_until(transport, channel, false, 2)?;
@@ -61,7 +61,7 @@ where
     let share = frost_rerandomized::sign_with_randomizer_seed(&package, &nonce, key_package, &seed)
         .map_err(|e| format!("sign: {e}"))?;
     transport
-        .send(channel, &[], &share.serialize())
+        .send(channel, &[], &Outbound::Share(share))
         .map_err(|e| format!("send share: {e}"))?;
     Ok(())
 }
@@ -98,14 +98,13 @@ where
         rand_core::OsRng,
     )
     .map_err(|e| format!("randomizer: {e}"))?;
-    let package_bytes = package.serialize().map_err(|e| format!("serialize package: {e}"))?;
     for id in signers {
         let peer = peer_of.get(id).ok_or("signer has no relay address")?;
         transport
-            .send(channel, std::slice::from_ref(peer), &package_bytes)
+            .send(channel, std::slice::from_ref(peer), &Outbound::Package(package.clone()))
             .map_err(|e| format!("send package: {e}"))?;
         transport
-            .send(channel, std::slice::from_ref(peer), &seed)
+            .send(channel, std::slice::from_ref(peer), &Outbound::RandomizerSeed(seed.as_slice().try_into().map_err(|_| "randomizer seed must be 32 bytes")?))
             .map_err(|e| format!("send randomizer seed: {e}"))?;
     }
 

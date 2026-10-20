@@ -10,7 +10,7 @@ use std::thread;
 
 use loki_poc::setup_transport::Identity;
 use loki_poc::sign_transport::{coordinate, sign_as_participant};
-use loki_poc::transport::{FrostdTransport, Peer, Transport};
+use loki_poc::transport::{FrostdLoginKey, FrostdTransport, Peer, Transport};
 use reddsa_frost::frost::redpallas as frost;
 
 #[test]
@@ -43,7 +43,7 @@ fn sign_driver_two_of_three_verifies_over_frostd() {
     let coord = Identity::new(9);
     let coord_secret: [u8; 32] = coord.to_secret_bytes()[34..].try_into().unwrap();
     let mut coord_tx =
-        FrostdTransport::new(&url, Peer(coord.public().encryption), coord_secret).expect("coordinator login");
+        FrostdTransport::new(&url, FrostdLoginKey::from_secret_bytes(coord_secret)).expect("coordinator login");
     let coord_ch = coord_tx.open(&signer_peers, 4).expect("open session");
     let session = coord_ch.session_id();
 
@@ -66,7 +66,7 @@ fn sign_driver_two_of_three_verifies_over_frostd() {
         let key_package = key_packages[&id].clone();
         signer_handles.push(thread::spawn(move || {
             let secret: [u8; 32] = me.to_secret_bytes()[34..].try_into().unwrap();
-            let mut tx = FrostdTransport::new(&url, Peer(me.public().encryption), secret).expect("member login");
+            let mut tx = FrostdTransport::new(&url, FrostdLoginKey::from_secret_bytes(secret)).expect("member login");
             let channel = tx.join(session).expect("join session");
             sign_as_participant(&tx, &channel, &key_package).expect("sign");
         }));
