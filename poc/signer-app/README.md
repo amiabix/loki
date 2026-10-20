@@ -8,7 +8,7 @@ provisioned macOS app (the only place macOS allows persistent SE keys — a bare
 - Apple ID in Xcode → Settings → Accounts.
 - **Apple WWDR intermediate** installed (otherwise the Dev cert is "invalid"):
   `curl -O https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer && security import AppleWWDRCAG3.cer -k ~/Library/Keychains/login.keychain-db`
-- Team: `B399KAT22M`. Touch ID present (biometric mode works).
+- Team: `<your-team-id>`. Touch ID present (biometric mode works).
 
 ## Build + run (the one GUI step that provisions a free-team profile)
 ```sh

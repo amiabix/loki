@@ -2,12 +2,12 @@
 
 The demo needs a real Zcash chain so a signed FROST multisig tx can be
 **broadcast** and **confirmed**, not just verified-valid. Two paths work on the
-demo host (omarchy). Pick one.
+demo host (the build host). Pick one.
 
 Host access:
 
 ```
-ssh -o HostKeyAlias=omarchy abix@100.83.113.38
+ssh <build-host>
 ```
 
 ---
@@ -17,7 +17,7 @@ ssh -o HostKeyAlias=omarchy abix@100.83.113.38
 No local node, no version skew with the Loki Python, and this is the path of
 the earlier confirmed Testnet payment.
 
-- **lightwalletd**: `https://testnet.zec.rocks:443` — reachable from omarchy
+- **lightwalletd**: `https://testnet.zec.rocks:443` — reachable from the build host
   (TLS connects, HTTP 200).
 - **Broadcast**: `loki_member_payment finish` sends the raw tx to lightwalletd
   via gRPC `SendTransaction` (`poc/src/bin/loki_member_payment.rs:1095-1101`).
@@ -50,7 +50,7 @@ Self-contained, nothing to fund from a tap, instant blocks. The node matches
 the contract `poc/demo/managed_ths.py` drives (RPC branch `37a5165b`,
 `/api/v1/status`, `ths mine`, bundled lightwalletd).
 
-### One-time setup (on omarchy)
+### One-time setup (on the build host)
 
 The installed launcher under the old name `thus-spoke-zakura` is stale and
 lacks `mine`/`faucet`. Build the current `ths` from the checkout and pull its

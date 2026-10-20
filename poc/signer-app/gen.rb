@@ -11,7 +11,10 @@ target.build_configurations.each do |c|
   bs['PRODUCT_BUNDLE_IDENTIFIER'] = 'cash.loki.signer'
   bs['PRODUCT_NAME'] = 'LokiSigner'
   bs['CODE_SIGN_STYLE'] = 'Automatic'
-  bs['DEVELOPMENT_TEAM'] = 'B399KAT22M'
+  # Your Apple Developer Team ID — from the environment, not hardcoded. If unset, Xcode's
+  # automatic signing picks the only team on the machine. `export LOKI_DEV_TEAM=XXXXXXXXXX`.
+  team = ENV['LOKI_DEV_TEAM'].to_s
+  bs['DEVELOPMENT_TEAM'] = team unless team.empty?
   bs['CODE_SIGN_ENTITLEMENTS'] = 'LokiSigner.entitlements'
   bs['SWIFT_VERSION'] = '5.0'
   bs['MACOSX_DEPLOYMENT_TARGET'] = '13.0'
