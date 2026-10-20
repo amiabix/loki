@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Make one funded 2-of-3 Testnet self-payment on the omarchy relay stack."""
+"""Make one funded 2-of-3 Testnet self-payment on the the build host relay stack."""
 
 import json
 import os

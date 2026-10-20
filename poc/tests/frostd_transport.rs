@@ -31,7 +31,7 @@
 //! The seal/transport regression (`relay_observer_cannot_recover_round2`) is OFFLINE and
 //! always runs.
 //!
-//! Start a local insecure relay on omarchy:
+//! Start a local insecure relay on the build host:
 //!   frostd --no-tls-very-insecure -p 2744
 //! then: FROSTD_URL=http://127.0.0.1:2744 cargo test --test frostd_transport -- --nocapture
 
