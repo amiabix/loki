@@ -168,6 +168,15 @@ impl Snapshot {
             prepared: self.prepared.clone(),
         }
     }
+    /// The phase of a saved generation. A `LOKIENG1` generation, written before the v2
+    /// round two, is only ever read for its phase: it is never turned into a v2 state and
+    /// its round-two messages are never reused.
+    fn saved_phase(raw: &[u8]) -> Result<(CeremonyPhase, bool), String> {
+        if raw.starts_with(b"LOKIENG1") {
+            return Ok((CeremonyPhase::decode(*raw.get(8).ok_or(ERROR)?)?, true));
+        }
+        Ok((Self::decode(raw)?.phase, false))
+    }
     /// Terminal state: keep the received history, drop every secret and the fresh key.
     fn retire(&mut self) {
         self.phase = CeremonyPhase::Aborted;
@@ -221,6 +230,11 @@ impl SetupCeremony {
         if journal.latest().is_none() {
             journal.append(&Snapshot::ready().encode()?)?;
         }
+        if Snapshot::saved_phase(&journal.latest().ok_or(ERROR)?.payload)?.1 {
+            // A setup begun before the v2 round two cannot continue; it is retired with
+            // `abort_saved_checkpoint` and a new setup starts.
+            return Err("setup_fresh_vault_required".into());
+        }
         let snapshot = Snapshot::decode(&journal.latest().ok_or(ERROR)?.payload)?;
         if matches!(
             snapshot.phase,
@@ -257,7 +271,7 @@ impl SetupCeremony {
         }
         let journal = Journal::open(&path, passphrase, context, own)?;
         Ok(Some(
-            Snapshot::decode(&journal.latest().ok_or(ERROR)?.payload)?.phase,
+            Snapshot::saved_phase(&journal.latest().ok_or(ERROR)?.payload)?.0,
         ))
     }
     #[cfg(any(feature = "relay-communication", test))]
@@ -276,11 +290,19 @@ impl SetupCeremony {
             return Ok(());
         }
         let mut journal = Journal::open(&path, passphrase, context, own)?;
-        let mut snapshot = Snapshot::decode(&journal.latest().ok_or(ERROR)?.payload)?;
-        if snapshot.phase == CeremonyPhase::Aborted {
+        let payload = journal.latest().ok_or(ERROR)?.payload.clone();
+        let (phase, legacy) = Snapshot::saved_phase(&payload)?;
+        if phase == CeremonyPhase::Aborted {
             return Ok(());
         }
-        if snapshot.phase == CeremonyPhase::Active {
+        // A legacy generation is retired with an empty v2 snapshot; the legacy
+        // generations stay in the journal.
+        let mut snapshot = if legacy {
+            Snapshot::ready()
+        } else {
+            Snapshot::decode(&payload)?
+        };
+        if phase == CeremonyPhase::Active {
             if !matches!(confirmed_terminal, Some(1 | 3 | 4)) {
                 return Err("setup_already_active".into());
             }
@@ -937,6 +959,17 @@ mod tests {
             std::fs::remove_dir_all(root).unwrap();
         }
     }
+    fn engine_accepted(document: &[u8]) -> AcceptedCeremonyRoster {
+        AcceptedCeremonyRoster {
+            roster: crate::member_state::ValidatedRoster::new(
+                crate::member_state::Roster::from_bytes(document).unwrap(),
+            )
+            .unwrap(),
+            network: "regtest".into(),
+            operator_digest: [73; 32],
+            transport_required: true,
+        }
+    }
     #[test]
     fn hosted_core_refuses_to_commit_dkg_without_prepared_outer_ciphertext() {
         struct Owned;
@@ -1028,6 +1061,52 @@ mod tests {
             )
             .unwrap();
             assert_eq!(terminal.latest().unwrap().number, generation + 1);
+            drop(terminal);
+
+            // A setup saved before the v2 round two (a `LOKIENG1` generation in round two)
+            // does not reopen, reports its saved phase, and is retired with a wiped v2
+            // snapshot while its legacy generation stays in the journal.
+            let mut legacy = super::super::journal::Journal::open(
+                &member.path().join("setup-ceremony"),
+                "pass",
+                context,
+                1,
+            )
+            .unwrap();
+            let mut payload = b"LOKIENG1".to_vec();
+            payload.push(CeremonyPhase::Round2Saved as u8);
+            payload.extend_from_slice(&[0x5a; 64]);
+            let legacy_number = legacy.append(&payload).unwrap().number;
+            drop(legacy);
+            assert_eq!(
+                SetupCeremony::saved_phase(member.path(), "pass", context, 1, &lock).unwrap(),
+                Some(CeremonyPhase::Round2Saved),
+            );
+            assert_eq!(
+                SetupCeremony::open_with_member_lock(
+                    member.path(),
+                    "pass",
+                    engine_accepted(&document),
+                    &lock
+                )
+                .err()
+                .as_deref(),
+                Some("setup_fresh_vault_required"),
+            );
+            SetupCeremony::abort_saved_checkpoint(member.path(), "pass", context, 1, &lock, None)
+                .unwrap();
+            let terminal = super::super::journal::Journal::open(
+                &member.path().join("setup-ceremony"),
+                "pass",
+                context,
+                1,
+            )
+            .unwrap();
+            let latest = terminal.latest().unwrap();
+            assert_eq!(latest.number, legacy_number + 1);
+            let saved = Snapshot::decode(&latest.payload).unwrap();
+            assert_eq!(saved.phase, CeremonyPhase::Aborted);
+            assert!(saved.core.is_wiped());
             drop(terminal);
             drop(lock);
             std::fs::remove_dir_all(root).unwrap();

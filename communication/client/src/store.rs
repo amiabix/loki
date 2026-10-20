@@ -21,11 +21,35 @@ fn member_schema(count: usize) -> &'static str {
         return SCHEMA;
     }
     let schemas = SCHEMAS.get_or_init(|| {
+        // Without the template text `replace` would return the 3-member schema unchanged,
+        // and the stored schema would still validate against it.
+        assert!(
+            SCHEMA.contains(MEMBER_BOUND),
+            "schema.sql lost its member-number bound"
+        );
         (0..=usize::from(loki_relay_protocol::types::MAX_MEMBERS))
-            .map(|n| SCHEMA.replace("BETWEEN 1 AND 3)", &format!("BETWEEN 1 AND {n})")))
+            .map(|n| SCHEMA.replace(MEMBER_BOUND, &format!("BETWEEN 1 AND {n})")))
             .collect()
     });
     &schemas[count]
+}
+const MEMBER_BOUND: &str = "BETWEEN 1 AND 3)";
+
+#[cfg(test)]
+mod member_schema_tests {
+    #[test]
+    fn every_member_count_raises_every_bound() {
+        let bounds = super::SCHEMA.matches(super::MEMBER_BOUND).count();
+        assert!(bounds > 0);
+        for count in 3..=usize::from(loki_relay_protocol::types::MAX_MEMBERS) {
+            let schema = super::member_schema(count);
+            let wanted = format!("BETWEEN 1 AND {count})");
+            assert_eq!(schema.matches(wanted.as_str()).count(), bounds, "{count}");
+            if count != 3 {
+                assert!(!schema.contains(super::MEMBER_BOUND), "{count}");
+            }
+        }
+    }
 }
 const STORAGE_BUDGET: u64 = 512 * 1024 * 1024;
 const PENDING_TRANSFERS: u64 = 128;

@@ -484,7 +484,7 @@ fn pause_owned_checkpoint(root: &Path, generation: &Generation) -> Result<(), St
     let phase = generation.payload.get(8).copied().unwrap_or(255);
     let all = selected_phase == "all";
     if Path::new(&selected) != root
-        || !generation.payload.starts_with(b"LOKIENG1")
+        || !generation.payload.starts_with(b"LOKIENG2")
         || (all && (phase == 1 || phase > 8))
         || (!all && selected_phase.parse::<u8>().ok() != Some(phase))
     {
