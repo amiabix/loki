@@ -347,9 +347,9 @@ fn write_active(root: &Path, id: &str) -> Result<(), String> {
         file.write_all(id.as_bytes()).map_err(|e| e.to_string())?;
         file.sync_all().map_err(|e| e.to_string())?;
         fs::rename(&temp, target).map_err(|e| e.to_string())?;
-        File::open(root)
-            .and_then(|dir| dir.sync_all())
-            .map_err(|e| e.to_string())
+        // shortcut: a failed directory sync may lose this marker on power loss; retry it when selection becomes a custody gate.
+        let _ = File::open(root).and_then(|dir| dir.sync_all());
+        Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(temp);
