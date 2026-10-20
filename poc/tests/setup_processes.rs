@@ -2,6 +2,7 @@ use loki_poc::state::MemberDir;
 use std::{
     collections::BTreeMap,
     fs,
+    io::Write,
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -628,6 +629,25 @@ fn three_processes_create_one_vault_without_sharing_secrets() {
             String::from_utf8_lossy(&repeated.stderr)
         );
     }
+    // The guided Rust entrypoint must restore real final cards through inherited
+    // descriptors, then refuse to sweep back to the source vault.
+    let recovery = env!("CARGO_BIN_EXE_loki_recover");
+    let recovery_input = format!(
+        "{}\n{}\nnew passphrase for member one\n{}\n{}\nnew passphrase for member two\n{}\n",
+        root.join("final-card-1/vault.card").display(),
+        fs::read_to_string(root.join("member-1/words.txt")).unwrap().trim(),
+        root.join("final-card-2/vault.card").display(),
+        fs::read_to_string(root.join("member-2/words.txt")).unwrap().trim(),
+        addresses[0].trim(),
+    );
+    let mut guided = Command::new(recovery)
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .spawn().unwrap();
+    guided.stdin.take().unwrap().write_all(recovery_input.as_bytes()).unwrap();
+    let guided = guided.wait_with_output().unwrap();
+    assert!(!guided.status.success());
+    assert!(String::from_utf8_lossy(&guided.stderr).contains("different vault"),
+        "real native card/pipe recovery: {}", String::from_utf8_lossy(&guided.stderr));
     // The payment CLI must reject bad local context before it can create an
     // attempt record or publish any commitment.
     let pay = env!("CARGO_BIN_EXE_loki_member_payment");
@@ -656,6 +676,37 @@ fn three_processes_create_one_vault_without_sharing_secrets() {
     assert!(!malformed.status.success());
     assert!(String::from_utf8_lossy(&malformed.stderr).contains("manifest:"));
     assert!(!first.join("signing").exists());
+
+    // The actual payment binary must also unlock from a one-shot inherited pipe.
+    // It reaches manifest validation only after reading and opening member state.
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+    let mut fds = [0; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    for fd in fds { assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) }, 0); }
+    let reader = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let mut writer = unsafe { fs::File::from_raw_fd(fds[1]) };
+    let fd = reader.as_raw_fd();
+    let mut command = Command::new(pay);
+    command.args(["sign", first.to_str().unwrap(), &format!("/dev/fd/{fd}"),
+        roster.to_str().unwrap(), work.to_str().unwrap()]);
+    unsafe {
+        command.pre_exec(move || {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    drop(reader);
+    writer.write_all(&fs::read(first.join("pass.txt")).unwrap()).unwrap();
+    drop(writer);
+    let one_shot = child.wait_with_output().unwrap();
+    assert!(!one_shot.status.success());
+    assert!(String::from_utf8_lossy(&one_shot.stderr).contains("manifest:"),
+        "payment pipe: {}", String::from_utf8_lossy(&one_shot.stderr));
 
     let intent = loki_poc::intent::Intent {
         proposer: reddsa_frost::frost::redpallas::Identifier::try_from(1u16)

@@ -40,7 +40,7 @@ use zcash_primitives::transaction::TxId;
 use zcash_client_backend::wallet::LockOwner;
 use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::{consensus::Parameters, memo::MemoBytes, value::Zatoshis};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 fn signer_set_from_name(name: &str, threshold: u16) -> Result<Vec<u16>, String> {
     let signers = name.bytes().map(|label| match label {
@@ -171,10 +171,8 @@ fn state(args: &[String]) -> Result<(MemberState, PathBuf, Zeroizing<String>), S
         return Err("expected <member-dir> <passphrase-file> <roster.json> <work-dir>".into());
     }
     let owner = PathBuf::from(&args[0]);
-    let loaded = member_state::open(&owner, Path::new(&args[1]), Path::new(&args[2]))?;
-    let mut pass = fs::read_to_string(&args[1]).map_err(|e| e.to_string())?;
-    let trimmed = Zeroizing::new(pass.trim_end_matches(['\r', '\n']).to_string());
-    pass.zeroize();
+    let trimmed = member_state::read_private_text(Path::new(&args[1]))?;
+    let loaded = member_state::open_with_passphrase(&owner, &trimmed, Path::new(&args[2]))?;
     Ok((loaded, owner, trimmed))
 }
 

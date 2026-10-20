@@ -31,6 +31,8 @@ rand_chacha        = "0.3"
 blake2b_simd       = "1"
 blake3             = "1.8"
 zeroize            = "1"
+libc               = "0.2"
+tempfile           = "3"
 bip39              = { version = "2.2.2", default-features = false, features = ["std", "zeroize"] }
 zip32              = "=0.2.1"
 # At-rest encryption for member secrets (`MemberDir::write_sealed`). XChaCha20-Poly1305

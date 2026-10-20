@@ -233,9 +233,11 @@ the local **Fund Vault** action uses the separate THS faucet described below.
 Two members who each saved a **final** `loki-vault.card` and their 24 words can
 spend without the old devices, old unlock passphrases, setup courier, or payment
 relays. Use one trusted recovery computer together. Each member enters their
-own words and chooses a new local unlock passphrase; each checks and approves
-the full transaction review independently. The tool erases its temporary
-restored stores when it exits normally.
+own words and chooses a new local unlock passphrase; each checks the full
+transaction review and types the payment ID to approve it. Both recovered
+shares and both approvals are handled on this one computer, so this emergency
+path concentrates the threshold there. Run it only on a computer both members
+trust. The tool removes its temporary restored stores when it exits normally.
 
 To replace a departing member, first create a **new** 2-of-3 vault in the
 member app with the continuing members, complete its backup checks, and copy
@@ -244,7 +246,7 @@ its receive address. Then run:
 ```sh
 cd poc
 cargo build --locked --bins
-python3 wallet/recovery_tool.py --rpc 127.0.0.1:18232
+./target/debug/loki_recover --rpc 127.0.0.1:18232
 ```
 
 Enter each member's final card **file** and 24 words when prompted, then the
@@ -253,9 +255,16 @@ chain, creates a sweep of all currently unspent source notes, displays the
 Rust signer's exact review to each member, and broadcasts only after both
 approve. Check the transaction ID and the new vault's balance after it is
 mined. A relay outage does not affect this path; a reachable regtest node is
-still required. No old passphrase or developer-run Rust command is needed.
+still required. No old passphrase is needed.
 The new vault must have a different address. Compare the displayed recipient
 with the new vault's address before either member approves.
+
+The native CLI passes backup words and passphrases through anonymous pipes,
+without writing them to named files. Its private temporary directory holds
+copied final cards, sealed restored state, the public roster, and payment work;
+it is removed on normal exit. Treat the cards and temporary directory as
+sensitive. A funded, mined end-to-end recovery sweep still needs
+live regtest verification before this beta path is release ready.
 
 The current payment manifest supports at most eight source notes. If the
 source vault has more, the tool stops before signing. See

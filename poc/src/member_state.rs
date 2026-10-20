@@ -1,12 +1,12 @@
 //! Validated state produced by the separate-member setup ceremony.
 
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{collections::BTreeMap, fs, io::Read, path::Path};
 
 use blake2b_simd::Params;
 use orchard::keys::FullViewingKey;
 use reddsa_frost::frost::redpallas as frost;
 use zcash_protocol::consensus::Parameters;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::{
     network::{VaultNetwork, TESTNET_NU7_BIRTH},
@@ -310,25 +310,42 @@ fn hex_bytes(value: &serde_json::Value, field: &str) -> Result<Vec<u8>, String> 
 }
 
 pub fn open(owner: &Path, pass_file: &Path, roster_file: &Path) -> Result<MemberState, String> {
+    let trimmed = read_private_text(pass_file)?;
+    open_with_passphrase(owner, &trimmed, roster_file)
+}
+
+/// Accept an owner-only regular file or an inherited anonymous descriptor.
+/// A named FIFO/socket path is never a valid secret source.
+pub fn read_private_text(path: &Path) -> Result<Zeroizing<String>, String> {
+    let metadata = fs::metadata(path).map_err(|e| e.to_string())?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        if fs::metadata(pass_file)
-            .map_err(|e| e.to_string())?
-            .permissions()
-            .mode()
-            & 0o077
-            != 0
-        {
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+        let inherited = path.to_str().and_then(|value| value.strip_prefix("/dev/fd/"))
+            .is_some_and(|fd| !fd.is_empty() && fd.bytes().all(|b| b.is_ascii_digit()))
+            && (metadata.file_type().is_socket() || metadata.file_type().is_fifo());
+        if !inherited && (!metadata.is_file() || metadata.permissions().mode() & 0o077 != 0) {
             return Err("passphrase file must be owner-only (mode 0600)".into());
         }
     }
-    let mut pass = fs::read_to_string(pass_file).map_err(|e| e.to_string())?;
-    let trimmed = Zeroizing::new(pass.trim_end_matches(['\r', '\n']).to_string());
-    pass.zeroize();
-    if trimmed.is_empty() {
+    let mut raw = Zeroizing::new(String::new());
+    fs::File::open(path).map_err(|e| e.to_string())?
+        .take(4099).read_to_string(&mut raw).map_err(|e| e.to_string())?;
+    if raw.len() > 4098 { return Err("invalid private input".into()); }
+    let text = Zeroizing::new(raw.trim_end_matches(['\r', '\n']).to_owned());
+    if text.is_empty() || text.len() > 4096 { return Err("invalid private input".into()); }
+    Ok(text)
+}
+
+pub fn open_with_passphrase(
+    owner: &Path,
+    passphrase: &str,
+    roster_file: &Path,
+) -> Result<MemberState, String> {
+    if passphrase.is_empty() {
         return Err("empty passphrase".into());
     }
+    let trimmed = Zeroizing::new(passphrase.to_owned());
     crate::seal_kdf::enable_session_cache(&trimmed);
     let dir = MemberDir::open(owner, "secrets");
     let state: serde_json::Value = serde_json::from_slice(

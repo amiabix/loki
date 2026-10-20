@@ -37,25 +37,7 @@ fn passphrase(path: &Path) -> Result<String, String> {
 
 /// Reads an owner-only secret file without touching the KDF session cache.
 fn secret_file(path: &Path) -> Result<String, String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if fs::metadata(path)
-            .map_err(|e| e.to_string())?
-            .permissions()
-            .mode()
-            & 0o077
-            != 0
-        {
-            return Err("passphrase file must be owner-only (mode 0600)".into());
-        }
-    }
-    let pass = fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let pass = pass.trim_end_matches(['\r', '\n']);
-    if pass.is_empty() {
-        return Err("empty passphrase".into());
-    }
-    Ok(pass.to_string())
+    Ok(loki_poc::member_state::read_private_text(path)?.to_string())
 }
 
 fn name(vault: &[u8; 32], phase: &str, from: u16, to: Option<u16>) -> String {
