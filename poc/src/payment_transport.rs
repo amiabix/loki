@@ -88,6 +88,11 @@ where
         )?;
         let candidate = pczt::roles::creator::Creator::build_from_parts(built.pczt_parts)
             .ok_or("create candidate from parts failed")?;
+        // Compress the value-commitment trapdoors into the per-bundle bsk; without this the
+        // transaction extractor fails with Sapling MissingBindingSignatureSigningKey at prove.
+        let candidate = pczt::roles::io_finalizer::IoFinalizer::new(candidate)
+            .finalize_io()
+            .map_err(|e| format!("io finalize: {e:?}"))?;
         transport
             .send(
                 channel,
