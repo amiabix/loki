@@ -7,9 +7,9 @@ publish.workspace = true
 
 [dependencies]
 loki-relay-protocol = { path = "../protocol" }
-axum = { version = "=0.8.6", default-features = false, features = ["http1", "tokio"] }
-tokio = { version = "=1.53.2", features = ["macros", "rt-multi-thread", "sync", "net", "time", "signal"] }
-tower = { version = "=0.5.2", features = ["util", "limit", "timeout"] }
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio"] }
+tokio = { version = "=1.54.0", features = ["macros", "rt-multi-thread", "sync", "net", "time", "signal"] }
+tower = { version = "=0.5.3", features = ["util", "limit", "timeout"] }
 rusqlite = { version = "=0.37.0", features = ["bundled"] }
 ed25519-dalek = "=2.2.0"
 base64 = "=0.22.1"
