@@ -68,7 +68,7 @@ impl BackupDevice for HostedBackup {
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct WireIdentity {
+pub(super) struct WireIdentity {
     id: u16,
     signing: String,
     encryption: String,
@@ -83,7 +83,7 @@ impl WireIdentity {
         }
     }
 
-    fn public(&self, slot: u16) -> Result<PublicIdentity, String> {
+    pub(super) fn public(&self, slot: u16) -> Result<PublicIdentity, String> {
         if self.id != slot {
             return Err("identity slot mismatch".into());
         }

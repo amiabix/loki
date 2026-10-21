@@ -26,6 +26,7 @@ use zcash_protocol::{
 use zeroize::Zeroizing;
 
 use super::{
+    ceremony::WireIdentity,
     routes::{blocking, err},
     state::Shared,
 };
@@ -33,7 +34,8 @@ use crate::{
     candidate::{quote_fee, CandidateInputs},
     network::{VaultNetwork, TESTNET_NU7_BIRTH},
     payment_transport::{coordinate, signer_loop},
-    setup_transport::Identity,
+    signing_session::{AttemptId, SessionContext},
+    setup_transport::{Identity, PublicIdentity},
     signer::{
         local::LocalSigner, secure_element::SoftwareSecureElement, CandidateRef, Network,
         PublicPaymentParams, Signer,
@@ -91,7 +93,7 @@ struct Vault {
     identity: Identity,
     threshold: u16,
     slot: u16,
-    peers: BTreeMap<u16, Peer>,
+    peers: BTreeMap<u16, PublicIdentity>,
     birth_height: u32,
 }
 
@@ -218,10 +220,12 @@ fn load_vault(data: &Path, pass: &str, vault: &str, configured: &str) -> Result<
     let mut peers = BTreeMap::new();
     for n in 1..=v["members"].as_u64().ok_or("missing members")? {
         let slot: u16 = n.try_into().map_err(|_| "invalid member id")?;
-        let encryption = required(&c["slots"][slot.to_string()]["identity"], "encryption")?;
-        peers.insert(slot, Peer(hex32(encryption)?));
+        let wire: WireIdentity =
+            serde_json::from_value(c["slots"][slot.to_string()]["identity"].clone())
+                .map_err(|e| e.to_string())?;
+        peers.insert(slot, wire.public(slot)?);
     }
-    if peers.get(&slot) != Some(&Peer(identity.public().encryption)) {
+    if peers.get(&slot) != Some(&identity.public()) {
         return Err("member relay identity mismatch".into());
     }
     // shortcut: older Testnet seals scan from NU7; upgrade when migrating those vaults to stored birth checkpoints.
@@ -308,46 +312,6 @@ fn relay(identity: &Identity, url: &str) -> Result<FrostdTransport, String> {
     // encryption pubkey the roster already maps it to. (A dedicated login key is a later
     // hardening; here reuse keeps the roster addressing unchanged.)
     FrostdTransport::new(url, FrostdLoginKey::from_secret_bytes(secret)).map_err(|e| e.to_string())
-}
-
-struct ReviewedTransport<'a> {
-    inner: &'a FrostdTransport,
-    payment: &'a Payment,
-    vault: &'a Vault,
-}
-
-impl Transport for ReviewedTransport<'_> {
-    type Error = String;
-    type Channel = FrostdChannel;
-    fn open(&mut self, _peers: &[Peer], _message_count: u8) -> Result<FrostdChannel, String> {
-        Err("signer cannot open session".into())
-    }
-    fn join(&mut self, _session: Uuid) -> Result<FrostdChannel, String> {
-        Err("signer session already joined".into())
-    }
-    fn send(&self, channel: &FrostdChannel, to: &[Peer], message: &Outbound) -> Result<(), String> {
-        if let Outbound::Candidate(candidate) = message {
-            review_candidate(candidate.as_bytes(), self.payment, self.vault)?;
-        }
-        self.inner
-            .send(channel, to, message)
-            .map_err(|e| e.to_string())
-    }
-    fn recv(&self, channel: &FrostdChannel, as_coordinator: bool) -> Result<Vec<Incoming>, String> {
-        let messages = self
-            .inner
-            .recv(channel, as_coordinator)
-            .map_err(|e| e.to_string())?;
-        for incoming in &messages {
-            if pczt::Pczt::parse(&incoming.message).is_ok() {
-                review_candidate(&incoming.message, self.payment, self.vault)?;
-            }
-        }
-        Ok(messages)
-    }
-    fn close(&self, channel: FrostdChannel) -> Result<(), String> {
-        self.inner.close(channel).map_err(|e| e.to_string())
-    }
 }
 
 fn review_candidate(bytes: &[u8], payment: &Payment, vault: &Vault) -> Result<(), String> {
@@ -575,7 +539,7 @@ pub(super) async fn publish(State(st): State<Shared>, Json(body): Json<Value>) -
         let peers = p
             .signers
             .iter()
-            .map(|id| v.peers[id].clone())
+            .map(|id| Peer(v.peers[id].encryption))
             .collect::<Vec<_>>();
         let ch = tx.open(&peers, 4).map_err(|e| e.to_string())?;
         p.session_id = Some(ch.session_id());
@@ -704,11 +668,6 @@ fn sign(st: &Shared, data: &Path, pass: &str, p: &Payment, v: &Vault) -> Result<
     let mut local = read_payment(data, pass, &p.vault, &p.attempt)?;
     local.approval_started = true;
     save_payment(data, pass, &local)?;
-    let reviewed = ReviewedTransport {
-        inner: &tx,
-        payment: p,
-        vault: v,
-    };
     let signer_network = match v.network {
         VaultNetwork::Regtest => Network::Regtest,
         VaultNetwork::Testnet => Network::Testnet,
@@ -734,13 +693,52 @@ fn sign(st: &Shared, data: &Path, pass: &str, p: &Payment, v: &Vault) -> Result<
     });
     let other_signers = p.signers.iter().filter(|id| **id != v.slot)
         .map(|id| v.peers[id].clone()).collect::<Vec<_>>();
+    let context = signing_context(p)?;
+    let dir = member_dir(data, &p.vault)?;
+    let proposer = p.proposer == v.slot;
+    if proposer {
+        // A retry builds a new candidate under a new randomizer; never hand over a stale one.
+        match std::fs::remove_file(dir.path().join(candidate_file(&p.attempt))) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(format!("clear stale candidate: {e}"))
+            }
+            _ => {}
+        }
+    }
     signer_loop(
-        &reviewed,
+        &tx,
         &ch,
         &mut signer, &session, &candidate, &v.public,
         frost::Identifier::try_from(v.slot).map_err(|e| e.to_string())?,
-        params.as_ref(), &v.peers[&p.proposer], &other_signers,
+        params.as_ref(), &v.identity, &context, &v.peers[&p.proposer], &other_signers,
+        &mut |bytes| {
+            review_candidate(bytes, p, v)?;
+            // The coordinator runs in this process (`finish`); hand it the candidate through
+            // the encrypted member store instead of the relay.
+            if proposer {
+                dir.write_sealed(&candidate_file(&p.attempt), bytes, pass)
+                    .map_err(|e| format!("save candidate: {e}"))?;
+            }
+            Ok(())
+        },
     )
+}
+
+/// The proposer's encrypted local hand-off of its candidate to its own coordinator.
+fn candidate_file(attempt: &str) -> String {
+    format!("candidate-{attempt}.sealed")
+}
+
+/// The sealed-envelope context of one hosted signing attempt.
+fn signing_context(p: &Payment) -> Result<SessionContext, String> {
+    let mut signers = p.signers.clone();
+    signers.sort_unstable();
+    Ok(SessionContext {
+        vault: hex32(&p.vault)?,
+        payment: hex32(&p.attempt)?,
+        attempt: AttemptId(hex32(&p.attempt)?),
+        signers,
+    })
 }
 
 fn frontier(
@@ -825,9 +823,17 @@ pub(super) async fn finish(State(st): State<Shared>, Json(body): Json<Value>) ->
                 .signers
                 .iter()
                 .zip(&ids)
-                .map(|(slot, id)| (*id, v.peers[slot].clone()))
+                .map(|(slot, id)| (*id, Peer(v.peers[slot].encryption)))
                 .collect();
-            let signed = coordinate(&tx, &ch, &v.public, &ids, &peer_of, v.threshold, OsRng)?;
+            let dir = member_dir(&data, &vault)?;
+            let file = candidate_file(&attempt);
+            let signed = coordinate(&tx, &ch, &v.public, &ids, &peer_of, v.threshold, OsRng, || {
+                match dir.read_sealed(&file, &pass) {
+                    Ok(bytes) => Ok(Some(bytes)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(e) => Err(format!("read candidate: {e}")),
+                }
+            })?;
             p.signed_pczt = Some(hex::encode(signed));
             save_payment(&data, &pass, &p)?;
             let _ = tx.close(ch);
@@ -886,6 +892,7 @@ pub(super) async fn finish(State(st): State<Shared>, Json(body): Json<Value>) ->
         p.signed_pczt = None;
         p.raw_tx = None;
         save_payment(&data, &pass, &p)?;
+        let _ = std::fs::remove_file(member_dir(&data, &vault)?.path().join(candidate_file(&attempt)));
         Ok(json!({"phase":"broadcast","txid":p.txid}))
     })
     .await
