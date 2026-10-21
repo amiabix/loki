@@ -34,14 +34,14 @@ use crate::{
     candidate::{quote_fee, CandidateInputs},
     network::{VaultNetwork, TESTNET_NU7_BIRTH},
     payment_transport::{coordinate, signer_loop},
-    signing_session::{AttemptId, SessionContext},
+    signing_session::{AttemptId, MessageKind, SessionContext},
     setup_transport::{Identity, PublicIdentity},
     signer::{
         local::LocalSigner, secure_element::SoftwareSecureElement, CandidateRef, Network,
         PublicPaymentParams, Signer,
     },
     state::MemberDir,
-    transport::{FrostdChannel, FrostdLoginKey, FrostdTransport, Incoming, Outbound, Peer, Transport},
+    transport::{FrostdLoginKey, FrostdTransport, Peer, Transport},
     tx_finalize::prove,
     vault,
     verify::{check_candidate, Expectations, Refusal},
@@ -375,35 +375,84 @@ fn check_intent(p: &Payment, v: &Vault) -> Result<(), String> {
 fn public_intent(p: &Payment) -> Value {
     json!({"attempt":p.attempt,"vault":p.vault,"proposer":p.proposer,"recipient":p.recipient,"amount_zat":p.amount_zat,"memo":p.memo,"fee_zat":p.fee_zat,"change_zat":p.change_zat,"note_selection":p.note_selection,"target_height":p.target_height,"expiry_height":p.expiry_height,"signers":p.signers,"phase":p.phase,"session_id":p.session_id})
 }
-fn peer_get(url: &str, vault: &str, attempt: &str) -> Result<Value, String> {
+const UNAVAILABLE: &str = "payment session unavailable";
+const PEER_REQUEST: &[u8] = b"loki payment-session v1";
+
+/// The sealed-envelope context between two members about one payment attempt.
+fn peer_context(vault: &str, attempt: &str, a: u16, b: u16) -> Result<SessionContext, String> {
+    Ok(SessionContext {
+        vault: hex32(vault)?,
+        payment: hex32(attempt)?,
+        attempt: AttemptId(hex32(attempt)?),
+        signers: vec![a.min(b), a.max(b)],
+    })
+}
+
+/// Ask member `slot`'s host for its view of a payment. The request is signed and sealed
+/// with this member's roster identity, and the reply must open under `slot`'s.
+fn peer_get(url: &str, v: &Vault, vault: &str, attempt: &str, slot: u16) -> Result<Value, String> {
+    let peer = v.peers.get(&slot).ok_or("unknown peer")?;
+    let context = peer_context(vault, attempt, v.slot, slot)?;
+    let request = v.identity.seal_session(peer, &context, MessageKind::PeerRequest, PEER_REQUEST)?;
     let rt = runtime()?;
-    rt.block_on(async {
+    let response: Value = rt.block_on(async {
         let response = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| e.to_string())?
-            .get(format!(
-                "{url}/api/payment-session?vault={vault}&attempt={attempt}"
-            ))
+            .post(format!("{url}/api/payment-session"))
+            .json(&json!({"vault":vault,"attempt":attempt,"from":v.slot,"request":hex::encode(request)}))
             .send()
             .await
             .map_err(|e| e.to_string())?;
         if !response.status().is_success() {
-            return Err("payment session unavailable".into());
+            return Err(UNAVAILABLE.to_string());
         }
         response.json().await.map_err(|e| e.to_string())
-    })
+    })?;
+    let reply = hex::decode(response["reply"].as_str().ok_or(UNAVAILABLE)?).map_err(|e| e.to_string())?;
+    let opened = v.identity.open_session(peer, &context, &reply)?;
+    if opened.kind != MessageKind::PeerReply {
+        return Err(UNAVAILABLE.into());
+    }
+    serde_json::from_slice(&opened.body).map_err(|e| e.to_string())
 }
-fn ready_to_send(st: &Shared, p: &Payment, own_slot: u16) -> bool {
+
+/// Answer a selected signer's sealed `/api/payment-session` request with this member's view
+/// of the payment, sealed back to it. Anyone else gets the same refusal whether or not the
+/// payment exists.
+fn answer_peer(data: &Path, pass: &str, v: &Vault, body: &Value) -> Result<Value, String> {
+    let (vault, attempt) = pair(body).map_err(|_| UNAVAILABLE)?;
+    let (vault, attempt) = (vault.as_str(), attempt.as_str());
+    let from = body["from"].as_u64().and_then(|n| u16::try_from(n).ok()).ok_or(UNAVAILABLE)?;
+    let request = hex::decode(body["request"].as_str().ok_or(UNAVAILABLE)?).map_err(|_| UNAVAILABLE)?;
+    let peer = v.peers.get(&from).filter(|_| from != v.slot).ok_or(UNAVAILABLE)?;
+    let p = read_payment(data, pass, vault, attempt).map_err(|_| UNAVAILABLE)?;
+    let id = p.session_id.filter(|_| p.signers.contains(&from)).ok_or(UNAVAILABLE)?;
+    let context = peer_context(vault, attempt, v.slot, from)?;
+    let opened = v.identity.open_session(peer, &context, &request).map_err(|_| UNAVAILABLE)?;
+    if opened.kind != MessageKind::PeerRequest || opened.body != PEER_REQUEST {
+        return Err(UNAVAILABLE.into());
+    }
+    let reply = json!({"session_id":id,"intent":public_intent(&p),"approval_started":p.approval_started});
+    let reply = v.identity.seal_session(
+        peer,
+        &context,
+        MessageKind::PeerReply,
+        &serde_json::to_vec(&reply).map_err(|e| e.to_string())?,
+    )?;
+    Ok(json!({"reply":hex::encode(reply)}))
+}
+fn ready_to_send(st: &Shared, p: &Payment, v: &Vault) -> bool {
     p.phase == "signing"
         && p.signers.iter().all(|slot| {
-            if *slot == own_slot {
+            if *slot == v.slot {
                 p.approval_started
             } else {
                 st.config
                     .peers
                     .get(slot)
-                    .and_then(|url| peer_get(url, &p.vault, &p.attempt).ok())
+                    .and_then(|url| peer_get(url, v, &p.vault, &p.attempt, *slot).ok())
                     .and_then(|r| r["approval_started"].as_bool())
                     .unwrap_or(false)
             }
@@ -424,7 +473,7 @@ fn discover(
         if slot == v.slot {
             continue;
         }
-        let Ok(response) = peer_get(url, vault, attempt) else {
+        let Ok(response) = peer_get(url, v, vault, attempt, slot) else {
             continue;
         };
         let mut p: Payment =
@@ -551,23 +600,22 @@ pub(super) async fn publish(State(st): State<Shared>, Json(body): Json<Value>) -
     .await
 }
 
-pub(super) async fn session(
-    State(st): State<Shared>,
-    Query(query): Query<BTreeMap<String, String>>,
-) -> Reply {
-    let (Some(vault), Some(attempt)) = (query.get("vault"), query.get("attempt")) else {
-        return err(StatusCode::BAD_REQUEST, "missing vault or attempt");
-    };
-    let (vault, attempt) = (vault.clone(), attempt.clone());
+pub(super) async fn session(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
     let (data, pass) = match unlocked(&st).await {
         Ok(x) => x,
         Err(e) => return e,
     };
-    blocking(move || {
-        let p = read_payment(&data, &pass, &vault, &attempt)?;
-        let id = p.session_id.ok_or("payment session pending")?;
-        Ok(json!({"session_id":id,"intent":public_intent(&p),"approval_started":p.approval_started}))
-    }).await
+    let reply = blocking(move || {
+        let vault = required(&body, "vault").map_err(|_| UNAVAILABLE)?;
+        let v = load_vault(&data, &pass, vault, &st.config.network).map_err(|_| UNAVAILABLE)?;
+        answer_peer(&data, &pass, &v, &body)
+    })
+    .await;
+    if reply.0 == StatusCode::OK {
+        reply
+    } else {
+        err(StatusCode::NOT_FOUND, UNAVAILABLE)
+    }
 }
 
 pub(super) async fn review(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
@@ -798,7 +846,7 @@ pub(super) async fn finish(State(st): State<Shared>, Json(body): Json<Value>) ->
             return Err("only the proposer can finish a signing payment".into());
         }
         check_intent(&p, &v)?;
-        if p.signed_pczt.is_none() && !ready_to_send(&st, &p, v.slot) {
+        if p.signed_pczt.is_none() && !ready_to_send(&st, &p, &v) {
             return Err("signer approvals are not ready".into());
         }
         if p.signed_pczt.is_none() {
@@ -943,7 +991,7 @@ pub(super) async fn payments(
             let Some(attempt) = name.strip_suffix(".json") else { continue };
             if hex32(attempt).is_err() { continue; }
             let p = read_payment(&data, &pass, &vault, attempt)?;
-            let ready = ready_to_send(&st, &p, v.slot);
+            let ready = ready_to_send(&st, &p, &v);
             out.push(json!({"attempt":p.attempt,"phase":p.phase,"recipient":p.recipient,"amount_zat":p.amount_zat.to_string(),"ready_to_send":ready,"txid":p.txid,"signers":p.signers}));
         }
         Ok(json!({"payments":out}))
@@ -1059,5 +1107,92 @@ mod tests {
         review_candidate(&pczt, &p, &v).unwrap();
         p.amount_zat += 1;
         assert!(review_candidate(&pczt, &p, &v).is_err());
+    }
+
+    /// A vault member's view: a share of a throwaway 2-of-3 key plus the roster.
+    fn member(identity: &Identity, peers: &BTreeMap<u16, PublicIdentity>) -> Vault {
+        let (shares, public) =
+            frost::keys::generate_with_dealer(3, 2, frost::keys::IdentifierList::Default, &mut OsRng)
+                .unwrap();
+        let key = frost::keys::KeyPackage::try_from(shares.into_values().next().unwrap()).unwrap();
+        let ak: [u8; 32] = public.verifying_key().serialize().unwrap().try_into().unwrap();
+        Vault {
+            network: VaultNetwork::Regtest,
+            fvk: zip2005::frost_viewing_key(&ak, &[42u8; 32]).unwrap(),
+            key,
+            public,
+            identity: Identity::from_secret_bytes(&identity.to_secret_bytes()).unwrap(),
+            threshold: 2,
+            slot: identity.public().id,
+            peers: peers.clone(),
+            birth_height: 2,
+        }
+    }
+
+    #[test]
+    fn payment_session_answers_only_selected_signers_over_sealed_http() {
+        let identities: Vec<Identity> = (1..=3).map(Identity::new).collect();
+        let peers: BTreeMap<_, _> = identities.iter().map(|i| (i.public().id, i.public())).collect();
+        let data = std::env::temp_dir().join(format!("loki-peer-session-{}", Uuid::new_v4()));
+        let (vault, attempt) = (hex::encode([2u8; 32]), hex::encode([1u8; 32]));
+        let session_id = Uuid::new_v4();
+        let p = Payment {
+            attempt: attempt.clone(), vault: vault.clone(), proposer: 1,
+            recipient: "uregtest1recipient".into(), amount_zat: 40_000_000, memo: "rent".into(),
+            fee_zat: 10_000, change_zat: 1, note_selection: vec![hex::encode([5u8; 32])],
+            target_height: 700, expiry_height: 1_152, signers: vec![1, 2], phase: "signing".into(),
+            session_id: Some(session_id), coordinator_secret: Some("secret".into()),
+            review_token: Some("token".into()), approval_requested: false, approval_started: true,
+            txid: None, signed_pczt: None, raw_tx: None, error: None,
+        };
+        save_payment(&data, "pass", &p).unwrap();
+
+        // The proposer's host serves `answer_peer`, exactly as the real handler does after
+        // loading its vault.
+        let proposer = std::sync::Arc::new(member(&identities[0], &peers));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let served = data.clone();
+        std::thread::spawn(move || {
+            runtime().unwrap().block_on(async move {
+                let app = axum::Router::new().route(
+                    "/api/payment-session",
+                    axum::routing::post(move |Json(body): Json<Value>| async move {
+                        match answer_peer(&served, "pass", &proposer, &body) {
+                            Ok(reply) => (StatusCode::OK, Json(reply)),
+                            Err(e) => (StatusCode::NOT_FOUND, Json(json!({"error": e}))),
+                        }
+                    }),
+                );
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                axum::serve(listener, app).await.unwrap();
+            })
+        });
+
+        // The selected signer gets the proposer's signed intent.
+        let reply = peer_get(&url, &member(&identities[1], &peers), &vault, &attempt, 1).unwrap();
+        assert_eq!(reply["intent"]["recipient"], "uregtest1recipient");
+        assert_eq!(reply["session_id"], session_id.to_string());
+        assert_eq!(reply["approval_started"], true);
+        assert!(reply["intent"].get("coordinator_secret").is_none());
+        // A vault member outside the signer set is refused.
+        assert!(peer_get(&url, &member(&identities[2], &peers), &vault, &attempt, 1).is_err());
+        // So is someone claiming slot 2 without slot 2's roster key.
+        let impostor = Identity::new(2);
+        assert!(peer_get(&url, &member(&impostor, &peers), &vault, &attempt, 1).is_err());
+        // The wire carries neither the intent nor the IDs it is about.
+        let request = member(&identities[1], &peers)
+            .identity
+            .seal_session(&peers[&1], &peer_context(&vault, &attempt, 2, 1).unwrap(), MessageKind::PeerRequest, PEER_REQUEST)
+            .unwrap();
+        let reply = answer_peer(&data, "pass", &member(&identities[0], &peers), &json!({
+            "vault": vault, "attempt": attempt, "from": 2, "request": hex::encode(request),
+        }))
+        .unwrap();
+        let wire = hex::decode(reply["reply"].as_str().unwrap()).unwrap();
+        assert!(!wire.windows(4).any(|w| w == b"rent"));
+        assert!(!wire.windows(18).any(|w| w == b"uregtest1recipient"));
+        std::fs::remove_dir_all(data).unwrap();
     }
 }

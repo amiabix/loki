@@ -14,6 +14,9 @@ pub use state::Config;
 pub fn run(config: Config) -> Result<(), String> {
     // rustls has no default provider; install one before any relay/lightwalletd TLS.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    for url in config.peers.values() {
+        crate::transport::require_tls_off_loopback(url)?;
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

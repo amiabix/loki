@@ -414,13 +414,14 @@ pub(super) async fn join(State(st): State<Shared>, Json(body): Json<Value>) -> R
         || !(2..=invite.members).contains(&invite.slot)
         || invite.name.trim().is_empty()
         || invite.name.len() > 80
-        || !(invite.creator_base_url.starts_with("http://")
-            || invite.creator_base_url.starts_with("https://"))
         || !base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(&invite.token)
             .is_ok_and(|bytes| bytes.len() == 32)
     {
         return err(StatusCode::BAD_REQUEST, "invalid invite");
+    }
+    if let Err(e) = crate::transport::require_tls_off_loopback(&invite.creator_base_url) {
+        return err(StatusCode::BAD_REQUEST, e);
     }
     let (data, pass) = match unlocked(&st).await {
         Ok(x) => x,
@@ -541,6 +542,35 @@ fn token_eq(expected: &str, given: &str) -> bool {
         == 0
 }
 
+/// The creator's ceremony, opened for an enrolled joiner that proves its slot with its
+/// invite token. Every failure is the same error, so it does not reveal which vaults exist.
+fn for_joiner(data: &Path, pass: &str, body: &Value) -> Result<Ceremony, String> {
+    const DENIED: &str = "invalid member token";
+    let (Some(vault), Some(slot), Some(token)) = (
+        body["vault"].as_str(),
+        body["slot"].as_u64().and_then(|n| u16::try_from(n).ok()),
+        body["token"].as_str(),
+    ) else {
+        return Err(DENIED.into());
+    };
+    let c = load(data, pass, vault).map_err(|_| DENIED)?;
+    let enrolled = c.slots.get(&slot).filter(|s| s.identity.is_some() && slot != c.my_slot);
+    match enrolled.and_then(|s| s.pending_token.as_deref()) {
+        Some(expected) if c.my_slot == 1 && token_eq(expected, token) => Ok(c),
+        _ => Err(DENIED.into()),
+    }
+}
+
+/// What a joiner presents to the creator's `for_joiner` endpoints.
+fn joiner_auth(c: &Ceremony) -> Result<Value, String> {
+    let token = c
+        .slots
+        .get(&c.my_slot)
+        .and_then(|s| s.pending_token.as_ref())
+        .ok_or("missing invite token")?;
+    Ok(json!({"vault":c.vault,"slot":c.my_slot,"token":token}))
+}
+
 fn query_vault(query: &BTreeMap<String, String>) -> Result<String, Reply> {
     let vault = query
         .get("vault")
@@ -549,23 +579,13 @@ fn query_vault(query: &BTreeMap<String, String>) -> Result<String, Reply> {
     Ok(vault.clone())
 }
 
-pub(super) async fn roster(
-    State(st): State<Shared>,
-    Query(query): Query<BTreeMap<String, String>>,
-) -> Reply {
-    let vault = match query_vault(&query) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
+pub(super) async fn roster(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
     let (data, pass) = match unlocked(&st).await {
         Ok(x) => x,
         Err(e) => return e,
     };
     let reply = blocking(move || {
-        let c = load(&data, &pass, &vault)?;
-        if c.my_slot != 1 {
-            return Err("not creator".into());
-        }
+        let c = for_joiner(&data, &pass, &body)?;
         let fingerprint = c.fingerprint.ok_or("roster pending")?;
         let roster: BTreeMap<_, _> = c
             .slots
@@ -587,9 +607,9 @@ fn refresh_roster(c: &mut Ceremony) -> Result<(), String> {
         return Ok(());
     }
     let remote = peer_request(
-        "GET",
-        &format!("{}/api/roster?vault={}", c.creator_base_url, c.vault),
-        None,
+        "POST",
+        &format!("{}/api/roster", c.creator_base_url),
+        Some(joiner_auth(c)?),
     )?;
     let fingerprint = remote["fingerprint"]
         .as_str()
@@ -711,17 +731,10 @@ pub(super) async fn agree(State(st): State<Shared>, Json(body): Json<Value>) -> 
             return Err("roster fingerprint mismatch".into());
         }
         if c.my_slot != 1 {
-            let token = c
-                .slots
-                .get(&c.my_slot)
-                .and_then(|s| s.pending_token.as_ref())
-                .ok_or("missing invite token")?;
             peer_request(
                 "POST",
                 &format!("{}/api/agreed", c.creator_base_url),
-                Some(json!({
-                    "vault":c.vault,"slot":c.my_slot,"token":token
-                })),
+                Some(joiner_auth(&c)?),
             )?;
         }
         c.agreed.insert(c.my_slot);
@@ -736,40 +749,25 @@ pub(super) async fn agree(State(st): State<Shared>, Json(body): Json<Value>) -> 
 }
 
 pub(super) async fn agreed(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
-    let (Some(vault), Some(slot), Some(token)) = (
+    let (Some(vault), Some(slot)) = (
         body["vault"].as_str(),
         body["slot"].as_u64().and_then(|n| u16::try_from(n).ok()),
-        body["token"].as_str(),
     ) else {
         return err(StatusCode::BAD_REQUEST, "invalid agreement");
     };
-    let (vault, token) = (vault.to_owned(), token.to_owned());
+    let vault = vault.to_owned();
     let (data, pass) = match unlocked(&st).await {
         Ok(x) => x,
         Err(e) => return e,
     };
     let work_data = data.clone();
     let work_pass = pass.clone();
-    let work_vault = vault.clone();
     let work_st = st.clone();
     let reply = blocking(move || {
         let _guard = work_st.ceremony.lock().map_err(|e| e.to_string())?;
-        let mut c = load(&work_data, &work_pass, &work_vault)?;
-        if c.my_slot != 1 || c.fingerprint.is_none() {
+        let mut c = for_joiner(&work_data, &work_pass, &body)?;
+        if c.fingerprint.is_none() {
             return Err("roster pending".into());
-        }
-        let expected = c
-            .slots
-            .get(&slot)
-            .and_then(|s| s.pending_token.as_deref())
-            .ok_or("unknown slot")?;
-        if !token_eq(expected, &token)
-            || c.slots
-                .get(&slot)
-                .and_then(|s| s.identity.as_ref())
-                .is_none()
-        {
-            return Err("invalid agreement token".into());
         }
         c.agreed.insert(slot);
         save(&work_data, &work_pass, &c)?;
@@ -782,23 +780,13 @@ pub(super) async fn agreed(State(st): State<Shared>, Json(body): Json<Value>) ->
     reply
 }
 
-pub(super) async fn session(
-    State(st): State<Shared>,
-    Query(query): Query<BTreeMap<String, String>>,
-) -> Reply {
-    let vault = match query_vault(&query) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
+pub(super) async fn session(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
     let (data, pass) = match unlocked(&st).await {
         Ok(x) => x,
         Err(e) => return e,
     };
     let reply = blocking(move || {
-        let c = load(&data, &pass, &vault)?;
-        if c.my_slot != 1 {
-            return Err("not creator".into());
-        }
+        let c = for_joiner(&data, &pass, &body)?;
         Ok(json!({
             "session_id": c.session_id.ok_or("session pending")?,
             "coordinator_peer": c.coordinator_peer,
@@ -908,7 +896,7 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
             let mut found = None;
             for _ in 0..200 {
                 if let Ok(response) = peer_request(
-                    "GET", &format!("{}/api/session?vault={}", c.creator_base_url, c.vault), None,
+                    "POST", &format!("{}/api/session", c.creator_base_url), Some(joiner_auth(&c)?),
                 ) {
                     if let (Some(id), Some(peer)) = (
                         response["session_id"].as_str().and_then(|s| Uuid::parse_str(s).ok()),
@@ -1148,6 +1136,7 @@ mod tests {
         .await;
         assert_eq!(created.0, StatusCode::OK, "{}", created.1 .0);
         let vault = created.1 .0["vault"].as_str().unwrap().to_owned();
+        let mut tokens = BTreeMap::new();
         for slot in 2..=3 {
             let code = created.1 .0["invites"]
                 .as_array()
@@ -1167,6 +1156,7 @@ mod tests {
                 fields.as_object().unwrap().keys().collect::<Vec<_>>()
             );
             let invite: Invite = serde_json::from_slice(&decoded).unwrap();
+            tokens.insert(slot, invite.token.clone());
             let wire = WireIdentity::from_public(Identity::new(slot).public());
             let refused = enroll(
                 State(st.clone()),
@@ -1186,7 +1176,18 @@ mod tests {
         }
         let status = status(st.clone(), vault.clone()).await;
         assert_eq!(status.1 .0["phase"], "compare_roster");
-        let response = roster(State(st), Query(BTreeMap::from([("vault".into(), vault)]))).await;
+        // Only an enrolled joiner with its own invite token may read the roster.
+        for body in [
+            json!({"vault":vault}),
+            json!({"vault":vault,"slot":2,"token":tokens[&3]}),
+            json!({"vault":vault,"slot":1,"token":tokens[&2]}),
+        ] {
+            let refused = roster(State(st.clone()), Json(body)).await;
+            assert_eq!(refused.0, StatusCode::BAD_REQUEST);
+            assert_eq!(refused.1 .0["error"], "invalid member token");
+        }
+        let response =
+            roster(State(st), Json(json!({"vault":vault,"slot":2,"token":tokens[&2]}))).await;
         assert_eq!(response.0, StatusCode::OK);
         assert_eq!(response.1 .0["fingerprint"], status.1 .0["fingerprint"]);
         eprintln!("PASS: emitted invite codes contain no vault_secret");
