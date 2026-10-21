@@ -154,9 +154,9 @@ impl SealedCandidate {
     }
 }
 
-/// Only TLS, or plain HTTP to this machine, may carry relay traffic.
-fn check_relay_url(base_url: &str) -> Result<(), TransportError> {
-    let url = reqwest::Url::parse(base_url).map_err(|e| TransportError::Http(e.to_string()))?;
+/// Only TLS, or plain HTTP to this machine, may carry relay or peer traffic.
+pub fn require_tls_off_loopback(base_url: &str) -> Result<(), String> {
+    let url = reqwest::Url::parse(base_url).map_err(|e| format!("{base_url}: {e}"))?;
     let host = url.host_str().unwrap_or_default();
     let loopback = host == "localhost"
         || host
@@ -166,9 +166,7 @@ fn check_relay_url(base_url: &str) -> Result<(), TransportError> {
     match url.scheme() {
         "https" => Ok(()),
         "http" if loopback => Ok(()),
-        _ => Err(TransportError::Http(
-            "frostd must use https:// unless it is on loopback".into(),
-        )),
+        _ => Err(format!("{base_url} must use https:// unless it is on loopback")),
     }
 }
 
@@ -316,7 +314,7 @@ impl FrostdTransport {
     /// `base_url` like `http://127.0.0.1:2744` (or `https://…` with TLS in production,
     /// ws3 §6). Logs in with `login`.
     pub fn new(base_url: &str, login: FrostdLoginKey) -> Result<Self, TransportError> {
-        check_relay_url(base_url)?;
+        require_tls_off_loopback(base_url).map_err(TransportError::Http)?;
         let runtime = Runtime::new().map_err(|e| TransportError::Http(e.to_string()))?;
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
@@ -645,10 +643,10 @@ mod tests {
     #[test]
     fn relay_url_needs_tls_off_loopback() {
         for ok in ["https://relay.example:2744", "http://127.0.0.1:2744", "http://localhost:2744/", "http://[::1]:2744"] {
-            assert!(check_relay_url(ok).is_ok(), "{ok}");
+            assert!(require_tls_off_loopback(ok).is_ok(), "{ok}");
         }
         for bad in ["http://relay.example:2744", "http://10.0.0.5:2744", "http://127.0.0.1.evil.example", "ws://127.0.0.1:2744", "not a url"] {
-            assert!(check_relay_url(bad).is_err(), "{bad}");
+            assert!(require_tls_off_loopback(bad).is_err(), "{bad}");
         }
     }
 
