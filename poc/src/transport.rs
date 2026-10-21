@@ -41,6 +41,10 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
 pub use crate::setup_transport::{DkgWire, DkgWireKind};
+use crate::{
+    setup_transport::{Identity, PublicIdentity},
+    signing_session::{MessageKind, SessionContext},
+};
 
 /// A member address on the relay: its 32-byte frostd/X25519 public key.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -79,7 +83,8 @@ impl FrostdLoginKey {
 /// }
 /// ```
 ///
-/// and only the signer makes a [`DkgWire`] or a [`crate::signer::CandidatePczt`]:
+/// and only the signer makes a [`DkgWire`] or a [`crate::signer::CandidatePczt`], which
+/// reaches the relay only sealed in a [`SealedCandidate`]:
 ///
 /// ```compile_fail
 /// let wire = loki_poc::transport::DkgWire::parse(vec![0u8; 200]);
@@ -88,12 +93,16 @@ impl FrostdLoginKey {
 /// ```compile_fail
 /// let candidate = loki_poc::signer::CandidatePczt(vec![0u8; 200]);
 /// ```
+///
+/// ```compile_fail
+/// let sealed = loki_poc::transport::SealedCandidate(vec![0u8; 200]);
+/// ```
 pub enum Outbound {
     /// A setup message produced by the signer.
     Dkg(DkgWire),
     Commitments(frost::round1::SigningCommitments),
-    /// The proposer signer's unsigned candidate, for every quorum member to render.
-    Candidate(crate::signer::CandidatePczt),
+    /// The proposer signer's unsigned candidate, sealed to one other selected signer.
+    Candidate(SealedCandidate),
     Package(frost::SigningPackage),
     RandomizerSeed([u8; 32]),
     Share(frost::round2::SignatureShare),
@@ -106,11 +115,60 @@ impl Outbound {
         match self {
             Self::Dkg(wire) => Ok(wire.as_bytes().to_vec()),
             Self::Commitments(commitments) => commitments.serialize().map_err(encoding),
-            Self::Candidate(candidate) => Ok(candidate.as_bytes().to_vec()),
+            Self::Candidate(sealed) => Ok(sealed.0.clone()),
             Self::Package(package) => package.serialize().map_err(encoding),
             Self::RandomizerSeed(seed) => Ok(seed.to_vec()),
             Self::Share(share) => Ok(share.serialize()),
         }
+    }
+}
+
+/// A candidate PCZT end-to-end encrypted and signed from one selected signer to another.
+/// The candidate carries the vault's full viewing key and the payment's notes, amounts and
+/// addresses, so it never crosses the relay in the clear.
+pub struct SealedCandidate(Vec<u8>);
+
+impl SealedCandidate {
+    pub fn seal(
+        own: &Identity,
+        recipient: &PublicIdentity,
+        context: &SessionContext,
+        candidate: &crate::signer::CandidatePczt,
+    ) -> Result<Self, String> {
+        own.seal_session(recipient, context, MessageKind::Candidate, candidate.as_bytes())
+            .map(Self)
+    }
+
+    /// Open a candidate `sender` sealed to `own` for this attempt.
+    pub fn open(
+        own: &Identity,
+        sender: &PublicIdentity,
+        context: &SessionContext,
+        wire: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let opened = own.open_session(sender, context, wire)?;
+        if opened.kind != MessageKind::Candidate {
+            return Err("sealed signing message is not a candidate".into());
+        }
+        Ok(opened.body)
+    }
+}
+
+/// Only TLS, or plain HTTP to this machine, may carry relay traffic.
+fn check_relay_url(base_url: &str) -> Result<(), TransportError> {
+    let url = reqwest::Url::parse(base_url).map_err(|e| TransportError::Http(e.to_string()))?;
+    let host = url.host_str().unwrap_or_default();
+    let loopback = host == "localhost"
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if loopback => Ok(()),
+        _ => Err(TransportError::Http(
+            "frostd must use https:// unless it is on loopback".into(),
+        )),
     }
 }
 
@@ -258,6 +316,7 @@ impl FrostdTransport {
     /// `base_url` like `http://127.0.0.1:2744` (or `https://…` with TLS in production,
     /// ws3 §6). Logs in with `login`.
     pub fn new(base_url: &str, login: FrostdLoginKey) -> Result<Self, TransportError> {
+        check_relay_url(base_url)?;
         let runtime = Runtime::new().map_err(|e| TransportError::Http(e.to_string()))?;
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
@@ -582,6 +641,16 @@ impl RelayLog {
 mod tests {
     use super::*;
     use crate::setup_transport::Identity;
+
+    #[test]
+    fn relay_url_needs_tls_off_loopback() {
+        for ok in ["https://relay.example:2744", "http://127.0.0.1:2744", "http://localhost:2744/", "http://[::1]:2744"] {
+            assert!(check_relay_url(ok).is_ok(), "{ok}");
+        }
+        for bad in ["http://relay.example:2744", "http://10.0.0.5:2744", "http://127.0.0.1.evil.example", "ws://127.0.0.1:2744", "not a url"] {
+            assert!(check_relay_url(bad).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn relay_log_checks_senders_survives_restart_and_deletes_only_when_active() {

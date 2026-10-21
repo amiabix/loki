@@ -5,8 +5,10 @@ use std::{collections::BTreeMap, time::Duration};
 use reddsa_frost::frost::redpallas as frost;
 
 use crate::{
+    setup_transport::{Identity, PublicIdentity},
     signer::{CandidateRef, PublicPaymentParams, Session, Signer},
-    transport::{Incoming, Outbound, Peer, Transport},
+    signing_session::SessionContext,
+    transport::{Incoming, Outbound, Peer, SealedCandidate, Transport},
 };
 
 fn recv_until<T: Transport>(
@@ -37,7 +39,11 @@ where
 }
 
 /// Commit, optionally build the candidate as proposer, then sign the candidate-bound package.
-/// The nonce, key package, viewing key, and selected note stay inside this process.
+/// The nonce, key package, viewing key, and selected note stay inside this process. The
+/// candidate crosses the relay only sealed from the proposer to each other selected signer;
+/// every signer passes it to `accept_candidate` (review, and for the proposer the local
+/// hand-off to its coordinator) before using it.
+#[allow(clippy::too_many_arguments)]
 pub fn signer_loop<T: Transport, S: Signer>(
     transport: &T,
     channel: &T::Channel,
@@ -47,8 +53,11 @@ pub fn signer_loop<T: Transport, S: Signer>(
     group_vk: &frost::keys::PublicKeyPackage,
     own_id: frost::Identifier,
     proposer_inputs: Option<&PublicPaymentParams>,
-    proposer_peer: &Peer,
-    other_signers: &[Peer],
+    own: &Identity,
+    context: &SessionContext,
+    proposer: &PublicIdentity,
+    other_signers: &[PublicIdentity],
+    accept_candidate: &mut dyn FnMut(&[u8]) -> Result<(), String>,
 ) -> Result<(), String>
 where
     T::Error: std::fmt::Display,
@@ -69,26 +78,28 @@ where
         coordinator = Some(alpha_message.from);
         let candidate = signer.build_candidate(session, candidate_ref, inputs, &alpha_bytes)
             .map_err(|e| format!("build_candidate: {e}"))?;
-        let bytes = candidate.as_bytes().to_vec();
-        transport
-            .send(channel, &[], &Outbound::Candidate(candidate.clone()))
-            .map_err(|e| format!("send candidate: {e}"))?;
+        accept_candidate(candidate.as_bytes())?;
         for peer in other_signers {
-            transport.send(channel, std::slice::from_ref(peer), &Outbound::Candidate(candidate.clone()))
+            let sealed = SealedCandidate::seal(own, peer, context, &candidate)?;
+            transport
+                .send(channel, &[Peer(peer.encryption)], &Outbound::Candidate(sealed))
                 .map_err(|e| format!("send candidate: {e}"))?;
         }
-        Some(bytes)
+        Some(candidate.into_bytes())
     } else { None };
 
     let got = recv_until(transport, channel, false, if local_candidate.is_some() { 2 } else { 3 })?;
-    let (candidate_bytes, package_index, seed_index) = if let Some(bytes) = local_candidate.as_deref() {
+    let (candidate_bytes, package_index, seed_index) = if let Some(bytes) = local_candidate {
         (bytes, 0, 1)
     } else {
-        let candidate_index = got.iter().position(|incoming| incoming.from == *proposer_peer)
+        let candidate_index = got.iter().position(|incoming| incoming.from == Peer(proposer.encryption))
             .ok_or("candidate came from a non-proposer")?;
+        let bytes = SealedCandidate::open(own, proposer, context, &got[candidate_index].message)?;
+        accept_candidate(&bytes)?;
         let other = (0..got.len()).filter(|index| *index != candidate_index).collect::<Vec<_>>();
-        (got[candidate_index].message.as_slice(), other[0], other[1])
+        (bytes, other[0], other[1])
     };
+    let candidate_bytes = candidate_bytes.as_slice();
     if got[package_index].from != got[seed_index].from
         || coordinator.is_some_and(|peer| peer != got[package_index].from)
     {
@@ -127,7 +138,8 @@ where
 }
 
 /// Gather a threshold of commitments, request the proposer candidate, aggregate, and apply.
-/// `peer_ids[0]` is the designated proposer. Only public artifacts reach this coordinator.
+/// `peer_ids[0]` is the designated proposer. The candidate never comes over the relay:
+/// `local_candidate` polls the proposer's local hand-off and returns `None` until it exists.
 pub fn coordinate<T: Transport>(
     transport: &T,
     channel: &T::Channel,
@@ -136,6 +148,7 @@ pub fn coordinate<T: Transport>(
     peer_of: &BTreeMap<frost::Identifier, Peer>,
     threshold: u16,
     rng: impl rand_core::CryptoRngCore,
+    mut local_candidate: impl FnMut() -> Result<Option<Vec<u8>>, String>,
 ) -> Result<Vec<u8>, String>
 where
     T::Error: std::fmt::Display,
@@ -181,11 +194,16 @@ where
     transport
         .send(channel, std::slice::from_ref(proposer), &Outbound::RandomizerSeed(alpha))
         .map_err(|e| format!("send alpha: {e}"))?;
-    let candidate_message = recv_until(transport, channel, true, 1)?.remove(0);
-    if candidate_message.from != *proposer {
-        return Err("candidate came from a non-proposer".into());
+    let mut candidate_bytes = None;
+    for _ in 0..400 {
+        candidate_bytes = local_candidate()?;
+        if candidate_bytes.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
     }
-    let candidate = pczt::Pczt::parse(&candidate_message.message)
+    let candidate_bytes = candidate_bytes.ok_or("the proposer built no candidate")?;
+    let candidate = pczt::Pczt::parse(&candidate_bytes)
         .map_err(|e| format!("parse candidate: {e:?}"))?;
     let sighash = pczt::roles::signer::Signer::new(candidate.clone())
         .map_err(|e| format!("candidate signer: {e:?}"))?

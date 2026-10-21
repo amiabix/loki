@@ -4,7 +4,8 @@
 //! app only moves the [`DkgWire`]s the signer returns. Members send to the coordinator,
 //! which logs each wire in its `RelayLog` before forwarding it and redelivers from the log
 //! after a restart. Signing moves typed `Outbound` values only: commitments, the
-//! proposer's candidate, the signing package, the randomizer seed and the shares.
+//! proposer's candidate sealed to the other signer, the signing package, the randomizer
+//! seed and the shares.
 //!
 //! Round two is a v2 envelope sealed under the two members' one-setup fresh keys, so the
 //! relay (and anyone who records its traffic) carries only ciphertext that the long-lived
@@ -24,7 +25,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use loki_poc::setup_transport::wire_kind;
+use loki_poc::setup_transport::{wire_kind, Identity};
+use loki_poc::signing_session::{AttemptId, SessionContext};
 use loki_poc::signer::backup::BackupArtifact;
 use loki_poc::signer::coordination::{member_dkg_step, redeliver_dkg, relay_dkg};
 use loki_poc::signer::local::{BackupDevice, DevicePrompts, LocalSigner, RosterDecision};
@@ -33,7 +35,8 @@ use loki_poc::signer::{
     CandidateRef, DkgWireKind, Network, PublicPaymentParams, Session, Signer, VaultRef,
 };
 use loki_poc::transport::{
-    FrostdLoginKey, FrostdTransport, Incoming, Outbound, Peer, RelayLog, Transport,
+    FrostdLoginKey, FrostdTransport, Incoming, Outbound, Peer, RelayLog, SealedCandidate,
+    Transport,
 };
 use reddsa_frost::frost::redpallas as frost;
 use uuid::Uuid;
@@ -161,6 +164,8 @@ struct Member {
     signer: LocalSigner<SoftwareSecureElement>,
     session: Session,
     codes: Arc<Mutex<Vec<String>>>,
+    /// The roster identity the signer was created with, kept by the member's app.
+    identity: Identity,
 }
 
 fn prompts(codes: Arc<Mutex<Vec<String>>>) -> DevicePrompts {
@@ -181,6 +186,7 @@ impl Member {
         let dir = tempdir(&format!("m{id}"));
         let codes = Arc::new(Mutex::new(Vec::new()));
         let se = SoftwareSecureElement::persistent(&dir, "member pass").unwrap();
+        let identity = Identity::new(id);
         let mut signer = LocalSigner::create_with_identity(
             &dir,
             se,
@@ -189,7 +195,7 @@ impl Member {
             id,
             "ws3 vault".into(),
             prompts(codes.clone()),
-            loki_poc::setup_transport::Identity::new(id),
+            Identity::from_secret_bytes(&identity.to_secret_bytes()).unwrap(),
         )
         .unwrap();
         let session = signer.connect(ORIGIN, Network::Regtest, b"ws3").unwrap().session;
@@ -199,6 +205,7 @@ impl Member {
             signer,
             session,
             codes,
+            identity,
         }
     }
 
@@ -394,23 +401,41 @@ where
     let sighash = pczt::roles::signer::Signer::new(pczt::Pczt::parse(candidate.as_bytes()).unwrap())
         .unwrap()
         .shielded_sighash();
+    // The proposer seals the candidate to the other signer; it never crosses in the clear.
+    let context = SessionContext {
+        vault,
+        payment: cand.payment_id,
+        attempt: AttemptId(cand.attempt_id),
+        signers: vec![members[0].id, members[1].id],
+    };
+    let sealed =
+        SealedCandidate::seal(&members[0].identity, &members[1].identity.public(), &context, &candidate)
+            .unwrap();
+    let (t, ch) = &members_tx[0];
+    t.send(ch, &[peers[&members[1].id].clone()], &Outbound::Candidate(sealed)).unwrap();
     let package = frost::SigningPackage::new(commitments, &sighash);
     let seed: [u8; 32] = seed.as_slice().try_into().unwrap();
     for &i in &quorum {
         let to = [peers[&members[i].id].clone()];
-        coord.send(&coord_ch, &to, &Outbound::Candidate(candidate.clone())).unwrap();
         coord.send(&coord_ch, &to, &Outbound::Package(package.clone())).unwrap();
         coord.send(&coord_ch, &to, &Outbound::RandomizerSeed(seed)).unwrap();
     }
     for &i in &quorum {
         let (t, ch) = &members_tx[i];
-        let got = recv_until(t, ch, false, 3);
-        let package = frost::SigningPackage::deserialize(&got[1].message).unwrap();
-        let seed: [u8; 32] = got[2].message.clone().try_into().unwrap();
+        let mut got = recv_until(t, ch, false, if i == 0 { 2 } else { 3 });
+        let candidate_bytes = if i == 0 {
+            candidate.as_bytes().to_vec()
+        } else {
+            let wire = got.remove(0).message;
+            SealedCandidate::open(&members[1].identity, &members[0].identity.public(), &context, &wire)
+                .unwrap()
+        };
+        let package = frost::SigningPackage::deserialize(&got[0].message).unwrap();
+        let seed: [u8; 32] = got[1].message.clone().try_into().unwrap();
         let m = &mut members[i];
         let share = m
             .signer
-            .sign_approve(&m.session, &cand, &got[0].message, &package, &seed)
+            .sign_approve(&m.session, &cand, &candidate_bytes, &package, &seed)
             .unwrap();
         t.send(ch, &[], &Outbound::Share(share)).unwrap();
     }
@@ -438,6 +463,7 @@ fn audit(tape: &[Vec<u8>]) {
     let mut round2 = 0;
     let mut setup = 0;
     for payload in tape {
+        assert!(pczt::Pczt::parse(payload).is_err(), "a plaintext candidate crossed the relay");
         let Some(kind) = wire_kind(payload) else { continue };
         setup += 1;
         if kind == DkgWireKind::Round2 {

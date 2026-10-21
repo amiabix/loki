@@ -66,6 +66,8 @@ pub enum MessageKind {
     Receipt = 5,
     Abort = 6,
     Consuming = 7,
+    /// A hosted proposer's candidate PCZT, sealed to one other selected signer.
+    Candidate = 8,
 }
 
 impl TryFrom<u8> for MessageKind {
@@ -79,6 +81,7 @@ impl TryFrom<u8> for MessageKind {
             5 => Ok(Self::Receipt),
             6 => Ok(Self::Abort),
             7 => Ok(Self::Consuming),
+            8 => Ok(Self::Candidate),
             _ => Err("unknown signing message type".into()),
         }
     }
@@ -87,7 +90,7 @@ impl TryFrom<u8> for MessageKind {
 impl MessageKind {
     pub fn max_body(self) -> usize {
         match self {
-            Self::Package => 4 * 1024 * 1024,
+            Self::Package | Self::Candidate => 4 * 1024 * 1024,
             Self::Invite | Self::Commitment | Self::Share | Self::Consuming => 64 * 1024,
             Self::Receipt | Self::Abort => 1024,
         }

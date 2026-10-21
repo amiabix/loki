@@ -8,6 +8,7 @@ use loki_poc::candidate::{quote_fee, CandidateInputs};
 use loki_poc::network::VaultNetwork;
 use loki_poc::payment_transport::{coordinate, signer_loop};
 use loki_poc::setup_transport::Identity;
+use loki_poc::signing_session::{AttemptId, SessionContext};
 use loki_poc::signer::{
     local::LocalSigner, secure_element::SoftwareSecureElement, CandidateRef, Network,
     PublicPaymentParams, Signer,
@@ -29,6 +30,8 @@ struct MemoryTransport {
     me: Peer,
     coordinator: Peer,
     inboxes: Arc<Mutex<BTreeMap<[u8; 32], Vec<Incoming>>>>,
+    /// Every message the relay carried, as a relay operator would see it.
+    relayed: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 impl Transport for MemoryTransport {
@@ -43,6 +46,7 @@ impl Transport for MemoryTransport {
     }
     fn send(&self, _channel: &Uuid, to: &[Peer], message: &Outbound) -> Result<(), String> {
         let message = message.to_bytes().map_err(|e| e.to_string())?;
+        self.relayed.lock().unwrap().push(message.clone());
         let recipients = if to.is_empty() {
             std::slice::from_ref(&self.coordinator)
         } else {
@@ -101,18 +105,32 @@ fn two_of_three_payment_pczt_verifies_over_frostd() {
 #[test]
 fn two_of_three_payment_pczt_verifies_in_memory() {
     let inboxes = Arc::new(Mutex::new(BTreeMap::new()));
+    let relayed = Arc::new(Mutex::new(Vec::new()));
     let coordinator = Identity::new(9);
     let coordinator_peer = Peer(coordinator.public().encryption);
-    roundtrip(
+    let fvk = roundtrip(
         coordinator,
         VaultNetwork::Regtest,
         |identity| MemoryTransport {
             me: Peer(identity.public().encryption),
             coordinator: coordinator_peer.clone(),
             inboxes: inboxes.clone(),
+            relayed: relayed.clone(),
         },
         |channel| *channel,
     );
+    // The relay carried the commitments, the sealed candidate, packages, seeds and shares,
+    // but never a readable candidate or the vault's viewing key.
+    let fvk = fvk.to_bytes();
+    let relayed = relayed.lock().unwrap();
+    assert!(relayed.len() >= 8, "relay carried {} messages", relayed.len());
+    for message in relayed.iter() {
+        assert!(pczt::Pczt::parse(message).is_err(), "a plaintext PCZT crossed the relay");
+        assert!(
+            !message.windows(fvk.len()).any(|window| window == fvk),
+            "the full viewing key crossed the relay"
+        );
+    }
 }
 
 #[test]
@@ -127,6 +145,7 @@ fn testnet_payment_uses_nu7_over_in_memory_transport() {
             me: Peer(identity.public().encryption),
             coordinator: coordinator_peer.clone(),
             inboxes: inboxes.clone(),
+            relayed: Arc::new(Mutex::new(Vec::new())),
         },
         |channel| *channel,
     );
@@ -137,7 +156,8 @@ fn roundtrip<T: Transport + Send>(
     network: VaultNetwork,
     make_transport: impl Fn(&Identity) -> T,
     session_id: impl Fn(&T::Channel) -> Uuid,
-) where
+) -> FullViewingKey
+where
     T::Channel: Send,
     T::Error: std::fmt::Debug + std::fmt::Display,
 {
@@ -185,6 +205,14 @@ fn roundtrip<T: Transport + Send>(
         .map(|id| frost::Identifier::try_from(id).unwrap())
         .collect();
     let identities: Vec<_> = (1u16..=2).map(Identity::new).collect();
+    let publics: Vec<_> = identities.iter().map(Identity::public).collect();
+    let context = SessionContext {
+        vault: [1; 32],
+        payment: [7; 32],
+        attempt: AttemptId([9; 32]),
+        signers: vec![1, 2],
+    };
+    let handoff = Mutex::new(None::<Vec<u8>>);
     let peer_of: BTreeMap<_, _> = ids
         .iter()
         .copied()
@@ -214,8 +242,10 @@ fn roundtrip<T: Transport + Send>(
             .map(|((identity, mut member_tx), id)| {
                 let key = keys[&id].clone();
                 let proposer_inputs = if id == ids[0] { Some(&params) } else { None };
-                let other_signers: Vec<_> = if proposer_inputs.is_some() { peers.iter().skip(1).cloned().collect() } else { Vec::new() };
-                let proposer_peer = peer_of[&ids[0]].clone();
+                let other_signers: Vec<_> = if proposer_inputs.is_some() { publics[1..].to_vec() } else { Vec::new() };
+                let proposer = publics[0].clone();
+                let context = context.clone();
+                let handoff = &handoff;
                 let public_bytes = public.serialize().unwrap();
                 let signer_public = public.clone();
                 let signer_fvk = fvk.clone();
@@ -234,14 +264,23 @@ fn roundtrip<T: Transport + Send>(
                         &member_tx,
                         &channel,
                         &mut signer, &signer_session, &candidate, &signer_public, id,
-                        proposer_inputs, &proposer_peer, &other_signers,
+                        proposer_inputs, &identity, &context, &proposer, &other_signers,
+                        &mut |bytes| {
+                            if proposer_inputs.is_some() {
+                                *handoff.lock().unwrap() = Some(bytes.to_vec());
+                            }
+                            Ok(())
+                        },
                     )
                     .unwrap();
                 })
             })
             .collect();
         let signed =
-            coordinate(&tx, &channel, &public, &ids, &peer_of, 2, rand_core::OsRng).unwrap();
+            coordinate(&tx, &channel, &public, &ids, &peer_of, 2, rand_core::OsRng, || {
+                Ok(handoff.lock().unwrap().clone())
+            })
+            .unwrap();
         for handle in handles {
             handle.join().unwrap();
         }
@@ -274,4 +313,5 @@ fn roundtrip<T: Transport + Send>(
         )
         .unwrap();
     });
+    fvk
 }
