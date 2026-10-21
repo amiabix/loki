@@ -4,6 +4,6 @@
   "type": "module",
   "description": "G3 standalone nonce safety prototype: browser nonce store, crash and restore drills.",
   "devDependencies": {
-    "playwright-core": "^1.63.0"
+    "playwright-core": "^1.64.1"
   }
 }
