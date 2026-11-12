@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -44,6 +45,7 @@ class THS:
         self.rpc_url = loopback_url(self.endpoints["rpc"])
         self.app_url = loopback_url(self.endpoints["dashboard"])
         self.rpc_address = urllib.parse.urlparse(self.rpc_url).netloc
+        self.lightwalletd_url = loopback_url(self.endpoints["lightwalletd"])
 
     def rpc(self, method, params=None, timeout=300):
         response = post(self.rpc_url, {"jsonrpc": "2.0", "id": 1,
@@ -61,7 +63,7 @@ class THS:
         return info
 
     def env(self):
-        env = dict(os.environ, LOKI_RPC=self.rpc_address)
+        env = dict(os.environ, LOKI_RPC=self.rpc_address, LOKI_LIGHTWALLETD=self.lightwalletd_url)
         env.pop("LOKI_ROUND", None)
         return env
 
@@ -69,13 +71,25 @@ class THS:
         results = []
         digest = hashlib.sha256(address.encode()).hexdigest()[:32]
         for index in range(count):
-            result = post(self.app_url + "/api/v1/faucet/address", {
+            request = {
                 "address": address, "amount_zatoshi": 100_000_000,
                 "idempotency_key": f"loki-{digest}-fund-{index}",
-            })
-            if result.get("status") != "confirmed" or not result.get("block_hash"):
-                raise RuntimeError(f"funding not confirmed; retry the same vault: {result}")
+            }
+            # The faucet is asynchronous: it returns `preparing` until the funding
+            # transaction is mined. Re-post the idempotent request, mining a block
+            # between tries, until it confirms.
+            deadline = time.monotonic() + 120
+            while True:
+                result = post(self.app_url + "/api/v1/faucet/address", request)
+                if result.get("status") == "confirmed" and result.get("block_hash"):
+                    break
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"funding not confirmed; retry the same vault: {result}")
+                self.mine(1)
+                time.sleep(1)
             results.append(result)
+        # Vault wallets spend a received note only after ten confirmations.
+        self.mine(9)
         return results
 
     def mine(self, blocks=3):
