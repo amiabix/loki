@@ -3810,3 +3810,43 @@ async fn http_limits_manifest_listen_mismatch() {
     assert_eq!(manifest_lines(&root), lines);
     drop(server);
 }
+
+#[tokio::test]
+async fn hosted_public_origin_is_immutable_and_independent_of_private_listen() {
+    if included_in_writer_unit_tests() { return; }
+    let scratch = Scratch::new();
+    std::fs::create_dir_all(scratch.path()).unwrap();
+    let root = scratch.path().join("hosted");
+    let provision = write_provision(scratch.path());
+    let listen = free_listen("127.0.0.1:0");
+    assert!(std::process::Command::new(relay_binary()).args([
+        "init", "--root", root.to_str().unwrap(), "--provision-capability-file", provision.to_str().unwrap(),
+        "--total-bytes", "100000", "--mailbox-bytes", "100000", "--mailbox-count", "3",
+        "--listen", &listen, "--public-origin", "https://relay.example:443",
+    ]).status().unwrap().success());
+    let before = manifest_lines(&root);
+    assert_eq!(before[0], "https://relay.example:443");
+    let mut server = serve_server(&root, &listen);
+    assert_eq!(read_bound_line(server.stdout.as_mut().unwrap()).trim(), format!("http://{listen}"));
+    let response = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(&listen).unwrap();
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        stream.write_all(format!("GET /v1/identity HTTP/1.1\r\nHost: attacker.example\r\nX-Forwarded-Host: attacker.example\r\nx-loki-challenge: {}\r\nConnection: close\r\n\r\n", "11".repeat(32)).as_bytes()).unwrap();
+        let mut raw = Vec::new(); stream.read_to_end(&mut raw).unwrap(); raw
+    }).join().unwrap();
+    assert!(response.windows(b"https://relay.example:443".len()).any(|b| b == b"https://relay.example:443"));
+    assert!(!response.windows(b"attacker.example".len()).any(|b| b == b"attacker.example"));
+    drop(server);
+    assert_eq!(manifest_lines(&root), before);
+}
+
+#[test]
+fn hosted_origin_validation_rejects_credential_and_path_substitution() {
+    for raw in ["http://relay.example", "https://u:p@relay.example", "https://relay.example?", "https://relay.example#", "https://relay.example/path", "https://relay.example/..", "https://relay.example//", "https://relay.example:0", "https://relay.example:65536", "https://relay.example\\", "https://relay.example\n", "https:///relay.example"] {
+        assert!(loki_relay_server::validate_public_origin(raw).is_err(), "{raw}");
+    }
+    for raw in ["https://relay.example", "https://relay.example:443/", "https://[::1]:8443"] {
+        assert!(loki_relay_server::validate_public_origin(raw).is_ok(), "{raw}");
+    }
+}

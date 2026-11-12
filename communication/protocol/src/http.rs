@@ -299,3 +299,30 @@ pub fn decode_page(encoded: &[u8]) -> WireResult<Page> {
     validate_page_structure(&page)?;
     Ok(page)
 }
+
+pub fn encode_setup_control(creation: &[u8], expires: u64, retire: bool) -> WireResult<Vec<u8>> {
+    decode_creation(creation)?;
+    positive_counter(expires)?;
+    encode_metadata(vec![
+        uint(1),
+        Value::Bytes(creation.to_vec()),
+        uint(expires),
+        uint(u64::from(retire)),
+    ])
+}
+pub fn decode_setup_control(encoded: &[u8]) -> WireResult<(Vec<u8>, u64, bool)> {
+    let value = decode_metadata(encoded)?;
+    let f = array(&value, 4)?;
+    version(&f[0])?;
+    let Value::Bytes(creation) = &f[1] else {
+        return Err(WireError::Schema);
+    };
+    decode_creation(creation)?;
+    let expires = positive_counter(number(&f[2])?)?;
+    let retire = match number(&f[3])? {
+        0 => false,
+        1 => true,
+        _ => return Err(WireError::Schema),
+    };
+    Ok((creation.clone(), expires, retire))
+}

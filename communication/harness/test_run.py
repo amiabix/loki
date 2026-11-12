@@ -154,6 +154,20 @@ class HarnessOwnership(unittest.TestCase):
         self.assertEqual(run.find_binary('member', workspace=self.base,
                                         target_dir='target', env=env), default)
 
+    def test_poc_acceptance_profile_is_explicit_and_never_falls_back(self):
+        workspace = self.base / 'poc'
+        binary = workspace / 'target/release/member'
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes(b'fixture')
+        binary.chmod(0o700)
+        env = {'LOKI_POC_BIN_PROFILE': 'release'}
+        self.assertEqual(run.find_binary('member', workspace=workspace, env=env), binary)
+        for profile in ('../debug', 'unexpected'):
+            with self.assertRaises(run.OwnershipError):
+                run.find_binary('member', workspace=workspace, env={'LOKI_POC_BIN_PROFILE': profile})
+        with self.assertRaises(run.OwnershipError):
+            run.find_binary('member', workspace=workspace, env={})
+
     def test_marker_symlink_refused(self):
         owner = run.OwnedRun.create(self.base / 'run')
         marker = owner.root / owner.MARKER

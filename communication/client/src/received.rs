@@ -8,7 +8,9 @@ use crate::{
     prepare_outbox, AuthenticatedMessage, AuthenticatedTransfer, ClientError, ClientResult,
     ClientStore, CommIdentity, CompleteSource, PreparedOutbox, TransferAssembler,
 };
-use loki_relay_protocol::types::{Id32, LogicalKey, MemberId, MessageBody, MessageRef, Payload, Roster};
+use loki_relay_protocol::types::{
+    Id32, LogicalKey, MemberId, MessageBody, MessageRef, Payload, Roster,
+};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -74,7 +76,7 @@ pub(crate) fn bound_ack(
     if prepared.key().sender != author
         || prepared.key().vault != original_key.vault
         || prepared.key().roster != original_key.roster
-        || prepared.recipients().len() != 3
+        || prepared.recipients().len() != roster.members.len()
     {
         return Err(ClientError::Identity);
     }
@@ -127,7 +129,7 @@ fn ack_blocked(store: &ClientStore, source: &CompleteSource) -> ClientResult<boo
     Ok(false)
 }
 
-/// Prepare three encrypted Received copies for a foreign test message.
+/// Prepare encrypted Received copies for every roster member for a foreign test message.
 ///
 /// Self-delivery, an incoming Received, a partial set, and a quarantined root produce no
 /// acknowledgement. A saved original also produces none: the commit reuses the saved link
@@ -147,8 +149,8 @@ pub fn prepare_received(
     {
         return Err(ClientError::Identity);
     }
-    let foreign_test = message.body().key.sender != owner
-        && matches!(message.body().payload, Payload::Test(_));
+    let foreign_test =
+        message.body().key.sender != owner && matches!(message.body().payload, Payload::Test(_));
     if !foreign_test || ack_blocked(store, source)? {
         return Ok(None);
     }
@@ -205,7 +207,7 @@ impl ReceivedStatus {
     /// This does not read relay receipts and does not release Stored capacity.
     pub fn whole_vault(&self) -> bool {
         self.author_committed
-            && self.audience.len() == 3
+            && loki_relay_protocol::types::valid_member_count(self.audience.len())
             && self.audience.contains(&self.key.sender)
             && self
                 .audience
@@ -251,7 +253,12 @@ pub fn reconcile_received(
         match &observation.outcome {
             AckOutcome::Pending => {}
             AckOutcome::Rejected(reason) => {
-                durable_reason(store, &observation.source_root, reason, observation.body_digest.as_ref())?;
+                durable_reason(
+                    store,
+                    &observation.source_root,
+                    reason,
+                    observation.body_digest.as_ref(),
+                )?;
             }
             AckOutcome::Certified(certified) => {
                 store.note_received_ref(
@@ -276,7 +283,8 @@ pub fn received_status(
     digest: &Id32,
 ) -> ClientResult<ReceivedStatus> {
     store.check_association(roster, identity.public().id)?;
-    if key.vault != roster.vault || key.roster != loki_relay_protocol::types::roster_digest(roster)? {
+    if key.vault != roster.vault || key.roster != loki_relay_protocol::types::roster_digest(roster)?
+    {
         return Err(ClientError::Identity);
     }
     let observations = collect_acks(store, roster, identity)?;
@@ -338,7 +346,10 @@ fn target_fact(
         Err(error) => return Err(error),
     };
     let body = opened.message().body();
-    if &body.key != key || opened.message().digest() != digest || !matches!(body.payload, Payload::Test(_)) {
+    if &body.key != key
+        || opened.message().digest() != digest
+        || !matches!(body.payload, Payload::Test(_))
+    {
         return Ok(None);
     }
     Ok(Some(TargetFact {
@@ -417,7 +428,15 @@ fn observe_incoming(
     Ok(AckObservation {
         source_root: row.source_root,
         body_digest: Some(*opened.message().digest()),
-        outcome: judge(store, roster, identity, &opened, &row.key, &row.digest, row.source_root)?,
+        outcome: judge(
+            store,
+            roster,
+            identity,
+            &opened,
+            &row.key,
+            &row.digest,
+            row.source_root,
+        )?,
     })
 }
 
@@ -506,7 +525,11 @@ fn judge(
     if body.key.sender == target_ref.sender {
         return Ok(AckOutcome::Rejected("author"));
     }
-    if !roster.members.iter().any(|member| member.id == body.key.sender) {
+    if !roster
+        .members
+        .iter()
+        .any(|member| member.id == body.key.sender)
+    {
         return Ok(AckOutcome::Rejected("audience"));
     }
     let target_key = LogicalKey {
@@ -520,7 +543,12 @@ fn judge(
     };
     let target = match open_saved(store, roster, identity, &saved, &target_key) {
         Ok(target) => target,
-        Err(ClientError::MissingObjects(_) | ClientError::Crypto | ClientError::Identity | ClientError::Wire(_)) => {
+        Err(
+            ClientError::MissingObjects(_)
+            | ClientError::Crypto
+            | ClientError::Identity
+            | ClientError::Wire(_),
+        ) => {
             return Ok(AckOutcome::Pending);
         }
         Err(error) => return Err(error),
@@ -600,7 +628,12 @@ fn open_hashes(
     if !missing.is_empty() {
         return Err(ClientError::MissingObjects(missing));
     }
-    TransferAssembler::open(roster, identity, &root.ok_or(ClientError::Storage)?, &objects)
+    TransferAssembler::open(
+        roster,
+        identity,
+        &root.ok_or(ClientError::Storage)?,
+        &objects,
+    )
 }
 
 /// Keep the first per-source reason. A full page budget retries on a later pass.

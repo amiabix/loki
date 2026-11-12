@@ -2,6 +2,7 @@ use crate::{WireError, WireResult};
 
 pub const MESSAGE_MAGIC: &[u8; 8] = b"LOKIRLY1";
 pub const CONFIG_MAGIC: &[u8; 8] = b"LOKICFG1";
+pub const SETUP_MAGIC: &[u8; 8] = b"LOKISET1";
 pub const VERSION: u8 = 1;
 pub const HEADER_LEN: usize = 8 + 1 + 32;
 pub const TAG_LEN: usize = 16;
@@ -30,7 +31,7 @@ pub fn validate_wire(wire: &[u8]) -> WireResult<()> {
     {
         return Err(WireError::Bounds);
     }
-    if &wire[..8] != MESSAGE_MAGIC && &wire[..8] != CONFIG_MAGIC {
+    if &wire[..8] != MESSAGE_MAGIC && &wire[..8] != CONFIG_MAGIC && &wire[..8] != SETUP_MAGIC {
         return Err(WireError::Schema);
     }
     if wire[8] != VERSION {

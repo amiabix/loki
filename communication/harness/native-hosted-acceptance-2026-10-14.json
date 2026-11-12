@@ -1,0 +1,296 @@
+{
+  "result": "required_native_https_and_final_main_mined_acceptance_complete",
+  "native_source_commit": "3f635645944bf144e36502dffe25681c86315261",
+  "native_source_tree": "379d4c3f9f4840c926f5957924765b1ff860064c",
+  "harness_implementation_commit": "bb6a0cab9f6ace834818a2f43fa86e8ca7d5e541",
+  "harness_publication_commit": "048ce7feac7f2263094d9f484ec3bfff4b5a514b",
+  "network": "owned regtest",
+  "branch_id": "37a5165b",
+  "handoffs": [
+    {
+      "policy": "2-of-3",
+      "result": "native_separate_host_signed_handoff_accepted",
+      "distinct_hosts": 2,
+      "configuration_sha256": "e265b7d2bca3b0f26f9a9a47eaa1df6702782d4c8306f4d49b5460c12d7af2da",
+      "fingerprint": "b866bcb3c0f25830dec5b478a111900c4b9484a59bcc5e0e69d658ddfc9d914b",
+      "ready_slots": [
+        1,
+        2,
+        3
+      ],
+      "native_binary_sha256": [
+        "8a8484a665636503e0950e89a16bbebefc1da1138ff49114f66f68811c5d5662",
+        "a5ef4606631eca23dc531274eb8c76f60c1b7d3ae2692e35bfddfcbcc90ebe3e"
+      ]
+    },
+    {
+      "policy": "2-of-4",
+      "result": "native_separate_host_signed_handoff_accepted",
+      "distinct_hosts": 2,
+      "configuration_sha256": "e265b7d2bca3b0f26f9a9a47eaa1df6702782d4c8306f4d49b5460c12d7af2da",
+      "fingerprint": "3d820116cb3eb92e201d9a406426933b387535019f89133cf6851de2528642a2",
+      "ready_slots": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "native_binary_sha256": [
+        "8a8484a665636503e0950e89a16bbebefc1da1138ff49114f66f68811c5d5662",
+        "a5ef4606631eca23dc531274eb8c76f60c1b7d3ae2692e35bfddfcbcc90ebe3e"
+      ]
+    }
+  ],
+  "payments": [
+    {
+      "policy": "2-of-3",
+      "pair": "AB",
+      "signers": [
+        1,
+        2
+      ],
+      "independent_finishers": [
+        3
+      ],
+      "finisher": 3,
+      "recipient_decrypted": true,
+      "txid": "d202004400b0eec366d1ddd1b2f53f56473d91c5b9a0b1409724cb2f1ebc9d71",
+      "confirmations": 3,
+      "block_hash": "e6283e2453cb545b8def14e9daff004cab8c3ef331c12bb45e29cea87bbcdcaa",
+      "payment": "a7d00285d8dc0748740f79191adc00f0476b15b2b9b50ea9f44f885b592c9937",
+      "attempt": "c6330753f90a72f8a0b8b6489315ae40d8ed922e7c0281f6903d4e980c8e452a",
+      "reviewed_manifest_sha256": "8940e250cad1bc331bf29e65f3b50e9287d5cc4f5c808fe5d98d54244c9d80e7",
+      "aggregate_verification_sha256": "5640d2d237babf11eac1da413063e08b712ff34d0164d27301b84fa009f6dfa2",
+      "transport": "native verified HTTPS",
+      "distinct_hosts": 2,
+      "private_keys_exported": false,
+      "manual_provisioning": false,
+      "nonce_witness_format": 2
+    },
+    {
+      "policy": "2-of-3",
+      "pair": "AC",
+      "signers": [
+        1,
+        3
+      ],
+      "independent_finishers": [
+        2
+      ],
+      "finisher": 2,
+      "recipient_decrypted": true,
+      "txid": "9e31de8b6e70f1948aacf8049cd5fea15d417b14c579420b755d70d50bcc659a",
+      "confirmations": 3,
+      "block_hash": "b0dde17d6087a72f8057c6861ef5f1e1309e1c4ae8f4f2dd50c8e64bca21e058",
+      "payment": "360c5a1e6e9776fe9baa09c1cdb6c5900f7dc3e2671d711607aed559cb5de850",
+      "attempt": "9251848f168c33652e0083e489907681a3655761025fa1058a067755a4f4fe38",
+      "reviewed_manifest_sha256": "3d9ec22ddfc6d868f2085ea92fd12a32d2ec6b5510b3fb0c2994accf90d72a6d",
+      "aggregate_verification_sha256": "78827839a4076610a54acb38c0c57ab409be70ab1ed0ef8ff4d912b995ad6ce2",
+      "transport": "native verified HTTPS",
+      "distinct_hosts": 2,
+      "private_keys_exported": false,
+      "manual_provisioning": false,
+      "nonce_witness_format": 2
+    },
+    {
+      "policy": "2-of-3",
+      "pair": "BC",
+      "signers": [
+        2,
+        3
+      ],
+      "independent_finishers": [
+        1
+      ],
+      "finisher": 1,
+      "recipient_decrypted": true,
+      "txid": "6eb894ba5b3538e9c35798909c1b7ff91fafd9413b9dd5975e3b6f96cfcd418f",
+      "confirmations": 3,
+      "block_hash": "a5c29ad37bcb757f0e265a302e358ed735a46a721b123e73c0247e9f763d72d9",
+      "payment": "2562a44b91b26daf0b73aa15e476dd1460c50217849c15ecdd2b3305b701de09",
+      "attempt": "1fa7cc6da9372bbcfb7ce48b816d3457a5b7d85f9cf886cb6055be9f3d9f7ad6",
+      "reviewed_manifest_sha256": "aa2525881aed8f7686e22a0aecef83a8ed2a303939bd77ae07603eb0669e7e8e",
+      "aggregate_verification_sha256": "7b532139fc2fc4adaed1bde9ef2eae8dadc0ea21dcc633e783cde42e5a2a9453",
+      "transport": "native verified HTTPS",
+      "distinct_hosts": 2,
+      "private_keys_exported": false,
+      "manual_provisioning": false,
+      "nonce_witness_format": 2
+    },
+    {
+      "policy": "2-of-4",
+      "pair": "AB",
+      "signers": [
+        1,
+        2
+      ],
+      "independent_finishers": [
+        3,
+        4
+      ],
+      "finisher": 3,
+      "recipient_decrypted": true,
+      "txid": "4f11b4239f97207a04ef9cad2c65f3c5bbe622d1256ea85e28bafaedd5442f5e",
+      "confirmations": 3,
+      "block_hash": "fa78e4bcd0c31f4cbdbe33b53721de8892899eed54f89def44679e5e7faccfe3",
+      "payment": "57f85628f9ded240193d6bee94c7482b622bc6e589a20e682a1183db26be294f",
+      "attempt": "d55e7719cf98cbdd8abe3f6db96c30145d195943d527e3c981a93c30987b7f4e",
+      "reviewed_manifest_sha256": "3f6d533cf20ba1d2f521d18dbbd8aa959a3152cc8617c69341beb049799b811b",
+      "aggregate_verification_sha256": "95367fc7c0e0273d50c1cc83683689a82400f0091e13f982b314e5cf81b5dd1f",
+      "transport": "native verified HTTPS",
+      "distinct_hosts": 2,
+      "private_keys_exported": false,
+      "manual_provisioning": false,
+      "nonce_witness_format": 2
+    },
+    {
+      "policy": "2-of-4",
+      "pair": "AC",
+      "signers": [
+        1,
+        3
+      ],
+      "independent_finishers": [
+        2,
+        4
+      ],
+      "finisher": 2,
+      "recipient_decrypted": true,
+      "txid": "b0d22c69aa34819b1d7a0bc728cb7169c2638ad0af800eb19f0df85701506785",
+      "confirmations": 3,
+      "block_hash": "a955e004d43d9e22667358aee799037082048e5fdd2acc34124a2bd87afefe9a",
+      "payment": "de96209758ce006d9969693cf8eaf38748b744189f41890c6f20214be496ee37",
+      "attempt": "bc4d42a469ae92605c1519a99393347b10b2c3105fe00d45f906b3b277cb1dd3",
+      "reviewed_manifest_sha256": "75adddd128e82797316539064a026f9975fc62d60e732f4644d37c28e99ea2d6",
+      "aggregate_verification_sha256": "0f6c03841c8c9277b8fb9dbdfe9b22f659f83238b3e746123554d997c01c604b",
+      "transport": "native verified HTTPS",
+      "distinct_hosts": 2,
+      "private_keys_exported": false,
+      "manual_provisioning": false,
+      "nonce_witness_format": 2
+    },
+    {
+      "policy": "2-of-4",
+      "pair": "AD",
+      "signers": [
+        1,
+        4
+      ],
+      "independent_finishers": [
+        2,
+        3
+      ],
+      "finisher": 2,
+      "recipient_decrypted": true,
+      "txid": "99058021de9505aefc69a5593d09f570c8cee472bf0988466e5cd93a295dbba8",
+      "confirmations": 3,
+      "block_hash": "e33990dfa98a5858e9f4b2edb9c7c6ef789b7320eabf5ed2192478369bec19ce",
+      "payment": "4111451a5b476f308f5bdb5427feb2ba6a177ee0620cdd7fb9bbda3911862fd3",
+      "attempt": "e1d9dd7d0656049cbfcdaa2a437db59744fa76c76048cc11ff8db9080b80cff5",
+      "reviewed_manifest_sha256": "3619859b9ec30779bcd984ee05063c80b303c93f22623be0dc032dd90bd09b75",
+      "aggregate_verification_sha256": "1b1931e3fde1ecd1d941b2bf4d67f928420b66574ee7fbffbfb4d9c3b7fba7f9",
+      "transport": "native verified HTTPS",
+      "distinct_hosts": 2,
+      "private_keys_exported": false,
+      "manual_provisioning": false,
+      "nonce_witness_format": 2
+    },
+    {
+      "policy": "2-of-4",
+      "pair": "BC",
+      "signers": [
+        2,
+        3
+      ],
+      "independent_finishers": [
+        1,
+        4
+      ],
+      "finisher": 1,
+      "recipient_decrypted": true,
+      "txid": "5eb453ba5d2bc305ccbf33540541969b6c1fcb8c461358b7fd74278df2be626a",
+      "confirmations": 3,
+      "block_hash": "4204b2276fa82e5b0f63b79401d1d3bacf67d2f1cb077ace5e81133e55adee98",
+      "payment": "3f83539d4c44207bf2d87831afab661fb613d36e4986346fc9f0837a7cd28a53",
+      "attempt": "c5e7953907ab0328a06b7c0fa91ea3a4588cafc8c2b863412549347b6eb04c8a",
+      "reviewed_manifest_sha256": "d52eb766f4b30e3a0d5b4819b694eb2057dffa256a6a7d63b75663f3fae21325",
+      "aggregate_verification_sha256": "231a4efa06d9aa0dc573db07935d748b21515558921795d06829bef0df3a9339",
+      "transport": "native verified HTTPS",
+      "distinct_hosts": 2,
+      "private_keys_exported": false,
+      "manual_provisioning": false,
+      "nonce_witness_format": 2
+    },
+    {
+      "policy": "2-of-4",
+      "pair": "BD",
+      "signers": [
+        2,
+        4
+      ],
+      "independent_finishers": [
+        1,
+        3
+      ],
+      "finisher": 1,
+      "recipient_decrypted": true,
+      "txid": "5ae62f16b4bdec8c2f2eeaea2d3e549b6edb9756f17e29c2470bc216794e98a9",
+      "confirmations": 3,
+      "block_hash": "6b4f59a2c1e83627ec6a6fa96eb88734621536f0196ed4f3ffeda9fc9ce4b2be",
+      "payment": "a679a7bb0aba534c816024a5df762ce1e88a67659efcbf8ac22172c57f8451e7",
+      "attempt": "a4264518f4fa5f4a1c674efc5840a722445fcdf52ef314734a397cbba3ae98cd",
+      "reviewed_manifest_sha256": "c41ae3b82a2f48fc62f76cb05e8a461ab3acd77d0192049a50f5319e46cd1b25",
+      "aggregate_verification_sha256": "24637880b20628d7d0c11681c365108ee79e5b7f50582dddf7ea79c541536396",
+      "transport": "native verified HTTPS",
+      "distinct_hosts": 2,
+      "private_keys_exported": false,
+      "manual_provisioning": false,
+      "nonce_witness_format": 2
+    },
+    {
+      "policy": "2-of-4",
+      "pair": "CD",
+      "signers": [
+        3,
+        4
+      ],
+      "independent_finishers": [
+        1,
+        2
+      ],
+      "finisher": 1,
+      "recipient_decrypted": true,
+      "txid": "30efd4b490af9a646fea7f6752dc6b5fb8c79460e1f31cfc6ea797d6d8dd44ee",
+      "confirmations": 3,
+      "block_hash": "f4ee41dbe04b3b610431ba1e010db185b0e281d0ee87b52910e941499b10f501",
+      "payment": "43594fdabf63b6674b67e7f1ea3fbaddecb4fa7e3b3db5653c767982ab0cd317",
+      "attempt": "45d3fc694ed59e2f73ea10b2515d67ff0a235c98deff26340b870ca77886b5de",
+      "reviewed_manifest_sha256": "3dad6fdc60ce6fcc1873346c8810368aa9774e6c0d4030a1e073b09638391e0c",
+      "aggregate_verification_sha256": "a4764d2b7cd3b773e4da960d7f247b07a8a806bdd5bd82ed415887e0d52103b6",
+      "transport": "native verified HTTPS",
+      "distinct_hosts": 2,
+      "private_keys_exported": false,
+      "manual_provisioning": false,
+      "nonce_witness_format": 2
+    }
+  ],
+  "funding_receipts": 2,
+  "funding_idempotency": "original address-derived THS keys retained",
+  "validation": {
+    "native": {
+      "passed": 250,
+      "failed": 0,
+      "ignored": 4,
+      "reused": true
+    },
+    "consolidated_harness_passed": 70,
+    "affected_resume_module_passed": 11,
+    "read_only_review": "both crash-resume findings resolved; no remaining substantive issue",
+    "native_tls_negative_cases_reused": [
+      "wrong-hostname",
+      "untrusted-ca",
+      "changed-key",
+      "changed-run"
+    ]
+  }
+}

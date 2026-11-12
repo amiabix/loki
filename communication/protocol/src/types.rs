@@ -4,6 +4,19 @@ use crate::{
 };
 use sha2::{Digest, Sha256};
 
+/// Largest vault: a policy is t-of-n with 2 ≤ t < n ≤ `MAX_MEMBERS`.
+pub const MAX_MEMBERS: u16 = 16;
+
+/// Whether `threshold`-of-`members` is a supported vault policy.
+pub fn valid_policy(threshold: u16, members: u16) -> bool {
+    2 <= threshold && threshold < members && members <= MAX_MEMBERS
+}
+
+/// Whether a vault may have `members` members (3 to `MAX_MEMBERS`).
+pub fn valid_member_count(members: usize) -> bool {
+    (3..=usize::from(MAX_MEMBERS)).contains(&members)
+}
+
 const MAX_BODY: usize = 16 * 1024 * 1024;
 
 pub type Id32 = [u8; 32];
@@ -55,12 +68,17 @@ fn reference_value(r: &MessageRef) -> Value {
     Value::Array(vec![uint(r.sender), bytes(&r.message), bytes(&r.digest)])
 }
 pub fn encode_roster(roster: &Roster) -> WireResult<Vec<u8>> {
-    if roster.members.len() != 3
-        || roster.members.iter().any(|m| !(1..=3).contains(&m.id))
+    if !valid_member_count(roster.members.len())
         || roster
             .members
-            .windows(2)
-            .any(|pair| pair[0].id >= pair[1].id)
+            .iter()
+            .enumerate()
+            .any(|(index, member)| member.id != index as u16 + 1)
+        || roster.members.iter().enumerate().any(|(index, member)| {
+            roster.members[..index].iter().any(|prior| {
+                prior.signing == member.signing || prior.encryption == member.encryption
+            })
+        })
     {
         return Err(WireError::Schema);
     }
@@ -80,13 +98,20 @@ pub fn roster_digest(roster: &Roster) -> WireResult<Id32> {
     Ok(Sha256::digest(encode_roster(roster)?).into())
 }
 pub fn encode_message(body: &MessageBody) -> WireResult<Vec<u8>> {
-    if body.audience != [1, 2, 3] || !(1..=3).contains(&body.key.sender) {
+    if !valid_member_count(body.audience.len())
+        || body
+            .audience
+            .iter()
+            .enumerate()
+            .any(|(index, member)| *member != index as u16 + 1)
+        || !body.audience.contains(&body.key.sender)
+    {
         return Err(WireError::Schema);
     }
     if body
         .prerequisites
         .iter()
-        .any(|r| !(1..=3).contains(&r.sender))
+        .any(|r| !body.audience.contains(&r.sender))
     {
         return Err(WireError::Schema);
     }

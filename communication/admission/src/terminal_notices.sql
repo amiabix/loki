@@ -1,0 +1,1 @@
+CREATE TABLE terminal_notices(ceremony BLOB NOT NULL,slot INTEGER NOT NULL,kind INTEGER NOT NULL CHECK(kind BETWEEN 1 AND 4),request BLOB NOT NULL CHECK(length(request) BETWEEN 1 AND 1024),PRIMARY KEY(ceremony,slot,kind),FOREIGN KEY(ceremony,slot) REFERENCES claims(ceremony,slot)) WITHOUT ROWID;

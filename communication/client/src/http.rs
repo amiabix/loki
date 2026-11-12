@@ -26,11 +26,12 @@ use zeroize::Zeroizing;
 const MAX_CONTROL: usize = 4096;
 pub struct RelayHttp {
     client: Client,
+    development: bool,
 }
 impl RelayHttp {
     /// Check that the pinned signer is reachable; this does not authenticate later HTTP requests.
     pub async fn authenticate_endpoint(&self, pin: &RelayPin, endpoint: &str) -> ClientResult<()> {
-        crate::descriptor::endpoint(endpoint)?;
+        crate::validate_endpoint(endpoint, self.development)?;
         let mut nonce = [0; 32];
         getrandom::fill(&mut nonce).map_err(|_| ClientError::Crypto)?;
         let url = format!("{}/v1/identity", endpoint.trim_end_matches('/'));
@@ -62,7 +63,7 @@ impl RelayHttp {
         cid: Id32,
         wire: &[u8],
     ) -> ClientResult<bool> {
-        crate::descriptor::endpoint(&route.endpoint)?;
+        crate::validate_endpoint(&route.endpoint, self.development)?;
         if wire.is_empty() || wire.len() > nonce::MAX_RECORD {
             return Err(ClientError::Config);
         }
@@ -89,20 +90,47 @@ impl RelayHttp {
         }
         verify_nonce_claim(route, cid, wire, challenge, status, &raw)
     }
+    /// Existing local tooling explicitly permits literal loopback HTTP.
     pub fn new() -> ClientResult<Self> {
+        Self::build(true)
+    }
+
+    /// Hosted requests require verified HTTPS on every request.
+    pub fn hosted() -> ClientResult<Self> {
+        Self::build(false)
+    }
+
+    pub(crate) fn development(&self) -> bool {
+        self.development
+    }
+    pub fn for_setup(operators: &crate::OperatorSet, development: bool) -> ClientResult<Self> {
         Ok(Self {
-            client: Client::builder()
-                .redirect(Policy::none())
-                // guard:proxy
-                .no_proxy()
-                // end:proxy
-                .no_gzip()
-                .no_brotli()
-                .no_deflate()
-                .no_zstd()
-                .timeout(Duration::from_secs(10))
+            development,
+            client: Self::client_builder()
+                .timeout(std::time::Duration::from_secs(
+                    operators.limits().request_seconds.min(10),
+                ))
                 .build()?,
         })
+    }
+    fn build(development: bool) -> ClientResult<Self> {
+        Ok(Self {
+            development,
+            client: Self::client_builder().build()?,
+        })
+    }
+
+    pub(crate) fn client_builder() -> reqwest::ClientBuilder {
+        Client::builder()
+            .redirect(Policy::none())
+            // guard:proxy
+            .no_proxy()
+            // end:proxy
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .no_zstd()
+            .timeout(Duration::from_secs(10))
     }
     async fn control(
         &self,
@@ -111,7 +139,7 @@ impl RelayHttp {
         request: &[u8],
         suffix: &str,
     ) -> ClientResult<(u16, Vec<u8>)> {
-        crate::descriptor::endpoint(&route.endpoint)?;
+        crate::validate_endpoint(&route.endpoint, self.development)?;
         if request.len() > MAX_CONTROL
             || route.append_revision == 0
             || route.append_revision > i64::MAX as u64
@@ -184,6 +212,30 @@ impl RelayHttp {
         }
         Ok(result)
     }
+    pub async fn setup_control(
+        &self,
+        route: &RelayRoute,
+        provision: &Secret32,
+        creation: &[u8],
+        expires: u64,
+        retire: bool,
+    ) -> ClientResult<CreationResult> {
+        let request = loki_relay_protocol::http::encode_setup_control(creation, expires, retire)?;
+        let creation = decode_creation(creation)?;
+        let (status, body) = self.control(route, provision, &request, "/setup").await?;
+        if status != 200 && status != 201 {
+            return Err(ClientError::Transport);
+        }
+        let (mailbox, result) = decode_creation_result(&body, status == 201)?;
+        if mailbox != route.mailbox
+            || result.run != route.pin.run
+            || result.quota != creation.quota
+            || result.append_revision < route.append_revision
+        {
+            return Err(ClientError::Config);
+        }
+        Ok(result)
+    }
     pub async fn rotate(
         &self,
         route: &RelayRoute,
@@ -217,7 +269,7 @@ impl RelayHttp {
         object: &Object,
     ) -> ClientResult<VerifiedReceipt> {
         // guard:endpoint_recheck
-        crate::descriptor::endpoint(&route.endpoint)?;
+        crate::validate_endpoint(&route.endpoint, self.development)?;
         // end:endpoint_recheck
         // guard:framing
         envelope::validate_wire(&object.wire).map_err(|_| ClientError::Config)?;
@@ -257,7 +309,7 @@ impl RelayHttp {
         hash: &Id32,
     ) -> ClientResult<Object> {
         // guard:endpoint_recheck
-        crate::descriptor::endpoint(&route.endpoint)?;
+        crate::validate_endpoint(&route.endpoint, self.development)?;
         // end:endpoint_recheck
         let url = format!(
             "{}/v1/mailboxes/{}/objects/{}",
@@ -305,7 +357,7 @@ impl RelayHttp {
         limit: Option<u64>,
     ) -> ClientResult<VerifiedPage> {
         // guard:endpoint_recheck
-        crate::descriptor::endpoint(&route.endpoint)?;
+        crate::validate_endpoint(&route.endpoint, self.development)?;
         // end:endpoint_recheck
         let limit = validate_limit(limit)?;
         if after > MAX_PERSISTED_COUNTER {
@@ -397,7 +449,7 @@ impl RelayHttp {
         after: u64,
         limit: Option<u64>,
     ) -> ClientResult<PageRead> {
-        crate::descriptor::endpoint(&route.endpoint)?;
+        crate::validate_endpoint(&route.endpoint, self.development)?;
         let limit = validate_limit(limit)?;
         if after > MAX_PERSISTED_COUNTER {
             return Err(ClientError::Config);
@@ -424,7 +476,7 @@ impl RelayHttp {
         read: &Secret32,
         hash: &Id32,
     ) -> ClientResult<Vec<u8>> {
-        crate::descriptor::endpoint(&route.endpoint)?;
+        crate::validate_endpoint(&route.endpoint, self.development)?;
         let url = format!(
             "{}/v1/mailboxes/{}/objects/{}",
             route.endpoint.trim_end_matches('/'),
@@ -1321,3 +1373,7 @@ mod nonce_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "http/hosted_tests.rs"]
+mod hosted_tests;

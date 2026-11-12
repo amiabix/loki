@@ -1,0 +1,17 @@
+CREATE TABLE metadata (singleton INTEGER PRIMARY KEY CHECK(singleton=1), association BLOB NOT NULL CHECK(length(association) BETWEEN 1 AND 4096), terminal INTEGER NOT NULL CHECK(terminal IN(0,1))) STRICT;
+CREATE TABLE objects (hash BLOB PRIMARY KEY CHECK(length(hash)=32), wire BLOB NOT NULL CHECK(length(wire) BETWEEN 1024 AND 65536)) STRICT;
+CREATE TABLE outgoing (key BLOB PRIMARY KEY CHECK(length(key) BETWEEN 1 AND 128), digest BLOB NOT NULL CHECK(length(digest)=32), recipient INTEGER NOT NULL CHECK(recipient BETWEEN 1 AND 16), root BLOB NOT NULL REFERENCES objects(hash)) STRICT;
+CREATE TABLE required (key BLOB NOT NULL CHECK(length(key) BETWEEN 1 AND 128) REFERENCES outgoing(key), ordinal INTEGER NOT NULL CHECK(ordinal>=0), hash BLOB NOT NULL REFERENCES objects(hash), PRIMARY KEY(key,ordinal), UNIQUE(key,hash)) STRICT;
+CREATE TABLE incoming (key BLOB PRIMARY KEY CHECK(length(key) BETWEEN 1 AND 128), digest BLOB NOT NULL CHECK(length(digest)=32), root BLOB NOT NULL REFERENCES objects(hash), prerequisites BLOB NOT NULL CHECK(length(prerequisites) BETWEEN 1 AND 2200)) STRICT;
+CREATE TABLE stored (key BLOB NOT NULL CHECK(length(key) BETWEEN 1 AND 128) REFERENCES outgoing(key), pin BLOB NOT NULL CHECK(length(pin)=32), hash BLOB NOT NULL REFERENCES objects(hash), receipt BLOB NOT NULL CHECK(length(receipt) BETWEEN 1 AND 512), PRIMARY KEY(key,pin,hash)) STRICT;
+CREATE TABLE cursors (pin BLOB PRIMARY KEY CHECK(length(pin)=32), mailbox BLOB NOT NULL CHECK(length(mailbox)=32), sequence INTEGER NOT NULL CHECK(sequence>=0)) STRICT;
+CREATE TRIGGER objects_immutable BEFORE UPDATE ON objects BEGIN SELECT RAISE(ABORT,'immutable'); END;
+CREATE TRIGGER outgoing_immutable BEFORE UPDATE ON outgoing BEGIN SELECT RAISE(ABORT,'immutable'); END;
+CREATE TRIGGER incoming_immutable BEFORE UPDATE ON incoming BEGIN SELECT RAISE(ABORT,'immutable'); END;
+CREATE TRIGGER required_immutable BEFORE UPDATE ON required BEGIN SELECT RAISE(ABORT,'immutable'); END;
+CREATE TABLE acknowledgements (key BLOB PRIMARY KEY REFERENCES incoming(key), recipient INTEGER NOT NULL CHECK(recipient BETWEEN 1 AND 16), hash BLOB NOT NULL REFERENCES objects(hash)) STRICT;
+CREATE TABLE ack_stored (hash BLOB NOT NULL REFERENCES objects(hash), pin BLOB NOT NULL CHECK(length(pin)=32), receipt BLOB NOT NULL CHECK(length(receipt) BETWEEN 1 AND 512), PRIMARY KEY(hash,pin)) STRICT;
+CREATE TABLE received (key BLOB PRIMARY KEY REFERENCES outgoing(key), digest BLOB NOT NULL CHECK(length(digest)=32), package BLOB NOT NULL CHECK(length(package) BETWEEN 1 AND 4096)) STRICT;
+CREATE TABLE rejected (hash BLOB PRIMARY KEY REFERENCES objects(hash)) STRICT;
+CREATE TABLE retries (pin BLOB PRIMARY KEY CHECK(length(pin)=32), attempts INTEGER NOT NULL CHECK(attempts BETWEEN 1 AND 1000000), next_ms INTEGER NOT NULL CHECK(next_ms>0)) STRICT;
+CREATE TABLE deferred (hash BLOB PRIMARY KEY REFERENCES objects(hash)) STRICT;

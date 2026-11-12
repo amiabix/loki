@@ -13,7 +13,7 @@ pub struct CommIdentity {
 impl CommIdentity {
     pub fn from_serialized(bytes: &[u8; 66]) -> ClientResult<Self> {
         let id = u16::from_be_bytes([bytes[0], bytes[1]]);
-        if !(1..=3).contains(&id) {
+        if !(1..=loki_relay_protocol::types::MAX_MEMBERS).contains(&id) {
             return Err(ClientError::Identity);
         }
         let mut signing_seed = Zeroizing::new([0u8; 32]);

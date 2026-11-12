@@ -204,11 +204,16 @@ pub fn router(db: DbHandle) -> Router {
             put(control_route).layer(DefaultBodyLimit::max(MAX_CONTROL_LEN)),
         )
         .route(
+            "/v1/mailboxes/{mailbox}/setup",
+            put(control_route).layer(DefaultBodyLimit::max(MAX_CONTROL_LEN)),
+        )
+        .route(
             "/v1/mailboxes/{mailbox}/append-capability",
             put(control_route).layer(DefaultBodyLimit::max(MAX_CONTROL_LEN)),
         )
         .route("/v1/mailboxes/{mailbox}/entries", get(page_route))
         .route("/v1/identity", get(identity_route))
+        .route("/health", get(|| async { StatusCode::OK }))
         .fallback(malformed)
         .method_not_allowed_fallback(malformed)
         .layer(DefaultBodyLimit::max(MAX_WIRE_LEN))
@@ -557,11 +562,14 @@ fn control_path(uri: &Uri) -> RelayResult<(Id32, bool)> {
     if uri.query().is_some()
         || !(parts.len() == 4 || parts.len() == 5)
         || parts[..3] != ["", "v1", "mailboxes"]
-        || (parts.len() == 5 && parts[4] != "append-capability")
+        || (parts.len() == 5 && !matches!(parts[4], "append-capability" | "setup"))
     {
         return Err(RelayError::MalformedRequest);
     }
-    Ok((id(parts[3])?, parts.len() == 5))
+    Ok((
+        id(parts[3])?,
+        parts.len() == 5 && parts[4] == "append-capability",
+    ))
 }
 
 fn control_headers(headers: &HeaderMap) -> RelayResult<Option<usize>> {
@@ -627,7 +635,22 @@ async fn control_request(
     if length.is_some_and(|n| n != body.len()) {
         return Err(RelayError::MalformedRequest);
     }
-    if rotate {
+    if uri.path().ends_with("/setup") {
+        loki_relay_protocol::http::decode_setup_control(&body)?;
+        let result = db
+            .setup_control(mailbox, body.to_vec(), capability)?
+            .receive()
+            .await?;
+        Ok(binary(
+            if result.created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            },
+            "application/cbor",
+            loki_relay_protocol::http::encode_creation_result(&mailbox, &result)?,
+        ))
+    } else if rotate {
         loki_relay_protocol::http::decode_append_update(&body)?;
         let revision = db
             .rotate(mailbox, body.to_vec(), capability)?

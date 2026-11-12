@@ -163,7 +163,7 @@ fn recipient_set_sender_binding() {
         assert!(prepare_outbox(&identity(1), &roster, &invalid).is_err());
     }
     let mut mismatched = roster.clone();
-    mismatched.members[0].encryption = identity(2).public().encryption;
+    mismatched.members[0].encryption = identity(4).public().encryption;
     let mut scoped = body.clone();
     scoped.key.roster = types::roster_digest(&mismatched).unwrap();
     assert!(prepare_outbox(&identity(1), &mismatched, &scoped).is_err());

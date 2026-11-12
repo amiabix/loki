@@ -1,5 +1,5 @@
 [workspace]
-members = ["protocol", "relay", "client"]
+members = ["protocol", "relay", "client", "admission"]
 resolver = "2"
 
 [workspace.package]
@@ -7,3 +7,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.89"
 publish = false
+
+# Dependencies are optimized in dev builds; the workspace crates keep opt-level 0.
+[profile.dev.package."*"]
+opt-level = 2

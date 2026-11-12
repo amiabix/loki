@@ -1,5 +1,5 @@
 use crate::store::{
-    admit_storage_growth, validate_schema, BoundSource, ClientStore, PendingDownload, StageResult, SCHEMA,
+    admit_storage_growth, validate_schema, BoundSource, ClientStore, PendingDownload, StageResult,
 };
 use crate::{
     http, AuthenticatedDescriptor, AuthenticatedMessage, ClientConfig, ClientError, ClientResult, CommIdentity,
@@ -583,10 +583,11 @@ impl ClientStore {
         }
         attach_rejected_samples(&mut drafts, downloads);
 
+        let schema = self.schema();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        validate_schema(&transaction, SCHEMA)?;
+        validate_schema(&transaction, schema)?;
         let current: Option<i64> = transaction
             .query_row(
                 "SELECT position FROM route_cursors WHERE relay_key=?1 AND run=?2 AND mailbox=?3",
@@ -1099,7 +1100,8 @@ fn publish_candidates(
     roster: &Roster,
     identity: &CommIdentity,
 ) -> ClientResult<()> {
-    let candidates = authenticate_staged(store, roster, identity)?;
+    let candidates = authenticate_staged_with_limit(store, roster, identity, Some(64))?;
+    let mut capacity_blocked = false;
     for candidate in &candidates {
         let ack = match crate::prepare_received(
             store,
@@ -1114,9 +1116,17 @@ fn publish_candidates(
         };
         match store.commit_incoming(roster, identity, candidate.source(), candidate.message(), ack.as_ref()) {
             Ok(_) => {}
+            Err(ClientError::Identity) if candidate.message().body().key.sender == identity.public().id => {
+                let root = candidate.source().required_hashes().first().ok_or(ClientError::Storage)?;
+                store.reject_source_root(root, "self_uncommitted", Some(candidate.message().digest()))?;
+            }
             Err(ClientError::Identity | ClientError::MissingObjects(_)) => continue,
+            Err(ClientError::Capacity) => capacity_blocked = true,
             Err(error) => return Err(error),
         }
+    }
+    if capacity_blocked {
+        return Err(ClientError::Capacity);
     }
     Ok(())
 }
@@ -1442,10 +1452,11 @@ fn settle_download(
     validated: Option<Vec<u8>>,
     failure: Option<(QuarantineReason, Vec<u8>)>,
 ) -> ClientResult<()> {
+    let schema = store.schema();
     let transaction = store
         .connection
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
-    validate_schema(&transaction, SCHEMA)?;
+    validate_schema(&transaction, schema)?;
     let stored_len: Option<i64> = transaction
         .query_row(
             "SELECT wire_length FROM pending_downloads WHERE relay_key=?1 AND run=?2 AND mailbox=?3 AND source_hash=?4",
@@ -1663,13 +1674,22 @@ pub fn authenticate_staged(
     roster: &Roster,
     identity: &CommIdentity,
 ) -> ClientResult<Vec<AuthenticatedCandidate>> {
+    authenticate_staged_with_limit(store, roster, identity, None)
+}
+
+fn authenticate_staged_with_limit(
+    store: &mut ClientStore,
+    roster: &Roster,
+    identity: &CommIdentity,
+    admission_limit: Option<u64>,
+) -> ClientResult<Vec<AuthenticatedCandidate>> {
     let public = identity.public();
     store.check_association(roster, public.id)?;
     if !roster.members.iter().any(|member| member == &public) {
         return Err(ClientError::Identity);
     }
     let mut opened = Vec::new();
-    discover_objects(store, roster, identity, &mut opened)?;
+    discover_objects(store, roster, identity, &mut opened, admission_limit)?;
     complete_staged(store, roster, identity, &mut opened)?;
     let prerequisites = classify_prerequisites(store, roster, identity, &opened)?;
     Ok(opened
@@ -1688,6 +1708,7 @@ fn discover_objects(
     roster: &Roster,
     identity: &CommIdentity,
     opened: &mut Vec<Opened>,
+    admission_limit: Option<u64>,
 ) -> ClientResult<()> {
     let mut after = None;
     loop {
@@ -1697,6 +1718,11 @@ fn discover_objects(
         };
         let short = page.len() < usize::from(RECOVERY_PAGE);
         for hash in page {
+            if let Some(limit) = admission_limit {
+                if store.pending_transfer_count()? >= limit {
+                    return Ok(());
+                }
+            }
             classify_cached(store, roster, identity, hash, opened)?;
         }
         after = Some(last);
@@ -1714,6 +1740,9 @@ fn classify_cached(
     hash: Id32,
     opened: &mut Vec<Opened>,
 ) -> ClientResult<()> {
+    if store.source_rejected(&hash)? || store.incoming_root_settled(&hash)? {
+        return Ok(());
+    }
     let Some(object) = store.saved_object(&hash)? else {
         return Ok(());
     };
@@ -2162,7 +2191,7 @@ pub fn committed_readiness(
     digest: &Id32,
 ) -> ClientResult<CandidateReadiness> {
     store.check_association(roster, identity.public().id)?;
-    if key.vault != roster.vault || key.roster != roster_digest(roster)? || !(1..=3).contains(&key.sender) {
+    if key.vault != roster.vault || key.roster != roster_digest(roster)? || !roster.members.iter().any(|member| member.id == key.sender) {
         return Err(ClientError::Identity);
     }
     let mut walk = ReadinessWalk::new(store, roster, identity, &[]);
@@ -2203,4 +2232,193 @@ fn classify_prerequisites(
         rows.push(statuses);
     }
     Ok(rows)
+}
+
+#[cfg(test)]
+mod bounded_intake_tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    use loki_relay_protocol::types::{LogicalKey, MessageBody, Payload, ReceiptBody, RelayPin};
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    #[test]
+    fn polling_backlog_preserves_capacity_for_atomic_received_copies() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        for (count, sender) in [(3u16, 2u16), (4, 2), (3, 1), (4, 1)] {
+            let identities: Vec<_> = (1..=count)
+                .map(|id| {
+                    let mut seed = [0u8; 66];
+                    seed[..2].copy_from_slice(&id.to_be_bytes());
+                    seed[2..34].fill(id as u8);
+                    seed[34..].fill(id as u8 + 10);
+                    CommIdentity::from_serialized(&seed).unwrap()
+                })
+                .collect();
+            let roster = Roster {
+                vault: [77; 32],
+                members: identities.iter().map(CommIdentity::public).collect(),
+            };
+            let parent = std::env::temp_dir().canonicalize().unwrap().join(format!(
+                "loki-bounded-intake-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&parent).unwrap();
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+            let mut store = ClientStore::open(&parent.join("client"), &roster, 1).unwrap();
+            let signer = SigningKey::from_bytes(&[91; 32]);
+            let route = RelayRoute {
+                pin: RelayPin {
+                    key: signer.verifying_key().to_bytes(),
+                    run: [92; 32],
+                },
+                endpoint: "http://127.0.0.1:9".into(),
+                mailbox: [93; 32],
+                append_revision: 1,
+            };
+            let objects: Vec<_> = (0u8..70)
+                .map(|id| {
+                    let body = MessageBody {
+                        key: LogicalKey {
+                            vault: roster.vault,
+                            roster: roster_digest(&roster).unwrap(),
+                            sender,
+                            message: [id; 32],
+                        },
+                        audience: (1..=count).collect(),
+                        session: Some([94; 32]),
+                        prerequisites: vec![],
+                        payload: Payload::Test(vec![id]),
+                    };
+                    crate::prepare_outbox(&identities[usize::from(sender - 1)], &roster, &body)
+                        .unwrap()
+                        .recipients()
+                        .iter()
+                        .find(|copy| copy.recipient() == 1)
+                        .unwrap()
+                        .objects()[0]
+                        .clone()
+                })
+                .collect();
+            for (batch, chunk) in objects.chunks(35).enumerate() {
+                let after = (batch * 35) as u64;
+                let entries = chunk
+                    .iter()
+                    .enumerate()
+                    .map(|(index, object)| {
+                        let sequence = after + index as u64 + 1;
+                        let body = ReceiptBody {
+                            pin: route.pin.clone(),
+                            mailbox: route.mailbox,
+                            hash: object.hash,
+                            wire_length: object.wire.len() as u64,
+                            sequence,
+                            retention: 1,
+                        };
+                        let encoded = loki_relay_protocol::receipt::encode_body(&body).unwrap();
+                        let mut input = b"Loki_Relay_Stored_v1\0".to_vec();
+                        input.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+                        input.extend_from_slice(&encoded);
+                        let receipt = canonical::encode(&Value::Array(vec![
+                            Value::Bytes(encoded),
+                            Value::Bytes(signer.sign(&input).to_bytes().to_vec()),
+                        ]))
+                        .unwrap();
+                        loki_relay_protocol::types::Entry {
+                            sequence,
+                            hash: object.hash,
+                            wire_length: object.wire.len() as u64,
+                            receipt,
+                        }
+                    })
+                    .collect();
+                let page = Page {
+                    mailbox: route.mailbox,
+                    after,
+                    next: after + chunk.len() as u64,
+                    high_water: after + chunk.len() as u64,
+                    entries,
+                };
+                let downloads = chunk
+                    .iter()
+                    .cloned()
+                    .map(DownloadOutcome::Cached)
+                    .collect::<Vec<_>>();
+                store.capture_page(&route, &page, &downloads).unwrap();
+            }
+            let candidates =
+                authenticate_staged_with_limit(&mut store, &roster, &identities[0], Some(64))
+                    .unwrap();
+            assert_eq!(candidates.len(), 64);
+            assert_eq!(store.pending_transfer_count().unwrap(), 64);
+            if sender == 1 {
+                for _ in 0..3 {
+                    publish_candidates(&mut store, &roster, &identities[0]).unwrap();
+                }
+                assert_eq!(store.pending_transfer_count().unwrap(), 0);
+                for table in [
+                    "logical_records",
+                    "incoming_originals",
+                    "caller_requests",
+                    "ack_links",
+                ] {
+                    let rows: u64 = store
+                        .connection
+                        .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                            row.get(0)
+                        })
+                        .unwrap();
+                    assert_eq!(rows, 0, "uncommitted self copies must not manufacture local publication or acknowledgements");
+                }
+                let rejected: u64 = store
+                    .connection
+                    .query_row(
+                        "SELECT count(*) FROM source_rejections WHERE reason='self_uncommitted'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(rejected, 70);
+                for object in &objects {
+                    assert_eq!(
+                        store.saved_object(&object.hash).unwrap().unwrap().wire,
+                        object.wire
+                    );
+                }
+                continue;
+            }
+            let candidate = &candidates[0];
+            let ack = crate::prepare_received(
+                &store,
+                &identities[0],
+                &roster,
+                candidate.message(),
+                candidate.source(),
+            )
+            .unwrap();
+            store
+                .commit_incoming(
+                    &roster,
+                    &identities[0],
+                    candidate.source(),
+                    candidate.message(),
+                    ack.as_ref(),
+                )
+                .unwrap();
+            assert_eq!(
+                store.pending_transfer_count().unwrap(),
+                64 + u64::from(count) - 1
+            );
+            for object in &objects {
+                assert_eq!(
+                    store.saved_object(&object.hash).unwrap().unwrap().wire,
+                    object.wire
+                );
+            }
+        }
+    }
 }

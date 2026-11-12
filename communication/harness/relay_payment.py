@@ -54,17 +54,27 @@ def pump(context, relay_binary, payment_binary, works, attempt, sent, rpc, deadl
             raise run.OwnershipError('Signing export returned an invalid count')
 
 
-def await_members(processes, pump_once, deadline):
-    while any(process.poll() is None for process in processes):
-        if time.monotonic() >= deadline:
-            raise run.OwnershipError('Payment signing timed out')
+def await_action(owner, command, member, pump_once, deadline):
+    while True:
+        result = owner.capture(command, cwd=member.root, timeout=run._remaining(deadline))
+        if result.returncode == 0:
+            return result
+        if re.fullmatch(rb'error: waiting for member [1-4] (Commitment|Package|Share); sync relay inbox and retry\n', result.stderr) is None:
+            raise run.OwnershipError('Payment action failed authenticated readiness checks')
         pump_once()
-        time.sleep(0.1)
-    pump_once()
+
+
+def await_members(processes, deadline, owner):
     output = []
     for process in processes:
-        stdout, _stderr = process.communicate(timeout=2)
+        try:
+            stdout, stderr = process.communicate(timeout=run._remaining(deadline))
+        except subprocess.TimeoutExpired as error:
+            raise run.OwnershipError('Payment finishing timed out') from error
         if process.returncode != 0:
+            index = len(list(owner.root.glob('finisher-failure-*.private')))
+            run._write_new(owner.root / f'finisher-failure-{index}.private',
+                           stderr[:run.OwnedRun.CAPTURE_OUTPUT_LIMIT], 0o600)
             raise run.OwnershipError('Payment member exited unsuccessfully')
         output.append(stdout.decode('utf-8', errors='replace'))
     return output
@@ -75,8 +85,12 @@ def main(argv=None):
     parser.add_argument('--payment-root', type=Path, required=True)
     parser.add_argument('--run-root', type=Path, required=True)
     parser.add_argument('--name', required=True, help='running THS regtest instance')
-    parser.add_argument('--ports', type=run._cli_port, nargs=3, required=True)
-    parser.add_argument('--finisher', type=int, choices=(1, 2, 3), help='member who proves and sends; defaults to the non-signer')
+    parser.add_argument('--ports', type=run._cli_port, nargs=3)
+    parser.add_argument('--source', type=Path)
+    parser.add_argument('--recipient-root', type=Path)
+    parser.add_argument('--hosted-runtime', type=Path)
+    parser.add_argument('--offline-relay', type=int, choices=(1, 2, 3))
+    parser.add_argument('--finisher', type=int, choices=(1, 2, 3, 4), help='member who proves and sends; defaults to the non-signer')
     args = parser.parse_args(argv)
     if sys.platform != 'darwin' or not Path('/usr/bin/sandbox-exec').is_file():
         parser.error('The member isolation test requires macOS sandbox-exec')
@@ -87,7 +101,10 @@ def main(argv=None):
            for field in ('payment', 'attempt')):
         parser.error('Payment manifest has invalid identifiers')
     pair = payment.get('pair', [1, 2])
-    if pair not in ([1, 2], [1, 3], [2, 3]):
+    source = args.source.resolve() if args.source else manual / 'source'
+    roster = json.loads((source / 'roster.json').read_text())
+    ids = [peer['id'] for peer in roster['members']]
+    if ids not in ([1, 2, 3], [1, 2, 3, 4]) or pair not in [[left, right] for left in ids for right in ids if left < right]:
         parser.error('Payment manifest has an invalid signing pair')
     communication, poc = run._default_workspaces()
     sys.path.insert(0, str(poc))
@@ -102,12 +119,18 @@ def main(argv=None):
     processes = []
     deadline = time.monotonic() + 900
     try:
-        context, hashes, _isolation, _server, relay = three_members.prepare_existing(
-            owner, manual / 'source', args.ports, communication, poc, deadline)
+        if args.hosted_runtime:
+            context, hashes, _isolation, _server, relay = three_members.prepare_hosted_existing(
+                owner, source, args.hosted_runtime.resolve(), communication, poc, deadline, args.offline_relay, payment['attempt'])
+        else:
+            if not args.ports or args.offline_relay:
+                raise run.OwnershipError('Manual provisioning requires three explicit ports')
+            context, hashes, _isolation, _server, relay = three_members.prepare_existing(
+                owner, source, args.ports, communication, poc, deadline)
         works = {member.member_id: member.root / 'payments' / payment['attempt']
                  for member in context.members}
         proposer_id = int.from_bytes(bytes.fromhex(payment['proposer']), 'little')
-        if proposer_id not in (1, 2, 3):
+        if proposer_id not in ids:
             raise run.OwnershipError('Payment proposer is outside the certified roster')
         proposer = context.members[proposer_id - 1]
         work = works[proposer_id]
@@ -116,7 +139,7 @@ def main(argv=None):
         run._write_new(work / 'payment.json', manifest, 0o600)
         run._member_text(context, relay, proposer, deadline, 'send-proposal',
                          ['--proposal-file', str(work / 'payment.json')])
-        for _ in range(12):
+        while time.monotonic() < deadline:
             run._member_text(context, relay, proposer, deadline, 'upload', [], allow_empty=True)
             for member in context.members:
                 if member.member_id == proposer_id:
@@ -144,17 +167,15 @@ def main(argv=None):
                 raise run.OwnershipError('Member could not persist and publish commitments')
             pump_once()
         proposer = context.members[pair[0] - 1]
-        result = owner.capture(payment_command(owner, proposer, pay, context.roster,
-            works[proposer.member_id], chain.rpc_address, 'package'), cwd=proposer.root,
-            timeout=run._remaining(deadline))
+        result = await_action(owner, payment_command(owner, proposer, pay, context.roster,
+            works[proposer.member_id], chain.rpc_address, 'package'), proposer, pump_once, deadline)
         if result.returncode != 0 or b'payment package published' not in result.stdout:
             raise run.OwnershipError('Proposer could not build the reviewed payment package')
         pump_once()
         for member in (context.members[number - 1] for number in pair):
             before = {item['id'] for item in three_members.status(context, relay, member, deadline)['messages']}
-            review = owner.capture(payment_command(owner, member, pay, context.roster,
-                works[member.member_id], chain.rpc_address, 'review'), cwd=member.root,
-                timeout=run._remaining(deadline))
+            review = await_action(owner, payment_command(owner, member, pay, context.roster,
+                works[member.member_id], chain.rpc_address, 'review'), member, pump_once, deadline)
             if review.returncode != 0:
                 raise run.OwnershipError('Member could not review the exact candidate')
             displayed = json.loads(review.stdout)
@@ -173,16 +194,28 @@ def main(argv=None):
             pump_once()
             delivered = [item for item in three_members.status(context, relay, member, deadline)['messages']
                          if item['id'] not in before and item['kind'] == 'test']
-            if len(delivered) != 2 or any(item['stored_whole'] != '1' for item in delivered):
+            if len(delivered) != len(ids) - 1 or any(item['stored_whole'] != '1' for item in delivered):
                 raise run.OwnershipError('Approval is not yet durably stored by relays')
-        finisher_id = args.finisher or next(number for number in (1, 2, 3) if number not in pair)
+        observers = [member for member in context.members if member.member_id not in pair]
+        aggregate_results = []
+        for observer in observers:
+            checked = await_action(owner, payment_command(owner, observer, pay, context.roster,
+                works[observer.member_id], chain.rpc_address, 'finish-check'), observer, pump_once, deadline)
+            if checked.returncode != 0 or b'aggregate verified' not in checked.stdout:
+                raise run.OwnershipError('Independent finisher could not verify both saved shares')
+            aggregate_results.append(checked.stdout)
+        if len(set(aggregate_results)) != 1:
+            raise run.OwnershipError('Independent finishers disagree on the approved signature hash')
+        finisher_id = args.finisher or next(number for number in ids if number not in pair)
+        if finisher_id not in ids:
+            raise run.OwnershipError('Finisher is outside the certified roster')
         finisher = context.members[finisher_id - 1]
         processes.append(subprocess.Popen(
             payment_command(owner, finisher, pay, context.roster, works[finisher.member_id],
                             chain.rpc_address, 'finish'),
             cwd=finisher.root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE))
-        finished = await_members(processes, pump_once, deadline)[0]
+        finished = await_members(processes, deadline, owner)[0]
         match = re.search(r'txid=([0-9a-f]{64})', finished)
         if match is None:
             raise run.OwnershipError('Finisher returned no transaction ID')
@@ -193,7 +226,7 @@ def main(argv=None):
                                  cwd=finisher.root, timeout=run._remaining(deadline))
         if verified.returncode != 0 or b'verified' not in verified.stdout:
             raise run.OwnershipError('Mined payment did not match the approved candidate')
-        recipient = manual / 'recipient'
+        recipient = args.recipient_root.resolve() if args.recipient_root else manual / 'recipient'
         received = subprocess.run([str(pay), 'receive', str(recipient / 'member-1'),
                                    str(recipient / 'member-1/pass.txt'),
                                    str(recipient / 'roster.json'), str(manual / 'payment'), txid],
@@ -203,7 +236,7 @@ def main(argv=None):
         three_members.verify_source(hashes)
         report = {'result': 'accepted', 'payment': payment['payment'], 'txid': txid,
                   'signers': pair, 'finisher': finisher.member_id, 'relay_envelopes': len(sent),
-                  'recipient_decrypted': True}
+                  'recipient_decrypted': True, 'members': len(ids), 'hosted_configuration': bool(args.hosted_runtime), 'offline_relay': args.offline_relay, 'isolation': _isolation, 'independent_finishers': [member.member_id for member in observers]}
         run._write_new(owner.root / 'relay-payment-report.json', run._json_bytes(report), 0o644)
         print(run._json_bytes(report).decode(), end='')
         return 0

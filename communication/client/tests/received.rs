@@ -2020,3 +2020,84 @@ fn received_reference_invalid_then_same_signer_counts() {
     assert_eq!(reopened_bob.len(), 1);
     assert_eq!(reopened_bob[0].source_root, good_object.hash);
 }
+
+#[test]
+fn received_reference_from_a_sixth_member_is_recovered() {
+    // A 2-of-6 vault: recovery must count a Received from member 6 and list all six
+    // recipients, not only the first four or five.
+    let roster = Roster {
+        vault: [72; 32],
+        members: (1..=6).map(|id| support::identity(id).public()).collect(),
+    };
+    let alice = support::identity(1);
+    let sixth = support::identity(6);
+    let key = |sender, message| LogicalKey {
+        vault: roster.vault,
+        roster: roster_digest(&roster).unwrap(),
+        sender,
+        message,
+    };
+    let original_id = [73; 32];
+    let original = prepare_outbox(
+        &alice,
+        &roster,
+        &MessageBody {
+            key: key(1, original_id),
+            audience: vec![1, 2, 3, 4, 5, 6],
+            session: Some([44; 32]),
+            prerequisites: Vec::new(),
+            payload: Payload::Test(vec![5, 4, 3]),
+        },
+    )
+    .unwrap();
+    let target = MessageRef {
+        sender: 1,
+        message: original_id,
+        digest: *original.digest(),
+    };
+    let sixth_id = [74; 32];
+    let sixth_received = prepare_outbox(
+        &sixth,
+        &roster,
+        &MessageBody {
+            key: key(6, sixth_id),
+            audience: vec![1, 2, 3, 4, 5, 6],
+            session: Some([44; 32]),
+            prerequisites: vec![target.clone()],
+            payload: Payload::Received(target),
+        },
+    )
+    .unwrap();
+    let sixth_object = recipient_object(&sixth_received, 1);
+    let root = evidence("reference-sixth").join("client");
+    let mut store = ClientStore::open(&root, &roster, 1).unwrap();
+    cache_object(&mut store, 1, 0, 9, 1, &sixth_object);
+    let staged = authenticate_staged(&mut store, &roster, &alice).unwrap();
+    let candidate = only_message(&staged, &sixth_id);
+    assert_eq!(
+        store
+            .commit_incoming(&roster, &alice, candidate.source(), candidate.message(), None)
+            .unwrap(),
+        CommitDisposition::New
+    );
+    store
+        .commit_outbox(&roster, &alice, &[0x77; 32], &original)
+        .unwrap();
+    reconcile_received(&mut store, &roster, &alice).unwrap();
+    let history = store.recover_early_received(&roster, 1, 0, 100).unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].from_member, 6);
+    assert_eq!(history[0].phase, ReferencePhase::Resolved);
+    let status = received_status(&store, &roster, &alice, original.key(), original.digest()).unwrap();
+    assert!(status.member_received(6));
+    // Every member gets its own copy, and recovery lists them all.
+    assert_eq!(
+        store
+            .recover_recipients(original.key())
+            .unwrap()
+            .iter()
+            .map(|r| r.recipient)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5, 6]
+    );
+}

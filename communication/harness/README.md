@@ -133,3 +133,37 @@ Native test-process scenarios set `simulation: true` to distinguish fixture exec
 The real acceptance evidence is `/private/tmp/loki-relay-acceptance-20261010-a/acceptance-report.json`. It includes three public relay keys/run IDs, nine mailbox IDs, six descriptor digests, original/Received ciphertext hashes and receipt digests before/after restart. The final campaign is `/private/tmp/loki-relay-faults-20261010-c/fault-report.json`: all seventeen scenarios and all 26 coverage rows passed, with no failures or skipped rows. The [completed requirement audit](verification-2026-10-10.md) maps all 47 units and 26 rows to named evidence; its JSON companion records source/log/report hashes. The orphan supplement `/private/tmp/loki-relay-orphan-evidence-20261010/fault-report.json` records three accepted orphan chunks, one pending task, cursor four and the refused ciphertext hash. Earlier failed campaign roots remain retained as diagnostic evidence.
 
 No capabilities, passphrases, payloads or decrypted member secrets belong in public reports. Tests verify redaction and process ownership. Local key separation does not establish separate operators. SIGKILL and synchronous FULL do not establish physical power-loss durability. The separate payment fixture above establishes only its named regtest payment and chain checks; it makes no browser or custody claim.
+
+## fix(harness): resume retained native HTTPS acceptance
+
+`native_hosted.py` and `native_hosted_payments.py` resume the owned 2026-10-14
+separate-host fixtures. They keep member keys, operator state and payment work on
+their original hosts. Remote paths and accounts match that fixture, so inventory
+its owner markers and services before using these runners. No repository source
+needs to be transferred to the remote host.
+
+Set `LOKI_ACCEPTANCE_ROOT` to the retained private root containing `owner.json`
+and `public-operator.json`, `LOKI_SETUP_BIN` and `LOKI_PAYMENT_BIN` to the existing
+verified native artifacts, and `LOKI_SOURCE_TREE` to their recorded source tree.
+For payments also set `LOKI_THS_INSTANCE` to the retained regtest instance and
+`LOKI_ACCEPTANCE_RECIPIENT` to the retained independent recipient root. Run:
+
+```sh
+python3 communication/harness/native_hosted.py
+python3 communication/harness/native_hosted_payments.py
+```
+
+Certified members retain their fingerprint consent and skip invitation,
+agreement and DKG replay. Final card completion checks `final-card/vault.card`,
+not the card directory. Funding retains THS's original address-derived
+idempotency keys and stores its confirmed receipt. Payment actions store intent
+before execution and results after success; resume reuses completed actions and
+stops at uncertain signing or broadcast actions. Reconcile the original attempt
+against saved local wires or the chain before marking such an action complete.
+Never delete an intent to make a retry possible.
+
+The payment runner supervises its own loopback reverse SSH forward from remote
+`127.0.0.1:47052` to local `127.0.0.1:18452`, checks the pinned regtest branch,
+and uses bounded SSH connection and keepalive limits. It terminates only its own
+SSH child. Admission HTTPS must be healthy independently; an RPC tunnel does
+not repair an unavailable admission service. Preserve diagnostics privately.

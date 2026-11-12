@@ -228,44 +228,13 @@ fn revision(value: u64) -> ClientResult<()> {
 }
 
 pub(crate) fn endpoint(endpoint: &str) -> ClientResult<()> {
-    if endpoint.len() > 2048 {
-        return Err(WireError::Bounds.into());
-    }
-    // Check the original authority before URL parsing can normalize an unsafe spelling.
-    let rest = endpoint
-        .strip_prefix("http://")
-        .ok_or(ClientError::Config)?;
-    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
-    if !path.is_empty() {
-        return Err(ClientError::Config);
-    }
-    let port = authority
-        .strip_prefix("127.0.0.1:")
-        .or_else(|| authority.strip_prefix("[::1]:"))
-        .ok_or(ClientError::Config)?;
-    if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(ClientError::Config);
-    }
-    let selected = port.parse::<u16>().map_err(|_| ClientError::Config)?;
-    if selected == 0 {
-        return Err(ClientError::Config);
-    }
-    let url = reqwest::Url::parse(endpoint).map_err(|_| ClientError::Config)?;
-    if url.scheme() != "http"
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-        || url.path() != "/"
-        || url.port_or_known_default() != Some(selected)
-    {
-        return Err(ClientError::Config);
-    }
-    Ok(())
+    crate::validate_endpoint(endpoint, true)
 }
 
 fn validate(descriptor: &Descriptor) -> ClientResult<()> {
-    if !(1..=3).contains(&descriptor.owner) || descriptor.relays.len() != 3 {
+    if !(1..=loki_relay_protocol::types::MAX_MEMBERS).contains(&descriptor.owner)
+        || descriptor.relays.len() != 3
+    {
         return Err(WireError::Schema.into());
     }
     revision(descriptor.revision)?;

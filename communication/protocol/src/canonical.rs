@@ -33,6 +33,7 @@ fn encoded_len(value: &Value, depth: usize) -> WireResult<usize> {
             Ok(header_len(n))
         }
         Value::Bytes(bytes) => add_size(header_len(bytes.len() as u64), bytes.len()),
+        Value::Text(text) => add_size(header_len(text.len() as u64), text.len()),
         Value::Array(items) => {
             if items.len() > MAX_ARRAY {
                 return Err(WireError::Bounds);
@@ -65,7 +66,7 @@ fn screen(input: &mut &[u8], depth: usize) -> WireResult<()> {
     *input = &input[consumed..];
     let argument = match header {
         Header::Positive(n) => n,
-        Header::Bytes(Some(n)) | Header::Array(Some(n)) => n as u64,
+        Header::Bytes(Some(n)) | Header::Text(Some(n)) | Header::Array(Some(n)) => n as u64,
         Header::Simple(22) => 22,
         _ => return Err(WireError::Schema),
     };
@@ -77,6 +78,11 @@ fn screen(input: &mut &[u8], depth: usize) -> WireResult<()> {
             if n > input.len() {
                 return Err(WireError::Bounds);
             }
+            *input = &input[n..];
+        }
+        Header::Text(Some(n)) => {
+            let bytes = input.get(..n).ok_or(WireError::Bounds)?;
+            std::str::from_utf8(bytes).map_err(|_| WireError::Schema)?;
             *input = &input[n..];
         }
         Header::Array(Some(n)) => {
@@ -106,5 +112,24 @@ pub fn decode(bytes: &[u8], max: usize) -> WireResult<Value> {
     if encode(&value)? != bytes {
         return Err(WireError::Canonical);
     }
+    Ok(value)
+}
+
+/// Historical message and configuration envelopes retain the text-free subset.
+pub fn decode_without_text(bytes: &[u8], max: usize) -> WireResult<Value> {
+    fn reject_text(value: &Value) -> WireResult<()> {
+        match value {
+            Value::Text(_) => Err(WireError::Schema),
+            Value::Array(values) => {
+                for value in values {
+                    reject_text(value)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+    let value = decode(bytes, max)?;
+    reject_text(&value)?;
     Ok(value)
 }

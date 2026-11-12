@@ -14,7 +14,7 @@ fn synthetic_identity(id: u16) -> [u8; 66] {
 
 #[test]
 fn identity_import_member_ids() {
-    for id in 1..=3 {
+    for id in 1..=4 {
         assert_eq!(
             CommIdentity::from_serialized(&synthetic_identity(id))
                 .unwrap()
@@ -60,8 +60,8 @@ fn identity_import_rejects_zero() {
 }
 
 #[test]
-fn identity_import_rejects_four() {
-    assert_invalid_id(4);
+fn identity_import_rejects_seventeen() {
+    assert_invalid_id(17);
 }
 
 #[test]
@@ -101,14 +101,15 @@ fn fixture(domain: SealDomain) -> (SealContext, CommIdentity) {
 fn record() -> Vec<u8> {
     vec![0x82, 1, 0x43, 9, 8, 7]
 }
-fn domains() -> [SealDomain; 2] {
-    [SealDomain::Message, SealDomain::Config]
+fn domains() -> [SealDomain; 3] {
+    [SealDomain::Message, SealDomain::Config, SealDomain::Setup]
 }
 fn info(ctx: &SealContext) -> Vec<u8> {
     canonical::encode(&Value::Array(vec![
         Value::Bytes(match ctx.domain {
             SealDomain::Message => b"Loki_Relay_Seal_v1".to_vec(),
             SealDomain::Config => b"Loki_Relay_Config_Seal_v1".to_vec(),
+            SealDomain::Setup => b"Loki_Setup_Seal_v1".to_vec(),
         }),
         Value::Integer(1.into()),
         Value::Bytes(ctx.vault.to_vec()),
@@ -122,6 +123,7 @@ fn aad(ctx: &SealContext, header: &[u8]) -> Vec<u8> {
     let mut aad = match ctx.domain {
         SealDomain::Message => b"Loki_Relay_Envelope_v1\0".to_vec(),
         SealDomain::Config => b"Loki_Relay_Config_Envelope_v1\0".to_vec(),
+        SealDomain::Setup => b"Loki_Setup_Envelope_v1\0".to_vec(),
     };
     aad.extend_from_slice(header);
     aad
@@ -138,6 +140,7 @@ fn authenticated_fixture(
     let mut header = match ctx.domain {
         SealDomain::Message => b"LOKIRLY1".to_vec(),
         SealDomain::Config => b"LOKICFG1".to_vec(),
+        SealDomain::Setup => b"LOKISET1".to_vec(),
     };
     header.push(1);
     header.extend_from_slice(&enc.to_bytes());
@@ -298,7 +301,11 @@ fn reject(case: &str) {
                 ClientError::Wire(WireError::Canonical)
             }
             "schema" => {
-                wire = authenticated_fixture(&ctx, &[0x61, 0x61], 2, false);
+                wire = if ctx.domain == SealDomain::Setup {
+                    authenticated_fixture(&ctx, &[0xa0], 1, false)
+                } else {
+                    authenticated_fixture(&ctx, &[0x61, 0x61], 2, false)
+                };
                 ClientError::Wire(WireError::Schema)
             }
             "depth" => {
@@ -485,8 +492,8 @@ fn hpke_binding_member_zero() {
     invalid_member(0);
 }
 #[test]
-fn hpke_binding_member_four() {
-    invalid_member(4);
+fn hpke_binding_member_seventeen() {
+    invalid_member(17);
 }
 fn invalid_member(id: u16) {
     for domain in domains() {
@@ -594,7 +601,7 @@ fn inner_signature_signer_certification() {
     let (roster, mut body) = message_fixture();
     assert!(sign_message(&message_identity(2), &roster, &body).is_err());
     let mut changed = roster.clone();
-    changed.members[0].signing = message_identity(2).public().signing;
+    changed.members[0].signing = message_identity(4).public().signing;
     body.key.roster = types::roster_digest(&changed).unwrap();
     assert!(sign_message(&message_identity(1), &changed, &body).is_err());
     changed = roster.clone();
@@ -655,7 +662,7 @@ fn inner_signature_wrong_certified_sender() {
     )
     .is_err());
     let mut changed = roster.clone();
-    changed.members[1].signing = message_identity(3).public().signing;
+    changed.members[1].signing = message_identity(4).public().signing;
     body.key.roster = types::roster_digest(&changed).unwrap();
     assert!(authenticate(
         &changed,

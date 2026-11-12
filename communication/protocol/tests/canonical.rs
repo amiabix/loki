@@ -80,7 +80,6 @@ fn canonical_subset_forbidden_types() {
         vec![0x20],
         vec![0xa0],
         vec![0xc0, 0],
-        vec![0x60],
         vec![0xf9, 0, 0],
         vec![0xfa, 0, 0, 0, 0],
         vec![0xfb, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -99,7 +98,6 @@ fn canonical_subset_forbidden_types() {
         Value::Integer((-1).into()),
         Value::Map(vec![]),
         Value::Tag(0, Box::new(uint(0))),
-        Value::Text(String::new()),
         Value::Float(0.0),
         Value::Bool(false),
     ] {
@@ -1043,4 +1041,19 @@ fn metadata_schema_zero_quota_golden() {
         http::decode_append_result(&metadata_bytes(vec![uint(1), metadata_id(3), uint(0)])),
         Err(WireError::Schema)
     );
+}
+
+#[test]
+fn canonical_setup_text_is_bounded_and_preserves_utf8() {
+    assert_eq!(
+        encode(&Value::Text("regtest".into())).unwrap(),
+        b"\x67regtest"
+    );
+    assert_eq!(
+        decode(b"\x67regtest", 8).unwrap(),
+        Value::Text("regtest".into())
+    );
+    assert!(decode(b"\x61\xff", 2).is_err());
+    assert!(decode(b"\x78\x07regtest", 9).is_err());
+    assert!(decode(b"\x67regtest", 7).is_err());
 }

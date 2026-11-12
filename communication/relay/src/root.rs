@@ -90,6 +90,9 @@ impl Root {
                 .try_into()
                 .map_err(|_| RelayError::StorageUnavailable)
         };
+        if lines[0].starts_with("https://") {
+            validate_public_origin(lines[0]).map_err(|_| RelayError::StorageUnavailable)?;
+        }
         let public_key = decode(lines[2])?;
         let seed_array = Zeroizing::new(
             <[u8; 32]>::try_from(seed.as_slice()).map_err(|_| RelayError::StorageUnavailable)?,
@@ -114,6 +117,9 @@ impl Root {
         url: &str,
         provision: &[u8; 32],
     ) -> RelayResult<Self> {
+        if url.starts_with("https://") {
+            validate_public_origin(url)?;
+        }
         if url.is_empty() || url.contains(['\n', '\r']) {
             return Err(RelayError::MalformedRequest);
         }
@@ -160,4 +166,63 @@ impl Drop for Root {
         // Release explicitly when a spawned child temporarily inherits the descriptor.
         let _ = self._lock.unlock();
     }
+}
+
+pub fn validate_public_origin(raw: &str) -> RelayResult<()> {
+    let invalid = || RelayError::MalformedRequest;
+    if raw.len() > 2048
+        || !raw.is_ascii()
+        || raw
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
+        return Err(invalid());
+    }
+    let rest = raw.strip_prefix("https://").ok_or_else(invalid)?;
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    if authority.is_empty() || !path.is_empty() || authority.contains(['@', '?', '#', '%', '\\']) {
+        return Err(invalid());
+    }
+    let (host, port) = if let Some(ip) = authority.strip_prefix('[') {
+        let (ip, suffix) = ip.split_once(']').ok_or_else(invalid)?;
+        ip.parse::<std::net::Ipv6Addr>().map_err(|_| invalid())?;
+        (
+            None,
+            if suffix.is_empty() {
+                None
+            } else {
+                Some(suffix.strip_prefix(':').ok_or_else(invalid)?)
+            },
+        )
+    } else {
+        let (host, port) = authority
+            .split_once(':')
+            .map(|(h, p)| (h, Some(p)))
+            .unwrap_or((authority, None));
+        (Some(host), port)
+    };
+    if let Some(host) = host {
+        if host.len() > 253
+            || host.split('.').any(|label| {
+                label.is_empty()
+                    || label.len() > 63
+                    || label.starts_with('-')
+                    || label.ends_with('-')
+                    || !label
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            })
+        {
+            return Err(invalid());
+        }
+    }
+    if let Some(port) = port {
+        if port.is_empty()
+            || !port.bytes().all(|b| b.is_ascii_digit())
+            || port.parse::<u16>().ok().filter(|p| *p != 0).is_none()
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(())
 }
