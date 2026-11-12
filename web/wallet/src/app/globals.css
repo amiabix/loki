@@ -1,0 +1,300 @@
+@import url("https://fonts.googleapis.com/css2?family=Raleway:wght@400;500;600;700;900&family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap");
+@import "tailwindcss";
+
+/* ── Clean glassmorphic wallet. Light by default; a moody dark theme mirrors every
+      colour token. Soft blue field, frosted cards, Raleway display. ──────────────── */
+:root {
+  /* accent + semantics */
+  --blue: #0e2ac5;
+  --blue-bright: #2f69ff;
+  --ink: #0a0a0a;
+
+  /* legacy app tokens remapped to the palette so inline utilities still read */
+  --background: #f3f6ff;
+  --foreground: #1a1a1a;
+  --mint: #0e2ac5;          /* former accent → blue */
+  --amber: #835008;
+  --danger: #ad2137;
+  --muted: #51596b;
+  --border: rgba(14, 42, 197, 0.14);
+
+  /* themed surfaces */
+  --card: rgba(255, 255, 255, 0.42);
+  --card-brd: rgba(255, 255, 255, 0.75);
+  --glass-shadow: inset 0 1.5px 1px rgba(255, 255, 255, 0.85), inset 0 -1px 2px rgba(14, 42, 197, 0.06), 0 24px 60px -22px rgba(14, 42, 197, 0.28);
+  --field: radial-gradient(circle at 50% 28%, #ffffff 0%, #eaefff 42%, #c3d3ff 100%);
+  --input-bg: rgba(255, 255, 255, 0.62);
+  --input-brd: rgba(14, 42, 197, 0.55);
+  --focus-ring: rgba(47, 105, 255, 0.18);
+  --scroll-thumb: rgba(14, 42, 197, 0.18);
+  --scroll-thumb-hover: rgba(14, 42, 197, 0.3);
+  --selection: rgba(47, 105, 255, 0.2);
+  --pill-bg: rgba(255, 255, 255, 0.58);
+  --btn-glass-bg: rgba(255, 255, 255, 0.5);
+  --btn-glass-bg-hover: rgba(255, 255, 255, 0.72);
+  --btn-glass-brd: rgba(255, 255, 255, 0.7);
+  --btn-glass-shadow: inset 0 1.5px 2px rgba(255, 255, 255, 0.7), 0 8px 24px -10px rgba(14, 42, 197, 0.14);
+  --balloon: radial-gradient(circle at 32% 26%, #ffffff 0%, #c7d6ff 22%, #6e8dff 55%, #1c3ad6 100%);
+  --balloon-shadow: 0 34px 70px -18px rgba(14, 42, 197, 0.45), inset 0 -18px 40px rgba(8, 24, 120, 0.4), inset 0 14px 26px rgba(255, 255, 255, 0.7);
+
+  color-scheme: light;
+}
+
+/* Dark values — defined once for the two selectors below (system-dark unless pinned
+   light, and an explicit data-theme="dark" that wins over the system preference). */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --blue: #5b85ff;
+    --blue-bright: #83a4ff;
+    --ink: #eef1f8;
+
+    --background: #0a0d18;
+    --foreground: #e7ebf5;
+    --mint: #5b85ff;
+    --amber: #e6ad4e;
+    --danger: #ff7488;
+    --muted: #9aa5bd;
+    --border: rgba(123, 160, 255, 0.22);
+
+    --card: rgba(22, 28, 46, 0.55);
+    --card-brd: rgba(255, 255, 255, 0.10);
+    --glass-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.08), inset 0 -1px 2px rgba(0, 0, 0, 0.35), 0 24px 60px -22px rgba(0, 0, 0, 0.6);
+    --field: radial-gradient(circle at 50% 26%, #182136 0%, #0b1022 46%, #05060e 100%);
+    --input-bg: rgba(255, 255, 255, 0.05);
+    --input-brd: rgba(123, 160, 255, 0.45);
+    --focus-ring: rgba(91, 133, 255, 0.3);
+    --scroll-thumb: rgba(170, 190, 255, 0.2);
+    --scroll-thumb-hover: rgba(170, 190, 255, 0.34);
+    --selection: rgba(91, 133, 255, 0.32);
+    --pill-bg: rgba(255, 255, 255, 0.06);
+    --btn-glass-bg: rgba(255, 255, 255, 0.06);
+    --btn-glass-bg-hover: rgba(255, 255, 255, 0.12);
+    --btn-glass-brd: rgba(255, 255, 255, 0.14);
+    --btn-glass-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.08), 0 8px 24px -10px rgba(0, 0, 0, 0.55);
+    --balloon: radial-gradient(circle at 32% 26%, #6782d8 0%, #3350b0 30%, #1a2a6e 60%, #0a1240 100%);
+    --balloon-shadow: 0 34px 70px -18px rgba(0, 0, 0, 0.55), inset 0 -18px 40px rgba(0, 0, 0, 0.5), inset 0 14px 26px rgba(130, 160, 255, 0.35);
+
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --blue: #5b85ff;
+  --blue-bright: #83a4ff;
+  --ink: #eef1f8;
+
+  --background: #0a0d18;
+  --foreground: #e7ebf5;
+  --mint: #5b85ff;
+  --amber: #e6ad4e;
+  --danger: #ff7488;
+  --muted: #9aa5bd;
+  --border: rgba(123, 160, 255, 0.22);
+
+  --card: rgba(22, 28, 46, 0.55);
+  --card-brd: rgba(255, 255, 255, 0.10);
+  --glass-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.08), inset 0 -1px 2px rgba(0, 0, 0, 0.35), 0 24px 60px -22px rgba(0, 0, 0, 0.6);
+  --field: radial-gradient(circle at 50% 26%, #182136 0%, #0b1022 46%, #05060e 100%);
+  --input-bg: rgba(255, 255, 255, 0.05);
+  --input-brd: rgba(123, 160, 255, 0.45);
+  --focus-ring: rgba(91, 133, 255, 0.3);
+  --scroll-thumb: rgba(170, 190, 255, 0.2);
+  --scroll-thumb-hover: rgba(170, 190, 255, 0.34);
+  --selection: rgba(91, 133, 255, 0.32);
+  --pill-bg: rgba(255, 255, 255, 0.06);
+  --btn-glass-bg: rgba(255, 255, 255, 0.06);
+  --btn-glass-bg-hover: rgba(255, 255, 255, 0.12);
+  --btn-glass-brd: rgba(255, 255, 255, 0.14);
+  --btn-glass-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.08), 0 8px 24px -10px rgba(0, 0, 0, 0.55);
+  --balloon: radial-gradient(circle at 32% 26%, #6782d8 0%, #3350b0 30%, #1a2a6e 60%, #0a1240 100%);
+  --balloon-shadow: 0 34px 70px -18px rgba(0, 0, 0, 0.55), inset 0 -18px 40px rgba(0, 0, 0, 0.5), inset 0 14px 26px rgba(130, 160, 255, 0.35);
+
+  color-scheme: dark;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-mint: var(--mint);
+  --color-amber: var(--amber);
+  --color-danger: var(--danger);
+  --color-muted: var(--muted);
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+  --font-display: "Raleway", ui-sans-serif, system-ui, sans-serif;
+}
+
+html, body { min-height: 100%; }
+html { scroll-padding-top: 7rem; }
+
+body {
+  color: var(--foreground);
+  font-family: "Inter", ui-sans-serif, system-ui, sans-serif;
+  overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* the fixed soft field behind everything */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -10;
+  background: var(--field);
+}
+
+h1, h2, h3, .font-display { font-family: "Raleway", ui-sans-serif, system-ui, sans-serif; letter-spacing: -0.02em; }
+
+:focus-visible { outline: 2px solid var(--blue); outline-offset: 4px; }
+button, a, input, textarea, select { scroll-margin-top: 7rem; }
+button:not(:disabled) { cursor: pointer; }
+button:disabled { cursor: not-allowed; }
+input[type="checkbox"] { accent-color: var(--blue); }
+.font-mono { font-variant-numeric: tabular-nums; }
+
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { scrollbar-width: none; }
+::selection { background: var(--selection); }
+::-webkit-scrollbar { width: 9px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--scroll-thumb); border-radius: 99px; }
+::-webkit-scrollbar-thumb:hover { background: var(--scroll-thumb-hover); }
+
+/* ── frosted glass surfaces ──────────────────────────────────────────────────── */
+@layer components {
+  .glass, .panel {
+    background: var(--card);
+    border: 1px solid var(--card-brd);
+    backdrop-filter: blur(26px) saturate(1.35);
+    -webkit-backdrop-filter: blur(26px) saturate(1.35);
+    box-shadow: var(--glass-shadow);
+  }
+  .panel { border-radius: 1.75rem; }
+}
+
+/* inputs/textarea/select that reuse .glass → clean frosted fields */
+input.glass, textarea.glass, select.glass {
+  min-width: 0;
+  min-height: 3rem;
+  font-size: 1rem;
+  background: var(--input-bg);
+  border: 1px solid var(--input-brd);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.05);
+  color: var(--ink);
+  backdrop-filter: blur(10px);
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+input.glass:focus, textarea.glass:focus, select.glass:focus {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 3px var(--focus-ring);
+}
+::placeholder { color: var(--muted); opacity: 1; }
+
+/* ── accent utilities → the blue system ──────────────────────────────────────── */
+.text-mint { color: var(--blue) !important; font-weight: 600; }
+.text-amber { color: var(--amber) !important; }
+.text-danger { color: var(--danger) !important; }
+.bg-mint { background: var(--blue) !important; color: #fff !important; }
+.glow-mint { box-shadow: 0 14px 38px -12px rgba(14, 42, 197, 0.5) !important; }
+.on-shader { text-shadow: none !important; }
+
+a { color: var(--blue); }
+
+/* Mono section labels. */
+.eyebrow {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 11px;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--blue);
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  max-width: 100%;
+  padding: 0.4rem 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: 9999px;
+  background: var(--pill-bg);
+  font-size: 0.75rem;
+  line-height: 1.5;
+}
+.dot { width: 7px; height: 7px; flex-shrink: 0; border-radius: 50%; }
+
+/* ── buttons ─────────────────────────────────────────────────────────────────── */
+.btn-primary, .btn-glass { min-height: 2.75rem; }
+.btn-primary {
+  background: var(--blue);
+  color: #fff;
+  box-shadow: 0 12px 32px -10px rgba(14, 42, 197, 0.55);
+  transition: background 0.2s, transform 0.2s;
+}
+.btn-primary:hover:not(:disabled) { background: var(--blue-bright); transform: translateY(-1px); }
+.btn-glass {
+  background: var(--btn-glass-bg);
+  border: 1px solid var(--btn-glass-brd);
+  color: var(--ink);
+  backdrop-filter: blur(14px);
+  box-shadow: var(--btn-glass-shadow);
+  transition: background 0.2s, transform 0.2s;
+}
+.btn-glass:hover:not(:disabled) { background: var(--btn-glass-bg-hover); transform: translateY(-1px); }
+
+/* contact-style arrow orb */
+.orb {
+  display: grid; place-items: center;
+  width: 2rem; height: 2rem;
+  border-radius: 999px;
+  color: #fff;
+  background: radial-gradient(circle at 50% 30%, #5175ff 0%, #0e2ac5 55%, #020b40 100%);
+}
+
+/* ── floating glass balloons drifting behind the content ─────────────────────── */
+.orb-field {
+  position: fixed;
+  inset: 0;
+  z-index: -5;
+  overflow: hidden;
+  pointer-events: none;
+}
+.orb-float {
+  position: absolute;
+  border-radius: 50%;
+  background: var(--balloon);
+  box-shadow: var(--balloon-shadow);
+  opacity: 0.85;
+  /* parallax drift toward the cursor (vars set in JS), scaled by each orb's depth --d */
+  transform: translate(calc(var(--px, 0px) * var(--d, 1)), calc(var(--py, 0px) * var(--d, 1)));
+  transition: transform 0.7s cubic-bezier(0.22, 1, 0.36, 1);
+  /* lively idle float — translate/rotate/scale compose with the transform parallax */
+  animation: float-a 13s ease-in-out infinite;
+  will-change: transform, translate;
+}
+.orb-float:nth-child(2) { animation: float-b 18s ease-in-out infinite; }
+.orb-float:nth-child(3) { animation: float-c 15s ease-in-out infinite; }
+.orb-float:nth-child(4) { animation: float-b 22s ease-in-out infinite reverse; }
+@keyframes float-a {
+  0%, 100% { translate: 0 0; rotate: 0deg; }
+  50% { translate: 20px -58px; rotate: 10deg; }
+}
+@keyframes float-b {
+  0%, 100% { translate: 0 0; }
+  33% { translate: -34px -34px; }
+  66% { translate: 18px -52px; }
+}
+@keyframes float-c {
+  0%, 100% { translate: 0 0; scale: 1; }
+  50% { translate: 26px -66px; scale: 1.07; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .orb-float { animation: none; transition: none; }
+  .screen-transition { opacity: 1 !important; transform: none !important; }
+  button, a, input, textarea, select { transition: none !important; }
+  button:hover, a:hover { transform: none !important; translate: none !important; }
+}
+
+/* Static decoration for payment and recovery tasks. */
+.orb-field { opacity: 0.65; }
+.orb-field-calm { opacity: 0.16; }
+.orb-field-calm .orb-float { animation: none; transition: none; transform: none; will-change: auto; }

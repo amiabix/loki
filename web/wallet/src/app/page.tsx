@@ -1,0 +1,2008 @@
+"use client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import { motion } from "framer-motion";
+import { OrbScene } from "@/components/OrbScene";
+import {
+  api,
+  ApiError,
+  fund,
+  pairDevice,
+  forgetPairing,
+  logout,
+  pendingApprovals,
+  recoveryRestore,
+  recoverySetup,
+  recoveryStatus,
+  type PendingApproval,
+} from "@/lib/api";
+import { invitePreview, paymentLabel, rememberedVaultSlot, rememberVaultSlot } from "@/lib/wallet-ui";
+import { toggleTheme, useIsDark } from "@/lib/theme";
+import { useCeremonyStatus, usePayments, useStatus } from "@/lib/hooks";
+import type {
+  CeremonyStatus,
+  InviteSlot,
+  Payment,
+  PaymentReview,
+  PaymentSession,
+  StatusResponse,
+  VaultSummary,
+} from "@/lib/types";
+
+// ─── util ────────────────────────────────────────────────────────────────────
+
+const zatToTaz = (zat: number | string) => {
+  const n = Number(zat) / 1e8;
+  return Number.isFinite(n) ? n.toLocaleString(undefined, { maximumFractionDigits: 8 }) : "—";
+};
+
+const short = (s: string, head = 8, tail = 6) =>
+  s.length > head + tail + 1 ? `${s.slice(0, head)}…${s.slice(-tail)}` : s;
+
+/** Pull the invite code out of a pasted link, or return the trimmed input as-is. */
+function extractInvite(raw: string): string {
+  const s = raw.trim();
+  try {
+    return new URL(s).searchParams.get("invite") ?? s;
+  } catch {
+    return s;
+  }
+}
+
+/** A shareable invite link for a join code — opens the app straight into Join. */
+function inviteLink(code: string): string {
+  return typeof window === "undefined" ? code : `${window.location.origin}/?invite=${code}`;
+}
+
+// ─── navigation state ────────────────────────────────────────────────────────
+
+type View =
+  | { id: "home" }
+  | { id: "create-vault" }
+  | { id: "join-vault"; invite?: string }
+  | { id: "ceremony"; vault: string }
+  | { id: "overview"; vault: VaultSummary }
+  | { id: "send"; vault: VaultSummary }
+  | { id: "review"; vault: VaultSummary; attempt: string; proposedHere?: boolean }
+  | { id: "history"; vault: VaultSummary };
+
+// ─── root ─────────────────────────────────────────────────────────────────────
+
+export default function App() {
+  // null = still checking the device session; false = show login; true = signed in.
+  const [authed, setAuthed] = useState<boolean | null>(null);
+  const [sessionError, setSessionError] = useState<string | null>(null);
+  const [view, setView] = useState<View>({ id: "home" });
+  const [pendingInvite, setPendingInvite] = useState<string | null>(null);
+  const { data: status, error: statusError, refresh: refreshStatus } = useStatus(authed === true);
+
+  // Invite deep-link: opening /?invite=<code> (or a full link) drops you straight into Join once
+  // you're signed in — no codes to paste, no "pick a member". Held across the login gate.
+  useEffect(() => {
+    const code = new URLSearchParams(window.location.search).get("invite");
+    if (code) {
+      setPendingInvite(code);
+      window.history.replaceState(null, "", window.location.pathname);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (authed === true && pendingInvite) {
+      setView({ id: "join-vault", invite: pendingInvite });
+      setPendingInvite(null);
+    }
+  }, [authed, pendingInvite]);
+
+  const checkSession = useCallback(async () => {
+    setAuthed(null); setSessionError(null);
+    try {
+      const s = await api<StatusResponse>("status");
+      setAuthed(s.phase === "home");
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 401) setAuthed(false);
+      else setSessionError((e as Error).message);
+    }
+  }, []);
+  useEffect(() => { void checkSession(); }, [checkSession]);
+
+  // Same desync can bite mid-use (the host restarts after sign-in): a later status comes back
+  // "locked", or an action 401s with "profile is locked"/"not signed in". Bounce to Login
+  // rather than surface a cryptic error — unlocking locally reconnects the device.
+  useEffect(() => {
+    const lockedPhase = status?.phase === "locked" || status?.phase === "new_profile";
+    if (authed === true && lockedPhase) {
+      setView({ id: "home" });
+      setAuthed(false);
+    }
+  }, [authed, status]);
+
+  // Any action (Join, Create, …) that hits a locked/expired host fires `loki:auth-lost` from
+  // the api() helper — route straight to Login so the user never sees a dead "profile is
+  // locked" on an action screen.
+  useEffect(() => {
+    const onAuthLost = () => {
+      setView({ id: "home" });
+      setAuthed(false);
+    };
+    window.addEventListener("loki:auth-lost", onAuthLost);
+    return () => window.removeEventListener("loki:auth-lost", onAuthLost);
+  }, []);
+
+  const signOut = async () => {
+    const locked = await logout();
+    setSessionError(locked ? null : "Pairing cleared. The device could not be locked remotely; lock or stop it locally.");
+    setView({ id: "home" });
+    setAuthed(false);
+  };
+
+  if (authed === null) return <FullScreen>{sessionError ? (
+    <GlassCard className="w-full max-w-md">
+      <h1 className="text-2xl font-semibold">Unable to connect</h1>
+      <p className="mt-3 text-sm text-muted">We couldn’t check your session. Your account may still be signed in.</p>
+      <ErrMsg msg={sessionError} />
+      <Btn className="mt-4" onClick={checkSession}>Retry connection</Btn>
+      <button className="mt-3 min-h-11 text-sm text-mint" onClick={() => { forgetPairing(); setSessionError(null); setAuthed(false); }}>Forget pairing and connect a device</button>
+    </GlassCard>
+  ) : <Splash sub="Connecting…" />}</FullScreen>;
+  if (!authed) return <Login notice={sessionError} onLoggedIn={() => { setAuthed(true); refreshStatus(); }} />;
+
+  const network = status?.network ?? "testnet";
+  const profile = status?.profile;
+
+  return (
+    <>
+      <OrbScene calm={["send", "review"].includes(view.id)} />
+      <header className="glass fixed inset-x-0 top-0 z-30 flex h-20 items-center justify-between gap-3 px-5 sm:px-10">
+        <button
+          aria-label="Loki home"
+          onClick={() => view.id !== "home" && setView({ id: "home" })}
+          className="font-display min-h-11 shrink-0 text-lg font-extrabold tracking-[0.22em] text-[var(--ink)]"
+        >
+          LOKI
+        </button>
+        <div className="flex min-w-0 items-center gap-3 text-sm">
+          {profile?.name && (
+            <span className="hidden min-w-0 items-center gap-1.5 text-muted sm:flex">
+              <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-mint" />
+              <span className="max-w-40 truncate" title={profile.name}>{profile.name}</span>
+            </span>
+          )}
+          <span className="eyebrow shrink-0 rounded-full border px-3 py-1" style={{ borderColor: "var(--border)" }}>
+            {network}
+          </span>
+          <ThemeToggle />
+          <button onClick={signOut} className="min-h-11 shrink-0 px-1 text-muted transition hover:text-danger">
+            Log out
+          </button>
+        </div>
+      </header>
+      <main className="flex min-h-dvh w-full items-center justify-center overflow-y-auto px-5 py-24 sm:px-6">
+        <Screen key={`${view.id}:${"vault" in view ? (typeof view.vault === "string" ? view.vault : view.vault.vault) : ""}:${"attempt" in view ? view.attempt : ""}`}>
+          <ViewRouter
+            view={view}
+            status={status}
+            statusError={statusError}
+            profile={profile}
+            onNavigate={setView}
+            onStatusRefresh={refreshStatus}
+          />
+        </Screen>
+      </main>
+    </>
+  );
+}
+
+// ─── screen wrapper ───────────────────────────────────────────────────────────
+
+function useScreenFocus() {
+  const ref = useRef<HTMLDivElement>(null);
+  const [announcement, setAnnouncement] = useState("");
+  useEffect(() => {
+    const root = ref.current;
+    if (!root) return;
+    let last: Element | null = null;
+    let lastTitle = "";
+    const update = () => {
+      const heading = root.querySelector<HTMLElement>("[data-screen-heading]") ?? root.querySelector<HTMLElement>("h1, h2");
+      const title = heading?.textContent ?? "Wallet";
+      if (heading === last && title === lastTitle) return;
+      last = heading; lastTitle = title;
+      const target = heading ?? root;
+      target.tabIndex = -1;
+      target.focus({ preventScroll: true });
+      setAnnouncement(title);
+    };
+    update();
+    const observer = new MutationObserver(update);
+    observer.observe(root, { childList: true, subtree: true, characterData: true });
+    return () => observer.disconnect();
+  }, []);
+  return { ref, announcement };
+}
+
+function Screen({ children }: { children: React.ReactNode }) {
+  const { ref, announcement } = useScreenFocus();
+  return (
+    <motion.div
+      ref={ref}
+      initial={{ opacity: 0, y: 20 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.4, ease: "easeOut" }}
+      className="screen-transition w-full min-w-0 max-w-xl [overflow-wrap:anywhere]"
+    >
+      <p className="sr-only" aria-live="polite" aria-atomic="true">{announcement}</p>
+      {children}
+    </motion.div>
+  );
+}
+
+// ─── view router ──────────────────────────────────────────────────────────────
+
+function ViewRouter({
+  view,
+  status,
+  statusError,
+  profile,
+  onNavigate,
+  onStatusRefresh,
+}: {
+  view: View;
+  status: StatusResponse | undefined;
+  statusError: string | null;
+  profile: { name: string; id: string } | undefined;
+  onNavigate: (v: View) => void;
+  onStatusRefresh: () => void;
+}) {
+  if (statusError && !status) {
+    return (
+      <GlassCard>
+        <h2 className="text-2xl font-semibold">Unable to load wallet</h2>
+        <ErrMsg msg={statusError} />
+        <p className="mt-3 text-sm text-muted">We’ll keep trying to reconnect.</p>
+        <Btn className="mt-4" onClick={onStatusRefresh}>Retry</Btn>
+      </GlassCard>
+    );
+  }
+
+  switch (view.id) {
+    case "home":
+      if (!status) return <Splash sub="Loading your wallet…" />;
+      return (
+        <>
+          {statusError && <div className="mb-4"><ErrMsg msg={statusError} /><Btn variant="ghost" onClick={onStatusRefresh}>Retry refresh</Btn></div>}
+          <Home
+            profile={profile}
+            vaults={status?.vaults ?? []}
+            secureElement={status?.secure_element}
+            onNavigate={onNavigate}
+            onRefresh={onStatusRefresh}
+          />
+        </>
+      );
+    case "create-vault":
+      return (
+        <CreateVault
+          profileId={profile?.id}
+          onBack={() => onNavigate({ id: "home" })}
+          onCreated={(vault) => onNavigate({ id: "ceremony", vault })}
+        />
+      );
+    case "join-vault":
+      return (
+        <JoinVault
+          profileId={profile?.id}
+          initialInvite={view.invite}
+          onBack={() => onNavigate({ id: "home" })}
+          onJoined={(vault) => onNavigate({ id: "ceremony", vault })}
+        />
+      );
+    case "ceremony":
+      return (
+        <CeremonyView
+          profileId={profile?.id}
+          vault={view.vault}
+          secureElement={status?.secure_element}
+          onDone={() => { onNavigate({ id: "home" }); onStatusRefresh(); }}
+        />
+      );
+    case "overview":
+      return (
+        <VaultOverview
+          vault={view.vault}
+          onSend={() => onNavigate({ id: "send", vault: view.vault })}
+          onHistory={() => onNavigate({ id: "history", vault: view.vault })}
+          onApprove={(attempt) => onNavigate({ id: "review", vault: view.vault, attempt, proposedHere: false })}
+          onBack={() => onNavigate({ id: "home" })}
+        />
+      );
+    case "send":
+      return (
+        <Send
+          vault={view.vault}
+          onBack={() => onNavigate({ id: "overview", vault: view.vault })}
+          onDraft={(attempt) => onNavigate({ id: "review", vault: view.vault, attempt, proposedHere: true })}
+        />
+      );
+    case "review":
+      return (
+        <ReviewApprove
+          profileId={profile?.id}
+          proposedHere={view.proposedHere}
+          vault={view.vault}
+          attempt={view.attempt}
+          onBack={() => onNavigate({ id: "history", vault: view.vault })}
+        />
+      );
+    case "history":
+      return (
+        <History
+          vault={view.vault}
+          onReview={(attempt) => onNavigate({ id: "review", vault: view.vault, attempt })}
+          onBack={() => onNavigate({ id: "overview", vault: view.vault })}
+        />
+      );
+  }
+}
+
+// ─── shared primitives ────────────────────────────────────────────────────────
+
+function Row({ label, value, mono }: { label: string; value: React.ReactNode; mono?: boolean }) {
+  return (
+    <div className="flex flex-col gap-1 border-b border-[var(--border)] py-3 last:border-0 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
+      <span className="shrink-0 text-sm text-muted">{label}</span>
+      <div className={`min-w-0 text-sm [overflow-wrap:anywhere] sm:text-right ${mono ? "font-mono break-all" : ""}`}>{value}</div>
+    </div>
+  );
+}
+
+function Btn({
+  children,
+  onClick,
+  disabled,
+  variant = "mint",
+  className = "",
+}: {
+  children: React.ReactNode;
+  onClick?: () => void;
+  disabled?: boolean;
+  variant?: "mint" | "amber" | "danger" | "ghost";
+  className?: string;
+}) {
+  const styles: Record<string, string> = {
+    mint: "btn-primary",
+    amber: "btn-glass text-amber",
+    danger: "btn-glass text-danger",
+    ghost: "btn-glass",
+  };
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className={`w-full min-w-0 rounded-full px-5 py-3.5 font-medium transition disabled:opacity-60 ${styles[variant]} ${className}`}
+    >
+      {children}
+    </button>
+  );
+}
+
+function GlassCard({ children, className = "" }: { children: React.ReactNode; className?: string }) {
+  return <div className={`glass min-w-0 rounded-2xl p-5 sm:px-6 ${className}`}>{children}</div>;
+}
+
+function BackLink({ onClick, label = "← Back" }: { onClick: () => void; label?: string }) {
+  return (
+    <button onClick={onClick} className="mb-4 min-h-11 rounded-full px-3 text-sm text-muted transition hover:bg-white/60 hover:text-mint">
+      {label}
+    </button>
+  );
+}
+
+function ErrMsg({ msg }: { msg: string | null }) {
+  if (!msg) return null;
+  return <p role="alert" className="mt-3 rounded-xl border border-danger/25 bg-white/70 px-4 py-3 text-left text-sm leading-relaxed text-danger [overflow-wrap:anywhere]">{msg}</p>;
+}
+
+// Every member gets a stable colour from their slot, so everyone sees the same person in the
+// same colour across the ceremony, approvals, and history.
+const MEMBER_COLORS = ["#2f69ff", "#e24d78", "#17b890", "#9b51e0", "#f29e0a", "#00b4d8", "#ff6b3d", "#4c6ef5"];
+function memberColor(slot: number) {
+  return MEMBER_COLORS[(Math.max(1, slot) - 1) % MEMBER_COLORS.length];
+}
+function MemberAvatar({ slot, name, size = 28 }: { slot: number; name?: string; size?: number }) {
+  const c = memberColor(slot);
+  const label = (name?.trim()?.[0] ?? String(slot)).toUpperCase();
+  return (
+    <span
+      className="inline-grid shrink-0 place-items-center rounded-full font-semibold text-white"
+      style={{ width: size, height: size, fontSize: Math.round(size * 0.42), background: c, boxShadow: `0 3px 10px -3px ${c}` }}
+      title={name ?? `Member ${slot}`}
+      aria-hidden
+    >
+      {label}
+    </span>
+  );
+}
+
+// Light/dark toggle. Shows the current theme's glyph (sun in light, moon in dark); a click
+// pins the opposite and persists it. Reads on both themes via --muted / --ink tokens.
+function ThemeToggle() {
+  const dark = useIsDark();
+  return (
+    <button
+      type="button"
+      onClick={toggleTheme}
+      aria-label={dark ? "Switch to light theme" : "Switch to dark theme"}
+      title={dark ? "Switch to light theme" : "Switch to dark theme"}
+      className="grid h-11 w-11 shrink-0 place-items-center rounded-full text-muted transition hover:text-[var(--ink)]"
+    >
+      {dark ? (
+        // moon
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+        </svg>
+      ) : (
+        // sun
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+          <circle cx="12" cy="12" r="4" />
+          <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
+        </svg>
+      )}
+    </button>
+  );
+}
+
+// ─── sign in ──────────────────────────────────────────────────────────────────
+
+function FullScreen({ children, calm = false }: { children: React.ReactNode; calm?: boolean }) {
+  const { ref, announcement } = useScreenFocus();
+  return (
+    <main className="flex min-h-dvh w-full items-center justify-center p-5">
+      <OrbScene calm={calm} />
+      <div ref={ref} className="flex w-full justify-center">
+        <p className="sr-only" aria-live="polite" aria-atomic="true">{announcement}</p>
+        {children}
+      </div>
+    </main>
+  );
+}
+
+function Splash({ sub }: { sub: string }) {
+  return (
+    <div className="panel w-full max-w-md px-6 py-9 text-center">
+      <div className="eyebrow mb-3">Shielded multisig</div>
+      <h1 className="font-display text-4xl font-bold tracking-tight">Loki</h1>
+      <p role="status" className="mt-4 flex items-center justify-center gap-2 text-sm text-muted">
+        <span aria-hidden="true" className="h-4 w-4 shrink-0 animate-spin rounded-full border-2 border-mint/20 border-t-mint motion-reduce:animate-none" />
+        {sub}
+      </p>
+    </div>
+  );
+}
+
+function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string | null }) {
+  const [link, setLink] = useState("");
+  const [claim, setClaim] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const inviteDevice = async () => {
+    setBusy(true); setErr(null); setClaim(null);
+    try {
+      const reply = await fetch("/api/members/pairing", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+      const body = await reply.json();
+      if (!reply.ok) throw new Error(body.error);
+      setClaim(body.url);
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  };
+  const connect = async () => {
+    setBusy(true); setErr(null);
+    try {
+      const member = await pairDevice(link);
+      sessionStorage.setItem("loki_me", JSON.stringify({ slot: member.slot }));
+      setLink("");
+      onLoggedIn();
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  };
+  return <FullScreen calm>
+    <div className="panel w-full max-w-md px-6 py-8 sm:px-10">
+      <div className="font-display text-center text-5xl font-semibold tracking-tight">Loki</div>
+      <h1 className="mb-3 mt-8 text-xl font-semibold">Connect your member device</h1>
+      <p className="mb-4 text-sm text-muted">Pair a new device with LokiSigner. Create or unlock your profile in the native app, then paste its private local session link below. Each browser tab connects to one member.</p>
+      <Btn disabled={busy} onClick={inviteDevice}>Pair a new native signer</Btn>
+      {claim && <div className="my-4 text-sm">
+        <a className="text-mint underline" href={claim}>Open LokiSigner</a>
+        <p className="mt-2 text-xs text-muted">Single use; expires in two minutes. Open on the device you want to pair.</p>
+        <label className="block mt-2 text-xs text-muted">Pairing link
+          <input className="glass mt-2 w-full rounded px-3 py-2" readOnly value={claim} onFocus={(e) => e.target.select()} />
+        </label>
+      </div>}
+      <p className="my-4 text-xs text-muted">Already paired? Unlock LokiSigner again. Your passphrase and shares stay on your device; the coordinator receives only public registration data.</p>
+      <label className="block text-xs text-muted">Local pairing link
+        <input type="password" value={link} autoComplete="off" spellCheck={false}
+          onChange={(e) => setLink(e.target.value)} onKeyDown={(e) => e.key === "Enter" && !busy && link && connect()}
+          placeholder="http://127.0.0.1:3601/#…" className="glass mb-4 mt-2 w-full rounded-full px-5 py-3" />
+      </label>
+      <Btn disabled={busy || !link.trim()} onClick={connect}>{busy ? "Connecting…" : "Pair this tab"}</Btn>
+      <ErrMsg msg={err ?? notice} />
+      <p className="mt-4 text-xs text-muted">After logout or a device restart, unlock locally and paste the current link again. Keep the link private.</p>
+    </div>
+  </FullScreen>;
+}
+
+// Describe protection on the signer host, not custody inside this browser.
+function SecureStorageBadge({ se }: { se?: string }) {
+  const enclave = se === "apple";
+  return (
+    <span
+      className="pill text-[11px] text-muted"
+      title={enclave
+        ? "Your device’s Secure Enclave protects the wrapping key; signing requires local consent. The share enters device process memory during signing."
+        : "Software development signer: local sealed storage, without hardware isolation."}
+    >
+      <span className={`dot ${enclave ? "bg-mint text-mint" : "bg-amber text-amber"}`} />
+      {enclave ? "Enclave-protected wrapping key" : "Software device storage"}
+    </span>
+  );
+}
+
+function AccountNumber() {
+  const [id, setId] = useState<number | null>(null);
+  useEffect(() => {
+    try { setId(JSON.parse(sessionStorage.getItem("loki_me") ?? "null")?.slot ?? null); } catch {}
+  }, []);
+  return id ? <p className="mb-5 text-xs text-muted">Account number: <span className="select-all font-mono">{id}</span> · Public roster slot; pair each browser tab locally.</p> : null;
+}
+
+// ─── home ─────────────────────────────────────────────────────────────────────
+
+function Home({
+  profile,
+  vaults,
+  secureElement,
+  onNavigate,
+  onRefresh,
+}: {
+  profile: { name: string; id: string } | undefined;
+  vaults: VaultSummary[];
+  secureElement?: string;
+  onNavigate: (v: View) => void;
+  onRefresh: () => void;
+}) {
+  return (
+    <div>
+      <div className="mb-6 flex flex-col items-start gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <h2 className="min-w-0 text-2xl font-semibold">{profile?.name ?? "Wallet"}</h2>
+        <SecureStorageBadge se={secureElement} />
+      </div>
+
+      <AccountNumber />
+      {[{ title: "Active vaults", items: vaults.filter((v) => v.active !== false) },
+        { title: "Setting up", items: vaults.filter((v) => v.active === false) }].map(({ title, items }) => (
+        (title === "Active vaults" || items.length > 0) && <section key={title} className="mb-6">
+          <h3 className="eyebrow mb-3">{title}</h3>
+          {items.length === 0 ? <GlassCard className="py-8 text-center text-sm text-muted">
+            <p className="mb-2 font-display text-lg font-semibold text-foreground">No active vaults yet</p>
+            <p>{vaults.length ? "Finish setup below to activate your vault." : "Create one or join with an invite link."}</p>
+          </GlassCard> : <div className="space-y-2.5">{items.map((v) => (
+            <button key={v.vault}
+              onClick={() => onNavigate(v.active === false ? { id: "ceremony", vault: v.vault } : { id: "overview", vault: v })}
+              className="glass w-full rounded-2xl p-5 text-left transition hover:-translate-y-0.5 hover:border-mint/30">
+              <div className="flex items-start justify-between gap-3">
+                <span className="min-w-0 font-medium">{v.name}</span>
+                <span className="shrink-0 rounded-full bg-mint/10 px-2.5 py-0.5 text-xs text-mint">{v.threshold} of {v.members} approvals</span>
+              </div>
+              <div className="mt-1 flex items-center justify-between gap-2">
+                <span className="font-mono text-xs text-muted">{short(v.vault)}</span>
+                {v.active === false && <span className="shrink-0 text-xs text-amber">Finish setup →</span>}
+              </div>
+            </button>
+          ))}</div>}
+        </section>
+      ))}
+
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Btn variant="mint" onClick={() => onNavigate({ id: "create-vault" })}>
+          Create vault
+        </Btn>
+        <Btn variant="ghost" onClick={() => onNavigate({ id: "join-vault" })}>
+          Join vault
+        </Btn>
+      </div>
+    </div>
+  );
+}
+
+// ─── create vault ─────────────────────────────────────────────────────────────
+
+function CreateVault({
+  profileId,
+  onBack,
+  onCreated,
+}: {
+  profileId?: string;
+  onBack: () => void;
+  onCreated: (vault: string) => void;
+}) {
+  const [name, setName] = useState("");
+  const [members, setMembers] = useState(3);
+  const [threshold, setThreshold] = useState(2);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  // threshold can't exceed members
+  const t = Math.min(threshold, members);
+  const submit = async () => {
+    setBusy(true); setErr(null);
+    try {
+      const res = await api<{ vault: string }>("create", { name, members, threshold: t });
+      rememberVaultSlot(profileId, res.vault, 1);
+      onCreated(res.vault);
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  };
+
+  const range = (lo: number, hi: number) => Array.from({ length: hi - lo + 1 }, (_, i) => lo + i);
+
+  return (
+    <div>
+      <BackLink onClick={onBack} />
+      <h2 className="mb-6 text-2xl font-semibold">Set up vault</h2>
+      <GlassCard className="space-y-3">
+        <div className="rounded-xl border border-mint/25 bg-mint/10 p-4">
+          <p className="text-2xl font-semibold text-mint">{t} of {members} approvals</p>
+          <p className="mt-1 text-sm text-muted">Required for every payment</p>
+        </div>
+        <p className="text-sm text-muted">
+          {members} people hold a share; any {t} of them must approve each payment. Share an
+          invite link with each of the others, then verify the members together.
+        </p>
+        <label className="block text-left text-xs text-muted">
+          Vault name
+          <input
+            placeholder="Vault name"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && name && !busy && submit()}
+            className="glass mt-1.5 w-full rounded-full px-5 py-3 outline-none"
+          />
+        </label>
+        <div className="grid grid-cols-2 gap-3">
+          <label className="text-left text-xs text-muted">
+            Members
+            <select
+              value={members}
+              onChange={(e) => setMembers(Number(e.target.value))}
+              className="glass mt-1 w-full rounded-full px-6 py-2.5 text-left text-sm text-foreground outline-none bg-transparent"
+            >
+              {range(2, 16).map((n) => (
+                <option key={n} value={n} className="bg-white text-foreground">{n}</option>
+              ))}
+            </select>
+          </label>
+          <label className="text-left text-xs text-muted">
+            Approvals needed
+            <select
+              value={t}
+              onChange={(e) => setThreshold(Number(e.target.value))}
+              className="glass mt-1 w-full rounded-full px-6 py-2.5 text-left text-sm text-foreground outline-none bg-transparent"
+            >
+              {range(2, members).map((n) => (
+                <option key={n} value={n} className="bg-white text-foreground">{n}</option>
+              ))}
+            </select>
+          </label>
+        </div>
+      </GlassCard>
+      <div className="mt-4">
+        <Btn onClick={submit} disabled={!name || busy}>
+          {busy ? "Starting…" : "Set up vault"}
+        </Btn>
+      </div>
+      <ErrMsg msg={err} />
+    </div>
+  );
+}
+
+// ─── join vault ───────────────────────────────────────────────────────────────
+
+function JoinVault({
+  profileId,
+  initialInvite,
+  onBack,
+  onJoined,
+}: {
+  profileId?: string;
+  initialInvite?: string;
+  onBack: () => void;
+  onJoined: (vault: string) => void;
+}) {
+  const [invite, setInvite] = useState(initialInvite ?? "");
+  const preview = invitePreview(extractInvite(invite));
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const submit = async () => {
+    setBusy(true); setErr(null);
+    try {
+      // Accept a full invite link or a raw code — pull the code out of a pasted URL.
+      const res = await api<{ vault: string }>("join", { invite: extractInvite(invite) });
+      const preview = invitePreview(extractInvite(invite));
+      if (preview?.vault === res.vault) rememberVaultSlot(profileId, res.vault, preview.slot);
+      onJoined(res.vault);
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div>
+      <BackLink onClick={onBack} />
+      <h2 className="mb-2 text-2xl font-semibold">Join a vault</h2>
+      <p className="mb-5 text-sm text-muted">
+        Paste the invite link the creator sent you (or just open their link). You join their vault,
+        then everyone verifies the members together and the keys are created.
+      </p>
+      <GlassCard>
+        <label className="block text-xs text-muted">
+          Invite link or code
+          <input
+            placeholder="Paste invite link"
+            value={invite}
+            onChange={(e) => setInvite(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && invite && !busy && submit()}
+            className="glass mt-1.5 w-full rounded-full px-5 py-3 font-mono outline-none"
+          />
+        </label>
+      </GlassCard>
+      <GlassCard className="mt-4">
+        <h3 className="eyebrow mb-2">Invite preview</h3>
+        {preview ? <>
+          <p className="text-lg font-semibold">{preview.name}</p>
+          <p className="mt-1 text-mint">{preview.threshold} of {preview.members} approvals</p>
+          <p className="mt-2 text-xs text-muted">These details come from the invite. Confirm the vault name and approval requirement with the creator before joining.</p>
+        </> : <p className="text-sm text-muted">{invite ? "Preview unavailable for this invite. Ask the creator for the vault name and approval requirement before joining." : "Paste an invite to see its vault name and approval requirement."}</p>}
+      </GlassCard>
+      <div className="mt-4">
+        <Btn onClick={submit} disabled={!invite || busy}>
+          {busy ? "Joining…" : "Join →"}
+        </Btn>
+      </div>
+      <ErrMsg msg={err} />
+    </div>
+  );
+}
+
+// ─── ceremony ─────────────────────────────────────────────────────────────────
+
+// The phases the host actually emits (see host/ceremony.rs status): waiting → roster → keys →
+// active. Backup is done inside the key-generation step, not as its own phase.
+const CEREMONY_PHASES: CeremonyStatus["phase"][] = [
+  "waiting_for_members",
+  "compare_roster",
+  "creating_keys",
+  "active",
+];
+
+const PHASE_LABEL: Record<CeremonyStatus["phase"], string> = {
+  waiting_for_members: "Waiting for members",
+  compare_roster: "Verify members",
+  creating_keys: "Creating keys",
+  back_up: "Back up",
+  waiting_for_backups: "Waiting for backups",
+  final_backup: "Final backup",
+  connecting_relays: "Connecting relays",
+  setup_interrupted: "Setup interrupted",
+  active: "Active",
+};
+
+function CeremonyView({
+  profileId,
+  vault,
+  secureElement,
+  onDone,
+}: {
+  profileId?: string;
+  vault: string;
+  secureElement?: string;
+  onDone: () => void;
+}) {
+  const { data: cs, error, refresh } = useCeremonyStatus(vault, true);
+
+  if (error) {
+    return (
+      <GlassCard>
+        <h2 className="text-2xl font-semibold">Vault setup unavailable</h2>
+        <ErrMsg msg={error} />
+        <p className="mt-3 text-sm text-muted">We’ll keep trying to reconnect.</p>
+        <Btn className="mt-4" onClick={refresh}>Retry</Btn>
+      </GlassCard>
+    );
+  }
+
+  if (!cs) {
+    return <GlassCard><p role="status" className="py-5 text-center text-sm text-muted">Loading vault setup…</p></GlassCard>;
+  }
+
+  if (cs.phase === "active") {
+    return (
+      <GlassCard className="text-center">
+        <div aria-hidden="true" className="mx-auto mb-4 grid h-14 w-14 place-items-center rounded-full bg-mint/10 text-3xl text-mint">✓</div>
+        <h2 className="text-2xl font-semibold text-mint mb-2">Vault ready</h2>
+        <p className="text-muted text-sm mb-4">Setup is complete and the vault is active.</p>
+        <p className="mb-6 text-sm text-foreground/90">
+          {secureElement === "apple"
+            ? "The signer host’s Secure Enclave protects the unwrapping key. Your share enters process memory during signing; it is not hardware-contained FROST signing."
+            : "Software development signer: local sealed storage, without hardware isolation."}
+        </p>
+        <div className="mb-8 flex justify-center"><SecureStorageBadge se={secureElement} /></div>
+        <Btn onClick={onDone}>Go to vault →</Btn>
+      </GlassCard>
+    );
+  }
+
+  return (
+    <div>
+      <h2 className="mb-4 text-2xl font-semibold">Set up vault</h2>
+      <PhaseLadder current={cs.phase} />
+
+      <div className="mt-6">
+        {cs.phase === "waiting_for_members" && (
+          <WaitingForMembers invites={cs.invites ?? []} />
+        )}
+        {cs.phase === "compare_roster" && (
+          <CompareRoster
+            profileId={profileId}
+            creator={cs.invites !== undefined}
+            vault={vault}
+            fingerprint={cs.fingerprint}
+            confirmations={cs.confirmations ?? []}
+          />
+        )}
+        {(cs.phase === "creating_keys" || cs.phase === "waiting_for_backups" || cs.phase === "connecting_relays") && (
+          <GlassCard>
+            <p role="status" className="py-5 text-center text-sm text-muted">
+              {PHASE_LABEL[cs.phase]}… please wait.
+            </p>
+          </GlassCard>
+        )}
+        {cs.phase === "back_up" && (
+          <BackupPhase vault={vault} finalStep={false} />
+        )}
+        {cs.phase === "final_backup" && (
+          <BackupPhase vault={vault} finalStep={true} />
+        )}
+        {cs.phase === "setup_interrupted" && <ResumeCeremony vault={vault} />}
+      </div>
+    </div>
+  );
+}
+
+// The DKG task died on a transient relay blip (phase "setup_interrupted"). Resume it — the host
+// re-drives the SAME DKG from its saved state (replays relay-log wires, continues; it does not
+// regenerate shares). Auto-try once, with a manual retry; status polling advances on success.
+function ResumeCeremony({ vault }: { vault: string }) {
+  const [tried, setTried] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [fails, setFails] = useState(0);
+
+  const resume = useCallback(async () => {
+    setBusy(true); setErr(null);
+    try {
+      await api("resume", { vault });
+    } catch (e) {
+      setErr((e as Error).message);
+      setFails((n) => n + 1);
+    } finally {
+      setBusy(false);
+    }
+  }, [vault]);
+
+  useEffect(() => {
+    if (tried) return;
+    setTried(true);
+    resume();
+  }, [tried, resume]);
+
+  return (
+    <GlassCard className="text-center">
+      <p className="mb-1 text-sm text-amber">Setup was interrupted (a relay/network blip).</p>
+      <p className="mb-4 text-xs text-muted">
+        {busy ? "Reconnecting and resuming setup…" : "Resuming from where it stopped — your keys are not regenerated."}
+      </p>
+      {err && (
+        <div className="mb-3"><ErrMsg msg={`${err}${fails >= 2 ? " — if this keeps failing, start a fresh vault from the LOKI menu." : ""}`} /></div>
+      )}
+      <Btn variant="ghost" onClick={resume} disabled={busy}>
+        {busy ? "Resuming…" : "Try again"}
+      </Btn>
+    </GlassCard>
+  );
+}
+
+function PhaseLadder({ current }: { current: CeremonyStatus["phase"] }) {
+  const currentIdx = CEREMONY_PHASES.indexOf(current);
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {CEREMONY_PHASES.map((p, i) => (
+        <span
+          key={p}
+          aria-current={i === currentIdx ? "step" : undefined}
+          className={`rounded-full px-2.5 py-0.5 text-[11px] font-medium transition ${
+            i < currentIdx
+              ? "bg-mint/15 text-mint"
+              : i === currentIdx
+              ? "bg-mint text-white"
+              : "border border-[var(--border)] bg-white/50 text-muted"
+          }`}
+        >
+          {PHASE_LABEL[p]}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function FullValue({ value, label, expanded = false }: { value: string; label: string; expanded?: boolean }) {
+  return <details open={expanded || undefined} className="min-w-0 text-left text-xs">
+    <summary className="min-h-11 cursor-pointer py-2 font-mono text-muted">{short(value, 16, 10)} · Full {label}</summary>
+    <p tabIndex={0} className="select-all break-all rounded-xl border border-[var(--border)] bg-white/60 p-3 font-mono">{value}</p>
+  </details>;
+}
+
+function WaitingForMembers({ invites }: { invites: InviteSlot[] }) {
+  const [copied, setCopied] = useState<number | null>(null);
+  const [copyFailed, setCopyFailed] = useState<number | null>(null);
+  const copy = async (slot: number, code: string) => {
+    try {
+      setCopyFailed(null);
+      await navigator.clipboard.writeText(inviteLink(code));
+      setCopied(slot);
+      setTimeout(() => setCopied(null), 1500);
+    } catch {
+      setCopyFailed(slot);
+    }
+  };
+  // A joiner's status carries no invite list (only the creator holds it), so an empty
+  // array here means the viewer has already joined and is just waiting for the others.
+  if (invites.length === 0) {
+    return (
+      <GlassCard>
+        <p role="status" className="text-sm leading-relaxed text-muted">
+          You&apos;re in. Waiting for the other members to join — setup advances
+          automatically once everyone has joined.
+        </p>
+      </GlassCard>
+    );
+  }
+  const joined = invites.filter((i) => i.joined).length;
+  return (
+    <div className="space-y-3">
+      <p className="text-sm text-muted">
+        Send <span className="text-foreground">one link to each person</span>. They open it, create
+        their account, and they&apos;re in — setup advances automatically once everyone has
+        joined.
+      </p>
+      <p className="pill text-muted">
+        <span className={`dot ${joined === invites.length ? "bg-mint text-mint" : "bg-amber text-amber"}`} />
+        {joined} of {invites.length} joined
+      </p>
+      {invites.map((inv, i) => (
+        <div key={inv.slot} className="glass flex items-center justify-between gap-3 rounded-2xl p-4">
+          <div className="flex min-w-0 items-center gap-3">
+            <MemberAvatar slot={inv.slot} />
+            <div className="min-w-0">
+              <p className="mb-1 text-xs text-muted">Invite {i + 1}</p>
+              {inv.joined ? <p className="text-xs text-muted">Joined ✓</p> : <FullValue value={inviteLink(inv.code)} label="invite link" expanded={copyFailed === inv.slot} />}
+              {copyFailed === inv.slot && <p role="alert" className="text-xs text-danger">Copy failed. Select the full link above and copy manually.</p>}
+            </div>
+          </div>
+          {inv.joined ? (
+            <span className="shrink-0 text-xs text-mint">✓ in</span>
+          ) : (
+            <button
+              onClick={() => copy(inv.slot, inv.code)}
+              aria-label={`Copy invite ${i + 1} link`}
+              className="btn-glass shrink-0 rounded-full px-3 py-2 text-sm"
+            >
+              {copied === inv.slot ? "✓ copied" : "Copy link"}
+            </button>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function CompareRoster({
+  profileId,
+  creator = false,
+  vault,
+  fingerprint,
+  confirmations,
+}: {
+  profileId?: string;
+  creator?: boolean;
+  vault: string;
+  fingerprint: string | undefined;
+  confirmations: { slot: number; confirmed: boolean; matches: boolean }[];
+}) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  // shortcut: older joins lack an exposed own slot; use the acknowledged action until status exposes it.
+  const [confirmedHere, setConfirmedHere] = useState(false);
+  const [ownSlot, setOwnSlot] = useState<number | null>(null);
+  const confirmationKey = profileId && fingerprint ? `loki_confirmed:${profileId}:${vault}:${fingerprint}` : null;
+  useEffect(() => {
+    setOwnSlot(creator ? 1 : rememberedVaultSlot(profileId, vault));
+    try { setConfirmedHere(!!confirmationKey && localStorage.getItem(confirmationKey) === "yes"); } catch {}
+  }, [profileId, vault, confirmationKey, creator]);
+
+  const agree = async () => {
+    setBusy(true); setErr(null);
+    try {
+      await api("agree", { vault, fingerprint });
+      setConfirmedHere(true);
+      try { if (confirmationKey) localStorage.setItem(confirmationKey, "yes"); } catch {}
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  };
+
+  const mySlot = confirmations.find((c) => c.slot === ownSlot);
+  const alreadyConfirmed = confirmedHere || mySlot?.confirmed === true;
+  const allConfirmed = confirmations.length > 0 && confirmations.every((c) => c.confirmed);
+
+  return (
+    <div>
+      <p className="text-sm text-muted mb-4">
+        Security check: make sure the code below is <span className="text-foreground">identical</span>{" "}
+        for everyone (read it out on a call). Matching codes prove you&apos;re all in the same vault and
+        no one was swapped in. Confirm once it matches.
+      </p>
+      {fingerprint && (
+        <GlassCard className="mb-4 text-center">
+          <h3 className="eyebrow mb-2">Compare this code</h3>
+          <p className="font-mono text-lg break-all text-amber">{fingerprint}</p>
+        </GlassCard>
+      )}
+      <div className="space-y-1 mb-4">
+        {confirmations.map((c) => (
+          <div key={c.slot} className="flex items-center justify-between gap-3 py-1 text-sm">
+            <span className="flex items-center gap-2.5"><MemberAvatar slot={c.slot} /> Member {c.slot}{c.slot === ownSlot ? " (you)" : ""}</span>
+            <span className={c.confirmed ? (c.matches ? "text-mint" : "text-danger") : "text-muted"}>
+              {c.confirmed ? (c.matches ? "✓ confirmed" : "✗ mismatch") : "waiting"}
+            </span>
+          </div>
+        ))}
+      </div>
+      {!alreadyConfirmed && !allConfirmed && (
+        <Btn variant="amber" onClick={agree} disabled={busy || !fingerprint}>
+          {busy ? "Confirming…" : "Confirm members"}
+        </Btn>
+      )}
+      {(alreadyConfirmed || allConfirmed) && (
+        <p role="status" className="glass rounded-2xl p-4 text-center text-sm text-mint">{allConfirmed ? "All members confirmed — advancing…" : "You confirmed — waiting for others."}</p>
+      )}
+      <ErrMsg msg={err} />
+    </div>
+  );
+}
+
+function BackupPhase({
+  vault,
+  finalStep,
+}: {
+  vault: string;
+  finalStep: boolean;
+}) {
+  const [words, setWords] = useState<string[] | null>(null);
+  const [entry, setEntry] = useState("");
+  const [card, setCard] = useState<string | null>(null);
+  const [cardEntry, setCardEntry] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [done, setDone] = useState(false);
+
+  const fetchWords = async () => {
+    setBusy(true); setErr(null);
+    try {
+      const res = await api<{ words: string[] }>("backup", { vault });
+      setWords(res.words);
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  };
+
+  const fetchFinalCard = async () => {
+    setBusy(true); setErr(null);
+    try {
+      const res = await api<{ card: string }>(`final-card?vault=${encodeURIComponent(vault)}`);
+      setCard(res.card);
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  };
+
+  const verifyWords = async () => {
+    setBusy(true); setErr(null);
+    try {
+      const enteredWords = entry.trim().split(/\s+/);
+      if (finalStep) {
+        await api("verify-final-backup", { vault, words: enteredWords, card: cardEntry.trim() });
+      } else {
+        await api("verify", { vault, words: enteredWords });
+        // then finalize-backup
+        await api("finalize-backup", { vault, words: enteredWords });
+      }
+      setDone(true);
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  };
+
+  if (done) {
+    return <p role="status" className="glass rounded-2xl p-5 text-center text-sm text-mint">Backup complete — waiting for others…</p>;
+  }
+
+  if (!words) {
+    return (
+      <GlassCard className="text-center">
+        <p className="text-sm text-muted mb-4">
+          {finalStep
+            ? "Final check — confirm your backup is safe, then the vault goes live."
+            : "Save the 24 words privately. Restoring a share here also requires signing in and a stored vault backup. Never share these words, including with other members."}
+        </p>
+        <Btn variant="amber" onClick={finalStep ? fetchFinalCard : fetchWords} disabled={busy}>
+          {busy ? "Loading…" : finalStep ? "Show final backup" : "Show my recovery phrase"}
+        </Btn>
+        <ErrMsg msg={err} />
+      </GlassCard>
+    );
+  }
+
+  return (
+    <div>
+      <h3 data-screen-heading className="eyebrow mb-3">
+        {finalStep ? "Final backup words" : "Recovery phrase — write these down"}
+      </h3>
+      <GlassCard className="mb-4">
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+          {words.map((w, i) => (
+            <div key={i} className="flex gap-1.5 items-baseline">
+              <span className="text-[10px] text-muted w-5 text-right">{i + 1}.</span>
+              <span className="font-mono text-sm">{w}</span>
+            </div>
+          ))}
+        </div>
+      </GlassCard>
+
+      {finalStep && card && (
+        <div className="mb-3">
+          <p className="text-xs text-muted mb-1">Recovery card code</p>
+          <GlassCard>
+            <p className="font-mono text-sm break-all text-amber">{card}</p>
+          </GlassCard>
+          <label className="mt-3 block text-xs text-muted">
+            Re-enter card code
+            <input
+              placeholder="Re-enter card code"
+              value={cardEntry}
+              onChange={(e) => setCardEntry(e.target.value)}
+              className="glass mt-2 w-full rounded-full px-6 py-3 font-mono text-sm outline-none placeholder:text-muted"
+            />
+          </label>
+        </div>
+      )}
+
+      <label htmlFor="backup-words" className="mb-2 block text-xs text-muted">Re-enter all 24 words to confirm</label>
+      <textarea
+        id="backup-words"
+        rows={3}
+        placeholder="word1 word2 word3 …"
+        value={entry}
+        onChange={(e) => setEntry(e.target.value)}
+        className="glass w-full rounded-2xl px-4 py-3 font-mono text-sm outline-none placeholder:text-muted resize-none mb-3"
+      />
+      <Btn
+        variant="amber"
+        onClick={verifyWords}
+        disabled={busy || !entry.trim() || (finalStep && !cardEntry.trim())}
+      >
+        {busy ? "Verifying…" : "Verify & continue"}
+      </Btn>
+      <ErrMsg msg={err} />
+    </div>
+  );
+}
+
+// ─── vault overview ───────────────────────────────────────────────────────────
+
+function VaultOverview({
+  vault,
+  onSend,
+  onHistory,
+  onApprove,
+  onBack,
+}: {
+  vault: VaultSummary;
+  onSend: () => void;
+  onHistory: () => void;
+  onApprove: (attempt: string) => void;
+  onBack: () => void;
+}) {
+  const [address, setAddress] = useState<string | null>(null);
+  const [balance, setBalance] = useState<{ balance_zat: number } | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [copyFailed, setCopyFailed] = useState(false);
+  const [loadVersion, setLoadVersion] = useState(0);
+  const [loadErr, setLoadErr] = useState<string | null>(null);
+  const [balanceErr, setBalanceErr] = useState(false);
+  const [funding, setFunding] = useState(false);
+  const [pending, setPending] = useState<PendingApproval[] | null>(null);
+  const [pendingError, setPendingError] = useState<string | null>(null);
+  const [pendingVersion, setPendingVersion] = useState(0);
+
+  // Poll for payments another member proposed that need THIS member's approval — the co-signer's
+  // inbox. Without this a co-signer has no way to discover a pending payment to approve.
+  useEffect(() => {
+    let active = true;
+    const load = () =>
+      pendingApprovals(vault.vault)
+        .then((r) => { if (active) { setPending(r.pending); setPendingError(null); } })
+        .catch((e) => active && setPendingError((e as Error).message));
+    load();
+    const timer = setInterval(load, 3000);
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
+  }, [vault.vault, pendingVersion]);
+
+  useEffect(() => {
+    let active = true;
+    setLoadErr(null);
+    // Load independently: a hosted vault's balance can be unavailable (needs a scan /
+    // roster the signer can't open), but the address must still render.
+    api<{ address: string }>(`address?vault=${vault.vault}`)
+      .then((r) => { if (active) { setAddress(r.address); setLoadErr(null); } })
+      .catch((e) => active && setLoadErr((e as Error).message));
+    // Poll the balance so a deposit (or a still-scanning signer) shows up without a reload.
+    const loadBalance = () =>
+      api<{ balance_zat: number }>("balance", { vault: vault.vault })
+        .then((r) => { if (active) { setBalance(r); setBalanceErr(false); } })
+        .catch(() => active && setBalanceErr(true));
+    loadBalance();
+    const timer = setInterval(loadBalance, 5000);
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
+  }, [vault.vault, loadVersion]);
+
+  const copy = async () => {
+    if (!address) return;
+    try {
+      setCopyFailed(false);
+      await navigator.clipboard.writeText(address);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch { setCopyFailed(true); }
+  };
+
+  const requestFunds = async () => {
+    if (!address) return;
+    setFunding(true); setLoadErr(null);
+    try {
+      await fund(address);
+      const r = await api<{ balance_zat: number }>("balance", { vault: vault.vault });
+      setBalance(r);
+    } catch (e) { setLoadErr((e as Error).message); }
+    finally { setFunding(false); }
+  };
+
+  return (
+    <div>
+      <BackLink onClick={onBack} />
+      <div className="mb-3 flex items-start justify-between gap-3">
+        <h2 className="min-w-0 text-2xl font-semibold">{vault.name}</h2>
+        <span className="pill shrink-0 font-mono text-muted">{vault.threshold}/{vault.members}</span>
+      </div>
+      <p className="eyebrow mb-2">Balance</p>
+      <div className="mb-6 font-mono text-3xl font-semibold [overflow-wrap:anywhere] sm:text-4xl">
+        {balance ? zatToTaz(balance.balance_zat) : "—"}
+        <span className="ml-2 text-xl text-muted">TAZ</span>
+      </div>
+
+      {!balance && !balanceErr && (
+        <p role="status" className="glass mb-4 rounded-2xl p-4 text-sm text-muted">Loading balance…</p>
+      )}
+      {balanceErr && (
+        <div className="mb-4"><ErrMsg msg={balance ? "Balance could not refresh. The amount shown may be out of date. Retrying automatically." : "Balance is unavailable. Retrying automatically."} /></div>
+      )}
+      {loadErr && <div className="mb-4"><ErrMsg msg={loadErr} /></div>}
+      {(loadErr || balanceErr) && <Btn variant="ghost" className="mb-4" onClick={() => setLoadVersion((v) => v + 1)}>Retry wallet details</Btn>}
+
+      <div className="mb-5">
+        <div className="mb-2 flex items-center gap-2">
+          <h3 className="eyebrow">Approvals</h3>
+          {pending && pending.length > 0 && (
+            <span className="rounded-full bg-amber px-2 py-0.5 text-[11px] font-bold leading-none text-white">{pending.length}</span>
+          )}
+        </div>
+        {pendingError ? (
+          <GlassCard>
+            <ErrMsg msg={`Approval inbox unavailable: ${pendingError}${pending ? " Showing the last loaded requests." : ""}`} />
+            <Btn variant="ghost" className="mt-3" onClick={() => { setPending(null); setPendingError(null); setPendingVersion((v) => v + 1); }}>Retry approval inbox</Btn>
+          </GlassCard>
+        ) : pending === null ? (
+          <GlassCard className="py-6 text-center text-sm text-muted"><span role="status">Loading approval inbox…</span></GlassCard>
+        ) : pending.length === 0 ? (
+          <GlassCard className="flex items-center justify-center gap-2 py-6 text-center text-sm text-muted">
+            <span className="text-mint">✓</span> No payments awaiting your approval
+          </GlassCard>
+        ) : (
+          <GlassCard className="border-2 border-amber/60 bg-amber/10 ring-4 ring-amber/15">
+            <div className="space-y-3">
+              {pending.map((p) => (
+                <div key={p.attempt} className="flex flex-col gap-3 border-b border-[var(--border)] pb-3 last:border-0 last:pb-0 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="min-w-0">
+                    <p className="font-mono text-base font-semibold">{zatToTaz(p.amount_zat)} TAZ</p>
+                    <p className="truncate font-mono text-[11px] text-muted">to {short(p.recipient, 12, 8)}</p>
+                    <p className="mt-1 flex items-center gap-2 text-[11px] text-muted"><MemberAvatar slot={p.proposer} size={22} /> Proposed by Member {p.proposer}</p>
+                  </div>
+                  <button
+                    onClick={() => onApprove(p.attempt)}
+                    className="btn-primary shrink-0 rounded-full px-5 py-2.5 text-sm font-semibold"
+                  >
+                    Review &amp; approve →
+                  </button>
+                </div>
+              ))}
+            </div>
+          </GlassCard>
+        )}
+      </div>
+
+      <GlassCard className="mb-4">
+        <Row label="Policy" value={`${vault.threshold} of ${vault.members}`} mono />
+        <Row label="Vault ID" value={short(vault.vault)} mono />
+        {address && (
+          <Row
+            label="Address"
+            value={
+              <FullValue value={address} label="receive address" expanded={copyFailed} />
+            }
+          />
+        )}
+        {!address && !loadErr && <p role="status" className="mt-3 text-sm text-muted">Loading receive address…</p>}
+      </GlassCard>
+
+      {copyFailed && <ErrMsg msg="Copy failed. Expand and select the full receive address above to copy it manually." />}
+      {address && (
+        <div className={`mb-3 grid gap-3 ${address.startsWith("uregtest1") ? "sm:grid-cols-2" : "grid-cols-1"}`}>
+          <button
+            onClick={copy}
+            className="btn-glass rounded-full px-4 py-3 text-sm"
+          >
+            {copied ? "✓ Copied" : "Copy address"}
+          </button>
+          {/* Regtest has an on-demand in-app faucet; testnet funds come from an external one. */}
+          {address.startsWith("uregtest1") && (
+            <button
+              onClick={requestFunds}
+              disabled={funding}
+              className="btn-glass rounded-full px-4 py-3 text-sm text-amber disabled:opacity-60"
+            >
+              {funding ? "Funding…" : "Request test funds"}
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Testnet has no in-app faucet: send the member to an external one with the address. */}
+      {address && !address.startsWith("uregtest1") && (
+        <a
+          href="https://faucet.testnet.valargroup.dev"
+          target="_blank"
+          rel="noreferrer"
+          className="btn-glass mb-3 block rounded-2xl px-5 py-3 text-center text-sm leading-relaxed text-amber sm:rounded-full"
+        >
+          Get testnet TAZ → copy the address above, paste it at the faucet
+        </a>
+      )}
+
+      <div className="mb-4 grid grid-cols-2 gap-3">
+        <Btn variant="mint" onClick={onSend}>Send</Btn>
+        <Btn variant="ghost" onClick={onHistory}>History</Btn>
+      </div>
+
+      <RecoveryCard vault={vault.vault} />
+    </div>
+  );
+}
+
+// ─── recovery ───────────────────────────────────────────────────────────────
+
+/**
+ * Per-vault recovery controls. "Set up recovery" mints the 24 words (shown ONCE — Loki never
+ * stores them); "Restore access" rebuilds this member's share from its encrypted backup using
+ * those words. The account login can never open the backup — only the words can.
+ */
+function RecoveryCard({ vault }: { vault: string }) {
+  const [status, setStatus] = useState<{ recovery_identity: boolean; recovery_backup: boolean } | null>(null);
+  const [words, setWords] = useState<string | null>(null);
+  const [mode, setMode] = useState<"idle" | "restoring">("idle");
+  const [entry, setEntry] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  const [statusError, setStatusError] = useState<string | null>(null);
+  const [checking, setChecking] = useState(true);
+  const refresh = useCallback(async () => {
+    setChecking(true); setStatusError(null);
+    try { setStatus(await recoveryStatus(vault)); }
+    catch (e) { setStatusError((e as Error).message); }
+    finally { setChecking(false); }
+  }, [vault]);
+  useEffect(() => { void refresh(); }, [refresh]);
+
+  const setup = async () => {
+    setBusy(true); setErr(null);
+    try {
+      const { words } = await recoverySetup();
+      setWords(words);
+      refresh();
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  };
+
+  const restore = async () => {
+    setBusy(true); setErr(null); setMsg(null);
+    try {
+      await recoveryRestore(vault, entry.trim());
+      setMsg("Access restored — your share is rebuilt.");
+      setMode("idle"); setEntry(""); refresh();
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <GlassCard>
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <h3 data-screen-heading={words || mode === "restoring" ? true : undefined} className="eyebrow">{words ? "Save your recovery phrase" : mode === "restoring" ? "Restore your share" : "Recovery"}</h3>
+        <span className="text-xs text-muted">
+          {checking ? "Checking recovery…" : statusError ? "Status unavailable" : status?.recovery_identity ? (status.recovery_backup ? "backed up" : "no vault backup yet") : "not set up"}
+        </span>
+      </div>
+
+      {statusError && <div className="mb-3"><ErrMsg msg={`Could not check recovery: ${statusError}`} /><Btn variant="ghost" onClick={refresh}>Retry recovery status</Btn></div>}
+      {checking && <p role="status" className="mb-3 text-sm text-muted">Loading recovery status…</p>}
+      {words ? (
+        <div>
+          <p className="mb-2 text-xs text-amber">
+            Write these 24 words down and keep them offline. They are shown once. Restoring your
+            share also requires signing in to this account and a stored backup for this vault.
+          </p>
+          <div className="mb-3 grid grid-cols-2 gap-x-3 gap-y-2 rounded-xl border border-[var(--border)] bg-white/60 p-3 font-mono text-xs sm:grid-cols-3">
+            {words.split(/\s+/).map((w, i) => (
+              <span key={i}><span className="text-muted">{i + 1}.</span> {w}</span>
+            ))}
+          </div>
+          <Btn variant="mint" onClick={() => setWords(null)}>I&apos;ve saved them</Btn>
+        </div>
+      ) : mode === "restoring" ? (
+        <div>
+          <label htmlFor="restore-words" className="mb-2 block text-xs text-muted">Enter your 24 recovery words to rebuild your share.</label>
+          <textarea
+            id="restore-words"
+            value={entry}
+            onChange={(e) => setEntry(e.target.value)}
+            rows={3}
+            placeholder="word1 word2 … word24"
+            className="glass mb-3 w-full rounded-2xl p-3 font-mono outline-none"
+          />
+          <div className="grid gap-3 sm:grid-cols-2">
+            <Btn variant="mint" onClick={restore} disabled={busy || !entry.trim()}>
+              {busy ? "Restoring…" : "Restore"}
+            </Btn>
+            <Btn variant="ghost" onClick={() => { setMode("idle"); setErr(null); }}>Cancel</Btn>
+          </div>
+        </div>
+      ) : (
+        <div className="grid gap-3 sm:grid-cols-2">
+          {status && !statusError && !status.recovery_identity && (
+            <Btn variant="mint" onClick={setup} disabled={busy || checking}>
+              {busy ? "Setting up…" : "Set up recovery"}
+            </Btn>
+          )}
+          <Btn variant="ghost" disabled={checking || !!statusError || !status?.recovery_backup} onClick={() => { setMode("restoring"); setMsg(null); }}>
+            Restore access
+          </Btn>
+        </div>
+      )}
+
+      {!words && mode === "idle" && status && !statusError && !checking && !status.recovery_backup && <p className="mt-3 text-xs text-muted">No stored backup is available for this vault. A phrase alone cannot restore it here.</p>}
+      {msg && <p role="status" className="mt-3 rounded-xl bg-mint/5 p-3 text-sm text-mint">{msg}</p>}
+      <ErrMsg msg={err} />
+    </GlassCard>
+  );
+}
+
+// ─── send ─────────────────────────────────────────────────────────────────────
+
+function Send({
+  vault,
+  onBack,
+  onDraft,
+}: {
+  vault: VaultSummary;
+  onBack: () => void;
+  onDraft: (attempt: string) => void;
+}) {
+  const [recipient, setRecipient] = useState("");
+  const [amountTaz, setAmountTaz] = useState("");
+  const [memo, setMemo] = useState("");
+  const [draft, setDraft] = useState<{ attempt: string; fee_zat: string; change_zat: string } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const prepareDraft = async () => {
+    setBusy(true); setErr(null);
+    try {
+      const taz = parseFloat(amountTaz);
+      if (!Number.isFinite(taz) || taz <= 0) throw new Error("Enter a valid amount in TAZ.");
+      const amount_zat = String(Math.round(taz * 1e8));
+      const res = await api<{ attempt: string; fee_zat: string; change_zat: string }>(
+        "payment-draft", { vault: vault.vault, recipient, amount_zat, memo }
+      );
+      setDraft(res);
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  };
+
+  const publish = async () => {
+    if (!draft) return;
+    setBusy(true); setErr(null);
+    try {
+      await api("payment-publish", { vault: vault.vault, attempt: draft.attempt });
+      onDraft(draft.attempt);
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div>
+      <BackLink onClick={onBack} />
+      <h2 className="mb-6 text-2xl font-semibold">Send from {vault.name}</h2>
+      <GlassCard className="mb-4 space-y-3">
+        <label className="block text-xs text-muted">
+          Recipient address
+          <input
+            placeholder="Recipient address"
+            value={recipient}
+            onChange={(e) => { setRecipient(e.target.value); setDraft(null); }}
+            className="glass mt-1.5 w-full rounded-full px-5 py-3 font-mono outline-none"
+          />
+        </label>
+        <label className="block text-xs text-muted">
+          Amount (TAZ)
+          <input
+            placeholder="Amount (TAZ)"
+            type="number"
+            step="0.00000001"
+            min="0"
+            value={amountTaz}
+            onChange={(e) => { setAmountTaz(e.target.value); setDraft(null); }}
+            className="glass mt-1.5 w-full rounded-full px-5 py-3 font-mono outline-none"
+          />
+        </label>
+        <label className="block text-xs text-muted">
+          Memo (optional)
+          <input
+            placeholder="Memo (optional)"
+            value={memo}
+            onChange={(e) => { setMemo(e.target.value); setDraft(null); }}
+            className="glass mt-1.5 w-full rounded-full px-5 py-3 outline-none"
+          />
+        </label>
+      </GlassCard>
+
+      {draft && (
+        <GlassCard className="mb-4">
+          <h3 className="eyebrow mb-3">Transaction summary</h3>
+          <Row label="Recipient" value={short(recipient, 14, 10)} mono />
+          <Row label="Amount" value={`${amountTaz} TAZ`} mono />
+          <Row label="Fee" value={`${zatToTaz(draft.fee_zat)} TAZ`} mono />
+          <Row label="Change" value={`${zatToTaz(draft.change_zat)} TAZ`} mono />
+        </GlassCard>
+      )}
+
+      {!draft ? (
+        <Btn onClick={prepareDraft} disabled={!recipient || !amountTaz || busy}>
+          {busy ? "Preparing…" : "Prepare →"}
+        </Btn>
+      ) : (
+        <>
+          <Btn variant="amber" onClick={publish} disabled={busy}>
+            {busy ? "Requesting…" : "Request approvals"}
+          </Btn>
+          <p className="mt-2 text-center text-xs text-muted">
+            Sends this exact payment to the group for approval. It only moves funds once the required members approve.
+          </p>
+        </>
+      )}
+      <ErrMsg msg={err} />
+    </div>
+  );
+}
+
+function SignerList({ signers, threshold, ready = false, complete = false }: { signers: number[]; threshold: number; ready?: boolean; complete?: boolean }) {
+  return <div className="my-3">
+    <p className="text-xs text-muted">{ready ? `${threshold} approvals ready · proposer can send` : complete ? "Your signer finished · awaiting proposer" : `${threshold} approvals required · waiting for signer readiness`}</p>
+    <p className="mt-1 text-xs text-muted">{signers.length} of {threshold} signing places filled. Selected members are not a count of completed approvals.</p>
+    <div className="mt-2 flex flex-wrap gap-2">
+      {signers.map((slot) => <span key={slot} className="pill"><MemberAvatar slot={slot} size={24} /> Member {slot}</span>)}
+    </div>
+  </div>;
+}
+
+// ─── review / approve ─────────────────────────────────────────────────────────
+
+function ReviewApprove({
+  profileId,
+  proposedHere,
+  vault,
+  attempt,
+  onBack,
+}: {
+  profileId?: string;
+  proposedHere?: boolean;
+  vault: VaultSummary;
+  attempt: string;
+  onBack: () => void;
+}) {
+  const [review, setReview] = useState<PaymentReview | null>(null);
+  const [approved, setApproved] = useState(false);
+  const [session, setSession] = useState<PaymentSession | null>(null);
+  const [sessionError, setSessionError] = useState<string | null>(null);
+  const [ownSlot, setOwnSlot] = useState<number | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const triesRef = useRef(0);
+
+  const fetchSession = useCallback(async () => {
+    try {
+      setSession(await api<PaymentSession>(`payment-session?vault=${vault.vault}&attempt=${attempt}`));
+      setSessionError(null);
+    } catch (e) { setSessionError((e as Error).message); }
+  }, [vault.vault, attempt]);
+  useEffect(() => {
+    setOwnSlot(rememberedVaultSlot(profileId, vault.vault));
+  }, [profileId, vault.vault]);
+  useEffect(() => {
+    if (!review) return;
+    void fetchSession();
+    const timer = setInterval(fetchSession, 3000);
+    return () => clearInterval(timer);
+  }, [review, fetchSession]);
+
+  const fetchReview = useCallback(async () => {
+    try {
+      const r = await api<PaymentReview>("payment-review", { vault: vault.vault, attempt });
+      setReview(r);
+      setErr(null);
+    } catch (e) {
+      // Early polls are expected to miss (the proposer may not have published yet); only after
+      // ~15s of failures surface the error so the user isn't stranded on a forever-spinner.
+      triesRef.current += 1;
+      if (triesRef.current >= 10) setErr((e as Error).message);
+    }
+  }, [vault.vault, attempt]);
+
+  useEffect(() => {
+    if (approved) return;
+    let active = true;
+    triesRef.current = 0;
+    setErr(null);
+    fetchReview();
+    const tick = () => {
+      fetchReview().finally(() => {
+        if (active) timerRef.current = setTimeout(tick, 1500);
+      });
+    };
+    timerRef.current = setTimeout(tick, 1500);
+    return () => { active = false; if (timerRef.current) clearTimeout(timerRef.current); };
+  }, [approved, fetchReview]);
+
+  const approve = async () => {
+    if (!review) return;
+    setBusy(true); setErr(null);
+    try {
+      await api("payment-approve", { vault: vault.vault, attempt, review_token: review.review_token });
+      setApproved(true);
+      void fetchSession();
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  };
+
+  const isProposer = proposedHere ?? (session && ownSlot !== null ? session.intent.proposer === ownSlot : null);
+
+  if (approved) {
+    return (
+      <GlassCard className="text-center">
+        <div aria-hidden="true" className="mx-auto mb-4 grid h-14 w-14 place-items-center rounded-full bg-mint/10 text-3xl text-mint">✓</div>
+        <h2 className="mb-2 text-2xl font-semibold text-mint">You approved this payment</h2>
+        <p className="text-sm text-muted mb-8">
+          It needs {vault.threshold} of {vault.members} members. Once enough have approved, the proposer broadcasts it.
+          {isProposer !== null ? (isProposer
+            ? " You proposed this payment. Open History, wait for Ready to send, then review and confirm the send."
+            : " Your approval is recorded. Wait for the proposer to send; follow its progress in History.")
+            : " If you proposed it, open History to review and confirm the send when it is ready. Otherwise, wait for the proposer."}
+        </p>
+        {session && <SignerList signers={session.intent.signers} threshold={vault.threshold} complete={session.signatures_received} />}
+        {sessionError && <><ErrMsg msg={`Could not refresh signer status: ${sessionError}`} /><Btn variant="ghost" onClick={fetchSession}>Retry signer status</Btn></>}
+        <Btn variant="ghost" onClick={onBack}>Back to History</Btn>
+      </GlassCard>
+    );
+  }
+
+  if (!review) {
+    return (
+      <div>
+        <BackLink onClick={onBack} />
+        <GlassCard>
+          <h2 className="text-2xl font-semibold">Review payment</h2>
+          {err ? (
+            <>
+              <ErrMsg msg={`Couldn’t load this payment: ${err}`} />
+              <p className="mt-3 text-sm text-muted">It may not exist yet, or the signer is unreachable. We’ll keep checking.</p>
+              <Btn className="mt-3" variant="ghost" onClick={fetchReview}>Retry payment</Btn>
+            </>
+          ) : (
+            <p role="status" className="mt-3 text-sm text-muted">Loading the payment to review…</p>
+          )}
+        </GlassCard>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <BackLink onClick={onBack} />
+      <h2 className="mb-1 text-2xl font-semibold">Approve payment</h2>
+      <p className="mb-5 text-sm text-muted">
+        from <span className="text-foreground">{vault.name}</span> · needs {vault.threshold} of {vault.members} approvals
+      </p>
+      <GlassCard className="mb-4">
+        <div className="py-2 text-center">
+          <p className="font-mono text-3xl font-semibold [overflow-wrap:anywhere] sm:text-4xl">
+            {zatToTaz(review.amount_zat)} <span className="text-xl text-muted">TAZ</span>
+          </p>
+          <p className="eyebrow mt-3">Recipient</p>
+          <p className="mt-1 font-mono text-xs break-all">{review.recipient}</p>
+        </div>
+        <div className="mt-3 border-t border-[var(--border)] pt-1">
+          <Row label="Network fee" value={`${zatToTaz(review.fee_zat)} TAZ`} mono />
+          {review.memo && <Row label="Memo" value={review.memo} />}
+        </div>
+      </GlassCard>
+      {session ? <SignerList signers={session.intent.signers} threshold={vault.threshold} complete={session.signatures_received} />
+        : !sessionError && <p role="status" className="mb-3 text-xs text-muted">Loading signer approvals…</p>}
+      {sessionError && <div className="mb-3"><ErrMsg msg={`Signer approvals unavailable: ${sessionError}`} /><Btn variant="ghost" onClick={fetchSession}>Retry signer list</Btn></div>}
+      <p className="mb-3 text-center text-xs text-muted">
+        Approving signs <span className="text-foreground">this exact payment</span> with your share.
+        Check the amount and address first.
+      </p>
+      <Btn variant="amber" onClick={approve} disabled={busy}>
+        {busy ? "Approving…" : "Approve payment"}
+      </Btn>
+      <ErrMsg msg={err} />
+    </div>
+  );
+}
+
+// ─── history ──────────────────────────────────────────────────────────────────
+
+const PHASE_PILL: Record<string, string> = {
+  preparing: "border border-[var(--border)] bg-white/50 text-muted",
+  approved: "bg-amber/15 text-amber",
+  broadcast: "bg-mint/15 text-mint",
+  confirmed: "bg-mint text-white",
+};
+
+function BroadcastConfirmation({ vault, attempt, busy, error, onConfirm, onCancel }: {
+  vault: string; attempt: string; busy: boolean; error: string | null;
+  onConfirm: () => void; onCancel: () => void;
+}) {
+  const [details, setDetails] = useState<PaymentSession | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [version, setVersion] = useState(0);
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  useEffect(() => { headingRef.current?.focus(); }, []);
+  useEffect(() => {
+    let active = true;
+    setDetails(null); setLoadError(null);
+    api<PaymentSession>(`payment-session?vault=${vault}&attempt=${attempt}`)
+      .then((value) => {
+        const intent = value.intent;
+        if (!intent.recipient || !Number.isFinite(intent.amount_zat) || intent.amount_zat <= 0
+          || !Number.isFinite(intent.fee_zat) || intent.fee_zat < 0) throw new Error("Payment details are incomplete.");
+        if (active) setDetails(value);
+      })
+      .catch((e) => active && setLoadError((e as Error).message));
+    return () => { active = false; };
+  }, [vault, attempt, version]);
+  const ready = details && ["signing", "approved"].includes(details.phase) && !details.finish_requested;
+  return <section aria-label="Confirm send" className="mt-4 rounded-xl border border-mint/30 bg-white/80 p-4">
+    <h3 data-screen-heading ref={headingRef} tabIndex={-1} className="text-lg font-semibold">Confirm irreversible send</h3>
+    {!details && !loadError && <p role="status" className="mt-3 text-sm text-muted">Loading full payment details…</p>}
+    {loadError && <><ErrMsg msg={loadError} /><Btn variant="ghost" className="mt-3" onClick={() => setVersion((v) => v + 1)}>Retry payment details</Btn></>}
+    {details && <>
+      <Row label="Full recipient address" value={<span className="select-all">{details.intent.recipient}</span>} mono />
+      <Row label="Amount" value={`${zatToTaz(details.intent.amount_zat)} TAZ`} mono />
+      <Row label="Network fee" value={`${zatToTaz(details.intent.fee_zat)} TAZ`} mono />
+      <Row label="Total leaving the vault" value={`${zatToTaz(details.intent.amount_zat + details.intent.fee_zat)} TAZ`} mono />
+      <p className="my-4 text-sm text-danger">Sending broadcasts this payment to the network. It cannot be undone. Check the full recipient address, amount, and fee before confirming.</p>
+      {!ready && <p role="status" className="mb-3 text-sm text-muted">This payment is no longer awaiting a send. Check its latest status in History.</p>}
+    </>}
+    <ErrMsg msg={error} />
+    <div className="mt-3 grid gap-2 sm:grid-cols-2">
+      <Btn onClick={onConfirm} disabled={!ready || busy}>{busy ? "Sending…" : "Confirm and send"}</Btn>
+      <Btn variant="ghost" onClick={onCancel} disabled={busy}>Cancel</Btn>
+    </div>
+  </section>;
+}
+
+function History({
+  vault,
+  onReview,
+  onBack,
+}: {
+  vault: VaultSummary;
+  onReview: (attempt: string) => void;
+  onBack: () => void;
+}) {
+  const { data, error, refresh } = usePayments(vault.vault, true);
+  const [confirming, setConfirming] = useState<string | null>(null);
+  const [requested, setRequested] = useState<Record<string, boolean>>({});
+  const sendButtonRef = useRef<HTMLButtonElement | null>(null);
+  const [finishing, setFinishing] = useState<string | null>(null);
+  const [verifying, setVerifying] = useState<string | null>(null);
+  const [txids, setTxids] = useState<Record<string, string>>({});
+  const [verified, setVerified] = useState<Record<string, boolean>>({});
+  const [err, setErr] = useState<string | null>(null);
+
+  const finish = async (attempt: string) => {
+    setFinishing(attempt); setErr(null);
+    try {
+      const res = await api<{ phase: string; txid: string | null }>("payment-finish", { vault: vault.vault, attempt });
+      setRequested((p) => ({ ...p, [attempt]: true }));
+      setConfirming(null);
+      sendButtonRef.current?.focus();
+      refresh();
+      const txid = res.txid;
+      if (txid) {
+        setTxids((p) => ({ ...p, [attempt]: txid }));
+        setVerifying(attempt);
+      }
+      // The existing history poll observes background signing, broadcast and confirmation.
+    } catch (e) { setErr((e as Error).message); }
+    finally { setFinishing(null); }
+  };
+
+  useEffect(() => {
+    if (!verifying) return;
+    const attempt = verifying;
+    const txid = txids[attempt];
+    if (!txid) return;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let cancelled = false;
+    let tries = 0;
+    const tick = async () => {
+      try {
+        const res = await api<{ phase: string }>("payment-verify", { vault: vault.vault, attempt, txid });
+        if (!cancelled && res.phase === "confirmed") {
+          setVerified((p) => ({ ...p, [attempt]: true }));
+          setVerifying(null);
+          return;
+        }
+      } catch {}
+      tries += 1;
+      // Cap at ~1min: the tx is broadcast and its id is shown; stop hammering the host if it's
+      // slow to confirm (common on testnet) rather than polling forever and leaking timers.
+      if (cancelled || tries >= 40) { setVerifying(null); return; }
+      timer = setTimeout(tick, 1500);
+    };
+    timer = setTimeout(tick, 1500);
+    return () => { cancelled = true; if (timer) clearTimeout(timer); };
+  }, [verifying, txids, vault.vault]);
+
+  const payments = data?.payments ?? [];
+
+  return (
+    <div>
+      <BackLink onClick={onBack} />
+      <h2 className="mb-4 text-2xl font-semibold">History</h2>
+
+      {error && <div className="mb-4"><ErrMsg msg={error} /><Btn variant="ghost" onClick={refresh}>Retry history</Btn></div>}
+
+      {!data ? (
+        <GlassCard className="py-10 text-center text-sm text-muted">
+          <p role="status">{error ? "History is unavailable. We’ll keep trying to reconnect." : "Loading payments…"}</p>
+        </GlassCard>
+      ) : payments.length === 0 ? (
+        <GlassCard className="py-10 text-center text-sm text-muted">
+          <p className="mb-2 font-display text-lg font-semibold text-foreground">No payments yet</p>
+          <p>Payments sent and received by this vault will appear here.</p>
+        </GlassCard>
+      ) : (
+        <div className="space-y-3">
+          {payments.map((p) => {
+            const txid = p.txid ?? txids[p.attempt];
+            const confirmed = !!verified[p.attempt] || p.phase === "confirmed";
+            const sending = !!p.finish_requested || !!requested[p.attempt] || finishing === p.attempt;
+            return (
+            <GlassCard key={p.attempt}>
+              <div className="mb-2 flex flex-col items-start gap-3 sm:flex-row sm:justify-between">
+                <div className="min-w-0">
+                  <p className="eyebrow mb-1">{p.direction === "received" ? "Received" : p.amount_is_net ? "Net outflow" : txid ? "Sent" : "Payment proposal"}</p>
+                  {p.recipient && <p className="font-mono text-xs text-muted break-all">{short(p.recipient, 14, 8)}</p>}
+                  <p className="font-mono text-sm mt-0.5">{zatToTaz(p.amount_zat)} TAZ</p>
+                  {p.fee_zat && <p className="mt-0.5 font-mono text-xs text-muted">+ fee {zatToTaz(p.fee_zat)} TAZ</p>}
+                </div>
+                <span className={`rounded-full px-2.5 py-0.5 text-xs font-medium shrink-0 ${PHASE_PILL[p.phase] ?? "border border-[var(--border)] bg-white/50 text-muted"}`}>
+                  {paymentLabel(confirmed ? "confirmed" : txid ? "broadcast" : p.phase, p.ready_to_send, sending)}
+                </span>
+              </div>
+              {p.signers && !txid && <SignerList signers={p.signers} threshold={vault.threshold} ready={p.ready_to_send} />}
+              {txid && <p className="text-xs text-muted">{p.mined_height != null ? `Included in block ${p.mined_height.toLocaleString()}. ` : confirmed ? "Confirmed on-chain. " : "Awaiting a block. "}Confirmation count is not available from this wallet.</p>}
+              <ErrMsg msg={p.error ?? null} />
+              <div className="mt-3 flex flex-col gap-2 sm:flex-row">
+                {p.phase === "signing" && !txid && <button
+                  onClick={() => onReview(p.attempt)}
+                  className="btn-glass flex-1 rounded-full px-4 py-2 text-sm"
+                >
+                  Review / approve
+                </button>}
+                {p.ready_to_send && !txid && (
+                  <button
+                    onClick={(event) => { sendButtonRef.current = event.currentTarget; setConfirming(p.attempt); setErr(null); }}
+                    disabled={sending || confirming === p.attempt}
+                    className="btn-primary flex-1 rounded-full px-4 py-2 text-sm disabled:opacity-60"
+                  >
+                    {sending ? "Sending…" : "Review & send"}
+                  </button>
+                )}
+                {txid && (
+                  <button
+                    onClick={() => { navigator.clipboard?.writeText(txid).catch(() => {}); }}
+                    title={`Copy transaction id: ${txid}`}
+                    aria-label={`Copy transaction ID ${txid}`}
+                    className="btn-glass min-w-0 flex-1 rounded-2xl px-3 py-2 text-center font-mono text-xs leading-relaxed text-mint [overflow-wrap:anywhere]"
+                  >
+                    {verified[p.attempt] || p.phase === "confirmed"
+                      ? `✓ Confirmed${p.mined_height ? ` · block ${p.mined_height.toLocaleString()}` : ""}`
+                      : "Awaiting confirmation"} · {short(txid, 8, 6)} ⧉
+                  </button>
+                )}
+              </div>
+              {confirming === p.attempt && <BroadcastConfirmation key={p.attempt} vault={vault.vault} attempt={p.attempt}
+                busy={finishing === p.attempt} error={err}
+                onConfirm={() => finish(p.attempt)}
+                onCancel={() => { setConfirming(null); setErr(null); requestAnimationFrame(() => sendButtonRef.current?.focus()); }} />}
+              {txid && (verified[p.attempt] || p.phase === "confirmed") && (
+                <p className="mt-1.5 text-center text-[11px] text-muted">
+                  Confirmed on-chain by your wallet{p.mined_height ? ` at block ${p.mined_height.toLocaleString()}` : ""}.{" "}
+                  <a href={`https://testnet.zecblock.com/tx/${txid}`} target="_blank" rel="noreferrer" className="text-mint underline">View on ZecBlock ↗</a>. Tap the id to copy.
+                </p>
+              )}
+            </GlassCard>
+            );
+          })}
+        </div>
+      )}
+      <ErrMsg msg={err} />
+    </div>
+  );
+}
