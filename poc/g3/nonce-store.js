@@ -85,6 +85,8 @@ function tx(db, stores, mode, fn) {
   return new Promise((res, rej) => {
     let t;
     if (mode === 'readwrite') {
+      // After a successful probe, falling back could release a share after a relaxed WAL write.
+      const wasSupported = DURABILITY.supported;
       DURABILITY.attrPresent = typeof IDBTransaction !== 'undefined'
         && 'durability' in IDBTransaction.prototype;
       try {
@@ -100,7 +102,12 @@ function tx(db, stores, mode, fn) {
         DURABILITY.optionsAccepted = false;
         DURABILITY.reflected = `threw: ${e.name}`;
         DURABILITY.supported = false;
+        if (wasSupported) return rej(e);
         t = db.transaction(stores, mode);
+      }
+      if (wasSupported && !DURABILITY.supported) {
+        t.abort();
+        return rej(new Error('strict durability lost'));
       }
     } else {
       t = db.transaction(stores, mode);

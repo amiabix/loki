@@ -33,6 +33,27 @@ fn roster_certifies_policy_and_keeps_legacy_fingerprint() {
     let old_three = Roster::load(&path).unwrap().fingerprint();
     assert_ne!(new_three, old_three);
 
+    document["threshold"] = 2.into();
+    document["network"] = "testnet".into();
+    assert!(Roster::from_bytes(document.to_string().as_bytes()).is_err());
+    document["birth_height"] = 4_465_100.into();
+    fs::write(&path, document.to_string()).unwrap();
+    let testnet = Roster::load(&path).unwrap();
+    assert_eq!(testnet.network.label(), "testnet");
+    assert_ne!(testnet.fingerprint(), new_three);
+    document["birth_height"] = 4_465_101.into();
+    assert_ne!(
+        Roster::from_bytes(document.to_string().as_bytes())
+            .unwrap()
+            .fingerprint(),
+        testnet.fingerprint()
+    );
+    document["network"] = "mainnet".into();
+    fs::write(&path, document.to_string()).unwrap();
+    assert!(Roster::load(&path).is_err());
+
+    document.as_object_mut().unwrap().remove("network");
+    document.as_object_mut().unwrap().remove("birth_height");
     document["threshold"] = 3.into();
     fs::write(&path, document.to_string()).unwrap();
     assert!(Roster::load(&path).is_err());

@@ -2,7 +2,6 @@ use loki_poc::{
     intent::{ChangePolicy, Intent},
     setup_transport::Identity,
     signing_session::{AttemptId, Mailbox, MessageKind, SessionContext, SigningSession},
-    vault,
 };
 use reddsa_frost::frost::redpallas as frost;
 use std::{collections::BTreeMap, fs, sync::Arc, thread};
@@ -12,7 +11,7 @@ fn context() -> SessionContext {
         vault: [11; 32],
         payment: [22; 32],
         attempt: AttemptId::random(),
-        pair: [1, 2],
+        signers: vec![1, 2],
     }
 }
 
@@ -73,7 +72,7 @@ fn relay_retry_and_reordering_preserve_two_authenticated_messages() {
             ..ctx.clone()
         },
         SessionContext {
-            pair: [1, 3],
+            signers: vec![1, 3],
             ..ctx.clone()
         },
     ] {
@@ -104,8 +103,22 @@ fn relay_retry_and_reordering_preserve_two_authenticated_messages() {
             .body(),
         b"x"
     );
+    // Any vault member up to 16 can receive the package; member 17 cannot exist.
+    let sixteenth = Identity::new(16);
+    let sixteenth_copy = alice
+        .seal_session(&sixteenth.public(), &ctx, MessageKind::Package, b"x")
+        .unwrap();
+    assert_eq!(
+        sixteenth
+            .open_session(&alice.public(), &ctx, &sixteenth_copy)
+            .unwrap()
+            .body(),
+        b"x"
+    );
+    let mut seventeenth = Identity::new(16).public();
+    seventeenth.id = 17;
     assert!(alice
-        .seal_session(&Identity::new(5).public(), &ctx, MessageKind::Package, b"x")
+        .seal_session(&seventeenth, &ctx, MessageKind::Package, b"x")
         .is_err());
     fs::remove_dir_all(path).unwrap();
 }
@@ -159,7 +172,7 @@ fn concurrent_start_has_one_winner_and_crash_before_share_requires_new_attempt()
         .unwrap()
         .try_into()
         .unwrap();
-    let fvk = vault::test_only_fvk(&ak).unwrap();
+    let fvk = loki_poc::zip2005::frost_viewing_key(&ak, &[42; 32]).unwrap();
     let intent = Intent {
         proposer: key.identifier().serialize(),
         created_height: 700,

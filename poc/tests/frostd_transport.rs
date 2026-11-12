@@ -1,0 +1,632 @@
+//! WS3 acceptance: the new signer's v2 DKG and a rerandomized signing round-trip carried
+//! over a transport (`docs/product/ws3-transport.md` §7). Every member is a
+//! storage-backed `LocalSigner`: the DKG runs inside it through the shared core, and its
+//! app only moves the [`DkgWire`]s the signer returns. Members send to the coordinator,
+//! which logs each wire in its `RelayLog` before forwarding it and redelivers from the log
+//! after a restart. Signing moves typed `Outbound` values only: commitments, the
+//! proposer's candidate, the signing package, the randomizer seed and the shares.
+//!
+//! Round two is a v2 envelope sealed under the two members' one-setup fresh keys, so the
+//! relay (and anyone who records its traffic) carries only ciphertext that the long-lived
+//! identity keys cannot open later. The leak-closure attack test itself is
+//! `signer::local::setup_tests::recorded_relay_traffic_cannot_rebuild_the_group_key`.
+//!
+//! The offline test runs over an in-memory relay with the same `Transport` contract. The
+//! live test needs a running frostd: set `FROSTD_URL` (e.g. `http://127.0.0.1:2744`); if
+//! unset it prints how to start one and returns. Real deployments MUST run frostd with
+//! TLS; `--no-tls-very-insecure` is only for the test.
+//!
+//!   frostd --no-tls-very-insecure -p 2744
+//!   FROSTD_URL=http://127.0.0.1:2744 cargo test --test frostd_transport -- --nocapture
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use loki_poc::setup_transport::{wire_kind, Identity};
+use loki_poc::signer::backup::BackupArtifact;
+use loki_poc::signer::coordination::{member_dkg_step, redeliver_dkg, relay_dkg};
+use loki_poc::signer::local::{BackupDevice, DevicePrompts, LocalSigner, RosterDecision};
+use loki_poc::signer::secure_element::SoftwareSecureElement;
+use loki_poc::signer::{
+    CandidateRef, DkgWireKind, Network, PublicPaymentParams, Session, Signer, VaultRef,
+};
+use loki_poc::transport::{
+    FrostdLoginKey, FrostdTransport, Incoming, Outbound, PaymentEncryption, Peer, RelayLog, Transport,
+};
+use reddsa_frost::frost::redpallas as frost;
+use uuid::Uuid;
+use zeroize::Zeroizing;
+
+const ORIGIN: &str = "https://coordinator.test";
+
+fn tempdir(tag: &str) -> PathBuf {
+    let p = std::env::temp_dir().join(format!(
+        "loki-ws3-{tag}-{}-{}",
+        std::process::id(),
+        rand_core::RngCore::next_u64(&mut rand_core::OsRng)
+    ));
+    let _ = std::fs::remove_dir_all(&p);
+    p
+}
+
+/// An in-memory relay with frostd's contract: an empty recipient list goes to the
+/// coordinator's mailbox, and `recv` drains the caller's mailbox. It records every
+/// payload it carried.
+#[derive(Clone, Default)]
+struct MemoryRelay(Arc<Mutex<RelayState>>);
+
+#[derive(Default)]
+struct RelayState {
+    coordinator: Option<Peer>,
+    boxes: BTreeMap<(Vec<u8>, bool), Vec<Incoming>>,
+    tape: Vec<Vec<u8>>,
+}
+
+impl MemoryRelay {
+    /// The relay loses everything still queued for the members.
+    fn drop_member_queues(&self) {
+        self.0.lock().unwrap().boxes.retain(|(_, coordinator), _| *coordinator);
+    }
+
+    fn tape(&self) -> Vec<Vec<u8>> {
+        self.0.lock().unwrap().tape.clone()
+    }
+}
+
+struct MemoryTransport {
+    payment: Option<PaymentEncryption>,
+    relay: MemoryRelay,
+    me: Peer,
+}
+
+impl Transport for MemoryTransport {
+    type Error = String;
+    type Channel = ();
+
+    fn open(&mut self, _: &[Peer], _: u8) -> Result<(), String> {
+        self.relay.0.lock().unwrap().coordinator = Some(self.me.clone());
+        Ok(())
+    }
+
+    fn join(&mut self, _: Uuid) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn send(&self, _: &(), to: &[Peer], message: &Outbound) -> Result<(), String> {
+        let mut state = self.relay.0.lock().unwrap();
+        let recipients = if to.is_empty() { vec![state.coordinator.clone().ok_or("no session")?] } else { to.to_vec() };
+        for peer in recipients {
+            let message = match &self.payment {
+                Some(payment) => payment.seal(&peer, message),
+                None => message.to_bytes(),
+            }.map_err(|e| e.to_string())?;
+            state.tape.push(message.clone());
+            state.boxes.entry((peer.0.to_vec(), to.is_empty())).or_default().push(Incoming {
+                from: self.me.clone(), message,
+            });
+        }
+        Ok(())
+    }
+
+    fn recv(&self, _: &(), as_coordinator: bool) -> Result<Vec<Incoming>, String> {
+        let mut state = self.relay.0.lock().unwrap();
+        Ok(state
+            .boxes
+            .remove(&(self.me.0.to_vec(), as_coordinator))
+            .unwrap_or_default().into_iter().map(|incoming| {
+                let message = match &self.payment {
+                    Some(payment) => payment.open(&incoming.from, &incoming.message).map_err(|e| e.to_string())?,
+                    None => incoming.message,
+                };
+                Ok(Incoming { from: incoming.from, message })
+            }).collect::<Result<_, String>>()?)
+    }
+
+    fn close(&self, _: ()) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+trait EncryptedTransport: Transport {
+    fn encrypt(&mut self, encryption: PaymentEncryption);
+}
+impl EncryptedTransport for MemoryTransport {
+    fn encrypt(&mut self, encryption: PaymentEncryption) { self.payment = Some(encryption); }
+}
+impl EncryptedTransport for FrostdTransport {
+    fn encrypt(&mut self, encryption: PaymentEncryption) { self.encrypt_payments(encryption).unwrap(); }
+}
+fn payment_identity(id: u16, login: &FrostdLoginKey) -> Identity {
+    let mut bytes = Identity::new(id).to_secret_bytes();
+    bytes[34..].copy_from_slice(&*login.to_secret_bytes());
+    Identity::from_secret_bytes(&bytes).unwrap()
+}
+fn single(bytes: &[u8]) -> &[u8] {
+    assert_eq!(&bytes[..2], &1u16.to_le_bytes());
+    assert_eq!(u32::from_le_bytes(bytes[2..6].try_into().unwrap()) as usize, bytes.len() - 6);
+    &bytes[6..]
+}
+
+#[derive(Clone, Default)]
+struct Shelf(Arc<Mutex<Option<Vec<u8>>>>);
+
+impl BackupDevice for Shelf {
+    fn passphrase(&mut self) -> Option<Zeroizing<String>> {
+        Some(Zeroizing::new("backup words".into()))
+    }
+    fn save(&mut self, artifact: &BackupArtifact) -> Result<(), String> {
+        *self.0.lock().unwrap() = Some(artifact.0.clone());
+        Ok(())
+    }
+    fn load(&mut self) -> Result<BackupArtifact, String> {
+        self.0
+            .lock()
+            .unwrap()
+            .clone()
+            .map(BackupArtifact)
+            .ok_or_else(|| "no backup".into())
+    }
+}
+
+/// One member: the storage-backed signer plus the code its device showed.
+struct Member {
+    id: u16,
+    dir: PathBuf,
+    signer: LocalSigner<SoftwareSecureElement>,
+    session: Session,
+    codes: Arc<Mutex<Vec<String>>>,
+}
+
+fn prompts(codes: Arc<Mutex<Vec<String>>>) -> DevicePrompts {
+    DevicePrompts {
+        connect: Box::new(|origin, _| origin == ORIGIN),
+        roster: Box::new(move |code| {
+            codes.lock().unwrap().push(code.to_owned());
+            RosterDecision::Match
+        }),
+        roster_deadline: Duration::from_secs(60),
+        backup: Box::new(Shelf::default()),
+        approval: Box::new(|_| true),
+    }
+}
+
+impl Member {
+    fn create(id: u16, vault: [u8; 32]) -> Self {
+        let dir = tempdir(&format!("m{id}"));
+        let codes = Arc::new(Mutex::new(Vec::new()));
+        let se = SoftwareSecureElement::persistent(&dir, "member pass").unwrap();
+        let mut signer = LocalSigner::create_with_identity(
+            &dir,
+            se,
+            Network::Regtest,
+            vault,
+            id,
+            "ws3 vault".into(),
+            prompts(codes.clone()),
+            loki_poc::setup_transport::Identity::new(id),
+        )
+        .unwrap();
+        let session = signer.connect(ORIGIN, Network::Regtest, b"ws3").unwrap().session;
+        Self {
+            id,
+            dir,
+            signer,
+            session,
+            codes,
+        }
+    }
+
+    /// The member's device restarts: reopen the signer from its data directory.
+    fn restart(&mut self) {
+        let se = SoftwareSecureElement::persistent(&self.dir, "member pass").unwrap();
+        self.signer =
+            LocalSigner::open(&self.dir, se, "ws3 vault".into(), prompts(self.codes.clone()))
+                .unwrap();
+        self.session = self
+            .signer
+            .connect(ORIGIN, Network::Regtest, b"ws3-again")
+            .unwrap()
+            .session;
+    }
+
+    fn ready(&self) -> bool {
+        self.signer.list_vaults(&self.session).unwrap()[0].ready
+    }
+}
+
+#[test]
+fn staggered_dkg_waits_past_old_window_and_reopens_saved_shares() {
+    use loki_poc::signer::coordination::drive_dkg;
+    use std::time::Instant;
+
+    let relay = MemoryRelay::default();
+    let coordinator_peer = Peer(Identity::new(0).public().encryption);
+    let mut coordinator = MemoryTransport {
+        payment: None, relay: relay.clone(), me: coordinator_peer.clone(),
+    };
+    let mut members: Vec<_> = (1..=3).map(|id| Member::create(id, [0x6b; 32])).collect();
+    let identities: Vec<_> = members.iter_mut().map(|m| {
+        let connection = m.signer.connect(ORIGIN, Network::Regtest, b"roster").unwrap();
+        m.session = connection.session;
+        connection.member
+    }).collect();
+    let peers: BTreeMap<_, _> = identities.iter().map(|p| (p.id, Peer(p.encryption))).collect();
+    coordinator.open(&peers.values().cloned().collect::<Vec<_>>(), 255).unwrap();
+    let document = serde_json::to_vec(&serde_json::json!({
+        "vault": hex::encode([0x6b; 32]), "threshold": 2, "setup_version": 2,
+        "members": identities.iter().map(|p| serde_json::json!({
+            "id": p.id, "signing": hex::encode(p.signing), "encryption": hex::encode(p.encryption),
+        })).collect::<Vec<_>>(),
+    })).unwrap();
+    let log_dir = tempdir("staggered-relay");
+    let started = Instant::now();
+    let handles: Vec<_> = members.into_iter().enumerate().map(|(index, mut m)| {
+        let (relay, peers, coordinator_peer, document, log_dir) = (
+            relay.clone(), peers.clone(), coordinator_peer.clone(), document.clone(), log_dir.clone(),
+        );
+        std::thread::spawn(move || {
+            // A real delay beyond the former 1200 * 50ms rendezvous window.
+            if index == 2 { std::thread::sleep(Duration::from_secs(180)); }
+            let vault = m.signer.dkg_begin(&m.session, &document).unwrap();
+            let transport = MemoryTransport { payment: None, relay: relay.clone(), me: peers[&m.id].clone() };
+            let coord = MemoryTransport { payment: None, relay, me: coordinator_peer.clone() };
+            let mut log = (index == 0).then(|| RelayLog::open(&log_dir, 3).unwrap());
+            drive_dkg(
+                &mut m.signer, &m.session, &vault, &transport, &(), &coordinator_peer,
+                (index == 0).then_some((&coord, &())), log.as_mut(), &peers,
+                started + Duration::from_secs(210),
+            ).unwrap_or_else(|error| panic!("member {} after {:?}: {error}", m.id, started.elapsed()));
+            assert!(m.ready());
+            let before = m.signer.hosted_metadata().unwrap().0.serialize().unwrap();
+            let address = m.signer.release_address(&m.session).unwrap().address;
+            m.restart();
+            assert!(m.ready());
+            assert_eq!(m.signer.hosted_metadata().unwrap().0.serialize().unwrap(), before);
+            assert_eq!(m.signer.release_address(&m.session).unwrap().address, address);
+            m
+        })
+    }).collect();
+    let mut members: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let addresses: Vec<_> = members.iter_mut().map(|m| m.signer.release_address(&m.session).unwrap().address).collect();
+    assert!(addresses.iter().all(|a| a == &addresses[0]));
+    let metadata: Vec<_> = members.iter().map(|m| m.signer.hosted_metadata().unwrap()).collect();
+    assert!(metadata.iter().all(|(public, fvk)| public == &metadata[0].0 && fvk.to_bytes() == metadata[0].1.to_bytes()));
+    let recipient = metadata[0].1.address_at(0u64, orchard::keys::Scope::External);
+    let rho = orchard::note::Rho::from_bytes(&[1; 32]).unwrap();
+    let note = orchard::Note::from_parts(recipient, orchard::value::NoteValue::from_raw(625_000_000), rho,
+        orchard::note::RandomSeed::from_bytes([2; 32], &rho).unwrap(), orchard::NoteVersion::V3).unwrap();
+    let mut quorum: Vec<_> = members.iter_mut().take(2).map(|m| {
+        m.signer.set_candidate_notes(vec![note]);
+        loki_poc::signer::coordination::QuorumMember {
+            id: frost::Identifier::try_from(m.id).unwrap(), session: m.session.clone(), signer: &mut m.signer,
+        }
+    }).collect();
+    let intent = loki_poc::signer::coordination::PaymentIntent {
+        recipient, amount: zcash_protocol::value::Zatoshis::const_from_u64(40_000_000),
+        memo: zcash_protocol::memo::MemoBytes::from_bytes(b"staggered DKG").unwrap(), target_height: 700, expiry_height: 1_152,
+    };
+    let candidate = CandidateRef { vault_id: [0x6b; 32], payment_id: [7; 32], attempt_id: [9; 32] };
+    loki_poc::signer::coordination::drive_to_signed_pczt(&metadata[0].0, &intent, &candidate, &mut quorum).unwrap();
+    eprintln!("staggered DKG: third member joined at +180s; all ready after {:?}; address {}", started.elapsed(), addresses[0]);
+    for m in members { std::fs::remove_dir_all(m.dir).unwrap(); }
+    std::fs::remove_dir_all(log_dir).unwrap();
+}
+
+/// Poll until `want` messages arrived (frostd is store-and-forward).
+fn recv_until<T: Transport>(t: &T, ch: &T::Channel, coordinator: bool, want: usize) -> Vec<Incoming>
+where
+    T::Error: std::fmt::Debug,
+{
+    let mut got = Vec::new();
+    for _ in 0..400 {
+        got.extend(t.recv(ch, coordinator).expect("recv"));
+        if got.len() >= want {
+            return got;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("the relay did not deliver {want} messages (got {})", got.len());
+}
+
+/// A full 2-of-3 setup and a signed candidate over `T`. `restart_coordinator` reopens the
+/// relay log mid-setup (after `lose_queues` dropped what the relay still held for the
+/// members) and redelivers from it.
+fn setup_and_sign<T>(
+    mut members_tx: Vec<(T, T::Channel)>,
+    member_peers: Vec<Peer>,
+    coordinator_peer: Peer,
+    coordinator: (T, T::Channel),
+    lose_queues: impl Fn(),
+    identities: Vec<Identity>,
+    payment_session: Uuid,
+) -> Vec<String>
+where
+    T: EncryptedTransport,
+    T::Error: std::fmt::Display + std::fmt::Debug,
+{
+    let (threshold, count, vault) = (2u16, 3u16, [0x5au8; 32]);
+    let peers: BTreeMap<u16, Peer> = (1..=count).zip(member_peers).collect();
+    let mut members: Vec<Member> = (1..=count).map(|id| Member::create(id, vault)).collect();
+    let (mut coord, coord_ch) = coordinator;
+    let log_dir = tempdir("relay-log");
+    let mut log = RelayLog::open(&log_dir, count).unwrap();
+
+    // The coordinator assembles the roster from what each signer's connect returned.
+    let roster = serde_json::json!({
+        "vault": hex::encode(vault),
+        "threshold": threshold,
+        "setup_version": 2,
+        "members": members.iter_mut().map(|m| {
+            let c = m.signer.connect(ORIGIN, Network::Regtest, b"roster").unwrap();
+            m.session = c.session;
+            serde_json::json!({
+                "id": c.member.id,
+                "signing": hex::encode(c.member.signing),
+                "encryption": hex::encode(c.member.encryption),
+            })
+        }).collect::<Vec<_>>(),
+    });
+    let document = serde_json::to_vec(&roster).unwrap();
+    let mut vault_ref: Option<VaultRef> = None;
+    for m in members.iter_mut() {
+        vault_ref = Some(m.signer.dkg_begin(&m.session, &document).unwrap());
+    }
+    let vault_ref = vault_ref.unwrap();
+    let codes: Vec<String> = members.iter().map(|m| m.codes.lock().unwrap()[0].clone()).collect();
+    assert!(codes.iter().all(|c| c == &codes[0] && c.len() == 29));
+
+    let mut backed_up = vec![false; usize::from(count)];
+    for pass in 0..12 {
+        for (m, (t, ch)) in members.iter_mut().zip(&members_tx) {
+            member_dkg_step(&mut m.signer, &m.session, &vault_ref, t, ch, &coordinator_peer).unwrap();
+            if !backed_up[usize::from(m.id - 1)] {
+                if let Ok(receipt) = m.signer.backup(&m.session) {
+                    for wire in receipt {
+                        t.send(ch, &[], &Outbound::Dkg(wire)).unwrap();
+                    }
+                    backed_up[usize::from(m.id - 1)] = true;
+                }
+            }
+        }
+        // Wait until the coordinator holds what the members just sent.
+        std::thread::sleep(Duration::from_millis(50));
+        relay_dkg(&mut log, &coord, &coord_ch, &peers).unwrap();
+        if pass == 1 {
+            // The coordinator restarts and the relay lost the queued deliveries: reopen the
+            // log and redeliver everything. A member's device restarts too.
+            lose_queues();
+            drop(log);
+            log = RelayLog::open(&log_dir, count).unwrap();
+            assert!(!log.is_empty());
+            redeliver_dkg(&log, &coord, &coord_ch, &peers).unwrap();
+            members[2].restart();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        if members.iter().all(Member::ready) {
+            break;
+        }
+    }
+    for m in &members {
+        assert!(m.ready(), "member {} must be ready after every receipt", m.id);
+    }
+    let viewing_keys: Vec<_> = members.iter().map(|m| m.signer.hosted_metadata().unwrap().1.to_bytes()).collect();
+    assert!(viewing_keys.iter().all(|fvk| *fvk == viewing_keys[0]));
+    // Active: the coordinator deletes its relay log.
+    assert!(log.active());
+    log.delete().unwrap();
+    assert!(!log_dir.join("dkg-relay.log").exists());
+
+    // Every member releases the same address; pay a note to it.
+    let addresses: Vec<String> = members
+        .iter_mut()
+        .map(|m| m.signer.release_address(&m.session).unwrap().address)
+        .collect();
+    assert!(addresses.iter().all(|a| a == &addresses[0]));
+    let recipient = loki_poc::vault::orchard_receiver_from_ua(
+        &addresses[0],
+        zcash_protocol::consensus::NetworkType::Regtest,
+    )
+    .unwrap();
+    let rho = orchard::note::Rho::from_bytes(&[1u8; 32]).unwrap();
+    let note = orchard::Note::from_parts(
+        recipient,
+        orchard::value::NoteValue::from_raw(625_000_000),
+        rho,
+        orchard::note::RandomSeed::from_bytes([2u8; 32], &rho).unwrap(),
+        orchard::NoteVersion::V3,
+    )
+    .unwrap();
+    let public = frost::keys::PublicKeyPackage::deserialize(
+        members[0].signer.public_package_bytes().unwrap(),
+    )
+    .unwrap();
+
+    // Pin the payment identities to the same relay login keys; DKG traffic stays unchanged.
+    let roster = identities.iter().map(|identity| (identity.public().id, identity.public())).collect::<BTreeMap<_, _>>();
+    coord.encrypt(PaymentEncryption::new(&identities[3], roster.clone(), &vault, &[9; 32], payment_session).unwrap());
+    for ((transport, _), identity) in members_tx.iter_mut().zip(&identities) {
+        transport.encrypt(PaymentEncryption::new(identity, roster.clone(), &vault, &[9; 32], payment_session).unwrap());
+    }
+    // ---- Signing: members 1 and 2, every message typed ----
+    let cand = CandidateRef {
+        vault_id: vault,
+        payment_id: [7; 32],
+        attempt_id: [9; 32],
+    };
+    let quorum = [0usize, 1];
+    let id_of = |peer: &Peer| *peers.iter().find(|(_, p)| *p == peer).unwrap().0;
+    for &i in &quorum {
+        let m = &mut members[i];
+        m.signer.set_candidate_notes(vec![note]);
+        let commitments = m.signer.sign_commit(&m.session, &cand).unwrap();
+        let (t, ch) = &members_tx[i];
+        t.send(ch, &[], &Outbound::Commitments(vec![commitments])).unwrap();
+    }
+    let commitments: BTreeMap<frost::Identifier, frost::round1::SigningCommitments> =
+        recv_until(&coord, &coord_ch, true, 2)
+            .into_iter()
+            .map(|m| {
+                (
+                    frost::Identifier::try_from(id_of(&m.from)).unwrap(),
+                    frost::round1::SigningCommitments::deserialize(single(&m.message)).unwrap(),
+                )
+            })
+            .collect();
+    let (params, seed) = frost_rerandomized::RandomizedParams::new_from_commitments(
+        public.verifying_key(),
+        &commitments,
+        rand_core::OsRng,
+    )
+    .unwrap();
+    let alpha: [u8; 32] = params.randomizer().serialize().as_slice().try_into().unwrap();
+    let intent = PublicPaymentParams {
+        recipient,
+        amount: zcash_protocol::value::Zatoshis::const_from_u64(40_000_000),
+        memo: zcash_protocol::memo::MemoBytes::from_bytes(b"ws3").unwrap(),
+        target_height: 700,
+        expiry_height: 1_152,
+    };
+    // The proposer's app answers the build request with the signer's candidate.
+    let candidate = members[0]
+        .signer
+        .build_candidate(&members[0].session, &cand, &intent, &[alpha])
+        .unwrap();
+    let sighash = pczt::roles::signer::Signer::new(pczt::Pczt::parse(candidate.as_bytes()).unwrap())
+        .unwrap()
+        .shielded_sighash();
+    let package = frost::SigningPackage::new(commitments, &sighash);
+    let seed: [u8; 32] = seed.as_slice().try_into().unwrap();
+    for &i in &quorum {
+        let to = [peers[&members[i].id].clone()];
+        coord.send(&coord_ch, &to, &Outbound::Candidate(candidate.clone())).unwrap();
+        coord.send(&coord_ch, &to, &Outbound::Package(vec![package.clone()])).unwrap();
+        coord.send(&coord_ch, &to, &Outbound::RandomizerSeed(vec![seed])).unwrap();
+    }
+    for &i in &quorum {
+        let (t, ch) = &members_tx[i];
+        let got = recv_until(t, ch, false, 3);
+        let package = frost::SigningPackage::deserialize(single(&got[1].message)).unwrap();
+        let seed: [u8; 32] = single(&got[2].message).try_into().unwrap();
+        let m = &mut members[i];
+        let share = m
+            .signer
+            .sign_approve(&m.session, &cand, &got[0].message, &package, &seed)
+            .unwrap();
+        t.send(ch, &[], &Outbound::Share(vec![share])).unwrap();
+    }
+    let shares: BTreeMap<_, _> = recv_until(&coord, &coord_ch, true, 2)
+        .into_iter()
+        .map(|m| {
+            (
+                frost::Identifier::try_from(id_of(&m.from)).unwrap(),
+                frost::round2::SignatureShare::deserialize(single(&m.message)).unwrap(),
+            )
+        })
+        .collect();
+    let signature = frost_rerandomized::aggregate(&package, &shares, &public, &params).unwrap();
+    params
+        .randomized_verifying_key()
+        .verify(&sighash, &signature)
+        .expect("the 2-of-3 signature verifies under the randomized group key");
+    coord.close(coord_ch).ok();
+    addresses
+}
+
+/// What crossed the relay: every setup message is a well-formed wire, every round-two
+/// message is a v2 envelope, and none decodes as a plaintext round-two package.
+fn audit(tape: &[Vec<u8>]) {
+    let mut round2 = 0;
+    let mut setup = 0;
+    for payload in tape {
+        let Some(kind) = wire_kind(payload) else { continue };
+        setup += 1;
+        if kind == DkgWireKind::Round2 {
+            round2 += 1;
+            assert_eq!(&payload[..8], b"LOKIDKG2", "round two crossed outside a v2 envelope");
+            assert!(
+                frost::keys::dkg::round2::Package::deserialize(payload).is_err(),
+                "a plaintext round-two package crossed the relay"
+            );
+        }
+    }
+    // Six round-two envelopes, each sent once by its member and once by the coordinator.
+    assert!(round2 >= 12, "round two crossed the relay ({round2} envelopes)");
+    assert!(setup > round2);
+}
+
+#[test]
+fn new_signer_setup_and_signing_over_an_in_memory_relay() {
+    let relay = MemoryRelay::default();
+    let login: Vec<FrostdLoginKey> = (0..4).map(|_| FrostdLoginKey::generate()).collect();
+    let identities = login.iter().enumerate().map(|(i, login)| payment_identity(if i == 3 { 0 } else { i as u16 + 1 }, login)).collect();
+    let mut coordinator = MemoryTransport {
+        payment: None,
+        relay: relay.clone(),
+        me: login[3].peer(),
+    };
+    let member_peers: Vec<Peer> = login[..3].iter().map(FrostdLoginKey::peer).collect();
+    coordinator.open(&member_peers, 255).unwrap();
+    let members: Vec<(MemoryTransport, ())> = member_peers
+        .iter()
+        .map(|peer| {
+            (
+                MemoryTransport {
+                    payment: None,
+                    relay: relay.clone(),
+                    me: peer.clone(),
+                },
+                (),
+            )
+        })
+        .collect();
+    let lose = relay.clone();
+    setup_and_sign(members, member_peers, login[3].peer(), (coordinator, ()), move || {
+        lose.drop_member_queues()
+    }, identities, Uuid::new_v4());
+    audit(&relay.tape());
+}
+
+#[test]
+fn new_signer_setup_and_signing_over_real_frostd() {
+    let url = match std::env::var("FROSTD_URL") {
+        Ok(u) => u,
+        Err(_) => {
+            eprintln!(
+                "[WS3] FROSTD_URL unset — skipping live relay test.\n\
+                 Start one: frostd --no-tls-very-insecure -p 2744\n\
+                 Then:      FROSTD_URL=http://127.0.0.1:2744 cargo test --test frostd_transport -- --nocapture"
+            );
+            return;
+        }
+    };
+    let login: Vec<FrostdLoginKey> = (0..4).map(|_| FrostdLoginKey::generate()).collect();
+    let identities = login.iter().enumerate().map(|(i, login)| payment_identity(if i == 3 { 0 } else { i as u16 + 1 }, login)).collect();
+    let member_peers: Vec<Peer> = login[..3].iter().map(FrostdLoginKey::peer).collect();
+    let coordinator_peer = login[3].peer();
+    let mut login = login.into_iter();
+    let members: Vec<FrostdTransport> = (0..3)
+        .map(|_| FrostdTransport::new(&url, login.next().unwrap()).expect("member login"))
+        .collect();
+    let mut coordinator =
+        FrostdTransport::new(&url, login.next().unwrap()).expect("coordinator login");
+    let channel = coordinator.open(&member_peers, 255).expect("create_new_session");
+    let session = channel.session_id();
+    let members: Vec<_> = members
+        .into_iter()
+        .map(|mut t| {
+            let ch = t.join(session).expect("join");
+            (t, ch)
+        })
+        .collect();
+    // frostd keeps queued messages across a coordinator restart, so nothing is lost.
+    let addresses = setup_and_sign(
+        members,
+        member_peers,
+        coordinator_peer,
+        (coordinator, channel),
+        || {}, identities, session,
+    );
+    eprintln!("[WS3] v2 DKG and 2-of-3 signing over frostd at {url}: vault {}", addresses[0]);
+}

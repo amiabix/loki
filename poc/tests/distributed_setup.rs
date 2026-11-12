@@ -64,11 +64,12 @@ fn a_changed_round_one_package_changes_the_transcript() {
 }
 
 #[test]
-fn four_members_certify_one_two_of_four_group_key() {
+fn four_members_certify_one_group_key_at_each_supported_threshold() {
+    for threshold in [2, 3] {
     let mut members = BTreeMap::new();
     let mut round1 = BTreeMap::new();
     for id in 1u16..=4 {
-        let (member, message) = Member::start_with_policy(id, 2, 4).unwrap();
+        let (member, message) = Member::start_with_policy(id, threshold, 4).unwrap();
         members.insert(id, member);
         round1.insert(id, message);
     }
@@ -97,5 +98,12 @@ fn four_members_certify_one_two_of_four_group_key() {
         .collect();
     assert_eq!(keys.len(), 4);
     assert!(keys.windows(2).all(|pair| pair[0] == pair[1]));
-    assert!(Member::start_with_policy(1, 3, 4).is_err());
+    }
+    // General t-of-n: threshold may equal the roster size.
+    assert!(Member::start_with_policy(1, 3, 3).is_ok());
+    assert!(Member::start_with_policy(1, 4, 4).is_ok());
+    // Degenerate shapes are still refused.
+    assert!(Member::start_with_policy(1, 0, 3).is_err());
+    assert!(Member::start_with_policy(1, 4, 3).is_err());
+    assert!(Member::start_with_policy(5, 2, 4).is_err());
 }

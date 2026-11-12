@@ -15,6 +15,7 @@ use zeroize::Zeroizing;
 const PASS: &str = " synthetic setup pass ";
 static CERTIFIED: OnceLock<PathBuf> = OnceLock::new();
 static CERTIFIED_POLICY: OnceLock<PathBuf> = OnceLock::new();
+static CERTIFIED_FOUR: OnceLock<PathBuf> = OnceLock::new();
 fn private(path: &Path, directory: bool) {
     #[cfg(unix)]
     {
@@ -40,13 +41,17 @@ fn certified_setup() -> &'static PathBuf {
     certified_setup_with_policy(false)
 }
 fn certified_setup_with_policy(policy: bool) -> &'static PathBuf {
-    (if policy { &CERTIFIED_POLICY } else { &CERTIFIED }).get_or_init(|| {
+    certified_setup_with_count(policy, 3)
+}
+fn certified_setup_with_count(policy: bool, count: u16) -> &'static PathBuf {
+    assert!(count == 3 || (count == 4 && policy));
+    (if count == 4 { &CERTIFIED_FOUR } else if policy { &CERTIFIED_POLICY } else { &CERTIFIED }).get_or_init(|| {
         let root = scratch();
         let exchange = root.join("exchange");
         fs::create_dir(&exchange).unwrap();
         let exe = env!("CARGO_BIN_EXE_loki_setup_member");
         let mut public = Vec::new();
-        for id in 1..=3 {
+        for id in 1..=count {
             let member = root.join(format!("member-{id}"));
             fs::create_dir(&member).unwrap();
             private(&member, true);
@@ -83,7 +88,7 @@ fn certified_setup_with_policy(policy: bool) -> &'static PathBuf {
         assert!(out.status.success());
         let fp = String::from_utf8(out.stdout).unwrap();
         let mut children = Vec::new();
-        for id in 1..=3 {
+        for id in 1..=count {
             let member = root.join(format!("member-{id}"));
             children.push(
                 Command::new(exe)
@@ -121,11 +126,65 @@ fn certified_setup_with_policy(policy: bool) -> &'static PathBuf {
     })
 }
 #[test]
+fn communication_cli_readiness_accepts_all_three_peers_in_four_member_vault() {
+    let base = certified_setup_with_count(true, 4);
+    let members: Vec<_> = (1..=4)
+        .map(|id| {
+            let root = base.join(format!("member-{id}"));
+            load(&root, &root.join("pass"), &base.join("roster.json")).unwrap()
+        })
+        .collect();
+    let root = base.join("member-1").canonicalize().unwrap();
+    let mut config = config_owner(&members[0]);
+    for peer in &members[1..] {
+        let wire = loki_relay_client::seal_descriptor(
+            &peer.identity, &peer.roster, &config_descriptor(peer, 1),
+            &members[0].identity.public(),
+        ).unwrap().wire;
+        config.import(&members[0], &wire).unwrap();
+    }
+    let mut db = loki_relay_client::ClientStore::open(&root.join("transport"), &members[0].roster, 1).unwrap();
+    let store = loki_poc::relay_member::ConfigStore::open(&root, &root.join("pass")).unwrap();
+    store.save_revision(&mut db, &members[0], 1, &config).unwrap();
+    drop(db);
+    let result = member_cli(&[
+        member_arg("readiness"), member_arg("--member-root"), member_arg(&root),
+        member_arg("--passphrase-file"), member_arg(root.join("pass")),
+        member_arg("--roster"), member_arg(base.join("roster.json")),
+    ]);
+    assert_eq!(result.status.code(), Some(0), "{}", member_stderr(&result));
+    let output = member_stdout(&result);
+    assert!(output.contains("inboxes=3 peers=3"), "{output}");
+    assert!(output.contains("routable=1"), "{output}");
+}
+
+#[test]
 fn certified_threshold_two_roster_loads_for_relay() {
     let base = certified_setup_with_policy(true);
     let member = base.join("member-2");
     assert_eq!(load(&member, &member.join("pass"), &base.join("roster.json"))
         .unwrap().identity.public().id, 2);
+}
+
+#[test]
+fn relay_loads_testnet_roster_and_binds_birth_height() {
+    let f = Fixture::with_policy(true);
+    let mut roster: Value = serde_json::from_slice(&fs::read(&f.roster).unwrap()).unwrap();
+    roster["network"] = Value::from("testnet");
+    roster["birth_height"] = Value::from(4_500_000);
+    let bytes = serde_json::to_vec(&roster).unwrap();
+    fs::write(&f.roster, &bytes).unwrap();
+    let fingerprint = loki_poc::member_state::Roster::from_bytes(&bytes).unwrap().fingerprint();
+    let mut state = f.state();
+    state["network"] = Value::from("testnet");
+    state["birth_height"] = Value::from(4_500_000);
+    state["roster_fingerprint"] = Value::from(hex::encode(fingerprint));
+    f.seal(&state);
+    assert!(f.loaded().is_ok());
+
+    state["birth_height"] = Value::from(4_500_001);
+    f.seal(&state);
+    refuses(&f, "member_roster");
 }
 struct Fixture {
     root: PathBuf,
@@ -483,6 +542,8 @@ fn config_members() -> Vec<loki_poc::relay_member::LoadedMember> {
         .map(|identity| loki_poc::relay_member::LoadedMember {
             identity,
             roster: roster.clone(),
+            threshold: 2,
+            network: loki_poc::network::VaultNetwork::Regtest,
         })
         .collect()
 }
@@ -546,6 +607,8 @@ fn sealed_revision_codec_authenticated_association() {
     let wrong = loki_poc::relay_member::LoadedMember {
         identity,
         roster: wrong_roster,
+        threshold: 2,
+        network: loki_poc::network::VaultNetwork::Regtest,
     };
     assert!(restored.authenticated(&wrong).is_err());
 }
@@ -1221,6 +1284,32 @@ fn owner_provision_random_pending_full_commit_and_exact_reopen() {
         bytes.as_slice()
     );
     assert!(f.store.routing(&f.db, &f.members[0]).is_err());
+}
+
+#[test]
+fn owner_cannot_reprovision_with_persisted_signing_nonces() {
+    let mut f = ConfigFixture::new();
+    f.store
+        .prepare_provision(&mut f.db, &f.members[0], &provision_targets())
+        .unwrap();
+    // Simulate losing transport state while the member's signing state survives.
+    fs::rename(f.root.join("transport"), f.root.join("lost-transport")).unwrap();
+    f.db = loki_relay_client::ClientStore::open(&f.root.join("transport"), &f.members[0].roster, 1)
+        .unwrap();
+    assert!(f.db.config_reference().unwrap().is_none());
+    assert!(f.store.load(&f.db, &f.members[0]).unwrap().is_none());
+    let attempt = f
+        .root
+        .join("signing")
+        .join("a".repeat(64))
+        .join("b".repeat(64));
+    fs::create_dir_all(&attempt).unwrap();
+    fs::write(attempt.join("nonces.sealed"), b"unfinished signing attempt").unwrap();
+    assert!(f
+        .store
+        .prepare_provision(&mut f.db, &f.members[0], &provision_targets())
+        .is_err());
+    assert!(f.db.config_reference().unwrap().is_none());
 }
 
 fn provision_targets() -> Vec<loki_poc::relay_member::ProvisionTarget> {
@@ -3235,6 +3324,17 @@ fn communication_cli_status_public_fields_only() {
 }
 
 #[test]
+fn communication_cli_readiness_without_config_reports_no_routes() {
+    let f = RetainedFixture::new();
+    let mut args = vec![member_arg("readiness")];
+    args.extend(common_member_args(&f));
+    let result = member_cli(&args);
+    assert_eq!(result.status.code(), Some(0));
+    assert_eq!(member_stdout(&result), "inboxes=0 peers=0 live=0 routable=0\n");
+    assert_fixture_secrets_absent(&f, result.stdout.as_slice());
+}
+
+#[test]
 fn communication_cli_missing_referenced_sealed_config_fails_closed() {
     let f = RetainedFixture::new();
     let member = f.loaded().unwrap();
@@ -3297,4 +3397,15 @@ fn communication_cli_missing_referenced_sealed_config_fails_closed() {
     assert_eq!(db.config_reference().unwrap().as_ref(), Some(&reference));
     let retained_bytes = fs::read(&retained).unwrap();
     assert!(retained_bytes == original, "original seal retained");
+}
+
+#[test]
+fn certified_four_member_roster_loads_each_owned_member() {
+    let base=certified_setup_with_count(true,4);
+    for id in 1..=4 {
+        let member=base.join(format!("member-{id}"));
+        let loaded=load(&member,&member.join("pass"),&base.join("roster.json")).unwrap();
+        assert_eq!(loaded.identity.public().id,id);
+        assert_eq!(loaded.roster.members.iter().map(|m|m.id).collect::<Vec<_>>(),vec![1,2,3,4]);
+    }
 }
