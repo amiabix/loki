@@ -1,5 +1,5 @@
-//! Separate-member DKG ceremony on regtest. The exchange directory is an untrusted courier.
-//! This ZIP 2005 implementation has not been independently reviewed; regtest only.
+//! Separate-member DKG ceremony. The exchange directory is an untrusted courier.
+//! This ZIP 2005 implementation has not been independently reviewed.
 
 use std::{
     collections::BTreeMap,
@@ -13,11 +13,12 @@ use std::{
 use bip39::{Language, Mnemonic};
 use blake2b_simd::Params;
 use loki_poc::{
-    distributed_setup::Member, member_state::Roster, setup_transport::Identity, state::MemberDir,
-    vault, zip2005,
+    distributed_setup::Member, member_state::Roster, network::VaultNetwork, rpc::Rpc,
+    setup_transport::Identity, state::MemberDir, vault, zip2005,
 };
 use rand_core::{OsRng, RngCore};
 use reddsa_frost::frost::redpallas as frost;
+use zcash_protocol::consensus::Parameters;
 use zeroize::Zeroize;
 
 fn hex32(text: &str) -> Result<[u8; 32], String> {
@@ -27,7 +28,15 @@ fn hex32(text: &str) -> Result<[u8; 32], String> {
         .map_err(|_| "expected 32 bytes".into())
 }
 
+/// Reads the member passphrase and keys the KDF session cache with it.
 fn passphrase(path: &Path) -> Result<String, String> {
+    let pass = secret_file(path)?;
+    loki_poc::seal_kdf::enable_session_cache(&pass);
+    Ok(pass)
+}
+
+/// Reads an owner-only secret file without touching the KDF session cache.
+fn secret_file(path: &Path) -> Result<String, String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -132,8 +141,8 @@ fn identity(args: &[String]) -> Result<(), String> {
         return Err("identity already exists".into());
     }
     let id: u16 = args[1].parse().map_err(|_| "invalid member id")?;
-    if !(1..=4).contains(&id) {
-        return Err("member id must be 1, 2, 3 or 4".into());
+    if !(1..=loki_poc::member_state::MAX_MEMBERS).contains(&id) {
+        return Err("member id must be 1 to 16".into());
     }
     let secret = Identity::new(id);
     dir.write_sealed(
@@ -225,13 +234,15 @@ fn sealed_state(root: &Path, pass_file: &Path) -> Result<Vec<u8>, String> {
 }
 
 fn state_address(state: &serde_json::Value) -> Result<String, String> {
-    if state.get("version").and_then(|v| v.as_u64()) != Some(2)
-        || state.get("network").and_then(|v| v.as_str()) != Some("regtest")
-    {
+    if state.get("version").and_then(|v| v.as_u64()) != Some(2) {
         return Err("unsupported vault state version or network".into());
     }
+    let network = VaultNetwork::parse(state["network"].as_str().ok_or("missing vault network")?)?;
+    if network == VaultNetwork::Testnet && state["birth_height"].as_u64().is_none() {
+        return Err("Testnet vault state has no birth height".into());
+    }
     if state.get("key_derivation").and_then(|v| v.as_str()) != Some(zip2005::VERSION) {
-        return Err("unsupported key derivation; recreate this regtest vault".into());
+        return Err("unsupported key derivation; recreate this vault".into());
     }
     let ak = hex32(state["group_ak"].as_str().ok_or("missing group key")?)?;
     let sk = hex32(
@@ -241,7 +252,7 @@ fn state_address(state: &serde_json::Value) -> Result<String, String> {
     )?;
     let fvk = zip2005::frost_viewing_key(&ak, &sk)
         .map_err(|e| format!("ZIP 2005 key derivation: {e:?}"))?;
-    let expected = vault::regtest_unified_address(&fvk);
+    let expected = vault::unified_address(&fvk, network.network_type());
     if state["address"].as_str() != Some(&expected) {
         return Err("stored address differs from the derived vault address".into());
     }
@@ -271,7 +282,11 @@ fn state_address(state: &serde_json::Value) -> Result<String, String> {
     let key = frost::keys::KeyPackage::deserialize(&key_bytes)
         .map_err(|e| format!("invalid member share: {e}"))?;
     let (threshold, members) = state_policy(state)?;
-    if !matches!((threshold, members), (2, 3) | (2, 4)) {
+    if !u16::try_from(threshold)
+        .ok()
+        .zip(usize::try_from(members).ok())
+        .is_some_and(|(t, n)| loki_poc::member_state::valid_policy(t, n))
+    {
         return Err("unsupported vault policy".into());
     }
     let id = frost::Identifier::try_from(state_identity(state)?.public().id)
@@ -357,6 +372,8 @@ fn checked_roster(state: &serde_json::Value, path: &Path) -> Result<Roster, Stri
 fn check_roster(state: &serde_json::Value, roster: &Roster) -> Result<(), String> {
     let (threshold, members) = state_policy(state)?;
     if hex::encode(roster.vault) != state["vault"]
+        || state["network"] != roster.network.label()
+        || state.get("birth_height").and_then(|v| v.as_u64()) != roster.birth_height.map(u64::from)
         || hex::encode(roster.fingerprint()) != state["roster_fingerprint"]
         || u64::from(roster.threshold) != threshold
         || roster.members.len() as u64 != members
@@ -395,7 +412,7 @@ fn checked_receipts(
 }
 
 fn words(path: &Path) -> Result<String, String> {
-    let entered = passphrase(path)?;
+    let entered = secret_file(path)?;
     let mnemonic = Mnemonic::parse_in(Language::English, &entered)
         .map_err(|e| format!("invalid backup words: {e}"))?;
     if mnemonic.word_count() != 24 {
@@ -501,6 +518,44 @@ fn backup_verify(args: &[String]) -> Result<(), String> {
         &receipt,
     )?;
     eprintln!("Backup checked; address appears after every member checks theirs");
+    Ok(())
+}
+
+fn backup_report(args: &[String]) -> Result<(), String> {
+    if args.len() != 3 {
+        return Err("backup-report <member-dir> <passphrase-file> <roster.json>".into());
+    }
+    let member_dir = Path::new(&args[0]);
+    if !member_dir.join("final-backup-checked").is_file()
+        || !member_dir.join("final-card/vault.card").is_file()
+    {
+        return Err("Check your final backup card before reporting its status".into());
+    }
+    let state: serde_json::Value =
+        serde_json::from_slice(&sealed_state(Path::new(&args[0]), Path::new(&args[1]))?)
+            .map_err(|e| e.to_string())?;
+    let roster = checked_roster(&state, Path::new(&args[2]))?;
+    println!(
+        "{}",
+        hex::encode(state_identity(&state)?.sign_final_status(&roster.vault)?)
+    );
+    Ok(())
+}
+
+fn backup_reports(args: &[String]) -> Result<(), String> {
+    if args.len() != 2 {
+        return Err("backup-reports <roster.json> <exchange-dir>".into());
+    }
+    let roster = Roster::load(Path::new(&args[0]))?;
+    let reports: Vec<_> = roster.members.values().map(|peer| {
+        let path = Path::new(&args[1]).join(name(&roster.vault, "final-status", peer.id, None));
+        let present = path.exists();
+        let reported = present && fs::read(&path)
+            .map(|wire| Identity::verify_final_status(peer, &roster.vault, &wire).is_ok())
+            .unwrap_or(false);
+        serde_json::json!({"slot": peer.id, "reported": reported, "invalid": present && !reported})
+    }).collect();
+    println!("{}", serde_json::json!(reports));
     Ok(())
 }
 
@@ -766,6 +821,15 @@ fn run(args: &[String]) -> Result<(), String> {
             .map_err(|e| e.to_string())?,
     )?;
     let roster = Roster::load(Path::new(&args[2]))?;
+    if roster.network == VaultNetwork::Testnet {
+        let tip = Rpc::testnet()?
+            .json("getblockcount", "[]")?
+            .as_u64()
+            .ok_or("Testnet node did not report a height")?;
+        if u64::from(roster.birth_height.ok_or("missing birth height")?) > tip + 1 {
+            return Err("Testnet birth height is ahead of the node".into());
+        }
+    }
     if hex::encode(roster.fingerprint()) != args[4] {
         return Err("roster fingerprint differs from the one compared by members".into());
     }
@@ -873,11 +937,12 @@ fn run(args: &[String]) -> Result<(), String> {
     let fvk = zip2005::frost_viewing_key(&certified.group_ak, &vs)
         .map_err(|e| format!("ZIP 2005 key derivation: {e:?}"))?;
     let pass = passphrase(Path::new(&args[1]))?;
-    let address = vault::regtest_unified_address(&fvk);
+    let address = vault::unified_address(&fvk, roster.network.network_type());
     let state = serde_json::to_vec(&serde_json::json!({
         "version": 2,
         "backup_version": 2,
-        "network": "regtest",
+        "network": roster.network.label(),
+        "birth_height": roster.birth_height,
         "key_derivation": zip2005::VERSION,
         "vault": hex::encode(roster.vault),
         "threshold": roster.threshold,
@@ -894,30 +959,63 @@ fn run(args: &[String]) -> Result<(), String> {
     dir.write_sealed("vault.sealed", &state, &pass)
         .map_err(|e| e.to_string())?;
     eprintln!(
-        "REGTEST ONLY: key derivation and backup card await review. Save and verify each member's backup before the address is shown."
+        "RESEARCH WALLET: key derivation and backup card await review. Save and verify each member's backup before the address is shown."
     );
     Ok(())
+}
+
+fn hosted(command: &str, args: &[String]) -> Result<(), String> {
+    #[cfg(feature = "relay-communication")]
+    {
+        if command.starts_with("setup-backup-") {
+            match loki_poc::setup_relay::backup_command(command, args)? {
+                loki_poc::setup_relay::BackupCommandOutput::Words(words) => {
+                    println!("{}", words.as_str())
+                }
+                loki_poc::setup_relay::BackupCommandOutput::Public(status) => println!("{status}"),
+            }
+        } else {
+            let status = loki_poc::setup_relay::command(command, args)?;
+            println!("{status}");
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "relay-communication"))]
+    {
+        let _ = (command, args);
+        Err("setup_transport_unavailable".into())
+    }
 }
 
 fn main() {
     let args: Vec<_> = env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
+        Some(command @ ("setup-config-check" | "setup-create" | "setup-join" | "setup-step" | "setup-abort" | "setup-agree" | "setup-fingerprint" | "setup-info" | "setup-evidence" | "setup-status" | "setup-invite" | "setup-backup-create" | "setup-backup-verify" | "setup-backup-finalize")) => hosted(command, &args[1..]),
         Some("identity") => identity(&args[1..]),
         Some("identity-public") => identity_public(&args[1..]),
         Some("profile-create") => profile_create(&args[1..]),
         Some("profile-open") => profile_open(&args[1..]),
+        Some("testnet-status") if args.len() == 1 => (|| {
+            let rpc = Rpc::testnet()?;
+            let height = rpc.json("getblockcount", "[]")?.as_u64().ok_or("Testnet height missing")?;
+            println!("{}", serde_json::json!({"network": "testnet", "height": height}));
+            Ok(())
+        })(),
         Some("address") => address(&args[1..]),
         Some("validate-roster") => validate_roster(&args[1..]),
         Some("backup-create") => backup_create(&args[1..]),
         Some("backup-verify") => backup_verify(&args[1..]),
         Some("backup-finalize") => backup_finalize(&args[1..]),
+        Some("backup-report") => backup_report(&args[1..]),
+        Some("backup-reports") => backup_reports(&args[1..]),
         Some("restore") => restore(&args[1..]),
         Some("fingerprint") if args.len() == 2 => {
             Roster::load(Path::new(&args[1])).map(|r| println!("{}", hex::encode(r.fingerprint())))
         }
         Some("run") => run(&args[1..]),
-        _ => Err("usage: loki_setup_member profile-create|profile-open|identity|identity-public|fingerprint|run|backup-create|backup-verify|backup-finalize|address|validate-roster|restore ...".into()),
+        _ => Err("usage: loki_setup_member profile-create|profile-open|identity|identity-public|fingerprint|run|backup-create|backup-verify|backup-finalize|backup-report|backup-reports|address|validate-roster|restore ...".into()),
     };
+    loki_poc::seal_kdf::report();
     if let Err(error) = result {
         eprintln!("error: {error}");
         process::exit(1);

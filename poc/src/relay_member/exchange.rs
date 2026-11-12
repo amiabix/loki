@@ -63,7 +63,7 @@ impl CourierFile {
             digest: *descriptor.digest(),
         })
     }
-    pub(super) fn peer(&self) -> u16 {
+    pub(crate) fn peer(&self) -> u16 {
         self.peer
     }
     pub(super) fn digest(&self) -> &[u8; 32] {
@@ -124,7 +124,7 @@ impl CourierImport {
         &self.wire
     }
 }
-pub(super) fn atomic_publish(directory: &Path, name: &str, bytes: &[u8]) -> MemberResult<()> {
+pub(crate) fn atomic_publish(directory: &Path, name: &str, bytes: &[u8]) -> MemberResult<()> {
     let path = directory.join(name);
     match fs::symlink_metadata(&path) {
         Ok(_) => {
@@ -163,6 +163,8 @@ pub(super) fn atomic_publish(directory: &Path, name: &str, bytes: &[u8]) -> Memb
     }
     sync(&File::open(&path).map_err(|_| MemberError::Io)?, 1)?;
     sync(&File::open(directory).map_err(|_| MemberError::Io)?, 2)?;
+    fs::remove_file(&temp).map_err(|_| MemberError::Io)?;
+    sync(&File::open(directory).map_err(|_| MemberError::Io)?, 2)?;
     Ok(())
 }
 
@@ -193,6 +195,16 @@ mod tests {
         .unwrap()
         .path()
         .to_owned()
+    }
+    #[test]
+    fn successful_courier_publish_leaves_only_the_named_file() {
+        let directory = directory();
+        atomic_publish(&directory, "courier.bin", b"synthetic").unwrap();
+        let names: Vec<_> = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["courier.bin"]);
     }
     #[test]
     fn sealed_revision_courier_file_sync_failure_prevents_link() {

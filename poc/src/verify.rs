@@ -10,6 +10,8 @@ use orchard::{
     note::{ExtractedNoteCommitment, Rho},
     Note,
 };
+use zcash_note_encryption::Domain;
+use zcash_primitives::transaction::fees::zip317::{GRACE_ACTIONS, MARGINAL_FEE};
 use zcash_protocol::memo::MemoBytes;
 
 /// What the signer requires of a candidate, derived from the intent and the vault key.
@@ -104,7 +106,7 @@ impl std::fmt::Display for Refusal {
 ///
 /// An action's output rho is the nullifier of the note that action spends. Returns the
 /// reconstructed note, or a refusal naming the missing or inconsistent part.
-fn open_output(
+pub(crate) fn open_output(
     action: &orchard::pczt::Action,
     label: &str,
 ) -> Result<(Note, [u8; 43], u64), Refusal> {
@@ -150,8 +152,8 @@ fn open_output(
 /// `enc_ciphertext` is a deterministic function of the note and its memo: the ephemeral
 /// secret is derived from the note's rseed, so there is no randomness left to differ.
 /// Re-encrypting with the expected memo and comparing bytes therefore binds the memo, the
-/// openings and the ciphertext together. A proposer cannot swap the memo without the
-/// ciphertext changing.
+/// openings and the ciphertext together. The transmitted ephemeral key must also match
+/// the derived key, otherwise the recipient cannot decrypt that ciphertext.
 fn check_memo(
     action: &orchard::pczt::Action,
     note: &Note,
@@ -164,6 +166,13 @@ fn check_memo(
         *expected.as_array(),
     );
 
+    if orchard::note_encryption::IronwoodDomain::epk_bytes(enc.epk()).0
+        != action.output().encrypted_note().epk_bytes
+    {
+        return Err(Refusal::OpeningsDoNotMatchCommitment(format!(
+            "{label}: ephemeral key differs from the reconstructed note"
+        )));
+    }
     let recomputed = enc.encrypt_note_plaintext();
     let actual: &[u8] = &action.output().encrypted_note().enc_ciphertext;
 
@@ -171,6 +180,22 @@ fn check_memo(
         return Err(Refusal::MemoDiffers(format!(
             "{label}: re-encrypting with the intended memo does not reproduce enc_ciphertext"
         )));
+    }
+    Ok(())
+}
+
+/// Both signing entry points accept only v6 transactions containing Ironwood.
+pub(crate) fn check_pools_and_version(pczt: &pczt::Pczt) -> Result<(), Refusal> {
+    if *pczt.global().tx_version() != 6 {
+        return Err(Refusal::WrongNetworkOrVersion("expected transaction version 6".into()));
+    }
+    if !pczt.orchard().actions().is_empty()
+        || !pczt.transparent().inputs().is_empty()
+        || !pczt.transparent().outputs().is_empty()
+        || !pczt.sapling().spends().is_empty()
+        || !pczt.sapling().outputs().is_empty()
+    {
+        return Err(Refusal::ExtraOutputOrPool("candidate contains another pool".into()));
     }
     Ok(())
 }
@@ -229,9 +254,13 @@ pub fn check_candidate(
     let want_memo =
         MemoBytes::from_bytes(&want.memo).map_err(|e| Refusal::MemoDiffers(format!("{e:?}")))?;
     let empty_memo = MemoBytes::empty();
+    // The builder pads a bundle with one output per spend beyond the two real outputs:
+    // zero value, to a random address, with an all-zero memo.
+    let padding_memo = MemoBytes::from_bytes(&[0; 512]).expect("512 bytes is a valid memo");
 
     let mut payments = 0usize;
     let mut changes = 0usize;
+    let mut padding = 0usize;
     let mut total_out: u64 = 0;
 
     for (i, action) in bundle.actions().iter().enumerate() {
@@ -263,6 +292,8 @@ pub fn check_candidate(
             // Change carries no memo; proving that binds it as tightly as the payment.
             check_memo(action, &note, &empty_memo, &label)?;
             changes += 1;
+        } else if value == 0 && check_memo(action, &note, &padding_memo, &label).is_ok() {
+            padding += 1;
         } else if value != 0 {
             return Err(Refusal::ExtraOutputOrPool(format!(
                 "{label}: {value} zat to an address the intent does not name"
@@ -281,6 +312,12 @@ pub fn check_candidate(
             "expected exactly one payment, found {payments}"
         )));
     }
+    if padding > want.input_nullifiers.len().saturating_sub(2) {
+        return Err(Refusal::ExtraOutputOrPool(format!(
+            "{padding} padding outputs for {} inputs",
+            want.input_nullifiers.len()
+        )));
+    }
     if changes != 1 {
         return Err(Refusal::ChangeAddressDiffers {
             expected: hex::encode(change_address),
@@ -297,6 +334,14 @@ pub fn check_candidate(
         return Err(Refusal::FeeDiffers {
             expected: want.fee_zat,
             found: implied_fee,
+        });
+    }
+    // The fee must be the conventional ZIP 317 fee for the action count, never more.
+    let zip317_fee = u64::from(MARGINAL_FEE) * bundle.actions().len().max(GRACE_ACTIONS) as u64;
+    if want.fee_zat != zip317_fee {
+        return Err(Refusal::FeeDiffers {
+            expected: zip317_fee,
+            found: want.fee_zat,
         });
     }
 
@@ -326,6 +371,11 @@ mod tests {
 
     /// One honest candidate, built the way `propose` builds them.
     fn fixture() -> Fixture {
+        fixture_with(1)
+    }
+
+    /// An honest candidate spending `spends` notes that split `SPEND_VALUE` between them.
+    fn fixture_with(spends: u8) -> Fixture {
         let rng = rand_core::OsRng;
         let (_shares, pubkeys) =
             frost::keys::generate_with_dealer(3, 2, frost::keys::IdentifierList::Default, rng)
@@ -338,23 +388,28 @@ mod tests {
             .unwrap();
         let fvk = zip2005::frost_viewing_key(&ak, &[42u8; 32]).unwrap();
 
-        let rho = Rho::from_bytes(&[1u8; 32]).unwrap();
-        let rseed = RandomSeed::from_bytes([2u8; 32], &rho).unwrap();
-        let note = Note::from_parts(
-            fvk.address_at(0u64, Scope::External),
-            NoteValue::from_raw(SPEND_VALUE),
-            rho,
-            rseed,
-            NoteVersion::V3,
-        )
-        .unwrap();
+        let notes: Vec<Note> = (0..spends)
+            .map(|i| {
+                let rho = Rho::from_bytes(&[1 + i; 32]).unwrap();
+                let rseed = RandomSeed::from_bytes([2u8; 32], &rho).unwrap();
+                Note::from_parts(
+                    fvk.address_at(0u64, Scope::External),
+                    NoteValue::from_raw(SPEND_VALUE / u64::from(spends)),
+                    rho,
+                    rseed,
+                    NoteVersion::V3,
+                )
+                .unwrap()
+            })
+            .collect();
+        let spend_value = SPEND_VALUE / u64::from(spends) * u64::from(spends);
 
         let recipient = fvk.address_at(7u64, Scope::External);
         let memo = b"loki g1-tx".to_vec();
 
         let mut inputs = CandidateInputs {
             vault_fvk: &fvk,
-            notes: vec![note],
+            notes: notes.clone(),
             recipient,
             amount: Zatoshis::const_from_u64(AMOUNT),
             memo: MemoBytes::from_bytes(&memo).unwrap(),
@@ -362,8 +417,8 @@ mod tests {
             target_height: 700,
             expiry_height: 1_152,
         };
-        let fee = quote_fee(&Regtest, &inputs).unwrap();
-        inputs.change = Zatoshis::const_from_u64(SPEND_VALUE - AMOUNT - u64::from(fee));
+        let fee = u64::from(quote_fee(&Regtest, &inputs).unwrap());
+        inputs.change = Zatoshis::const_from_u64(spend_value - AMOUNT - fee);
 
         let alpha = alpha_from_canonical_bytes(&{
             let mut b = [0u8; 32];
@@ -375,18 +430,18 @@ mod tests {
         let built = build_candidate(
             &Regtest,
             &inputs,
-            &[alpha],
+            &vec![alpha; notes.len()],
             rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng),
         )
         .unwrap();
 
         let want = Expectations {
-            input_nullifiers: vec![note.nullifier(&fvk).to_bytes()],
+            input_nullifiers: notes.iter().map(|note| note.nullifier(&fvk).to_bytes()).collect(),
             recipient: recipient.to_raw_address_bytes(),
             amount_zat: AMOUNT,
             memo,
-            change_zat: SPEND_VALUE - AMOUNT - u64::from(fee),
-            fee_zat: u64::from(fee),
+            change_zat: spend_value - AMOUNT - fee,
+            fee_zat: fee,
             expiry_height: 1_152,
         };
 
@@ -403,6 +458,17 @@ mod tests {
     fn c4_honest_candidate_is_approved() {
         let f = fixture();
         assert_eq!(check_candidate(&f.bundle, &f.fvk, &f.want), Ok(()));
+    }
+
+    /// Spending three or more notes makes the builder add padding outputs, which signers
+    /// accept only up to that count.
+    #[test]
+    fn multi_note_candidates_with_padding_are_approved() {
+        for spends in [2, 3, 5] {
+            let f = fixture_with(spends);
+            assert_eq!(f.bundle.actions().len(), usize::from(spends).max(2));
+            assert_eq!(check_candidate(&f.bundle, &f.fvk, &f.want), Ok(()), "{spends} spends");
+        }
     }
 
     /// Tamper with one expectation at a time and confirm the signer refuses. A refusal

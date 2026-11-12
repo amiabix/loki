@@ -1,7 +1,13 @@
 //! FROST viewing-key derivation from ZIP 2005 (2026.8.0).
 //!
-//! This path is limited to regtest until an independent implementation checks its
-//! vectors and the key and backup flow is reviewed. The ZIP is still Proposed.
+//! This derivation is unreviewed (ZIP 2005 is still Proposed; ZIP 312 still Draft), so Loki
+//! restricts itself to TEST chains only — regtest and testnet, never mainnet — until an
+//! independent implementation checks its vectors and the key/backup flow is reviewed. The
+//! restriction is enforced, not just documented: [`crate::network::VaultNetwork`] and
+//! [`crate::signer::Network`] have no mainnet variant, `VaultNetwork::parse` rejects it, and
+//! `Network::ensure_test_only` gates deposit-address release (both guards use a wildcard-free
+//! match, so adding a non-test network cannot compile without revisiting the policy). Real
+//! funds must not be accepted until that review is done.
 
 use blake2b_simd::Params;
 use ff::{FromUniformBytes, PrimeField};

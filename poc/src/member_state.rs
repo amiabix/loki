@@ -1,13 +1,15 @@
-//! Validated regtest state produced by the separate-member setup ceremony.
+//! Validated state produced by the separate-member setup ceremony.
 
 use std::{collections::BTreeMap, fs, path::Path};
 
 use blake2b_simd::Params;
 use orchard::keys::FullViewingKey;
 use reddsa_frost::frost::redpallas as frost;
+use zcash_protocol::consensus::Parameters;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
+    network::{VaultNetwork, TESTNET_NU7_BIRTH},
     setup_transport::{Identity, PublicIdentity},
     state::MemberDir,
     vault, zip2005,
@@ -16,8 +18,100 @@ use crate::{
 pub struct Roster {
     pub vault: [u8; 32],
     pub threshold: u16,
+    pub network: VaultNetwork,
+    pub birth_height: Option<u32>,
     pub members: BTreeMap<u16, PublicIdentity>,
+    /// The setup format version a new-path roster declares (`"setup_version": 2`). Absent on
+    /// old-path rosters, which keep their earlier fingerprint label.
+    pub setup_version: Option<u16>,
     legacy: bool,
+    explicit_network: bool,
+}
+
+/// Largest roster either setup path accepts (C5): `2 <= t < n <= 16`.
+pub const MAX_MEMBERS: u16 = 16;
+
+/// The general t-of-n policy: at least two signers, at least one spare member, at most
+/// [`MAX_MEMBERS`] members.
+pub fn valid_policy(threshold: u16, members: usize) -> bool {
+    2 <= threshold && usize::from(threshold) < members && members <= usize::from(MAX_MEMBERS)
+}
+
+/// Why the shared roster gate refused a roster. The hosted path maps these onto its
+/// existing `setup_policy` / `setup_identity` error strings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RosterRejection {
+    /// Vault id, threshold, member count or member numbering is outside the policy.
+    Policy,
+    /// A weak, shared or non-contributory member key.
+    Identity,
+}
+
+impl std::fmt::Display for RosterRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Policy => "setup_policy",
+            Self::Identity => "setup_identity",
+        })
+    }
+}
+
+/// A roster that passed the shared setup gate (A7). The DKG core accepts nothing else, so
+/// no setup path can skip these checks. Each path adds its own checks on top.
+pub struct ValidatedRoster(Roster);
+
+impl ValidatedRoster {
+    /// The rules shared by the hosted engine and the new signer: a non-zero vault id,
+    /// `2 <= t < n <= 16` with ids `1..=n`, and per member a strong Ed25519 signing key and
+    /// a contributory X25519 encryption key, none shared with another member.
+    pub fn new(roster: Roster) -> Result<Self, RosterRejection> {
+        Self::check(&roster)?;
+        Ok(Self(roster))
+    }
+
+    pub fn check(roster: &Roster) -> Result<(), RosterRejection> {
+        if roster.vault == [0; 32]
+            || !valid_policy(roster.threshold, roster.members.len())
+            || roster.members.keys().copied().collect::<Vec<_>>()
+                != (1..=roster.members.len() as u16).collect::<Vec<_>>()
+        {
+            return Err(RosterRejection::Policy);
+        }
+        let mut signing = std::collections::BTreeSet::new();
+        let mut encryption = std::collections::BTreeSet::new();
+        // Any fixed secret works: a small-order public key gives an all-zero shared secret.
+        let probe = x25519_dalek::StaticSecret::from([1; 32]);
+        for (&id, member) in &roster.members {
+            let key = ed25519_dalek::VerifyingKey::from_bytes(&member.signing)
+                .map_err(|_| RosterRejection::Identity)?;
+            if member.id != id
+                || key.is_weak()
+                || !signing.insert(member.signing)
+                || !encryption.insert(member.encryption)
+                || !probe
+                    .diffie_hellman(&x25519_dalek::PublicKey::from(member.encryption))
+                    .was_contributory()
+            {
+                return Err(RosterRejection::Identity);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn roster(&self) -> &Roster {
+        &self.0
+    }
+
+    pub fn member_count(&self) -> u16 {
+        self.0.members.len() as u16
+    }
+}
+
+impl std::ops::Deref for ValidatedRoster {
+    type Target = Roster;
+    fn deref(&self) -> &Roster {
+        &self.0
+    }
 }
 
 impl Roster {
@@ -27,6 +121,32 @@ impl Roster {
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
         let data: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+        let explicit_network = data.get("network").is_some();
+        let network =
+            VaultNetwork::parse(data["network"].as_str().unwrap_or(if explicit_network {
+                ""
+            } else {
+                "regtest"
+            }))?;
+        let birth_height = match network {
+            VaultNetwork::Testnet => {
+                let height: u32 = data["birth_height"]
+                    .as_u64()
+                    .ok_or("Testnet roster needs a birth height")?
+                    .try_into()
+                    .map_err(|_| "invalid Testnet birth height")?;
+                if height < TESTNET_NU7_BIRTH {
+                    return Err("Testnet birth height predates NU7".into());
+                }
+                Some(height)
+            }
+            VaultNetwork::Regtest => {
+                if data.get("birth_height").is_some() {
+                    return Err("regtest roster cannot have a birth height".into());
+                }
+                None
+            }
+        };
         let vault = hex32(&data, "vault")?;
         let entries = data["members"].as_array().ok_or("missing members")?;
         let mut members = BTreeMap::new();
@@ -54,7 +174,19 @@ impl Roster {
                 return Err("duplicate member in roster".into());
             }
         }
+        let setup_version = match data.get("setup_version") {
+            None => None,
+            Some(value) => Some(
+                value
+                    .as_u64()
+                    .and_then(|v| u16::try_from(v).ok())
+                    .ok_or("invalid roster setup_version")?,
+            ),
+        };
         let legacy = data.get("threshold").is_none();
+        if legacy && setup_version.is_some() {
+            return Err("a versioned roster needs a threshold".into());
+        }
         let threshold: u16 = if legacy {
             2
         } else {
@@ -65,32 +197,65 @@ impl Roster {
                 .map_err(|_| "invalid roster threshold")?
         };
         let count = members.len();
-        if !matches!((threshold, count), (2, 3) | (2, 4))
+        if !valid_policy(threshold, count)
             || (legacy && count != 3)
             || members.keys().copied().collect::<Vec<_>>() != (1..=count as u16).collect::<Vec<_>>()
         {
             return Err(
-                "supported rosters are 2-of-3 and 2-of-4 with consecutive member IDs".into(),
+                "supported rosters are t-of-n with 2 <= t < n <= 16 and consecutive member IDs"
+                    .into(),
             );
         }
         Ok(Self {
             vault,
             threshold,
+            network,
+            birth_height,
             members,
+            setup_version,
             legacy,
+            explicit_network,
         })
     }
 
     pub fn fingerprint(&self) -> [u8; 32] {
+        if let Some(version) = self.setup_version {
+            // A new label only when the field is present, so existing rosters hash unchanged.
+            let mut hash = Params::new()
+                .hash_length(32)
+                .personal(b"Loki_roster_v4")
+                .to_state();
+            hash.update(&version.to_be_bytes());
+            hash.update(&self.vault);
+            hash.update(&[self.network.label().len() as u8]);
+            hash.update(self.network.label().as_bytes());
+            hash.update(&self.birth_height.unwrap_or(0).to_be_bytes());
+            hash.update(&self.threshold.to_be_bytes());
+            hash.update(&(self.members.len() as u16).to_be_bytes());
+            for member in self.members.values() {
+                hash.update(&member.id.to_be_bytes());
+                hash.update(&member.signing);
+                hash.update(&member.encryption);
+            }
+            return hash.finalize().as_bytes().try_into().unwrap();
+        }
         let mut hash = Params::new()
             .hash_length(32)
-            .personal(if self.legacy {
+            .personal(if self.explicit_network {
+                b"Loki_roster_v3"
+            } else if self.legacy {
                 b"Loki_roster_v1"
             } else {
                 b"Loki_roster_v2"
             })
             .to_state();
         hash.update(&self.vault);
+        if self.explicit_network {
+            hash.update(self.network.label().as_bytes());
+            if let Some(height) = self.birth_height {
+                hash.update(&height.to_be_bytes());
+            }
+        }
         if !self.legacy {
             hash.update(&self.threshold.to_be_bytes());
             hash.update(&(self.members.len() as u16).to_be_bytes());
@@ -106,11 +271,22 @@ impl Roster {
 
 pub struct MemberState {
     pub vault: [u8; 32],
+    pub network: VaultNetwork,
+    pub birth_height: Option<u32>,
     pub roster: Roster,
     pub identity: Identity,
     pub key: frost::keys::KeyPackage,
     pub public: frost::keys::PublicKeyPackage,
     pub fvk: FullViewingKey,
+}
+
+impl MemberState {
+    /// The first block the wallet scans: the certified birth on Testnet, block 2 on regtest.
+    /// Light-client sync starts from the tree state before the birth, and lightwalletd cannot
+    /// serve height 0; a regtest vault cannot be paid in block 1, mined before it existed.
+    pub fn wallet_birth(&self) -> u32 {
+        self.birth_height.unwrap_or(2)
+    }
 }
 
 fn hex32(value: &serde_json::Value, field: &str) -> Result<[u8; 32], String> {
@@ -153,21 +329,24 @@ pub fn open(owner: &Path, pass_file: &Path, roster_file: &Path) -> Result<Member
     if trimmed.is_empty() {
         return Err("empty passphrase".into());
     }
+    crate::seal_kdf::enable_session_cache(&trimmed);
     let dir = MemberDir::open(owner, "secrets");
     let state: serde_json::Value = serde_json::from_slice(
         &dir.read_sealed("vault.sealed", &trimmed)
             .map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    if state["version"] != 2
-        || state["network"] != "regtest"
-        || state["key_derivation"] != zip2005::VERSION
-    {
-        return Err("unsupported separate-member regtest vault state".into());
+    if state["version"] != 2 || state["key_derivation"] != zip2005::VERSION {
+        return Err("unsupported separate-member vault state".into());
     }
+    let network = VaultNetwork::parse(state["network"].as_str().ok_or("missing vault network")?)?;
     let vault = hex32(&state, "vault")?;
     let roster = Roster::load(roster_file)?;
-    if roster.vault != vault || roster.fingerprint() != hex32(&state, "roster_fingerprint")? {
+    if roster.vault != vault
+        || roster.network != network
+        || state.get("birth_height").and_then(|v| v.as_u64()) != roster.birth_height.map(u64::from)
+        || roster.fingerprint() != hex32(&state, "roster_fingerprint")?
+    {
         return Err("roster differs from sealed vault certificate".into());
     }
     if state
@@ -192,7 +371,7 @@ pub fn open(owner: &Path, pass_file: &Path, roster_file: &Path) -> Result<Member
     let secret = hex32(&state, "vault_secret")?;
     let fvk = zip2005::frost_viewing_key(&ak, &secret)
         .map_err(|e| format!("ZIP 2005 derivation: {e:?}"))?;
-    if state["address"].as_str() != Some(&vault::regtest_unified_address(&fvk)) {
+    if state["address"].as_str() != Some(&vault::unified_address(&fvk, network.network_type())) {
         return Err("stored address differs from derived vault address".into());
     }
     let public = frost::keys::PublicKeyPackage::deserialize(&hex_bytes(&state, "public_package")?)
@@ -242,6 +421,8 @@ pub fn open(owner: &Path, pass_file: &Path, roster_file: &Path) -> Result<Member
     }
     Ok(MemberState {
         vault,
+        network,
+        birth_height: roster.birth_height,
         roster,
         identity,
         key,

@@ -1,8 +1,9 @@
-//! Two-member signing attempt and its encrypted courier mailbox.
+//! One exact signer set per attempt and its encrypted courier mailbox.
 //! A caller must review the full exact PCZT and its locally derived sighash before `sign`.
 
 use crate::{
     intent::Intent,
+    payment_manifest::MAX_INPUTS,
     setup_transport::{Identity, PublicIdentity},
     state::MemberDir,
 };
@@ -14,6 +15,10 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
 };
+
+/// Upper bound on sealed outbox copies (one per other roster member). Rosters fit u16,
+/// but this bounds reads of a possibly corrupt sealed file.
+const MAX_OUTBOX_COPIES: usize = u16::MAX as usize;
 
 /// Random per retry. The payment ID remains the canonical intent ID.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,14 +37,17 @@ pub struct SessionContext {
     pub vault: [u8; 32],
     pub payment: [u8; 32],
     pub attempt: AttemptId,
-    /// Exactly one pair, sorted by roster member ID.
-    pub pair: [u16; 2],
+    /// The exact two or three signers, sorted by roster member ID.
+    pub signers: Vec<u16>,
 }
 
 impl SessionContext {
     pub fn validate(&self) -> Result<(), String> {
-        if self.pair[0] < 1 || self.pair[1] > 4 || self.pair[0] >= self.pair[1] {
-            return Err("signing attempt needs one distinct supported pair".into());
+        if self.signers.is_empty()
+            || self.signers[0] < 1
+            || self.signers.windows(2).any(|ids| ids[0] >= ids[1])
+        {
+            return Err("signing attempt needs sorted distinct members, each >= 1".into());
         }
         if self.attempt.0 == [0; 32] {
             return Err("zero signing attempt ID".into());
@@ -95,7 +103,7 @@ pub struct OpenedMessage {
     pub(crate) body: Vec<u8>,
     /// Hash of the exact authenticated envelope. A retry resends those same bytes.
     pub(crate) wire_hash: [u8; 32],
-    /// Hash of vault/payment/attempt/pair/sender/recipient/type and exact plaintext.
+    /// Hash of vault/payment/attempt/signers/sender/recipient/type and exact plaintext.
     pub(crate) transcript_hash: [u8; 32],
 }
 
@@ -195,7 +203,7 @@ impl Mailbox {
             }
             for peer in roster
                 .values()
-                .filter(|p| p.id != own.public().id && context.pair.contains(&p.id))
+                .filter(|p| p.id != own.public().id && context.signers.contains(&p.id))
             {
                 if let Ok(opened) = own.open_session(peer, context, &wire) {
                     if seen.insert(opened.wire_hash) {
@@ -258,10 +266,15 @@ pub fn review_batch(
     {
         return Err("member key differs from vault group key".into());
     }
-    let own: u16 = (1..=4)
-        .find(|n| frost::Identifier::try_from(*n).ok() == Some(*key.identifier()))
-        .ok_or("unknown signer identifier")?;
-    if !context.pair.contains(&own) {
+    let own: u16 = *context
+        .signers
+        .iter()
+        .find(|n| frost::Identifier::try_from(**n).ok() == Some(*key.identifier()))
+        .ok_or("signer outside chosen pair")?;
+    if usize::from(*key.min_signers()) != context.signers.len()
+        || public.min_signers().map(usize::from) != Some(context.signers.len())
+        || !context.signers.contains(&own)
+    {
         return Err("signer outside chosen pair".into());
     }
     review_public_candidate(
@@ -293,11 +306,14 @@ fn review_public_candidate(
         verifier::{OrchardError, Verifier},
     };
     context.validate()?;
+    if public.min_signers().map(usize::from) != Some(context.signers.len()) {
+        return Err("signer count differs from certified FROST threshold".into());
+    }
     if context.vault != *known_vault || context.payment != intent.proposal_id() {
         return Err("vault or payment differs from member-approved intent".into());
     }
     if intent.input_nullifiers.is_empty()
-        || intent.input_nullifiers.len() > 64
+        || intent.input_nullifiers.len() > MAX_INPUTS
         || intent
             .input_nullifiers
             .iter()
@@ -324,7 +340,7 @@ fn review_public_candidate(
         return Err("public package and vault viewing key differ".into());
     }
     let pair: BTreeSet<_> = context
-        .pair
+        .signers
         .iter()
         .map(|n| frost::Identifier::try_from(*n).unwrap())
         .collect();
@@ -383,15 +399,9 @@ fn review_public_candidate(
         })
         .map_err(|e| format!("candidate refused: {e:?}"))?
         .finish();
-    if !checked.orchard().actions().is_empty()
-        || !checked.transparent().inputs().is_empty()
-        || !checked.transparent().outputs().is_empty()
-        || !checked.sapling().spends().is_empty()
-        || !checked.sapling().outputs().is_empty()
-        || *checked.global().tx_version() != 6
-        || *checked.global().expiry_height() != intent.expiry_height
-    {
-        return Err("candidate has another pool, version, or expiry".into());
+    crate::verify::check_pools_and_version(&checked).map_err(|e| e.to_string())?;
+    if *checked.global().expiry_height() != intent.expiry_height {
+        return Err("candidate has another expiry".into());
     }
     let sighash = Signer::new(checked.clone())
         .map_err(|e| format!("sighash: {e:?}"))?
@@ -471,13 +481,14 @@ impl LiveAttempt {
         spends: usize,
     ) -> Result<Self, String> {
         context.validate()?;
-        if spends == 0 || spends > 64 {
-            return Err("signing attempt must have 1..=64 spends".into());
+        if spends == 0 || spends > MAX_INPUTS {
+            return Err(format!("signing attempt must have 1..={} spends", MAX_INPUTS));
         }
-        let id: u16 = (1..=4)
-            .find(|n| frost::Identifier::try_from(*n).ok() == Some(*key.identifier()))
-            .ok_or("key package has unknown member ID")?;
-        if !context.pair.contains(&id) {
+        if !context
+            .signers
+            .iter()
+            .any(|n| frost::Identifier::try_from(*n).ok() == Some(*key.identifier()))
+        {
             return Err("member is not in selected pair".into());
         }
         let mut nonces = Vec::with_capacity(spends);
@@ -520,7 +531,7 @@ impl LiveAttempt {
         }
         let pair: BTreeSet<_> = self
             .context
-            .pair
+            .signers
             .iter()
             .map(|n| frost::Identifier::try_from(*n).unwrap())
             .collect();
@@ -566,7 +577,7 @@ pub struct ReviewSummary {
     pub vault: [u8; 32],
     pub payment: [u8; 32],
     pub attempt: AttemptId,
-    pub pair: [u16; 2],
+    pub signers: Vec<u16>,
     pub recipient: [u8; 43],
     pub amount_zat: u64,
     pub memo: Vec<u8>,
@@ -593,11 +604,11 @@ impl ReviewedPackage {
     /// Binds a displayed review to this exact member package; it is not member consent.
     pub fn review_token(&self) -> [u8; 32] {
         let mut hash = blake3::Hasher::new();
-        hash.update(b"Loki_review_token_v1\0");
+        hash.update(if self.summary.signers.len() == 2 { b"Loki_review_token_v1\0" } else { b"Loki_review_token_v2\0" });
         hash.update(&self.summary.vault);
         hash.update(&self.summary.payment);
         hash.update(&self.summary.attempt.0);
-        for member in self.summary.pair {
+        for &member in &self.summary.signers {
             hash.update(&member.to_be_bytes());
         }
         hash.update(&self.peer.to_be_bytes());
@@ -620,22 +631,22 @@ impl PackagePayload {
         context.validate()?;
         if self.candidate.is_empty()
             || self.commitments.is_empty()
-            || self.commitments.len() > 64
+            || self.commitments.len() > MAX_INPUTS
             || self.commitments.len() != self.seeds.len()
         {
             return Err("invalid signing package batch".into());
         }
         let mut out = Vec::new();
-        out.push(1);
+        out.push(if context.signers.len() == 2 { 1 } else { 2 });
         out.extend_from_slice(&(self.candidate.len() as u32).to_be_bytes());
         out.extend_from_slice(&self.candidate);
         out.extend_from_slice(&(self.commitments.len() as u16).to_be_bytes());
         for (set, seed) in self.commitments.iter().zip(&self.seeds) {
-            if set.len() != 2 {
-                return Err("package must name exactly two commitments".into());
+            if set.len() != context.signers.len() {
+                return Err("package must name exactly the selected signers".into());
             }
             out.extend_from_slice(seed);
-            for member in context.pair {
+            for &member in &context.signers {
                 let id = frost::Identifier::try_from(member).map_err(|e| e.to_string())?;
                 let raw = set
                     .get(&id)
@@ -657,7 +668,8 @@ impl PackagePayload {
 
     pub fn decode(context: &SessionContext, body: &[u8]) -> Result<Self, String> {
         context.validate()?;
-        if body.len() < 7 || body.len() > MessageKind::Package.max_body() || body[0] != 1 {
+        if body.len() < 7 || body.len() > MessageKind::Package.max_body()
+            || body[0] != if context.signers.len() == 2 { 1 } else { 2 } {
             return Err("invalid signing package version or length".into());
         }
         let mut at = 1;
@@ -670,7 +682,7 @@ impl PackagePayload {
         at += candidate_len;
         let count = u16::from_be_bytes(body[at..at + 2].try_into().unwrap()) as usize;
         at += 2;
-        if count == 0 || count > 64 {
+        if count == 0 || count > MAX_INPUTS {
             return Err("invalid spend count".into());
         }
         let mut commitments = Vec::with_capacity(count);
@@ -682,7 +694,7 @@ impl PackagePayload {
             seeds.push(body[at..at + 32].try_into().unwrap());
             at += 32;
             let mut set = BTreeMap::new();
-            for member in context.pair {
+            for &member in &context.signers {
                 if at + 2 > body.len() {
                     return Err("truncated commitment length".into());
                 }
@@ -720,8 +732,8 @@ pub fn commitments_from_message(
 ) -> Result<Vec<frost::round1::SigningCommitments>, String> {
     if message.context != *context
         || message.kind != MessageKind::Commitment
-        || !context.pair.contains(&message.sender)
-        || !context.pair.contains(&message.recipient)
+        || !context.signers.contains(&message.sender)
+        || !context.signers.contains(&message.recipient)
         || message.sender == message.recipient
         || message.body.len() < 3
         || message.body[0] != 1
@@ -769,15 +781,16 @@ pub struct SigningSession {
     witness_pins: Option<WitnessPins>,
 }
 
-/// (relay public key, relay run ID), fixed before commitments are published.
-pub type WitnessPins = [([u8; 32], [u8; 32]); 2];
+/// (relay public key, relay run ID, mailbox), fixed before commitments are published.
+pub type WitnessPins = [([u8; 32], [u8; 32], [u8; 32]); 2];
 
-fn valid_witness_pins(pins: WitnessPins) -> bool {
+pub(crate) fn valid_witness_pins(pins: WitnessPins) -> bool {
     pins[0].0 != pins[1].0
         && pins[0].1 != pins[1].1
+        && pins[0].2 != pins[1].2
         && pins
             .iter()
-            .all(|(key, run)| *key != [0; 32] && *run != [0; 32])
+            .all(|(key, run, mailbox)| *key != [0; 32] && *run != [0; 32] && *mailbox != [0; 32])
 }
 
 /// Implementations must verify fresh signed receipts from two fixed, distinct relay
@@ -805,6 +818,11 @@ impl SigningSession {
         let id = own.public().id;
         if frost::Identifier::try_from(id).map_err(|e| e.to_string())? != *key.identifier() {
             return Err("identity and FROST key belong to different members".into());
+        }
+        if usize::from(*key.min_signers()) != context.signers.len()
+            || public.min_signers().map(usize::from) != Some(context.signers.len())
+        {
+            return Err("signer set differs from certified FROST threshold".into());
         }
         let live = LiveAttempt::new(context.clone(), &key, spends)?;
         let store = AttemptStore::new(root, &context, id)?;
@@ -869,6 +887,8 @@ impl SigningSession {
     ) -> Result<Self, String> {
         if context.vault != *known_vault
             || context.payment != approved_intent.proposal_id()
+            || usize::from(*key.min_signers()) != context.signers.len()
+            || public.min_signers().map(usize::from) != Some(context.signers.len())
             || frost::Identifier::try_from(own.public().id).map_err(|e| e.to_string())?
                 != *key.identifier()
         {
@@ -910,10 +930,10 @@ impl SigningSession {
         passphrase: &str,
     ) -> Result<Vec<[u8; 32]>, String> {
         let own = self.own.public();
-        if !matches!(roster.len(), 3 | 4)
+        if roster.len() < 2
             || roster.keys().copied().collect::<Vec<_>>()
                 != (1..=roster.len() as u16).collect::<Vec<_>>()
-            || self.context.pair.iter().any(|id| !roster.contains_key(id))
+            || self.context.signers.iter().any(|id| !roster.contains_key(id))
             || roster.get(&own.id) != Some(&own)
         {
             return Err("package publisher differs from certified roster".into());
@@ -945,18 +965,9 @@ impl SigningSession {
                 ));
             }
         }
-        let peer_id = self
-            .context
-            .pair
-            .iter()
-            .copied()
-            .find(|id| *id != own.id)
-            .unwrap();
-        let peers = std::iter::once(roster.get(&peer_id).unwrap()).chain(
-            roster
-                .values()
-                .filter(|p| !self.context.pair.contains(&p.id)),
-        );
+        let peers = self.context.signers.iter().filter(|id| **id != own.id)
+            .map(|id| &roster[id])
+            .chain(roster.values().filter(|p| !self.context.signers.contains(&p.id)));
         let wires = peers
             .map(|peer| {
                 self.own
@@ -972,7 +983,7 @@ impl SigningSession {
         peer: &PublicIdentity,
         mailbox: &Mailbox,
     ) -> Result<[u8; 32], String> {
-        if !self.context.pair.contains(&peer.id) || peer.id == self.own.public().id {
+        if !self.context.signers.contains(&peer.id) || peer.id == self.own.public().id {
             return Err("commitment recipient is not selected peer".into());
         }
         let mut body = Vec::new();
@@ -1001,7 +1012,7 @@ impl SigningSession {
             || package_message.kind != MessageKind::Package
             || !(from_peer || own_outbound)
             || peer.id == self.own.public().id
-            || !self.context.pair.contains(&peer.id)
+            || !self.context.signers.contains(&peer.id)
         {
             return Err("package is not from selected peer for this attempt".into());
         }
@@ -1027,7 +1038,7 @@ impl SigningSession {
             vault: self.context.vault,
             payment: self.context.payment,
             attempt: self.context.attempt,
-            pair: self.context.pair,
+            signers: self.context.signers.clone(),
             recipient,
             amount_zat: self.approved_intent.amount_zat,
             memo: self.approved_intent.memo.clone(),
@@ -1062,10 +1073,10 @@ impl SigningSession {
         if reviewed.batch.context != self.context
             || reviewed.peer != peer.id
             || peer.id == self.own.public().id
-            || !self.context.pair.contains(&peer.id)
-            || !matches!(finishers.len(), 1 | 2)
+            || !self.context.signers.contains(&peer.id)
+            || finishers.is_empty()
             || finishers.iter().any(|finisher| {
-                !(1..=4).contains(&finisher.id) || self.context.pair.contains(&finisher.id)
+                finisher.id < 1 || finisher.id == self.own.public().id || finisher.id == peer.id
             })
             || finishers
                 .iter()
@@ -1128,14 +1139,75 @@ impl SigningSession {
         passphrase: &str,
         witness: &mut impl NonceWitness,
     ) -> Result<[u8; 32], String> {
+        if self.public.verifying_shares().len() != 3 {
+            return Err("four-member approval requires the complete certified roster".into());
+        }
+        self.publish_approved_secured_to_finishers(
+            reviewed, peer, std::slice::from_ref(finisher), mailbox, passphrase, witness,
+        )
+    }
+
+    /// The caller supplies its certified roster. Validate its complete audience before
+    /// claiming nonces, then compute each share once and persist every recipient copy.
+    pub fn publish_approved_secured_to_roster(
+        &mut self,
+        reviewed: ReviewedPackage,
+        peer: &PublicIdentity,
+        roster: &BTreeMap<u16, PublicIdentity>,
+        mailbox: &Mailbox,
+        passphrase: &str,
+        witness: &mut impl NonceWitness,
+    ) -> Result<[u8; 32], String> {
+        let own = self.own.public();
+        if roster.len() < 2
+            || roster.keys().copied().collect::<Vec<_>>()
+                != (1..=roster.len() as u16).collect::<Vec<_>>()
+            || roster.get(&own.id) != Some(&own)
+            || roster.get(&peer.id) != Some(peer)
+            || self.context.signers.iter().any(|id| !roster.contains_key(id))
+            || roster.iter().any(|(id, identity)| {
+                *id != identity.id || identity.signing == [0; 32] || identity.encryption == [0; 32]
+            })
+            || roster.values().any(|identity| {
+                roster.values().any(|other| identity.id != other.id &&
+                    (identity.signing == other.signing || identity.encryption == other.encryption))
+            })
+            || self.public.verifying_shares().len() != roster.len()
+            || roster.keys().any(|id| {
+                frost::Identifier::try_from(*id).map_or(true, |identifier| {
+                    !self.public.verifying_shares().contains_key(&identifier)
+                })
+            })
+        {
+            return Err("approval audience differs from certified roster".into());
+        }
+        let finishers = roster.values()
+            .filter(|identity| identity.id != own.id && identity.id != peer.id)
+            .cloned().collect::<Vec<_>>();
+        self.publish_approved_secured_to_finishers(
+            reviewed, peer, &finishers, mailbox, passphrase, witness,
+        )
+    }
+
+    fn publish_approved_secured_to_finishers(
+        &mut self,
+        reviewed: ReviewedPackage,
+        peer: &PublicIdentity,
+        finishers: &[PublicIdentity],
+        mailbox: &Mailbox,
+        passphrase: &str,
+        witness: &mut impl NonceWitness,
+    ) -> Result<[u8; 32], String> {
         if self._lock.is_none()
             || self.witness_pins != Some(witness.pins())
             || reviewed.batch.context != self.context
             || reviewed.peer != peer.id
             || peer.id == self.own.public().id
-            || !self.context.pair.contains(&peer.id)
-            || !(1..=4).contains(&finisher.id)
-            || self.context.pair.contains(&finisher.id)
+            || !self.context.signers.contains(&peer.id)
+            || finishers.is_empty()
+            || finishers.iter().any(|finisher| {
+                finisher.id < 1 || finisher.id == self.own.public().id || finisher.id == peer.id
+            })
         {
             return Err("invalid persisted signing attempt or peer".into());
         }
@@ -1193,12 +1265,12 @@ impl SigningSession {
             body.extend_from_slice(&(raw.len() as u16).to_be_bytes());
             body.extend_from_slice(&raw);
         }
-        let wires = [
-            self.own
-                .seal_session(peer, &self.context, MessageKind::Share, &body)?,
-            self.own
-                .seal_session(finisher, &self.context, MessageKind::Share, &body)?,
-        ];
+        let wires = std::iter::once(peer)
+            .chain(finishers.iter())
+            .map(|recipient| {
+                self.own.seal_session(recipient, &self.context, MessageKind::Share, &body)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         self.store
             .save_share_after_decision(&wires, &candidate_hash, &package_hash, passphrase)?;
         self.store.publish(mailbox, passphrase)
@@ -1287,7 +1359,7 @@ pub fn aggregate_and_apply(
     public: &frost::keys::PublicKeyPackage,
     fvk: &orchard::keys::FullViewingKey,
     package: &PackagePayload,
-    share_messages: &[OpenedMessage; 2],
+    share_messages: &[OpenedMessage],
 ) -> Result<(pczt::Pczt, [u8; 32], Vec<usize>), String> {
     use pczt::roles::signer::Signer;
     let reviewed = review_public_candidate(
@@ -1304,7 +1376,7 @@ pub fn aggregate_and_apply(
     for message in share_messages {
         if message.context != *context
             || message.kind != MessageKind::Share
-            || !context.pair.contains(&message.sender)
+            || !context.signers.contains(&message.sender)
         {
             return Err("share comes from another attempt or signer".into());
         }
@@ -1319,8 +1391,8 @@ pub fn aggregate_and_apply(
             return Err("duplicate share sender".into());
         }
     }
-    if by_member.keys().copied().collect::<Vec<_>>() != context.pair {
-        return Err("incomplete selected signer pair".into());
+    if by_member.keys().copied().collect::<Vec<_>>() != context.signers {
+        return Err("incomplete selected signer set".into());
     }
     let candidate =
         pczt::Pczt::parse(&package.candidate).map_err(|e| format!("candidate parse: {e:?}"))?;
@@ -1334,7 +1406,7 @@ pub fn aggregate_and_apply(
         .enumerate()
     {
         let mut shares = BTreeMap::new();
-        for member in context.pair {
+        for &member in &context.signers {
             let id = frost::Identifier::try_from(member).map_err(|e| e.to_string())?;
             shares.insert(id, by_member[&member][i].clone());
         }
@@ -1351,7 +1423,7 @@ pub fn aggregate_and_apply(
                     .iter()
                     .filter_map(|id| {
                         context
-                            .pair
+                            .signers
                             .iter()
                             .find(|n| frost::Identifier::try_from(**n).ok() == Some(*id))
                     })
@@ -1430,10 +1502,11 @@ impl AttemptStore {
         pins: WitnessPins,
     ) -> Result<(), String> {
         let mut raw = zeroize::Zeroizing::new(Vec::new());
-        raw.push(1);
-        for (key, run) in pins {
+        raw.push(2);
+        for (key, run, mailbox) in pins {
             raw.extend_from_slice(&key);
             raw.extend_from_slice(&run);
+            raw.extend_from_slice(&mailbox);
         }
         raw.extend_from_slice(&(live.commitments.len() as u16).to_be_bytes());
         for nonce in live.nonces.as_ref().ok_or("nonces already consumed")? {
@@ -1458,27 +1531,31 @@ impl AttemptStore {
                 .read_sealed("nonces.sealed", passphrase)
                 .map_err(|e| e.to_string())?,
         );
-        if raw.len() < 131 || raw[0] != 1 {
+        // v1 omitted mailbox IDs; reopening those nonce records could reuse a CID on
+        // a newly provisioned mailbox. Discard the attempt and start with fresh nonces.
+        if raw.len() < 195 || raw[0] != 2 {
             return Err("invalid sealed nonce record".into());
         }
         let pins = [
             (
                 raw[1..33].try_into().unwrap(),
                 raw[33..65].try_into().unwrap(),
+                raw[65..97].try_into().unwrap(),
             ),
             (
-                raw[65..97].try_into().unwrap(),
                 raw[97..129].try_into().unwrap(),
+                raw[129..161].try_into().unwrap(),
+                raw[161..193].try_into().unwrap(),
             ),
         ];
         if !valid_witness_pins(pins) {
             return Err("invalid sealed relay identities".into());
         }
-        let count = u16::from_be_bytes(raw[129..131].try_into().unwrap()) as usize;
+        let count = u16::from_be_bytes(raw[193..195].try_into().unwrap()) as usize;
         if !(1..=64).contains(&count) {
             return Err("invalid sealed nonce count".into());
         }
-        let mut at = 131;
+        let mut at = 195;
         let mut nonces = Vec::with_capacity(count);
         let mut commitments = Vec::with_capacity(count);
         for _ in 0..count {
@@ -1501,7 +1578,7 @@ impl AttemptStore {
         }
         let own_id = *key.identifier();
         if !context
-            .pair
+            .signers
             .iter()
             .any(|id| frost::Identifier::try_from(*id).ok() == Some(own_id))
         {
@@ -1526,7 +1603,7 @@ impl AttemptStore {
     }
     fn new(root: &Path, context: &SessionContext, own: u16) -> Result<Self, String> {
         context.validate()?;
-        if !context.pair.contains(&own) {
+        if !context.signers.contains(&own) {
             return Err("member is not in selected pair".into());
         }
         let parent = root.join(hex::encode(context.payment));
@@ -1539,11 +1616,13 @@ impl AttemptStore {
             .create_new(true)
             .open(state)
             .map_err(|e| format!("attempt already exists: {e}"))?;
+        if context.signers.len() == 3 {
+            file.write_all(&[2]).map_err(|e| e.to_string())?;
+        }
         file.write_all(&context.vault).map_err(|e| e.to_string())?;
-        file.write_all(&context.pair[0].to_be_bytes())
-            .map_err(|e| e.to_string())?;
-        file.write_all(&context.pair[1].to_be_bytes())
-            .map_err(|e| e.to_string())?;
+        for &id in &context.signers {
+            file.write_all(&id.to_be_bytes()).map_err(|e| e.to_string())?;
+        }
         file.write_all(&own.to_be_bytes())
             .map_err(|e| e.to_string())?;
         file.sync_all().map_err(|e| e.to_string())?;
@@ -1552,16 +1631,19 @@ impl AttemptStore {
 
     fn reopen(root: &Path, context: &SessionContext, own: u16) -> Result<Self, String> {
         context.validate()?;
-        if !context.pair.contains(&own) {
+        if !context.signers.contains(&own) {
             return Err("member is not in selected pair".into());
         }
         let dir = MemberDir::open(
             &root.join(hex::encode(context.payment)),
             &hex::encode(context.attempt.0),
         );
-        let mut expected = Vec::with_capacity(38);
+        let mut expected = Vec::with_capacity(35 + 2 * context.signers.len());
+        if context.signers.len() == 3 {
+            expected.push(2);
+        }
         expected.extend_from_slice(&context.vault);
-        for id in context.pair {
+        for &id in &context.signers {
             expected.extend_from_slice(&id.to_be_bytes());
         }
         expected.extend_from_slice(&own.to_be_bytes());
@@ -1577,7 +1659,7 @@ impl AttemptStore {
         digest: &[u8; 32],
         passphrase: &str,
     ) -> Result<(), String> {
-        if !matches!(wires.len(), 2 | 3) {
+        if wires.len() < 2 {
             return Err("package needs one copy for each other member".into());
         }
         let mut out = Vec::with_capacity(40 + wires.iter().map(Vec::len).sum::<usize>());
@@ -1602,10 +1684,10 @@ impl AttemptStore {
         }
         let mut at = 32;
         let mut wires = Vec::new();
-        while at < raw.len() && wires.len() < 4 {
+        while at < raw.len() && wires.len() < MAX_OUTBOX_COPIES {
             wires.push(read_saved_wire(&raw, &mut at)?);
         }
-        if at != raw.len() || !matches!(wires.len(), 2 | 3) {
+        if at != raw.len() || wires.len() < 2 {
             return Err("invalid sealed package copy count".into());
         }
         Ok((raw[..32].try_into().unwrap(), wires))
@@ -1646,7 +1728,7 @@ impl AttemptStore {
         package_hash: &[u8; 32],
         passphrase: &str,
     ) -> Result<(), String> {
-        if !matches!(wires.len(), 2 | 3) {
+        if wires.len() < 2 {
             return Err("share needs one copy for the peer and each finisher".into());
         }
         let mut out = Vec::with_capacity(72 + wires.iter().map(Vec::len).sum::<usize>());
@@ -1672,10 +1754,10 @@ impl AttemptStore {
         }
         let mut at = 64;
         let mut wires = Vec::new();
-        while at < raw.len() && wires.len() < 4 {
+        while at < raw.len() && wires.len() < MAX_OUTBOX_COPIES {
             wires.push(read_saved_wire(&raw, &mut at)?);
         }
-        if at != raw.len() || !matches!(wires.len(), 2 | 3) {
+        if at != raw.len() || wires.len() < 2 {
             return Err("invalid sealed share copy count".into());
         }
         Ok((

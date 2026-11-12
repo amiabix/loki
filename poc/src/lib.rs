@@ -14,27 +14,71 @@
 //! `probe-zip2005` feature still records the missing upstream API. C1.4 is supplied by
 //! an isolated patch to vendored orchard; see vendor/README.md.
 
+#[cfg_attr(not(feature = "research-fixtures"), doc = r#"
+Production builds do not export research fixtures.
+
+```compile_fail
+use loki_poc::vault::test_only_fvk;
+```
+
+```compile_fail
+use loki_poc::candidate::build_tampered;
+```
+
+```compile_fail
+use loki_poc::candidate::{forbidden_transparent_bundle, forbidden_sapling_bundle};
+```
+"#)]
 pub mod candidate;
 #[cfg(test)]
 mod coordinator;
+pub mod coordinator_boundary;
 pub mod distributed_setup;
+pub mod dkg_core;
+#[cfg(all(feature = "apple-enclave", target_os = "macos"))]
+pub mod enclave_ffi;
 pub mod intent;
+pub mod frost_roster;
 pub mod member_state;
+pub mod network;
 #[cfg(test)]
 mod nonce_binding;
 pub mod payment_manifest;
+pub mod payment_transport;
+pub mod profile;
 pub mod randomizer;
 pub mod refresh;
+// The per-member HTTP coordinator (axum) that fronts the account + hosted-vault ceremony
+// for the web UI, driving the library in-process. Gated with the hosted relay stack.
+#[cfg(feature = "relay-communication")]
+pub mod host;
+// RETIRING (WS3/WS4): Loki's bespoke relay stack — `relay_member`, `setup_relay`,
+// `member_service`, and their `setup_backup`/`setup_retry` helpers — is being replaced
+// by the audited ZF `frostd` relay via `transport::FrostdTransport` (ws3 §2, ws4 §4).
+// It is already behind the off-by-default `relay-communication` feature and kept only so
+// the old flow still compiles during migration; the product build routes DKG + signing
+// messages through `transport` instead (typed `Outbound` sends; the signer's v2 DKG wires
+// via the `signer::coordination` drivers and the coordinator's `RelayLog`). The old flow
+// is on the same v2 round two and setup version 2, so it never sends round two under the
+// long-lived identity keys. The thin roster/admission layer (`setup_ceremony`,
+// invitations, the `VaultCertificate`) stays — that is what frostd does NOT provide
+// (ws3 §4). Do not add new callers of the modules below.
 #[cfg(feature = "relay-communication")]
 pub mod relay_member;
 pub mod rpc;
 pub mod scan;
 pub mod scanstate;
+pub mod seal_kdf;
 pub mod setup_transport;
+pub mod setup_ceremony;
+pub mod signer;
 pub mod signing_session;
 pub mod state;
+pub mod transport;
+pub mod tx_finalize;
 pub mod vault;
 pub mod verify;
+pub mod wallet_store;
 pub mod witness;
 pub mod zip2005;
 
@@ -246,3 +290,15 @@ mod checkpoint_1 {
         fn _confirmed<P>(_: Option<DeferredPcztBuilder<P>>, _: Option<Pczt>) {}
     }
 }
+
+#[cfg(feature = "relay-communication")]
+pub mod setup_relay;
+
+#[cfg(feature = "relay-communication")]
+pub mod member_service;
+
+#[cfg(feature = "relay-communication")]
+pub(crate) mod setup_backup;
+
+#[cfg(feature = "relay-communication")]
+pub(crate) mod setup_retry;

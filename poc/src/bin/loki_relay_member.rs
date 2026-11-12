@@ -5,7 +5,7 @@ use loki_poc::relay_member::{
     load, ConfigStore, CourierImport, LoadedMember, MemberError, ProvisionTarget,
 };
 use loki_poc::{
-    payment_manifest::{self, decode_proposal, encode_proposal},
+    payment_manifest::{self, decode_proposal_for_network, encode_proposal_for_network},
     setup_transport::session_envelope,
     signing_session::Mailbox,
 };
@@ -62,6 +62,7 @@ fn main() {
             1
         }
     };
+    loki_poc::seal_kdf::report();
     std::process::exit(code);
 }
 
@@ -252,6 +253,7 @@ fn run() -> Result<(), Exit> {
                 "--roster",
                 "--verify-relays",
                 "--diagnostics",
+                "--attempt",
             ])?;
             let (root, pass, roster) = common()?;
             status(
@@ -260,7 +262,22 @@ fn run() -> Result<(), Exit> {
                 &roster,
                 switched("--verify-relays"),
                 switched("--diagnostics"),
+                if switched("--attempt") {
+                    Some(parse_id(take("--attempt")?.to_str().ok_or(Exit::Usage)?)?)
+                } else {
+                    None
+                },
             )
+        }
+        "payment-sync" => {
+            expect(&["--member-root", "--passphrase-file", "--roster", "--plan"])?;
+            let (root, pass, roster) = common()?;
+            payment_sync(&root, &pass, &roster, &take("--plan")?)
+        }
+        "readiness" => {
+            expect(&["--member-root", "--passphrase-file", "--roster"])?;
+            let (root, pass, roster) = common()?;
+            readiness(&root, &pass, &roster)
         }
         _ => Err(Exit::Usage),
     }
@@ -400,6 +417,19 @@ fn commit_payload(
     request_id: Id32,
     signing_attempt: Option<Id32>,
 ) -> Result<(), Exit> {
+    let saved = save_payload(session, payload, request_id, signing_attempt)?;
+    println!("request_id={}", hex_id(&request_id));
+    print_logical(&session.db, &saved)?;
+    Ok(())
+}
+
+/// Commit one outbox message (or find the one already saved for `request_id`).
+fn save_payload(
+    session: &mut Session,
+    payload: &[u8],
+    request_id: Id32,
+    signing_attempt: Option<Id32>,
+) -> Result<RecoveryLogical, Exit> {
     let digest =
         roster_digest(&session.member.roster).map_err(|_| Exit::Member(MemberError::Roster))?;
     let mut body = MessageBody {
@@ -450,19 +480,31 @@ fn commit_payload(
             .map_err(Exit::Client)
     });
     wipe_test(&mut body);
-    let saved = saved?;
-    println!("request_id={}", hex_id(&request_id));
-    print_logical(&session.db, &saved)?;
-    Ok(())
+    saved
 }
 
 fn send_proposal(root: &Path, pass: &Path, roster: &Path, proposal: &Path) -> Result<(), Exit> {
     let manifest = read_exact(proposal, payment_manifest::MAX_MANIFEST, false)?;
-    let (context, intent) =
-        payment_manifest::parse(&manifest).map_err(|_| Exit::Member(MemberError::Markers))?;
     let mut session = open_session(root, pass, roster)?;
+    let (payment, attempt, saved) = save_proposal(&mut session, &manifest)?;
+    println!("request_id={}", hex_id(&attempt));
+    print_logical(&session.db, &saved)?;
+    println!("proposal={} attempt={}", hex_id(&payment), hex_id(&attempt));
+    Ok(())
+}
+
+/// Check a payment manifest against this member and commit it as a proposal.
+/// Returns the payment, the attempt and the saved message.
+fn save_proposal(
+    session: &mut Session,
+    manifest: &[u8],
+) -> Result<(Id32, Id32, RecoveryLogical), Exit> {
+    let (context, intent) =
+        payment_manifest::parse_for_network(manifest, session.member.network)
+            .map_err(|_| Exit::Member(MemberError::Markers))?;
     payment_manifest::validate_roster(
         session.member.roster.vault,
+        session.member.threshold,
         session.member.roster.members.iter().map(|member| member.id),
         &context,
         &intent,
@@ -475,23 +517,28 @@ fn send_proposal(root: &Path, pass: &Path, roster: &Path, proposal: &Path) -> Re
         return Err(Exit::Member(MemberError::Identity));
     }
     let payload =
-        Zeroizing::new(encode_proposal(&manifest).map_err(|_| Exit::Member(MemberError::Markers))?);
-    commit_payload(
-        &mut session,
-        &payload,
-        context.attempt.0,
-        Some(context.attempt.0),
-    )?;
-    println!(
-        "proposal={} attempt={}",
-        hex_id(&context.payment),
-        hex_id(&context.attempt.0)
-    );
-    Ok(())
+        Zeroizing::new(encode_proposal_for_network(manifest, session.member.network)
+            .map_err(|_| Exit::Member(MemberError::Markers))?);
+    let saved = save_payload(session, &payload, context.attempt.0, Some(context.attempt.0))?;
+    Ok((context.payment, context.attempt.0, saved))
 }
 
 fn import_proposals(root: &Path, pass: &Path, roster: &Path, payments: &Path) -> Result<(), Exit> {
     let session = open_session(root, pass, roster)?;
+    let (imported, rejected) = import_saved_proposals(&session, root, payments, true)?;
+    println!("imported_proposals={imported}");
+    println!("rejected_proposals={rejected}");
+    Ok(())
+}
+
+/// Write each received, valid payment proposal to `<root>/payments/<attempt>/payment.json`
+/// once. Returns how many were new and how many were rejected.
+fn import_saved_proposals(
+    session: &Session,
+    root: &Path,
+    payments: &Path,
+    print: bool,
+) -> Result<(usize, usize), Exit> {
     let owner = fs::canonicalize(root).map_err(|_| Exit::Member(MemberError::Io))?;
     let expected = owner.join("payments");
     if payments != expected
@@ -502,73 +549,77 @@ fn import_proposals(root: &Path, pass: &Path, roster: &Path, payments: &Path) ->
     create_private_dir(&expected)?;
     let mut imported = 0;
     let mut rejected = 0;
-    visit_pages(|after| session.db.recover_incoming_originals(after, PAGE), |row| {
-        if row.kind != 1 {
-            return Ok(());
-        }
-        let Ok(opened) =
-            session
-                .db
-                .open_incoming(&session.member.roster, &session.member.identity, &row)
-        else {
-            rejected += 1;
-            return Ok(());
-        };
-        let body = opened.message().body();
-        let Payload::Test(payload) = &body.payload else {
-            return Ok(());
-        };
-        let manifest = match decode_proposal(payload) {
-            Ok(Some(manifest)) => manifest,
-            Ok(None) => return Ok(()),
-            Err(_) => {
+    visit_pages(
+        |after| session.db.recover_incoming_originals(after, PAGE),
+        |row| {
+            if row.kind != 1 {
+                return Ok(());
+            }
+            let Ok(opened) =
+                session
+                    .db
+                    .open_incoming(&session.member.roster, &session.member.identity, &row)
+            else {
+                rejected += 1;
+                return Ok(());
+            };
+            let body = opened.message().body();
+            let Payload::Test(payload) = &body.payload else {
+                return Ok(());
+            };
+            let manifest = match decode_proposal_for_network(payload, session.member.network) {
+                Ok(Some(manifest)) => manifest,
+                Ok(None) => return Ok(()),
+                Err(_) => {
+                    rejected += 1;
+                    return Ok(());
+                }
+            };
+            let Ok((context, intent)) = payment_manifest::parse_for_network(manifest, session.member.network) else {
+                rejected += 1;
+                return Ok(());
+            };
+            if payment_manifest::validate_roster(
+                session.member.roster.vault,
+                session.member.threshold,
+                session.member.roster.members.iter().map(|member| member.id),
+                &context,
+                &intent,
+            )
+            .is_err()
+            {
                 rejected += 1;
                 return Ok(());
             }
-        };
-        let Ok((context, intent)) = payment_manifest::parse(manifest) else {
-            rejected += 1;
-            return Ok(());
-        };
-        if payment_manifest::validate_roster(
-            session.member.roster.vault,
-            session.member.roster.members.iter().map(|member| member.id),
-            &context,
-            &intent,
-        )
-        .is_err()
-        {
-            rejected += 1;
-            return Ok(());
-        }
-        if body.session != Some(context.attempt.0)
-            || Some(body.key.sender) != payment_manifest::proposer_id(&intent.proposer).ok()
-        {
-            rejected += 1;
-            return Ok(());
-        }
-        let directory = expected.join(hex_id(&context.attempt.0));
-        create_private_dir(&directory)?;
-        let path = directory.join("payment.json");
-        match create_private_file(&path, manifest) {
-            Ok(true) => imported += 1,
-            Ok(false) => {}
-            Err(Exit::Member(MemberError::Identity)) => {
+            if body.session != Some(context.attempt.0)
+                || Some(body.key.sender) != payment_manifest::proposer_id(&intent.proposer).ok()
+            {
                 rejected += 1;
                 return Ok(());
             }
-            Err(error) => return Err(error),
-        }
-        println!(
-            "proposal={} attempt={}",
-            hex_id(&context.payment),
-            hex_id(&context.attempt.0)
-        );
-        Ok(())
-    })?;
-    println!("imported_proposals={imported}");
-    println!("rejected_proposals={rejected}");
-    Ok(())
+            let directory = expected.join(hex_id(&context.attempt.0));
+            create_private_dir(&directory)?;
+            let path = directory.join("payment.json");
+            match create_private_file(&path, manifest) {
+                Ok(true) => imported += 1,
+                Ok(false) => {}
+                Err(Exit::Member(MemberError::Identity)) => {
+                    rejected += 1;
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+            if print {
+                println!(
+                    "proposal={} attempt={}",
+                    hex_id(&context.payment),
+                    hex_id(&context.attempt.0)
+                );
+            }
+            Ok(())
+        },
+    )?;
+    Ok((imported, rejected))
 }
 
 fn create_private_dir(path: &Path) -> Result<(), Exit> {
@@ -694,6 +745,15 @@ fn export_signing(
     work: &Path,
     attempt: Id32,
 ) -> Result<(), Exit> {
+    let work = checked_work(root, work)?;
+    let session = open_session(root, pass, roster)?;
+    let count = export_saved_signing(&session, &work, attempt)?;
+    println!("exported_signing={count}");
+    Ok(())
+}
+
+/// Check that `work` is a private directory inside the member root.
+fn checked_work(root: &Path, work: &Path) -> Result<PathBuf, Exit> {
     let member_root = fs::canonicalize(root).map_err(|_| Exit::Member(MemberError::Io))?;
     let work = fs::canonicalize(work).map_err(|_| Exit::Member(MemberError::Io))?;
     if !work.starts_with(&member_root) || work == member_root {
@@ -712,37 +772,171 @@ fn export_signing(
             return Err(Exit::Member(MemberError::Permissions));
         }
     }
-    let session = open_session(root, pass, roster)?;
+    Ok(work)
+}
+
+/// Append every received signing wire of `attempt` to `<work>/mailbox`; returns how many.
+fn export_saved_signing(session: &Session, work: &Path, attempt: Id32) -> Result<usize, Exit> {
     let mailbox = Mailbox::new(&work.join("mailbox")).map_err(|_| Exit::Member(MemberError::Io))?;
     let mut count = 0;
-    visit_pages(|after| session.db.recover_incoming_originals(after, PAGE), |row| {
-        if row.session != Some(attempt) || row.kind != 1 {
-            return Ok(());
+    visit_pages(
+        |after| session.db.recover_incoming_originals(after, PAGE),
+        |row| {
+            if row.session != Some(attempt) || row.kind != 1 {
+                return Ok(());
+            }
+            let Ok(opened) =
+                session
+                    .db
+                    .open_incoming(&session.member.roster, &session.member.identity, &row)
+            else {
+                return Ok(());
+            };
+            let Payload::Test(wire) = &opened.message().body().payload else {
+                return Ok(());
+            };
+            match decode_proposal_for_network(wire, session.member.network) {
+                Ok(Some(_)) | Err(_) => return Ok(()),
+                Ok(None) => {}
+            }
+            if session_envelope(wire).is_err() {
+                return Ok(());
+            }
+            mailbox
+                .append(wire)
+                .map_err(|_| Exit::Member(MemberError::Io))?;
+            count += 1;
+            Ok(())
+        },
+    )?;
+    Ok(count)
+}
+
+/// One payment sync in one session: what `send-proposal` for each queued proposal,
+/// `send-signing` for each saved wire, `upload`, `poll --once`, `import-proposals`,
+/// `export-signing` for each attempt and `status` did as separate processes.
+///
+/// The plan is a JSON file `{"proposals":[<payment.json>…], "signing":[{"attempt",
+/// "wire"}…], "export":[{"attempt","work"}…], "import":bool}`. Every message is
+/// committed before any request, then one poll uploads and receives. The report on
+/// stdout is JSON: for each proposal and signing message its id and whether it is
+/// stored on every member's relays, the imported and rejected proposal counts, and
+/// the exported wire count per attempt.
+fn payment_sync(root: &Path, pass: &Path, roster: &Path, plan: &Path) -> Result<(), Exit> {
+    let raw = read_exact(plan, 1024 * 1024, false)?;
+    let plan: serde_json::Value =
+        serde_json::from_slice(&raw).map_err(|_| Exit::Usage)?;
+    let list = |name: &str| -> Result<Vec<serde_json::Value>, Exit> {
+        match plan.get(name) {
+            None => Ok(Vec::new()),
+            Some(serde_json::Value::Array(items)) => Ok(items.clone()),
+            Some(_) => Err(Exit::Usage),
         }
-        let Ok(opened) =
-            session
-                .db
-                .open_incoming(&session.member.roster, &session.member.identity, &row)
-        else {
-            return Ok(());
-        };
-        let Payload::Test(wire) = &opened.message().body().payload else {
-            return Ok(());
-        };
-        match decode_proposal(wire) {
-            Ok(Some(_)) | Err(_) => return Ok(()),
-            Ok(None) => {}
+    };
+    let text = |item: &serde_json::Value, name: &str| -> Result<String, Exit> {
+        item.get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or(Exit::Usage)
+    };
+    let proposals = list("proposals")?
+        .iter()
+        .map(|item| item.as_str().map(PathBuf::from).ok_or(Exit::Usage))
+        .collect::<Result<Vec<_>, _>>()?;
+    let signing = list("signing")?
+        .iter()
+        .map(|item| Ok((parse_id(&text(item, "attempt")?)?, PathBuf::from(text(item, "wire")?))))
+        .collect::<Result<Vec<_>, Exit>>()?;
+    let exports = list("export")?
+        .iter()
+        .map(|item| Ok((parse_id(&text(item, "attempt")?)?, checked_work(root, Path::new(&text(item, "work")?))?)))
+        .collect::<Result<Vec<_>, Exit>>()?;
+    let import = match plan.get("import") {
+        None => false,
+        Some(serde_json::Value::Bool(value)) => *value,
+        Some(_) => return Err(Exit::Usage),
+    };
+    let mut session = open_session(root, pass, roster)?;
+    let mut sent_proposals = Vec::new();
+    for path in &proposals {
+        let manifest = read_exact(path, payment_manifest::MAX_MANIFEST, false)?;
+        let (_, attempt, saved) = save_proposal(&mut session, &manifest)?;
+        sent_proposals.push((attempt, saved));
+    }
+    let mut sent_signing = Vec::new();
+    for (attempt, path) in &signing {
+        let mut payload = read_exact(path, MAX_PAYLOAD, false)?;
+        let checked = session_envelope(&payload).map_err(|_| Exit::Member(MemberError::Bounds));
+        let saved = checked.and_then(|_| {
+            let request = *blake3::hash(&payload).as_bytes();
+            save_payload(&mut session, &payload, request, Some(*attempt))
+        });
+        payload.zeroize();
+        sent_signing.push((*attempt, saved?));
+    }
+    let (config, self_route) = routed(&session)?;
+    let now = now_ms()?;
+    runtime()?
+        .block_on(poll_once(
+            &mut session.db,
+            &RelayHttp::new().map_err(Exit::Client)?,
+            &session.member.identity,
+            &session.member.roster,
+            &config,
+            &self_route,
+            now,
+        ))
+        .map_err(Exit::Client)?;
+    let (imported, rejected) = if import {
+        import_saved_proposals(&session, root, &root.join("payments"), false)?
+    } else {
+        (0, 0)
+    };
+    let mut exported = serde_json::Map::new();
+    for (attempt, work) in &exports {
+        let count = export_saved_signing(&session, work, *attempt)?;
+        exported.insert(hex_id(attempt), count.into());
+    }
+    let stored = |session: &mut Session, logical: &RecoveryLogical| -> Result<bool, Exit> {
+        match session.db.delivery_report(
+            &session.member.roster,
+            &session.member.identity,
+            logical,
+            &config,
+            &self_route,
+        ) {
+            Ok(report) => Ok(report.whole_vault()),
+            Err(ClientError::Config) => Ok(false),
+            Err(error) => Err(Exit::Client(error)),
         }
-        if session_envelope(wire).is_err() {
-            return Ok(());
+    };
+    let mut proposal_report = serde_json::Map::new();
+    for (attempt, logical) in &sent_proposals {
+        proposal_report.insert(
+            hex_id(attempt),
+            serde_json::json!({"message": hex_id(&logical.key.message), "stored": stored(&mut session, logical)?}),
+        );
+    }
+    let mut signing_report = serde_json::Map::new();
+    for (attempt, logical) in &sent_signing {
+        let row = serde_json::json!({"message": hex_id(&logical.key.message), "stored": stored(&mut session, logical)?});
+        let entry = signing_report
+            .entry(hex_id(attempt))
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        if let serde_json::Value::Array(items) = entry {
+            items.push(row);
         }
-        mailbox
-            .append(wire)
-            .map_err(|_| Exit::Member(MemberError::Io))?;
-        count += 1;
-        Ok(())
-    })?;
-    println!("exported_signing={count}");
+    }
+    println!(
+        "{}",
+        serde_json::json!({
+            "proposals": proposal_report,
+            "signing": signing_report,
+            "imported": imported,
+            "rejected": rejected,
+            "exported": exported,
+        })
+    );
     Ok(())
 }
 
@@ -806,6 +1000,7 @@ fn status(
     roster: &Path,
     verify_relays: bool,
     diagnostics: bool,
+    attempt: Option<Id32>,
 ) -> Result<(), Exit> {
     let mut session = open_session(root, pass, roster)?;
     println!("section=local");
@@ -813,15 +1008,27 @@ fn status(
     println!("member={}", session.member.identity.public().id);
     print_reference(&session)?;
     print_authenticated_inboxes(&session)?;
-    let logicals = logical_page(&session.db)?;
-    let incoming = page_rows(
+    let mut logicals = logical_page(&session.db)?;
+    let mut incoming = page_rows(
         |after| session.db.recover_incoming_originals(after, PAGE),
         usize::MAX,
     )?;
-    let acks = page_rows(
+    let mut acks = page_rows(
         |after| session.db.recover_ack_links(after, PAGE),
         usize::MAX,
     )?;
+    if let Some(attempt) = attempt {
+        logicals.retain(|record| record.session == Some(attempt));
+        incoming.retain(|record| record.session == Some(attempt));
+        acks.retain(|ack| {
+            logicals
+                .iter()
+                .any(|record| record.key == ack.key && record.digest == ack.digest)
+                || incoming
+                    .iter()
+                    .any(|record| record.key == ack.key && record.digest == ack.digest)
+        });
+    }
     println!("logical_count={}", logicals.len());
     println!("incoming_count={}", incoming.len());
     println!("ack_count={}", acks.len());
@@ -902,6 +1109,39 @@ fn status(
     if diagnostics {
         print_diagnostics(&session)?;
     }
+    Ok(())
+}
+
+fn readiness(root: &Path, pass: &Path, roster: &Path) -> Result<(), Exit> {
+    let session = open_session(root, pass, roster)?;
+    let Some(config) = session
+        .configs
+        .load(&session.db, &session.member)
+        .map_err(Exit::Member)?
+    else {
+        println!("inboxes=0 peers=0 live=0 routable=0");
+        return Ok(());
+    };
+    let inboxes = config.own.len();
+    let peers = config.peer_wires.len();
+    let routable = inboxes == 3
+        && peers == session.member.roster.members.len() - 1
+        && session.configs.routing(&session.db, &session.member).is_ok();
+    let http = RelayHttp::new().map_err(Exit::Client)?;
+    let live = runtime()?.block_on(async {
+        let mut live = 0;
+        for inbox in &config.own {
+            if http
+                .entries(&inbox.route, &inbox.read, 0, Some(1))
+                .await
+                .is_ok()
+            {
+                live += 1;
+            }
+        }
+        live
+    });
+    println!("inboxes={inboxes} peers={peers} live={live} routable={}", u8::from(routable));
     Ok(())
 }
 
