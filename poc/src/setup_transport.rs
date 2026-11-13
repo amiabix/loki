@@ -212,6 +212,11 @@ impl Identity {
         }
     }
 
+    /// Authorize a device login key using the same Ed25519 enrollment proof as recovery.
+    pub fn authorize_device(&self, device_pub: &[u8]) -> [u8; 64] {
+        self.signing.sign(device_pub).to_bytes()
+    }
+
     pub fn sign_setup_agreement(
         &self,
         vault: &[u8; 32],

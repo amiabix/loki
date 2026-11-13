@@ -17,9 +17,11 @@
 
 pub mod backup;
 pub mod coordination;
+pub mod device_auth;
 pub(crate) mod durable;
 pub mod local;
 pub mod nonce;
+pub mod recovery;
 pub mod secure_element;
 #[cfg(all(feature = "apple-enclave", target_os = "macos"))]
 pub mod secure_element_apple;

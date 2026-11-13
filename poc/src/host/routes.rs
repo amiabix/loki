@@ -10,11 +10,11 @@ use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
 use super::{
-    ceremony, payment,
+    ceremony, device, payment, recovery,
     state::{Session, Shared},
 };
 
-type Reply = (StatusCode, Json<Value>);
+pub(super) type Reply = (StatusCode, Json<Value>);
 
 pub(super) fn ok(v: Value) -> Reply {
     (StatusCode::OK, Json(v))
@@ -43,6 +43,7 @@ pub fn router(state: Shared) -> Router {
         .route("/api/unlock", post(unlock))
         .route("/api/lock", post(lock))
         .route("/api/status", get(status))
+        .route("/api/registration", get(registration))
         .route("/api/create", post(ceremony::create))
         .route("/api/join", post(ceremony::join))
         .route("/api/enroll", post(ceremony::enroll))
@@ -60,8 +61,55 @@ pub fn router(state: Shared) -> Router {
         .route("/api/payment-finish", post(payment::finish))
         .route("/api/payment-verify", post(payment::verify))
         .route("/api/payments", get(payment::payments))
+        .route("/api/recovery-setup", post(recovery::setup))
+        .route("/api/recovery-status", get(recovery::status))
+        .route("/api/recovery-backup", get(recovery::fetch))
+        .route("/api/recovery-restore", post(recovery::restore))
+        .route("/api/device-enroll", post(device::enroll))
+        .route("/api/device-challenge", get(device::challenge))
+        .route("/api/device-login", post(device::login))
+        .route("/api/device-revoke", post(device::revoke))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
+        .layer(middleware::from_fn_with_state(state.clone(), browser_origin))
         .with_state(state)
+}
+
+/// Only the explicitly paired browser origin can read this device's API. The process
+/// capability is still required; CORS never authorizes a member action on its own.
+async fn browser_origin(State(st): State<Shared>, req: Request, next: Next) -> Response {
+    let origin = req.headers().get("origin").cloned();
+    if let Some(origin) = &origin {
+        let allowed = st.config.registration.as_ref().map(|c| c.coordinator.as_str());
+        if allowed.is_none() || origin.to_str().ok() != allowed {
+            return err(StatusCode::FORBIDDEN, "browser origin is not paired").into_response();
+        }
+    }
+    let mut response = if req.method() == axum::http::Method::OPTIONS {
+        let method = req.headers().get("access-control-request-method").and_then(|v| v.to_str().ok());
+        let headers = req.headers().get("access-control-request-headers").and_then(|v| v.to_str().ok()).unwrap_or("");
+        if origin.is_none() || !matches!(method, Some("GET" | "POST"))
+            || headers.split(',').any(|h| !matches!(h.trim().to_ascii_lowercase().as_str(), "" | "content-type" | "x-loki-token")) {
+            return err(StatusCode::FORBIDDEN, "unsupported browser request").into_response();
+        }
+        StatusCode::NO_CONTENT.into_response()
+    } else { next.run(req).await };
+    if let Some(origin) = origin {
+        let headers = response.headers_mut();
+        headers.insert("access-control-allow-origin", origin);
+        headers.insert("access-control-allow-methods", "GET, POST".parse().unwrap());
+        headers.insert("access-control-allow-headers", "content-type, x-loki-token".parse().unwrap());
+        headers.insert("access-control-allow-private-network", "true".parse().unwrap());
+        headers.insert("vary", "Origin".parse().unwrap());
+    }
+    response.headers_mut().insert("cache-control", "no-store".parse().unwrap());
+    response
+}
+
+async fn registration(State(st): State<Shared>) -> Reply {
+    match st.registration.read().await.as_ref() {
+        Some(member) => ok(json!(member)),
+        None => err(StatusCode::CONFLICT, "device has not self-registered"),
+    }
 }
 
 /// Every `/api/*` request must carry the process token (the web proxy injects it).

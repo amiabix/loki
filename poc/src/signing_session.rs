@@ -800,7 +800,7 @@ pub struct SigningSession {
 /// (relay public key, relay run ID, mailbox), fixed before commitments are published.
 pub type WitnessPins = [([u8; 32], [u8; 32], [u8; 32]); 2];
 
-fn valid_witness_pins(pins: WitnessPins) -> bool {
+pub(crate) fn valid_witness_pins(pins: WitnessPins) -> bool {
     pins[0].0 != pins[1].0
         && pins[0].1 != pins[1].1
         && pins[0].2 != pins[1].2

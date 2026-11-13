@@ -29,6 +29,9 @@ use std::path::PathBuf;
 use zeroize::Zeroizing;
 
 const BACKUP_MAGIC: &[u8; 8] = b"LOKIBAK2";
+/// Magic for a recovery-sealed artifact: same plaintext as [`BACKUP_MAGIC`], but HPKE-sealed
+/// to a words-derived recovery public key instead of a passphrase KEK.
+const RECOVERY_BACKUP_MAGIC: &[u8; 8] = b"LOKIRCV1";
 
 fn network_tag(n: Network) -> u8 {
     match n {
@@ -229,6 +232,13 @@ pub fn verify(
     let sealed = SealedShare::from_bytes(&artifact.0[8..])?;
     let plain = sealed.open(&se)?;
     let material = BackupMaterial::decode_plaintext(&plain)?;
+    validate_material(material, vault_id)
+}
+
+/// Shared post-decode checks for any backup artifact, however it was sealed: it is for this
+/// vault, its share + public package parse and derive a valid FVK, and (when present) its
+/// identity is the one its own roster names.
+fn validate_material(material: BackupMaterial, vault_id: &[u8; 32]) -> Result<BackupMaterial, String> {
     if &material.vault_id != vault_id {
         return Err("backup is for a different vault".into());
     }
@@ -271,6 +281,18 @@ pub fn restore<SE: SecureElement>(
     approval: ApprovalPolicy,
 ) -> Result<LocalSigner<SE>, SignerError> {
     let material = verify(artifact, passphrase, vault_id).map_err(SignerError::Other)?;
+    rebuild_signer(material, se, nonce_dir, approval)
+}
+
+/// Reconstruct a signing-ready signer from already-validated material, re-sealing the share
+/// under the NEW device's `se` and opening the nonce store at `backup_epoch + 1`. Shared by
+/// the passphrase ([`restore`]) and recovery-words ([`restore_recovery`]) restore paths.
+fn rebuild_signer<SE: SecureElement>(
+    material: BackupMaterial,
+    se: SE,
+    nonce_dir: PathBuf,
+    approval: ApprovalPolicy,
+) -> Result<LocalSigner<SE>, SignerError> {
     let ak = material.group_ak().map_err(SignerError::Other)?;
     let fvk = zip2005::frost_viewing_key(&ak, &material.group_sk)
         .map_err(|e| SignerError::Other(format!("FVK derivation: {e:?}")))?;
@@ -302,6 +324,58 @@ pub fn restore<SE: SecureElement>(
         approval,
         identity,
     )
+}
+
+/// RECOVERY BACKUP: seal `material` to a words-derived recovery PUBLIC key (RFC 9180 HPKE),
+/// vault-scoped. Needs only the public key, so the signer makes a fresh backup for every new
+/// vault without re-entering its recovery words; only the matching recovery key (the 24 words)
+/// can reopen it. The service may hold this artifact — it is opaque ciphertext to anyone but
+/// the words-holder. See [`crate::signer::recovery`].
+pub fn create_to_recovery(
+    material: &BackupMaterial,
+    recovery_pub: &[u8; 32],
+) -> Result<BackupArtifact, String> {
+    let blob = crate::signer::recovery::seal_backup(
+        recovery_pub,
+        &material.vault_id,
+        &material.encode_plaintext(),
+    )?;
+    let mut out = Vec::with_capacity(8 + blob.len());
+    out.extend_from_slice(RECOVERY_BACKUP_MAGIC);
+    out.extend_from_slice(&blob);
+    Ok(BackupArtifact(out))
+}
+
+/// VERIFY a recovery-sealed artifact with the words-derived recovery key (same validation as
+/// the passphrase [`verify`]). Wrong words (different key) or a tampered blob -> `Err`.
+pub fn verify_recovery(
+    artifact: &BackupArtifact,
+    recovery: &crate::signer::recovery::RecoveryKey,
+    vault_id: &[u8; 32],
+) -> Result<BackupMaterial, String> {
+    if artifact.0.len() < 8 || &artifact.0[..8] != RECOVERY_BACKUP_MAGIC {
+        return Err("not a Loki recovery backup artifact".into());
+    }
+    let plain = recovery.open_backup(vault_id, &artifact.0[8..])?;
+    let material = BackupMaterial::decode_plaintext(&plain)?;
+    validate_material(material, vault_id)
+}
+
+/// RESTORE from a recovery-sealed artifact onto a fresh data root (the new-phone path):
+/// re-derive the recovery key from the 24 words, open the service-held backup, and rebuild a
+/// signing-ready signer under this device's `se`. Mirrors [`restore`]; `nonce_dir` MUST be a
+/// fresh/empty directory.
+#[allow(clippy::too_many_arguments)]
+pub fn restore_recovery<SE: SecureElement>(
+    artifact: &BackupArtifact,
+    recovery: &crate::signer::recovery::RecoveryKey,
+    vault_id: &[u8; 32],
+    se: SE,
+    nonce_dir: PathBuf,
+    approval: ApprovalPolicy,
+) -> Result<LocalSigner<SE>, SignerError> {
+    let material = verify_recovery(artifact, recovery, vault_id).map_err(SignerError::Other)?;
+    rebuild_signer(material, se, nonce_dir, approval)
 }
 
 #[cfg(test)]
@@ -350,6 +424,79 @@ mod tests {
             birth_height: None,
         };
         (material, public)
+    }
+
+    #[test]
+    fn recovery_artifact_restores_a_signing_share_from_the_words() {
+        use crate::signer::recovery::RecoveryKey;
+        let (material, public) = fixture();
+        let vault_id = material.vault_id;
+
+        // First launch: words + recovery key. Back up to the PUBLIC key only.
+        let (words, key) = RecoveryKey::generate().unwrap();
+        let art = create_to_recovery(&material, &key.public_bytes()).unwrap();
+        drop(key);
+        // The share plaintext never appears in the artifact bytes.
+        assert!(!art
+            .0
+            .windows(material.key_package.len())
+            .any(|w| w == material.key_package.as_slice()));
+
+        // Wrong words cannot open it.
+        let (other, _) = RecoveryKey::generate().unwrap();
+        assert!(verify_recovery(&art, &RecoveryKey::from_words(&other).unwrap(), &vault_id).is_err());
+
+        // New phone: re-derive from the SAME words, restore onto a clean root, and sign.
+        let restored_key = RecoveryKey::from_words(&words).unwrap();
+        let mut signer = restore_recovery(
+            &art,
+            &restored_key,
+            &vault_id,
+            SoftwareSecureElement::generate(),
+            tempdir("recovery-nonces"),
+            Box::new(|_v| true),
+        )
+        .unwrap();
+
+        let ak: [u8; 32] = public.verifying_key().serialize().unwrap().try_into().unwrap();
+        let fvk = zip2005::frost_viewing_key(&ak, &material.group_sk).unwrap();
+        let key1 = frost::keys::KeyPackage::deserialize(&material.key_package).unwrap();
+        let cand = CandidateRef {
+            vault_id,
+            payment_id: [3u8; 32],
+            attempt_id: [4u8; 32],
+        };
+        let session = signer
+            .connect("http://coordinator.test", Network::Regtest, b"c")
+            .unwrap()
+            .session;
+        let own = signer.sign_commit(&session, &cand).unwrap();
+        let key2 = {
+            let (shares, _p) = frost::keys::generate_with_dealer(
+                3,
+                2,
+                frost::keys::IdentifierList::Default,
+                &mut rand_core::OsRng,
+            )
+            .unwrap();
+            frost::keys::KeyPackage::try_from(
+                shares.get(&frost::Identifier::try_from(2u16).unwrap()).unwrap().clone(),
+            )
+            .unwrap()
+        };
+        let (pczt, pkg, seed) = crate::signer::local::tests::candidate_and_package(
+            &fvk,
+            &key1,
+            &public,
+            *key2.identifier(),
+            frost::round1::commit(key2.signing_share(), &mut rand_core::OsRng).1,
+            own,
+            true,
+        );
+        let share = signer
+            .sign_approve(&session, &cand, &pczt, &pkg, &seed)
+            .expect("the words-restored share must sign a candidate for its group key");
+        assert_eq!(share.serialize().len(), 32);
     }
 
     #[test]

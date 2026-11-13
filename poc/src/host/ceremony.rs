@@ -215,7 +215,7 @@ pub(super) fn vault_summaries(data: &Path, pass: &str) -> Result<Vec<Value>, Str
     Ok(out)
 }
 
-fn identity(data: &Path, pass: &str, slot: u16) -> Result<Identity, String> {
+pub(super) fn identity(data: &Path, pass: &str, slot: u16) -> Result<Identity, String> {
     let d = MemberDir::create(data, ".").map_err(|e| e.to_string())?;
     match d.read_sealed("identity.sealed", pass) {
         Ok(raw) => {
@@ -1093,6 +1093,8 @@ mod tests {
             operator_key: None, enrollment_issuer: None, development_http: false,
             token: "test".into(), frostd_url: "http://127.0.0.1:2744".into(),
             peers: BTreeMap::new(),
+            registration: None, bind: "127.0.0.1".parse().unwrap(), advertise_url: None,
+            secure_element: "software".into(), nonce_witnesses: None, loopback_peers: false,
         }));
         *st.session.write().await = Some(Session {
             passphrase: Zeroizing::new("pass".into()), data: data.clone(),
@@ -1124,6 +1126,12 @@ mod tests {
             token: "test".into(),
             frostd_url: "http://127.0.0.1:2744".into(),
             peers: BTreeMap::new(),
+            registration: None,
+            bind: "127.0.0.1".parse().unwrap(),
+            advertise_url: None,
+            secure_element: "software".into(),
+            nonce_witnesses: None,
+            loopback_peers: false,
         }));
         *st.session.write().await = Some(Session {
             passphrase: Zeroizing::new("test passphrase".into()),
@@ -1193,4 +1201,116 @@ mod tests {
         eprintln!("PASS: emitted invite codes contain no vault_secret");
         std::fs::remove_dir_all(data).unwrap();
     }
+}
+
+// ---- self-custody helpers ported from the speedmaster host (device pairing + recovery restore) ----
+pub(super) fn signer_dir(data: &Path, vault: &str) -> Result<PathBuf, String> {
+    Ok(dir(data, vault)?.path().join("signer"))
+}
+
+/// Build the passphrase-sealed `vault.sealed` payload that `payment::load_vault` reads. Shared
+/// by DKG completion and recovery restore so both emit the identical schema.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn vault_sealed_bytes(
+    vault: &str,
+    slot: u16,
+    threshold: u16,
+    members: u16,
+    roster_fingerprint: &str,
+    public: &frost::keys::PublicKeyPackage,
+    fvk: &orchard::keys::FullViewingKey,
+    birth_height: u32,
+    network: VaultNetwork,
+) -> Result<Vec<u8>, String> {
+    let ak: [u8; 32] = public
+        .verifying_key()
+        .serialize()
+        .map_err(|e| e.to_string())?
+        .try_into()
+        .map_err(|_| "group key length")?;
+    let group_address = vault::unified_address(&fvk, network.network_type());
+    let sealed = json!({
+        "vault": vault, "threshold": threshold, "members": members,
+        "roster_fingerprint": roster_fingerprint,
+        "public_package": hex::encode(public.serialize().map_err(|e| e.to_string())?),
+        "my_frost_id": slot, "group_address": group_address,
+        "group_ak": hex::encode(ak),
+        "birth_height": birth_height, "key_derivation": zip2005::VERSION,
+        "network": network.label(),
+    });
+    serde_json::to_vec(&sealed).map_err(|e| e.to_string())
+}
+
+/// Recovery restore: rebuild this member's `vault.sealed` (and `identity.sealed` if missing)
+/// from the stored recovery backup, opened with the member's 24 words. After this the hosted
+/// payment path can re-open the vault and sign, exactly as after the original ceremony.
+pub(super) fn restore_vault_from_backup(
+    data: &Path,
+    vault: &str,
+    words: &str,
+    pass: &str,
+    config: &super::Config,
+) -> Result<(), String> {
+    let key = crate::signer::recovery::RecoveryKey::from_words(words)?;
+    let blob = std::fs::read(super::recovery::backup_file(&signer_dir(data, vault)?))
+        .map_err(|_| "no recovery backup for this vault".to_string())?;
+    let vault_id = vault_bytes(vault)?;
+    let material = crate::signer::backup::verify_recovery(&BackupArtifact(blob), &key, &vault_id)?;
+
+    let pp = frost::keys::PublicKeyPackage::deserialize(&material.public_package)
+        .map_err(|e| e.to_string())?;
+    let kp = frost::keys::KeyPackage::deserialize(&material.key_package).map_err(|e| e.to_string())?;
+    let id = frost::Identifier::try_from(material.member_id).map_err(|e| e.to_string())?;
+    if kp.identifier() != &id || kp.verifying_key() != pp.verifying_key()
+        || pp.min_signers() != Some(material.threshold)
+        || pp.verifying_shares().len() != usize::from(material.members)
+        || pp.verifying_shares().get(&id) != Some(kp.verifying_share()) {
+        return Err("recovery share differs from its public vault metadata".into());
+    }
+    let network = match material.network {
+        Network::Regtest => VaultNetwork::Regtest,
+        Network::Testnet => VaultNetwork::Testnet,
+    };
+    let fvk = zip2005::frost_viewing_key(&pp.verifying_key().serialize().map_err(|e| e.to_string())?.try_into().map_err(|_| "group key length")?, &material.group_sk)
+        .map_err(|e| format!("group viewing key: {e:?}"))?;
+    let bytes = vault_sealed_bytes(
+        vault,
+        material.member_id,
+        material.threshold,
+        material.members,
+        &hex::encode(material.roster_fingerprint),
+        &pp,
+        &fvk,
+        material.birth_height.unwrap_or(0),
+        network,
+    )?;
+    let sdir = signer_dir(data, vault)?;
+    let se = config.open_secure_element(&sdir, pass)?;
+    let store = if sdir.join("signer.meta").exists() {
+        crate::signer::store::SignerStore::open(&sdir)?
+    } else {
+        crate::signer::store::SignerStore::create(&sdir, material.network, vault_id, material.member_id)?
+    };
+    if store.vault() != vault_id || store.member() != material.member_id || store.network() != material.network {
+        return Err("recovery backup belongs to another signer".into());
+    }
+    if dir(data, vault)?.exists("vault.sealed") {
+        return Err("vault already exists; restore into a fresh device profile".into());
+    }
+    let previous_epoch = store.read(&se, crate::signer::store::FileKind::Share)?
+        .map(|(epoch, _)| epoch).unwrap_or(0);
+    let epoch = material.backup_epoch.max(previous_epoch).checked_add(1).ok_or("backup epoch overflow")?;
+    store.write(&se, crate::signer::store::FileKind::Share, epoch,
+        &crate::signer::local::encode_share(&material.key_package, &material.public_package, &material.group_sk))?;
+    dir(data, vault)?
+        .write_sealed("vault.sealed", &bytes, pass)
+        .map_err(|e| e.to_string())?;
+
+    // A brand-new device also needs the member identity the vault is enrolled under.
+    let root = MemberDir::open(data, ".");
+    if !root.exists("identity.sealed") && !material.identity.is_empty() {
+        root.write_sealed("identity.sealed", &material.identity, pass)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }

@@ -286,7 +286,7 @@ impl SetupCheckpoint {
 }
 
 /// The share file: key package, group public package and `vs`.
-fn encode_share(key_package: &[u8], public_package: &[u8], vs: &[u8; 32]) -> Zeroizing<Vec<u8>> {
+pub(crate) fn encode_share(key_package: &[u8], public_package: &[u8], vs: &[u8; 32]) -> Zeroizing<Vec<u8>> {
     let mut out = Zeroizing::new(Vec::new());
     out.extend_from_slice(&(key_package.len() as u32).to_be_bytes());
     out.extend_from_slice(key_package);
@@ -297,7 +297,7 @@ fn encode_share(key_package: &[u8], public_package: &[u8], vs: &[u8; 32]) -> Zer
 }
 
 #[allow(clippy::type_complexity)]
-fn decode_share(raw: &[u8]) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>, [u8; 32]), String> {
+pub(crate) fn decode_share(raw: &[u8]) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>, [u8; 32]), String> {
     let mut reader = crate::dkg_core::Reader::new(raw);
     let key = Zeroizing::new(reader.field(64 * 1024)?.to_vec());
     let public = reader.field(64 * 1024)?.to_vec();
