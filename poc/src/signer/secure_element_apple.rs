@@ -34,6 +34,8 @@ extern "C" {
     fn se_open_persistent(tag: *const u8, tag_len: isize, out_handle: *mut u64) -> isize;
     fn se_wrap(handle: u64, dek: *const u8, dek_len: isize, out: *mut u8, out_cap: isize) -> isize;
     fn se_unwrap(handle: u64, ct: *const u8, ct_len: isize, out: *mut u8, out_cap: isize) -> isize;
+    fn se_sign(handle: u64, msg: *const u8, msg_len: isize, out: *mut u8, out_cap: isize) -> isize;
+    fn se_public_key(handle: u64, out: *mut u8, out_cap: isize) -> isize;
     fn se_close(handle: u64);
 }
 
@@ -67,6 +69,36 @@ impl AppleSecureElement {
             ));
         }
         Ok(Self { handle })
+    }
+}
+
+impl AppleSecureElement {
+    /// Sign `msg` with the Enclave key (ECDSA/SHA-256, DER) — the device login-challenge
+    /// signature. On a persistent biometric key this prompts Face/Touch ID; the private op
+    /// stays inside the Enclave. Verified by [`crate::signer::device_auth::DeviceRegistry`].
+    pub fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, String> {
+        // A P-256 ECDSA DER signature is <= 72 bytes; 128 is a comfortable ceiling.
+        let mut out = vec![0u8; 128];
+        let n = unsafe {
+            se_sign(self.handle, msg.as_ptr(), msg.len() as isize, out.as_mut_ptr(), out.len() as isize)
+        };
+        if n <= 0 {
+            return Err(format!("se_sign failed (code {n})"));
+        }
+        out.truncate(n as usize);
+        Ok(out)
+    }
+
+    /// The Enclave key's PUBLIC point, X9.63 uncompressed (`04 || X || Y`, 65 bytes for P-256).
+    /// This is what Loki enrolls as the device key; the private key never leaves the Enclave.
+    pub fn public_key_sec1(&self) -> Result<Vec<u8>, String> {
+        let mut out = vec![0u8; 128];
+        let n = unsafe { se_public_key(self.handle, out.as_mut_ptr(), out.len() as isize) };
+        if n <= 0 {
+            return Err(format!("se_public_key failed (code {n})"));
+        }
+        out.truncate(n as usize);
+        Ok(out)
     }
 }
 

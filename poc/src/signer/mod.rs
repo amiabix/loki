@@ -20,8 +20,11 @@ pub mod coordination;
 pub mod device_auth;
 pub(crate) mod durable;
 pub mod local;
+#[cfg(any(test, all(feature = "apple-enclave", target_os = "macos")))]
+pub(crate) mod native_member;
 pub mod nonce;
 pub mod recovery;
+pub mod repair;
 pub mod secure_element;
 #[cfg(all(feature = "apple-enclave", target_os = "macos"))]
 pub mod secure_element_apple;
@@ -116,7 +119,7 @@ impl CandidatePczt {
 }
 
 /// Names a candidate the coordinator wants this member to commit/sign to. Public.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CandidateRef {
     pub vault_id: [u8; 32],
     pub payment_id: [u8; 32],

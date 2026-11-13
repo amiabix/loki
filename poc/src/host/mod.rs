@@ -9,6 +9,8 @@ mod payment;
 mod nonce_witness;
 mod recovery;
 mod registration;
+#[cfg(test)]
+mod repair;
 mod routes;
 mod state;
 

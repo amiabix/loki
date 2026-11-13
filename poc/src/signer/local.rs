@@ -44,7 +44,16 @@ use zeroize::Zeroizing;
 /// is a full-screen confirmation + biometric prompt; here it is a policy callback so the
 /// tests can drive approve/refuse deterministically (ws1-signer §7: "a callback/policy is
 /// fine for tests").
-pub type ApprovalPolicy = Box<dyn FnMut(&PaymentView) -> bool + Send>;
+pub type ApprovalPolicy = Box<dyn FnMut(&ApprovalRequest<'_>) -> bool + Send>;
+
+/// What the member is asked to approve: the independently rendered payment, the candidate it
+/// belongs to, and the sighash recomputed from the same PCZT bytes — so consent binds to the
+/// exact thing that will be signed, not just the human-readable view.
+pub struct ApprovalRequest<'a> {
+    pub candidate: &'a CandidateRef,
+    pub sighash: [u8; 32],
+    pub view: &'a PaymentView,
+}
 
 /// The member's on-device decision on a coordinator connection, shown with the
 /// coordinator's origin and network. Only an approved session may receive the address.
@@ -657,6 +666,17 @@ impl<SE: SecureElement> LocalSigner<SE> {
             self.public_package.as_deref().ok_or(SignerError::NoShare)?
         ).map_err(|e| SignerError::Other(e.to_string()))?;
         Ok((self.open_key()?, public, Zeroizing::new(*setup.core.vault_secret())))
+    }
+
+    /// Public vault metadata (group public-key package + full viewing key) for an active
+    /// signer, without touching the sealed share. Used by the native member serve path.
+    pub fn hosted_metadata(&self) -> Result<(frost::keys::PublicKeyPackage, FullViewingKey), SignerError> {
+        self.require_ready()?;
+        let public = frost::keys::PublicKeyPackage::deserialize(
+            self.public_package.as_deref().ok_or(SignerError::NoShare)?,
+        )
+        .map_err(|e| SignerError::Other(e.to_string()))?;
+        Ok((public, self.fvk()?.clone()))
     }
 
     /// The device-side "abandon this setup" action: wipe the setup's fresh key, FROST
@@ -1423,16 +1443,19 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
         let view = wysiwys::describe_pczt(pczt, self.fvk()?).map_err(SignerError::Other)?;
         self.rendered.insert(cand.attempt_id, view.clone());
 
-        // 2. The member decides on THAT render (policy/biometric). Refusal is first-class.
-        if !(self.approval)(&view) {
+        // 2. Recompute the sighash from the SAME bytes, so consent binds to it (not just the view).
+        let local_sighash =
+            wysiwys::sighash_of_pczt(pczt, self.fvk()?).map_err(SignerError::Other)?;
+
+        // 3. The member decides on THAT render + candidate + sighash (policy/biometric).
+        //    Refusal is first-class.
+        if !(self.approval)(&ApprovalRequest { candidate: cand, sighash: local_sighash, view: &view }) {
             return Err(SignerError::MemberRefused);
         }
 
-        // 3. BINDING (the must-fix): recompute the sighash from the SAME bytes and require
-        //    the SigningPackage to name exactly it. Done BEFORE the nonce/share is touched,
-        //    so a mismatched package can never consume a nonce or release a share.
-        let local_sighash =
-            wysiwys::sighash_of_pczt(pczt, self.fvk()?).map_err(SignerError::Other)?;
+        // 4. BINDING (the must-fix): require the SigningPackage to name exactly that sighash.
+        //    Done BEFORE the nonce/share is touched, so a mismatched package can never consume
+        //    a nonce or release a share.
         if pkg.message().as_slice() != local_sighash {
             return Err(SignerError::SighashMismatch);
         }

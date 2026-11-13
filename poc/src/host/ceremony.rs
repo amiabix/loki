@@ -216,15 +216,19 @@ pub(super) fn vault_summaries(data: &Path, pass: &str) -> Result<Vec<Value>, Str
 }
 
 pub(super) fn identity(data: &Path, pass: &str, slot: u16) -> Result<Identity, String> {
+    if !(1..=crate::member_state::MAX_MEMBERS).contains(&slot) {
+        return Err("invalid member slot".into());
+    }
     let d = MemberDir::create(data, ".").map_err(|e| e.to_string())?;
     match d.read_sealed("identity.sealed", pass) {
         Ok(raw) => {
-            let raw = Zeroizing::new(raw);
-            let id = Identity::from_secret_bytes(&raw)?;
-            if id.public().id != slot {
-                return Err("this coordinator already has a different member slot".into());
+            let mut raw = Zeroizing::new(raw);
+            if raw.len() != 66 {
+                return Err("invalid DKG identity length".into());
             }
-            Ok(id)
+            // Keys belong to the profile; the FROST slot belongs to each vault.
+            raw[..2].copy_from_slice(&slot.to_be_bytes());
+            Identity::from_secret_bytes(&raw)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let id = Identity::new(slot);
@@ -1313,4 +1317,15 @@ pub(super) fn restore_vault_from_backup(
             .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// Re-derive a vault's FROST roster from stored ceremony state, verifying it still matches the
+/// recorded fingerprint. Used by the repair flow to rebuild roster-dependent artifacts.
+pub(super) fn repair_roster(data: &Path, pass: &str, vault: &str) -> Result<FrostRoster, String> {
+    let c = load(data, pass, vault)?;
+    let roster = roster_of(&c)?;
+    if c.fingerprint.as_deref() != Some(hex::encode(roster.fingerprint()).as_str()) {
+        return Err("stored roster fingerprint mismatch".into());
+    }
+    Ok(roster)
 }
