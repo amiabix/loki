@@ -679,6 +679,69 @@ impl VaultWallet {
         Ok(())
     }
 
+    /// Atomically re-binds the reservations for `nullifiers` from `from` to `to`, extending each
+    /// lock to `expiry_height`. Used when a draft's reserved inputs move to the broadcast txid so
+    /// the reservation survives the draft→tx transition. Idempotent for inputs already held by
+    /// `to`; fails without changing anything if any input is held by a third owner.
+    pub fn transfer_inputs(
+        &mut self,
+        from: LockOwner,
+        to: LockOwner,
+        nullifiers: &[[u8; 32]],
+        expiry_height: u32,
+    ) -> Result<(), String> {
+        let height = self
+            .scanned_height()?
+            .ok_or("wallet has not scanned any blocks")?;
+        if nullifiers.is_empty() || expiry_height <= height {
+            return Err("payment has no inputs or has expired".into());
+        }
+        let outputs = self.input_refs(nullifiers)?;
+        let expiry = BlockHeight::from_u32(expiry_height);
+        let from_bytes = *from.as_bytes();
+        let to_bytes = *to.as_bytes();
+        self.db
+            .transactionally_with_extension(|db, ext| {
+                // Validate every input is held by `from` (or already by `to`) before mutating any,
+                // so a third-party lock aborts the whole transfer (the transaction rolls back).
+                let mut source_locked = Vec::new();
+                for output in &outputs {
+                    let owner: Option<[u8; 32]> = ext
+                        .query_row(
+                            "SELECT rn.lock_owner FROM ironwood_received_notes rn \
+                             JOIN transactions t ON t.id_tx = rn.transaction_id \
+                             WHERE t.txid = ?1 AND rn.action_index = ?2",
+                            rusqlite::params![output.txid().as_ref(), output.output_index()],
+                            |row| row.get::<_, Option<Vec<u8>>>(0),
+                        )
+                        .optional()?
+                        .flatten()
+                        .map(|o| {
+                            <[u8; 32]>::try_from(o)
+                                .map_err(|_| io::Error::other("invalid payment reservation owner"))
+                        })
+                        .transpose()?;
+                    match owner {
+                        Some(o) if o == to_bytes => {}
+                        Some(o) if o == from_bytes => source_locked.push(*output),
+                        _ => {
+                            return Err(Box::new(io::Error::other(
+                                "input is not reserved by the source owner",
+                            )) as Box<dyn std::error::Error>)
+                        }
+                    }
+                }
+                // Release the source locks, then (re)lock all inputs under `to` at the new expiry.
+                for output in &source_locked {
+                    db.unlock_output(output, from)?;
+                }
+                db.lock_outputs(&outputs, to, expiry)
+                    .map_err(|e| Box::new(io::Error::other(format!("lock payment inputs: {e:?}"))) as Box<dyn std::error::Error>)?;
+                Ok::<(), Box<dyn std::error::Error>>(())
+            })
+            .map_err(|e| format!("transfer payment inputs: {e}"))
+    }
+
     fn input_refs(&self, nullifiers: &[[u8; 32]]) -> Result<Vec<OutputRef>, String> {
         let height = self
             .scanned_height()?
