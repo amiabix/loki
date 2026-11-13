@@ -17,9 +17,13 @@ import Security
 // Error codes returned to Rust (negative = failure, >=0 = byte count written):
 //   -1 no key handle          -2 ECIES encrypt failed      -3 output buffer too small
 //   -4 ECIES decrypt failed   -5 key create failed         -6 key load/not-found
-//   -7 access-control build    -8 unknown handle
+//   -7 access-control build    -8 unknown handle           -9 ECDSA sign failed
+//   -10 public-key export failed
 
 private let algo = SecKeyAlgorithm.eciesEncryptionCofactorX963SHA256AESGCM
+// ECDSA over SHA-256 of the message, ASN.1/DER (X9.62) output — the device login-challenge
+// signature. The same Enclave key signs and wraps; no usage flag restricts it.
+private let sigAlgo = SecKeyAlgorithm.ecdsaSignatureMessageX962SHA256
 
 // Opaque handle table: Rust holds a u64, Swift owns the SecKey. Avoids leaking SecKey
 // pointers across the FFI and lets one process hold several elements (tests do).
@@ -129,6 +133,37 @@ public func se_unwrap(_ handle: UInt64,
     if pt.count > outCap { return -3 }
     pt.copyBytes(to: out, count: pt.count)
     return pt.count
+}
+
+// MARK: - device login key (same Enclave key, ECDSA path)
+
+// Sign `msg` with the Enclave key (ECDSA/SHA-256, DER). On a persistent biometric key this
+// prompts Face/Touch ID — proof of user presence for a login challenge. The private op runs
+// inside the Secure Enclave; only the signature comes back.
+@_cdecl("se_sign")
+public func se_sign(_ handle: UInt64,
+                    _ msg: UnsafePointer<UInt8>, _ msgLen: Int,
+                    _ out: UnsafeMutablePointer<UInt8>, _ outCap: Int) -> Int {
+    guard let k = fetch(handle) else { return -8 }
+    let data = Data(bytes: msg, count: msgLen)
+    guard let sig = SecKeyCreateSignature(k, sigAlgo, data as CFData, nil) as Data? else { return -9 }
+    if sig.count > outCap { return -3 }
+    sig.copyBytes(to: out, count: sig.count)
+    return sig.count
+}
+
+// Export the Enclave key's PUBLIC point as X9.63 uncompressed bytes (04 || X || Y, 65B for
+// P-256) — what Loki enrolls and verifies challenge signatures against. The private key never
+// leaves the Enclave (SecKeyCopyExternalRepresentation on it would refuse).
+@_cdecl("se_public_key")
+public func se_public_key(_ handle: UInt64,
+                          _ out: UnsafeMutablePointer<UInt8>, _ outCap: Int) -> Int {
+    guard let k = fetch(handle) else { return -8 }
+    guard let pub = SecKeyCopyPublicKey(k) else { return -1 }
+    guard let rep = SecKeyCopyExternalRepresentation(pub, nil) as Data? else { return -10 }
+    if rep.count > outCap { return -3 }
+    rep.copyBytes(to: out, count: rep.count)
+    return rep.count
 }
 
 @_cdecl("se_close")

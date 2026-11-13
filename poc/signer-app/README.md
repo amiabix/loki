@@ -1,14 +1,85 @@
-# LokiSigner — minimal signer app (Secure Enclave persistence proof + seed of the native signer)
+# LokiSigner — member-owned native signer
 
-Proves a **persistent** Secure Enclave key wrapping/unwrapping the signer DEK, inside a
-provisioned macOS app (the only place macOS allows persistent SE keys — a bare CLI gets
-`errSecMissingEntitlement` / SIGKILL). This is the seed of the native signer shell.
+The native app claims a `loki://pair` link, opens the existing persistent Secure Enclave
+P-256 device key, and runs S4a self-registration. The coordinator receives public enrollment
+and a challenge signature. Profile passphrases, local session capabilities and FROST shares
+stay on the member device. The FROST share is encrypted with an Enclave-wrapped key; it is
+opened in signer memory for signing.
+
+## Build and pair
+
+```sh
+LOKI_DEV_TEAM=B399KAT22M bash poc/signer-app/build.sh
+open poc/signer-app/out/LokiSigner.app
+```
+
+In the web wallet choose **Pair a new native signer**, then **Open LokiSigner** (or copy the
+link to the member's Mac). Confirm the coordinator shown in the native dialog. Enter a local
+profile passphrase, save the recovery words privately, and approve the Enclave prompt. The
+app displays a private local session link: paste it into the wallet tab on **that same Mac**.
+The app stays running for ceremony, payment review and signing using the existing device
+consent and nonce-witness paths. Quit locks the process; launch again to unlock and register
+with the saved public coordinator/slot, without reusing the claim.
+
+Pairing reserves a slot for 120 seconds. Both claim and registration are consumed once,
+including failed proofs; claiming does not extend the deadline. If it expires while saving
+recovery words, request a fresh link for the same slot. After a lost response, restart and
+unlock; an outstanding reservation may need to expire before retry. Public device bindings
+prevent a different identity or slot from reusing the enrolled key.
+
+The default data directory is `~/Library/Application Support/LokiSigner`; default listener
+is a dynamically chosen loopback port. Production coordinator links require HTTPS. Local
+HTTP coordinators need an explicit development launch:
+
+```sh
+poc/signer-app/out/LokiSigner.app/Contents/MacOS/LokiSigner native --development-http
+# Or launch with a link and member configuration:
+poc/signer-app/out/LokiSigner.app/Contents/MacOS/LokiSigner pair 'loki://pair?...' \
+  --data /path/to/member --port 3601 --development-http \
+  --frostd-url http://127.0.0.1:2744 --nonce-witnesses /path/to/witnesses.json
+```
+
+Other member flags are the existing `loki_member_app` flags: network, lightwalletd, relay,
+nonce witnesses, and peer allowlist. For members on separate Macs, configure a reachable
+HTTPS `--advertise-url` (forwarded to the member service) and the allowed `--peer` origins.
+The private browser session still uses loopback; it is never sent to that public endpoint.
+The link contains only origin, slot and a random claim, never runtime configuration or keys.
+The native passphrase is passed to Rust in memory and the Swift byte buffer is immediately
+zeroed. `serve` retains S4a's local-file unlock for development automation only.
+
+## Verification
+
+With a built wallet (`cd web/wallet && npm run build`) and Rust member binary:
+
+```sh
+node poc/scripts/test_self_registration.mjs --pairing
+# Exercise the signed app instead; approve the local Enclave prompts:
+LOKI_NATIVE_SIGNER=1 \
+LOKI_MEMBER_APP_BIN="$PWD/poc/signer-app/out/LokiSigner.app/Contents/MacOS/LokiSigner" \
+node poc/scripts/test_self_registration.mjs --pairing
+```
+
+For a complete real paired signing/payment run, use a running web coordinator, frostd,
+lightwalletd, nonce witnesses, and the existing funded testnet fixture. This test **broadcasts
+a testnet payment**, keeps member state in the printed private temporary directory, and
+requires native consent/Touch ID:
+
+```sh
+LOKI_NATIVE_SIGNER=1 \
+LOKI_MEMBER_APP_BIN="$PWD/poc/signer-app/out/LokiSigner.app/Contents/MacOS/LokiSigner" \
+LOKI_COORDINATOR=http://localhost:3001 \
+LOKI_NONCE_WITNESSES=/path/to/witnesses.json \
+FROSTD_URL=http://127.0.0.1:2744 \
+LIGHTWALLETD_URL=https://testnet.zec.rocks:443 \
+RECIPIENT='<testnet Orchard address>' AMOUNT_ZAT=100000 \
+bash poc/scripts/test_payment.sh
+```
 
 ## One-time setup (done)
 - Apple ID in Xcode → Settings → Accounts.
 - **Apple WWDR intermediate** installed (otherwise the Dev cert is "invalid"):
   `curl -O https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer && security import AppleWWDRCAG3.cer -k ~/Library/Keychains/login.keychain-db`
-- Team: `<your-team-id>`. Touch ID present (biometric mode works).
+- Team: `B399KAT22M`. Touch ID present (biometric mode works).
 
 ## Build + run (the one GUI step that provisions a free-team profile)
 ```sh
@@ -25,10 +96,6 @@ builds work headlessly.
 
 - `LokiSigner persist`   — create + reload a persistent SE key, wrap/unwrap (no biometric).
 - `LokiSigner biometric` — same, gated by **Touch ID** on unwrap (interactive).
-
-## Next
-Wire `poc/src/signer/secure_element_apple.rs` (the `AppleSecureElement` trait impl) as
-this app's SecureElement backend; that is the real native signer.
 
 ## Native signer: the real Rust signer seals its share in the Enclave
 

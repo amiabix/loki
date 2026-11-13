@@ -8,7 +8,16 @@ import Security
 //   LokiSigner persist     -> create at init + reload (no biometric; headless-verifiable)
 //   LokiSigner biometric   -> create + unwrap gated by Touch ID (interactive)
 
-let mode = CommandLine.arguments.dropFirst().first ?? "persist"
+let mode = CommandLine.arguments.dropFirst().first ?? "native"
+if mode == "native" || mode == "pair" || mode.hasPrefix("loki://") {
+    let link = mode == "pair" ? CommandLine.arguments.dropFirst(2).first : mode.hasPrefix("loki://") ? mode : nil
+    let offset = mode == "pair" ? 3 : 2
+    runNativeSigner(arguments: Array(CommandLine.arguments.dropFirst(offset)), link: link)
+}
+if !["persist", "biometric", "rust", "member", "serve"].contains(mode) {
+    FileHandle.standardError.write("Unknown mode; use native, pair <link>, serve, rust, member, persist or biometric\n".data(using: .utf8)!)
+    exit(2)
+}
 let biometric = (mode == "biometric")
 let tag = "cash.loki.signer.kek.app".data(using: .utf8)!
 
@@ -17,6 +26,19 @@ let tag = "cash.loki.signer.kek.app".data(using: .utf8)!
 @_silgen_name("loki_signer_enclave_selftest")
 func loki_signer_enclave_selftest() -> Int32
 
+@_silgen_name("loki_signer_enclave_dkg_member_selftest")
+func loki_signer_enclave_dkg_member_selftest() -> Int32
+
+// `serve` mode: run the LIVE member-app signer with the member's FROST share held in the Secure
+// Enclave, joining a vault over frostd. Args after `serve` are the member flags (--data, --port,
+// --frostd-url, --advertise-url, --peer, ...). Blocks until the process is stopped.
+@_silgen_name("loki_member_app_serve")
+func loki_member_app_serve() -> Int32
+
+if mode == "serve" {
+    exit(loki_member_app_serve())
+}
+
 if mode == "rust" {
     let rc = loki_signer_enclave_selftest()
     if rc == 0 {
@@ -24,6 +46,19 @@ if mode == "rust" {
         exit(0)
     }
     FileHandle.standardError.write("RUST SELFTEST FAILED (code \(rc))\n".data(using: .utf8)!)
+    exit(rc)
+}
+
+// `member` mode: the full native-member lifecycle — a 2-of-3 vault created by real v2 DKG with
+// every share generated + sealed under its own PERSISTENT Secure Enclave key, then a quorum
+// signs a payment. The persistent counterpart of the ephemeral `cargo test`.
+if mode == "member" {
+    let rc = loki_signer_enclave_dkg_member_selftest()
+    if rc == 0 {
+        print("RUST SIGNER ENCLAVE MEMBER PASS: real DKG + payment through persistent Secure Enclave keys")
+        exit(0)
+    }
+    FileHandle.standardError.write("RUST MEMBER SELFTEST FAILED (code \(rc))\n".data(using: .utf8)!)
     exit(rc)
 }
 
