@@ -6,11 +6,15 @@ export type VaultSummary = {
   policy?: string;
   members: number;
   threshold: number;
+  // False while the vault is still in setup (no DKG key yet, so no address).
+  active?: boolean;
 };
 
 export type StatusResponse = {
   phase: "new_profile" | "locked" | "home";
   network?: string;
+  // Share encryption on the signer host: Enclave wrapping key or software sealing.
+  secure_element?: "apple" | "software" | string;
   profile?: { name: string; id: string };
   vaults?: VaultSummary[];
 };
@@ -27,6 +31,7 @@ export type CeremonyStatus = {
     | "waiting_for_backups"
     | "final_backup"
     | "connecting_relays"
+    | "setup_interrupted"
     | "active";
   fingerprint?: string;
   invites?: InviteSlot[];
@@ -41,6 +46,28 @@ export type Payment = {
   recipient: string;
   amount_zat: string;
   ready_to_send: boolean;
+  finish_requested?: boolean;
+  error?: string | null;
+  txid?: string | null;
+  direction?: "sent" | "received";
+  amount_is_net?: boolean;
+  mined_height?: number | null;
+  fee_zat?: string | null;
+  signers?: number[];
+};
+
+export type PaymentSession = {
+  phase: string;
+  finish_requested: boolean;
+  signatures_received: boolean;
+  intent: {
+    proposer: number;
+    signers: number[];
+    recipient: string;
+    amount_zat: number;
+    fee_zat: number;
+    open_approval: boolean;
+  };
 };
 
 export type PaymentReview = {

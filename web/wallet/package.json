@@ -9,11 +9,13 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@types/three": "0.160.0",
     "@vgpu/wgsl": "0.6.0",
     "framer-motion": "^14.4.0",
     "next": "16.4.2",
-    "react": "19.3.1",
-    "react-dom": "19.3.1",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "three": "0.160.0",
     "vgpu": "^0.6.0"
   },
   "devDependencies": {
@@ -26,8 +28,5 @@
     "eslint-config-next": "16.4.2",
     "tailwindcss": "^4",
     "typescript": "^5"
-  },
-  "overrides": {
-    "@modelcontextprotocol/server": "2.3.1"
   }
 }

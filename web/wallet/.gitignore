@@ -33,9 +33,15 @@ yarn-error.log*
 # env files (can opt-in for committing if needed)
 .env*
 
-# runtime member access maps (hold per-member tokens / capability slugs — never commit)
+# runtime public roster and one-use registration challenges
 .members.json
+.session-secret
 .access.json
+.access.json.challenges
+.access.json.challenges.*.tmp
+.access.json.lock
+.access.json.*.tmp
+/.signers/
 
 # vercel
 .vercel

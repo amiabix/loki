@@ -1,0 +1,159 @@
+import assert from 'node:assert/strict';
+import { generateKeyPairSync, randomBytes, sign } from 'node:crypto';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { test } from 'node:test';
+import * as members from '../src/lib/members.ts';
+
+const origin = 'http://localhost:3001';
+function device(slot) {
+  const identity = generateKeyPairSync('ed25519');
+  const key = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+  const jwk = key.publicKey.export({ format: 'jwk' });
+  const device_pubkey = Buffer.concat([Buffer.from([4]), Buffer.from(jwk.x, 'base64url'), Buffer.from(jwk.y, 'base64url')]).toString('hex');
+  const input = { ...(slot ? { slot } : {}), signing_pubkey: identity.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('hex'), relay_pubkey: randomBytes(32).toString('hex'), advertise_url: 'http://127.0.0.1:3601', device_pubkey,
+    authorization: sign(null, Buffer.from(device_pubkey, 'hex'), identity.privateKey).toString('hex') };
+  return { input, key };
+}
+function response(d, challenge, changed = {}) {
+  const input = { ...d.input, ...changed };
+  const message = ['loki-member-registration-v1', origin, input.slot ?? 0, input.signing_pubkey, input.relay_pubkey, input.advertise_url, input.device_pubkey, challenge].join('\n');
+  return { ...input, challenge, signature: sign('sha256', Buffer.from(message), d.key.privateKey).toString('hex') };
+}
+
+test('device self-registration binds identity, endpoint and slot; consumes challenges across reloads', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'loki-roster-'));
+  process.env.LOKI_REGISTRY = join(dir, '.access.json');
+  try {
+    assert.equal(typeof members.issueRegistrationChallenge, 'function', 'device challenge endpoint is required');
+    const d = device();
+    const challenge = await members.issueRegistrationChallenge(d.input, origin);
+    const member = await members.registerMember(response(d, challenge.challenge), origin);
+    assert.deepEqual(Object.keys(member).sort(), ['advertise_url', 'relay_pubkey', 'signing_pubkey', 'slot']);
+    assert.equal(member.slot, 1);
+    assert.deepEqual(members.memberById(1), member);
+    assert.deepEqual(JSON.parse(readFileSync(process.env.LOKI_REGISTRY)), { access: [member] });
+    await assert.rejects(members.registerMember(response(d, challenge.challenge), origin), /challenge/);
+    const reloaded = await import(`../src/lib/members.ts?restart=${Date.now()}`);
+    const pending = await members.issueRegistrationChallenge(d.input, origin);
+    assert.equal((await reloaded.registerMember(response(d, pending.challenge), origin)).slot, 1);
+    const tampered = await members.issueRegistrationChallenge(d.input, origin);
+    await assert.rejects(members.registerMember(response(d, tampered.challenge, { advertise_url: 'http://127.0.0.1:3602' }), origin), /registration|challenge/);
+    const foreign = device(1);
+    await assert.rejects(members.issueRegistrationChallenge(foreign.input, origin), /slot/);
+    await assert.rejects(members.issueRegistrationChallenge({ ...d.input, authorization: '00'.repeat(64) }, origin), /authorization/);
+    await assert.rejects(members.issueRegistrationChallenge({ ...d.input, passphrase: 'never accept' }, origin), /field/);
+  } finally { rmSync(dir, { recursive: true, force: true }); delete process.env.LOKI_REGISTRY; }
+});
+
+test('registration bounds request bodies before parsing', async () => {
+  assert.equal(typeof members.readRegistrationBody, 'function');
+  const req = (body) => new Request('http://localhost:3001/api/members', { method: 'POST', body });
+  assert.deepEqual(await members.readRegistrationBody(req('{"slot":1}')), { slot: 1 });
+  await assert.rejects(members.readRegistrationBody(req(' '.repeat(4097))), /too large/);
+});
+
+test('failed, expired and wrong-origin proofs cannot be replayed; allocations are serialized', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'loki-roster-proof-'));
+  process.env.LOKI_REGISTRY = join(dir, '.access.json');
+  try {
+    const d = device();
+    let challenge = await members.issueRegistrationChallenge(d.input, origin);
+    await assert.rejects(members.registerMember({ ...response(d, challenge.challenge), signature: '00'.repeat(64) }, origin));
+    await assert.rejects(members.registerMember(response(d, challenge.challenge), origin), /challenge/);
+    challenge = await members.issueRegistrationChallenge(d.input, origin);
+    await assert.rejects(members.registerMember(response(d, challenge.challenge), 'https://other.example'), /challenge/);
+    challenge = await members.issueRegistrationChallenge(d.input, origin);
+    const pendingFile = process.env.LOKI_REGISTRY + '.challenges';
+    writeFileSync(pendingFile, JSON.stringify(JSON.parse(readFileSync(pendingFile)).map((c) => ({ ...c, expires: 0 }))));
+    await assert.rejects(members.registerMember(response(d, challenge.challenge), origin), /challenge/);
+    const devices = Array.from({ length: 6 }, () => device());
+    const pending = await Promise.all(devices.map((d) => members.issueRegistrationChallenge(d.input, origin)));
+    const registered = await Promise.all(devices.map((d, i) => members.registerMember(response(d, pending[i].challenge), origin)));
+    assert.equal(new Set(registered.map((m) => m.slot)).size, 6);
+    assert.equal(members.slots().length, 6);
+    const bad = { ...devices[0].input, relay_pubkey: '00'.repeat(32) };
+    await assert.rejects(members.issueRegistrationChallenge(bad, origin), /relay key/);
+    writeFileSync(process.env.LOKI_REGISTRY, JSON.stringify({ access: [{ id: 1, port: 3601, token: 'legacy' }] }));
+    assert.throws(() => members.slots(), /field/);
+    await assert.rejects(members.issueRegistrationChallenge(d.input, origin), /field/);
+  } finally { rmSync(dir, { recursive: true, force: true }); delete process.env.LOKI_REGISTRY; }
+});
+
+test('pairing reserves one slot, claims once, and pins one device to one identity', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'loki-pairing-'));
+  process.env.LOKI_REGISTRY = join(dir, 'roster.json');
+  try {
+    const pair = await members.issuePairingChallenge({}, origin);
+    assert.equal(pair.slot, 1);
+    assert(pair.expires > Date.now() && pair.expires <= Date.now() + 120_000);
+    const link = new URL(pair.url);
+    assert.equal(link.protocol, 'loki:');
+    assert.equal(link.hostname, 'pair');
+    assert.equal(link.searchParams.get('origin'), origin);
+    assert.equal(link.searchParams.get('challenge'), pair.challenge);
+    assert.equal(link.searchParams.get('slot'), '1');
+    assert.deepEqual(members.slots(), []);
+    await assert.rejects(members.issuePairingChallenge({ slot: 1 }, origin), /slot/);
+    const d = device(1);
+    await assert.rejects(members.issueRegistrationChallenge(d.input, origin), /reserved/);
+    const claims = await Promise.allSettled([1, 2].map(() => members.issueRegistrationChallenge({ ...d.input, pairing_challenge: pair.challenge }, origin)));
+    assert.equal(claims.filter((r) => r.status === 'fulfilled').length, 1);
+    const claim = claims.find((r) => r.status === 'fulfilled').value;
+    await assert.rejects(members.issueRegistrationChallenge(d.input, origin), /reserved/);
+    const member = await members.registerMember(response(d, claim.challenge), origin);
+    assert.equal(member.slot, 1);
+    await assert.rejects(members.registerMember(response(d, claim.challenge), origin), /challenge/);
+    await assert.rejects(members.issuePairingChallenge({ slot: 1 }, origin), /slot/);
+    const next = await members.issuePairingChallenge({}, origin);
+    assert.equal(next.slot, 2);
+    // A different identity cannot reuse the same device, even with valid authorization.
+    const other = generateKeyPairSync('ed25519');
+    const moved = { ...d.input, slot: 2, signing_pubkey: other.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('hex'),
+      authorization: sign(null, Buffer.from(d.input.device_pubkey, 'hex'), other.privateKey).toString('hex') };
+    await assert.rejects(members.issueRegistrationChallenge({ ...moved, pairing_challenge: next.challenge }, origin), /device/);
+    const reloaded = await import(`../src/lib/members.ts?pair-restart=${Date.now()}`);
+    const renewed = await reloaded.issueRegistrationChallenge(d.input, origin);
+    assert.deepEqual(await reloaded.registerMember(response(d, renewed.challenge), origin), member);
+    const rotated = device(1);
+    await assert.rejects(members.issueRegistrationChallenge({ ...rotated.input, signing_pubkey: d.input.signing_pubkey }, origin));
+  } finally { rmSync(dir, { recursive: true, force: true }); delete process.env.LOKI_REGISTRY; }
+});
+
+test('pairing rejects expired, wrong-origin and changed-slot claims without reviving them', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'loki-pairing-reject-'));
+  process.env.LOKI_REGISTRY = join(dir, 'roster.json');
+  try {
+    const d = device(1);
+    for (const failure of ['origin', 'slot', 'expiry']) {
+      const pair = await members.issuePairingChallenge({ slot: 1 }, origin);
+      if (failure === 'expiry') {
+        const file = process.env.LOKI_REGISTRY + '.challenges';
+        writeFileSync(file, JSON.stringify(JSON.parse(readFileSync(file)).map((c) => ({ ...c, expires: 0 }))));
+      }
+      await assert.rejects(members.issueRegistrationChallenge({ ...d.input, slot: failure === 'slot' ? 2 : 1, pairing_challenge: pair.challenge }, failure === 'origin' ? 'https://other.example' : origin), /pairing challenge/);
+      await assert.rejects(members.issueRegistrationChallenge({ ...d.input, pairing_challenge: pair.challenge }, origin), /pairing challenge/);
+    }
+    assert.deepEqual(members.slots(), []);
+    await assert.rejects(members.issuePairingChallenge({ passphrase: 'forbidden' }, origin), /field/);
+    await assert.rejects(members.issuePairingChallenge({}, 'http://remote.example'), /HTTPS/);
+  } finally { rmSync(dir, { recursive: true, force: true }); delete process.env.LOKI_REGISTRY; }
+});
+
+test('a binding saved before a crashed roster write still reserves and recovers its slot', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'loki-pairing-crash-'));
+  process.env.LOKI_REGISTRY = join(dir, 'roster.json');
+  try {
+    const d = device();
+    const challenge = await members.issueRegistrationChallenge(d.input, origin);
+    const first = await members.registerMember(response(d, challenge.challenge), origin);
+    // Model interruption after the binding write but before the roster write.
+    rmSync(process.env.LOKI_REGISTRY);
+    const pair = await members.issuePairingChallenge({}, origin);
+    assert.equal(pair.slot, 2);
+    await assert.rejects(members.issueRegistrationChallenge(device(1).input, origin), /slot/);
+    const retry = await members.issueRegistrationChallenge(d.input, origin);
+    assert.deepEqual(await members.registerMember(response(d, retry.challenge), origin), first);
+  } finally { rmSync(dir, { recursive: true, force: true }); delete process.env.LOKI_REGISTRY; }
+});
