@@ -20,7 +20,6 @@ export type StatusResponse = {
 };
 
 export type InviteSlot = { slot: number; code: string; joined: boolean };
-export type ConfirmationSlot = { slot: number; confirmed: boolean; matches: boolean };
 
 export type CeremonyStatus = {
   phase:
@@ -35,7 +34,8 @@ export type CeremonyStatus = {
     | "active";
   fingerprint?: string;
   invites?: InviteSlot[];
-  confirmations?: ConfirmationSlot[];
+  // Count of members who have confirmed (the host sends a number, not a per-slot list).
+  confirmations?: number;
   members: number;
   threshold: number;
 };

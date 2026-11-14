@@ -856,7 +856,8 @@ function CeremonyView({
             creator={cs.invites !== undefined}
             vault={vault}
             fingerprint={cs.fingerprint}
-            confirmations={cs.confirmations ?? []}
+            confirmations={cs.confirmations ?? 0}
+            members={cs.members}
           />
         )}
         {(cs.phase === "creating_keys" || cs.phase === "waiting_for_backups" || cs.phase === "connecting_relays") && (
@@ -1021,24 +1022,25 @@ function CompareRoster({
   vault,
   fingerprint,
   confirmations,
+  members,
 }: {
   profileId?: string;
   creator?: boolean;
   vault: string;
   fingerprint: string | undefined;
-  confirmations: { slot: number; confirmed: boolean; matches: boolean }[];
+  confirmations: number;
+  members: number;
 }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  // shortcut: older joins lack an exposed own slot; use the acknowledged action until status exposes it.
+  // The host reports only a confirmation count, not per-member state, so the viewer's own
+  // confirmation is tracked locally (survives status polls and reloads within this browser).
   const [confirmedHere, setConfirmedHere] = useState(false);
-  const [ownSlot, setOwnSlot] = useState<number | null>(null);
   const confirmationKey = profileId && fingerprint ? `loki_confirmed:${profileId}:${vault}:${fingerprint}` : null;
   useEffect(() => {
-    setOwnSlot(creator ? 1 : rememberedVaultSlot(profileId, vault));
     try { setConfirmedHere(!!confirmationKey && localStorage.getItem(confirmationKey) === "yes"); } catch {}
-  }, [profileId, vault, confirmationKey, creator]);
+  }, [confirmationKey]);
 
   const agree = async () => {
     setBusy(true); setErr(null);
@@ -1050,9 +1052,7 @@ function CompareRoster({
     finally { setBusy(false); }
   };
 
-  const mySlot = confirmations.find((c) => c.slot === ownSlot);
-  const alreadyConfirmed = confirmedHere || mySlot?.confirmed === true;
-  const allConfirmed = confirmations.length > 0 && confirmations.every((c) => c.confirmed);
+  const allConfirmed = members > 0 && confirmations >= members;
 
   return (
     <div>
@@ -1067,22 +1067,18 @@ function CompareRoster({
           <p className="font-mono text-lg break-all text-amber">{fingerprint}</p>
         </GlassCard>
       )}
-      <div className="space-y-1 mb-4">
-        {confirmations.map((c) => (
-          <div key={c.slot} className="flex items-center justify-between gap-3 py-1 text-sm">
-            <span className="flex items-center gap-2.5"><MemberAvatar slot={c.slot} /> Member {c.slot}{c.slot === ownSlot ? " (you)" : ""}</span>
-            <span className={c.confirmed ? (c.matches ? "text-mint" : "text-danger") : "text-muted"}>
-              {c.confirmed ? (c.matches ? "✓ confirmed" : "✗ mismatch") : "waiting"}
-            </span>
-          </div>
-        ))}
-      </div>
-      {!alreadyConfirmed && !allConfirmed && (
+      {creator && (
+        <p className="pill text-muted mb-4">
+          <span className={`dot ${allConfirmed ? "bg-mint text-mint" : "bg-amber text-amber"}`} />
+          {confirmations} of {members} confirmed
+        </p>
+      )}
+      {!confirmedHere && !allConfirmed && (
         <Btn variant="amber" onClick={agree} disabled={busy || !fingerprint}>
           {busy ? "Confirming…" : "Confirm members"}
         </Btn>
       )}
-      {(alreadyConfirmed || allConfirmed) && (
+      {(confirmedHere || allConfirmed) && (
         <p role="status" className="glass rounded-2xl p-4 text-center text-sm text-mint">{allConfirmed ? "All members confirmed — advancing…" : "You confirmed — waiting for others."}</p>
       )}
       <ErrMsg msg={err} />

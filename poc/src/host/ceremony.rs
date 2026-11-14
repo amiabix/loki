@@ -203,12 +203,16 @@ pub(super) fn vault_summaries(data: &Path, pass: &str) -> Result<Vec<Value>, Str
             continue;
         }
         if let Ok(c) = load(data, pass, &vault) {
+            // `active` lets the home screen route a still-setting-up vault back to the
+            // ceremony flow instead of the (unavailable) wallet view.
+            let active = dir(data, &vault).map(|d| d.exists("vault.sealed")).unwrap_or(false);
             out.push(json!({
                 "vault": c.vault,
                 "name": c.name,
                 "members": c.members,
                 "threshold": c.threshold,
                 "policy": format!("{}-of-{}", c.threshold, c.members),
+                "active": active,
             }));
         }
     }
