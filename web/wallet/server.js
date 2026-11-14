@@ -11,7 +11,11 @@ const { createServer } = require("http");
 const next = require("next");
 
 const port = parseInt(process.env.PORT || "3001", 10);
-const app = next({ dev: false });
+// Next must know its real host/port, or it derives request origins from the default
+// localhost:3000 — which breaks member self-registration (the device signs over the
+// coordinator origin it was given). Behind a TLS proxy, set HOSTNAME to the public host.
+const hostname = process.env.HOSTNAME || "localhost";
+const app = next({ dev: false, hostname, port });
 const handle = app.getRequestHandler();
 
 const cacheFor = (url) =>
