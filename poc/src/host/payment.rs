@@ -171,15 +171,8 @@ fn load_vault(data: &Path, pass: &str, vault: &str, configured: &str) -> Result<
         .ok_or("missing threshold")?
         .try_into()
         .map_err(|_| "invalid threshold")?;
-    let identity_raw = Zeroizing::new(
-        MemberDir::open(data, ".")
-            .read_sealed("identity.sealed", pass)
-            .map_err(|e| e.to_string())?,
-    );
-    let identity = Identity::from_secret_bytes(&identity_raw)?;
-    if identity.public().id != slot {
-        return Err("member identity differs from vault".into());
-    }
+    // Re-stamp the profile identity to this vault's FROST slot (registration seals it at slot 1).
+    let identity = super::ceremony::identity(data, pass, slot)?;
     let ak = hex32(required(&v, "group_ak")?)?;
     let secret = Zeroizing::new(hex32(required(&v, "vault_secret")?)?);
     let fvk = zip2005::frost_viewing_key(&ak, &secret)
