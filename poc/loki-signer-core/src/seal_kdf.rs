@@ -55,19 +55,19 @@ fn identify(hasher: &[u8; 32], secret: &str, salt: Option<&[u8]>) -> [u8; 32] {
     *hash.finalize().as_bytes()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     /// Unit tests run in parallel in one process; only a test that opts in on its
     /// own thread turns the process-wide cache on.
-    pub(crate) static TEST_OPT_IN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub static TEST_OPT_IN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 /// Serializes the unit tests that opt in to the cache.
-#[cfg(test)]
-pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(any(test, feature = "test-support"))]
+pub static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// Remember derivations for `passphrase` (and only it) in this process's memory.
 pub fn enable_session_cache(passphrase: &str) {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if !TEST_OPT_IN.with(|opt_in| opt_in.get()) {
         return;
     }
@@ -107,7 +107,7 @@ pub struct KdfError;
 
 /// Derive the 32-byte file key for `secret` over `salt`. Fails only for a salt shorter
 /// than Argon2's minimum, which means a corrupt header.
-pub(crate) fn derive(secret: &str, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>, KdfError> {
+pub fn derive(secret: &str, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>, KdfError> {
     let lookup = {
         let guard = cache();
         match guard.as_ref() {

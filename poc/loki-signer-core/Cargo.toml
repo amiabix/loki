@@ -1,0 +1,66 @@
+[package]
+name = "loki-signer-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The dependency-clean signer core, extracted from `loki-poc` so it compiles to
+# wasm32-unknown-unknown. It holds the FROST DKG + signing + WYSIWYS + secure-element +
+# persistence modules and pulls NONE of rusqlite/tonic/tokio/reqwest/axum. `loki-poc`
+# depends on this crate and re-exports its modules. The `frostd` transport impl
+# (reqwest/tokio) stays in `loki-poc`; only the `Transport` trait + message types live here.
+
+[dependencies]
+orchard            = { package = "zakura-orchard", version = "=2.2.0" }
+zcash_primitives   = { package = "zakura-primitives", version = "=2.2.0" }
+pczt               = { package = "zakura-pczt", version = "=0.1.0-rc4", features = ["orchard", "signer", "io-finalizer", "spend-finalizer", "tx-extractor", "zcp-builder"] }
+reddsa_frost       = { package = "zakura-reddsa", version = "=2.2.0", features = ["frost"] }
+frost-core         = { version = "=3.0.0", features = ["serialization"] }
+frost-rerandomized = { version = "=3.0.0", features = ["serialization"] }
+pasta_curves       = { package = "zakura-pasta-curves", version = "=2.2.0" }
+group              = "0.14"
+incrementalmerkletree = "0.8.2"
+ff                 = "0.14"
+rand_core          = { version = "0.6", features = ["getrandom"] }
+rand_core_zp       = { package = "rand_core", version = "0.10" }
+rand_zp            = { package = "rand", version = "0.10" }
+rand_chacha        = "0.3"
+blake2b_simd       = "1"
+blake3             = "1.8"
+zeroize            = "1"
+bip39              = { version = "2.2.2", default-features = false, features = ["std", "zeroize"] }
+zip32              = "=0.2.1"
+chacha20poly1305   = "=0.10.1"
+hkdf               = "0.12"
+argon2             = { version = "0.5", default-features = false, features = ["alloc"] }
+ed25519-dalek      = { version = "2.2", features = ["rand_core"] }
+x25519-dalek       = { version = "2.0", features = ["static_secrets"] }
+hex                = "0.4"
+hpke               = { version = "=0.14.1", default-features = false, features = ["alloc", "getrandom", "x25519", "chacha"] }
+p256               = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+base64             = "0.22"
+ciborium           = "0.2"
+serde_json         = "1"
+zcash_address      = { package = "zakura-address", version = "=2.2.0" }
+zip321             = { package = "zakura-zip321", version = "=2.2.0" }
+zcash_protocol     = { package = "zakura-protocol", version = "=2.2.0" }
+zcash_keys         = { package = "zakura-keys", version = "=2.2.0", features = ["orchard", "unstable-frost"] }
+uuid               = { version = "1", features = ["v4", "serde"] }
+serde              = { version = "1", features = ["derive"] }
+zcash_note_encryption = "0.4.2"
+zcash_transparent  = { package = "zakura-transparent", version = "=2.2.0" }
+sapling-crypto     = { package = "zakura-sapling-crypto", version = "=2.2.0" }
+ciborium-io        = "0.2"
+sha2               = "=0.10.9"
+
+[features]
+# Apple Secure Enclave backend (macOS only); the swift link lives in loki-poc's build.rs,
+# so this feature is never built from this crate's gates.
+apple-enclave = []
+# Counts Argon2id derivations; measurement only.
+kdf-stats = []
+# Exposes the `#[cfg(test)]`-only helpers (KDF cache test seam, DkgState fixtures) so
+# loki-poc's own test suite — which used them when these modules lived in loki-poc — can
+# still reach them across the crate boundary. loki-poc enables it as a dev-dependency, so
+# a normal `cargo build` never compiles these helpers.
+test-support = []

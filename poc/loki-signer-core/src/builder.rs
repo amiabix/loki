@@ -22,7 +22,7 @@
 //! only produce the candidate the signers accept once the live session has yielded `alpha`, so
 //! it runs as the session's coordinator — it is not a pre-session `build(intent) -> sighash`.
 //! Proving and broadcast (the `broadcast(signed_pczt) -> txid` half) are the equally share-free
-//! [`crate::tx_finalize::prove`] followed by the lightwalletd send in host/payment.rs `finish`.
+//! `loki_poc::tx_finalize::prove` followed by the lightwalletd send in host/payment.rs `finish`.
 
 use orchard::{keys::FullViewingKey, Note};
 use zcash_protocol::consensus::Parameters;

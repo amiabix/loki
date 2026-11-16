@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [workspace]
-members = ["harness", "wasm-spike"]
+members = ["harness", "wasm-spike", "loki-signer-core"]
 # wasm-spike is excluded from default-members: `cargo build/test` from poc/ never
 # touches it, so the native build is unaffected. Build it explicitly with
 # `cargo build -p loki-wasm-spike --target wasm32-unknown-unknown`.
@@ -18,6 +18,8 @@ crate-type = ["lib", "staticlib"]
 
 # One Zakura family serves transaction construction, proving, scanning and FROST.
 [dependencies]
+# The extracted dependency-clean signer core. loki-poc re-exports its modules.
+loki-signer-core   = { path = "loki-signer-core" }
 orchard            = { package = "zakura-orchard", version = "=2.2.0" }
 zcash_primitives   = { package = "zakura-primitives", version = "=2.2.0" }
 pczt               = { package = "zakura-pczt", version = "=0.1.0-rc4", features = ["orchard", "signer", "io-finalizer", "prover", "spend-finalizer", "tx-extractor", "zcp-builder"] }
@@ -136,6 +138,12 @@ required-features = ["relay-communication"]
 
 [dependencies.sha2]
 version = "=0.10.9"
+
+[dev-dependencies]
+# loki-poc's own tests reach the signer core's `#[cfg(test)]` helpers (KDF cache test seam,
+# DkgState fixtures) that used to be same-crate. A dev-dependency enables `test-support`
+# only for the test build; a normal `cargo build` never compiles those helpers.
+loki-signer-core = { path = "loki-signer-core", features = ["test-support"] }
 
 # Dependencies (Argon2id, Pallas, halo2, ed25519, HPKE, SQLite) are optimized in dev
 # builds too; Loki's own crate keeps opt-level 0, debug assertions and fault injection.

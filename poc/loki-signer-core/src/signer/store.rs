@@ -30,7 +30,7 @@ use crate::signer::Network;
 const META: &str = "signer.meta";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FileKind {
+pub enum FileKind {
     Identity,
     Roster,
     Setup,
@@ -51,7 +51,7 @@ impl FileKind {
     }
 }
 
-pub(crate) struct SignerStore {
+pub struct SignerStore {
     dir: PathBuf,
     network: Network,
     vault: [u8; 32],
@@ -67,7 +67,7 @@ fn network_label(network: Network) -> &'static str {
 
 impl SignerStore {
     /// Create the data directory (owner-only) and its public metadata, once.
-    pub(crate) fn create(
+    pub fn create(
         dir: &Path,
         network: Network,
         vault: [u8; 32],
@@ -106,7 +106,7 @@ impl SignerStore {
     }
 
     /// Reopen an existing data directory from its public metadata.
-    pub(crate) fn open(dir: &Path) -> Result<Self, String> {
+    pub fn open(dir: &Path) -> Result<Self, String> {
         let meta: serde_json::Value = serde_json::from_slice(
             &std::fs::read(dir.join(META)).map_err(|e| format!("signer metadata: {e}"))?,
         )
@@ -135,15 +135,15 @@ impl SignerStore {
         })
     }
 
-    pub(crate) fn network(&self) -> Network {
+    pub fn network(&self) -> Network {
         self.network
     }
 
-    pub(crate) fn vault(&self) -> [u8; 32] {
+    pub fn vault(&self) -> [u8; 32] {
         self.vault
     }
 
-    pub(crate) fn member(&self) -> u16 {
+    pub fn member(&self) -> u16 {
         self.member
     }
 
@@ -156,7 +156,7 @@ impl SignerStore {
     }
 
     /// Seal and atomically replace one file.
-    pub(crate) fn write(
+    pub fn write(
         &self,
         se: &impl SecureElement,
         kind: FileKind,
@@ -170,7 +170,7 @@ impl SignerStore {
 
     /// Open one file, or `None` if it does not exist. A file sealed for another type,
     /// vault or member, or under another element, is an error.
-    pub(crate) fn read(
+    pub fn read(
         &self,
         se: &impl SecureElement,
         kind: FileKind,

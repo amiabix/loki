@@ -14,25 +14,24 @@
 //! `probe-zip2005` feature still records the missing upstream API. C1.4 is supplied by
 //! an isolated patch to vendored orchard; see vendor/README.md.
 
-pub mod builder;
-pub mod candidate;
+// Moved into `loki-signer-core` (the dependency-clean, wasm-compilable signer core) and
+// re-exported here so the rest of this crate keeps using `crate::builder`, `crate::signer`,
+// `crate::member_state`, … unchanged. See that crate's lib.rs for the module list.
+pub use loki_signer_core::{
+    builder, candidate, distributed_setup, dkg_core, intent, member_state, network,
+    payment_manifest, randomizer, seal_kdf, setup_transport, signer, signing_session,
+    state, vault, verify, zip2005,
+};
 #[cfg(test)]
 mod coordinator;
 pub mod coordinator_boundary;
-pub mod distributed_setup;
-pub mod dkg_core;
 #[cfg(all(feature = "apple-enclave", target_os = "macos"))]
 pub mod enclave_ffi;
-pub mod intent;
 pub mod frost_roster;
-pub mod member_state;
-pub mod network;
 #[cfg(test)]
 mod nonce_binding;
-pub mod payment_manifest;
 pub mod payment_transport;
 pub mod profile;
-pub mod randomizer;
 pub mod refresh;
 // The per-member HTTP coordinator (axum) that fronts the account + hosted-vault ceremony
 // for the web UI, driving the library in-process. Gated with the hosted relay stack.
@@ -54,21 +53,13 @@ pub mod relay_member;
 pub mod rpc;
 pub mod scan;
 pub mod scanstate;
-pub mod seal_kdf;
-pub mod setup_transport;
 pub mod setup_ceremony;
-pub mod signer;
-pub mod signing_session;
 // Reusable rerandomized FROST signing driver over a WS3 Transport (frostd).
 pub mod sign_transport;
-pub mod state;
 pub mod transport;
 pub mod tx_finalize;
-pub mod vault;
-pub mod verify;
 pub mod wallet_store;
 pub mod witness;
-pub mod zip2005;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Compile probe for the one blocked requirement.

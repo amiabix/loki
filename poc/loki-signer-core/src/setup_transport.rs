@@ -89,7 +89,12 @@ pub struct DkgWire {
 impl DkgWire {
     /// Frame-check `bytes` as a setup message. Signatures are not checked here; the
     /// receiving member verifies them against its roster.
-    pub(crate) fn parse(bytes: Vec<u8>) -> Result<Self, String> {
+    ///
+    /// `pub` across the `loki-signer-core` → `loki-poc` seam (it was crate-private when
+    /// both lived in one crate). The "only the signer constructs a DkgWire" guard is now a
+    /// workspace-level convention; the wasm-bindgen API, not Rust visibility, is the
+    /// boundary against untrusted JS callers.
+    pub fn parse(bytes: Vec<u8>) -> Result<Self, String> {
         let kind = wire_kind(&bytes).ok_or("not a setup message")?;
         let sender = u16::from_be_bytes(bytes[40..42].try_into().unwrap());
         let recipient = if kind == DkgWireKind::Round2 {

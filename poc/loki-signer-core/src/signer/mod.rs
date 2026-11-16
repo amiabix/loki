@@ -29,7 +29,7 @@ pub mod secure_element;
 #[cfg(all(feature = "apple-enclave", target_os = "macos"))]
 pub mod secure_element_apple;
 pub mod secure_element_webauthn;
-pub(crate) mod store;
+pub mod store;
 pub mod wysiwys;
 
 pub use crate::setup_transport::{DkgWire, DkgWireKind};
