@@ -32,6 +32,19 @@ pub mod secure_element_webauthn;
 pub mod store;
 pub mod wysiwys;
 
+/// Browser-only self-test of the OPFS synchronous-store seam: write `bytes` at `path`,
+/// then read them back through the same `durable` backend the signer's store uses. The
+/// calling Worker must pre-open `path` (`opfsPreopenWrite`) first. Proves the wasm↔OPFS
+/// sync-handle path works in a real browser before the full store rides on it.
+#[cfg(target_arch = "wasm32")]
+pub fn opfs_selftest(path: &str, bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let p = std::path::Path::new(path);
+    let dir = p.parent().ok_or("path needs a parent directory")?;
+    let name = p.file_name().and_then(|n| n.to_str()).ok_or("path needs a file name")?;
+    durable::write_durable(dir, name, bytes).map_err(|e| e.to_string())?;
+    durable::read_file(dir, name).map_err(|e| e.to_string())
+}
+
 pub use crate::setup_transport::{DkgWire, DkgWireKind};
 use crate::signer::wysiwys::PaymentView;
 use reddsa_frost::frost::redpallas as frost;

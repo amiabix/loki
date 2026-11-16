@@ -1,0 +1,26 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Loki OPFS+wasm check</title>
+<body style="font:14px system-ui;max-width:640px;margin:2rem auto">
+  <h3>Loki in-browser signer — OPFS + wasm foundation check</h3>
+  <p>The signer runs in a Web Worker; its store persists to OPFS via synchronous access handles.
+     Round-trip writes+reads through the real Rust <code>durable</code> backend; read-back after a
+     page reload proves it persisted.</p>
+  <button id="rt">1. Write + read (round-trip)</button>
+  <button id="rb">2. Read back (reload first to prove persistence)</button>
+  <pre id="out" style="background:#111;color:#0f0;padding:1rem;white-space:pre-wrap"></pre>
+  <script type="module">
+    const w = new Worker("./worker.js", { type: "module" });
+    const out = document.getElementById("out");
+    const log = (m) => { out.textContent += m + "\n"; };
+    w.onerror = (e) => log("WORKER ERROR " + (e.message || e.filename + ":" + e.lineno));
+    w.onmessage = (e) => {
+      if (e.data.cmd === "loaded") return log("worker + wasm loaded");
+      if (e.data.ok) log("OK read = " + JSON.stringify(e.data.read));
+      else log("ERR " + e.data.error);
+    };
+    document.getElementById("rt").onclick = () =>
+      w.postMessage({ cmd: "roundtrip", text: "hello-" + Date.now() });
+    document.getElementById("rb").onclick = () => w.postMessage({ cmd: "readback" });
+  </script>
+</body>

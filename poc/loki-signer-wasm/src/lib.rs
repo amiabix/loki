@@ -16,6 +16,31 @@ use loki_signer_core::signer::secure_element::SealedShare;
 use loki_signer_core::signer::secure_element_webauthn::WebAuthnSecureElement;
 use wasm_bindgen::prelude::*;
 
+// secp256k1 is pulled into this crate transitively (bip32 <- zakura-transparent, and pczt's
+// `signer` feature forces `transparent`), but the Orchard FROST signer never calls it. Its
+// C preallocated-context functions are left as `env` module imports by the wasm build (no
+// WASI C toolchain compiles the C here), and a browser can't resolve a bare `env` specifier.
+// Define the three dead symbols so the linker satisfies them in-module instead — no `env`
+// import, no WASI toolchain, no fork of the vendored crypto. They are never called; if that
+// ever changes, a null context makes the first real use fail loudly rather than silently.
+#[cfg(target_arch = "wasm32")]
+mod secp256k1_link_stub {
+    use core::ffi::{c_uint, c_void};
+    #[no_mangle]
+    pub extern "C" fn rustsecp256k1_v0_10_0_context_preallocated_size(_flags: c_uint) -> usize {
+        0
+    }
+    #[no_mangle]
+    pub extern "C" fn rustsecp256k1_v0_10_0_context_preallocated_create(
+        _prealloc: *mut c_void,
+        _flags: c_uint,
+    ) -> *mut c_void {
+        core::ptr::null_mut()
+    }
+    #[no_mangle]
+    pub extern "C" fn rustsecp256k1_v0_10_0_context_preallocated_destroy(_ctx: *mut c_void) {}
+}
+
 fn prf32(prf_secret: &[u8]) -> Result<[u8; 32], String> {
     prf_secret
         .try_into()
@@ -52,6 +77,14 @@ pub fn seal_share_under_passkey(
 #[wasm_bindgen(js_name = openShareWithPasskey)]
 pub fn open_share_with_passkey(prf_secret: &[u8], sealed: &[u8]) -> Result<Vec<u8>, JsError> {
     open_impl(prf_secret, sealed).map_err(|e| JsError::new(&e))
+}
+
+/// Browser OPFS-store seam self-test: write bytes at `path` and read them back through
+/// the signer's synchronous `durable` backend (OPFS sync handles in this Worker). The
+/// Worker must `opfsPreopenWrite(path)` first. Proves wasm↔OPFS before the full store.
+#[wasm_bindgen(js_name = opfsSelftest)]
+pub fn opfs_selftest(path: &str, bytes: &[u8]) -> Result<Vec<u8>, JsError> {
+    loki_signer_core::signer::opfs_selftest(path, bytes).map_err(|e| JsError::new(&e))
 }
 
 #[cfg(test)]
