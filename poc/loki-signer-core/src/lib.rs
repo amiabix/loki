@@ -9,6 +9,11 @@
 //! The `frostd` [`transport::Transport`] implementation (reqwest/tokio) stays in `loki-poc`;
 //! only the trait and its public message types live here.
 
+/// The FROST ciphersuite (reddsa/redpallas), re-exported so non-native transports (the
+/// browser signer) can serialize/deserialize the public signing wire without a direct
+/// reddsa-frost dependency and its version pinning.
+pub use reddsa_frost::frost::redpallas as frost;
+
 pub mod builder;
 pub mod candidate;
 pub mod distributed_setup;

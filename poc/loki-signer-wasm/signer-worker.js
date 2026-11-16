@@ -74,6 +74,74 @@ async function driveDkg(signer, p) {
   return { vault: vref.vault_id, address: signer.vaultAddress() };
 }
 
+// Reopen an already-DKG'd vault into an active `VaultState` + session, so the synchronous
+// signer core can sign for it. Idempotent: `vaultJoin` reopens an existing vault (no new
+// DKG) and `connect` re-establishes the session. Returns the connected `FrostdClient`.
+async function reopenVault(signer, p) {
+  const { vaultHex, slot, label, network, rosterHex, frostdUrl, sessionId, transportUrl } = p;
+  for (const path of JSON.parse(vaultPaths(vaultHex))) await opfsPreopenWrite(path);
+  const roster = Uint8Array.from(rosterHex.match(/../g).map((b) => parseInt(b, 16)));
+  signer.vaultJoin(vaultHex, slot, label ?? "vault", network, roster);
+
+  const login = JSON.parse(signer.frostdLogin());
+  const Client = await loadFrostd(transportUrl);
+  const fc = new Client(frostdUrl, login.secret, login.pubkey);
+  await fc.login();
+  fc.useSession(sessionId);
+  return fc;
+}
+
+// Drive this NON-proposer member through one payment signing attempt over frostd, mirroring
+// the native `signer_loop`: commit → receive the proposer's sealed candidate + the
+// coordinator's signing package + rerandomizer seed → open + WYSIWYS-review the candidate →
+// release the signature share. The signer core is synchronous (signCommit/openCandidate/
+// paymentReview/signApprove); this loop owns the async frostd pump. WYSIWYS is enforced
+// inside signApprove — it refuses unless the package binds the recomputed sighash.
+async function drivePayment(signer, p) {
+  const { vaultHex, attemptHex, proposerSigning, proposerEnc, proposerId, signers, coordinatorPeer } = p;
+  const fc = await reopenVault(signer, p);
+
+  // Pre-open this attempt's crash-safe nonce files (name = payment_id ++ attempt_id hex; the
+  // native host sets both to the attempt), so the synchronous commit/sign can persist.
+  const nonceId = attemptHex + attemptHex;
+  const dir = `loki/vaults/${vaultHex}/signer`;
+  await opfsPreopenWrite(`${dir}/nonces/${nonceId}.nonce`);
+  await opfsPreopenWrite(`${dir}/nonces/${nonceId}.burn`);
+
+  // Round 1: emit this member's public commitment to the coordinator.
+  await fc.sendToCoordinator(signer.signCommit(attemptHex));
+
+  // Collect the three inbound messages: the sealed candidate (from the proposer) and the
+  // signing package + 32-byte seed (from the coordinator). The 32-byte message is the seed;
+  // the longer coordinator message is the package.
+  const signersCsv = signers.join(",");
+  let candidateHex = null, packageHex = null, seedHex = null;
+  const pollMs = Number(p.pollMs) || 200;
+  const maxTicks = Number(p.maxTicks) || 1200;
+  for (let tick = 0; tick < maxTicks; tick++) {
+    for (const m of JSON.parse(await fc.recv())) {
+      if (m.from === proposerEnc && candidateHex === null) {
+        candidateHex = signer.openCandidate(proposerSigning, proposerEnc, proposerId, signersCsv, attemptHex, m.message);
+      } else if (m.from === coordinatorPeer) {
+        if (m.message.length === 64) seedHex = m.message; // 32 bytes hex
+        else packageHex = m.message;
+      }
+    }
+    if (candidateHex !== null && packageHex !== null && seedHex !== null) break;
+    await sleep(pollMs);
+  }
+  if (candidateHex === null || packageHex === null || seedHex === null) {
+    throw new Error("payment signing messages did not arrive before the deadline");
+  }
+
+  // WYSIWYS render (for the UI/audit) then release the share — signApprove re-derives and
+  // binds the sighash itself and refuses any mismatch before touching the nonce/share.
+  const review = JSON.parse(signer.paymentReview(candidateHex));
+  const share = signer.signApprove(attemptHex, candidateHex, packageHex, seedHex);
+  await fc.sendToCoordinator(share);
+  return { approved: true, review };
+}
+
 async function preopenCreate(P, method) {
   await opfsPreopenWrite(P.identity);
   await opfsPreopenWrite(P.profile);
@@ -87,7 +155,7 @@ async function preopenUnlock(P, method) {
 }
 
 self.onmessage = async (e) => {
-  const { id, op, method, name, passphrase, prfSecret, dkg, devicePubHex } = e.data;
+  const { id, op, method, name, passphrase, prfSecret, dkg, payment, devicePubHex } = e.data;
   try {
     const { signer, P } = await ready;
     let result;
@@ -105,6 +173,14 @@ self.onmessage = async (e) => {
         break;
       case "dkg":
         result = await driveDkg(signer, dkg);
+        break;
+      case "payment-review":
+        // Reopen the vault for its viewing key, then WYSIWYS-render the supplied candidate.
+        await reopenVault(signer, payment);
+        result = JSON.parse(signer.paymentReview(payment.candidateHex));
+        break;
+      case "payment-approve":
+        result = await drivePayment(signer, payment);
         break;
       case "create":
         await preopenCreate(P, method);

@@ -22,7 +22,7 @@
 
 use crate::dkg_core::{DkgCore, DkgPhase, DkgState};
 use crate::member_state::{Roster, ValidatedRoster};
-use crate::setup_transport::{DkgWire, DkgWireKind, Identity};
+use crate::setup_transport::{DkgWire, DkgWireKind, Identity, PublicIdentity};
 use crate::signer::backup::{self, BackupArtifact, BackupMaterial};
 use crate::signer::nonce::NonceStore;
 use crate::signer::secure_element::{SealedShare, SecureElement};
@@ -683,6 +683,22 @@ impl<SE: SecureElement> LocalSigner<SE> {
         )
         .map_err(|e| SignerError::Other(e.to_string()))?;
         Ok((public, self.fvk()?.clone()))
+    }
+
+    /// Open a candidate PCZT the `proposer` signer sealed to this member for `context`,
+    /// using this signer's own setup identity. Returns the unsigned candidate bytes; the
+    /// caller still runs the WYSIWYS render + `sign_approve` (which re-derives and binds the
+    /// sighash) before any share is released. Used by the browser non-proposer pump, whose
+    /// transport layer lives in JS and so cannot open the member-to-member envelope itself.
+    pub fn open_candidate(
+        &self,
+        proposer: &PublicIdentity,
+        context: &crate::signing_session::SessionContext,
+        wire: &[u8],
+    ) -> Result<Vec<u8>, SignerError> {
+        let identity = self.identity.as_ref().ok_or(SignerError::NotReady)?;
+        crate::transport::SealedCandidate::open(identity, proposer, context, wire)
+            .map_err(SignerError::Other)
     }
 
     /// The device-side "abandon this setup" action: wipe the setup's fresh key, FROST
@@ -1693,6 +1709,49 @@ pub(crate) mod tests {
             .sign_approve(&session, &cand, &pczt, &good_pkg, &seed)
             .expect("matching sighash must sign");
         assert_eq!(share.serialize().len(), 32);
+    }
+
+    // (a'') The browser `paymentReview` seam: it renders the candidate (describe_pczt) and
+    //       INDEPENDENTLY recomputes the sighash (sighash_of_pczt) the exact same way the
+    //       native path does, with NO share released. The recomputed sighash must equal the
+    //       message a correct SigningPackage commits to, and a tampered candidate must not
+    //       reproduce it (so sign_approve's binding would refuse to release a share).
+    #[test]
+    fn payment_review_recomputes_candidate_sighash_and_tamper_is_refused() {
+        let (shares, public, fvk) = dealer_vault();
+        let (mut signer, key1) = signer_with_dealer_share(1, &shares, &public, &fvk);
+        let session = connect_signer(&mut signer);
+        let cand = CandidateRef {
+            vault_id: [1u8; 32],
+            payment_id: [9u8; 32],
+            attempt_id: [9u8; 32],
+        };
+        let own_commit = signer.sign_commit(&session, &cand).unwrap();
+        let key2 = frost::keys::KeyPackage::try_from(
+            shares.get(&frost::Identifier::try_from(2u16).unwrap()).unwrap().clone(),
+        )
+        .unwrap();
+        let (_n2, peer_commit) = frost::round1::commit(key2.signing_share(), &mut rand_core::OsRng);
+        let (pczt, pkg, _seed) = candidate_and_package(
+            &fvk, &key1, &public, *key2.identifier(), peer_commit, own_commit, true,
+        );
+
+        // paymentReview = describe + recompute-sighash, both over the vault viewing key.
+        let view = wysiwys::describe_pczt(&pczt, &fvk).unwrap();
+        let sighash = wysiwys::sighash_of_pczt(&pczt, &fvk).unwrap();
+        assert_eq!(view.amount_zat, AMOUNT);
+        assert!(view.fee_verified);
+        // The recomputed sighash is EXACTLY what the real SigningPackage commits to.
+        assert_eq!(pkg.message().as_slice(), sighash);
+
+        // Flip a byte: the candidate no longer reproduces that sighash (refused outright, or a
+        // different hash that sign_approve's `pkg.message() == sighash` gate would reject).
+        let mut bad = pczt.clone();
+        *bad.last_mut().unwrap() ^= 0xff;
+        match wysiwys::sighash_of_pczt(&bad, &fvk) {
+            Ok(h) => assert_ne!(h, sighash, "tampered candidate must not reproduce the sighash"),
+            Err(_) => {}
+        }
     }
 
     // (a') a member refusal is first-class and does not consume the nonce.

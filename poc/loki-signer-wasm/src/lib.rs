@@ -12,7 +12,7 @@
 //! `std::fs` (the core stays synchronous; the signer runs in a Web Worker where OPFS
 //! `createSyncAccessHandle` gives synchronous file I/O). See the Phase 3 report.
 
-use loki_signer_core::setup_transport::Identity;
+use loki_signer_core::setup_transport::{Identity, PublicIdentity};
 use loki_signer_core::signer::backup::BackupArtifact;
 use loki_signer_core::signer::local::{
     BackupDevice, DevicePrompts, LocalSigner, RosterDecision, SignerError,
@@ -22,9 +22,13 @@ use loki_signer_core::signer::secure_element::{
 };
 use loki_signer_core::signer::secure_element_webauthn::{prf_kek, WebAuthnSecureElement};
 use loki_signer_core::signer::{
-    opfs_exists, opfs_get, opfs_put, Network, Session, Signer as SignerTrait, VaultRef,
+    opfs_exists, opfs_get, opfs_put, CandidateRef, Network, Session, Signer as SignerTrait,
+    VaultRef,
 };
+use loki_signer_core::signer::wysiwys::{describe_pczt, sighash_of_pczt};
 use loki_signer_core::signer::DkgInput;
+use loki_signer_core::signing_session::{AttemptId, SessionContext};
+use loki_signer_core::frost;
 use std::time::Duration;
 use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
@@ -397,6 +401,77 @@ impl Signer {
             .map_err(|e| JsError::new(&format!("release_address: {e}")))?
             .address)
     }
+
+    // ─── Phase C: review + approve a payment (NON-proposer signer) ───────────────
+    //
+    // The audited payment seam (`Signer::sign_commit/sign_approve`, `wysiwys::describe_pczt/
+    // sighash_of_pczt`) is SYNCHRONOUS and message-in/out: it never owns a transport. These
+    // wasm methods drive the active vault's `LocalSigner` through them; the async frostd pump
+    // (`drivePayment` in signer-worker.js) carries the signing-round messages. The browser
+    // member REVIEWS + APPROVES only — the proposer/builder assembles and seals the candidate
+    // (out of scope here). WYSIWYS is enforced inside `signApprove`: it re-renders the
+    // candidate, recomputes the sighash, and REFUSES unless the signing package commits to
+    // that exact sighash, BEFORE the nonce/share is touched.
+
+    /// WYSIWYS render of a candidate PCZT (hex): the facts this member would sign, derived
+    /// from the bytes with the vault viewing key, plus the independently recomputed sighash.
+    /// Releases NO secret and touches no nonce. Returns JSON
+    /// `{recipient, amount_zat, fee_zat, change_zat, memo, network_branch_id, fee_verified,
+    /// sighash}` (recipient/memo/sighash hex; amounts decimal strings). Reopen the vault
+    /// (`vaultJoin`) first. Errors on an unparseable/invalid candidate.
+    #[wasm_bindgen(js_name = paymentReview)]
+    pub fn payment_review(&self, candidate_hex: &str) -> Result<String, JsError> {
+        self.payment_review_impl(candidate_hex).map_err(|e| JsError::new(&e))
+    }
+
+    /// Round 1: the PUBLIC signing commitment for `attempt_hex` (hex). The secret nonce is
+    /// persisted crash-safe to OPFS and never returned. The Worker must pre-open this attempt's
+    /// `nonces/<id>.nonce` + `.burn` paths first. Reopen the vault first.
+    #[wasm_bindgen(js_name = signCommit)]
+    pub fn sign_commit(&mut self, attempt_hex: &str) -> Result<String, JsError> {
+        self.sign_commit_impl(attempt_hex).map_err(|e| JsError::new(&e))
+    }
+
+    /// Open a candidate the `proposer` signer sealed to this member over frostd for this
+    /// attempt. Returns the unsigned candidate PCZT (hex) to review + approve. `signers_csv`
+    /// is the comma-separated slot list the proposer sealed under (sorted internally to match).
+    /// No share is released here. Reopen the vault first.
+    #[wasm_bindgen(js_name = openCandidate)]
+    pub fn open_candidate(
+        &self,
+        proposer_signing_hex: &str,
+        proposer_enc_hex: &str,
+        proposer_id: u16,
+        signers_csv: &str,
+        attempt_hex: &str,
+        wire_hex: &str,
+    ) -> Result<String, JsError> {
+        self.open_candidate_impl(
+            proposer_signing_hex,
+            proposer_enc_hex,
+            proposer_id,
+            signers_csv,
+            attempt_hex,
+            wire_hex,
+        )
+        .map_err(|e| JsError::new(&e))
+    }
+
+    /// Round 2: the PUBLIC signature share for `attempt_hex` (hex). INDEPENDENTLY re-renders
+    /// the candidate, recomputes its sighash, and REFUSES unless `package_hex` commits to that
+    /// exact sighash — before the nonce/share is touched (WYSIWYS). `candidate_hex` is the
+    /// opened candidate, `seed_hex` the 32-byte rerandomizer seed. Reopen the vault first.
+    #[wasm_bindgen(js_name = signApprove)]
+    pub fn sign_approve(
+        &mut self,
+        attempt_hex: &str,
+        candidate_hex: &str,
+        package_hex: &str,
+        seed_hex: &str,
+    ) -> Result<String, JsError> {
+        self.sign_approve_impl(attempt_hex, candidate_hex, package_hex, seed_hex)
+            .map_err(|e| JsError::new(&e))
+    }
 }
 
 /// The active vault's DKG signer, held while a join/DKG is in flight (and after, until lock).
@@ -480,7 +555,114 @@ fn vault_ref_json(v: &VaultRef) -> String {
     .to_string()
 }
 
+fn hex32(s: &str) -> Result<[u8; 32], String> {
+    hex::decode(s)
+        .map_err(|e| e.to_string())?
+        .try_into()
+        .map_err(|_| "expected 32 bytes of hex".to_string())
+}
+
 impl Signer {
+    /// This payment's candidate reference. The native host uses `payment_id == attempt_id ==
+    /// attempt`, which also fixes the crash-safe nonce file name; mirror it.
+    fn candidate_ref(&self, attempt_hex: &str) -> Result<(CandidateRef, [u8; 32]), String> {
+        let vs = self.vault.as_ref().ok_or("no active vault — call vaultJoin first")?;
+        let attempt = hex32(attempt_hex)?;
+        Ok((
+            CandidateRef {
+                vault_id: vs.vref.vault_id,
+                payment_id: attempt,
+                attempt_id: attempt,
+            },
+            vs.vref.vault_id,
+        ))
+    }
+
+    fn payment_review_impl(&self, candidate_hex: &str) -> Result<String, String> {
+        let vs = self.vault.as_ref().ok_or("no active vault — call vaultJoin first")?;
+        let (_, fvk) = vs.signer.hosted_metadata().map_err(|e| e.to_string())?;
+        let bytes = hex::decode(candidate_hex).map_err(|e| e.to_string())?;
+        let view = describe_pczt(&bytes, &fvk)?;
+        let sighash = sighash_of_pczt(&bytes, &fvk)?;
+        Ok(serde_json::json!({
+            "recipient": hex::encode(view.to),
+            "amount_zat": view.amount_zat.to_string(),
+            "fee_zat": view.fee_zat.to_string(),
+            "change_zat": view.change_zat.to_string(),
+            "memo": hex::encode(view.memo),
+            "network_branch_id": view.network_branch_id,
+            "fee_verified": view.fee_verified,
+            "sighash": hex::encode(sighash),
+        })
+        .to_string())
+    }
+
+    fn sign_commit_impl(&mut self, attempt_hex: &str) -> Result<String, String> {
+        let (cand, _) = self.candidate_ref(attempt_hex)?;
+        let vs = self.vault.as_mut().ok_or("no active vault — call vaultJoin first")?;
+        let commit = vs.signer.sign_commit(&vs.session, &cand).map_err(|e| e.to_string())?;
+        commit.serialize().map(hex::encode).map_err(|e| e.to_string())
+    }
+
+    fn open_candidate_impl(
+        &self,
+        proposer_signing_hex: &str,
+        proposer_enc_hex: &str,
+        proposer_id: u16,
+        signers_csv: &str,
+        attempt_hex: &str,
+        wire_hex: &str,
+    ) -> Result<String, String> {
+        let vs = self.vault.as_ref().ok_or("no active vault — call vaultJoin first")?;
+        let proposer = PublicIdentity {
+            id: proposer_id,
+            signing: hex32(proposer_signing_hex)?,
+            encryption: hex32(proposer_enc_hex)?,
+        };
+        let mut signers: Vec<u16> = signers_csv
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse::<u16>().map_err(|e| e.to_string()))
+            .collect::<Result<_, _>>()?;
+        signers.sort_unstable();
+        let attempt = hex32(attempt_hex)?;
+        let context = SessionContext {
+            vault: vs.vref.vault_id,
+            payment: attempt,
+            attempt: AttemptId(attempt),
+            signers,
+        };
+        let wire = hex::decode(wire_hex).map_err(|e| e.to_string())?;
+        let bytes = vs
+            .signer
+            .open_candidate(&proposer, &context, &wire)
+            .map_err(|e| e.to_string())?;
+        Ok(hex::encode(bytes))
+    }
+
+    fn sign_approve_impl(
+        &mut self,
+        attempt_hex: &str,
+        candidate_hex: &str,
+        package_hex: &str,
+        seed_hex: &str,
+    ) -> Result<String, String> {
+        let (cand, _) = self.candidate_ref(attempt_hex)?;
+        let candidate = hex::decode(candidate_hex).map_err(|e| e.to_string())?;
+        let package = frost::SigningPackage::deserialize(
+            &hex::decode(package_hex).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        let seed = hex32(seed_hex)?;
+        let vs = self.vault.as_mut().ok_or("no active vault — call vaultJoin first")?;
+        let share = vs
+            .signer
+            .sign_approve(&vs.session, &cand, &candidate, &package, &seed)
+            .map_err(|e| e.to_string())?;
+        Ok(hex::encode(share.serialize()))
+    }
+
     fn vault_join_impl(
         &mut self,
         vault_hex: &str,

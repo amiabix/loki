@@ -192,7 +192,14 @@ function browserSigner(url: string): SignerModule {
       // coordinator's frostd session + relay peer, the TLS frostd URL); the Worker drives the
       // synchronous DKG core over the frostd transport to an active vault + released address.
       if (path === "dkg") return call<T>({ op: "dkg", dkg: body });
-      throw new SignerPending(path); // payment ops stay Phase C
+      // Phase C: review + approve a payment (NON-proposer signer). The UI supplies the vault
+      // reopen params (vaultHex/slot/label/network/rosterHex), the frostd session + relay
+      // peers, the proposer identity, and the attempt; the Worker drives the synchronous
+      // signer core over the frostd transport. WYSIWYS is enforced inside the core (signApprove
+      // refuses unless the signing package binds the recomputed sighash).
+      if (path === "payment-review") return call<T>({ op: "payment-review", payment: body });
+      if (path === "payment-approve") return call<T>({ op: "payment-approve", payment: body });
+      throw new SignerPending(path); // other member paths stay unbuilt
     },
   };
 }
