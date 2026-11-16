@@ -37,7 +37,13 @@ use orchard::keys::FullViewingKey;
 use reddsa_frost::frost::redpallas as frost;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// std::time::Instant has no time source on wasm32-unknown-unknown; web-time maps it onto
+// performance.now() with the same API, so the roster-deadline logic is unchanged.
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 use zeroize::Zeroizing;
 
 /// The member's on-device approval decision for a rendered payment. In a real signer this

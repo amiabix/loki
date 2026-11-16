@@ -11,8 +11,14 @@ publish = false
 # (reqwest/tokio) stays in `loki-poc`; only the `Transport` trait + message types live here.
 
 [dependencies]
-orchard            = { package = "zakura-orchard", version = "=2.2.0" }
-zcash_primitives   = { package = "zakura-primitives", version = "=2.2.0" }
+# default-features=false drops the halo2 circuit: the in-browser signer verifies
+# sighashes and signs but does NOT prove (proving is the server-side builder). Native
+# loki-poc keeps the circuit via its own orchard dep (cargo unifies features), so the
+# native build is unaffected.
+orchard            = { package = "zakura-orchard", version = "=2.2.0", default-features = false, features = ["std", "unstable-frost", "unstable-voting-circuits"] }
+# default-features=false drops `circuits`+`multicore` (orchard/sapling halo2 + rayon),
+# which don't build on wasm. Native loki-poc re-enables them via its own primitives dep.
+zcash_primitives   = { package = "zakura-primitives", version = "=2.2.0", default-features = false, features = ["std"] }
 pczt               = { package = "zakura-pczt", version = "=0.1.0-rc4", features = ["orchard", "signer", "io-finalizer", "spend-finalizer", "tx-extractor", "zcp-builder"] }
 reddsa_frost       = { package = "zakura-reddsa", version = "=2.2.0", features = ["frost"] }
 frost-core         = { version = "=3.0.0", features = ["serialization"] }
@@ -49,9 +55,18 @@ uuid               = { version = "1", features = ["v4", "serde"] }
 serde              = { version = "1", features = ["derive"] }
 zcash_note_encryption = "0.4.2"
 zcash_transparent  = { package = "zakura-transparent", version = "=2.2.0" }
-sapling-crypto     = { package = "zakura-sapling-crypto", version = "=2.2.0" }
+sapling-crypto     = { package = "zakura-sapling-crypto", version = "=2.2.0", default-features = false, features = ["std"] }
 ciborium-io        = "0.2"
 sha2               = "=0.10.9"
+
+# wasm getrandom backends + a monotonic clock. rand_core 0.6 -> getrandom 0.2 ("js");
+# rand 0.10 -> getrandom 0.4 ("wasm_js", also needs --cfg getrandom_backend="wasm_js").
+# web-time replaces std::time::Instant (no time source on wasm32-unknown-unknown).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom     = { version = "0.2", features = ["js"] }
+getrandom_v04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+web-time      = "1"
+uuid          = { version = "1", features = ["js"] }
 
 [features]
 # Apple Secure Enclave backend (macOS only); the swift link lives in loki-poc's build.rs,
