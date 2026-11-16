@@ -52,6 +52,7 @@ export function createSignerClient(workerUrl = "./signer-worker.js") {
     // ceremony params (vaultHex, slot, label, network, rosterHex, frostdUrl, coordinatorPeer,
     // sessionId, transportUrl); resolves to { vault, address }.
     dkg: (params) => call({ op: "dkg", dkg: params }),
+    join: (params) => call({ op: "join", join: params }),
     terminate: () => worker.terminate(),
   };
 }

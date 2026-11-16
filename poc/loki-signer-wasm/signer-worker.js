@@ -107,26 +107,29 @@ async function joinCeremony(signer, p) {
     throw new Error("creator roster changed this member's identity");
   }
 
-  // Rebuild the creator's setup document (setup_version 2), members sorted by slot.
+  // Rebuild the creator's setup document (setup_version 2), members sorted by slot. The
+  // testnet birth_height is NOT reconstructed from a guessed tip (it would mismatch the
+  // creator's and the DKG setup certificate would be refused) — it is adopted from the
+  // creator's published session below, so the document matches byte-for-byte.
   const members = Object.keys(roster)
     .map(Number)
     .sort((a, b) => a - b)
     .map((s) => ({ id: s, signing: roster[String(s)].signing, encryption: roster[String(s)].encryption }));
-  const doc = { vault, threshold, setup_version: 2, network, members };
-  if (network === "testnet") {
-    if (p.birthHeight == null) throw new Error("testnet join needs birthHeight");
-    doc.birth_height = Number(p.birthHeight);
-  }
-  const rosterHex = toHex(new TextEncoder().encode(JSON.stringify(doc)));
 
-  // Agree, then poll for the creator's frostd session + coordinator relay peer.
+  // Agree, then poll for the creator's frostd session + coordinator relay peer (+ birth_height).
   await postJson(`${base}/api/agreed`, auth);
   const session = await poll(
     () =>
       postJson(`${base}/api/session`, auth).then((s) =>
-        s.session_id && s.coordinator_peer ? s : Promise.reject(new Error("session pending"))),
+        s.session_id && s.coordinator_peer && (network !== "testnet" || s.birth_height != null)
+          ? s
+          : Promise.reject(new Error("session pending"))),
     p,
   );
+
+  const doc = { vault, threshold, setup_version: 2, network, members };
+  if (network === "testnet") doc.birth_height = Number(session.birth_height);
+  const rosterHex = toHex(new TextEncoder().encode(JSON.stringify(doc)));
 
   return driveDkg(signer, {
     vaultHex: vault,
