@@ -62,6 +62,15 @@ mod secp256k1_link_stub {
     }
 }
 
+// Runs once when the worker instantiates the module (wasm-bindgen `start`), so any later
+// panic in a synchronous core call prints its real message + Rust location to the Worker
+// console instead of a bare "unreachable" trap. console_error_panic_hook logs via
+// `console.error`, which exists in a Web Worker.
+#[wasm_bindgen(start)]
+pub fn start() {
+    console_error_panic_hook::set_once();
+}
+
 fn prf32(prf_secret: &[u8]) -> Result<[u8; 32], String> {
     prf_secret
         .try_into()
