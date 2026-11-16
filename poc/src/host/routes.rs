@@ -57,6 +57,7 @@ pub fn router(state: Shared) -> Router {
         .route("/api/payment-publish", post(payment::publish))
         .route("/api/payment-review", post(payment::review))
         .route("/api/payment-approve", post(payment::approve))
+        .route("/api/payment-discard", post(payment::discard))
         .route("/api/payment-finish", post(payment::finish))
         .route("/api/payment-verify", post(payment::verify))
         .route("/api/payments", get(payment::payments))

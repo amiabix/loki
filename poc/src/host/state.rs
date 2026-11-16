@@ -142,6 +142,8 @@ pub struct AppState {
     pub(super) registration: RwLock<Option<super::registration::PublicMember>>,
     pub session: RwLock<Option<Session>>,
     pub ceremony: std::sync::Mutex<()>,
+    pub payment: std::sync::Mutex<()>,
+    pub active_payments: std::sync::Mutex<BTreeSet<String>>,
     pub active_dkgs: std::sync::Mutex<BTreeSet<String>>,
     /// Device login registry, built lazily from `data/recovery.pub` + `data/devices.json` once
     /// a recovery identity exists. Holds outstanding challenges in-process across requests.
@@ -155,6 +157,8 @@ impl AppState {
             registration: RwLock::new(None),
             session: RwLock::new(None),
             ceremony: std::sync::Mutex::new(()),
+            payment: std::sync::Mutex::new(()),
+            active_payments: std::sync::Mutex::new(BTreeSet::new()),
             active_dkgs: std::sync::Mutex::new(BTreeSet::new()),
             device_auth: std::sync::Mutex::new(None),
         }

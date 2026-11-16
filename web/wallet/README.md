@@ -101,3 +101,28 @@ repository root, after building `loki_member_app`:
 ```sh
 FROSTD_URL=http://127.0.0.1:2744 node --test poc/scripts/test_confirmation_wait.mjs
 ```
+
+## Payment approval and recovery
+
+Publishing creates separate encrypted control and signing relay sessions. Each selected member’s
+approval inbox discovers pending requests over the control session without a copied attempt ID.
+Review the full recipient, amount and fee, then approve on each selected member. Waiting for people
+does not start a signing timeout or create a nonce. After quorum, the proposer prepares wallet inputs
+and starts the bounded signing round automatically. A saved signed PCZT is required for **Ready to
+send**; the proposer can then use **Review & send** and **Confirm and send**. A delayed final send
+does not require another signing round. Peer status notices do not establish chain confirmation;
+each wallet verifies that locally.
+
+Consent waiting can resume after a member restart. A started signing round cannot restart under
+the same attempt ID. Failed attempts retain their diagnostic state and nonce journal. The proposer
+can **Discard failed payment** only when no signature share was released and no signed or raw
+transaction exists. Discard closes relay sessions, saves a cancellation record, and releases that
+attempt’s reserved input; the next payment gets a fresh ID. Ambiguous signed outcomes stay reserved
+for recovery. Broadcast retries reuse the saved raw transaction and move input reservations atomically.
+
+The payment regressions use disposable testnet identities and synthetic notes with the live relay;
+they never broadcast a transaction:
+
+```sh
+FROSTD_URL=http://127.0.0.1:2744 cargo test --manifest-path poc/Cargo.toml --locked --offline --features relay-communication --lib host::payment::tests
+```

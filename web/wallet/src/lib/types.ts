@@ -48,6 +48,9 @@ export type Payment = {
   recipient: string;
   amount_zat: string;
   ready_to_send: boolean;
+  approvals?: number[];
+  approval_requested?: boolean;
+  can_discard?: boolean;
   finish_requested?: boolean;
   error?: string | null;
   txid?: string | null;
@@ -62,6 +65,9 @@ export type PaymentSession = {
   phase: string;
   finish_requested: boolean;
   signatures_received: boolean;
+  approvals: number[];
+  approval_requested: boolean;
+  error?: string | null;
   intent: {
     proposer: number;
     signers: number[];
