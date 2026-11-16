@@ -644,8 +644,14 @@ pub(super) async fn draft(State(st): State<Shared>, Json(body): Json<Value>) -> 
         if funding.notes.len() == 1 && (funding.fee_zat != fee_zat || funding.change_zat != change_zat) { return Err("wallet funding differs from candidate fee or change".into()); }
         let mut random = [0u8; 32]; OsRng.fill_bytes(&mut random);
         let attempt = hex::encode(random);
-        let mut signers = vec![v.slot];
-        signers.extend(v.peers.keys().copied().filter(|id| *id != v.slot).take(usize::from(v.threshold - 1)));
+        let signers = match body.get("signers").and_then(|v| v.as_array()) {
+            Some(arr) => arr.iter().filter_map(|x| x.as_u64().map(|n| n as u16)).collect::<Vec<u16>>(),
+            None => {
+                let mut s = vec![v.slot];
+                s.extend(v.peers.keys().copied().filter(|id| *id != v.slot).take(usize::from(v.threshold - 1)));
+                s
+            }
+        };
         if signers.len() != usize::from(v.threshold) { return Err("not enough vault signers".into()); }
         let note_selection = vec![hex::encode(note.nullifier(&v.fvk).to_bytes())];
         let p = Payment { attempt: attempt.clone(), vault: vault.to_owned(), proposer: v.slot, recipient: recipient.to_owned(), amount_zat, memo: memo.to_owned(), fee_zat, change_zat, note_selection, target_height: tip, expiry_height: expiry, signers, phase: "draft".into(), session_id: None, control_session_id: None, approvals: BTreeSet::new(), start_requested: false, coordinator_secret: None, review_token: None, approval_requested: false, approval_started: false, txid: None, signed_pczt: None, raw_tx: None, error: None };
