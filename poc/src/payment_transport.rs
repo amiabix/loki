@@ -1,6 +1,6 @@
 //! Keyless, one-note PCZT signing over a public-message transport.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, time::{Duration, Instant}};
 
 use reddsa_frost::frost::redpallas as frost;
 
@@ -21,7 +21,8 @@ where
     T::Error: std::fmt::Display,
 {
     let mut got = Vec::new();
-    for _ in 0..400 {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while Instant::now() < deadline {
         got.extend(
             transport
                 .recv(channel, as_coordinator)
@@ -195,7 +196,8 @@ where
         .send(channel, std::slice::from_ref(proposer), &Outbound::RandomizerSeed(alpha))
         .map_err(|e| format!("send alpha: {e}"))?;
     let mut candidate_bytes = None;
-    for _ in 0..400 {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while Instant::now() < deadline {
         candidate_bytes = local_candidate()?;
         if candidate_bytes.is_some() {
             break;

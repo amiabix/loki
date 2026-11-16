@@ -54,6 +54,13 @@ update cannot silently retarget an existing paired tab. Create/join, review/appr
 co-signing use the existing typed device API. Logout locks the device; restart that member
 locally with its unlock file and pair with its new link. A web restart does not restart members.
 
+After confirming the roster, a member stays on **Verify members** until the creator has all
+confirmations and publishes the relay session. Waiting for people has no key-generation
+timeout. A creator lock or temporary disconnect can be retried before key generation starts;
+an unlocked member restarted during that wait retains its confirmation. Once key generation
+has started, an interruption requires **Create a new vault**, new invitations, and a new code
+comparison by every member. The failed vault and its diagnostic error remain available.
+
 `LOKI_DEV_FAUCET=1` enables the optional local-origin regtest faucet; it receives only a public
 regtest address. It is off by default, and the supplied launcher binds Next to localhost.
 
@@ -131,3 +138,37 @@ npx next build
 The end-to-end local registration/restart smoke test is in
 `poc/scripts/test_self_registration.mjs` (starts isolated member processes explicitly, outside
 Next). Run it after building `loki_member_app` with `relay-communication` and the web bundle.
+
+The confirmation regression starts three disposable testnet member processes against a live
+`frostd`, delays the remaining confirmations for 22 seconds, locks and restarts the creator,
+restarts the waiting member, then checks that all three activate the same vault. From the
+repository root, after building `loki_member_app`:
+
+```sh
+FROSTD_URL=http://127.0.0.1:2744 node --test poc/scripts/test_confirmation_wait.mjs
+```
+
+## Payment approval and recovery
+
+Publishing creates separate encrypted control and signing relay sessions. Each selected member’s
+approval inbox discovers pending requests over the control session without a copied attempt ID.
+Review the full recipient, amount and fee, then approve on each selected member. Waiting for people
+does not start a signing timeout or create a nonce. After quorum, the proposer prepares wallet inputs
+and starts the bounded signing round automatically. A saved signed PCZT is required for **Ready to
+send**; the proposer can then use **Review & send** and **Confirm and send**. A delayed final send
+does not require another signing round. Peer status notices do not establish chain confirmation;
+each wallet verifies that locally.
+
+Consent waiting can resume after a member restart. A started signing round cannot restart under
+the same attempt ID. Failed attempts retain their diagnostic state and nonce journal. The proposer
+can **Discard failed payment** only when no signature share was released and no signed or raw
+transaction exists. Discard closes relay sessions, saves a cancellation record, and releases that
+attempt’s reserved input; the next payment gets a fresh ID. Ambiguous signed outcomes stay reserved
+for recovery. Broadcast retries reuse the saved raw transaction and move input reservations atomically.
+
+The payment regressions use disposable testnet identities and synthetic notes with the live relay;
+they never broadcast a transaction:
+
+```sh
+FROSTD_URL=http://127.0.0.1:2744 cargo test --manifest-path poc/Cargo.toml --locked --offline --features relay-communication --lib host::payment::tests
+```

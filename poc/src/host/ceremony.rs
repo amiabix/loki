@@ -26,7 +26,7 @@ use super::{
 };
 use crate::{
     frost_roster::FrostRoster,
-    network::VaultNetwork,
+    network::{VaultNetwork, TESTNET_NU7_BIRTH},
     setup_transport::{Identity, PublicIdentity},
     signer::{
         backup::BackupArtifact,
@@ -299,26 +299,43 @@ fn invitations(c: &Ceremony) -> Result<Vec<Value>, String> {
         .collect()
 }
 
+enum PeerRequestError {
+    Unavailable(String),
+    Rejected(String),
+}
+
 fn peer_request(method: &str, url: &str, body: Option<Value>) -> Result<Value, String> {
-    let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    peer_request_result(method, url, body).map_err(|error| match error {
+        PeerRequestError::Unavailable(message) | PeerRequestError::Rejected(message) => message,
+    })
+}
+
+fn peer_request_result(method: &str, url: &str, body: Option<Value>) -> Result<Value, PeerRequestError> {
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|e| PeerRequestError::Unavailable(e.to_string()))?;
     runtime.block_on(async {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| PeerRequestError::Unavailable(e.to_string()))?;
         let req = if method == "POST" {
             client.post(url).json(&body.unwrap_or(json!({})))
         } else {
             client.get(url)
         };
-        let response = req.send().await.map_err(|e| e.to_string())?;
+        let response = req.send().await.map_err(|e| PeerRequestError::Unavailable(e.to_string()))?;
         let status = response.status();
-        let value: Value = response.json().await.map_err(|e| e.to_string())?;
+        let value: Value = response.json().await.map_err(|e| PeerRequestError::Unavailable(e.to_string()))?;
         if !status.is_success() {
-            return Err(value["error"]
+            let message = value["error"]
                 .as_str()
                 .unwrap_or("peer request failed")
-                .into());
+                .to_owned();
+            return Err(if status.is_server_error() || matches!(status.as_u16(), 401 | 404 | 408 | 429) {
+                PeerRequestError::Unavailable(message)
+            } else {
+                PeerRequestError::Rejected(message)
+            });
         }
         Ok(value)
     })
@@ -670,7 +687,11 @@ pub(super) async fn status(st: Shared, vault: String) -> Reply {
         Ok(x) => x,
         Err(e) => return e,
     };
-    blocking(move || {
+    let waiting_st = st.clone();
+    let waiting_data = data.clone();
+    let waiting_pass = pass.clone();
+    let waiting_vault = vault.clone();
+    let reply = blocking(move || {
         let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
         let mut c = load(&data, &pass, &vault)?;
         if c.my_slot != 1 && c.fingerprint.is_none() {
@@ -682,7 +703,7 @@ pub(super) async fn status(st: Shared, vault: String) -> Reply {
         let running_here = st.active_dkgs.lock().map_err(|e| e.to_string())?.contains(&vault);
         let phase = if active {
             "active"
-        } else if c.dkg_started && !running_here {
+        } else if c.error.is_some() || (c.dkg_started && !running_here) {
             "setup_interrupted"
         } else if c.dkg_started || (c.my_slot == 1 && c.agreed.len() == usize::from(c.members)) {
             "creating_keys"
@@ -692,7 +713,8 @@ pub(super) async fn status(st: Shared, vault: String) -> Reply {
             "waiting_for_members"
         };
         let mut value = json!({"phase":phase,"members":c.members,"threshold":c.threshold,
-            "confirmations":c.agreed.len(),"fingerprint":c.fingerprint});
+            "confirmations":c.agreed.len(),"confirmed":c.agreed.contains(&c.my_slot),
+            "fingerprint":c.fingerprint});
         if c.my_slot == 1 {
             value["invites"] = json!(invitations(&c)?);
         }
@@ -703,10 +725,20 @@ pub(super) async fn status(st: Shared, vault: String) -> Reply {
         }
         Ok(value)
     })
-    .await
+    .await;
+    if reply.0 == StatusCode::OK
+        && reply.1 .0["confirmed"] == true
+        && matches!(reply.1 .0["phase"].as_str(), Some("compare_roster" | "creating_keys"))
+    {
+        spawn_dkg(waiting_st, waiting_vault, waiting_data, waiting_pass);
+    }
+    reply
 }
 
 fn spawn_dkg(st: Shared, vault: String, data: std::path::PathBuf, pass: Zeroizing<String>) {
+    let Ok(mut active) = st.active_dkgs.lock() else { return; };
+    if !active.insert(vault.clone()) { return; }
+    drop(active);
     tokio::spawn(async move {
         let running = st.clone();
         let finished_vault = vault.clone();
@@ -737,7 +769,7 @@ pub(super) async fn agree(State(st): State<Shared>, Json(body): Json<Value>) -> 
     let reply = blocking(move || {
         let _guard = work_st.ceremony.lock().map_err(|e| e.to_string())?;
         let mut c = load(&work_data, &work_pass, &work_vault)?;
-        if c.dkg_started {
+        if c.dkg_started || c.error.is_some() {
             return Err("DKG interrupted or already running; create a fresh vault if interrupted".into());
         }
         refresh_roster(&mut c)?;
@@ -801,6 +833,12 @@ pub(super) async fn session(State(st): State<Shared>, Json(body): Json<Value>) -
     };
     let reply = blocking(move || {
         let c = for_joiner(&data, &pass, &body)?;
+        if let Some(error) = c.error {
+            return Err(format!("Creator setup failed: {error}"));
+        }
+        if c.agreed.len() != usize::from(c.members) {
+            return Err("session pending".into());
+        }
         Ok(json!({
             "session_id": c.session_id.ok_or("session pending")?,
             "coordinator_peer": c.coordinator_peer,
@@ -841,11 +879,31 @@ pub(super) async fn address(
     .await
 }
 
+fn setup_birth_height(
+    network: VaultNetwork,
+    slot: u16,
+    published: Option<u32>,
+    fetch_tip: impl FnOnce() -> Result<u32, String>,
+) -> Result<u32, String> {
+    if network == VaultNetwork::Regtest {
+        return Ok(2);
+    }
+    let height = if slot == 1 {
+        fetch_tip()?
+    } else {
+        published.ok_or("creator did not publish a testnet birth height")?
+    };
+    if height < TESTNET_NU7_BIRTH {
+        return Err("creator birth height precedes testnet NU7".into());
+    }
+    Ok(height)
+}
+
 fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result<Value, String> {
     let mut c = {
         let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
-        let mut c = load(data, pass, vault_id)?;
-        if c.dkg_started || dir(data, vault_id)?.exists("vault.sealed") {
+        let c = load(data, pass, vault_id)?;
+        if c.dkg_started || c.error.is_some() || dir(data, vault_id)?.exists("vault.sealed") {
             return Ok(json!({"ok":true}));
         }
         if (c.my_slot == 1 && c.agreed.len() != usize::from(c.members))
@@ -853,18 +911,49 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
         {
             return Ok(json!({"ok":true}));
         }
-        c.dkg_started = true;
-        save(data, pass, &c)?;
-        st.active_dkgs.lock().map_err(|e| e.to_string())?.insert(vault_id.to_owned());
         c
     };
     let outcome: Result<Value, String> = (|| {
+        if c.my_slot != 1 {
+            loop {
+                if st.session.blocking_read().is_none() {
+                    return Ok(json!({"ok":true}));
+                }
+                match peer_request_result(
+                    "POST", &format!("{}/api/session", c.creator_base_url), Some(joiner_auth(&c)?),
+                ) {
+                    Ok(response) => {
+                        let id = response["session_id"].as_str()
+                            .and_then(|id| Uuid::parse_str(id).ok()).ok_or("invalid creator session")?;
+                        let peer = response["coordinator_peer"].as_str()
+                            .and_then(|peer| hex::decode(peer).ok())
+                            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                            .ok_or("invalid creator relay identity")?;
+                        c.session_id = Some(id);
+                        c.coordinator_peer = Some(hex::encode(peer));
+                        if st.config.network == "testnet" {
+                            c.birth_height = Some(response["birth_height"].as_u64()
+                                .and_then(|n| u32::try_from(n).ok())
+                                .ok_or("creator did not publish a valid testnet birth height")?);
+                        }
+                        break;
+                    }
+                    // Human confirmation has no key-generation deadline. The creator only
+                    // publishes a session after every member has confirmed the roster.
+                    Err(PeerRequestError::Unavailable(_)) => std::thread::sleep(Duration::from_secs(1)),
+                    Err(PeerRequestError::Rejected(error)) => return Err(format!("Waiting for creator: {error}")),
+                }
+            }
+        }
+        {
+            let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
+            c.dkg_started = true;
+            save(data, pass, &c)?;
+        }
         let me = identity(data, pass, c.my_slot)?;
         let roster = roster_of(&c)?;
         let network = VaultNetwork::parse(&st.config.network)?;
-        let birth_height = match network {
-            VaultNetwork::Regtest => 2,
-            VaultNetwork::Testnet => {
+        let birth_height = setup_birth_height(network, c.my_slot, c.birth_height, || {
                 let url = st.config.lightwalletd.as_deref().ok_or("Testnet vault requires a lightwalletd URL")?;
                 let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
                 let channel = runtime.block_on(crate::wallet_store::lightwalletd_endpoint(url)?.connect())
@@ -876,9 +965,8 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
                     || Some(info.sapling_activation_height) != network.activation_height(zcash_protocol::consensus::NetworkUpgrade::Sapling).map(u64::from) {
                     return Err("lightwalletd serves another chain".into());
                 }
-                u32::try_from(info.block_height).map_err(|_| "chain height overflow")?
-            }
-        };
+                u32::try_from(info.block_height).map_err(|_| "chain height overflow".into())
+        })?;
         let peers: BTreeMap<u16, Peer> = roster.members.values()
             .map(|identity| (identity.id, Peer(identity.encryption))).collect();
         let identity_secret = Zeroizing::new(me.to_secret_bytes());
@@ -909,24 +997,10 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
             }
             (id, Some((coord_tx, coord_ch)), peer)
         } else {
-            let mut found = None;
-            for _ in 0..200 {
-                if let Ok(response) = peer_request(
-                    "POST", &format!("{}/api/session", c.creator_base_url), Some(joiner_auth(&c)?),
-                ) {
-                    if let (Some(id), Some(peer)) = (
-                        response["session_id"].as_str().and_then(|s| Uuid::parse_str(s).ok()),
-                        response["coordinator_peer"].as_str().and_then(|s| hex::decode(s).ok())
-                            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok()),
-                    ) {
-                        found = Some((id, Peer(peer)));
-                        break;
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            let (id, peer) = found.ok_or("creator session not available")?;
-            (id, None, peer)
+            let id = c.session_id.ok_or("creator session missing")?;
+            let peer: [u8; 32] = hex::decode(c.coordinator_peer.as_deref().ok_or("creator relay identity missing")?)
+                .map_err(|e| e.to_string())?.try_into().map_err(|_| "invalid creator relay identity")?;
+            (id, None, Peer(peer))
         };
         let channel = transport.join(session_id).map_err(|e| e.to_string())?;
         let signer_dir = dir(data, vault_id)?.path().join("signer");
@@ -1053,6 +1127,21 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
 mod tests {
     use super::*;
     use crate::host::state::{AppState, Config, Session};
+
+    #[test]
+    fn testnet_joiner_uses_creator_birth_height_when_tip_advances() {
+        let published = TESTNET_NU7_BIRTH + 100;
+        assert_eq!(setup_birth_height(VaultNetwork::Testnet, 2, Some(published), || Ok(published + 1)).unwrap(), published);
+        assert_eq!(setup_birth_height(VaultNetwork::Testnet, 3, Some(published), || Err("joiner must not fetch its own tip".into())).unwrap(), published);
+    }
+
+    #[test]
+    fn testnet_birth_height_requires_a_valid_creator_checkpoint() {
+        let height = TESTNET_NU7_BIRTH + 100;
+        assert_eq!(setup_birth_height(VaultNetwork::Testnet, 1, None, || Ok(height)).unwrap(), height);
+        assert!(setup_birth_height(VaultNetwork::Testnet, 2, None, || Ok(height)).is_err());
+        assert!(setup_birth_height(VaultNetwork::Testnet, 2, Some(TESTNET_NU7_BIRTH - 1), || Ok(height)).is_err());
+    }
 
     #[test]
     fn roster_requires_every_valid_distinct_member() {

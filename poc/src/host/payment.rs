@@ -1,7 +1,7 @@
 //! Hosted one-note payments. All wallet, frostd, proving, and broadcast work is blocking.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -34,12 +34,12 @@ use crate::{
     candidate::{quote_fee, CandidateInputs},
     network::{VaultNetwork, TESTNET_NU7_BIRTH},
     payment_transport::{coordinate, signer_loop},
-    signing_session::{AttemptId, MessageKind, SessionContext},
     setup_transport::{Identity, PublicIdentity},
     signer::{
         local::LocalSigner, secure_element::SoftwareSecureElement, CandidateRef, Network,
         PublicPaymentParams, Signer,
     },
+    signing_session::{AttemptId, MessageKind, SessionContext},
     state::MemberDir,
     transport::{FrostdLoginKey, FrostdTransport, Outbound, Peer, SealedPeer, Transport},
     tx_finalize::prove,
@@ -67,6 +67,12 @@ struct Payment {
     signers: Vec<u16>,
     phase: String,
     session_id: Option<Uuid>,
+    #[serde(default)]
+    control_session_id: Option<Uuid>,
+    #[serde(default)]
+    approvals: BTreeSet<u16>,
+    #[serde(default)]
+    start_requested: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     coordinator_secret: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -136,6 +142,8 @@ fn read_payment(data: &Path, pass: &str, vault: &str, attempt: &str) -> Result<P
     Ok(p)
 }
 fn save_payment(data: &Path, pass: &str, p: &Payment) -> Result<(), String> {
+    hex32(&p.vault)?;
+    hex32(&p.attempt)?;
     let dir = payment_dir(data, &p.vault)?;
     let file = format!("{}.json", p.attempt);
     let temp = format!("{}.{}.tmp", p.attempt, Uuid::new_v4());
@@ -145,7 +153,10 @@ fn save_payment(data: &Path, pass: &str, p: &Payment) -> Result<(), String> {
         pass,
     )
     .map_err(|e| e.to_string())?;
-    std::fs::rename(dir.path().join(temp), dir.path().join(file)).map_err(|e| e.to_string())
+    std::fs::rename(dir.path().join(temp), dir.path().join(file)).map_err(|e| e.to_string())?;
+    std::fs::File::open(dir.path())
+        .and_then(|f| f.sync_all())
+        .map_err(|e| e.to_string())
 }
 fn load_vault(data: &Path, pass: &str, vault: &str, configured: &str) -> Result<Vault, String> {
     let dir = member_dir(data, vault)?;
@@ -343,6 +354,8 @@ fn review_candidate(bytes: &[u8], payment: &Payment, vault: &Vault) -> Result<()
     Ok(())
 }
 fn check_intent(p: &Payment, v: &Vault) -> Result<(), String> {
+    hex32(&p.vault)?;
+    hex32(&p.attempt)?;
     if p.signers.len() != usize::from(v.threshold)
         || p.signers.first() != Some(&p.proposer)
         || !p.signers.contains(&v.slot)
@@ -366,7 +379,7 @@ fn check_intent(p: &Payment, v: &Vault) -> Result<(), String> {
     Ok(())
 }
 fn public_intent(p: &Payment) -> Value {
-    json!({"attempt":p.attempt,"vault":p.vault,"proposer":p.proposer,"recipient":p.recipient,"amount_zat":p.amount_zat,"memo":p.memo,"fee_zat":p.fee_zat,"change_zat":p.change_zat,"note_selection":p.note_selection,"target_height":p.target_height,"expiry_height":p.expiry_height,"signers":p.signers,"phase":p.phase,"session_id":p.session_id})
+    json!({"attempt":p.attempt,"vault":p.vault,"proposer":p.proposer,"recipient":p.recipient,"amount_zat":p.amount_zat,"memo":p.memo,"fee_zat":p.fee_zat,"change_zat":p.change_zat,"note_selection":p.note_selection,"target_height":p.target_height,"expiry_height":p.expiry_height,"signers":p.signers,"phase":p.phase,"session_id":p.session_id,"control_session_id":p.control_session_id})
 }
 const UNAVAILABLE: &str = "payment session unavailable";
 
@@ -380,107 +393,181 @@ fn peer_context(vault: &str, attempt: &str, a: u16, b: u16) -> Result<SessionCon
     })
 }
 
-/// This member's view of a payment, sealed to signer `slot` with the same roster identity
-/// and context the HTTP path used. Carried over frostd for discovery, opened under `slot`'s.
-fn seal_intent(v: &Vault, p: &Payment, slot: u16) -> Result<SealedPeer, String> {
-    let peer = v.peers.get(&slot).ok_or("unknown peer")?;
-    let context = peer_context(&p.vault, &p.attempt, v.slot, slot)?;
-    let body = serde_json::to_vec(
-        &json!({"session_id":p.session_id,"intent":public_intent(p),"approval_started":p.approval_started}),
-    )
-    .map_err(|e| e.to_string())?;
-    SealedPeer::seal(&v.identity, peer, &context, MessageKind::PeerReply, &body)
+fn ready_to_send(p: &Payment) -> bool {
+    p.phase == "ready" && p.error.is_none() && p.signed_pczt.is_some()
 }
 
-/// The proposer pushes its sealed payment view to every other selected signer on the fresh
-/// frostd signing session, so each can discover the attempt by dialing out to the relay with
-/// zero inbound reachability. `tx`/`ch` are the session's (ephemeral) coordinator channel.
-fn push_intent(
-    tx: &FrostdTransport,
-    ch: &crate::transport::FrostdChannel,
+fn control_context(vault: &str, session: Uuid, a: u16, b: u16) -> Result<SessionContext, String> {
+    let mut hash = blake3::Hasher::new_derive_key("loki payment control session v1");
+    hash.update(&hex32(vault)?);
+    hash.update(session.as_bytes());
+    peer_context(vault, &hash.finalize().to_hex().to_string(), a, b)
+}
+
+fn intent_hash(p: &Payment) -> String {
+    let mut intent = public_intent(p);
+    intent.as_object_mut().unwrap().remove("phase");
+    blake3::hash(&serde_json::to_vec(&intent).unwrap())
+        .to_hex()
+        .to_string()
+}
+
+fn send_control(
+    url: &str,
     v: &Vault,
     p: &Payment,
+    kind: &str,
+    slots: &[u16],
 ) -> Result<(), String> {
-    for &slot in p.signers.iter().filter(|id| **id != v.slot) {
-        let sealed = seal_intent(v, p, slot)?;
-        tx.send(ch, &[Peer(v.peers[&slot].encryption)], &Outbound::Peer(sealed))
+    let session = p
+        .control_session_id
+        .ok_or("missing payment control session; create a fresh payment")?;
+    let mut tx = relay(&v.identity, url)?;
+    let ch = tx.join(session).map_err(|e| e.to_string())?;
+    for slot in slots.iter().copied().filter(|s| *s != v.slot) {
+        let peer = v.peers.get(&slot).ok_or("unknown control recipient")?;
+        let context = control_context(&p.vault, session, v.slot, slot)?;
+        let body = serde_json::to_vec(
+            &json!({"kind":kind,"hash":intent_hash(p),"intent":public_intent(p),"txid":p.txid}),
+        )
+        .map_err(|e| e.to_string())?;
+        let sealed = SealedPeer::seal(&v.identity, peer, &context, MessageKind::PeerReply, &body)?;
+        tx.send(&ch, &[Peer(peer.encryption)], &Outbound::Peer(sealed))
             .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
 
-/// A proposer may run `finish` once it is signing; the frostd aggregate round itself gathers
-/// the quorum's commitments and shares (or times out), so no inbound status poll is needed.
-fn ready_to_send(p: &Payment) -> bool {
-    p.phase == "signing"
-}
-
-/// Find the proposer's pushed payment view by dialing out to frostd. The relay lists every
-/// session this member was enlisted in; the quorum session is the one whose participants are
-/// exactly a threshold-sized subset of the roster that includes this member. Opening a sealed
-/// `PeerReply` there yields the intent and the session id to join for signing — no peer HTTP.
-fn discover_over_frostd(
-    frostd_url: &str,
-    v: &Vault,
-    vault: &str,
-    attempt: &str,
-) -> Result<Payment, String> {
-    let mut tx = relay(&v.identity, frostd_url)?;
-    let me = v.identity.public().encryption;
-    let roster: std::collections::BTreeSet<[u8; 32]> =
-        v.peers.values().map(|p| p.encryption).collect();
-    // The proposer pushes before it asks signers to review; poll briefly for relay latency.
-    for _ in 0..40 {
-        for session in tx.list_sessions().map_err(|e| e.to_string())? {
-            let Ok(pubkeys) = tx.session_info(session) else {
+// Only roster-owned control sessions are drained. Signing sessions have ephemeral owners.
+fn sync_control(url: &str, data: &Path, pass: &str, vault: &str, v: &Vault) -> Result<(), String> {
+    let mut tx = relay(&v.identity, url)?;
+    for session in tx.list_sessions().map_err(|e| e.to_string())? {
+        let Ok((participants, Some(owner))) = tx.session_details(session) else {
+            continue;
+        };
+        let Some(proposer) = v.peers.values().find(|p| p.encryption == owner) else {
+            continue;
+        };
+        if participants.len() != usize::from(v.threshold)
+            || !participants.contains(&v.identity.public().encryption)
+            || !participants.contains(&owner)
+            || !participants
+                .iter()
+                .all(|k| v.peers.values().any(|p| &p.encryption == k))
+        {
+            continue;
+        }
+        let ch = tx.join(session).map_err(|e| e.to_string())?;
+        for msg in tx.recv(&ch, false).map_err(|e| e.to_string())? {
+            let Some(peer) = v
+                .peers
+                .values()
+                .find(|p| p.encryption == msg.from.0 && p.id != v.slot)
+            else {
                 continue;
             };
-            if pubkeys.len() != usize::from(v.threshold)
-                || !pubkeys.contains(&me)
-                || !pubkeys.iter().all(|k| roster.contains(k))
+            let context = control_context(vault, session, v.slot, peer.id)?;
+            let Ok(opened) = v.identity.open_session(peer, &context, &msg.message) else {
+                continue;
+            };
+            if opened.kind() != MessageKind::PeerReply {
+                continue;
+            }
+            let Ok(body) = serde_json::from_slice::<Value>(opened.body()) else {
+                continue;
+            };
+            let Ok(mut incoming) = serde_json::from_value::<Payment>(body["intent"].clone()) else {
+                continue;
+            };
+            if incoming.vault != vault
+                || incoming.proposer != proposer.id
+                || incoming.control_session_id != Some(session)
+                || incoming.session_id.is_none()
+                || incoming.session_id == Some(session)
+                || body["hash"].as_str() != Some(intent_hash(&incoming).as_str())
+                || check_intent(&incoming, v).is_err()
+                || !incoming.signers.contains(&peer.id)
+                || incoming
+                    .signers
+                    .iter()
+                    .any(|id| !participants.contains(&v.peers[id].encryption))
             {
                 continue;
             }
-            // ponytail: recv drains this mailbox; a second not-yet-discovered payment the same
-            // signer is in (same quorum shape) would have its pushed intent consumed here. Fine
-            // for one payment at a time; give discovery its own relay session if that changes.
-            let ch = tx.join(session).map_err(|e| e.to_string())?;
-            for msg in tx.recv(&ch, false).map_err(|e| e.to_string())? {
-                for peer in v.peers.values().filter(|peer| peer.id != v.slot) {
-                    let Ok(context) = peer_context(vault, attempt, v.slot, peer.id) else {
-                        continue;
-                    };
-                    let Ok(opened) = v.identity.open_session(peer, &context, &msg.message) else {
-                        continue;
-                    };
-                    if opened.kind() != MessageKind::PeerReply {
+            match read_payment(data, pass, vault, &incoming.attempt) {
+                Ok(mut p) => {
+                    if intent_hash(&p) != intent_hash(&incoming) || p.error.is_some() {
                         continue;
                     }
-                    let reply: Value =
-                        serde_json::from_slice(opened.body()).map_err(|e| e.to_string())?;
-                    let p: Payment = serde_json::from_value(reply["intent"].clone())
-                        .map_err(|e| e.to_string())?;
-                    let sess = reply["session_id"]
-                        .as_str()
-                        .and_then(|s| Uuid::parse_str(s).ok());
-                    if p.vault == vault
-                        && p.attempt == attempt
-                        && p.proposer == peer.id
-                        && p.session_id == sess
-                        && sess == Some(session)
+                    if peer.id == p.proposer
+                        && body["kind"] == "failed"
+                        && matches!(p.phase.as_str(), "signing" | "approved")
                     {
-                        return Ok(p);
+                        p.phase = "failed".into();
+                        p.error = Some("The proposer could not complete this signing attempt. Create a fresh payment after recovery.".into());
+                        save_payment(data, pass, &p)?;
+                        continue;
                     }
+                    if peer.id == p.proposer
+                        && matches!(p.phase.as_str(), "approved" | "broadcast")
+                        && matches!(body["kind"].as_str(), Some("broadcast" | "confirmed"))
+                    {
+                        let Some(txid) = body["txid"].as_str().filter(|s| hex32(s).is_ok()) else {
+                            continue;
+                        };
+                        if p.txid.as_deref().is_some_and(|id| id != txid) {
+                            continue;
+                        }
+                        p.txid = Some(txid.to_owned());
+                        p.phase = "broadcast".into();
+                        save_payment(data, pass, &p)?;
+                        continue;
+                    }
+                    if p.phase != "signing" {
+                        continue;
+                    }
+                    match body["kind"].as_str() {
+                        Some("approval") if v.slot == p.proposer => {
+                            p.approvals.insert(peer.id);
+                        }
+                        Some("start") if peer.id == p.proposer && p.approval_requested => {
+                            p.start_requested = true;
+                        }
+                        _ => continue,
+                    }
+                    save_payment(data, pass, &p)?;
                 }
+                Err(_)
+                    if body["kind"] == "intent"
+                        && peer.id == proposer.id
+                        && !payment_dir(data, vault)?
+                            .path()
+                            .join(format!("{}.json", incoming.attempt))
+                            .try_exists()
+                            .map_err(|e| e.to_string())? =>
+                {
+                    incoming.phase = "signing".into();
+                    incoming.coordinator_secret = None;
+                    incoming.review_token = None;
+                    incoming.approval_requested = false;
+                    incoming.approval_started = false;
+                    incoming.approvals.clear();
+                    incoming.start_requested = false;
+                    incoming.txid = None;
+                    incoming.signed_pczt = None;
+                    incoming.raw_tx = None;
+                    incoming.error = None;
+                    save_payment(data, pass, &incoming)?;
+                }
+                _ => {}
             }
         }
-        std::thread::sleep(Duration::from_millis(100));
     }
-    Err(UNAVAILABLE.into())
+    Ok(())
 }
 
 fn discover(
-    frostd_url: &str,
+    url: &str,
     data: &Path,
     pass: &str,
     vault: &str,
@@ -490,18 +577,8 @@ fn discover(
     if let Ok(p) = read_payment(data, pass, vault, attempt) {
         return Ok(p);
     }
-    let mut p = discover_over_frostd(frostd_url, v, vault, attempt)?;
-    check_intent(&p, v)?;
-    p.coordinator_secret = None;
-    p.review_token = None;
-    p.approval_requested = false;
-    p.approval_started = false;
-    p.txid = None;
-    p.signed_pczt = None;
-    p.raw_tx = None;
-    p.error = None;
-    save_payment(data, pass, &p)?;
-    Ok(p)
+    sync_control(url, data, pass, vault, v)?;
+    read_payment(data, pass, vault, attempt).map_err(|_| UNAVAILABLE.into())
 }
 async fn unlocked(st: &Shared) -> Result<(PathBuf, Zeroizing<String>), Reply> {
     let guard = st.session.read().await;
@@ -519,7 +596,12 @@ async fn with_body(
         Ok(x) => x,
         Err(e) => return e,
     };
-    blocking(move || f(st, data, pass, body)).await
+    blocking(move || {
+        let locked_st = st.clone();
+        let _guard = locked_st.payment.lock().map_err(|e| e.to_string())?;
+        f(st, data, pass, body)
+    })
+    .await
 }
 fn url(st: &Shared) -> Result<&str, String> {
     st.config
@@ -563,10 +645,10 @@ pub(super) async fn draft(State(st): State<Shared>, Json(body): Json<Value>) -> 
         let mut random = [0u8; 32]; OsRng.fill_bytes(&mut random);
         let attempt = hex::encode(random);
         let mut signers = vec![v.slot];
-        signers.extend(v.peers.keys().copied().filter(|id| *id != v.slot && st.config.peers.contains_key(id)).take(usize::from(v.threshold - 1)));
-        if signers.len() != usize::from(v.threshold) { return Err("not enough configured signer coordinators".into()); }
+        signers.extend(v.peers.keys().copied().filter(|id| *id != v.slot).take(usize::from(v.threshold - 1)));
+        if signers.len() != usize::from(v.threshold) { return Err("not enough vault signers".into()); }
         let note_selection = vec![hex::encode(note.nullifier(&v.fvk).to_bytes())];
-        let p = Payment { attempt: attempt.clone(), vault: vault.to_owned(), proposer: v.slot, recipient: recipient.to_owned(), amount_zat, memo: memo.to_owned(), fee_zat, change_zat, note_selection, target_height: tip, expiry_height: expiry, signers, phase: "draft".into(), session_id: None, coordinator_secret: None, review_token: None, approval_requested: false, approval_started: false, txid: None, signed_pczt: None, raw_tx: None, error: None };
+        let p = Payment { attempt: attempt.clone(), vault: vault.to_owned(), proposer: v.slot, recipient: recipient.to_owned(), amount_zat, memo: memo.to_owned(), fee_zat, change_zat, note_selection, target_height: tip, expiry_height: expiry, signers, phase: "draft".into(), session_id: None, control_session_id: None, approvals: BTreeSet::new(), start_requested: false, coordinator_secret: None, review_token: None, approval_requested: false, approval_started: false, txid: None, signed_pczt: None, raw_tx: None, error: None };
         check_intent(&p, &v)?;
         let nullifier = [hex32(&p.note_selection[0])?];
         w.reserve_inputs(zcash_client_backend::wallet::LockOwner::new(random), &nullifier, expiry)?;
@@ -595,9 +677,12 @@ pub(super) async fn publish(State(st): State<Shared>, Json(body): Json<Value>) -
         p.session_id = Some(ch.session_id());
         p.coordinator_secret = Some(hex::encode(&*Zeroizing::new(coord.to_secret_bytes())));
         p.phase = "signing".into();
-        push_intent(&tx, &ch, &v, &p)?;
+        let mut control = relay(&v.identity, &st.config.frostd_url)?;
+        let control_ch = control.open(&peers, 4).map_err(|e| e.to_string())?;
+        p.control_session_id = Some(control_ch.session_id());
         save_payment(&data, &pass, &p)?;
-        Ok(json!({"phase":p.phase,"session_id":p.session_id}))
+        send_control(&st.config.frostd_url, &v, &p, "intent", &p.signers)?;
+        Ok(json!({"phase":p.phase,"session_id":p.session_id,"control_session_id":p.control_session_id}))
     })
     .await
 }
@@ -607,7 +692,7 @@ pub(super) async fn review(State(st): State<Shared>, Json(body): Json<Value>) ->
         let (vault, attempt) = pair(&body)?;
         let v = load_vault(&data, &pass, &vault, &st.config.network)?;
         let mut p = discover(&st.config.frostd_url, &data, &pass, &vault, &attempt, &v)?;
-        if p.phase != "signing" || p.session_id.is_none() { return Err("payment is not signing".into()); }
+        if p.phase != "signing" || p.session_id.is_none() || p.control_session_id.is_none() || p.error.is_some() { return Err("payment is not signing".into()); }
         check_intent(&p, &v)?;
         if p.approval_requested { return Err("payment approval already requested".into()); }
         if p.review_token.is_none() {
@@ -624,51 +709,180 @@ pub(super) async fn approve(State(st): State<Shared>, Json(body): Json<Value>) -
         Ok(x) => x,
         Err(e) => return e,
     };
-    let work_st = st.clone();
-    let reply = blocking(move || {
+    blocking(move || {
+        let guard = st.payment.lock().map_err(|e| e.to_string())?;
         let (vault, attempt) = pair(&body)?;
         let mut p = read_payment(&data, &pass, &vault, &attempt)?;
         if p.phase != "signing"
+            || p.error.is_some()
+            || p.control_session_id.is_none()
             || p.approval_requested
+            || p.review_token.is_none()
             || p.review_token.as_deref() != body["review_token"].as_str()
         {
-            return Err("invalid or repeated payment approval".into());
+            return Err(
+                "invalid or repeated payment approval; failed attempts need a new payment".into(),
+            );
         }
-        let v = load_vault(&data, &pass, &vault, &work_st.config.network)?;
+        let v = load_vault(&data, &pass, &vault, &st.config.network)?;
         check_intent(&p, &v)?;
         p.approval_requested = true;
+        p.approvals.insert(v.slot);
+        p.review_token = None;
         save_payment(&data, &pass, &p)?;
-        let bg_st = work_st.clone();
-        tokio::task::spawn_blocking(move || {
-            let result = sign(&bg_st, &data, &pass, &p, &v);
-            if let Ok(mut local) = read_payment(&data, &pass, &vault, &attempt) {
-                let changed = match result {
-                    Ok(()) if local.phase == "signing" && local.proposer != v.slot => {
-                        local.phase = "approved".into();
-                        true
-                    }
-                    Ok(()) => false,
-                    Err(e) => {
-                        local.approval_started = false;
-                        local.error = Some(e);
-                        true
-                    }
-                };
-                if changed {
-                    let _ = save_payment(&data, &pass, &local);
-                }
-            }
-        });
+        drop(guard);
+        ensure_worker(&st, &data, &pass, &vault, &attempt)?;
         Ok(json!({"phase":"signing"}))
     })
-    .await;
-    reply
+    .await
 }
-fn sign(st: &Shared, data: &Path, pass: &str, p: &Payment, v: &Vault) -> Result<(), String> {
-    let mut tx = relay(&v.identity, &st.config.frostd_url)?;
-    let ch = tx
-        .join(p.session_id.ok_or("missing signing session")?)
-        .map_err(|e| e.to_string())?;
+
+fn ensure_worker(
+    st: &Shared,
+    data: &Path,
+    pass: &str,
+    vault: &str,
+    attempt: &str,
+) -> Result<(), String> {
+    let guard = st.payment.lock().map_err(|e| e.to_string())?;
+    let mut p = read_payment(data, pass, vault, attempt)?;
+    if p.phase == "signing" && p.error.is_some() {
+        p.phase = "failed".into();
+        save_payment(data, pass, &p)?;
+    }
+    if p.phase != "signing" || !p.approval_requested {
+        return Ok(());
+    }
+    let key = format!("{vault}/{attempt}");
+    let mut active = st.active_payments.lock().map_err(|e| e.to_string())?;
+    if active.contains(&key) {
+        return Ok(());
+    }
+    if p.approval_started {
+        p.phase = "failed".into();
+        p.error = Some("Signing was interrupted. Keep this attempt for recovery; create a fresh payment after discarding it safely.".into());
+        save_payment(data, pass, &p)?;
+        if let Ok(v) = load_vault(data, pass, vault, &st.config.network) {
+            if p.proposer == v.slot {
+                let _ = send_control(&st.config.frostd_url, &v, &p, "failed", &p.signers);
+            }
+        }
+        return Ok(());
+    }
+    active.insert(key.clone());
+    drop(active);
+    drop(guard);
+    let st = st.clone();
+    let data = data.to_owned();
+    let pass = Zeroizing::new(pass.to_owned());
+    let (vault, attempt) = (vault.to_owned(), attempt.to_owned());
+    tokio::task::spawn_blocking(move || {
+        let result = payment_worker(&st, &data, &pass, &vault, &attempt);
+        let _guard = st.payment.lock().unwrap();
+        if let Err(error) = result {
+            if let Ok(mut p) = read_payment(&data, &pass, &vault, &attempt) {
+                if p.phase == "signing" {
+                    p.phase = "failed".into();
+                    p.error = Some(error);
+                    let _ = save_payment(&data, &pass, &p);
+                    if let Ok(v) = load_vault(&data, &pass, &vault, &st.config.network) {
+                        if p.proposer == v.slot {
+                            let _ =
+                                send_control(&st.config.frostd_url, &v, &p, "failed", &p.signers);
+                        }
+                    }
+                }
+            }
+        }
+        st.active_payments.lock().unwrap().remove(&key);
+    });
+    Ok(())
+}
+
+fn payment_worker(
+    st: &Shared,
+    data: &Path,
+    pass: &str,
+    vault: &str,
+    attempt: &str,
+) -> Result<(), String> {
+    let v = load_vault(data, pass, vault, &st.config.network)?;
+    let mut last_notice = std::time::Instant::now() - Duration::from_secs(5);
+    let p = loop {
+        if st.session.blocking_read().is_none() {
+            return Ok(());
+        }
+        let guard = st.payment.lock().map_err(|e| e.to_string())?;
+        // A relay outage while waiting for people is retried before any nonce exists.
+        let _ = sync_control(&st.config.frostd_url, data, pass, vault, &v);
+        let p = read_payment(data, pass, vault, attempt)?;
+        if p.phase != "signing" || p.error.is_some() {
+            return Ok(());
+        }
+        if p.proposer == v.slot && p.signers.iter().all(|id| p.approvals.contains(id))
+            || p.proposer != v.slot && p.start_requested
+        {
+            break p;
+        }
+        drop(guard);
+        if last_notice.elapsed() >= Duration::from_secs(3) {
+            if v.slot == p.proposer {
+                let _ = send_control(&st.config.frostd_url, &v, &p, "intent", &p.signers);
+            } else {
+                let _ = send_control(&st.config.frostd_url, &v, &p, "approval", &[p.proposer]);
+            }
+            last_notice = std::time::Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    // Wallet synchronization and candidate inputs precede the bounded protocol round.
+    let owned = prepare_sign(st, data, pass, &p, &v)?;
+    {
+        let _guard = st.payment.lock().map_err(|e| e.to_string())?;
+        let mut local = read_payment(data, pass, vault, attempt)?;
+        if local.phase != "signing" || local.approval_started {
+            return Err("payment cannot start again".into());
+        }
+        local.approval_started = true;
+        save_payment(data, pass, &local)?;
+    }
+    if p.proposer == v.slot {
+        send_control(&st.config.frostd_url, &v, &p, "start", &p.signers)?;
+        let signed = std::thread::scope(|scope| {
+            let coordinator = scope.spawn(|| aggregate(st, data, pass, &p, &v));
+            let signer_result = sign(st, data, pass, &p, &v, owned);
+            let signed = coordinator
+                .join()
+                .map_err(|_| "payment coordinator panicked".to_owned())??;
+            signer_result?;
+            Ok::<_, String>(signed)
+        })?;
+        let _guard = st.payment.lock().map_err(|e| e.to_string())?;
+        let mut local = read_payment(data, pass, vault, attempt)?;
+        local.signed_pczt = Some(hex::encode(signed));
+        if local.phase == "signing" && local.error.is_none() {
+            local.phase = "ready".into();
+        }
+        save_payment(data, pass, &local)?;
+    } else {
+        sign(st, data, pass, &p, &v, owned)?;
+        let _guard = st.payment.lock().map_err(|e| e.to_string())?;
+        let mut local = read_payment(data, pass, vault, attempt)?;
+        if local.phase == "signing" && local.error.is_none() {
+            local.phase = "approved".into();
+        }
+        save_payment(data, pass, &local)?;
+    }
+    Ok(())
+}
+
+fn prepare_sign<'a>(
+    st: &Shared,
+    data: &Path,
+    pass: &str,
+    p: &Payment,
+    v: &'a Vault,
+) -> Result<Option<CandidateInputs<'a>>, String> {
     let mut owned = None;
     if p.proposer == v.slot {
         let (w, mut client, rt) = wallet(data, pass, &p.vault, v, url(st)?)?;
@@ -697,34 +911,65 @@ fn sign(st: &Shared, data: &Path, pass: &str, p: &Payment, v: &Vault) -> Result<
             return Err("candidate fee differs from reviewed intent".into());
         }
     }
-    let mut local = read_payment(data, pass, &p.vault, &p.attempt)?;
-    local.approval_started = true;
-    save_payment(data, pass, &local)?;
+    Ok(owned)
+}
+
+fn sign(
+    st: &Shared,
+    data: &Path,
+    pass: &str,
+    p: &Payment,
+    v: &Vault,
+    owned: Option<CandidateInputs<'_>>,
+) -> Result<(), String> {
+    let mut tx = relay(&v.identity, &st.config.frostd_url)?;
+    let ch = tx
+        .join(p.session_id.ok_or("missing signing session")?)
+        .map_err(|e| e.to_string())?;
     let signer_network = match v.network {
         VaultNetwork::Regtest => Network::Regtest,
         VaultNetwork::Testnet => Network::Testnet,
     };
     let mut signer = LocalSigner::with_sealed_share(
-        v.slot, v.threshold, v.peers.len() as u16, hex32(&p.vault)?,
-        p.vault.clone(), signer_network, SoftwareSecureElement::generate(),
+        v.slot,
+        v.threshold,
+        v.peers.len() as u16,
+        hex32(&p.vault)?,
+        p.vault.clone(),
+        signer_network,
+        SoftwareSecureElement::generate(),
         &v.key.serialize().map_err(|e| e.to_string())?,
-        v.public.serialize().map_err(|e| e.to_string())?, v.fvk.clone(),
-        member_dir(data, &p.vault)?.path().join("signer-nonces"), Box::new(|_| true),
-    ).map_err(|e| e.to_string())?;
+        v.public.serialize().map_err(|e| e.to_string())?,
+        v.fvk.clone(),
+        member_dir(data, &p.vault)?.path().join("signer-nonces"),
+        Box::new(|_| true),
+    )
+    .map_err(|e| e.to_string())?;
     if let Some(inputs) = &owned {
         signer.set_candidate_notes(inputs.notes.clone());
     }
-    let session = signer.connect("hosted payment", signer_network, p.attempt.as_bytes())
-        .map_err(|e| e.to_string())?.session;
+    let session = signer
+        .connect("hosted payment", signer_network, p.attempt.as_bytes())
+        .map_err(|e| e.to_string())?
+        .session;
     let candidate = CandidateRef {
-        vault_id: hex32(&p.vault)?, payment_id: hex32(&p.attempt)?, attempt_id: hex32(&p.attempt)?,
+        vault_id: hex32(&p.vault)?,
+        payment_id: hex32(&p.attempt)?,
+        attempt_id: hex32(&p.attempt)?,
     };
     let params = owned.as_ref().map(|inputs| PublicPaymentParams {
-        recipient: inputs.recipient, amount: inputs.amount, memo: inputs.memo.clone(),
-        target_height: inputs.target_height, expiry_height: inputs.expiry_height,
+        recipient: inputs.recipient,
+        amount: inputs.amount,
+        memo: inputs.memo.clone(),
+        target_height: inputs.target_height,
+        expiry_height: inputs.expiry_height,
     });
-    let other_signers = p.signers.iter().filter(|id| **id != v.slot)
-        .map(|id| v.peers[id].clone()).collect::<Vec<_>>();
+    let other_signers = p
+        .signers
+        .iter()
+        .filter(|id| **id != v.slot)
+        .map(|id| v.peers[id].clone())
+        .collect::<Vec<_>>();
     let context = signing_context(p)?;
     let dir = member_dir(data, &p.vault)?;
     let proposer = p.proposer == v.slot;
@@ -740,12 +985,19 @@ fn sign(st: &Shared, data: &Path, pass: &str, p: &Payment, v: &Vault) -> Result<
     signer_loop(
         &tx,
         &ch,
-        &mut signer, &session, &candidate, &v.public,
+        &mut signer,
+        &session,
+        &candidate,
+        &v.public,
         frost::Identifier::try_from(v.slot).map_err(|e| e.to_string())?,
-        params.as_ref(), &v.identity, &context, &v.peers[&p.proposer], &other_signers,
+        params.as_ref(),
+        &v.identity,
+        &context,
+        &v.peers[&p.proposer],
+        &other_signers,
         &mut |bytes| {
             review_candidate(bytes, p, v)?;
-            // The coordinator runs in this process (`finish`); hand it the candidate through
+            // The background coordinator runs in this process; hand it the candidate through
             // the encrypted member store instead of the relay.
             if proposer {
                 dir.write_sealed(&candidate_file(&p.attempt), bytes, pass)
@@ -821,54 +1073,91 @@ fn frontier(
     Ok((frontier, anchor))
 }
 
+fn aggregate(
+    st: &Shared,
+    data: &Path,
+    pass: &str,
+    p: &Payment,
+    v: &Vault,
+) -> Result<Vec<u8>, String> {
+    let coord = Identity::from_secret_bytes(
+        &hex::decode(
+            p.coordinator_secret
+                .as_deref()
+                .ok_or("missing coordinator identity")?,
+        )
+        .map_err(|e| e.to_string())?,
+    )?;
+    let mut tx = relay(&coord, &st.config.frostd_url)?;
+    let ch = tx
+        .join(p.session_id.ok_or("missing signing session")?)
+        .map_err(|e| e.to_string())?;
+    let ids = p
+        .signers
+        .iter()
+        .map(|id| frost::Identifier::try_from(*id).map_err(|e| e.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let peer_of = p
+        .signers
+        .iter()
+        .zip(&ids)
+        .map(|(slot, id)| (*id, Peer(v.peers[slot].encryption)))
+        .collect();
+    let dir = member_dir(data, &p.vault)?;
+    let file = candidate_file(&p.attempt);
+    let signed = coordinate(
+        &tx,
+        &ch,
+        &v.public,
+        &ids,
+        &peer_of,
+        v.threshold,
+        OsRng,
+        || match dir.read_sealed(&file, pass) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("read candidate: {e}")),
+        },
+    )?;
+    let _ = tx.close(ch);
+    Ok(signed)
+}
+
+struct ActivePayment<'a> {
+    st: &'a Shared,
+    key: String,
+}
+impl Drop for ActivePayment<'_> {
+    fn drop(&mut self) {
+        self.st.active_payments.lock().unwrap().remove(&self.key);
+    }
+}
+
 pub(super) async fn finish(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
-    with_body(st, body, |st, data, pass, body| {
+    let (data, pass) = match unlocked(&st).await {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    blocking(move || {
         let (vault, attempt) = pair(&body)?;
         let v = load_vault(&data, &pass, &vault, &st.config.network)?;
+        let key = format!("{vault}/{attempt}");
+        if !st
+            .active_payments
+            .lock()
+            .map_err(|e| e.to_string())?
+            .insert(key.clone())
+        {
+            return Err("payment work is already running".into());
+        }
+        let _active = ActivePayment { st: &st, key };
         let mut p = read_payment(&data, &pass, &vault, &attempt)?;
-        if p.proposer != v.slot || p.phase != "signing" {
-            return Err("only the proposer can finish a signing payment".into());
+        if p.proposer != v.slot || p.phase != "ready" {
+            return Err("only the proposer can send a ready payment".into());
         }
         check_intent(&p, &v)?;
-        if p.signed_pczt.is_none() && !ready_to_send(&p) {
+        if !ready_to_send(&p) {
             return Err("signer approvals are not ready".into());
-        }
-        if p.signed_pczt.is_none() {
-            let coord = Identity::from_secret_bytes(
-                &hex::decode(
-                    p.coordinator_secret
-                        .as_deref()
-                        .ok_or("missing coordinator identity")?,
-                )
-                .map_err(|e| e.to_string())?,
-            )?;
-            let mut tx = relay(&coord, &st.config.frostd_url)?;
-            let ch = tx
-                .join(p.session_id.ok_or("missing signing session")?)
-                .map_err(|e| e.to_string())?;
-            let ids = p
-                .signers
-                .iter()
-                .map(|id| frost::Identifier::try_from(*id).map_err(|e| e.to_string()))
-                .collect::<Result<Vec<_>, _>>()?;
-            let peer_of = p
-                .signers
-                .iter()
-                .zip(&ids)
-                .map(|(slot, id)| (*id, Peer(v.peers[slot].encryption)))
-                .collect();
-            let dir = member_dir(&data, &vault)?;
-            let file = candidate_file(&attempt);
-            let signed = coordinate(&tx, &ch, &v.public, &ids, &peer_of, v.threshold, OsRng, || {
-                match dir.read_sealed(&file, &pass) {
-                    Ok(bytes) => Ok(Some(bytes)),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                    Err(e) => Err(format!("read candidate: {e}")),
-                }
-            })?;
-            p.signed_pczt = Some(hex::encode(signed));
-            save_payment(&data, &pass, &p)?;
-            let _ = tx.close(ch);
         }
         let (mut w, mut client, rt) = wallet(&data, &pass, &vault, &v, url(&st)?)?;
         if p.raw_tx.is_none() {
@@ -897,12 +1186,23 @@ pub(super) async fn finish(State(st): State<Shared>, Json(body): Json<Value>) ->
                 .position(|a| a.spend().nullifier() == &selected[0])
                 .ok_or("signed candidate spends a different note")?;
             let (raw, txid) = prove(pczt, sighash, vec![(index, witness)], anchor)?;
-            let owner = zcash_client_backend::wallet::LockOwner::new(hex32(&p.attempt)?);
-            w.release_inputs(owner, &selected)?;
-            w.reserve_inputs(txid.into(), &selected, p.expiry_height)?;
             p.raw_tx = Some(hex::encode(raw));
             p.txid = Some(txid.to_string());
+            let _guard = st.payment.lock().map_err(|e| e.to_string())?;
             save_payment(&data, &pass, &p)?;
+        }
+        {
+            let _guard = st.payment.lock().map_err(|e| e.to_string())?;
+            let txid = zcash_primitives::transaction::TxId::from_hex(
+                p.txid.as_deref().ok_or("missing transaction id")?,
+            )
+            .ok_or("invalid transaction id")?;
+            w.transfer_inputs(
+                zcash_client_backend::wallet::LockOwner::new(hex32(&attempt)?),
+                txid.into(),
+                &[hex32(&p.note_selection[0])?],
+                p.expiry_height,
+            )?;
         }
         let raw = hex::decode(p.raw_tx.as_deref().ok_or("missing raw transaction")?)
             .map_err(|e| e.to_string())?;
@@ -923,8 +1223,16 @@ pub(super) async fn finish(State(st): State<Shared>, Json(body): Json<Value>) ->
         p.phase = "broadcast".into();
         p.signed_pczt = None;
         p.raw_tx = None;
-        save_payment(&data, &pass, &p)?;
-        let _ = std::fs::remove_file(member_dir(&data, &vault)?.path().join(candidate_file(&attempt)));
+        {
+            let _guard = st.payment.lock().map_err(|e| e.to_string())?;
+            save_payment(&data, &pass, &p)?;
+        }
+        let _ = send_control(&st.config.frostd_url, &v, &p, "broadcast", &p.signers);
+        let _ = std::fs::remove_file(
+            member_dir(&data, &vault)?
+                .path()
+                .join(candidate_file(&attempt)),
+        );
         Ok(json!({"phase":"broadcast","txid":p.txid}))
     })
     .await
@@ -936,19 +1244,128 @@ pub(super) async fn verify(State(st): State<Shared>, Json(body): Json<Value>) ->
         let v = load_vault(&data, &pass, &vault, &st.config.network)?;
         let mut p = read_payment(&data, &pass, &vault, &attempt)?;
         let txid = required(&body, "txid")?;
-        if p.txid.as_deref() != Some(txid) {
+        if !matches!(p.phase.as_str(), "broadcast" | "confirmed") || p.txid.as_deref() != Some(txid)
+        {
             return Err("txid differs from broadcast payment".into());
         }
         let id = zcash_primitives::transaction::TxId::from_hex(txid).ok_or("invalid txid")?;
         let (w, _, _) = wallet(&data, &pass, &vault, &v, url(&st)?)?;
-        p.phase = if w.mined_height(id)?.is_some() {
+        let mined_height = w.mined_height(id)?;
+        p.phase = if mined_height.is_some() {
             "confirmed"
         } else {
             "broadcast"
         }
         .into();
         save_payment(&data, &pass, &p)?;
-        Ok(json!({"phase":p.phase}))
+        let _ = send_control(&st.config.frostd_url, &v, &p, &p.phase, &p.signers);
+        Ok(json!({"phase":p.phase,"mined_height":mined_height.map(u32::from)}))
+    })
+    .await
+}
+
+fn local_attempts(data: &Path, vault: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(payment_dir(data, vault)?.path()).map_err(|e| e.to_string())? {
+        let name = entry
+            .map_err(|e| e.to_string())?
+            .file_name()
+            .to_string_lossy()
+            .into_owned();
+        if let Some(attempt) = name.strip_suffix(".json").filter(|s| hex32(s).is_ok()) {
+            out.push(attempt.to_owned());
+        }
+    }
+    Ok(out)
+}
+
+fn restore_workers(st: &Shared, data: &Path, pass: &str, vault: &str) -> Result<(), String> {
+    for attempt in local_attempts(data, vault)? {
+        ensure_worker(st, data, pass, vault, &attempt)?;
+    }
+    Ok(())
+}
+
+fn discardable(data: &Path, p: &Payment) -> Result<(), String> {
+    if !matches!(p.phase.as_str(), "failed" | "discarding" | "draft")
+        || p.signed_pczt.is_some()
+        || p.raw_tx.is_some()
+        || p.txid.is_some()
+    {
+        return Err("only a failed unsigned payment or draft can be discarded".into());
+    }
+    let burn = member_dir(data, &p.vault)?
+        .path()
+        .join("signer-nonces")
+        .join(format!("{}{}.burn", p.attempt, p.attempt));
+    if burn.try_exists().map_err(|e| e.to_string())? {
+        return Err("a signature share was released; keep the input reserved for recovery".into());
+    }
+    Ok(())
+}
+
+fn close_if_present(tx: &mut FrostdTransport, session: Uuid) -> Result<(), String> {
+    if tx
+        .list_sessions()
+        .map_err(|e| e.to_string())?
+        .contains(&session)
+    {
+        let ch = tx.join(session).map_err(|e| e.to_string())?;
+        tx.close(ch).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+pub(super) async fn discard(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
+    with_body(st, body, |st, data, pass, body| {
+        let (vault, attempt) = pair(&body)?;
+        let v = load_vault(&data, &pass, &vault, &st.config.network)?;
+        if st
+            .active_payments
+            .lock()
+            .map_err(|e| e.to_string())?
+            .contains(&format!("{vault}/{attempt}"))
+        {
+            return Err("payment worker is still running".into());
+        }
+        let mut p = read_payment(&data, &pass, &vault, &attempt)?;
+        if p.proposer != v.slot {
+            return Err("only the proposer can discard a payment".into());
+        }
+        if p.phase == "signing" && p.error.is_some() {
+            p.phase = "failed".into();
+        }
+        discardable(&data, &p)?;
+        if let Some(session) = p.session_id {
+            let coord = Identity::from_secret_bytes(
+                &hex::decode(
+                    p.coordinator_secret
+                        .as_deref()
+                        .ok_or("missing coordinator identity")?,
+                )
+                .map_err(|e| e.to_string())?,
+            )?;
+            let mut tx = relay(&coord, &st.config.frostd_url)?;
+            close_if_present(&mut tx, session)?;
+            p.session_id = None;
+            save_payment(&data, &pass, &p)?;
+        }
+        if let Some(session) = p.control_session_id {
+            let mut tx = relay(&v.identity, &st.config.frostd_url)?;
+            close_if_present(&mut tx, session)?;
+            p.control_session_id = None;
+            save_payment(&data, &pass, &p)?;
+        }
+        p.phase = "discarding".into();
+        save_payment(&data, &pass, &p)?;
+        let (mut w, _, _) = wallet(&data, &pass, &vault, &v, url(&st)?)?;
+        w.release_inputs(
+            zcash_client_backend::wallet::LockOwner::new(hex32(&attempt)?),
+            &[hex32(&p.note_selection[0])?],
+        )?;
+        p.phase = "cancelled".into();
+        save_payment(&data, &pass, &p)?;
+        Ok(json!({"phase":"cancelled"}))
     })
     .await
 }
@@ -966,7 +1383,10 @@ pub(super) async fn payments(
         Err(e) => return e,
     };
     blocking(move || {
-        let _v = load_vault(&data, &pass, &vault, &st.config.network)?;
+        let v = load_vault(&data, &pass, &vault, &st.config.network)?;
+        restore_workers(&st, &data, &pass, &vault)?;
+        let _guard = st.payment.lock().map_err(|e| e.to_string())?;
+        let _ = sync_control(&st.config.frostd_url, &data, &pass, &vault, &v);
         let dir = payment_dir(&data, &vault)?;
         let mut out = Vec::new();
         for entry in std::fs::read_dir(dir.path()).map_err(|e| e.to_string())? {
@@ -976,7 +1396,7 @@ pub(super) async fn payments(
             if hex32(attempt).is_err() { continue; }
             let p = read_payment(&data, &pass, &vault, attempt)?;
             let ready = ready_to_send(&p);
-            out.push(json!({"attempt":p.attempt,"phase":p.phase,"recipient":p.recipient,"amount_zat":p.amount_zat.to_string(),"ready_to_send":ready,"txid":p.txid,"signers":p.signers,"error":p.error}));
+            out.push(json!({"attempt":p.attempt,"phase":p.phase,"recipient":p.recipient,"amount_zat":p.amount_zat.to_string(),"ready_to_send":ready && p.proposer == v.slot,"txid":if matches!(p.phase.as_str(), "broadcast" | "confirmed") {p.txid.clone()} else {None},"signers":p.signers,"approvals":p.approvals,"approval_requested":p.approval_requested,"finish_requested":st.active_payments.lock().map_err(|e| e.to_string())?.contains(&format!("{}/{}",p.vault,p.attempt)) && p.phase=="ready","can_discard":p.proposer==v.slot && discardable(&data,&p).is_ok(),"fee_zat":p.fee_zat.to_string(),"error":p.error}));
         }
         Ok(json!({"payments":out}))
     }).await
@@ -990,10 +1410,19 @@ fn pending_for(data: &Path, pass: &str, vault: &str, slot: u16) -> Result<Vec<Va
     for entry in std::fs::read_dir(dir.path()).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(attempt) = name.strip_suffix(".json") else { continue };
-        if hex32(attempt).is_err() { continue; }
+        let Some(attempt) = name.strip_suffix(".json") else {
+            continue;
+        };
+        if hex32(attempt).is_err() {
+            continue;
+        }
         let p = read_payment(data, pass, vault, attempt)?;
-        if p.phase == "signing" && p.proposer != slot && p.signers.contains(&slot) && !p.approval_started {
+        if p.phase == "signing"
+            && p.proposer != slot
+            && p.signers.contains(&slot)
+            && !p.approval_requested
+            && p.error.is_none()
+        {
             out.push(json!({"attempt":p.attempt,"amount_zat":p.amount_zat.to_string(),"recipient":p.recipient,"proposer":p.proposer}));
         }
     }
@@ -1015,6 +1444,9 @@ pub(super) async fn pending(
     blocking(move || {
         // load_vault authorizes the caller as a member of this vault before listing anything.
         let v = load_vault(&data, &pass, &vault, &st.config.network)?;
+        restore_workers(&st, &data, &pass, &vault)?;
+        let _guard = st.payment.lock().map_err(|e| e.to_string())?;
+        sync_control(&st.config.frostd_url, &data, &pass, &vault, &v)?;
         Ok(json!({"pending": pending_for(&data, &pass, &vault, v.slot)?}))
     })
     .await
@@ -1035,12 +1467,16 @@ pub(super) async fn status(
         Err(e) => return e,
     };
     blocking(move || {
-        let _v = load_vault(&data, &pass, &vault, &st.config.network)?;
+        let v = load_vault(&data, &pass, &vault, &st.config.network)?;
+        ensure_worker(&st, &data, &pass, &vault, &attempt)?;
+        let _guard = st.payment.lock().map_err(|e| e.to_string())?;
+        let _ = sync_control(&st.config.frostd_url, &data, &pass, &vault, &v);
         let p = read_payment(&data, &pass, &vault, &attempt)?;
         let ready = ready_to_send(&p);
         Ok(json!({
             "phase": p.phase,
-            "finish_requested": p.signed_pczt.is_some() || p.raw_tx.is_some(),
+            "finish_requested": p.phase == "ready" && st.active_payments.lock().map_err(|e| e.to_string())?.contains(&format!("{vault}/{attempt}")),
+            "approvals":p.approvals,"error":p.error,"approval_requested":p.approval_requested,
             "signatures_received": ready,
             "intent": {
                 "proposer": p.proposer,
@@ -1099,7 +1535,7 @@ mod tests {
         let to = fvk.address_at(7u64, Scope::External);
         let recipient = vault::unified_receiver(
             to.to_raw_address_bytes(),
-            VaultNetwork::Regtest.network_type(),
+            VaultNetwork::Testnet.network_type(),
         );
         let mut inputs = CandidateInputs {
             vault_fvk: &fvk,
@@ -1108,14 +1544,14 @@ mod tests {
             amount: Zatoshis::const_from_u64(40_000_000),
             memo: MemoBytes::from_bytes(b"reviewed memo").unwrap(),
             change: Zatoshis::ZERO,
-            target_height: 700,
-            expiry_height: 1_152,
+            target_height: TESTNET_NU7_BIRTH + 1,
+            expiry_height: TESTNET_NU7_BIRTH + 1_152,
         };
-        let fee_zat: u64 = quote_fee(&VaultNetwork::Regtest, &inputs).unwrap().into();
+        let fee_zat: u64 = quote_fee(&VaultNetwork::Testnet, &inputs).unwrap().into();
         let change_zat = 625_000_000 - 40_000_000 - fee_zat;
         inputs.change = Zatoshis::from_u64(change_zat).unwrap();
         let built = crate::candidate::build_candidate(
-            &VaultNetwork::Regtest,
+            &VaultNetwork::Testnet,
             &inputs,
             &[pallas::Scalar::from(3)],
             rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng),
@@ -1127,7 +1563,7 @@ mod tests {
             .unwrap();
         let identity = Identity::new(1);
         let v = Vault {
-            network: VaultNetwork::Regtest,
+            network: VaultNetwork::Testnet,
             fvk,
             key,
             public,
@@ -1135,7 +1571,7 @@ mod tests {
             threshold: 2,
             slot: 1,
             peers: BTreeMap::new(),
-            birth_height: 2,
+            birth_height: TESTNET_NU7_BIRTH,
         };
         let mut p = Payment {
             attempt: hex::encode([1u8; 32]),
@@ -1147,11 +1583,14 @@ mod tests {
             fee_zat,
             change_zat,
             note_selection: vec![hex::encode(note.nullifier(&v.fvk).to_bytes())],
-            target_height: 700,
-            expiry_height: 1_152,
+            target_height: TESTNET_NU7_BIRTH + 1,
+            expiry_height: TESTNET_NU7_BIRTH + 1_152,
             signers: vec![1, 2],
             phase: "signing".into(),
             session_id: None,
+            control_session_id: None,
+            approvals: BTreeSet::new(),
+            start_requested: false,
             coordinator_secret: None,
             review_token: None,
             approval_requested: false,
@@ -1168,13 +1607,22 @@ mod tests {
 
     /// A vault member's view: a share of a throwaway 2-of-3 key plus the roster.
     fn member(identity: &Identity, peers: &BTreeMap<u16, PublicIdentity>) -> Vault {
-        let (shares, public) =
-            frost::keys::generate_with_dealer(3, 2, frost::keys::IdentifierList::Default, &mut OsRng)
-                .unwrap();
+        let (shares, public) = frost::keys::generate_with_dealer(
+            3,
+            2,
+            frost::keys::IdentifierList::Default,
+            &mut OsRng,
+        )
+        .unwrap();
         let key = frost::keys::KeyPackage::try_from(shares.into_values().next().unwrap()).unwrap();
-        let ak: [u8; 32] = public.verifying_key().serialize().unwrap().try_into().unwrap();
+        let ak: [u8; 32] = public
+            .verifying_key()
+            .serialize()
+            .unwrap()
+            .try_into()
+            .unwrap();
         Vault {
-            network: VaultNetwork::Regtest,
+            network: VaultNetwork::Testnet,
             fvk: zip2005::frost_viewing_key(&ak, &[42u8; 32]).unwrap(),
             key,
             public,
@@ -1182,87 +1630,433 @@ mod tests {
             threshold: 2,
             slot: identity.public().id,
             peers: peers.clone(),
-            birth_height: 2,
+            birth_height: TESTNET_NU7_BIRTH,
         }
     }
 
-    /// The core no-inbound proof: a signer behind NAT discovers the proposer's payment with
-    /// nothing but dial-out to frostd. No member binds an HTTP listener; the proposer pushes
-    /// its sealed intent onto the fresh signing session, and the signer finds that session via
-    /// `list_sessions` and opens the intent. Needs a running frostd (`FROSTD_URL`); skips
-    /// otherwise so the offline suite stays green.
     #[test]
-    fn review_discovery_completes_over_frostd_with_no_inbound_http() {
+    fn testnet_control_discovers_all_intents_without_draining_signing_messages() {
         let Ok(url) = std::env::var("FROSTD_URL") else {
-            eprintln!("FROSTD_URL unset — skipping no-inbound discovery proof");
             return;
         };
-        let identities: Vec<Identity> = (1..=3).map(Identity::new).collect();
-        let peers: BTreeMap<_, _> = identities.iter().map(|i| (i.public().id, i.public())).collect();
-        let (vault, attempt) = (hex::encode([2u8; 32]), hex::encode([1u8; 32]));
+        let identities: Vec<_> = (1..=3).map(Identity::new).collect();
+        let peers: BTreeMap<_, _> = identities
+            .iter()
+            .map(|i| (i.public().id, i.public()))
+            .collect();
+        let a = member(&identities[0], &peers);
+        let b = member(&identities[1], &peers);
+        let outsider = member(&identities[2], &peers);
+        let data_a = std::env::temp_dir().join(format!("loki-control-a-{}", Uuid::new_v4()));
+        let data_b = std::env::temp_dir().join(format!("loki-control-b-{}", Uuid::new_v4()));
+        let vault = hex::encode([2; 32]);
         let mut p = Payment {
-            attempt: attempt.clone(), vault: vault.clone(), proposer: 1,
-            recipient: "uregtest1recipient".into(), amount_zat: 40_000_000, memo: "rent".into(),
-            fee_zat: 10_000, change_zat: 1, note_selection: vec![hex::encode([5u8; 32])],
-            target_height: 700, expiry_height: 1_152, signers: vec![1, 2], phase: "signing".into(),
-            session_id: None, coordinator_secret: None,
-            review_token: None, approval_requested: false, approval_started: false,
-            txid: None, signed_pczt: None, raw_tx: None, error: None,
+            attempt: hex::encode([1; 32]),
+            vault: vault.clone(),
+            proposer: 1,
+            recipient: vault::unified_address(&a.fvk, a.network.network_type()),
+            amount_zat: 100_000,
+            memo: "private control notice".into(),
+            fee_zat: 10_000,
+            change_zat: 1,
+            note_selection: vec![hex::encode([5; 32])],
+            target_height: TESTNET_NU7_BIRTH + 1,
+            expiry_height: TESTNET_NU7_BIRTH + 1152,
+            signers: vec![1, 2],
+            phase: "signing".into(),
+            session_id: None,
+            control_session_id: None,
+            approvals: BTreeSet::new(),
+            start_requested: false,
+            coordinator_secret: None,
+            review_token: None,
+            approval_requested: false,
+            approval_started: false,
+            txid: None,
+            signed_pczt: None,
+            raw_tx: None,
+            error: None,
         };
+        let coord = Identity::new(0);
+        let mut signing = relay(&coord, &url).unwrap();
+        let selected: Vec<_> = p
+            .signers
+            .iter()
+            .map(|id| Peer(peers[id].encryption))
+            .collect();
+        let signing_ch = signing.open(&selected, 4).unwrap();
+        p.session_id = Some(signing_ch.session_id());
+        let mut control = relay(&a.identity, &url).unwrap();
+        let control_ch = control.open(&selected, 4).unwrap();
+        p.control_session_id = Some(control_ch.session_id());
+        save_payment(&data_a, "pass", &p).unwrap();
+        send_control(&url, &a, &p, "intent", &p.signers).unwrap();
+        let mut second = p.clone();
+        second.attempt = hex::encode([8; 32]);
+        let control_ch2 = control.open(&selected, 4).unwrap();
+        second.control_session_id = Some(control_ch2.session_id());
+        send_control(&url, &a, &second, "intent", &second.signers).unwrap();
+        signing
+            .send(
+                &signing_ch,
+                &[Peer(peers[&2].encryption)],
+                &Outbound::RandomizerSeed([7; 32]),
+            )
+            .unwrap();
+        sync_control(&url, &data_b, "pass", &vault, &b).unwrap();
+        assert_eq!(pending_for(&data_b, "pass", &vault, 2).unwrap().len(), 2);
+        let mut receiver = relay(&b.identity, &url).unwrap();
+        let ch = receiver.join(p.session_id.unwrap()).unwrap();
+        assert_eq!(receiver.recv(&ch, false).unwrap()[0].message, vec![7; 32]);
+        let mut invalid = p.clone();
+        invalid.attempt = "../outside".into();
+        assert!(save_payment(&data_a, "pass", &invalid).is_err());
+        send_control(&url, &a, &invalid, "intent", &p.signers).unwrap();
+        let corrupt_path = payment_dir(&data_b, &vault)
+            .unwrap()
+            .path()
+            .join(format!("{}.json", second.attempt));
+        std::fs::write(&corrupt_path, b"unreadable sealed record").unwrap();
+        send_control(&url, &a, &second, "intent", &p.signers).unwrap();
+        sync_control(&url, &data_b, "pass", &vault, &b).unwrap();
+        assert_eq!(
+            std::fs::read(&corrupt_path).unwrap(),
+            b"unreadable sealed record"
+        );
+        let mut local = read_payment(&data_b, "pass", &vault, &p.attempt).unwrap();
+        assert!(!local.approval_requested);
+        local.approval_requested = true;
+        local.approvals.insert(2);
+        save_payment(&data_b, "pass", &local).unwrap();
+        send_control(&url, &b, &local, "approval", &[1]).unwrap();
+        sync_control(&url, &data_a, "pass", &vault, &a).unwrap();
+        let mut proposer = read_payment(&data_a, "pass", &vault, &p.attempt).unwrap();
+        assert_eq!(proposer.approvals, BTreeSet::from([2]));
+        assert!(!ready_to_send(&proposer));
+        // A repeated notice preserves consent; conflicting terms cannot replace it.
+        send_control(&url, &a, &p, "intent", &p.signers).unwrap();
+        let mut changed = p.clone();
+        changed.amount_zat += 1;
+        send_control(&url, &a, &changed, "intent", &p.signers).unwrap();
+        sync_control(&url, &data_b, "pass", &vault, &b).unwrap();
+        assert!(
+            read_payment(&data_b, "pass", &vault, &p.attempt)
+                .unwrap()
+                .approval_requested
+        );
+        assert_eq!(
+            read_payment(&data_b, "pass", &vault, &p.attempt)
+                .unwrap()
+                .amount_zat,
+            p.amount_zat
+        );
+        send_control(&url, &b, &p, "start", &[1]).unwrap();
+        sync_control(&url, &data_a, "pass", &vault, &a).unwrap();
+        assert!(
+            !read_payment(&data_a, "pass", &vault, &p.attempt)
+                .unwrap()
+                .start_requested
+        );
+        proposer.approvals.insert(1);
+        save_payment(&data_a, "pass", &proposer).unwrap();
+        // Human delay exceeds the old timeout without starting a nonce or signing round.
+        std::thread::sleep(Duration::from_secs(12));
+        sync_control(&url, &data_b, "pass", &vault, &b).unwrap();
+        assert!(
+            !read_payment(&data_b, "pass", &vault, &p.attempt)
+                .unwrap()
+                .approval_started
+        );
+        send_control(&url, &a, &proposer, "start", &p.signers).unwrap();
+        sync_control(&url, &data_b, "pass", &vault, &b).unwrap();
+        assert!(
+            read_payment(&data_b, "pass", &vault, &p.attempt)
+                .unwrap()
+                .start_requested
+        );
+        let mut reported = read_payment(&data_b, "pass", &vault, &p.attempt).unwrap();
+        reported.phase = "approved".into();
+        save_payment(&data_b, "pass", &reported).unwrap();
+        proposer.txid = Some(hex::encode([6; 32]));
+        send_control(&url, &a, &proposer, "confirmed", &p.signers).unwrap();
+        sync_control(&url, &data_b, "pass", &vault, &b).unwrap();
+        assert_eq!(
+            read_payment(&data_b, "pass", &vault, &p.attempt)
+                .unwrap()
+                .phase,
+            "broadcast"
+        );
+        reported.phase = "signing".into();
+        reported.txid = None;
+        save_payment(&data_b, "pass", &reported).unwrap();
+        send_control(&url, &a, &proposer, "failed", &p.signers).unwrap();
+        send_control(&url, &a, &proposer, "start", &p.signers).unwrap();
+        sync_control(&url, &data_b, "pass", &vault, &b).unwrap();
+        assert_eq!(
+            read_payment(&data_b, "pass", &vault, &p.attempt)
+                .unwrap()
+                .phase,
+            "failed"
+        );
+        let data_c = std::env::temp_dir().join(format!("loki-control-c-{}", Uuid::new_v4()));
+        sync_control(&url, &data_c, "pass", &vault, &outsider).unwrap();
+        assert!(local_attempts(&data_c, &vault).unwrap().is_empty());
+        signing.close(signing_ch).unwrap();
+        close_if_present(&mut control, control_ch.session_id()).unwrap();
+        close_if_present(&mut control, control_ch.session_id()).unwrap();
+        control.close(control_ch2).unwrap();
+        for data in [data_a, data_b, data_c] {
+            std::fs::remove_dir_all(data).unwrap();
+        }
+    }
 
-        // The proposer creates the signing session (ephemeral coordinator, signers as the
-        // participants) and pushes its sealed intent to the other signer — exactly `publish`.
-        let proposer = member(&identities[0], &peers);
+    #[test]
+    fn testnet_signed_artifact_survives_a_delayed_final_send() {
+        let Ok(url) = std::env::var("FROSTD_URL") else {
+            return;
+        };
+        use crate::host::state::{AppState, Config};
+        let data = std::env::temp_dir().join(format!("loki-testnet-round-{}", Uuid::new_v4()));
+        let identities: Vec<_> = (1..=3).map(Identity::new).collect();
+        let peers: BTreeMap<_, _> = identities
+            .iter()
+            .map(|i| (i.public().id, i.public()))
+            .collect();
+        let (shares, public) = frost::keys::generate_with_dealer(
+            3,
+            2,
+            frost::keys::IdentifierList::Default,
+            &mut OsRng,
+        )
+        .unwrap();
+        let ak = public
+            .verifying_key()
+            .serialize()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let fvk = zip2005::frost_viewing_key(&ak, &[42; 32]).unwrap();
+        let make = |slot: u16| Vault {
+            network: VaultNetwork::Testnet,
+            fvk: fvk.clone(),
+            key: frost::keys::KeyPackage::try_from(
+                shares[&frost::Identifier::try_from(slot).unwrap()].clone(),
+            )
+            .unwrap(),
+            public: public.clone(),
+            identity: Identity::from_secret_bytes(
+                &identities[usize::from(slot - 1)].to_secret_bytes(),
+            )
+            .unwrap(),
+            threshold: 2,
+            slot,
+            peers: peers.clone(),
+            birth_height: TESTNET_NU7_BIRTH,
+        };
+        let a = make(1);
+        let b = make(2);
+        let rho = Rho::from_bytes(&[1; 32]).unwrap();
+        let note = orchard::Note::from_parts(
+            fvk.address_at(0u64, Scope::External),
+            NoteValue::from_raw(5_000_000),
+            rho,
+            RandomSeed::from_bytes([2; 32], &rho).unwrap(),
+            NoteVersion::V3,
+        )
+        .unwrap();
+        let vault = hex::encode([2; 32]);
+        member_dir(&data, &vault).unwrap();
+        std::fs::create_dir_all(data.join("vaults").join(&vault)).unwrap();
+        let mut inputs = CandidateInputs {
+            vault_fvk: &fvk,
+            notes: vec![note],
+            recipient: fvk.address_at(0u64, Scope::External),
+            amount: Zatoshis::const_from_u64(100_000),
+            memo: MemoBytes::from_bytes(b"").unwrap(),
+            change: Zatoshis::ZERO,
+            target_height: TESTNET_NU7_BIRTH + 1,
+            expiry_height: TESTNET_NU7_BIRTH + 1152,
+        };
+        let fee: u64 = quote_fee(&VaultNetwork::Testnet, &inputs).unwrap().into();
+        inputs.change = Zatoshis::from_u64(4_900_000 - fee).unwrap();
         let coord = Identity::new(0);
         let mut tx = relay(&coord, &url).unwrap();
-        let signer_peers: Vec<Peer> = p.signers.iter().map(|id| Peer(peers[id].encryption)).collect();
-        let ch = tx.open(&signer_peers, 4).unwrap();
-        p.session_id = Some(ch.session_id());
-        push_intent(&tx, &ch, &proposer, &p).unwrap();
-
-        // The selected signer, with NO inbound listener, discovers the attempt over frostd.
-        let signer = member(&identities[1], &peers);
-        let found = discover_over_frostd(&url, &signer, &vault, &attempt).unwrap();
-        assert_eq!(found.proposer, 1);
-        assert_eq!(found.recipient, "uregtest1recipient");
-        assert_eq!(found.session_id, Some(ch.session_id()));
-        assert!(found.coordinator_secret.is_none());
-
-        // The relayed envelope leaks neither the memo nor the recipient.
-        let body = serde_json::to_vec(
-            &json!({"session_id":p.session_id,"intent":public_intent(&p),"approval_started":p.approval_started}),
-        ).unwrap();
-        let context = peer_context(&vault, &attempt, 1, 2).unwrap();
-        let wire = proposer.identity
-            .seal_session(&peers[&2], &context, MessageKind::PeerReply, &body).unwrap();
-        assert!(!wire.windows(4).any(|w| w == b"rent"));
-        assert!(!wire.windows(18).any(|w| w == b"uregtest1recipient"));
-        tx.close(ch).ok();
-
-        // A roster member who was not enlisted in the quorum session discovers nothing.
-        let outsider = member(&identities[2], &peers);
-        assert!(discover_over_frostd(&url, &outsider, &vault, &attempt).is_err());
+        let ch = tx
+            .open(&[Peer(peers[&1].encryption), Peer(peers[&2].encryption)], 4)
+            .unwrap();
+        let mut p = Payment {
+            attempt: hex::encode([3; 32]),
+            vault: vault.clone(),
+            proposer: 1,
+            recipient: vault::unified_address(&fvk, VaultNetwork::Testnet.network_type()),
+            amount_zat: 100_000,
+            memo: String::new(),
+            fee_zat: fee,
+            change_zat: 4_900_000 - fee,
+            note_selection: vec![hex::encode(note.nullifier(&fvk).to_bytes())],
+            target_height: inputs.target_height,
+            expiry_height: inputs.expiry_height,
+            signers: vec![1, 2],
+            phase: "signing".into(),
+            session_id: Some(ch.session_id()),
+            control_session_id: None,
+            approvals: BTreeSet::from([1, 2]),
+            start_requested: true,
+            coordinator_secret: Some(hex::encode(coord.to_secret_bytes())),
+            review_token: None,
+            approval_requested: true,
+            approval_started: true,
+            txid: None,
+            signed_pczt: None,
+            raw_tx: None,
+            error: None,
+        };
+        let st = std::sync::Arc::new(AppState::new(Config {
+            registration: None,
+            data: data.clone(),
+            port: 0,
+            bind: "127.0.0.1".parse().unwrap(),
+            advertise_url: None,
+            network: "testnet".into(),
+            lightwalletd: None,
+            transport: "frostd".into(),
+            secure_element: "software".into(),
+            operator_bundle: None,
+            nonce_witnesses: None,
+            operator_key: None,
+            enrollment_issuer: None,
+            development_http: true,
+            token: "disposable".into(),
+            frostd_url: url,
+            peers: BTreeMap::new(),
+            loopback_peers: true,
+        }));
+        let b_data = data.join("b");
+        std::fs::create_dir_all(b_data.join("vaults").join(&vault)).unwrap();
+        let signed = std::thread::scope(|scope| {
+            let aggregate = scope.spawn(|| aggregate(&st, &data, "pass", &p, &a));
+            let other = scope.spawn(|| sign(&st, &b_data, "pass", &p, &b, None));
+            let result = sign(&st, &data, "pass", &p, &a, Some(inputs));
+            result.unwrap();
+            other.join().unwrap().unwrap();
+            aggregate.join().unwrap().unwrap()
+        });
+        p.phase = "ready".into();
+        p.signed_pczt = Some(hex::encode(signed));
+        save_payment(&data, "pass", &p).unwrap();
+        std::thread::sleep(Duration::from_secs(12));
+        let reloaded = read_payment(&data, "pass", &vault, &p.attempt).unwrap();
+        assert!(ready_to_send(&reloaded));
+        assert_eq!(reloaded.signed_pczt, p.signed_pczt);
+        assert!(reloaded.txid.is_none());
+        assert!(discardable(&data, &reloaded).is_err());
+        let mut interrupted = reloaded.clone();
+        interrupted.attempt = hex::encode([4; 32]);
+        interrupted.phase = "signing".into();
+        interrupted.signed_pczt = None;
+        save_payment(&data, "pass", &interrupted).unwrap();
+        ensure_worker(&st, &data, "pass", &vault, &interrupted.attempt).unwrap();
+        let interrupted = read_payment(&data, "pass", &vault, &interrupted.attempt).unwrap();
+        assert_eq!(interrupted.phase, "failed");
+        assert!(!ready_to_send(&interrupted));
+        assert!(st.active_payments.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(data).unwrap();
     }
 
     #[test]
     fn pending_lists_only_this_members_unapproved_signing_payments() {
         let data = std::env::temp_dir().join(format!("loki-pending-{}", Uuid::new_v4()));
         let vault = hex::encode([2u8; 32]);
-        let mk = |attempt: [u8; 32], signers: Vec<u16>, proposer: u16, phase: &str, started: bool| Payment {
-            attempt: hex::encode(attempt), vault: vault.clone(), proposer,
-            recipient: "uregtest1recipient".into(), amount_zat: 40_000_000, memo: "rent".into(),
-            fee_zat: 10_000, change_zat: 1, note_selection: vec![hex::encode([5u8; 32])],
-            target_height: 700, expiry_height: 1_152, signers, phase: phase.into(),
-            session_id: Some(Uuid::new_v4()), coordinator_secret: None, review_token: None,
-            approval_requested: started, approval_started: started,
-            txid: None, signed_pczt: None, raw_tx: None, error: None,
-        };
+        let mk =
+            |attempt: [u8; 32], signers: Vec<u16>, proposer: u16, phase: &str, started: bool| {
+                Payment {
+                    attempt: hex::encode(attempt),
+                    vault: vault.clone(),
+                    proposer,
+                    recipient: "uregtest1recipient".into(),
+                    amount_zat: 40_000_000,
+                    memo: "rent".into(),
+                    fee_zat: 10_000,
+                    change_zat: 1,
+                    note_selection: vec![hex::encode([5u8; 32])],
+                    target_height: TESTNET_NU7_BIRTH + 1,
+                    expiry_height: TESTNET_NU7_BIRTH + 1_152,
+                    signers,
+                    phase: phase.into(),
+                    session_id: Some(Uuid::new_v4()),
+                    control_session_id: None,
+                    approvals: BTreeSet::new(),
+                    start_requested: false,
+                    coordinator_secret: None,
+                    review_token: None,
+                    approval_requested: started,
+                    approval_started: started,
+                    txid: None,
+                    signed_pczt: None,
+                    raw_tx: None,
+                    error: None,
+                }
+            };
+        let mut readiness = mk([9u8; 32], vec![1, 2], 1, "signing", false);
+        assert!(
+            !ready_to_send(&readiness),
+            "publishing is not signature readiness"
+        );
+        readiness.phase = "ready".into();
+        readiness.signed_pczt = Some("signed artifact".into());
+        assert!(ready_to_send(&readiness));
+        readiness.error = Some("round failed".into());
+        assert!(!ready_to_send(&readiness), "errors must never report ready");
+        let mut failed = mk([9; 32], vec![1, 2], 1, "failed", true);
+        assert!(discardable(&data, &failed).is_ok());
+        let nonce_dir = member_dir(&data, &vault)
+            .unwrap()
+            .path()
+            .join("signer-nonces");
+        std::fs::create_dir_all(&nonce_dir).unwrap();
+        std::fs::write(
+            nonce_dir.join(format!("{}{}.burn", failed.attempt, failed.attempt)),
+            b"burned",
+        )
+        .unwrap();
+        assert!(discardable(&data, &failed).is_err());
+        failed.attempt = hex::encode([10; 32]);
+        failed.raw_tx = Some("raw".into());
+        assert!(discardable(&data, &failed).is_err());
+        failed.raw_tx = None;
+        failed.signed_pczt = Some("signed".into());
+        assert!(discardable(&data, &failed).is_err());
         // Member 2's inbox should surface only the first payment.
-        save_payment(&data, "pass", &mk([1u8; 32], vec![1, 2], 1, "signing", false)).unwrap(); // must approve → shown
-        save_payment(&data, "pass", &mk([2u8; 32], vec![1, 3], 1, "signing", false)).unwrap(); // not a signer → hidden
-        save_payment(&data, "pass", &mk([3u8; 32], vec![1, 2], 1, "signing", true)).unwrap();  // already approved → hidden
-        save_payment(&data, "pass", &mk([4u8; 32], vec![2, 1], 2, "signing", false)).unwrap(); // own proposal → hidden
-        save_payment(&data, "pass", &mk([5u8; 32], vec![1, 2], 1, "broadcast", false)).unwrap(); // not signing → hidden
+        save_payment(
+            &data,
+            "pass",
+            &mk([1u8; 32], vec![1, 2], 1, "signing", false),
+        )
+        .unwrap(); // must approve → shown
+        save_payment(
+            &data,
+            "pass",
+            &mk([2u8; 32], vec![1, 3], 1, "signing", false),
+        )
+        .unwrap(); // not a signer → hidden
+        save_payment(
+            &data,
+            "pass",
+            &mk([3u8; 32], vec![1, 2], 1, "signing", true),
+        )
+        .unwrap(); // already approved → hidden
+        save_payment(
+            &data,
+            "pass",
+            &mk([4u8; 32], vec![2, 1], 2, "signing", false),
+        )
+        .unwrap(); // own proposal → hidden
+        save_payment(
+            &data,
+            "pass",
+            &mk([5u8; 32], vec![1, 2], 1, "broadcast", false),
+        )
+        .unwrap(); // not signing → hidden
 
         let seen: Vec<String> = pending_for(&data, "pass", &vault, 2)
             .unwrap()

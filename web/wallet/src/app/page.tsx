@@ -302,10 +302,10 @@ function ViewRouter({
     case "ceremony":
       return (
         <CeremonyView
-          profileId={profile?.id}
           vault={view.vault}
           secureElement={status?.secure_element}
           onDone={() => { onNavigate({ id: "home" }); onStatusRefresh(); }}
+          onRestart={() => onNavigate({ id: "create-vault" })}
         />
       );
     case "overview":
@@ -839,15 +839,15 @@ const PHASE_LABEL: Record<CeremonyStatus["phase"], string> = {
 };
 
 function CeremonyView({
-  profileId,
   vault,
   secureElement,
   onDone,
+  onRestart,
 }: {
-  profileId?: string;
   vault: string;
   secureElement?: string;
   onDone: () => void;
+  onRestart: () => void;
 }) {
   const { data: cs, error, refresh } = useCeremonyStatus(vault, true);
 
@@ -894,11 +894,11 @@ function CeremonyView({
         )}
         {cs.phase === "compare_roster" && (
           <CompareRoster
-            profileId={profileId}
             creator={cs.invites !== undefined}
             vault={vault}
             fingerprint={cs.fingerprint}
             confirmations={cs.confirmations ?? 0}
+            confirmed={cs.confirmed ?? false}
             members={cs.members}
           />
         )}
@@ -915,52 +915,20 @@ function CeremonyView({
         {cs.phase === "final_backup" && (
           <BackupPhase vault={vault} finalStep={true} />
         )}
-        {cs.phase === "setup_interrupted" && <ResumeCeremony vault={vault} />}
+        {cs.phase === "setup_interrupted" && (
+          <GlassCard className="text-center">
+            <h3 className="mb-3 text-lg font-semibold text-amber">Vault setup interrupted</h3>
+            <ErrMsg msg={cs.error ?? "Key generation stopped before this vault became active."} />
+            <p className="my-4 text-sm text-muted">
+              This setup cannot be resumed safely. Create a new vault and share its new invitations
+              with every member. Each member must compare and confirm the new verification code.
+              The interrupted vault is kept for reference.
+            </p>
+            <Btn onClick={onRestart}>Create a new vault</Btn>
+          </GlassCard>
+        )}
       </div>
     </div>
-  );
-}
-
-// The DKG task died on a transient relay blip (phase "setup_interrupted"). Resume it — the host
-// re-drives the SAME DKG from its saved state (replays relay-log wires, continues; it does not
-// regenerate shares). Auto-try once, with a manual retry; status polling advances on success.
-function ResumeCeremony({ vault }: { vault: string }) {
-  const [tried, setTried] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
-  const [fails, setFails] = useState(0);
-
-  const resume = useCallback(async () => {
-    setBusy(true); setErr(null);
-    try {
-      await api("resume", { vault });
-    } catch (e) {
-      setErr((e as Error).message);
-      setFails((n) => n + 1);
-    } finally {
-      setBusy(false);
-    }
-  }, [vault]);
-
-  useEffect(() => {
-    if (tried) return;
-    setTried(true);
-    resume();
-  }, [tried, resume]);
-
-  return (
-    <GlassCard className="text-center">
-      <p className="mb-1 text-sm text-amber">Setup was interrupted (a relay/network blip).</p>
-      <p className="mb-4 text-xs text-muted">
-        {busy ? "Reconnecting and resuming setup…" : "Resuming from where it stopped — your keys are not regenerated."}
-      </p>
-      {err && (
-        <div className="mb-3"><ErrMsg msg={`${err}${fails >= 2 ? " — if this keeps failing, start a fresh vault from the LOKI menu." : ""}`} /></div>
-      )}
-      <Btn variant="ghost" onClick={resume} disabled={busy}>
-        {busy ? "Resuming…" : "Try again"}
-      </Btn>
-    </GlassCard>
   );
 }
 
@@ -1059,18 +1027,18 @@ function WaitingForMembers({ invites }: { invites: InviteSlot[] }) {
 }
 
 function CompareRoster({
-  profileId,
   creator = false,
   vault,
   fingerprint,
   confirmations,
+  confirmed,
   members,
 }: {
-  profileId?: string;
   creator?: boolean;
   vault: string;
   fingerprint: string | undefined;
   confirmations: number;
+  confirmed: boolean;
   members: number;
 }) {
   const [busy, setBusy] = useState(false);
@@ -1080,20 +1048,16 @@ function CompareRoster({
   const [checked, setChecked] = useState(false);
   const phrase = verifyPhrase(fingerprint);
 
-  // The host reports only a confirmation count, not per-member state, so the viewer's own
-  // confirmation is tracked locally (survives status polls and reloads within this browser).
-  const [confirmedHere, setConfirmedHere] = useState(false);
-  const confirmationKey = profileId && fingerprint ? `loki_confirmed:${profileId}:${vault}:${fingerprint}` : null;
+  const [confirmedHere, setConfirmedHere] = useState(confirmed);
   useEffect(() => {
-    try { setConfirmedHere(!!confirmationKey && localStorage.getItem(confirmationKey) === "yes"); } catch {}
-  }, [confirmationKey]);
+    setConfirmedHere(confirmed);
+  }, [confirmed]);
 
   const agree = async () => {
     setBusy(true); setErr(null);
     try {
       await api("agree", { vault, fingerprint });
       setConfirmedHere(true);
-      try { if (confirmationKey) localStorage.setItem(confirmationKey, "yes"); } catch {}
     } catch (e) { setErr((e as Error).message); }
     finally { setBusy(false); }
   };
@@ -1688,12 +1652,11 @@ function Send({
   );
 }
 
-function SignerList({ signers, threshold, ready = false, complete = false }: { signers: number[]; threshold: number; ready?: boolean; complete?: boolean }) {
+function SignerList({ signers, threshold, approvals = [], ready = false, complete = false }: { signers: number[]; threshold: number; approvals?: number[]; ready?: boolean; complete?: boolean }) {
   return <div className="my-3">
-    <p className="text-xs text-muted">{ready ? `${threshold} approvals ready · proposer can send` : complete ? "Your signer finished · awaiting proposer" : `${threshold} approvals required · waiting for signer readiness`}</p>
-    <p className="mt-1 text-xs text-muted">{signers.length} of {threshold} signing places filled. Selected members are not a count of completed approvals.</p>
+    <p className="text-xs text-muted">{ready ? "Signatures saved · proposer can send" : complete ? "Your signer finished · awaiting proposer" : `${approvals.filter((id) => signers.includes(id)).length} of ${threshold} approvals recorded here`}</p>
     <div className="mt-2 flex flex-wrap gap-2">
-      {signers.map((slot) => <span key={slot} className="pill"><MemberAvatar slot={slot} size={24} /> Member {slot}</span>)}
+      {signers.map((slot) => <span key={slot} className="pill"><MemberAvatar slot={slot} size={24} /> Member {slot}{approvals.includes(slot) ? " · approved" : " · waiting"}</span>)}
     </div>
   </div>;
 }
@@ -1725,7 +1688,9 @@ function ReviewApprove({
 
   const fetchSession = useCallback(async () => {
     try {
-      setSession(await api<PaymentSession>(`payment-status?vault=${vault.vault}&attempt=${attempt}`));
+      const value = await api<PaymentSession>(`payment-status?vault=${vault.vault}&attempt=${attempt}`);
+      setSession(value);
+      if (value.approval_requested) setApproved(true);
       setSessionError(null);
     } catch (e) { setSessionError((e as Error).message); }
   }, [vault.vault, attempt]);
@@ -1733,11 +1698,10 @@ function ReviewApprove({
     setOwnSlot(rememberedVaultSlot(profileId, vault.vault));
   }, [profileId, vault.vault]);
   useEffect(() => {
-    if (!review) return;
     void fetchSession();
     const timer = setInterval(fetchSession, 3000);
     return () => clearInterval(timer);
-  }, [review, fetchSession]);
+  }, [fetchSession]);
 
   const fetchReview = useCallback(async () => {
     try {
@@ -1784,7 +1748,8 @@ function ReviewApprove({
     return (
       <GlassCard className="text-center">
         <div aria-hidden="true" className="mx-auto mb-4 grid h-14 w-14 place-items-center rounded-full bg-mint/10 text-3xl text-mint">✓</div>
-        <h2 className="mb-2 text-2xl font-semibold text-mint">You approved this payment</h2>
+        <h2 className="mb-2 text-2xl font-semibold text-mint">{session?.phase === "failed" ? "Payment signing failed" : "You approved this payment"}</h2>
+        <ErrMsg msg={session?.error ?? null} />
         <p className="text-sm text-muted mb-8">
           It needs {vault.threshold} of {vault.members} members. Once enough have approved, the proposer broadcasts it.
           {isProposer !== null ? (isProposer
@@ -1792,7 +1757,7 @@ function ReviewApprove({
             : " Your approval is recorded. Wait for the proposer to send; follow its progress in History.")
             : " If you proposed it, open History to review and confirm the send when it is ready. Otherwise, wait for the proposer."}
         </p>
-        {session && <SignerList signers={session.intent.signers} threshold={vault.threshold} complete={session.signatures_received} />}
+        {session && <SignerList signers={session.intent.signers} threshold={vault.threshold} approvals={session.approvals} ready={session.signatures_received} complete={session.phase === "approved"} />}
         {sessionError && <><ErrMsg msg={`Could not refresh signer status: ${sessionError}`} /><Btn variant="ghost" onClick={fetchSession}>Retry signer status</Btn></>}
         <Btn variant="ghost" onClick={onBack}>Back to History</Btn>
       </GlassCard>
@@ -1839,14 +1804,14 @@ function ReviewApprove({
           {review.memo && <Row label="Memo" value={review.memo} />}
         </div>
       </GlassCard>
-      {session ? <SignerList signers={session.intent.signers} threshold={vault.threshold} complete={session.signatures_received} />
+      {session ? <SignerList signers={session.intent.signers} threshold={vault.threshold} approvals={session.approvals} ready={session.signatures_received} complete={session.phase === "approved"} />
         : !sessionError && <p role="status" className="mb-3 text-xs text-muted">Loading signer approvals…</p>}
       {sessionError && <div className="mb-3"><ErrMsg msg={`Signer approvals unavailable: ${sessionError}`} /><Btn variant="ghost" onClick={fetchSession}>Retry signer list</Btn></div>}
       <p className="mb-3 text-center text-xs text-muted">
         Approving signs <span className="text-foreground">this exact payment</span> with your share.
         Check the amount and address first.
       </p>
-      <Btn variant="amber" onClick={approve} disabled={busy}>
+      <Btn variant="amber" onClick={approve} disabled={busy || !!session?.error || (!!session && session.phase !== "signing")}>
         {busy ? "Approving…" : "Approve payment"}
       </Btn>
       <ErrMsg msg={err} />
@@ -1885,7 +1850,7 @@ function BroadcastConfirmation({ vault, attempt, busy, error, onConfirm, onCance
       .catch((e) => active && setLoadError((e as Error).message));
     return () => { active = false; };
   }, [vault, attempt, version]);
-  const ready = details && ["signing", "approved"].includes(details.phase) && !details.finish_requested;
+  const ready = details?.phase === "ready" && details.signatures_received && !details.error && !details.finish_requested;
   return <section aria-label="Confirm send" className="mt-4 rounded-xl border border-mint/30 bg-white/80 p-4">
     <h3 data-screen-heading ref={headingRef} tabIndex={-1} className="text-lg font-semibold">Confirm irreversible send</h3>
     {!details && !loadError && <p role="status" className="mt-3 text-sm text-muted">Loading full payment details…</p>}
@@ -1970,6 +1935,13 @@ function History({
     return () => { cancelled = true; if (timer) clearTimeout(timer); };
   }, [verifying, txids, vault.vault]);
 
+  useEffect(() => {
+    const pending = data?.payments.find((p) => p.phase === "broadcast" && p.txid && !txids[p.attempt]);
+    if (!pending?.txid || verifying) return;
+    setTxids((ids) => ({ ...ids, [pending.attempt]: pending.txid! }));
+    setVerifying(pending.attempt);
+  }, [data, txids, verifying]);
+
   const payments = data?.payments ?? [];
 
   return (
@@ -1991,7 +1963,7 @@ function History({
       ) : (
         <div className="space-y-3">
           {payments.map((p) => {
-            const txid = p.txid ?? txids[p.attempt];
+            const txid = ["broadcast", "confirmed"].includes(p.phase) ? p.txid ?? txids[p.attempt] : null;
             const confirmed = !!verified[p.attempt] || p.phase === "confirmed";
             const sending = !!p.finish_requested || !!requested[p.attempt] || finishing === p.attempt;
             return (
@@ -2007,16 +1979,21 @@ function History({
                   {paymentLabel(confirmed ? "confirmed" : txid ? "broadcast" : p.phase, p.ready_to_send, sending)}
                 </span>
               </div>
-              {p.signers && !txid && <SignerList signers={p.signers} threshold={vault.threshold} ready={p.ready_to_send} />}
+              {p.signers && !txid && <SignerList signers={p.signers} threshold={vault.threshold} approvals={p.approvals} ready={p.ready_to_send} complete={p.phase === "approved"} />}
               {txid && <p className="text-xs text-muted">{p.mined_height != null ? `Included in block ${p.mined_height.toLocaleString()}. ` : confirmed ? "Confirmed on-chain. " : "Awaiting a block. "}Confirmation count is not available from this wallet.</p>}
               <ErrMsg msg={p.error ?? null} />
               <div className="mt-3 flex flex-col gap-2 sm:flex-row">
-                {p.phase === "signing" && !txid && <button
+                {p.phase === "signing" && !p.approval_requested && !p.error && !txid && <button
                   onClick={() => onReview(p.attempt)}
                   className="btn-glass flex-1 rounded-full px-4 py-2 text-sm"
                 >
                   Review / approve
                 </button>}
+                {p.can_discard && <button className="btn-glass flex-1 rounded-full px-4 py-2 text-sm" onClick={async () => {
+                  setErr(null);
+                  try { await api("payment-discard", { vault: vault.vault, attempt: p.attempt }); refresh(); }
+                  catch (e) { setErr((e as Error).message); }
+                }}>Discard failed payment</button>}
                 {p.ready_to_send && !txid && (
                   <button
                     onClick={(event) => { sendButtonRef.current = event.currentTarget; setConfirming(p.attempt); setErr(null); }}

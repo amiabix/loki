@@ -86,6 +86,8 @@ struct ListSessionsOut {
 #[derive(Deserialize)]
 struct SessionInfoOut {
     pubkeys: Vec<HexKey>,
+    #[serde(default)]
+    coordinator_pubkey: Option<HexKey>,
 }
 #[derive(Serialize, Deserialize)]
 struct WireMsg {
@@ -218,19 +220,25 @@ impl FrostdTransport {
     /// The participant pubkeys of one session, so a member can tell a payment quorum from
     /// an unrelated session before it drains the mailbox.
     pub fn session_info(&self, session: Uuid) -> Result<Vec<[u8; 32]>, TransportError> {
+        Ok(self.session_details(session)?.0)
+    }
+
+    pub fn session_details(&self, session: Uuid) -> Result<(Vec<[u8; 32]>, Option<[u8; 32]>), TransportError> {
         let out: SessionInfoOut = self.runtime.block_on(Self::post(
             &self.client,
             format!("{}/get_session_info", self.base_url),
             self.token,
             json!({ "session_id": session }),
         ))?;
-        out.pubkeys
+        let owner = out.coordinator_pubkey.map(|k| k.0.try_into().map_err(|_| TransportError::Decode("coordinator key length".into()))).transpose()?;
+        let participants = out.pubkeys
             .into_iter()
             .map(|k| {
                 k.0.try_into()
                     .map_err(|_| TransportError::Decode("session pubkey length".into()))
             })
-            .collect()
+            .collect::<Result<_, _>>()?;
+        Ok((participants, owner))
     }
 }
 
