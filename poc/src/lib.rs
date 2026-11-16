@@ -14,6 +14,7 @@
 //! `probe-zip2005` feature still records the missing upstream API. C1.4 is supplied by
 //! an isolated patch to vendored orchard; see vendor/README.md.
 
+pub mod builder;
 pub mod candidate;
 #[cfg(test)]
 mod coordinator;

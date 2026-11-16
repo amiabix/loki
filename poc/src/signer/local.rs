@@ -713,49 +713,16 @@ impl<SE: SecureElement> LocalSigner<SE> {
         params: &crate::signer::PublicPaymentParams,
         alpha: &[u8; 32],
     ) -> Result<Vec<u8>, SignerError> {
-        use crate::candidate::{alpha_from_canonical_bytes, build_candidate, quote_fee, CandidateInputs};
         // ponytail: first-note selection; swap for real coin selection when multi-note lands.
         let note = *self
             .candidate_notes
             .first()
             .ok_or_else(|| SignerError::Other("signer holds no spendable note".into()))?;
-        let alpha = alpha_from_canonical_bytes(alpha)
-            .ok_or_else(|| SignerError::Other("noncanonical alpha".into()))?;
-
-        let mut inputs = CandidateInputs {
-            vault_fvk: self.fvk()?,
-            notes: vec![note],
-            recipient: params.recipient,
-            amount: params.amount,
-            memo: params.memo.clone(),
-            change: zcash_protocol::value::Zatoshis::ZERO,
-            target_height: params.target_height,
-            expiry_height: params.expiry_height,
-        };
-        let fee = u64::from(quote_fee(params_net, &inputs).map_err(SignerError::Other)?);
-        let spend = note.value().inner();
-        let amount = u64::from(params.amount);
-        let change = spend
-            .checked_sub(amount)
-            .and_then(|r| r.checked_sub(fee))
-            .ok_or_else(|| SignerError::Other("note does not cover amount + fee".into()))?;
-        inputs.change = zcash_protocol::value::Zatoshis::from_u64(change)
-            .map_err(|e| SignerError::Other(format!("{e:?}")))?;
-        let built = build_candidate(
-            params_net,
-            &inputs,
-            &[alpha],
-            rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng),
-        )
-        .map_err(SignerError::Other)?;
-        let candidate = pczt::roles::creator::Creator::build_from_parts(built.pczt_parts)
-            .ok_or_else(|| SignerError::Other("build_from_parts returned None".into()))?;
-        let candidate = pczt::roles::io_finalizer::IoFinalizer::new(candidate)
-            .finalize_io()
-            .map_err(|e| SignerError::Other(format!("io finalize: {e:?}")))?;
-        candidate
-            .serialize()
-            .map_err(|e| SignerError::Other(format!("serialize: {e:?}")))
+        // The PCZT build is share-free; it lives in `crate::builder` so the untrusted
+        // server-side builder (W4) runs this identical path. Only note selection and the
+        // viewing key stay here.
+        crate::builder::build_unsigned(self.fvk()?, params_net, params, note, alpha)
+            .map_err(SignerError::Other)
     }
 
     fn fvk(&self) -> Result<&FullViewingKey, SignerError> {
