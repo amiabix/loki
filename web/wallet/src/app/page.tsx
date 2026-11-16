@@ -1683,7 +1683,7 @@ function ReviewApprove({
 
   const fetchSession = useCallback(async () => {
     try {
-      setSession(await api<PaymentSession>(`payment-session?vault=${vault.vault}&attempt=${attempt}`));
+      setSession(await api<PaymentSession>(`payment-status?vault=${vault.vault}&attempt=${attempt}`));
       setSessionError(null);
     } catch (e) { setSessionError((e as Error).message); }
   }, [vault.vault, attempt]);
@@ -1833,7 +1833,7 @@ function BroadcastConfirmation({ vault, attempt, busy, error, onConfirm, onCance
   useEffect(() => {
     let active = true;
     setDetails(null); setLoadError(null);
-    api<PaymentSession>(`payment-session?vault=${vault}&attempt=${attempt}`)
+    api<PaymentSession>(`payment-status?vault=${vault}&attempt=${attempt}`)
       .then((value) => {
         const intent = value.intent;
         if (!intent.recipient || !Number.isFinite(intent.amount_zat) || intent.amount_zat <= 0

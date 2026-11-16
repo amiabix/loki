@@ -966,7 +966,7 @@ pub(super) async fn payments(
         Err(e) => return e,
     };
     blocking(move || {
-        let v = load_vault(&data, &pass, &vault, &st.config.network)?;
+        let _v = load_vault(&data, &pass, &vault, &st.config.network)?;
         let dir = payment_dir(&data, &vault)?;
         let mut out = Vec::new();
         for entry in std::fs::read_dir(dir.path()).map_err(|e| e.to_string())? {
@@ -976,10 +976,83 @@ pub(super) async fn payments(
             if hex32(attempt).is_err() { continue; }
             let p = read_payment(&data, &pass, &vault, attempt)?;
             let ready = ready_to_send(&p);
-            out.push(json!({"attempt":p.attempt,"phase":p.phase,"recipient":p.recipient,"amount_zat":p.amount_zat.to_string(),"ready_to_send":ready,"txid":p.txid,"signers":p.signers}));
+            out.push(json!({"attempt":p.attempt,"phase":p.phase,"recipient":p.recipient,"amount_zat":p.amount_zat.to_string(),"ready_to_send":ready,"txid":p.txid,"signers":p.signers,"error":p.error}));
         }
         Ok(json!({"payments":out}))
     }).await
+}
+
+/// A co-signer's approval inbox: payments in this member's local store that another member
+/// proposed, that this member is a selected signer on, and that it has not yet approved.
+fn pending_for(data: &Path, pass: &str, vault: &str, slot: u16) -> Result<Vec<Value>, String> {
+    let dir = payment_dir(data, vault)?;
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir.path()).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(attempt) = name.strip_suffix(".json") else { continue };
+        if hex32(attempt).is_err() { continue; }
+        let p = read_payment(data, pass, vault, attempt)?;
+        if p.phase == "signing" && p.proposer != slot && p.signers.contains(&slot) && !p.approval_started {
+            out.push(json!({"attempt":p.attempt,"amount_zat":p.amount_zat.to_string(),"recipient":p.recipient,"proposer":p.proposer}));
+        }
+    }
+    Ok(out)
+}
+
+pub(super) async fn pending(
+    State(st): State<Shared>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Reply {
+    let Some(vault) = query.get("vault") else {
+        return err(StatusCode::BAD_REQUEST, "missing vault");
+    };
+    let vault = vault.clone();
+    let (data, pass) = match unlocked(&st).await {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    blocking(move || {
+        // load_vault authorizes the caller as a member of this vault before listing anything.
+        let v = load_vault(&data, &pass, &vault, &st.config.network)?;
+        Ok(json!({"pending": pending_for(&data, &pass, &vault, v.slot)?}))
+    })
+    .await
+}
+
+/// A payment's current status for the UI (replaces the removed UI-facing payment-session GET):
+/// the sealed intent this member already holds locally, plus live signer readiness.
+pub(super) async fn status(
+    State(st): State<Shared>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Reply {
+    let (Some(vault), Some(attempt)) = (query.get("vault"), query.get("attempt")) else {
+        return err(StatusCode::BAD_REQUEST, "missing vault or attempt");
+    };
+    let (vault, attempt) = (vault.clone(), attempt.clone());
+    let (data, pass) = match unlocked(&st).await {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    blocking(move || {
+        let _v = load_vault(&data, &pass, &vault, &st.config.network)?;
+        let p = read_payment(&data, &pass, &vault, &attempt)?;
+        let ready = ready_to_send(&p);
+        Ok(json!({
+            "phase": p.phase,
+            "finish_requested": p.signed_pczt.is_some() || p.raw_tx.is_some(),
+            "signatures_received": ready,
+            "intent": {
+                "proposer": p.proposer,
+                "signers": p.signers,
+                "recipient": p.recipient,
+                "amount_zat": p.amount_zat,
+                "fee_zat": p.fee_zat,
+                "open_approval": false,
+            },
+        }))
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -1169,5 +1242,34 @@ mod tests {
         // A roster member who was not enlisted in the quorum session discovers nothing.
         let outsider = member(&identities[2], &peers);
         assert!(discover_over_frostd(&url, &outsider, &vault, &attempt).is_err());
+    }
+
+    #[test]
+    fn pending_lists_only_this_members_unapproved_signing_payments() {
+        let data = std::env::temp_dir().join(format!("loki-pending-{}", Uuid::new_v4()));
+        let vault = hex::encode([2u8; 32]);
+        let mk = |attempt: [u8; 32], signers: Vec<u16>, proposer: u16, phase: &str, started: bool| Payment {
+            attempt: hex::encode(attempt), vault: vault.clone(), proposer,
+            recipient: "uregtest1recipient".into(), amount_zat: 40_000_000, memo: "rent".into(),
+            fee_zat: 10_000, change_zat: 1, note_selection: vec![hex::encode([5u8; 32])],
+            target_height: 700, expiry_height: 1_152, signers, phase: phase.into(),
+            session_id: Some(Uuid::new_v4()), coordinator_secret: None, review_token: None,
+            approval_requested: started, approval_started: started,
+            txid: None, signed_pczt: None, raw_tx: None, error: None,
+        };
+        // Member 2's inbox should surface only the first payment.
+        save_payment(&data, "pass", &mk([1u8; 32], vec![1, 2], 1, "signing", false)).unwrap(); // must approve → shown
+        save_payment(&data, "pass", &mk([2u8; 32], vec![1, 3], 1, "signing", false)).unwrap(); // not a signer → hidden
+        save_payment(&data, "pass", &mk([3u8; 32], vec![1, 2], 1, "signing", true)).unwrap();  // already approved → hidden
+        save_payment(&data, "pass", &mk([4u8; 32], vec![2, 1], 2, "signing", false)).unwrap(); // own proposal → hidden
+        save_payment(&data, "pass", &mk([5u8; 32], vec![1, 2], 1, "broadcast", false)).unwrap(); // not signing → hidden
+
+        let seen: Vec<String> = pending_for(&data, "pass", &vault, 2)
+            .unwrap()
+            .iter()
+            .map(|p| p["attempt"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(seen, vec![hex::encode([1u8; 32])]);
+        std::fs::remove_dir_all(data).unwrap();
     }
 }

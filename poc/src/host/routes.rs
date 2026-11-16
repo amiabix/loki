@@ -60,6 +60,8 @@ pub fn router(state: Shared) -> Router {
         .route("/api/payment-finish", post(payment::finish))
         .route("/api/payment-verify", post(payment::verify))
         .route("/api/payments", get(payment::payments))
+        .route("/api/pending", get(payment::pending))
+        .route("/api/payment-status", get(payment::status))
         .route("/api/recovery-setup", post(recovery::setup))
         .route("/api/recovery-status", get(recovery::status))
         .route("/api/recovery-backup", get(recovery::fetch))
