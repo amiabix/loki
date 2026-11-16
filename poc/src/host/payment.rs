@@ -687,6 +687,68 @@ pub(super) async fn publish(State(st): State<Shared>, Json(body): Json<Value>) -
     .await
 }
 
+/// Everything a remote (browser) signer needs to join this payment's frostd signing session
+/// and release its share. Served by the proposer's host (it alone holds the published payment
+/// and the coordinator secret). Mirrors the ceremony `/api/session` endpoint: CORS-open and
+/// process-token-exempt so a browser member can poll it cross-origin.
+///
+/// The frostd `from` identity a signer matches is the sender's frostd login pubkey, which for
+/// a native member equals its roster `encryption` key (see `relay`): so `proposer_frostd_pubkey`
+/// is the proposer's roster encryption, and `coordinator_frostd_pubkey` is the X25519 public of
+/// this payment's one-shot coordinator identity (`coordinator_secret`, a fresh `Identity::new(0)`).
+pub(super) async fn session(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
+    let (data, pass) = match unlocked(&st).await {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    blocking(move || {
+        let (vault, attempt) = pair(&body)?;
+        let v = load_vault(&data, &pass, &vault, &st.config.network)?;
+        let p = read_payment(&data, &pass, &vault, &attempt)?;
+        if p.phase != "signing" || p.session_id.is_none() || p.error.is_some() {
+            return Err("payment is not signing".into());
+        }
+        let coord_bytes = hex::decode(
+            p.coordinator_secret
+                .as_deref()
+                .ok_or("missing coordinator identity")?,
+        )
+        .map_err(|e| e.to_string())?;
+        let coordinator_frostd_pubkey =
+            hex::encode(Identity::from_secret_bytes(&coord_bytes)?.public().encryption);
+        let proposer_frostd_pubkey = hex::encode(
+            v.peers
+                .get(&p.proposer)
+                .ok_or("proposer not in vault roster")?
+                .encryption,
+        );
+        let members = v
+            .peers
+            .iter()
+            .map(|(id, pid)| {
+                json!({
+                    "id": id,
+                    "signing": hex::encode(pid.signing),
+                    "encryption": hex::encode(pid.encryption),
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "session_id": p.session_id,
+            "attempt": p.attempt,
+            "signers": p.signers,
+            "proposer": p.proposer,
+            "proposer_frostd_pubkey": proposer_frostd_pubkey,
+            "coordinator_frostd_pubkey": coordinator_frostd_pubkey,
+            "members": members,
+            "threshold": v.threshold,
+            "network": v.network.label(),
+            "birth_height": v.birth_height,
+        }))
+    })
+    .await
+}
+
 pub(super) async fn review(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
     with_body(st, body, |st, data, pass, body| {
         let (vault, attempt) = pair(&body)?;

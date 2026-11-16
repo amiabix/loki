@@ -35,6 +35,22 @@ export interface SignerSession { slot?: number; profile: { id: string; name: str
 /** A public-roster member, as the coordinator's `/api/members` returns it. */
 export interface EnrolledMember { slot: number; signing_pubkey: string; relay_pubkey: string; advertise_url: string }
 
+/** Discover + sign a payment the proposer published (this signer is a NON-proposer approver). */
+export interface ApprovePaymentOpts { creatorBaseUrl: string; vault: string; attempt: string }
+/** `/api/payment-session` on the proposer's host (poc/src/host/payment.rs::session). */
+interface PaymentSession {
+  session_id: string;
+  attempt: string;
+  signers: number[];
+  proposer: number;
+  proposer_frostd_pubkey: string;
+  coordinator_frostd_pubkey: string;
+  members: { id: number; signing: string; encryption: string }[];
+  threshold: number;
+  network: string;
+  birth_height: number | null;
+}
+
 /**
  * The contract W1's wasm module must satisfy. `request` is the in-process
  * equivalent of the old member HTTP API: W1 dispatches each (path, body) into
@@ -60,6 +76,8 @@ export interface SignerModule {
   enroll(coordinatorOrigin?: string): Promise<EnrolledMember>;
   /** In-process member call — the old per-member HTTP, now dispatched into wasm. */
   request<T = unknown>(path: string, body?: unknown): Promise<T>;
+  /** Discover a published payment on the proposer's host and release this member's share. */
+  approvePayment(opts: ApprovePaymentOpts): Promise<{ approved: boolean; review: unknown }>;
 }
 
 // ─── real wasm signer (browser Worker) ───────────────────────────────────────
@@ -240,6 +258,43 @@ function browserSigner(cfg: SignerConfig): SignerModule {
       if (path === "payment-approve") return call<T>({ op: "payment-approve", payment: relay(body) });
       throw new SignerPending(path); // other member paths stay unbuilt
     },
+    async approvePayment({ creatorBaseUrl, vault, attempt }) {
+      if (!current) throw new ApiError("Unlock your signer", 401);
+      const base = creatorBaseUrl.replace(/\/+$/, "");
+      const s = await postJson<PaymentSession>(`${base}/api/payment-session`, { vault, attempt });
+      // Find THIS member's slot by matching its roster encryption (relay) key — the frostd
+      // login pubkey differs, so match the roster field, not the login identity.
+      const material = await call<{ relay_pubkey: string }>({ op: "enroll-material" });
+      const me = s.members.find((m) => m.encryption === material.relay_pubkey);
+      if (!me) throw new ApiError("this signer is not a member of the payment's vault", 403);
+      const proposer = s.members.find((m) => m.id === s.proposer);
+      if (!proposer) throw new ApiError("payment session is missing the proposer", 502);
+      // Rebuild the DKG setup document BYTE-IDENTICAL (joinCeremony: sorted by slot, same keys).
+      const members = s.members
+        .slice()
+        .sort((a, b) => a.id - b.id)
+        .map((m) => ({ id: m.id, signing: m.signing, encryption: m.encryption }));
+      const doc: Record<string, unknown> = { vault, threshold: s.threshold, setup_version: 2, network: s.network, members };
+      if (s.network === "testnet") doc.birth_height = Number(s.birth_height);
+      const rosterHex = toHex(new TextEncoder().encode(JSON.stringify(doc)));
+      const body = {
+        vaultHex: vault,
+        slot: me.id,
+        label: "vault",
+        network: s.network,
+        rosterHex,
+        sessionId: s.session_id,
+        attemptHex: s.attempt,
+        signers: s.signers,
+        proposerSigning: proposer.signing,
+        proposerEnc: s.proposer_frostd_pubkey,
+        proposerId: s.proposer,
+        coordinatorPeer: s.coordinator_frostd_pubkey,
+        frostdUrl: cfg.frostdUrl,
+        transportUrl: cfg.transportUrl,
+      };
+      return call({ op: "payment-approve", payment: body });
+    },
   };
 }
 
@@ -284,6 +339,7 @@ const mockSigner: SignerModule = {
   },
   // Enrollment needs the unlocked identity + a device key the wasm core authorizes (W1).
   async enroll(): Promise<EnrolledMember> { throw new SignerPending("enroll"); },
+  async approvePayment(): Promise<{ approved: boolean; review: unknown }> { throw new SignerPending("payment-approve"); },
   async request<T>(path: string): Promise<T> {
     const s = session();
     // Status is the only member call the onboarding lifecycle needs; serve it so a
@@ -335,4 +391,10 @@ export const signer: SignerModule = {
   lock: async () => (await impl()).lock(),
   enroll: async (coordinatorOrigin) => (await impl()).enroll(coordinatorOrigin),
   async request<T = unknown>(path: string, body?: unknown): Promise<T> { return (await impl()).request<T>(path, body); },
+  approvePayment: async (opts) => (await impl()).approvePayment(opts),
 };
+
+// Callable without the (unwired) vault UI: `await window.lokiApprovePayment({ creatorBaseUrl, vault, attempt })`.
+if (typeof window !== "undefined") {
+  (window as unknown as { lokiApprovePayment?: typeof signer.approvePayment }).lokiApprovePayment = signer.approvePayment;
+}

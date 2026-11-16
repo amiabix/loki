@@ -55,6 +55,7 @@ pub fn router(state: Shared) -> Router {
         .route("/api/balance", post(payment::balance))
         .route("/api/payment-draft", post(payment::draft))
         .route("/api/payment-publish", post(payment::publish))
+        .route("/api/payment-session", post(payment::session))
         .route("/api/payment-review", post(payment::review))
         .route("/api/payment-approve", post(payment::approve))
         .route("/api/payment-discard", post(payment::discard))
@@ -87,7 +88,7 @@ async fn browser_origin(State(st): State<Shared>, req: Request, next: Next) -> R
     // does not already guard); every other `/api/*` route stays locked to the paired coordinator.
     let open_ceremony = matches!(
         req.uri().path(),
-        "/api/enroll" | "/api/agreed" | "/api/roster" | "/api/session"
+        "/api/enroll" | "/api/agreed" | "/api/roster" | "/api/session" | "/api/payment-session"
     );
     if let Some(origin) = &origin {
         if !open_ceremony {
@@ -129,7 +130,7 @@ async fn registration(State(st): State<Shared>) -> Reply {
 async fn auth(State(st): State<Shared>, req: Request, next: Next) -> Result<Response, Response> {
     if matches!(
         req.uri().path(),
-        "/api/enroll" | "/api/agreed" | "/api/roster" | "/api/session"
+        "/api/enroll" | "/api/agreed" | "/api/roster" | "/api/session" | "/api/payment-session"
     ) {
         return Ok(next.run(req).await);
     }
