@@ -34,8 +34,10 @@ export type CeremonyStatus = {
     | "active";
   fingerprint?: string;
   invites?: InviteSlot[];
-  // Count of members who have confirmed (the host sends a number, not a per-slot list).
+  // The creator counts all confirmations; a joining device records its own confirmation.
   confirmations?: number;
+  confirmed?: boolean;
+  error?: string;
   members: number;
   threshold: number;
 };

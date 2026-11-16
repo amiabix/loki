@@ -299,10 +299,10 @@ function ViewRouter({
     case "ceremony":
       return (
         <CeremonyView
-          profileId={profile?.id}
           vault={view.vault}
           secureElement={status?.secure_element}
           onDone={() => { onNavigate({ id: "home" }); onStatusRefresh(); }}
+          onRestart={() => onNavigate({ id: "create-vault" })}
         />
       );
     case "overview":
@@ -797,15 +797,15 @@ const PHASE_LABEL: Record<CeremonyStatus["phase"], string> = {
 };
 
 function CeremonyView({
-  profileId,
   vault,
   secureElement,
   onDone,
+  onRestart,
 }: {
-  profileId?: string;
   vault: string;
   secureElement?: string;
   onDone: () => void;
+  onRestart: () => void;
 }) {
   const { data: cs, error, refresh } = useCeremonyStatus(vault, true);
 
@@ -852,11 +852,11 @@ function CeremonyView({
         )}
         {cs.phase === "compare_roster" && (
           <CompareRoster
-            profileId={profileId}
             creator={cs.invites !== undefined}
             vault={vault}
             fingerprint={cs.fingerprint}
             confirmations={cs.confirmations ?? 0}
+            confirmed={cs.confirmed ?? false}
             members={cs.members}
           />
         )}
@@ -873,52 +873,20 @@ function CeremonyView({
         {cs.phase === "final_backup" && (
           <BackupPhase vault={vault} finalStep={true} />
         )}
-        {cs.phase === "setup_interrupted" && <ResumeCeremony vault={vault} />}
+        {cs.phase === "setup_interrupted" && (
+          <GlassCard className="text-center">
+            <h3 className="mb-3 text-lg font-semibold text-amber">Vault setup interrupted</h3>
+            <ErrMsg msg={cs.error ?? "Key generation stopped before this vault became active."} />
+            <p className="my-4 text-sm text-muted">
+              This setup cannot be resumed safely. Create a new vault and share its new invitations
+              with every member. Each member must compare and confirm the new verification code.
+              The interrupted vault is kept for reference.
+            </p>
+            <Btn onClick={onRestart}>Create a new vault</Btn>
+          </GlassCard>
+        )}
       </div>
     </div>
-  );
-}
-
-// The DKG task died on a transient relay blip (phase "setup_interrupted"). Resume it — the host
-// re-drives the SAME DKG from its saved state (replays relay-log wires, continues; it does not
-// regenerate shares). Auto-try once, with a manual retry; status polling advances on success.
-function ResumeCeremony({ vault }: { vault: string }) {
-  const [tried, setTried] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
-  const [fails, setFails] = useState(0);
-
-  const resume = useCallback(async () => {
-    setBusy(true); setErr(null);
-    try {
-      await api("resume", { vault });
-    } catch (e) {
-      setErr((e as Error).message);
-      setFails((n) => n + 1);
-    } finally {
-      setBusy(false);
-    }
-  }, [vault]);
-
-  useEffect(() => {
-    if (tried) return;
-    setTried(true);
-    resume();
-  }, [tried, resume]);
-
-  return (
-    <GlassCard className="text-center">
-      <p className="mb-1 text-sm text-amber">Setup was interrupted (a relay/network blip).</p>
-      <p className="mb-4 text-xs text-muted">
-        {busy ? "Reconnecting and resuming setup…" : "Resuming from where it stopped — your keys are not regenerated."}
-      </p>
-      {err && (
-        <div className="mb-3"><ErrMsg msg={`${err}${fails >= 2 ? " — if this keeps failing, start a fresh vault from the LOKI menu." : ""}`} /></div>
-      )}
-      <Btn variant="ghost" onClick={resume} disabled={busy}>
-        {busy ? "Resuming…" : "Try again"}
-      </Btn>
-    </GlassCard>
   );
 }
 
@@ -1017,18 +985,18 @@ function WaitingForMembers({ invites }: { invites: InviteSlot[] }) {
 }
 
 function CompareRoster({
-  profileId,
   creator = false,
   vault,
   fingerprint,
   confirmations,
+  confirmed,
   members,
 }: {
-  profileId?: string;
   creator?: boolean;
   vault: string;
   fingerprint: string | undefined;
   confirmations: number;
+  confirmed: boolean;
   members: number;
 }) {
   const [busy, setBusy] = useState(false);
@@ -1038,20 +1006,16 @@ function CompareRoster({
   const [checked, setChecked] = useState(false);
   const phrase = verifyPhrase(fingerprint);
 
-  // The host reports only a confirmation count, not per-member state, so the viewer's own
-  // confirmation is tracked locally (survives status polls and reloads within this browser).
-  const [confirmedHere, setConfirmedHere] = useState(false);
-  const confirmationKey = profileId && fingerprint ? `loki_confirmed:${profileId}:${vault}:${fingerprint}` : null;
+  const [confirmedHere, setConfirmedHere] = useState(confirmed);
   useEffect(() => {
-    try { setConfirmedHere(!!confirmationKey && localStorage.getItem(confirmationKey) === "yes"); } catch {}
-  }, [confirmationKey]);
+    setConfirmedHere(confirmed);
+  }, [confirmed]);
 
   const agree = async () => {
     setBusy(true); setErr(null);
     try {
       await api("agree", { vault, fingerprint });
       setConfirmedHere(true);
-      try { if (confirmationKey) localStorage.setItem(confirmationKey, "yes"); } catch {}
     } catch (e) { setErr((e as Error).message); }
     finally { setBusy(false); }
   };
