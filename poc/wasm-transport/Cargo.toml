@@ -1,0 +1,48 @@
+# W3 browser transport to frostd. A standalone crate (NOT a member of the poc
+# workspace) so it compiles to wasm32-unknown-unknown on its own: the big `loki-poc`
+# crate pulls orchard/tonic/rusqlite and cannot target wasm, but the wire to frostd
+# only needs reqwest's fetch backend + the login signature. Integrates into the signer
+# core (W1) once that compiles to wasm; see src/lib.rs.
+[package]
+name = "loki-wasm-transport"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# cdylib for the wasm-pack output the signer Worker imports (FrostdClient JS bindings);
+# rlib so the native round-trip test still links.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Own workspace root: detached from poc/ and the communication workspace so a bare
+# `cargo build --target wasm32-unknown-unknown` here resolves only these deps.
+[workspace]
+
+[dependencies]
+# reqwest on wasm32 compiles to the browser Fetch API (async, no tokio runtime); on
+# native it is the same client over http. Same crate/version poc already uses.
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# No `v4`: this crate only parses/echoes session ids, never mints them (so no wasm RNG dep).
+uuid = { version = "1", features = ["serde"] }
+hex = "0.4"
+zeroize = "1"
+# Login challenge signature — exactly what frostd verifies (xed25519 over the challenge).
+xeddsa = "1"
+# RNG for the XEdDSA signature nonce. rand 0.10 == poc's `rand_zp`.
+rand = "0.10"
+# JS bindings so the signer Worker can drive these async methods directly (W1G). Native
+# builds never link these in (the wasm_api module is cfg(target_arch = "wasm32")).
+wasm-bindgen = "0.2"
+
+# getrandom (via rand 0.10 → rand_core 0.10) needs the browser entropy backend on wasm.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+wasm-bindgen-futures = "0.4"
+
+[dev-dependencies]
+# Native-only: drive the async methods in the round-trip test against a live frostd,
+# and derive the X25519 login pubkey the same way the native transport does.
+tokio = { version = "1", features = ["rt", "macros"] }
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }

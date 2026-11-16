@@ -101,9 +101,27 @@ impl SoftwareSecureElement {
         Ok(Self::from_kek(kek))
     }
 
+    /// Derive the KEK straight from a passphrase over an explicit `salt` (Argon2id, the same
+    /// stretch as the native `kek.sealed`). The in-browser signer owns its salt file in OPFS
+    /// rather than the native `MemberDir` sealed-KEK layout, so this skips `std::fs` entirely
+    /// while keeping the derivation identical. Pair with [`fresh_kek_salt`] on first create.
+    pub fn from_passphrase(passphrase: &str, salt: &[u8]) -> Result<Self, String> {
+        let kek = crate::seal_kdf::derive(passphrase, salt)
+            .map_err(|_| "passphrase KEK derivation failed (salt too short?)".to_string())?;
+        Ok(Self::from_kek(*kek))
+    }
+
     fn cipher(&self) -> XChaCha20Poly1305 {
         XChaCha20Poly1305::new_from_slice(&*self.kek).expect("32-byte KEK")
     }
+}
+
+/// A fresh 16-byte Argon2id salt for [`SoftwareSecureElement::from_passphrase`]. The
+/// in-browser signer persists this beside the sealed share so a reload re-derives the KEK.
+pub fn fresh_kek_salt() -> [u8; 16] {
+    let mut salt = [0u8; 16];
+    OsRng.fill_bytes(&mut salt);
+    salt
 }
 
 const KEK_FILE: &str = "kek.sealed";
@@ -306,6 +324,27 @@ mod tests {
         assert_eq!(reopened, sealed);
         assert_eq!(&**reopened.open(&se).unwrap(), share);
         assert_eq!(reopened.backup_epoch, 1);
+    }
+
+    #[test]
+    fn passphrase_salt_element_round_trips_and_rejects_wrong_passphrase() {
+        let salt = fresh_kek_salt();
+        let se = SoftwareSecureElement::from_passphrase("correct horse battery staple", &salt);
+        let se = se.unwrap();
+        let sealed = SealedShare::seal(&se, 0, b"device identity secret").unwrap();
+        // Same passphrase + same salt re-derive the KEK and reopen.
+        let again =
+            SoftwareSecureElement::from_passphrase("correct horse battery staple", &salt).unwrap();
+        assert_eq!(
+            &**SealedShare::from_bytes(&sealed.to_bytes())
+                .unwrap()
+                .open(&again)
+                .unwrap(),
+            b"device identity secret"
+        );
+        // Wrong passphrase derives a different KEK and cannot open.
+        let wrong = SoftwareSecureElement::from_passphrase("wrong", &salt).unwrap();
+        assert!(sealed.open(&wrong).is_err());
     }
 
     #[test]

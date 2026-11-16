@@ -88,17 +88,22 @@ mod tests {
     /// the result, so they are stripped first — only live coordinator code counts.
     #[test]
     fn coordinator_drive_loop_is_viewing_key_less() {
-        let src = std::fs::read_to_string(Path::new("src/signer/coordination.rs"))
-            .or_else(|_| std::fs::read_to_string("poc/src/signer/coordination.rs"))
-            .or_else(|_| {
-                std::fs::read_to_string(
-                    Path::new(file!())
-                        .parent()
-                        .unwrap()
-                        .join("signer/coordination.rs"),
-                )
-            })
-            .expect("read coordination.rs");
+        // `signer::coordination` now lives in the extracted `loki-signer-core` crate.
+        let src = std::fs::read_to_string(Path::new(
+            "loki-signer-core/src/signer/coordination.rs",
+        ))
+        .or_else(|_| {
+            std::fs::read_to_string("poc/loki-signer-core/src/signer/coordination.rs")
+        })
+        .or_else(|_| {
+            std::fs::read_to_string(
+                Path::new(file!())
+                    .parent()
+                    .unwrap()
+                    .join("../loki-signer-core/src/signer/coordination.rs"),
+            )
+        })
+        .expect("read coordination.rs");
         let shipped = src.split("#[cfg(test)]").next().unwrap_or("");
         let code: String = shipped
             .lines()

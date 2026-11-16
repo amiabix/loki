@@ -132,6 +132,10 @@ struct Ceremony {
     vs_session_id: Option<Uuid>,
     dkg_started: bool,
     error: Option<String>,
+    // The creator's testnet birth height, published to joiners so their setup document
+    // matches the creator's byte-for-byte (joiners must not reconstruct it from a guess).
+    #[serde(default)]
+    birth_height: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -398,6 +402,7 @@ pub(super) async fn create(State(st): State<Shared>, Json(body): Json<Value>) ->
             vs_session_id: None,
             dkg_started: false,
             error: None,
+            birth_height: None,
         };
         save(&data, &pass, &c)?;
         Ok(json!({"vault":c.vault,"invites":invitations(&c)?}))
@@ -470,6 +475,7 @@ pub(super) async fn join(State(st): State<Shared>, Json(body): Json<Value>) -> R
             vs_session_id: None,
             dkg_started: false,
             error: None,
+            birth_height: None,
         };
         if dir(&data, &c.vault)?.exists("ceremony.sealed") {
             let old = load(&data, &pass, &c.vault)?;
@@ -799,6 +805,7 @@ pub(super) async fn session(State(st): State<Shared>, Json(body): Json<Value>) -
             "session_id": c.session_id.ok_or("session pending")?,
             "coordinator_peer": c.coordinator_peer,
             "vs_session_id": c.vs_session_id,
+            "birth_height": c.birth_height,
         }))
     })
     .await;
@@ -895,6 +902,7 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
             let peer = Peer(coord.public().encryption);
             c.session_id = Some(id);
             c.coordinator_peer = Some(hex::encode(peer.0));
+            c.birth_height = Some(birth_height);
             {
                 let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
                 save(data, pass, &c)?;
@@ -1074,6 +1082,7 @@ mod tests {
             vs_session_id: None,
             dkg_started: false,
             error: None,
+            birth_height: None,
         };
         let fingerprint = roster_of(&c).unwrap().fingerprint();
         assert_eq!(fingerprint, roster_of(&c).unwrap().fingerprint());
@@ -1096,7 +1105,7 @@ mod tests {
             my_slot: 1, creator_base_url: String::new(), frostd_url: String::new(),
             slots, fingerprint: Some("fingerprint".into()), agreed: BTreeSet::new(),
             session_id: None, coordinator_peer: None, vs_session_id: None,
-            dkg_started: true, error: None,
+            dkg_started: true, error: None, birth_height: None,
         };
         save(&data, "pass", &ceremony).unwrap();
         let st = std::sync::Arc::new(AppState::new(Config {

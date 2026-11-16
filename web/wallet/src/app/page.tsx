@@ -7,13 +7,16 @@ import {
   api,
   ApiError,
   fund,
-  pairDevice,
-  forgetPairing,
+  createSigner,
+  unlock,
+  hasSigner,
+  forgetSession,
   logout,
   pendingApprovals,
   recoveryRestore,
   recoverySetup,
   recoveryStatus,
+  type CustodyMethod,
   type PendingApproval,
 } from "@/lib/api";
 import { invitePreview, paymentLabel, rememberedVaultSlot, rememberVaultSlot, verifyPhrase } from "@/lib/wallet-ui";
@@ -130,7 +133,7 @@ export default function App() {
 
   const signOut = async () => {
     const locked = await logout();
-    setSessionError(locked ? null : "Pairing cleared. The device could not be locked remotely; lock or stop it locally.");
+    setSessionError(locked ? null : "Signed out. Your share could not be locked; close this tab to be safe.");
     setView({ id: "home" });
     setAuthed(false);
   };
@@ -138,10 +141,10 @@ export default function App() {
   if (authed === null) return <FullScreen>{sessionError ? (
     <GlassCard className="w-full max-w-md">
       <h1 className="text-2xl font-semibold">Unable to connect</h1>
-      <p className="mt-3 text-sm text-muted">We couldn’t check your session. Your account may still be signed in.</p>
+      <p className="mt-3 text-sm text-muted">We couldn’t check your session. Your signer may still be unlocked in this browser.</p>
       <ErrMsg msg={sessionError} />
       <Btn className="mt-4" onClick={checkSession}>Retry connection</Btn>
-      <button className="mt-3 min-h-11 text-sm text-mint" onClick={() => { forgetPairing(); setSessionError(null); setAuthed(false); }}>Forget pairing and connect a device</button>
+      <button className="mt-3 min-h-11 text-sm text-mint" onClick={() => { forgetSession(); setSessionError(null); setAuthed(false); }}>Sign out and start over</button>
     </GlassCard>
   ) : <Splash sub="Connecting…" />}</FullScreen>;
   if (!authed) return <Login notice={sessionError} onLoggedIn={() => { setAuthed(true); refreshStatus(); }} />;
@@ -480,53 +483,92 @@ function Splash({ sub }: { sub: string }) {
   );
 }
 
+// The signer lives in this browser now: a passkey (Touch/Face ID, security key, or
+// phone) unlocks the sealed share, with a passphrase fallback for machines without
+// WebAuthn. No install, no 127.0.0.1 pairing link. Tiers match definition §2.B.
 function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string | null }) {
-  const [link, setLink] = useState("");
-  const [claim, setClaim] = useState<string | null>(null);
+  const [existing, setExisting] = useState<boolean | null>(null); // a share sealed here?
+  const [mode, setMode] = useState<"passkey" | "passphrase">("passkey");
+  const [platform, setPlatform] = useState(false); // biometric authenticator present?
+  const [name, setName] = useState("");
+  const [passphrase, setPassphrase] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  const inviteDevice = async () => {
-    setBusy(true); setErr(null); setClaim(null);
-    try {
-      const reply = await fetch("/api/members/pairing", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-      const body = await reply.json();
-      if (!reply.ok) throw new Error(body.error);
-      setClaim(body.url);
-    } catch (e) { setErr((e as Error).message); }
-    finally { setBusy(false); }
-  };
-  const connect = async () => {
+
+  useEffect(() => {
+    hasSigner().then(setExisting).catch(() => setExisting(false));
+    const pk = (window as unknown as { PublicKeyCredential?: { isUserVerifyingPlatformAuthenticatorAvailable?: () => Promise<boolean> } }).PublicKeyCredential;
+    pk?.isUserVerifyingPlatformAuthenticatorAvailable?.().then(setPlatform).catch(() => setPlatform(false));
+  }, []);
+
+  const unlocking = existing === true;
+  const go = async (method: CustodyMethod) => {
     setBusy(true); setErr(null);
     try {
-      const member = await pairDevice(link);
-      sessionStorage.setItem("loki_me", JSON.stringify({ slot: member.slot }));
-      setLink("");
+      const opts = { method, passphrase: method === "passphrase" ? passphrase : undefined };
+      if (unlocking) await unlock(opts);
+      else await createSigner({ name: name.trim() || "You", ...opts });
+      setPassphrase("");
       onLoggedIn();
     } catch (e) { setErr((e as Error).message); }
     finally { setBusy(false); }
   };
+
   return <FullScreen calm>
     <div className="panel w-full max-w-md px-6 py-8 sm:px-10">
       <div className="font-display text-center text-5xl font-semibold tracking-tight">Loki</div>
-      <h1 className="mb-3 mt-8 text-xl font-semibold">Connect your member device</h1>
-      <p className="mb-4 text-sm text-muted">Pair a new device with LokiSigner. Create or unlock your profile in the native app, then paste its private local session link below. Each browser tab connects to one member.</p>
-      <Btn disabled={busy} onClick={inviteDevice}>Pair a new native signer</Btn>
-      {claim && <div className="my-4 text-sm">
-        <a className="text-mint underline" href={claim}>Open LokiSigner</a>
-        <p className="mt-2 text-xs text-muted">Single use; expires in two minutes. Open on the device you want to pair.</p>
-        <label className="block mt-2 text-xs text-muted">Pairing link
-          <input className="glass mt-2 w-full rounded px-3 py-2" readOnly value={claim} onFocus={(e) => e.target.select()} />
+      <h1 className="mb-2 mt-8 text-xl font-semibold">{unlocking ? "Unlock your signer" : "Create your signer"}</h1>
+      <p className="mb-5 text-sm text-muted">
+        Your signing share lives in this browser, sealed by a passkey. The platform never sees it —
+        no install, no pairing link.
+      </p>
+
+      {!unlocking && (
+        <label className="block text-xs text-muted">Your name on the roster
+          <input value={name} autoComplete="name" spellCheck={false}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="e.g. Alex" className="glass mb-4 mt-2 w-full rounded-full px-5 py-3" />
         </label>
-      </div>}
-      <p className="my-4 text-xs text-muted">Already paired? Unlock LokiSigner again. Your passphrase and shares stay on your device; the coordinator receives only public registration data.</p>
-      <label className="block text-xs text-muted">Local pairing link
-        <input type="password" value={link} autoComplete="off" spellCheck={false}
-          onChange={(e) => setLink(e.target.value)} onKeyDown={(e) => e.key === "Enter" && !busy && link && connect()}
-          placeholder="http://127.0.0.1:3601/#…" className="glass mb-4 mt-2 w-full rounded-full px-5 py-3" />
-      </label>
-      <Btn disabled={busy || !link.trim()} onClick={connect}>{busy ? "Connecting…" : "Pair this tab"}</Btn>
+      )}
+
+      {mode === "passkey" ? (
+        <div className="space-y-3">
+          <Btn disabled={busy} onClick={() => go("platform")}>
+            {busy ? "Waiting for passkey…" : unlocking
+              ? (platform ? "Unlock with Touch/Face ID" : "Unlock with a passkey")
+              : (platform ? "Create with Touch/Face ID" : "Create with a passkey")}
+          </Btn>
+          <Btn variant="ghost" disabled={busy} onClick={() => go("roaming")}>Use a security key or phone</Btn>
+          <button className="min-h-11 w-full text-sm text-mint" onClick={() => { setErr(null); setMode("passphrase"); }}>
+            No passkey on this device? Use a passphrase
+          </button>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          <label className="block text-xs text-muted">Passphrase
+            <input type="password" value={passphrase} autoComplete={unlocking ? "current-password" : "new-password"} spellCheck={false}
+              onChange={(e) => setPassphrase(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && !busy && passphrase && go("passphrase")}
+              placeholder="Protects your share on this device" className="glass mt-2 w-full rounded-full px-5 py-3" />
+          </label>
+          {!unlocking && <p className="text-xs text-muted">Write down the recovery words after setup — they restore your share if you lose this browser.</p>}
+          <Btn disabled={busy || !passphrase} onClick={() => go("passphrase")}>
+            {busy ? "Working…" : unlocking ? "Unlock" : "Create signer"}
+          </Btn>
+          <button className="min-h-11 w-full text-sm text-mint" onClick={() => { setErr(null); setMode("passkey"); }}>
+            Use a passkey instead
+          </button>
+        </div>
+      )}
+
       <ErrMsg msg={err ?? notice} />
-      <p className="mt-4 text-xs text-muted">After logout or a device restart, unlock locally and paste the current link again. Keep the link private.</p>
+
+      {existing !== null && (
+        <button className="mt-5 min-h-11 w-full text-xs text-muted hover:text-mint"
+          onClick={() => { setErr(null); setExisting(!unlocking); }}>
+          {unlocking ? "Set up a different signer instead" : "Already have a signer here? Unlock it"}
+        </button>
+      )}
     </div>
   </FullScreen>;
 }
@@ -552,7 +594,7 @@ function AccountNumber() {
   useEffect(() => {
     try { setId(JSON.parse(sessionStorage.getItem("loki_me") ?? "null")?.slot ?? null); } catch {}
   }, []);
-  return id ? <p className="mb-5 text-xs text-muted">Account number: <span className="select-all font-mono">{id}</span> · Public roster slot; pair each browser tab locally.</p> : null;
+  return id ? <p className="mb-5 text-xs text-muted">Account number: <span className="select-all font-mono">{id}</span> · Your public roster slot in this vault.</p> : null;
 }
 
 // ─── home ─────────────────────────────────────────────────────────────────────

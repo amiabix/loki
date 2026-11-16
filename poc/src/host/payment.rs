@@ -453,11 +453,11 @@ fn discover_over_frostd(
                     let Ok(opened) = v.identity.open_session(peer, &context, &msg.message) else {
                         continue;
                     };
-                    if opened.kind != MessageKind::PeerReply {
+                    if opened.kind() != MessageKind::PeerReply {
                         continue;
                     }
                     let reply: Value =
-                        serde_json::from_slice(&opened.body).map_err(|e| e.to_string())?;
+                        serde_json::from_slice(opened.body()).map_err(|e| e.to_string())?;
                     let p: Payment = serde_json::from_value(reply["intent"].clone())
                         .map_err(|e| e.to_string())?;
                     let sess = reply["session_id"]

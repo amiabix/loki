@@ -124,6 +124,9 @@ and recovery-spend drills. Tracked in [`docs/product/07-roadmap.md`](docs/produc
 | `poc/src/transport.rs` | `frostd` transport |
 | `poc/src/distributed_setup.rs`, `candidate.rs`, `signing_session.rs` | General t-of-n DKG + signing |
 | `poc/src/scan.rs`, `witness.rs`, `loki_wallet_sync` | Chain scan / balance (coordinator) |
+| `web/wallet/` | Next.js wallet UI + keyless coordinator (public roster) |
+| `poc/loki-signer-wasm/` | The signer core compiled to wasm — runs in the browser (`web/wallet`) |
+| `poc/wasm-transport/` | Browser `frostd` transport (wasm), loaded lazily for DKG/payment |
 | `poc/wallet/design/` | Wallet UI design prototype |
 | `poc/enclave-spike/` | Secure Enclave feasibility spike |
 | `web/wallet/` | The keyless coordinator web app (Next; `node server.js`) |
@@ -149,5 +152,37 @@ Preview the wallet UI design prototype:
 ```sh
 poc/wallet/design/serve.sh   # then open http://localhost:8080/design/
 ```
+
+## In-browser signer (web wallet)
+
+The signer in [`poc/loki-signer-wasm`](poc/loki-signer-wasm) compiles the FROST signer core
+to wasm and runs **inside the browser tab** of the [`web/wallet`](web/wallet) Next app — there
+is no local member process and no `127.0.0.1` pairing link. The device identity is sealed under
+a **passkey (Touch/Face ID, security key, or phone) or passphrase** and persisted to the
+browser's **OPFS**; the FROST core runs in a Web Worker, and the share is born in it during DKG
+and never enters page JavaScript. A browser member has completed a real **2-of-3 DKG** over the
+live `frostd` relay. See [`web/wallet/README.md`](web/wallet/README.md) for the signer seam.
+
+**Run it:**
+
+```sh
+# 1. Build the two wasm bundles (gitignored; a copy step stages them into the app):
+cd poc/loki-signer-wasm && RUSTFLAGS='--cfg getrandom_backend="wasm_js"' wasm-pack build --dev --target web
+cd ../wasm-transport    && wasm-pack build --target web
+
+# 2. Run the wallet (predev/prebuild copies the bundles into web/wallet/public/signer/):
+cd ../../web/wallet && npm install && npm run dev   # → http://localhost:3000
+```
+
+Open `http://localhost:3000` and create or unlock your signer (passkey or passphrase) to reach
+Home — this **onboarding works standalone**. If the wasm bundles are not built, the app serves a
+mock signer that services onboarding only and reports vault/DKG/payment paths as unbuilt.
+
+**Full ceremony requires a live coordinator + `frostd`.** Creating/joining a vault and signing
+need a reachable `frostd` over **https/wss with CORS** (a browser cannot use a loopback-plaintext
+relay) and a vault invite from a creator member. Point the app at your relay with
+`NEXT_PUBLIC_FROSTD_URL` (the transport module defaults to the served
+`/signer/wasm-transport/pkg/loki_wasm_transport.js`). The joiner adopts the creator's
+`birth_height` from its published session, so the DKG setup document matches byte-for-byte.
 
 Use only disposable test-network funds.

@@ -112,7 +112,7 @@ fn field(out: &mut Vec<u8>, value: &[u8], limit: usize) -> Result<(), String> {
 }
 
 /// Encode a member-id map with at most [`MAX_MEMBERS`] entries and ids `1..=MAX_MEMBERS`.
-pub(crate) fn encode_map(out: &mut Vec<u8>, values: &BTreeMap<u16, Vec<u8>>) -> Result<(), String> {
+pub fn encode_map(out: &mut Vec<u8>, values: &BTreeMap<u16, Vec<u8>>) -> Result<(), String> {
     if values.len() > usize::from(MAX_MEMBERS) {
         return Err(ERROR.into());
     }
@@ -128,16 +128,16 @@ pub(crate) fn encode_map(out: &mut Vec<u8>, values: &BTreeMap<u16, Vec<u8>>) -> 
 }
 
 /// A bounds-checked reader for the state and snapshot encodings.
-pub(crate) struct Reader<'a> {
+pub struct Reader<'a> {
     raw: &'a [u8],
     offset: usize,
 }
 
 impl<'a> Reader<'a> {
-    pub(crate) fn new(raw: &'a [u8]) -> Self {
+    pub fn new(raw: &'a [u8]) -> Self {
         Self { raw, offset: 0 }
     }
-    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+    pub fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
         let end = self
             .offset
             .checked_add(n)
@@ -147,14 +147,14 @@ impl<'a> Reader<'a> {
         self.offset = end;
         Ok(bytes)
     }
-    pub(crate) fn field(&mut self, limit: usize) -> Result<&'a [u8], String> {
+    pub fn field(&mut self, limit: usize) -> Result<&'a [u8], String> {
         let size = u32::from_be_bytes(self.take(4)?.try_into().map_err(|_| ERROR)?) as usize;
         if size > limit {
             return Err(ERROR.into());
         }
         self.take(size)
     }
-    pub(crate) fn map(&mut self) -> Result<BTreeMap<u16, Vec<u8>>, String> {
+    pub fn map(&mut self) -> Result<BTreeMap<u16, Vec<u8>>, String> {
         let count = self.take(1)?[0];
         if u16::from(count) > MAX_MEMBERS {
             return Err(ERROR.into());
@@ -171,7 +171,7 @@ impl<'a> Reader<'a> {
         }
         Ok(map)
     }
-    pub(crate) fn finish(&self) -> Result<(), String> {
+    pub fn finish(&self) -> Result<(), String> {
         if self.offset == self.raw.len() {
             Ok(())
         } else {
@@ -303,10 +303,10 @@ impl DkgState {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl DkgState {
     /// A state filled with recognizable non-zero bytes, for storage-format tests.
-    pub(crate) fn filled_for_tests(phase: DkgPhase, fill: u8) -> Self {
+    pub fn filled_for_tests(phase: DkgPhase, fill: u8) -> Self {
         let mut state = Self::empty();
         state.phase = phase;
         state.contribution = Zeroizing::new([fill; 32]);
@@ -317,14 +317,14 @@ impl DkgState {
     }
 
     /// Whether every secret is gone (zeroized contribution, `vs`, FROST state, fresh key).
-    pub(crate) fn is_wiped(&self) -> bool {
+    pub fn is_wiped(&self) -> bool {
         self.dkg.is_empty()
             && *self.contribution == [0; 32]
             && *self.vs == [0; 32]
             && self.fresh.is_none()
     }
 
-    pub(crate) fn replace_dkg_for_tests(&mut self, dkg: Zeroizing<Vec<u8>>) {
+    pub fn replace_dkg_for_tests(&mut self, dkg: Zeroizing<Vec<u8>>) {
         self.dkg = dkg;
     }
 }
