@@ -1,26 +1,52 @@
 <!doctype html>
 <meta charset="utf-8" />
-<title>Loki OPFS+wasm check</title>
-<body style="font:14px system-ui;max-width:640px;margin:2rem auto">
-  <h3>Loki in-browser signer — OPFS + wasm foundation check</h3>
-  <p>The signer runs in a Web Worker; its store persists to OPFS via synchronous access handles.
-     Round-trip writes+reads through the real Rust <code>durable</code> backend; read-back after a
-     page reload proves it persisted.</p>
-  <button id="rt">1. Write + read (round-trip)</button>
-  <button id="rb">2. Read back (reload first to prove persistence)</button>
+<title>Loki in-browser signer — profile lifecycle</title>
+<body style="font:14px system-ui;max-width:680px;margin:2rem auto">
+  <h3>Loki in-browser signer — profile lifecycle (Phase A)</h3>
+  <p>The signer runs in a Web Worker; the device <code>Identity</code> is sealed under your
+     passphrase (Argon2id KEK) and persisted to OPFS. <b>Create</b> seals it; <b>reload the
+     page</b>; <b>Has signer?</b> should be true and <b>Unlock</b> re-derives the key and
+     reopens the same identity — the <code>id</code> is identical across the reload.</p>
+
+  <section style="margin:1rem 0">
+    <label>Passphrase <input id="pass" value="correct horse battery staple" size="34" /></label>
+    &nbsp;<label>Name <input id="name" value="Ayush" size="12" /></label>
+    <div style="margin-top:.6rem">
+      <button id="create">1. Create signer (passphrase)</button>
+      <button id="has">2. Has signer?</button>
+      <button id="unlock">3. Unlock</button>
+      <button id="lock">Lock</button>
+    </div>
+    <p style="color:#a00">Reload the page between step 1 and step 3 to prove persistence.</p>
+  </section>
+
   <pre id="out" style="background:#111;color:#0f0;padding:1rem;white-space:pre-wrap"></pre>
+
   <script type="module">
-    const w = new Worker("./worker.js", { type: "module" });
+    import { createSignerClient } from "./signer-client.js";
     const out = document.getElementById("out");
     const log = (m) => { out.textContent += m + "\n"; };
-    w.onerror = (e) => log("WORKER ERROR " + (e.message || e.filename + ":" + e.lineno));
-    w.onmessage = (e) => {
-      if (e.data.cmd === "loaded") return log("worker + wasm loaded");
-      if (e.data.ok) log("OK read = " + JSON.stringify(e.data.read));
-      else log("ERR " + e.data.error);
-    };
-    document.getElementById("rt").onclick = () =>
-      w.postMessage({ cmd: "roundtrip", text: "hello-" + Date.now() });
-    document.getElementById("rb").onclick = () => w.postMessage({ cmd: "readback" });
+    const pass = () => document.getElementById("pass").value;
+    const name = () => document.getElementById("name").value;
+    const signer = createSignerClient("./signer-worker.js");
+    log("worker spawning…");
+
+    const guard = (fn) => async () => { try { await fn(); } catch (e) { log("ERR " + (e.message || e)); } };
+
+    document.getElementById("create").onclick = guard(async () => {
+      const p = await signer.createSigner({ method: "passphrase", name: name(), passphrase: pass() });
+      log("created profile = " + JSON.stringify(p));
+    });
+    document.getElementById("has").onclick = guard(async () => {
+      log("hasSigner = " + await signer.hasSigner());
+    });
+    document.getElementById("unlock").onclick = guard(async () => {
+      const p = await signer.unlock({ method: "passphrase", passphrase: pass() });
+      log("unlocked profile = " + JSON.stringify(p));
+    });
+    document.getElementById("lock").onclick = guard(async () => {
+      await signer.lock();
+      log("locked");
+    });
   </script>
 </body>

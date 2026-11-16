@@ -55,7 +55,77 @@ export interface SignerModule {
   request<T = unknown>(path: string, body?: unknown): Promise<T>;
 }
 
-// ─── mock implementation ─────────────────────────────────────────────────────
+// ─── real wasm signer (browser Worker) ───────────────────────────────────────
+//
+// W1F's wasm module runs the FROST core in a Web Worker and seals the device identity to
+// OPFS (loki-signer-wasm/signer-worker.js). This client bridges the lifecycle half of
+// `SignerModule` to it over postMessage; `request()` stays `SignerPending` (DKG/payment are
+// Phase B/C). It activates only when the integrator serves the built pkg + worker and points
+// `window.__LOKI_SIGNER_WORKER_URL` at it — so SSR, Node tests and the un-provisioned app all
+// keep the in-memory mock below (OPFS cannot run there anyway) with no behaviour change.
+
+function workerUrl(): string | null {
+  if (typeof window === "undefined" || typeof Worker === "undefined") return null;
+  const u = (window as unknown as { __LOKI_SIGNER_WORKER_URL?: string }).__LOKI_SIGNER_WORKER_URL;
+  return typeof u === "string" && u.length > 0 ? u : null;
+}
+
+function browserSigner(url: string): SignerModule {
+  const worker = new Worker(url, { type: "module" });
+  const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+  let seq = 0;
+  const loaded = new Promise<void>((resolve) => {
+    const onload = (e: MessageEvent) => {
+      if (e.data?.cmd === "loaded") { worker.removeEventListener("message", onload); resolve(); }
+    };
+    worker.addEventListener("message", onload);
+  });
+  worker.addEventListener("message", (e: MessageEvent) => {
+    const { id, ok, result, error } = e.data ?? {};
+    const p = pending.get(id);
+    if (!p) return;
+    pending.delete(id);
+    ok ? p.resolve(result) : p.reject(new ApiError(error ?? "signer error", 500));
+  });
+  async function call<T>(msg: Record<string, unknown>): Promise<T> {
+    await loaded;
+    const id = ++seq;
+    return new Promise<T>((resolve, reject) => {
+      pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
+      worker.postMessage({ id, ...msg });
+    });
+  }
+  // The onboarding UX needs `status` to reach Home; the worker holds the identity, so mirror
+  // the current profile/method here to answer status without a round-trip.
+  let current: { profile: { id: string; name: string }; se: string } | null = null;
+  return {
+    hasSigner: () => call<boolean>({ op: "has" }),
+    async createSigner({ name, method, passphrase }) {
+      if (method === "passphrase" && !passphrase) throw new ApiError("Choose a passphrase to protect your share", 400);
+      const profile = await call<{ id: string; name: string }>({ op: "create", method, name, passphrase });
+      current = { profile, se: method === "passphrase" ? "software" : "passkey" };
+      return { profile };
+    },
+    async unlock({ method, passphrase }) {
+      if (method === "passphrase" && !passphrase) throw new ApiError("Enter your passphrase", 400);
+      const profile = await call<{ id: string; name: string }>({ op: "unlock", method, passphrase });
+      current = { profile, se: method === "passphrase" ? "software" : "passkey" };
+      return { profile };
+    },
+    async lock() { await call({ op: "lock" }); current = null; },
+    async request<T>(path: string): Promise<T> {
+      if (path === "status") {
+        if (!current) throw new ApiError("Unlock your signer", 401);
+        return { phase: "home", network: "testnet", secure_element: current.se, profile: current.profile, vaults: [] } as T;
+      }
+      if (path === "lock") { await this.lock(); return {} as T; }
+      if (!current) throw new ApiError("Unlock your signer", 401);
+      throw new SignerPending(path);
+    },
+  };
+}
+
+// ─── mock implementation (SSR / Node tests / un-provisioned app) ──────────────
 
 const SESSION = "loki_signer_session"; // sessionStorage: the unlocked session
 const SEALED = "loki_signer_sealed";   // localStorage: a share exists in this browser
@@ -72,7 +142,7 @@ function open(name: string, method: CustodyMethod): SignerSession {
   return { profile: s.profile };
 }
 
-export const signer: SignerModule = {
+const mockSigner: SignerModule = {
   async hasSigner() {
     try { return typeof window !== "undefined" && localStorage.getItem(SEALED) !== null; }
     catch { return false; }
@@ -103,4 +173,24 @@ export const signer: SignerModule = {
     if (!s) throw new ApiError("Unlock your signer", 401);
     throw new SignerPending(path);
   },
+};
+
+// ─── dispatcher ──────────────────────────────────────────────────────────────
+// The real Worker-backed signer when provisioned (browser + worker URL), the mock
+// otherwise. Chosen per call so SSR→client hydration and test env never bind the wrong one.
+
+let browser: SignerModule | null = null;
+function impl(): SignerModule {
+  const url = workerUrl();
+  if (!url) return mockSigner;
+  if (!browser) browser = browserSigner(url);
+  return browser;
+}
+
+export const signer: SignerModule = {
+  hasSigner: () => impl().hasSigner(),
+  createSigner: (opts) => impl().createSigner(opts),
+  unlock: (opts) => impl().unlock(opts),
+  lock: () => impl().lock(),
+  request<T = unknown>(path: string, body?: unknown): Promise<T> { return impl().request<T>(path, body); },
 };
