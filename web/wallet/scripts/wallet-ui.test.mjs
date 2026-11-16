@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { invitePreview, paymentLabel, rememberedVaultSlot, rememberVaultSlot } from "../src/lib/wallet-ui.ts";
+import { invitePreview, paymentLabel, rememberedVaultSlot, rememberVaultSlot, verifyPhrase } from "../src/lib/wallet-ui.ts";
 
 const invite = { vault: "a".repeat(64), name: "Friends’ vault", members: 3, threshold: 2, slot: 2 };
 const encode = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
@@ -22,6 +22,18 @@ test("pending payments never look sent and internal phase names stay hidden", ()
   assert.equal(paymentLabel("not_selected", false, false), "Other members are signing");
   assert.equal(paymentLabel("expired", true, true), "Expired");
   assert.equal(paymentLabel("unknown_internal_phase", false, false), "Status unavailable");
+});
+
+test("verify phrase is deterministic, word+emoji, and rejects non-hex", () => {
+  const fp = "a".repeat(64);
+  const p = verifyPhrase(fp);
+  assert.deepEqual(p, verifyPhrase(fp.toUpperCase())); // case-insensitive, deterministic
+  assert.equal(p.words.length, 5);
+  assert.equal(p.emoji.length, 4);
+  assert.ok(p.words.every((w) => typeof w === "string" && w.length));
+  // a flipped byte changes the rendering (so a swapped roster shows differently)
+  assert.notDeepEqual(p, verifyPhrase("b" + "a".repeat(63)));
+  for (const bad of [undefined, "", "xyz", "abc", "zz"]) assert.equal(verifyPhrase(bad), null);
 });
 
 test("remembered vault slots are scoped to the authenticated profile and vault", () => {
