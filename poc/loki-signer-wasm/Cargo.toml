@@ -1,0 +1,19 @@
+# wasm-bindgen bindings for the in-browser signer. A poc workspace member (like
+# wasm-spike, and excluded from default-members) so it inherits poc's Cargo.lock and
+# [patch] vendored deps; native `cargo build`/`test` from poc never build it. Build:
+# RUSTFLAGS='--cfg getrandom_backend="wasm_js"' wasm-pack build --dev --target web
+[package]
+name = "loki-signer-wasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+loki-signer-core = { path = "../loki-signer-core" }
+wasm-bindgen = "0.2"
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
