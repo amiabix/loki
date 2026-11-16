@@ -55,7 +55,6 @@ pub fn router(state: Shared) -> Router {
         .route("/api/balance", post(payment::balance))
         .route("/api/payment-draft", post(payment::draft))
         .route("/api/payment-publish", post(payment::publish))
-        .route("/api/payment-session", post(payment::session))
         .route("/api/payment-review", post(payment::review))
         .route("/api/payment-approve", post(payment::approve))
         .route("/api/payment-finish", post(payment::finish))
@@ -116,7 +115,7 @@ async fn registration(State(st): State<Shared>) -> Reply {
 async fn auth(State(st): State<Shared>, req: Request, next: Next) -> Result<Response, Response> {
     if matches!(
         req.uri().path(),
-        "/api/enroll" | "/api/agreed" | "/api/roster" | "/api/session" | "/api/payment-session"
+        "/api/enroll" | "/api/agreed" | "/api/roster" | "/api/session"
     ) {
         return Ok(next.run(req).await);
     }

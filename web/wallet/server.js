@@ -15,7 +15,12 @@ const port = parseInt(process.env.PORT || "3001", 10);
 // localhost:3000 — which breaks member self-registration (the device signs over the
 // coordinator origin it was given). Behind a TLS proxy, set HOSTNAME to the public host.
 const hostname = process.env.HOSTNAME || "localhost";
-const app = next({ dev: false, hostname, port });
+// Next builds request origins (used to verify self-registration signatures) from this port.
+// Behind a TLS proxy/tunnel the listen port is loopback-only; the public origin is https on
+// 443, which URL.origin omits. Set PUBLIC_PORT=443 so the derived origin is https://HOSTNAME
+// with no port, matching what members sign over. Defaults to the listen port (direct/loopback).
+const publicPort = parseInt(process.env.PUBLIC_PORT || String(port), 10);
+const app = next({ dev: false, hostname, port: publicPort });
 const handle = app.getRequestHandler();
 
 const cacheFor = (url) =>

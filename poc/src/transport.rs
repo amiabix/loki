@@ -106,6 +106,8 @@ pub enum Outbound {
     Package(frost::SigningPackage),
     RandomizerSeed([u8; 32]),
     Share(frost::round2::SignatureShare),
+    /// A hosted member's sealed payment-session request or reply, relayed for discovery.
+    Peer(SealedPeer),
 }
 
 impl Outbound {
@@ -119,7 +121,28 @@ impl Outbound {
             Self::Package(package) => package.serialize().map_err(encoding),
             Self::RandomizerSeed(seed) => Ok(seed.to_vec()),
             Self::Share(share) => Ok(share.serialize()),
+            Self::Peer(sealed) => Ok(sealed.0.clone()),
         }
+    }
+}
+
+/// One member's payment-session request or reply, sealed to another member with the same
+/// roster identity and [`SessionContext`] the HTTP path used. The relay carries only the
+/// ciphertext; the recipient opens it with [`Identity::open_session`].
+pub struct SealedPeer(Vec<u8>);
+
+impl SealedPeer {
+    pub fn seal(
+        own: &Identity,
+        recipient: &PublicIdentity,
+        context: &SessionContext,
+        kind: MessageKind,
+        body: &[u8],
+    ) -> Result<Self, String> {
+        if !matches!(kind, MessageKind::PeerRequest | MessageKind::PeerReply) {
+            return Err("sealed peer message must be a peer request or reply".into());
+        }
+        own.seal_session(recipient, context, kind, body).map(Self)
     }
 }
 
@@ -277,6 +300,14 @@ struct LoginOut {
 struct CreateOut {
     session_id: Uuid,
 }
+#[derive(Deserialize)]
+struct ListSessionsOut {
+    session_ids: Vec<Uuid>,
+}
+#[derive(Deserialize)]
+struct SessionInfoOut {
+    pubkeys: Vec<HexKey>,
+}
 #[derive(Serialize, Deserialize)]
 struct WireMsg {
     sender: HexKey,
@@ -390,6 +421,37 @@ impl FrostdTransport {
         })?;
         self.token = Some(token);
         Ok(())
+    }
+
+    /// Every session id this logged-in member is a participant or coordinator of. A member
+    /// behind NAT uses this to find the signing session a proposer enlisted it in without
+    /// any inbound reachability (the relay keys sessions by participant pubkey).
+    pub fn list_sessions(&self) -> Result<Vec<Uuid>, TransportError> {
+        let out: ListSessionsOut = self.runtime.block_on(Self::post(
+            &self.client,
+            format!("{}/list_sessions", self.base_url),
+            self.token,
+            json!({}),
+        ))?;
+        Ok(out.session_ids)
+    }
+
+    /// The participant pubkeys of one session, so a member can tell a payment quorum from
+    /// an unrelated session before it drains the mailbox.
+    pub fn session_info(&self, session: Uuid) -> Result<Vec<[u8; 32]>, TransportError> {
+        let out: SessionInfoOut = self.runtime.block_on(Self::post(
+            &self.client,
+            format!("{}/get_session_info", self.base_url),
+            self.token,
+            json!({ "session_id": session }),
+        ))?;
+        out.pubkeys
+            .into_iter()
+            .map(|k| {
+                k.0.try_into()
+                    .map_err(|_| TransportError::Decode("session pubkey length".into()))
+            })
+            .collect()
     }
 }
 

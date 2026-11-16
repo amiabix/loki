@@ -16,7 +16,7 @@ import {
   recoveryStatus,
   type PendingApproval,
 } from "@/lib/api";
-import { invitePreview, paymentLabel, rememberedVaultSlot, rememberVaultSlot } from "@/lib/wallet-ui";
+import { invitePreview, paymentLabel, rememberedVaultSlot, rememberVaultSlot, verifyPhrase } from "@/lib/wallet-ui";
 import { toggleTheme, useIsDark } from "@/lib/theme";
 import { useCeremonyStatus, usePayments, useStatus } from "@/lib/hooks";
 import type {
@@ -1033,6 +1033,10 @@ function CompareRoster({
 }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // Explicit out-of-band gate: the member must affirm they compared the code on a side channel
+  // before "Confirm" is enabled, so the check can't degrade into trusting the shown value.
+  const [checked, setChecked] = useState(false);
+  const phrase = verifyPhrase(fingerprint);
 
   // The host reports only a confirmation count, not per-member state, so the viewer's own
   // confirmation is tracked locally (survives status polls and reloads within this browser).
@@ -1057,14 +1061,17 @@ function CompareRoster({
   return (
     <div>
       <p className="text-sm text-muted mb-4">
-        Security check: make sure the code below is <span className="text-foreground">identical</span>{" "}
-        for everyone (read it out on a call). Matching codes prove you&apos;re all in the same vault and
-        no one was swapped in. Confirm once it matches.
+        Security check: on a call or in person, make sure this code is{" "}
+        <span className="text-foreground">identical</span> for every member. Read the words aloud and
+        match the emoji. Matching codes prove you&apos;re all in the same vault and no one was swapped
+        in — don&apos;t trust the code on this screen alone.
       </p>
-      {fingerprint && (
+      {phrase && (
         <GlassCard className="mb-4 text-center">
           <h3 className="eyebrow mb-2">Compare this code</h3>
-          <p className="font-mono text-lg break-all text-amber">{fingerprint}</p>
+          <p className="text-2xl mb-2" aria-label={`emoji ${phrase.emoji.join(" ")}`}>{phrase.emoji.join(" ")}</p>
+          <p className="font-mono text-lg font-semibold tracking-wide text-amber break-words">{phrase.words.join(" · ")}</p>
+          <p className="mt-3 font-mono text-xs break-all text-muted">{fingerprint}</p>
         </GlassCard>
       )}
       {creator && (
@@ -1074,9 +1081,16 @@ function CompareRoster({
         </p>
       )}
       {!confirmedHere && !allConfirmed && (
-        <Btn variant="amber" onClick={agree} disabled={busy || !fingerprint}>
-          {busy ? "Confirming…" : "Confirm members"}
-        </Btn>
+        <>
+          <label className="glass mb-3 flex items-start gap-3 rounded-2xl p-4 text-left text-sm text-foreground cursor-pointer">
+            <input type="checkbox" className="mt-0.5 h-4 w-4 shrink-0 accent-amber" checked={checked}
+              onChange={(e) => setChecked(e.target.checked)} />
+            <span>I compared this code with the other members out of band and it matches.</span>
+          </label>
+          <Btn variant="amber" onClick={agree} disabled={busy || !fingerprint || !checked}>
+            {busy ? "Confirming…" : "Confirm members"}
+          </Btn>
+        </>
       )}
       {(confirmedHere || allConfirmed) && (
         <p role="status" className="glass rounded-2xl p-4 text-center text-sm text-mint">{allConfirmed ? "All members confirmed — advancing…" : "You confirmed — waiting for others."}</p>
