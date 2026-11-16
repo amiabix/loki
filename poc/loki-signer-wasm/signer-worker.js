@@ -206,6 +206,21 @@ async function drivePayment(signer, p) {
   const { vaultHex, attemptHex, proposerSigning, proposerEnc, proposerId, signers, coordinatorPeer } = p;
   const fc = await reopenVault(signer, p);
 
+  // Record this member's approval on the CONTROL session so the proposer proceeds: payment
+  // signing uses two frostd sessions — the signing session (commitments/package/shares, above)
+  // AND the control session, where the proposer records each signer's approval (payment.rs
+  // sync_control). Mirror the native non-proposer (send_control): a sealed {kind:"approval"}
+  // PeerReply addressed to the proposer (its frostd pubkey = roster encryption). Durable at
+  // frostd, so a single send is enough.
+  const approval = JSON.stringify({ kind: "approval", hash: p.intentHash, intent: p.intent, txid: null });
+  const sealed = signer.signControlApproval(proposerSigning, proposerEnc, proposerId, p.slot, p.controlHash, approval);
+  const login = JSON.parse(signer.frostdLogin());
+  const Client = await loadFrostd(p.transportUrl);
+  const control = new Client(p.frostdUrl, login.secret, login.pubkey);
+  await control.login();
+  control.useSession(p.controlSessionId);
+  await control.sendToPeer(proposerEnc, sealed);
+
   // Pre-open this attempt's crash-safe nonce files (name = payment_id ++ attempt_id hex; the
   // native host sets both to the attempt), so the synchronous commit/sign can persist.
   const nonceId = attemptHex + attemptHex;

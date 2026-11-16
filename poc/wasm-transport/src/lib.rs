@@ -347,6 +347,14 @@ mod wasm_api {
             self.inner.send(self.session()?, &[], &msg).await.map_err(je)
         }
 
+        /// Send one message (hex) to a single peer (hex pubkey) on the bound session — the
+        /// explicit-recipient path the native host uses for control messages (`&[Peer(..)]`).
+        #[wasm_bindgen(js_name = sendToPeer)]
+        pub async fn send_to_peer(&self, peer_hex: &str, msg_hex: &str) -> Result<(), JsError> {
+            let msg = hex::decode(msg_hex).map_err(je)?;
+            self.inner.send(self.session()?, &[hex32(peer_hex)?], &msg).await.map_err(je)
+        }
+
         /// Drain this member's inbox; returns a JSON array of `{from, message}` (both hex).
         /// The Worker keeps only messages whose `from` is the coordinator peer.
         pub async fn recv(&self) -> Result<String, JsError> {

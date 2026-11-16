@@ -27,7 +27,7 @@ use loki_signer_core::signer::{
 };
 use loki_signer_core::signer::wysiwys::{describe_pczt, sighash_of_pczt};
 use loki_signer_core::signer::DkgInput;
-use loki_signer_core::signing_session::{AttemptId, SessionContext};
+use loki_signer_core::signing_session::{AttemptId, MessageKind, SessionContext};
 use loki_signer_core::frost;
 use std::time::Duration;
 use wasm_bindgen::prelude::*;
@@ -461,6 +461,32 @@ impl Signer {
         .map_err(|e| JsError::new(&e))
     }
 
+    /// Seal this member's payment-control message to the proposer (a `{kind:"approval"}` body)
+    /// as a `PeerReply`, for the browser to send on the control session. The proposer records
+    /// the approval from it (`sync_control`). `control_hash_hex` is the control session's
+    /// envelope attempt binding (from `/api/payment-session`); `proposer_*` is the proposer's
+    /// roster identity; `my_slot` this member's roster slot. Returns the sealed wire (hex).
+    #[wasm_bindgen(js_name = signControlApproval)]
+    pub fn sign_control_approval(
+        &self,
+        proposer_signing_hex: &str,
+        proposer_enc_hex: &str,
+        proposer_id: u16,
+        my_slot: u16,
+        control_hash_hex: &str,
+        body_json: &str,
+    ) -> Result<String, JsError> {
+        self.sign_control_approval_impl(
+            proposer_signing_hex,
+            proposer_enc_hex,
+            proposer_id,
+            my_slot,
+            control_hash_hex,
+            body_json,
+        )
+        .map_err(|e| JsError::new(&e))
+    }
+
     /// Round 2: the PUBLIC signature share for `attempt_hex` (hex). INDEPENDENTLY re-renders
     /// the candidate, recomputes its sighash, and REFUSES unless `package_hex` commits to that
     /// exact sighash — before the nonce/share is touched (WYSIWYS). `candidate_hex` is the
@@ -643,6 +669,36 @@ impl Signer {
             .open_candidate(&proposer, &context, &wire)
             .map_err(|e| e.to_string())?;
         Ok(hex::encode(bytes))
+    }
+
+    fn sign_control_approval_impl(
+        &self,
+        proposer_signing_hex: &str,
+        proposer_enc_hex: &str,
+        proposer_id: u16,
+        my_slot: u16,
+        control_hash_hex: &str,
+        body_json: &str,
+    ) -> Result<String, String> {
+        let identity = self.identity.as_ref().ok_or("unlock the signer first")?;
+        let vs = self.vault.as_ref().ok_or("no active vault — call vaultJoin first")?;
+        let stamped = restamp(identity, my_slot)?;
+        let proposer = PublicIdentity {
+            id: proposer_id,
+            signing: hex32(proposer_signing_hex)?,
+            encryption: hex32(proposer_enc_hex)?,
+        };
+        let derived = hex32(control_hash_hex)?;
+        let mut signers = vec![my_slot, proposer_id];
+        signers.sort_unstable();
+        let context = SessionContext {
+            vault: vs.vref.vault_id,
+            payment: derived,
+            attempt: AttemptId(derived),
+            signers,
+        };
+        let sealed = stamped.seal_session(&proposer, &context, MessageKind::PeerReply, body_json.as_bytes())?;
+        Ok(hex::encode(sealed))
     }
 
     fn sign_approve_impl(

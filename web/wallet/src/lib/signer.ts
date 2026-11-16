@@ -40,6 +40,10 @@ export interface ApprovePaymentOpts { creatorBaseUrl: string; vault: string; att
 /** `/api/payment-session` on the proposer's host (poc/src/host/payment.rs::session). */
 interface PaymentSession {
   session_id: string;
+  control_session_id: string;
+  control_hash: string;
+  intent: unknown;
+  intent_hash: string;
   attempt: string;
   signers: number[];
   proposer: number;
@@ -290,6 +294,10 @@ function browserSigner(cfg: SignerConfig): SignerModule {
         proposerEnc: s.proposer_frostd_pubkey,
         proposerId: s.proposer,
         coordinatorPeer: s.coordinator_frostd_pubkey,
+        controlSessionId: s.control_session_id,
+        controlHash: s.control_hash,
+        intent: s.intent,
+        intentHash: s.intent_hash,
         frostdUrl: cfg.frostdUrl,
         transportUrl: cfg.transportUrl,
       };
