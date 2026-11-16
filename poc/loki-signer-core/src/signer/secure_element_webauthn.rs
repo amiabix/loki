@@ -40,16 +40,24 @@ impl WebAuthnSecureElement {
     /// same salt always yields the same secret, so a reloaded signer re-derives the same KEK
     /// and opens its sealed share.
     pub fn from_prf_secret(prf_secret: &[u8; 32]) -> Self {
-        // PRF output is already uniform HMAC material, so extract with no salt; expand pins the
-        // domain. A 32-byte OKM is always a valid HKDF-SHA256 length.
-        let hk = Hkdf::<Sha256>::new(None, prf_secret);
-        let mut kek = Zeroizing::new([0u8; 32]);
-        hk.expand(KEK_INFO, &mut *kek)
-            .expect("32 bytes is a valid HKDF-SHA256 output length");
         Self {
-            inner: SoftwareSecureElement::from_kek(*kek),
+            inner: SoftwareSecureElement::from_kek(prf_kek(prf_secret)),
         }
     }
+}
+
+/// The KEK bytes a WebAuthn PRF secret derives (HKDF-SHA256 over the fixed domain `info`).
+/// Exposed so the in-browser signer can seal its per-vault files under the identical custody
+/// KEK that wraps the device identity, without reconstructing a `SecureElement` it can't read
+/// the KEK back out of.
+pub fn prf_kek(prf_secret: &[u8; 32]) -> [u8; 32] {
+    // PRF output is already uniform HMAC material, so extract with no salt; expand pins the
+    // domain. A 32-byte OKM is always a valid HKDF-SHA256 length.
+    let hk = Hkdf::<Sha256>::new(None, prf_secret);
+    let mut kek = Zeroizing::new([0u8; 32]);
+    hk.expand(KEK_INFO, &mut *kek)
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    *kek
 }
 
 impl SecureElement for WebAuthnSecureElement {

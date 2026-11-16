@@ -113,14 +113,18 @@ function browserSigner(url: string): SignerModule {
       return { profile };
     },
     async lock() { await call({ op: "lock" }); current = null; },
-    async request<T>(path: string): Promise<T> {
+    async request<T>(path: string, body?: unknown): Promise<T> {
       if (path === "status") {
         if (!current) throw new ApiError("Unlock your signer", 401);
         return { phase: "home", network: "testnet", secure_element: current.se, profile: current.profile, vaults: [] } as T;
       }
       if (path === "lock") { await this.lock(); return {} as T; }
       if (!current) throw new ApiError("Unlock your signer", 401);
-      throw new SignerPending(path);
+      // Phase B: join-a-vault + DKG. The UI supplies the ceremony params (roster bytes, the
+      // coordinator's frostd session + relay peer, the TLS frostd URL); the Worker drives the
+      // synchronous DKG core over the frostd transport to an active vault + released address.
+      if (path === "dkg") return call<T>({ op: "dkg", dkg: body });
+      throw new SignerPending(path); // payment ops stay Phase C
     },
   };
 }

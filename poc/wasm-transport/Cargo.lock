@@ -584,6 +584,8 @@ dependencies = [
  "serde_json",
  "tokio",
  "uuid",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
  "x25519-dalek",
  "xeddsa",
  "zeroize",

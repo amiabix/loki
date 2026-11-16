@@ -277,6 +277,89 @@ impl WasmFrostdTransport {
     }
 }
 
+/// JS bindings (W1G): the signer Worker drives DKG by pumping these async methods between
+/// the synchronous wasm `Signer` and frostd. A thin wrapper over [`WasmFrostdTransport`] that
+/// holds the one session id the coordinator published, so the Worker passes only opaque hex.
+#[cfg(target_arch = "wasm32")]
+mod wasm_api {
+    use super::*;
+    use wasm_bindgen::prelude::*;
+
+    fn je<E: std::fmt::Display>(e: E) -> JsError {
+        JsError::new(&e.to_string())
+    }
+    fn hex32(s: &str) -> Result<[u8; 32], JsError> {
+        hex::decode(s)
+            .map_err(je)?
+            .try_into()
+            .map_err(|_| JsError::new("expected 32 bytes of hex"))
+    }
+
+    /// A logged-in browser frostd client bound to one DKG session. Addressed on the relay by
+    /// the member's X25519 login pubkey (the `encryption` key enrolled for its slot).
+    #[wasm_bindgen]
+    pub struct FrostdClient {
+        inner: WasmFrostdTransport,
+        session: Option<Uuid>,
+    }
+
+    #[wasm_bindgen]
+    impl FrostdClient {
+        /// `base_url` is the TLS frostd (https off loopback). `secret_hex`/`pubkey_hex` are the
+        /// member's X25519 login key, from the wasm signer's `frostdLogin()`.
+        #[wasm_bindgen(constructor)]
+        pub fn new(base_url: &str, secret_hex: &str, pubkey_hex: &str) -> Result<FrostdClient, JsError> {
+            let inner = WasmFrostdTransport::new(base_url, hex32(secret_hex)?, hex32(pubkey_hex)?).map_err(je)?;
+            Ok(Self { inner, session: None })
+        }
+
+        /// Challenge → XEdDSA-sign → login, caching the bearer token.
+        pub async fn login(&mut self) -> Result<(), JsError> {
+            self.inner.login().await.map_err(je)
+        }
+
+        /// Every session id this member participates in (NAT-free discovery), as hex strings.
+        pub async fn list_sessions(&self) -> Result<Vec<String>, JsError> {
+            Ok(self.inner.list_sessions().await.map_err(je)?.iter().map(Uuid::to_string).collect())
+        }
+
+        /// Bind the coordinator's published session id; send/recv address it.
+        #[wasm_bindgen(js_name = useSession)]
+        pub fn use_session(&mut self, session_id: &str) -> Result<(), JsError> {
+            self.session = Some(Uuid::parse_str(session_id).map_err(je)?);
+            Ok(())
+        }
+
+        fn session(&self) -> Result<Uuid, JsError> {
+            self.session.ok_or_else(|| JsError::new("no session bound — call useSession first"))
+        }
+
+        /// The participant pubkeys of the bound session (hex), for sanity-checking the roster.
+        #[wasm_bindgen(js_name = sessionInfo)]
+        pub async fn session_info(&self) -> Result<Vec<String>, JsError> {
+            Ok(self.inner.session_info(self.session()?).await.map_err(je)?.iter().map(hex::encode).collect())
+        }
+
+        /// Send one DKG wire (hex) to the coordinator (frostd empty-recipient convention).
+        #[wasm_bindgen(js_name = sendToCoordinator)]
+        pub async fn send_to_coordinator(&self, msg_hex: &str) -> Result<(), JsError> {
+            let msg = hex::decode(msg_hex).map_err(je)?;
+            self.inner.send(self.session()?, &[], &msg).await.map_err(je)
+        }
+
+        /// Drain this member's inbox; returns a JSON array of `{from, message}` (both hex).
+        /// The Worker keeps only messages whose `from` is the coordinator peer.
+        pub async fn recv(&self) -> Result<String, JsError> {
+            let msgs = self.inner.recv(self.session()?, false).await.map_err(je)?;
+            let out: Vec<serde_json::Value> = msgs
+                .into_iter()
+                .map(|m| serde_json::json!({ "from": hex::encode(m.from), "message": hex::encode(m.message) }))
+                .collect();
+            Ok(serde_json::Value::Array(out).to_string())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

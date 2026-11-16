@@ -48,6 +48,10 @@ export function createSignerClient(workerUrl = "./signer-worker.js") {
     unlock: ({ method, passphrase, prfSecret }) =>
       call({ op: "unlock", method, passphrase, prfSecret }),
     lock: () => call({ op: "lock" }),
+    // Phase B: drive this member through join-a-vault + DKG to active. `dkg` carries the
+    // ceremony params (vaultHex, slot, label, network, rosterHex, frostdUrl, coordinatorPeer,
+    // sessionId, transportUrl); resolves to { vault, address }.
+    dkg: (params) => call({ op: "dkg", dkg: params }),
     terminate: () => worker.terminate(),
   };
 }

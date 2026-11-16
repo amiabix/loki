@@ -9,6 +9,11 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+# cdylib for the wasm-pack output the signer Worker imports (FrostdClient JS bindings);
+# rlib so the native round-trip test still links.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 # Own workspace root: detached from poc/ and the communication workspace so a bare
 # `cargo build --target wasm32-unknown-unknown` here resolves only these deps.
 [workspace]
@@ -27,10 +32,14 @@ zeroize = "1"
 xeddsa = "1"
 # RNG for the XEdDSA signature nonce. rand 0.10 == poc's `rand_zp`.
 rand = "0.10"
+# JS bindings so the signer Worker can drive these async methods directly (W1G). Native
+# builds never link these in (the wasm_api module is cfg(target_arch = "wasm32")).
+wasm-bindgen = "0.2"
 
 # getrandom (via rand 0.10 → rand_core 0.10) needs the browser entropy backend on wasm.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.4", features = ["wasm_js"] }
+wasm-bindgen-futures = "0.4"
 
 [dev-dependencies]
 # Native-only: drive the async methods in the round-trip test against a live frostd,
