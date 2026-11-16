@@ -1,5 +1,7 @@
 "use client";
 
+import { createWebAuthnCredential, getPrfSecret } from "./webauthn";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // MOCK WASM signer — the seam for Agent W1's wasm-bindgen output.
 //
@@ -124,6 +126,12 @@ async function deviceKeypair(): Promise<CryptoKeyPair> {
 function toHex(bytes: Uint8Array): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
+function fromHex(hex: string): Uint8Array {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+const PASSKEY_CRED = "loki_passkey_cred"; // localStorage: the passkey credential id (hex) for unlock
 async function postJson<T>(url: string, body: unknown): Promise<T> {
   const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   const data = await res.json().catch(() => ({}));
@@ -163,14 +171,28 @@ function browserSigner(cfg: SignerConfig): SignerModule {
     hasSigner: () => call<boolean>({ op: "has" }),
     async createSigner({ name, method, passphrase }) {
       if (method === "passphrase" && !passphrase) throw new ApiError("Choose a passphrase to protect your share", 400);
-      const profile = await call<{ id: string; name: string }>({ op: "create", method, name, passphrase });
+      let prfSecret: Uint8Array | undefined;
+      if (method !== "passphrase") {
+        const { credentialId, prfSupported } = await createWebAuthnCredential(name || "You", method === "platform" ? "platform" : "cross-platform");
+        if (!prfSupported) throw new ApiError("This device's authenticator has no PRF support — use a passphrase instead", 400);
+        prfSecret = await getPrfSecret(credentialId);
+        try { localStorage.setItem(PASSKEY_CRED, toHex(credentialId)); } catch {}
+      }
+      const profile = await call<{ id: string; name: string }>({ op: "create", method, name, passphrase, prfSecret });
       current = { profile, se: method === "passphrase" ? "software" : "passkey" };
       try { localStorage.setItem(SEALED, "1"); } catch {} // sync hint so Login paints Unlock without a flicker
       return { profile };
     },
     async unlock({ method, passphrase }) {
       if (method === "passphrase" && !passphrase) throw new ApiError("Enter your passphrase", 400);
-      const profile = await call<{ id: string; name: string }>({ op: "unlock", method, passphrase });
+      let prfSecret: Uint8Array | undefined;
+      if (method !== "passphrase") {
+        let credHex: string | null = null;
+        try { credHex = localStorage.getItem(PASSKEY_CRED); } catch {}
+        if (!credHex) throw new ApiError("No passkey registered on this device — create your signer first", 400);
+        prfSecret = await getPrfSecret(fromHex(credHex));
+      }
+      const profile = await call<{ id: string; name: string }>({ op: "unlock", method, passphrase, prfSecret });
       current = { profile, se: method === "passphrase" ? "software" : "passkey" };
       return { profile };
     },
