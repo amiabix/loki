@@ -1,37 +1,23 @@
 "use client";
 
-/** A paired tab calls its member device directly. No member capability goes to Next. */
-export class ApiError extends Error {
-  status: number;
-  constructor(message: string, status: number) { super(message); this.status = status; }
-}
+// Member calls now run in the in-browser wasm signer (src/lib/signer.ts), not
+// over HTTP to a local member. Only coordinator calls (/api/members, /api/fund)
+// still hit the network.
+// Explicit .ts extension so Node's test loader resolves the chained import.
+import { signer, ApiError, type CreateSignerOpts, type SignerSession, type UnlockOpts } from "./signer.ts";
+export { ApiError };
+export type { CustodyMethod, CreateSignerOpts, UnlockOpts } from "./signer";
 export type Slot = { slot: number; signing_pubkey: string; relay_pubkey: string; advertise_url: string };
-type Pairing = { endpoint: string; capability: string };
-const PAIRING = "loki_device_session";
-function paired(): Pairing | null {
-  if (typeof window === "undefined") return null;
-  const raw = sessionStorage.getItem(PAIRING);
-  return raw ? JSON.parse(raw) as Pairing : null;
-}
 
+/** A member request, dispatched into the in-browser signer instead of fetched. */
 export async function api<T = unknown>(path: string, body?: unknown): Promise<T> {
-  const session = paired();
-  if (!session) throw new ApiError("Pair your local member device", 401);
-  if (!/^[a-z][a-z0-9-]*(\?[^#]*)?$/.test(path)) throw new Error("invalid device API path");
-  const headers: Record<string, string> = { "X-Loki-Token": session.capability };
-  if (body !== undefined) headers["Content-Type"] = "application/json";
-  const res = await fetch(`${session.endpoint}/api/${path}`, {
-    method: body === undefined ? "GET" : "POST", headers,
-    body: body === undefined ? undefined : JSON.stringify(body),
-    credentials: "omit", redirect: "error", cache: "no-store",
-  });
-  const text = await res.text();
-  const data = text ? JSON.parse(text) : {};
-  if (!res.ok) {
-    if (res.status === 401) window.dispatchEvent(new Event("loki:auth-lost"));
-    throw new ApiError(data.error ?? `${path} failed (${res.status})`, res.status);
+  if (!/^[a-z][a-z0-9-]*(\?[^#]*)?$/.test(path)) throw new Error("invalid signer API path");
+  try {
+    return await signer.request<T>(path, body);
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 401 && typeof window !== "undefined") window.dispatchEvent(new Event("loki:auth-lost"));
+    throw e;
   }
-  return data as T;
 }
 
 export async function listSlots(): Promise<Slot[]> {
@@ -40,35 +26,29 @@ export async function listSlots(): Promise<Slot[]> {
   return (await res.json()).slots as Slot[];
 }
 
-/** shortcut: explicit loopback pairing for S4a; replace with native pairing in S4b. */
-export async function pairDevice(link: string): Promise<Slot> {
-  const url = new URL(link.trim());
-  if (url.protocol !== "http:" || !["127.0.0.1", "[::1]"].includes(url.hostname)
-    || !url.port || Number(url.port) < 1024 || url.pathname !== "/" || url.search || url.username || url.password
-    || !/^#[A-Za-z0-9_-]{43}$/.test(url.hash)) throw new Error("Paste the local pairing link printed by your member process");
-  const previous = sessionStorage.getItem(PAIRING);
-  sessionStorage.setItem(PAIRING, JSON.stringify({ endpoint: url.origin, capability: url.hash.slice(1) }));
-  try {
-    const member = await api<Slot>("registration");
-    const roster = await listSlots();
-    // The manually selected loopback session and the public peer endpoint serve different callers.
-    if (!roster.some((m) => m.slot === member.slot && m.signing_pubkey === member.signing_pubkey && m.relay_pubkey === member.relay_pubkey && m.advertise_url === member.advertise_url)) throw new Error("Device identity does not match the public roster; register the device first");
-    const status = await api<{ phase: string }>("status");
-    if (status.phase !== "home") throw new Error("Unlock the profile locally on your device, then pair again");
-    return member;
-  } catch (error) {
-    if (previous) sessionStorage.setItem(PAIRING, previous); else sessionStorage.removeItem(PAIRING);
-    throw error;
-  }
+/** True once a share is sealed in this browser → Unlock rather than Create. */
+export function hasSigner(): Promise<boolean> { return signer.hasSigner(); }
+
+function rememberMe(s: SignerSession): void {
+  try { sessionStorage.setItem("loki_me", JSON.stringify({ slot: s.slot })); } catch {}
 }
-export function forgetPairing(): void {
-  sessionStorage.removeItem(PAIRING);
-  sessionStorage.removeItem("loki_me");
+export async function createSigner(opts: CreateSignerOpts): Promise<SignerSession> {
+  const s = await signer.createSigner(opts);
+  rememberMe(s);
+  return s;
+}
+export async function unlock(opts: UnlockOpts): Promise<SignerSession> {
+  const s = await signer.unlock(opts);
+  rememberMe(s);
+  return s;
+}
+export function forgetSession(): void {
+  try { sessionStorage.removeItem("loki_me"); } catch {}
 }
 export async function logout(): Promise<boolean> {
-  try { if (paired()) await api("lock", {}); return true; }
+  try { await signer.lock(); return true; }
   catch { return false; }
-  finally { forgetPairing(); }
+  finally { forgetSession(); }
 }
 
 /** Development faucet accepts only a public regtest address. */
