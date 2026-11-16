@@ -41,7 +41,7 @@ use crate::{
         PublicPaymentParams, Signer,
     },
     state::MemberDir,
-    transport::{FrostdLoginKey, FrostdTransport, Peer, Transport},
+    transport::{FrostdLoginKey, FrostdTransport, Outbound, Peer, SealedPeer, Transport},
     tx_finalize::prove,
     vault,
     verify::{check_candidate, Expectations, Refusal},
@@ -369,7 +369,6 @@ fn public_intent(p: &Payment) -> Value {
     json!({"attempt":p.attempt,"vault":p.vault,"proposer":p.proposer,"recipient":p.recipient,"amount_zat":p.amount_zat,"memo":p.memo,"fee_zat":p.fee_zat,"change_zat":p.change_zat,"note_selection":p.note_selection,"target_height":p.target_height,"expiry_height":p.expiry_height,"signers":p.signers,"phase":p.phase,"session_id":p.session_id})
 }
 const UNAVAILABLE: &str = "payment session unavailable";
-const PEER_REQUEST: &[u8] = b"loki payment-session v1";
 
 /// The sealed-envelope context between two members about one payment attempt.
 fn peer_context(vault: &str, attempt: &str, a: u16, b: u16) -> Result<SessionContext, String> {
@@ -381,78 +380,107 @@ fn peer_context(vault: &str, attempt: &str, a: u16, b: u16) -> Result<SessionCon
     })
 }
 
-/// Ask member `slot`'s host for its view of a payment. The request is signed and sealed
-/// with this member's roster identity, and the reply must open under `slot`'s.
-fn peer_get(url: &str, v: &Vault, vault: &str, attempt: &str, slot: u16) -> Result<Value, String> {
+/// This member's view of a payment, sealed to signer `slot` with the same roster identity
+/// and context the HTTP path used. Carried over frostd for discovery, opened under `slot`'s.
+fn seal_intent(v: &Vault, p: &Payment, slot: u16) -> Result<SealedPeer, String> {
     let peer = v.peers.get(&slot).ok_or("unknown peer")?;
-    let context = peer_context(vault, attempt, v.slot, slot)?;
-    let request = v.identity.seal_session(peer, &context, MessageKind::PeerRequest, PEER_REQUEST)?;
-    let rt = runtime()?;
-    let response: Value = rt.block_on(async {
-        let response = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|e| e.to_string())?
-            .post(format!("{url}/api/payment-session"))
-            .json(&json!({"vault":vault,"attempt":attempt,"from":v.slot,"request":hex::encode(request)}))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        if !response.status().is_success() {
-            return Err(UNAVAILABLE.to_string());
-        }
-        response.json().await.map_err(|e| e.to_string())
-    })?;
-    let reply = hex::decode(response["reply"].as_str().ok_or(UNAVAILABLE)?).map_err(|e| e.to_string())?;
-    let opened = v.identity.open_session(peer, &context, &reply)?;
-    if opened.kind != MessageKind::PeerReply {
-        return Err(UNAVAILABLE.into());
-    }
-    serde_json::from_slice(&opened.body).map_err(|e| e.to_string())
+    let context = peer_context(&p.vault, &p.attempt, v.slot, slot)?;
+    let body = serde_json::to_vec(
+        &json!({"session_id":p.session_id,"intent":public_intent(p),"approval_started":p.approval_started}),
+    )
+    .map_err(|e| e.to_string())?;
+    SealedPeer::seal(&v.identity, peer, &context, MessageKind::PeerReply, &body)
 }
 
-/// Answer a selected signer's sealed `/api/payment-session` request with this member's view
-/// of the payment, sealed back to it. Anyone else gets the same refusal whether or not the
-/// payment exists.
-fn answer_peer(data: &Path, pass: &str, v: &Vault, body: &Value) -> Result<Value, String> {
-    let (vault, attempt) = pair(body).map_err(|_| UNAVAILABLE)?;
-    let (vault, attempt) = (vault.as_str(), attempt.as_str());
-    let from = body["from"].as_u64().and_then(|n| u16::try_from(n).ok()).ok_or(UNAVAILABLE)?;
-    let request = hex::decode(body["request"].as_str().ok_or(UNAVAILABLE)?).map_err(|_| UNAVAILABLE)?;
-    let peer = v.peers.get(&from).filter(|_| from != v.slot).ok_or(UNAVAILABLE)?;
-    let p = read_payment(data, pass, vault, attempt).map_err(|_| UNAVAILABLE)?;
-    let id = p.session_id.filter(|_| p.signers.contains(&from)).ok_or(UNAVAILABLE)?;
-    let context = peer_context(vault, attempt, v.slot, from)?;
-    let opened = v.identity.open_session(peer, &context, &request).map_err(|_| UNAVAILABLE)?;
-    if opened.kind != MessageKind::PeerRequest || opened.body != PEER_REQUEST {
-        return Err(UNAVAILABLE.into());
+/// The proposer pushes its sealed payment view to every other selected signer on the fresh
+/// frostd signing session, so each can discover the attempt by dialing out to the relay with
+/// zero inbound reachability. `tx`/`ch` are the session's (ephemeral) coordinator channel.
+fn push_intent(
+    tx: &FrostdTransport,
+    ch: &crate::transport::FrostdChannel,
+    v: &Vault,
+    p: &Payment,
+) -> Result<(), String> {
+    for &slot in p.signers.iter().filter(|id| **id != v.slot) {
+        let sealed = seal_intent(v, p, slot)?;
+        tx.send(ch, &[Peer(v.peers[&slot].encryption)], &Outbound::Peer(sealed))
+            .map_err(|e| e.to_string())?;
     }
-    let reply = json!({"session_id":id,"intent":public_intent(&p),"approval_started":p.approval_started});
-    let reply = v.identity.seal_session(
-        peer,
-        &context,
-        MessageKind::PeerReply,
-        &serde_json::to_vec(&reply).map_err(|e| e.to_string())?,
-    )?;
-    Ok(json!({"reply":hex::encode(reply)}))
+    Ok(())
 }
-fn ready_to_send(st: &Shared, p: &Payment, v: &Vault) -> bool {
+
+/// A proposer may run `finish` once it is signing; the frostd aggregate round itself gathers
+/// the quorum's commitments and shares (or times out), so no inbound status poll is needed.
+fn ready_to_send(p: &Payment) -> bool {
     p.phase == "signing"
-        && p.signers.iter().all(|slot| {
-            if *slot == v.slot {
-                p.approval_started
-            } else {
-                st.config
-                    .peers
-                    .get(slot)
-                    .and_then(|url| peer_get(url, v, &p.vault, &p.attempt, *slot).ok())
-                    .and_then(|r| r["approval_started"].as_bool())
-                    .unwrap_or(false)
-            }
-        })
 }
+
+/// Find the proposer's pushed payment view by dialing out to frostd. The relay lists every
+/// session this member was enlisted in; the quorum session is the one whose participants are
+/// exactly a threshold-sized subset of the roster that includes this member. Opening a sealed
+/// `PeerReply` there yields the intent and the session id to join for signing — no peer HTTP.
+fn discover_over_frostd(
+    frostd_url: &str,
+    v: &Vault,
+    vault: &str,
+    attempt: &str,
+) -> Result<Payment, String> {
+    let mut tx = relay(&v.identity, frostd_url)?;
+    let me = v.identity.public().encryption;
+    let roster: std::collections::BTreeSet<[u8; 32]> =
+        v.peers.values().map(|p| p.encryption).collect();
+    // The proposer pushes before it asks signers to review; poll briefly for relay latency.
+    for _ in 0..40 {
+        for session in tx.list_sessions().map_err(|e| e.to_string())? {
+            let Ok(pubkeys) = tx.session_info(session) else {
+                continue;
+            };
+            if pubkeys.len() != usize::from(v.threshold)
+                || !pubkeys.contains(&me)
+                || !pubkeys.iter().all(|k| roster.contains(k))
+            {
+                continue;
+            }
+            // ponytail: recv drains this mailbox; a second not-yet-discovered payment the same
+            // signer is in (same quorum shape) would have its pushed intent consumed here. Fine
+            // for one payment at a time; give discovery its own relay session if that changes.
+            let ch = tx.join(session).map_err(|e| e.to_string())?;
+            for msg in tx.recv(&ch, false).map_err(|e| e.to_string())? {
+                for peer in v.peers.values().filter(|peer| peer.id != v.slot) {
+                    let Ok(context) = peer_context(vault, attempt, v.slot, peer.id) else {
+                        continue;
+                    };
+                    let Ok(opened) = v.identity.open_session(peer, &context, &msg.message) else {
+                        continue;
+                    };
+                    if opened.kind != MessageKind::PeerReply {
+                        continue;
+                    }
+                    let reply: Value =
+                        serde_json::from_slice(&opened.body).map_err(|e| e.to_string())?;
+                    let p: Payment = serde_json::from_value(reply["intent"].clone())
+                        .map_err(|e| e.to_string())?;
+                    let sess = reply["session_id"]
+                        .as_str()
+                        .and_then(|s| Uuid::parse_str(s).ok());
+                    if p.vault == vault
+                        && p.attempt == attempt
+                        && p.proposer == peer.id
+                        && p.session_id == sess
+                        && sess == Some(session)
+                    {
+                        return Ok(p);
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err(UNAVAILABLE.into())
+}
+
 fn discover(
-    st: &Shared,
+    frostd_url: &str,
     data: &Path,
     pass: &str,
     vault: &str,
@@ -462,38 +490,18 @@ fn discover(
     if let Ok(p) = read_payment(data, pass, vault, attempt) {
         return Ok(p);
     }
-    for (&slot, url) in &st.config.peers {
-        if slot == v.slot {
-            continue;
-        }
-        let Ok(response) = peer_get(url, v, vault, attempt, slot) else {
-            continue;
-        };
-        let mut p: Payment =
-            serde_json::from_value(response["intent"].clone()).map_err(|e| e.to_string())?;
-        if p.vault != vault
-            || p.attempt != attempt
-            || p.proposer != slot
-            || p.session_id
-                != response["session_id"]
-                    .as_str()
-                    .and_then(|s| Uuid::parse_str(s).ok())
-        {
-            continue;
-        }
-        check_intent(&p, v)?;
-        p.coordinator_secret = None;
-        p.review_token = None;
-        p.approval_requested = false;
-        p.approval_started = false;
-        p.txid = None;
-        p.signed_pczt = None;
-        p.raw_tx = None;
-        p.error = None;
-        save_payment(data, pass, &p)?;
-        return Ok(p);
-    }
-    Err("payment session unavailable".into())
+    let mut p = discover_over_frostd(frostd_url, v, vault, attempt)?;
+    check_intent(&p, v)?;
+    p.coordinator_secret = None;
+    p.review_token = None;
+    p.approval_requested = false;
+    p.approval_started = false;
+    p.txid = None;
+    p.signed_pczt = None;
+    p.raw_tx = None;
+    p.error = None;
+    save_payment(data, pass, &p)?;
+    Ok(p)
 }
 async fn unlocked(st: &Shared) -> Result<(PathBuf, Zeroizing<String>), Reply> {
     let guard = st.session.read().await;
@@ -587,35 +595,18 @@ pub(super) async fn publish(State(st): State<Shared>, Json(body): Json<Value>) -
         p.session_id = Some(ch.session_id());
         p.coordinator_secret = Some(hex::encode(&*Zeroizing::new(coord.to_secret_bytes())));
         p.phase = "signing".into();
+        push_intent(&tx, &ch, &v, &p)?;
         save_payment(&data, &pass, &p)?;
         Ok(json!({"phase":p.phase,"session_id":p.session_id}))
     })
     .await
 }
 
-pub(super) async fn session(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
-    let (data, pass) = match unlocked(&st).await {
-        Ok(x) => x,
-        Err(e) => return e,
-    };
-    let reply = blocking(move || {
-        let vault = required(&body, "vault").map_err(|_| UNAVAILABLE)?;
-        let v = load_vault(&data, &pass, vault, &st.config.network).map_err(|_| UNAVAILABLE)?;
-        answer_peer(&data, &pass, &v, &body)
-    })
-    .await;
-    if reply.0 == StatusCode::OK {
-        reply
-    } else {
-        err(StatusCode::NOT_FOUND, UNAVAILABLE)
-    }
-}
-
 pub(super) async fn review(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
     with_body(st, body, |st, data, pass, body| {
         let (vault, attempt) = pair(&body)?;
         let v = load_vault(&data, &pass, &vault, &st.config.network)?;
-        let mut p = discover(&st, &data, &pass, &vault, &attempt, &v)?;
+        let mut p = discover(&st.config.frostd_url, &data, &pass, &vault, &attempt, &v)?;
         if p.phase != "signing" || p.session_id.is_none() { return Err("payment is not signing".into()); }
         check_intent(&p, &v)?;
         if p.approval_requested { return Err("payment approval already requested".into()); }
@@ -839,7 +830,7 @@ pub(super) async fn finish(State(st): State<Shared>, Json(body): Json<Value>) ->
             return Err("only the proposer can finish a signing payment".into());
         }
         check_intent(&p, &v)?;
-        if p.signed_pczt.is_none() && !ready_to_send(&st, &p, &v) {
+        if p.signed_pczt.is_none() && !ready_to_send(&p) {
             return Err("signer approvals are not ready".into());
         }
         if p.signed_pczt.is_none() {
@@ -984,7 +975,7 @@ pub(super) async fn payments(
             let Some(attempt) = name.strip_suffix(".json") else { continue };
             if hex32(attempt).is_err() { continue; }
             let p = read_payment(&data, &pass, &vault, attempt)?;
-            let ready = ready_to_send(&st, &p, &v);
+            let ready = ready_to_send(&p);
             out.push(json!({"attempt":p.attempt,"phase":p.phase,"recipient":p.recipient,"amount_zat":p.amount_zat.to_string(),"ready_to_send":ready,"txid":p.txid,"signers":p.signers}));
         }
         Ok(json!({"payments":out}))
@@ -1122,70 +1113,61 @@ mod tests {
         }
     }
 
+    /// The core no-inbound proof: a signer behind NAT discovers the proposer's payment with
+    /// nothing but dial-out to frostd. No member binds an HTTP listener; the proposer pushes
+    /// its sealed intent onto the fresh signing session, and the signer finds that session via
+    /// `list_sessions` and opens the intent. Needs a running frostd (`FROSTD_URL`); skips
+    /// otherwise so the offline suite stays green.
     #[test]
-    fn payment_session_answers_only_selected_signers_over_sealed_http() {
+    fn review_discovery_completes_over_frostd_with_no_inbound_http() {
+        let Ok(url) = std::env::var("FROSTD_URL") else {
+            eprintln!("FROSTD_URL unset — skipping no-inbound discovery proof");
+            return;
+        };
         let identities: Vec<Identity> = (1..=3).map(Identity::new).collect();
         let peers: BTreeMap<_, _> = identities.iter().map(|i| (i.public().id, i.public())).collect();
-        let data = std::env::temp_dir().join(format!("loki-peer-session-{}", Uuid::new_v4()));
         let (vault, attempt) = (hex::encode([2u8; 32]), hex::encode([1u8; 32]));
-        let session_id = Uuid::new_v4();
-        let p = Payment {
+        let mut p = Payment {
             attempt: attempt.clone(), vault: vault.clone(), proposer: 1,
             recipient: "uregtest1recipient".into(), amount_zat: 40_000_000, memo: "rent".into(),
             fee_zat: 10_000, change_zat: 1, note_selection: vec![hex::encode([5u8; 32])],
             target_height: 700, expiry_height: 1_152, signers: vec![1, 2], phase: "signing".into(),
-            session_id: Some(session_id), coordinator_secret: Some("secret".into()),
-            review_token: Some("token".into()), approval_requested: false, approval_started: true,
+            session_id: None, coordinator_secret: None,
+            review_token: None, approval_requested: false, approval_started: false,
             txid: None, signed_pczt: None, raw_tx: None, error: None,
         };
-        save_payment(&data, "pass", &p).unwrap();
 
-        // The proposer's host serves `answer_peer`, exactly as the real handler does after
-        // loading its vault.
-        let proposer = std::sync::Arc::new(member(&identities[0], &peers));
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let served = data.clone();
-        std::thread::spawn(move || {
-            runtime().unwrap().block_on(async move {
-                let app = axum::Router::new().route(
-                    "/api/payment-session",
-                    axum::routing::post(move |Json(body): Json<Value>| async move {
-                        match answer_peer(&served, "pass", &proposer, &body) {
-                            Ok(reply) => (StatusCode::OK, Json(reply)),
-                            Err(e) => (StatusCode::NOT_FOUND, Json(json!({"error": e}))),
-                        }
-                    }),
-                );
-                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-                axum::serve(listener, app).await.unwrap();
-            })
-        });
+        // The proposer creates the signing session (ephemeral coordinator, signers as the
+        // participants) and pushes its sealed intent to the other signer — exactly `publish`.
+        let proposer = member(&identities[0], &peers);
+        let coord = Identity::new(0);
+        let mut tx = relay(&coord, &url).unwrap();
+        let signer_peers: Vec<Peer> = p.signers.iter().map(|id| Peer(peers[id].encryption)).collect();
+        let ch = tx.open(&signer_peers, 4).unwrap();
+        p.session_id = Some(ch.session_id());
+        push_intent(&tx, &ch, &proposer, &p).unwrap();
 
-        // The selected signer gets the proposer's signed intent.
-        let reply = peer_get(&url, &member(&identities[1], &peers), &vault, &attempt, 1).unwrap();
-        assert_eq!(reply["intent"]["recipient"], "uregtest1recipient");
-        assert_eq!(reply["session_id"], session_id.to_string());
-        assert_eq!(reply["approval_started"], true);
-        assert!(reply["intent"].get("coordinator_secret").is_none());
-        // A vault member outside the signer set is refused.
-        assert!(peer_get(&url, &member(&identities[2], &peers), &vault, &attempt, 1).is_err());
-        // So is someone claiming slot 2 without slot 2's roster key.
-        let impostor = Identity::new(2);
-        assert!(peer_get(&url, &member(&impostor, &peers), &vault, &attempt, 1).is_err());
-        // The wire carries neither the intent nor the IDs it is about.
-        let request = member(&identities[1], &peers)
-            .identity
-            .seal_session(&peers[&1], &peer_context(&vault, &attempt, 2, 1).unwrap(), MessageKind::PeerRequest, PEER_REQUEST)
-            .unwrap();
-        let reply = answer_peer(&data, "pass", &member(&identities[0], &peers), &json!({
-            "vault": vault, "attempt": attempt, "from": 2, "request": hex::encode(request),
-        }))
-        .unwrap();
-        let wire = hex::decode(reply["reply"].as_str().unwrap()).unwrap();
+        // The selected signer, with NO inbound listener, discovers the attempt over frostd.
+        let signer = member(&identities[1], &peers);
+        let found = discover_over_frostd(&url, &signer, &vault, &attempt).unwrap();
+        assert_eq!(found.proposer, 1);
+        assert_eq!(found.recipient, "uregtest1recipient");
+        assert_eq!(found.session_id, Some(ch.session_id()));
+        assert!(found.coordinator_secret.is_none());
+
+        // The relayed envelope leaks neither the memo nor the recipient.
+        let body = serde_json::to_vec(
+            &json!({"session_id":p.session_id,"intent":public_intent(&p),"approval_started":p.approval_started}),
+        ).unwrap();
+        let context = peer_context(&vault, &attempt, 1, 2).unwrap();
+        let wire = proposer.identity
+            .seal_session(&peers[&2], &context, MessageKind::PeerReply, &body).unwrap();
         assert!(!wire.windows(4).any(|w| w == b"rent"));
         assert!(!wire.windows(18).any(|w| w == b"uregtest1recipient"));
-        std::fs::remove_dir_all(data).unwrap();
+        tx.close(ch).ok();
+
+        // A roster member who was not enlisted in the quorum session discovers nothing.
+        let outsider = member(&identities[2], &peers);
+        assert!(discover_over_frostd(&url, &outsider, &vault, &attempt).is_err());
     }
 }
