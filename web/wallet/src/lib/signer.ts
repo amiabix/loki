@@ -284,10 +284,19 @@ function impl(): Promise<SignerModule> {
   implPromise = (async () => {
     const cfg = signerConfig();
     if (!cfg) return mockSigner;
+    // A missing build 404s fast → mock. But the probe must never hang the app: on a slow
+    // network the memoized promise would stall forever, so time it out and, since a timeout
+    // means "served but slow" (not "absent"), bind the real signer anyway. Only a fast,
+    // definitive non-ok degrades to the mock.
+    const ctrl = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, 2500);
     try {
-      const res = await fetch(cfg.workerUrl, { method: "HEAD" });
+      const res = await fetch(cfg.workerUrl, { method: "HEAD", signal: ctrl.signal });
       if (res.ok) return browserSigner(cfg);
-    } catch { /* assets not served → mock */ }
+    } catch {
+      if (timedOut) return browserSigner(cfg);
+    } finally { clearTimeout(timer); }
     return mockSigner;
   })();
   return implPromise;
