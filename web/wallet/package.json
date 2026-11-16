@@ -3,10 +3,13 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
+    "predev": "node scripts/copy-signer.mjs",
     "dev": "next dev",
+    "prebuild": "node scripts/copy-signer.mjs",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "copy-signer": "node scripts/copy-signer.mjs"
   },
   "dependencies": {
     "@types/three": "0.160.0",

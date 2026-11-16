@@ -63,7 +63,16 @@ An in-browser signer (`src/lib/signer.ts`, the wasm core in `poc/loki-signer-was
 local HTTP server, so it enrolls as a **frostd-only member with no `advertise_url`** — peer
 traffic goes over the frostd relay (peer-over-frostd), and the roster stores `advertise_url: ""`
 for it. Native members still advertise their loopback origin and enroll exactly as before; both
-coexist in one roster.
+coexist in one roster. A browser member has completed a real **2-of-3 DKG** over the live relay.
+
+**Serving the signer.** `scripts/copy-signer.mjs` (wired to `predev`/`prebuild`) stages the built
+`poc/loki-signer-wasm/{pkg,signer-worker.js,signer-client.js}` and `poc/wasm-transport/pkg` into
+`public/signer/` (gitignored), keeping the worker's relative `./pkg/...` + OPFS-snippet imports
+intact. `signer.ts` then defaults to the served worker at `/signer/signer-worker.js`: a HEAD
+probe confirms the asset before binding the `Worker`, so `browserSigner` is the default whenever
+the bundles are present and a build without them degrades cleanly to the in-memory mock. Build
+the bundles first — `RUSTFLAGS='--cfg getrandom_backend="wasm_js"' wasm-pack build --dev --target
+web` in `poc/loki-signer-wasm`, and `wasm-pack build --target web` in `poc/wasm-transport`.
 
 1. **Create / unlock** the signer (passkey or passphrase). The device `Identity` is held in the
    Worker.
@@ -83,12 +92,16 @@ coexist in one roster.
    supplies these to the signer. **Not built here:** a browser-reachable discovery surface for the
    creator's session (CORS/TLS + invite delivery, or a vault-announcement endpoint in this app) —
    see the handoff below.
-4. **DKG** — `request("dkg", {vaultHex, slot, label, network, rosterHex, frostdUrl,
-   coordinatorPeer, sessionId, transportUrl})` drives `driveDkg()` to an active vault + address.
-   `frostdUrl` (TLS frostd) and `transportUrl` (the `wasm-transport` module) are **deployment
-   config the parent supplies**, not discovered.
+4. **DKG** — `request("dkg", {vaultHex, slot, label, network, rosterHex, coordinatorPeer,
+   sessionId})` drives `driveDkg()` to an active vault + address. `signer.ts` folds `frostdUrl`
+   and `transportUrl` into every ceremony/payment call from **deployment config**: set the TLS
+   relay with `NEXT_PUBLIC_FROSTD_URL`, and `transportUrl` defaults to the served
+   `/signer/wasm-transport/pkg/loki_wasm_transport.js` (override with
+   `NEXT_PUBLIC_SIGNER_TRANSPORT_URL`). The frostd endpoint must be reachable over **https/wss
+   with CORS** — a browser cannot use a loopback-plaintext relay.
 
-Payment stays `SignerPending` (Phase C).
+Onboarding (create/unlock → Home) works standalone; the full ceremony above needs that live
+coordinator + frostd. Payment review/approve are wired through `request()` the same way.
 
 ## Registry and limits
 

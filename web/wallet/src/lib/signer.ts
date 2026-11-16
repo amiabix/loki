@@ -64,15 +64,23 @@ export interface SignerModule {
 //
 // W1F's wasm module runs the FROST core in a Web Worker and seals the device identity to
 // OPFS (loki-signer-wasm/signer-worker.js). This client bridges the lifecycle half of
-// `SignerModule` to it over postMessage; `request()` stays `SignerPending` (DKG/payment are
-// Phase B/C). It activates only when the integrator serves the built pkg + worker and points
-// `window.__LOKI_SIGNER_WORKER_URL` at it — so SSR, Node tests and the un-provisioned app all
-// keep the in-memory mock below (OPFS cannot run there anyway) with no behaviour change.
+// `SignerModule` to it over postMessage, and routes DKG/join/payment through it. The app
+// serves the built worker + pkg under `/signer/` (scripts/copy-signer.mjs), so `browserSigner`
+// is the default in the browser; SSR, Node tests and an un-provisioned build (no assets copied)
+// fall back to the in-memory mock below — OPFS cannot run there anyway.
 
-function workerUrl(): string | null {
+export interface SignerConfig { workerUrl: string; transportUrl: string; frostdUrl: string }
+
+/** Served-asset + live-frostd config, overridable at build (NEXT_PUBLIC_*) or runtime (window).
+ *  null when there is no Worker (SSR / Node tests) — the caller then uses the mock. */
+function signerConfig(): SignerConfig | null {
   if (typeof window === "undefined" || typeof Worker === "undefined") return null;
-  const u = (window as unknown as { __LOKI_SIGNER_WORKER_URL?: string }).__LOKI_SIGNER_WORKER_URL;
-  return typeof u === "string" && u.length > 0 ? u : null;
+  const w = window as unknown as { __LOKI_SIGNER_WORKER_URL?: string; __LOKI_FROSTD_URL?: string };
+  return {
+    workerUrl: w.__LOKI_SIGNER_WORKER_URL || process.env.NEXT_PUBLIC_SIGNER_WORKER_URL || "/signer/signer-worker.js",
+    transportUrl: process.env.NEXT_PUBLIC_SIGNER_TRANSPORT_URL || "/signer/wasm-transport/pkg/loki_wasm_transport.js",
+    frostdUrl: w.__LOKI_FROSTD_URL || process.env.NEXT_PUBLIC_FROSTD_URL || "",
+  };
 }
 
 // ─── browser enrollment: device key + signed registration ────────────────────
@@ -123,8 +131,8 @@ async function postJson<T>(url: string, body: unknown): Promise<T> {
   return data as T;
 }
 
-function browserSigner(url: string): SignerModule {
-  const worker = new Worker(url, { type: "module" });
+function browserSigner(cfg: SignerConfig): SignerModule {
+  const worker = new Worker(cfg.workerUrl, { type: "module" });
   const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
   let seq = 0;
   const loaded = new Promise<void>((resolve) => {
@@ -188,22 +196,25 @@ function browserSigner(url: string): SignerModule {
       }
       if (path === "lock") { await this.lock(); return {} as T; }
       if (!current) throw new ApiError("Unlock your signer", 401);
+      // The ceremony/payment ops reach frostd: fold in the served transport module + the
+      // deployment's TLS frostd URL (config, not discovered); a caller-supplied value still wins.
+      const relay = (b: unknown) => ({ frostdUrl: cfg.frostdUrl, transportUrl: cfg.transportUrl, ...(b as object) });
       // Phase B: join-a-vault + DKG. The UI supplies the ceremony params (roster bytes, the
-      // coordinator's frostd session + relay peer, the TLS frostd URL); the Worker drives the
-      // synchronous DKG core over the frostd transport to an active vault + released address.
-      if (path === "dkg") return call<T>({ op: "dkg", dkg: body });
+      // coordinator's frostd session + relay peer); the Worker drives the synchronous DKG core
+      // over the frostd transport to an active vault + released address.
+      if (path === "dkg") return call<T>({ op: "dkg", dkg: relay(body) });
       // Phase B join: decode a creator invite and run the joiner dance (enroll → poll roster →
       // agree → poll session) against the creator's member app, then drive the DKG. The UI
-      // supplies the invite plus this browser's TLS frostdUrl/transportUrl (and, on testnet, the
-      // creator's birthHeight) so the rebuilt setup document matches the creator's.
-      if (path === "join") return call<T>({ op: "join", join: body });
+      // supplies the invite (and, on testnet, the creator's birthHeight) so the rebuilt setup
+      // document matches the creator's.
+      if (path === "join") return call<T>({ op: "join", join: relay(body) });
       // Phase C: review + approve a payment (NON-proposer signer). The UI supplies the vault
       // reopen params (vaultHex/slot/label/network/rosterHex), the frostd session + relay
       // peers, the proposer identity, and the attempt; the Worker drives the synchronous
       // signer core over the frostd transport. WYSIWYS is enforced inside the core (signApprove
       // refuses unless the signing package binds the recomputed sighash).
-      if (path === "payment-review") return call<T>({ op: "payment-review", payment: body });
-      if (path === "payment-approve") return call<T>({ op: "payment-approve", payment: body });
+      if (path === "payment-review") return call<T>({ op: "payment-review", payment: relay(body) });
+      if (path === "payment-approve") return call<T>({ op: "payment-approve", payment: relay(body) });
       throw new SignerPending(path); // other member paths stay unbuilt
     },
   };
@@ -262,22 +273,31 @@ const mockSigner: SignerModule = {
 };
 
 // ─── dispatcher ──────────────────────────────────────────────────────────────
-// The real Worker-backed signer when provisioned (browser + worker URL), the mock
-// otherwise. Chosen per call so SSR→client hydration and test env never bind the wrong one.
+// The real Worker-backed signer when the app serves the signer assets, the mock otherwise
+// (SSR / Node tests, or a build where scripts/copy-signer.mjs found nothing to copy). Resolved
+// once: a HEAD probe of the served worker confirms the assets are present before binding the
+// Worker, so a missing build degrades cleanly to the mock instead of hanging on a 404.
 
-let browser: SignerModule | null = null;
-function impl(): SignerModule {
-  const url = workerUrl();
-  if (!url) return mockSigner;
-  if (!browser) browser = browserSigner(url);
-  return browser;
+let implPromise: Promise<SignerModule> | null = null;
+function impl(): Promise<SignerModule> {
+  if (implPromise) return implPromise;
+  implPromise = (async () => {
+    const cfg = signerConfig();
+    if (!cfg) return mockSigner;
+    try {
+      const res = await fetch(cfg.workerUrl, { method: "HEAD" });
+      if (res.ok) return browserSigner(cfg);
+    } catch { /* assets not served → mock */ }
+    return mockSigner;
+  })();
+  return implPromise;
 }
 
 export const signer: SignerModule = {
-  hasSigner: () => impl().hasSigner(),
-  createSigner: (opts) => impl().createSigner(opts),
-  unlock: (opts) => impl().unlock(opts),
-  lock: () => impl().lock(),
-  enroll: (coordinatorOrigin) => impl().enroll(coordinatorOrigin),
-  request<T = unknown>(path: string, body?: unknown): Promise<T> { return impl().request<T>(path, body); },
+  hasSigner: async () => (await impl()).hasSigner(),
+  createSigner: async (opts) => (await impl()).createSigner(opts),
+  unlock: async (opts) => (await impl()).unlock(opts),
+  lock: async () => (await impl()).lock(),
+  enroll: async (coordinatorOrigin) => (await impl()).enroll(coordinatorOrigin),
+  async request<T = unknown>(path: string, body?: unknown): Promise<T> { return (await impl()).request<T>(path, body); },
 };
