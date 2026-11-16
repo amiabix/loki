@@ -77,6 +77,70 @@ poc/target/release/loki_member_app --data /absolute/member-1 --port 3601 \
 (the SSRF guard otherwise rejects loopback peer URLs). The local-passphrase file must be
 mode 0600. This is a one-host TEST setup, not production HTTPS or independent operators.
 
+## Public HTTPS bringup (`public-testnet.sh`)
+
+Hosts ONLY the shared coordinator over a free cloudflared quick tunnel, so testers on
+other machines/networks join without hosting anything. It ensures frostd is reachable
+(ssh tunnel to `FROSTD_HOST`, default `omarchy`), opens
+`cloudflared tunnel --url http://localhost:$WEB_PORT`, captures the printed
+`https://*.trycloudflare.com` URL, and starts `node server.js` with `HOSTNAME` set to
+that host and `PUBLIC_PORT=443`, then prints the join URL. Requires `/opt/homebrew/bin/cloudflared`.
+
+```sh
+communication/deploy/public-testnet.sh /absolute/new/pub-stack
+# -> coordinator LIVE:  https://<random>.trycloudflare.com   (open in a browser)
+kill $(cat /absolute/new/pub-stack/pids)   # stop
+```
+
+`PUBLIC_PORT=443` is load-bearing: `server.js` builds the request origin (which members'
+self-registration signatures are verified against) from this port, and `URL.origin` omits
+`:443` for https — so the derived origin is exactly `https://HOSTNAME`, matching the origin
+a member signs over. Without it the origin carries the loopback listen port and registration
+fails with "device signature does not verify". Ports default to `WEB_PORT=3011` to avoid the
+loopback test stack on `:3001`. frostd (`:2744`) is shared and supports concurrent sessions.
+
+## Packaged member (`run-member.sh`)
+
+Testers run a member from a release binary with no Rust toolchain:
+
+```sh
+ssh -N -L 2744:localhost:2744 omarchy   # frostd must be reachable on loopback
+communication/deploy/run-member.sh https://<coordinator>.trycloudflare.com 1
+# -> open in a browser to pair this device: http://127.0.0.1:3611/#<token>
+kill $(cat ./loki-member-1/pids)   # stop
+```
+
+It self-registers to the coordinator URL (slot = 2nd arg), using `software` device storage.
+Until the peer-over-frostd change lands (gap A in the work definition), the payment review
+step is a direct member->member HTTP GET, so each member must be inbound-reachable to its
+peers: the wrapper gives the member its OWN cloudflared quick tunnel and advertises that
+https URL. Once gap A lands, members need zero inbound — set `NO_TUNNEL=1` (or pass
+`ADVERTISE_URL`) to skip the per-member tunnel. Tunables: `MEMBER_BIN`, `DATA`, `PORT`,
+`FROSTD_URL`, `LWD_URL`, `NETWORK`.
+
+### Binaries
+
+Build the macOS arm64 member binary (what `run-member.sh` defaults to):
+
+```sh
+( cd poc && cargo build --release --features relay-communication --bin loki_member_app )
+# -> poc/target/release/loki_member_app   (Mach-O arm64)
+```
+
+Linux x64 is **not cross-built here** — this Mac has no x86_64-linux C cross-linker, and the
+crate has native deps, so a bare `cargo build --target x86_64-unknown-linux-gnu` fails at link.
+Build it on a Linux x64 box, or on this Mac via Docker (present):
+
+```sh
+# native, on a Linux x64 host:
+cargo build --release --features relay-communication --bin loki_member_app
+
+# or cross-build from macOS with Docker:
+docker run --rm -v "$PWD":/src -w /src/poc rust:1.91 \
+  cargo build --release --features relay-communication --bin loki_member_app
+# -> poc/target/release/loki_member_app   (ELF x86_64); point run-member.sh at it with MEMBER_BIN=
+```
+
 ### Owned-relay operator kit (above)
 
 The `bringup.sh` relay/admission stack is the operator-side enrollment/admission toolkit
