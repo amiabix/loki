@@ -34,32 +34,69 @@ use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
 
 // secp256k1 is pulled into this crate transitively (bip32 <- zakura-transparent, and pczt's
-// `signer` feature forces `transparent`), but the Orchard FROST signer never calls it. Its
-// C preallocated-context functions are left as `env` module imports by the wasm build (no
-// WASI C toolchain compiles the C here), and a browser can't resolve a bare `env` specifier.
-// Define the three dead symbols so the linker satisfies them in-module instead — no `env`
-// import, no WASI toolchain, no fork of the vendored crypto. They are never called; if that
-// ever changes, a null context makes the first real use fail loudly rather than silently.
+// `signer` feature forces `transparent`). The Orchard FROST signer performs no secp256k1
+// CRYPTO, but `pczt::roles::signer::Signer` OWNS a `secp256k1::Secp256k1<All>` context, so the
+// payment review/sighash path still CONSTRUCTS and DROPS one. Its C preallocated-context
+// functions are left as `env` module imports by the wasm build (no WASI C toolchain compiles
+// the C here), and a browser can't resolve a bare `env` specifier. Define them in-module so
+// the linker is satisfied AND the context's construct→drop lifecycle is memory-safe: `size`
+// and `clone_size` return the SAME non-zero value and `create` returns its own buffer, so
+// secp256k1's `alloc(size)` / `dealloc(ctx, clone_size)` is a balanced round-trip. Earlier
+// these returned size 0 / a null ctx, so `Drop` ran `dealloc(null, 0)` — a wasm "memory access
+// out of bounds" the moment a candidate was reviewed. The context is never used for crypto
+// (no secp256k1 op runs for our shielded-only candidates); a transparent-input tx would still
+// need a real context, out of scope here.
 #[cfg(target_arch = "wasm32")]
 mod secp256k1_link_stub {
     use core::ffi::{c_uint, c_void};
+    // Arbitrary non-zero, aligned buffer size; only alloc/dealloc balance matters since the
+    // context bytes are never read by a real secp256k1 operation.
+    const CTX_SIZE: usize = 256;
     #[no_mangle]
     pub extern "C" fn rustsecp256k1_v0_10_0_context_preallocated_size(_flags: c_uint) -> usize {
-        0
+        CTX_SIZE
     }
     #[no_mangle]
     pub extern "C" fn rustsecp256k1_v0_10_0_context_preallocated_create(
-        _prealloc: *mut c_void,
+        prealloc: *mut c_void,
         _flags: c_uint,
     ) -> *mut c_void {
-        core::ptr::null_mut()
+        prealloc
     }
     #[no_mangle]
     pub extern "C" fn rustsecp256k1_v0_10_0_context_preallocated_destroy(_ctx: *mut c_void) {}
     #[no_mangle]
     pub extern "C" fn rustsecp256k1_v0_10_0_context_preallocated_clone_size(_ctx: *const c_void) -> usize {
-        0
+        CTX_SIZE
     }
+
+    // secp256k1-sys's `sanity_checks_for_wasm()` (types.rs) runs when a context is constructed
+    // — which the pczt transparent Signer/Verifier role does even for our shielded-only
+    // candidate — and asserts each C ABI size/align against these `extern "C"` statics. The C
+    // that defines them is not compiled here (see the note above), so without definitions they
+    // read as garbage and the assert aborts with a bare "unreachable". Define them with the
+    // real wasm32 ABI values (int/uint/size_t/ptr = 4 bytes, uchar = 1), so the check passes;
+    // the context itself is still the never-operated-on null from the stubs above.
+    #[no_mangle]
+    pub static WASM32_INT_SIZE: u8 = 4;
+    #[no_mangle]
+    pub static WASM32_INT_ALIGN: u8 = 4;
+    #[no_mangle]
+    pub static WASM32_UNSIGNED_INT_SIZE: u8 = 4;
+    #[no_mangle]
+    pub static WASM32_UNSIGNED_INT_ALIGN: u8 = 4;
+    #[no_mangle]
+    pub static WASM32_SIZE_T_SIZE: u8 = 4;
+    #[no_mangle]
+    pub static WASM32_SIZE_T_ALIGN: u8 = 4;
+    #[no_mangle]
+    pub static WASM32_UNSIGNED_CHAR_SIZE: u8 = 1;
+    #[no_mangle]
+    pub static WASM32_UNSIGNED_CHAR_ALIGN: u8 = 1;
+    #[no_mangle]
+    pub static WASM32_PTR_SIZE: u8 = 4;
+    #[no_mangle]
+    pub static WASM32_PTR_ALIGN: u8 = 4;
 }
 
 // Runs once when the worker instantiates the module (wasm-bindgen `start`), so any later
@@ -847,6 +884,20 @@ impl Signer {
 mod tests {
     use super::*;
     use wasm_bindgen_test::*;
+
+    // Repro of the browser approver's post-message signing path that panicked live: render +
+    // recompute-sighash of a real candidate PCZT. Fixture dumped from a native dealer vault.
+    const CANDIDATE_HEX: &str = "50435a54020000000698ed92c40ddbac94bd0301008009010000000100000000010000000000000000000000000000000000000000000000000000000000000000000102015c2b08f6b99c91e8e05bc36d9331c4b2e1bb76aba2c320e46274a826c09ab83b018183dc4afdfa1e06f2b949edf3c02bb83d546168327ea5d0f6a66ae20906a3220181ae52a0c6e38631987a4b019191de61179929706c0aa8a8754580563cd57e0d0001b4859a5cd871081c2e1f900b7602861cf689ec0e0e0dfa429228cbc14a221f3b6ed8d0c0c94b3a0a21959a01c0fc82aa02010101010101010101010101010101010101010101010101010101010101010101010202020202020202020202020202020202020202020202020202020202020202016f5b47426a1736e8b211c04c923c7f87698a403412b9e7e6e3cca56035b4973f18c5cd0dcf61488eec0ce2981deaa3343f36606137da78739171664d4dde5e37ca728c87a618c1082ca7f43989c8a4c4260d212f706886e30f120b588018463a0001dd5eacc8e21a886a41ff31d2ba73f188c827f47fff093e51373b97a6390eb209000000016aaac0b071c902f81ad053322535a7394d44839a353c342d9ce33501815ef1089b723e9d7fb3102378fdde39f8e0ec5118f299f30d4c8ee707364eefc706fa8400c4049eb46b7f7866a1c6532ce4e464d08e278c78e3a127daa3e603ad5bb0f73a274361d6a6b0403947e78a6134679c1bddd987b808489f383639acd9fe10ddda8c9089b9c14a5aad080fbcf82e5b5334e393779ece9e4c90b39f67d16b44f4e1cf4ff1fecb224dda4bdd44b92d8b9cb4a40cdb37d237470d86e4724bec4b92788e1747634eaaf33370f658af7b99446d7489c0b9cd374b9978c7c8da9a890e89e5b05564106b142d6ad0b9f3cdb8b2bd34daa107a7bb5bbe70b8776f09b8fe22a4ada3b0781b246ade2992649513e8a93743a6fa741241b248a77c56f8f5d8967ab17db34a4ca070f84fde75730082429e2bb8c180538295b5b9b845edfa219c0e34fe2401fc716a47406fff539381a11890ae39e0fa71e725ed616487408adcbf90f8730536716e55ee07d801ac61857adcafd96671b8729a74dd8643cba69d5af927275bf67a58e3ae249c58011436a7ea1c55e789518bc88808e0b438263a58c0cc276868c8a13bb060123fcb08ed723ef7aca8cba056abe8ee8f7ab69e4728b892c69ba15607e2840a21da6770092d7375e757ac36ae238bd7f609d8b023983a5305e0eb18532b585e03917aadbc1ecc12ac5baf9263c517587d69783863a8b282e5012015f168a7f4b79c4ae3324b76ae755b3e73d7c2d40e77b32df2edb1c9829f67110c125f0cfb54318b07f51b821465f6941fb531e92314a1771e48d40ae4b0e517da53883f9d9cfa3d28ed350a2abc7b73ae14f846dfd27e8087d2faaa6998b23db2abb39542c4faa981e59bb357396b293964d9c6d047640524ab262ca9fce8c35001d57d337509d84dd3db799ad3d4c632407c94e6fcefced0eed856f7719e3e712847bf40c9391c22b47907cdc000a0443a178443e469806dcf34d4558109b0c93b7627de1919ec060b486938c568554a0132452ece66910908921f4a55e35dcb88d16257cbbd86d7a4ca3e554aad8afa84670a3a1cafc5638a89beb001b0faf896020117088f6c65a962f897a82129712a98a295a646adb533af9d3efc75cf70af2c3c0000000001cb5ead2f0b21c1e5afa6257ffd47594ea1d93569b07c81cc40645d9addb2ca2001af34cabeea8ef9c8a7d2b5bed819923163bc40f1378af8ab62ea2f91c048d73401dfb51768c5a344e46b7509e27dc9e3363913dbfb1993e3aebe5c7dd55088d00001cc81f56467d96b3bebf8aa8491c17a0677cd92ca7c1ba45cbb2c274e15ded08d01527a16cd43084f245f66b54642532ac4415dd70614b30d558dd66ab6716cd98fe945fbf14fb086466ca75daff959fa5771b633c70fb01ddc39688e422f28b9140110a413bf94a727fe6eb7b3595cf1cf58bc1316229e8ab0bda996dec4233f98f0a2e3ba849098f9915bd124010001a76e2245b2668050ef16f541cacb4fe415c7cacedcfdec7a4d7de5966173403701d12324a9a342980013e2e704c7ef18d69939dc885d94a6558af06b89a85839d8016685f198a38ba86b8ed39aabe8ae8e7cb6c5721eea72108bede1c6a6401c733c68868b870439da5569c46a6c1317e73948edf61d53319371bc018ed2d426e62b81d6c08cd18fa46f09673ec059a6df1b5bdb88946e12015234dd3eec4d549a3401e1d3b1cb05aac213a5554247f930ad7cf035cff899d20c7444d7914dba50534c19eaa06d1097622ce7d229a2c29404fcbc79d29a0f4557f58807d29458535c9ed5cf74e13faa91bde886412f6ff81049fd0fbca55868d777539b6cc04ce3bff39889be28234d6f245eb852f5e97286f06e881677f8de6cbd7e2a6654bbb1420f5112b5ac0e0e6c58b8500ba776754b561b3530f47f3dfbad30d5f6dbcf06d2fc97d31ea8221f01d8f48c69c6de2506fdf07c57ed04f3be543ae18173a66dad07c026a792043f87c235275ef14821e5592a8aa3d7825f9641cef63e59249199f7cef880570848e5391b72cc1763ea7a171754b95edeae02971e4365a7ab6e19cd7103f2aa3c99747eea7890376fdd40df7e359ccda78829898c2ffa35919be4476aedb2a82a11fd1e4f79dc39a6ba909716164b498e4b674586e8dc5a8ba9edfc3459e0ef0ea70959085d5d0738641e5f25fecbac293fead8b05e75680f1b0e510e3008471fa0b43d2efb24495c0d30f6309f0943be5e4c97079078b57a19040c82ff98e5252fdb13294a1d9b30a63298123882e999d0995303880622659557d523ea980f12c09e4fe24562baf552c9781979fc0ab16bb301772bc7aa6afa923279bf520f24bd8292e1192e1bde41e780e8310a2909171e487d182e1178eed42f7d8b2f9c267bf170839b58b900455f41ccca87f65c912eeba6d562aaaaaa2059569e53be09e5d607cd2ac28fbaa837368df67c4eaeb603bce36a5f30381b4c5aad0b98a407e0fbe00347c08b07d3e61a72aeaed2723d44afbf35d070f2ef49105fdbd73c3afd03943bf23d3d80ac52d1f1439eef01bde21295a13fb600f00481c8cba1eb0718a1ca9a66958f2f44628744b3dfb0e9e222b4ce8e3193235602b0b139c637187af8e972637da0c82a374e46eb6bf5a9176c3dbb2ac482d0d2eeef0d186f243cdfd8d14aae595048d2f2df335156981ff30a0594a74c71f7df21cbc79b574912f092498340ae1ee0f8315873c0f335f358879d95de92153db82679d6dbd5941368b431ee71297347f6f684fd9d2b8e34af348858f0ec2067b3849011b3c36f1db7e15d4e3c3652a452dc2db10b87e489287943efe67da12ab6510ddd6ef11a3d6c16d049c6539b53f05ef6840188f239dc1e5f2865e295e77af4033416ec930221016b89167d7f780e151b0995f3d742d348e3d6bdb566f6eb7ec9358e4df801ddd832eaf606e448188f6bee47ed37823306f2bb6319520d044d51f1effaa20bf465d19332e094facb71a9097fe9c8b9f45cd1bdc0ff1aac76c49c55590c591844dfd3d1ae94ddd0693138f92d89ed7baef6b01d973fae0404e2aa1b518e2f23c72ffcb8055713487417419e8af75e16ee70695943434fba69522bcc2af7bc3c19f1e2207ea5068ac7e1b9fdad92d2c18bf5553cab1990e9a9fea9e95788220e01f9f637460dc2859c171b9ccbf2e9d49744465174404441bc34af2449372c3f0600000001d85682fb8c88d5f6ae464fd5acc37c74a1d64960bcf6186201886adc98b1ea1c14841398177f00fb3278d90b0fe6b97ff1ff0df90ce22869240432d4c605120700c404ce98a0a8bfa21346d6ba9d4efa56d8763ba000ebe48b32110f8844b91a0113f4f35ca4059e5ee14a1a2e12b6522e9f291465a86cc596ae8e9438325d2b75d4e1cd04d20ebac9db3823541ac36baf0733e07c10c2860661bbdc7e65908820b94972688648db283b7044f1c1c49577801527f6dffed053095c7ddfe291168d80228c3aeb45598384cde6ebc6cd0d9fdbc31de34052e514dcaf2ca2668c9e323597064dae0a5ac2f8a86df62e48f52f475e3852315947386a2cb80abf66d281ee18c0dfb426093ace6a97b1b53de57489b84c777f52ef064bedfdc341ce5e7807a38022526e1881e384291eb1635674189f95404c3055a51341159bcc30ed6248befa852ef3d32e517b3df38a83801a854754dbc2f64882762ff66b449279f9d402cdb04776378bbbc197a33de4138c50704f0f2be738162185177335c17a21ac2baf31455566d81cc1793e022362408f13f3e4b10311db2e175a7cd082a213922d9e3868fb1c7293543e93aadd457792a8aa3a47d672e7593e6b0ff9d469c039b13569c6515878656e1dd7d6f259900f82d3fad904893f6f5c3d088351752458108d4242a5c6e8c046bf6dd7a9b3d1e259ffe7db7efb35e330a74e591274c8ef5f4b30921ce409ef889494dff5ade225f4cd80b617f1159635f9e375e489fa1b09602d47e614d778f09c75886997cc57e0ea4d208f7087e2eb04095d25023799bbebd7eb210405285913ab61d66244aecd3aea556b09ac7762abc86895458790f2450f4191322336071584f7de8c1deb873fca04646b55e9d1427caf16fbe04036dc36d15b506e6a998ad8510f92fe89ce68ae38e9a15d744ff1436375eddd4135e62810ee4c4b457916f5b9f5cf14d2ab940ec3f3bf141b80210aeac2b5ed6dd466519167eda9f0bf976e108492cc9ada2f4c3210c201e2d15cb4e254a54a1fa7eff6f7cded3b3aaefdade66050a6b340a25b611e1cf27a47fc4c608738eb2d70390180b489130131fb120b23f891b76f36c712463434f498487485c756d054bc13d7ef3d3e240600000000014db58c86ea90a5c93ecf5877654ab27ae0cf60bcd04165e422d2d94fec68e73307904e000001000117143ab6d4c61f2311cde9ec66f9c4a681a9962581bee6b0633637eac91bb214";
+    const FVK_HEX: &str = "6f5b47426a1736e8b211c04c923c7f87698a403412b9e7e6e3cca56035b4973f18c5cd0dcf61488eec0ce2981deaa3343f36606137da78739171664d4dde5e37ca728c87a618c1082ca7f43989c8a4c4260d212f706886e30f120b588018463a";
+
+    #[wasm_bindgen_test]
+    fn repro_describe_and_sighash_candidate() {
+        let cand = hex::decode(CANDIDATE_HEX).unwrap();
+        let fvk_bytes: [u8; 96] = hex::decode(FVK_HEX).unwrap().try_into().unwrap();
+        let fvk = orchard::keys::FullViewingKey::from_bytes(&fvk_bytes).unwrap();
+        let _ = describe_pczt(&cand, &fvk).unwrap();
+        let _ = sighash_of_pczt(&cand, &fvk).unwrap();
+    }
 
     #[wasm_bindgen_test]
     fn prf_seal_open_round_trips_and_rejects_wrong_secret() {

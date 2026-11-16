@@ -2155,6 +2155,7 @@ dependencies = [
  "serde_json",
  "wasm-bindgen",
  "wasm-bindgen-test",
+ "zakura-orchard",
  "zeroize 1.9.1",
 ]
 
