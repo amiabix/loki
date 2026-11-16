@@ -87,7 +87,7 @@ async function preopenUnlock(P, method) {
 }
 
 self.onmessage = async (e) => {
-  const { id, op, method, name, passphrase, prfSecret, dkg } = e.data;
+  const { id, op, method, name, passphrase, prfSecret, dkg, devicePubHex } = e.data;
   try {
     const { signer, P } = await ready;
     let result;
@@ -95,6 +95,13 @@ self.onmessage = async (e) => {
       case "has":
         await opfsPreopenRead(P.identity);
         result = signer.hasSigner();
+        break;
+      case "enroll-material":
+        // Public roster enrollment identity; the unlocked device identity is already in memory.
+        result = JSON.parse(signer.enrollMaterial());
+        break;
+      case "authorize-device":
+        result = signer.authorizeDevice(devicePubHex);
         break;
       case "dkg":
         result = await driveDkg(signer, dkg);

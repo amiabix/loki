@@ -30,6 +30,8 @@ export type CustodyMethod = "platform" | "roaming" | "passphrase";
 export interface CreateSignerOpts { name: string; method: CustodyMethod; passphrase?: string }
 export interface UnlockOpts { method: CustodyMethod; passphrase?: string }
 export interface SignerSession { slot?: number; profile: { id: string; name: string } }
+/** A public-roster member, as the coordinator's `/api/members` returns it. */
+export interface EnrolledMember { slot: number; signing_pubkey: string; relay_pubkey: string; advertise_url: string }
 
 /**
  * The contract W1's wasm module must satisfy. `request` is the in-process
@@ -51,6 +53,9 @@ export interface SignerModule {
   unlock(opts: UnlockOpts): Promise<SignerSession>;
   /** Drop the in-memory share; the session ends. */
   lock(): Promise<void>;
+  /** Register this signer into the coordinator's public roster (frostd-only, no advertise_url)
+   *  and return the allocated member — its `slot` is the DKG slot. Default origin: same-origin. */
+  enroll(coordinatorOrigin?: string): Promise<EnrolledMember>;
   /** In-process member call — the old per-member HTTP, now dispatched into wasm. */
   request<T = unknown>(path: string, body?: unknown): Promise<T>;
 }
@@ -68,6 +73,54 @@ function workerUrl(): string | null {
   if (typeof window === "undefined" || typeof Worker === "undefined") return null;
   const u = (window as unknown as { __LOKI_SIGNER_WORKER_URL?: string }).__LOKI_SIGNER_WORKER_URL;
   return typeof u === "string" && u.length > 0 ? u : null;
+}
+
+// ─── browser enrollment: device key + signed registration ────────────────────
+//
+// Enrollment mirrors the native self-registration (poc/src/host/registration.rs): the member
+// identity (held unlocked in the Worker) authorizes a device-login key, which then signs the
+// coordinator's registration transcript. In the browser the device key is a non-extractable
+// WebCrypto P-256 keypair persisted in IndexedDB — the private key never leaves the device,
+// and re-enrolling the same identity reuses the same device key (the coordinator pins one
+// device to one identity). The member advertises no origin: it is reachable only over frostd.
+
+const DEVICE_DB = "loki_signer";
+const DEVICE_STORE = "device";
+const DEVICE_KEY = "enrollment-device-key";
+
+function idb(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DEVICE_DB, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(DEVICE_STORE);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+function idbReq<T>(store: IDBObjectStore, op: "get" | "put", ...args: unknown[]): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const r = (store[op] as (...a: unknown[]) => IDBRequest).apply(store, args);
+    r.onsuccess = () => resolve(r.result as T);
+    r.onerror = () => reject(r.error);
+  });
+}
+/** The persistent device-login keypair for this browser; generated once, never extractable. */
+async function deviceKeypair(): Promise<CryptoKeyPair> {
+  const db = await idb();
+  const existing = await idbReq<CryptoKeyPair | undefined>(
+    db.transaction(DEVICE_STORE, "readonly").objectStore(DEVICE_STORE), "get", DEVICE_KEY);
+  if (existing) return existing;
+  const pair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, false, ["sign", "verify"]);
+  await idbReq(db.transaction(DEVICE_STORE, "readwrite").objectStore(DEVICE_STORE), "put", pair, DEVICE_KEY);
+  return pair;
+}
+function toHex(bytes: Uint8Array): string {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+async function postJson<T>(url: string, body: unknown): Promise<T> {
+  const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new ApiError(data.error ?? "coordinator request failed", res.status);
+  return data as T;
 }
 
 function browserSigner(url: string): SignerModule {
@@ -113,6 +166,21 @@ function browserSigner(url: string): SignerModule {
       return { profile };
     },
     async lock() { await call({ op: "lock" }); current = null; },
+    async enroll(coordinatorOrigin?: string): Promise<EnrolledMember> {
+      if (!current) throw new ApiError("Unlock your signer", 401);
+      const origin = coordinatorOrigin ?? window.location.origin;
+      const material = await call<{ signing_pubkey: string; relay_pubkey: string }>({ op: "enroll-material" });
+      const pair = await deviceKeypair();
+      const device_pubkey = toHex(new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey)));
+      const authorization = await call<string>({ op: "authorize-device", devicePubHex: device_pubkey });
+      const enrollment = { signing_pubkey: material.signing_pubkey, relay_pubkey: material.relay_pubkey, device_pubkey, authorization };
+      // No advertise_url (frostd-only) and no slot (coordinator allocates); the transcript binds "".
+      const { challenge } = await postJson<{ challenge: string }>(`${origin}/api/members/challenge`, enrollment);
+      const transcript = ["loki-member-registration-v1", origin, 0, enrollment.signing_pubkey, enrollment.relay_pubkey, "", device_pubkey, challenge].join("\n");
+      const signature = new Uint8Array(await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, pair.privateKey, new TextEncoder().encode(transcript)));
+      const { member } = await postJson<{ member: EnrolledMember }>(`${origin}/api/members`, { ...enrollment, challenge, signature: toHex(signature) });
+      return member;
+    },
     async request<T>(path: string, body?: unknown): Promise<T> {
       if (path === "status") {
         if (!current) throw new ApiError("Unlock your signer", 401);
@@ -165,6 +233,8 @@ const mockSigner: SignerModule = {
   async lock() {
     try { sessionStorage.removeItem(SESSION); } catch {}
   },
+  // Enrollment needs the unlocked identity + a device key the wasm core authorizes (W1).
+  async enroll(): Promise<EnrolledMember> { throw new SignerPending("enroll"); },
   async request<T>(path: string): Promise<T> {
     const s = session();
     // Status is the only member call the onboarding lifecycle needs; serve it so a
@@ -196,5 +266,6 @@ export const signer: SignerModule = {
   createSigner: (opts) => impl().createSigner(opts),
   unlock: (opts) => impl().unlock(opts),
   lock: () => impl().lock(),
+  enroll: (coordinatorOrigin) => impl().enroll(coordinatorOrigin),
   request<T = unknown>(path: string, body?: unknown): Promise<T> { return impl().request<T>(path, body); },
 };

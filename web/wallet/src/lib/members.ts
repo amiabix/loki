@@ -45,10 +45,16 @@ function publicOrigin(value: unknown): string {
   }
   return value;
 }
+// A frostd-only member (an in-browser signer) advertises no peer origin: peer-over-frostd
+// removed inbound peer HTTP, so "" means "reachable only via the frostd relay". A native
+// member still advertises its loopback origin, which must be a valid origin.
+function optionalOrigin(value: unknown): string {
+  return value === undefined || value === "" ? "" : publicOrigin(value);
+}
 function publicMember(raw: unknown): Member {
   const m = object(raw);
   fields(m, ["slot", "signing_pubkey", "relay_pubkey", "advertise_url"]);
-  return { slot: slot(m.slot), signing_pubkey: hex(m.signing_pubkey, 32), relay_pubkey: hex(m.relay_pubkey, 32), advertise_url: publicOrigin(m.advertise_url) };
+  return { slot: slot(m.slot), signing_pubkey: hex(m.signing_pubkey, 32), relay_pubkey: hex(m.relay_pubkey, 32), advertise_url: optionalOrigin(m.advertise_url) };
 }
 
 /** Strictly public data. Legacy hosted registries must be retired locally, never loaded. */
@@ -104,7 +110,7 @@ function enrollment(raw: unknown): Enrollment {
   const authorization = hex(e.authorization, 64);
   const identity = createPublicKey({ key: Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), Buffer.from(signing_pubkey, "hex")]), format: "der", type: "spki" });
   if (!verify(null, Buffer.from(device_pubkey, "hex"), identity, Buffer.from(authorization, "hex"))) throw new Error("device authorization does not verify");
-  return { ...(e.slot === undefined ? {} : { slot: slot(e.slot) }), signing_pubkey, relay_pubkey, advertise_url: publicOrigin(e.advertise_url), device_pubkey, authorization };
+  return { ...(e.slot === undefined ? {} : { slot: slot(e.slot) }), signing_pubkey, relay_pubkey, advertise_url: optionalOrigin(e.advertise_url), device_pubkey, authorization };
 }
 function deviceKey(key: string) {
   if (!key.startsWith("04")) throw new Error("expected uncompressed P-256 key");

@@ -57,6 +57,39 @@ locally with its unlock file and pair with its new link. A web restart does not 
 `LOKI_DEV_FAUCET=1` enables the optional local-origin regtest faucet; it receives only a public
 regtest address. It is off by default, and the supplied launcher binds Next to localhost.
 
+## In-browser signer: enroll → discover → DKG
+
+An in-browser signer (`src/lib/signer.ts`, the wasm core in `poc/loki-signer-wasm`) has no
+local HTTP server, so it enrolls as a **frostd-only member with no `advertise_url`** — peer
+traffic goes over the frostd relay (peer-over-frostd), and the roster stores `advertise_url: ""`
+for it. Native members still advertise their loopback origin and enroll exactly as before; both
+coexist in one roster.
+
+1. **Create / unlock** the signer (passkey or passphrase). The device `Identity` is held in the
+   Worker.
+2. **Enroll** — `enroll(coordinatorOrigin?)` (default: same origin):
+   - the Worker returns `enrollMaterial()` → `{signing_pubkey, relay_pubkey}` (the relay key is
+     the frostd-login pubkey);
+   - the browser generates a non-extractable **WebCrypto P-256 device key** (persisted in
+     IndexedDB, reused on re-enroll) and the Worker's `authorizeDevice()` signs it with the
+     member identity — the same Ed25519/P-256 proof as `poc/src/host/registration.rs`;
+   - `POST /api/members/challenge` → the browser signs the registration transcript
+     (`advertise_url` is `""`) with the device key (ECDSA P-256 / SHA-256, IEEE-P1363) →
+     `POST /api/members` returns the allocated member and `slot`.
+3. **Discover** the ceremony params. The public coordinator (this Next app) owns only the roster;
+   the DKG session is run by the vault **creator** (slot 1), which serves `vaultHex`, the setup
+   doc (`rosterHex`, `setup_version: 2`), the frostd `sessionId` and `coordinatorPeer` from its
+   ceremony endpoints (`/api/roster`, `/api/session`, see `poc/src/host/ceremony.rs`). The UI/parent
+   supplies these to the signer. **Not built here:** a browser-reachable discovery surface for the
+   creator's session (CORS/TLS + invite delivery, or a vault-announcement endpoint in this app) —
+   see the handoff below.
+4. **DKG** — `request("dkg", {vaultHex, slot, label, network, rosterHex, frostdUrl,
+   coordinatorPeer, sessionId, transportUrl})` drives `driveDkg()` to an active vault + address.
+   `frostdUrl` (TLS frostd) and `transportUrl` (the `wasm-transport` module) are **deployment
+   config the parent supplies**, not discovered.
+
+Payment stays `SignerPending` (Phase C).
+
 ## Registry and limits
 
 `.access.json` (or `LOKI_REGISTRY`) contains only `{access: [{slot, signing_pubkey, relay_pubkey,

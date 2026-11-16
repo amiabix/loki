@@ -283,6 +283,38 @@ impl Signer {
         .to_string())
     }
 
+    /// This member's public enrollment identity for the coordinator's public roster:
+    /// `signing_pubkey` (the Ed25519 member identity) and `relay_pubkey` (= the X25519 frostd
+    /// login pubkey, this member's relay address). Hex JSON. The browser POSTs these, plus a
+    /// browser device key, to the coordinator's `/api/members` — a frostd-only member with no
+    /// `advertise_url`. Unlock the signer first.
+    #[wasm_bindgen(js_name = enrollMaterial)]
+    pub fn enroll_material(&self) -> Result<String, JsError> {
+        let identity = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| JsError::new("unlock the signer first"))?;
+        Ok(serde_json::json!({
+            "signing_pubkey": hex::encode(identity.public().signing),
+            "relay_pubkey": hex::encode(identity.public().encryption),
+        })
+        .to_string())
+    }
+
+    /// Authorize a browser device-login key (P-256 SEC1 uncompressed bytes, hex) with this
+    /// member identity, using the same Ed25519 enrollment proof as the native self-registration
+    /// (`Identity::authorize_device`). Returns the authorization signature (hex) the coordinator
+    /// verifies before the device key's own signature over the registration transcript.
+    #[wasm_bindgen(js_name = authorizeDevice)]
+    pub fn authorize_device(&self, device_pub_hex: &str) -> Result<String, JsError> {
+        let identity = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| JsError::new("unlock the signer first"))?;
+        let device_pub = hex::decode(device_pub_hex).map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(hex::encode(identity.authorize_device(&device_pub)))
+    }
+
     /// Create-or-reopen this member's vault signer, confirm the coordinator's roster, and
     /// begin DKG. Returns the `VaultRef` JSON. The Worker must pre-open `vaultPaths(vaultHex)`
     /// for write first. `roster` is the coordinator's setup document (`setup_version: 2`).

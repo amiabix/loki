@@ -4,10 +4,13 @@
 // over HTTP to a local member. Only coordinator calls (/api/members, /api/fund)
 // still hit the network.
 // Explicit .ts extension so Node's test loader resolves the chained import.
-import { signer, ApiError, type CreateSignerOpts, type SignerSession, type UnlockOpts } from "./signer.ts";
+import { signer, ApiError, type CreateSignerOpts, type EnrolledMember, type SignerSession, type UnlockOpts } from "./signer.ts";
 export { ApiError };
-export type { CustodyMethod, CreateSignerOpts, UnlockOpts } from "./signer";
+export type { CustodyMethod, CreateSignerOpts, EnrolledMember, UnlockOpts } from "./signer";
 export type Slot = { slot: number; signing_pubkey: string; relay_pubkey: string; advertise_url: string };
+
+/** Register this in-browser signer into the public roster; returns its allocated member/slot. */
+export function enroll(coordinatorOrigin?: string): Promise<EnrolledMember> { return signer.enroll(coordinatorOrigin); }
 
 /** A member request, dispatched into the in-browser signer instead of fetched. */
 export async function api<T = unknown>(path: string, body?: unknown): Promise<T> {

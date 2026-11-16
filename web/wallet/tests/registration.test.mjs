@@ -7,12 +7,12 @@ import { test } from 'node:test';
 import * as members from '../src/lib/members.ts';
 
 const origin = 'http://localhost:3001';
-function device(slot) {
+function device(slot, { advertise_url = 'http://127.0.0.1:3601' } = {}) {
   const identity = generateKeyPairSync('ed25519');
   const key = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
   const jwk = key.publicKey.export({ format: 'jwk' });
   const device_pubkey = Buffer.concat([Buffer.from([4]), Buffer.from(jwk.x, 'base64url'), Buffer.from(jwk.y, 'base64url')]).toString('hex');
-  const input = { ...(slot ? { slot } : {}), signing_pubkey: identity.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('hex'), relay_pubkey: randomBytes(32).toString('hex'), advertise_url: 'http://127.0.0.1:3601', device_pubkey,
+  const input = { ...(slot ? { slot } : {}), signing_pubkey: identity.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('hex'), relay_pubkey: randomBytes(32).toString('hex'), ...(advertise_url === null ? {} : { advertise_url }), device_pubkey,
     authorization: sign(null, Buffer.from(device_pubkey, 'hex'), identity.privateKey).toString('hex') };
   return { input, key };
 }
@@ -44,6 +44,29 @@ test('device self-registration binds identity, endpoint and slot; consumes chall
     await assert.rejects(members.issueRegistrationChallenge(foreign.input, origin), /slot/);
     await assert.rejects(members.issueRegistrationChallenge({ ...d.input, authorization: '00'.repeat(64) }, origin), /authorization/);
     await assert.rejects(members.issueRegistrationChallenge({ ...d.input, passphrase: 'never accept' }, origin), /field/);
+  } finally { rmSync(dir, { recursive: true, force: true }); delete process.env.LOKI_REGISTRY; }
+});
+
+test('a frostd-only in-browser signer enrolls without an advertise_url, beside native members', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'loki-roster-frostd-'));
+  process.env.LOKI_REGISTRY = join(dir, '.access.json');
+  try {
+    // No advertise_url: the browser signer has no inbound peer HTTP (peer-over-frostd).
+    const browser = device(undefined, { advertise_url: null });
+    const challenge = await members.issueRegistrationChallenge(browser.input, origin);
+    const member = await members.registerMember(response(browser, challenge.challenge), origin);
+    assert.equal(member.slot, 1);
+    assert.equal(member.advertise_url, '', 'frostd-only member stores an empty advertise_url');
+    assert.deepEqual(members.memberById(1), member);
+    // A native member that still advertises a loopback origin registers alongside it.
+    const native = device();
+    const nativeChallenge = await members.issueRegistrationChallenge(native.input, origin);
+    const nativeMember = await members.registerMember(response(native, nativeChallenge.challenge), origin);
+    assert.equal(nativeMember.slot, 2);
+    assert.equal(nativeMember.advertise_url, 'http://127.0.0.1:3601');
+    assert.equal(members.slots().length, 2);
+    // A non-empty advertise_url that is not a valid origin is still rejected.
+    await assert.rejects(members.issueRegistrationChallenge(device(undefined, { advertise_url: 'not-an-origin' }).input, origin));
   } finally { rmSync(dir, { recursive: true, force: true }); delete process.env.LOKI_REGISTRY; }
 });
 
