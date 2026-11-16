@@ -10,6 +10,7 @@ import {
   createSigner,
   unlock,
   hasSigner,
+  hasSignerHint,
   forgetSession,
   logout,
   pendingApprovals,
@@ -487,7 +488,7 @@ function Splash({ sub }: { sub: string }) {
 // phone) unlocks the sealed share, with a passphrase fallback for machines without
 // WebAuthn. No install, no 127.0.0.1 pairing link. Tiers match definition §2.B.
 function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string | null }) {
-  const [existing, setExisting] = useState<boolean | null>(null); // a share sealed here?
+  const [existing, setExisting] = useState<boolean>(hasSignerHint); // a share sealed here? sync guess, confirmed below
   const [mode, setMode] = useState<"passkey" | "passphrase">("passkey");
   const [platform, setPlatform] = useState(false); // biometric authenticator present?
   const [name, setName] = useState("");
@@ -563,12 +564,10 @@ function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string 
 
       <ErrMsg msg={err ?? notice} />
 
-      {existing !== null && (
-        <button className="mt-5 min-h-11 w-full text-xs text-muted hover:text-mint"
-          onClick={() => { setErr(null); setExisting(!unlocking); }}>
-          {unlocking ? "Set up a different signer instead" : "Already have a signer here? Unlock it"}
-        </button>
-      )}
+      <button className="mt-5 min-h-11 w-full text-xs text-muted hover:text-mint"
+        onClick={() => { setErr(null); setExisting(!unlocking); }}>
+        {unlocking ? "Set up a different signer instead" : "Already have a signer here? Unlock it"}
+      </button>
     </div>
   </FullScreen>;
 }

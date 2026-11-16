@@ -31,6 +31,7 @@ export async function listSlots(): Promise<Slot[]> {
 
 /** True once a share is sealed in this browser → Unlock rather than Create. */
 export function hasSigner(): Promise<boolean> { return signer.hasSigner(); }
+export { hasSignerHint } from "./signer"; // sync first-paint guess; hasSigner() confirms
 
 function rememberMe(s: SignerSession): void {
   try { sessionStorage.setItem("loki_me", JSON.stringify({ slot: s.slot })); } catch {}

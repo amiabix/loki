@@ -165,6 +165,7 @@ function browserSigner(cfg: SignerConfig): SignerModule {
       if (method === "passphrase" && !passphrase) throw new ApiError("Choose a passphrase to protect your share", 400);
       const profile = await call<{ id: string; name: string }>({ op: "create", method, name, passphrase });
       current = { profile, se: method === "passphrase" ? "software" : "passkey" };
+      try { localStorage.setItem(SEALED, "1"); } catch {} // sync hint so Login paints Unlock without a flicker
       return { profile };
     },
     async unlock({ method, passphrase }) {
@@ -224,6 +225,9 @@ function browserSigner(cfg: SignerConfig): SignerModule {
 
 const SESSION = "loki_signer_session"; // sessionStorage: the unlocked session
 const SEALED = "loki_signer_sealed";   // localStorage: a share exists in this browser
+
+/** Synchronous best-guess "a share is sealed here" for the first paint; hasSigner() confirms. */
+export function hasSignerHint(): boolean { try { return localStorage.getItem(SEALED) !== null; } catch { return false; } }
 
 function session(): (SignerSession & { se: string }) | null {
   if (typeof window === "undefined") return null;
