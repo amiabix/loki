@@ -67,6 +67,9 @@ getrandom     = { version = "0.2", features = ["js"] }
 getrandom_v04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 web-time      = "1"
 uuid          = { version = "1", features = ["js"] }
+# OPFS synchronous store backend (signer/durable.rs) imports the js/opfs_fs.js worker glue
+# via wasm-bindgen. Native builds never pull this.
+wasm-bindgen  = "0.2"
 
 [features]
 # Apple Secure Enclave backend (macOS only); the swift link lives in loki-poc's build.rs,

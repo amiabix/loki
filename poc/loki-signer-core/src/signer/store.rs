@@ -23,7 +23,9 @@ use std::path::{Path, PathBuf};
 
 use zeroize::Zeroizing;
 
-use crate::signer::durable::{replace_durable, write_durable};
+use crate::signer::durable::{
+    create_dir_private, file_exists, read_file, replace_durable, write_durable,
+};
 use crate::signer::secure_element::{file_binding, SealedShare, SecureElement};
 use crate::signer::Network;
 
@@ -73,20 +75,8 @@ impl SignerStore {
         vault: [u8; 32],
         member: u16,
     ) -> Result<Self, String> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(dir)
-                .map_err(|e| format!("signer directory: {e}"))?;
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-                .map_err(|e| format!("signer directory: {e}"))?;
-        }
-        #[cfg(not(unix))]
-        std::fs::create_dir_all(dir).map_err(|e| format!("signer directory: {e}"))?;
-        if dir.join(META).exists() {
+        create_dir_private(dir).map_err(|e| format!("signer directory: {e}"))?;
+        if file_exists(dir, META) {
             return Err("signer directory already holds a signer".into());
         }
         let meta = serde_json::json!({
@@ -108,7 +98,7 @@ impl SignerStore {
     /// Reopen an existing data directory from its public metadata.
     pub fn open(dir: &Path) -> Result<Self, String> {
         let meta: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(dir.join(META)).map_err(|e| format!("signer metadata: {e}"))?,
+            &read_file(dir, META).map_err(|e| format!("signer metadata: {e}"))?,
         )
         .map_err(|_| "signer metadata is not JSON")?;
         let network = match meta["network"].as_str() {
@@ -175,7 +165,7 @@ impl SignerStore {
         se: &impl SecureElement,
         kind: FileKind,
     ) -> Result<Option<(u64, Zeroizing<Vec<u8>>)>, String> {
-        let raw = match std::fs::read(self.dir.join(kind.file())) {
+        let raw = match read_file(&self.dir, &kind.file()) {
             Ok(raw) => raw,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(format!("signer {} file: {e}", kind.name())),
