@@ -28,8 +28,71 @@ pub mod repair;
 pub mod secure_element;
 #[cfg(all(feature = "apple-enclave", target_os = "macos"))]
 pub mod secure_element_apple;
-pub(crate) mod store;
+pub mod secure_element_webauthn;
+pub mod store;
 pub mod wysiwys;
+
+/// Browser-only self-test of the OPFS synchronous-store seam: write `bytes` at `path`,
+/// then read them back through the same `durable` backend the signer's store uses. The
+/// calling Worker must pre-open `path` (`opfsPreopenWrite`) first. Proves the wasm↔OPFS
+/// sync-handle path works in a real browser before the full store rides on it.
+#[cfg(target_arch = "wasm32")]
+pub fn opfs_selftest(path: &str, bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let p = std::path::Path::new(path);
+    let dir = p.parent().ok_or("path needs a parent directory")?;
+    let name = p.file_name().and_then(|n| n.to_str()).ok_or("path needs a file name")?;
+    durable::write_durable(dir, name, bytes).map_err(|e| e.to_string())?;
+    durable::read_file(dir, name).map_err(|e| e.to_string())
+}
+
+/// Split a deterministic OPFS path into `(dir, name)` for the `durable` backend.
+#[cfg(target_arch = "wasm32")]
+fn opfs_split(path: &str) -> Result<(&std::path::Path, &str), String> {
+    let p = std::path::Path::new(path);
+    let dir = p.parent().ok_or("path needs a parent directory")?;
+    let name = p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("path needs a file name")?;
+    Ok((dir, name))
+}
+
+/// Write `bytes` to the deterministic OPFS `path` through the signer's `durable` backend.
+/// `create_new` selects write-once (`true`, keeps existing content) vs. replace (`false`).
+/// The calling Worker must `opfsPreopenWrite(path)` first. Used by the stateful wasm signer
+/// for the pre-vault device files (`identity.sealed`, `profile.json`, `kek.salt`).
+#[cfg(target_arch = "wasm32")]
+pub fn opfs_put(path: &str, bytes: &[u8], create_new: bool) -> Result<(), String> {
+    let (dir, name) = opfs_split(path)?;
+    if create_new {
+        durable::write_durable(dir, name, bytes)
+    } else {
+        durable::replace_durable(dir, name, bytes)
+    }
+    .map_err(|e| e.to_string())
+}
+
+/// Read the deterministic OPFS `path`, or `None` if absent. The calling Worker must
+/// `opfsPreopenRead(path)` first.
+#[cfg(target_arch = "wasm32")]
+pub fn opfs_get(path: &str) -> Result<Option<Vec<u8>>, String> {
+    let (dir, name) = opfs_split(path)?;
+    match durable::read_file(dir, name) {
+        Ok(b) => Ok(Some(b)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Whether the deterministic OPFS `path` exists with content. The calling Worker must
+/// `opfsPreopenRead(path)` first (an un-pre-opened path reads as absent).
+#[cfg(target_arch = "wasm32")]
+pub fn opfs_exists(path: &str) -> bool {
+    match opfs_split(path) {
+        Ok((dir, name)) => durable::file_exists(dir, name),
+        Err(_) => false,
+    }
+}
 
 pub use crate::setup_transport::{DkgWire, DkgWireKind};
 use crate::signer::wysiwys::PaymentView;

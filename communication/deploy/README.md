@@ -77,6 +77,39 @@ poc/target/release/loki_member_app --data /absolute/member-1 --port 3601 \
 (the SSRF guard otherwise rejects loopback peer URLs). The local-passphrase file must be
 mode 0600. This is a one-host TEST setup, not production HTTPS or independent operators.
 
+## frostd behind TLS + CORS for the in-browser signer (`frostd-tls.sh`)
+
+The in-browser (wasm) signer (`poc/wasm-transport`, W3) runs frostd's POST contract from
+the page itself over the Fetch API. A browser can reach frostd **only** over https/wss and
+**only** if the reply carries CORS headers for the wallet origin. The loopback-plaintext dev
+relay (`frostd -n -p 2744`) fails both: `http://127.0.0.1:2744` is mixed content from an
+https page, and frostd emits no CORS headers, so the `fetch()` is blocked before the signer
+sees any reply. The ssh-tunnel path (`ssh -N -L 2744:localhost:2744`) only helps a
+server-side `FrostdTransport` dialing out; it does nothing for code running in the browser.
+
+`require_tls_off_loopback` (in both the native and wasm transports) already demands https
+off loopback — so the wasm signer must point at a TLS front, not the tunnel.
+
+`frostd-tls.sh` runs Caddy as a TLS-terminating reverse proxy in front of the loopback
+frostd and injects CORS (including the OPTIONS preflight, which it answers itself since
+frostd would 405 it) for one site origin:
+
+```sh
+# real host + ACME cert, public:
+ORIGIN=https://wallet.example FRONT=relay.example communication/deploy/frostd-tls.sh
+# -> wasm signer points at https://relay.example
+
+# local https (Caddy internal CA), for dev against a localhost wallet origin:
+ORIGIN=https://localhost:3011 communication/deploy/frostd-tls.sh
+# -> wasm signer points at https://localhost:8443
+```
+
+cloudflared works the same way for the public case (a `trycloudflare` tunnel to
+`127.0.0.1:2744` gives https), but it does not add CORS, so Caddy in front of frostd is
+still needed for the CORS headers; put cloudflared in front of Caddy, or use Caddy's own
+ACME. CORS is per-origin: list the exact wallet origin (scheme+host+port, no trailing
+slash), not `*` — `*` is incompatible with the `authorization` bearer header browsers send.
+
 ## Public HTTPS bringup (`public-testnet.sh`)
 
 Hosts ONLY the shared coordinator over a free cloudflared quick tunnel, so testers on

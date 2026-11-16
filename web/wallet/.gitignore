@@ -33,6 +33,9 @@ yarn-error.log*
 # env files (can opt-in for committing if needed)
 .env*
 
+# staged in-browser signer assets (built from poc/, copied by scripts/copy-signer.mjs)
+/public/signer/
+
 # runtime public roster and one-use registration challenges
 .members.json
 .session-secret

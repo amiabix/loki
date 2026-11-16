@@ -22,11 +22,13 @@
 //! "burned but lost" is impossible: the partial is in `.burn` before `.nonce` is removed,
 //! and `.burn` is fsync'd before the removal.
 
-use crate::signer::durable::write_durable;
+use crate::signer::durable::{
+    create_dir_all, file_exists, read_file, remove_file, sync_dir, write_durable,
+};
 use crate::signer::secure_element::{SealedShare, SecureElement};
 use reddsa_frost::frost::redpallas as frost;
 use std::{
-    fs, io,
+    io,
     path::{Path, PathBuf},
 };
 
@@ -88,18 +90,18 @@ impl NonceStore {
     /// (fresh) nonce dir at that same epoch, so nonces stamped with any lower epoch are
     /// refused by [`NonceStore::sign_and_burn`].
     pub fn open_at_epoch(dir: &Path, epoch: u64) -> io::Result<Self> {
-        fs::create_dir_all(dir)?;
+        create_dir_all(dir)?;
         Ok(Self {
             dir: dir.to_path_buf(),
             epoch,
         })
     }
 
-    fn nonce_path(&self, id: &str) -> PathBuf {
-        self.dir.join(format!("{id}.nonce"))
+    fn nonce_name(id: &str) -> String {
+        format!("{id}.nonce")
     }
-    fn burn_path(&self, id: &str) -> PathBuf {
-        self.dir.join(format!("{id}.burn"))
+    fn burn_name(id: &str) -> String {
+        format!("{id}.burn")
     }
 
     /// Round 1: generate a single-use nonce, PERSIST it (sealed + fsync'd), then return
@@ -110,10 +112,10 @@ impl NonceStore {
         se: &impl SecureElement,
         signing_share: &frost::keys::SigningShare,
     ) -> Result<frost::round1::SigningCommitments, NonceError> {
-        if self.burn_path(id).exists() {
+        if file_exists(&self.dir, &Self::burn_name(id)) {
             return Err(NonceError::Other("nonce id already burned".into()));
         }
-        if self.nonce_path(id).exists() {
+        if file_exists(&self.dir, &Self::nonce_name(id)) {
             // Already committed; recover the same public commitment, do not re-generate.
             let (_, commitment) = self.load(id, se)?;
             return Ok(commitment);
@@ -126,7 +128,7 @@ impl NonceStore {
         // Seal the secret nonce with the same at-rest hierarchy as the share, STAMPED with
         // the current epoch so a restore (which bumps the epoch) refuses this nonce.
         let sealed = SealedShare::seal(se, self.epoch, &serialized).map_err(NonceError::Other)?;
-        write_durable(&self.dir, &format!("{id}.nonce"), &sealed.to_bytes())?;
+        write_durable(&self.dir, &Self::nonce_name(id), &sealed.to_bytes())?;
         Ok(commitment)
     }
 
@@ -135,7 +137,7 @@ impl NonceStore {
         id: &str,
         se: &impl SecureElement,
     ) -> Result<(frost::round1::SigningNonces, frost::round1::SigningCommitments), NonceError> {
-        let raw = fs::read(self.nonce_path(id))?;
+        let raw = read_file(&self.dir, &Self::nonce_name(id))?;
         let sealed = SealedShare::from_bytes(&raw).map_err(NonceError::Other)?;
         // A nonce stamped with an older epoch than this store survived across a restore
         // (the dir is normally fresh after restore, but a leftover/rolled-back file must
@@ -152,7 +154,7 @@ impl NonceStore {
 
     /// The 32-byte message a burn record was created for (used to detect reuse).
     fn burned_message(&self, id: &str) -> io::Result<Option<[u8; 32]>> {
-        match fs::read(self.burn_path(id)) {
+        match read_file(&self.dir, &Self::burn_name(id)) {
             Ok(raw) if raw.len() >= 32 => Ok(Some(raw[..32].try_into().unwrap())),
             Ok(_) => Ok(None),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -189,7 +191,7 @@ impl NonceStore {
             if prev != message {
                 return Err(NonceError::Reuse);
             }
-            let raw = fs::read(self.burn_path(id))?;
+            let raw = read_file(&self.dir, &Self::burn_name(id))?;
             return frost::round2::SignatureShare::deserialize(&raw[32..])
                 .map_err(|e| NonceError::Other(format!("recorded partial: {e}")));
         }
@@ -202,7 +204,7 @@ impl NonceStore {
         let mut record = Vec::with_capacity(32 + 64);
         record.extend_from_slice(&message);
         record.extend_from_slice(&share.serialize());
-        write_durable(&self.dir, &format!("{id}.burn"), &record)?;
+        write_durable(&self.dir, &Self::burn_name(id), &record)?;
 
         if inject_crash_after_burn() {
             // Simulate a power loss after the burn is durable but before the nonce file
@@ -212,15 +214,15 @@ impl NonceStore {
         }
 
         // Only now remove the now-dead nonce; crash here is still safe (burn present).
-        let _ = fs::remove_file(self.nonce_path(id));
-        fs::File::open(&self.dir)?.sync_all()?;
+        let _ = remove_file(&self.dir, &Self::nonce_name(id));
+        sync_dir(&self.dir)?;
         Ok(share)
     }
 
     /// State after a (possibly crashed) attempt, for tests and recovery.
     pub fn state(&self, id: &str) -> NonceState {
-        let nonce = self.nonce_path(id).exists();
-        let burn = self.burn_path(id).exists();
+        let nonce = file_exists(&self.dir, &Self::nonce_name(id));
+        let burn = file_exists(&self.dir, &Self::burn_name(id));
         match (nonce, burn) {
             (false, false) => NonceState::Fresh,
             (true, false) => NonceState::Committed,
@@ -242,6 +244,7 @@ mod tests {
     use crate::signer::secure_element::SoftwareSecureElement;
     use reddsa_frost::frost::redpallas as frost;
     use std::collections::BTreeMap;
+    use std::fs;
 
     /// A 2-of-2 key set and a rerandomized signing package over `msg`, for one signer.
     fn fixture(

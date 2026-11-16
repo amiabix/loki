@@ -22,7 +22,7 @@
 
 use crate::dkg_core::{DkgCore, DkgPhase, DkgState};
 use crate::member_state::{Roster, ValidatedRoster};
-use crate::setup_transport::{DkgWire, DkgWireKind, Identity};
+use crate::setup_transport::{DkgWire, DkgWireKind, Identity, PublicIdentity};
 use crate::signer::backup::{self, BackupArtifact, BackupMaterial};
 use crate::signer::nonce::NonceStore;
 use crate::signer::secure_element::{SealedShare, SecureElement};
@@ -37,7 +37,13 @@ use orchard::keys::FullViewingKey;
 use reddsa_frost::frost::redpallas as frost;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// std::time::Instant has no time source on wasm32-unknown-unknown; web-time maps it onto
+// performance.now() with the same API, so the roster-deadline logic is unchanged.
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 use zeroize::Zeroizing;
 
 /// The member's on-device approval decision for a rendered payment. In a real signer this
@@ -295,7 +301,7 @@ impl SetupCheckpoint {
 }
 
 /// The share file: key package, group public package and `vs`.
-pub(crate) fn encode_share(key_package: &[u8], public_package: &[u8], vs: &[u8; 32]) -> Zeroizing<Vec<u8>> {
+pub fn encode_share(key_package: &[u8], public_package: &[u8], vs: &[u8; 32]) -> Zeroizing<Vec<u8>> {
     let mut out = Zeroizing::new(Vec::new());
     out.extend_from_slice(&(key_package.len() as u32).to_be_bytes());
     out.extend_from_slice(key_package);
@@ -306,7 +312,7 @@ pub(crate) fn encode_share(key_package: &[u8], public_package: &[u8], vs: &[u8; 
 }
 
 #[allow(clippy::type_complexity)]
-pub(crate) fn decode_share(raw: &[u8]) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>, [u8; 32]), String> {
+pub fn decode_share(raw: &[u8]) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>, [u8; 32]), String> {
     let mut reader = crate::dkg_core::Reader::new(raw);
     let key = Zeroizing::new(reader.field(64 * 1024)?.to_vec());
     let public = reader.field(64 * 1024)?.to_vec();
@@ -679,6 +685,22 @@ impl<SE: SecureElement> LocalSigner<SE> {
         Ok((public, self.fvk()?.clone()))
     }
 
+    /// Open a candidate PCZT the `proposer` signer sealed to this member for `context`,
+    /// using this signer's own setup identity. Returns the unsigned candidate bytes; the
+    /// caller still runs the WYSIWYS render + `sign_approve` (which re-derives and binds the
+    /// sighash) before any share is released. Used by the browser non-proposer pump, whose
+    /// transport layer lives in JS and so cannot open the member-to-member envelope itself.
+    pub fn open_candidate(
+        &self,
+        proposer: &PublicIdentity,
+        context: &crate::signing_session::SessionContext,
+        wire: &[u8],
+    ) -> Result<Vec<u8>, SignerError> {
+        let identity = self.identity.as_ref().ok_or(SignerError::NotReady)?;
+        crate::transport::SealedCandidate::open(identity, proposer, context, wire)
+            .map_err(SignerError::Other)
+    }
+
     /// The device-side "abandon this setup" action: wipe the setup's fresh key, FROST
     /// state and saved messages, and refuse to continue it. Also done automatically on
     /// any mismatch before the share exists.
@@ -713,49 +735,16 @@ impl<SE: SecureElement> LocalSigner<SE> {
         params: &crate::signer::PublicPaymentParams,
         alpha: &[u8; 32],
     ) -> Result<Vec<u8>, SignerError> {
-        use crate::candidate::{alpha_from_canonical_bytes, build_candidate, quote_fee, CandidateInputs};
         // ponytail: first-note selection; swap for real coin selection when multi-note lands.
         let note = *self
             .candidate_notes
             .first()
             .ok_or_else(|| SignerError::Other("signer holds no spendable note".into()))?;
-        let alpha = alpha_from_canonical_bytes(alpha)
-            .ok_or_else(|| SignerError::Other("noncanonical alpha".into()))?;
-
-        let mut inputs = CandidateInputs {
-            vault_fvk: self.fvk()?,
-            notes: vec![note],
-            recipient: params.recipient,
-            amount: params.amount,
-            memo: params.memo.clone(),
-            change: zcash_protocol::value::Zatoshis::ZERO,
-            target_height: params.target_height,
-            expiry_height: params.expiry_height,
-        };
-        let fee = u64::from(quote_fee(params_net, &inputs).map_err(SignerError::Other)?);
-        let spend = note.value().inner();
-        let amount = u64::from(params.amount);
-        let change = spend
-            .checked_sub(amount)
-            .and_then(|r| r.checked_sub(fee))
-            .ok_or_else(|| SignerError::Other("note does not cover amount + fee".into()))?;
-        inputs.change = zcash_protocol::value::Zatoshis::from_u64(change)
-            .map_err(|e| SignerError::Other(format!("{e:?}")))?;
-        let built = build_candidate(
-            params_net,
-            &inputs,
-            &[alpha],
-            rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng),
-        )
-        .map_err(SignerError::Other)?;
-        let candidate = pczt::roles::creator::Creator::build_from_parts(built.pczt_parts)
-            .ok_or_else(|| SignerError::Other("build_from_parts returned None".into()))?;
-        let candidate = pczt::roles::io_finalizer::IoFinalizer::new(candidate)
-            .finalize_io()
-            .map_err(|e| SignerError::Other(format!("io finalize: {e:?}")))?;
-        candidate
-            .serialize()
-            .map_err(|e| SignerError::Other(format!("serialize: {e:?}")))
+        // The PCZT build is share-free; it lives in `crate::builder` so the untrusted
+        // server-side builder (W4) runs this identical path. Only note selection and the
+        // viewing key stay here.
+        crate::builder::build_unsigned(self.fvk()?, params_net, params, note, alpha)
+            .map_err(SignerError::Other)
     }
 
     fn fvk(&self) -> Result<&FullViewingKey, SignerError> {
@@ -1720,6 +1709,49 @@ pub(crate) mod tests {
             .sign_approve(&session, &cand, &pczt, &good_pkg, &seed)
             .expect("matching sighash must sign");
         assert_eq!(share.serialize().len(), 32);
+    }
+
+    // (a'') The browser `paymentReview` seam: it renders the candidate (describe_pczt) and
+    //       INDEPENDENTLY recomputes the sighash (sighash_of_pczt) the exact same way the
+    //       native path does, with NO share released. The recomputed sighash must equal the
+    //       message a correct SigningPackage commits to, and a tampered candidate must not
+    //       reproduce it (so sign_approve's binding would refuse to release a share).
+    #[test]
+    fn payment_review_recomputes_candidate_sighash_and_tamper_is_refused() {
+        let (shares, public, fvk) = dealer_vault();
+        let (mut signer, key1) = signer_with_dealer_share(1, &shares, &public, &fvk);
+        let session = connect_signer(&mut signer);
+        let cand = CandidateRef {
+            vault_id: [1u8; 32],
+            payment_id: [9u8; 32],
+            attempt_id: [9u8; 32],
+        };
+        let own_commit = signer.sign_commit(&session, &cand).unwrap();
+        let key2 = frost::keys::KeyPackage::try_from(
+            shares.get(&frost::Identifier::try_from(2u16).unwrap()).unwrap().clone(),
+        )
+        .unwrap();
+        let (_n2, peer_commit) = frost::round1::commit(key2.signing_share(), &mut rand_core::OsRng);
+        let (pczt, pkg, _seed) = candidate_and_package(
+            &fvk, &key1, &public, *key2.identifier(), peer_commit, own_commit, true,
+        );
+
+        // paymentReview = describe + recompute-sighash, both over the vault viewing key.
+        let view = wysiwys::describe_pczt(&pczt, &fvk).unwrap();
+        let sighash = wysiwys::sighash_of_pczt(&pczt, &fvk).unwrap();
+        assert_eq!(view.amount_zat, AMOUNT);
+        assert!(view.fee_verified);
+        // The recomputed sighash is EXACTLY what the real SigningPackage commits to.
+        assert_eq!(pkg.message().as_slice(), sighash);
+
+        // Flip a byte: the candidate no longer reproduces that sighash (refused outright, or a
+        // different hash that sign_approve's `pkg.message() == sighash` gate would reject).
+        let mut bad = pczt.clone();
+        *bad.last_mut().unwrap() ^= 0xff;
+        match wysiwys::sighash_of_pczt(&bad, &fvk) {
+            Ok(h) => assert_ne!(h, sighash, "tampered candidate must not reproduce the sighash"),
+            Err(_) => {}
+        }
     }
 
     // (a') a member refusal is first-class and does not consume the nonce.

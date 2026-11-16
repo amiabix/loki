@@ -470,10 +470,10 @@ fn sync_control(url: &str, data: &Path, pass: &str, vault: &str, v: &Vault) -> R
             let Ok(opened) = v.identity.open_session(peer, &context, &msg.message) else {
                 continue;
             };
-            if opened.kind != MessageKind::PeerReply {
+            if opened.kind() != MessageKind::PeerReply {
                 continue;
             }
-            let Ok(body) = serde_json::from_slice::<Value>(&opened.body) else {
+            let Ok(body) = serde_json::from_slice::<Value>(opened.body()) else {
                 continue;
             };
             let Ok(mut incoming) = serde_json::from_value::<Payment>(body["intent"].clone()) else {

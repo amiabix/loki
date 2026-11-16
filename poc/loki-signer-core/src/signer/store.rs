@@ -23,14 +23,16 @@ use std::path::{Path, PathBuf};
 
 use zeroize::Zeroizing;
 
-use crate::signer::durable::{replace_durable, write_durable};
+use crate::signer::durable::{
+    create_dir_private, file_exists, read_file, replace_durable, write_durable,
+};
 use crate::signer::secure_element::{file_binding, SealedShare, SecureElement};
 use crate::signer::Network;
 
 const META: &str = "signer.meta";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FileKind {
+pub enum FileKind {
     Identity,
     Roster,
     Setup,
@@ -51,7 +53,7 @@ impl FileKind {
     }
 }
 
-pub(crate) struct SignerStore {
+pub struct SignerStore {
     dir: PathBuf,
     network: Network,
     vault: [u8; 32],
@@ -67,26 +69,14 @@ fn network_label(network: Network) -> &'static str {
 
 impl SignerStore {
     /// Create the data directory (owner-only) and its public metadata, once.
-    pub(crate) fn create(
+    pub fn create(
         dir: &Path,
         network: Network,
         vault: [u8; 32],
         member: u16,
     ) -> Result<Self, String> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(dir)
-                .map_err(|e| format!("signer directory: {e}"))?;
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-                .map_err(|e| format!("signer directory: {e}"))?;
-        }
-        #[cfg(not(unix))]
-        std::fs::create_dir_all(dir).map_err(|e| format!("signer directory: {e}"))?;
-        if dir.join(META).exists() {
+        create_dir_private(dir).map_err(|e| format!("signer directory: {e}"))?;
+        if file_exists(dir, META) {
             return Err("signer directory already holds a signer".into());
         }
         let meta = serde_json::json!({
@@ -106,9 +96,9 @@ impl SignerStore {
     }
 
     /// Reopen an existing data directory from its public metadata.
-    pub(crate) fn open(dir: &Path) -> Result<Self, String> {
+    pub fn open(dir: &Path) -> Result<Self, String> {
         let meta: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(dir.join(META)).map_err(|e| format!("signer metadata: {e}"))?,
+            &read_file(dir, META).map_err(|e| format!("signer metadata: {e}"))?,
         )
         .map_err(|_| "signer metadata is not JSON")?;
         let network = match meta["network"].as_str() {
@@ -135,15 +125,15 @@ impl SignerStore {
         })
     }
 
-    pub(crate) fn network(&self) -> Network {
+    pub fn network(&self) -> Network {
         self.network
     }
 
-    pub(crate) fn vault(&self) -> [u8; 32] {
+    pub fn vault(&self) -> [u8; 32] {
         self.vault
     }
 
-    pub(crate) fn member(&self) -> u16 {
+    pub fn member(&self) -> u16 {
         self.member
     }
 
@@ -156,7 +146,7 @@ impl SignerStore {
     }
 
     /// Seal and atomically replace one file.
-    pub(crate) fn write(
+    pub fn write(
         &self,
         se: &impl SecureElement,
         kind: FileKind,
@@ -170,12 +160,12 @@ impl SignerStore {
 
     /// Open one file, or `None` if it does not exist. A file sealed for another type,
     /// vault or member, or under another element, is an error.
-    pub(crate) fn read(
+    pub fn read(
         &self,
         se: &impl SecureElement,
         kind: FileKind,
     ) -> Result<Option<(u64, Zeroizing<Vec<u8>>)>, String> {
-        let raw = match std::fs::read(self.dir.join(kind.file())) {
+        let raw = match read_file(&self.dir, &kind.file()) {
             Ok(raw) => raw,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(format!("signer {} file: {e}", kind.name())),

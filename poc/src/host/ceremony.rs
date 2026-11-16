@@ -26,7 +26,7 @@ use super::{
 };
 use crate::{
     frost_roster::FrostRoster,
-    network::VaultNetwork,
+    network::{VaultNetwork, TESTNET_NU7_BIRTH},
     setup_transport::{Identity, PublicIdentity},
     signer::{
         backup::BackupArtifact,
@@ -132,6 +132,10 @@ struct Ceremony {
     vs_session_id: Option<Uuid>,
     dkg_started: bool,
     error: Option<String>,
+    // The creator's testnet birth height, published to joiners so their setup document
+    // matches the creator's byte-for-byte (joiners must not reconstruct it from a guess).
+    #[serde(default)]
+    birth_height: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -415,6 +419,7 @@ pub(super) async fn create(State(st): State<Shared>, Json(body): Json<Value>) ->
             vs_session_id: None,
             dkg_started: false,
             error: None,
+            birth_height: None,
         };
         save(&data, &pass, &c)?;
         Ok(json!({"vault":c.vault,"invites":invitations(&c)?}))
@@ -487,6 +492,7 @@ pub(super) async fn join(State(st): State<Shared>, Json(body): Json<Value>) -> R
             vs_session_id: None,
             dkg_started: false,
             error: None,
+            birth_height: None,
         };
         if dir(&data, &c.vault)?.exists("ceremony.sealed") {
             let old = load(&data, &pass, &c.vault)?;
@@ -837,6 +843,7 @@ pub(super) async fn session(State(st): State<Shared>, Json(body): Json<Value>) -
             "session_id": c.session_id.ok_or("session pending")?,
             "coordinator_peer": c.coordinator_peer,
             "vs_session_id": c.vs_session_id,
+            "birth_height": c.birth_height,
         }))
     })
     .await;
@@ -872,6 +879,26 @@ pub(super) async fn address(
     .await
 }
 
+fn setup_birth_height(
+    network: VaultNetwork,
+    slot: u16,
+    published: Option<u32>,
+    fetch_tip: impl FnOnce() -> Result<u32, String>,
+) -> Result<u32, String> {
+    if network == VaultNetwork::Regtest {
+        return Ok(2);
+    }
+    let height = if slot == 1 {
+        fetch_tip()?
+    } else {
+        published.ok_or("creator did not publish a testnet birth height")?
+    };
+    if height < TESTNET_NU7_BIRTH {
+        return Err("creator birth height precedes testnet NU7".into());
+    }
+    Ok(height)
+}
+
 fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result<Value, String> {
     let mut c = {
         let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
@@ -904,6 +931,11 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
                             .ok_or("invalid creator relay identity")?;
                         c.session_id = Some(id);
                         c.coordinator_peer = Some(hex::encode(peer));
+                        if st.config.network == "testnet" {
+                            c.birth_height = Some(response["birth_height"].as_u64()
+                                .and_then(|n| u32::try_from(n).ok())
+                                .ok_or("creator did not publish a valid testnet birth height")?);
+                        }
                         break;
                     }
                     // Human confirmation has no key-generation deadline. The creator only
@@ -921,9 +953,7 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
         let me = identity(data, pass, c.my_slot)?;
         let roster = roster_of(&c)?;
         let network = VaultNetwork::parse(&st.config.network)?;
-        let birth_height = match network {
-            VaultNetwork::Regtest => 2,
-            VaultNetwork::Testnet => {
+        let birth_height = setup_birth_height(network, c.my_slot, c.birth_height, || {
                 let url = st.config.lightwalletd.as_deref().ok_or("Testnet vault requires a lightwalletd URL")?;
                 let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
                 let channel = runtime.block_on(crate::wallet_store::lightwalletd_endpoint(url)?.connect())
@@ -935,9 +965,8 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
                     || Some(info.sapling_activation_height) != network.activation_height(zcash_protocol::consensus::NetworkUpgrade::Sapling).map(u64::from) {
                     return Err("lightwalletd serves another chain".into());
                 }
-                u32::try_from(info.block_height).map_err(|_| "chain height overflow")?
-            }
-        };
+                u32::try_from(info.block_height).map_err(|_| "chain height overflow".into())
+        })?;
         let peers: BTreeMap<u16, Peer> = roster.members.values()
             .map(|identity| (identity.id, Peer(identity.encryption))).collect();
         let identity_secret = Zeroizing::new(me.to_secret_bytes());
@@ -961,6 +990,7 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
             let peer = Peer(coord.public().encryption);
             c.session_id = Some(id);
             c.coordinator_peer = Some(hex::encode(peer.0));
+            c.birth_height = Some(birth_height);
             {
                 let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
                 save(data, pass, &c)?;
@@ -1099,6 +1129,21 @@ mod tests {
     use crate::host::state::{AppState, Config, Session};
 
     #[test]
+    fn testnet_joiner_uses_creator_birth_height_when_tip_advances() {
+        let published = TESTNET_NU7_BIRTH + 100;
+        assert_eq!(setup_birth_height(VaultNetwork::Testnet, 2, Some(published), || Ok(published + 1)).unwrap(), published);
+        assert_eq!(setup_birth_height(VaultNetwork::Testnet, 3, Some(published), || Err("joiner must not fetch its own tip".into())).unwrap(), published);
+    }
+
+    #[test]
+    fn testnet_birth_height_requires_a_valid_creator_checkpoint() {
+        let height = TESTNET_NU7_BIRTH + 100;
+        assert_eq!(setup_birth_height(VaultNetwork::Testnet, 1, None, || Ok(height)).unwrap(), height);
+        assert!(setup_birth_height(VaultNetwork::Testnet, 2, None, || Ok(height)).is_err());
+        assert!(setup_birth_height(VaultNetwork::Testnet, 2, Some(TESTNET_NU7_BIRTH - 1), || Ok(height)).is_err());
+    }
+
+    #[test]
     fn roster_requires_every_valid_distinct_member() {
         let mut slots = BTreeMap::new();
         for slot in 1..=3 {
@@ -1126,6 +1171,7 @@ mod tests {
             vs_session_id: None,
             dkg_started: false,
             error: None,
+            birth_height: None,
         };
         let fingerprint = roster_of(&c).unwrap().fingerprint();
         assert_eq!(fingerprint, roster_of(&c).unwrap().fingerprint());
@@ -1148,7 +1194,7 @@ mod tests {
             my_slot: 1, creator_base_url: String::new(), frostd_url: String::new(),
             slots, fingerprint: Some("fingerprint".into()), agreed: BTreeSet::new(),
             session_id: None, coordinator_peer: None, vs_session_id: None,
-            dkg_started: true, error: None,
+            dkg_started: true, error: None, birth_height: None,
         };
         save(&data, "pass", &ceremony).unwrap();
         let st = std::sync::Arc::new(AppState::new(Config {

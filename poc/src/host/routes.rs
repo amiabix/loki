@@ -80,10 +80,21 @@ pub fn router(state: Shared) -> Router {
 /// capability is still required; CORS never authorizes a member action on its own.
 async fn browser_origin(State(st): State<Shared>, req: Request, next: Next) -> Response {
     let origin = req.headers().get("origin").cloned();
+    // The ceremony endpoints are token-authenticated, member-to-member calls (also exempt from
+    // the process token in `auth`): a native peer reaches them with no `Origin` and so skips the
+    // pairing check, and a browser joiner from another origin reaches ONLY these four, still gated
+    // by its invite token. So CORS-open them to any origin (they expose nothing the invite token
+    // does not already guard); every other `/api/*` route stays locked to the paired coordinator.
+    let open_ceremony = matches!(
+        req.uri().path(),
+        "/api/enroll" | "/api/agreed" | "/api/roster" | "/api/session"
+    );
     if let Some(origin) = &origin {
-        let allowed = st.config.registration.as_ref().map(|c| c.coordinator.as_str());
-        if allowed.is_none() || origin.to_str().ok() != allowed {
-            return err(StatusCode::FORBIDDEN, "browser origin is not paired").into_response();
+        if !open_ceremony {
+            let allowed = st.config.registration.as_ref().map(|c| c.coordinator.as_str());
+            if allowed.is_none() || origin.to_str().ok() != allowed {
+                return err(StatusCode::FORBIDDEN, "browser origin is not paired").into_response();
+            }
         }
     }
     let mut response = if req.method() == axum::http::Method::OPTIONS {
