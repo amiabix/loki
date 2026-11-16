@@ -40,6 +40,108 @@ async function loadFrostd(transportUrl) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const toHex = (bytes) => Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+
+function b64urlToBytes(s) {
+  const b64 = s.replace(/-/g, "+").replace(/_/g, "/");
+  const pad = b64.length % 4 ? "=".repeat(4 - (b64.length % 4)) : "";
+  const bin = atob(b64 + pad);
+  return Uint8Array.from(bin, (c) => c.charCodeAt(0));
+}
+
+async function postJson(url, body) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error ?? `request to ${url} failed (${res.status})`);
+  return data;
+}
+
+// Retry `fn` until it resolves (the creator's roster/session endpoints 404 "pending" until
+// every member has enrolled/agreed), bounded so a stalled ceremony fails instead of hanging.
+async function poll(fn, p) {
+  const pollMs = Number(p.joinPollMs) || 500;
+  const max = Number(p.joinMaxTicks) || 240;
+  let lastErr;
+  for (let i = 0; i < max; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastErr = e;
+      await sleep(pollMs);
+    }
+  }
+  throw lastErr ?? new Error("ceremony step timed out");
+}
+
+// Decode a creator invite and run the native joiner dance against the creator's member app
+// (poc/src/host/ceremony.rs: enroll → poll roster → agree → poll session), then hand the
+// assembled DKG params to driveDkg. The four endpoints are token-authenticated member-to-member
+// calls the creator CORS-opens for browser joiners (routes.rs `browser_origin`). The setup
+// document the creator feeds its own dkg_begin is rebuilt here from the polled roster — the
+// roster fingerprint is over PARSED content (member_state::Roster::fingerprint), so field/byte
+// order is irrelevant and only the values must match.
+async function joinCeremony(signer, p) {
+  const invite = JSON.parse(new TextDecoder().decode(b64urlToBytes(p.invite)));
+  const base = invite.creator_base_url.replace(/\/+$/, "");
+  const { vault, slot, token, threshold, name } = invite;
+  const network = p.network ?? "testnet";
+
+  // Our enrolled identity at the target slot: the device signing/relay keys (slot-independent;
+  // restamp only overwrites the id bytes) stamped with the slot id. Needs the signer unlocked.
+  const material = JSON.parse(signer.enrollMaterial());
+  const identity = { id: slot, signing: material.signing_pubkey, encryption: material.relay_pubkey };
+  await postJson(`${base}/api/enroll`, { vault, slot, token, identity });
+
+  // Poll until the full roster is published (fingerprint present).
+  const auth = { vault, slot, token };
+  const rosterResp = await poll(() => postJson(`${base}/api/roster`, auth), p);
+  const roster = rosterResp.roster;
+
+  // The creator must not have swapped our slot's identity.
+  const mine = roster[String(slot)];
+  if (!mine || mine.signing !== identity.signing || mine.encryption !== identity.encryption) {
+    throw new Error("creator roster changed this member's identity");
+  }
+
+  // Rebuild the creator's setup document (setup_version 2), members sorted by slot.
+  const members = Object.keys(roster)
+    .map(Number)
+    .sort((a, b) => a - b)
+    .map((s) => ({ id: s, signing: roster[String(s)].signing, encryption: roster[String(s)].encryption }));
+  const doc = { vault, threshold, setup_version: 2, network, members };
+  if (network === "testnet") {
+    if (p.birthHeight == null) throw new Error("testnet join needs birthHeight");
+    doc.birth_height = Number(p.birthHeight);
+  }
+  const rosterHex = toHex(new TextEncoder().encode(JSON.stringify(doc)));
+
+  // Agree, then poll for the creator's frostd session + coordinator relay peer.
+  await postJson(`${base}/api/agreed`, auth);
+  const session = await poll(
+    () =>
+      postJson(`${base}/api/session`, auth).then((s) =>
+        s.session_id && s.coordinator_peer ? s : Promise.reject(new Error("session pending"))),
+    p,
+  );
+
+  return driveDkg(signer, {
+    vaultHex: vault,
+    slot,
+    label: p.label ?? name,
+    network,
+    rosterHex,
+    frostdUrl: p.frostdUrl,
+    transportUrl: p.transportUrl,
+    sessionId: session.session_id,
+    coordinatorPeer: session.coordinator_peer,
+    pollMs: p.pollMs,
+    maxTicks: p.maxTicks,
+  });
+}
 
 // Drive this member through create-or-reopen → confirm roster → DKG rounds ↔ frostd → backup
 // → active, then release the vault address. The signer core is synchronous (vaultJoin/vaultStep/
@@ -155,7 +257,7 @@ async function preopenUnlock(P, method) {
 }
 
 self.onmessage = async (e) => {
-  const { id, op, method, name, passphrase, prfSecret, dkg, payment, devicePubHex } = e.data;
+  const { id, op, method, name, passphrase, prfSecret, dkg, join, payment, devicePubHex } = e.data;
   try {
     const { signer, P } = await ready;
     let result;
@@ -173,6 +275,9 @@ self.onmessage = async (e) => {
         break;
       case "dkg":
         result = await driveDkg(signer, dkg);
+        break;
+      case "join":
+        result = await joinCeremony(signer, join);
         break;
       case "payment-review":
         // Reopen the vault for its viewing key, then WYSIWYS-render the supplied candidate.

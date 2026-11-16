@@ -192,6 +192,11 @@ function browserSigner(url: string): SignerModule {
       // coordinator's frostd session + relay peer, the TLS frostd URL); the Worker drives the
       // synchronous DKG core over the frostd transport to an active vault + released address.
       if (path === "dkg") return call<T>({ op: "dkg", dkg: body });
+      // Phase B join: decode a creator invite and run the joiner dance (enroll → poll roster →
+      // agree → poll session) against the creator's member app, then drive the DKG. The UI
+      // supplies the invite plus this browser's TLS frostdUrl/transportUrl (and, on testnet, the
+      // creator's birthHeight) so the rebuilt setup document matches the creator's.
+      if (path === "join") return call<T>({ op: "join", join: body });
       // Phase C: review + approve a payment (NON-proposer signer). The UI supplies the vault
       // reopen params (vaultHex/slot/label/network/rosterHex), the frostd session + relay
       // peers, the proposer identity, and the attempt; the Worker drives the synchronous

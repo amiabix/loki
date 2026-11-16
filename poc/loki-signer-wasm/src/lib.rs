@@ -56,6 +56,10 @@ mod secp256k1_link_stub {
     }
     #[no_mangle]
     pub extern "C" fn rustsecp256k1_v0_10_0_context_preallocated_destroy(_ctx: *mut c_void) {}
+    #[no_mangle]
+    pub extern "C" fn rustsecp256k1_v0_10_0_context_preallocated_clone_size(_ctx: *const c_void) -> usize {
+        0
+    }
 }
 
 fn prf32(prf_secret: &[u8]) -> Result<[u8; 32], String> {
