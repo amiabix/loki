@@ -23,7 +23,9 @@ use zeroize::Zeroizing;
 
 use super::routes::{err, ok, Reply};
 use super::state::Shared;
+use crate::signer::backup::{self, BackupArtifact};
 use crate::signer::recovery::RecoveryKey;
+use crate::state::MemberDir;
 
 /// `data/recovery.pub` — 64 bytes: X25519 backup-encryption key (32) then Ed25519 device-
 /// authorization key (32). Public keys only; the 24 words are never written to disk.
@@ -45,6 +47,35 @@ pub(super) fn read_authz_pubkey(data: &Path) -> Option<[u8; 32]> {
 /// The opaque recovery backup for a vault lives beside its sealed share.
 pub(super) fn backup_file(signer_dir: &Path) -> PathBuf {
     signer_dir.join("recovery.backup")
+}
+
+/// Seal this vault's recovery backup: re-seal the share held in the passphrase-sealed
+/// `backup.sealed` to the member's recovery words (HPKE to its recovery public key), so a
+/// lost device can restore from the words alone ([`restore`] → [`crate::host::ceremony::
+/// restore_vault_from_backup`]). Called at vault activation. A no-op (not an error) when no
+/// recovery identity is established, when `backup.sealed` is absent, or when the recovery
+/// backup already exists — so it is safe to call idempotently.
+pub(super) fn seal_vault_backup(
+    data: &Path,
+    signer_dir: &Path,
+    vault_id: &[u8; 32],
+    pass: &str,
+) -> Result<(), String> {
+    let Some(recovery_pub) = read_encryption_pubkey(data) else {
+        return Ok(());
+    };
+    let target = backup_file(signer_dir);
+    if target.exists() {
+        return Ok(());
+    }
+    let sealed = match MemberDir::open(signer_dir, "").read_sealed("backup.sealed", pass) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let material = backup::verify(&BackupArtifact(sealed), pass, vault_id)?;
+    let artifact = backup::create_to_recovery(&material, &recovery_pub)?;
+    fs::write(&target, &artifact.0).map_err(|e| e.to_string())
 }
 
 /// Establish the recovery identity once. Only public keys are persisted; existing identities

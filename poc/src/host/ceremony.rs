@@ -1027,6 +1027,10 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
                 pass,
             )
             .map_err(|e| e.to_string())?;
+        // The vault is now active: seal this member's recovery backup (share HPKE-sealed to its
+        // recovery words) so a lost device can restore the share from the words. The recovery
+        // identity is established at registration, so `recovery.pub` already exists here.
+        super::recovery::seal_vault_backup(data, &signer_dir, &roster.vault_id, pass)?;
         Ok(json!({"ok":true}))
     })();
     if let Err(ref error) = outcome {
@@ -1208,6 +1212,135 @@ mod tests {
         assert_eq!(response.1 .0["fingerprint"], status.1 .0["fingerprint"]);
         eprintln!("PASS: emitted invite codes contain no vault_secret");
         std::fs::remove_dir_all(data).unwrap();
+    }
+
+    /// Recovery WORDS loop (ship-blocker fix): the vault seals a per-vault recovery backup at
+    /// activation, and a member whose local state is destroyed restores its signing share from
+    /// the 24 words alone. Reproduces the post-DKG state (`recovery.pub` + `backup.sealed`) and
+    /// drives the real host seal (`recovery::seal_vault_backup`) and restore
+    /// (`restore_vault_from_backup`) paths — the loop QA could not run because nothing sealed the
+    /// backup.
+    #[test]
+    fn recovery_backup_seals_at_activation_and_restores_the_share_from_words() {
+        use crate::signer::backup::{self, BackupMaterial};
+        use crate::signer::recovery::RecoveryKey;
+        use crate::signer::secure_element::SoftwareSecureElement;
+        use crate::signer::store::{FileKind, SignerStore};
+        use reddsa_frost::frost::redpallas as frost;
+
+        let data = std::env::temp_dir().join(format!("loki-recovery-words-{}", Uuid::new_v4()));
+        let vault = [9u8; 32];
+        let vault_hex = hex::encode(vault);
+        let pass = "pass";
+        let group_sk = [42u8; 32];
+
+        // Registration establishes the recovery identity (words shown once; only pubkeys stored).
+        let (words, rkey) = RecoveryKey::generate().unwrap();
+        MemberDir::create(&data, "").unwrap();
+        let mut pubkeys = Vec::with_capacity(64);
+        pubkeys.extend_from_slice(&rkey.public_bytes());
+        pubkeys.extend_from_slice(&rkey.signing_public());
+        std::fs::write(data.join("recovery.pub"), &pubkeys).unwrap();
+        drop(rkey);
+
+        // A 2-of-3 dealer vault; this member is slot 1. Write `backup.sealed` exactly as the
+        // signer does during DKG (`HostedBackup::save`): the passphrase-sealed backup artifact.
+        let (shares, public) = frost::keys::generate_with_dealer(
+            3,
+            2,
+            frost::keys::IdentifierList::Default,
+            &mut rand_core::OsRng,
+        )
+        .unwrap();
+        let id1 = frost::Identifier::try_from(1u16).unwrap();
+        let kp1 = frost::keys::KeyPackage::try_from(shares[&id1].clone()).unwrap();
+        let share_bytes = kp1.serialize().unwrap();
+        let material = BackupMaterial {
+            member_id: 1,
+            threshold: 2,
+            members: 3,
+            network: Network::Regtest,
+            vault_id: vault,
+            label: "recovery vault".into(),
+            group_sk,
+            key_package: Zeroizing::new(share_bytes.clone()),
+            public_package: public.serialize().unwrap(),
+            backup_epoch: 0,
+            identity: Zeroizing::new(Vec::new()),
+            roster: Vec::new(),
+            roster_fingerprint: [0; 32],
+            birth_height: None,
+        };
+        let sdir = signer_dir(&data, &vault_hex).unwrap();
+        MemberDir::create(&sdir, "")
+            .unwrap()
+            .write_sealed("backup.sealed", &backup::create(&material, pass).unwrap().0, pass)
+            .unwrap();
+
+        // Activation seals the recovery backup — the wiring under test.
+        crate::host::recovery::seal_vault_backup(&data, &sdir, &vault, pass).unwrap();
+        let blob = std::fs::read(crate::host::recovery::backup_file(&sdir)).unwrap();
+        assert!(
+            !blob.windows(share_bytes.len()).any(|w| w == share_bytes.as_slice()),
+            "the recovery backup is HPKE ciphertext, never the share plaintext",
+        );
+
+        // DESTROY the device: wipe the entire data root (share store, backups, identity, pubkeys).
+        std::fs::remove_dir_all(&data).unwrap();
+        // The restoring phone keeps only the opaque recovery backup blob and the 24 words.
+        let sdir = signer_dir(&data, &vault_hex).unwrap();
+        std::fs::create_dir_all(&sdir).unwrap();
+        std::fs::write(crate::host::recovery::backup_file(&sdir), &blob).unwrap();
+
+        let config = Config {
+            registration: None,
+            data: data.clone(),
+            port: 3001,
+            bind: "127.0.0.1".parse().unwrap(),
+            advertise_url: None,
+            network: "regtest".into(),
+            lightwalletd: None,
+            transport: "local".into(),
+            secure_element: "software".into(),
+            operator_bundle: None,
+            nonce_witnesses: None,
+            operator_key: None,
+            enrollment_issuer: None,
+            development_http: false,
+            token: "test".into(),
+            frostd_url: "http://127.0.0.1:2744".into(),
+            peers: BTreeMap::new(),
+            loopback_peers: false,
+        };
+
+        // Wrong words cannot open the backup; the real words restore it.
+        let (other, _) = RecoveryKey::generate().unwrap();
+        assert!(restore_vault_from_backup(&data, &vault_hex, &other, pass, &config).is_err());
+        restore_vault_from_backup(&data, &vault_hex, &words, pass, &config).unwrap();
+        assert!(
+            dir(&data, &vault_hex).unwrap().exists("vault.sealed"),
+            "restore rebuilt vault.sealed",
+        );
+
+        // Read the restored share back through the real store + device element (the production
+        // signing path) and prove it is byte-identical to the original and derives the vault's
+        // viewing key — i.e. it signs for this group.
+        let se = SoftwareSecureElement::persistent(&sdir, pass).unwrap();
+        let (_epoch, raw) = SignerStore::open(&sdir)
+            .unwrap()
+            .read(&se, FileKind::Share)
+            .unwrap()
+            .unwrap();
+        let (restored_key, restored_public, restored_vs) =
+            crate::signer::local::decode_share(&raw).unwrap();
+        assert_eq!(&*restored_key, &share_bytes, "restored share matches the original key package");
+        assert_eq!(restored_vs, group_sk);
+        assert_eq!(restored_public, material.public_package);
+        let ak: [u8; 32] = public.verifying_key().serialize().unwrap().try_into().unwrap();
+        zip2005::frost_viewing_key(&ak, &restored_vs)
+            .expect("the restored share derives the vault FVK — it can sign for this group");
+
+        std::fs::remove_dir_all(&data).unwrap();
     }
 }
 
