@@ -18,7 +18,7 @@ export function paymentLabel(phase: string, ready: boolean, sending: boolean): s
   if (phase === "expired") return "Expired";
   if (phase === "failed") return "Failed · create a new payment";
   if (phase === "discarding") return "Releasing reserved input";
-  if (phase === "cancelled") return "Discarded";
+  if (phase === "cancelled") return "Cancelled";
   if (sending) return "Sending";
   if (ready) return "Ready to send";
   const labels: Record<string, string> = {

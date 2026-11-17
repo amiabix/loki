@@ -7,6 +7,7 @@ const nextConfig: NextConfig = {
   // newer node/TS. The runtime is unaffected. We still run `tsc --noEmit` locally for real type
   // safety, so skip the build-time type/lint check to keep deploys reliable.
   typescript: { ignoreBuildErrors: true },
+  experimental: { agentUpgrade: "security" },
   turbopack: {
     rules: {
       "*.css": {

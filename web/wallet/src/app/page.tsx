@@ -1652,10 +1652,14 @@ function Send({
 }
 
 function SignerList({ signers, threshold, approvals = [], ready = false, complete = false }: { signers: number[]; threshold: number; approvals?: number[]; ready?: boolean; complete?: boolean }) {
+  // Until the first approvals fix the signing group, any member may approve.
+  const open = signers.length === 0;
+  const shown = open ? approvals : signers;
+  const count = open ? approvals.length : approvals.filter((id) => signers.includes(id)).length;
   return <div className="my-3">
-    <p className="text-xs text-muted">{ready ? "Signatures saved · proposer can send" : complete ? "Your signer finished · awaiting proposer" : `${approvals.filter((id) => signers.includes(id)).length} of ${threshold} approvals recorded here`}</p>
+    <p className="text-xs text-muted">{ready ? "Signatures saved · proposer can send" : complete ? "Your signer finished · awaiting proposer" : `${count} of ${threshold} approvals recorded here${open ? " · any member can approve" : ""}`}</p>
     <div className="mt-2 flex flex-wrap gap-2">
-      {signers.map((slot) => <span key={slot} className="pill"><MemberAvatar slot={slot} size={24} /> Member {slot}{approvals.includes(slot) ? " · approved" : " · waiting"}</span>)}
+      {shown.map((slot) => <span key={slot} className="pill"><MemberAvatar slot={slot} size={24} /> Member {slot}{approvals.includes(slot) ? " · approved" : " · waiting"}</span>)}
     </div>
   </div>;
 }
@@ -1978,7 +1982,7 @@ function History({
                   {paymentLabel(confirmed ? "confirmed" : txid ? "broadcast" : p.phase, p.ready_to_send, sending)}
                 </span>
               </div>
-              {p.signers && !txid && <SignerList signers={p.signers} threshold={vault.threshold} approvals={p.approvals} ready={p.ready_to_send} complete={p.phase === "approved"} />}
+              {p.signers && !txid && p.phase !== "cancelled" && <SignerList signers={p.signers} threshold={vault.threshold} approvals={p.approvals} ready={p.ready_to_send} complete={p.phase === "approved"} />}
               {txid && <p className="text-xs text-muted">{p.mined_height != null ? `Included in block ${p.mined_height.toLocaleString()}. ` : confirmed ? "Confirmed on-chain. " : "Awaiting a block. "}Confirmation count is not available from this wallet.</p>}
               <ErrMsg msg={p.error ?? null} />
               <div className="mt-3 flex flex-col gap-2 sm:flex-row">
@@ -1992,7 +1996,7 @@ function History({
                   setErr(null);
                   try { await api("payment-discard", { vault: vault.vault, attempt: p.attempt }); refresh(); }
                   catch (e) { setErr((e as Error).message); }
-                }}>Discard failed payment</button>}
+                }}>{p.error || p.phase === "failed" ? "Discard failed payment" : "Cancel payment"}</button>}
                 {p.ready_to_send && !txid && (
                   <button
                     onClick={(event) => { sendButtonRef.current = event.currentTarget; setConfirming(p.attempt); setErr(null); }}

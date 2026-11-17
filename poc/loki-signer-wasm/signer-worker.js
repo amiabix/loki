@@ -202,8 +202,12 @@ async function reopenVault(signer, p) {
 // release the signature share. The signer core is synchronous (signCommit/openCandidate/
 // paymentReview/signApprove); this loop owns the async frostd pump. WYSIWYS is enforced
 // inside signApprove — it refuses unless the package binds the recomputed sighash.
+//
+// The request is open to every member: the proposer fixes the signing group from the first
+// approvals to arrive. So this member approves, waits for the group, and commits a nonce only
+// if the group includes it; a commitment from outside the group would fail the round.
 async function drivePayment(signer, p) {
-  const { vaultHex, attemptHex, proposerSigning, proposerEnc, proposerId, signers, coordinatorPeer } = p;
+  const { vaultHex, attemptHex, proposerSigning, proposerEnc, proposerId, coordinatorPeer } = p;
   const fc = await reopenVault(signer, p);
 
   // Record this member's approval on the CONTROL session so the proposer proceeds: payment
@@ -220,6 +224,9 @@ async function drivePayment(signer, p) {
   await control.login();
   control.useSession(p.controlSessionId);
   await control.sendToPeer(proposerEnc, sealed);
+
+  const signers = await waitForSigningGroup(p);
+  if (!signers.includes(p.slot)) return { approved: true, signed: false };
 
   // Pre-open this attempt's crash-safe nonce files (name = payment_id ++ attempt_id hex; the
   // native host sets both to the attempt), so the synchronous commit/sign can persist.
@@ -259,7 +266,30 @@ async function drivePayment(signer, p) {
   const review = JSON.parse(signer.paymentReview(candidateHex));
   const share = signer.signApprove(attemptHex, candidateHex, packageHex, seedHex);
   await fc.sendToCoordinator(share);
-  return { approved: true, review };
+  return { approved: true, signed: true, review };
+}
+
+// Poll the proposer's payment session until it names the signing group. Nothing secret is
+// committed while waiting, so giving up here is safe: approving again resumes the wait.
+async function waitForSigningGroup(p) {
+  const pollMs = Number(p.groupPollMs) || 2000;
+  const maxTicks = Number(p.groupMaxTicks) || 900; // 30 minutes at the default poll
+  let signers = p.signers ?? [];
+  for (let tick = 0; signers.length === 0; tick++) {
+    if (tick >= maxTicks) {
+      throw new Error("Your approval is recorded, but not enough members approved yet. Open this payment again later to sign.");
+    }
+    await sleep(pollMs);
+    const res = await fetch(p.sessionUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ vault: p.vaultHex, attempt: p.attemptHex }),
+    });
+    const s = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(s.error ?? `payment session request failed (${res.status})`);
+    signers = s.signers ?? [];
+  }
+  return signers;
 }
 
 async function preopenCreate(P, method) {
