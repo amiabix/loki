@@ -690,10 +690,16 @@ pub(super) async fn draft(State(st): State<Shared>, Json(body): Json<Value>) -> 
         let memo_bytes = MemoBytes::from_bytes(memo.as_bytes()).map_err(|e| format!("memo: {e:?}"))?;
         let (mut w, _, _) = wallet(&data, &pass, vault, &v, url(&st)?)?;
         let tip = w.scanned_height()?.ok_or("wallet has no scanned blocks")?;
+        // The candidate's target and anchor height, which signing and finish reread from
+        // lightwalletd. Not the scanned tip: public endpoints such as zec.rocks balance each
+        // request across backends whose tips differ by a block, so a later request can land on
+        // one that has not reached it. The wallet funds only from notes with at least 3
+        // confirmations (`ConfirmationsPolicy::default`), so the selected note is in the tree here.
+        let anchor = tip.checked_sub(2).ok_or("wallet has too few scanned blocks")?;
         let expiry = tip.checked_add(match v.network { VaultNetwork::Regtest => 8_064, VaultNetwork::Testnet => 24_192 }).ok_or("expiry overflow")?.div_ceil(1_152).checked_mul(1_152).ok_or("expiry overflow")?;
         let funding = w.propose(address, Some(amount), memo_bytes.clone())?;
         let first = *funding.notes.first().ok_or("wallet proposed no Ironwood notes")?;
-        let inputs = CandidateInputs { vault_fvk: &v.fvk, notes: vec![first], recipient: address, amount, memo: memo_bytes, change: Zatoshis::ZERO, target_height: tip, expiry_height: expiry };
+        let inputs = CandidateInputs { vault_fvk: &v.fvk, notes: vec![first], recipient: address, amount, memo: memo_bytes, change: Zatoshis::ZERO, target_height: anchor, expiry_height: expiry };
         let fee_zat: u64 = quote_fee(&v.network, &inputs)?.into();
         let note = funding.notes.iter().find(|note| note.value().inner() >= amount_zat.saturating_add(fee_zat))
             .ok_or("payment needs one Ironwood note large enough for amount and fee")?;
@@ -703,7 +709,7 @@ pub(super) async fn draft(State(st): State<Shared>, Json(body): Json<Value>) -> 
         let attempt = hex::encode(random);
         let note_selection = vec![hex::encode(note.nullifier(&v.fvk).to_bytes())];
         // No signing group yet: the request is open to every member (`signing_group`).
-        let p = Payment { attempt: attempt.clone(), vault: vault.to_owned(), proposer: v.slot, recipient: recipient.to_owned(), amount_zat, memo: memo.to_owned(), fee_zat, change_zat, note_selection, target_height: tip, expiry_height: expiry, signers: Vec::new(), phase: "draft".into(), session_id: None, control_session_id: None, approvals: Vec::new(), start_requested: false, coordinator_secret: None, review_token: None, approval_requested: false, approval_started: false, txid: None, signed_pczt: None, raw_tx: None, error: None };
+        let p = Payment { attempt: attempt.clone(), vault: vault.to_owned(), proposer: v.slot, recipient: recipient.to_owned(), amount_zat, memo: memo.to_owned(), fee_zat, change_zat, note_selection, target_height: anchor, expiry_height: expiry, signers: Vec::new(), phase: "draft".into(), session_id: None, control_session_id: None, approvals: Vec::new(), start_requested: false, coordinator_secret: None, review_token: None, approval_requested: false, approval_started: false, txid: None, signed_pczt: None, raw_tx: None, error: None };
         check_intent(&p, &v)?;
         let nullifier = [hex32(&p.note_selection[0])?];
         w.reserve_inputs(zcash_client_backend::wallet::LockOwner::new(random), &nullifier, expiry)?;
