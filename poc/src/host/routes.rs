@@ -121,7 +121,10 @@ async fn browser_origin(State(st): State<Shared>, req: Request, next: Next) -> R
 async fn registration(State(st): State<Shared>) -> Reply {
     match st.registration.read().await.as_ref() {
         Some(member) => ok(json!(member)),
-        None => err(StatusCode::CONFLICT, "device has not self-registered"),
+        None => match st.registration_error.read().await.as_ref() {
+            Some(e) => err(StatusCode::CONFLICT, format!("device has not self-registered; retrying after: {e}")),
+            None => err(StatusCode::CONFLICT, "device has not self-registered"),
+        },
     }
 }
 
