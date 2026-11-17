@@ -64,13 +64,17 @@ struct Payment {
     note_selection: Vec<String>,
     target_height: u32,
     expiry_height: u32,
+    /// The signing group: empty while the request is open to every member, then fixed by
+    /// the proposer to itself plus the first `threshold - 1` other members who approved.
+    #[serde(default)]
     signers: Vec<u16>,
     phase: String,
     session_id: Option<Uuid>,
     #[serde(default)]
     control_session_id: Option<Uuid>,
+    /// Members who approved, in the order their approvals arrived.
     #[serde(default)]
-    approvals: BTreeSet<u16>,
+    approvals: Vec<u16>,
     #[serde(default)]
     start_requested: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -353,18 +357,12 @@ fn review_candidate(bytes: &[u8], payment: &Payment, vault: &Vault) -> Result<()
     crate::signer::wysiwys::sighash_of_pczt(bytes, &vault.fvk)?;
     Ok(())
 }
+/// The payment terms every member reviews. The signing group is not part of them: any member
+/// may approve, and the group is fixed later (`signing_group`, `check_signers`).
 fn check_intent(p: &Payment, v: &Vault) -> Result<(), String> {
     hex32(&p.vault)?;
     hex32(&p.attempt)?;
-    if p.signers.len() != usize::from(v.threshold)
-        || p.signers.first() != Some(&p.proposer)
-        || !p.signers.contains(&v.slot)
-        || p.signers.iter().any(|s| !v.peers.contains_key(s))
-        || p.signers
-            .iter()
-            .collect::<std::collections::BTreeSet<_>>()
-            .len()
-            != p.signers.len()
+    if !v.peers.contains_key(&p.proposer)
         || p.note_selection.len() != 1
         || p.amount_zat == 0
         || p.expiry_height <= p.target_height
@@ -378,10 +376,48 @@ fn check_intent(p: &Payment, v: &Vault) -> Result<(), String> {
     hex32(&p.note_selection[0])?;
     Ok(())
 }
+/// A fixed signing group: exactly `threshold` distinct vault members, led by the proposer
+/// (the coordinator sends the randomizer to the first signer, who builds the candidate).
+fn check_signers(p: &Payment, v: &Vault) -> Result<(), String> {
+    let distinct: BTreeSet<_> = p.signers.iter().collect();
+    if p.signers.len() != usize::from(v.threshold)
+        || distinct.len() != p.signers.len()
+        || p.signers.first() != Some(&p.proposer)
+        || p.signers.iter().any(|s| !v.peers.contains_key(s))
+    {
+        return Err("invalid signing group".into());
+    }
+    Ok(())
+}
+/// The proposer plus the first `threshold - 1` other members whose approvals arrived, once
+/// the proposer has approved too; `None` while fewer than `threshold` members approved.
+fn signing_group(p: &Payment, v: &Vault) -> Option<Vec<u16>> {
+    if !p.approvals.contains(&p.proposer) {
+        return None;
+    }
+    let mut group = vec![p.proposer];
+    group.extend(
+        p.approvals
+            .iter()
+            .copied()
+            .filter(|id| *id != p.proposer && v.peers.contains_key(id))
+            .take(usize::from(v.threshold) - 1),
+    );
+    (group.len() == usize::from(v.threshold)).then_some(group)
+}
+fn record_approval(p: &mut Payment, id: u16) {
+    if !p.approvals.contains(&id) {
+        p.approvals.push(id);
+    }
+}
+fn members(v: &Vault) -> Vec<u16> {
+    v.peers.keys().copied().collect()
+}
 fn public_intent(p: &Payment) -> Value {
     json!({"attempt":p.attempt,"vault":p.vault,"proposer":p.proposer,"recipient":p.recipient,"amount_zat":p.amount_zat,"memo":p.memo,"fee_zat":p.fee_zat,"change_zat":p.change_zat,"note_selection":p.note_selection,"target_height":p.target_height,"expiry_height":p.expiry_height,"signers":p.signers,"phase":p.phase,"session_id":p.session_id,"control_session_id":p.control_session_id})
 }
 const UNAVAILABLE: &str = "payment session unavailable";
+const ENOUGH_APPROVED: &str = "enough members already approved this payment";
 
 /// The sealed-envelope context between two members about one payment attempt.
 fn peer_context(vault: &str, attempt: &str, a: u16, b: u16) -> Result<SessionContext, String> {
@@ -404,9 +440,11 @@ fn control_context(vault: &str, session: Uuid, a: u16, b: u16) -> Result<Session
     peer_context(vault, &hash.finalize().to_hex().to_string(), a, b)
 }
 
+/// Binds approvals to the payment terms, not to the signing group fixed after them.
 fn intent_hash(p: &Payment) -> String {
     let mut intent = public_intent(p);
     intent.as_object_mut().unwrap().remove("phase");
+    intent.as_object_mut().unwrap().remove("signers");
     blake3::hash(&serde_json::to_vec(&intent).unwrap())
         .to_hex()
         .to_string()
@@ -448,7 +486,7 @@ fn sync_control(url: &str, data: &Path, pass: &str, vault: &str, v: &Vault) -> R
         let Some(proposer) = v.peers.values().find(|p| p.encryption == owner) else {
             continue;
         };
-        if participants.len() != usize::from(v.threshold)
+        if participants.len() != v.peers.len()
             || !participants.contains(&v.identity.public().encryption)
             || !participants.contains(&owner)
             || !participants
@@ -486,11 +524,7 @@ fn sync_control(url: &str, data: &Path, pass: &str, vault: &str, v: &Vault) -> R
                 || incoming.session_id == Some(session)
                 || body["hash"].as_str() != Some(intent_hash(&incoming).as_str())
                 || check_intent(&incoming, v).is_err()
-                || !incoming.signers.contains(&peer.id)
-                || incoming
-                    .signers
-                    .iter()
-                    .any(|id| !participants.contains(&v.peers[id].encryption))
+                || !incoming.signers.is_empty() && check_signers(&incoming, v).is_err()
             {
                 continue;
             }
@@ -501,7 +535,7 @@ fn sync_control(url: &str, data: &Path, pass: &str, vault: &str, v: &Vault) -> R
                     }
                     if peer.id == p.proposer
                         && body["kind"] == "failed"
-                        && matches!(p.phase.as_str(), "signing" | "approved")
+                        && matches!(p.phase.as_str(), "signing" | "approved" | "not_selected")
                     {
                         p.phase = "failed".into();
                         p.error = Some("The proposer could not complete this signing attempt. Create a fresh payment after recovery.".into());
@@ -509,7 +543,7 @@ fn sync_control(url: &str, data: &Path, pass: &str, vault: &str, v: &Vault) -> R
                         continue;
                     }
                     if peer.id == p.proposer
-                        && matches!(p.phase.as_str(), "approved" | "broadcast")
+                        && matches!(p.phase.as_str(), "approved" | "not_selected" | "broadcast")
                         && matches!(body["kind"].as_str(), Some("broadcast" | "confirmed"))
                     {
                         let Some(txid) = body["txid"].as_str().filter(|s| hex32(s).is_ok()) else {
@@ -528,10 +562,20 @@ fn sync_control(url: &str, data: &Path, pass: &str, vault: &str, v: &Vault) -> R
                     }
                     match body["kind"].as_str() {
                         Some("approval") if v.slot == p.proposer => {
-                            p.approvals.insert(peer.id);
+                            record_approval(&mut p, peer.id);
                         }
-                        Some("start") if peer.id == p.proposer && p.approval_requested => {
-                            p.start_requested = true;
+                        // The proposer fixed the group from the first approvals; it never changes.
+                        Some("start")
+                            if peer.id == p.proposer
+                                && !incoming.signers.is_empty()
+                                && (p.signers.is_empty() || p.signers == incoming.signers) =>
+                        {
+                            p.signers = incoming.signers;
+                            if !p.signers.contains(&v.slot) {
+                                p.phase = "not_selected".into();
+                            } else if p.approval_requested {
+                                p.start_requested = true;
+                            }
                         }
                         _ => continue,
                     }
@@ -547,6 +591,8 @@ fn sync_control(url: &str, data: &Path, pass: &str, vault: &str, v: &Vault) -> R
                             .map_err(|e| e.to_string())? =>
                 {
                     incoming.phase = "signing".into();
+                    // Only a `start` from the proposer fixes the group.
+                    incoming.signers.clear();
                     incoming.coordinator_secret = None;
                     incoming.review_token = None;
                     incoming.approval_requested = false;
@@ -644,17 +690,9 @@ pub(super) async fn draft(State(st): State<Shared>, Json(body): Json<Value>) -> 
         if funding.notes.len() == 1 && (funding.fee_zat != fee_zat || funding.change_zat != change_zat) { return Err("wallet funding differs from candidate fee or change".into()); }
         let mut random = [0u8; 32]; OsRng.fill_bytes(&mut random);
         let attempt = hex::encode(random);
-        let signers = match body.get("signers").and_then(|v| v.as_array()) {
-            Some(arr) => arr.iter().filter_map(|x| x.as_u64().map(|n| n as u16)).collect::<Vec<u16>>(),
-            None => {
-                let mut s = vec![v.slot];
-                s.extend(v.peers.keys().copied().filter(|id| *id != v.slot).take(usize::from(v.threshold - 1)));
-                s
-            }
-        };
-        if signers.len() != usize::from(v.threshold) { return Err("not enough vault signers".into()); }
         let note_selection = vec![hex::encode(note.nullifier(&v.fvk).to_bytes())];
-        let p = Payment { attempt: attempt.clone(), vault: vault.to_owned(), proposer: v.slot, recipient: recipient.to_owned(), amount_zat, memo: memo.to_owned(), fee_zat, change_zat, note_selection, target_height: tip, expiry_height: expiry, signers, phase: "draft".into(), session_id: None, control_session_id: None, approvals: BTreeSet::new(), start_requested: false, coordinator_secret: None, review_token: None, approval_requested: false, approval_started: false, txid: None, signed_pczt: None, raw_tx: None, error: None };
+        // No signing group yet: the request is open to every member (`signing_group`).
+        let p = Payment { attempt: attempt.clone(), vault: vault.to_owned(), proposer: v.slot, recipient: recipient.to_owned(), amount_zat, memo: memo.to_owned(), fee_zat, change_zat, note_selection, target_height: tip, expiry_height: expiry, signers: Vec::new(), phase: "draft".into(), session_id: None, control_session_id: None, approvals: Vec::new(), start_requested: false, coordinator_secret: None, review_token: None, approval_requested: false, approval_started: false, txid: None, signed_pczt: None, raw_tx: None, error: None };
         check_intent(&p, &v)?;
         let nullifier = [hex32(&p.note_selection[0])?];
         w.reserve_inputs(zcash_client_backend::wallet::LockOwner::new(random), &nullifier, expiry)?;
@@ -674,10 +712,11 @@ pub(super) async fn publish(State(st): State<Shared>, Json(body): Json<Value>) -
         check_intent(&p, &v)?;
         let coord = Identity::new(0);
         let mut tx = relay(&coord, &st.config.frostd_url)?;
-        let peers = p
-            .signers
-            .iter()
-            .map(|id| Peer(v.peers[id].encryption))
+        // Every member joins both sessions: whoever approves first may end up signing.
+        let peers = v
+            .peers
+            .values()
+            .map(|peer| Peer(peer.encryption))
             .collect::<Vec<_>>();
         let ch = tx.open(&peers, 4).map_err(|e| e.to_string())?;
         p.session_id = Some(ch.session_id());
@@ -687,7 +726,7 @@ pub(super) async fn publish(State(st): State<Shared>, Json(body): Json<Value>) -
         let control_ch = control.open(&peers, 4).map_err(|e| e.to_string())?;
         p.control_session_id = Some(control_ch.session_id());
         save_payment(&data, &pass, &p)?;
-        send_control(&st.config.frostd_url, &v, &p, "intent", &p.signers)?;
+        send_control(&st.config.frostd_url, &v, &p, "intent", &members(&v))?;
         Ok(json!({"phase":p.phase,"session_id":p.session_id,"control_session_id":p.control_session_id}))
     })
     .await
@@ -702,6 +741,9 @@ pub(super) async fn publish(State(st): State<Shared>, Json(body): Json<Value>) -
 /// a native member equals its roster `encryption` key (see `relay`): so `proposer_frostd_pubkey`
 /// is the proposer's roster encryption, and `coordinator_frostd_pubkey` is the X25519 public of
 /// this payment's one-shot coordinator identity (`coordinator_secret`, a fresh `Identity::new(0)`).
+///
+/// `signers` stays empty while the request is open. A browser member sends its approval, then
+/// polls this until the group is fixed, and signs only if the group includes it.
 pub(super) async fn session(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
     let (data, pass) = match unlocked(&st).await {
         Ok(x) => x,
@@ -730,9 +772,9 @@ pub(super) async fn session(State(st): State<Shared>, Json(body): Json<Value>) -
         // the proposer); `control_hash` is its sealed-envelope attempt binding (slot-independent),
         // which the browser's `signControlApproval` reconstructs the SessionContext from.
         let control_session = p.control_session_id.ok_or("missing payment control session")?;
-        let other = *p
-            .signers
-            .iter()
+        let other = *v
+            .peers
+            .keys()
             .find(|s| **s != p.proposer)
             .ok_or("payment has no approver")?;
         let control_hash = hex::encode(control_context(&vault, control_session, p.proposer, other)?.payment);
@@ -781,6 +823,7 @@ pub(super) async fn review(State(st): State<Shared>, Json(body): Json<Value>) ->
         if p.phase != "signing" || p.session_id.is_none() || p.control_session_id.is_none() || p.error.is_some() { return Err("payment is not signing".into()); }
         check_intent(&p, &v)?;
         if p.approval_requested { return Err("payment approval already requested".into()); }
+        if !p.signers.is_empty() && !p.signers.contains(&v.slot) { return Err(ENOUGH_APPROVED.into()); }
         if p.review_token.is_none() {
             let mut token = [0u8; 32]; OsRng.fill_bytes(&mut token);
             p.review_token = Some(hex::encode(token));
@@ -812,8 +855,11 @@ pub(super) async fn approve(State(st): State<Shared>, Json(body): Json<Value>) -
         }
         let v = load_vault(&data, &pass, &vault, &st.config.network)?;
         check_intent(&p, &v)?;
+        if !p.signers.is_empty() && !p.signers.contains(&v.slot) {
+            return Err(ENOUGH_APPROVED.into());
+        }
         p.approval_requested = true;
-        p.approvals.insert(v.slot);
+        record_approval(&mut p, v.slot);
         p.review_token = None;
         save_payment(&data, &pass, &p)?;
         drop(guard);
@@ -850,7 +896,7 @@ fn ensure_worker(
         save_payment(data, pass, &p)?;
         if let Ok(v) = load_vault(data, pass, vault, &st.config.network) {
             if p.proposer == v.slot {
-                let _ = send_control(&st.config.frostd_url, &v, &p, "failed", &p.signers);
+                let _ = send_control(&st.config.frostd_url, &v, &p, "failed", &members(&v));
             }
         }
         return Ok(());
@@ -874,7 +920,7 @@ fn ensure_worker(
                     if let Ok(v) = load_vault(&data, &pass, &vault, &st.config.network) {
                         if p.proposer == v.slot {
                             let _ =
-                                send_control(&st.config.frostd_url, &v, &p, "failed", &p.signers);
+                                send_control(&st.config.frostd_url, &v, &p, "failed", &members(&v));
                         }
                     }
                 }
@@ -901,19 +947,24 @@ fn payment_worker(
         let guard = st.payment.lock().map_err(|e| e.to_string())?;
         // A relay outage while waiting for people is retried before any nonce exists.
         let _ = sync_control(&st.config.frostd_url, data, pass, vault, &v);
-        let p = read_payment(data, pass, vault, attempt)?;
+        let mut p = read_payment(data, pass, vault, attempt)?;
         if p.phase != "signing" || p.error.is_some() {
             return Ok(());
         }
-        if p.proposer == v.slot && p.signers.iter().all(|id| p.approvals.contains(id))
-            || p.proposer != v.slot && p.start_requested
-        {
+        if p.proposer == v.slot && p.signers.is_empty() {
+            if let Some(group) = signing_group(&p, &v) {
+                // Saved before any nonce exists, so a restart signs with the same group.
+                p.signers = group;
+                save_payment(data, pass, &p)?;
+            }
+        }
+        if p.proposer == v.slot && !p.signers.is_empty() || p.proposer != v.slot && p.start_requested {
             break p;
         }
         drop(guard);
         if last_notice.elapsed() >= Duration::from_secs(3) {
             if v.slot == p.proposer {
-                let _ = send_control(&st.config.frostd_url, &v, &p, "intent", &p.signers);
+                let _ = send_control(&st.config.frostd_url, &v, &p, "intent", &members(&v));
             } else {
                 let _ = send_control(&st.config.frostd_url, &v, &p, "approval", &[p.proposer]);
             }
@@ -933,7 +984,8 @@ fn payment_worker(
         save_payment(data, pass, &local)?;
     }
     if p.proposer == v.slot {
-        send_control(&st.config.frostd_url, &v, &p, "start", &p.signers)?;
+        // Every member hears the group: those outside it stop waiting to sign.
+        send_control(&st.config.frostd_url, &v, &p, "start", &members(&v))?;
         let signed = std::thread::scope(|scope| {
             let coordinator = scope.spawn(|| aggregate(st, data, pass, &p, &v));
             let signer_result = sign(st, data, pass, &p, &v, owned);
@@ -1313,7 +1365,7 @@ pub(super) async fn finish(State(st): State<Shared>, Json(body): Json<Value>) ->
             let _guard = st.payment.lock().map_err(|e| e.to_string())?;
             save_payment(&data, &pass, &p)?;
         }
-        let _ = send_control(&st.config.frostd_url, &v, &p, "broadcast", &p.signers);
+        let _ = send_control(&st.config.frostd_url, &v, &p, "broadcast", &members(&v));
         let _ = std::fs::remove_file(
             member_dir(&data, &vault)?
                 .path()
@@ -1344,7 +1396,7 @@ pub(super) async fn verify(State(st): State<Shared>, Json(body): Json<Value>) ->
         }
         .into();
         save_payment(&data, &pass, &p)?;
-        let _ = send_control(&st.config.frostd_url, &v, &p, &p.phase, &p.signers);
+        let _ = send_control(&st.config.frostd_url, &v, &p, &p.phase, &members(&v));
         Ok(json!({"phase":p.phase,"mined_height":mined_height.map(u32::from)}))
     })
     .await
@@ -1489,7 +1541,7 @@ pub(super) async fn payments(
 }
 
 /// A co-signer's approval inbox: payments in this member's local store that another member
-/// proposed, that this member is a selected signer on, and that it has not yet approved.
+/// proposed, that are still open to this member, and that it has not yet approved.
 fn pending_for(data: &Path, pass: &str, vault: &str, slot: u16) -> Result<Vec<Value>, String> {
     let dir = payment_dir(data, vault)?;
     let mut out = Vec::new();
@@ -1505,7 +1557,7 @@ fn pending_for(data: &Path, pass: &str, vault: &str, slot: u16) -> Result<Vec<Va
         let p = read_payment(data, pass, vault, attempt)?;
         if p.phase == "signing"
             && p.proposer != slot
-            && p.signers.contains(&slot)
+            && (p.signers.is_empty() || p.signers.contains(&slot))
             && !p.approval_requested
             && p.error.is_none()
         {
@@ -1570,7 +1622,7 @@ pub(super) async fn status(
                 "recipient": p.recipient,
                 "amount_zat": p.amount_zat,
                 "fee_zat": p.fee_zat,
-                "open_approval": false,
+                "open_approval": p.signers.is_empty(),
             },
         }))
     })
@@ -1675,7 +1727,7 @@ mod tests {
             phase: "signing".into(),
             session_id: None,
             control_session_id: None,
-            approvals: BTreeSet::new(),
+            approvals: Vec::new(),
             start_requested: false,
             coordinator_secret: None,
             review_token: None,
@@ -1720,8 +1772,95 @@ mod tests {
         }
     }
 
+    /// A request no member has acted on yet: proposed by `proposer`, open to every member.
+    fn open_payment(vault: &str, proposer: u16) -> Payment {
+        Payment {
+            attempt: hex::encode([1; 32]),
+            vault: vault.to_owned(),
+            proposer,
+            recipient: "uregtest1recipient".into(),
+            amount_zat: 100_000,
+            memo: "private control notice".into(),
+            fee_zat: 10_000,
+            change_zat: 1,
+            note_selection: vec![hex::encode([5; 32])],
+            target_height: TESTNET_NU7_BIRTH + 1,
+            expiry_height: TESTNET_NU7_BIRTH + 1152,
+            signers: Vec::new(),
+            phase: "signing".into(),
+            session_id: None,
+            control_session_id: None,
+            approvals: Vec::new(),
+            start_requested: false,
+            coordinator_secret: None,
+            review_token: None,
+            approval_requested: false,
+            approval_started: false,
+            txid: None,
+            signed_pczt: None,
+            raw_tx: None,
+            error: None,
+        }
+    }
+
+    fn state(data: &Path, frostd_url: &str) -> Shared {
+        use crate::host::state::{AppState, Config};
+        std::sync::Arc::new(AppState::new(Config {
+            registration: None,
+            data: data.to_owned(),
+            port: 0,
+            bind: "127.0.0.1".parse().unwrap(),
+            advertise_url: None,
+            network: "testnet".into(),
+            lightwalletd: None,
+            transport: "frostd".into(),
+            secure_element: "software".into(),
+            operator_bundle: None,
+            nonce_witnesses: None,
+            operator_key: None,
+            enrollment_issuer: None,
+            development_http: true,
+            token: "disposable".into(),
+            frostd_url: frostd_url.into(),
+            peers: BTreeMap::new(),
+            loopback_peers: true,
+        }))
+    }
+
     #[test]
-    fn testnet_control_discovers_all_intents_without_draining_signing_messages() {
+    fn signing_group_is_the_proposer_and_the_first_other_approvers() {
+        let identities: Vec<_> = (1..=5).map(Identity::new).collect();
+        let peers: BTreeMap<_, _> = identities
+            .iter()
+            .map(|i| (i.public().id, i.public()))
+            .collect();
+        let mut v = member(&identities[1], &peers);
+        let mut p = open_payment(&hex::encode([2; 32]), 2);
+        // Arrival order decides, not slot numbers; the proposer must approve too.
+        for (threshold, approvals, group) in [
+            (2, vec![], None),
+            (2, vec![3, 1], None),
+            (2, vec![3, 2, 1], Some(vec![2, 3])),
+            (2, vec![9, 2, 4], Some(vec![2, 4])),
+            (3, vec![5, 2], None),
+            (3, vec![5, 2, 1, 3], Some(vec![2, 5, 1])),
+        ] {
+            v.threshold = threshold;
+            p.approvals = approvals;
+            assert_eq!(signing_group(&p, &v), group, "{:?}", p.approvals);
+            if let Some(group) = group {
+                p.signers = group;
+                check_signers(&p, &v).unwrap();
+            }
+        }
+        for invalid in [vec![5, 2, 1], vec![2, 5, 5], vec![2, 5], vec![2, 5, 9]] {
+            p.signers = invalid;
+            assert!(check_signers(&p, &v).is_err(), "{:?}", p.signers);
+        }
+    }
+
+    #[test]
+    fn testnet_control_opens_requests_to_every_member_and_signs_with_the_first_approvers() {
         let Ok(url) = std::env::var("FROSTD_URL") else {
             return;
         };
@@ -1732,56 +1871,30 @@ mod tests {
             .collect();
         let a = member(&identities[0], &peers);
         let b = member(&identities[1], &peers);
-        let outsider = member(&identities[2], &peers);
-        let data_a = std::env::temp_dir().join(format!("loki-control-a-{}", Uuid::new_v4()));
-        let data_b = std::env::temp_dir().join(format!("loki-control-b-{}", Uuid::new_v4()));
+        let c = member(&identities[2], &peers);
+        let stranger = member(&Identity::new(4), &peers);
+        let dirs: Vec<_> = (0..4)
+            .map(|_| std::env::temp_dir().join(format!("loki-control-{}", Uuid::new_v4())))
+            .collect();
+        let (data_a, data_b, data_c) = (&dirs[0], &dirs[1], &dirs[2]);
         let vault = hex::encode([2; 32]);
-        let mut p = Payment {
-            attempt: hex::encode([1; 32]),
-            vault: vault.clone(),
-            proposer: 1,
-            recipient: vault::unified_address(&a.fvk, a.network.network_type()),
-            amount_zat: 100_000,
-            memo: "private control notice".into(),
-            fee_zat: 10_000,
-            change_zat: 1,
-            note_selection: vec![hex::encode([5; 32])],
-            target_height: TESTNET_NU7_BIRTH + 1,
-            expiry_height: TESTNET_NU7_BIRTH + 1152,
-            signers: vec![1, 2],
-            phase: "signing".into(),
-            session_id: None,
-            control_session_id: None,
-            approvals: BTreeSet::new(),
-            start_requested: false,
-            coordinator_secret: None,
-            review_token: None,
-            approval_requested: false,
-            approval_started: false,
-            txid: None,
-            signed_pczt: None,
-            raw_tx: None,
-            error: None,
-        };
+        let mut p = open_payment(&vault, 1);
+        p.recipient = vault::unified_address(&a.fvk, a.network.network_type());
+        let everyone: Vec<_> = peers.values().map(|m| Peer(m.encryption)).collect();
         let coord = Identity::new(0);
         let mut signing = relay(&coord, &url).unwrap();
-        let selected: Vec<_> = p
-            .signers
-            .iter()
-            .map(|id| Peer(peers[id].encryption))
-            .collect();
-        let signing_ch = signing.open(&selected, 4).unwrap();
+        let signing_ch = signing.open(&everyone, 4).unwrap();
         p.session_id = Some(signing_ch.session_id());
         let mut control = relay(&a.identity, &url).unwrap();
-        let control_ch = control.open(&selected, 4).unwrap();
+        let control_ch = control.open(&everyone, 4).unwrap();
         p.control_session_id = Some(control_ch.session_id());
-        save_payment(&data_a, "pass", &p).unwrap();
-        send_control(&url, &a, &p, "intent", &p.signers).unwrap();
+        save_payment(data_a, "pass", &p).unwrap();
+        send_control(&url, &a, &p, "intent", &members(&a)).unwrap();
         let mut second = p.clone();
         second.attempt = hex::encode([8; 32]);
-        let control_ch2 = control.open(&selected, 4).unwrap();
+        let control_ch2 = control.open(&everyone, 4).unwrap();
         second.control_session_id = Some(control_ch2.session_id());
-        send_control(&url, &a, &second, "intent", &second.signers).unwrap();
+        send_control(&url, &a, &second, "intent", &members(&a)).unwrap();
         signing
             .send(
                 &signing_ch,
@@ -1789,110 +1902,125 @@ mod tests {
                 &Outbound::RandomizerSeed([7; 32]),
             )
             .unwrap();
-        sync_control(&url, &data_b, "pass", &vault, &b).unwrap();
-        assert_eq!(pending_for(&data_b, "pass", &vault, 2).unwrap().len(), 2);
+        // Every member, not a preselected pair, can approve the request.
+        for (data, m) in [(data_b, &b), (data_c, &c)] {
+            sync_control(&url, data, "pass", &vault, m).unwrap();
+            assert_eq!(pending_for(data, "pass", &vault, m.slot).unwrap().len(), 2);
+        }
         let mut receiver = relay(&b.identity, &url).unwrap();
         let ch = receiver.join(p.session_id.unwrap()).unwrap();
         assert_eq!(receiver.recv(&ch, false).unwrap()[0].message, vec![7; 32]);
         let mut invalid = p.clone();
         invalid.attempt = "../outside".into();
-        assert!(save_payment(&data_a, "pass", &invalid).is_err());
-        send_control(&url, &a, &invalid, "intent", &p.signers).unwrap();
-        let corrupt_path = payment_dir(&data_b, &vault)
+        assert!(save_payment(data_a, "pass", &invalid).is_err());
+        send_control(&url, &a, &invalid, "intent", &members(&a)).unwrap();
+        let corrupt_path = payment_dir(data_b, &vault)
             .unwrap()
             .path()
             .join(format!("{}.json", second.attempt));
         std::fs::write(&corrupt_path, b"unreadable sealed record").unwrap();
-        send_control(&url, &a, &second, "intent", &p.signers).unwrap();
-        sync_control(&url, &data_b, "pass", &vault, &b).unwrap();
+        send_control(&url, &a, &second, "intent", &members(&a)).unwrap();
+        sync_control(&url, data_b, "pass", &vault, &b).unwrap();
         assert_eq!(
             std::fs::read(&corrupt_path).unwrap(),
             b"unreadable sealed record"
         );
-        let mut local = read_payment(&data_b, "pass", &vault, &p.attempt).unwrap();
-        assert!(!local.approval_requested);
-        local.approval_requested = true;
-        local.approvals.insert(2);
-        save_payment(&data_b, "pass", &local).unwrap();
-        send_control(&url, &b, &local, "approval", &[1]).unwrap();
-        sync_control(&url, &data_a, "pass", &vault, &a).unwrap();
-        let mut proposer = read_payment(&data_a, "pass", &vault, &p.attempt).unwrap();
-        assert_eq!(proposer.approvals, BTreeSet::from([2]));
-        assert!(!ready_to_send(&proposer));
+
+        // Member 3 approves before member 2, so member 3 signs: arrival order, not slot order.
+        let approve = |data: &Path, m: &Vault| {
+            let mut local = read_payment(data, "pass", &vault, &p.attempt).unwrap();
+            assert!(!local.approval_requested);
+            local.approval_requested = true;
+            record_approval(&mut local, m.slot);
+            save_payment(data, "pass", &local).unwrap();
+            send_control(&url, m, &local, "approval", &[1]).unwrap();
+        };
+        approve(data_c, &c);
+        sync_control(&url, data_a, "pass", &vault, &a).unwrap();
+        approve(data_b, &b);
+        sync_control(&url, data_a, "pass", &vault, &a).unwrap();
+        let mut proposer = read_payment(data_a, "pass", &vault, &p.attempt).unwrap();
+        assert_eq!(proposer.approvals, vec![3, 2]);
+        assert!(signing_group(&proposer, &a).is_none(), "the proposer approves too");
         // A repeated notice preserves consent; conflicting terms cannot replace it.
-        send_control(&url, &a, &p, "intent", &p.signers).unwrap();
+        send_control(&url, &a, &p, "intent", &members(&a)).unwrap();
         let mut changed = p.clone();
         changed.amount_zat += 1;
-        send_control(&url, &a, &changed, "intent", &p.signers).unwrap();
-        sync_control(&url, &data_b, "pass", &vault, &b).unwrap();
-        assert!(
-            read_payment(&data_b, "pass", &vault, &p.attempt)
-                .unwrap()
-                .approval_requested
-        );
-        assert_eq!(
-            read_payment(&data_b, "pass", &vault, &p.attempt)
-                .unwrap()
-                .amount_zat,
-            p.amount_zat
-        );
-        send_control(&url, &b, &p, "start", &[1]).unwrap();
-        sync_control(&url, &data_a, "pass", &vault, &a).unwrap();
-        assert!(
-            !read_payment(&data_a, "pass", &vault, &p.attempt)
-                .unwrap()
-                .start_requested
-        );
-        proposer.approvals.insert(1);
-        save_payment(&data_a, "pass", &proposer).unwrap();
+        send_control(&url, &a, &changed, "intent", &members(&a)).unwrap();
+        sync_control(&url, data_b, "pass", &vault, &b).unwrap();
+        let local = read_payment(data_b, "pass", &vault, &p.attempt).unwrap();
+        assert!(local.approval_requested);
+        assert_eq!(local.amount_zat, p.amount_zat);
+        // Only the proposer fixes the group.
+        let mut forged = p.clone();
+        forged.signers = vec![1, 2];
+        send_control(&url, &b, &forged, "start", &[3]).unwrap();
+        sync_control(&url, data_c, "pass", &vault, &c).unwrap();
+        let local = read_payment(data_c, "pass", &vault, &p.attempt).unwrap();
+        assert!(local.signers.is_empty() && !local.start_requested);
+        record_approval(&mut proposer, 1);
+        proposer.signers = signing_group(&proposer, &a).unwrap();
+        assert_eq!(proposer.signers, vec![1, 3]);
+        save_payment(data_a, "pass", &proposer).unwrap();
         // Human delay exceeds the old timeout without starting a nonce or signing round.
         std::thread::sleep(Duration::from_secs(12));
-        sync_control(&url, &data_b, "pass", &vault, &b).unwrap();
+        sync_control(&url, data_c, "pass", &vault, &c).unwrap();
         assert!(
-            !read_payment(&data_b, "pass", &vault, &p.attempt)
+            !read_payment(data_c, "pass", &vault, &p.attempt)
                 .unwrap()
                 .approval_started
         );
-        send_control(&url, &a, &proposer, "start", &p.signers).unwrap();
-        sync_control(&url, &data_b, "pass", &vault, &b).unwrap();
-        assert!(
-            read_payment(&data_b, "pass", &vault, &p.attempt)
-                .unwrap()
-                .start_requested
-        );
-        let mut reported = read_payment(&data_b, "pass", &vault, &p.attempt).unwrap();
+        send_control(&url, &a, &proposer, "start", &members(&a)).unwrap();
+        // A later, different group from the proposer cannot replace the first.
+        let mut regroup = proposer.clone();
+        regroup.signers = vec![1, 2];
+        send_control(&url, &a, &regroup, "start", &members(&a)).unwrap();
+        sync_control(&url, data_b, "pass", &vault, &b).unwrap();
+        sync_control(&url, data_c, "pass", &vault, &c).unwrap();
+        let signer = read_payment(data_c, "pass", &vault, &p.attempt).unwrap();
+        assert_eq!(signer.signers, vec![1, 3]);
+        assert!(signer.start_requested);
+        assert_eq!(signer.phase, "signing");
+        let outside = read_payment(data_b, "pass", &vault, &p.attempt).unwrap();
+        assert_eq!(outside.signers, vec![1, 3]);
+        assert!(!outside.start_requested);
+        assert_eq!(outside.phase, "not_selected");
+
+        let mut reported = signer;
         reported.phase = "approved".into();
-        save_payment(&data_b, "pass", &reported).unwrap();
+        save_payment(data_c, "pass", &reported).unwrap();
         proposer.txid = Some(hex::encode([6; 32]));
-        send_control(&url, &a, &proposer, "confirmed", &p.signers).unwrap();
-        sync_control(&url, &data_b, "pass", &vault, &b).unwrap();
-        assert_eq!(
-            read_payment(&data_b, "pass", &vault, &p.attempt)
-                .unwrap()
-                .phase,
-            "broadcast"
-        );
+        send_control(&url, &a, &proposer, "confirmed", &members(&a)).unwrap();
+        for (data, m) in [(data_b, &b), (data_c, &c)] {
+            sync_control(&url, data, "pass", &vault, m).unwrap();
+            assert_eq!(
+                read_payment(data, "pass", &vault, &p.attempt)
+                    .unwrap()
+                    .phase,
+                "broadcast"
+            );
+        }
         reported.phase = "signing".into();
         reported.txid = None;
-        save_payment(&data_b, "pass", &reported).unwrap();
-        send_control(&url, &a, &proposer, "failed", &p.signers).unwrap();
-        send_control(&url, &a, &proposer, "start", &p.signers).unwrap();
-        sync_control(&url, &data_b, "pass", &vault, &b).unwrap();
+        save_payment(data_c, "pass", &reported).unwrap();
+        send_control(&url, &a, &proposer, "failed", &members(&a)).unwrap();
+        send_control(&url, &a, &proposer, "start", &members(&a)).unwrap();
+        sync_control(&url, data_c, "pass", &vault, &c).unwrap();
         assert_eq!(
-            read_payment(&data_b, "pass", &vault, &p.attempt)
+            read_payment(data_c, "pass", &vault, &p.attempt)
                 .unwrap()
                 .phase,
             "failed"
         );
-        let data_c = std::env::temp_dir().join(format!("loki-control-c-{}", Uuid::new_v4()));
-        sync_control(&url, &data_c, "pass", &vault, &outsider).unwrap();
-        assert!(local_attempts(&data_c, &vault).unwrap().is_empty());
+        let data_stranger = &dirs[3];
+        sync_control(&url, data_stranger, "pass", &vault, &stranger).unwrap();
+        assert!(local_attempts(data_stranger, &vault).unwrap().is_empty());
         signing.close(signing_ch).unwrap();
         close_if_present(&mut control, control_ch.session_id()).unwrap();
         close_if_present(&mut control, control_ch.session_id()).unwrap();
         control.close(control_ch2).unwrap();
-        for data in [data_a, data_b, data_c] {
-            std::fs::remove_dir_all(data).unwrap();
+        for data in dirs {
+            let _ = std::fs::remove_dir_all(data);
         }
     }
 
@@ -1901,7 +2029,6 @@ mod tests {
         let Ok(url) = std::env::var("FROSTD_URL") else {
             return;
         };
-        use crate::host::state::{AppState, Config};
         let data = std::env::temp_dir().join(format!("loki-testnet-round-{}", Uuid::new_v4()));
         let identities: Vec<_> = (1..=3).map(Identity::new).collect();
         let peers: BTreeMap<_, _> = identities
@@ -1939,8 +2066,9 @@ mod tests {
             peers: peers.clone(),
             birth_height: TESTNET_NU7_BIRTH,
         };
+        // Members 1 and 3 sign; member 2 is in the session but never joins it.
         let a = make(1);
-        let b = make(2);
+        let b = make(3);
         let rho = Rho::from_bytes(&[1; 32]).unwrap();
         let note = orchard::Note::from_parts(
             fvk.address_at(0u64, Scope::External),
@@ -1968,7 +2096,7 @@ mod tests {
         let coord = Identity::new(0);
         let mut tx = relay(&coord, &url).unwrap();
         let ch = tx
-            .open(&[Peer(peers[&1].encryption), Peer(peers[&2].encryption)], 4)
+            .open(&peers.values().map(|m| Peer(m.encryption)).collect::<Vec<_>>(), 4)
             .unwrap();
         let mut p = Payment {
             attempt: hex::encode([3; 32]),
@@ -1982,11 +2110,11 @@ mod tests {
             note_selection: vec![hex::encode(note.nullifier(&fvk).to_bytes())],
             target_height: inputs.target_height,
             expiry_height: inputs.expiry_height,
-            signers: vec![1, 2],
+            signers: vec![1, 3],
             phase: "signing".into(),
             session_id: Some(ch.session_id()),
             control_session_id: None,
-            approvals: BTreeSet::from([1, 2]),
+            approvals: vec![1, 3],
             start_requested: true,
             coordinator_secret: Some(hex::encode(coord.to_secret_bytes())),
             review_token: None,
@@ -1997,26 +2125,7 @@ mod tests {
             raw_tx: None,
             error: None,
         };
-        let st = std::sync::Arc::new(AppState::new(Config {
-            registration: None,
-            data: data.clone(),
-            port: 0,
-            bind: "127.0.0.1".parse().unwrap(),
-            advertise_url: None,
-            network: "testnet".into(),
-            lightwalletd: None,
-            transport: "frostd".into(),
-            secure_element: "software".into(),
-            operator_bundle: None,
-            nonce_witnesses: None,
-            operator_key: None,
-            enrollment_issuer: None,
-            development_http: true,
-            token: "disposable".into(),
-            frostd_url: url,
-            peers: BTreeMap::new(),
-            loopback_peers: true,
-        }));
+        let st = state(&data, &url);
         let b_data = data.join("b");
         std::fs::create_dir_all(b_data.join("vaults").join(&vault)).unwrap();
         let signed = std::thread::scope(|scope| {
@@ -2071,7 +2180,7 @@ mod tests {
                     phase: phase.into(),
                     session_id: Some(Uuid::new_v4()),
                     control_session_id: None,
-                    approvals: BTreeSet::new(),
+                    approvals: Vec::new(),
                     start_requested: false,
                     coordinator_secret: None,
                     review_token: None,
@@ -2143,13 +2252,16 @@ mod tests {
             &mk([5u8; 32], vec![1, 2], 1, "broadcast", false),
         )
         .unwrap(); // not signing → hidden
+        save_payment(&data, "pass", &mk([6u8; 32], vec![], 3, "signing", false))
+            .unwrap(); // open to every member → shown
 
-        let seen: Vec<String> = pending_for(&data, "pass", &vault, 2)
+        let mut seen: Vec<String> = pending_for(&data, "pass", &vault, 2)
             .unwrap()
             .iter()
             .map(|p| p["attempt"].as_str().unwrap().to_owned())
             .collect();
-        assert_eq!(seen, vec![hex::encode([1u8; 32])]);
+        seen.sort();
+        assert_eq!(seen, vec![hex::encode([1u8; 32]), hex::encode([6u8; 32])]);
         std::fs::remove_dir_all(data).unwrap();
     }
 }

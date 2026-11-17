@@ -1652,10 +1652,14 @@ function Send({
 }
 
 function SignerList({ signers, threshold, approvals = [], ready = false, complete = false }: { signers: number[]; threshold: number; approvals?: number[]; ready?: boolean; complete?: boolean }) {
+  // Until the first approvals fix the signing group, any member may approve.
+  const open = signers.length === 0;
+  const shown = open ? approvals : signers;
+  const count = open ? approvals.length : approvals.filter((id) => signers.includes(id)).length;
   return <div className="my-3">
-    <p className="text-xs text-muted">{ready ? "Signatures saved · proposer can send" : complete ? "Your signer finished · awaiting proposer" : `${approvals.filter((id) => signers.includes(id)).length} of ${threshold} approvals recorded here`}</p>
+    <p className="text-xs text-muted">{ready ? "Signatures saved · proposer can send" : complete ? "Your signer finished · awaiting proposer" : `${count} of ${threshold} approvals recorded here${open ? " · any member can approve" : ""}`}</p>
     <div className="mt-2 flex flex-wrap gap-2">
-      {signers.map((slot) => <span key={slot} className="pill"><MemberAvatar slot={slot} size={24} /> Member {slot}{approvals.includes(slot) ? " · approved" : " · waiting"}</span>)}
+      {shown.map((slot) => <span key={slot} className="pill"><MemberAvatar slot={slot} size={24} /> Member {slot}{approvals.includes(slot) ? " · approved" : " · waiting"}</span>)}
     </div>
   </div>;
 }

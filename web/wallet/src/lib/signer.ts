@@ -80,8 +80,9 @@ export interface SignerModule {
   enroll(coordinatorOrigin?: string): Promise<EnrolledMember>;
   /** In-process member call — the old per-member HTTP, now dispatched into wasm. */
   request<T = unknown>(path: string, body?: unknown): Promise<T>;
-  /** Discover a published payment on the proposer's host and release this member's share. */
-  approvePayment(opts: ApprovePaymentOpts): Promise<{ approved: boolean; review: unknown }>;
+  /** Approve a published payment on the proposer's host. `signed` is true when this member was
+   *  among the first approvers and released its share; otherwise others signed it. */
+  approvePayment(opts: ApprovePaymentOpts): Promise<{ approved: boolean; signed: boolean; review?: unknown }>;
 }
 
 // ─── real wasm signer (browser Worker) ───────────────────────────────────────
@@ -265,12 +266,17 @@ function browserSigner(cfg: SignerConfig): SignerModule {
     async approvePayment({ creatorBaseUrl, vault, attempt }) {
       if (!current) throw new ApiError("Unlock your signer", 401);
       const base = creatorBaseUrl.replace(/\/+$/, "");
-      const s = await postJson<PaymentSession>(`${base}/api/payment-session`, { vault, attempt });
+      const sessionUrl = `${base}/api/payment-session`;
+      const s = await postJson<PaymentSession>(sessionUrl, { vault, attempt });
       // Find THIS member's slot by matching its roster encryption (relay) key — the frostd
       // login pubkey differs, so match the roster field, not the login identity.
       const material = await call<{ relay_pubkey: string }>({ op: "enroll-material" });
       const me = s.members.find((m) => m.encryption === material.relay_pubkey);
       if (!me) throw new ApiError("this signer is not a member of the payment's vault", 403);
+      // Open request: empty `signers` until the first approvals fix the group.
+      if (s.signers.length > 0 && !s.signers.includes(me.id)) {
+        throw new ApiError("enough members already approved this payment", 409);
+      }
       const proposer = s.members.find((m) => m.id === s.proposer);
       if (!proposer) throw new ApiError("payment session is missing the proposer", 502);
       // Rebuild the DKG setup document BYTE-IDENTICAL (joinCeremony: sorted by slot, same keys).
@@ -288,6 +294,7 @@ function browserSigner(cfg: SignerConfig): SignerModule {
         network: s.network,
         rosterHex,
         sessionId: s.session_id,
+        sessionUrl,
         attemptHex: s.attempt,
         signers: s.signers,
         proposerSigning: proposer.signing,
@@ -347,7 +354,7 @@ const mockSigner: SignerModule = {
   },
   // Enrollment needs the unlocked identity + a device key the wasm core authorizes (W1).
   async enroll(): Promise<EnrolledMember> { throw new SignerPending("enroll"); },
-  async approvePayment(): Promise<{ approved: boolean; review: unknown }> { throw new SignerPending("payment-approve"); },
+  async approvePayment(): Promise<{ approved: boolean; signed: boolean; review?: unknown }> { throw new SignerPending("payment-approve"); },
   async request<T>(path: string): Promise<T> {
     const s = session();
     // Status is the only member call the onboarding lifecycle needs; serve it so a

@@ -32,11 +32,12 @@ A vault is a **t-of-n** group (any `2 ≤ t < n ≤ 16`). Its lifecycle:
    substitution.
 4. **Fund.** Send testnet ZEC to the vault address; the coordinator scans the chain and
    reports the balance.
-5. **Pay.** A member proposes a send. The coordinator builds the unsigned transaction
-   (PCZT). Each required signer **re-derives the sighash from the raw transaction, sees
-   exactly what it is signing (WYSIWYS), and approves** — producing a signature share over
-   `frostd`. The coordinator aggregates `t` shares into one re-randomized signature and
-   **broadcasts**.
+5. **Pay.** A member proposes a send, and every member can approve it. The proposer and
+   the first `t − 1` other members to approve form the signing group; nobody is chosen in
+   advance. The coordinator builds the unsigned transaction (PCZT). Each signer in the group
+   **re-derives the sighash from the raw transaction, sees exactly what it is signing
+   (WYSIWYS), and signs** — producing a signature share over `frostd`. The coordinator
+   aggregates `t` shares into one re-randomized signature and **broadcasts**.
 
 ## Architecture
 
@@ -121,7 +122,8 @@ communication/deploy/join-loki.sh      https://<random>.trycloudflare.com   # ea
 
 Then, together in the coordinator UI: create a vault → verify every member (compare the
 roster fingerprint out of band) → fund from a [testnet faucet](https://faucet.zecpages.com/)
-→ propose a send; each required signer reviews and approves on their device → broadcast.
+→ propose a send; any members review and approve on their own devices, and the first `t`
+(including the proposer) sign → broadcast.
 
 Use only disposable test-network funds. Full design, threat model, and invariants:
 [`docs/product/`](docs/product/).
