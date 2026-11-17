@@ -54,6 +54,21 @@ impl SessionContext {
         }
         Ok(())
     }
+
+    /// The sealed-envelope context between members `a` and `b` on one payment's frostd
+    /// control session, where the proposer announces the payment and members approve it.
+    pub fn control(vault: [u8; 32], session: uuid::Uuid, a: u16, b: u16) -> Self {
+        let mut hash = blake3::Hasher::new_derive_key("loki payment control session v1");
+        hash.update(&vault);
+        hash.update(session.as_bytes());
+        let derived = *hash.finalize().as_bytes();
+        Self {
+            vault,
+            payment: derived,
+            attempt: AttemptId(derived),
+            signers: vec![a.min(b), a.max(b)],
+        }
+    }
 }
 
 #[repr(u8)]

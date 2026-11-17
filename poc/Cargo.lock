@@ -2153,6 +2153,7 @@ dependencies = [
  "hex",
  "loki-signer-core",
  "serde_json",
+ "uuid",
  "wasm-bindgen",
  "wasm-bindgen-test",
  "zakura-orchard",

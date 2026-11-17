@@ -91,6 +91,8 @@ struct ListSessionsOut {
 #[derive(Deserialize)]
 struct SessionInfoOut {
     pubkeys: Vec<HexKey>,
+    #[serde(default)]
+    coordinator_pubkey: Option<HexKey>,
 }
 #[derive(Serialize, Deserialize)]
 struct WireMsg {
@@ -255,18 +257,18 @@ impl WasmFrostdTransport {
         Ok(out.session_ids)
     }
 
-    /// The participant pubkeys of one session.
-    pub async fn session_info(&self, session: Uuid) -> Result<Vec<[u8; 32]>, TransportError> {
+    /// The participant pubkeys of one session, and the pubkey of the member who opened it.
+    pub async fn session_info(&self, session: Uuid) -> Result<(Vec<[u8; 32]>, Option<[u8; 32]>), TransportError> {
         let out: SessionInfoOut = self
             .post("get_session_info", json!({ "session_id": session }))
             .await?;
-        out.pubkeys
-            .into_iter()
-            .map(|k| {
-                k.0.try_into()
-                    .map_err(|_| TransportError::Decode("session pubkey length".into()))
-            })
-            .collect()
+        let key = |k: HexKey| -> Result<[u8; 32], TransportError> {
+            k.0.try_into()
+                .map_err(|_| TransportError::Decode("session pubkey length".into()))
+        };
+        let owner = out.coordinator_pubkey.map(key).transpose()?;
+        let participants = out.pubkeys.into_iter().map(key).collect::<Result<_, _>>()?;
+        Ok((participants, owner))
     }
 
     /// Coordinator-only: close the session (frostd rejects non-coordinator closes).
@@ -334,10 +336,16 @@ mod wasm_api {
             self.session.ok_or_else(|| JsError::new("no session bound — call useSession first"))
         }
 
-        /// The participant pubkeys of the bound session (hex), for sanity-checking the roster.
+        /// The bound session's participants and the member who opened it (its coordinator), as
+        /// JSON `{participants: [hex], coordinator: hex | null}`.
         #[wasm_bindgen(js_name = sessionInfo)]
-        pub async fn session_info(&self) -> Result<Vec<String>, JsError> {
-            Ok(self.inner.session_info(self.session()?).await.map_err(je)?.iter().map(hex::encode).collect())
+        pub async fn session_info(&self) -> Result<String, JsError> {
+            let (participants, owner) = self.inner.session_info(self.session()?).await.map_err(je)?;
+            Ok(serde_json::json!({
+                "participants": participants.iter().map(hex::encode).collect::<Vec<_>>(),
+                "coordinator": owner.map(hex::encode),
+            })
+            .to_string())
         }
 
         /// Send one DKG wire (hex) to the coordinator (frostd empty-recipient convention).
@@ -449,6 +457,8 @@ mod live {
         assert_eq!(msgs, vec![Incoming { from: me, message: b"hello frostd over fetch".to_vec() }]);
         let sessions = t.list_sessions().await.expect("list");
         assert!(sessions.contains(&session));
+        // Members tell a payment's control session from its signing session by who opened it.
+        assert_eq!(t.session_info(session).await.expect("info"), (vec![me], Some(me)));
         t.close(session).await.expect("close");
     }
 }

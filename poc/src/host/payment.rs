@@ -419,25 +419,12 @@ fn public_intent(p: &Payment) -> Value {
 const UNAVAILABLE: &str = "payment session unavailable";
 const ENOUGH_APPROVED: &str = "enough members already approved this payment";
 
-/// The sealed-envelope context between two members about one payment attempt.
-fn peer_context(vault: &str, attempt: &str, a: u16, b: u16) -> Result<SessionContext, String> {
-    Ok(SessionContext {
-        vault: hex32(vault)?,
-        payment: hex32(attempt)?,
-        attempt: AttemptId(hex32(attempt)?),
-        signers: vec![a.min(b), a.max(b)],
-    })
-}
-
 fn ready_to_send(p: &Payment) -> bool {
     p.phase == "ready" && p.error.is_none() && p.signed_pczt.is_some()
 }
 
 fn control_context(vault: &str, session: Uuid, a: u16, b: u16) -> Result<SessionContext, String> {
-    let mut hash = blake3::Hasher::new_derive_key("loki payment control session v1");
-    hash.update(&hex32(vault)?);
-    hash.update(session.as_bytes());
-    peer_context(vault, &hash.finalize().to_hex().to_string(), a, b)
+    Ok(SessionContext::control(hex32(vault)?, session, a, b))
 }
 
 /// Binds approvals to the payment terms, not to the signing group fixed after them.
@@ -745,89 +732,6 @@ pub(super) async fn publish(State(st): State<Shared>, Json(body): Json<Value>) -
         save_payment(&data, &pass, &p)?;
         send_control(&st.config.frostd_url, &v, &p, "intent", &members(&v))?;
         Ok(json!({"phase":p.phase,"session_id":p.session_id,"control_session_id":p.control_session_id}))
-    })
-    .await
-}
-
-/// Everything a remote (browser) signer needs to join this payment's frostd signing session
-/// and release its share. Served by the proposer's host (it alone holds the published payment
-/// and the coordinator secret). Mirrors the ceremony `/api/session` endpoint: CORS-open and
-/// process-token-exempt so a browser member can poll it cross-origin.
-///
-/// The frostd `from` identity a signer matches is the sender's frostd login pubkey, which for
-/// a native member equals its roster `encryption` key (see `relay`): so `proposer_frostd_pubkey`
-/// is the proposer's roster encryption, and `coordinator_frostd_pubkey` is the X25519 public of
-/// this payment's one-shot coordinator identity (`coordinator_secret`, a fresh `Identity::new(0)`).
-///
-/// `signers` stays empty while the request is open. A browser member sends its approval, then
-/// polls this until the group is fixed, and signs only if the group includes it.
-pub(super) async fn session(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
-    let (data, pass) = match unlocked(&st).await {
-        Ok(x) => x,
-        Err(e) => return e,
-    };
-    blocking(move || {
-        let (vault, attempt) = pair(&body)?;
-        let v = load_vault(&data, &pass, &vault, &st.config.network)?;
-        let p = read_payment(&data, &pass, &vault, &attempt)?;
-        if p.phase != "signing"
-            || p.session_id.is_none()
-            || p.control_session_id.is_none()
-            || p.error.is_some()
-        {
-            return Err("payment is not signing".into());
-        }
-        let coord_bytes = hex::decode(
-            p.coordinator_secret
-                .as_deref()
-                .ok_or("missing coordinator identity")?,
-        )
-        .map_err(|e| e.to_string())?;
-        let coordinator_frostd_pubkey =
-            hex::encode(Identity::from_secret_bytes(&coord_bytes)?.public().encryption);
-        // The control session carries the approval (a sealed `{kind:"approval"}` PeerReply to
-        // the proposer); `control_hash` is its sealed-envelope attempt binding (slot-independent),
-        // which the browser's `signControlApproval` reconstructs the SessionContext from.
-        let control_session = p.control_session_id.ok_or("missing payment control session")?;
-        let other = *v
-            .peers
-            .keys()
-            .find(|s| **s != p.proposer)
-            .ok_or("payment has no approver")?;
-        let control_hash = hex::encode(control_context(&vault, control_session, p.proposer, other)?.payment);
-        let proposer_frostd_pubkey = hex::encode(
-            v.peers
-                .get(&p.proposer)
-                .ok_or("proposer not in vault roster")?
-                .encryption,
-        );
-        let members = v
-            .peers
-            .iter()
-            .map(|(id, pid)| {
-                json!({
-                    "id": id,
-                    "signing": hex::encode(pid.signing),
-                    "encryption": hex::encode(pid.encryption),
-                })
-            })
-            .collect::<Vec<_>>();
-        Ok(json!({
-            "session_id": p.session_id,
-            "control_session_id": p.control_session_id,
-            "control_hash": control_hash,
-            "intent": public_intent(&p),
-            "intent_hash": intent_hash(&p),
-            "attempt": p.attempt,
-            "signers": p.signers,
-            "proposer": p.proposer,
-            "proposer_frostd_pubkey": proposer_frostd_pubkey,
-            "coordinator_frostd_pubkey": coordinator_frostd_pubkey,
-            "members": members,
-            "threshold": v.threshold,
-            "network": v.network.label(),
-            "birth_height": v.birth_height,
-        }))
     })
     .await
 }

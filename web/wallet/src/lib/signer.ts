@@ -36,25 +36,7 @@ export interface SignerSession { slot?: number; profile: { id: string; name: str
 export interface EnrolledMember { slot: number; signing_pubkey: string; relay_pubkey: string; advertise_url: string }
 
 /** Discover + sign a payment the proposer published (this signer is a NON-proposer approver). */
-export interface ApprovePaymentOpts { creatorBaseUrl: string; vault: string; attempt: string }
-/** `/api/payment-session` on the proposer's host (poc/src/host/payment.rs::session). */
-interface PaymentSession {
-  session_id: string;
-  control_session_id: string;
-  control_hash: string;
-  intent: unknown;
-  intent_hash: string;
-  attempt: string;
-  signers: number[];
-  proposer: number;
-  proposer_frostd_pubkey: string;
-  coordinator_frostd_pubkey: string;
-  members: { id: number; signing: string; encryption: string }[];
-  threshold: number;
-  network: string;
-  birth_height: number | null;
-}
-
+export interface ApprovePaymentOpts { vault: string; attempt: string }
 /**
  * The contract W1's wasm module must satisfy. `request` is the in-process
  * equivalent of the old member HTTP API: W1 dispatches each (path, body) into
@@ -80,8 +62,8 @@ export interface SignerModule {
   enroll(coordinatorOrigin?: string): Promise<EnrolledMember>;
   /** In-process member call — the old per-member HTTP, now dispatched into wasm. */
   request<T = unknown>(path: string, body?: unknown): Promise<T>;
-  /** Approve a published payment on the proposer's host. `signed` is true when this member was
-   *  among the first approvers and released its share; otherwise others signed it. */
+  /** Approve a published payment, found on frostd. `signed` is true when this member was among
+   *  the first approvers and released its share; otherwise others signed it. */
   approvePayment(opts: ApprovePaymentOpts): Promise<{ approved: boolean; signed: boolean; review?: unknown }>;
 }
 
@@ -254,61 +236,19 @@ function browserSigner(cfg: SignerConfig): SignerModule {
       // supplies the invite (and, on testnet, the creator's birthHeight) so the rebuilt setup
       // document matches the creator's.
       if (path === "join") return call<T>({ op: "join", join: relay(body) });
-      // Phase C: review + approve a payment (NON-proposer signer). The UI supplies the vault
-      // reopen params (vaultHex/slot/label/network/rosterHex), the frostd session + relay
-      // peers, the proposer identity, and the attempt; the Worker drives the synchronous
-      // signer core over the frostd transport. WYSIWYS is enforced inside the core (signApprove
-      // refuses unless the signing package binds the recomputed sighash).
+      // Phase C: review + approve a payment (NON-proposer signer). The Worker reopens the vault
+      // from its own stored roster and drives the synchronous signer core over the frostd
+      // transport. WYSIWYS is enforced inside the core (signApprove refuses unless the signing
+      // package binds the recomputed sighash).
       if (path === "payment-review") return call<T>({ op: "payment-review", payment: relay(body) });
       if (path === "payment-approve") return call<T>({ op: "payment-approve", payment: relay(body) });
       throw new SignerPending(path); // other member paths stay unbuilt
     },
-    async approvePayment({ creatorBaseUrl, vault, attempt }) {
+    async approvePayment({ vault, attempt }) {
       if (!current) throw new ApiError("Unlock your signer", 401);
-      const base = creatorBaseUrl.replace(/\/+$/, "");
-      const sessionUrl = `${base}/api/payment-session`;
-      const s = await postJson<PaymentSession>(sessionUrl, { vault, attempt });
-      // Find THIS member's slot by matching its roster encryption (relay) key — the frostd
-      // login pubkey differs, so match the roster field, not the login identity.
-      const material = await call<{ relay_pubkey: string }>({ op: "enroll-material" });
-      const me = s.members.find((m) => m.encryption === material.relay_pubkey);
-      if (!me) throw new ApiError("this signer is not a member of the payment's vault", 403);
-      // Open request: empty `signers` until the first approvals fix the group.
-      if (s.signers.length > 0 && !s.signers.includes(me.id)) {
-        throw new ApiError("enough members already approved this payment", 409);
-      }
-      const proposer = s.members.find((m) => m.id === s.proposer);
-      if (!proposer) throw new ApiError("payment session is missing the proposer", 502);
-      // Rebuild the DKG setup document BYTE-IDENTICAL (joinCeremony: sorted by slot, same keys).
-      const members = s.members
-        .slice()
-        .sort((a, b) => a.id - b.id)
-        .map((m) => ({ id: m.id, signing: m.signing, encryption: m.encryption }));
-      const doc: Record<string, unknown> = { vault, threshold: s.threshold, setup_version: 2, network: s.network, members };
-      if (s.network === "testnet") doc.birth_height = Number(s.birth_height);
-      const rosterHex = toHex(new TextEncoder().encode(JSON.stringify(doc)));
-      const body = {
-        vaultHex: vault,
-        slot: me.id,
-        label: "vault",
-        network: s.network,
-        rosterHex,
-        sessionId: s.session_id,
-        sessionUrl,
-        attemptHex: s.attempt,
-        signers: s.signers,
-        proposerSigning: proposer.signing,
-        proposerEnc: s.proposer_frostd_pubkey,
-        proposerId: s.proposer,
-        coordinatorPeer: s.coordinator_frostd_pubkey,
-        controlSessionId: s.control_session_id,
-        controlHash: s.control_hash,
-        intent: s.intent,
-        intentHash: s.intent_hash,
-        frostdUrl: cfg.frostdUrl,
-        transportUrl: cfg.transportUrl,
-      };
-      return call({ op: "payment-approve", payment: body });
+      // The worker finds the payment on frostd, sealed to this member by the proposer, and
+      // checks every key against the roster this member confirmed at setup.
+      return call({ op: "payment-approve", payment: { vaultHex: vault, attemptHex: attempt, frostdUrl: cfg.frostdUrl, transportUrl: cfg.transportUrl } });
     },
   };
 }
@@ -409,7 +349,7 @@ export const signer: SignerModule = {
   approvePayment: async (opts) => (await impl()).approvePayment(opts),
 };
 
-// Callable without the (unwired) vault UI: `await window.lokiApprovePayment({ creatorBaseUrl, vault, attempt })`.
+// Callable without the (unwired) vault UI: `await window.lokiApprovePayment({ vault, attempt })`.
 if (typeof window !== "undefined") {
   (window as unknown as { lokiApprovePayment?: typeof signer.approvePayment }).lokiApprovePayment = signer.approvePayment;
 }

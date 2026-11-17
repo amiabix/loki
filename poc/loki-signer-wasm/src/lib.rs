@@ -27,7 +27,7 @@ use loki_signer_core::signer::{
 };
 use loki_signer_core::signer::wysiwys::{describe_pczt, sighash_of_pczt};
 use loki_signer_core::signer::DkgInput;
-use loki_signer_core::signing_session::{AttemptId, MessageKind, SessionContext};
+use loki_signer_core::signing_session::{AttemptId, SessionContext};
 use loki_signer_core::frost;
 use std::time::Duration;
 use wasm_bindgen::prelude::*;
@@ -385,6 +385,15 @@ impl Signer {
             .map_err(|e| JsError::new(&e))
     }
 
+    /// Reopen this browser's signer for an existing vault, with no network input. Returns
+    /// `{vault_id, slot, threshold, network, ready, members: [{id, signing, encryption}]}`
+    /// from the roster this member confirmed at setup. The Worker must pre-open
+    /// `vaultPaths(vaultHex)` first.
+    #[wasm_bindgen(js_name = vaultOpen)]
+    pub fn vault_open(&mut self, vault_hex: &str) -> Result<String, JsError> {
+        self.vault_open_impl(vault_hex).map_err(|e| JsError::new(&e))
+    }
+
     /// One DKG pass: feed the relayed peer wires (each hex `DkgWire` bytes the coordinator
     /// forwarded) into `dkg_step` and return this member's outgoing wires (hex), which the
     /// Worker sends to the coordinator. Call with `[]` on every poll tick to advance phases
@@ -507,30 +516,23 @@ impl Signer {
         .map_err(|e| JsError::new(&e))
     }
 
-    /// Seal this member's payment-control message to the proposer (a `{kind:"approval"}` body)
-    /// as a `PeerReply`, for the browser to send on the control session. The proposer records
-    /// the approval from it (`sync_control`). `control_hash_hex` is the control session's
-    /// envelope attempt binding (from `/api/payment-session`); `proposer_*` is the proposer's
-    /// roster identity; `my_slot` this member's roster slot. Returns the sealed wire (hex).
-    #[wasm_bindgen(js_name = signControlApproval)]
-    pub fn sign_control_approval(
-        &self,
-        proposer_signing_hex: &str,
-        proposer_enc_hex: &str,
-        proposer_id: u16,
-        my_slot: u16,
-        control_hash_hex: &str,
-        body_json: &str,
-    ) -> Result<String, JsError> {
-        self.sign_control_approval_impl(
-            proposer_signing_hex,
-            proposer_enc_hex,
-            proposer_id,
-            my_slot,
-            control_hash_hex,
-            body_json,
-        )
-        .map_err(|e| JsError::new(&e))
+    /// Open a message a vault member sealed to this one on a payment's frostd control session
+    /// (`session_id`, a UUID). `from_hex` is the frostd sender; the sender's identity comes from
+    /// the roster this member confirmed at setup, so a non-member's message is refused.
+    /// Returns `{from, body}`: the sender's member id and the message body (JSON text).
+    #[wasm_bindgen(js_name = openControl)]
+    pub fn open_control(&self, session_id: &str, from_hex: &str, wire_hex: &str) -> Result<String, JsError> {
+        self.open_control_impl(session_id, from_hex, wire_hex)
+            .map_err(|e| JsError::new(&e))
+    }
+
+    /// Seal a control message (`body_json`) from this member to member `to` on the payment
+    /// control session `session_id`, under the roster confirmed at setup. Returns the wire (hex)
+    /// to send to that member's relay key.
+    #[wasm_bindgen(js_name = sealControl)]
+    pub fn seal_control(&self, session_id: &str, to: u16, body_json: &str) -> Result<String, JsError> {
+        self.seal_control_impl(session_id, to, body_json)
+            .map_err(|e| JsError::new(&e))
     }
 
     /// Round 2: the PUBLIC signature share for `attempt_hex` (hex). INDEPENDENTLY re-renders
@@ -602,6 +604,21 @@ impl BackupDevice for OpfsBackup {
         Ok(BackupArtifact(
             opfs_get(&self.path)?.ok_or("no stored backup")?,
         ))
+    }
+}
+
+/// The browser signer's device prompts for the vault in `dir`.
+fn browser_prompts(dir: &str, kek: [u8; 32]) -> DevicePrompts {
+    DevicePrompts {
+        connect: Box::new(|_origin, _net| true),
+        // The web coordinator already drove this member's roster agreement.
+        roster: Box::new(|_code| RosterDecision::Match),
+        roster_deadline: Duration::from_secs(60),
+        backup: Box::new(OpfsBackup {
+            path: format!("{dir}/backup.sealed"),
+            pass: Zeroizing::new(hex::encode(kek)),
+        }),
+        approval: Box::new(|_request| true),
     }
 }
 
@@ -717,33 +734,25 @@ impl Signer {
         Ok(hex::encode(bytes))
     }
 
-    fn sign_control_approval_impl(
-        &self,
-        proposer_signing_hex: &str,
-        proposer_enc_hex: &str,
-        proposer_id: u16,
-        my_slot: u16,
-        control_hash_hex: &str,
-        body_json: &str,
-    ) -> Result<String, String> {
-        let identity = self.identity.as_ref().ok_or("unlock the signer first")?;
-        let vs = self.vault.as_ref().ok_or("no active vault — call vaultJoin first")?;
-        let stamped = restamp(identity, my_slot)?;
-        let proposer = PublicIdentity {
-            id: proposer_id,
-            signing: hex32(proposer_signing_hex)?,
-            encryption: hex32(proposer_enc_hex)?,
-        };
-        let derived = hex32(control_hash_hex)?;
-        let mut signers = vec![my_slot, proposer_id];
-        signers.sort_unstable();
-        let context = SessionContext {
-            vault: vs.vref.vault_id,
-            payment: derived,
-            attempt: AttemptId(derived),
-            signers,
-        };
-        let sealed = stamped.seal_session(&proposer, &context, MessageKind::PeerReply, body_json.as_bytes())?;
+    fn open_control_impl(&self, session_id: &str, from_hex: &str, wire_hex: &str) -> Result<String, String> {
+        let vs = self.vault.as_ref().ok_or("no active vault — call vaultOpen first")?;
+        let session = uuid::Uuid::parse_str(session_id).map_err(|e| e.to_string())?;
+        let wire = hex::decode(wire_hex).map_err(|e| e.to_string())?;
+        let (from, body) = vs
+            .signer
+            .open_control(session, &hex32(from_hex)?, &wire)
+            .map_err(|e| e.to_string())?;
+        let body = String::from_utf8(body).map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "from": from, "body": body }).to_string())
+    }
+
+    fn seal_control_impl(&self, session_id: &str, to: u16, body_json: &str) -> Result<String, String> {
+        let vs = self.vault.as_ref().ok_or("no active vault — call vaultOpen first")?;
+        let session = uuid::Uuid::parse_str(session_id).map_err(|e| e.to_string())?;
+        let sealed = vs
+            .signer
+            .seal_control(session, to, body_json.as_bytes())
+            .map_err(|e| e.to_string())?;
         Ok(hex::encode(sealed))
     }
 
@@ -769,6 +778,62 @@ impl Signer {
         Ok(hex::encode(share.serialize()))
     }
 
+    fn vault_open_impl(&mut self, vault_hex: &str) -> Result<String, String> {
+        let kek = self.kek.ok_or("unlock the signer first")?;
+        let me = self.identity.as_ref().ok_or("unlock the signer first")?.public().encryption;
+        let dir = vault_dir(vault_hex);
+        if !opfs_exists(&format!("{dir}/signer.meta")) {
+            return Err("this browser holds no signer for that vault".into());
+        }
+        let mut signer = LocalSigner::open(
+            std::path::Path::new(&dir),
+            SoftwareSecureElement::from_kek(kek),
+            "vault".into(),
+            browser_prompts(&dir, kek),
+        )
+        .map_err(|e| e.to_string())?;
+        let net = signer.network();
+        let session = signer
+            .connect("https://coordinator", net, b"browser vault")
+            .map_err(|e| e.to_string())?
+            .session;
+        let vref = signer
+            .list_vaults(&session)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .next()
+            .ok_or("this vault's setup has not started")?;
+        let roster = signer.confirmed_roster().ok_or("this vault has no confirmed roster")?;
+        let slot = roster
+            .members
+            .values()
+            .find(|m| m.encryption == me)
+            .ok_or("this signer is not a member of that vault")?
+            .id;
+        let members: Vec<_> = roster
+            .members
+            .values()
+            .map(|m| {
+                serde_json::json!({
+                    "id": m.id,
+                    "signing": hex::encode(m.signing),
+                    "encryption": hex::encode(m.encryption),
+                })
+            })
+            .collect();
+        let out = serde_json::json!({
+            "vault_id": hex::encode(vref.vault_id),
+            "slot": slot,
+            "threshold": roster.threshold,
+            "network": roster.network.label(),
+            "ready": vref.ready,
+            "members": members,
+        })
+        .to_string();
+        self.vault = Some(VaultState { signer, session, vref });
+        Ok(out)
+    }
+
     fn vault_join_impl(
         &mut self,
         vault_hex: &str,
@@ -787,17 +852,7 @@ impl Signer {
         let stamped = restamp(identity, slot)?;
         let dir = vault_dir(vault_hex);
         let se = SoftwareSecureElement::from_kek(kek);
-        let prompts = DevicePrompts {
-            connect: Box::new(|_origin, _net| true),
-            // The web coordinator already drove this member's roster agreement.
-            roster: Box::new(|_code| RosterDecision::Match),
-            roster_deadline: Duration::from_secs(60),
-            backup: Box::new(OpfsBackup {
-                path: format!("{dir}/backup.sealed"),
-                pass: Zeroizing::new(hex::encode(kek)),
-            }),
-            approval: Box::new(|_request| true),
-        };
+        let prompts = browser_prompts(&dir, kek);
         let path = std::path::Path::new(&dir);
         let mut signer = if opfs_exists(&format!("{dir}/signer.meta")) {
             LocalSigner::open(path, se, label.to_string(), prompts)

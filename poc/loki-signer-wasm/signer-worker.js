@@ -179,54 +179,122 @@ async function driveDkg(signer, p) {
   return { vault: vref.vault_id, address: signer.vaultAddress() };
 }
 
-// Reopen an already-DKG'd vault into an active `VaultState` + session, so the synchronous
-// signer core can sign for it. Idempotent: `vaultJoin` reopens an existing vault (no new
-// DKG) and `connect` re-establishes the session. Returns the connected `FrostdClient`.
-async function reopenVault(signer, p) {
-  const { vaultHex, slot, label, network, rosterHex, frostdUrl, sessionId, transportUrl } = p;
+// Reopen this browser's signer for an active vault from its own stored state. Every member
+// key the payment flow uses comes from the roster this member confirmed at setup.
+async function openVault(signer, vaultHex) {
   for (const path of JSON.parse(vaultPaths(vaultHex))) await opfsPreopenWrite(path);
-  const roster = Uint8Array.from(rosterHex.match(/../g).map((b) => parseInt(b, 16)));
-  signer.vaultJoin(vaultHex, slot, label ?? "vault", network, roster);
+  const vault = JSON.parse(signer.vaultOpen(vaultHex));
+  if (!vault.ready) throw new Error("this vault is not active yet");
+  return vault;
+}
 
+async function frostdClient(signer, p) {
   const login = JSON.parse(signer.frostdLogin());
-  const Client = await loadFrostd(transportUrl);
-  const fc = new Client(frostdUrl, login.secret, login.pubkey);
+  const Client = await loadFrostd(p.transportUrl);
+  const fc = new Client(p.frostdUrl, login.secret, login.pubkey);
   await fc.login();
-  fc.useSession(sessionId);
   return fc;
 }
 
+// Drain this member's inbox on a payment control session and open each sealed message under
+// the confirmed roster. Anything that does not open (a non-member, another session) is dropped.
+async function readControl(signer, control, sessionId) {
+  control.useSession(sessionId);
+  const out = [];
+  for (const m of JSON.parse(await control.recv())) {
+    try {
+      const { from, body } = JSON.parse(signer.openControl(sessionId, m.from, m.message));
+      out.push({ from, ...JSON.parse(body) });
+    } catch { /* not a control message sealed to this member */ }
+  }
+  return out;
+}
+
+// A proposer notice about this payment: the sender is the proposer and the session ids match.
+function aboutPayment(msg, vault, attemptHex, controlSessionId) {
+  const i = msg.intent;
+  return i && msg.from === i.proposer && i.attempt === attemptHex && i.vault === vault.vault_id
+    && i.control_session_id === controlSessionId && i.session_id && i.session_id !== controlSessionId;
+}
+
+// Find the payment's control session the way native members do (payment.rs `sync_control`):
+// a session a vault member opened with every member as a participant, where that member sealed
+// a notice about this attempt. A signing session is opened by a one-shot coordinator key, so it
+// never matches. Reading drains this member's inbox there; the proposer re-sends its notice every
+// few seconds until signing starts, and other payments' sessions are read once and skipped.
+async function findPayment(signer, control, vault, attemptHex, p) {
+  const ids = new Map(vault.members.map((m) => [m.encryption, m.id]));
+  const skip = new Set();
+  const pollMs = Number(p.findPollMs) || 2000;
+  const maxTicks = Number(p.findMaxTicks) || 30;
+  for (let tick = 0; tick < maxTicks; tick++) {
+    for (const sessionId of await control.list_sessions()) {
+      if (skip.has(sessionId)) continue;
+      control.useSession(sessionId);
+      const info = JSON.parse(await control.sessionInfo());
+      const owner = ids.get(info.coordinator);
+      if (owner === undefined || owner === vault.slot
+        || info.participants.length !== ids.size || !info.participants.every((k) => ids.has(k))) {
+        skip.add(sessionId);
+        continue;
+      }
+      const msgs = await readControl(signer, control, sessionId);
+      const notices = msgs.filter((m) => m.from === owner && aboutPayment(m, vault, attemptHex, sessionId));
+      if (notices.length > 0) return { controlSessionId: sessionId, notices };
+      if (msgs.length > 0) skip.add(sessionId);
+    }
+    await sleep(pollMs);
+  }
+  throw new Error("this payment was not found on the relay; it may be finished, cancelled or for another vault");
+}
+
+// The proposer's latest word on the signing group: `start` names it, `cancelled` and `failed`
+// end the request. Plain `intent` re-announcements change nothing.
+function groupFrom(notices) {
+  for (const n of notices) {
+    if (n.kind === "cancelled") throw new Error("the proposer cancelled this payment");
+    if (n.kind === "failed") throw new Error("the proposer could not complete this payment");
+    if (n.kind === "start" && n.intent.signers?.length) return n.intent.signers;
+  }
+  return null;
+}
+
 // Drive this NON-proposer member through one payment signing attempt over frostd, mirroring
-// the native `signer_loop`: commit → receive the proposer's sealed candidate + the
-// coordinator's signing package + rerandomizer seed → open + WYSIWYS-review the candidate →
-// release the signature share. The signer core is synchronous (signCommit/openCandidate/
-// paymentReview/signApprove); this loop owns the async frostd pump. WYSIWYS is enforced
-// inside signApprove — it refuses unless the package binds the recomputed sighash.
+// the native `signer_loop`: find the payment on the relay → approve → wait for the signing
+// group → commit → receive the proposer's sealed candidate + the coordinator's signing package
+// and rerandomizer seed → WYSIWYS-review the candidate → release the signature share.
+// Everything comes from the relay and this member's own stored roster; no member serves HTTP.
 //
 // The request is open to every member: the proposer fixes the signing group from the first
 // approvals to arrive. So this member approves, waits for the group, and commits a nonce only
 // if the group includes it; a commitment from outside the group would fail the round.
 async function drivePayment(signer, p) {
-  const { vaultHex, attemptHex, proposerSigning, proposerEnc, proposerId, coordinatorPeer } = p;
-  const fc = await reopenVault(signer, p);
+  const { vaultHex, attemptHex } = p;
+  const vault = await openVault(signer, vaultHex);
+  const control = await frostdClient(signer, p);
+  const { controlSessionId, notices } = await findPayment(signer, control, vault, attemptHex, p);
+  const announced = notices[notices.length - 1];
+  const proposer = vault.members.find((m) => m.id === announced.from);
 
-  // Record this member's approval on the CONTROL session so the proposer proceeds: payment
-  // signing uses two frostd sessions — the signing session (commitments/package/shares, above)
-  // AND the control session, where the proposer records each signer's approval (payment.rs
-  // sync_control). Mirror the native non-proposer (send_control): a sealed {kind:"approval"}
-  // PeerReply addressed to the proposer (its frostd pubkey = roster encryption). Durable at
-  // frostd, so a single send is enough.
-  const approval = JSON.stringify({ kind: "approval", hash: p.intentHash, intent: p.intent, txid: null });
-  const sealed = signer.signControlApproval(proposerSigning, proposerEnc, proposerId, p.slot, p.controlHash, approval);
-  const login = JSON.parse(signer.frostdLogin());
-  const Client = await loadFrostd(p.transportUrl);
-  const control = new Client(p.frostdUrl, login.secret, login.pubkey);
-  await control.login();
-  control.useSession(p.controlSessionId);
-  await control.sendToPeer(proposerEnc, sealed);
+  // Approve on the control session: a sealed {kind:"approval"} for the terms the proposer
+  // announced, which the proposer records (payment.rs `sync_control`). Durable at frostd.
+  let signers = groupFrom(notices);
+  if (signers && !signers.includes(vault.slot)) throw new Error("enough members already approved this payment");
+  if (!signers) {
+    const approval = JSON.stringify({ kind: "approval", hash: announced.hash, intent: announced.intent, txid: null });
+    await control.sendToPeer(proposer.encryption, signer.sealControl(controlSessionId, proposer.id, approval));
+    signers = await waitForSigningGroup(signer, control, vault, attemptHex, controlSessionId, proposer.id, p);
+  }
+  if (!signers.includes(vault.slot)) return { approved: true, signed: false };
 
-  const signers = await waitForSigningGroup(p);
-  if (!signers.includes(p.slot)) return { approved: true, signed: false };
+  // The signing session's coordinator is the one-shot key that opened it.
+  const fc = await frostdClient(signer, p);
+  const signingSessionId = announced.intent.session_id;
+  fc.useSession(signingSessionId);
+  const coordinatorPeer = JSON.parse(await fc.sessionInfo()).coordinator;
+  if (!coordinatorPeer || vault.members.some((m) => m.encryption === coordinatorPeer)) {
+    throw new Error("the payment's signing session has no coordinator");
+  }
 
   // Pre-open this attempt's crash-safe nonce files (name = payment_id ++ attempt_id hex; the
   // native host sets both to the attempt), so the synchronous commit/sign can persist.
@@ -247,8 +315,8 @@ async function drivePayment(signer, p) {
   const maxTicks = Number(p.maxTicks) || 1200;
   for (let tick = 0; tick < maxTicks; tick++) {
     for (const m of JSON.parse(await fc.recv())) {
-      if (m.from === proposerEnc && candidateHex === null) {
-        candidateHex = signer.openCandidate(proposerSigning, proposerEnc, proposerId, signersCsv, attemptHex, m.message);
+      if (m.from === proposer.encryption && candidateHex === null) {
+        candidateHex = signer.openCandidate(proposer.signing, proposer.encryption, proposer.id, signersCsv, attemptHex, m.message);
       } else if (m.from === coordinatorPeer) {
         if (m.message.length === 64) seedHex = m.message; // 32 bytes hex
         else packageHex = m.message;
@@ -269,27 +337,19 @@ async function drivePayment(signer, p) {
   return { approved: true, signed: true, review };
 }
 
-// Poll the proposer's payment session until it names the signing group. Nothing secret is
+// Wait on the control session until the proposer names the signing group. Nothing secret is
 // committed while waiting, so giving up here is safe: approving again resumes the wait.
-async function waitForSigningGroup(p) {
+async function waitForSigningGroup(signer, control, vault, attemptHex, controlSessionId, proposerId, p) {
   const pollMs = Number(p.groupPollMs) || 2000;
   const maxTicks = Number(p.groupMaxTicks) || 900; // 30 minutes at the default poll
-  let signers = p.signers ?? [];
-  for (let tick = 0; signers.length === 0; tick++) {
-    if (tick >= maxTicks) {
-      throw new Error("Your approval is recorded, but not enough members approved yet. Open this payment again later to sign.");
-    }
+  for (let tick = 0; tick < maxTicks; tick++) {
     await sleep(pollMs);
-    const res = await fetch(p.sessionUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ vault: p.vaultHex, attempt: p.attemptHex }),
-    });
-    const s = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(s.error ?? `payment session request failed (${res.status})`);
-    signers = s.signers ?? [];
+    const notices = (await readControl(signer, control, controlSessionId))
+      .filter((m) => m.from === proposerId && aboutPayment(m, vault, attemptHex, controlSessionId));
+    const signers = groupFrom(notices);
+    if (signers) return signers;
   }
-  return signers;
+  throw new Error("Your approval is recorded, but not enough members approved yet. Open this payment again later to sign.");
 }
 
 async function preopenCreate(P, method) {
@@ -329,7 +389,7 @@ self.onmessage = async (e) => {
         break;
       case "payment-review":
         // Reopen the vault for its viewing key, then WYSIWYS-render the supplied candidate.
-        await reopenVault(signer, payment);
+        await openVault(signer, payment.vaultHex);
         result = JSON.parse(signer.paymentReview(payment.candidateHex));
         break;
       case "payment-approve":

@@ -1154,3 +1154,35 @@ fn general_policies_run_the_dkg_and_sign() {
             .unwrap_or_else(|e| panic!("{threshold}-of-{count}: {e}"));
     }
 }
+
+#[test]
+fn control_messages_open_only_from_the_confirmed_roster_member_on_their_session() {
+    let vault = [91; 32];
+    let (mut members, document) = setup_members(2, 3, vault);
+    begin(&mut members, &document);
+    let session = uuid::Uuid::new_v4();
+    let body = br#"{"kind":"approval"}"#;
+    let wire = members[2].signer.seal_control(session, 1, body).unwrap();
+    // The proposer opens it from its stored roster, after a restart too.
+    members[0].reopen();
+    let opened = members[0].signer.open_control(session, &members[2].public.encryption, &wire);
+    assert_eq!(opened.unwrap(), (3, body.to_vec()));
+    // Bound to its control session.
+    assert!(members[0].signer.open_control(uuid::Uuid::new_v4(), &members[2].public.encryption, &wire).is_err());
+    // A relay that relabels the sender cannot pass it off as another member's.
+    assert!(members[0].signer.open_control(session, &members[1].public.encryption, &wire).is_err());
+    // An outsider claiming member 1's id and the relay sender of member 1 is refused.
+    let outsider = Identity::new(1);
+    let forged = outsider
+        .seal_session(
+            &members[2].public,
+            &SessionContext::control(vault, session, 1, 3),
+            MessageKind::PeerReply,
+            body,
+        )
+        .unwrap();
+    assert!(members[2].signer.open_control(session, &members[0].public.encryption, &forged).is_err());
+    assert!(members[2].signer.open_control(session, &outsider.public().encryption, &forged).is_err());
+    // Only roster members are recipients.
+    assert!(members[2].signer.seal_control(session, 4, body).is_err());
+}

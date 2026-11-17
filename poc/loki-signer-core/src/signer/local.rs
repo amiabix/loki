@@ -23,6 +23,7 @@
 use crate::dkg_core::{DkgCore, DkgPhase, DkgState};
 use crate::member_state::{Roster, ValidatedRoster};
 use crate::setup_transport::{DkgWire, DkgWireKind, Identity, PublicIdentity};
+use crate::signing_session::{MessageKind, SessionContext};
 use crate::signer::backup::{self, BackupArtifact, BackupMaterial};
 use crate::signer::nonce::NonceStore;
 use crate::signer::secure_element::{SealedShare, SecureElement};
@@ -698,6 +699,64 @@ impl<SE: SecureElement> LocalSigner<SE> {
     ) -> Result<Vec<u8>, SignerError> {
         let identity = self.identity.as_ref().ok_or(SignerError::NotReady)?;
         crate::transport::SealedCandidate::open(identity, proposer, context, wire)
+            .map_err(SignerError::Other)
+    }
+
+    /// The roster this member confirmed at setup. Peers are looked up here, never taken from
+    /// keys a network reply supplies.
+    pub fn confirmed_roster(&self) -> Option<&Roster> {
+        self.roster.as_ref().map(|(roster, _)| roster.roster())
+    }
+
+    pub fn network(&self) -> Network {
+        self.network
+    }
+
+    /// Open a message another member sealed to this one on a payment's control session. The
+    /// sender is the confirmed-roster member whose relay key is `sender_relay`. Returns its
+    /// member id and the message body.
+    pub fn open_control(
+        &self,
+        session: uuid::Uuid,
+        sender_relay: &[u8; 32],
+        wire: &[u8],
+    ) -> Result<(u16, Vec<u8>), SignerError> {
+        let identity = self.identity.as_ref().ok_or(SignerError::NotReady)?;
+        let me = identity.public().id;
+        let sender = self
+            .confirmed_roster()
+            .ok_or(SignerError::NotReady)?
+            .members
+            .values()
+            .find(|m| &m.encryption == sender_relay && m.id != me)
+            .ok_or_else(|| SignerError::Other("control message from a non-member".into()))?;
+        let context = SessionContext::control(self.vault_id, session, me, sender.id);
+        let opened = identity
+            .open_session(sender, &context, wire)
+            .map_err(SignerError::Other)?;
+        if opened.kind() != MessageKind::PeerReply {
+            return Err(SignerError::Other("not a control message".into()));
+        }
+        Ok((sender.id, opened.body().to_vec()))
+    }
+
+    /// Seal a control-session message from this member to confirmed-roster member `recipient`.
+    pub fn seal_control(
+        &self,
+        session: uuid::Uuid,
+        recipient: u16,
+        body: &[u8],
+    ) -> Result<Vec<u8>, SignerError> {
+        let identity = self.identity.as_ref().ok_or(SignerError::NotReady)?;
+        let peer = self
+            .confirmed_roster()
+            .ok_or(SignerError::NotReady)?
+            .members
+            .get(&recipient)
+            .ok_or_else(|| SignerError::Other("recipient is not a vault member".into()))?;
+        let context = SessionContext::control(self.vault_id, session, identity.public().id, recipient);
+        identity
+            .seal_session(peer, &context, MessageKind::PeerReply, body)
             .map_err(SignerError::Other)
     }
 
