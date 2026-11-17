@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Testnet end to end: an open payment request signed by the first approvers and broadcast.
+# Testnet end to end: an open payment request signed by the first approvers and broadcast,
+# then a second request that the proposer cancels.
 #
 # By default this starts three members and creates a new 2-of-3 vault. With VAULT and
 # TOKEN_DIR it reuses three running members on BASE_PORT+1..3 that are already in that
@@ -22,7 +23,10 @@ else
   tmp="$(mktemp -d)"
 fi
 pids=()
+held=()
 cleanup() {
+  # Release what this run reserved and did not get to spend.
+  for attempt in "${held[@]}"; do api 1 POST /api/payment-discard "$(pair "$attempt")" >/dev/null 2>&1 || true; done
   for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
   wait 2>/dev/null || true
   [[ -n "${VAULT:-}" ]] || echo "member data preserved: $tmp"
@@ -184,4 +188,37 @@ verified="$(api 1 POST /api/payment-verify "$(jq -nc --arg vault "$vault" --arg 
 jq -e '.phase == "broadcast" or .phase == "confirmed"' <<<"$verified" >/dev/null || fail "verify result: $verified"
 for i in 2 3; do wait_for "member $i hears the broadcast" 60 has_phase "$i" "$attempt" broadcast; done
 phases "$attempt"
-echo "PASS: Testnet payment $txid broadcast ($(jq -r '.phase' <<<"$verified"))"
+
+echo "== cancel: member 1 cancels its request after member 2 approved"
+first="$(draft_when_spendable 'cancelled payment')"
+attempt="$(jq -er '.attempt' <<<"$first")"
+held+=("$attempt")
+echo "attempt $attempt"
+publish "$attempt"
+for i in 2 3; do wait_for "member $i sees the request" 60 pending "$i" "$attempt"; done
+approve 2 "$attempt"
+wait_for 'proposer records member 2' 60 proposer_has "$attempt" '.approvals == [2] and .can_discard'
+phases "$attempt"
+# Reserve every other note that could fund this amount, so only the cancel can free one.
+while other="$(draft 'reserves another note')"; do
+  held+=("$(jq -er '.attempt' <<<"$other")")
+  (( ${#held[@]} <= 20 )) || fail 'too many spendable notes'
+done
+echo "reserved $(( ${#held[@]} - 1 )) other notes; a further draft is refused: $other"
+cancelled="$(api 1 POST /api/payment-discard "$(pair "$attempt")")" || fail "cancel: $cancelled"
+jq -e '.phase == "cancelled"' <<<"$cancelled" >/dev/null || fail "cancel result: $cancelled"
+has_phase 1 "$attempt" cancelled || fail 'proposer copy is not cancelled'
+for i in 2 3; do
+  wait_for "member $i hears the cancel" 60 has_phase "$i" "$attempt" cancelled
+  ! pending "$i" "$attempt" || fail "member $i still lists the cancelled request"
+done
+phases "$attempt"
+again="$(draft 'after cancel')" || fail "draft after cancel: $again"
+held+=("$(jq -er '.attempt' <<<"$again")")
+[[ "$(jq -r '.change_zat' <<<"$again")" == "$(jq -r '.change_zat' <<<"$first")" ]] || fail "draft after cancel spends another note: $again"
+echo "the draft after cancel spends the released note"
+for held_attempt in "${held[@]:1}"; do
+  api 1 POST /api/payment-discard "$(pair "$held_attempt")" | jq -e '.phase == "cancelled"' >/dev/null || fail "discard draft $held_attempt"
+done
+held=()
+echo "PASS: Testnet payment $txid broadcast ($(jq -r '.phase' <<<"$verified")); cancelled request released its note"

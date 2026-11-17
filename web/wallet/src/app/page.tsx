@@ -1982,7 +1982,7 @@ function History({
                   {paymentLabel(confirmed ? "confirmed" : txid ? "broadcast" : p.phase, p.ready_to_send, sending)}
                 </span>
               </div>
-              {p.signers && !txid && <SignerList signers={p.signers} threshold={vault.threshold} approvals={p.approvals} ready={p.ready_to_send} complete={p.phase === "approved"} />}
+              {p.signers && !txid && p.phase !== "cancelled" && <SignerList signers={p.signers} threshold={vault.threshold} approvals={p.approvals} ready={p.ready_to_send} complete={p.phase === "approved"} />}
               {txid && <p className="text-xs text-muted">{p.mined_height != null ? `Included in block ${p.mined_height.toLocaleString()}. ` : confirmed ? "Confirmed on-chain. " : "Awaiting a block. "}Confirmation count is not available from this wallet.</p>}
               <ErrMsg msg={p.error ?? null} />
               <div className="mt-3 flex flex-col gap-2 sm:flex-row">
@@ -1996,7 +1996,7 @@ function History({
                   setErr(null);
                   try { await api("payment-discard", { vault: vault.vault, attempt: p.attempt }); refresh(); }
                   catch (e) { setErr((e as Error).message); }
-                }}>Discard failed payment</button>}
+                }}>{p.error || p.phase === "failed" ? "Discard failed payment" : "Cancel payment"}</button>}
                 {p.ready_to_send && !txid && (
                   <button
                     onClick={(event) => { sendButtonRef.current = event.currentTarget; setConfirming(p.attempt); setErr(null); }}

@@ -542,6 +542,17 @@ fn sync_control(url: &str, data: &Path, pass: &str, vault: &str, v: &Vault) -> R
                         save_payment(data, pass, &p)?;
                         continue;
                     }
+                    // The proposer cancels only before signing starts; a copy that already
+                    // committed a nonce is kept as it is.
+                    if peer.id == p.proposer
+                        && body["kind"] == "cancelled"
+                        && matches!(p.phase.as_str(), "signing" | "not_selected")
+                        && !p.approval_started
+                    {
+                        p.phase = "cancelled".into();
+                        save_payment(data, pass, &p)?;
+                        continue;
+                    }
                     if peer.id == p.proposer
                         && matches!(p.phase.as_str(), "approved" | "not_selected" | "broadcast")
                         && matches!(body["kind"].as_str(), Some("broadcast" | "confirmed"))
@@ -1425,12 +1436,18 @@ fn restore_workers(st: &Shared, data: &Path, pass: &str, vault: &str) -> Result<
 }
 
 fn discardable(data: &Path, p: &Payment) -> Result<(), String> {
-    if !matches!(p.phase.as_str(), "failed" | "discarding" | "draft")
+    // No nonce exists before the proposer's worker marks `approval_started`; after it, one may
+    // be in use, so a request can be cancelled only while it is still collecting approvals.
+    if p.phase == "signing" && p.approval_started {
+        return Err("signing already started; this payment can no longer be cancelled".into());
+    }
+    let open = p.phase == "signing" && p.error.is_none();
+    if !open && !matches!(p.phase.as_str(), "failed" | "discarding" | "draft")
         || p.signed_pczt.is_some()
         || p.raw_tx.is_some()
         || p.txid.is_some()
     {
-        return Err("only a failed unsigned payment or draft can be discarded".into());
+        return Err("only an open request, a failed unsigned payment or a draft can be discarded".into());
     }
     let burn = member_dir(data, &p.vault)?
         .path()
@@ -1454,48 +1471,73 @@ fn close_if_present(tx: &mut FrostdTransport, session: Uuid) -> Result<(), Strin
     Ok(())
 }
 
+/// Everything a discard does before releasing the note. Runs under `st.payment`. An open
+/// request is cancelled even while the proposer's worker waits for approvals: the worker takes
+/// the same lock to mark `approval_started` and stops once the phase is no longer `signing`.
+fn stop_payment(
+    st: &Shared,
+    data: &Path,
+    pass: &str,
+    v: &Vault,
+    p: &mut Payment,
+) -> Result<(), String> {
+    if p.proposer != v.slot {
+        return Err("only the proposer can discard a payment".into());
+    }
+    if p.phase == "signing" && p.error.is_some() {
+        p.phase = "failed".into();
+    }
+    discardable(data, p)?;
+    // Published and not failed: an open request, or a cancel interrupted after `discarding`.
+    let cancel = p.error.is_none() && p.control_session_id.is_some();
+    if !cancel
+        && st
+            .active_payments
+            .lock()
+            .map_err(|e| e.to_string())?
+            .contains(&format!("{}/{}", p.vault, p.attempt))
+    {
+        return Err("payment worker is still running".into());
+    }
+    p.phase = "discarding".into();
+    save_payment(data, pass, p)?;
+    if cancel {
+        // Sent before the session ids change: members match it against their copy.
+        send_control(&st.config.frostd_url, v, p, "cancelled", &members(v))?;
+    }
+    if let Some(session) = p.session_id {
+        let coord = Identity::from_secret_bytes(
+            &hex::decode(
+                p.coordinator_secret
+                    .as_deref()
+                    .ok_or("missing coordinator identity")?,
+            )
+            .map_err(|e| e.to_string())?,
+        )?;
+        let mut tx = relay(&coord, &st.config.frostd_url)?;
+        close_if_present(&mut tx, session)?;
+        p.session_id = None;
+        save_payment(data, pass, p)?;
+    }
+    // A cancelled request keeps its control session: closing it would drop the notice for
+    // members who have not read it yet. frostd expires the session once it is idle.
+    if let Some(session) = p.control_session_id.filter(|_| !cancel) {
+        let mut tx = relay(&v.identity, &st.config.frostd_url)?;
+        close_if_present(&mut tx, session)?;
+        p.control_session_id = None;
+        save_payment(data, pass, p)?;
+    }
+    Ok(())
+}
+
+/// Discards a draft or a failed unsigned payment, or cancels a request still collecting
+/// approvals, and releases its reserved note.
 pub(super) async fn discard(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
     with_body(st, body, |st, data, pass, body| {
         let (vault, attempt) = pair(&body)?;
         let v = load_vault(&data, &pass, &vault, &st.config.network)?;
-        if st
-            .active_payments
-            .lock()
-            .map_err(|e| e.to_string())?
-            .contains(&format!("{vault}/{attempt}"))
-        {
-            return Err("payment worker is still running".into());
-        }
         let mut p = read_payment(&data, &pass, &vault, &attempt)?;
-        if p.proposer != v.slot {
-            return Err("only the proposer can discard a payment".into());
-        }
-        if p.phase == "signing" && p.error.is_some() {
-            p.phase = "failed".into();
-        }
-        discardable(&data, &p)?;
-        if let Some(session) = p.session_id {
-            let coord = Identity::from_secret_bytes(
-                &hex::decode(
-                    p.coordinator_secret
-                        .as_deref()
-                        .ok_or("missing coordinator identity")?,
-                )
-                .map_err(|e| e.to_string())?,
-            )?;
-            let mut tx = relay(&coord, &st.config.frostd_url)?;
-            close_if_present(&mut tx, session)?;
-            p.session_id = None;
-            save_payment(&data, &pass, &p)?;
-        }
-        if let Some(session) = p.control_session_id {
-            let mut tx = relay(&v.identity, &st.config.frostd_url)?;
-            close_if_present(&mut tx, session)?;
-            p.control_session_id = None;
-            save_payment(&data, &pass, &p)?;
-        }
-        p.phase = "discarding".into();
-        save_payment(&data, &pass, &p)?;
+        stop_payment(&st, &data, &pass, &v, &mut p)?;
         let (mut w, _, _) = wallet(&data, &pass, &vault, &v, url(&st)?)?;
         w.release_inputs(
             zcash_client_backend::wallet::LockOwner::new(hex32(&attempt)?),
@@ -1825,6 +1867,146 @@ mod tests {
             peers: BTreeMap::new(),
             loopback_peers: true,
         }))
+    }
+
+    #[test]
+    fn cancel_is_refused_once_signing_started_or_a_share_was_released() {
+        let data = std::env::temp_dir().join(format!("loki-cancel-refused-{}", Uuid::new_v4()));
+        let identities: Vec<_> = (1..=3).map(Identity::new).collect();
+        let peers: BTreeMap<_, _> = identities
+            .iter()
+            .map(|i| (i.public().id, i.public()))
+            .collect();
+        let a = member(&identities[0], &peers);
+        let b = member(&identities[1], &peers);
+        // Every refusal comes before frostd is contacted, so no relay is needed.
+        let st = state(&data, "http://127.0.0.1:9");
+        let vault = hex::encode([2; 32]);
+        let mut p = open_payment(&vault, 1);
+        p.session_id = Some(Uuid::new_v4());
+        p.control_session_id = Some(Uuid::new_v4());
+        p.approval_requested = true;
+        p.approvals = vec![1, 2];
+        // The group is fixed and the worker prepares outside the lock: still cancellable.
+        p.signers = vec![1, 2];
+        st.active_payments
+            .lock()
+            .unwrap()
+            .insert(format!("{vault}/{}", p.attempt));
+        assert!(discardable(&data, &p).is_ok());
+        let refused = |p: &Payment, v: &Vault, reason: &str| {
+            save_payment(&data, "pass", p).unwrap();
+            let error = stop_payment(&st, &data, "pass", v, &mut p.clone()).unwrap_err();
+            assert!(error.contains(reason), "{error}");
+            let saved = read_payment(&data, "pass", &vault, &p.attempt).unwrap();
+            assert_eq!(saved.phase, "signing");
+            assert_eq!(saved.session_id, p.session_id);
+        };
+        refused(&p, &b, "only the proposer");
+        // Once the worker marked `approval_started` under the lock, nonces may be in use.
+        p.approval_started = true;
+        assert!(discardable(&data, &p).is_err());
+        refused(&p, &a, "signing already started");
+        p.approval_started = false;
+        let nonce_dir = member_dir(&data, &vault)
+            .unwrap()
+            .path()
+            .join("signer-nonces");
+        std::fs::create_dir_all(&nonce_dir).unwrap();
+        std::fs::write(
+            nonce_dir.join(format!("{}{}.burn", p.attempt, p.attempt)),
+            b"burned",
+        )
+        .unwrap();
+        assert!(discardable(&data, &p).is_err());
+        refused(&p, &a, "signature share was released");
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
+    fn testnet_proposer_cancels_an_open_request_and_every_member_drops_it() {
+        let Ok(url) = std::env::var("FROSTD_URL") else {
+            return;
+        };
+        let identities: Vec<_> = (1..=4).map(Identity::new).collect();
+        let peers: BTreeMap<_, _> = identities
+            .iter()
+            .map(|i| (i.public().id, i.public()))
+            .collect();
+        let m: Vec<_> = identities.iter().map(|i| member(i, &peers)).collect();
+        let dirs: Vec<_> = (0..4)
+            .map(|_| std::env::temp_dir().join(format!("loki-cancel-{}", Uuid::new_v4())))
+            .collect();
+        let vault = hex::encode([2; 32]);
+        let mut p = open_payment(&vault, 1);
+        p.recipient = vault::unified_address(&m[0].fvk, m[0].network.network_type());
+        let everyone: Vec<_> = peers.values().map(|m| Peer(m.encryption)).collect();
+        let coord = Identity::new(0);
+        let mut signing = relay(&coord, &url).unwrap();
+        let signing_ch = signing.open(&everyone, 4).unwrap();
+        p.session_id = Some(signing_ch.session_id());
+        p.coordinator_secret = Some(hex::encode(coord.to_secret_bytes()));
+        let mut control = relay(&m[0].identity, &url).unwrap();
+        let control_ch = control.open(&everyone, 4).unwrap();
+        p.control_session_id = Some(control_ch.session_id());
+        // The proposer approved and its worker waits for one more approval.
+        p.approval_requested = true;
+        record_approval(&mut p, 1);
+        save_payment(&dirs[0], "pass", &p).unwrap();
+        let st = state(&dirs[0], &url);
+        st.active_payments
+            .lock()
+            .unwrap()
+            .insert(format!("{vault}/{}", p.attempt));
+        send_control(&url, &m[0], &p, "intent", &members(&m[0])).unwrap();
+        for i in 1..4 {
+            sync_control(&url, &dirs[i], "pass", &vault, &m[i]).unwrap();
+            assert_eq!(pending_for(&dirs[i], "pass", &vault, m[i].slot).unwrap().len(), 1);
+        }
+        // Member 2 approved and waits for the group. Member 4's copy stands in for a member
+        // left outside a group.
+        let mut local = read_payment(&dirs[1], "pass", &vault, &p.attempt).unwrap();
+        local.approval_requested = true;
+        record_approval(&mut local, 2);
+        save_payment(&dirs[1], "pass", &local).unwrap();
+        local = read_payment(&dirs[3], "pass", &vault, &p.attempt).unwrap();
+        local.phase = "not_selected".into();
+        save_payment(&dirs[3], "pass", &local).unwrap();
+
+        // Only the proposer can cancel its request.
+        send_control(&url, &m[1], &p, "cancelled", &members(&m[1])).unwrap();
+        for i in 2..4 {
+            sync_control(&url, &dirs[i], "pass", &vault, &m[i]).unwrap();
+        }
+        assert_eq!(pending_for(&dirs[2], "pass", &vault, 3).unwrap().len(), 1);
+        assert_eq!(
+            read_payment(&dirs[3], "pass", &vault, &p.attempt)
+                .unwrap()
+                .phase,
+            "not_selected"
+        );
+
+        stop_payment(&st, &dirs[0], "pass", &m[0], &mut p).unwrap();
+        // The waiting worker rereads this under the lock before it marks `approval_started`.
+        let proposer = read_payment(&dirs[0], "pass", &vault, &p.attempt).unwrap();
+        assert_eq!(proposer.phase, "discarding");
+        assert!(proposer.session_id.is_none());
+        assert!(!signing
+            .list_sessions()
+            .unwrap()
+            .contains(&signing_ch.session_id()));
+        for i in 1..4 {
+            sync_control(&url, &dirs[i], "pass", &vault, &m[i]).unwrap();
+            let copy = read_payment(&dirs[i], "pass", &vault, &p.attempt).unwrap();
+            assert_eq!(copy.phase, "cancelled", "member {}", m[i].slot);
+            assert!(pending_for(&dirs[i], "pass", &vault, m[i].slot)
+                .unwrap()
+                .is_empty());
+        }
+        close_if_present(&mut control, control_ch.session_id()).unwrap();
+        for data in dirs {
+            let _ = std::fs::remove_dir_all(data);
+        }
     }
 
     #[test]
