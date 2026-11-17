@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Testnet end to end: an open payment request signed by the first approvers and sent by a
-# member outside the signing group; then a request that the proposer cancels.
+# member outside the signing group; a signed payment left unsent and retried on the same note,
+# which a member's app approves by itself; then a request that the proposer cancels.
 #
 # By default this starts three members and creates a new 2-of-3 vault. With VAULT and
 # TOKEN_DIR it reuses three running members on BASE_PORT+1..3 that are already in that
@@ -208,6 +209,47 @@ verified="$(wait_confirmed 2 "$attempt" "$txid")"
 echo "confirmed at height $(jq -r '.mined_height' <<<"$verified")"
 first_txid="$txid"
 
+echo "== retry: a signed payment left unsent is retried on the same note; member 2's app approves it"
+attempt="$(draft_when_spendable 'retried payment' | jq -er '.attempt')"
+echo "attempt $attempt"
+publish "$attempt"
+for i in 2 3; do wait_for "member $i sees the request" 60 pending "$i" "$attempt"; done
+approve 2 "$attempt"
+wait_for 'proposer records member 2' 60 proposer_has "$attempt" '.approvals == [2]'
+approve 1 "$attempt"
+wait_for 'signers did not finish' 600 proposer_has "$attempt" '.ready_to_send'
+wait_for 'member 3 holds the signed payment' 120 has_phase 3 "$attempt" ready
+note="$(api 1 GET "/api/payments?vault=$vault" | jq -c --arg attempt "$attempt" '.payments[] | select(.attempt == $attempt) | .note_selection')"
+echo "first attempt signed and left unsent; it spends $note"
+retried="$(api 1 POST /api/payment-draft "$(jq -nc --arg vault "$vault" --arg retry_of "$attempt" '{vault:$vault,retry_of:$retry_of}')")" || fail "retry draft: $retried"
+retry="$(jq -er '.attempt' <<<"$retried")"
+echo "retry $retry"
+proposer_has "$attempt" '.phase == "superseded"' || fail 'first attempt is not superseded'
+proposer_has "$retry" ".note_selection == $note" || fail 'retry spends another note'
+api 1 POST /api/payment-publish "$(pair "$retry")" | jq -e '.phase == "signing" and .approved' >/dev/null || fail "publish retry"
+# No approve call for member 2: its app approves the identical retry when it reads the request.
+# Member 2's app reads requests whenever it lists payments, as its screen does.
+retry_signed() { api 2 GET "/api/payments?vault=$vault" >/dev/null && proposer_has "$retry" '.ready_to_send'; }
+wait_for 'retry is signed without a new approval' 600 retry_signed
+proposer_has "$retry" '.signers == [1,2]' || fail 'retry signed by another group'
+! pending 2 "$retry" || fail 'member 2 was asked to approve the retry'
+for i in 2 3; do wait_for "member $i hears the first attempt is superseded" 60 has_phase "$i" "$attempt" superseded; done
+phases "$retry"
+finished="$(api 1 POST /api/payment-finish "$(pair "$retry")")" || fail "finish retry: $finished"
+txid="$(jq -er '.txid' <<<"$finished")" || fail txid
+echo "retry broadcast txid: $txid"
+verified="$(wait_confirmed 1 "$retry" "$txid")"
+echo "retry confirmed at height $(jq -r '.mined_height' <<<"$verified")"
+for i in 1 2 3; do
+  if refused="$(api "$i" POST /api/payment-finish "$(pair "$attempt")" 2>&1)"; then fail "member $i sent the superseded attempt: $refused"; fi
+  echo "  member $i refuses to send the first attempt: $(jq -r '.error // .' <<<"$refused" 2>/dev/null || echo "$refused")"
+done
+for i in 1 2 3; do
+  p="$(phase "$i" "$attempt")"
+  [[ "$p" == superseded || "$p" == failed ]] || fail "member $i shows the first attempt as $p"
+done
+phases "$attempt"
+
 echo "== cancel: member 1 cancels its request after member 2 approved"
 first="$(draft_when_spendable 'cancelled payment')"
 attempt="$(jq -er '.attempt' <<<"$first")"
@@ -240,4 +282,4 @@ for held_attempt in "${held[@]:1}"; do
   api 1 POST /api/payment-discard "$(pair "$held_attempt")" | jq -e '.phase == "cancelled"' >/dev/null || fail "discard draft $held_attempt"
 done
 held=()
-echo "PASS: member 2 sent $first_txid; cancelled request released its note"
+echo "PASS: member 2 sent $first_txid; retry $txid confirmed on the first attempt's note; cancelled request released its note"
