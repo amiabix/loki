@@ -1,6 +1,6 @@
 "use client";
 
-import { createWebAuthnCredential, getPrfSecret } from "./webauthn";
+import { createWebAuthnCredential, getPrfSecret } from "./webauthn.ts";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MOCK WASM signer — the seam for Agent W1's wasm-bindgen output.
