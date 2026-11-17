@@ -68,6 +68,11 @@ struct Payment {
     /// the proposer to itself plus the first `threshold - 1` other members who approved.
     #[serde(default)]
     signers: Vec<u16>,
+    /// The transaction's real expiry, fixed by the proposer with the signing group and never
+    /// changed after: about seven days above its scanned tip, at most `expiry_height`, the
+    /// bound members approve. Outside the intent hash, like `signers`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signing_expiry: Option<u32>,
     phase: String,
     session_id: Option<Uuid>,
     #[serde(default)]
@@ -336,7 +341,7 @@ fn review_candidate(bytes: &[u8], payment: &Payment, vault: &Vault) -> Result<()
             &vault.network,
             BlockHeight::from_u32(payment.target_height),
         ))
-        || *parsed.global().expiry_height() != payment.expiry_height
+        || *parsed.global().expiry_height() != tx_expiry(payment)
     {
         return Err("candidate network or expiry differs from reviewed intent".into());
     }
@@ -353,7 +358,7 @@ fn review_candidate(bytes: &[u8], payment: &Payment, vault: &Vault) -> Result<()
         memo: payment.memo.as_bytes().to_vec(),
         change_zat: payment.change_zat,
         fee_zat: payment.fee_zat,
-        expiry_height: payment.expiry_height,
+        expiry_height: tx_expiry(payment),
     };
     pczt::roles::verifier::Verifier::new(parsed)
         .with_ironwood::<Refusal, _>(|bundle| {
@@ -399,6 +404,7 @@ fn check_intent(p: &Payment, v: &Vault) -> Result<(), String> {
         || p.note_selection.len() != 1
         || p.amount_zat == 0
         || p.expiry_height <= p.target_height
+        || p.signing_expiry.is_some_and(|e| e <= p.target_height || e > p.expiry_height)
     {
         return Err("invalid payment intent".into());
     }
@@ -447,7 +453,7 @@ fn members(v: &Vault) -> Vec<u16> {
     v.peers.keys().copied().collect()
 }
 fn public_intent(p: &Payment) -> Value {
-    json!({"attempt":p.attempt,"vault":p.vault,"proposer":p.proposer,"recipient":p.recipient,"amount_zat":p.amount_zat,"memo":p.memo,"fee_zat":p.fee_zat,"change_zat":p.change_zat,"note_selection":p.note_selection,"target_height":p.target_height,"expiry_height":p.expiry_height,"signers":p.signers,"phase":p.phase,"session_id":p.session_id,"control_session_id":p.control_session_id})
+    json!({"attempt":p.attempt,"vault":p.vault,"proposer":p.proposer,"recipient":p.recipient,"amount_zat":p.amount_zat,"memo":p.memo,"fee_zat":p.fee_zat,"change_zat":p.change_zat,"note_selection":p.note_selection,"target_height":p.target_height,"expiry_height":p.expiry_height,"signers":p.signers,"signing_expiry":p.signing_expiry,"phase":p.phase,"session_id":p.session_id,"control_session_id":p.control_session_id})
 }
 const UNAVAILABLE: &str = "payment session unavailable";
 const ENOUGH_APPROVED: &str = "enough members already approved this payment";
@@ -459,9 +465,20 @@ fn ready_to_send(p: &Payment) -> bool {
 fn sendable(p: &Payment) -> bool {
     matches!(p.phase.as_str(), "ready" | "broadcast") && p.error.is_none() && p.signed_pczt.is_some()
 }
-/// The transaction's expiry height.
+/// The transaction's expiry height: the one fixed when signing started, else the bound.
 fn tx_expiry(p: &Payment) -> u32 {
-    p.expiry_height
+    p.signing_expiry.unwrap_or(p.expiry_height)
+}
+/// About seven days (8,064 blocks) above `tip`, rounded up to a multiple of 1,152 as drafts
+/// are, and never above the approved bound.
+fn signing_expiry(tip: u32, bound: u32) -> Result<u32, String> {
+    Ok(tip
+        .checked_add(8_064)
+        .ok_or("expiry overflow")?
+        .div_ceil(1_152)
+        .checked_mul(1_152)
+        .ok_or("expiry overflow")?
+        .min(bound))
 }
 
 fn control_context(vault: &str, session: Uuid, a: u16, b: u16) -> Result<SessionContext, String> {
@@ -473,6 +490,7 @@ fn intent_hash(p: &Payment) -> String {
     let mut intent = public_intent(p);
     intent.as_object_mut().unwrap().remove("phase");
     intent.as_object_mut().unwrap().remove("signers");
+    intent.as_object_mut().unwrap().remove("signing_expiry");
     blake3::hash(&serde_json::to_vec(&intent).unwrap())
         .to_hex()
         .to_string()
@@ -630,12 +648,16 @@ fn sync_control(url: &str, data: &Path, pass: &str, vault: &str, v: &Vault) -> R
                             record_approval(&mut p, peer.id);
                         }
                         // The proposer fixed the group from the first approvals; it never changes.
+                        // The real expiry travels with it, checked in `check_intent`.
                         Some("start")
                             if peer.id == p.proposer
                                 && !incoming.signers.is_empty()
-                                && (p.signers.is_empty() || p.signers == incoming.signers) =>
+                                && incoming.signing_expiry.is_some()
+                                && (p.signers.is_empty() || p.signers == incoming.signers)
+                                && (p.signing_expiry.is_none() || p.signing_expiry == incoming.signing_expiry) =>
                         {
                             p.signers = incoming.signers;
+                            p.signing_expiry = incoming.signing_expiry;
                             if !p.signers.contains(&v.slot) {
                                 p.phase = "not_selected".into();
                             } else if p.approval_requested {
@@ -656,8 +678,9 @@ fn sync_control(url: &str, data: &Path, pass: &str, vault: &str, v: &Vault) -> R
                             .map_err(|e| e.to_string())? =>
                 {
                     incoming.phase = "signing".into();
-                    // Only a `start` from the proposer fixes the group.
+                    // Only a `start` from the proposer fixes the group and the expiry.
                     incoming.signers.clear();
+                    incoming.signing_expiry = None;
                     incoming.coordinator_secret = None;
                     incoming.review_token = None;
                     incoming.approval_requested = false;
@@ -861,7 +884,7 @@ pub(super) async fn draft(State(st): State<Shared>, Json(body): Json<Value>) -> 
         let attempt = hex::encode(random);
         let note_selection = vec![hex::encode(note.nullifier(&v.fvk).to_bytes())];
         // No signing group yet: the request is open to every member (`signing_group`).
-        let p = Payment { attempt: attempt.clone(), vault: vault.to_owned(), proposer: v.slot, recipient: recipient.to_owned(), amount_zat, memo: memo.to_owned(), fee_zat, change_zat, note_selection, target_height: anchor, expiry_height: expiry, signers: Vec::new(), phase: "draft".into(), session_id: None, control_session_id: None, approvals: Vec::new(), start_requested: false, coordinator_secret: None, review_token: None, approval_requested: false, approval_started: false, txid: None, signed_pczt: None, raw_tx: None, error: None, retry_of: None, superseded_by: None };
+        let p = Payment { attempt: attempt.clone(), vault: vault.to_owned(), proposer: v.slot, recipient: recipient.to_owned(), amount_zat, memo: memo.to_owned(), fee_zat, change_zat, note_selection, target_height: anchor, expiry_height: expiry, signers: Vec::new(), phase: "draft".into(), session_id: None, control_session_id: None, approvals: Vec::new(), start_requested: false, coordinator_secret: None, review_token: None, approval_requested: false, approval_started: false, txid: None, signed_pczt: None, raw_tx: None, error: None, retry_of: None, superseded_by: None, signing_expiry: None };
         check_intent(&p, &v)?;
         let nullifier = [hex32(&p.note_selection[0])?];
         w.reserve_inputs(zcash_client_backend::wallet::LockOwner::new(random), &nullifier, expiry)?;
@@ -928,6 +951,7 @@ fn redraft_with(
         p.expiry_height = draft_expiry(tip, v.network)?;
     }
     p.signers.clear();
+    p.signing_expiry = None;
     p.phase = "draft".into();
     p.session_id = None;
     p.control_session_id = None;
@@ -1174,7 +1198,7 @@ fn payment_worker(
 ) -> Result<(), String> {
     let v = load_vault(data, pass, vault, &st.config.network)?;
     let mut last_notice = std::time::Instant::now() - Duration::from_secs(5);
-    let p = loop {
+    let mut p = loop {
         if st.session.blocking_read().is_none() {
             return Ok(());
         }
@@ -1207,7 +1231,7 @@ fn payment_worker(
         std::thread::sleep(Duration::from_millis(300));
     };
     // Wallet synchronization and candidate inputs precede the bounded protocol round.
-    let owned = prepare_sign(st, data, pass, &p, &v)?;
+    let owned = prepare_sign(st, data, pass, &mut p, &v)?;
     {
         let _guard = st.payment.lock().map_err(|e| e.to_string())?;
         let mut local = read_payment(data, pass, vault, attempt)?;
@@ -1215,6 +1239,8 @@ fn payment_worker(
             return Err("payment cannot start again".into());
         }
         local.approval_started = true;
+        // Saved with `approval_started`, before any nonce; the `start` notice carries it.
+        local.signing_expiry = p.signing_expiry;
         save_payment(data, pass, &local)?;
     }
     if p.proposer == v.slot {
@@ -1258,12 +1284,17 @@ fn prepare_sign<'a>(
     st: &Shared,
     data: &Path,
     pass: &str,
-    p: &Payment,
+    p: &mut Payment,
     v: &'a Vault,
 ) -> Result<Option<CandidateInputs<'a>>, String> {
     let mut owned = None;
     if p.proposer == v.slot {
         let (w, mut client, rt) = wallet(data, pass, &p.vault, v, url(st)?)?;
+        if p.signing_expiry.is_none() {
+            let tip = w.scanned_height()?.ok_or("wallet has no scanned blocks")?;
+            p.signing_expiry = Some(signing_expiry(tip, p.expiry_height)?);
+            check_intent(p, v).map_err(|_| "the approved expiry bound has passed; void or retry with a fresh payment")?;
+        }
         // Select the candidate's input notes at its fixed draft height (target_height), so the
         // proposer rebuilds the same candidate the quorum reviewed; the witness here is unused.
         let height = p.target_height;
@@ -1283,7 +1314,7 @@ fn prepare_sign<'a>(
             memo: MemoBytes::from_bytes(p.memo.as_bytes()).map_err(|e| format!("memo: {e:?}"))?,
             change: Zatoshis::from_u64(p.change_zat).map_err(|e| format!("change: {e:?}"))?,
             target_height: p.target_height,
-            expiry_height: p.expiry_height,
+            expiry_height: tx_expiry(p),
         });
         if u64::from(quote_fee(&v.network, owned.as_ref().unwrap())?) != p.fee_zat {
             return Err("candidate fee differs from reviewed intent".into());
@@ -1822,11 +1853,11 @@ pub(super) async fn discard(State(st): State<Shared>, Json(body): Json<Value>) -
         // A retry hands its note back to the earlier attempt it superseded while that one could
         // still be mined, so the note stays reserved; otherwise the note is released.
         match p.retry_of.as_deref().and_then(|e| read_payment(&data, &pass, &vault, e).ok()) {
-            Some(e) if e.phase == "superseded" && e.expiry_height > tip => w.transfer_inputs(
+            Some(e) if e.phase == "superseded" && tx_expiry(&e) > tip => w.transfer_inputs(
                 owner,
                 zcash_client_backend::wallet::LockOwner::new(hex32(&e.attempt)?),
                 &nullifier,
-                e.expiry_height,
+                tx_expiry(&e),
             )?,
             _ => w.release_inputs(owner, &nullifier)?,
         }
@@ -2078,6 +2109,7 @@ mod tests {
             error: None,
             retry_of: None,
             superseded_by: None,
+            signing_expiry: None,
         };
         review_candidate(&pczt, &p, &v).unwrap();
         p.amount_zat += 1;
@@ -2143,6 +2175,7 @@ mod tests {
             error: None,
             retry_of: None,
             superseded_by: None,
+            signing_expiry: None,
         }
     }
 
@@ -2444,6 +2477,7 @@ mod tests {
         record_approval(&mut proposer, 1);
         proposer.signers = signing_group(&proposer, &a).unwrap();
         assert_eq!(proposer.signers, vec![1, 3]);
+        proposer.signing_expiry = Some(proposer.expiry_height);
         save_payment(data_a, "pass", &proposer).unwrap();
         // Human delay exceeds the old timeout without starting a nonce or signing round.
         std::thread::sleep(Duration::from_secs(12));
@@ -2454,14 +2488,18 @@ mod tests {
                 .approval_started
         );
         send_control(&url, &a, &proposer, "start", &members(&a)).unwrap();
-        // A later, different group from the proposer cannot replace the first.
+        // A later, different group or expiry from the proposer cannot replace the first.
         let mut regroup = proposer.clone();
         regroup.signers = vec![1, 2];
         send_control(&url, &a, &regroup, "start", &members(&a)).unwrap();
+        let mut reexpire = proposer.clone();
+        reexpire.signing_expiry = Some(proposer.expiry_height - 1);
+        send_control(&url, &a, &reexpire, "start", &members(&a)).unwrap();
         sync_control(&url, data_b, "pass", &vault, &b).unwrap();
         sync_control(&url, data_c, "pass", &vault, &c).unwrap();
         let signer = read_payment(data_c, "pass", &vault, &p.attempt).unwrap();
         assert_eq!(signer.signers, vec![1, 3]);
+        assert_eq!(signer.signing_expiry, proposer.signing_expiry);
         assert!(signer.start_requested);
         assert_eq!(signer.phase, "signing");
         let outside = read_payment(data_b, "pass", &vault, &p.attempt).unwrap();
@@ -2609,6 +2647,7 @@ mod tests {
             error: None,
             retry_of: None,
             superseded_by: None,
+            signing_expiry: None,
         };
         let st = state(&data, &url);
         let b_data = data.join("b");
@@ -2677,6 +2716,7 @@ mod tests {
                     error: None,
                     retry_of: None,
                     superseded_by: None,
+                    signing_expiry: None,
                 }
             };
         let mut readiness = mk([9u8; 32], vec![1, 2], 1, "signing", false);
@@ -3087,5 +3127,36 @@ mod tests {
         save_payment(&data, "pass", &earlier).unwrap();
         assert!(approved_before(&data, "pass", &retry).unwrap());
         std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
+    fn the_signing_expiry_is_seven_days_out_bounded_and_fixed_once() {
+        // 8,064 blocks above the tip, rounded up to 1,152, never above the approved bound.
+        assert_eq!(signing_expiry(4_633_700, 4_700_000).unwrap(), 4_642_560);
+        assert_eq!(signing_expiry(4_633_700, 4_640_000).unwrap(), 4_640_000);
+        assert_eq!(signing_expiry(1_152, 100_000).unwrap(), 9_216);
+        assert_eq!(signing_expiry(1_153, 100_000).unwrap(), 10_368);
+        let identities: Vec<_> = (1..=3).map(Identity::new).collect();
+        let peers: BTreeMap<_, _> = identities.iter().map(|i| (i.public().id, i.public())).collect();
+        let v = member(&identities[1], &peers);
+        let mut p = open_payment(&hex::encode([2; 32]), 1);
+        p.recipient = vault::unified_address(&v.fvk, v.network.network_type());
+        check_intent(&p, &v).unwrap();
+        let hash = intent_hash(&p);
+        assert_eq!(tx_expiry(&p), p.expiry_height);
+        p.signing_expiry = Some(p.target_height + 1);
+        check_intent(&p, &v).unwrap();
+        assert_eq!(tx_expiry(&p), p.target_height + 1);
+        // Outside the approved terms, like the signing group.
+        assert_eq!(intent_hash(&p), hash);
+        for bad in [p.target_height, p.expiry_height + 1] {
+            p.signing_expiry = Some(bad);
+            assert!(check_intent(&p, &v).is_err(), "{bad}");
+        }
+        // A candidate signed for the bound is refused once a shorter expiry is fixed.
+        let (signer, mut signed_p, signed) = signed_fixture();
+        verify_signed(&signed, &signed_p, &signer).unwrap();
+        signed_p.signing_expiry = Some(signed_p.expiry_height - 1);
+        assert!(verify_signed(&signed, &signed_p, &signer).is_err());
     }
 }
