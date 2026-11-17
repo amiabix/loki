@@ -14,7 +14,14 @@ function device(slot, { advertise_url = 'http://127.0.0.1:3601' } = {}) {
   const device_pubkey = Buffer.concat([Buffer.from([4]), Buffer.from(jwk.x, 'base64url'), Buffer.from(jwk.y, 'base64url')]).toString('hex');
   const input = { ...(slot ? { slot } : {}), signing_pubkey: identity.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('hex'), relay_pubkey: randomBytes(32).toString('hex'), ...(advertise_url === null ? {} : { advertise_url }), device_pubkey,
     authorization: sign(null, Buffer.from(device_pubkey, 'hex'), identity.privateKey).toString('hex') };
-  return { input, key };
+  return { input, key, identity };
+}
+// The same identity on a new device: a fresh device key, authorized by the identity's key.
+function newDevice(d) {
+  const key = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+  const jwk = key.publicKey.export({ format: 'jwk' });
+  const device_pubkey = Buffer.concat([Buffer.from([4]), Buffer.from(jwk.x, 'base64url'), Buffer.from(jwk.y, 'base64url')]).toString('hex');
+  return { ...d, key, input: { ...d.input, device_pubkey, authorization: sign(null, Buffer.from(device_pubkey, 'hex'), d.identity.privateKey).toString('hex') } };
 }
 function response(d, challenge, changed = {}) {
   const input = { ...d.input, ...changed };
@@ -104,7 +111,7 @@ test('failed, expired and wrong-origin proofs cannot be replayed; allocations ar
   } finally { rmSync(dir, { recursive: true, force: true }); delete process.env.LOKI_REGISTRY; }
 });
 
-test('pairing reserves one slot, claims once, and pins one device to one identity', async () => {
+test('pairing reserves one slot, claims once, and pins one device to one identity and slot', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'loki-pairing-'));
   process.env.LOKI_REGISTRY = join(dir, 'roster.json');
   try {
@@ -141,6 +148,19 @@ test('pairing reserves one slot, claims once, and pins one device to one identit
     assert.deepEqual(await reloaded.registerMember(response(d, renewed.challenge), origin), member);
     const rotated = device(1);
     await assert.rejects(members.issueRegistrationChallenge({ ...rotated.input, signing_pubkey: d.input.signing_pubkey }, origin));
+    // The same identity may move to a new device; its slot and relay key stay pinned.
+    const moved2 = newDevice(d);
+    await assert.rejects(members.issueRegistrationChallenge({ ...moved2.input, slot: 2 }, origin), /slot/);
+    await assert.rejects(members.issueRegistrationChallenge({ ...moved2.input, relay_pubkey: randomBytes(32).toString('hex') }, origin), /relay key/);
+    const replaced = await members.issueRegistrationChallenge(moved2.input, origin);
+    assert.deepEqual(await members.registerMember(response(moved2, replaced.challenge), origin), member);
+    assert.deepEqual(members.slots(), [member]);
+    const bindings = JSON.parse(readFileSync(process.env.LOKI_REGISTRY + '.devices'));
+    assert.deepEqual(bindings, [{ slot: 1, signing_pubkey: d.input.signing_pubkey, device_pubkey: moved2.input.device_pubkey }]);
+    // The new device key is now bound to this identity; another identity still cannot take it.
+    const thief = generateKeyPairSync('ed25519');
+    await assert.rejects(members.issueRegistrationChallenge({ ...moved2.input, slot: undefined, signing_pubkey: thief.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('hex'),
+      authorization: sign(null, Buffer.from(moved2.input.device_pubkey, 'hex'), thief.privateKey).toString('hex') }, origin), /device/);
   } finally { rmSync(dir, { recursive: true, force: true }); delete process.env.LOKI_REGISTRY; }
 });
 
