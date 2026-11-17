@@ -160,9 +160,10 @@ pub(super) async fn fetch(
     }
 }
 
-/// POST /api/recovery-restore { vault, words } — rebuild this member's vault share from the
-/// stored recovery backup using the 24 words. Requires an unlocked session (the restored
-/// public `vault.sealed` is passphrase-sealed; the share is re-sealed under the device element).
+/// POST /api/recovery-restore { vault, words, backup? } — rebuild this member's vault from a
+/// recovery backup using the 24 words. `backup` is the hex blob exported with
+/// `GET /api/recovery-backup`, needed on a new device; without it the stored blob is used.
+/// Requires an unlocked session (the restored vault is sealed under the profile passphrase).
 pub(super) async fn restore(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
     let (data, pass) = {
         let session = st.session.read().await;
@@ -177,7 +178,12 @@ pub(super) async fn restore(State(st): State<Shared>, Json(body): Json<Value>) -
     ) else {
         return err(StatusCode::BAD_REQUEST, "missing vault or words");
     };
-    match super::ceremony::restore_vault_from_backup(&data, vault, words.trim(), &pass, &st.config) {
+    let backup = match body.get("backup").and_then(Value::as_str).map(|b| hex::decode(b.trim())) {
+        None => None,
+        Some(Ok(blob)) => Some(blob),
+        Some(Err(_)) => return err(StatusCode::BAD_REQUEST, "backup must be hex"),
+    };
+    match super::ceremony::restore_vault_from_backup(&data, vault, words.trim(), backup.as_deref(), &pass, &st.config) {
         Ok(()) => ok(json!({ "restored": true })),
         Err(e) => err(StatusCode::BAD_REQUEST, e),
     }
