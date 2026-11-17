@@ -184,7 +184,12 @@ async fn unlock(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
     let data = st.config.data.clone();
     let passphrase = Zeroizing::new(pass);
     let for_block = passphrase.clone();
-    match tokio::task::spawn_blocking(move || Session::unlock(data, for_block)).await {
+    let unlocked = tokio::task::spawn_blocking(move || {
+        let unlocked = Session::unlock(data.clone(), for_block.clone())?;
+        recovery::seal_missing_backups_logged(&data, &for_block);
+        Ok::<_, String>(unlocked)
+    });
+    match unlocked.await {
         Ok(Ok((session, profile))) => {
             *st.session.write().await = Some(session);
             ok(json!({ "unlocked": true, "profile": profile }))
