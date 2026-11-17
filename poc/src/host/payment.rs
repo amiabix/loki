@@ -718,6 +718,7 @@ fn approved_before(data: &Path, pass: &str, p: &Payment) -> Result<bool, String>
 fn repeats(earlier: &Payment, p: &Payment) -> bool {
     earlier.attempt != p.attempt
         && earlier.approval_requested
+        && counts_as_approved(earlier)
         && earlier.proposer == p.proposer
         && earlier.recipient == p.recipient
         && earlier.amount_zat == p.amount_zat
@@ -726,6 +727,20 @@ fn repeats(earlier: &Payment, p: &Payment) -> bool {
         && earlier.change_zat == p.change_zat
         && earlier.note_selection == p.note_selection
         && p.expiry_height <= earlier.expiry_height
+}
+
+/// An approval carries over only from an attempt whose signing went ahead and then stopped short
+/// of the chain: failed, superseded by a retry, or signed and unsent. A cancelled request needs
+/// a fresh approval, and so does one this member cannot yet tell from a cancelled one: a copy
+/// still `signing` before signing started may be cancelled by a notice it has not read. Once
+/// signing started (the proposer's `start`, or `not_selected`) the proposer can no longer
+/// cancel it. Broadcast and confirmed attempts spent the note, so nothing repeats them.
+fn counts_as_approved(earlier: &Payment) -> bool {
+    match earlier.phase.as_str() {
+        "failed" | "superseded" | "ready" | "approved" | "not_selected" => true,
+        "signing" => earlier.approval_started,
+        _ => false,
+    }
 }
 
 /// Marks every other attempt on `mined`'s note failed: only one spend of a note can be mined.
@@ -1629,11 +1644,10 @@ pub(super) async fn finish(State(st): State<Shared>, Json(body): Json<Value>) ->
             }))
             .map_err(|e| format!("lightwalletd send transaction: {e}"))?
             .into_inner();
-        // A refusal for a transaction the server already holds (sent earlier by this or
-        // another member) is a success.
-        if sent.error_code != 0
-            && !sent.error_message.to_lowercase().contains("already")
-            && !server_has(&rt, &mut client, derived)
+        // A refusal is a success only if the server holds this very transaction (sent earlier
+        // by this or another member). The refusal text is not trusted: a conflicting spend of
+        // the same note is also refused as having "already spent" its inputs.
+        if sent.error_code != 0 && !server_has(&rt, &mut client, derived)
         {
             let _guard = st.payment.lock().map_err(|e| e.to_string())?;
             let mut local = read_payment(&data, &pass, &vault, &attempt)?;
@@ -2337,6 +2351,24 @@ mod tests {
                 .unwrap()
                 .is_empty());
         }
+        // The identical payment on the same note, proposed again: member 2 approved the
+        // cancelled one, but a cancelled request needs a fresh approval.
+        let mut again = open_payment(&vault, 1);
+        again.recipient = p.recipient.clone();
+        again.attempt = hex::encode([4; 32]);
+        let again_ch = control.open(&everyone, 4).unwrap();
+        again.control_session_id = Some(again_ch.session_id());
+        again.session_id = Some(Uuid::new_v4());
+        assert_eq!(intent_hash(&Payment { attempt: p.attempt.clone(), session_id: p.session_id, control_session_id: p.control_session_id, ..again.clone() }), intent_hash(&Payment { phase: again.phase.clone(), ..p.clone() }));
+        send_control(&url, &m[0], &again, "intent", &members(&m[0])).unwrap();
+        sync_control(&url, &dirs[1], "pass", &vault, &m[1]).unwrap();
+        let copy = read_payment(&dirs[1], "pass", &vault, &again.attempt).unwrap();
+        assert!(!copy.approval_requested && copy.approvals.is_empty());
+        assert!(pending_for(&dirs[1], "pass", &vault, 2)
+            .unwrap()
+            .iter()
+            .any(|q| q["attempt"] == again.attempt));
+        close_if_present(&mut control, again_ch.session_id()).unwrap();
         close_if_present(&mut control, control_ch.session_id()).unwrap();
         for data in dirs {
             let _ = std::fs::remove_dir_all(data);
@@ -3094,6 +3126,7 @@ mod tests {
         let vault = hex::encode([2; 32]);
         let mut earlier = open_payment(&vault, 1);
         earlier.approval_requested = true;
+        earlier.phase = "failed".into();
         let mut retry = earlier.clone();
         retry.attempt = hex::encode([7; 32]);
         retry.approval_requested = false;
@@ -3117,6 +3150,25 @@ mod tests {
             let mut e = earlier.clone();
             change(&mut e);
             assert!(!repeats(&e, &retry), "{what}");
+        }
+        // Only an attempt whose signing went ahead carries its approval over.
+        for (phase, started, counts) in [
+            ("failed", true, true),
+            ("superseded", true, true),
+            ("ready", true, true),
+            ("approved", true, true),
+            ("not_selected", false, true),
+            ("signing", true, true),
+            ("signing", false, false),
+            ("cancelled", false, false),
+            ("discarding", false, false),
+            ("broadcast", true, false),
+            ("confirmed", true, false),
+        ] {
+            let mut e = earlier.clone();
+            e.phase = phase.into();
+            e.approval_started = started;
+            assert_eq!(repeats(&e, &retry), counts, "{phase} started={started}");
         }
         // On disk: only this member's own approved copy counts.
         let data = std::env::temp_dir().join(format!("loki-auto-approve-{}", Uuid::new_v4()));
