@@ -798,19 +798,16 @@ pub(super) fn restore_vault_from_repair(
     let sigmas: Vec<_> = parts.values().copied().collect();
     let key = repaired_part3(&sigmas, identifier, public)?;
     let vault = hex::encode(vault_id);
-    let fvk = crate::zip2005::frost_viewing_key(
-        &public.verifying_key().serialize().map_err(|e| e.to_string())?.try_into().map_err(|_| "group key length")?, vault_secret,
-    ).map_err(|e| format!("viewing key: {e:?}"))?;
     let sdir = super::ceremony::signer_dir(data, &vault)?;
     let se = crate::signer::secure_element::SoftwareSecureElement::persistent(&sdir, pass)?;
     let signer_network = match network { VaultNetwork::Regtest => crate::signer::Network::Regtest, VaultNetwork::Testnet => crate::signer::Network::Testnet };
     let store = crate::signer::store::SignerStore::create(&sdir, signer_network, *vault_id, slot)?;
     store.write(&se, crate::signer::store::FileKind::Share, 0,
         &crate::signer::local::encode_share(&key.serialize().map_err(|e| e.to_string())?, &public.serialize().map_err(|e| e.to_string())?, vault_secret))?;
-    let bytes = Zeroizing::new(super::ceremony::vault_sealed_bytes(
+    let bytes = super::ceremony::vault_sealed_bytes(
         &vault, slot, threshold, members as u16, &hex::encode(roster_fingerprint),
-        public, &fvk, birth_height, network,
-    )?);
+        &key, public, vault_secret, birth_height, network,
+    )?;
     MemberDir::create(&data.join("vaults"), &vault)
         .map_err(|e| e.to_string())?
         .write_sealed("vault.sealed", &bytes, pass)
@@ -894,7 +891,6 @@ mod tests {
         assert!(dir.read_sealed("vault.sealed", "wrong pass").is_err());
         let raw = dir.read_sealed("vault.sealed", "replacement pass").unwrap();
         let stored: Value = serde_json::from_slice(&raw).unwrap();
-        assert!(stored.get("key_package").is_none());
         let sdir = super::super::ceremony::signer_dir(&data, &vault).unwrap();
         let se = crate::signer::secure_element::SoftwareSecureElement::persistent(&sdir, "replacement pass").unwrap();
         let (_, raw) = crate::signer::store::SignerStore::open(&sdir).unwrap()
@@ -905,8 +901,8 @@ mod tests {
         assert_eq!(restored.serialize().unwrap(), keys[&lost].serialize().unwrap());
         // The original DKG payload binds the share to its unchanged address and metadata.
         let original = super::super::ceremony::vault_sealed_bytes(
-            &vault, 2, 2, 3, &hex::encode(fingerprint), &public,
-            &crate::zip2005::frost_viewing_key(&public.verifying_key().serialize().unwrap().try_into().unwrap(), &vault_secret).unwrap(), 100, VaultNetwork::Regtest,
+            &vault, 2, 2, 3, &hex::encode(fingerprint), &keys[&lost], &public, &vault_secret,
+            100, VaultNetwork::Regtest,
         ).unwrap();
         assert_eq!(stored, serde_json::from_slice::<Value>(&original).unwrap());
 

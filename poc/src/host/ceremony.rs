@@ -1089,25 +1089,13 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
         }
         // Keep the frostd session open until the relay's TTL; peers may still be finishing.
         let (key, public, vault_secret) = signer.hosted_material().map_err(|e| e.to_string())?;
-        let ak: [u8; 32] = public.verifying_key().serialize()
-            .map_err(|e| e.to_string())?.try_into().map_err(|_| "group key length")?;
-        let fvk = zip2005::frost_viewing_key(&ak, &vault_secret)
-            .map_err(|e| format!("group viewing key: {e:?}"))?;
-        let group_address = vault::unified_address(&fvk, network.network_type());
-        let sealed = json!({
-            "vault":c.vault,"threshold":c.threshold,"members":c.members,
-            "roster_fingerprint":c.fingerprint,"key_package":hex::encode(key.serialize().map_err(|e| e.to_string())?),
-            "public_package":hex::encode(public.serialize().map_err(|e| e.to_string())?),
-            "my_frost_id":c.my_slot,"group_address":group_address,
-            "group_ak":hex::encode(ak),"vault_secret":hex::encode(&*vault_secret),"birth_height":birth_height,
-            "key_derivation":zip2005::VERSION,"network":network.label()
-        });
+        let sealed = vault_sealed_bytes(
+            &c.vault, c.my_slot, c.threshold, c.members,
+            c.fingerprint.as_deref().ok_or("roster fingerprint missing at activation")?,
+            &key, &public, &vault_secret, birth_height, network,
+        )?;
         dir(data, vault_id)?
-            .write_sealed(
-                "vault.sealed",
-                &serde_json::to_vec(&sealed).map_err(|e| e.to_string())?,
-                pass,
-            )
+            .write_sealed("vault.sealed", &sealed, pass)
             .map_err(|e| e.to_string())?;
         // The vault is now active: seal this member's recovery backup (share HPKE-sealed to its
         // recovery words) so a lost device can restore the share from the words. The recovery
@@ -1353,6 +1341,16 @@ mod tests {
         let id1 = frost::Identifier::try_from(1u16).unwrap();
         let kp1 = frost::keys::KeyPackage::try_from(shares[&id1].clone()).unwrap();
         let share_bytes = kp1.serialize().unwrap();
+        // The DKG roster names every member's relay identity, which signing needs.
+        let ids: Vec<_> = (1..=3).map(Identity::new).collect();
+        let roster = serde_json::to_vec(&json!({
+            "vault": vault_hex, "threshold": 2, "setup_version": 2, "network": "regtest",
+            "members": ids.iter().map(|i| {
+                let p = i.public();
+                json!({"id": p.id, "signing": hex::encode(p.signing), "encryption": hex::encode(p.encryption)})
+            }).collect::<Vec<_>>(),
+        }))
+        .unwrap();
         let material = BackupMaterial {
             member_id: 1,
             threshold: 2,
@@ -1364,9 +1362,9 @@ mod tests {
             key_package: Zeroizing::new(share_bytes.clone()),
             public_package: public.serialize().unwrap(),
             backup_epoch: 0,
-            identity: Zeroizing::new(Vec::new()),
-            roster: Vec::new(),
-            roster_fingerprint: [0; 32],
+            identity: Zeroizing::new(ids[0].to_secret_bytes().to_vec()),
+            roster_fingerprint: crate::member_state::Roster::from_bytes(&roster).unwrap().fingerprint(),
+            roster,
             birth_height: None,
         };
         let sdir = signer_dir(&data, &vault_hex).unwrap();
@@ -1384,11 +1382,9 @@ mod tests {
         );
 
         // DESTROY the device: wipe the entire data root (share store, backups, identity, pubkeys).
+        // The new device starts empty; the member brings only the exported blob and the words.
         std::fs::remove_dir_all(&data).unwrap();
-        // The restoring phone keeps only the opaque recovery backup blob and the 24 words.
         let sdir = signer_dir(&data, &vault_hex).unwrap();
-        std::fs::create_dir_all(&sdir).unwrap();
-        std::fs::write(crate::host::recovery::backup_file(&sdir), &blob).unwrap();
 
         let config = Config {
             registration: None,
@@ -1411,13 +1407,26 @@ mod tests {
             loopback_peers: false,
         };
 
-        // Wrong words cannot open the backup; the real words restore it.
+        // Wrong words cannot open the backup, and restore needs the exported blob here.
         let (other, _) = RecoveryKey::generate().unwrap();
-        assert!(restore_vault_from_backup(&data, &vault_hex, &other, pass, &config).is_err());
-        restore_vault_from_backup(&data, &vault_hex, &words, pass, &config).unwrap();
+        assert!(restore_vault_from_backup(&data, &vault_hex, &other, Some(&blob), pass, &config).is_err());
+        assert!(restore_vault_from_backup(&data, &vault_hex, &words, None, pass, &config).is_err());
+        // A profile that already holds another member identity is never overwritten.
+        let root = MemberDir::create(&data, "").unwrap();
+        root.write_sealed("identity.sealed", &Identity::new(1).to_secret_bytes(), pass).unwrap();
+        let conflict = restore_vault_from_backup(&data, &vault_hex, &words, Some(&blob), pass, &config);
+        assert!(conflict.unwrap_err().contains("different member identity"));
+        assert!(!dir(&data, &vault_hex).unwrap().exists("vault.sealed"));
+        std::fs::remove_dir_all(&data).unwrap();
+
+        // The real words restore a member the payment path can open and sign with.
+        restore_vault_from_backup(&data, &vault_hex, &words, Some(&blob), pass, &config).unwrap();
+        crate::host::payment::load_vault(&data, pass, &vault_hex, "regtest")
+            .expect("the restored member opens for signing");
+        assert_eq!(std::fs::read(crate::host::recovery::backup_file(&sdir)).unwrap(), blob);
         assert!(
-            dir(&data, &vault_hex).unwrap().exists("vault.sealed"),
-            "restore rebuilt vault.sealed",
+            restore_vault_from_backup(&data, &vault_hex, &words, Some(&blob), pass, &config).is_err(),
+            "never replace an existing vault",
         );
 
         // Read the restored share back through the real store + device element (the production
@@ -1447,8 +1456,9 @@ pub(super) fn signer_dir(data: &Path, vault: &str) -> Result<PathBuf, String> {
     Ok(dir(data, vault)?.path().join("signer"))
 }
 
-/// Build the passphrase-sealed `vault.sealed` payload that `payment::load_vault` reads. Shared
-/// by DKG completion and recovery restore so both emit the identical schema.
+/// Build the passphrase-sealed `vault.sealed` payload that `payment::load_vault` reads. DKG
+/// completion and recovery restore both write it through here, so a restored member gets the
+/// same complete file (share and vault secret included) that signing reads.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn vault_sealed_bytes(
     vault: &str,
@@ -1456,45 +1466,56 @@ pub(super) fn vault_sealed_bytes(
     threshold: u16,
     members: u16,
     roster_fingerprint: &str,
+    key: &frost::keys::KeyPackage,
     public: &frost::keys::PublicKeyPackage,
-    fvk: &orchard::keys::FullViewingKey,
+    vault_secret: &[u8; 32],
     birth_height: u32,
     network: VaultNetwork,
-) -> Result<Vec<u8>, String> {
+) -> Result<Zeroizing<Vec<u8>>, String> {
     let ak: [u8; 32] = public
         .verifying_key()
         .serialize()
         .map_err(|e| e.to_string())?
         .try_into()
         .map_err(|_| "group key length")?;
+    let fvk = zip2005::frost_viewing_key(&ak, vault_secret)
+        .map_err(|e| format!("group viewing key: {e:?}"))?;
     let group_address = vault::unified_address(&fvk, network.network_type());
     let sealed = json!({
         "vault": vault, "threshold": threshold, "members": members,
         "roster_fingerprint": roster_fingerprint,
+        "key_package": hex::encode(key.serialize().map_err(|e| e.to_string())?),
         "public_package": hex::encode(public.serialize().map_err(|e| e.to_string())?),
         "my_frost_id": slot, "group_address": group_address,
-        "group_ak": hex::encode(ak),
+        "group_ak": hex::encode(ak), "vault_secret": hex::encode(vault_secret),
         "birth_height": birth_height, "key_derivation": zip2005::VERSION,
         "network": network.label(),
     });
-    serde_json::to_vec(&sealed).map_err(|e| e.to_string())
+    serde_json::to_vec(&sealed).map(Zeroizing::new).map_err(|e| e.to_string())
 }
 
-/// Recovery restore: rebuild this member's `vault.sealed` (and `identity.sealed` if missing)
-/// from the stored recovery backup, opened with the member's 24 words. After this the hosted
-/// payment path can re-open the vault and sign, exactly as after the original ceremony.
+/// Recovery restore: rebuild this member's vault from a recovery backup opened with the
+/// member's 24 words, so the payment path can re-open the vault and sign exactly as after the
+/// original ceremony. `backup` is the exported blob (`GET /api/recovery-backup`) a member
+/// brings to a new device; without it the blob stored beside the signer is used.
 pub(super) fn restore_vault_from_backup(
     data: &Path,
     vault: &str,
     words: &str,
+    backup: Option<&[u8]>,
     pass: &str,
     config: &super::Config,
 ) -> Result<(), String> {
     let key = crate::signer::recovery::RecoveryKey::from_words(words)?;
-    let blob = std::fs::read(super::recovery::backup_file(&signer_dir(data, vault)?))
-        .map_err(|_| "no recovery backup for this vault".to_string())?;
+    let sdir = signer_dir(data, vault)?;
+    let local = super::recovery::backup_file(&sdir);
+    let blob = match backup {
+        Some(blob) => blob.to_vec(),
+        None => std::fs::read(&local)
+            .map_err(|_| "no recovery backup for this vault; supply the exported backup".to_string())?,
+    };
     let vault_id = vault_bytes(vault)?;
-    let material = crate::signer::backup::verify_recovery(&BackupArtifact(blob), &key, &vault_id)?;
+    let material = crate::signer::backup::verify_recovery(&BackupArtifact(blob.clone()), &key, &vault_id)?;
 
     let pp = frost::keys::PublicKeyPackage::deserialize(&material.public_package)
         .map_err(|e| e.to_string())?;
@@ -1506,24 +1527,69 @@ pub(super) fn restore_vault_from_backup(
         || pp.verifying_shares().get(&id) != Some(kp.verifying_share()) {
         return Err("recovery share differs from its public vault metadata".into());
     }
+    // Signing needs every member's relay identity, which only the backup's roster carries.
+    // `verify_recovery` already bound that roster to this vault and to the backup's identity.
+    if material.roster.is_empty() || material.identity.is_empty() {
+        return Err("this backup has no roster, so it cannot rebuild a member that signs".into());
+    }
+    let roster = crate::member_state::Roster::from_bytes(&material.roster)?;
+    if roster.threshold != material.threshold || roster.members.len() != usize::from(material.members) {
+        return Err("recovery roster differs from its vault metadata".into());
+    }
     let network = match material.network {
         Network::Regtest => VaultNetwork::Regtest,
         Network::Testnet => VaultNetwork::Testnet,
     };
-    let fvk = zip2005::frost_viewing_key(&pp.verifying_key().serialize().map_err(|e| e.to_string())?.try_into().map_err(|_| "group key length")?, &material.group_sk)
-        .map_err(|e| format!("group viewing key: {e:?}"))?;
+    if network.label() != config.network {
+        return Err("recovery backup is for a different network".into());
+    }
+    if dir(data, vault)?.exists("vault.sealed") {
+        return Err("vault already exists; restore into a fresh device profile".into());
+    }
+    // The profile's identity serves every vault it holds, so restore never replaces one.
+    let root = MemberDir::open(data, ".");
+    let write_identity = match root.read_sealed("identity.sealed", pass) {
+        Ok(existing) => {
+            let existing = Zeroizing::new(existing);
+            if existing.len() != material.identity.len() || existing[2..] != material.identity[2..] {
+                return Err("this profile already has a different member identity; restore into a \
+                    profile created without --coordinator-url that holds no other vaults".into());
+            }
+            false
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut ceremony = Ceremony {
+        vault: vault.to_owned(),
+        name: material.label.clone(),
+        members: material.members,
+        threshold: material.threshold,
+        my_slot: material.member_id,
+        creator_base_url: String::new(),
+        frostd_url: config.frostd_url.clone(),
+        slots: roster.members.values().map(|m| (m.id, Slot {
+            identity: Some(WireIdentity::from_public(m.clone())),
+            pending_token: None,
+        })).collect(),
+        fingerprint: None,
+        agreed: roster.members.keys().copied().collect(),
+        session_id: None,
+        coordinator_peer: None,
+        vs_session_id: None,
+        dkg_started: true,
+        error: None,
+        birth_height: material.birth_height,
+    };
+    // The ceremony records the relay roster's fingerprint, not the setup document's.
+    let fingerprint = hex::encode(roster_of(&ceremony)?.fingerprint());
+    ceremony.fingerprint = Some(fingerprint.clone());
     let bytes = vault_sealed_bytes(
-        vault,
-        material.member_id,
-        material.threshold,
-        material.members,
-        &hex::encode(material.roster_fingerprint),
-        &pp,
-        &fvk,
-        material.birth_height.unwrap_or(0),
-        network,
+        vault, material.member_id, material.threshold, material.members, &fingerprint,
+        &kp, &pp, &material.group_sk,
+        // Regtest vaults are born at height 2 (`setup_birth_height`); Testnet backups carry theirs.
+        material.birth_height.unwrap_or(2), network,
     )?;
-    let sdir = signer_dir(data, vault)?;
     let se = config.open_secure_element(&sdir, pass)?;
     let store = if sdir.join("signer.meta").exists() {
         crate::signer::store::SignerStore::open(&sdir)?
@@ -1533,24 +1599,24 @@ pub(super) fn restore_vault_from_backup(
     if store.vault() != vault_id || store.member() != material.member_id || store.network() != material.network {
         return Err("recovery backup belongs to another signer".into());
     }
-    if dir(data, vault)?.exists("vault.sealed") {
-        return Err("vault already exists; restore into a fresh device profile".into());
-    }
     let previous_epoch = store.read(&se, crate::signer::store::FileKind::Share)?
         .map(|(epoch, _)| epoch).unwrap_or(0);
     let epoch = material.backup_epoch.max(previous_epoch).checked_add(1).ok_or("backup epoch overflow")?;
     store.write(&se, crate::signer::store::FileKind::Share, epoch,
         &crate::signer::local::encode_share(&material.key_package, &material.public_package, &material.group_sk))?;
-    dir(data, vault)?
-        .write_sealed("vault.sealed", &bytes, pass)
-        .map_err(|e| e.to_string())?;
-
-    // A brand-new device also needs the member identity the vault is enrolled under.
-    let root = MemberDir::open(data, ".");
-    if !root.exists("identity.sealed") && !material.identity.is_empty() {
+    if write_identity {
         root.write_sealed("identity.sealed", &material.identity, pass)
             .map_err(|e| e.to_string())?;
     }
+    // Keep the backup on the new device so it can be exported again.
+    if !local.exists() {
+        std::fs::write(&local, &blob).map_err(|e| e.to_string())?;
+    }
+    save(data, pass, &ceremony)?;
+    // Written last: `vault.sealed` is what marks the vault active.
+    dir(data, vault)?
+        .write_sealed("vault.sealed", &bytes, pass)
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 

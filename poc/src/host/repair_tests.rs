@@ -258,8 +258,9 @@ fn wired_repair(threshold: u16, members: u16, lost: u16, fault: Option<Fault>) {
     let expected = keys[&frost::Identifier::try_from(lost).unwrap()]
         .serialize()
         .unwrap();
-    assert!(stored.get("key_package").is_none());
-    assert!(stored.get("vault_secret").is_none());
+    // Signing reads the share from `vault.sealed`, exactly as after DKG.
+    assert_eq!(stored["key_package"], hex::encode(&expected));
+    assert_eq!(stored["vault_secret"], hex::encode([42u8; 32]));
     let sdir = super::super::ceremony::signer_dir(&data, &hex::encode(vault)).unwrap();
     let se = crate::signer::secure_element::SoftwareSecureElement::persistent(&sdir, "replacement pass").unwrap();
     let (_, raw) = crate::signer::store::SignerStore::open(&sdir).unwrap()
@@ -492,8 +493,9 @@ async fn repair_handlers_require_unlock_consent_and_local_relay_and_original_vau
         2,
         3,
         &fingerprint,
+        &key,
         &public,
-        &crate::zip2005::frost_viewing_key(&public.verifying_key().serialize().unwrap().try_into().unwrap(), &[42; 32]).unwrap(),
+        &[42; 32],
         100,
         VaultNetwork::Regtest,
     )
@@ -527,7 +529,7 @@ async fn repair_handlers_require_unlock_consent_and_local_relay_and_original_vau
         .as_str()
         .unwrap()
         .contains("never overwrite"));
-    assert_eq!(dir.read_sealed("vault.sealed", "pass").unwrap(), bytes);
+    assert_eq!(dir.read_sealed("vault.sealed", "pass").unwrap(), *bytes);
     std::fs::remove_file(root.path().join("identity.sealed")).unwrap();
     assert!(load_helper(&data, "pass", &invite).is_err());
     assert!(!root.exists("identity.sealed"), "repair must not replace a missing recovery identity");

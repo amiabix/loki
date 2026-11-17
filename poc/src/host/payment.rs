@@ -91,7 +91,7 @@ struct Payment {
     error: Option<String>,
 }
 
-struct Vault {
+pub(super) struct Vault {
     network: VaultNetwork,
     fvk: FullViewingKey,
     key: frost::keys::KeyPackage,
@@ -158,7 +158,7 @@ fn save_payment(data: &Path, pass: &str, p: &Payment) -> Result<(), String> {
         .and_then(|f| f.sync_all())
         .map_err(|e| e.to_string())
 }
-fn load_vault(data: &Path, pass: &str, vault: &str, configured: &str) -> Result<Vault, String> {
+pub(super) fn load_vault(data: &Path, pass: &str, vault: &str, configured: &str) -> Result<Vault, String> {
     let dir = member_dir(data, vault)?;
     let sealed = Zeroizing::new(
         dir.read_sealed("vault.sealed", pass)
