@@ -78,45 +78,122 @@ pub(super) fn seal_vault_backup(
     fs::write(&target, &artifact.0).map_err(|e| e.to_string())
 }
 
-/// Establish the recovery identity once. Only public keys are persisted; existing identities
-/// are left untouched and their words can never be reshown.
-pub async fn establish_recovery(data: &Path) -> Result<Option<Zeroizing<String>>, String> {
-    let path = pubkey_file(data);
-    if path.try_exists().map_err(|e| e.to_string())? {
-        return Ok(None);
+/// Seal the missing recovery backup of every active vault. Vaults that became active before
+/// the recovery identity existed have none; this runs at unlock and after recovery setup.
+/// Each vault is attempted; the errors are returned together.
+pub(super) fn seal_missing_backups(data: &Path, pass: &str) -> Result<(), String> {
+    if read_encryption_pubkey(data).is_none() {
+        return Ok(());
     }
-    let (words, key) = RecoveryKey::generate()?;
+    let entries = match fs::read_dir(data.join("vaults")) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut errors = Vec::new();
+    for entry in entries.flatten() {
+        let Some(vault) = entry.file_name().to_str().map(str::to_owned) else { continue };
+        let Ok(vault_id) = <[u8; 32]>::try_from(hex::decode(&vault).unwrap_or_default()) else { continue };
+        if !entry.path().join("vault.sealed").exists() {
+            continue;
+        }
+        let sealed = super::ceremony::signer_dir(data, &vault)
+            .and_then(|dir| seal_vault_backup(data, &dir, &vault_id, pass));
+        if let Err(e) = sealed {
+            errors.push(format!("vault {vault}: {e}"));
+        }
+    }
+    if errors.is_empty() { Ok(()) } else { Err(errors.join("; ")) }
+}
+
+/// [`seal_missing_backups`] for callers that must not fail on it (unlock, recovery setup):
+/// the error goes to the local log and the next unlock tries again.
+pub(super) fn seal_missing_backups_logged(data: &Path, pass: &str) {
+    if let Err(e) = seal_missing_backups(data, pass) {
+        eprintln!("recovery backup not sealed (retried at the next unlock): {e}");
+    }
+}
+
+/// The `recovery.pub` layout for these words.
+fn public_keys(key: &RecoveryKey) -> Vec<u8> {
     let mut pubkeys = Vec::with_capacity(64);
     pubkeys.extend_from_slice(&key.public_bytes());
     pubkeys.extend_from_slice(&key.signing_public());
+    pubkeys
+}
+
+/// Write `recovery.pub` only if it does not exist. Returns false when it already exists.
+fn create_public_keys(data: &Path, pubkeys: &[u8]) -> Result<bool, String> {
+    let path = pubkey_file(data);
     // Never replace an identity created by a concurrent request.
     let mut file = match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
         Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
         Err(e) => return Err(e.to_string()),
     };
-    if let Err(e) = file.write_all(&pubkeys) {
+    if let Err(e) = file.write_all(pubkeys) {
         let _ = fs::remove_file(&path);
         return Err(e.to_string());
     }
-    Ok(Some(words))
+    Ok(true)
+}
+
+/// Restore brings the recovery identity with it: these words must be this profile's recovery
+/// identity. Returns true when `recovery.pub` is absent and must be written with
+/// [`adopt_recovery`]; refuses when the profile already has different words.
+pub(super) fn check_recovery(data: &Path, key: &RecoveryKey) -> Result<bool, String> {
+    match fs::read(pubkey_file(data)) {
+        Ok(existing) if existing == public_keys(key) => Ok(false),
+        Ok(_) => Err("this profile already has different recovery words; restore into a profile \
+            created without --coordinator-url that holds no other vaults".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Make these words the profile's recovery identity (public keys only).
+pub(super) fn adopt_recovery(data: &Path, key: &RecoveryKey) -> Result<(), String> {
+    if !create_public_keys(data, &public_keys(key))? {
+        check_recovery(data, key)?;
+    }
+    Ok(())
+}
+
+/// Whether this profile has a recovery identity.
+pub(super) fn exists(data: &Path) -> bool {
+    pubkey_file(data).exists()
+}
+
+/// Establish the recovery identity once. Only public keys are persisted; existing identities
+/// are left untouched and their words can never be reshown.
+pub async fn establish_recovery(data: &Path) -> Result<Option<Zeroizing<String>>, String> {
+    if pubkey_file(data).try_exists().map_err(|e| e.to_string())? {
+        return Ok(None);
+    }
+    let (words, key) = RecoveryKey::generate()?;
+    Ok(create_public_keys(data, &public_keys(&key))?.then_some(words))
 }
 
 /// POST /api/recovery-setup — establish the recovery identity once and return the 24 words for
 /// the member to write down. Persists only the public keys; refuses if one already exists (the
 /// words can never be reshown). Requires an unlocked session (a deliberate member action).
 pub(super) async fn setup(State(st): State<Shared>) -> Reply {
-    let data = {
+    let (data, pass) = {
         let session = st.session.read().await;
         match session.as_ref() {
-            Some(s) => s.data.clone(),
+            Some(s) => (s.data.clone(), s.passphrase.clone()),
             None => return err(StatusCode::UNAUTHORIZED, "unlock before setting up recovery"),
         }
     };
     // Returned once, never stored. The member writes these down; they are the only way to open
     // recovery backups and to authorize a replacement device.
     match establish_recovery(&data).await {
-        Ok(Some(words)) => ok(json!({ "words": words.as_str() })),
+        Ok(Some(words)) => {
+            // Vaults that are already active get their backup now; the words are returned
+            // even if sealing fails, and the next unlock retries it.
+            let _ = tokio::task::spawn_blocking(move || seal_missing_backups_logged(&data, &pass)).await;
+            ok(json!({ "words": words.as_str() }))
+        }
         Ok(None) => err(StatusCode::CONFLICT, "a recovery identity is already established"),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
