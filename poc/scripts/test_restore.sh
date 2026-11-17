@@ -213,10 +213,13 @@ approve 3
 wait_for 'proposer records member 3' 60 proposer_has '.approvals == [3]'
 approve 1
 wait_for 'signing group [1,3]' 60 proposer_has '.signers == [1,3]'
-wait_for 'signers did not finish' 600 proposer_has '.ready_to_send'
-finished="$(api 1 POST /api/payment-finish "$(pair "$attempt")")" || fail "finish: $finished"
-txid="$(jq -er '.txid' <<<"$finished")" || fail txid
+# The proposer sends on its own once the signatures combine, after sealing a copy to every member.
+wait_for 'proposer did not send' 600 proposer_has '.phase == "broadcast" or .phase == "confirmed"'
+txid="$(api 1 GET "/api/payments?vault=$vault" | jq -er --arg attempt "$attempt" '.payments[] | select(.attempt == $attempt) | .txid')" || fail txid
 echo "broadcast txid: $txid (signed by members 1 and restored 3)"
+restored_holds() { api 3 GET "/api/payments?vault=$vault" | jq -e --arg attempt "$attempt" --arg txid "$txid" 'any(.payments[]; .attempt == $attempt and .txid == $txid and (.phase == "broadcast" or .phase == "confirmed"))' >/dev/null; }
+wait_for 'restored member holds the sent transaction' 60 restored_holds
+echo "the restored member holds the signed transaction"
 verify() { api 1 POST /api/payment-verify "$(jq -nc --arg vault "$vault" --arg attempt "$attempt" --arg txid "$txid" '{vault:$vault,attempt:$attempt,txid:$txid}')"; }
 verified=''
 for ((n=0; n<confirm_timeout; n+=30)); do
