@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Testnet end to end: an open payment request signed by the first approvers and broadcast,
-# then a second request that the proposer cancels.
+# Testnet end to end: an open payment request signed by the first approvers and sent by a
+# member outside the signing group; then a request that the proposer cancels.
 #
 # By default this starts three members and creates a new 2-of-3 vault. With VAULT and
 # TOKEN_DIR it reuses three running members on BASE_PORT+1..3 that are already in that
@@ -163,6 +163,16 @@ wait_for() {
   fail "$what"
 }
 phases() { for i in 1 2 3; do echo "  member $i: $(phase "$i" "$1")"; done; }
+# payment-verify on member $1 until the transaction is mined; prints the last result.
+wait_confirmed() {
+  local i="$1" attempt="$2" txid="$3" out=''
+  for ((n=0; n<funding_timeout; n+=30)); do
+    out="$(api "$i" POST /api/payment-verify "$(jq -nc --arg vault "$vault" --arg attempt "$attempt" --arg txid "$txid" '{vault:$vault,attempt:$attempt,txid:$txid}')")" || fail "verify: $out"
+    jq -e '.phase == "confirmed"' <<<"$out" >/dev/null && { echo "$out"; return; }
+    sleep 30
+  done
+  fail "not mined within $funding_timeout seconds: $out"
+}
 
 echo "== open request: any member may approve; member 3 approves before member 2"
 attempt="$(draft_when_spendable "${MEMO:-testnet payment}" | jq -er '.attempt')"
@@ -176,18 +186,27 @@ approve 2 "$attempt"
 wait_for 'proposer records member 2' 60 proposer_has "$attempt" '.approvals == [3,2]'
 approve 1 "$attempt"
 wait_for 'signing group [1,3]' 60 proposer_has "$attempt" '.signers == [1,3]'
-wait_for 'member 2 is not selected' 300 has_phase 2 "$attempt" not_selected
+# Member 2 is left out; once the proposer sends it the signed payment it is ready to send too.
+outside() { local p; p="$(phase 2 "$attempt")"; [[ "$p" == not_selected || "$p" == ready ]]; }
+wait_for 'member 2 is not selected' 300 outside
 ! pending 2 "$attempt" || fail 'member 2 still lists the request'
-echo "signing group [1,3]; member 2 not_selected and off its pending list"
+echo "signing group [1,3]; member 2 left out and off its pending list"
 wait_for 'signers did not finish' 600 proposer_has "$attempt" '.ready_to_send'
+# Member 2 did not sign; it gets the signed payment from the proposer and sends it.
+wait_for 'member 2 holds the signed payment' 120 has_phase 2 "$attempt" ready
 phases "$attempt"
-finished="$(api 1 POST /api/payment-finish "$(pair "$attempt")")" || fail "finish: $finished"
+finished="$(api 2 POST /api/payment-finish "$(pair "$attempt")")" || fail "finish by member 2: $finished"
 txid="$(jq -er '.txid' <<<"$finished")" || fail txid
-echo "broadcast txid: $txid"
-verified="$(api 1 POST /api/payment-verify "$(jq -nc --arg vault "$vault" --arg attempt "$attempt" --arg txid "$txid" '{vault:$vault,attempt:$attempt,txid:$txid}')")" || fail "verify: $verified"
-jq -e '.phase == "broadcast" or .phase == "confirmed"' <<<"$verified" >/dev/null || fail "verify result: $verified"
-for i in 2 3; do wait_for "member $i hears the broadcast" 60 has_phase "$i" "$attempt" broadcast; done
+echo "member 2, outside the signing group, broadcast txid: $txid"
+for i in 1 3; do wait_for "member $i hears the broadcast" 60 has_phase "$i" "$attempt" broadcast; done
 phases "$attempt"
+# Sending again while unmined is allowed and reports the same transaction.
+again="$(api 3 POST /api/payment-finish "$(pair "$attempt")")" || fail "rebroadcast by member 3: $again"
+[[ "$(jq -r '.txid' <<<"$again")" == "$txid" ]] || fail "rebroadcast has another txid: $again"
+echo "member 3 rebroadcast the same txid"
+verified="$(wait_confirmed 2 "$attempt" "$txid")"
+echo "confirmed at height $(jq -r '.mined_height' <<<"$verified")"
+first_txid="$txid"
 
 echo "== cancel: member 1 cancels its request after member 2 approved"
 first="$(draft_when_spendable 'cancelled payment')"
@@ -221,4 +240,4 @@ for held_attempt in "${held[@]:1}"; do
   api 1 POST /api/payment-discard "$(pair "$held_attempt")" | jq -e '.phase == "cancelled"' >/dev/null || fail "discard draft $held_attempt"
 done
 held=()
-echo "PASS: Testnet payment $txid broadcast ($(jq -r '.phase' <<<"$verified")); cancelled request released its note"
+echo "PASS: member 2 sent $first_txid; cancelled request released its note"
