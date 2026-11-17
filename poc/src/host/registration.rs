@@ -159,7 +159,8 @@ impl DeviceKey {
     }
 }
 
-async fn register(config: &Config, pass: &str) -> Result<PublicMember, String> {
+/// `pairing_claim`: the one-use claim from a pairing link, sent on the first attempt only.
+async fn register(config: &Config, pass: &str, pairing_claim: Option<&str>) -> Result<PublicMember, String> {
     let launch = config.registration.as_ref().ok_or("self-registration not configured")?;
     // Loopback is the device-local browser endpoint, even with an HTTPS coordinator.
     let advertise_url = plain_origin(&config.base_url(), true)?;
@@ -177,7 +178,7 @@ async fn register(config: &Config, pass: &str) -> Result<PublicMember, String> {
     let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(15)).build().map_err(|e| e.to_string())?;
     let mut claim = serde_json::to_value(&enrollment).map_err(|e| e.to_string())?;
-    if let Some(challenge) = &launch.pairing_challenge { claim["pairing_challenge"] = challenge.clone().into(); }
+    if let Some(challenge) = pairing_claim { claim["pairing_challenge"] = challenge.into(); }
     let challenge: serde_json::Value = client.post(format!("{}/api/members/challenge", launch.coordinator))
         .json(&claim).send().await.and_then(|r| r.error_for_status()).map_err(|e| format!("registration challenge: {e}"))?
         .json().await.map_err(|e| e.to_string())?;
@@ -257,12 +258,12 @@ async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option
 }
 
 /// One registration attempt; on success the public roster entry is saved and served.
-async fn register_once(st: &Shared, pass: Zeroizing<String>) -> Result<PublicMember, String> {
+async fn register_once(st: &Shared, pass: Zeroizing<String>, pairing_claim: Option<String>) -> Result<PublicMember, String> {
     let launch = st.config.registration.as_ref().ok_or("self-registration not configured")?;
     let owned = st.clone();
     let member = tokio::task::spawn_blocking(move || {
         tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?
-            .block_on(register(&owned.config, &pass))
+            .block_on(register(&owned.config, &pass, pairing_claim.as_deref()))
     }).await.map_err(|e| e.to_string())??;
     save_coordinator(&st.config.data, &launch.coordinator, member.slot)?;
     *st.registration.write().await = Some(member.clone());
@@ -272,8 +273,12 @@ async fn register_once(st: &Shared, pass: Zeroizing<String>) -> Result<PublicMem
 /// Retry registration with backoff (5 s doubling to 5 min) until the coordinator accepts it.
 async fn keep_registering(st: Shared, pass: Zeroizing<String>) {
     let mut wait = std::time::Duration::from_secs(5);
+    // The coordinator consumes a pairing claim even when its reply is lost, so only the first
+    // attempt carries it. Later attempts resume against the saved coordinator and slot, which
+    // the coordinator accepts once the claim's reservation expires (or as the same identity).
+    let mut pairing_claim = st.config.registration.as_ref().and_then(|launch| launch.pairing_challenge.clone());
     loop {
-        match register_once(&st, pass.clone()).await {
+        match register_once(&st, pass.clone(), pairing_claim.take()).await {
             Ok(member) => {
                 println!("Public roster slot: {}", member.slot);
                 return;
@@ -365,6 +370,51 @@ mod tests {
         assert!(resumed.passphrase_file.is_none());
         assert_eq!(serde_json::from_slice::<serde_json::Value>(&std::fs::read(data.join("paired-coordinator.json")).unwrap()).unwrap(),
             serde_json::json!({ "origin": "https://127.0.0.1:1", "slot": 7 }));
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    /// A pairing claim is consumed by the coordinator even when the reply is lost, so a retry
+    /// that resent it could never register. Only the first attempt carries the claim.
+    #[tokio::test]
+    async fn registration_retries_resume_without_the_consumed_pairing_claim() {
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+        let claims = std::sync::Arc::new(std::sync::Mutex::new(Vec::<bool>::new()));
+        let posts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (c, p) = (claims.clone(), posts.clone());
+        let app = Router::new()
+            .route("/api/members/challenge", post(move |Json(body): Json<Value>| {
+                c.lock().unwrap().push(body.get("pairing_challenge").is_some());
+                async { Json(json!({ "challenge": "cd".repeat(32) })) }
+            }))
+            .route("/api/members", post(move |Json(body): Json<Value>| {
+                // The first registration reply is lost; the next one succeeds.
+                let first = p.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                async move {
+                    if first { return Err(axum::http::StatusCode::BAD_GATEWAY); }
+                    Ok(Json(json!({ "member": { "slot": body["slot"], "signing_pubkey": body["signing_pubkey"],
+                        "relay_pubkey": body["relay_pubkey"], "advertise_url": body["advertise_url"] } })))
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let data = std::env::temp_dir().join(format!("loki-pair-claim-{}", uuid::Uuid::new_v4()));
+        let mut config = super::super::config_from_args(&[
+            "--data".into(), data.to_str().unwrap().into(), "--port".into(), "3601".into(),
+        ]).unwrap();
+        config.registration = Some(RegistrationConfig::pairing(&format!(
+            "loki://pair?origin=http%3A%2F%2F127.0.0.1%3A{port}&slot=7&challenge={}", "ab".repeat(32)), true).unwrap());
+        let state: Shared = std::sync::Arc::new(super::super::state::AppState::new(config));
+        start_with(&state, Some(Zeroizing::new("claim unlock".into())), None, false).await.unwrap();
+        let mut member = None;
+        for _ in 0..300 {
+            if let Some(m) = state.registration.read().await.clone() { member = Some(m); break; }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let member = member.expect("registration recovers after the lost reply");
+        assert_eq!(member.slot, 7);
+        assert_eq!(*claims.lock().unwrap(), vec![true, false], "only the first attempt carries the claim");
         std::fs::remove_dir_all(data).unwrap();
     }
 
