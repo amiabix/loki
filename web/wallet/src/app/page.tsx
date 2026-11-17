@@ -1363,6 +1363,7 @@ function VaultOverview({
                     <p className="font-mono text-base font-semibold">{zatToTaz(p.amount_zat)} TAZ</p>
                     <p className="truncate font-mono text-[11px] text-muted">to {short(p.recipient, 12, 8)}</p>
                     <p className="mt-1 flex items-center gap-2 text-[11px] text-muted"><MemberAvatar slot={p.proposer} size={22} /> Proposed by Member {p.proposer}</p>
+                    {p.replaces && <p className="mt-1 text-[11px] text-amber">{p.replaces.cancel ? "Cancels" : "Retries"} stuck payment {short(p.replaces.attempt, 6, 4)} with the same note</p>}
                   </div>
                   <button
                     onClick={() => onApprove(p.attempt)}
@@ -1657,7 +1658,7 @@ function SignerList({ signers, threshold, approvals = [], ready = false, complet
   const shown = open ? approvals : signers;
   const count = open ? approvals.length : approvals.filter((id) => signers.includes(id)).length;
   return <div className="my-3">
-    <p className="text-xs text-muted">{ready ? "Signatures saved · proposer can send" : complete ? "Your signer finished · awaiting proposer" : `${count} of ${threshold} approvals recorded here${open ? " · any member can approve" : ""}`}</p>
+    <p className="text-xs text-muted">{ready ? "Signed · every member gets the transaction" : complete ? "Your signer finished · awaiting the signed transaction" : `${count} of ${threshold} approvals recorded here${open ? " · any member can approve" : ""}`}</p>
     <div className="mt-2 flex flex-wrap gap-2">
       {shown.map((slot) => <span key={slot} className="pill"><MemberAvatar slot={slot} size={24} /> Member {slot}{approvals.includes(slot) ? " · approved" : " · waiting"}</span>)}
     </div>
@@ -1754,11 +1755,8 @@ function ReviewApprove({
         <h2 className="mb-2 text-2xl font-semibold text-mint">{session?.phase === "failed" ? "Payment signing failed" : "You approved this payment"}</h2>
         <ErrMsg msg={session?.error ?? null} />
         <p className="text-sm text-muted mb-8">
-          It needs {vault.threshold} of {vault.members} members. Once enough have approved, the proposer broadcasts it.
-          {isProposer !== null ? (isProposer
-            ? " You proposed this payment. Open History, wait for Ready to send, then review and confirm the send."
-            : " Your approval is recorded. Wait for the proposer to send; follow its progress in History.")
-            : " If you proposed it, open History to review and confirm the send when it is ready. Otherwise, wait for the proposer."}
+          It needs {vault.threshold} of {vault.members} members. Once enough have approved, the proposer builds the transaction, gives every member a copy, and sends it.
+          {isProposer ? " You proposed this payment; this device sends it as soon as it is signed." : " Follow its progress in History. If it does not go out, any member holding the copy can send it."}
         </p>
         {session && <SignerList signers={session.intent.signers} threshold={vault.threshold} approvals={session.approvals} ready={session.signatures_received} complete={session.phase === "approved"} />}
         {sessionError && <><ErrMsg msg={`Could not refresh signer status: ${sessionError}`} /><Btn variant="ghost" onClick={fetchSession}>Retry signer status</Btn></>}
@@ -1794,6 +1792,16 @@ function ReviewApprove({
       <p className="mb-5 text-sm text-muted">
         from <span className="text-foreground">{vault.name}</span> · needs {vault.threshold} of {vault.members} approvals
       </p>
+      {review.replaces && <GlassCard className="mb-4 border-2 border-amber/60 bg-amber/10">
+        <p className="eyebrow mb-1 text-amber">{review.replaces.cancel ? "Cancels a stuck payment" : "Retries a stuck payment"}</p>
+        <p className="text-sm">
+          Replaces payment <span className="font-mono">{short(review.replaces.attempt, 8, 6)}</span>
+          {review.replaces.amount_zat && review.replaces.recipient ? <> ({zatToTaz(review.replaces.amount_zat)} TAZ to <span className="font-mono">{short(review.replaces.recipient, 10, 6)}</span>)</> : null}.
+        </p>
+        <p className="mt-1 text-xs text-muted">
+          It spends the same note, so only one of the two can ever be mined.{review.replaces.cancel ? " The note returns to the vault, less one fee." : ""}
+        </p>
+      </GlassCard>}
       <GlassCard className="mb-4">
         <div className="py-2 text-center">
           <p className="font-mono text-3xl font-semibold [overflow-wrap:anywhere] sm:text-4xl">
@@ -1827,51 +1835,43 @@ function ReviewApprove({
 const PHASE_PILL: Record<string, string> = {
   preparing: "border border-[var(--border)] bg-white/50 text-muted",
   approved: "bg-amber/15 text-amber",
+  signed: "bg-amber/15 text-amber",
   broadcast: "bg-mint/15 text-mint",
   confirmed: "bg-mint text-white",
+  replaced: "border border-danger/40 bg-danger/10 text-danger",
 };
 
-function BroadcastConfirmation({ vault, attempt, busy, error, onConfirm, onCancel }: {
-  vault: string; attempt: string; busy: boolean; error: string | null;
-  onConfirm: () => void; onCancel: () => void;
+/** Replace a stuck payment with a new request that spends exactly its note. */
+function ReplacePanel({ vault, payment, onStarted }: {
+  vault: VaultSummary; payment: Payment; onStarted: (attempt: string) => void;
 }) {
-  const [details, setDetails] = useState<PaymentSession | null>(null);
-  const [loadError, setLoadError] = useState<string | null>(null);
-  const [version, setVersion] = useState(0);
-  const headingRef = useRef<HTMLHeadingElement>(null);
-  useEffect(() => { headingRef.current?.focus(); }, []);
-  useEffect(() => {
-    let active = true;
-    setDetails(null); setLoadError(null);
-    api<PaymentSession>(`payment-status?vault=${vault}&attempt=${attempt}`)
-      .then((value) => {
-        const intent = value.intent;
-        if (!intent.recipient || !Number.isFinite(intent.amount_zat) || intent.amount_zat <= 0
-          || !Number.isFinite(intent.fee_zat) || intent.fee_zat < 0) throw new Error("Payment details are incomplete.");
-        if (active) setDetails(value);
-      })
-      .catch((e) => active && setLoadError((e as Error).message));
-    return () => { active = false; };
-  }, [vault, attempt, version]);
-  const ready = details?.phase === "ready" && details.signatures_received && !details.error && !details.finish_requested;
-  return <section aria-label="Confirm send" className="mt-4 rounded-xl border border-mint/30 bg-white/80 p-4">
-    <h3 data-screen-heading ref={headingRef} tabIndex={-1} className="text-lg font-semibold">Confirm irreversible send</h3>
-    {!details && !loadError && <p role="status" className="mt-3 text-sm text-muted">Loading full payment details…</p>}
-    {loadError && <><ErrMsg msg={loadError} /><Btn variant="ghost" className="mt-3" onClick={() => setVersion((v) => v + 1)}>Retry payment details</Btn></>}
-    {details && <>
-      <Row label="Full recipient address" value={<span className="select-all">{details.intent.recipient}</span>} mono />
-      <Row label="Amount" value={`${zatToTaz(details.intent.amount_zat)} TAZ`} mono />
-      <Row label="Network fee" value={`${zatToTaz(details.intent.fee_zat)} TAZ`} mono />
-      <Row label="Total leaving the vault" value={`${zatToTaz(details.intent.amount_zat + details.intent.fee_zat)} TAZ`} mono />
-      <p className="my-4 text-sm text-danger">Sending broadcasts this payment to the network. It cannot be undone. Check the full recipient address, amount, and fee before confirming.</p>
-      {!ready && <p role="status" className="mb-3 text-sm text-muted">This payment is no longer awaiting a send. Check its latest status in History.</p>}
-    </>}
-    <ErrMsg msg={error} />
-    <div className="mt-3 grid gap-2 sm:grid-cols-2">
-      <Btn onClick={onConfirm} disabled={!ready || busy}>{busy ? "Sending…" : "Confirm and send"}</Btn>
-      <Btn variant="ghost" onClick={onCancel} disabled={busy}>Cancel</Btn>
+  const [busy, setBusy] = useState<"retry" | "cancel" | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const start = async (mode: "retry" | "cancel") => {
+    setBusy(mode); setErr(null);
+    try {
+      const draft = await api<{ attempt: string }>("payment-replace", { vault: vault.vault, attempt: payment.attempt, mode });
+      await api("payment-publish", { vault: vault.vault, attempt: draft.attempt });
+      onStarted(draft.attempt);
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(null); }
+  };
+  return <div className="mt-3 rounded-xl border border-amber/40 bg-amber/10 p-3">
+    <p className="text-sm font-semibold text-amber">This payment looks stuck</p>
+    <p className="mt-1 text-xs text-muted">
+      Any member can replace it with a new request that spends the same note. It needs {vault.threshold} approvals.
+      A note can be spent only once, so whichever transaction is mined first wins and the recipient is never paid twice.
+    </p>
+    <div className="mt-3 flex flex-col gap-2 sm:flex-row">
+      <button className="btn-glass flex-1 rounded-full px-4 py-2 text-sm disabled:opacity-60" disabled={!!busy} onClick={() => start("retry")}>
+        {busy === "retry" ? "Requesting…" : "Retry the same payment"}
+      </button>
+      <button className="btn-glass flex-1 rounded-full px-4 py-2 text-sm disabled:opacity-60" disabled={!!busy} onClick={() => start("cancel")}>
+        {busy === "cancel" ? "Requesting…" : "Cancel · return the note to the vault (one fee)"}
+      </button>
     </div>
-  </section>;
+    <ErrMsg msg={err} />
+  </div>;
 }
 
 function History({
@@ -1884,31 +1884,20 @@ function History({
   onBack: () => void;
 }) {
   const { data, error, refresh } = usePayments(vault.vault, true);
-  const [confirming, setConfirming] = useState<string | null>(null);
-  const [requested, setRequested] = useState<Record<string, boolean>>({});
-  const sendButtonRef = useRef<HTMLButtonElement | null>(null);
-  const [finishing, setFinishing] = useState<string | null>(null);
+  const [sendingHere, setSendingHere] = useState<string | null>(null);
   const [verifying, setVerifying] = useState<string | null>(null);
   const [txids, setTxids] = useState<Record<string, string>>({});
   const [verified, setVerified] = useState<Record<string, boolean>>({});
   const [err, setErr] = useState<string | null>(null);
 
-  const finish = async (attempt: string) => {
-    setFinishing(attempt); setErr(null);
+  // Sends the signed transaction through this member's own lightwalletd, or sends it again.
+  const send = async (attempt: string) => {
+    setSendingHere(attempt); setErr(null);
     try {
-      const res = await api<{ phase: string; txid: string | null }>("payment-finish", { vault: vault.vault, attempt });
-      setRequested((p) => ({ ...p, [attempt]: true }));
-      setConfirming(null);
-      sendButtonRef.current?.focus();
+      await api<{ phase: string; txid: string | null }>("payment-send", { vault: vault.vault, attempt });
       refresh();
-      const txid = res.txid;
-      if (txid) {
-        setTxids((p) => ({ ...p, [attempt]: txid }));
-        setVerifying(attempt);
-      }
-      // The existing history poll observes background signing, broadcast and confirmation.
     } catch (e) { setErr((e as Error).message); }
-    finally { setFinishing(null); }
+    finally { setSendingHere(null); }
   };
 
   useEffect(() => {
@@ -1966,27 +1955,40 @@ function History({
       ) : (
         <div className="space-y-3">
           {payments.map((p) => {
-            const txid = ["broadcast", "confirmed"].includes(p.phase) ? p.txid ?? txids[p.attempt] : null;
             const confirmed = !!verified[p.attempt] || p.phase === "confirmed";
-            const sending = !!p.finish_requested || !!requested[p.attempt] || finishing === p.attempt;
+            const replaced = p.phase === "replaced";
+            const txid = !replaced ? p.txid ?? txids[p.attempt] ?? null : null;
+            const sending = !!p.sending || sendingHere === p.attempt;
+            const settled = confirmed || replaced || ["cancelled", "expired"].includes(p.phase);
             return (
             <GlassCard key={p.attempt}>
               <div className="mb-2 flex flex-col items-start gap-3 sm:flex-row sm:justify-between">
                 <div className="min-w-0">
-                  <p className="eyebrow mb-1">{p.direction === "received" ? "Received" : p.amount_is_net ? "Net outflow" : txid ? "Sent" : "Payment proposal"}</p>
+                  <p className="eyebrow mb-1">{p.direction === "received" ? "Received" : p.amount_is_net ? "Net outflow" : p.replaces ? (p.replaces.cancel ? "Cancel request" : "Retry request") : confirmed ? "Sent" : "Payment proposal"}</p>
                   {p.recipient && <p className="font-mono text-xs text-muted break-all">{short(p.recipient, 14, 8)}</p>}
                   <p className="font-mono text-sm mt-0.5">{zatToTaz(p.amount_zat)} TAZ</p>
                   {p.fee_zat && <p className="mt-0.5 font-mono text-xs text-muted">+ fee {zatToTaz(p.fee_zat)} TAZ</p>}
+                  {p.replaces && <p className="mt-1 text-xs text-muted">
+                    Replaces payment {short(p.replaces.attempt, 6, 4)} with the same note{p.replaces.cancel ? "; the note goes back to the vault" : ""}.
+                  </p>}
                 </div>
-                <span className={`rounded-full px-2.5 py-0.5 text-xs font-medium shrink-0 ${PHASE_PILL[p.phase] ?? "border border-[var(--border)] bg-white/50 text-muted"}`}>
-                  {paymentLabel(confirmed ? "confirmed" : txid ? "broadcast" : p.phase, p.ready_to_send, sending)}
+                <span className={`rounded-full px-2.5 py-0.5 text-xs font-medium shrink-0 ${PHASE_PILL[confirmed ? "confirmed" : p.phase] ?? "border border-[var(--border)] bg-white/50 text-muted"}`}>
+                  {paymentLabel(confirmed ? "confirmed" : p.phase, false, sending && !settled)}
                 </span>
               </div>
-              {p.signers && !txid && p.phase !== "cancelled" && <SignerList signers={p.signers} threshold={vault.threshold} approvals={p.approvals} ready={p.ready_to_send} complete={p.phase === "approved"} />}
-              {txid && <p className="text-xs text-muted">{p.mined_height != null ? `Included in block ${p.mined_height.toLocaleString()}. ` : confirmed ? "Confirmed on-chain. " : "Awaiting a block. "}Confirmation count is not available from this wallet.</p>}
-              <ErrMsg msg={p.error ?? null} />
+              {p.signers && !txid && !settled && <SignerList signers={p.signers} threshold={vault.threshold} approvals={p.approvals} complete={p.phase === "approved"} />}
+              {replaced && <p className="text-xs text-muted">
+                Another transaction spent this payment’s note in a mined block{p.replaced_by ? ` (${short(p.replaced_by, 8, 6)})` : ""}, so this one can never be mined. Its reservation is released.
+              </p>}
+              {txid && !confirmed && p.phase === "signed" && <p className="text-xs text-muted">
+                Signed by {vault.threshold} members. This device holds the final transaction{p.can_send ? " and can send it" : ""}.
+              </p>}
+              {txid && p.phase === "broadcast" && <p className="text-xs text-muted">
+                Sent; awaiting a block. {p.can_send ? "This device holds the transaction and can send it again." : ""}
+              </p>}
+              <ErrMsg msg={settled ? null : p.error ?? null} />
               <div className="mt-3 flex flex-col gap-2 sm:flex-row">
-                {p.phase === "signing" && !p.approval_requested && !p.error && !txid && <button
+                {p.phase === "signing" && !p.approval_requested && !p.error && <button
                   onClick={() => onReview(p.attempt)}
                   className="btn-glass flex-1 rounded-full px-4 py-2 text-sm"
                 >
@@ -1997,13 +1999,13 @@ function History({
                   try { await api("payment-discard", { vault: vault.vault, attempt: p.attempt }); refresh(); }
                   catch (e) { setErr((e as Error).message); }
                 }}>{p.error || p.phase === "failed" ? "Discard failed payment" : "Cancel payment"}</button>}
-                {p.ready_to_send && !txid && (
+                {(p.can_send || sending) && !settled && (
                   <button
-                    onClick={(event) => { sendButtonRef.current = event.currentTarget; setConfirming(p.attempt); setErr(null); }}
-                    disabled={sending || confirming === p.attempt}
+                    onClick={() => send(p.attempt)}
+                    disabled={sending}
                     className="btn-primary flex-1 rounded-full px-4 py-2 text-sm disabled:opacity-60"
                   >
-                    {sending ? "Sending…" : "Review & send"}
+                    {sending ? "Sending…" : p.phase === "broadcast" ? "Send again" : "Send now"}
                   </button>
                 )}
                 {txid && (
@@ -2013,17 +2015,14 @@ function History({
                     aria-label={`Copy transaction ID ${txid}`}
                     className="btn-glass min-w-0 flex-1 rounded-2xl px-3 py-2 text-center font-mono text-xs leading-relaxed text-mint [overflow-wrap:anywhere]"
                   >
-                    {verified[p.attempt] || p.phase === "confirmed"
+                    {confirmed
                       ? `✓ Confirmed${p.mined_height ? ` · block ${p.mined_height.toLocaleString()}` : ""}`
-                      : "Awaiting confirmation"} · {short(txid, 8, 6)} ⧉
+                      : p.phase === "signed" ? "Not sent yet" : "Awaiting confirmation"} · {short(txid, 8, 6)} ⧉
                   </button>
                 )}
               </div>
-              {confirming === p.attempt && <BroadcastConfirmation key={p.attempt} vault={vault.vault} attempt={p.attempt}
-                busy={finishing === p.attempt} error={err}
-                onConfirm={() => finish(p.attempt)}
-                onCancel={() => { setConfirming(null); setErr(null); requestAnimationFrame(() => sendButtonRef.current?.focus()); }} />}
-              {txid && (verified[p.attempt] || p.phase === "confirmed") && (
+              {p.can_replace && <ReplacePanel vault={vault} payment={p} onStarted={onReview} />}
+              {txid && confirmed && (
                 <p className="mt-1.5 text-center text-[11px] text-muted">
                   Confirmed on-chain by your wallet{p.mined_height ? ` at block ${p.mined_height.toLocaleString()}` : ""}.{" "}
                   <a href={`https://testnet.zecblock.com/tx/${txid}`} target="_blank" rel="noreferrer" className="text-mint underline">View on ZecBlock ↗</a>. Tap the id to copy.

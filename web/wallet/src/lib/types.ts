@@ -42,16 +42,25 @@ export type CeremonyStatus = {
   threshold: number;
 };
 
+/** The stuck payment a replacement request replaces; it spends the same note. */
+export type Replaces = { attempt: string; cancel: boolean };
+
 export type Payment = {
   attempt: string;
   phase: string;
+  proposer?: number;
   recipient: string;
   amount_zat: string;
-  ready_to_send: boolean;
   approvals?: number[];
   approval_requested?: boolean;
   can_discard?: boolean;
-  finish_requested?: boolean;
+  // This member holds the signed transaction and can send it, or send it again.
+  can_send?: boolean;
+  sending?: boolean;
+  // The payment looks stuck: any member may replace it by spending the same note.
+  can_replace?: boolean;
+  replaces?: Replaces | null;
+  replaced_by?: string | null;
   error?: string | null;
   txid?: string | null;
   direction?: "sent" | "received";
@@ -63,8 +72,9 @@ export type Payment = {
 
 export type PaymentSession = {
   phase: string;
-  finish_requested: boolean;
   signatures_received: boolean;
+  txid?: string | null;
+  replaces?: Replaces | null;
   approvals: number[];
   approval_requested: boolean;
   error?: string | null;
@@ -84,4 +94,6 @@ export type PaymentReview = {
   amount_zat: string;
   fee_zat: string;
   memo: string;
+  // The terms of the replaced payment, when this member holds it.
+  replaces?: (Replaces & { phase?: string | null; recipient?: string | null; amount_zat?: string | null }) | null;
 };

@@ -64,5 +64,5 @@ export type RecoveryStatus = { recovery_identity: boolean; recovery_backup: bool
 export function recoveryStatus(vault: string): Promise<RecoveryStatus> { return api(`recovery-status?vault=${vault}`); }
 export function recoverySetup(): Promise<{ words: string }> { return api("recovery-setup", {}); }
 export function recoveryRestore(vault: string, words: string): Promise<{ restored: boolean }> { return api("recovery-restore", { vault, words }); }
-export type PendingApproval = { attempt: string; amount_zat: string; recipient: string; proposer: number };
+export type PendingApproval = { attempt: string; amount_zat: string; recipient: string; proposer: number; replaces?: { attempt: string; cancel: boolean } | null };
 export function pendingApprovals(vault: string): Promise<{ pending: PendingApproval[] }> { return api(`pending?vault=${vault}`); }

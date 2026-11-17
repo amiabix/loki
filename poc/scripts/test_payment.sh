@@ -179,14 +179,15 @@ wait_for 'signing group [1,3]' 60 proposer_has "$attempt" '.signers == [1,3]'
 wait_for 'member 2 is not selected' 300 has_phase 2 "$attempt" not_selected
 ! pending 2 "$attempt" || fail 'member 2 still lists the request'
 echo "signing group [1,3]; member 2 not_selected and off its pending list"
-wait_for 'signers did not finish' 600 proposer_has "$attempt" '.ready_to_send'
+# The proposer sends on its own once the signatures combine, after sealing a copy to every member.
+wait_for 'proposer did not send' 600 proposer_has "$attempt" '.phase == "broadcast" or .phase == "confirmed"'
 phases "$attempt"
-finished="$(api 1 POST /api/payment-finish "$(pair "$attempt")")" || fail "finish: $finished"
-txid="$(jq -er '.txid' <<<"$finished")" || fail txid
+txid="$(api 1 GET "/api/payments?vault=$vault" | jq -er --arg attempt "$attempt" '.payments[] | select(.attempt == $attempt) | .txid')" || fail txid
 echo "broadcast txid: $txid"
 verified="$(api 1 POST /api/payment-verify "$(jq -nc --arg vault "$vault" --arg attempt "$attempt" --arg txid "$txid" '{vault:$vault,attempt:$attempt,txid:$txid}')")" || fail "verify: $verified"
 jq -e '.phase == "broadcast" or .phase == "confirmed"' <<<"$verified" >/dev/null || fail "verify result: $verified"
-for i in 2 3; do wait_for "member $i hears the broadcast" 60 has_phase "$i" "$attempt" broadcast; done
+member_sent() { api "$1" GET "/api/payments?vault=$vault" | jq -e --arg attempt "$2" --arg txid "$txid" 'any(.payments[]; .attempt == $attempt and .txid == $txid and (.phase == "broadcast" or .phase == "confirmed"))' >/dev/null; }
+for i in 2 3; do wait_for "member $i holds the sent transaction" 60 member_sent "$i" "$attempt"; done
 phases "$attempt"
 
 echo "== cancel: member 1 cancels its request after member 2 approved"
