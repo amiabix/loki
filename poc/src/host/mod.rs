@@ -7,6 +7,7 @@ mod ceremony;
 mod custody;
 mod device;
 mod payment;
+mod native_config;
 mod nonce_witness;
 mod recovery;
 mod registration;
@@ -17,6 +18,7 @@ mod state;
 
 pub use state::Config;
 pub use registration::RegistrationConfig;
+pub use native_config::{Deployment, NativeConfig};
 #[cfg(feature = "relay-communication")]
 pub use nonce_witness::WitnessConfig;
 

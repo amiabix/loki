@@ -5,6 +5,27 @@ func loki_member_app_pair(_ launch: UnsafePointer<CChar>, _ pass: UnsafeMutableP
     _ notify: @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Void,
     _ approve: @convention(c) (UnsafePointer<CChar>?) -> Int32) -> Int32
 
+@_silgen_name("loki_member_app_configuration")
+func loki_member_app_configuration(_ launch: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
+
+@_silgen_name("loki_member_app_free")
+func loki_member_app_free(_ value: UnsafeMutablePointer<CChar>?)
+
+/// The configuration this launch would run with (`{"config": ...}`), or why it cannot start
+/// (`{"error": ...}`). Reads the saved configuration or asks the coordinator, so call it off
+/// the main thread.
+private func nativeConfiguration(_ launch: [String: Any]) -> [String: Any] {
+    guard let json = try? JSONSerialization.data(withJSONObject: launch), let request = String(data: json, encoding: .utf8) else {
+        return ["error": "invalid launch"]
+    }
+    let reply = request.withCString { loki_member_app_configuration($0) }
+    defer { loki_member_app_free(reply) }
+    guard let reply = reply,
+          let parsed = try? JSONSerialization.jsonObject(with: Data(String(cString: reply).utf8)) as? [String: Any]
+    else { return ["error": "invalid configuration reply"] }
+    return parsed
+}
+
 @_silgen_name("loki_signer_approval_selftest")
 func loki_signer_approval_selftest(_ approve: @convention(c) (UnsafePointer<CChar>?) -> Int32) -> Int32
 
@@ -113,27 +134,62 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
     }
 
     func start(_ link: String?) {
-        let alert = NSAlert()
         if running || prompting {
+            let alert = NSAlert()
             alert.messageText = "This signer is already running"
             alert.informativeText = "Quit to lock it before opening another pairing link."
             alert.runModal()
             return
         }
-        prompting = true
-        defer { prompting = false }
+        var launch: [String: Any] = ["args": args]
+        var slot = ""
         // Rust validates the complete URL again before touching the coordinator.
         if let link = link {
             guard let parts = URLComponents(string: link), parts.scheme == "loki", parts.host == "pair",
-                let origin = parts.queryItems?.first(where: { $0.name == "origin" })?.value,
-                let slot = parts.queryItems?.first(where: { $0.name == "slot" })?.value else {
+                parts.queryItems?.first(where: { $0.name == "origin" })?.value != nil,
+                let value = parts.queryItems?.first(where: { $0.name == "slot" })?.value else {
+                let alert = NSAlert()
                 alert.messageText = "Invalid pairing link"; alert.runModal(); return
             }
+            slot = value
+            launch["pairing_url"] = link
+        }
+        prompting = true
+        // A pairing link, or an unlock with nothing saved, asks the coordinator; keep the UI live.
+        DispatchQueue.global(qos: .userInitiated).async {
+            let reply = nativeConfiguration(launch)
+            DispatchQueue.main.async { self.confirm(link: link, slot: slot, launch: launch, reply: reply) }
+        }
+    }
+
+    /// Shows the configuration before anything is saved; the member continues with exactly it.
+    private func confirm(link: String?, slot: String, launch: [String: Any], reply: [String: Any]) {
+        defer { prompting = false }
+        let alert = NSAlert()
+        guard let config = reply["config"] as? [String: Any] else {
+            alert.messageText = "Signer could not start"
+            alert.informativeText = reply["error"] as? String ?? "unknown error"
+            alert.runModal()
+            return
+        }
+        let text = { (key: String) in config[key] as? String ?? "none" }
+        let witnesses = (config["nonce_witnesses"] as? [String])?.joined(separator: "\n  ") ?? "none"
+        let endpoints = """
+            Coordinator: \(text("coordinator"))
+            Network: \(text("network"))
+            frostd: \(text("frostd_url"))
+            lightwalletd: \(text("lightwalletd_url"))
+            Nonce witnesses:
+              \(witnesses)
+
+            The coordinator above chose these endpoints, except any you set with launch flags.
+            """
+        if link != nil {
             alert.messageText = "Pair this device with slot \(slot)?"
-            alert.informativeText = "Coordinator: \(origin)\nOnly continue if this is the coordinator you intended. Create or unlock your local profile below."
+            alert.informativeText = "\(endpoints)\nOnly continue if this is the coordinator you intended. Create or unlock your local profile below."
         } else {
             alert.messageText = "Unlock your paired signer"
-            alert.informativeText = "For a new device, cancel and open a pairing link from the wallet. Your passphrase stays in this app."
+            alert.informativeText = "\(endpoints)\nFor a new device, cancel and open a pairing link from the wallet. Your passphrase stays in this app."
         }
         let password = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 420, height: 26))
         password.placeholderString = "Local profile passphrase"
@@ -141,10 +197,11 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         alert.addButton(withTitle: link == nil ? "Unlock" : "Pair")
         alert.addButton(withTitle: "Cancel")
         alert.window.initialFirstResponder = password
+        NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn, !password.stringValue.isEmpty else { return }
-        var launch: [String: Any] = ["args": args]
-        if let link = link { launch["pairing_url"] = link }
-        guard let json = try? JSONSerialization.data(withJSONObject: launch), let request = String(data: json, encoding: .utf8) else { return }
+        var confirmed = launch
+        confirmed["config"] = config
+        guard let json = try? JSONSerialization.data(withJSONObject: confirmed), let request = String(data: json, encoding: .utf8) else { return }
         var secret = Array(password.stringValue.utf8CString)
         password.stringValue = ""
         running = true

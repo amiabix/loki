@@ -18,6 +18,10 @@
 //                         JSON file a native member takes with --nonce-witnesses. Without it
 //                         the browser signer refuses to sign. NOTE: each entry's mailbox
 //                         `read` capability is served to every page load of this origin.
+//   LOKI_NETWORK          the deployment's network, testnet (default) or regtest; mainnet is
+//                         refused. Served for the native signer (LokiSigner), which reads this
+//                         config through the wallet's /api/signer-config.
+//   LOKI_LIGHTWALLETD_URL the lightwalletd the native signer syncs from (served the same way)
 //   LOKI_SIGNER_PORT      listen port (default 3002)
 import { createServer } from "node:http";
 import { createHash } from "node:crypto";
@@ -31,6 +35,9 @@ const walletOrigin = new URL(process.env.LOKI_WALLET_ORIGIN || "http://localhost
 const frostdUrl = process.env.LOKI_FROSTD_URL || "";
 const rpId = process.env.LOKI_RP_ID || "";
 const ceremonyOrigins = process.env.LOKI_CEREMONY_ORIGINS || "http://127.0.0.1:* http://localhost:*";
+const network = process.env.LOKI_NETWORK || "testnet";
+if (network !== "testnet" && network !== "regtest") throw new Error(`LOKI_NETWORK must be testnet or regtest, not ${network}`);
+const lightwalletdUrl = process.env.LOKI_LIGHTWALLETD_URL || "";
 // Native `[WitnessConfig; 2]` (byte arrays) → hex for the page; empty when unset.
 const hex = (bytes) => Buffer.from(bytes).toString("hex");
 const nonceWitnesses = process.env.LOKI_NONCE_WITNESSES
@@ -66,7 +73,8 @@ if (process.argv.includes("--hash")) {
   console.log(JSON.stringify(build, null, 2));
   process.exit(0);
 }
-bundle.set("/config.json", Buffer.from(JSON.stringify({ walletOrigin, frostdUrl, rpId, nonceWitnesses })));
+// Outside the hashed bundle: deployment values do not change the published build hash.
+bundle.set("/config.json", Buffer.from(JSON.stringify({ walletOrigin, frostdUrl, rpId, nonceWitnesses, network, lightwalletdUrl })));
 bundle.set("/build-hash.json", Buffer.from(JSON.stringify(build)));
 
 // Strict CSP on every response (the page, the Worker script and its imports all get it).
