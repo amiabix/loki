@@ -16,6 +16,11 @@ import {
   logout,
   pairDevice,
   pendingApprovals,
+  exportRecoveryBackup,
+  removeBrowserSigner,
+  restoreSigner,
+  setupBrowserRecovery,
+  signerKind,
   recoveryRestore,
   recoverySetup,
   recoveryStatus,
@@ -570,6 +575,20 @@ function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string 
         </div>
       )}
 
+      {!unlocking && (
+        // A fresh browser: rebuild a vault member from its 24 words and backup file, entered on
+        // the signer page, sealed under the passkey or passphrase chosen above.
+        <button className="mt-3 min-h-11 w-full text-sm text-mint" disabled={busy}
+          onClick={async () => {
+            setBusy(true); setErr(null);
+            try { await restoreSigner({ name: name.trim() || "You", method: mode === "passphrase" ? "passphrase" : "platform" }); onLoggedIn(); }
+            catch (e) { setErr((e as Error).message); }
+            finally { setBusy(false); }
+          }}>
+          Restore from recovery words and a backup file
+        </button>
+      )}
+
       <ErrMsg msg={err ?? notice} />
 
       <button className="mt-5 min-h-11 w-full text-xs text-muted hover:text-mint"
@@ -688,7 +707,36 @@ function Home({
           Join vault
         </Btn>
       </div>
+      {signerKind() === "browser" && <BrowserSignerRecovery />}
     </div>
+  );
+}
+
+// The in-browser signer's recovery words and removal. Both run on the signer page: it shows
+// the words once and checks three of them, and it asks before deleting anything.
+function BrowserSignerRecovery() {
+  const [hasWords, setHasWords] = useState<boolean | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  useEffect(() => {
+    recoveryStatus("").then((s) => setHasWords(s.recovery_identity)).catch((e) => setErr((e as Error).message));
+  }, []);
+  const run = async (fn: () => Promise<unknown>) => {
+    setBusy(true); setErr(null);
+    try { await fn(); } catch (e) { setErr((e as Error).message); } finally { setBusy(false); }
+  };
+  return (
+    <section className="mt-6 space-y-3">
+      <h3 className="eyebrow">Recovery</h3>
+      <p className="text-xs text-muted">
+        {hasWords
+          ? "Your 24 recovery words are set. Each vault's backup is sealed to them; download it from the vault."
+          : "Set up 24 recovery words. You need them, and each vault's backup file, to restore this signer in another browser."}
+      </p>
+      {hasWords === false && <Btn disabled={busy} onClick={() => run(async () => { await setupBrowserRecovery(); setHasWords(true); })}>Set up recovery words</Btn>}
+      <Btn variant="ghost" disabled={busy} onClick={() => run(async () => { await removeBrowserSigner(); window.location.reload(); })}>Remove signer from this browser</Btn>
+      <ErrMsg msg={err} />
+    </section>
   );
 }
 
@@ -1473,8 +1521,30 @@ function VaultOverview({
         <Btn variant="ghost" onClick={onHistory}>History</Btn>
       </div>
 
-      <RecoveryCard vault={vault.vault} />
+      {signerKind() === "browser" ? <BrowserBackupCard vault={vault.vault} /> : <RecoveryCard vault={vault.vault} />}
     </div>
+  );
+}
+
+// Download this vault's recovery backup from the in-browser signer: ciphertext only the 24
+// words open, saved on the signer page (the wallet sees the same opaque bytes).
+function BrowserBackupCard({ vault }: { vault: string }) {
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const save = async () => {
+    setBusy(true); setErr(null);
+    try { await exportRecoveryBackup(vault); setDone(true); }
+    catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  };
+  return (
+    <GlassCard className="mt-4">
+      <h3 className="eyebrow mb-2">Recovery backup</h3>
+      <p className="mb-3 text-xs text-muted">Keep this file with your 24 recovery words. Together they restore your share in a new browser.</p>
+      <Btn variant="ghost" disabled={busy} onClick={save}>{busy ? "Waiting for the signer…" : done ? "Download again" : "Download recovery backup"}</Btn>
+      <ErrMsg msg={err} />
+    </GlassCard>
   );
 }
 

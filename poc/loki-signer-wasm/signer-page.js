@@ -260,17 +260,23 @@ async function recoveryExport({ vault }) {
 }
 
 // Restore a vault member into this (fresh) browser from its words and backup file.
-async function restore({ vault, name, method }) {
+// The backup is opaque ciphertext, so the wallet may hand it over (`backup`, hex, with its
+// `vault`), e.g. one the member kept with the coordinator; otherwise the member picks the file.
+async function restore({ vault, name, method, backup }) {
   const words = el("textarea", { autocomplete: "off", spellcheck: false, rows: 4 });
   const file = el("input", { type: "file" });
+  const given = typeof backup === "string" && /^([0-9a-f]{2})+$/.test(backup) && /^[0-9a-f]{64}$/.test(vault ?? "");
   const input = await prompt("Restore your signer", [
     el("label", { textContent: "Your 24 recovery words" }, words),
-    el("label", { textContent: "The vault's recovery backup file" }, file),
+    given ? el("p", { className: "mono", textContent: `Backup for vault ${vault.slice(0, 16)}… provided by the wallet` })
+      : el("label", { textContent: "The vault's recovery backup file" }, file),
   ], [cancelButton, { label: "Continue", run: async () => {
+    const typed = words.value.trim().toLowerCase().split(/\s+/).join(" ");
+    if (given) return { vaultHex: vault, words: typed, blob: fromHex(backup) };
     const f = file.files[0];
     const vaultHex = vault || f?.name.match(/[0-9a-f]{64}/)?.[0];
     if (!f || !vaultHex) throw new SignerError("Choose the loki-recovery-<vault>.bin file you saved.", 400);
-    return { vaultHex, words: words.value.trim().toLowerCase().split(/\s+/).join(" "), blob: new Uint8Array(await f.arrayBuffer()) };
+    return { vaultHex, words: typed, blob: new Uint8Array(await f.arrayBuffer()) };
   } }]);
   name = String(name || "You");
   const result = await newCustody(name, method, (secret) => call({ op: "restore", method, name, ...input, ...secret }));
@@ -408,11 +414,12 @@ const ops = {
   vaults: () => call({ op: "vaults" }),
   address: (p) => call({ op: "address", payment: p }),
   "recovery-setup": recoverySetup,
+  "recovery-status": async () => ({ recovery_identity: await call({ op: "has-recovery" }) }),
   "recovery-export": recoveryExport,
   restore,
   remove,
 };
-const UNLOCKED = new Set(["join", "payment-review", "payment-approve", "pending", "vaults", "address", "recovery-setup", "recovery-export"]);
+const UNLOCKED = new Set(["join", "payment-review", "payment-approve", "pending", "vaults", "address", "recovery-setup", "recovery-export", "recovery-status"]);
 // Ops that may show a prompt run one at a time; the read-only ones answer alongside them
 // (the Worker refuses them with "busy" while a join or payment holds the vault).
 const PROMPTING = new Set(["create", "unlock", "join", "payment-approve", "recovery-setup", "recovery-export", "restore", "remove"]);

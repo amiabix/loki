@@ -19,3 +19,5 @@ button.ghost { background: transparent; color: var(--fg); border-color: var(--li
 button:disabled { opacity: .5; cursor: default; }
 #error { color: #d33; min-height: 1em; font-size: 13px; }
 .warn { color: #b7791f; font-size: 13px; }
+textarea { display: block; width: 100%; margin-top: 4px; padding: 10px 12px; font: 13px ui-monospace, monospace; color: var(--fg); background: transparent; border: 1px solid var(--line); border-radius: 8px; }
+input[type="checkbox"] { display: inline; width: auto; margin: 0 6px 0 0; }

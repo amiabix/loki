@@ -114,5 +114,24 @@ export type RecoveryStatus = { recovery_identity: boolean; recovery_backup: bool
 export function recoveryStatus(vault: string): Promise<RecoveryStatus> { return api(`recovery-status?vault=${vault}`); }
 export function recoverySetup(): Promise<{ words: string }> { return api("recovery-setup", {}); }
 export function recoveryRestore(vault: string, words: string): Promise<{ restored: boolean }> { return api("recovery-restore", { vault, words }); }
+
+// The in-browser signer's recovery. The words are shown, re-typed and entered only on the
+// signer page; the wallet sees public results and the opaque backup ciphertext.
+function browserOnly(): void {
+  if (paired()) throw new ApiError("This tab uses a native member; recover it in the member app", 400);
+}
+/** Show the 24 words once on the signer page and confirm three of them. */
+export async function setupBrowserRecovery(): Promise<{ recovery: boolean }> { browserOnly(); return signer.request("recovery-setup", {}); }
+/** Download this vault's recovery backup on the signer page (ciphertext only the words open). */
+export async function exportRecoveryBackup(vault: string): Promise<{ backup: string }> { browserOnly(); return signer.request("recovery-export", { vault }); }
+/** Fresh browser: restore a vault member from its words (typed on the signer page) and its backup:
+ *  the file the member picks there, or `backup` (hex ciphertext) + `vault` the wallet already holds. */
+export async function restoreSigner(opts: CreateSignerOpts & { vault?: string; backup?: string }): Promise<SignerSession> { browserOnly(); return signer.request("restore", opts); }
+/** Delete this browser's signer after the member confirms the backups are exported. */
+export async function removeBrowserSigner(): Promise<void> {
+  browserOnly();
+  await signer.request("remove", {});
+  forgetSession();
+}
 export type PendingApproval = { attempt: string; amount_zat: string; recipient: string; proposer: number; replaces?: { attempt: string; cancel: boolean } | null };
 export function pendingApprovals(vault: string): Promise<{ pending: PendingApproval[] }> { return api(`pending?vault=${vault}`); }
