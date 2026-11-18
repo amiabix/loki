@@ -824,6 +824,21 @@ pub fn valid_witness_pins(pins: WitnessPins) -> bool {
             .all(|(key, run, mailbox)| *key != [0; 32] && *run != [0; 32] && *mailbox != [0; 32])
 }
 
+/// The witness claim ID of one member's nonce: bound to the vault, the member and the
+/// nonce's public commitment, so each nonce can be claimed exactly once.
+pub fn nonce_claim_id(
+    vault: &[u8; 32],
+    member: &frost::Identifier,
+    commitment: &frost::round1::SigningCommitments,
+) -> Result<[u8; 32], String> {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"Loki_nonce_cid_v1\0");
+    hash.update(vault);
+    hash.update(&member.serialize());
+    hash.update(&commitment.serialize().map_err(|e| e.to_string())?);
+    Ok(hash.finalize().into())
+}
+
 /// Implementations must verify fresh signed receipts from two fixed, distinct relay
 /// identities. Operators must be checked separately. A duplicate claim is a refusal.
 pub trait NonceWitness {
@@ -1258,13 +1273,7 @@ impl SigningSession {
                     "spend {i}: own nonce differs from reviewed package"
                 ));
             }
-            let raw = own_commitment.serialize().map_err(|e| e.to_string())?;
-            let mut hash = blake3::Hasher::new();
-            hash.update(b"Loki_nonce_cid_v1\0");
-            hash.update(&self.context.vault);
-            hash.update(&self.live.own_id.serialize());
-            hash.update(&raw);
-            let cid: [u8; 32] = hash.finalize().into();
+            let cid = nonce_claim_id(&self.context.vault, &self.live.own_id, own_commitment)?;
             let mut record = Vec::new();
             record.extend_from_slice(&cid);
             record.extend_from_slice(&candidate_hash);

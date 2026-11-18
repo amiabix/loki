@@ -122,9 +122,14 @@ impl NonceStore {
         }
         let (nonces, commitment) =
             frost::round1::commit(signing_share, &mut rand_core::OsRng);
-        let serialized = nonces
-            .serialize()
-            .map_err(|e| NonceError::Other(e.to_string()))?;
+        // The serialized secret nonce is as sensitive as the share once a partial exists:
+        // wipe it after sealing (`SigningNonces` itself zeroizes on drop).
+        let serialized = zeroize::Zeroizing::new(
+            nonces
+                .serialize()
+                .map_err(|e| NonceError::Other(e.to_string()))?,
+        );
+        drop(nonces);
         // Seal the secret nonce with the same at-rest hierarchy as the share, STAMPED with
         // the current epoch so a restore (which bumps the epoch) refuses this nonce.
         let sealed = SealedShare::seal(se, self.epoch, &serialized).map_err(NonceError::Other)?;

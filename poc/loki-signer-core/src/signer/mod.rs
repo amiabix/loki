@@ -21,7 +21,7 @@ pub mod device_auth;
 pub(crate) mod durable;
 pub mod local;
 #[cfg(any(test, all(feature = "apple-enclave", target_os = "macos")))]
-pub(crate) mod native_member;
+pub mod native_member;
 pub mod nonce;
 pub mod recovery;
 pub mod repair;

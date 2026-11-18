@@ -55,6 +55,9 @@ pub(super) fn backup_file(signer_dir: &Path) -> PathBuf {
 /// restore_vault_from_backup`]). Called at vault activation. A no-op (not an error) when no
 /// recovery identity is established, when `backup.sealed` is absent, or when the recovery
 /// backup already exists — so it is safe to call idempotently.
+///
+/// Once the recovery backup is written, `backup.sealed` is deleted: it is a copy of the share
+/// under the profile passphrase alone, which the device-bound store must not have beside it.
 pub(super) fn seal_vault_backup(
     data: &Path,
     signer_dir: &Path,
@@ -66,7 +69,7 @@ pub(super) fn seal_vault_backup(
     };
     let target = backup_file(signer_dir);
     if target.exists() {
-        return Ok(());
+        return drop_passphrase_backup(signer_dir);
     }
     let sealed = match MemberDir::open(signer_dir, "").read_sealed("backup.sealed", pass) {
         Ok(bytes) => bytes,
@@ -75,7 +78,25 @@ pub(super) fn seal_vault_backup(
     };
     let material = backup::verify(&BackupArtifact(sealed), pass, vault_id)?;
     let artifact = backup::create_to_recovery(&material, &recovery_pub)?;
-    fs::write(&target, &artifact.0).map_err(|e| e.to_string())
+    // Written whole before the passphrase copy goes, so a crash never leaves neither.
+    let temp = signer_dir.join(format!(".recovery.backup.{}.tmp", uuid::Uuid::new_v4()));
+    fs::File::create(&temp)
+        .and_then(|mut f| f.write_all(&artifact.0).and_then(|_| f.sync_all()))
+        .and_then(|_| fs::rename(&temp, &target))
+        .and_then(|_| fs::File::open(signer_dir)?.sync_all())
+        .map_err(|e| {
+            let _ = fs::remove_file(&temp);
+            e.to_string()
+        })?;
+    drop_passphrase_backup(signer_dir)
+}
+
+/// Delete the passphrase-only `backup.sealed` copy of the share, if present.
+pub(super) fn drop_passphrase_backup(signer_dir: &Path) -> Result<(), String> {
+    match fs::remove_file(signer_dir.join("backup.sealed")) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!("remove backup.sealed: {e}")),
+        _ => Ok(()),
+    }
 }
 
 /// Seal the missing recovery backup of every active vault. Vaults that became active before

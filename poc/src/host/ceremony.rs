@@ -31,8 +31,7 @@ use crate::{
     signer::{
         backup::BackupArtifact,
         coordination::{member_dkg_step, redeliver_dkg, relay_dkg},
-        local::{BackupDevice, DevicePrompts, LocalSigner, RosterDecision, SignerError},
-        secure_element::SoftwareSecureElement,
+        local::{ApprovalPolicy, BackupDevice, DevicePrompts, LocalSigner, RosterDecision, SignerError},
         Network, Signer,
     },
     state::MemberDir,
@@ -64,6 +63,18 @@ impl BackupDevice for HostedBackup {
             .read_sealed("backup.sealed", &self.pass)
             .map(BackupArtifact)
             .map_err(|e| e.to_string())
+    }
+}
+
+/// The hosted member's device prompts. The hosted flow already required the member's roster
+/// agreement, and payment approval goes to `approval` (the member's native decision).
+pub(super) fn hosted_prompts(signer_dir: &Path, pass: &str, approval: ApprovalPolicy) -> DevicePrompts {
+    DevicePrompts {
+        connect: Box::new(|_, _| true),
+        roster: Box::new(|_| RosterDecision::Match),
+        roster_deadline: Duration::from_secs(60),
+        backup: Box::new(HostedBackup { dir: signer_dir.to_owned(), pass: Zeroizing::new(pass.to_owned()) }),
+        approval,
     }
 }
 
@@ -1004,19 +1015,15 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
         };
         let channel = transport.join(session_id).map_err(|e| e.to_string())?;
         let signer_dir = dir(data, vault_id)?.path().join("signer");
-        let se = SoftwareSecureElement::persistent(&signer_dir, pass)?;
+        // The share is born in the store under the configured element: the Secure Enclave
+        // for `--secure-element apple`, so it never exists under the passphrase alone.
+        let se = st.config.open_secure_element(&signer_dir, pass)?;
         let signer_network = match network {
             VaultNetwork::Regtest => Network::Regtest,
             VaultNetwork::Testnet => Network::Testnet,
         };
-        let prompts = DevicePrompts {
-            connect: Box::new(|_, _| true),
-            // The hosted flow already required this member's roster agreement.
-            roster: Box::new(|_| RosterDecision::Match),
-            roster_deadline: Duration::from_secs(60),
-            backup: Box::new(HostedBackup { dir: signer_dir.clone(), pass: Zeroizing::new(pass.to_owned()) }),
-            approval: Box::new(|_| true),
-        };
+        // DKG never signs a payment; any request still goes to the member, or is refused.
+        let prompts = hosted_prompts(&signer_dir, pass, super::approval_policy(st.approval.clone(), signer_network));
         let mut signer = if signer_dir.join("signer.meta").exists() {
             LocalSigner::open(&signer_dir, se, c.name.clone(), prompts)
         } else {
@@ -1088,11 +1095,12 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
             if log.active() { log.delete().map_err(|e| e.to_string())?; }
         }
         // Keep the frostd session open until the relay's TTL; peers may still be finishing.
-        let (key, public, vault_secret) = signer.hosted_material().map_err(|e| e.to_string())?;
+        // vault.sealed records public metadata only; the share stays in the signer store.
+        let (public, fvk) = signer.hosted_metadata().map_err(|e| e.to_string())?;
         let sealed = vault_sealed_bytes(
             &c.vault, c.my_slot, c.threshold, c.members,
             c.fingerprint.as_deref().ok_or("roster fingerprint missing at activation")?,
-            &key, &public, &vault_secret, birth_height, network,
+            &public, &fvk, birth_height, network,
         )?;
         dir(data, vault_id)?
             .write_sealed("vault.sealed", &sealed, pass)
@@ -1343,7 +1351,7 @@ mod tests {
         std::fs::remove_dir_all(&data).unwrap();
         let sdir = signer_dir(&data, &vault_hex).unwrap();
 
-        let config = Config {
+        let make_config = || Config {
             registration: None,
             data: data.clone(),
             port: 3001,
@@ -1363,6 +1371,7 @@ mod tests {
             peers: BTreeMap::new(),
             loopback_peers: false,
         };
+        let config = make_config();
 
         // Wrong words cannot open the backup, and restore needs the exported blob here.
         let (other, _) = RecoveryKey::generate().unwrap();
@@ -1390,17 +1399,21 @@ mod tests {
 
         // The real words restore a member the payment path can open and sign with.
         restore_vault_from_backup(&data, &vault_hex, &words, Some(&blob), pass, &config).unwrap();
-        crate::host::payment::load_vault(&data, pass, &vault_hex, "regtest")
+        crate::host::payment::load_vault(&AppState::new(make_config()), &data, pass, &vault_hex)
             .expect("the restored member opens for signing");
         // Restore brings the recovery identity: `recovery.pub` holds both public keys of these
         // words, so a later start or recovery setup does not mint a second set.
         assert_eq!(std::fs::read(data.join("recovery.pub")).unwrap(), pubkeys);
         assert!(tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(crate::host::recovery::establish_recovery(&data)).unwrap().is_none());
 
-        // The restored member completes a rerandomized FROST round with member 2 using the key
-        // package the payment path reads from `vault.sealed`; the aggregate verifies.
+        // `vault.sealed` is public metadata only. The restored member completes a rerandomized
+        // FROST round with member 2 using the key package from the signer store, read through
+        // the configured element as the payment path does; the aggregate verifies.
         let sealed: Value = serde_json::from_slice(&dir(&data, &vault_hex).unwrap().read_sealed("vault.sealed", pass).unwrap()).unwrap();
-        let restored = frost::keys::KeyPackage::deserialize(&hex::decode(sealed["key_package"].as_str().unwrap()).unwrap()).unwrap();
+        assert!(sealed.get("key_package").is_none() && sealed.get("vault_secret").is_none());
+        let element = config.open_secure_element(&sdir, pass).unwrap();
+        let (_, stored) = SignerStore::open(&sdir).unwrap().read(&element, FileKind::Share).unwrap().unwrap();
+        let restored = frost::keys::KeyPackage::deserialize(&crate::signer::local::decode_share(&stored).unwrap().0).unwrap();
         let group = frost::keys::PublicKeyPackage::deserialize(&hex::decode(sealed["public_package"].as_str().unwrap()).unwrap()).unwrap();
         let peer = frost::keys::KeyPackage::try_from(shares[&frost::Identifier::try_from(2u16).unwrap()].clone()).unwrap();
         let message = b"restored member signs";
@@ -1441,6 +1454,36 @@ mod tests {
         let ak: [u8; 32] = public.verifying_key().serialize().unwrap().try_into().unwrap();
         zip2005::frost_viewing_key(&ak, &restored_vs)
             .expect("the restored share derives the vault FVK — it can sign for this group");
+
+        // A vault written before device-bound custody carried the share and `vs` in
+        // `vault.sealed`, with a passphrase-sealed `backup.sealed` beside the store.
+        let vdir = dir(&data, &vault_hex).unwrap();
+        let write_legacy = |legacy: &Value| {
+            std::fs::remove_file(vdir.path().join("vault.sealed")).unwrap();
+            vdir.write_sealed("vault.sealed", &serde_json::to_vec(legacy).unwrap(), pass).unwrap();
+        };
+        let mut legacy = sealed.clone();
+        legacy["vault_secret"] = json!(hex::encode(material.group_sk));
+        legacy["key_package"] = json!(hex::encode(peer.serialize().unwrap()));
+        write_legacy(&legacy);
+        MemberDir::open(&sdir, "").write_sealed("backup.sealed", b"passphrase copy", pass).unwrap();
+        // A share in vault.sealed that differs from the store's stops migration, changing nothing.
+        let refused = crate::host::payment::load_vault(&AppState::new(make_config()), &data, pass, &vault_hex);
+        assert!(refused.err().unwrap().contains("different share"));
+        let unchanged: Value = serde_json::from_slice(&vdir.read_sealed("vault.sealed", pass).unwrap()).unwrap();
+        assert_eq!(unchanged, legacy);
+        assert!(sdir.join("backup.sealed").exists());
+        // The same share migrates once: vault.sealed keeps exactly its public metadata, the
+        // passphrase copy goes, the recovery backup stays, and the member still opens.
+        legacy["key_package"] = json!(hex::encode(restored.serialize().unwrap()));
+        write_legacy(&legacy);
+        crate::host::payment::load_vault(&AppState::new(make_config()), &data, pass, &vault_hex)
+            .expect("the migrated member opens for signing");
+        let migrated: Value = serde_json::from_slice(&vdir.read_sealed("vault.sealed", pass).unwrap()).unwrap();
+        assert_eq!(migrated, sealed);
+        assert!(!sdir.join("backup.sealed").exists());
+        assert_eq!(std::fs::read(crate::host::recovery::backup_file(&sdir)).unwrap(), blob);
+        crate::host::payment::load_vault(&AppState::new(make_config()), &data, pass, &vault_hex).unwrap();
 
         std::fs::remove_dir_all(&data).unwrap();
     }
@@ -1512,7 +1555,7 @@ mod tests {
         let vault_hex = hex::encode(vault);
         let pass = "late pass";
         crate::profile::create(&data, pass, "Late").unwrap();
-        dealer_vault(&data, vault, pass);
+        let (material, _, _) = dealer_vault(&data, vault, pass);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let config = crate::host::config_from_args(&[
@@ -1540,8 +1583,14 @@ mod tests {
         let opened = crate::signer::backup::verify_recovery(&BackupArtifact(std::fs::read(&backup).unwrap()), &key, &vault).unwrap();
         assert_eq!(opened.member_id, 1);
 
+        // Sealing it deleted the passphrase-only copy of the share.
+        assert!(!signer_dir(&data, &vault_hex).unwrap().join("backup.sealed").exists());
+
         // Recovery set up while the backup could not be sealed: the next unlock seals it.
         std::fs::remove_file(&backup).unwrap();
+        MemberDir::open(&signer_dir(&data, &vault_hex).unwrap(), "")
+            .write_sealed("backup.sealed", &crate::signer::backup::create(&material, pass).unwrap().0, pass)
+            .unwrap();
         assert_eq!(status().await["recovery_backup"], false);
         call(reqwest::Method::POST, "/api/lock", json!({})).await.unwrap();
         assert!(call(reqwest::Method::POST, "/api/unlock", json!({"passphrase": pass})).await.unwrap().status().is_success());
@@ -1558,8 +1607,9 @@ pub(super) fn signer_dir(data: &Path, vault: &str) -> Result<PathBuf, String> {
 }
 
 /// Build the passphrase-sealed `vault.sealed` payload that `payment::load_vault` reads. DKG
-/// completion and recovery restore both write it through here, so a restored member gets the
-/// same complete file (share and vault secret included) that signing reads.
+/// completion and recovery restore both write it through here. It holds public vault metadata
+/// only: the share and the vault secret stay in the signer store under the configured secure
+/// element (`super::custody`), and the viewing key is never written here.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn vault_sealed_bytes(
     vault: &str,
@@ -1567,9 +1617,8 @@ pub(super) fn vault_sealed_bytes(
     threshold: u16,
     members: u16,
     roster_fingerprint: &str,
-    key: &frost::keys::KeyPackage,
     public: &frost::keys::PublicKeyPackage,
-    vault_secret: &[u8; 32],
+    fvk: &orchard::keys::FullViewingKey,
     birth_height: u32,
     network: VaultNetwork,
 ) -> Result<Zeroizing<Vec<u8>>, String> {
@@ -1579,16 +1628,13 @@ pub(super) fn vault_sealed_bytes(
         .map_err(|e| e.to_string())?
         .try_into()
         .map_err(|_| "group key length")?;
-    let fvk = zip2005::frost_viewing_key(&ak, vault_secret)
-        .map_err(|e| format!("group viewing key: {e:?}"))?;
-    let group_address = vault::unified_address(&fvk, network.network_type());
+    let group_address = vault::unified_address(fvk, network.network_type());
     let sealed = json!({
         "vault": vault, "threshold": threshold, "members": members,
         "roster_fingerprint": roster_fingerprint,
-        "key_package": hex::encode(key.serialize().map_err(|e| e.to_string())?),
         "public_package": hex::encode(public.serialize().map_err(|e| e.to_string())?),
         "my_frost_id": slot, "group_address": group_address,
-        "group_ak": hex::encode(ak), "vault_secret": hex::encode(vault_secret),
+        "group_ak": hex::encode(ak),
         "birth_height": birth_height, "key_derivation": zip2005::VERSION,
         "network": network.label(),
     });
@@ -1688,9 +1734,13 @@ pub(super) fn restore_vault_from_backup(
     // The ceremony records the relay roster's fingerprint, not the setup document's.
     let fingerprint = hex::encode(roster_of(&ceremony)?.fingerprint());
     ceremony.fingerprint = Some(fingerprint.clone());
+    let ak: [u8; 32] = pp.verifying_key().serialize().map_err(|e| e.to_string())?
+        .try_into().map_err(|_| "group key length")?;
+    let fvk = zip2005::frost_viewing_key(&ak, &material.group_sk)
+        .map_err(|e| format!("group viewing key: {e:?}"))?;
     let bytes = vault_sealed_bytes(
         vault, material.member_id, material.threshold, material.members, &fingerprint,
-        &kp, &pp, &material.group_sk,
+        &pp, &fvk,
         // Regtest vaults are born at height 2 (`setup_birth_height`); Testnet backups carry theirs.
         material.birth_height.unwrap_or(2), network,
     )?;

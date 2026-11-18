@@ -23,7 +23,7 @@
 use crate::dkg_core::{DkgCore, DkgPhase, DkgState};
 use crate::member_state::{Roster, ValidatedRoster};
 use crate::setup_transport::{DkgWire, DkgWireKind, Identity, PublicIdentity};
-use crate::signing_session::{MessageKind, SessionContext};
+use crate::signing_session::{MessageKind, NonceWitness, SessionContext};
 use crate::signer::backup::{self, BackupArtifact, BackupMaterial};
 use crate::signer::nonce::NonceStore;
 use crate::signer::secure_element::{SealedShare, SecureElement};
@@ -359,6 +359,8 @@ pub struct LocalSigner<SE: SecureElement> {
     nonces: NonceStore,
     approval: ApprovalPolicy,
     connect_approval: Option<ConnectApproval>,
+    /// External nonce witnesses claimed before each fresh signature share is released.
+    nonce_witness: Option<Box<dyn NonceWitness + Send>>,
     roster_confirmation: Option<RosterConfirmation>,
     roster_deadline: Duration,
     backup_device: Option<Box<dyn BackupDevice>>,
@@ -404,6 +406,7 @@ impl<SE: SecureElement> LocalSigner<SE> {
             nonces,
             approval,
             connect_approval: None,
+            nonce_witness: None,
             roster_confirmation: None,
             roster_deadline: Duration::ZERO,
             backup_device: None,
@@ -665,18 +668,9 @@ impl<SE: SecureElement> LocalSigner<SE> {
         self.public_package.as_deref()
     }
 
-    /// Material for the hosted vault's existing sealed file after every receipt arrived.
-    pub fn hosted_material(&self) -> Result<(frost::keys::KeyPackage, frost::keys::PublicKeyPackage, Zeroizing<[u8; 32]>), SignerError> {
-        self.require_ready()?;
-        let setup = self.setup.as_ref().ok_or(SignerError::NotReady)?;
-        let public = frost::keys::PublicKeyPackage::deserialize(
-            self.public_package.as_deref().ok_or(SignerError::NoShare)?
-        ).map_err(|e| SignerError::Other(e.to_string()))?;
-        Ok((self.open_key()?, public, Zeroizing::new(*setup.core.vault_secret())))
-    }
-
     /// Public vault metadata (group public-key package + full viewing key) for an active
-    /// signer, without touching the sealed share. Used by the native member serve path.
+    /// signer, without touching the sealed share. The hosted member records it in
+    /// `vault.sealed` and scans with it; the share itself never leaves the signer.
     pub fn hosted_metadata(&self) -> Result<(frost::keys::PublicKeyPackage, FullViewingKey), SignerError> {
         self.require_ready()?;
         let public = frost::keys::PublicKeyPackage::deserialize(
@@ -778,6 +772,13 @@ impl<SE: SecureElement> LocalSigner<SE> {
         saved
     }
 
+    /// Require a claim at both external nonce witnesses before every fresh signature share:
+    /// a nonce whose claim is refused or already taken (for example after the local nonce
+    /// files were rolled back) never signs. The local durable burn record still applies.
+    pub fn set_nonce_witness(&mut self, witness: Box<dyn NonceWitness + Send>) {
+        self.nonce_witness = Some(witness);
+    }
+
     /// Give this signer the vault notes it may spend. These are scanned member-side with
     /// this signer's own fvk (`wallet_store::sync_member_wallet`); they never cross the
     /// coordinator seam. The proposer signer selects from them in `build_candidate`.
@@ -810,12 +811,17 @@ impl<SE: SecureElement> LocalSigner<SE> {
         self.vault_fvk.as_ref().ok_or(SignerError::NoShare)
     }
 
-    /// Unseal the member's `KeyPackage` into memory. Caller drops it promptly.
+    /// Unseal the member's `KeyPackage` into memory (with the Apple element, one Secure
+    /// Enclave unwrap). The unwrapped bytes are a `Zeroizing` buffer wiped when this returns;
+    /// the returned `KeyPackage` wipes its signing share on drop (`ZeroizeOnDrop`), so
+    /// callers drop it as soon as its one use is done. It is never stored on the signer.
     fn open_key(&self) -> Result<frost::keys::KeyPackage, SignerError> {
         let sealed = self.sealed_share.as_ref().ok_or(SignerError::NoShare)?;
         let plain = sealed.open(&self.se).map_err(SignerError::Other)?;
-        frost::keys::KeyPackage::deserialize(&plain)
-            .map_err(|e| SignerError::Other(format!("key package: {e}")))
+        let key = frost::keys::KeyPackage::deserialize(&plain)
+            .map_err(|e| SignerError::Other(format!("key package: {e}")));
+        drop(plain);
+        key
     }
 
     fn nonce_id(&self, cand: &CandidateRef) -> String {
@@ -1467,11 +1473,12 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
             return Err(SignerError::NoSession);
         }
         self.require_ready()?;
-        let kp = self.open_key()?;
         let id = self.nonce_id(cand);
-        self.nonces
-            .commit(&id, &self.se, kp.signing_share())
-            .map_err(|e| SignerError::Other(e.to_string()))
+        // Round 1 needs the share to derive the nonce; the key lives only for this call.
+        let kp = self.open_key()?;
+        let commitment = self.nonces.commit(&id, &self.se, kp.signing_share());
+        drop(kp);
+        commitment.map_err(|e| SignerError::Other(e.to_string()))
     }
 
     fn sign_approve(
@@ -1513,16 +1520,43 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
         let seed: [u8; 32] = randomizer
             .try_into()
             .map_err(|_| SignerError::Other("randomizer seed is not 32 bytes".into()))?;
-        let kp = self.open_key()?;
         let id = self.nonce_id(cand);
-        self.nonces
-            .sign_and_burn(&id, &self.se, pkg, &kp, &seed, &|| false)
-            .map_err(|e| match e {
-                crate::signer::nonce::NonceError::Reuse => {
-                    SignerError::Other(crate::signer::nonce::NonceError::Reuse.to_string())
-                }
-                other => SignerError::Other(other.to_string()),
-            })
+        // 5. External anti-rollback: claim this committed nonce at both witnesses before any
+        //    share can leave. A burned nonce only replays its recorded partial (or refuses
+        //    reuse) and a missing one cannot sign, so neither is claimed.
+        if let Some(witness) = self.nonce_witness.as_mut() {
+            if self.nonces.state(&id) == crate::signer::nonce::NonceState::Committed {
+                let member = frost::Identifier::try_from(self.member_id)
+                    .map_err(|e| SignerError::Other(e.to_string()))?;
+                let commitment = pkg
+                    .signing_commitments()
+                    .get(&member)
+                    .ok_or_else(|| SignerError::Other("own commitment absent".into()))?;
+                let cid = crate::signing_session::nonce_claim_id(&self.vault_id, &member, commitment)
+                    .map_err(SignerError::Other)?;
+                // The witness stores only a digest of what the nonce signs: no sighash or
+                // randomizer reaches the relay operators.
+                let mut digest = blake3::Hasher::new();
+                digest.update(b"Loki_hosted_nonce_use_v1\0");
+                digest.update(&local_sighash);
+                digest.update(&seed);
+                let mut record = cid.to_vec();
+                record.extend_from_slice(digest.finalize().as_bytes());
+                witness
+                    .claim(cid, &record)
+                    .map_err(|e| SignerError::Other(format!("nonce witness refused: {e}")))?;
+            }
+        }
+        let kp = self.open_key()?;
+        let share = self.nonces.sign_and_burn(&id, &self.se, pkg, &kp, &seed, &|| false);
+        // The key is wiped here, before the partial leaves this call.
+        drop(kp);
+        share.map_err(|e| match e {
+            crate::signer::nonce::NonceError::Reuse => {
+                SignerError::Other(crate::signer::nonce::NonceError::Reuse.to_string())
+            }
+            other => SignerError::Other(other.to_string()),
+        })
     }
 
     fn rendered_payment(
@@ -1768,6 +1802,75 @@ pub(crate) mod tests {
             .sign_approve(&session, &cand, &pczt, &good_pkg, &seed)
             .expect("matching sighash must sign");
         assert_eq!(share.serialize().len(), 32);
+    }
+
+    /// Both witnesses as one first-writer-wins claim set, like two relay mailboxes.
+    #[derive(Clone, Default)]
+    struct Witnesses(std::sync::Arc<std::sync::Mutex<Vec<[u8; 32]>>>, bool);
+
+    impl NonceWitness for Witnesses {
+        fn pins(&self) -> crate::signing_session::WitnessPins {
+            [([1; 32], [2; 32], [3; 32]), ([4; 32], [5; 32], [6; 32])]
+        }
+        fn claim(&mut self, cid: [u8; 32], record: &[u8]) -> Result<(), String> {
+            let mut claimed = self.0.lock().unwrap();
+            if self.1 || claimed.contains(&cid) || record[..32] != cid {
+                return Err("nonce already claimed; start a new signing attempt".into());
+            }
+            claimed.push(cid);
+            Ok(())
+        }
+    }
+
+    // The external witnesses gate every fresh share: a refused claim releases nothing and
+    // keeps the nonce; a nonce whose local files were rolled back after it signed cannot
+    // sign again, because its claim is already taken.
+    #[test]
+    fn nonce_witness_claim_gates_the_share_and_blocks_rolled_back_nonces() {
+        let (shares, public, fvk) = dealer_vault();
+        let key1 = frost::keys::KeyPackage::try_from(shares[&frost::Identifier::try_from(1u16).unwrap()].clone()).unwrap();
+        let key2 = frost::keys::KeyPackage::try_from(shares[&frost::Identifier::try_from(2u16).unwrap()].clone()).unwrap();
+        let nonce_dir = tempdir("witness-m1");
+        let mut signer = LocalSigner::with_sealed_share(
+            1, 2, 3, [1; 32], "test vault".into(), Network::Regtest, SoftwareSecureElement::generate(),
+            &key1.serialize().unwrap(), public.serialize().unwrap(), fvk.clone(), nonce_dir.clone(),
+            Box::new(|_| true),
+        )
+        .unwrap();
+        let witnesses = Witnesses::default();
+        signer.set_nonce_witness(Box::new(Witnesses(witnesses.0.clone(), true)));
+        let session = connect_signer(&mut signer);
+        let cand = CandidateRef { vault_id: [1; 32], payment_id: [7; 32], attempt_id: [9; 32] };
+        let own = signer.sign_commit(&session, &cand).unwrap();
+        let (_n2, peer) = frost::round1::commit(key2.signing_share(), &mut rand_core::OsRng);
+        let (pczt, pkg, seed) = candidate_and_package(&fvk, &key1, &public, *key2.identifier(), peer, own, true);
+        let id = signer.nonce_id(&cand);
+
+        // A refusing witness: no share, and the nonce is neither burned nor consumed.
+        let refused = signer.sign_approve(&session, &cand, &pczt, &pkg, &seed);
+        assert!(matches!(&refused, Err(SignerError::Other(e)) if e.contains("nonce witness refused")), "{refused:?}");
+        assert_eq!(signer.nonces.state(&id), crate::signer::nonce::NonceState::Committed);
+
+        // Two working witnesses: the claim is taken once and the share is released.
+        signer.set_nonce_witness(Box::new(witnesses.clone()));
+        let snapshot: Vec<_> = std::fs::read_dir(&nonce_dir).unwrap().flatten()
+            .map(|e| (e.path(), std::fs::read(e.path()).unwrap())).collect();
+        let share = signer.sign_approve(&session, &cand, &pczt, &pkg, &seed).expect("claimed nonce signs");
+        assert_eq!(witnesses.0.lock().unwrap().len(), 1);
+        // An identical resend replays the recorded partial without a second claim.
+        assert_eq!(signer.sign_approve(&session, &cand, &pczt, &pkg, &seed).unwrap(), share);
+        assert_eq!(witnesses.0.lock().unwrap().len(), 1);
+
+        // Roll the local nonce files back to before the burn: the witnesses refuse.
+        for entry in std::fs::read_dir(&nonce_dir).unwrap().flatten() {
+            std::fs::remove_file(entry.path()).unwrap();
+        }
+        for (path, bytes) in &snapshot {
+            std::fs::write(path, bytes).unwrap();
+        }
+        assert_eq!(signer.nonces.state(&id), crate::signer::nonce::NonceState::Committed);
+        let replayed = signer.sign_approve(&session, &cand, &pczt, &pkg, &seed);
+        assert!(matches!(&replayed, Err(SignerError::Other(e)) if e.contains("already claimed")), "{replayed:?}");
     }
 
     // (a'') The browser `paymentReview` seam: it renders the candidate (describe_pczt) and

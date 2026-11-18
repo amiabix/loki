@@ -804,9 +804,13 @@ pub(super) fn restore_vault_from_repair(
     let store = crate::signer::store::SignerStore::create(&sdir, signer_network, *vault_id, slot)?;
     store.write(&se, crate::signer::store::FileKind::Share, 0,
         &crate::signer::local::encode_share(&key.serialize().map_err(|e| e.to_string())?, &public.serialize().map_err(|e| e.to_string())?, vault_secret))?;
+    let ak: [u8; 32] = public.verifying_key().serialize().map_err(|e| e.to_string())?
+        .try_into().map_err(|_| "group key length")?;
+    let fvk = crate::zip2005::frost_viewing_key(&ak, vault_secret)
+        .map_err(|e| format!("group viewing key: {e:?}"))?;
     let bytes = super::ceremony::vault_sealed_bytes(
         &vault, slot, threshold, members as u16, &hex::encode(roster_fingerprint),
-        &key, public, vault_secret, birth_height, network,
+        public, &fvk, birth_height, network,
     )?;
     MemberDir::create(&data.join("vaults"), &vault)
         .map_err(|e| e.to_string())?
@@ -900,8 +904,10 @@ mod tests {
         assert_eq!(restored.signing_share(), keys[&lost].signing_share());
         assert_eq!(restored.serialize().unwrap(), keys[&lost].serialize().unwrap());
         // The original DKG payload binds the share to its unchanged address and metadata.
+        let ak: [u8; 32] = public.verifying_key().serialize().unwrap().try_into().unwrap();
+        let fvk = crate::zip2005::frost_viewing_key(&ak, &vault_secret).unwrap();
         let original = super::super::ceremony::vault_sealed_bytes(
-            &vault, 2, 2, 3, &hex::encode(fingerprint), &keys[&lost], &public, &vault_secret,
+            &vault, 2, 2, 3, &hex::encode(fingerprint), &public, &fvk,
             100, VaultNetwork::Regtest,
         ).unwrap();
         assert_eq!(stored, serde_json::from_slice::<Value>(&original).unwrap());

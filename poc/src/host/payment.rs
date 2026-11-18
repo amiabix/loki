@@ -28,7 +28,7 @@ use zeroize::Zeroizing;
 use super::{
     ceremony::WireIdentity,
     routes::{blocking, err},
-    state::Shared,
+    state::{AppState, Shared},
 };
 use crate::{
     candidate::{quote_fee, CandidateInputs},
@@ -36,8 +36,7 @@ use crate::{
     payment_transport::{coordinate, signer_loop},
     setup_transport::{Identity, PublicIdentity},
     signer::{
-        local::LocalSigner, secure_element::SoftwareSecureElement, CandidateRef, Network,
-        PublicPaymentParams, Signer,
+        CandidateRef, Network, PublicPaymentParams, Signer,
     },
     signing_session::{AttemptId, MessageKind, SessionContext},
     state::MemberDir,
@@ -122,7 +121,6 @@ struct Payment {
 pub(super) struct Vault {
     network: VaultNetwork,
     fvk: FullViewingKey,
-    key: frost::keys::KeyPackage,
     public: frost::keys::PublicKeyPackage,
     identity: Identity,
     threshold: u16,
@@ -186,7 +184,10 @@ fn save_payment(data: &Path, pass: &str, p: &Payment) -> Result<(), String> {
         .and_then(|f| f.sync_all())
         .map_err(|e| e.to_string())
 }
-pub(super) fn load_vault(data: &Path, pass: &str, vault: &str, configured: &str) -> Result<Vault, String> {
+/// Open this member's vault for scanning and signing. `vault.sealed` supplies public
+/// metadata; the viewing key comes from the device-bound signer store (`super::custody`).
+pub(super) fn load_vault(st: &AppState, data: &Path, pass: &str, vault: &str) -> Result<Vault, String> {
+    let configured = st.config.network.as_str();
     let dir = member_dir(data, vault)?;
     let sealed = Zeroizing::new(
         dir.read_sealed("vault.sealed", pass)
@@ -213,25 +214,13 @@ pub(super) fn load_vault(data: &Path, pass: &str, vault: &str, configured: &str)
     // Re-stamp the profile identity to this vault's FROST slot (registration seals it at slot 1).
     let identity = super::ceremony::identity(data, pass, slot)?;
     let ak = hex32(required(&v, "group_ak")?)?;
-    let secret = Zeroizing::new(hex32(required(&v, "vault_secret")?)?);
-    let fvk = zip2005::frost_viewing_key(&ak, &secret)
-        .map_err(|e| format!("group viewing key: {e:?}"))?;
-    if v["group_address"].as_str() != Some(&vault::unified_address(&fvk, network.network_type())) {
-        return Err("sealed vault address mismatch".into());
-    }
-    let key = frost::keys::KeyPackage::deserialize(
-        &hex::decode(required(&v, "key_package")?).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
     let public = frost::keys::PublicKeyPackage::deserialize(
         &hex::decode(required(&v, "public_package")?).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
     let id = frost::Identifier::try_from(slot).map_err(|e| e.to_string())?;
-    if key.identifier() != &id
-        || key.verifying_key() != public.verifying_key()
-        || public.min_signers() != Some(threshold)
-        || public.verifying_shares().get(&id) != Some(key.verifying_share())
+    if public.min_signers() != Some(threshold)
+        || !public.verifying_shares().contains_key(&id)
         || public
             .verifying_key()
             .serialize()
@@ -240,6 +229,8 @@ pub(super) fn load_vault(data: &Path, pass: &str, vault: &str, configured: &str)
     {
         return Err("member key differs from sealed vault".into());
     }
+    // Checks the signer's share and viewing key against `public_package` and `group_address`.
+    let fvk = super::custody::viewing_key(st, data, pass, vault, slot, &v)?;
     let c: Value = serde_json::from_slice(
         &member_dir(data, vault)?
             .read_sealed("ceremony.sealed", pass)
@@ -271,7 +262,6 @@ pub(super) fn load_vault(data: &Path, pass: &str, vault: &str, configured: &str)
     Ok(Vault {
         network,
         fvk,
-        key,
         public,
         identity,
         threshold,
@@ -968,7 +958,7 @@ fn reconcile(data: &Path, pass: &str, vault: &str, w: &mut VaultWallet) -> Resul
 pub(super) async fn balance(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
     with_body(st, body, |st, data, pass, body| {
         let vault = required(&body, "vault")?;
-        let v = load_vault(&data, &pass, vault, &st.config.network)?;
+        let v = load_vault(&st, &data, &pass, vault)?;
         let (w, _, _) = wallet(&data, &pass, vault, &v, url(&st)?)?;
         Ok(json!({"balance_zat": w.ironwood_balance_zat()?}))
     })
@@ -978,7 +968,7 @@ pub(super) async fn balance(State(st): State<Shared>, Json(body): Json<Value>) -
 pub(super) async fn draft(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
     with_body(st, body, |st, data, pass, body| {
         let vault = required(&body, "vault")?;
-        let v = load_vault(&data, &pass, vault, &st.config.network)?;
+        let v = load_vault(&st, &data, &pass, vault)?;
         let recipient = required(&body, "recipient")?;
         let address = vault::orchard_receiver_from_ua(recipient, v.network.network_type())?;
         let amount_zat: u64 = required(&body, "amount_zat")?.parse().map_err(|_| "invalid amount_zat")?;
@@ -1020,7 +1010,7 @@ pub(super) async fn publish(State(st): State<Shared>, Json(body): Json<Value>) -
     blocking(move || {
         let guard = st.payment.lock().map_err(|e| e.to_string())?;
         let (vault, attempt) = pair(&body)?;
-        let v = load_vault(&data, &pass, &vault, &st.config.network)?;
+        let v = load_vault(&st, &data, &pass, &vault)?;
         let mut p = read_payment(&data, &pass, &vault, &attempt)?;
         if p.proposer != v.slot || p.phase != "draft" {
             return Err("only the proposer can publish a draft".into());
@@ -1060,7 +1050,7 @@ pub(super) async fn publish(State(st): State<Shared>, Json(body): Json<Value>) -
 pub(super) async fn review(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
     with_body(st, body, |st, data, pass, body| {
         let (vault, attempt) = pair(&body)?;
-        let v = load_vault(&data, &pass, &vault, &st.config.network)?;
+        let v = load_vault(&st, &data, &pass, &vault)?;
         let mut p = discover(&st.config.frostd_url, &data, &pass, &vault, &attempt, &v)?;
         if p.phase != "signing" || p.session_id.is_none() || p.control_session_id.is_none() || p.error.is_some() { return Err("payment is not signing".into()); }
         check_intent(&p, &v)?;
@@ -1101,7 +1091,7 @@ pub(super) async fn approve(State(st): State<Shared>, Json(body): Json<Value>) -
                 "invalid or repeated payment approval; replace a failed attempt instead".into(),
             );
         }
-        let v = load_vault(&data, &pass, &vault, &st.config.network)?;
+        let v = load_vault(&st, &data, &pass, &vault)?;
         check_intent(&p, &v)?;
         if !p.signers.is_empty() && !p.signers.contains(&v.slot) {
             return Err(ENOUGH_APPROVED.into());
@@ -1150,7 +1140,7 @@ fn ensure_worker(
         p.error = Some("Signing was interrupted. Discard it if no share was released; otherwise replace it with a request that spends the same note.".into());
         save_payment(data, pass, &p)?;
         if p.proposer == slot {
-            if let Ok(v) = load_vault(data, pass, vault, &st.config.network) {
+            if let Ok(v) = load_vault(&st, data, pass, vault) {
                 let _ = send_control(&st.config.frostd_url, &v, &p, "failed", &members(&v));
             }
         }
@@ -1188,7 +1178,7 @@ fn record_failure(st: &Shared, data: &Path, pass: &str, vault: &str, attempt: &s
             p.phase = "failed".into();
             p.error = Some(error);
             let _ = save_payment(data, pass, &p);
-            if let Ok(v) = load_vault(data, pass, vault, &st.config.network) {
+            if let Ok(v) = load_vault(&st, data, pass, vault) {
                 if p.proposer == v.slot {
                     let _ = send_control(&st.config.frostd_url, &v, &p, "failed", &members(&v));
                 }
@@ -1209,7 +1199,7 @@ fn payment_worker(
     vault: &str,
     attempt: &str,
 ) -> Result<(), String> {
-    let v = load_vault(data, pass, vault, &st.config.network)?;
+    let v = load_vault(&st, data, pass, vault)?;
     let mut last_notice = std::time::Instant::now() - Duration::from_secs(5);
     let mut p = loop {
         if st.session.blocking_read().is_none() {
@@ -1345,6 +1335,12 @@ fn sign(
     v: &Vault,
     owned: Option<CandidateInputs<'_>>,
 ) -> Result<(), String> {
+    // Both external nonce witnesses must be configured; without them this member refuses to
+    // sign, before it joins the session or unwraps the share.
+    let witness = super::nonce_witness::RelayWitness::open(
+        st.config.nonce_witnesses.as_deref(),
+        st.config.development_http,
+    )?;
     let mut tx = relay(&v.identity, &st.config.frostd_url)?;
     let ch = tx
         .join(p.session_id.ok_or("missing signing session")?)
@@ -1353,21 +1349,13 @@ fn sign(
         VaultNetwork::Regtest => Network::Regtest,
         VaultNetwork::Testnet => Network::Testnet,
     };
-    let mut signer = LocalSigner::with_sealed_share(
-        v.slot,
-        v.threshold,
-        v.peers.len() as u16,
-        hex32(&p.vault)?,
-        p.vault.clone(),
-        signer_network,
-        SoftwareSecureElement::generate(),
-        &v.key.serialize().map_err(|e| e.to_string())?,
-        v.public.serialize().map_err(|e| e.to_string())?,
-        v.fvk.clone(),
-        member_dir(data, &p.vault)?.path().join("signer-nonces"),
-        Box::new(|_| true),
-    )
-    .map_err(|e| e.to_string())?;
+    // The share stays in the device-bound store under the configured element; only the
+    // member's own native decision approves, and headless members refuse.
+    let mut signer = super::custody::open_signer(
+        st, data, pass, &p.vault, v.slot,
+        super::approval_policy(st.approval.clone(), signer_network),
+    )?;
+    signer.set_nonce_witness(Box::new(witness));
     if let Some(inputs) = &owned {
         signer.set_candidate_notes(inputs.notes.clone());
     }
@@ -1625,7 +1613,7 @@ fn deliver(
     vault: &str,
     attempt: &str,
 ) -> Result<Payment, String> {
-    let v = load_vault(data, pass, vault, &st.config.network)?;
+    let v = load_vault(&st, data, pass, vault)?;
     let reread = |change: &dyn Fn(&mut Payment)| -> Result<Payment, String> {
         let _guard = st.payment.lock().map_err(|e| e.to_string())?;
         let mut p = read_payment(data, pass, vault, attempt)?;
@@ -1677,7 +1665,7 @@ pub(super) async fn send(State(st): State<Shared>, Json(body): Json<Value>) -> R
     };
     blocking(move || {
         let (vault, attempt) = pair(&body)?;
-        let v = load_vault(&data, &pass, &vault, &st.config.network)?;
+        let v = load_vault(&st, &data, &pass, &vault)?;
         let key = format!("{vault}/{attempt}");
         if !st
             .active_payments
@@ -1728,7 +1716,7 @@ pub(super) async fn send(State(st): State<Shared>, Json(body): Json<Value>) -> R
 pub(super) async fn verify(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
     with_body(st, body, |st, data, pass, body| {
         let (vault, attempt) = pair(&body)?;
-        let v = load_vault(&data, &pass, &vault, &st.config.network)?;
+        let v = load_vault(&st, &data, &pass, &vault)?;
         let txid = required(&body, "txid")?;
         let id = zcash_primitives::transaction::TxId::from_hex(txid).ok_or("invalid txid")?;
         if read_payment(&data, &pass, &vault, &attempt)?.txid.as_deref() != Some(txid) {
@@ -1758,7 +1746,7 @@ pub(super) async fn replace(State(st): State<Shared>, Json(body): Json<Value>) -
             Some("cancel") => true,
             _ => return Err("mode must be retry or cancel".into()),
         };
-        let v = load_vault(&data, &pass, &vault, &st.config.network)?;
+        let v = load_vault(&st, &data, &pass, &vault)?;
         let (mut w, _, _) = wallet(&data, &pass, &vault, &v, url(&st)?)?;
         let _ = sync_control(&st.config.frostd_url, &data, &pass, &vault, &v);
         reconcile(&data, &pass, &vault, &mut w)?;
@@ -1829,7 +1817,7 @@ fn watch_chain(st: &Shared, data: &Path, pass: &str, vault: &str) -> Result<(), 
                         .any(|p| !settled(p) && p.control_session_id.is_some())
                 };
                 if in_flight {
-                    let v = load_vault(&data, &pass, &vault, &st.config.network)?;
+                    let v = load_vault(&st, &data, &pass, &vault)?;
                     // The scan runs under the lock like every other use of the wallet
                     // database; a concurrent one fails a draft with "database is locked".
                     let _guard = st.payment.lock().map_err(|e| e.to_string())?;
@@ -1969,7 +1957,7 @@ fn stop_payment(
 pub(super) async fn discard(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
     with_body(st, body, |st, data, pass, body| {
         let (vault, attempt) = pair(&body)?;
-        let v = load_vault(&data, &pass, &vault, &st.config.network)?;
+        let v = load_vault(&st, &data, &pass, &vault)?;
         let mut p = read_payment(&data, &pass, &vault, &attempt)?;
         stop_payment(&st, &data, &pass, &v, &mut p)?;
         let (mut w, _, _) = wallet(&data, &pass, &vault, &v, url(&st)?)?;
@@ -1997,7 +1985,7 @@ pub(super) async fn payments(
         Err(e) => return e,
     };
     blocking(move || {
-        let v = load_vault(&data, &pass, &vault, &st.config.network)?;
+        let v = load_vault(&st, &data, &pass, &vault)?;
         {
             let _guard = st.payment.lock().map_err(|e| e.to_string())?;
             let _ = sync_control(&st.config.frostd_url, &data, &pass, &vault, &v);
@@ -2082,7 +2070,7 @@ pub(super) async fn pending(
     };
     blocking(move || {
         // load_vault authorizes the caller as a member of this vault before listing anything.
-        let v = load_vault(&data, &pass, &vault, &st.config.network)?;
+        let v = load_vault(&st, &data, &pass, &vault)?;
         {
             let _guard = st.payment.lock().map_err(|e| e.to_string())?;
             sync_control(&st.config.frostd_url, &data, &pass, &vault, &v)?;
@@ -2109,7 +2097,7 @@ pub(super) async fn status(
         Err(e) => return e,
     };
     blocking(move || {
-        let v = load_vault(&data, &pass, &vault, &st.config.network)?;
+        let v = load_vault(&st, &data, &pass, &vault)?;
         ensure_worker(&st, &data, &pass, &vault, &attempt, v.slot)?;
         let _guard = st.payment.lock().map_err(|e| e.to_string())?;
         let _ = sync_control(&st.config.frostd_url, &data, &pass, &vault, &v);
@@ -2206,7 +2194,6 @@ mod tests {
         let v = Vault {
             network: VaultNetwork::Testnet,
             fvk,
-            key,
             public,
             identity,
             threshold: 2,
@@ -2271,7 +2258,6 @@ mod tests {
         Vault {
             network: VaultNetwork::Testnet,
             fvk: zip2005::frost_viewing_key(&ak, &[42u8; 32]).unwrap(),
-            key,
             public,
             identity: Identity::from_secret_bytes(&identity.to_secret_bytes()).unwrap(),
             threshold: 2,
@@ -2279,6 +2265,26 @@ mod tests {
             peers: peers.clone(),
             birth_height: TESTNET_NU7_BIRTH,
         }
+    }
+
+    #[test]
+    fn hosted_signing_refuses_without_nonce_witnesses() {
+        let data = std::env::temp_dir().join(format!("loki-no-witness-{}", Uuid::new_v4()));
+        let identity = Identity::new(1);
+        let peers = BTreeMap::from([(1, identity.public())]);
+        let v = member(&identity, &peers);
+        let p = open_payment(&hex::encode([2; 32]), 1);
+        // A member that would approve, but has no `--nonce-witnesses`.
+        let config = crate::host::config_from_args(&[
+            "--data".into(), data.to_str().unwrap().into(), "--port".into(), "0".into(),
+            "--frostd-url".into(), "http://127.0.0.1:9".into(),
+        ]).unwrap();
+        let approval: crate::host::LocalApproval = std::sync::Arc::new(|_| true);
+        let st = std::sync::Arc::new(AppState { approval: Some(approval), ..AppState::new(config) });
+        // Refused before it contacts frostd (unreachable here) or opens any signer.
+        let refused = sign(&st, &data, "pass", &p, &v, None).unwrap_err();
+        assert!(refused.contains("--nonce-witnesses"), "{refused}");
+        assert!(!data.exists(), "nothing was written");
     }
 
     /// A request no member has acted on yet: proposed by `proposer`, open to every member.
@@ -2315,7 +2321,9 @@ mod tests {
 
     fn state(data: &Path, frostd_url: &str) -> Shared {
         use crate::host::state::{AppState, Config};
-        std::sync::Arc::new(AppState::new(Config {
+        // These members stand in for a member who approves every payment natively.
+        let approval: crate::host::LocalApproval = std::sync::Arc::new(|_| true);
+        std::sync::Arc::new(AppState { approval: Some(approval), ..AppState::new(Config {
             registration: None,
             data: data.to_owned(),
             port: 0,
@@ -2326,7 +2334,8 @@ mod tests {
             transport: "frostd".into(),
             secure_element: "software".into(),
             operator_bundle: None,
-            nonce_witnesses: None,
+            // Two provisioned dev relays (`examples/provision_nonce_witnesses`).
+            nonce_witnesses: std::env::var_os("LOKI_NONCE_WITNESSES").map(Into::into),
             operator_key: None,
             enrollment_issuer: None,
             development_http: true,
@@ -2334,7 +2343,7 @@ mod tests {
             frostd_url: frostd_url.into(),
             peers: BTreeMap::new(),
             loopback_peers: true,
-        }))
+        }) })
     }
 
     #[test]
@@ -2531,7 +2540,8 @@ mod tests {
 
     #[test]
     fn testnet_control_opens_requests_to_every_member_and_signs_with_the_first_approvers() {
-        let Ok(url) = std::env::var("FROSTD_URL") else {
+        // Live: frostd plus two provisioned nonce witnesses (hosted signing refuses without).
+        let (Ok(url), Some(_)) = (std::env::var("FROSTD_URL"), std::env::var_os("LOKI_NONCE_WITNESSES")) else {
             return;
         };
         let identities: Vec<_> = (1..=3).map(Identity::new).collect();
@@ -2702,7 +2712,8 @@ mod tests {
 
     #[test]
     fn testnet_signed_artifact_survives_a_delayed_final_send() {
-        let Ok(url) = std::env::var("FROSTD_URL") else {
+        // Live: frostd plus two provisioned nonce witnesses (hosted signing refuses without).
+        let (Ok(url), Some(_)) = (std::env::var("FROSTD_URL"), std::env::var_os("LOKI_NONCE_WITNESSES")) else {
             return;
         };
         let data = std::env::temp_dir().join(format!("loki-testnet-round-{}", Uuid::new_v4()));
@@ -2728,10 +2739,6 @@ mod tests {
         let make = |slot: u16| Vault {
             network: VaultNetwork::Testnet,
             fvk: fvk.clone(),
-            key: frost::keys::KeyPackage::try_from(
-                shares[&frost::Identifier::try_from(slot).unwrap()].clone(),
-            )
-            .unwrap(),
             public: public.clone(),
             identity: Identity::from_secret_bytes(
                 &identities[usize::from(slot - 1)].to_secret_bytes(),
@@ -2805,6 +2812,15 @@ mod tests {
         let st = state(&data, &url);
         let b_data = data.join("b");
         std::fs::create_dir_all(b_data.join("vaults").join(&vault)).unwrap();
+        // Each member's share sits in its own signer store, as after DKG or a restore.
+        for (root, slot) in [(&data, 1u16), (&b_data, 3)] {
+            use crate::signer::{secure_element::SoftwareSecureElement, store::{FileKind, SignerStore}};
+            let sdir = super::super::ceremony::signer_dir(root, &vault).unwrap();
+            let store = SignerStore::create(&sdir, Network::Testnet, [2; 32], slot).unwrap();
+            let key = frost::keys::KeyPackage::try_from(shares[&frost::Identifier::try_from(slot).unwrap()].clone()).unwrap();
+            let share = crate::signer::local::encode_share(&key.serialize().unwrap(), &public.serialize().unwrap(), &[42; 32]);
+            store.write(&SoftwareSecureElement::persistent(&sdir, "pass").unwrap(), FileKind::Share, 0, &share).unwrap();
+        }
         let signed = std::thread::scope(|scope| {
             let aggregate = scope.spawn(|| aggregate(&st, &data, "pass", &p, &a));
             let other = scope.spawn(|| sign(&st, &b_data, "pass", &p, &b, None));

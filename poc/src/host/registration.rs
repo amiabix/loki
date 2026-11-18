@@ -454,7 +454,7 @@ mod tests {
         let notice: super::super::LocalNotice = std::sync::Arc::new(move |kind, value| {
             if kind == "ready" { tx.send(value.to_owned()).unwrap(); }
         });
-        let app = std::thread::spawn(move || super::super::run_local(config, None, Some(notice)));
+        let app = std::thread::spawn(move || super::super::run_local(config, None, Some(notice), None));
         let ready = tokio::task::spawn_blocking(move || rx.recv_timeout(std::time::Duration::from_secs(60))).await.unwrap()
             .unwrap_or_else(|_| panic!("the app did not come up: {:?}", app.join()));
         let (base, token) = ready.split_once("/#").unwrap();

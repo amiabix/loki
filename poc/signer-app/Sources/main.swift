@@ -7,6 +7,7 @@ import Security
 //
 //   LokiSigner persist     -> create at init + reload (no biometric; headless-verifiable)
 //   LokiSigner biometric   -> create + unwrap gated by Touch ID (interactive)
+//   LokiSigner approve     -> real DKG + payment gated by the native approval dialog
 
 let mode = CommandLine.arguments.dropFirst().first ?? "native"
 if mode == "native" || mode == "pair" || mode.hasPrefix("loki://") {
@@ -14,8 +15,11 @@ if mode == "native" || mode == "pair" || mode.hasPrefix("loki://") {
     let offset = mode == "pair" ? 3 : 2
     runNativeSigner(arguments: Array(CommandLine.arguments.dropFirst(offset)), link: link)
 }
+if mode == "approve" {
+    runApprovalSelftest()
+}
 if !["persist", "biometric", "rust", "member", "serve"].contains(mode) {
-    FileHandle.standardError.write("Unknown mode; use native, pair <link>, serve, rust, member, persist or biometric\n".data(using: .utf8)!)
+    FileHandle.standardError.write("Unknown mode; use native, pair <link>, serve, approve, rust, member, persist or biometric\n".data(using: .utf8)!)
     exit(2)
 }
 let biometric = (mode == "biometric")
