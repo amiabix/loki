@@ -122,7 +122,6 @@ struct Payment {
 pub(super) struct Vault {
     network: VaultNetwork,
     fvk: FullViewingKey,
-    key: frost::keys::KeyPackage,
     public: frost::keys::PublicKeyPackage,
     identity: Identity,
     threshold: u16,
@@ -219,19 +218,14 @@ pub(super) fn load_vault(data: &Path, pass: &str, vault: &str, configured: &str)
     if v["group_address"].as_str() != Some(&vault::unified_address(&fvk, network.network_type())) {
         return Err("sealed vault address mismatch".into());
     }
-    let key = frost::keys::KeyPackage::deserialize(
-        &hex::decode(required(&v, "key_package")?).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
+    // The share is not read here: it stays sealed in the signer store until `sign`.
     let public = frost::keys::PublicKeyPackage::deserialize(
         &hex::decode(required(&v, "public_package")?).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
     let id = frost::Identifier::try_from(slot).map_err(|e| e.to_string())?;
-    if key.identifier() != &id
-        || key.verifying_key() != public.verifying_key()
-        || public.min_signers() != Some(threshold)
-        || public.verifying_shares().get(&id) != Some(key.verifying_share())
+    if public.min_signers() != Some(threshold)
+        || !public.verifying_shares().contains_key(&id)
         || public
             .verifying_key()
             .serialize()
@@ -271,7 +265,6 @@ pub(super) fn load_vault(data: &Path, pass: &str, vault: &str, configured: &str)
     Ok(Vault {
         network,
         fvk,
-        key,
         public,
         identity,
         threshold,
@@ -1337,6 +1330,35 @@ fn prepare_sign<'a>(
     Ok(owned)
 }
 
+/// This member's FROST key package for `vault`. Spend authority lives only in the signer
+/// store, sealed under the configured secure element; with the Enclave backend this unseal is
+/// the biometric unlock for signing.
+fn open_share(
+    config: &super::Config,
+    data: &Path,
+    pass: &str,
+    vault: &str,
+    v: &Vault,
+) -> Result<frost::keys::KeyPackage, String> {
+    let sdir = super::ceremony::signer_dir(data, vault)?;
+    let store = crate::signer::store::SignerStore::open(&sdir)?;
+    if store.vault() != hex32(vault)? || store.member() != v.slot {
+        return Err("signer share belongs to another vault or member".into());
+    }
+    let (_, raw) = store
+        .read(&config.open_secure_element(&sdir, pass)?, crate::signer::store::FileKind::Share)?
+        .ok_or("missing signer share; restore from recovery backup")?;
+    let (key_bytes, public_bytes, _) = crate::signer::local::decode_share(&raw)?;
+    let key = frost::keys::KeyPackage::deserialize(&key_bytes).map_err(|e| e.to_string())?;
+    if public_bytes != v.public.serialize().map_err(|e| e.to_string())?
+        || key.identifier() != &frost::Identifier::try_from(v.slot).map_err(|e| e.to_string())?
+        || v.public.verifying_shares().get(key.identifier()) != Some(key.verifying_share())
+    {
+        return Err("member key differs from sealed vault".into());
+    }
+    Ok(key)
+}
+
 fn sign(
     st: &Shared,
     data: &Path,
@@ -1353,6 +1375,8 @@ fn sign(
         VaultNetwork::Regtest => Network::Regtest,
         VaultNetwork::Testnet => Network::Testnet,
     };
+    let key = open_share(&st.config, data, pass, &p.vault, v)?;
+    // Re-sealed for this process only: the configured element guards the share at rest.
     let mut signer = LocalSigner::with_sealed_share(
         v.slot,
         v.threshold,
@@ -1361,7 +1385,7 @@ fn sign(
         p.vault.clone(),
         signer_network,
         SoftwareSecureElement::generate(),
-        &v.key.serialize().map_err(|e| e.to_string())?,
+        &Zeroizing::new(key.serialize().map_err(|e| e.to_string())?),
         v.public.serialize().map_err(|e| e.to_string())?,
         v.fvk.clone(),
         member_dir(data, &p.vault)?.path().join("signer-nonces"),
@@ -2145,15 +2169,11 @@ mod tests {
 
     #[test]
     fn signer_reviews_candidate_effects_before_signing() {
-        let (shares, public) = frost::keys::generate_with_dealer(
+        let (_, public) = frost::keys::generate_with_dealer(
             3,
             2,
             frost::keys::IdentifierList::Default,
             &mut OsRng,
-        )
-        .unwrap();
-        let key = frost::keys::KeyPackage::try_from(
-            shares[&frost::Identifier::try_from(1u16).unwrap()].clone(),
         )
         .unwrap();
         let ak: [u8; 32] = public
@@ -2206,7 +2226,6 @@ mod tests {
         let v = Vault {
             network: VaultNetwork::Testnet,
             fvk,
-            key,
             public,
             identity,
             threshold: 2,
@@ -2254,14 +2273,13 @@ mod tests {
 
     /// A vault member's view: a share of a throwaway 2-of-3 key plus the roster.
     fn member(identity: &Identity, peers: &BTreeMap<u16, PublicIdentity>) -> Vault {
-        let (shares, public) = frost::keys::generate_with_dealer(
+        let (_, public) = frost::keys::generate_with_dealer(
             3,
             2,
             frost::keys::IdentifierList::Default,
             &mut OsRng,
         )
         .unwrap();
-        let key = frost::keys::KeyPackage::try_from(shares.into_values().next().unwrap()).unwrap();
         let ak: [u8; 32] = public
             .verifying_key()
             .serialize()
@@ -2271,7 +2289,6 @@ mod tests {
         Vault {
             network: VaultNetwork::Testnet,
             fvk: zip2005::frost_viewing_key(&ak, &[42u8; 32]).unwrap(),
-            key,
             public,
             identity: Identity::from_secret_bytes(&identity.to_secret_bytes()).unwrap(),
             threshold: 2,
@@ -2279,6 +2296,66 @@ mod tests {
             peers: peers.clone(),
             birth_height: TESTNET_NU7_BIRTH,
         }
+    }
+
+    #[test]
+    fn signing_key_comes_only_from_the_signer_store() {
+        let identities: Vec<_> = (1..=3).map(Identity::new).collect();
+        let peers: BTreeMap<_, _> = identities.iter().map(|i| (i.public().id, i.public())).collect();
+        let (shares, public) = frost::keys::generate_with_dealer(
+            3,
+            2,
+            frost::keys::IdentifierList::Default,
+            &mut OsRng,
+        )
+        .unwrap();
+        let mut v = member(&identities[0], &peers);
+        v.public = public.clone();
+        let data = std::env::temp_dir().join(format!("loki-share-store-{}", Uuid::new_v4()));
+        let st = state(&data, "http://127.0.0.1:2744");
+        let vault = hex::encode([2; 32]);
+        member_dir(&data, &vault).unwrap();
+        // No signer store: nothing to sign with, whatever `vault.sealed` once held.
+        assert!(open_share(&st.config, &data, "pass", &vault, &v).is_err());
+
+        let key = frost::keys::KeyPackage::try_from(
+            shares[&frost::Identifier::try_from(1u16).unwrap()].clone(),
+        )
+        .unwrap();
+        let sdir = super::super::ceremony::signer_dir(&data, &vault).unwrap();
+        let store = crate::signer::store::SignerStore::create(&sdir, Network::Testnet, [2; 32], 1).unwrap();
+        let share = crate::signer::local::encode_share(
+            &key.serialize().unwrap(),
+            &public.serialize().unwrap(),
+            &[42; 32],
+        );
+        // A share sealed under another element does not open.
+        store
+            .write(&SoftwareSecureElement::generate(), crate::signer::store::FileKind::Share, 0, &share)
+            .unwrap();
+        assert!(open_share(&st.config, &data, "pass", &vault, &v).is_err());
+        store
+            .write(
+                &st.config.open_secure_element(&sdir, "pass").unwrap(),
+                crate::signer::store::FileKind::Share,
+                0,
+                &share,
+            )
+            .unwrap();
+        assert_eq!(open_share(&st.config, &data, "pass", &vault, &v).unwrap(), key);
+        assert!(open_share(&st.config, &data, "wrong", &vault, &v).is_err());
+        // Another member's slot does not open this member's share.
+        v.slot = 2;
+        assert!(open_share(&st.config, &data, "pass", &vault, &v).is_err());
+
+        // The vault file members unlock with the passphrase holds no spend authority.
+        let sealed = super::super::ceremony::vault_sealed_bytes(
+            &vault, 1, 2, 3, "00", &public, &[42; 32], TESTNET_NU7_BIRTH, VaultNetwork::Testnet,
+        )
+        .unwrap();
+        let sealed: Value = serde_json::from_slice(&sealed).unwrap();
+        assert!(sealed.get("key_package").is_none());
+        std::fs::remove_dir_all(&data).unwrap();
     }
 
     /// A request no member has acted on yet: proposed by `proposer`, open to every member.
@@ -2728,10 +2805,6 @@ mod tests {
         let make = |slot: u16| Vault {
             network: VaultNetwork::Testnet,
             fvk: fvk.clone(),
-            key: frost::keys::KeyPackage::try_from(
-                shares[&frost::Identifier::try_from(slot).unwrap()].clone(),
-            )
-            .unwrap(),
             public: public.clone(),
             identity: Identity::from_secret_bytes(
                 &identities[usize::from(slot - 1)].to_secret_bytes(),
@@ -2805,6 +2878,27 @@ mod tests {
         let st = state(&data, &url);
         let b_data = data.join("b");
         std::fs::create_dir_all(b_data.join("vaults").join(&vault)).unwrap();
+        // Each member's share sits in its signer store, as DKG leaves it.
+        for (root, slot) in [(&data, 1u16), (&b_data, 3)] {
+            let sdir = super::super::ceremony::signer_dir(root, &vault).unwrap();
+            let key = frost::keys::KeyPackage::try_from(
+                shares[&frost::Identifier::try_from(slot).unwrap()].clone(),
+            )
+            .unwrap();
+            crate::signer::store::SignerStore::create(&sdir, Network::Testnet, [2; 32], slot)
+                .unwrap()
+                .write(
+                    &st.config.open_secure_element(&sdir, "pass").unwrap(),
+                    crate::signer::store::FileKind::Share,
+                    0,
+                    &crate::signer::local::encode_share(
+                        &key.serialize().unwrap(),
+                        &public.serialize().unwrap(),
+                        &[42; 32],
+                    ),
+                )
+                .unwrap();
+        }
         let signed = std::thread::scope(|scope| {
             let aggregate = scope.spawn(|| aggregate(&st, &data, "pass", &p, &a));
             let other = scope.spawn(|| sign(&st, &b_data, "pass", &p, &b, None));

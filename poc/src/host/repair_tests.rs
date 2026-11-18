@@ -258,8 +258,9 @@ fn wired_repair(threshold: u16, members: u16, lost: u16, fault: Option<Fault>) {
     let expected = keys[&frost::Identifier::try_from(lost).unwrap()]
         .serialize()
         .unwrap();
-    // Signing reads the share from `vault.sealed`, exactly as after DKG.
-    assert_eq!(stored["key_package"], hex::encode(&expected));
+    // Signing reads the share from the signer store, exactly as after DKG; `vault.sealed`
+    // holds no spend authority.
+    assert!(stored.get("key_package").is_none());
     assert_eq!(stored["vault_secret"], hex::encode([42u8; 32]));
     let sdir = super::super::ceremony::signer_dir(&data, &hex::encode(vault)).unwrap();
     let se = crate::signer::secure_element::SoftwareSecureElement::persistent(&sdir, "replacement pass").unwrap();
@@ -493,7 +494,6 @@ async fn repair_handlers_require_unlock_consent_and_local_relay_and_original_vau
         2,
         3,
         &fingerprint,
-        &key,
         &public,
         &[42; 32],
         100,

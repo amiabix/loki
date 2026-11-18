@@ -102,7 +102,7 @@ fn tempdir(id: u16) -> std::path::PathBuf {
 /// in-process, then have the first `threshold` of them sign a payment the prover accepts.
 /// `Ok(())` means every share was generated and sealed through its SecureElement and the
 /// quorum produced a verified signature — the native-member lifecycle end to end.
-pub(crate) fn prove_dkg_member<SE: SecureElement>(
+pub fn prove_dkg_member<SE: SecureElement>(
     threshold: u16,
     members: u16,
     mut make_se: impl FnMut(u16) -> SE,

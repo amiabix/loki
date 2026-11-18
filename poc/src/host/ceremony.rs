@@ -32,7 +32,6 @@ use crate::{
         backup::BackupArtifact,
         coordination::{member_dkg_step, redeliver_dkg, relay_dkg},
         local::{BackupDevice, DevicePrompts, LocalSigner, RosterDecision, SignerError},
-        secure_element::SoftwareSecureElement,
         Network, Signer,
     },
     state::MemberDir,
@@ -1004,7 +1003,9 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
         };
         let channel = transport.join(session_id).map_err(|e| e.to_string())?;
         let signer_dir = dir(data, vault_id)?.path().join("signer");
-        let se = SoftwareSecureElement::persistent(&signer_dir, pass)?;
+        // The share is sealed under the configured element (`--secure-element`): the Secure
+        // Enclave when built with `apple-enclave`, else the passphrase-sealed software KEK.
+        let se = st.config.open_secure_element(&signer_dir, pass)?;
         let signer_network = match network {
             VaultNetwork::Regtest => Network::Regtest,
             VaultNetwork::Testnet => Network::Testnet,
@@ -1088,11 +1089,11 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
             if log.active() { log.delete().map_err(|e| e.to_string())?; }
         }
         // Keep the frostd session open until the relay's TTL; peers may still be finishing.
-        let (key, public, vault_secret) = signer.hosted_material().map_err(|e| e.to_string())?;
+        let (_, public, vault_secret) = signer.hosted_material().map_err(|e| e.to_string())?;
         let sealed = vault_sealed_bytes(
             &c.vault, c.my_slot, c.threshold, c.members,
             c.fingerprint.as_deref().ok_or("roster fingerprint missing at activation")?,
-            &key, &public, &vault_secret, birth_height, network,
+            &public, &vault_secret, birth_height, network,
         )?;
         dir(data, vault_id)?
             .write_sealed("vault.sealed", &sealed, pass)
@@ -1398,9 +1399,13 @@ mod tests {
         assert!(tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(crate::host::recovery::establish_recovery(&data)).unwrap().is_none());
 
         // The restored member completes a rerandomized FROST round with member 2 using the key
-        // package the payment path reads from `vault.sealed`; the aggregate verifies.
+        // package the payment path opens from the signer store; the aggregate verifies.
+        // `vault.sealed` carries no spend authority.
         let sealed: Value = serde_json::from_slice(&dir(&data, &vault_hex).unwrap().read_sealed("vault.sealed", pass).unwrap()).unwrap();
-        let restored = frost::keys::KeyPackage::deserialize(&hex::decode(sealed["key_package"].as_str().unwrap()).unwrap()).unwrap();
+        assert!(sealed.get("key_package").is_none(), "vault.sealed must not hold the share");
+        let (_, raw) = SignerStore::open(&sdir).unwrap()
+            .read(&config.open_secure_element(&sdir, pass).unwrap(), FileKind::Share).unwrap().unwrap();
+        let restored = frost::keys::KeyPackage::deserialize(&crate::signer::local::decode_share(&raw).unwrap().0).unwrap();
         let group = frost::keys::PublicKeyPackage::deserialize(&hex::decode(sealed["public_package"].as_str().unwrap()).unwrap()).unwrap();
         let peer = frost::keys::KeyPackage::try_from(shares[&frost::Identifier::try_from(2u16).unwrap()].clone()).unwrap();
         let message = b"restored member signs";
@@ -1558,8 +1563,9 @@ pub(super) fn signer_dir(data: &Path, vault: &str) -> Result<PathBuf, String> {
 }
 
 /// Build the passphrase-sealed `vault.sealed` payload that `payment::load_vault` reads. DKG
-/// completion and recovery restore both write it through here, so a restored member gets the
-/// same complete file (share and vault secret included) that signing reads.
+/// completion and recovery restore both write it through here. It holds public vault metadata
+/// and the viewing secret only: the FROST share stays in the signer store, sealed under the
+/// device's secure element, and is opened only to sign.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn vault_sealed_bytes(
     vault: &str,
@@ -1567,7 +1573,6 @@ pub(super) fn vault_sealed_bytes(
     threshold: u16,
     members: u16,
     roster_fingerprint: &str,
-    key: &frost::keys::KeyPackage,
     public: &frost::keys::PublicKeyPackage,
     vault_secret: &[u8; 32],
     birth_height: u32,
@@ -1585,7 +1590,6 @@ pub(super) fn vault_sealed_bytes(
     let sealed = json!({
         "vault": vault, "threshold": threshold, "members": members,
         "roster_fingerprint": roster_fingerprint,
-        "key_package": hex::encode(key.serialize().map_err(|e| e.to_string())?),
         "public_package": hex::encode(public.serialize().map_err(|e| e.to_string())?),
         "my_frost_id": slot, "group_address": group_address,
         "group_ak": hex::encode(ak), "vault_secret": hex::encode(vault_secret),
@@ -1690,7 +1694,7 @@ pub(super) fn restore_vault_from_backup(
     ceremony.fingerprint = Some(fingerprint.clone());
     let bytes = vault_sealed_bytes(
         vault, material.member_id, material.threshold, material.members, &fingerprint,
-        &kp, &pp, &material.group_sk,
+        &pp, &material.group_sk,
         // Regtest vaults are born at height 2 (`setup_birth_height`); Testnet backups carry theirs.
         material.birth_height.unwrap_or(2), network,
     )?;
