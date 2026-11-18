@@ -23,6 +23,9 @@ use loki_signer_core::signer::local::{
 use loki_signer_core::vault::orchard_receiver_from_ua;
 use loki_signer_core::verify::{check_candidate, Expectations, Refusal};
 use loki_signer_core::signer::PublicPaymentParams;
+use loki_signer_core::signing_session::{
+    nonce_claim_id, nonce_claim_record, valid_witness_pins, NonceWitness, WitnessPins,
+};
 use zcash_protocol::consensus::{BlockHeight, BranchId, Parameters};
 use zcash_protocol::memo::MemoBytes;
 use zcash_protocol::value::Zatoshis;
@@ -266,6 +269,11 @@ pub struct Signer {
     /// Recovery public keys minted by `recoveryBegin`, written only once the member has
     /// re-typed some of the words (`recoveryConfirm`).
     pending_recovery: Option<Vec<u8>>,
+    /// The two external nonce witnesses (pins) this signer claims at before every signature
+    /// share. None: signing is refused, like a native member without --nonce-witnesses.
+    witness_pins: Option<WitnessPins>,
+    /// Claims both witnesses confirmed for this signature (cid, record), consumed by the core.
+    claimed: Arc<Mutex<Vec<([u8; 32], Vec<u8>)>>>,
 }
 
 impl Default for Signer {
@@ -276,6 +284,8 @@ impl Default for Signer {
             vault: None,
             approved: Arc::new(Mutex::new(None)),
             pending_recovery: None,
+            witness_pins: None,
+            claimed: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -684,6 +694,34 @@ impl Signer {
             .map_err(|e| JsError::new(&e))
     }
 
+    /// The two external nonce witnesses (JSON `[{key, run, mailbox}, ...]`, hex): the pins the
+    /// Worker's claims must match. Two distinct, nonzero witnesses are required (core
+    /// `valid_witness_pins`); without them `signApprove` refuses.
+    #[wasm_bindgen(js_name = setNonceWitnesses)]
+    pub fn set_nonce_witnesses(&mut self, pins_json: &str) -> Result<(), JsError> {
+        self.witness_pins = Some(parse_witness_pins(pins_json).map_err(|e| JsError::new(&e))?);
+        Ok(())
+    }
+
+    /// The claim this signature needs at both witnesses: `{cid, record}` (hex), from the core
+    /// derivations (`nonce_claim_id` over this member's own commitment in the package, and
+    /// `nonce_claim_record` over the confirmed sighash and the randomizer seed). The Worker
+    /// claims it at both witnesses, then reports `nonceClaimed`.
+    #[wasm_bindgen(js_name = nonceClaim)]
+    pub fn nonce_claim(&self, package_hex: &str, seed_hex: &str, sighash_hex: &str) -> Result<String, JsError> {
+        self.nonce_claim_impl(package_hex, seed_hex, sighash_hex).map_err(|e| JsError::new(&e))
+    }
+
+    /// Both witnesses issued a FRESH, verified claim receipt for `{cid, record}`. The core's
+    /// witness check inside `signApprove` accepts exactly this claim, once.
+    #[wasm_bindgen(js_name = nonceClaimed)]
+    pub fn nonce_claimed(&self, cid_hex: &str, record_hex: &str) -> Result<(), JsError> {
+        let cid = hex32(cid_hex).map_err(|e| JsError::new(&e))?;
+        let record = hex::decode(record_hex).map_err(|e| JsError::new(&e.to_string()))?;
+        self.claimed.lock().map_err(|_| JsError::new("claim state poisoned"))?.push((cid, record));
+        Ok(())
+    }
+
     /// Round 2: the PUBLIC signature share for `attempt_hex` (hex). INDEPENDENTLY re-renders
     /// the candidate, recomputes its sighash, and REFUSES unless `package_hex` commits to that
     /// exact sighash — before the nonce/share is touched (WYSIWYS). `candidate_hex` is the
@@ -712,6 +750,8 @@ struct VaultState {
     signer: LocalSigner<SoftwareSecureElement>,
     session: Session,
     vref: VaultRef,
+    /// This member's slot (FROST identifier) in the vault.
+    slot: u16,
 }
 
 /// The vault signer's data directory in OPFS. The `LocalSigner` store owns
@@ -839,6 +879,44 @@ fn sign_challenge(identity: &Identity, challenge: &str) -> Result<String, String
     let signing = xeddsa::xed25519::PrivateKey::from(&*Zeroizing::new(relay));
     let sig: [u8; 64] = xeddsa::Sign::sign(&signing, challenge.as_bytes(), rand::rng());
     Ok(hex::encode(sig))
+}
+
+/// The core nonce witness for a browser member. The core calls `claim` inside `sign_approve`,
+/// after approval and the sighash binding and before the share is opened; a synchronous call
+/// cannot wait on the network, so the Worker claims at both witness relays first (verified,
+/// fresh receipts) and this accepts exactly a claim it was told both confirmed, once. Any
+/// other claim (none made, refused, duplicate, or for other bytes) is a refusal, so the core
+/// releases nothing and leaves the nonce unburned.
+struct ClaimedAhead {
+    pins: WitnessPins,
+    claimed: Arc<Mutex<Vec<([u8; 32], Vec<u8>)>>>,
+}
+
+impl NonceWitness for ClaimedAhead {
+    fn pins(&self) -> WitnessPins {
+        self.pins
+    }
+    fn claim(&mut self, cid: [u8; 32], record: &[u8]) -> Result<(), String> {
+        let mut claimed = self.claimed.lock().map_err(|_| "claim state poisoned")?;
+        let at = claimed
+            .iter()
+            .position(|(c, r)| *c == cid && r == record)
+            .ok_or("both nonce witnesses must first confirm a fresh claim for this signature")?;
+        claimed.remove(at);
+        Ok(())
+    }
+}
+
+fn parse_witness_pins(json: &str) -> Result<WitnessPins, String> {
+    #[derive(serde::Deserialize)]
+    struct Pin { key: String, run: String, mailbox: String }
+    let pins: [Pin; 2] = serde_json::from_str(json).map_err(|_| "nonce witnesses: expected two {key, run, mailbox}".to_string())?;
+    let one = |p: &Pin| -> Result<([u8; 32], [u8; 32], [u8; 32]), String> { Ok((hex32(&p.key)?, hex32(&p.run)?, hex32(&p.mailbox)?)) };
+    let pins = [one(&pins[0])?, one(&pins[1])?];
+    if !valid_witness_pins(pins) {
+        return Err("two distinct, nonzero nonce witnesses are required".into());
+    }
+    Ok(pins)
 }
 
 /// The payment terms a member approved, as the proposer announced them (payment.rs
@@ -1005,6 +1083,17 @@ impl Signer {
         .to_string())
     }
 
+    fn nonce_claim_impl(&self, package_hex: &str, seed_hex: &str, sighash_hex: &str) -> Result<String, String> {
+        let vs = self.vault.as_ref().ok_or("no active vault — call vaultOpen first")?;
+        let package = frost::SigningPackage::deserialize(&hex::decode(package_hex).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        let member = frost::Identifier::try_from(vs.slot).map_err(|e| e.to_string())?;
+        let commitment = package.signing_commitments().get(&member).ok_or("own commitment absent")?;
+        let cid = nonce_claim_id(&vs.vref.vault_id, &member, commitment)?;
+        let record = nonce_claim_record(&cid, &hex32(sighash_hex)?, &hex32(seed_hex)?);
+        Ok(serde_json::json!({ "cid": hex::encode(cid), "record": hex::encode(record) }).to_string())
+    }
+
     fn reauth_check(&self, method: &str, passphrase: Option<String>, prf_secret: Option<Vec<u8>>) -> Result<(), String> {
         let held = self.kek.as_ref().ok_or("unlock the signer first")?;
         let again = custody_kek(method, passphrase, prf_secret, false)?;
@@ -1104,6 +1193,9 @@ impl Signer {
         confirmed_sighash_hex: &str,
         terms_json: &str,
     ) -> Result<String, String> {
+        if self.witness_pins.is_none() {
+            return Err("browser signing requires two nonce witnesses; none are configured".into());
+        }
         let (cand, _) = self.candidate_ref(attempt_hex)?;
         let terms: Terms = serde_json::from_str(terms_json).map_err(|e| format!("payment terms: {e}"))?;
         let candidate = hex::decode(candidate_hex).map_err(|e| e.to_string())?;
@@ -1185,7 +1277,10 @@ impl Signer {
             "members": members,
         })
         .to_string();
-        self.vault = Some(VaultState { signer, session, vref });
+        if let Some(pins) = self.witness_pins {
+            signer.set_nonce_witness(Box::new(ClaimedAhead { pins, claimed: self.claimed.clone() }));
+        }
+        self.vault = Some(VaultState { signer, session, vref, slot });
         Ok(out)
     }
 
@@ -1250,6 +1345,7 @@ impl Signer {
             signer,
             session,
             vref,
+            slot,
         });
         Ok(out)
     }
@@ -1421,6 +1517,40 @@ mod tests {
         };
         assert!(payment_params(&terms("not an address", 1), VaultNetwork::Testnet).is_err());
         assert!(vault_network(Network::Testnet).is_ok() && vault_network(Network::Regtest).is_ok());
+    }
+
+    fn pins_json(a: u8, b: u8) -> String {
+        let pin = |n: u8| serde_json::json!({ "key": hex::encode([n; 32]), "run": hex::encode([n + 1; 32]), "mailbox": hex::encode([n + 2; 32]) });
+        serde_json::json!([pin(a), pin(b)]).to_string()
+    }
+
+    #[wasm_bindgen_test]
+    fn signing_is_refused_without_two_nonce_witnesses() {
+        let mut signer = Signer::new();
+        let err = signer.sign_approve_impl(&"00".repeat(32), "", "", "", "", "{}").unwrap_err();
+        assert!(err.contains("nonce witnesses"), "{err}");
+        // Two distinct, nonzero witnesses only.
+        assert!(parse_witness_pins(&pins_json(1, 1)).is_err(), "the same witness twice");
+        assert!(parse_witness_pins(&pins_json(0, 5)).is_err(), "a zero pin");
+        assert!(parse_witness_pins("[]").is_err());
+        assert!(parse_witness_pins(&pins_json(1, 5)).is_ok());
+    }
+
+    #[wasm_bindgen_test]
+    fn core_witness_accepts_only_a_claim_both_relays_confirmed_once() {
+        let claimed = Arc::new(Mutex::new(Vec::new()));
+        let mut witness = ClaimedAhead { pins: parse_witness_pins(&pins_json(1, 5)).unwrap(), claimed: claimed.clone() };
+        let record = nonce_claim_record(&[7; 32], &[8; 32], &[9; 32]);
+        // Not claimed at the relays (or refused there): the core gets a refusal, so it releases
+        // no share and leaves the nonce unburned (core test
+        // `nonce_witness_claim_gates_the_share_and_blocks_rolled_back_nonces`).
+        assert!(witness.claim([7; 32], &record).is_err());
+        claimed.lock().unwrap().push(([7; 32], record.clone()));
+        // Other bytes for the same nonce are not the confirmed claim.
+        assert!(witness.claim([7; 32], &nonce_claim_record(&[7; 32], &[1; 32], &[9; 32])).is_err());
+        assert!(witness.claim([7; 32], &record).is_ok());
+        // A second use of the same claim is a duplicate: refused.
+        assert!(witness.claim([7; 32], &record).is_err(), "duplicate claim");
     }
 
     #[wasm_bindgen_test]

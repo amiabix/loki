@@ -14,6 +14,10 @@
 //                         unlocking (default: the signer page's hostname)
 //   LOKI_CEREMONY_ORIGINS creator member-app origins a joiner may call during setup
 //                         (space-separated CSP sources; default: loopback member apps)
+//   LOKI_NONCE_WITNESSES  the two nonce-witness relays every signature is claimed at: the same
+//                         JSON file a native member takes with --nonce-witnesses. Without it
+//                         the browser signer refuses to sign. NOTE: each entry's mailbox
+//                         `read` capability is served to every page load of this origin.
 //   LOKI_SIGNER_PORT      listen port (default 3002)
 import { createServer } from "node:http";
 import { createHash } from "node:crypto";
@@ -27,6 +31,13 @@ const walletOrigin = new URL(process.env.LOKI_WALLET_ORIGIN || "http://localhost
 const frostdUrl = process.env.LOKI_FROSTD_URL || "";
 const rpId = process.env.LOKI_RP_ID || "";
 const ceremonyOrigins = process.env.LOKI_CEREMONY_ORIGINS || "http://127.0.0.1:* http://localhost:*";
+// Native `[WitnessConfig; 2]` (byte arrays) → hex for the page; empty when unset.
+const hex = (bytes) => Buffer.from(bytes).toString("hex");
+const nonceWitnesses = process.env.LOKI_NONCE_WITNESSES
+  ? JSON.parse(readFileSync(process.env.LOKI_NONCE_WITNESSES, "utf8")).map((w) => ({
+      endpoint: w.endpoint, key: hex(w.key), run: hex(w.run), mailbox: hex(w.mailbox), read: hex(w.read),
+    }))
+  : [];
 
 // The whole servable bundle, read ONCE at startup: the page files plus the two wasm-pack
 // pkgs. Requests are answered from this snapshot by exact path, so nothing else on disk is
@@ -55,7 +66,7 @@ if (process.argv.includes("--hash")) {
   console.log(JSON.stringify(build, null, 2));
   process.exit(0);
 }
-bundle.set("/config.json", Buffer.from(JSON.stringify({ walletOrigin, frostdUrl, rpId })));
+bundle.set("/config.json", Buffer.from(JSON.stringify({ walletOrigin, frostdUrl, rpId, nonceWitnesses })));
 bundle.set("/build-hash.json", Buffer.from(JSON.stringify(build)));
 
 // Strict CSP on every response (the page, the Worker script and its imports all get it).
@@ -67,7 +78,7 @@ const csp = [
   "script-src 'self' 'wasm-unsafe-eval'",
   "worker-src 'self'",
   "style-src 'self'",
-  `connect-src 'self' ${frostdUrl ? new URL(frostdUrl).origin : ""} ${ceremonyOrigins}`.replace(/\s+/g, " ").trim(),
+  `connect-src 'self' ${frostdUrl ? new URL(frostdUrl).origin : ""} ${nonceWitnesses.map((w) => new URL(w.endpoint).origin).join(" ")} ${ceremonyOrigins}`.replace(/\s+/g, " ").trim(),
   "img-src 'self'",
   "base-uri 'none'",
   "form-action 'none'",

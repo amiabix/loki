@@ -1600,14 +1600,7 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
                     .ok_or_else(|| SignerError::Other("own commitment absent".into()))?;
                 let cid = crate::signing_session::nonce_claim_id(&self.vault_id, &member, commitment)
                     .map_err(SignerError::Other)?;
-                // The witness stores only a digest of what the nonce signs: no sighash or
-                // randomizer reaches the relay operators.
-                let mut digest = blake3::Hasher::new();
-                digest.update(b"Loki_hosted_nonce_use_v1\0");
-                digest.update(&local_sighash);
-                digest.update(&seed);
-                let mut record = cid.to_vec();
-                record.extend_from_slice(digest.finalize().as_bytes());
+                let record = crate::signing_session::nonce_claim_record(&cid, &local_sighash, &seed);
                 witness
                     .claim(cid, &record)
                     .map_err(|e| SignerError::Other(format!("nonce witness refused: {e}")))?;

@@ -839,6 +839,19 @@ pub fn nonce_claim_id(
     Ok(hash.finalize().into())
 }
 
+/// The record a signer claims at the nonce witnesses for one use of a nonce: the claim ID and
+/// a digest of what the nonce signs, so no sighash or randomizer reaches the relay operators.
+/// One derivation for `LocalSigner::sign_approve` and any signer that claims ahead of it.
+pub fn nonce_claim_record(cid: &[u8; 32], sighash: &[u8; 32], randomizer: &[u8; 32]) -> Vec<u8> {
+    let mut digest = blake3::Hasher::new();
+    digest.update(b"Loki_hosted_nonce_use_v1\0");
+    digest.update(sighash);
+    digest.update(randomizer);
+    let mut record = cid.to_vec();
+    record.extend_from_slice(digest.finalize().as_bytes());
+    record
+}
+
 /// Implementations must verify fresh signed receipts from two fixed, distinct relay
 /// identities. Operators must be checked separately. A duplicate claim is a refusal.
 pub trait NonceWitness {

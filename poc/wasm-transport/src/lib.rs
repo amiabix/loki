@@ -282,6 +282,92 @@ impl WasmFrostdTransport {
     }
 }
 
+/// One external nonce witness (a relay mailbox), as the operator provisions it for native
+/// members (`poc/src/host/nonce_witness.rs` `WitnessConfig`): the relay's pinned signing key
+/// and run, the mailbox, and the mailbox's owner-read capability.
+pub struct NonceWitnessRoute {
+    pub endpoint: String,
+    pub key: [u8; 32],
+    pub run: [u8; 32],
+    pub mailbox: [u8; 32],
+    pub read: Zeroizing<[u8; 32]>,
+}
+
+const RECEIPT_CAP: usize = 4096;
+
+/// Claim `cid` once at one witness, the same request and receipt check as the native relay
+/// client (`loki_relay_client::RelayHttp::claim_nonce`): PUT the record under a fresh
+/// challenge, then accept only a canonical receipt signed by the PINNED relay key that binds
+/// this mailbox, CID, record hash and challenge. `Ok(true)` is a fresh claim; `Ok(false)` an
+/// existing one (a duplicate, which a signer must treat as a refusal).
+pub async fn claim_nonce(
+    client: &reqwest::Client,
+    route: &NonceWitnessRoute,
+    cid: [u8; 32],
+    record: &[u8],
+) -> Result<bool, String> {
+    use base64::Engine;
+    use loki_relay_protocol::{canonical::{self, Value}, nonce};
+    use sha2::Digest;
+    require_tls_off_loopback(&route.endpoint)?;
+    if record.is_empty() || record.len() > nonce::MAX_RECORD {
+        return Err("nonce witness record size".into());
+    }
+    let mut challenge = [0u8; 32];
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut challenge);
+    let token = Zeroizing::new(format!(
+        "Bearer {}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(*route.read)
+    ));
+    let url = format!(
+        "{}/v1/mailboxes/{}/nonces/{}",
+        route.endpoint.trim_end_matches('/'),
+        hex::encode(route.mailbox),
+        hex::encode(cid)
+    );
+    let resp = client
+        .put(url)
+        .header("authorization", token.as_str())
+        .header("content-type", "application/octet-stream")
+        .header("x-loki-challenge", hex::encode(challenge))
+        .body(record.to_vec())
+        .send()
+        .await
+        .map_err(|e| format!("nonce witness: {e}"))?;
+    let status = resp.status().as_u16();
+    if status != 200 && status != 201 {
+        return Err(format!("nonce witness refused the claim ({status})"));
+    }
+    let raw = resp.bytes().await.map_err(|e| format!("nonce witness: {e}"))?;
+    if raw.len() > RECEIPT_CAP {
+        return Err("nonce witness receipt too large".into());
+    }
+    let bad = || "nonce witness receipt does not verify".to_string();
+    let Value::Array(parts) = canonical::decode(&raw, RECEIPT_CAP).map_err(|_| bad())? else {
+        return Err(bad());
+    };
+    let [Value::Bytes(body), Value::Bytes(signature)] = parts.as_slice() else {
+        return Err(bad());
+    };
+    let receipt = nonce::decode_body(body).map_err(|_| bad())?;
+    if nonce::encode_body(&receipt).map_err(|_| bad())? != *body
+        || receipt.pin.key != route.key
+        || receipt.pin.run != route.run
+        || receipt.mailbox != route.mailbox
+        || receipt.cid != cid
+        || receipt.challenge != challenge
+        || receipt.record_hash != <[u8; 32]>::from(sha2::Sha256::digest(record))
+        || receipt.created != (status == 201)
+    {
+        return Err(bad());
+    }
+    let key = ed25519_dalek::VerifyingKey::from_bytes(&route.key).map_err(|_| bad())?;
+    let signature = ed25519_dalek::Signature::from_slice(signature).map_err(|_| bad())?;
+    key.verify_strict(&nonce::signature_input(body).map_err(|_| bad())?, &signature)
+        .map_err(|_| bad())?;
+    Ok(receipt.created)
+}
+
 /// JS bindings (W1G): the signer Worker drives DKG by pumping these async methods between
 /// the synchronous wasm `Signer` and frostd. A thin wrapper over [`WasmFrostdTransport`] that
 /// holds the one session id the coordinator published, so the Worker passes only opaque hex.
@@ -298,6 +384,29 @@ mod wasm_api {
             .map_err(je)?
             .try_into()
             .map_err(|_| JsError::new("expected 32 bytes of hex"))
+    }
+
+    /// Claim a nonce at one external witness: `true` only for a fresh claim whose receipt the
+    /// pinned relay key signed (see [`claim_nonce`]); `false` for an existing claim. Hex args.
+    #[wasm_bindgen(js_name = claimNonce)]
+    pub async fn claim_nonce_js(
+        endpoint: String,
+        key_hex: String,
+        run_hex: String,
+        mailbox_hex: String,
+        read_hex: String,
+        cid_hex: String,
+        record_hex: String,
+    ) -> Result<bool, JsError> {
+        let route = NonceWitnessRoute {
+            endpoint,
+            key: hex32(&key_hex)?,
+            run: hex32(&run_hex)?,
+            mailbox: hex32(&mailbox_hex)?,
+            read: Zeroizing::new(hex32(&read_hex)?),
+        };
+        let record = hex::decode(record_hex).map_err(je)?;
+        claim_nonce(&reqwest::Client::new(), &route, hex32(&cid_hex)?, &record).await.map_err(je)
     }
 
     /// A logged-in browser frostd client bound to one DKG session. Addressed on the relay by
@@ -455,6 +564,28 @@ mod live {
         let secret = [7u8; 32];
         let pubkey = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(secret)).to_bytes();
         (secret, pubkey)
+    }
+
+    /// Live: the two dev witness relays `poc/scripts/native_e2e.sh` provisions, named by
+    /// `LOKI_NONCE_WITNESSES` (the native `[WitnessConfig; 2]` JSON). A fresh claim is accepted
+    /// at each; the same claim again is a duplicate; a receipt from an unpinned key is refused.
+    #[tokio::test]
+    #[ignore = "needs two provisioned witness relays (LOKI_NONCE_WITNESSES)"]
+    async fn witnesses_accept_a_claim_once_and_refuse_a_duplicate() {
+        #[derive(serde::Deserialize)]
+        struct Config { endpoint: String, key: [u8; 32], run: [u8; 32], mailbox: [u8; 32], read: [u8; 32] }
+        let path = std::env::var("LOKI_NONCE_WITNESSES").expect("LOKI_NONCE_WITNESSES");
+        let configs: [Config; 2] = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let client = reqwest::Client::new();
+        let mut cid = [0u8; 32];
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut cid);
+        for c in configs {
+            let route = NonceWitnessRoute { endpoint: c.endpoint, key: c.key, run: c.run, mailbox: c.mailbox, read: Zeroizing::new(c.read) };
+            assert!(claim_nonce(&client, &route, cid, b"first use").await.unwrap(), "fresh claim");
+            assert!(!claim_nonce(&client, &route, cid, b"first use").await.unwrap(), "duplicate is not fresh");
+            let forged = NonceWitnessRoute { key: [9; 32], ..route };
+            assert!(claim_nonce(&client, &forged, cid, b"first use").await.is_err(), "unpinned key");
+        }
     }
 
     #[tokio::test]
