@@ -138,7 +138,20 @@ ce2af70ad66490d1debe087c9d10ff62e688c25cda256c41b1daaa3510b43647  target/release
 f2907a8dea9f895f1ca451f8e2deb16f85ba835d3cd631c9d4f9e49c2a8323f2  wasm-pkg/loki_signer_wasm_bg.wasm
 218b0373097414c1408a2627db2faf5db42ab389312b7d93470644a8340831ab  wasm-pkg/loki_signer_wasm.js
 ```
-Hashes are per OS + arch: macOS and Linux differ, which is expected.
+Hashes are per OS + arch: macOS and Linux differ, which is expected. The native
+half also reproduced on Linux arm64 (two fresh ubuntu:24.04 containers):
+`d2ea2083ae002cfb0b17b48ea986b579120bbaa72dabd2bc2de5c9abfabe3065  loki_member_app`.
+
+**Open: the wasm signer does not link on Linux,** so the CI job fails until this is
+fixed. `loki-signer-wasm/src/lib.rs` defines secp256k1's
+`context_preallocated_*` functions in Rust, assuming no C toolchain compiles
+secp256k1 for wasm. That holds on macOS, where `ar` writes an empty
+`libsecp256k1.a` for wasm objects. On Linux the C does compile, and rust-lld
+reports `duplicate symbol: rustsecp256k1_v0_10_0_context_preallocated_size`
+(measured with default and `codegen-units=1`; forcing GNU `ar` does not help).
+So today the bundle's contents depend on the host's C archiver. The signer owner
+has to pick one of two fixes: compile the real secp256k1 C on every host and drop
+the stubs, or keep the stubs and stop the C from being linked on every host.
 
 **Still needed for independent delivery** (`ws6` §4, SECURITY.md item 8):
 - A second builder on different hardware, run by someone else, that reproduces the
