@@ -203,10 +203,10 @@ fn custody_kek(
     passphrase: Option<String>,
     prf_secret: Option<Vec<u8>>,
     create: bool,
-) -> Result<[u8; 32], String> {
+) -> Result<Zeroizing<[u8; 32]>, String> {
     match method {
         "passphrase" => {
-            let pass = passphrase.ok_or("passphrase required for passphrase custody")?;
+            let pass = Zeroizing::new(passphrase.ok_or("passphrase required for passphrase custody")?);
             let salt = if create {
                 let s = fresh_kek_salt();
                 opfs_put(SALT_PATH, &s, false)?; // fresh salt on every create
@@ -214,12 +214,12 @@ fn custody_kek(
             } else {
                 opfs_get(SALT_PATH)?.ok_or("no KEK salt — this signer is not passphrase-backed")?
             };
-            Ok(*loki_signer_core::seal_kdf::derive(&pass, &salt)
+            Ok(loki_signer_core::seal_kdf::derive(&pass, &salt)
                 .map_err(|_| "passphrase KEK derivation failed (salt too short?)".to_string())?)
         }
         "platform" | "roaming" => {
-            let prf = prf_secret.ok_or("WebAuthn PRF secret required for passkey custody")?;
-            Ok(prf_kek(&prf32(&prf)?))
+            let prf = Zeroizing::new(prf_secret.ok_or("WebAuthn PRF secret required for passkey custody")?);
+            Ok(Zeroizing::new(prf_kek(&*Zeroizing::new(prf32(&prf)?))))
         }
         other => Err(format!("unknown custody method: {other}")),
     }
@@ -238,7 +238,7 @@ fn profile_json(identity: &Identity, name: &str) -> String {
 #[wasm_bindgen]
 pub struct Signer {
     identity: Option<Identity>,
-    kek: Option<[u8; 32]>,
+    kek: Option<Zeroizing<[u8; 32]>>,
     vault: Option<VaultState>,
 }
 
@@ -296,7 +296,9 @@ impl Signer {
     }
 
     /// Drop the in-memory identity, custody KEK and any active vault signer; the session
-    /// ends. The sealed files stay on disk.
+    /// ends. Each is wiped as it drops: the KEK is `Zeroizing`, the identity's Ed25519 and
+    /// X25519 keys zeroize on drop, and the vault signer's element holds a `Zeroizing` KEK.
+    /// The sealed files stay on disk.
     #[wasm_bindgen(js_name = lock)]
     pub fn lock(&mut self) {
         self.identity = None;
@@ -320,21 +322,34 @@ impl Signer {
     // re-stamped to the vault slot on join (slot bytes overwritten, keys unchanged), exactly
     // like the native hosted `ceremony::identity` fix.
 
-    /// The X25519 frostd login key for this device (secret + public, hex). The Worker builds
-    /// the browser frostd transport from it; the public half is this member's relay address
-    /// and must equal the `encryption` key the coordinator enrolled for the slot.
-    #[wasm_bindgen(js_name = frostdLogin)]
-    pub fn frostd_login(&self) -> Result<String, JsError> {
+    /// This member's frostd relay address (X25519 public key, hex): the `encryption` key the
+    /// coordinator enrolled for the slot. The browser transport is built from this alone.
+    ///
+    /// The login key IS the roster encryption key, exactly as on native members
+    /// (poc/src/host/payment.rs `relay`): the relay addresses a member by its roster key, so
+    /// separating them is a protocol change across core + host, not a browser one. Its secret
+    /// stays inside wasm — only [`frostd_sign_challenge`](Self::frostd_sign_challenge)'s
+    /// signature leaves.
+    #[wasm_bindgen(js_name = frostdPubkey)]
+    pub fn frostd_pubkey(&self) -> Result<String, JsError> {
         let identity = self
             .identity
             .as_ref()
             .ok_or_else(|| JsError::new("unlock the signer first"))?;
-        let secret = identity.to_secret_bytes();
-        Ok(serde_json::json!({
-            "secret": hex::encode(&secret[34..66]),
-            "pubkey": hex::encode(identity.public().encryption),
-        })
-        .to_string())
+        Ok(hex::encode(identity.public().encryption))
+    }
+
+    /// XEdDSA-sign a frostd login challenge (the UUID string `FrostdClient.challenge()`
+    /// returned) with this member's relay key; returns the 64-byte signature (hex) for
+    /// `FrostdClient.loginSigned`. Signs only a parsed UUID, so it cannot be used to sign
+    /// arbitrary bytes.
+    #[wasm_bindgen(js_name = frostdSignChallenge)]
+    pub fn frostd_sign_challenge(&self, challenge: &str) -> Result<String, JsError> {
+        let identity = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| JsError::new("unlock the signer first"))?;
+        sign_challenge(identity, challenge).map_err(|e| JsError::new(&e))
     }
 
     /// This member's public enrollment identity for the coordinator's public roster:
@@ -608,7 +623,7 @@ impl BackupDevice for OpfsBackup {
 }
 
 /// The browser signer's device prompts for the vault in `dir`.
-fn browser_prompts(dir: &str, kek: [u8; 32]) -> DevicePrompts {
+fn browser_prompts(dir: &str, kek: &[u8; 32]) -> DevicePrompts {
     DevicePrompts {
         connect: Box::new(|_origin, net| browser_network(net).is_ok()),
         // The web coordinator already drove this member's roster agreement.
@@ -640,11 +655,20 @@ fn browser_network(net: Network) -> Result<Network, String> {
     }
 }
 
+fn sign_challenge(identity: &Identity, challenge: &str) -> Result<String, String> {
+    let challenge = uuid::Uuid::parse_str(challenge).map_err(|e| e.to_string())?;
+    let secret = Zeroizing::new(identity.to_secret_bytes());
+    let relay: [u8; 32] = secret[34..66].try_into().expect("32-byte X25519 secret");
+    let signing = xeddsa::xed25519::PrivateKey::from(&*Zeroizing::new(relay));
+    let sig: [u8; 64] = xeddsa::Sign::sign(&signing, challenge.as_bytes(), rand::rng());
+    Ok(hex::encode(sig))
+}
+
 /// Re-stamp a device identity to a vault slot: overwrite the 2 id bytes, keep the keys.
 fn restamp(identity: &Identity, slot: u16) -> Result<Identity, String> {
-    let mut secret = identity.to_secret_bytes();
+    let mut secret = Zeroizing::new(identity.to_secret_bytes());
     secret[..2].copy_from_slice(&slot.to_be_bytes());
-    Identity::from_secret_bytes(&secret)
+    Identity::from_secret_bytes(&secret[..])
 }
 
 fn vault_ref_json(v: &VaultRef) -> String {
@@ -790,7 +814,7 @@ impl Signer {
     }
 
     fn vault_open_impl(&mut self, vault_hex: &str) -> Result<String, String> {
-        let kek = self.kek.ok_or("unlock the signer first")?;
+        let kek = self.kek.clone().ok_or("unlock the signer first")?;
         let me = self.identity.as_ref().ok_or("unlock the signer first")?.public().encryption;
         let dir = vault_dir(vault_hex);
         if !opfs_exists(&format!("{dir}/signer.meta")) {
@@ -798,9 +822,9 @@ impl Signer {
         }
         let mut signer = LocalSigner::open(
             std::path::Path::new(&dir),
-            SoftwareSecureElement::from_kek(kek),
+            SoftwareSecureElement::from_kek(*kek),
             "vault".into(),
-            browser_prompts(&dir, kek),
+            browser_prompts(&dir, &kek),
         )
         .map_err(|e| e.to_string())?;
         let net = browser_network(signer.network())?;
@@ -853,7 +877,7 @@ impl Signer {
         network: &str,
         roster: &[u8],
     ) -> Result<String, String> {
-        let kek = self.kek.ok_or("unlock the signer first")?;
+        let kek = self.kek.clone().ok_or("unlock the signer first")?;
         let identity = self.identity.as_ref().ok_or("unlock the signer first")?;
         let vault_id: [u8; 32] = hex::decode(vault_hex)
             .map_err(|e| e.to_string())?
@@ -862,8 +886,8 @@ impl Signer {
         let net = parse_network(network)?;
         let stamped = restamp(identity, slot)?;
         let dir = vault_dir(vault_hex);
-        let se = SoftwareSecureElement::from_kek(kek);
-        let prompts = browser_prompts(&dir, kek);
+        let se = SoftwareSecureElement::from_kek(*kek);
+        let prompts = browser_prompts(&dir, &kek);
         let path = std::path::Path::new(&dir);
         let mut signer = if opfs_exists(&format!("{dir}/signer.meta")) {
             LocalSigner::open(path, se, label.to_string(), prompts)
@@ -912,10 +936,10 @@ impl Signer {
             return Err("a signer already exists in this browser".into());
         }
         let kek = custody_kek(method, passphrase, prf_secret, true)?;
-        let se = SoftwareSecureElement::from_kek(kek);
+        let se = SoftwareSecureElement::from_kek(*kek);
         let identity = Identity::new(1);
-        let secret = identity.to_secret_bytes();
-        let sealed = SealedShare::seal(&se, 0, &secret)?;
+        let secret = Zeroizing::new(identity.to_secret_bytes());
+        let sealed = SealedShare::seal(&se, 0, &secret[..])?;
         opfs_put(IDENTITY_PATH, &sealed.to_bytes(), true)?; // write-once
         opfs_put(PROFILE_PATH, profile_json(&identity, name).as_bytes(), false)?;
         let out = profile_json(&identity, name);
@@ -931,7 +955,7 @@ impl Signer {
         prf_secret: Option<Vec<u8>>,
     ) -> Result<String, String> {
         let kek = custody_kek(method, passphrase, prf_secret, false)?;
-        let se = SoftwareSecureElement::from_kek(kek);
+        let se = SoftwareSecureElement::from_kek(*kek);
         let raw = opfs_get(IDENTITY_PATH)?.ok_or("no signer in this browser — create one first")?;
         let secret = SealedShare::from_bytes(&raw)?.open(&se)?;
         let identity = Identity::from_secret_bytes(&secret)?;
@@ -973,8 +997,34 @@ mod tests {
             assert!(parse_network(other).is_err(), "{other:?} must be refused");
         }
         // The connect prompt refuses through the same gate.
-        let mut prompts = browser_prompts("loki/vaults/x/signer", [0u8; 32]);
+        let mut prompts = browser_prompts("loki/vaults/x/signer", &[0u8; 32]);
         assert!((prompts.connect)("https://coordinator", Network::Testnet));
+    }
+
+    #[wasm_bindgen_test]
+    fn frostd_challenge_is_signed_in_wasm_with_the_relay_key() {
+        let identity = Identity::new(1);
+        let relay = identity.public().encryption;
+        let challenge = uuid::Uuid::from_bytes([9u8; 16]);
+        let sig: [u8; 64] = hex::decode(sign_challenge(&identity, &challenge.to_string()).unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        // Exactly what frostd checks: xed25519 over the 16 challenge bytes, by the relay pubkey.
+        let public = xeddsa::xed25519::PublicKey::from(&x25519_dalek::PublicKey::from(relay));
+        assert!(xeddsa::Verify::verify(&public, challenge.as_bytes(), &sig).is_ok());
+        assert!(xeddsa::Verify::verify(&public, b"other bytes", &sig).is_err());
+        assert!(sign_challenge(&identity, "not a uuid").is_err());
+    }
+
+    #[wasm_bindgen_test]
+    fn lock_drops_identity_and_kek() {
+        let mut signer = Signer::new();
+        signer.identity = Some(Identity::new(1));
+        signer.kek = Some(Zeroizing::new([5u8; 32]));
+        signer.lock();
+        assert!(signer.identity.is_none() && signer.kek.is_none() && signer.vault.is_none());
+        assert!(!signer.is_unlocked());
     }
 
     #[wasm_bindgen_test]

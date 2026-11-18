@@ -127,28 +127,27 @@ mod hex_bytes {
 }
 
 /// A browser `frostd` client for one logged-in member. Addressed on the relay by the
-/// public half of its X25519 login key; the secret only XEdDSA-signs the login challenge.
+/// public half of its X25519 login key. It never holds that key's secret: the key owner (the
+/// wasm signer) signs the challenge and hands over only the signature
+/// ([`login_signed`](Self::login_signed)).
 /// Unlike [`FrostdTransport`](../poc) it owns no tokio runtime — every method `.await`s.
 pub struct WasmFrostdTransport {
     base_url: String,
     client: reqwest::Client,
     me: [u8; 32],
-    login_secret: Zeroizing<[u8; 32]>,
     token: Option<Uuid>,
 }
 
 impl WasmFrostdTransport {
-    /// `base_url` like `https://relay.example` (https off loopback). `login_secret` is the
-    /// 32-byte X25519 login secret; `me` is its public half (the relay address). Call
-    /// [`login`](Self::login) before any session call.
-    pub fn new(base_url: &str, login_secret: [u8; 32], me: [u8; 32]) -> Result<Self, TransportError> {
+    /// `base_url` like `https://relay.example` (https off loopback). `me` is the X25519 login
+    /// public key (the relay address). Log in before any session call.
+    pub fn new(base_url: &str, me: [u8; 32]) -> Result<Self, TransportError> {
         require_tls_off_loopback(base_url).map_err(TransportError::Http)?;
         let client = reqwest::Client::new();
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             client,
             me,
-            login_secret: Zeroizing::new(login_secret),
             token: None,
         })
     }
@@ -179,19 +178,23 @@ impl WasmFrostdTransport {
         serde_json::from_str(&text).map_err(|e| TransportError::Decode(e.to_string()))
     }
 
-    /// `challenge` → XEdDSA-sign it → `login`, caching the bearer token. Byte-for-byte the
-    /// scheme frostd verifies (`frostd/src/functions.rs::login`), same as the native path.
-    pub async fn login(&mut self) -> Result<(), TransportError> {
+    /// Fetch a login challenge. The key owner XEdDSA-signs its 16 UUID bytes and passes the
+    /// signature to [`login_signed`](Self::login_signed).
+    pub async fn challenge(&self) -> Result<Uuid, TransportError> {
         let ch: ChallengeOut = self.post("challenge", json!({})).await?;
-        let signing = xeddsa::xed25519::PrivateKey::from(&*self.login_secret);
-        let sig: [u8; 64] = xeddsa::Sign::sign(&signing, ch.challenge.as_bytes(), rand::rng());
+        Ok(ch.challenge)
+    }
+
+    /// Present a signed challenge and cache the bearer token. Byte-for-byte the scheme frostd
+    /// verifies (`frostd/src/functions.rs::login`), same as the native path.
+    pub async fn login_signed(&mut self, challenge: Uuid, signature: [u8; 64]) -> Result<(), TransportError> {
         let out: LoginOut = self
             .post(
                 "login",
                 json!({
-                    "challenge": ch.challenge,
+                    "challenge": challenge,
                     "pubkey": hex::encode(self.me),
-                    "signature": hex::encode(sig),
+                    "signature": hex::encode(signature),
                 }),
             )
             .await?;
@@ -307,17 +310,28 @@ mod wasm_api {
 
     #[wasm_bindgen]
     impl FrostdClient {
-        /// `base_url` is the TLS frostd (https off loopback). `secret_hex`/`pubkey_hex` are the
-        /// member's X25519 login key, from the wasm signer's `frostdLogin()`.
+        /// `base_url` is the TLS frostd (https off loopback). `pubkey_hex` is the member's
+        /// X25519 login public key, from the wasm signer's `frostdPubkey()`. No secret here.
         #[wasm_bindgen(constructor)]
-        pub fn new(base_url: &str, secret_hex: &str, pubkey_hex: &str) -> Result<FrostdClient, JsError> {
-            let inner = WasmFrostdTransport::new(base_url, hex32(secret_hex)?, hex32(pubkey_hex)?).map_err(je)?;
+        pub fn new(base_url: &str, pubkey_hex: &str) -> Result<FrostdClient, JsError> {
+            let inner = WasmFrostdTransport::new(base_url, hex32(pubkey_hex)?).map_err(je)?;
             Ok(Self { inner, session: None })
         }
 
-        /// Challenge → XEdDSA-sign → login, caching the bearer token.
-        pub async fn login(&mut self) -> Result<(), JsError> {
-            self.inner.login().await.map_err(je)
+        /// A fresh login challenge (UUID string) for the wasm signer's `frostdSignChallenge`.
+        pub async fn challenge(&self) -> Result<String, JsError> {
+            Ok(self.inner.challenge().await.map_err(je)?.to_string())
+        }
+
+        /// Log in with the challenge and the signer's XEdDSA signature (hex), caching the token.
+        #[wasm_bindgen(js_name = loginSigned)]
+        pub async fn login_signed(&mut self, challenge: &str, signature_hex: &str) -> Result<(), JsError> {
+            let challenge = Uuid::parse_str(challenge).map_err(je)?;
+            let sig: [u8; 64] = hex::decode(signature_hex)
+                .map_err(je)?
+                .try_into()
+                .map_err(|_| JsError::new("expected a 64-byte signature"))?;
+            self.inner.login_signed(challenge, sig).await.map_err(je)
         }
 
         /// Every session id this member participates in (NAT-free discovery), as hex strings.
@@ -447,8 +461,11 @@ mod live {
     #[ignore = "needs a frostd on http://127.0.0.1:2744"]
     async fn round_trip_over_fetch_wire() {
         let (secret, me) = gen_login();
-        let mut t = WasmFrostdTransport::new("http://127.0.0.1:2744", secret, me).unwrap();
-        t.login().await.expect("login");
+        let mut t = WasmFrostdTransport::new("http://127.0.0.1:2744", me).unwrap();
+        let challenge = t.challenge().await.expect("challenge");
+        let signing = xeddsa::xed25519::PrivateKey::from(&secret);
+        let sig: [u8; 64] = xeddsa::Sign::sign(&signing, challenge.as_bytes(), rand::rng());
+        t.login_signed(challenge, sig).await.expect("login");
         // One-member session with self as the only participant: create, send to coordinator,
         // drain the coordinator mailbox, close.
         let session = t.open(&[me], 1).await.expect("create");
