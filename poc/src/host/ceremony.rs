@@ -1023,7 +1023,7 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
             VaultNetwork::Testnet => Network::Testnet,
         };
         // DKG never signs a payment; any request still goes to the member, or is refused.
-        let prompts = hosted_prompts(&signer_dir, pass, super::approval_policy(st.approval.clone(), signer_network));
+        let prompts = hosted_prompts(&signer_dir, pass, super::approval_policy(st.approval.clone(), signer_network, c.my_slot));
         let mut signer = if signer_dir.join("signer.meta").exists() {
             LocalSigner::open(&signer_dir, se, c.name.clone(), prompts)
         } else {

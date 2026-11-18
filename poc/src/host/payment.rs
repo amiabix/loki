@@ -1353,7 +1353,7 @@ fn sign(
     // member's own native decision approves, and headless members refuse.
     let mut signer = super::custody::open_signer(
         st, data, pass, &p.vault, v.slot,
-        super::approval_policy(st.approval.clone(), signer_network),
+        super::approval_policy(st.approval.clone(), signer_network, v.slot),
     )?;
     signer.set_nonce_witness(Box::new(witness));
     if let Some(inputs) = &owned {

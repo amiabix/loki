@@ -125,7 +125,7 @@ pub extern "C" fn loki_signer_approval_selftest(approve: NativeApprove) -> i32 {
             2,
             3,
             |_| crate::signer::secure_element::SoftwareSecureElement::generate(),
-            |_| Some(crate::host::approval_policy(Some(native_approval(approve)), crate::signer::Network::Regtest)),
+            |slot| Some(crate::host::approval_policy(Some(native_approval(approve)), crate::signer::Network::Regtest, slot)),
         )
     });
     match r {
