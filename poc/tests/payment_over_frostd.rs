@@ -246,6 +246,7 @@ where
                 let proposer = publics[0].clone();
                 let context = context.clone();
                 let handoff = &handoff;
+                let request = &params;
                 let public_bytes = public.serialize().unwrap();
                 let signer_public = public.clone();
                 let signer_fvk = fvk.clone();
@@ -264,7 +265,7 @@ where
                         &member_tx,
                         &channel,
                         &mut signer, &signer_session, &candidate, &signer_public, id,
-                        proposer_inputs, &identity, &context, &proposer, &other_signers,
+                        request, proposer_inputs.is_some(), &identity, &context, &proposer, &other_signers,
                         &|| Ok(()),
                         &mut |bytes| {
                             if proposer_inputs.is_some() {

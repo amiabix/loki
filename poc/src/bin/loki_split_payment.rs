@@ -16,7 +16,9 @@ use loki_poc::member_state::{self, MemberState};
 use loki_poc::signer::local::LocalSigner;
 use loki_poc::signer::secure_element::SoftwareSecureElement;
 use loki_poc::signer::wysiwys;
-use loki_poc::signer::{CandidateRef, Network as SignerNetwork, Session, Signer};
+use loki_poc::signer::{
+    CandidateRef, Network as SignerNetwork, PublicPaymentParams, Session, Signer,
+};
 use loki_poc::wallet_store::{sync_member_wallet, Lightwalletd};
 
 use orchard::keys::Scope;
@@ -137,6 +139,13 @@ fn run() -> Result<(), String> {
     let notes = funding.notes.clone();
     let nulls: Vec<[u8; 32]> = notes.iter().map(|n| n.nullifier(&m1.fvk).to_bytes()).collect();
     let change = Zatoshis::from_u64(funding.change_zat).map_err(|e| format!("change: {e:?}"))?;
+    let params = PublicPaymentParams {
+        recipient,
+        amount,
+        memo: memo.clone(),
+        target_height: height,
+        expiry_height: height + 40,
+    };
     let inputs = CandidateInputs {
         vault_fvk: &m1.fvk,
         notes: notes.clone(),
@@ -238,10 +247,10 @@ fn run() -> Result<(), String> {
     for (i, cand) in cands.iter().enumerate() {
         let pkg = frost::SigningPackage::new(sets[i].clone(), &sighash);
         let share1 = s1
-            .sign_approve(&sess1, cand, &pczt_bytes, &pkg, &seeds[i])
+            .sign_approve(&sess1, cand, &params, &pczt_bytes, &pkg, &seeds[i])
             .map_err(|e| format!("sign_approve m1 spend {i}: {e}"))?;
         let share2 = s2
-            .sign_approve(&sess2, cand, &pczt_bytes, &pkg, &seeds[i])
+            .sign_approve(&sess2, cand, &params, &pczt_bytes, &pkg, &seeds[i])
             .map_err(|e| format!("sign_approve m2 spend {i}: {e}"))?;
         let mut shares = BTreeMap::new();
         shares.insert(id1, share1);

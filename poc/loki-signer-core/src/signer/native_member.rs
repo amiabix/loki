@@ -259,7 +259,7 @@ pub fn prove_dkg_member_with<SE: SecureElement>(
         to: recipient.to_raw_address_bytes(), amount_zat: 40_000_000, fee_zat: fee,
         change_zat: 625_000_000 - 40_000_000 - fee, memo: intent.memo.as_array().to_vec(),
         network_branch_id: u32::from(zcash_protocol::consensus::BranchId::for_height(
-            &crate::candidate::Regtest, zcash_protocol::consensus::BlockHeight::from_u32(intent.target_height))), fee_verified: true,
+            &crate::candidate::Regtest, zcash_protocol::consensus::BlockHeight::from_u32(intent.target_height))), fee_verified: true, expiry_height: intent.expiry_height,
     };
     for approval in &approvals {
         *approval.lock().map_err(|e| e.to_string())? = Some((cand, view.clone()));
@@ -291,7 +291,7 @@ mod tests {
         let mut device = prompts(reviewed.clone(), None);
         let candidate = CandidateRef { vault_id: [1; 32], payment_id: [2; 32], attempt_id: [3; 32] };
         let view = PaymentView { to: [4; 43], amount_zat: 1, fee_zat: 1, change_zat: 1,
-            memo: vec![], network_branch_id: 1, fee_verified: true };
+            memo: vec![], expiry_height: 1, network_branch_id: 1, fee_verified: true };
         let request = super::super::local::ApprovalRequest { candidate: &candidate, sighash: [5; 32], view: &view };
         assert!(!(device.approval)(&request));
         *reviewed.lock().unwrap() = Some((candidate, view.clone()));

@@ -190,6 +190,7 @@ mod tests {
                 &mut self,
                 _: &Session,
                 _: &crate::signer::CandidateRef,
+                _: &crate::signer::PublicPaymentParams,
                 _: &[u8],
                 _: &reddsa_frost::frost::redpallas::SigningPackage,
                 _: &[u8],

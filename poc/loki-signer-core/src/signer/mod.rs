@@ -293,9 +293,11 @@ pub trait Signer {
     ) -> Result<CandidatePczt, Self::Error>;
 
     /// Round 2 (rerandomized): BLOCKS on in-signer parse + render + approval + sighash
-    /// binding. The signer independently parses `pczt`, renders it (WYSIWYS), requires an
-    /// approval decision, and VERIFIES that `pkg.message()` equals the sighash recomputed
-    /// from the rendered bytes — refusing BEFORE touching the nonce/share if they differ.
+    /// binding. The signer independently parses `pczt`, checks its payment effects against
+    /// `params`, renders it (WYSIWYS), requires an approval decision, and VERIFIES that
+    /// `pkg.message()` equals the sighash recomputed from the rendered bytes — refusing
+    /// BEFORE touching the nonce/share if they differ. `params` comes from the coordinator;
+    /// the approval decision must use the independently derived render.
     /// Only then is the PUBLIC partial signature produced under single-use nonce rules.
     /// `randomizer` is the 32-byte rerandomization seed (the coordinator's public per-pair
     /// seed; the randomizer scalar is regenerated from it + the commitments).
@@ -303,6 +305,7 @@ pub trait Signer {
         &mut self,
         session: &Session,
         cand: &CandidateRef,
+        params: &PublicPaymentParams,
         pczt: &[u8],
         pkg: &frost::SigningPackage,
         randomizer: &[u8],

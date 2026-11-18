@@ -1419,13 +1419,15 @@ fn sign(
         payment_id: hex32(&p.attempt)?,
         attempt_id: hex32(&p.attempt)?,
     };
-    let params = owned.as_ref().map(|inputs| PublicPaymentParams {
-        recipient: inputs.recipient,
-        amount: inputs.amount,
-        memo: inputs.memo.clone(),
-        target_height: inputs.target_height,
-        expiry_height: inputs.expiry_height,
-    });
+    // Every signer checks its candidate against the request it reviewed; the proposer also
+    // builds from it.
+    let params = PublicPaymentParams {
+        recipient: vault::orchard_receiver_from_ua(&p.recipient, v.network.network_type())?,
+        amount: Zatoshis::from_u64(p.amount_zat).map_err(|e| format!("amount: {e:?}"))?,
+        memo: MemoBytes::from_bytes(p.memo.as_bytes()).map_err(|e| format!("memo: {e:?}"))?,
+        target_height: p.target_height,
+        expiry_height: tx_expiry(p),
+    };
     let other_signers = p
         .signers
         .iter()
@@ -1452,7 +1454,8 @@ fn sign(
         &candidate,
         &v.public,
         frost::Identifier::try_from(v.slot).map_err(|e| e.to_string())?,
-        params.as_ref(),
+        &params,
+        proposer,
         &v.identity,
         &context,
         &v.peers[&p.proposer],

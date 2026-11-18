@@ -391,7 +391,7 @@ fn new_signer_setup_reaches_ready_only_after_every_receipt_and_signs() {
         );
         let share = first
             .signer
-            .sign_approve(&first.session, &cand, &pczt, &pkg, &seed)
+            .sign_approve(&first.session, &cand, &super::tests::payment_params(&fvk), &pczt, &pkg, &seed)
             .expect("a DKG-born share signs");
         assert_eq!(share.serialize().len(), 32);
     }

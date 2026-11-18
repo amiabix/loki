@@ -180,7 +180,7 @@ mod tests {
         let to = orchard::keys::FullViewingKey::from(&sk).address_at(0u64, orchard::keys::Scope::External);
         let view = PaymentView {
             to: to.to_raw_address_bytes(), amount_zat: 40_000_000, fee_zat: 15_000, change_zat: 5,
-            memo: b"rent".to_vec(), network_branch_id: 0x77190ad8, fee_verified: true,
+            memo: b"rent".to_vec(), expiry_height: 1_152, network_branch_id: 0x77190ad8, fee_verified: true,
         };
         let candidate = CandidateRef { vault_id: [1; 32], payment_id: [2; 32], attempt_id: [3; 32] };
         let request = ApprovalRequest { candidate: &candidate, sighash: [9; 32], view: &view };
