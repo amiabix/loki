@@ -1875,12 +1875,12 @@ fn discardable(data: &Path, p: &Payment) -> Result<(), String> {
     {
         return Err("only an open request, a failed unsigned payment or a draft can be discarded".into());
     }
-    let burn = member_dir(data, &p.vault)?
-        .path()
-        .join("signer-nonces")
-        .join(format!("{}{}.burn", p.attempt, p.attempt));
-    if burn.try_exists().map_err(|e| e.to_string())? {
-        return Err("a signature share was released; keep the input reserved for recovery".into());
+    let dir = member_dir(data, &p.vault)?;
+    let burn = format!("{}{}.burn", p.attempt, p.attempt);
+    for nonces in ["signer/nonces", "signer-nonces"] {
+        if dir.path().join(nonces).join(&burn).try_exists().map_err(|e| e.to_string())? {
+            return Err("a signature share was released; keep the input reserved for recovery".into());
+        }
     }
     Ok(())
 }
@@ -1915,7 +1915,7 @@ fn stop_payment(
     }
     discardable(data, p)?;
     // Published and not failed: an open request, or a cancel interrupted after `discarding`.
-    let cancel = p.error.is_none() && p.control_session_id.is_some();
+    let cancel = !p.approval_started && p.error.is_none() && p.control_session_id.is_some();
     if !cancel
         && st
             .active_payments
@@ -1927,13 +1927,12 @@ fn stop_payment(
     }
     p.phase = "discarding".into();
     save_payment(data, pass, p)?;
-    if p.control_session_id.is_some() {
-        // Sent before the session ids change: members match it against their copy. A failed
-        // attempt can never complete either: the proposer signs in every group and released
-        // no share (`discardable`), so members stop reserving its note.
-        send_control(&st.config.frostd_url, v, p, "cancelled", &members(v))?;
-    }
     if let Some(session) = p.session_id {
+        // Every group needs this proposer, which hasn't released a share (`discardable`).
+        // `discarding` prevents it from signing later, even if the relay lost both sessions.
+        if p.control_session_id.is_some() {
+            let _ = send_control(&st.config.frostd_url, v, p, "cancelled", &members(v));
+        }
         let coord = Identity::from_secret_bytes(
             &hex::decode(
                 p.coordinator_secret
@@ -1942,8 +1941,9 @@ fn stop_payment(
             )
             .map_err(|e| e.to_string())?,
         )?;
-        let mut tx = relay(&coord, &st.config.frostd_url)?;
-        close_if_present(&mut tx, session)?;
+        if relay(&coord, &st.config.frostd_url).and_then(|mut tx| close_if_present(&mut tx, session)).is_err() {
+            eprintln!("payment {}: frostd close discarded signing session error", p.attempt);
+        }
         p.session_id = None;
         save_payment(data, pass, p)?;
     }
@@ -2397,6 +2397,44 @@ mod tests {
         .unwrap();
         assert!(discardable(&data, &p).is_err());
         refused(&p, &a, "signature share was released");
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
+    fn testnet_discard_can_resume_when_frostd_lost_the_sessions() {
+        let Ok(url) = std::env::var("FROSTD_URL") else { return };
+        let data = std::env::temp_dir().join(format!("loki-discard-lost-{}", Uuid::new_v4()));
+        let a = Identity::new(1);
+        let b = Identity::new(2);
+        let peers = BTreeMap::from([(1, a.public()), (2, b.public())]);
+        let everyone = peers.values().map(|m| Peer(m.encryption)).collect::<Vec<_>>();
+        let v = member(&a, &peers);
+        let coord = Identity::new(0);
+        let mut signing = relay(&coord, &url).unwrap();
+        let mut control = relay(&a, &url).unwrap();
+        let st = state(&data, &url);
+        let vault = hex::encode([2; 32]);
+        for (i, phase) in ["signing", "discarding"].into_iter().enumerate() {
+            let mut p = open_payment(&vault, 1);
+            p.attempt = hex::encode([i as u8 + 1; 32]);
+            p.phase = phase.into();
+            p.coordinator_secret = Some(hex::encode(coord.to_secret_bytes()));
+            let signing_ch = signing.open(&everyone, 4).unwrap();
+            let control_ch = control.open(&everyone, 4).unwrap();
+            p.session_id = Some(signing_ch.session_id());
+            p.control_session_id = Some(control_ch.session_id());
+            save_payment(&data, "pass", &p).unwrap();
+            signing.close(signing_ch).unwrap();
+            control.close(control_ch).unwrap();
+            let error = send_control(&url, &v, &p, "cancelled", &[2]).unwrap_err();
+            assert!(error.contains("session was not found"), "{error}");
+
+            let mut p = read_payment(&data, "pass", &vault, &p.attempt).unwrap();
+            stop_payment(&st, &data, "pass", &v, &mut p).unwrap();
+            let saved = read_payment(&data, "pass", &vault, &p.attempt).unwrap();
+            assert_eq!(saved.phase, "discarding");
+            assert!(saved.session_id.is_none(), "safe to proceed with the local release");
+        }
         std::fs::remove_dir_all(data).unwrap();
     }
 
