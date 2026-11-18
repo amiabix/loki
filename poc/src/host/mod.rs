@@ -7,7 +7,6 @@ mod ceremony;
 mod custody;
 mod device;
 mod payment;
-#[cfg(feature = "relay-communication")]
 mod nonce_witness;
 mod recovery;
 mod registration;
