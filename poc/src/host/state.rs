@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use tokio::sync::RwLock;
 use zeroize::Zeroizing;
 
-use crate::signer::secure_element::{SecureElement, SoftwareSecureElement, WrappedDek};
+use crate::signer::secure_element::{OpenError, SecureElement, SoftwareSecureElement, WrappedDek};
 
 /// Launch configuration for one member coordinator (one process per member).
 pub struct Config {
@@ -73,6 +73,12 @@ impl Config {
     }
 
     pub(super) fn open_secure_element(&self, dir: &Path, pass: &str) -> Result<HostedSecureElement, String> {
+        let result = self.open_element(dir, pass);
+        eprintln!("secure-element open: {}", if result.is_ok() { "ok" } else { "error" });
+        result
+    }
+
+    fn open_element(&self, dir: &Path, pass: &str) -> Result<HostedSecureElement, String> {
         self.validate_secure_element()?;
         #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
         if self.secure_element == "apple" {
@@ -108,12 +114,19 @@ impl SecureElement for HostedSecureElement {
         }
     }
 
-    fn unwrap_dek(&self, wrapped: &WrappedDek) -> Result<Zeroizing<[u8; 32]>, String> {
-        match self {
+    fn unwrap_dek(&self, wrapped: &WrappedDek) -> Result<Zeroizing<[u8; 32]>, OpenError> {
+        let result = match self {
             Self::Software(se) => se.unwrap_dek(wrapped),
             #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
             Self::Apple(se) => se.unwrap_dek(wrapped),
-        }
+        };
+        let outcome = match &result {
+            Ok(_) => "ok",
+            Err(OpenError::WrongBinding(_)) => "error (wrong binding)",
+            Err(OpenError::Element(_)) => "error (secure element)",
+        };
+        eprintln!("secure-element unwrap: {outcome}");
+        result
     }
 }
 

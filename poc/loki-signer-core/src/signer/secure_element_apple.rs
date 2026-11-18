@@ -24,7 +24,7 @@
 //! it is reachable from the main build. Until then it is verified standalone by
 //! `poc/enclave-spike/apple_ffi_verify.rs`.
 
-use super::secure_element::{SecureElement, WrappedDek};
+use super::secure_element::{OpenError, SecureElement, WrappedDek};
 use zeroize::Zeroizing;
 
 // C-ABI surface implemented in se_backend.swift. Lengths are `isize`-shaped `Int` on the
@@ -125,7 +125,7 @@ impl SecureElement for AppleSecureElement {
         Ok(WrappedDek(out))
     }
 
-    fn unwrap_dek(&self, wrapped: &WrappedDek) -> Result<Zeroizing<[u8; 32]>, String> {
+    fn unwrap_dek(&self, wrapped: &WrappedDek) -> Result<Zeroizing<[u8; 32]>, OpenError> {
         let mut out = Zeroizing::new([0u8; 64]);
         let n = unsafe {
             se_unwrap(
@@ -137,7 +137,12 @@ impl SecureElement for AppleSecureElement {
             )
         };
         if n != 32 {
-            return Err(format!("se_unwrap failed or wrong length (code/len {n})"));
+            return Err(match n {
+                -11 => OpenError::Element("Touch ID was cancelled or authentication failed".into()),
+                // Security didn't expose a recognizable authentication error. This does not prove a wrong binding.
+                -4 => OpenError::Element("Secure Enclave could not unlock the file key (code -4); Touch ID may not have completed".into()),
+                _ => OpenError::Element(format!("se_unwrap failed or wrong length (code/len {n})")),
+            });
         }
         let mut dek = Zeroizing::new([0u8; 32]);
         dek.copy_from_slice(&out[..32]);

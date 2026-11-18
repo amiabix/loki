@@ -19,7 +19,7 @@
 //! wrap/unwrap is the proven [`SoftwareSecureElement`] format (XChaCha20-Poly1305). Nothing in
 //! [`super::secure_element::SealedShare`] changes; only the KEK source does.
 
-use super::secure_element::{SecureElement, SoftwareSecureElement, WrappedDek};
+use super::secure_element::{OpenError, SecureElement, SoftwareSecureElement, WrappedDek};
 use hkdf::Hkdf;
 use sha2::Sha256;
 use zeroize::Zeroizing;
@@ -65,7 +65,7 @@ impl SecureElement for WebAuthnSecureElement {
         self.inner.wrap_dek(dek)
     }
 
-    fn unwrap_dek(&self, wrapped: &WrappedDek) -> Result<Zeroizing<[u8; 32]>, String> {
+    fn unwrap_dek(&self, wrapped: &WrappedDek) -> Result<Zeroizing<[u8; 32]>, OpenError> {
         self.inner.unwrap_dek(wrapped)
     }
 }
