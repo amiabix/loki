@@ -14,7 +14,9 @@ import {
   hasSignerHint,
   forgetSession,
   logout,
+  listSlots,
   pairDevice,
+  requestPairingLink,
   pendingApprovals,
   exportRecoveryBackup,
   removeBrowserSigner,
@@ -25,9 +27,10 @@ import {
   recoverySetup,
   recoveryStatus,
   type CustodyMethod,
+  type PairingLink,
   type PendingApproval,
 } from "@/lib/api";
-import { invitePreview, paymentLabel, rememberedVaultSlot, rememberVaultSlot, verifyPhrase } from "@/lib/wallet-ui";
+import { invitePreview, pairingSecondsLeft, paymentLabel, rememberedVaultSlot, rememberVaultSlot, verifyPhrase } from "@/lib/wallet-ui";
 import { toggleTheme, useIsDark } from "@/lib/theme";
 import { useCeremonyStatus, usePayments, useStatus } from "@/lib/hooks";
 import type {
@@ -527,6 +530,9 @@ function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string 
     finally { setBusy(false); }
   };
   const [link, setLink] = useState("");
+  const [nativeOpen, setNativeOpen] = useState(false);
+  const pasteRef = useRef<HTMLInputElement>(null);
+  const focusPaste = useCallback(() => pasteRef.current?.focus(), []);
   const pair = async () => {
     setBusy(true); setErr(null);
     try { await pairDevice(link); setLink(""); onLoggedIn(); }
@@ -597,17 +603,114 @@ function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string 
       </button>
 
       {/* A native member app (LokiSigner / loki_member_app) instead of the browser signer: this
-          tab then drives that member over its loopback device API. */}
-      <details className="mt-4 text-xs text-muted">
+          tab then drives that member over its loopback device API. A new app first takes a
+          pairing link (step 1); an app that is already paired goes straight to step 2. */}
+      <details className="mt-4 text-xs text-muted" onToggle={(e) => setNativeOpen(e.currentTarget.open)}>
         <summary className="min-h-11 cursor-pointer hover:text-mint">Use a native member app instead</summary>
-        <p className="my-2">Unlock your profile in the member app, then paste the local link it printed. Keep the link private.</p>
-        <input type="password" value={link} autoComplete="off" spellCheck={false}
+        <h2 className="mb-1 mt-3 text-sm font-semibold text-[var(--ink)]">1 · Pair a new native signer</h2>
+        <NativePairingLink open={nativeOpen} onRegistered={focusPaste} />
+        <h2 className="mb-1 mt-5 text-sm font-semibold text-[var(--ink)]">2 · Paste LokiSigner&apos;s private link</h2>
+        <p className="my-2">Already paired? Unlock your profile in the member app. Then paste the private link it shows here. Keep the link private.</p>
+        <input ref={pasteRef} type="password" value={link} autoComplete="off" spellCheck={false} aria-label="LokiSigner's private link"
           onChange={(e) => setLink(e.target.value)} onKeyDown={(e) => e.key === "Enter" && !busy && link && pair()}
           placeholder="http://127.0.0.1:3601/#…" className="glass mb-3 w-full rounded-full px-5 py-3" />
         <Btn variant="ghost" disabled={busy || !link.trim()} onClick={pair}>{busy ? "Connecting…" : "Pair this tab"}</Btn>
       </details>
     </div>
   </FullScreen>;
+}
+
+// Step 1 of pairing a native member app: a `loki://pair` link from the coordinator. Each
+// request reserves a slot for 120 s and the coordinator caps pending reservations, so only the
+// member asks for a new link, never a timer. While the link is out, and for a minute after it
+// lapses, the public roster shows whether LokiSigner registered that slot.
+const ROSTER_POLL_MS = 3000;
+const ROSTER_GRACE_MS = 60_000;
+
+function NativePairingLink({ open, onRegistered }: { open: boolean; onRegistered: () => void }) {
+  const [link, setLink] = useState<PairingLink | null>(null);
+  const [slot, setSlot] = useState<number>(); // a new link asks for this slot again
+  const [registered, setRegistered] = useState<number | null>(null);
+  const [now, setNow] = useState(0);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [copied, setCopied] = useState<boolean | null>(null); // null: not copied, false: copy failed
+
+  const request = async () => {
+    setBusy(true); setErr(null); setCopied(null);
+    try {
+      const issued = await requestPairingLink(slot);
+      setSlot(issued.slot); setNow(Date.now()); setLink(issued);
+    } catch (e) { setLink(null); setErr((e as Error).message); }
+    finally { setBusy(false); }
+  };
+  const copy = async () => {
+    try { await navigator.clipboard.writeText(link!.url); setCopied(true); setTimeout(() => setCopied(null), 1500); }
+    catch { setCopied(false); }
+  };
+
+  const watching = open && link !== null && registered === null;
+  useEffect(() => {
+    if (!watching) return;
+    const tick = setInterval(() => {
+      setNow(Date.now());
+      if (Date.now() >= link.expires) clearInterval(tick);
+    }, 250);
+    let stopped = false;
+    const poll = setInterval(async () => {
+      if (Date.now() > link.expires + ROSTER_GRACE_MS) { clearInterval(poll); return; }
+      try {
+        const roster = await listSlots();
+        if (!stopped && roster.some((m) => m.slot === link.slot)) { setRegistered(link.slot); onRegistered(); }
+      } catch {} // the next poll retries
+    }, ROSTER_POLL_MS);
+    return () => { stopped = true; clearInterval(tick); clearInterval(poll); };
+  }, [watching, link, onRegistered]);
+
+  if (registered !== null) {
+    return <p role="status" className="my-2 font-medium text-mint">
+      Slot {registered} is registered. Finish in LokiSigner, then paste its private link below.
+    </p>;
+  }
+  if (!link) {
+    return <>
+      <p className="my-2">Get a link that opens LokiSigner and reserves a slot for two minutes.</p>
+      {err && <p role="alert" className="mb-3 leading-relaxed text-danger [overflow-wrap:anywhere]">{err}</p>}
+      <Btn variant="ghost" disabled={busy} onClick={request}>
+        {busy ? "Requesting…" : err ? "Try again" : "Get a pairing link"}
+      </Btn>
+    </>;
+  }
+  const left = pairingSecondsLeft(link.expires, now);
+  if (left === 0) {
+    return <>
+      <p role="status" className="my-2">
+        The link for slot {link.slot} expired. If LokiSigner already shows its private link, paste it below.
+        Otherwise get a new link for the same slot.
+      </p>
+      <Btn variant="ghost" disabled={busy} onClick={request}>{busy ? "Requesting…" : "Get a new link"}</Btn>
+    </>;
+  }
+  return <>
+    <p className="my-2">
+      Slot <span className="font-semibold text-[var(--ink)]">{link.slot}</span> is reserved for this link.
+      {" "}Expires in <span className="font-mono text-[var(--ink)]">{Math.floor(left / 60)}:{String(left % 60).padStart(2, "0")}</span>.
+    </p>
+    <div className="mb-3 flex gap-2">
+      <a href={link.url} className="btn-primary min-w-0 flex-1 rounded-full px-5 py-3.5 text-center text-sm font-medium">Open LokiSigner</a>
+      <button type="button" onClick={copy} className="btn-glass rounded-full px-5 py-3.5 text-sm font-medium">
+        {copied ? "Copied" : "Copy link"}
+      </button>
+    </div>
+    {copied === false && <p role="alert" className="mb-2 text-danger">Could not copy. Use Open LokiSigner instead.</p>}
+    <p className="mb-1">LokiSigner then asks, in this order:</p>
+    <ol className="list-decimal space-y-1 pl-5">
+      <li>“Pair this device with slot {link.slot}?” with the coordinator. Choose Continue only if it shows {window.location.origin}.</li>
+      <li>“Pair this device with slot {link.slot}?” again, with the network and endpoints. Enter a local profile passphrase and choose Pair.</li>
+      <li>For a new profile, “Save your recovery words privately”. Write them down, then choose “I saved these words”.</li>
+      <li>“Signer paired and running”. Choose “Copy private link” and paste it in step 2 below.</li>
+    </ol>
+  </>;
 }
 
 // Describe protection on the signer host, not custody inside this browser.

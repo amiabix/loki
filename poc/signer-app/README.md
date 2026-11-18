@@ -13,10 +13,28 @@ LOKI_DEV_TEAM=B399KAT22M bash poc/signer-app/build.sh
 open poc/signer-app/out/LokiSigner.app
 ```
 
-In the web wallet choose **Pair a new native signer**, then **Open LokiSigner** (or copy the
-link to the member's Mac). Confirm the coordinator shown in the native dialog. Enter a local
-profile passphrase, save the recovery words privately, and approve the Enclave prompt. The
-app displays a private local session link: paste it into the wallet tab on **that same Mac**.
+On the wallet's sign-in screen open **Use a native member app instead**. It has two steps.
+
+1. **Pair a new native signer**: choose **Get a pairing link**. The wallet shows the reserved
+   slot, the time left on the link, an **Open LokiSigner** button and **Copy link** (to open
+   it on the member's Mac yourself). LokiSigner then asks, in this order:
+   - "Pair this device with slot N?" with the coordinator origin. Choose **Continue** only if
+     it is the wallet's address.
+   - "Pair this device with slot N?" again, with the network and endpoints that coordinator
+     chose (see below). Enter a local profile passphrase and choose **Pair**. Approve the
+     Enclave prompt if macOS shows one.
+   - For a new profile, "Save your recovery words privately". Write them down, then choose
+     **I saved these words**.
+   - "Signer paired and running". Choose **Copy private link**.
+
+   While the link is out the wallet watches the public roster. Once LokiSigner registers the
+   slot, the wallet says so and moves to step 2. When the two minutes run out first, the link
+   and copy button go away; **Get a new link** asks for the same slot again. The wallet never
+   asks for a new link by itself, because each one reserves a slot.
+2. **Paste LokiSigner's private link**: paste the private session link into the wallet tab on
+   **that same Mac** and choose **Pair this tab**. A member whose app is already paired starts
+   here after unlocking it.
+
 The app stays running for ceremony, payment review and signing using the existing device
 consent and nonce-witness paths. Quit locks the process; launch again to unlock and register
 with the saved public coordinator/slot, without reusing the claim.
@@ -63,9 +81,10 @@ This applies only to the native app's pairing and unlock. `LokiSigner serve` and
 
 Pairing reserves a slot for 120 seconds. Both claim and registration are consumed once,
 including failed proofs; claiming does not extend the deadline. If it expires while saving
-recovery words, request a fresh link for the same slot. After a lost response, restart and
-unlock; an outstanding reservation may need to expire before retry. Public device bindings
-prevent a different identity or slot from reusing the enrolled key.
+recovery words, choose **Get a new link** in the wallet, which asks for the same slot. After
+a lost response, restart and unlock; an outstanding reservation may need to expire before
+retry. Public device bindings prevent a different identity or slot from reusing the enrolled
+key.
 
 The default data directory is `~/Library/Application Support/LokiSigner`; default listener
 is a dynamically chosen loopback port. Production coordinator links require HTTPS. Local

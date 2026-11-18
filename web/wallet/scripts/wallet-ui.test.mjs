@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { invitePreview, paymentLabel, rememberedVaultSlot, rememberVaultSlot, verifyPhrase } from "../src/lib/wallet-ui.ts";
+import { invitePreview, pairingSecondsLeft, paymentLabel, rememberedVaultSlot, rememberVaultSlot, verifyPhrase } from "../src/lib/wallet-ui.ts";
 
 const invite = { vault: "a".repeat(64), name: "Friends’ vault", members: 3, threshold: 2, slot: 2 };
 const encode = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
@@ -56,4 +56,14 @@ test("remembered vault slots are scoped to the authenticated profile and vault",
   assert.doesNotThrow(() => rememberVaultSlot("alice", "vault-a", 2));
   assert.equal(rememberedVaultSlot("alice", "vault-a"), null);
   delete globalThis.localStorage;
+});
+
+test("a pairing link counts down in whole seconds and is expired exactly at its deadline", () => {
+  const expires = 1_700_000_120_000;
+  assert.equal(pairingSecondsLeft(expires, expires - 120_000), 120);
+  assert.equal(pairingSecondsLeft(expires, expires - 1001), 2);
+  assert.equal(pairingSecondsLeft(expires, expires - 1000), 1);
+  assert.equal(pairingSecondsLeft(expires, expires - 1), 1, "still live: never shown as 0:00 before it expires");
+  assert.equal(pairingSecondsLeft(expires, expires), 0, "the coordinator drops the reservation at its deadline");
+  assert.equal(pairingSecondsLeft(expires, expires + 5000), 0);
 });

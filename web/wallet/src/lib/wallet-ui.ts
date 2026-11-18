@@ -79,3 +79,9 @@ export function rememberedVaultSlot(profile: string | undefined, vault: string):
     return Number.isInteger(slot) && slot >= 1 && slot <= 16 ? slot : null;
   } catch { return null; }
 }
+
+/** Whole seconds before a pairing link lapses, rounded up; 0 once expired. The coordinator
+ *  keeps a reservation while `expires > now`, so the link is gone at `now === expires`. */
+export function pairingSecondsLeft(expires: number, now: number): number {
+  return expires > now ? Math.ceil((expires - now) / 1000) : 0;
+}

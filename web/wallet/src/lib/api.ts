@@ -60,6 +60,37 @@ export async function pairDevice(link: string): Promise<Slot> {
   return member;
 }
 
+/** A pairing link LokiSigner opens; the coordinator reserves its slot until `expires` (ms). */
+export type PairingLink = { slot: number; url: string; expires: number };
+// The coordinator builds `loki://pair?` + URLSearchParams; anything else is never a link target.
+const PAIRING_LINK = /^loki:\/\/pair\?[A-Za-z0-9%*._+=&-]+$/;
+const PAIRING_REFUSALS: [string, (slot?: number) => string][] = [
+  ["slot already registered or reserved", (slot) => `${slot === undefined ? "That slot" : `Slot ${slot}`} is already registered or reserved. If LokiSigner showed “Signer paired and running”, paste its private link in step 2. Otherwise wait two minutes for the earlier link to lapse and try again.`],
+  ["too many pending registrations", () => "The coordinator has too many pairing links waiting. Try again in two minutes."],
+  ["registration is busy", () => "The coordinator is busy registering another member. Try again in a moment."],
+  ["expected an HTTPS origin", () => "This coordinator issues pairing links only over HTTPS. Open the wallet at its HTTPS address and try again."],
+];
+
+/** Ask the coordinator for a native pairing link: the next free slot, or `slot` again after
+ *  its link expired. Each request reserves a slot, so callers never reissue on their own. */
+export async function requestPairingLink(slot?: number): Promise<PairingLink> {
+  const res = await fetch("/api/members/pairing", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(slot === undefined ? {} : { slot }), cache: "no-store",
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    // Only our own sentences reach the page, never the coordinator's text.
+    const known = PAIRING_REFUSALS.find(([error]) => typeof data.error === "string" && data.error.startsWith(error));
+    throw new Error(known ? known[1](slot) : `The coordinator refused a pairing link (HTTP ${res.status}). Try again, or ask whoever runs it.`);
+  }
+  if (!Number.isSafeInteger(data.slot) || data.slot < 1 || (slot !== undefined && data.slot !== slot)
+    || !Number.isSafeInteger(data.expires) || typeof data.url !== "string" || !PAIRING_LINK.test(data.url)) {
+    throw new Error("The coordinator returned a pairing link LokiSigner would not accept. Try again, or ask whoever runs it.");
+  }
+  return { slot: data.slot, url: data.url, expires: data.expires };
+}
+
 /** A member request: to this tab's paired native member, else into the in-browser signer. */
 export async function api<T = unknown>(path: string, body?: unknown): Promise<T> {
   if (!/^[a-z][a-z0-9-]*(\?[^#]*)?$/.test(path)) throw new Error("invalid signer API path");
