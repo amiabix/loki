@@ -6,6 +6,7 @@
 mod ceremony;
 mod device;
 mod payment;
+#[cfg(feature = "relay-communication")]
 mod nonce_witness;
 mod recovery;
 mod registration;
@@ -16,6 +17,7 @@ mod state;
 
 pub use state::Config;
 pub use registration::RegistrationConfig;
+#[cfg(feature = "relay-communication")]
 pub use nonce_witness::WitnessConfig;
 
 /// Device-local UI notifications; never forwarded to the coordinator or a log.

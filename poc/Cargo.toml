@@ -68,9 +68,9 @@ async-trait = "0.1"
 tonic = { version = "0.14.6", features = ["transport", "tls-webpki-roots"] }
 rustls = { version = "0.23", features = ["aws_lc_rs"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
-# loki_member_app: the Rust HTTP coordinator (one per member). Optional, gated on
-# relay-communication; hyper/tower come in transitively via tonic/reqwest.
-axum = { version = "0.8", optional = true }
+# loki_member_app: the Rust HTTP coordinator (one per member); hyper/tower come in
+# transitively via tonic/reqwest.
+axum = "0.8"
 # WS3 frostd transport: speak the audited relay's JSON-over-HTTP contract directly
 # (the 8 endpoints in `frostd/src/lib.rs`). xeddsa signs the login challenge exactly as
 # frostd verifies it. reqwest/uuid are already in the graph transitively; named here so
@@ -94,7 +94,7 @@ probe-zip2005 = []
 # Apple Secure Enclave backend (macOS only): build.rs links enclave-spike/se_backend.swift.
 apple-enclave = []
 setup-fault-injection = ["relay-communication"]
-relay-communication = ["dep:loki-relay-client", "dep:loki-relay-protocol", "dep:axum"]
+relay-communication = ["dep:loki-relay-client", "dep:loki-relay-protocol"]
 # Counts Argon2id derivations and prints `kdf_derivations=N` to stderr at exit.
 # Measurement only: never in builds used for timing or acceptance.
 kdf-stats = []
@@ -123,12 +123,16 @@ required-features = ["relay-communication"]
 # The per-member HTTP coordinator (axum): account + hosted vault ceremony + multi-party
 # payment, driving the audited library in-process. Served to the web UI. See `src/host/`.
 name = "loki_member_app"
-required-features = ["relay-communication"]
 
 [[example]]
 # Test-only fixture: stands up owned development relay operators and issues grants
 # with fixed keys for the hosted app flow (`wallet/test_hosted_app_flow.py`).
 name = "hosted_ops"
+required-features = ["relay-communication"]
+
+[[example]]
+# Provisions the relay mailboxes behind the host's relay nonce witnesses.
+name = "provision_nonce_witnesses"
 required-features = ["relay-communication"]
 
 [[bin]]
