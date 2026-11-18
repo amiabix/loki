@@ -1015,7 +1015,8 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
             roster: Box::new(|_| RosterDecision::Match),
             roster_deadline: Duration::from_secs(60),
             backup: Box::new(HostedBackup { dir: signer_dir.clone(), pass: Zeroizing::new(pass.to_owned()) }),
-            approval: Box::new(|_| true),
+            // DKG never signs a payment; any request still goes to the member, or is refused.
+            approval: super::approval_policy(st.approval.clone(), signer_network),
         };
         let mut signer = if signer_dir.join("signer.meta").exists() {
             LocalSigner::open(&signer_dir, se, c.name.clone(), prompts)

@@ -21,6 +21,49 @@ pub use nonce_witness::WitnessConfig;
 /// Device-local UI notifications; never forwarded to the coordinator or a log.
 pub type LocalNotice = std::sync::Arc<dyn Fn(&str, &str) + Send + Sync>;
 
+/// The member's own decision on one payment, asked on this device (the native app's dialog).
+/// Receives the signer-derived summary as JSON ([`approval_summary`]); `true` approves.
+/// Without one, every payment is refused: HTTP or relay requests never approve on their own.
+pub type LocalApproval = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// The signer's [`ApprovalPolicy`](crate::signer::local::ApprovalPolicy): route each request
+/// to the member's local decision, and refuse when no approval channel is attached.
+pub fn approval_policy(
+    approval: Option<LocalApproval>,
+    network: crate::signer::Network,
+) -> crate::signer::local::ApprovalPolicy {
+    Box::new(move |request| match &approval {
+        Some(approve) => approve(&approval_summary(request, network)),
+        None => false,
+    })
+}
+
+/// What the member reviews: the payee, amounts and network the signer derived itself from the
+/// PCZT bytes, and the candidate and sighash its consent binds to.
+pub fn approval_summary(request: &crate::signer::local::ApprovalRequest<'_>, network: crate::signer::Network) -> String {
+    use zcash_protocol::consensus::NetworkType;
+    let (label, kind) = match network {
+        crate::signer::Network::Regtest => ("regtest", NetworkType::Regtest),
+        crate::signer::Network::Testnet => ("testnet", NetworkType::Test),
+    };
+    let view = request.view;
+    serde_json::json!({
+        "recipient": crate::vault::unified_receiver(view.to, kind),
+        "amount_zat": view.amount_zat,
+        "fee_zat": view.fee_zat,
+        "fee_verified": view.fee_verified,
+        "change_zat": view.change_zat,
+        "memo": String::from_utf8_lossy(&view.memo).trim_end_matches('\0'),
+        "network": label,
+        "branch_id": format!("{:08x}", view.network_branch_id),
+        "vault": hex::encode(request.candidate.vault_id),
+        "payment": hex::encode(request.candidate.payment_id),
+        "attempt": hex::encode(request.candidate.attempt_id),
+        "sighash": hex::encode(request.sighash),
+    })
+    .to_string()
+}
+
 /// Parse member-app CLI args into a `Config`. Shared by the `loki_member_app` bin and the native
 /// signer app's FFI `serve` entry point, so both build the member identically.
 pub fn config_from_args(args: &[String]) -> Result<Config, String> {
@@ -77,10 +120,15 @@ pub fn config_from_args(args: &[String]) -> Result<Config, String> {
 
 /// Build the axum app and serve on the configured bind IP and port. Blocks.
 pub fn run(config: Config) -> Result<(), String> {
-    run_local(config, None, None)
+    run_local(config, None, None, None)
 }
 
-pub fn run_local(mut config: Config, pass: Option<zeroize::Zeroizing<String>>, notice: Option<LocalNotice>) -> Result<(), String> {
+pub fn run_local(
+    mut config: Config,
+    pass: Option<zeroize::Zeroizing<String>>,
+    notice: Option<LocalNotice>,
+    approval: Option<LocalApproval>,
+) -> Result<(), String> {
     // rustls has no default provider; install one before any relay/lightwalletd TLS.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     // Peer origins must use TLS off loopback (preserved from main's hardening).
@@ -100,7 +148,7 @@ pub fn run_local(mut config: Config, pass: Option<zeroize::Zeroizing<String>>, n
             .map_err(|e| format!("bind {addr}: {e}"))?;
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
         config.port = addr.port();
-        let state: state::Shared = std::sync::Arc::new(state::AppState::new(config));
+        let state: state::Shared = std::sync::Arc::new(state::AppState { approval, ..state::AppState::new(config) });
         registration::start(&state, pass, notice.as_ref()).await?;
         // Member-local output only. Paste into a local browser tab; never send to the coordinator.
         if let Some(notice) = notice {
@@ -114,4 +162,48 @@ pub fn run_local(mut config: Config, pass: Option<zeroize::Zeroizing<String>>, n
             .await
             .map_err(|e| format!("serve: {e}"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::signer::{local::ApprovalRequest, wysiwys::PaymentView, CandidateRef, Network};
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn payment_approval_fails_closed_and_asks_with_signer_derived_details() {
+        let sk = orchard::keys::SpendingKey::from_bytes([7; 32]).unwrap();
+        let to = orchard::keys::FullViewingKey::from(&sk).address_at(0u64, orchard::keys::Scope::External);
+        let view = PaymentView {
+            to: to.to_raw_address_bytes(), amount_zat: 40_000_000, fee_zat: 15_000, change_zat: 5,
+            memo: b"rent".to_vec(), network_branch_id: 0x77190ad8, fee_verified: true,
+        };
+        let candidate = CandidateRef { vault_id: [1; 32], payment_id: [2; 32], attempt_id: [3; 32] };
+        let request = ApprovalRequest { candidate: &candidate, sighash: [9; 32], view: &view };
+        // No approval channel (headless serve): refused.
+        assert!(!(super::approval_policy(None, Network::Testnet))(&request));
+
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let decision = Arc::new(Mutex::new(false));
+        let (log, answer) = (asked.clone(), decision.clone());
+        let approve: super::LocalApproval = Arc::new(move |summary| {
+            log.lock().unwrap().push(summary.to_owned());
+            *answer.lock().unwrap()
+        });
+        let mut policy = super::approval_policy(Some(approve), Network::Testnet);
+        assert!(!policy(&request), "the member's refusal refuses");
+        *decision.lock().unwrap() = true;
+        assert!(policy(&request), "the member's approval approves");
+
+        let shown: serde_json::Value = serde_json::from_str(&asked.lock().unwrap()[0]).unwrap();
+        let recipient = shown["recipient"].as_str().unwrap();
+        assert!(recipient.starts_with("utest1"), "{recipient}");
+        let decoded = crate::vault::orchard_receiver_from_ua(recipient, zcash_protocol::consensus::NetworkType::Test).unwrap();
+        assert_eq!(decoded.to_raw_address_bytes(), view.to);
+        assert_eq!(shown["amount_zat"], 40_000_000);
+        assert_eq!(shown["fee_zat"], 15_000);
+        assert_eq!(shown["network"], "testnet");
+        assert_eq!(shown["memo"], "rent");
+        assert_eq!(shown["attempt"], hex::encode([3; 32]));
+        assert_eq!(shown["sighash"], hex::encode([9; 32]));
+    }
 }

@@ -17,7 +17,7 @@ use zeroize::Zeroizing;
 
 use super::backup::BackupArtifact;
 use super::coordination::{drive_to_signed_pczt, PaymentIntent, QuorumMember};
-use super::local::{BackupDevice, DevicePrompts, LocalSigner, RosterDecision};
+use super::local::{ApprovalPolicy, BackupDevice, DevicePrompts, LocalSigner, RosterDecision};
 use super::secure_element::SecureElement;
 use super::{CandidateRef, DkgInput, Network, Session, Signer};
 use super::wysiwys::PaymentView;
@@ -53,7 +53,10 @@ impl BackupDevice for MemBackup {
     }
 }
 
-fn prompts(reviewed: Arc<Mutex<Option<(CandidateRef, PaymentView)>>>) -> DevicePrompts {
+fn prompts(
+    reviewed: Arc<Mutex<Option<(CandidateRef, PaymentView)>>>,
+    mut native: Option<ApprovalPolicy>,
+) -> DevicePrompts {
     let mut approved_sighash = None;
     DevicePrompts {
         connect: Box::new(|_origin, _net| true),
@@ -66,7 +69,11 @@ fn prompts(reviewed: Arc<Mutex<Option<(CandidateRef, PaymentView)>>>) -> DeviceP
                 return false;
             }
             // The native selftest explicitly approves one intent and pins its first candidate.
-            *approved_sighash.get_or_insert(request.sighash) == request.sighash
+            if *approved_sighash.get_or_insert(request.sighash) != request.sighash {
+                return false;
+            }
+            // Then the member's own decision, when a native approval channel is attached.
+            native.as_mut().map_or(true, |approve| approve(request))
         }),
     }
 }
@@ -105,7 +112,18 @@ fn tempdir(id: u16) -> std::path::PathBuf {
 pub fn prove_dkg_member<SE: SecureElement>(
     threshold: u16,
     members: u16,
+    make_se: impl FnMut(u16) -> SE,
+) -> Result<(), String> {
+    prove_dkg_member_with(threshold, members, make_se, |_| None)
+}
+
+/// [`prove_dkg_member`] where member `id`'s payment approval also asks `native(id)`, the
+/// member's own decision (the signer app's dialog). A refusal stops the payment.
+pub fn prove_dkg_member_with<SE: SecureElement>(
+    threshold: u16,
+    members: u16,
     mut make_se: impl FnMut(u16) -> SE,
+    mut native: impl FnMut(u16) -> Option<ApprovalPolicy>,
 ) -> Result<(), String> {
     let vault = [61u8; 32];
 
@@ -121,7 +139,7 @@ pub fn prove_dkg_member<SE: SecureElement>(
             vault,
             id,
             "native vault".into(),
-            prompts(reviewed),
+            prompts(reviewed, native(id)),
         )
         .map_err(|e| format!("create member {id}: {e:?}"))?;
         let conn = signer
@@ -270,7 +288,7 @@ mod tests {
     #[test]
     fn native_consent_requires_recorded_intent_and_pins_sighash() {
         let reviewed = Arc::new(Mutex::new(None));
-        let mut device = prompts(reviewed.clone());
+        let mut device = prompts(reviewed.clone(), None);
         let candidate = CandidateRef { vault_id: [1; 32], payment_id: [2; 32], attempt_id: [3; 32] };
         let view = PaymentView { to: [4; 43], amount_zat: 1, fee_zat: 1, change_zat: 1,
             memo: vec![], network_branch_id: 1, fee_verified: true };
@@ -279,6 +297,9 @@ mod tests {
         *reviewed.lock().unwrap() = Some((candidate, view.clone()));
         assert!((device.approval)(&request));
         assert!(!(device.approval)(&super::super::local::ApprovalRequest { sighash: [6; 32], ..request }));
+        // The member's native refusal overrides a recorded intent.
+        let mut refusing = prompts(reviewed.clone(), Some(Box::new(|_| false)));
+        assert!(!(refusing.approval)(&request));
     }
 
     #[test]

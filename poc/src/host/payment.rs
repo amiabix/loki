@@ -1365,7 +1365,8 @@ fn sign(
         v.public.serialize().map_err(|e| e.to_string())?,
         v.fvk.clone(),
         member_dir(data, &p.vault)?.path().join("signer-nonces"),
-        Box::new(|_| true),
+        // Only the member's own native decision approves; headless members refuse.
+        super::approval_policy(st.approval.clone(), signer_network),
     )
     .map_err(|e| e.to_string())?;
     if let Some(inputs) = &owned {
@@ -2315,7 +2316,9 @@ mod tests {
 
     fn state(data: &Path, frostd_url: &str) -> Shared {
         use crate::host::state::{AppState, Config};
-        std::sync::Arc::new(AppState::new(Config {
+        // These members stand in for a member who approves every payment natively.
+        let approval: crate::host::LocalApproval = std::sync::Arc::new(|_| true);
+        std::sync::Arc::new(AppState { approval: Some(approval), ..AppState::new(Config {
             registration: None,
             data: data.to_owned(),
             port: 0,
@@ -2334,7 +2337,7 @@ mod tests {
             frostd_url: frostd_url.into(),
             peers: BTreeMap::new(),
             loopback_peers: true,
-        }))
+        }) })
     }
 
     #[test]

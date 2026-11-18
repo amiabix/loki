@@ -150,6 +150,8 @@ pub struct AppState {
     /// Device login registry, built lazily from `data/recovery.pub` + `data/devices.json` once
     /// a recovery identity exists. Holds outstanding challenges in-process across requests.
     pub device_auth: std::sync::Mutex<Option<crate::signer::device_auth::DeviceRegistry>>,
+    /// The member's native payment decision; `None` (headless) refuses every payment.
+    pub approval: Option<super::LocalApproval>,
 }
 
 impl AppState {
@@ -164,6 +166,7 @@ impl AppState {
             active_payments: std::sync::Mutex::new(BTreeSet::new()),
             active_dkgs: std::sync::Mutex::new(BTreeSet::new()),
             device_auth: std::sync::Mutex::new(None),
+            approval: None,
         }
     }
 }
