@@ -215,3 +215,5 @@ and the passkey (rpId) are all bound to it. A new hostname per run (for example 
 trycloudflare URL) gives an empty signer that cannot open the old share. Only one tab per browser
 profile may run the signer: a Web Lock guards the Worker, its share and its nonce store. Other
 tabs refuse signer operations until the first one closes.
+
+The signer origin sends a strict CSP: only its own scripts, `wasm-unsafe-eval` for wasm, and connections only to itself, the relay and `LOKI_CEREMONY_ORIGINS`. It answers only from the snapshot it read at startup. `node poc/loki-signer-wasm/serve.mjs --hash` prints the published build hash (per-file SHA-256 plus one bundle hash), and a running signer serves the same thing at `/build-hash.json`. Publish the bundle hash with each release so the deployed signer can be compared against it.
