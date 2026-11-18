@@ -115,12 +115,15 @@ pub fn regtest_unified_receiver(raw: [u8; 43]) -> String {
     unified_receiver(raw, zcash_protocol::consensus::NetworkType::Regtest)
 }
 
+/// Panics on Mainnet: every caller takes its network from a `VaultNetwork`, which has no
+/// Mainnet, so reaching this with one is a bug that must not print a payable address.
 pub fn unified_receiver(raw: [u8; 43], network: zcash_protocol::consensus::NetworkType) -> String {
     use zcash_address::{
         unified::{Address as Ua, Encoding, Receiver},
         ToAddress, ZcashAddress,
     };
 
+    let network = crate::network::refuse_mainnet(network).expect("Loki never encodes a mainnet address");
     let ua = Ua::try_from_items(vec![Receiver::Orchard(raw)])
         .expect("one Orchard receiver is a valid unified address");
 
@@ -212,6 +215,7 @@ pub fn orchard_receiver_from_ua(
 ) -> Result<orchard::Address, String> {
     use zcash_address::unified::{Address as Ua, Container, Encoding, Receiver};
 
+    crate::network::refuse_mainnet(expect)?;
     let (net, ua) = Ua::decode(s.trim()).map_err(|e| format!("not a unified address: {e:?}"))?;
     if net != expect {
         return Err(format!(
@@ -294,6 +298,21 @@ mod address_tests {
             err.contains("network"),
             "the error should name the mismatch, got: {err}"
         );
+    }
+
+    #[test]
+    fn a_real_mainnet_ua_is_refused_at_decode_and_encode() {
+        use zcash_address::{unified::{Address as Ua, Encoding, Receiver}, ToAddress, ZcashAddress};
+        use zcash_protocol::consensus::NetworkType;
+
+        let raw = test_only_address(&test_only_fvk(&real_ak()).unwrap()).to_raw_address_bytes();
+        let ua = Ua::try_from_items(vec![Receiver::Orchard(raw)]).unwrap();
+        let mainnet = ZcashAddress::from_unified(NetworkType::Main, ua).to_string();
+        assert!(mainnet.starts_with("u1"), "{mainnet}");
+        for expect in [NetworkType::Main, NetworkType::Test, NetworkType::Regtest] {
+            assert!(orchard_receiver_from_ua(&mainnet, expect).is_err(), "{expect:?}");
+        }
+        assert!(std::panic::catch_unwind(|| unified_receiver(raw, NetworkType::Main)).is_err());
     }
 
     #[test]
