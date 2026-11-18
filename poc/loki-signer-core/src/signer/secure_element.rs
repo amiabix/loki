@@ -27,6 +27,20 @@ use zeroize::{Zeroize, Zeroizing};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WrappedDek(pub Vec<u8>);
 
+#[derive(Debug)]
+pub enum OpenError {
+    WrongBinding(String),
+    Element(String),
+}
+
+impl std::fmt::Display for OpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WrongBinding(message) | Self::Element(message) => f.write_str(message),
+        }
+    }
+}
+
 /// Platform secure element: holds a non-exportable KEK and wraps/unwraps data keys.
 ///
 /// Real implementations (Secure Enclave, StrongBox, TPM) gate `unwrap_dek` behind a
@@ -37,7 +51,7 @@ pub trait SecureElement {
     /// Wrap a freshly generated 32-byte DEK under the element's KEK.
     fn wrap_dek(&self, dek: &[u8; 32]) -> Result<WrappedDek, String>;
     /// Release the DEK after unlock. The caller must zeroize the result.
-    fn unwrap_dek(&self, wrapped: &WrappedDek) -> Result<Zeroizing<[u8; 32]>, String>;
+    fn unwrap_dek(&self, wrapped: &WrappedDek) -> Result<Zeroizing<[u8; 32]>, OpenError>;
 }
 
 /// Software fallback KEK (desktop without a TPM, ws1-signer §4 reduced-guarantee row).
@@ -148,9 +162,9 @@ impl SecureElement for SoftwareSecureElement {
         Ok(WrappedDek(out))
     }
 
-    fn unwrap_dek(&self, wrapped: &WrappedDek) -> Result<Zeroizing<[u8; 32]>, String> {
+    fn unwrap_dek(&self, wrapped: &WrappedDek) -> Result<Zeroizing<[u8; 32]>, OpenError> {
         if wrapped.0.len() < 24 {
-            return Err("truncated wrapped DEK".into());
+            return Err(OpenError::WrongBinding("truncated wrapped DEK".into()));
         }
         let (nonce, ct) = wrapped.0.split_at(24);
         let mut plain = self
@@ -159,11 +173,11 @@ impl SecureElement for SoftwareSecureElement {
                 XNonce::from_slice(nonce),
                 Payload { msg: ct, aad: WRAP_AAD },
             )
-            .map_err(|_| "DEK unwrap failed (wrong KEK or tampered)".to_string())?;
+            .map_err(|_| OpenError::WrongBinding("DEK unwrap failed (wrong KEK or tampered)".into()))?;
         let dek: [u8; 32] = plain
             .as_slice()
             .try_into()
-            .map_err(|_| "unwrapped DEK is not 32 bytes")?;
+            .map_err(|_| OpenError::WrongBinding("unwrapped DEK is not 32 bytes".into()))?;
         plain.zeroize();
         Ok(Zeroizing::new(dek))
     }
@@ -245,7 +259,7 @@ impl SealedShare {
 
     /// Unwrap the DEK via `se`, then AEAD-decrypt the share. Caller zeroizes the result.
     pub fn open(&self, se: &impl SecureElement) -> Result<Zeroizing<Vec<u8>>, String> {
-        self.open_with_aad(se, SHARE_AAD)
+        self.open_bound(se, SHARE_AAD).map_err(|e| e.to_string())
     }
 
     /// Open a blob sealed with [`SealedShare::seal_bound`] under the same `binding`. A blob
@@ -254,11 +268,7 @@ impl SealedShare {
         &self,
         se: &impl SecureElement,
         binding: &[u8],
-    ) -> Result<Zeroizing<Vec<u8>>, String> {
-        self.open_with_aad(se, binding)
-    }
-
-    fn open_with_aad(&self, se: &impl SecureElement, aad: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
+    ) -> Result<Zeroizing<Vec<u8>>, OpenError> {
         let dek = se.unwrap_dek(&self.wrapped_dek)?;
         let cipher = XChaCha20Poly1305::new_from_slice(&*dek).expect("32-byte DEK");
         let plain = cipher
@@ -266,10 +276,10 @@ impl SealedShare {
                 XNonce::from_slice(&self.nonce),
                 Payload {
                     msg: &self.ciphertext,
-                    aad,
+                    aad: binding,
                 },
             )
-            .map_err(|_| "share open failed (wrong element or tampered blob)".to_string())?;
+            .map_err(|_| OpenError::WrongBinding("share open failed (wrong element or tampered blob)".into()))?;
         Ok(Zeroizing::new(plain))
     }
 

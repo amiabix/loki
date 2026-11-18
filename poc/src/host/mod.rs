@@ -32,16 +32,19 @@ pub type LocalApproval = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
 pub fn approval_policy(
     approval: Option<LocalApproval>,
     network: crate::signer::Network,
+    slot: u16,
 ) -> crate::signer::local::ApprovalPolicy {
-    Box::new(move |request| match &approval {
-        Some(approve) => approve(&approval_summary(request, network)),
-        None => false,
+    Box::new(move |request| {
+        let approved = approval.as_ref().is_some_and(|approve| approve(&approval_summary(request, network, slot)));
+        let attempt = hex::encode(request.candidate.attempt_id);
+        eprintln!("payment {attempt}: member {slot} approval {}", if approved { "approved" } else { "refused" });
+        approved
     })
 }
 
 /// What the member reviews: the payee, amounts and network the signer derived itself from the
 /// PCZT bytes, and the candidate and sighash its consent binds to.
-pub fn approval_summary(request: &crate::signer::local::ApprovalRequest<'_>, network: crate::signer::Network) -> String {
+pub fn approval_summary(request: &crate::signer::local::ApprovalRequest<'_>, network: crate::signer::Network, slot: u16) -> String {
     use zcash_protocol::consensus::NetworkType;
     let (label, kind) = match network {
         crate::signer::Network::Regtest => ("regtest", NetworkType::Regtest),
@@ -58,6 +61,7 @@ pub fn approval_summary(request: &crate::signer::local::ApprovalRequest<'_>, net
         "network": label,
         "branch_id": format!("{:08x}", view.network_branch_id),
         "vault": hex::encode(request.candidate.vault_id),
+        "member": slot,
         "payment": hex::encode(request.candidate.payment_id),
         "attempt": hex::encode(request.candidate.attempt_id),
         "sighash": hex::encode(request.sighash),
@@ -181,7 +185,7 @@ mod tests {
         let candidate = CandidateRef { vault_id: [1; 32], payment_id: [2; 32], attempt_id: [3; 32] };
         let request = ApprovalRequest { candidate: &candidate, sighash: [9; 32], view: &view };
         // No approval channel (headless serve): refused.
-        assert!(!(super::approval_policy(None, Network::Testnet))(&request));
+        assert!(!(super::approval_policy(None, Network::Testnet, 2))(&request));
 
         let asked = Arc::new(Mutex::new(Vec::new()));
         let decision = Arc::new(Mutex::new(false));
@@ -190,7 +194,7 @@ mod tests {
             log.lock().unwrap().push(summary.to_owned());
             *answer.lock().unwrap()
         });
-        let mut policy = super::approval_policy(Some(approve), Network::Testnet);
+        let mut policy = super::approval_policy(Some(approve), Network::Testnet, 2);
         assert!(!policy(&request), "the member's refusal refuses");
         *decision.lock().unwrap() = true;
         assert!(policy(&request), "the member's approval approves");
@@ -203,6 +207,7 @@ mod tests {
         assert_eq!(shown["amount_zat"], 40_000_000);
         assert_eq!(shown["fee_zat"], 15_000);
         assert_eq!(shown["network"], "testnet");
+        assert_eq!(shown["member"], 2);
         assert_eq!(shown["memo"], "rent");
         assert_eq!(shown["attempt"], hex::encode([3; 32]));
         assert_eq!(shown["sighash"], hex::encode([9; 32]));

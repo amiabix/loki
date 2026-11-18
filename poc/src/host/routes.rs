@@ -81,6 +81,7 @@ pub fn router(state: Shared) -> Router {
 /// capability is still required; CORS never authorizes a member action on its own.
 async fn browser_origin(State(st): State<Shared>, req: Request, next: Next) -> Response {
     let origin = req.headers().get("origin").cloned();
+    let route = req.extensions().get::<axum::extract::MatchedPath>().cloned();
     // The ceremony endpoints are token-authenticated, member-to-member calls (also exempt from
     // the process token in `auth`): a native peer reaches them with no `Origin` and so skips the
     // pairing check, and a browser joiner from another origin reaches ONLY these four, still gated
@@ -107,6 +108,11 @@ async fn browser_origin(State(st): State<Shared>, req: Request, next: Next) -> R
         }
         StatusCode::NO_CONTENT.into_response()
     } else { next.run(req).await };
+    if response.status().is_client_error() || response.status().is_server_error() {
+        if let Some(route) = route {
+            eprintln!("member API {}: error status {}", route.as_str(), response.status().as_u16());
+        }
+    }
     if let Some(origin) = origin {
         let headers = response.headers_mut();
         headers.insert("access-control-allow-origin", origin);

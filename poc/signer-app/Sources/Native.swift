@@ -32,6 +32,7 @@ private func nativeApprove(_ summary: UnsafePointer<CChar>?) -> Int32 {
         alert.messageText = "Approve this payment?"
         let memo = text("memo").isEmpty ? "" : "\nMemo: \(text("memo"))"
         let fee = (request["fee_verified"] as? Bool) == true ? zec(request["fee_zat"]) : "\(zec(request["fee_zat"])) (NOT VERIFIED)"
+        let member = (request["member"] as? NSNumber)?.stringValue ?? "?"
         alert.informativeText = """
             Recipient: \(text("recipient"))
             Amount: \(zec(request["amount_zat"]))
@@ -39,7 +40,7 @@ private func nativeApprove(_ summary: UnsafePointer<CChar>?) -> Int32 {
             Change back to the vault: \(zec(request["change_zat"]))
             Network: \(text("network")) (branch \(text("branch_id")))\(memo)
 
-            Vault: \(text("vault"))
+            Member \(member) — Vault: \(text("vault"))
             Payment: \(text("payment"))
             Attempt: \(text("attempt"))
             Signs: \(text("sighash"))

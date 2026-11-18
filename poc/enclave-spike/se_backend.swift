@@ -1,4 +1,5 @@
 import Foundation
+import LocalAuthentication
 import Security
 
 // C-ABI Secure Enclave backend for loki's `SecureElement` trait
@@ -18,7 +19,7 @@ import Security
 //   -1 no key handle          -2 ECIES encrypt failed      -3 output buffer too small
 //   -4 ECIES decrypt failed   -5 key create failed         -6 key load/not-found
 //   -7 access-control build    -8 unknown handle           -9 ECDSA sign failed
-//   -10 public-key export failed
+//   -10 public-key export failed    -11 biometric authentication cancelled or failed
 
 private let algo = SecKeyAlgorithm.eciesEncryptionCofactorX963SHA256AESGCM
 // ECDSA over SHA-256 of the message, ASN.1/DER (X9.62) output — the device login-challenge
@@ -129,7 +130,19 @@ public func se_unwrap(_ handle: UInt64,
     let data = Data(bytes: ct, count: ctLen)
     // On a persistent biometric key this call triggers the Face/Touch ID prompt; the
     // private op runs inside the Secure Enclave and only the plaintext DEK comes back.
-    guard let pt = SecKeyCreateDecryptedData(k, algo, data as CFData, nil) as Data? else { return -4 }
+    var failure: Unmanaged<CFError>?
+    guard let pt = SecKeyCreateDecryptedData(k, algo, data as CFData, &failure) as Data? else {
+        var error = failure.map { $0.takeRetainedValue() as Error as NSError }
+        while let current = error {
+            if current.domain == LAError.errorDomain ||
+                (current.domain == NSOSStatusErrorDomain &&
+                    [errSecUserCanceled, errSecAuthFailed, errSecInteractionNotAllowed].map(Int.init).contains(current.code)) {
+                return -11
+            }
+            error = current.userInfo[NSUnderlyingErrorKey] as? NSError
+        }
+        return -4
+    }
     if pt.count > outCap { return -3 }
     pt.copyBytes(to: out, count: pt.count)
     return pt.count

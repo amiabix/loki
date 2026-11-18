@@ -26,7 +26,7 @@ use zeroize::Zeroizing;
 use crate::signer::durable::{
     create_dir_private, file_exists, read_file, replace_durable, write_durable,
 };
-use crate::signer::secure_element::{file_binding, SealedShare, SecureElement};
+use crate::signer::secure_element::{file_binding, OpenError, SealedShare, SecureElement};
 use crate::signer::Network;
 
 const META: &str = "signer.meta";
@@ -171,9 +171,10 @@ impl SignerStore {
             Err(e) => return Err(format!("signer {} file: {e}", kind.name())),
         };
         let sealed = SealedShare::from_bytes(&raw)?;
-        let plain = sealed
-            .open_bound(se, &self.binding(kind))
-            .map_err(|_| format!("signer {} file does not belong to this signer", kind.name()))?;
+        let plain = sealed.open_bound(se, &self.binding(kind)).map_err(|error| match error {
+            OpenError::WrongBinding(_) => format!("signer {} file does not belong to this signer", kind.name()),
+            OpenError::Element(message) => format!("signer {} file: {message}", kind.name()),
+        })?;
         Ok(Some((sealed.backup_epoch, plain)))
     }
 }
