@@ -16,6 +16,9 @@ fn recv_until<T: Transport>(
     channel: &T::Channel,
     as_coordinator: bool,
     want: usize,
+    attempt: &str,
+    kind: impl Fn(&Incoming) -> &'static str,
+    check_running: &dyn Fn() -> Result<(), String>,
 ) -> Result<Vec<Incoming>, String>
 where
     T::Error: std::fmt::Display,
@@ -23,20 +26,45 @@ where
     let mut got = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(120);
     while Instant::now() < deadline {
-        got.extend(
-            transport
-                .recv(channel, as_coordinator)
-                .map_err(|e| format!("relay recv: {e}"))?,
-        );
+        check_running()?;
+        let batch = transport.recv(channel, as_coordinator).map_err(|e| {
+            eprintln!("payment {attempt}: frostd signing receive error");
+            format!("relay recv: {e}")
+        })?;
+        for msg in &batch {
+            eprintln!("payment {attempt}: frostd received {}", kind(msg));
+        }
+        got.extend(batch);
         if got.len() >= want {
             return Ok(got);
         }
         std::thread::sleep(Duration::from_millis(25));
     }
+    eprintln!("payment {attempt}: frostd signing receive timeout ({}/{want})", got.len());
     Err(format!(
         "relay delivered {} of {want} expected messages",
         got.len()
     ))
+}
+
+fn send<T: Transport>(
+    transport: &T,
+    channel: &T::Channel,
+    attempt: &str,
+    kind: &str,
+    peers: &[Peer],
+    message: Outbound,
+) -> Result<(), String>
+where
+    T::Error: std::fmt::Display,
+{
+    match transport.send(channel, peers, &message) {
+        Ok(()) => { eprintln!("payment {attempt}: frostd sent {kind}"); Ok(()) }
+        Err(e) => {
+            eprintln!("payment {attempt}: frostd send {kind} error");
+            Err(format!("send {kind}: {e}"))
+        }
+    }
 }
 
 /// Commit, optionally build the candidate as proposer, then sign the candidate-bound package.
@@ -58,20 +86,21 @@ pub fn signer_loop<T: Transport, S: Signer>(
     context: &SessionContext,
     proposer: &PublicIdentity,
     other_signers: &[PublicIdentity],
+    check_running: &dyn Fn() -> Result<(), String>,
     accept_candidate: &mut dyn FnMut(&[u8]) -> Result<(), String>,
 ) -> Result<(), String>
 where
     T::Error: std::fmt::Display,
     S::Error: std::fmt::Display,
 {
+    let attempt = hex::encode(candidate_ref.attempt_id);
+    check_running()?;
     let commitment = signer.sign_commit(session, candidate_ref).map_err(|e| format!("sign_commit: {e}"))?;
-    transport
-        .send(channel, &[], &Outbound::Commitments(commitment))
-        .map_err(|e| format!("send commitment: {e}"))?;
+    send(transport, channel, &attempt, "commitment", &[], Outbound::Commitments(commitment))?;
 
     let mut coordinator = None;
     let local_candidate = if let Some(inputs) = proposer_inputs {
-        let alpha_message = recv_until(transport, channel, false, 1)?.remove(0);
+        let alpha_message = recv_until(transport, channel, false, 1, &attempt, |_| "alpha", check_running)?.remove(0);
         let alpha_bytes: [u8; 32] = alpha_message
             .message
             .try_into()
@@ -82,14 +111,20 @@ where
         accept_candidate(candidate.as_bytes())?;
         for peer in other_signers {
             let sealed = SealedCandidate::seal(own, peer, context, &candidate)?;
-            transport
-                .send(channel, &[Peer(peer.encryption)], &Outbound::Candidate(sealed))
-                .map_err(|e| format!("send candidate: {e}"))?;
+            send(transport, channel, &attempt, "candidate", &[Peer(peer.encryption)], Outbound::Candidate(sealed))?;
         }
         Some(candidate.into_bytes())
     } else { None };
 
-    let got = recv_until(transport, channel, false, if local_candidate.is_some() { 2 } else { 3 })?;
+    let got = recv_until(transport, channel, false, if local_candidate.is_some() { 2 } else { 3 }, &attempt, |msg| {
+        if local_candidate.is_none() && msg.from == Peer(proposer.encryption) {
+            "candidate"
+        } else if msg.message.len() == 32 {
+            "randomizer seed"
+        } else {
+            "signing package"
+        }
+    }, check_running)?;
     let (candidate_bytes, package_index, seed_index) = if let Some(bytes) = local_candidate {
         (bytes, 0, 1)
     } else {
@@ -131,11 +166,11 @@ where
     if !candidate.ironwood().actions().iter().any(|action| action.spend().rk() == &rk) {
         return Err("candidate has no spend under the randomized group key".into());
     }
+    check_running()?;
     let share = signer.sign_approve(session, candidate_ref, candidate_bytes, &package, &seed)
         .map_err(|e| format!("sign_approve: {e}"))?;
-    transport
-        .send(channel, &[], &Outbound::Share(share))
-        .map_err(|e| format!("send share: {e}"))
+    check_running()?;
+    send(transport, channel, &attempt, "share", &[], Outbound::Share(share))
 }
 
 /// Gather a threshold of commitments, request the proposer candidate, aggregate, and apply.
@@ -149,6 +184,8 @@ pub fn coordinate<T: Transport>(
     peer_of: &BTreeMap<frost::Identifier, Peer>,
     threshold: u16,
     rng: impl rand_core::CryptoRngCore,
+    attempt: &str,
+    check_running: &dyn Fn() -> Result<(), String>,
     mut local_candidate: impl FnMut() -> Result<Option<Vec<u8>>, String>,
 ) -> Result<Vec<u8>, String>
 where
@@ -170,7 +207,7 @@ where
             .copied()
     };
     let mut commitments = BTreeMap::new();
-    for incoming in recv_until(transport, channel, true, peer_ids.len())? {
+    for incoming in recv_until(transport, channel, true, peer_ids.len(), attempt, |_| "commitment", check_running)? {
         let id = sender_id(&incoming.from).ok_or("commitment from a non-signer")?;
         let commitment = frost::round1::SigningCommitments::deserialize(&incoming.message)
             .map_err(|e| format!("decode commitment: {e}"))?;
@@ -192,12 +229,11 @@ where
     let proposer = peer_of
         .get(&peer_ids[0])
         .ok_or("proposer has no relay address")?;
-    transport
-        .send(channel, std::slice::from_ref(proposer), &Outbound::RandomizerSeed(alpha))
-        .map_err(|e| format!("send alpha: {e}"))?;
+    send(transport, channel, attempt, "alpha", std::slice::from_ref(proposer), Outbound::RandomizerSeed(alpha))?;
     let mut candidate_bytes = None;
     let deadline = Instant::now() + Duration::from_secs(120);
     while Instant::now() < deadline {
+        check_running()?;
         candidate_bytes = local_candidate()?;
         if candidate_bytes.is_some() {
             break;
@@ -213,13 +249,11 @@ where
     let package = frost::SigningPackage::new(commitments, &sighash);
     for id in peer_ids {
         let peer = peer_of.get(id).ok_or("signer has no relay address")?;
-        transport.send(channel, std::slice::from_ref(peer), &Outbound::Package(package.clone()))
-            .map_err(|e| format!("send signing package: {e}"))?;
-        transport.send(channel, std::slice::from_ref(peer), &Outbound::RandomizerSeed(seed.as_slice().try_into().map_err(|_| "randomizer seed must be 32 bytes")?))
-            .map_err(|e| format!("send randomizer seed: {e}"))?;
+        send(transport, channel, attempt, "signing package", std::slice::from_ref(peer), Outbound::Package(package.clone()))?;
+        send(transport, channel, attempt, "randomizer seed", std::slice::from_ref(peer), Outbound::RandomizerSeed(seed.as_slice().try_into().map_err(|_| "randomizer seed must be 32 bytes")?))?;
     }
     let mut shares = BTreeMap::new();
-    for incoming in recv_until(transport, channel, true, peer_ids.len())? {
+    for incoming in recv_until(transport, channel, true, peer_ids.len(), attempt, |_| "share", check_running)? {
         let id = sender_id(&incoming.from).ok_or("share from a non-signer")?;
         let share = frost::round2::SignatureShare::deserialize(&incoming.message)
             .map_err(|e| format!("decode share: {e}"))?;

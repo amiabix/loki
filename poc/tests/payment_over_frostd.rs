@@ -265,6 +265,7 @@ where
                         &channel,
                         &mut signer, &signer_session, &candidate, &signer_public, id,
                         proposer_inputs, &identity, &context, &proposer, &other_signers,
+                        &|| Ok(()),
                         &mut |bytes| {
                             if proposer_inputs.is_some() {
                                 *handoff.lock().unwrap() = Some(bytes.to_vec());
@@ -277,7 +278,7 @@ where
             })
             .collect();
         let signed =
-            coordinate(&tx, &channel, &public, &ids, &peer_of, 2, rand_core::OsRng, || {
+            coordinate(&tx, &channel, &public, &ids, &peer_of, 2, rand_core::OsRng, &hex::encode(candidate.attempt_id), &|| Ok(()), || {
                 Ok(handoff.lock().unwrap().clone())
             })
             .unwrap();

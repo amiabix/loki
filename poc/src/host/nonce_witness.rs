@@ -22,13 +22,14 @@ impl Drop for WitnessConfig {
 }
 
 pub(super) struct RelayWitness {
+    attempt: String,
     routes: [(RelayRoute, Secret32); 2],
     http: RelayHttp,
     runtime: tokio::runtime::Runtime,
 }
 
 impl RelayWitness {
-    pub(super) fn open(path: Option<&Path>, development: bool) -> Result<Self, String> {
+    pub(super) fn open(path: Option<&Path>, development: bool, attempt: &str) -> Result<Self, String> {
         let path = path.ok_or("hosted signing requires --nonce-witnesses <file>")?;
         let mut raw = Zeroizing::new(Vec::new());
         std::fs::File::open(path).map_err(|e| format!("nonce witnesses: {e}"))?
@@ -41,6 +42,7 @@ impl RelayWitness {
             mailbox: c.mailbox, append_revision: 1,
         }, Secret32::from_bytes(c.read)));
         let witness = Self {
+            attempt: attempt.to_owned(),
             routes,
             http: if development { RelayHttp::new() } else { RelayHttp::hosted() }
                 .map_err(|e| e.to_string())?,
@@ -66,9 +68,15 @@ impl NonceWitness for RelayWitness {
     }
 
     fn claim(&mut self, cid: [u8; 32], record: &[u8]) -> Result<(), String> {
-        for (route, read) in &self.routes {
+        for (index, (route, read)) in self.routes.iter().enumerate() {
+            let (attempt, witness) = (&self.attempt, index + 1);
+            eprintln!("payment {attempt}: relay sending nonce claim to witness {witness}");
             let created = self.runtime.block_on(self.http.claim_nonce(route, read, cid, record))
-                .map_err(|e| format!("nonce witness claim: {e}"))?;
+                .map_err(|e| {
+                    eprintln!("payment {attempt}: relay nonce claim error from witness {witness}");
+                    format!("nonce witness claim: {e}")
+                })?;
+            eprintln!("payment {attempt}: relay received nonce claim response from witness {witness}: {}", if created { "accepted" } else { "duplicate" });
             if !created { return Err("nonce already claimed; start a new signing attempt".into()); }
         }
         Ok(())
@@ -81,7 +89,7 @@ mod tests {
 
     #[test]
     fn hosted_signing_requires_external_witness_configuration() {
-        assert!(RelayWitness::open(None, false).err().unwrap().contains("--nonce-witnesses"));
+        assert!(RelayWitness::open(None, false, "test").err().unwrap().contains("--nonce-witnesses"));
     }
 
     #[test]
@@ -104,11 +112,11 @@ mod tests {
         assert_eq!(decoded[1].read, [8; 32]);
         let path = std::env::temp_dir().join(format!("loki-witness-{}.json", uuid::Uuid::new_v4()));
         std::fs::write(&path, &*raw).unwrap();
-        let witness = RelayWitness::open(Some(&path), true).unwrap();
+        let witness = RelayWitness::open(Some(&path), true, "test").unwrap();
         assert_eq!(witness.pins(), [([1; 32], [2; 32], [3; 32]), ([5; 32], [6; 32], [7; 32])]);
         assert_eq!(witness.routes[0].1.as_bytes(), &[4; 32]);
         assert_eq!(witness.routes[1].1.as_bytes(), &[8; 32]);
-        assert!(RelayWitness::open(Some(&path), false).is_err());
+        assert!(RelayWitness::open(Some(&path), false, "test").is_err());
         std::fs::remove_file(path).unwrap();
     }
 
@@ -118,7 +126,7 @@ mod tests {
     #[test]
     fn provisioned_relays_accept_a_claim_once_and_refuse_a_duplicate() {
         let Some(path) = std::env::var_os("LOKI_NONCE_WITNESSES") else { return };
-        let mut witness = RelayWitness::open(Some(Path::new(&path)), true).unwrap();
+        let mut witness = RelayWitness::open(Some(Path::new(&path)), true, "test").unwrap();
         let mut cid = [0u8; 32];
         rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut cid);
         witness.claim(cid, b"first use").unwrap();
@@ -136,9 +144,9 @@ mod tests {
             "run": ([n + 1; 32].to_vec()), "mailbox": ([n + 2; 32].to_vec()), "read": ([n + 3; 32].to_vec())
         });
         std::fs::write(&path, serde_json::to_vec(&[entry(1), entry(1)]).unwrap()).unwrap();
-        assert!(RelayWitness::open(Some(&path), false).is_err());
+        assert!(RelayWitness::open(Some(&path), false, "test").is_err());
         std::fs::write(&path, serde_json::to_vec(&[entry(1), entry(5)]).unwrap()).unwrap();
-        let witness = RelayWitness::open(Some(&path), false).unwrap();
+        let witness = RelayWitness::open(Some(&path), false, "test").unwrap();
         assert_eq!(witness.pins(), [([1; 32], [2; 32], [3; 32]), ([5; 32], [6; 32], [7; 32])]);
         std::fs::remove_file(path).unwrap();
     }
