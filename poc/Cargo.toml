@@ -94,7 +94,7 @@ probe-zip2005 = []
 # Apple Secure Enclave backend (macOS only): build.rs links enclave-spike/se_backend.swift.
 apple-enclave = ["loki-signer-core/apple-enclave"]
 setup-fault-injection = ["relay-communication"]
-relay-communication = ["dep:loki-relay-client", "dep:loki-relay-protocol"]
+relay-communication = []
 # Counts Argon2id derivations and prints `kdf_derivations=N` to stderr at exit.
 # Measurement only: never in builds used for timing or acceptance.
 kdf-stats = []
@@ -107,11 +107,9 @@ zakura-primitives = { path = "vendor/zakura-primitives" }
 
 [dependencies.loki-relay-client]
 path = "../communication/client"
-optional = true
 
 [dependencies.loki-relay-protocol]
 path = "../communication/protocol"
-optional = true
 
 [[bin]]
 # Hosted setup commands in one long-lived process per unlocked profile; see
