@@ -22,8 +22,12 @@ zeroize = "1"
 # XEdDSA signs the frostd login challenge inside wasm, so the relay secret never reaches JS.
 xeddsa = "1"
 rand = "0.10"
+# The co-signer candidate review (paymentCheck) parses the PCZT itself, like the native host.
+pczt = { package = "zakura-pczt", version = "=0.1.0-rc4", features = ["orchard"] }
+zcash_protocol = { package = "zakura-protocol", version = "=2.2.0" }
+serde = { version = "1", features = ["derive"] }
+orchard = { package = "zakura-orchard", version = "=2.2.0", default-features = false, features = ["std", "unstable-frost", "unstable-voting-circuits"] }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
 x25519-dalek = "2.0"
-orchard = { package = "zakura-orchard", version = "=2.2.0", default-features = false, features = ["std", "unstable-frost", "unstable-voting-circuits"] }

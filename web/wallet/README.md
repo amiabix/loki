@@ -172,3 +172,46 @@ they never broadcast a transaction:
 ```sh
 FROSTD_URL=http://127.0.0.1:2744 cargo test --manifest-path poc/Cargo.toml --locked --offline --features relay-communication --lib host::payment::tests
 ```
+
+## Browser signer (separate signer origin)
+
+The in-browser signer runs on its **own origin**, not the wallet's. `poc/loki-signer-wasm/serve.mjs`
+serves the signer page, Worker, wasm and transport. The wallet embeds that page in an iframe and
+exchanges only public data with it over postMessage. The passkey PRF ceremony, the passphrase,
+the roster-code comparison and every payment approval happen on the signer page. The share
+stays in that origin's OPFS.
+
+Local development uses two ports. Build the wasm once (both pkgs are gitignored):
+
+```sh
+# in poc/loki-signer-wasm
+RUSTFLAGS='--cfg getrandom_backend="wasm_js"' wasm-pack build --dev --target web
+# in poc/wasm-transport
+wasm-pack build --target web
+```
+
+Then, in web/wallet:
+
+```sh
+LOKI_FROSTD_URL=http://127.0.0.1:2744 npm run signer   # signer origin  → http://localhost:3002
+npm run dev                                           # wallet         → http://localhost:3001
+```
+
+`next dev` points at `http://localhost:3002` by default. A production build **must** set
+`NEXT_PUBLIC_SIGNER_ORIGIN`. Without it, every signer call fails. There is no mock fallback in a
+browser.
+
+What a deploy must provide on the signer server (`serve.mjs` env):
+
+| variable | meaning |
+|---|---|
+| `LOKI_WALLET_ORIGIN` | the one wallet origin allowed to frame and message the signer (`frame-ancestors`, postMessage check) |
+| `LOKI_FROSTD_URL` | the frostd relay the signer logs in to. It is shown to the member and not settable from the wallet page. One relay only. |
+| `LOKI_RP_ID` | WebAuthn rpId. It **must stay the same across deploys** or passkeys stop unlocking. |
+| `LOKI_SIGNER_PORT` | listen port (default 3002) |
+
+The signer origin itself must be **stable**. The share (OPFS), the device-login key (IndexedDB)
+and the passkey (rpId) are all bound to it. A new hostname per run (for example a fresh
+trycloudflare URL) gives an empty signer that cannot open the old share. Only one tab per browser
+profile may run the signer: a Web Lock guards the Worker, its share and its nonce store. Other
+tabs refuse signer operations until the first one closes.

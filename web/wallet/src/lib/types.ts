@@ -17,6 +17,10 @@ export type StatusResponse = {
   secure_element?: "apple" | "software" | string;
   profile?: { name: string; id: string };
   vaults?: VaultSummary[];
+  // In-browser signer: whether the browser granted persistent storage (null: not asked yet),
+  // and the frostd relay the signer origin logs in to.
+  persisted?: boolean | null;
+  relay?: string;
 };
 
 export type InviteSlot = { slot: number; code: string; joined: boolean };

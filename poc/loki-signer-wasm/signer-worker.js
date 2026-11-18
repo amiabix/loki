@@ -26,18 +26,24 @@ const ready = init().then(() => {
   return { signer: new Signer(), P };
 });
 
-// The frostd transport is a SEPARATE wasm module (poc/wasm-transport) so its reqwest/xeddsa
-// dep tree stays isolated from the signer core. It is loaded lazily from the URL the UI passes
-// in the DKG params (`transportUrl`), so lifecycle-only pages never fetch it.
+// The frostd transport is a SEPARATE wasm module (poc/wasm-transport) so its reqwest dep tree
+// stays isolated from the signer core. It is loaded lazily, and only from its pinned path on
+// this (the signer) origin — never from a caller-supplied URL — so lifecycle-only pages never
+// fetch it and no page can swap the code that runs beside the signer.
+const TRANSPORT_URL = new URL("./wasm-transport/pkg/loki_wasm_transport.js", import.meta.url).href;
 let FrostdClient = null;
-async function loadFrostd(transportUrl) {
+async function loadFrostd() {
   if (!FrostdClient) {
-    const mod = await import(transportUrl);
+    const mod = await import(TRANSPORT_URL);
     await mod.default();
     FrostdClient = mod.FrostdClient;
   }
   return FrostdClient;
 }
+
+// Testnet NU5 (Orchard) activation height (zakura-protocol consensus.rs, TestNetwork). No
+// Orchard vault can be born below it.
+const TESTNET_NU5_HEIGHT = 1_842_420;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const toHex = (bytes) => Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
@@ -116,6 +122,14 @@ async function joinCeremony(signer, p) {
     .sort((a, b) => a - b)
     .map((s) => ({ id: s, signing: roster[String(s)].signing, encryption: roster[String(s)].encryption }));
 
+  // The member sees EVERY member before telling the creator it agrees, not just its own slot.
+  if (!Number.isSafeInteger(threshold) || threshold < 1 || threshold > members.length) {
+    throw new Error("the invite's threshold does not fit the roster");
+  }
+  if (!await ask("roster-members", { name, vault, threshold, network, slot, members })) {
+    throw new Error("You rejected this vault's members");
+  }
+
   // Agree, then poll for the creator's frostd session + coordinator relay peer (+ birth_height).
   await postJson(`${base}/api/agreed`, auth);
   const session = await poll(
@@ -127,8 +141,18 @@ async function joinCeremony(signer, p) {
     p,
   );
 
+  // The creator's birth height: it is inside the roster fingerprint, so every member's roster
+  // code differs if the creator gave members different heights. Here it must at least be a
+  // real Orchard-era Testnet height. ponytail: no upper bound — the browser has no chain
+  // source to compare against; add one when the signer can reach a lightwalletd.
   const doc = { vault, threshold, setup_version: 2, network, members };
-  if (network === "testnet") doc.birth_height = Number(session.birth_height);
+  if (network === "testnet") {
+    const height = Number(session.birth_height);
+    if (!Number.isSafeInteger(height) || height < TESTNET_NU5_HEIGHT) {
+      throw new Error("the creator's vault birth height is not a Testnet Orchard height");
+    }
+    doc.birth_height = height;
+  }
   const rosterHex = toHex(new TextEncoder().encode(JSON.stringify(doc)));
 
   return driveDkg(signer, {
@@ -137,8 +161,8 @@ async function joinCeremony(signer, p) {
     label: p.label ?? name,
     network,
     rosterHex,
+    birthHeight: doc.birth_height,
     frostdUrl: p.frostdUrl,
-    transportUrl: p.transportUrl,
     sessionId: session.session_id,
     coordinatorPeer: session.coordinator_peer,
     pollMs: p.pollMs,
@@ -152,13 +176,20 @@ async function joinCeremony(signer, p) {
 // (a roster member running the frostd relay) forwards each member's wires to its peers; this
 // member only ever sends to the coordinator and keeps the coordinator's relayed wires.
 async function driveDkg(signer, p) {
-  const { vaultHex, slot, label, network, rosterHex, frostdUrl, coordinatorPeer, sessionId, transportUrl } = p;
+  const { vaultHex, slot, label, network, rosterHex, frostdUrl, coordinatorPeer, sessionId } = p;
   for (const path of JSON.parse(vaultPaths(vaultHex))) await opfsPreopenWrite(path);
 
+  // The 24-digit roster code, computed by the signer from the exact roster it will confirm,
+  // shown on the signer page for the member to compare with every other member. vaultJoin's
+  // roster prompt answers Match only for the code the member confirmed here.
   const roster = Uint8Array.from(rosterHex.match(/../g).map((b) => parseInt(b, 16)));
-  const vref = JSON.parse(signer.vaultJoin(vaultHex, slot, label ?? "vault", network, roster));
+  const code = signer.rosterCode(roster);
+  if (!await ask("roster-code", { code, birth_height: p.birthHeight ?? null })) {
+    throw new Error("You reported that the roster codes differ; this vault setup is stopped");
+  }
+  const vref = JSON.parse(signer.vaultJoin(vaultHex, slot, label ?? "vault", network, roster, code));
 
-  const fc = await frostdClient(signer, { frostdUrl, transportUrl });
+  const fc = await frostdClient(signer, { frostdUrl });
   fc.useSession(sessionId);
 
   const pollMs = Number(p.pollMs) || 200;
@@ -188,7 +219,7 @@ async function openVault(signer, vaultHex) {
 // Log in to frostd without the relay secret ever reaching JS: the transport fetches the
 // challenge, the wasm signer XEdDSA-signs it, and only the signature crosses back.
 async function frostdClient(signer, p) {
-  const Client = await loadFrostd(p.transportUrl);
+  const Client = await loadFrostd();
   const fc = new Client(p.frostdUrl, signer.frostdPubkey());
   const challenge = await fc.challenge();
   await fc.loginSigned(challenge, signer.frostdSignChallenge(challenge));
@@ -247,13 +278,16 @@ async function findPayment(signer, control, vault, attemptHex, p) {
   throw new Error("this payment was not found on the relay; it may be finished, cancelled or for another vault");
 }
 
-// The proposer's latest word on the signing group: `start` names it, `cancelled` and `failed`
-// end the request. Plain `intent` re-announcements change nothing.
+// The proposer's latest word on the signing group: `start` names it and fixes the signing
+// expiry (outside the intent hash, like the group), `cancelled` and `failed` end the request.
+// Plain `intent` re-announcements change nothing.
 function groupFrom(notices) {
   for (const n of notices) {
     if (n.kind === "cancelled") throw new Error("the proposer cancelled this payment");
     if (n.kind === "failed") throw new Error("the proposer could not complete this payment");
-    if (n.kind === "start" && n.intent.signers?.length) return n.intent.signers;
+    if (n.kind === "start" && n.intent.signers?.length) {
+      return { signers: n.intent.signers, signingExpiry: n.intent.signing_expiry ?? null };
+    }
   }
   return null;
 }
@@ -275,16 +309,29 @@ async function drivePayment(signer, p) {
   const announced = notices[notices.length - 1];
   const proposer = vault.members.find((m) => m.id === announced.from);
 
+  const terms = announced.intent;
+  checkTerms(terms);
+
   // Approve on the control session: a sealed {kind:"approval"} for the terms the proposer
-  // announced, which the proposer records (payment.rs `sync_control`). Durable at frostd.
-  let signers = groupFrom(notices);
-  if (signers && !signers.includes(vault.slot)) throw new Error("enough members already approved this payment");
-  if (!signers) {
-    const approval = JSON.stringify({ kind: "approval", hash: announced.hash, intent: announced.intent, txid: null });
+  // announced, which the proposer records (payment.rs `sync_control`). Durable at frostd. The
+  // member sees those terms on the signer page first; declining sends nothing.
+  let group = groupFrom(notices);
+  if (group && !group.signers.includes(vault.slot)) throw new Error("enough members already approved this payment");
+  if (!group) {
+    if (!await ask("payment-terms", terms)) throw new Error("You declined this payment request");
+    const approval = JSON.stringify({ kind: "approval", hash: announced.hash, intent: terms, txid: null });
     await control.sendToPeer(proposer.encryption, signer.sealControl(controlSessionId, proposer.id, approval));
-    signers = await waitForSigningGroup(signer, control, vault, attemptHex, controlSessionId, proposer.id, p);
+    group = await waitForSigningGroup(signer, control, vault, attemptHex, controlSessionId, proposer.id, p);
   }
+  const { signers, signingExpiry } = group;
   if (!signers.includes(vault.slot)) return { approved: true, signed: false };
+  // The transaction's real expiry is fixed by `start` (about seven days above the proposer's
+  // tip) and must lie above the anchor and no later than the approved bound (payment.rs
+  // `check_intent`). Without one, the approved bound is the expiry.
+  const expiry = signingExpiry ?? terms.expiry_height;
+  if (!Number.isSafeInteger(expiry) || expiry <= terms.target_height || expiry > terms.expiry_height) {
+    throw new Error("the proposer's signing expiry is outside the approved terms");
+  }
 
   // The signing session's coordinator is the one-shot key that opened it.
   const fc = await frostdClient(signer, p);
@@ -328,12 +375,28 @@ async function drivePayment(signer, p) {
     throw new Error("payment signing messages did not arrive before the deadline");
   }
 
-  // WYSIWYS render (for the UI/audit) then release the share — signApprove re-derives and
-  // binds the sighash itself and refuses any mismatch before touching the nonce/share.
-  const review = JSON.parse(signer.paymentReview(candidateHex));
-  const share = signer.signApprove(attemptHex, candidateHex, packageHex, seedHex);
+  // The signer's own parse of the candidate must be exactly the approved terms (network,
+  // expiry, the one input note, recipient, amount, memo, change, fee) — refused otherwise,
+  // before the member is even asked. Then the member confirms that parse on the signer page
+  // with a fresh passkey assertion (or the passphrase again), and signApprove releases the
+  // share only for the sighash the member confirmed.
+  const review = JSON.parse(signer.paymentCheck(candidateHex, JSON.stringify({ ...terms, tx_expiry: expiry })));
+  const consent = await ask("payment-sign", review);
+  if (!consent) throw new Error("You declined to sign this payment");
+  signer.reauth(consent.method, consent.passphrase, consent.prfSecret);
+  const share = signer.signApprove(attemptHex, candidateHex, packageHex, seedHex, review.sighash);
   await fc.sendToCoordinator(share);
   return { approved: true, signed: true, review };
+}
+
+// The announced terms, shape-checked before they are shown (payment.rs `check_intent`). The
+// wasm `paymentCheck` re-checks every value against the candidate itself.
+function checkTerms(t) {
+  const ok = t && typeof t.recipient === "string" && typeof t.memo === "string"
+    && [t.amount_zat, t.fee_zat, t.change_zat, t.target_height, t.expiry_height].every(Number.isSafeInteger)
+    && t.amount_zat > 0 && t.expiry_height > t.target_height
+    && Array.isArray(t.note_selection) && t.note_selection.length === 1;
+  if (!ok) throw new Error("the proposer announced invalid payment terms");
 }
 
 // Wait on the control session until the proposer names the signing group. Nothing secret is
@@ -345,8 +408,8 @@ async function waitForSigningGroup(signer, control, vault, attemptHex, controlSe
     await sleep(pollMs);
     const notices = (await readControl(signer, control, controlSessionId))
       .filter((m) => m.from === proposerId && aboutPayment(m, vault, attemptHex, controlSessionId));
-    const signers = groupFrom(notices);
-    if (signers) return signers;
+    const group = groupFrom(notices);
+    if (group) return group;
   }
   throw new Error("Your approval is recorded, but not enough members approved yet. Open this payment again later to sign.");
 }
@@ -363,8 +426,26 @@ async function preopenUnlock(P, method) {
   if (method === "passphrase") await opfsPreopenRead(P.salt);
 }
 
+// On-device decisions: the worker asks the signer page (signer-page.js), which shows the
+// prompt on the signer origin and answers. The wallet page never sees or answers these.
+const asks = new Map();
+let askSeq = 0;
+function ask(kind, data) {
+  const id = ++askSeq;
+  return new Promise((resolve, reject) => {
+    asks.set(id, { resolve, reject });
+    self.postMessage({ ask: id, kind, data });
+  });
+}
+
 self.onmessage = async (e) => {
-  const { id, op, method, name, passphrase, prfSecret, dkg, join, payment, devicePubHex } = e.data;
+  if (e.data.answer !== undefined) {
+    const a = asks.get(e.data.answer);
+    asks.delete(e.data.answer);
+    if (a) e.data.ok ? a.resolve(e.data.value) : a.reject(new Error(e.data.error));
+    return;
+  }
+  const { id, op, method, name, passphrase, prfSecret, join, payment, devicePubHex } = e.data;
   try {
     const { signer, P } = await ready;
     let result;
@@ -379,9 +460,6 @@ self.onmessage = async (e) => {
         break;
       case "authorize-device":
         result = signer.authorizeDevice(devicePubHex);
-        break;
-      case "dkg":
-        result = await driveDkg(signer, dkg);
         break;
       case "join":
         result = await joinCeremony(signer, join);
