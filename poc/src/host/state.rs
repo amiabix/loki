@@ -152,6 +152,8 @@ pub struct AppState {
     pub device_auth: std::sync::Mutex<Option<crate::signer::device_auth::DeviceRegistry>>,
     /// The member's native payment decision; `None` (headless) refuses every payment.
     pub approval: Option<super::LocalApproval>,
+    /// Each vault's group viewing key, read from its device-bound signer once per process.
+    pub(super) viewing_keys: std::sync::Mutex<BTreeMap<String, orchard::keys::FullViewingKey>>,
 }
 
 impl AppState {
@@ -167,6 +169,7 @@ impl AppState {
             active_dkgs: std::sync::Mutex::new(BTreeSet::new()),
             device_auth: std::sync::Mutex::new(None),
             approval: None,
+            viewing_keys: std::sync::Mutex::new(BTreeMap::new()),
         }
     }
 }

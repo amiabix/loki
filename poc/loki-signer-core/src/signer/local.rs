@@ -665,18 +665,9 @@ impl<SE: SecureElement> LocalSigner<SE> {
         self.public_package.as_deref()
     }
 
-    /// Material for the hosted vault's existing sealed file after every receipt arrived.
-    pub fn hosted_material(&self) -> Result<(frost::keys::KeyPackage, frost::keys::PublicKeyPackage, Zeroizing<[u8; 32]>), SignerError> {
-        self.require_ready()?;
-        let setup = self.setup.as_ref().ok_or(SignerError::NotReady)?;
-        let public = frost::keys::PublicKeyPackage::deserialize(
-            self.public_package.as_deref().ok_or(SignerError::NoShare)?
-        ).map_err(|e| SignerError::Other(e.to_string()))?;
-        Ok((self.open_key()?, public, Zeroizing::new(*setup.core.vault_secret())))
-    }
-
     /// Public vault metadata (group public-key package + full viewing key) for an active
-    /// signer, without touching the sealed share. Used by the native member serve path.
+    /// signer, without touching the sealed share. The hosted member records it in
+    /// `vault.sealed` and scans with it; the share itself never leaves the signer.
     pub fn hosted_metadata(&self) -> Result<(frost::keys::PublicKeyPackage, FullViewingKey), SignerError> {
         self.require_ready()?;
         let public = frost::keys::PublicKeyPackage::deserialize(

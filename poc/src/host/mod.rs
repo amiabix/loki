@@ -4,6 +4,7 @@
 //! stack blocks on its own runtime (see `setup_relay::shared_runtime`).
 
 mod ceremony;
+mod custody;
 mod device;
 mod payment;
 mod nonce_witness;

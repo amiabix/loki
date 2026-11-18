@@ -322,8 +322,9 @@ where
     for m in &members {
         assert!(m.ready(), "member {} must be ready after every receipt", m.id);
     }
-    let secrets: Vec<_> = members.iter().map(|m| *m.signer.hosted_material().unwrap().2).collect();
-    assert!(secrets.iter().all(|secret| *secret == secrets[0]));
+    // Every member derived the same vault secret, so the same group viewing key.
+    let viewing: Vec<_> = members.iter().map(|m| m.signer.hosted_metadata().unwrap().1.to_bytes()).collect();
+    assert!(viewing.iter().all(|fvk| *fvk == viewing[0]));
     // Active: the coordinator deletes its relay log.
     assert!(log.active());
     log.delete().unwrap();

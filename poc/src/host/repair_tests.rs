@@ -258,9 +258,8 @@ fn wired_repair(threshold: u16, members: u16, lost: u16, fault: Option<Fault>) {
     let expected = keys[&frost::Identifier::try_from(lost).unwrap()]
         .serialize()
         .unwrap();
-    // Signing reads the share from `vault.sealed`, exactly as after DKG.
-    assert_eq!(stored["key_package"], hex::encode(&expected));
-    assert_eq!(stored["vault_secret"], hex::encode([42u8; 32]));
+    // `vault.sealed` is public metadata; signing reads the share from the signer store.
+    assert!(stored.get("key_package").is_none() && stored.get("vault_secret").is_none());
     let sdir = super::super::ceremony::signer_dir(&data, &hex::encode(vault)).unwrap();
     let se = crate::signer::secure_element::SoftwareSecureElement::persistent(&sdir, "replacement pass").unwrap();
     let (_, raw) = crate::signer::store::SignerStore::open(&sdir).unwrap()
@@ -487,15 +486,16 @@ async fn repair_handlers_require_unlock_consent_and_local_relay_and_original_vau
         "fingerprint":fingerprint, "agreed":[1,2,3], "session_id":null, "dkg_started":true, "error":null});
     dir.write_sealed("ceremony.sealed", &encode(&ceremony).unwrap(), "pass")
         .unwrap();
+    let ak: [u8; 32] = public.verifying_key().serialize().unwrap().try_into().unwrap();
+    let fvk = crate::zip2005::frost_viewing_key(&ak, &[42; 32]).unwrap();
     let bytes = super::super::ceremony::vault_sealed_bytes(
         &invite.vault,
         1,
         2,
         3,
         &fingerprint,
-        &key,
         &public,
-        &[42; 32],
+        &fvk,
         100,
         VaultNetwork::Regtest,
     )
