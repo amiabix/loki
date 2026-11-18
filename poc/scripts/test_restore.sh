@@ -203,7 +203,7 @@ approve() {
   local i="$1" review
   review="$(api "$i" POST /api/payment-review "$(pair "$attempt")")" || fail "review $i: $review"
   jq -e --arg recipient "$recipient" --arg amount "$AMOUNT_ZAT" '.recipient == $recipient and .amount_zat == $amount' <<<"$review" >/dev/null || fail "review values $i: $review"
-  api "$i" POST /api/payment-approve "$(jq -nc --arg vault "$vault" --arg attempt "$attempt" --arg review_token "$(jq -er '.review_token' <<<"$review")" '{vault:$vault,attempt:$attempt,review_token:$review_token}')" \
+  api "$i" POST /api/payment-approve "$(jq -nc --arg vault "$vault" --arg attempt "$attempt" --arg review_token "$(jq -er '.review_token' <<<"$review")" --arg intent_hash "$(jq -er '.intent_hash' <<<"$review")" '{vault:$vault,attempt:$attempt,review_token:$review_token,intent_hash:$intent_hash}')" \
     | jq -e '.phase == "signing"' >/dev/null || fail "approve $i"
   echo "member $i approved"
 }
