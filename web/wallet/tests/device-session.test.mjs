@@ -31,7 +31,7 @@ test('member calls run in the in-browser signer; only the coordinator is fetched
     assert.deepEqual(status.vaults, []);
 
     // Vault/DKG/payment paths belong to the wasm core (W1); the mock says so, it never fakes them.
-    await assert.rejects(api('create', { name: 'v', members: 3, threshold: 2 }), /wasm signer \(W1\)/);
+    await assert.rejects(api('create', { name: 'v', members: 3, threshold: 2 }), /does not serve/);
     await assert.rejects(api('../api/members'), /invalid signer API path/);
 
     // The public roster still comes from the coordinator over HTTP.

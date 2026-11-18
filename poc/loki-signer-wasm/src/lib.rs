@@ -14,9 +14,14 @@
 
 use loki_signer_core::setup_transport::{Identity, PublicIdentity};
 use loki_signer_core::signer::backup::BackupArtifact;
+use loki_signer_core::member_state::Roster;
+use loki_signer_core::network::VaultNetwork;
 use loki_signer_core::signer::local::{
-    BackupDevice, DevicePrompts, LocalSigner, RosterDecision, SignerError,
+    self, BackupDevice, DevicePrompts, LocalSigner, RosterDecision, SignerError,
 };
+use loki_signer_core::vault::orchard_receiver_from_ua;
+use loki_signer_core::verify::{check_candidate, Expectations, Refusal};
+use zcash_protocol::consensus::{BlockHeight, BranchId, Parameters};
 use loki_signer_core::signer::secure_element::{
     fresh_kek_salt, SealedShare, SoftwareSecureElement,
 };
@@ -29,6 +34,7 @@ use loki_signer_core::signer::wysiwys::{describe_pczt, sighash_of_pczt};
 use loki_signer_core::signer::DkgInput;
 use loki_signer_core::signing_session::{AttemptId, SessionContext};
 use loki_signer_core::frost;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use wasm_bindgen::prelude::*;
 use zeroize::Zeroizing;
@@ -240,6 +246,9 @@ pub struct Signer {
     identity: Option<Identity>,
     kek: Option<Zeroizing<[u8; 32]>>,
     vault: Option<VaultState>,
+    /// The sighash the member confirmed on the signer page for the next `signApprove`. The
+    /// core's approval prompt takes it (one use) and approves only that exact sighash.
+    approved: Arc<Mutex<Option<[u8; 32]>>>,
 }
 
 impl Default for Signer {
@@ -248,6 +257,7 @@ impl Default for Signer {
             identity: None,
             kek: None,
             vault: None,
+            approved: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -387,6 +397,8 @@ impl Signer {
     /// Create-or-reopen this member's vault signer, confirm the coordinator's roster, and
     /// begin DKG. Returns the `VaultRef` JSON. The Worker must pre-open `vaultPaths(vaultHex)`
     /// for write first. `roster` is the coordinator's setup document (`setup_version: 2`).
+    /// `confirmed_code` is the roster code the member confirmed on the signer page: the core's
+    /// roster prompt answers Match only if the code it derives equals it.
     #[wasm_bindgen(js_name = vaultJoin)]
     pub fn vault_join(
         &mut self,
@@ -395,9 +407,42 @@ impl Signer {
         label: &str,
         network: &str,
         roster: &[u8],
+        confirmed_code: &str,
     ) -> Result<String, JsError> {
-        self.vault_join_impl(vault_hex, slot, label, network, roster)
+        self.vault_join_impl(vault_hex, slot, label, network, roster, confirmed_code)
             .map_err(|e| JsError::new(&e))
+    }
+
+    /// The 24-digit roster code of a setup document, for the member to compare with every
+    /// other member before `vaultJoin` (the same code the core's roster prompt is shown).
+    #[wasm_bindgen(js_name = rosterCode)]
+    pub fn roster_code(&self, roster: &[u8]) -> Result<String, JsError> {
+        let roster = Roster::from_bytes(roster).map_err(|e| JsError::new(&e))?;
+        Ok(local::roster_code(&roster.fingerprint()))
+    }
+
+    /// A fresh proof the member is present for one approval: the custody secret (a new passkey
+    /// PRF output, or the passphrase typed again) must re-derive the KEK this session holds.
+    #[wasm_bindgen(js_name = reauth)]
+    pub fn reauth(
+        &self,
+        method: &str,
+        passphrase: Option<String>,
+        prf_secret: Option<Vec<u8>>,
+    ) -> Result<(), JsError> {
+        self.reauth_check(method, passphrase, prf_secret).map_err(|e| JsError::new(&e))
+    }
+
+    /// Check a candidate PCZT (hex) against the payment terms the member approved (JSON: the
+    /// proposer's announced intent plus `tx_expiry`, the expiry fixed at `start`), the same
+    /// review a native co-signer runs (poc/src/host/payment.rs `review_candidate`): network
+    /// branch for the anchor height, the exact expiry, and — through `verify::check_candidate`
+    /// with the vault viewing key — the one input note, recipient, amount, memo, change and
+    /// fee. Refuses on any difference. Returns the review the member confirms:
+    /// `paymentReview`'s fields plus `recipient_ua`, `memo_text` and `expiry_height`.
+    #[wasm_bindgen(js_name = paymentCheck)]
+    pub fn payment_check(&self, candidate_hex: &str, terms_json: &str) -> Result<String, JsError> {
+        self.payment_check_impl(candidate_hex, terms_json).map_err(|e| JsError::new(&e))
     }
 
     /// Reopen this browser's signer for an existing vault, with no network input. Returns
@@ -553,7 +598,9 @@ impl Signer {
     /// Round 2: the PUBLIC signature share for `attempt_hex` (hex). INDEPENDENTLY re-renders
     /// the candidate, recomputes its sighash, and REFUSES unless `package_hex` commits to that
     /// exact sighash — before the nonce/share is touched (WYSIWYS). `candidate_hex` is the
-    /// opened candidate, `seed_hex` the 32-byte rerandomizer seed. Reopen the vault first.
+    /// opened candidate, `seed_hex` the 32-byte rerandomizer seed. `confirmed_sighash_hex` is
+    /// the sighash the member confirmed on the signer page: the core's approval prompt approves
+    /// only when its own recomputed sighash equals it. Reopen the vault first.
     #[wasm_bindgen(js_name = signApprove)]
     pub fn sign_approve(
         &mut self,
@@ -561,8 +608,9 @@ impl Signer {
         candidate_hex: &str,
         package_hex: &str,
         seed_hex: &str,
+        confirmed_sighash_hex: &str,
     ) -> Result<String, JsError> {
-        self.sign_approve_impl(attempt_hex, candidate_hex, package_hex, seed_hex)
+        self.sign_approve_impl(attempt_hex, candidate_hex, package_hex, seed_hex, confirmed_sighash_hex)
             .map_err(|e| JsError::new(&e))
     }
 }
@@ -622,18 +670,32 @@ impl BackupDevice for OpfsBackup {
     }
 }
 
-/// The browser signer's device prompts for the vault in `dir`.
-fn browser_prompts(dir: &str, kek: &[u8; 32]) -> DevicePrompts {
+/// The browser signer's device prompts for the vault in `dir`. The member answered on the
+/// signer page before the synchronous core call (a sync callback cannot wait for a click), so
+/// each prompt carries that answer and checks it against what the core actually shows:
+/// `roster_code` is the code the member confirmed (None: no roster may be confirmed), and
+/// `approved` holds the one sighash the member confirmed for the next signature.
+fn browser_prompts(
+    dir: &str,
+    kek: &[u8; 32],
+    roster_code: Option<String>,
+    approved: Arc<Mutex<Option<[u8; 32]>>>,
+) -> DevicePrompts {
     DevicePrompts {
         connect: Box::new(|_origin, net| browser_network(net).is_ok()),
-        // The web coordinator already drove this member's roster agreement.
-        roster: Box::new(|_code| RosterDecision::Match),
+        roster: Box::new(move |code| match &roster_code {
+            Some(confirmed) if confirmed == code => RosterDecision::Match,
+            Some(_) => RosterDecision::NoMatch,
+            None => RosterDecision::Cancelled,
+        }),
         roster_deadline: Duration::from_secs(60),
         backup: Box::new(OpfsBackup {
             path: format!("{dir}/backup.sealed"),
             pass: Zeroizing::new(hex::encode(kek)),
         }),
-        approval: Box::new(|_request| true),
+        approval: Box::new(move |request| {
+            approved.lock().map(|mut slot| slot.take() == Some(request.sighash)).unwrap_or(false)
+        }),
     }
 }
 
@@ -662,6 +724,53 @@ fn sign_challenge(identity: &Identity, challenge: &str) -> Result<String, String
     let signing = xeddsa::xed25519::PrivateKey::from(&*Zeroizing::new(relay));
     let sig: [u8; 64] = xeddsa::Sign::sign(&signing, challenge.as_bytes(), rand::rng());
     Ok(hex::encode(sig))
+}
+
+/// The payment terms a member approved, as the proposer announced them (payment.rs
+/// `intent_json`), plus `tx_expiry`: the expiry fixed at `start`, else `expiry_height`.
+#[derive(serde::Deserialize)]
+struct Terms {
+    recipient: String,
+    amount_zat: u64,
+    memo: String,
+    fee_zat: u64,
+    change_zat: u64,
+    note_selection: Vec<String>,
+    target_height: u32,
+    tx_expiry: u32,
+}
+
+/// The co-signer review of a candidate against approved terms (payment.rs `review_candidate`).
+fn check_against_terms(
+    bytes: &[u8],
+    terms: &Terms,
+    net: VaultNetwork,
+    fvk: &orchard::keys::FullViewingKey,
+) -> Result<(), String> {
+    let parsed = pczt::Pczt::parse(bytes).map_err(|e| format!("candidate: {e:?}"))?;
+    let branch = u32::from(BranchId::for_height(&net, BlockHeight::from_u32(terms.target_height)));
+    if *parsed.global().consensus_branch_id() != branch || *parsed.global().expiry_height() != terms.tx_expiry {
+        return Err("candidate network or expiry differs from the approved terms".into());
+    }
+    let [note] = terms.note_selection.as_slice() else {
+        return Err("the approved terms must spend exactly one note".into());
+    };
+    let recipient = orchard_receiver_from_ua(&terms.recipient, net.network_type())?;
+    let expected = Expectations {
+        input_nullifiers: vec![hex32(note)?],
+        recipient: recipient.to_raw_address_bytes(),
+        amount_zat: terms.amount_zat,
+        memo: terms.memo.as_bytes().to_vec(),
+        change_zat: terms.change_zat,
+        fee_zat: terms.fee_zat,
+        expiry_height: terms.tx_expiry,
+    };
+    pczt::roles::verifier::Verifier::new(parsed)
+        .with_ironwood::<Refusal, _>(|bundle| {
+            check_candidate(bundle, fvk, &expected).map_err(pczt::roles::verifier::OrchardError::Custom)
+        })
+        .map_err(|e| format!("candidate differs from the approved terms: {e:?}"))?;
+    Ok(())
 }
 
 /// Re-stamp a device identity to a vault slot: overwrite the 2 id bytes, keep the keys.
@@ -712,7 +821,9 @@ impl Signer {
         let bytes = hex::decode(candidate_hex).map_err(|e| e.to_string())?;
         let view = describe_pczt(&bytes, &fvk)?;
         let sighash = sighash_of_pczt(&bytes, &fvk)?;
+        let expiry = *pczt::Pczt::parse(&bytes).map_err(|e| format!("candidate: {e:?}"))?.global().expiry_height();
         Ok(serde_json::json!({
+            "expiry_height": expiry,
             "recipient": hex::encode(view.to),
             "amount_zat": view.amount_zat.to_string(),
             "fee_zat": view.fee_zat.to_string(),
@@ -723,6 +834,33 @@ impl Signer {
             "sighash": hex::encode(sighash),
         })
         .to_string())
+    }
+
+    fn reauth_check(&self, method: &str, passphrase: Option<String>, prf_secret: Option<Vec<u8>>) -> Result<(), String> {
+        let held = self.kek.as_ref().ok_or("unlock the signer first")?;
+        let again = custody_kek(method, passphrase, prf_secret, false)?;
+        let diff = held.iter().zip(again.iter()).fold(0u8, |acc, (a, b)| acc | (a ^ b));
+        if diff != 0 {
+            return Err("that does not unlock this signer".into());
+        }
+        Ok(())
+    }
+
+    fn payment_check_impl(&self, candidate_hex: &str, terms_json: &str) -> Result<String, String> {
+        let vs = self.vault.as_ref().ok_or("no active vault — call vaultOpen first")?;
+        let terms: Terms = serde_json::from_str(terms_json).map_err(|e| format!("payment terms: {e}"))?;
+        let net = match browser_network(vs.signer.network())? {
+            Network::Regtest => VaultNetwork::Regtest,
+            Network::Testnet => VaultNetwork::Testnet,
+        };
+        let (_, fvk) = vs.signer.hosted_metadata().map_err(|e| e.to_string())?;
+        let bytes = hex::decode(candidate_hex).map_err(|e| e.to_string())?;
+        check_against_terms(&bytes, &terms, net, &fvk)?;
+        let mut review: serde_json::Value =
+            serde_json::from_str(&self.payment_review_impl(candidate_hex)?).map_err(|e| e.to_string())?;
+        review["recipient_ua"] = terms.recipient.into();
+        review["memo_text"] = terms.memo.into();
+        Ok(review.to_string())
     }
 
     fn sign_commit_impl(&mut self, attempt_hex: &str) -> Result<String, String> {
@@ -797,8 +935,10 @@ impl Signer {
         candidate_hex: &str,
         package_hex: &str,
         seed_hex: &str,
+        confirmed_sighash_hex: &str,
     ) -> Result<String, String> {
         let (cand, _) = self.candidate_ref(attempt_hex)?;
+        *self.approved.lock().map_err(|_| "approval state poisoned")? = Some(hex32(confirmed_sighash_hex)?);
         let candidate = hex::decode(candidate_hex).map_err(|e| e.to_string())?;
         let package = frost::SigningPackage::deserialize(
             &hex::decode(package_hex).map_err(|e| e.to_string())?,
@@ -824,7 +964,7 @@ impl Signer {
             std::path::Path::new(&dir),
             SoftwareSecureElement::from_kek(*kek),
             "vault".into(),
-            browser_prompts(&dir, &kek),
+            browser_prompts(&dir, &kek, None, self.approved.clone()),
         )
         .map_err(|e| e.to_string())?;
         let net = browser_network(signer.network())?;
@@ -876,6 +1016,7 @@ impl Signer {
         label: &str,
         network: &str,
         roster: &[u8],
+        confirmed_code: &str,
     ) -> Result<String, String> {
         let kek = self.kek.clone().ok_or("unlock the signer first")?;
         let identity = self.identity.as_ref().ok_or("unlock the signer first")?;
@@ -887,7 +1028,7 @@ impl Signer {
         let stamped = restamp(identity, slot)?;
         let dir = vault_dir(vault_hex);
         let se = SoftwareSecureElement::from_kek(*kek);
-        let prompts = browser_prompts(&dir, &kek);
+        let prompts = browser_prompts(&dir, &kek, Some(confirmed_code.to_string()), self.approved.clone());
         let path = std::path::Path::new(&dir);
         let mut signer = if opfs_exists(&format!("{dir}/signer.meta")) {
             LocalSigner::open(path, se, label.to_string(), prompts)
@@ -997,7 +1138,7 @@ mod tests {
             assert!(parse_network(other).is_err(), "{other:?} must be refused");
         }
         // The connect prompt refuses through the same gate.
-        let mut prompts = browser_prompts("loki/vaults/x/signer", &[0u8; 32]);
+        let mut prompts = browser_prompts("loki/vaults/x/signer", &[0u8; 32], None, Arc::new(Mutex::new(None)));
         assert!((prompts.connect)("https://coordinator", Network::Testnet));
     }
 
@@ -1025,6 +1166,57 @@ mod tests {
         signer.lock();
         assert!(signer.identity.is_none() && signer.kek.is_none() && signer.vault.is_none());
         assert!(!signer.is_unlocked());
+    }
+
+    #[wasm_bindgen_test]
+    fn candidate_check_refuses_terms_it_does_not_match() {
+        let cand = hex::decode(CANDIDATE_HEX).unwrap();
+        let fvk_bytes: [u8; 96] = hex::decode(FVK_HEX).unwrap().try_into().unwrap();
+        let fvk = orchard::keys::FullViewingKey::from_bytes(&fvk_bytes).unwrap();
+        let parsed = pczt::Pczt::parse(&cand).unwrap();
+        let expiry = *parsed.global().expiry_height();
+        let terms = |tx_expiry, notes: Vec<String>| Terms {
+            recipient: "not checked first".into(), amount_zat: 1, memo: String::new(), fee_zat: 0, change_zat: 0,
+            note_selection: notes, target_height: 1, tx_expiry,
+        };
+        // A different expiry than the candidate's is refused before anything else.
+        let err = check_against_terms(&cand, &terms(expiry + 1, vec!["00".repeat(32)]), VaultNetwork::Regtest, &fvk).unwrap_err();
+        assert!(err.contains("network or expiry"), "{err}");
+        // So is a branch that is not the one for the approved anchor height.
+        let err = check_against_terms(&cand, &terms(expiry, vec!["00".repeat(32)]), VaultNetwork::Testnet, &fvk).unwrap_err();
+        assert!(err.contains("network or expiry"), "{err}");
+    }
+
+    #[wasm_bindgen_test]
+    fn prompts_answer_only_what_the_member_confirmed() {
+        let approved = Arc::new(Mutex::new(None));
+        let mut prompts = browser_prompts("d", &[0u8; 32], Some("1111 2222".into()), approved.clone());
+        assert_eq!((prompts.roster)("1111 2222"), RosterDecision::Match);
+        assert_eq!((prompts.roster)("1111 2223"), RosterDecision::NoMatch);
+        let mut none = browser_prompts("d", &[0u8; 32], None, approved.clone());
+        assert_eq!((none.roster)("1111 2222"), RosterDecision::Cancelled);
+
+        let cand = CandidateRef { vault_id: [1; 32], payment_id: [2; 32], attempt_id: [2; 32] };
+        let view = loki_signer_core::signer::wysiwys::PaymentView {
+            to: [0; 43], amount_zat: 1, fee_zat: 1, change_zat: 0, memo: vec![], network_branch_id: 0, fee_verified: true,
+        };
+        let ask = |sighash| local::ApprovalRequest { candidate: &cand, sighash, view: &view };
+        // Nothing confirmed: refuse. Confirmed: approve that sighash once, never another.
+        assert!(!(prompts.approval)(&ask([7; 32])));
+        *approved.lock().unwrap() = Some([7; 32]);
+        assert!(!(prompts.approval)(&ask([8; 32])));
+        *approved.lock().unwrap() = Some([7; 32]);
+        assert!((prompts.approval)(&ask([7; 32])));
+        assert!(!(prompts.approval)(&ask([7; 32])), "one confirmation, one signature");
+    }
+
+    #[wasm_bindgen_test]
+    fn reauth_needs_the_same_custody_secret() {
+        let mut signer = Signer::new();
+        signer.kek = Some(custody_kek("platform", None, Some(vec![3u8; 32]), false).unwrap());
+        assert!(signer.reauth_check("platform", None, Some(vec![3u8; 32])).is_ok());
+        assert!(signer.reauth_check("platform", None, Some(vec![4u8; 32])).is_err());
+        assert!(signer.reauth_check("platform", None, None).is_err());
     }
 
     #[wasm_bindgen_test]

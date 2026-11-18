@@ -274,6 +274,10 @@ function ViewRouter({
       return (
         <>
           {statusError && <div className="mb-4"><ErrMsg msg={statusError} /><Btn variant="ghost" onClick={onStatusRefresh}>Retry refresh</Btn></div>}
+          {status.persisted === false && (
+            <div className="mb-4"><ErrMsg msg="This browser did not grant persistent storage, so it may delete your signer's sealed share under storage pressure. Keep a backup of your share before you rely on it." /></div>
+          )}
+          {status.relay && <p className="mb-4 text-xs text-muted">Signer relay: <span className="font-mono">{status.relay}</span></p>}
           <Home
             profile={profile}
             vaults={status?.vaults ?? []}
@@ -492,12 +496,13 @@ function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string 
   const [mode, setMode] = useState<"passkey" | "passphrase">("passkey");
   const [platform, setPlatform] = useState(false); // biometric authenticator present?
   const [name, setName] = useState("");
-  const [passphrase, setPassphrase] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
-    hasSigner().then(setExisting).catch(() => setExisting(false));
+    // A signer error (another tab holds the signer, or the signer origin is unreachable) is
+    // shown, not mistaken for "no signer here".
+    hasSigner().then(setExisting).catch((e) => setErr((e as Error).message));
     const pk = (window as unknown as { PublicKeyCredential?: { isUserVerifyingPlatformAuthenticatorAvailable?: () => Promise<boolean> } }).PublicKeyCredential;
     pk?.isUserVerifyingPlatformAuthenticatorAvailable?.().then(setPlatform).catch(() => setPlatform(false));
   }, []);
@@ -506,10 +511,10 @@ function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string 
   const go = async (method: CustodyMethod) => {
     setBusy(true); setErr(null);
     try {
-      const opts = { method, passphrase: method === "passphrase" ? passphrase : undefined };
-      if (unlocking) await unlock(opts);
-      else await createSigner({ name: name.trim() || "You", ...opts });
-      setPassphrase("");
+      // The passkey ceremony or passphrase entry happens in the signer's own window (its
+      // origin), which opens over this page; this page never sees the secret.
+      if (unlocking) await unlock({ method });
+      else await createSigner({ name: name.trim() || "You", method });
       onLoggedIn();
     } catch (e) { setErr((e as Error).message); }
     finally { setBusy(false); }
@@ -546,15 +551,9 @@ function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string 
         </div>
       ) : (
         <div className="space-y-3">
-          <label className="block text-xs text-muted">Passphrase
-            <input type="password" value={passphrase} autoComplete={unlocking ? "current-password" : "new-password"} spellCheck={false}
-              onChange={(e) => setPassphrase(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && !busy && passphrase && go("passphrase")}
-              placeholder="Protects your share on this device" className="glass mt-2 w-full rounded-full px-5 py-3" />
-          </label>
-          {!unlocking && <p className="text-xs text-muted">Write down the recovery words after setup — they restore your share if you lose this browser.</p>}
-          <Btn disabled={busy || !passphrase} onClick={() => go("passphrase")}>
-            {busy ? "Working…" : unlocking ? "Unlock" : "Create signer"}
+          <p className="text-xs text-muted">You type the passphrase in the Loki signer window, not on this page.</p>
+          <Btn disabled={busy} onClick={() => go("passphrase")}>
+            {busy ? "Waiting for the signer…" : unlocking ? "Unlock with passphrase" : "Create with passphrase"}
           </Btn>
           <button className="min-h-11 w-full text-sm text-mint" onClick={() => { setErr(null); setMode("passkey"); }}>
             Use a passkey instead
