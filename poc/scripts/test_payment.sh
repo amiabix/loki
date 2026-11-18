@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Testnet end to end: an open payment request signed by the first approvers and broadcast,
-# then a second request that the proposer cancels.
+# with a seven-day expiry; a failed payment that another member retries on the same note,
+# which a member that approved the failed one approves without being asked; then a request
+# that the proposer cancels.
 #
 # By default this starts three members and creates a new 2-of-3 vault. With VAULT and
 # TOKEN_DIR it reuses three running members on BASE_PORT+1..3 that are already in that
@@ -163,6 +165,17 @@ wait_for() {
   fail "$what"
 }
 phases() { for i in 1 2 3; do echo "  member $i: $(phase "$i" "$1")"; done; }
+# The transaction member $1 holds for payment $2 expires about seven days (8,064 blocks) after
+# the tip it was signed at, below the approved bound; prints its expiry height.
+check_expiry() {
+  local p
+  p="$(api "$1" GET "/api/payments?vault=$vault" | jq -c --arg attempt "$2" '.payments[] | select(.attempt == $attempt)')"
+  jq -e '.tx_expiry != null and .tx_expiry == .signing_expiry and .tx_expiry < .expiry_height
+    and (.tx_expiry - .target_height - 2) >= 8064 and (.tx_expiry - .target_height - 2) < 8064 + 1152' <<<"$p" >/dev/null \
+    || fail "member $1 holds no seven-day transaction for $2: $p"
+  jq -r '"\(.tx_expiry) (signed at tip \(.target_height + 2), approved bound \(.expiry_height))"' <<<"$p"
+}
+unlock() { api "$1" POST /api/unlock "$(jq -nc --arg passphrase "$(passphrase "$1")" '{passphrase:$passphrase}')" | jq -e '.unlocked' >/dev/null || fail "unlock $1"; }
 
 echo "== open request: any member may approve; member 3 approves before member 2"
 attempt="$(draft_when_spendable "${MEMO:-testnet payment}" | jq -er '.attempt')"
@@ -188,6 +201,63 @@ verified="$(api 1 POST /api/payment-verify "$(jq -nc --arg vault "$vault" --arg 
 jq -e '.phase == "broadcast" or .phase == "confirmed"' <<<"$verified" >/dev/null || fail "verify result: $verified"
 member_sent() { api "$1" GET "/api/payments?vault=$vault" | jq -e --arg attempt "$2" --arg txid "$txid" 'any(.payments[]; .attempt == $attempt and .txid == $txid and (.phase == "broadcast" or .phase == "confirmed"))' >/dev/null; }
 for i in 2 3; do wait_for "member $i holds the sent transaction" 60 member_sent "$i" "$attempt"; done
+phases "$attempt"
+echo "transaction expires at $(check_expiry 2 "$attempt")"
+first_txid="$txid"
+
+echo "== retry: member 3 retries a failed payment; member 2 approved it and approves the retry unasked"
+attempt="$(draft_when_spendable 'retried payment' | jq -er '.attempt')"
+echo "attempt $attempt"
+publish "$attempt"
+for i in 2 3; do wait_for "member $i sees the request" 60 pending "$i" "$attempt"; done
+approve 2 "$attempt"
+wait_for 'proposer records member 2' 60 proposer_has "$attempt" '.approvals == [2]'
+# Member 2 goes away after approving, so the round the proposer starts with it fails.
+api 2 POST /api/lock '{}' | jq -e '.locked' >/dev/null || fail 'lock 2'
+approve 1 "$attempt"
+wait_for 'signing group [1,2]' 60 proposer_has "$attempt" '.signers == [1,2]'
+wait_for 'the round fails without member 2' 600 proposer_has "$attempt" '.phase == "failed"'
+unlock 2
+for i in 2 3; do wait_for "member $i hears the failure" 300 has_phase "$i" "$attempt" failed; done
+phases "$attempt"
+replaced="$(api 3 POST /api/payment-replace "$(jq -nc --arg vault "$vault" --arg attempt "$attempt" '{vault:$vault,attempt:$attempt,mode:"retry"}')")" || fail "replace: $replaced"
+retry="$(jq -er '.attempt' <<<"$replaced")"
+echo "member 3 retries it as $retry"
+api 3 POST /api/payment-publish "$(pair "$retry")" | jq -e '.phase == "signing" and (.approved | not)' >/dev/null || fail 'publish retry'
+retry_seen() { api 2 GET "/api/payments?vault=$vault" | jq -e --arg attempt "$retry" 'any(.payments[]; .attempt == $attempt)' >/dev/null; }
+wait_for 'member 2 sees the retry' 60 retry_seen
+# No approve call for member 2: its app approves the retry when it reads the request.
+! pending 2 "$retry" || fail 'member 2 was asked to approve the retry'
+api 2 GET "/api/payments?vault=$vault" | jq -e --arg attempt "$retry" 'any(.payments[]; .attempt == $attempt and .approval_requested)' >/dev/null || fail 'member 2 did not approve the retry'
+echo "member 2 approved the retry by itself"
+retry_by() { api 3 GET "/api/payments?vault=$vault" | jq -e --arg attempt "$retry" "any(.payments[]; .attempt == \$attempt and ($1))" >/dev/null; }
+approve_retry() {
+  local review token
+  review="$(api 3 POST /api/payment-review "$(pair "$retry")")" || fail "review 3: $review"
+  token="$(jq -er '.review_token' <<<"$review")"
+  api 3 POST /api/payment-approve "$(jq -nc --arg vault "$vault" --arg attempt "$retry" --arg review_token "$token" '{vault:$vault,attempt:$attempt,review_token:$review_token}')" | jq -e '.phase == "signing"' >/dev/null || fail 'approve 3'
+}
+approve_retry
+echo "member 3 approved its retry"
+wait_for 'retry signing group [3,2]' 120 retry_by '.signers == [3,2]'
+# Member 2 lists payments as its screen does, which starts its signing.
+retry_sent() { api 2 GET "/api/payments?vault=$vault" >/dev/null; retry_by '.phase == "broadcast" or .phase == "confirmed"'; }
+wait_for 'retry was not sent' 600 retry_sent
+txid="$(api 3 GET "/api/payments?vault=$vault" | jq -er --arg attempt "$retry" '.payments[] | select(.attempt == $attempt) | .txid')" || fail txid
+echo "retry broadcast txid: $txid"
+retry_txid="$txid"
+member_sent() { api "$1" GET "/api/payments?vault=$vault" | jq -e --arg attempt "$2" --arg txid "$retry_txid" 'any(.payments[]; .attempt == $attempt and .txid == $txid and (.phase == "broadcast" or .phase == "confirmed"))' >/dev/null; }
+wait_for 'member 2 holds the retry' 60 member_sent 2 "$retry"
+echo "retry expires at $(check_expiry 2 "$retry")"
+mined() {
+  local out
+  out="$(api "$1" POST /api/payment-verify "$(jq -nc --arg vault "$vault" --arg attempt "$retry" --arg txid "$retry_txid" '{vault:$vault,attempt:$attempt,txid:$txid}')")" || return 1
+  jq -e '.phase == "confirmed"' <<<"$out" >/dev/null && echo "$out"
+}
+for ((n=0; n<funding_timeout; n+=30)); do out="$(mined 3)" && break; sleep 30; done
+[[ "$(jq -r .phase <<<"$out")" == confirmed ]] || fail "retry not mined: $out"
+echo "retry confirmed at height $(jq -r '.mined_height' <<<"$out")"
+for i in 1 2 3; do wait_for "member $i settles the failed payment as replaced" 120 has_phase "$i" "$attempt" replaced; done
 phases "$attempt"
 
 echo "== cancel: member 1 cancels its request after member 2 approved"
@@ -222,4 +292,4 @@ for held_attempt in "${held[@]:1}"; do
   api 1 POST /api/payment-discard "$(pair "$held_attempt")" | jq -e '.phase == "cancelled"' >/dev/null || fail "discard draft $held_attempt"
 done
 held=()
-echo "PASS: Testnet payment $txid broadcast ($(jq -r '.phase' <<<"$verified")); cancelled request released its note"
+echo "PASS: Testnet payment $first_txid broadcast ($(jq -r '.phase' <<<"$verified")); retry $retry_txid mined in place of the failed payment; cancelled request released its note"
