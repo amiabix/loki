@@ -158,10 +158,7 @@ async function driveDkg(signer, p) {
   const roster = Uint8Array.from(rosterHex.match(/../g).map((b) => parseInt(b, 16)));
   const vref = JSON.parse(signer.vaultJoin(vaultHex, slot, label ?? "vault", network, roster));
 
-  const login = JSON.parse(signer.frostdLogin());
-  const Client = await loadFrostd(transportUrl);
-  const fc = new Client(frostdUrl, login.secret, login.pubkey);
-  await fc.login();
+  const fc = await frostdClient(signer, { frostdUrl, transportUrl });
   fc.useSession(sessionId);
 
   const pollMs = Number(p.pollMs) || 200;
@@ -188,11 +185,13 @@ async function openVault(signer, vaultHex) {
   return vault;
 }
 
+// Log in to frostd without the relay secret ever reaching JS: the transport fetches the
+// challenge, the wasm signer XEdDSA-signs it, and only the signature crosses back.
 async function frostdClient(signer, p) {
-  const login = JSON.parse(signer.frostdLogin());
   const Client = await loadFrostd(p.transportUrl);
-  const fc = new Client(p.frostdUrl, login.secret, login.pubkey);
-  await fc.login();
+  const fc = new Client(p.frostdUrl, signer.frostdPubkey());
+  const challenge = await fc.challenge();
+  await fc.loginSigned(challenge, signer.frostdSignChallenge(challenge));
   return fc;
 }
 

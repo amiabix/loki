@@ -2152,10 +2152,13 @@ dependencies = [
  "console_error_panic_hook",
  "hex",
  "loki-signer-core",
+ "rand",
  "serde_json",
  "uuid",
  "wasm-bindgen",
  "wasm-bindgen-test",
+ "x25519-dalek 2.0.1",
+ "xeddsa",
  "zakura-orchard",
  "zeroize 1.9.1",
 ]
