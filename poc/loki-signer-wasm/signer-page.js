@@ -13,7 +13,7 @@ const wallet = cfg.walletOrigin;
 const rpId = cfg.rpId || location.hostname;
 const $ = (id) => document.getElementById(id);
 $("self-origin").textContent = location.origin;
-$("relay").textContent = cfg.frostdUrl || "none configured";
+$("relay").textContent = `${cfg.frostdUrl || "none configured"} · nonce witnesses: ${cfg.nonceWitnesses?.map((w) => w.endpoint).join(", ") || "none (signing is refused)"}`;
 
 class SignerError extends Error {
   constructor(message, status = 500) { super(message); this.status = status; }
@@ -391,7 +391,7 @@ async function enrollSign({ challenge }) {
 }
 
 // ─── the wallet bridge ───────────────────────────────────────────────────────
-const relay = (p) => ({ ...p, frostdUrl: cfg.frostdUrl });
+const relay = (p) => ({ ...p, frostdUrl: cfg.frostdUrl, nonceWitnesses: cfg.nonceWitnesses });
 const ops = {
   has: () => call({ op: "has" }),
   status: () => {

@@ -46,14 +46,31 @@ const ready = init().then(() => {
 // this (the signer) origin — never from a caller-supplied URL — so lifecycle-only pages never
 // fetch it and no page can swap the code that runs beside the signer.
 const TRANSPORT_URL = new URL("./wasm-transport/pkg/loki_wasm_transport.js", import.meta.url).href;
-let FrostdClient = null;
-async function loadFrostd() {
-  if (!FrostdClient) {
+let transport = null;
+async function loadTransport() {
+  if (!transport) {
     const mod = await import(TRANSPORT_URL);
     await mod.default();
-    FrostdClient = mod.FrostdClient;
+    transport = mod;
   }
-  return FrostdClient;
+  return transport;
+}
+async function loadFrostd() {
+  return (await loadTransport()).FrostdClient;
+}
+
+// Claim this signature's nonce at BOTH external witnesses (fresh, pinned-key receipts verified
+// in wasm-transport), then tell the signer; the core's witness check in signApprove accepts
+// only that claim. A duplicate at either relay (a nonce already used) refuses the signature.
+async function claimAtWitnesses(signer, witnesses, packageHex, seedHex, sighashHex) {
+  const { cid, record } = JSON.parse(signer.nonceClaim(packageHex, seedHex, sighashHex));
+  const { claimNonce } = await loadTransport();
+  for (const w of witnesses) {
+    if (!await claimNonce(w.endpoint, w.key, w.run, w.mailbox, w.read, cid, record)) {
+      throw new Error("This nonce was already claimed at a nonce witness; start a new signing attempt");
+    }
+  }
+  signer.nonceClaimed(cid, record);
 }
 
 // Testnet NU5 (Orchard) activation height (zakura-protocol consensus.rs, TestNetwork). No
@@ -377,6 +394,12 @@ function groupFrom(notices) {
 // if the group includes it; a commitment from outside the group would fail the round.
 async function drivePayment(signer, p) {
   const { vaultHex, attemptHex } = p;
+  // Like a native member without --nonce-witnesses: no witnesses, no signing — refused before
+  // anything is approved or committed.
+  if (!Array.isArray(p.nonceWitnesses) || p.nonceWitnesses.length !== 2) {
+    throw new Error("This signer has no nonce witnesses configured, so it cannot sign");
+  }
+  signer.setNonceWitnesses(JSON.stringify(p.nonceWitnesses.map(({ key, run, mailbox }) => ({ key, run, mailbox }))));
   const vault = await openVault(signer, vaultHex);
   const control = await frostdClient(signer, p);
   const { controlSessionId, notices } = await findPayment(signer, control, vault, attemptHex, p);
@@ -458,6 +481,7 @@ async function drivePayment(signer, p) {
   const consent = await ask("payment-sign", review);
   if (!consent) throw new Error("You declined to sign this payment");
   signer.reauth(consent.method, consent.passphrase, consent.prfSecret);
+  await claimAtWitnesses(signer, p.nonceWitnesses, packageHex, seedHex, review.sighash);
   const share = signer.signApprove(attemptHex, candidateHex, packageHex, seedHex, review.sighash, JSON.stringify({ ...terms, tx_expiry: expiry }));
   await fc.sendToCoordinator(share);
   return { approved: true, signed: true, review };
