@@ -934,11 +934,20 @@ fn reconcile(data: &Path, pass: &str, vault: &str, w: &mut VaultWallet) -> Resul
     for p in &before {
         let note = hex32(p.note_selection.first().ok_or("payment has no input note")?)?;
         let mut p = p.clone();
+        let mined = w.mined_spend(&note)?.map(|txid| txid.to_string());
+        // A reorg can drop the block that settled it: it is in flight again until a block
+        // settles it anew (below) or its expiry passes.
+        let settled_by = if p.phase == "confirmed" { &p.txid } else { &p.replaced_by };
+        if matches!(p.phase.as_str(), "confirmed" | "replaced") && mined != *settled_by {
+            p.phase = if p.txid.is_some() { "broadcast" } else { "failed" }.into();
+            p.replaced_by = None;
+            save_payment(data, pass, &p)?;
+        }
         if !settled(&p) {
             let siblings = || {
                 before.iter().filter(|q| q.attempt != p.attempt && q.note_selection == p.note_selection)
             };
-            let settle = match w.mined_spend(&note)?.map(|txid| txid.to_string()) {
+            let settle = match mined {
                 Some(spend) if p.txid.as_deref() == Some(spend.as_str()) => "confirmed",
                 // The spend is another transaction: one this member knows, or any other while
                 // it knows this payment's own txid.
@@ -3042,12 +3051,12 @@ mod tests {
     }
 
     /// A vault wallet that scanned `notes` arriving in one block, then a block in which
-    /// transaction `spender` spends the first of them.
+    /// transaction `spender` spends the first of them (or, with `None`, spends nothing).
     fn wallet_with_spend(
         path: &Path,
         fvk: &FullViewingKey,
         notes: &[orchard::Note],
-        spender: zcash_primitives::transaction::TxId,
+        spender: Option<zcash_primitives::transaction::TxId>,
     ) -> VaultWallet {
         use orchard::note_encryption::{IronwoodDomain, IronwoodNoteEncryption};
         use zcash_client_backend::proto::compact_formats::{
@@ -3107,7 +3116,10 @@ mod tests {
                 &prior,
                 &[
                     block(height, received, vec![6; 32], n),
-                    block(height + 1, vec![spend], spender.as_ref().to_vec(), n + 1),
+                    match spender {
+                        Some(txid) => block(height + 1, vec![spend], txid.as_ref().to_vec(), n + 1),
+                        None => block(height + 1, vec![], vec![12; 32], n),
+                    },
                 ],
             )
             .unwrap();
@@ -3168,7 +3180,7 @@ mod tests {
                 &member_dir(&data, &vault).unwrap().path().join("wallet.sqlite"),
                 &fvk,
                 &notes,
-                mined,
+                Some(mined),
             );
             reconcile(&data, "pass", &vault, &mut w).unwrap();
             let read = |p: &Payment| read_payment(&data, "pass", &vault, &p.attempt).unwrap();
@@ -3201,6 +3213,75 @@ mod tests {
             drop(w);
             std::fs::remove_dir_all(data).unwrap();
         }
+    }
+
+    /// A reorg can drop the block that confirmed a payment. Each wallet below is the scanned
+    /// chain on one branch (the wallet's own rollback is `wallet_store`'s
+    /// `broadcast_reservation_expires_and_reorg_releases_confirmed_spend`): the payment must not
+    /// stay `confirmed` once its spend is gone, keeps its note reserved, and settles again on
+    /// whatever the next branch mines.
+    #[test]
+    fn reconcile_reopens_a_confirmed_payment_whose_spend_a_reorg_dropped() {
+        use orchard::keys::SpendingKey;
+        use zcash_primitives::transaction::TxId;
+        let fvk = FullViewingKey::from(&SpendingKey::from_bytes([3; 32]).unwrap());
+        let notes: Vec<_> = (0..2u8)
+            .map(|i| {
+                let rho = Rho::from_bytes(&[20 + i; 32]).unwrap();
+                orchard::Note::from_parts(
+                    fvk.address_at(0u64, Scope::External),
+                    NoteValue::from_raw(1_000_000),
+                    rho,
+                    RandomSeed::from_bytes([30 + i; 32], &rho).unwrap(),
+                    NoteVersion::V3,
+                )
+                .unwrap()
+            })
+            .collect();
+        let height = TESTNET_NU7_BIRTH;
+        let vault = hex::encode([2; 32]);
+        let data = std::env::temp_dir().join(format!("loki-reconcile-reorg-{}", Uuid::new_v4()));
+        let mined = TxId::from_bytes([11; 32]);
+        let p = Payment {
+            attempt: hex::encode([1; 32]),
+            vault: vault.clone(),
+            proposer: 1,
+            note_selection: vec![hex::encode(notes[0].nullifier(&fvk).to_bytes())],
+            phase: "broadcast".into(),
+            txid: Some(mined.to_string()),
+            raw_tx: Some("raw".into()),
+            expiry_height: height + 100,
+            ..Default::default()
+        };
+        save_payment(&data, "pass", &p).unwrap();
+        let branch = |name: &str, spender| {
+            let path = member_dir(&data, &vault).unwrap().path().join(format!("wallet-{name}.sqlite"));
+            wallet_with_spend(&path, &fvk, &notes, spender)
+        };
+        let read = || read_payment(&data, "pass", &vault, &p.attempt).unwrap();
+
+        reconcile(&data, "pass", &vault, &mut branch("mined", Some(mined))).unwrap();
+        assert_eq!(read().phase, "confirmed");
+
+        // The block that mined it is reorged out; the new branch has no spend of the note.
+        let mut w = branch("reorged", None);
+        reconcile(&data, "pass", &vault, &mut w).unwrap();
+        let reopened = read();
+        assert_eq!(reopened.phase, "broadcast", "a payment whose spend a reorg dropped is not confirmed");
+        assert_eq!(reopened.txid, Some(mined.to_string()));
+        let other = zcash_client_backend::wallet::LockOwner::new([99; 32]);
+        assert!(
+            w.reserve_inputs(other, &[notes[0].nullifier(&fvk).to_bytes()], height + 50).is_err(),
+            "its note stays reserved while it may still be mined"
+        );
+
+        // A branch that mines another transaction spending the note: it was replaced.
+        let rival = TxId::from_bytes([13; 32]);
+        reconcile(&data, "pass", &vault, &mut branch("rival", Some(rival))).unwrap();
+        let replaced = read();
+        assert_eq!(replaced.phase, "replaced");
+        assert_eq!(replaced.replaced_by, Some(rival.to_string()));
+        std::fs::remove_dir_all(data).unwrap();
     }
 
     #[test]
