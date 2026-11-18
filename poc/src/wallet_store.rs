@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, convert::Infallible, fs, io, path::Path, sync::Mutex};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    convert::Infallible,
+    fs, io,
+    path::Path,
+    sync::Mutex,
+};
 
 use argon2::Argon2;
 use async_trait::async_trait;
@@ -679,67 +685,76 @@ impl VaultWallet {
         Ok(())
     }
 
-    /// Atomically re-binds the reservations for `nullifiers` from `from` to `to`, extending each
-    /// lock to `expiry_height`. Used when a draft's reserved inputs move to the broadcast txid so
-    /// the reservation survives the draft→tx transition. Idempotent for inputs already held by
-    /// `to`; fails without changing anything if any input is held by a third owner.
-    pub fn transfer_inputs(
+    /// Makes this wallet's reservations match `live`, the notes that payments still in flight
+    /// spend: each is reserved for its owner until the given height unless a reservation already
+    /// holds it, and every other reservation is released.
+    pub fn set_reservations(
         &mut self,
-        from: LockOwner,
-        to: LockOwner,
-        nullifiers: &[[u8; 32]],
-        expiry_height: u32,
+        live: &BTreeMap<[u8; 32], (LockOwner, u32)>,
     ) -> Result<(), String> {
+        let mut held = BTreeSet::new();
+        let locked = self
+            .db
+            .get_locked_outputs(self.account()?)
+            .map_err(|e| format!("read reserved inputs: {e}"))?;
+        for output in locked.iter().filter(|output| output.pool() == PoolType::IRONWOOD) {
+            let (nf, owner) = self
+                .db
+                .transactionally_with_extension(|_, ext| {
+                    ext.query_row(
+                        "SELECT rn.nf, rn.lock_owner FROM ironwood_received_notes rn \
+                         JOIN transactions t ON t.id_tx = rn.transaction_id \
+                         WHERE t.txid = ?1 AND rn.action_index = ?2",
+                        rusqlite::params![output.txid().as_ref(), output.output_index()],
+                        |row| Ok((row.get::<_, Option<[u8; 32]>>(0)?, row.get::<_, Option<[u8; 32]>>(1)?)),
+                    )
+                })
+                .map_err(|e: rusqlite::Error| format!("read reservation: {e}"))?;
+            match (nf, owner) {
+                (Some(nf), Some(_)) if live.contains_key(&nf) => {
+                    held.insert(nf);
+                }
+                (_, Some(owner)) => {
+                    self.db
+                        .unlock_output(output, LockOwner::new(owner))
+                        .map_err(|e| format!("release payment inputs: {e}"))?;
+                }
+                _ => {}
+            }
+        }
+        for (nf, (owner, expiry)) in live.iter().filter(|(nf, _)| !held.contains(*nf)) {
+            // A note this wallet has not scanned yet, has seen spent, or that is past the
+            // payment's expiry is not one a new draft could select either.
+            let _ = self.reserve_inputs(*owner, &[*nf], *expiry);
+        }
+        Ok(())
+    }
+
+    /// The transaction in a scanned block that spent the vault note with this nullifier, if
+    /// any. Transactions that are only in the mempool never count.
+    pub fn mined_spend(&mut self, nullifier: &[u8; 32]) -> Result<Option<TxId>, String> {
+        self.db
+            .transactionally_with_extension(|_, ext| {
+                ext.query_row(
+                    "SELECT t.txid FROM ironwood_received_notes rn \
+                     JOIN ironwood_received_note_spends s ON s.ironwood_received_note_id = rn.id \
+                     JOIN transactions t ON t.id_tx = s.transaction_id \
+                     WHERE rn.nf = ?1 AND t.mined_height IS NOT NULL LIMIT 1",
+                    [nullifier.as_slice()],
+                    |row| row.get::<_, [u8; 32]>(0),
+                )
+                .optional()
+            })
+            .map(|txid| txid.map(TxId::from_bytes))
+            .map_err(|e: rusqlite::Error| format!("read note spend: {e}"))
+    }
+
+    /// The unspent vault note with this nullifier at the scanned height.
+    pub fn unspent_note(&self, nullifier: &[u8; 32]) -> Result<Note, String> {
         let height = self
             .scanned_height()?
             .ok_or("wallet has not scanned any blocks")?;
-        if nullifiers.is_empty() || expiry_height <= height {
-            return Err("payment has no inputs or has expired".into());
-        }
-        let outputs = self.input_refs(nullifiers)?;
-        let expiry = BlockHeight::from_u32(expiry_height);
-        let from_bytes = *from.as_bytes();
-        let to_bytes = *to.as_bytes();
-        self.db
-            .transactionally_with_extension(|db, ext| {
-                // Validate every input is held by `from` (or already by `to`) before mutating any,
-                // so a third-party lock aborts the whole transfer (the transaction rolls back).
-                let mut source_locked = Vec::new();
-                for output in &outputs {
-                    let owner: Option<[u8; 32]> = ext
-                        .query_row(
-                            "SELECT rn.lock_owner FROM ironwood_received_notes rn \
-                             JOIN transactions t ON t.id_tx = rn.transaction_id \
-                             WHERE t.txid = ?1 AND rn.action_index = ?2",
-                            rusqlite::params![output.txid().as_ref(), output.output_index()],
-                            |row| row.get::<_, Option<Vec<u8>>>(0),
-                        )
-                        .optional()?
-                        .flatten()
-                        .map(|o| {
-                            <[u8; 32]>::try_from(o)
-                                .map_err(|_| io::Error::other("invalid payment reservation owner"))
-                        })
-                        .transpose()?;
-                    match owner {
-                        Some(o) if o == to_bytes => {}
-                        Some(o) if o == from_bytes => source_locked.push(*output),
-                        _ => {
-                            return Err(Box::new(io::Error::other(
-                                "input is not reserved by the source owner",
-                            )) as Box<dyn std::error::Error>)
-                        }
-                    }
-                }
-                // Release the source locks, then (re)lock all inputs under `to` at the new expiry.
-                for output in &source_locked {
-                    db.unlock_output(output, from)?;
-                }
-                db.lock_outputs(&outputs, to, expiry)
-                    .map_err(|e| Box::new(io::Error::other(format!("lock payment inputs: {e:?}"))) as Box<dyn std::error::Error>)?;
-                Ok::<(), Box<dyn std::error::Error>>(())
-            })
-            .map_err(|e| format!("transfer payment inputs: {e}"))
+        Ok(*self.unspent_notes(BlockHeight::from_u32(height), &[*nullifier])?[0].note())
     }
 
     fn input_refs(&self, nullifiers: &[[u8; 32]]) -> Result<Vec<OutputRef>, String> {
@@ -1028,6 +1043,7 @@ mod tests {
             ..Default::default()
         };
         wallet.sync_blocks(&before_spend, &[spent]).unwrap();
+        assert_eq!(wallet.mined_spend(&nullifier).unwrap(), Some(payment_txid));
         assert_eq!(
             wallet.mined_height(payment_txid).unwrap(),
             Some(BlockHeight::from_u32(height + 2))
@@ -1058,6 +1074,7 @@ mod tests {
             .unwrap();
         assert_eq!(wallet.mined_height(payment_txid).unwrap(), None);
         assert_eq!(locked(&wallet), 0);
+        assert_eq!(wallet.mined_spend(&nullifier).unwrap(), None);
         assert_eq!(
             wallet
                 .ironwood_note_count(BlockHeight::from_u32(height + 2))
@@ -1176,17 +1193,23 @@ mod tests {
         let funding = pay(&mut wallet, 60_000).unwrap();
         assert_eq!(funding.notes.len(), 2);
         assert!(funding.notes.iter().all(|note| note.nullifier(&fvk).to_bytes() != reserved));
+        // Reservations follow the payments still in flight: a note one of them spends stays
+        // reserved by whoever holds it, and every other reservation is released.
         let second = notes[1].nullifier(&fvk).to_bytes();
         let other = LockOwner::new([2; 32]);
-        let txid = LockOwner::new([3; 32]);
-        wallet.reserve_inputs(other, &[second], height + 100).unwrap();
-        assert!(wallet.transfer_inputs(draft, txid, &[reserved, second], height + 100).is_err());
+        let live = |nfs: &[[u8; 32]]| -> BTreeMap<_, _> {
+            nfs.iter().map(|nf| (*nf, (other, height + 100))).collect()
+        };
+        wallet.set_reservations(&live(&[reserved, second])).unwrap();
+        assert_eq!(locked(&wallet), 2);
         assert!(wallet.reserve_inputs(other, &[reserved], height + 100).is_err());
-        wallet.release_inputs(other, &[second]).unwrap();
-        wallet.transfer_inputs(draft, txid, &[reserved], height + 100).unwrap();
-        wallet.transfer_inputs(draft, txid, &[reserved], height + 100).unwrap();
-        assert!(wallet.reserve_inputs(other, &[reserved], height + 100).is_err());
-        wallet.release_inputs(txid, &[reserved]).unwrap();
+        assert!(pay(&mut wallet, 60_000).is_err());
+        wallet.set_reservations(&live(&[second])).unwrap();
+        assert_eq!(locked(&wallet), 1);
+        let funding = pay(&mut wallet, 60_000).unwrap();
+        assert!(funding.notes.iter().all(|note| note.nullifier(&fvk).to_bytes() != second));
+        wallet.set_reservations(&BTreeMap::new()).unwrap();
+        assert_eq!(locked(&wallet), 0);
         assert_eq!(pay(&mut wallet, 100_000).unwrap().notes.len(), 3);
         drop(wallet);
         std::fs::remove_file(path).unwrap();

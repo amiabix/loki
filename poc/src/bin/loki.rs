@@ -5,7 +5,7 @@
 
 use std::{collections::BTreeMap, env, path::PathBuf, process};
 
-use loki_poc::{state::MemberDir, vault};
+use loki_poc::{state::MemberDir, tx_finalize::finalized_sighash, vault};
 use reddsa_frost::frost::redpallas as frost;
 
 const MEMBERS: [(&str, u16); 3] = [("alice", 1), ("bob", 2), ("carol", 3)];
@@ -1996,36 +1996,6 @@ struct AggregateInputs {
     shares: Vec<[Vec<u8>; 2]>,
     proposal_id: [u8; 32],
     want_nfs: Vec<[u8; 32]>,
-}
-
-/// Compute the v6 shielded sighash of finalized bytes for comparison with the PCZT.
-/// The transaction crate requires a transparent signing context even when the bundle is
-/// absent, so map only that empty slot to its effects-only authorization type.
-fn finalized_sighash(tx: &zcash_primitives::transaction::Transaction) -> Result<[u8; 32], String> {
-    use zcash_primitives::transaction::{Authorization, TransactionData};
-    struct ShieldedOnly;
-    impl Authorization for ShieldedOnly {
-        type TransparentAuth = zcash_transparent::bundle::EffectsOnly;
-        type SaplingAuth = sapling_crypto::bundle::Authorized;
-        type OrchardAuth = orchard::bundle::Authorized;
-    }
-    if tx.transparent_bundle().is_some()
-        || tx.sapling_bundle().is_some()
-        || tx.orchard_bundle().is_some()
-    {
-        return Err("the finalized transaction has an unexpected pool".into());
-    }
-    let data: TransactionData<ShieldedOnly> = tx.clone().into_data().try_map_bundles(
-        |_| Ok::<_, String>(None),
-        |_| Ok::<_, String>(None),
-        Ok::<_, String>,
-    )?;
-    let digest = zcash_primitives::transaction::sighash::signature_hash(
-        &data,
-        &zcash_primitives::transaction::sighash::SignableInput::Shielded,
-        &data.digest(zcash_primitives::transaction::txid::TxIdDigester),
-    );
-    Ok(*digest.as_ref())
 }
 
 /// Verify the two shares, aggregate, check the group signature under `ak + [alpha]G`, and
