@@ -1732,9 +1732,10 @@ mod tests {
 
     /// Restore-on-new-device drill through the host recovery routes: the old device exports its
     /// recovery backup, a CLEAN data dir restores it with the words over `POST
-    /// /api/recovery-restore`, and the restored member signs through the nonce store the
-    /// payment path uses (`payment::sign`). A nonce the old device committed before the restore,
-    /// and a package carrying that old commitment, are both refused afterwards.
+    /// /api/recovery-restore`, the payment path opens its signer (`custody::open_signer`), and it
+    /// signs through the store's nonce dir at the restored epoch. A nonce the old device
+    /// committed before the restore, and a package carrying that old commitment, are both
+    /// refused afterwards.
     #[tokio::test(flavor = "multi_thread")]
     async fn restore_on_new_device_over_routes_signs_and_refuses_pre_restore_nonce() {
         use crate::signer::nonce::NonceStore;
@@ -1759,14 +1760,14 @@ mod tests {
         let backup = call(&old_base, &old_token, reqwest::Method::GET, &format!("/api/recovery-backup?vault={vault_hex}"), json!({}))
             .await.unwrap().json::<Value>().await.unwrap()["backup"].as_str().unwrap().to_owned();
 
-        // Before the restore the old device commits a nonce for an attempt, as `payment::sign`
-        // does (ephemeral element, `signer-nonces`, id = payment || attempt).
+        // Before the restore the old device commits a nonce for an attempt (epoch 0, its own
+        // element, id = payment || attempt).
         let id1 = frost::Identifier::try_from(1u16).unwrap();
         let id2 = frost::Identifier::try_from(2u16).unwrap();
         let old_key = frost::keys::KeyPackage::try_from(shares[&id1].clone()).unwrap();
         let peer = frost::keys::KeyPackage::try_from(shares[&id2].clone()).unwrap();
         let stale_id = hex::encode([[3u8; 32], [3u8; 32]].concat());
-        let old_nonces = dir(&old, &vault_hex).unwrap().path().join("signer-nonces");
+        let old_nonces = signer_dir(&old, &vault_hex).unwrap().join("nonces");
         let old_commitment = NonceStore::open(&old_nonces).unwrap()
             .commit(&stale_id, &SoftwareSecureElement::generate(), old_key.signing_share()).unwrap();
 
@@ -1782,17 +1783,26 @@ mod tests {
             .await.unwrap().json::<Value>().await.unwrap();
         assert_eq!(status, json!({"recovery_identity": true, "recovery_backup": true}));
 
-        // The restored member signs: the payment path opens it, its nonce store emits a share,
-        // and the share aggregates with member 2's into a signature under the group key.
-        crate::host::payment::load_vault(&new, pass, &vault_hex, "regtest").expect("the restored member opens for signing");
-        let sealed: Value = serde_json::from_slice(&dir(&new, &vault_hex).unwrap().read_sealed("vault.sealed", pass).unwrap()).unwrap();
-        let key = frost::keys::KeyPackage::deserialize(&hex::decode(sealed["key_package"].as_str().unwrap()).unwrap()).unwrap();
-        let group = frost::keys::PublicKeyPackage::deserialize(&hex::decode(sealed["public_package"].as_str().unwrap()).unwrap()).unwrap();
-        assert_eq!(group.verifying_key(), public.verifying_key());
-        let new_nonces = dir(&new, &vault_hex).unwrap().path().join("signer-nonces");
+        // The restored member signs: the payment path opens its signer from the store (a
+        // restored store opens through `LocalSigner::from_restored`), the store's nonce dir at
+        // the restored share epoch emits a share, and the share aggregates with member 2's into
+        // a signature under the group key.
+        let sdir = signer_dir(&new, &vault_hex).unwrap();
+        let new_nonces = sdir.join("nonces");
         assert!(!new_nonces.exists(), "a clean device starts with no nonces");
-        let store = NonceStore::open(&new_nonces).unwrap();
-        let se = SoftwareSecureElement::generate();
+        let st = AppState::new(crate::host::config_from_args(&[
+            "--data".into(), new.to_str().unwrap().into(), "--port".into(), "3601".into(),
+        ]).unwrap());
+        let signer = crate::host::custody::open_signer(&st, &new, pass, &vault_hex, 1, Box::new(|_| false))
+            .expect("the restored member opens for signing");
+        let (group, _) = signer.hosted_metadata().unwrap();
+        assert_eq!(group.verifying_key(), public.verifying_key());
+        let se = st.config.open_secure_element(&sdir, pass).unwrap();
+        let (epoch, raw) = crate::signer::store::SignerStore::open(&sdir).unwrap()
+            .read(&se, crate::signer::store::FileKind::Share).unwrap().expect("the restored store holds the share");
+        assert!(epoch > 0, "a restore bumps the share epoch");
+        let key = frost::keys::KeyPackage::deserialize(&crate::signer::local::decode_share(&raw).unwrap().0).unwrap();
+        let store = NonceStore::open_at_epoch(&new_nonces, epoch).unwrap();
         let fresh_id = hex::encode([[4u8; 32], [4u8; 32]].concat());
         let c1 = store.commit(&fresh_id, &se, key.signing_share()).unwrap();
         let (n2, c2) = frost::round1::commit(peer.signing_share(), &mut OsRng);
