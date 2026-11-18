@@ -208,7 +208,18 @@ What a deploy must provide on the signer server (`serve.mjs` env):
 | `LOKI_WALLET_ORIGIN` | the one wallet origin allowed to frame and message the signer (`frame-ancestors`, postMessage check) |
 | `LOKI_FROSTD_URL` | the frostd relay the signer logs in to. It is shown to the member and not settable from the wallet page. One relay only. |
 | `LOKI_RP_ID` | WebAuthn rpId. It **must stay the same across deploys** or passkeys stop unlocking. |
+| `LOKI_NONCE_WITNESSES` | the two nonce-witness relays every signature is claimed at (the native `--nonce-witnesses` file). Each mailbox `read` capability is served publicly in `config.json`. |
+| `LOKI_NETWORK` | `testnet` (default) or `regtest`; mainnet is refused at startup. A regtest stack **must** set `regtest`, or LokiSigner is told testnet. |
+| `LOKI_LIGHTWALLETD_URL` | the lightwalletd native members sync from |
 | `LOKI_SIGNER_PORT` | listen port (default 3002) |
+
+The coordinator (this app) serves the same values to the native signer at
+`GET /api/signer-config`: network, frostd, lightwalletd and the witnesses, read from
+`${NEXT_PUBLIC_SIGNER_ORIGIN}/config.json` on each request (the origin is inlined at build time,
+as for the browser signer). Nothing is copied into the wallet's own configuration. The route answers 502 with an error when the signer origin is unset,
+unreachable, redirects, or serves a configuration it cannot validate, and it never serves
+mainnet. LokiSigner shows these values when it pairs and saves them (see
+`poc/signer-app/README.md`).
 
 The signer origin itself must be **stable**. The share (OPFS), the device-login key (IndexedDB)
 and the passkey (rpId) are all bound to it. A new hostname per run (for example a fresh

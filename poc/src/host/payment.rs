@@ -1399,11 +1399,7 @@ fn sign(
 ) -> Result<(), String> {
     // Both external nonce witnesses must be configured; without them this member refuses to
     // sign, before it joins the session or unwraps the share.
-    let witness = super::nonce_witness::RelayWitness::open(
-        st.config.nonce_witnesses.as_deref(),
-        st.config.development_http,
-        &p.attempt,
-    )?;
+    let witness = super::nonce_witness::RelayWitness::for_member(st, &p.attempt)?;
     let mut tx = relay(&v.identity, &st.config.frostd_url)?;
     let ch = tx
         .join(p.session_id.ok_or("missing signing session")?)

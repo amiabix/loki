@@ -5,6 +5,36 @@ func loki_member_app_pair(_ launch: UnsafePointer<CChar>, _ pass: UnsafeMutableP
     _ notify: @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Void,
     _ approve: @convention(c) (UnsafePointer<CChar>?) -> Int32) -> Int32
 
+@_silgen_name("loki_member_app_pairing_target")
+func loki_member_app_pairing_target(_ launch: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
+
+@_silgen_name("loki_member_app_configuration")
+func loki_member_app_configuration(_ launch: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
+
+@_silgen_name("loki_member_app_free")
+func loki_member_app_free(_ value: UnsafeMutablePointer<CChar>?)
+
+/// One Rust query on this launch: `{"<answer>": ...}` or `{"error": ...}`. Every value shown
+/// to the member comes from Rust, which checked it; nothing is parsed from the link here.
+private func nativeQuery(_ query: (UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?, _ launch: [String: Any]) -> [String: Any] {
+    guard let json = try? JSONSerialization.data(withJSONObject: launch), let request = String(data: json, encoding: .utf8) else {
+        return ["error": "invalid launch"]
+    }
+    let reply = request.withCString { query($0) }
+    defer { loki_member_app_free(reply) }
+    guard let reply = reply,
+          let parsed = try? JSONSerialization.jsonObject(with: Data(String(cString: reply).utf8)) as? [String: Any]
+    else { return ["error": "invalid reply"] }
+    return parsed
+}
+
+private func showStartError(_ reply: [String: Any]) {
+    let alert = NSAlert()
+    alert.messageText = "Signer could not start"
+    alert.informativeText = reply["error"] as? String ?? "unknown error"
+    alert.runModal()
+}
+
 @_silgen_name("loki_signer_approval_selftest")
 func loki_signer_approval_selftest(_ approve: @convention(c) (UnsafePointer<CChar>?) -> Int32) -> Int32
 
@@ -113,27 +143,67 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
     }
 
     func start(_ link: String?) {
-        let alert = NSAlert()
         if running || prompting {
+            let alert = NSAlert()
             alert.messageText = "This signer is already running"
             alert.informativeText = "Quit to lock it before opening another pairing link."
             alert.runModal()
             return
         }
         prompting = true
-        defer { prompting = false }
-        // Rust validates the complete URL again before touching the coordinator.
+        var launch: [String: Any] = ["args": args]
         if let link = link {
-            guard let parts = URLComponents(string: link), parts.scheme == "loki", parts.host == "pair",
-                let origin = parts.queryItems?.first(where: { $0.name == "origin" })?.value,
-                let slot = parts.queryItems?.first(where: { $0.name == "slot" })?.value else {
-                alert.messageText = "Invalid pairing link"; alert.runModal(); return
+            launch["pairing_url"] = link
+            // First confirm the coordinator. Rust checks the whole link without any network
+            // request and returns its canonical origin and slot; LokiSigner contacts that
+            // coordinator only after the member continues.
+            let reply = nativeQuery(loki_member_app_pairing_target, launch)
+            guard let target = reply["target"] as? [String: Any], let origin = target["coordinator"] as? String,
+                  let slot = (target["slot"] as? NSNumber)?.stringValue else {
+                prompting = false
+                showStartError(reply)
+                return
             }
+            let alert = NSAlert()
             alert.messageText = "Pair this device with slot \(slot)?"
-            alert.informativeText = "Coordinator: \(origin)\nOnly continue if this is the coordinator you intended. Create or unlock your local profile below."
+            alert.informativeText = "Coordinator: \(origin)\n\nOnly continue if this is the coordinator you intended. LokiSigner then asks it for the signer configuration and shows it to you before anything is saved."
+            alert.addButton(withTitle: "Continue")
+            alert.addButton(withTitle: "Cancel")
+            NSApp.activate(ignoringOtherApps: true)
+            guard alert.runModal() == .alertFirstButtonReturn else { prompting = false; return }
+        }
+        // A pairing link, or an unlock with nothing saved, asks the coordinator; keep the UI live.
+        DispatchQueue.global(qos: .userInitiated).async {
+            let reply = nativeQuery(loki_member_app_configuration, launch)
+            DispatchQueue.main.async { self.confirm(link: link, launch: launch, reply: reply) }
+        }
+    }
+
+    /// Shows the configuration before anything is saved; the member continues with exactly it.
+    private func confirm(link: String?, launch: [String: Any], reply: [String: Any]) {
+        defer { prompting = false }
+        guard let config = reply["config"] as? [String: Any] else { showStartError(reply); return }
+        let alert = NSAlert()
+        let slot = (config["slot"] as? NSNumber)?.stringValue ?? "?"
+        let text = { (key: String) in config[key] as? String ?? "none" }
+        let witnesses = (config["nonce_witnesses"] as? [String])?.joined(separator: "\n  ") ?? "none"
+        let endpoints = """
+            Coordinator: \(text("coordinator"))
+            Network: \(text("network"))
+            frostd: \(text("frostd_url"))
+            lightwalletd: \(text("lightwalletd_url"))
+            Nonce witnesses:
+              \(witnesses)
+
+            The coordinator above chose these endpoints, except any you set with launch flags \
+            (those apply to this launch only, and then nothing is saved).
+            """
+        if link != nil {
+            alert.messageText = "Pair this device with slot \(slot)?"
+            alert.informativeText = "\(endpoints)\nCreate or unlock your local profile below. These values are saved once it unlocks."
         } else {
             alert.messageText = "Unlock your paired signer"
-            alert.informativeText = "For a new device, cancel and open a pairing link from the wallet. Your passphrase stays in this app."
+            alert.informativeText = "\(endpoints)\nFor a new device, cancel and open a pairing link from the wallet. Your passphrase stays in this app."
         }
         let password = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 420, height: 26))
         password.placeholderString = "Local profile passphrase"
@@ -141,10 +211,11 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         alert.addButton(withTitle: link == nil ? "Unlock" : "Pair")
         alert.addButton(withTitle: "Cancel")
         alert.window.initialFirstResponder = password
+        NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn, !password.stringValue.isEmpty else { return }
-        var launch: [String: Any] = ["args": args]
-        if let link = link { launch["pairing_url"] = link }
-        guard let json = try? JSONSerialization.data(withJSONObject: launch), let request = String(data: json, encoding: .utf8) else { return }
+        var confirmed = launch
+        confirmed["config"] = config
+        guard let json = try? JSONSerialization.data(withJSONObject: confirmed), let request = String(data: json, encoding: .utf8) else { return }
         var secret = Array(password.stringValue.utf8CString)
         password.stringValue = ""
         running = true

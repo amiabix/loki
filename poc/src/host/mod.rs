@@ -7,6 +7,7 @@ mod ceremony;
 mod custody;
 mod device;
 mod payment;
+mod native_config;
 mod nonce_witness;
 mod recovery;
 mod registration;
@@ -17,6 +18,7 @@ mod state;
 
 pub use state::Config;
 pub use registration::RegistrationConfig;
+pub use native_config::{Deployment, FetchedConfig, NativeConfig};
 #[cfg(feature = "relay-communication")]
 pub use nonce_witness::WitnessConfig;
 
@@ -156,14 +158,17 @@ pub fn config_from_args(args: &[String]) -> Result<Config, String> {
 
 /// Build the axum app and serve on the configured bind IP and port. Blocks.
 pub fn run(config: Config) -> Result<(), String> {
-    run_local(config, None, None, None)
+    run_local(config, None, None, None, None)
 }
 
+/// `fetched`: the configuration the native app fetched and the member confirmed; it is saved
+/// only once the profile unlocks.
 pub fn run_local(
     mut config: Config,
     pass: Option<zeroize::Zeroizing<String>>,
     notice: Option<LocalNotice>,
     approval: Option<LocalApproval>,
+    fetched: Option<FetchedConfig>,
 ) -> Result<(), String> {
     // rustls has no default provider; install one before any relay/lightwalletd TLS.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -184,7 +189,7 @@ pub fn run_local(
             .map_err(|e| format!("bind {addr}: {e}"))?;
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
         config.port = addr.port();
-        let state: state::Shared = std::sync::Arc::new(state::AppState { approval, ..state::AppState::new(config) });
+        let state: state::Shared = std::sync::Arc::new(state::AppState { approval, fetched_config: fetched, ..state::AppState::new(config) });
         registration::start(&state, pass, notice.as_ref()).await?;
         // Member-local output only. Paste into a local browser tab; never send to the coordinator.
         if let Some(notice) = notice {

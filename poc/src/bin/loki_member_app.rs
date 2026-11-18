@@ -31,7 +31,7 @@ fn main() {
         .position(|a| a == "--approve-from")
         .and_then(|i| args.get(i + 1))
         .map(|file| host::file_approval(file.into(), std::time::Duration::from_secs(120)));
-    if let Err(error) = config.validate_secure_element().and_then(|_| host::run_local(config, None, None, approval)) {
+    if let Err(error) = config.validate_secure_element().and_then(|_| host::run_local(config, None, None, approval, None)) {
         eprintln!("error: {error}");
         std::process::exit(1);
     }

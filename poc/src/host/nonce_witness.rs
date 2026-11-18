@@ -7,7 +7,7 @@ use loki_relay_protocol::types::{RelayPin, RelayRoute};
 use crate::signing_session::{NonceWitness, WitnessPins};
 use zeroize::{Zeroize, Zeroizing};
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WitnessConfig {
     pub endpoint: String,
@@ -28,34 +28,57 @@ pub(super) struct RelayWitness {
     runtime: tokio::runtime::Runtime,
 }
 
+/// Read a `--nonce-witnesses` file: two [`WitnessConfig`] entries.
+pub(super) fn read(path: &Path) -> Result<[WitnessConfig; 2], String> {
+    let mut raw = Zeroizing::new(Vec::new());
+    std::fs::File::open(path).map_err(|e| format!("nonce witnesses: {e}"))?
+        .take(16_385).read_to_end(&mut raw).map_err(|e| format!("nonce witnesses: {e}"))?;
+    if raw.len() > 16_384 { return Err("nonce witness configuration too large".into()); }
+    serde_json::from_slice(&raw).map_err(|_| "invalid nonce witness configuration".into())
+}
+
+/// What every witness configuration passes before hosted signing uses it: two distinct,
+/// nonzero witness identities at valid relay endpoints (HTTPS, or loopback HTTP in development).
+pub(super) fn check(config: &[WitnessConfig; 2], development: bool) -> Result<(), String> {
+    if !crate::signing_session::valid_witness_pins(std::array::from_fn(|i| (config[i].key, config[i].run, config[i].mailbox))) {
+        return Err("two distinct nonzero nonce witnesses required".into());
+    }
+    for witness in config {
+        loki_relay_client::validate_endpoint(&witness.endpoint, development)
+            .map_err(|_| "a nonce witness endpoint is not a plain HTTPS origin; loopback HTTP requires --development-http")?;
+    }
+    Ok(())
+}
+
 impl RelayWitness {
+    /// This member's witnesses: the `--nonce-witnesses` file (named by a flag or saved), or the
+    /// ones LokiSigner fetched from its coordinator for this launch.
+    pub(super) fn for_member(st: &super::state::AppState, attempt: &str) -> Result<Self, String> {
+        let development = st.config.development_http;
+        match (&st.config.nonce_witnesses, &st.fetched_config) {
+            (None, Some(fetched)) => Self::from_config(fetched.witnesses(), development, attempt),
+            (path, _) => Self::open(path.as_deref(), development, attempt),
+        }
+    }
+
     pub(super) fn open(path: Option<&Path>, development: bool, attempt: &str) -> Result<Self, String> {
-        let path = path.ok_or("hosted signing requires --nonce-witnesses <file>")?;
-        let mut raw = Zeroizing::new(Vec::new());
-        std::fs::File::open(path).map_err(|e| format!("nonce witnesses: {e}"))?
-            .take(16_385).read_to_end(&mut raw).map_err(|e| format!("nonce witnesses: {e}"))?;
-        if raw.len() > 16_384 { return Err("nonce witness configuration too large".into()); }
-        let config: [WitnessConfig; 2] = serde_json::from_slice(&raw)
-            .map_err(|_| "invalid nonce witness configuration")?;
+        Self::from_config(read(path.ok_or("hosted signing requires --nonce-witnesses <file>")?)?, development, attempt)
+    }
+
+    fn from_config(config: [WitnessConfig; 2], development: bool, attempt: &str) -> Result<Self, String> {
+        check(&config, development)?;
         let routes = config.map(|c| (RelayRoute {
             pin: RelayPin { key: c.key, run: c.run }, endpoint: c.endpoint.clone(),
             mailbox: c.mailbox, append_revision: 1,
         }, Secret32::from_bytes(c.read)));
-        let witness = Self {
+        Ok(Self {
             attempt: attempt.to_owned(),
             routes,
             http: if development { RelayHttp::new() } else { RelayHttp::hosted() }
                 .map_err(|e| e.to_string())?,
             runtime: tokio::runtime::Builder::new_current_thread().enable_all().build()
                 .map_err(|e| e.to_string())?,
-        };
-        if !crate::signing_session::valid_witness_pins(witness.pins()) {
-            return Err("two distinct nonzero nonce witnesses required".into());
-        }
-        for (route, _) in &witness.routes {
-            loki_relay_client::validate_endpoint(&route.endpoint, development).map_err(|e| e.to_string())?;
-        }
-        Ok(witness)
+        })
     }
 }
 
