@@ -34,8 +34,8 @@ pub mod payment_transport;
 pub mod profile;
 pub mod refresh;
 // The per-member HTTP coordinator (axum) that fronts the account + hosted-vault ceremony
-// for the web UI, driving the library in-process. Gated with the hosted relay stack.
-#[cfg(feature = "relay-communication")]
+// for the web UI, driving the library in-process. Not feature-gated: it speaks frostd, not
+// the retiring relay stack; only its relay nonce-witness adapter needs `relay-communication`.
 pub mod host;
 // RETIRING (WS3/WS4): Loki's bespoke relay stack — `relay_member`, `setup_relay`,
 // `member_service`, and their `setup_backup`/`setup_retry` helpers — is being replaced
