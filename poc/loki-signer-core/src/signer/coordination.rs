@@ -119,7 +119,7 @@ where
     for m in quorum.iter_mut() {
         let share = m
             .signer
-            .sign_approve(&m.session, cand, &pczt_bytes, &package, &seed_bytes)
+            .sign_approve(&m.session, cand, intent, &pczt_bytes, &package, &seed_bytes)
             .map_err(|e| format!("member {:?} sign_approve: {e}", m.id))?;
         shares.insert(m.id, share);
     }

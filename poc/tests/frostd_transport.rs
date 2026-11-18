@@ -436,7 +436,7 @@ where
         let m = &mut members[i];
         let share = m
             .signer
-            .sign_approve(&m.session, &cand, &candidate_bytes, &package, &seed)
+            .sign_approve(&m.session, &cand, &intent, &candidate_bytes, &package, &seed)
             .unwrap();
         t.send(ch, &[], &Outbound::Share(share)).unwrap();
     }

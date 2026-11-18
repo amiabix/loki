@@ -81,7 +81,8 @@ pub fn signer_loop<T: Transport, S: Signer>(
     candidate_ref: &CandidateRef,
     group_vk: &frost::keys::PublicKeyPackage,
     own_id: frost::Identifier,
-    proposer_inputs: Option<&PublicPaymentParams>,
+    params: &PublicPaymentParams,
+    is_proposer: bool,
     own: &Identity,
     context: &SessionContext,
     proposer: &PublicIdentity,
@@ -99,14 +100,14 @@ where
     send(transport, channel, &attempt, "commitment", &[], Outbound::Commitments(commitment))?;
 
     let mut coordinator = None;
-    let local_candidate = if let Some(inputs) = proposer_inputs {
+    let local_candidate = if is_proposer {
         let alpha_message = recv_until(transport, channel, false, 1, &attempt, |_| "alpha", check_running)?.remove(0);
         let alpha_bytes: [u8; 32] = alpha_message
             .message
             .try_into()
             .map_err(|_| "alpha must be 32 bytes")?;
         coordinator = Some(alpha_message.from);
-        let candidate = signer.build_candidate(session, candidate_ref, inputs, &alpha_bytes)
+        let candidate = signer.build_candidate(session, candidate_ref, params, &alpha_bytes)
             .map_err(|e| format!("build_candidate: {e}"))?;
         accept_candidate(candidate.as_bytes())?;
         for peer in other_signers {
@@ -157,17 +158,17 @@ where
     {
         return Err("signing package differs from candidate or own commitment".into());
     }
-    let params = frost_rerandomized::RandomizedParams::regenerate_from_seed_and_commitments(
+    let randomized = frost_rerandomized::RandomizedParams::regenerate_from_seed_and_commitments(
         group_vk.verifying_key(), &seed, package.signing_commitments(),
     ).map_err(|e| format!("regenerate randomizer: {e}"))?;
-    let rk: [u8; 32] = params.randomized_verifying_key().serialize()
+    let rk: [u8; 32] = randomized.randomized_verifying_key().serialize()
         .map_err(|e| e.to_string())?.try_into()
         .map_err(|_| "randomized key is not 32 bytes")?;
     if !candidate.ironwood().actions().iter().any(|action| action.spend().rk() == &rk) {
         return Err("candidate has no spend under the randomized group key".into());
     }
     check_running()?;
-    let share = signer.sign_approve(session, candidate_ref, candidate_bytes, &package, &seed)
+    let share = signer.sign_approve(session, candidate_ref, params, candidate_bytes, &package, &seed)
         .map_err(|e| format!("sign_approve: {e}"))?;
     check_running()?;
     send(transport, channel, &attempt, "share", &[], Outbound::Share(share))
