@@ -320,23 +320,31 @@ const ops = {
   "enroll-begin": enrollBegin,
   "enroll-sign": enrollSign,
   join: (p) => call({ op: "join", join: relay(p) }),
-  "payment-review": (p) => call({ op: "payment-review", payment: p }),
+  "payment-review": (p) => call({ op: "payment-review", payment: relay(p) }),
   "payment-approve": (p) => call({ op: "payment-approve", payment: relay(p) }),
+  pending: (p) => call({ op: "pending", payment: relay(p) }),
+  vaults: () => call({ op: "vaults" }),
+  address: (p) => call({ op: "address", payment: p }),
 };
-const UNLOCKED = new Set(["join", "payment-review", "payment-approve"]);
+const UNLOCKED = new Set(["join", "payment-review", "payment-approve", "pending", "vaults", "address"]);
+// Ops that may show a prompt run one at a time; the read-only ones answer alongside them
+// (the Worker refuses them with "busy" while a join or payment holds the vault).
+const PROMPTING = new Set(["create", "unlock", "join", "payment-approve"]);
 
 let queue = Promise.resolve(); // one op (and so one prompt) at a time
 addEventListener("message", (e) => {
   if (e.origin !== wallet || e.source !== parent || parent === window) return;
   const { id, op, params } = e.data ?? {};
   if (typeof id !== "number" || !Object.hasOwn(ops, op)) return;
-  queue = queue.then(async () => {
+  const run = async () => {
     try {
       if (UNLOCKED.has(op) && !current) throw new SignerError("Unlock your signer", 401);
       parent.postMessage({ id, ok: true, result: await ops[op](params ?? {}) }, wallet);
     } catch (err) {
       parent.postMessage({ id, ok: false, error: err.message || String(err), status: err.status ?? 500 }, wallet);
     }
-  });
+  };
+  if (PROMPTING.has(op)) queue = queue.then(run);
+  else run();
 });
 if (parent !== window) parent.postMessage({ cmd: "ready" }, wallet);

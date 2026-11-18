@@ -31,11 +31,9 @@ export interface SignerSession { slot?: number; profile: { id: string; name: str
 /** A public-roster member, as the coordinator's `/api/members` returns it. */
 export interface EnrolledMember { slot: number; signing_pubkey: string; relay_pubkey: string; advertise_url: string }
 
-/** Discover + sign a payment the proposer published (this signer is a NON-proposer approver). */
-export interface ApprovePaymentOpts { vault: string; attempt: string }
 /**
  * The signer contract. `request` is the in-process equivalent of the old member HTTP API,
- * dispatched to the signer origin for the paths it serves (status, lock, join,
+ * dispatched to the signer origin for the paths it serves (status, lock, join, pending, address,
  * payment-review, payment-approve); other paths throw `SignerPending`.
  */
 export interface SignerModule {
@@ -52,9 +50,6 @@ export interface SignerModule {
   enroll(coordinatorOrigin?: string): Promise<EnrolledMember>;
   /** In-process member call — the old per-member HTTP, now dispatched to the signer. */
   request<T = unknown>(path: string, body?: unknown): Promise<T>;
-  /** Approve a published payment, found on frostd. `signed` is true when this member was among
-   *  the first approvers and released its share; otherwise others signed it. */
-  approvePayment(opts: ApprovePaymentOpts): Promise<{ approved: boolean; signed: boolean; review?: unknown }>;
 }
 
 // ─── the signer origin (iframe + postMessage) ────────────────────────────────
@@ -135,19 +130,29 @@ function browserSigner(origin: string): SignerModule {
       const { member } = await postJson<{ member: EnrolledMember }>(`${origin}/api/members`, { ...enrollment, challenge, signature });
       return member;
     },
-    async request<T>(path: string, body?: unknown): Promise<T> {
+    async request<T>(pathAndQuery: string, body?: unknown): Promise<T> {
+      const [path, query] = pathAndQuery.split("?");
+      const args = { ...Object.fromEntries(new URLSearchParams(query ?? "")), ...(body as object) } as { vault?: string; attempt?: string };
       if (path === "status") {
         const s = await call<{ profile: { id: string; name: string }; se: string; persisted: boolean | null; relay: string }>("status");
-        return { phase: "home", network: "testnet", secure_element: s.se, profile: s.profile, persisted: s.persisted, relay: s.relay, vaults: [] } as T;
+        // The signer's own vaults (OPFS). Refused while a join/payment holds the signer; the
+        // next status poll fills them in.
+        const vaults = await call<unknown[]>("vaults").catch(() => undefined);
+        return { phase: "home", network: "testnet", secure_element: s.se, profile: s.profile, persisted: s.persisted, relay: s.relay, vaults } as T;
       }
       if (path === "lock") { await this.lock(); return {} as T; }
       // Join a vault (enroll → roster → agree → session → DKG). The member confirms every member
       // and the roster code on the signer page; the relay is the signer origin's own config.
       if (path === "join") return call<T>("join", body);
-      if (path === "payment-review" || path === "payment-approve") return call<T>(path, body);
+      // Payments other members proposed: list them, read one's announced terms, and approve it.
+      // Approving opens the signer page, which checks the transaction against those terms and
+      // asks the member to confirm with a fresh passkey assertion (or the passphrase).
+      const payment = { vaultHex: args.vault, attemptHex: args.attempt };
+      if (path === "pending") return { pending: await call("pending", payment) } as T;
+      if (path === "payment-review" || path === "payment-approve") return call<T>(path, payment);
+      if (path === "address") return { address: await call<string>("address", payment) } as T;
       throw new SignerPending(path);
     },
-    approvePayment: ({ vault, attempt }) => call("payment-approve", { vaultHex: vault, attemptHex: attempt }),
   };
 }
 
@@ -188,7 +193,6 @@ const mockSigner: SignerModule = {
     try { sessionStorage.removeItem(SESSION); } catch {}
   },
   async enroll(): Promise<EnrolledMember> { throw new SignerPending("enroll"); },
-  async approvePayment(): Promise<{ approved: boolean; signed: boolean; review?: unknown }> { throw new SignerPending("payment-approve"); },
   async request<T>(path: string): Promise<T> {
     const s = session();
     // Status is the only member call the onboarding lifecycle needs; serve it so a
@@ -221,10 +225,5 @@ export const signer: SignerModule = {
   lock: async () => (await impl()).lock(),
   enroll: async (coordinatorOrigin) => (await impl()).enroll(coordinatorOrigin),
   async request<T = unknown>(path: string, body?: unknown): Promise<T> { return (await impl()).request<T>(path, body); },
-  approvePayment: async (opts) => (await impl()).approvePayment(opts),
 };
 
-// Callable without the (unwired) vault UI: `await window.lokiApprovePayment({ vault, attempt })`.
-if (typeof window !== "undefined") {
-  (window as unknown as { lokiApprovePayment?: typeof signer.approvePayment }).lokiApprovePayment = signer.approvePayment;
-}
