@@ -843,6 +843,7 @@ fn sync_control_inner(url: &str, data: &Path, pass: &str, vault: &str, v: &Vault
                     // A retry of a payment this member already approved needs no new approval;
                     // the next `restore_workers` starts its signing.
                     if approved_before(data, pass, v, &incoming) {
+                        record_consent(data, pass, &incoming)?;
                         incoming.approval_requested = true;
                         record_approval(&mut incoming, v.slot);
                     }
@@ -1066,6 +1067,7 @@ pub(super) async fn publish(State(st): State<Shared>, Json(body): Json<Value>) -
         p.control_session_id = Some(control_ch.session_id());
         let approved = approved_before(&data, &pass, &v, &p);
         if approved {
+            record_consent(&data, &pass, &p)?;
             p.approval_requested = true;
             record_approval(&mut p, v.slot);
         }
@@ -1100,7 +1102,7 @@ pub(super) async fn review(State(st): State<Shared>, Json(body): Json<Value>) ->
             let old = read_payment(&data, &pass, &vault, &r.attempt).ok();
             json!({"attempt":r.attempt,"cancel":r.cancel,"phase":old.as_ref().map(|o| o.phase.clone()),"recipient":old.as_ref().map(|o| o.recipient.clone()),"amount_zat":old.as_ref().map(|o| o.amount_zat.to_string())})
         });
-        Ok(json!({"review_token":p.review_token,"recipient":p.recipient,"amount_zat":p.amount_zat.to_string(),"fee_zat":p.fee_zat.to_string(),"change_zat":p.change_zat.to_string(),"memo":p.memo,"replaces":replaces}))
+        Ok(json!({"review_token":p.review_token,"intent_hash":intent_hash(&p),"recipient":p.recipient,"amount_zat":p.amount_zat.to_string(),"fee_zat":p.fee_zat.to_string(),"change_zat":p.change_zat.to_string(),"memo":p.memo,"replaces":replaces}))
     }).await
 }
 
@@ -1119,6 +1121,7 @@ pub(super) async fn approve(State(st): State<Shared>, Json(body): Json<Value>) -
             || p.approval_requested
             || p.review_token.is_none()
             || p.review_token.as_deref() != body["review_token"].as_str()
+            || body["intent_hash"].as_str() != Some(intent_hash(&p).as_str())
         {
             return Err(
                 "invalid or repeated payment approval; replace a failed attempt instead".into(),
@@ -1129,6 +1132,7 @@ pub(super) async fn approve(State(st): State<Shared>, Json(body): Json<Value>) -
         if !p.signers.is_empty() && !p.signers.contains(&v.slot) {
             return Err(ENOUGH_APPROVED.into());
         }
+        record_consent(&data, &pass, &p)?;
         p.approval_requested = true;
         record_approval(&mut p, v.slot);
         p.review_token = None;
@@ -1408,12 +1412,13 @@ fn sign(
         VaultNetwork::Regtest => Network::Regtest,
         VaultNetwork::Testnet => Network::Testnet,
     };
-    // The share stays in the device-bound store under the configured element; only the
-    // member's own native decision approves, and headless members refuse.
+    // The share stays in the device-bound store under the configured element. The member's
+    // own native decision approves, and only for the reviewed intent and pinned candidate;
+    // headless members refuse.
     eprintln!("payment {}: opening signer for member {}", p.attempt, v.slot);
     let mut signer = super::custody::open_signer(
         st, data, pass, &p.vault, v.slot,
-        super::approval_policy(st.approval.clone(), signer_network, v.slot),
+        payment_approval(data, pass, p, &v.network, super::approval_policy(st.approval.clone(), signer_network, v.slot))?,
     )?;
     signer.set_nonce_witness(Box::new(witness));
     if let Some(inputs) = &owned {
@@ -1471,7 +1476,9 @@ fn sign(
         &other_signers,
         check_running,
         &mut |bytes| {
-            review_candidate(bytes, p, v)?;
+            let sighash = review_candidate(bytes, p, v)?;
+            require_consent(data, pass, p)?;
+            pin_sighash(data, pass, p, sighash)?;
             // The background coordinator runs in this process; hand it the candidate through
             // the encrypted member store instead of the relay.
             if proposer {
@@ -1481,6 +1488,73 @@ fn sign(
             Ok(())
         },
     )
+}
+
+/// This member's sealed consent to an attempt: the intent hash of the terms it approved,
+/// written once.
+fn record_consent(data: &Path, pass: &str, p: &Payment) -> Result<(), String> {
+    let dir = payment_dir(data, &p.vault)?;
+    let file = format!("{}.consent", p.attempt);
+    if !dir.exists(&file) {
+        dir.write_sealed(&file, intent_hash(p).as_bytes(), pass).map_err(|e| e.to_string())?;
+    }
+    require_consent(data, pass, p)
+}
+fn require_consent(data: &Path, pass: &str, p: &Payment) -> Result<(), String> {
+    let raw = payment_dir(data, &p.vault)?
+        .read_sealed(&format!("{}.consent", p.attempt), pass)
+        .map_err(|_| "no recorded member consent for this attempt")?;
+    if raw != intent_hash(p).as_bytes() {
+        return Err("payment differs from recorded member consent".into());
+    }
+    Ok(())
+}
+/// Pins the first reviewed candidate's sighash for the attempt; a different one is refused.
+fn pin_sighash(data: &Path, pass: &str, p: &Payment, sighash: [u8; 32]) -> Result<(), String> {
+    let dir = payment_dir(data, &p.vault)?;
+    let file = format!("{}.consent-sighash", p.attempt);
+    if !dir.exists(&file) {
+        dir.write_sealed(&file, &sighash, pass).map_err(|e| e.to_string())?;
+    }
+    if dir.read_sealed(&file, pass).map_err(|e| e.to_string())? != sighash {
+        return Err("candidate differs from the approved sighash; start a new attempt".into());
+    }
+    Ok(())
+}
+/// The signer's approval: the member consented to these terms, the request names this
+/// attempt's candidate, the pinned sighash and a view of exactly the approved effects, and
+/// only then does `native` (the member's own dialog) decide.
+fn payment_approval(
+    data: &Path,
+    pass: &str,
+    p: &Payment,
+    network: &VaultNetwork,
+    mut native: crate::signer::local::ApprovalPolicy,
+) -> Result<crate::signer::local::ApprovalPolicy, String> {
+    let (data, pass, p) = (data.to_owned(), Zeroizing::new(pass.to_owned()), p.clone());
+    let to = vault::orchard_receiver_from_ua(&p.recipient, network.network_type())?
+        .to_raw_address_bytes();
+    let memo = MemoBytes::from_bytes(p.memo.as_bytes()).map_err(|e| format!("memo: {e:?}"))?;
+    Ok(Box::new(move |request| {
+        let approved = || -> Result<bool, String> {
+            require_consent(&data, &pass, &p)?;
+            let attempt = hex32(&p.attempt)?;
+            let candidate = CandidateRef { vault_id: hex32(&p.vault)?, payment_id: attempt, attempt_id: attempt };
+            let pinned = payment_dir(&data, &p.vault)?
+                .read_sealed(&format!("{}.consent-sighash", p.attempt), &pass)
+                .map_err(|e| e.to_string())?;
+            let view = request.view;
+            Ok(*request.candidate == candidate
+                && pinned == request.sighash
+                && view.to == to
+                && view.amount_zat == p.amount_zat
+                && view.fee_zat == p.fee_zat
+                && view.change_zat == p.change_zat
+                && view.memo == memo.as_array()
+                && view.expiry_height == tx_expiry(&p))
+        };
+        approved().unwrap_or(false) && native(request)
+    }))
 }
 
 /// The proposer's encrypted local hand-off of its candidate to its own coordinator.
@@ -2466,6 +2540,123 @@ mod tests {
         .unwrap();
         assert!(discardable(&data, &p).is_err());
         refused(&p, &a, "signature share was released");
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[tokio::test]
+    async fn approve_needs_the_reviewed_intent_hash_and_records_nothing_without_it() {
+        let data = std::env::temp_dir().join(format!("loki-consent-approve-{}", Uuid::new_v4()));
+        // Every refusal comes before the vault or frostd is used.
+        let st = state(&data, "http://127.0.0.1:9");
+        *st.session.write().await = Some(crate::host::state::Session {
+            data: data.clone(),
+            passphrase: Zeroizing::new("pass".into()),
+        });
+        let vault = hex::encode([2; 32]);
+        let mut p = open_payment(&vault, 1);
+        p.session_id = Some(Uuid::new_v4());
+        p.control_session_id = Some(Uuid::new_v4());
+        p.review_token = Some("token".into());
+        save_payment(&data, "pass", &p).unwrap();
+        let mut other = p.clone();
+        other.amount_zat += 1;
+        for hash in [None, Some(intent_hash(&other))] {
+            let mut body = json!({"vault":vault,"attempt":p.attempt,"review_token":"token"});
+            if let Some(hash) = hash {
+                body["intent_hash"] = json!(hash);
+            }
+            let reply = approve(State(st.clone()), Json(body)).await;
+            assert_eq!(reply.0, StatusCode::BAD_REQUEST);
+            let saved = read_payment(&data, "pass", &vault, &p.attempt).unwrap();
+            assert!(!saved.approval_requested && saved.approvals.is_empty());
+            assert_eq!(saved.review_token, p.review_token);
+            assert!(!payment_dir(&data, &vault)
+                .unwrap()
+                .exists(&format!("{}.consent", p.attempt)));
+        }
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
+    fn signer_approval_binds_consent_candidate_sighash_and_terms() {
+        let data = std::env::temp_dir().join(format!("loki-consent-policy-{}", Uuid::new_v4()));
+        let identity = Identity::new(1);
+        let v = member(&identity, &BTreeMap::new());
+        let vault = hex::encode([2; 32]);
+        let mut p = open_payment(&vault, 1);
+        p.recipient = vault::unified_address(&v.fvk, v.network.network_type());
+        let attempt = hex32(&p.attempt).unwrap();
+        let candidate = CandidateRef { vault_id: [2; 32], payment_id: attempt, attempt_id: attempt };
+        let sighash = [9u8; 32];
+        let view = crate::signer::wysiwys::PaymentView {
+            to: vault::orchard_receiver_from_ua(&p.recipient, v.network.network_type())
+                .unwrap()
+                .to_raw_address_bytes(),
+            amount_zat: p.amount_zat,
+            fee_zat: p.fee_zat,
+            change_zat: p.change_zat,
+            memo: MemoBytes::from_bytes(p.memo.as_bytes()).unwrap().as_array().to_vec(),
+            expiry_height: tx_expiry(&p),
+            network_branch_id: 0,
+            fee_verified: true,
+        };
+        // The member's native dialog: counts how often it is asked and answers `member_says`.
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let member_says = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let dialog: super::super::LocalApproval = {
+            let (asked, member_says) = (asked.clone(), member_says.clone());
+            std::sync::Arc::new(move |_| {
+                asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                member_says.load(std::sync::atomic::Ordering::SeqCst)
+            })
+        };
+        let native = || super::super::approval_policy(Some(dialog.clone()), Network::Testnet, 1);
+        let mut policy = payment_approval(&data, "pass", &p, &v.network, native()).unwrap();
+        let mut approves = |candidate: &CandidateRef, sighash: [u8; 32], view: &crate::signer::wysiwys::PaymentView| {
+            policy(&crate::signer::local::ApprovalRequest { candidate, sighash, view })
+        };
+        // No consent record yet.
+        assert!(!approves(&candidate, sighash, &view));
+        record_consent(&data, "pass", &p).unwrap();
+        // Consent, but no candidate sighash pinned yet.
+        assert!(!approves(&candidate, sighash, &view));
+        pin_sighash(&data, "pass", &p, sighash).unwrap();
+        assert!(pin_sighash(&data, "pass", &p, [8; 32]).is_err());
+        // Binding failures never reach the member's dialog.
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(approves(&candidate, sighash, &view));
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // The binding holds but the member declines in the dialog: refused.
+        member_says.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(!approves(&candidate, sighash, &view));
+        member_says.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(!approves(&candidate, [8; 32], &view));
+        let mut other = candidate;
+        other.attempt_id = [3; 32];
+        assert!(!approves(&other, sighash, &view));
+        let mut changed = view.clone();
+        changed.amount_zat += 1;
+        assert!(!approves(&candidate, sighash, &changed));
+        let mut changed = view.clone();
+        changed.to = v.fvk.address_at(7u64, Scope::External).to_raw_address_bytes();
+        assert!(!approves(&candidate, sighash, &changed));
+        let mut changed = view.clone();
+        changed.expiry_height += 1;
+        assert!(!approves(&candidate, sighash, &changed));
+        // The consent recorded for these terms neither changes nor approves other terms.
+        let mut terms = p.clone();
+        terms.amount_zat += 1;
+        assert!(record_consent(&data, "pass", &terms).is_err());
+        let mut policy = payment_approval(&data, "pass", &terms, &v.network, native()).unwrap();
+        changed = view.clone();
+        changed.amount_zat = terms.amount_zat;
+        let request = crate::signer::local::ApprovalRequest { candidate: &candidate, sighash, view: &changed };
+        assert!(!policy(&request));
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // Without a native approval channel (headless), even the bound request is refused.
+        let mut headless =
+            payment_approval(&data, "pass", &p, &v.network, super::super::approval_policy(None, Network::Testnet, 1)).unwrap();
+        assert!(!headless(&crate::signer::local::ApprovalRequest { candidate: &candidate, sighash, view: &view }));
         std::fs::remove_dir_all(data).unwrap();
     }
 

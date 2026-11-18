@@ -150,7 +150,7 @@ approve() {
   review="$(api "$i" POST /api/payment-review "$(pair "$attempt")")" || fail "review $i: $review"
   jq -e --arg recipient "$recipient" --arg amount "$AMOUNT_ZAT" '.recipient == $recipient and .amount_zat == $amount' <<<"$review" >/dev/null || fail "review values $i"
   token="$(jq -er '.review_token' <<<"$review")"
-  api "$i" POST /api/payment-approve "$(jq -nc --arg vault "$vault" --arg attempt "$attempt" --arg review_token "$token" '{vault:$vault,attempt:$attempt,review_token:$review_token}')" | jq -e '.phase == "signing"' >/dev/null || fail "approve $i"
+  api "$i" POST /api/payment-approve "$(jq -nc --arg vault "$vault" --arg attempt "$attempt" --arg review_token "$token" --arg intent_hash "$(jq -er '.intent_hash' <<<"$review")" '{vault:$vault,attempt:$attempt,review_token:$review_token,intent_hash:$intent_hash}')" | jq -e '.phase == "signing"' >/dev/null || fail "approve $i"
   echo "member $i approved"
 }
 phase() { api "$1" GET "/api/payment-status?vault=$vault&attempt=$2" | jq -r '.phase'; }
@@ -235,7 +235,7 @@ approve_retry() {
   local review token
   review="$(api 3 POST /api/payment-review "$(pair "$retry")")" || fail "review 3: $review"
   token="$(jq -er '.review_token' <<<"$review")"
-  api 3 POST /api/payment-approve "$(jq -nc --arg vault "$vault" --arg attempt "$retry" --arg review_token "$token" '{vault:$vault,attempt:$attempt,review_token:$review_token}')" | jq -e '.phase == "signing"' >/dev/null || fail 'approve 3'
+  api 3 POST /api/payment-approve "$(jq -nc --arg vault "$vault" --arg attempt "$retry" --arg review_token "$token" --arg intent_hash "$(jq -er '.intent_hash' <<<"$review")" '{vault:$vault,attempt:$attempt,review_token:$review_token,intent_hash:$intent_hash}')" | jq -e '.phase == "signing"' >/dev/null || fail 'approve 3'
 }
 approve_retry
 echo "member 3 approved its retry"
