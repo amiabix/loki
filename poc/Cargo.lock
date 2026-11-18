@@ -2149,6 +2149,7 @@ dependencies = [
 name = "loki-signer-wasm"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "console_error_panic_hook",
  "hex",
  "loki-signer-core",

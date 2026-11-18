@@ -46,7 +46,13 @@ use zeroize::Zeroizing;
 // out of bounds" the moment a candidate was reviewed. The context is never used for crypto
 // (no secp256k1 op runs for our shielded-only candidates); a transparent-input tx would still
 // need a real context, out of scope here.
-#[cfg(target_arch = "wasm32")]
+//
+// Only when the C library is NOT linked (build.rs `secp_c_unlinked`): secp256k1-sys does
+// compile its C for wasm32, but archives it with the archiver `cc` finds. With `llvm-ar` (Linux
+// toolchains) the archive is indexed, wasm-ld links the real C, and these stubs would be
+// duplicate definitions. With Apple's `ar` the archive has no index, nothing is pulled from it,
+// and these stubs are what resolves the symbols.
+#[cfg(all(target_arch = "wasm32", secp_c_unlinked))]
 mod secp256k1_link_stub {
     use core::ffi::{c_uint, c_void};
     // Arbitrary non-zero, aligned buffer size; only alloc/dealloc balance matters since the
