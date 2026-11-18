@@ -6,7 +6,13 @@
 #
 # By default this starts three members and creates a new 2-of-3 vault. With VAULT and
 # TOKEN_DIR it reuses three running members on BASE_PORT+1..3 that are already in that
-# active vault; TOKEN_DIR holds each member's API token as <i>.token.
+# active vault; TOKEN_DIR holds each member's API token as <i>.token, its log as <i>.log,
+# and the members must have been started with `--approve-from TOKEN_DIR/<i>.approvals`.
+#
+# Members sign only with an approval channel and two nonce witnesses. This script starts
+# two witness relays (or uses NONCE_WITNESSES, a provisioned witnesses.json) and runs each
+# member with `--approve-from`: it reads the signer's own `approval-request` summary from the
+# member's log and approves only the recipient, amount and network it proposed.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -62,10 +68,36 @@ if [[ -n "$vault" ]]; then
   done
 else
 [[ -x "$bin" ]] || fail "missing $bin; build loki_member_app first"
+witnesses="${NONCE_WITNESSES:-}"
+if [[ -z "$witnesses" ]]; then
+  relay="$PWD/../communication/target/debug/loki-relay-server"
+  [[ -x "$relay" ]] || cargo build --manifest-path ../communication/Cargo.toml --target-dir ../communication/target \
+    --locked --bin loki-relay-server || fail 'build loki-relay-server'
+  witness_port="${WITNESS_BASE_PORT:-39400}"
+  for n in 1 2; do
+    head -c 32 /dev/urandom >"$tmp/relay-$n.secret"; chmod 600 "$tmp/relay-$n.secret"
+    "$relay" init --root "$tmp/relay-$n" --listen "127.0.0.1:$((witness_port+n))" \
+      --provision-capability-file "$tmp/relay-$n.secret" \
+      --total-bytes 268435456 --mailbox-bytes 67108864 --mailbox-count 1024 >/dev/null || fail "witness relay $n init"
+    cp "$tmp/relay-$n.secret" "$tmp/relay-$n/provision.secret"
+    "$relay" serve --root "$tmp/relay-$n" --listen "127.0.0.1:$((witness_port+n))" >"$tmp/relay-$n.log" 2>&1 &
+    pids+=("$!")
+  done
+  for n in 1 2; do
+    for _ in {1..100}; do nc -z 127.0.0.1 "$((witness_port+n))" 2>/dev/null && break; sleep 0.1; done
+    nc -z 127.0.0.1 "$((witness_port+n))" 2>/dev/null || fail "witness relay $n did not start"
+  done
+  witnesses="$tmp/witnesses.json"
+  cargo run -q --locked --features relay-communication --example provision_nonce_witnesses -- \
+    --relay-root "$tmp/relay-1" --relay-root "$tmp/relay-2" --out "$witnesses" --development-http \
+    >"$tmp/provision.log" 2>&1 || fail "provisioning the nonce witnesses failed; see $tmp/provision.log"
+fi
+echo "nonce witnesses: $witnesses"
 for i in 1 2 3; do
   port=$((base_port+i))
   "$bin" --data "$tmp/$i" --port "$port" --network testnet \
     --lightwalletd-url "$LIGHTWALLETD_URL" --frostd-url "$frostd" \
+    --nonce-witnesses "$witnesses" --development-http --approve-from "$tmp/$i.approvals" \
     --peer "1=http://127.0.0.1:$((base_port+1))" \
     --peer "2=http://127.0.0.1:$((base_port+2))" \
     --peer "3=http://127.0.0.1:$((base_port+3))" >"$tmp/$i.log" 2>&1 &
@@ -129,6 +161,27 @@ for ((n=0; n<funding_timeout; n+=30)); do
 done
 [[ "$ready" == true ]] || fail "funding not scanned within $funding_timeout seconds"
 echo "balance: $(jq -r '.balance_zat' <<<"$balance") zat"
+
+# Each member's signer asks before it signs; answer from the summary it derived itself.
+review_signing() {
+  local i="$1" seen=' ' summary sighash
+  while sleep 1; do
+    while read -r summary; do
+      sighash="$(jq -r '.sighash' <<<"$summary")"
+      [[ "$seen" == *" $sighash "* ]] && continue
+      seen+="$sighash "
+      if jq -e --arg recipient "$recipient" --arg amount "$AMOUNT_ZAT" \
+        '.recipient == $recipient and (.amount_zat | tostring) == $amount and .network == "testnet" and .fee_verified' \
+        <<<"$summary" >/dev/null; then
+        echo "approve $sighash" >>"$tmp/$i.approvals"
+      else
+        echo "refuse $sighash" >>"$tmp/$i.approvals"
+        echo "member $i signer refused a payment it was not asked for: $summary" >&2
+      fi
+    done < <(sed -n 's/^approval-request //p' "$tmp/$i.log")
+  done
+}
+for i in 1 2 3; do review_signing "$i" & pids+=("$!"); done
 
 draft() {
   api 1 POST /api/payment-draft "$(jq -nc --arg vault "$vault" --arg recipient "$recipient" --arg amount_zat "$AMOUNT_ZAT" --arg memo "$1" '{vault:$vault,recipient:$recipient,amount_zat:$amount_zat,memo:$memo}')"
