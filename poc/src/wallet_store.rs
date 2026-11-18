@@ -241,19 +241,9 @@ pub async fn sync_member_wallet(
         .await
         .map_err(|e| format!("lightwalletd info: {e}"))?
         .into_inner();
-    // lightwalletd names regtest "test" too, so tell the chains apart by Sapling activation.
-    let sapling = member
+    member
         .network
-        .activation_height(zcash_protocol::consensus::NetworkUpgrade::Sapling)
-        .map(u64::from);
-    if info.chain_name != "test" || Some(info.sapling_activation_height) != sapling {
-        return Err(format!(
-            "lightwalletd serves another chain ({} with Sapling at {}), not this {} vault's",
-            info.chain_name,
-            info.sapling_activation_height,
-            member.network.label()
-        ));
-    }
+        .require_lightwalletd_chain(&info.chain_name, info.sapling_activation_height)?;
     if info.block_height < u64::from(birth) {
         return Err(format!("lightwalletd is below this vault's birth height {birth}"));
     }

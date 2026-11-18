@@ -208,6 +208,20 @@ mod tests {
     }
 
     #[test]
+    fn cli_network_is_testnet_or_regtest_only() {
+        let args = |network: Option<&str>| {
+            let mut args: Vec<String> = ["--data", "unused", "--port", "0"].map(Into::into).to_vec();
+            args.extend(network.map(|n| ["--network".into(), n.into()]).into_iter().flatten());
+            super::super::config_from_args(&args).map(|c| c.network)
+        };
+        assert_eq!(args(None).unwrap(), "regtest");
+        assert_eq!(args(Some("testnet")).unwrap(), "testnet");
+        for refused in ["mainnet", "main", "Mainnet", "", "test"] {
+            assert!(args(Some(refused)).is_err(), "{refused}");
+        }
+    }
+
+    #[test]
     fn peer_urls_allow_regtest_loopback_and_operator_origins_only() {
         let mut c = config("software");
         for url in ["http://127.0.0.1:42783", "http://[::1]:42784"] {

@@ -103,11 +103,13 @@ pub fn config_from_args(args: &[String]) -> Result<Config, String> {
             peers.insert(slot, url.trim_end_matches('/').to_owned());
         }
     }
+    let network = value("--network").unwrap_or_else(|| "regtest".into());
+    crate::network::VaultNetwork::parse(&network)?;
     Ok(Config {
         data, port, bind,
         registration: RegistrationConfig::from_args(args, flag("--development-http"))?,
         advertise_url: value("--advertise-url"),
-        network: value("--network").unwrap_or_else(|| "regtest".into()),
+        network,
         lightwalletd: value("--lightwalletd-url"),
         transport: value("--transport").unwrap_or_else(|| "local".into()),
         secure_element: value("--secure-element").unwrap_or_else(|| "software".into()),
