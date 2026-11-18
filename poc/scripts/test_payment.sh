@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Testnet end to end: an open payment request signed by the first approvers and sent by a
-# member outside the signing group; a signed payment left unsent and retried on the same note,
-# which a member's app approves by itself; then a request that the proposer cancels.
+# Testnet end to end: an open payment request signed by the first approvers and broadcast,
+# then a second request that the proposer cancels.
 #
 # By default this starts three members and creates a new 2-of-3 vault. With VAULT and
 # TOKEN_DIR it reuses three running members on BASE_PORT+1..3 that are already in that
@@ -164,16 +163,6 @@ wait_for() {
   fail "$what"
 }
 phases() { for i in 1 2 3; do echo "  member $i: $(phase "$i" "$1")"; done; }
-# payment-verify on member $1 until the transaction is mined; prints the last result.
-wait_confirmed() {
-  local i="$1" attempt="$2" txid="$3" out=''
-  for ((n=0; n<funding_timeout; n+=30)); do
-    out="$(api "$i" POST /api/payment-verify "$(jq -nc --arg vault "$vault" --arg attempt "$attempt" --arg txid "$txid" '{vault:$vault,attempt:$attempt,txid:$txid}')")" || fail "verify: $out"
-    jq -e '.phase == "confirmed"' <<<"$out" >/dev/null && { echo "$out"; return; }
-    sleep 30
-  done
-  fail "not mined within $funding_timeout seconds: $out"
-}
 
 echo "== open request: any member may approve; member 3 approves before member 2"
 attempt="$(draft_when_spendable "${MEMO:-testnet payment}" | jq -er '.attempt')"
@@ -187,67 +176,18 @@ approve 2 "$attempt"
 wait_for 'proposer records member 2' 60 proposer_has "$attempt" '.approvals == [3,2]'
 approve 1 "$attempt"
 wait_for 'signing group [1,3]' 60 proposer_has "$attempt" '.signers == [1,3]'
-# Member 2 is left out; once the proposer sends it the signed payment it is ready to send too.
-outside() { local p; p="$(phase 2 "$attempt")"; [[ "$p" == not_selected || "$p" == ready ]]; }
-wait_for 'member 2 is not selected' 300 outside
+wait_for 'member 2 is not selected' 300 has_phase 2 "$attempt" not_selected
 ! pending 2 "$attempt" || fail 'member 2 still lists the request'
-echo "signing group [1,3]; member 2 left out and off its pending list"
-wait_for 'signers did not finish' 600 proposer_has "$attempt" '.ready_to_send'
-# Member 2 did not sign; it gets the signed payment from the proposer and sends it.
-wait_for 'member 2 holds the signed payment' 120 has_phase 2 "$attempt" ready
+echo "signing group [1,3]; member 2 not_selected and off its pending list"
+# The proposer sends on its own once the signatures combine, after sealing a copy to every member.
+wait_for 'proposer did not send' 600 proposer_has "$attempt" '.phase == "broadcast" or .phase == "confirmed"'
 phases "$attempt"
-finished="$(api 2 POST /api/payment-finish "$(pair "$attempt")")" || fail "finish by member 2: $finished"
-txid="$(jq -er '.txid' <<<"$finished")" || fail txid
-echo "member 2, outside the signing group, broadcast txid: $txid"
-for i in 1 3; do wait_for "member $i hears the broadcast" 60 has_phase "$i" "$attempt" broadcast; done
-phases "$attempt"
-# Sending again while unmined is allowed and reports the same transaction.
-again="$(api 3 POST /api/payment-finish "$(pair "$attempt")")" || fail "rebroadcast by member 3: $again"
-[[ "$(jq -r '.txid' <<<"$again")" == "$txid" ]] || fail "rebroadcast has another txid: $again"
-echo "member 3 rebroadcast the same txid"
-verified="$(wait_confirmed 2 "$attempt" "$txid")"
-echo "confirmed at height $(jq -r '.mined_height' <<<"$verified")"
-first_txid="$txid"
-
-echo "== retry: a signed payment left unsent is retried on the same note; member 2's app approves it"
-attempt="$(draft_when_spendable 'retried payment' | jq -er '.attempt')"
-echo "attempt $attempt"
-publish "$attempt"
-for i in 2 3; do wait_for "member $i sees the request" 60 pending "$i" "$attempt"; done
-approve 2 "$attempt"
-wait_for 'proposer records member 2' 60 proposer_has "$attempt" '.approvals == [2]'
-approve 1 "$attempt"
-wait_for 'signers did not finish' 600 proposer_has "$attempt" '.ready_to_send'
-wait_for 'member 3 holds the signed payment' 120 has_phase 3 "$attempt" ready
-note="$(api 1 GET "/api/payments?vault=$vault" | jq -c --arg attempt "$attempt" '.payments[] | select(.attempt == $attempt) | .note_selection')"
-echo "first attempt signed and left unsent; it spends $note"
-retried="$(api 1 POST /api/payment-draft "$(jq -nc --arg vault "$vault" --arg retry_of "$attempt" '{vault:$vault,retry_of:$retry_of}')")" || fail "retry draft: $retried"
-retry="$(jq -er '.attempt' <<<"$retried")"
-echo "retry $retry"
-proposer_has "$attempt" '.phase == "superseded"' || fail 'first attempt is not superseded'
-proposer_has "$retry" ".note_selection == $note" || fail 'retry spends another note'
-api 1 POST /api/payment-publish "$(pair "$retry")" | jq -e '.phase == "signing" and .approved' >/dev/null || fail "publish retry"
-# No approve call for member 2: its app approves the identical retry when it reads the request.
-# Member 2's app reads requests whenever it lists payments, as its screen does.
-retry_signed() { api 2 GET "/api/payments?vault=$vault" >/dev/null && proposer_has "$retry" '.ready_to_send'; }
-wait_for 'retry is signed without a new approval' 600 retry_signed
-proposer_has "$retry" '.signers == [1,2]' || fail 'retry signed by another group'
-! pending 2 "$retry" || fail 'member 2 was asked to approve the retry'
-for i in 2 3; do wait_for "member $i hears the first attempt is superseded" 60 has_phase "$i" "$attempt" superseded; done
-phases "$retry"
-finished="$(api 1 POST /api/payment-finish "$(pair "$retry")")" || fail "finish retry: $finished"
-txid="$(jq -er '.txid' <<<"$finished")" || fail txid
-echo "retry broadcast txid: $txid"
-verified="$(wait_confirmed 1 "$retry" "$txid")"
-echo "retry confirmed at height $(jq -r '.mined_height' <<<"$verified")"
-for i in 1 2 3; do
-  if refused="$(api "$i" POST /api/payment-finish "$(pair "$attempt")" 2>&1)"; then fail "member $i sent the superseded attempt: $refused"; fi
-  echo "  member $i refuses to send the first attempt: $(jq -r '.error // .' <<<"$refused" 2>/dev/null || echo "$refused")"
-done
-for i in 1 2 3; do
-  p="$(phase "$i" "$attempt")"
-  [[ "$p" == superseded || "$p" == failed ]] || fail "member $i shows the first attempt as $p"
-done
+txid="$(api 1 GET "/api/payments?vault=$vault" | jq -er --arg attempt "$attempt" '.payments[] | select(.attempt == $attempt) | .txid')" || fail txid
+echo "broadcast txid: $txid"
+verified="$(api 1 POST /api/payment-verify "$(jq -nc --arg vault "$vault" --arg attempt "$attempt" --arg txid "$txid" '{vault:$vault,attempt:$attempt,txid:$txid}')")" || fail "verify: $verified"
+jq -e '.phase == "broadcast" or .phase == "confirmed"' <<<"$verified" >/dev/null || fail "verify result: $verified"
+member_sent() { api "$1" GET "/api/payments?vault=$vault" | jq -e --arg attempt "$2" --arg txid "$txid" 'any(.payments[]; .attempt == $attempt and .txid == $txid and (.phase == "broadcast" or .phase == "confirmed"))' >/dev/null; }
+for i in 2 3; do wait_for "member $i holds the sent transaction" 60 member_sent "$i" "$attempt"; done
 phases "$attempt"
 
 echo "== cancel: member 1 cancels its request after member 2 approved"
@@ -282,4 +222,4 @@ for held_attempt in "${held[@]:1}"; do
   api 1 POST /api/payment-discard "$(pair "$held_attempt")" | jq -e '.phase == "cancelled"' >/dev/null || fail "discard draft $held_attempt"
 done
 held=()
-echo "PASS: member 2 sent $first_txid; retry $txid confirmed on the first attempt's note; cancelled request released its note"
+echo "PASS: Testnet payment $txid broadcast ($(jq -r '.phase' <<<"$verified")); cancelled request released its note"

@@ -12,6 +12,7 @@ use std::{
 
 #[cfg(feature = "relay-communication")]
 use loki_poc::signing_session::{NonceWitness, ReviewedPackage};
+use loki_poc::tx_finalize::finalized_sighash;
 use loki_poc::{
     candidate::{alpha_from_canonical_bytes, build_candidate, quote_fee, CandidateInputs},
     intent::{ChangePolicy, Intent},
@@ -1068,33 +1069,6 @@ fn finish(args: &[String], broadcast: bool) -> Result<(), String> {
         hex::encode(context.payment)
     );
     Ok(())
-}
-
-fn finalized_sighash(tx: &zcash_primitives::transaction::Transaction) -> Result<[u8; 32], String> {
-    use zcash_primitives::transaction::{Authorization, TransactionData};
-    struct ShieldedOnly;
-    impl Authorization for ShieldedOnly {
-        type TransparentAuth = zcash_transparent::bundle::EffectsOnly;
-        type SaplingAuth = sapling_crypto::bundle::Authorized;
-        type OrchardAuth = orchard::bundle::Authorized;
-    }
-    if tx.transparent_bundle().is_some()
-        || tx.sapling_bundle().is_some()
-        || tx.orchard_bundle().is_some()
-    {
-        return Err("mined transaction uses an unexpected pool".into());
-    }
-    let data: TransactionData<ShieldedOnly> = tx.clone().into_data().try_map_bundles(
-        |_| Ok::<_, String>(None),
-        |_| Ok::<_, String>(None),
-        Ok::<_, String>,
-    )?;
-    let digest = zcash_primitives::transaction::sighash::signature_hash(
-        &data,
-        &zcash_primitives::transaction::sighash::SignableInput::Shielded,
-        &data.digest(zcash_primitives::transaction::txid::TxIdDigester),
-    );
-    Ok(*digest.as_ref())
 }
 
 fn verify(args: &[String]) -> Result<(), String> {

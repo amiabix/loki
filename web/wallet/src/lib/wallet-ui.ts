@@ -14,16 +14,18 @@ export function invitePreview(code: string): { vault: string; name: string; memb
 
 export function paymentLabel(phase: string, ready: boolean, sending: boolean): string {
   if (phase === "confirmed") return "Confirmed";
+  if (phase === "replaced") return "Replaced · will never be sent";
   if (phase === "broadcast") return "Awaiting confirmation";
   if (phase === "expired") return "Expired";
-  if (phase === "failed") return "Failed · create a new payment";
+  if (phase === "failed") return "Failed · not sent";
   if (phase === "discarding") return "Releasing reserved input";
   if (phase === "cancelled") return "Cancelled";
   if (sending) return "Sending";
   if (ready) return "Ready to send";
   const labels: Record<string, string> = {
     draft: "Draft", preparing: "Preparing payment", signing: "Collecting approvals",
-    approved: "Approved · awaiting proposer", not_selected: "Other members are signing",
+    approved: "Approved · awaiting the signed transaction", not_selected: "Other members are signing",
+    ready: "Signed · building the transaction", signed: "Signed · not sent yet",
   };
   return labels[phase] ?? "Status unavailable";
 }

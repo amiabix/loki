@@ -58,7 +58,8 @@ pub fn router(state: Shared) -> Router {
         .route("/api/payment-review", post(payment::review))
         .route("/api/payment-approve", post(payment::approve))
         .route("/api/payment-discard", post(payment::discard))
-        .route("/api/payment-finish", post(payment::finish))
+        .route("/api/payment-send", post(payment::send))
+        .route("/api/payment-replace", post(payment::replace))
         .route("/api/payment-verify", post(payment::verify))
         .route("/api/payments", get(payment::payments))
         .route("/api/pending", get(payment::pending))
@@ -121,7 +122,10 @@ async fn browser_origin(State(st): State<Shared>, req: Request, next: Next) -> R
 async fn registration(State(st): State<Shared>) -> Reply {
     match st.registration.read().await.as_ref() {
         Some(member) => ok(json!(member)),
-        None => err(StatusCode::CONFLICT, "device has not self-registered"),
+        None => match st.registration_error.read().await.as_ref() {
+            Some(e) => err(StatusCode::CONFLICT, format!("device has not self-registered; retrying after: {e}")),
+            None => err(StatusCode::CONFLICT, "device has not self-registered"),
+        },
     }
 }
 
@@ -184,7 +188,12 @@ async fn unlock(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
     let data = st.config.data.clone();
     let passphrase = Zeroizing::new(pass);
     let for_block = passphrase.clone();
-    match tokio::task::spawn_blocking(move || Session::unlock(data, for_block)).await {
+    let unlocked = tokio::task::spawn_blocking(move || {
+        let unlocked = Session::unlock(data.clone(), for_block.clone())?;
+        recovery::seal_missing_backups_logged(&data, &for_block);
+        Ok::<_, String>(unlocked)
+    });
+    match unlocked.await {
         Ok(Ok((session, profile))) => {
             *st.session.write().await = Some(session);
             ok(json!({ "unlocked": true, "profile": profile }))

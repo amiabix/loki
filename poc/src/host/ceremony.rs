@@ -1098,8 +1098,8 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
             .write_sealed("vault.sealed", &sealed, pass)
             .map_err(|e| e.to_string())?;
         // The vault is now active: seal this member's recovery backup (share HPKE-sealed to its
-        // recovery words) so a lost device can restore the share from the words. The recovery
-        // identity is established at registration, so `recovery.pub` already exists here.
+        // recovery words) so a lost device can restore the share from the words. Without a
+        // recovery identity yet, recovery setup or the next unlock seals it instead.
         super::recovery::seal_vault_backup(data, &signer_dir, &roster.vault_id, pass)?;
         Ok(json!({"ok":true}))
     })();
@@ -1308,17 +1308,14 @@ mod tests {
     /// backup.
     #[test]
     fn recovery_backup_seals_at_activation_and_restores_the_share_from_words() {
-        use crate::signer::backup::{self, BackupMaterial};
         use crate::signer::recovery::RecoveryKey;
         use crate::signer::secure_element::SoftwareSecureElement;
         use crate::signer::store::{FileKind, SignerStore};
-        use reddsa_frost::frost::redpallas as frost;
 
         let data = std::env::temp_dir().join(format!("loki-recovery-words-{}", Uuid::new_v4()));
         let vault = [9u8; 32];
         let vault_hex = hex::encode(vault);
         let pass = "pass";
-        let group_sk = [42u8; 32];
 
         // Registration establishes the recovery identity (words shown once; only pubkeys stored).
         let (words, rkey) = RecoveryKey::generate().unwrap();
@@ -1329,49 +1326,9 @@ mod tests {
         std::fs::write(data.join("recovery.pub"), &pubkeys).unwrap();
         drop(rkey);
 
-        // A 2-of-3 dealer vault; this member is slot 1. Write `backup.sealed` exactly as the
-        // signer does during DKG (`HostedBackup::save`): the passphrase-sealed backup artifact.
-        let (shares, public) = frost::keys::generate_with_dealer(
-            3,
-            2,
-            frost::keys::IdentifierList::Default,
-            &mut rand_core::OsRng,
-        )
-        .unwrap();
-        let id1 = frost::Identifier::try_from(1u16).unwrap();
-        let kp1 = frost::keys::KeyPackage::try_from(shares[&id1].clone()).unwrap();
-        let share_bytes = kp1.serialize().unwrap();
-        // The DKG roster names every member's relay identity, which signing needs.
-        let ids: Vec<_> = (1..=3).map(Identity::new).collect();
-        let roster = serde_json::to_vec(&json!({
-            "vault": vault_hex, "threshold": 2, "setup_version": 2, "network": "regtest",
-            "members": ids.iter().map(|i| {
-                let p = i.public();
-                json!({"id": p.id, "signing": hex::encode(p.signing), "encryption": hex::encode(p.encryption)})
-            }).collect::<Vec<_>>(),
-        }))
-        .unwrap();
-        let material = BackupMaterial {
-            member_id: 1,
-            threshold: 2,
-            members: 3,
-            network: Network::Regtest,
-            vault_id: vault,
-            label: "recovery vault".into(),
-            group_sk,
-            key_package: Zeroizing::new(share_bytes.clone()),
-            public_package: public.serialize().unwrap(),
-            backup_epoch: 0,
-            identity: Zeroizing::new(ids[0].to_secret_bytes().to_vec()),
-            roster_fingerprint: crate::member_state::Roster::from_bytes(&roster).unwrap().fingerprint(),
-            roster,
-            birth_height: None,
-        };
+        let (material, shares, public) = dealer_vault(&data, vault, pass);
+        let share_bytes = material.key_package.to_vec();
         let sdir = signer_dir(&data, &vault_hex).unwrap();
-        MemberDir::create(&sdir, "")
-            .unwrap()
-            .write_sealed("backup.sealed", &backup::create(&material, pass).unwrap().0, pass)
-            .unwrap();
 
         // Activation seals the recovery backup — the wiring under test.
         crate::host::recovery::seal_vault_backup(&data, &sdir, &vault, pass).unwrap();
@@ -1418,11 +1375,49 @@ mod tests {
         assert!(conflict.unwrap_err().contains("different member identity"));
         assert!(!dir(&data, &vault_hex).unwrap().exists("vault.sealed"));
         std::fs::remove_dir_all(&data).unwrap();
+        // A profile whose recovery identity is another set of words is refused before any write.
+        let other_key = RecoveryKey::from_words(&other).unwrap();
+        let mut other_pub = other_key.public_bytes().to_vec();
+        other_pub.extend_from_slice(&other_key.signing_public());
+        MemberDir::create(&data, "").unwrap();
+        std::fs::write(data.join("recovery.pub"), &other_pub).unwrap();
+        let conflict = restore_vault_from_backup(&data, &vault_hex, &words, Some(&blob), pass, &config);
+        assert!(conflict.unwrap_err().contains("different recovery words"));
+        assert!(!dir(&data, &vault_hex).unwrap().exists("vault.sealed"));
+        assert!(!data.join("identity.sealed").exists());
+        assert_eq!(std::fs::read(data.join("recovery.pub")).unwrap(), other_pub);
+        std::fs::remove_dir_all(&data).unwrap();
 
         // The real words restore a member the payment path can open and sign with.
         restore_vault_from_backup(&data, &vault_hex, &words, Some(&blob), pass, &config).unwrap();
         crate::host::payment::load_vault(&data, pass, &vault_hex, "regtest")
             .expect("the restored member opens for signing");
+        // Restore brings the recovery identity: `recovery.pub` holds both public keys of these
+        // words, so a later start or recovery setup does not mint a second set.
+        assert_eq!(std::fs::read(data.join("recovery.pub")).unwrap(), pubkeys);
+        assert!(tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(crate::host::recovery::establish_recovery(&data)).unwrap().is_none());
+
+        // The restored member completes a rerandomized FROST round with member 2 using the key
+        // package the payment path reads from `vault.sealed`; the aggregate verifies.
+        let sealed: Value = serde_json::from_slice(&dir(&data, &vault_hex).unwrap().read_sealed("vault.sealed", pass).unwrap()).unwrap();
+        let restored = frost::keys::KeyPackage::deserialize(&hex::decode(sealed["key_package"].as_str().unwrap()).unwrap()).unwrap();
+        let group = frost::keys::PublicKeyPackage::deserialize(&hex::decode(sealed["public_package"].as_str().unwrap()).unwrap()).unwrap();
+        let peer = frost::keys::KeyPackage::try_from(shares[&frost::Identifier::try_from(2u16).unwrap()].clone()).unwrap();
+        let message = b"restored member signs";
+        let (n1, c1) = frost::round1::commit(restored.signing_share(), &mut OsRng);
+        let (n2, c2) = frost::round1::commit(peer.signing_share(), &mut OsRng);
+        let commitments = BTreeMap::from([(*restored.identifier(), c1), (*peer.identifier(), c2)]);
+        let package = frost::SigningPackage::new(commitments.clone(), message);
+        let (params, seed) = frost_rerandomized::RandomizedParams::new_from_commitments(group.verifying_key(), &commitments, OsRng).unwrap();
+        let shares_out = BTreeMap::from([
+            (*restored.identifier(), frost_rerandomized::sign_with_randomizer_seed(&package, &n1, &restored, &seed).unwrap()),
+            (*peer.identifier(), frost_rerandomized::sign_with_randomizer_seed(&package, &n2, &peer, &seed).unwrap()),
+        ]);
+        let signature = frost_rerandomized::aggregate(&package, &shares_out, &group, &params)
+            .expect("the restored member's share aggregates");
+        params.randomized_verifying_key().verify(message, &signature)
+            .expect("the aggregate signature verifies under the vault's randomized group key");
+        assert_eq!(group.verifying_key(), public.verifying_key());
         assert_eq!(std::fs::read(crate::host::recovery::backup_file(&sdir)).unwrap(), blob);
         assert!(
             restore_vault_from_backup(&data, &vault_hex, &words, Some(&blob), pass, &config).is_err(),
@@ -1441,7 +1436,7 @@ mod tests {
         let (restored_key, restored_public, restored_vs) =
             crate::signer::local::decode_share(&raw).unwrap();
         assert_eq!(&*restored_key, &share_bytes, "restored share matches the original key package");
-        assert_eq!(restored_vs, group_sk);
+        assert_eq!(restored_vs, material.group_sk);
         assert_eq!(restored_public, material.public_package);
         let ak: [u8; 32] = public.verifying_key().serialize().unwrap().try_into().unwrap();
         zip2005::frost_viewing_key(&ak, &restored_vs)
@@ -1449,6 +1444,112 @@ mod tests {
 
         std::fs::remove_dir_all(&data).unwrap();
     }
+
+    /// An active 2-of-3 dealer vault where this member is slot 1: `backup.sealed` written exactly
+    /// as the signer does during DKG (`HostedBackup::save`), and a `vault.sealed` marker.
+    fn dealer_vault(
+        data: &Path,
+        vault: [u8; 32],
+        pass: &str,
+    ) -> (
+        crate::signer::backup::BackupMaterial,
+        BTreeMap<frost::Identifier, frost::keys::SecretShare>,
+        frost::keys::PublicKeyPackage,
+    ) {
+        use crate::signer::backup::{self, BackupMaterial};
+        let vault_hex = hex::encode(vault);
+        let (shares, public) = frost::keys::generate_with_dealer(
+            3,
+            2,
+            frost::keys::IdentifierList::Default,
+            &mut rand_core::OsRng,
+        )
+        .unwrap();
+        let id1 = frost::Identifier::try_from(1u16).unwrap();
+        let kp1 = frost::keys::KeyPackage::try_from(shares[&id1].clone()).unwrap();
+        // The DKG roster names every member's relay identity, which signing needs.
+        let ids: Vec<_> = (1..=3).map(Identity::new).collect();
+        let roster = serde_json::to_vec(&json!({
+            "vault": vault_hex, "threshold": 2, "setup_version": 2, "network": "regtest",
+            "members": ids.iter().map(|i| {
+                let p = i.public();
+                json!({"id": p.id, "signing": hex::encode(p.signing), "encryption": hex::encode(p.encryption)})
+            }).collect::<Vec<_>>(),
+        }))
+        .unwrap();
+        let material = BackupMaterial {
+            member_id: 1,
+            threshold: 2,
+            members: 3,
+            network: Network::Regtest,
+            vault_id: vault,
+            label: "recovery vault".into(),
+            group_sk: [42u8; 32],
+            key_package: Zeroizing::new(kp1.serialize().unwrap()),
+            public_package: public.serialize().unwrap(),
+            backup_epoch: 0,
+            identity: Zeroizing::new(ids[0].to_secret_bytes().to_vec()),
+            roster_fingerprint: crate::member_state::Roster::from_bytes(&roster).unwrap().fingerprint(),
+            roster,
+            birth_height: None,
+        };
+        MemberDir::create(&signer_dir(data, &vault_hex).unwrap(), "")
+            .unwrap()
+            .write_sealed("backup.sealed", &backup::create(&material, pass).unwrap().0, pass)
+            .unwrap();
+        // Only its presence marks the vault active for the backup sweep.
+        dir(data, &vault_hex).unwrap().write_sealed("vault.sealed", b"{}", pass).unwrap();
+        (material, shares, public)
+    }
+
+    /// A vault that became active before the member set up recovery still gets its recovery
+    /// backup: right after `POST /api/recovery-setup`, and at the next unlock if it is missing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recovery_backup_is_sealed_for_an_already_active_vault_at_setup_and_unlock() {
+        use crate::signer::recovery::RecoveryKey;
+        let data = std::env::temp_dir().join(format!("loki-recovery-late-{}", Uuid::new_v4()));
+        let vault = [7u8; 32];
+        let vault_hex = hex::encode(vault);
+        let pass = "late pass";
+        crate::profile::create(&data, pass, "Late").unwrap();
+        dealer_vault(&data, vault, pass);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let config = crate::host::config_from_args(&[
+            "--data".into(), data.to_str().unwrap().into(), "--port".into(), "3601".into(),
+        ]).unwrap();
+        let token = config.token.clone();
+        let st: Shared = std::sync::Arc::new(AppState::new(config));
+        tokio::spawn(async move { axum::serve(listener, crate::host::routes::router(st)).await });
+        let client = reqwest::Client::new();
+        let call = |method: reqwest::Method, path: &str, body: Value| {
+            client.request(method, format!("{base}{path}")).header("x-loki-token", &token).json(&body).send()
+        };
+        let status = || async {
+            call(reqwest::Method::GET, &format!("/api/recovery-status?vault={vault_hex}"), json!({}))
+                .await.unwrap().json::<Value>().await.unwrap()
+        };
+        let backup = signer_dir(&data, &vault_hex).unwrap().join("recovery.backup");
+
+        assert!(call(reqwest::Method::POST, "/api/unlock", json!({"passphrase": pass})).await.unwrap().status().is_success());
+        assert_eq!(status().await, json!({"recovery_identity": false, "recovery_backup": false}));
+        let words = call(reqwest::Method::POST, "/api/recovery-setup", json!({})).await.unwrap()
+            .json::<Value>().await.unwrap()["words"].as_str().unwrap().to_owned();
+        assert_eq!(status().await, json!({"recovery_identity": true, "recovery_backup": true}));
+        let key = RecoveryKey::from_words(&words).unwrap();
+        let opened = crate::signer::backup::verify_recovery(&BackupArtifact(std::fs::read(&backup).unwrap()), &key, &vault).unwrap();
+        assert_eq!(opened.member_id, 1);
+
+        // Recovery set up while the backup could not be sealed: the next unlock seals it.
+        std::fs::remove_file(&backup).unwrap();
+        assert_eq!(status().await["recovery_backup"], false);
+        call(reqwest::Method::POST, "/api/lock", json!({})).await.unwrap();
+        assert!(call(reqwest::Method::POST, "/api/unlock", json!({"passphrase": pass})).await.unwrap().status().is_success());
+        assert_eq!(status().await, json!({"recovery_identity": true, "recovery_backup": true}));
+        crate::signer::backup::verify_recovery(&BackupArtifact(std::fs::read(&backup).unwrap()), &key, &vault).unwrap();
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
 }
 
 // ---- self-custody helpers ported from the speedmaster host (device pairing + recovery restore) ----
@@ -1560,6 +1661,9 @@ pub(super) fn restore_vault_from_backup(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
         Err(e) => return Err(e.to_string()),
     };
+    // The words that open this backup become the profile's recovery identity, so a later start
+    // or recovery setup never mints a second, unrelated set the backup is not sealed to.
+    let write_recovery = super::recovery::check_recovery(data, &key)?;
     let mut ceremony = Ceremony {
         vault: vault.to_owned(),
         name: material.label.clone(),
@@ -1607,6 +1711,9 @@ pub(super) fn restore_vault_from_backup(
     if write_identity {
         root.write_sealed("identity.sealed", &material.identity, pass)
             .map_err(|e| e.to_string())?;
+    }
+    if write_recovery {
+        super::recovery::adopt_recovery(data, &key)?;
     }
     // Keep the backup on the new device so it can be exported again.
     if !local.exists() {
