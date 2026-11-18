@@ -801,12 +801,17 @@ impl<SE: SecureElement> LocalSigner<SE> {
         self.vault_fvk.as_ref().ok_or(SignerError::NoShare)
     }
 
-    /// Unseal the member's `KeyPackage` into memory. Caller drops it promptly.
+    /// Unseal the member's `KeyPackage` into memory (with the Apple element, one Secure
+    /// Enclave unwrap). The unwrapped bytes are a `Zeroizing` buffer wiped when this returns;
+    /// the returned `KeyPackage` wipes its signing share on drop (`ZeroizeOnDrop`), so
+    /// callers drop it as soon as its one use is done. It is never stored on the signer.
     fn open_key(&self) -> Result<frost::keys::KeyPackage, SignerError> {
         let sealed = self.sealed_share.as_ref().ok_or(SignerError::NoShare)?;
         let plain = sealed.open(&self.se).map_err(SignerError::Other)?;
-        frost::keys::KeyPackage::deserialize(&plain)
-            .map_err(|e| SignerError::Other(format!("key package: {e}")))
+        let key = frost::keys::KeyPackage::deserialize(&plain)
+            .map_err(|e| SignerError::Other(format!("key package: {e}")));
+        drop(plain);
+        key
     }
 
     fn nonce_id(&self, cand: &CandidateRef) -> String {
@@ -1458,11 +1463,12 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
             return Err(SignerError::NoSession);
         }
         self.require_ready()?;
-        let kp = self.open_key()?;
         let id = self.nonce_id(cand);
-        self.nonces
-            .commit(&id, &self.se, kp.signing_share())
-            .map_err(|e| SignerError::Other(e.to_string()))
+        // Round 1 needs the share to derive the nonce; the key lives only for this call.
+        let kp = self.open_key()?;
+        let commitment = self.nonces.commit(&id, &self.se, kp.signing_share());
+        drop(kp);
+        commitment.map_err(|e| SignerError::Other(e.to_string()))
     }
 
     fn sign_approve(
@@ -1504,16 +1510,17 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
         let seed: [u8; 32] = randomizer
             .try_into()
             .map_err(|_| SignerError::Other("randomizer seed is not 32 bytes".into()))?;
-        let kp = self.open_key()?;
         let id = self.nonce_id(cand);
-        self.nonces
-            .sign_and_burn(&id, &self.se, pkg, &kp, &seed, &|| false)
-            .map_err(|e| match e {
-                crate::signer::nonce::NonceError::Reuse => {
-                    SignerError::Other(crate::signer::nonce::NonceError::Reuse.to_string())
-                }
-                other => SignerError::Other(other.to_string()),
-            })
+        let kp = self.open_key()?;
+        let share = self.nonces.sign_and_burn(&id, &self.se, pkg, &kp, &seed, &|| false);
+        // The key is wiped here, before the partial leaves this call.
+        drop(kp);
+        share.map_err(|e| match e {
+            crate::signer::nonce::NonceError::Reuse => {
+                SignerError::Other(crate::signer::nonce::NonceError::Reuse.to_string())
+            }
+            other => SignerError::Other(other.to_string()),
+        })
     }
 
     fn rendered_payment(
