@@ -58,6 +58,9 @@ jobs:
       - name: Test loki-signer-core
         working-directory: poc
         run: cargo +1.95.0 test --locked -p loki-signer-core
+      # The native test artifacts fill the runner disk; the wasm link needs the room.
+      - name: Free native test artifacts
+        run: rm -rf poc/target/debug
       - name: Build wasm signer
         working-directory: poc
         env:
