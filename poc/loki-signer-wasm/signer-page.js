@@ -167,27 +167,31 @@ async function persist() {
   return persisted;
 }
 
-async function create({ name, method }) {
-  name = String(name || "You");
-  let result;
+// Ask for a new custody secret (a passphrase typed twice, or a new passkey) and pass it to
+// `submit`, which seals the signer under it.
+function newCustody(name, method, submit) {
   if (method === "passphrase") {
     const a = passField("Passphrase", "new-password"), b = passField("Repeat passphrase", "new-password");
-    result = await prompt("Protect your signer with a passphrase", [
+    return prompt("Protect your signer with a passphrase", [
       el("p", { textContent: `At least ${MIN_PASSPHRASE} characters. It seals your share in this browser; it is not sent anywhere.` }),
       el("label", { textContent: "Passphrase" }, a), el("label", { textContent: "Repeat" }, b),
     ], [cancelButton, { label: "Create signer", run: async () => {
       if (a.value.length < MIN_PASSPHRASE) throw new SignerError(`Use at least ${MIN_PASSPHRASE} characters.`, 400);
       if (a.value !== b.value) throw new SignerError("The two passphrases differ.", 400);
-      return call({ op: "create", method, name, passphrase: a.value });
-    } }]);
-  } else {
-    result = await prompt("Create a passkey for your signer", [
-      el("p", { textContent: `Your share is sealed under a passkey for ${rpId}. Touch/Face ID, a security key or your phone unlocks it.` }),
-    ], [cancelButton, { label: "Create passkey", run: async () => {
-      const id = await createPasskey(name, method === "platform" ? "platform" : "cross-platform");
-      return call({ op: "create", method, name, prfSecret: await prfSecret(id) });
+      return submit({ passphrase: a.value });
     } }]);
   }
+  return prompt("Create a passkey for your signer", [
+    el("p", { textContent: `Your share is sealed under a passkey for ${rpId}. Touch/Face ID, a security key or your phone unlocks it.` }),
+  ], [cancelButton, { label: "Create passkey", run: async () => {
+    const id = await createPasskey(name, method === "platform" ? "platform" : "cross-platform");
+    return submit({ prfSecret: await prfSecret(id) });
+  } }]);
+}
+
+async function create({ name, method }) {
+  name = String(name || "You");
+  const result = await newCustody(name, method, (secret) => call({ op: "create", method, name, ...secret }));
   current = { profile: result, se: method === "passphrase" ? "software" : "passkey" };
   await persist();
   return { profile: result, persisted };
@@ -215,6 +219,80 @@ function reauthField() {
 }
 async function reauthValue(field) {
   return field ? { method: "passphrase", passphrase: field.value } : { method: "platform", prfSecret: await prfSecret() };
+}
+
+// ─── recovery: 24 words shown once, backups sealed to them ──────────────────
+// The words exist only on this page, once; the signer keeps only their public keys. Each
+// vault's recovery backup is ciphertext only the words open, so it is safe to download.
+async function recoverySetup() {
+  if (!current) throw new SignerError("Unlock your signer", 401);
+  const words = (await call({ op: "recovery-begin" })).split(" ");
+  await prompt("Write down your 24 recovery words", [
+    el("p", { textContent: "They are shown only now. With them and a vault's recovery backup file, you can restore your signer in a new browser. Anyone who has both can sign as you." }),
+    el("ol", { className: "mono" }, ...words.map((w) => el("li", { textContent: w }))),
+  ], [cancelButton, { label: "I wrote them down", value: true }]);
+  const chosen = new Set();
+  while (chosen.size < 3) chosen.add(random(1)[0] % 24);
+  const picks = [...chosen].sort((a, b) => a - b);
+  const fields = picks.map(() => el("input", { autocomplete: "off", spellcheck: false }));
+  await prompt("Confirm your recovery words", [
+    ...picks.map((i, k) => el("label", { textContent: `Word ${i + 1}` }, fields[k])),
+  ], [cancelButton, { label: "Confirm", run: async () => {
+    if (picks.some((i, k) => fields[k].value.trim().toLowerCase() !== words[i])) {
+      throw new SignerError("Those words do not match. Check what you wrote down.", 400);
+    }
+    return call({ op: "recovery-confirm" });
+  } }]);
+  return { recovery: true };
+}
+
+// Download a vault's recovery backup on this origin. The wallet gets the same opaque bytes.
+async function recoveryExport({ vault }) {
+  const blob = await call({ op: "recovery-backup", vaultHex: vault });
+  await prompt("Save this vault's recovery backup", [
+    el("p", { textContent: "Keep the file anywhere you like. It opens only with your 24 recovery words." }),
+  ], [cancelButton, { label: "Download backup", run: () => {
+    const a = el("a", { href: URL.createObjectURL(new Blob([blob])), download: `loki-recovery-${vault}.bin` });
+    a.click();
+    URL.revokeObjectURL(a.href);
+  } }]);
+  return { backup: toHex(blob) };
+}
+
+// Restore a vault member into this (fresh) browser from its words and backup file.
+async function restore({ vault, name, method }) {
+  const words = el("textarea", { autocomplete: "off", spellcheck: false, rows: 4 });
+  const file = el("input", { type: "file" });
+  const input = await prompt("Restore your signer", [
+    el("label", { textContent: "Your 24 recovery words" }, words),
+    el("label", { textContent: "The vault's recovery backup file" }, file),
+  ], [cancelButton, { label: "Continue", run: async () => {
+    const f = file.files[0];
+    const vaultHex = vault || f?.name.match(/[0-9a-f]{64}/)?.[0];
+    if (!f || !vaultHex) throw new SignerError("Choose the loki-recovery-<vault>.bin file you saved.", 400);
+    return { vaultHex, words: words.value.trim().toLowerCase().split(/\s+/).join(" "), blob: new Uint8Array(await f.arrayBuffer()) };
+  } }]);
+  name = String(name || "You");
+  const result = await newCustody(name, method, (secret) => call({ op: "restore", method, name, ...input, ...secret }));
+  current = { profile: result.profile, se: method === "passphrase" ? "software" : "passkey" };
+  await persist();
+  return { ...result, persisted };
+}
+
+// Delete this browser's signer, only after the member confirms every vault's recovery
+// backup is exported and the words are kept: without them the shares here are gone.
+async function remove() {
+  const kept = el("input", { type: "checkbox" });
+  await prompt("Remove the signer from this browser?", [
+    el("p", { textContent: "This deletes your sealed identity and every vault share in this browser. You can sign again only by restoring from your 24 recovery words and each vault's recovery backup file." }),
+    el("label", {}, kept, " I exported every vault's recovery backup and I have my 24 words"),
+  ], [cancelButton, { label: "Remove signer", run: async () => {
+    if (!kept.checked) throw new SignerError("Export your recovery backups first.", 400);
+    return call({ op: "remove" });
+  } }]);
+  current = null;
+  enrollment = null;
+  return null;
 }
 
 // ─── Worker asks: on-device decisions ────────────────────────────────────────
@@ -319,17 +397,25 @@ const ops = {
   lock: async () => { if (worker) await call({ op: "lock" }); current = null; enrollment = null; return null; },
   "enroll-begin": enrollBegin,
   "enroll-sign": enrollSign,
-  join: (p) => call({ op: "join", join: relay(p) }),
+  // A vault backup must also seal to recovery words, so set them up before the first join.
+  join: async (p) => {
+    if (!await call({ op: "has-recovery" })) await recoverySetup();
+    return call({ op: "join", join: relay(p) });
+  },
   "payment-review": (p) => call({ op: "payment-review", payment: relay(p) }),
   "payment-approve": (p) => call({ op: "payment-approve", payment: relay(p) }),
   pending: (p) => call({ op: "pending", payment: relay(p) }),
   vaults: () => call({ op: "vaults" }),
   address: (p) => call({ op: "address", payment: p }),
+  "recovery-setup": recoverySetup,
+  "recovery-export": recoveryExport,
+  restore,
+  remove,
 };
-const UNLOCKED = new Set(["join", "payment-review", "payment-approve", "pending", "vaults", "address"]);
+const UNLOCKED = new Set(["join", "payment-review", "payment-approve", "pending", "vaults", "address", "recovery-setup", "recovery-export"]);
 // Ops that may show a prompt run one at a time; the read-only ones answer alongside them
 // (the Worker refuses them with "busy" while a join or payment holds the vault).
-const PROMPTING = new Set(["create", "unlock", "join", "payment-approve"]);
+const PROMPTING = new Set(["create", "unlock", "join", "payment-approve", "recovery-setup", "recovery-export", "restore", "remove"]);
 
 let queue = Promise.resolve(); // one op (and so one prompt) at a time
 addEventListener("message", (e) => {

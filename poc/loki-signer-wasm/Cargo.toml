@@ -35,3 +35,5 @@ cc = "1"
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
 x25519-dalek = "2.0"
+# Dealer keys for the recovery-backup round-trip test; the same rand_core the core uses.
+rand_core = { version = "0.6", features = ["getrandom"] }
