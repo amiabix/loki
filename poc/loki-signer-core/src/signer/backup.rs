@@ -500,6 +500,41 @@ mod tests {
     }
 
     #[test]
+    fn restored_signer_adopts_only_its_backup_roster() {
+        use crate::setup_transport::Identity;
+        let (mut material, _public) = fixture();
+        let ids: Vec<Identity> = (1..=3).map(Identity::new).collect();
+        let doc = |vault: [u8; 32]| {
+            serde_json::to_vec(&serde_json::json!({
+                "vault": hex::encode(vault), "threshold": 2, "setup_version": 2,
+                "members": ids.iter().map(|i| serde_json::json!({
+                    "id": i.public().id,
+                    "signing": hex::encode(i.public().signing),
+                    "encryption": hex::encode(i.public().encryption),
+                })).collect::<Vec<_>>(),
+            }))
+            .unwrap()
+        };
+        let roster = doc(material.vault_id);
+        material.identity = Zeroizing::new(ids[0].to_secret_bytes().to_vec());
+        material.roster_fingerprint = crate::member_state::Roster::from_bytes(&roster).unwrap().fingerprint();
+        material.roster = roster.clone();
+        let art = create(&material, "pw").unwrap();
+        let restore_one = || {
+            restore(&art, "pw", &material.vault_id, SoftwareSecureElement::generate(), tempdir("adopt"), Box::new(|_v| true))
+                .unwrap()
+        };
+
+        let mut other = restore_one();
+        assert!(other.adopt_restored_roster(&doc([8u8; 32])).is_err(), "a roster for another vault");
+        let mut signer = restore_one();
+        assert!(signer.confirmed_roster().is_none());
+        signer.adopt_restored_roster(&roster).unwrap();
+        assert_eq!(signer.confirmed_roster().unwrap().members.len(), 3);
+        assert!(signer.adopt_restored_roster(&roster).is_err(), "adopted once");
+    }
+
+    #[test]
     fn artifact_is_ciphertext_and_verifies_only_with_the_passphrase() {
         let (material, _public) = fixture();
         let art = create(&material, "correct horse").unwrap();

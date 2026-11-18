@@ -13,7 +13,8 @@
 //! `createSyncAccessHandle` gives synchronous file I/O). See the Phase 3 report.
 
 use loki_signer_core::setup_transport::{Identity, PublicIdentity};
-use loki_signer_core::signer::backup::BackupArtifact;
+use loki_signer_core::signer::backup::{self, BackupArtifact, BackupMaterial};
+use loki_signer_core::signer::recovery::RecoveryKey;
 use loki_signer_core::member_state::Roster;
 use loki_signer_core::network::VaultNetwork;
 use loki_signer_core::signer::local::{
@@ -191,6 +192,9 @@ pub const IDENTITY_PATH: &str = "loki/device/identity.sealed";
 pub const PROFILE_PATH: &str = "loki/device/profile.json";
 /// Argon2id salt for the passphrase KEK (passphrase custody only).
 pub const SALT_PATH: &str = "loki/device/kek.salt";
+/// The recovery identity's PUBLIC keys, 64 bytes like native `recovery.pub`: X25519 backup
+/// encryption (32) then Ed25519 device authorization (32). The 24 words are never written.
+pub const RECOVERY_PUB_PATH: &str = "loki/device/recovery.pub";
 
 /// The device file set the Worker pre-opens, as a JSON array, so the pre-open protocol has a
 /// single source of truth shared with `signer-worker.js` instead of drifting constants.
@@ -200,6 +204,7 @@ pub fn device_paths() -> String {
         "identity": IDENTITY_PATH,
         "profile": PROFILE_PATH,
         "salt": SALT_PATH,
+        "recovery": RECOVERY_PUB_PATH,
     })
     .to_string()
 }
@@ -258,6 +263,9 @@ pub struct Signer {
     /// The sighash the member confirmed on the signer page for the next `signApprove`. The
     /// core's approval prompt takes it (one use) and approves only that exact sighash.
     approved: Arc<Mutex<Option<[u8; 32]>>>,
+    /// Recovery public keys minted by `recoveryBegin`, written only once the member has
+    /// re-typed some of the words (`recoveryConfirm`).
+    pending_recovery: Option<Vec<u8>>,
 }
 
 impl Default for Signer {
@@ -267,6 +275,7 @@ impl Default for Signer {
             kek: None,
             vault: None,
             approved: Arc::new(Mutex::new(None)),
+            pending_recovery: None,
         }
     }
 }
@@ -323,12 +332,83 @@ impl Signer {
         self.identity = None;
         self.kek = None;
         self.vault = None;
+        self.pending_recovery = None;
     }
 
     /// Whether an identity is currently held unlocked in memory.
     #[wasm_bindgen(js_name = isUnlocked)]
     pub fn is_unlocked(&self) -> bool {
         self.identity.is_some()
+    }
+
+    // ─── Recovery identity + independent vault backup ─────────────────────────
+    //
+    // Mirrors the native flow (poc/src/host/recovery.rs): 24 words shown ONCE on the signer
+    // page, only their public keys persisted. Every vault backup is also HPKE-sealed to the
+    // recovery key (`recovery.backup`), which only the words open, so it is independent of
+    // this browser. Joining a vault requires a recovery identity first.
+
+    /// Whether this browser's signer has a recovery identity. Pre-open `recovery` for read.
+    #[wasm_bindgen(js_name = hasRecovery)]
+    pub fn has_recovery(&self) -> bool {
+        opfs_exists(RECOVERY_PUB_PATH)
+    }
+
+    /// Mint the 24 recovery words. Returns them for the signer page to show once; nothing is
+    /// written until [`recovery_confirm`](Self::recovery_confirm). Refuses if one exists.
+    #[wasm_bindgen(js_name = recoveryBegin)]
+    pub fn recovery_begin(&mut self) -> Result<String, JsError> {
+        if self.identity.is_none() {
+            return Err(JsError::new("unlock the signer first"));
+        }
+        if opfs_exists(RECOVERY_PUB_PATH) {
+            return Err(JsError::new("this signer already has recovery words; they cannot be shown again"));
+        }
+        let (words, key) = RecoveryKey::generate().map_err(|e| JsError::new(&e))?;
+        self.pending_recovery = Some(recovery_public_keys(&key));
+        Ok(words.to_string())
+    }
+
+    /// Persist the public keys of the words `recoveryBegin` showed, after the member re-typed
+    /// some of them. Pre-open `recovery` for write.
+    #[wasm_bindgen(js_name = recoveryConfirm)]
+    pub fn recovery_confirm(&mut self) -> Result<(), JsError> {
+        let pubkeys = self
+            .pending_recovery
+            .take()
+            .ok_or_else(|| JsError::new("no recovery words are waiting to be confirmed"))?;
+        opfs_put(RECOVERY_PUB_PATH, &pubkeys, true).map_err(|e| JsError::new(&e))
+    }
+
+    /// This vault's recovery backup (opaque HPKE ciphertext, safe to keep anywhere), for the
+    /// member to export. Pre-open `vaultPaths(vaultHex)` first.
+    #[wasm_bindgen(js_name = recoveryBackup)]
+    pub fn recovery_backup(&self, vault_hex: &str) -> Result<Vec<u8>, JsError> {
+        opfs_get(&format!("{}/recovery.backup", vault_dir(vault_hex)))
+            .map_err(|e| JsError::new(&e))?
+            .ok_or_else(|| JsError::new("this browser holds no recovery backup for that vault"))
+    }
+
+    /// Restore a vault member into a FRESH browser from its 24 words and exported recovery
+    /// backup: the backup's member identity becomes this browser's signer, sealed under the
+    /// chosen custody (as `createSigner`), and the vault reopens ready to sign. Returns
+    /// `{profile, vault}`: the profile and the `vaultOpen` JSON. Pre-open the device paths
+    /// and `vaultPaths(vaultHex)` for write.
+    #[wasm_bindgen(js_name = restoreSigner)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore_signer(
+        &mut self,
+        method: &str,
+        name: &str,
+        passphrase: Option<String>,
+        prf_secret: Option<Vec<u8>>,
+        vault_hex: &str,
+        words: String,
+        blob: &[u8],
+    ) -> Result<String, JsError> {
+        let words = Zeroizing::new(words);
+        self.restore_impl(method, name, passphrase, prf_secret, vault_hex, &words, blob)
+            .map_err(|e| JsError::new(&e))
     }
 
     // ─── Phase B: join-a-vault + DKG ─────────────────────────────────────────
@@ -653,16 +733,23 @@ pub fn vault_paths(vault_hex: &str) -> String {
         format!("{dir}/setup.sealed"),
         format!("{dir}/share.sealed"),
         format!("{dir}/backup.sealed"),
+        format!("{dir}/recovery.backup"),
     ])
     .to_string()
 }
 
 /// OPFS-backed [`BackupDevice`]: the in-ceremony backup `LocalSigner::backup` saves and
-/// re-loads to prove it persisted. It is sealed under a KEK-derived passphrase; the separate
-/// HPKE-to-recovery-words backup (lost-device restore) is a later phase.
+/// re-loads to prove it persisted. `backup.sealed` is sealed under a KEK-derived passphrase,
+/// so it lives and dies with this browser; `save` therefore also seals the same material to
+/// the member's recovery words (`recovery.backup`) and fails without them, so the core never
+/// signs a backup receipt for a member with no independent backup.
 struct OpfsBackup {
     path: String,
+    recovery_path: String,
     pass: Zeroizing<String>,
+    vault_id: [u8; 32],
+    /// The recovery X25519 public key; `None` when this signer has no recovery identity.
+    recovery: Option<[u8; 32]>,
 }
 
 impl BackupDevice for OpfsBackup {
@@ -670,10 +757,20 @@ impl BackupDevice for OpfsBackup {
         Some(self.pass.clone())
     }
     fn save(&mut self, artifact: &BackupArtifact) -> Result<(), String> {
-        if opfs_exists(&self.path) {
-            return Ok(());
+        let recovery = self
+            .recovery
+            .ok_or("set up recovery words first: this vault would have no backup outside this browser")?;
+        let sealed = seal_to_recovery(artifact, &self.pass, &self.vault_id, &recovery)?;
+        if !opfs_exists(&self.path) {
+            opfs_put(&self.path, &artifact.0, true)?;
         }
-        opfs_put(&self.path, &artifact.0, true)
+        // Replace, then read back: the stored recovery backup must be exactly what was sealed.
+        // Opening it needs the words, which this browser never keeps.
+        opfs_put(&self.recovery_path, &sealed.0, false)?;
+        if opfs_get(&self.recovery_path)?.as_deref() != Some(&sealed.0[..]) {
+            return Err("the recovery backup did not persist".into());
+        }
+        Ok(())
     }
     fn load(&mut self) -> Result<BackupArtifact, String> {
         Ok(BackupArtifact(
@@ -686,10 +783,13 @@ impl BackupDevice for OpfsBackup {
 /// signer page before the synchronous core call (a sync callback cannot wait for a click), so
 /// each prompt carries that answer and checks it against what the core actually shows:
 /// `roster_code` is the code the member confirmed (None: no roster may be confirmed), and
-/// `approved` holds the one sighash the member confirmed for the next signature.
+/// `approved` holds the one sighash the member confirmed for the next signature. `recovery`
+/// is the recovery public key the vault backup is also sealed to (`None`: backup refuses).
 fn browser_prompts(
     dir: &str,
     kek: &[u8; 32],
+    vault_id: [u8; 32],
+    recovery: Option<[u8; 32]>,
     roster_code: Option<String>,
     approved: Arc<Mutex<Option<[u8; 32]>>>,
 ) -> DevicePrompts {
@@ -703,7 +803,10 @@ fn browser_prompts(
         roster_deadline: Duration::from_secs(60),
         backup: Box::new(OpfsBackup {
             path: format!("{dir}/backup.sealed"),
+            recovery_path: format!("{dir}/recovery.backup"),
             pass: Zeroizing::new(hex::encode(kek)),
+            vault_id,
+            recovery,
         }),
         approval: Box::new(move |request| {
             approved.lock().map(|mut slot| slot.take() == Some(request.sighash)).unwrap_or(false)
@@ -810,6 +913,40 @@ fn restamp(identity: &Identity, slot: u16) -> Result<Identity, String> {
     let mut secret = Zeroizing::new(identity.to_secret_bytes());
     secret[..2].copy_from_slice(&slot.to_be_bytes());
     Identity::from_secret_bytes(&secret[..])
+}
+
+/// The `recovery.pub` layout (native host `public_keys`): X25519 then Ed25519 public key.
+fn recovery_public_keys(key: &RecoveryKey) -> Vec<u8> {
+    [key.public_bytes(), key.signing_public()].concat()
+}
+
+/// The recovery X25519 public key, if this signer has a recovery identity.
+fn read_recovery_pub() -> Result<Option<[u8; 32]>, String> {
+    Ok(opfs_get(RECOVERY_PUB_PATH)?.and_then(|b| b.get(..32)?.try_into().ok()))
+}
+
+/// Re-seal a KEK-sealed vault backup to the recovery public key, as the native host's
+/// `seal_vault_backup` does: reopen it for its material, then HPKE-seal that to the words.
+fn seal_to_recovery(
+    artifact: &BackupArtifact,
+    pass: &str,
+    vault_id: &[u8; 32],
+    recovery_pub: &[u8; 32],
+) -> Result<BackupArtifact, String> {
+    let material = backup::verify(artifact, pass, vault_id)?;
+    backup::create_to_recovery(&material, recovery_pub)
+}
+
+/// Open a recovery backup with the words: it must be for this vault, carry the identity and
+/// roster a signing member needs (native `restore_vault_from_backup`), and be for a network
+/// browser signers serve.
+fn restored_material(key: &RecoveryKey, blob: &[u8], vault_id: &[u8; 32]) -> Result<BackupMaterial, String> {
+    let material = backup::verify_recovery(&BackupArtifact(blob.to_vec()), key, vault_id)?;
+    if material.roster.is_empty() || material.identity.is_empty() {
+        return Err("this backup has no roster, so it cannot rebuild a member that signs".into());
+    }
+    browser_network(material.network)?;
+    Ok(material)
 }
 
 fn vault_ref_json(v: &VaultRef) -> String {
@@ -989,16 +1126,27 @@ impl Signer {
         let kek = self.kek.clone().ok_or("unlock the signer first")?;
         let me = self.identity.as_ref().ok_or("unlock the signer first")?.public().encryption;
         let dir = vault_dir(vault_hex);
-        if !opfs_exists(&format!("{dir}/signer.meta")) {
+        let vault_id = hex32(vault_hex)?;
+        let prompts = browser_prompts(&dir, &kek, vault_id, None, None, self.approved.clone());
+        let se = SoftwareSecureElement::from_kek(*kek);
+        let mut signer = if opfs_exists(&format!("{dir}/signer.meta")) {
+            LocalSigner::open(std::path::Path::new(&dir), se, "vault".into(), prompts)
+                .map_err(|e| e.to_string())?
+        } else if let Some(sealed) = opfs_get(&format!("{dir}/backup.sealed"))? {
+            // A member restored from its recovery words (`restoreSigner`): no DKG files, only
+            // the backup, re-sealed under this browser's KEK. Rebuilt on every open, with its
+            // nonces in the same `nonces/` dir at the restore epoch.
+            let artifact = BackupArtifact(sealed);
+            let pass = hex::encode(*kek);
+            let roster = backup::verify(&artifact, &pass, &vault_id)?.roster;
+            let nonces = std::path::PathBuf::from(format!("{dir}/nonces"));
+            let mut signer = backup::restore(&artifact, &pass, &vault_id, se, nonces, prompts.approval)
+                .map_err(|e| e.to_string())?;
+            signer.adopt_restored_roster(&roster).map_err(|e| e.to_string())?;
+            signer
+        } else {
             return Err("this browser holds no signer for that vault".into());
-        }
-        let mut signer = LocalSigner::open(
-            std::path::Path::new(&dir),
-            SoftwareSecureElement::from_kek(*kek),
-            "vault".into(),
-            browser_prompts(&dir, &kek, None, self.approved.clone()),
-        )
-        .map_err(|e| e.to_string())?;
+        };
         let net = browser_network(signer.network())?;
         let session = signer
             .connect("https://coordinator", net, b"browser vault")
@@ -1057,10 +1205,18 @@ impl Signer {
             .try_into()
             .map_err(|_| "vault id must be 32 bytes of hex".to_string())?;
         let net = parse_network(network)?;
+        let recovery = read_recovery_pub()?.ok_or("set up your recovery words before joining a vault")?;
         let stamped = restamp(identity, slot)?;
         let dir = vault_dir(vault_hex);
         let se = SoftwareSecureElement::from_kek(*kek);
-        let prompts = browser_prompts(&dir, &kek, Some(confirmed_code.to_string()), self.approved.clone());
+        let prompts = browser_prompts(
+            &dir,
+            &kek,
+            vault_id,
+            Some(recovery),
+            Some(confirmed_code.to_string()),
+            self.approved.clone(),
+        );
         let path = std::path::Path::new(&dir);
         let mut signer = if opfs_exists(&format!("{dir}/signer.meta")) {
             LocalSigner::open(path, se, label.to_string(), prompts)
@@ -1121,6 +1277,44 @@ impl Signer {
         Ok(out)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn restore_impl(
+        &mut self,
+        method: &str,
+        name: &str,
+        passphrase: Option<String>,
+        prf_secret: Option<Vec<u8>>,
+        vault_hex: &str,
+        words: &str,
+        blob: &[u8],
+    ) -> Result<String, String> {
+        if opfs_exists(IDENTITY_PATH) {
+            return Err("restore into a fresh browser: this one already holds a signer".into());
+        }
+        let vault_id = hex32(vault_hex)?;
+        let key = RecoveryKey::from_words(words)?;
+        let material = restored_material(&key, blob, &vault_id)?;
+        let identity = Identity::from_secret_bytes(&material.identity)?;
+        let kek = custody_kek(method, passphrase, prf_secret, true)?;
+        let se = SoftwareSecureElement::from_kek(*kek);
+        let dir = vault_dir(vault_hex);
+        // The backup re-sealed under this browser's KEK is what `vaultOpen` rebuilds from; the
+        // words stay this signer's recovery identity, so later backups seal to the same words.
+        let local = backup::create(&material, &hex::encode(*kek))?;
+        opfs_put(&format!("{dir}/backup.sealed"), &local.0, false)?;
+        opfs_put(&format!("{dir}/recovery.backup"), blob, false)?;
+        opfs_put(RECOVERY_PUB_PATH, &recovery_public_keys(&key), false)?;
+        opfs_put(PROFILE_PATH, profile_json(&identity, name).as_bytes(), false)?;
+        // The identity last: until it exists this browser still counts as fresh.
+        let secret = Zeroizing::new(identity.to_secret_bytes());
+        opfs_put(IDENTITY_PATH, &SealedShare::seal(&se, 0, &secret[..])?.to_bytes(), true)?;
+        let profile = profile_json(&identity, name);
+        self.kek = Some(kek);
+        self.identity = Some(identity);
+        let vault = self.vault_open_impl(vault_hex)?;
+        Ok(format!(r#"{{"profile":{profile},"vault":{vault}}}"#))
+    }
+
     fn unlock_impl(
         &mut self,
         method: &str,
@@ -1170,7 +1364,7 @@ mod tests {
             assert!(parse_network(other).is_err(), "{other:?} must be refused");
         }
         // The connect prompt refuses through the same gate.
-        let mut prompts = browser_prompts("loki/vaults/x/signer", &[0u8; 32], None, Arc::new(Mutex::new(None)));
+        let mut prompts = browser_prompts("loki/vaults/x/signer", &[0u8; 32], [1u8; 32], None, None, Arc::new(Mutex::new(None)));
         assert!((prompts.connect)("https://coordinator", Network::Testnet));
     }
 
@@ -1232,10 +1426,10 @@ mod tests {
     #[wasm_bindgen_test]
     fn prompts_answer_only_what_the_member_confirmed() {
         let approved = Arc::new(Mutex::new(None));
-        let mut prompts = browser_prompts("d", &[0u8; 32], Some("1111 2222".into()), approved.clone());
+        let mut prompts = browser_prompts("d", &[0u8; 32], [1u8; 32], None, Some("1111 2222".into()), approved.clone());
         assert_eq!((prompts.roster)("1111 2222"), RosterDecision::Match);
         assert_eq!((prompts.roster)("1111 2223"), RosterDecision::NoMatch);
-        let mut none = browser_prompts("d", &[0u8; 32], None, approved.clone());
+        let mut none = browser_prompts("d", &[0u8; 32], [1u8; 32], None, None, approved.clone());
         assert_eq!((none.roster)("1111 2222"), RosterDecision::Cancelled);
 
         let cand = CandidateRef { vault_id: [1; 32], payment_id: [2; 32], attempt_id: [2; 32] };
@@ -1259,6 +1453,79 @@ mod tests {
         assert!(signer.reauth_check("platform", None, Some(vec![3u8; 32])).is_ok());
         assert!(signer.reauth_check("platform", None, Some(vec![4u8; 32])).is_err());
         assert!(signer.reauth_check("platform", None, None).is_err());
+    }
+
+    /// Member 1's backup of a 2-of-3 dealer vault, with its identity and roster.
+    fn backup_material() -> BackupMaterial {
+        use frost::keys::{generate_with_dealer, IdentifierList, KeyPackage};
+        let (shares, public) = generate_with_dealer(3, 2, IdentifierList::Default, &mut rand_core::OsRng).unwrap();
+        let ids: Vec<Identity> = (1..=3).map(Identity::new).collect();
+        let vault_id = [7u8; 32];
+        let roster = serde_json::to_vec(&serde_json::json!({
+            "vault": hex::encode(vault_id), "threshold": 2, "setup_version": 2,
+            "members": ids.iter().map(|i| serde_json::json!({
+                "id": i.public().id,
+                "signing": hex::encode(i.public().signing),
+                "encryption": hex::encode(i.public().encryption),
+            })).collect::<Vec<_>>(),
+        }))
+        .unwrap();
+        let key = KeyPackage::try_from(shares[&frost::Identifier::try_from(1u16).unwrap()].clone()).unwrap();
+        BackupMaterial {
+            member_id: 1, threshold: 2, members: 3, network: Network::Regtest, vault_id,
+            label: "v".into(), group_sk: [42u8; 32],
+            key_package: Zeroizing::new(key.serialize().unwrap()),
+            public_package: public.serialize().unwrap(),
+            backup_epoch: 0,
+            identity: Zeroizing::new(ids[0].to_secret_bytes().to_vec()),
+            roster_fingerprint: Roster::from_bytes(&roster).unwrap().fingerprint(),
+            roster,
+            birth_height: None,
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn dkg_backup_seals_to_the_recovery_words_and_reopens_only_with_them() {
+        let material = backup_material();
+        let vault_id = material.vault_id;
+        let pass = hex::encode([5u8; 32]);
+        let local = backup::create(&material, &pass).unwrap();
+
+        let (words, key) = RecoveryKey::generate().unwrap();
+        let pubkeys = recovery_public_keys(&key);
+        assert_eq!(pubkeys.len(), 64);
+        let recovery_pub: [u8; 32] = pubkeys[..32].try_into().unwrap();
+        drop(key); // sealing needs only the public key
+        let sealed = seal_to_recovery(&local, &pass, &vault_id, &recovery_pub).unwrap();
+        assert!(seal_to_recovery(&local, "wrong", &vault_id, &recovery_pub).is_err());
+
+        // A fresh browser: the same words open it for this vault, and nothing else does.
+        let back = restored_material(&RecoveryKey::from_words(&words).unwrap(), &sealed.0, &vault_id).unwrap();
+        assert_eq!(&*back.key_package, &*material.key_package);
+        assert_eq!(back.roster, material.roster);
+        let (other, _) = RecoveryKey::generate().unwrap();
+        assert!(restored_material(&RecoveryKey::from_words(&other).unwrap(), &sealed.0, &vault_id).is_err());
+        assert!(restored_material(&RecoveryKey::from_words(&words).unwrap(), &sealed.0, &[8u8; 32]).is_err());
+
+        // A bare-share backup cannot rebuild a signing member.
+        let mut bare = backup_material();
+        let bare_id = bare.vault_id;
+        (bare.identity, bare.roster, bare.roster_fingerprint) = (Zeroizing::new(Vec::new()), Vec::new(), [0; 32]);
+        let bare_local = backup::create(&bare, &pass).unwrap();
+        let bare_sealed = seal_to_recovery(&bare_local, &pass, &bare_id, &recovery_pub).unwrap();
+        let err = restored_material(&RecoveryKey::from_words(&words).unwrap(), &bare_sealed.0, &bare_id).err().unwrap();
+        assert!(err.contains("no roster"), "{err}");
+    }
+
+    #[wasm_bindgen_test]
+    fn backup_without_recovery_words_refuses_before_any_write() {
+        // `LocalSigner::backup` signs its receipt only after `save` succeeds, so this refusal
+        // is what keeps a member with no independent backup from reporting itself backed up.
+        let material = backup_material();
+        let pass = hex::encode([5u8; 32]);
+        let mut prompts = browser_prompts("d", &[5u8; 32], material.vault_id, None, None, Arc::new(Mutex::new(None)));
+        let err = prompts.backup.save(&backup::create(&material, &pass).unwrap()).unwrap_err();
+        assert!(err.contains("recovery words"), "{err}");
     }
 
     #[wasm_bindgen_test]

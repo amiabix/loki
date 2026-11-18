@@ -702,6 +702,22 @@ impl<SE: SecureElement> LocalSigner<SE> {
         self.roster.as_ref().map(|(roster, _)| roster.roster())
     }
 
+    /// Give a signer restored from a backup ([`crate::signer::backup::restore`]) the roster
+    /// document that backup carried, so it can seal and open control messages with its peers
+    /// again. Only for a restored signer (no data directory, no roster or setup yet); the
+    /// document passes the same roster gate as setup and must match the restored vault size.
+    pub fn adopt_restored_roster(&mut self, document: &[u8]) -> Result<(), SignerError> {
+        if self.store.is_some() || self.roster.is_some() || self.setup.is_some() {
+            return Err(SignerError::Other("only a restored signer adopts its backup roster".into()));
+        }
+        let roster = self.check_roster(document)?;
+        if roster.threshold != self.threshold || roster.member_count() != self.members {
+            return Err(SignerError::RosterRejected("roster differs from the restored vault".into()));
+        }
+        self.roster = Some((roster, document.to_vec()));
+        Ok(())
+    }
+
     pub fn network(&self) -> Network {
         self.network
     }

@@ -19,10 +19,11 @@ import init, { Signer, devicePaths, vaultPaths } from "./pkg/loki_signer_wasm.js
 import {
   opfsPreopenWrite,
   opfsPreopenRead,
+  opfsCloseAll,
 } from "./pkg/snippets/loki-signer-core-8724841f4db15c9f/js/opfs_fs.js";
 
 const ready = init().then(() => {
-  const P = JSON.parse(devicePaths()); // { identity, profile, salt }
+  const P = JSON.parse(devicePaths()); // { identity, profile, salt, recovery }
   return { signer: new Signer(), P };
 });
 
@@ -178,6 +179,8 @@ async function joinCeremony(signer, p) {
 async function driveDkg(signer, p) {
   const { vaultHex, slot, label, network, rosterHex, frostdUrl, coordinatorPeer, sessionId } = p;
   for (const path of JSON.parse(vaultPaths(vaultHex))) await opfsPreopenWrite(path);
+  // The backup also seals to the recovery public key; without one vaultJoin refuses.
+  await opfsPreopenRead(JSON.parse(devicePaths()).recovery);
 
   // The 24-digit roster code, computed by the signer from the exact roster it will confirm,
   // shown on the signer page for the member to compare with every other member. vaultJoin's
@@ -504,15 +507,15 @@ self.onmessage = async (e) => {
     if (a) e.data.ok ? a.resolve(e.data.value) : a.reject(new Error(e.data.error));
     return;
   }
-  const { id, op, method, name, passphrase, prfSecret, join, payment, devicePubHex } = e.data;
-  // The Signer holds ONE open vault, and these ops each reopen one. A join or payment holds it
-  // for minutes, so the quick reads are refused while one runs (the wallet polls again) and
-  // otherwise take turns, so no op swaps the vault under another mid-flight.
-  const holds = op === "join" || op === "payment-approve";
-  const reads = op === "payment-review" || op === "pending" || op === "vaults" || op === "address";
+  const { id, op, method, name, passphrase, prfSecret, join, payment, devicePubHex, vaultHex, words, blob } = e.data;
+  // The Signer holds ONE open vault, and these ops each reopen one. A join, payment, restore
+  // or removal holds it, so the quick reads are refused while one runs (the wallet polls
+  // again) and otherwise take turns, so no op swaps the vault under another mid-flight.
+  const holds = op === "join" || op === "payment-approve" || op === "restore" || op === "remove";
+  const reads = op === "payment-review" || op === "pending" || op === "vaults" || op === "address" || op === "recovery-backup";
   let release = () => {};
   try {
-    if (reads && busy) throw new Error(`the signer is busy with a ${busy === "join" ? "vault setup" : "payment"}; try again when it finishes`);
+    if (reads && busy) throw new Error(`the signer is busy with a ${{ join: "vault setup", "payment-approve": "payment", restore: "restore", remove: "removal" }[busy]}; try again when it finishes`);
     if (holds) busy = op;
     if (reads || holds) {
       const prev = turn;
@@ -567,6 +570,39 @@ self.onmessage = async (e) => {
         signer.lock();
         result = null;
         break;
+      case "has-recovery":
+        await opfsPreopenRead(P.recovery);
+        result = signer.hasRecovery();
+        break;
+      case "recovery-begin":
+        // The words go only to the signer page, which shows them once.
+        await opfsPreopenRead(P.recovery);
+        result = signer.recoveryBegin();
+        break;
+      case "recovery-confirm":
+        await opfsPreopenWrite(P.recovery);
+        signer.recoveryConfirm();
+        result = null;
+        break;
+      case "recovery-backup":
+        for (const path of JSON.parse(vaultPaths(vaultHex))) await opfsPreopenWrite(path);
+        result = signer.recoveryBackup(vaultHex);
+        break;
+      case "restore":
+        await preopenCreate(P, method);
+        await opfsPreopenWrite(P.recovery);
+        for (const path of JSON.parse(vaultPaths(vaultHex))) await opfsPreopenWrite(path);
+        result = JSON.parse(signer.restoreSigner(method, name ?? "", passphrase, prfSecret, vaultHex, words, blob));
+        break;
+      case "remove": {
+        // Delete every signer file in this browser: release the sync handles, then the tree.
+        signer.lock();
+        opfsCloseAll();
+        const root = await navigator.storage.getDirectory();
+        await root.removeEntry("loki", { recursive: true }).catch((e) => { if (e.name !== "NotFoundError") throw e; });
+        result = null;
+        break;
+      }
       default:
         throw new Error(`unknown op: ${op}`);
     }
