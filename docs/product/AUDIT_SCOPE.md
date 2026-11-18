@@ -104,46 +104,49 @@ Everything not listed in §1 is out of custody scope.
 
 ---
 
-## 3. Reproducible-build recipe (verified)
+## 3. Reproducible builds (verified)
 
 The signer's delivery is custody (`ws6` §4): a targeted malicious build must be
-detectable. Two clean builds of a chosen artifact must produce the same hash.
+detectable. Two clean builds of each signer must produce the same hash.
 
-**Artifact:** `loki_member_payment` (the default-feature payment/signing CLI;
-links the in-scope `signer`, `candidate`, `wysiwys`, `zip2005` code).
+**Artifacts:** the native signer `loki_member_app` (`--features
+relay-communication`, the packaged member binary `run-member.sh` runs) and the
+browser signer bundle `poc/loki-signer-wasm` (wasm-pack `--release --no-opt
+--target web`, what `web/wallet/scripts/copy-signer.mjs` serves). The Xcode
+`LokiSigner.app` (`poc/signer-app`) is not covered.
 
-**Pins:**
-- Toolchain: `rustc 1.98.0 (88d9e12ae 2026-08-18)`, `cargo 1.98.0`.
-- `Cargo.lock` committed; built with `--locked`.
-- `SOURCE_DATE_EPOCH=1700000000` (fixed timestamp).
-- `CARGO_INCREMENTAL=0` (no incremental codegen).
-- `RUSTFLAGS="--remap-path-prefix=$HOME=/build -C codegen-units=1"`
-  (`codegen-units=1` is **required** — parallel codegen reordering otherwise
-  made two clean builds differ in the ELF section layout).
+**Recipe:** `poc/scripts/repro-build.sh > SHA256SUMS`. It exports the committed
+`HEAD` to `/tmp/loki-repro/src` and builds there with `CARGO_HOME` and the target
+dir also under `/tmp/loki-repro`, rustc 1.95.0, `--locked`,
+`SOURCE_DATE_EPOCH=1700000000`, `CARGO_INCREMENTAL=0`, `-C codegen-units=1`,
+`--remap-path-prefix=/tmp/loki-repro=/build`. CI (`.github/workflows/repro.yml`)
+builds twice from two checkouts on ubuntu-24.04 and fails on any difference.
 
-**Recipe (run from `poc/`):**
-```sh
-rm -rf target
-export SOURCE_DATE_EPOCH=1700000000 CARGO_INCREMENTAL=0
-RUSTFLAGS="--remap-path-prefix=$HOME=/build -C codegen-units=1" \
-  cargo build --release --locked --bin loki_member_payment
-sha256sum target/release/loki_member_payment
+Why a fixed root (measured, so it is not retried):
+- Per-checkout `--remap-path-prefix` is not enough. `communication/*` crates are
+  path deps outside the `poc/` workspace, so cargo's metadata hash for
+  `loki_relay_client`, `loki_relay_protocol` and `loki_poc` changed with the
+  checkout path, which reordered the binary's contents.
+- Vendored OpenSSL (via `rusqlite` sqlcipher) bakes its OUT_DIR install prefix into
+  the binary as `ENGINESDIR`/`MODULESDIR` strings, so the target dir must not vary.
+- Without `codegen-units=1` two clean builds alternated between two hashes.
+
+**Verification (macOS arm64, rustc 1.95.0, two checkouts at different paths):**
+both runs printed identical output:
 ```
-
-**Verification (two clean builds, the build host, rustc 1.98.0):**
+ce2af70ad66490d1debe087c9d10ff62e688c25cda256c41b1daaa3510b43647  target/release/loki_member_app
+f2907a8dea9f895f1ca451f8e2deb16f85ba835d3cd631c9d4f9e49c2a8323f2  wasm-pkg/loki_signer_wasm_bg.wasm
+218b0373097414c1408a2627db2faf5db42ab389312b7d93470644a8340831ab  wasm-pkg/loki_signer_wasm.js
 ```
-b6e63b82c6a00cc4e4aabf604287148ffb7c199976cdb318406c5bc01c700a5d  target/release/loki_member_payment
-b6e63b82c6a00cc4e4aabf604287148ffb7c199976cdb318406c5bc01c700a5d  target/release/loki_member_payment
-```
-Same hash twice. (Without `codegen-units=1` the same procedure alternated
-between two distinct hashes — recorded so it is not retried.)
+Hashes are per OS + arch: macOS and Linux differ, which is expected.
 
-Remaining for production delivery (`ws6` §4, SECURITY.md item 8): publish
-hashes, sign releases, and deliver to a quorum through independent channels so
-one compromised publisher cannot backdoor a threshold. A second independent
-machine should reproduce `b6e63b82…` before release; this recipe fixes every
-input known to vary, so a second host on the same toolchain is expected to
-match.
+**Still needed for independent delivery** (`ws6` §4, SECURITY.md item 8):
+- A second builder on different hardware, run by someone else, that reproduces the
+  hashes for each release tag and publishes them independently.
+- Release hashes signed by a key that is not the CI's (e.g. a maintainer's
+  signing key), so a compromised CI cannot publish its own hashes.
+- One agreed publication place for `SHA256SUMS` plus signatures (e.g. the GitHub
+  release and a second channel), checked by members before they install.
 
 ---
 
