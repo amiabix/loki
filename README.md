@@ -108,8 +108,11 @@ cd poc/loki-signer-wasm && RUSTFLAGS='--cfg getrandom_backend="wasm_js"' wasm-pa
 cd ../wasm-transport    && wasm-pack build --target web
 
 # 2. Run the wallet:
-cd ../../web/wallet && npm install && npm run dev      # → http://localhost:3000
+cd ../../web/wallet && npm install && npx next dev --hostname localhost -p 3001   # → http://localhost:3001
 ```
+
+The wallet and the signer are served from separate origins; see
+[`web/wallet/README.md`](web/wallet/README.md) for the two-origin setup.
 
 Open the app and **create or unlock your signer** (passkey or passphrase) to reach Home —
 this onboarding works standalone. Creating/joining a vault and signing additionally need a
