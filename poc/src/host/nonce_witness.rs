@@ -112,6 +112,22 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    /// Live: two dev relays provisioned with `examples/provision_nonce_witnesses`, named by
+    /// `LOKI_NONCE_WITNESSES`. A fresh claim is accepted by both; the same claim again is
+    /// refused, which is what blocks a rolled-back nonce from signing twice.
+    #[test]
+    fn provisioned_relays_accept_a_claim_once_and_refuse_a_duplicate() {
+        let Some(path) = std::env::var_os("LOKI_NONCE_WITNESSES") else { return };
+        let mut witness = RelayWitness::open(Some(Path::new(&path)), true).unwrap();
+        let mut cid = [0u8; 32];
+        rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut cid);
+        witness.claim(cid, b"first use").unwrap();
+        let again = witness.claim(cid, b"first use").unwrap_err();
+        assert!(again.contains("already claimed"), "{again}");
+        let other = witness.claim(cid, b"another use").unwrap_err();
+        assert!(other.contains("already claimed") || other.contains("nonce witness claim"), "{other}");
+    }
+
     #[test]
     fn witness_configuration_requires_two_distinct_identities() {
         let path = std::env::temp_dir().join(format!("loki-witness-{}.json", uuid::Uuid::new_v4()));

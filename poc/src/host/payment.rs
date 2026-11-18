@@ -1335,6 +1335,12 @@ fn sign(
     v: &Vault,
     owned: Option<CandidateInputs<'_>>,
 ) -> Result<(), String> {
+    // Both external nonce witnesses must be configured; without them this member refuses to
+    // sign, before it joins the session or unwraps the share.
+    let witness = super::nonce_witness::RelayWitness::open(
+        st.config.nonce_witnesses.as_deref(),
+        st.config.development_http,
+    )?;
     let mut tx = relay(&v.identity, &st.config.frostd_url)?;
     let ch = tx
         .join(p.session_id.ok_or("missing signing session")?)
@@ -1349,6 +1355,7 @@ fn sign(
         st, data, pass, &p.vault, v.slot,
         super::approval_policy(st.approval.clone(), signer_network),
     )?;
+    signer.set_nonce_witness(Box::new(witness));
     if let Some(inputs) = &owned {
         signer.set_candidate_notes(inputs.notes.clone());
     }
@@ -2260,6 +2267,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn hosted_signing_refuses_without_nonce_witnesses() {
+        let data = std::env::temp_dir().join(format!("loki-no-witness-{}", Uuid::new_v4()));
+        let identity = Identity::new(1);
+        let peers = BTreeMap::from([(1, identity.public())]);
+        let v = member(&identity, &peers);
+        let p = open_payment(&hex::encode([2; 32]), 1);
+        // A member that would approve, but has no `--nonce-witnesses`.
+        let config = crate::host::config_from_args(&[
+            "--data".into(), data.to_str().unwrap().into(), "--port".into(), "0".into(),
+            "--frostd-url".into(), "http://127.0.0.1:9".into(),
+        ]).unwrap();
+        let approval: crate::host::LocalApproval = std::sync::Arc::new(|_| true);
+        let st = std::sync::Arc::new(AppState { approval: Some(approval), ..AppState::new(config) });
+        // Refused before it contacts frostd (unreachable here) or opens any signer.
+        let refused = sign(&st, &data, "pass", &p, &v, None).unwrap_err();
+        assert!(refused.contains("--nonce-witnesses"), "{refused}");
+        assert!(!data.exists(), "nothing was written");
+    }
+
     /// A request no member has acted on yet: proposed by `proposer`, open to every member.
     fn open_payment(vault: &str, proposer: u16) -> Payment {
         Payment {
@@ -2307,7 +2334,8 @@ mod tests {
             transport: "frostd".into(),
             secure_element: "software".into(),
             operator_bundle: None,
-            nonce_witnesses: None,
+            // Two provisioned dev relays (`examples/provision_nonce_witnesses`).
+            nonce_witnesses: std::env::var_os("LOKI_NONCE_WITNESSES").map(Into::into),
             operator_key: None,
             enrollment_issuer: None,
             development_http: true,
@@ -2512,7 +2540,8 @@ mod tests {
 
     #[test]
     fn testnet_control_opens_requests_to_every_member_and_signs_with_the_first_approvers() {
-        let Ok(url) = std::env::var("FROSTD_URL") else {
+        // Live: frostd plus two provisioned nonce witnesses (hosted signing refuses without).
+        let (Ok(url), Some(_)) = (std::env::var("FROSTD_URL"), std::env::var_os("LOKI_NONCE_WITNESSES")) else {
             return;
         };
         let identities: Vec<_> = (1..=3).map(Identity::new).collect();
@@ -2683,7 +2712,8 @@ mod tests {
 
     #[test]
     fn testnet_signed_artifact_survives_a_delayed_final_send() {
-        let Ok(url) = std::env::var("FROSTD_URL") else {
+        // Live: frostd plus two provisioned nonce witnesses (hosted signing refuses without).
+        let (Ok(url), Some(_)) = (std::env::var("FROSTD_URL"), std::env::var_os("LOKI_NONCE_WITNESSES")) else {
             return;
         };
         let data = std::env::temp_dir().join(format!("loki-testnet-round-{}", Uuid::new_v4()));
