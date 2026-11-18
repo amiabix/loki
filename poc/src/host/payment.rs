@@ -1514,8 +1514,7 @@ fn pin_sighash(data: &Path, pass: &str, p: &Payment, sighash: [u8; 32]) -> Resul
 }
 /// The signer's approval: the member consented to these terms, the request names this
 /// attempt's candidate, the pinned sighash and a view of exactly the approved effects, and
-/// only then does `native` (the member's own dialog) decide. The expiry is not in the view;
-/// the pinned sighash binds the reviewed candidate's.
+/// only then does `native` (the member's own dialog) decide.
 fn payment_approval(
     data: &Path,
     pass: &str,
@@ -1542,7 +1541,8 @@ fn payment_approval(
                 && view.amount_zat == p.amount_zat
                 && view.fee_zat == p.fee_zat
                 && view.change_zat == p.change_zat
-                && view.memo == memo.as_array())
+                && view.memo == memo.as_array()
+                && view.expiry_height == tx_expiry(&p))
         };
         approved().unwrap_or(false) && native(request)
     }))
@@ -2587,6 +2587,7 @@ mod tests {
             fee_zat: p.fee_zat,
             change_zat: p.change_zat,
             memo: MemoBytes::from_bytes(p.memo.as_bytes()).unwrap().as_array().to_vec(),
+            expiry_height: tx_expiry(&p),
             network_branch_id: 0,
             fee_verified: true,
         };
@@ -2629,6 +2630,9 @@ mod tests {
         assert!(!approves(&candidate, sighash, &changed));
         let mut changed = view.clone();
         changed.to = v.fvk.address_at(7u64, Scope::External).to_raw_address_bytes();
+        assert!(!approves(&candidate, sighash, &changed));
+        let mut changed = view.clone();
+        changed.expiry_height += 1;
         assert!(!approves(&candidate, sighash, &changed));
         // The consent recorded for these terms neither changes nor approves other terms.
         let mut terms = p.clone();
