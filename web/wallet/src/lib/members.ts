@@ -121,12 +121,14 @@ function devices(file: string): Device[] {
   if (!Array.isArray(data)) throw new Error("invalid device registry");
   return data as Device[];
 }
+// A device key stays bound to one identity. An identity may replace its device key (a member
+// restored on a new machine): its signature authorizes the new key, which signs a fresh
+// challenge, and whoever holds the identity key already holds the share. Its slot and relay key
+// stay pinned (relay key: `allocatedSlot`).
 function checkDevice(e: Enrollment, file: string) {
   for (const d of devices(file)) {
-    if ((d.device_pubkey === e.device_pubkey && d.signing_pubkey !== e.signing_pubkey)
-      || (d.signing_pubkey === e.signing_pubkey && (d.device_pubkey !== e.device_pubkey || (e.slot !== undefined && d.slot !== e.slot)))) {
-      throw new Error("registered device cannot change identity or slot");
-    }
+    if (d.device_pubkey === e.device_pubkey && d.signing_pubkey !== e.signing_pubkey) throw new Error("registered device cannot change identity");
+    if (d.signing_pubkey === e.signing_pubkey && e.slot !== undefined && d.slot !== e.slot) throw new Error("registered identity cannot change slot");
   }
 }
 function allocatedSlot(e: Enrollment, list: Member[], challenges: Challenge[]): number {

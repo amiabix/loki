@@ -140,6 +140,8 @@ impl Session {
 pub struct AppState {
     pub config: Config,
     pub(super) registration: RwLock<Option<super::registration::PublicMember>>,
+    /// The last failed registration attempt, reported locally while registration retries.
+    pub(super) registration_error: RwLock<Option<String>>,
     pub session: RwLock<Option<Session>>,
     pub ceremony: std::sync::Mutex<()>,
     pub payment: std::sync::Mutex<()>,
@@ -155,6 +157,7 @@ impl AppState {
         Self {
             config,
             registration: RwLock::new(None),
+            registration_error: RwLock::new(None),
             session: RwLock::new(None),
             ceremony: std::sync::Mutex::new(()),
             payment: std::sync::Mutex::new(()),

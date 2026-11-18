@@ -82,14 +82,19 @@ for _ in {1..90}; do
   grep -q 'error:' "$data/member.log" && { echo "member failed:"; tail -4 "$data/member.log"; exit 1; }
   sleep 0.4
 done
-[[ -n $token ]] || { echo "member never registered; see $data/member.log" >&2; exit 1; }
+[[ -n $token ]] || { echo "member never started; see $data/member.log" >&2; exit 1; }
 
+# The member serves locally even when the coordinator refuses or is unreachable; it keeps
+# retrying registration and logs each failure to member.log.
 curl -sf --max-time 10 "$coordinator/api/members" | grep -q "\"slot\": *$slot\|\"slot\":$slot" \
-  || { echo "warning: slot $slot not yet visible in $coordinator/api/members" >&2; }
+  || { echo "warning: slot $slot not yet visible in $coordinator/api/members; registration retries, see $data/member.log" >&2; }
 
 echo "=============================================================="
-echo "member slot $slot registered to $coordinator"
+echo "member slot $slot running; registering with $coordinator"
 echo "open in a browser to pair this device:  http://127.0.0.1:$port/#$token"
+echo "recovery words are never written to member.log; if this member has none yet, set them up"
+echo "once (the reply shows them once):"
+echo "  curl -s -X POST -H 'X-Loki-Token: $token' http://127.0.0.1:$port/api/recovery-setup"
 echo "=============================================================="
 trap - EXIT INT TERM
 echo "member still running; stop with: kill \$(cat $data/pids)"
