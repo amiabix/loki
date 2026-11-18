@@ -5,7 +5,7 @@ Audience: a decision-maker who is not a cryptographer and needs to know what is
 proven, what is still dangerous, and exactly what to arrange before any mainnet
 money is at risk.
 
-Scope of this brief: the round-2 signer work (`poc/src/signer/` +
+Scope of this brief: the round-2 signer work (`poc/loki-signer-core/src/signer/` +
 `poc/src/coordinator_boundary.rs`), audited against the threat model
 (`00-architecture.md` §5) and invariants (§7), `ws1-signer.md`, and
 `ws6-standards-and-audit.md`. The companion `pr2/coordinator-demo` branch exists,
@@ -24,8 +24,8 @@ round-two boundary required a fix: it previously returned plaintext share packag
 
 - **No spend key in the coordinator.** The coordinator (the part that would be a web
   app) talks to a member only through one narrow trait, `Signer`
-  (`poc/src/signer/mod.rs`). The DKG runs inside the signer through the shared core
-  (`poc/src/dkg_core.rs`): round one is signed, and each round-two package is sealed in
+  (`poc/loki-signer-core/src/signer/mod.rs`). The DKG runs inside the signer through the shared core
+  (`poc/loki-signer-core/src/dkg_core.rs`): round one is signed, and each round-two package is sealed in
   a v2 envelope under the two members' one-setup fresh X25519 keys, which are erased
   once the certificate state is saved. Recorded relay traffic therefore does not open
   round two even after a later compromise of the members' long-lived identity keys
@@ -40,11 +40,11 @@ round-two boundary required a fix: it previously returned plaintext share packag
 - **Audited FROST crypto.** The threshold math is the ZF `frost-rerandomized` /
   `reddsa` RedPallas stack (`ADOPTION.md` §1–2, 4); Loki writes the signer shell, not
   new threshold crypto. The partial signature is produced by
-  `frost_rerandomized::sign_with_randomizer_seed` (`poc/src/signer/nonce.rs`).
+  `frost_rerandomized::sign_with_randomizer_seed` (`poc/loki-signer-core/src/signer/nonce.rs`).
 - **Each member approves the real transaction on their own signer.** Before any share
   is touched, the signer independently parses the PCZT, renders what it actually pays,
-  and recomputes the exact bytes being signed (`poc/src/signer/local.rs`
-  `sign_approve`; `poc/src/signer/wysiwys.rs` `describe_pczt` + `sighash_of_pczt`).
+  and recomputes the exact bytes being signed (`poc/loki-signer-core/src/signer/local.rs`
+  `sign_approve`; `poc/loki-signer-core/src/signer/wysiwys.rs` `describe_pczt` + `sighash_of_pczt`).
 
 ---
 
@@ -69,7 +69,7 @@ limit what this demo establishes about a malicious coordinator.
 
 - **Software KEK (share-at-rest).** `SoftwareSecureElement::persistent` keeps the
   wrapping key in `kek.sealed` under the member passphrase and in process memory while
-  running, and `from_kek` can still reconstruct it (`poc/src/signer/secure_element.rs`).
+  running, and `from_kek` can still reconstruct it (`poc/loki-signer-core/src/signer/secure_element.rs`).
   A stolen/imaged device plus the passphrase yields the share, and a removed or replaced
   sealed file is only unlinked, not securely erased, until a real Secure Enclave /
   StrongBox / TPM backend replaces it. This weakens threat **A3 (stolen device)**.
