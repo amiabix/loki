@@ -1,104 +1,145 @@
+> **For Ayush (delete before sending).** Send to the audit firms on your shortlist (your
+> call; none has been contacted). Things to arrange with them: (1) a commit to pin;
+> re-measure the line counts below at that commit; (2) scope is §1, §2 is out; (3) whether
+> the browser signer (§1g) is in this round or a second one; (4) a macOS host with an
+> Apple Team ID if they want to run the Secure Enclave path (§1a); (5) a reproducible-build
+> check on their own machine (§3); (6) the #1094 status (§4) at audit time.
+
 # Loki — External Audit Scope
 
 Status: **DEMO / TEST-NETWORK ONLY. NOT FOR REAL FUNDS.**
 
-This is the concrete file/module list an external auditor must review, the
-out-of-custody-scope remainder, a reproducible-build recipe verified on a real
-machine, and the #1094 / #490 alignment notes required by
-`ws6-standards-and-audit.md` §6.
+What an external auditor must review, what is out of custody scope, a
+reproducible-build recipe, and the #1094 / #490 alignment notes required by
+`ws6-standards-and-audit.md` §6. Companion docs: `SECURITY.md`, `ws1-signer.md`,
+`ws6-standards-and-audit.md`.
 
-Companion docs: `SECURITY.md` (what is proven vs dangerous, pre-custody
-checklist), `ws1-signer.md`, `ws6-standards-and-audit.md` §3.
+Paths are relative to `poc/` unless they start with `web/`. `core/` means
+`poc/loki-signer-core/src/`. Line counts are `wc -l` at commit `9d7c06b`.
 
 ---
 
 ## 1. In scope — review every line
 
-The ZF `frost-rerandomized` / `reddsa` threshold crypto is already audited
-(`ADOPTION.md` §1–2). Loki writes the *shell* around it. The shell is the entire
-custody surface and is small on purpose. All paths are under `poc/`.
+The ZF `frost-core` / `frost-rerandomized` / `reddsa` crates are already audited
+(`ADOPTION.md` §1–2). Loki writes the shell around them; that shell is the custody
+surface.
 
-### 1a. Signer shell (WS1) — the highest-value target
-
-What stands between an attacker and a FROST share. ~2,900 lines.
+### 1a. Signer shell and at-rest sealing
 
 | File | Lines | What to review |
 |---|---:|---|
-| `src/signer/mod.rs` | 189 | The one signer seam (`Signer` trait); the return-type allow-list audit (`known_signer_return_types_are_public_artifacts`). Confirm no method returns a share/nonce/spend type. |
-| `src/signer/local.rs` | 1231 | `LocalSigner`: share sealed at rest, unsealed only for the two FROST rounds; `connect` network/vault/identity checks; `sign_approve` WYSIWYS→sighash binding; `dkg_step` (see 1c). |
-| `src/signer/nonce.rs` | 386 | Nonce single-use + crash-safety: persist-before-emit (round 1), atomic burn-before-removal with fsync (round 2), reuse-for-different-message hard-refusal. |
-| `src/signer/wysiwys.rs` | 316 | `describe_pczt` + `sighash_of_pczt`: the signer independently parses the PCZT, renders what it pays, recomputes the signed bytes, and binds fee to `cv_net`. The `fee_verified == false` branch is defensive and **not yet reachable from the public builder** — audit it against an adversarial PCZT (`SECURITY.md` §3). |
-| `src/signer/secure_element.rs` | 247 | `SecureElement` trait + `SoftwareSecureElement`. The software KEK lives in process memory and `from_kek` reconstructs it — this is a **known demo gap** (defeats stolen-device A3); audit the trait boundary a real Enclave/StrongBox/TPM backend must satisfy, not the software stub as production. |
-| `src/signer/backup.rs` | 419 | Share backup / restore-to-new-device and the nonce-epoch reset on restore (no old-nonce replay). |
-| `src/signer/coordination.rs` | 333 | Signer-side coordination of the rounds. |
+| `core/signer/mod.rs` | 375 | The one signer seam, `pub trait Signer` (226). Return-type allow-list test `known_signer_return_types_are_public_artifacts` (352); it pins current methods only and does not inspect opaque bytes (comment at 353-354). |
+| `core/signer/local.rs` | 2015 | `LocalSigner`. Share unsealed only in `open_key` (813-819). `connect` (1203-1248): network check, origin shown to a `connect_approval` prompt. `check_roster` (861-885). `sign_commit` (1461-1475), `sign_approve` (1477-1526, see 1c). |
+| `core/signer/store.rs` | 179 | Signer data dir layout (1-20). Every `.sealed` file except the KEK is a `SealedShare` with AAD `file_binding(kind, vault, member)`; `write` 148-159, `read` 161-178. |
+| `core/signer/durable.rs` | 186 | Atomic writes. Native: temp file 0600, fsync, rename, dir fsync (18-115). wasm: OPFS sync handles (117-184); **no atomic rename, `replace_durable` overwrites in place (122-128); `sync_dir` is a no-op (180)**. |
+| `core/signer/secure_element.rs` | 367 | KEK→DEK→share hierarchy (1-16). `SecureElement` trait (36-41). `SoftwareSecureElement`: KEK in process memory, `from_kek` (60), `persistent` stores the KEK in `kek.sealed` under the passphrase (70-102), `from_passphrase` (108-112). `WRAP_AAD` (129), `file_binding` (176-183), `SealedShare` (190-309). The software KEK is a known demo gap, not a hardware boundary. |
+| `core/seal_kdf.rs` | 244 | Single Argon2id call, `Argon2::default()` (header 1-14, `derive_uncached` 153-162). Per-process session key cache keyed by keyed BLAKE3 of secret+salt (22-151). |
+| `core/signer/secure_element_apple.rs` | 164 | Secure Enclave KEK via ECIES; persistent key with biometric access control (doc 9-16). Compiled only with feature `apple-enclave` on macOS (`core/signer/mod.rs:29-30`). Swift side: `poc/enclave-spike/se_backend.swift`. |
+| `src/enclave_ffi.rs` | 49 | C-ABI `loki_signer_enclave_selftest` (13-49) for `poc/signer-app`: seals a stand-in share under a persistent Enclave key, reopens by tag. Same cfg gate (`src/lib.rs:28-29`). |
+| `core/signer/secure_element_webauthn.rs` | 123 | Browser KEK = HKDF-SHA256(PRF secret, info `Loki_signer_webauthn_prf_kek_v1`) (29, 53-61); wrap format is `SoftwareSecureElement`'s (63-71). |
+| `core/signer/backup.rs` | 630 | Share backup / restore and nonce-epoch reset on restore. |
+| `core/signer/coordination.rs` | 433 | `drive_to_signed_pczt` (51): keyless drive loop over `dyn Signer` (doc 1-20). |
 
-### 1b. Keyless coordinator boundary (WS2 §4, invariant #1)
-
-Prove no share/nonce/spend path exists in the coordinator/browser.
-
-| File | Lines | What to review |
-|---|---:|---|
-| `src/coordinator_boundary.rs` | 140 | The single re-exported signer seam; `assert_keyless` start-up check; the source deny-list test `coordinator_source_links_no_secret_type`. Both guards are narrow (one file; named types only) — confirm the whole coordinator process actually stays keyless, not just this file. |
-| `src/coordinator.rs` | 253 | Coordinator round driver / aggregation / broadcast. Public data + encrypted DKG only. |
-
-### 1c. DKG seal path
-
-The round-two DKG package is a recipient's share contribution; a relay observer
-collecting a threshold of raw packages could reconstruct the vault key. It must
-be sealed to the recipient before it leaves the signer.
-
-- `src/signer/local.rs` `dkg_step` (**line 374**): round 1 produces round-2
-  packages, each sealed via `Identity::seal_round2` (**line 441**); inbound
-  round-2 packages unsealed via `open_round2` (**line 463**).
-- `src/signer/coordination.rs` — the signer requires a signed
-  `AcceptedCeremonyRoster` (`src/setup_ceremony/`) and checks vault, policy,
-  network, and its own identity before sealing.
-- Regression: `tests/frostd_transport.rs` (commit `c9f6ad1`) proves a relay
-  observer holding every wire byte cannot deserialize any `round2::Package`,
-  only the intended recipient can unseal, and DKG still reaches the same group
-  key. **Note:** the relay transport this test exercises is being retired;
-  review the seal/open primitives, which the member path reuses, not the relay.
-
-### 1d. ZIP-2005 FVK derivation (WS5, #1094)
+### 1b. Nonce safety
 
 | File | Lines | What to review |
 |---|---:|---|
-| `src/zip2005.rs` | 66 | `use_qsk = true` FVK derivation from the group key. Cross-checked against vectors, **not yet reviewed upstream (ZF #1094)**. An error here corrupts which address the vault controls. Regtest-only until reviewed (file header). See §4. |
+| `core/signer/nonce.rs` | 367 | Crash states (doc 1-23). `commit` persists the sealed nonce before returning the commitment (107-133). `load` refuses a nonce from another backup epoch (135-153). `sign_and_burn` (165-220): same-message resend replays the recorded partial, different message → `NonceError::Reuse`; burn record fsync'd before the nonce file is removed. Nonce id = payment id ‖ attempt id (`local.rs:821-828`). On wasm the final `sync_dir` is a no-op (see `durable.rs:180`). |
 
-### 1e. Thin enrollment / roster layer (WS3 §4)
+### 1c. WYSIWYS → sighash binding
 
 | File | Lines | What to review |
 |---|---:|---|
-| `src/setup_transport.rs` | 530 | `Identity`, `PublicIdentity`, session sealing/opening used by DKG and signing transport. |
-| `src/setup_ceremony/` | — | `AcceptedCeremonyRoster` production and the signed setup agreement the signer verifies. Human fingerprint review binding each peer key to a person is **not yet proven** (`SECURITY.md` §3). |
+| `core/signer/wysiwys.rs` | 316 | `describe_pczt` (51-139) renders payee/amount/change/fee/memo from PCZT openings and the vault FVK. `fee_verified` clears when any action fails `verify_cv_net` (72, 86-87). `sighash_of_pczt` (149-182) runs `verify_cv_net`, `verify_nullifier`, `verify_rk` against the vault FVK, then computes the shielded sighash. |
+| `core/signer/local.rs` | — | `sign_approve` (1477-1526): render → recompute sighash → member approval → refuse unless `pkg.message() == local_sighash` (1507-1509) → only then unseal the share and burn the nonce. |
+
+### 1d. Keyless coordinator boundary
+
+| File | Lines | What to review |
+|---|---:|---|
+| `src/coordinator_boundary.rs` | 213 | Re-exported seam (21). `assert_keyless` (27-32) only calls `list_vaults`; its own doc says it proves nothing about other paths (23-26). Source deny-list tests: `coordinator_source_links_no_secret_type` (46-80, this file only) and `coordinator_drive_loop_is_viewing_key_less` (90-131, token grep of `core/signer/coordination.rs`). |
+| `src/payment_transport.rs` | 265 | `coordinate` (144): the payment coordinator. Gets the candidate from the proposer's local hand-off, not the relay (doc 141-143). |
+| `src/host/payment.rs` | 3342 | `aggregate` (1499-1547): one-shot coordinator identity in the proposer's member process; reads the plaintext candidate from the member's encrypted store (1530-1543), written at 1423-1428. |
+| `core/transport.rs` | 431 | `SealedCandidate` (146-170): the candidate sent to other members is sealed per recipient. |
+
+**Viewing-key boundary, stated accurately.** The coordinator *does* see the vault viewing
+key. The candidate PCZT carries the FVK in each Orchard spend: the vendored builder sets
+`fvk: Some(self.fvk)` (`vendor/zakura-orchard/src/builder.rs:517`), the PCZT format
+serializes it (`zakura-pczt 0.1.0-rc4`, `src/orchard.rs:604`), and Loki does not strip
+it (no redaction code under `core/` or `src/`). A throwaway test on this commit built a
+candidate with `core/builder.rs` `build_candidate_for_vault` and found the 96-byte FVK
+in the PCZT bytes (`FVK_IN_CANDIDATE=true`). So: the frostd relay sees only sealed
+envelopes (`core/transport.rs:146-170`; relay tape audit `tests/frostd_transport.rs:462-481`
+asserts no plaintext PCZT crosses), but every party that opens the candidate — each
+signing member and the proposer-side coordinator (`src/host/payment.rs:1530-1543`) —
+holds the FVK. The "never reads a viewing key" line in `coordinator_boundary.rs:7` and
+`coordination.rs:13-15` is true of those files' code tokens, not of the data the
+coordinator handles. No share, nonce, or spend key reaches the coordinator through this
+path.
+
+`src/coordinator.rs` (253) is compiled only under `#[cfg(test)]` (`src/lib.rs:25-26`); it
+is not shipped code.
+
+### 1e. DKG roster binding and round-two encryption
+
+| File | Lines | What to review |
+|---|---:|---|
+| `core/dkg_core.rs` | 830 | Phases (doc 1-29). `DkgCore::new` refuses an identity not in the roster with the same keys (347-352). Round 2 seals each peer's `contribution ‖ FROST round-2 package` with `seal_round2_v2` (474-520, call at 498). `finish` opens with `open_round2_v2` (522+, call at 536). Certificate body binds certificate digest, `vs` digest, roster fingerprint, ZIP 2005 `VERSION` (610-616). |
+| `core/setup_transport.rs` | 813 | v1 vs v2 envelopes (doc 1-9). `seal_round2` / `open_round2` (v1, `LOKIDKG1`, 349 / 385; only `loki_setup_member run` uses it). `seal_round2_v2` (457), `verify_round2_v2` (497), `open_round2_v2` (535): key from both one-setup fresh keys, vault, both ids and round-one transcript; header is AEAD AAD; envelope signed by the identity key. |
+| `src/frost_roster.rs` | 60 | `FrostRoster::fingerprint` (30-48): BLAKE2b `Loki_frostr_v1` over vault, threshold, member ids and keys. |
+| `src/setup_ceremony/` | 2688 | `mod.rs` 156, `engine.rs` 1316, `journal.rs` 626, `admission_checkpoint.rs` 590. `AcceptedCeremonyRoster` (`mod.rs:24-41`): network label + non-zero operator digest, then `ValidatedRoster::new`. Human fingerprint review binding each key to a person is not yet proven (`SECURITY.md` §3). |
+| `core/signer/local.rs` | — | `check_roster` (861-885): setup version 2, network, vault, own identity present. |
+
+Regression: `tests/frostd_transport.rs` `audit` (462-481) asserts every round-two wire is
+`LOKIDKG2` and none deserializes as a `round2::Package`; run on the in-memory relay
+(484-510). The live-frostd variant (513+) skips unless `FROSTD_URL` is set.
+
+### 1f. ZIP-2005 FVK derivation (#1094)
+
+| File | Lines | What to review |
+|---|---:|---|
+| `core/zip2005.rs` | 66 | `frost_viewing_key` (39-66), `use_qsk = true`. Matched against 8 frost-tools #610 vectors (`tests/zip2005_vectors.rs`) and 2 independent vectors (`tests/zip2005_keys.rs`); not reviewed upstream. File header: regtest-only until reviewed (3-4). An error here changes the address the vault controls. Details: `ZIP2005_1094.md`. |
+
+### 1g. Browser signer origin model
+
+| File | Lines | What to review |
+|---|---:|---|
+| `loki-signer-wasm/src/lib.rs` | 970 | wasm bindings over `LocalSigner`. `browser_prompts` (611-623) auto-approves: `connect` → `true` (613), roster → `Match` (615), payment approval → `true` (621). `connect` is called with the literal origin `"https://coordinator"` (797, 873). So the Rust signer does **no** origin binding in the browser; approval UI and origin isolation are in JS / the browser. `sign_approve` still enforces the 1c sighash binding (`signApprove`, 542-552 → `LocalSigner::sign_approve`). |
+| `loki-signer-wasm/signer-worker.js` | 421 | Worker driving DKG/payment over frostd; `drivePayment` (271-338) opens the proposer's sealed candidate and calls `paymentReview` then `signApprove`. |
+| `loki-signer-wasm/signer-client.js` | 58 | Main-thread ↔ Worker RPC. |
+| `wasm-transport/src/lib.rs` | 464 | Browser frostd client over Fetch; TLS required off loopback (header 1-30). |
+| `web/wallet/src/lib/webauthn.ts` | 62 | **RP ID binding**: `rp.id = window.location.hostname` at create (27), `rpId = window.location.hostname` at get (51); fixed PRF salt `loki/signer/share-kek/v1` (9); `userVerification: "required"` (36, 53). The passkey, hence the PRF secret and the share KEK, is scoped to the serving hostname. Same logic in `poc/web/webauthn_prf.js` (93; 33, 41, 71, 75). |
+| `web/wallet/src/lib/signer.ts` | 355 | `enroll` (205-219): device ECDSA key signs `loki-member-registration-v1 ‖ origin ‖ … ‖ challenge`; origin defaults to `window.location.origin` (207, 215). |
+| `web/wallet/src/lib/members.ts` | 244 | Server side: `publicOrigin` requires HTTPS except loopback (39-47); `registerMember` (199-225) consumes the challenge, requires the issued origin equal the request origin (214), verifies the device signature over the origin-bound transcript (148-150, 216-217). |
+| `web/wallet/server.js` | — | Request origin derives from `HOSTNAME` / `PUBLIC_PORT` env (13-23); a misconfigured value changes the origin registrations are checked against. |
+| `src/host/routes.rs` | 240 | Native member API `browser_origin` (82-120): non-ceremony `/api/*` requests with an `Origin` must equal the paired coordinator origin; the four ceremony routes are CORS-open but token-gated (84-91). |
+
+Audit questions for 1g: whether WebAuthn RP-ID scoping plus browser per-origin storage
+is a sufficient boundary given the Rust-side auto-approve; who can serve JS on the wallet
+hostname (§3 covers delivery); the no-op `sync_dir` on wasm (1b).
 
 ---
 
 ## 2. Out of custody scope
 
-Non-custodial public-data code. A bug here can lose availability or leak
-*viewing* activity (a privacy review, separate from custody), but cannot move
-funds, because none of it holds a share, nonce, or spend authorization. Lower
-review priority.
+Non-custodial code. A bug here can lose availability or leak *viewing* activity (a
+privacy review, separate from custody), but holds no share, nonce, or spend
+authorization. Lower priority.
 
-- `src/scan.rs`, `src/scanstate.rs`, `src/witness.rs` — chain scan / note
-  selection / witnesses (public viewing-key data).
+- `src/scan.rs`, `src/scanstate.rs`, `src/witness.rs` — chain scan, note selection,
+  witnesses (viewing-key data).
 - `src/wallet_store.rs` — SQLCipher wallet DB, balance, broadcast, pending-note
-  reservation (reservation is a correctness/UX guard, not a custody boundary).
+  reservation.
 - `src/rpc.rs`, `src/bin/loki_wallet_sync.rs`, `src/bin/loki_indexer.rs` —
   node/lightwalletd I/O.
-- `src/bin/loki_member_payment.rs`, `src/candidate.rs`, `src/intent.rs`,
-  `src/verify.rs` — PCZT build / intent / post-mine verification. These shape
-  what the signer is *asked* to sign; the signer independently re-derives and
-  binds the sighash (1a `wysiwys.rs`), so a bug here cannot forge an approval —
-  but the intent→PCZT path is worth a correctness pass.
-- `src/payment_manifest.rs`, `src/transport.rs`, `src/setup_relay*.rs`,
-  `src/relay_member/`, `communication/` — **relay transport, being retired.**
-  Not in custody scope.
-- `poc/wallet/*.py`, `poc/wallet/*.js` — the host app / browser UI. The browser
-  holds no key; recovery words entered for restore are cleared from the DOM on
-  leave/lock (`app.js` `selectVault`). UI delivery trust is §3 (reproducible
-  builds), not source audit.
+- `src/bin/loki_member_payment.rs`, `core/candidate.rs`, `core/builder.rs`,
+  `core/intent.rs`, `core/verify.rs` — PCZT build / intent / post-mine verification.
+  The signer re-derives and binds the sighash itself (1c), so a bug here cannot forge an
+  approval; the intent→PCZT path still deserves a correctness pass.
+- `core/payment_manifest.rs`, `src/transport.rs`, `src/setup_relay*.rs`,
+  `src/relay_member/`, repo-root `communication/` — relay transport. Not in custody scope.
+- `web/wallet/` UI outside the files in 1g — holds no key. UI delivery trust is §3.
 
 Everything not listed in §1 is out of custody scope.
 
@@ -149,34 +190,23 @@ match.
 
 ## 4. #1094 (ZIP-2005 FVK) disposition
 
-- **Current state:** Loki derives the vault FVK with its own `use_qsk = true`
-  branch in `src/zip2005.rs` (66 lines), cross-checked against ZIP-2005 vectors
-  but **not reviewed upstream**. ZIP-2005 is still Proposed. The file is
-  **regtest-only** until the derivation and the key/backup flow are reviewed.
-- **Not N/A:** Loki is **not** on an audited `zcash-sign generate` derivation,
-  so the WS5 "Option A kept" case applies — this must be reviewed.
-- **Plan (per `ws5-fvk-derivation.md` §4):** read `zcash-sign`'s `generate.rs`
-  to decide if it implements the quantum-recoverable derivation. If yes, switch
-  to it (Option B) and drop `zip2005.rs` from scope. If no, drive the
-  vector-matched `use_qsk` derivation through ZF `frost#1094` and land it
-  reviewed. Until one of those closes, `zip2005.rs` is in audit scope (§1d) and
-  mainnet is blocked (`SECURITY.md` item 7).
+- Loki derives the vault FVK with its own `use_qsk = true` code in `core/zip2005.rs`
+  (66 lines), matched against vectors (§1f), not reviewed upstream. ZIP 2005 is still
+  Proposed (`core/zip2005.rs:4`).
+- Loki is not on `zcash-sign generate`: `tests/zf_spine.rs:79-144` shows its FVK
+  differs in `rivk`. So this is in scope, not N/A.
+- Until ZF `frost#1094` reviews the derivation, `core/zip2005.rs` stays in audit scope
+  (§1f) and mainnet is blocked (`SECURITY.md` §4 item 7). Review packet:
+  `ZIP2005_1094.md`.
 
 ## 5. #490 (QR handoff + backup format) alignment
 
-- **Spec:** Grant #490 is an open spec for the coordinator↔co-signer **QR**
-  handoff and a backup artifact format, so an isolated / air-gapped / hardware
-  signer can interoperate.
-- **What matches:** Loki already uses **PCZT** as the coordinator→signer
-  interchange (`ws6` §2; the WYSIWYS path parses a PCZT), which is the format
-  #490 and the hardware-signing trajectory build on. The signer approve/backup
-  surface is the narrow `Signer` trait (`src/signer/mod.rs`) plus
-  `src/signer/backup.rs`.
-- **What diverges:** Loki's current transport is the (being-retired) relay
-  framing and a local-directory courier, **not** a QR handoff; the backup
-  artifact in `src/signer/backup.rs` is Loki-defined, not yet the #490 format.
-- **Plan:** pull the current #490 draft **before** freezing the WS1
-  approve/backup formats, then converge the `Signer` approve/backup surface and
-  the PCZT message framing onto the spec so an external signer interops.
-  Zconnect (web-coordinator ↔ external signer) is the longer-term target
-  (`ws6` §2). This is an interop-convergence task, not a custody blocker.
+- **Spec:** Grant #490 is an open spec for the coordinator↔co-signer QR handoff and a
+  backup artifact format, so an isolated / air-gapped / hardware signer can interoperate.
+- **Matches:** PCZT is the coordinator→signer interchange (the WYSIWYS path parses a
+  PCZT, `core/signer/wysiwys.rs:51,149`). The approve/backup surface is the `Signer` trait
+  (`core/signer/mod.rs:226`) plus `core/signer/backup.rs`.
+- **Diverges:** transport is frostd envelopes, not a QR handoff; the backup artifact in
+  `core/signer/backup.rs` is Loki-defined, not the #490 format.
+- **Plan:** pull the current #490 draft before freezing the approve/backup formats, then
+  converge on it. Interop task, not a custody blocker.
