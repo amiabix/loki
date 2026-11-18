@@ -210,10 +210,25 @@ async function driveDkg(signer, p) {
 // Reopen this browser's signer for an active vault from its own stored state. Every member
 // key the payment flow uses comes from the roster this member confirmed at setup.
 async function openVault(signer, vaultHex) {
-  for (const path of JSON.parse(vaultPaths(vaultHex))) await opfsPreopenWrite(path);
-  const vault = JSON.parse(signer.vaultOpen(vaultHex));
+  const vault = await openVaultAny(signer, vaultHex);
   if (!vault.ready) throw new Error("this vault is not active yet");
   return vault;
+}
+async function openVaultAny(signer, vaultHex) {
+  if (!/^[0-9a-f]{64}$/.test(vaultHex ?? "")) throw new Error("invalid vault id");
+  for (const path of JSON.parse(vaultPaths(vaultHex))) await opfsPreopenWrite(path);
+  return JSON.parse(signer.vaultOpen(vaultHex));
+}
+
+// The terms a proposer announced for this payment, read-only: nothing is approved or sent.
+// The wallet shows them before the member opens the approval on the signer page.
+async function paymentTerms(signer, p) {
+  const vault = await openVault(signer, p.vaultHex);
+  const control = await frostdClient(signer, p);
+  const { notices } = await findPayment(signer, control, vault, p.attemptHex, p);
+  const t = notices[notices.length - 1].intent;
+  checkTerms(t);
+  return { review_token: p.attemptHex, recipient: t.recipient, amount_zat: String(t.amount_zat), fee_zat: String(t.fee_zat), memo: t.memo };
 }
 
 // Log in to frostd without the relay secret ever reaching JS: the transport fetches the
@@ -276,6 +291,48 @@ async function findPayment(signer, control, vault, attemptHex, p) {
     await sleep(pollMs);
   }
   throw new Error("this payment was not found on the relay; it may be finished, cancelled or for another vault");
+}
+
+// Payments other members proposed in this vault that still want this member: one pass over the
+// relay's control sessions, read like findPayment. Reading drains the inbox; the proposer
+// re-sends its notice every few seconds until signing starts, so approving later still finds it.
+async function listPending(signer, vaultHex, p) {
+  const vault = await openVault(signer, vaultHex);
+  const control = await frostdClient(signer, p);
+  const ids = new Map(vault.members.map((m) => [m.encryption, m.id]));
+  const pending = new Map();
+  for (const sessionId of await control.list_sessions()) {
+    control.useSession(sessionId);
+    const info = JSON.parse(await control.sessionInfo());
+    const owner = ids.get(info.coordinator);
+    if (owner === undefined || owner === vault.slot
+      || info.participants.length !== ids.size || !info.participants.every((k) => ids.has(k))) continue;
+    for (const m of await readControl(signer, control, sessionId)) {
+      const i = m.intent;
+      if (m.from !== owner || !i || !/^[0-9a-f]{64}$/.test(i.attempt ?? "") || !aboutPayment(m, vault, i.attempt, sessionId)) continue;
+      if (m.kind === "cancelled" || m.kind === "failed") { pending.set(i.attempt, null); continue; }
+      if (pending.get(i.attempt) === null) continue;
+      if (m.kind === "start" && i.signers?.length && !i.signers.includes(vault.slot)) { pending.set(i.attempt, null); continue; }
+      pending.set(i.attempt, { attempt: i.attempt, amount_zat: String(i.amount_zat), recipient: i.recipient, proposer: i.proposer });
+    }
+  }
+  return [...pending.values()].filter(Boolean);
+}
+
+// Every vault this browser holds a signer for, from its own OPFS (loki/vaults/<id>/signer).
+async function listVaults(signer) {
+  let dir;
+  try {
+    dir = await (await (await navigator.storage.getDirectory()).getDirectoryHandle("loki")).getDirectoryHandle("vaults");
+  } catch { return []; } // no vault yet
+  const out = [];
+  for await (const [name, h] of dir.entries()) {
+    if (h.kind !== "directory" || !/^[0-9a-f]{64}$/.test(name)) continue;
+    let v;
+    try { v = await openVaultAny(signer, name); } catch { continue; } // setup never started
+    out.push({ vault: v.vault_id, name: `Vault ${name.slice(0, 8)}`, members: v.members.length, threshold: v.threshold, active: v.ready });
+  }
+  return out;
 }
 
 // The proposer's latest word on the signing group: `start` names it and fixes the signing
@@ -430,6 +487,8 @@ async function preopenUnlock(P, method) {
 // prompt on the signer origin and answers. The wallet page never sees or answers these.
 const asks = new Map();
 let askSeq = 0;
+let busy = null; // "join" | "payment-approve" while one holds the open vault
+let turn = Promise.resolve(); // vault ops take turns
 function ask(kind, data) {
   const id = ++askSeq;
   return new Promise((resolve, reject) => {
@@ -446,7 +505,20 @@ self.onmessage = async (e) => {
     return;
   }
   const { id, op, method, name, passphrase, prfSecret, join, payment, devicePubHex } = e.data;
+  // The Signer holds ONE open vault, and these ops each reopen one. A join or payment holds it
+  // for minutes, so the quick reads are refused while one runs (the wallet polls again) and
+  // otherwise take turns, so no op swaps the vault under another mid-flight.
+  const holds = op === "join" || op === "payment-approve";
+  const reads = op === "payment-review" || op === "pending" || op === "vaults" || op === "address";
+  let release = () => {};
   try {
+    if (reads && busy) throw new Error(`the signer is busy with a ${busy === "join" ? "vault setup" : "payment"}; try again when it finishes`);
+    if (holds) busy = op;
+    if (reads || holds) {
+      const prev = turn;
+      turn = new Promise((r) => { release = r; });
+      await prev;
+    }
     const { signer, P } = await ready;
     let result;
     switch (op) {
@@ -465,9 +537,18 @@ self.onmessage = async (e) => {
         result = await joinCeremony(signer, join);
         break;
       case "payment-review":
-        // Reopen the vault for its viewing key, then WYSIWYS-render the supplied candidate.
+        // The announced terms only; the candidate is checked against them inside approval.
+        result = await paymentTerms(signer, payment);
+        break;
+      case "pending":
+        result = await listPending(signer, payment.vaultHex, payment);
+        break;
+      case "vaults":
+        result = await listVaults(signer);
+        break;
+      case "address":
         await openVault(signer, payment.vaultHex);
-        result = JSON.parse(signer.paymentReview(payment.candidateHex));
+        result = signer.vaultAddress();
         break;
       case "payment-approve":
         result = await drivePayment(signer, payment);
@@ -492,6 +573,9 @@ self.onmessage = async (e) => {
     self.postMessage({ id, ok: true, result });
   } catch (err) {
     self.postMessage({ id, ok: false, error: String((err && err.message) || err) });
+  } finally {
+    if (holds) busy = null;
+    release();
   }
 };
 
