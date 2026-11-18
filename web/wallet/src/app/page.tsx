@@ -14,6 +14,7 @@ import {
   hasSignerHint,
   forgetSession,
   logout,
+  pairDevice,
   pendingApprovals,
   recoveryRestore,
   recoverySetup,
@@ -520,6 +521,13 @@ function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string 
     } catch (e) { setErr((e as Error).message); }
     finally { setBusy(false); }
   };
+  const [link, setLink] = useState("");
+  const pair = async () => {
+    setBusy(true); setErr(null);
+    try { await pairDevice(link); setLink(""); onLoggedIn(); }
+    catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  };
 
   return <FullScreen calm>
     <div className="panel w-full max-w-md px-6 py-8 sm:px-10">
@@ -568,6 +576,17 @@ function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string 
         onClick={() => { setErr(null); setExisting(!unlocking); }}>
         {unlocking ? "Set up a different signer instead" : "Already have a signer here? Unlock it"}
       </button>
+
+      {/* A native member app (LokiSigner / loki_member_app) instead of the browser signer: this
+          tab then drives that member over its loopback device API. */}
+      <details className="mt-4 text-xs text-muted">
+        <summary className="min-h-11 cursor-pointer hover:text-mint">Use a native member app instead</summary>
+        <p className="my-2">Unlock your profile in the member app, then paste the local link it printed. Keep the link private.</p>
+        <input type="password" value={link} autoComplete="off" spellCheck={false}
+          onChange={(e) => setLink(e.target.value)} onKeyDown={(e) => e.key === "Enter" && !busy && link && pair()}
+          placeholder="http://127.0.0.1:3601/#…" className="glass mb-3 w-full rounded-full px-5 py-3" />
+        <Btn variant="ghost" disabled={busy || !link.trim()} onClick={pair}>{busy ? "Connecting…" : "Pair this tab"}</Btn>
+      </details>
     </div>
   </FullScreen>;
 }
@@ -914,6 +933,7 @@ function CeremonyView({
             creator={cs.invites !== undefined}
             vault={vault}
             fingerprint={cs.fingerprint}
+            rosterCode={cs.roster_code ?? undefined}
             confirmations={cs.confirmations ?? 0}
             confirmed={cs.confirmed ?? false}
             members={cs.members}
@@ -1047,6 +1067,7 @@ function CompareRoster({
   creator = false,
   vault,
   fingerprint,
+  rosterCode,
   confirmations,
   confirmed,
   members,
@@ -1054,6 +1075,7 @@ function CompareRoster({
   creator?: boolean;
   vault: string;
   fingerprint: string | undefined;
+  rosterCode?: string;
   confirmations: number;
   confirmed: boolean;
   members: number;
@@ -1073,7 +1095,8 @@ function CompareRoster({
   const agree = async () => {
     setBusy(true); setErr(null);
     try {
-      await api("agree", { vault, fingerprint });
+      // The signer accepts agreement only with the 24-digit code it derives itself, the one shown.
+      await api("agree", { vault, fingerprint, roster_code: rosterCode });
       setConfirmedHere(true);
     } catch (e) { setErr((e as Error).message); }
     finally { setBusy(false); }
@@ -1094,6 +1117,7 @@ function CompareRoster({
           <h3 className="eyebrow mb-2">Compare this code</h3>
           <p className="text-2xl mb-2" aria-label={`emoji ${phrase.emoji.join(" ")}`}>{phrase.emoji.join(" ")}</p>
           <p className="font-mono text-lg font-semibold tracking-wide text-amber break-words">{phrase.words.join(" · ")}</p>
+          {rosterCode && <p className="font-mono text-xl font-semibold tracking-wide">{rosterCode}</p>}
           <p className="mt-3 font-mono text-xs break-all text-muted">{fingerprint}</p>
         </GlassCard>
       )}
@@ -1110,7 +1134,7 @@ function CompareRoster({
               onChange={(e) => setChecked(e.target.checked)} />
             <span>I compared this code with the other members out of band and it matches.</span>
           </label>
-          <Btn variant="amber" onClick={agree} disabled={busy || !fingerprint || !checked}>
+          <Btn variant="amber" onClick={agree} disabled={busy || !fingerprint || !rosterCode || !checked}>
             {busy ? "Confirming…" : "Confirm members"}
           </Btn>
         </>
@@ -1757,7 +1781,7 @@ function ReviewApprove({
     if (!review) return;
     setBusy(true); setErr(null);
     try {
-      await api("payment-approve", { vault: vault.vault, attempt, review_token: review.review_token });
+      await api("payment-approve", { vault: vault.vault, attempt, review_token: review.review_token, intent_hash: review.intent_hash });
       setApproved(true);
       void fetchSession();
     } catch (e) { setErr((e as Error).message); }

@@ -37,6 +37,8 @@ export type CeremonyStatus = {
     | "setup_interrupted"
     | "active";
   fingerprint?: string;
+  // The 24-digit roster code the member's own signer derives; agree must echo the one shown.
+  roster_code?: string | null;
   invites?: InviteSlot[];
   // The creator counts all confirmations; a joining device records its own confirmation.
   confirmations?: number;
@@ -94,6 +96,8 @@ export type PaymentSession = {
 
 export type PaymentReview = {
   review_token: string;
+  // Hash of the terms shown; a native member approves only with the hash it reviewed.
+  intent_hash?: string;
   recipient: string;
   amount_zat: string;
   fee_zat: string;
