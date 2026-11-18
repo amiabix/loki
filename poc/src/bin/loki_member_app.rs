@@ -9,6 +9,11 @@
 //!        --registration-slot <public-slot> --profile-name <name>]
 //!       [--transport hosted --operator-bundle <cbor> --operator-key <hex>
 //!        --enrollment-issuer <path> --development-http]
+//!       [--nonce-witnesses <json>] [--approve-from <file>]
+//!
+//! Without `--approve-from` this process has no approval channel and refuses every payment;
+//! members sign from the native app. `--approve-from` is for test harnesses only: see
+//! `host::file_approval`.
 
 use loki_poc::host;
 
@@ -21,7 +26,12 @@ fn main() {
             std::process::exit(2);
         }
     };
-    if let Err(error) = config.validate_secure_element().and_then(|_| host::run(config)) {
+    let approval = args
+        .iter()
+        .position(|a| a == "--approve-from")
+        .and_then(|i| args.get(i + 1))
+        .map(|file| host::file_approval(file.into(), std::time::Duration::from_secs(120)));
+    if let Err(error) = config.validate_secure_element().and_then(|_| host::run_local(config, None, None, approval)) {
         eprintln!("error: {error}");
         std::process::exit(1);
     }

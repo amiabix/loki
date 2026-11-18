@@ -43,6 +43,34 @@ pub fn approval_policy(
     })
 }
 
+/// A scripted reviewer in place of the native dialog (`loki_member_app --approve-from <file>`),
+/// for test harnesses. Each request's summary is printed as an `approval-request <json>` line
+/// on stderr; the member approves only when `approve <sighash>` for that request appears in
+/// `file` within `timeout`. `refuse <sighash>`, no answer, or an unreadable summary refuse.
+pub fn file_approval(file: std::path::PathBuf, timeout: std::time::Duration) -> LocalApproval {
+    std::sync::Arc::new(move |summary| {
+        let Some(sighash) = serde_json::from_str::<serde_json::Value>(summary)
+            .ok()
+            .and_then(|v| v["sighash"].as_str().map(str::to_owned))
+        else {
+            return false;
+        };
+        eprintln!("approval-request {summary}");
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            for line in std::fs::read_to_string(&file).unwrap_or_default().lines() {
+                match line.split_once(' ') {
+                    Some(("approve", h)) if h == sighash => return true,
+                    Some(("refuse", h)) if h == sighash => return false,
+                    _ => {}
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        false
+    })
+}
+
 /// What the member reviews: the payee, amounts and network the signer derived itself from the
 /// PCZT bytes, and the candidate and sighash its consent binds to.
 pub fn approval_summary(request: &crate::signer::local::ApprovalRequest<'_>, network: crate::signer::Network, slot: u16) -> String {
@@ -214,5 +242,20 @@ mod tests {
         assert_eq!(shown["memo"], "rent");
         assert_eq!(shown["attempt"], hex::encode([3; 32]));
         assert_eq!(shown["sighash"], hex::encode([9; 32]));
+    }
+
+    #[test]
+    fn file_approval_approves_only_its_own_sighash() {
+        let file = std::env::temp_dir().join(format!("loki-approvals-{}", uuid::Uuid::new_v4()));
+        let wait = std::time::Duration::from_millis(600);
+        let approve = super::file_approval(file.clone(), wait);
+        let summary = |sighash: &str| serde_json::json!({ "sighash": sighash }).to_string();
+        assert!(!approve(&summary("aa")), "no answer refuses");
+        assert!(!approve("not json"), "an unreadable summary refuses");
+        std::fs::write(&file, "approve bb\nrefuse cc\napprove aaa\n").unwrap();
+        assert!(approve(&summary("bb")));
+        assert!(!approve(&summary("cc")), "an explicit refusal refuses");
+        assert!(!approve(&summary("aa")), "another sighash's approval does not approve this one");
+        std::fs::remove_file(file).unwrap();
     }
 }
