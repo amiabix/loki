@@ -1,10 +1,10 @@
 # Loki
 
 Loki is a **shielded Zcash FROST multisig wallet** built so that **no single machine can
-move funds**. It splits into two parts: a **keyless coordinator** — a web app that builds
-and tracks transactions but holds no key material — and, for each member, an **isolated
-signer** that holds exactly one FROST key share and approves on-device. A share is **born
-during DKG inside the signer and never leaves it**, and every member **re-derives and
+move funds**. It splits into two parts: a **keyless coordinator** — a web app that tracks
+vaults and payments and holds no FROST share, nonce or spend key — and, for each member,
+an **isolated signer** that holds exactly one FROST key share and approves on-device. A
+share is **born during DKG inside the signer and never leaves it**, and every member **re-derives and
 confirms the real transaction** before adding their signature. The threshold crypto is the
 audited **Zcash Foundation FROST** stack.
 
@@ -71,22 +71,28 @@ flowchart TB
 
 The invariants behind the picture:
 
-- **Keyless coordinator.** It holds only public protocol messages and the vault address —
-  never a share, nonce, viewing key, or spend key
+- **Keyless coordinator.** It never holds a share, nonce, or spend key
   ([`poc/src/coordinator_boundary.rs`](poc/src/coordinator_boundary.rs), compile-time +
-  deny-list enforced) — so it **cannot forge a signature** on its own.
-- **WYSIWYS.** The coordinator builds the candidate PCZT; every member **re-derives the
-  sighash and refuses any mismatch** before signing
-  ([`poc/src/host/payment.rs:342`](poc/src/host/payment.rs)).
+  deny-list enforced) — so it **cannot forge a signature** on its own. It is not
+  view-blind: the candidate PCZT carries the vault viewing key in each Orchard spend
+  ([`poc/vendor/zakura-orchard/src/builder.rs:517`](poc/vendor/zakura-orchard/src/builder.rs)),
+  so whatever holds the candidate can see the vault's payments.
+- **WYSIWYS.** The proposer's signer builds the candidate PCZT
+  ([`poc/loki-signer-core/src/signer/coordination.rs:105`](poc/loki-signer-core/src/signer/coordination.rs));
+  every member **re-derives the sighash and refuses any mismatch** before signing
+  ([`poc/src/host/payment.rs:349`](poc/src/host/payment.rs)).
 - **Private payments.** Payment details stay **member↔member, sealed, and carried over
   `frostd`** — the coordinator never sees them.
 - **Dial-out relay.** `frostd` is the signing relay; coordinator and members connect
   **outbound** to it, so a member needs **zero inbound** — a browser tab suffices.
 - **Substitution defence.** Roster-fingerprint verification binds the DKG to the agreed set
   of members ([`poc/src/host/ceremony.rs`](poc/src/host/ceremony.rs)).
-- **In-browser custody.** The share is born in a Web Worker during DKG, never enters page
-  JavaScript, and is sealed under the passkey's WebAuthn-PRF secret (or an Argon2id
-  passphrase key) before it touches OPFS.
+- **In-browser custody (testnet only by policy).** The share is born in a Web Worker during
+  DKG and is sealed under the passkey's WebAuthn-PRF secret (or an Argon2id passphrase key)
+  before it touches OPFS. The passphrase and the PRF output pass through page JavaScript
+  on their way to the worker ([`web/wallet/src/lib/signer.ts:177`](web/wallet/src/lib/signer.ts)),
+  and the coordinator site serves the page and worker code that holds the share, so whoever
+  controls that origin can capture both. That is why the browser signer is testnet-only.
 
 ## Try it
 
@@ -154,11 +160,11 @@ recovery-spend drills. Tracked in
 | `web/wallet/` | Next.js wallet UI **and** keyless coordinator (public roster); the in-browser signer loads here |
 | `poc/loki-signer-wasm/` | The signer core compiled to wasm + the Web Worker that runs it in the browser |
 | `poc/wasm-transport/` | Browser `frostd` transport (wasm), loaded lazily for DKG/payment |
-| `poc/src/signer/` | The isolated signer: `Signer` trait, `LocalSigner`, sealing, nonces, WYSIWYS, backup |
+| `poc/loki-signer-core/src/signer/` | The isolated signer: `Signer` trait, `LocalSigner`, sealing, nonces, WYSIWYS, backup |
 | `poc/src/host/` | The native member app: ceremony, payment, recovery, device pairing + its HTTP routes |
 | `poc/src/coordinator_boundary.rs` | The keyless coordinator↔signer seam |
 | `poc/src/transport.rs` | `frostd` transport (native) |
-| `poc/src/distributed_setup.rs`, `candidate.rs`, `signing_session.rs` | General t-of-n DKG + signing primitives |
+| `poc/loki-signer-core/src/distributed_setup.rs`, `candidate.rs`, `signing_session.rs` | General t-of-n DKG + signing primitives |
 | `poc/src/scan.rs`, `witness.rs` | Chain scan / balance (coordinator) |
 | `poc/enclave-spike/` | Secure Enclave feasibility spike |
 | `communication/deploy/` | Deploy scripts: `public-testnet.sh` (host), `join-loki.sh` / `run-member.sh` (join) |

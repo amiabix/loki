@@ -11,8 +11,11 @@
 //!   2. derive the rerandomizer from those commitments and the candidate's `alpha` from it,
 //!   3. ASK THE PROPOSER SIGNER to build the unproved candidate PCZT under that alpha
 //!      ([`Signer::build_candidate`]) — using ITS own viewing key and ITS own selected note.
-//!      The coordinator passes only the public payment effects + alpha and never sees the
-//!      viewing key, the note, or selects a note.
+//!      The coordinator passes only the public payment effects + alpha and never selects a
+//!      note. It does see the viewing key: the candidate PCZT it gets back carries the vault
+//!      FVK and the spent note in each Orchard spend, so this loop must run where that is
+//!      acceptable (in the host, the coordinator role runs inside the proposer member's
+//!      process).
 //!   4. assemble the FROST [`SigningPackage`] from the commitments + the candidate sighash,
 //!   5. round 2: [`Signer::sign_approve`] on each member (pczt + package + randomizer seed),
 //!   6. aggregate the shares ([`frost_rerandomized::aggregate`]), apply the signature to the
@@ -93,8 +96,8 @@ where
 
     // 3. Ask the PROPOSER signer (quorum member 0) to build the unproved candidate under
     //    this alpha. It uses its OWN viewing key and OWN selected note; the coordinator
-    //    hands over only the public effects + alpha (canonical bytes). The coordinator never
-    //    sees the viewing key or the note and never selects one.
+    //    hands over only the public effects + alpha (canonical bytes) and never selects a
+    //    note; the returned candidate carries the vault FVK and the spent note.
     let pczt_bytes = {
         let proposer = &quorum[0];
         proposer
