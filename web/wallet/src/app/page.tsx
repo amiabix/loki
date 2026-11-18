@@ -8,6 +8,7 @@ import {
   ApiError,
   fund,
   createSigner,
+  enroll,
   unlock,
   hasSigner,
   hasSignerHint,
@@ -525,8 +526,8 @@ function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string 
       <div className="font-display text-center text-5xl font-semibold tracking-tight">Loki</div>
       <h1 className="mb-2 mt-8 text-xl font-semibold">{unlocking ? "Unlock your signer" : "Create your signer"}</h1>
       <p className="mb-5 text-sm text-muted">
-        Your signing share lives in this browser, sealed by a passkey. The platform never sees it —
-        no install, no pairing link.
+        Your signing share lives in this browser, in the Loki signer&apos;s own storage, sealed under your
+        passkey or passphrase. This page and the coordinator never receive it. Testnet only.
       </p>
 
       {!unlocking && (
@@ -592,7 +593,25 @@ function AccountNumber() {
   useEffect(() => {
     try { setId(JSON.parse(sessionStorage.getItem("loki_me") ?? "null")?.slot ?? null); } catch {}
   }, []);
-  return id ? <p className="mb-5 text-xs text-muted">Account number: <span className="select-all font-mono">{id}</span> · Your public roster slot in this vault.</p> : null;
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  // Register this browser's signer in the coordinator's public roster (frostd-only member, no
+  // advertised URL). The signer signs the registration on its own origin; registering the same
+  // identity again returns the same slot, so this also recovers the number after a reload.
+  const register = async () => {
+    setBusy(true); setErr(null);
+    try {
+      const member = await enroll();
+      try { sessionStorage.setItem("loki_me", JSON.stringify({ slot: member.slot })); } catch {}
+      setId(member.slot);
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  };
+  if (id) return <p className="mb-5 text-xs text-muted">Account number: <span className="select-all font-mono">{id}</span> · Your public roster slot in this vault.</p>;
+  return <div className="mb-5">
+    <Btn variant="ghost" disabled={busy} onClick={register}>{busy ? "Registering…" : "Register this signer with the coordinator"}</Btn>
+    <ErrMsg msg={err} />
+  </div>;
 }
 
 // ─── home ─────────────────────────────────────────────────────────────────────
