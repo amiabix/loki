@@ -1550,6 +1550,113 @@ mod tests {
         std::fs::remove_dir_all(data).unwrap();
     }
 
+    /// A host serving `data` on a loopback port: its base URL and API token.
+    async fn spawn_host(data: &Path) -> (String, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let config = crate::host::config_from_args(&[
+            "--data".into(), data.to_str().unwrap().into(), "--port".into(), "3601".into(),
+        ]).unwrap();
+        let token = config.token.clone();
+        let st: Shared = std::sync::Arc::new(AppState::new(config));
+        tokio::spawn(async move { axum::serve(listener, crate::host::routes::router(st)).await });
+        (base, token)
+    }
+
+    /// Restore-on-new-device drill through the host recovery routes: the old device exports its
+    /// recovery backup, a CLEAN data dir restores it with the words over `POST
+    /// /api/recovery-restore`, and the restored member signs through the nonce store the
+    /// payment path uses (`payment::sign`). A nonce the old device committed before the restore,
+    /// and a package carrying that old commitment, are both refused afterwards.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restore_on_new_device_over_routes_signs_and_refuses_pre_restore_nonce() {
+        use crate::signer::nonce::NonceStore;
+        use crate::signer::secure_element::SoftwareSecureElement;
+        let root = std::env::temp_dir().join(format!("loki-restore-drill-{}", Uuid::new_v4()));
+        let (old, new) = (root.join("old"), root.join("new"));
+        let vault = [5u8; 32];
+        let vault_hex = hex::encode(vault);
+        let pass = "drill pass";
+        let client = reqwest::Client::new();
+        let call = |base: &str, token: &str, method: reqwest::Method, path: &str, body: Value| {
+            client.request(method, format!("{base}{path}")).header("x-loki-token", token).json(&body).send()
+        };
+
+        // Old device: an active vault, recovery set up, backup exported over the route.
+        crate::profile::create(&old, pass, "Old").unwrap();
+        let (_material, shares, public) = dealer_vault(&old, vault, pass);
+        let (old_base, old_token) = spawn_host(&old).await;
+        assert!(call(&old_base, &old_token, reqwest::Method::POST, "/api/unlock", json!({"passphrase": pass})).await.unwrap().status().is_success());
+        let words = call(&old_base, &old_token, reqwest::Method::POST, "/api/recovery-setup", json!({})).await.unwrap()
+            .json::<Value>().await.unwrap()["words"].as_str().unwrap().to_owned();
+        let backup = call(&old_base, &old_token, reqwest::Method::GET, &format!("/api/recovery-backup?vault={vault_hex}"), json!({}))
+            .await.unwrap().json::<Value>().await.unwrap()["backup"].as_str().unwrap().to_owned();
+
+        // Before the restore the old device commits a nonce for an attempt, as `payment::sign`
+        // does (ephemeral element, `signer-nonces`, id = payment || attempt).
+        let id1 = frost::Identifier::try_from(1u16).unwrap();
+        let id2 = frost::Identifier::try_from(2u16).unwrap();
+        let old_key = frost::keys::KeyPackage::try_from(shares[&id1].clone()).unwrap();
+        let peer = frost::keys::KeyPackage::try_from(shares[&id2].clone()).unwrap();
+        let stale_id = hex::encode([[3u8; 32], [3u8; 32]].concat());
+        let old_nonces = dir(&old, &vault_hex).unwrap().path().join("signer-nonces");
+        let old_commitment = NonceStore::open(&old_nonces).unwrap()
+            .commit(&stale_id, &SoftwareSecureElement::generate(), old_key.signing_share()).unwrap();
+
+        // New device: a clean data dir restores from the exported backup and the words alone.
+        crate::profile::create(&new, pass, "New").unwrap();
+        let (new_base, new_token) = spawn_host(&new).await;
+        assert!(call(&new_base, &new_token, reqwest::Method::POST, "/api/unlock", json!({"passphrase": pass})).await.unwrap().status().is_success());
+        let restored = call(&new_base, &new_token, reqwest::Method::POST, "/api/recovery-restore",
+            json!({"vault": vault_hex, "words": words, "backup": backup})).await.unwrap();
+        assert_eq!(restored.status(), reqwest::StatusCode::OK);
+        assert_eq!(restored.json::<Value>().await.unwrap(), json!({"restored": true}));
+        let status = call(&new_base, &new_token, reqwest::Method::GET, &format!("/api/recovery-status?vault={vault_hex}"), json!({}))
+            .await.unwrap().json::<Value>().await.unwrap();
+        assert_eq!(status, json!({"recovery_identity": true, "recovery_backup": true}));
+
+        // The restored member signs: the payment path opens it, its nonce store emits a share,
+        // and the share aggregates with member 2's into a signature under the group key.
+        crate::host::payment::load_vault(&new, pass, &vault_hex, "regtest").expect("the restored member opens for signing");
+        let sealed: Value = serde_json::from_slice(&dir(&new, &vault_hex).unwrap().read_sealed("vault.sealed", pass).unwrap()).unwrap();
+        let key = frost::keys::KeyPackage::deserialize(&hex::decode(sealed["key_package"].as_str().unwrap()).unwrap()).unwrap();
+        let group = frost::keys::PublicKeyPackage::deserialize(&hex::decode(sealed["public_package"].as_str().unwrap()).unwrap()).unwrap();
+        assert_eq!(group.verifying_key(), public.verifying_key());
+        let new_nonces = dir(&new, &vault_hex).unwrap().path().join("signer-nonces");
+        assert!(!new_nonces.exists(), "a clean device starts with no nonces");
+        let store = NonceStore::open(&new_nonces).unwrap();
+        let se = SoftwareSecureElement::generate();
+        let fresh_id = hex::encode([[4u8; 32], [4u8; 32]].concat());
+        let c1 = store.commit(&fresh_id, &se, key.signing_share()).unwrap();
+        let (n2, c2) = frost::round1::commit(peer.signing_share(), &mut OsRng);
+        let package_with = |own| {
+            let commitments = BTreeMap::from([(id1, own), (id2, c2)]);
+            let package = frost::SigningPackage::new(commitments.clone(), &[6u8; 32]);
+            let (params, seed) = frost_rerandomized::RandomizedParams::new_from_commitments(public.verifying_key(), &commitments, OsRng).unwrap();
+            (package, params, <[u8; 32]>::try_from(seed).unwrap())
+        };
+        let (package, params, seed) = package_with(c1);
+        let own = store.sign_and_burn(&fresh_id, &se, &package, &key, &seed, &|| false).unwrap();
+        let theirs = frost_rerandomized::sign_with_randomizer_seed(&package, &n2, &peer, &seed).unwrap();
+        let signature = frost_rerandomized::aggregate(&package, &BTreeMap::from([(id1, own), (id2, theirs)]), &group, &params)
+            .expect("the restored member's share aggregates");
+        params.randomized_verifying_key().verify(&[6u8; 32], &signature).unwrap();
+
+        // The old device's nonce file, replayed into the new device, never signs and is never
+        // replaced by a fresh nonce for that id.
+        std::fs::copy(old_nonces.join(format!("{stale_id}.nonce")), new_nonces.join(format!("{stale_id}.nonce"))).unwrap();
+        let (package, _, seed) = package_with(old_commitment);
+        assert!(store.sign_and_burn(&stale_id, &se, &package, &key, &seed, &|| false).is_err());
+        assert!(store.commit(&stale_id, &se, key.signing_share()).is_err());
+        assert!(!new_nonces.join(format!("{stale_id}.burn")).exists(), "no share was released");
+        // A package carrying the pre-restore commitment is refused against the new nonce.
+        let retry_id = hex::encode([[3u8; 32], [8u8; 32]].concat());
+        store.commit(&retry_id, &se, key.signing_share()).unwrap();
+        assert!(store.sign_and_burn(&retry_id, &se, &package, &key, &seed, &|| false).is_err());
+        assert!(!new_nonces.join(format!("{retry_id}.burn")).exists(), "no share was released");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
 }
 
 // ---- self-custody helpers ported from the speedmaster host (device pairing + recovery restore) ----

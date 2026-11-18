@@ -576,6 +576,28 @@ mod tests {
         assert_eq!(notes[0].value_zat, 150);
     }
 
+    /// A reorg below the saved tip that drops the block's vault note entirely: the resumed scan
+    /// must not keep offering the note it saw on the old branch.
+    #[test]
+    fn reorg_that_drops_a_note_below_the_saved_tip_forgets_it() {
+        let vault = a_fvk(3);
+        let decoy = a_fvk(9);
+        let mut chain = canned_chain(&vault, &decoy);
+        let mut state = ScanState::default();
+        scan_blocks(&vault, &mut state, 6, |h| Ok(chain[h as usize - 1].clone())).unwrap();
+        let path = std::env::temp_dir().join(format!("loki-reorg-drop-{}.txt", std::process::id()));
+        state.save(&path).unwrap();
+        let mut state = ScanState::load(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(state.notes(&vault).unwrap().iter().any(|note| note.value_zat == 100));
+
+        chain[1]["tx"] = serde_json::json!([]);
+        rebranch(&mut chain, 1);
+        scan_blocks(&vault, &mut state, 6, |h| Ok(chain[h as usize - 1].clone())).unwrap();
+        let notes = state.notes(&vault).unwrap();
+        assert_eq!(notes.iter().map(|note| note.value_zat).collect::<Vec<_>>(), [200, 300]);
+    }
+
     #[test]
     fn legacy_cache_without_tip_hash_is_rescanned() {
         let vault = a_fvk(3);
