@@ -706,7 +706,10 @@ impl<SE: SecureElement> LocalSigner<SE> {
     /// document that backup carried, so it can seal and open control messages with its peers
     /// again. Only for a restored signer (no data directory, no roster or setup yet); the
     /// document passes the same roster gate as setup and must match the restored vault size.
-    pub fn adopt_restored_roster(&mut self, document: &[u8]) -> Result<(), SignerError> {
+    /// `connect` is the member's on-device connection prompt: a restored signer built from a
+    /// bare share has none, so without it every session stays unapproved and the member can
+    /// never release its address.
+    pub fn adopt_restored_roster(&mut self, document: &[u8], connect: ConnectApproval) -> Result<(), SignerError> {
         if self.store.is_some() || self.roster.is_some() || self.setup.is_some() {
             return Err(SignerError::Other("only a restored signer adopts its backup roster".into()));
         }
@@ -715,6 +718,7 @@ impl<SE: SecureElement> LocalSigner<SE> {
             return Err(SignerError::RosterRejected("roster differs from the restored vault".into()));
         }
         self.roster = Some((roster, document.to_vec()));
+        self.connect_approval = Some(connect);
         Ok(())
     }
 
@@ -1449,11 +1453,19 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
         }
         self.require_ready()?;
         let (roster, _) = self.roster.as_ref().ok_or(SignerError::NotReady)?;
-        let setup = self.setup.as_ref().ok_or(SignerError::NotReady)?;
         let identity = self.identity.as_ref().ok_or(SignerError::NotReady)?;
-        let address = DkgCore::new(roster, identity)
-            .and_then(|core| core.address(&setup.core))
-            .map_err(SignerError::Other)?;
+        let address = match self.setup.as_ref() {
+            Some(setup) => DkgCore::new(roster, identity)
+                .and_then(|core| core.address(&setup.core))
+                .map_err(SignerError::Other)?,
+            // A member restored from its backup holds the vault FVK its DKG derived
+            // (`frost_viewing_key(ak, vs)`, the same key `DkgCore::address` encodes), not the
+            // setup transcript.
+            None => crate::vault::unified_address(
+                self.vault_fvk.as_ref().ok_or(SignerError::NotReady)?,
+                zcash_protocol::consensus::Parameters::network_type(&roster.roster().network),
+            ),
+        };
         Ok(ReleasedAddress {
             vault_id: self.vault_id,
             address,

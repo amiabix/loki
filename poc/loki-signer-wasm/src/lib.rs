@@ -1142,7 +1142,7 @@ impl Signer {
             let nonces = std::path::PathBuf::from(format!("{dir}/nonces"));
             let mut signer = backup::restore(&artifact, &pass, &vault_id, se, nonces, prompts.approval)
                 .map_err(|e| e.to_string())?;
-            signer.adopt_restored_roster(&roster).map_err(|e| e.to_string())?;
+            signer.adopt_restored_roster(&roster, prompts.connect).map_err(|e| e.to_string())?;
             signer
         } else {
             return Err("this browser holds no signer for that vault".into());

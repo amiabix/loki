@@ -525,13 +525,27 @@ mod tests {
                 .unwrap()
         };
 
+        let connect = || -> crate::signer::local::ConnectApproval { Box::new(|_origin, _net| true) };
         let mut other = restore_one();
-        assert!(other.adopt_restored_roster(&doc([8u8; 32])).is_err(), "a roster for another vault");
+        assert!(other.adopt_restored_roster(&doc([8u8; 32]), connect()).is_err(), "a roster for another vault");
         let mut signer = restore_one();
         assert!(signer.confirmed_roster().is_none());
-        signer.adopt_restored_roster(&roster).unwrap();
+        // Without the adopted connect prompt a restored member's session is never approved.
+        let unapproved = signer.connect("https://coordinator", Network::Regtest, b"before").unwrap().session;
+        assert!(matches!(signer.release_address(&unapproved), Err(SignerError::ConnectRefused)));
+        signer.adopt_restored_roster(&roster, connect()).unwrap();
         assert_eq!(signer.confirmed_roster().unwrap().members.len(), 3);
-        assert!(signer.adopt_restored_roster(&roster).is_err(), "adopted once");
+        assert!(signer.adopt_restored_roster(&roster, connect()).is_err(), "adopted once");
+
+        // Restored, the member connects, releases the vault's address (from the FVK the backup
+        // re-derives, as the DKG did) and can commit a signing nonce.
+        let session = signer.connect("https://coordinator", Network::Regtest, b"after").unwrap().session;
+        let released = signer.release_address(&session).unwrap();
+        let fvk = zip2005::frost_viewing_key(&material.group_ak().unwrap(), &material.group_sk).unwrap();
+        assert_eq!(released.vault_id, material.vault_id);
+        assert_eq!(released.address, crate::vault::unified_address(&fvk, zcash_protocol::consensus::NetworkType::Regtest));
+        let cand = CandidateRef { vault_id: material.vault_id, payment_id: [3; 32], attempt_id: [4; 32] };
+        signer.sign_commit(&session, &cand).unwrap();
     }
 
     #[test]
