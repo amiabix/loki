@@ -441,7 +441,7 @@ async function drivePayment(signer, p) {
   const consent = await ask("payment-sign", review);
   if (!consent) throw new Error("You declined to sign this payment");
   signer.reauth(consent.method, consent.passphrase, consent.prfSecret);
-  const share = signer.signApprove(attemptHex, candidateHex, packageHex, seedHex, review.sighash);
+  const share = signer.signApprove(attemptHex, candidateHex, packageHex, seedHex, review.sighash, JSON.stringify({ ...terms, tx_expiry: expiry }));
   await fc.sendToCoordinator(share);
   return { approved: true, signed: true, review };
 }

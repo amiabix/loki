@@ -21,7 +21,10 @@ use loki_signer_core::signer::local::{
 };
 use loki_signer_core::vault::orchard_receiver_from_ua;
 use loki_signer_core::verify::{check_candidate, Expectations, Refusal};
+use loki_signer_core::signer::PublicPaymentParams;
 use zcash_protocol::consensus::{BlockHeight, BranchId, Parameters};
+use zcash_protocol::memo::MemoBytes;
+use zcash_protocol::value::Zatoshis;
 use loki_signer_core::signer::secure_element::{
     fresh_kek_salt, SealedShare, SoftwareSecureElement,
 };
@@ -606,7 +609,9 @@ impl Signer {
     /// exact sighash — before the nonce/share is touched (WYSIWYS). `candidate_hex` is the
     /// opened candidate, `seed_hex` the 32-byte rerandomizer seed. `confirmed_sighash_hex` is
     /// the sighash the member confirmed on the signer page: the core's approval prompt approves
-    /// only when its own recomputed sighash equals it. Reopen the vault first.
+    /// only when its own recomputed sighash equals it. `terms_json` is the payment the member
+    /// approved (the same terms `paymentCheck` took): the core refuses a candidate whose
+    /// recipient, amount, memo, anchor or expiry differ from it. Reopen the vault first.
     #[wasm_bindgen(js_name = signApprove)]
     pub fn sign_approve(
         &mut self,
@@ -615,8 +620,9 @@ impl Signer {
         package_hex: &str,
         seed_hex: &str,
         confirmed_sighash_hex: &str,
+        terms_json: &str,
     ) -> Result<String, JsError> {
-        self.sign_approve_impl(attempt_hex, candidate_hex, package_hex, seed_hex, confirmed_sighash_hex)
+        self.sign_approve_impl(attempt_hex, candidate_hex, package_hex, seed_hex, confirmed_sighash_hex, terms_json)
             .map_err(|e| JsError::new(&e))
     }
 }
@@ -746,6 +752,26 @@ struct Terms {
     tx_expiry: u32,
 }
 
+/// The consensus parameters of a browser signer's network (testnet-only gate included).
+fn vault_network(net: Network) -> Result<VaultNetwork, String> {
+    Ok(match browser_network(net)? {
+        Network::Regtest => VaultNetwork::Regtest,
+        Network::Testnet => VaultNetwork::Testnet,
+    })
+}
+
+/// The reviewed request core `sign_approve` binds the candidate to, built from the terms the
+/// member approved — never from the candidate (payment.rs builds it the same way).
+fn payment_params(terms: &Terms, net: VaultNetwork) -> Result<PublicPaymentParams, String> {
+    Ok(PublicPaymentParams {
+        recipient: orchard_receiver_from_ua(&terms.recipient, net.network_type())?,
+        amount: Zatoshis::from_u64(terms.amount_zat).map_err(|e| format!("amount: {e:?}"))?,
+        memo: MemoBytes::from_bytes(terms.memo.as_bytes()).map_err(|e| format!("memo: {e:?}"))?,
+        target_height: terms.target_height,
+        expiry_height: terms.tx_expiry,
+    })
+}
+
 /// The co-signer review of a candidate against approved terms (payment.rs `review_candidate`).
 fn check_against_terms(
     bytes: &[u8],
@@ -855,10 +881,7 @@ impl Signer {
     fn payment_check_impl(&self, candidate_hex: &str, terms_json: &str) -> Result<String, String> {
         let vs = self.vault.as_ref().ok_or("no active vault — call vaultOpen first")?;
         let terms: Terms = serde_json::from_str(terms_json).map_err(|e| format!("payment terms: {e}"))?;
-        let net = match browser_network(vs.signer.network())? {
-            Network::Regtest => VaultNetwork::Regtest,
-            Network::Testnet => VaultNetwork::Testnet,
-        };
+        let net = vault_network(vs.signer.network())?;
         let (_, fvk) = vs.signer.hosted_metadata().map_err(|e| e.to_string())?;
         let bytes = hex::decode(candidate_hex).map_err(|e| e.to_string())?;
         check_against_terms(&bytes, &terms, net, &fvk)?;
@@ -942,9 +965,10 @@ impl Signer {
         package_hex: &str,
         seed_hex: &str,
         confirmed_sighash_hex: &str,
+        terms_json: &str,
     ) -> Result<String, String> {
         let (cand, _) = self.candidate_ref(attempt_hex)?;
-        *self.approved.lock().map_err(|_| "approval state poisoned")? = Some(hex32(confirmed_sighash_hex)?);
+        let terms: Terms = serde_json::from_str(terms_json).map_err(|e| format!("payment terms: {e}"))?;
         let candidate = hex::decode(candidate_hex).map_err(|e| e.to_string())?;
         let package = frost::SigningPackage::deserialize(
             &hex::decode(package_hex).map_err(|e| e.to_string())?,
@@ -952,9 +976,11 @@ impl Signer {
         .map_err(|e| e.to_string())?;
         let seed = hex32(seed_hex)?;
         let vs = self.vault.as_mut().ok_or("no active vault — call vaultJoin first")?;
+        let params = payment_params(&terms, vault_network(vs.signer.network())?)?;
+        *self.approved.lock().map_err(|_| "approval state poisoned")? = Some(hex32(confirmed_sighash_hex)?);
         let share = vs
             .signer
-            .sign_approve(&vs.session, &cand, &candidate, &package, &seed)
+            .sign_approve(&vs.session, &cand, &params, &candidate, &package, &seed)
             .map_err(|e| e.to_string())?;
         Ok(hex::encode(share.serialize()))
     }
@@ -1194,6 +1220,16 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
+    fn sign_params_come_only_from_valid_approved_terms() {
+        let terms = |recipient: &str, amount_zat| Terms {
+            recipient: recipient.into(), amount_zat, memo: "m".into(), fee_zat: 0, change_zat: 0,
+            note_selection: vec![], target_height: 10, tx_expiry: 20,
+        };
+        assert!(payment_params(&terms("not an address", 1), VaultNetwork::Testnet).is_err());
+        assert!(vault_network(Network::Testnet).is_ok() && vault_network(Network::Regtest).is_ok());
+    }
+
+    #[wasm_bindgen_test]
     fn prompts_answer_only_what_the_member_confirmed() {
         let approved = Arc::new(Mutex::new(None));
         let mut prompts = browser_prompts("d", &[0u8; 32], Some("1111 2222".into()), approved.clone());
@@ -1204,7 +1240,7 @@ mod tests {
 
         let cand = CandidateRef { vault_id: [1; 32], payment_id: [2; 32], attempt_id: [2; 32] };
         let view = loki_signer_core::signer::wysiwys::PaymentView {
-            to: [0; 43], amount_zat: 1, fee_zat: 1, change_zat: 0, memo: vec![], network_branch_id: 0, fee_verified: true,
+            to: [0; 43], amount_zat: 1, fee_zat: 1, change_zat: 0, memo: vec![], network_branch_id: 0, fee_verified: true, expiry_height: 0,
         };
         let ask = |sighash| local::ApprovalRequest { candidate: &cand, sighash, view: &view };
         // Nothing confirmed: refuse. Confirmed: approve that sighash once, never another.
