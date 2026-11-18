@@ -34,6 +34,10 @@ jobs:
   rust:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    # Full debuginfo on ~35 test binaries fills the runner disk (ld dies with SIGBUS).
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
