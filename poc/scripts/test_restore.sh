@@ -131,7 +131,8 @@ phase_is() { [[ "$(api "$1" GET "/api/status?vault=$vault" | jq -r '.phase')" ==
 for i in 1 2 3; do wait_for "roster $i" 30 phase_is "$i" compare_roster; done
 for i in 1 2 3; do
   fingerprint="$(api "$i" GET "/api/status?vault=$vault" | jq -er '.fingerprint')" || fail "fingerprint $i"
-  api "$i" POST /api/agree "$(jq -nc --arg vault "$vault" --arg fingerprint "$fingerprint" '{vault:$vault,fingerprint:$fingerprint}')" | jq -e '.ok == true' >/dev/null || fail "agree $i"
+  roster_code="$(api "$i" GET "/api/status?vault=$vault" | jq -er '.roster_code')" || fail "roster code $i"
+  api "$i" POST /api/agree "$(jq -nc --arg vault "$vault" --arg fingerprint "$fingerprint" --arg roster_code "$roster_code" '{vault:$vault,fingerprint:$fingerprint,roster_code:$roster_code}')" | jq -e '.ok == true' >/dev/null || fail "agree $i"
 done
 for i in 1 2 3; do wait_for "DKG member $i" 120 phase_is "$i" active; done
 echo "vault $vault active"

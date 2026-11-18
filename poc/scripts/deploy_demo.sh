@@ -71,12 +71,12 @@ echo "[3/6] waiting for roster agreement"
 FP=""
 for n in $(seq 1 120); do
   s=$(api 1 GET "/api/status?vault=$V")
-  [ "$(echo "$s" | jq -r .phase)" = compare_roster ] && { FP=$(echo "$s" | jq -r .fingerprint); break; }
+  [ "$(echo "$s" | jq -r .phase)" = compare_roster ] && { FP=$(echo "$s" | jq -r .fingerprint); CODE=$(echo "$s" | jq -r .roster_code); break; }
   sleep 1
 done
 [ -z "$FP" ] && { echo "never reached compare_roster"; exit 1; }
 echo "      fingerprint=$FP"
-for i in $(seq 1 $N); do api $i POST /api/agree "{\"vault\":\"$V\",\"fingerprint\":\"$FP\"}" >/dev/null; done
+for i in $(seq 1 $N); do api $i POST /api/agree "{\"vault\":\"$V\",\"fingerprint\":\"$FP\",\"roster_code\":\"$CODE\"}" >/dev/null; done
 
 echo "[4/6] running DKG to active (this takes a bit for 10 members)"
 for i in $(seq 1 $N); do

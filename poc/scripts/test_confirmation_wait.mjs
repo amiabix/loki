@@ -62,17 +62,17 @@ test("confirmed members tolerate delayed confirmations, creator outages and pre-
       await members[slot - 1].api("join", { invite });
     }
     const status = (member) => member.api(`status?vault=${vault}`);
-    const fingerprint = (await status(members[0])).fingerprint;
+    const { fingerprint, roster_code } = await status(members[0]);
     await status(members[1]);
     await status(members[2]);
-    await members[1].api("agree", { vault, fingerprint });
+    await members[1].api("agree", { vault, fingerprint, roster_code });
     await delay(22_000);
     const waiting = await status(members[1]);
     assert.equal(waiting.phase, "compare_roster", `confirmation waiting must not time out: ${JSON.stringify(waiting)}`);
     assert.equal(waiting.confirmed, true);
     assert.equal((await status(members[0])).confirmations, 1);
     assert.equal((await status(members[2])).confirmed, false);
-    await members[1].api("agree", { vault, fingerprint });
+    await members[1].api("agree", { vault, fingerprint, roster_code });
     await members[0].api("lock", {});
     await delay(1500);
     assert.equal((await status(members[1])).phase, "compare_roster", "a locked creator must not invalidate a confirmed roster");
@@ -87,9 +87,9 @@ test("confirmed members tolerate delayed confirmations, creator outages and pre-
     const restarted = await status(members[1]);
     assert.equal(restarted.phase, "compare_roster");
     assert.equal(restarted.confirmed, true, "restart must preserve this member's consent");
-    await members[0].api("agree", { vault, fingerprint });
+    await members[0].api("agree", { vault, fingerprint, roster_code });
     assert.equal((await status(members[1])).phase, "compare_roster");
-    await members[2].api("agree", { vault, fingerprint });
+    await members[2].api("agree", { vault, fingerprint, roster_code });
     let states;
     for (let attempt = 0; attempt < 160; attempt++) {
       states = await Promise.all(members.map(status));

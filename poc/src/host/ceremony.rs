@@ -31,7 +31,7 @@ use crate::{
     signer::{
         backup::BackupArtifact,
         coordination::{member_dkg_step, redeliver_dkg, relay_dkg},
-        local::{ApprovalPolicy, BackupDevice, DevicePrompts, LocalSigner, RosterDecision, SignerError},
+        local::{roster_code, ApprovalPolicy, BackupDevice, DevicePrompts, LocalSigner, RosterDecision, SignerError},
         Network, Signer,
     },
     state::MemberDir,
@@ -71,7 +71,8 @@ impl BackupDevice for HostedBackup {
 pub(super) fn hosted_prompts(signer_dir: &Path, pass: &str, approval: ApprovalPolicy) -> DevicePrompts {
     DevicePrompts {
         connect: Box::new(|_, _| true),
-        roster: Box::new(|_| RosterDecision::Match),
+        // Only the hosted DKG compares a roster code (`roster_decision`); every other open refuses.
+        roster: Box::new(|_| RosterDecision::NoMatch),
         roster_deadline: Duration::from_secs(60),
         backup: Box::new(HostedBackup { dir: signer_dir.to_owned(), pass: Zeroizing::new(pass.to_owned()) }),
         approval,
@@ -147,6 +148,9 @@ struct Ceremony {
     // matches the creator's byte-for-byte (joiners must not reconstruct it from a guess).
     #[serde(default)]
     birth_height: Option<u32>,
+    // The roster code this member confirmed in `agree`; the signer's roster prompt matches it.
+    #[serde(default)]
+    roster_code: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -431,6 +435,7 @@ pub(super) async fn create(State(st): State<Shared>, Json(body): Json<Value>) ->
             dkg_started: false,
             error: None,
             birth_height: None,
+            roster_code: None,
         };
         save(&data, &pass, &c)?;
         Ok(json!({"vault":c.vault,"invites":invitations(&c)?}))
@@ -504,6 +509,7 @@ pub(super) async fn join(State(st): State<Shared>, Json(body): Json<Value>) -> R
             dkg_started: false,
             error: None,
             birth_height: None,
+            roster_code: None,
         };
         if dir(&data, &c.vault)?.exists("ceremony.sealed") {
             let old = load(&data, &pass, &c.vault)?;
@@ -566,6 +572,11 @@ pub(super) async fn enroll(State(st): State<Shared>, Json(body): Json<Value>) ->
         }
         if c.slots.values().all(|s| s.identity.is_some()) {
             c.fingerprint = Some(hex::encode(roster_of(&c)?.fingerprint()));
+            // Fixed with the roster so every member can show the roster code before agreeing.
+            let network = VaultNetwork::parse(&st.config.network)?;
+            if network == VaultNetwork::Testnet && c.birth_height.is_none() {
+                c.birth_height = Some(setup_birth_height(network, 1, None, || testnet_tip(&st, network))?);
+            }
         }
         save(&data, &pass, &c)?;
         Ok(json!({"ok":true}))
@@ -634,7 +645,7 @@ pub(super) async fn roster(State(st): State<Shared>, Json(body): Json<Value>) ->
             .into_iter()
             .map(|(slot, s)| (slot, s.identity))
             .collect();
-        Ok(json!({"fingerprint":fingerprint,"roster":roster}))
+        Ok(json!({"fingerprint":fingerprint,"roster":roster,"birth_height":c.birth_height}))
     })
     .await;
     if reply.1 .0["error"] == "roster pending" {
@@ -687,6 +698,7 @@ fn refresh_roster(c: &mut Ceremony) -> Result<(), String> {
         return Err("roster fingerprint mismatch".into());
     }
     c.fingerprint = Some(actual);
+    c.birth_height = remote["birth_height"].as_u64().and_then(|n| u32::try_from(n).ok());
     Ok(())
 }
 
@@ -726,6 +738,9 @@ pub(super) async fn status(st: Shared, vault: String) -> Reply {
         let mut value = json!({"phase":phase,"members":c.members,"threshold":c.threshold,
             "confirmations":c.agreed.len(),"confirmed":c.agreed.contains(&c.my_slot),
             "fingerprint":c.fingerprint});
+        if c.fingerprint.is_some() {
+            value["roster_code"] = json!(setup_roster_code(&c, VaultNetwork::parse(&st.config.network)?).ok());
+        }
         if c.my_slot == 1 {
             value["invites"] = json!(invitations(&c)?);
         }
@@ -764,11 +779,12 @@ fn spawn_dkg(st: Shared, vault: String, data: std::path::PathBuf, pass: Zeroizin
 }
 
 pub(super) async fn agree(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
-    let (Some(vault), Some(fingerprint)) = (body["vault"].as_str(), body["fingerprint"].as_str())
+    let (Some(vault), Some(fingerprint), Some(roster_code)) =
+        (body["vault"].as_str(), body["fingerprint"].as_str(), body["roster_code"].as_str())
     else {
-        return err(StatusCode::BAD_REQUEST, "missing vault or fingerprint");
+        return err(StatusCode::BAD_REQUEST, "missing vault, fingerprint or roster_code");
     };
-    let (vault, fingerprint) = (vault.to_owned(), fingerprint.to_owned());
+    let (vault, fingerprint, roster_code) = (vault.to_owned(), fingerprint.to_owned(), roster_code.to_owned());
     let (data, pass) = match unlocked(&st).await {
         Ok(x) => x,
         Err(e) => return e,
@@ -787,6 +803,10 @@ pub(super) async fn agree(State(st): State<Shared>, Json(body): Json<Value>) -> 
         if c.fingerprint.as_deref() != Some(&fingerprint) {
             return Err("roster fingerprint mismatch".into());
         }
+        let code = setup_roster_code(&c, VaultNetwork::parse(&work_st.config.network)?)?;
+        if code != roster_code {
+            return Err("roster code mismatch".into());
+        }
         if c.my_slot != 1 {
             peer_request(
                 "POST",
@@ -795,6 +815,7 @@ pub(super) async fn agree(State(st): State<Shared>, Json(body): Json<Value>) -> 
             )?;
         }
         c.agreed.insert(c.my_slot);
+        c.roster_code = Some(code);
         save(&work_data, &work_pass, &c)?;
         Ok(json!({"ok":true}))
     })
@@ -899,15 +920,61 @@ fn setup_birth_height(
     if network == VaultNetwork::Regtest {
         return Ok(2);
     }
-    let height = if slot == 1 {
-        fetch_tip()?
-    } else {
-        published.ok_or("creator did not publish a testnet birth height")?
+    let height = match published {
+        Some(height) => height,
+        None if slot == 1 => fetch_tip()?,
+        None => return Err("creator did not publish a testnet birth height".into()),
     };
     if height < TESTNET_NU7_BIRTH {
         return Err("creator birth height precedes testnet NU7".into());
     }
     Ok(height)
+}
+
+fn testnet_tip(st: &Shared, network: VaultNetwork) -> Result<u32, String> {
+    let url = st.config.lightwalletd.as_deref().ok_or("Testnet vault requires a lightwalletd URL")?;
+    let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let channel = runtime.block_on(crate::wallet_store::lightwalletd_endpoint(url)?.connect())
+        .map_err(|e| format!("connect to lightwalletd: {e}"))?;
+    let mut client = crate::wallet_store::Lightwalletd::new(channel);
+    let info = runtime.block_on(client.get_lightd_info(zcash_client_backend::proto::service::Empty {}))
+        .map_err(|e| format!("lightwalletd info: {e}"))?.into_inner();
+    if info.chain_name != "test"
+        || Some(info.sapling_activation_height) != network.activation_height(zcash_protocol::consensus::NetworkUpgrade::Sapling).map(u64::from) {
+        return Err("lightwalletd serves another chain".into());
+    }
+    u32::try_from(info.block_height).map_err(|_| "chain height overflow".into())
+}
+
+/// The setup document `dkg_begin` receives, and its birth height. `agree`, `status` and
+/// `run_background` all use these bytes, so the code a member confirms is the code the signer shows.
+fn setup_document(c: &Ceremony, network: VaultNetwork) -> Result<(Vec<u8>, u32), String> {
+    // The creator fixes the testnet birth height in `enroll`, when the roster completes.
+    let birth_height = setup_birth_height(network, c.my_slot, c.birth_height,
+        || Err("testnet birth height is not fixed yet".into()))?;
+    let roster = roster_of(c)?;
+    let mut document = json!({
+        "vault": c.vault, "threshold": c.threshold, "setup_version": 2,
+        "network": network.label(),
+        "members": roster.members.values().map(|p| json!({
+            "id": p.id, "signing": hex::encode(p.signing),
+            "encryption": hex::encode(p.encryption),
+        })).collect::<Vec<_>>(),
+    });
+    if network == VaultNetwork::Testnet {
+        document["birth_height"] = json!(birth_height);
+    }
+    Ok((serde_json::to_vec(&document).map_err(|e| e.to_string())?, birth_height))
+}
+
+fn setup_roster_code(c: &Ceremony, network: VaultNetwork) -> Result<String, String> {
+    let (document, _) = setup_document(c, network)?;
+    Ok(roster_code(&crate::member_state::Roster::from_bytes(&document)?.fingerprint()))
+}
+
+/// The signer's roster prompt: only the code this member confirmed matches.
+fn roster_decision(confirmed: Option<&str>, code: &str) -> RosterDecision {
+    if confirmed == Some(code) { RosterDecision::Match } else { RosterDecision::NoMatch }
 }
 
 fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result<Value, String> {
@@ -942,10 +1009,9 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
                             .ok_or("invalid creator relay identity")?;
                         c.session_id = Some(id);
                         c.coordinator_peer = Some(hex::encode(peer));
-                        if st.config.network == "testnet" {
-                            c.birth_height = Some(response["birth_height"].as_u64()
-                                .and_then(|n| u32::try_from(n).ok())
-                                .ok_or("creator did not publish a valid testnet birth height")?);
+                        if st.config.network == "testnet"
+                            && response["birth_height"].as_u64() != c.birth_height.map(u64::from) {
+                            return Err("creator session birth height differs from the agreed roster".into());
                         }
                         break;
                     }
@@ -964,20 +1030,7 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
         let me = identity(data, pass, c.my_slot)?;
         let roster = roster_of(&c)?;
         let network = VaultNetwork::parse(&st.config.network)?;
-        let birth_height = setup_birth_height(network, c.my_slot, c.birth_height, || {
-                let url = st.config.lightwalletd.as_deref().ok_or("Testnet vault requires a lightwalletd URL")?;
-                let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-                let channel = runtime.block_on(crate::wallet_store::lightwalletd_endpoint(url)?.connect())
-                    .map_err(|e| format!("connect to lightwalletd: {e}"))?;
-                let mut client = crate::wallet_store::Lightwalletd::new(channel);
-                let info = runtime.block_on(client.get_lightd_info(zcash_client_backend::proto::service::Empty {}))
-                    .map_err(|e| format!("lightwalletd info: {e}"))?.into_inner();
-                if info.chain_name != "test"
-                    || Some(info.sapling_activation_height) != network.activation_height(zcash_protocol::consensus::NetworkUpgrade::Sapling).map(u64::from) {
-                    return Err("lightwalletd serves another chain".into());
-                }
-                u32::try_from(info.block_height).map_err(|_| "chain height overflow".into())
-        })?;
+        let (document, birth_height) = setup_document(&c, network)?;
         let peers: BTreeMap<u16, Peer> = roster.members.values()
             .map(|identity| (identity.id, Peer(identity.encryption))).collect();
         let identity_secret = Zeroizing::new(me.to_secret_bytes());
@@ -1001,7 +1054,6 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
             let peer = Peer(coord.public().encryption);
             c.session_id = Some(id);
             c.coordinator_peer = Some(hex::encode(peer.0));
-            c.birth_height = Some(birth_height);
             {
                 let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
                 save(data, pass, &c)?;
@@ -1023,7 +1075,10 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
             VaultNetwork::Testnet => Network::Testnet,
         };
         // DKG never signs a payment; any request still goes to the member, or is refused.
-        let prompts = hosted_prompts(&signer_dir, pass, super::approval_policy(st.approval.clone(), signer_network, c.my_slot));
+        let mut prompts = hosted_prompts(&signer_dir, pass, super::approval_policy(st.approval.clone(), signer_network, c.my_slot));
+        // Matches only the code this member confirmed in `agree`.
+        let confirmed = c.roster_code.clone();
+        prompts.roster = Box::new(move |code| roster_decision(confirmed.as_deref(), code));
         let mut signer = if signer_dir.join("signer.meta").exists() {
             LocalSigner::open(&signer_dir, se, c.name.clone(), prompts)
         } else {
@@ -1038,20 +1093,8 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
             return Err("signer identity differs from enrolled member".into());
         }
         let session = connection.session;
-        let document = json!({
-            "vault": c.vault, "threshold": c.threshold, "setup_version": 2,
-            "network": network.label(),
-            "members": roster.members.values().map(|p| json!({
-                "id": p.id, "signing": hex::encode(p.signing),
-                "encryption": hex::encode(p.encryption),
-            })).collect::<Vec<_>>(),
-        });
-        let mut document = document;
-        if network == VaultNetwork::Testnet {
-            document["birth_height"] = json!(birth_height);
-        }
         let vault_ref = if signer.list_vaults(&session).map_err(|e| e.to_string())?.is_empty() {
-            signer.dkg_begin(&session, &serde_json::to_vec(&document).map_err(|e| e.to_string())?)
+            signer.dkg_begin(&session, &document)
                 .map_err(|e| e.to_string())?
         } else {
             signer.list_vaults(&session).map_err(|e| e.to_string())?.remove(0)
@@ -1168,6 +1211,7 @@ mod tests {
             dkg_started: false,
             error: None,
             birth_height: None,
+            roster_code: None,
         };
         let fingerprint = roster_of(&c).unwrap().fingerprint();
         assert_eq!(fingerprint, roster_of(&c).unwrap().fingerprint());
@@ -1190,7 +1234,7 @@ mod tests {
             my_slot: 1, creator_base_url: String::new(), frostd_url: String::new(),
             slots, fingerprint: Some("fingerprint".into()), agreed: BTreeSet::new(),
             session_id: None, coordinator_peer: None, vs_session_id: None,
-            dkg_started: true, error: None, birth_height: None,
+            dkg_started: true, error: None, birth_height: None, roster_code: None,
         };
         save(&data, "pass", &ceremony).unwrap();
         let st = std::sync::Arc::new(AppState::new(Config {
@@ -1208,7 +1252,7 @@ mod tests {
 
         let reply = status(st.clone(), vault.clone()).await;
         assert_eq!(reply.1 .0["phase"], "setup_interrupted");
-        let reply = agree(State(st), Json(json!({"vault":vault,"fingerprint":"fingerprint"}))).await;
+        let reply = agree(State(st), Json(json!({"vault":vault,"fingerprint":"fingerprint","roster_code":"code"}))).await;
         assert_eq!(reply.0, StatusCode::BAD_REQUEST);
         assert!(reply.1 .0["error"].as_str().unwrap().contains("interrupted"));
         assert!(load(&data, "pass", &vault).unwrap().dkg_started);
@@ -1305,6 +1349,80 @@ mod tests {
         assert_eq!(response.0, StatusCode::OK);
         assert_eq!(response.1 .0["fingerprint"], status.1 .0["fingerprint"]);
         eprintln!("PASS: emitted invite codes contain no vault_secret");
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
+    fn roster_prompt_matches_only_the_confirmed_code() {
+        let code = "1234 5678 9012 3456 7890 1234";
+        assert!(matches!(roster_decision(Some(code), code), RosterDecision::Match));
+        assert!(matches!(roster_decision(Some(code), "1234 5678 9012 3456 7890 1235"), RosterDecision::NoMatch));
+        assert!(matches!(roster_decision(None, code), RosterDecision::NoMatch));
+    }
+
+    #[tokio::test]
+    async fn agree_requires_the_roster_code_the_signer_will_show() {
+        let data = std::env::temp_dir().join(format!("loki-roster-code-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&data).unwrap();
+        let st = std::sync::Arc::new(AppState::new(Config {
+            data: data.clone(), port: 3001, network: "regtest".into(),
+            lightwalletd: None, transport: "local".into(), operator_bundle: None,
+            operator_key: None, enrollment_issuer: None, development_http: false,
+            token: "test".into(), frostd_url: "http://127.0.0.1:2744".into(),
+            peers: BTreeMap::new(),
+            registration: None, bind: "127.0.0.1".parse().unwrap(), advertise_url: None,
+            secure_element: "software".into(), nonce_witnesses: None, loopback_peers: false,
+        }));
+        *st.session.write().await = Some(Session {
+            passphrase: Zeroizing::new("pass".into()), data: data.clone(),
+        });
+        let created = create(State(st.clone()), Json(json!({"name":"test","members":3,"threshold":2}))).await;
+        let vault = created.1 .0["vault"].as_str().unwrap().to_owned();
+        for slot in 2..=3u16 {
+            let code = created.1 .0["invites"].as_array().unwrap().iter()
+                .find(|item| item["slot"] == slot).unwrap()["code"].as_str().unwrap();
+            let invite: Invite = serde_json::from_slice(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(code).unwrap()).unwrap();
+            let wire = WireIdentity::from_public(Identity::new(slot).public());
+            let reply = enroll(State(st.clone()),
+                Json(json!({"vault":vault,"slot":slot,"token":invite.token,"identity":wire}))).await;
+            assert_eq!(reply.0, StatusCode::OK);
+        }
+        let status = status(st.clone(), vault.clone()).await.1 .0;
+        let fingerprint = status["fingerprint"].as_str().unwrap().to_owned();
+        let code = status["roster_code"].as_str().unwrap().to_owned();
+        // The code the signer derives in `dkg_begin` from the document `run_background` hands it.
+        let c = load(&data, "pass", &vault).unwrap();
+        let (document, _) = setup_document(&c, VaultNetwork::Regtest).unwrap();
+        let validated = crate::member_state::ValidatedRoster::new(
+            crate::member_state::Roster::from_bytes(&document).unwrap()).unwrap();
+        assert_eq!(code, roster_code(&validated.fingerprint()));
+        assert_eq!(code.len(), 29);
+
+        let wrong = format!("{}{}", &code[..28], if code.ends_with('0') { '1' } else { '0' });
+        for body in [
+            json!({"vault":vault,"fingerprint":fingerprint}),
+            json!({"vault":vault,"fingerprint":fingerprint,"roster_code":wrong}),
+        ] {
+            let refused = agree(State(st.clone()), Json(body)).await;
+            assert_eq!(refused.0, StatusCode::BAD_REQUEST);
+            let c = load(&data, "pass", &vault).unwrap();
+            assert!(c.agreed.is_empty() && c.roster_code.is_none());
+        }
+        let reply = agree(State(st.clone()),
+            Json(json!({"vault":vault,"fingerprint":fingerprint,"roster_code":code}))).await;
+        assert_eq!(reply.0, StatusCode::OK, "{}", reply.1 .0);
+        let c = load(&data, "pass", &vault).unwrap();
+        assert!(c.agreed.contains(&1));
+        assert_eq!(c.roster_code.as_deref(), Some(code.as_str()));
+
+        // On Testnet the code covers the birth height fixed with the roster.
+        let mut c = c;
+        assert!(setup_roster_code(&c, VaultNetwork::Testnet).is_err());
+        c.birth_height = Some(TESTNET_NU7_BIRTH + 1);
+        let testnet = setup_roster_code(&c, VaultNetwork::Testnet).unwrap();
+        c.birth_height = Some(TESTNET_NU7_BIRTH + 2);
+        assert_ne!(testnet, setup_roster_code(&c, VaultNetwork::Testnet).unwrap());
         std::fs::remove_dir_all(data).unwrap();
     }
 
@@ -1837,6 +1955,7 @@ pub(super) fn restore_vault_from_backup(
         dkg_started: true,
         error: None,
         birth_height: material.birth_height,
+        roster_code: None,
     };
     // The ceremony records the relay roster's fingerprint, not the setup document's.
     let fingerprint = hex::encode(roster_of(&ceremony)?.fingerprint());
