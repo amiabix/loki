@@ -610,7 +610,7 @@ impl BackupDevice for OpfsBackup {
 /// The browser signer's device prompts for the vault in `dir`.
 fn browser_prompts(dir: &str, kek: [u8; 32]) -> DevicePrompts {
     DevicePrompts {
-        connect: Box::new(|_origin, _net| true),
+        connect: Box::new(|_origin, net| browser_network(net).is_ok()),
         // The web coordinator already drove this member's roster agreement.
         roster: Box::new(|_code| RosterDecision::Match),
         roster_deadline: Duration::from_secs(60),
@@ -624,9 +624,19 @@ fn browser_prompts(dir: &str, kek: [u8; 32]) -> DevicePrompts {
 
 fn parse_network(s: &str) -> Result<Network, String> {
     match s {
-        "regtest" => Ok(Network::Regtest),
-        "testnet" => Ok(Network::Testnet),
-        other => Err(format!("unknown network: {other}")),
+        "regtest" => browser_network(Network::Regtest),
+        "testnet" => browser_network(Network::Testnet),
+        other => Err(format!("browser signers are testnet-only; refused network: {other}")),
+    }
+}
+
+/// Browser signers are TESTNET-ONLY (product decision). Every create/join/sign path routes
+/// the network through here. The match is exhaustive with no wildcard on purpose: if core
+/// `Network` ever gains a Mainnet variant, this crate stops compiling until that variant is
+/// explicitly refused here, so the browser fails closed instead of silently signing for it.
+fn browser_network(net: Network) -> Result<Network, String> {
+    match net {
+        Network::Regtest | Network::Testnet => Ok(net),
     }
 }
 
@@ -660,6 +670,7 @@ impl Signer {
     /// attempt`, which also fixes the crash-safe nonce file name; mirror it.
     fn candidate_ref(&self, attempt_hex: &str) -> Result<(CandidateRef, [u8; 32]), String> {
         let vs = self.vault.as_ref().ok_or("no active vault — call vaultJoin first")?;
+        browser_network(vs.signer.network())?;
         let attempt = hex32(attempt_hex)?;
         Ok((
             CandidateRef {
@@ -792,7 +803,7 @@ impl Signer {
             browser_prompts(&dir, kek),
         )
         .map_err(|e| e.to_string())?;
-        let net = signer.network();
+        let net = browser_network(signer.network())?;
         let session = signer
             .connect("https://coordinator", net, b"browser vault")
             .map_err(|e| e.to_string())?
@@ -952,6 +963,18 @@ mod tests {
         let fvk = orchard::keys::FullViewingKey::from_bytes(&fvk_bytes).unwrap();
         let _ = describe_pczt(&cand, &fvk).unwrap();
         let _ = sighash_of_pczt(&cand, &fvk).unwrap();
+    }
+
+    #[wasm_bindgen_test]
+    fn browser_signer_refuses_every_network_but_testnet_and_regtest() {
+        assert_eq!(parse_network("testnet").unwrap(), Network::Testnet);
+        assert_eq!(parse_network("regtest").unwrap(), Network::Regtest);
+        for other in ["mainnet", "main", "Testnet", "", "testnet "] {
+            assert!(parse_network(other).is_err(), "{other:?} must be refused");
+        }
+        // The connect prompt refuses through the same gate.
+        let mut prompts = browser_prompts("loki/vaults/x/signer", [0u8; 32]);
+        assert!((prompts.connect)("https://coordinator", Network::Testnet));
     }
 
     #[wasm_bindgen_test]
