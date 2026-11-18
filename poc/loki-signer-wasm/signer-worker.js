@@ -17,10 +17,24 @@
 
 import init, { Signer, devicePaths, vaultPaths } from "./pkg/loki_signer_wasm.js";
 import {
-  opfsPreopenWrite,
-  opfsPreopenRead,
+  opfsPreopenWrite as preopenWriteOnce,
+  opfsPreopenRead as preopenReadOnce,
   opfsCloseAll,
 } from "./pkg/snippets/loki-signer-core-8724841f4db15c9f/js/opfs_fs.js";
+
+// Ops run concurrently (a status read during a join), and two pre-opens of one path racing
+// would each try to take its exclusive sync handle; the second throws. Share one in-flight
+// pre-open per path instead.
+const inflight = new Map();
+function shared(open) {
+  return (path) => {
+    const key = `${open === preopenWriteOnce ? "w" : "r"}:${path}`;
+    if (!inflight.has(key)) inflight.set(key, open(path).finally(() => inflight.delete(key)));
+    return inflight.get(key);
+  };
+}
+const opfsPreopenWrite = shared(preopenWriteOnce);
+const opfsPreopenRead = shared(preopenReadOnce);
 
 const ready = init().then(() => {
   const P = JSON.parse(devicePaths()); // { identity, profile, salt, recovery }

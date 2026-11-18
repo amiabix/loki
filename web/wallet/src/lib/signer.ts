@@ -153,7 +153,7 @@ function browserSigner(origin: string): SignerModule {
       if (path === "address") return { address: await call<string>("address", payment) } as T;
       // Recovery words are shown, typed and checked on the signer page; only the opaque
       // backup ciphertext ({backup} from recovery-export) and public results come back.
-      if (path === "recovery-setup" || path === "recovery-export") return call<T>(path, body);
+      if (path === "recovery-setup" || path === "recovery-export" || path === "recovery-status") return call<T>(path, body);
       if (path === "restore") { const r = await call<T>(path, body); try { localStorage.setItem(SEALED, "1"); } catch {} return r; }
       if (path === "remove") { const r = await call<T>(path, body); try { localStorage.removeItem(SEALED); } catch {} return r; }
       throw new SignerPending(path);
