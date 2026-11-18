@@ -19,7 +19,7 @@
 //                         the browser signer refuses to sign. NOTE: each entry's mailbox
 //                         `read` capability is served to every page load of this origin.
 //   LOKI_NETWORK          the deployment's network, testnet (default) or regtest; mainnet is
-//                         refused. Served for the native signer (LokiSigner), which reads this
+//                         refused. A regtest stack must set it, or LokiSigner is told testnet. Served for the native signer (LokiSigner), which reads this
 //                         config through the wallet's /api/signer-config.
 //   LOKI_LIGHTWALLETD_URL the lightwalletd the native signer syncs from (served the same way)
 //   LOKI_SIGNER_PORT      listen port (default 3002)

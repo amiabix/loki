@@ -29,24 +29,34 @@ pairing dialog. That coordinator serves them at `GET <origin>/api/signer-config`
 values its signer origin gives the browser signer (`LOKI_NETWORK`, `LOKI_FROSTD_URL`,
 `LOKI_LIGHTWALLETD_URL` and `LOKI_NONCE_WITNESSES` in `poc/loki-signer-wasm/serve.mjs`).
 
-- **Shown before saved.** Opening a pairing link fetches the configuration and shows the
-  network and every endpoint beside the coordinator origin. Nothing is saved until the member
-  continues, and LokiSigner runs with exactly the values shown, without fetching again.
+- **Coordinator first.** Opening a pairing link first shows only the coordinator origin and
+  slot, read from the link by Rust without any network request. LokiSigner contacts that
+  coordinator only after the member confirms it is the one they intended.
+- **Shown before saved.** It then fetches the configuration and shows the network and every
+  endpoint beside the coordinator origin, with the passphrase field. LokiSigner runs with
+  exactly the values shown, without fetching again.
 - **Checked locally.** LokiSigner treats the reply as untrusted. It refuses unknown fields,
-  mainnet, remote endpoints without TLS (loopback HTTP only with `--development-http`), and
-  witnesses that hosted signing would refuse. The request follows no redirect and times out.
-- **Saved and pinned.** The configuration is saved owner-only (0600) in the data directory:
-  `signer-config.json` with the coordinator origin it came from, and the witnesses in
-  `nonce-witnesses.json`, the `--nonce-witnesses` format. A configuration from any coordinator
-  other than the paired one is refused and the saved one is left as it was. A new pairing link
-  for the same coordinator and slot refreshes it once the member confirms.
+  mainnet, remote endpoints without TLS (loopback HTTP only with `--development-http`),
+  endpoints containing whitespace, control or non-ASCII characters, and witnesses that hosted
+  signing would refuse. The request follows no redirect and times out. Its errors name only
+  the origin and the HTTP status; nothing the coordinator sends is shown.
+- **Saved once unlocked, and pinned.** The configuration is saved only after the local profile
+  unlocks, owner-only (0600) in the data directory: `signer-config.json` with the coordinator
+  origin it came from, and the witnesses in `nonce-witnesses.json`, the `--nonce-witnesses`
+  format. A wrong passphrase saves nothing. A configuration from any coordinator other than the
+  paired one is refused and the saved one is left as it was. A new pairing link for the same
+  coordinator and slot refreshes it once the member confirms and unlocks.
 - **Unlock.** A plain launch shows and uses the saved configuration. A profile paired before
   configurations were saved fetches it once from its paired coordinator.
 - **Flags.** An explicit `--network`, `--frostd-url`, `--lightwalletd-url` or
-  `--nonce-witnesses` overrides the saved value for that field only.
+  `--nonce-witnesses` overrides the value for that field **for this launch only**. When a flag
+  overrides a fetched value, nothing is saved, because the member was shown the flag's value
+  and not the coordinator's.
 - **Nothing to run with.** When a launch still lacks the network, frostd, lightwalletd (on
   testnet) or the witnesses, LokiSigner names what is missing and does not start. It never
   falls back to regtest defaults.
+- **Regtest deployments.** The signer origin's `LOKI_NETWORK` defaults to `testnet`. A regtest
+  stack must set `LOKI_NETWORK=regtest` on the signer origin, or LokiSigner is told testnet.
 
 This applies only to the native app's pairing and unlock. `LokiSigner serve` and the headless
 `loki_member_app` keep their flags and defaults.
@@ -70,7 +80,8 @@ poc/signer-app/out/LokiSigner.app/Contents/MacOS/LokiSigner pair 'loki://pair?..
 ```
 
 Other member flags are the existing `loki_member_app` flags: network, lightwalletd, relay,
-nonce witnesses, and peer allowlist. Each overrides the coordinator's value for its field. For members on separate Macs, configure a reachable
+nonce witnesses, and peer allowlist. Each overrides the coordinator's value for its field,
+for that launch only. For members on separate Macs, configure a reachable
 HTTPS `--advertise-url` (forwarded to the member service) and the allowed `--peer` origins.
 The private browser session still uses loopback; it is never sent to that public endpoint.
 The link contains only origin, slot and a random claim, never runtime configuration or keys;

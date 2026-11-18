@@ -16,9 +16,9 @@ test('the coordinator serves the signer origin\'s configuration to LokiSigner, a
   let reply = (res) => res.end(JSON.stringify(served()));
   const signer = createServer((req, res) => (req.url === '/config.json' ? reply(res) : res.writeHead(404).end()));
   await new Promise((resolve) => signer.listen(0, '127.0.0.1', resolve));
-  const env = { NODE_ENV: 'production', NEXT_PUBLIC_SIGNER_ORIGIN: `http://127.0.0.1:${signer.address().port}` };
+  const origin = `http://127.0.0.1:${signer.address().port}`;
   const get = async () => {
-    const response = await signerConfigResponse(env);
+    const response = await signerConfigResponse(origin, 'production');
     assert.equal(response.headers.get('cache-control'), 'no-store');
     return { status: response.status, body: await response.json() };
   };
@@ -53,11 +53,11 @@ test('the coordinator serves the signer origin\'s configuration to LokiSigner, a
     await new Promise((resolve) => signer.close(resolve));
   }
   // Unreachable, or no signer origin configured: a clear error, never a configuration.
-  const unreachable = await signerConfigResponse(env);
+  const unreachable = await signerConfigResponse(origin, 'production');
   assert.equal(unreachable.status, 502);
   assert.match((await unreachable.json()).error, /unreachable/);
-  const unset = await signerConfigResponse({ NODE_ENV: 'production' });
+  const unset = await signerConfigResponse('', 'production');
   assert.equal(unset.status, 502);
   assert.match((await unset.json()).error, /NEXT_PUBLIC_SIGNER_ORIGIN/);
-  assert.equal(signerOrigin({ NEXT_PUBLIC_SIGNER_ORIGIN: 'https://signer.example/path' }), 'https://signer.example');
+  assert.equal(signerOrigin('https://signer.example/path', 'production'), 'https://signer.example');
 });

@@ -44,14 +44,28 @@ pub(super) fn check(config: &[WitnessConfig; 2], development: bool) -> Result<()
         return Err("two distinct nonzero nonce witnesses required".into());
     }
     for witness in config {
-        loki_relay_client::validate_endpoint(&witness.endpoint, development).map_err(|e| e.to_string())?;
+        loki_relay_client::validate_endpoint(&witness.endpoint, development)
+            .map_err(|_| "a nonce witness endpoint is not a plain HTTPS origin; loopback HTTP requires --development-http")?;
     }
     Ok(())
 }
 
 impl RelayWitness {
+    /// This member's witnesses: the `--nonce-witnesses` file (named by a flag or saved), or the
+    /// ones LokiSigner fetched from its coordinator for this launch.
+    pub(super) fn for_member(st: &super::state::AppState, attempt: &str) -> Result<Self, String> {
+        let development = st.config.development_http;
+        match (&st.config.nonce_witnesses, &st.fetched_config) {
+            (None, Some(fetched)) => Self::from_config(fetched.witnesses(), development, attempt),
+            (path, _) => Self::open(path.as_deref(), development, attempt),
+        }
+    }
+
     pub(super) fn open(path: Option<&Path>, development: bool, attempt: &str) -> Result<Self, String> {
-        let config = read(path.ok_or("hosted signing requires --nonce-witnesses <file>")?)?;
+        Self::from_config(read(path.ok_or("hosted signing requires --nonce-witnesses <file>")?)?, development, attempt)
+    }
+
+    fn from_config(config: [WitnessConfig; 2], development: bool, attempt: &str) -> Result<Self, String> {
         check(&config, development)?;
         let routes = config.map(|c| (RelayRoute {
             pin: RelayPin { key: c.key, run: c.run }, endpoint: c.endpoint.clone(),

@@ -252,6 +252,8 @@ async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option
         .await.map_err(|e| e.to_string())?;
     // Keep the public resume destination before consuming a claim; a lost reply is retryable.
     if let Some(slot) = launch.slot { save_coordinator(&st.config.data, &launch.coordinator, slot)?; }
+    // Only an unlocked profile saves (or refreshes) the configuration it was paired with.
+    if let Some(fetched) = &st.fetched_config { fetched.save_unlocked(&st.config.data)?; }
     *st.session.write().await = Some(session);
     tokio::spawn(keep_registering(st.clone(), pass));
     Ok(())
@@ -454,7 +456,7 @@ mod tests {
         let notice: super::super::LocalNotice = std::sync::Arc::new(move |kind, value| {
             if kind == "ready" { tx.send(value.to_owned()).unwrap(); }
         });
-        let app = std::thread::spawn(move || super::super::run_local(config, None, Some(notice), None));
+        let app = std::thread::spawn(move || super::super::run_local(config, None, Some(notice), None, None));
         let ready = tokio::task::spawn_blocking(move || rx.recv_timeout(std::time::Duration::from_secs(60))).await.unwrap()
             .unwrap_or_else(|_| panic!("the app did not come up: {:?}", app.join()));
         let (base, token) = ready.split_once("/#").unwrap();

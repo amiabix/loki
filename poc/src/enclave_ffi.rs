@@ -142,8 +142,52 @@ pub extern "C" fn loki_signer_approval_selftest(approve: NativeApprove) -> i32 {
     }
 }
 
+#[cfg(feature = "relay-communication")]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeLaunch { args: Vec<String>, pairing_url: Option<String> }
+
+/// Answers one native query on `launch` (`{"args": [...], "pairing_url": "loki://pair?..."?}`)
+/// as a JSON string `{"<key>": ...}` or `{"error": "..."}`, freed by [`loki_member_app_free`].
+#[cfg(feature = "relay-communication")]
+unsafe fn native_query(
+    launch: *const std::ffi::c_char,
+    key: &str,
+    query: impl FnOnce(NativeLaunch) -> Result<serde_json::Value, String>,
+) -> *mut std::ffi::c_char {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if launch.is_null() { return Err("missing native launch".to_string()); }
+        let launch = std::ffi::CStr::from_ptr(launch).to_str().map_err(|_| "invalid native launch")?;
+        query(serde_json::from_str(launch).map_err(|_| "invalid native launch")?)
+    }));
+    let reply = match result {
+        Ok(Ok(value)) => serde_json::json!({ key: value }),
+        Ok(Err(error)) => serde_json::json!({ "error": error }),
+        Err(_) => serde_json::json!({ "error": "reading the signer configuration stopped unexpectedly" }),
+    };
+    std::ffi::CString::new(reply.to_string()).map_or(std::ptr::null_mut(), std::ffi::CString::into_raw)
+}
+
+/// The coordinator origin and slot a pairing link names, checked without any network request.
+/// LokiSigner asks the member to confirm them before it contacts that coordinator. Returns
+/// `{"target": {"coordinator": "...", "slot": n}}` or `{"error": "..."}`; free it with
+/// [`loki_member_app_free`].
+///
+/// # Safety
+/// `launch` must be a live NUL-terminated UTF-8 string for this call.
+#[cfg(feature = "relay-communication")]
+#[no_mangle]
+pub unsafe extern "C" fn loki_member_app_pairing_target(launch: *const std::ffi::c_char) -> *mut std::ffi::c_char {
+    native_query(launch, "target", |launch| {
+        let link = launch.pairing_url.ok_or("missing pairing link")?;
+        let (coordinator, slot) = crate::host::NativeConfig::pairing_target(&launch.args, &link)?;
+        Ok(serde_json::json!({ "coordinator": coordinator, "slot": slot }))
+    })
+}
+
 /// The configuration a native launch would run with, for the member to review before pairing
-/// or unlocking: `launch` is `{"args": [...], "pairing_url": "loki://pair?..."?}`. Returns
+/// or unlocking. For a pairing link, call it only after the member confirmed the link's
+/// coordinator ([`loki_member_app_pairing_target`]): it asks that coordinator. Returns
 /// `{"config": <NativeConfig>}` or `{"error": "..."}`; pass the config back unchanged to
 /// [`loki_member_app_pair`]. Free the result with [`loki_member_app_free`].
 ///
@@ -152,26 +196,17 @@ pub extern "C" fn loki_signer_approval_selftest(approve: NativeApprove) -> i32 {
 #[cfg(feature = "relay-communication")]
 #[no_mangle]
 pub unsafe extern "C" fn loki_member_app_configuration(launch: *const std::ffi::c_char) -> *mut std::ffi::c_char {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<crate::host::NativeConfig, String> {
-        if launch.is_null() { return Err("missing native launch".into()); }
-        #[derive(serde::Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Launch { args: Vec<String>, pairing_url: Option<String> }
-        let launch: Launch = serde_json::from_str(std::ffi::CStr::from_ptr(launch).to_str().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-        crate::host::NativeConfig::preview(&launch.args, launch.pairing_url.as_deref())
-    }));
-    let reply = match result {
-        Ok(Ok(config)) => serde_json::json!({ "config": config }),
-        Ok(Err(error)) => serde_json::json!({ "error": error }),
-        Err(_) => serde_json::json!({ "error": "reading the signer configuration stopped unexpectedly" }),
-    };
-    std::ffi::CString::new(reply.to_string()).map_or(std::ptr::null_mut(), std::ffi::CString::into_raw)
+    native_query(launch, "config", |launch| {
+        let config = crate::host::NativeConfig::preview(&launch.args, launch.pairing_url.as_deref())?;
+        serde_json::to_value(config).map_err(|e| e.to_string())
+    })
 }
 
-/// Frees a string returned by [`loki_member_app_configuration`].
+/// Frees a string returned by [`loki_member_app_configuration`] or
+/// [`loki_member_app_pairing_target`].
 ///
 /// # Safety
-/// `value` must be null or a pointer that function returned, freed only once.
+/// `value` must be null or a pointer one of those functions returned, freed only once.
 #[cfg(feature = "relay-communication")]
 #[no_mangle]
 pub unsafe extern "C" fn loki_member_app_free(value: *mut std::ffi::c_char) {
@@ -216,13 +251,14 @@ pub unsafe extern "C" fn loki_member_app_pair(
         if config.registration.is_some() { return Err("native pairing accepts registration only through its pairing link".into()); }
         config.secure_element = "apple".into();
         config.validate_secure_element()?;
-        // The values the member reviewed, checked again and saved; never fetched a second time.
-        launch.config.apply(&mut config, &launch.args, launch.pairing_url.as_deref())?;
+        // The values the member reviewed, checked again; never fetched a second time. A fetched
+        // configuration is saved only after the profile unlocks.
+        let fetched = launch.config.apply(&mut config, &launch.args, launch.pairing_url.as_deref())?;
         config.registration = Some(match launch.pairing_url {
             Some(link) => crate::host::RegistrationConfig::pairing(&link, config.development_http)?,
             None => crate::host::RegistrationConfig::resume(&config.data, config.development_http)?,
         });
-        crate::host::run_local(config, Some(pass), Some(notice.clone()), Some(native_approval(approve)))
+        crate::host::run_local(config, Some(pass), Some(notice.clone()), Some(native_approval(approve)), fetched)
     }));
     match result {
         Ok(Ok(())) => 0,
@@ -256,5 +292,29 @@ mod native_pairing_tests {
         unsafe { super::loki_member_app_free(reply) };
         let error = serde_json::from_str::<serde_json::Value>(&text).unwrap()["error"].as_str().unwrap().to_owned();
         assert!(error.contains("network, frostd URL, lightwalletd URL, nonce witnesses"), "{error}");
+    }
+
+    fn query(f: unsafe extern "C" fn(*const std::ffi::c_char) -> *mut std::ffi::c_char, launch: serde_json::Value) -> serde_json::Value {
+        let launch = std::ffi::CString::new(launch.to_string()).unwrap();
+        let reply = unsafe { f(launch.as_ptr()) };
+        let value = serde_json::from_str(unsafe { std::ffi::CStr::from_ptr(reply) }.to_str().unwrap()).unwrap();
+        unsafe { super::loki_member_app_free(reply) };
+        value
+    }
+
+    /// The member confirms the link's coordinator before LokiSigner contacts it: the target
+    /// is read from the link alone (this origin is unreachable) and in its canonical form.
+    #[test]
+    fn a_pairing_target_is_checked_without_contacting_the_coordinator() {
+        let data = std::env::temp_dir().join(format!("loki-native-target-{}", uuid::Uuid::new_v4()));
+        let args = serde_json::json!(["--data", data, "--port", "0"]);
+        let link = format!("loki://pair?origin=https%3A%2F%2F127.0.0.1%3A1&slot=7&challenge={}", "ab".repeat(32));
+        let reply = query(super::loki_member_app_pairing_target, serde_json::json!({ "args": args, "pairing_url": link }));
+        assert_eq!(reply, serde_json::json!({ "target": { "coordinator": "https://127.0.0.1:1", "slot": 7 } }));
+        let hostile = link.replace("https%3A%2F%2F127.0.0.1%3A1", "https%3A%2F%2Fwallet.example%0AType%20your%20recovery%20words");
+        let reply = query(super::loki_member_app_pairing_target, serde_json::json!({ "args": args, "pairing_url": hostile }));
+        let error = reply["error"].as_str().unwrap();
+        assert!(!error.contains("recovery"), "{error}");
+        assert!(!data.exists());
     }
 }

@@ -13,11 +13,12 @@ export type SignerConfig = {
 };
 
 /** The signer origin the wallet embeds: NEXT_PUBLIC_SIGNER_ORIGIN, or the local signer server
- *  under `next dev`, as `signer.ts` resolves it. A production build without one has none. */
-export function signerOrigin(env: Record<string, string | undefined> = process.env): string {
-  const configured = env.NEXT_PUBLIC_SIGNER_ORIGIN;
+ *  under `next dev`, as `signer.ts` resolves it. A production build without one has none.
+ *  The defaults name `process.env.NEXT_PUBLIC_SIGNER_ORIGIN` directly so Next inlines it at build
+ *  time, exactly as in `signer.ts`; a deploy that sets it only for the build still has it here. */
+export function signerOrigin(configured: string | undefined = process.env.NEXT_PUBLIC_SIGNER_ORIGIN, mode: string | undefined = process.env.NODE_ENV): string {
   if (configured) return new URL(configured).origin;
-  if (env.NODE_ENV !== "production") return "http://localhost:3002";
+  if (mode !== "production") return "http://localhost:3002";
   throw new Error("this coordinator has no signer origin (NEXT_PUBLIC_SIGNER_ORIGIN), so it serves no signer configuration");
 }
 
@@ -56,10 +57,10 @@ export async function signerConfig(origin: string, timeoutMs = 10_000): Promise<
 }
 
 /** The /api/signer-config reply: the configuration, or a clear error; never cached. */
-export async function signerConfigResponse(env: Record<string, string | undefined> = process.env): Promise<Response> {
+export async function signerConfigResponse(configured: string | undefined = process.env.NEXT_PUBLIC_SIGNER_ORIGIN, mode: string | undefined = process.env.NODE_ENV): Promise<Response> {
   const headers = { "Cache-Control": "no-store" };
   try {
-    return Response.json(await signerConfig(signerOrigin(env)), { headers });
+    return Response.json(await signerConfig(signerOrigin(configured, mode)), { headers });
   } catch (error) {
     return Response.json({ error: (error as Error).message }, { status: 502, headers });
   }

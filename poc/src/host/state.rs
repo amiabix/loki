@@ -167,6 +167,8 @@ pub struct AppState {
     pub approval: Option<super::LocalApproval>,
     /// Each vault's group viewing key, read from its device-bound signer once per process.
     pub(super) viewing_keys: std::sync::Mutex<BTreeMap<String, orchard::keys::FullViewingKey>>,
+    /// The signer configuration LokiSigner fetched for this launch, saved once the profile unlocks.
+    pub(super) fetched_config: Option<super::FetchedConfig>,
 }
 
 impl AppState {
@@ -183,6 +185,7 @@ impl AppState {
             device_auth: std::sync::Mutex::new(None),
             approval: None,
             viewing_keys: std::sync::Mutex::new(BTreeMap::new()),
+            fetched_config: None,
         }
     }
 }
