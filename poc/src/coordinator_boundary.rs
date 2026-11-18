@@ -4,7 +4,8 @@
 //! aggregates partials, and broadcasts. It handles the vault address, PCZTs the signer
 //! built, public protocol messages, and the signer's DKG wires (round two only as v2
 //! envelopes under one-setup fresh keys it cannot open). It must never read a FROST
-//! share, a signing nonce, a viewing key, or a spend authorization.
+//! share, a signing nonce, or a spend authorization. Its code holds no viewing key, but
+//! the candidate PCZTs it relays carry the vault's full viewing key in their spends.
 //!
 //! There is exactly ONE signer seam in this codebase — [`crate::signer::Signer`] — and the
 //! coordinator talks to members only through it. This module used to define a separate
