@@ -110,6 +110,34 @@ still needed for the CORS headers; put cloudflared in front of Caddy, or use Cad
 ACME. CORS is per-origin: list the exact wallet origin (scheme+host+port, no trailing
 slash), not `*` — `*` is incompatible with the `authorization` bearer header browsers send.
 
+## lightwalletd behind gRPC-web + CORS for the in-browser signer (`lightwalletd-grpcweb.sh`)
+
+The in-browser signer scans the chain for its vault balance itself, from the signer page. A
+browser cannot make native gRPC calls (HTTP/2 trailers), and lightwalletd sends no CORS:
+`testnet.zec.rocks` answers a preflight with 404 and replies `application/grpc`.
+`lightwalletd-grpcweb.sh` runs Envoy (docker, `envoyproxy/envoy:v1.31.2`) with its `grpc_web`
+and CORS filters in front of lightwalletd, for ONE origin: the signer origin, where the scan
+runs. Only the `cash.z.wallet.sdk.rpc.CompactTxStreamer` service is routed.
+
+```sh
+ORIGIN=http://localhost:3002 communication/deploy/lightwalletd-grpcweb.sh
+# -> the signer calls http://127.0.0.1:9068 (UPSTREAM defaults to testnet.zec.rocks:443)
+```
+
+Check it answers the preflight for the signer origin and a gRPC-web call:
+
+```sh
+curl -si -X OPTIONS http://127.0.0.1:9068/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo \
+  -H 'Origin: http://localhost:3002' -H 'Access-Control-Request-Method: POST' \
+  -H 'Access-Control-Request-Headers: content-type,x-grpc-web' | grep -i access-control
+printf '\0\0\0\0\0' | curl -s -X POST http://127.0.0.1:9068/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo \
+  -H 'Origin: http://localhost:3002' -H 'content-type: application/grpc-web+proto' -H 'x-grpc-web: 1' \
+  --data-binary @- | strings | head -3
+```
+
+The listener is plaintext, which suits a loopback dev signer origin; an https signer origin
+needs it behind TLS, as `frostd-tls.sh` puts frostd.
+
 ## Public HTTPS bringup (`public-testnet.sh`)
 
 Hosts ONLY the shared coordinator over a free cloudflared quick tunnel, so testers on
