@@ -115,6 +115,11 @@ export default function App() {
 
   const checkSession = useCallback(async () => {
     setAuthed(null); setSessionError(null);
+    // A reload keeps the slot but not the grant. Reconnect without waiting for the browser signer.
+    if (lastLokiSignerSlot() !== undefined && signerKind() === "browser") {
+      setAuthed(false);
+      return;
+    }
     const lokiSigner = hasLokiSignerSession();
     try {
       const s = await api<StatusResponse>("status");

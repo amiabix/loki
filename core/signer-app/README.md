@@ -111,12 +111,22 @@ registration field,” breaking `/api/members` for everyone, not just those slot
 
 The signed `lokisigner_url` roster field tells everyone who can read `/api/members` that the
 slot uses LokiSigner and which local port it currently listens on. The field is separate
-from the peer endpoint and contains no tab token. A website the member visits can use that
-port and the member API's open ceremony routes to learn that LokiSigner is running, subject
-to the browser's local network permission. Only the pinned coordinator origin can ask to
-connect from a browser. Grants are stored in `sessionStorage`: duplicating a tab can copy its
-grant without another **Allow**. The coordinator serves the page but never receives the token
-in registration. Safari may block the wallet's request to loopback; this has not been verified.
+from the peer endpoint and contains no tab token. If your browser allows local network
+requests, another website may be able to tell that LokiSigner is running. Four ceremony
+routes accept requests from other origins so browser signers can join a vault, but require
+a valid invite to take part. Their replies can also reveal whether the profile is locked.
+Blocking other origins from reading responses would not by itself hide the local listener.
+
+Only the paired coordinator's website can ask to connect from a browser. LokiSigner cannot
+tell another program on your Mac apart from the wallet when it asks to connect. It can open
+a dialog as often as every five seconds, but it still needs an **Allow** in LokiSigner.
+Refuse any request you didn't start. While a dialog is pending or fewer than five seconds
+have passed since the last request started, your own tab may also have to wait.
+
+The grant stays in the approved page's memory. Duplicating a tab or reloading the page
+requires a new **Allow**. The wallet remembers the last slot so you can reconnect. The
+coordinator serves the page but never receives the grant during registration. Safari may
+block the HTTPS wallet's request to LokiSigner on this Mac; this has not been verified.
 
 ## Back up and restore a vault
 
