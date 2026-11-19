@@ -27,10 +27,13 @@ On the wallet's sign-in screen open **Use a native member app instead**. It has 
      **I saved these words**.
    - "Signer paired and running". Choose **Copy private link**.
 
-   While the link is out the wallet watches the public roster. Once LokiSigner registers the
-   slot, the wallet says so and moves to step 2. When the two minutes run out first, the link
-   and copy button go away; **Get a new link** asks for the same slot again. The wallet never
-   asks for a new link by itself, because each one reserves a slot.
+   While the link is out the wallet watches the public roster. Once the slot appears there,
+   the wallet says so and moves to step 2. It cannot tell whose identity registered the slot,
+   so trust LokiSigner's "Signer paired and running", not the roster alone. When the two
+   minutes run out first, the link and copy button go away; **Get a new link** asks for the
+   same slot again. A lapsed slot can go to another member: the wallet then says the slot was
+   taken, and the next link uses another slot. The wallet never asks for a new link by itself,
+   because each one reserves a slot.
 2. **Paste LokiSigner's private link**: paste the private session link into the wallet tab on
    **that same Mac** and choose **Pair this tab**. A member whose app is already paired starts
    here after unlocking it.
@@ -81,7 +84,8 @@ This applies only to the native app's pairing and unlock. `LokiSigner serve` and
 
 Pairing reserves a slot for 120 seconds. Both claim and registration are consumed once,
 including failed proofs; claiming does not extend the deadline. If it expires while saving
-recovery words, choose **Get a new link** in the wallet, which asks for the same slot. After
+recovery words, choose **Get a new link** in the wallet, which asks for the same slot (or,
+if another member took it meanwhile, a new one). After
 a lost response, restart and unlock; an outstanding reservation may need to expire before
 retry. Public device bindings prevent a different identity or slot from reusing the enrolled
 key.

@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { api, pairDevice, requestPairingLink, signerKind, logout } from '../src/lib/api.ts';
+import { api, pairDevice, PairingSlotTaken, requestPairingLink, signerKind, logout } from '../src/lib/api.ts';
 import * as members from '../src/lib/members.ts';
 
 test('a tab paired with a native member routes member calls to it, with its capability', async () => {
@@ -64,6 +64,8 @@ test('the wallet asks for a pairing link, then for the same slot again only once
     try { return Response.json(await members.issuePairingChallenge(body, origin)); }
     catch (e) { return Response.json({ error: e.message }, { status: 400 }); }
   };
+  const originalWindow = globalThis.window;
+  globalThis.window = { location: { origin } };
   try {
     const first = await requestPairingLink();
     assert.deepEqual(bodies[0], {}, 'the first link lets the coordinator pick the slot');
@@ -72,8 +74,9 @@ test('the wallet asks for a pairing link, then for the same slot again only once
     // Another member's link takes the next slot, so a request without a slot no longer returns 1.
     assert.equal((await members.issuePairingChallenge({}, origin)).slot, 2);
 
-    // While the link is live its slot is reserved; the member reads a sentence, not the coordinator's.
-    await assert.rejects(requestPairingLink(first.slot), (e) => /^Slot 1 is already registered or reserved\. /.test(e.message));
+    // While the link is live its slot is reserved; the member reads a sentence, not the coordinator's,
+    // and the page learns that the next link must take another slot.
+    await assert.rejects(requestPairingLink(first.slot), (e) => e instanceof PairingSlotTaken && /^Slot 1 was taken, possibly by another member\. .*another slot\.$/.test(e.message));
 
     // Once it expired, a new link is for slot 1 again, with a new claim.
     const file = process.env.LOKI_REGISTRY + '.challenges';
@@ -83,9 +86,52 @@ test('the wallet asks for a pairing link, then for the same slot again only once
     assert.equal(again.slot, 1);
     assert.notEqual(new URL(again.url).searchParams.get('challenge'), new URL(first.url).searchParams.get('challenge'));
 
-    // A link for another slot than the one asked for is refused.
-    reply = () => Response.json({ ...again, slot: 3, url: again.url.replace('slot=1', 'slot=3') });
-    await assert.rejects(requestPairingLink(1), /would not accept/);
+    // LokiSigner shows the origin and slot inside the link, so they must be what this page shows,
+    // even when the reply's own `slot` field is right.
+    const challenge = new URL(again.url).searchParams.get('challenge');
+    const enc = encodeURIComponent(origin);
+    const forged = (query, fields = {}) => () => Response.json({ slot: 1, expires: Date.now() + 120_000, url: `loki://pair?${query}`, ...fields });
+    const good = `origin=${enc}&slot=1&challenge=${challenge}`;
+    reply = forged(good);
+    assert.equal((await requestPairingLink(1)).url, `loki://pair?${good}`, 'a link that matches is shown');
+    for (const query of [
+      `origin=${enc}&slot=9&challenge=${challenge}`, // another slot in the link only
+      `origin=https%3A%2F%2Fother.example&slot=1&challenge=${challenge}`, // another origin (a rewritten Host)
+      `origin=${enc}&slot=1&slot=9&challenge=${challenge}`, // a duplicate key
+      `origin=${enc}&slot=1&challenge=${challenge}&x=1`, // an extra key
+      `origin=${enc}&slot=01&challenge=${challenge}`, // the same number, written differently
+      `origin=${enc}&slot=1&challenge=${challenge.toUpperCase()}`, // not lowercase hex
+      `origin=${enc}&slot=1`, // no challenge
+    ]) {
+      reply = forged(query);
+      await assert.rejects(requestPairingLink(1), /does not match this page/, query);
+    }
+    // A link for another slot than the one asked for is refused, even when it is consistent.
+    reply = forged(`origin=${enc}&slot=3&challenge=${challenge}`, { slot: 3 });
+    await assert.rejects(requestPairingLink(1), /does not match this page/);
+
+    // A reply to a first request with a slot or deadline that is not a whole number is refused.
+    for (const fields of [{ slot: '1' }, { slot: 1.5 }, { expires: Date.now() + 120_000.5 }, { expires: String(Date.now() + 120_000) }]) {
+      reply = forged(good, fields);
+      await assert.rejects(requestPairingLink(), /would not accept/, JSON.stringify(fields));
+    }
+
+    // The deadline is the time the coordinator has left, on this browser's clock, never over 120 s.
+    const leftAfter = async (serverNow, expires, date = new Date(serverNow).toUTCString()) => {
+      reply = () => Response.json({ slot: 1, url: `loki://pair?${good}`, expires }, date === null ? {} : { headers: { Date: date } });
+      const issued = await requestPairingLink(1);
+      return issued.expires - Date.now();
+    };
+    const ahead = await leftAfter(Date.now() - 600_000, Date.now() - 600_000 + 120_000); // this clock is 10 min fast
+    assert(ahead > 118_000 && ahead <= 120_000, `fast clock: ${ahead}`);
+    const behind = await leftAfter(Date.now() + 600_000, Date.now() + 600_000 + 30_000); // 10 min slow, 30 s left
+    assert(behind > 28_000 && behind < 31_000, `slow clock: ${behind}`);
+    const capped = await leftAfter(Date.now(), Date.now() + 600_000);
+    assert(capped > 118_000 && capped <= 120_000, `capped: ${capped}`);
+    for (const date of [null, 'yesterday']) {
+      const fallback = await leftAfter(Date.now(), Date.now() - 600_000, date);
+      assert(fallback > 118_000 && fallback <= 120_000, `no usable Date header (${date}): ${fallback}`);
+    }
 
     // Only a plain `loki://pair?` link from the coordinator becomes a link target.
     for (const url of ['javascript:alert(1)//loki://pair?slot=1', 'https://evil.example/?u=loki://pair?slot=1', 'loki://pairing?slot=1',
@@ -100,6 +146,7 @@ test('the wallet asks for a pairing link, then for the same slot again only once
     await assert.rejects(requestPairingLink(), /HTTP 502/);
   } finally {
     globalThis.fetch = originalFetch;
+    globalThis.window = originalWindow;
     rmSync(dir, { recursive: true, force: true }); delete process.env.LOKI_REGISTRY;
   }
 });

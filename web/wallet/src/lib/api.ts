@@ -60,12 +60,16 @@ export async function pairDevice(link: string): Promise<Slot> {
   return member;
 }
 
-/** A pairing link LokiSigner opens; the coordinator reserves its slot until `expires` (ms). */
+/** A pairing link LokiSigner opens; the coordinator reserves its slot until `expires`, in this
+ *  browser's clock (ms). */
 export type PairingLink = { slot: number; url: string; expires: number };
+/** The asked-for slot is registered or reserved, possibly by another member: the next link must
+ *  let the coordinator pick a new slot. */
+export class PairingSlotTaken extends Error {}
 // The coordinator builds `loki://pair?` + URLSearchParams; anything else is never a link target.
 const PAIRING_LINK = /^loki:\/\/pair\?[A-Za-z0-9%*._+=&-]+$/;
+const PAIRING_TTL_MS = 120_000;
 const PAIRING_REFUSALS: [string, (slot?: number) => string][] = [
-  ["slot already registered or reserved", (slot) => `${slot === undefined ? "That slot" : `Slot ${slot}`} is already registered or reserved. If LokiSigner showed “Signer paired and running”, paste its private link in step 2. Otherwise wait two minutes for the earlier link to lapse and try again.`],
   ["too many pending registrations", () => "The coordinator has too many pairing links waiting. Try again in two minutes."],
   ["registration is busy", () => "The coordinator is busy registering another member. Try again in a moment."],
   ["expected an HTTPS origin", () => "This coordinator issues pairing links only over HTTPS. Open the wallet at its HTTPS address and try again."],
@@ -78,17 +82,33 @@ export async function requestPairingLink(slot?: number): Promise<PairingLink> {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify(slot === undefined ? {} : { slot }), cache: "no-store",
   });
+  const now = Date.now();
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     // Only our own sentences reach the page, never the coordinator's text.
-    const known = PAIRING_REFUSALS.find(([error]) => typeof data.error === "string" && data.error.startsWith(error));
+    const error = typeof data.error === "string" ? data.error : "";
+    if (error.startsWith("slot already registered or reserved")) {
+      throw new PairingSlotTaken(`${slot === undefined ? "That slot" : `Slot ${slot}`} was taken, possibly by another member. If LokiSigner shows “Signer paired and running”, paste its private link in step 2. Otherwise get a new link; it will use another slot.`);
+    }
+    const known = PAIRING_REFUSALS.find(([prefix]) => error.startsWith(prefix));
     throw new Error(known ? known[1](slot) : `The coordinator refused a pairing link (HTTP ${res.status}). Try again, or ask whoever runs it.`);
   }
-  if (!Number.isSafeInteger(data.slot) || data.slot < 1 || (slot !== undefined && data.slot !== slot)
-    || !Number.isSafeInteger(data.expires) || typeof data.url !== "string" || !PAIRING_LINK.test(data.url)) {
+  if (!Number.isSafeInteger(data.slot) || data.slot < 1 || !Number.isSafeInteger(data.expires)
+    || typeof data.url !== "string" || !PAIRING_LINK.test(data.url)) {
     throw new Error("The coordinator returned a pairing link LokiSigner would not accept. Try again, or ask whoever runs it.");
   }
-  return { slot: data.slot, url: data.url, expires: data.expires };
+  // LokiSigner shows the origin and slot from the link itself; they must be what this page shows.
+  const query = new URLSearchParams(data.url.slice("loki://pair?".length));
+  const keys = [...query.keys()].sort();
+  if ((slot !== undefined && data.slot !== slot) || keys.join() !== "challenge,origin,slot"
+    || query.get("origin") !== window.location.origin || query.get("slot") !== String(data.slot)
+    || !/^[0-9a-f]{64}$/.test(query.get("challenge")!)) {
+    throw new Error("The coordinator's pairing link does not match this page, so it is not shown. Ask whoever runs the coordinator.");
+  }
+  // `expires` is on the coordinator's clock: keep only the time left, measured from its Date header.
+  const served = Date.parse(res.headers.get("date") ?? "");
+  const left = Number.isNaN(served) ? PAIRING_TTL_MS : data.expires - served;
+  return { slot: data.slot, url: data.url, expires: now + Math.min(left, PAIRING_TTL_MS) };
 }
 
 /** A member request: to this tab's paired native member, else into the in-browser signer. */

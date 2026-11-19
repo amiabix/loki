@@ -17,6 +17,7 @@ import {
   listSlots,
   pairDevice,
   requestPairingLink,
+  PairingSlotTaken,
   pendingApprovals,
   exportRecoveryBackup,
   removeBrowserSigner,
@@ -636,12 +637,16 @@ function NativePairingLink({ open, onRegistered }: { open: boolean; onRegistered
   const [err, setErr] = useState<string | null>(null);
   const [copied, setCopied] = useState<boolean | null>(null); // null: not copied, false: copy failed
 
-  const request = async () => {
-    setBusy(true); setErr(null); setCopied(null);
+  const request = async (want = slot) => {
+    setBusy(true); setErr(null); setCopied(null); setRegistered(null);
     try {
-      const issued = await requestPairingLink(slot);
+      const issued = await requestPairingLink(want);
       setSlot(issued.slot); setNow(Date.now()); setLink(issued);
-    } catch (e) { setLink(null); setErr((e as Error).message); }
+    } catch (e) {
+      // A taken slot stays taken: stop watching it, and let the next link take a new slot.
+      if (e instanceof PairingSlotTaken) setSlot(undefined);
+      setLink(null); setErr((e as Error).message);
+    }
     finally { setBusy(false); }
   };
   const copy = async () => {
@@ -668,16 +673,23 @@ function NativePairingLink({ open, onRegistered }: { open: boolean; onRegistered
   }, [watching, link, onRegistered]);
 
   if (registered !== null) {
-    return <p role="status" className="my-2 font-medium text-mint">
-      Slot {registered} is registered. Finish in LokiSigner, then paste its private link below.
-    </p>;
+    // The roster shows only that some identity registered this slot, not that it is this member's.
+    return <>
+      <p role="status" className="my-2 font-medium text-mint">
+        Slot {registered} now appears on the roster. If LokiSigner shows “Signer paired and running”, paste its private link below.
+      </p>
+      <button type="button" disabled={busy} onClick={() => request(undefined)} className="min-h-11 text-mint">
+        {busy ? "Requesting…" : "LokiSigner did not pair? Get a link for another slot"}
+      </button>
+      {err && <p role="alert" className="mb-3 leading-relaxed text-danger [overflow-wrap:anywhere]">{err}</p>}
+    </>;
   }
   if (!link) {
     return <>
       <p className="my-2">Get a link that opens LokiSigner and reserves a slot for two minutes.</p>
       {err && <p role="alert" className="mb-3 leading-relaxed text-danger [overflow-wrap:anywhere]">{err}</p>}
-      <Btn variant="ghost" disabled={busy} onClick={request}>
-        {busy ? "Requesting…" : err ? "Try again" : "Get a pairing link"}
+      <Btn variant="ghost" disabled={busy} onClick={() => request()}>
+        {busy ? "Requesting…" : err ? (slot === undefined ? "Get a new link" : "Try again") : "Get a pairing link"}
       </Btn>
     </>;
   }
@@ -688,7 +700,7 @@ function NativePairingLink({ open, onRegistered }: { open: boolean; onRegistered
         The link for slot {link.slot} expired. If LokiSigner already shows its private link, paste it below.
         Otherwise get a new link for the same slot.
       </p>
-      <Btn variant="ghost" disabled={busy} onClick={request}>{busy ? "Requesting…" : "Get a new link"}</Btn>
+      <Btn variant="ghost" disabled={busy} onClick={() => request()}>{busy ? "Requesting…" : "Get a new link"}</Btn>
     </>;
   }
   return <>
