@@ -30,6 +30,12 @@ export function paymentLabel(phase: string, ready: boolean, sending: boolean): s
   return labels[phase] ?? "Status unavailable";
 }
 
+export function emptyHistoryText(lokiSigner: boolean): string {
+  return lokiSigner
+    ? "Outgoing payment requests and sent payments will appear here. Incoming deposits aren’t listed."
+    : "Payments sent and received by this vault will appear here.";
+}
+
 // A short, human-comparable rendering of the roster fingerprint, so members can read it aloud on a
 // call or eyeball it on another phone instead of trusting a coordinator-shown hex string. Pure and
 // deterministic; the fingerprint itself is untouched. Every byte folds into every slot (XOR), so a
@@ -118,5 +124,7 @@ export function storageLabel(se: string | undefined, kind: "native" | "browser")
     return { enclave: false, label: `Sealed under your ${by} in this browser`,
       detail: `Your share is sealed in the Loki signer’s own browser storage under your ${by}. It enters browser memory during signing, without hardware isolation.` };
   }
+  if (se !== "software") return { enclave: false, label: "Share protection not reported",
+    detail: "This signer did not report a recognized storage type. The wallet cannot tell how your share is protected." };
   return { enclave: false, label: "Software device storage", detail: "Software development signer: local sealed storage, without hardware isolation." };
 }

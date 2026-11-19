@@ -36,7 +36,7 @@ import {
   type Slot,
   type RecoveryStatus,
 } from "@/lib/api";
-import { comparesInLokiSigner, invitePreview, nativeRosterRefusal, pairingSecondsLeft, paymentLabel, rememberedVaultSlot, rememberVaultSlot, storageLabel, verifyPhrase } from "@/lib/wallet-ui";
+import { comparesInLokiSigner, emptyHistoryText, invitePreview, nativeRosterRefusal, pairingSecondsLeft, paymentLabel, rememberedVaultSlot, rememberVaultSlot, storageLabel, verifyPhrase } from "@/lib/wallet-ui";
 import { toggleTheme, useIsDark } from "@/lib/theme";
 import { useCeremonyStatus, usePayments, useStatus } from "@/lib/hooks";
 import type {
@@ -2334,7 +2334,7 @@ function History({
       ) : payments.length === 0 ? (
         <GlassCard className="py-10 text-center text-sm text-muted">
           <p className="mb-2 font-display text-lg font-semibold text-foreground">No payments yet</p>
-          <p>Payments sent and received by this vault will appear here.</p>
+          <p>{emptyHistoryText(hasLokiSignerSession())}</p>
         </GlassCard>
       ) : (
         <div className="space-y-3">

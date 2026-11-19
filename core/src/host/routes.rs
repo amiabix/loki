@@ -247,6 +247,7 @@ async fn status(
         return ceremony::status(st, vault.clone()).await;
     }
     let network = st.config.network.clone();
+    let secure_element = &st.config.secure_element;
     let session = st.session.read().await;
     let Some(session) = session.as_ref() else {
         let phase = if crate::profile::exists(&st.config.data) {
@@ -254,7 +255,7 @@ async fn status(
         } else {
             "new_profile"
         };
-        return ok(json!({ "phase": phase, "network": network }));
+        return ok(json!({ "phase": phase, "network": network, "secure_element": secure_element }));
     };
     // Unlocked: re-read the profile for its name/id and list the member's vaults.
     match crate::profile::open(&session.data, &session.passphrase) {
@@ -263,7 +264,7 @@ async fn status(
                 Ok(v) => v,
                 Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
             };
-            ok(json!({ "phase": "home", "network": network, "profile": profile, "vaults": vaults }))
+            ok(json!({ "phase": "home", "network": network, "secure_element": secure_element, "profile": profile, "vaults": vaults }))
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
     }

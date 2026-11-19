@@ -1030,6 +1030,16 @@ pub(super) async fn balance(State(st): State<Shared>, Json(body): Json<Value>) -
     .await
 }
 
+fn draft_funding_error(native: bool, error: String) -> String {
+    // shortcut: VaultWallet::propose exposes only text, not whether any notes are immature.
+    if native && error.starts_with("fund payment: Insufficient balance (") {
+        let confirmations = zcash_client_backend::data_api::wallet::ConfirmationsPolicy::default().untrusted();
+        format!("Not enough spendable funds. If you just deposited, wait for {confirmations} confirmations before trying again.")
+    } else {
+        error
+    }
+}
+
 pub(super) async fn draft(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
     with_body(st, body, |st, data, pass, body| {
         let vault = required(&body, "vault")?;
@@ -1046,7 +1056,8 @@ pub(super) async fn draft(State(st): State<Shared>, Json(body): Json<Value>) -> 
         let _ = sync_control(&st.config.frostd_url, &data, &pass, vault, &v);
         reconcile(&data, &pass, vault, &mut w)?;
         let (anchor, expiry) = heights(&w, &v)?;
-        let funding = w.propose(address, Some(amount), memo_bytes.clone())?;
+        let funding = w.propose(address, Some(amount), memo_bytes.clone())
+            .map_err(|error| draft_funding_error(st.config.native, error))?;
         let first = *funding.notes.first().ok_or("wallet proposed no Ironwood notes")?;
         let inputs = CandidateInputs { vault_fvk: &v.fvk, notes: vec![first], recipient: address, amount, memo: memo_bytes, change: Zatoshis::ZERO, target_height: anchor, expiry_height: expiry };
         let fee_zat: u64 = quote_fee(&v.network, &inputs)?.into();
@@ -3454,6 +3465,32 @@ mod tests {
             )
             .unwrap();
         wallet
+    }
+
+    #[test]
+    fn draft_funding_error_explains_confirmation_wait_for_a_fresh_deposit() {
+        use orchard::keys::SpendingKey;
+        let fvk = FullViewingKey::from(&SpendingKey::from_bytes([3; 32]).unwrap());
+        let rho = Rho::from_bytes(&[20; 32]).unwrap();
+        let note = orchard::Note::from_parts(
+            fvk.address_at(0u64, Scope::External),
+            NoteValue::from_raw(1_000_000),
+            rho,
+            RandomSeed::from_bytes([30; 32], &rho).unwrap(),
+            NoteVersion::V3,
+        ).unwrap();
+        let path = std::env::temp_dir().join(format!("loki-fresh-deposit-{}.sqlite", Uuid::new_v4()));
+        let mut wallet = wallet_with_spend(&path, &fvk, &[note], None);
+        assert_eq!(wallet.ironwood_balance_zat().unwrap(), 1_000_000);
+        let recipient = FullViewingKey::from(&SpendingKey::from_bytes([9; 32]).unwrap()).address_at(0u64, Scope::External);
+        let error = wallet.propose(recipient, Some(Zatoshis::const_from_u64(50_000)), MemoBytes::empty())
+            .err().expect("a fresh deposit cannot fund this draft yet");
+        assert_eq!(draft_funding_error(false, error.clone()), error);
+        assert_eq!(draft_funding_error(true, error),
+            "Not enough spendable funds. If you just deposited, wait for 10 confirmations before trying again.");
+        assert_eq!(draft_funding_error(true, "fund payment: Must scan blocks first".into()), "fund payment: Must scan blocks first");
+        drop(wallet);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
