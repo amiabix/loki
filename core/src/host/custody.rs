@@ -143,10 +143,21 @@ fn opened_viewing_key(
     slot: u16,
     sealed: &Value,
 ) -> Result<FullViewingKey, String> {
-    let (key, _) = SignerViewingKey::open(st, data, pass, vault, slot)?;
+    let signer = open_signer(st, data, pass, vault, slot, Box::new(|_| false))?;
+    let (key, _) = SignerViewingKey::from_signer(&signer)?;
     let network = VaultNetwork::parse(sealed["network"].as_str().unwrap_or(""))?;
     key.checked_address(sealed, network)?;
     Ok(key.fvk)
+}
+
+pub(super) fn vault_touch_id_reason(st: &AppState, action: &str, name: Option<&str>) -> Option<String> {
+    if !st.config.native || st.config.secure_element != "apple" { return None; }
+    let label = super::vault_label(name.unwrap_or_default());
+    Some(if label == super::HIDDEN_VAULT_NAME || label.trim().is_empty() {
+        format!("{action} a vault")
+    } else {
+        format!("{action} vault “{label}”")
+    })
 }
 
 /// Store-derived values, kept together so the native window can recheck a fresh seal on cache hits.
@@ -158,10 +169,10 @@ pub(super) struct SignerViewingKey {
 
 impl SignerViewingKey {
     pub(super) fn open(
-        st: &AppState, data: &Path, pass: &str, vault: &str, slot: u16,
+        st: &AppState, data: &Path, pass: &str, vault: &str, slot: u16, reason: Option<&str>,
     ) -> Result<(Self, VaultNetwork), String> {
-        // Never signs: no payment is approved through this signer.
-        let signer = open_signer(st, data, pass, vault, slot, Box::new(|_| false))?;
+        // Never signs or enters a cache: only the viewing key outlives this open.
+        let signer = open_signer_with_reason(st, data, pass, vault, slot, Box::new(|_| false), reason)?;
         Self::from_signer(&signer)
     }
 

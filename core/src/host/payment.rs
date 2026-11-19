@@ -192,16 +192,17 @@ fn save_payment(data: &Path, pass: &str, p: &Payment) -> Result<(), String> {
 /// Open this member's vault for scanning and signing. `vault.sealed` supplies public
 /// metadata; the viewing key comes from the device-bound signer store (`super::custody`).
 pub(super) fn load_vault(st: &AppState, data: &Path, pass: &str, vault: &str) -> Result<Vault, String> {
-    load_vault_with(st, data, pass, vault, |slot, _, sealed| {
+    load_vault_with(st, data, pass, vault, |slot, _, sealed, name| {
         super::custody::viewing_key(st, data, pass, vault, slot, sealed, || {
-            super::custody::SignerViewingKey::open(st, data, pass, vault, slot).map(|(key, _)| key)
+            let reason = super::custody::vault_touch_id_reason(st, "open", name);
+            super::custody::SignerViewingKey::open(st, data, pass, vault, slot, reason.as_deref()).map(|(key, _)| key)
         })
     })
 }
 
 fn load_vault_with<Fvk>(
     st: &AppState, data: &Path, pass: &str, vault: &str,
-    viewing_key: impl FnOnce(u16, VaultNetwork, &Value) -> Result<Fvk, String>,
+    viewing_key: impl FnOnce(u16, VaultNetwork, &Value, Option<&str>) -> Result<Fvk, String>,
 ) -> Result<Vault<Fvk>, String> {
     let configured = st.config.network.as_str();
     let dir = member_dir(data, vault)?;
@@ -275,7 +276,7 @@ fn load_vault_with<Fvk>(
         });
     Ok(Vault {
         network,
-        fvk: viewing_key(slot, network, &v)?,
+        fvk: viewing_key(slot, network, &v, c["name"].as_str())?,
         public,
         identity,
         threshold,
@@ -1158,31 +1159,7 @@ pub(super) async fn approve(State(st): State<Shared>, Json(body): Json<Value>) -
                 "invalid or repeated payment approval; replace a failed attempt instead".into(),
             );
         }
-        // A review token normally implies a warm cache, but both the token and intent
-        // survive a restart. If the cache is cold, keep that scoped signer for the worker.
-        let mut opened = None;
-        let mut authenticating = false;
-        let v = if st.config.native && st.config.secure_element == "apple" {
-            load_vault_with(&st, &data, &pass, &vault, |slot, network, sealed| {
-                if !p.signers.is_empty() && !p.signers.contains(&slot) {
-                    return Err(ENOUGH_APPROVED.into());
-                }
-                super::custody::viewing_key(&st, &data, &pass, &vault, slot, sealed, || {
-                    super::nonce_witness::RelayWitness::for_member(&st, &p.attempt)?;
-                    authenticating = true;
-                    let signer = open_payment_signer(&st, &data, &pass, &p, network, slot, Box::new(|_| false))?;
-                    let (key, _) = super::custody::SignerViewingKey::from_signer(&signer)?;
-                    opened = Some(signer);
-                    Ok(key)
-                })
-            }).inspect_err(|error| {
-                if authenticating {
-                    record_failure(&st, &data, &pass, &vault, &attempt, error.clone());
-                }
-            })?
-        } else {
-            load_vault(&st, &data, &pass, &vault)?
-        };
+        let (v, opened) = load_vault_for_approval(&st, &data, &pass, &p)?;
         check_intent(&p, &v)?;
         if !p.signers.is_empty() && !p.signers.contains(&v.slot) {
             return Err(ENOUGH_APPROVED.into());
@@ -1196,6 +1173,37 @@ pub(super) async fn approve(State(st): State<Shared>, Json(body): Json<Value>) -
         Ok(json!({"phase":"signing"}))
     })
     .await
+}
+
+fn load_vault_for_approval(
+    st: &Shared, data: &Path, pass: &str, p: &Payment,
+) -> Result<(Vault, Option<super::custody::HostedSigner>), String> {
+    let vault = &p.vault;
+    if !st.config.native || st.config.secure_element != "apple" {
+        return load_vault(st, data, pass, vault).map(|v| (v, None));
+    }
+    // A review token normally implies a warm cache, but both the token and intent
+    // survive a restart. If the cache is cold, keep that scoped signer for the worker.
+    let mut opened = None;
+    let mut authenticating = false;
+    let v = load_vault_with(st, data, pass, vault, |slot, network, sealed, _| {
+        if !p.signers.is_empty() && !p.signers.contains(&slot) {
+            return Err(ENOUGH_APPROVED.into());
+        }
+        super::custody::viewing_key(st, data, pass, vault, slot, sealed, || {
+            super::nonce_witness::RelayWitness::for_member(st, &p.attempt)?;
+            authenticating = true;
+            let signer = open_payment_signer(st, data, pass, p, network, slot, Box::new(|_| false))?;
+            let (key, _) = super::custody::SignerViewingKey::from_signer(&signer)?;
+            opened = Some(signer);
+            Ok(key)
+        })
+    }).inspect_err(|error| {
+        if authenticating {
+            record_failure(st, data, pass, vault, &p.attempt, error.clone());
+        }
+    })?;
+    Ok((v, opened))
 }
 
 /// Runs this member's background work on a payment, unless it already runs: the signing round
@@ -1286,7 +1294,7 @@ fn record_failure(st: &Shared, data: &Path, pass: &str, vault: &str, attempt: &s
             // Reporting an error (including cancelling the very first payment prompt)
             // only needs the roster and relay identity. Never prompt again to send it.
             let sent = if st.config.native && st.config.secure_element == "apple" {
-                load_vault_with(st, data, pass, vault, |_, _, _| Ok(()))
+                load_vault_with(st, data, pass, vault, |_, _, _, _| Ok(()))
                     .map(|v| send_control(&st.config.frostd_url, &v, &p, "failed", &members(&v)))
             } else {
                 load_vault(st, data, pass, vault)
@@ -1503,15 +1511,7 @@ fn sign_with_opened(
     // headless members refuse.
     eprintln!("payment {}: opening signer for member {}", p.attempt, v.slot);
     let approval = payment_approval(data, pass, p, &v.network, super::approval_policy(st.approval.clone(), signer_network, v.slot))?;
-    let mut signer = if let Some(mut signer) = opened {
-        signer.set_approval_policy(approval);
-        signer
-    } else {
-        if st.config.native && st.config.secure_element == "apple" {
-            require_consent(data, pass, p)?;
-        }
-        open_payment_signer(st, data, pass, p, v.network, v.slot, approval)?
-    };
+    let mut signer = payment_signer_for_round(st, data, pass, p, v, approval, opened)?;
     signer.set_nonce_witness(Box::new(witness));
     if let Some(inputs) = &owned {
         signer.set_candidate_notes(inputs.notes.clone());
@@ -1580,6 +1580,20 @@ fn sign_with_opened(
             Ok(())
         },
     )
+}
+
+fn payment_signer_for_round(
+    st: &AppState, data: &Path, pass: &str, p: &Payment, v: &Vault,
+    approval: crate::signer::local::ApprovalPolicy, opened: Option<super::custody::HostedSigner>,
+) -> Result<super::custody::HostedSigner, String> {
+    if let Some(mut signer) = opened {
+        signer.set_approval_policy(approval);
+        return Ok(signer);
+    }
+    if st.config.native && st.config.secure_element == "apple" {
+        require_consent(data, pass, p)?;
+    }
+    open_payment_signer(st, data, pass, p, v.network, v.slot, approval)
 }
 
 fn open_payment_signer(
@@ -2408,6 +2422,124 @@ mod tests {
             "unlock signing for 3.12345678 ZEC to {}…{}", &canonical[..14], &canonical[canonical.len() - 10..],
         ));
         assert!(payment_touch_id_reason(&p, VaultNetwork::Regtest).is_err());
+    }
+
+    #[test]
+    fn vault_and_payment_opens_use_separate_authentication_scopes() {
+        use crate::host::{ceremony, state::scope_test::{Fixture, Scope}};
+        use crate::signer::{local::{LocalSigner, RosterDecision}, secure_element::SoftwareSecureElement, DkgInput};
+
+        let data = std::env::temp_dir().join(format!("loki-vault-open-{}", Uuid::new_v4()));
+        let vault = hex::encode([73; 32]);
+        let pass = "vault open fixture";
+        let dir = ceremony::dir(&data, &vault).unwrap();
+        let sdir = ceremony::signer_dir(&data, &vault).unwrap();
+
+        // Make a certified DKG store without requiring a relay or biometric hardware.
+        let mut members = Vec::new();
+        let mut roster = Vec::new();
+        for id in 1..=3 {
+            let path = if id == 1 { sdir.clone() } else { data.join(id.to_string()) };
+            let mut prompts = ceremony::hosted_prompts(&path, pass, Box::new(|_| false));
+            prompts.roster = Box::new(|_| RosterDecision::Match);
+            let se = SoftwareSecureElement::persistent(&path, pass).unwrap();
+            let mut signer = LocalSigner::create(&path, se, Network::Regtest, [73; 32], id, vault.clone(), prompts).unwrap();
+            let conn = signer.connect("hosted payment", Network::Regtest, b"fixture").unwrap();
+            roster.push(json!({"id": id, "signing": hex::encode(conn.member.signing), "encryption": hex::encode(conn.member.encryption)}));
+            members.push((id, signer, conn.session));
+        }
+        let doc = serde_json::to_vec(&json!({"vault":vault,"threshold":2,"setup_version":2,"members":roster})).unwrap();
+        let mut vref = None;
+        for (_, signer, session) in &mut members {
+            vref = Some(signer.dkg_begin(session, &doc).unwrap());
+        }
+        let vref = vref.unwrap();
+        let mut inbox = BTreeMap::<u16, Vec<DkgInput>>::new();
+        let route = |sender, wires: Vec<crate::setup_transport::DkgWire>, inbox: &mut BTreeMap<u16, Vec<DkgInput>>| {
+            for wire in wires {
+                for id in (1..=3).filter(|id| *id != sender && wire.recipient().is_none_or(|r| r == *id)) {
+                    inbox.entry(id).or_default().push(DkgInput { sender, bytes: wire.as_bytes().to_vec() });
+                }
+            }
+        };
+        for _ in 0..6 {
+            for (id, signer, session) in &mut members {
+                let inputs = inbox.remove(id).unwrap_or_default();
+                route(*id, signer.dkg_step(session, &vref, &inputs).unwrap(), &mut inbox);
+            }
+        }
+        for (id, signer, session) in &mut members {
+            route(*id, signer.backup(session).unwrap(), &mut inbox);
+        }
+        for (id, signer, session) in &mut members {
+            let inputs = inbox.remove(id).unwrap_or_default();
+            route(*id, signer.dkg_step(session, &vref, &inputs).unwrap(), &mut inbox);
+        }
+        let (public, fvk) = members[0].1.hosted_metadata().unwrap();
+        drop(members);
+        // load_vault checks a separate profile relay identity. Use the same public identity
+        // as member 1's store, taken from the store's sealed identity file.
+        let se = SoftwareSecureElement::persistent(&sdir, pass).unwrap();
+        let store = crate::signer::store::SignerStore::open(&sdir).unwrap();
+        let (_, identity) = store.read(&se, crate::signer::store::FileKind::Identity).unwrap().unwrap();
+        MemberDir::open(&data, "").write_sealed("identity.sealed", &identity, pass).unwrap();
+        let network = VaultNetwork::Regtest;
+        let sealed = ceremony::vault_sealed_bytes(&vault, 1, 2, 3, "fixture", &public, &fvk, 2, network).unwrap();
+        dir.write_sealed("vault.sealed", &sealed, pass).unwrap();
+        let slots: serde_json::Map<_, _> = roster.iter().enumerate().map(|(i, id)| ((i + 1).to_string(), json!({"identity":id}))).collect();
+
+        let mut p = open_payment(&vault, 1);
+        p.recipient = vault::unified_address(&fvk, network.network_type());
+        record_consent(&data, pass, &p).unwrap();
+        let payment_reason = payment_touch_id_reason(&p, network).unwrap();
+        let witnesses = data.join("witnesses.json");
+        let witness_config = [1, 5].map(|i| json!({
+            "endpoint":"https://example.invalid", "key":vec![i; 32],
+            "run":vec![i+1; 32], "mailbox":vec![i+2; 32], "read":vec![i+3; 32],
+        }));
+        std::fs::write(&witnesses, serde_json::to_vec(&witness_config).unwrap()).unwrap();
+
+        for (unwraps, name, expected_reason) in [(4, "Shared reserve", "open vault “Shared reserve”"),
+            (1, "Hidden\nname", "open a vault")]
+        {
+            if unwraps == 1 {
+                // Recovery publishes a store with only the share, not the DKG checkpoint.
+                for file in ["identity.sealed", "roster.sealed", "setup.sealed"] {
+                    std::fs::remove_file(sdir.join(file)).unwrap();
+                }
+                std::fs::remove_file(dir.path().join("ceremony.sealed")).unwrap();
+            }
+            dir.write_sealed("ceremony.sealed", &serde_json::to_vec(&json!({
+                "vault":vault,"name":name,"my_slot":1,"threshold":2,"slots":slots,
+            })).unwrap(), pass).unwrap();
+            let mut config = crate::host::config_from_args(&["--data".into(), data.to_str().unwrap().into(), "--port".into(), "0".into()]).unwrap();
+            config.native = true;
+            config.secure_element = "apple".into();
+            config.nonce_witnesses = Some(witnesses.clone());
+            let st = std::sync::Arc::new(AppState::new(config));
+            let fixture = Fixture::install(&data);
+            let view_scope = Scope { reason: Some(expected_reason.into()), unwraps, closed: true };
+            let v = load_vault(&st, &data, pass, &vault).unwrap();
+            assert_eq!(v.fvk.to_bytes(), fvk.to_bytes());
+            load_vault(&st, &data, pass, &vault).unwrap();
+            assert_eq!(fixture.scopes(), [view_scope.clone()], "a warm vault cache must not reopen the key");
+
+            let (v, opened) = load_vault_for_approval(&st, &data, pass, &p).unwrap();
+            let signer = payment_signer_for_round(&st, &data, pass, &p, &v, Box::new(|_| false), opened).unwrap();
+            let mut payment_scope = Scope { reason: Some(payment_reason.clone()), unwraps, closed: false };
+            assert_eq!(fixture.scopes(), [view_scope.clone(), payment_scope.clone()]);
+            drop(signer);
+            payment_scope.closed = true;
+
+            // The cold approval path can hand an already authorized signer to the round.
+            // The round must reuse it, not authenticate again or reuse the closed vault scope.
+            st.viewing_keys.lock().unwrap().clear();
+            let (v, opened) = load_vault_for_approval(&st, &data, pass, &p).unwrap();
+            let signer = payment_signer_for_round(&st, &data, pass, &p, &v, Box::new(|_| false), opened).unwrap();
+            drop(signer);
+            assert_eq!(fixture.scopes(), [view_scope, payment_scope.clone(), payment_scope]);
+        }
+        std::fs::remove_dir_all(data).unwrap();
     }
 
     #[test]
