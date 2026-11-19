@@ -50,6 +50,7 @@ pub(crate) fn run_native(
     notice: LocalNotice,
     approval: LocalApproval,
     roster_confirmation: LocalRosterConfirmation,
+    connect: super::connect::LocalConnect,
     fetched: Option<FetchedConfig>,
 ) -> Result<(), String> {
     struct ClearCache;
@@ -59,7 +60,7 @@ pub(crate) fn run_native(
     let _cache = ClearCache;
     let stop = Arc::new(tokio::sync::Notify::new());
     super::run_local_with(config, Some(pass), Some(notice), Some(approval), Some(roster_confirmation), fetched,
-        Some(&stop), |state| NativeScope::install(state, stop.clone()))
+        Some(&stop), Some(connect), |state| NativeScope::install(state, stop.clone()))
 }
 
 pub(crate) fn request_stop() -> bool {
@@ -73,6 +74,12 @@ pub(crate) fn set_aside(data: &Path) -> Result<(), &'static str> {
     let running = RUNNING.lock().map_err(|_| super::native_recovery::REFUSED)?;
     if running.is_some() { return Err(super::native_recovery::REFUSED); }
     super::native_recovery::set_aside(data)
+}
+
+pub(crate) fn disconnect_wallet_tabs() {
+    if let Some(tabs) = RUNNING.lock().unwrap().as_ref().and_then(|m| m.state.wallet_tabs.as_ref()) {
+        tabs.revoke_all();
+    }
 }
 
 pub(crate) fn restore_running(words: Zeroizing<Vec<u8>>, file: &Path) -> Result<(), &'static str> {
@@ -210,19 +217,13 @@ mod tests {
                 if kind != "recovery" { ready_tx.send((kind.to_owned(), message.to_owned())).unwrap(); }
             });
             stop_tx.send(run_native(settings, Zeroizing::new(PASS.into()), notice, Arc::new(|_| false),
-                Arc::new(|_| crate::host::RosterAnswer::Differ), None)).unwrap();
+                Arc::new(|_| crate::host::RosterAnswer::Differ), Arc::new(|_, _, _| false), None)).unwrap();
         });
         let timeout = std::time::Duration::from_secs(10);
         let events: BTreeMap<_, _> = (0..2).map(|_| ready_rx.recv_timeout(timeout).unwrap()).collect();
         assert_eq!(events["registration-warning"], "LokiSigner couldn’t reach the coordinator. Your profile is unlocked and LokiSigner will keep trying in the background.");
-        let (base, token) = events["ready"].split_once("/#").unwrap();
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        runtime.block_on(async {
-            let client = reqwest::Client::new();
-            let status: Value = client.get(format!("{base}/api/recovery-status")).header("x-loki-token", token)
-                .send().await.unwrap().json().await.unwrap();
-            assert_eq!(status["recovery_in_app"], true);
-        });
+        assert_eq!(events["ready"], "", "native readiness does not expose a local pairing link");
+        assert!(vault_addresses().unwrap().is_empty(), "local features work while offline");
         assert!(set_aside(&data).is_err());
         assert!(request_stop());
         stop_rx.recv_timeout(timeout).unwrap().unwrap();
@@ -390,8 +391,10 @@ mod tests {
             });
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if native {
-                    run_native(config(data), Zeroizing::new(PASS.into()), notice, Arc::new(|_| false),
-                        Arc::new(|_| crate::host::RosterAnswer::Differ), None)
+                    let mut config = config(data);
+                    config.token.clear();
+                    run_native(config, Zeroizing::new(PASS.into()), notice, Arc::new(|_| false),
+                        Arc::new(|_| crate::host::RosterAnswer::Differ), Arc::new(|_, _, _| false), None)
                 } else {
                     super::super::run_local(config(data), None, Some(notice), None, None)
                 }

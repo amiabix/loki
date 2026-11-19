@@ -26,22 +26,28 @@ On the wallet's sign-in screen open **Use a native member app instead**. It has 
      Enclave prompt if macOS shows one.
    - For a new profile, "Save your recovery words privately". Write them down, then choose
      **I saved these words**.
-   - "Signer paired and running". Choose **Copy private link**.
+   - "LokiSigner is running". Choose **Done**.
 
    While the link is out the wallet watches the public roster. Once the slot appears there,
-   the wallet says so and moves to step 2. It cannot tell whose identity registered the slot,
-   so trust LokiSigner's "Signer paired and running", not the roster alone. When the two
+   the wallet says so and you can continue to step 2. The roster alone cannot tell you whose
+   app registered the slot. Compare the code on your own Mac before allowing the tab. When the two
    minutes run out first, the link and copy button go away; **Get a new link** asks for the
    same slot again. A lapsed slot can go to another member: the wallet then says the slot was
    taken, and the next link uses another slot. The wallet never asks for a new link by itself,
    because each one reserves a slot.
-2. **Paste LokiSigner's private link**: paste the private session link into the wallet tab on
-   **that same Mac** and choose **Pair this tab**. A member whose app is already paired starts
-   here after unlocking it.
+2. **Connect this wallet tab**: on **that same Mac**, unlock LokiSigner, select its slot in
+   the wallet, and choose **Connect LokiSigner**. If the app is still registering, the tab
+   waits and retries. When LokiSigner asks, check the wallet origin and match the six-digit
+   code in the app to the one in the tab, then choose **Allow**. If they do not match, choose
+   **Refuse**. Nothing is copied. Allow local network access if your browser asks.
 
 The app stays running for ceremony, payment review and signing using the existing device
-consent and nonce-witness paths. Quit locks the process; launch again to unlock and register
-with the saved public coordinator/slot, without reusing the claim. With saved settings, you can
+consent and nonce-witness paths. Connect separately in each new tab and after a relaunch. In
+the **LokiSigner** menu, **Disconnect all wallet tabs** withdraws existing grants without
+quitting or locking the app. Quit locks the process and also invalidates every grant; launch
+again to unlock and register with the saved public coordinator/slot, without reusing the claim.
+
+With saved settings, you can
 unlock and use local features such as **Vault addresses…** and **Restore a vault…** while the
 coordinator is offline. If registration fails or is refused, LokiSigner shows a warning, stays
 unlocked and keeps trying in the background. A launch with a new pairing link waits for the
@@ -54,6 +60,17 @@ aside before pairing or restoring. LokiSigner moves the whole data folder to a d
 it deletes neither the folder nor the old device key in the Keychain. New native profiles save
 a random key scope and use a different device login key, even at the same path. That key stays
 with its profile if the folder is moved. Existing vault share key tags do not change.
+
+**Update the coordinator and wallet before updating LokiSigner.** An older coordinator will
+not accept the new app's registration. Its wallet will still offer only a paste field, and
+the new app has no link to paste. An updated wallet still accepts the printed or displayed
+link from `loki_member_app`, `LokiSigner serve`, and older LokiSigner versions.
+
+The signed `lokisigner_url` roster field tells everyone who can read `/api/members` that the
+slot uses LokiSigner and which local port it currently listens on. The field is separate
+from the peer endpoint and contains no tab token. Only the pinned coordinator origin can
+ask from a browser. An approved tab's token stays in its session storage until it disconnects;
+the coordinator serves the page but never receives the token in registration.
 
 ## Back up and restore a vault
 
@@ -72,7 +89,7 @@ then registers the new Mac in that slot without reserving a new one. If the conn
 after saving, keep LokiSigner running or reopen and unlock it to retry. If the coordinator
 refuses the slot before the first successful registration, LokiSigner checks the member list
 again and uses a different slot only when exactly one entry matches both public identity keys.
-You won't need the words again to reconnect. Once connected, use the private link to pair the
+You won't need the words again to reconnect. Use **Connect LokiSigner** to connect each
 wallet tab on the new Mac.
 
 Restore can reuse an absent or empty data folder, or one with only recognized leftovers: empty

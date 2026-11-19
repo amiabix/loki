@@ -114,6 +114,33 @@ fn native_approval(approve: NativeApprove) -> crate::host::LocalApproval {
     })
 }
 
+#[cfg(feature = "relay-communication")]
+pub type NativeConnect = extern "C" fn(
+    *const std::ffi::c_char,
+    *const std::ffi::c_char,
+    *const std::ffi::c_void,
+    extern "C" fn(*const std::ffi::c_void) -> i32,
+) -> i32;
+
+#[cfg(feature = "relay-communication")]
+fn native_connect(ask: NativeConnect) -> crate::host::LocalConnect {
+    extern "C" fn cancelled(context: *const std::ffi::c_void) -> i32 {
+        // The attempt is borrowed for the whole synchronous call to Swift below.
+        i32::from(unsafe { &*context.cast::<crate::host::ConnectAttempt>() }.cancelled())
+    }
+    std::sync::Arc::new(move |origin, code, attempt| {
+        let (Ok(origin), Ok(code)) = (std::ffi::CString::new(origin), std::ffi::CString::new(code)) else { return false; };
+        ask(origin.as_ptr(), code.as_ptr(), std::ptr::from_ref(attempt).cast(), cancelled) == 1
+    })
+}
+
+/// Revoke every tab's grant without locking the local profile or stopping the app.
+#[cfg(feature = "relay-communication")]
+#[no_mangle]
+pub extern "C" fn loki_member_app_disconnect_wallet_tabs() {
+    crate::host::disconnect_wallet_tabs();
+}
+
 /// Native payment-approval selftest: a 2-of-3 vault created by real v2 DKG signs one payment,
 /// and each quorum member's `sign_approve` asks the app's dialog through `approve`, exactly as
 /// the live member does. Shares use the software element, so it runs without enrolled
@@ -332,6 +359,7 @@ pub unsafe extern "C" fn loki_member_app_restore_profile(
     notify: extern "C" fn(*const std::ffi::c_char, *const std::ffi::c_char),
     approve: NativeApprove,
     confirm_roster: NativeConfirmRoster,
+    connect: NativeConnect,
 ) -> *mut std::ffi::c_char {
     let error = crate::host::NATIVE_RESTORE_REFUSED;
     let start_error = "Vault restored to this Mac, but LokiSigner could not start. Try unlocking again; your recovery words are not needed.";
@@ -362,7 +390,7 @@ pub unsafe extern "C" fn loki_member_app_restore_profile(
             }
         });
         crate::host::run_native(config, pass, notice, native_approval(approve),
-            native_roster_confirmation(confirm_roster), fetched).map_err(|_| start_error)
+            native_roster_confirmation(confirm_roster), native_connect(connect), fetched).map_err(|_| start_error)
     }));
     restore_reply(result.unwrap_or(Err(if published { start_error } else { error })))
 }
@@ -370,15 +398,15 @@ pub unsafe extern "C" fn loki_member_app_restore_profile(
 /// Native UI entry point. Unlock material crosses only this in-process ABI, never HTTP,
 /// argv, a file or stdout. `launch` is the launch given to [`loki_member_app_configuration`]
 /// plus `"config"`, the configuration it returned and the member reviewed. `notify` presents
-/// recovery words and the local session link; `approve` asks the member to approve each
+/// recovery words and startup notices; `approve` asks the member to approve each
 /// payment before this device signs it; `confirm_roster` asks the member to compare a vault's
-/// roster code before this device agrees to it.
+/// roster code before this device agrees to it; `connect` asks about a single wallet tab.
 ///
 /// # Safety
 /// `launch` and `pass` must be live NUL-terminated UTF-8 strings for this call. `pass`
-/// must be writable: its bytes are zeroed immediately after copying into Rust. `notify`,
-/// `approve` and `confirm_roster` must remain callable until the member stops and must copy strings before
-/// returning.
+/// must be writable: its bytes are zeroed immediately after copying into Rust. Callbacks must
+/// remain callable until the member stops. Strings and the connect cancellation context are
+/// borrowed only for their callback; never use them after it returns.
 #[cfg(feature = "relay-communication")]
 #[no_mangle]
 pub unsafe extern "C" fn loki_member_app_pair(
@@ -387,6 +415,7 @@ pub unsafe extern "C" fn loki_member_app_pair(
     notify: extern "C" fn(*const std::ffi::c_char, *const std::ffi::c_char),
     approve: NativeApprove,
     confirm_roster: NativeConfirmRoster,
+    connect: NativeConnect,
 ) -> i32 {
     let notice: crate::host::LocalNotice = std::sync::Arc::new(move |kind, message| {
         if let (Ok(kind), Ok(message)) = (std::ffi::CString::new(kind), std::ffi::CString::new(message)) {
@@ -414,7 +443,7 @@ pub unsafe extern "C" fn loki_member_app_pair(
             None => crate::host::RegistrationConfig::resume(&config.data, config.development_http)?,
         });
         crate::host::run_native(config, pass, notice.clone(), native_approval(approve),
-            native_roster_confirmation(confirm_roster), fetched)
+            native_roster_confirmation(confirm_roster), native_connect(connect), fetched)
     }));
     match result {
         Ok(Ok(())) => 0,
@@ -431,6 +460,9 @@ pub unsafe extern "C" fn loki_member_app_pair(
 
 #[cfg(all(test, feature = "relay-communication"))]
 mod native_pairing_tests {
+    extern "C" fn refuse_connect(_: *const std::ffi::c_char, _: *const std::ffi::c_char,
+        _: *const std::ffi::c_void, _: extern "C" fn(*const std::ffi::c_void) -> i32) -> i32 { 0 }
+
     #[test]
     fn native_restore_wipes_both_buffers_even_when_the_request_is_refused() {
         let mut words = b"not-valid-words\0never-echo-this".to_vec();
@@ -438,7 +470,7 @@ mod native_pairing_tests {
         extern "C" fn notice(_: *const std::ffi::c_char, _: *const std::ffi::c_char) {}
         extern "C" fn refuse(_: *const std::ffi::c_char) -> i32 { 0 }
         let reply = unsafe { super::loki_member_app_restore_profile(std::ptr::null(),
-            words.as_mut_ptr(), words.len(), pass.as_mut_ptr(), pass.len(), std::ptr::null(), notice, refuse, refuse) };
+            words.as_mut_ptr(), words.len(), pass.as_mut_ptr(), pass.len(), std::ptr::null(), notice, refuse, refuse, refuse_connect) };
         assert!(words.iter().chain(&pass).all(|&b| b == 0));
         let error: serde_json::Value = serde_json::from_slice(unsafe { std::ffi::CStr::from_ptr(reply) }.to_bytes()).unwrap();
         unsafe { super::loki_member_app_free(reply); }
@@ -458,7 +490,7 @@ mod native_pairing_tests {
         let launch = std::ffi::CString::new(r#"{"args":[]}"#).unwrap();
         extern "C" fn refuse(_: *const std::ffi::c_char) -> i32 { 0 }
         let mut pass = b"native passphrase\0".to_vec();
-        let code = unsafe { super::loki_member_app_pair(launch.as_ptr(), pass.as_mut_ptr().cast(), notice, refuse, refuse) };
+        let code = unsafe { super::loki_member_app_pair(launch.as_ptr(), pass.as_mut_ptr().cast(), notice, refuse, refuse, refuse_connect) };
         assert_eq!(code, 1); // Invalid config fails before any Enclave operation.
         assert!(pass.iter().all(|b| *b == 0));
     }

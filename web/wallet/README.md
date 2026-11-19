@@ -117,19 +117,22 @@ coordinator + frostd. Payment review/approve are wired through `request()` the s
 ## Registry and limits
 
 `.access.json` (or `LOKI_REGISTRY`) contains only `{access: [{slot, signing_pubkey, relay_pubkey,
-advertise_url}]}`. Old hosted registry formats fail closed; retire those files privately and
-self-register existing devices into a fresh public roster. Never copy old access records into
+advertise_url, lokisigner_url?}]}`. The optional signed `lokisigner_url` field tells everyone
+reading `/api/members` that the slot uses LokiSigner and which loopback port it currently
+listens on. It is not a capability. Deploy this coordinator and wallet before updating
+LokiSigner; an older coordinator rejects registration containing the field. Headless and
+older apps without that field still use the pasted local link. Old hosted registry formats
+fail closed; retire those files privately and self-register existing devices into a fresh
+public roster. Never copy old access records into
 it. The adjacent `.challenges` file contains only short-lived public enrollment proofs and
 nonces; consumption persists across Next workers and restarts. At most 256 live challenges
 are accepted, each expires after two minutes. If a worker crashes while holding `.lock`, stop
 all web workers before removing that lock. The roster is discovery, not authority to spend.
 
-This is a **development-only pairing seam**: the coordinator-served JavaScript is trusted
-with that tab's device session. A malicious web bundle can steal that session; device-side
-consent remains required for signing. Co-location under one OS account is not independent
-custody against that OS operator. Real cross-device QR pairing and the native signed app
-client are S4b. No QR or production device trust UX is implemented here. The existing Enclave
-binary is reused; no Swift changes are required.
+LokiSigner sends a tab its device session only after the member allows that tab's code in
+the native app. The coordinator-served JavaScript can still read a grant held by its own tab;
+device-side consent remains required for signing. Co-location under one OS account is not
+independent custody against that OS operator.
 
 ## Checks
 

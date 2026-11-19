@@ -4,6 +4,7 @@
 //! stack blocks on its own runtime (see `setup_relay::shared_runtime`).
 
 mod ceremony;
+mod connect;
 mod custody;
 mod device;
 mod payment;
@@ -21,10 +22,12 @@ mod routes;
 mod state;
 
 pub use state::Config;
+#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+pub(crate) use connect::{ConnectAttempt, LocalConnect};
 pub use registration::RegistrationConfig;
 pub use native_config::{Deployment, FetchedConfig, NativeConfig};
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
-pub(crate) use native_member::{run_native, request_stop as native_request_stop, set_aside as native_set_aside, vault_addresses as native_vault_addresses};
+pub(crate) use native_member::{disconnect_wallet_tabs, run_native, request_stop as native_request_stop, set_aside as native_set_aside, vault_addresses as native_vault_addresses};
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
 pub(crate) use native_member::restore_running as native_restore_running;
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
@@ -153,8 +156,25 @@ pub fn approval_summary(request: &crate::signer::local::ApprovalRequest<'_>, net
 /// Parse member-app CLI args into a `Config`. Shared by the `loki_member_app` bin and the native
 /// signer app's FFI `serve` entry point, so both build the member identically.
 pub fn config_from_args(args: &[String]) -> Result<Config, String> {
+    parse_config(args, false)
+}
+
+#[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+pub(crate) fn native_config_from_args(args: &[String]) -> Result<Config, String> {
+    let mut config = parse_config(args, true)?;
+    config.secure_element = "apple".into();
+    Ok(config)
+}
+
+fn new_token() -> String {
     use base64::Engine;
     use rand_core::{OsRng, RngCore};
+    let mut token = [0u8; 32];
+    OsRng.fill_bytes(&mut token);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token)
+}
+
+fn parse_config(args: &[String], native: bool) -> Result<Config, String> {
     use std::{collections::BTreeMap, path::PathBuf};
     let value = |name: &str| -> Option<String> {
         args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
@@ -170,9 +190,6 @@ pub fn config_from_args(args: &[String]) -> Result<Config, String> {
     if flag("--secure-element") && value("--secure-element").is_none() {
         return Err("--secure-element requires <software|apple>".into());
     }
-    let mut token = [0u8; 32];
-    OsRng.fill_bytes(&mut token);
-    let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token);
     let mut peers = BTreeMap::new();
     for (index, arg) in args.iter().enumerate() {
         if arg == "--peer" {
@@ -187,7 +204,7 @@ pub fn config_from_args(args: &[String]) -> Result<Config, String> {
     let network = value("--network").unwrap_or_else(|| "regtest".into());
     crate::network::VaultNetwork::parse(&network)?;
     Ok(Config {
-        data, port, bind, native: false,
+        data, port, bind, native,
         registration: RegistrationConfig::from_args(args, flag("--development-http"))?,
         advertise_url: value("--advertise-url"),
         network,
@@ -199,19 +216,11 @@ pub fn config_from_args(args: &[String]) -> Result<Config, String> {
         operator_key: value("--operator-key"),
         enrollment_issuer: value("--enrollment-issuer").map(PathBuf::from),
         development_http: flag("--development-http"),
-        token,
+        token: if native { String::new() } else { new_token() },
         frostd_url: value("--frostd-url").unwrap_or_else(|| "http://127.0.0.1:2744".into()),
         peers,
         loopback_peers: flag("--allow-loopback-peers"),
     })
-}
-
-#[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
-pub(crate) fn native_config_from_args(args: &[String]) -> Result<Config, String> {
-    let mut config = config_from_args(args)?;
-    config.native = true;
-    config.secure_element = "apple".into();
-    Ok(config)
 }
 
 /// Build the axum app and serve on the configured bind IP and port. Blocks.
@@ -229,7 +238,7 @@ pub fn run_local(
     approval: Option<LocalApproval>,
     fetched: Option<FetchedConfig>,
 ) -> Result<(), String> {
-    run_local_with(config, pass, notice, approval, None, fetched, None, |_| Ok(()))
+    run_local_with(config, pass, notice, approval, None, fetched, None, None, |_| Ok(()))
 }
 
 fn run_local_with<G>(
@@ -240,6 +249,7 @@ fn run_local_with<G>(
     roster_confirmation: Option<LocalRosterConfirmation>,
     fetched: Option<FetchedConfig>,
     stop: Option<&tokio::sync::Notify>,
+    connect: Option<connect::LocalConnect>,
     on_start: impl FnOnce(&state::Shared) -> Result<G, String>,
 ) -> Result<(), String> {
     // rustls has no default provider; install one before any relay/lightwalletd TLS.
@@ -261,18 +271,24 @@ fn run_local_with<G>(
             .map_err(|e| format!("bind {addr}: {e}"))?;
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
         config.port = addr.port();
-        let state: state::Shared = std::sync::Arc::new(state::AppState { approval, roster_confirmation, fetched_config: fetched, ..state::AppState::new(config) });
+        let wallet_tabs = connect.map(|ask| {
+            let endpoint = config.lokisigner_url().ok_or("LokiSigner needs a loopback listener")?;
+            let origin = config.registration.as_ref().ok_or("LokiSigner needs a pinned coordinator")?.coordinator.clone();
+            Ok::<_, &str>(connect::WalletTabs::new(endpoint, origin, ask))
+        }).transpose()?;
+        let state: state::Shared = std::sync::Arc::new(state::AppState { approval, roster_confirmation, fetched_config: fetched, wallet_tabs, ..state::AppState::new(config) });
         let _scope = on_start(&state)?;
         let ready = registration::start(&state, pass, notice.as_ref()).await?;
-        // Member-local output only. Paste into a local browser tab; never send to the coordinator.
-        if let Some(notice) = notice {
+        if state.config.native {
+            if let Some(notice) = notice { notice(ready, ""); }
+        } else if let Some(notice) = notice {
             notice(ready, &format!("http://{addr}/#{}", state.config.token));
         } else if let Some(launch) = &state.config.registration {
             println!("{} ({}) — Local pairing: http://{addr}/#{}", launch.name, state.config.data.display(), state.config.token);
         } else {
             println!("Signer: http://{addr}/#{}", state.config.token);
         }
-        let server = axum::serve(listener, routes::router(state));
+        let server = axum::serve(listener, routes::router(state).into_make_service_with_connect_info::<std::net::SocketAddr>());
         if let Some(stop) = stop {
             // Drop the native runtime before the UI can set aside the profile. No HTTP
             // request or signer worker may keep writing to the old profile after that.

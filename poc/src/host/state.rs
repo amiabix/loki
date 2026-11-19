@@ -25,7 +25,8 @@ pub struct Config {
     pub operator_key: Option<String>,
     pub enrollment_issuer: Option<PathBuf>,
     pub development_http: bool,
-    /// Printed in the signer link and required on every `/api/*` request.
+    /// Headless capability, printed in the signer link. Empty for LokiSigner, which
+    /// authenticates only with individually approved wallet-tab tokens.
     pub token: String,
     pub frostd_url: String,
     /// Operator URL allowlist for remote peers; vault slots never resolve through this map.
@@ -36,6 +37,16 @@ pub struct Config {
 }
 
 impl Config {
+    pub(super) fn lokisigner_url(&self) -> Option<String> {
+        if !self.native || self.port == 0 { return None; }
+        let host = match self.bind {
+            std::net::IpAddr::V4(ip) if ip == std::net::Ipv4Addr::LOCALHOST || ip.is_unspecified() => "127.0.0.1",
+            std::net::IpAddr::V6(ip) if ip.is_loopback() || ip.is_unspecified() => "[::1]",
+            _ => return None,
+        };
+        Some(format!("http://{host}:{}", self.port))
+    }
+
     pub(super) fn base_url(&self) -> String {
         self.advertise_url.clone().unwrap_or_else(|| format!("http://127.0.0.1:{}", self.port))
             .trim_end_matches('/').to_owned()
@@ -209,6 +220,7 @@ pub struct AppState {
     pub(super) roster_asking: std::sync::Mutex<Option<String>>,
     /// Vaults whose codes the member said differ, refused until the app restarts.
     pub(super) roster_refused: std::sync::Mutex<BTreeSet<String>>,
+    pub(super) wallet_tabs: Option<super::connect::WalletTabs>,
     /// Each vault's group viewing key, read from its device-bound signer once per process.
     pub(super) viewing_keys: std::sync::Mutex<BTreeMap<String, orchard::keys::FullViewingKey>>,
     /// The signer configuration LokiSigner fetched for this launch, saved once the profile unlocks.
@@ -231,6 +243,7 @@ impl AppState {
             roster_confirmation: None,
             roster_asking: std::sync::Mutex::new(None),
             roster_refused: std::sync::Mutex::new(BTreeSet::new()),
+            wallet_tabs: None,
             viewing_keys: std::sync::Mutex::new(BTreeMap::new()),
             fetched_config: None,
         }

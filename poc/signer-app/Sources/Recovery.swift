@@ -50,7 +50,8 @@ func loki_member_app_restore_profile(_ launch: UnsafePointer<CChar>,
     _ pass: UnsafeMutablePointer<UInt8>?, _ passCount: Int, _ file: UnsafePointer<CChar>,
     _ notify: @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Void,
     _ approve: @convention(c) (UnsafePointer<CChar>?) -> Int32,
-    _ confirmRoster: @convention(c) (UnsafePointer<CChar>?) -> Int32) -> UnsafeMutablePointer<CChar>?
+    _ confirmRoster: @convention(c) (UnsafePointer<CChar>?) -> Int32,
+    _ connect: ConnectDecision) -> UnsafeMutablePointer<CChar>?
 
 func firstRunChoice() -> NSApplication.ModalResponse {
     let alert = NSAlert()

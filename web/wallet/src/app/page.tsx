@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
+import { NativeTabConnection } from "@/components/NativeTabConnection";
 import { OrbScene } from "@/components/OrbScene";
 import {
   api,
@@ -15,7 +16,8 @@ import {
   forgetSession,
   logout,
   listSlots,
-  pairDevice,
+  hasLokiSignerSession,
+  lastLokiSignerSlot,
   requestPairingLink,
   PairingSlotTaken,
   pendingApprovals,
@@ -31,6 +33,7 @@ import {
   type CustodyMethod,
   type PairingLink,
   type PendingApproval,
+  type Slot,
   type RecoveryStatus,
 } from "@/lib/api";
 import { comparesInLokiSigner, invitePreview, nativeRosterRefusal, pairingSecondsLeft, paymentLabel, rememberedVaultSlot, rememberVaultSlot, storageLabel, verifyPhrase } from "@/lib/wallet-ui";
@@ -112,11 +115,13 @@ export default function App() {
 
   const checkSession = useCallback(async () => {
     setAuthed(null); setSessionError(null);
+    const lokiSigner = hasLokiSignerSession();
     try {
       const s = await api<StatusResponse>("status");
       setAuthed(s.phase === "home");
     } catch (e) {
-      if (e instanceof ApiError && e.status === 401) setAuthed(false);
+      if (lokiSigner && !hasLokiSignerSession()) setAuthed(false);
+      else if (e instanceof ApiError && e.status === 401) setAuthed(false);
       else setSessionError((e as Error).message);
     }
   }, []);
@@ -532,16 +537,25 @@ function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string 
     } catch (e) { setErr((e as Error).message); }
     finally { setBusy(false); }
   };
-  const [link, setLink] = useState("");
   const [nativeOpen, setNativeOpen] = useState(false);
-  const pasteRef = useRef<HTMLInputElement>(null);
-  const focusPaste = useCallback(() => pasteRef.current?.focus(), []);
-  const pair = async () => {
-    setBusy(true); setErr(null);
-    try { await pairDevice(link); setLink(""); onLoggedIn(); }
-    catch (e) { setErr((e as Error).message); }
-    finally { setBusy(false); }
-  };
+  const [apps, setApps] = useState<Slot[]>();
+  const [choice, setChoice] = useState<number | "paste">();
+  useEffect(() => {
+    const last = lastLokiSignerSlot();
+    if (last !== undefined) { setChoice(last); setNativeOpen(true); }
+  }, []);
+  useEffect(() => {
+    if (!nativeOpen) return;
+    const loading = new AbortController();
+    listSlots(loading.signal).then(setApps).catch(() => {
+      if (!loading.signal.aborted) setApps([]); // An existing headless member can still paste.
+    });
+    return () => loading.abort();
+  }, [nativeOpen]);
+  const lokiSigners = apps?.filter((m) => m.lokisigner_url !== undefined) ?? [];
+  const selected = choice ?? (lokiSigners.length === 1 ? lokiSigners[0].slot : lokiSigners.length === 0 && apps ? "paste" : undefined);
+  const selectedSlot = typeof selected === "number" ? selected : undefined;
+  const selectedMember = apps?.find((m) => m.slot === selectedSlot);
 
   return <FullScreen calm>
     <div className="panel w-full max-w-md px-6 py-8 sm:px-10">
@@ -608,16 +622,27 @@ function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string 
       {/* A native member app (LokiSigner / loki_member_app) instead of the browser signer: this
           tab then drives that member over its loopback device API. A new app first takes a
           pairing link (step 1); an app that is already paired goes straight to step 2. */}
-      <details className="mt-4 text-xs text-muted" onToggle={(e) => setNativeOpen(e.currentTarget.open)}>
+      <details open={nativeOpen} className="mt-4 text-xs text-muted" onToggle={(e) => setNativeOpen(e.currentTarget.open)}>
         <summary className="min-h-11 cursor-pointer hover:text-mint">Use a native member app instead</summary>
         <h2 className="mb-1 mt-3 text-sm font-semibold text-[var(--ink)]">1 · Pair a new native signer</h2>
-        <NativePairingLink open={nativeOpen} onRegistered={focusPaste} />
-        <h2 className="mb-1 mt-5 text-sm font-semibold text-[var(--ink)]">2 · Paste LokiSigner&apos;s private link</h2>
-        <p className="my-2">Already paired? Unlock your profile in the member app. Then paste the private link it shows here. Keep the link private.</p>
-        <input ref={pasteRef} type="password" value={link} autoComplete="off" spellCheck={false} aria-label="LokiSigner's private link"
-          onChange={(e) => setLink(e.target.value)} onKeyDown={(e) => e.key === "Enter" && !busy && link && pair()}
-          placeholder="http://127.0.0.1:3601/#…" className="glass mb-3 w-full rounded-full px-5 py-3" />
-        <Btn variant="ghost" disabled={busy || !link.trim()} onClick={pair}>{busy ? "Connecting…" : "Pair this tab"}</Btn>
+        <NativePairingLink open={nativeOpen} onReserved={setChoice} onRegistered={setApps} />
+        <h2 className="mb-1 mt-5 text-sm font-semibold text-[var(--ink)]">2 · Connect this wallet tab</h2>
+        {nativeOpen && <>
+          {(lokiSigners.length > 0 || selectedSlot !== undefined) && <label className="my-2 block">
+            Member app
+            <select value={selected ?? ""} disabled={busy} onChange={(e) => setChoice(e.target.value === "paste" ? "paste" : Number(e.target.value))}
+              className="glass mt-1 w-full rounded-full px-4 py-2.5 text-[var(--ink)]">
+              {selected === undefined && <option value="" disabled>Choose a member app</option>}
+              {lokiSigners.map((m) => <option key={m.slot} value={m.slot}>LokiSigner · Slot {m.slot}</option>)}
+              {selectedSlot !== undefined && !lokiSigners.some((m) => m.slot === selectedSlot) &&
+                <option value={selectedSlot}>Member app · Slot {selectedSlot}</option>}
+              <option value="paste">Headless or older member app</option>
+            </select>
+          </label>}
+          {selected === undefined && lokiSigners.length === 0 && <p role="status" className="my-2">Reading the member roster…</p>}
+          {selected !== undefined && <NativeTabConnection key={selected} member={selectedMember} slot={selectedSlot} disabled={busy}
+            onBusy={setBusy} onConnected={onLoggedIn} />}
+        </>}
       </details>
     </div>
   </FullScreen>;
@@ -630,7 +655,7 @@ function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string 
 const ROSTER_POLL_MS = 3000;
 const ROSTER_GRACE_MS = 60_000;
 
-function NativePairingLink({ open, onRegistered }: { open: boolean; onRegistered: () => void }) {
+function NativePairingLink({ open, onReserved, onRegistered }: { open: boolean; onReserved: (slot: number) => void; onRegistered: (roster: Slot[]) => void }) {
   const [link, setLink] = useState<PairingLink | null>(null);
   const [slot, setSlot] = useState<number>(); // a new link asks for this slot again
   const [registered, setRegistered] = useState<number | null>(null);
@@ -644,6 +669,7 @@ function NativePairingLink({ open, onRegistered }: { open: boolean; onRegistered
     try {
       const issued = await requestPairingLink(want);
       setSlot(issued.slot); setNow(Date.now()); setLink(issued); setRegistered(null);
+      onReserved(issued.slot);
     } catch (e) {
       // A taken slot stays taken: stop watching it, and let the next link take a new slot.
       if (e instanceof PairingSlotTaken) setSlot(undefined);
@@ -668,7 +694,7 @@ function NativePairingLink({ open, onRegistered }: { open: boolean; onRegistered
       if (Date.now() > link.expires + ROSTER_GRACE_MS) { clearInterval(poll); return; }
       try {
         const roster = await listSlots();
-        if (!stopped && roster.some((m) => m.slot === link.slot)) { setRegistered(link.slot); onRegistered(); }
+        if (!stopped && roster.some((m) => m.slot === link.slot)) { setRegistered(link.slot); onRegistered(roster); }
       } catch {} // the next poll retries
     }, ROSTER_POLL_MS);
     return () => { stopped = true; clearInterval(tick); clearInterval(poll); };
@@ -678,7 +704,7 @@ function NativePairingLink({ open, onRegistered }: { open: boolean; onRegistered
     // The roster shows only that some identity registered this slot, not that it is this member's.
     return <>
       <p role="status" className="my-2 font-medium text-mint">
-        Slot {registered} now appears on the roster. If LokiSigner shows “Signer paired and running”, paste its private link below.
+        Slot {registered} now appears on the roster. If LokiSigner is running and paired with that slot, connect below.
       </p>
       <button type="button" disabled={busy} onClick={() => request(undefined)} className="min-h-11 text-mint">
         {busy ? "Requesting…" : "LokiSigner did not pair? Get a link for another slot"}
@@ -699,7 +725,7 @@ function NativePairingLink({ open, onRegistered }: { open: boolean; onRegistered
   if (left === 0) {
     return <>
       <p role="status" className="my-2">
-        The link for slot {link.slot} expired. If LokiSigner already shows its private link, paste it below.
+        The link for slot {link.slot} expired. If LokiSigner is running and paired with that slot, connect below.
         Otherwise get a new link for the same slot.
       </p>
       <Btn variant="ghost" disabled={busy} onClick={() => request(slot)}>{busy ? "Requesting…" : "Get a new link"}</Btn>
@@ -722,7 +748,7 @@ function NativePairingLink({ open, onRegistered }: { open: boolean; onRegistered
       <li>“Pair this device with slot {link.slot}?” with the coordinator. Choose Continue only if it shows {window.location.origin}.</li>
       <li>“Pair this device with slot {link.slot}?” again, with the network and endpoints. Enter a local profile passphrase and choose Pair.</li>
       <li>For a new profile, “Save your recovery words privately”. Write them down, then choose “I saved these words”.</li>
-      <li>“Signer paired and running”. Choose “Copy private link” and paste it in step 2 below.</li>
+      <li>“LokiSigner is running”. Choose Done, then connect this tab in step 2 below.</li>
     </ol>
   </>;
 }

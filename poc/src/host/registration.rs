@@ -94,6 +94,8 @@ pub(super) struct PublicMember {
     pub signing_pubkey: String,
     pub relay_pubkey: String,
     pub advertise_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lokisigner_url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -103,6 +105,8 @@ struct Enrollment {
     signing_pubkey: String,
     relay_pubkey: String,
     advertise_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lokisigner_url: Option<String>,
     device_pubkey: String,
     authorization: String,
 }
@@ -167,7 +171,9 @@ async fn registration_response(mut response: reqwest::Response, step: &str, nati
 
 impl Enrollment {
     fn message(&self, origin: &str, challenge: &str) -> Vec<u8> {
-        format!("loki-member-registration-v1\n{origin}\n{}\n{}\n{}\n{}\n{}\n{challenge}",
+        let (version, local) = self.lokisigner_url.as_ref()
+            .map_or(("v1", String::new()), |url| ("v2", format!("{url}\n")));
+        format!("loki-member-registration-{version}\n{origin}\n{}\n{}\n{}\n{}\n{local}{}\n{challenge}",
             self.slot.unwrap_or(0), self.signing_pubkey, self.relay_pubkey, self.advertise_url, self.device_pubkey).into_bytes()
     }
 }
@@ -231,6 +237,7 @@ async fn register(config: &Config, pass: &str, pairing_claim: Option<&str>, slot
     let enrollment = Enrollment {
         slot, signing_pubkey: hex::encode(identity.public().signing),
         relay_pubkey: hex::encode(identity.public().encryption), advertise_url,
+        lokisigner_url: config.lokisigner_url(),
         device_pubkey: hex::encode(&device_pub), authorization: hex::encode(authorization),
     };
     let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
@@ -255,7 +262,8 @@ async fn register(config: &Config, pass: &str, pairing_claim: Option<&str>, slot
         .json().await.map_err(|e| e.to_string())?;
     let member: PublicMember = serde_json::from_value(reply["member"].clone()).map_err(|e| e.to_string())?;
     if member.slot == 0 || slot.is_some_and(|s| s != member.slot) || member.signing_pubkey != enrollment.signing_pubkey
-        || member.relay_pubkey != enrollment.relay_pubkey || member.advertise_url != enrollment.advertise_url {
+        || member.relay_pubkey != enrollment.relay_pubkey || member.advertise_url != enrollment.advertise_url
+        || member.lokisigner_url != enrollment.lokisigner_url {
         return Err("coordinator returned a different identity".into());
     }
     Ok(member)
@@ -724,7 +732,7 @@ mod tests {
         let public = sk.verifying_key().to_encoded_point(false).as_bytes().to_vec();
         let mut registry = DeviceRegistry::new(identity.public().signing);
         registry.enroll(&public, &identity.authorize_device(&public)).unwrap();
-        let mut e = Enrollment { slot: Some(1), signing_pubkey: hex::encode(identity.public().signing), relay_pubkey: hex::encode(identity.public().encryption), advertise_url: "http://127.0.0.1:3601".into(), device_pubkey: hex::encode(&public), authorization: hex::encode(identity.authorize_device(&public)) };
+        let mut e = Enrollment { slot: Some(1), signing_pubkey: hex::encode(identity.public().signing), relay_pubkey: hex::encode(identity.public().encryption), advertise_url: "http://127.0.0.1:3601".into(), lokisigner_url: None, device_pubkey: hex::encode(&public), authorization: hex::encode(identity.authorize_device(&public)) };
         let origin = "http://localhost:3001";
         let challenge = hex::encode(registry.issue_challenge());
         let message = e.message(origin, &challenge);

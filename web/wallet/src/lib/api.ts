@@ -8,16 +8,18 @@
 // signer. Only coordinator calls (/api/members, /api/fund) go to this origin.
 // Explicit .ts extension so Node's test loader resolves the chained import.
 import { signer, ApiError, type CreateSignerOpts, type EnrolledMember, type SignerSession, type UnlockOpts } from "./signer.ts";
+import { isLokiSignerUrl } from "./lokisigner-url.ts";
 export { ApiError };
 export type { CustodyMethod, CreateSignerOpts, EnrolledMember, UnlockOpts } from "./signer";
-export type Slot = { slot: number; signing_pubkey: string; relay_pubkey: string; advertise_url: string };
+export type Slot = { slot: number; signing_pubkey: string; relay_pubkey: string; advertise_url: string; lokisigner_url?: string };
 
 /** Register this in-browser signer into the public roster; returns its allocated member/slot. */
 export function enroll(coordinatorOrigin?: string): Promise<EnrolledMember> { return signer.enroll(coordinatorOrigin); }
 
 // ─── native member (paired tab) ──────────────────────────────────────────────
-type Pairing = { endpoint: string; capability: string };
+type Pairing = { endpoint: string; capability: string; lokisigner?: true };
 const PAIRING = "loki_device_session"; // sessionStorage: this tab's native member + capability
+const LOKISIGNER_SLOT = "loki_lokisigner_slot"; // public reconnect hint, not authorization
 function paired(): Pairing | null {
   if (typeof window === "undefined") return null;
   try { const raw = sessionStorage.getItem(PAIRING); return raw ? JSON.parse(raw) as Pairing : null; }
@@ -25,8 +27,16 @@ function paired(): Pairing | null {
 }
 /** Which signer this tab drives. */
 export function signerKind(): "native" | "browser" { return paired() ? "native" : "browser"; }
+export function hasLokiSignerSession(): boolean { return paired()?.lokisigner === true; }
+export function lastLokiSignerSlot(): number | undefined {
+  try {
+    const slot = Number(sessionStorage.getItem(LOKISIGNER_SLOT));
+    return Number.isSafeInteger(slot) && slot > 0 ? slot : undefined;
+  } catch { return undefined; }
+}
 
 async function nativeApi<T>(session: Pairing, path: string, body?: unknown): Promise<T> {
+  if (session.lokisigner && !isLokiSignerUrl(session.endpoint)) throw new ApiError("invalid LokiSigner endpoint", 401);
   const headers: Record<string, string> = { "X-Loki-Token": session.capability };
   if (body !== undefined) headers["Content-Type"] = "application/json";
   const res = await fetch(`${session.endpoint}/api/${path}`, {
@@ -35,6 +45,7 @@ async function nativeApi<T>(session: Pairing, path: string, body?: unknown): Pro
     credentials: "omit", redirect: "error", cache: "no-store",
   });
   const text = await res.text();
+  if (session.lokisigner && res.status === 401) throw new ApiError("LokiSigner disconnected this tab", 401);
   const data = text ? JSON.parse(text) : {};
   if (!res.ok) throw new ApiError(data.error ?? `${path} failed (${res.status})`, res.status);
   return data as T;
@@ -57,7 +68,84 @@ export async function pairDevice(link: string): Promise<Slot> {
   if (status.phase !== "home") throw new Error("Unlock the profile locally on your device, then pair again");
   sessionStorage.setItem(PAIRING, JSON.stringify(session));
   sessionStorage.setItem("loki_me", JSON.stringify({ slot: member.slot }));
+  sessionStorage.removeItem(LOKISIGNER_SLOT);
   return member;
+}
+
+export type ConnectProgress = { phase: "starting" } | { phase: "compare"; code: string };
+
+/** Discover this launch and keep its single response open until LokiSigner decides. */
+export async function connectLokiSigner(slot: number, show: (progress: ConnectProgress) => void, signal: AbortSignal): Promise<void> {
+  show({ phase: "starting" });
+  while (!signal.aborted) {
+    const member = (await listSlots(signal)).find((m) => m.slot === slot);
+    const endpoint = member?.lokisigner_url;
+    if (endpoint !== undefined && !isLokiSignerUrl(endpoint)) throw new Error("The coordinator did not give a valid LokiSigner loopback address.");
+    if (member && endpoint) {
+      const { signing_pubkey, relay_pubkey } = member;
+      // Timeout only if no response has started; an opened dialog gets its full deadline.
+      const stalled = new AbortController();
+      const timer = setTimeout(() => stalled.abort(), 15_000);
+      const res = await fetch(`${endpoint}/api/connect`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ slot, signing_pubkey, relay_pubkey }),
+        signal: AbortSignal.any([signal, stalled.signal]), credentials: "omit", redirect: "error", cache: "no-store",
+      }).catch(() => null).finally(() => clearTimeout(timer));
+      signal.throwIfAborted();
+      if (res?.ok) {
+        const capability = await readConnectDecision(res, show);
+        signal.throwIfAborted();
+        const session: Pairing = { endpoint, capability, lokisigner: true };
+        sessionStorage.setItem(LOKISIGNER_SLOT, String(slot));
+        sessionStorage.setItem("loki_me", JSON.stringify({ slot }));
+        sessionStorage.setItem(PAIRING, JSON.stringify(session));
+        return;
+      }
+      if (res && ![404, 405, 425].includes(res.status)) {
+        throw new Error(res.status === 429 ? "LokiSigner is handling another request. Try again in a moment." : "LokiSigner did not allow this connection.");
+      }
+    }
+    // Missing or stale roster entry, or the server has not received its registration reply yet.
+    // The retry waits for the new port; no credential is sent to the stale port.
+    await new Promise<void>((resolve) => {
+      const wake = () => { clearTimeout(timer); signal.removeEventListener("abort", wake); resolve(); };
+      const timer = setTimeout(wake, 1500);
+      signal.addEventListener("abort", wake, { once: true });
+    });
+  }
+  signal.throwIfAborted();
+}
+
+async function readConnectDecision(res: Response, show: (progress: ConnectProgress) => void): Promise<string> {
+  const refused = () => new Error("LokiSigner did not allow this connection.");
+  if (res.headers.get("content-type") !== "application/x-ndjson" || !res.body) {
+    void res.body?.cancel().catch(() => {});
+    throw refused();
+  }
+  const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+  let partial = "", code = "", token = "", received = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      received += value.length;
+      if (received > 1024) throw refused();
+      const lines = (partial + value).split("\n");
+      partial = lines.pop()!;
+      for (const line of lines) {
+        const frame = JSON.parse(line);
+        if (!code && typeof frame.code === "string" && /^[0-9]{6}$/.test(frame.code)) {
+          code = frame.code;
+          show({ phase: "compare", code });
+        } else if (code && !token && typeof frame.token === "string" && /^[A-Za-z0-9_-]{43}$/.test(frame.token)) {
+          token = frame.token;
+        } else { throw refused(); }
+      }
+    }
+    if (!token || partial) throw refused();
+    return token;
+  } catch { throw refused(); }
+  finally { await reader.cancel().catch(() => {}); }
 }
 
 /** A pairing link LokiSigner opens; the coordinator reserves its slot until `expires`, in this
@@ -88,7 +176,7 @@ export async function requestPairingLink(slot?: number): Promise<PairingLink> {
     // Only our own sentences reach the page, never the coordinator's text.
     const error = typeof data.error === "string" ? data.error : "";
     if (error.startsWith("slot already registered or reserved")) {
-      throw new PairingSlotTaken(`${slot === undefined ? "That slot" : `Slot ${slot}`} was taken, possibly by another member. If LokiSigner shows “Signer paired and running”, paste its private link in step 2. Otherwise get a new link; it will use another slot.`);
+      throw new PairingSlotTaken(`${slot === undefined ? "That slot" : `Slot ${slot}`} was taken, possibly by another member. If LokiSigner is running and paired with that slot, connect in step 2. Otherwise get a new link; it will use another slot.`);
     }
     const known = PAIRING_REFUSALS.find(([prefix]) => error.startsWith(prefix));
     throw new Error(known ? known[1](slot) : `The coordinator refused a pairing link (HTTP ${res.status}). Try again, or ask whoever runs it.`);
@@ -118,13 +206,21 @@ export async function api<T = unknown>(path: string, body?: unknown): Promise<T>
   try {
     return native ? await nativeApi<T>(native, path, body) : await signer.request<T>(path, body);
   } catch (e) {
-    if (e instanceof ApiError && e.status === 401 && typeof window !== "undefined") window.dispatchEvent(new Event("loki:auth-lost"));
+    const unauthorized = e instanceof ApiError && e.status === 401;
+    if (typeof window !== "undefined" && native?.lokisigner && (unauthorized || e instanceof TypeError || e instanceof SyntaxError)) {
+      if (paired()?.capability === native.capability) {
+        forgetSession();
+        window.dispatchEvent(new Event("loki:auth-lost"));
+      }
+    } else if (unauthorized && !native?.lokisigner && typeof window !== "undefined") {
+      window.dispatchEvent(new Event("loki:auth-lost"));
+    }
     throw e;
   }
 }
 
-export async function listSlots(): Promise<Slot[]> {
-  const res = await fetch("/api/members", { cache: "no-store" });
+export async function listSlots(signal?: AbortSignal): Promise<Slot[]> {
+  const res = await fetch("/api/members", { cache: "no-store", signal });
   if (!res.ok) throw new Error("could not read public roster");
   return (await res.json()).slots as Slot[];
 }
@@ -134,7 +230,7 @@ export function hasSigner(): Promise<boolean> { return signer.hasSigner(); }
 export { hasSignerHint } from "./signer.ts"; // sync first-paint guess; hasSigner() confirms
 
 function rememberMe(s: SignerSession): void {
-  try { sessionStorage.setItem("loki_me", JSON.stringify({ slot: s.slot })); } catch {}
+  try { sessionStorage.setItem("loki_me", JSON.stringify({ slot: s.slot })); sessionStorage.removeItem(LOKISIGNER_SLOT); } catch {}
 }
 export async function createSigner(opts: CreateSignerOpts): Promise<SignerSession> {
   const s = await signer.createSigner(opts);
@@ -153,7 +249,7 @@ export function forgetSession(): void {
   try { sessionStorage.removeItem("loki_me"); sessionStorage.removeItem(PAIRING); } catch {}
 }
 export async function logout(): Promise<boolean> {
-  // A native member locks its own profile (it restarts locally with a new pairing link).
+  // A native member locks its own profile; unlock it locally before reconnecting.
   try { if (paired()) await api("lock", {}); else await signer.lock(); return true; }
   catch { return false; }
   finally { forgetSession(); }

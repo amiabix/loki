@@ -1,10 +1,18 @@
 import AppKit
 
+typealias ConnectCancellation = @convention(c) (UnsafeRawPointer?) -> Int32
+typealias ConnectDecision = @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?,
+    UnsafeRawPointer?, ConnectCancellation) -> Int32
+
 @_silgen_name("loki_member_app_pair")
 func loki_member_app_pair(_ launch: UnsafePointer<CChar>, _ pass: UnsafeMutablePointer<CChar>,
     _ notify: @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Void,
     _ approve: @convention(c) (UnsafePointer<CChar>?) -> Int32,
-    _ confirmRoster: @convention(c) (UnsafePointer<CChar>?) -> Int32) -> Int32
+    _ confirmRoster: @convention(c) (UnsafePointer<CChar>?) -> Int32,
+    _ connect: ConnectDecision) -> Int32
+
+@_silgen_name("loki_member_app_disconnect_wallet_tabs")
+func loki_member_app_disconnect_wallet_tabs()
 
 @_silgen_name("loki_member_app_pairing_target")
 func loki_member_app_pairing_target(_ launch: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
@@ -237,6 +245,49 @@ private func nativeConfirmRoster(_ summary: UnsafePointer<CChar>?) -> Int32 {
     return answer
 }
 
+private func nativeConnect(_ origin: UnsafePointer<CChar>?, _ code: UnsafePointer<CChar>?,
+                           _ context: UnsafeRawPointer?, _ cancelled: ConnectCancellation) -> Int32 {
+    guard let origin, let code, let context else { return 0 }
+    let coordinator = String(cString: origin), comparison = String(cString: code)
+    return DispatchQueue.main.sync {
+        showConnectDialog(origin: coordinator, code: comparison, cancelled: { cancelled(context) != 0 }) ? 1 : 0
+    }
+}
+
+/// Only answer the request whose code matches the wallet tab. The borrowed cancellation
+/// check is used only while the C callback is live, including during the modal run loop.
+func showConnectDialog(origin: String, code: String, cancelled: @escaping () -> Bool) -> Bool {
+    guard !cancelled(), NSApp.modalWindow == nil else { return false }
+    let alert = NSAlert()
+    alert.messageText = "Connect this wallet tab?"
+    alert.informativeText = """
+        Wallet: \(origin)
+
+        Choose Allow only if you clicked Connect LokiSigner and the code below matches the one in that tab.
+        Unanswered requests are refused in under two minutes.
+        """
+    let comparison = NSTextField(labelWithString: code)
+    comparison.font = .monospacedDigitSystemFont(ofSize: 24, weight: .semibold)
+    comparison.frame = NSRect(x: 0, y: 0, width: 230, height: 30)
+    alert.accessoryView = comparison
+    alert.addButton(withTitle: "Refuse")
+    alert.addButton(withTitle: "Allow")
+    alert.layout()
+    for button in alert.buttons {
+        button.keyEquivalent = ""
+        button.refusesFirstResponder = true
+    }
+    let window = alert.window
+    window.defaultButtonCell = nil
+    NSApp.activate(ignoringOtherApps: true)
+    let timer = Timer(timeInterval: 0.1, repeats: true) { _ in
+        if cancelled() && NSApp.modalWindow === window { NSApp.abortModal() }
+    }
+    RunLoop.main.add(timer, forMode: .modalPanel)
+    defer { timer.invalidate() }
+    return alert.runModal() == .alertSecondButtonReturn && !cancelled()
+}
+
 private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointer<CChar>?) {
     guard let kind = kind, let message = message else { return }
     let event = String(cString: kind), text = String(cString: message)
@@ -249,21 +300,13 @@ private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointe
     DispatchQueue.main.sync {
         let alert = NSAlert()
         if event == "ready" || event == "restore-ready" || event == "restore-pending" {
-            alert.messageText = event == "ready" ? "Signer paired and running" : "Vault restored"
+            alert.messageText = event == "ready" ? "LokiSigner is running" : "Vault restored"
+            let connect = "On this Mac, choose Connect LokiSigner in the wallet. If the wallet only offers to paste a link, ask the coordinator to update it. Keep LokiSigner running to approve and sign."
             alert.informativeText = event == "restore-pending"
-                ? "Your vault is saved on this Mac. LokiSigner could not reconnect to the coordinator yet. It will retry now and when you next unlock, without your recovery words. Pair the wallet tab after it reconnects."
-                : "Paste this private session link into your wallet tab. Keep LokiSigner running to approve and sign."
-            let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 420, height: 26))
-            field.stringValue = text
-            field.isEditable = false
-            field.isSelectable = true
-            alert.accessoryView = field
+                ? "Your vault is saved on this Mac. LokiSigner will keep trying to reconnect, without your recovery words.\n\n\(connect)"
+                : connect
             alert.addButton(withTitle: "Done")
-            alert.addButton(withTitle: "Copy private link")
-            if alert.runModal() == .alertSecondButtonReturn {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(text, forType: .string)
-            }
+            alert.runModal()
             (NSApp.delegate as? NativeSigner)?.didStart()
         } else if event == "recovery" {
             alert.messageText = "Save your recovery words privately"
@@ -521,7 +564,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         DispatchQueue.global(qos: .userInitiated).async {
             defer { _ = secret.withUnsafeMutableBytes { $0.initializeMemory(as: UInt8.self, repeating: 0) } }
             let code = request.withCString { request in
-                secret.withUnsafeMutableBufferPointer { pass in loki_member_app_pair(request, pass.baseAddress!, nativeNotice, nativeApprove, nativeConfirmRoster) }
+                secret.withUnsafeMutableBufferPointer { pass in loki_member_app_pair(request, pass.baseAddress!, nativeNotice, nativeApprove, nativeConfirmRoster, nativeConnect) }
             }
             let failure: SignerStartFailure
             switch code {
@@ -592,7 +635,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
                     input.words.withUnsafeMutableBufferPointer { words in
                         input.pass.withUnsafeMutableBufferPointer { pass in
                             recoveryError(loki_member_app_restore_profile(request, words.baseAddress, words.count,
-                                pass.baseAddress, pass.count, file, nativeNotice, nativeApprove, nativeConfirmRoster))
+                                pass.baseAddress, pass.count, file, nativeNotice, nativeApprove, nativeConfirmRoster, nativeConnect))
                         }
                     }
                 }
@@ -643,6 +686,10 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
             }
         }
     }
+
+    @objc func disconnectWalletTabs(_ sender: Any?) {
+        loki_member_app_disconnect_wallet_tabs()
+    }
 }
 
 func runNativeSigner(arguments: [String], link: String?) -> Never {
@@ -664,6 +711,8 @@ func runNativeSigner(arguments: [String], link: String?) -> Never {
     let restore = actions.addItem(withTitle: "Restore a vault…", action: #selector(NativeSigner.restoreVault(_:)), keyEquivalent: "")
     restore.target = delegate
     actions.addItem(.separator())
+    let disconnect = actions.addItem(withTitle: "Disconnect all wallet tabs", action: #selector(NativeSigner.disconnectWalletTabs(_:)), keyEquivalent: "")
+    disconnect.target = delegate
     actions.addItem(withTitle: "Quit and lock LokiSigner", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     item.submenu = actions
     menu.addItem(item)
