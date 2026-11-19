@@ -38,6 +38,13 @@ where
 }
 
 pub fn router(state: Shared) -> Router {
+    // Headless automation keeps both secret-bearing routes. With LokiSigner, neither route
+    // even extracts a body: malformed JSON (including its contents) cannot reach an error.
+    let (recovery_setup, recovery_restore) = if state.recovery_in_app {
+        (post(recovery::in_app_only), post(recovery::in_app_only))
+    } else {
+        (post(recovery::setup), post(recovery::restore))
+    };
     Router::new()
         .route("/api/profile-create", post(profile_create))
         .route("/api/unlock", post(unlock))
@@ -64,10 +71,10 @@ pub fn router(state: Shared) -> Router {
         .route("/api/payments", get(payment::payments))
         .route("/api/pending", get(payment::pending))
         .route("/api/payment-status", get(payment::status))
-        .route("/api/recovery-setup", post(recovery::setup))
+        .route("/api/recovery-setup", recovery_setup)
         .route("/api/recovery-status", get(recovery::status))
         .route("/api/recovery-backup", get(recovery::fetch))
-        .route("/api/recovery-restore", post(recovery::restore))
+        .route("/api/recovery-restore", recovery_restore)
         .route("/api/device-enroll", post(device::enroll))
         .route("/api/device-challenge", get(device::challenge))
         .route("/api/device-login", post(device::login))

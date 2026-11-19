@@ -18,6 +18,7 @@ On the wallet's sign-in screen open **Use a native member app instead**. It has 
 1. **Pair a new native signer**: choose **Get a pairing link**. The wallet shows the reserved
    slot, the time left on the link, an **Open LokiSigner** button and **Copy link** (to open
    it on the member's Mac yourself). LokiSigner then asks, in this order:
+   - On first launch, choose **Pair a new signer** (or see restore below if this is a replacement Mac).
    - "Pair this device with slot N?" with the coordinator origin. Choose **Continue** only if
      it is the wallet's address.
    - "Pair this device with slot N?" again, with the network and endpoints that coordinator
@@ -41,6 +42,38 @@ On the wallet's sign-in screen open **Use a native member app instead**. It has 
 The app stays running for ceremony, payment review and signing using the existing device
 consent and nonce-witness paths. Quit locks the process; launch again to unlock and register
 with the saved public coordinator/slot, without reusing the claim.
+
+## Back up and restore a vault
+
+After your vault is active, choose **Download encrypted backup** in the wallet's **Recovery**
+card. The ciphertext is stored in your LokiSigner profile on this Mac, not by the coordinator.
+**Keep the downloaded JSON somewhere other than this Mac.** If you lose the Mac and the file,
+the 24 words alone cannot recover the vault. Export one file per vault and store your words
+privately, separately from the files. Together the words and a file can recover your share.
+
+On a new Mac, open LokiSigner without a pairing link. Choose **Restore from recovery words**,
+enter the original coordinator's HTTPS origin, confirm it, and review the signer configuration.
+Choose one backup file in LokiSigner, enter the 24 words, and set a new local profile passphrase.
+LokiSigner opens the file locally and checks that both recovered public identity keys identify
+exactly one slot in the coordinator's roster. It saves the recovered vault and identity together,
+then registers the new Mac in that slot without reserving a new one. If the connection fails
+after saving, keep LokiSigner running or reopen and unlock it to retry. You won't need the words
+again to reconnect. Once connected, use the private link to pair the wallet tab on the new Mac.
+
+Restore each additional backup from **LokiSigner → Restore a vault…** in the unlocked app.
+It must belong to the same member and recovery words. It will not replace an existing vault.
+After the replacement registers, the coordinator's device binding and advertised endpoint
+point to the new Mac; the member slot and identity keys stay the same. This does not erase or
+revoke the old Mac's local share. Quit and retire the old signer if you still have it: a Mac
+that still holds the identity can register another device binding again.
+
+LokiSigner refuses HTTP recovery setup and restore. It continues serving recovery status and
+the encrypted backup. The headless `loki_member_app` and `LokiSigner serve` **do** keep HTTP
+setup and restore for automation; their authenticated callers handle the words directly.
+The native restore field is masked, with spell checking and autocorrection off. LokiSigner
+clears the field and Rust wipes the writable FFI buffer after copying it. Swift/AppKit do not
+guarantee that transient string or text-editor copies are wiped from process memory. Do not
+copy your words into the system clipboard or type them into the wallet.
 
 ## Verify a receive address
 

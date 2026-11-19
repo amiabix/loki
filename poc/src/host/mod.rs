@@ -10,6 +10,8 @@ mod payment;
 mod native_config;
 #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
 mod native_member;
+#[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+mod native_recovery;
 mod nonce_witness;
 mod recovery;
 mod registration;
@@ -23,6 +25,10 @@ pub use registration::RegistrationConfig;
 pub use native_config::{Deployment, FetchedConfig, NativeConfig};
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
 pub(crate) use native_member::{run_native, vault_addresses as native_vault_addresses};
+#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+pub(crate) use native_member::restore_running as native_restore_running;
+#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+pub(crate) use native_recovery::{restore_new as native_restore_new, REFUSED as NATIVE_RESTORE_REFUSED};
 #[cfg(feature = "relay-communication")]
 pub use nonce_witness::WitnessConfig;
 
@@ -215,7 +221,7 @@ pub fn run_local(
     approval: Option<LocalApproval>,
     fetched: Option<FetchedConfig>,
 ) -> Result<(), String> {
-    run_local_with(config, pass, notice, approval, None, fetched, |_| Ok(()))
+    run_local_with(config, pass, notice, approval, None, fetched, false, |_| Ok(()))
 }
 
 fn run_local_with<G>(
@@ -225,6 +231,7 @@ fn run_local_with<G>(
     approval: Option<LocalApproval>,
     roster_confirmation: Option<LocalRosterConfirmation>,
     fetched: Option<FetchedConfig>,
+    recovery_in_app: bool,
     on_start: impl FnOnce(&state::Shared) -> Result<G, String>,
 ) -> Result<(), String> {
     // rustls has no default provider; install one before any relay/lightwalletd TLS.
@@ -246,12 +253,12 @@ fn run_local_with<G>(
             .map_err(|e| format!("bind {addr}: {e}"))?;
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
         config.port = addr.port();
-        let state: state::Shared = std::sync::Arc::new(state::AppState { approval, roster_confirmation, fetched_config: fetched, ..state::AppState::new(config) });
+        let state: state::Shared = std::sync::Arc::new(state::AppState { approval, roster_confirmation, fetched_config: fetched, recovery_in_app, ..state::AppState::new(config) });
         let _scope = on_start(&state)?;
-        registration::start(&state, pass, notice.as_ref()).await?;
+        let ready = registration::start(&state, pass, notice.as_ref()).await?;
         // Member-local output only. Paste into a local browser tab; never send to the coordinator.
         if let Some(notice) = notice {
-            notice("ready", &format!("http://{addr}/#{}", state.config.token));
+            notice(ready, &format!("http://{addr}/#{}", state.config.token));
         } else if let Some(launch) = &state.config.registration {
             println!("{} ({}) — Local pairing: http://{addr}/#{}", launch.name, state.config.data.display(), state.config.token);
         } else {
