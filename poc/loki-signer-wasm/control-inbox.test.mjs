@@ -1,7 +1,7 @@
 // node --test poc/loki-signer-wasm/control-inbox.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { controlInbox } from "./control-inbox.js";
+import { controlInbox, endsRequest } from "./control-inbox.js";
 
 // frostd hands a message to a recipient once: every later receive is empty.
 const relayOnce = (...msgs) => { let left = msgs; return async () => { const out = left; left = []; return out; }; };
@@ -19,4 +19,12 @@ test("later messages follow earlier ones, per session", async () => {
   await read("s2", relayOnce({ from: 2, kind: "intent" }));
   assert.deepEqual(await read("s1", relayOnce({ from: 1, kind: "start" })), [{ from: 1, kind: "intent" }, { from: 1, kind: "start" }]);
   assert.deepEqual(await read("s2", relayOnce()), [{ from: 2, kind: "intent" }]);
+});
+
+// Kept notices outlive the request: a payment that was signed or sent must leave the inbox too.
+test("a request ends when it is cancelled, failed, signed, sent or leaves this member out", () => {
+  for (const kind of ["cancelled", "failed", "signed", "broadcast", "confirmed"]) assert.equal(endsRequest({ kind, intent: {} }, 3), true, kind);
+  assert.equal(endsRequest({ kind: "start", intent: { signers: [1, 2] } }, 3), true);
+  assert.equal(endsRequest({ kind: "start", intent: { signers: [1, 3] } }, 3), false);
+  assert.equal(endsRequest({ kind: "intent", intent: {} }, 3), false);
 });

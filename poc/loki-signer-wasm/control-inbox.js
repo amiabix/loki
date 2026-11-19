@@ -14,3 +14,11 @@ export function controlInbox() {
     return [...all];
   };
 }
+
+// Whether a proposer notice ends a request for this member (slot): cancelled, failed, already
+// signed or sent, or a signing group that leaves this member out. Kept notices outlive the
+// request, so the inbox must drop it on these, not only when the notices stop coming.
+export function endsRequest(msg, slot) {
+  if (["cancelled", "failed", "signed", "broadcast", "confirmed"].includes(msg.kind)) return true;
+  return msg.kind === "start" && !!msg.intent?.signers?.length && !msg.intent.signers.includes(slot);
+}

@@ -21,7 +21,7 @@ import {
   opfsPreopenRead as preopenReadOnce,
   opfsCloseAll,
 } from "./pkg/snippets/loki-signer-core-8724841f4db15c9f/js/opfs_fs.js";
-import { controlInbox } from "./control-inbox.js";
+import { controlInbox, endsRequest } from "./control-inbox.js";
 
 // Ops run concurrently (a status read during a join), and two pre-opens of one path racing
 // would each try to take its exclusive sync handle; the second throws. Share one in-flight
@@ -349,9 +349,8 @@ async function listPending(signer, vaultHex, p) {
     for (const m of await readControl(signer, control, sessionId)) {
       const i = m.intent;
       if (m.from !== owner || !i || !/^[0-9a-f]{64}$/.test(i.attempt ?? "") || !aboutPayment(m, vault, i.attempt, sessionId)) continue;
-      if (m.kind === "cancelled" || m.kind === "failed") { pending.set(i.attempt, null); continue; }
+      if (endsRequest(m, vault.slot)) { pending.set(i.attempt, null); continue; }
       if (pending.get(i.attempt) === null) continue;
-      if (m.kind === "start" && i.signers?.length && !i.signers.includes(vault.slot)) { pending.set(i.attempt, null); continue; }
       pending.set(i.attempt, { attempt: i.attempt, amount_zat: String(i.amount_zat), recipient: i.recipient, proposer: i.proposer });
     }
   }
