@@ -143,7 +143,10 @@ export async function createSigner(opts: CreateSignerOpts): Promise<SignerSessio
 }
 export async function unlock(opts: UnlockOpts): Promise<SignerSession> {
   const s = await signer.unlock(opts);
-  rememberMe(s);
+  // The browser signer returns no slot. If it registered before this reload, its roster entry
+  // is the one carrying its signing key, which is its profile id.
+  const slot = s.slot ?? (await listSlots().catch(() => [])).find((m) => m.signing_pubkey === s.profile.id)?.slot;
+  rememberMe({ ...s, slot });
   return s;
 }
 export function forgetSession(): void {
