@@ -99,7 +99,7 @@ impl NativeConfig {
 
     #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
     pub(crate) fn recovery_origin(args: &[String], origin: &str) -> Result<String, String> {
-        let config = super::config_from_args(args)?;
+        let config = super::native_config_from_args(args)?;
         super::registration::plain_origin(origin, config.development_http)
     }
 
@@ -113,7 +113,7 @@ impl NativeConfig {
     #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
     fn resolve_restore(args: &[String], origin: String, deployment: Deployment) -> Result<Self, String> {
         // The coordinator slot is unknown until we open the backup and find its identity.
-        Self::merge(args, Some((origin, 0)), Some(deployment.clone()), Some(deployment), super::config_from_args(args)?.development_http)
+        Self::merge(args, Some((origin, 0)), Some(deployment.clone()), Some(deployment), super::native_config_from_args(args)?.development_http)
     }
 
     #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
@@ -127,7 +127,7 @@ impl NativeConfig {
     /// The coordinator and slot a pairing link names, checked without any network request, for
     /// the member to confirm before LokiSigner asks that coordinator for anything.
     pub fn pairing_target(args: &[String], pairing_url: &str) -> Result<(String, u32), String> {
-        let config = super::config_from_args(args)?;
+        let config = super::native_config_from_args(args)?;
         Self::target(&config, Some(pairing_url))?.ok_or_else(|| "invalid pairing link".into())
     }
 
@@ -170,7 +170,7 @@ impl NativeConfig {
     }
 
     fn resolve(args: &[String], pairing_url: Option<&str>, fetch: impl FnOnce(&str) -> Result<Deployment, String>) -> Result<Self, String> {
-        let config = super::config_from_args(args)?;
+        let config = super::native_config_from_args(args)?;
         let (data, development_http) = (&config.data, config.development_http);
         let target = Self::target(&config, pairing_url)?;
         let saved = load(data, development_http)?;

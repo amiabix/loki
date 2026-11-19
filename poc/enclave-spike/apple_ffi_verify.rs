@@ -1,7 +1,7 @@
 //! End-to-end verifier for the real `AppleSecureElement` backend, built with `rustc`
 //! directly (std-only, offline — the main crate can't resolve crates.io on this Mac).
 //!
-//! It includes the SHIPPED module `poc/src/signer/secure_element_apple.rs` as a submodule,
+//! It includes the SHIPPED `secure_element_apple.rs` as a submodule,
 //! so the code exercised here is byte-for-byte the code that goes into the crate. The only
 //! dependencies it stubs are the crate-side `SecureElement`/`WrappedDek` (declared in the
 //! crate-root `secure_element` module below, which the backend reaches via `super::`) and
@@ -16,16 +16,19 @@ mod secure_element {
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct WrappedDek(pub Vec<u8>);
 
+    #[derive(Debug)]
+    pub enum OpenError { Element(String) }
+
     pub trait SecureElement {
         fn wrap_dek(&self, dek: &[u8; 32]) -> Result<WrappedDek, String>;
         fn unwrap_dek(&self, wrapped: &WrappedDek)
-            -> Result<zeroize::Zeroizing<[u8; 32]>, String>;
+            -> Result<zeroize::Zeroizing<[u8; 32]>, OpenError>;
     }
 }
 
 use secure_element::SecureElement;
 
-#[path = "../src/signer/secure_element_apple.rs"]
+#[path = "../loki-signer-core/src/signer/secure_element_apple.rs"]
 mod backend;
 
 use backend::AppleSecureElement;
@@ -54,7 +57,7 @@ fn main() {
 
     // Persistent path is present and callable; unsigned it must fail cleanly (not panic,
     // not succeed) — this is the documented cert gate, asserted so it can't silently pass.
-    match AppleSecureElement::persistent(b"cash.loki.signer.kek.verify") {
+    match AppleSecureElement::create_persistent(b"cash.loki.signer.kek.verify", None) {
         Err(e) => println!("[rust] persistent path gated as expected (unsigned): {e}"),
         Ok(_) => panic!("UNEXPECTED: persistent Enclave key succeeded without a signing identity"),
     }

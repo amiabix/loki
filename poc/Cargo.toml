@@ -72,6 +72,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync",
 # loki_member_app: the Rust HTTP coordinator (one per member); hyper/tower come in
 # transitively via tonic/reqwest.
 axum = "0.8"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # WS3 frostd transport: speak the audited relay's JSON-over-HTTP contract directly
 # (the 8 endpoints in `frostd/src/lib.rs`). xeddsa signs the login challenge exactly as
 # frostd verifies it. reqwest/uuid are already in the graph transitively; named here so

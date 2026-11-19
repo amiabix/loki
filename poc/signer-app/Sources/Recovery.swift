@@ -1,4 +1,5 @@
 import AppKit
+import LocalAuthentication
 import UniformTypeIdentifiers
 
 enum SignerStartFailure: Error, Equatable {
@@ -7,6 +8,12 @@ enum SignerStartFailure: Error, Equatable {
     case missingRecoveryInput, missingRecoveryWords, invalidBackup, backupMismatch, wrongProfile
     case vaultExists, rosterUnavailable, rosterMismatch, restoredButStopped, unlockToRestore
     case notFresh, dataFolderUnavailable, protectedProfile, setAsideFailed
+    case key(String), keyGone(String), registrationRosterUnavailable
+
+    var keyIsGone: Bool {
+        if case .keyGone = self { return true }
+        return false
+    }
 
     var message: String {
         switch self {
@@ -21,6 +28,8 @@ enum SignerStartFailure: Error, Equatable {
         case .deviceKey: return "This Mac couldn’t use the device key LokiSigner needs to connect. Try again, or set aside the profile if it has no vaults."
         case .registrationRefused: return "The coordinator refused this pairing. Try unlocking again, or get a new pairing link from the wallet."
         case .registrationFailed: return "LokiSigner couldn’t finish connecting to the coordinator. Check your connection and try again."
+        case .registrationRosterUnavailable: return "LokiSigner couldn’t reach the coordinator. Check your connection, then try again."
+        case .key(let message), .keyGone(let message): return message
         case .unexpected: return "LokiSigner couldn’t finish this step. Try again."
         case .missingRecoveryInput: return "Enter your recovery words and a new local passphrase, then try again."
         case .missingRecoveryWords: return "Enter your recovery words and try again."
@@ -50,12 +59,53 @@ func loki_member_app_restore_profile(_ launch: UnsafePointer<CChar>,
     _ pass: UnsafeMutablePointer<UInt8>?, _ passCount: Int, _ file: UnsafePointer<CChar>,
     _ notify: @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Void,
     _ approve: @convention(c) (UnsafePointer<CChar>?) -> Int32,
-    _ confirmRoster: @convention(c) (UnsafePointer<CChar>?) -> Int32) -> UnsafeMutablePointer<CChar>?
+    _ confirmRoster: @convention(c) (UnsafePointer<CChar>?) -> Int32,
+    _ connect: ConnectDecision) -> UnsafeMutablePointer<CChar>?
+
+func touchIDSetupAlert(_ error: NSError?) -> NSAlert {
+    let code = error.flatMap { $0.domain == LAError.errorDomain ? LAError.Code(rawValue: $0.code) : nil }
+    let alert = NSAlert()
+    alert.alertStyle = .warning
+    switch code {
+    case .biometryNotAvailable:
+        alert.messageText = "Touch ID is not available right now"
+        alert.informativeText = "If you’re using a MacBook, open its lid and try again. To set up LokiSigner, you need a Mac or an accessory with Touch ID."
+    case .biometryDisconnected:
+        alert.messageText = "Your Touch ID accessory is disconnected"
+        alert.informativeText = "Reconnect it and try again."
+    case .biometryNotPaired:
+        alert.messageText = "No Touch ID accessory is paired"
+        alert.informativeText = "Pair it with this Mac and try again."
+    case .biometryNotEnrolled:
+        alert.messageText = "No fingerprint is enrolled for Touch ID"
+        alert.informativeText = "Add a fingerprint in System Settings, then try again."
+    case .biometryLockout:
+        alert.messageText = "Touch ID is locked out"
+        alert.informativeText = "Unlock your Mac with its password, then try again."
+    default:
+        alert.messageText = "Touch ID cannot be used right now"
+        alert.informativeText = "Unlock your Mac and try again in LokiSigner."
+    }
+    alert.addButton(withTitle: "OK")
+    return alert
+}
+
+func canSetUpWithTouchID() -> Bool {
+    var error: NSError?
+    let context = LAContext()
+    guard !context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error) else { return true }
+    touchIDSetupAlert(error).runModal()
+    return false
+}
 
 func firstRunChoice() -> NSApplication.ModalResponse {
     let alert = NSAlert()
     alert.messageText = "Set up LokiSigner"
-    alert.informativeText = "Pair a new signer, or restore your existing member using its 24 recovery words and an encrypted vault backup file."
+    alert.informativeText = """
+        Pair a new signer, or restore your existing member using its 24 recovery words and an encrypted vault backup file.
+
+        Adding or removing a Touch ID fingerprint makes this Mac’s signer keys unusable. To get your vault back, you’ll need your recovery words and the encrypted backup file downloaded from the wallet.
+        """
     alert.addButton(withTitle: "Pair a new signer")
     alert.addButton(withTitle: "Restore from recovery words")
     alert.addButton(withTitle: "Cancel")
@@ -76,6 +126,8 @@ final class RecoveryInput: @unchecked Sendable {
 }
 
 func restoreInput(newProfile: Bool) -> Result<RecoveryInput, SignerStartFailure> {
+    // First-run restore was already checked before presenting the setup choice.
+    guard newProfile || canSetUpWithTouchID() else { return .failure(.cancelled) }
     // Choose a file before collecting any secret, so the picker never shares a field editor with it.
     let picker = NSOpenPanel()
     picker.title = "Choose a LokiSigner recovery backup"
@@ -125,6 +177,7 @@ func recoveryError(_ reply: UnsafeMutablePointer<CChar>?) -> SignerStartFailure?
     if let reply,
        let result = try? JSONSerialization.jsonObject(with: Data(String(cString: reply).utf8)) as? [String: Any] {
         if result["restored"] as? Bool == true { return nil }
+        if let message = result["key_error"] as? String { return .key(message) }
         switch result["error"] as? String {
         case "Choose a valid LokiSigner recovery backup file (at most 256 KiB).": return .invalidBackup
         case "This backup or these recovery words do not match the unlocked LokiSigner profile.": return .wrongProfile

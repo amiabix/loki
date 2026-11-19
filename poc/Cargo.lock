@@ -2026,6 +2026,7 @@ dependencies = [
  "ff 0.14.0",
  "frost-core",
  "frost-rerandomized",
+ "futures-util",
  "group 0.14.0",
  "hex",
  "hkdf 0.12.4",

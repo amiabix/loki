@@ -22,6 +22,7 @@ import {
   opfsCloseAll,
 } from "./pkg/snippets/loki-signer-core-8724841f4db15c9f/js/opfs_fs.js";
 import { controlInbox, endsRequest, idbStore } from "./control-inbox.js";
+import { vaultSummary, saveVaultName, readVaultName } from "./vault-list.js";
 
 // Ops run concurrently (a status read during a join), and two pre-opens of one path racing
 // would each try to take its exclusive sync handle; the second throws. Share one in-flight
@@ -223,6 +224,7 @@ async function driveDkg(signer, p) {
     throw new Error("You reported that the roster codes differ; this vault setup is stopped");
   }
   const vref = JSON.parse(signer.vaultJoin(vaultHex, slot, label ?? "vault", network, roster, code));
+  if (label) await saveVaultName(await (await (await (await navigator.storage.getDirectory()).getDirectoryHandle("loki")).getDirectoryHandle("vaults")).getDirectoryHandle(vaultHex), label);
 
   const fc = await frostdClient(signer, { frostdUrl });
   fc.useSession(sessionId);
@@ -369,7 +371,7 @@ async function listVaults(signer) {
     if (h.kind !== "directory" || !/^[0-9a-f]{64}$/.test(name)) continue;
     let v;
     try { v = await openVaultAny(signer, name); } catch { continue; } // setup never started
-    out.push({ vault: v.vault_id, name: `Vault ${name.slice(0, 8)}`, members: v.members.length, threshold: v.threshold, active: v.ready });
+    out.push(vaultSummary(v, await readVaultName(h)));
   }
   return out;
 }

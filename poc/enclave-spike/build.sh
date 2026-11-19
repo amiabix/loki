@@ -5,6 +5,20 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+if [[ ${1:-} == --test-backend ]]; then
+    out=$(mktemp -d "${TMPDIR:-/tmp}/loki-se-tests.XXXXXX")
+    trap 'rm -rf "$out"' EXIT
+    swiftc -D SE_TESTS se_backend.swift se_backend_tests.swift -o "$out/swift-tests"
+    "$out/swift-tests"
+    swiftc -emit-library -o "$out/libse_backend.dylib" \
+        -Xlinker -install_name -Xlinker "@rpath/libse_backend.dylib" se_backend.swift
+    rustc --edition 2021 --crate-type rlib zeroize_shim.rs -o "$out/libzeroize.rlib"
+    rustc --edition 2021 --test apple_ffi_verify.rs --extern "zeroize=$out/libzeroize.rlib" \
+        -L "$out" -lse_backend -C "link-arg=-Wl,-rpath,$out" -o "$out/rust-tests"
+    "$out/rust-tests" enclave_failures_have_fixed_member_messages
+    exit
+fi
+
 echo "== 1. wrap/unwrap spike (unsigned) =="
 swiftc enclave_spike.swift -o /tmp/enclave_spike_bin -framework Security -framework Foundation
 /tmp/enclave_spike_bin
