@@ -246,7 +246,7 @@ pub(crate) fn restore_new(
     if entries(&dest)?.next().transpose()?.is_some() { archive(&dest)?; }
     staged.publish(&dest)?;
     config.registration = Some(RegistrationConfig {
-        coordinator: origin, slot: Some(slot), passphrase_file: None, name: name.into(), pairing_challenge: None, retry_pairing: false,
+        coordinator: origin, slot: Some(slot), passphrase_file: None, name: name.into(), pairing_challenge: None,
     });
     Ok(())
 }

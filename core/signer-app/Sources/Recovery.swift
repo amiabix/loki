@@ -58,7 +58,7 @@ func loki_member_app_restore_vault(_ words: UnsafeMutablePointer<UInt8>?, _ coun
 func loki_member_app_restore_profile(_ launch: UnsafePointer<CChar>,
     _ words: UnsafeMutablePointer<UInt8>?, _ wordCount: Int,
     _ pass: UnsafeMutablePointer<UInt8>?, _ passCount: Int, _ file: UnsafePointer<CChar>,
-    _ notify: @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Void,
+    _ notify: NativeNotice,
     _ approve: @convention(c) (UnsafePointer<CChar>?) -> Int32,
     _ confirmRoster: @convention(c) (UnsafePointer<CChar>?) -> Int32,
     _ connect: ConnectDecision) -> UnsafeMutablePointer<CChar>?

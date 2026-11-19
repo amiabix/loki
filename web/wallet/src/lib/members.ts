@@ -195,7 +195,19 @@ export async function issueRegistrationChallenge(raw: unknown, origin: string): 
       if (!claimed || claimed.origin !== origin || claimed.pairing_slot !== e.slot) throw new Error("unknown, expired or changed pairing challenge");
     }
     checkDevice(e, file);
-    allocatedSlot(e, slots(), challenges);
+    // A native retry may have a new listener port, but only the same authorized device and
+    // identity can resume the unexpired reservation. Both URLs still need a fresh signed proof.
+    const resumed = pairing_challenge === undefined && e.lokisigner_url !== undefined
+      ? challenges.find((c) => c.origin === origin && c.pairing_slot === e.slot && c.enrollment?.lokisigner_url !== undefined
+        && c.enrollment.signing_pubkey === e.signing_pubkey && c.enrollment.relay_pubkey === e.relay_pubkey
+        && c.enrollment.device_pubkey === e.device_pubkey)
+      : undefined;
+    allocatedSlot(e, slots(), challenges.filter((c) => c !== resumed));
+    if (resumed) {
+      resumed.enrollment = e;
+      write(`${file}.challenges`, challenges);
+      return { challenge: resumed.challenge };
+    }
     if (challenges.length >= 256) throw new Error("too many pending registrations");
     const challenge = randomBytes(32).toString("hex");
     challenges.push({ challenge, origin, enrollment: e, ...(claimed ? { pairing_slot: claimed.pairing_slot } : {}), expires: claimed?.expires ?? Date.now() + 120_000 });

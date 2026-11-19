@@ -547,7 +547,7 @@ mod tests {
             config.registration = Some(RegistrationConfig::pairing(&link, false).unwrap());
             std::sync::Arc::new(super::super::state::AppState { fetched_config: fetched, ..super::super::state::AppState::new(config) })
         };
-        let notice: super::super::LocalNotice = Arc::new(|_, _| {});
+        let notice: super::super::LocalNotice = Arc::new(|_, _| true);
         let wrong = state();
         // This launch signs with the fetched witnesses from memory, before anything is saved.
         let opened = wrong.clone();

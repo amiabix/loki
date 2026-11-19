@@ -3,10 +3,11 @@ import AppKit
 typealias ConnectCancellation = @convention(c) (UnsafeRawPointer?) -> Int32
 typealias ConnectDecision = @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?,
     UnsafeRawPointer?, ConnectCancellation) -> Int32
+typealias NativeNotice = @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Int32
 
 @_silgen_name("loki_member_app_pair")
 func loki_member_app_pair(_ launch: UnsafePointer<CChar>, _ pass: UnsafeMutablePointer<CChar>,
-    _ notify: @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Void,
+    _ notify: NativeNotice,
     _ approve: @convention(c) (UnsafePointer<CChar>?) -> Int32,
     _ confirmRoster: @convention(c) (UnsafePointer<CChar>?) -> Int32,
     _ connect: ConnectDecision) -> Int32
@@ -357,20 +358,24 @@ func showConnectDialog(origin: String, code: String, cancelled: @escaping () -> 
     return runDecisionAlert(alert, escape: .alertFirstButtonReturn) == .alertSecondButtonReturn && !cancelled()
 }
 
-private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointer<CChar>?) {
-    guard let kind = kind, let message = message else { return }
+private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointer<CChar>?) -> Int32 {
+    guard let kind = kind, let message = message else { return 0 }
     let event = String(cString: kind), text = String(cString: message)
     if event == "registration-warning" || event == "registration-key" || event == "registration-key-gone" {
         // Rust supplies fixed copy here. Don't block its retry loop on an open dialog.
         DispatchQueue.main.async { (NSApp.delegate as? NativeSigner)?.warnRegistration(event, message: text) }
-        return
+        return 0
     }
     if event == "startup-key" || event == "startup-key-gone" {
         DispatchQueue.main.async { (NSApp.delegate as? NativeSigner)?.startupKeyFailure = event == "startup-key-gone" ? .keyGone(text) : .key(text) }
-        return
+        return 0
     }
     // Synchronous delivery makes startup wait until the member acknowledges the recovery words.
-    DispatchQueue.main.sync {
+    return DispatchQueue.main.sync {
+        if event == "pairing-claim-attempted" {
+            (NSApp.delegate as? NativeSigner)?.markPairingClaimAttempted(text)
+            return 0
+        }
         let alert = NSAlert()
         if event == "ready" || event == "restore-ready" || event == "restore-pending" {
             alert.messageText = event == "ready" ? "LokiSigner is running" : "Vault restored"
@@ -385,8 +390,9 @@ private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointe
             alert.messageText = "Save your recovery words privately"
             alert.informativeText = text
             alert.addButton(withTitle: "I saved these words")
-            alert.runModal()
+            return runDecisionAlert(alert, escape: .abort) == .alertFirstButtonReturn ? 1 : 0
         }
+        return 0
     }
 }
 
@@ -403,6 +409,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
     private var cleanupNeeded = true
     private var retryLink: String?
     private var queuedLink: String?
+    private var attemptedPairingClaims: Set<String> = []
     private var startingOver = false
     private var recoveringKey = false
     private let args: [String]
@@ -422,9 +429,21 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
 
     func application(_ application: NSApplication, open urls: [URL]) {
         opened = true
-        guard let url = urls.first else { return }
-        if prompting { queuedLink = url.absoluteString }
-        else { start(url.absoluteString) }
+        guard let link = urls.lazy.map(\.absoluteString).first(where: { self.unusedPairingLink($0) != nil }) else { return }
+        if prompting { queuedLink = link }
+        else { start(link) }
+    }
+
+    private func unusedPairingLink(_ link: String?) -> String? {
+        guard let link else { return nil }
+        let items = URLComponents(string: link)?.queryItems ?? []
+        return items.contains { $0.name == "challenge" && $0.value.map(attemptedPairingClaims.contains) == true } ? nil : link
+    }
+
+    fileprivate func markPairingClaimAttempted(_ claim: String) {
+        attemptedPairingClaims.insert(claim)
+        queuedLink = unusedPairingLink(queuedLink)
+        retryLink = unusedPairingLink(retryLink)
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -489,7 +508,6 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
     fileprivate func didStart() {
         prompting = false
         queuedLink = nil
-        retryPairing = false
     }
 
     fileprivate func warnRegistration(_ event: String, message: String) {
@@ -519,10 +537,9 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         }
     }
 
-    private var retryPairing = false
-
     func start(_ link: String?) {
         guard !prompting else { return }
+        let link = unusedPairingLink(link)
         prompting = true
         queuedLink = nil
         retryLink = link
@@ -661,7 +678,6 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         var confirmed = launch
         confirmed["config"] = config
         if let name = nameField?.stringValue, !name.isEmpty { confirmed["profile_name"] = name }
-        if link == nil && retryPairing { confirmed["retry_pairing"] = true }
         guard let json = try? JSONSerialization.data(withJSONObject: confirmed), let request = String(data: json, encoding: .utf8) else {
             password.stringValue = ""
             retry(.unexpected, link: link)
@@ -685,16 +701,12 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
                 case 7: failure = self.startupKeyFailure ?? .deviceKey
                 case 8: failure = .registrationRosterUnavailable
                 case 9: failure = .invalidProfileName
+                case 10: failure = .cancelled
                 default: failure = .unexpected
                 }
                 self.startupKeyFailure = nil
-                // A registration failure may have consumed the link already. Try again with the
-                // saved coordinator and slot, without reusing even a queued copy of the same link.
-                if (4...8).contains(code) {
-                    self.retryPairing = true
-                    if self.queuedLink == link { self.queuedLink = nil }
-                }
-                self.stopped(failure, link: [3, 9].contains(code) ? link : nil)
+                // A local failure before the claim was sent leaves the link usable.
+                self.stopped(failure, link: code == 0 ? nil : self.unusedPairingLink(link))
             }
         }
     }

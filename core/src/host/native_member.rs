@@ -250,6 +250,7 @@ mod tests {
         let worker = std::thread::spawn(move || {
             let notice: LocalNotice = Arc::new(move |kind, message| {
                 if kind != "recovery" { ready_tx.send((kind.to_owned(), message.to_owned())).unwrap(); }
+                true
             });
             stop_tx.send(run_native(settings, Zeroizing::new(PASS.into()), notice, Arc::new(|_| false),
                 Arc::new(|_| crate::host::RosterAnswer::Differ), Arc::new(|_, _, _| false), None)).unwrap();
@@ -285,7 +286,7 @@ mod tests {
         settings.secure_element = "apple".into();
         let state = Arc::new(crate::host::state::AppState::new(settings));
         let (tx, rx) = std::sync::mpsc::channel();
-        let notice: LocalNotice = Arc::new(move |kind, text| tx.send((kind.to_owned(), text.to_owned())).unwrap());
+        let notice: LocalNotice = Arc::new(move |kind, text| { tx.send((kind.to_owned(), text.to_owned())).unwrap(); true });
         for failure in [KeyFailure::Cancelled, KeyFailure::LockedOut, KeyFailure::Missing] {
             let scope = NativeScope::install(&state, Arc::default(), Some(notice.clone())).unwrap();
             let _fixture = super::super::state::apple_test::install(&data, move |_, _, create| {
