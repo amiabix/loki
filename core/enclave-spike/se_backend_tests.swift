@@ -42,6 +42,8 @@ enum BackendTests {
         precondition(keyOperationFailure(unrelated, fallback: -4) == -4)
         entryPoint(failures)
         print("PASS: persistent Keychain entry point, lock, reuse proof, and biometric failure classes (no hardware)")
+        paymentScope()
+        print("PASS: payment authorization, non-interactive key binding, scope invalidation and cancellation (stand-in)")
     }
 
     static func entryPoint(_ failures: [(OSStatus, Int)]) {
@@ -157,5 +159,48 @@ enum BackendTests {
         try! FileManager.default.removeItem(atPath: statePath)
         run(false, -20) // a legacy profile lacks evidence of invalidation
         precondition(creations == 2)
+    }
+
+    static func paymentScope() {
+        let key = SecKeyCreateRandomKey([
+            kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+            kSecAttrKeySizeInBits as String: 256,
+        ] as CFDictionary, nil)!
+        let reason = "unlock signing for 0.40000000 ZEC to utest1abcdefgh…ij23456789"
+        var contexts = [LAContext]()
+        var bound = 0
+        var cancel = false
+        setTestKeychain(lockPath: { fatalError("a payment cannot create a key") }, lookup: { query, out in
+            if let context = (query as NSDictionary)[kSecUseAuthenticationContext as String] as? LAContext {
+                precondition(!cancel && context === contexts.last && context.interactionNotAllowed)
+                bound += 1
+            }
+            out?.pointee = key
+            return errSecSuccess
+        }, create: { _ in fatalError("a payment cannot create a key") },
+           prove: { _ in fatalError("a payment cannot ask for an ECDSA proof") },
+           biometry: { fatalError("a cancellation must not be reclassified") },
+           authorizePayment: { _, context, text in
+               precondition(text == reason && !context.interactionNotAllowed)
+               precondition(!contexts.contains { $0 === context })
+               contexts.append(context)
+               return cancel ? -11 : 0
+           })
+
+        for expected in [0, 0, -11] {
+            cancel = expected != 0
+            var handle: UInt64 = 0
+            let rc = reason.withCString { text in
+                [UInt8(1)].withUnsafeBufferPointer { tag in
+                    se_open_payment(tag.baseAddress!, tag.count, nil, text, &handle)
+                }
+            }
+            precondition(rc == expected && (handle != 0) == !cancel)
+            if handle != 0 { se_close(handle) }
+            var error: NSError?
+            precondition(!contexts.last!.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error))
+            precondition(error?.code == LAError.Code.invalidContext.rawValue)
+        }
+        precondition(contexts.count == 3 && bound == 2)
     }
 }

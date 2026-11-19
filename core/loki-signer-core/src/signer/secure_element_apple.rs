@@ -33,6 +33,7 @@ use zeroize::Zeroizing;
 extern "C" {
     fn se_open_ephemeral(out_handle: *mut u64) -> isize;
     fn se_open_persistent(tag: *const u8, tag_len: isize, create_if_missing: i32, state_path: *const c_char, out_handle: *mut u64) -> isize;
+    fn se_open_payment(tag: *const u8, tag_len: isize, state_path: *const c_char, reason: *const c_char, out_handle: *mut u64) -> isize;
     fn se_wrap(handle: u64, dek: *const u8, dek_len: isize, out: *mut u8, out_cap: isize) -> isize;
     fn se_unwrap(handle: u64, ct: *const u8, ct_len: isize, out: *mut u8, out_cap: isize) -> isize;
     fn se_sign(handle: u64, msg: *const u8, msg_len: isize, out: *mut u8, out_cap: isize) -> isize;
@@ -120,19 +121,31 @@ impl AppleSecureElement {
 
     /// Open the persistent, biometric-gated key without ever creating a replacement.
     pub fn open_persistent(tag: &[u8], state: Option<&Path>) -> Result<Self, KeyFailure> {
-        Self::persistent(tag, state, false)
+        Self::persistent(tag, state, false, None)
     }
 
     /// For new sealed data only: reuse a key for `tag` or create it if it is absent.
     pub fn create_persistent(tag: &[u8], state: Option<&Path>) -> Result<Self, KeyFailure> {
-        Self::persistent(tag, state, true)
+        Self::persistent(tag, state, true, None)
     }
 
-    fn persistent(tag: &[u8], state: Option<&Path>, create_if_missing: bool) -> Result<Self, KeyFailure> {
+    /// Authorize this existing vault key for one payment. Dropping the handle invalidates
+    /// the context; it is never eligible for device login or returned to an app-wide cache.
+    pub fn open_payment(tag: &[u8], state: Option<&Path>, reason: &str) -> Result<Self, KeyFailure> {
+        let reason = CString::new(reason).map_err(|_| KeyFailure::Other)?;
+        Self::persistent(tag, state, false, Some(&reason))
+    }
+
+    fn persistent(tag: &[u8], state: Option<&Path>, create_if_missing: bool, reason: Option<&std::ffi::CStr>) -> Result<Self, KeyFailure> {
         let mut handle = 0u64;
         let state = state.map(|path| CString::new(path.as_os_str().as_bytes())).transpose().map_err(|_| KeyFailure::Other)?;
         let ptr = state.as_ref().map_or(std::ptr::null(), |path| path.as_ptr());
-        let rc = unsafe { se_open_persistent(tag.as_ptr(), tag.len() as isize, i32::from(create_if_missing), ptr, &mut handle) };
+        let rc = unsafe {
+            match reason {
+                Some(reason) => se_open_payment(tag.as_ptr(), tag.len() as isize, ptr, reason.as_ptr(), &mut handle),
+                None => se_open_persistent(tag.as_ptr(), tag.len() as isize, i32::from(create_if_missing), ptr, &mut handle),
+            }
+        };
         if rc != 0 {
             return Err(KeyFailure::from_code(rc));
         }

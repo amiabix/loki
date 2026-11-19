@@ -222,6 +222,14 @@ Space. No button starts focused. The first Tab reaches **Codes differ** or **Ref
 Tab then Space cannot agree to a roster or approve a payment. Return and Enter never answer.
 Escape refuses a payment and dismisses a roster comparison without recording an answer.
 
+When LokiSigner starts signing a payment, macOS asks for Touch ID once for that attempt.
+The reason is “unlock signing for <amount> ZEC to <short recipient>”. It names the reviewed
+amount and recipient, not the memo or vault name. Touch ID unlocks the signing key; it does
+not approve the payment. Check the full recipient and other details LokiSigner reads from the
+transaction, then choose **Approve and sign** or **Refuse**. A mismatch cannot be signed.
+Cancelling Touch ID fails the attempt, and a new attempt (even a retry) asks again. Opening a
+vault or using **Vault addresses…** may ask for Touch ID separately.
+
 The roster dialog and the payment dialog are both modal on the app's main thread. A payment
 request that arrives while the roster dialog is open waits until the member answers it or it
 times out, and only then shows its own dialog. Ten minutes may be longer than the

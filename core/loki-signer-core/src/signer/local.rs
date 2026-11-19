@@ -799,6 +799,11 @@ impl<SE: SecureElement> LocalSigner<SE> {
         self.nonce_witness = Some(witness);
     }
 
+    /// Install the decision for an attempt after its signing group and expiry are fixed.
+    pub fn set_approval_policy(&mut self, approval: ApprovalPolicy) {
+        self.approval = approval;
+    }
+
     /// Give this signer the vault notes it may spend. These are scanned member-side with
     /// this signer's own fvk (`wallet_store::sync_member_wallet`); they never cross the
     /// coordinator seam. The proposer signer selects from them in `build_candidate`.
@@ -2399,4 +2404,3 @@ pub(crate) mod tests {
         assert_eq!(share.serialize().len(), 32);
     }
 }
-

@@ -74,12 +74,24 @@ pub(super) fn open_signer(
     slot: u16,
     approval: ApprovalPolicy,
 ) -> Result<HostedSigner, String> {
+    open_signer_with_reason(st, data, pass, vault, slot, approval, None)
+}
+
+pub(super) fn open_signer_with_reason(
+    st: &AppState,
+    data: &Path,
+    pass: &str,
+    vault: &str,
+    slot: u16,
+    approval: ApprovalPolicy,
+    reason: Option<&str>,
+) -> Result<HostedSigner, String> {
     let sdir = super::ceremony::signer_dir(data, vault)?;
     let store = SignerStore::open(&sdir)?;
     if store.vault() != hex32(vault)? || store.member() != slot {
         return Err("this vault's signer belongs to another vault or member".into());
     }
-    let se = st.config.open_secure_element(&sdir, pass)?;
+    let se = st.config.open_secure_element_with_reason(&sdir, pass, reason)?;
     if sdir.join("setup.sealed").exists() {
         let prompts = super::ceremony::hosted_prompts(&sdir, pass, approval);
         return LocalSigner::open(&sdir, se, vault.to_owned(), prompts).map_err(|e| e.to_string());
@@ -98,7 +110,7 @@ pub(super) fn open_signer(
     .map_err(|e| e.to_string())
 }
 
-/// The vault's group viewing key, from the opened signer (one store unwrap per process, then
+/// The vault's group viewing key, from the opened signer (one store open per process, then
 /// cached in memory), checked against the public metadata in `vault.sealed` (`sealed`).
 /// Migrates a pre-fix `vault.sealed` first.
 pub(super) fn viewing_key(
@@ -108,6 +120,7 @@ pub(super) fn viewing_key(
     vault: &str,
     slot: u16,
     sealed: &Value,
+    open: impl FnOnce() -> Result<SignerViewingKey, String>,
 ) -> Result<FullViewingKey, String> {
     let mut cache = st.viewing_keys.lock().map_err(|e| e.to_string())?;
     if let Some(fvk) = cache.get(vault) {
@@ -116,9 +129,10 @@ pub(super) fn viewing_key(
     if is_legacy(sealed) {
         migrate(st, data, pass, vault, slot, sealed)?;
     }
-    let fvk = opened_viewing_key(st, data, pass, vault, slot, sealed)?;
-    cache.insert(vault.to_owned(), fvk.clone());
-    Ok(fvk)
+    let key = open()?;
+    key.checked_address(sealed, VaultNetwork::parse(sealed["network"].as_str().unwrap_or(""))?)?;
+    cache.insert(vault.to_owned(), key.fvk.clone());
+    Ok(key.fvk)
 }
 
 fn opened_viewing_key(
@@ -148,6 +162,10 @@ impl SignerViewingKey {
     ) -> Result<(Self, VaultNetwork), String> {
         // Never signs: no payment is approved through this signer.
         let signer = open_signer(st, data, pass, vault, slot, Box::new(|_| false))?;
+        Self::from_signer(&signer)
+    }
+
+    pub(super) fn from_signer(signer: &HostedSigner) -> Result<(Self, VaultNetwork), String> {
         let (public, fvk) = signer.hosted_metadata().map_err(|e| e.to_string())?;
         let network = match signer.network() {
             Network::Regtest => VaultNetwork::Regtest,
