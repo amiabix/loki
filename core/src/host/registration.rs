@@ -251,7 +251,7 @@ impl DeviceKey {
     fn apple(config: &Config, root: &std::path::Path, create: bool, published: Option<&std::path::Path>) -> Result<Self, DeviceKeyError> {
         use super::state::{key_scope, open_apple_element, HostedSecureElement};
         let scope = key_scope(config, root).map_err(|_| DeviceKeyError::Enclave(KeyFailure::Other))?;
-        let element = open_apple_element(&root.join("device-auth"), create, published, scope, "device-auth")
+        let element = open_apple_element(&root.join("device-auth"), create, published, scope, "device-auth", None)
             .map_err(DeviceKeyError::Enclave)?;
         match element {
             HostedSecureElement::Apple(key, _) => Ok(Self::Apple(key)),

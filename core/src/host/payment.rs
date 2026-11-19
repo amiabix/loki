@@ -121,9 +121,9 @@ struct Payment {
     error: Option<String>,
 }
 
-pub(super) struct Vault {
+pub(super) struct Vault<Fvk = FullViewingKey> {
     network: VaultNetwork,
-    fvk: FullViewingKey,
+    fvk: Fvk,
     public: frost::keys::PublicKeyPackage,
     identity: Identity,
     threshold: u16,
@@ -192,6 +192,17 @@ fn save_payment(data: &Path, pass: &str, p: &Payment) -> Result<(), String> {
 /// Open this member's vault for scanning and signing. `vault.sealed` supplies public
 /// metadata; the viewing key comes from the device-bound signer store (`super::custody`).
 pub(super) fn load_vault(st: &AppState, data: &Path, pass: &str, vault: &str) -> Result<Vault, String> {
+    load_vault_with(st, data, pass, vault, |slot, _, sealed| {
+        super::custody::viewing_key(st, data, pass, vault, slot, sealed, || {
+            super::custody::SignerViewingKey::open(st, data, pass, vault, slot).map(|(key, _)| key)
+        })
+    })
+}
+
+fn load_vault_with<Fvk>(
+    st: &AppState, data: &Path, pass: &str, vault: &str,
+    viewing_key: impl FnOnce(u16, VaultNetwork, &Value) -> Result<Fvk, String>,
+) -> Result<Vault<Fvk>, String> {
     let configured = st.config.network.as_str();
     let dir = member_dir(data, vault)?;
     let sealed = Zeroizing::new(
@@ -234,8 +245,6 @@ pub(super) fn load_vault(st: &AppState, data: &Path, pass: &str, vault: &str) ->
     {
         return Err("member key differs from sealed vault".into());
     }
-    // Checks the signer's share and viewing key against `public_package` and `group_address`.
-    let fvk = super::custody::viewing_key(st, data, pass, vault, slot, &v)?;
     let c: Value = serde_json::from_slice(
         &member_dir(data, vault)?
             .read_sealed("ceremony.sealed", pass)
@@ -266,7 +275,7 @@ pub(super) fn load_vault(st: &AppState, data: &Path, pass: &str, vault: &str) ->
         });
     Ok(Vault {
         network,
-        fvk,
+        fvk: viewing_key(slot, network, &v)?,
         public,
         identity,
         threshold,
@@ -475,7 +484,7 @@ fn record_approval(p: &mut Payment, id: u16) {
         p.approvals.push(id);
     }
 }
-fn members(v: &Vault) -> Vec<u16> {
+fn members(v: &Vault<impl Sized>) -> Vec<u16> {
     v.peers.keys().copied().collect()
 }
 fn public_intent(p: &Payment) -> Value {
@@ -603,7 +612,7 @@ fn intent_hash(p: &Payment) -> String {
 
 fn send_control(
     url: &str,
-    v: &Vault,
+    v: &Vault<impl Sized>,
     p: &Payment,
     kind: &str,
     slots: &[u16],
@@ -613,7 +622,7 @@ fn send_control(
     })
 }
 
-fn send_control_inner(url: &str, v: &Vault, p: &Payment, kind: &str, slots: &[u16]) -> Result<(), String> {
+fn send_control_inner(url: &str, v: &Vault<impl Sized>, p: &Payment, kind: &str, slots: &[u16]) -> Result<(), String> {
     let session = p
         .control_session_id
         .ok_or("missing payment control session; create a fresh payment")?;
@@ -1149,7 +1158,31 @@ pub(super) async fn approve(State(st): State<Shared>, Json(body): Json<Value>) -
                 "invalid or repeated payment approval; replace a failed attempt instead".into(),
             );
         }
-        let v = load_vault(&st, &data, &pass, &vault)?;
+        // A review token normally implies a warm cache, but both the token and intent
+        // survive a restart. If the cache is cold, keep that scoped signer for the worker.
+        let mut opened = None;
+        let mut authenticating = false;
+        let v = if st.config.native && st.config.secure_element == "apple" {
+            load_vault_with(&st, &data, &pass, &vault, |slot, network, sealed| {
+                if !p.signers.is_empty() && !p.signers.contains(&slot) {
+                    return Err(ENOUGH_APPROVED.into());
+                }
+                super::custody::viewing_key(&st, &data, &pass, &vault, slot, sealed, || {
+                    super::nonce_witness::RelayWitness::for_member(&st, &p.attempt)?;
+                    authenticating = true;
+                    let signer = open_payment_signer(&st, &data, &pass, &p, network, slot, Box::new(|_| false))?;
+                    let (key, _) = super::custody::SignerViewingKey::from_signer(&signer)?;
+                    opened = Some(signer);
+                    Ok(key)
+                })
+            }).inspect_err(|error| {
+                if authenticating {
+                    record_failure(&st, &data, &pass, &vault, &attempt, error.clone());
+                }
+            })?
+        } else {
+            load_vault(&st, &data, &pass, &vault)?
+        };
         check_intent(&p, &v)?;
         if !p.signers.is_empty() && !p.signers.contains(&v.slot) {
             return Err(ENOUGH_APPROVED.into());
@@ -1159,8 +1192,7 @@ pub(super) async fn approve(State(st): State<Shared>, Json(body): Json<Value>) -
         record_approval(&mut p, v.slot);
         p.review_token = None;
         save_payment(&data, &pass, &p)?;
-        drop(guard);
-        ensure_worker(&st, &data, &pass, &vault, &attempt, v.slot)?;
+        ensure_worker_with_signer(&st, &data, &pass, &vault, &attempt, v.slot, opened, guard)?;
         Ok(json!({"phase":"signing"}))
     })
     .await
@@ -1178,6 +1210,19 @@ fn ensure_worker(
     slot: u16,
 ) -> Result<(), String> {
     let guard = st.payment.lock().map_err(|e| e.to_string())?;
+    ensure_worker_with_signer(st, data, pass, vault, attempt, slot, None, guard)
+}
+
+fn ensure_worker_with_signer(
+    st: &Shared,
+    data: &Path,
+    pass: &str,
+    vault: &str,
+    attempt: &str,
+    slot: u16,
+    opened: Option<super::custody::HostedSigner>,
+    guard: std::sync::MutexGuard<'_, ()>,
+) -> Result<(), String> {
     let mut p = read_payment(data, pass, vault, attempt)?;
     if p.phase == "signing" && p.error.is_some() {
         p.phase = "failed".into();
@@ -1214,7 +1259,7 @@ fn ensure_worker(
         let result = if finish {
             deliver(&st, &data, &pass, &vault, &attempt).map(|_| ())
         } else {
-            payment_worker(&st, &data, &pass, &vault, &attempt)
+            payment_worker(&st, &data, &pass, &vault, &attempt, opened)
         };
         let _guard = st.payment.lock().unwrap();
         if let Err(error) = result {
@@ -1238,9 +1283,16 @@ fn record_failure(st: &Shared, data: &Path, pass: &str, vault: &str, attempt: &s
             if save_payment(data, pass, &p).is_err() {
                 eprintln!("payment {attempt}: error saving signing failure");
             }
-            if let Ok(v) = load_vault(&st, data, pass, vault) {
-                let _ = send_control(&st.config.frostd_url, &v, &p, "failed", &members(&v));
+            // Reporting an error (including cancelling the very first payment prompt)
+            // only needs the roster and relay identity. Never prompt again to send it.
+            let sent = if st.config.native && st.config.secure_element == "apple" {
+                load_vault_with(st, data, pass, vault, |_, _, _| Ok(()))
+                    .map(|v| send_control(&st.config.frostd_url, &v, &p, "failed", &members(&v)))
             } else {
+                load_vault(st, data, pass, vault)
+                    .map(|v| send_control(&st.config.frostd_url, &v, &p, "failed", &members(&v)))
+            };
+            if sent.is_err() {
                 eprintln!("payment {attempt}: error opening vault to report signing failure");
             }
         }
@@ -1261,6 +1313,7 @@ fn payment_worker(
     pass: &str,
     vault: &str,
     attempt: &str,
+    opened: Option<super::custody::HostedSigner>,
 ) -> Result<(), String> {
     let v = load_vault(&st, data, pass, vault)?;
     let mut last_notice = std::time::Instant::now() - Duration::from_secs(5);
@@ -1328,6 +1381,7 @@ fn payment_worker(
         }
         poll.1.clone()
     };
+    let sign_member = || sign_with_opened(st, data, pass, &p, &v, owned, &check_running, opened);
     if p.proposer == v.slot {
         // Every member hears the group: those outside it stop waiting to sign.
         send_control(&st.config.frostd_url, &v, &p, "start", &members(&v))?;
@@ -1337,7 +1391,7 @@ fn payment_worker(
         };
         let signed = std::thread::scope(|scope| {
             let coordinator = scope.spawn(|| aggregate(st, data, pass, &p, &v, &check_running).inspect_err(&report));
-            let signer_result = sign(st, data, pass, &p, &v, owned, &check_running).inspect_err(&report);
+            let signer_result = sign_member().inspect_err(&report);
             let signed = coordinator
                 .join()
                 .map_err(|_| "payment coordinator panicked".to_owned())??;
@@ -1356,7 +1410,7 @@ fn payment_worker(
         // Sending is automatic once the transaction is signed.
         deliver(st, data, pass, vault, attempt)?;
     } else {
-        sign(st, data, pass, &p, &v, owned, &check_running)?;
+        sign_member()?;
         let _guard = st.payment.lock().map_err(|e| e.to_string())?;
         let mut local = read_payment(data, pass, vault, attempt)?;
         if local.phase == "signing" && local.error.is_none() {
@@ -1410,6 +1464,7 @@ fn prepare_sign<'a>(
     Ok(owned)
 }
 
+#[cfg(test)]
 fn sign(
     st: &Shared,
     data: &Path,
@@ -1418,6 +1473,19 @@ fn sign(
     v: &Vault,
     owned: Option<CandidateInputs<'_>>,
     check_running: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    sign_with_opened(st, data, pass, p, v, owned, check_running, None)
+}
+
+fn sign_with_opened(
+    st: &Shared,
+    data: &Path,
+    pass: &str,
+    p: &Payment,
+    v: &Vault,
+    owned: Option<CandidateInputs<'_>>,
+    check_running: &dyn Fn() -> Result<(), String>,
+    opened: Option<super::custody::HostedSigner>,
 ) -> Result<(), String> {
     // Both external nonce witnesses must be configured; without them this member refuses to
     // sign, before it joins the session or unwraps the share.
@@ -1434,10 +1502,16 @@ fn sign(
     // own native decision approves, and only for the reviewed intent and pinned candidate;
     // headless members refuse.
     eprintln!("payment {}: opening signer for member {}", p.attempt, v.slot);
-    let mut signer = super::custody::open_signer(
-        st, data, pass, &p.vault, v.slot,
-        payment_approval(data, pass, p, &v.network, super::approval_policy(st.approval.clone(), signer_network, v.slot))?,
-    )?;
+    let approval = payment_approval(data, pass, p, &v.network, super::approval_policy(st.approval.clone(), signer_network, v.slot))?;
+    let mut signer = if let Some(mut signer) = opened {
+        signer.set_approval_policy(approval);
+        signer
+    } else {
+        if st.config.native && st.config.secure_element == "apple" {
+            require_consent(data, pass, p)?;
+        }
+        open_payment_signer(st, data, pass, p, v.network, v.slot, approval)?
+    };
     signer.set_nonce_witness(Box::new(witness));
     if let Some(inputs) = &owned {
         signer.set_candidate_notes(inputs.notes.clone());
@@ -1506,6 +1580,30 @@ fn sign(
             Ok(())
         },
     )
+}
+
+fn open_payment_signer(
+    st: &AppState, data: &Path, pass: &str, p: &Payment, network: VaultNetwork,
+    slot: u16, approval: crate::signer::local::ApprovalPolicy,
+) -> Result<super::custody::HostedSigner, String> {
+    let reason = if st.config.native && st.config.secure_element == "apple" {
+        Some(payment_touch_id_reason(p, network)?)
+    } else {
+        None
+    };
+    super::custody::open_signer_with_reason(st, data, pass, &p.vault, slot, approval, reason.as_deref())
+}
+
+fn payment_touch_id_reason(p: &Payment, network: VaultNetwork) -> Result<String, String> {
+    // The candidate does not exist yet: the coordinator needs round-1 commitments to
+    // build it. Canonicalize the reviewed recipient to the same receiver sign_approve
+    // derives and checks, and do not put untrusted text, the memo, or the vault name here.
+    let kind = network.network_type();
+    let to = vault::orchard_receiver_from_ua(&p.recipient, kind)?;
+    let address = vault::unified_receiver(to.to_raw_address_bytes(), kind);
+    let amount = u64::from(Zatoshis::from_u64(p.amount_zat).map_err(|e| format!("amount: {e:?}"))?);
+    Ok(format!("unlock signing for {}.{:08} ZEC to {}…{}",
+        amount / 100_000_000, amount % 100_000_000, &address[..14], &address[address.len() - 10..]))
 }
 
 /// This member's sealed consent to an attempt: the intent hash of the terms it approved,
@@ -2295,6 +2393,22 @@ mod tests {
         NoteVersion,
     };
     use pasta_curves::pallas;
+
+    #[test]
+    fn touch_id_reason_names_only_amount_and_short_canonical_recipient() {
+        let v = member(&Identity::new(1), &BTreeMap::new());
+        let recipient = vault::unified_address(&v.fvk, v.network.network_type());
+        let mut p = open_payment(&hex::encode([2; 32]), 1);
+        p.recipient = recipient;
+        p.amount_zat = 312_345_678;
+        p.memo = "not for the system prompt".into();
+        let to = v.fvk.address_at(0u64, Scope::External).to_raw_address_bytes();
+        let canonical = vault::unified_receiver(to, v.network.network_type());
+        assert_eq!(payment_touch_id_reason(&p, v.network).unwrap(), format!(
+            "unlock signing for 3.12345678 ZEC to {}…{}", &canonical[..14], &canonical[canonical.len() - 10..],
+        ));
+        assert!(payment_touch_id_reason(&p, VaultNetwork::Regtest).is_err());
+    }
 
     #[test]
     fn signer_reviews_candidate_effects_before_signing() {

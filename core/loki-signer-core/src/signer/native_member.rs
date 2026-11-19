@@ -28,6 +28,8 @@ struct Member<SE: SecureElement> {
     signer: LocalSigner<SE>,
     session: Session,
     public: PublicIdentity,
+    #[cfg(test)]
+    dir: std::path::PathBuf,
 }
 
 /// An in-memory backup store with no recovery identity — enough to satisfy the signer's
@@ -53,10 +55,9 @@ impl BackupDevice for MemBackup {
     }
 }
 
-fn prompts(
-    reviewed: Arc<Mutex<Option<(CandidateRef, PaymentView)>>>,
-    mut native: Option<ApprovalPolicy>,
-) -> DevicePrompts {
+type ReviewedPayment = Arc<Mutex<Option<(CandidateRef, PaymentView)>>>;
+
+fn prompts(reviewed: ReviewedPayment, mut native: Option<ApprovalPolicy>) -> DevicePrompts {
     let mut approved_sighash = None;
     DevicePrompts {
         connect: Box::new(|_origin, _net| true),
@@ -122,18 +123,29 @@ pub fn prove_dkg_member<SE: SecureElement>(
 pub fn prove_dkg_member_with<SE: SecureElement>(
     threshold: u16,
     members: u16,
+    make_se: impl FnMut(u16) -> SE,
+    native: impl FnMut(u16) -> Option<ApprovalPolicy>,
+) -> Result<(), String> {
+    let vault = [61; 32];
+    let (mut signers, approvals) = setup_members(threshold, members, vault, make_se, native)?;
+    sign_payment(threshold, CandidateRef { vault_id: vault, payment_id: [7; 32], attempt_id: [9; 32] }, &mut signers, &approvals)
+}
+
+fn setup_members<SE: SecureElement>(
+    threshold: u16,
+    members: u16,
+    vault: [u8; 32],
     mut make_se: impl FnMut(u16) -> SE,
     mut native: impl FnMut(u16) -> Option<ApprovalPolicy>,
-) -> Result<(), String> {
-    let vault = [61u8; 32];
-
+) -> Result<(Vec<Member<SE>>, Vec<ReviewedPayment>), String> {
     let mut ms: Vec<Member<SE>> = Vec::new();
     let mut approvals = Vec::new();
     for id in 1..=members {
         let reviewed = Arc::new(Mutex::new(None));
         approvals.push(reviewed.clone());
+        let dir = tempdir(id);
         let mut signer = LocalSigner::create(
-            &tempdir(id),
+            &dir,
             make_se(id),
             Network::Regtest,
             vault,
@@ -150,7 +162,7 @@ pub fn prove_dkg_member_with<SE: SecureElement>(
             signing: conn.member.signing,
             encryption: conn.member.encryption,
         };
-        ms.push(Member { id, signer, session: conn.session, public });
+        ms.push(Member { id, signer, session: conn.session, public, #[cfg(test)] dir });
     }
 
     let document = serde_json::to_vec(&serde_json::json!({
@@ -210,7 +222,12 @@ pub fn prove_dkg_member_with<SE: SecureElement>(
     if !ready {
         return Err("not every member reached ready after DKG".into());
     }
+    Ok((ms, approvals))
+}
 
+fn sign_payment<SE: SecureElement>(
+    threshold: u16, cand: CandidateRef, ms: &mut [Member<SE>], approvals: &[ReviewedPayment],
+) -> Result<(), String> {
     // Every member derives the same vault address; a quorum signs a payment to it.
     let mut addresses = Vec::new();
     for m in ms.iter_mut() {
@@ -249,7 +266,6 @@ pub fn prove_dkg_member_with<SE: SecureElement>(
         target_height: 700,
         expiry_height: 1_152,
     };
-    let cand = CandidateRef { vault_id: vault, payment_id: [7; 32], attempt_id: [9; 32] };
     let (_, fvk) = ms[0].signer.hosted_metadata().map_err(|e| e.to_string())?;
     let fee: u64 = crate::candidate::quote_fee(&crate::candidate::Regtest, &crate::candidate::CandidateInputs {
         vault_fvk: &fvk, notes: vec![note], recipient, amount: intent.amount, memo: intent.memo.clone(),
@@ -261,12 +277,13 @@ pub fn prove_dkg_member_with<SE: SecureElement>(
         network_branch_id: u32::from(zcash_protocol::consensus::BranchId::for_height(
             &crate::candidate::Regtest, zcash_protocol::consensus::BlockHeight::from_u32(intent.target_height))), fee_verified: true, expiry_height: intent.expiry_height,
     };
-    for approval in &approvals {
+    for approval in approvals {
         *approval.lock().map_err(|e| e.to_string())? = Some((cand, view.clone()));
     }
+    let first = ms.len() - usize::from(threshold);
     let mut quorum: Vec<QuorumMember<'_, _>> = ms
         .iter_mut()
-        .skip(usize::from(members - threshold))
+        .skip(first)
         .map(|m| {
             m.signer.set_candidate_notes(vec![note]);
             QuorumMember {
@@ -305,5 +322,74 @@ mod tests {
     #[test]
     fn software_native_member_runs_real_dkg_and_signs_reviewed_payment() {
         prove_dkg_member(2, 3, |_| super::super::secure_element::SoftwareSecureElement::generate()).unwrap();
+    }
+
+    #[test]
+    fn reopened_dkg_signer_needs_seven_unwraps_in_one_scope_per_payment() {
+        use super::super::secure_element::{OpenError, SoftwareSecureElement, WrappedDek};
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+        struct CountingElement {
+            inner: SoftwareSecureElement,
+            unwraps: Arc<AtomicUsize>,
+            closed: Arc<AtomicUsize>,
+        }
+        impl SecureElement for CountingElement {
+            fn wrap_dek(&self, dek: &[u8; 32]) -> Result<WrappedDek, String> {
+                self.inner.wrap_dek(dek)
+            }
+            fn unwrap_dek(&self, wrapped: &WrappedDek) -> Result<Zeroizing<[u8; 32]>, OpenError> {
+                self.unwraps.fetch_add(1, Relaxed);
+                self.inner.unwrap_dek(wrapped)
+            }
+        }
+        impl Drop for CountingElement {
+            fn drop(&mut self) {
+                self.closed.fetch_add(1, Relaxed);
+            }
+        }
+
+        let vault = [61; 32];
+        let keystore = |id| SoftwareSecureElement::from_kek([id as u8; 32]);
+        let (setup, approvals) = setup_members(2, 3, vault, keystore, |_| None).unwrap();
+        let mut last_scopes = Vec::<(Arc<AtomicUsize>, Arc<AtomicUsize>)>::new();
+        for attempt in [9, 10] {
+            let mut scopes = vec![];
+            let mut signers: Vec<_> = setup[1..].iter().map(|m| {
+                let unwraps = Arc::new(AtomicUsize::new(0));
+                let closed = Arc::new(AtomicUsize::new(0));
+                scopes.push((unwraps.clone(), closed.clone()));
+                let element = CountingElement { inner: keystore(m.id), unwraps: unwraps.clone(), closed };
+                let mut signer = LocalSigner::open(&m.dir, element, "native vault".into(),
+                    prompts(approvals[usize::from(m.id - 1)].clone(), Some(Box::new({
+                        let unwraps = unwraps.clone();
+                        move |_| {
+                            assert_eq!(unwraps.load(Relaxed), 5, "nothing from round 2 opens before approval");
+                            true
+                        }
+                    })))).unwrap();
+                assert_eq!(unwraps.load(Relaxed), 4, "identity, roster, setup, share");
+                let session = signer.connect("https://coordinator.test", Network::Regtest, &[attempt]).unwrap().session;
+                Member { signer, session, public: m.public.clone(), id: m.id, dir: m.dir.clone() }
+            }).collect();
+            let candidate = CandidateRef { vault_id: vault, payment_id: [7; 32], attempt_id: [attempt; 32] };
+            sign_payment(2, candidate, &mut signers, &approvals).unwrap();
+            for (unwraps, closed) in &scopes {
+                assert_eq!(unwraps.load(Relaxed), 7, "one element covers both rounds");
+                assert_eq!(closed.load(Relaxed), 0);
+            }
+            drop(signers);
+            for (unwraps, closed) in &scopes {
+                assert_eq!(unwraps.load(Relaxed), 7);
+                assert_eq!(closed.load(Relaxed), 1, "the payment closes its scope");
+            }
+            for (unwraps, _) in &last_scopes {
+                assert_eq!(unwraps.load(Relaxed), 7, "a retry never uses an old scope");
+            }
+            last_scopes = scopes;
+        }
+        for m in setup {
+            std::fs::remove_dir_all(m.dir).unwrap();
+        }
     }
 }

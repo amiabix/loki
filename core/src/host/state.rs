@@ -88,17 +88,21 @@ impl Config {
     }
 
     pub(super) fn open_secure_element(&self, dir: &Path, pass: &str) -> Result<HostedSecureElement, String> {
-        let result = self.open_element(dir, pass, false, None, &self.data);
+        self.open_secure_element_with_reason(dir, pass, None)
+    }
+
+    pub(super) fn open_secure_element_with_reason(&self, dir: &Path, pass: &str, payment_reason: Option<&str>) -> Result<HostedSecureElement, String> {
+        let result = self.open_element(dir, pass, false, None, &self.data, payment_reason);
         eprintln!("secure-element open: {}", if result.is_ok() { "ok" } else { "error" });
         result
     }
 
     // A staged vault must use the same Enclave key after its directory is published.
     pub(super) fn create_secure_element(&self, dir: &Path, pass: &str, published: Option<&Path>, profile: &Path) -> Result<HostedSecureElement, String> {
-        self.open_element(dir, pass, true, published, profile)
+        self.open_element(dir, pass, true, published, profile, None)
     }
 
-    fn open_element(&self, dir: &Path, pass: &str, _create: bool, _published: Option<&Path>, _profile: &Path) -> Result<HostedSecureElement, String> {
+    fn open_element(&self, dir: &Path, pass: &str, _create: bool, _published: Option<&Path>, _profile: &Path, _payment_reason: Option<&str>) -> Result<HostedSecureElement, String> {
         self.validate_secure_element()?;
         #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
         if self.secure_element == "apple" {
@@ -113,7 +117,8 @@ impl Config {
                     Err(_) => return Err(KeyFailure::Other.to_string()),
                 }
             }
-            let element = open_apple_element(dir, _create, _published, scope, &role);
+            let element = open_apple_element(dir, _create, _published, scope, &role,
+                if self.native { _payment_reason } else { None });
             #[cfg(feature = "relay-communication")]
             let element = if self.native && !_create {
                 match element {
@@ -184,27 +189,26 @@ pub(super) fn apple_key_tag(dir: &Path, scope: Option<uuid::Uuid>, role: &str) -
 }
 
 #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
-pub(super) fn open_apple_element(dir: &Path, create: bool, published: Option<&Path>, scope: Option<uuid::Uuid>, role: &str) -> Result<HostedSecureElement, KeyFailure> {
+pub(super) fn open_apple_element(dir: &Path, create: bool, published: Option<&Path>, scope: Option<uuid::Uuid>, role: &str, payment_reason: Option<&str>) -> Result<HostedSecureElement, KeyFailure> {
     use std::os::unix::fs::DirBuilderExt;
     if create {
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(|_| KeyFailure::Other)?;
     }
     let legacy = if scope.is_none() { legacy_key_dir(dir, published)? } else { PathBuf::new() };
     let tag = apple_key_tag(&legacy, scope, role);
-    persistent_apple_key(dir, &tag, create)
-}
-
-#[cfg(all(target_os = "macos", feature = "apple-enclave"))]
-fn persistent_apple_key(dir: &Path, tag: &[u8], create: bool) -> Result<HostedSecureElement, KeyFailure> {
     #[cfg(test)]
-    if let Some(outcome) = apple_test::lookup(dir, tag, create) {
+    if let Some(outcome) = apple_test::lookup(dir, &tag, create) {
         outcome?;
         return SoftwareSecureElement::persistent(dir, "Apple test stand-in")
             .map(HostedSecureElement::Software).map_err(|_| KeyFailure::Other);
     }
     let state = dir.join("biometry-state");
-    let key = if create { AppleSecureElement::create_persistent(tag, Some(&state)) }
-    else { AppleSecureElement::open_persistent(tag, Some(&state)) };
+    let state = Some(state.as_path());
+    let key = match payment_reason {
+        Some(reason) => AppleSecureElement::open_payment(&tag, state, reason),
+        None if create => AppleSecureElement::create_persistent(&tag, state),
+        None => AppleSecureElement::open_persistent(&tag, state),
+    };
     key.map(|key| HostedSecureElement::Apple(key, None))
 }
 
