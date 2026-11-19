@@ -11,6 +11,30 @@ use crate::{
     transport::{Incoming, Outbound, Peer, SealedCandidate, Transport},
 };
 
+#[derive(Clone, Debug)]
+pub enum RoundError {
+    Other(String),
+    ReceiveDeadline { received: usize, expected: usize, shares: bool },
+}
+
+impl From<&str> for RoundError {
+    fn from(error: &str) -> Self { Self::Other(error.into()) }
+}
+
+impl From<String> for RoundError {
+    fn from(error: String) -> Self { Self::Other(error) }
+}
+
+impl From<RoundError> for String {
+    fn from(error: RoundError) -> Self {
+        match error {
+            RoundError::Other(error) => error,
+            RoundError::ReceiveDeadline { received, expected, .. } =>
+                format!("relay delivered {received} of {expected} expected messages"),
+        }
+    }
+}
+
 fn recv_until<T: Transport>(
     transport: &T,
     channel: &T::Channel,
@@ -19,12 +43,12 @@ fn recv_until<T: Transport>(
     attempt: &str,
     kind: impl Fn(&Incoming) -> &'static str,
     check_running: &dyn Fn() -> Result<(), String>,
-) -> Result<Vec<Incoming>, String>
+    deadline: Instant,
+) -> Result<Vec<Incoming>, RoundError>
 where
     T::Error: std::fmt::Display,
 {
     let mut got = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(120);
     while Instant::now() < deadline {
         check_running()?;
         let batch = transport.recv(channel, as_coordinator).map_err(|e| {
@@ -41,11 +65,10 @@ where
         std::thread::sleep(Duration::from_millis(25));
     }
     eprintln!("payment {attempt}: frostd signing receive timeout ({}/{want})", got.len());
-    Err(format!(
-        "relay delivered {} of {want} expected messages",
-        got.len()
-    ))
+    Err(RoundError::ReceiveDeadline { received: got.len(), expected: want, shares: false })
 }
+
+fn receive_deadline() -> Instant { Instant::now() + Duration::from_secs(120) }
 
 fn send<T: Transport>(
     transport: &T,
@@ -88,8 +111,9 @@ pub fn signer_loop<T: Transport, S: Signer>(
     proposer: &PublicIdentity,
     other_signers: &[PublicIdentity],
     check_running: &dyn Fn() -> Result<(), String>,
+    before_share: &dyn Fn() -> Result<(), String>,
     accept_candidate: &mut dyn FnMut(&[u8]) -> Result<(), String>,
-) -> Result<(), String>
+) -> Result<(), RoundError>
 where
     T::Error: std::fmt::Display,
     S::Error: std::fmt::Display,
@@ -101,7 +125,7 @@ where
 
     let mut coordinator = None;
     let local_candidate = if is_proposer {
-        let alpha_message = recv_until(transport, channel, false, 1, &attempt, |_| "alpha", check_running)?.remove(0);
+        let alpha_message = recv_until(transport, channel, false, 1, &attempt, |_| "alpha", check_running, receive_deadline())?.remove(0);
         let alpha_bytes: [u8; 32] = alpha_message
             .message
             .try_into()
@@ -125,7 +149,7 @@ where
         } else {
             "signing package"
         }
-    }, check_running)?;
+    }, check_running, receive_deadline())?;
     let (candidate_bytes, package_index, seed_index) = if let Some(bytes) = local_candidate {
         (bytes, 0, 1)
     } else {
@@ -170,8 +194,8 @@ where
     check_running()?;
     let share = signer.sign_approve(session, candidate_ref, params, candidate_bytes, &package, &seed)
         .map_err(|e| format!("sign_approve: {e}"))?;
-    check_running()?;
-    send(transport, channel, &attempt, "share", &[], Outbound::Share(share))
+    before_share()?;
+    Ok(send(transport, channel, &attempt, "share", &[], Outbound::Share(share))?)
 }
 
 /// Gather a threshold of commitments, request the proposer candidate, aggregate, and apply.
@@ -188,7 +212,7 @@ pub fn coordinate<T: Transport>(
     attempt: &str,
     check_running: &dyn Fn() -> Result<(), String>,
     mut local_candidate: impl FnMut() -> Result<Option<Vec<u8>>, String>,
-) -> Result<Vec<u8>, String>
+) -> Result<Vec<u8>, RoundError>
 where
     T::Error: std::fmt::Display,
 {
@@ -208,7 +232,7 @@ where
             .copied()
     };
     let mut commitments = BTreeMap::new();
-    for incoming in recv_until(transport, channel, true, peer_ids.len(), attempt, |_| "commitment", check_running)? {
+    for incoming in recv_until(transport, channel, true, peer_ids.len(), attempt, |_| "commitment", check_running, receive_deadline())? {
         let id = sender_id(&incoming.from).ok_or("commitment from a non-signer")?;
         let commitment = frost::round1::SigningCommitments::deserialize(&incoming.message)
             .map_err(|e| format!("decode commitment: {e}"))?;
@@ -254,7 +278,12 @@ where
         send(transport, channel, attempt, "randomizer seed", std::slice::from_ref(peer), Outbound::RandomizerSeed(seed.as_slice().try_into().map_err(|_| "randomizer seed must be 32 bytes")?))?;
     }
     let mut shares = BTreeMap::new();
-    for incoming in recv_until(transport, channel, true, peer_ids.len(), attempt, |_| "share", check_running)? {
+    let incoming_shares = recv_until(transport, channel, true, peer_ids.len(), attempt, |_| "share", check_running, receive_deadline())
+        .map_err(|error| match error {
+            RoundError::ReceiveDeadline { received, expected, .. } => RoundError::ReceiveDeadline { received, expected, shares: true },
+            other => other,
+        })?;
+    for incoming in incoming_shares {
         let id = sender_id(&incoming.from).ok_or("share from a non-signer")?;
         let share = frost::round2::SignatureShare::deserialize(&incoming.message)
             .map_err(|e| format!("decode share: {e}"))?;
@@ -293,8 +322,5 @@ where
     signer
         .apply_ironwood_signature(index, orchard_sig)
         .map_err(|e| format!("apply signature: {e:?}"))?;
-    signer
-        .finish()
-        .serialize()
-        .map_err(|e| format!("serialize signed: {e:?}"))
+    Ok(signer.finish().serialize().map_err(|e| format!("serialize signed: {e:?}"))?)
 }

@@ -161,7 +161,7 @@ pub extern "C" fn loki_member_app_disconnect_wallet_tabs() {
 /// biometrics. Returns 0 when signed, 3 when the member refused.
 #[no_mangle]
 pub extern "C" fn loki_signer_approval_selftest(approve: NativeApprove) -> i32 {
-    use crate::host::{ApprovalAnswer, ApprovalAttempt, LocalApproval};
+    use crate::host::{ApprovalAnswer, ApprovalAttempt, ApprovalEnd, LocalApproval};
     use std::{sync::Arc, time::Duration};
     let r = std::panic::catch_unwind(|| {
         let ask = native_approval(approve);
@@ -173,7 +173,7 @@ pub extern "C" fn loki_signer_approval_selftest(approve: NativeApprove) -> i32 {
                 std::thread::scope(|scope| {
                     let cancel = scope.spawn(|| {
                         std::thread::sleep(Duration::from_secs(10));
-                        attempt.cancel();
+                        attempt.end(ApprovalEnd::Failed);
                     });
                     ask(&summary.to_string(), attempt);
                     cancel.join().unwrap();
@@ -215,7 +215,7 @@ fn native_approval_does_not_sign_after_cancellation() {
     static SAW_END: AtomicBool = AtomicBool::new(false);
     extern "C" fn late(_: *const c_char, context: *const c_void, cancelled: extern "C" fn(*const c_void) -> i32) -> i32 {
         if cancelled(context) != 0 { return -1; }
-        unsafe { &*context.cast::<crate::host::ApprovalAttempt>() }.cancel();
+        unsafe { &*context.cast::<crate::host::ApprovalAttempt>() }.end(crate::host::ApprovalEnd::Failed);
         // Simulate the member clicking just as the attempt ends, before Swift can close.
         SAW_END.store(cancelled(context) == 1, Ordering::Relaxed);
         1

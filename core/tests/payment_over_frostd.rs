@@ -267,6 +267,7 @@ where
                         &mut signer, &signer_session, &candidate, &signer_public, id,
                         request, proposer_inputs.is_some(), &identity, &context, &proposer, &other_signers,
                         &|| Ok(()),
+                        &|| Ok(()),
                         &mut |bytes| {
                             if proposer_inputs.is_some() {
                                 *handoff.lock().unwrap() = Some(bytes.to_vec());

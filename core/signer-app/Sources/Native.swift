@@ -180,7 +180,7 @@ func runDecisionAlert(_ alert: NSAlert, timeout: TimeInterval? = nil,
     return alert.runModal()
 }
 
-/// An unanswered payment request is refused after this long, or sooner if the round ends.
+/// An unanswered payment request times out after this long, or sooner if the round ends.
 private let approvalTimeout: TimeInterval = 120
 private let approvalTimedOut = NSApplication.ModalResponse(rawValue: 1003)
 
@@ -197,16 +197,22 @@ private final class ApprovalNotifications: NSObject, UNUserNotificationCenterDel
 // Keep the last unanswered request visible even with system notifications disabled.
 private var approvalEndedWindow: NSPanel?
 
-private func showApprovalEnded(timedOut: Bool) {
+private func showApprovalEnded(_ state: Int32) {
     let frame = NSRect(x: 0, y: 0, width: 360, height: 72)
     let panel = approvalEndedWindow ?? NSPanel(contentRect: frame, styleMask: [.titled, .closable],
         backing: .buffered, defer: false)
-    panel.title = timedOut ? "Payment approval timed out" : "Payment request ended"
+    panel.title = state == 2 ? "Payment approval timed out" : "Payment request ended"
     panel.isReleasedWhenClosed = false
     panel.hidesOnDeactivate = false
-    let label = NSTextField(wrappingLabelWithString: timedOut
-        ? "You did not answer the payment request in time. LokiSigner did not approve it."
-        : "This payment attempt ended before you answered. LokiSigner did not approve it.")
+    let reason: String
+    switch state {
+    case 2: reason = "You did not answer the payment request in time."
+    case 3: reason = "Another member did not answer the payment request in time."
+    case 4: reason = "Another member refused the payment."
+    case 5: reason = "The signing round timed out waiting for members."
+    default: reason = "This payment attempt ended before LokiSigner could complete it."
+    }
+    let label = NSTextField(wrappingLabelWithString: reason + " LokiSigner did not approve it.")
     panel.contentView = NSView(frame: frame)
     label.frame = frame.insetBy(dx: 16, dy: 12)
     panel.contentView?.addSubview(label)
@@ -231,42 +237,7 @@ private func nativeApprove(_ summary: UnsafePointer<CChar>?, _ context: UnsafeRa
           let expiry = (request["expiry_height"] as? NSNumber)?.stringValue,
           let memo = request["memo"] as? String
     else { return 0 }
-    return DispatchQueue.main.sync {
-        let cancelled = { cancellation(context) != 0 }
-        let initialState = cancellation(context)
-        guard initialState == 0 else { showApprovalEnded(timedOut: initialState == 2); return 0 }
-        guard NSApp.modalWindow == nil else { return 0 }
-
-        var stopNotice: (() -> Void)?
-        if !NSApp.isActive {
-            let attention = NSApp.requestUserAttention(.informationalRequest)
-            let center = UNUserNotificationCenter.current()
-            center.delegate = ApprovalNotifications.shared
-            let id = "payment-approval-\(UUID())"
-            var waiting = true
-            center.requestAuthorization(options: [.alert]) { granted, _ in
-                guard granted else { return }
-                RunLoop.main.perform(inModes: [.default, .modalPanel]) {
-                    guard waiting else { return }
-                    let content = UNMutableNotificationContent()
-                    content.title = "LokiSigner payment request"
-                    content.body = "Open LokiSigner to review a payment awaiting approval."
-                    center.add(UNNotificationRequest(identifier: id, content: content, trigger: nil)) { _ in
-                        RunLoop.main.perform(inModes: [.default, .modalPanel]) {
-                            if !waiting { center.removeDeliveredNotifications(withIdentifiers: [id]) }
-                        }
-                    }
-                }
-            }
-            stopNotice = {
-                waiting = false
-                NSApp.cancelUserAttentionRequest(attention)
-                center.removePendingNotificationRequests(withIdentifiers: [id])
-                center.removeDeliveredNotifications(withIdentifiers: [id])
-            }
-        }
-        defer { stopNotice?() }
-
+    return waitForApprovalDialog(cancellation: { cancellation(context) }, timeout: approvalTimeout) { remaining, cancelled in
         let text = { (key: String) in request[key] as? String ?? "?" }
         let alert = NSAlert()
         alert.alertStyle = .warning
@@ -286,8 +257,8 @@ private func nativeApprove(_ summary: UnsafePointer<CChar>?, _ context: UnsafeRa
             Attempt: \(text("attempt"))
             Signs: \(text("sighash"))
 
-            Approve only if the transaction matches the payment you intend. \
-            Unanswered requests are refused after \(Int(approvalTimeout / 60)) minutes.
+            Approve only if the transaction matches the payment you intend.
+            Unanswered requests time out after \(Int(approvalTimeout / 60)) minutes.
             """
         let nameLabel = NSTextField(labelWithString: "Vault name (ID \(vault.prefix(12))):")
         let name = untrustedLine(vaultName)
@@ -320,15 +291,77 @@ private func nativeApprove(_ summary: UnsafePointer<CChar>?, _ context: UnsafeRa
         alert.accessoryView = stack
         alert.addButton(withTitle: "Refuse")
         alert.addButton(withTitle: "Approve and sign")
-        let result = runDecisionAlert(alert, timeout: approvalTimeout, escape: .alertFirstButtonReturn,
+        return runDecisionAlert(alert, timeout: remaining, escape: .alertFirstButtonReturn,
             cancelled: cancelled, timeoutResponse: approvalTimedOut)
-        let finalState = cancellation(context)
-        if finalState != 0 || result == approvalTimedOut {
-            let timedOut = finalState == 2 || finalState == 0 && result == approvalTimedOut
-            showApprovalEnded(timedOut: timedOut)
-            return timedOut ? 2 : 0
+    }
+}
+
+/// Poll from the caller, not the main thread; a different alert's modal loop must be
+/// free to finish. The same deadline bounds both the queue and the decision.
+private func waitForApprovalDialog(cancellation: @escaping () -> Int32, timeout: TimeInterval,
+                                   present: @escaping (TimeInterval, @escaping () -> Bool) -> NSApplication.ModalResponse) -> Int32 {
+    // Connect and roster alerts can occupy the main dispatch queue while they run modally.
+    func onMainRunLoop<T>(_ body: @escaping () -> T) -> T {
+        var result: T?
+        let work = DispatchWorkItem { result = body() }
+        RunLoop.main.perform(inModes: [.default, .modalPanel]) { work.perform() }
+        work.wait()
+        return result!
+    }
+
+    let deadline = ProcessInfo.processInfo.systemUptime + timeout
+    let stopNotice = onMainRunLoop { () -> (() -> Void)? in
+        if cancellation() == 0 && !NSApp.isActive {
+            let attention = NSApp.requestUserAttention(.informationalRequest)
+            let center = UNUserNotificationCenter.current()
+            center.delegate = ApprovalNotifications.shared
+            let id = "payment-approval-\(UUID())"
+            var waiting = true
+            center.requestAuthorization(options: [.alert]) { granted, _ in
+                guard granted else { return }
+                RunLoop.main.perform(inModes: [.default, .modalPanel]) {
+                    guard waiting else { return }
+                    let content = UNMutableNotificationContent()
+                    content.title = "LokiSigner payment request"
+                    content.body = "Open LokiSigner to review a payment awaiting approval."
+                    center.add(UNNotificationRequest(identifier: id, content: content, trigger: nil)) { _ in
+                        RunLoop.main.perform(inModes: [.default, .modalPanel]) {
+                            if !waiting { center.removeDeliveredNotifications(withIdentifiers: [id]) }
+                        }
+                    }
+                }
+            }
+            return {
+                waiting = false
+                NSApp.cancelUserAttentionRequest(attention)
+                center.removePendingNotificationRequests(withIdentifiers: [id])
+                center.removeDeliveredNotifications(withIdentifiers: [id])
+            }
         }
-        return result == .alertSecondButtonReturn ? 1 : 0
+        return nil
+    }
+    defer { onMainRunLoop { stopNotice?() } }
+
+    while true {
+        if let answer = onMainRunLoop({ () -> Int32? in
+            let remaining = deadline - ProcessInfo.processInfo.systemUptime
+            let state = cancellation()
+            if state != 0 || remaining <= 0 {
+                showApprovalEnded(state == 0 ? 2 : state)
+                return state == 0 || state == 2 ? 2 : 0
+            }
+            guard NSApp.modalWindow == nil else { return nil }
+            let result = present(remaining, { cancellation() != 0 })
+            let finalState = cancellation()
+            if finalState != 0 || result == approvalTimedOut || ProcessInfo.processInfo.systemUptime >= deadline {
+                showApprovalEnded(finalState == 0 ? 2 : finalState)
+                return finalState == 0 || finalState == 2 ? 2 : 0
+            }
+            return result == .alertSecondButtonReturn ? 1 : 0
+        }) {
+            return answer
+        }
+        Thread.sleep(forTimeInterval: 0.1)
     }
 }
 
@@ -937,6 +970,11 @@ func runNativeSigner(arguments: [String], link: String?) -> Never {
 final class ApprovalSelftest: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.activate(ignoringOtherApps: true)
+        if CommandLine.arguments.contains("--queued-approval") {
+            let expire = CommandLine.arguments.contains("--expire")
+            DispatchQueue.main.async { self.checkQueuedApproval(expire: expire) }
+            return
+        }
         DispatchQueue.global(qos: .userInitiated).async {
             let rc = loki_signer_approval_selftest(nativeApprove)
             print(rc == 0 ? "APPROVAL SELFTEST PASS: payment signed only after native approval"
@@ -945,6 +983,46 @@ final class ApprovalSelftest: NSObject, NSApplicationDelegate {
             fflush(stdout)
             exit(rc)
         }
+    }
+
+    /// Exercise the same main-queue modal ownership as Connect and roster.
+    private func checkQueuedApproval(expire: Bool) {
+        let blocker = NSAlert()
+        blocker.messageText = "Existing dialog (approval self-test)"
+        blocker.addButton(withTitle: "Close")
+        let launch = Timer(timeInterval: 0.05, repeats: false) { _ in
+            precondition(NSApp.modalWindow === blocker.window)
+            DispatchQueue.global(qos: .userInitiated).async {
+                let result = waitForApprovalDialog(cancellation: { 0 }, timeout: expire ? 0.4 : 3) { remaining, _ in
+                    precondition(!expire && NSApp.modalWindow == nil && remaining < 2.8)
+                    return .alertSecondButtonReturn
+                }
+                precondition(result == (expire ? 2 : 1))
+                if expire {
+                    let checked = DispatchWorkItem {
+                        precondition(NSApp.modalWindow === blocker.window)
+                        precondition(approvalEndedWindow?.title == "Payment approval timed out")
+                        print("APPROVAL QUEUE SELFTEST PASS: timed out while the other dialog was open")
+                        exit(0)
+                    }
+                    RunLoop.main.perform(inModes: [.modalPanel]) { checked.perform() }
+                } else {
+                    print("APPROVAL QUEUE SELFTEST PASS: presented after the other dialog closed")
+                    exit(0)
+                }
+            }
+        }
+        let close = Timer(timeInterval: 0.9, repeats: false) { _ in
+            precondition(!expire, "queued approval did not time out while modal")
+            NSApp.stopModal()
+        }
+        let watchdog = Timer(timeInterval: 5, repeats: false) { _ in
+            fatalError("queued approval self-test did not finish")
+        }
+        RunLoop.main.add(launch, forMode: .modalPanel)
+        RunLoop.main.add(close, forMode: .modalPanel)
+        RunLoop.main.add(watchdog, forMode: .common)
+        _ = blocker.runModal()
     }
 }
 

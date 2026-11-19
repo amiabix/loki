@@ -41,9 +41,20 @@ pub type LocalNotice = std::sync::Arc<dyn Fn(&str, &str) + Send + Sync>;
 #[derive(Default)]
 pub struct ApprovalAttempt {
     vault_name: Option<String>,
-    // 0 pending, 1 ended, 2 timed out. The first terminal outcome wins.
-    state: std::sync::atomic::AtomicU8,
+    state: std::sync::Mutex<Option<ApprovalEnd>>,
     waiting: std::sync::atomic::AtomicBool,
+}
+
+/// Fixed status codes for the native approval's borrowed cancellation callback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum ApprovalEnd {
+    Failed = 1,
+    LocalTimeout = 2,
+    PeerTimeout = 3,
+    PeerRefused = 4,
+    ShareDeadline = 5,
+    LocalRefused = 6,
 }
 
 impl ApprovalAttempt {
@@ -51,21 +62,15 @@ impl ApprovalAttempt {
         Self { vault_name: Some(vault_name), ..Self::default() }
     }
 
-    pub(crate) fn cancel(&self) {
-        self.end(1);
+    pub(crate) fn end(&self, reason: ApprovalEnd) {
+        self.state.lock().unwrap().get_or_insert(reason);
     }
 
-    fn timeout(&self) {
-        self.end(2);
-    }
+    fn ended(&self) -> Option<ApprovalEnd> { *self.state.lock().unwrap() }
 
-    fn end(&self, code: u8) {
-        use std::sync::atomic::Ordering;
-        let _ = self.state.compare_exchange(0, code, Ordering::AcqRel, Ordering::Acquire);
-    }
-
+    #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
     pub(crate) fn cancellation_code(&self) -> u8 {
-        self.state.load(std::sync::atomic::Ordering::Acquire)
+        self.ended().map_or(0, |reason| reason as u8)
     }
 }
 
@@ -128,23 +133,31 @@ pub fn approval_policy(
     let attempt = attempt.unwrap_or_default();
     Box::new(move |request| {
         let approved = approval.as_ref().is_some_and(|approve| {
-            if attempt.cancellation_code() != 0 { return false; }
+            if attempt.ended().is_some() { return false; }
             let summary = approval_summary(request, network, slot, attempt.vault_name.as_deref());
             attempt.waiting.store(true, Ordering::Release);
             let answer = approve(&summary, &attempt);
             attempt.waiting.store(false, Ordering::Release);
-            if attempt.cancellation_code() != 0 { return false; }
+            if attempt.ended().is_some() { return false; }
             match answer {
                 ApprovalAnswer::Approve => true,
-                ApprovalAnswer::Refuse => false,
-                ApprovalAnswer::Timeout => {
-                    attempt.timeout();
+                ApprovalAnswer::Refuse | ApprovalAnswer::Timeout => {
+                    if attempt.vault_name.is_some() {
+                        attempt.end(if matches!(answer, ApprovalAnswer::Timeout) { ApprovalEnd::LocalTimeout }
+                            else { ApprovalEnd::LocalRefused });
+                    }
                     false
                 }
             }
         });
         let id = hex::encode(request.candidate.attempt_id);
-        eprintln!("payment {id}: member {slot} approval {}", if approved { "approved" } else { "refused" });
+        let outcome = match attempt.ended() {
+            Some(ApprovalEnd::LocalTimeout) => "timed out",
+            Some(ApprovalEnd::LocalRefused) | None if !approved => "refused",
+            Some(_) => "ended",
+            None => "approved",
+        };
+        eprintln!("payment {id}: member {slot} approval {outcome}");
         approved
     })
 }
@@ -384,11 +397,11 @@ mod tests {
             log.lock().unwrap().push(summary.to_owned());
             if *answer.lock().unwrap() { ApprovalAnswer::Approve } else { ApprovalAnswer::Refuse }
         });
-        let mut policy = super::approval_policy(Some(approve), Network::Testnet, 2,
+        let policy = || super::approval_policy(Some(approve.clone()), Network::Testnet, 2,
             Some(Arc::new(ApprovalAttempt::named("Household".into()))));
-        assert!(!policy(&request), "the member's refusal refuses");
+        assert!(!policy()(&request), "the member's refusal refuses");
         *decision.lock().unwrap() = true;
-        assert!(policy(&request), "the member's approval approves");
+        assert!(policy()(&request), "the member's approval approves");
 
         let asked = asked.lock().unwrap();
         assert_eq!(asked[0].lines().count(), 1, "a memo cannot add a summary line");
