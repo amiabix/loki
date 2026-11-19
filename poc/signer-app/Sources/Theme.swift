@@ -13,6 +13,7 @@ enum Loki {
     static let accent = NSColor(srgbRed: 0x2F / 255, green: 0xD8 / 255, blue: 0xA8 / 255, alpha: 1)
     static let accentDeep = NSColor(srgbRed: 0x13 / 255, green: 0xA5 / 255, blue: 0x7E / 255, alpha: 1)
     static let gold = NSColor(srgbRed: 0xE8 / 255, green: 0xB4 / 255, blue: 0x4A / 255, alpha: 1)
+    static let danger = NSColor(srgbRed: 0xF4 / 255, green: 0x71 / 255, blue: 0x74 / 255, alpha: 1)
     static let mono = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
 
     /// A solid rounded surface; security-critical text only ever sits on one of these.
@@ -226,7 +227,7 @@ final class LokiAlert: NSObject {
         if buttons.isEmpty { _ = addButton(withTitle: "OK") }
         let width: CGFloat = 420
 
-        let dot = Loki.box(alertStyle == .informational ? Loki.accent : Loki.gold, radius: 4)
+        let dot = Loki.box([.critical: Loki.danger, .warning: Loki.gold][alertStyle] ?? Loki.accent, radius: 4)
         dot.layer?.borderWidth = 0
         dot.widthAnchor.constraint(equalToConstant: 8).isActive = true
         dot.heightAnchor.constraint(equalToConstant: 8).isActive = true
@@ -294,7 +295,13 @@ final class LokiAlert: NSObject {
         root.wantsLayer = true
         root.layer?.cornerRadius = 20
         root.layer?.masksToBounds = true
+        root.layer?.borderWidth = 1
+        root.layer?.borderColor = NSColor(white: 1, alpha: 0.14).cgColor
         Loki.mount(card, in: root, inset: 24)
+        card.layer?.shadowColor = NSColor.black.cgColor
+        card.layer?.shadowOpacity = 0.5
+        card.layer?.shadowRadius = 16
+        card.layer?.shadowOffset = CGSize(width: 0, height: -12)
         window.contentView = root
         window.appearance = NSAppearance(named: .darkAqua)
         window.isOpaque = false
@@ -308,14 +315,16 @@ final class LokiAlert: NSObject {
     @discardableResult func runModal() -> NSApplication.ModalResponse {
         layout()
         window.center()
-        window.alphaValue = 0
         window.makeKeyAndOrderFront(nil)
+        window.invalidateShadow()
         if let first = window.initialFirstResponder { window.makeFirstResponder(first) }
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.18
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            window.animator().alphaValue = 1
-        }
+        // Fade the content layer, not the window: the window stays fully opaque even if a modal
+        // run loop never drives an AppKit window animation to its end.
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = 0
+        fade.duration = 0.18
+        fade.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        window.contentView?.layer?.add(fade, forKey: "appear")
         let response = NSApp.runModal(for: window)
         window.orderOut(nil)
         return response

@@ -31,6 +31,7 @@ private func nativeQuery(_ query: (UnsafePointer<CChar>) -> UnsafeMutablePointer
 
 private func showStartError(_ reply: [String: Any]) {
     let alert = LokiAlert()
+    alert.alertStyle = .critical
     alert.messageText = "Signer could not start"
     alert.informativeText = reply["error"] as? String ?? "unknown error"
     alert.runModal()
@@ -232,6 +233,7 @@ private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointe
                 NSPasteboard.general.setString(text, forType: .string)
             }
         } else {
+            alert.alertStyle = event == "recovery" ? .warning : .critical
             alert.messageText = event == "recovery" ? "Save your recovery words privately" : "Signer could not start"
             if event == "recovery" { alert.detailText = text } else { alert.informativeText = text }
             alert.addButton(withTitle: event == "recovery" ? "I saved these words" : "OK")
@@ -267,6 +269,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
     func start(_ link: String?) {
         if running || prompting {
             let alert = LokiAlert()
+            alert.alertStyle = .warning
             alert.messageText = "This signer is already running"
             alert.informativeText = "Quit to lock it before opening another pairing link."
             alert.runModal()

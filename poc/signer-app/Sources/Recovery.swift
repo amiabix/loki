@@ -96,6 +96,7 @@ func recoveryError(_ reply: UnsafeMutablePointer<CChar>?) -> String? {
 
 func showRecoveryResult(error: String?) {
     let alert = LokiAlert()
+    alert.alertStyle = error == nil ? .informational : .critical
     alert.messageText = error == nil ? "Vault restored" : "Could not restore vault"
     alert.informativeText = error ?? "LokiSigner rebuilt your share on this Mac. Reopen your vault list in the wallet to see the restored vault."
     alert.addButton(withTitle: "OK")
