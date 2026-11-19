@@ -807,6 +807,10 @@ fn sync_control_inner(url: &str, data: &Path, pass: &str, vault: &str, v: &Vault
                         {
                             p.signers = incoming.signers;
                             p.signing_expiry = incoming.signing_expiry;
+                            // The proposer forms the group from approvals only (`signing_group`).
+                            for id in p.signers.clone() {
+                                record_approval(&mut p, id);
+                            }
                             if !p.signers.contains(&v.slot) {
                                 p.phase = "not_selected".into();
                             } else if p.approval_requested {
@@ -2968,11 +2972,14 @@ mod tests {
         sync_control(&url, data_c, "pass", &vault, &c).unwrap();
         let signer = read_payment(data_c, "pass", &vault, &p.attempt).unwrap();
         assert_eq!(signer.signers, vec![1, 3]);
+        // The group is made of approvers only, so every member shows it fully approved.
+        assert_eq!(signer.approvals, vec![3, 1]);
         assert_eq!(signer.signing_expiry, proposer.signing_expiry);
         assert!(signer.start_requested);
         assert_eq!(signer.phase, "signing");
         let outside = read_payment(data_b, "pass", &vault, &p.attempt).unwrap();
         assert_eq!(outside.signers, vec![1, 3]);
+        assert_eq!(outside.approvals, vec![2, 1, 3]);
         assert!(!outside.start_requested);
         assert_eq!(outside.phase, "not_selected");
         send_control(&url, &b, &outside, "failed", &[1, 3]).unwrap();
