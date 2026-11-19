@@ -626,6 +626,19 @@ impl Signer {
         Ok(())
     }
 
+    /// The transaction that spent the vault note with this nullifier (hex), as JSON
+    /// `{txid, height}`, or `null` while the scan has not seen it spent.
+    #[wasm_bindgen(js_name = scanSpentBy)]
+    pub fn scan_spent_by(&self, nullifier_hex: &str) -> Result<String, JsError> {
+        let (_, scan) = self.scan.as_ref().ok_or_else(|| JsError::new("call scanNext first"))?;
+        let nf: [u8; 32] = hex::decode(nullifier_hex).ok().and_then(|b| b.try_into().ok()).ok_or_else(|| JsError::new("invalid nullifier"))?;
+        Ok(match scan.spent_by(&nf) {
+            Some((txid, height)) => serde_json::json!({ "txid": txid, "height": height }),
+            None => serde_json::Value::Null,
+        }
+        .to_string())
+    }
+
     /// `{height, balance_zat, history}` from the blocks scanned so far.
     #[wasm_bindgen(js_name = scanResult)]
     pub fn scan_result(&self) -> Result<String, JsError> {

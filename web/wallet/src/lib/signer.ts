@@ -12,6 +12,8 @@
 // never falls back to it.
 // ─────────────────────────────────────────────────────────────────────────────
 
+import type { Payment, PaymentSession } from "./types";
+
 export class ApiError extends Error {
   status: number;
   constructor(message: string, status: number) { super(message); this.status = status; }
@@ -57,6 +59,41 @@ export interface SignerModule {
  *  still creating keys. */
 export function browserVaultStatus(vaults: { vault: string; active: boolean }[] | undefined, vault: string): { phase: "active" | "creating_keys" } {
   return { phase: vaults?.some((v) => v.vault === vault && v.active) ? "active" : "creating_keys" };
+}
+
+/** One transaction from the browser signer's own chain scan (loki-signer-core chain_scan.rs). */
+export type ChainTx = { txid: string; height: number; received_zat: number; change_zat: number; spent_zat: number };
+
+/** The History list from the chain scan: what each transaction did to the vault. A spend shows
+ *  its net outflow (amount sent plus fee); every entry is mined, by construction. */
+export function chainPayments(history: ChainTx[]): Payment[] {
+  return history.map((t) => {
+    const sent = t.spent_zat > 0;
+    const amount = sent ? t.spent_zat - t.change_zat - t.received_zat : t.received_zat + t.change_zat;
+    return { attempt: t.txid, phase: "confirmed", recipient: "", amount_zat: String(amount), txid: t.txid,
+      direction: sent ? "sent" : "received", amount_is_net: sent, mined_height: t.height };
+  });
+}
+
+/** A payment's status on the browser signer. The terms and signing group come from the
+ *  proposer's notices; "confirmed" only from the chain: the scan saw its input note spent. */
+export function chainPaymentSession(r: {
+  terms: { proposer: number; recipient: string; amount_zat: number; fee_zat: number };
+  signers: number[];
+  ended?: "cancelled" | "failed" | null;
+  spent: { txid: string; height: number } | null;
+}): PaymentSession {
+  return {
+    phase: r.spent ? "confirmed" : r.ended ?? "signing",
+    signatures_received: !!r.spent,
+    txid: r.spent?.txid ?? null,
+    // The proposer forms the signing group from the first approvals, so its members approved.
+    approvals: r.signers,
+    // Not known on the browser signer before the chain shows the payment (its approval is sent,
+    // not kept); false keeps the Approve button for a request this member has not signed.
+    approval_requested: !!r.spent,
+    intent: { proposer: r.terms.proposer, signers: r.signers, recipient: r.terms.recipient, amount_zat: r.terms.amount_zat, fee_zat: r.terms.fee_zat, open_approval: true },
+  };
 }
 
 // ─── the signer origin (iframe + postMessage) ────────────────────────────────
@@ -159,6 +196,10 @@ function browserSigner(origin: string): SignerModule {
       if (path === "pending") return { pending: await call("pending", payment) } as T;
       if (path === "payment-review" || path === "payment-approve") return call<T>(path, payment);
       if (path === "address") return { address: await call<string>("address", payment) } as T;
+      // Balance, History and a payment's status from the signer's own scan of the chain.
+      if (path === "balance") return { balance_zat: Number((await call<{ balance_zat: string }>("chain", payment)).balance_zat) } as T;
+      if (path === "payments") return { payments: chainPayments((await call<{ history: ChainTx[] }>("chain", payment)).history) } as T;
+      if (path === "payment-status") return chainPaymentSession(await call("payment-status", payment)) as T;
       // Recovery words are shown, typed and checked on the signer page; only the opaque
       // backup ciphertext ({backup} from recovery-export) and public results come back.
       if (path === "recovery-setup" || path === "recovery-export" || path === "recovery-status") return call<T>(path, body);

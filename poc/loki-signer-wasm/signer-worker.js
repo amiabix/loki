@@ -282,6 +282,21 @@ async function chainScan(signer, p) {
   return { tip, ...JSON.parse(signer.scanResult()) };
 }
 
+// A payment's status for the wallet: its terms and signing group from the proposer's notices,
+// and whether the chain scan saw its one input note spent (and in which transaction).
+async function paymentStatus(signer, p) {
+  const vault = await openVault(signer, p.vaultHex);
+  const control = await frostdClient(signer, p);
+  const { notices } = await findPayment(signer, control, vault, p.attemptHex, p);
+  const terms = notices[notices.length - 1].intent;
+  checkTerms(terms);
+  const ended = notices.find((n) => n.kind === "cancelled" || n.kind === "failed")?.kind ?? null;
+  const signers = notices.find((n) => n.kind === "start" && n.intent.signers?.length)?.intent.signers ?? [];
+  await chainScan(signer, p);
+  const spent = JSON.parse(signer.scanSpentBy(terms.note_selection[0]));
+  return { terms, signers, ended, spent };
+}
+
 // The terms a proposer announced for this payment, read-only: nothing is approved or sent.
 // The wallet shows them before the member opens the approval on the signer page.
 async function paymentTerms(signer, p) {
@@ -582,7 +597,7 @@ self.onmessage = async (e) => {
   // or removal holds it, so the quick reads are refused while one runs (the wallet polls
   // again) and otherwise take turns, so no op swaps the vault under another mid-flight.
   const holds = op === "join" || op === "payment-approve" || op === "restore" || op === "remove";
-  const reads = op === "payment-review" || op === "pending" || op === "vaults" || op === "address" || op === "recovery-backup" || op === "chain";
+  const reads = op === "payment-review" || op === "pending" || op === "vaults" || op === "address" || op === "recovery-backup" || op === "chain" || op === "payment-status";
   let release = () => {};
   try {
     if (reads && busy) throw new Error(`the signer is busy with a ${{ join: "vault setup", "payment-approve": "payment", restore: "restore", remove: "removal" }[busy]}; try again when it finishes`);
@@ -621,6 +636,9 @@ self.onmessage = async (e) => {
         break;
       case "chain":
         result = await chainScan(signer, payment);
+        break;
+      case "payment-status":
+        result = await paymentStatus(signer, payment);
         break;
       case "address":
         await openVault(signer, payment.vaultHex);

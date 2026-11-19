@@ -148,6 +148,11 @@ impl ChainScan {
         self.notes.values()
     }
 
+    /// The transaction (and height) that spent the vault note with this spend nullifier.
+    pub fn spent_by(&self, nullifier: &[u8; 32]) -> Option<&(String, u32)> {
+        self.notes.get(nullifier)?.spent_in.as_ref()
+    }
+
     /// Every transaction that touched the vault, newest first.
     pub fn history(&self) -> Vec<TxEffect> {
         let mut by_tx: BTreeMap<String, TxEffect> = BTreeMap::new();
@@ -269,8 +274,10 @@ mod tests {
         assert_eq!(resumed.history(), scan.history());
         // The spend in the next block is found from the restored notes.
         let (_, change) = action(&vault, Scope::Internal, 39_000, paid.nullifier(&vault));
+        assert_eq!(resumed.spent_by(&paid.nullifier(&vault).to_bytes()), None);
         resumed.scan(&block(H + 1, 0xa1, 0xa0, vec![(0xbb, vec![change])], 2)).unwrap();
         assert_eq!(resumed.balance_zat(), 39_000);
+        assert_eq!(resumed.spent_by(&paid.nullifier(&vault).to_bytes()), Some(&("bb".repeat(32), H as u32 + 1)));
         // A block that does not extend the saved tip is still refused.
         let mut again = ChainScan::from_bytes(VaultNetwork::Testnet, &vault, &saved).unwrap();
         assert!(again.scan(&block(H + 1, 0xa1, 0x55, vec![], 1)).is_err());
