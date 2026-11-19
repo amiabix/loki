@@ -172,10 +172,10 @@ fn archive(data: &Path) -> Result<(), &'static str> {
     fs::rename(data, archive).map_err(|_| REFUSED)
 }
 
-pub(crate) fn set_aside(data: &Path) -> Result<(), &'static str> {
+pub(super) fn set_aside(data: &Path, key_gone: bool) -> Result<(), &'static str> {
     let dest = data_location(data)?;
     match profile_state(&dest)? {
-        "profile" => {
+        state if state == "profile" || (state == "vault" && key_gone) => {
             archive(&dest)?;
             // Preserve a root symlink and give it a fresh target to pair or restore into.
             if dest != data { MemberDir::create(&dest, "").map_err(|_| REFUSED)?; }
@@ -187,26 +187,13 @@ pub(crate) fn set_aside(data: &Path) -> Result<(), &'static str> {
 }
 
 pub(super) fn read_roster(origin: &str) -> Result<Vec<PublicMember>, &'static str> {
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Roster { slots: Vec<PublicMember> }
-
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| ROSTER_UNAVAILABLE)?;
     runtime.block_on(async {
-        let error = |_| ROSTER_UNAVAILABLE;
         let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(15)).build().map_err(error)?;
+            .timeout(std::time::Duration::from_secs(15)).build().map_err(|_| ROSTER_UNAVAILABLE)?;
         // A plain GET: never send words, backup data, recovered keys, or a candidate slot here.
-        let mut response = client.get(format!("{origin}/api/members")).send().await
-            .and_then(|r| r.error_for_status()).map_err(error)?;
-        if !response.status().is_success() { return Err(ROSTER_UNAVAILABLE); }
-        let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(error)? {
-            if body.len() + chunk.len() > 1024 * 1024 { return Err(ROSTER_UNAVAILABLE); }
-            body.extend_from_slice(&chunk);
-        }
-        serde_json::from_slice::<Roster>(&body).map(|r| r.slots).map_err(|_| ROSTER_UNAVAILABLE)
+        registration::fetch_roster(&client, origin).await.map_err(|_| ROSTER_UNAVAILABLE)
     })
 }
 
@@ -243,7 +230,13 @@ pub(crate) fn restore_new(
     let final_key_dir = dest.join("vaults").join(&vault).join("signer");
     crate::profile::create(&staged.path, pass, name).map_err(|_| REFUSED)?;
     write_native_key_scope(&staged.path).map_err(|_| REFUSED)?;
-    ceremony::restore_opened_backup(backup, &staged.path, &vault_dir, pass, config, Some(&final_key_dir)).map_err(|_| REFUSED)?;
+    ceremony::restore_opened_backup(backup, &staged.path, &vault_dir, pass, config, Some(&final_key_dir))
+        .map_err(|e| super::state::member_key_message(&e).unwrap_or(REFUSED))?;
+    #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
+    if config.secure_element == "apple" {
+        registration::DeviceKey::create_staged(config, &staged.path, &dest)
+            .map_err(|e| super::state::member_key_message(&e.to_string()).unwrap_or(REFUSED))?;
+    }
     registration::save_coordinator(&staged.path, &origin, slot).map_err(|_| REFUSED)?;
     if let Some(fetched) = fetched { fetched.save_unlocked(&staged.path).map_err(|_| REFUSED)?; }
     fs::write(staged.path.join(RESTORE_PENDING), []).map_err(|_| REFUSED)?;
@@ -276,7 +269,8 @@ pub(super) fn restore_running(st: &Shared, words: Zeroizing<Vec<u8>>, file: &Pat
     if !absent(&dest)? { return Err(ALREADY_PRESENT); }
     let staged = Stage::new(&parent)?;
     let vault_dir = MemberDir::open(&staged.path, "");
-    ceremony::restore_opened_backup(backup, data, &vault_dir, pass, &st.config, Some(&dest.join("signer"))).map_err(|_| REFUSED)?;
+    ceremony::restore_opened_backup(backup, data, &vault_dir, pass, &st.config, Some(&dest.join("signer")))
+        .map_err(|e| super::state::member_key_message(&e).unwrap_or(REFUSED))?;
     staged.publish(&dest)
 }
 
@@ -329,12 +323,12 @@ mod tests {
         let vault = data.join("vaults/member-vault/signer");
         fs::create_dir_all(&vault).unwrap();
         fs::write(vault.join("share.sealed"), b"share fixture").unwrap();
-        assert_eq!(set_aside(&data), Err("vault"));
+        assert_eq!(set_aside(&data, false), Err("vault"));
         assert_eq!(fs::read(vault.join("share.sealed")).unwrap(), b"share fixture");
         assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
         fs::remove_dir_all(data.join("vaults")).unwrap();
 
-        set_aside(&data).unwrap();
+        set_aside(&data, false).unwrap();
         assert!(!data.exists());
         let archived = fs::read_dir(&root).unwrap().next().unwrap().unwrap();
         assert!(archived.file_name().to_string_lossy().starts_with("LokiSigner-set-aside-"));
@@ -407,7 +401,7 @@ mod tests {
         assert_eq!(profile_state(&alias), Ok("fresh"));
         crate::profile::create(&target, "old passphrase", "Old member").unwrap();
         assert_eq!(profile_state(&alias), Ok("profile"));
-        set_aside(&alias).unwrap();
+        set_aside(&alias, false).unwrap();
         assert_eq!(fs::read_link(&alias).unwrap(), target);
         assert_eq!(profile_state(&alias), Ok("fresh"));
         let archived = fs::read_dir(parent(&target)).unwrap().map(|e| e.unwrap().path()).find(|p| *p != target).unwrap();

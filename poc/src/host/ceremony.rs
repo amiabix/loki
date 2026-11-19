@@ -1094,6 +1094,15 @@ fn roster_decision(confirmed: Option<&str>, code: &str) -> RosterDecision {
     if confirmed == Some(code) { RosterDecision::Match } else { RosterDecision::NoMatch }
 }
 
+fn setup_signer_element(config: &super::state::Config, dir: &Path, pass: &str, published: Option<&Path>, profile: &Path)
+    -> Result<(super::state::HostedSecureElement, bool), String>
+{
+    let existing = super::custody::has_signer_data(dir)?;
+    let element = if existing { config.open_secure_element(dir, pass)? }
+    else { config.create_secure_element(dir, pass, published, profile)? };
+    Ok((element, existing))
+}
+
 fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result<Value, String> {
     let mut c = {
         let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
@@ -1186,7 +1195,7 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
         let signer_dir = dir(data, vault_id)?.path().join("signer");
         // The share is born in the store under the configured element: the Secure Enclave
         // for `--secure-element apple`, so it never exists under the passphrase alone.
-        let se = st.config.open_secure_element(&signer_dir, pass)?;
+        let (se, existing) = setup_signer_element(&st.config, &signer_dir, pass, None, data)?;
         let signer_network = match network {
             VaultNetwork::Regtest => Network::Regtest,
             VaultNetwork::Testnet => Network::Testnet,
@@ -1196,7 +1205,7 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
         // Matches only the code this member confirmed in `agree`.
         let confirmed = c.roster_code.clone();
         prompts.roster = Box::new(move |code| roster_decision(confirmed.as_deref(), code));
-        let mut signer = if signer_dir.join("signer.meta").exists() {
+        let mut signer = if existing {
             LocalSigner::open(&signer_dir, se, c.name.clone(), prompts)
         } else {
             LocalSigner::create_with_identity(
@@ -1975,6 +1984,22 @@ mod tests {
         assert_eq!(std::fs::read(crate::host::recovery::backup_file(&sdir)).unwrap(), blob);
         crate::host::payment::load_vault(&AppState::new(make_config()), &data, pass, &vault_hex).unwrap();
 
+        #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
+        {
+            use crate::signer::secure_element_apple::KeyFailure;
+            let mut config = make_config();
+            config.secure_element = "apple".into();
+            let st = AppState::new(config);
+            for may_create in [true, false] {
+                let _keychain = crate::host::state::apple_test::install(&data, move |_, _, create| {
+                    assert_eq!(create, may_create);
+                    Err(KeyFailure::Cancelled)
+                });
+                assert_eq!(crate::host::custody::migrate(&st, &data, pass, &vault_hex, 1, &legacy).unwrap_err(),
+                    KeyFailure::Cancelled.message());
+                if may_create { std::fs::remove_file(sdir.join("kek.sealed")).unwrap(); }
+            }
+        }
         std::fs::remove_dir_all(&data).unwrap();
     }
 
@@ -2033,6 +2058,26 @@ mod tests {
         // Only its presence marks the vault active for the backup sweep.
         dir(data, &vault_hex).unwrap().write_sealed("vault.sealed", b"{}", pass).unwrap();
         (material, shares, public)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
+    #[test]
+    fn dkg_opens_an_existing_signer_and_only_creates_for_a_fresh_store() {
+        use crate::signer::secure_element_apple::KeyFailure;
+        let data = std::env::temp_dir().join(format!("loki-apple-dkg-{}", Uuid::new_v4()));
+        let dir = data.join("signer");
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = crate::host::config_from_args(&["--data".into(), data.to_str().unwrap().into(),
+            "--port".into(), "3601".into(), "--secure-element".into(), "apple".into()]).unwrap();
+        for fresh in [true, false] {
+            if !fresh { std::fs::write(dir.join("share.sealed"), b"existing seal without metadata").unwrap(); }
+            let _keychain = crate::host::state::apple_test::install(&data, move |_, _, create| {
+                assert_eq!(create, fresh);
+                Err(KeyFailure::Cancelled)
+            });
+            assert_eq!(setup_signer_element(&config, &dir, "unused", None, &config.data).err().as_deref(), Some(KeyFailure::Cancelled.message()));
+        }
+        std::fs::remove_dir_all(&data).unwrap();
     }
 
     /// A vault that became active before the member set up recovery still gets its recovery
@@ -2212,6 +2257,8 @@ mod tests {
         use crate::signer::{backup, recovery::RecoveryKey};
         use axum::{routing::{get, post}, Json, Router};
         use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
+        #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
+        use std::sync::atomic::AtomicBool;
 
         let root = std::env::temp_dir().join(format!("loki-native-restore-{}", Uuid::new_v4()));
         let data = root.join("restored");
@@ -2302,7 +2349,7 @@ mod tests {
             settings.secure_element = "software".into();
             crate::profile::create(&data, pass, "Mistaken new member").unwrap();
             assert!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None).is_err());
-            native_recovery::set_aside(&data).unwrap();
+            native_recovery::set_aside(&data, false).unwrap();
             std::fs::create_dir_all(data.join("signer")).unwrap();
             std::fs::write(data.join("signer/share.sealed"), b"unrecognised data").unwrap();
             assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None),
@@ -2378,6 +2425,50 @@ mod tests {
         assert_eq!(registered.signing_pubkey, signing);
         assert_eq!(registered.relay_pubkey, relay);
         assert!(!data.join(registration::RESTORE_PENDING).exists());
+
+        #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
+        {
+            use crate::signer::secure_element_apple::KeyFailure;
+            let root = root.canonicalize().unwrap();
+            let mut apple = config();
+            apple.data = root.join("apple-restored");
+            apple.secure_element = "apple".into();
+            let tags = Arc::new(Mutex::new(Vec::new()));
+            let accesses = tags.clone();
+            let block_device = Arc::new(AtomicBool::new(true));
+            let blocked = block_device.clone();
+            let _keychain = crate::host::state::apple_test::install(&root, move |path, tag, create| {
+                let device = path.ends_with("device-auth");
+                accesses.lock().unwrap().push((device, create, tag.to_vec()));
+                if device && blocked.load(Ordering::SeqCst) { Err(KeyFailure::Cancelled) } else { Ok(()) }
+            });
+            std::fs::write(&file, document.to_string()).unwrap();
+            tokio::task::block_in_place(|| {
+                assert_eq!(native_recovery::restore_new(&mut apple, pass, secret(&words), &file, &origin, None),
+                    Err(KeyFailure::Cancelled.message()));
+                assert!(!apple.data.exists());
+                block_device.store(false, Ordering::SeqCst);
+                native_recovery::restore_new(&mut apple, pass, secret(&words), &file, &origin, None).unwrap();
+            });
+            assert!(!apple.data.join("device-registration-confirmed").exists());
+            assert!(registration::DeviceKey::open(&apple, pass).is_ok());
+            let restored = apple.data.clone();
+            let moved = restored.with_extension("moved");
+            std::fs::rename(&restored, &moved).unwrap();
+            apple.data = moved.clone();
+            assert!(registration::DeviceKey::open(&apple, pass).is_ok());
+            crate::host::custody::open_signer(&AppState::new(apple), &moved, pass, &vault_hex, 1, Box::new(|_| false)).unwrap();
+            let actual = tags.lock().unwrap();
+            let scope = std::fs::read_to_string(moved.join(NATIVE_KEY_SCOPE)).unwrap();
+            let vault = format!("cash.loki.member.kek.v2:{scope}:vault:{vault_hex}").into_bytes();
+            let device = format!("cash.loki.member.kek.v2:{scope}:device-auth").into_bytes();
+            assert_ne!(actual[0].2, vault, "a failed first restore does not publish its scope");
+            assert_ne!(actual[1].2, device);
+            assert_eq!(actual[2..], [
+                (false, true, vault.clone()), (true, true, device.clone()),
+                (true, false, device.clone()), (true, false, device), (false, false, vault),
+            ]);
+        }
         let sent = enrollment.lock().unwrap();
         assert_eq!(sent.iter().map(|request| request["slot"].as_u64().unwrap()).collect::<Vec<_>>(), [31, 31, 47]);
         for request in sent.iter() {
@@ -2607,12 +2698,8 @@ pub(super) fn restore_opened_backup(backup: RecoveryBackup, data: &Path, dest: &
         // Regtest vaults are born at height 2 (`setup_birth_height`); Testnet backups carry theirs.
         material.birth_height.unwrap_or(2), network,
     )?;
-    let se = if published_key_dir.is_some() {
-        config.open_element(&sdir, pass, published_key_dir)?
-    } else {
-        config.open_secure_element(&sdir, pass)?
-    };
-    let store = if sdir.join("signer.meta").exists() {
+    let (se, existing) = setup_signer_element(config, &sdir, pass, published_key_dir, data)?;
+    let store = if existing {
         crate::signer::store::SignerStore::open(&sdir)?
     } else {
         crate::signer::store::SignerStore::create(&sdir, material.network, vault_id, material.member_id)?

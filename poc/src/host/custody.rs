@@ -36,6 +36,16 @@ pub(super) type HostedSigner = LocalSigner<HostedSecureElement>;
 
 const FILES: [FileKind; 4] = [FileKind::Identity, FileKind::Roster, FileKind::Setup, FileKind::Share];
 
+/// A missing metadata file does not make a directory with sealed signer data new.
+pub(super) fn has_signer_data(dir: &Path) -> Result<bool, String> {
+    for file in ["signer.meta", "identity.sealed", "roster.sealed", "setup.sealed", "share.sealed"] {
+        if dir.join(file).try_exists().map_err(|_| "LokiSigner could not access the signer folder.")? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn hex32(s: &str) -> Result<[u8; 32], String> {
     hex::decode(s).ok().and_then(|v| v.try_into().ok()).ok_or_else(|| "expected 32 bytes of hex".into())
 }
@@ -196,19 +206,34 @@ pub(super) fn migrate(
     let network = VaultNetwork::parse(field("network")?)?;
 
     let sdir = super::ceremony::signer_dir(data, vault)?;
-    let se = st.config.open_secure_element(&sdir, pass)?;
-    let store = if sdir.join("signer.meta").exists() {
-        SignerStore::open(&sdir)?
-    } else {
-        SignerStore::create(&sdir, signer_network(network), hex32(vault)?, slot)?
-    };
-    if store.vault() != hex32(vault)? || store.member() != slot || store.network() != signer_network(network) {
+    let id = hex32(vault)?;
+    let network = signer_network(network);
+    let store = has_signer_data(&sdir)?.then(|| SignerStore::open(&sdir)).transpose()?;
+    if store.as_ref().is_some_and(|store| store.vault() != id || store.member() != slot || store.network() != network) {
         return Err("this vault's signer belongs to another vault or member".into());
     }
     let software_kek = sdir.join("kek.sealed");
-    let apple = st.config.secure_element == "apple";
-    if apple && software_kek.exists() {
-        reseal(&store, &SoftwareSecureElement::persistent(&sdir, pass)?, &se)?;
+    let old = if st.config.secure_element == "apple" && software_kek.exists() {
+        Some(SoftwareSecureElement::persistent(&sdir, pass)?)
+    } else {
+        None
+    };
+    // A partially migrated store already relies on its Enclave key. Only allow a fresh key
+    // when no signer exists or every file still opens with the original software KEK.
+    let new_key = store.as_ref().is_none_or(|store| {
+        old.as_ref().is_some_and(|old| FILES.iter().all(|&file| store.read(old, file).is_ok()))
+    });
+    let se = if new_key {
+        st.config.create_secure_element(&sdir, pass, None, data)?
+    } else {
+        st.config.open_secure_element(&sdir, pass)?
+    };
+    let store = match store {
+        Some(store) => store,
+        None => SignerStore::create(&sdir, network, id, slot)?,
+    };
+    if let Some(old) = &old {
+        reseal(&store, old, &se)?;
     }
     match store.read(&se, FileKind::Share)? {
         Some((_, raw)) if !same_share(&raw, &legacy)? => {
@@ -234,7 +259,7 @@ pub(super) fn migrate(
             let _ = std::fs::remove_file(vdir.path().join(&temp));
             format!("rewrite vault.sealed: {e}")
         })?;
-    if apple && software_kek.exists() {
+    if old.is_some() {
         std::fs::remove_file(&software_kek).map_err(|e| format!("remove software KEK: {e}"))?;
     }
     if super::recovery::backup_file(&sdir).exists() {
