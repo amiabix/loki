@@ -241,13 +241,17 @@ func runNativeSigner(arguments: [String], link: String?) -> Never {
     let menu = NSMenu()
     let item = NSMenuItem()
     let actions = NSMenu()
+    let vaultAddresses = VaultAddressesWindow()
+    let showAddresses = actions.addItem(withTitle: "Vault addresses…", action: #selector(VaultAddressesWindow.show(_:)), keyEquivalent: "")
+    showAddresses.target = vaultAddresses
+    actions.addItem(.separator())
     actions.addItem(withTitle: "Quit and lock LokiSigner", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     item.submenu = actions
     menu.addItem(item)
     app.mainMenu = menu
     let delegate = NativeSigner(args: args, link: link)
     app.delegate = delegate
-    withExtendedLifetime(delegate) { app.run() }
+    withExtendedLifetime((delegate, vaultAddresses)) { app.run() }
     exit(0)
 }
 

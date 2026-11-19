@@ -2030,6 +2030,7 @@ dependencies = [
  "hex",
  "hkdf 0.12.4",
  "hpke",
+ "icu_properties",
  "incrementalmerkletree",
  "loki-relay-client",
  "loki-relay-protocol",

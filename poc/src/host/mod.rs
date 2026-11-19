@@ -8,6 +8,8 @@ mod custody;
 mod device;
 mod payment;
 mod native_config;
+#[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+mod native_member;
 mod nonce_witness;
 mod recovery;
 mod registration;
@@ -19,6 +21,8 @@ mod state;
 pub use state::Config;
 pub use registration::RegistrationConfig;
 pub use native_config::{Deployment, FetchedConfig, NativeConfig};
+#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+pub(crate) use native_member::{run_native, vault_addresses as native_vault_addresses};
 #[cfg(feature = "relay-communication")]
 pub use nonce_witness::WitnessConfig;
 
@@ -164,11 +168,22 @@ pub fn run(config: Config) -> Result<(), String> {
 /// `fetched`: the configuration the native app fetched and the member confirmed; it is saved
 /// only once the profile unlocks.
 pub fn run_local(
+    config: Config,
+    pass: Option<zeroize::Zeroizing<String>>,
+    notice: Option<LocalNotice>,
+    approval: Option<LocalApproval>,
+    fetched: Option<FetchedConfig>,
+) -> Result<(), String> {
+    run_local_with(config, pass, notice, approval, fetched, |_| Ok(()))
+}
+
+fn run_local_with<G>(
     mut config: Config,
     pass: Option<zeroize::Zeroizing<String>>,
     notice: Option<LocalNotice>,
     approval: Option<LocalApproval>,
     fetched: Option<FetchedConfig>,
+    on_start: impl FnOnce(&state::Shared) -> Result<G, String>,
 ) -> Result<(), String> {
     // rustls has no default provider; install one before any relay/lightwalletd TLS.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -190,6 +205,7 @@ pub fn run_local(
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
         config.port = addr.port();
         let state: state::Shared = std::sync::Arc::new(state::AppState { approval, fetched_config: fetched, ..state::AppState::new(config) });
+        let _scope = on_start(&state)?;
         registration::start(&state, pass, notice.as_ref()).await?;
         // Member-local output only. Paste into a local browser tab; never send to the coordinator.
         if let Some(notice) = notice {

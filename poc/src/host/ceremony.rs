@@ -126,12 +126,12 @@ struct Slot {
 }
 
 #[derive(Serialize, Deserialize)]
-struct Ceremony {
+pub(super) struct Ceremony {
     vault: String,
-    name: String,
+    pub(super) name: String,
     members: u16,
     threshold: u16,
-    my_slot: u16,
+    pub(super) my_slot: u16,
     creator_base_url: String,
     frostd_url: String,
     slots: BTreeMap<u16, Slot>,
@@ -174,12 +174,12 @@ fn vault_bytes(vault: &str) -> Result<[u8; 32], String> {
         .map_err(|_| "vault must be 32 bytes of hex".into())
 }
 
-fn dir(data: &Path, vault: &str) -> Result<MemberDir, String> {
+pub(super) fn dir(data: &Path, vault: &str) -> Result<MemberDir, String> {
     vault_bytes(vault)?;
     Ok(MemberDir::open(&data.join("vaults"), vault))
 }
 
-fn load(data: &Path, pass: &str, vault: &str) -> Result<Ceremony, String> {
+pub(super) fn load(data: &Path, pass: &str, vault: &str) -> Result<Ceremony, String> {
     let raw = dir(data, vault)?
         .read_sealed("ceremony.sealed", pass)
         .map_err(|e| e.to_string())?;
