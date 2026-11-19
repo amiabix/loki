@@ -413,13 +413,14 @@ const ops = {
   pending: (p) => call({ op: "pending", payment: relay(p) }),
   vaults: () => call({ op: "vaults" }),
   address: (p) => call({ op: "address", payment: p }),
+  chain: (p) => call({ op: "chain", payment: { ...p, lightwalletdGrpcWeb: cfg.lightwalletdGrpcWebUrl } }),
   "recovery-setup": recoverySetup,
   "recovery-status": async () => ({ recovery_identity: await call({ op: "has-recovery" }) }),
   "recovery-export": recoveryExport,
   restore,
   remove,
 };
-const UNLOCKED = new Set(["join", "payment-review", "payment-approve", "pending", "vaults", "address", "recovery-setup", "recovery-export", "recovery-status"]);
+const UNLOCKED = new Set(["join", "payment-review", "payment-approve", "pending", "vaults", "address", "chain", "recovery-setup", "recovery-export", "recovery-status"]);
 // Ops that may show a prompt run one at a time; the read-only ones answer alongside them
 // (the Worker refuses them with "busy" while a join or payment holds the vault).
 const PROMPTING = new Set(["create", "unlock", "join", "payment-approve", "recovery-setup", "recovery-export", "restore", "remove"]);

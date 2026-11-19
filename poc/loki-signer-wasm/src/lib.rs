@@ -17,6 +17,7 @@ use loki_signer_core::signer::backup::{self, BackupArtifact, BackupMaterial};
 use loki_signer_core::signer::recovery::RecoveryKey;
 use loki_signer_core::member_state::Roster;
 use loki_signer_core::network::VaultNetwork;
+use loki_signer_core::chain_scan::ChainScan;
 use loki_signer_core::signer::local::{
     self, BackupDevice, DevicePrompts, LocalSigner, RosterDecision, SignerError,
 };
@@ -274,6 +275,8 @@ pub struct Signer {
     witness_pins: Option<WitnessPins>,
     /// Claims both witnesses confirmed for this signature (cid, record), consumed by the core.
     claimed: Arc<Mutex<Vec<([u8; 32], Vec<u8>)>>>,
+    /// The open vault's chain scan (vault id, scan state), started by `scanNext`.
+    scan: Option<([u8; 32], ChainScan)>,
 }
 
 impl Default for Signer {
@@ -286,6 +289,7 @@ impl Default for Signer {
             pending_recovery: None,
             witness_pins: None,
             claimed: Arc::new(Mutex::new(Vec::new())),
+            scan: None,
         }
     }
 }
@@ -589,6 +593,32 @@ impl Signer {
             Err(SignerError::NotReady) => Ok(Vec::new()),
             Err(e) => Err(JsError::new(&format!("backup: {e}"))),
         }
+    }
+
+    /// The next block height the open vault's chain scan needs: the vault's birth height on a
+    /// fresh scan, else one past the last block scanned. Starts the scan for this vault.
+    #[wasm_bindgen(js_name = scanNext)]
+    pub fn scan_next(&mut self) -> Result<u32, JsError> {
+        self.scan_next_impl().map_err(|e| JsError::new(&e))
+    }
+
+    /// Scan the next compact block (protobuf bytes from lightwalletd's `GetBlockRange`).
+    #[wasm_bindgen(js_name = scanBlock)]
+    pub fn scan_block(&mut self, block: &[u8]) -> Result<(), JsError> {
+        let (_, scan) = self.scan.as_mut().ok_or_else(|| JsError::new("call scanNext first"))?;
+        scan.scan(block).map_err(|e| JsError::new(&e))
+    }
+
+    /// `{height, balance_zat, history}` from the blocks scanned so far.
+    #[wasm_bindgen(js_name = scanResult)]
+    pub fn scan_result(&self) -> Result<String, JsError> {
+        let (_, scan) = self.scan.as_ref().ok_or_else(|| JsError::new("call scanNext first"))?;
+        Ok(serde_json::json!({
+            "height": scan.height(),
+            "balance_zat": scan.balance_zat().to_string(),
+            "history": scan.history(),
+        })
+        .to_string())
     }
 
     /// True once every member's backup receipt has arrived and the vault is active.
@@ -1212,6 +1242,18 @@ impl Signer {
             .sign_approve(&vs.session, &cand, &params, &candidate, &package, &seed)
             .map_err(|e| e.to_string())?;
         Ok(hex::encode(share.serialize()))
+    }
+
+    fn scan_next_impl(&mut self) -> Result<u32, String> {
+        let vs = self.vault.as_ref().ok_or("open the vault first")?;
+        if self.scan.as_ref().map(|(id, _)| *id) != Some(vs.vref.vault_id) {
+            let roster = vs.signer.confirmed_roster().ok_or("this vault has no confirmed roster")?;
+            let (_, fvk) = vs.signer.hosted_metadata().map_err(|e| e.to_string())?;
+            let birth = roster.birth_height.unwrap_or(1);
+            self.scan = Some((vs.vref.vault_id, ChainScan::new(roster.network, &fvk, birth)?));
+        }
+        let (_, scan) = self.scan.as_ref().expect("set above");
+        Ok(scan.next_height())
     }
 
     fn vault_open_impl(&mut self, vault_hex: &str) -> Result<String, String> {

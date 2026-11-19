@@ -22,6 +22,9 @@
 //                         refused. A regtest stack must set it, or LokiSigner is told testnet. Served for the native signer (LokiSigner), which reads this
 //                         config through the wallet's /api/signer-config.
 //   LOKI_LIGHTWALLETD_URL the lightwalletd the native signer syncs from (served the same way)
+//   LOKI_LIGHTWALLETD_GRPCWEB_URL  lightwalletd behind gRPC-web + CORS for this origin
+//                         (communication/deploy/lightwalletd-grpcweb.sh); the signer scans the
+//                         chain through it for the vault balance and history
 //   LOKI_SIGNER_PORT      listen port (default 3002)
 import { createServer } from "node:http";
 import { createHash } from "node:crypto";
@@ -38,6 +41,7 @@ const ceremonyOrigins = process.env.LOKI_CEREMONY_ORIGINS || "http://127.0.0.1:*
 const network = process.env.LOKI_NETWORK || "testnet";
 if (network !== "testnet" && network !== "regtest") throw new Error(`LOKI_NETWORK must be testnet or regtest, not ${network}`);
 const lightwalletdUrl = process.env.LOKI_LIGHTWALLETD_URL || "";
+const lightwalletdGrpcWebUrl = process.env.LOKI_LIGHTWALLETD_GRPCWEB_URL || "";
 // Native `[WitnessConfig; 2]` (byte arrays) → hex for the page; empty when unset.
 const hex = (bytes) => Buffer.from(bytes).toString("hex");
 const nonceWitnesses = process.env.LOKI_NONCE_WITNESSES
@@ -51,7 +55,7 @@ const nonceWitnesses = process.env.LOKI_NONCE_WITNESSES
 // reachable and the bytes served are exactly the bytes hashed below.
 const types = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".wasm": "application/wasm", ".json": "application/json" };
 const bundle = new Map();
-for (const name of ["signer.html", "signer-page.js", "signer-page.css", "signer-worker.js"]) {
+for (const name of ["signer.html", "signer-page.js", "signer-page.css", "signer-worker.js", "lightwalletd.js"]) {
   bundle.set(`/${name}`, readFileSync(join(here, name)));
 }
 for (const [prefix, dir] of [["/pkg/", resolve(here, "pkg")], ["/wasm-transport/pkg/", resolve(here, "../wasm-transport/pkg")]]) {
@@ -74,7 +78,7 @@ if (process.argv.includes("--hash")) {
   process.exit(0);
 }
 // Outside the hashed bundle: deployment values do not change the published build hash.
-bundle.set("/config.json", Buffer.from(JSON.stringify({ walletOrigin, frostdUrl, rpId, nonceWitnesses, network, lightwalletdUrl })));
+bundle.set("/config.json", Buffer.from(JSON.stringify({ walletOrigin, frostdUrl, rpId, nonceWitnesses, network, lightwalletdUrl, lightwalletdGrpcWebUrl })));
 bundle.set("/build-hash.json", Buffer.from(JSON.stringify(build)));
 
 // Strict CSP on every response (the page, the Worker script and its imports all get it).
@@ -86,7 +90,7 @@ const csp = [
   "script-src 'self' 'wasm-unsafe-eval'",
   "worker-src 'self'",
   "style-src 'self'",
-  `connect-src 'self' ${frostdUrl ? new URL(frostdUrl).origin : ""} ${nonceWitnesses.map((w) => new URL(w.endpoint).origin).join(" ")} ${ceremonyOrigins}`.replace(/\s+/g, " ").trim(),
+  `connect-src 'self' ${frostdUrl ? new URL(frostdUrl).origin : ""} ${nonceWitnesses.map((w) => new URL(w.endpoint).origin).join(" ")} ${lightwalletdGrpcWebUrl ? new URL(lightwalletdGrpcWebUrl).origin : ""} ${ceremonyOrigins}`.replace(/\s+/g, " ").trim(),
   "img-src 'self'",
   "base-uri 'none'",
   "form-action 'none'",

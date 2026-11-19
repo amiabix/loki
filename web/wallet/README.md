@@ -215,6 +215,7 @@ What a deploy must provide on the signer server (`serve.mjs` env):
 | `LOKI_NONCE_WITNESSES` | the two nonce-witness relays every signature is claimed at (the native `--nonce-witnesses` file). Each mailbox `read` capability is served publicly in `config.json`. |
 | `LOKI_NETWORK` | `testnet` (default) or `regtest`; mainnet is refused at startup. A regtest stack **must** set `regtest`, or LokiSigner is told testnet. |
 | `LOKI_LIGHTWALLETD_URL` | the lightwalletd native members sync from |
+| `LOKI_LIGHTWALLETD_GRPCWEB_URL` | lightwalletd behind gRPC-web + CORS for the signer origin (`communication/deploy/lightwalletd-grpcweb.sh`); the browser signer scans the chain through it for its vault balance and history |
 | `LOKI_SIGNER_PORT` | listen port (default 3002) |
 
 The coordinator (this app) serves the same values to the native signer at
