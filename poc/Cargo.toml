@@ -57,6 +57,7 @@ p256               = { version = "0.13", default-features = false, features = ["
 base64             = "0.22"
 ciborium           = "0.2"
 serde_json         = "1"
+icu_properties     = "2" # Unicode format characters in native vault labels (already used by URL handling).
 zcash_address = { package = "zakura-address", version = "=2.2.0" }
 zip321             = { package = "zakura-zip321", version = "=2.2.0" }
 zcash_protocol = { package = "zakura-protocol", version = "=2.2.0" }

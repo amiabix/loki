@@ -6,15 +6,17 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use icu_properties::{props::GeneralCategory, CodePointMapData};
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
 use crate::network::VaultNetwork;
-use super::{ceremony, custody::SignerViewingKey, state::Shared, Config, FetchedConfig, LocalApproval, LocalNotice};
+use super::{ceremony, custody::{is_legacy, SignerViewingKey}, state::Shared, Config, FetchedConfig, LocalApproval, LocalNotice};
 
 const LOCKED: &str = "Unlock LokiSigner to view vault addresses.";
 const LIST_ERROR: &str = "LokiSigner could not list vaults.";
 const VAULT_ERROR: &str = "LokiSigner could not verify this vault’s receive address.";
+const UPGRADE_VAULT: &str = "Open this vault in the wallet once to upgrade it.";
 
 struct NativeMember {
     state: Shared,
@@ -66,6 +68,10 @@ fn with_running_member<T>(query: impl FnOnce(&NativeMember) -> Result<T, &'stati
 
 /// Called from a native worker thread, not a Tokio task or the app's main thread.
 pub(crate) fn vault_addresses() -> Result<Vec<Value>, &'static str> {
+    vault_addresses_with(|| {})
+}
+
+fn vault_addresses_with(after_list: impl FnOnce()) -> Result<Vec<Value>, &'static str> {
     with_running_member(|member| {
         let (data, pass) = {
             let session = member.state.session.blocking_read();
@@ -73,6 +79,7 @@ pub(crate) fn vault_addresses() -> Result<Vec<Value>, &'static str> {
             (session.data.clone(), session.passphrase.clone())
         };
         let rows = member.list(&data, &pass);
+        after_list();
         if member.state.session.blocking_read().is_none() {
             return Err(LOCKED);
         }
@@ -105,41 +112,43 @@ impl NativeMember {
             let label = vault_label(&c.name);
             let row = match self.address(data, pass, vault, slot) {
                 Ok((network, address)) => json!({ "name": label, "slot": slot, "network": network, "address": address }),
-                Err(_) => json!({ "name": label, "slot": slot, "error": VAULT_ERROR }),
+                Err(error) => json!({ "name": label, "slot": slot, "error": error }),
             };
             rows.push(row);
         }
         Ok(rows)
     }
 
-    fn address(&self, data: &Path, pass: &str, vault: &str, slot: u16) -> Result<(&'static str, String), String> {
+    fn address(&self, data: &Path, pass: &str, vault: &str, slot: u16) -> Result<(&'static str, String), &'static str> {
         // Don't migrate from vault.sealed or hold any host/cache lock over the Enclave prompt.
         let id = (vault.to_owned(), slot);
-        let cached = self.viewing_keys.lock().map_err(|e| e.to_string())?.get(&id).cloned();
-        let (key, network) = match cached {
-            Some(entry) => entry,
-            None => SignerViewingKey::open(&self.state, data, pass, vault, slot)?,
-        };
-        // Read the seal after any prompt, even when the key was already cached.
-        let raw = Zeroizing::new(ceremony::dir(data, vault)?.read_sealed("vault.sealed", pass).map_err(|e| e.to_string())?);
-        let sealed: Value = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
+        let cached = self.viewing_keys.lock().map_err(|_| VAULT_ERROR)?.get(&id).cloned();
+        let opened = cached.map_or_else(|| SignerViewingKey::open(&self.state, data, pass, vault, slot), Ok);
+        // Read after any prompt, including when the store could not be opened for a legacy vault.
+        let dir = ceremony::dir(data, vault).map_err(|_| VAULT_ERROR)?;
+        let raw = Zeroizing::new(dir.read_sealed("vault.sealed", pass).map_err(|_| VAULT_ERROR)?);
+        let sealed: Value = serde_json::from_slice(&raw).map_err(|_| VAULT_ERROR)?;
+        if is_legacy(&sealed) {
+            return Err(UPGRADE_VAULT);
+        }
+        let (key, network) = opened.map_err(|_| VAULT_ERROR)?;
         if sealed["vault"] != vault || sealed["my_frost_id"] != slot || sealed["network"] != network.label()
             || sealed["key_derivation"] != crate::zip2005::VERSION
         {
-            return Err("vault metadata mismatch".into());
+            return Err(VAULT_ERROR);
         }
-        let address = key.checked_address(&sealed, network)?;
-        self.viewing_keys.lock().map_err(|e| e.to_string())?.entry(id).or_insert((key, network));
+        let address = key.checked_address(&sealed, network).map_err(|_| VAULT_ERROR)?;
+        self.viewing_keys.lock().map_err(|_| VAULT_ERROR)?.entry(id).or_insert((key, network));
         Ok((network.label(), address))
     }
 }
 
 fn vault_label(name: &str) -> &str {
-    // Refuse multiline, terminal controls and bidi overrides. Swift also confines names to a
+    // Refuse multiline, control, format and long labels. Swift also confines names to a
     // single plain-text field separate from trusted labels, addresses, and error messages.
-    if name.chars().any(|c| {
-        c.is_control() || (c.is_whitespace() && c != ' ')
-            || matches!(c, '\u{061c}' | '\u{200e}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    let category = CodePointMapData::<GeneralCategory>::new();
+    if name.chars().count() > 80 || name.chars().any(|c| {
+        c.is_control() || (c.is_whitespace() && c != ' ') || category.get(c) == GeneralCategory::Format
     }) {
         "Name hidden (unsupported characters)"
     } else {
@@ -221,6 +230,15 @@ mod tests {
             "error": "LokiSigner could not verify this vault’s receive address." });
         assert_eq!(vault_addresses().unwrap(), vec![error_row.clone()], "a seal alone isn't enough");
 
+        let mut legacy = sealed.clone();
+        legacy["key_package"] = json!(hex::encode(share.serialize().unwrap()));
+        legacy["vault_secret"] = json!(hex::encode(vs));
+        write(&dir, "vault.sealed", &legacy);
+        let upgrade_row = json!({ "name": "Shared reserve", "slot": SLOT,
+            "error": "Open this vault in the wallet once to upgrade it." });
+        assert_eq!(vault_addresses().unwrap(), vec![upgrade_row.clone()], "legacy seal with no signer store");
+        write(&dir, "vault.sealed", &sealed);
+
         let signer_dir = super::super::ceremony::signer_dir(&data, &id_hex).unwrap();
         let store = SignerStore::create(&signer_dir, Network::Testnet, id, SLOT).unwrap();
         let se = state.config.open_secure_element(&signer_dir, PASS).unwrap();
@@ -237,17 +255,21 @@ mod tests {
             assert_eq!(value, json!({ "vaults": [correct] }));
         }
 
+        write(&dir, "vault.sealed", &legacy);
+        assert_eq!(vault_addresses().unwrap(), vec![upgrade_row], "legacy seal with a cached viewing key");
+
         let other_fvk = zip2005::frost_viewing_key(&ak, &[63; 32]).unwrap();
         let other_address = vault::unified_address(&other_fvk, NetworkType::Test);
         let (_, other_package) = frost::keys::generate_with_dealer(
             3, 2, frost::keys::IdentifierList::Default, rand_core::OsRng,
         ).unwrap();
         for (field, tampered) in [
-            ("group_address", other_address),
-            ("public_package", hex::encode(other_package.serialize().unwrap())),
+            ("group_address", json!(other_address)),
+            ("public_package", json!(hex::encode(other_package.serialize().unwrap()))),
+            ("my_frost_id", json!(SLOT + 1)),
         ] {
             let mut invalid = sealed.clone();
-            invalid[field] = json!(tampered);
+            invalid[field] = tampered;
             write(&dir, "vault.sealed", &invalid);
             assert_eq!(vault_addresses().unwrap(), vec![error_row.clone()], "changed {field}");
         }
@@ -259,15 +281,41 @@ mod tests {
         assert_eq!(vault_addresses().unwrap(), vec![error_row]);
 
         write(&dir, "vault.sealed", &sealed);
-        for hidden in ['\n', '\u{0085}', '\u{2028}', '\u{202e}', '\u{001b}'] {
+        for hidden in ['\n', '\u{0085}', '\u{2028}', '\u{202e}', '\u{001b}', '\u{200b}', '\u{200c}', '\u{200d}', '\u{2060}', '\u{feff}'] {
             ceremony(&dir, &id_hex, &format!("Reserve{hidden}Copy this address instead"));
             let mut safe = correct.clone();
             safe["name"] = json!("Name hidden (unsupported characters)");
             assert_eq!(vault_addresses().unwrap(), vec![safe], "{hidden:?}");
         }
-        *state.session.blocking_write() = None;
+        let max_label = "é".repeat(80);
+        assert_eq!(vault_label(&max_label), max_label);
+        ceremony(&dir, &id_hex, &(max_label + "!"));
+        let mut safe = correct;
+        safe["name"] = json!("Name hidden (unsupported characters)");
+        assert_eq!(vault_addresses().unwrap(), vec![safe]);
+
+        let rows = vault_addresses_with(|| *state.session.blocking_write() = None);
+        assert_eq!(rows, Err("Unlock LokiSigner to view vault addresses."), "profile locked during listing");
         assert_eq!(vault_addresses(), Err("Unlock LokiSigner to view vault addresses."));
         std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
+    fn running_handle_refuses_second_install_and_discards_rows_after_replacement() {
+        let _test = TEST_MEMBER.lock().unwrap();
+        let state = Arc::new(crate::host::state::AppState::new(config(Path::new("unused"))));
+        let scope = NativeScope::install(&state).unwrap();
+        assert_eq!(NativeScope::install(&state).err().as_deref(), Some("LokiSigner is already running."));
+
+        let mut replacement = None;
+        let rows = with_running_member(|_| {
+            drop(scope);
+            replacement = Some(NativeScope::install(&state).unwrap());
+            Ok(vec![json!({ "name": "Old member’s vault" })])
+        });
+        assert!(replacement.is_some());
+        assert_eq!(rows, Err("Unlock LokiSigner to view vault addresses."));
+        assert_eq!(with_running_member(|_| Ok(())), Ok(()));
     }
 
     #[test]
