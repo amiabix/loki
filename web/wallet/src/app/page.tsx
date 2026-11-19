@@ -2119,11 +2119,23 @@ function ReviewApprove({
 
   const isProposer = proposedHere ?? (session && ownSlot !== null ? session.intent.proposer === ownSlot : null);
 
+  if (approved && session?.phase === "failed") {
+    return (
+      <GlassCard className="text-center">
+        <div aria-hidden="true" className="mx-auto mb-4 grid h-14 w-14 place-items-center rounded-full bg-danger/10 text-3xl text-danger">✕</div>
+        <h2 className="mb-2 text-2xl font-semibold text-danger">Payment signing failed</h2>
+        <ErrMsg msg={session.error ?? null} />
+        <p className="text-sm text-muted mb-8">Nothing was sent. Replace or discard it from History.</p>
+        <Btn variant="ghost" onClick={onBack}>Back to History</Btn>
+      </GlassCard>
+    );
+  }
+
   if (approved) {
     return (
       <GlassCard className="text-center">
         <div aria-hidden="true" className="mx-auto mb-4 grid h-14 w-14 place-items-center rounded-full bg-mint/10 text-3xl text-mint">✓</div>
-        <h2 className="mb-2 text-2xl font-semibold text-mint">{session?.phase === "failed" ? "Payment signing failed" : "You approved this payment"}</h2>
+        <h2 className="mb-2 text-2xl font-semibold text-mint">You approved this payment</h2>
         <ErrMsg msg={session?.error ?? null} />
         <p className="text-sm text-muted mb-8">
           It needs {vault.threshold} of {vault.members} members. Once enough have approved, the proposer builds the transaction, gives every member a copy, and sends it.
