@@ -1595,6 +1595,12 @@ function VaultOverview({
           />
         )}
         {!address && !loadErr && <p role="status" className="mt-3 text-sm text-muted">Loading receive address…</p>}
+        {signerKind() === "native" && (
+          <p className="mt-3 text-sm leading-relaxed text-muted">
+            Open <strong>Vault addresses…</strong> in LokiSigner. Give senders the address copied from LokiSigner,
+            or compare both addresses before sharing the one shown here.
+          </p>
+        )}
       </GlassCard>
 
       {copyFailed && <ErrMsg msg="Copy failed. Expand and select the full receive address above to copy it manually." />}

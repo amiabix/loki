@@ -119,16 +119,43 @@ fn opened_viewing_key(
     slot: u16,
     sealed: &Value,
 ) -> Result<FullViewingKey, String> {
-    // Never signs: no payment is approved through this signer.
-    let signer = open_signer(st, data, pass, vault, slot, Box::new(|_| false))?;
-    let (public, fvk) = signer.hosted_metadata().map_err(|e| e.to_string())?;
+    let (key, _) = SignerViewingKey::open(st, data, pass, vault, slot)?;
     let network = VaultNetwork::parse(sealed["network"].as_str().unwrap_or(""))?;
-    if sealed["public_package"].as_str() != Some(&hex::encode(public.serialize().map_err(|e| e.to_string())?))
-        || sealed["group_address"].as_str() != Some(&vault::unified_address(&fvk, network.network_type()))
-    {
-        return Err("the signer's share differs from this vault's public metadata".into());
+    key.checked_address(sealed, network)?;
+    Ok(key.fvk)
+}
+
+/// Store-derived values, kept together so the native window can recheck a fresh seal on cache hits.
+#[derive(Clone)]
+pub(super) struct SignerViewingKey {
+    fvk: FullViewingKey,
+    public_package: String,
+}
+
+impl SignerViewingKey {
+    pub(super) fn open(
+        st: &AppState, data: &Path, pass: &str, vault: &str, slot: u16,
+    ) -> Result<(Self, VaultNetwork), String> {
+        // Never signs: no payment is approved through this signer.
+        let signer = open_signer(st, data, pass, vault, slot, Box::new(|_| false))?;
+        let (public, fvk) = signer.hosted_metadata().map_err(|e| e.to_string())?;
+        let network = match signer.network() {
+            Network::Regtest => VaultNetwork::Regtest,
+            Network::Testnet => VaultNetwork::Testnet,
+        };
+        let public_package = hex::encode(public.serialize().map_err(|e| e.to_string())?);
+        Ok((Self { fvk, public_package }, network))
     }
-    Ok(fvk)
+
+    pub(super) fn checked_address(&self, sealed: &Value, network: VaultNetwork) -> Result<String, String> {
+        let address = vault::unified_address(&self.fvk, network.network_type());
+        if sealed["public_package"].as_str() != Some(&self.public_package)
+            || sealed["group_address"].as_str() != Some(&address)
+        {
+            return Err("the signer's share differs from this vault's public metadata".into());
+        }
+        Ok(address)
+    }
 }
 
 /// Whether `vault.sealed` still carries the share or the vault secret.

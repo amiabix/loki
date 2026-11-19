@@ -202,8 +202,22 @@ pub unsafe extern "C" fn loki_member_app_configuration(launch: *const std::ffi::
     })
 }
 
-/// Frees a string returned by [`loki_member_app_configuration`] or
-/// [`loki_member_app_pairing_target`].
+/// Lists active vault receive addresses for the running native member, as `{"vaults": [...]}`
+/// or `{"error": "..."}`. Call off the main thread: opening a signer may prompt for Touch ID.
+/// Free the result (which may be null) with [`loki_member_app_free`].
+#[cfg(feature = "relay-communication")]
+#[no_mangle]
+pub extern "C" fn loki_member_app_vault_addresses() -> *mut std::ffi::c_char {
+    let reply = match std::panic::catch_unwind(crate::host::native_vault_addresses) {
+        Ok(Ok(vaults)) => serde_json::json!({ "vaults": vaults }),
+        Ok(Err(error)) => serde_json::json!({ "error": error }),
+        Err(_) => serde_json::json!({ "error": "LokiSigner could not list vaults." }),
+    };
+    std::ffi::CString::new(reply.to_string()).map_or(std::ptr::null_mut(), std::ffi::CString::into_raw)
+}
+
+/// Frees a string returned by [`loki_member_app_configuration`],
+/// [`loki_member_app_pairing_target`] or [`loki_member_app_vault_addresses`].
 ///
 /// # Safety
 /// `value` must be null or a pointer one of those functions returned, freed only once.
@@ -258,7 +272,7 @@ pub unsafe extern "C" fn loki_member_app_pair(
             Some(link) => crate::host::RegistrationConfig::pairing(&link, config.development_http)?,
             None => crate::host::RegistrationConfig::resume(&config.data, config.development_http)?,
         });
-        crate::host::run_local(config, Some(pass), Some(notice.clone()), Some(native_approval(approve)), fetched)
+        crate::host::run_native(config, pass, notice.clone(), native_approval(approve), fetched)
     }));
     match result {
         Ok(Ok(())) => 0,

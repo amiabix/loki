@@ -42,6 +42,20 @@ The app stays running for ceremony, payment review and signing using the existin
 consent and nonce-witness paths. Quit locks the process; launch again to unlock and register
 with the saved public coordinator/slot, without reusing the claim.
 
+## Verify a receive address
+
+In the **LokiSigner** menu, open **Vault addresses…**. Each active vault shows its network,
+your member slot, and the full receive address with a **Copy address** button. macOS may ask
+for Touch ID when LokiSigner first opens a vault's signer store. Use **Refresh** if you finish
+setting up a vault while the window is open.
+
+Give senders the address copied from LokiSigner, or compare the full addresses before sharing
+the one on the wallet page. A page served by the coordinator could substitute a different
+address and redirect deposits. LokiSigner derives the address from the device-bound signer's
+group viewing key and checks it against the local public metadata. If it cannot verify a
+vault's address, it shows an error and offers nothing to copy. Vault names are creator-supplied
+labels, not instructions from LokiSigner.
+
 ## Signer configuration
 
 LokiSigner needs no terminal or flags. Its network, frostd relay, lightwalletd and the two
