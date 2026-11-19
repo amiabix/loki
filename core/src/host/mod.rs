@@ -65,22 +65,24 @@ pub(crate) const HIDDEN_VAULT_NAME: &str = "Name hidden (unsupported characters)
 
 /// The creator's vault name as LokiSigner shows it, in the roster dialog and in
 /// "Vault addresses…". A name is shown as written or hidden whole, never cleaned: hidden when
-/// it is longer than 80 characters or holds a control character, whitespace other than a
+/// it has no letter, is longer than 80 characters or holds a control character, whitespace other than a
 /// space, a format character (Cf, such as bidi overrides and zero-width joiners), a default
 /// ignorable character (such as variation selectors and U+034F), or a run of more than three
 /// combining marks, which draw outside a one-line box.
 pub(crate) fn vault_label(name: &str) -> &str {
-    use icu_properties::{props::{DefaultIgnorableCodePoint, GeneralCategory}, CodePointMapData, CodePointSetData};
+    use icu_properties::{props::{DefaultIgnorableCodePoint, GeneralCategory, GeneralCategoryGroup}, CodePointMapData, CodePointSetData};
     let category = CodePointMapData::<GeneralCategory>::new();
     let ignorable = CodePointSetData::new::<DefaultIgnorableCodePoint>();
     let mut marks = 0;
+    let mut has_letter = false;
     let unsupported = name.chars().count() > 80 || name.chars().any(|c| {
         let general = category.get(c);
+        has_letter |= GeneralCategoryGroup::Letter.contains(general);
         marks = if matches!(general, GeneralCategory::NonspacingMark | GeneralCategory::EnclosingMark) { marks + 1 } else { 0 };
         c.is_control() || (c.is_whitespace() && c != ' ') || general == GeneralCategory::Format
             || ignorable.contains(c) || marks > 3
     });
-    if unsupported { HIDDEN_VAULT_NAME } else { name }
+    if unsupported || !has_letter { HIDDEN_VAULT_NAME } else { name }
 }
 
 /// The signer's [`ApprovalPolicy`](crate::signer::local::ApprovalPolicy): route each request
@@ -346,12 +348,13 @@ mod tests {
 
     #[test]
     fn a_vault_name_is_shown_as_written_or_hidden_whole() {
-        for shown in ["Household", "Friends’ vault", "Tiền nhà", "Tie\u{0323}\u{0302}n", "家族 🏠", &"é".repeat(80)] {
+        for shown in ["Household", "Friends’ vault", "Tiền nhà", "Tie\u{0323}\u{0302}n", "家族 🏠", "2026年", &"é".repeat(80)] {
             assert_eq!(super::vault_label(shown), shown, "{shown:?}");
         }
         let marks = |n: usize| format!("Rent{}", "\u{0301}".repeat(n));
         assert_eq!(super::vault_label(&marks(3)), marks(3));
         for hidden in [
+            "1234 5678 9012 3456 7890 1234".into(), "１２３４".into(), "1234-5678".into(), "1234\u{05b0}".into(),
             "Rent\nChoose Codes match".to_owned(), "a\u{0085}b".into(), "a\u{2028}b".into(), "a\u{202e}b".into(),
             "a\u{001b}[2Jb".into(), "a\u{200b}b".into(), "a\u{feff}b".into(), "a\tb".into(),
             // Format and default ignorable characters the review found shown as written.

@@ -246,7 +246,11 @@ fn endpoint(url: &str, development_http: bool, what: &str) -> Result<(), String>
     if !url.is_ascii() || url.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control()) { return Err(refused()); }
     let parsed = reqwest::Url::parse(url).map_err(|_| refused())?;
     let loopback = matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    // Check the spelling shown to the member: URL parsing can normalize a path to `/`.
+    let authority_and_path = url[parsed.scheme().len()..].strip_prefix("://").ok_or_else(&refused)?;
+    let root_only = authority_and_path.find(['/', '\\']).is_none_or(|i| &authority_and_path[i..] == "/");
     if !parsed.username().is_empty() || parsed.password().is_some() || parsed.query().is_some() || parsed.fragment().is_some()
+        || !root_only
         || !(parsed.scheme() == "https" || (development_http && loopback && parsed.scheme() == "http")) {
         return Err(refused());
     }
@@ -447,6 +451,14 @@ mod tests {
         let mut plaintext = served();
         plaintext["lightwalletdUrl"] = json!("http://lwd.example:9067");
         bad.push((plaintext, "lightwalletd URL is not a plain HTTPS URL"));
+        for (field, what, url) in [
+            ("frostdUrl", "frostd URL", "https://frostd.example/rpc"),
+            ("lightwalletdUrl", "lightwalletd URL", "https://lwd.example:443/rpc/.."),
+        ] {
+            let mut with_path = served();
+            with_path[field] = json!(url);
+            bad.push((with_path, what));
+        }
         let mut plaintext = served();
         plaintext["nonceWitnesses"][1]["endpoint"] = json!("http://w2.example");
         bad.push((plaintext, "nonce witness endpoint is not a plain HTTPS origin"));
@@ -500,7 +512,7 @@ mod tests {
             assert!(!error.contains("wallet.good") && !error.contains("frostd.example"), "{error}");
         }
         assert!(endpoint("https://frostd.example", false, "frostd URL").is_ok());
-        assert!(endpoint("https://lwd.example:443", false, "lightwalletd URL").is_ok());
+        assert!(endpoint("https://lwd.example:443/", false, "lightwalletd URL").is_ok());
     }
 
     #[test]
