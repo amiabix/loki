@@ -6,7 +6,7 @@ Loki splits a vault's spending key into FROST shares, one per member. Any `t` of
 members must approve and sign a payment together; fewer than `t` cannot spend, and no
 server ever holds a share.
 
-![Loki wallet](docs/images/loki-wallet.jpg)
+![Loki](docs/images/loki-banner.jpg)
 
 > **Testnet only.** Loki is not ready for real funds and refuses mainnet. Use disposable
 > testnet ZEC.
@@ -93,7 +93,6 @@ signer, see [`poc/signer-app/README.md`](poc/signer-app/README.md).
 | `poc/signer-app/` | LokiSigner, the native macOS signer |
 | `poc/src/host/` | The native member app: vault setup, payments, recovery |
 | `communication/deploy/` | Deploy scripts for relays and fronts |
-| `docs/product/` | Architecture, security model and roadmap |
 
 Built on the Zcash Foundation's audited FROST crates and its `frostd` relay.
 
