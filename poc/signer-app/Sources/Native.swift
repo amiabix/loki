@@ -39,7 +39,7 @@ func retryAlert(_ failure: SignerStartFailure, profile: String?) -> NSAlert {
     let alert = NSAlert()
     alert.messageText = failure == .cancelled ? "LokiSigner paused" : "LokiSigner couldn’t continue"
     alert.informativeText = failure.message
-    if profile == "vault", [.differentPairing, .wrongProfile, .registrationRefused].contains(failure) {
+    if profile == "vault", [.differentPairing, .notFresh, .wrongProfile, .registrationRefused].contains(failure) {
         alert.informativeText += "\n\n" + SignerStartFailure.protectedProfile.message
     }
     alert.addButton(withTitle: "Try again")
@@ -54,6 +54,14 @@ func setAsideAlert() -> NSAlert {
     alert.informativeText = "LokiSigner will move the entire local data folder, including this profile’s identity and pairing settings, to a dated folder beside it. Nothing will be deleted. You can then pair a new signer or restore from recovery words."
     alert.addButton(withTitle: "Cancel")
     alert.addButton(withTitle: "Set aside and start over")
+    return alert
+}
+
+func registrationWarningAlert(_ message: String) -> NSAlert {
+    let alert = NSAlert()
+    alert.messageText = "LokiSigner is running"
+    alert.informativeText = message
+    alert.addButton(withTitle: "OK")
     return alert
 }
 
@@ -232,6 +240,11 @@ private func nativeConfirmRoster(_ summary: UnsafePointer<CChar>?) -> Int32 {
 private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointer<CChar>?) {
     guard let kind = kind, let message = message else { return }
     let event = String(cString: kind), text = String(cString: message)
+    if event == "registration-warning" {
+        // Rust supplies fixed copy here. Don't block its retry loop on an open dialog.
+        DispatchQueue.main.async { (NSApp.delegate as? NativeSigner)?.warnRegistration(text) }
+        return
+    }
     // Synchronous delivery keeps recovery words on screen before registration continues.
     DispatchQueue.main.sync {
         let alert = NSAlert()
@@ -263,7 +276,15 @@ private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointe
 
 final class NativeSigner: NSObject, NSApplicationDelegate {
     private var running = false
-    private var prompting = false
+    private var prompting = false {
+        didSet {
+            if !prompting, let message = registrationWarning {
+                registrationWarning = nil
+                DispatchQueue.main.async { self.warnRegistration(message) }
+            }
+        }
+    }
+    private var registrationWarning: String?
     private var opened = false
     private var cleanupNeeded = true
     private var retryLink: String?
@@ -322,8 +343,12 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
     private func confirmSetAside() -> Bool {
         guard setAsideAlert().runModal() == .alertSecondButtonReturn else { return false }
         if running {
-            startingOver = true
-            _ = loki_member_app_stop()
+            startingOver = loki_member_app_stop() != 0
+            if !startingOver {
+                DispatchQueue.main.async {
+                    if self.running { self.retry(.setAsideFailed, link: self.retryLink) }
+                }
+            }
         } else {
             finishSetAside()
         }
@@ -348,8 +373,15 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         queuedLink = nil
     }
 
+    fileprivate func warnRegistration(_ message: String) {
+        guard running, !startingOver else { return }
+        if prompting { registrationWarning = message; return }
+        registrationWarningAlert(message).runModal()
+    }
+
     private func stopped(_ failure: SignerStartFailure, link: String?) {
         running = false
+        registrationWarning = nil
         if startingOver {
             startingOver = false
             finishSetAside()
@@ -376,8 +408,9 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
             prompting = false
             return
         }
-        guard let state = profile(cleanupNeeded ? 1 : 0)["profile"] as? String else {
-            retry(.unexpected, link: link)
+        let location = profile(cleanupNeeded ? 1 : 0)
+        guard let state = location["profile"] as? String else {
+            retry(location["error"] as? String == "data-folder-unavailable" ? .dataFolderUnavailable : .unexpected, link: link)
             return
         }
         cleanupNeeded = false

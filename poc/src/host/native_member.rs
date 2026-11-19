@@ -186,28 +186,43 @@ mod tests {
     const SLOT: u16 = 2;
 
     fn config(data: &Path) -> Config {
-        super::super::config_from_args(&[
+        let mut settings = super::super::native_config_from_args(&[
             "--data".into(), data.to_str().unwrap().into(), "--port".into(), "0".into(),
             "--network".into(), "testnet".into(),
-        ]).unwrap()
+        ]).unwrap();
+        settings.secure_element = "software".into();
+        settings
     }
 
     #[test]
-    fn a_running_profile_is_only_set_aside_after_the_native_server_stops() {
+    fn a_paired_native_app_runs_offline_and_only_sets_aside_after_stop() {
         let _test = TEST_MEMBER.lock().unwrap();
         let root = std::env::temp_dir().join(format!("loki-native-stop-{}", uuid::Uuid::new_v4()));
         let data = root.join("LokiSigner");
         crate::profile::create(&data, PASS, "Test member").unwrap();
-        let settings = config(&data);
+        super::super::registration::save_coordinator(&data, "https://127.0.0.1:1", 7).unwrap();
+        let mut settings = config(&data);
+        settings.registration = Some(super::super::RegistrationConfig::resume(&data, false).unwrap());
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let notice: LocalNotice = Arc::new(move |kind, _| { assert_eq!(kind, "ready"); ready_tx.send(()).unwrap(); });
+            let notice: LocalNotice = Arc::new(move |kind, message| {
+                if kind != "recovery" { ready_tx.send((kind.to_owned(), message.to_owned())).unwrap(); }
+            });
             stop_tx.send(run_native(settings, Zeroizing::new(PASS.into()), notice, Arc::new(|_| false),
                 Arc::new(|_| crate::host::RosterAnswer::Differ), None)).unwrap();
         });
         let timeout = std::time::Duration::from_secs(10);
-        ready_rx.recv_timeout(timeout).unwrap();
+        let events: BTreeMap<_, _> = (0..2).map(|_| ready_rx.recv_timeout(timeout).unwrap()).collect();
+        assert_eq!(events["registration-warning"], "LokiSigner couldn’t reach the coordinator. Your profile is unlocked and LokiSigner will keep trying in the background.");
+        let (base, token) = events["ready"].split_once("/#").unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let client = reqwest::Client::new();
+            let status: Value = client.get(format!("{base}/api/recovery-status")).header("x-loki-token", token)
+                .send().await.unwrap().json().await.unwrap();
+            assert_eq!(status["recovery_in_app"], true);
+        });
         assert!(set_aside(&data).is_err());
         assert!(request_stop());
         stop_rx.recv_timeout(timeout).unwrap().unwrap();

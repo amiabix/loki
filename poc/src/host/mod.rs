@@ -187,7 +187,7 @@ pub fn config_from_args(args: &[String]) -> Result<Config, String> {
     let network = value("--network").unwrap_or_else(|| "regtest".into());
     crate::network::VaultNetwork::parse(&network)?;
     Ok(Config {
-        data, port, bind,
+        data, port, bind, native: false,
         registration: RegistrationConfig::from_args(args, flag("--development-http"))?,
         advertise_url: value("--advertise-url"),
         network,
@@ -204,6 +204,14 @@ pub fn config_from_args(args: &[String]) -> Result<Config, String> {
         peers,
         loopback_peers: flag("--allow-loopback-peers"),
     })
+}
+
+#[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+pub(crate) fn native_config_from_args(args: &[String]) -> Result<Config, String> {
+    let mut config = config_from_args(args)?;
+    config.native = true;
+    config.secure_element = "apple".into();
+    Ok(config)
 }
 
 /// Build the axum app and serve on the configured bind IP and port. Blocks.
@@ -253,7 +261,7 @@ fn run_local_with<G>(
             .map_err(|e| format!("bind {addr}: {e}"))?;
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
         config.port = addr.port();
-        let state: state::Shared = std::sync::Arc::new(state::AppState { approval, roster_confirmation, fetched_config: fetched, recovery_in_app: stop.is_some(), ..state::AppState::new(config) });
+        let state: state::Shared = std::sync::Arc::new(state::AppState { approval, roster_confirmation, fetched_config: fetched, ..state::AppState::new(config) });
         let _scope = on_start(&state)?;
         let ready = registration::start(&state, pass, notice.as_ref()).await?;
         // Member-local output only. Paste into a local browser tab; never send to the coordinator.

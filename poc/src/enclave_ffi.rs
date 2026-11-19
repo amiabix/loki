@@ -184,7 +184,7 @@ unsafe fn native_query(
     std::ffi::CString::new(reply.to_string()).map_or(std::ptr::null_mut(), std::ffi::CString::into_raw)
 }
 
-/// Inspect this Mac's local profile. `action`: 0 inspect, 1 clean restore staging then
+/// Inspect this Mac's local profile. `action`: 0 inspect, 1 try to clean restore staging then
 /// inspect at startup, 2 set aside a stopped, vault-free profile then inspect.
 ///
 /// # Safety
@@ -196,7 +196,7 @@ pub unsafe extern "C" fn loki_member_app_profile(launch: *const std::ffi::c_char
         let data = crate::host::config_from_args(&launch.args)?.data;
         match action {
             0 => {},
-            1 => crate::host::native_clean_staging(&data)?,
+            1 => crate::host::native_clean_staging(&data),
             2 => crate::host::native_set_aside(&data)?,
             _ => return Err("unknown profile action".into()),
         }
@@ -352,8 +352,7 @@ pub unsafe extern "C" fn loki_member_app_restore_profile(
         struct Launch { args: Vec<String>, restore_origin: String, config: crate::host::NativeConfig }
         let launch: Launch = serde_json::from_slice(std::ffi::CStr::from_ptr(launch).to_bytes()).map_err(|_| error)?;
         let file = std::ffi::CStr::from_ptr(file).to_str().map_err(|_| error)?;
-        let mut config = crate::host::config_from_args(&launch.args).map_err(|_| error)?;
-        config.secure_element = "apple".into();
+        let mut config = crate::host::native_config_from_args(&launch.args).map_err(|_| error)?;
         let fetched = launch.config.apply_restore(&mut config, &launch.args, &launch.restore_origin).map_err(|_| error)?;
         crate::host::native_restore_new(&mut config, &pass, words, std::path::Path::new(file), &launch.restore_origin, fetched.as_ref())?;
         published = true;
@@ -404,9 +403,8 @@ pub unsafe extern "C" fn loki_member_app_pair(
         #[serde(deny_unknown_fields)]
         struct Launch { args: Vec<String>, pairing_url: Option<String>, config: crate::host::NativeConfig }
         let launch: Launch = serde_json::from_str(std::ffi::CStr::from_ptr(launch).to_str().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-        let mut config = crate::host::config_from_args(&launch.args)?;
+        let mut config = crate::host::native_config_from_args(&launch.args)?;
         if config.registration.is_some() { return Err("native pairing accepts registration only through its pairing link".into()); }
-        config.secure_element = "apple".into();
         config.validate_secure_element()?;
         // The values the member reviewed, checked again; never fetched a second time. A fetched
         // configuration is saved only after the profile unlocks.

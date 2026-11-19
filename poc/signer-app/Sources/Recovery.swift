@@ -6,7 +6,7 @@ enum SignerStartFailure: Error, Equatable {
     case emptyPassphrase, unlock, deviceKey, registrationRefused, registrationFailed, unexpected
     case missingRecoveryInput, missingRecoveryWords, invalidBackup, backupMismatch, wrongProfile
     case vaultExists, rosterUnavailable, rosterMismatch, restoredButStopped, unlockToRestore
-    case protectedProfile, setAsideFailed
+    case notFresh, dataFolderUnavailable, protectedProfile, setAsideFailed
 
     var message: String {
         switch self {
@@ -32,6 +32,8 @@ enum SignerStartFailure: Error, Equatable {
         case .rosterMismatch: return "The coordinator’s member list doesn’t show exactly one slot for this backup. Check that you entered the original coordinator and try again."
         case .restoredButStopped: return "Your vault was saved. Try unlocking again; you don’t need your recovery words."
         case .unlockToRestore: return "Unlock LokiSigner before restoring another vault."
+        case .notFresh: return "This data folder is no longer ready for a first restore. If the profile has no vaults, set it aside and try again."
+        case .dataFolderUnavailable: return "LokiSigner’s data folder points to a location this Mac can’t open. Reconnect the drive or fix the folder link, then try again."
         case .protectedProfile: return "This profile holds vault data that may include a share. LokiSigner won’t set it aside. To restore a different member, use another Mac or macOS account."
         case .setAsideFailed: return "LokiSigner couldn’t set aside this profile. Try again."
         }
@@ -127,7 +129,8 @@ func recoveryError(_ reply: UnsafeMutablePointer<CChar>?) -> SignerStartFailure?
         case "Choose a valid LokiSigner recovery backup file (at most 256 KiB).": return .invalidBackup
         case "This backup or these recovery words do not match the unlocked LokiSigner profile.": return .wrongProfile
         case "This vault already has data in the profile. LokiSigner did not replace it.": return .vaultExists
-        case "First-run recovery needs a new LokiSigner profile directory.": return .wrongProfile
+        case "First-run recovery needs a new LokiSigner profile directory.": return .notFresh
+        case "data-folder-unavailable": return .dataFolderUnavailable
         case "LokiSigner could not read the coordinator roster. Check the coordinator and try again.": return .rosterUnavailable
         case "The coordinator roster does not identify exactly one slot for this backup.": return .rosterMismatch
         case "Vault restored to this Mac, but LokiSigner could not start. Try unlocking again; your recovery words are not needed.": return .restoredButStopped

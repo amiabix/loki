@@ -5,7 +5,7 @@ use std::{fs, io::Read, path::{Path, PathBuf}};
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
-use super::{ceremony::{self, RecoveryBackup}, recovery, registration::{self, PublicMember, RESTORE_PENDING}, state::Shared, Config, FetchedConfig, RegistrationConfig};
+use super::{ceremony::{self, RecoveryBackup}, recovery, registration::{self, PublicMember, RESTORE_PENDING}, state::{write_native_key_scope, Shared, NATIVE_KEY_SCOPE}, Config, FetchedConfig, RegistrationConfig};
 use crate::{setup_transport::{Identity, PublicIdentity}, signer::{recovery::RecoveryKey, Network}, state::MemberDir};
 
 pub(crate) const REFUSED: &str = "LokiSigner could not restore this vault. Check the recovery words and backup, then try again.";
@@ -14,6 +14,7 @@ const BAD_FILE: &str = "Choose a valid LokiSigner recovery backup file (at most 
 const WRONG_PROFILE: &str = "This backup or these recovery words do not match the unlocked LokiSigner profile.";
 const ALREADY_PRESENT: &str = "This vault already has data in the profile. LokiSigner did not replace it.";
 const NOT_FRESH: &str = "First-run recovery needs a new LokiSigner profile directory.";
+const DATA_LOCATION: &str = "data-folder-unavailable";
 const ROSTER_UNAVAILABLE: &str = "LokiSigner could not read the coordinator roster. Check the coordinator and try again.";
 const ROSTER_MISMATCH: &str = "The coordinator roster does not identify exactly one slot for this backup.";
 
@@ -110,47 +111,55 @@ fn parent(data: &Path) -> &Path {
     data.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."))
 }
 
-pub(crate) fn clean_staging(data: &Path) -> Result<(), &'static str> {
-    let name = data.file_name().ok_or(REFUSED)?;
-    // Refuse a symlink as the data root before inspecting its children.
-    drop(entries(data)?);
-    for (dir, sibling) in [(parent(data), true), (&data.join("vaults"), false)] {
-        for entry in entries(dir)? {
-            let entry = entry?;
-            if !(sibling && entry.file_name() == name) && staging_dir(&entry) {
-                let active = match fs::File::open(entry.path()) {
-                    Ok(file) => file,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(_) => return Err(REFUSED),
-                };
+fn data_location(data: &Path) -> Result<PathBuf, &'static str> {
+    // The configured root may be a symlink. Don't follow symlinks among its contents.
+    if let Some(name) = data.file_name() {
+        let link = parent(data).join(name); // Inspect the last component without a trailing slash.
+        if fs::symlink_metadata(&link).is_ok_and(|m| m.is_symlink()) {
+            return link.canonicalize().ok().filter(|path| path.is_dir()).ok_or(DATA_LOCATION);
+        }
+    }
+    Ok(data.to_owned())
+}
+
+pub(crate) fn clean_staging(data: &Path) {
+    let Ok(data) = data_location(data) else { return };
+    let paths = [(parent(&data).canonicalize().ok(), data.file_name()), (Some(data.join("vaults")), None)];
+    for (dir, skip) in paths {
+        let Some(dir) = dir else { continue };
+        let Ok(entries) = entries(&dir) else { continue };
+        for entry in entries.flatten() {
+            if Some(entry.file_name().as_os_str()) != skip && staging_dir(&entry) {
+                let Ok(active) = fs::File::open(entry.path()) else { continue };
                 // A different signer launch using the same parent may be restoring now.
-                if active.try_lock().is_ok() { fs::remove_dir_all(entry.path()).map_err(|_| REFUSED)?; }
+                if active.try_lock().is_ok() { let _ = fs::remove_dir_all(entry.path()); }
             }
         }
     }
-    Ok(())
 }
 
 /// Treat even partial ceremonies and unreadable vaults as belonging to the member.
 pub(crate) fn profile_state(data: &Path) -> Result<&'static str, &'static str> {
     let mut material = false;
-    for entry in entries(data)? {
+    for entry in entries(&data_location(data)?)? {
         let entry = entry?;
         let name = entry.file_name();
         let kind = entry.file_type().map_err(|_| REFUSED)?;
         match name.to_str() {
-            Some("vaults" | "card") => {
+            Some("vaults") => {
                 if !kind.is_dir() { return Ok("vault"); }
                 for child in entries(&entry.path())? {
-                    if name != "vaults" || !staging_dir(&child?) { return Ok("vault"); }
+                    if !staging_dir(&child?) { return Ok("vault"); }
                 }
             }
-            Some("vault.card" | "vault.sealed" | "share.sealed") => return Ok("vault"),
+            Some("card" | "vault.card" | "vault.sealed" | "share.sealed") => return Ok("vault"),
             Some("profile" | "device-auth") => {
                 material |= !kind.is_dir() || entries(&entry.path())?.next().transpose()?.is_some();
             }
-            Some("recovery.pub" | "devices.json" | RESTORE_PENDING) => material = true,
-            _ => material |= entry.path().extension().is_some_and(|ext| ext == "sealed"),
+            // Allow only known files left by an interrupted native startup; everything else
+            // requires explicit confirmation, even when we don't understand its contents.
+            Some(NATIVE_KEY_SCOPE | "paired-coordinator.json.tmp" | "signer-config.json.tmp" | "nonce-witnesses.json.tmp") if kind.is_file() => {},
+            _ => material = true,
         }
     }
     Ok(if material { "profile" } else { "fresh" })
@@ -164,8 +173,14 @@ fn archive(data: &Path) -> Result<(), &'static str> {
 }
 
 pub(crate) fn set_aside(data: &Path) -> Result<(), &'static str> {
-    match profile_state(data)? {
-        "profile" => archive(data),
+    let dest = data_location(data)?;
+    match profile_state(&dest)? {
+        "profile" => {
+            archive(&dest)?;
+            // Preserve a root symlink and give it a fresh target to pair or restore into.
+            if dest != data { MemberDir::create(&dest, "").map_err(|_| REFUSED)?; }
+            Ok(())
+        }
         "vault" => Err("vault"),
         _ => Err(REFUSED),
     }
@@ -217,16 +232,17 @@ pub(crate) fn restore_new(
     let slot = restored_slot(&identity, &read_roster(&origin)?)?;
 
     let name = "Member";
-    let parent = parent(&config.data);
+    let data = data_location(&config.data)?;
+    let parent = parent(&data);
     fs::create_dir_all(parent).map_err(|_| REFUSED)?;
     let parent = parent.canonicalize().map_err(|_| REFUSED)?;
-    let dest = parent.join(config.data.file_name().ok_or(NOT_FRESH)?);
+    let dest = parent.join(data.file_name().ok_or(NOT_FRESH)?);
     let staged = Stage::new(&parent)?;
     let vault = hex::encode(backup.material.vault_id);
     let vault_dir = MemberDir::open(&staged.path.join("vaults"), &vault);
     let final_key_dir = dest.join("vaults").join(&vault).join("signer");
     crate::profile::create(&staged.path, pass, name).map_err(|_| REFUSED)?;
-    registration::write_device_scope(&staged.path).map_err(|_| REFUSED)?;
+    write_native_key_scope(&staged.path).map_err(|_| REFUSED)?;
     ceremony::restore_opened_backup(backup, &staged.path, &vault_dir, pass, config, Some(&final_key_dir)).map_err(|_| REFUSED)?;
     registration::save_coordinator(&staged.path, &origin, slot).map_err(|_| REFUSED)?;
     if let Some(fetched) = fetched { fetched.save_unlocked(&staged.path).map_err(|_| REFUSED)?; }
@@ -276,15 +292,27 @@ mod tests {
         fs::create_dir_all(&data).unwrap();
         assert_eq!(profile_state(&data), Ok("fresh"));
         for dir in ["profile", "device-auth", "vaults"] { fs::create_dir(data.join(dir)).unwrap(); }
-        fs::write(data.join("attempt.txt"), b"leftover").unwrap();
+        write_native_key_scope(&data).unwrap();
         assert_eq!(profile_state(&data), Ok("fresh"));
-        for name in ["profile/profile.sealed", "identity.sealed", "recovery.pub", "device-auth/login.sealed"] {
+        for name in ["profile/profile.sealed", "identity.sealed", "recovery.pub", "device-auth/login.sealed", "devices.json", RESTORE_PENDING] {
             fs::write(data.join(name), []).unwrap();
             assert_eq!(profile_state(&data), Ok("profile"), "{name}");
             fs::remove_file(data.join(name)).unwrap();
         }
         fs::create_dir(data.join("vaults/partial-vault")).unwrap();
         assert_eq!(profile_state(&data), Ok("vault"));
+        fs::remove_dir_all(data.join("vaults")).unwrap();
+        fs::create_dir(data.join("card")).unwrap();
+        assert_eq!(profile_state(&data), Ok("vault"), "legacy card directory");
+        fs::remove_dir(data.join("card")).unwrap();
+        for name in ["vault.card", "vault.sealed", "share.sealed", "vaults"] {
+            fs::write(data.join(name), []).unwrap();
+            assert_eq!(profile_state(&data), Ok("vault"), "{name}");
+            fs::remove_file(data.join(name)).unwrap();
+        }
+        fs::create_dir(data.join("signer")).unwrap();
+        fs::write(data.join("signer/share.sealed"), b"unrecognised layout").unwrap();
+        assert_eq!(profile_state(&data), Ok("profile"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -296,8 +324,8 @@ mod tests {
         crate::profile::create(&data, pass, "Old member").unwrap();
         let original = fs::read(data.join("profile/profile.sealed")).unwrap();
         fs::write(data.join("identity.sealed"), b"old identity fixture").unwrap();
-        registration::write_device_scope(&data).unwrap();
-        let scope = fs::read(data.join(registration::DEVICE_SCOPE)).unwrap();
+        write_native_key_scope(&data).unwrap();
+        let scope = fs::read(data.join(NATIVE_KEY_SCOPE)).unwrap();
         let vault = data.join("vaults/member-vault/signer");
         fs::create_dir_all(&vault).unwrap();
         fs::write(vault.join("share.sealed"), b"share fixture").unwrap();
@@ -312,9 +340,9 @@ mod tests {
         assert!(archived.file_name().to_string_lossy().starts_with("LokiSigner-set-aside-"));
         assert_eq!(fs::read(archived.path().join("profile/profile.sealed")).unwrap(), original);
         assert_eq!(fs::read(archived.path().join("identity.sealed")).unwrap(), b"old identity fixture");
-        assert_eq!(fs::read(archived.path().join(registration::DEVICE_SCOPE)).unwrap(), scope);
-        registration::write_device_scope(&data).unwrap();
-        assert_ne!(fs::read(data.join(registration::DEVICE_SCOPE)).unwrap(), scope);
+        assert_eq!(fs::read(archived.path().join(NATIVE_KEY_SCOPE)).unwrap(), scope);
+        write_native_key_scope(&data).unwrap();
+        assert_ne!(fs::read(data.join(NATIVE_KEY_SCOPE)).unwrap(), scope);
         assert_eq!(profile_state(&data), Ok("fresh"));
         fs::remove_dir_all(root).unwrap();
     }
@@ -336,7 +364,7 @@ mod tests {
                 dir.join(format!(".loki-restore-{}", uuid::Uuid::new_v4()))).unwrap();
         }
         let active = Stage::new(&root).unwrap();
-        clean_staging(&data).unwrap();
+        clean_staging(&data);
         assert!(active.path.is_dir());
         for dir in [&root, &data.join("vaults")] {
             assert!(!dir.join(&staging).exists());
@@ -346,6 +374,44 @@ mod tests {
             #[cfg(unix)]
             assert!(fs::read_dir(dir).unwrap().any(|e| e.unwrap().file_type().unwrap().is_symlink()));
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_resolves_a_symlinked_parent_before_cleaning_staging() {
+        let root = std::env::temp_dir().join(format!("loki-stage-parent-link-{}", uuid::Uuid::new_v4()));
+        let actual = root.join("actual");
+        let alias = root.join("alias");
+        let stale = actual.join(format!(".loki-restore-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&stale).unwrap();
+        std::os::unix::fs::symlink(&actual, &alias).unwrap();
+        let data = alias.join("LokiSigner");
+        clean_staging(&data);
+        assert!(!stale.exists());
+        assert_eq!(profile_state(&data), Ok("fresh"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_data_root_stays_usable_after_cleanup_and_set_aside() {
+        let root = std::env::temp_dir().join(format!("loki-data-link-{}", uuid::Uuid::new_v4()));
+        let target = root.join("actual/LokiSigner");
+        let alias = root.join("alias");
+        let stale = target.join("vaults").join(format!(".loki-restore-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&stale).unwrap();
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        clean_staging(&alias);
+        assert!(!stale.exists());
+        assert_eq!(profile_state(&alias), Ok("fresh"));
+        crate::profile::create(&target, "old passphrase", "Old member").unwrap();
+        assert_eq!(profile_state(&alias), Ok("profile"));
+        set_aside(&alias).unwrap();
+        assert_eq!(fs::read_link(&alias).unwrap(), target);
+        assert_eq!(profile_state(&alias), Ok("fresh"));
+        let archived = fs::read_dir(parent(&target)).unwrap().map(|e| e.unwrap().path()).find(|p| *p != target).unwrap();
+        assert!(crate::profile::open(&archived, "old passphrase").is_ok());
         fs::remove_dir_all(root).unwrap();
     }
 }

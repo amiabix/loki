@@ -41,14 +41,19 @@ On the wallet's sign-in screen open **Use a native member app instead**. It has 
 
 The app stays running for ceremony, payment review and signing using the existing device
 consent and nonce-witness paths. Quit locks the process; launch again to unlock and register
-with the saved public coordinator/slot, without reusing the claim.
+with the saved public coordinator/slot, without reusing the claim. With saved settings, you can
+unlock and use local features such as **Vault addresses…** and **Restore a vault…** while the
+coordinator is offline. If registration fails or is refused, LokiSigner shows a warning, stays
+unlocked and keeps trying in the background. A launch with a new pairing link waits for the
+registration result before reporting success.
 
 If you cancel, enter the wrong passphrase, or LokiSigner cannot start, choose **Try again**
 or **Quit**. If the coordinator refuses a pairing, retry the saved pairing or get a new link
 from the wallet. When the existing profile has no vault data, **Start over…** lets you set it
 aside before pairing or restoring. LokiSigner moves the whole data folder to a dated sibling;
-it deletes neither the folder nor the old device key in the Keychain. New native profiles use a
-different device login key, even at the same path. Existing vault share keys do not change.
+it deletes neither the folder nor the old device key in the Keychain. New native profiles save
+a random key scope and use a different device login key, even at the same path. That key stays
+with its profile if the folder is moved. Existing vault share key tags do not change.
 
 ## Back up and restore a vault
 
@@ -70,14 +75,16 @@ again and uses a different slot only when exactly one entry matches both public 
 You won't need the words again to reconnect. Once connected, use the private link to pair the
 wallet tab on the new Mac.
 
-An absent or empty data folder is not required. Restore can reuse the location after a failed
-attempt if it contains no profile, identity, or vault material. Profiles or keys in `profile/`
-or `device-auth/`, top-level `.sealed` files, `recovery.pub`, the device registry, and a pending
-restore marker all block direct restore. Any entry in `vaults/` or the legacy `card/` folder
-counts as vault data, even if it is only a partial setup; top-level `vault.card`, `vault.sealed`,
-and `share.sealed` count too. The exception is a generated `.loki-restore-<UUID>` staging directory
-in `vaults/`. LokiSigner clears those expired staging directories at startup, including siblings
-of the data folder. Other non-profile leftovers are preserved in a dated sibling when restoring.
+Restore can reuse an absent or empty data folder, or one with only recognized leftovers: empty
+`profile/` or `device-auth/` directories, the public `native-key-scope` file, incomplete
+pairing or signer-settings `.tmp` files, and an empty `vaults/` directory or one holding only
+generated restore staging directories. Restore preserves these leftovers in a dated sibling.
+Anything unrecognized requires you to confirm **Start over…** before it is moved. Any other
+entry in `vaults/`, a `vaults` file, a legacy `card` entry, or top-level `vault.card`,
+`vault.sealed`, or `share.sealed` protects the profile from being set aside. LokiSigner tries
+to clear expired `.loki-restore-<UUID>` directories at startup, both in `vaults/` and beside
+the data folder. Symlinks to the data folder still work; set-aside keeps the link pointing to
+the newly emptied location and archives the old contents beside its target.
 
 If you already paired a different member by mistake, choose **Start over…** from the retry
 dialog or when **Restore a vault…** says the backup does not match the running profile. Confirm
