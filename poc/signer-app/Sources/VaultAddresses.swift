@@ -30,7 +30,7 @@ private final class VaultListDocument: NSView {
 final class VaultAddressesWindow: NSObject {
     private lazy var window = makeWindow()
     private let rows = NSStackView()
-    private lazy var refreshButton = NSButton(title: "Refresh", target: self, action: #selector(refresh(_:)))
+    private lazy var refreshButton = LokiButton("Refresh", target: self, action: #selector(refresh(_:)))
     private var addresses: [String] = []
 
     @objc func show(_ sender: Any?) {
@@ -40,18 +40,21 @@ final class VaultAddressesWindow: NSObject {
     }
 
     private func makeWindow() -> NSWindow {
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 720, height: 390),
-            styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 784, height: 454),
+            styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView], backing: .buffered, defer: false)
         window.title = "Vault addresses"
+        window.titlebarAppearsTransparent = true
+        window.appearance = NSAppearance(named: .darkAqua)
         window.isReleasedWhenClosed = false
         window.center()
 
         let intro = NSTextField(wrappingLabelWithString:
             "Share an address copied from LokiSigner, or compare it with the wallet page before sharing. macOS may ask for Touch ID to verify an address.")
+        intro.textColor = Loki.muted
         let scroll = NSScrollView()
         scroll.hasVerticalScroller = true
         scroll.autohidesScrollers = true
-        scroll.borderType = .lineBorder
+        scroll.drawsBackground = false
         let document = VaultListDocument()
         document.translatesAutoresizingMaskIntoConstraints = false
         scroll.documentView = document
@@ -67,13 +70,14 @@ final class VaultAddressesWindow: NSObject {
         content.alignment = .leading
         content.spacing = 12
         content.translatesAutoresizingMaskIntoConstraints = false
-        let root = window.contentView!
-        root.addSubview(content)
+        let card = Loki.box(Loki.surface, radius: 16)
+        card.addSubview(content)
+        Loki.mount(card, in: window.contentView!, inset: 32)
         NSLayoutConstraint.activate([
-            content.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 20),
-            content.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -20),
-            content.topAnchor.constraint(equalTo: root.topAnchor, constant: 16),
-            content.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -16),
+            content.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 20),
+            content.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -20),
+            content.topAnchor.constraint(equalTo: card.topAnchor, constant: 16),
+            content.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -16),
             intro.widthAnchor.constraint(equalTo: content.widthAnchor),
             scroll.widthAnchor.constraint(equalTo: content.widthAnchor),
             document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
@@ -134,7 +138,7 @@ final class VaultAddressesWindow: NSObject {
                 field.setAccessibilityLabel("Receive address")
                 row.addArrangedSubview(field)
                 field.widthAnchor.constraint(equalTo: row.widthAnchor).isActive = true
-                let copy = NSButton(title: "Copy address", target: self, action: #selector(copyAddress(_:)))
+                let copy = LokiButton("Copy address", target: self, action: #selector(copyAddress(_:)))
                 copy.tag = addresses.count
                 addresses.append(address)
                 row.addArrangedSubview(copy)

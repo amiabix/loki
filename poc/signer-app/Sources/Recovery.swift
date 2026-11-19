@@ -14,7 +14,7 @@ func loki_member_app_restore_profile(_ launch: UnsafePointer<CChar>,
     _ confirmRoster: @convention(c) (UnsafePointer<CChar>?) -> Int32) -> UnsafeMutablePointer<CChar>?
 
 func firstRunChoice() -> NSApplication.ModalResponse {
-    let alert = NSAlert()
+    let alert = LokiAlert()
     alert.messageText = "Set up LokiSigner"
     alert.informativeText = "Pair a new signer, or restore your existing member using its 24 recovery words and an encrypted vault backup file."
     alert.addButton(withTitle: "Pair a new signer")
@@ -44,7 +44,7 @@ func restoreInput(newProfile: Bool) -> RecoveryInput? {
     picker.allowedContentTypes = [.json]
     guard picker.runModal() == .OK, let file = picker.url else { return nil }
 
-    let alert = NSAlert()
+    let alert = LokiAlert()
     alert.messageText = "Restore a vault"
     alert.informativeText = "Encrypted backup selected. Enter its 24 recovery words here, never on the wallet page."
     let fields = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: newProfile ? 52 : 22))
@@ -95,7 +95,7 @@ func recoveryError(_ reply: UnsafeMutablePointer<CChar>?) -> String? {
 }
 
 func showRecoveryResult(error: String?) {
-    let alert = NSAlert()
+    let alert = LokiAlert()
     alert.messageText = error == nil ? "Vault restored" : "Could not restore vault"
     alert.informativeText = error ?? "LokiSigner rebuilt your share on this Mac. Reopen your vault list in the wallet to see the restored vault."
     alert.addButton(withTitle: "OK")

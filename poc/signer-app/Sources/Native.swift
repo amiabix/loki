@@ -30,7 +30,7 @@ private func nativeQuery(_ query: (UnsafePointer<CChar>) -> UnsafeMutablePointer
 }
 
 private func showStartError(_ reply: [String: Any]) {
-    let alert = NSAlert()
+    let alert = LokiAlert()
     alert.messageText = "Signer could not start"
     alert.informativeText = reply["error"] as? String ?? "unknown error"
     alert.runModal()
@@ -58,13 +58,13 @@ private func nativeApprove(_ summary: UnsafePointer<CChar>?) -> Int32 {
     var approved = false
     DispatchQueue.main.sync {
         let text = { (key: String) in request[key] as? String ?? "?" }
-        let alert = NSAlert()
+        let alert = LokiAlert()
         alert.alertStyle = .warning
         alert.messageText = "Approve this payment?"
         let memo = text("memo").isEmpty ? "" : "\nMemo: \(text("memo"))"
         let fee = (request["fee_verified"] as? Bool) == true ? zec(request["fee_zat"]) : "\(zec(request["fee_zat"])) (NOT VERIFIED)"
         let member = (request["member"] as? NSNumber)?.stringValue ?? "?"
-        alert.informativeText = """
+        alert.detailText = """
             Recipient: \(text("recipient"))
             Amount: \(zec(request["amount_zat"]))
             Fee: \(fee)
@@ -75,7 +75,8 @@ private func nativeApprove(_ summary: UnsafePointer<CChar>?) -> Int32 {
             Payment: \(text("payment"))
             Attempt: \(text("attempt"))
             Signs: \(text("sighash"))
-
+            """
+        alert.informativeText = """
             LokiSigner read these details from the transaction itself, not from the wallet page. \
             Approve only if they match the payment you intend. Unanswered requests are refused after \(Int(approvalTimeout / 60)) minutes.
             """
@@ -155,7 +156,7 @@ private func nativeConfirmRoster(_ summary: UnsafePointer<CChar>?) -> Int32 {
     else { return 0 }
     var answer: Int32 = 0
     DispatchQueue.main.sync {
-        let alert = NSAlert()
+        let alert = LokiAlert()
         alert.alertStyle = .warning
         alert.messageText = "Do the roster codes match?"
         alert.informativeText = """
@@ -171,7 +172,7 @@ private func nativeConfirmRoster(_ summary: UnsafePointer<CChar>?) -> Int32 {
         let codeLabel = NSTextField(labelWithString: "Roster code")
         codeLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         let codeField = NSTextField(labelWithString: code)
-        codeField.font = .monospacedDigitSystemFont(ofSize: 20, weight: .semibold)
+        codeField.font = .monospacedSystemFont(ofSize: 20, weight: .semibold)
         codeField.isSelectable = true
         let nameLabel = NSTextField(labelWithString: "Vault name (set by creator):")
         nameLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
@@ -188,7 +189,7 @@ private func nativeConfirmRoster(_ summary: UnsafePointer<CChar>?) -> Int32 {
         alert.addButton(withTitle: "Codes match")
         // The dialog takes focus while the member may be typing elsewhere: Return, Space or any
         // other key answers nothing, and the member must click. Lay out first, because
-        // NSAlert assigns its default button there.
+        // the alert assigns its default button there.
         alert.layout()
         for button in alert.buttons {
             button.keyEquivalent = ""
@@ -213,7 +214,7 @@ private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointe
     let event = String(cString: kind), text = String(cString: message)
     // Synchronous delivery keeps recovery words on screen before registration continues.
     DispatchQueue.main.sync {
-        let alert = NSAlert()
+        let alert = LokiAlert()
         if event == "ready" || event == "restore-ready" || event == "restore-pending" {
             alert.messageText = event == "ready" ? "Signer paired and running" : "Vault restored"
             alert.informativeText = event == "restore-pending"
@@ -232,7 +233,7 @@ private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointe
             }
         } else {
             alert.messageText = event == "recovery" ? "Save your recovery words privately" : "Signer could not start"
-            alert.informativeText = text
+            if event == "recovery" { alert.detailText = text } else { alert.informativeText = text }
             alert.addButton(withTitle: event == "recovery" ? "I saved these words" : "OK")
             alert.runModal()
         }
@@ -265,7 +266,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
 
     func start(_ link: String?) {
         if running || prompting {
-            let alert = NSAlert()
+            let alert = LokiAlert()
             alert.messageText = "This signer is already running"
             alert.informativeText = "Quit to lock it before opening another pairing link."
             alert.runModal()
@@ -313,44 +314,47 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
     }
 
     private func confirmCoordinator(_ origin: String, title: String) -> Bool {
-        let alert = NSAlert()
+        let alert = LokiAlert()
         alert.messageText = title
-        alert.informativeText = "Coordinator: \(origin)\n\nOnly continue if this is the coordinator you intended. LokiSigner then asks it for the signer configuration and shows it to you before anything is saved."
+        alert.detailText = "Coordinator: \(origin)"
+        alert.informativeText = "Only continue if this is the coordinator you intended. LokiSigner then asks it for the signer configuration and shows it to you before anything is saved."
         alert.addButton(withTitle: "Continue")
         alert.addButton(withTitle: "Cancel")
         NSApp.activate(ignoringOtherApps: true)
         return alert.runModal() == .alertFirstButtonReturn
     }
 
-    private func configurationText(_ config: [String: Any]) -> String {
+    /// The endpoints, and the note on who chose them.
+    private func configurationText(_ config: [String: Any]) -> (endpoints: String, note: String) {
         let text = { (key: String) in config[key] as? String ?? "none" }
         let witnesses = (config["nonce_witnesses"] as? [String])?.joined(separator: "\n  ") ?? "none"
-        return """
+        return ("""
             Coordinator: \(text("coordinator"))
             Network: \(text("network"))
             frostd: \(text("frostd_url"))
             lightwalletd: \(text("lightwalletd_url"))
             Nonce witnesses:
               \(witnesses)
-
+            """, """
             The coordinator above chose these endpoints, except any you set with launch flags \
             (those apply to this launch only, and then nothing is saved).
-            """
+            """)
     }
 
     /// Shows the configuration before anything is saved; the member continues with exactly it.
     private func confirm(link: String?, launch: [String: Any], reply: [String: Any]) {
         defer { prompting = false }
         guard let config = reply["config"] as? [String: Any] else { showStartError(reply); return }
-        let alert = NSAlert()
+        let alert = LokiAlert()
         let slot = (config["slot"] as? NSNumber)?.stringValue ?? "?"
-        let endpoints = configurationText(config)
+        let (endpoints, note) = configurationText(config)
+        alert.detailText = endpoints
         if link != nil {
             alert.messageText = "Pair this device with slot \(slot)?"
-            alert.informativeText = "\(endpoints)\nCreate or unlock your local profile below. These values are saved once it unlocks."
+            alert.informativeText = "\(note)\nCreate or unlock your local profile below. These values are saved once it unlocks."
         } else {
             alert.messageText = "Unlock your paired signer"
-            alert.informativeText = "\(endpoints)\nFor a new device, cancel and open a pairing link from the wallet. Your passphrase stays in this app."
+            alert.informativeText = "\(note)\nFor a new device, cancel and open a pairing link from the wallet. Your passphrase stays in this app."
         }
         let password = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 420, height: 26))
         password.placeholderString = "Local profile passphrase"
@@ -376,7 +380,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
     }
 
     private func beginRecovery() {
-        let alert = NSAlert()
+        let alert = LokiAlert()
         alert.messageText = "Enter your original coordinator"
         alert.informativeText = "Use the HTTPS origin of the wallet that your old Mac was paired with."
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 420, height: 26))
@@ -406,9 +410,9 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
             showRecoveryResult(error: reply["error"] as? String ?? "LokiSigner could not read the coordinator configuration.")
             return
         }
-        let alert = NSAlert()
+        let alert = LokiAlert()
         alert.messageText = "Review the signer configuration"
-        alert.informativeText = configurationText(config)
+        (alert.detailText, alert.informativeText) = configurationText(config)
         alert.addButton(withTitle: "Continue")
         alert.addButton(withTitle: "Cancel")
         var confirmed = launch
