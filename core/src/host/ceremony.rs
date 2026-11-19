@@ -2340,9 +2340,9 @@ mod tests {
         let mut settings = config();
         let mut wrong_vault = document.clone();
         wrong_vault["vault"] = json!(hex::encode([8; 32]));
-        let refused = "LokiSigner could not restore this vault. Check the recovery words and backup, then try again.";
-        let bad_file = "Choose a valid LokiSigner recovery backup file (at most 256 KiB).";
-        let mismatch = "The coordinator roster does not identify exactly one slot for this backup.";
+        let refused = "restore-refused";
+        let bad_file = "invalid-backup";
+        let mismatch = "roster-mismatch";
         let secret = |words: &str| Zeroizing::new(words.as_bytes().to_vec());
         tokio::task::block_in_place(|| {
             for (contents, input, expected) in [
@@ -2358,6 +2358,8 @@ mod tests {
             }
             assert_eq!(roster_reads.load(Ordering::SeqCst), 0, "invalid backups never reach the roster lookup");
             std::fs::write(&file, document.to_string()).unwrap();
+            assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &format!("{origin}/wallet"), None),
+                Err("roster-unavailable"));
             assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None), Err(mismatch));
             assert!(!data.exists());
             *roster.lock().unwrap() = vec![entry.clone(), entry.clone()];
@@ -2374,7 +2376,7 @@ mod tests {
             std::fs::create_dir_all(data.join("signer")).unwrap();
             std::fs::write(data.join("signer/share.sealed"), b"unrecognised data").unwrap();
             assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None),
-                Err("First-run recovery needs a new LokiSigner profile directory."));
+                Err("profile-not-fresh"));
             assert_eq!(std::fs::read(data.join("signer/share.sealed")).unwrap(), b"unrecognised data");
             std::fs::remove_dir_all(data.join("signer")).unwrap();
             std::fs::create_dir_all(data.join("profile")).unwrap();
@@ -2399,14 +2401,16 @@ mod tests {
 
         let s = state.clone();
         tokio::task::block_in_place(|| {
+            assert_eq!(native_recovery::restore_running(&s, secret(&words), &file), Err("profile-locked"));
             *s.session.blocking_write() = Some(crate::host::state::Session::unlock(data.clone(), Zeroizing::new(pass.into())).unwrap().0);
+            assert_eq!(native_recovery::restore_running(&s, secret(&words), &file), Err("vault-exists"));
             let signer = crate::host::custody::open_signer(&s, &data, pass, &vault_hex, 1, Box::new(|_| false)).unwrap();
             assert_eq!(signer.hosted_metadata().unwrap().0.verifying_key(), public.verifying_key());
 
             // Same words with another member's valid backup must not install into a running profile.
             let (other_member, _, _) = dealer_vault(&root.join("other"), [7; 32], pass);
             std::fs::write(&file, exported(&other_member).to_string()).unwrap();
-            let wrong_profile = "This backup or these recovery words do not match the unlocked LokiSigner profile.";
+            let wrong_profile = "wrong-profile";
             assert_eq!(native_recovery::restore_running(&s, secret(&words), &file), Err(wrong_profile));
             assert!(!dir(&data, &hex::encode([7; 32])).unwrap().path().exists());
 

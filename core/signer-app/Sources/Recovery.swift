@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 
 enum SignerStartFailure: Error, Equatable {
     case cancelled, pairingLinkNeeded, invalidLink, differentPairing, configuration, coordinatorOrigin
+    case savedEndpointsRefreshFailed
     case invalidProfileName, emptyPassphrase, unlock, deviceKey, registrationRefused, registrationFailed, unexpected
     case missingRecoveryInput, missingRecoveryWords, invalidBackup, backupMismatch, wrongProfile
     case vaultExists, rosterUnavailable, rosterMismatch, restoredButStopped, unlockToRestore
@@ -22,6 +23,7 @@ enum SignerStartFailure: Error, Equatable {
         case .invalidLink: return "This pairing link isn’t valid. Get a new link from the wallet and open it in LokiSigner."
         case .differentPairing: return "This link is for a different coordinator or member slot. Unlock your existing profile or use a link for its slot."
         case .configuration: return "LokiSigner couldn’t load its settings. Check your connection and try again."
+        case .savedEndpointsRefreshFailed: return "A saved server address contains a path LokiSigner no longer supports. LokiSigner couldn’t load updated settings from your paired coordinator. Check that you can reach the coordinator, or ask its operator for help, then try again."
         case .coordinatorOrigin: return "Enter the original coordinator’s HTTPS address, without a page or path, and try again."
         case .invalidProfileName: return "Choose a short, single-line profile name without invisible formatting characters, or leave it blank to use Member."
         case .emptyPassphrase: return "Enter your local profile passphrase and try again."
@@ -178,18 +180,19 @@ func recoveryError(_ reply: UnsafeMutablePointer<CChar>?) -> SignerStartFailure?
     if let reply,
        let result = try? JSONSerialization.jsonObject(with: Data(String(cString: reply).utf8)) as? [String: Any] {
         if result["restored"] as? Bool == true { return nil }
-        if let message = result["key_error"] as? String { return .key(message) }
         switch result["error"] as? String {
-        case "Choose a valid LokiSigner recovery backup file (at most 256 KiB).": return .invalidBackup
-        case "This backup or these recovery words do not match the unlocked LokiSigner profile.": return .wrongProfile
-        case "This vault already has data in the profile. LokiSigner did not replace it.": return .vaultExists
-        case "First-run recovery needs a new LokiSigner profile directory.": return .notFresh
+        case "key-error":
+            if let message = result["key_error"] as? String { return .key(message) }
+        case "invalid-backup": return .invalidBackup
+        case "wrong-profile": return .wrongProfile
+        case "vault-exists": return .vaultExists
+        case "profile-not-fresh": return .notFresh
         case "data-folder-unavailable": return .dataFolderUnavailable
-        case "LokiSigner could not read the coordinator roster. Check the coordinator and try again.": return .rosterUnavailable
-        case "The coordinator roster does not identify exactly one slot for this backup.": return .rosterMismatch
-        case "Vault restored to this Mac, but LokiSigner could not start. Try unlocking again; your recovery words are not needed.": return .restoredButStopped
-        case "Unlock LokiSigner before restoring a vault.": return .unlockToRestore
-        case "LokiSigner could not restore this vault. Check the recovery words and backup, then try again.": return .backupMismatch
+        case "roster-unavailable": return .rosterUnavailable
+        case "roster-mismatch": return .rosterMismatch
+        case "restored-but-stopped": return .restoredButStopped
+        case "profile-locked": return .unlockToRestore
+        case "restore-refused": return .backupMismatch
         default: break
         }
     }

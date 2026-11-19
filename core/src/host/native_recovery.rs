@@ -8,15 +8,16 @@ use zeroize::Zeroizing;
 use super::{ceremony::{self, RecoveryBackup}, recovery, registration::{self, PublicMember, RESTORE_PENDING}, state::{write_native_key_scope, Shared, NATIVE_KEY_SCOPE}, Config, FetchedConfig, RegistrationConfig};
 use crate::{setup_transport::{Identity, PublicIdentity}, signer::{recovery::RecoveryKey, Network}, state::MemberDir};
 
-pub(crate) const REFUSED: &str = "LokiSigner could not restore this vault. Check the recovery words and backup, then try again.";
-pub(super) const LOCKED: &str = "Unlock LokiSigner before restoring a vault.";
-const BAD_FILE: &str = "Choose a valid LokiSigner recovery backup file (at most 256 KiB).";
-const WRONG_PROFILE: &str = "This backup or these recovery words do not match the unlocked LokiSigner profile.";
-const ALREADY_PRESENT: &str = "This vault already has data in the profile. LokiSigner did not replace it.";
-const NOT_FRESH: &str = "First-run recovery needs a new LokiSigner profile directory.";
+// Stable restore reply codes; Recovery.swift owns the member-facing copy.
+pub(crate) const REFUSED: &str = "restore-refused";
+pub(super) const LOCKED: &str = "profile-locked";
+const BAD_FILE: &str = "invalid-backup";
+const WRONG_PROFILE: &str = "wrong-profile";
+const ALREADY_PRESENT: &str = "vault-exists";
+const NOT_FRESH: &str = "profile-not-fresh";
 const DATA_LOCATION: &str = "data-folder-unavailable";
-const ROSTER_UNAVAILABLE: &str = "LokiSigner could not read the coordinator roster. Check the coordinator and try again.";
-const ROSTER_MISMATCH: &str = "The coordinator roster does not identify exactly one slot for this backup.";
+const ROSTER_UNAVAILABLE: &str = "roster-unavailable";
+const ROSTER_MISMATCH: &str = "roster-mismatch";
 
 fn open_backup(file: &Path, words: Zeroizing<Vec<u8>>) -> Result<RecoveryBackup, &'static str> {
     const LIMIT: u64 = 256 * 1024;
@@ -394,8 +395,10 @@ mod tests {
         let target = root.join("actual/LokiSigner");
         let alias = root.join("alias");
         let stale = target.join("vaults").join(format!(".loki-restore-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&stale).unwrap();
+        fs::create_dir_all(&root).unwrap();
         std::os::unix::fs::symlink(&target, &alias).unwrap();
+        assert_eq!(profile_state(&alias), Err("data-folder-unavailable"));
+        fs::create_dir_all(&stale).unwrap();
         clean_staging(&alias);
         assert!(!stale.exists());
         assert_eq!(profile_state(&alias), Ok("fresh"));

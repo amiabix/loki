@@ -163,6 +163,13 @@ verified every restored vault. A failed match, cancellation, or lockout does not
 exception. For older keys without enrolment metadata, a failed match can only offer a recovery
 hint, not confirm that the key is gone.
 
+A key that macOS cannot find counts as gone. That can also happen if you moved a profile
+created before #95 (whose key tags depended on the folder path), or if you opened it with an
+app signed by a different Apple developer team. Try the original path and signing team before
+restoring. If you already set the profile aside, quit LokiSigner and rename the archived folder
+back to its original name and location to undo the set-aside. If a new profile now occupies that
+location, move it out of the way without deleting it first.
+
 Restore each additional backup from **LokiSigner → Restore a vault…** in the unlocked app.
 It must belong to the same member and recovery words. It will not replace an existing vault.
 After the replacement registers, the coordinator's device binding and advertised endpoint
@@ -203,7 +210,8 @@ same setup document the signer checks in `dkg_begin`. The vault name comes from 
 invite. It follows the same rule as in **Vault addresses…**: it is shown as written, in its own
 one-line box, or replaced whole by "Name hidden (unsupported characters)" when it is longer
 than 80 characters or holds a control, format, default-ignorable or line-breaking character
-or a run of more than three combining marks.
+or a run of more than three combining marks. A name without a letter is also hidden, so a name
+made of digits and spaces cannot look like a second roster code.
 
 - **Codes match** records the agreement and tells the creator.
 - **Codes differ** records nothing, and LokiSigner refuses that vault until it restarts, so a

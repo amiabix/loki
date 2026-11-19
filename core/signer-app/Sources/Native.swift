@@ -628,7 +628,8 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
     /// Shows the configuration before anything is saved; the member continues with exactly it.
     private func confirm(link: String?, launch: [String: Any], reply: [String: Any], fresh: Bool) {
         guard let config = reply["config"] as? [String: Any] else {
-            retry(.configuration, link: link)
+            let refreshFailed = reply["error"] as? String == "saved-endpoints-refresh-failed"
+            retry(refreshFailed ? .savedEndpointsRefreshFailed : .configuration, link: link)
             return
         }
         let alert = NSAlert()

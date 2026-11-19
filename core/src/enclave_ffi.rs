@@ -316,11 +316,14 @@ unsafe fn take_restore_secret(ptr: *mut u8, len: usize) -> Result<zeroize::Zeroi
 }
 
 #[cfg(feature = "relay-communication")]
+const RESTORED_BUT_STOPPED: &str = "restored-but-stopped";
+
+#[cfg(feature = "relay-communication")]
 fn restore_reply(result: Result<(), &'static str>) -> *mut std::ffi::c_char {
     let reply = match result {
         Ok(()) => serde_json::json!({ "restored": true }),
         Err(error) if crate::signer::secure_element_apple::member_key_message(error).is_some() =>
-            serde_json::json!({ "key_error": error }),
+            serde_json::json!({ "error": "key-error", "key_error": error }),
         Err(error) => serde_json::json!({ "error": error }),
     };
     std::ffi::CString::new(reply.to_string()).map_or(std::ptr::null_mut(), std::ffi::CString::into_raw)
@@ -365,7 +368,6 @@ pub unsafe extern "C" fn loki_member_app_restore_profile(
     connect: NativeConnect,
 ) -> *mut std::ffi::c_char {
     let error = crate::host::NATIVE_RESTORE_REFUSED;
-    let start_error = "Vault restored to this Mac, but LokiSigner could not start. Try unlocking again; your recovery words are not needed.";
     let mut published = false;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let words = take_restore_secret(words, words_len);
@@ -390,9 +392,9 @@ pub unsafe extern "C" fn loki_member_app_restore_profile(
         let notice = native_notice(notify);
         crate::host::run_native(config, pass, notice, native_approval(approve),
             native_roster_confirmation(confirm_roster), native_connect(connect), fetched)
-            .map_err(|e| crate::signer::secure_element_apple::member_key_message(&e).unwrap_or(start_error))
+            .map_err(|e| crate::signer::secure_element_apple::member_key_message(&e).unwrap_or(RESTORED_BUT_STOPPED))
     }));
-    restore_reply(result.unwrap_or(Err(if published { start_error } else { error })))
+    restore_reply(result.unwrap_or(Err(if published { RESTORED_BUT_STOPPED } else { error })))
 }
 
 #[cfg(feature = "relay-communication")]
@@ -502,7 +504,7 @@ mod native_pairing_tests {
         assert!(words.iter().chain(&pass).all(|&b| b == 0));
         let error: serde_json::Value = serde_json::from_slice(unsafe { std::ffi::CStr::from_ptr(reply) }.to_bytes()).unwrap();
         unsafe { super::loki_member_app_free(reply); }
-        assert_eq!(error, serde_json::json!({"error": "LokiSigner could not restore this vault. Check the recovery words and backup, then try again."}));
+        assert_eq!(error, serde_json::json!({"error": "restore-refused"}));
 
         let mut words = [b'X'; 4097];
         let reply = unsafe { super::loki_member_app_restore_vault(words.as_mut_ptr(), words.len(), std::ptr::null()) };
@@ -510,6 +512,22 @@ mod native_pairing_tests {
         let refused: serde_json::Value = serde_json::from_slice(unsafe { std::ffi::CStr::from_ptr(reply) }.to_bytes()).unwrap();
         unsafe { super::loki_member_app_free(reply); }
         assert_eq!(refused, error);
+    }
+
+    #[test]
+    fn native_restore_replies_distinguish_key_errors_from_saved_but_stopped() {
+        use crate::signer::secure_element_apple::KeyFailure;
+        use serde_json::{json, Value};
+        let key_message = KeyFailure::Cancelled.message();
+        for (error, expected) in [
+            (key_message, json!({"error": "key-error", "key_error": key_message})),
+            (super::RESTORED_BUT_STOPPED, json!({"error": "restored-but-stopped"})),
+        ] {
+            let reply = super::restore_reply(Err(error));
+            let result: Value = serde_json::from_slice(unsafe { std::ffi::CStr::from_ptr(reply) }.to_bytes()).unwrap();
+            unsafe { super::loki_member_app_free(reply); }
+            assert_eq!(result, expected);
+        }
     }
 
     #[test]
