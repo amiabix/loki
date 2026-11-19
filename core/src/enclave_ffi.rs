@@ -241,7 +241,7 @@ pub extern "C" fn loki_member_app_stop() -> i32 {
 /// The coordinator origin and slot a pairing link names, checked without any network request.
 /// LokiSigner asks the member to confirm them before it contacts that coordinator. Returns
 /// `{"target": {"coordinator": "...", "slot": n}}` or `{"error": "..."}`; free it with
-/// [`loki_member_app_free`].
+/// [`loki_member_app_free`]. An already pinned origin or slot mismatch returns `different-pairing`.
 ///
 /// # Safety
 /// `launch` must be a live NUL-terminated UTF-8 string for this call.
@@ -434,7 +434,14 @@ pub unsafe extern "C" fn loki_member_app_pair(
         let pass = secret.map_err(|e| e.to_string())?;
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
-        struct Launch { args: Vec<String>, pairing_url: Option<String>, config: crate::host::NativeConfig }
+        struct Launch {
+            args: Vec<String>,
+            pairing_url: Option<String>,
+            profile_name: Option<String>,
+            #[serde(default)]
+            retry_pairing: bool,
+            config: crate::host::NativeConfig,
+        }
         let launch: Launch = serde_json::from_str(std::ffi::CStr::from_ptr(launch).to_str().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         let mut config = crate::host::native_config_from_args(&launch.args)?;
         if config.registration.is_some() { return Err("native pairing accepts registration only through its pairing link".into()); }
@@ -442,10 +449,19 @@ pub unsafe extern "C" fn loki_member_app_pair(
         // The values the member reviewed, checked again; never fetched a second time. A fetched
         // configuration is saved only after the profile unlocks.
         let fetched = launch.config.apply(&mut config, &launch.args, launch.pairing_url.as_deref())?;
-        config.registration = Some(match launch.pairing_url {
-            Some(link) => crate::host::RegistrationConfig::pairing(&link, config.development_http)?,
-            None => crate::host::RegistrationConfig::resume(&config.data, config.development_http)?,
-        });
+        let registration = match launch.pairing_url {
+            Some(link) => {
+                let mut registration = crate::host::RegistrationConfig::pairing(&link, config.development_http)?;
+                if let Some(name) = launch.profile_name { registration.name = name; }
+                registration
+            }
+            None => {
+                let mut registration = crate::host::RegistrationConfig::resume(&config.data, config.development_http)?;
+                registration.retry_pairing = launch.retry_pairing;
+                registration
+            }
+        };
+        config.registration = Some(registration);
         crate::host::run_native(config, pass, notice.clone(), native_approval(approve),
             native_roster_confirmation(confirm_roster), native_connect(connect), fetched)
     }));
@@ -462,6 +478,7 @@ pub unsafe extern "C" fn loki_member_app_pair(
                 7
             },
             "coordinator-roster-unreachable" => 8,
+            "invalid-profile-name" => 9,
             _ => 1,
         },
         Err(_) => 2,
@@ -557,5 +574,11 @@ mod native_pairing_tests {
         let error = reply["error"].as_str().unwrap();
         assert!(!error.contains("recovery"), "{error}");
         assert!(!data.exists());
+        std::fs::create_dir(&data).unwrap();
+        std::fs::write(data.join("paired-coordinator.json"), r#"{"origin":"https://127.0.0.1:1","slot":7}"#).unwrap();
+        let wrong_slot = link.replace("slot=7", "slot=8");
+        let reply = query(super::loki_member_app_pairing_target, serde_json::json!({ "args": args, "pairing_url": wrong_slot }));
+        assert_eq!(reply, serde_json::json!({ "error": "different-pairing" }));
+        std::fs::remove_dir_all(data).unwrap();
     }
 }

@@ -17,6 +17,8 @@ pub struct RegistrationConfig {
     pub passphrase_file: Option<PathBuf>,
     pub name: String,
     pub pairing_challenge: Option<String>,
+    /// The native dialog's explicit retry must finish pairing, unlike an ordinary unlock.
+    pub retry_pairing: bool,
 }
 
 impl RegistrationConfig {
@@ -40,14 +42,14 @@ impl RegistrationConfig {
         if challenge.len() != 64 || !challenge.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
             return Err("invalid pairing challenge".into());
         }
-        Ok(Self { coordinator, slot: Some(slot), passphrase_file: None, name: "Member".into(), pairing_challenge: Some(challenge) })
+        Ok(Self { coordinator, slot: Some(slot), passphrase_file: None, name: "Member".into(), pairing_challenge: Some(challenge), retry_pairing: false })
     }
 
     pub fn resume(data: &std::path::Path, development_http: bool) -> Result<Self, String> {
         let saved: PairedCoordinator = serde_json::from_slice(&std::fs::read(data.join("paired-coordinator.json")).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         if saved.slot == 0 { return Err("invalid saved slot".into()); }
         Ok(Self { coordinator: plain_origin(&saved.origin, development_http)?, slot: Some(saved.slot),
-            passphrase_file: None, name: "Member".into(), pairing_challenge: None })
+            passphrase_file: None, name: "Member".into(), pairing_challenge: None, retry_pairing: false })
     }
 
     pub(super) fn from_args(args: &[String], development_http: bool) -> Result<Option<Self>, String> {
@@ -71,7 +73,7 @@ impl RegistrationConfig {
         let slot = value("--registration-slot").map(|v| v.parse::<u32>().ok().filter(|s| *s > 0)
             .ok_or("--registration-slot requires a positive integer")).transpose()?;
         let passphrase_file = value("--local-passphrase-file").ok_or("--local-passphrase-file is required for local unlock")?.into();
-        Ok(Some(Self { coordinator, slot, passphrase_file: Some(passphrase_file), name: value("--profile-name").unwrap_or_else(|| "Member".into()), pairing_challenge: None }))
+        Ok(Some(Self { coordinator, slot, passphrase_file: Some(passphrase_file), name: value("--profile-name").unwrap_or_else(|| "Member".into()), pairing_challenge: None, retry_pairing: false }))
     }
 }
 
@@ -372,8 +374,8 @@ async fn register(config: &Config, pass: &str, pairing_claim: Option<&str>, slot
     Ok(member)
 }
 
-/// Unlock the profile. A native launch with a pairing claim waits for registration and reports
-/// failure before going ready. A pending restore tries once and runs even on failure. Regular
+/// Unlock the profile. Native pairing (including Try again) registers before showing recovery
+/// words. A pending restore tries once and runs even on failure. Regular
 /// unlocks and headless launches serve immediately and retry registration in the background.
 pub(super) async fn start(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option<&super::LocalNotice>) -> Result<&'static str, String> {
     use std::io::IsTerminal;
@@ -414,14 +416,41 @@ async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option
                     }
                 }
             }
-            if native { write_native_key_scope(&data)?; }
-            crate::profile::create(&data, &secret, &name)?;
+            let name = if native {
+                let label = name.trim_matches(' ');
+                if label.is_empty() || label.len() > 80 || super::vault_label(label) != label {
+                    return Err("invalid-profile-name".into());
+                }
+                write_native_key_scope(&data)?;
+                label
+            } else { &name };
+            crate::profile::create(&data, &secret, name)?;
         }
         Session::unlock(data, secret).map(|(session, _)| session).map_err(|e| {
             if native && e == "sealed file failed authentication: wrong passphrase or tampered file" { "unlock".into() }
             else { e }
         })
     }).await.map_err(|e| e.to_string())??;
+    let pairing = native && !restored && (launch.pairing_challenge.is_some() || launch.retry_pairing);
+    let save_destination = || -> Result<(), String> {
+        // Keep the resume destination before sending the one-use claim.
+        if let Some(slot) = launch.slot { save_coordinator(&st.config.data, &launch.coordinator, slot)?; }
+        if let Some(fetched) = st.fetched_config.as_ref().filter(|_| !restored) {
+            if let Err(e) = fetched.save_unlocked(&st.config.data) {
+                eprintln!("could not save signer configuration for future launches: {e}");
+            }
+        }
+        Ok(())
+    };
+    if pairing {
+        save_destination()?;
+        // Complete enrollment before minting words: the slot then belongs to this identity,
+        // not to an expiring claim.
+        register_once(st, pass.clone(), launch.pairing_challenge.clone()).await.map_err(|e| {
+            eprintln!("native coordinator registration failed: {e}");
+            e.native_code()
+        })?;
+    }
     if restored {
         // A published restore already adopted its words. Never mint different words for it,
         // even if someone deleted one of its files after publication.
@@ -440,24 +469,13 @@ async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option
     let secret = pass.clone();
     tokio::task::spawn_blocking(move || super::recovery::seal_missing_backups_logged(&data, &secret))
         .await.map_err(|e| e.to_string())?;
-    // Keep the public resume destination before consuming a claim; a lost reply is retryable.
-    if let Some(slot) = launch.slot { save_coordinator(&st.config.data, &launch.coordinator, slot)?; }
-    // Only an unlocked profile saves (or refreshes) the configuration it was paired with.
-    if !restored {
-        if let Some(fetched) = &st.fetched_config { fetched.save_unlocked(&st.config.data)?; }
-    }
+    if !pairing { save_destination()?; }
     *st.session.write().await = Some(session);
+    if pairing { return Ok("ready"); }
     if restored {
         // The profile is already committed; registration can fail without losing the restore.
         if register_once(st, pass.clone(), None).await.is_ok() { return Ok("restore-ready"); }
         *st.registration_error.write().await = Some(RESTORE_RETRY.into());
-    } else if let Some(claim) = launch.pairing_challenge.as_ref().filter(|_| native) {
-        // Only a first pairing waits for a refusal or a local key failure before going ready.
-        register_once(st, pass, Some(claim.clone())).await.map_err(|e| {
-            eprintln!("native coordinator registration failed: {e}");
-            e.native_code()
-        })?;
-        return Ok("ready");
     }
     tokio::spawn(keep_registering(st.clone(), pass, restored, notice.filter(|_| native).cloned()));
     Ok(if restored { "restore-pending" } else { "ready" })
@@ -870,6 +888,115 @@ mod tests {
         let scope = std::fs::read_to_string(data.join(super::super::state::NATIVE_KEY_SCOPE)).unwrap();
         assert_eq!(uuid::Uuid::parse_str(&scope).unwrap().get_version_num(), 4);
         std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_pairing_owns_the_slot_while_words_are_shown_even_after_a_refusal() {
+        use axum::{http::StatusCode, routing::post, Json, Router};
+        use serde_json::{json, Value};
+        use std::future::IntoFuture;
+        use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+
+        for refuse_first in [false, true] {
+            let data = std::env::temp_dir().join(format!("loki-native-slot-{}", uuid::Uuid::new_v4()));
+            let claim_expired = Arc::new(AtomicBool::new(refuse_first));
+            let claims = Arc::new(Mutex::new(Vec::new()));
+            let owner = Arc::new(Mutex::new(Value::Null));
+            let (expiry, log, occupied, bind_slot) = (claim_expired.clone(), claims.clone(), owner.clone(), owner.clone());
+            let app = Router::new()
+                .route("/api/members/challenge", post(move |Json(body): Json<Value>| {
+                    let mut log = log.lock().unwrap();
+                    let occupied = occupied.lock().unwrap();
+                    let with_claim = body.get("pairing_challenge").is_some();
+                    let refused = (with_claim && (expiry.load(Ordering::SeqCst) || !log.is_empty()))
+                        || (!occupied.is_null() && *occupied != body["signing_pubkey"]);
+                    log.push(with_claim);
+                    async move {
+                        if refused { Err(StatusCode::BAD_REQUEST) } else { Ok(Json(json!({ "challenge": "cd".repeat(32) }))) }
+                    }
+                }))
+                .route("/api/members", post(move |Json(body): Json<Value>| {
+                    assert_eq!(body["slot"], 7);
+                    *bind_slot.lock().unwrap() = body["signing_pubkey"].clone();
+                    async move { Json(json!({"member": {"slot": body["slot"], "signing_pubkey": body["signing_pubkey"],
+                        "relay_pubkey": body["relay_pubkey"], "advertise_url": body["advertise_url"], "lokisigner_url": body["lokisigner_url"]}})) }
+                }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let coordinator = tokio::spawn(axum::serve(listener, app).into_future());
+            let mut state = pairing_state(&data);
+            let config = &mut Arc::get_mut(&mut state).unwrap().config;
+            config.native = true;
+            config.development_http = true;
+            let launch = config.registration.as_mut().unwrap();
+            launch.coordinator = origin.clone();
+            launch.name = "Élodie’s signer".into();
+            let pass = || Some(Zeroizing::new("native slot test unlock".into()));
+            if refuse_first {
+                let no_words: super::super::LocalNotice = Arc::new(|_, _| panic!("a refused pairing must not mint words"));
+                assert_eq!(start_with(&state, pass(), Some(&no_words), false).await, Err("registration-refused".into()));
+                assert!(!super::super::recovery::exists(&data));
+                let mut launch = RegistrationConfig::resume(&data, true).unwrap();
+                launch.retry_pairing = true;
+                Arc::get_mut(&mut state).unwrap().config.registration = Some(launch);
+            }
+
+            let words_shown = Arc::new(AtomicBool::new(false));
+            let (observed, starting, endpoint) = (words_shown.clone(), state.clone(), origin.clone());
+            let notice: super::super::LocalNotice = Arc::new(move |kind, words| {
+                assert_eq!(kind, "recovery");
+                assert_eq!(words.split_whitespace().count(), 24);
+                assert!(!observed.swap(true, Ordering::SeqCst), "words shown twice");
+                assert!(starting.session.try_read().unwrap().is_none(), "startup is not ready during the notice");
+                // Advance past the claim lifetime while the notice is still blocking startup.
+                claim_expired.store(true, Ordering::SeqCst);
+                let status = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(async {
+                    reqwest::Client::new().post(format!("{endpoint}/api/members/challenge"))
+                        .json(&json!({ "slot": 7, "signing_pubkey": "another identity" })).send().await.unwrap().status()
+                }));
+                assert_eq!(status, StatusCode::BAD_REQUEST, "another identity cannot take the slot during the notice");
+            });
+            assert_eq!(start_with(&state, pass(), Some(&notice), false).await.unwrap(), "ready");
+            assert!(words_shown.load(Ordering::SeqCst));
+            assert_eq!(state.registration.read().await.as_ref().unwrap().slot, 7);
+            let expected = if refuse_first { vec![true, false, false] } else { vec![true, false] };
+            assert_eq!(*claims.lock().unwrap(), expected);
+            drop(notice);
+
+            // A regular unlock reads the sealed name, not the default from resume().
+            let mut config = Arc::try_unwrap(state).ok().unwrap().config;
+            config.registration = Some(RegistrationConfig::resume(&data, true).unwrap());
+            let state = Arc::new(super::super::state::AppState::new(config));
+            let no_words: super::super::LocalNotice = Arc::new(|_, _| panic!("a later unlock must not show words again"));
+            start_with(&state, pass(), Some(&no_words), false).await.unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/api/status", listener.local_addr().unwrap());
+            let server = super::super::routes::router(state.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>();
+            let server = tokio::spawn(axum::serve(listener, server).into_future());
+            let status: Value = reqwest::Client::new().get(url).header("x-loki-token", &state.config.token)
+                .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+            assert_eq!(status["profile"]["name"], "Élodie’s signer");
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while state.registration.read().await.is_none() { tokio::time::sleep(std::time::Duration::from_millis(20)).await; }
+            }).await.unwrap();
+            server.abort();
+            coordinator.abort();
+            std::fs::remove_dir_all(data).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_pairing_rejects_names_that_cannot_be_displayed_or_stored() {
+        for name in ["  ".to_owned(), "Name\nVault".into(), "Right\u{202e}to left".into(), "é".repeat(41)] {
+            let data = std::env::temp_dir().join(format!("loki-native-name-{}", uuid::Uuid::new_v4()));
+            let mut state = pairing_state(&data);
+            let config = &mut std::sync::Arc::get_mut(&mut state).unwrap().config;
+            config.native = true;
+            config.registration.as_mut().unwrap().name = name;
+            assert_eq!(start_with(&state, Some(Zeroizing::new("unlock".into())), None, false).await,
+                Err("invalid-profile-name".into()));
+            assert!(!crate::profile::exists(&data));
+        }
     }
 
     /// A pairing claim is consumed by the coordinator even when the reply is lost, so a retry
