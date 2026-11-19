@@ -508,10 +508,16 @@ fn signing_expiry(tip: u32, bound: u32) -> Result<u32, String> {
 /// Whether this member's app approves `p` by itself: `p` retries (not cancels) a payment this
 /// member approved on this device, with the same recipient, amount, memo, fee, change and note,
 /// and an expiry bound no later than the one approved. Both spend the same note, so at most one
-/// is ever mined, whoever proposed either.
+/// is ever mined, whoever proposed either. A member whose signer refused that payment
+/// approves the retry by hand again, so the retry is not sent back to a signer that said no.
 fn approved_before(data: &Path, pass: &str, v: &Vault, p: &Payment) -> bool {
     let Some(r) = p.replaces.as_ref().filter(|r| !r.cancel) else { return false };
-    read_payment(data, pass, &p.vault, &r.attempt).is_ok_and(|earlier| repeats(&earlier, p, v.slot))
+    payment_dir(data, &p.vault).is_ok_and(|dir| !dir.exists(&refused_file(&r.attempt)))
+        && read_payment(data, pass, &p.vault, &r.attempt).is_ok_and(|earlier| repeats(&earlier, p, v.slot))
+}
+/// Marks that this member's signer refused the attempt (`payment_approval`).
+fn refused_file(attempt: &str) -> String {
+    format!("{attempt}.refused")
 }
 fn repeats(earlier: &Payment, p: &Payment, slot: u16) -> bool {
     earlier.attempt != p.attempt
@@ -1549,7 +1555,11 @@ fn payment_approval(
                 && view.memo == memo.as_array()
                 && view.expiry_height == tx_expiry(&p))
         };
-        approved().unwrap_or(false) && native(request)
+        let approves = approved().unwrap_or(false) && native(request);
+        if !approves {
+            let _ = payment_dir(&data, &p.vault).map(|dir| dir.write_text(&refused_file(&p.attempt), ""));
+        }
+        approves
     }))
 }
 
@@ -3711,6 +3721,54 @@ mod tests {
         let mut unapproved = earlier.clone();
         unapproved.approval_requested = false;
         save_payment(&data, "pass", &unapproved).unwrap();
+        assert!(!approved_before(&data, "pass", &v, &retry));
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
+    fn a_member_whose_signer_refused_approves_the_retry_again() {
+        let identities: Vec<_> = (1..=3).map(Identity::new).collect();
+        let peers: BTreeMap<_, _> = identities.iter().map(|i| (i.public().id, i.public())).collect();
+        let v = member(&identities[1], &peers);
+        let vault = hex::encode([2; 32]);
+        let data = std::env::temp_dir().join(format!("loki-refused-retry-{}", Uuid::new_v4()));
+        // Member 2 approved payment 1 and heard its `start`, then its signer refused the
+        // candidate; the round failed.
+        let mut earlier = open_payment(&vault, 1);
+        earlier.recipient = vault::unified_address(&v.fvk, v.network.network_type());
+        earlier.approval_requested = true;
+        earlier.signers = vec![1, 2];
+        earlier.phase = "failed".into();
+        save_payment(&data, "pass", &earlier).unwrap();
+        let mut retry = earlier.clone();
+        retry.attempt = hex::encode([7; 32]);
+        retry.signers.clear();
+        retry.phase = "signing".into();
+        retry.approval_requested = false;
+        retry.replaces = Some(Replaces { attempt: earlier.attempt.clone(), cancel: false });
+        assert!(approved_before(&data, "pass", &v, &retry));
+        record_consent(&data, "pass", &earlier).unwrap();
+        let sighash = [9u8; 32];
+        pin_sighash(&data, "pass", &earlier, sighash).unwrap();
+        let attempt = hex32(&earlier.attempt).unwrap();
+        let candidate = CandidateRef { vault_id: [2; 32], payment_id: attempt, attempt_id: attempt };
+        let view = crate::signer::wysiwys::PaymentView {
+            to: vault::orchard_receiver_from_ua(&earlier.recipient, v.network.network_type())
+                .unwrap()
+                .to_raw_address_bytes(),
+            amount_zat: earlier.amount_zat,
+            fee_zat: earlier.fee_zat,
+            change_zat: earlier.change_zat,
+            memo: MemoBytes::from_bytes(earlier.memo.as_bytes()).unwrap().as_array().to_vec(),
+            expiry_height: tx_expiry(&earlier),
+            network_branch_id: 0,
+            fee_verified: true,
+        };
+        let declines: super::super::LocalApproval = std::sync::Arc::new(|_| false);
+        let native = super::super::approval_policy(Some(declines), Network::Testnet, 2);
+        let mut policy = payment_approval(&data, "pass", &earlier, &v.network, native).unwrap();
+        assert!(!policy(&crate::signer::local::ApprovalRequest { candidate: &candidate, sighash, view: &view }));
+        // The refusal stands: the retry waits for this member's own approval again.
         assert!(!approved_before(&data, "pass", &v, &retry));
         std::fs::remove_dir_all(data).unwrap();
     }
