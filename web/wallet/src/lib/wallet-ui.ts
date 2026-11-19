@@ -106,3 +106,17 @@ export function nativeRosterRefusal(message: string, answered: boolean): string 
   if (message === "roster code mismatch" || message === "roster fingerprint mismatch") return "The vault's members changed since this page loaded. Choose Compare in LokiSigner again to see the current code.";
   return `LokiSigner recorded no agreement: ${message}`;
 }
+
+/** What protects this signer's share, from its status `secure_element` and the signer kind. The
+ *  in-browser signer reports `passkey`, or `software` for its passphrase tier; a native member
+ *  reports `apple` (Secure Enclave) or `software` (the development backend). */
+export function storageLabel(se: string | undefined, kind: "native" | "browser"): { enclave: boolean; label: string; detail: string } {
+  if (se === "apple") return { enclave: true, label: "Enclave-protected wrapping key",
+    detail: "The signer host’s Secure Enclave protects the unwrapping key. Your share enters process memory during signing; it is not hardware-contained FROST signing." };
+  if (kind === "browser") {
+    const by = se === "passkey" ? "passkey" : "passphrase";
+    return { enclave: false, label: `Sealed under your ${by} in this browser`,
+      detail: `Your share is sealed in the Loki signer’s own browser storage under your ${by}. It enters browser memory during signing, without hardware isolation.` };
+  }
+  return { enclave: false, label: "Software device storage", detail: "Software development signer: local sealed storage, without hardware isolation." };
+}
