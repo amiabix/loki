@@ -378,14 +378,11 @@ pub(super) async fn create(State(st): State<Shared>, Json(body): Json<Value>) ->
         .as_u64()
         .and_then(|n| u16::try_from(n).ok())
         .unwrap_or(0);
-    if name.is_empty()
-        || name.len() > 80
-        || !valid_policy(threshold, usize::from(members))
-    {
-        return err(
-            StatusCode::BAD_REQUEST,
-            "name must be 1 to 80 bytes; use 2 <= t < n <= 16",
-        );
+    if name.is_empty() || name.len() > 80 {
+        return err(StatusCode::BAD_REQUEST, "name must be 1 to 80 bytes");
+    }
+    if !valid_policy(threshold, usize::from(members)) {
+        return err(StatusCode::BAD_REQUEST, "use 2 <= t < n <= 16");
     }
     let (data, pass) = match unlocked(&st).await {
         Ok(x) => x,
@@ -1467,6 +1464,30 @@ mod tests {
         assert_eq!(response.1 .0["fingerprint"], status.1 .0["fingerprint"]);
         eprintln!("PASS: emitted invite codes contain no vault_secret");
         std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_names_the_field_it_refuses() {
+        let st = std::sync::Arc::new(AppState::new(Config {
+            data: std::env::temp_dir(), port: 3001, network: "regtest".into(), native: false,
+            lightwalletd: None, transport: "local".into(), operator_bundle: None,
+            operator_key: None, enrollment_issuer: None, development_http: false,
+            token: "test".into(), frostd_url: "http://127.0.0.1:2744".into(),
+            peers: BTreeMap::new(),
+            registration: None, bind: "127.0.0.1".parse().unwrap(), advertise_url: None,
+            secure_element: "software".into(), nonce_witnesses: None, loopback_peers: false,
+        }));
+        for (name, members, threshold, error) in [
+            ("".to_owned(), 3, 2, "name must be 1 to 80 bytes"),
+            ("x".repeat(81), 3, 2, "name must be 1 to 80 bytes"),
+            ("Friends".to_owned(), 3, 3, "use 2 <= t < n <= 16"),
+            ("Friends".to_owned(), 17, 2, "use 2 <= t < n <= 16"),
+        ] {
+            let body = json!({"name":name,"members":members,"threshold":threshold});
+            let (status, Json(reply)) = create(State(st.clone()), Json(body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(reply["error"], error, "{members} {threshold}");
+        }
     }
 
     #[test]
