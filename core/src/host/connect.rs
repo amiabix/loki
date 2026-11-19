@@ -24,6 +24,7 @@ use super::{new_token, state::Shared};
 // Leave a margin below the browser's response timeout, even if the main thread is busy.
 const DEADLINE: Duration = Duration::from_secs(110);
 const COOLDOWN: Duration = Duration::from_secs(5);
+const MAX_COOLDOWN: Duration = Duration::from_secs(120);
 
 pub(crate) type LocalConnect = Arc<dyn Fn(&str, &str, &ConnectAttempt) -> bool + Send + Sync>;
 
@@ -40,16 +41,24 @@ impl ConnectAttempt {
 
 // The body owns this guard, not the worker. A dropped HTTP stream closes the native prompt
 // even while the worker is in AppKit. The worker can never mint a token on its own.
-struct ResponseAttempt(Arc<ConnectAttempt>);
+struct ResponseAttempt {
+    attempt: Arc<ConnectAttempt>,
+    state: Shared,
+    allowed: bool,
+}
 
 impl Drop for ResponseAttempt {
-    fn drop(&mut self) { self.0.cancelled.store(true, Ordering::Release); }
+    fn drop(&mut self) {
+        self.attempt.cancelled.store(true, Ordering::Release);
+        self.state.wallet_tabs.as_ref().unwrap().record_decision(self.allowed, Instant::now());
+    }
 }
 
 #[derive(Default)]
 struct Grants {
     pending: Weak<ConnectAttempt>,
-    last_prompt: Option<Instant>,
+    next_prompt: Option<Instant>,
+    refusal_wait: Duration,
     tokens: HashSet<String>,
 }
 
@@ -90,16 +99,25 @@ impl WalletTabs {
         }
     }
 
-    fn begin(&self) -> Option<Arc<ConnectAttempt>> {
+    fn begin(&self, now: Instant) -> Option<Arc<ConnectAttempt>> {
         let mut grants = self.grants.lock().unwrap();
-        let now = Instant::now();
-        if grants.pending.strong_count() != 0 || grants.last_prompt.is_some_and(|last| now - last < self.cooldown) {
+        if grants.pending.strong_count() != 0 || grants.next_prompt.is_some_and(|next| now < next) {
             return None;
         }
         let attempt = Arc::new(ConnectAttempt { cancelled: AtomicBool::new(false), deadline: now + self.deadline });
-        grants.last_prompt = Some(now);
         grants.pending = Arc::downgrade(&attempt);
         Some(attempt)
+    }
+
+    fn record_decision(&self, allowed: bool, now: Instant) {
+        let mut grants = self.grants.lock().unwrap();
+        if allowed {
+            grants.refusal_wait = Duration::ZERO;
+            grants.next_prompt = Some(now + self.cooldown);
+        } else {
+            grants.refusal_wait = (grants.refusal_wait * 2).clamp(self.cooldown, MAX_COOLDOWN);
+            grants.next_prompt = Some(now + grants.refusal_wait);
+        }
     }
 
     fn issue(&self, attempt: &ConnectAttempt) -> Option<String> {
@@ -129,7 +147,7 @@ pub(super) async fn request(State(st): State<Shared>, member: Result<Json<Member
     // Lock must either cancel this attempt or prevent it from starting.
     let session = st.session.read().await;
     if session.is_none() { return StatusCode::FORBIDDEN.into_response(); }
-    let Some(attempt) = tabs.begin() else { return StatusCode::TOO_MANY_REQUESTS.into_response(); };
+    let Some(attempt) = tabs.begin(Instant::now()) else { return StatusCode::TOO_MANY_REQUESTS.into_response(); };
     drop(session);
     // A short code is for human comparison, not an HTTP credential or a lookup key.
     let code = format!("{:06}", (OsRng.next_u64() % 1_000_000));
@@ -139,11 +157,12 @@ pub(super) async fn request(State(st): State<Shared>, member: Result<Json<Member
     };
     let line = |value| Ok::<_, Infallible>(format!("{value}\n"));
     let first = stream::once(std::future::ready(line(json!({ "code": code }))));
-    let response_attempt = ResponseAttempt(attempt);
+    let mut response_attempt = ResponseAttempt { attempt, state: st, allowed: false };
     let last = stream::once(async move {
-        let attempt = &response_attempt.0;
+        let attempt = &response_attempt.attempt;
         let approved = matches!(tokio::time::timeout_at(attempt.deadline.into(), worker).await, Ok(Ok(true)));
-        let token = approved.then(|| st.wallet_tabs.as_ref().unwrap().issue(attempt)).flatten();
+        let token = approved.then(|| response_attempt.state.wallet_tabs.as_ref().unwrap().issue(attempt)).flatten();
+        response_attempt.allowed = token.is_some();
         // Retain the drop guard even if the stream is discarded without polling this future.
         drop(response_attempt);
         line(token.map_or_else(|| json!({ "refused": true }), |token| json!({ "token": token })))
@@ -319,13 +338,31 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_dropped_response_cools_down_and_cannot_issue_a_grant_even_on_allow() {
+        let app = Host::start(Some(Arc::new(|_, _, _| true)), DEADLINE, COOLDOWN).await;
+        let attempt = app.tabs().begin(Instant::now()).unwrap();
+        drop(ResponseAttempt { attempt: attempt.clone(), state: app.state.clone(), allowed: false });
+        assert!(app.tabs().issue(&attempt).is_none());
+        drop(attempt);
+        assert!(app.tabs().begin(Instant::now()).is_none());
+        assert!(app.tabs().grants.lock().unwrap().tokens.is_empty());
+    }
+
     #[test]
-    fn a_dropped_response_cannot_issue_a_grant_even_on_allow() {
+    fn consecutive_refusals_wait_from_decision_until_the_cap_and_allow_resets_the_wait() {
         let tabs = WalletTabs::new("http://127.0.0.1:3601".into(), ORIGIN.into(), Arc::new(|_, _, _| true));
-        let attempt = tabs.begin().unwrap();
-        drop(ResponseAttempt(attempt.clone()));
-        assert!(tabs.issue(&attempt).is_none());
-        assert!(tabs.grants.lock().unwrap().tokens.is_empty());
+        let mut now = Instant::now();
+        let mut attempt = tabs.begin(now).unwrap();
+        for (allowed, seconds) in [(false, 5), (false, 10), (false, 20), (false, 40), (false, 80),
+            (false, 120), (false, 120), (true, 5), (false, 5), (false, 10)] {
+            now += Duration::from_secs(30); // The dialog has been open longer than the base wait.
+            tabs.record_decision(allowed, now);
+            drop(attempt);
+            now += Duration::from_secs(seconds);
+            assert!(tabs.begin(now - Duration::from_millis(1)).is_none(), "waited less than {seconds}s");
+            attempt = tabs.begin(now).expect("the wait is over at the boundary");
+        }
     }
 
     #[tokio::test]

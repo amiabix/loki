@@ -100,9 +100,8 @@ async fn browser_origin(State(st): State<Shared>, req: Request, next: Next) -> R
     }
     // The ceremony endpoints are token-authenticated, member-to-member calls (also exempt from
     // the process token in `auth`): a native peer reaches them with no `Origin` and so skips the
-    // pairing check, and a browser joiner from another origin reaches ONLY these four, still gated
-    // by its invite token. So CORS-open them to any origin (they expose nothing the invite token
-    // does not already guard); every other `/api/*` route stays locked to the paired coordinator.
+    // pairing check. The browser signer runs its join worker on a separate origin and needs CORS
+    // on these four routes. The invite token gates ceremony access, not detection of the listener.
     let open_ceremony = matches!(
         req.uri().path(),
         "/api/enroll" | "/api/agreed" | "/api/roster" | "/api/session"

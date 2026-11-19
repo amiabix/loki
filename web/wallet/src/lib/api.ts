@@ -18,12 +18,21 @@ export function enroll(coordinatorOrigin?: string): Promise<EnrolledMember> { re
 
 // ─── native member (paired tab) ──────────────────────────────────────────────
 type Pairing = { endpoint: string; capability: string; lokisigner?: true };
-const PAIRING = "loki_device_session"; // sessionStorage: this tab's native member + capability
+const PAIRING = "loki_device_session"; // sessionStorage: headless paste flow only
 const LOKISIGNER_SLOT = "loki_lokisigner_slot"; // public reconnect hint, not authorization
+// Browsers can copy sessionStorage to a new tab; keep an approved grant in this page only.
+let lokiSignerSession: Pairing | null = null;
 function paired(): Pairing | null {
   if (typeof window === "undefined") return null;
-  try { const raw = sessionStorage.getItem(PAIRING); return raw ? JSON.parse(raw) as Pairing : null; }
-  catch { return null; }
+  if (lokiSignerSession) return lokiSignerSession;
+  try {
+    const raw = sessionStorage.getItem(PAIRING);
+    const stored = raw ? JSON.parse(raw) as Pairing : null;
+    if (!stored?.lokisigner) return stored;
+    // Older wallets stored LokiSigner grants here. Never use a copy from storage.
+    sessionStorage.removeItem(PAIRING);
+  } catch {}
+  return null;
 }
 /** Which signer this tab drives. */
 export function signerKind(): "native" | "browser" { return paired() ? "native" : "browser"; }
@@ -70,6 +79,7 @@ export async function pairDevice(link: string, signal?: AbortSignal): Promise<Sl
   sessionStorage.setItem(PAIRING, JSON.stringify(session));
   sessionStorage.setItem("loki_me", JSON.stringify({ slot: member.slot }));
   sessionStorage.removeItem(LOKISIGNER_SLOT);
+  lokiSignerSession = null;
   return member;
 }
 
@@ -109,15 +119,15 @@ export async function connectLokiSigner(slot: number, show: (progress: ConnectPr
           clearTimeout(deadline);
           const capability = await readConnectDecision(res, show);
           signal.throwIfAborted();
-          const session: Pairing = { endpoint, capability, lokisigner: true };
           sessionStorage.setItem(LOKISIGNER_SLOT, String(slot));
           sessionStorage.setItem("loki_me", JSON.stringify({ slot }));
-          sessionStorage.setItem(PAIRING, JSON.stringify(session));
+          sessionStorage.removeItem(PAIRING);
+          lokiSignerSession = { endpoint, capability, lokisigner: true };
           return;
         }
         if (res && ![404, 405, 425].includes(res.status)) {
           throw new Error(res.status === 429
-            ? "LokiSigner is showing another connection request. If you did not start it, choose Refuse in LokiSigner."
+            ? "LokiSigner is showing another connection request or waiting before it can show a new one. Refuse any request you did not start. You may need to wait up to two minutes before trying again."
             : "LokiSigner did not allow this connection.");
         }
       }
@@ -261,6 +271,7 @@ export async function unlock(opts: UnlockOpts): Promise<SignerSession> {
   return s;
 }
 export function forgetSession(): void {
+  lokiSignerSession = null;
   try { sessionStorage.removeItem("loki_me"); sessionStorage.removeItem(PAIRING); } catch {}
 }
 export async function logout(): Promise<boolean> {
