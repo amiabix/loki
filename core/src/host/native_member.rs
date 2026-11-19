@@ -3,7 +3,7 @@
 use std::{
     collections::BTreeMap,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex},
 };
 
 use serde_json::{json, Value};
@@ -20,9 +20,23 @@ const UPGRADE_VAULT: &str = "Open this vault in the wallet once to upgrade it.";
 struct NativeMember {
     state: Shared,
     viewing_keys: Mutex<BTreeMap<(String, u16), (SignerViewingKey, VaultNetwork)>>,
-    stop: Arc<tokio::sync::Notify>,
+    stop: Arc<NativeStop>,
     #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
     notice: Option<LocalNotice>,
+}
+
+#[derive(Default)]
+struct NativeStop {
+    requested: AtomicBool,
+    wake: tokio::sync::Notify,
+}
+
+impl NativeStop {
+    fn decision<T>(&self, refused: T, ask: impl FnOnce() -> T) -> T {
+        if self.requested.load(Ordering::Acquire) { return refused; }
+        let answer = ask();
+        if self.requested.load(Ordering::Acquire) { refused } else { answer }
+    }
 }
 
 static RUNNING: Mutex<Option<Arc<NativeMember>>> = Mutex::new(None);
@@ -32,7 +46,7 @@ static KEY_RECOVERY: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 struct NativeScope;
 
 impl NativeScope {
-    fn install(state: &Shared, stop: Arc<tokio::sync::Notify>, _notice: Option<LocalNotice>) -> Result<Self, String> {
+    fn install(state: &Shared, stop: Arc<NativeStop>, _notice: Option<LocalNotice>) -> Result<Self, String> {
         let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
         if running.is_some() {
             return Err("LokiSigner is already running.".into());
@@ -66,14 +80,25 @@ pub(crate) fn run_native(
         fn drop(&mut self) { crate::seal_kdf::clear_session_cache(); }
     }
     let _cache = ClearCache;
-    let stop = Arc::new(tokio::sync::Notify::new());
-    super::run_local_with(config, Some(pass), Some(notice.clone()), Some(approval), Some(roster_confirmation), fetched,
-        Some(&stop), Some(connect), |state| NativeScope::install(state, stop.clone(), Some(notice)))
+    let stop = Arc::new(NativeStop::default());
+    let payment_stop = stop.clone();
+    let approval: LocalApproval = Arc::new(move |summary| {
+        let approved = payment_stop.decision(false, || approval(summary));
+        emit(if approved { Event::PaymentApproved } else { Event::PaymentRefused });
+        approved
+    });
+    let roster_stop = stop.clone();
+    let roster_confirmation: LocalRosterConfirmation = Arc::new(move |summary|
+        roster_stop.decision(super::RosterAnswer::NoAnswer, || roster_confirmation(summary)));
+    super::run_local_with(config, Some(pass), Some(notice.clone()), Some(approval), Some(roster_confirmation),
+        fetched, Some(&stop.wake), Some(connect), |state| NativeScope::install(state, stop.clone(), Some(notice)))
 }
 
 pub(crate) fn request_stop() -> bool {
     RUNNING.lock().is_ok_and(|running| running.as_ref().is_some_and(|member| {
-        member.stop.notify_one();
+        member.stop.requested.store(true, Ordering::Release);
+        if let Some(tabs) = &member.state.wallet_tabs { tabs.close(); }
+        member.stop.wake.notify_one();
         true
     }))
 }
@@ -117,6 +142,94 @@ pub(crate) fn disconnect_wallet_tabs() {
     }
 }
 
+// The file sink accepts only these messages, never a coordinator response, request or secret.
+pub(super) enum Event {
+    Registered,
+    RegistrationFailed,
+    CoordinatorUnavailable,
+    RegistrationRefused,
+    RegistrationKeyUnavailable,
+    PaymentApproved,
+    PaymentRefused,
+    PaymentFailed,
+    PaymentSigned,
+}
+
+#[derive(Default)]
+struct Diagnostics {
+    sink: Option<extern "C" fn(*const std::ffi::c_char)>,
+    last_error: Option<&'static str>,
+}
+
+impl Diagnostics {
+    fn record(&mut self, event: Event) {
+        let (message, error) = match event {
+            Event::Registered => ("Registered with the coordinator.", false),
+            Event::RegistrationFailed => ("LokiSigner couldn’t register with the coordinator.", true),
+            Event::CoordinatorUnavailable => ("LokiSigner couldn’t reach the coordinator. Check your connection.", true),
+            Event::RegistrationRefused => ("The coordinator refused to register this device.", true),
+            Event::RegistrationKeyUnavailable => ("LokiSigner couldn’t use its device key to register.", true),
+            Event::PaymentApproved => ("Payment approved on this Mac.", false),
+            Event::PaymentRefused => ("Payment approval was refused or not completed on this Mac.", true),
+            Event::PaymentFailed => ("LokiSigner couldn’t complete the payment. Check the wallet for details.", true),
+            Event::PaymentSigned => ("LokiSigner signed a payment.", false),
+        };
+        if error { self.last_error = Some(message); }
+        if let Some(sink) = self.sink { sink(std::ffi::CString::new(message).unwrap().as_ptr()); }
+    }
+}
+
+static DIAGNOSTICS: Mutex<Diagnostics> = Mutex::new(Diagnostics { sink: None, last_error: None });
+
+pub(crate) fn set_log_sink(sink: extern "C" fn(*const std::ffi::c_char)) {
+    DIAGNOSTICS.lock().unwrap().sink = Some(sink);
+}
+
+fn emit(event: Event) {
+    DIAGNOSTICS.lock().unwrap().record(event);
+}
+
+pub(super) fn emit_for(state: &super::state::AppState, event: Event) {
+    let running = RUNNING.lock().unwrap().as_ref().is_some_and(|member| std::ptr::eq(state, member.state.as_ref()));
+    if running { emit(event); }
+}
+
+pub(crate) fn status(data: &Path, development_http: bool) -> Value {
+    let saved = super::RegistrationConfig::resume(data, development_http).ok();
+    let mut reply = json!({
+        "unlocked": false, "registered": false, "wallet_tabs": 0, "vaults": null,
+        "coordinator": saved.as_ref().map(|r| &r.coordinator),
+        "slot": saved.and_then(|r| r.slot),
+    });
+    if let Ok(running) = with_running_member(|member| {
+        let state = &member.state;
+        let has_session = state.session.blocking_read().is_some();
+        let registered_slot = state.registration.blocking_read().as_ref().map(|r| r.slot);
+        let active = !member.stop.requested.load(Ordering::Acquire);
+        let unlocked = has_session && active;
+        let count = if unlocked { state.wallet_tabs.as_ref().map_or(0, |tabs| tabs.count()) } else { 0 };
+        // Count on-disk vaults without opening shares or prompting for Touch ID.
+        let vaults = unlocked.then(|| {
+            match std::fs::read_dir(state.config.data.join("vaults")) {
+                Ok(entries) => Some(entries.flatten().filter(|entry| {
+                    entry.file_name().to_str().and_then(|name| ceremony::dir(&state.config.data, name).ok())
+                        .is_some_and(|dir| dir.exists("vault.sealed"))
+                }).count()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(0),
+                Err(_) => None,
+            }
+        }).flatten();
+        let registration = state.config.registration.as_ref();
+        Ok(json!({
+            "unlocked": unlocked, "registered": active && registered_slot.is_some(), "wallet_tabs": count, "vaults": vaults,
+            "coordinator": registration.map(|r| &r.coordinator),
+            "slot": registered_slot.or_else(|| registration.and_then(|r| r.slot)),
+        }))
+    }) { reply = running; }
+    reply["last_error"] = json!(DIAGNOSTICS.lock().unwrap().last_error);
+    reply
+}
+
 pub(crate) fn restore_running(words: Zeroizing<Vec<u8>>, file: &Path) -> Result<(), &'static str> {
     let member = RUNNING.lock().map_err(|_| super::native_recovery::REFUSED)?.clone()
         .ok_or(super::native_recovery::LOCKED)?;
@@ -142,14 +255,14 @@ pub(crate) fn vault_addresses() -> Result<Vec<Value>, &'static str> {
 
 fn vault_addresses_with(after_list: impl FnOnce()) -> Result<Vec<Value>, &'static str> {
     with_running_member(|member| {
-        let (data, pass) = {
+        let rows = {
             let session = member.state.session.blocking_read();
             let session = session.as_ref().ok_or(LOCKED)?;
-            (session.data.clone(), session.passphrase.clone())
+            if member.stop.requested.load(Ordering::Acquire) { return Err(LOCKED); }
+            member.list(&session.data, &session.passphrase)
         };
-        let rows = member.list(&data, &pass);
         after_list();
-        if member.state.session.blocking_read().is_none() {
+        if member.stop.requested.load(Ordering::Acquire) || member.state.session.blocking_read().is_none() {
             return Err(LOCKED);
         }
         rows
@@ -239,32 +352,111 @@ mod tests {
     #[test]
     fn a_paired_native_app_runs_offline_and_only_sets_aside_after_stop() {
         let _test = TEST_MEMBER.lock().unwrap();
+        static LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        extern "C" fn capture(line: *const std::ffi::c_char) {
+            let line = unsafe { std::ffi::CStr::from_ptr(line) }.to_str().unwrap();
+            LOG.lock().unwrap().push(line.to_owned());
+        }
+        set_log_sink(capture);
         let root = std::env::temp_dir().join(format!("loki-native-stop-{}", uuid::Uuid::new_v4()));
         let data = root.join("LokiSigner");
         crate::profile::create(&data, PASS, "Test member").unwrap();
         super::super::registration::save_coordinator(&data, "https://127.0.0.1:1", 7).unwrap();
         let mut settings = config(&data);
         settings.registration = Some(super::super::RegistrationConfig::resume(&data, false).unwrap());
+        let before = status(&data, false);
+        assert_eq!(before["unlocked"], false);
+        assert_eq!(before["coordinator"], "https://127.0.0.1:1");
+        assert_eq!(before["slot"], 7);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let (asked_tx, asked_rx) = std::sync::mpsc::channel();
+        let (answer_tx, answer_rx) = std::sync::mpsc::channel();
+        let answer_rx = Mutex::new(answer_rx);
         let worker = std::thread::spawn(move || {
             let notice: LocalNotice = Arc::new(move |kind, message| {
                 if kind != "recovery" { ready_tx.send((kind.to_owned(), message.to_owned())).unwrap(); }
             });
-            stop_tx.send(run_native(settings, Zeroizing::new(PASS.into()), notice, Arc::new(|_| false),
-                Arc::new(|_| crate::host::RosterAnswer::Differ), Arc::new(|_, _, _| false), None)).unwrap();
+            let approve: LocalApproval = Arc::new(move |_| {
+                asked_tx.send(()).unwrap();
+                answer_rx.lock().unwrap().recv().unwrap()
+            });
+            stop_tx.send(run_native(settings, Zeroizing::new(PASS.into()), notice, approve,
+                Arc::new(|_| crate::host::RosterAnswer::Differ), Arc::new(|_, _, _| true), None)).unwrap();
         });
         let timeout = std::time::Duration::from_secs(10);
         let events: BTreeMap<_, _> = (0..2).map(|_| ready_rx.recv_timeout(timeout).unwrap()).collect();
         assert_eq!(events["registration-warning"], "LokiSigner couldn’t reach the coordinator. Your profile is unlocked and LokiSigner will keep trying in the background.");
         assert_eq!(events["ready"], "", "native readiness does not expose a local pairing link");
+        let offline = status(&data, false);
+        assert_eq!(offline["unlocked"], true);
+        assert_eq!(offline["registered"], false);
+        assert_eq!(offline["vaults"], 0);
+        assert_eq!(offline["last_error"], "LokiSigner couldn’t reach the coordinator. Check your connection.");
         assert!(vault_addresses().unwrap().is_empty(), "local features work while offline");
+
+        // Fake only the coordinator's public registration reply. Use the real tab handshake.
+        let state = RUNNING.lock().unwrap().as_ref().unwrap().state.clone();
+        let endpoint = state.config.lokisigner_url().unwrap();
+        let member = super::super::registration::PublicMember {
+            slot: 7, signing_pubkey: "01".repeat(32), relay_pubkey: "02".repeat(32),
+            advertise_url: "https://member.example".into(), lokisigner_url: Some(endpoint.clone()),
+        };
+        *state.registration.blocking_write() = Some(member.clone());
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let client = reqwest::Client::builder().timeout(timeout).no_proxy().build().unwrap();
+        let connect = || runtime.block_on(async {
+            let body = client.post(format!("{endpoint}/api/connect")).header("origin", "https://127.0.0.1:1")
+                .json(&json!({"slot": 7, "signing_pubkey": member.signing_pubkey, "relay_pubkey": member.relay_pubkey}))
+                .send().await.unwrap().error_for_status().unwrap().text().await.unwrap();
+            serde_json::from_str::<Value>(body.lines().last().unwrap()).unwrap()["token"].as_str().unwrap().to_owned()
+        });
+        let access = |token: &str| runtime.block_on(async {
+            client.get(format!("{endpoint}/api/registration")).header("origin", "https://127.0.0.1:1")
+                .header("x-loki-token", token).send().await
+        });
+        let first = connect();
+        assert_eq!(access(&first).unwrap().status(), 200);
+        let connected = status(&data, false);
+        assert_eq!(connected["registered"], true);
+        assert_eq!(connected["wallet_tabs"], 1);
+        disconnect_wallet_tabs();
+        assert_eq!(status(&data, false)["wallet_tabs"], 0);
+        assert_eq!(access(&first).unwrap().status(), 401);
         // A subsequent attempt still fails, but the modal warning is once per launch.
         assert_eq!(ready_rx.recv_timeout(std::time::Duration::from_secs(6)).unwrap_err(), std::sync::mpsc::RecvTimeoutError::Timeout);
+
+        let second = connect();
+        let approve = state.approval.clone().unwrap();
+        let prompt = std::thread::spawn(move || approve(r#"{"memo":"test-private-payment-memo"}"#));
+        asked_rx.recv_timeout(timeout).unwrap();
         assert!(set_aside(&data, false).is_err());
         assert!(request_stop());
+        assert_eq!(status(&data, false)["unlocked"], false);
+        assert_eq!(status(&data, false)["wallet_tabs"], 0);
+        assert!(!matches!(access(&second), Ok(response) if response.status().is_success()));
+        answer_tx.send(true).unwrap();
+        assert!(!prompt.join().unwrap(), "a late approval cannot override lock");
         stop_rx.recv_timeout(timeout).unwrap().unwrap();
         worker.join().unwrap();
+        assert!(state.session.blocking_read().is_none(), "stop clears the retained session");
+        let refused = "Payment approval was refused or not completed on this Mac.";
+        assert_eq!(status(&data, false)["last_error"], refused);
+        #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+        {
+            let args = std::ffi::CString::new(json!({"args": ["--data", data, "--port", "0"]}).to_string()).unwrap();
+            let ptr = unsafe { crate::enclave_ffi::loki_member_app_status(args.as_ptr()) };
+            let reply: Value = serde_json::from_slice(unsafe { std::ffi::CStr::from_ptr(ptr) }.to_bytes()).unwrap();
+            unsafe { crate::enclave_ffi::loki_member_app_free(ptr); }
+            assert_eq!(reply, json!({"status": status(&data, false)}));
+        }
+        DIAGNOSTICS.lock().unwrap().sink = None;
+        let messages = LOG.lock().unwrap().join("\n");
+        assert!(messages.contains("LokiSigner couldn’t reach the coordinator. Check your connection."));
+        assert!(messages.contains(refused));
+        for secret in [PASS, &first, &second, "test-private-payment-memo", "127.0.0.1:1"] {
+            assert!(!messages.contains(secret), "diagnostics must only contain fixed messages");
+        }
         set_aside(&data, false).unwrap();
         assert!(!data.exists());
         std::fs::remove_dir_all(root).unwrap();

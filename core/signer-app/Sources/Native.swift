@@ -87,6 +87,7 @@ func loki_signer_approval_selftest(_ approve: @convention(c) (UnsafePointer<CCha
 func runDecisionAlert(_ alert: NSAlert, timeout: TimeInterval? = nil,
                       escape: NSApplication.ModalResponse,
                       field: NSTextField? = nil) -> NSApplication.ModalResponse {
+    guard (NSApp.delegate as? NativeSigner)?.lockingForAbsence != true else { return escape }
     alert.layout()
     let window = alert.window
     let buttons = alert.buttons
@@ -371,7 +372,9 @@ private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointe
     // Synchronous delivery keeps recovery words on screen before registration continues.
     DispatchQueue.main.sync {
         let alert = NSAlert()
+        let signer = NSApp.delegate as? NativeSigner
         if event == "ready" || event == "restore-ready" || event == "restore-pending" {
+            guard signer?.lockingForAbsence != true else { return }
             alert.messageText = event == "ready" ? "LokiSigner is running" : "Vault restored"
             let connect = "On this Mac, choose Connect LokiSigner in the wallet. If the wallet only offers to paste a link, ask the coordinator to update it. Keep LokiSigner running to approve and sign."
             alert.informativeText = event == "restore-pending"
@@ -381,6 +384,9 @@ private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointe
             alert.runModal()
             (NSApp.delegate as? NativeSigner)?.didStart()
         } else if event == "recovery" {
+            // These words can only be shown once. Lock the member, but do not discard its notice.
+            signer?.showingRecoveryWords = true
+            defer { signer?.showingRecoveryWords = false }
             alert.messageText = "Save your recovery words privately"
             alert.informativeText = text
             alert.addButton(withTitle: "I saved these words")
@@ -404,8 +410,22 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
     private var queuedLink: String?
     private var startingOver = false
     private var recoveringKey = false
+    fileprivate private(set) var lockingForAbsence = false
+    fileprivate var showingRecoveryWords = false
+    private var lockTimer: Timer?
+    private var presence: SignerPresence?
+    private var lastStartError: String?
     private let args: [String]
     private let initialLink: String?
+    private lazy var statusWindow = SignerStatusWindow(load: { [args = self.args] in
+        nativeQuery(loki_member_app_status, ["args": args])
+    }, localError: { [weak self] in self?.lastStartError }, canUnlock: { [weak self] in
+        guard let self else { return false }
+        return !self.running && !self.prompting
+    }, unlock: { [weak self] in
+        guard let self else { return }
+        self.start(self.queuedLink ?? self.retryLink)
+    })
 
     init(args: [String], link: String?) {
         self.args = args
@@ -413,22 +433,47 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        presence = SignerPresence { [weak self] in self?.lockForAbsence() }
         NSApp.activate(ignoringOtherApps: true)
         DispatchQueue.main.async {
-            if !self.opened { self.opened = true; self.start(self.initialLink) }
+            guard !self.opened else { return }
+            self.opened = true
+            if self.initialLink == nil, self.profile()["profile"] as? String == "fresh" {
+                self.showStatus(nil)
+            } else {
+                self.start(self.initialLink)
+            }
         }
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
         opened = true
-        guard let url = urls.first else { return }
+        guard !lockingForAbsence, let url = urls.first else { return }
         if prompting { queuedLink = url.absoluteString }
         else { start(url.absoluteString) }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if opened && !running && !prompting { start(queuedLink ?? retryLink) }
-        return true
+        showStatus(nil)
+        return false
+    }
+
+    private func lockForAbsence() {
+        guard running, !startingOver, !lockingForAbsence else { return }
+        lockingForAbsence = true
+        SignerLog.write("LokiSigner locked because the Mac was unattended.")
+        finishLockRequest()
+        // The Swift worker can be starting before Rust installs its stop handle. Also unwind
+        // any stacked decision panels without discarding the one-time recovery words.
+        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in self?.finishLockRequest() }
+        RunLoop.main.add(timer, forMode: .common)
+        RunLoop.main.add(timer, forMode: .modalPanel)
+        lockTimer = timer
+    }
+
+    private func finishLockRequest() {
+        _ = loki_member_app_stop()
+        if !showingRecoveryWords && NSApp.modalWindow != nil { NSApp.abortModal() }
     }
 
     private func profile(_ action: UInt32 = 0) -> [String: Any] {
@@ -436,6 +481,11 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
     }
 
     private func retry(_ failure: SignerStartFailure, link: String?) {
+        guard !lockingForAbsence else { return }
+        if failure != .cancelled {
+            lastStartError = failure.message
+            SignerLog.write("LokiSigner couldn’t finish setup or unlock. Check the app for details.")
+        }
         prompting = true
         retryLink = link
         let alert = retryAlert(failure, profile: profile()["profile"] as? String)
@@ -486,18 +536,20 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
     }
 
     fileprivate func didStart() {
+        guard !lockingForAbsence else { return }
+        lastStartError = nil
         prompting = false
         queuedLink = nil
     }
 
     fileprivate func warnRegistration(_ event: String, message: String) {
-        guard running, !startingOver else { return }
+        guard running, !startingOver, !lockingForAbsence else { return }
         registrationWarnings.append((event, message))
         showNextRegistrationWarning()
     }
 
     private func showNextRegistrationWarning() {
-        guard running, !startingOver, !prompting, !registrationWarnings.isEmpty else { return }
+        guard running, !startingOver, !lockingForAbsence, !prompting, !registrationWarnings.isEmpty else { return }
         prompting = true
         let warning = registrationWarnings.removeFirst()
         let recover = warning.event == "registration-key-gone"
@@ -509,7 +561,15 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
     private func stopped(_ failure: SignerStartFailure, link: String?) {
         running = false
         registrationWarnings.removeAll()
-        if startingOver {
+        if lockingForAbsence {
+            lockTimer?.invalidate()
+            lockTimer = nil
+            lockingForAbsence = false
+            // Resume only on an explicit Unlock, never from the consumed pairing claim.
+            queuedLink = nil
+            retryLink = nil
+            prompting = false
+        } else if startingOver {
             startingOver = false
             finishSetAside()
         } else {
@@ -518,7 +578,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
     }
 
     func start(_ link: String?) {
-        guard !prompting else { return }
+        guard !prompting, !lockingForAbsence else { return }
         prompting = true
         queuedLink = nil
         retryLink = link
@@ -784,6 +844,10 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
     @objc func disconnectWalletTabs(_ sender: Any?) {
         loki_member_app_disconnect_wallet_tabs()
     }
+
+    @objc func showStatus(_ sender: Any?) { statusWindow.show() }
+
+    @objc func showLog(_ sender: Any?) { SignerLog.showInFinder() }
 }
 
 func runNativeSigner(arguments: [String], link: String?) -> Never {
@@ -797,13 +861,17 @@ func runNativeSigner(arguments: [String], link: String?) -> Never {
     app.setActivationPolicy(.regular)
     let menu = NSMenu()
     let item = NSMenuItem()
-    let actions = NSMenu()
+    let actions = NSMenu(title: "LokiSigner")
     let delegate = NativeSigner(args: args, link: link)
     let vaultAddresses = VaultAddressesWindow()
+    let status = actions.addItem(withTitle: "Status…", action: #selector(NativeSigner.showStatus(_:)), keyEquivalent: "")
+    status.target = delegate
     let showAddresses = actions.addItem(withTitle: "Vault addresses…", action: #selector(VaultAddressesWindow.show(_:)), keyEquivalent: "")
     showAddresses.target = vaultAddresses
     let restore = actions.addItem(withTitle: "Restore a vault…", action: #selector(NativeSigner.restoreVault(_:)), keyEquivalent: "")
     restore.target = delegate
+    let log = actions.addItem(withTitle: "Show Log in Finder", action: #selector(NativeSigner.showLog(_:)), keyEquivalent: "")
+    log.target = delegate
     actions.addItem(.separator())
     let disconnect = actions.addItem(withTitle: "Disconnect all wallet tabs", action: #selector(NativeSigner.disconnectWalletTabs(_:)), keyEquivalent: "")
     disconnect.target = delegate

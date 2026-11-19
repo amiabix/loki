@@ -1275,6 +1275,11 @@ fn ensure_worker_with_signer(
 /// Runs under `st.payment`.
 fn record_failure(st: &Shared, data: &Path, pass: &str, vault: &str, attempt: &str, error: String) {
     let Ok(mut p) = read_payment(data, pass, vault, attempt) else { return };
+    #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+    if st.config.native && matches!(p.phase.as_str(), "signing" | "ready" | "signed")
+        && !payment_dir(data, vault).is_ok_and(|dir| dir.exists(&refused_file(attempt))) {
+        super::native_member::emit_for(st, super::native_member::Event::PaymentFailed);
+    }
     match p.phase.as_str() {
         "signing" => {
             eprintln!("payment {attempt}: error in signing worker");
@@ -1369,6 +1374,9 @@ fn payment_worker(
     // mailbox while waiting, with one throttled poll shared by the proposer and its coordinator.
     let poll = std::sync::Mutex::new((std::time::Instant::now() - Duration::from_millis(500), Ok(())));
     let check_running = || {
+        if st.config.native && st.session.blocking_read().is_none() {
+            return Err("LokiSigner is locked".into());
+        }
         let mut poll = poll.lock().map_err(|e| e.to_string())?;
         if poll.1.is_ok() && poll.0.elapsed() >= Duration::from_millis(500) {
             let _guard = st.payment.lock().map_err(|e| e.to_string())?;
@@ -1381,7 +1389,13 @@ fn payment_worker(
         }
         poll.1.clone()
     };
-    let sign_member = || sign_with_opened(st, data, pass, &p, &v, owned, &check_running, opened);
+    let sign_member = || -> Result<(), String> {
+        if st.config.native { check_running()?; }
+        sign_with_opened(st, data, pass, &p, &v, owned, &check_running, opened)?;
+        #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+        if st.config.native { super::native_member::emit_for(st, super::native_member::Event::PaymentSigned); }
+        Ok(())
+    };
     if p.proposer == v.slot {
         // Every member hears the group: those outside it stop waiting to sign.
         send_control(&st.config.frostd_url, &v, &p, "start", &members(&v))?;

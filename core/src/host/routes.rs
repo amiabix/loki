@@ -231,12 +231,16 @@ async fn unlock(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
 }
 
 async fn lock(State(st): State<Shared>) -> Reply {
+    lock_session(&st).await;
+    ok(json!({ "locked": true }))
+}
+
+pub(super) async fn lock_session(st: &Shared) {
     let mut session = st.session.write().await;
     *session = None;
     if let Some(tabs) = &st.wallet_tabs { tabs.revoke_all(); }
     drop(session);
     crate::seal_kdf::clear_session_cache();
-    ok(json!({ "locked": true }))
 }
 
 async fn status(

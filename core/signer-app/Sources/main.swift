@@ -11,6 +11,7 @@ import Security
 
 let mode = CommandLine.arguments.dropFirst().first ?? "native"
 if mode == "native" || mode == "pair" || mode.hasPrefix("loki://") {
+    SignerLog.start()
     let link = mode == "pair" ? CommandLine.arguments.dropFirst(2).first : mode.hasPrefix("loki://") ? mode : nil
     let offset = mode == "pair" ? 3 : 2
     runNativeSigner(arguments: Array(CommandLine.arguments.dropFirst(offset)), link: link)

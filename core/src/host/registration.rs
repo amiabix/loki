@@ -468,6 +468,22 @@ const RESTORE_RETRY: &str = "Vault restored. LokiSigner could not reconnect to t
 
 /// One registration attempt; on success the public roster entry is saved and served.
 async fn register_once(st: &Shared, pass: Zeroizing<String>, pairing_claim: Option<String>) -> Result<PublicMember, RegistrationFailure> {
+    let result = register_member(st, pass, pairing_claim).await;
+    #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+    if st.config.native {
+        use super::native_member::{emit_for, Event};
+        emit_for(st, match &result {
+            Ok(_) => Event::Registered,
+            Err(RegistrationFailure::Connection(_)) => Event::CoordinatorUnavailable,
+            Err(RegistrationFailure::WrongSlot | RegistrationFailure::Refused(_)) => Event::RegistrationRefused,
+            Err(RegistrationFailure::Device(_)) => Event::RegistrationKeyUnavailable,
+            Err(RegistrationFailure::Other(_)) => Event::RegistrationFailed,
+        });
+    }
+    result
+}
+
+async fn register_member(st: &Shared, pass: Zeroizing<String>, pairing_claim: Option<String>) -> Result<PublicMember, RegistrationFailure> {
     let launch = st.config.registration.as_ref().ok_or("self-registration not configured")?;
     let owned = st.clone();
     let member = tokio::task::spawn_blocking(move || -> Result<_, RegistrationFailure> {

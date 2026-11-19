@@ -51,6 +51,7 @@ struct Grants {
     pending: Weak<ConnectAttempt>,
     last_prompt: Option<Instant>,
     tokens: HashSet<String>,
+    closed: bool,
 }
 
 pub(super) struct WalletTabs {
@@ -82,8 +83,23 @@ impl WalletTabs {
         self.permits_request(request) && self.grants.lock().unwrap().tokens.contains(token)
     }
 
+    #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+    pub(super) fn count(&self) -> usize {
+        self.grants.lock().unwrap().tokens.len()
+    }
+
     pub(super) fn revoke_all(&self) {
+        self.clear(false);
+    }
+
+    #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+    pub(super) fn close(&self) {
+        self.clear(true);
+    }
+
+    fn clear(&self, close: bool) {
         let mut grants = self.grants.lock().unwrap();
+        grants.closed |= close;
         grants.tokens.clear();
         if let Some(attempt) = grants.pending.upgrade() {
             attempt.cancelled.store(true, Ordering::Release);
@@ -93,7 +109,7 @@ impl WalletTabs {
     fn begin(&self) -> Option<Arc<ConnectAttempt>> {
         let mut grants = self.grants.lock().unwrap();
         let now = Instant::now();
-        if grants.pending.strong_count() != 0 || grants.last_prompt.is_some_and(|last| now - last < self.cooldown) {
+        if grants.closed || grants.pending.strong_count() != 0 || grants.last_prompt.is_some_and(|last| now - last < self.cooldown) {
             return None;
         }
         let attempt = Arc::new(ConnectAttempt { cancelled: AtomicBool::new(false), deadline: now + self.deadline });
