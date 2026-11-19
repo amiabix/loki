@@ -82,7 +82,6 @@ impl WalletTabs {
         self.permits_request(request) && self.grants.lock().unwrap().tokens.contains(token)
     }
 
-    #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
     pub(super) fn revoke_all(&self) {
         let mut grants = self.grants.lock().unwrap();
         grants.tokens.clear();
@@ -127,8 +126,11 @@ pub(super) async fn request(State(st): State<Shared>, member: Result<Json<Member
     let registered = st.registration.read().await.as_ref().is_some_and(|r|
         member.slot == r.slot && member.signing_pubkey == r.signing_pubkey && member.relay_pubkey == r.relay_pubkey);
     if !registered { return StatusCode::TOO_EARLY.into_response(); }
-    if st.session.read().await.is_none() { return StatusCode::FORBIDDEN.into_response(); }
+    // Lock must either cancel this attempt or prevent it from starting.
+    let session = st.session.read().await;
+    if session.is_none() { return StatusCode::FORBIDDEN.into_response(); }
     let Some(attempt) = tabs.begin() else { return StatusCode::TOO_MANY_REQUESTS.into_response(); };
+    drop(session);
     // A short code is for human comparison, not an HTTP credential or a lookup key.
     let code = format!("{:06}", (OsRng.next_u64() % 1_000_000));
     let worker = {
@@ -245,6 +247,7 @@ mod tests {
         let app = Host::start(Some(ask), Duration::from_secs(3), Duration::ZERO).await;
         empty(app.connect().send().await.unwrap(), StatusCode::FORBIDDEN).await;
         empty(app.connect().header("origin", "https://other.example").send().await.unwrap(), StatusCode::FORBIDDEN).await;
+        empty(app.connect().header("origin", ORIGIN).header("origin", ORIGIN).send().await.unwrap(), StatusCode::FORBIDDEN).await;
         empty(app.connect().header("origin", ORIGIN).header("host", "localhost").send().await.unwrap(), StatusCode::FORBIDDEN).await;
         empty(app.connect().header("origin", ORIGIN).send().await.unwrap(), StatusCode::TOO_EARLY).await;
         assert!(prompts.try_recv().is_err());
@@ -274,14 +277,29 @@ mod tests {
 
         decide.send(true).unwrap();
         let second_token = token(app.connect().header("origin", ORIGIN).send().await.unwrap()).await;
+        assert!(prompts.try_recv().is_ok());
         assert_ne!(first_token, second_token);
         for token in [&first_token, &second_token] {
             assert_eq!(app.try_token(Some(ORIGIN), token).await.status(), StatusCode::OK);
         }
-        app.tabs().revoke_all();
+        let reply = app.client.post(format!("{}/api/lock", app.endpoint)).header("origin", ORIGIN)
+            .header("x-loki-token", &first_token).send().await.unwrap();
+        assert_eq!(reply.status(), StatusCode::OK);
+        assert_eq!(reply.json::<Value>().await.unwrap(), json!({"locked": true}));
         for token in [&first_token, &second_token] {
             assert_eq!(app.try_token(Some(ORIGIN), token).await.status(), StatusCode::UNAUTHORIZED);
+            for path in ["status", "recovery-backup", "unlock"] {
+                let url = format!("{}/api/{path}", app.endpoint);
+                let request = if path == "unlock" { app.client.post(url).json(&json!({"passphrase": "unused"})) }
+                    else { app.client.get(url) };
+                let reply = request.header("origin", ORIGIN).header("x-loki-token", token).send().await.unwrap();
+                assert_eq!(reply.status(), StatusCode::UNAUTHORIZED, "{path}");
+                assert_eq!(reply.json::<Value>().await.unwrap(), json!({"error": "invalid process token"}));
+            }
         }
+        // The registration still matches, but a locked profile cannot start a fresh dialog.
+        empty(app.connect().header("origin", ORIGIN).send().await.unwrap(), StatusCode::FORBIDDEN).await;
+        assert!(prompts.try_recv().is_err());
 
         let restarted = Host::start(Some(Arc::new(|_, _, _| true)), Duration::from_secs(3), Duration::ZERO).await;
         restarted.registered().await;
@@ -289,6 +307,45 @@ mod tests {
         let after_restart = token(restarted.connect().header("origin", ORIGIN).send().await.unwrap()).await;
         assert_ne!(after_restart, first_token);
         assert_eq!(restarted.try_token(Some(ORIGIN), &after_restart).await.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn a_valid_host_and_origin_still_require_a_loopback_peer() {
+        let tabs = WalletTabs::new("http://127.0.0.1:3601".into(), ORIGIN.into(), Arc::new(|_, _, _| false));
+        for (peer, allowed) in [("127.0.0.1:40100", true), ("192.0.2.4:40100", false)] {
+            let request = axum::http::Request::builder().uri("/api/connect").header("host", "127.0.0.1:3601").header("origin", ORIGIN)
+                .extension(ConnectInfo(peer.parse::<SocketAddr>().unwrap())).body(Body::empty()).unwrap();
+            assert_eq!(tabs.permits_request(&request), allowed, "{peer}");
+        }
+    }
+
+    #[test]
+    fn a_dropped_response_cannot_issue_a_grant_even_on_allow() {
+        let tabs = WalletTabs::new("http://127.0.0.1:3601".into(), ORIGIN.into(), Arc::new(|_, _, _| true));
+        let attempt = tabs.begin().unwrap();
+        drop(ResponseAttempt(attempt.clone()));
+        assert!(tabs.issue(&attempt).is_none());
+        assert!(tabs.grants.lock().unwrap().tokens.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disconnect_all_refuses_an_open_request_even_if_allow_arrives_later() {
+        let (shown, mut prompts) = tokio::sync::mpsc::unbounded_channel();
+        let (allow, decisions) = std::sync::mpsc::channel();
+        let decisions = Mutex::new(decisions);
+        let ask = Arc::new(move |_: &str, code: &str, _: &ConnectAttempt| {
+            shown.send(code.to_owned()).unwrap();
+            decisions.lock().unwrap().recv_timeout(Duration::from_secs(2)).unwrap_or(false)
+        });
+        let app = Host::start(Some(ask), Duration::from_secs(3), Duration::ZERO).await;
+        app.registered().await;
+        let response = app.connect().header("origin", ORIGIN).send().await.unwrap();
+        let code = tokio::time::timeout(Duration::from_secs(1), prompts.recv()).await.unwrap().unwrap();
+        app.tabs().revoke_all(); // The same operation the LokiSigner menu invokes.
+        allow.send(true).unwrap();
+        let frames: Vec<Value> = response.text().await.unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(frames, [json!({"code": code}), json!({"refused": true})]);
+        assert!(app.tabs().grants.lock().unwrap().tokens.is_empty());
     }
 
     #[tokio::test]
@@ -353,6 +410,9 @@ mod tests {
         for origin in [None, Some(ORIGIN)] {
             assert_eq!(app.try_token(origin, &capability).await.status(), StatusCode::OK);
         }
+        assert_eq!(app.client.post(format!("{}/api/lock", app.endpoint)).header("x-loki-token", &capability)
+            .send().await.unwrap().status(), StatusCode::OK);
+        assert_eq!(app.try_token(None, &capability).await.status(), StatusCode::OK);
         empty(app.connect().header("origin", ORIGIN).header("x-loki-token", capability).send().await.unwrap(), StatusCode::NOT_FOUND).await;
     }
 }

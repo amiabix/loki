@@ -80,6 +80,12 @@ test('a frostd-only in-browser signer enrolls without an advertise_url, beside n
   } finally { rmSync(dir, { recursive: true, force: true }); delete process.env.LOKI_REGISTRY; }
 });
 
+test('registration v2 matches the shared byte-for-byte Rust and Node fixture', () => {
+  const fixture = new URL('../../../poc/tests/fixtures/lokisigner-registration-v2.json', import.meta.url);
+  const { enrollment, origin, challenge, expected } = JSON.parse(readFileSync(fixture, 'utf8'));
+  assert.deepEqual(members.registrationMessage(enrollment, origin, challenge), Buffer.from(expected));
+});
+
 test('registration signs the separate LokiSigner loopback port and refuses unsigned changes', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'loki-roster-local-'));
   process.env.LOKI_REGISTRY = join(dir, 'roster.json');

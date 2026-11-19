@@ -152,7 +152,7 @@ function allocatedSlot(e: Enrollment, list: Member[], challenges: Challenge[]): 
   if (list.some((m) => m.relay_pubkey === e.relay_pubkey)) throw new Error("relay key already registered");
   return slot(desired ?? Math.max(0, ...list.map((m) => m.slot), ...bindings.map((d) => d.slot), ...reserved) + 1);
 }
-function message(e: Enrollment, origin: string, challenge: string): Buffer {
+export function registrationMessage(e: Enrollment, origin: string, challenge: string): Buffer {
   const local = e.lokisigner_url === undefined ? [] : [e.lokisigner_url];
   return Buffer.from([local.length ? "loki-member-registration-v2" : "loki-member-registration-v1", origin, e.slot ?? 0, e.signing_pubkey, e.relay_pubkey, e.advertise_url, ...local, e.device_pubkey, challenge].join("\n"));
 }
@@ -221,7 +221,7 @@ export async function registerMember(raw: unknown, origin: string): Promise<Memb
     write(`${file}.challenges`, challenges.filter((c) => c.challenge !== challenge));
     if (!issued || issued.origin !== origin || JSON.stringify(issued.enrollment) !== JSON.stringify(e)) throw new Error("unknown, expired or changed registration challenge");
     const key = deviceKey(e.device_pubkey);
-    const bytes = message(e, origin, challenge);
+    const bytes = registrationMessage(e, origin, challenge);
     if (!verify("sha256", bytes, key, signature) && !(signature.length === 64 && verify("sha256", bytes, { key, dsaEncoding: "ieee-p1363" }, signature))) throw new Error("device signature does not verify");
     checkDevice(e, file);
     const list = slots();

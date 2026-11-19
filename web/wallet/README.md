@@ -45,14 +45,15 @@ The Node verifier uses the same Ed25519 enrollment / P-256 SHA-256 verification 
 This proves key possession, **not hardware attestation**. The software development backend
 and an Enclave key produce the same wire proofs.
 
-Open `http://localhost:3001`. Paste the member's printed **local pairing link into the pairing
-field**, never into the address bar or a message to an operator. Each tab stores its own
-device capability in session storage and calls that manually selected loopback endpoint
-with `X-Loki-Token`; no capability is sent to Next. The device allows only the exact configured
-browser origin, and pairing checks the device's public identity against the roster. A roster
-update cannot silently retarget an existing paired tab. Create/join, review/approve, and
-co-signing use the existing typed device API. Logout locks the device; restart that member
-locally with its unlock file and pair with its new link. A web restart does not restart members.
+Open `http://localhost:3001`. For the headless member or an older app, paste its **local
+pairing link into the pairing field**, never into the address bar or a message to an operator.
+For an updated LokiSigner, select its slot and choose **Connect LokiSigner**; compare the
+code and allow in the app instead of pasting a link. The tab stores the capability in
+`sessionStorage` (duplicating a tab can copy it) and calls that loopback endpoint with
+`X-Loki-Token`; no capability is sent to Next. The member restricts browser access to the
+configured origin, and the wallet checks the member's public identity against the roster.
+A roster update cannot silently retarget a connected tab. Logout locks the device and, on
+updated LokiSigner, revokes all wallet-tab grants. A web restart does not restart members.
 
 A LokiSigner member compares the roster code in LokiSigner, not on this page: **Compare in
 LokiSigner** opens LokiSigner's dialog, and only its **Codes match** records the agreement
@@ -120,8 +121,11 @@ coordinator + frostd. Payment review/approve are wired through `request()` the s
 advertise_url, lokisigner_url?}]}`. The optional signed `lokisigner_url` field tells everyone
 reading `/api/members` that the slot uses LokiSigner and which loopback port it currently
 listens on. It is not a capability. Deploy this coordinator and wallet before updating
-LokiSigner; an older coordinator rejects registration containing the field. Headless and
-older apps without that field still use the pasted local link. Old hosted registry formats
+LokiSigner; see the [version matrix](../../poc/signer-app/README.md#build-and-pair). Do not roll
+back the coordinator until roster rows containing the field are removed: an older `/api/members`
+rejects those rows and fails for everyone. A visited website can use the port and the open
+ceremony routes to learn whether LokiSigner is running, subject to local network permission.
+Safari may block the wallet's loopback request; this has not been verified. Old hosted registry formats
 fail closed; retire those files privately and self-register existing devices into a fresh
 public roster. Never copy old access records into
 it. The adjacent `.challenges` file contains only short-lived public enrollment proofs and

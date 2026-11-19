@@ -538,6 +538,7 @@ function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string 
     finally { setBusy(false); }
   };
   const [nativeOpen, setNativeOpen] = useState(false);
+  const [nativeBusy, setNativeBusy] = useState(false);
   const [apps, setApps] = useState<Slot[]>();
   const [choice, setChoice] = useState<number | "paste">();
   useEffect(() => {
@@ -553,7 +554,7 @@ function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string 
     return () => loading.abort();
   }, [nativeOpen]);
   const lokiSigners = apps?.filter((m) => m.lokisigner_url !== undefined) ?? [];
-  const selected = choice ?? (lokiSigners.length === 1 ? lokiSigners[0].slot : lokiSigners.length === 0 && apps ? "paste" : undefined);
+  const selected = choice ?? (lokiSigners.length === 0 && apps ? "paste" : undefined);
   const selectedSlot = typeof selected === "number" ? selected : undefined;
   const selectedMember = apps?.find((m) => m.slot === selectedSlot);
 
@@ -630,7 +631,7 @@ function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string 
         {nativeOpen && <>
           {(lokiSigners.length > 0 || selectedSlot !== undefined) && <label className="my-2 block">
             Member app
-            <select value={selected ?? ""} disabled={busy} onChange={(e) => setChoice(e.target.value === "paste" ? "paste" : Number(e.target.value))}
+            <select value={selected ?? ""} disabled={busy || nativeBusy} onChange={(e) => setChoice(e.target.value === "paste" ? "paste" : Number(e.target.value))}
               className="glass mt-1 w-full rounded-full px-4 py-2.5 text-[var(--ink)]">
               {selected === undefined && <option value="" disabled>Choose a member app</option>}
               {lokiSigners.map((m) => <option key={m.slot} value={m.slot}>LokiSigner · Slot {m.slot}</option>)}
@@ -640,8 +641,9 @@ function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string 
             </select>
           </label>}
           {selected === undefined && lokiSigners.length === 0 && <p role="status" className="my-2">Reading the member roster…</p>}
-          {selected !== undefined && <NativeTabConnection key={selected} member={selectedMember} slot={selectedSlot} disabled={busy}
-            onBusy={setBusy} onConnected={onLoggedIn} />}
+          {/* Starting a browser-signer action unmounts and cancels a pending native connection. */}
+          {selected !== undefined && !busy && <NativeTabConnection key={selected} member={selectedMember} slot={selectedSlot} disabled={nativeBusy}
+            onBusy={setNativeBusy} onConnected={onLoggedIn} />}
         </>}
       </details>
     </div>

@@ -391,12 +391,12 @@ mod tests {
             });
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if native {
-                    let mut config = config(data);
-                    config.token.clear();
-                    run_native(config, Zeroizing::new(PASS.into()), notice, Arc::new(|_| false),
+                    run_native(config(data), Zeroizing::new(PASS.into()), notice, Arc::new(|_| false),
                         Arc::new(|_| crate::host::RosterAnswer::Differ), Arc::new(|_, _, _| false), None)
                 } else {
-                    super::super::run_local(config(data), None, Some(notice), None, None)
+                    let config = super::super::config_from_args(&["--data".into(), data.to_str().unwrap().into(),
+                        "--port".into(), "0".into()]).unwrap();
+                    super::super::run_local(config, None, Some(notice), None, None)
                 }
             }));
             assert!(result.unwrap_err().is::<Ready>());

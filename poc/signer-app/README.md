@@ -37,21 +37,22 @@ On the wallet's sign-in screen open **Use a native member app instead**. It has 
    because each one reserves a slot.
 2. **Connect this wallet tab**: on **that same Mac**, unlock LokiSigner, select its slot in
    the wallet, and choose **Connect LokiSigner**. If the app is still registering, the tab
-   waits and retries. When LokiSigner asks, check the wallet origin and match the six-digit
-   code in the app to the one in the tab, then choose **Allow**. If they do not match, choose
-   **Refuse**. Nothing is copied. Allow local network access if your browser asks.
+   retries for up to a minute, then offers **Try again**. When LokiSigner asks, check the
+   wallet origin and match the six-digit code in the app to the one in the tab, then choose
+   **Allow**. If they do not match, choose **Refuse**. Nothing is copied. Allow local network
+   access if your browser asks.
 
 The app stays running for ceremony, payment review and signing using the existing device
 consent and nonce-witness paths. Connect separately in each new tab and after a relaunch. In
 the **LokiSigner** menu, **Disconnect all wallet tabs** withdraws existing grants without
-quitting or locking the app. Quit locks the process and also invalidates every grant; launch
-again to unlock and register with the saved public coordinator/slot, without reusing the claim.
+quitting or locking the app. Wallet logout locks the profile and revokes all wallet-tab grants.
+Quit also invalidates every grant; launch again to unlock and register with the saved public
+coordinator/slot, without reusing the claim.
 
-With saved settings, you can
-unlock and use local features such as **Vault addresses…** and **Restore a vault…** while the
-coordinator is offline. If registration fails or is refused, LokiSigner shows a warning, stays
-unlocked and keeps trying in the background. A launch with a new pairing link waits for the
-registration result before reporting success.
+With saved settings, you can unlock and use local features such as **Vault addresses…** and
+**Restore a vault…** while the coordinator is offline. If registration fails or is refused,
+LokiSigner shows a warning, stays unlocked and keeps trying in the background. A launch with
+a new pairing link waits for the registration result before reporting success.
 
 If you cancel, enter the wrong passphrase, or LokiSigner cannot start, choose **Try again**
 or **Quit**. If the coordinator refuses a pairing, retry the saved pairing or get a new link
@@ -61,16 +62,28 @@ it deletes neither the folder nor the old device key in the Keychain. New native
 a random key scope and use a different device login key, even at the same path. That key stays
 with its profile if the folder is moved. Existing vault share key tags do not change.
 
-**Update the coordinator and wallet before updating LokiSigner.** An older coordinator will
-not accept the new app's registration. Its wallet will still offer only a paste field, and
-the new app has no link to paste. An updated wallet still accepts the printed or displayed
-link from `loki_member_app`, `LokiSigner serve`, and older LokiSigner versions.
+**Update the coordinator and wallet before updating LokiSigner.**
+
+| Coordinator and wallet | LokiSigner | What the member sees |
+| --- | --- | --- |
+| Old | Old | Paste the private link displayed by LokiSigner. |
+| New | Old | The wallet still offers the paste flow for an older app. |
+| Old | New | First pairing shows a refusal; a saved profile opens with a registration warning and retries. The old wallet offers only paste, and the new app has no link to paste. |
+| New | New | Select the member slot, choose **Connect LokiSigner**, and compare the code before allowing. |
+
+`loki_member_app` and `LokiSigner serve` still use their printed pairing link. Once a new
+LokiSigner has registered, **do not roll back the coordinator** without removing the roster
+rows containing `lokisigner_url`. The old coordinator rejects those rows as an “unexpected
+registration field,” breaking `/api/members` for everyone, not just those slots.
 
 The signed `lokisigner_url` roster field tells everyone who can read `/api/members` that the
 slot uses LokiSigner and which local port it currently listens on. The field is separate
-from the peer endpoint and contains no tab token. Only the pinned coordinator origin can
-ask from a browser. An approved tab's token stays in its session storage until it disconnects;
-the coordinator serves the page but never receives the token in registration.
+from the peer endpoint and contains no tab token. A website the member visits can use that
+port and the member API's open ceremony routes to learn that LokiSigner is running, subject
+to the browser's local network permission. Only the pinned coordinator origin can ask to
+connect from a browser. Grants are stored in `sessionStorage`: duplicating a tab can copy its
+grant without another **Allow**. The coordinator serves the page but never receives the token
+in registration. Safari may block the wallet's request to loopback; this has not been verified.
 
 ## Back up and restore a vault
 

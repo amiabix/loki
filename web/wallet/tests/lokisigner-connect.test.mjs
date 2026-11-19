@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import ts from 'typescript';
-import { api, connectLokiSigner, hasLokiSignerSession, lastLokiSignerSlot } from '../src/lib/api.ts';
+import { api, connectLokiSigner, hasLokiSignerSession, lastLokiSignerSlot, LokiSignerStartupTimeout } from '../src/lib/api.ts';
 
 // Compile just this JSX module so the existing Node test command can render the production component.
 const componentUrl = new URL('../src/components/NativeTabConnection.tsx', import.meta.url);
@@ -138,4 +138,79 @@ test('a stale loopback port retries discovery; a foreign URL or a refused respon
     await assert.rejects(connect(), /valid LokiSigner loopback address/);
   }
   assert.equal(posts, 2, 'no invalid roster address is contacted');
+});
+
+test('a forbidden or busy connect response is final and displays no comparison code', async (t) => {
+  let status, posts = 0;
+  const tab = new Map();
+  tabFixture(t, async (url) => {
+    if (url === '/api/members') return Response.json({ slots: [{ ...member, lokisigner_url: current }] });
+    return ++posts === 1 ? new Response(null, { status }) : streamed('{"code":"061274"}\n', `{"token":"${token('a')}"}\n`);
+  }).use(tab);
+  for (const [reply, message] of [[403, /did not allow/], [429, /showing another connection request.*choose Refuse/]]) {
+    status = reply;
+    posts = 0;
+    const events = [];
+    await assert.rejects(connectLokiSigner(member.slot, (event) => events.push(event), new AbortController().signal), message);
+    assert.equal(posts, 1);
+    assert.deepEqual(events, [{ phase: 'starting' }]);
+    assert.equal(stored(tab), null);
+  }
+});
+
+test('startup retries stop after one minute and a new attempt can connect', { timeout: 5_000 }, async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const tab = new Map();
+  let ready = false, posts = 0;
+  tabFixture(t, async (url) => {
+    if (url === '/api/members') return Response.json({ slots: [{ ...member, lokisigner_url: current }] });
+    if (ready) return streamed('{"code":"061274"}\n', `{"token":"${token('b')}"}\n`);
+    const status = [undefined, 404, 405, 425][posts++ % 4];
+    if (!status) throw new TypeError('network error');
+    return new Response(null, { status });
+  }).use(tab);
+  const events = [];
+  const connect = () => connectLokiSigner(member.slot, (event) => events.push(event), new AbortController().signal);
+  const stopped = assert.rejects(connect(), (error) => error instanceof LokiSignerStartupTimeout
+    && /open and unlocked.*local network permission.*browser may block/.test(error.message));
+  for (let n = 0; n < 40; n++) {
+    await new Promise(setImmediate);
+    assert.equal(posts, n + 1);
+    t.mock.timers.tick(1500);
+  }
+  await stopped;
+  assert.deepEqual(events, [{ phase: 'starting' }]);
+  assert.equal(stored(tab), null);
+  ready = true;
+  await connect();
+  assert.equal(stored(tab).capability, token('b'));
+});
+
+test('only a code followed by a token in a live request can persist a grant', async (t) => {
+  const tab = new Map();
+  const code = '{"code":"061274"}\n';
+  const grant = `{"token":"${token('c')}"}\n`;
+  let frames = [grant, code];
+  tabFixture(t, async (url) => url === '/api/members'
+    ? Response.json({ slots: [{ ...member, lokisigner_url: current }] })
+    : streamed(...frames)).use(tab);
+  const request = new AbortController();
+  await assert.rejects(connectLokiSigner(member.slot, () => {}, request.signal), /did not allow/);
+  assert.equal(tab.size, 0);
+
+  frames = [code, grant];
+  // The fake stream deliberately delivers a valid decision even after we cancel the request.
+  await assert.rejects(connectLokiSigner(member.slot, (event) => {
+    if (event.phase === 'compare') request.abort();
+  }, request.signal), { name: 'AbortError' });
+  assert.equal(tab.size, 0);
+});
+
+test('a stored LokiSigner grant is not sent to a non-loopback address', async (t) => {
+  const tab = new Map([[sessionKey, JSON.stringify({ endpoint: 'http://not-loopback.example:41227', capability: token('d'), lokisigner: true })]]);
+  const fixture = tabFixture(t, () => assert.fail('an invalid stored address must not be contacted'));
+  fixture.use(tab);
+  await assert.rejects(api('status'), { status: 401, message: 'invalid LokiSigner endpoint' });
+  assert.equal(stored(tab), null);
+  assert.deepEqual(fixture.events, ['loki:auth-lost']);
 });

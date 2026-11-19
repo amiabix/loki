@@ -159,7 +159,6 @@ pub fn config_from_args(args: &[String]) -> Result<Config, String> {
     parse_config(args, false)
 }
 
-#[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
 pub(crate) fn native_config_from_args(args: &[String]) -> Result<Config, String> {
     let mut config = parse_config(args, true)?;
     config.secure_element = "apple".into();
@@ -271,10 +270,9 @@ fn run_local_with<G>(
             .map_err(|e| format!("bind {addr}: {e}"))?;
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
         config.port = addr.port();
-        let wallet_tabs = connect.map(|ask| {
+        let wallet_tabs = connect.zip(config.registration.as_ref()).map(|(ask, registration)| {
             let endpoint = config.lokisigner_url().ok_or("LokiSigner needs a loopback listener")?;
-            let origin = config.registration.as_ref().ok_or("LokiSigner needs a pinned coordinator")?.coordinator.clone();
-            Ok::<_, &str>(connect::WalletTabs::new(endpoint, origin, ask))
+            Ok::<_, &str>(connect::WalletTabs::new(endpoint, registration.coordinator.clone(), ask))
         }).transpose()?;
         let state: state::Shared = std::sync::Arc::new(state::AppState { approval, roster_confirmation, fetched_config: fetched, wallet_tabs, ..state::AppState::new(config) });
         let _scope = on_start(&state)?;

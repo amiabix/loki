@@ -35,14 +35,14 @@ export function lastLokiSignerSlot(): number | undefined {
   } catch { return undefined; }
 }
 
-async function nativeApi<T>(session: Pairing, path: string, body?: unknown): Promise<T> {
+async function nativeApi<T>(session: Pairing, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
   if (session.lokisigner && !isLokiSignerUrl(session.endpoint)) throw new ApiError("invalid LokiSigner endpoint", 401);
   const headers: Record<string, string> = { "X-Loki-Token": session.capability };
   if (body !== undefined) headers["Content-Type"] = "application/json";
   const res = await fetch(`${session.endpoint}/api/${path}`, {
     method: body === undefined ? "GET" : "POST", headers,
     body: body === undefined ? undefined : JSON.stringify(body),
-    credentials: "omit", redirect: "error", cache: "no-store",
+    credentials: "omit", redirect: "error", cache: "no-store", signal,
   });
   const text = await res.text();
   if (session.lokisigner && res.status === 401) throw new ApiError("LokiSigner disconnected this tab", 401);
@@ -53,19 +53,20 @@ async function nativeApi<T>(session: Pairing, path: string, body?: unknown): Pro
 
 /** Pair this tab with a native member from the link it printed (`http://127.0.0.1:<port>/#<capability>`).
  *  The member's identity must be the one the public roster lists for its slot. */
-export async function pairDevice(link: string): Promise<Slot> {
+export async function pairDevice(link: string, signal?: AbortSignal): Promise<Slot> {
   const url = new URL(link.trim());
   if (url.protocol !== "http:" || !["127.0.0.1", "[::1]"].includes(url.hostname)
     || !url.port || Number(url.port) < 1024 || url.pathname !== "/" || url.search || url.username || url.password
     || !/^#[A-Za-z0-9_-]{43}$/.test(url.hash)) throw new Error("Paste the local pairing link printed by your member process");
   const session = { endpoint: url.origin, capability: url.hash.slice(1) };
-  const member = await nativeApi<Slot>(session, "registration");
-  const roster = await listSlots();
+  const member = await nativeApi<Slot>(session, "registration", undefined, signal);
+  const roster = await listSlots(signal);
   if (!roster.some((m) => m.slot === member.slot && m.signing_pubkey === member.signing_pubkey && m.relay_pubkey === member.relay_pubkey && m.advertise_url === member.advertise_url)) {
     throw new Error("Device identity does not match the public roster; register the device first");
   }
-  const status = await nativeApi<{ phase: string }>(session, "status");
+  const status = await nativeApi<{ phase: string }>(session, "status", undefined, signal);
   if (status.phase !== "home") throw new Error("Unlock the profile locally on your device, then pair again");
+  signal?.throwIfAborted();
   sessionStorage.setItem(PAIRING, JSON.stringify(session));
   sessionStorage.setItem("loki_me", JSON.stringify({ slot: member.slot }));
   sessionStorage.removeItem(LOKISIGNER_SLOT);
@@ -74,46 +75,60 @@ export async function pairDevice(link: string): Promise<Slot> {
 
 export type ConnectProgress = { phase: "starting" } | { phase: "compare"; code: string };
 
+export class LokiSignerStartupTimeout extends Error {
+  constructor() {
+    super("Could not reach LokiSigner. It may not be open and unlocked on this Mac, local network permission may have been denied, or this browser may block the request.");
+  }
+}
+
 /** Discover this launch and keep its single response open until LokiSigner decides. */
 export async function connectLokiSigner(slot: number, show: (progress: ConnectProgress) => void, signal: AbortSignal): Promise<void> {
   show({ phase: "starting" });
-  while (!signal.aborted) {
-    const member = (await listSlots(signal)).find((m) => m.slot === slot);
-    const endpoint = member?.lokisigner_url;
-    if (endpoint !== undefined && !isLokiSignerUrl(endpoint)) throw new Error("The coordinator did not give a valid LokiSigner loopback address.");
-    if (member && endpoint) {
-      const { signing_pubkey, relay_pubkey } = member;
-      // Timeout only if no response has started; an opened dialog gets its full deadline.
-      const stalled = new AbortController();
-      const timer = setTimeout(() => stalled.abort(), 15_000);
-      const res = await fetch(`${endpoint}/api/connect`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ slot, signing_pubkey, relay_pubkey }),
-        signal: AbortSignal.any([signal, stalled.signal]), credentials: "omit", redirect: "error", cache: "no-store",
-      }).catch(() => null).finally(() => clearTimeout(timer));
-      signal.throwIfAborted();
-      if (res?.ok) {
-        const capability = await readConnectDecision(res, show);
-        signal.throwIfAborted();
-        const session: Pairing = { endpoint, capability, lokisigner: true };
-        sessionStorage.setItem(LOKISIGNER_SLOT, String(slot));
-        sessionStorage.setItem("loki_me", JSON.stringify({ slot }));
-        sessionStorage.setItem(PAIRING, JSON.stringify(session));
-        return;
+  const starting = new AbortController();
+  const discovery = AbortSignal.any([signal, starting.signal]);
+  const deadline = setTimeout(() => starting.abort(new LokiSignerStartupTimeout()), 60_000);
+  try {
+    while (true) {
+      discovery.throwIfAborted();
+      const member = (await listSlots(discovery)).find((m) => m.slot === slot);
+      discovery.throwIfAborted();
+      const endpoint = member?.lokisigner_url;
+      if (endpoint !== undefined && !isLokiSignerUrl(endpoint)) throw new Error("The coordinator did not give a valid LokiSigner loopback address.");
+      if (member && endpoint) {
+        const { signing_pubkey, relay_pubkey } = member;
+        const stalled = new AbortController();
+        const timer = setTimeout(() => stalled.abort(), 15_000);
+        const res = await fetch(`${endpoint}/api/connect`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ slot, signing_pubkey, relay_pubkey }),
+          signal: AbortSignal.any([discovery, stalled.signal]), credentials: "omit", redirect: "error", cache: "no-store",
+        }).catch(() => null).finally(() => clearTimeout(timer));
+        discovery.throwIfAborted();
+        if (res?.ok) {
+          // A response with a dialog gets the app's full decision deadline, not the startup budget.
+          clearTimeout(deadline);
+          const capability = await readConnectDecision(res, show);
+          signal.throwIfAborted();
+          const session: Pairing = { endpoint, capability, lokisigner: true };
+          sessionStorage.setItem(LOKISIGNER_SLOT, String(slot));
+          sessionStorage.setItem("loki_me", JSON.stringify({ slot }));
+          sessionStorage.setItem(PAIRING, JSON.stringify(session));
+          return;
+        }
+        if (res && ![404, 405, 425].includes(res.status)) {
+          throw new Error(res.status === 429
+            ? "LokiSigner is showing another connection request. If you did not start it, choose Refuse in LokiSigner."
+            : "LokiSigner did not allow this connection.");
+        }
       }
-      if (res && ![404, 405, 425].includes(res.status)) {
-        throw new Error(res.status === 429 ? "LokiSigner is handling another request. Try again in a moment." : "LokiSigner did not allow this connection.");
-      }
+      // Wait for a fresh registration rather than sending a credential to a stale port.
+      await new Promise<void>((resolve) => {
+        const wake = () => { clearTimeout(timer); discovery.removeEventListener("abort", wake); resolve(); };
+        const timer = setTimeout(wake, 1500);
+        discovery.addEventListener("abort", wake, { once: true });
+      });
     }
-    // Missing or stale roster entry, or the server has not received its registration reply yet.
-    // The retry waits for the new port; no credential is sent to the stale port.
-    await new Promise<void>((resolve) => {
-      const wake = () => { clearTimeout(timer); signal.removeEventListener("abort", wake); resolve(); };
-      const timer = setTimeout(wake, 1500);
-      signal.addEventListener("abort", wake, { once: true });
-    });
-  }
-  signal.throwIfAborted();
+  } finally { clearTimeout(deadline); }
 }
 
 async function readConnectDecision(res: Response, show: (progress: ConnectProgress) => void): Promise<string> {

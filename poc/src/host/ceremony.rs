@@ -2244,7 +2244,8 @@ mod tests {
                 async move { Json(result) }
             }).post(|Json(body): Json<Value>| async move {
                 Json(json!({"member": {"slot": body["slot"], "signing_pubkey": body["signing_pubkey"],
-                    "relay_pubkey": body["relay_pubkey"], "advertise_url": body["advertise_url"]}}))
+                    "relay_pubkey": body["relay_pubkey"], "advertise_url": body["advertise_url"],
+                    "lokisigner_url": body["lokisigner_url"]}}))
             }))
             .route("/api/members/challenge", post(move |Json(body): Json<Value>| {
                 let slot = body["slot"].as_u64();
@@ -2380,33 +2381,50 @@ mod tests {
         let sent = enrollment.lock().unwrap();
         assert_eq!(sent.iter().map(|request| request["slot"].as_u64().unwrap()).collect::<Vec<_>>(), [31, 31, 47]);
         for request in sent.iter() {
-            assert_eq!(request.as_object().unwrap().keys().collect::<Vec<_>>(), ["advertise_url", "authorization", "device_pubkey", "relay_pubkey", "signing_pubkey", "slot"]);
+            assert_eq!(request.as_object().unwrap().keys().collect::<Vec<_>>(), ["advertise_url", "authorization", "device_pubkey", "lokisigner_url", "relay_pubkey", "signing_pubkey", "slot"]);
+            assert_eq!(request["lokisigner_url"], "http://127.0.0.1:10001");
         }
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
     async fn native_http_never_extracts_recovery_words_and_keeps_the_ciphertext_routes() {
+        use std::sync::Arc;
+
+        const ORIGIN: &str = "https://wallet.example";
         let data = std::env::temp_dir().join(format!("loki-native-routes-{}", Uuid::new_v4()));
-        let state = AppState::new(crate::host::native_config_from_args(&[
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        let mut state = AppState::new(crate::host::native_config_from_args(&[
             "--data".into(), data.to_str().unwrap().into(), "--port".into(), "0".into(),
+            "--coordinator-url".into(), ORIGIN.into(), "--local-passphrase-file".into(), "unused".into(),
         ]).unwrap());
-        let token = state.config.token.clone();
+        state.wallet_tabs = Some(super::super::connect::WalletTabs::new(base.clone(), ORIGIN.into(), Arc::new(|_, _, _| true)));
+        let member = super::super::registration::PublicMember {
+            slot: 7, signing_pubkey: "01".repeat(32), relay_pubkey: "02".repeat(32),
+            advertise_url: base.clone(), lokisigner_url: Some(base.clone()),
+        };
+        let body = json!({"slot": member.slot, "signing_pubkey": member.signing_pubkey, "relay_pubkey": member.relay_pubkey});
+        *state.registration.write().await = Some(member);
         *state.session.write().await = Some(Session { data: data.clone(), passphrase: Zeroizing::new("test".into()) });
         let vault = hex::encode([61; 32]);
         let signer_dir = signer_dir(&data, &vault).unwrap();
         std::fs::create_dir_all(&signer_dir).unwrap();
         std::fs::write(crate::host::recovery::backup_file(&signer_dir), [8; 16]).unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, crate::host::routes::router(std::sync::Arc::new(state))).await });
+        let router = crate::host::routes::router(Arc::new(state)).into_make_service_with_connect_info::<std::net::SocketAddr>();
+        tokio::spawn(async move { axum::serve(listener, router).await });
         let client = reqwest::Client::new();
+        let grant = client.post(format!("{base}/api/connect")).header("origin", ORIGIN).json(&body)
+            .send().await.unwrap().error_for_status().unwrap().text().await.unwrap();
+        let frame: Value = serde_json::from_str(grant.lines().last().unwrap()).unwrap();
+        let token = frame["token"].as_str().unwrap();
         for (path, body) in [
             ("recovery-setup", "{}"),
             ("recovery-restore", r#"{"vault":"ignored","words":"UNIQUE-RECOVERY-SECRET"}"#),
             ("recovery-restore", r#"{"words":"UNIQUE-RECOVERY-SECRET"!}"#),
         ] {
-            let response = client.post(format!("{base}/api/{path}")).header("x-loki-token", &token)
+            let response = client.post(format!("{base}/api/{path}")).header("origin", ORIGIN).header("x-loki-token", token)
                 .header("content-type", "application/json").body(body).send().await.unwrap();
             assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
             assert_eq!(response.json::<Value>().await.unwrap(), json!({"error": "Manage recovery words and restore vaults in LokiSigner."}));
@@ -2415,7 +2433,7 @@ mod tests {
             ("recovery-status", json!({"recovery_identity": false, "recovery_backup": true, "recovery_in_app": true})),
             ("recovery-backup", json!({"vault": vault, "backup": "08".repeat(16)})),
         ] {
-            assert_eq!(client.get(format!("{base}/api/{path}?vault={vault}")).header("x-loki-token", &token)
+            assert_eq!(client.get(format!("{base}/api/{path}?vault={vault}")).header("origin", ORIGIN).header("x-loki-token", token)
                 .send().await.unwrap().json::<Value>().await.unwrap(), expected);
         }
         assert!(!data.join("recovery.pub").exists());
