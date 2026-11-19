@@ -82,6 +82,92 @@ func registrationWarningAlert(_ message: String, key: Bool = false, recover: Boo
 @_silgen_name("loki_signer_approval_selftest")
 func loki_signer_approval_selftest(_ approve: @convention(c) (UnsafePointer<CChar>?) -> Int32) -> Int32
 
+/// Presents a decision requested by the wallet, without accepting input carried over from
+/// another window. Keep native buttons so assistive technology can still press them.
+func runDecisionAlert(_ alert: NSAlert, timeout: TimeInterval? = nil,
+                      escape: NSApplication.ModalResponse,
+                      field: NSTextField? = nil) -> NSApplication.ModalResponse {
+    alert.layout()
+    let window = alert.window
+    let buttons = alert.buttons
+    var controls: [NSView] = buttons
+    if let field { controls.append(field) }
+    for button in buttons {
+        button.keyEquivalent = ""
+        button.isEnabled = false
+    }
+    window.defaultButtonCell = nil
+    window.initialFirstResponder = field
+
+    var acceptsInputSince = TimeInterval.infinity
+    var enable: Timer?
+    let center = NotificationCenter.default
+    let becameKey = center.addObserver(forName: NSWindow.didBecomeKeyNotification,
+                                       object: window, queue: nil) { _ in
+        window.makeFirstResponder(field)
+        let deadline = ProcessInfo.processInfo.systemUptime + 1
+        let timer = Timer(timeInterval: 1, repeats: false) { _ in
+            guard window.isKeyWindow, window.isVisible else { return }
+            acceptsInputSince = deadline
+            for button in buttons { button.isEnabled = true }
+        }
+        enable = timer
+        RunLoop.main.add(timer, forMode: .modalPanel)
+    }
+    let resignedKey = center.addObserver(forName: NSWindow.didResignKeyNotification,
+                                         object: window, queue: nil) { _ in
+        enable?.invalidate()
+        acceptsInputSince = .infinity
+        for button in buttons { button.isEnabled = false }
+    }
+
+    let input = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseDown, .leftMouseUp]) { event in
+        guard event.window === window else { return event }
+        guard event.timestamp >= acceptsInputSince else { return nil }
+        guard event.type == .keyDown else { return event }
+
+        let focused = window.firstResponder
+        let editing = field.map { $0 === focused || $0.currentEditor() === focused } ?? false
+        switch event.keyCode {
+        case 36, 76: // Return, keypad Enter
+            return nil
+        case 48: // Tab / Shift-Tab
+            // Keep the field reachable even when macOS Keyboard Navigation is off.
+            guard !event.isARepeat else { return nil }
+            let reverse = event.modifierFlags.contains(.shift)
+            let current = editing ? controls.count - 1 : controls.firstIndex { $0 === focused }
+            let next = current.map { ($0 + (reverse ? controls.count - 1 : 1)) % controls.count }
+                ?? (reverse ? controls.count - 1 : 0)
+            window.makeFirstResponder(controls[next])
+            return nil
+        case 49: // Space
+            if editing { return event }
+            if !event.isARepeat { buttons.first { $0 === focused }?.performClick(nil) }
+            return nil
+        case 53: // Escape
+            if !event.isARepeat { NSApp.stopModal(withCode: escape) }
+            return nil
+        default:
+            return event
+        }
+    }
+
+    NSApp.activate(ignoringOtherApps: true)
+    let expiry = timeout.map { seconds in
+        let timer = Timer(timeInterval: seconds, repeats: false) { _ in NSApp.abortModal() }
+        RunLoop.main.add(timer, forMode: .modalPanel)
+        return timer
+    }
+    defer {
+        expiry?.invalidate()
+        enable?.invalidate()
+        center.removeObserver(becameKey)
+        center.removeObserver(resignedKey)
+        if let input = input { NSEvent.removeMonitor(input) }
+    }
+    return alert.runModal()
+}
+
 /// An unanswered payment request is refused after this long.
 private let approvalTimeout: TimeInterval = 120
 
@@ -124,12 +210,8 @@ private func nativeApprove(_ summary: UnsafePointer<CChar>?) -> Int32 {
             """
         alert.addButton(withTitle: "Refuse")
         alert.addButton(withTitle: "Approve and sign")
-        alert.buttons[1].keyEquivalent = ""
-        NSApp.activate(ignoringOtherApps: true)
-        let timeout = Timer(timeInterval: approvalTimeout, repeats: false) { _ in NSApp.abortModal() }
-        RunLoop.main.add(timeout, forMode: .modalPanel)
-        approved = alert.runModal() == .alertSecondButtonReturn
-        timeout.invalidate()
+        approved = runDecisionAlert(alert, timeout: approvalTimeout, escape: .alertFirstButtonReturn)
+            == .alertSecondButtonReturn
     }
     return approved ? 1 : 0
 }
@@ -229,24 +311,11 @@ private func nativeConfirmRoster(_ summary: UnsafePointer<CChar>?) -> Int32 {
         alert.accessoryView = stack
         alert.addButton(withTitle: "Codes differ")
         alert.addButton(withTitle: "Codes match")
-        // The dialog takes focus while the member may be typing elsewhere: Return, Space or any
-        // other key answers nothing, and the member must click. Lay out first, because
-        // NSAlert assigns its default button there.
-        alert.layout()
-        for button in alert.buttons {
-            button.keyEquivalent = ""
-            button.refusesFirstResponder = true
-        }
-        alert.window.defaultButtonCell = nil
-        NSApp.activate(ignoringOtherApps: true)
-        let timeout = Timer(timeInterval: rosterTimeout, repeats: false) { _ in NSApp.abortModal() }
-        RunLoop.main.add(timeout, forMode: .modalPanel)
-        switch alert.runModal() {
+        switch runDecisionAlert(alert, timeout: rosterTimeout, escape: .abort) {
         case .alertSecondButtonReturn: answer = 1
         case .alertFirstButtonReturn: answer = 2
         default: answer = 0
         }
-        timeout.invalidate()
     }
     return answer
 }
@@ -278,20 +347,13 @@ func showConnectDialog(origin: String, code: String, cancelled: @escaping () -> 
     alert.accessoryView = comparison
     alert.addButton(withTitle: "Refuse")
     alert.addButton(withTitle: "Allow")
-    alert.layout()
-    for button in alert.buttons {
-        button.keyEquivalent = ""
-        button.refusesFirstResponder = true
-    }
     let window = alert.window
-    window.defaultButtonCell = nil
-    NSApp.activate(ignoringOtherApps: true)
     let timer = Timer(timeInterval: 0.1, repeats: true) { _ in
         if cancelled() && NSApp.modalWindow === window { NSApp.abortModal() }
     }
     RunLoop.main.add(timer, forMode: .modalPanel)
     defer { timer.invalidate() }
-    return alert.runModal() == .alertSecondButtonReturn && !cancelled()
+    return runDecisionAlert(alert, escape: .alertFirstButtonReturn) == .alertSecondButtonReturn && !cancelled()
 }
 
 private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointer<CChar>?) {
@@ -523,8 +585,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         alert.informativeText = "Coordinator: \(origin)\n\nOnly continue if this is the coordinator you intended. LokiSigner then asks it for the signer configuration and shows it to you before anything is saved."
         alert.addButton(withTitle: "Continue")
         alert.addButton(withTitle: "Cancel")
-        NSApp.activate(ignoringOtherApps: true)
-        return alert.runModal() == .alertFirstButtonReturn
+        return runDecisionAlert(alert, escape: .alertSecondButtonReturn) == .alertFirstButtonReturn
     }
 
     private func configurationText(_ config: [String: Any]) -> String {
@@ -564,9 +625,14 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         alert.accessoryView = password
         alert.addButton(withTitle: link == nil ? "Unlock" : "Pair")
         alert.addButton(withTitle: "Cancel")
-        alert.window.initialFirstResponder = password
-        NSApp.activate(ignoringOtherApps: true)
-        let answer = alert.runModal()
+        let answer: NSApplication.ModalResponse
+        if link != nil {
+            answer = runDecisionAlert(alert, escape: .alertSecondButtonReturn, field: password)
+        } else {
+            alert.window.initialFirstResponder = password
+            NSApp.activate(ignoringOtherApps: true)
+            answer = alert.runModal()
+        }
         alert.window.endEditing(for: password)
         guard answer == .alertFirstButtonReturn else {
             password.stringValue = ""

@@ -30,6 +30,9 @@ On the wallet's sign-in screen open **Use a native member app instead**. It has 
      **I saved these words**.
    - "LokiSigner is running". Choose **Done**.
 
+   The coordinator and pairing configuration dialogs ignore input for the first second after
+   taking focus. Return and Enter do not confirm either dialog; Escape cancels.
+
    While the link is out the wallet watches the public roster. Once the slot appears there,
    the wallet says so and you can continue to step 2. The roster alone cannot tell you whose
    app registered the slot. Compare the code on your own Mac before allowing the tab. When the two
@@ -41,8 +44,10 @@ On the wallet's sign-in screen open **Use a native member app instead**. It has 
    the wallet, and choose **Connect LokiSigner**. If the app is still registering, the tab
    retries for up to a minute, then offers **Try again**. When LokiSigner asks, check the
    wallet origin and match the six-digit code in the app to the one in the tab, then choose
-   **Allow**. If they do not match, choose **Refuse**. Nothing is copied. Allow local network
-   access if your browser asks.
+   **Allow**. If they do not match, choose **Refuse**. The dialog ignores input for the first
+   second after taking focus. Tab starts on **Refuse**, Space activates the focused button,
+   Escape refuses, and Return and Enter do not answer. Nothing is copied. Allow local
+   network access if your browser asks.
 
 The app stays running for ceremony, payment review and signing using the existing device
 consent and nonce-witness paths. Connect separately in each new tab and after a relaunch. In
@@ -202,14 +207,20 @@ or a run of more than three combining marks.
 
 - **Codes match** records the agreement and tells the creator.
 - **Codes differ** records nothing, and LokiSigner refuses that vault until it restarts, so a
-  page cannot reopen the dialog until the member gives in.
-- Neither button answers to Return, Space or any other key. The dialog takes focus when a page
-  asks, possibly while the member is typing elsewhere, so the member must click.
-- Closing the dialog or leaving it unanswered for 10 minutes records nothing; the member can
-  ask again.
+  page cannot reopen the dialog until the member gives in. If you choose **Codes differ** by
+  mistake, restart LokiSigner to clear the refusal and compare again.
+- Pressing Escape, closing the dialog or leaving it unanswered for 10 minutes records nothing;
+  the member can ask again.
 
 LokiSigner shows one roster dialog at a time. While it is open the member's other requests
 continue, and when the roster or the setup changed in the meantime the answer is refused.
+
+The roster and payment dialogs come to the front, but their buttons are disabled for the first
+second each time the dialog takes focus. Clicks and keystrokes during that second are ignored.
+Once the buttons are enabled, click a button or use Tab (or Shift-Tab) to focus it and press
+Space. No button starts focused. The first Tab reaches **Codes differ** or **Refuse** so that
+Tab then Space cannot agree to a roster or approve a payment. Return and Enter never answer.
+Escape refuses a payment and dismisses a roster comparison without recording an answer.
 
 The roster dialog and the payment dialog are both modal on the app's main thread. A payment
 request that arrives while the roster dialog is open waits until the member answers it or it
