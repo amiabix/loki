@@ -94,6 +94,8 @@ pub(super) struct PublicMember {
     pub signing_pubkey: String,
     pub relay_pubkey: String,
     pub advertise_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lokisigner_url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -103,6 +105,8 @@ struct Enrollment {
     signing_pubkey: String,
     relay_pubkey: String,
     advertise_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lokisigner_url: Option<String>,
     device_pubkey: String,
     authorization: String,
 }
@@ -167,7 +171,9 @@ async fn registration_response(mut response: reqwest::Response, step: &str, nati
 
 impl Enrollment {
     fn message(&self, origin: &str, challenge: &str) -> Vec<u8> {
-        format!("loki-member-registration-v1\n{origin}\n{}\n{}\n{}\n{}\n{}\n{challenge}",
+        let (version, local) = self.lokisigner_url.as_ref()
+            .map_or(("v1", String::new()), |url| ("v2", format!("{url}\n")));
+        format!("loki-member-registration-{version}\n{origin}\n{}\n{}\n{}\n{}\n{local}{}\n{challenge}",
             self.slot.unwrap_or(0), self.signing_pubkey, self.relay_pubkey, self.advertise_url, self.device_pubkey).into_bytes()
     }
 }
@@ -231,6 +237,7 @@ async fn register(config: &Config, pass: &str, pairing_claim: Option<&str>, slot
     let enrollment = Enrollment {
         slot, signing_pubkey: hex::encode(identity.public().signing),
         relay_pubkey: hex::encode(identity.public().encryption), advertise_url,
+        lokisigner_url: config.lokisigner_url(),
         device_pubkey: hex::encode(&device_pub), authorization: hex::encode(authorization),
     };
     let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
@@ -255,7 +262,8 @@ async fn register(config: &Config, pass: &str, pairing_claim: Option<&str>, slot
         .json().await.map_err(|e| e.to_string())?;
     let member: PublicMember = serde_json::from_value(reply["member"].clone()).map_err(|e| e.to_string())?;
     if member.slot == 0 || slot.is_some_and(|s| s != member.slot) || member.signing_pubkey != enrollment.signing_pubkey
-        || member.relay_pubkey != enrollment.relay_pubkey || member.advertise_url != enrollment.advertise_url {
+        || member.relay_pubkey != enrollment.relay_pubkey || member.advertise_url != enrollment.advertise_url
+        || member.lokisigner_url != enrollment.lokisigner_url {
         return Err("coordinator returned a different identity".into());
     }
     Ok(member)
@@ -717,6 +725,67 @@ mod tests {
         std::fs::remove_dir_all(data).unwrap();
     }
 
+    #[tokio::test]
+    async fn native_registration_sends_its_loopback_address_and_requires_the_same_address_back() {
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+        use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
+
+        const LOCAL: &str = "http://127.0.0.1:3601";
+        let replies = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/api/members/challenge", post(|Json(body): Json<Value>| async move {
+                assert_eq!(body["lokisigner_url"], LOCAL);
+                Json(json!({"challenge": "cd".repeat(32)}))
+            }))
+            .route("/api/members", post(move |Json(body): Json<Value>| {
+                let reply = replies.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    assert_eq!(body["lokisigner_url"], LOCAL);
+                    let mut member = json!({"slot": body["slot"], "signing_pubkey": body["signing_pubkey"],
+                        "relay_pubkey": body["relay_pubkey"], "advertise_url": body["advertise_url"]});
+                    match reply {
+                        0 => member["lokisigner_url"] = body["lokisigner_url"].clone(),
+                        1 => member["lokisigner_url"] = "http://127.0.0.1:3602".into(),
+                        _ => {} // An absent field must not be silently accepted either.
+                    }
+                    Json(json!({"member": member}))
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let coordinator = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let data = std::env::temp_dir().join(format!("loki-native-register-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&data).unwrap();
+        let mut config = super::super::native_config_from_args(&[
+            "--data".into(), data.to_str().unwrap().into(), "--port".into(), "3601".into(),
+            "--registration-slot".into(), "7".into(), "--coordinator-url".into(), coordinator,
+            "--local-passphrase-file".into(), "unused".into(), "--development-http".into(),
+        ]).unwrap();
+        config.secure_element = "software".into();
+        let member = register(&config, "native unlock", None, Some(7)).await.map_err(|e| e.to_string()).unwrap();
+        assert_eq!(member.lokisigner_url.as_deref(), Some(LOCAL));
+        for _ in 0..2 {
+            assert_eq!(register(&config, "native unlock", None, Some(7)).await.unwrap_err().to_string(), "coordinator returned a different identity");
+        }
+        server.abort();
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
+    fn registration_v2_transcript_matches_the_shared_wire_fixture() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!("../../tests/fixtures/lokisigner-registration-v2.json")).unwrap();
+        let field = |name: &str| fixture["enrollment"][name].as_str().unwrap().to_owned();
+        let enrollment = Enrollment {
+            slot: Some(fixture["enrollment"]["slot"].as_u64().unwrap() as u32),
+            signing_pubkey: field("signing_pubkey"), relay_pubkey: field("relay_pubkey"),
+            advertise_url: field("advertise_url"), lokisigner_url: Some(field("lokisigner_url")),
+            device_pubkey: field("device_pubkey"), authorization: field("authorization"),
+        };
+        assert_eq!(enrollment.message(fixture["origin"].as_str().unwrap(), fixture["challenge"].as_str().unwrap()),
+            fixture["expected"].as_str().unwrap().as_bytes());
+    }
+
     #[test]
     fn registration_transcript_binds_every_public_field_and_coordinator() {
         let identity = crate::setup_transport::Identity::new(1);
@@ -724,7 +793,7 @@ mod tests {
         let public = sk.verifying_key().to_encoded_point(false).as_bytes().to_vec();
         let mut registry = DeviceRegistry::new(identity.public().signing);
         registry.enroll(&public, &identity.authorize_device(&public)).unwrap();
-        let mut e = Enrollment { slot: Some(1), signing_pubkey: hex::encode(identity.public().signing), relay_pubkey: hex::encode(identity.public().encryption), advertise_url: "http://127.0.0.1:3601".into(), device_pubkey: hex::encode(&public), authorization: hex::encode(identity.authorize_device(&public)) };
+        let mut e = Enrollment { slot: Some(1), signing_pubkey: hex::encode(identity.public().signing), relay_pubkey: hex::encode(identity.public().encryption), advertise_url: "http://127.0.0.1:3601".into(), lokisigner_url: None, device_pubkey: hex::encode(&public), authorization: hex::encode(identity.authorize_device(&public)) };
         let origin = "http://localhost:3001";
         let challenge = hex::encode(registry.issue_challenge());
         let message = e.message(origin, &challenge);

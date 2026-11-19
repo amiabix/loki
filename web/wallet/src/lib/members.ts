@@ -2,12 +2,14 @@ import { createPublicKey, randomBytes, verify } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { isLokiSignerUrl } from "./lokisigner-url.ts";
 
-export type Member = { slot: number; signing_pubkey: string; relay_pubkey: string; advertise_url: string };
+export type Member = { slot: number; signing_pubkey: string; relay_pubkey: string; advertise_url: string; lokisigner_url?: string };
 type Enrollment = Omit<Member, "slot"> & { slot?: number; device_pubkey: string; authorization: string };
 type Challenge = { challenge: string; origin: string; enrollment?: Enrollment; pairing_slot?: number; expires: number };
 type Device = { slot: number; signing_pubkey: string; device_pubkey: string };
-const enrollmentFields = ["slot", "signing_pubkey", "relay_pubkey", "advertise_url", "device_pubkey", "authorization"];
+const publicFields = ["slot", "signing_pubkey", "relay_pubkey", "advertise_url", "lokisigner_url"];
+const enrollmentFields = [...publicFields, "device_pubkey", "authorization"];
 
 function registryPath(): string {
   return process.env.LOKI_REGISTRY ?? join(process.cwd(), ".access.json");
@@ -51,10 +53,15 @@ function publicOrigin(value: unknown): string {
 function optionalOrigin(value: unknown): string {
   return value === undefined || value === "" ? "" : publicOrigin(value);
 }
+function lokiSignerField(value: unknown): { lokisigner_url?: string } {
+  if (value === undefined) return {};
+  if (!isLokiSignerUrl(value)) throw new Error("invalid LokiSigner loopback endpoint");
+  return { lokisigner_url: value };
+}
 function publicMember(raw: unknown): Member {
   const m = object(raw);
-  fields(m, ["slot", "signing_pubkey", "relay_pubkey", "advertise_url"]);
-  return { slot: slot(m.slot), signing_pubkey: hex(m.signing_pubkey, 32), relay_pubkey: hex(m.relay_pubkey, 32), advertise_url: optionalOrigin(m.advertise_url) };
+  fields(m, publicFields);
+  return { slot: slot(m.slot), signing_pubkey: hex(m.signing_pubkey, 32), relay_pubkey: hex(m.relay_pubkey, 32), advertise_url: optionalOrigin(m.advertise_url), ...lokiSignerField(m.lokisigner_url) };
 }
 
 /** Strictly public data. Legacy hosted registries must be retired locally, never loaded. */
@@ -110,7 +117,7 @@ function enrollment(raw: unknown): Enrollment {
   const authorization = hex(e.authorization, 64);
   const identity = createPublicKey({ key: Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), Buffer.from(signing_pubkey, "hex")]), format: "der", type: "spki" });
   if (!verify(null, Buffer.from(device_pubkey, "hex"), identity, Buffer.from(authorization, "hex"))) throw new Error("device authorization does not verify");
-  return { ...(e.slot === undefined ? {} : { slot: slot(e.slot) }), signing_pubkey, relay_pubkey, advertise_url: optionalOrigin(e.advertise_url), device_pubkey, authorization };
+  return { ...(e.slot === undefined ? {} : { slot: slot(e.slot) }), signing_pubkey, relay_pubkey, advertise_url: optionalOrigin(e.advertise_url), ...lokiSignerField(e.lokisigner_url), device_pubkey, authorization };
 }
 function deviceKey(key: string) {
   if (!key.startsWith("04")) throw new Error("expected uncompressed P-256 key");
@@ -145,8 +152,9 @@ function allocatedSlot(e: Enrollment, list: Member[], challenges: Challenge[]): 
   if (list.some((m) => m.relay_pubkey === e.relay_pubkey)) throw new Error("relay key already registered");
   return slot(desired ?? Math.max(0, ...list.map((m) => m.slot), ...bindings.map((d) => d.slot), ...reserved) + 1);
 }
-function message(e: Enrollment, origin: string, challenge: string): Buffer {
-  return Buffer.from(["loki-member-registration-v1", origin, e.slot ?? 0, e.signing_pubkey, e.relay_pubkey, e.advertise_url, e.device_pubkey, challenge].join("\n"));
+export function registrationMessage(e: Enrollment, origin: string, challenge: string): Buffer {
+  const local = e.lokisigner_url === undefined ? [] : [e.lokisigner_url];
+  return Buffer.from([local.length ? "loki-member-registration-v2" : "loki-member-registration-v1", origin, e.slot ?? 0, e.signing_pubkey, e.relay_pubkey, e.advertise_url, ...local, e.device_pubkey, challenge].join("\n"));
 }
 
 export async function issuePairingChallenge(raw: unknown, origin: string) {
@@ -213,11 +221,11 @@ export async function registerMember(raw: unknown, origin: string): Promise<Memb
     write(`${file}.challenges`, challenges.filter((c) => c.challenge !== challenge));
     if (!issued || issued.origin !== origin || JSON.stringify(issued.enrollment) !== JSON.stringify(e)) throw new Error("unknown, expired or changed registration challenge");
     const key = deviceKey(e.device_pubkey);
-    const bytes = message(e, origin, challenge);
+    const bytes = registrationMessage(e, origin, challenge);
     if (!verify("sha256", bytes, key, signature) && !(signature.length === 64 && verify("sha256", bytes, { key, dsaEncoding: "ieee-p1363" }, signature))) throw new Error("device signature does not verify");
     checkDevice(e, file);
     const list = slots();
-    const member: Member = { slot: allocatedSlot(e, list, challenges.filter((c) => c.challenge !== challenge)), signing_pubkey: e.signing_pubkey, relay_pubkey: e.relay_pubkey, advertise_url: e.advertise_url };
+    const member: Member = { slot: allocatedSlot(e, list, challenges.filter((c) => c.challenge !== challenge)), signing_pubkey: e.signing_pubkey, relay_pubkey: e.relay_pubkey, advertise_url: e.advertise_url, ...lokiSignerField(e.lokisigner_url) };
     // Persist the public binding first: a crash cannot let a second identity reuse the device.
     write(`${file}.devices`, [...devices(file).filter((d) => d.signing_pubkey !== e.signing_pubkey), { slot: member.slot, signing_pubkey: e.signing_pubkey, device_pubkey: e.device_pubkey }]);
     write(file, { access: [...list.filter((m) => m.slot !== member.slot), member] });
