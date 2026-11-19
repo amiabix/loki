@@ -56,6 +56,40 @@ group viewing key and checks it against the local public metadata. If it cannot 
 vault's address, it shows an error and offers nothing to copy. Vault names are creator-supplied
 labels, not instructions from LokiSigner.
 
+## Roster code
+
+Before key generation every member compares the vault's 24-digit roster code with the others,
+so a coordinator cannot swap a member in. For a LokiSigner member the wallet page cannot agree
+to a roster by itself. When the member chooses **Compare in LokiSigner** on the wallet's
+**Verify members** step, LokiSigner shows "Do the roster codes match?" with the threshold,
+the member count, the member's slot, the network and the code. Rust derives the code from the
+same setup document the signer checks in `dkg_begin`. The vault name comes from the creator's
+invite. It follows the same rule as in **Vault addresses…**: it is shown as written, in its own
+one-line box, or replaced whole by "Name hidden (unsupported characters)" when it is longer
+than 80 characters or holds a control, format, default-ignorable or line-breaking character
+or a run of more than three combining marks.
+
+- **Codes match** records the agreement and tells the creator.
+- **Codes differ** records nothing, and LokiSigner refuses that vault until it restarts, so a
+  page cannot reopen the dialog until the member gives in.
+- Neither button answers to Return, Space or any other key. The dialog takes focus when a page
+  asks, possibly while the member is typing elsewhere, so the member must click.
+- Closing the dialog or leaving it unanswered for 10 minutes records nothing; the member can
+  ask again.
+
+LokiSigner shows one roster dialog at a time. While it is open the member's other requests
+continue, and when the roster or the setup changed in the meantime the answer is refused.
+
+The roster dialog and the payment dialog are both modal on the app's main thread. A payment
+request that arrives while the roster dialog is open waits until the member answers it or it
+times out, and only then shows its own dialog. Ten minutes may be longer than the
+coordinator waits for this member's approval, so answer the roster dialog before approving
+payments.
+
+The headless member (`loki_member_app`, `LokiSigner serve`) has no screen. It keeps the earlier
+behaviour: `POST /api/agree` with the right code agrees, so it trusts whoever holds its session
+token to have compared the code with the other members.
+
 ## Signer configuration
 
 LokiSigner needs no terminal or flags. Its network, frostd relay, lightwalletd and the two

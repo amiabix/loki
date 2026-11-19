@@ -31,7 +31,7 @@ import {
   type PairingLink,
   type PendingApproval,
 } from "@/lib/api";
-import { invitePreview, pairingSecondsLeft, paymentLabel, rememberedVaultSlot, rememberVaultSlot, verifyPhrase } from "@/lib/wallet-ui";
+import { comparesInLokiSigner, invitePreview, nativeRosterRefusal, pairingSecondsLeft, paymentLabel, rememberedVaultSlot, rememberVaultSlot, verifyPhrase } from "@/lib/wallet-ui";
 import { toggleTheme, useIsDark } from "@/lib/theme";
 import { useCeremonyStatus, usePayments, useStatus } from "@/lib/hooks";
 import type {
@@ -1091,7 +1091,21 @@ function CeremonyView({
         {cs.phase === "waiting_for_members" && (
           <WaitingForMembers invites={cs.invites ?? []} />
         )}
-        {cs.phase === "compare_roster" && (
+        {/* Only LokiSigner's roster channel reports `roster_dialog`; any other member, including
+            a headless one paired with this tab, compares the code shown here. */}
+        {cs.phase === "compare_roster" && comparesInLokiSigner(cs) && (
+          <NativeCompareRoster
+            creator={cs.invites !== undefined}
+            vault={vault}
+            fingerprint={cs.fingerprint}
+            rosterCode={cs.roster_code ?? undefined}
+            confirmations={cs.confirmations ?? 0}
+            confirmed={cs.confirmed ?? false}
+            members={cs.members}
+            dialog={cs.roster_dialog ?? null}
+          />
+        )}
+        {cs.phase === "compare_roster" && !comparesInLokiSigner(cs) && (
           <CompareRoster
             creator={cs.invites !== undefined}
             vault={vault}
@@ -1306,6 +1320,82 @@ function CompareRoster({
         <p role="status" className="glass rounded-2xl p-4 text-center text-sm text-mint">{allConfirmed ? "All members confirmed — advancing…" : "You confirmed — waiting for others."}</p>
       )}
       <ErrMsg msg={err} />
+    </div>
+  );
+}
+
+/** A LokiSigner member compares the code in LokiSigner, which records agreement only when the
+ *  member chooses "Codes match" there. This page never shows the code it was sent to compare. */
+function NativeCompareRoster({
+  creator = false,
+  vault,
+  fingerprint,
+  rosterCode,
+  confirmations,
+  confirmed,
+  members,
+  dialog,
+}: {
+  creator?: boolean;
+  vault: string;
+  fingerprint: string | undefined;
+  rosterCode?: string;
+  confirmations: number;
+  confirmed: boolean;
+  members: number;
+  dialog: CeremonyStatus["roster_dialog"];
+}) {
+  const [asking, setAsking] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [confirmedHere, setConfirmedHere] = useState(false);
+
+  const ask = async () => {
+    setAsking(true); setErr(null);
+    try {
+      // The request names the code the member's signer derived; LokiSigner shows it and agrees
+      // only when the member chooses "Codes match" there.
+      await api("agree", { vault, fingerprint, roster_code: rosterCode });
+      setConfirmedHere(true);
+    } catch (e) {
+      setErr(nativeRosterRefusal((e as Error).message, e instanceof ApiError));
+    } finally { setAsking(false); }
+  };
+
+  const allConfirmed = members > 0 && confirmations >= members;
+  // The member's own status reports a confirmation made after this page lost the request.
+  const done = confirmed || confirmedHere || allConfirmed;
+  const waiting = !done && (asking || dialog === "open");
+  const refusal = err ?? (dialog === "codes_differ" ? nativeRosterRefusal("roster codes differ", true) : null);
+
+  return (
+    <div>
+      <p className="mb-4 text-sm text-muted">
+        Security check: <span className="text-foreground">LokiSigner shows this vault&apos;s code</span>,
+        not this page. Compare it with every other member over a channel you already trust, such
+        as a call or in person, and answer in LokiSigner. Choose Codes match there only if every
+        member sees the same code.
+      </p>
+      {creator && (
+        <p className="pill text-muted mb-4">
+          <span className={`dot ${allConfirmed ? "bg-mint text-mint" : "bg-amber text-amber"}`} />
+          {confirmations} of {members} confirmed
+        </p>
+      )}
+      {!done && !waiting && dialog !== "codes_differ" && (
+        <Btn variant="amber" onClick={ask} disabled={!fingerprint || !rosterCode}>
+          Compare in LokiSigner
+        </Btn>
+      )}
+      {waiting && (
+        <p role="status" className="glass rounded-2xl p-4 text-center text-sm text-foreground">
+          LokiSigner is showing the code. Compare it with every other member, then answer in
+          LokiSigner. Unanswered after 10 minutes, it is refused.
+        </p>
+      )}
+      {done && (
+        <p role="status" className="glass rounded-2xl p-4 text-center text-sm text-mint">{allConfirmed ? "All members confirmed — advancing…" : "You confirmed in LokiSigner — waiting for others."}</p>
+      )}
+      {!done && <ErrMsg msg={refusal} />}
     </div>
   );
 }

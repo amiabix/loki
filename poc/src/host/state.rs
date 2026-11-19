@@ -165,6 +165,13 @@ pub struct AppState {
     pub device_auth: std::sync::Mutex<Option<crate::signer::device_auth::DeviceRegistry>>,
     /// The member's native payment decision; `None` (headless) refuses every payment.
     pub approval: Option<super::LocalApproval>,
+    /// The member's native roster-code comparison; `None` (headless) trusts the caller of
+    /// `/api/agree`.
+    pub roster_confirmation: Option<super::LocalRosterConfirmation>,
+    /// The vault whose roster code the native app is asking about; it asks about one at a time.
+    pub(super) roster_asking: std::sync::Mutex<Option<String>>,
+    /// Vaults whose codes the member said differ, refused until the app restarts.
+    pub(super) roster_refused: std::sync::Mutex<BTreeSet<String>>,
     /// Each vault's group viewing key, read from its device-bound signer once per process.
     pub(super) viewing_keys: std::sync::Mutex<BTreeMap<String, orchard::keys::FullViewingKey>>,
     /// The signer configuration LokiSigner fetched for this launch, saved once the profile unlocks.
@@ -184,6 +191,9 @@ impl AppState {
             active_dkgs: std::sync::Mutex::new(BTreeSet::new()),
             device_auth: std::sync::Mutex::new(None),
             approval: None,
+            roster_confirmation: None,
+            roster_asking: std::sync::Mutex::new(None),
+            roster_refused: std::sync::Mutex::new(BTreeSet::new()),
             viewing_keys: std::sync::Mutex::new(BTreeMap::new()),
             fetched_config: None,
         }

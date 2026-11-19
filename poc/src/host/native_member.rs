@@ -6,12 +6,11 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use icu_properties::{props::GeneralCategory, CodePointMapData};
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
 use crate::network::VaultNetwork;
-use super::{ceremony, custody::{is_legacy, SignerViewingKey}, state::Shared, Config, FetchedConfig, LocalApproval, LocalNotice};
+use super::{ceremony, custody::{is_legacy, SignerViewingKey}, state::Shared, Config, FetchedConfig, LocalApproval, LocalNotice, LocalRosterConfirmation, vault_label};
 
 const LOCKED: &str = "Unlock LokiSigner to view vault addresses.";
 const LIST_ERROR: &str = "LokiSigner could not list vaults.";
@@ -49,9 +48,10 @@ pub(crate) fn run_native(
     pass: Zeroizing<String>,
     notice: LocalNotice,
     approval: LocalApproval,
+    roster_confirmation: LocalRosterConfirmation,
     fetched: Option<FetchedConfig>,
 ) -> Result<(), String> {
-    super::run_local_with(config, Some(pass), Some(notice), Some(approval), fetched, NativeScope::install)
+    super::run_local_with(config, Some(pass), Some(notice), Some(approval), Some(roster_confirmation), fetched, NativeScope::install)
 }
 
 /// Snapshot the running member without keeping the process handle locked over a query. Discard
@@ -140,19 +140,6 @@ impl NativeMember {
         let address = key.checked_address(&sealed, network).map_err(|_| VAULT_ERROR)?;
         self.viewing_keys.lock().map_err(|_| VAULT_ERROR)?.entry(id).or_insert((key, network));
         Ok((network.label(), address))
-    }
-}
-
-fn vault_label(name: &str) -> &str {
-    // Refuse multiline, control, format and long labels. Swift also confines names to a
-    // single plain-text field separate from trusted labels, addresses, and error messages.
-    let category = CodePointMapData::<GeneralCategory>::new();
-    if name.chars().count() > 80 || name.chars().any(|c| {
-        c.is_control() || (c.is_whitespace() && c != ' ') || category.get(c) == GeneralCategory::Format
-    }) {
-        "Name hidden (unsupported characters)"
-    } else {
-        name
     }
 }
 
@@ -327,12 +314,17 @@ mod tests {
             let notice: LocalNotice = Arc::new(move |kind, _| {
                 assert_eq!(kind, "ready");
                 assert_eq!(RUNNING.lock().unwrap().is_some(), native);
+                // Only LokiSigner's entry attaches its roster dialog, and it is the one given.
+                let roster = RUNNING.lock().unwrap().as_ref()
+                    .and_then(|member| member.state.roster_confirmation.as_ref().map(|confirm| confirm("{}")));
+                assert_eq!(roster, native.then_some(crate::host::RosterAnswer::Differ));
                 assert_eq!(std::thread::spawn(vault_addresses).join().unwrap(), Err("Unlock LokiSigner to view vault addresses."));
                 std::panic::panic_any(Ready); // Stop once startup reached ready, without leaving a listener running.
             });
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if native {
-                    run_native(config(data), Zeroizing::new(PASS.into()), notice, Arc::new(|_| false), None)
+                    run_native(config(data), Zeroizing::new(PASS.into()), notice, Arc::new(|_| false),
+                        Arc::new(|_| crate::host::RosterAnswer::Differ), None)
                 } else {
                     super::super::run_local(config(data), None, Some(notice), None, None)
                 }

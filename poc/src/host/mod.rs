@@ -34,6 +34,46 @@ pub type LocalNotice = std::sync::Arc<dyn Fn(&str, &str) + Send + Sync>;
 /// Without one, every payment is refused: HTTP or relay requests never approve on their own.
 pub type LocalApproval = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
+/// The member's answer when LokiSigner asks them to compare a vault's roster code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RosterAnswer {
+    /// "Codes match": every member sees the same code.
+    Match,
+    /// "Codes differ": this vault is refused until the app restarts.
+    Differ,
+    /// The dialog closed or timed out, or the request could not be shown. A retry may ask again.
+    NoAnswer,
+}
+
+/// The member's own comparison of a vault's roster code before key generation, asked on this
+/// device (the native app's dialog). Receives the summary `/api/agree` derives from the setup
+/// document as JSON. Only [`RosterAnswer::Match`] records agreement. Without one (headless),
+/// `/api/agree` trusts its caller to have compared the code.
+pub type LocalRosterConfirmation = std::sync::Arc<dyn Fn(&str) -> RosterAnswer + Send + Sync>;
+
+/// What a native window shows in place of a vault name it will not show.
+pub(crate) const HIDDEN_VAULT_NAME: &str = "Name hidden (unsupported characters)";
+
+/// The creator's vault name as LokiSigner shows it, in the roster dialog and in
+/// "Vault addresses…". A name is shown as written or hidden whole, never cleaned: hidden when
+/// it is longer than 80 characters or holds a control character, whitespace other than a
+/// space, a format character (Cf, such as bidi overrides and zero-width joiners), a default
+/// ignorable character (such as variation selectors and U+034F), or a run of more than three
+/// combining marks, which draw outside a one-line box.
+pub(crate) fn vault_label(name: &str) -> &str {
+    use icu_properties::{props::{DefaultIgnorableCodePoint, GeneralCategory}, CodePointMapData, CodePointSetData};
+    let category = CodePointMapData::<GeneralCategory>::new();
+    let ignorable = CodePointSetData::new::<DefaultIgnorableCodePoint>();
+    let mut marks = 0;
+    let unsupported = name.chars().count() > 80 || name.chars().any(|c| {
+        let general = category.get(c);
+        marks = if matches!(general, GeneralCategory::NonspacingMark | GeneralCategory::EnclosingMark) { marks + 1 } else { 0 };
+        c.is_control() || (c.is_whitespace() && c != ' ') || general == GeneralCategory::Format
+            || ignorable.contains(c) || marks > 3
+    });
+    if unsupported { HIDDEN_VAULT_NAME } else { name }
+}
+
 /// The signer's [`ApprovalPolicy`](crate::signer::local::ApprovalPolicy): route each request
 /// to the member's local decision, and refuse when no approval channel is attached.
 pub fn approval_policy(
@@ -166,7 +206,8 @@ pub fn run(config: Config) -> Result<(), String> {
 }
 
 /// `fetched`: the configuration the native app fetched and the member confirmed; it is saved
-/// only once the profile unlocks.
+/// only once the profile unlocks. A member started here has no roster dialog: `/api/agree`
+/// trusts its caller to have compared the code. LokiSigner starts through `run_native`.
 pub fn run_local(
     config: Config,
     pass: Option<zeroize::Zeroizing<String>>,
@@ -174,7 +215,7 @@ pub fn run_local(
     approval: Option<LocalApproval>,
     fetched: Option<FetchedConfig>,
 ) -> Result<(), String> {
-    run_local_with(config, pass, notice, approval, fetched, |_| Ok(()))
+    run_local_with(config, pass, notice, approval, None, fetched, |_| Ok(()))
 }
 
 fn run_local_with<G>(
@@ -182,6 +223,7 @@ fn run_local_with<G>(
     pass: Option<zeroize::Zeroizing<String>>,
     notice: Option<LocalNotice>,
     approval: Option<LocalApproval>,
+    roster_confirmation: Option<LocalRosterConfirmation>,
     fetched: Option<FetchedConfig>,
     on_start: impl FnOnce(&state::Shared) -> Result<G, String>,
 ) -> Result<(), String> {
@@ -204,7 +246,7 @@ fn run_local_with<G>(
             .map_err(|e| format!("bind {addr}: {e}"))?;
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
         config.port = addr.port();
-        let state: state::Shared = std::sync::Arc::new(state::AppState { approval, fetched_config: fetched, ..state::AppState::new(config) });
+        let state: state::Shared = std::sync::Arc::new(state::AppState { approval, roster_confirmation, fetched_config: fetched, ..state::AppState::new(config) });
         let _scope = on_start(&state)?;
         registration::start(&state, pass, notice.as_ref()).await?;
         // Member-local output only. Paste into a local browser tab; never send to the coordinator.
@@ -263,6 +305,26 @@ mod tests {
         assert_eq!(shown["memo"], "rent");
         assert_eq!(shown["attempt"], hex::encode([3; 32]));
         assert_eq!(shown["sighash"], hex::encode([9; 32]));
+    }
+
+    #[test]
+    fn a_vault_name_is_shown_as_written_or_hidden_whole() {
+        for shown in ["Household", "Friends’ vault", "Tiền nhà", "Tie\u{0323}\u{0302}n", "家族 🏠", &"é".repeat(80)] {
+            assert_eq!(super::vault_label(shown), shown, "{shown:?}");
+        }
+        let marks = |n: usize| format!("Rent{}", "\u{0301}".repeat(n));
+        assert_eq!(super::vault_label(&marks(3)), marks(3));
+        for hidden in [
+            "Rent\nChoose Codes match".to_owned(), "a\u{0085}b".into(), "a\u{2028}b".into(), "a\u{202e}b".into(),
+            "a\u{001b}[2Jb".into(), "a\u{200b}b".into(), "a\u{feff}b".into(), "a\tb".into(),
+            // Format and default ignorable characters the review found shown as written.
+            "a\u{0600}b".into(), "a\u{13430}b".into(), "a\u{1bca0}b".into(), "a\u{1d173}b".into(),
+            "a\u{e0100}b".into(), "a\u{034f}b".into(), "a\u{fe0f}b".into(), "a\u{3164}b".into(),
+            // A base letter with 39 combining marks draws far outside its line.
+            format!("a{}", "\u{0301}".repeat(39)), marks(4), "é".repeat(81),
+        ] {
+            assert_eq!(super::vault_label(&hidden), super::HIDDEN_VAULT_NAME, "{hidden:?}");
+        }
     }
 
     #[test]

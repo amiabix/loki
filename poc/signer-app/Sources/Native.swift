@@ -3,7 +3,8 @@ import AppKit
 @_silgen_name("loki_member_app_pair")
 func loki_member_app_pair(_ launch: UnsafePointer<CChar>, _ pass: UnsafeMutablePointer<CChar>,
     _ notify: @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Void,
-    _ approve: @convention(c) (UnsafePointer<CChar>?) -> Int32) -> Int32
+    _ approve: @convention(c) (UnsafePointer<CChar>?) -> Int32,
+    _ confirmRoster: @convention(c) (UnsafePointer<CChar>?) -> Int32) -> Int32
 
 @_silgen_name("loki_member_app_pairing_target")
 func loki_member_app_pairing_target(_ launch: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
@@ -88,6 +89,123 @@ private func nativeApprove(_ summary: UnsafePointer<CChar>?) -> Int32 {
         timeout.invalidate()
     }
     return approved ? 1 : 0
+}
+
+/// An unanswered roster comparison is refused after this long; members compare by phone.
+private let rosterTimeout: TimeInterval = 600
+
+/// The most combining marks shown in a row; the rest are dropped so text stays in its line.
+private let combiningMarksShown = 3
+
+/// Another party's text, such as a vault name from the creator, as one plain line. Rust already
+/// hides a name with control, format, default-ignorable or line-breaking characters or with a
+/// long run of combining marks (`vault_label`). This is the second layer: any such character
+/// that still arrives becomes U+FFFD, and a run of combining marks is cut to three.
+func untrustedText(_ text: String) -> String {
+    let replaced: Set<Unicode.GeneralCategory> = [.control, .format, .lineSeparator, .paragraphSeparator]
+    let marks: Set<Unicode.GeneralCategory> = [.nonspacingMark, .enclosingMark]
+    var scalars = String.UnicodeScalarView()
+    var run = 0
+    for scalar in text.unicodeScalars {
+        let category = scalar.properties.generalCategory
+        if replaced.contains(category) || scalar.properties.isDefaultIgnorableCodePoint {
+            scalars.append("\u{FFFD}")
+            run = 0
+        } else if marks.contains(category) {
+            run += 1
+            if run <= combiningMarksShown { scalars.append(scalar) }
+        } else {
+            scalars.append(scalar)
+            run = 0
+        }
+    }
+    return String(scalars)
+}
+
+/// A bordered one-line box holding another party's text, apart from the app's own wording.
+/// The text is truncated at the box's edge and its drawing is clipped to the box.
+func untrustedLine(_ text: String) -> NSTextField {
+    let field = NSTextField(labelWithString: untrustedText(text))
+    field.isBordered = true
+    field.drawsBackground = true
+    field.backgroundColor = .textBackgroundColor
+    field.usesSingleLineMode = true
+    field.maximumNumberOfLines = 1
+    field.cell?.wraps = false
+    field.lineBreakMode = .byTruncatingTail
+    field.isSelectable = true
+    if #available(macOS 14, *) { field.clipsToBounds = true }
+    return field
+}
+
+/// The member's comparison of a vault's roster code, called by the member from a worker thread
+/// when the wallet asks to agree to a roster. The code is the one Rust derived from the setup
+/// document key generation will use. Returns 1 for an explicit "Codes match" and 2 for
+/// "Codes differ"; closing the dialog, a malformed request or the timeout return 0.
+private func nativeConfirmRoster(_ summary: UnsafePointer<CChar>?) -> Int32 {
+    guard let summary = summary,
+          let request = try? JSONSerialization.jsonObject(with: Data(String(cString: summary).utf8)) as? [String: Any],
+          let code = request["roster_code"] as? String,
+          code.range(of: "^[0-9]{4}( [0-9]{4}){5}$", options: .regularExpression) != nil,
+          let name = request["vault_name"] as? String,
+          let threshold = (request["threshold"] as? NSNumber)?.intValue,
+          let members = (request["members"] as? NSNumber)?.intValue,
+          let member = (request["member"] as? NSNumber)?.intValue,
+          let network = request["network"] as? String, ["regtest", "testnet"].contains(network)
+    else { return 0 }
+    var answer: Int32 = 0
+    DispatchQueue.main.sync {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Do the roster codes match?"
+        alert.informativeText = """
+            A vault needs \(threshold) of \(members) members to approve. You are member \(member). Network: \(network).
+
+            Compare the code below with every other member over a channel you already trust, \
+            such as a phone call or in person. Choose Codes match only if every member sees \
+            the same code. If any code differs, someone may have been swapped into this vault: \
+            choose Codes differ.
+
+            Unanswered requests are refused after \(Int(rosterTimeout / 60)) minutes.
+            """
+        let codeLabel = NSTextField(labelWithString: "Roster code")
+        codeLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        let codeField = NSTextField(labelWithString: code)
+        codeField.font = .monospacedDigitSystemFont(ofSize: 20, weight: .semibold)
+        codeField.isSelectable = true
+        let nameLabel = NSTextField(labelWithString: "Vault name (set by creator):")
+        nameLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        let nameField = untrustedLine(name)
+        let stack = NSStackView(views: [codeLabel, codeField, nameLabel, nameField])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 4
+        stack.setCustomSpacing(12, after: codeField)
+        stack.frame = NSRect(x: 0, y: 0, width: 420, height: 96)
+        nameField.widthAnchor.constraint(equalToConstant: 420).isActive = true
+        alert.accessoryView = stack
+        alert.addButton(withTitle: "Codes differ")
+        alert.addButton(withTitle: "Codes match")
+        // The dialog takes focus while the member may be typing elsewhere: Return, Space or any
+        // other key answers nothing, and the member must click. Lay out first, because
+        // NSAlert assigns its default button there.
+        alert.layout()
+        for button in alert.buttons {
+            button.keyEquivalent = ""
+            button.refusesFirstResponder = true
+        }
+        alert.window.defaultButtonCell = nil
+        NSApp.activate(ignoringOtherApps: true)
+        let timeout = Timer(timeInterval: rosterTimeout, repeats: false) { _ in NSApp.abortModal() }
+        RunLoop.main.add(timeout, forMode: .modalPanel)
+        switch alert.runModal() {
+        case .alertSecondButtonReturn: answer = 1
+        case .alertFirstButtonReturn: answer = 2
+        default: answer = 0
+        }
+        timeout.invalidate()
+    }
+    return answer
 }
 
 private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointer<CChar>?) {
@@ -222,7 +340,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         DispatchQueue.global(qos: .userInitiated).async {
             defer { _ = secret.withUnsafeMutableBytes { $0.initializeMemory(as: UInt8.self, repeating: 0) } }
             _ = request.withCString { request in
-                secret.withUnsafeMutableBufferPointer { pass in loki_member_app_pair(request, pass.baseAddress!, nativeNotice, nativeApprove) }
+                secret.withUnsafeMutableBufferPointer { pass in loki_member_app_pair(request, pass.baseAddress!, nativeNotice, nativeApprove, nativeConfirmRoster) }
             }
             DispatchQueue.main.async { self.running = false }
         }

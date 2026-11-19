@@ -116,9 +116,7 @@ final class VaultAddressesWindow: NSObject {
             // The creator's label is plain, single-line display text, not part of an instruction.
             let label = NSTextField(labelWithString: "Vault name (set by creator):")
             label.textColor = .secondaryLabelColor
-            let name = NSTextField(labelWithString: vault.name ?? "Unavailable")
-            name.maximumNumberOfLines = 1
-            name.lineBreakMode = .byTruncatingTail
+            let name = untrustedLine(vault.name ?? "Unavailable")
             name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
             let nameLine = NSStackView(views: [label, name])
             nameLine.spacing = 5
