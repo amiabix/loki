@@ -63,7 +63,7 @@ def preflight_ports(ports):
 
 def find_binary(name, *, workspace, target_dir=None, profile='debug', env=None):
     env = os.environ if env is None else env
-    if Path(workspace).resolve().name == 'poc' and profile == 'debug':
+    if Path(workspace).resolve().name == 'core' and profile == 'debug':
         profile = env.get('LOKI_POC_BIN_PROFILE', profile)
         if profile not in ('debug', 'release'):
             raise OwnershipError('PoC acceptance profile must be debug or release')
@@ -2437,14 +2437,14 @@ _TEST_FAULTS = {
                          ('client', 'received', 'received_atomic_conflict'),
                          ('client', 'received', 'incoming_crash_reordered_relays')),
     'provisioning_retry': (('server', 'provisioning', 'rotation_monotonic'),
-                           ('poc', 'relay_member', 'partial_rotation')),
+                           ('core', 'relay_member', 'partial_rotation')),
     'canonical_vectors': (('protocol', 'canonical', 'canonical_subset'),
                            ('protocol', 'envelope', 'wire_boundary'),
                            ('client', 'crypto_vectors', 'selected_suite_vectors'),
                            ('client', 'transfer', 'transfer_complete_maximum274')),
     'orphan_flood': (('client', None,
                      'store::incoming_crash_tests::orphan_chunk_flood_budget_preserves_downloads_after_reopen'),),
-    'sealed_config': (('poc', 'relay_member',
+    'sealed_config': (('core', 'relay_member',
                       'communication_cli_missing_referenced_sealed_config_fails_closed'),),
     'capacity': (('server', 'store', 'capacity_preserves'),),
 }
@@ -2472,11 +2472,11 @@ def _test_fault_evidence(owner, name, communication, poc, deadline, target_dir):
         raise OwnershipError('Selected test runner is unavailable')
     checks = []
     for package, suite, selector in _TEST_FAULTS[name]:
-        workspace = poc if package == 'poc' else communication
+        workspace = core if package == 'core' else communication
         # rustup selects Cargo from argv[0]; resolving its symlink changes that name.
         argv = [str(Path(cargo).absolute()), 'test', '--manifest-path',
                 str(Path(workspace).resolve() / 'Cargo.toml'), '--locked', '--offline']
-        if package == 'poc':
+        if package == 'core':
             argv.extend(['--features', 'relay-communication'])
         else:
             argv.extend(['-p', 'loki-relay-' + package])
@@ -2586,7 +2586,7 @@ def run_faults(root, ports, *, communication_workspace, poc_workspace, timeout, 
     return FaultResult(report)
 
 
-def _run_fault_scenario(parent, name, ports, deadline, target_dir, profile, communication, poc):
+def _run_fault_scenario(parent, name, ports, deadline, target_dir, profile, communication, core):
     child = OwnedRun.create(parent.root / 'scenarios' / name)
     try:
         parent.bind_nested_run(scenario=name, child=child)
@@ -3529,7 +3529,7 @@ def _stop_owned_relay(context, relay, deadline):
 
 def _default_workspaces():
     communication = Path(__file__).resolve().parents[1]
-    return communication, communication.parent / 'poc'
+    return communication, communication.parent / 'core'
 
 
 def _parse_cli(argv):
@@ -3628,7 +3628,7 @@ def main(argv=None):
     except OwnershipError as error:
         print(error, file=sys.stderr)
         return 2
-    communication, poc = _default_workspaces()
+    communication, core = _default_workspaces()
     try:
         if command == 'acceptance':
             result = run_acceptance(

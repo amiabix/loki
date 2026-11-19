@@ -1,6 +1,6 @@
 // The deployment's signer configuration for the native signer (LokiSigner), served by this
 // coordinator at /api/signer-config. Its one source is the signer origin's own /config.json
-// (poc/loki-signer-wasm/serve.mjs), which the browser signer runs with; nothing is copied here.
+// (core/loki-signer-wasm/serve.mjs), which the browser signer runs with; nothing is copied here.
 // The witness `read` capabilities in it are already public on the signer origin (since #72).
 
 export type WitnessConfig = { endpoint: string; key: number[]; run: number[]; mailbox: number[]; read: number[] };

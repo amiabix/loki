@@ -73,10 +73,10 @@ class HostedRun(run.OwnedRun):
             for stream in streams:
                 stream.close()
 
-def fixture_binary(poc):
-    target = Path(os.environ.get('CARGO_TARGET_DIR', poc / 'target'))
+def fixture_binary(core):
+    target = Path(os.environ.get('CARGO_TARGET_DIR', core / 'target'))
     if not target.is_absolute():
-        target = poc / target
+        target = core / target
     candidates = [path for path in (target / 'debug/deps').glob('setup_relay-*')
                   if path.is_file() and path.suffix == '' and os.access(path, os.X_OK)]
     if not candidates:
@@ -209,16 +209,16 @@ def payments(owner, source_owner, count, name, poc, offline_relay=None, selected
     source = export_hosted_source(runtime, owner.root / 'source', count)
     if transport_source is not None:
         reuse_transport_journals(source, transport_source, count)
-    sys.path.insert(0, str(poc))
+    sys.path.insert(0, str(core))
     from ths import THS
     chain = THS(name)
     chain.check()
     chain.fund(evidence['address'], 3)
-    spec = importlib.util.spec_from_file_location('owned_recipient', poc / 'run-member-payment.py')
+    spec = importlib.util.spec_from_file_location('owned_recipient', core / 'run-member-payment.py')
     helper = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(helper)
-    setup = run.find_binary('loki_setup_member', workspace=poc)
-    pay = run.find_binary('loki_member_payment', workspace=poc)
+    setup = run.find_binary('loki_setup_member', workspace=core)
+    pay = run.find_binary('loki_member_payment', workspace=core)
     recipient_root = owner.root / 'recipient'
     _, _, address = helper.create_vault(recipient_root, 8, setup, chain.env(), count)
     if address == evidence['address']:
@@ -260,8 +260,8 @@ def payments(owner, source_owner, count, name, poc, offline_relay=None, selected
             'selected_pairs': list(pairs), 'unmet_payment_pairs': [pair for pair in required_pairs if pair not in pairs],
             'unmet_release_gates': ['distinct-host HTTPS', 'independent security review']}
 
-def device_evidence(owner, member_root, passphrase_file, poc):
-    native = run.find_binary('loki_setup_member', workspace=poc)
+def device_evidence(owner, member_root, passphrase_file, core):
+    native = run.find_binary('loki_setup_member', workspace=core)
     result = owner.capture([str(native), 'setup-evidence', str(member_root.resolve()), str(passphrase_file.resolve())],
                            cwd=owner.root, timeout=120)
     if result.returncode:
@@ -318,11 +318,11 @@ def main(argv=None):
     parser.add_argument('--passphrase-file', type=Path)
     parser.add_argument('--device-reports', type=Path, nargs='+')
     args = parser.parse_args(argv)
-    communication, poc = run._default_workspaces()
+    communication, core = run._default_workspaces()
     if args.command == 'validate-config':
         if args.bundle is None or args.trusted_key is None:
             parser.error('Configuration validation requires a bundle and trusted signing key')
-        native = run.find_binary('loki_setup_member', workspace=poc)
+        native = run.find_binary('loki_setup_member', workspace=core)
         result = subprocess.run([str(native), 'setup-config-check', str(args.bundle), '--operator-key',
                                  args.trusted_key], capture_output=True, timeout=30)
         if result.returncode:
@@ -331,13 +331,13 @@ def main(argv=None):
         return 0
     if args.run_root is None or (args.members is None and args.command != 'device-evidence'):
         parser.error('Acceptance requires a new owned root and member count')
-    binary = args.fixture.resolve() if args.fixture else fixture_binary(poc) if args.command in ("acceptance", "resume-handoff", "faults") else None
+    binary = args.fixture.resolve() if args.fixture else fixture_binary(core) if args.command in ("acceptance", "resume-handoff", "faults") else None
     owner = HostedRun.create(args.run_root)
     try:
         if args.command == 'device-evidence':
             if args.member_root is None or args.passphrase_file is None:
                 parser.error('Device evidence requires this member root and private passphrase file')
-            report = device_evidence(owner, args.member_root, args.passphrase_file, poc)
+            report = device_evidence(owner, args.member_root, args.passphrase_file, core)
         elif args.command == 'distinct-hosts':
             if not args.device_reports:
                 parser.error('Select reports collected independently on every member host')

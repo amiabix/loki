@@ -65,7 +65,7 @@ ssh -N -L 2744:localhost:2744 your-frostd-host   # then run selfcustody-testnet.
 One member app on its own:
 
 ```sh
-poc/target/release/loki_member_app --data /absolute/member-1 --port 3601 \
+core/target/release/loki_member_app --data /absolute/member-1 --port 3601 \
   --network testnet --lightwalletd-url https://testnet.zec.rocks:443 \
   --frostd-url http://127.0.0.1:2744 --allow-loopback-peers \
   --secure-element software --development-http \
@@ -79,7 +79,7 @@ mode 0600. This is a one-host TEST setup, not production HTTPS or independent op
 
 ## frostd behind TLS + CORS for the in-browser signer (`frostd-tls.sh`)
 
-The in-browser (wasm) signer (`poc/wasm-transport`, W3) runs frostd's POST contract from
+The in-browser (wasm) signer (`core/wasm-transport`, W3) runs frostd's POST contract from
 the page itself over the Fetch API. A browser can reach frostd **only** over https/wss and
 **only** if the reply carries CORS headers for the wallet origin. The loopback-plaintext dev
 relay (`frostd -n -p 2744`) fails both: `http://127.0.0.1:2744` is mixed content from an
@@ -184,8 +184,8 @@ https URL. Once gap A lands, members need zero inbound — set `NO_TUNNEL=1` (or
 Build the macOS arm64 member binary (what `run-member.sh` defaults to):
 
 ```sh
-( cd poc && cargo build --release --features relay-communication --bin loki_member_app )
-# -> poc/target/release/loki_member_app   (Mach-O arm64)
+( cd core && cargo build --release --features relay-communication --bin loki_member_app )
+# -> core/target/release/loki_member_app   (Mach-O arm64)
 ```
 
 Linux x64 is **not cross-built here** — this Mac has no x86_64-linux C cross-linker, and the
@@ -197,9 +197,9 @@ Build it on a Linux x64 box, or on this Mac via Docker (present):
 cargo build --release --features relay-communication --bin loki_member_app
 
 # or cross-build from macOS with Docker:
-docker run --rm -v "$PWD":/src -w /src/poc rust:1.91 \
+docker run --rm -v "$PWD":/src -w /src/core rust:1.91 \
   cargo build --release --features relay-communication --bin loki_member_app
-# -> poc/target/release/loki_member_app   (ELF x86_64); point run-member.sh at it with MEMBER_BIN=
+# -> core/target/release/loki_member_app   (ELF x86_64); point run-member.sh at it with MEMBER_BIN=
 ```
 
 ### Owned-relay operator kit (above)

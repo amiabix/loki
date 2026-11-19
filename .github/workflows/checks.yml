@@ -27,7 +27,7 @@ jobs:
           for candidate in member/passphrase member/operator.passphrase member/profile/profile.sealed member/card/vault.card member/wallet.sqlite member/wallet.sqlite-wal member/wallet.sqlite-shm member/wallet.sqlite-journal member/.unlock-test; do
             git check-ignore -q --no-index "$candidate"
           done
-          for candidate in communication/client/tests/fixtures/hosted-tls/server-key.pem poc/tests/zip2005_keys.rs web/wallet/tests/registration.test.mjs; do
+          for candidate in communication/client/tests/fixtures/hosted-tls/server-key.pem core/tests/zip2005_keys.rs web/wallet/tests/registration.test.mjs; do
             ! git check-ignore -q --no-index "$candidate"
           done
 
@@ -50,25 +50,25 @@ jobs:
         run: |
           cargo +1.95.0 install --locked --git https://github.com/ZcashFoundation/frost-tools --rev 53df99c2bd61f7cb60a0d1f634822a76be3799cf frostd
           frostd -n -p 2744 > "$RUNNER_TEMP/frostd.log" 2>&1 &
-      - name: Test poc
-        working-directory: poc
+      - name: Test core
+        working-directory: core
         env:
           FROSTD_URL: http://127.0.0.1:2744
         run: cargo +1.95.0 test --locked
       - name: Test loki-signer-core
-        working-directory: poc
+        working-directory: core
         run: cargo +1.95.0 test --locked -p loki-signer-core
       # Known failure on Linux: the runner's clang compiles secp256k1's C for wasm32, so the
-      # link stubs in poc/loki-signer-wasm/src/lib.rs (secp256k1_link_stub) define those
+      # link stubs in core/loki-signer-wasm/src/lib.rs (secp256k1_link_stub) define those
       # symbols twice. Drop continue-on-error once the stubs are gated.
       - name: Build wasm signer
         continue-on-error: true
-        working-directory: poc
+        working-directory: core
         env:
           RUSTFLAGS: --cfg getrandom_backend="wasm_js"
         run: cargo +1.95.0 build --locked -p loki-signer-wasm --target wasm32-unknown-unknown
       - name: Build wasm transport
-        working-directory: poc/wasm-transport
+        working-directory: core/wasm-transport
         env:
           RUSTFLAGS: --cfg getrandom_backend="wasm_js"
         run: cargo +1.95.0 build --locked --target wasm32-unknown-unknown

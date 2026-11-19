@@ -13,7 +13,7 @@
       "log_sha256": "0196ceb01f467324b2396acb2ded766d172859fc607e45aabd01357a04853495"
     },
     {
-      "command": "cargo test --manifest-path poc/Cargo.toml --features relay-communication --locked --offline",
+      "command": "cargo test --manifest-path core/Cargo.toml --features relay-communication --locked --offline",
       "exit_code": 0,
       "passed": 180,
       "ignored_child_entry_points": 4,
@@ -26,13 +26,13 @@
       "log_sha256": "80a34126f11da30752bbd361a7355ea09cb0810d4ac478a40b337bd56fdd3a2a"
     },
     {
-      "command": "python3 -m unittest discover -s poc/tests -p test_dependency_graph.py",
+      "command": "python3 -m unittest discover -s core/tests -p test_dependency_graph.py",
       "exit_code": 0,
       "passed": 1,
       "log_sha256": "70e93564d0764ef0a87cb81eef0920beaaace971b28365ee0acd06f66cbe72d7"
     },
     {
-      "command": "python3 poc/scripts/verify_relay_source_isolation.py",
+      "command": "python3 core/scripts/verify_relay_source_isolation.py",
       "exit_code": 0,
       "published_archives": 7,
       "log_sha256": "6eae430bfe42e4365398220c21e2cb9147ef7d8f9fc975ded3e6dc3fa9ec1c68"
@@ -43,7 +43,7 @@
       "log_sha256": "4cf86278c1e6d659943a46a3d7e3da429ac15be90f0f17742e24ef85228e7d3e"
     },
     {
-      "command": "cargo build --manifest-path poc/Cargo.toml --locked --offline --features relay-communication --bin loki_relay_member --bin loki_setup_member",
+      "command": "cargo build --manifest-path core/Cargo.toml --locked --offline --features relay-communication --bin loki_relay_member --bin loki_setup_member",
       "exit_code": 0,
       "log_sha256": "d7dae192715495fa89ccbe279af3efb9792c1dae1768228e369035e68a1df673"
     }
@@ -53,13 +53,13 @@
     "communication/client/src/lib.rs": "66a947079b4eeb8f283b9e8d4f6852f3aace83f2dfdd713314934c2f38e44c95",
     "communication/client/src/store.rs": "64c62d9ba7617266dd62e97172e8bf875c12a781a29740b47bf61bd93f887036",
     "communication/harness/run.py": "5473c2735862ddf88c905df77cea6b5993e8869732bb002babc49f5277041183",
-    "poc/src/bin/loki_relay_member.rs": "adf3226fdc0535f2887e7f38b27c0dae6a027bcc0bd29289f95db3bfb33f02ae",
+    "core/src/bin/loki_relay_member.rs": "adf3226fdc0535f2887e7f38b27c0dae6a027bcc0bd29289f95db3bfb33f02ae",
     "communication/Cargo.lock": "f814c6814578c4ff15b30945cbba91d9517877d97f56a8f6676f6c01233259a1",
-    "poc/Cargo.lock": "e9f59ce49f75e30210d691eaba13023ecb32f7857bb4d9bc29f2851ea7540577",
+    "core/Cargo.lock": "e9f59ce49f75e30210d691eaba13023ecb32f7857bb4d9bc29f2851ea7540577",
     "communication/client/Cargo.toml": "cbe335ddb77863ac9a70211ea23227596b9b0dd995e1a1a0f8ec72710d03aa8e",
     "communication/relay/Cargo.toml": "7a6590357b82f291be8a408488b7f1072a513fe1b76dc4af4d770d3179477070",
     "communication/protocol/Cargo.toml": "c2929525aa604e0c4ce05019723dd73f30ee4b01a07d2cf0f3f000033753293c",
-    "poc/Cargo.toml": "f1edbada62a2badd87ea26e472ed89193aee8d0d814df4ae22f853a14b2b3985"
+    "core/Cargo.toml": "f1edbada62a2badd87ea26e472ed89193aee8d0d814df4ae22f853a14b2b3985"
   },
   "clippy": {
     "command": "cargo clippy --manifest-path communication/Cargo.toml --workspace --all-targets --locked --offline",

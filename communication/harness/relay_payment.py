@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Spend an already funded manual regtest vault through three private relay members.
 
-First run poc/run-member-payment.py --manual with a fresh --state directory.
+First run core/run-member-payment.py --manual with a fresh --state directory.
 This harness copies only sealed source state, keeps each payment mailbox private,
 and uses relays for every signing envelope.
 """
@@ -106,12 +106,12 @@ def main(argv=None):
     ids = [peer['id'] for peer in roster['members']]
     if ids not in ([1, 2, 3], [1, 2, 3, 4]) or pair not in [[left, right] for left in ids for right in ids if left < right]:
         parser.error('Payment manifest has an invalid signing pair')
-    communication, poc = run._default_workspaces()
-    sys.path.insert(0, str(poc))
+    communication, core = run._default_workspaces()
+    sys.path.insert(0, str(core))
     from ths import THS
     chain = THS(args.name)
     chain.check()
-    pay = run.find_binary('loki_member_payment', workspace=poc)
+    pay = run.find_binary('loki_member_payment', workspace=core)
     feature = subprocess.run([str(pay), 'features'], capture_output=True, timeout=5)
     if feature.returncode != 0 or feature.stdout != b'relay-backed-signing=1\n':
         parser.error('Build loki_member_payment with --features relay-communication')

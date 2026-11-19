@@ -23,6 +23,6 @@ jobs:
           path: b
       - run: rustup toolchain install 1.95.0 --profile minimal --target wasm32-unknown-unknown
       - run: cargo +1.95.0 install wasm-pack --version 0.15.1 --locked
-      - run: a/poc/scripts/repro-build.sh > a.sha256
-      - run: b/poc/scripts/repro-build.sh > b.sha256
+      - run: a/core/scripts/repro-build.sh > a.sha256
+      - run: b/core/scripts/repro-build.sh > b.sha256
       - run: cat a.sha256 && diff a.sha256 b.sha256

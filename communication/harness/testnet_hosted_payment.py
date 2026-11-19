@@ -10,7 +10,7 @@ import subprocess
 import time
 
 ROOT = Path.home() / "tn-ceremony-state"
-BIN = Path.home() / "loki/poc/target/debug"
+BIN = Path.home() / "loki/core/target/debug"
 LIGHTWALLETD = "https://testnet.zec.rocks:443"
 ADDRESS = "utest1489sr06ervmjft2fv0gyhy7u9esv7lxmx787g62e5cvyg70pyzy3crn7h22g9e4kqhcfvq5l055esh9rrcrhs67fc5sp2wc0lsfzsq7s"
 AMOUNT = 5_000_000
@@ -22,7 +22,7 @@ PENDING = re.compile(r"error: waiting for member [1-3] (Commitment|Package|Share
 def run(argv, timeout=180, pending=False):
     env = os.environ.copy()
     env["LOKI_LIGHTWALLETD"] = LIGHTWALLETD
-    result = subprocess.run(list(map(str, argv)), cwd=Path.home() / "loki/poc",
+    result = subprocess.run(list(map(str, argv)), cwd=Path.home() / "loki/core",
                             env=env, capture_output=True, text=True, timeout=timeout)
     if result.returncode:
         if pending and PENDING.fullmatch(result.stderr):

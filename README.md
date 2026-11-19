@@ -38,7 +38,6 @@ server ever holds a share.
 |---|---|---|
 | Where the share lives | On the member's machine, on macOS LokiSigner seals it under a Secure Enclave key | In the browser's private storage, sealed under a passkey or passphrase |
 | Approving a payment | A native dialog, with Face ID / Touch ID in LokiSigner | A signer page on its own origin, with a passkey prompt |
-| Status | Signs end to end, the LokiSigner app is not yet hand-tested end to end | Joins, approves and signs end to end |
 
 The browser signer runs the same signer core compiled to WebAssembly, on a separate origin
 from the wallet, and whoever controls the site that serves it could capture the share.
@@ -55,25 +54,13 @@ from the wallet, and whoever controls the site that serves it could capture the 
 A failed payment can be retried or cancelled, and since a retry spends the same note, at
 most one of them is ever mined.
 
-## Status
-
-Tested end to end, vault creation, funding, payments signed by native and browser members
-together, retry and cancel, and restoring a browser member from its 24 words plus an
-encrypted backup.
-
-Not done yet:
-
-- An external security audit and an independent reproducible build.
-- A browser member can approve and sign, but cannot propose a payment yet.
-- The browser member's own balance and history, in review.
-- The native signer app is macOS only.
 
 ## Try it
 
 Build the browser signer once, then run the wallet:
 
 ```sh
-cd poc/loki-signer-wasm && RUSTFLAGS='--cfg getrandom_backend="wasm_js"' wasm-pack build --dev --target web
+cd core/loki-signer-wasm && RUSTFLAGS='--cfg getrandom_backend="wasm_js"' wasm-pack build --dev --target web
 cd ../wasm-transport    && wasm-pack build --target web
 cd ../../web/wallet     && npm install && npm run dev        # http://localhost:3001
 ```
@@ -81,17 +68,17 @@ cd ../../web/wallet     && npm install && npm run dev        # http://localhost:
 The signer must be served from its own origin and the relays need CORS for it, see
 [`web/wallet/README.md`](web/wallet/README.md) for the full setup,
 [`communication/deploy/`](communication/deploy/) for deploy scripts and
-[`poc/signer-app/README.md`](poc/signer-app/README.md) to build the macOS signer.
+[`core/signer-app/README.md`](core/signer-app/README.md) to build the macOS signer.
 
 ## Repository
 
 | Path | What |
 |---|---|
 | `web/wallet/` | The wallet web app and keyless coordinator |
-| `poc/loki-signer-core/` | The signer, shares, sealing, nonces, transaction checks and recovery |
-| `poc/loki-signer-wasm/` | The signer core for the browser, and its signer page |
-| `poc/signer-app/` | LokiSigner, the native macOS signer |
-| `poc/src/host/` | The native member app, vault setup, payments and recovery |
+| `core/loki-signer-core/` | The signer, shares, sealing, nonces, transaction checks and recovery |
+| `core/loki-signer-wasm/` | The signer core for the browser, and its signer page |
+| `core/signer-app/` | LokiSigner, the native macOS signer |
+| `core/src/host/` | The native member app, vault setup, payments and recovery |
 | `communication/deploy/` | Deploy scripts for relays and fronts |
 
 Built on the Zcash Foundation's audited FROST crates and its `frostd` relay.
@@ -99,6 +86,6 @@ Built on the Zcash Foundation's audited FROST crates and its `frostd` relay.
 ## Build and test
 
 ```sh
-cd poc && cargo test --locked --lib
+cd core && cargo test --locked --lib
 cd web/wallet && npm test
 ```
