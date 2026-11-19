@@ -51,27 +51,27 @@ pub enum RosterAnswer {
 /// `/api/agree` trusts its caller to have compared the code.
 pub type LocalRosterConfirmation = std::sync::Arc<dyn Fn(&str) -> RosterAnswer + Send + Sync>;
 
-/// The longest untrusted line a native window shows, in characters.
-pub const UNTRUSTED_LINE_CHARS: usize = 40;
+/// What a native window shows in place of a vault name it will not show.
+pub(crate) const HIDDEN_VAULT_NAME: &str = "Name hidden (unsupported characters)";
 
-/// Text another party chose, such as a vault name from the creator's invite, as one short line
-/// a native window can show. Control, invisible formatting, bidi and line or paragraph
-/// separator characters become U+FFFD, so the text cannot add lines, reorder the window's own
-/// wording or hide characters; it is cut to [`UNTRUSTED_LINE_CHARS`] characters and `…`.
-pub fn untrusted_line(text: &str) -> String {
-    let hidden = |c: char| {
-        c.is_control()
-            || matches!(c, '\u{00AD}' | '\u{061C}' | '\u{115F}' | '\u{1160}' | '\u{180E}'
-                | '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{206F}'
-                | '\u{3164}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}' | '\u{FFA0}'
-                | '\u{FFF9}'..='\u{FFFB}' | '\u{E0000}'..='\u{E007F}')
-    };
-    let mut line: String = text.chars().map(|c| if hidden(c) { '\u{FFFD}' } else { c })
-        .take(UNTRUSTED_LINE_CHARS).collect();
-    if text.chars().count() > UNTRUSTED_LINE_CHARS {
-        line.push('…');
-    }
-    line
+/// The creator's vault name as LokiSigner shows it, in the roster dialog and in
+/// "Vault addresses…". A name is shown as written or hidden whole, never cleaned: hidden when
+/// it is longer than 80 characters or holds a control character, whitespace other than a
+/// space, a format character (Cf, such as bidi overrides and zero-width joiners), a default
+/// ignorable character (such as variation selectors and U+034F), or a run of more than three
+/// combining marks, which draw outside a one-line box.
+pub(crate) fn vault_label(name: &str) -> &str {
+    use icu_properties::{props::{DefaultIgnorableCodePoint, GeneralCategory}, CodePointMapData, CodePointSetData};
+    let category = CodePointMapData::<GeneralCategory>::new();
+    let ignorable = CodePointSetData::new::<DefaultIgnorableCodePoint>();
+    let mut marks = 0;
+    let unsupported = name.chars().count() > 80 || name.chars().any(|c| {
+        let general = category.get(c);
+        marks = if matches!(general, GeneralCategory::NonspacingMark | GeneralCategory::EnclosingMark) { marks + 1 } else { 0 };
+        c.is_control() || (c.is_whitespace() && c != ' ') || general == GeneralCategory::Format
+            || ignorable.contains(c) || marks > 3
+    });
+    if unsupported { HIDDEN_VAULT_NAME } else { name }
 }
 
 /// The signer's [`ApprovalPolicy`](crate::signer::local::ApprovalPolicy): route each request
@@ -308,12 +308,23 @@ mod tests {
     }
 
     #[test]
-    fn untrusted_text_becomes_one_short_line() {
-        assert_eq!(super::untrusted_line("Household"), "Household");
-        assert_eq!(super::untrusted_line("a\nb\r\u{7}\u{202e}c\u{2028}d\u{200b}"), "a\u{fffd}b\u{fffd}\u{fffd}\u{fffd}c\u{fffd}d\u{fffd}");
-        let long = "é".repeat(super::UNTRUSTED_LINE_CHARS + 5);
-        assert_eq!(super::untrusted_line(&long), format!("{}…", "é".repeat(super::UNTRUSTED_LINE_CHARS)));
-        assert_eq!(super::untrusted_line(&long[..2 * super::UNTRUSTED_LINE_CHARS]), "é".repeat(super::UNTRUSTED_LINE_CHARS));
+    fn a_vault_name_is_shown_as_written_or_hidden_whole() {
+        for shown in ["Household", "Friends’ vault", "Tiền nhà", "Tie\u{0323}\u{0302}n", "家族 🏠", &"é".repeat(80)] {
+            assert_eq!(super::vault_label(shown), shown, "{shown:?}");
+        }
+        let marks = |n: usize| format!("Rent{}", "\u{0301}".repeat(n));
+        assert_eq!(super::vault_label(&marks(3)), marks(3));
+        for hidden in [
+            "Rent\nChoose Codes match".to_owned(), "a\u{0085}b".into(), "a\u{2028}b".into(), "a\u{202e}b".into(),
+            "a\u{001b}[2Jb".into(), "a\u{200b}b".into(), "a\u{feff}b".into(), "a\tb".into(),
+            // Format and default ignorable characters the review found shown as written.
+            "a\u{0600}b".into(), "a\u{13430}b".into(), "a\u{1bca0}b".into(), "a\u{1d173}b".into(),
+            "a\u{e0100}b".into(), "a\u{034f}b".into(), "a\u{fe0f}b".into(), "a\u{3164}b".into(),
+            // A base letter with 39 combining marks draws far outside its line.
+            format!("a{}", "\u{0301}".repeat(39)), marks(4), "é".repeat(81),
+        ] {
+            assert_eq!(super::vault_label(&hidden), super::HIDDEN_VAULT_NAME, "{hidden:?}");
+        }
     }
 
     #[test]

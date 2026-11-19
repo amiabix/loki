@@ -925,10 +925,11 @@ fn record_agreement(data: &Path, pass: &str, mut c: Ceremony, code: String) -> R
 }
 
 /// What LokiSigner shows the member before they agree: the code of the setup document
-/// `dkg_begin` receives, and the vault it is for. The name comes from the creator's invite.
+/// `dkg_begin` receives, and the vault it is for. The name comes from the creator's invite, so
+/// it is shown as written or hidden, by the same rule as "Vault addresses…".
 fn roster_summary(c: &Ceremony, network: VaultNetwork, code: &str) -> String {
     json!({
-        "vault_name": super::untrusted_line(&c.name),
+        "vault_name": super::vault_label(&c.name),
         "threshold": c.threshold,
         "members": c.members,
         "member": c.my_slot,
@@ -1676,9 +1677,7 @@ mod tests {
             assert_eq!(shown["roster_code"], signer_code.as_str());
             assert_eq!((shown["threshold"].as_u64(), shown["members"].as_u64(), shown["member"].as_u64()), (Some(2), Some(3), Some(2)));
             assert_eq!(shown["network"], "regtest");
-            let name = shown["vault_name"].as_str().unwrap();
-            assert!(name.starts_with("Rent\u{fffd}Choose Codes match now"), "{name}");
-            assert!(!name.chars().any(|c| c.is_control() || matches!(c, '\u{202e}' | '\u{2028}' | '\u{200b}')), "{name:?}");
+            assert_eq!(shown["vault_name"], crate::host::HIDDEN_VAULT_NAME, "the creator's text reached the dialog");
             let keys: Vec<_> = shown.as_object().unwrap().keys().cloned().collect();
             assert_eq!(keys, ["member", "members", "network", "roster_code", "threshold", "vault_name"]);
             lokisigner.answer.send(answer).unwrap();

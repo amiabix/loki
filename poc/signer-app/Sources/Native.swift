@@ -94,22 +94,47 @@ private func nativeApprove(_ summary: UnsafePointer<CChar>?) -> Int32 {
 /// An unanswered roster comparison is refused after this long; members compare by phone.
 private let rosterTimeout: TimeInterval = 600
 
-/// One line of another party's text, shown inside its own box and never as the app's wording.
-/// Rust already replaced control, invisible, bidi and line-breaking characters; this replaces
-/// any that still arrive, so the box holds one line in reading order.
-private func untrustedLine(_ text: String) -> NSTextField {
-    let hidden: Set<Unicode.GeneralCategory> = [.control, .format, .lineSeparator, .paragraphSeparator]
-    let line = String(String.UnicodeScalarView(text.unicodeScalars.map {
-        hidden.contains($0.properties.generalCategory) ? "\u{FFFD}" : $0
-    }))
-    let field = NSTextField(labelWithString: line)
+/// The most combining marks shown in a row; the rest are dropped so text stays in its line.
+private let combiningMarksShown = 3
+
+/// Another party's text, such as a vault name from the creator, as one plain line. Rust already
+/// hides a name with control, format, default-ignorable or line-breaking characters or with a
+/// long run of combining marks (`vault_label`). This is the second layer: any such character
+/// that still arrives becomes U+FFFD, and a run of combining marks is cut to three.
+func untrustedText(_ text: String) -> String {
+    let replaced: Set<Unicode.GeneralCategory> = [.control, .format, .lineSeparator, .paragraphSeparator]
+    let marks: Set<Unicode.GeneralCategory> = [.nonspacingMark, .enclosingMark]
+    var scalars = String.UnicodeScalarView()
+    var run = 0
+    for scalar in text.unicodeScalars {
+        let category = scalar.properties.generalCategory
+        if replaced.contains(category) || scalar.properties.isDefaultIgnorableCodePoint {
+            scalars.append("\u{FFFD}")
+            run = 0
+        } else if marks.contains(category) {
+            run += 1
+            if run <= combiningMarksShown { scalars.append(scalar) }
+        } else {
+            scalars.append(scalar)
+            run = 0
+        }
+    }
+    return String(scalars)
+}
+
+/// A bordered one-line box holding another party's text, apart from the app's own wording.
+/// The text is truncated at the box's edge and its drawing is clipped to the box.
+func untrustedLine(_ text: String) -> NSTextField {
+    let field = NSTextField(labelWithString: untrustedText(text))
     field.isBordered = true
     field.drawsBackground = true
     field.backgroundColor = .textBackgroundColor
     field.usesSingleLineMode = true
+    field.maximumNumberOfLines = 1
     field.cell?.wraps = false
     field.lineBreakMode = .byTruncatingTail
     field.isSelectable = true
+    if #available(macOS 14, *) { field.clipsToBounds = true }
     return field
 }
 
@@ -148,7 +173,7 @@ private func nativeConfirmRoster(_ summary: UnsafePointer<CChar>?) -> Int32 {
         let codeField = NSTextField(labelWithString: code)
         codeField.font = .monospacedDigitSystemFont(ofSize: 20, weight: .semibold)
         codeField.isSelectable = true
-        let nameLabel = NSTextField(labelWithString: "Vault name, as the vault creator wrote it:")
+        let nameLabel = NSTextField(labelWithString: "Vault name (set by creator):")
         nameLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         let nameField = untrustedLine(name)
         let stack = NSStackView(views: [codeLabel, codeField, nameLabel, nameField])

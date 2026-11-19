@@ -64,8 +64,10 @@ to a roster by itself. When the member chooses **Compare in LokiSigner** on the 
 **Verify members** step, LokiSigner shows "Do the roster codes match?" with the threshold,
 the member count, the member's slot, the network and the code. Rust derives the code from the
 same setup document the signer checks in `dkg_begin`. The vault name comes from the creator's
-invite, so it appears in its own box as one line, with control, invisible and line-breaking
-characters replaced.
+invite. It follows the same rule as in **Vault addresses…**: it is shown as written, in its own
+one-line box, or replaced whole by "Name hidden (unsupported characters)" when it is longer
+than 80 characters or holds a control, format, default-ignorable or line-breaking character
+or a run of more than three combining marks.
 
 - **Codes match** records the agreement and tells the creator.
 - **Codes differ** records nothing, and LokiSigner refuses that vault until it restarts, so a
@@ -77,6 +79,12 @@ characters replaced.
 
 LokiSigner shows one roster dialog at a time. While it is open the member's other requests
 continue, and when the roster or the setup changed in the meantime the answer is refused.
+
+The roster dialog and the payment dialog are both modal on the app's main thread. A payment
+request that arrives while the roster dialog is open waits until the member answers it or it
+times out, and only then shows its own dialog. Ten minutes may be longer than the
+coordinator waits for this member's approval, so answer the roster dialog before approving
+payments.
 
 The headless member (`loki_member_app`, `LokiSigner serve`) has no screen. It keeps the earlier
 behaviour: `POST /api/agree` with the right code agrees, so it trusts whoever holds its session

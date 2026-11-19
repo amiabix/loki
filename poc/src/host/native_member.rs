@@ -6,12 +6,11 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use icu_properties::{props::GeneralCategory, CodePointMapData};
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
 use crate::network::VaultNetwork;
-use super::{ceremony, custody::{is_legacy, SignerViewingKey}, state::Shared, Config, FetchedConfig, LocalApproval, LocalNotice, LocalRosterConfirmation};
+use super::{ceremony, custody::{is_legacy, SignerViewingKey}, state::Shared, Config, FetchedConfig, LocalApproval, LocalNotice, LocalRosterConfirmation, vault_label};
 
 const LOCKED: &str = "Unlock LokiSigner to view vault addresses.";
 const LIST_ERROR: &str = "LokiSigner could not list vaults.";
@@ -141,19 +140,6 @@ impl NativeMember {
         let address = key.checked_address(&sealed, network).map_err(|_| VAULT_ERROR)?;
         self.viewing_keys.lock().map_err(|_| VAULT_ERROR)?.entry(id).or_insert((key, network));
         Ok((network.label(), address))
-    }
-}
-
-fn vault_label(name: &str) -> &str {
-    // Refuse multiline, control, format and long labels. Swift also confines names to a
-    // single plain-text field separate from trusted labels, addresses, and error messages.
-    let category = CodePointMapData::<GeneralCategory>::new();
-    if name.chars().count() > 80 || name.chars().any(|c| {
-        c.is_control() || (c.is_whitespace() && c != ' ') || category.get(c) == GeneralCategory::Format
-    }) {
-        "Name hidden (unsupported characters)"
-    } else {
-        name
     }
 }
 
