@@ -293,7 +293,7 @@ function ViewRouter({
         <>
           {statusError && <div className="mb-4"><ErrMsg msg={statusError} /><Btn variant="ghost" onClick={onStatusRefresh}>Retry refresh</Btn></div>}
           {status.persisted === false && (
-            <div className="mb-4"><ErrMsg msg="This browser did not grant persistent storage, so it may delete your signer's sealed share under storage pressure. Keep a backup of your share before you rely on it." /></div>
+            <div className="mb-4"><ErrMsg msg="This browser no longer keeps your signer's storage persistent, so it may delete your share under storage pressure. Export every vault's recovery backup and keep your 24 recovery words." /></div>
           )}
           {status.relay && <p className="mb-4 text-xs text-muted">Signer relay: <span className="font-mono">{status.relay}</span></p>}
           <Home
@@ -520,7 +520,8 @@ function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string 
   useEffect(() => {
     // A signer error (another tab holds the signer, or the signer origin is unreachable) is
     // shown, not mistaken for "no signer here".
-    hasSigner().then(setExisting).catch((e) => setErr((e as Error).message));
+    // A share this browser had but the signer lost (404) offers Restore, not Unlock.
+    hasSigner().then(setExisting).catch((e) => { setErr((e as Error).message); if ((e as ApiError).status === 404) setExisting(false); });
     const pk = (window as unknown as { PublicKeyCredential?: { isUserVerifyingPlatformAuthenticatorAvailable?: () => Promise<boolean> } }).PublicKeyCredential;
     pk?.isUserVerifyingPlatformAuthenticatorAvailable?.().then(setPlatform).catch(() => setPlatform(false));
   }, []);

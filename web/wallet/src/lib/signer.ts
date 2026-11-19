@@ -120,7 +120,7 @@ function browserSigner(origin: string): SignerModule {
   const opened = (s: SignerSession) => { try { localStorage.setItem(SEALED, "1"); } catch {} return s; };
 
   return {
-    hasSigner: () => call<boolean>("has"),
+    hasSigner: async () => checkShare(await call<boolean>("has")),
     createSigner: async ({ name, method }) => opened(await call<SignerSession>("create", { name, method })),
     unlock: async ({ method }) => opened(await call<SignerSession>("unlock", { method })),
     async lock() { await call("lock"); },
@@ -175,6 +175,15 @@ const SESSION = "loki_signer_session"; // sessionStorage: the unlocked session
 
 /** Synchronous best-guess "a share is sealed here" for the first paint; hasSigner() confirms. */
 export function hasSignerHint(): boolean { try { return localStorage.getItem(SEALED) !== null; } catch { return false; } }
+
+/** The signer's answer to "is a share sealed here?". This (wallet) origin remembers that one was:
+ *  if the signer origin's storage was since cleared (evicted), say so rather than offer Create. */
+export function checkShare(has: boolean): boolean {
+  if (!has && hasSignerHint()) {
+    throw new ApiError("Your signer's share is missing from this browser: its storage was cleared. Restore it from your 24 recovery words and a vault's recovery backup file.", 404);
+  }
+  return has;
+}
 
 function session(): (SignerSession & { se: string }) | null {
   if (typeof window === "undefined") return null;
