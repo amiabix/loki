@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import { LokiTunnel } from "@/components/LokiTunnel";
+import { NativeTabConnection } from "@/components/NativeTabConnection";
 import {
   api,
   ApiError,
@@ -15,7 +16,8 @@ import {
   forgetSession,
   logout,
   listSlots,
-  pairDevice,
+  hasLokiSignerSession,
+  lastLokiSignerSlot,
   requestPairingLink,
   PairingSlotTaken,
   pendingApprovals,
@@ -31,9 +33,10 @@ import {
   type CustodyMethod,
   type PairingLink,
   type PendingApproval,
+  type Slot,
   type RecoveryStatus,
 } from "@/lib/api";
-import { comparesInLokiSigner, invitePreview, nativeRosterRefusal, pairingSecondsLeft, paymentLabel, rememberedVaultSlot, rememberVaultSlot, verifyPhrase } from "@/lib/wallet-ui";
+import { comparesInLokiSigner, invitePreview, nativeRosterRefusal, pairingSecondsLeft, paymentLabel, rememberedVaultSlot, rememberVaultSlot, storageLabel, verifyPhrase } from "@/lib/wallet-ui";
 import { toggleTheme, useIsDark } from "@/lib/theme";
 import { useCeremonyStatus, usePayments, useStatus } from "@/lib/hooks";
 import type {
@@ -112,11 +115,13 @@ export default function App() {
 
   const checkSession = useCallback(async () => {
     setAuthed(null); setSessionError(null);
+    const lokiSigner = hasLokiSignerSession();
     try {
       const s = await api<StatusResponse>("status");
       setAuthed(s.phase === "home");
     } catch (e) {
-      if (e instanceof ApiError && e.status === 401) setAuthed(false);
+      if (lokiSigner && !hasLokiSignerSession()) setAuthed(false);
+      else if (e instanceof ApiError && e.status === 401) setAuthed(false);
       else setSessionError((e as Error).message);
     }
   }, []);
@@ -288,7 +293,7 @@ function ViewRouter({
         <>
           {statusError && <div className="mb-4"><ErrMsg msg={statusError} /><Btn variant="ghost" onClick={onStatusRefresh}>Retry refresh</Btn></div>}
           {status.persisted === false && (
-            <div className="mb-4"><ErrMsg msg="This browser did not grant persistent storage, so it may delete your signer's sealed share under storage pressure. Keep a backup of your share before you rely on it." /></div>
+            <div className="mb-4"><ErrMsg msg="This browser no longer keeps your signer's storage persistent, so it may delete your share under storage pressure. Export every vault's recovery backup and keep your 24 recovery words." /></div>
           )}
           {status.relay && <p className="mb-4 text-xs text-muted">Signer relay: <span className="font-mono">{status.relay}</span></p>}
           <Home
@@ -515,7 +520,8 @@ function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string 
   useEffect(() => {
     // A signer error (another tab holds the signer, or the signer origin is unreachable) is
     // shown, not mistaken for "no signer here".
-    hasSigner().then(setExisting).catch((e) => setErr((e as Error).message));
+    // A share this browser had but the signer lost (404) offers Restore, not Unlock.
+    hasSigner().then(setExisting).catch((e) => { setErr((e as Error).message); if ((e as ApiError).status === 404) setExisting(false); });
     const pk = (window as unknown as { PublicKeyCredential?: { isUserVerifyingPlatformAuthenticatorAvailable?: () => Promise<boolean> } }).PublicKeyCredential;
     pk?.isUserVerifyingPlatformAuthenticatorAvailable?.().then(setPlatform).catch(() => setPlatform(false));
   }, []);
@@ -532,16 +538,26 @@ function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string 
     } catch (e) { setErr((e as Error).message); }
     finally { setBusy(false); }
   };
-  const [link, setLink] = useState("");
   const [nativeOpen, setNativeOpen] = useState(false);
-  const pasteRef = useRef<HTMLInputElement>(null);
-  const focusPaste = useCallback(() => pasteRef.current?.focus(), []);
-  const pair = async () => {
-    setBusy(true); setErr(null);
-    try { await pairDevice(link); setLink(""); onLoggedIn(); }
-    catch (e) { setErr((e as Error).message); }
-    finally { setBusy(false); }
-  };
+  const [nativeBusy, setNativeBusy] = useState(false);
+  const [apps, setApps] = useState<Slot[]>();
+  const [choice, setChoice] = useState<number | "paste">();
+  useEffect(() => {
+    const last = lastLokiSignerSlot();
+    if (last !== undefined) { setChoice(last); setNativeOpen(true); }
+  }, []);
+  useEffect(() => {
+    if (!nativeOpen) return;
+    const loading = new AbortController();
+    listSlots(loading.signal).then(setApps).catch(() => {
+      if (!loading.signal.aborted) setApps([]); // An existing headless member can still paste.
+    });
+    return () => loading.abort();
+  }, [nativeOpen]);
+  const lokiSigners = apps?.filter((m) => m.lokisigner_url !== undefined) ?? [];
+  const selected = choice ?? (lokiSigners.length === 0 && apps ? "paste" : undefined);
+  const selectedSlot = typeof selected === "number" ? selected : undefined;
+  const selectedMember = apps?.find((m) => m.slot === selectedSlot);
 
   return <FullScreen calm>
     <div className="panel w-full max-w-md px-6 py-8 sm:px-10">
@@ -608,16 +624,28 @@ function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string 
       {/* A native member app (LokiSigner / loki_member_app) instead of the browser signer: this
           tab then drives that member over its loopback device API. A new app first takes a
           pairing link (step 1); an app that is already paired goes straight to step 2. */}
-      <details className="mt-4 text-xs text-muted" onToggle={(e) => setNativeOpen(e.currentTarget.open)}>
+      <details open={nativeOpen} className="mt-4 text-xs text-muted" onToggle={(e) => setNativeOpen(e.currentTarget.open)}>
         <summary className="min-h-11 cursor-pointer hover:text-mint">Use a native member app instead</summary>
         <h2 className="mb-1 mt-3 text-sm font-semibold text-[var(--ink)]">1 · Pair a new native signer</h2>
-        <NativePairingLink open={nativeOpen} onRegistered={focusPaste} />
-        <h2 className="mb-1 mt-5 text-sm font-semibold text-[var(--ink)]">2 · Paste LokiSigner&apos;s private link</h2>
-        <p className="my-2">Already paired? Unlock your profile in the member app. Then paste the private link it shows here. Keep the link private.</p>
-        <input ref={pasteRef} type="password" value={link} autoComplete="off" spellCheck={false} aria-label="LokiSigner's private link"
-          onChange={(e) => setLink(e.target.value)} onKeyDown={(e) => e.key === "Enter" && !busy && link && pair()}
-          placeholder="http://127.0.0.1:3601/#…" className="glass mb-3 w-full rounded-full px-5 py-3" />
-        <Btn variant="ghost" disabled={busy || !link.trim()} onClick={pair}>{busy ? "Connecting…" : "Pair this tab"}</Btn>
+        <NativePairingLink open={nativeOpen} onReserved={setChoice} onRegistered={setApps} />
+        <h2 className="mb-1 mt-5 text-sm font-semibold text-[var(--ink)]">2 · Connect this wallet tab</h2>
+        {nativeOpen && <>
+          {(lokiSigners.length > 0 || selectedSlot !== undefined) && <label className="my-2 block">
+            Member app
+            <select value={selected ?? ""} disabled={busy || nativeBusy} onChange={(e) => setChoice(e.target.value === "paste" ? "paste" : Number(e.target.value))}
+              className="glass mt-1 w-full rounded-full px-4 py-2.5 text-[var(--ink)]">
+              {selected === undefined && <option value="" disabled>Choose a member app</option>}
+              {lokiSigners.map((m) => <option key={m.slot} value={m.slot}>LokiSigner · Slot {m.slot}</option>)}
+              {selectedSlot !== undefined && !lokiSigners.some((m) => m.slot === selectedSlot) &&
+                <option value={selectedSlot}>Member app · Slot {selectedSlot}</option>}
+              <option value="paste">Headless or older member app</option>
+            </select>
+          </label>}
+          {selected === undefined && lokiSigners.length === 0 && <p role="status" className="my-2">Reading the member roster…</p>}
+          {/* Starting a browser-signer action unmounts and cancels a pending native connection. */}
+          {selected !== undefined && !busy && <NativeTabConnection key={selected} member={selectedMember} slot={selectedSlot} disabled={nativeBusy}
+            onBusy={setNativeBusy} onConnected={onLoggedIn} />}
+        </>}
       </details>
     </div>
   </FullScreen>;
@@ -630,7 +658,7 @@ function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string 
 const ROSTER_POLL_MS = 3000;
 const ROSTER_GRACE_MS = 60_000;
 
-function NativePairingLink({ open, onRegistered }: { open: boolean; onRegistered: () => void }) {
+function NativePairingLink({ open, onReserved, onRegistered }: { open: boolean; onReserved: (slot: number) => void; onRegistered: (roster: Slot[]) => void }) {
   const [link, setLink] = useState<PairingLink | null>(null);
   const [slot, setSlot] = useState<number>(); // a new link asks for this slot again
   const [registered, setRegistered] = useState<number | null>(null);
@@ -644,6 +672,7 @@ function NativePairingLink({ open, onRegistered }: { open: boolean; onRegistered
     try {
       const issued = await requestPairingLink(want);
       setSlot(issued.slot); setNow(Date.now()); setLink(issued); setRegistered(null);
+      onReserved(issued.slot);
     } catch (e) {
       // A taken slot stays taken: stop watching it, and let the next link take a new slot.
       if (e instanceof PairingSlotTaken) setSlot(undefined);
@@ -668,7 +697,7 @@ function NativePairingLink({ open, onRegistered }: { open: boolean; onRegistered
       if (Date.now() > link.expires + ROSTER_GRACE_MS) { clearInterval(poll); return; }
       try {
         const roster = await listSlots();
-        if (!stopped && roster.some((m) => m.slot === link.slot)) { setRegistered(link.slot); onRegistered(); }
+        if (!stopped && roster.some((m) => m.slot === link.slot)) { setRegistered(link.slot); onRegistered(roster); }
       } catch {} // the next poll retries
     }, ROSTER_POLL_MS);
     return () => { stopped = true; clearInterval(tick); clearInterval(poll); };
@@ -678,7 +707,7 @@ function NativePairingLink({ open, onRegistered }: { open: boolean; onRegistered
     // The roster shows only that some identity registered this slot, not that it is this member's.
     return <>
       <p role="status" className="my-2 font-medium text-mint">
-        Slot {registered} now appears on the roster. If LokiSigner shows “Signer paired and running”, paste its private link below.
+        Slot {registered} now appears on the roster. If LokiSigner is running and paired with that slot, connect below.
       </p>
       <button type="button" disabled={busy} onClick={() => request(undefined)} className="min-h-11 text-mint">
         {busy ? "Requesting…" : "LokiSigner did not pair? Get a link for another slot"}
@@ -699,7 +728,7 @@ function NativePairingLink({ open, onRegistered }: { open: boolean; onRegistered
   if (left === 0) {
     return <>
       <p role="status" className="my-2">
-        The link for slot {link.slot} expired. If LokiSigner already shows its private link, paste it below.
+        The link for slot {link.slot} expired. If LokiSigner is running and paired with that slot, connect below.
         Otherwise get a new link for the same slot.
       </p>
       <Btn variant="ghost" disabled={busy} onClick={() => request(slot)}>{busy ? "Requesting…" : "Get a new link"}</Btn>
@@ -722,23 +751,21 @@ function NativePairingLink({ open, onRegistered }: { open: boolean; onRegistered
       <li>“Pair this device with slot {link.slot}?” with the coordinator. Choose Continue only if it shows {window.location.origin}.</li>
       <li>“Pair this device with slot {link.slot}?” again, with the network and endpoints. Enter a local profile passphrase and choose Pair.</li>
       <li>For a new profile, “Save your recovery words privately”. Write them down, then choose “I saved these words”.</li>
-      <li>“Signer paired and running”. Choose “Copy private link” and paste it in step 2 below.</li>
+      <li>“LokiSigner is running”. Choose Done, then connect this tab in step 2 below.</li>
     </ol>
   </>;
 }
 
 // Describe protection on the signer host, not custody inside this browser.
 function SecureStorageBadge({ se }: { se?: string }) {
-  const enclave = se === "apple";
+  const { enclave, label, detail } = storageLabel(se, signerKind());
   return (
     <span
       className="pill text-[11px] text-muted"
-      title={enclave
-        ? "Your device’s Secure Enclave protects the wrapping key; signing requires local consent. The share enters device process memory during signing."
-        : "Software development signer: local sealed storage, without hardware isolation."}
+      title={detail}
     >
       <span className={`dot ${enclave ? "bg-mint text-mint" : "bg-amber text-amber"}`} />
-      {enclave ? "Enclave-protected wrapping key" : "Software device storage"}
+      {label}
     </span>
   );
 }
@@ -874,8 +901,8 @@ function CreateVault({
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  // threshold can't exceed members
-  const t = Math.min(threshold, members);
+  // the host requires 2 <= threshold < members <= 16
+  const t = Math.min(threshold, members - 1);
   const submit = async () => {
     setBusy(true); setErr(null);
     try {
@@ -919,7 +946,7 @@ function CreateVault({
               onChange={(e) => setMembers(Number(e.target.value))}
               className="glass mt-1 w-full rounded-full px-6 py-2.5 text-left text-sm text-foreground outline-none bg-transparent"
             >
-              {range(2, 16).map((n) => (
+              {range(3, 16).map((n) => (
                 <option key={n} value={n} className="bg-[var(--surface-2)] text-foreground">{n}</option>
               ))}
             </select>
@@ -931,7 +958,7 @@ function CreateVault({
               onChange={(e) => setThreshold(Number(e.target.value))}
               className="glass mt-1 w-full rounded-full px-6 py-2.5 text-left text-sm text-foreground outline-none bg-transparent"
             >
-              {range(2, members).map((n) => (
+              {range(2, members - 1).map((n) => (
                 <option key={n} value={n} className="bg-[var(--surface-2)] text-foreground">{n}</option>
               ))}
             </select>
@@ -1074,9 +1101,7 @@ function CeremonyView({
         <h2 className="text-2xl font-semibold text-mint mb-2">Vault ready</h2>
         <p className="text-muted text-sm mb-4">Setup is complete and the vault is active.</p>
         <p className="mb-6 text-sm text-foreground/90">
-          {secureElement === "apple"
-            ? "The signer host’s Secure Enclave protects the unwrapping key. Your share enters process memory during signing; it is not hardware-contained FROST signing."
-            : "Software development signer: local sealed storage, without hardware isolation."}
+          {storageLabel(secureElement, signerKind()).detail}
         </p>
         <div className="mb-8 flex justify-center"><SecureStorageBadge se={secureElement} /></div>
         <Btn onClick={onDone}>Go to vault →</Btn>
@@ -2095,11 +2120,23 @@ function ReviewApprove({
 
   const isProposer = proposedHere ?? (session && ownSlot !== null ? session.intent.proposer === ownSlot : null);
 
+  if (approved && session?.phase === "failed") {
+    return (
+      <GlassCard className="text-center">
+        <div aria-hidden="true" className="mx-auto mb-4 grid h-14 w-14 place-items-center rounded-full bg-danger/10 text-3xl text-danger">✕</div>
+        <h2 className="mb-2 text-2xl font-semibold text-danger">Payment signing failed</h2>
+        <ErrMsg msg={session.error ?? null} />
+        <p className="text-sm text-muted mb-8">Nothing was sent. Replace or discard it from History.</p>
+        <Btn variant="ghost" onClick={onBack}>Back to History</Btn>
+      </GlassCard>
+    );
+  }
+
   if (approved) {
     return (
       <GlassCard className="text-center">
         <div aria-hidden="true" className="mx-auto mb-4 grid h-14 w-14 place-items-center rounded-full bg-mint/10 text-3xl text-mint">✓</div>
-        <h2 className="mb-2 text-2xl font-semibold text-mint">{session?.phase === "failed" ? "Payment signing failed" : "You approved this payment"}</h2>
+        <h2 className="mb-2 text-2xl font-semibold text-mint">You approved this payment</h2>
         <ErrMsg msg={session?.error ?? null} />
         <p className="text-sm text-muted mb-8">
           It needs {vault.threshold} of {vault.members} members. Once enough have approved, the proposer builds the transaction, gives every member a copy, and sends it.

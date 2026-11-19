@@ -5,10 +5,14 @@ use tokio::sync::RwLock;
 use zeroize::Zeroizing;
 
 use crate::signer::secure_element::{OpenError, SecureElement, SoftwareSecureElement, WrappedDek};
+#[cfg(all(target_os = "macos", feature = "apple-enclave"))]
+use crate::signer::secure_element_apple::{AppleSecureElement, KeyFailure};
 
 /// Launch configuration for one member coordinator (one process per member).
 pub struct Config {
     pub registration: Option<super::RegistrationConfig>,
+    /// The GUI entry points own local recovery and may use a profile-scoped Apple key tag.
+    pub(super) native: bool,
     pub data: PathBuf,
     pub port: u16,
     pub bind: std::net::IpAddr,
@@ -23,7 +27,8 @@ pub struct Config {
     pub operator_key: Option<String>,
     pub enrollment_issuer: Option<PathBuf>,
     pub development_http: bool,
-    /// Printed in the signer link and required on every `/api/*` request.
+    /// Headless capability, printed in the signer link. Empty for LokiSigner, which
+    /// authenticates only with individually approved wallet-tab tokens.
     pub token: String,
     pub frostd_url: String,
     /// Operator URL allowlist for remote peers; vault slots never resolve through this map.
@@ -34,6 +39,16 @@ pub struct Config {
 }
 
 impl Config {
+    pub(super) fn lokisigner_url(&self) -> Option<String> {
+        if !self.native || self.port == 0 { return None; }
+        let host = match self.bind {
+            std::net::IpAddr::V4(ip) if ip == std::net::Ipv4Addr::LOCALHOST || ip.is_unspecified() => "127.0.0.1",
+            std::net::IpAddr::V6(ip) if ip.is_loopback() || ip.is_unspecified() => "[::1]",
+            _ => return None,
+        };
+        Some(format!("http://{host}:{}", self.port))
+    }
+
     pub(super) fn base_url(&self) -> String {
         self.advertise_url.clone().unwrap_or_else(|| format!("http://127.0.0.1:{}", self.port))
             .trim_end_matches('/').to_owned()
@@ -73,40 +88,181 @@ impl Config {
     }
 
     pub(super) fn open_secure_element(&self, dir: &Path, pass: &str) -> Result<HostedSecureElement, String> {
-        let result = self.open_element(dir, pass, None);
+        let result = self.open_element(dir, pass, false, None, &self.data);
         eprintln!("secure-element open: {}", if result.is_ok() { "ok" } else { "error" });
         result
     }
 
     // A staged vault must use the same Enclave key after its directory is published.
-    pub(super) fn open_element(&self, dir: &Path, pass: &str, _published: Option<&Path>) -> Result<HostedSecureElement, String> {
+    pub(super) fn create_secure_element(&self, dir: &Path, pass: &str, published: Option<&Path>, profile: &Path) -> Result<HostedSecureElement, String> {
+        self.open_element(dir, pass, true, published, profile)
+    }
+
+    fn open_element(&self, dir: &Path, pass: &str, _create: bool, _published: Option<&Path>, _profile: &Path) -> Result<HostedSecureElement, String> {
         self.validate_secure_element()?;
         #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
         if self.secure_element == "apple" {
-            use std::os::unix::fs::DirBuilderExt;
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(dir)
-                .map_err(|e| format!("signer directory: {e}"))?;
-            // Scope the persistent key to this signer directory, resolving path aliases.
-            let dir = match _published {
-                Some(path) => path.to_owned(),
-                None => dir.canonicalize().map_err(|e| format!("signer directory: {e}"))?,
-            };
-            let mut tag = b"cash.loki.member.kek.v1:".to_vec();
-            tag.extend_from_slice(dir.as_os_str().as_encoded_bytes());
-            return crate::signer::secure_element_apple::AppleSecureElement::persistent(&tag)
-                .map(HostedSecureElement::Apple);
+            let (scope, role) = vault_key_scope(self, _profile, dir, _published, _create)
+                .map_err(|_| KeyFailure::Other.to_string())?;
+            if _create && scope.is_some() {
+                crate::state::MemberDir::create(dir, "").map_err(|_| KeyFailure::Other.to_string())?;
+                match std::fs::OpenOptions::new().write(true).create_new(true).open(dir.join(SCOPED_VAULT_KEY)) {
+                    Ok(file) => file.sync_all().and_then(|_| std::fs::File::open(dir)?.sync_all())
+                        .map_err(|_| KeyFailure::Other.to_string())?,
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {},
+                    Err(_) => return Err(KeyFailure::Other.to_string()),
+                }
+            }
+            let element = open_apple_element(dir, _create, _published, scope, &role);
+            #[cfg(feature = "relay-communication")]
+            let element = if self.native && !_create {
+                match element {
+                    Err(failure) if failure.is_gone() => {
+                        super::native_member::report_vault_key_gone(_profile);
+                        Err(failure)
+                    },
+                    Ok(HostedSecureElement::Apple(key, _)) => Ok(HostedSecureElement::Apple(key, Some(_profile.to_owned()))),
+                    other => other,
+                }
+            } else { element };
+            return element.map_err(|e| e.to_string());
         }
         SoftwareSecureElement::persistent(dir, pass).map(HostedSecureElement::Software)
     }
 }
 
+pub(super) const NATIVE_KEY_SCOPE: &str = "native-key-scope";
+
+pub(super) fn write_native_key_scope(data: &Path) -> Result<(), String> {
+    let dir = crate::state::MemberDir::create(data, "").map_err(|e| e.to_string())?;
+    dir.write_text(NATIVE_KEY_SCOPE, &uuid::Uuid::new_v4().to_string()).map_err(|e| e.to_string())
+}
+
+#[cfg(any(test, all(target_os = "macos", feature = "apple-enclave")))]
+pub(super) fn read_native_key_scope(data: &Path) -> Result<Option<uuid::Uuid>, String> {
+    match std::fs::read_to_string(data.join(NATIVE_KEY_SCOPE)) {
+        Ok(scope) => uuid::Uuid::parse_str(&scope).map(Some).map_err(|_| "invalid native key scope".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[cfg(any(test, all(target_os = "macos", feature = "apple-enclave")))]
+pub(super) fn key_scope(config: &Config, profile: &Path) -> Result<Option<uuid::Uuid>, String> {
+    if config.native { read_native_key_scope(profile) } else { Ok(None) }
+}
+
+#[cfg(any(test, all(target_os = "macos", feature = "apple-enclave")))]
+const SCOPED_VAULT_KEY: &str = "native-scoped-vault-key";
+
+#[cfg(any(test, all(target_os = "macos", feature = "apple-enclave")))]
+fn vault_key_scope(config: &Config, profile: &Path, key_dir: &Path, published: Option<&Path>, create: bool) -> Result<(Option<uuid::Uuid>, String), String> {
+    let mut scope = key_scope(config, profile)?;
+    // The first release with profile scopes used them only for device keys. Existing
+    // vault seals without this marker still use their original path tag.
+    if scope.is_some() && !create && !key_dir.join(SCOPED_VAULT_KEY).try_exists().map_err(|e| e.to_string())? {
+        scope = None;
+    }
+    // Only the vault ID (the parent of signer/) is part of the role, never a staging name.
+    let role = if scope.is_some() {
+        let id = published.unwrap_or(key_dir).parent().and_then(Path::file_name).and_then(|name| name.to_str()).ok_or("invalid vault key directory")?;
+        format!("vault:{id}")
+    } else { String::new() };
+    Ok((scope, role))
+}
+
+/// The scoped form survives a folder move. For a staged restore, pass the scope read from
+/// the staged profile and use the published directory only as the legacy fallback.
+#[cfg(any(test, all(target_os = "macos", feature = "apple-enclave")))]
+pub(super) fn apple_key_tag(dir: &Path, scope: Option<uuid::Uuid>, role: &str) -> Vec<u8> {
+    if let Some(scope) = scope {
+        return format!("cash.loki.member.kek.v2:{scope}:{role}").into_bytes();
+    }
+    let mut tag = b"cash.loki.member.kek.v1:".to_vec();
+    tag.extend_from_slice(dir.as_os_str().as_encoded_bytes());
+    tag
+}
+
+#[cfg(all(target_os = "macos", feature = "apple-enclave"))]
+pub(super) fn open_apple_element(dir: &Path, create: bool, published: Option<&Path>, scope: Option<uuid::Uuid>, role: &str) -> Result<HostedSecureElement, KeyFailure> {
+    use std::os::unix::fs::DirBuilderExt;
+    if create {
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(|_| KeyFailure::Other)?;
+    }
+    let legacy = if scope.is_none() { legacy_key_dir(dir, published)? } else { PathBuf::new() };
+    let tag = apple_key_tag(&legacy, scope, role);
+    persistent_apple_key(dir, &tag, create)
+}
+
+#[cfg(all(target_os = "macos", feature = "apple-enclave"))]
+fn persistent_apple_key(dir: &Path, tag: &[u8], create: bool) -> Result<HostedSecureElement, KeyFailure> {
+    #[cfg(test)]
+    if let Some(outcome) = apple_test::lookup(dir, tag, create) {
+        outcome?;
+        return SoftwareSecureElement::persistent(dir, "Apple test stand-in")
+            .map(HostedSecureElement::Software).map_err(|_| KeyFailure::Other);
+    }
+    let state = dir.join("biometry-state");
+    let key = if create { AppleSecureElement::create_persistent(tag, Some(&state)) }
+    else { AppleSecureElement::open_persistent(tag, Some(&state)) };
+    key.map(|key| HostedSecureElement::Apple(key, None))
+}
+
+#[cfg(all(target_os = "macos", feature = "apple-enclave"))]
+fn legacy_key_dir(dir: &Path, published: Option<&Path>) -> Result<PathBuf, KeyFailure> {
+    // Keep existing tags compatible, including the eventual location of a staged key.
+    Ok(match published {
+        Some(path) => path.to_owned(),
+        None => match dir.canonicalize() {
+            Ok(path) => path,
+            // The login key can exist even if its directory was never published or was removed.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && dir.file_name().is_some() => {
+                let parent = dir.parent().ok_or(KeyFailure::Other)?.canonicalize().map_err(|_| KeyFailure::Other)?;
+                parent.join(dir.file_name().unwrap())
+            }
+            Err(_) => return Err(KeyFailure::Other),
+        },
+    })
+}
+
+#[cfg(all(test, target_os = "macos", feature = "apple-enclave"))]
+pub(super) mod apple_test {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    type Lookup = Arc<dyn Fn(&Path, &[u8], bool) -> Result<(), KeyFailure> + Send + Sync>;
+    static FIXTURES: Mutex<Vec<(PathBuf, Lookup)>> = Mutex::new(Vec::new());
+
+    pub(crate) struct Fixture(PathBuf);
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            FIXTURES.lock().unwrap().retain(|(path, _)| *path != self.0);
+        }
+    }
+
+    pub(crate) fn install(root: &Path, lookup: impl Fn(&Path, &[u8], bool) -> Result<(), KeyFailure> + Send + Sync + 'static) -> Fixture {
+        FIXTURES.lock().unwrap().push((root.to_owned(), Arc::new(lookup)));
+        Fixture(root.to_owned())
+    }
+
+    pub(super) fn lookup(dir: &Path, tag: &[u8], create: bool) -> Option<Result<(), KeyFailure>> {
+        let lookup = FIXTURES.lock().unwrap().iter().find(|(path, _)| dir.starts_with(path)).map(|(_, lookup)| lookup.clone());
+        lookup.map(|f| f(dir, tag, create))
+    }
+}
+
+pub(super) fn member_key_message(_error: &str) -> Option<&'static str> {
+    #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
+    return crate::signer::secure_element_apple::member_key_message(_error);
+    #[cfg(not(all(target_os = "macos", feature = "apple-enclave")))]
+    None
+}
+
 pub(super) enum HostedSecureElement {
     Software(SoftwareSecureElement),
     #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
-    Apple(crate::signer::secure_element_apple::AppleSecureElement),
+    Apple(AppleSecureElement, Option<PathBuf>),
 }
 
 impl SecureElement for HostedSecureElement {
@@ -114,7 +270,7 @@ impl SecureElement for HostedSecureElement {
         match self {
             Self::Software(se) => se.wrap_dek(dek),
             #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
-            Self::Apple(se) => se.wrap_dek(dek),
+            Self::Apple(se, _) => se.wrap_dek(dek),
         }
     }
 
@@ -122,7 +278,14 @@ impl SecureElement for HostedSecureElement {
         let result = match self {
             Self::Software(se) => se.unwrap_dek(wrapped),
             #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
-            Self::Apple(se) => se.unwrap_dek(wrapped),
+            Self::Apple(se, _profile) => {
+                let result = se.unwrap_dek(wrapped);
+                #[cfg(feature = "relay-communication")]
+                if let (Some(profile), Err(OpenError::Element(error))) = (_profile, &result) {
+                    if error == KeyFailure::Missing.message() { super::native_member::report_vault_key_gone(profile); }
+                }
+                result
+            },
         };
         let outcome = match &result {
             Ok(_) => "ok",
@@ -176,8 +339,7 @@ pub struct AppState {
     pub(super) roster_asking: std::sync::Mutex<Option<String>>,
     /// Vaults whose codes the member said differ, refused until the app restarts.
     pub(super) roster_refused: std::sync::Mutex<BTreeSet<String>>,
-    /// Only the GUI entry point handles recovery locally. Headless scripted approval is separate.
-    pub(super) recovery_in_app: bool,
+    pub(super) wallet_tabs: Option<super::connect::WalletTabs>,
     /// Each vault's group viewing key, read from its device-bound signer once per process.
     pub(super) viewing_keys: std::sync::Mutex<BTreeMap<String, orchard::keys::FullViewingKey>>,
     /// The signer configuration LokiSigner fetched for this launch, saved once the profile unlocks.
@@ -200,7 +362,7 @@ impl AppState {
             roster_confirmation: None,
             roster_asking: std::sync::Mutex::new(None),
             roster_refused: std::sync::Mutex::new(BTreeSet::new()),
-            recovery_in_app: false,
+            wallet_tabs: None,
             viewing_keys: std::sync::Mutex::new(BTreeMap::new()),
             fetched_config: None,
         }
@@ -214,9 +376,49 @@ mod tests {
     use super::*;
     use crate::signer::secure_element::SealedShare;
 
+    #[test]
+    fn apple_tags_keep_legacy_identity_and_scope_new_keys_to_the_profile_and_role() {
+        let data = std::env::temp_dir().join(format!("loki-device-tag-{}", uuid::Uuid::new_v4()));
+        let device = data.join("device-auth");
+        let legacy_vault = data.join("vaults/older/signer");
+        let vault = data.join("vaults/example/signer");
+        let mut config = config("apple");
+        config.native = true;
+        let legacy = |path: &Path| format!("cash.loki.member.kek.v1:{}", path.display()).into_bytes();
+        let tags = |config: &Config, root: &Path, device: &Path, vault: &Path, create: bool| {
+            let (scope, role) = vault_key_scope(config, root, vault, None, create).unwrap();
+            (apple_key_tag(device, key_scope(config, root).unwrap(), "device-auth"), apple_key_tag(vault, scope, &role))
+        };
+        assert_eq!(tags(&config, &data, &device, &legacy_vault, false), (legacy(&device), legacy(&legacy_vault)));
+        write_native_key_scope(&data).unwrap();
+        std::fs::create_dir_all(&legacy_vault).unwrap();
+        std::fs::write(legacy_vault.join("share.sealed"), b"already sealed with #93").unwrap();
+        let scope = read_native_key_scope(&data).unwrap().unwrap();
+        let scoped = tags(&config, &data, &device, &vault, true);
+        assert_eq!(scoped.0, format!("cash.loki.member.kek.v2:{scope}:device-auth").as_bytes());
+        assert_eq!(scoped.1, format!("cash.loki.member.kek.v2:{scope}:vault:example").as_bytes());
+        assert_eq!(tags(&config, &data, &device, &vault, false), (scoped.0.clone(), legacy(&vault)));
+        std::fs::create_dir_all(&vault).unwrap();
+        std::fs::write(vault.join(SCOPED_VAULT_KEY), []).unwrap();
+        assert_eq!(tags(&config, &data, &device, &vault, false), scoped);
+        assert_eq!(tags(&config, &data, &device, &legacy_vault, false), (scoped.0.clone(), legacy(&legacy_vault)));
+        config.native = false;
+        assert_eq!(tags(&config, &data, &device, &vault, false), (legacy(&device), legacy(&vault)));
+        config.native = true;
+        let moved = data.with_extension("moved");
+        std::fs::rename(&data, &moved).unwrap();
+        assert_eq!(scoped, tags(&config, &moved, &moved.join("device-auth"), &moved.join("vaults/example/signer"), false));
+        write_native_key_scope(&data).unwrap();
+        let replacement = tags(&config, &data, &device, &vault, true);
+        assert_ne!(scoped.0, replacement.0);
+        assert_ne!(scoped.1, replacement.1);
+        std::fs::remove_dir_all(data).unwrap();
+        std::fs::remove_dir_all(moved).unwrap();
+    }
+
     fn config(secure_element: &str) -> Config {
         Config {
-            registration: None,
+            registration: None, native: false,
             bind: "127.0.0.1".parse().unwrap(), advertise_url: None,
             data: PathBuf::new(), port: 3001, network: "regtest".into(),
             lightwalletd: None, transport: "local".into(), secure_element: secure_element.into(),
@@ -282,6 +484,60 @@ mod tests {
         #[cfg(not(all(target_os = "macos", feature = "apple-enclave")))]
         assert!(config("apple").open_secure_element(&dir, "pass").is_err());
         assert!(!dir.exists());
+    }
+
+    #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
+    #[test]
+    fn marked_scoped_vault_with_no_key_is_not_created_on_open() {
+        let root = std::env::temp_dir().join(format!("loki-marked-with-no-key-{}", uuid::Uuid::new_v4()));
+        let dir = root.join("vaults/new/signer");
+        write_native_key_scope(&root).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = config("apple");
+        cfg.native = true;
+        cfg.data = root.clone();
+        let scope = read_native_key_scope(&root).unwrap().unwrap();
+        let expected = format!("cash.loki.member.kek.v2:{scope}:vault:new");
+        let intents = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let accesses = intents.clone();
+        let _fixture = apple_test::install(&root, move |dir, tag, create| {
+            assert!(dir.join(SCOPED_VAULT_KEY).is_file(), "write the marker before touching the Keychain");
+            assert_eq!(tag, expected.as_bytes());
+            accesses.lock().unwrap().push(create);
+            Err(if create { KeyFailure::Cancelled } else { KeyFailure::Missing })
+        });
+        assert_eq!(cfg.create_secure_element(&dir, "unused", None, &root).err().as_deref(), Some(KeyFailure::Cancelled.message()));
+        assert_eq!(cfg.open_secure_element(&dir, "unused").err().as_deref(), Some(KeyFailure::Missing.message()));
+        assert_eq!(*intents.lock().unwrap(), [true, false]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
+    #[test]
+    fn staged_apple_vault_uses_the_existing_canonical_tag_after_publication() {
+        let root = std::env::temp_dir().canonicalize().unwrap().join(uuid::Uuid::new_v4().to_string());
+        let dest = root.join("published").join("signer");
+        let cfg = config("apple");
+        let expected = [b"cash.loki.member.kek.v1:", dest.as_os_str().as_encoded_bytes()].concat();
+        let stage = root.join("stage");
+        let pending = stage.join("signer");
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let accesses = calls.clone();
+        let _fixture = apple_test::install(&root, move |_, tag, create| {
+            assert_eq!(tag, expected);
+            accesses.lock().unwrap().push(create);
+            if create { Ok(()) } else { Err(KeyFailure::Missing) }
+        });
+        for _ in 0..2 {
+            cfg.create_secure_element(&pending, "unused", Some(&dest), &stage).unwrap();
+            assert!(!dest.exists(), "staging leaves the published profile absent");
+            std::fs::remove_dir_all(&stage).unwrap();
+        }
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        assert_eq!(cfg.open_secure_element(&dest, "unused").err().as_deref(), Some(KeyFailure::Missing.message()));
+        assert!(!dest.exists(), "an open with no key must not create a directory");
+        assert_eq!(*calls.lock().unwrap(), [true, true, false]);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

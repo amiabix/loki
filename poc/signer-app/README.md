@@ -1,7 +1,7 @@
 # LokiSigner — member-owned native signer
 
-The native app claims a `loki://pair` link, opens the existing persistent Secure Enclave
-P-256 device key, and runs S4a self-registration. The coordinator receives public enrollment
+The native app claims a `loki://pair` link, sets up a persistent Secure Enclave P-256 device
+key for a new profile (or opens the existing key), and runs S4a self-registration. The coordinator receives public enrollment
 and a challenge signature. Profile passphrases, local session capabilities and FROST shares
 stay on the member device. The FROST share is encrypted with an Enclave-wrapped key; it is
 opened in signer memory for signing.
@@ -18,7 +18,9 @@ On the wallet's sign-in screen open **Use a native member app instead**. It has 
 1. **Pair a new native signer**: choose **Get a pairing link**. The wallet shows the reserved
    slot, the time left on the link, an **Open LokiSigner** button and **Copy link** (to open
    it on the member's Mac yourself). LokiSigner then asks, in this order:
-   - On first launch, choose **Pair a new signer** (or see restore below if this is a replacement Mac).
+   - On first launch, LokiSigner checks that Touch ID is available, enrolled and not locked out.
+     Setup stops if it isn't ready. Read the fingerprint-change warning and choose **Pair a new
+     signer** (or see restore below if this is a replacement Mac).
    - "Pair this device with slot N?" with the coordinator origin. Choose **Continue** only if
      it is the wallet's address.
    - "Pair this device with slot N?" again, with the network and endpoints that coordinator
@@ -26,22 +28,95 @@ On the wallet's sign-in screen open **Use a native member app instead**. It has 
      Enclave prompt if macOS shows one.
    - For a new profile, "Save your recovery words privately". Write them down, then choose
      **I saved these words**.
-   - "Signer paired and running". Choose **Copy private link**.
+   - "LokiSigner is running". Choose **Done**.
+
+   The coordinator and pairing configuration dialogs ignore input for the first second after
+   taking focus. Return and Enter do not confirm either dialog; Escape cancels.
 
    While the link is out the wallet watches the public roster. Once the slot appears there,
-   the wallet says so and moves to step 2. It cannot tell whose identity registered the slot,
-   so trust LokiSigner's "Signer paired and running", not the roster alone. When the two
+   the wallet says so and you can continue to step 2. The roster alone cannot tell you whose
+   app registered the slot. Compare the code on your own Mac before allowing the tab. When the two
    minutes run out first, the link and copy button go away; **Get a new link** asks for the
    same slot again. A lapsed slot can go to another member: the wallet then says the slot was
    taken, and the next link uses another slot. The wallet never asks for a new link by itself,
    because each one reserves a slot.
-2. **Paste LokiSigner's private link**: paste the private session link into the wallet tab on
-   **that same Mac** and choose **Pair this tab**. A member whose app is already paired starts
-   here after unlocking it.
+2. **Connect this wallet tab**: on **that same Mac**, unlock LokiSigner, select its slot in
+   the wallet, and choose **Connect LokiSigner**. If the app is still registering, the tab
+   retries for up to a minute, then offers **Try again**. When LokiSigner asks, check the
+   wallet origin and match the six-digit code in the app to the one in the tab, then choose
+   **Allow**. If they do not match, choose **Refuse**. The dialog ignores input for the first
+   second after taking focus. Tab starts on **Refuse**, Space activates the focused button,
+   Escape refuses, and Return and Enter do not answer. Nothing is copied. Allow local
+   network access if your browser asks.
 
 The app stays running for ceremony, payment review and signing using the existing device
-consent and nonce-witness paths. Quit locks the process; launch again to unlock and register
-with the saved public coordinator/slot, without reusing the claim.
+consent and nonce-witness paths. Connect separately in each new tab and after a relaunch. In
+the **LokiSigner** menu, **Disconnect all wallet tabs** withdraws existing grants without
+quitting or locking the app. Wallet logout locks the profile and revokes all wallet-tab grants.
+Quit also invalidates every grant; launch again to unlock and register with the saved public
+coordinator/slot, without reusing the claim.
+
+With saved settings, you can unlock and use local features such as **Vault addresses…** and
+**Restore a vault…** while the coordinator is offline. If registration fails or is refused,
+LokiSigner shows a warning, stays unlocked and keeps trying in the background. A launch with
+a new pairing link waits for the registration result before reporting success.
+
+If you cancel, enter the wrong passphrase, or LokiSigner cannot start, choose **Try again**
+or **Quit**. If the coordinator refuses a pairing, retry the saved pairing or get a new link
+from the wallet. When the existing profile has no vault data, **Start over…** lets you set it
+aside before pairing or restoring. LokiSigner moves the whole data folder to a dated sibling;
+it deletes neither the folder nor its old keys in the Keychain. New and restored native profiles
+save a public random `native-key-scope`. The device login key and each new vault key use that
+scope and a distinct role, so they keep the same tags when the folder moves on the same Mac and
+do not reuse the prior profile's keys at the same path. Existing path-based tags stay unchanged,
+including vaults written when only the device key used the scope. An empty `native-scoped-vault-key`
+marker beside a new vault's seals records that it uses the scoped tag. Keep both files with the
+profile if you move it.
+
+After a validated Apple device registration, LokiSigner writes an empty
+`device-registration-confirmed` marker in the profile. It contains no secrets and is not
+written during restore staging. Without that marker, a missing device key may be created
+only if the saved coordinator's roster can be read and does not list this profile’s identity.
+An unreadable roster does not authorize key creation.
+
+New Secure Enclave keys record the public LocalAuthentication enrolment state in a
+`biometry-state` file beside the corresponding sealed data. LokiSigner uses a change in that
+state to distinguish a fingerprint change from a failed match; it never stores fingerprints.
+When setup reuses a key left by an interrupted attempt, it verifies one private-key use
+before sealing new data under that key.
+
+`NativeSigner.start` checks Touch ID once when it sees a fresh profile, before pairing or
+first-run recovery asks for a passphrase or words. **Restore a vault…** checks it before
+collecting words in an unlocked profile. Neither check runs in `serve` or the headless binary.
+
+Adding or removing a fingerprint invalidates this Mac's signer keys. Copying a profile to
+another Mac does not copy its keys. LokiSigner does not create a replacement when opening
+sealed data. If you only moved an older profile that uses path-based tags on the same Mac,
+putting the folder back at its original path can recover access. A cancelled Touch ID prompt
+does not invalidate the key.
+
+**Update the coordinator and wallet before updating LokiSigner.**
+
+| Coordinator and wallet | LokiSigner | What the member sees |
+| --- | --- | --- |
+| Old | Old | Paste the private link displayed by LokiSigner. |
+| New | Old | The wallet still offers the paste flow for an older app. |
+| Old | New | First pairing shows a refusal; a saved profile opens with a registration warning and retries. The old wallet offers only paste, and the new app has no link to paste. |
+| New | New | Select the member slot, choose **Connect LokiSigner**, and compare the code before allowing. |
+
+`loki_member_app` and `LokiSigner serve` still use their printed pairing link. Once a new
+LokiSigner has registered, **do not roll back the coordinator** without removing the roster
+rows containing `lokisigner_url`. The old coordinator rejects those rows as an “unexpected
+registration field,” breaking `/api/members` for everyone, not just those slots.
+
+The signed `lokisigner_url` roster field tells everyone who can read `/api/members` that the
+slot uses LokiSigner and which local port it currently listens on. The field is separate
+from the peer endpoint and contains no tab token. A website the member visits can use that
+port and the member API's open ceremony routes to learn that LokiSigner is running, subject
+to the browser's local network permission. Only the pinned coordinator origin can ask to
+connect from a browser. Grants are stored in `sessionStorage`: duplicating a tab can copy its
+grant without another **Allow**. The coordinator serves the page but never receives the token
+in registration. Safari may block the wallet's request to loopback; this has not been verified.
 
 ## Back up and restore a vault
 
@@ -57,8 +132,36 @@ Choose one backup file in LokiSigner, enter the 24 words, and set a new local pr
 LokiSigner opens the file locally and checks that both recovered public identity keys identify
 exactly one slot in the coordinator's roster. It saves the recovered vault and identity together,
 then registers the new Mac in that slot without reserving a new one. If the connection fails
-after saving, keep LokiSigner running or reopen and unlock it to retry. You won't need the words
-again to reconnect. Once connected, use the private link to pair the wallet tab on the new Mac.
+after saving, keep LokiSigner running or reopen and unlock it to retry. If the coordinator
+refuses the slot before the first successful registration, LokiSigner checks the member list
+again and uses a different slot only when exactly one entry matches both public identity keys.
+You won't need the words again to reconnect. Use **Connect LokiSigner** to connect each
+wallet tab on the new Mac.
+
+Restore can reuse an absent or empty data folder, or one with only recognized leftovers: empty
+`profile/` or `device-auth/` directories, the public `native-key-scope` file, incomplete
+pairing or signer-settings `.tmp` files, and an empty `vaults/` directory or one holding only
+generated restore staging directories. Restore preserves these leftovers in a dated sibling.
+Anything unrecognized requires you to confirm **Start over…** before it is moved. Any other
+entry in `vaults/`, a `vaults` file, a legacy `card` entry, or top-level `vault.card`,
+`vault.sealed`, or `share.sealed` protects the profile from ordinary set-aside. LokiSigner tries
+to clear expired `.loki-restore-<UUID>` directories at startup, both in `vaults/` and beside
+the data folder. Symlinks to the data folder still work; set-aside keeps the link pointing to
+the newly emptied location and archives the old contents beside its target.
+
+If you already paired a different member by mistake, choose **Start over…** from the retry
+dialog or when **Restore a vault…** says the backup does not match the running profile. Confirm
+**Set aside and start over**, then choose **Restore from recovery words**. A profile with vault
+data is protected from this ordinary action. To restore a different member in that case, use
+another Mac or macOS account.
+
+When LokiSigner confirms that a vault or device key is missing or invalidated, it offers
+**Set aside profile…** even if the profile holds vault data. This stops the signer and renames
+the old folder without deleting it or any Keychain record. Choose **Restore from recovery words**
+to restore into the original folder with fresh keys. Keep the archived folder until you have
+verified every restored vault. A failed match, cancellation, or lockout does not grant this
+exception. For older keys without enrolment metadata, a failed match can only offer a recovery
+hint, not confirm that the key is gone.
 
 Restore each additional backup from **LokiSigner → Restore a vault…** in the unlocked app.
 It must belong to the same member and recovery words. It will not replace an existing vault.
@@ -104,14 +207,20 @@ or a run of more than three combining marks.
 
 - **Codes match** records the agreement and tells the creator.
 - **Codes differ** records nothing, and LokiSigner refuses that vault until it restarts, so a
-  page cannot reopen the dialog until the member gives in.
-- Neither button answers to Return, Space or any other key. The dialog takes focus when a page
-  asks, possibly while the member is typing elsewhere, so the member must click.
-- Closing the dialog or leaving it unanswered for 10 minutes records nothing; the member can
-  ask again.
+  page cannot reopen the dialog until the member gives in. If you choose **Codes differ** by
+  mistake, restart LokiSigner to clear the refusal and compare again.
+- Pressing Escape, closing the dialog or leaving it unanswered for 10 minutes records nothing;
+  the member can ask again.
 
 LokiSigner shows one roster dialog at a time. While it is open the member's other requests
 continue, and when the roster or the setup changed in the meantime the answer is refused.
+
+The roster and payment dialogs come to the front, but their buttons are disabled for the first
+second each time the dialog takes focus. Clicks and keystrokes during that second are ignored.
+Once the buttons are enabled, click a button or use Tab (or Shift-Tab) to focus it and press
+Space. No button starts focused. The first Tab reaches **Codes differ** or **Refuse** so that
+Tab then Space cannot agree to a roster or approve a payment. Return and Enter never answer.
+Escape refuses a payment and dismisses a roster comparison without recording an answer.
 
 The roster dialog and the payment dialog are both modal on the app's main thread. A payment
 request that arrives while the roster dialog is open waits until the member answers it or it
@@ -140,8 +249,8 @@ values its signer origin gives the browser signer (`LOKI_NETWORK`, `LOKI_FROSTD_
 - **Checked locally.** LokiSigner treats the reply as untrusted. It refuses unknown fields,
   mainnet, remote endpoints without TLS (loopback HTTP only with `--development-http`),
   endpoints containing whitespace, control or non-ASCII characters, and witnesses that hosted
-  signing would refuse. The request follows no redirect and times out. Its errors name only
-  the origin and the HTTP status; nothing the coordinator sends is shown.
+  signing would refuse. The request follows no redirect and times out. The app shows a fixed
+  message on failure, not the coordinator’s reply or HTTP status.
 - **Saved once unlocked, and pinned.** The configuration is saved only after the local profile
   unlocks, owner-only (0600) in the data directory: `signer-config.json` with the coordinator
   origin it came from, and the witnesses in `nonce-witnesses.json`, the `--nonce-witnesses`
@@ -155,7 +264,7 @@ values its signer origin gives the browser signer (`LOKI_NETWORK`, `LOKI_FROSTD_
   overrides a fetched value, nothing is saved, because the member was shown the flag's value
   and not the coordinator's.
 - **Nothing to run with.** When a launch still lacks the network, frostd, lightwalletd (on
-  testnet) or the witnesses, LokiSigner names what is missing and does not start. It never
+  testnet) or the witnesses, LokiSigner reports that it couldn’t load settings. It never
   falls back to regtest defaults.
 - **Regtest deployments.** The signer origin's `LOKI_NETWORK` defaults to `testnet`. A regtest
   stack must set `LOKI_NETWORK=regtest` on the signer origin, or LokiSigner is told testnet.
@@ -167,7 +276,7 @@ Pairing reserves a slot for 120 seconds. Both claim and registration are consume
 including failed proofs; claiming does not extend the deadline. If it expires while saving
 recovery words, choose **Get a new link** in the wallet, which asks for the same slot (or,
 if another member took it meanwhile, a new one). After
-a lost response, restart and unlock; an outstanding reservation may need to expire before
+a lost response, choose **Try again** and unlock; an outstanding reservation may need to expire before
 retry. Public device bindings prevent a different identity or slot from reusing the enrolled
 key.
 
@@ -253,7 +362,7 @@ RUST SIGNER ENCLAVE PASS: FROST share sealed + reloaded under the persistent Sec
 ```
 
 The app calls `loki_signer_enclave_selftest()` (`poc/src/enclave_ffi.rs`), which runs the
-actual signer path — `SealedShare::seal` under `AppleSecureElement::persistent` — so the
+actual signer path — `SealedShare::seal` under `AppleSecureElement::create_persistent` — so the
 member's FROST share is held in a persistent, device-bound, biometric-capable Secure Enclave
 key, **inside the provisioned app**. Built entirely on the Mac (crates.io + Enclave + Xcode).
 Arch must be `arm64` (matches the Rust lib). `libs/` is regenerated by `build.sh`, not committed.

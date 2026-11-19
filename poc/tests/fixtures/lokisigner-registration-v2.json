@@ -1,0 +1,14 @@
+{
+  "origin": "https://wallet.example",
+  "challenge": "one-use-challenge",
+  "enrollment": {
+    "slot": 7,
+    "signing_pubkey": "signing-key",
+    "relay_pubkey": "relay-key",
+    "advertise_url": "https://peer.example",
+    "lokisigner_url": "http://[::1]:42761",
+    "device_pubkey": "device-key",
+    "authorization": "not-in-the-transcript"
+  },
+  "expected": "loki-member-registration-v2\nhttps://wallet.example\n7\nsigning-key\nrelay-key\nhttps://peer.example\nhttp://[::1]:42761\ndevice-key\none-use-challenge"
+}

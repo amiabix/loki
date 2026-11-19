@@ -378,14 +378,11 @@ pub(super) async fn create(State(st): State<Shared>, Json(body): Json<Value>) ->
         .as_u64()
         .and_then(|n| u16::try_from(n).ok())
         .unwrap_or(0);
-    if name.is_empty()
-        || name.len() > 80
-        || !valid_policy(threshold, usize::from(members))
-    {
-        return err(
-            StatusCode::BAD_REQUEST,
-            "name must be 1 to 80 bytes; use 2 <= t < n <= 16",
-        );
+    if name.is_empty() || name.len() > 80 {
+        return err(StatusCode::BAD_REQUEST, "name must be 1 to 80 bytes");
+    }
+    if !valid_policy(threshold, usize::from(members)) {
+        return err(StatusCode::BAD_REQUEST, "use 2 <= t < n <= 16");
     }
     let (data, pass) = match unlocked(&st).await {
         Ok(x) => x,
@@ -1094,6 +1091,15 @@ fn roster_decision(confirmed: Option<&str>, code: &str) -> RosterDecision {
     if confirmed == Some(code) { RosterDecision::Match } else { RosterDecision::NoMatch }
 }
 
+fn setup_signer_element(config: &super::state::Config, dir: &Path, pass: &str, published: Option<&Path>, profile: &Path)
+    -> Result<(super::state::HostedSecureElement, bool), String>
+{
+    let existing = super::custody::has_signer_data(dir)?;
+    let element = if existing { config.open_secure_element(dir, pass)? }
+    else { config.create_secure_element(dir, pass, published, profile)? };
+    Ok((element, existing))
+}
+
 fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result<Value, String> {
     let mut c = {
         let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
@@ -1186,7 +1192,7 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
         let signer_dir = dir(data, vault_id)?.path().join("signer");
         // The share is born in the store under the configured element: the Secure Enclave
         // for `--secure-element apple`, so it never exists under the passphrase alone.
-        let se = st.config.open_secure_element(&signer_dir, pass)?;
+        let (se, existing) = setup_signer_element(&st.config, &signer_dir, pass, None, data)?;
         let signer_network = match network {
             VaultNetwork::Regtest => Network::Regtest,
             VaultNetwork::Testnet => Network::Testnet,
@@ -1196,7 +1202,7 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
         // Matches only the code this member confirmed in `agree`.
         let confirmed = c.roster_code.clone();
         prompts.roster = Box::new(move |code| roster_decision(confirmed.as_deref(), code));
-        let mut signer = if signer_dir.join("signer.meta").exists() {
+        let mut signer = if existing {
             LocalSigner::open(&signer_dir, se, c.name.clone(), prompts)
         } else {
             LocalSigner::create_with_identity(
@@ -1355,7 +1361,7 @@ mod tests {
         };
         save(&data, "pass", &ceremony).unwrap();
         let st = std::sync::Arc::new(AppState::new(Config {
-            data: data.clone(), port: 3001, network: "regtest".into(),
+            data: data.clone(), port: 3001, network: "regtest".into(), native: false,
             lightwalletd: None, transport: "local".into(), operator_bundle: None,
             operator_key: None, enrollment_issuer: None, development_http: false,
             token: "test".into(), frostd_url: "http://127.0.0.1:2744".into(),
@@ -1381,7 +1387,7 @@ mod tests {
         let data = std::env::temp_dir().join(format!("loki-ceremony-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&data).unwrap();
         let st = std::sync::Arc::new(AppState::new(Config {
-            data: data.clone(),
+            data: data.clone(), native: false,
             port: 3001,
             network: "regtest".into(),
             lightwalletd: None,
@@ -1469,6 +1475,30 @@ mod tests {
         std::fs::remove_dir_all(data).unwrap();
     }
 
+    #[tokio::test]
+    async fn create_names_the_field_it_refuses() {
+        let st = std::sync::Arc::new(AppState::new(Config {
+            data: std::env::temp_dir(), port: 3001, network: "regtest".into(), native: false,
+            lightwalletd: None, transport: "local".into(), operator_bundle: None,
+            operator_key: None, enrollment_issuer: None, development_http: false,
+            token: "test".into(), frostd_url: "http://127.0.0.1:2744".into(),
+            peers: BTreeMap::new(),
+            registration: None, bind: "127.0.0.1".parse().unwrap(), advertise_url: None,
+            secure_element: "software".into(), nonce_witnesses: None, loopback_peers: false,
+        }));
+        for (name, members, threshold, error) in [
+            ("".to_owned(), 3, 2, "name must be 1 to 80 bytes"),
+            ("x".repeat(81), 3, 2, "name must be 1 to 80 bytes"),
+            ("Friends".to_owned(), 3, 3, "use 2 <= t < n <= 16"),
+            ("Friends".to_owned(), 17, 2, "use 2 <= t < n <= 16"),
+        ] {
+            let body = json!({"name":name,"members":members,"threshold":threshold});
+            let (status, Json(reply)) = create(State(st.clone()), Json(body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(reply["error"], error, "{members} {threshold}");
+        }
+    }
+
     #[test]
     fn roster_prompt_matches_only_the_confirmed_code() {
         let code = "1234 5678 9012 3456 7890 1234";
@@ -1482,7 +1512,7 @@ mod tests {
         let data = std::env::temp_dir().join(format!("loki-roster-code-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&data).unwrap();
         let st = std::sync::Arc::new(AppState::new(Config {
-            data: data.clone(), port: 3001, network: "regtest".into(),
+            data: data.clone(), port: 3001, network: "regtest".into(), native: false,
             lightwalletd: None, transport: "local".into(), operator_bundle: None,
             operator_key: None, enrollment_issuer: None, development_http: false,
             token: "test".into(), frostd_url: "http://127.0.0.1:2744".into(),
@@ -1546,7 +1576,7 @@ mod tests {
 
     fn test_config(data: &Path, port: u16) -> Config {
         Config {
-            data: data.to_owned(), port, network: "regtest".into(),
+            data: data.to_owned(), port, network: "regtest".into(), native: false,
             lightwalletd: None, transport: "local".into(), operator_bundle: None,
             operator_key: None, enrollment_issuer: None, development_http: false,
             token: "test".into(), frostd_url: "http://127.0.0.1:2744".into(),
@@ -1842,7 +1872,7 @@ mod tests {
         let sdir = signer_dir(&data, &vault_hex).unwrap();
 
         let make_config = || Config {
-            registration: None,
+            registration: None, native: false,
             data: data.clone(),
             port: 3001,
             bind: "127.0.0.1".parse().unwrap(),
@@ -1975,6 +2005,22 @@ mod tests {
         assert_eq!(std::fs::read(crate::host::recovery::backup_file(&sdir)).unwrap(), blob);
         crate::host::payment::load_vault(&AppState::new(make_config()), &data, pass, &vault_hex).unwrap();
 
+        #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
+        {
+            use crate::signer::secure_element_apple::KeyFailure;
+            let mut config = make_config();
+            config.secure_element = "apple".into();
+            let st = AppState::new(config);
+            for may_create in [true, false] {
+                let _keychain = crate::host::state::apple_test::install(&data, move |_, _, create| {
+                    assert_eq!(create, may_create);
+                    Err(KeyFailure::Cancelled)
+                });
+                assert_eq!(crate::host::custody::migrate(&st, &data, pass, &vault_hex, 1, &legacy).unwrap_err(),
+                    KeyFailure::Cancelled.message());
+                if may_create { std::fs::remove_file(sdir.join("kek.sealed")).unwrap(); }
+            }
+        }
         std::fs::remove_dir_all(&data).unwrap();
     }
 
@@ -2033,6 +2079,26 @@ mod tests {
         // Only its presence marks the vault active for the backup sweep.
         dir(data, &vault_hex).unwrap().write_sealed("vault.sealed", b"{}", pass).unwrap();
         (material, shares, public)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
+    #[test]
+    fn dkg_opens_an_existing_signer_and_only_creates_for_a_fresh_store() {
+        use crate::signer::secure_element_apple::KeyFailure;
+        let data = std::env::temp_dir().join(format!("loki-apple-dkg-{}", Uuid::new_v4()));
+        let dir = data.join("signer");
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = crate::host::config_from_args(&["--data".into(), data.to_str().unwrap().into(),
+            "--port".into(), "3601".into(), "--secure-element".into(), "apple".into()]).unwrap();
+        for fresh in [true, false] {
+            if !fresh { std::fs::write(dir.join("share.sealed"), b"existing seal without metadata").unwrap(); }
+            let _keychain = crate::host::state::apple_test::install(&data, move |_, _, create| {
+                assert_eq!(create, fresh);
+                Err(KeyFailure::Cancelled)
+            });
+            assert_eq!(setup_signer_element(&config, &dir, "unused", None, &config.data).err().as_deref(), Some(KeyFailure::Cancelled.message()));
+        }
+        std::fs::remove_dir_all(&data).unwrap();
     }
 
     /// A vault that became active before the member set up recovery still gets its recovery
@@ -2208,10 +2274,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn native_recovery_publishes_only_a_matching_profile_and_resumes_registration_without_words() {
-        use crate::host::{native_recovery, registration, RegistrationConfig};
+        use crate::host::{native_recovery, registration, state::NATIVE_KEY_SCOPE, RegistrationConfig};
         use crate::signer::{backup, recovery::RecoveryKey};
         use axum::{routing::{get, post}, Json, Router};
-        use std::sync::{Arc, Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}};
+        use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
+        #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
+        use std::sync::atomic::AtomicBool;
 
         let root = std::env::temp_dir().join(format!("loki-native-restore-{}", Uuid::new_v4()));
         let data = root.join("restored");
@@ -2235,9 +2303,8 @@ mod tests {
         wrong_relay["relay_pubkey"] = json!(hex::encode([78; 32]));
         let roster = Arc::new(Mutex::new(vec![wrong_relay.clone()]));
         let roster_reads = Arc::new(AtomicUsize::new(0));
-        let allow_registration = Arc::new(AtomicBool::new(false));
         let enrollment = Arc::new(Mutex::new(Vec::new()));
-        let (r, reads, allow, received) = (roster.clone(), roster_reads.clone(), allow_registration.clone(), enrollment.clone());
+        let (r, reads, received) = (roster.clone(), roster_reads.clone(), enrollment.clone());
         let app = Router::new()
             .route("/api/members", get(move || {
                 reads.fetch_add(1, Ordering::SeqCst);
@@ -2245,22 +2312,30 @@ mod tests {
                 async move { Json(result) }
             }).post(|Json(body): Json<Value>| async move {
                 Json(json!({"member": {"slot": body["slot"], "signing_pubkey": body["signing_pubkey"],
-                    "relay_pubkey": body["relay_pubkey"], "advertise_url": body["advertise_url"]}}))
+                    "relay_pubkey": body["relay_pubkey"], "advertise_url": body["advertise_url"],
+                    "lokisigner_url": body["lokisigner_url"]}}))
             }))
             .route("/api/members/challenge", post(move |Json(body): Json<Value>| {
+                let slot = body["slot"].as_u64();
                 received.lock().unwrap().push(body);
-                let ok = allow.load(Ordering::SeqCst);
                 async move {
-                    if !ok { return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE); }
+                    use axum::http::StatusCode;
+                    if slot != Some(47) {
+                        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "registered identity cannot change slot"}))));
+                    }
                     Ok(Json(json!({"challenge": "ab".repeat(32)})))
                 }
             }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await });
-        let config = || crate::host::config_from_args(&[
-            "--data".into(), data.to_str().unwrap().into(), "--port".into(), "10001".into(), "--development-http".into(),
-        ]).unwrap();
+        let config = || {
+            let mut config = crate::host::native_config_from_args(&[
+                "--data".into(), data.to_str().unwrap().into(), "--port".into(), "10001".into(), "--development-http".into(),
+            ]).unwrap();
+            config.secure_element = "software".into();
+            config
+        };
 
         let mut settings = config();
         let mut wrong_vault = document.clone();
@@ -2293,24 +2368,38 @@ mod tests {
             assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None), Err(refused));
             assert!(!data.exists(), "even a failure during installation must not publish the profile");
             settings.secure_element = "software".into();
+            crate::profile::create(&data, pass, "Mistaken new member").unwrap();
+            assert!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None).is_err());
+            native_recovery::set_aside(&data, false).unwrap();
+            std::fs::create_dir_all(data.join("signer")).unwrap();
+            std::fs::write(data.join("signer/share.sealed"), b"unrecognised data").unwrap();
+            assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None),
+                Err("First-run recovery needs a new LokiSigner profile directory."));
+            assert_eq!(std::fs::read(data.join("signer/share.sealed")).unwrap(), b"unrecognised data");
+            std::fs::remove_dir_all(data.join("signer")).unwrap();
+            std::fs::create_dir_all(data.join("profile")).unwrap();
+            std::fs::write(data.join(NATIVE_KEY_SCOPE), b"interrupted write").unwrap();
             native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None).unwrap();
+            let archives: Vec<_> = std::fs::read_dir(&root).unwrap().map(|e| e.unwrap().path())
+                .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("restored-set-aside-")).collect();
+            assert_eq!(archives.len(), 2);
+            assert!(archives.iter().any(|p| crate::profile::open(p, pass).is_ok()));
+            assert!(archives.iter().any(|p| std::fs::read(p.join(NATIVE_KEY_SCOPE)).ok().as_deref() == Some(b"interrupted write")));
         });
         let old_pub = std::fs::read(data.join("recovery.pub")).unwrap();
         assert_eq!(old_pub, [key.public_bytes(), key.signing_public()].concat());
+        assert!(crate::host::state::read_native_key_scope(&data).unwrap().is_some());
         assert_eq!(settings.registration.as_ref().unwrap().slot, Some(31));
-        let mut state = AppState::new(settings);
-        state.recovery_in_app = true;
-        let state = Arc::new(state);
+        let state = Arc::new(AppState::new(settings));
         let notice: crate::host::LocalNotice = Arc::new(|_, _| panic!("restored profile must never mint new words"));
         let unlock = || Some(Zeroizing::new(pass.into()));
-        assert_eq!(registration::start(&state, unlock(), Some(&notice)).await.unwrap(), "restore-pending");
-        assert_eq!(state.registration_error.read().await.as_deref(), Some("Vault restored. LokiSigner could not reconnect to the coordinator yet; it will retry without your recovery words."));
         assert!(data.join(registration::RESTORE_PENDING).exists());
         assert!(crate::profile::exists(&data));
         assert!(state.registration.read().await.is_none());
 
         let s = state.clone();
         tokio::task::block_in_place(|| {
+            *s.session.blocking_write() = Some(crate::host::state::Session::unlock(data.clone(), Zeroizing::new(pass.into())).unwrap().0);
             let signer = crate::host::custody::open_signer(&s, &data, pass, &vault_hex, 1, Box::new(|_| false)).unwrap();
             assert_eq!(signer.hosted_metadata().unwrap().0.verifying_key(), public.verifying_key());
 
@@ -2340,49 +2429,114 @@ mod tests {
             assert!(dir(&data, &another_hex).unwrap().exists("vault.sealed"));
         });
 
+        // If the coordinator still gives the old slot, keep the restored app usable.
+        assert_eq!(registration::start(&state, unlock(), Some(&notice)).await.unwrap(), "restore-pending");
+        assert_eq!(state.registration_error.read().await.as_deref(), Some("Vault restored. LokiSigner could not reconnect to the coordinator yet; it will retry without your recovery words."));
+        assert!(data.join(registration::RESTORE_PENDING).exists());
+
         // Restart from disk. Its saved coordinator/slot and local passphrase are enough.
         let mut resumed = config();
         resumed.registration = Some(RegistrationConfig::resume(&data, true).unwrap());
         let resumed = Arc::new(AppState::new(resumed));
-        allow_registration.store(true, Ordering::SeqCst);
+        roster.lock().unwrap().iter_mut().filter(|m| m["relay_pubkey"] == relay).for_each(|m| m["slot"] = json!(47));
         assert_eq!(registration::start(&resumed, unlock(), Some(&notice)).await.unwrap(), "restore-ready");
         let registered = resumed.registration.read().await.clone().unwrap();
-        assert_eq!(registered.slot, 31);
+        assert_eq!(registered.slot, 47);
+        assert_eq!(RegistrationConfig::resume(&data, true).unwrap().slot, Some(47));
         assert_eq!(registered.signing_pubkey, signing);
         assert_eq!(registered.relay_pubkey, relay);
         assert!(!data.join(registration::RESTORE_PENDING).exists());
+
+        #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
+        {
+            use crate::signer::secure_element_apple::KeyFailure;
+            let root = root.canonicalize().unwrap();
+            let mut apple = config();
+            apple.data = root.join("apple-restored");
+            apple.secure_element = "apple".into();
+            let tags = Arc::new(Mutex::new(Vec::new()));
+            let accesses = tags.clone();
+            let block_device = Arc::new(AtomicBool::new(true));
+            let blocked = block_device.clone();
+            let _keychain = crate::host::state::apple_test::install(&root, move |path, tag, create| {
+                let device = path.ends_with("device-auth");
+                accesses.lock().unwrap().push((device, create, tag.to_vec()));
+                if device && blocked.load(Ordering::SeqCst) { Err(KeyFailure::Cancelled) } else { Ok(()) }
+            });
+            std::fs::write(&file, document.to_string()).unwrap();
+            tokio::task::block_in_place(|| {
+                assert_eq!(native_recovery::restore_new(&mut apple, pass, secret(&words), &file, &origin, None),
+                    Err(KeyFailure::Cancelled.message()));
+                assert!(!apple.data.exists());
+                block_device.store(false, Ordering::SeqCst);
+                native_recovery::restore_new(&mut apple, pass, secret(&words), &file, &origin, None).unwrap();
+            });
+            assert!(!apple.data.join("device-registration-confirmed").exists());
+            assert!(registration::DeviceKey::open(&apple, pass).is_ok());
+            let restored = apple.data.clone();
+            let moved = restored.with_extension("moved");
+            std::fs::rename(&restored, &moved).unwrap();
+            apple.data = moved.clone();
+            assert!(registration::DeviceKey::open(&apple, pass).is_ok());
+            crate::host::custody::open_signer(&AppState::new(apple), &moved, pass, &vault_hex, 1, Box::new(|_| false)).unwrap();
+            let actual = tags.lock().unwrap();
+            let scope = std::fs::read_to_string(moved.join(NATIVE_KEY_SCOPE)).unwrap();
+            let vault = format!("cash.loki.member.kek.v2:{scope}:vault:{vault_hex}").into_bytes();
+            let device = format!("cash.loki.member.kek.v2:{scope}:device-auth").into_bytes();
+            assert_ne!(actual[0].2, vault, "a failed first restore does not publish its scope");
+            assert_ne!(actual[1].2, device);
+            assert_eq!(actual[2..], [
+                (false, true, vault.clone()), (true, true, device.clone()),
+                (true, false, device.clone()), (true, false, device), (false, false, vault),
+            ]);
+        }
         let sent = enrollment.lock().unwrap();
-        assert!(sent.len() >= 2);
+        assert_eq!(sent.iter().map(|request| request["slot"].as_u64().unwrap()).collect::<Vec<_>>(), [31, 31, 47]);
         for request in sent.iter() {
-            assert_eq!(request.as_object().unwrap().keys().collect::<Vec<_>>(), ["advertise_url", "authorization", "device_pubkey", "relay_pubkey", "signing_pubkey", "slot"]);
-            assert_eq!(request["slot"], 31);
+            assert_eq!(request.as_object().unwrap().keys().collect::<Vec<_>>(), ["advertise_url", "authorization", "device_pubkey", "lokisigner_url", "relay_pubkey", "signing_pubkey", "slot"]);
+            assert_eq!(request["lokisigner_url"], "http://127.0.0.1:10001");
         }
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
     async fn native_http_never_extracts_recovery_words_and_keeps_the_ciphertext_routes() {
+        use std::sync::Arc;
+
+        const ORIGIN: &str = "https://wallet.example";
         let data = std::env::temp_dir().join(format!("loki-native-routes-{}", Uuid::new_v4()));
-        let mut state = AppState::new(crate::host::config_from_args(&[
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        let mut state = AppState::new(crate::host::native_config_from_args(&[
             "--data".into(), data.to_str().unwrap().into(), "--port".into(), "0".into(),
+            "--coordinator-url".into(), ORIGIN.into(), "--local-passphrase-file".into(), "unused".into(),
         ]).unwrap());
-        state.recovery_in_app = true;
-        let token = state.config.token.clone();
+        state.wallet_tabs = Some(super::super::connect::WalletTabs::new(base.clone(), ORIGIN.into(), Arc::new(|_, _, _| true)));
+        let member = super::super::registration::PublicMember {
+            slot: 7, signing_pubkey: "01".repeat(32), relay_pubkey: "02".repeat(32),
+            advertise_url: base.clone(), lokisigner_url: Some(base.clone()),
+        };
+        let body = json!({"slot": member.slot, "signing_pubkey": member.signing_pubkey, "relay_pubkey": member.relay_pubkey});
+        *state.registration.write().await = Some(member);
         *state.session.write().await = Some(Session { data: data.clone(), passphrase: Zeroizing::new("test".into()) });
         let vault = hex::encode([61; 32]);
         let signer_dir = signer_dir(&data, &vault).unwrap();
         std::fs::create_dir_all(&signer_dir).unwrap();
         std::fs::write(crate::host::recovery::backup_file(&signer_dir), [8; 16]).unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, crate::host::routes::router(std::sync::Arc::new(state))).await });
+        let router = crate::host::routes::router(Arc::new(state)).into_make_service_with_connect_info::<std::net::SocketAddr>();
+        tokio::spawn(async move { axum::serve(listener, router).await });
         let client = reqwest::Client::new();
+        let grant = client.post(format!("{base}/api/connect")).header("origin", ORIGIN).json(&body)
+            .send().await.unwrap().error_for_status().unwrap().text().await.unwrap();
+        let frame: Value = serde_json::from_str(grant.lines().last().unwrap()).unwrap();
+        let token = frame["token"].as_str().unwrap();
         for (path, body) in [
             ("recovery-setup", "{}"),
             ("recovery-restore", r#"{"vault":"ignored","words":"UNIQUE-RECOVERY-SECRET"}"#),
             ("recovery-restore", r#"{"words":"UNIQUE-RECOVERY-SECRET"!}"#),
         ] {
-            let response = client.post(format!("{base}/api/{path}")).header("x-loki-token", &token)
+            let response = client.post(format!("{base}/api/{path}")).header("origin", ORIGIN).header("x-loki-token", token)
                 .header("content-type", "application/json").body(body).send().await.unwrap();
             assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
             assert_eq!(response.json::<Value>().await.unwrap(), json!({"error": "Manage recovery words and restore vaults in LokiSigner."}));
@@ -2391,7 +2545,7 @@ mod tests {
             ("recovery-status", json!({"recovery_identity": false, "recovery_backup": true, "recovery_in_app": true})),
             ("recovery-backup", json!({"vault": vault, "backup": "08".repeat(16)})),
         ] {
-            assert_eq!(client.get(format!("{base}/api/{path}?vault={vault}")).header("x-loki-token", &token)
+            assert_eq!(client.get(format!("{base}/api/{path}?vault={vault}")).header("origin", ORIGIN).header("x-loki-token", token)
                 .send().await.unwrap().json::<Value>().await.unwrap(), expected);
         }
         assert!(!data.join("recovery.pub").exists());
@@ -2565,12 +2719,8 @@ pub(super) fn restore_opened_backup(backup: RecoveryBackup, data: &Path, dest: &
         // Regtest vaults are born at height 2 (`setup_birth_height`); Testnet backups carry theirs.
         material.birth_height.unwrap_or(2), network,
     )?;
-    let se = if published_key_dir.is_some() {
-        config.open_element(&sdir, pass, published_key_dir)?
-    } else {
-        config.open_secure_element(&sdir, pass)?
-    };
-    let store = if sdir.join("signer.meta").exists() {
+    let (se, existing) = setup_signer_element(config, &sdir, pass, published_key_dir, data)?;
+    let store = if existing {
         crate::signer::store::SignerStore::open(&sdir)?
     } else {
         crate::signer::store::SignerStore::create(&sdir, material.network, vault_id, material.member_id)?

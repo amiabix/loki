@@ -21,6 +21,9 @@ import {
   opfsPreopenRead as preopenReadOnce,
   opfsCloseAll,
 } from "./pkg/snippets/loki-signer-core-8724841f4db15c9f/js/opfs_fs.js";
+import { blockRange, latestHeight } from "./lightwalletd.js";
+import { controlInbox, endsRequest, idbStore } from "./control-inbox.js";
+import { vaultSummary, saveVaultName, readVaultName } from "./vault-list.js";
 
 // Ops run concurrently (a status read during a join), and two pre-opens of one path racing
 // would each try to take its exclusive sync handle; the second throws. Share one in-flight
@@ -222,6 +225,7 @@ async function driveDkg(signer, p) {
     throw new Error("You reported that the roster codes differ; this vault setup is stopped");
   }
   const vref = JSON.parse(signer.vaultJoin(vaultHex, slot, label ?? "vault", network, roster, code));
+  if (label) await saveVaultName(await (await (await (await navigator.storage.getDirectory()).getDirectoryHandle("loki")).getDirectoryHandle("vaults")).getDirectoryHandle(vaultHex), label);
 
   const fc = await frostdClient(signer, { frostdUrl });
   fc.useSession(sessionId);
@@ -254,6 +258,47 @@ async function openVaultAny(signer, vaultHex) {
   return JSON.parse(signer.vaultOpen(vaultHex));
 }
 
+// The vault's balance and history from the chain itself: lightwalletd compact blocks from the
+// vault's birth (or the last block this Worker scanned) to the tip, trial-decrypted in wasm
+// (loki-signer-core chain_scan.rs). Nothing here comes from other members.
+async function chainScan(signer, p) {
+  if (!p.lightwalletdGrpcWeb) throw new Error("This signer has no lightwalletd gRPC-web endpoint configured, so it cannot read the chain");
+  await openVault(signer, p.vaultHex);
+  const tip = await latestHeight(p.lightwalletdGrpcWeb);
+  // Resumes from the sealed state the last scan saved (scanSave after each batch). A block that
+  // does not extend the saved tip means the chain reorganized: rescan once from the vault birth.
+  // ponytail: full rescan on any reorg; roll back a few blocks if vaults get old.
+  for (let rescanned = false; ;) {
+    try {
+      for (let next = signer.scanNext(); next <= tip; next = signer.scanNext()) {
+        for (const block of await blockRange(p.lightwalletdGrpcWeb, next, Math.min(tip, next + 499))) signer.scanBlock(block);
+        signer.scanSave();
+      }
+      break;
+    } catch (e) {
+      if (rescanned || !/extend|expected block/.test(String(e?.message ?? e))) throw e;
+      rescanned = true;
+      signer.scanReset();
+    }
+  }
+  return { tip, ...JSON.parse(signer.scanResult()) };
+}
+
+// A payment's status for the wallet: its terms and signing group from the proposer's notices,
+// and whether the chain scan saw its one input note spent (and in which transaction).
+async function paymentStatus(signer, p) {
+  const vault = await openVault(signer, p.vaultHex);
+  const control = await frostdClient(signer, p);
+  const { notices } = await findPayment(signer, control, vault, p.attemptHex, p);
+  const terms = notices[notices.length - 1].intent;
+  checkTerms(terms);
+  const ended = notices.find((n) => n.kind === "cancelled" || n.kind === "failed")?.kind ?? null;
+  const signers = notices.find((n) => n.kind === "start" && n.intent.signers?.length)?.intent.signers ?? [];
+  await chainScan(signer, p);
+  const spent = JSON.parse(signer.scanSpentBy(terms.note_selection[0]));
+  return { terms, signers, ended, spent };
+}
+
 // The terms a proposer announced for this payment, read-only: nothing is approved or sent.
 // The wallet shows them before the member opens the approval on the signer page.
 async function paymentTerms(signer, p) {
@@ -277,10 +322,15 @@ async function frostdClient(signer, p) {
 
 // Drain this member's inbox on a payment control session and open each sealed message under
 // the confirmed roster. Anything that does not open (a non-member, another session) is dropped.
+// Returns every message opened on that session so far (control-inbox.js), not just new ones.
+const controlHistory = controlInbox(idbStore());
 async function readControl(signer, control, sessionId) {
-  control.useSession(sessionId);
+  const raw = await controlHistory(sessionId, async () => {
+    control.useSession(sessionId);
+    return JSON.parse(await control.recv());
+  });
   const out = [];
-  for (const m of JSON.parse(await control.recv())) {
+  for (const m of raw) {
     try {
       const { from, body } = JSON.parse(signer.openControl(sessionId, m.from, m.message));
       out.push({ from, ...JSON.parse(body) });
@@ -299,8 +349,8 @@ function aboutPayment(msg, vault, attemptHex, controlSessionId) {
 // Find the payment's control session the way native members do (payment.rs `sync_control`):
 // a session a vault member opened with every member as a participant, where that member sealed
 // a notice about this attempt. A signing session is opened by a one-shot coordinator key, so it
-// never matches. Reading drains this member's inbox there; the proposer re-sends its notice every
-// few seconds until signing starts, and other payments' sessions are read once and skipped.
+// never matches. Notices already drained there are kept (readControl), and other payments'
+// sessions are read once and skipped.
 async function findPayment(signer, control, vault, attemptHex, p) {
   const ids = new Map(vault.members.map((m) => [m.encryption, m.id]));
   const skip = new Set();
@@ -328,8 +378,8 @@ async function findPayment(signer, control, vault, attemptHex, p) {
 }
 
 // Payments other members proposed in this vault that still want this member: one pass over the
-// relay's control sessions, read like findPayment. Reading drains the inbox; the proposer
-// re-sends its notice every few seconds until signing starts, so approving later still finds it.
+// relay's control sessions, read like findPayment. The proposer sends its notice once at publish
+// and again only after it approves, so a request stays listed from the notices readControl kept.
 async function listPending(signer, vaultHex, p) {
   const vault = await openVault(signer, vaultHex);
   const control = await frostdClient(signer, p);
@@ -344,9 +394,8 @@ async function listPending(signer, vaultHex, p) {
     for (const m of await readControl(signer, control, sessionId)) {
       const i = m.intent;
       if (m.from !== owner || !i || !/^[0-9a-f]{64}$/.test(i.attempt ?? "") || !aboutPayment(m, vault, i.attempt, sessionId)) continue;
-      if (m.kind === "cancelled" || m.kind === "failed") { pending.set(i.attempt, null); continue; }
+      if (endsRequest(m, vault.slot)) { pending.set(i.attempt, null); continue; }
       if (pending.get(i.attempt) === null) continue;
-      if (m.kind === "start" && i.signers?.length && !i.signers.includes(vault.slot)) { pending.set(i.attempt, null); continue; }
       pending.set(i.attempt, { attempt: i.attempt, amount_zat: String(i.amount_zat), recipient: i.recipient, proposer: i.proposer });
     }
   }
@@ -364,7 +413,7 @@ async function listVaults(signer) {
     if (h.kind !== "directory" || !/^[0-9a-f]{64}$/.test(name)) continue;
     let v;
     try { v = await openVaultAny(signer, name); } catch { continue; } // setup never started
-    out.push({ vault: v.vault_id, name: `Vault ${name.slice(0, 8)}`, members: v.members.length, threshold: v.threshold, active: v.ready });
+    out.push(vaultSummary(v, await readVaultName(h)));
   }
   return out;
 }
@@ -550,7 +599,7 @@ self.onmessage = async (e) => {
   // or removal holds it, so the quick reads are refused while one runs (the wallet polls
   // again) and otherwise take turns, so no op swaps the vault under another mid-flight.
   const holds = op === "join" || op === "payment-approve" || op === "restore" || op === "remove";
-  const reads = op === "payment-review" || op === "pending" || op === "vaults" || op === "address" || op === "recovery-backup";
+  const reads = op === "payment-review" || op === "pending" || op === "vaults" || op === "address" || op === "recovery-backup" || op === "chain" || op === "payment-status";
   let release = () => {};
   try {
     if (reads && busy) throw new Error(`the signer is busy with a ${{ join: "vault setup", "payment-approve": "payment", restore: "restore", remove: "removal" }[busy]}; try again when it finishes`);
@@ -586,6 +635,12 @@ self.onmessage = async (e) => {
         break;
       case "vaults":
         result = await listVaults(signer);
+        break;
+      case "chain":
+        result = await chainScan(signer, payment);
+        break;
+      case "payment-status":
+        result = await paymentStatus(signer, payment);
         break;
       case "address":
         await openVault(signer, payment.vaultHex);

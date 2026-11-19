@@ -45,14 +45,15 @@ The Node verifier uses the same Ed25519 enrollment / P-256 SHA-256 verification 
 This proves key possession, **not hardware attestation**. The software development backend
 and an Enclave key produce the same wire proofs.
 
-Open `http://localhost:3001`. Paste the member's printed **local pairing link into the pairing
-field**, never into the address bar or a message to an operator. Each tab stores its own
-device capability in session storage and calls that manually selected loopback endpoint
-with `X-Loki-Token`; no capability is sent to Next. The device allows only the exact configured
-browser origin, and pairing checks the device's public identity against the roster. A roster
-update cannot silently retarget an existing paired tab. Create/join, review/approve, and
-co-signing use the existing typed device API. Logout locks the device; restart that member
-locally with its unlock file and pair with its new link. A web restart does not restart members.
+Open `http://localhost:3001`. For the headless member or an older app, paste its **local
+pairing link into the pairing field**, never into the address bar or a message to an operator.
+For an updated LokiSigner, select its slot and choose **Connect LokiSigner**; compare the
+code and allow in the app instead of pasting a link. The tab stores the capability in
+`sessionStorage` (duplicating a tab can copy it) and calls that loopback endpoint with
+`X-Loki-Token`; no capability is sent to Next. The member restricts browser access to the
+configured origin, and the wallet checks the member's public identity against the roster.
+A roster update cannot silently retarget a connected tab. Logout locks the device and, on
+updated LokiSigner, revokes all wallet-tab grants. A web restart does not restart members.
 
 A LokiSigner member compares the roster code in LokiSigner, not on this page: **Compare in
 LokiSigner** opens LokiSigner's dialog, and only its **Codes match** records the agreement
@@ -117,19 +118,25 @@ coordinator + frostd. Payment review/approve are wired through `request()` the s
 ## Registry and limits
 
 `.access.json` (or `LOKI_REGISTRY`) contains only `{access: [{slot, signing_pubkey, relay_pubkey,
-advertise_url}]}`. Old hosted registry formats fail closed; retire those files privately and
-self-register existing devices into a fresh public roster. Never copy old access records into
+advertise_url, lokisigner_url?}]}`. The optional signed `lokisigner_url` field tells everyone
+reading `/api/members` that the slot uses LokiSigner and which loopback port it currently
+listens on. It is not a capability. Deploy this coordinator and wallet before updating
+LokiSigner; see the [version matrix](../../poc/signer-app/README.md#build-and-pair). Do not roll
+back the coordinator until roster rows containing the field are removed: an older `/api/members`
+rejects those rows and fails for everyone. A visited website can use the port and the open
+ceremony routes to learn whether LokiSigner is running, subject to local network permission.
+Safari may block the wallet's loopback request; this has not been verified. Old hosted registry formats
+fail closed; retire those files privately and self-register existing devices into a fresh
+public roster. Never copy old access records into
 it. The adjacent `.challenges` file contains only short-lived public enrollment proofs and
 nonces; consumption persists across Next workers and restarts. At most 256 live challenges
 are accepted, each expires after two minutes. If a worker crashes while holding `.lock`, stop
 all web workers before removing that lock. The roster is discovery, not authority to spend.
 
-This is a **development-only pairing seam**: the coordinator-served JavaScript is trusted
-with that tab's device session. A malicious web bundle can steal that session; device-side
-consent remains required for signing. Co-location under one OS account is not independent
-custody against that OS operator. Real cross-device QR pairing and the native signed app
-client are S4b. No QR or production device trust UX is implemented here. The existing Enclave
-binary is reused; no Swift changes are required.
+LokiSigner sends a tab its device session only after the member allows that tab's code in
+the native app. The coordinator-served JavaScript can still read a grant held by its own tab;
+device-side consent remains required for signing. Co-location under one OS account is not
+independent custody against that OS operator.
 
 ## Checks
 
@@ -215,6 +222,7 @@ What a deploy must provide on the signer server (`serve.mjs` env):
 | `LOKI_NONCE_WITNESSES` | the two nonce-witness relays every signature is claimed at (the native `--nonce-witnesses` file). Each mailbox `read` capability is served publicly in `config.json`. |
 | `LOKI_NETWORK` | `testnet` (default) or `regtest`; mainnet is refused at startup. A regtest stack **must** set `regtest`, or LokiSigner is told testnet. |
 | `LOKI_LIGHTWALLETD_URL` | the lightwalletd native members sync from |
+| `LOKI_LIGHTWALLETD_GRPCWEB_URL` | lightwalletd behind gRPC-web + CORS for the signer origin (`communication/deploy/lightwalletd-grpcweb.sh`); the browser signer scans the chain through it for its vault balance and history |
 | `LOKI_SIGNER_PORT` | listen port (default 3002) |
 
 The coordinator (this app) serves the same values to the native signer at

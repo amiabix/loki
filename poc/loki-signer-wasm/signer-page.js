@@ -8,6 +8,8 @@
 // can reveal the iframe while a prompt needs the member. Messages from any origin other than
 // the configured wallet origin, or from any window other than the embedding parent, are dropped.
 
+import { requirePersistentStorage, requireShare } from "./storage-guard.js";
+
 const cfg = await fetch("./config.json", { cache: "no-store" }).then((r) => r.json());
 const wallet = cfg.walletOrigin;
 const rpId = cfg.rpId || location.hostname;
@@ -160,11 +162,11 @@ function passField(label, autocomplete) {
 let current = null; // { profile, se }
 let persisted = null;
 
-// Ask the browser not to evict this origin's storage (the sealed share lives in OPFS). A denial
-// is surfaced to the member and in status, never ignored.
-async function persist() {
-  persisted = navigator.storage?.persist ? await navigator.storage.persist().catch(() => false) : false;
-  return persisted;
+// A share is sealed only while the browser keeps this origin's storage persistent
+// (storage-guard.js); each unlock re-reads it so a lost grant shows in status.
+async function persistent() {
+  await requirePersistentStorage(navigator.storage);
+  persisted = true;
 }
 
 // Ask for a new custody secret (a passphrase typed twice, or a new passkey) and pass it to
@@ -191,13 +193,14 @@ function newCustody(name, method, submit) {
 
 async function create({ name, method }) {
   name = String(name || "You");
+  await persistent();
   const result = await newCustody(name, method, (secret) => call({ op: "create", method, name, ...secret }));
   current = { profile: result, se: method === "passphrase" ? "software" : "passkey" };
-  await persist();
   return { profile: result, persisted };
 }
 
 async function unlock({ method }) {
+  await requireShare(() => call({ op: "has" }));
   let result;
   if (method === "passphrase") {
     const a = passField("Passphrase", "current-password");
@@ -208,7 +211,7 @@ async function unlock({ method }) {
       [cancelButton, { label: "Use passkey", run: async () => call({ op: "unlock", method, prfSecret: await prfSecret() }) }]);
   }
   current = { profile: result, se: method === "passphrase" ? "software" : "passkey" };
-  await persist();
+  persisted = await navigator.storage?.persisted?.().catch(() => false) ?? false;
   return { profile: result, persisted };
 }
 
@@ -263,6 +266,7 @@ async function recoveryExport({ vault }) {
 // The backup is opaque ciphertext, so the wallet may hand it over (`backup`, hex, with its
 // `vault`), e.g. one the member kept with the coordinator; otherwise the member picks the file.
 async function restore({ vault, name, method, backup }) {
+  await persistent();
   const words = el("textarea", { autocomplete: "off", spellcheck: false, rows: 4 });
   const file = el("input", { type: "file" });
   const given = typeof backup === "string" && /^([0-9a-f]{2})+$/.test(backup) && /^[0-9a-f]{64}$/.test(vault ?? "");
@@ -281,7 +285,6 @@ async function restore({ vault, name, method, backup }) {
   name = String(name || "You");
   const result = await newCustody(name, method, (secret) => call({ op: "restore", method, name, ...input, ...secret }));
   current = { profile: result.profile, se: method === "passphrase" ? "software" : "passkey" };
-  await persist();
   return { ...result, persisted };
 }
 
@@ -413,13 +416,15 @@ const ops = {
   pending: (p) => call({ op: "pending", payment: relay(p) }),
   vaults: () => call({ op: "vaults" }),
   address: (p) => call({ op: "address", payment: p }),
+  chain: (p) => call({ op: "chain", payment: { ...p, lightwalletdGrpcWeb: cfg.lightwalletdGrpcWebUrl } }),
+  "payment-status": (p) => call({ op: "payment-status", payment: { ...relay(p), lightwalletdGrpcWeb: cfg.lightwalletdGrpcWebUrl } }),
   "recovery-setup": recoverySetup,
   "recovery-status": async () => ({ recovery_identity: await call({ op: "has-recovery" }) }),
   "recovery-export": recoveryExport,
   restore,
   remove,
 };
-const UNLOCKED = new Set(["join", "payment-review", "payment-approve", "pending", "vaults", "address", "recovery-setup", "recovery-export", "recovery-status"]);
+const UNLOCKED = new Set(["join", "payment-review", "payment-approve", "pending", "vaults", "address", "chain", "payment-status", "recovery-setup", "recovery-export", "recovery-status"]);
 // Ops that may show a prompt run one at a time; the read-only ones answer alongside them
 // (the Worker refuses them with "busy" while a join or payment holds the vault).
 const PROMPTING = new Set(["create", "unlock", "join", "payment-approve", "recovery-setup", "recovery-export", "restore", "remove"]);

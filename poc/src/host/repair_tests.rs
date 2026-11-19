@@ -399,7 +399,7 @@ async fn repair_handlers_require_unlock_consent_and_local_relay_and_original_vau
     use super::super::state::{AppState, Config, Session};
     let data = std::env::temp_dir().join(format!("loki-repair-http-{}", Uuid::new_v4()));
     let st = Arc::new(AppState::new(Config {
-        registration: None,
+        registration: None, native: false,
         bind: "127.0.0.1".parse().unwrap(), advertise_url: None,
         data: data.clone(),
         port: 3001,

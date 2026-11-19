@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
 use super::{
-    ceremony, device, payment, recovery,
+    ceremony, connect, device, payment, recovery,
     state::{Session, Shared},
 };
 
@@ -40,12 +40,17 @@ where
 pub fn router(state: Shared) -> Router {
     // Headless automation keeps both secret-bearing routes. With LokiSigner, neither route
     // even extracts a body: malformed JSON (including its contents) cannot reach an error.
-    let (recovery_setup, recovery_restore) = if state.recovery_in_app {
+    let (recovery_setup, recovery_restore) = if state.config.native {
         (post(recovery::in_app_only), post(recovery::in_app_only))
     } else {
         (post(recovery::setup), post(recovery::restore))
     };
-    Router::new()
+    let router = if state.wallet_tabs.is_some() {
+        Router::new().route("/api/connect", post(connect::request))
+    } else {
+        Router::new()
+    };
+    router
         .route("/api/profile-create", post(profile_create))
         .route("/api/unlock", post(unlock))
         .route("/api/lock", post(lock))
@@ -89,6 +94,10 @@ pub fn router(state: Shared) -> Router {
 async fn browser_origin(State(st): State<Shared>, req: Request, next: Next) -> Response {
     let origin = req.headers().get("origin").cloned();
     let route = req.extensions().get::<axum::extract::MatchedPath>().cloned();
+    if req.uri().path() == "/api/connect" {
+        let Some(tabs) = &st.wallet_tabs else { return StatusCode::NOT_FOUND.into_response(); };
+        if !tabs.permits_request(&req) { return StatusCode::FORBIDDEN.into_response(); }
+    }
     // The ceremony endpoints are token-authenticated, member-to-member calls (also exempt from
     // the process token in `auth`): a native peer reaches them with no `Origin` and so skips the
     // pairing check, and a browser joiner from another origin reaches ONLY these four, still gated
@@ -142,19 +151,24 @@ async fn registration(State(st): State<Shared>) -> Reply {
     }
 }
 
-/// Every `/api/*` request must carry the process token (the web proxy injects it).
+/// Require a device capability outside enrollment, ceremony peer calls, and the native
+/// connect handshake (which is origin- and loopback-checked before reaching this middleware).
 async fn auth(State(st): State<Shared>, req: Request, next: Next) -> Result<Response, Response> {
     if matches!(
         req.uri().path(),
         "/api/enroll" | "/api/agreed" | "/api/roster" | "/api/session"
-    ) {
+    ) || (req.uri().path() == "/api/connect" && st.wallet_tabs.is_some()) {
         return Ok(next.run(req).await);
     }
     let presented = req
         .headers()
         .get("x-loki-token")
         .and_then(|v| v.to_str().ok());
-    if presented == Some(st.config.token.as_str()) {
+    let authorized = presented.is_some_and(|token| match &st.wallet_tabs {
+        Some(tabs) => tabs.authorizes(&req, token),
+        None => !st.config.token.is_empty() && token == st.config.token,
+    });
+    if authorized {
         Ok(next.run(req).await)
     } else {
         Err(err(StatusCode::UNAUTHORIZED, "invalid process token").into_response())
@@ -217,7 +231,10 @@ async fn unlock(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
 }
 
 async fn lock(State(st): State<Shared>) -> Reply {
-    *st.session.write().await = None;
+    let mut session = st.session.write().await;
+    *session = None;
+    if let Some(tabs) = &st.wallet_tabs { tabs.revoke_all(); }
+    drop(session);
     crate::seal_kdf::clear_session_cache();
     ok(json!({ "locked": true }))
 }

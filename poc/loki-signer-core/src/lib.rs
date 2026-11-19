@@ -15,6 +15,7 @@
 pub use reddsa_frost::frost::redpallas as frost;
 
 pub mod builder;
+pub mod chain_scan;
 pub mod candidate;
 pub mod distributed_setup;
 pub mod dkg_core;

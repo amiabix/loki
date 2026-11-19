@@ -12,6 +12,8 @@
 // never falls back to it.
 // ─────────────────────────────────────────────────────────────────────────────
 
+import type { Payment, PaymentSession } from "./types";
+
 export class ApiError extends Error {
   status: number;
   constructor(message: string, status: number) { super(message); this.status = status; }
@@ -50,6 +52,48 @@ export interface SignerModule {
   enroll(coordinatorOrigin?: string): Promise<EnrolledMember>;
   /** In-process member call — the old per-member HTTP, now dispatched to the signer. */
   request<T = unknown>(path: string, body?: unknown): Promise<T>;
+}
+
+/** One vault's setup phase for `status?vault=` (the wallet's setup screen). The browser signer's
+ *  `join` resolves only once its vault is active, so any vault it does not report active is
+ *  still creating keys. */
+export function browserVaultStatus(vaults: { vault: string; active: boolean }[] | undefined, vault: string): { phase: "active" | "creating_keys" } {
+  return { phase: vaults?.some((v) => v.vault === vault && v.active) ? "active" : "creating_keys" };
+}
+
+/** One transaction from the browser signer's own chain scan (loki-signer-core chain_scan.rs). */
+export type ChainTx = { txid: string; height: number; received_zat: number; change_zat: number; spent_zat: number };
+
+/** The History list from the chain scan: what each transaction did to the vault. A spend shows
+ *  its net outflow (amount sent plus fee); every entry is mined, by construction. */
+export function chainPayments(history: ChainTx[]): Payment[] {
+  return history.map((t) => {
+    const sent = t.spent_zat > 0;
+    const amount = sent ? t.spent_zat - t.change_zat - t.received_zat : t.received_zat + t.change_zat;
+    return { attempt: t.txid, phase: "confirmed", recipient: "", amount_zat: String(amount), txid: t.txid,
+      direction: sent ? "sent" : "received", amount_is_net: sent, mined_height: t.height };
+  });
+}
+
+/** A payment's status on the browser signer. The terms and signing group come from the
+ *  proposer's notices; "confirmed" only from the chain: the scan saw its input note spent. */
+export function chainPaymentSession(r: {
+  terms: { proposer: number; recipient: string; amount_zat: number; fee_zat: number };
+  signers: number[];
+  ended?: "cancelled" | "failed" | null;
+  spent: { txid: string; height: number } | null;
+}): PaymentSession {
+  return {
+    phase: r.spent ? "confirmed" : r.ended ?? "signing",
+    signatures_received: !!r.spent,
+    txid: r.spent?.txid ?? null,
+    // The proposer forms the signing group from the first approvals, so its members approved.
+    approvals: r.signers,
+    // Not known on the browser signer before the chain shows the payment (its approval is sent,
+    // not kept); false keeps the Approve button for a request this member has not signed.
+    approval_requested: !!r.spent,
+    intent: { proposer: r.terms.proposer, signers: r.signers, recipient: r.terms.recipient, amount_zat: r.terms.amount_zat, fee_zat: r.terms.fee_zat, open_approval: true },
+  };
 }
 
 // ─── the signer origin (iframe + postMessage) ────────────────────────────────
@@ -113,7 +157,7 @@ function browserSigner(origin: string): SignerModule {
   const opened = (s: SignerSession) => { try { localStorage.setItem(SEALED, "1"); } catch {} return s; };
 
   return {
-    hasSigner: () => call<boolean>("has"),
+    hasSigner: async () => checkShare(await call<boolean>("has")),
     createSigner: async ({ name, method }) => opened(await call<SignerSession>("create", { name, method })),
     unlock: async ({ method }) => opened(await call<SignerSession>("unlock", { method })),
     async lock() { await call("lock"); },
@@ -137,7 +181,8 @@ function browserSigner(origin: string): SignerModule {
         const s = await call<{ profile: { id: string; name: string }; se: string; persisted: boolean | null; relay: string }>("status");
         // The signer's own vaults (OPFS). Refused while a join/payment holds the signer; the
         // next status poll fills them in.
-        const vaults = await call<unknown[]>("vaults").catch(() => undefined);
+        const vaults = await call<{ vault: string; active: boolean }[]>("vaults").catch(() => undefined);
+        if (args.vault) return browserVaultStatus(vaults, args.vault) as T;
         return { phase: "home", network: "testnet", secure_element: s.se, profile: s.profile, persisted: s.persisted, relay: s.relay, vaults } as T;
       }
       if (path === "lock") { await this.lock(); return {} as T; }
@@ -151,6 +196,10 @@ function browserSigner(origin: string): SignerModule {
       if (path === "pending") return { pending: await call("pending", payment) } as T;
       if (path === "payment-review" || path === "payment-approve") return call<T>(path, payment);
       if (path === "address") return { address: await call<string>("address", payment) } as T;
+      // Balance, History and a payment's status from the signer's own scan of the chain.
+      if (path === "balance") return { balance_zat: Number((await call<{ balance_zat: string }>("chain", payment)).balance_zat) } as T;
+      if (path === "payments") return { payments: chainPayments((await call<{ history: ChainTx[] }>("chain", payment)).history) } as T;
+      if (path === "payment-status") return chainPaymentSession(await call("payment-status", payment)) as T;
       // Recovery words are shown, typed and checked on the signer page; only the opaque
       // backup ciphertext ({backup} from recovery-export) and public results come back.
       if (path === "recovery-setup" || path === "recovery-export" || path === "recovery-status") return call<T>(path, body);
@@ -167,6 +216,15 @@ const SESSION = "loki_signer_session"; // sessionStorage: the unlocked session
 
 /** Synchronous best-guess "a share is sealed here" for the first paint; hasSigner() confirms. */
 export function hasSignerHint(): boolean { try { return localStorage.getItem(SEALED) !== null; } catch { return false; } }
+
+/** The signer's answer to "is a share sealed here?". This (wallet) origin remembers that one was:
+ *  if the signer origin's storage was since cleared (evicted), say so rather than offer Create. */
+export function checkShare(has: boolean): boolean {
+  if (!has && hasSignerHint()) {
+    throw new ApiError("Your signer's share is missing from this browser: its storage was cleared. Restore it from your 24 recovery words and a vault's recovery backup file.", 404);
+  }
+  return has;
+}
 
 function session(): (SignerSession & { se: string }) | null {
   if (typeof window === "undefined") return null;

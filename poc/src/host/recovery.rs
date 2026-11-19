@@ -239,7 +239,7 @@ pub(super) async fn status(
         None => false,
     };
     let mut reply = json!({ "recovery_identity": has_identity, "recovery_backup": has_backup });
-    if st.recovery_in_app { reply["recovery_in_app"] = json!(true); }
+    if st.config.native { reply["recovery_in_app"] = json!(true); }
     ok(reply)
 }
 
