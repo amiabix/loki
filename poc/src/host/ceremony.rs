@@ -1355,7 +1355,7 @@ mod tests {
         };
         save(&data, "pass", &ceremony).unwrap();
         let st = std::sync::Arc::new(AppState::new(Config {
-            data: data.clone(), port: 3001, network: "regtest".into(),
+            data: data.clone(), port: 3001, network: "regtest".into(), native: false,
             lightwalletd: None, transport: "local".into(), operator_bundle: None,
             operator_key: None, enrollment_issuer: None, development_http: false,
             token: "test".into(), frostd_url: "http://127.0.0.1:2744".into(),
@@ -1381,7 +1381,7 @@ mod tests {
         let data = std::env::temp_dir().join(format!("loki-ceremony-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&data).unwrap();
         let st = std::sync::Arc::new(AppState::new(Config {
-            data: data.clone(),
+            data: data.clone(), native: false,
             port: 3001,
             network: "regtest".into(),
             lightwalletd: None,
@@ -1482,7 +1482,7 @@ mod tests {
         let data = std::env::temp_dir().join(format!("loki-roster-code-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&data).unwrap();
         let st = std::sync::Arc::new(AppState::new(Config {
-            data: data.clone(), port: 3001, network: "regtest".into(),
+            data: data.clone(), port: 3001, network: "regtest".into(), native: false,
             lightwalletd: None, transport: "local".into(), operator_bundle: None,
             operator_key: None, enrollment_issuer: None, development_http: false,
             token: "test".into(), frostd_url: "http://127.0.0.1:2744".into(),
@@ -1546,7 +1546,7 @@ mod tests {
 
     fn test_config(data: &Path, port: u16) -> Config {
         Config {
-            data: data.to_owned(), port, network: "regtest".into(),
+            data: data.to_owned(), port, network: "regtest".into(), native: false,
             lightwalletd: None, transport: "local".into(), operator_bundle: None,
             operator_key: None, enrollment_issuer: None, development_http: false,
             token: "test".into(), frostd_url: "http://127.0.0.1:2744".into(),
@@ -1842,7 +1842,7 @@ mod tests {
         let sdir = signer_dir(&data, &vault_hex).unwrap();
 
         let make_config = || Config {
-            registration: None,
+            registration: None, native: false,
             data: data.clone(),
             port: 3001,
             bind: "127.0.0.1".parse().unwrap(),
@@ -2208,10 +2208,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn native_recovery_publishes_only_a_matching_profile_and_resumes_registration_without_words() {
-        use crate::host::{native_recovery, registration, RegistrationConfig};
+        use crate::host::{native_recovery, registration, state::NATIVE_KEY_SCOPE, RegistrationConfig};
         use crate::signer::{backup, recovery::RecoveryKey};
         use axum::{routing::{get, post}, Json, Router};
-        use std::sync::{Arc, Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}};
+        use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
 
         let root = std::env::temp_dir().join(format!("loki-native-restore-{}", Uuid::new_v4()));
         let data = root.join("restored");
@@ -2235,9 +2235,8 @@ mod tests {
         wrong_relay["relay_pubkey"] = json!(hex::encode([78; 32]));
         let roster = Arc::new(Mutex::new(vec![wrong_relay.clone()]));
         let roster_reads = Arc::new(AtomicUsize::new(0));
-        let allow_registration = Arc::new(AtomicBool::new(false));
         let enrollment = Arc::new(Mutex::new(Vec::new()));
-        let (r, reads, allow, received) = (roster.clone(), roster_reads.clone(), allow_registration.clone(), enrollment.clone());
+        let (r, reads, received) = (roster.clone(), roster_reads.clone(), enrollment.clone());
         let app = Router::new()
             .route("/api/members", get(move || {
                 reads.fetch_add(1, Ordering::SeqCst);
@@ -2248,19 +2247,26 @@ mod tests {
                     "relay_pubkey": body["relay_pubkey"], "advertise_url": body["advertise_url"]}}))
             }))
             .route("/api/members/challenge", post(move |Json(body): Json<Value>| {
+                let slot = body["slot"].as_u64();
                 received.lock().unwrap().push(body);
-                let ok = allow.load(Ordering::SeqCst);
                 async move {
-                    if !ok { return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE); }
+                    use axum::http::StatusCode;
+                    if slot != Some(47) {
+                        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "registered identity cannot change slot"}))));
+                    }
                     Ok(Json(json!({"challenge": "ab".repeat(32)})))
                 }
             }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await });
-        let config = || crate::host::config_from_args(&[
-            "--data".into(), data.to_str().unwrap().into(), "--port".into(), "10001".into(), "--development-http".into(),
-        ]).unwrap();
+        let config = || {
+            let mut config = crate::host::native_config_from_args(&[
+                "--data".into(), data.to_str().unwrap().into(), "--port".into(), "10001".into(), "--development-http".into(),
+            ]).unwrap();
+            config.secure_element = "software".into();
+            config
+        };
 
         let mut settings = config();
         let mut wrong_vault = document.clone();
@@ -2293,24 +2299,38 @@ mod tests {
             assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None), Err(refused));
             assert!(!data.exists(), "even a failure during installation must not publish the profile");
             settings.secure_element = "software".into();
+            crate::profile::create(&data, pass, "Mistaken new member").unwrap();
+            assert!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None).is_err());
+            native_recovery::set_aside(&data).unwrap();
+            std::fs::create_dir_all(data.join("signer")).unwrap();
+            std::fs::write(data.join("signer/share.sealed"), b"unrecognised data").unwrap();
+            assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None),
+                Err("First-run recovery needs a new LokiSigner profile directory."));
+            assert_eq!(std::fs::read(data.join("signer/share.sealed")).unwrap(), b"unrecognised data");
+            std::fs::remove_dir_all(data.join("signer")).unwrap();
+            std::fs::create_dir_all(data.join("profile")).unwrap();
+            std::fs::write(data.join(NATIVE_KEY_SCOPE), b"interrupted write").unwrap();
             native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None).unwrap();
+            let archives: Vec<_> = std::fs::read_dir(&root).unwrap().map(|e| e.unwrap().path())
+                .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("restored-set-aside-")).collect();
+            assert_eq!(archives.len(), 2);
+            assert!(archives.iter().any(|p| crate::profile::open(p, pass).is_ok()));
+            assert!(archives.iter().any(|p| std::fs::read(p.join(NATIVE_KEY_SCOPE)).ok().as_deref() == Some(b"interrupted write")));
         });
         let old_pub = std::fs::read(data.join("recovery.pub")).unwrap();
         assert_eq!(old_pub, [key.public_bytes(), key.signing_public()].concat());
+        assert!(crate::host::state::read_native_key_scope(&data).unwrap().is_some());
         assert_eq!(settings.registration.as_ref().unwrap().slot, Some(31));
-        let mut state = AppState::new(settings);
-        state.recovery_in_app = true;
-        let state = Arc::new(state);
+        let state = Arc::new(AppState::new(settings));
         let notice: crate::host::LocalNotice = Arc::new(|_, _| panic!("restored profile must never mint new words"));
         let unlock = || Some(Zeroizing::new(pass.into()));
-        assert_eq!(registration::start(&state, unlock(), Some(&notice)).await.unwrap(), "restore-pending");
-        assert_eq!(state.registration_error.read().await.as_deref(), Some("Vault restored. LokiSigner could not reconnect to the coordinator yet; it will retry without your recovery words."));
         assert!(data.join(registration::RESTORE_PENDING).exists());
         assert!(crate::profile::exists(&data));
         assert!(state.registration.read().await.is_none());
 
         let s = state.clone();
         tokio::task::block_in_place(|| {
+            *s.session.blocking_write() = Some(crate::host::state::Session::unlock(data.clone(), Zeroizing::new(pass.into())).unwrap().0);
             let signer = crate::host::custody::open_signer(&s, &data, pass, &vault_hex, 1, Box::new(|_| false)).unwrap();
             assert_eq!(signer.hosted_metadata().unwrap().0.verifying_key(), public.verifying_key());
 
@@ -2340,22 +2360,27 @@ mod tests {
             assert!(dir(&data, &another_hex).unwrap().exists("vault.sealed"));
         });
 
+        // If the coordinator still gives the old slot, keep the restored app usable.
+        assert_eq!(registration::start(&state, unlock(), Some(&notice)).await.unwrap(), "restore-pending");
+        assert_eq!(state.registration_error.read().await.as_deref(), Some("Vault restored. LokiSigner could not reconnect to the coordinator yet; it will retry without your recovery words."));
+        assert!(data.join(registration::RESTORE_PENDING).exists());
+
         // Restart from disk. Its saved coordinator/slot and local passphrase are enough.
         let mut resumed = config();
         resumed.registration = Some(RegistrationConfig::resume(&data, true).unwrap());
         let resumed = Arc::new(AppState::new(resumed));
-        allow_registration.store(true, Ordering::SeqCst);
+        roster.lock().unwrap().iter_mut().filter(|m| m["relay_pubkey"] == relay).for_each(|m| m["slot"] = json!(47));
         assert_eq!(registration::start(&resumed, unlock(), Some(&notice)).await.unwrap(), "restore-ready");
         let registered = resumed.registration.read().await.clone().unwrap();
-        assert_eq!(registered.slot, 31);
+        assert_eq!(registered.slot, 47);
+        assert_eq!(RegistrationConfig::resume(&data, true).unwrap().slot, Some(47));
         assert_eq!(registered.signing_pubkey, signing);
         assert_eq!(registered.relay_pubkey, relay);
         assert!(!data.join(registration::RESTORE_PENDING).exists());
         let sent = enrollment.lock().unwrap();
-        assert!(sent.len() >= 2);
+        assert_eq!(sent.iter().map(|request| request["slot"].as_u64().unwrap()).collect::<Vec<_>>(), [31, 31, 47]);
         for request in sent.iter() {
             assert_eq!(request.as_object().unwrap().keys().collect::<Vec<_>>(), ["advertise_url", "authorization", "device_pubkey", "relay_pubkey", "signing_pubkey", "slot"]);
-            assert_eq!(request["slot"], 31);
         }
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -2363,10 +2388,9 @@ mod tests {
     #[tokio::test]
     async fn native_http_never_extracts_recovery_words_and_keeps_the_ciphertext_routes() {
         let data = std::env::temp_dir().join(format!("loki-native-routes-{}", Uuid::new_v4()));
-        let mut state = AppState::new(crate::host::config_from_args(&[
+        let state = AppState::new(crate::host::native_config_from_args(&[
             "--data".into(), data.to_str().unwrap().into(), "--port".into(), "0".into(),
         ]).unwrap());
-        state.recovery_in_app = true;
         let token = state.config.token.clone();
         *state.session.write().await = Some(Session { data: data.clone(), passphrase: Zeroizing::new("test".into()) });
         let vault = hex::encode([61; 32]);

@@ -2463,7 +2463,7 @@ mod tests {
         // These members stand in for a member who approves every payment natively.
         let approval: crate::host::LocalApproval = std::sync::Arc::new(|_| true);
         std::sync::Arc::new(AppState { approval: Some(approval), ..AppState::new(Config {
-            registration: None,
+            registration: None, native: false,
             data: data.to_owned(),
             port: 0,
             bind: "127.0.0.1".parse().unwrap(),
