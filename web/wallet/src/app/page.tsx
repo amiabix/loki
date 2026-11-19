@@ -900,8 +900,8 @@ function CreateVault({
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  // threshold can't exceed members
-  const t = Math.min(threshold, members);
+  // the host requires 2 <= threshold < members <= 16
+  const t = Math.min(threshold, members - 1);
   const submit = async () => {
     setBusy(true); setErr(null);
     try {
@@ -945,7 +945,7 @@ function CreateVault({
               onChange={(e) => setMembers(Number(e.target.value))}
               className="glass mt-1 w-full rounded-full px-6 py-2.5 text-left text-sm text-foreground outline-none bg-transparent"
             >
-              {range(2, 16).map((n) => (
+              {range(3, 16).map((n) => (
                 <option key={n} value={n} className="bg-white text-foreground">{n}</option>
               ))}
             </select>
@@ -957,7 +957,7 @@ function CreateVault({
               onChange={(e) => setThreshold(Number(e.target.value))}
               className="glass mt-1 w-full rounded-full px-6 py-2.5 text-left text-sm text-foreground outline-none bg-transparent"
             >
-              {range(2, members).map((n) => (
+              {range(2, members - 1).map((n) => (
                 <option key={n} value={n} className="bg-white text-foreground">{n}</option>
               ))}
             </select>
