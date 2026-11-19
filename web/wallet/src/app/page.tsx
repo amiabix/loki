@@ -33,7 +33,7 @@ import {
   type PendingApproval,
   type RecoveryStatus,
 } from "@/lib/api";
-import { comparesInLokiSigner, invitePreview, nativeRosterRefusal, pairingSecondsLeft, paymentLabel, rememberedVaultSlot, rememberVaultSlot, verifyPhrase } from "@/lib/wallet-ui";
+import { comparesInLokiSigner, invitePreview, nativeRosterRefusal, pairingSecondsLeft, paymentLabel, rememberedVaultSlot, rememberVaultSlot, storageLabel, verifyPhrase } from "@/lib/wallet-ui";
 import { toggleTheme, useIsDark } from "@/lib/theme";
 import { useCeremonyStatus, usePayments, useStatus } from "@/lib/hooks";
 import type {
@@ -729,16 +729,14 @@ function NativePairingLink({ open, onRegistered }: { open: boolean; onRegistered
 
 // Describe protection on the signer host, not custody inside this browser.
 function SecureStorageBadge({ se }: { se?: string }) {
-  const enclave = se === "apple";
+  const { enclave, label, detail } = storageLabel(se, signerKind());
   return (
     <span
       className="pill text-[11px] text-muted"
-      title={enclave
-        ? "Your device’s Secure Enclave protects the wrapping key; signing requires local consent. The share enters device process memory during signing."
-        : "Software development signer: local sealed storage, without hardware isolation."}
+      title={detail}
     >
       <span className={`dot ${enclave ? "bg-mint text-mint" : "bg-amber text-amber"}`} />
-      {enclave ? "Enclave-protected wrapping key" : "Software device storage"}
+      {label}
     </span>
   );
 }
@@ -1074,9 +1072,7 @@ function CeremonyView({
         <h2 className="text-2xl font-semibold text-mint mb-2">Vault ready</h2>
         <p className="text-muted text-sm mb-4">Setup is complete and the vault is active.</p>
         <p className="mb-6 text-sm text-foreground/90">
-          {secureElement === "apple"
-            ? "The signer host’s Secure Enclave protects the unwrapping key. Your share enters process memory during signing; it is not hardware-contained FROST signing."
-            : "Software development signer: local sealed storage, without hardware isolation."}
+          {storageLabel(secureElement, signerKind()).detail}
         </p>
         <div className="mb-8 flex justify-center"><SecureStorageBadge se={secureElement} /></div>
         <Btn onClick={onDone}>Go to vault →</Btn>

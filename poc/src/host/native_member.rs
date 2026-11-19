@@ -20,6 +20,7 @@ const UPGRADE_VAULT: &str = "Open this vault in the wallet once to upgrade it.";
 struct NativeMember {
     state: Shared,
     viewing_keys: Mutex<BTreeMap<(String, u16), (SignerViewingKey, VaultNetwork)>>,
+    stop: Arc<tokio::sync::Notify>,
 }
 
 static RUNNING: Mutex<Option<Arc<NativeMember>>> = Mutex::new(None);
@@ -27,12 +28,12 @@ static RUNNING: Mutex<Option<Arc<NativeMember>>> = Mutex::new(None);
 struct NativeScope;
 
 impl NativeScope {
-    fn install(state: &Shared) -> Result<Self, String> {
+    fn install(state: &Shared, stop: Arc<tokio::sync::Notify>) -> Result<Self, String> {
         let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
         if running.is_some() {
             return Err("LokiSigner is already running.".into());
         }
-        *running = Some(Arc::new(NativeMember { state: state.clone(), viewing_keys: Mutex::default() }));
+        *running = Some(Arc::new(NativeMember { state: state.clone(), viewing_keys: Mutex::default(), stop }));
         Ok(Self)
     }
 }
@@ -51,7 +52,27 @@ pub(crate) fn run_native(
     roster_confirmation: LocalRosterConfirmation,
     fetched: Option<FetchedConfig>,
 ) -> Result<(), String> {
-    super::run_local_with(config, Some(pass), Some(notice), Some(approval), Some(roster_confirmation), fetched, true, NativeScope::install)
+    struct ClearCache;
+    impl Drop for ClearCache {
+        fn drop(&mut self) { crate::seal_kdf::clear_session_cache(); }
+    }
+    let _cache = ClearCache;
+    let stop = Arc::new(tokio::sync::Notify::new());
+    super::run_local_with(config, Some(pass), Some(notice), Some(approval), Some(roster_confirmation), fetched,
+        Some(&stop), |state| NativeScope::install(state, stop.clone()))
+}
+
+pub(crate) fn request_stop() -> bool {
+    RUNNING.lock().is_ok_and(|running| running.as_ref().is_some_and(|member| {
+        member.stop.notify_one();
+        true
+    }))
+}
+
+pub(crate) fn set_aside(data: &Path) -> Result<(), &'static str> {
+    let running = RUNNING.lock().map_err(|_| super::native_recovery::REFUSED)?;
+    if running.is_some() { return Err(super::native_recovery::REFUSED); }
+    super::native_recovery::set_aside(data)
 }
 
 pub(crate) fn restore_running(words: Zeroizing<Vec<u8>>, file: &Path) -> Result<(), &'static str> {
@@ -165,10 +186,50 @@ mod tests {
     const SLOT: u16 = 2;
 
     fn config(data: &Path) -> Config {
-        super::super::config_from_args(&[
+        let mut settings = super::super::native_config_from_args(&[
             "--data".into(), data.to_str().unwrap().into(), "--port".into(), "0".into(),
             "--network".into(), "testnet".into(),
-        ]).unwrap()
+        ]).unwrap();
+        settings.secure_element = "software".into();
+        settings
+    }
+
+    #[test]
+    fn a_paired_native_app_runs_offline_and_only_sets_aside_after_stop() {
+        let _test = TEST_MEMBER.lock().unwrap();
+        let root = std::env::temp_dir().join(format!("loki-native-stop-{}", uuid::Uuid::new_v4()));
+        let data = root.join("LokiSigner");
+        crate::profile::create(&data, PASS, "Test member").unwrap();
+        super::super::registration::save_coordinator(&data, "https://127.0.0.1:1", 7).unwrap();
+        let mut settings = config(&data);
+        settings.registration = Some(super::super::RegistrationConfig::resume(&data, false).unwrap());
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let notice: LocalNotice = Arc::new(move |kind, message| {
+                if kind != "recovery" { ready_tx.send((kind.to_owned(), message.to_owned())).unwrap(); }
+            });
+            stop_tx.send(run_native(settings, Zeroizing::new(PASS.into()), notice, Arc::new(|_| false),
+                Arc::new(|_| crate::host::RosterAnswer::Differ), None)).unwrap();
+        });
+        let timeout = std::time::Duration::from_secs(10);
+        let events: BTreeMap<_, _> = (0..2).map(|_| ready_rx.recv_timeout(timeout).unwrap()).collect();
+        assert_eq!(events["registration-warning"], "LokiSigner couldn’t reach the coordinator. Your profile is unlocked and LokiSigner will keep trying in the background.");
+        let (base, token) = events["ready"].split_once("/#").unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let client = reqwest::Client::new();
+            let status: Value = client.get(format!("{base}/api/recovery-status")).header("x-loki-token", token)
+                .send().await.unwrap().json().await.unwrap();
+            assert_eq!(status["recovery_in_app"], true);
+        });
+        assert!(set_aside(&data).is_err());
+        assert!(request_stop());
+        stop_rx.recv_timeout(timeout).unwrap().unwrap();
+        worker.join().unwrap();
+        set_aside(&data).unwrap();
+        assert!(!data.exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn write(dir: &MemberDir, file: &str, value: &Value) {
@@ -191,7 +252,7 @@ mod tests {
         let _test = TEST_MEMBER.lock().unwrap();
         let data = std::env::temp_dir().join(format!("loki-addresses-{}", uuid::Uuid::new_v4()));
         let state = Arc::new(crate::host::state::AppState::new(config(&data)));
-        let _native = NativeScope::install(&state).unwrap();
+        let _native = NativeScope::install(&state, Arc::default()).unwrap();
         *state.session.blocking_write() = Some(crate::host::state::Session {
             passphrase: Zeroizing::new(PASS.into()), data: data.clone(),
         });
@@ -297,13 +358,13 @@ mod tests {
     fn running_handle_refuses_second_install_and_discards_rows_after_replacement() {
         let _test = TEST_MEMBER.lock().unwrap();
         let state = Arc::new(crate::host::state::AppState::new(config(Path::new("unused"))));
-        let scope = NativeScope::install(&state).unwrap();
-        assert_eq!(NativeScope::install(&state).err().as_deref(), Some("LokiSigner is already running."));
+        let scope = NativeScope::install(&state, Arc::default()).unwrap();
+        assert_eq!(NativeScope::install(&state, Arc::default()).err().as_deref(), Some("LokiSigner is already running."));
 
         let mut replacement = None;
         let rows = with_running_member(|_| {
             drop(scope);
-            replacement = Some(NativeScope::install(&state).unwrap());
+            replacement = Some(NativeScope::install(&state, Arc::default()).unwrap());
             Ok(vec![json!({ "name": "Old member’s vault" })])
         });
         assert!(replacement.is_some());

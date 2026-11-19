@@ -184,6 +184,32 @@ unsafe fn native_query(
     std::ffi::CString::new(reply.to_string()).map_or(std::ptr::null_mut(), std::ffi::CString::into_raw)
 }
 
+/// Inspect this Mac's local profile. `action`: 0 inspect, 1 try to clean restore staging then
+/// inspect at startup, 2 set aside a stopped, vault-free profile then inspect.
+///
+/// # Safety
+/// `launch` must be a live NUL-terminated UTF-8 launch JSON string for this call.
+#[cfg(feature = "relay-communication")]
+#[no_mangle]
+pub unsafe extern "C" fn loki_member_app_profile(launch: *const std::ffi::c_char, action: u32) -> *mut std::ffi::c_char {
+    native_query(launch, "profile", |launch| {
+        let data = crate::host::config_from_args(&launch.args)?.data;
+        match action {
+            0 => {},
+            1 => crate::host::native_clean_staging(&data),
+            2 => crate::host::native_set_aside(&data)?,
+            _ => return Err("unknown profile action".into()),
+        }
+        Ok(crate::host::native_profile_state(&data)?.into())
+    })
+}
+
+#[cfg(feature = "relay-communication")]
+#[no_mangle]
+pub extern "C" fn loki_member_app_stop() -> i32 {
+    i32::from(crate::host::native_request_stop())
+}
+
 /// The coordinator origin and slot a pairing link names, checked without any network request.
 /// LokiSigner asks the member to confirm them before it contacts that coordinator. Returns
 /// `{"target": {"coordinator": "...", "slot": n}}` or `{"error": "..."}`; free it with
@@ -308,7 +334,7 @@ pub unsafe extern "C" fn loki_member_app_restore_profile(
     confirm_roster: NativeConfirmRoster,
 ) -> *mut std::ffi::c_char {
     let error = crate::host::NATIVE_RESTORE_REFUSED;
-    let start_error = "Vault restored to this Mac, but LokiSigner could not start. Reopen LokiSigner and unlock; your recovery words are not needed.";
+    let start_error = "Vault restored to this Mac, but LokiSigner could not start. Try unlocking again; your recovery words are not needed.";
     let mut published = false;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let words = take_restore_secret(words, words_len);
@@ -326,8 +352,7 @@ pub unsafe extern "C" fn loki_member_app_restore_profile(
         struct Launch { args: Vec<String>, restore_origin: String, config: crate::host::NativeConfig }
         let launch: Launch = serde_json::from_slice(std::ffi::CStr::from_ptr(launch).to_bytes()).map_err(|_| error)?;
         let file = std::ffi::CStr::from_ptr(file).to_str().map_err(|_| error)?;
-        let mut config = crate::host::config_from_args(&launch.args).map_err(|_| error)?;
-        config.secure_element = "apple".into();
+        let mut config = crate::host::native_config_from_args(&launch.args).map_err(|_| error)?;
         let fetched = launch.config.apply_restore(&mut config, &launch.args, &launch.restore_origin).map_err(|_| error)?;
         crate::host::native_restore_new(&mut config, &pass, words, std::path::Path::new(file), &launch.restore_origin, fetched.as_ref())?;
         published = true;
@@ -378,9 +403,8 @@ pub unsafe extern "C" fn loki_member_app_pair(
         #[serde(deny_unknown_fields)]
         struct Launch { args: Vec<String>, pairing_url: Option<String>, config: crate::host::NativeConfig }
         let launch: Launch = serde_json::from_str(std::ffi::CStr::from_ptr(launch).to_str().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-        let mut config = crate::host::config_from_args(&launch.args)?;
+        let mut config = crate::host::native_config_from_args(&launch.args)?;
         if config.registration.is_some() { return Err("native pairing accepts registration only through its pairing link".into()); }
-        config.secure_element = "apple".into();
         config.validate_secure_element()?;
         // The values the member reviewed, checked again; never fetched a second time. A fetched
         // configuration is saved only after the profile unlocks.
@@ -394,8 +418,14 @@ pub unsafe extern "C" fn loki_member_app_pair(
     }));
     match result {
         Ok(Ok(())) => 0,
-        Ok(Err(e)) => { notice("error", &e); 1 }
-        Err(_) => { notice("error", "native member stopped unexpectedly"); 2 }
+        Ok(Err(e)) => match e.as_str() {
+            "unlock" => 3,
+            "device-key" => 4,
+            "registration-refused" => 5,
+            "registration-failed" => 6,
+            _ => 1,
+        },
+        Err(_) => 2,
     }
 }
 
@@ -424,9 +454,7 @@ mod native_pairing_tests {
 
     #[test]
     fn native_unlock_buffer_is_wiped_before_startup() {
-        extern "C" fn notice(kind: *const std::ffi::c_char, _: *const std::ffi::c_char) {
-            assert_eq!(unsafe { std::ffi::CStr::from_ptr(kind) }.to_str().unwrap(), "error");
-        }
+        extern "C" fn notice(_: *const std::ffi::c_char, _: *const std::ffi::c_char) {}
         let launch = std::ffi::CString::new(r#"{"args":[]}"#).unwrap();
         extern "C" fn refuse(_: *const std::ffi::c_char) -> i32 { 0 }
         let mut pass = b"native passphrase\0".to_vec();

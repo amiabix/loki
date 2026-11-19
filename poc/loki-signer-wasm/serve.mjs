@@ -55,7 +55,7 @@ const nonceWitnesses = process.env.LOKI_NONCE_WITNESSES
 // reachable and the bytes served are exactly the bytes hashed below.
 const types = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".wasm": "application/wasm", ".json": "application/json" };
 const bundle = new Map();
-for (const name of ["signer.html", "signer-page.js", "signer-page.css", "signer-worker.js", "lightwalletd.js"]) {
+for (const name of ["signer.html", "signer-page.js", "signer-page.css", "signer-worker.js", "lightwalletd.js", "control-inbox.js"]) {
   bundle.set(`/${name}`, readFileSync(join(here, name)));
 }
 for (const [prefix, dir] of [["/pkg/", resolve(here, "pkg")], ["/wasm-transport/pkg/", resolve(here, "../wasm-transport/pkg")]]) {

@@ -24,11 +24,11 @@ pub use state::Config;
 pub use registration::RegistrationConfig;
 pub use native_config::{Deployment, FetchedConfig, NativeConfig};
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
-pub(crate) use native_member::{run_native, vault_addresses as native_vault_addresses};
+pub(crate) use native_member::{run_native, request_stop as native_request_stop, set_aside as native_set_aside, vault_addresses as native_vault_addresses};
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
 pub(crate) use native_member::restore_running as native_restore_running;
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
-pub(crate) use native_recovery::{restore_new as native_restore_new, REFUSED as NATIVE_RESTORE_REFUSED};
+pub(crate) use native_recovery::{clean_staging as native_clean_staging, profile_state as native_profile_state, restore_new as native_restore_new, REFUSED as NATIVE_RESTORE_REFUSED};
 #[cfg(feature = "relay-communication")]
 pub use nonce_witness::WitnessConfig;
 
@@ -187,7 +187,7 @@ pub fn config_from_args(args: &[String]) -> Result<Config, String> {
     let network = value("--network").unwrap_or_else(|| "regtest".into());
     crate::network::VaultNetwork::parse(&network)?;
     Ok(Config {
-        data, port, bind,
+        data, port, bind, native: false,
         registration: RegistrationConfig::from_args(args, flag("--development-http"))?,
         advertise_url: value("--advertise-url"),
         network,
@@ -206,6 +206,14 @@ pub fn config_from_args(args: &[String]) -> Result<Config, String> {
     })
 }
 
+#[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+pub(crate) fn native_config_from_args(args: &[String]) -> Result<Config, String> {
+    let mut config = config_from_args(args)?;
+    config.native = true;
+    config.secure_element = "apple".into();
+    Ok(config)
+}
+
 /// Build the axum app and serve on the configured bind IP and port. Blocks.
 pub fn run(config: Config) -> Result<(), String> {
     run_local(config, None, None, None, None)
@@ -221,7 +229,7 @@ pub fn run_local(
     approval: Option<LocalApproval>,
     fetched: Option<FetchedConfig>,
 ) -> Result<(), String> {
-    run_local_with(config, pass, notice, approval, None, fetched, false, |_| Ok(()))
+    run_local_with(config, pass, notice, approval, None, fetched, None, |_| Ok(()))
 }
 
 fn run_local_with<G>(
@@ -231,7 +239,7 @@ fn run_local_with<G>(
     approval: Option<LocalApproval>,
     roster_confirmation: Option<LocalRosterConfirmation>,
     fetched: Option<FetchedConfig>,
-    recovery_in_app: bool,
+    stop: Option<&tokio::sync::Notify>,
     on_start: impl FnOnce(&state::Shared) -> Result<G, String>,
 ) -> Result<(), String> {
     // rustls has no default provider; install one before any relay/lightwalletd TLS.
@@ -253,7 +261,7 @@ fn run_local_with<G>(
             .map_err(|e| format!("bind {addr}: {e}"))?;
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
         config.port = addr.port();
-        let state: state::Shared = std::sync::Arc::new(state::AppState { approval, roster_confirmation, fetched_config: fetched, recovery_in_app, ..state::AppState::new(config) });
+        let state: state::Shared = std::sync::Arc::new(state::AppState { approval, roster_confirmation, fetched_config: fetched, ..state::AppState::new(config) });
         let _scope = on_start(&state)?;
         let ready = registration::start(&state, pass, notice.as_ref()).await?;
         // Member-local output only. Paste into a local browser tab; never send to the coordinator.
@@ -264,9 +272,17 @@ fn run_local_with<G>(
         } else {
             println!("Signer: http://{addr}/#{}", state.config.token);
         }
-        axum::serve(listener, routes::router(state))
-            .await
-            .map_err(|e| format!("serve: {e}"))
+        let server = axum::serve(listener, routes::router(state));
+        if let Some(stop) = stop {
+            // Drop the native runtime before the UI can set aside the profile. No HTTP
+            // request or signer worker may keep writing to the old profile after that.
+            tokio::select! {
+                result = async { server.await } => result.map_err(|e| format!("serve: {e}")),
+                _ = stop.notified() => Ok(()),
+            }
+        } else {
+            server.await.map_err(|e| format!("serve: {e}"))
+        }
     })
 }
 

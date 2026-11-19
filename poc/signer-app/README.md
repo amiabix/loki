@@ -41,7 +41,19 @@ On the wallet's sign-in screen open **Use a native member app instead**. It has 
 
 The app stays running for ceremony, payment review and signing using the existing device
 consent and nonce-witness paths. Quit locks the process; launch again to unlock and register
-with the saved public coordinator/slot, without reusing the claim.
+with the saved public coordinator/slot, without reusing the claim. With saved settings, you can
+unlock and use local features such as **Vault addresses…** and **Restore a vault…** while the
+coordinator is offline. If registration fails or is refused, LokiSigner shows a warning, stays
+unlocked and keeps trying in the background. A launch with a new pairing link waits for the
+registration result before reporting success.
+
+If you cancel, enter the wrong passphrase, or LokiSigner cannot start, choose **Try again**
+or **Quit**. If the coordinator refuses a pairing, retry the saved pairing or get a new link
+from the wallet. When the existing profile has no vault data, **Start over…** lets you set it
+aside before pairing or restoring. LokiSigner moves the whole data folder to a dated sibling;
+it deletes neither the folder nor the old device key in the Keychain. New native profiles save
+a random key scope and use a different device login key, even at the same path. That key stays
+with its profile if the folder is moved. Existing vault share key tags do not change.
 
 ## Back up and restore a vault
 
@@ -57,8 +69,28 @@ Choose one backup file in LokiSigner, enter the 24 words, and set a new local pr
 LokiSigner opens the file locally and checks that both recovered public identity keys identify
 exactly one slot in the coordinator's roster. It saves the recovered vault and identity together,
 then registers the new Mac in that slot without reserving a new one. If the connection fails
-after saving, keep LokiSigner running or reopen and unlock it to retry. You won't need the words
-again to reconnect. Once connected, use the private link to pair the wallet tab on the new Mac.
+after saving, keep LokiSigner running or reopen and unlock it to retry. If the coordinator
+refuses the slot before the first successful registration, LokiSigner checks the member list
+again and uses a different slot only when exactly one entry matches both public identity keys.
+You won't need the words again to reconnect. Once connected, use the private link to pair the
+wallet tab on the new Mac.
+
+Restore can reuse an absent or empty data folder, or one with only recognized leftovers: empty
+`profile/` or `device-auth/` directories, the public `native-key-scope` file, incomplete
+pairing or signer-settings `.tmp` files, and an empty `vaults/` directory or one holding only
+generated restore staging directories. Restore preserves these leftovers in a dated sibling.
+Anything unrecognized requires you to confirm **Start over…** before it is moved. Any other
+entry in `vaults/`, a `vaults` file, a legacy `card` entry, or top-level `vault.card`,
+`vault.sealed`, or `share.sealed` protects the profile from being set aside. LokiSigner tries
+to clear expired `.loki-restore-<UUID>` directories at startup, both in `vaults/` and beside
+the data folder. Symlinks to the data folder still work; set-aside keeps the link pointing to
+the newly emptied location and archives the old contents beside its target.
+
+If you already paired a different member by mistake, choose **Start over…** from the retry
+dialog or when **Restore a vault…** says the backup does not match the running profile. Confirm
+**Set aside and start over**, then choose **Restore from recovery words**. LokiSigner will not
+set aside a profile with vault data. To restore a different member in that case, use another Mac
+or macOS account.
 
 Restore each additional backup from **LokiSigner → Restore a vault…** in the unlocked app.
 It must belong to the same member and recovery words. It will not replace an existing vault.
@@ -140,8 +172,8 @@ values its signer origin gives the browser signer (`LOKI_NETWORK`, `LOKI_FROSTD_
 - **Checked locally.** LokiSigner treats the reply as untrusted. It refuses unknown fields,
   mainnet, remote endpoints without TLS (loopback HTTP only with `--development-http`),
   endpoints containing whitespace, control or non-ASCII characters, and witnesses that hosted
-  signing would refuse. The request follows no redirect and times out. Its errors name only
-  the origin and the HTTP status; nothing the coordinator sends is shown.
+  signing would refuse. The request follows no redirect and times out. The app shows a fixed
+  message on failure, not the coordinator’s reply or HTTP status.
 - **Saved once unlocked, and pinned.** The configuration is saved only after the local profile
   unlocks, owner-only (0600) in the data directory: `signer-config.json` with the coordinator
   origin it came from, and the witnesses in `nonce-witnesses.json`, the `--nonce-witnesses`
@@ -155,7 +187,7 @@ values its signer origin gives the browser signer (`LOKI_NETWORK`, `LOKI_FROSTD_
   overrides a fetched value, nothing is saved, because the member was shown the flag's value
   and not the coordinator's.
 - **Nothing to run with.** When a launch still lacks the network, frostd, lightwalletd (on
-  testnet) or the witnesses, LokiSigner names what is missing and does not start. It never
+  testnet) or the witnesses, LokiSigner reports that it couldn’t load settings. It never
   falls back to regtest defaults.
 - **Regtest deployments.** The signer origin's `LOKI_NETWORK` defaults to `testnet`. A regtest
   stack must set `LOKI_NETWORK=regtest` on the signer origin, or LokiSigner is told testnet.
@@ -167,7 +199,7 @@ Pairing reserves a slot for 120 seconds. Both claim and registration are consume
 including failed proofs; claiming does not extend the deadline. If it expires while saving
 recovery words, choose **Get a new link** in the wallet, which asks for the same slot (or,
 if another member took it meanwhile, a new one). After
-a lost response, restart and unlock; an outstanding reservation may need to expire before
+a lost response, choose **Try again** and unlock; an outstanding reservation may need to expire before
 retry. Public device bindings prevent a different identity or slot from reusing the enrolled
 key.
 

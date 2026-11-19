@@ -9,6 +9,8 @@ use crate::signer::secure_element::{OpenError, SecureElement, SoftwareSecureElem
 /// Launch configuration for one member coordinator (one process per member).
 pub struct Config {
     pub registration: Option<super::RegistrationConfig>,
+    /// The GUI entry points own local recovery and may use a profile-scoped Apple key tag.
+    pub(super) native: bool,
     pub data: PathBuf,
     pub port: u16,
     pub bind: std::net::IpAddr,
@@ -89,18 +91,49 @@ impl Config {
                 .mode(0o700)
                 .create(dir)
                 .map_err(|e| format!("signer directory: {e}"))?;
-            // Scope the persistent key to this signer directory, resolving path aliases.
+            // Only device login keys opt into the scope here. A staged restore uses the
+            // published path for legacy tags; scoped callers read the actual profile root.
+            let scope = if self.native && dir.file_name().is_some_and(|n| n == "device-auth") {
+                read_native_key_scope(&self.data)?
+            } else { None };
             let dir = match _published {
                 Some(path) => path.to_owned(),
                 None => dir.canonicalize().map_err(|e| format!("signer directory: {e}"))?,
             };
-            let mut tag = b"cash.loki.member.kek.v1:".to_vec();
-            tag.extend_from_slice(dir.as_os_str().as_encoded_bytes());
+            let tag = apple_key_tag(&dir, scope, "device-auth");
             return crate::signer::secure_element_apple::AppleSecureElement::persistent(&tag)
                 .map(HostedSecureElement::Apple);
         }
         SoftwareSecureElement::persistent(dir, pass).map(HostedSecureElement::Software)
     }
+}
+
+pub(super) const NATIVE_KEY_SCOPE: &str = "native-key-scope";
+
+pub(super) fn write_native_key_scope(data: &Path) -> Result<(), String> {
+    let dir = crate::state::MemberDir::create(data, "").map_err(|e| e.to_string())?;
+    dir.write_text(NATIVE_KEY_SCOPE, &uuid::Uuid::new_v4().to_string()).map_err(|e| e.to_string())
+}
+
+#[cfg(any(test, all(target_os = "macos", feature = "apple-enclave")))]
+pub(super) fn read_native_key_scope(data: &Path) -> Result<Option<uuid::Uuid>, String> {
+    match std::fs::read_to_string(data.join(NATIVE_KEY_SCOPE)) {
+        Ok(scope) => uuid::Uuid::parse_str(&scope).map(Some).map_err(|_| "invalid native key scope".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// The scoped form survives a folder move. For a staged restore, pass the scope read from
+/// the staged profile and use the published directory only as the legacy fallback.
+#[cfg(any(test, all(target_os = "macos", feature = "apple-enclave")))]
+pub(super) fn apple_key_tag(dir: &Path, scope: Option<uuid::Uuid>, role: &str) -> Vec<u8> {
+    if let Some(scope) = scope {
+        return format!("cash.loki.member.kek.v2:{scope}:{role}").into_bytes();
+    }
+    let mut tag = b"cash.loki.member.kek.v1:".to_vec();
+    tag.extend_from_slice(dir.as_os_str().as_encoded_bytes());
+    tag
 }
 
 pub(super) enum HostedSecureElement {
@@ -176,8 +209,6 @@ pub struct AppState {
     pub(super) roster_asking: std::sync::Mutex<Option<String>>,
     /// Vaults whose codes the member said differ, refused until the app restarts.
     pub(super) roster_refused: std::sync::Mutex<BTreeSet<String>>,
-    /// Only the GUI entry point handles recovery locally. Headless scripted approval is separate.
-    pub(super) recovery_in_app: bool,
     /// Each vault's group viewing key, read from its device-bound signer once per process.
     pub(super) viewing_keys: std::sync::Mutex<BTreeMap<String, orchard::keys::FullViewingKey>>,
     /// The signer configuration LokiSigner fetched for this launch, saved once the profile unlocks.
@@ -200,7 +231,6 @@ impl AppState {
             roster_confirmation: None,
             roster_asking: std::sync::Mutex::new(None),
             roster_refused: std::sync::Mutex::new(BTreeSet::new()),
-            recovery_in_app: false,
             viewing_keys: std::sync::Mutex::new(BTreeMap::new()),
             fetched_config: None,
         }
@@ -214,9 +244,28 @@ mod tests {
     use super::*;
     use crate::signer::secure_element::SealedShare;
 
+    #[test]
+    fn apple_tags_keep_legacy_identity_and_scope_new_keys_to_the_profile_and_role() {
+        let data = std::env::temp_dir().join(format!("loki-device-tag-{}", uuid::Uuid::new_v4()));
+        let device = data.join("device-auth");
+        let legacy = |path: &Path| format!("cash.loki.member.kek.v1:{}", path.display()).into_bytes();
+        assert_eq!(apple_key_tag(&device, read_native_key_scope(&data).unwrap(), "device-auth"), legacy(&device));
+        write_native_key_scope(&data).unwrap();
+        let scope = read_native_key_scope(&data).unwrap();
+        let tag = apple_key_tag(&device, scope, "device-auth");
+        assert_ne!(tag, legacy(&device));
+        assert_eq!(tag, apple_key_tag(Path::new("moved/profile/device-auth"), scope, "device-auth"));
+        assert_ne!(tag, apple_key_tag(&device, scope, "vault:example"));
+        write_native_key_scope(&data).unwrap();
+        assert_ne!(tag, apple_key_tag(&device, read_native_key_scope(&data).unwrap(), "device-auth"));
+        let vault = data.join("vaults/vault/signer");
+        assert_eq!(apple_key_tag(&vault, None, "vault:example"), legacy(&vault));
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
     fn config(secure_element: &str) -> Config {
         Config {
-            registration: None,
+            registration: None, native: false,
             bind: "127.0.0.1".parse().unwrap(), advertise_url: None,
             data: PathBuf::new(), port: 3001, network: "regtest".into(),
             lightwalletd: None, transport: "local".into(), secure_element: secure_element.into(),
