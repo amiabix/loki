@@ -78,7 +78,7 @@ see public or sealed data.
 
 A payment, from proposal to broadcast:
 
-![A payment, from proposal to broadcast](docs/images/payment-overview.png)
+![A payment, from proposal to broadcast](docs/images/payment-sequence.png)
 
 Built on the Zcash Foundation's audited FROST crates and its `frostd` relay.
 
