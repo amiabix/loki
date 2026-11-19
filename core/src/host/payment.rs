@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
+    sync::{atomic::Ordering, Arc},
     time::Duration,
 };
 
@@ -29,11 +30,12 @@ use super::{
     ceremony::WireIdentity,
     routes::{blocking, err},
     state::{AppState, Shared},
+    ApprovalAttempt, ApprovalEnd,
 };
 use crate::{
     candidate::{quote_fee, CandidateInputs},
     network::{VaultNetwork, TESTNET_NU7_BIRTH},
-    payment_transport::{coordinate, signer_loop},
+    payment_transport::{coordinate, signer_loop, RoundError},
     setup_transport::{Identity, PublicIdentity},
     signer::{
         CandidateRef, Network, PublicPaymentParams, Signer,
@@ -119,9 +121,46 @@ struct Payment {
     mined_height: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failure_reason: Option<FailureReason>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FailureReason { ApprovalTimeout, Refused, ShareDeadline }
+
+impl FailureReason {
+    fn peer_end(self) -> ApprovalEnd {
+        match self {
+            Self::ApprovalTimeout => ApprovalEnd::PeerTimeout,
+            Self::Refused => ApprovalEnd::PeerRefused,
+            Self::ShareDeadline => ApprovalEnd::ShareDeadline,
+        }
+    }
+
+    fn peer_message(self) -> &'static str {
+        match self {
+            Self::ApprovalTimeout => "Another member did not answer the payment request in time.",
+            Self::Refused => "Another member refused the payment.",
+            Self::ShareDeadline => "The signing round timed out waiting for members.",
+        }
+    }
+}
+
+fn record_peer_failure(p: &mut Payment, peer: u16, native: bool, body: &Value) {
+    p.phase = "failed".into();
+    p.failure_reason = serde_json::from_value(body["failure_reason"].clone()).ok();
+    let reason = if native {
+        p.failure_reason.map_or("The signing attempt could not be completed.", FailureReason::peer_message).to_owned()
+    } else {
+        format!("Member {peer} refused or failed to complete this signing attempt.")
+    };
+    p.error = Some(format!("{reason} Any member can replace it with a request that spends the same note."));
 }
 
 pub(super) struct Vault<Fvk = FullViewingKey> {
+    name: String,
+    native: bool,
     network: VaultNetwork,
     fvk: Fvk,
     public: frost::keys::PublicKeyPackage,
@@ -274,6 +313,8 @@ fn load_vault_with<Fvk>(
             VaultNetwork::Testnet => TESTNET_NU7_BIRTH,
         });
     Ok(Vault {
+        name: c["name"].as_str().unwrap_or("Unnamed vault").to_owned(),
+        native: st.config.native,
         network,
         fvk: viewing_key(slot, network, &v)?,
         public,
@@ -500,6 +541,7 @@ fn public_intent(p: &Payment) -> Value {
 }
 const UNAVAILABLE: &str = "payment session unavailable";
 const ENOUGH_APPROVED: &str = "enough members already approved this payment";
+const APPROVAL_TIMED_OUT: &str = "Payment approval timed out: the member did not answer in time.";
 
 /// The transaction's expiry height: the one fixed when signing started, else the approved bound.
 fn tx_expiry(p: &Payment) -> u32 {
@@ -633,6 +675,9 @@ fn send_control_inner(url: &str, v: &Vault<impl Sized>, p: &Payment, kind: &str,
         let context = control_context(&p.vault, session, v.slot, slot)?;
         let mut body =
             json!({"kind":kind,"hash":intent_hash(p),"intent":public_intent(p),"txid":p.txid});
+        if kind == "failed" {
+            if let Some(reason) = p.failure_reason { body["failure_reason"] = json!(reason); }
+        }
         if kind == "signed" {
             // The copy each member checks and keeps: the signed PCZT carries the openings of
             // the terms, the transaction is what goes on chain.
@@ -650,31 +695,39 @@ fn send_control_inner(url: &str, v: &Vault<impl Sized>, p: &Payment, kind: &str,
 
 // Only roster-owned control sessions are drained. Signing sessions have ephemeral owners.
 fn sync_control(url: &str, data: &Path, pass: &str, vault: &str, v: &Vault) -> Result<(), String> {
-    sync_control_inner(url, data, pass, vault, v).inspect_err(|_| {
+    sync_control_inner(url, data, pass, vault, v, None).inspect_err(|_| {
         eprintln!("vault {vault}: frostd control receive error");
     })
 }
 
-fn sync_control_inner(url: &str, data: &Path, pass: &str, vault: &str, v: &Vault) -> Result<(), String> {
-    let mut tx = relay(&v.identity, url)?;
-    for session in tx.list_sessions().map_err(|e| e.to_string())? {
-        let Ok((participants, Some(owner))) = tx.session_details(session) else {
-            continue;
+fn sync_control_inner(url: &str, data: &Path, pass: &str, vault: &str, v: &Vault,
+    target: Option<(&FrostdTransport, &Payment)>,
+) -> Result<(), String> {
+    let transport;
+    let (tx, sessions) = if let Some((tx, p)) = target {
+        // This mailbox and its roster owner were authenticated when the terms were stored.
+        (tx, vec![p.control_session_id.ok_or("missing payment control session")?])
+    } else {
+        transport = relay(&v.identity, url)?;
+        (&transport, transport.list_sessions().map_err(|e| e.to_string())?)
+    };
+    for session in sessions {
+        let (proposer, timeout) = if let Some((_, p)) = target {
+            (p.proposer, Duration::from_secs(2))
+        } else {
+            let Ok((participants, Some(owner))) = tx.session_details(session) else { continue };
+            let Some(proposer) = v.peers.values().find(|p| p.encryption == owner) else { continue };
+            if participants.len() != v.peers.len()
+                || !participants.contains(&v.identity.public().encryption)
+                || !participants.contains(&owner)
+                || !participants.iter().all(|k| v.peers.values().any(|p| &p.encryption == k))
+            {
+                continue;
+            }
+            (proposer.id, Duration::from_secs(30))
         };
-        let Some(proposer) = v.peers.values().find(|p| p.encryption == owner) else {
-            continue;
-        };
-        if participants.len() != v.peers.len()
-            || !participants.contains(&v.identity.public().encryption)
-            || !participants.contains(&owner)
-            || !participants
-                .iter()
-                .all(|k| v.peers.values().any(|p| &p.encryption == k))
-        {
-            continue;
-        }
-        let ch = tx.join(session).map_err(|e| e.to_string())?;
-        for msg in tx.recv(&ch, false).map_err(|e| e.to_string())? {
+        let batch = tx.recv_control_bounded(session, timeout).map_err(|e| e.to_string())?;
+        for msg in batch {
             let Some(peer) = v
                 .peers
                 .values()
@@ -696,7 +749,7 @@ fn sync_control_inner(url: &str, data: &Path, pass: &str, vault: &str, v: &Vault
                 continue;
             };
             if incoming.vault != vault
-                || incoming.proposer != proposer.id
+                || incoming.proposer != proposer
                 || incoming.control_session_id != Some(session)
                 || incoming.session_id.is_none()
                 || incoming.session_id == Some(session)
@@ -766,8 +819,7 @@ fn sync_control_inner(url: &str, data: &Path, pass: &str, vault: &str, v: &Vault
                         && (peer.id == p.proposer || p.signers.contains(&peer.id))
                         && matches!(p.phase.as_str(), "signing" | "approved" | "not_selected")
                     {
-                        p.phase = "failed".into();
-                        p.error = Some(format!("Member {} refused or failed to complete this signing attempt. Any member can replace it with a request that spends the same note.", peer.id));
+                        record_peer_failure(&mut p, peer.id, v.native, &body);
                         save_payment(data, pass, &p)?;
                         // Members that haven't seen the group yet only trust the proposer.
                         if v.slot == p.proposer {
@@ -835,7 +887,7 @@ fn sync_control_inner(url: &str, data: &Path, pass: &str, vault: &str, v: &Vault
                 }
                 Err(_)
                     if body["kind"] == "intent"
-                        && peer.id == proposer.id
+                        && peer.id == proposer
                         && !payment_dir(data, vault)?
                             .path()
                             .join(format!("{}.json", incoming.attempt))
@@ -858,6 +910,7 @@ fn sync_control_inner(url: &str, data: &Path, pass: &str, vault: &str, v: &Vault
                     incoming.copies_sent = false;
                     incoming.replaced_by = None;
                     incoming.error = None;
+                    incoming.failure_reason = None;
                     if check_replacement(data, pass, v, &incoming).is_err() {
                         eprintln!("payment {}: error checking replacement request", incoming.attempt);
                         continue;
@@ -1177,7 +1230,7 @@ pub(super) async fn approve(State(st): State<Shared>, Json(body): Json<Value>) -
                 })
             }).inspect_err(|error| {
                 if authenticating {
-                    record_failure(&st, &data, &pass, &vault, &attempt, error.clone());
+                    record_failure(&st, &data, &pass, &vault, &attempt, error.clone(), None);
                 }
             })?
         } else {
@@ -1263,7 +1316,7 @@ fn ensure_worker_with_signer(
         };
         let _guard = st.payment.lock().unwrap();
         if let Err(error) = result {
-            record_failure(&st, &data, &pass, &vault, &attempt, error);
+            record_failure(&st, &data, &pass, &vault, &attempt, error, None);
         }
         st.active_payments.lock().unwrap().remove(&key);
     });
@@ -1273,13 +1326,16 @@ fn ensure_worker_with_signer(
 /// A signing round that fails ends the attempt (the failed signer tells the roster); a finish
 /// that fails keeps the signed payment and shows the error until someone sends it again.
 /// Runs under `st.payment`.
-fn record_failure(st: &Shared, data: &Path, pass: &str, vault: &str, attempt: &str, error: String) {
+fn record_failure(st: &Shared, data: &Path, pass: &str, vault: &str, attempt: &str, error: String,
+    reason: Option<FailureReason>,
+) {
     let Ok(mut p) = read_payment(data, pass, vault, attempt) else { return };
     match p.phase.as_str() {
         "signing" => {
             eprintln!("payment {attempt}: error in signing worker");
             p.phase = "failed".into();
             p.error = Some(error);
+            p.failure_reason = reason;
             if save_payment(data, pass, &p).is_err() {
                 eprintln!("payment {attempt}: error saving signing failure");
             }
@@ -1307,6 +1363,45 @@ fn record_failure(st: &Shared, data: &Path, pass: &str, vault: &str, attempt: &s
     }
 }
 
+fn approval_still_running(st: &Shared, data: &Path, pass: &str, p: &Payment,
+    approval: &ApprovalAttempt,
+) -> Result<(), String> {
+    if approval.ended().is_some() {
+        return Err("payment attempt ended".into());
+    }
+    if st.session.blocking_read().is_none() {
+        approval.end(ApprovalEnd::Failed);
+        return Err("LokiSigner locked before signing finished".into());
+    }
+    let local = read_payment(data, pass, &p.vault, &p.attempt)?;
+    if local.phase != "signing" || local.error.is_some() {
+        approval.end(local.failure_reason.map_or(ApprovalEnd::Failed, FailureReason::peer_end));
+        return Err(local.error.unwrap_or_else(|| "payment no longer signing".into()));
+    }
+    Ok(())
+}
+
+fn refresh_approval(st: &Shared, data: &Path, pass: &str, p: &Payment, v: &Vault,
+    tx: &FrostdTransport, approval: &ApprovalAttempt,
+) -> Result<(), String> {
+    // Receive drains the mailbox: serialize it with the ordinary poll and apply the whole
+    // authenticated batch, not just terminal notices. Reuse the signer's logged-in relay.
+    let _guard = st.payment.lock().map_err(|e| e.to_string())?;
+    approval_still_running(st, data, pass, p, approval)?;
+    if sync_control_inner(&st.config.frostd_url, data, pass, &p.vault, v, Some((tx, p))).is_err() {
+        eprintln!("payment: fresh approval status unavailable; continuing after member approval");
+    }
+    approval_still_running(st, data, pass, p, approval)
+}
+
+fn round_approval_end(error: &RoundError, waiting: bool) -> ApprovalEnd {
+    match error {
+        RoundError::ReceiveDeadline { shares: true, .. } if waiting => ApprovalEnd::LocalTimeout,
+        RoundError::ReceiveDeadline { shares: true, .. } => ApprovalEnd::ShareDeadline,
+        _ => ApprovalEnd::Failed,
+    }
+}
+
 fn payment_worker(
     st: &Shared,
     data: &Path,
@@ -1315,7 +1410,7 @@ fn payment_worker(
     attempt: &str,
     opened: Option<super::custody::HostedSigner>,
 ) -> Result<(), String> {
-    let v = load_vault(&st, data, pass, vault)?;
+    let v = Arc::new(load_vault(st, data, pass, vault)?);
     let mut last_notice = std::time::Instant::now() - Duration::from_secs(5);
     let mut p = loop {
         if st.session.blocking_read().is_none() {
@@ -1367,28 +1462,62 @@ fn payment_worker(
     }
     // Signing mailboxes carry only protocol data. Check the separate, authenticated control
     // mailbox while waiting, with one throttled poll shared by the proposer and its coordinator.
+    let approval = st.config.native.then(|| Arc::new(ApprovalAttempt::named(v.name.clone())));
     let poll = std::sync::Mutex::new((std::time::Instant::now() - Duration::from_millis(500), Ok(())));
     let check_running = || {
-        let mut poll = poll.lock().map_err(|e| e.to_string())?;
-        if poll.1.is_ok() && poll.0.elapsed() >= Duration::from_millis(500) {
-            let _guard = st.payment.lock().map_err(|e| e.to_string())?;
-            let _ = sync_control(&st.config.frostd_url, data, pass, vault, &v);
-            let local = read_payment(data, pass, vault, attempt)?;
-            if local.phase != "signing" {
-                poll.1 = Err(local.error.unwrap_or_else(|| "payment no longer signing".into()));
+        let result = (|| {
+            if approval.is_some() && st.session.blocking_read().is_none() {
+                return Err("LokiSigner locked before signing finished".into());
             }
-            poll.0 = std::time::Instant::now();
+            if approval.as_ref().is_some_and(|approval| approval.ended().is_some()) {
+                return Err("payment attempt ended".into());
+            }
+            let mut poll = poll.lock().map_err(|e| e.to_string())?;
+            if poll.1.is_ok() && poll.0.elapsed() >= Duration::from_millis(500) {
+                let _guard = st.payment.lock().map_err(|e| e.to_string())?;
+                let _ = sync_control(&st.config.frostd_url, data, pass, vault, &v);
+                poll.1 = if let Some(approval) = &approval {
+                    approval_still_running(st, data, pass, &p, approval)
+                } else {
+                    let local = read_payment(data, pass, vault, attempt)?;
+                    if local.phase == "signing" { Ok(()) }
+                    else { Err(local.error.unwrap_or_else(|| "payment no longer signing".into())) }
+                };
+                poll.0 = std::time::Instant::now();
+            }
+            poll.1.clone()
+        })();
+        if let Some(approval) = &approval {
+            if result.is_err() { approval.end(ApprovalEnd::Failed); }
+            if result.is_ok() && approval.ended().is_some() { return Err("payment attempt ended".into()); }
         }
-        poll.1.clone()
+        result
     };
-    let sign_member = || sign_with_opened(st, data, pass, &p, &v, owned, &check_running, opened);
+    let sign_member = || sign_with_opened(st, data, pass, &p, &v, owned, &check_running, opened, approval.clone());
+    let report = |error: &RoundError| {
+        let _guard = st.payment.lock().unwrap();
+        let mut message = String::from(error.clone());
+        let mut reason = None;
+        if let Some(approval) = &approval {
+            approval.end(round_approval_end(error, approval.waiting.load(Ordering::Acquire)));
+            match approval.ended() {
+                Some(ApprovalEnd::LocalTimeout) => {
+                    message = APPROVAL_TIMED_OUT.into();
+                    reason = Some(FailureReason::ApprovalTimeout);
+                }
+                Some(ApprovalEnd::LocalRefused) => reason = Some(FailureReason::Refused),
+                Some(ApprovalEnd::ShareDeadline) => {
+                    message = FailureReason::ShareDeadline.peer_message().into();
+                    reason = Some(FailureReason::ShareDeadline);
+                }
+                _ => {}
+            }
+        }
+        record_failure(st, data, pass, vault, attempt, message, reason);
+    };
     if p.proposer == v.slot {
         // Every member hears the group: those outside it stop waiting to sign.
         send_control(&st.config.frostd_url, &v, &p, "start", &members(&v))?;
-        let report = |error: &String| {
-            let _guard = st.payment.lock().unwrap();
-            record_failure(st, data, pass, vault, attempt, error.clone());
-        };
         let signed = std::thread::scope(|scope| {
             let coordinator = scope.spawn(|| aggregate(st, data, pass, &p, &v, &check_running).inspect_err(&report));
             let signer_result = sign_member().inspect_err(&report);
@@ -1410,7 +1539,20 @@ fn payment_worker(
         // Sending is automatic once the transaction is signed.
         deliver(st, data, pass, vault, attempt)?;
     } else {
-        sign_member()?;
+        if let Some(approval) = &approval {
+            // Unlike the proposer, a co-signer has no coordinator polling control while
+            // its signer is blocked in the native dialog.
+            std::thread::scope(|scope| {
+                let signer = scope.spawn(sign_member);
+                while !signer.is_finished() {
+                    if approval.waiting.load(Ordering::Acquire) && check_running().is_err() { break; }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                signer.join().map_err(|_| RoundError::from("payment signer panicked"))?
+            }).inspect_err(&report)?;
+        } else {
+            sign_member()?;
+        }
         let _guard = st.payment.lock().map_err(|e| e.to_string())?;
         let mut local = read_payment(data, pass, vault, attempt)?;
         if local.phase == "signing" && local.error.is_none() {
@@ -1470,11 +1612,11 @@ fn sign(
     data: &Path,
     pass: &str,
     p: &Payment,
-    v: &Vault,
+    v: &Arc<Vault>,
     owned: Option<CandidateInputs<'_>>,
     check_running: &dyn Fn() -> Result<(), String>,
 ) -> Result<(), String> {
-    sign_with_opened(st, data, pass, p, v, owned, check_running, None)
+    Ok(sign_with_opened(st, data, pass, p, v, owned, check_running, None, None)?)
 }
 
 fn sign_with_opened(
@@ -1482,11 +1624,12 @@ fn sign_with_opened(
     data: &Path,
     pass: &str,
     p: &Payment,
-    v: &Vault,
+    v: &Arc<Vault>,
     owned: Option<CandidateInputs<'_>>,
     check_running: &dyn Fn() -> Result<(), String>,
     opened: Option<super::custody::HostedSigner>,
-) -> Result<(), String> {
+    attempt: Option<Arc<ApprovalAttempt>>,
+) -> Result<(), RoundError> {
     // Both external nonce witnesses must be configured; without them this member refuses to
     // sign, before it joins the session or unwraps the share.
     let witness = super::nonce_witness::RelayWitness::for_member(st, &p.attempt)?;
@@ -1494,6 +1637,12 @@ fn sign_with_opened(
     let ch = tx
         .join(p.session_id.ok_or("missing signing session")?)
         .map_err(|e| e.to_string())?;
+    let tx = Arc::new(tx);
+    let fresh_approval = attempt.clone().filter(|_| p.proposer != v.slot).map(|attempt| {
+        let (st, p, v, tx) = (st.clone(), p.clone(), v.clone(), tx.clone());
+        let (data, pass) = (data.to_owned(), Zeroizing::new(pass.to_owned()));
+        move || refresh_approval(&st, &data, &pass, &p, &v, &tx, &attempt)
+    });
     let signer_network = match v.network {
         VaultNetwork::Regtest => Network::Regtest,
         VaultNetwork::Testnet => Network::Testnet,
@@ -1502,7 +1651,10 @@ fn sign_with_opened(
     // own native decision approves, and only for the reviewed intent and pinned candidate;
     // headless members refuse.
     eprintln!("payment {}: opening signer for member {}", p.attempt, v.slot);
-    let approval = payment_approval(data, pass, p, &v.network, super::approval_policy(st.approval.clone(), signer_network, v.slot))?;
+    let approval = payment_approval(data, pass, p, &v.network,
+        super::approval_policy(st.approval.clone(), signer_network, v.slot, attempt.clone()),
+        attempt.as_ref().map(|_| st),
+        fresh_approval.clone().map(|refresh| Box::new(move || refresh().is_ok()) as _))?;
     let mut signer = if let Some(mut signer) = opened {
         signer.set_approval_policy(approval);
         signer
@@ -1547,13 +1699,13 @@ fn sign_with_opened(
         // A retry builds a new candidate under a new randomizer; never hand over a stale one.
         match std::fs::remove_file(dir.path().join(candidate_file(&p.attempt))) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                return Err(format!("clear stale candidate: {e}"))
+                return Err(format!("clear stale candidate: {e}").into())
             }
             _ => {}
         }
     }
     signer_loop(
-        &tx,
+        &*tx,
         &ch,
         &mut signer,
         &session,
@@ -1567,6 +1719,10 @@ fn sign_with_opened(
         &v.peers[&p.proposer],
         &other_signers,
         check_running,
+        &|| match &fresh_approval {
+            Some(refresh) => refresh(),
+            None => check_running(),
+        },
         &mut |bytes| {
             let sighash = review_candidate(bytes, p, v)?;
             require_consent(data, pass, p)?;
@@ -1646,8 +1802,11 @@ fn payment_approval(
     p: &Payment,
     network: &VaultNetwork,
     mut native: crate::signer::local::ApprovalPolicy,
+    live: Option<&Shared>,
+    fresh: Option<Box<dyn Fn() -> bool + Send>>,
 ) -> Result<crate::signer::local::ApprovalPolicy, String> {
     let (data, pass, p) = (data.to_owned(), Zeroizing::new(pass.to_owned()), p.clone());
+    let live = live.cloned();
     let to = vault::orchard_receiver_from_ua(&p.recipient, network.network_type())?
         .to_raw_address_bytes();
     let memo = MemoBytes::from_bytes(p.memo.as_bytes()).map_err(|e| format!("memo: {e:?}"))?;
@@ -1669,7 +1828,11 @@ fn payment_approval(
                 && view.memo == memo.as_array()
                 && view.expiry_height == tx_expiry(&p))
         };
-        let approves = approved().unwrap_or(false) && native(request);
+        let approves = approved().unwrap_or(false) && native(request) && fresh.as_ref().is_none_or(|refresh| refresh()) && live.as_ref().is_none_or(|st| {
+            // The dialog's poll may not have observed the last state change yet.
+            st.session.blocking_read().is_some() && read_payment(&data, &pass, &p.vault, &p.attempt)
+                .is_ok_and(|local| local.phase == "signing" && local.error.is_none())
+        });
         if !approves {
             let _ = payment_dir(&data, &p.vault).map(|dir| dir.write_text(&refused_file(&p.attempt), ""));
         }
@@ -1749,7 +1912,7 @@ fn aggregate(
     p: &Payment,
     v: &Vault,
     check_running: &dyn Fn() -> Result<(), String>,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, RoundError> {
     let coord = Identity::from_secret_bytes(
         &hex::decode(
             p.coordinator_secret
@@ -1945,7 +2108,7 @@ pub(super) async fn send(State(st): State<Shared>, Json(body): Json<Value>) -> R
                 Ok(p) => p,
                 Err(e) => {
                     let _guard = st.payment.lock().map_err(|e| e.to_string())?;
-                    record_failure(&st, &data, &pass, &vault, &attempt, e.clone());
+                    record_failure(&st, &data, &pass, &vault, &attempt, e.clone(), None);
                     return Err(e);
                 }
             };
@@ -2471,6 +2634,8 @@ mod tests {
             .unwrap();
         let identity = Identity::new(1);
         let v = Vault {
+            name: "Test vault".into(),
+            native: false,
             network: VaultNetwork::Testnet,
             fvk,
             public,
@@ -2535,6 +2700,8 @@ mod tests {
             .try_into()
             .unwrap();
         Vault {
+            name: "Test vault".into(),
+            native: false,
             network: VaultNetwork::Testnet,
             fvk: zip2005::frost_viewing_key(&ak, &[42u8; 32]).unwrap(),
             public,
@@ -2551,14 +2718,14 @@ mod tests {
         let data = std::env::temp_dir().join(format!("loki-no-witness-{}", Uuid::new_v4()));
         let identity = Identity::new(1);
         let peers = BTreeMap::from([(1, identity.public())]);
-        let v = member(&identity, &peers);
+        let v = Arc::new(member(&identity, &peers));
         let p = open_payment(&hex::encode([2; 32]), 1);
         // A member that would approve, but has no `--nonce-witnesses`.
         let config = crate::host::config_from_args(&[
             "--data".into(), data.to_str().unwrap().into(), "--port".into(), "0".into(),
             "--frostd-url".into(), "http://127.0.0.1:9".into(),
         ]).unwrap();
-        let approval: crate::host::LocalApproval = std::sync::Arc::new(|_| true);
+        let approval: crate::host::LocalApproval = Arc::new(|_, _| super::super::ApprovalAnswer::Approve);
         let st = std::sync::Arc::new(AppState { approval: Some(approval), ..AppState::new(config) });
         // Refused before it contacts frostd (unreachable here) or opens any signer.
         let refused = sign(&st, &data, "pass", &p, &v, None, &|| Ok(())).unwrap_err();
@@ -2601,7 +2768,7 @@ mod tests {
     fn state(data: &Path, frostd_url: &str) -> Shared {
         use crate::host::state::{AppState, Config};
         // These members stand in for a member who approves every payment natively.
-        let approval: crate::host::LocalApproval = std::sync::Arc::new(|_| true);
+        let approval: crate::host::LocalApproval = Arc::new(|_, _| super::super::ApprovalAnswer::Approve);
         std::sync::Arc::new(AppState { approval: Some(approval), ..AppState::new(Config {
             registration: None, native: false,
             data: data.to_owned(),
@@ -2741,13 +2908,14 @@ mod tests {
         let member_says = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let dialog: super::super::LocalApproval = {
             let (asked, member_says) = (asked.clone(), member_says.clone());
-            std::sync::Arc::new(move |_| {
+            std::sync::Arc::new(move |_, _| {
                 asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                member_says.load(std::sync::atomic::Ordering::SeqCst)
+                if member_says.load(Ordering::SeqCst) { super::super::ApprovalAnswer::Approve }
+                else { super::super::ApprovalAnswer::Refuse }
             })
         };
-        let native = || super::super::approval_policy(Some(dialog.clone()), Network::Testnet, 1);
-        let mut policy = payment_approval(&data, "pass", &p, &v.network, native()).unwrap();
+        let native = || super::super::approval_policy(Some(dialog.clone()), Network::Testnet, 1, None);
+        let mut policy = payment_approval(&data, "pass", &p, &v.network, native(), None, None).unwrap();
         let mut approves = |candidate: &CandidateRef, sighash: [u8; 32], view: &crate::signer::wysiwys::PaymentView| {
             policy(&crate::signer::local::ApprovalRequest { candidate, sighash, view })
         };
@@ -2783,16 +2951,127 @@ mod tests {
         let mut terms = p.clone();
         terms.amount_zat += 1;
         assert!(record_consent(&data, "pass", &terms).is_err());
-        let mut policy = payment_approval(&data, "pass", &terms, &v.network, native()).unwrap();
+        let mut policy = payment_approval(&data, "pass", &terms, &v.network, native(), None, None).unwrap();
         changed = view.clone();
         changed.amount_zat = terms.amount_zat;
         let request = crate::signer::local::ApprovalRequest { candidate: &candidate, sighash, view: &changed };
         assert!(!policy(&request));
         assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 2);
         // Without a native approval channel (headless), even the bound request is refused.
-        let mut headless =
-            payment_approval(&data, "pass", &p, &v.network, super::super::approval_policy(None, Network::Testnet, 1)).unwrap();
+        let mut headless = payment_approval(&data, "pass", &p, &v.network,
+            super::super::approval_policy(None, Network::Testnet, 1, None), None, None).unwrap();
         assert!(!headless(&crate::signer::local::ApprovalRequest { candidate: &candidate, sighash, view: &view }));
+
+        // The worker hasn't polled again yet, but the wallet has ended the attempt.
+        let st = state(&data, "http://127.0.0.1:9");
+        *st.session.blocking_write() = Some(crate::host::state::Session {
+            data: data.clone(), passphrase: Zeroizing::new("pass".into()),
+        });
+        save_payment(&data, "pass", &p).unwrap();
+        let mut cancelled = p.clone();
+        cancelled.phase = "cancelled".into();
+        let root = data.clone();
+        let answer = Box::new(move |_: &crate::signer::local::ApprovalRequest<'_>| {
+            save_payment(&root, "pass", &cancelled).unwrap();
+            true
+        });
+        let mut late = payment_approval(&data, "pass", &p, &v.network, answer, Some(&st), None).unwrap();
+        assert!(!late(&crate::signer::local::ApprovalRequest { candidate: &candidate, sighash, view: &view }));
+        save_payment(&data, "pass", &p).unwrap();
+        let mut remotely_closed = payment_approval(&data, "pass", &p, &v.network, native(), Some(&st),
+            Some(Box::new(|| false))).unwrap();
+        assert!(!remotely_closed(&crate::signer::local::ApprovalRequest { candidate: &candidate, sighash, view: &view }));
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
+    fn payment_approval_failure_reason_is_fixed_and_optional() {
+        let deadline = RoundError::ReceiveDeadline { received: 1, expected: 2, shares: true };
+        assert_eq!(round_approval_end(&deadline, true), ApprovalEnd::LocalTimeout);
+        assert_eq!(round_approval_end(&deadline, false), ApprovalEnd::ShareDeadline);
+        assert_eq!(round_approval_end(&RoundError::Other(deadline.into()), true), ApprovalEnd::Failed);
+        for (wire, expected, copy) in [
+            (json!("approval_timeout"), Some(FailureReason::ApprovalTimeout), "Another member did not answer"),
+            (json!("refused"), Some(FailureReason::Refused), "Another member refused"),
+            (json!("share_deadline"), Some(FailureReason::ShareDeadline), "The signing round timed out"),
+            (json!("private error"), None, "The signing attempt could not be completed"),
+            (Value::Null, None, "The signing attempt could not be completed"),
+        ] {
+            let mut p = Payment::default();
+            let body = json!({"failure_reason":wire,"error":"private error"});
+            record_peer_failure(&mut p, 3, true, &body);
+            assert_eq!(p.phase, "failed");
+            assert_eq!(p.failure_reason, expected);
+            let error = p.error.as_deref().unwrap();
+            assert!(error.starts_with(copy));
+            assert!(!error.contains("private error"));
+            record_peer_failure(&mut p, 3, false, &body);
+            assert!(p.error.unwrap().starts_with("Member 3 refused or failed"));
+        }
+    }
+
+    #[test]
+    fn payment_approval_refresh_allows_relay_error_but_stops_on_authenticated_failure() {
+        use axum::{http::HeaderMap, routing::post, Router};
+        use std::sync::atomic::AtomicUsize;
+
+        let a = Identity::new(1);
+        let b = Identity::new(2);
+        let mut v = member(&b, &BTreeMap::from([(1, a.public()), (2, b.public())]));
+        v.native = true;
+        let mut p = open_payment(&hex::encode([2; 32]), 1);
+        p.recipient = vault::unified_address(&v.fvk, v.network.network_type());
+        p.session_id = Some(Uuid::new_v4());
+        let control = Uuid::new_v4();
+        p.control_session_id = Some(control);
+        p.signers = vec![1, 2];
+        let body = json!({"kind":"failed", "hash":intent_hash(&p), "intent":public_intent(&p),
+            "failure_reason":"approval_timeout"});
+        let context = control_context(&p.vault, control, 1, 2).unwrap();
+        let sealed = SealedPeer::seal(&a, &b.public(), &context, MessageKind::PeerReply, &serde_json::to_vec(&body).unwrap()).unwrap();
+        let message = json!({"sender":hex::encode(a.public().encryption),"msg":hex::encode(Outbound::Peer(sealed).to_bytes().unwrap())});
+        let requests = Arc::new(AtomicUsize::new(0));
+        let token = Uuid::new_v4();
+        let app = Router::new()
+            .route("/challenge", post(|| async { Json(json!({"challenge":Uuid::new_v4()})) }))
+            .route("/login", post(move || async move { Json(json!({"access_token":token})) }))
+            .route("/receive", post({
+                let requests = requests.clone();
+                move |headers: HeaderMap, Json(body): Json<Value>| {
+                    let (requests, message) = (requests.clone(), message.clone());
+                    async move {
+                        assert_eq!(headers["authorization"].to_str().unwrap(), format!("Bearer {token}"));
+                        assert_eq!(body, json!({"session_id":control,"as_coordinator":false}));
+                        if requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                            (StatusCode::BAD_GATEWAY, Json(Value::Null))
+                        } else {
+                            (StatusCode::OK, Json(json!({"msgs":[message]})))
+                        }
+                    }
+                }
+            }));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = rt.spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let data = std::env::temp_dir().join(format!("loki-fresh-status-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(data.join("vaults").join(&p.vault)).unwrap();
+        save_payment(&data, "pass", &p).unwrap();
+        let st = state(&data, &url);
+        *st.session.blocking_write() = Some(super::super::state::Session {
+            data: data.clone(), passphrase: Zeroizing::new("pass".into()),
+        });
+        let approval = ApprovalAttempt::named(v.name.clone());
+        let tx = relay(&b, &url).unwrap();
+        refresh_approval(&st, &data, "pass", &p, &v, &tx, &approval).unwrap();
+        assert_eq!(approval.ended(), None);
+        assert!(refresh_approval(&st, &data, "pass", &p, &v, &tx, &approval).is_err());
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(approval.ended(), Some(ApprovalEnd::PeerTimeout));
+        let failed = read_payment(&data, "pass", &p.vault, &p.attempt).unwrap();
+        assert!(failed.error.unwrap().starts_with("Another member did not answer"));
+        server.abort();
         std::fs::remove_dir_all(data).unwrap();
     }
 
@@ -3190,6 +3469,8 @@ mod tests {
             .unwrap();
         let fvk = zip2005::frost_viewing_key(&ak, &[42; 32]).unwrap();
         let make = |slot: u16| Vault {
+            name: "Test vault".into(),
+            native: false,
             network: VaultNetwork::Testnet,
             fvk: fvk.clone(),
             public: public.clone(),
@@ -3203,8 +3484,8 @@ mod tests {
             birth_height: TESTNET_NU7_BIRTH,
         };
         // Members 1 and 3 sign; member 2 is in the session but never joins it.
-        let a = make(1);
-        let b = make(3);
+        let a = Arc::new(make(1));
+        let b = Arc::new(make(3));
         let rho = Rho::from_bytes(&[1; 32]).unwrap();
         let note = orchard::Note::from_parts(
             fvk.address_at(0u64, Scope::External),
@@ -3329,7 +3610,7 @@ mod tests {
         let control_ch = control.open(&everyone, 4).unwrap();
         p.control_session_id = Some(control_ch.session_id());
         send_control(&url, &a, &p, "intent", &members(&a)).unwrap();
-        for (m, member_data) in [(&b, &b_data), (&c, &c_data)] {
+        for (m, member_data) in [(&*b, &b_data), (&c, &c_data)] {
             sync_control(&url, member_data, "pass", &vault, m).unwrap();
             let copy = read_payment(member_data, "pass", &vault, &p.attempt).unwrap();
             assert!(copy.raw_tx.is_none() && !can_send(&copy));
@@ -3351,7 +3632,7 @@ mod tests {
         assert!(copy.raw_tx.is_none() && copy.phase == "signing");
 
         send_control(&url, &a, &p, "signed", &members(&a)).unwrap();
-        for (m, member_data) in [(&b, &b_data), (&c, &c_data)] {
+        for (m, member_data) in [(&*b, &b_data), (&c, &c_data)] {
             sync_control(&url, member_data, "pass", &vault, m).unwrap();
             let copy = read_payment(member_data, "pass", &vault, &p.attempt).unwrap();
             assert_eq!(copy.phase, "signed", "member {}", m.slot);
@@ -3899,9 +4180,9 @@ mod tests {
             network_branch_id: 0,
             fee_verified: true,
         };
-        let declines: super::super::LocalApproval = std::sync::Arc::new(|_| false);
-        let native = super::super::approval_policy(Some(declines), Network::Testnet, 2);
-        let mut policy = payment_approval(&data, "pass", &earlier, &v.network, native).unwrap();
+        let declines: super::super::LocalApproval = Arc::new(|_, _| super::super::ApprovalAnswer::Refuse);
+        let native = super::super::approval_policy(Some(declines), Network::Testnet, 2, None);
+        let mut policy = payment_approval(&data, "pass", &earlier, &v.network, native, None, None).unwrap();
         assert!(!policy(&crate::signer::local::ApprovalRequest { candidate: &candidate, sighash, view: &view }));
         // The refusal stands: the retry waits for this member's own approval again.
         assert!(!approved_before(&data, "pass", &v, &retry));

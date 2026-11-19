@@ -240,6 +240,26 @@ impl FrostdTransport {
             .collect::<Result<_, _>>()?;
         Ok((participants, owner))
     }
+
+    pub(crate) fn recv_control_bounded(&self, session: Uuid, timeout: Duration) -> Result<Vec<Incoming>, TransportError> {
+        self.receive(session, false, timeout)
+    }
+
+    fn receive(&self, session: Uuid, as_coordinator: bool, timeout: Duration) -> Result<Vec<Incoming>, TransportError> {
+        let out: ReceiveOut = self.runtime.block_on(async {
+            tokio::time::timeout(timeout, Self::post(
+                &self.client,
+                format!("{}/receive", self.base_url),
+                self.token,
+                json!({ "session_id": session, "as_coordinator": as_coordinator }),
+            )).await.map_err(|_| TransportError::Http("relay receive timed out".into()))?
+        })?;
+        out.msgs.into_iter().map(|m| {
+            let key = m.sender.0.try_into()
+                .map_err(|_| TransportError::Decode("sender pubkey length".into()))?;
+            Ok(Incoming { from: Peer(key), message: m.msg })
+        }).collect()
+    }
 }
 
 impl Transport for FrostdTransport {
@@ -292,29 +312,7 @@ impl Transport for FrostdTransport {
     }
 
     fn recv(&self, channel: &FrostdChannel, as_coordinator: bool) -> Result<Vec<Incoming>, TransportError> {
-        let base = self.base_url.clone();
-        let client = self.client.clone();
-        let token = self.token;
-        let out: ReceiveOut = self.runtime.block_on(Self::post(
-            &client,
-            format!("{base}/receive"),
-            token,
-            json!({ "session_id": channel.session, "as_coordinator": as_coordinator }),
-        ))?;
-        out.msgs
-            .into_iter()
-            .map(|m| {
-                let key: [u8; 32] = m
-                    .sender
-                    .0
-                    .try_into()
-                    .map_err(|_| TransportError::Decode("sender pubkey length".into()))?;
-                Ok(Incoming {
-                    from: Peer(key),
-                    message: m.msg,
-                })
-            })
-            .collect()
+        self.receive(channel.session, as_coordinator, Duration::from_secs(30))
     }
 
     fn close(&self, channel: FrostdChannel) -> Result<(), TransportError> {

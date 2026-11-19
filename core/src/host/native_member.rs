@@ -252,7 +252,7 @@ mod tests {
                 if kind != "recovery" { ready_tx.send((kind.to_owned(), message.to_owned())).unwrap(); }
                 true
             });
-            stop_tx.send(run_native(settings, Zeroizing::new(PASS.into()), notice, Arc::new(|_| false),
+            stop_tx.send(run_native(settings, Zeroizing::new(PASS.into()), notice, Arc::new(|_, _| crate::host::ApprovalAnswer::Refuse),
                 Arc::new(|_| crate::host::RosterAnswer::Differ), Arc::new(|_, _, _| false), None)).unwrap();
         });
         let timeout = std::time::Duration::from_secs(10);
@@ -468,7 +468,7 @@ mod tests {
             });
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if native {
-                    run_native(config(data), Zeroizing::new(PASS.into()), notice, Arc::new(|_| false),
+                    run_native(config(data), Zeroizing::new(PASS.into()), notice, Arc::new(|_, _| crate::host::ApprovalAnswer::Refuse),
                         Arc::new(|_| crate::host::RosterAnswer::Differ), Arc::new(|_, _, _| false), None)
                 } else {
                     let config = super::super::config_from_args(&["--data".into(), data.to_str().unwrap().into(),
