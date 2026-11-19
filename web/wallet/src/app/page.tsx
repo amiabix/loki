@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
-import { OrbScene } from "@/components/OrbScene";
+import { LokiTunnel } from "@/components/LokiTunnel";
 import {
   api,
   ApiError,
@@ -168,7 +168,7 @@ export default function App() {
 
   return (
     <>
-      <OrbScene calm={["send", "review"].includes(view.id)} />
+      <LokiTunnel calm={["send", "review"].includes(view.id)} />
       <header className="glass fixed inset-x-0 top-0 z-30 flex h-20 items-center justify-between gap-3 px-5 sm:px-10">
         <button
           aria-label="Loki home"
@@ -242,9 +242,9 @@ function Screen({ children }: { children: React.ReactNode }) {
   return (
     <motion.div
       ref={ref}
-      initial={{ opacity: 0, y: 20 }}
+      initial={{ opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.4, ease: "easeOut" }}
+      transition={{ duration: 0.2, ease: "easeOut" }}
       className="screen-transition w-full min-w-0 max-w-xl [overflow-wrap:anywhere]"
     >
       <p className="sr-only" aria-live="polite" aria-atomic="true">{announcement}</p>
@@ -391,7 +391,7 @@ function Btn({
 }) {
   const styles: Record<string, string> = {
     mint: "btn-primary",
-    amber: "btn-glass text-amber",
+    amber: "btn-primary",
     danger: "btn-glass text-danger",
     ghost: "btn-glass",
   };
@@ -413,7 +413,7 @@ function GlassCard({ children, className = "" }: { children: React.ReactNode; cl
 
 function BackLink({ onClick, label = "← Back" }: { onClick: () => void; label?: string }) {
   return (
-    <button onClick={onClick} className="mb-4 min-h-11 rounded-full px-3 text-sm text-muted transition hover:bg-white/60 hover:text-mint">
+    <button onClick={onClick} className="mb-4 min-h-11 rounded-full px-3 text-sm text-muted transition hover:bg-[var(--surface-2)] hover:text-mint">
       {label}
     </button>
   );
@@ -421,7 +421,7 @@ function BackLink({ onClick, label = "← Back" }: { onClick: () => void; label?
 
 function ErrMsg({ msg }: { msg: string | null }) {
   if (!msg) return null;
-  return <p role="alert" className="mt-3 rounded-xl border border-danger/25 bg-white/70 px-4 py-3 text-left text-sm leading-relaxed text-danger [overflow-wrap:anywhere]">{msg}</p>;
+  return <p role="alert" className="mt-3 rounded-xl border border-danger/25 bg-[var(--surface-2)] px-4 py-3 text-left text-sm leading-relaxed text-danger [overflow-wrap:anywhere]">{msg}</p>;
 }
 
 // Every member gets a stable colour from their slot, so everyone sees the same person in the
@@ -479,7 +479,7 @@ function FullScreen({ children, calm = false }: { children: React.ReactNode; cal
   const { ref, announcement } = useScreenFocus();
   return (
     <main className="flex min-h-dvh w-full items-center justify-center p-5">
-      <OrbScene calm={calm} />
+      <LokiTunnel calm={calm} />
       <div ref={ref} className="flex w-full justify-center">
         <p className="sr-only" aria-live="polite" aria-atomic="true">{announcement}</p>
         {children}
@@ -920,7 +920,7 @@ function CreateVault({
               className="glass mt-1 w-full rounded-full px-6 py-2.5 text-left text-sm text-foreground outline-none bg-transparent"
             >
               {range(2, 16).map((n) => (
-                <option key={n} value={n} className="bg-white text-foreground">{n}</option>
+                <option key={n} value={n} className="bg-[var(--surface-2)] text-foreground">{n}</option>
               ))}
             </select>
           </label>
@@ -932,7 +932,7 @@ function CreateVault({
               className="glass mt-1 w-full rounded-full px-6 py-2.5 text-left text-sm text-foreground outline-none bg-transparent"
             >
               {range(2, members).map((n) => (
-                <option key={n} value={n} className="bg-white text-foreground">{n}</option>
+                <option key={n} value={n} className="bg-[var(--surface-2)] text-foreground">{n}</option>
               ))}
             </select>
           </label>
@@ -1160,8 +1160,8 @@ function PhaseLadder({ current }: { current: CeremonyStatus["phase"] }) {
             i < currentIdx
               ? "bg-mint/15 text-mint"
               : i === currentIdx
-              ? "bg-mint text-white"
-              : "border border-[var(--border)] bg-white/50 text-muted"
+              ? "bg-mint text-[var(--on-accent)]"
+              : "border border-[var(--border)] bg-[var(--surface-2)] text-muted"
           }`}
         >
           {PHASE_LABEL[p]}
@@ -1174,7 +1174,7 @@ function PhaseLadder({ current }: { current: CeremonyStatus["phase"] }) {
 function FullValue({ value, label, expanded = false }: { value: string; label: string; expanded?: boolean }) {
   return <details open={expanded || undefined} className="min-w-0 text-left text-xs">
     <summary className="min-h-11 cursor-pointer py-2 font-mono text-muted">{short(value, 16, 10)} · Full {label}</summary>
-    <p tabIndex={0} className="select-all break-all rounded-xl border border-[var(--border)] bg-white/60 p-3 font-mono">{value}</p>
+    <p tabIndex={0} className="select-all break-all rounded-xl border border-[var(--border)] bg-[var(--surface-2)] p-3 font-mono">{value}</p>
   </details>;
 }
 
@@ -1637,7 +1637,7 @@ function VaultOverview({
         <div className="mb-2 flex items-center gap-2">
           <h3 className="eyebrow">Approvals</h3>
           {pending && pending.length > 0 && (
-            <span className="rounded-full bg-amber px-2 py-0.5 text-[11px] font-bold leading-none text-white">{pending.length}</span>
+            <span className="rounded-full bg-amber px-2 py-0.5 text-[11px] font-bold leading-none text-[var(--on-accent)]">{pending.length}</span>
           )}
         </div>
         {pendingError ? (
@@ -1846,7 +1846,7 @@ function RecoveryCard({ vault }: { vault: string }) {
             Write these 24 words down and keep them offline. They are shown once. Restoring your
             share also requires signing in to this account and a stored backup for this vault.
           </p>
-          <div className="mb-3 grid grid-cols-2 gap-x-3 gap-y-2 rounded-xl border border-[var(--border)] bg-white/60 p-3 font-mono text-xs sm:grid-cols-3">
+          <div className="mb-3 grid grid-cols-2 gap-x-3 gap-y-2 rounded-xl border border-[var(--border)] bg-[var(--surface-2)] p-3 font-mono text-xs sm:grid-cols-3">
             {words.split(/\s+/).map((w, i) => (
               <span key={i}><span className="text-muted">{i + 1}.</span> {w}</span>
             ))}
@@ -2180,11 +2180,11 @@ function ReviewApprove({
 // ─── history ──────────────────────────────────────────────────────────────────
 
 const PHASE_PILL: Record<string, string> = {
-  preparing: "border border-[var(--border)] bg-white/50 text-muted",
+  preparing: "border border-[var(--border)] bg-[var(--surface-2)] text-muted",
   approved: "bg-amber/15 text-amber",
   signed: "bg-amber/15 text-amber",
   broadcast: "bg-mint/15 text-mint",
-  confirmed: "bg-mint text-white",
+  confirmed: "bg-mint text-[var(--on-accent)]",
   replaced: "border border-danger/40 bg-danger/10 text-danger",
 };
 
@@ -2319,7 +2319,7 @@ function History({
                     Replaces payment {short(p.replaces.attempt, 6, 4)} with the same note{p.replaces.cancel ? "; the note goes back to the vault" : ""}.
                   </p>}
                 </div>
-                <span className={`rounded-full px-2.5 py-0.5 text-xs font-medium shrink-0 ${PHASE_PILL[confirmed ? "confirmed" : p.phase] ?? "border border-[var(--border)] bg-white/50 text-muted"}`}>
+                <span className={`rounded-full px-2.5 py-0.5 text-xs font-medium shrink-0 ${PHASE_PILL[confirmed ? "confirmed" : p.phase] ?? "border border-[var(--border)] bg-[var(--surface-2)] text-muted"}`}>
                   {paymentLabel(confirmed ? "confirmed" : p.phase, false, sending && !settled)}
                 </span>
               </div>
