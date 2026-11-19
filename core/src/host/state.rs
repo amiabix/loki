@@ -91,8 +91,8 @@ impl Config {
         self.open_secure_element_with_reason(dir, pass, None)
     }
 
-    pub(super) fn open_secure_element_with_reason(&self, dir: &Path, pass: &str, payment_reason: Option<&str>) -> Result<HostedSecureElement, String> {
-        let result = self.open_element(dir, pass, false, None, &self.data, payment_reason);
+    pub(super) fn open_secure_element_with_reason(&self, dir: &Path, pass: &str, reason: Option<&str>) -> Result<HostedSecureElement, String> {
+        let result = self.open_element(dir, pass, false, None, &self.data, reason);
         eprintln!("secure-element open: {}", if result.is_ok() { "ok" } else { "error" });
         result
     }
@@ -102,7 +102,15 @@ impl Config {
         self.open_element(dir, pass, true, published, profile, None)
     }
 
-    fn open_element(&self, dir: &Path, pass: &str, _create: bool, _published: Option<&Path>, _profile: &Path, _payment_reason: Option<&str>) -> Result<HostedSecureElement, String> {
+    fn open_element(&self, dir: &Path, pass: &str, _create: bool, _published: Option<&Path>, _profile: &Path, _reason: Option<&str>) -> Result<HostedSecureElement, String> {
+        #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave")))]
+        let reason = _reason.filter(|_| self.native);
+        #[cfg(test)]
+        if self.secure_element == "apple" {
+            if let Some(result) = scope_test::open(dir, pass, reason) {
+                return result.map(HostedSecureElement::Software);
+            }
+        }
         self.validate_secure_element()?;
         #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
         if self.secure_element == "apple" {
@@ -117,8 +125,7 @@ impl Config {
                     Err(_) => return Err(KeyFailure::Other.to_string()),
                 }
             }
-            let element = open_apple_element(dir, _create, _published, scope, &role,
-                if self.native { _payment_reason } else { None });
+            let element = open_apple_element(dir, _create, _published, scope, &role, reason);
             #[cfg(feature = "relay-communication")]
             let element = if self.native && !_create {
                 match element {
@@ -132,7 +139,7 @@ impl Config {
             } else { element };
             return element.map_err(|e| e.to_string());
         }
-        SoftwareSecureElement::persistent(dir, pass).map(HostedSecureElement::Software)
+        SoftwareSecureElement::persistent(dir, pass).map(HostedSecureElement::software)
     }
 }
 
@@ -189,7 +196,7 @@ pub(super) fn apple_key_tag(dir: &Path, scope: Option<uuid::Uuid>, role: &str) -
 }
 
 #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
-pub(super) fn open_apple_element(dir: &Path, create: bool, published: Option<&Path>, scope: Option<uuid::Uuid>, role: &str, payment_reason: Option<&str>) -> Result<HostedSecureElement, KeyFailure> {
+pub(super) fn open_apple_element(dir: &Path, create: bool, published: Option<&Path>, scope: Option<uuid::Uuid>, role: &str, reason: Option<&str>) -> Result<HostedSecureElement, KeyFailure> {
     use std::os::unix::fs::DirBuilderExt;
     if create {
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(|_| KeyFailure::Other)?;
@@ -200,11 +207,11 @@ pub(super) fn open_apple_element(dir: &Path, create: bool, published: Option<&Pa
     if let Some(outcome) = apple_test::lookup(dir, &tag, create) {
         outcome?;
         return SoftwareSecureElement::persistent(dir, "Apple test stand-in")
-            .map(HostedSecureElement::Software).map_err(|_| KeyFailure::Other);
+            .map(HostedSecureElement::software).map_err(|_| KeyFailure::Other);
     }
     let state = dir.join("biometry-state");
     let state = Some(state.as_path());
-    let key = match payment_reason {
+    let key = match reason {
         Some(reason) => AppleSecureElement::open_payment(&tag, state, reason),
         None if create => AppleSecureElement::create_persistent(&tag, state),
         None => AppleSecureElement::open_persistent(&tag, state),
@@ -263,10 +270,23 @@ pub(super) fn member_key_message(_error: &str) -> Option<&'static str> {
     None
 }
 
+#[cfg(not(test))]
+type HostedSoftware = SoftwareSecureElement;
+#[cfg(test)]
+type HostedSoftware = scope_test::Software;
+
 pub(super) enum HostedSecureElement {
-    Software(SoftwareSecureElement),
+    Software(HostedSoftware),
     #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
     Apple(AppleSecureElement, Option<PathBuf>),
+}
+
+impl HostedSecureElement {
+    fn software(se: SoftwareSecureElement) -> Self {
+        #[cfg(test)]
+        let se = scope_test::Software::plain(se);
+        Self::Software(se)
+    }
 }
 
 impl SecureElement for HostedSecureElement {
@@ -298,6 +318,73 @@ impl SecureElement for HostedSecureElement {
         };
         eprintln!("secure-element unwrap: {outcome}");
         result
+    }
+}
+
+#[cfg(test)]
+pub(super) mod scope_test {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(in crate::host) struct Scope {
+        pub reason: Option<String>,
+        pub unwraps: usize,
+        pub closed: bool,
+    }
+
+    type Scopes = Arc<Mutex<Vec<Scope>>>;
+    static FIXTURES: Mutex<Vec<(PathBuf, Scopes)>> = Mutex::new(Vec::new());
+
+    pub(in crate::host) struct Fixture(PathBuf, Scopes);
+
+    impl Fixture {
+        pub fn install(root: &Path) -> Self {
+            let scopes = Scopes::default();
+            FIXTURES.lock().unwrap().push((root.to_owned(), scopes.clone()));
+            Self(root.to_owned(), scopes)
+        }
+
+        pub fn scopes(&self) -> Vec<Scope> { self.1.lock().unwrap().clone() }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) { FIXTURES.lock().unwrap().retain(|(path, _)| *path != self.0); }
+    }
+
+    pub(in crate::host) struct Software {
+        inner: SoftwareSecureElement,
+        scope: Option<(Scopes, usize)>,
+    }
+
+    impl Software {
+        pub(super) fn plain(inner: SoftwareSecureElement) -> Self { Self { inner, scope: None } }
+    }
+
+    pub(super) fn open(dir: &Path, pass: &str, reason: Option<&str>) -> Option<Result<Software, String>> {
+        let scopes = FIXTURES.lock().unwrap().iter().find(|(path, _)| dir.starts_with(path))?.1.clone();
+        Some(SoftwareSecureElement::persistent(dir, pass).map(|inner| {
+            let mut events = scopes.lock().unwrap();
+            let index = events.len();
+            events.push(Scope { reason: reason.map(str::to_owned), unwraps: 0, closed: false });
+            drop(events);
+            Software { inner, scope: Some((scopes, index)) }
+        }))
+    }
+
+    impl SecureElement for Software {
+        fn wrap_dek(&self, dek: &[u8; 32]) -> Result<WrappedDek, String> { self.inner.wrap_dek(dek) }
+
+        fn unwrap_dek(&self, wrapped: &WrappedDek) -> Result<Zeroizing<[u8; 32]>, OpenError> {
+            if let Some((scopes, i)) = &self.scope { scopes.lock().unwrap()[*i].unwraps += 1; }
+            self.inner.unwrap_dek(wrapped)
+        }
+    }
+
+    impl Drop for Software {
+        fn drop(&mut self) {
+            if let Some((scopes, i)) = &self.scope { scopes.lock().unwrap()[*i].closed = true; }
+        }
     }
 }
 
@@ -344,8 +431,8 @@ pub struct AppState {
     /// Vaults whose codes the member said differ, refused until the app restarts.
     pub(super) roster_refused: std::sync::Mutex<BTreeSet<String>>,
     pub(super) wallet_tabs: Option<super::connect::WalletTabs>,
-    /// Each vault's group viewing key, read from its device-bound signer once per process.
-    pub(super) viewing_keys: std::sync::Mutex<BTreeMap<String, orchard::keys::FullViewingKey>>,
+    /// Each opened vault's viewing key; `None` means a cancelled open needs an explicit retry.
+    pub(super) viewing_keys: std::sync::Mutex<BTreeMap<String, Option<orchard::keys::FullViewingKey>>>,
     /// The signer configuration LokiSigner fetched for this launch, saved once the profile unlocks.
     pub(super) fetched_config: Option<super::FetchedConfig>,
 }

@@ -229,6 +229,39 @@ test('pairing rejects expired, wrong-origin and changed-slot claims without revi
   } finally { rmSync(dir, { recursive: true, force: true }); delete process.env.LOKI_REGISTRY; }
 });
 
+test('native pairing retries a cancelled proof on the same reservation without extending it', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'loki-pairing-resume-'));
+  process.env.LOKI_REGISTRY = join(dir, 'roster.json');
+  const file = process.env.LOKI_REGISTRY + '.challenges';
+  try {
+    const d = device(7);
+    const first = { ...d.input, lokisigner_url: 'http://127.0.0.1:3601' };
+    const retry = { ...first, advertise_url: 'http://127.0.0.1:3687', lokisigner_url: 'http://127.0.0.1:3687' };
+    const pair = await members.issuePairingChallenge({ slot: 7 }, origin);
+    const issue = (input, from = origin) => members.issueRegistrationChallenge(input, from);
+    const { challenge } = await issue({ ...first, pairing_challenge: pair.challenge });
+    await assert.rejects(issue({ ...first, pairing_challenge: pair.challenge }), /pairing challenge/);
+    await assert.rejects(issue({ ...device(7).input, lokisigner_url: retry.lokisigner_url }), /reserved/);
+    await assert.rejects(issue({ ...newDevice(d).input, lokisigner_url: retry.lokisigner_url }), /reserved/);
+    await assert.rejects(issue(retry, 'https://other.example'), /reserved/);
+    assert.deepEqual(await issue(retry), { challenge });
+    assert.equal(JSON.parse(readFileSync(file))[0].expires, pair.expires);
+
+    const proof = { ...retry, challenge, signature: sign('sha256', members.registrationMessage(retry, origin, challenge), d.key.privateKey).toString('hex') };
+    assert.deepEqual(await members.registerMember(proof, origin), {
+      slot: 7, signing_pubkey: retry.signing_pubkey, relay_pubkey: retry.relay_pubkey,
+      advertise_url: retry.advertise_url, lokisigner_url: retry.lokisigner_url,
+    });
+    await assert.rejects(members.registerMember(proof, origin), /challenge/);
+
+    const next = await members.issuePairingChallenge({ slot: 8 }, origin);
+    const fresh = { ...device(8).input, lokisigner_url: first.lokisigner_url };
+    const pending = await issue({ ...fresh, pairing_challenge: next.challenge });
+    writeFileSync(file, JSON.stringify(JSON.parse(readFileSync(file)).map((c) => ({ ...c, expires: 0 }))));
+    assert.notEqual((await issue(fresh)).challenge, pending.challenge);
+  } finally { rmSync(dir, { recursive: true, force: true }); delete process.env.LOKI_REGISTRY; }
+});
+
 test('a binding saved before a crashed roster write still reserves and recovers its slot', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'loki-pairing-crash-'));
   process.env.LOKI_REGISTRY = join(dir, 'roster.json');

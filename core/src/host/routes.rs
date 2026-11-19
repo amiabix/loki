@@ -100,9 +100,8 @@ async fn browser_origin(State(st): State<Shared>, req: Request, next: Next) -> R
     }
     // The ceremony endpoints are token-authenticated, member-to-member calls (also exempt from
     // the process token in `auth`): a native peer reaches them with no `Origin` and so skips the
-    // pairing check, and a browser joiner from another origin reaches ONLY these four, still gated
-    // by its invite token. So CORS-open them to any origin (they expose nothing the invite token
-    // does not already guard); every other `/api/*` route stays locked to the paired coordinator.
+    // pairing check. The browser signer runs its join worker on a separate origin and needs CORS
+    // on these four routes. The invite token gates ceremony access, not detection of the listener.
     let open_ceremony = matches!(
         req.uri().path(),
         "/api/enroll" | "/api/agreed" | "/api/roster" | "/api/session"
@@ -231,12 +230,16 @@ async fn unlock(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
 }
 
 async fn lock(State(st): State<Shared>) -> Reply {
+    lock_session(&st).await;
+    ok(json!({ "locked": true }))
+}
+
+pub(super) async fn lock_session(st: &Shared) {
     let mut session = st.session.write().await;
     *session = None;
     if let Some(tabs) = &st.wallet_tabs { tabs.revoke_all(); }
     drop(session);
     crate::seal_kdf::clear_session_cache();
-    ok(json!({ "locked": true }))
 }
 
 async fn status(
@@ -247,6 +250,7 @@ async fn status(
         return ceremony::status(st, vault.clone()).await;
     }
     let network = st.config.network.clone();
+    let secure_element = &st.config.secure_element;
     let session = st.session.read().await;
     let Some(session) = session.as_ref() else {
         let phase = if crate::profile::exists(&st.config.data) {
@@ -254,7 +258,7 @@ async fn status(
         } else {
             "new_profile"
         };
-        return ok(json!({ "phase": phase, "network": network }));
+        return ok(json!({ "phase": phase, "network": network, "secure_element": secure_element }));
     };
     // Unlocked: re-read the profile for its name/id and list the member's vaults.
     match crate::profile::open(&session.data, &session.passphrase) {
@@ -263,7 +267,7 @@ async fn status(
                 Ok(v) => v,
                 Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
             };
-            ok(json!({ "phase": "home", "network": network, "profile": profile, "vaults": vaults }))
+            ok(json!({ "phase": "home", "network": network, "secure_element": secure_element, "profile": profile, "vaults": vaults }))
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
     }

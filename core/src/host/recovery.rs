@@ -184,6 +184,14 @@ pub(super) fn exists(data: &Path) -> bool {
     pubkey_file(data).exists()
 }
 
+/// Native startup must not adopt words the member never confirmed saving.
+pub(super) fn confirm_recovery(data: &Path, notice: &super::LocalNotice) -> Result<(), String> {
+    if pubkey_file(data).try_exists().map_err(|e| e.to_string())? { return Ok(()); }
+    let (words, key) = RecoveryKey::generate()?;
+    if !notice("recovery", words.as_str()) { return Err("recovery-not-confirmed".into()); }
+    adopt_recovery(data, &key)
+}
+
 /// Establish the recovery identity once. Only public keys are persisted; existing identities
 /// are left untouched and their words can never be reshown.
 pub async fn establish_recovery(data: &Path) -> Result<Option<Zeroizing<String>>, String> {

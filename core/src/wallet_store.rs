@@ -23,6 +23,7 @@ use zcash_client_backend::{
         chain::{
             BlockCache, BlockSource, ChainState, error::Error as ScanError, scan_cached_blocks,
         },
+        error::Error as FundingError,
         scanning::ScanRange,
         wallet::{
             ConfirmationsPolicy, propose_send_max_transfer, propose_transfer,
@@ -556,6 +557,16 @@ impl VaultWallet {
         amount: Option<Zatoshis>,
         memo: MemoBytes,
     ) -> Result<Funding, String> {
+        self.propose_with_confirmation_wait(recipient, amount, memo, false)
+    }
+
+    pub(crate) fn propose_with_confirmation_wait(
+        &mut self,
+        recipient: orchard::Address,
+        amount: Option<Zatoshis>,
+        memo: MemoBytes,
+        explain_wait: bool,
+    ) -> Result<Funding, String> {
         let account = self.account()?;
         let recipient = ZcashAddress::try_from_encoded(&crate::vault::unified_receiver(
             recipient.to_raw_address_bytes(),
@@ -567,26 +578,48 @@ impl VaultWallet {
             Some(amount) => {
                 let payment = Payment::new(recipient, Some(amount), Some(memo), None, None, vec![])
                     .map_err(|e| format!("payment request: {e:?}"))?;
-                propose_transfer::<_, _, _, _, Infallible>(
-                    &mut self.db,
-                    &self.network,
-                    account,
-                    &GreedyInputSelector::new(),
-                    &SingleOutputChangeStrategy::new(
-                        StandardFeeRule::Zip317,
+                let request = TransactionRequest::new(vec![payment])
+                    .map_err(|e| format!("payment request: {e:?}"))?;
+                let network = &self.network;
+                let propose = |db: &mut Database, policy, selection| {
+                    propose_transfer::<_, _, _, _, Infallible>(
+                        db,
+                        network,
+                        account,
+                        &GreedyInputSelector::new(),
+                        &SingleOutputChangeStrategy::new(
+                            StandardFeeRule::Zip317,
+                            None,
+                            ShieldedPool::Ironwood,
+                            DustOutputPolicy::default(),
+                        ),
+                        request.clone(),
+                        policy,
+                        &SpendPolicy::shielded_pools([ShieldedPool::Ironwood])
+                            .with_note_selection(selection),
                         None,
-                        ShieldedPool::Ironwood,
-                        DustOutputPolicy::default(),
-                    ),
-                    TransactionRequest::new(vec![payment])
-                        .map_err(|e| format!("payment request: {e:?}"))?,
-                    confirmations,
-                    &SpendPolicy::shielded_pools([ShieldedPool::Ironwood])
-                        .with_note_selection(NoteSelection::PreferConsolidation),
-                    None,
-                    None,
-                )
-                .map_err(|e| format!("fund payment: {e}"))?
+                        None,
+                    )
+                };
+                propose(&mut self.db, confirmations, NoteSelection::PreferConsolidation)
+                    .map_err(|error| {
+                        // The native host can sign only one input. Check whether lowering just
+                        // the confirmation depths would fund it, without reserving any notes.
+                        let covers_one_note = |db: &mut Database, policy| {
+                            propose(db, policy, NoteSelection::PreferSingle).is_ok_and(|proposal| {
+                                proposal.steps().first().shielded_inputs()
+                                    .is_some_and(|inputs| inputs.notes().len() == 1)
+                            })
+                        };
+                        if explain_wait && matches!(error, FundingError::InsufficientFunds { .. })
+                            && covers_one_note(&mut self.db, ConfirmationsPolicy::MIN)
+                            && !covers_one_note(&mut self.db, confirmations)
+                        {
+                            format!("Funds for this payment are waiting for confirmations. Incoming deposits need {} confirmations before they can be spent.", confirmations.untrusted())
+                        } else {
+                            format!("fund payment: {error}")
+                        }
+                    })?
             }
             None => propose_send_max_transfer::<_, _, _, Infallible>(
                 &mut self.db,
