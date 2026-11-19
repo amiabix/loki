@@ -86,6 +86,14 @@ export function pairingSecondsLeft(expires: number, now: number): number {
   return expires > now ? Math.ceil((expires - now) / 1000) : 0;
 }
 
+/** Whether this member asks LokiSigner's dialog to agree to a roster. Only a member with
+ *  LokiSigner's roster channel reports `roster_dialog` in its vault status (null while no dialog
+ *  is open); a headless member paired with this tab does not, and agrees on the page's request,
+ *  so the page shows it the code to compare as before. */
+export function comparesInLokiSigner(status: object): boolean {
+  return Object.hasOwn(status, "roster_dialog");
+}
+
 /** What a native member reads when LokiSigner recorded no agreement to a roster. `answered` is
  *  false when the request lost its connection before LokiSigner replied. The member's own error
  *  prefixes come from `agree` in poc/src/host/ceremony.rs. */

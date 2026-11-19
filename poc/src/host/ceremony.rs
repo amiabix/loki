@@ -816,9 +816,6 @@ pub(super) async fn agree(State(st): State<Shared>, Json(body): Json<Value>) -> 
             let (c, code) = agreement(data, pass, vault, &fingerprint, &roster_code, network)?;
             return record_agreement(data, pass, c, code);
         };
-        if st.roster_refused.lock().map_err(|e| e.to_string())?.contains(vault) {
-            return Err(ROSTER_CODES_DIFFER.into());
-        }
         let _asking = RosterAsking::claim(st, vault)?;
         let summary = {
             let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
@@ -867,8 +864,14 @@ const ROSTER_CHANGED: &str = "the vault setup changed while LokiSigner was askin
 struct RosterAsking<'a>(&'a super::state::AppState);
 
 impl<'a> RosterAsking<'a> {
+    /// Claims the dialog for `vault`, unless one is open or the member said its codes differ.
+    /// Both are checked under the `roster_asking` lock: a "Codes differ" is recorded before its
+    /// dialog's claim is released, so no request can open another dialog for that vault.
     fn claim(st: &'a super::state::AppState, vault: &str) -> Result<Self, String> {
         let mut asking = st.roster_asking.lock().map_err(|e| e.to_string())?;
+        if st.roster_refused.lock().map_err(|e| e.to_string())?.contains(vault) {
+            return Err(ROSTER_CODES_DIFFER.into());
+        }
         if asking.is_some() {
             return Err(ROSTER_ASKING.into());
         }
@@ -1754,6 +1757,41 @@ mod tests {
         lokisigner.answer.send(crate::host::RosterAnswer::Match).unwrap();
         assert_eq!(request.await.unwrap().0, StatusCode::OK);
         assert_eq!(load(&data, "pass", &vault).unwrap().roster_code.as_deref(), Some(code.as_str()));
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    /// A request that reaches the claim after another request's "Codes differ" opens no
+    /// dialog: the refusal is checked under the same lock as the open dialog.
+    #[tokio::test]
+    async fn a_refused_vault_cannot_claim_the_dialog() {
+        let data = std::env::temp_dir().join(format!("loki-roster-claim-{}", Uuid::new_v4()));
+        let (dialog, _lokisigner) = Dialog::new();
+        let st = member(&data, 3601, Some(dialog)).await;
+        let vault = hex::encode([4u8; 32]);
+        drop(RosterAsking::claim(&st, &vault).expect("an open vault claims the dialog"));
+        st.roster_refused.lock().unwrap().insert(vault.clone());
+        assert_eq!(RosterAsking::claim(&st, &vault).err().as_deref(), Some(ROSTER_CODES_DIFFER));
+        assert!(st.roster_asking.lock().unwrap().is_none(), "a refused claim left the dialog marked open");
+        assert!(RosterAsking::claim(&st, &hex::encode([5u8; 32])).is_ok(), "another vault may still ask");
+        std::fs::remove_dir_all(data).ok();
+    }
+
+    /// A profile locked while LokiSigner asks records nothing, even when the member then
+    /// chooses "Codes match".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_profile_locked_while_lokisigner_asks_records_nothing() {
+        let data = std::env::temp_dir().join(format!("loki-roster-locked-{}", Uuid::new_v4()));
+        let (dialog, lokisigner) = Dialog::new();
+        let st = member(&data, 3601, Some(dialog)).await;
+        let (vault, _) = complete_roster(&st, "Household", None).await;
+        let (fingerprint, code, _) = compare(&st, &vault).await;
+        let request = tokio::spawn(agree(State(st.clone()), agree_body(&vault, &fingerprint, &code)));
+        lokisigner.open();
+        *st.session.write().await = None;
+        lokisigner.answer.send(crate::host::RosterAnswer::Match).unwrap();
+        let reply = request.await.unwrap();
+        assert!(reply.1 .0["error"].as_str().unwrap().starts_with(ROSTER_CHANGED), "{}", reply.1 .0);
+        unrecorded(&st, &vault);
         std::fs::remove_dir_all(data).unwrap();
     }
 

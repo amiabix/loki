@@ -31,7 +31,7 @@ import {
   type PairingLink,
   type PendingApproval,
 } from "@/lib/api";
-import { invitePreview, nativeRosterRefusal, pairingSecondsLeft, paymentLabel, rememberedVaultSlot, rememberVaultSlot, verifyPhrase } from "@/lib/wallet-ui";
+import { comparesInLokiSigner, invitePreview, nativeRosterRefusal, pairingSecondsLeft, paymentLabel, rememberedVaultSlot, rememberVaultSlot, verifyPhrase } from "@/lib/wallet-ui";
 import { toggleTheme, useIsDark } from "@/lib/theme";
 import { useCeremonyStatus, usePayments, useStatus } from "@/lib/hooks";
 import type {
@@ -1091,7 +1091,9 @@ function CeremonyView({
         {cs.phase === "waiting_for_members" && (
           <WaitingForMembers invites={cs.invites ?? []} />
         )}
-        {cs.phase === "compare_roster" && signerKind() === "native" && (
+        {/* Only LokiSigner's roster channel reports `roster_dialog`; any other member, including
+            a headless one paired with this tab, compares the code shown here. */}
+        {cs.phase === "compare_roster" && comparesInLokiSigner(cs) && (
           <NativeCompareRoster
             creator={cs.invites !== undefined}
             vault={vault}
@@ -1103,7 +1105,7 @@ function CeremonyView({
             dialog={cs.roster_dialog ?? null}
           />
         )}
-        {cs.phase === "compare_roster" && signerKind() === "browser" && (
+        {cs.phase === "compare_roster" && !comparesInLokiSigner(cs) && (
           <CompareRoster
             creator={cs.invites !== undefined}
             vault={vault}
@@ -1322,7 +1324,7 @@ function CompareRoster({
   );
 }
 
-/** A native member compares the code in LokiSigner, which records agreement only when the
+/** A LokiSigner member compares the code in LokiSigner, which records agreement only when the
  *  member chooses "Codes match" there. This page never shows the code it was sent to compare. */
 function NativeCompareRoster({
   creator = false,

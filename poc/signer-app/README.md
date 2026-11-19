@@ -67,9 +67,11 @@ same setup document the signer checks in `dkg_begin`. The vault name comes from 
 invite, so it appears in its own box as one line, with control, invisible and line-breaking
 characters replaced.
 
-- **Codes match** (no keyboard shortcut) records the agreement and tells the creator.
-- **Codes differ** (the default) records nothing, and LokiSigner refuses that vault until it
-  restarts, so a page cannot reopen the dialog until the member gives in.
+- **Codes match** records the agreement and tells the creator.
+- **Codes differ** records nothing, and LokiSigner refuses that vault until it restarts, so a
+  page cannot reopen the dialog until the member gives in.
+- Neither button answers to Return, Space or any other key. The dialog takes focus when a page
+  asks, possibly while the member is typing elsewhere, so the member must click.
 - Closing the dialog or leaving it unanswered for 10 minutes records nothing; the member can
   ask again.
 

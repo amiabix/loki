@@ -161,7 +161,15 @@ private func nativeConfirmRoster(_ summary: UnsafePointer<CChar>?) -> Int32 {
         alert.accessoryView = stack
         alert.addButton(withTitle: "Codes differ")
         alert.addButton(withTitle: "Codes match")
-        alert.buttons[1].keyEquivalent = ""
+        // The dialog takes focus while the member may be typing elsewhere: Return, Space or any
+        // other key answers nothing, and the member must click. Lay out first, because
+        // NSAlert assigns its default button there.
+        alert.layout()
+        for button in alert.buttons {
+            button.keyEquivalent = ""
+            button.refusesFirstResponder = true
+        }
+        alert.window.defaultButtonCell = nil
         NSApp.activate(ignoringOtherApps: true)
         let timeout = Timer(timeInterval: rosterTimeout, repeats: false) { _ in NSApp.abortModal() }
         RunLoop.main.add(timeout, forMode: .modalPanel)

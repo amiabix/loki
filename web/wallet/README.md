@@ -54,9 +54,11 @@ update cannot silently retarget an existing paired tab. Create/join, review/appr
 co-signing use the existing typed device API. Logout locks the device; restart that member
 locally with its unlock file and pair with its new link. A web restart does not restart members.
 
-A native member compares the roster code in LokiSigner, not on this page: **Compare in
+A LokiSigner member compares the roster code in LokiSigner, not on this page: **Compare in
 LokiSigner** opens LokiSigner's dialog, and only its **Codes match** records the agreement
-(see `poc/signer-app/README.md`). After confirming the roster, a member stays on **Verify
+(see `poc/signer-app/README.md`). The page knows LokiSigner asks because the member's vault
+status reports `roster_dialog`. A headless member paired with this tab (`loki_member_app`,
+`LokiSigner serve`) does not, so the page shows it the code to compare, as it always did. After confirming the roster, a member stays on **Verify
 members** until the creator has all confirmations and publishes the relay session. Waiting
 for people has no key-generation timeout. A creator lock or temporary disconnect can be retried before key generation starts;
 an unlocked member restarted during that wait retains its confirmation. Once key generation
