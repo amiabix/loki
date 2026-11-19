@@ -34,6 +34,46 @@ pub type LocalNotice = std::sync::Arc<dyn Fn(&str, &str) + Send + Sync>;
 /// Without one, every payment is refused: HTTP or relay requests never approve on their own.
 pub type LocalApproval = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
+/// The member's answer when LokiSigner asks them to compare a vault's roster code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RosterAnswer {
+    /// "Codes match": every member sees the same code.
+    Match,
+    /// "Codes differ": this vault is refused until the app restarts.
+    Differ,
+    /// The dialog closed or timed out, or the request could not be shown. A retry may ask again.
+    NoAnswer,
+}
+
+/// The member's own comparison of a vault's roster code before key generation, asked on this
+/// device (the native app's dialog). Receives the summary `/api/agree` derives from the setup
+/// document as JSON. Only [`RosterAnswer::Match`] records agreement. Without one (headless),
+/// `/api/agree` trusts its caller to have compared the code.
+pub type LocalRosterConfirmation = std::sync::Arc<dyn Fn(&str) -> RosterAnswer + Send + Sync>;
+
+/// The longest untrusted line a native window shows, in characters.
+pub const UNTRUSTED_LINE_CHARS: usize = 40;
+
+/// Text another party chose, such as a vault name from the creator's invite, as one short line
+/// a native window can show. Control, invisible formatting, bidi and line or paragraph
+/// separator characters become U+FFFD, so the text cannot add lines, reorder the window's own
+/// wording or hide characters; it is cut to [`UNTRUSTED_LINE_CHARS`] characters and `…`.
+pub fn untrusted_line(text: &str) -> String {
+    let hidden = |c: char| {
+        c.is_control()
+            || matches!(c, '\u{00AD}' | '\u{061C}' | '\u{115F}' | '\u{1160}' | '\u{180E}'
+                | '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{206F}'
+                | '\u{3164}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}' | '\u{FFA0}'
+                | '\u{FFF9}'..='\u{FFFB}' | '\u{E0000}'..='\u{E007F}')
+    };
+    let mut line: String = text.chars().map(|c| if hidden(c) { '\u{FFFD}' } else { c })
+        .take(UNTRUSTED_LINE_CHARS).collect();
+    if text.chars().count() > UNTRUSTED_LINE_CHARS {
+        line.push('…');
+    }
+    line
+}
+
 /// The signer's [`ApprovalPolicy`](crate::signer::local::ApprovalPolicy): route each request
 /// to the member's local decision, and refuse when no approval channel is attached.
 pub fn approval_policy(
@@ -166,7 +206,8 @@ pub fn run(config: Config) -> Result<(), String> {
 }
 
 /// `fetched`: the configuration the native app fetched and the member confirmed; it is saved
-/// only once the profile unlocks.
+/// only once the profile unlocks. A member started here has no roster dialog: `/api/agree`
+/// trusts its caller to have compared the code. LokiSigner starts through `run_native`.
 pub fn run_local(
     config: Config,
     pass: Option<zeroize::Zeroizing<String>>,
@@ -174,7 +215,7 @@ pub fn run_local(
     approval: Option<LocalApproval>,
     fetched: Option<FetchedConfig>,
 ) -> Result<(), String> {
-    run_local_with(config, pass, notice, approval, fetched, |_| Ok(()))
+    run_local_with(config, pass, notice, approval, None, fetched, |_| Ok(()))
 }
 
 fn run_local_with<G>(
@@ -182,6 +223,7 @@ fn run_local_with<G>(
     pass: Option<zeroize::Zeroizing<String>>,
     notice: Option<LocalNotice>,
     approval: Option<LocalApproval>,
+    roster_confirmation: Option<LocalRosterConfirmation>,
     fetched: Option<FetchedConfig>,
     on_start: impl FnOnce(&state::Shared) -> Result<G, String>,
 ) -> Result<(), String> {
@@ -204,7 +246,7 @@ fn run_local_with<G>(
             .map_err(|e| format!("bind {addr}: {e}"))?;
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
         config.port = addr.port();
-        let state: state::Shared = std::sync::Arc::new(state::AppState { approval, fetched_config: fetched, ..state::AppState::new(config) });
+        let state: state::Shared = std::sync::Arc::new(state::AppState { approval, roster_confirmation, fetched_config: fetched, ..state::AppState::new(config) });
         let _scope = on_start(&state)?;
         registration::start(&state, pass, notice.as_ref()).await?;
         // Member-local output only. Paste into a local browser tab; never send to the coordinator.
@@ -263,6 +305,15 @@ mod tests {
         assert_eq!(shown["memo"], "rent");
         assert_eq!(shown["attempt"], hex::encode([3; 32]));
         assert_eq!(shown["sighash"], hex::encode([9; 32]));
+    }
+
+    #[test]
+    fn untrusted_text_becomes_one_short_line() {
+        assert_eq!(super::untrusted_line("Household"), "Household");
+        assert_eq!(super::untrusted_line("a\nb\r\u{7}\u{202e}c\u{2028}d\u{200b}"), "a\u{fffd}b\u{fffd}\u{fffd}\u{fffd}c\u{fffd}d\u{fffd}");
+        let long = "é".repeat(super::UNTRUSTED_LINE_CHARS + 5);
+        assert_eq!(super::untrusted_line(&long), format!("{}…", "é".repeat(super::UNTRUSTED_LINE_CHARS)));
+        assert_eq!(super::untrusted_line(&long[..2 * super::UNTRUSTED_LINE_CHARS]), "é".repeat(super::UNTRUSTED_LINE_CHARS));
     }
 
     #[test]

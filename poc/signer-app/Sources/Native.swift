@@ -3,7 +3,8 @@ import AppKit
 @_silgen_name("loki_member_app_pair")
 func loki_member_app_pair(_ launch: UnsafePointer<CChar>, _ pass: UnsafeMutablePointer<CChar>,
     _ notify: @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Void,
-    _ approve: @convention(c) (UnsafePointer<CChar>?) -> Int32) -> Int32
+    _ approve: @convention(c) (UnsafePointer<CChar>?) -> Int32,
+    _ confirmRoster: @convention(c) (UnsafePointer<CChar>?) -> Int32) -> Int32
 
 @_silgen_name("loki_member_app_pairing_target")
 func loki_member_app_pairing_target(_ launch: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
@@ -88,6 +89,90 @@ private func nativeApprove(_ summary: UnsafePointer<CChar>?) -> Int32 {
         timeout.invalidate()
     }
     return approved ? 1 : 0
+}
+
+/// An unanswered roster comparison is refused after this long; members compare by phone.
+private let rosterTimeout: TimeInterval = 600
+
+/// One line of another party's text, shown inside its own box and never as the app's wording.
+/// Rust already replaced control, invisible, bidi and line-breaking characters; this replaces
+/// any that still arrive, so the box holds one line in reading order.
+private func untrustedLine(_ text: String) -> NSTextField {
+    let hidden: Set<Unicode.GeneralCategory> = [.control, .format, .lineSeparator, .paragraphSeparator]
+    let line = String(String.UnicodeScalarView(text.unicodeScalars.map {
+        hidden.contains($0.properties.generalCategory) ? "\u{FFFD}" : $0
+    }))
+    let field = NSTextField(labelWithString: line)
+    field.isBordered = true
+    field.drawsBackground = true
+    field.backgroundColor = .textBackgroundColor
+    field.usesSingleLineMode = true
+    field.cell?.wraps = false
+    field.lineBreakMode = .byTruncatingTail
+    field.isSelectable = true
+    return field
+}
+
+/// The member's comparison of a vault's roster code, called by the member from a worker thread
+/// when the wallet asks to agree to a roster. The code is the one Rust derived from the setup
+/// document key generation will use. Returns 1 for an explicit "Codes match" and 2 for
+/// "Codes differ"; closing the dialog, a malformed request or the timeout return 0.
+private func nativeConfirmRoster(_ summary: UnsafePointer<CChar>?) -> Int32 {
+    guard let summary = summary,
+          let request = try? JSONSerialization.jsonObject(with: Data(String(cString: summary).utf8)) as? [String: Any],
+          let code = request["roster_code"] as? String,
+          code.range(of: "^[0-9]{4}( [0-9]{4}){5}$", options: .regularExpression) != nil,
+          let name = request["vault_name"] as? String,
+          let threshold = (request["threshold"] as? NSNumber)?.intValue,
+          let members = (request["members"] as? NSNumber)?.intValue,
+          let member = (request["member"] as? NSNumber)?.intValue,
+          let network = request["network"] as? String, ["regtest", "testnet"].contains(network)
+    else { return 0 }
+    var answer: Int32 = 0
+    DispatchQueue.main.sync {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Do the roster codes match?"
+        alert.informativeText = """
+            A vault needs \(threshold) of \(members) members to approve. You are member \(member). Network: \(network).
+
+            Compare the code below with every other member over a channel you already trust, \
+            such as a phone call or in person. Choose Codes match only if every member sees \
+            the same code. If any code differs, someone may have been swapped into this vault: \
+            choose Codes differ.
+
+            Unanswered requests are refused after \(Int(rosterTimeout / 60)) minutes.
+            """
+        let codeLabel = NSTextField(labelWithString: "Roster code")
+        codeLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        let codeField = NSTextField(labelWithString: code)
+        codeField.font = .monospacedDigitSystemFont(ofSize: 20, weight: .semibold)
+        codeField.isSelectable = true
+        let nameLabel = NSTextField(labelWithString: "Vault name, as the vault creator wrote it:")
+        nameLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        let nameField = untrustedLine(name)
+        let stack = NSStackView(views: [codeLabel, codeField, nameLabel, nameField])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 4
+        stack.setCustomSpacing(12, after: codeField)
+        stack.frame = NSRect(x: 0, y: 0, width: 420, height: 96)
+        nameField.widthAnchor.constraint(equalToConstant: 420).isActive = true
+        alert.accessoryView = stack
+        alert.addButton(withTitle: "Codes differ")
+        alert.addButton(withTitle: "Codes match")
+        alert.buttons[1].keyEquivalent = ""
+        NSApp.activate(ignoringOtherApps: true)
+        let timeout = Timer(timeInterval: rosterTimeout, repeats: false) { _ in NSApp.abortModal() }
+        RunLoop.main.add(timeout, forMode: .modalPanel)
+        switch alert.runModal() {
+        case .alertSecondButtonReturn: answer = 1
+        case .alertFirstButtonReturn: answer = 2
+        default: answer = 0
+        }
+        timeout.invalidate()
+    }
+    return answer
 }
 
 private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointer<CChar>?) {
@@ -222,7 +307,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         DispatchQueue.global(qos: .userInitiated).async {
             defer { _ = secret.withUnsafeMutableBytes { $0.initializeMemory(as: UInt8.self, repeating: 0) } }
             _ = request.withCString { request in
-                secret.withUnsafeMutableBufferPointer { pass in loki_member_app_pair(request, pass.baseAddress!, nativeNotice, nativeApprove) }
+                secret.withUnsafeMutableBufferPointer { pass in loki_member_app_pair(request, pass.baseAddress!, nativeNotice, nativeApprove, nativeConfirmRoster) }
             }
             DispatchQueue.main.async { self.running = false }
         }

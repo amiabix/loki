@@ -85,3 +85,16 @@ export function rememberedVaultSlot(profile: string | undefined, vault: string):
 export function pairingSecondsLeft(expires: number, now: number): number {
   return expires > now ? Math.ceil((expires - now) / 1000) : 0;
 }
+
+/** What a native member reads when LokiSigner recorded no agreement to a roster. `answered` is
+ *  false when the request lost its connection before LokiSigner replied. The member's own error
+ *  prefixes come from `agree` in poc/src/host/ceremony.rs. */
+export function nativeRosterRefusal(message: string, answered: boolean): string {
+  if (!answered) return "This page lost its connection to LokiSigner. If its dialog is still open, answer it there; this page moves on once you choose Codes match.";
+  if (message.startsWith("roster codes differ")) return "You chose Codes differ in LokiSigner, so it will not agree to this vault. Tell the creator and the other members: someone may have been swapped in. If you chose it by mistake, quit and reopen LokiSigner, pair this tab again, and compare once more.";
+  if (message.startsWith("roster code not confirmed")) return "LokiSigner's dialog closed or timed out before you answered, so nothing was recorded. Choose Compare in LokiSigner again when every member is ready to compare.";
+  if (message.startsWith("LokiSigner is already asking")) return "LokiSigner is already showing a roster code. Answer that dialog first.";
+  if (message.startsWith("the vault setup changed while LokiSigner was asking")) return "The vault's members changed while LokiSigner was asking, so nothing was recorded. Choose Compare in LokiSigner again to see the new code, and compare it with every member again.";
+  if (message === "roster code mismatch" || message === "roster fingerprint mismatch") return "The vault's members changed since this page loaded. Choose Compare in LokiSigner again to see the current code.";
+  return `LokiSigner recorded no agreement: ${message}`;
+}

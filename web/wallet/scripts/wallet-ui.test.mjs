@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { invitePreview, pairingSecondsLeft, paymentLabel, rememberedVaultSlot, rememberVaultSlot, verifyPhrase } from "../src/lib/wallet-ui.ts";
+import { invitePreview, nativeRosterRefusal, pairingSecondsLeft, paymentLabel, rememberedVaultSlot, rememberVaultSlot, verifyPhrase } from "../src/lib/wallet-ui.ts";
 
 const invite = { vault: "a".repeat(64), name: "Friends’ vault", members: 3, threshold: 2, slot: 2 };
 const encode = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
@@ -66,4 +66,15 @@ test("a pairing link counts down in whole seconds and is expired exactly at its 
   assert.equal(pairingSecondsLeft(expires, expires - 1), 1, "still live: never shown as 0:00 before it expires");
   assert.equal(pairingSecondsLeft(expires, expires), 0, "the coordinator drops the reservation at its deadline");
   assert.equal(pairingSecondsLeft(expires, expires + 5000), 0);
+});
+
+test("a native member's roster refusals say what to do next", () => {
+  const refusal = (message, answered = true) => nativeRosterRefusal(message, answered);
+  assert.match(refusal("roster codes differ: LokiSigner refuses this vault until it restarts"), /^You chose Codes differ/);
+  assert.match(refusal("roster code not confirmed in LokiSigner"), /closed or timed out .* nothing was recorded/);
+  assert.match(refusal("LokiSigner is already asking about a roster code"), /Answer that dialog first/);
+  assert.match(refusal("the vault setup changed while LokiSigner was asking; nothing was recorded: roster code mismatch"), /members changed while LokiSigner was asking/);
+  assert.match(refusal("roster code mismatch"), /changed since this page loaded/);
+  assert.match(refusal("anything", false), /lost its connection/);
+  assert.equal(refusal("profile is locked"), "LokiSigner recorded no agreement: profile is locked");
 });

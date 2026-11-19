@@ -39,6 +39,9 @@ export type CeremonyStatus = {
   fingerprint?: string;
   // The 24-digit roster code the member's own signer derives; agree must echo the one shown.
   roster_code?: string | null;
+  // LokiSigner's roster dialog for this vault (native members only): open, or the member chose
+  // "Codes differ" and it refuses the vault until it restarts.
+  roster_dialog?: "open" | "codes_differ" | null;
   invites?: InviteSlot[];
   // The creator counts all confirmations; a joining device records its own confirmation.
   confirmations?: number;

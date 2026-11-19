@@ -56,6 +56,30 @@ group viewing key and checks it against the local public metadata. If it cannot 
 vault's address, it shows an error and offers nothing to copy. Vault names are creator-supplied
 labels, not instructions from LokiSigner.
 
+## Roster code
+
+Before key generation every member compares the vault's 24-digit roster code with the others,
+so a coordinator cannot swap a member in. For a LokiSigner member the wallet page cannot agree
+to a roster by itself. When the member chooses **Compare in LokiSigner** on the wallet's
+**Verify members** step, LokiSigner shows "Do the roster codes match?" with the threshold,
+the member count, the member's slot, the network and the code. Rust derives the code from the
+same setup document the signer checks in `dkg_begin`. The vault name comes from the creator's
+invite, so it appears in its own box as one line, with control, invisible and line-breaking
+characters replaced.
+
+- **Codes match** (no keyboard shortcut) records the agreement and tells the creator.
+- **Codes differ** (the default) records nothing, and LokiSigner refuses that vault until it
+  restarts, so a page cannot reopen the dialog until the member gives in.
+- Closing the dialog or leaving it unanswered for 10 minutes records nothing; the member can
+  ask again.
+
+LokiSigner shows one roster dialog at a time. While it is open the member's other requests
+continue, and when the roster or the setup changed in the meantime the answer is refused.
+
+The headless member (`loki_member_app`, `LokiSigner serve`) has no screen. It keeps the earlier
+behaviour: `POST /api/agree` with the right code agrees, so it trusts whoever holds its session
+token to have compared the code with the other members.
+
 ## Signer configuration
 
 LokiSigner needs no terminal or flags. Its network, frostd relay, lightwalletd and the two

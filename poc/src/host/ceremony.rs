@@ -741,6 +741,12 @@ pub(super) async fn status(st: Shared, vault: String) -> Reply {
         if c.fingerprint.is_some() {
             value["roster_code"] = json!(setup_roster_code(&c, VaultNetwork::parse(&st.config.network)?).ok());
         }
+        // LokiSigner asks the member to compare the code; the page shows where that stands.
+        if st.roster_confirmation.is_some() {
+            let open = st.roster_asking.lock().map_err(|e| e.to_string())?.as_deref() == Some(vault.as_str());
+            let differ = st.roster_refused.lock().map_err(|e| e.to_string())?.contains(&vault);
+            value["roster_dialog"] = if differ { json!("codes_differ") } else if open { json!("open") } else { Value::Null };
+        }
         if c.my_slot == 1 {
             value["invites"] = json!(invitations(&c)?);
         }
@@ -778,6 +784,15 @@ fn spawn_dkg(st: Shared, vault: String, data: std::path::PathBuf, pass: Zeroizin
     });
 }
 
+/// `POST /api/agree`: this member agrees to the roster whose fingerprint and 24-digit code the
+/// request names, once setup has not started, the roster is fresh and both match.
+///
+/// With LokiSigner's roster channel attached ([`AppState::roster_confirmation`]), the request
+/// cannot agree by itself: LokiSigner shows the member the code derived here and only their
+/// "Codes match" records agreement. A headless member (`loki_member_app`, `LokiSigner serve`)
+/// has no screen and trusts its caller to have compared the code with the other members.
+///
+/// [`AppState::roster_confirmation`]: super::state::AppState::roster_confirmation
 pub(super) async fn agree(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
     let (Some(vault), Some(fingerprint), Some(roster_code)) =
         (body["vault"].as_str(), body["fingerprint"].as_str(), body["roster_code"].as_str())
@@ -794,36 +809,130 @@ pub(super) async fn agree(State(st): State<Shared>, Json(body): Json<Value>) -> 
     let work_vault = vault.clone();
     let work_st = st.clone();
     let reply = blocking(move || {
-        let _guard = work_st.ceremony.lock().map_err(|e| e.to_string())?;
-        let mut c = load(&work_data, &work_pass, &work_vault)?;
-        if c.dkg_started || c.error.is_some() {
-            return Err("DKG interrupted or already running; create a fresh vault if interrupted".into());
+        let (st, data, pass, vault) = (&work_st, &work_data, &work_pass, &work_vault);
+        let network = VaultNetwork::parse(&st.config.network)?;
+        let Some(confirm) = st.roster_confirmation.clone() else {
+            let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
+            let (c, code) = agreement(data, pass, vault, &fingerprint, &roster_code, network)?;
+            return record_agreement(data, pass, c, code);
+        };
+        if st.roster_refused.lock().map_err(|e| e.to_string())?.contains(vault) {
+            return Err(ROSTER_CODES_DIFFER.into());
         }
-        refresh_roster(&mut c)?;
-        if c.fingerprint.as_deref() != Some(&fingerprint) {
-            return Err("roster fingerprint mismatch".into());
+        let _asking = RosterAsking::claim(st, vault)?;
+        let summary = {
+            let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
+            let (c, code) = agreement(data, pass, vault, &fingerprint, &roster_code, network)?;
+            roster_summary(&c, network, &code)
+        };
+        // The member may take minutes to compare codes by phone: other requests need the
+        // ceremony lock meanwhile, so it is not held while LokiSigner asks.
+        let answer = confirm(&summary);
+        eprintln!("roster code: member {answer:?}");
+        match answer {
+            super::RosterAnswer::Match => {}
+            super::RosterAnswer::Differ => {
+                st.roster_refused.lock().map_err(|e| e.to_string())?.insert(vault.clone());
+                return Err(ROSTER_CODES_DIFFER.into());
+            }
+            super::RosterAnswer::NoAnswer => return Err(ROSTER_NOT_CONFIRMED.into()),
         }
-        let code = setup_roster_code(&c, VaultNetwork::parse(&work_st.config.network)?)?;
-        if code != roster_code {
-            return Err("roster code mismatch".into());
+        let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
+        if st.session.blocking_read().is_none() {
+            return Err(format!("{ROSTER_CHANGED}: profile is locked"));
         }
-        if c.my_slot != 1 {
-            peer_request(
-                "POST",
-                &format!("{}/api/agreed", c.creator_base_url),
-                Some(joiner_auth(&c)?),
-            )?;
-        }
-        c.agreed.insert(c.my_slot);
-        c.roster_code = Some(code);
-        save(&work_data, &work_pass, &c)?;
-        Ok(json!({"ok":true}))
+        // Everything is checked again: the member confirmed the code of the roster shown, and
+        // the request names that same code, so any change to the roster or the setup refuses.
+        let (c, code) = agreement(data, pass, vault, &fingerprint, &roster_code, network)
+            .map_err(|e| format!("{ROSTER_CHANGED}: {e}"))?;
+        record_agreement(data, pass, c, code)
     })
     .await;
     if reply.0 == StatusCode::OK {
         spawn_dkg(st, vault, data, pass);
     }
     reply
+}
+
+/// The member chose "Codes differ" in LokiSigner; it refuses this vault until it restarts.
+const ROSTER_CODES_DIFFER: &str = "roster codes differ: LokiSigner refuses this vault until it restarts";
+/// The LokiSigner dialog closed or timed out; a new request asks again.
+const ROSTER_NOT_CONFIRMED: &str = "roster code not confirmed in LokiSigner";
+/// LokiSigner already shows a roster dialog.
+const ROSTER_ASKING: &str = "LokiSigner is already asking about a roster code";
+/// The setup changed while LokiSigner asked; nothing was recorded.
+const ROSTER_CHANGED: &str = "the vault setup changed while LokiSigner was asking; nothing was recorded";
+
+/// Marks the one roster dialog LokiSigner shows, for as long as it is open.
+struct RosterAsking<'a>(&'a super::state::AppState);
+
+impl<'a> RosterAsking<'a> {
+    fn claim(st: &'a super::state::AppState, vault: &str) -> Result<Self, String> {
+        let mut asking = st.roster_asking.lock().map_err(|e| e.to_string())?;
+        if asking.is_some() {
+            return Err(ROSTER_ASKING.into());
+        }
+        *asking = Some(vault.to_owned());
+        Ok(Self(st))
+    }
+}
+
+impl Drop for RosterAsking<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut asking) = self.0.roster_asking.lock() {
+            *asking = None;
+        }
+    }
+}
+
+/// `agree`'s checks, under the ceremony lock: setup has not started, the roster is refreshed
+/// from the creator, and the request's fingerprint and code are this roster's. Returns the
+/// ceremony and the code of its setup document.
+fn agreement(
+    data: &Path, pass: &str, vault: &str, fingerprint: &str, roster_code: &str, network: VaultNetwork,
+) -> Result<(Ceremony, String), String> {
+    let mut c = load(data, pass, vault)?;
+    if c.dkg_started || c.error.is_some() {
+        return Err("DKG interrupted or already running; create a fresh vault if interrupted".into());
+    }
+    refresh_roster(&mut c)?;
+    if c.fingerprint.as_deref() != Some(fingerprint) {
+        return Err("roster fingerprint mismatch".into());
+    }
+    let code = setup_roster_code(&c, network)?;
+    if code != roster_code {
+        return Err("roster code mismatch".into());
+    }
+    Ok((c, code))
+}
+
+/// Tells the creator (a joiner only) and records this member's agreement and confirmed code.
+fn record_agreement(data: &Path, pass: &str, mut c: Ceremony, code: String) -> Result<Value, String> {
+    if c.my_slot != 1 {
+        peer_request(
+            "POST",
+            &format!("{}/api/agreed", c.creator_base_url),
+            Some(joiner_auth(&c)?),
+        )?;
+    }
+    c.agreed.insert(c.my_slot);
+    c.roster_code = Some(code);
+    save(data, pass, &c)?;
+    Ok(json!({"ok":true}))
+}
+
+/// What LokiSigner shows the member before they agree: the code of the setup document
+/// `dkg_begin` receives, and the vault it is for. The name comes from the creator's invite.
+fn roster_summary(c: &Ceremony, network: VaultNetwork, code: &str) -> String {
+    json!({
+        "vault_name": super::untrusted_line(&c.name),
+        "threshold": c.threshold,
+        "members": c.members,
+        "member": c.my_slot,
+        "network": network.label(),
+        "roster_code": code,
+    })
+    .to_string()
 }
 
 pub(super) async fn agreed(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
@@ -1389,6 +1498,7 @@ mod tests {
             assert_eq!(reply.0, StatusCode::OK);
         }
         let status = status(st.clone(), vault.clone()).await.1 .0;
+        assert!(status.get("roster_dialog").is_none(), "a headless member has no roster dialog");
         let fingerprint = status["fingerprint"].as_str().unwrap().to_owned();
         let code = status["roster_code"].as_str().unwrap().to_owned();
         // The code the signer derives in `dkg_begin` from the document `run_background` hands it.
@@ -1423,6 +1533,227 @@ mod tests {
         let testnet = setup_roster_code(&c, VaultNetwork::Testnet).unwrap();
         c.birth_height = Some(TESTNET_NU7_BIRTH + 2);
         assert_ne!(testnet, setup_roster_code(&c, VaultNetwork::Testnet).unwrap());
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    fn test_config(data: &Path, port: u16) -> Config {
+        Config {
+            data: data.to_owned(), port, network: "regtest".into(),
+            lightwalletd: None, transport: "local".into(), operator_bundle: None,
+            operator_key: None, enrollment_issuer: None, development_http: false,
+            token: "test".into(), frostd_url: "http://127.0.0.1:2744".into(),
+            peers: BTreeMap::new(),
+            registration: None, bind: "127.0.0.1".parse().unwrap(), advertise_url: None,
+            secure_element: "software".into(), nonce_witnesses: None, loopback_peers: false,
+        }
+    }
+
+    /// An unlocked member on `data`, with LokiSigner's roster dialog when `dialog` is given.
+    async fn member(data: &Path, port: u16, dialog: Option<crate::host::LocalRosterConfirmation>) -> Shared {
+        std::fs::create_dir_all(data).unwrap();
+        let st = std::sync::Arc::new(AppState { roster_confirmation: dialog, ..AppState::new(test_config(data, port)) });
+        *st.session.write().await = Some(Session { passphrase: Zeroizing::new("pass".into()), data: data.to_owned() });
+        st
+    }
+
+    /// LokiSigner's roster dialog, scripted: each summary it is asked about arrives on
+    /// `asked`, and it waits for the test's answer on `answer`.
+    struct Dialog {
+        asked: std::sync::mpsc::Receiver<String>,
+        answer: std::sync::mpsc::Sender<crate::host::RosterAnswer>,
+    }
+
+    impl Dialog {
+        fn new() -> (crate::host::LocalRosterConfirmation, Self) {
+            let (asked_tx, asked) = std::sync::mpsc::channel();
+            let (answer, answer_rx) = std::sync::mpsc::channel();
+            let answer_rx = std::sync::Mutex::new(answer_rx);
+            let confirm: crate::host::LocalRosterConfirmation = std::sync::Arc::new(move |summary: &str| {
+                asked_tx.send(summary.to_owned()).unwrap();
+                answer_rx.lock().unwrap().recv().unwrap_or(crate::host::RosterAnswer::NoAnswer)
+            });
+            (confirm, Self { asked, answer })
+        }
+
+        /// The summary of the dialog now open.
+        fn open(&self) -> Value {
+            serde_json::from_str(&self.asked.recv_timeout(Duration::from_secs(30)).expect("LokiSigner was not asked")).unwrap()
+        }
+
+        fn not_asked(&self) {
+            assert!(self.asked.try_recv().is_err(), "LokiSigner was asked");
+        }
+    }
+
+    /// A creator's 2-of-3 vault named `name` whose roster is complete. Returns the vault and
+    /// each joiner slot's invite.
+    async fn complete_roster(creator: &Shared, name: &str, joiner: Option<&Shared>) -> (String, BTreeMap<u16, String>) {
+        let created = create(State(creator.clone()), Json(json!({"name":name,"members":3,"threshold":2}))).await;
+        assert_eq!(created.0, StatusCode::OK, "{}", created.1 .0);
+        let vault = created.1 .0["vault"].as_str().unwrap().to_owned();
+        let mut invites = BTreeMap::new();
+        for slot in 2..=3u16 {
+            let code = created.1 .0["invites"].as_array().unwrap().iter()
+                .find(|item| item["slot"] == slot).unwrap()["code"].as_str().unwrap().to_owned();
+            invites.insert(slot, code.clone());
+            let reply = match (slot, joiner) {
+                (2, Some(joiner)) => join(State(joiner.clone()), Json(json!({"invite":code}))).await,
+                _ => {
+                    let invite: Invite = serde_json::from_slice(
+                        &base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&code).unwrap()).unwrap();
+                    let wire = WireIdentity::from_public(Identity::new(slot).public());
+                    enroll(State(creator.clone()),
+                        Json(json!({"vault":vault,"slot":slot,"token":invite.token,"identity":wire}))).await
+                }
+            };
+            assert_eq!(reply.0, StatusCode::OK, "{}", reply.1 .0);
+        }
+        (vault, invites)
+    }
+
+    /// The fingerprint and code `/api/status` gives the page, and the code the signer derives
+    /// in `dkg_begin` from the setup document `run_background` hands it.
+    async fn compare(st: &Shared, vault: &str) -> (String, String, String) {
+        let status = status(st.clone(), vault.to_owned()).await.1 .0;
+        assert_eq!(status["phase"], "compare_roster", "{status}");
+        let c = load(&st.config.data, "pass", vault).unwrap();
+        let (document, _) = setup_document(&c, VaultNetwork::Regtest).unwrap();
+        let validated = crate::member_state::ValidatedRoster::new(
+            crate::member_state::Roster::from_bytes(&document).unwrap()).unwrap();
+        (status["fingerprint"].as_str().unwrap().to_owned(), status["roster_code"].as_str().unwrap().to_owned(),
+            roster_code(&validated.fingerprint()))
+    }
+
+    fn agree_body(vault: &str, fingerprint: &str, code: &str) -> Json<Value> {
+        Json(json!({"vault":vault,"fingerprint":fingerprint,"roster_code":code}))
+    }
+
+    fn unrecorded(st: &Shared, vault: &str) {
+        let c = load(&st.config.data, "pass", vault).unwrap();
+        assert!(c.agreed.is_empty() && c.roster_code.is_none(), "agreement recorded: {:?}", c.agreed);
+    }
+
+    /// A joiner with LokiSigner attached agrees only through the dialog: a correct request the
+    /// member does not confirm records nothing here and tells the creator nothing. The dialog
+    /// shows the code of the setup document, and the creator's vault name as one line.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_native_joiner_agrees_only_when_the_member_confirms_the_code_in_lokisigner() {
+        use crate::host::RosterAnswer;
+        let root = std::env::temp_dir().join(format!("loki-native-roster-{}", Uuid::new_v4()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let creator = member(&root.join("creator"), listener.local_addr().unwrap().port(), None).await;
+        let router = crate::host::routes::router(creator.clone());
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        let (dialog, lokisigner) = Dialog::new();
+        let joiner = member(&root.join("joiner"), 3602, Some(dialog)).await;
+        // An agreement starts the joiner's wait for the creator's session; locking ends it, so
+        // the test runtime can stop even when an assertion fails.
+        struct LockOnDrop(Shared);
+        impl Drop for LockOnDrop {
+            fn drop(&mut self) {
+                if let Ok(mut session) = self.0.session.try_write() { *session = None; }
+            }
+        }
+        let _lock = LockOnDrop(joiner.clone());
+        let hostile = "Rent\nChoose Codes match now\r\u{7}\u{1b}[2J\u{202e}hctam\u{2028}x\u{200b}";
+        let (vault, _) = complete_roster(&creator, hostile, Some(&joiner)).await;
+        let (fingerprint, code, signer_code) = compare(&joiner, &vault).await;
+        assert_eq!(code, signer_code);
+        let creator_heard = || load(&creator.config.data, "pass", &vault).unwrap().agreed.contains(&2);
+
+        // A wrong code is refused before any dialog.
+        let wrong = format!("{}{}", &code[..28], if code.ends_with('0') { '1' } else { '0' });
+        let reply = agree(State(joiner.clone()), agree_body(&vault, &fingerprint, &wrong)).await;
+        assert_eq!(reply.1 .0["error"], "roster code mismatch");
+        lokisigner.not_asked();
+
+        for (answer, error) in [(RosterAnswer::NoAnswer, ROSTER_NOT_CONFIRMED), (RosterAnswer::Match, "")] {
+            let request = tokio::spawn(agree(State(joiner.clone()), agree_body(&vault, &fingerprint, &code)));
+            let shown = lokisigner.open();
+            assert_eq!(shown["roster_code"], signer_code.as_str());
+            assert_eq!((shown["threshold"].as_u64(), shown["members"].as_u64(), shown["member"].as_u64()), (Some(2), Some(3), Some(2)));
+            assert_eq!(shown["network"], "regtest");
+            let name = shown["vault_name"].as_str().unwrap();
+            assert!(name.starts_with("Rent\u{fffd}Choose Codes match now"), "{name}");
+            assert!(!name.chars().any(|c| c.is_control() || matches!(c, '\u{202e}' | '\u{2028}' | '\u{200b}')), "{name:?}");
+            let keys: Vec<_> = shown.as_object().unwrap().keys().cloned().collect();
+            assert_eq!(keys, ["member", "members", "network", "roster_code", "threshold", "vault_name"]);
+            lokisigner.answer.send(answer).unwrap();
+            let reply = request.await.unwrap();
+            if answer == RosterAnswer::Match {
+                assert_eq!(reply.0, StatusCode::OK, "{}", reply.1 .0);
+            } else {
+                assert_eq!(reply.1 .0["error"], error);
+                unrecorded(&joiner, &vault);
+                assert!(!creator_heard(), "the creator heard of an agreement the member did not confirm");
+            }
+        }
+        let c = load(&joiner.config.data, "pass", &vault).unwrap();
+        assert!(c.agreed.contains(&2));
+        assert_eq!(c.roster_code.as_deref(), Some(signer_code.as_str()));
+        assert!(creator_heard());
+        drop(_lock);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// While LokiSigner asks, the ceremony lock is free and a second request is refused without
+    /// a second dialog. A roster that changes while the dialog is open is refused even when
+    /// the member confirms the code shown.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_roster_dialog_holds_no_lock_asks_once_and_refuses_a_changed_roster() {
+        let data = std::env::temp_dir().join(format!("loki-roster-dialog-{}", Uuid::new_v4()));
+        let (dialog, lokisigner) = Dialog::new();
+        let st = member(&data, 3601, Some(dialog)).await;
+        let (vault, _) = complete_roster(&st, "Household", None).await;
+        let (fingerprint, code, _) = compare(&st, &vault).await;
+
+        let request = tokio::spawn(agree(State(st.clone()), agree_body(&vault, &fingerprint, &code)));
+        lokisigner.open();
+        assert!(st.ceremony.try_lock().is_ok(), "the ceremony lock is held while the member decides");
+        assert_eq!(status(st.clone(), vault.clone()).await.1 .0["roster_dialog"], "open");
+        let second = tokio::time::timeout(Duration::from_secs(10), agree(State(st.clone()), agree_body(&vault, &fingerprint, &code)))
+            .await.expect("a second request waited for a second dialog");
+        assert_eq!(second.1 .0["error"], ROSTER_ASKING);
+        lokisigner.not_asked();
+        // Slot 3's identity changes while the dialog is open.
+        let mut c = load(&data, "pass", &vault).unwrap();
+        c.slots.get_mut(&3).unwrap().identity = Some(WireIdentity::from_public(Identity::new(3).public()));
+        save(&data, "pass", &c).unwrap();
+        lokisigner.answer.send(crate::host::RosterAnswer::Match).unwrap();
+        let reply = request.await.unwrap();
+        assert!(reply.1 .0["error"].as_str().unwrap().starts_with(ROSTER_CHANGED), "{}", reply.1 .0);
+        unrecorded(&st, &vault);
+        assert!(status(st.clone(), vault.clone()).await.1 .0["roster_dialog"].is_null());
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    /// After "Codes differ" the vault is refused without asking until LokiSigner restarts; a
+    /// restarted LokiSigner asks again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn codes_differ_refuses_the_vault_until_lokisigner_restarts() {
+        let data = std::env::temp_dir().join(format!("loki-roster-differ-{}", Uuid::new_v4()));
+        let (dialog, lokisigner) = Dialog::new();
+        let st = member(&data, 3601, Some(dialog)).await;
+        let (vault, _) = complete_roster(&st, "Household", None).await;
+        let (fingerprint, code, _) = compare(&st, &vault).await;
+        let request = tokio::spawn(agree(State(st.clone()), agree_body(&vault, &fingerprint, &code)));
+        lokisigner.open();
+        lokisigner.answer.send(crate::host::RosterAnswer::Differ).unwrap();
+        assert_eq!(request.await.unwrap().1 .0["error"], ROSTER_CODES_DIFFER);
+        let again = tokio::time::timeout(Duration::from_secs(10), agree(State(st.clone()), agree_body(&vault, &fingerprint, &code)))
+            .await.expect("the refused vault opened a dialog again");
+        assert_eq!(again.1 .0["error"], ROSTER_CODES_DIFFER);
+        lokisigner.not_asked();
+        unrecorded(&st, &vault);
+        assert_eq!(status(st.clone(), vault.clone()).await.1 .0["roster_dialog"], "codes_differ");
+
+        let (dialog, lokisigner) = Dialog::new();
+        let restarted = member(&data, 3601, Some(dialog)).await;
+        let request = tokio::spawn(agree(State(restarted.clone()), agree_body(&vault, &fingerprint, &code)));
+        lokisigner.open();
+        lokisigner.answer.send(crate::host::RosterAnswer::Match).unwrap();
+        assert_eq!(request.await.unwrap().0, StatusCode::OK);
+        assert_eq!(load(&data, "pass", &vault).unwrap().roster_code.as_deref(), Some(code.as_str()));
         std::fs::remove_dir_all(data).unwrap();
     }
 

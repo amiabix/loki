@@ -142,6 +142,22 @@ pub extern "C" fn loki_signer_approval_selftest(approve: NativeApprove) -> i32 {
     }
 }
 
+/// The native app's roster dialog: receives the roster summary JSON `/api/agree` derived and
+/// returns 1 when the member chose "Codes match" and 2 when they chose "Codes differ".
+/// Anything else (closed, timed out, unreadable) is no answer, and nothing is recorded.
+pub type NativeConfirmRoster = extern "C" fn(*const std::ffi::c_char) -> i32;
+
+#[cfg(feature = "relay-communication")]
+fn native_roster_confirmation(confirm: NativeConfirmRoster) -> crate::host::LocalRosterConfirmation {
+    std::sync::Arc::new(move |summary| {
+        match std::ffi::CString::new(summary).map(|summary| confirm(summary.as_ptr())) {
+            Ok(1) => crate::host::RosterAnswer::Match,
+            Ok(2) => crate::host::RosterAnswer::Differ,
+            _ => crate::host::RosterAnswer::NoAnswer,
+        }
+    })
+}
+
 #[cfg(feature = "relay-communication")]
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -231,12 +247,13 @@ pub unsafe extern "C" fn loki_member_app_free(value: *mut std::ffi::c_char) {
 /// argv, a file or stdout. `launch` is the launch given to [`loki_member_app_configuration`]
 /// plus `"config"`, the configuration it returned and the member reviewed. `notify` presents
 /// recovery words and the local session link; `approve` asks the member to approve each
-/// payment before this device signs it.
+/// payment before this device signs it; `confirm_roster` asks the member to compare a vault's
+/// roster code before this device agrees to it.
 ///
 /// # Safety
 /// `launch` and `pass` must be live NUL-terminated UTF-8 strings for this call. `pass`
-/// must be writable: its bytes are zeroed immediately after copying into Rust. `notify`
-/// and `approve` must remain callable until the member stops and must copy strings before
+/// must be writable: its bytes are zeroed immediately after copying into Rust. `notify`,
+/// `approve` and `confirm_roster` must remain callable until the member stops and must copy strings before
 /// returning.
 #[cfg(feature = "relay-communication")]
 #[no_mangle]
@@ -245,6 +262,7 @@ pub unsafe extern "C" fn loki_member_app_pair(
     pass: *mut std::ffi::c_char,
     notify: extern "C" fn(*const std::ffi::c_char, *const std::ffi::c_char),
     approve: NativeApprove,
+    confirm_roster: NativeConfirmRoster,
 ) -> i32 {
     let notice: crate::host::LocalNotice = std::sync::Arc::new(move |kind, message| {
         if let (Ok(kind), Ok(message)) = (std::ffi::CString::new(kind), std::ffi::CString::new(message)) {
@@ -272,7 +290,8 @@ pub unsafe extern "C" fn loki_member_app_pair(
             Some(link) => crate::host::RegistrationConfig::pairing(&link, config.development_http)?,
             None => crate::host::RegistrationConfig::resume(&config.data, config.development_http)?,
         });
-        crate::host::run_native(config, pass, notice.clone(), native_approval(approve), fetched)
+        crate::host::run_native(config, pass, notice.clone(), native_approval(approve),
+            native_roster_confirmation(confirm_roster), fetched)
     }));
     match result {
         Ok(Ok(())) => 0,
@@ -291,7 +310,7 @@ mod native_pairing_tests {
         let launch = std::ffi::CString::new(r#"{"args":[]}"#).unwrap();
         extern "C" fn refuse(_: *const std::ffi::c_char) -> i32 { 0 }
         let mut pass = b"native passphrase\0".to_vec();
-        let code = unsafe { super::loki_member_app_pair(launch.as_ptr(), pass.as_mut_ptr().cast(), notice, refuse) };
+        let code = unsafe { super::loki_member_app_pair(launch.as_ptr(), pass.as_mut_ptr().cast(), notice, refuse, refuse) };
         assert_eq!(code, 1); // Invalid config fails before any Enclave operation.
         assert!(pass.iter().all(|b| *b == 0));
     }
@@ -314,6 +333,24 @@ mod native_pairing_tests {
         let value = serde_json::from_str(unsafe { std::ffi::CStr::from_ptr(reply) }.to_str().unwrap()).unwrap();
         unsafe { super::loki_member_app_free(reply) };
         value
+    }
+
+    /// Only the dialog's "Codes match" (1) agrees and only "Codes differ" (2) refuses the vault;
+    /// any other value is no answer. The dialog receives the summary unchanged.
+    #[test]
+    fn the_roster_dialog_answers_map_to_match_differ_or_no_answer() {
+        use crate::host::RosterAnswer;
+        extern "C" fn answer(summary: *const std::ffi::c_char) -> i32 {
+            let summary = unsafe { std::ffi::CStr::from_ptr(summary) }.to_str().unwrap();
+            serde_json::from_str::<serde_json::Value>(summary).unwrap()["answer"].as_i64().unwrap() as i32
+        }
+        let confirm = super::native_roster_confirmation(answer);
+        let ask = |value: i64| confirm(&serde_json::json!({ "answer": value }).to_string());
+        assert_eq!(ask(1), RosterAnswer::Match);
+        assert_eq!(ask(2), RosterAnswer::Differ);
+        for other in [0, 3, -1, 257] {
+            assert_eq!(ask(other), RosterAnswer::NoAnswer, "{other}");
+        }
     }
 
     /// The member confirms the link's coordinator before LokiSigner contacts it: the target
