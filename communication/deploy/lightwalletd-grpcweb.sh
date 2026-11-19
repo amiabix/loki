@@ -87,4 +87,5 @@ static_resources:
 YAML
 
 echo "lightwalletd gRPC-web front: http://${listen}  ->  https://${upstream}   (CORS origin: ${origin})"
-exec docker run --rm --network host -v "$conf:/etc/envoy/envoy.yaml:ro" envoyproxy/envoy:v1.31.2 -c /etc/envoy/envoy.yaml --log-level warn
+# --base-id: Envoys on one host network share a domain-socket namespace; one per listen port.
+exec docker run --rm --network host -v "$conf:/etc/envoy/envoy.yaml:ro" envoyproxy/envoy:v1.31.2 -c /etc/envoy/envoy.yaml --log-level warn --base-id "${listen##*:}"
