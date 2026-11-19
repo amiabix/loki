@@ -125,8 +125,9 @@ final class SignerPresence: NSObject {
 
     init(lock: @escaping () -> Void) {
         self.lock = lock
+        let anyInput = CGEventType(rawValue: UInt32.max)!
         timer = Timer(timeInterval: 5, repeats: true) { _ in
-            if CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .null) >= 15 * 60 {
+            if CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: anyInput) >= 15 * 60 {
                 lock()
             }
         }

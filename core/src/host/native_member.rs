@@ -103,6 +103,21 @@ pub(crate) fn request_stop() -> bool {
     }))
 }
 
+pub(super) fn check_signing(state: &Shared, poll_control: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    let locked = || "LokiSigner is locked".to_owned();
+    let stop = RUNNING.lock().ok().and_then(|running| {
+        running.as_ref().filter(|member| Arc::ptr_eq(&member.state, state)).map(|member| member.stop.clone())
+    }).ok_or_else(locked)?;
+    let check_unlocked = || {
+        let has_session = state.session.blocking_read().is_some();
+        if !has_session || stop.requested.load(Ordering::Acquire) { Err(locked()) } else { Ok(()) }
+    };
+    check_unlocked()?;
+    poll_control()?;
+    // The final call before the share is sent must catch a lock during the relay poll.
+    check_unlocked()
+}
+
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
 pub(super) fn authorize_key_recovery(data: &Path) {
     if let Ok(running) = RUNNING.lock() {
@@ -347,6 +362,25 @@ mod tests {
         ]).unwrap();
         settings.secure_element = "software".into();
         settings
+    }
+
+    #[test]
+    fn lock_during_final_signing_poll_refuses_share_before_session_clears() {
+        let _test = TEST_MEMBER.lock().unwrap();
+        let state = Arc::new(super::super::state::AppState::new(config(Path::new("unused"))));
+        *state.session.blocking_write() = Some(super::super::state::Session {
+            data: "unused".into(), passphrase: Zeroizing::new(PASS.into()),
+        });
+        let _scope = NativeScope::install(&state, Arc::default(), None).unwrap();
+        assert_eq!(check_signing(&state, || Ok(())), Ok(()));
+
+        assert_eq!(check_signing(&state, || {
+            assert!(request_stop());
+            // Shutdown has been requested, but the async runtime has not cleared the session.
+            assert!(state.session.blocking_read().is_some());
+            Ok(())
+        }), Err("LokiSigner is locked".into()));
+        assert!(check_signing(&state, || panic!("a stopped signer must not poll the relay")).is_err());
     }
 
     #[test]

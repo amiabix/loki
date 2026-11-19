@@ -24,9 +24,6 @@ enum SignerLog {
         guard line.count <= limit else { return }
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700])
-        var folder = stat()
-        guard lstat(directory.path, &folder) == 0, folder.st_mode & S_IFMT == S_IFDIR,
-              folder.st_uid == geteuid(), folder.st_mode & 0o077 == 0 else { return }
         guard let file = openLog() else { return }
         defer { try? file.close() }
         guard let size = try? file.seekToEnd() else { return }
@@ -39,6 +36,9 @@ enum SignerLog {
     }
 
     private static func openLog() -> FileHandle? {
+        var folder = stat()
+        guard lstat(directory.path, &folder) == 0, folder.st_mode & S_IFMT == S_IFDIR,
+              folder.st_uid == geteuid(), folder.st_mode & 0o077 == 0 else { return nil }
         let fd = open(current.path, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0o600)
         guard fd >= 0 else { return nil }
         var file = stat()

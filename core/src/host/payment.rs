@@ -1373,10 +1373,7 @@ fn payment_worker(
     // Signing mailboxes carry only protocol data. Check the separate, authenticated control
     // mailbox while waiting, with one throttled poll shared by the proposer and its coordinator.
     let poll = std::sync::Mutex::new((std::time::Instant::now() - Duration::from_millis(500), Ok(())));
-    let check_running = || {
-        if st.config.native && st.session.blocking_read().is_none() {
-            return Err("LokiSigner is locked".into());
-        }
+    let poll_control = || {
         let mut poll = poll.lock().map_err(|e| e.to_string())?;
         if poll.1.is_ok() && poll.0.elapsed() >= Duration::from_millis(500) {
             let _guard = st.payment.lock().map_err(|e| e.to_string())?;
@@ -1388,6 +1385,11 @@ fn payment_worker(
             poll.0 = std::time::Instant::now();
         }
         poll.1.clone()
+    };
+    let check_running = || {
+        #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+        if st.config.native { return super::native_member::check_signing(st, poll_control); }
+        poll_control()
     };
     let sign_member = || -> Result<(), String> {
         if st.config.native { check_running()?; }
