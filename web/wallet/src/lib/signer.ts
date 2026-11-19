@@ -52,6 +52,13 @@ export interface SignerModule {
   request<T = unknown>(path: string, body?: unknown): Promise<T>;
 }
 
+/** One vault's setup phase for `status?vault=` (the wallet's setup screen). The browser signer's
+ *  `join` resolves only once its vault is active, so any vault it does not report active is
+ *  still creating keys. */
+export function browserVaultStatus(vaults: { vault: string; active: boolean }[] | undefined, vault: string): { phase: "active" | "creating_keys" } {
+  return { phase: vaults?.some((v) => v.vault === vault && v.active) ? "active" : "creating_keys" };
+}
+
 // ─── the signer origin (iframe + postMessage) ────────────────────────────────
 
 /** The signer origin, fixed at build (NEXT_PUBLIC_SIGNER_ORIGIN); never overridable from the page.
@@ -137,7 +144,8 @@ function browserSigner(origin: string): SignerModule {
         const s = await call<{ profile: { id: string; name: string }; se: string; persisted: boolean | null; relay: string }>("status");
         // The signer's own vaults (OPFS). Refused while a join/payment holds the signer; the
         // next status poll fills them in.
-        const vaults = await call<unknown[]>("vaults").catch(() => undefined);
+        const vaults = await call<{ vault: string; active: boolean }[]>("vaults").catch(() => undefined);
+        if (args.vault) return browserVaultStatus(vaults, args.vault) as T;
         return { phase: "home", network: "testnet", secure_element: s.se, profile: s.profile, persisted: s.persisted, relay: s.relay, vaults } as T;
       }
       if (path === "lock") { await this.lock(); return {} as T; }
