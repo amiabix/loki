@@ -1,4 +1,4 @@
-![Loki](docs/images/hero.png)
+![Loki](docs/images/loki-social.png)
 
 > [!WARNING]
 > **Testnet only**, Loki is not ready for real funds and refuses mainnet, use disposable
@@ -74,7 +74,7 @@ The signer must be served from its own origin and the relays need CORS for it, s
 Every party dials out, secrets stay on member devices, and the shared services only ever
 see public or sealed data.
 
-![Loki architecture](docs/images/diagram-architecture.png)
+![Loki architecture](docs/images/architecture-overview.png)
 
 A payment, from proposal to broadcast:
 
