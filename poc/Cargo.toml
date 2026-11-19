@@ -5,10 +5,7 @@ edition = "2021"
 publish = false
 
 [workspace]
-members = ["harness", "wasm-spike", "loki-signer-core", "loki-signer-wasm"]
-# wasm-spike is excluded from default-members: `cargo build/test` from poc/ never
-# touches it, so the native build is unaffected. Build it explicitly with
-# `cargo build -p loki-wasm-spike --target wasm32-unknown-unknown`.
+members = ["harness", "loki-signer-core", "loki-signer-wasm"]
 default-members = [".", "harness"]
 
 # `staticlib` so the native signer app (poc/signer-app) can link the Rust signer and call
