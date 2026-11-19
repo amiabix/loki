@@ -74,11 +74,11 @@ The signer must be served from its own origin and the relays need CORS for it, s
 Every party dials out, secrets stay on member devices, and the shared services only ever
 see public or sealed data.
 
-![Loki architecture](docs/images/architecture-overview.png)
+![Loki architecture](docs/images/architecture-map.png)
 
 A payment, from proposal to broadcast:
 
-![A payment, from proposal to broadcast](docs/images/payment-overview.png)
+![A payment, from proposal to broadcast](docs/images/payment-sequence.png)
 
 Built on the Zcash Foundation's audited FROST crates and its `frostd` relay.
 
