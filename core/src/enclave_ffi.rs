@@ -293,6 +293,26 @@ pub extern "C" fn loki_member_app_stop() -> i32 {
     i32::from(crate::host::native_request_stop())
 }
 
+/// Install the native app's in-process sink for fixed diagnostic events only. The sink must
+/// be callable on any thread for the lifetime of the app; its string is borrowed per call.
+#[cfg(feature = "relay-communication")]
+#[no_mangle]
+pub extern "C" fn loki_member_app_set_log_sink(sink: extern "C" fn(*const std::ffi::c_char)) {
+    crate::host::native_set_log_sink(sink);
+}
+
+/// Native status is local only. Call from a worker and free the JSON with `loki_member_app_free`.
+/// # Safety
+/// `launch` must be a live NUL-terminated UTF-8 launch JSON string for this call.
+#[cfg(feature = "relay-communication")]
+#[no_mangle]
+pub unsafe extern "C" fn loki_member_app_status(launch: *const std::ffi::c_char) -> *mut std::ffi::c_char {
+    native_query(launch, "status", |launch| {
+        let config = crate::host::native_config_from_args(&launch.args)?;
+        Ok(crate::host::native_status(&config.data, config.development_http))
+    })
+}
+
 /// The coordinator origin and slot a pairing link names, checked without any network request.
 /// LokiSigner asks the member to confirm them before it contacts that coordinator. Returns
 /// `{"target": {"coordinator": "...", "slot": n}}` or `{"error": "..."}`; free it with

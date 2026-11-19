@@ -1344,6 +1344,11 @@ fn record_failure(st: &Shared, data: &Path, pass: &str, vault: &str, attempt: &s
     reason: Option<FailureReason>,
 ) {
     let Ok(mut p) = read_payment(data, pass, vault, attempt) else { return };
+    #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+    if st.config.native && matches!(p.phase.as_str(), "signing" | "ready" | "signed")
+        && !payment_dir(data, vault).is_ok_and(|dir| dir.exists(&refused_file(attempt))) {
+        super::native_member::emit_for(st, super::native_member::Event::PaymentFailed);
+    }
     match p.phase.as_str() {
         "signing" => {
             eprintln!("payment {attempt}: error in signing worker");
@@ -1478,36 +1483,46 @@ fn payment_worker(
     // mailbox while waiting, with one throttled poll shared by the proposer and its coordinator.
     let approval = st.config.native.then(|| Arc::new(ApprovalAttempt::named(v.name.clone())));
     let poll = std::sync::Mutex::new((std::time::Instant::now() - Duration::from_millis(500), Ok(())));
+    let poll_control = || {
+        if approval.is_some() && st.session.blocking_read().is_none() {
+            return Err("LokiSigner locked before signing finished".into());
+        }
+        if approval.as_ref().is_some_and(|approval| approval.ended().is_some()) {
+            return Err("payment attempt ended".into());
+        }
+        let mut poll = poll.lock().map_err(|e| e.to_string())?;
+        if poll.1.is_ok() && poll.0.elapsed() >= Duration::from_millis(500) {
+            let _guard = st.payment.lock().map_err(|e| e.to_string())?;
+            let _ = sync_control(&st.config.frostd_url, data, pass, vault, &v);
+            poll.1 = if let Some(approval) = &approval {
+                approval_still_running(st, data, pass, &p, approval)
+            } else {
+                let local = read_payment(data, pass, vault, attempt)?;
+                if local.phase == "signing" { Ok(()) }
+                else { Err(local.error.unwrap_or_else(|| "payment no longer signing".into())) }
+            };
+            poll.0 = std::time::Instant::now();
+        }
+        poll.1.clone()
+    };
     let check_running = || {
-        let result = (|| {
-            if approval.is_some() && st.session.blocking_read().is_none() {
-                return Err("LokiSigner locked before signing finished".into());
-            }
-            if approval.as_ref().is_some_and(|approval| approval.ended().is_some()) {
-                return Err("payment attempt ended".into());
-            }
-            let mut poll = poll.lock().map_err(|e| e.to_string())?;
-            if poll.1.is_ok() && poll.0.elapsed() >= Duration::from_millis(500) {
-                let _guard = st.payment.lock().map_err(|e| e.to_string())?;
-                let _ = sync_control(&st.config.frostd_url, data, pass, vault, &v);
-                poll.1 = if let Some(approval) = &approval {
-                    approval_still_running(st, data, pass, &p, approval)
-                } else {
-                    let local = read_payment(data, pass, vault, attempt)?;
-                    if local.phase == "signing" { Ok(()) }
-                    else { Err(local.error.unwrap_or_else(|| "payment no longer signing".into())) }
-                };
-                poll.0 = std::time::Instant::now();
-            }
-            poll.1.clone()
-        })();
+        #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+        let result = if st.config.native { super::native_member::check_signing(st, poll_control) } else { poll_control() };
+        #[cfg(not(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))))]
+        let result = poll_control();
         if let Some(approval) = &approval {
             if result.is_err() { approval.end(ApprovalEnd::Failed); }
             if result.is_ok() && approval.ended().is_some() { return Err("payment attempt ended".into()); }
         }
         result
     };
-    let sign_member = || sign_with_opened(st, data, pass, &p, &v, owned, &check_running, opened, approval.clone());
+    let sign_member = || -> Result<(), RoundError> {
+        if st.config.native { check_running()?; }
+        sign_with_opened(st, data, pass, &p, &v, owned, &check_running, opened, approval.clone())?;
+        #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+        if st.config.native { super::native_member::emit_for(st, super::native_member::Event::PaymentSigned); }
+        Ok(())
+    };
     let report = |error: &RoundError| {
         let _guard = st.payment.lock().unwrap();
         let mut message = String::from(error.clone());
@@ -1655,7 +1670,12 @@ fn sign_with_opened(
     let fresh_approval = attempt.clone().filter(|_| p.proposer != v.slot).map(|attempt| {
         let (st, p, v, tx) = (st.clone(), p.clone(), v.clone(), tx.clone());
         let (data, pass) = (data.to_owned(), Zeroizing::new(pass.to_owned()));
-        move || refresh_approval(&st, &data, &pass, &p, &v, &tx, &attempt)
+        move || {
+            let refresh = || refresh_approval(&st, &data, &pass, &p, &v, &tx, &attempt);
+            #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+            if st.config.native { return super::native_member::check_signing(&st, refresh); }
+            refresh()
+        }
     });
     let signer_network = match v.network {
         VaultNetwork::Regtest => Network::Regtest,

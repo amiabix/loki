@@ -31,6 +31,8 @@ pub(crate) use native_member::{disconnect_wallet_tabs, run_native, request_stop 
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
 pub(crate) use native_member::restore_running as native_restore_running;
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+pub(crate) use native_member::{set_log_sink as native_set_log_sink, status as native_status};
+#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
 pub(crate) use native_recovery::{clean_staging as native_clean_staging, profile_state as native_profile_state, restore_new as native_restore_new, REFUSED as NATIVE_RESTORE_REFUSED};
 #[cfg(feature = "relay-communication")]
 pub use nonce_witness::WitnessConfig;
@@ -347,29 +349,30 @@ fn run_local_with<G>(
         }).transpose()?;
         let state: state::Shared = std::sync::Arc::new(state::AppState { approval, roster_confirmation, fetched_config: fetched, wallet_tabs, ..state::AppState::new(config) });
         let _scope = on_start(&state)?;
-        let ready = registration::start(&state, pass, notice.as_ref()).await?;
-        if state.config.native {
-            if let Some(notice) = notice { notice(ready, ""); }
-        } else if let Some(notice) = notice {
-            notice(ready, &format!("http://{addr}/#{}", state.config.token));
-        } else if let Some(launch) = &state.config.registration {
-            println!("{} ({}) — Local pairing: http://{addr}/#{}", launch.name, state.config.data.display(), state.config.token);
-        } else {
-            println!("Signer: http://{addr}/#{}", state.config.token);
-        }
-        let server = axum::serve(listener, routes::router(state.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>());
+        let serve = async {
+            let ready = registration::start(&state, pass, notice.as_ref()).await?;
+            if state.config.native {
+                if let Some(notice) = notice { notice(ready, ""); }
+            } else if let Some(notice) = notice {
+                notice(ready, &format!("http://{addr}/#{}", state.config.token));
+            } else if let Some(launch) = &state.config.registration {
+                println!("{} ({}) — Local pairing: http://{addr}/#{}", launch.name, state.config.data.display(), state.config.token);
+            } else {
+                println!("Signer: http://{addr}/#{}", state.config.token);
+            }
+            axum::serve(listener, routes::router(state.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>())
+                .await.map_err(|e| format!("serve: {e}"))
+        };
         if let Some(stop) = stop {
-            // Drop the native runtime before the UI can set aside the profile. No HTTP
-            // request or signer worker may keep writing to the old profile after that.
+            // Clear the session before dropping the runtime: blocking workers check it to exit.
+            // The UI cannot restart or set aside the profile until those workers have drained.
             tokio::select! {
-                result = async { server.await } => result.map_err(|e| format!("serve: {e}")),
-                _ = stop.notified() => {
-                    *state.session.write().await = None;
-                    Ok(())
-                },
+                biased;
+                _ = stop.notified() => { routes::lock_session(&state).await; Ok(()) },
+                result = serve => result,
             }
         } else {
-            server.await.map_err(|e| format!("serve: {e}"))
+            serve.await
         }
     })
 }
