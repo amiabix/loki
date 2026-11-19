@@ -92,7 +92,7 @@ impl FetchedConfig {
 
 impl NativeConfig {
     /// The configuration a native launch with these arguments and pairing link would use.
-    /// Fetches from the coordinator for a pairing link, or for an unlock with nothing saved.
+    /// Fetches from the coordinator for a pairing link or when the saved settings need replacing.
     pub fn preview(args: &[String], pairing_url: Option<&str>) -> Result<Self, String> {
         Self::resolve(args, pairing_url, fetch)
     }
@@ -180,11 +180,13 @@ impl NativeConfig {
         let flag = |name: &str| value(args, name);
         let flags_complete = ["--network", "--frostd-url", "--nonce-witnesses"].iter().all(|name| flag(name).is_some())
             && (flag("--network").as_deref() == Some("regtest") || flag("--lightwalletd-url").is_some());
-        // A pairing link always fetches, so a new link refreshes the saved configuration. An
-        // unlock uses the saved one, and fetches only when none is saved and the flags lack a field.
+        // Refresh obsolete settings only from the pinned coordinator, even with complete flags.
+        // Otherwise, an unlock uses saved settings, and a pairing link always fetches.
         let fetched = match (&target, saved) {
+            (Some((coordinator, _)), Some((_, None))) => Some(fetch(coordinator)
+                .map_err(|_| "saved-endpoints-refresh-failed")?),
             (Some((coordinator, _)), _) if pairing_url.is_some() => Some(fetch(coordinator)?),
-            (_, Some((_, saved))) => return Self::merge(args, target, Some(saved), None, development_http),
+            (_, Some((_, Some(saved)))) => return Self::merge(args, target, Some(saved), None, development_http),
             (Some((coordinator, _)), None) if !flags_complete => Some(fetch(coordinator)?),
             _ => None,
         };
@@ -199,6 +201,8 @@ impl NativeConfig {
         let network = flag("--network").or_else(|| deployment.as_ref().map(|d| d.network.clone()));
         let frostd_url = flag("--frostd-url").or_else(|| deployment.as_ref().map(|d| d.frostd_url.clone()));
         let lightwalletd_url = flag("--lightwalletd-url").or_else(|| deployment.as_ref().and_then(|d| d.lightwalletd_url.clone()));
+        if let Some(url) = &frostd_url { endpoint(url, development_http, "frostd URL")?; }
+        if let Some(url) = &lightwalletd_url { endpoint(url, development_http, "lightwalletd URL")?; }
         let nonce_witnesses = match flag("--nonce-witnesses") {
             Some(path) => {
                 let witnesses = nonce_witness::read(Path::new(&path))?;
@@ -238,23 +242,26 @@ fn value(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
 }
 
+fn endpoint(url: &str, development_http: bool, what: &str) -> Result<(), String> {
+    if endpoint_has_path(url, development_http, what)? { return Err(format!("the {what} must not include a path")); }
+    Ok(())
+}
+
 /// Remote endpoints need TLS; loopback plaintext only in an explicit development launch. The
 /// URL is shown to the member, so whitespace, control characters and non-ASCII are refused
 /// (`Url::parse` would silently drop tabs and newlines), and the error never repeats it.
-fn endpoint(url: &str, development_http: bool, what: &str) -> Result<(), String> {
+fn endpoint_has_path(url: &str, development_http: bool, what: &str) -> Result<bool, String> {
     let refused = || format!("the {what} is not a plain HTTPS URL; loopback HTTP requires --development-http");
     if !url.is_ascii() || url.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control()) { return Err(refused()); }
     let parsed = reqwest::Url::parse(url).map_err(|_| refused())?;
     let loopback = matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
     // Check the spelling shown to the member: URL parsing can normalize a path to `/`.
     let authority_and_path = url[parsed.scheme().len()..].strip_prefix("://").ok_or_else(&refused)?;
-    let root_only = authority_and_path.find(['/', '\\']).is_none_or(|i| &authority_and_path[i..] == "/");
     if !parsed.username().is_empty() || parsed.password().is_some() || parsed.query().is_some() || parsed.fragment().is_some()
-        || !root_only
         || !(parsed.scheme() == "https" || (development_http && loopback && parsed.scheme() == "http")) {
         return Err(refused());
     }
-    Ok(())
+    Ok(authority_and_path.find(['/', '\\']).is_some_and(|i| &authority_and_path[i..] != "/"))
 }
 
 fn paired_coordinator(data: &Path, development_http: bool) -> Result<Option<(String, u32)>, String> {
@@ -270,14 +277,22 @@ fn read_saved(data: &Path) -> Result<Option<Saved>, String> {
     serde_json::from_slice(&raw).map(Some).map_err(|e| format!("saved signer configuration: {e}"))
 }
 
-fn load(data: &Path, development_http: bool) -> Result<Option<(String, Deployment)>, String> {
+/// Keep the origin pin even when legacy paths make the saved deployment unusable.
+fn load(data: &Path, development_http: bool) -> Result<Option<(String, Option<Deployment>)>, String> {
     let Some(saved) = read_saved(data)? else { return Ok(None) };
+    let has_path = |url, what| endpoint_has_path(url, development_http, what).map_err(|e| format!("saved signer configuration: {e}"));
+    let frostd_path = has_path(&saved.frostd_url, "frostd URL")?;
+    let lightwalletd_path = match &saved.lightwalletd_url {
+        Some(url) => has_path(url, "lightwalletd URL")?,
+        None => false,
+    };
+    if frostd_path || lightwalletd_path { return Ok(Some((saved.origin, None))); }
     let deployment = Deployment {
         network: saved.network, frostd_url: saved.frostd_url, lightwalletd_url: saved.lightwalletd_url,
         nonce_witnesses: nonce_witness::read(&data.join(WITNESSES))?,
     };
     deployment.check(development_http).map_err(|e| format!("saved signer configuration: {e}"))?;
-    Ok(Some((saved.origin, deployment)))
+    Ok(Some((saved.origin, Some(deployment))))
 }
 
 /// Save a configuration for `origin`. It must be the coordinator this profile is paired with,
@@ -616,6 +631,64 @@ mod tests {
         refreshed["frostdUrl"] = json!("https://frostd2.example");
         confirm(&data, "https://coordinator.example", refreshed);
         assert_eq!(NativeConfig::resolve(&plain, None, no_fetch).unwrap().frostd_url, "https://frostd2.example");
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
+    fn obsolete_saved_endpoint_paths_refresh_only_from_the_pinned_coordinator() {
+        let data = temp("obsolete-endpoint");
+        let (origin, reply) = mock_coordinator();
+        let plain = args(&data, &["--development-http"]);
+        let mut replacement = served();
+        replacement["frostdUrl"] = json!("https://new-frostd.example/");
+        replacement["lightwalletdUrl"] = json!("https://new-lwd.example:443");
+        for (field, url) in [("frostdUrl", "https://frostd.example/rpc"), ("lightwalletdUrl", "https://lwd.example:443/rpc")] {
+            let mut legacy = served();
+            legacy[field] = json!(url);
+            pair(&data, &origin, 7);
+            save(&data, &origin, &deployment(legacy)).unwrap();
+            let original = files(&data);
+
+            pair(&data, "https://other.example", 7);
+            let rejected = NativeConfig::resolve(&plain, None, |_| panic!("mismatched origin must not fetch")).err().unwrap();
+            assert!(rejected.contains("the saved configuration belongs to"), "{rejected}");
+            pair(&data, &origin, 7);
+
+            *reply.lock().unwrap() = Some((503, "coordinator unavailable".into()));
+            assert_eq!(NativeConfig::preview(&plain, None).err().as_deref(), Some("saved-endpoints-refresh-failed"));
+            *reply.lock().unwrap() = ok(replacement.clone());
+            let shown = NativeConfig::preview(&plain, None).unwrap();
+            assert_eq!((shown.coordinator.as_str(), shown.slot), (origin.as_str(), 7));
+            assert_eq!(shown.frostd_url, "https://new-frostd.example/");
+            assert_eq!(shown.lightwalletd_url.as_deref(), Some("https://new-lwd.example:443"));
+            let mut config = super::super::config_from_args(&plain).unwrap();
+            let fetched = shown.apply(&mut config, &plain, None).unwrap().unwrap();
+            assert!(files(&data) == original, "preview and apply must not save before unlock");
+
+            fetched.save_unlocked(&data).unwrap();
+            let saved = NativeConfig::resolve(&plain, None, |_| panic!("the replacement was saved")).unwrap();
+            assert_eq!(saved.frostd_url, "https://new-frostd.example/");
+            assert_eq!(saved.lightwalletd_url.as_deref(), Some("https://new-lwd.example:443"));
+        }
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
+    fn endpoint_paths_in_native_launch_flags_are_refused() {
+        let data = temp("flag-path");
+        let origin = "https://coordinator.example";
+        pair(&data, origin, 7);
+        save(&data, origin, &deployment(served())).unwrap();
+        for (flag, url, expected) in [
+            ("--frostd-url", "https://my-relay.example/rpc", "the frostd URL must not include a path"),
+            ("--lightwalletd-url", "https://my-lwd.example/rpc/..", "the lightwalletd URL must not include a path"),
+        ] {
+            let flagged = args(&data, &[flag, url]);
+            assert_eq!(NativeConfig::preview(&flagged, None).err().as_deref(), Some(expected));
+            let headless = super::super::config_from_args(&flagged).unwrap();
+            let parsed = if flag == "--frostd-url" { headless.frostd_url } else { headless.lightwalletd.unwrap() };
+            assert_eq!(parsed, url);
+        }
         std::fs::remove_dir_all(data).unwrap();
     }
 
