@@ -6,7 +6,7 @@
 # (`frostd -n -p 2744`) that sends NO CORS headers — a `fetch()` from the wallet origin to
 # http://127.0.0.1:2744 is blocked twice over (mixed content + CORS). The native
 # `FrostdTransport` dials out server-to-server, so it never hit this; the wasm transport
-# (`poc/wasm-transport`) runs IN the page and does.
+# (`core/wasm-transport`) runs IN the page and does.
 #
 # This runs Caddy as a TLS-terminating reverse proxy in front of the loopback frostd and
 # injects CORS for one site origin, including the OPTIONS preflight. `require_tls_off_loopback`

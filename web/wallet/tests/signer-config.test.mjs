@@ -5,7 +5,7 @@ import { signerConfigResponse, signerOrigin } from '../src/lib/signer-config.ts'
 
 const hex = (n) => n.toString(16).padStart(2, '0').repeat(32);
 const witness = (n, endpoint) => ({ endpoint, key: hex(n), run: hex(n + 1), mailbox: hex(n + 2), read: hex(n + 3) });
-// What poc/loki-signer-wasm/serve.mjs serves at /config.json.
+// What core/loki-signer-wasm/serve.mjs serves at /config.json.
 const served = () => ({
   walletOrigin: 'http://localhost:3001', frostdUrl: 'https://frostd.example', rpId: 'signer.example',
   nonceWitnesses: [witness(1, 'https://w1.example'), witness(5, 'https://w2.example')],

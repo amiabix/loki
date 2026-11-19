@@ -81,7 +81,7 @@ test('a frostd-only in-browser signer enrolls without an advertise_url, beside n
 });
 
 test('registration v2 matches the shared byte-for-byte Rust and Node fixture', () => {
-  const fixture = new URL('../../../poc/tests/fixtures/lokisigner-registration-v2.json', import.meta.url);
+  const fixture = new URL('../../../core/tests/fixtures/lokisigner-registration-v2.json', import.meta.url);
   const { enrollment, origin, challenge, expected } = JSON.parse(readFileSync(fixture, 'utf8'));
   assert.deepEqual(members.registrationMessage(enrollment, origin, challenge), Buffer.from(expected));
 });

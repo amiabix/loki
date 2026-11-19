@@ -295,8 +295,8 @@
   ],
   "binary_hashes": {
     "communication/target/debug/loki-relay-server": "aa29420c8a19f40f96a96e74e7184349eca3be998e49c2465157b06f50b2c3fb",
-    "poc/target/debug/loki_relay_member": "f699116d6a6550a11f38599d25c6dce88f12b39c2bed2d9bba4f6ae3a86a3fb0",
-    "poc/target/debug/loki_setup_member": "bd7eed347f8a88d130aa389ab662f2679dde213e36ea5c8ace3dce9f6e9fece8"
+    "core/target/debug/loki_relay_member": "f699116d6a6550a11f38599d25c6dce88f12b39c2bed2d9bba4f6ae3a86a3fb0",
+    "core/target/debug/loki_setup_member": "bd7eed347f8a88d130aa389ab662f2679dde213e36ea5c8ace3dce9f6e9fece8"
   },
   "date": "2026-10-10",
   "limits": {
@@ -1900,14 +1900,14 @@
     "communication/relay/tests/provisioning.rs": "25763865c4b0b2068a83ab4690bc231f0dbc2b2c4f2d7e68fe7f2923d8355289",
     "communication/relay/tests/store.rs": "beb9b81fcaaa2b9c4831b72695bdf030dc1a83fd4903337c29446fc56117737d",
     "communication/relay/tests/support/mod.rs": "639fa6a5c1211bf5e54d8717bdf9c9f49b3c04c7e218925bc4eaef890543e3fd",
-    "poc/Cargo.lock": "e9f59ce49f75e30210d691eaba13023ecb32f7857bb4d9bc29f2851ea7540577",
-    "poc/Cargo.toml": "f1edbada62a2badd87ea26e472ed89193aee8d0d814df4ae22f853a14b2b3985",
-    "poc/scripts/verify_relay_source_isolation.py": "6281be18ff77d901f89f9c5f7f740b610a3ca4a3313252f86707d0f7303b5ddb",
-    "poc/src/bin/loki_relay_member.rs": "3998524a7e20d8b2e106779325f7b634230883b3673715e39dd201ce986ca9fa",
-    "poc/src/relay_member/config.rs": "ca2e0064b488be5a131091236b30c01e4516835ff5ae9e8209a8d7349d5e6c26",
-    "poc/src/relay_member/exchange.rs": "c46eb11713e03f3901a25e402465597a3d5d9f1f094c90b9ff60b74059909b38",
-    "poc/src/relay_member/mod.rs": "f282eb93e278561076a58fe4733c625f4a45e6394390b56053774d44b4278291",
-    "poc/tests/relay_member.rs": "9d1f9269790e9b943fb4f79461e63884d33b4f7450a9cbc5437000430c71f7db"
+    "core/Cargo.lock": "e9f59ce49f75e30210d691eaba13023ecb32f7857bb4d9bc29f2851ea7540577",
+    "core/Cargo.toml": "f1edbada62a2badd87ea26e472ed89193aee8d0d814df4ae22f853a14b2b3985",
+    "core/scripts/verify_relay_source_isolation.py": "6281be18ff77d901f89f9c5f7f740b610a3ca4a3313252f86707d0f7303b5ddb",
+    "core/src/bin/loki_relay_member.rs": "3998524a7e20d8b2e106779325f7b634230883b3673715e39dd201ce986ca9fa",
+    "core/src/relay_member/config.rs": "ca2e0064b488be5a131091236b30c01e4516835ff5ae9e8209a8d7349d5e6c26",
+    "core/src/relay_member/exchange.rs": "c46eb11713e03f3901a25e402465597a3d5d9f1f094c90b9ff60b74059909b38",
+    "core/src/relay_member/mod.rs": "f282eb93e278561076a58fe4733c625f4a45e6394390b56053774d44b4278291",
+    "core/tests/relay_member.rs": "9d1f9269790e9b943fb4f79461e63884d33b4f7450a9cbc5437000430c71f7db"
   },
   "status": "verified",
   "toolchain": "Rust/Cargo 1.98.0"

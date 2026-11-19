@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Resume a local 2-of-3 Testnet ceremony against the owned loopback stack.
 
-Build poc/loki_setup_member with relay-communication and the communication
+Build core/loki_setup_member with relay-communication and the communication
 loki-owned-test-inputs release binary first. Private state stays in --root.
 """
 
@@ -79,7 +79,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path("/tmp/loki-testnet-hosted-ceremony"))
     parser.add_argument("--inputs", type=Path, default=Path("/tmp/loki-tn-inputs"))
-    parser.add_argument("--member-bin", type=Path, default=REPO / "poc/target/debug/loki_setup_member")
+    parser.add_argument("--member-bin", type=Path, default=REPO / "core/target/debug/loki_setup_member")
     parser.add_argument("--grant-bin", type=Path, default=REPO / "communication/target/release/loki-owned-test-inputs")
     args = parser.parse_args()
     root, inputs = args.root.resolve(), args.inputs.resolve()

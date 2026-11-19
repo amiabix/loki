@@ -29,7 +29,7 @@ root=$1
 deploy=$(cd "$(dirname "$0")" && pwd -P)
 workspace=$(cd "$deploy/.." && pwd -P)
 repo=$(cd "$workspace/.." && pwd -P)
-poc="$repo/poc"
+poc="$repo/core"
 web="$repo/web/wallet"
 
 frostd=${FROSTD_URL:-http://127.0.0.1:2744}
@@ -49,8 +49,8 @@ trap cleanup EXIT
 trap 'exit 1' INT TERM
 
 echo "== build =="
-( cd "$poc" && cargo build --release --locked --features relay-communication --bin loki_member_app )
-member_bin="$poc/target/release/loki_member_app"
+( cd "$core" && cargo build --release --locked --features relay-communication --bin loki_member_app )
+member_bin="$core/target/release/loki_member_app"
 ( cd "$web" && npm run build >/dev/null )
 
 echo "== coordinator on :$web_port =="

@@ -1,16 +1,16 @@
 # Build output
-poc/target/
+core/target/
 target/
 
 # Node modules for the G3 browser drills
-poc/g3/node_modules/
+core/g3/node_modules/
 
 # The demo's sandbox. Contains generated FROST key packages and nonce secrets for a
 # throwaway regtest account. Never commit it.
-poc/demo/.sandbox/
-poc/demo/.sandbox-server.lock
-poc/demo/.member-sandbox/
-poc/demo/.member-sandbox.lock
+core/demo/.sandbox/
+core/demo/.sandbox-server.lock
+core/demo/.member-sandbox/
+core/demo/.member-sandbox.lock
 
 # Any run state directory: member key packages, nonce secrets, note secrets.
 /tmp/loki-*

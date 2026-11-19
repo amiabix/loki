@@ -4,7 +4,7 @@
 // The wallet's seam to the in-browser signer.
 //
 // The signer (the Rust FROST core compiled to wasm, in a Web Worker, its share sealed in
-// OPFS) runs on its OWN origin — poc/loki-signer-wasm/serve.mjs — embedded here in an iframe.
+// OPFS) runs on its OWN origin — core/loki-signer-wasm/serve.mjs — embedded here in an iframe.
 // This page never holds the share, never runs the passkey PRF ceremony and never sees the
 // passphrase: those happen on the signer-origin page, which also shows the roster code and
 // every payment for the member to confirm. This file only exchanges public data with it over

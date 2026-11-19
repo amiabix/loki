@@ -25,14 +25,14 @@ slot=${2:-}
 
 deploy=$(cd "$(dirname "$0")" && pwd -P)
 repo=$(cd "$deploy/../.." && pwd -P)
-member_bin=${MEMBER_BIN:-$repo/poc/target/release/loki_member_app}
+member_bin=${MEMBER_BIN:-$repo/core/target/release/loki_member_app}
 frostd=${FROSTD_URL:-http://127.0.0.1:2744}
 frostd_host=${FROSTD_HOST:-omarchy}
 
 # 1. Build the member binary on first run.
 if [[ ! -x $member_bin && -z ${MEMBER_BIN:-} ]]; then
   echo "== building loki_member_app (first run, a few minutes) =="
-  ( cd "$repo/poc" && cargo build --release --features relay-communication --bin loki_member_app )
+  ( cd "$repo/core" && cargo build --release --features relay-communication --bin loki_member_app )
 fi
 [[ -x $member_bin ]] || { echo "member binary not found: $member_bin" >&2; exit 1; }
 

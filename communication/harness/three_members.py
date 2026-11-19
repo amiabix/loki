@@ -204,8 +204,8 @@ def check_isolation(owner, source, deadline):
 
 def prepare_existing(owner, source, ports, communication, poc, deadline):
     server = run.find_binary('loki-relay-server', workspace=communication)
-    member_bin = run.find_binary('loki_relay_member', workspace=poc)
-    setup_bin = run.find_binary('loki_setup_member', workspace=poc)
+    member_bin = run.find_binary('loki_relay_member', workspace=core)
+    setup_bin = run.find_binary('loki_setup_member', workspace=core)
     run.preflight_ports(ports)
     members, roster, hashes = copy_vault(source, owner.root)
     owner.configure(members, source, member_bin)
@@ -239,8 +239,8 @@ def prepare_existing(owner, source, ports, communication, poc, deadline):
 
 def prepare_hosted_existing(owner, source, runtime, communication, poc, deadline, offline_relay=None, signing_attempt=None):
     server = run.find_binary('loki-relay-server', workspace=communication)
-    member_bin = run.find_binary('loki_relay_member', workspace=poc)
-    setup_bin = run.find_binary('loki_setup_member', workspace=poc)
+    member_bin = run.find_binary('loki_relay_member', workspace=core)
+    setup_bin = run.find_binary('loki_setup_member', workspace=core)
     members, roster, hashes = copy_vault(source, owner.root, preserve_configuration=True)
     owner.configure(members, source, member_bin, extra_denied=(runtime,))
     run._mkdir(owner.root / 'relays')
@@ -462,7 +462,7 @@ def main(argv=None):
     if sys.platform != 'darwin' or not Path('/usr/bin/sandbox-exec').is_file():
         parser.error('This test requires macOS sandbox-exec; isolation is never silently disabled')
     source = args.vault_root.absolute()
-    communication, poc = run._default_workspaces()
+    communication, core = run._default_workspaces()
     harness_hashes = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
                       for path in (Path(__file__), Path(run.__file__))}
     owner = MemberEnvironments.create(args.run_root)

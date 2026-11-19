@@ -1,0 +1,152 @@
+[package]
+name = "loki-poc"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+members = ["harness", "loki-signer-core", "loki-signer-wasm"]
+default-members = [".", "harness"]
+
+# `staticlib` so the native signer app (core/signer-app) can link the Rust signer and call
+# its C-ABI (src/enclave_ffi.rs). `lib` keeps the normal crate/tests working.
+[lib]
+crate-type = ["lib", "staticlib"]
+
+# One Zakura family serves transaction construction, proving, scanning and FROST.
+[dependencies]
+# The extracted dependency-clean signer core. loki-poc re-exports its modules.
+loki-signer-core   = { path = "loki-signer-core" }
+orchard            = { package = "zakura-orchard", version = "=2.2.0" }
+zcash_primitives   = { package = "zakura-primitives", version = "=2.2.0" }
+pczt               = { package = "zakura-pczt", version = "=0.1.0-rc4", features = ["orchard", "signer", "io-finalizer", "prover", "spend-finalizer", "tx-extractor", "zcp-builder"] }
+reddsa_frost       = { package = "zakura-reddsa", version = "=2.2.0", features = ["frost"] }
+frost-core         = { version = "=3.0.0", features = ["serialization"] }
+frost-rerandomized = { version = "=3.0.0", features = ["serialization"] }
+pasta_curves       = { package = "zakura-pasta-curves", version = "=2.2.0" }
+group              = "0.14"
+incrementalmerkletree = "0.8.2"
+ff                 = "0.14"
+rand_core          = { version = "0.6", features = ["getrandom"] }
+# Transactions use rand_core 0.10; FROST 3.0.0 keeps its public 0.6 RNG API.
+rand_core_zp       = { package = "rand_core", version = "0.10" }
+rand_zp            = { package = "rand", version = "0.10" }
+# Deterministic nonce derivation for the Phase A binding tests. Test-only: a seeded
+# stream stands in for the OS RNG so a publication is reproducible.
+rand_chacha        = "0.3"
+blake2b_simd       = "1"
+blake3             = "1.8"
+zeroize            = "1"
+bip39              = { version = "2.2.2", default-features = false, features = ["std", "zeroize"] }
+zip32              = "=0.2.1"
+# At-rest encryption for member secrets (`MemberDir::write_sealed`). XChaCha20-Poly1305
+# is already in the graph via zcash_note_encryption, so only the KDF is new: Argon2id is
+# the one memory-hard password hash in wide review, and a passphrase needs a real KDF.
+# `default-features = false` keeps it to the raw `hash_password_into` entry point.
+chacha20poly1305   = "=0.10.1"
+hkdf               = "0.12"
+argon2             = { version = "0.5", default-features = false, features = ["alloc"] }
+ed25519-dalek      = { version = "2.2", features = ["rand_core"] }
+x25519-dalek       = { version = "2.0", features = ["static_secrets"] }
+hex                = "0.4"
+hpke               = { version = "=0.14.1", default-features = false, features = ["alloc", "getrandom", "x25519", "chacha"] }
+p256               = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+base64             = "0.22"
+ciborium           = "0.2"
+serde_json         = "1"
+icu_properties     = "2" # Unicode format characters in native vault labels (already used by URL handling).
+zcash_address = { package = "zakura-address", version = "=2.2.0" }
+zip321             = { package = "zakura-zip321", version = "=2.2.0" }
+zcash_protocol = { package = "zakura-protocol", version = "=2.2.0" }
+zcash_client_backend = { package = "zakura-client-backend", version = "=0.1.0-rc7", features = ["orchard", "sync", "lightwalletd-tonic-transport", "lightwalletd-tonic-tls-webpki-roots"] }
+zcash_client_sqlite = { package = "zakura-client-sqlite", version = "=0.1.0-rc7", features = ["orchard"] }
+zcash_keys = { package = "zakura-keys", version = "=2.2.0", features = ["orchard", "unstable-frost"] }
+rusqlite = { version = "=0.37.0", features = ["bundled-sqlcipher-vendored-openssl"] }
+async-trait = "0.1"
+tonic = { version = "0.14.6", features = ["transport", "tls-webpki-roots"] }
+rustls = { version = "0.23", features = ["aws_lc_rs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+# loki_member_app: the Rust HTTP coordinator (one per member); hyper/tower come in
+# transitively via tonic/reqwest.
+axum = "0.8"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# WS3 frostd transport: speak the audited relay's JSON-over-HTTP contract directly
+# (the 8 endpoints in `frostd/src/lib.rs`). xeddsa signs the login challenge exactly as
+# frostd verifies it. reqwest/uuid are already in the graph transitively; named here so
+# the transport module can use them as direct deps.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+serde = { version = "1", features = ["derive"] }
+xeddsa = "1"
+zcash_note_encryption = "0.4.2"
+# Only for the forbidden-pool tamper fixtures: these build a transparent / Sapling
+# PCZT component directly through the public `pczt::parse` constructors, which is the
+# only way to produce one (DeferredPcztBuilder has no transparent or Sapling methods).
+zcash_transparent = { package = "zakura-transparent", version = "=2.2.0" }
+sapling-crypto = { package = "zakura-sapling-crypto", version = "=2.2.0" }
+ciborium-io        = "0.2"
+
+[features]
+# Compile probes that reproduce the two blocked checkpoint-1 requirements.
+# Each FAILS TO COMPILE on purpose; the compiler error is the blocker report.
+probe-zip2005 = []
+# Apple Secure Enclave backend (macOS only): build.rs links enclave-spike/se_backend.swift.
+apple-enclave = ["loki-signer-core/apple-enclave"]
+setup-fault-injection = ["relay-communication"]
+relay-communication = []
+# Counts Argon2id derivations and prints `kdf_derivations=N` to stderr at exit.
+# Measurement only: never in builds used for timing or acceptance.
+kdf-stats = []
+
+# Caller-supplied alpha is threaded into the spend before rk is derived.
+[patch.crates-io]
+bip32 = { path = "vendor/bip32-0.6.0-pre.1" }
+zakura-orchard = { path = "vendor/zakura-orchard" }
+zakura-primitives = { path = "vendor/zakura-primitives" }
+
+[dependencies.loki-relay-client]
+path = "../communication/client"
+
+[dependencies.loki-relay-protocol]
+path = "../communication/protocol"
+
+[[bin]]
+# Hosted setup commands in one long-lived process per unlocked profile; see
+# `src/member_service.rs` for the stdin/stdout protocol.
+name = "loki_member_service"
+required-features = ["relay-communication"]
+
+[[bin]]
+# The per-member HTTP coordinator (axum): account + hosted vault ceremony + multi-party
+# payment, driving the audited library in-process. Served to the web UI. See `src/host/`.
+name = "loki_member_app"
+
+[[example]]
+# Test-only fixture: stands up owned development relay operators and issues grants
+# with fixed keys for the hosted app flow (`wallet/test_hosted_app_flow.py`).
+name = "hosted_ops"
+required-features = ["relay-communication"]
+
+[[example]]
+# Provisions the relay mailboxes behind the host's relay nonce witnesses.
+name = "provision_nonce_witnesses"
+required-features = ["relay-communication"]
+
+[[bin]]
+name = "loki_relay_member"
+path = "src/bin/loki_relay_member.rs"
+required-features = ["relay-communication"]
+
+[dependencies.sha2]
+version = "=0.10.9"
+
+[dev-dependencies]
+# loki-poc's own tests reach the signer core's `#[cfg(test)]` helpers (KDF cache test seam,
+# DkgState fixtures) that used to be same-crate. A dev-dependency enables `test-support`
+# only for the test build; a normal `cargo build` never compiles those helpers.
+loki-signer-core = { path = "loki-signer-core", features = ["test-support"] }
+
+# Dependencies (Argon2id, Pallas, halo2, ed25519, HPKE, SQLite) are optimized in dev
+# builds too; Loki's own crate keeps opt-level 0, debug assertions and fault injection.
+[profile.dev.package."*"]
+opt-level = 2

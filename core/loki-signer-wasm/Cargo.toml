@@ -1,0 +1,39 @@
+# wasm-bindgen bindings for the in-browser signer. A core workspace member (excluded
+# from default-members) so it inherits core's Cargo.lock and
+# [patch] vendored deps; native `cargo build`/`test` from core never build it. Build:
+# RUSTFLAGS='--cfg getrandom_backend="wasm_js"' wasm-pack build --dev --target web
+[package]
+name = "loki-signer-wasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+loki-signer-core = { path = "../loki-signer-core" }
+wasm-bindgen = "0.2"
+console_error_panic_hook = "0.1"
+serde_json = "1"
+hex = "0.4"
+uuid = "1"
+zeroize = "1"
+# XEdDSA signs the frostd login challenge inside wasm, so the relay secret never reaches JS.
+xeddsa = "1"
+rand = "0.10"
+# The co-signer candidate review (paymentCheck) parses the PCZT itself, like the native host.
+pczt = { package = "zakura-pczt", version = "=0.1.0-rc4", features = ["orchard"] }
+zcash_protocol = { package = "zakura-protocol", version = "=2.2.0" }
+serde = { version = "1", features = ["derive"] }
+orchard = { package = "zakura-orchard", version = "=2.2.0", default-features = false, features = ["std", "unstable-frost", "unstable-voting-circuits"] }
+
+[build-dependencies]
+# Same archiver probe secp256k1-sys uses, to know whether its C is linked (build.rs).
+cc = "1"
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+x25519-dalek = "2.0"
+# Dealer keys for the recovery-backup round-trip test; the same rand_core the core uses.
+rand_core = { version = "0.6", features = ["getrandom"] }

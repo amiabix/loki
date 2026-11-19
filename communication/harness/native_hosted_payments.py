@@ -5,7 +5,7 @@ import native_hosted as hosted
 from acceptance_resume import Actions, RpcTunnel, controller_lock, ssh_argv, ensure_manifest
 ROOT=hosted.ROOT
 TUNNEL=None
-POC=Path(__file__).resolve().parents[2]/'poc'
+POC=Path(__file__).resolve().parents[2]/'core'
 sys.path.insert(0,str(POC));from ths import THS
 CHAIN=None
 LOCAL_PAY=Path(os.environ['LOKI_PAYMENT_BIN']).resolve()

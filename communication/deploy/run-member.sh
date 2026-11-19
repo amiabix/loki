@@ -17,7 +17,7 @@
 # shared relay first, e.g.  ssh -N -L 2744:localhost:2744 omarchy
 #
 # Env:
-#   MEMBER_BIN   path to loki_member_app  (default <repo>/poc/target/release/loki_member_app)
+#   MEMBER_BIN   path to loki_member_app  (default <repo>/core/target/release/loki_member_app)
 #   DATA         member data dir          (default ./loki-member-<slot>)
 #   PORT         local member port        (default 3610 + slot)
 #   FROSTD_URL   frostd loopback url       (default http://127.0.0.1:2744)
@@ -36,7 +36,7 @@ slot=$2
 deploy=$(cd "$(dirname "$0")" && pwd -P)
 repo=$(cd "$deploy/../.." && pwd -P)
 
-member_bin=${MEMBER_BIN:-$repo/poc/target/release/loki_member_app}
+member_bin=${MEMBER_BIN:-$repo/core/target/release/loki_member_app}
 data=${DATA:-$PWD/loki-member-$slot}
 port=${PORT:-$((3610 + slot))}
 frostd=${FROSTD_URL:-http://127.0.0.1:2744}

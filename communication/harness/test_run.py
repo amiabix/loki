@@ -155,7 +155,7 @@ class HarnessOwnership(unittest.TestCase):
                                         target_dir='target', env=env), default)
 
     def test_poc_acceptance_profile_is_explicit_and_never_falls_back(self):
-        workspace = self.base / 'poc'
+        workspace = self.base / 'core'
         binary = workspace / 'target/release/member'
         binary.parent.mkdir(parents=True)
         binary.write_bytes(b'fixture')
@@ -511,7 +511,7 @@ class HarnessSetup(unittest.TestCase):
             context = run.prepare_certified_setup(
                 root, ports,
                 communication_workspace=repo / 'communication',
-                poc_workspace=repo / 'poc',
+                poc_workspace=repo / 'core',
                 timeout=30,
                 target_dir=str(build))
         except run.OwnershipError as error:
@@ -828,7 +828,7 @@ class OfflineDelivery(unittest.TestCase):
         parent.mkdir(exist_ok=True)
         result = run.run_acceptance(
             parent / uuid.uuid4().hex, _free_ports(),
-            communication_workspace=repo / 'communication', poc_workspace=repo / 'poc',
+            communication_workspace=repo / 'communication', poc_workspace=repo / 'core',
             timeout=300)
         report = result.public_report()
         self.assertEqual(report['result'], 'accepted')
@@ -864,7 +864,7 @@ class HarnessFaultEvidence(unittest.TestCase):
         with patch.dict(os.environ, {'PATH': str(self.base)}):
             return run._run_fault_scenario(
                 owner, 'missing_chunk', (39001, 39002, 39003),
-                time.monotonic() + 10, None, 'debug', repo / 'communication', repo / 'poc')
+                time.monotonic() + 10, None, 'debug', repo / 'communication', repo / 'core')
 
     def test_dispatch_executes_fixture_and_labels_injection(self):
         report = self.dispatch()
