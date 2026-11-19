@@ -1,4 +1,4 @@
-![Loki](docs/images/loki-banner.png)
+![Loki](docs/images/banner.png)
 
 > [!WARNING]
 > **Testnet only**, Loki is not ready for real funds and refuses mainnet, use disposable
@@ -74,11 +74,11 @@ The signer must be served from its own origin and the relays need CORS for it, s
 Every party dials out, secrets stay on member devices, and the shared services only ever
 see public or sealed data.
 
-![Loki architecture](docs/images/architecture.png)
+![Loki architecture](docs/images/diagram-architecture.png)
 
 A payment, from proposal to broadcast:
 
-![A payment, from proposal to broadcast](docs/images/payment-flow.png)
+![A payment, from proposal to broadcast](docs/images/diagram-payment.png)
 
 Built on the Zcash Foundation's audited FROST crates and its `frostd` relay.
 
