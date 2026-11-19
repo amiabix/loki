@@ -114,6 +114,9 @@ struct Payment {
     /// The mined transaction that spent this payment's note instead of its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     replaced_by: Option<String>,
+    /// The block that mined this payment's own transaction, while it is `confirmed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mined_height: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -935,13 +938,15 @@ fn reconcile(data: &Path, pass: &str, vault: &str, w: &mut VaultWallet) -> Resul
     for p in &before {
         let note = hex32(p.note_selection.first().ok_or("payment has no input note")?)?;
         let mut p = p.clone();
-        let mined = w.mined_spend(&note)?.map(|txid| txid.to_string());
+        let spend_id = w.mined_spend(&note)?;
+        let mined = spend_id.map(|txid| txid.to_string());
         // A reorg can drop the block that settled it: it is in flight again until a block
         // settles it anew (below) or its expiry passes.
         let settled_by = if p.phase == "confirmed" { &p.txid } else { &p.replaced_by };
         if matches!(p.phase.as_str(), "confirmed" | "replaced") && mined != *settled_by {
             p.phase = if p.txid.is_some() { "broadcast" } else { "failed" }.into();
             p.replaced_by = None;
+            p.mined_height = None;
             save_payment(data, pass, &p)?;
         }
         if !settled(&p) {
@@ -976,6 +981,13 @@ fn reconcile(data: &Path, pass: &str, vault: &str, w: &mut VaultWallet) -> Resul
                 p.phase = settle.into();
                 p.raw_tx = None;
                 p.signed_pczt = None;
+                save_payment(data, pass, &p)?;
+            }
+        }
+        // Also fills in payments confirmed before the height was kept.
+        if p.phase == "confirmed" && p.mined_height.is_none() {
+            if let Some(height) = spend_id.map(|txid| w.mined_height(txid)).transpose()?.flatten() {
+                p.mined_height = Some(height.into());
                 save_payment(data, pass, &p)?;
             }
         }
@@ -2147,7 +2159,7 @@ pub(super) async fn payments(
                 "can_send": !busy && (can_send(p) || finishing),
                 "sending": busy && finishing,
                 "can_replace": stuck(&data, &v, p, &all)?,
-                "replaces": p.replaces, "replaced_by": p.replaced_by,
+                "replaces": p.replaces, "replaced_by": p.replaced_by, "mined_height": p.mined_height,
                 "target_height": p.target_height, "expiry_height": p.expiry_height,
                 "signing_expiry": p.signing_expiry, "tx_expiry": held_tx_expiry(&v, p),
                 "error": p.error,
@@ -3449,6 +3461,7 @@ mod tests {
 
         reconcile(&data, "pass", &vault, &mut branch("mined", Some(mined))).unwrap();
         assert_eq!(read().phase, "confirmed");
+        assert_eq!(read().mined_height, Some(height + 1), "the block that mined it");
 
         // The block that mined it is reorged out; the new branch has no spend of the note.
         let mut w = branch("reorged", None);
@@ -3456,6 +3469,7 @@ mod tests {
         let reopened = read();
         assert_eq!(reopened.phase, "broadcast", "a payment whose spend a reorg dropped is not confirmed");
         assert_eq!(reopened.txid, Some(mined.to_string()));
+        assert_eq!(reopened.mined_height, None);
         let other = zcash_client_backend::wallet::LockOwner::new([99; 32]);
         assert!(
             w.reserve_inputs(other, &[notes[0].nullifier(&fvk).to_bytes()], height + 50).is_err(),
