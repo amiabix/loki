@@ -8,18 +8,19 @@ use std::collections::BTreeMap;
 
 use orchard::keys::FullViewingKey;
 use prost::Message;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use zcash_client_backend::{
     data_api::BlockMetadata,
     proto::compact_formats::CompactBlock,
     scanning::{scan_block, Nullifiers, ScanningKeys},
 };
 use zcash_keys::keys::UnifiedFullViewingKey;
+use zcash_primitives::block::BlockHash;
 
 use crate::network::VaultNetwork;
 
 /// One note the vault received.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Received {
     pub height: u32,
     pub txid: String,
@@ -106,6 +107,38 @@ impl ChainScan {
         Ok(())
     }
 
+    /// The scan state to persist: the vault's notes and the last block scanned. Holds the
+    /// vault's history, so the caller seals it.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let tip = self.prior.as_ref().map(|m| Tip {
+            height: m.block_height().into(),
+            hash: hex::encode(m.block_hash().0),
+            sapling: m.sapling_tree_size(),
+            orchard: m.orchard_tree_size(),
+            ironwood: m.ironwood_tree_size(),
+        });
+        let notes = self.notes.iter().map(|(nf, n)| (hex::encode(nf), n.clone())).collect();
+        serde_json::to_vec(&Saved { version: 1, birth: self.birth, tip, notes }).expect("scan state serializes")
+    }
+
+    /// Resume from [`Self::to_bytes`].
+    pub fn from_bytes(network: VaultNetwork, fvk: &FullViewingKey, saved: &[u8]) -> Result<Self, String> {
+        let saved: Saved = serde_json::from_slice(saved).map_err(|e| format!("scan state: {e}"))?;
+        if saved.version != 1 {
+            return Err(format!("scan state version {} is not supported", saved.version));
+        }
+        let mut scan = Self::new(network, fvk, saved.birth)?;
+        scan.prior = saved.tip.map(|t| -> Result<_, String> {
+            let hash: [u8; 32] = hex::decode(&t.hash).ok().and_then(|h| h.try_into().ok()).ok_or("scan state: bad block hash")?;
+            Ok(BlockMetadata::from_parts(t.height.into(), BlockHash(hash), t.sapling, t.orchard, t.ironwood))
+        }).transpose()?;
+        for (nf, note) in saved.notes {
+            let nf: [u8; 32] = hex::decode(&nf).ok().and_then(|h| h.try_into().ok()).ok_or("scan state: bad nullifier")?;
+            scan.notes.insert(nf, note);
+        }
+        Ok(scan)
+    }
+
     /// Unspent Ironwood value, as `VaultWallet::ironwood_balance_zat` counts it.
     pub fn balance_zat(&self) -> u64 {
         self.notes.values().filter(|n| n.spent_in.is_none()).map(|n| n.value_zat).sum()
@@ -135,6 +168,12 @@ impl ChainScan {
         out
     }
 }
+
+#[derive(Serialize, Deserialize)]
+struct Tip { height: u32, hash: String, sapling: Option<u32>, orchard: Option<u32>, ironwood: Option<u32> }
+
+#[derive(Serialize, Deserialize)]
+struct Saved { version: u8, birth: u32, tip: Option<Tip>, notes: Vec<(String, Received)> }
 
 /// A compact transaction id as explorers show it (byte-reversed hex).
 fn tx_id(bytes: &[u8]) -> String {
@@ -213,5 +252,28 @@ mod tests {
         assert!(scan.scan(&block(H + 1, 0xa1, 0x55, vec![], 0)).is_err());
         assert!(scan.scan(&block(H + 2, 0xa2, 0xa0, vec![], 0)).is_err(), "a gap is refused");
         assert_eq!(scan.next_height(), H as u32 + 1);
+    }
+
+    #[test]
+    fn saved_state_resumes_where_it_stopped() {
+        let vault = fvk(1);
+        let zero = Nullifier::from_bytes(&[0u8; 32]).unwrap();
+        let (paid, to_vault) = action(&vault, Scope::External, 50_000, zero);
+        let mut scan = ChainScan::new(VaultNetwork::Testnet, &vault, H as u32).unwrap();
+        scan.scan(&block(H, 0xa0, 0x9f, vec![(0xaa, vec![to_vault])], 1)).unwrap();
+
+        let saved = scan.to_bytes();
+        let mut resumed = ChainScan::from_bytes(VaultNetwork::Testnet, &vault, &saved).unwrap();
+        assert_eq!(resumed.next_height(), H as u32 + 1);
+        assert_eq!(resumed.balance_zat(), 50_000);
+        assert_eq!(resumed.history(), scan.history());
+        // The spend in the next block is found from the restored notes.
+        let (_, change) = action(&vault, Scope::Internal, 39_000, paid.nullifier(&vault));
+        resumed.scan(&block(H + 1, 0xa1, 0xa0, vec![(0xbb, vec![change])], 2)).unwrap();
+        assert_eq!(resumed.balance_zat(), 39_000);
+        // A block that does not extend the saved tip is still refused.
+        let mut again = ChainScan::from_bytes(VaultNetwork::Testnet, &vault, &saved).unwrap();
+        assert!(again.scan(&block(H + 1, 0xa1, 0x55, vec![], 1)).is_err());
+        assert!(ChainScan::from_bytes(VaultNetwork::Testnet, &vault, b"not a scan").is_err());
     }
 }

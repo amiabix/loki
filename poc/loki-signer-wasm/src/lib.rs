@@ -609,6 +609,23 @@ impl Signer {
         scan.scan(block).map_err(|e| JsError::new(&e))
     }
 
+    /// Seal the scan state under the custody KEK and save it, so the next scan resumes here.
+    /// Pre-open `vaultPaths(vaultHex)` for write first.
+    #[wasm_bindgen(js_name = scanSave)]
+    pub fn scan_save(&self) -> Result<(), JsError> {
+        self.scan_save_impl().map_err(|e| JsError::new(&e))
+    }
+
+    /// Forget the scan state (memory and OPFS); the next `scanNext` starts at the vault birth.
+    /// For a chain that no longer extends the saved tip (a reorganization).
+    #[wasm_bindgen(js_name = scanReset)]
+    pub fn scan_reset(&mut self) -> Result<(), JsError> {
+        if let Some((id, _)) = self.scan.take() {
+            opfs_put(&scan_path(&id), &[], false).map_err(|e| JsError::new(&e))?;
+        }
+        Ok(())
+    }
+
     /// `{height, balance_zat, history}` from the blocks scanned so far.
     #[wasm_bindgen(js_name = scanResult)]
     pub fn scan_result(&self) -> Result<String, JsError> {
@@ -804,8 +821,14 @@ pub fn vault_paths(vault_hex: &str) -> String {
         format!("{dir}/share.sealed"),
         format!("{dir}/backup.sealed"),
         format!("{dir}/recovery.backup"),
+        format!("{dir}/scan.sealed"),
     ])
     .to_string()
+}
+
+/// The vault's sealed chain-scan state (`scanSave`).
+fn scan_path(vault_id: &[u8; 32]) -> String {
+    format!("{}/scan.sealed", vault_dir(&hex::encode(vault_id)))
 }
 
 /// OPFS-backed [`BackupDevice`]: the in-ceremony backup `LocalSigner::backup` saves and
@@ -1244,13 +1267,29 @@ impl Signer {
         Ok(hex::encode(share.serialize()))
     }
 
+    fn scan_save_impl(&self) -> Result<(), String> {
+        let (id, scan) = self.scan.as_ref().ok_or("call scanNext first")?;
+        let se = SoftwareSecureElement::from_kek(*self.kek.clone().ok_or("unlock the signer first")?);
+        opfs_put(&scan_path(id), &SealedShare::seal(&se, 0, &scan.to_bytes())?.to_bytes(), false)
+    }
+
     fn scan_next_impl(&mut self) -> Result<u32, String> {
         let vs = self.vault.as_ref().ok_or("open the vault first")?;
         if self.scan.as_ref().map(|(id, _)| *id) != Some(vs.vref.vault_id) {
             let roster = vs.signer.confirmed_roster().ok_or("this vault has no confirmed roster")?;
             let (_, fvk) = vs.signer.hosted_metadata().map_err(|e| e.to_string())?;
             let birth = roster.birth_height.unwrap_or(1);
-            self.scan = Some((vs.vref.vault_id, ChainScan::new(roster.network, &fvk, birth)?));
+            // Resume from this browser's sealed scan state, if a scan ran before.
+            // An empty file is a scan never saved, or reset (`scanReset`).
+            let saved = opfs_get(&scan_path(&vs.vref.vault_id))?.filter(|b| !b.is_empty());
+            let scan = match saved {
+                Some(sealed) => {
+                    let se = SoftwareSecureElement::from_kek(*self.kek.clone().ok_or("unlock the signer first")?);
+                    ChainScan::from_bytes(roster.network, &fvk, &SealedShare::from_bytes(&sealed)?.open(&se)?)?
+                }
+                None => ChainScan::new(roster.network, &fvk, birth)?,
+            };
+            self.scan = Some((vs.vref.vault_id, scan));
         }
         let (_, scan) = self.scan.as_ref().expect("set above");
         Ok(scan.next_height())

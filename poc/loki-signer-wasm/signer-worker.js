@@ -262,8 +262,21 @@ async function chainScan(signer, p) {
   if (!p.lightwalletdGrpcWeb) throw new Error("This signer has no lightwalletd gRPC-web endpoint configured, so it cannot read the chain");
   await openVault(signer, p.vaultHex);
   const tip = await latestHeight(p.lightwalletdGrpcWeb);
-  for (let next = signer.scanNext(); next <= tip; next = signer.scanNext()) {
-    for (const block of await blockRange(p.lightwalletdGrpcWeb, next, Math.min(tip, next + 499))) signer.scanBlock(block);
+  // Resumes from the sealed state the last scan saved (scanSave after each batch). A block that
+  // does not extend the saved tip means the chain reorganized: rescan once from the vault birth.
+  // ponytail: full rescan on any reorg; roll back a few blocks if vaults get old.
+  for (let rescanned = false; ;) {
+    try {
+      for (let next = signer.scanNext(); next <= tip; next = signer.scanNext()) {
+        for (const block of await blockRange(p.lightwalletdGrpcWeb, next, Math.min(tip, next + 499))) signer.scanBlock(block);
+        signer.scanSave();
+      }
+      break;
+    } catch (e) {
+      if (rescanned || !/extend|expected block/.test(String(e?.message ?? e))) throw e;
+      rescanned = true;
+      signer.scanReset();
+    }
   }
   return { tip, ...JSON.parse(signer.scanResult()) };
 }
