@@ -1,4 +1,4 @@
-![Loki](docs/images/hero.png)
+![Loki](docs/images/loki-social.png)
 
 > [!WARNING]
 > **Testnet only**, Loki is not ready for real funds and refuses mainnet, use disposable
