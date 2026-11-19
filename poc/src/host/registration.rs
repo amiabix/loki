@@ -107,6 +107,53 @@ struct Enrollment {
     authorization: String,
 }
 
+enum RegistrationFailure {
+    Other(String),
+    Connection(String),
+    Device(String),
+    Refused(String),
+    WrongSlot,
+}
+
+impl From<String> for RegistrationFailure {
+    fn from(error: String) -> Self { Self::Other(error) }
+}
+
+impl From<&str> for RegistrationFailure {
+    fn from(error: &str) -> Self { Self::Other(error.into()) }
+}
+
+impl std::fmt::Display for RegistrationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Other(e) | Self::Connection(e) | Self::Device(e) | Self::Refused(e) => f.write_str(e),
+            Self::WrongSlot => f.write_str("registered identity cannot change slot"),
+        }
+    }
+}
+
+// Only the coordinator's exact, bounded 400 refusal is a hint to reread its public roster.
+// No arbitrary response text is passed to the UI or treated as a slot number.
+async fn registration_response(mut response: reqwest::Response, step: &str, native: bool) -> Result<reqwest::Response, RegistrationFailure> {
+    if let Err(error) = response.error_for_status_ref() {
+        let error = format!("{step}: {error}");
+        if native && response.status() == reqwest::StatusCode::BAD_REQUEST {
+            let mut body = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(|_| RegistrationFailure::Refused(error.clone()))? {
+                if body.len() + chunk.len() > 1024 { return Err(RegistrationFailure::Refused(error)); }
+                body.extend_from_slice(&chunk);
+            }
+            if serde_json::from_slice::<serde_json::Value>(&body).ok().as_ref().is_some_and(|json|
+                matches!(json["error"].as_str(), Some("registered identity cannot change slot" | "registered identity cannot change slot or relay key"))) {
+                return Err(RegistrationFailure::WrongSlot);
+            }
+            return Err(RegistrationFailure::Refused(error));
+        }
+        return Err(RegistrationFailure::Connection(error));
+    }
+    Ok(response)
+}
+
 impl Enrollment {
     fn message(&self, origin: &str, challenge: &str) -> Vec<u8> {
         format!("loki-member-registration-v1\n{origin}\n{}\n{}\n{}\n{}\n{}\n{challenge}",
@@ -160,18 +207,18 @@ impl DeviceKey {
 }
 
 /// `pairing_claim`: the one-use claim from a pairing link, sent on the first attempt only.
-async fn register(config: &Config, pass: &str, pairing_claim: Option<&str>) -> Result<PublicMember, String> {
+async fn register(config: &Config, pass: &str, pairing_claim: Option<&str>, slot: Option<u32>, native: bool) -> Result<PublicMember, RegistrationFailure> {
     let launch = config.registration.as_ref().ok_or("self-registration not configured")?;
     // Loopback is the device-local browser endpoint, even with an HTTPS coordinator.
     let advertise_url = plain_origin(&config.base_url(), true)?;
     let identity = super::ceremony::identity(&config.data, pass, 1)?;
-    let device = DeviceKey::open(config, pass)?;
-    let device_pub = device.public()?;
+    let device = DeviceKey::open(config, pass).map_err(RegistrationFailure::Device)?;
+    let device_pub = device.public().map_err(RegistrationFailure::Device)?;
     let authorization = identity.authorize_device(&device_pub);
     // Reuse the device enrollment verifier; this profile's identity authorizes the device.
     DeviceRegistry::new(identity.public().signing).enroll(&device_pub, &authorization)?;
     let enrollment = Enrollment {
-        slot: launch.slot, signing_pubkey: hex::encode(identity.public().signing),
+        slot, signing_pubkey: hex::encode(identity.public().signing),
         relay_pubkey: hex::encode(identity.public().encryption), advertise_url,
         device_pubkey: hex::encode(&device_pub), authorization: hex::encode(authorization),
     };
@@ -179,22 +226,24 @@ async fn register(config: &Config, pass: &str, pairing_claim: Option<&str>) -> R
         .timeout(std::time::Duration::from_secs(15)).build().map_err(|e| e.to_string())?;
     let mut claim = serde_json::to_value(&enrollment).map_err(|e| e.to_string())?;
     if let Some(challenge) = pairing_claim { claim["pairing_challenge"] = challenge.into(); }
-    let challenge: serde_json::Value = client.post(format!("{}/api/members/challenge", launch.coordinator))
-        .json(&claim).send().await.and_then(|r| r.error_for_status()).map_err(|e| format!("registration challenge: {e}"))?
+    let response = client.post(format!("{}/api/members/challenge", launch.coordinator))
+        .json(&claim).send().await.map_err(|e| RegistrationFailure::Connection(format!("registration challenge: {e}")))?;
+    let challenge: serde_json::Value = registration_response(response, "registration challenge", native).await?
         .json().await.map_err(|e| e.to_string())?;
     let challenge = challenge["challenge"].as_str().filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
         .ok_or("invalid coordinator challenge")?;
     let message = enrollment.message(&launch.coordinator, challenge);
-    let signature = device.sign(&message)?;
+    let signature = device.sign(&message).map_err(RegistrationFailure::Device)?;
     verify_device_signature(&device_pub, &message, &signature)?;
     let mut body = serde_json::to_value(&enrollment).map_err(|e| e.to_string())?;
     body["challenge"] = challenge.into();
     body["signature"] = hex::encode(signature).into();
-    let reply: serde_json::Value = client.post(format!("{}/api/members", launch.coordinator))
-        .json(&body).send().await.and_then(|r| r.error_for_status()).map_err(|e| format!("self-registration: {e}"))?
+    let response = client.post(format!("{}/api/members", launch.coordinator))
+        .json(&body).send().await.map_err(|e| RegistrationFailure::Connection(format!("self-registration: {e}")))?;
+    let reply: serde_json::Value = registration_response(response, "self-registration", native).await?
         .json().await.map_err(|e| e.to_string())?;
     let member: PublicMember = serde_json::from_value(reply["member"].clone()).map_err(|e| e.to_string())?;
-    if member.slot == 0 || launch.slot.is_some_and(|s| s != member.slot) || member.signing_pubkey != enrollment.signing_pubkey
+    if member.slot == 0 || slot.is_some_and(|s| s != member.slot) || member.signing_pubkey != enrollment.signing_pubkey
         || member.relay_pubkey != enrollment.relay_pubkey || member.advertise_url != enrollment.advertise_url {
         return Err("coordinator returned a different identity".into());
     }
@@ -233,9 +282,16 @@ async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option
     let name = launch.name.clone();
     let secret = pass.clone();
     let restored = st.config.data.join(RESTORE_PENDING).is_file();
-    let session = tokio::task::spawn_blocking(move || {
-        if !crate::profile::exists(&data) { crate::profile::create(&data, &secret, &name)?; }
-        Session::unlock(data, secret).map(|(session, _)| session)
+    let native = st.recovery_in_app;
+    let session = tokio::task::spawn_blocking(move || -> Result<Session, String> {
+        if !crate::profile::exists(&data) {
+            if native { write_device_scope(&data)?; }
+            crate::profile::create(&data, &secret, &name)?;
+        }
+        Session::unlock(data, secret).map(|(session, _)| session).map_err(|e| {
+            if native && e == "sealed file failed authentication: wrong passphrase or tampered file" { "unlock".into() }
+            else { e }
+        })
     }).await.map_err(|e| e.to_string())??;
     if restored {
         // A published restore already adopted its words. Never mint different words for it,
@@ -266,25 +322,71 @@ async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option
         // The profile is already committed; registration can fail without losing the restore.
         if register_once(st, pass.clone(), None).await.is_ok() { return Ok("restore-ready"); }
         *st.registration_error.write().await = Some(RESTORE_RETRY.into());
+    } else if native {
+        // A native member must see a refusal or a local key failure, not a success link.
+        register_once(st, pass, launch.pairing_challenge.clone()).await.map_err(|e| {
+            eprintln!("native coordinator registration failed: {e}");
+            match e {
+                RegistrationFailure::Device(_) => "device-key",
+                RegistrationFailure::WrongSlot | RegistrationFailure::Refused(_) => "registration-refused",
+                RegistrationFailure::Connection(_) => "registration-failed",
+                RegistrationFailure::Other(_) => "native registration stopped",
+            }
+        })?;
+        return Ok("ready");
     }
     tokio::spawn(keep_registering(st.clone(), pass, restored));
     Ok(if restored { "restore-pending" } else { "ready" })
 }
 
 pub(super) const RESTORE_PENDING: &str = "restore-registration-pending";
+pub(super) const DEVICE_SCOPE: &str = "native-device-scope";
 const RESTORE_RETRY: &str = "Vault restored. LokiSigner could not reconnect to the coordinator yet; it will retry without your recovery words.";
 
+pub(super) fn write_device_scope(data: &std::path::Path) -> Result<(), String> {
+    let dir = MemberDir::create(data, "").map_err(|e| e.to_string())?;
+    dir.write_text(DEVICE_SCOPE, &uuid::Uuid::new_v4().to_string()).map_err(|e| e.to_string())
+}
+
 /// One registration attempt; on success the public roster entry is saved and served.
-async fn register_once(st: &Shared, pass: Zeroizing<String>, pairing_claim: Option<String>) -> Result<PublicMember, String> {
+async fn register_once(st: &Shared, pass: Zeroizing<String>, pairing_claim: Option<String>) -> Result<PublicMember, RegistrationFailure> {
     let launch = st.config.registration.as_ref().ok_or("self-registration not configured")?;
     let owned = st.clone();
-    let member = tokio::task::spawn_blocking(move || {
-        tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?
-            .block_on(register(&owned.config, &pass, pairing_claim.as_deref()))
+    let member = tokio::task::spawn_blocking(move || -> Result<_, RegistrationFailure> {
+        let config = &owned.config;
+        let native = owned.recovery_in_app;
+        let launch = config.registration.as_ref().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
+        #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+        if native && config.data.join(RESTORE_PENDING).is_file() {
+            let pinned = RegistrationConfig::resume(&config.data, config.development_http)?;
+            if pinned.coordinator != launch.coordinator || !config.data.join("identity.sealed").is_file() {
+                return Err("restored registration identity or coordinator missing".into());
+            }
+            let attempt = |slot| runtime.block_on(register(config, &pass, None, slot, native));
+            return match attempt(pinned.slot) {
+                Err(RegistrationFailure::WrongSlot) => {
+                    let identity = super::ceremony::identity(&config.data, &pass, 1)?.public();
+                    let roster = super::native_recovery::read_roster(&pinned.coordinator)?;
+                    let slot = super::native_recovery::restored_slot(&identity, &roster)?;
+                    if Some(slot) == pinned.slot || !config.data.join(RESTORE_PENDING).is_file() {
+                        return Err(RegistrationFailure::WrongSlot);
+                    }
+                    write_coordinator(&config.data, &pinned.coordinator, slot)?;
+                    attempt(Some(slot))
+                }
+                result => result,
+            };
+        }
+        runtime.block_on(register(config, &pass, pairing_claim.as_deref(), launch.slot, native))
     }).await.map_err(|e| e.to_string())??;
     save_coordinator(&st.config.data, &launch.coordinator, member.slot)?;
+    if st.recovery_in_app && st.config.data.join(RESTORE_PENDING).is_file() {
+        std::fs::remove_file(st.config.data.join(RESTORE_PENDING)).map_err(|e| e.to_string())?;
+    } else {
+        let _ = std::fs::remove_file(st.config.data.join(RESTORE_PENDING));
+    }
     *st.registration.write().await = Some(member.clone());
-    let _ = std::fs::remove_file(st.config.data.join(RESTORE_PENDING));
     Ok(member)
 }
 
@@ -303,7 +405,7 @@ async fn keep_registering(st: Shared, pass: Zeroizing<String>, restored: bool) {
                 return;
             }
             Err(e) => {
-                let e = if restored { RESTORE_RETRY.into() } else { e };
+                let e = if restored { RESTORE_RETRY.into() } else { e.to_string() };
                 eprintln!("coordinator registration failed, retrying in {}s (the local signer keeps running): {e}", wait.as_secs());
                 *st.registration_error.write().await = Some(e);
             }
@@ -321,6 +423,10 @@ pub(super) fn save_coordinator(data: &std::path::Path, origin: &str, slot: u32) 
         }
         return Ok(());
     }
+    write_coordinator(data, origin, slot)
+}
+
+fn write_coordinator(data: &std::path::Path, origin: &str, slot: u32) -> Result<(), String> {
     let saved = PairedCoordinator { origin: origin.into(), slot };
     let dir = MemberDir::create(data, "").map_err(|e| e.to_string())?;
     dir.write_text("paired-coordinator.json.tmp", &serde_json::to_string(&saved).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
@@ -508,6 +614,56 @@ mod tests {
         assert_eq!(saved.coordinator, "https://coordinator.example");
         assert_eq!(saved.slot, Some(1));
         save_coordinator(&data, "https://coordinator.example", 1).unwrap();
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[tokio::test]
+    async fn only_a_pending_native_restore_consults_the_roster_and_needs_one_match_for_both_keys() {
+        use axum::{http::StatusCode, routing::{get, post}, Json, Router};
+        use serde_json::json;
+        use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
+
+        let data = std::env::temp_dir().join(format!("loki-registration-repair-{}", uuid::Uuid::new_v4()));
+        let pass = "registration repair fixture";
+        std::fs::create_dir(&data).unwrap();
+        let identity = super::super::ceremony::identity(&data, pass, 1).unwrap().public();
+        let matched = json!({ "slot": 19, "signing_pubkey": hex::encode(identity.signing),
+            "relay_pubkey": hex::encode(identity.encryption), "advertise_url": "http://127.0.0.1:3601" });
+        let mut wrong_relay = matched.clone();
+        wrong_relay["relay_pubkey"] = json!("different relay key");
+        let roster = Arc::new(Mutex::new(vec![matched.clone()]));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let (r, count) = (roster.clone(), reads.clone());
+        let app = Router::new().route("/api/members", get(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            let members = json!({ "slots": *r.lock().unwrap() });
+            async { Json(members) }
+        })).route("/api/members/challenge", post(|| async {
+            (StatusCode::BAD_REQUEST, Json(json!({ "error": "registered identity cannot change slot or relay key" })))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        save_coordinator(&data, &origin, 7).unwrap();
+
+        for (native, pending, entries, expected_reads) in [
+            (true, false, vec![matched.clone()], 0),
+            (false, true, vec![matched.clone()], 0), // Headless refuses as before, without repinning.
+            (true, true, vec![wrong_relay], 1),
+            (true, true, vec![matched.clone(), matched], 2),
+        ] {
+            if pending { std::fs::write(data.join(RESTORE_PENDING), []).unwrap(); }
+            *roster.lock().unwrap() = entries;
+            let mut config = super::super::config_from_args(&["--data".into(), data.to_str().unwrap().into(),
+                "--port".into(), "3601".into(), "--development-http".into()]).unwrap();
+            config.registration = Some(RegistrationConfig::resume(&data, true).unwrap());
+            let state = Arc::new(super::super::state::AppState { recovery_in_app: native, ..super::super::state::AppState::new(config) });
+            let error = register_once(&state, Zeroizing::new(pass.into()), None).await.err().expect("refused enrollment");
+            if !native { assert!(error.to_string().starts_with("registration challenge:")); }
+            assert_eq!(reads.load(Ordering::SeqCst), expected_reads);
+            assert_eq!(RegistrationConfig::resume(&data, true).unwrap().slot, Some(7));
+            assert_eq!(data.join(RESTORE_PENDING).exists(), pending);
+        }
         std::fs::remove_dir_all(data).unwrap();
     }
 

@@ -2211,7 +2211,7 @@ mod tests {
         use crate::host::{native_recovery, registration, RegistrationConfig};
         use crate::signer::{backup, recovery::RecoveryKey};
         use axum::{routing::{get, post}, Json, Router};
-        use std::sync::{Arc, Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}};
+        use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
 
         let root = std::env::temp_dir().join(format!("loki-native-restore-{}", Uuid::new_v4()));
         let data = root.join("restored");
@@ -2235,9 +2235,8 @@ mod tests {
         wrong_relay["relay_pubkey"] = json!(hex::encode([78; 32]));
         let roster = Arc::new(Mutex::new(vec![wrong_relay.clone()]));
         let roster_reads = Arc::new(AtomicUsize::new(0));
-        let allow_registration = Arc::new(AtomicBool::new(false));
         let enrollment = Arc::new(Mutex::new(Vec::new()));
-        let (r, reads, allow, received) = (roster.clone(), roster_reads.clone(), allow_registration.clone(), enrollment.clone());
+        let (r, reads, received) = (roster.clone(), roster_reads.clone(), enrollment.clone());
         let app = Router::new()
             .route("/api/members", get(move || {
                 reads.fetch_add(1, Ordering::SeqCst);
@@ -2248,10 +2247,13 @@ mod tests {
                     "relay_pubkey": body["relay_pubkey"], "advertise_url": body["advertise_url"]}}))
             }))
             .route("/api/members/challenge", post(move |Json(body): Json<Value>| {
+                let slot = body["slot"].as_u64();
                 received.lock().unwrap().push(body);
-                let ok = allow.load(Ordering::SeqCst);
                 async move {
-                    if !ok { return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE); }
+                    use axum::http::StatusCode;
+                    if slot != Some(47) {
+                        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "registered identity cannot change slot"}))));
+                    }
                     Ok(Json(json!({"challenge": "ab".repeat(32)})))
                 }
             }));
@@ -2293,7 +2295,18 @@ mod tests {
             assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None), Err(refused));
             assert!(!data.exists(), "even a failure during installation must not publish the profile");
             settings.secure_element = "software".into();
+            crate::profile::create(&data, pass, "Mistaken new member").unwrap();
+            assert!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None).is_err());
+            native_recovery::set_aside(&data).unwrap();
+            std::fs::create_dir_all(data.join("profile")).unwrap();
+            std::fs::write(data.join("old-attempt.txt"), b"leftover").unwrap();
             native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None).unwrap();
+            assert!(!data.join("old-attempt.txt").exists());
+            let archives: Vec<_> = std::fs::read_dir(&root).unwrap().map(|e| e.unwrap().path())
+                .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("restored-set-aside-")).collect();
+            assert_eq!(archives.len(), 2);
+            assert!(archives.iter().any(|p| crate::profile::open(p, pass).is_ok()));
+            assert!(archives.iter().any(|p| std::fs::read(p.join("old-attempt.txt")).ok().as_deref() == Some(b"leftover")));
         });
         let old_pub = std::fs::read(data.join("recovery.pub")).unwrap();
         assert_eq!(old_pub, [key.public_bytes(), key.signing_public()].concat());
@@ -2303,14 +2316,13 @@ mod tests {
         let state = Arc::new(state);
         let notice: crate::host::LocalNotice = Arc::new(|_, _| panic!("restored profile must never mint new words"));
         let unlock = || Some(Zeroizing::new(pass.into()));
-        assert_eq!(registration::start(&state, unlock(), Some(&notice)).await.unwrap(), "restore-pending");
-        assert_eq!(state.registration_error.read().await.as_deref(), Some("Vault restored. LokiSigner could not reconnect to the coordinator yet; it will retry without your recovery words."));
         assert!(data.join(registration::RESTORE_PENDING).exists());
         assert!(crate::profile::exists(&data));
         assert!(state.registration.read().await.is_none());
 
         let s = state.clone();
         tokio::task::block_in_place(|| {
+            *s.session.blocking_write() = Some(crate::host::state::Session::unlock(data.clone(), Zeroizing::new(pass.into())).unwrap().0);
             let signer = crate::host::custody::open_signer(&s, &data, pass, &vault_hex, 1, Box::new(|_| false)).unwrap();
             assert_eq!(signer.hosted_metadata().unwrap().0.verifying_key(), public.verifying_key());
 
@@ -2343,19 +2355,19 @@ mod tests {
         // Restart from disk. Its saved coordinator/slot and local passphrase are enough.
         let mut resumed = config();
         resumed.registration = Some(RegistrationConfig::resume(&data, true).unwrap());
-        let resumed = Arc::new(AppState::new(resumed));
-        allow_registration.store(true, Ordering::SeqCst);
+        let resumed = Arc::new(AppState { recovery_in_app: true, ..AppState::new(resumed) });
+        roster.lock().unwrap().iter_mut().filter(|m| m["relay_pubkey"] == relay).for_each(|m| m["slot"] = json!(47));
         assert_eq!(registration::start(&resumed, unlock(), Some(&notice)).await.unwrap(), "restore-ready");
         let registered = resumed.registration.read().await.clone().unwrap();
-        assert_eq!(registered.slot, 31);
+        assert_eq!(registered.slot, 47);
+        assert_eq!(RegistrationConfig::resume(&data, true).unwrap().slot, Some(47));
         assert_eq!(registered.signing_pubkey, signing);
         assert_eq!(registered.relay_pubkey, relay);
         assert!(!data.join(registration::RESTORE_PENDING).exists());
         let sent = enrollment.lock().unwrap();
-        assert!(sent.len() >= 2);
+        assert_eq!(sent.iter().map(|request| request["slot"].as_u64().unwrap()).collect::<Vec<_>>(), [31, 47]);
         for request in sent.iter() {
             assert_eq!(request.as_object().unwrap().keys().collect::<Vec<_>>(), ["advertise_url", "authorization", "device_pubkey", "relay_pubkey", "signing_pubkey", "slot"]);
-            assert_eq!(request["slot"], 31);
         }
         std::fs::remove_dir_all(root).unwrap();
     }

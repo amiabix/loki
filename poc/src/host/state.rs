@@ -94,13 +94,34 @@ impl Config {
                 Some(path) => path.to_owned(),
                 None => dir.canonicalize().map_err(|e| format!("signer directory: {e}"))?,
             };
-            let mut tag = b"cash.loki.member.kek.v1:".to_vec();
-            tag.extend_from_slice(dir.as_os_str().as_encoded_bytes());
+            // The CLI's registration always unlocks from a file, unlike the native app.
+            let native = self.registration.as_ref().is_some_and(|r| r.passphrase_file.is_none());
+            let tag = apple_key_tag(&dir, native)?;
             return crate::signer::secure_element_apple::AppleSecureElement::persistent(&tag)
                 .map(HostedSecureElement::Apple);
         }
         SoftwareSecureElement::persistent(dir, pass).map(HostedSecureElement::Software)
     }
+}
+
+#[cfg(any(test, all(target_os = "macos", feature = "apple-enclave")))]
+fn apple_key_tag(dir: &Path, native: bool) -> Result<Vec<u8>, String> {
+    let mut tag = b"cash.loki.member.kek.v1:".to_vec();
+    tag.extend_from_slice(dir.as_os_str().as_encoded_bytes());
+    // Don't reuse an archived member's registration key. Legacy and vault keys retain
+    // the byte-for-byte original tag.
+    if native && dir.file_name().is_some_and(|name| name == "device-auth") {
+        match std::fs::read_to_string(dir.with_file_name(super::registration::DEVICE_SCOPE)) {
+            Ok(scope) => {
+                let scope = uuid::Uuid::parse_str(&scope).map_err(|_| "invalid native device key scope")?;
+                tag.push(0);
+                tag.extend_from_slice(scope.as_bytes());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(tag)
 }
 
 pub(super) enum HostedSecureElement {
@@ -213,6 +234,22 @@ pub type Shared = std::sync::Arc<AppState>;
 mod tests {
     use super::*;
     use crate::signer::secure_element::SealedShare;
+
+    #[test]
+    fn native_scope_changes_only_new_native_device_login_tags() {
+        let data = std::env::temp_dir().join(format!("loki-device-tag-{}", uuid::Uuid::new_v4()));
+        let device = data.join("device-auth");
+        let legacy = |path: &Path| format!("cash.loki.member.kek.v1:{}", path.display()).into_bytes();
+        assert_eq!(apple_key_tag(&device, true).unwrap(), legacy(&device));
+        super::super::registration::write_device_scope(&data).unwrap();
+        assert_eq!(apple_key_tag(&device, false).unwrap(), legacy(&device));
+        let vault = data.join("vaults/vault/signer");
+        assert_eq!(apple_key_tag(&vault, true).unwrap(), legacy(&vault));
+        let tag = apple_key_tag(&device, true).unwrap();
+        assert_ne!(tag, legacy(&device));
+        assert_eq!(apple_key_tag(&device, true).unwrap(), tag);
+        std::fs::remove_dir_all(data).unwrap();
+    }
 
     fn config(secure_element: &str) -> Config {
         Config {
