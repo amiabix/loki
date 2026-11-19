@@ -129,8 +129,9 @@ impl AppleSecureElement {
         Self::persistent(tag, state, true, None)
     }
 
-    /// Authorize this existing vault key for one payment. Dropping the handle invalidates
-    /// the context; it is never eligible for device login or returned to an app-wide cache.
+    /// Authorize this existing vault key for one payment or one viewing-key open.
+    /// Dropping the handle invalidates the context; it is never eligible for device login
+    /// or returned to an app-wide cache.
     pub fn open_payment(tag: &[u8], state: Option<&Path>, reason: &str) -> Result<Self, KeyFailure> {
         let reason = CString::new(reason).map_err(|_| KeyFailure::Other)?;
         Self::persistent(tag, state, false, Some(&reason))
@@ -234,6 +235,7 @@ mod tests {
     fn enclave_failures_have_fixed_member_messages() {
         assert_eq!(KeyFailure::from_code(-6), KeyFailure::Missing);
         assert_eq!(KeyFailure::from_code(-17), KeyFailure::Invalidated);
+        assert!(!KeyFailure::from_code(-11).is_gone(), "cancellation must not allow set-aside");
         for (code, expected) in [
             (-6, KEY_GONE),
             (-17, KEY_GONE),

@@ -179,7 +179,7 @@ impl NativeMember {
             };
             let slot = c.my_slot;
             let label = vault_label(&c.name);
-            let row = match self.address(data, pass, vault, slot) {
+            let row = match self.address(data, pass, vault, slot, &c.name) {
                 Ok((network, address)) => json!({ "name": label, "slot": slot, "network": network, "address": address }),
                 Err(error) => json!({ "name": label, "slot": slot, "error": error }),
             };
@@ -188,11 +188,14 @@ impl NativeMember {
         Ok(rows)
     }
 
-    fn address(&self, data: &Path, pass: &str, vault: &str, slot: u16) -> Result<(&'static str, String), &'static str> {
+    fn address(&self, data: &Path, pass: &str, vault: &str, slot: u16, name: &str) -> Result<(&'static str, String), &'static str> {
         // Don't migrate from vault.sealed or hold any host/cache lock over the Enclave prompt.
         let id = (vault.to_owned(), slot);
         let cached = self.viewing_keys.lock().map_err(|_| VAULT_ERROR)?.get(&id).cloned();
-        let opened = cached.map_or_else(|| SignerViewingKey::open(&self.state, data, pass, vault, slot), Ok);
+        let opened = cached.map_or_else(|| {
+            let reason = super::custody::vault_touch_id_reason(&self.state, "verify the receive address for", vault, Some(name));
+            SignerViewingKey::open(&self.state, data, pass, vault, slot, reason.as_deref())
+        }, Ok);
         // Read after any prompt, including when the store could not be opened for a legacy vault.
         let dir = ceremony::dir(data, vault).map_err(|_| VAULT_ERROR)?;
         let raw = Zeroizing::new(dir.read_sealed("vault.sealed", pass).map_err(|_| VAULT_ERROR)?);
@@ -293,7 +296,8 @@ mod tests {
                 assert!(!create);
                 Err(failure)
             });
-            assert_eq!(state.config.open_secure_element(&key_dir, PASS).err().as_deref(), Some(failure.message()));
+            let opened = state.config.open_secure_element_with_reason(&key_dir, PASS, Some("open a vault"));
+            assert_eq!(opened.err().as_deref(), Some(failure.message()));
             assert!(set_aside(&data, true).is_err(), "cannot archive a running profile");
             drop(scope);
             if !failure.is_gone() {
@@ -327,9 +331,14 @@ mod tests {
 
     #[test]
     fn addresses_require_the_signer_store_and_check_each_seal_even_after_caching() {
+        use super::super::state::scope_test::{Fixture, Scope};
+        use crate::signer::secure_element::SoftwareSecureElement;
         let _test = TEST_MEMBER.lock().unwrap();
         let data = std::env::temp_dir().join(format!("loki-addresses-{}", uuid::Uuid::new_v4()));
-        let state = Arc::new(crate::host::state::AppState::new(config(&data)));
+        let mut settings = config(&data);
+        settings.secure_element = "apple".into();
+        let state = Arc::new(crate::host::state::AppState::new(settings));
+        let fixture = Fixture::install(&data);
         let _native = NativeScope::install(&state, Arc::default(), None).unwrap();
         *state.session.blocking_write() = Some(crate::host::state::Session {
             passphrase: Zeroizing::new(PASS.into()), data: data.clone(),
@@ -373,7 +382,7 @@ mod tests {
 
         let signer_dir = super::super::ceremony::signer_dir(&data, &id_hex).unwrap();
         let store = SignerStore::create(&signer_dir, Network::Testnet, id, SLOT).unwrap();
-        let se = state.config.open_secure_element(&signer_dir, PASS).unwrap();
+        let se = SoftwareSecureElement::persistent(&signer_dir, PASS).unwrap();
         let raw = encode_share(&share.serialize().unwrap(), &public.serialize().unwrap(), &vs);
         store.write(&se, FileKind::Share, 0, &raw).unwrap();
         let correct = json!({ "name": "Shared reserve", "slot": SLOT, "network": "testnet", "address": expected });
@@ -429,6 +438,9 @@ mod tests {
         let rows = vault_addresses_with(|| *state.session.blocking_write() = None);
         assert_eq!(rows, Err("Unlock LokiSigner to view vault addresses."), "profile locked during listing");
         assert_eq!(vault_addresses(), Err("Unlock LokiSigner to view vault addresses."));
+        assert_eq!(fixture.scopes(), [Scope {
+            reason: Some("verify the receive address for vault “Shared reserve”".into()), unwraps: 1, closed: true,
+        }]);
         std::fs::remove_dir_all(data).unwrap();
     }
 

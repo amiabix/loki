@@ -31,7 +31,7 @@ private let algo = SecKeyAlgorithm.eciesEncryptionCofactorX963SHA256AESGCM
 // signature. The same Enclave key signs and wraps; no usage flag restricts it.
 private let sigAlgo = SecKeyAlgorithm.ecdsaSignatureMessageX962SHA256
 
-// Opaque handle table: Rust holds a u64, Swift owns the key and any payment authorization.
+// Opaque handle table: Rust holds a u64, Swift owns the key and any scoped authorization.
 private var table: [UInt64: (key: SecKey, biometry: Data?, payment: LAContext?)] = [:]
 private var nextHandle: UInt64 = 1
 private let lock = NSLock()
@@ -182,7 +182,7 @@ func setTestKeychain(lockPath: @escaping () -> String?,
                      lookup: @escaping (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus,
                      create: @escaping (Data) -> (SecKey?, Int), prove: @escaping (SecKey) -> Int,
                      biometry: @escaping () -> Biometry,
-                     authorizePayment: @escaping (SecKey, LAContext, String) -> Int = authorizePaymentKey) {
+                     authorizePayment: @escaping (SecKey, LAContext, LAAccessControlOperation, String) -> Int = authorizePaymentKey) {
     keychain = Keychain(lockPath: lockPath, lookup: lookup, create: create, prove: prove,
                         biometry: biometry, authorizePayment: authorizePayment)
 }
@@ -198,6 +198,7 @@ public func se_open_persistent(_ tagPtr: UnsafePointer<UInt8>, _ tagLen: Int,
     return openPersistent(tagPtr, tagLen, createIfMissing != 0, statePath, nil, outHandle)
 }
 
+// Also used for short-lived viewing-key opens; only the reason and handle lifetime differ.
 @_cdecl("se_open_payment")
 public func se_open_payment(_ tagPtr: UnsafePointer<UInt8>, _ tagLen: Int,
                             _ statePath: UnsafePointer<CChar>?, _ reason: UnsafePointer<CChar>,
@@ -239,12 +240,13 @@ private func openPersistent(_ tagPtr: UnsafePointer<UInt8>, _ tagLen: Int, _ cre
             let context = LAContext()
             var keep = false
             defer { if !keep { context.invalidate() } }
-            let authorized = keychain.authorizePayment(key, context, reason)
+            // Security's ECIES adaptor performs ECDH on the Enclave key, not a token decrypt.
+            let authorized = keychain.authorizePayment(key, context, .useKeyKeyExchange, reason)
             guard authorized == 0 else {
                 return checkedBiometricFailure(authorized, recorded: recorded, current: keychain.biometry)
             }
             // Only the explicit evaluation can show UI. Bind the authenticated context
-            // to the key reference used for every payment unwrap.
+            // to the key reference used for every unwrap in this scope.
             context.interactionNotAllowed = true
             query[kSecUseAuthenticationContext as String] = context
             out = nil
@@ -287,14 +289,13 @@ private func openPersistent(_ tagPtr: UnsafePointer<UInt8>, _ tagLen: Int, _ cre
     return 0
 }
 
-private func authorizePaymentKey(_ key: SecKey, _ context: LAContext, _ reason: String) -> Int {
+private func authorizePaymentKey(_ key: SecKey, _ context: LAContext, _ operation: LAAccessControlOperation, _ reason: String) -> Int {
     guard let attributes = SecKeyCopyAttributes(key) as NSDictionary?,
           let acl = attributes[kSecAttrAccessControl as String],
           CFGetTypeID(acl as CFTypeRef) == SecAccessControlGetTypeID() else { return -4 }
     let done = DispatchSemaphore(value: 0)
     let result = OSAllocatedUnfairLock(initialState: -4)
-    // Security's ECIES adaptor performs ECDH on the Enclave key, not a token decrypt.
-    context.evaluateAccessControl(acl as! SecAccessControl, operation: .useKeyKeyExchange,
+    context.evaluateAccessControl(acl as! SecAccessControl, operation: operation,
                                   localizedReason: reason) { success, error in
         result.withLock { $0 = success ? 0 : keyOperationFailure(error as NSError?, fallback: -4) }
         done.signal()
@@ -356,7 +357,7 @@ public func se_unwrap(_ handle: UInt64,
                       _ out: UnsafeMutablePointer<UInt8>, _ outCap: Int) -> Int {
     guard let (k, biometry, _) = fetch(handle) else { return -8 }
     let data = Data(bytes: ct, count: ctLen)
-    // Unscoped persistent keys prompt here. Payment keys already have their authorization.
+    // Unscoped persistent keys prompt here. Scoped keys already have their authorization.
     var failure: Unmanaged<CFError>?
     guard let pt = SecKeyCreateDecryptedData(k, algo, data as CFData, &failure) as Data? else {
         let code = keyOperationFailure(failure.map { $0.takeRetainedValue() as Error as NSError }, fallback: -4)
