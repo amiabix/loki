@@ -637,11 +637,11 @@ function NativePairingLink({ open, onRegistered }: { open: boolean; onRegistered
   const [err, setErr] = useState<string | null>(null);
   const [copied, setCopied] = useState<boolean | null>(null); // null: not copied, false: copy failed
 
-  const request = async (want = slot) => {
-    setBusy(true); setErr(null); setCopied(null); setRegistered(null);
+  const request = async (want: number | undefined) => {
+    setBusy(true); setErr(null); setCopied(null);
     try {
       const issued = await requestPairingLink(want);
-      setSlot(issued.slot); setNow(Date.now()); setLink(issued);
+      setSlot(issued.slot); setNow(Date.now()); setLink(issued); setRegistered(null);
     } catch (e) {
       // A taken slot stays taken: stop watching it, and let the next link take a new slot.
       if (e instanceof PairingSlotTaken) setSlot(undefined);
@@ -688,7 +688,7 @@ function NativePairingLink({ open, onRegistered }: { open: boolean; onRegistered
     return <>
       <p className="my-2">Get a link that opens LokiSigner and reserves a slot for two minutes.</p>
       {err && <p role="alert" className="mb-3 leading-relaxed text-danger [overflow-wrap:anywhere]">{err}</p>}
-      <Btn variant="ghost" disabled={busy} onClick={() => request()}>
+      <Btn variant="ghost" disabled={busy} onClick={() => request(slot)}>
         {busy ? "Requesting…" : err ? (slot === undefined ? "Get a new link" : "Try again") : "Get a pairing link"}
       </Btn>
     </>;
@@ -700,7 +700,7 @@ function NativePairingLink({ open, onRegistered }: { open: boolean; onRegistered
         The link for slot {link.slot} expired. If LokiSigner already shows its private link, paste it below.
         Otherwise get a new link for the same slot.
       </p>
-      <Btn variant="ghost" disabled={busy} onClick={() => request()}>{busy ? "Requesting…" : "Get a new link"}</Btn>
+      <Btn variant="ghost" disabled={busy} onClick={() => request(slot)}>{busy ? "Requesting…" : "Get a new link"}</Btn>
     </>;
   }
   return <>
