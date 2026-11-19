@@ -28,3 +28,14 @@ test("a request ends when it is cancelled, failed, signed, sent or leaves this m
   assert.equal(endsRequest({ kind: "start", intent: { signers: [1, 3] } }, 3), false);
   assert.equal(endsRequest({ kind: "intent", intent: {} }, 3), false);
 });
+
+// A page reload starts a new Worker. The relay will not hand the notices over again, so the
+// kept ones come back from the store (IndexedDB in the browser; a Map here).
+test("kept notices survive a new inbox over the same store", async () => {
+  const saved = new Map();
+  const store = { get: async (k) => saved.get(k) ?? [], put: async (k, v) => { saved.set(k, v); } };
+  await controlInbox(store)("s1", relayOnce({ from: "aa", message: "sealed-1" }));
+  const afterReload = controlInbox(store);
+  assert.deepEqual(await afterReload("s1", relayOnce()), [{ from: "aa", message: "sealed-1" }]);
+  assert.deepEqual(await afterReload("s1", relayOnce({ from: "aa", message: "sealed-2" })), [{ from: "aa", message: "sealed-1" }, { from: "aa", message: "sealed-2" }]);
+});

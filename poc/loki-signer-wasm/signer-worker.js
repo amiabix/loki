@@ -21,7 +21,7 @@ import {
   opfsPreopenRead as preopenReadOnce,
   opfsCloseAll,
 } from "./pkg/snippets/loki-signer-core-8724841f4db15c9f/js/opfs_fs.js";
-import { controlInbox, endsRequest } from "./control-inbox.js";
+import { controlInbox, endsRequest, idbStore } from "./control-inbox.js";
 
 // Ops run concurrently (a status read during a join), and two pre-opens of one path racing
 // would each try to take its exclusive sync handle; the second throws. Share one in-flight
@@ -279,19 +279,20 @@ async function frostdClient(signer, p) {
 // Drain this member's inbox on a payment control session and open each sealed message under
 // the confirmed roster. Anything that does not open (a non-member, another session) is dropped.
 // Returns every message opened on that session so far (control-inbox.js), not just new ones.
-const controlHistory = controlInbox();
+const controlHistory = controlInbox(idbStore());
 async function readControl(signer, control, sessionId) {
-  return controlHistory(sessionId, async () => {
+  const raw = await controlHistory(sessionId, async () => {
     control.useSession(sessionId);
-    const out = [];
-    for (const m of JSON.parse(await control.recv())) {
-      try {
-        const { from, body } = JSON.parse(signer.openControl(sessionId, m.from, m.message));
-        out.push({ from, ...JSON.parse(body) });
-      } catch { /* not a control message sealed to this member */ }
-    }
-    return out;
+    return JSON.parse(await control.recv());
   });
+  const out = [];
+  for (const m of raw) {
+    try {
+      const { from, body } = JSON.parse(signer.openControl(sessionId, m.from, m.message));
+      out.push({ from, ...JSON.parse(body) });
+    } catch { /* not a control message sealed to this member */ }
+  }
+  return out;
 }
 
 // A proposer notice about this payment: the sender is the proposer and the session ids match.
