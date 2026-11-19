@@ -193,7 +193,7 @@ impl NativeMember {
         let id = (vault.to_owned(), slot);
         let cached = self.viewing_keys.lock().map_err(|_| VAULT_ERROR)?.get(&id).cloned();
         let opened = cached.map_or_else(|| {
-            let reason = super::custody::vault_touch_id_reason(&self.state, "verify the receive address for", Some(name));
+            let reason = super::custody::vault_touch_id_reason(&self.state, "verify the receive address for", vault, Some(name));
             SignerViewingKey::open(&self.state, data, pass, vault, slot, reason.as_deref())
         }, Ok);
         // Read after any prompt, including when the store could not be opened for a legacy vault.

@@ -192,9 +192,13 @@ fn save_payment(data: &Path, pass: &str, p: &Payment) -> Result<(), String> {
 /// Open this member's vault for scanning and signing. `vault.sealed` supplies public
 /// metadata; the viewing key comes from the device-bound signer store (`super::custody`).
 pub(super) fn load_vault(st: &AppState, data: &Path, pass: &str, vault: &str) -> Result<Vault, String> {
+    load_vault_for_view(st, data, pass, vault, super::custody::VaultOpen::Read)
+}
+
+fn load_vault_for_view(st: &AppState, data: &Path, pass: &str, vault: &str, mode: super::custody::VaultOpen) -> Result<Vault, String> {
     load_vault_with(st, data, pass, vault, |slot, _, sealed, name| {
-        super::custody::viewing_key(st, data, pass, vault, slot, sealed, || {
-            let reason = super::custody::vault_touch_id_reason(st, "open", name);
+        super::custody::viewing_key(st, data, pass, vault, slot, sealed, mode, || {
+            let reason = super::custody::vault_touch_id_reason(st, "open", vault, name);
             super::custody::SignerViewingKey::open(st, data, pass, vault, slot, reason.as_deref()).map(|(key, _)| key)
         })
     })
@@ -1023,8 +1027,10 @@ fn reconcile(data: &Path, pass: &str, vault: &str, w: &mut VaultWallet) -> Resul
 
 pub(super) async fn balance(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
     with_body(st, body, |st, data, pass, body| {
+        use super::custody::VaultOpen;
         let vault = required(&body, "vault")?;
-        let v = load_vault(&st, &data, &pass, vault)?;
+        let mode = if body["retry_touch_id"].as_bool() == Some(true) { VaultOpen::Retry } else { VaultOpen::Read };
+        let v = load_vault_for_view(&st, &data, &pass, vault, mode)?;
         let (w, _, _) = wallet(&data, &pass, vault, &v, url(&st)?)?;
         Ok(json!({"balance_zat": w.ironwood_balance_zat()?}))
     })
@@ -1190,7 +1196,7 @@ fn load_vault_for_approval(
         if !p.signers.is_empty() && !p.signers.contains(&slot) {
             return Err(ENOUGH_APPROVED.into());
         }
-        super::custody::viewing_key(st, data, pass, vault, slot, sealed, || {
+        super::custody::viewing_key(st, data, pass, vault, slot, sealed, super::custody::VaultOpen::Payment, || {
             super::nonce_witness::RelayWitness::for_member(st, &p.attempt)?;
             authenticating = true;
             let signer = open_payment_signer(st, data, pass, p, network, slot, Box::new(|_| false))?;
@@ -2500,7 +2506,7 @@ mod tests {
         std::fs::write(&witnesses, serde_json::to_vec(&witness_config).unwrap()).unwrap();
 
         for (unwraps, name, expected_reason) in [(4, "Shared reserve", "open vault “Shared reserve”"),
-            (1, "Hidden\nname", "open a vault")]
+            (1, "Hidden\nname", "open vault 49494949")]
         {
             if unwraps == 1 {
                 // Recovery publishes a store with only the share, not the DKG checkpoint.

@@ -431,8 +431,8 @@ pub struct AppState {
     /// Vaults whose codes the member said differ, refused until the app restarts.
     pub(super) roster_refused: std::sync::Mutex<BTreeSet<String>>,
     pub(super) wallet_tabs: Option<super::connect::WalletTabs>,
-    /// Each vault's group viewing key, read from its device-bound signer once per process.
-    pub(super) viewing_keys: std::sync::Mutex<BTreeMap<String, orchard::keys::FullViewingKey>>,
+    /// Each opened vault's viewing key; `None` means a cancelled open needs an explicit retry.
+    pub(super) viewing_keys: std::sync::Mutex<BTreeMap<String, Option<orchard::keys::FullViewingKey>>>,
     /// The signer configuration LokiSigner fetched for this launch, saved once the profile unlocks.
     pub(super) fetched_config: Option<super::FetchedConfig>,
 }

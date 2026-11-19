@@ -1572,7 +1572,9 @@ function VaultOverview({
   const [copyFailed, setCopyFailed] = useState(false);
   const [loadVersion, setLoadVersion] = useState(0);
   const [loadErr, setLoadErr] = useState<string | null>(null);
-  const [balanceErr, setBalanceErr] = useState(false);
+  const [balanceErr, setBalanceErr] = useState<string | null>(null);
+  const [retrying, setRetrying] = useState(false);
+  const needsTouchID = balanceErr === "Touch ID is required to open this vault.";
   const [funding, setFunding] = useState(false);
   const [pending, setPending] = useState<PendingApproval[] | null>(null);
   const [pendingError, setPendingError] = useState<string | null>(null);
@@ -1605,8 +1607,8 @@ function VaultOverview({
     // Poll the balance so a deposit (or a still-scanning signer) shows up without a reload.
     const loadBalance = () =>
       api<{ balance_zat: number }>("balance", { vault: vault.vault })
-        .then((r) => { if (active) { setBalance(r); setBalanceErr(false); } })
-        .catch(() => active && setBalanceErr(true));
+        .then((r) => { if (active) { setBalance(r); setBalanceErr(null); } })
+        .catch((e) => active && setBalanceErr((e as Error).message));
     loadBalance();
     const timer = setInterval(loadBalance, 5000);
     return () => {
@@ -1614,6 +1616,18 @@ function VaultOverview({
       clearInterval(timer);
     };
   }, [vault.vault, loadVersion]);
+
+  const retryDetails = async () => {
+    if (needsTouchID) {
+      setRetrying(true);
+      try {
+        setBalance(await api<{ balance_zat: number }>("balance", { vault: vault.vault, retry_touch_id: true }));
+        setBalanceErr(null);
+      } catch (e) { setBalanceErr((e as Error).message); }
+      finally { setRetrying(false); }
+    }
+    setLoadVersion((v) => v + 1);
+  };
 
   const copy = async () => {
     if (!address) return;
@@ -1653,10 +1667,10 @@ function VaultOverview({
         <p role="status" className="glass mb-4 rounded-2xl p-4 text-sm text-muted">Loading balance…</p>
       )}
       {balanceErr && (
-        <div className="mb-4"><ErrMsg msg={balance ? "Balance could not refresh. The amount shown may be out of date. Retrying automatically." : "Balance is unavailable. Retrying automatically."} /></div>
+        <div className="mb-4"><ErrMsg msg={needsTouchID ? balanceErr : balance ? "Balance could not refresh. The amount shown may be out of date. Retrying automatically." : "Balance is unavailable. Retrying automatically."} /></div>
       )}
       {loadErr && <div className="mb-4"><ErrMsg msg={loadErr} /></div>}
-      {(loadErr || balanceErr) && <Btn variant="ghost" className="mb-4" onClick={() => setLoadVersion((v) => v + 1)}>Retry wallet details</Btn>}
+      {(loadErr || balanceErr || retrying) && <Btn variant="ghost" className="mb-4" disabled={retrying} onClick={retryDetails}>{retrying ? "Waiting for LokiSigner…" : needsTouchID ? "Retry Touch ID" : "Retry wallet details"}</Btn>}
 
       <div className="mb-5">
         <div className="mb-2 flex items-center gap-2">
