@@ -71,9 +71,54 @@ test('a frostd-only in-browser signer enrolls without an advertise_url, beside n
     const nativeMember = await members.registerMember(response(native, nativeChallenge.challenge), origin);
     assert.equal(nativeMember.slot, 2);
     assert.equal(nativeMember.advertise_url, 'http://127.0.0.1:3601');
+    // response() signs the original v1 transcript for both the browser and the headless member.
+    assert.equal(Object.hasOwn(member, 'lokisigner_url'), false);
+    assert.equal(Object.hasOwn(nativeMember, 'lokisigner_url'), false);
     assert.equal(members.slots().length, 2);
     // A non-empty advertise_url that is not a valid origin is still rejected.
     await assert.rejects(members.issueRegistrationChallenge(device(undefined, { advertise_url: 'not-an-origin' }).input, origin));
+  } finally { rmSync(dir, { recursive: true, force: true }); delete process.env.LOKI_REGISTRY; }
+});
+
+test('registration v2 matches the shared byte-for-byte Rust and Node fixture', () => {
+  const fixture = new URL('../../../poc/tests/fixtures/lokisigner-registration-v2.json', import.meta.url);
+  const { enrollment, origin, challenge, expected } = JSON.parse(readFileSync(fixture, 'utf8'));
+  assert.deepEqual(members.registrationMessage(enrollment, origin, challenge), Buffer.from(expected));
+});
+
+test('registration signs the separate LokiSigner loopback port and refuses unsigned changes', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'loki-roster-local-'));
+  process.env.LOKI_REGISTRY = join(dir, 'roster.json');
+  const d = device(7, { advertise_url: 'https://peer.example' });
+  const endpoint = 'http://127.0.0.1:43812';
+  const moved = 'http://[::1]:42761';
+  const proof = (challenge, value, signed = value) => {
+    const { slot, signing_pubkey, relay_pubkey, advertise_url, device_pubkey } = d.input;
+    const transcript = `loki-member-registration-v2\n${origin}\n${slot}\n${signing_pubkey}\n${relay_pubkey}\n${advertise_url}\n${signed}\n${device_pubkey}\n${challenge}`;
+    return { ...d.input, lokisigner_url: value, challenge, signature: sign('sha256', Buffer.from(transcript), d.key.privateKey).toString('hex') };
+  };
+  const issue = (value) => members.issueRegistrationChallenge({ ...d.input, lokisigner_url: value }, origin);
+  try {
+    for (const invalid of [null, '', 'http://127.0.0.2:43812', 'http://localhost:43812', 'https://127.0.0.1:43812',
+      'http://127.0.0.1', 'http://127.0.0.1:0', 'http://127.0.0.1:65536', ` ${endpoint}`, `${endpoint}\n`,
+      `${endpoint}/`, `${endpoint}?x`, `${endpoint}#x`, 'http://user@127.0.0.1:43812']) {
+      await assert.rejects(issue(invalid), /invalid LokiSigner loopback endpoint/);
+    }
+    const { challenge: added } = await issue(endpoint);
+    await assert.rejects(members.registerMember(response(d, added, { lokisigner_url: endpoint }), origin), /signature/);
+    const { challenge: altered } = await issue(moved);
+    await assert.rejects(members.registerMember(proof(altered, moved, endpoint), origin), /signature/);
+    assert.deepEqual(members.slots(), []);
+
+    const { challenge: first } = await issue(endpoint);
+    const enrolled = await members.registerMember(proof(first, endpoint), origin);
+    assert.equal(enrolled.lokisigner_url, endpoint);
+    assert.equal(enrolled.advertise_url, 'https://peer.example');
+    const { challenge: restart } = await issue(moved);
+    await members.registerMember(proof(restart, moved), origin);
+    assert.deepEqual(members.slots(), [{ ...enrolled, lokisigner_url: moved }]);
+    writeFileSync(process.env.LOKI_REGISTRY, JSON.stringify({ access: [{ ...enrolled, lokisigner_url: 'http://example.com:43812' }] }));
+    assert.throws(() => members.slots(), /invalid LokiSigner loopback endpoint/);
   } finally { rmSync(dir, { recursive: true, force: true }); delete process.env.LOKI_REGISTRY; }
 });
 

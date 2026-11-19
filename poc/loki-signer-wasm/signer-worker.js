@@ -22,7 +22,8 @@ import {
   opfsCloseAll,
 } from "./pkg/snippets/loki-signer-core-8724841f4db15c9f/js/opfs_fs.js";
 import { blockRange, latestHeight } from "./lightwalletd.js";
-import { controlInbox } from "./control-inbox.js";
+import { controlInbox, endsRequest, idbStore } from "./control-inbox.js";
+import { vaultSummary, saveVaultName, readVaultName } from "./vault-list.js";
 
 // Ops run concurrently (a status read during a join), and two pre-opens of one path racing
 // would each try to take its exclusive sync handle; the second throws. Share one in-flight
@@ -224,6 +225,7 @@ async function driveDkg(signer, p) {
     throw new Error("You reported that the roster codes differ; this vault setup is stopped");
   }
   const vref = JSON.parse(signer.vaultJoin(vaultHex, slot, label ?? "vault", network, roster, code));
+  if (label) await saveVaultName(await (await (await (await navigator.storage.getDirectory()).getDirectoryHandle("loki")).getDirectoryHandle("vaults")).getDirectoryHandle(vaultHex), label);
 
   const fc = await frostdClient(signer, { frostdUrl });
   fc.useSession(sessionId);
@@ -321,19 +323,20 @@ async function frostdClient(signer, p) {
 // Drain this member's inbox on a payment control session and open each sealed message under
 // the confirmed roster. Anything that does not open (a non-member, another session) is dropped.
 // Returns every message opened on that session so far (control-inbox.js), not just new ones.
-const controlHistory = controlInbox();
+const controlHistory = controlInbox(idbStore());
 async function readControl(signer, control, sessionId) {
-  return controlHistory(sessionId, async () => {
+  const raw = await controlHistory(sessionId, async () => {
     control.useSession(sessionId);
-    const out = [];
-    for (const m of JSON.parse(await control.recv())) {
-      try {
-        const { from, body } = JSON.parse(signer.openControl(sessionId, m.from, m.message));
-        out.push({ from, ...JSON.parse(body) });
-      } catch { /* not a control message sealed to this member */ }
-    }
-    return out;
+    return JSON.parse(await control.recv());
   });
+  const out = [];
+  for (const m of raw) {
+    try {
+      const { from, body } = JSON.parse(signer.openControl(sessionId, m.from, m.message));
+      out.push({ from, ...JSON.parse(body) });
+    } catch { /* not a control message sealed to this member */ }
+  }
+  return out;
 }
 
 // A proposer notice about this payment: the sender is the proposer and the session ids match.
@@ -391,9 +394,8 @@ async function listPending(signer, vaultHex, p) {
     for (const m of await readControl(signer, control, sessionId)) {
       const i = m.intent;
       if (m.from !== owner || !i || !/^[0-9a-f]{64}$/.test(i.attempt ?? "") || !aboutPayment(m, vault, i.attempt, sessionId)) continue;
-      if (m.kind === "cancelled" || m.kind === "failed") { pending.set(i.attempt, null); continue; }
+      if (endsRequest(m, vault.slot)) { pending.set(i.attempt, null); continue; }
       if (pending.get(i.attempt) === null) continue;
-      if (m.kind === "start" && i.signers?.length && !i.signers.includes(vault.slot)) { pending.set(i.attempt, null); continue; }
       pending.set(i.attempt, { attempt: i.attempt, amount_zat: String(i.amount_zat), recipient: i.recipient, proposer: i.proposer });
     }
   }
@@ -411,7 +413,7 @@ async function listVaults(signer) {
     if (h.kind !== "directory" || !/^[0-9a-f]{64}$/.test(name)) continue;
     let v;
     try { v = await openVaultAny(signer, name); } catch { continue; } // setup never started
-    out.push({ vault: v.vault_id, name: `Vault ${name.slice(0, 8)}`, members: v.members.length, threshold: v.threshold, active: v.ready });
+    out.push(vaultSummary(v, await readVaultName(h)));
   }
   return out;
 }

@@ -1,5 +1,4 @@
 import type { NextConfig } from "next";
-import { wgslTurbopackRule } from "@vgpu/wgsl/next";
 
 const nextConfig: NextConfig = {
   experimental: { agentUpgrade: "security" },
@@ -9,7 +8,6 @@ const nextConfig: NextConfig = {
         loaders: ["@tailwindcss/turbopack"],
         as: "*.css",
       },
-      "*.wgsl": wgslTurbopackRule(),
     },
   },
   // Turbopack names the app chunk stably, so a code change can reuse a filename with new

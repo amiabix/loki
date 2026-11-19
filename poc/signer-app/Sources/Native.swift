@@ -1,10 +1,18 @@
 import AppKit
 
+typealias ConnectCancellation = @convention(c) (UnsafeRawPointer?) -> Int32
+typealias ConnectDecision = @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?,
+    UnsafeRawPointer?, ConnectCancellation) -> Int32
+
 @_silgen_name("loki_member_app_pair")
 func loki_member_app_pair(_ launch: UnsafePointer<CChar>, _ pass: UnsafeMutablePointer<CChar>,
     _ notify: @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Void,
     _ approve: @convention(c) (UnsafePointer<CChar>?) -> Int32,
-    _ confirmRoster: @convention(c) (UnsafePointer<CChar>?) -> Int32) -> Int32
+    _ confirmRoster: @convention(c) (UnsafePointer<CChar>?) -> Int32,
+    _ connect: ConnectDecision) -> Int32
+
+@_silgen_name("loki_member_app_disconnect_wallet_tabs")
+func loki_member_app_disconnect_wallet_tabs()
 
 @_silgen_name("loki_member_app_pairing_target")
 func loki_member_app_pairing_target(_ launch: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
@@ -38,35 +46,127 @@ private func nativeQuery(_ query: (UnsafePointer<CChar>) -> UnsafeMutablePointer
 func retryAlert(_ failure: SignerStartFailure, profile: String?) -> NSAlert {
     let alert = NSAlert()
     alert.messageText = failure == .cancelled ? "LokiSigner paused" : "LokiSigner couldn’t continue"
-    alert.informativeText = failure.message
-    if profile == "vault", [.differentPairing, .notFresh, .wrongProfile, .registrationRefused].contains(failure) {
+    alert.informativeText = profile == "vault" && failure == .notFresh
+        ? SignerStartFailure.protectedProfile.message : failure.message
+    if profile == "vault", [.differentPairing, .wrongProfile, .registrationRefused].contains(failure) {
         alert.informativeText += "\n\n" + SignerStartFailure.protectedProfile.message
     }
     alert.addButton(withTitle: "Try again")
     alert.addButton(withTitle: "Quit")
-    if profile == "profile" { alert.addButton(withTitle: "Start over…") }
+    if profile == "profile" || (profile == "vault" && failure.keyIsGone) {
+        alert.addButton(withTitle: failure.keyIsGone ? "Set aside profile…" : "Start over…")
+    }
     return alert
 }
 
-func setAsideAlert() -> NSAlert {
+func setAsideAlert(recover: Bool = false) -> NSAlert {
     let alert = NSAlert()
     alert.messageText = "Set aside this LokiSigner profile?"
-    alert.informativeText = "LokiSigner will move the entire local data folder, including this profile’s identity and pairing settings, to a dated folder beside it. Nothing will be deleted. You can then pair a new signer or restore from recovery words."
+    alert.informativeText = recover
+        ? "LokiSigner will rename the entire local data folder, including any vault data. Nothing will be deleted. To restore your vault in the original location, choose “Restore from recovery words”. You’ll need your recovery words and downloaded backup file."
+        : "LokiSigner will rename the entire local data folder, including this profile’s identity and pairing settings. Nothing will be deleted. You can then pair a new signer or choose “Restore from recovery words”. To restore, you’ll need your recovery words and downloaded backup file."
     alert.addButton(withTitle: "Cancel")
     alert.addButton(withTitle: "Set aside and start over")
     return alert
 }
 
-func registrationWarningAlert(_ message: String) -> NSAlert {
+func registrationWarningAlert(_ message: String, key: Bool = false, recover: Bool = false) -> NSAlert {
     let alert = NSAlert()
-    alert.messageText = "LokiSigner is running"
+    alert.messageText = key ? "LokiSigner is still running" : "LokiSigner is running"
     alert.informativeText = message
     alert.addButton(withTitle: "OK")
+    if recover { alert.addButton(withTitle: "Set aside profile…") }
     return alert
 }
 
 @_silgen_name("loki_signer_approval_selftest")
 func loki_signer_approval_selftest(_ approve: @convention(c) (UnsafePointer<CChar>?) -> Int32) -> Int32
+
+/// Presents a decision requested by the wallet, without accepting input carried over from
+/// another window. Keep native buttons so assistive technology can still press them.
+func runDecisionAlert(_ alert: NSAlert, timeout: TimeInterval? = nil,
+                      escape: NSApplication.ModalResponse,
+                      field: NSTextField? = nil) -> NSApplication.ModalResponse {
+    alert.layout()
+    let window = alert.window
+    let buttons = alert.buttons
+    var controls: [NSView] = buttons
+    if let field { controls.append(field) }
+    for button in buttons {
+        button.keyEquivalent = ""
+        button.isEnabled = false
+    }
+    window.defaultButtonCell = nil
+    window.initialFirstResponder = field
+
+    var acceptsInputSince = TimeInterval.infinity
+    var enable: Timer?
+    let center = NotificationCenter.default
+    let becameKey = center.addObserver(forName: NSWindow.didBecomeKeyNotification,
+                                       object: window, queue: nil) { _ in
+        window.makeFirstResponder(field)
+        let deadline = ProcessInfo.processInfo.systemUptime + 1
+        let timer = Timer(timeInterval: 1, repeats: false) { _ in
+            guard window.isKeyWindow, window.isVisible else { return }
+            acceptsInputSince = deadline
+            for button in buttons { button.isEnabled = true }
+        }
+        enable = timer
+        RunLoop.main.add(timer, forMode: .modalPanel)
+    }
+    let resignedKey = center.addObserver(forName: NSWindow.didResignKeyNotification,
+                                         object: window, queue: nil) { _ in
+        enable?.invalidate()
+        acceptsInputSince = .infinity
+        for button in buttons { button.isEnabled = false }
+    }
+
+    let input = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseDown, .leftMouseUp]) { event in
+        guard event.window === window else { return event }
+        guard event.timestamp >= acceptsInputSince else { return nil }
+        guard event.type == .keyDown else { return event }
+
+        let focused = window.firstResponder
+        let editing = field.map { $0 === focused || $0.currentEditor() === focused } ?? false
+        switch event.keyCode {
+        case 36, 76: // Return, keypad Enter
+            return nil
+        case 48: // Tab / Shift-Tab
+            // Keep the field reachable even when macOS Keyboard Navigation is off.
+            guard !event.isARepeat else { return nil }
+            let reverse = event.modifierFlags.contains(.shift)
+            let current = editing ? controls.count - 1 : controls.firstIndex { $0 === focused }
+            let next = current.map { ($0 + (reverse ? controls.count - 1 : 1)) % controls.count }
+                ?? (reverse ? controls.count - 1 : 0)
+            window.makeFirstResponder(controls[next])
+            return nil
+        case 49: // Space
+            if editing { return event }
+            if !event.isARepeat { buttons.first { $0 === focused }?.performClick(nil) }
+            return nil
+        case 53: // Escape
+            if !event.isARepeat { NSApp.stopModal(withCode: escape) }
+            return nil
+        default:
+            return event
+        }
+    }
+
+    NSApp.activate(ignoringOtherApps: true)
+    let expiry = timeout.map { seconds in
+        let timer = Timer(timeInterval: seconds, repeats: false) { _ in NSApp.abortModal() }
+        RunLoop.main.add(timer, forMode: .modalPanel)
+        return timer
+    }
+    defer {
+        expiry?.invalidate()
+        enable?.invalidate()
+        center.removeObserver(becameKey)
+        center.removeObserver(resignedKey)
+        if let input = input { NSEvent.removeMonitor(input) }
+    }
+    return alert.runModal()
+}
 
 /// An unanswered payment request is refused after this long.
 private let approvalTimeout: TimeInterval = 120
@@ -110,12 +210,8 @@ private func nativeApprove(_ summary: UnsafePointer<CChar>?) -> Int32 {
             """
         alert.addButton(withTitle: "Refuse")
         alert.addButton(withTitle: "Approve and sign")
-        alert.buttons[1].keyEquivalent = ""
-        NSApp.activate(ignoringOtherApps: true)
-        let timeout = Timer(timeInterval: approvalTimeout, repeats: false) { _ in NSApp.abortModal() }
-        RunLoop.main.add(timeout, forMode: .modalPanel)
-        approved = alert.runModal() == .alertSecondButtonReturn
-        timeout.invalidate()
+        approved = runDecisionAlert(alert, timeout: approvalTimeout, escape: .alertFirstButtonReturn)
+            == .alertSecondButtonReturn
     }
     return approved ? 1 : 0
 }
@@ -215,55 +311,74 @@ private func nativeConfirmRoster(_ summary: UnsafePointer<CChar>?) -> Int32 {
         alert.accessoryView = stack
         alert.addButton(withTitle: "Codes differ")
         alert.addButton(withTitle: "Codes match")
-        // The dialog takes focus while the member may be typing elsewhere: Return, Space or any
-        // other key answers nothing, and the member must click. Lay out first, because
-        // NSAlert assigns its default button there.
-        alert.layout()
-        for button in alert.buttons {
-            button.keyEquivalent = ""
-            button.refusesFirstResponder = true
-        }
-        alert.window.defaultButtonCell = nil
-        NSApp.activate(ignoringOtherApps: true)
-        let timeout = Timer(timeInterval: rosterTimeout, repeats: false) { _ in NSApp.abortModal() }
-        RunLoop.main.add(timeout, forMode: .modalPanel)
-        switch alert.runModal() {
+        switch runDecisionAlert(alert, timeout: rosterTimeout, escape: .abort) {
         case .alertSecondButtonReturn: answer = 1
         case .alertFirstButtonReturn: answer = 2
         default: answer = 0
         }
-        timeout.invalidate()
     }
     return answer
+}
+
+private func nativeConnect(_ origin: UnsafePointer<CChar>?, _ code: UnsafePointer<CChar>?,
+                           _ context: UnsafeRawPointer?, _ cancelled: ConnectCancellation) -> Int32 {
+    guard let origin, let code, let context else { return 0 }
+    let coordinator = String(cString: origin), comparison = String(cString: code)
+    return DispatchQueue.main.sync {
+        showConnectDialog(origin: coordinator, code: comparison, cancelled: { cancelled(context) != 0 }) ? 1 : 0
+    }
+}
+
+/// Only answer the request whose code matches the wallet tab. The borrowed cancellation
+/// check is used only while the C callback is live, including during the modal run loop.
+func showConnectDialog(origin: String, code: String, cancelled: @escaping () -> Bool) -> Bool {
+    guard !cancelled(), NSApp.modalWindow == nil else { return false }
+    let alert = NSAlert()
+    alert.messageText = "Connect this wallet tab?"
+    alert.informativeText = """
+        Wallet: \(origin)
+
+        Choose Allow only if you clicked Connect LokiSigner and the code below matches the one in that tab.
+        Unanswered requests are refused in under two minutes.
+        """
+    let comparison = NSTextField(labelWithString: code)
+    comparison.font = .monospacedDigitSystemFont(ofSize: 24, weight: .semibold)
+    comparison.frame = NSRect(x: 0, y: 0, width: 230, height: 30)
+    alert.accessoryView = comparison
+    alert.addButton(withTitle: "Refuse")
+    alert.addButton(withTitle: "Allow")
+    let window = alert.window
+    let timer = Timer(timeInterval: 0.1, repeats: true) { _ in
+        if cancelled() && NSApp.modalWindow === window { NSApp.abortModal() }
+    }
+    RunLoop.main.add(timer, forMode: .modalPanel)
+    defer { timer.invalidate() }
+    return runDecisionAlert(alert, escape: .alertFirstButtonReturn) == .alertSecondButtonReturn && !cancelled()
 }
 
 private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointer<CChar>?) {
     guard let kind = kind, let message = message else { return }
     let event = String(cString: kind), text = String(cString: message)
-    if event == "registration-warning" {
+    if event == "registration-warning" || event == "registration-key" || event == "registration-key-gone" {
         // Rust supplies fixed copy here. Don't block its retry loop on an open dialog.
-        DispatchQueue.main.async { (NSApp.delegate as? NativeSigner)?.warnRegistration(text) }
+        DispatchQueue.main.async { (NSApp.delegate as? NativeSigner)?.warnRegistration(event, message: text) }
+        return
+    }
+    if event == "startup-key" || event == "startup-key-gone" {
+        DispatchQueue.main.async { (NSApp.delegate as? NativeSigner)?.startupKeyFailure = event == "startup-key-gone" ? .keyGone(text) : .key(text) }
         return
     }
     // Synchronous delivery keeps recovery words on screen before registration continues.
     DispatchQueue.main.sync {
         let alert = NSAlert()
         if event == "ready" || event == "restore-ready" || event == "restore-pending" {
-            alert.messageText = event == "ready" ? "Signer paired and running" : "Vault restored"
+            alert.messageText = event == "ready" ? "LokiSigner is running" : "Vault restored"
+            let connect = "On this Mac, choose Connect LokiSigner in the wallet. If the wallet only offers to paste a link, ask the coordinator to update it. Keep LokiSigner running to approve and sign."
             alert.informativeText = event == "restore-pending"
-                ? "Your vault is saved on this Mac. LokiSigner could not reconnect to the coordinator yet. It will retry now and when you next unlock, without your recovery words. Pair the wallet tab after it reconnects."
-                : "Paste this private session link into your wallet tab. Keep LokiSigner running to approve and sign."
-            let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 420, height: 26))
-            field.stringValue = text
-            field.isEditable = false
-            field.isSelectable = true
-            alert.accessoryView = field
+                ? "Your vault is saved on this Mac. LokiSigner will keep trying to reconnect, without your recovery words.\n\n\(connect)"
+                : connect
             alert.addButton(withTitle: "Done")
-            alert.addButton(withTitle: "Copy private link")
-            if alert.runModal() == .alertSecondButtonReturn {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(text, forType: .string)
-            }
+            alert.runModal()
             (NSApp.delegate as? NativeSigner)?.didStart()
         } else if event == "recovery" {
             alert.messageText = "Save your recovery words privately"
@@ -278,18 +393,17 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
     private var running = false
     private var prompting = false {
         didSet {
-            if !prompting, let message = registrationWarning {
-                registrationWarning = nil
-                DispatchQueue.main.async { self.warnRegistration(message) }
-            }
+            if !prompting && !registrationWarnings.isEmpty { DispatchQueue.main.async { self.showNextRegistrationWarning() } }
         }
     }
-    private var registrationWarning: String?
+    private var registrationWarnings: [(event: String, message: String)] = []
+    fileprivate var startupKeyFailure: SignerStartFailure?
     private var opened = false
     private var cleanupNeeded = true
     private var retryLink: String?
     private var queuedLink: String?
     private var startingOver = false
+    private var recoveringKey = false
     private let args: [String]
     private let initialLink: String?
 
@@ -330,7 +444,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         case .alertSecondButtonReturn:
             NSApp.terminate(nil)
         case .alertThirdButtonReturn:
-            if confirmSetAside() { return }
+            if confirmSetAside(recover: failure.keyIsGone) { return }
         default: break
         }
         // Don't nest modal panels or keep a previous passphrase field alive on retry.
@@ -340,8 +454,9 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func confirmSetAside() -> Bool {
-        guard setAsideAlert().runModal() == .alertSecondButtonReturn else { return false }
+    private func confirmSetAside(recover: Bool = false) -> Bool {
+        guard setAsideAlert(recover: recover).runModal() == .alertSecondButtonReturn else { return false }
+        recoveringKey = recover
         if running {
             startingOver = loki_member_app_stop() != 0
             if !startingOver {
@@ -356,11 +471,13 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
     }
 
     private func finishSetAside() {
-        let reply = profile(2)
+        let recover = recoveringKey
+        recoveringKey = false
+        let reply = profile(recover ? 3 : 2)
         if reply["profile"] as? String != "fresh" {
             retry(reply["error"] as? String == "vault" ? .protectedProfile : .setAsideFailed, link: retryLink)
         } else {
-            let link = queuedLink ?? retryLink
+            let link = recover ? nil : queuedLink ?? retryLink
             DispatchQueue.main.async {
                 self.prompting = false
                 self.start(link)
@@ -373,15 +490,25 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         queuedLink = nil
     }
 
-    fileprivate func warnRegistration(_ message: String) {
+    fileprivate func warnRegistration(_ event: String, message: String) {
         guard running, !startingOver else { return }
-        if prompting { registrationWarning = message; return }
-        registrationWarningAlert(message).runModal()
+        registrationWarnings.append((event, message))
+        showNextRegistrationWarning()
+    }
+
+    private func showNextRegistrationWarning() {
+        guard running, !startingOver, !prompting, !registrationWarnings.isEmpty else { return }
+        prompting = true
+        let warning = registrationWarnings.removeFirst()
+        let recover = warning.event == "registration-key-gone"
+        let alert = registrationWarningAlert(warning.message, key: warning.event != "registration-warning", recover: recover)
+        if alert.runModal() == .alertSecondButtonReturn, recover, confirmSetAside(recover: true) { return }
+        prompting = false
     }
 
     private func stopped(_ failure: SignerStartFailure, link: String?) {
         running = false
-        registrationWarning = nil
+        registrationWarnings.removeAll()
         if startingOver {
             startingOver = false
             finishSetAside()
@@ -415,6 +542,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         }
         cleanupNeeded = false
         if state == "fresh" {
+            guard canSetUpWithTouchID() else { prompting = false; return }
             switch firstRunChoice() {
             case .alertSecondButtonReturn:
                 beginRecovery()
@@ -457,8 +585,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         alert.informativeText = "Coordinator: \(origin)\n\nOnly continue if this is the coordinator you intended. LokiSigner then asks it for the signer configuration and shows it to you before anything is saved."
         alert.addButton(withTitle: "Continue")
         alert.addButton(withTitle: "Cancel")
-        NSApp.activate(ignoringOtherApps: true)
-        return alert.runModal() == .alertFirstButtonReturn
+        return runDecisionAlert(alert, escape: .alertSecondButtonReturn) == .alertFirstButtonReturn
     }
 
     private func configurationText(_ config: [String: Any]) -> String {
@@ -498,9 +625,14 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         alert.accessoryView = password
         alert.addButton(withTitle: link == nil ? "Unlock" : "Pair")
         alert.addButton(withTitle: "Cancel")
-        alert.window.initialFirstResponder = password
-        NSApp.activate(ignoringOtherApps: true)
-        let answer = alert.runModal()
+        let answer: NSApplication.ModalResponse
+        if link != nil {
+            answer = runDecisionAlert(alert, escape: .alertSecondButtonReturn, field: password)
+        } else {
+            alert.window.initialFirstResponder = password
+            NSApp.activate(ignoringOtherApps: true)
+            answer = alert.runModal()
+        }
         alert.window.endEditing(for: password)
         guard answer == .alertFirstButtonReturn else {
             password.stringValue = ""
@@ -521,18 +653,23 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         DispatchQueue.global(qos: .userInitiated).async {
             defer { _ = secret.withUnsafeMutableBytes { $0.initializeMemory(as: UInt8.self, repeating: 0) } }
             let code = request.withCString { request in
-                secret.withUnsafeMutableBufferPointer { pass in loki_member_app_pair(request, pass.baseAddress!, nativeNotice, nativeApprove, nativeConfirmRoster) }
+                secret.withUnsafeMutableBufferPointer { pass in loki_member_app_pair(request, pass.baseAddress!, nativeNotice, nativeApprove, nativeConfirmRoster, nativeConnect) }
             }
-            let failure: SignerStartFailure
-            switch code {
-            case 3: failure = .unlock
-            case 4: failure = .deviceKey
-            case 5: failure = .registrationRefused
-            case 6: failure = .registrationFailed
-            default: failure = .unexpected
+            DispatchQueue.main.async {
+                let failure: SignerStartFailure
+                switch code {
+                case 3: failure = .unlock
+                case 4: failure = .deviceKey
+                case 5: failure = .registrationRefused
+                case 6: failure = .registrationFailed
+                case 7: failure = self.startupKeyFailure ?? .deviceKey
+                case 8: failure = .registrationRosterUnavailable
+                default: failure = .unexpected
+                }
+                self.startupKeyFailure = nil
+                // A consumed pairing link cannot unlock again. Resume from the saved pin instead.
+                self.stopped(failure, link: [3, 4, 7, 8].contains(code) ? link : nil)
             }
-            // A consumed pairing link cannot unlock again. Resume from the saved pin instead.
-            DispatchQueue.main.async { self.stopped(failure, link: [3, 4].contains(code) ? link : nil) }
         }
     }
 
@@ -592,7 +729,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
                     input.words.withUnsafeMutableBufferPointer { words in
                         input.pass.withUnsafeMutableBufferPointer { pass in
                             recoveryError(loki_member_app_restore_profile(request, words.baseAddress, words.count,
-                                pass.baseAddress, pass.count, file, nativeNotice, nativeApprove, nativeConfirmRoster))
+                                pass.baseAddress, pass.count, file, nativeNotice, nativeApprove, nativeConfirmRoster, nativeConnect))
                         }
                     }
                 }
@@ -643,6 +780,10 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
             }
         }
     }
+
+    @objc func disconnectWalletTabs(_ sender: Any?) {
+        loki_member_app_disconnect_wallet_tabs()
+    }
 }
 
 func runNativeSigner(arguments: [String], link: String?) -> Never {
@@ -664,6 +805,8 @@ func runNativeSigner(arguments: [String], link: String?) -> Never {
     let restore = actions.addItem(withTitle: "Restore a vault…", action: #selector(NativeSigner.restoreVault(_:)), keyEquivalent: "")
     restore.target = delegate
     actions.addItem(.separator())
+    let disconnect = actions.addItem(withTitle: "Disconnect all wallet tabs", action: #selector(NativeSigner.disconnectWalletTabs(_:)), keyEquivalent: "")
+    disconnect.target = delegate
     actions.addItem(withTitle: "Quit and lock LokiSigner", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     item.submenu = actions
     menu.addItem(item)

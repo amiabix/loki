@@ -1,9 +1,0 @@
-{
-  "name": "loki-g3-nonce-safety",
-  "private": true,
-  "type": "module",
-  "description": "G3 standalone nonce safety prototype: browser nonce store, crash and restore drills.",
-  "devDependencies": {
-    "playwright-core": "^1.64.1"
-  }
-}

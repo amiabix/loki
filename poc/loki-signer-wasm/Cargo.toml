@@ -1,5 +1,5 @@
-# wasm-bindgen bindings for the in-browser signer. A poc workspace member (like
-# wasm-spike, and excluded from default-members) so it inherits poc's Cargo.lock and
+# wasm-bindgen bindings for the in-browser signer. A poc workspace member (excluded
+# from default-members) so it inherits poc's Cargo.lock and
 # [patch] vendored deps; native `cargo build`/`test` from poc never build it. Build:
 # RUSTFLAGS='--cfg getrandom_backend="wasm_js"' wasm-pack build --dev --target web
 [package]
