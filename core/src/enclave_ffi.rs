@@ -241,7 +241,7 @@ pub extern "C" fn loki_member_app_stop() -> i32 {
 /// The coordinator origin and slot a pairing link names, checked without any network request.
 /// LokiSigner asks the member to confirm them before it contacts that coordinator. Returns
 /// `{"target": {"coordinator": "...", "slot": n}}` or `{"error": "..."}`; free it with
-/// [`loki_member_app_free`].
+/// [`loki_member_app_free`]. An already pinned origin or slot mismatch returns `different-pairing`.
 ///
 /// # Safety
 /// `launch` must be a live NUL-terminated UTF-8 string for this call.
@@ -359,7 +359,7 @@ pub unsafe extern "C" fn loki_member_app_restore_profile(
     words: *mut u8, words_len: usize,
     pass: *mut u8, pass_len: usize,
     file: *const std::ffi::c_char,
-    notify: extern "C" fn(*const std::ffi::c_char, *const std::ffi::c_char),
+    notify: NativeNotice,
     approve: NativeApprove,
     confirm_roster: NativeConfirmRoster,
     connect: NativeConnect,
@@ -387,11 +387,7 @@ pub unsafe extern "C" fn loki_member_app_restore_profile(
         let fetched = launch.config.apply_restore(&mut config, &launch.args, &launch.restore_origin).map_err(|_| error)?;
         crate::host::native_restore_new(&mut config, &pass, words, std::path::Path::new(file), &launch.restore_origin, fetched.as_ref())?;
         published = true;
-        let notice: crate::host::LocalNotice = std::sync::Arc::new(move |kind, message| {
-            if let (Ok(kind), Ok(message)) = (std::ffi::CString::new(kind), std::ffi::CString::new(message)) {
-                notify(kind.as_ptr(), message.as_ptr());
-            }
-        });
+        let notice = native_notice(notify);
         crate::host::run_native(config, pass, notice, native_approval(approve),
             native_roster_confirmation(confirm_roster), native_connect(connect), fetched)
             .map_err(|e| crate::signer::secure_element_apple::member_key_message(&e).unwrap_or(start_error))
@@ -399,10 +395,24 @@ pub unsafe extern "C" fn loki_member_app_restore_profile(
     restore_reply(result.unwrap_or(Err(if published { start_error } else { error })))
 }
 
+#[cfg(feature = "relay-communication")]
+type NativeNotice = extern "C" fn(*const std::ffi::c_char, *const std::ffi::c_char) -> i32;
+
+#[cfg(feature = "relay-communication")]
+fn native_notice(notify: NativeNotice) -> crate::host::LocalNotice {
+    std::sync::Arc::new(move |kind, message| {
+        match (std::ffi::CString::new(kind), std::ffi::CString::new(message)) {
+            (Ok(kind), Ok(message)) => notify(kind.as_ptr(), message.as_ptr()) == 1,
+            _ => false,
+        }
+    })
+}
+
 /// Native UI entry point. Unlock material crosses only this in-process ABI, never HTTP,
 /// argv, a file or stdout. `launch` is the launch given to [`loki_member_app_configuration`]
 /// plus `"config"`, the configuration it returned and the member reviewed. `notify` presents
-/// recovery words and startup notices; `approve` asks the member to approve each
+/// recovery words and startup notices, returning 1 only after the member has saved the words;
+/// `approve` asks the member to approve each
 /// payment before this device signs it; `confirm_roster` asks the member to compare a vault's
 /// roster code before this device agrees to it; `connect` asks about a single wallet tab.
 ///
@@ -416,16 +426,12 @@ pub unsafe extern "C" fn loki_member_app_restore_profile(
 pub unsafe extern "C" fn loki_member_app_pair(
     launch: *const std::ffi::c_char,
     pass: *mut std::ffi::c_char,
-    notify: extern "C" fn(*const std::ffi::c_char, *const std::ffi::c_char),
+    notify: NativeNotice,
     approve: NativeApprove,
     confirm_roster: NativeConfirmRoster,
     connect: NativeConnect,
 ) -> i32 {
-    let notice: crate::host::LocalNotice = std::sync::Arc::new(move |kind, message| {
-        if let (Ok(kind), Ok(message)) = (std::ffi::CString::new(kind), std::ffi::CString::new(message)) {
-            notify(kind.as_ptr(), message.as_ptr());
-        }
-    });
+    let notice = native_notice(notify);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(), String> {
         if launch.is_null() || pass.is_null() { return Err("missing native launch or unlock".into()); }
         let raw = std::ffi::CStr::from_ptr(pass).to_bytes();
@@ -434,7 +440,12 @@ pub unsafe extern "C" fn loki_member_app_pair(
         let pass = secret.map_err(|e| e.to_string())?;
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
-        struct Launch { args: Vec<String>, pairing_url: Option<String>, config: crate::host::NativeConfig }
+        struct Launch {
+            args: Vec<String>,
+            pairing_url: Option<String>,
+            profile_name: Option<String>,
+            config: crate::host::NativeConfig,
+        }
         let launch: Launch = serde_json::from_str(std::ffi::CStr::from_ptr(launch).to_str().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         let mut config = crate::host::native_config_from_args(&launch.args)?;
         if config.registration.is_some() { return Err("native pairing accepts registration only through its pairing link".into()); }
@@ -442,10 +453,15 @@ pub unsafe extern "C" fn loki_member_app_pair(
         // The values the member reviewed, checked again; never fetched a second time. A fetched
         // configuration is saved only after the profile unlocks.
         let fetched = launch.config.apply(&mut config, &launch.args, launch.pairing_url.as_deref())?;
-        config.registration = Some(match launch.pairing_url {
-            Some(link) => crate::host::RegistrationConfig::pairing(&link, config.development_http)?,
+        let registration = match launch.pairing_url {
+            Some(link) => {
+                let mut registration = crate::host::RegistrationConfig::pairing(&link, config.development_http)?;
+                if let Some(name) = launch.profile_name { registration.name = name; }
+                registration
+            }
             None => crate::host::RegistrationConfig::resume(&config.data, config.development_http)?,
-        });
+        };
+        config.registration = Some(registration);
         crate::host::run_native(config, pass, notice.clone(), native_approval(approve),
             native_roster_confirmation(confirm_roster), native_connect(connect), fetched)
     }));
@@ -462,6 +478,8 @@ pub unsafe extern "C" fn loki_member_app_pair(
                 7
             },
             "coordinator-roster-unreachable" => 8,
+            "invalid-profile-name" => 9,
+            "recovery-not-confirmed" => 10,
             _ => 1,
         },
         Err(_) => 2,
@@ -477,7 +495,7 @@ mod native_pairing_tests {
     fn native_restore_wipes_both_buffers_even_when_the_request_is_refused() {
         let mut words = b"not-valid-words\0never-echo-this".to_vec();
         let mut pass = b"not-valid-passphrase".to_vec();
-        extern "C" fn notice(_: *const std::ffi::c_char, _: *const std::ffi::c_char) {}
+        extern "C" fn notice(_: *const std::ffi::c_char, _: *const std::ffi::c_char) -> i32 { 0 }
         extern "C" fn refuse(_: *const std::ffi::c_char) -> i32 { 0 }
         let reply = unsafe { super::loki_member_app_restore_profile(std::ptr::null(),
             words.as_mut_ptr(), words.len(), pass.as_mut_ptr(), pass.len(), std::ptr::null(), notice, refuse, refuse, refuse_connect) };
@@ -496,13 +514,26 @@ mod native_pairing_tests {
 
     #[test]
     fn native_unlock_buffer_is_wiped_before_startup() {
-        extern "C" fn notice(_: *const std::ffi::c_char, _: *const std::ffi::c_char) {}
+        extern "C" fn notice(_: *const std::ffi::c_char, _: *const std::ffi::c_char) -> i32 { 0 }
         let launch = std::ffi::CString::new(r#"{"args":[]}"#).unwrap();
         extern "C" fn refuse(_: *const std::ffi::c_char) -> i32 { 0 }
         let mut pass = b"native passphrase\0".to_vec();
         let code = unsafe { super::loki_member_app_pair(launch.as_ptr(), pass.as_mut_ptr().cast(), notice, refuse, refuse, refuse_connect) };
         assert_eq!(code, 1); // Invalid config fails before any Enclave operation.
         assert!(pass.iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn native_notice_requires_the_explicit_confirmation_reply() {
+        use std::ffi::{c_char, CStr};
+        extern "C" fn reply(kind: *const c_char, text: *const c_char) -> i32 {
+            if unsafe { CStr::from_ptr(kind) }.to_bytes() != b"recovery" { return 0; }
+            unsafe { CStr::from_ptr(text) }.to_str().unwrap().parse().unwrap()
+        }
+        let notice = super::native_notice(reply);
+        assert!(notice("recovery", "1"));
+        for other in ["0", "-1", "1000"] { assert!(!notice("recovery", other)); }
+        assert!(!notice("pairing-claim-attempted", "1"));
     }
 
     #[test]
@@ -557,5 +588,11 @@ mod native_pairing_tests {
         let error = reply["error"].as_str().unwrap();
         assert!(!error.contains("recovery"), "{error}");
         assert!(!data.exists());
+        std::fs::create_dir(&data).unwrap();
+        std::fs::write(data.join("paired-coordinator.json"), r#"{"origin":"https://127.0.0.1:1","slot":7}"#).unwrap();
+        let wrong_slot = link.replace("slot=7", "slot=8");
+        let reply = query(super::loki_member_app_pairing_target, serde_json::json!({ "args": args, "pairing_url": wrong_slot }));
+        assert_eq!(reply, serde_json::json!({ "error": "different-pairing" }));
+        std::fs::remove_dir_all(data).unwrap();
     }
 }

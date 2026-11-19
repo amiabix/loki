@@ -163,8 +163,8 @@ impl NativeConfig {
         let Some(link) = pairing_url else { return Ok(paired) };
         let link = RegistrationConfig::pairing(link, config.development_http)?;
         let target = (link.coordinator, link.slot.ok_or("invalid pairing slot")?);
-        if let Some((origin, slot)) = paired.filter(|paired| *paired != target) {
-            return Err(format!("this profile is already paired with {origin} slot {slot}; a link for another coordinator or slot is refused"));
+        if paired.is_some_and(|paired| paired != target) {
+            return Err("different-pairing".into());
         }
         Ok(Some(target))
     }
@@ -547,7 +547,7 @@ mod tests {
             config.registration = Some(RegistrationConfig::pairing(&link, false).unwrap());
             std::sync::Arc::new(super::super::state::AppState { fetched_config: fetched, ..super::super::state::AppState::new(config) })
         };
-        let notice: super::super::LocalNotice = Arc::new(|_, _| {});
+        let notice: super::super::LocalNotice = Arc::new(|_, _| true);
         let wrong = state();
         // This launch signs with the fetched witnesses from memory, before anything is saved.
         let opened = wrong.clone();
@@ -558,6 +558,32 @@ mod tests {
         super::super::registration::start(&right, Some(Zeroizing::new("right passphrase".into())), Some(&notice)).await.unwrap();
         let saved = NativeConfig::resolve(&args, None, |_| panic!("the saved configuration is used")).unwrap();
         assert_eq!((saved.coordinator.as_str(), saved.frostd_url.as_str()), ("https://127.0.0.1:1", "https://frostd.example"));
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_unlock_uses_the_in_memory_configuration_when_saving_fails() {
+        let data = temp("unsaved");
+        let origin = "https://127.0.0.1:1";
+        pair(&data, origin, 7);
+        let args = args(&data, &[]);
+        let pass = "local unlock for unsaved configuration";
+        crate::profile::create(&data, pass, "Member").unwrap();
+        std::fs::create_dir(data.join(format!("{SAVED}.tmp"))).unwrap();
+        let shown = NativeConfig::resolve(&args, None, |_| Ok(deployment(served()))).unwrap();
+        let mut config = super::super::native_config_from_args(&args).unwrap();
+        let fetched_config = shown.apply(&mut config, &args, None).unwrap();
+        assert!(fetched_config.as_ref().unwrap().save_unlocked(&data).is_err());
+        config.registration = Some(RegistrationConfig::resume(&data, false).unwrap());
+        let state = Arc::new(super::super::state::AppState { fetched_config, ..super::super::state::AppState::new(config) });
+        assert_eq!(super::super::registration::start(&state, Some(Zeroizing::new(pass.into())), None).await.unwrap(), "ready");
+        assert!(state.session.read().await.is_some());
+        let opened = state.clone();
+        assert!(tokio::task::spawn_blocking(move || super::super::nonce_witness::RelayWitness::for_member(&opened, "test").is_ok()).await.unwrap());
+        assert!(!data.join(SAVED).exists());
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while state.registration_error.read().await.is_none() { tokio::time::sleep(std::time::Duration::from_millis(20)).await; }
+        }).await.unwrap();
         std::fs::remove_dir_all(data).unwrap();
     }
 
@@ -618,7 +644,7 @@ mod tests {
         let fetch = |_: &str| -> Result<Deployment, String> { Ok(deployment(other.clone())) };
         for link in [link("https://other.example", 7), link("https://coordinator.example", 8)] {
             let error = NativeConfig::resolve(&args(&data, &[]), Some(&link), fetch).err().unwrap();
-            assert!(error.contains("already paired"), "{error}");
+            assert_eq!(error, "different-pairing");
         }
         // A configuration claiming to be from another coordinator is refused when applied.
         let mut forged = NativeConfig::resolve(&args(&data, &[]), None, fetch).unwrap();

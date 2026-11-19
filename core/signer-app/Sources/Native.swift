@@ -3,10 +3,11 @@ import AppKit
 typealias ConnectCancellation = @convention(c) (UnsafeRawPointer?) -> Int32
 typealias ConnectDecision = @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?,
     UnsafeRawPointer?, ConnectCancellation) -> Int32
+typealias NativeNotice = @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Int32
 
 @_silgen_name("loki_member_app_pair")
 func loki_member_app_pair(_ launch: UnsafePointer<CChar>, _ pass: UnsafeMutablePointer<CChar>,
-    _ notify: @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Void,
+    _ notify: NativeNotice,
     _ approve: @convention(c) (UnsafePointer<CChar>?) -> Int32,
     _ confirmRoster: @convention(c) (UnsafePointer<CChar>?) -> Int32,
     _ connect: ConnectDecision) -> Int32
@@ -86,12 +87,13 @@ func loki_signer_approval_selftest(_ approve: @convention(c) (UnsafePointer<CCha
 /// another window. Keep native buttons so assistive technology can still press them.
 func runDecisionAlert(_ alert: NSAlert, timeout: TimeInterval? = nil,
                       escape: NSApplication.ModalResponse,
-                      field: NSTextField? = nil) -> NSApplication.ModalResponse {
+                      fields: [NSTextField] = []) -> NSApplication.ModalResponse {
     alert.layout()
     let window = alert.window
     let buttons = alert.buttons
     var controls: [NSView] = buttons
-    if let field { controls.append(field) }
+    controls.append(contentsOf: fields)
+    let field = fields.first
     for button in buttons {
         button.keyEquivalent = ""
         button.isEnabled = false
@@ -127,7 +129,7 @@ func runDecisionAlert(_ alert: NSAlert, timeout: TimeInterval? = nil,
         guard event.type == .keyDown else { return event }
 
         let focused = window.firstResponder
-        let editing = field.map { $0 === focused || $0.currentEditor() === focused } ?? false
+        let editing = fields.firstIndex { $0 === focused || (focused != nil && $0.currentEditor() === focused) }
         switch event.keyCode {
         case 36, 76: // Return, keypad Enter
             return nil
@@ -135,13 +137,13 @@ func runDecisionAlert(_ alert: NSAlert, timeout: TimeInterval? = nil,
             // Keep the field reachable even when macOS Keyboard Navigation is off.
             guard !event.isARepeat else { return nil }
             let reverse = event.modifierFlags.contains(.shift)
-            let current = editing ? controls.count - 1 : controls.firstIndex { $0 === focused }
+            let current = editing.map { buttons.count + $0 } ?? controls.firstIndex { $0 === focused }
             let next = current.map { ($0 + (reverse ? controls.count - 1 : 1)) % controls.count }
                 ?? (reverse ? controls.count - 1 : 0)
             window.makeFirstResponder(controls[next])
             return nil
         case 49: // Space
-            if editing { return event }
+            if editing != nil { return event }
             if !event.isARepeat { buttons.first { $0 === focused }?.performClick(nil) }
             return nil
         case 53: // Escape
@@ -356,20 +358,24 @@ func showConnectDialog(origin: String, code: String, cancelled: @escaping () -> 
     return runDecisionAlert(alert, escape: .alertFirstButtonReturn) == .alertSecondButtonReturn && !cancelled()
 }
 
-private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointer<CChar>?) {
-    guard let kind = kind, let message = message else { return }
+private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointer<CChar>?) -> Int32 {
+    guard let kind = kind, let message = message else { return 0 }
     let event = String(cString: kind), text = String(cString: message)
     if event == "registration-warning" || event == "registration-key" || event == "registration-key-gone" {
         // Rust supplies fixed copy here. Don't block its retry loop on an open dialog.
         DispatchQueue.main.async { (NSApp.delegate as? NativeSigner)?.warnRegistration(event, message: text) }
-        return
+        return 0
     }
     if event == "startup-key" || event == "startup-key-gone" {
         DispatchQueue.main.async { (NSApp.delegate as? NativeSigner)?.startupKeyFailure = event == "startup-key-gone" ? .keyGone(text) : .key(text) }
-        return
+        return 0
     }
-    // Synchronous delivery keeps recovery words on screen before registration continues.
-    DispatchQueue.main.sync {
+    // Synchronous delivery makes startup wait until the member acknowledges the recovery words.
+    return DispatchQueue.main.sync {
+        if event == "pairing-claim-attempted" {
+            (NSApp.delegate as? NativeSigner)?.markPairingClaimAttempted(text)
+            return 0
+        }
         let alert = NSAlert()
         if event == "ready" || event == "restore-ready" || event == "restore-pending" {
             alert.messageText = event == "ready" ? "LokiSigner is running" : "Vault restored"
@@ -384,8 +390,9 @@ private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointe
             alert.messageText = "Save your recovery words privately"
             alert.informativeText = text
             alert.addButton(withTitle: "I saved these words")
-            alert.runModal()
+            return runDecisionAlert(alert, escape: .abort) == .alertFirstButtonReturn ? 1 : 0
         }
+        return 0
     }
 }
 
@@ -402,6 +409,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
     private var cleanupNeeded = true
     private var retryLink: String?
     private var queuedLink: String?
+    private var attemptedPairingClaims: Set<String> = []
     private var startingOver = false
     private var recoveringKey = false
     private let args: [String]
@@ -421,9 +429,21 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
 
     func application(_ application: NSApplication, open urls: [URL]) {
         opened = true
-        guard let url = urls.first else { return }
-        if prompting { queuedLink = url.absoluteString }
-        else { start(url.absoluteString) }
+        guard let link = urls.lazy.map(\.absoluteString).first(where: { self.unusedPairingLink($0) != nil }) else { return }
+        if prompting { queuedLink = link }
+        else { start(link) }
+    }
+
+    private func unusedPairingLink(_ link: String?) -> String? {
+        guard let link else { return nil }
+        let items = URLComponents(string: link)?.queryItems ?? []
+        return items.contains { $0.name == "challenge" && $0.value.map(attemptedPairingClaims.contains) == true } ? nil : link
+    }
+
+    fileprivate func markPairingClaimAttempted(_ claim: String) {
+        attemptedPairingClaims.insert(claim)
+        queuedLink = unusedPairingLink(queuedLink)
+        retryLink = unusedPairingLink(retryLink)
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -519,6 +539,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
 
     func start(_ link: String?) {
         guard !prompting else { return }
+        let link = unusedPairingLink(link)
         prompting = true
         queuedLink = nil
         retryLink = link
@@ -563,7 +584,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
             let reply = nativeQuery(loki_member_app_pairing_target, launch)
             guard let target = reply["target"] as? [String: Any], let origin = target["coordinator"] as? String,
                   let slot = (target["slot"] as? NSNumber)?.stringValue else {
-                let different = (reply["error"] as? String)?.hasPrefix("this profile is already paired with ") == true
+                let different = reply["error"] as? String == "different-pairing"
                 retry(different ? .differentPairing : .invalidLink, link: link)
                 return
             }
@@ -575,7 +596,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         // A pairing link, or an unlock with nothing saved, asks the coordinator; keep the UI live.
         DispatchQueue.global(qos: .userInitiated).async {
             let reply = nativeQuery(loki_member_app_configuration, launch)
-            DispatchQueue.main.async { self.confirm(link: link, launch: launch, reply: reply) }
+            DispatchQueue.main.async { self.confirm(link: link, launch: launch, reply: reply, fresh: state == "fresh") }
         }
     }
 
@@ -605,7 +626,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
     }
 
     /// Shows the configuration before anything is saved; the member continues with exactly it.
-    private func confirm(link: String?, launch: [String: Any], reply: [String: Any]) {
+    private func confirm(link: String?, launch: [String: Any], reply: [String: Any], fresh: Bool) {
         guard let config = reply["config"] as? [String: Any] else {
             retry(.configuration, link: link)
             return
@@ -613,21 +634,35 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         let alert = NSAlert()
         let slot = (config["slot"] as? NSNumber)?.stringValue ?? "?"
         let endpoints = configurationText(config)
+        let password = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 420, height: 26))
+        password.placeholderString = "Local profile passphrase"
+        alert.accessoryView = password
+        var nameField: NSTextField?
         if link != nil {
             alert.messageText = "Pair this device with slot \(slot)?"
-            alert.informativeText = "\(endpoints)\nCreate or unlock your local profile below. These values are saved once it unlocks."
+            if fresh {
+                alert.informativeText = "\(endpoints)\nChoose an optional profile name for your wallet and set a local passphrase. The default name is Member."
+                let fields = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 60))
+                let name = NSTextField(frame: NSRect(x: 0, y: 34, width: 420, height: 26))
+                name.placeholderString = "Profile name (optional)"
+                name.setAccessibilityLabel("Profile name (optional)")
+                fields.addSubview(name)
+                fields.addSubview(password)
+                alert.accessoryView = fields
+                nameField = name
+            } else {
+                alert.informativeText = "\(endpoints)\nUnlock your local profile below. These values are saved once it unlocks."
+            }
         } else {
             alert.messageText = "Unlock your paired signer"
             alert.informativeText = "\(endpoints)\nFor a new device, cancel and open a pairing link from the wallet. Your passphrase stays in this app."
         }
-        let password = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 420, height: 26))
-        password.placeholderString = "Local profile passphrase"
-        alert.accessoryView = password
         alert.addButton(withTitle: link == nil ? "Unlock" : "Pair")
         alert.addButton(withTitle: "Cancel")
         let answer: NSApplication.ModalResponse
         if link != nil {
-            answer = runDecisionAlert(alert, escape: .alertSecondButtonReturn, field: password)
+            let fields = nameField.map { [$0, password] } ?? [password]
+            answer = runDecisionAlert(alert, escape: .alertSecondButtonReturn, fields: fields)
         } else {
             alert.window.initialFirstResponder = password
             NSApp.activate(ignoringOtherApps: true)
@@ -642,6 +677,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         guard !password.stringValue.isEmpty else { retry(.emptyPassphrase, link: link); return }
         var confirmed = launch
         confirmed["config"] = config
+        if let name = nameField?.stringValue, !name.isEmpty { confirmed["profile_name"] = name }
         guard let json = try? JSONSerialization.data(withJSONObject: confirmed), let request = String(data: json, encoding: .utf8) else {
             password.stringValue = ""
             retry(.unexpected, link: link)
@@ -664,11 +700,13 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
                 case 6: failure = .registrationFailed
                 case 7: failure = self.startupKeyFailure ?? .deviceKey
                 case 8: failure = .registrationRosterUnavailable
+                case 9: failure = .invalidProfileName
+                case 10: failure = .cancelled
                 default: failure = .unexpected
                 }
                 self.startupKeyFailure = nil
-                // A consumed pairing link cannot unlock again. Resume from the saved pin instead.
-                self.stopped(failure, link: [3, 4, 7, 8].contains(code) ? link : nil)
+                // A local failure before the claim was sent leaves the link usable.
+                self.stopped(failure, link: code == 0 ? nil : self.unusedPairingLink(link))
             }
         }
     }

@@ -36,7 +36,8 @@ pub(crate) use native_recovery::{clean_staging as native_clean_staging, profile_
 pub use nonce_witness::WitnessConfig;
 
 /// Device-local UI notifications; never forwarded to the coordinator or a log.
-pub type LocalNotice = std::sync::Arc<dyn Fn(&str, &str) + Send + Sync>;
+/// Only recovery setup uses the result: true means the member confirmed saving the words.
+pub type LocalNotice = std::sync::Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
 
 /// The member's own decision on one payment, asked on this device (the native app's dialog).
 /// Receives the signer-derived summary as JSON ([`approval_summary`]); `true` approves.
