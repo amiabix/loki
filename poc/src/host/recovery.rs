@@ -1,10 +1,9 @@
-//! Coordinator wiring for the native-signer recovery flow.
+//! Member host wiring for the native-signer recovery flow.
 //!
 //! Establishes the member's recovery identity (24 words shown ONCE; only the PUBLIC keys are
 //! persisted) and serves the independent recovery backup blob. Each per-vault backup is HPKE
-//! ciphertext to the member's words (see [`crate::signer::recovery`]): this coordinator stores
-//! it but cannot open it, and neither can an account login — so the login key is never the
-//! vault backup. The share itself is sealed into the backup by the signer during the ceremony
+//! ciphertext to the member's words (see [`crate::signer::recovery`]). The member host stores
+//! it locally; an account login cannot open it. The share is sealed into the backup during the ceremony
 //! ([`crate::signer::local::BackupDevice::save_recovery`]); this module only persists the
 //! public key the signer seals to, and hands the stored blob back for a restore.
 
@@ -51,8 +50,8 @@ pub(super) fn backup_file(signer_dir: &Path) -> PathBuf {
 
 /// Seal this vault's recovery backup: re-seal the share held in the passphrase-sealed
 /// `backup.sealed` to the member's recovery words (HPKE to its recovery public key), so a
-/// lost device can restore from the words alone ([`restore`] → [`crate::host::ceremony::
-/// restore_vault_from_backup`]). Called at vault activation. A no-op (not an error) when no
+/// replacement device can restore from the words and an exported copy of this file.
+/// Called at vault activation. A no-op (not an error) when no
 /// recovery identity is established, when `backup.sealed` is absent, or when the recovery
 /// backup already exists — so it is safe to call idempotently.
 ///
@@ -195,7 +194,11 @@ pub async fn establish_recovery(data: &Path) -> Result<Option<Zeroizing<String>>
     Ok(create_public_keys(data, &public_keys(&key))?.then_some(words))
 }
 
-/// POST /api/recovery-setup — establish the recovery identity once and return the 24 words for
+pub(super) async fn in_app_only() -> Reply {
+    err(StatusCode::FORBIDDEN, "Manage recovery words and restore vaults in LokiSigner.")
+}
+
+/// Headless only: POST /api/recovery-setup — establish the recovery identity once and return the 24 words for
 /// the member to write down. Persists only the public keys; refuses if one already exists (the
 /// words can never be reshown). Requires an unlocked session (a deliberate member action).
 pub(super) async fn setup(State(st): State<Shared>) -> Reply {
@@ -235,7 +238,9 @@ pub(super) async fn status(
         },
         None => false,
     };
-    ok(json!({ "recovery_identity": has_identity, "recovery_backup": has_backup }))
+    let mut reply = json!({ "recovery_identity": has_identity, "recovery_backup": has_backup });
+    if st.recovery_in_app { reply["recovery_in_app"] = json!(true); }
+    ok(reply)
 }
 
 /// GET /api/recovery-backup?vault=<id> — return the opaque recovery backup blob (hex) for a
@@ -258,7 +263,7 @@ pub(super) async fn fetch(
     }
 }
 
-/// POST /api/recovery-restore { vault, words, backup? } — rebuild this member's vault from a
+/// Headless only: POST /api/recovery-restore { vault, words, backup? } — rebuild this member's vault from a
 /// recovery backup using the 24 words. `backup` is the hex blob exported with
 /// `GET /api/recovery-backup`, needed on a new device; without it the stored blob is used.
 /// Requires an unlocked session (the restored vault is sealed under the profile passphrase).

@@ -73,12 +73,13 @@ impl Config {
     }
 
     pub(super) fn open_secure_element(&self, dir: &Path, pass: &str) -> Result<HostedSecureElement, String> {
-        let result = self.open_element(dir, pass);
+        let result = self.open_element(dir, pass, None);
         eprintln!("secure-element open: {}", if result.is_ok() { "ok" } else { "error" });
         result
     }
 
-    fn open_element(&self, dir: &Path, pass: &str) -> Result<HostedSecureElement, String> {
+    // A staged vault must use the same Enclave key after its directory is published.
+    pub(super) fn open_element(&self, dir: &Path, pass: &str, _published: Option<&Path>) -> Result<HostedSecureElement, String> {
         self.validate_secure_element()?;
         #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
         if self.secure_element == "apple" {
@@ -89,7 +90,10 @@ impl Config {
                 .create(dir)
                 .map_err(|e| format!("signer directory: {e}"))?;
             // Scope the persistent key to this signer directory, resolving path aliases.
-            let dir = dir.canonicalize().map_err(|e| format!("signer directory: {e}"))?;
+            let dir = match _published {
+                Some(path) => path.to_owned(),
+                None => dir.canonicalize().map_err(|e| format!("signer directory: {e}"))?,
+            };
             let mut tag = b"cash.loki.member.kek.v1:".to_vec();
             tag.extend_from_slice(dir.as_os_str().as_encoded_bytes());
             return crate::signer::secure_element_apple::AppleSecureElement::persistent(&tag)
@@ -172,6 +176,8 @@ pub struct AppState {
     pub(super) roster_asking: std::sync::Mutex<Option<String>>,
     /// Vaults whose codes the member said differ, refused until the app restarts.
     pub(super) roster_refused: std::sync::Mutex<BTreeSet<String>>,
+    /// Only the GUI entry point handles recovery locally. Headless scripted approval is separate.
+    pub(super) recovery_in_app: bool,
     /// Each vault's group viewing key, read from its device-bound signer once per process.
     pub(super) viewing_keys: std::sync::Mutex<BTreeMap<String, orchard::keys::FullViewingKey>>,
     /// The signer configuration LokiSigner fetched for this launch, saved once the profile unlocks.
@@ -194,6 +200,7 @@ impl AppState {
             roster_confirmation: None,
             roster_asking: std::sync::Mutex::new(None),
             roster_refused: std::sync::Mutex::new(BTreeSet::new()),
+            recovery_in_app: false,
             viewing_keys: std::sync::Mutex::new(BTreeMap::new()),
             fetched_config: None,
         }

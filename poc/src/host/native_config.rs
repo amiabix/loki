@@ -97,6 +97,33 @@ impl NativeConfig {
         Self::resolve(args, pairing_url, fetch)
     }
 
+    #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+    pub(crate) fn recovery_origin(args: &[String], origin: &str) -> Result<String, String> {
+        let config = super::config_from_args(args)?;
+        super::registration::plain_origin(origin, config.development_http)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+    pub(crate) fn preview_restore(args: &[String], origin: &str) -> Result<Self, String> {
+        let origin = Self::recovery_origin(args, origin)?;
+        let deployment = fetch(&origin)?;
+        Self::resolve_restore(args, origin, deployment)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+    fn resolve_restore(args: &[String], origin: String, deployment: Deployment) -> Result<Self, String> {
+        // The coordinator slot is unknown until we open the backup and find its identity.
+        Self::merge(args, Some((origin, 0)), Some(deployment.clone()), Some(deployment), super::config_from_args(args)?.development_http)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+    pub(crate) fn apply_restore(self, config: &mut Config, args: &[String], origin: &str) -> Result<Option<FetchedConfig>, String> {
+        let origin = Self::recovery_origin(args, origin)?;
+        let deployment = self.fetched.clone().ok_or("missing restored profile configuration")?;
+        let resolved = Self::resolve_restore(args, origin, deployment)?;
+        self.apply_resolved(config, args, resolved)
+    }
+
     /// The coordinator and slot a pairing link names, checked without any network request, for
     /// the member to confirm before LokiSigner asks that coordinator for anything.
     pub fn pairing_target(args: &[String], pairing_url: &str) -> Result<(String, u32), String> {
@@ -110,6 +137,10 @@ impl NativeConfig {
     pub fn apply(self, config: &mut Config, args: &[String], pairing_url: Option<&str>) -> Result<Option<FetchedConfig>, String> {
         let shown = self.fetched.clone();
         let resolved = Self::resolve(args, pairing_url, |_| shown.ok_or_else(|| "the confirmed configuration is missing".to_string()))?;
+        self.apply_resolved(config, args, resolved)
+    }
+
+    fn apply_resolved(self, config: &mut Config, args: &[String], resolved: Self) -> Result<Option<FetchedConfig>, String> {
         if resolved != self {
             return Err("the configuration changed after it was shown; open LokiSigner again".into());
         }

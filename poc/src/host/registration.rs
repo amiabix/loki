@@ -77,7 +77,7 @@ impl RegistrationConfig {
 #[serde(deny_unknown_fields)]
 struct PairedCoordinator { origin: String, slot: u32 }
 
-fn plain_origin(value: &str, development_http: bool) -> Result<String, String> {
+pub(super) fn plain_origin(value: &str, development_http: bool) -> Result<String, String> {
     let url = reqwest::Url::parse(value).map_err(|_| "invalid origin")?;
     let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
     if url.origin().ascii_serialization() != value || !url.username().is_empty() || url.password().is_some()
@@ -205,15 +205,15 @@ async fn register(config: &Config, pass: &str, pairing_claim: Option<&str>) -> R
 /// the background. Only local failures (the unlock file, the profile, the saved pairing) stop
 /// the app; an unreachable or refusing coordinator is logged and retried, and the local API
 /// keeps serving meanwhile.
-pub(super) async fn start(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option<&super::LocalNotice>) -> Result<(), String> {
+pub(super) async fn start(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option<&super::LocalNotice>) -> Result<&'static str, String> {
     use std::io::IsTerminal;
     start_with(st, pass, notice, std::io::stdout().is_terminal()).await
 }
 
 /// `interactive`: standard output is a terminal, so recovery words printed there reach the
 /// member and not a log file.
-async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option<&super::LocalNotice>, interactive: bool) -> Result<(), String> {
-    let Some(launch) = &st.config.registration else { return Ok(()); };
+async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option<&super::LocalNotice>, interactive: bool) -> Result<&'static str, String> {
+    let Some(launch) = &st.config.registration else { return Ok("ready"); };
     let pass = match pass {
         Some(pass) => pass,
         None => {
@@ -232,11 +232,16 @@ async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option
     let data = st.config.data.clone();
     let name = launch.name.clone();
     let secret = pass.clone();
+    let restored = st.config.data.join(RESTORE_PENDING).is_file();
     let session = tokio::task::spawn_blocking(move || {
         if !crate::profile::exists(&data) { crate::profile::create(&data, &secret, &name)?; }
         Session::unlock(data, secret).map(|(session, _)| session)
     }).await.map_err(|e| e.to_string())??;
-    if notice.is_some() || interactive {
+    if restored {
+        // A published restore already adopted its words. Never mint different words for it,
+        // even if someone deleted one of its files after publication.
+        if !super::recovery::exists(&st.config.data) { return Err("The restored recovery identity is missing.".into()); }
+    } else if notice.is_some() || interactive {
         if let Some(words) = super::recovery::establish_recovery(&st.config.data).await? {
             if let Some(notice) = notice { notice("recovery", words.as_str()); }
             else { println!("Member {} ({}) — save these recovery words privately (shown once): {}", launch.name, st.config.data.display(), words.as_str()); }
@@ -253,11 +258,21 @@ async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option
     // Keep the public resume destination before consuming a claim; a lost reply is retryable.
     if let Some(slot) = launch.slot { save_coordinator(&st.config.data, &launch.coordinator, slot)?; }
     // Only an unlocked profile saves (or refreshes) the configuration it was paired with.
-    if let Some(fetched) = &st.fetched_config { fetched.save_unlocked(&st.config.data)?; }
+    if !restored {
+        if let Some(fetched) = &st.fetched_config { fetched.save_unlocked(&st.config.data)?; }
+    }
     *st.session.write().await = Some(session);
-    tokio::spawn(keep_registering(st.clone(), pass));
-    Ok(())
+    if restored {
+        // The profile is already committed; registration can fail without losing the restore.
+        if register_once(st, pass.clone(), None).await.is_ok() { return Ok("restore-ready"); }
+        *st.registration_error.write().await = Some(RESTORE_RETRY.into());
+    }
+    tokio::spawn(keep_registering(st.clone(), pass, restored));
+    Ok(if restored { "restore-pending" } else { "ready" })
 }
+
+pub(super) const RESTORE_PENDING: &str = "restore-registration-pending";
+const RESTORE_RETRY: &str = "Vault restored. LokiSigner could not reconnect to the coordinator yet; it will retry without your recovery words.";
 
 /// One registration attempt; on success the public roster entry is saved and served.
 async fn register_once(st: &Shared, pass: Zeroizing<String>, pairing_claim: Option<String>) -> Result<PublicMember, String> {
@@ -269,16 +284,18 @@ async fn register_once(st: &Shared, pass: Zeroizing<String>, pairing_claim: Opti
     }).await.map_err(|e| e.to_string())??;
     save_coordinator(&st.config.data, &launch.coordinator, member.slot)?;
     *st.registration.write().await = Some(member.clone());
+    let _ = std::fs::remove_file(st.config.data.join(RESTORE_PENDING));
     Ok(member)
 }
 
 /// Retry registration with backoff (5 s doubling to 5 min) until the coordinator accepts it.
-async fn keep_registering(st: Shared, pass: Zeroizing<String>) {
+async fn keep_registering(st: Shared, pass: Zeroizing<String>, restored: bool) {
     let mut wait = std::time::Duration::from_secs(5);
     // The coordinator consumes a pairing claim even when its reply is lost, so only the first
     // attempt carries it. Later attempts resume against the saved coordinator and slot, which
     // the coordinator accepts once the claim's reservation expires (or as the same identity).
     let mut pairing_claim = st.config.registration.as_ref().and_then(|launch| launch.pairing_challenge.clone());
+    if restored { tokio::time::sleep(wait).await; }
     loop {
         match register_once(&st, pass.clone(), pairing_claim.take()).await {
             Ok(member) => {
@@ -286,6 +303,7 @@ async fn keep_registering(st: Shared, pass: Zeroizing<String>) {
                 return;
             }
             Err(e) => {
+                let e = if restored { RESTORE_RETRY.into() } else { e };
                 eprintln!("coordinator registration failed, retrying in {}s (the local signer keeps running): {e}", wait.as_secs());
                 *st.registration_error.write().await = Some(e);
             }
@@ -295,12 +313,13 @@ async fn keep_registering(st: Shared, pass: Zeroizing<String>) {
     }
 }
 
-fn save_coordinator(data: &std::path::Path, origin: &str, slot: u32) -> Result<(), String> {
+pub(super) fn save_coordinator(data: &std::path::Path, origin: &str, slot: u32) -> Result<(), String> {
     if data.join("paired-coordinator.json").try_exists().map_err(|e| e.to_string())? {
         let existing = RegistrationConfig::resume(data, true)?;
         if existing.coordinator != origin || existing.slot != Some(slot) {
             return Err("this profile is already paired with a different coordinator or slot".into());
         }
+        return Ok(());
     }
     let saved = PairedCoordinator { origin: origin.into(), slot };
     let dir = MemberDir::create(data, "").map_err(|e| e.to_string())?;

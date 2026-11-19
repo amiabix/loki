@@ -24,12 +24,14 @@ import {
   restoreSigner,
   setupBrowserRecovery,
   signerKind,
+  recoveryBackup,
   recoveryRestore,
   recoverySetup,
   recoveryStatus,
   type CustodyMethod,
   type PairingLink,
   type PendingApproval,
+  type RecoveryStatus,
 } from "@/lib/api";
 import { comparesInLokiSigner, invitePreview, nativeRosterRefusal, pairingSecondsLeft, paymentLabel, rememberedVaultSlot, rememberVaultSlot, verifyPhrase } from "@/lib/wallet-ui";
 import { toggleTheme, useIsDark } from "@/lib/theme";
@@ -1762,12 +1764,11 @@ function BrowserBackupCard({ vault }: { vault: string }) {
 // ─── recovery ───────────────────────────────────────────────────────────────
 
 /**
- * Per-vault recovery controls. "Set up recovery" mints the 24 words (shown ONCE — Loki never
- * stores them); "Restore access" rebuilds this member's share from its encrypted backup using
- * those words. The account login can never open the backup — only the words can.
+ * Per-vault recovery status. LokiSigner only exposes the encrypted backup; a headless
+ * member keeps the original HTTP setup and restore controls.
  */
 function RecoveryCard({ vault }: { vault: string }) {
-  const [status, setStatus] = useState<{ recovery_identity: boolean; recovery_backup: boolean } | null>(null);
+  const [status, setStatus] = useState<RecoveryStatus | null>(null);
   const [words, setWords] = useState<string | null>(null);
   const [mode, setMode] = useState<"idle" | "restoring">("idle");
   const [entry, setEntry] = useState("");
@@ -1784,6 +1785,21 @@ function RecoveryCard({ vault }: { vault: string }) {
     finally { setChecking(false); }
   }, [vault]);
   useEffect(() => { void refresh(); }, [refresh]);
+
+  const inApp = status?.recovery_in_app === true;
+  const download = async () => {
+    setBusy(true); setErr(null);
+    try {
+      const { vault: id, backup } = await recoveryBackup(vault);
+      const url = URL.createObjectURL(new Blob([JSON.stringify({ vault: id, backup })], { type: "application/json" }));
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `loki-recovery-${vault}.json`;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  };
 
   const setup = async () => {
     setBusy(true); setErr(null);
@@ -1808,7 +1824,7 @@ function RecoveryCard({ vault }: { vault: string }) {
   return (
     <GlassCard>
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-        <h3 data-screen-heading={words || mode === "restoring" ? true : undefined} className="eyebrow">{words ? "Save your recovery phrase" : mode === "restoring" ? "Restore your share" : "Recovery"}</h3>
+        <h3 data-screen-heading={!inApp && (words || mode === "restoring") ? true : undefined} className="eyebrow">{inApp ? "Recovery" : words ? "Save your recovery phrase" : mode === "restoring" ? "Restore your share" : "Recovery"}</h3>
         <span className="text-xs text-muted">
           {checking ? "Checking recovery…" : statusError ? "Status unavailable" : status?.recovery_identity ? (status.recovery_backup ? "backed up" : "no vault backup yet") : "not set up"}
         </span>
@@ -1816,7 +1832,15 @@ function RecoveryCard({ vault }: { vault: string }) {
 
       {statusError && <div className="mb-3"><ErrMsg msg={`Could not check recovery: ${statusError}`} /><Btn variant="ghost" onClick={refresh}>Retry recovery status</Btn></div>}
       {checking && <p role="status" className="mb-3 text-sm text-muted">Loading recovery status…</p>}
-      {words ? (
+      {inApp ? (
+        <div>
+          <p className="mb-2 text-xs text-muted">Use LokiSigner for recovery words and for restoring vaults. Never enter your words on this page.</p>
+          <p className="mb-3 text-xs text-muted">Save the encrypted backup somewhere other than this Mac. If you lose this Mac without the file, the words alone cannot restore this vault.</p>
+          <Btn variant="ghost" disabled={busy || checking || !!statusError || !status?.recovery_backup} onClick={download}>
+            {busy ? "Downloading…" : "Download encrypted backup"}
+          </Btn>
+        </div>
+      ) : !status ? null : words ? (
         <div>
           <p className="mb-2 text-xs text-amber">
             Write these 24 words down and keep them offline. They are shown once. Restoring your
@@ -1860,8 +1884,8 @@ function RecoveryCard({ vault }: { vault: string }) {
         </div>
       )}
 
-      {!words && mode === "idle" && status && !statusError && !checking && !status.recovery_backup && <p className="mt-3 text-xs text-muted">No stored backup is available for this vault. A phrase alone cannot restore it here.</p>}
-      {msg && <p role="status" className="mt-3 rounded-xl bg-mint/5 p-3 text-sm text-mint">{msg}</p>}
+      {!inApp && !words && mode === "idle" && status && !statusError && !checking && !status.recovery_backup && <p className="mt-3 text-xs text-muted">No stored backup is available for this vault. A phrase alone cannot restore it here.</p>}
+      {!inApp && msg && <p role="status" className="mt-3 rounded-xl bg-mint/5 p-3 text-sm text-mint">{msg}</p>}
       <ErrMsg msg={err} />
     </GlassCard>
   );

@@ -193,6 +193,10 @@ pub(super) fn load(data: &Path, pass: &str, vault: &str) -> Result<Ceremony, Str
 fn save(data: &Path, pass: &str, c: &Ceremony) -> Result<(), String> {
     let root = data.join("vaults");
     let d = MemberDir::create(&root, &c.vault).map_err(|e| e.to_string())?;
+    save_to(&d, pass, c)
+}
+
+fn save_to(d: &MemberDir, pass: &str, c: &Ceremony) -> Result<(), String> {
     let temp = format!("ceremony.{}.sealed", Uuid::new_v4());
     d.write_sealed(
         &temp,
@@ -2202,6 +2206,198 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn native_recovery_publishes_only_a_matching_profile_and_resumes_registration_without_words() {
+        use crate::host::{native_recovery, registration, RegistrationConfig};
+        use crate::signer::{backup, recovery::RecoveryKey};
+        use axum::{routing::{get, post}, Json, Router};
+        use std::sync::{Arc, Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}};
+
+        let root = std::env::temp_dir().join(format!("loki-native-restore-{}", Uuid::new_v4()));
+        let data = root.join("restored");
+        let pass = "native restore fixture passphrase";
+        let vault = [9; 32];
+        let vault_hex = hex::encode(vault);
+        let (material, _, public) = dealer_vault(&root.join("old"), vault, pass);
+        let (words, key) = RecoveryKey::generate().unwrap();
+        let (other_words, other_key) = RecoveryKey::generate().unwrap();
+        let exported = |m: &backup::BackupMaterial| json!({
+            "vault": hex::encode(m.vault_id), "backup": hex::encode(backup::create_to_recovery(m, &key.public_bytes()).unwrap().0),
+        });
+        let file = root.join("recovery.json");
+        let document = exported(&material);
+        let identity = Identity::from_secret_bytes(&material.identity).unwrap().public();
+        let signing = hex::encode(identity.signing);
+        let relay = hex::encode(identity.encryption);
+        // Coordinator slot deliberately differs from the backup's FROST member id.
+        let entry = json!({"slot": 31, "signing_pubkey": signing, "relay_pubkey": relay, "advertise_url": "http://127.0.0.1:10000"});
+        let mut wrong_relay = entry.clone();
+        wrong_relay["relay_pubkey"] = json!(hex::encode([78; 32]));
+        let roster = Arc::new(Mutex::new(vec![wrong_relay.clone()]));
+        let roster_reads = Arc::new(AtomicUsize::new(0));
+        let allow_registration = Arc::new(AtomicBool::new(false));
+        let enrollment = Arc::new(Mutex::new(Vec::new()));
+        let (r, reads, allow, received) = (roster.clone(), roster_reads.clone(), allow_registration.clone(), enrollment.clone());
+        let app = Router::new()
+            .route("/api/members", get(move || {
+                reads.fetch_add(1, Ordering::SeqCst);
+                let result = json!({"slots": *r.lock().unwrap()});
+                async move { Json(result) }
+            }).post(|Json(body): Json<Value>| async move {
+                Json(json!({"member": {"slot": body["slot"], "signing_pubkey": body["signing_pubkey"],
+                    "relay_pubkey": body["relay_pubkey"], "advertise_url": body["advertise_url"]}}))
+            }))
+            .route("/api/members/challenge", post(move |Json(body): Json<Value>| {
+                received.lock().unwrap().push(body);
+                let ok = allow.load(Ordering::SeqCst);
+                async move {
+                    if !ok { return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE); }
+                    Ok(Json(json!({"challenge": "ab".repeat(32)})))
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let config = || crate::host::config_from_args(&[
+            "--data".into(), data.to_str().unwrap().into(), "--port".into(), "10001".into(), "--development-http".into(),
+        ]).unwrap();
+
+        let mut settings = config();
+        let mut wrong_vault = document.clone();
+        wrong_vault["vault"] = json!(hex::encode([8; 32]));
+        let refused = "LokiSigner could not restore this vault. Check the recovery words and backup, then try again.";
+        let bad_file = "Choose a valid LokiSigner recovery backup file (at most 256 KiB).";
+        let mismatch = "The coordinator roster does not identify exactly one slot for this backup.";
+        let secret = |words: &str| Zeroizing::new(words.as_bytes().to_vec());
+        tokio::task::block_in_place(|| {
+            for (contents, input, expected) in [
+                (document.to_string(), other_words.as_str(), refused),
+                (wrong_vault.to_string(), words.as_str(), refused),
+                (format!("{}!", document), words.as_str(), bad_file),
+                (format!("{document}{}", " ".repeat(256 * 1024)), words.as_str(), bad_file),
+                (format!(r#"{{"vault":"{vault_hex}","vault":"{vault_hex}","backup":{}}}"#, document["backup"]), words.as_str(), bad_file),
+            ] {
+                std::fs::write(&file, contents).unwrap();
+                assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(input), &file, &origin, None), Err(expected));
+                assert!(!data.exists());
+            }
+            assert_eq!(roster_reads.load(Ordering::SeqCst), 0, "invalid backups never reach the roster lookup");
+            std::fs::write(&file, document.to_string()).unwrap();
+            assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None), Err(mismatch));
+            assert!(!data.exists());
+            *roster.lock().unwrap() = vec![entry.clone(), entry.clone()];
+            assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None), Err(mismatch));
+            assert!(!data.exists());
+            *roster.lock().unwrap() = vec![wrong_relay, entry];
+            settings.secure_element = "invalid fixture backend".into();
+            assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None), Err(refused));
+            assert!(!data.exists(), "even a failure during installation must not publish the profile");
+            settings.secure_element = "software".into();
+            native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None).unwrap();
+        });
+        let old_pub = std::fs::read(data.join("recovery.pub")).unwrap();
+        assert_eq!(old_pub, [key.public_bytes(), key.signing_public()].concat());
+        assert_eq!(settings.registration.as_ref().unwrap().slot, Some(31));
+        let mut state = AppState::new(settings);
+        state.recovery_in_app = true;
+        let state = Arc::new(state);
+        let notice: crate::host::LocalNotice = Arc::new(|_, _| panic!("restored profile must never mint new words"));
+        let unlock = || Some(Zeroizing::new(pass.into()));
+        assert_eq!(registration::start(&state, unlock(), Some(&notice)).await.unwrap(), "restore-pending");
+        assert_eq!(state.registration_error.read().await.as_deref(), Some("Vault restored. LokiSigner could not reconnect to the coordinator yet; it will retry without your recovery words."));
+        assert!(data.join(registration::RESTORE_PENDING).exists());
+        assert!(crate::profile::exists(&data));
+        assert!(state.registration.read().await.is_none());
+
+        let s = state.clone();
+        tokio::task::block_in_place(|| {
+            let signer = crate::host::custody::open_signer(&s, &data, pass, &vault_hex, 1, Box::new(|_| false)).unwrap();
+            assert_eq!(signer.hosted_metadata().unwrap().0.verifying_key(), public.verifying_key());
+
+            // Same words with another member's valid backup must not install into a running profile.
+            let (other_member, _, _) = dealer_vault(&root.join("other"), [7; 32], pass);
+            std::fs::write(&file, exported(&other_member).to_string()).unwrap();
+            let wrong_profile = "This backup or these recovery words do not match the unlocked LokiSigner profile.";
+            assert_eq!(native_recovery::restore_running(&s, secret(&words), &file), Err(wrong_profile));
+            assert!(!dir(&data, &hex::encode([7; 32])).unwrap().path().exists());
+
+            // Another vault for the same member: change the vault-bound roster and fingerprint.
+            let mut another_vault = material;
+            another_vault.vault_id = [6; 32];
+            let another_hex = hex::encode(another_vault.vault_id);
+            let mut vault_roster: Value = serde_json::from_slice(&another_vault.roster).unwrap();
+            vault_roster["vault"] = json!(another_hex);
+            another_vault.roster = serde_json::to_vec(&vault_roster).unwrap();
+            another_vault.roster_fingerprint = crate::member_state::Roster::from_bytes(&another_vault.roster).unwrap().fingerprint();
+            std::fs::write(&file, exported(&another_vault).to_string()).unwrap();
+            let other_pub = [other_key.public_bytes(), other_key.signing_public()].concat();
+            std::fs::write(data.join("recovery.pub"), &other_pub).unwrap();
+            assert_eq!(native_recovery::restore_running(&s, secret(&words), &file), Err(wrong_profile));
+            assert_eq!(std::fs::read(data.join("recovery.pub")).unwrap(), other_pub);
+            assert!(!dir(&data, &another_hex).unwrap().path().exists());
+            std::fs::write(data.join("recovery.pub"), &old_pub).unwrap();
+            native_recovery::restore_running(&s, secret(&words), &file).unwrap();
+            assert!(dir(&data, &another_hex).unwrap().exists("vault.sealed"));
+        });
+
+        // Restart from disk. Its saved coordinator/slot and local passphrase are enough.
+        let mut resumed = config();
+        resumed.registration = Some(RegistrationConfig::resume(&data, true).unwrap());
+        let resumed = Arc::new(AppState::new(resumed));
+        allow_registration.store(true, Ordering::SeqCst);
+        assert_eq!(registration::start(&resumed, unlock(), Some(&notice)).await.unwrap(), "restore-ready");
+        let registered = resumed.registration.read().await.clone().unwrap();
+        assert_eq!(registered.slot, 31);
+        assert_eq!(registered.signing_pubkey, signing);
+        assert_eq!(registered.relay_pubkey, relay);
+        assert!(!data.join(registration::RESTORE_PENDING).exists());
+        let sent = enrollment.lock().unwrap();
+        assert!(sent.len() >= 2);
+        for request in sent.iter() {
+            assert_eq!(request.as_object().unwrap().keys().collect::<Vec<_>>(), ["advertise_url", "authorization", "device_pubkey", "relay_pubkey", "signing_pubkey", "slot"]);
+            assert_eq!(request["slot"], 31);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_http_never_extracts_recovery_words_and_keeps_the_ciphertext_routes() {
+        let data = std::env::temp_dir().join(format!("loki-native-routes-{}", Uuid::new_v4()));
+        let mut state = AppState::new(crate::host::config_from_args(&[
+            "--data".into(), data.to_str().unwrap().into(), "--port".into(), "0".into(),
+        ]).unwrap());
+        state.recovery_in_app = true;
+        let token = state.config.token.clone();
+        *state.session.write().await = Some(Session { data: data.clone(), passphrase: Zeroizing::new("test".into()) });
+        let vault = hex::encode([61; 32]);
+        let signer_dir = signer_dir(&data, &vault).unwrap();
+        std::fs::create_dir_all(&signer_dir).unwrap();
+        std::fs::write(crate::host::recovery::backup_file(&signer_dir), [8; 16]).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, crate::host::routes::router(std::sync::Arc::new(state))).await });
+        let client = reqwest::Client::new();
+        for (path, body) in [
+            ("recovery-setup", "{}"),
+            ("recovery-restore", r#"{"vault":"ignored","words":"UNIQUE-RECOVERY-SECRET"}"#),
+            ("recovery-restore", r#"{"words":"UNIQUE-RECOVERY-SECRET"!}"#),
+        ] {
+            let response = client.post(format!("{base}/api/{path}")).header("x-loki-token", &token)
+                .header("content-type", "application/json").body(body).send().await.unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+            assert_eq!(response.json::<Value>().await.unwrap(), json!({"error": "Manage recovery words and restore vaults in LokiSigner."}));
+        }
+        for (path, expected) in [
+            ("recovery-status", json!({"recovery_identity": false, "recovery_backup": true, "recovery_in_app": true})),
+            ("recovery-backup", json!({"vault": vault, "backup": "08".repeat(16)})),
+        ] {
+            assert_eq!(client.get(format!("{base}/api/{path}?vault={vault}")).header("x-loki-token", &token)
+                .send().await.unwrap().json::<Value>().await.unwrap(), expected);
+        }
+        assert!(!data.join("recovery.pub").exists());
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
 }
 
 // ---- self-custody helpers ported from the speedmaster host (device pairing + recovery restore) ----
@@ -2257,16 +2453,37 @@ pub(super) fn restore_vault_from_backup(
     config: &super::Config,
 ) -> Result<(), String> {
     let key = crate::signer::recovery::RecoveryKey::from_words(words)?;
-    let sdir = signer_dir(data, vault)?;
-    let local = super::recovery::backup_file(&sdir);
+    let dir = dir(data, vault)?;
+    let local = super::recovery::backup_file(&dir.path().join("signer"));
     let blob = match backup {
         Some(blob) => blob.to_vec(),
         None => std::fs::read(&local)
             .map_err(|_| "no recovery backup for this vault; supply the exported backup".to_string())?,
     };
-    let vault_id = vault_bytes(vault)?;
-    let material = crate::signer::backup::verify_recovery(&BackupArtifact(blob.clone()), &key, &vault_id)?;
+    restore_opened_backup(RecoveryBackup::open(vault, key, blob)?, data, &dir, pass, config, None)
+}
 
+pub(super) struct RecoveryBackup {
+    pub(super) material: crate::signer::backup::BackupMaterial,
+    pub(super) key: crate::signer::recovery::RecoveryKey,
+    blob: Vec<u8>,
+    vault: String,
+}
+
+impl RecoveryBackup {
+    pub(super) fn open(vault: &str, key: crate::signer::recovery::RecoveryKey, blob: Vec<u8>) -> Result<Self, String> {
+        let artifact = BackupArtifact(blob);
+        let material = crate::signer::backup::verify_recovery(&artifact, &key, &vault_bytes(vault)?)?;
+        Ok(Self { material, key, blob: artifact.0, vault: vault.into() })
+    }
+}
+
+pub(super) fn restore_opened_backup(backup: RecoveryBackup, data: &Path, dest: &MemberDir, pass: &str, config: &super::Config, published_key_dir: Option<&Path>) -> Result<(), String> {
+    let RecoveryBackup { material, key, blob, vault } = backup;
+    let vault = vault.as_str();
+    let vault_id = material.vault_id;
+    let sdir = dest.path().join("signer");
+    let local = super::recovery::backup_file(&sdir);
     let pp = frost::keys::PublicKeyPackage::deserialize(&material.public_package)
         .map_err(|e| e.to_string())?;
     let kp = frost::keys::KeyPackage::deserialize(&material.key_package).map_err(|e| e.to_string())?;
@@ -2293,7 +2510,7 @@ pub(super) fn restore_vault_from_backup(
     if network.label() != config.network {
         return Err("recovery backup is for a different network".into());
     }
-    if dir(data, vault)?.exists("vault.sealed") {
+    if dest.exists("vault.sealed") {
         return Err("vault already exists; restore into a fresh device profile".into());
     }
     // The profile's identity serves every vault it holds, so restore never replaces one.
@@ -2348,7 +2565,11 @@ pub(super) fn restore_vault_from_backup(
         // Regtest vaults are born at height 2 (`setup_birth_height`); Testnet backups carry theirs.
         material.birth_height.unwrap_or(2), network,
     )?;
-    let se = config.open_secure_element(&sdir, pass)?;
+    let se = if published_key_dir.is_some() {
+        config.open_element(&sdir, pass, published_key_dir)?
+    } else {
+        config.open_secure_element(&sdir, pass)?
+    };
     let store = if sdir.join("signer.meta").exists() {
         crate::signer::store::SignerStore::open(&sdir)?
     } else {
@@ -2373,10 +2594,9 @@ pub(super) fn restore_vault_from_backup(
     if !local.exists() {
         std::fs::write(&local, &blob).map_err(|e| e.to_string())?;
     }
-    save(data, pass, &ceremony)?;
+    save_to(dest, pass, &ceremony)?;
     // Written last: `vault.sealed` is what marks the vault active.
-    dir(data, vault)?
-        .write_sealed("vault.sealed", &bytes, pass)
+    dest.write_sealed("vault.sealed", &bytes, pass)
         .map_err(|e| e.to_string())?;
     Ok(())
 }

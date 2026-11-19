@@ -161,8 +161,9 @@ export async function fund(address: string): Promise<void> {
   const res = await fetch("/api/fund", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address }) });
   if (!res.ok) throw new Error((await res.json()).error ?? "could not request funds");
 }
-export type RecoveryStatus = { recovery_identity: boolean; recovery_backup: boolean };
+export type RecoveryStatus = { recovery_identity: boolean; recovery_backup: boolean; recovery_in_app?: boolean };
 export function recoveryStatus(vault: string): Promise<RecoveryStatus> { return api(`recovery-status?vault=${vault}`); }
+export function recoveryBackup(vault: string): Promise<{ vault: string; backup: string }> { return api(`recovery-backup?vault=${vault}`); }
 export function recoverySetup(): Promise<{ words: string }> { return api("recovery-setup", {}); }
 export function recoveryRestore(vault: string, words: string): Promise<{ restored: boolean }> { return api("recovery-restore", { vault, words }); }
 

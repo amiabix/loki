@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
+import React from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import ts from 'typescript';
 import { exportRecoveryBackup, removeBrowserSigner, restoreSigner, setupBrowserRecovery } from '../src/lib/api.ts';
 
 test('browser recovery calls go only to the browser signer, never to a paired native member', async () => {
@@ -23,4 +27,35 @@ test('browser recovery calls go only to the browser signer, never to a paired na
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test('the wallet Recovery card distinguishes LokiSigner from a paired headless member', () => {
+  // Render the actual page component without Next's app shell. Model its first render after
+  // the member status arrives; both sessions report the same signerKind to the wallet.
+  const source = readFileSync(new URL('../src/app/page.tsx', import.meta.url), 'utf8');
+  const page = ts.createSourceFile('page.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const card = page.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'RecoveryCard');
+  assert.ok(card);
+  const { outputText } = ts.transpileModule(card.getText(page), { compilerOptions: { jsx: ts.JsxEmit.React } });
+  const load = new Function('React', 'useState', 'useCallback', 'useEffect', 'GlassCard', 'Btn', 'ErrMsg', 'signerKind',
+    `${outputText}\nreturn RecoveryCard;`);
+  function render(status) {
+    let initialized = false;
+    const useState = (initial) => {
+      const value = initialized ? initial : status;
+      initialized = true;
+      return React.useState(value);
+    };
+    const RecoveryCard = load(React, useState, React.useCallback, () => {}, 'section', 'button', () => null, () => 'native');
+    return renderToStaticMarkup(React.createElement(RecoveryCard, { vault: 'a'.repeat(64) }));
+  }
+
+  const status = { recovery_identity: true, recovery_backup: true };
+  const headless = render(status);
+  assert.match(headless, /Restore access/);
+  assert.doesNotMatch(headless, /Download encrypted backup|Use LokiSigner/);
+  const lokiSigner = render({ ...status, recovery_in_app: true });
+  assert.match(lokiSigner, /Download encrypted backup/);
+  assert.match(lokiSigner, /Use LokiSigner/);
+  assert.doesNotMatch(lokiSigner, /Restore access|Set up recovery|<textarea/);
 });

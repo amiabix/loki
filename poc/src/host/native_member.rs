@@ -51,7 +51,13 @@ pub(crate) fn run_native(
     roster_confirmation: LocalRosterConfirmation,
     fetched: Option<FetchedConfig>,
 ) -> Result<(), String> {
-    super::run_local_with(config, Some(pass), Some(notice), Some(approval), Some(roster_confirmation), fetched, NativeScope::install)
+    super::run_local_with(config, Some(pass), Some(notice), Some(approval), Some(roster_confirmation), fetched, true, NativeScope::install)
+}
+
+pub(crate) fn restore_running(words: Zeroizing<Vec<u8>>, file: &Path) -> Result<(), &'static str> {
+    let member = RUNNING.lock().map_err(|_| super::native_recovery::REFUSED)?.clone()
+        .ok_or(super::native_recovery::LOCKED)?;
+    super::native_recovery::restore_running(&member.state, words, file)
 }
 
 /// Snapshot the running member without keeping the process handle locked over a query. Discard

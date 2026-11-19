@@ -214,9 +214,11 @@ private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointe
     // Synchronous delivery keeps recovery words on screen before registration continues.
     DispatchQueue.main.sync {
         let alert = NSAlert()
-        alert.messageText = event == "recovery" ? "Save your recovery words privately" : event == "ready" ? "Signer paired and running" : "Signer could not start"
-        if event == "ready" {
-            alert.informativeText = "Paste this private session link into your wallet tab. Keep LokiSigner running to approve and sign."
+        if event == "ready" || event == "restore-ready" || event == "restore-pending" {
+            alert.messageText = event == "ready" ? "Signer paired and running" : "Vault restored"
+            alert.informativeText = event == "restore-pending"
+                ? "Your vault is saved on this Mac. LokiSigner could not reconnect to the coordinator yet. It will retry now and when you next unlock, without your recovery words. Pair the wallet tab after it reconnects."
+                : "Paste this private session link into your wallet tab. Keep LokiSigner running to approve and sign."
             let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 420, height: 26))
             field.stringValue = text
             field.isEditable = false
@@ -229,6 +231,7 @@ private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointe
                 NSPasteboard.general.setString(text, forType: .string)
             }
         } else {
+            alert.messageText = event == "recovery" ? "Save your recovery words privately" : "Signer could not start"
             alert.informativeText = text
             alert.addButton(withTitle: event == "recovery" ? "I saved these words" : "OK")
             alert.runModal()
@@ -269,6 +272,24 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
             return
         }
         prompting = true
+        NSApp.activate(ignoringOtherApps: true)
+        if let idx = args.firstIndex(of: "--data"), args.indices.contains(idx + 1),
+           !FileManager.default.fileExists(atPath: URL(fileURLWithPath: args[idx + 1]).appendingPathComponent("profile/profile.sealed").path) {
+            switch firstRunChoice() {
+            case .alertSecondButtonReturn:
+                beginRecovery()
+                return
+            case .alertFirstButtonReturn:
+                if link == nil {
+                    prompting = false
+                    showStartError(["error": "Open a new pairing link from the wallet to pair this signer."])
+                    return
+                }
+            default:
+                prompting = false
+                return
+            }
+        }
         var launch: [String: Any] = ["args": args]
         if let link = link {
             launch["pairing_url"] = link
@@ -282,13 +303,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
                 showStartError(reply)
                 return
             }
-            let alert = NSAlert()
-            alert.messageText = "Pair this device with slot \(slot)?"
-            alert.informativeText = "Coordinator: \(origin)\n\nOnly continue if this is the coordinator you intended. LokiSigner then asks it for the signer configuration and shows it to you before anything is saved."
-            alert.addButton(withTitle: "Continue")
-            alert.addButton(withTitle: "Cancel")
-            NSApp.activate(ignoringOtherApps: true)
-            guard alert.runModal() == .alertFirstButtonReturn else { prompting = false; return }
+            guard confirmCoordinator(origin, title: "Pair this device with slot \(slot)?") else { prompting = false; return }
         }
         // A pairing link, or an unlock with nothing saved, asks the coordinator; keep the UI live.
         DispatchQueue.global(qos: .userInitiated).async {
@@ -297,15 +312,20 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Shows the configuration before anything is saved; the member continues with exactly it.
-    private func confirm(link: String?, launch: [String: Any], reply: [String: Any]) {
-        defer { prompting = false }
-        guard let config = reply["config"] as? [String: Any] else { showStartError(reply); return }
+    private func confirmCoordinator(_ origin: String, title: String) -> Bool {
         let alert = NSAlert()
-        let slot = (config["slot"] as? NSNumber)?.stringValue ?? "?"
+        alert.messageText = title
+        alert.informativeText = "Coordinator: \(origin)\n\nOnly continue if this is the coordinator you intended. LokiSigner then asks it for the signer configuration and shows it to you before anything is saved."
+        alert.addButton(withTitle: "Continue")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    private func configurationText(_ config: [String: Any]) -> String {
         let text = { (key: String) in config[key] as? String ?? "none" }
         let witnesses = (config["nonce_witnesses"] as? [String])?.joined(separator: "\n  ") ?? "none"
-        let endpoints = """
+        return """
             Coordinator: \(text("coordinator"))
             Network: \(text("network"))
             frostd: \(text("frostd_url"))
@@ -316,6 +336,15 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
             The coordinator above chose these endpoints, except any you set with launch flags \
             (those apply to this launch only, and then nothing is saved).
             """
+    }
+
+    /// Shows the configuration before anything is saved; the member continues with exactly it.
+    private func confirm(link: String?, launch: [String: Any], reply: [String: Any]) {
+        defer { prompting = false }
+        guard let config = reply["config"] as? [String: Any] else { showStartError(reply); return }
+        let alert = NSAlert()
+        let slot = (config["slot"] as? NSNumber)?.stringValue ?? "?"
+        let endpoints = configurationText(config)
         if link != nil {
             alert.messageText = "Pair this device with slot \(slot)?"
             alert.informativeText = "\(endpoints)\nCreate or unlock your local profile below. These values are saved once it unlocks."
@@ -345,6 +374,84 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async { self.running = false }
         }
     }
+
+    private func beginRecovery() {
+        let alert = NSAlert()
+        alert.messageText = "Enter your original coordinator"
+        alert.informativeText = "Use the HTTPS origin of the wallet that your old Mac was paired with."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 420, height: 26))
+        field.placeholderString = "https://wallet.example"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Continue")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { prompting = false; return }
+        let launch: [String: Any] = ["args": args, "restore_origin": field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)]
+        let reply = nativeQuery(loki_member_app_pairing_target, launch)
+        guard let target = reply["target"] as? [String: Any], let origin = target["coordinator"] as? String else {
+            prompting = false
+            showRecoveryResult(error: reply["error"] as? String ?? "Enter the original coordinator’s HTTPS origin.")
+            return
+        }
+        guard confirmCoordinator(origin, title: "Restore with this coordinator?") else { prompting = false; return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let reply = nativeQuery(loki_member_app_configuration, launch)
+            DispatchQueue.main.async { self.confirmRecovery(launch: launch, reply: reply) }
+        }
+    }
+
+    private func confirmRecovery(launch: [String: Any], reply: [String: Any]) {
+        defer { prompting = false }
+        guard let config = reply["config"] as? [String: Any] else {
+            showRecoveryResult(error: reply["error"] as? String ?? "LokiSigner could not read the coordinator configuration.")
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Review the signer configuration"
+        alert.informativeText = configurationText(config)
+        alert.addButton(withTitle: "Continue")
+        alert.addButton(withTitle: "Cancel")
+        var confirmed = launch
+        confirmed["config"] = config
+        guard alert.runModal() == .alertFirstButtonReturn,
+              let json = try? JSONSerialization.data(withJSONObject: confirmed), let request = String(data: json, encoding: .utf8),
+              let input = restoreInput(newProfile: true) else { return }
+        running = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            let error = request.withCString { request in
+                input.file.withCString { file in
+                    input.words.withUnsafeMutableBufferPointer { words in
+                        input.pass.withUnsafeMutableBufferPointer { pass in
+                            recoveryError(loki_member_app_restore_profile(request, words.baseAddress, words.count,
+                                pass.baseAddress, pass.count, file, nativeNotice, nativeApprove, nativeConfirmRoster))
+                        }
+                    }
+                }
+            }
+            DispatchQueue.main.async {
+                if let error { showRecoveryResult(error: error) }
+                self.running = false
+            }
+        }
+    }
+
+    @objc func restoreVault(_ sender: Any?) {
+        guard !prompting else { return }
+        guard running else { showRecoveryResult(error: "Unlock LokiSigner before restoring a vault."); return }
+        prompting = true
+        guard let input = restoreInput(newProfile: false) else { prompting = false; return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let error = input.file.withCString { file in
+                input.words.withUnsafeMutableBufferPointer { words in
+                    recoveryError(loki_member_app_restore_vault(words.baseAddress, words.count, file))
+                }
+            }
+            DispatchQueue.main.async {
+                showRecoveryResult(error: error)
+                self.prompting = false
+            }
+        }
+    }
 }
 
 func runNativeSigner(arguments: [String], link: String?) -> Never {
@@ -359,15 +466,17 @@ func runNativeSigner(arguments: [String], link: String?) -> Never {
     let menu = NSMenu()
     let item = NSMenuItem()
     let actions = NSMenu()
+    let delegate = NativeSigner(args: args, link: link)
     let vaultAddresses = VaultAddressesWindow()
     let showAddresses = actions.addItem(withTitle: "Vault addresses…", action: #selector(VaultAddressesWindow.show(_:)), keyEquivalent: "")
     showAddresses.target = vaultAddresses
+    let restore = actions.addItem(withTitle: "Restore a vault…", action: #selector(NativeSigner.restoreVault(_:)), keyEquivalent: "")
+    restore.target = delegate
     actions.addItem(.separator())
     actions.addItem(withTitle: "Quit and lock LokiSigner", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     item.submenu = actions
     menu.addItem(item)
     app.mainMenu = menu
-    let delegate = NativeSigner(args: args, link: link)
     app.delegate = delegate
     withExtendedLifetime((delegate, vaultAddresses)) { app.run() }
     exit(0)
