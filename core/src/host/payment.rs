@@ -1106,7 +1106,7 @@ pub(super) async fn draft(State(st): State<Shared>, Json(body): Json<Value>) -> 
         let _ = sync_control(&st.config.frostd_url, &data, &pass, vault, &v);
         reconcile(&data, &pass, vault, &mut w)?;
         let (anchor, expiry) = heights(&w, &v)?;
-        let funding = w.propose(address, Some(amount), memo_bytes.clone())?;
+        let funding = w.propose_with_confirmation_wait(address, Some(amount), memo_bytes.clone(), st.config.native)?;
         let first = *funding.notes.first().ok_or("wallet proposed no Ironwood notes")?;
         let inputs = CandidateInputs { vault_fvk: &v.fvk, notes: vec![first], recipient: address, amount, memo: memo_bytes, change: Zatoshis::ZERO, target_height: anchor, expiry_height: expiry };
         let fee_zat: u64 = quote_fee(&v.network, &inputs)?.into();
@@ -3845,12 +3845,6 @@ mod tests {
                 ..Default::default()
             }
         };
-        let spend = CompactOrchardAction {
-            nullifier: notes[0].nullifier(fvk).to_bytes().to_vec(),
-            cmx: vec![0; 32],
-            ephemeral_key: vec![0; 32],
-            ciphertext: vec![0; 52],
-        };
         let n = notes.len() as u32;
         let mut wallet = VaultWallet::open(
             path,
@@ -3866,13 +3860,57 @@ mod tests {
                 &[
                     block(height, received, vec![6; 32], n),
                     match spender {
-                        Some(txid) => block(height + 1, vec![spend], txid.as_ref().to_vec(), n + 1),
+                        Some(txid) => block(height + 1, vec![CompactOrchardAction {
+                            nullifier: notes[0].nullifier(fvk).to_bytes().to_vec(),
+                            cmx: vec![0; 32],
+                            ephemeral_key: vec![0; 32],
+                            ciphertext: vec![0; 52],
+                        }], txid.as_ref().to_vec(), n + 1),
                         None => block(height + 1, vec![], vec![12; 32], n),
                     },
                 ],
             )
             .unwrap();
         wallet
+    }
+
+    #[test]
+    fn draft_funding_error_distinguishes_waiting_from_a_shortfall() {
+        use orchard::keys::SpendingKey;
+        let fvk = FullViewingKey::from(&SpendingKey::from_bytes([3; 32]).unwrap());
+        let rho = Rho::from_bytes(&[20; 32]).unwrap();
+        let note = orchard::Note::from_parts(
+            fvk.address_at(0u64, Scope::External),
+            NoteValue::from_raw(1_000_000),
+            rho,
+            RandomSeed::from_bytes([30; 32], &rho).unwrap(),
+            NoteVersion::V3,
+        ).unwrap();
+        let recipient = FullViewingKey::from(&SpendingKey::from_bytes([9; 32]).unwrap()).address_at(0u64, Scope::External);
+        let draft_error = |wallet: &mut VaultWallet, amount, native| {
+            wallet.propose_with_confirmation_wait(recipient, Some(Zatoshis::const_from_u64(amount)), MemoBytes::empty(), native)
+                .err().expect("this draft should not be fundable yet")
+        };
+        let empty_error = "fund payment: Insufficient balance (have 0, need 60000 including fee)";
+        let path = std::env::temp_dir().join(format!("loki-fresh-deposit-{}.sqlite", Uuid::new_v4()));
+        let mut wallet = wallet_with_spend(&path, &fvk, &[note], None);
+        assert_eq!(wallet.ironwood_balance_zat().unwrap(), 1_000_000);
+        assert_eq!(draft_error(&mut wallet, 50_000, true),
+            "Funds for this payment are waiting for confirmations. Incoming deposits need 10 confirmations before they can be spent.");
+        assert_eq!(draft_error(&mut wallet, 50_000, false), empty_error);
+        // The amount fits in the deposit but the amount plus fee does not.
+        assert_eq!(draft_error(&mut wallet, 995_000, true),
+            "fund payment: Insufficient balance (have 0, need 1005000 including fee)");
+        let owner = zcash_client_backend::wallet::LockOwner::new([1; 32]);
+        wallet.reserve_inputs(owner, &[note.nullifier(&fvk).to_bytes()], TESTNET_NU7_BIRTH + 50).unwrap();
+        assert_eq!(draft_error(&mut wallet, 50_000, true), empty_error);
+        drop(wallet);
+        std::fs::remove_file(&path).unwrap();
+
+        let mut empty = wallet_with_spend(&path, &fvk, &[], None);
+        assert_eq!(draft_error(&mut empty, 50_000, true), empty_error);
+        drop(empty);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

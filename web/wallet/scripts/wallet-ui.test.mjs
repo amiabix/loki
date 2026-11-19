@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { comparesInLokiSigner, invitePreview, nativeRosterRefusal, pairingSecondsLeft, paymentLabel, rememberedVaultSlot, rememberVaultSlot, verifyPhrase } from "../src/lib/wallet-ui.ts";
+import { comparesInLokiSigner, emptyHistoryText, invitePreview, nativeRosterRefusal, pairingSecondsLeft, paymentLabel, rememberedVaultSlot, rememberVaultSlot, storageLabel, verifyPhrase } from "../src/lib/wallet-ui.ts";
 
 const invite = { vault: "a".repeat(64), name: "Friends’ vault", members: 3, threshold: 2, slot: 2 };
 const encode = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
@@ -28,6 +28,25 @@ test("pending payments never look sent and internal phase names stay hidden", ()
   assert.equal(paymentLabel("signed", false, true), "Sending");
   assert.equal(paymentLabel("replaced", false, true), "Replaced · will never be sent");
   assert.equal(paymentLabel("unknown_internal_phase", false, false), "Status unavailable");
+});
+
+test("only LokiSigner's empty history warns that deposits are not listed", () => {
+  assert.equal(emptyHistoryText(true), "Outgoing payment requests and sent payments will appear here. Incoming deposits aren’t listed.");
+  assert.equal(emptyHistoryText(false), "Payments sent and received by this vault will appear here.");
+});
+
+test("the storage badge only claims protection reported by the native signer", () => {
+  for (const [element, enclave, label] of [
+    ["apple", true, "Enclave-protected wrapping key"],
+    ["software", false, "Software device storage"],
+    [undefined, false, "Share protection not reported"],
+    ["unexpected", false, "Share protection not reported"],
+  ]) {
+    assert.equal(storageLabel(element, "native").label, label);
+    assert.equal(storageLabel(element, "native").enclave, enclave);
+  }
+  assert.equal(storageLabel("passkey", "browser").label, "Sealed under your passkey in this browser");
+  assert.equal(storageLabel(undefined, "browser").label, "Sealed under your passphrase in this browser");
 });
 
 test("verify phrase is deterministic, word+emoji, and rejects non-hex", () => {

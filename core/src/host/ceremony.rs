@@ -738,7 +738,7 @@ pub(super) async fn status(st: Shared, vault: String) -> Reply {
         };
         let mut value = json!({"phase":phase,"members":c.members,"threshold":c.threshold,
             "confirmations":c.agreed.len(),"confirmed":c.agreed.contains(&c.my_slot),
-            "fingerprint":c.fingerprint});
+            "fingerprint":c.fingerprint,"secure_element":st.config.secure_element});
         if c.fingerprint.is_some() {
             value["roster_code"] = json!(setup_roster_code(&c, VaultNetwork::parse(&st.config.network)?).ok());
         }
@@ -1583,6 +1583,44 @@ mod tests {
             peers: BTreeMap::new(),
             registration: None, bind: "127.0.0.1".parse().unwrap(), advertise_url: None,
             secure_element: "software".into(), nonce_witnesses: None, loopback_peers: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn status_reports_the_configured_secure_element() {
+        let client = reqwest::Client::new();
+        for element in ["apple", "software"] {
+            let data = std::env::temp_dir().join(format!("loki-storage-status-{}", Uuid::new_v4()));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let config = Config { secure_element: element.into(), ..test_config(&data, addr.port()) };
+            // Status describes the configuration; no platform key is needed to report it.
+            let st = std::sync::Arc::new(AppState::new(config));
+            let router = crate::host::routes::router(st.clone());
+            tokio::spawn(async move { axum::serve(listener, router).await });
+            let status = |query: &str| client.get(format!("http://{addr}/api/status{query}"))
+                .header("x-loki-token", "test");
+            let read = |response: reqwest::RequestBuilder| async move {
+                response.send().await.unwrap().error_for_status().unwrap().json::<Value>().await.unwrap()
+            };
+
+            let new_profile = read(status("")).await;
+            assert_eq!(new_profile["phase"], "new_profile");
+            assert_eq!(new_profile["secure_element"], element);
+
+            crate::profile::create(&data, "pass", "test").unwrap();
+            *st.session.write().await = Some(Session { passphrase: Zeroizing::new("pass".into()), data: data.clone() });
+            let created = create(State(st), Json(json!({"name":"test","members":3,"threshold":2}))).await;
+            assert_eq!(created.0, StatusCode::OK, "{}", created.1 .0);
+            let vault = created.1 .0["vault"].as_str().unwrap();
+
+            let home = read(status("")).await;
+            assert_eq!(home["phase"], "home");
+            assert_eq!(home["secure_element"], element);
+            let setup = read(status(&format!("?vault={vault}"))).await;
+            assert_eq!(setup["phase"], "waiting_for_members");
+            assert_eq!(setup["secure_element"], element);
+            std::fs::remove_dir_all(data).unwrap();
         }
     }
 
