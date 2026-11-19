@@ -21,6 +21,7 @@ import {
   opfsPreopenRead as preopenReadOnce,
   opfsCloseAll,
 } from "./pkg/snippets/loki-signer-core-8724841f4db15c9f/js/opfs_fs.js";
+import { controlInbox } from "./control-inbox.js";
 
 // Ops run concurrently (a status read during a join), and two pre-opens of one path racing
 // would each try to take its exclusive sync handle; the second throws. Share one in-flight
@@ -277,16 +278,20 @@ async function frostdClient(signer, p) {
 
 // Drain this member's inbox on a payment control session and open each sealed message under
 // the confirmed roster. Anything that does not open (a non-member, another session) is dropped.
+// Returns every message opened on that session so far (control-inbox.js), not just new ones.
+const controlHistory = controlInbox();
 async function readControl(signer, control, sessionId) {
-  control.useSession(sessionId);
-  const out = [];
-  for (const m of JSON.parse(await control.recv())) {
-    try {
-      const { from, body } = JSON.parse(signer.openControl(sessionId, m.from, m.message));
-      out.push({ from, ...JSON.parse(body) });
-    } catch { /* not a control message sealed to this member */ }
-  }
-  return out;
+  return controlHistory(sessionId, async () => {
+    control.useSession(sessionId);
+    const out = [];
+    for (const m of JSON.parse(await control.recv())) {
+      try {
+        const { from, body } = JSON.parse(signer.openControl(sessionId, m.from, m.message));
+        out.push({ from, ...JSON.parse(body) });
+      } catch { /* not a control message sealed to this member */ }
+    }
+    return out;
+  });
 }
 
 // A proposer notice about this payment: the sender is the proposer and the session ids match.
@@ -299,8 +304,8 @@ function aboutPayment(msg, vault, attemptHex, controlSessionId) {
 // Find the payment's control session the way native members do (payment.rs `sync_control`):
 // a session a vault member opened with every member as a participant, where that member sealed
 // a notice about this attempt. A signing session is opened by a one-shot coordinator key, so it
-// never matches. Reading drains this member's inbox there; the proposer re-sends its notice every
-// few seconds until signing starts, and other payments' sessions are read once and skipped.
+// never matches. Notices already drained there are kept (readControl), and other payments'
+// sessions are read once and skipped.
 async function findPayment(signer, control, vault, attemptHex, p) {
   const ids = new Map(vault.members.map((m) => [m.encryption, m.id]));
   const skip = new Set();
@@ -328,8 +333,8 @@ async function findPayment(signer, control, vault, attemptHex, p) {
 }
 
 // Payments other members proposed in this vault that still want this member: one pass over the
-// relay's control sessions, read like findPayment. Reading drains the inbox; the proposer
-// re-sends its notice every few seconds until signing starts, so approving later still finds it.
+// relay's control sessions, read like findPayment. The proposer sends its notice once at publish
+// and again only after it approves, so a request stays listed from the notices readControl kept.
 async function listPending(signer, vaultHex, p) {
   const vault = await openVault(signer, vaultHex);
   const control = await frostdClient(signer, p);
