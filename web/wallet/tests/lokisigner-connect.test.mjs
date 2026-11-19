@@ -157,7 +157,7 @@ test('a forbidden or busy connect response is final and displays no comparison c
     if (url === '/api/members') return Response.json({ slots: [{ ...member, lokisigner_url: current }] });
     return ++posts === 1 ? new Response(null, { status }) : streamed('{"code":"061274"}\n', `{"token":"${token('a')}"}\n`);
   }).use(tab);
-  for (const [reply, message] of [[403, /did not allow/], [429, /another connection request or waiting.*Refuse.*two minutes/]]) {
+  for (const [reply, message] of [[403, /did not allow/], [429, /another connection request or waiting.*Refuse.*few seconds/]]) {
     status = reply;
     posts = 0;
     const events = [];

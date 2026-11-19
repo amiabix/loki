@@ -127,7 +127,7 @@ export async function connectLokiSigner(slot: number, show: (progress: ConnectPr
         }
         if (res && ![404, 405, 425].includes(res.status)) {
           throw new Error(res.status === 429
-            ? "LokiSigner is showing another connection request or waiting before it can show a new one. Refuse any request you did not start. You may need to wait up to two minutes before trying again."
+            ? "LokiSigner is showing another connection request or waiting before it can show a new one. Refuse any request you did not start, then try again in a few seconds."
             : "LokiSigner did not allow this connection.");
         }
       }

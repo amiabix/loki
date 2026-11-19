@@ -114,15 +114,14 @@ slot uses LokiSigner and which local port it currently listens on. The field is 
 from the peer endpoint and contains no tab token. If your browser allows local network
 requests, another website may be able to tell that LokiSigner is running. Four ceremony
 routes accept requests from other origins so browser signers can join a vault, but require
-a valid invite to take part. Blocking other origins from reading responses would not by
-itself hide the local listener.
+a valid invite to take part. Their replies can also reveal whether the profile is locked.
+Blocking other origins from reading responses would not by itself hide the local listener.
 
-Only the paired coordinator's website can ask to connect from a browser. A program already
-running on your Mac can impersonate that website when asking, but it still needs an **Allow**
-in LokiSigner. Refuse any request you didn't start. A refusal, a timeout or a closed request
-starts a wait at five seconds. Consecutive unsuccessful requests double the wait up to two
-minutes; **Allow** resets it to five seconds. While a request is pending or the wait is in
-effect, your own tab may also need to wait before connecting.
+Only the paired coordinator's website can ask to connect from a browser. LokiSigner cannot
+tell another program on your Mac apart from the wallet when it asks to connect. It can open
+a dialog as often as every five seconds, but it still needs an **Allow** in LokiSigner.
+Refuse any request you didn't start. While a dialog is pending or fewer than five seconds
+have passed since the last request started, your own tab may also have to wait.
 
 The grant stays in the approved page's memory. Duplicating a tab or reloading the page
 requires a new **Allow**. The wallet remembers the last slot so you can reconnect. The
