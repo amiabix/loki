@@ -46,30 +46,36 @@ private func nativeQuery(_ query: (UnsafePointer<CChar>) -> UnsafeMutablePointer
 func retryAlert(_ failure: SignerStartFailure, profile: String?) -> NSAlert {
     let alert = NSAlert()
     alert.messageText = failure == .cancelled ? "LokiSigner paused" : "LokiSigner couldn’t continue"
-    alert.informativeText = failure.message
-    if profile == "vault", [.differentPairing, .notFresh, .wrongProfile, .registrationRefused].contains(failure) {
+    alert.informativeText = profile == "vault" && failure == .notFresh
+        ? SignerStartFailure.protectedProfile.message : failure.message
+    if profile == "vault", [.differentPairing, .wrongProfile, .registrationRefused].contains(failure) {
         alert.informativeText += "\n\n" + SignerStartFailure.protectedProfile.message
     }
     alert.addButton(withTitle: "Try again")
     alert.addButton(withTitle: "Quit")
-    if profile == "profile" { alert.addButton(withTitle: "Start over…") }
+    if profile == "profile" || (profile == "vault" && failure.keyIsGone) {
+        alert.addButton(withTitle: failure.keyIsGone ? "Set aside profile…" : "Start over…")
+    }
     return alert
 }
 
-func setAsideAlert() -> NSAlert {
+func setAsideAlert(recover: Bool = false) -> NSAlert {
     let alert = NSAlert()
     alert.messageText = "Set aside this LokiSigner profile?"
-    alert.informativeText = "LokiSigner will move the entire local data folder, including this profile’s identity and pairing settings, to a dated folder beside it. Nothing will be deleted. You can then pair a new signer or restore from recovery words."
+    alert.informativeText = recover
+        ? "LokiSigner will rename the entire local data folder, including any vault data. Nothing will be deleted. To restore your vault in the original location, choose “Restore from recovery words”. You’ll need your recovery words and downloaded backup file."
+        : "LokiSigner will rename the entire local data folder, including this profile’s identity and pairing settings. Nothing will be deleted. You can then pair a new signer or choose “Restore from recovery words”. To restore, you’ll need your recovery words and downloaded backup file."
     alert.addButton(withTitle: "Cancel")
     alert.addButton(withTitle: "Set aside and start over")
     return alert
 }
 
-func registrationWarningAlert(_ message: String) -> NSAlert {
+func registrationWarningAlert(_ message: String, key: Bool = false, recover: Bool = false) -> NSAlert {
     let alert = NSAlert()
-    alert.messageText = "LokiSigner is running"
+    alert.messageText = key ? "LokiSigner is still running" : "LokiSigner is running"
     alert.informativeText = message
     alert.addButton(withTitle: "OK")
+    if recover { alert.addButton(withTitle: "Set aside profile…") }
     return alert
 }
 
@@ -291,9 +297,13 @@ func showConnectDialog(origin: String, code: String, cancelled: @escaping () -> 
 private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointer<CChar>?) {
     guard let kind = kind, let message = message else { return }
     let event = String(cString: kind), text = String(cString: message)
-    if event == "registration-warning" {
+    if event == "registration-warning" || event == "registration-key" || event == "registration-key-gone" {
         // Rust supplies fixed copy here. Don't block its retry loop on an open dialog.
-        DispatchQueue.main.async { (NSApp.delegate as? NativeSigner)?.warnRegistration(text) }
+        DispatchQueue.main.async { (NSApp.delegate as? NativeSigner)?.warnRegistration(event, message: text) }
+        return
+    }
+    if event == "startup-key" || event == "startup-key-gone" {
+        DispatchQueue.main.async { (NSApp.delegate as? NativeSigner)?.startupKeyFailure = event == "startup-key-gone" ? .keyGone(text) : .key(text) }
         return
     }
     // Synchronous delivery keeps recovery words on screen before registration continues.
@@ -321,18 +331,17 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
     private var running = false
     private var prompting = false {
         didSet {
-            if !prompting, let message = registrationWarning {
-                registrationWarning = nil
-                DispatchQueue.main.async { self.warnRegistration(message) }
-            }
+            if !prompting && !registrationWarnings.isEmpty { DispatchQueue.main.async { self.showNextRegistrationWarning() } }
         }
     }
-    private var registrationWarning: String?
+    private var registrationWarnings: [(event: String, message: String)] = []
+    fileprivate var startupKeyFailure: SignerStartFailure?
     private var opened = false
     private var cleanupNeeded = true
     private var retryLink: String?
     private var queuedLink: String?
     private var startingOver = false
+    private var recoveringKey = false
     private let args: [String]
     private let initialLink: String?
 
@@ -373,7 +382,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         case .alertSecondButtonReturn:
             NSApp.terminate(nil)
         case .alertThirdButtonReturn:
-            if confirmSetAside() { return }
+            if confirmSetAside(recover: failure.keyIsGone) { return }
         default: break
         }
         // Don't nest modal panels or keep a previous passphrase field alive on retry.
@@ -383,8 +392,9 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func confirmSetAside() -> Bool {
-        guard setAsideAlert().runModal() == .alertSecondButtonReturn else { return false }
+    private func confirmSetAside(recover: Bool = false) -> Bool {
+        guard setAsideAlert(recover: recover).runModal() == .alertSecondButtonReturn else { return false }
+        recoveringKey = recover
         if running {
             startingOver = loki_member_app_stop() != 0
             if !startingOver {
@@ -399,11 +409,13 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
     }
 
     private func finishSetAside() {
-        let reply = profile(2)
+        let recover = recoveringKey
+        recoveringKey = false
+        let reply = profile(recover ? 3 : 2)
         if reply["profile"] as? String != "fresh" {
             retry(reply["error"] as? String == "vault" ? .protectedProfile : .setAsideFailed, link: retryLink)
         } else {
-            let link = queuedLink ?? retryLink
+            let link = recover ? nil : queuedLink ?? retryLink
             DispatchQueue.main.async {
                 self.prompting = false
                 self.start(link)
@@ -416,15 +428,25 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         queuedLink = nil
     }
 
-    fileprivate func warnRegistration(_ message: String) {
+    fileprivate func warnRegistration(_ event: String, message: String) {
         guard running, !startingOver else { return }
-        if prompting { registrationWarning = message; return }
-        registrationWarningAlert(message).runModal()
+        registrationWarnings.append((event, message))
+        showNextRegistrationWarning()
+    }
+
+    private func showNextRegistrationWarning() {
+        guard running, !startingOver, !prompting, !registrationWarnings.isEmpty else { return }
+        prompting = true
+        let warning = registrationWarnings.removeFirst()
+        let recover = warning.event == "registration-key-gone"
+        let alert = registrationWarningAlert(warning.message, key: warning.event != "registration-warning", recover: recover)
+        if alert.runModal() == .alertSecondButtonReturn, recover, confirmSetAside(recover: true) { return }
+        prompting = false
     }
 
     private func stopped(_ failure: SignerStartFailure, link: String?) {
         running = false
-        registrationWarning = nil
+        registrationWarnings.removeAll()
         if startingOver {
             startingOver = false
             finishSetAside()
@@ -458,6 +480,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         }
         cleanupNeeded = false
         if state == "fresh" {
+            guard canSetUpWithTouchID() else { prompting = false; return }
             switch firstRunChoice() {
             case .alertSecondButtonReturn:
                 beginRecovery()
@@ -566,16 +589,21 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
             let code = request.withCString { request in
                 secret.withUnsafeMutableBufferPointer { pass in loki_member_app_pair(request, pass.baseAddress!, nativeNotice, nativeApprove, nativeConfirmRoster, nativeConnect) }
             }
-            let failure: SignerStartFailure
-            switch code {
-            case 3: failure = .unlock
-            case 4: failure = .deviceKey
-            case 5: failure = .registrationRefused
-            case 6: failure = .registrationFailed
-            default: failure = .unexpected
+            DispatchQueue.main.async {
+                let failure: SignerStartFailure
+                switch code {
+                case 3: failure = .unlock
+                case 4: failure = .deviceKey
+                case 5: failure = .registrationRefused
+                case 6: failure = .registrationFailed
+                case 7: failure = self.startupKeyFailure ?? .deviceKey
+                case 8: failure = .registrationRosterUnavailable
+                default: failure = .unexpected
+                }
+                self.startupKeyFailure = nil
+                // A consumed pairing link cannot unlock again. Resume from the saved pin instead.
+                self.stopped(failure, link: [3, 4, 7, 8].contains(code) ? link : nil)
             }
-            // A consumed pairing link cannot unlock again. Resume from the saved pin instead.
-            DispatchQueue.main.async { self.stopped(failure, link: [3, 4].contains(code) ? link : nil) }
         }
     }
 

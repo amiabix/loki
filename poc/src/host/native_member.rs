@@ -21,19 +21,27 @@ struct NativeMember {
     state: Shared,
     viewing_keys: Mutex<BTreeMap<(String, u16), (SignerViewingKey, VaultNetwork)>>,
     stop: Arc<tokio::sync::Notify>,
+    #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+    notice: Option<LocalNotice>,
 }
 
 static RUNNING: Mutex<Option<Arc<NativeMember>>> = Mutex::new(None);
+// The UI may request recovery, but only a local key failure for this launch grants it.
+static KEY_RECOVERY: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 
 struct NativeScope;
 
 impl NativeScope {
-    fn install(state: &Shared, stop: Arc<tokio::sync::Notify>) -> Result<Self, String> {
+    fn install(state: &Shared, stop: Arc<tokio::sync::Notify>, _notice: Option<LocalNotice>) -> Result<Self, String> {
         let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
         if running.is_some() {
             return Err("LokiSigner is already running.".into());
         }
-        *running = Some(Arc::new(NativeMember { state: state.clone(), viewing_keys: Mutex::default(), stop }));
+        KEY_RECOVERY.lock().map_err(|_| "LokiSigner could not access profile recovery.")?.take();
+        *running = Some(Arc::new(NativeMember { state: state.clone(), viewing_keys: Mutex::default(), stop,
+            #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+            notice: _notice,
+        }));
         Ok(Self)
     }
 }
@@ -59,8 +67,8 @@ pub(crate) fn run_native(
     }
     let _cache = ClearCache;
     let stop = Arc::new(tokio::sync::Notify::new());
-    super::run_local_with(config, Some(pass), Some(notice), Some(approval), Some(roster_confirmation), fetched,
-        Some(&stop), Some(connect), |state| NativeScope::install(state, stop.clone()))
+    super::run_local_with(config, Some(pass), Some(notice.clone()), Some(approval), Some(roster_confirmation), fetched,
+        Some(&stop), Some(connect), |state| NativeScope::install(state, stop.clone(), Some(notice)))
 }
 
 pub(crate) fn request_stop() -> bool {
@@ -70,10 +78,37 @@ pub(crate) fn request_stop() -> bool {
     }))
 }
 
-pub(crate) fn set_aside(data: &Path) -> Result<(), &'static str> {
+#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+pub(super) fn authorize_key_recovery(data: &Path) {
+    if let Ok(running) = RUNNING.lock() {
+        if running.as_ref().is_some_and(|member| member.state.config.data == data) {
+            if let Ok(mut recovery) = KEY_RECOVERY.lock() { *recovery = Some(data.to_owned()); }
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+pub(super) fn report_vault_key_gone(data: &Path) {
+    let notice = RUNNING.lock().ok().and_then(|running| {
+        let member = running.as_ref().filter(|member| member.state.config.data == data)?;
+        let mut recovery = KEY_RECOVERY.lock().ok()?;
+        if recovery.as_deref() == Some(data) { return None; }
+        *recovery = Some(data.to_owned());
+        member.notice.clone()
+    });
+    if let Some(notice) = notice {
+        use crate::signer::secure_element_apple::KeyFailure;
+        notice("registration-key-gone", KeyFailure::Missing.message());
+    }
+}
+
+pub(crate) fn set_aside(data: &Path, recover: bool) -> Result<(), &'static str> {
     let running = RUNNING.lock().map_err(|_| super::native_recovery::REFUSED)?;
     if running.is_some() { return Err(super::native_recovery::REFUSED); }
-    super::native_recovery::set_aside(data)
+    let mut evidence = KEY_RECOVERY.lock().map_err(|_| super::native_recovery::REFUSED)?;
+    super::native_recovery::set_aside(data, recover && evidence.as_deref() == Some(data))?;
+    evidence.take();
+    Ok(())
 }
 
 pub(crate) fn disconnect_wallet_tabs() {
@@ -165,7 +200,7 @@ impl NativeMember {
         if is_legacy(&sealed) {
             return Err(UPGRADE_VAULT);
         }
-        let (key, network) = opened.map_err(|_| VAULT_ERROR)?;
+        let (key, network) = opened.map_err(|e| super::state::member_key_message(&e).unwrap_or(VAULT_ERROR))?;
         if sealed["vault"] != vault || sealed["my_frost_id"] != slot || sealed["network"] != network.label()
             || sealed["key_derivation"] != crate::zip2005::VERSION
         {
@@ -224,12 +259,53 @@ mod tests {
         assert_eq!(events["registration-warning"], "LokiSigner couldn’t reach the coordinator. Your profile is unlocked and LokiSigner will keep trying in the background.");
         assert_eq!(events["ready"], "", "native readiness does not expose a local pairing link");
         assert!(vault_addresses().unwrap().is_empty(), "local features work while offline");
-        assert!(set_aside(&data).is_err());
+        // A subsequent attempt still fails, but the modal warning is once per launch.
+        assert_eq!(ready_rx.recv_timeout(std::time::Duration::from_secs(6)).unwrap_err(), std::sync::mpsc::RecvTimeoutError::Timeout);
+        assert!(set_aside(&data, false).is_err());
         assert!(request_stop());
         stop_rx.recv_timeout(timeout).unwrap().unwrap();
         worker.join().unwrap();
-        set_aside(&data).unwrap();
+        set_aside(&data, false).unwrap();
         assert!(!data.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+    #[test]
+    fn only_a_gone_vault_key_allows_archiving_vault_data_after_stop() {
+        use crate::signer::secure_element_apple::KeyFailure;
+        let _test = TEST_MEMBER.lock().unwrap();
+        let root = std::env::temp_dir().join(format!("loki-native-key-gone-{}", uuid::Uuid::new_v4()));
+        let data = root.join("LokiSigner");
+        let share = "vaults/member-vault/signer/share.sealed";
+        let key_dir = data.join(share).parent().unwrap().to_owned();
+        std::fs::create_dir_all(&key_dir).unwrap();
+        std::fs::write(data.join(share), b"existing sealed share").unwrap();
+        let mut settings = config(&data);
+        settings.secure_element = "apple".into();
+        let state = Arc::new(crate::host::state::AppState::new(settings));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let notice: LocalNotice = Arc::new(move |kind, text| tx.send((kind.to_owned(), text.to_owned())).unwrap());
+        for failure in [KeyFailure::Cancelled, KeyFailure::LockedOut, KeyFailure::Missing] {
+            let scope = NativeScope::install(&state, Arc::default(), Some(notice.clone())).unwrap();
+            let _fixture = super::super::state::apple_test::install(&data, move |_, _, create| {
+                assert!(!create);
+                Err(failure)
+            });
+            assert_eq!(state.config.open_secure_element(&key_dir, PASS).err().as_deref(), Some(failure.message()));
+            assert!(set_aside(&data, true).is_err(), "cannot archive a running profile");
+            drop(scope);
+            if !failure.is_gone() {
+                assert!(rx.try_recv().is_err());
+                assert_eq!(set_aside(&data, true), Err("vault"));
+            }
+        }
+        assert_eq!(rx.try_recv().unwrap(), ("registration-key-gone".into(), KeyFailure::Missing.message().into()));
+        assert_eq!(set_aside(&data, false), Err("vault"));
+        set_aside(&data, true).unwrap();
+        assert!(!data.exists());
+        let archived = std::fs::read_dir(&root).unwrap().next().unwrap().unwrap().path();
+        assert_eq!(std::fs::read(archived.join(share)).unwrap(), b"existing sealed share");
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -253,7 +329,7 @@ mod tests {
         let _test = TEST_MEMBER.lock().unwrap();
         let data = std::env::temp_dir().join(format!("loki-addresses-{}", uuid::Uuid::new_v4()));
         let state = Arc::new(crate::host::state::AppState::new(config(&data)));
-        let _native = NativeScope::install(&state, Arc::default()).unwrap();
+        let _native = NativeScope::install(&state, Arc::default(), None).unwrap();
         *state.session.blocking_write() = Some(crate::host::state::Session {
             passphrase: Zeroizing::new(PASS.into()), data: data.clone(),
         });
@@ -359,13 +435,13 @@ mod tests {
     fn running_handle_refuses_second_install_and_discards_rows_after_replacement() {
         let _test = TEST_MEMBER.lock().unwrap();
         let state = Arc::new(crate::host::state::AppState::new(config(Path::new("unused"))));
-        let scope = NativeScope::install(&state, Arc::default()).unwrap();
-        assert_eq!(NativeScope::install(&state, Arc::default()).err().as_deref(), Some("LokiSigner is already running."));
+        let scope = NativeScope::install(&state, Arc::default(), None).unwrap();
+        assert_eq!(NativeScope::install(&state, Arc::default(), None).err().as_deref(), Some("LokiSigner is already running."));
 
         let mut replacement = None;
         let rows = with_running_member(|_| {
             drop(scope);
-            replacement = Some(NativeScope::install(&state, Arc::default()).unwrap());
+            replacement = Some(NativeScope::install(&state, Arc::default(), None).unwrap());
             Ok(vec![json!({ "name": "Old member’s vault" })])
         });
         assert!(replacement.is_some());

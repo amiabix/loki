@@ -15,7 +15,7 @@ pub extern "C" fn loki_signer_enclave_selftest() -> i32 {
     let tag = b"cash.loki.signer.share.v1";
 
     // Wallet init: open the persistent Enclave KEK and seal the member's share under it.
-    let se = match AppleSecureElement::persistent(tag) {
+    let se = match AppleSecureElement::create_persistent(tag, None) {
         Ok(s) => s,
         Err(_) => return 1,
     };
@@ -29,7 +29,7 @@ pub extern "C" fn loki_signer_enclave_selftest() -> i32 {
     drop(se);
 
     // Next launch: reopen the SAME Enclave key by tag and unseal the share.
-    let se2 = match AppleSecureElement::persistent(tag) {
+    let se2 = match AppleSecureElement::open_persistent(tag, None) {
         Ok(s) => s,
         Err(_) => return 3,
     };
@@ -62,7 +62,7 @@ pub extern "C" fn loki_signer_enclave_dkg_member_selftest() -> i32 {
     ];
     let r = std::panic::catch_unwind(|| {
         crate::signer::native_member::prove_dkg_member(2, 3, |id| {
-            AppleSecureElement::persistent(tags[(id - 1) as usize])
+            AppleSecureElement::create_persistent(tags[(id - 1) as usize], None)
                 .expect("open persistent Secure Enclave key")
         })
     });
@@ -212,7 +212,8 @@ unsafe fn native_query(
 }
 
 /// Inspect this Mac's local profile. `action`: 0 inspect, 1 try to clean restore staging then
-/// inspect at startup, 2 set aside a stopped, vault-free profile then inspect.
+/// inspect at startup, 2 set aside a stopped, vault-free profile then inspect, 3 recover
+/// after a positively missing or invalidated local key (may set aside a vault).
 ///
 /// # Safety
 /// `launch` must be a live NUL-terminated UTF-8 launch JSON string for this call.
@@ -224,7 +225,7 @@ pub unsafe extern "C" fn loki_member_app_profile(launch: *const std::ffi::c_char
         match action {
             0 => {},
             1 => crate::host::native_clean_staging(&data),
-            2 => crate::host::native_set_aside(&data)?,
+            2 | 3 => crate::host::native_set_aside(&data, action == 3)?,
             _ => return Err("unknown profile action".into()),
         }
         Ok(crate::host::native_profile_state(&data)?.into())
@@ -318,6 +319,8 @@ unsafe fn take_restore_secret(ptr: *mut u8, len: usize) -> Result<zeroize::Zeroi
 fn restore_reply(result: Result<(), &'static str>) -> *mut std::ffi::c_char {
     let reply = match result {
         Ok(()) => serde_json::json!({ "restored": true }),
+        Err(error) if crate::signer::secure_element_apple::member_key_message(error).is_some() =>
+            serde_json::json!({ "key_error": error }),
         Err(error) => serde_json::json!({ "error": error }),
     };
     std::ffi::CString::new(reply.to_string()).map_or(std::ptr::null_mut(), std::ffi::CString::into_raw)
@@ -390,7 +393,8 @@ pub unsafe extern "C" fn loki_member_app_restore_profile(
             }
         });
         crate::host::run_native(config, pass, notice, native_approval(approve),
-            native_roster_confirmation(confirm_roster), native_connect(connect), fetched).map_err(|_| start_error)
+            native_roster_confirmation(confirm_roster), native_connect(connect), fetched)
+            .map_err(|e| crate::signer::secure_element_apple::member_key_message(&e).unwrap_or(start_error))
     }));
     restore_reply(result.unwrap_or(Err(if published { start_error } else { error })))
 }
@@ -452,6 +456,12 @@ pub unsafe extern "C" fn loki_member_app_pair(
             "device-key" => 4,
             "registration-refused" => 5,
             "registration-failed" => 6,
+            text if crate::signer::secure_element_apple::member_key_message(text).is_some() => {
+                use crate::signer::secure_element_apple::KeyFailure;
+                notice(if text == KeyFailure::Missing.message() { "startup-key-gone" } else { "startup-key" }, text);
+                7
+            },
+            "coordinator-roster-unreachable" => 8,
             _ => 1,
         },
         Err(_) => 2,

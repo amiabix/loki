@@ -14,7 +14,7 @@ fully offline. Reproduce with `./build.sh`.
 | File | Role |
 |---|---|
 | `se_backend.swift` | C-ABI Secure Enclave backend: `se_open_ephemeral`, `se_open_persistent`, `se_wrap`, `se_unwrap`, `se_close`. Handle table so one process can hold several elements. |
-| `poc/src/signer/secure_element_apple.rs` | **Shipped** Rust `AppleSecureElement` — `impl SecureElement` (`wrap_dek`/`unwrap_dek`), `ephemeral()` + `persistent(tag)` constructors, `Drop` closes the handle. |
+| `poc/loki-signer-core/src/signer/secure_element_apple.rs` | **Shipped** Rust `AppleSecureElement` — `impl SecureElement` (`wrap_dek`/`unwrap_dek`), `ephemeral()`, `open_persistent(tag)` and `create_persistent(tag)`, `Drop` closes the handle. |
 | `apple_ffi_verify.rs` | Offline `rustc` verifier that **includes the shipped module** and round-trips a DEK through the real Enclave. |
 | `zeroize_shim.rs` | Std-only `zeroize::Zeroizing` stand-in so the shipped module compiles under `rustc` without cargo. Verifier-only. |
 
@@ -39,12 +39,18 @@ Two independent gates remain. Neither is a crypto problem; both are environment.
 
 ### Gate 1 — persistence + biometrics need a signed binary (no cert on this Mac)
 
-`se_open_persistent` creates `kSecAttrIsPermanent=true` + `kSecAttrApplicationTag` with
+`se_open_persistent` only creates a key for a creating caller after `errSecItemNotFound`.
+The key uses `kSecAttrIsPermanent=true` + `kSecAttrApplicationTag` with
 access control `[.biometryCurrentSet, .privateKeyUsage]` — the persistent, Face/Touch-ID-gated
-KEK a real wallet needs. **Unsigned, key creation fails with `errSecMissingEntitlement`
-(-34018)** (surfaced to Rust as code -5; see stage 4 output and the assertion in the verifier
-that this path must NOT silently succeed). No Apple signing certificate exists on this machine,
-so this path is **present and gated, not claimed working**.
+KEK a real wallet needs. **Unsigned, Keychain operations can fail with
+`errSecMissingEntitlement`**; members see a fixed message, not the OS status.
+Run the Swift entry-point and signer-core error-copy tests without a Secure Enclave or signing
+identity. The script links the shipped Rust module against the dylib, even when a direct Cargo
+test of the leaf crate cannot link it:
+
+```sh
+bash poc/enclave-spike/build.sh --test-backend
+```
 
 Unblock: add a free Apple ID in Xcode → Settings → Accounts → Manage Certificates (creates a
 "personal team" + free *Apple Development* cert + Team ID; no paid membership needed), then

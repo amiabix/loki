@@ -1,7 +1,7 @@
 # LokiSigner — member-owned native signer
 
-The native app claims a `loki://pair` link, opens the existing persistent Secure Enclave
-P-256 device key, and runs S4a self-registration. The coordinator receives public enrollment
+The native app claims a `loki://pair` link, sets up a persistent Secure Enclave P-256 device
+key for a new profile (or opens the existing key), and runs S4a self-registration. The coordinator receives public enrollment
 and a challenge signature. Profile passphrases, local session capabilities and FROST shares
 stay on the member device. The FROST share is encrypted with an Enclave-wrapped key; it is
 opened in signer memory for signing.
@@ -18,7 +18,9 @@ On the wallet's sign-in screen open **Use a native member app instead**. It has 
 1. **Pair a new native signer**: choose **Get a pairing link**. The wallet shows the reserved
    slot, the time left on the link, an **Open LokiSigner** button and **Copy link** (to open
    it on the member's Mac yourself). LokiSigner then asks, in this order:
-   - On first launch, choose **Pair a new signer** (or see restore below if this is a replacement Mac).
+   - On first launch, LokiSigner checks that Touch ID is available, enrolled and not locked out.
+     Setup stops if it isn't ready. Read the fingerprint-change warning and choose **Pair a new
+     signer** (or see restore below if this is a replacement Mac).
    - "Pair this device with slot N?" with the coordinator origin. Choose **Continue** only if
      it is the wallet's address.
    - "Pair this device with slot N?" again, with the network and endpoints that coordinator
@@ -58,9 +60,35 @@ If you cancel, enter the wrong passphrase, or LokiSigner cannot start, choose **
 or **Quit**. If the coordinator refuses a pairing, retry the saved pairing or get a new link
 from the wallet. When the existing profile has no vault data, **Start over…** lets you set it
 aside before pairing or restoring. LokiSigner moves the whole data folder to a dated sibling;
-it deletes neither the folder nor the old device key in the Keychain. New native profiles save
-a random key scope and use a different device login key, even at the same path. That key stays
-with its profile if the folder is moved. Existing vault share key tags do not change.
+it deletes neither the folder nor its old keys in the Keychain. New and restored native profiles
+save a public random `native-key-scope`. The device login key and each new vault key use that
+scope and a distinct role, so they keep the same tags when the folder moves on the same Mac and
+do not reuse the prior profile's keys at the same path. Existing path-based tags stay unchanged,
+including vaults written when only the device key used the scope. An empty `native-scoped-vault-key`
+marker beside a new vault's seals records that it uses the scoped tag. Keep both files with the
+profile if you move it.
+
+After a validated Apple device registration, LokiSigner writes an empty
+`device-registration-confirmed` marker in the profile. It contains no secrets and is not
+written during restore staging. Without that marker, a missing device key may be created
+only if the saved coordinator's roster can be read and does not list this profile’s identity.
+An unreadable roster does not authorize key creation.
+
+New Secure Enclave keys record the public LocalAuthentication enrolment state in a
+`biometry-state` file beside the corresponding sealed data. LokiSigner uses a change in that
+state to distinguish a fingerprint change from a failed match; it never stores fingerprints.
+When setup reuses a key left by an interrupted attempt, it verifies one private-key use
+before sealing new data under that key.
+
+`NativeSigner.start` checks Touch ID once when it sees a fresh profile, before pairing or
+first-run recovery asks for a passphrase or words. **Restore a vault…** checks it before
+collecting words in an unlocked profile. Neither check runs in `serve` or the headless binary.
+
+Adding or removing a fingerprint invalidates this Mac's signer keys. Copying a profile to
+another Mac does not copy its keys. LokiSigner does not create a replacement when opening
+sealed data. If you only moved an older profile that uses path-based tags on the same Mac,
+putting the folder back at its original path can recover access. A cancelled Touch ID prompt
+does not invalidate the key.
 
 **Update the coordinator and wallet before updating LokiSigner.**
 
@@ -111,16 +139,24 @@ pairing or signer-settings `.tmp` files, and an empty `vaults/` directory or one
 generated restore staging directories. Restore preserves these leftovers in a dated sibling.
 Anything unrecognized requires you to confirm **Start over…** before it is moved. Any other
 entry in `vaults/`, a `vaults` file, a legacy `card` entry, or top-level `vault.card`,
-`vault.sealed`, or `share.sealed` protects the profile from being set aside. LokiSigner tries
+`vault.sealed`, or `share.sealed` protects the profile from ordinary set-aside. LokiSigner tries
 to clear expired `.loki-restore-<UUID>` directories at startup, both in `vaults/` and beside
 the data folder. Symlinks to the data folder still work; set-aside keeps the link pointing to
 the newly emptied location and archives the old contents beside its target.
 
 If you already paired a different member by mistake, choose **Start over…** from the retry
 dialog or when **Restore a vault…** says the backup does not match the running profile. Confirm
-**Set aside and start over**, then choose **Restore from recovery words**. LokiSigner will not
-set aside a profile with vault data. To restore a different member in that case, use another Mac
-or macOS account.
+**Set aside and start over**, then choose **Restore from recovery words**. A profile with vault
+data is protected from this ordinary action. To restore a different member in that case, use
+another Mac or macOS account.
+
+When LokiSigner confirms that a vault or device key is missing or invalidated, it offers
+**Set aside profile…** even if the profile holds vault data. This stops the signer and renames
+the old folder without deleting it or any Keychain record. Choose **Restore from recovery words**
+to restore into the original folder with fresh keys. Keep the archived folder until you have
+verified every restored vault. A failed match, cancellation, or lockout does not grant this
+exception. For older keys without enrolment metadata, a failed match can only offer a recovery
+hint, not confirm that the key is gone.
 
 Restore each additional backup from **LokiSigner → Restore a vault…** in the unlocked app.
 It must belong to the same member and recovery words. It will not replace an existing vault.
@@ -315,7 +351,7 @@ RUST SIGNER ENCLAVE PASS: FROST share sealed + reloaded under the persistent Sec
 ```
 
 The app calls `loki_signer_enclave_selftest()` (`poc/src/enclave_ffi.rs`), which runs the
-actual signer path — `SealedShare::seal` under `AppleSecureElement::persistent` — so the
+actual signer path — `SealedShare::seal` under `AppleSecureElement::create_persistent` — so the
 member's FROST share is held in a persistent, device-bound, biometric-capable Secure Enclave
 key, **inside the provisioned app**. Built entirely on the Mac (crates.io + Enclave + Xcode).
 Arch must be `arm64` (matches the Rust lib). `libs/` is regenerated by `build.sh`, not committed.
