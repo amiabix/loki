@@ -1,13 +1,15 @@
 import AppKit
+import UserNotifications
 
 typealias ConnectCancellation = @convention(c) (UnsafeRawPointer?) -> Int32
 typealias ConnectDecision = @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?,
     UnsafeRawPointer?, ConnectCancellation) -> Int32
+typealias ApprovalDecision = @convention(c) (UnsafePointer<CChar>?, UnsafeRawPointer?, ConnectCancellation) -> Int32
 
 @_silgen_name("loki_member_app_pair")
 func loki_member_app_pair(_ launch: UnsafePointer<CChar>, _ pass: UnsafeMutablePointer<CChar>,
     _ notify: @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Void,
-    _ approve: @convention(c) (UnsafePointer<CChar>?) -> Int32,
+    _ approve: ApprovalDecision,
     _ confirmRoster: @convention(c) (UnsafePointer<CChar>?) -> Int32,
     _ connect: ConnectDecision) -> Int32
 
@@ -80,13 +82,14 @@ func registrationWarningAlert(_ message: String, key: Bool = false, recover: Boo
 }
 
 @_silgen_name("loki_signer_approval_selftest")
-func loki_signer_approval_selftest(_ approve: @convention(c) (UnsafePointer<CChar>?) -> Int32) -> Int32
+func loki_signer_approval_selftest(_ approve: ApprovalDecision) -> Int32
 
 /// Presents a decision requested by the wallet, without accepting input carried over from
 /// another window. Keep native buttons so assistive technology can still press them.
 func runDecisionAlert(_ alert: NSAlert, timeout: TimeInterval? = nil,
                       escape: NSApplication.ModalResponse,
-                      field: NSTextField? = nil) -> NSApplication.ModalResponse {
+                      field: NSTextField? = nil, cancelled: (() -> Bool)? = nil,
+                      timeoutResponse: NSApplication.ModalResponse = .abort) -> NSApplication.ModalResponse {
     alert.layout()
     let window = alert.window
     let buttons = alert.buttons
@@ -153,8 +156,17 @@ func runDecisionAlert(_ alert: NSAlert, timeout: TimeInterval? = nil,
     }
 
     NSApp.activate(ignoringOtherApps: true)
-    let expiry = timeout.map { seconds in
-        let timer = Timer(timeInterval: seconds, repeats: false) { _ in NSApp.abortModal() }
+    let deadline = timeout.map { ProcessInfo.processInfo.systemUptime + $0 }
+    let interval = cancelled == nil ? timeout : 0.1
+    let expiry = interval.map { seconds in
+        let timer = Timer(timeInterval: seconds, repeats: cancelled != nil) { _ in
+            if let cancelled {
+                guard NSApp.modalWindow === window else { return }
+                if cancelled() { NSApp.abortModal(); return }
+                guard let deadline, ProcessInfo.processInfo.systemUptime >= deadline else { return }
+            }
+            NSApp.stopModal(withCode: timeoutResponse)
+        }
         RunLoop.main.add(timer, forMode: .modalPanel)
         return timer
     }
@@ -168,8 +180,40 @@ func runDecisionAlert(_ alert: NSAlert, timeout: TimeInterval? = nil,
     return alert.runModal()
 }
 
-/// An unanswered payment request is refused after this long.
+/// An unanswered payment request is refused after this long, or sooner if the round ends.
 private let approvalTimeout: TimeInterval = 120
+private let approvalTimedOut = NSApplication.ModalResponse(rawValue: 1003)
+
+private final class ApprovalNotifications: NSObject, UNUserNotificationCenterDelegate {
+    static let shared = ApprovalNotifications()
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                                withCompletionHandler complete: @escaping (UNNotificationPresentationOptions) -> Void) {
+        // The wallet-triggered alert may have activated the app since we asked for attention.
+        complete(notification.request.identifier.hasPrefix("payment-approval-") ? [.banner, .list] : [])
+    }
+}
+
+// Keep the last unanswered request visible even with system notifications disabled.
+private var approvalEndedWindow: NSPanel?
+
+private func showApprovalEnded(timedOut: Bool) {
+    let frame = NSRect(x: 0, y: 0, width: 360, height: 72)
+    let panel = approvalEndedWindow ?? NSPanel(contentRect: frame, styleMask: [.titled, .closable],
+        backing: .buffered, defer: false)
+    panel.title = timedOut ? "Payment approval timed out" : "Payment request ended"
+    panel.isReleasedWhenClosed = false
+    panel.hidesOnDeactivate = false
+    let label = NSTextField(wrappingLabelWithString: timedOut
+        ? "You did not answer the payment request in time. LokiSigner did not approve it."
+        : "This payment attempt ended before you answered. LokiSigner did not approve it.")
+    panel.contentView = NSView(frame: frame)
+    label.frame = frame.insetBy(dx: 16, dy: 12)
+    panel.contentView?.addSubview(label)
+    if approvalEndedWindow == nil { panel.center() }
+    approvalEndedWindow = panel
+    panel.orderFront(nil)
+}
 
 private func zec(_ value: Any?) -> String {
     let zat = (value as? NSNumber)?.uint64Value ?? 0
@@ -177,20 +221,56 @@ private func zec(_ value: Any?) -> String {
 }
 
 /// The member's decision on one payment, called by the signer from a worker thread just
-/// before it would release its signature share. Every detail shown is what the signer
-/// derived from the transaction bytes itself. Returns 1 only for an explicit approval;
-/// Refuse, closing the dialog, a malformed request or the timeout all refuse.
-private func nativeApprove(_ summary: UnsafePointer<CChar>?) -> Int32 {
-    guard let summary = summary,
-          let request = try? JSONSerialization.jsonObject(with: Data(String(cString: summary).utf8)) as? [String: Any]
+/// before it would release its signature share. The cancellation context is borrowed until
+/// this call returns. Returns 1 only for an explicit approval and 2 for a local timeout.
+private func nativeApprove(_ summary: UnsafePointer<CChar>?, _ context: UnsafeRawPointer?,
+                           _ cancellation: ConnectCancellation) -> Int32 {
+    guard let summary, let context,
+          let request = try? JSONSerialization.jsonObject(with: Data(String(cString: summary).utf8)) as? [String: Any],
+          let vault = request["vault"] as? String, let vaultName = request["vault_name"] as? String,
+          let expiry = (request["expiry_height"] as? NSNumber)?.stringValue,
+          let memo = request["memo"] as? String
     else { return 0 }
-    var approved = false
-    DispatchQueue.main.sync {
+    return DispatchQueue.main.sync {
+        let cancelled = { cancellation(context) != 0 }
+        let initialState = cancellation(context)
+        guard initialState == 0 else { showApprovalEnded(timedOut: initialState == 2); return 0 }
+        guard NSApp.modalWindow == nil else { return 0 }
+
+        var stopNotice: (() -> Void)?
+        if !NSApp.isActive {
+            let attention = NSApp.requestUserAttention(.informationalRequest)
+            let center = UNUserNotificationCenter.current()
+            center.delegate = ApprovalNotifications.shared
+            let id = "payment-approval-\(UUID())"
+            var waiting = true
+            center.requestAuthorization(options: [.alert]) { granted, _ in
+                guard granted else { return }
+                RunLoop.main.perform(inModes: [.default, .modalPanel]) {
+                    guard waiting else { return }
+                    let content = UNMutableNotificationContent()
+                    content.title = "LokiSigner payment request"
+                    content.body = "Open LokiSigner to review a payment awaiting approval."
+                    center.add(UNNotificationRequest(identifier: id, content: content, trigger: nil)) { _ in
+                        RunLoop.main.perform(inModes: [.default, .modalPanel]) {
+                            if !waiting { center.removeDeliveredNotifications(withIdentifiers: [id]) }
+                        }
+                    }
+                }
+            }
+            stopNotice = {
+                waiting = false
+                NSApp.cancelUserAttentionRequest(attention)
+                center.removePendingNotificationRequests(withIdentifiers: [id])
+                center.removeDeliveredNotifications(withIdentifiers: [id])
+            }
+        }
+        defer { stopNotice?() }
+
         let text = { (key: String) in request[key] as? String ?? "?" }
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Approve this payment?"
-        let memo = text("memo").isEmpty ? "" : "\nMemo: \(text("memo"))"
         let fee = (request["fee_verified"] as? Bool) == true ? zec(request["fee_zat"]) : "\(zec(request["fee_zat"])) (NOT VERIFIED)"
         let member = (request["member"] as? NSNumber)?.stringValue ?? "?"
         alert.informativeText = """
@@ -198,22 +278,58 @@ private func nativeApprove(_ summary: UnsafePointer<CChar>?) -> Int32 {
             Amount: \(zec(request["amount_zat"]))
             Fee: \(fee)
             Change back to the vault: \(zec(request["change_zat"]))
-            Network: \(text("network")) (branch \(text("branch_id")))\(memo)
+            Network: \(text("network")) (branch \(text("branch_id")))
+            Expiry height: \(expiry)
 
-            Member \(member) — Vault: \(text("vault"))
+            Member: \(member)
             Payment: \(text("payment"))
             Attempt: \(text("attempt"))
             Signs: \(text("sighash"))
 
-            LokiSigner read these details from the transaction itself, not from the wallet page. \
-            Approve only if they match the payment you intend. Unanswered requests are refused after \(Int(approvalTimeout / 60)) minutes.
+            Approve only if the transaction matches the payment you intend. \
+            Unanswered requests are refused after \(Int(approvalTimeout / 60)) minutes.
             """
+        let nameLabel = NSTextField(labelWithString: "Vault name (ID \(vault.prefix(12))):")
+        let name = untrustedLine(vaultName)
+        var details: [NSView] = [nameLabel, name]
+        let width: CGFloat = 420
+        if !memo.isEmpty {
+            let box = NSScrollView()
+            box.borderType = .bezelBorder
+            box.hasVerticalScroller = true
+            let memoText = NSTextView(frame: NSRect(x: 0, y: 0, width: width, height: 84))
+            // Only LF is a layout character, and only within this clipped scroll view.
+            memoText.string = memo.components(separatedBy: "\n").map(untrustedText).joined(separator: "\n")
+            memoText.isEditable = false
+            memoText.isRichText = false
+            memoText.isVerticallyResizable = true
+            memoText.autoresizingMask = [.width]
+            memoText.textContainer?.widthTracksTextView = true
+            memoText.font = .systemFont(ofSize: NSFont.systemFontSize)
+            box.documentView = memoText
+            box.widthAnchor.constraint(equalToConstant: width).isActive = true
+            box.heightAnchor.constraint(equalToConstant: 84).isActive = true
+            details += [NSTextField(labelWithString: "Memo (payment sender’s text):"), box]
+        }
+        let stack = NSStackView(views: details)
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 4
+        name.widthAnchor.constraint(equalToConstant: width).isActive = true
+        stack.frame = NSRect(x: 0, y: 0, width: width, height: memo.isEmpty ? 45 : 152)
+        alert.accessoryView = stack
         alert.addButton(withTitle: "Refuse")
         alert.addButton(withTitle: "Approve and sign")
-        approved = runDecisionAlert(alert, timeout: approvalTimeout, escape: .alertFirstButtonReturn)
-            == .alertSecondButtonReturn
+        let result = runDecisionAlert(alert, timeout: approvalTimeout, escape: .alertFirstButtonReturn,
+            cancelled: cancelled, timeoutResponse: approvalTimedOut)
+        let finalState = cancellation(context)
+        if finalState != 0 || result == approvalTimedOut {
+            let timedOut = finalState == 2 || finalState == 0 && result == approvalTimedOut
+            showApprovalEnded(timedOut: timedOut)
+            return timedOut ? 2 : 0
+        }
+        return result == .alertSecondButtonReturn ? 1 : 0
     }
-    return approved ? 1 : 0
 }
 
 /// An unanswered roster comparison is refused after this long; members compare by phone.

@@ -1198,7 +1198,7 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
             VaultNetwork::Testnet => Network::Testnet,
         };
         // DKG never signs a payment; any request still goes to the member, or is refused.
-        let mut prompts = hosted_prompts(&signer_dir, pass, super::approval_policy(st.approval.clone(), signer_network, c.my_slot));
+        let mut prompts = hosted_prompts(&signer_dir, pass, super::approval_policy(st.approval.clone(), signer_network, c.my_slot, None));
         // Matches only the code this member confirmed in `agree`.
         let confirmed = c.roster_code.clone();
         prompts.roster = Box::new(move |code| roster_decision(confirmed.as_deref(), code));

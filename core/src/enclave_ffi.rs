@@ -104,13 +104,27 @@ pub extern "C" fn loki_member_app_serve() -> i32 {
     0
 }
 
-/// The native app's payment dialog: receives the signer-derived summary JSON and returns 1
-/// only when the member approved. Anything else (refuse, cancel, timeout) refuses.
-pub type NativeApprove = extern "C" fn(*const std::ffi::c_char) -> i32;
+/// The native app's payment dialog: 1 approves, 2 timed out, everything else refuses.
+/// The cancellation callback and its context are borrowed for this call only.
+pub type NativeApprove = extern "C" fn(
+    *const std::ffi::c_char,
+    *const std::ffi::c_void,
+    extern "C" fn(*const std::ffi::c_void) -> i32,
+) -> i32;
 
 fn native_approval(approve: NativeApprove) -> crate::host::LocalApproval {
-    std::sync::Arc::new(move |summary| {
-        std::ffi::CString::new(summary).is_ok_and(|summary| approve(summary.as_ptr()) == 1)
+    use crate::host::{ApprovalAnswer, ApprovalAttempt};
+    extern "C" fn cancelled(context: *const std::ffi::c_void) -> i32 {
+        i32::from(unsafe { &*context.cast::<ApprovalAttempt>() }.cancellation_code())
+    }
+    std::sync::Arc::new(move |summary, attempt| {
+        match std::ffi::CString::new(summary).map(|summary| {
+            approve(summary.as_ptr(), std::ptr::from_ref(attempt).cast(), cancelled)
+        }) {
+            Ok(1) => ApprovalAnswer::Approve,
+            Ok(2) => ApprovalAnswer::Timeout,
+            _ => ApprovalAnswer::Refuse,
+        }
     })
 }
 
@@ -147,12 +161,36 @@ pub extern "C" fn loki_member_app_disconnect_wallet_tabs() {
 /// biometrics. Returns 0 when signed, 3 when the member refused.
 #[no_mangle]
 pub extern "C" fn loki_signer_approval_selftest(approve: NativeApprove) -> i32 {
+    use crate::host::{ApprovalAnswer, ApprovalAttempt, LocalApproval};
+    use std::{sync::Arc, time::Duration};
     let r = std::panic::catch_unwind(|| {
+        let ask = native_approval(approve);
+        let ask: LocalApproval = if std::env::args().any(|arg| arg == "--cancel-approval") {
+            Arc::new(move |summary, attempt| {
+                // This presentation-only fixture can never approve the underlying test payment.
+                let mut summary: serde_json::Value = serde_json::from_str(summary).unwrap();
+                summary["memo"] = "Rent for November\nRecipient: imitation\nAmount: 0.00000001 ZEC\u{202e}".into();
+                std::thread::scope(|scope| {
+                    let cancel = scope.spawn(|| {
+                        std::thread::sleep(Duration::from_secs(10));
+                        attempt.cancel();
+                    });
+                    ask(&summary.to_string(), attempt);
+                    cancel.join().unwrap();
+                });
+                // Leave the closed-request notice on screen briefly in the self-test.
+                std::thread::sleep(Duration::from_secs(4));
+                ApprovalAnswer::Refuse
+            })
+        } else {
+            ask
+        };
         crate::signer::native_member::prove_dkg_member_with(
             2,
             3,
             |_| crate::signer::secure_element::SoftwareSecureElement::generate(),
-            |slot| Some(crate::host::approval_policy(Some(native_approval(approve)), crate::signer::Network::Regtest, slot)),
+            |slot| Some(crate::host::approval_policy(Some(ask.clone()), crate::signer::Network::Regtest, slot,
+                Some(Arc::new(ApprovalAttempt::named("Native vault".into()))))),
         )
     });
     match r {
@@ -167,6 +205,23 @@ pub extern "C" fn loki_signer_approval_selftest(approve: NativeApprove) -> i32 {
         }
         Err(_) => 2,
     }
+}
+
+#[cfg(test)]
+#[test]
+fn native_approval_does_not_sign_after_cancellation() {
+    use std::ffi::{c_char, c_void};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SAW_END: AtomicBool = AtomicBool::new(false);
+    extern "C" fn late(_: *const c_char, context: *const c_void, cancelled: extern "C" fn(*const c_void) -> i32) -> i32 {
+        if cancelled(context) != 0 { return -1; }
+        unsafe { &*context.cast::<crate::host::ApprovalAttempt>() }.cancel();
+        // Simulate the member clicking just as the attempt ends, before Swift can close.
+        SAW_END.store(cancelled(context) == 1, Ordering::Relaxed);
+        1
+    }
+    assert_eq!(loki_signer_approval_selftest(late), 3);
+    assert!(SAW_END.load(Ordering::Relaxed));
 }
 
 /// The native app's roster dialog: receives the roster summary JSON `/api/agree` derived and
@@ -470,6 +525,8 @@ pub unsafe extern "C" fn loki_member_app_pair(
 
 #[cfg(all(test, feature = "relay-communication"))]
 mod native_pairing_tests {
+    extern "C" fn refuse_approval(_: *const std::ffi::c_char, _: *const std::ffi::c_void,
+        _: extern "C" fn(*const std::ffi::c_void) -> i32) -> i32 { 0 }
     extern "C" fn refuse_connect(_: *const std::ffi::c_char, _: *const std::ffi::c_char,
         _: *const std::ffi::c_void, _: extern "C" fn(*const std::ffi::c_void) -> i32) -> i32 { 0 }
 
@@ -480,7 +537,7 @@ mod native_pairing_tests {
         extern "C" fn notice(_: *const std::ffi::c_char, _: *const std::ffi::c_char) {}
         extern "C" fn refuse(_: *const std::ffi::c_char) -> i32 { 0 }
         let reply = unsafe { super::loki_member_app_restore_profile(std::ptr::null(),
-            words.as_mut_ptr(), words.len(), pass.as_mut_ptr(), pass.len(), std::ptr::null(), notice, refuse, refuse, refuse_connect) };
+            words.as_mut_ptr(), words.len(), pass.as_mut_ptr(), pass.len(), std::ptr::null(), notice, refuse_approval, refuse, refuse_connect) };
         assert!(words.iter().chain(&pass).all(|&b| b == 0));
         let error: serde_json::Value = serde_json::from_slice(unsafe { std::ffi::CStr::from_ptr(reply) }.to_bytes()).unwrap();
         unsafe { super::loki_member_app_free(reply); }
@@ -500,7 +557,7 @@ mod native_pairing_tests {
         let launch = std::ffi::CString::new(r#"{"args":[]}"#).unwrap();
         extern "C" fn refuse(_: *const std::ffi::c_char) -> i32 { 0 }
         let mut pass = b"native passphrase\0".to_vec();
-        let code = unsafe { super::loki_member_app_pair(launch.as_ptr(), pass.as_mut_ptr().cast(), notice, refuse, refuse, refuse_connect) };
+        let code = unsafe { super::loki_member_app_pair(launch.as_ptr(), pass.as_mut_ptr().cast(), notice, refuse_approval, refuse, refuse_connect) };
         assert_eq!(code, 1); // Invalid config fails before any Enclave operation.
         assert!(pass.iter().all(|b| *b == 0));
     }

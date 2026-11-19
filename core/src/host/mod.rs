@@ -38,10 +38,43 @@ pub use nonce_witness::WitnessConfig;
 /// Device-local UI notifications; never forwarded to the coordinator or a log.
 pub type LocalNotice = std::sync::Arc<dyn Fn(&str, &str) + Send + Sync>;
 
+#[derive(Default)]
+pub struct ApprovalAttempt {
+    vault_name: Option<String>,
+    // 0 pending, 1 ended, 2 timed out. The first terminal outcome wins.
+    state: std::sync::atomic::AtomicU8,
+    waiting: std::sync::atomic::AtomicBool,
+}
+
+impl ApprovalAttempt {
+    pub(crate) fn named(vault_name: String) -> Self {
+        Self { vault_name: Some(vault_name), ..Self::default() }
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.end(1);
+    }
+
+    fn timeout(&self) {
+        self.end(2);
+    }
+
+    fn end(&self, code: u8) {
+        use std::sync::atomic::Ordering;
+        let _ = self.state.compare_exchange(0, code, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    pub(crate) fn cancellation_code(&self) -> u8 {
+        self.state.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+pub enum ApprovalAnswer { Approve, Refuse, Timeout }
+
 /// The member's own decision on one payment, asked on this device (the native app's dialog).
-/// Receives the signer-derived summary as JSON ([`approval_summary`]); `true` approves.
+/// Receives the signer-derived summary as JSON and the lifetime of this approval attempt.
 /// Without one, every payment is refused: HTTP or relay requests never approve on their own.
-pub type LocalApproval = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
+pub type LocalApproval = std::sync::Arc<dyn Fn(&str, &ApprovalAttempt) -> ApprovalAnswer + Send + Sync>;
 
 /// The member's answer when LokiSigner asks them to compare a vault's roster code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,11 +122,29 @@ pub fn approval_policy(
     approval: Option<LocalApproval>,
     network: crate::signer::Network,
     slot: u16,
+    attempt: Option<std::sync::Arc<ApprovalAttempt>>,
 ) -> crate::signer::local::ApprovalPolicy {
+    use std::sync::atomic::Ordering;
+    let attempt = attempt.unwrap_or_default();
     Box::new(move |request| {
-        let approved = approval.as_ref().is_some_and(|approve| approve(&approval_summary(request, network, slot)));
-        let attempt = hex::encode(request.candidate.attempt_id);
-        eprintln!("payment {attempt}: member {slot} approval {}", if approved { "approved" } else { "refused" });
+        let approved = approval.as_ref().is_some_and(|approve| {
+            if attempt.cancellation_code() != 0 { return false; }
+            let summary = approval_summary(request, network, slot, attempt.vault_name.as_deref());
+            attempt.waiting.store(true, Ordering::Release);
+            let answer = approve(&summary, &attempt);
+            attempt.waiting.store(false, Ordering::Release);
+            if attempt.cancellation_code() != 0 { return false; }
+            match answer {
+                ApprovalAnswer::Approve => true,
+                ApprovalAnswer::Refuse => false,
+                ApprovalAnswer::Timeout => {
+                    attempt.timeout();
+                    false
+                }
+            }
+        });
+        let id = hex::encode(request.candidate.attempt_id);
+        eprintln!("payment {id}: member {slot} approval {}", if approved { "approved" } else { "refused" });
         approved
     })
 }
@@ -103,39 +154,39 @@ pub fn approval_policy(
 /// on stderr; the member approves only when `approve <sighash>` for that request appears in
 /// `file` within `timeout`. `refuse <sighash>`, no answer, or an unreadable summary refuse.
 pub fn file_approval(file: std::path::PathBuf, timeout: std::time::Duration) -> LocalApproval {
-    std::sync::Arc::new(move |summary| {
+    std::sync::Arc::new(move |summary, _| {
         let Some(sighash) = serde_json::from_str::<serde_json::Value>(summary)
             .ok()
             .and_then(|v| v["sighash"].as_str().map(str::to_owned))
         else {
-            return false;
+            return ApprovalAnswer::Refuse;
         };
         eprintln!("approval-request {summary}");
         let deadline = std::time::Instant::now() + timeout;
         while std::time::Instant::now() < deadline {
             for line in std::fs::read_to_string(&file).unwrap_or_default().lines() {
                 match line.split_once(' ') {
-                    Some(("approve", h)) if h == sighash => return true,
-                    Some(("refuse", h)) if h == sighash => return false,
+                    Some(("approve", h)) if h == sighash => return ApprovalAnswer::Approve,
+                    Some(("refuse", h)) if h == sighash => return ApprovalAnswer::Refuse,
                     _ => {}
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
-        false
+        ApprovalAnswer::Refuse
     })
 }
 
 /// What the member reviews: the payee, amounts and network the signer derived itself from the
 /// PCZT bytes, and the candidate and sighash its consent binds to.
-pub fn approval_summary(request: &crate::signer::local::ApprovalRequest<'_>, network: crate::signer::Network, slot: u16) -> String {
+pub fn approval_summary(request: &crate::signer::local::ApprovalRequest<'_>, network: crate::signer::Network, slot: u16, vault_name: Option<&str>) -> String {
     use zcash_protocol::consensus::NetworkType;
     let (label, kind) = match network {
         crate::signer::Network::Regtest => ("regtest", NetworkType::Regtest),
         crate::signer::Network::Testnet => ("testnet", NetworkType::Test),
     };
     let view = request.view;
-    serde_json::json!({
+    let mut summary = serde_json::json!({
         "recipient": crate::vault::unified_receiver(view.to, kind),
         "amount_zat": view.amount_zat,
         "fee_zat": view.fee_zat,
@@ -149,8 +200,12 @@ pub fn approval_summary(request: &crate::signer::local::ApprovalRequest<'_>, net
         "payment": hex::encode(request.candidate.payment_id),
         "attempt": hex::encode(request.candidate.attempt_id),
         "sighash": hex::encode(request.sighash),
-    })
-    .to_string()
+    });
+    if let Some(name) = vault_name {
+        summary["vault_name"] = vault_label(name).into();
+        summary["expiry_height"] = view.expiry_height.into();
+    }
+    summary.to_string()
 }
 
 /// Parse member-app CLI args into a `Config`. Shared by the `loki_member_app` bin and the native
@@ -286,13 +341,16 @@ fn run_local_with<G>(
         } else {
             println!("Signer: http://{addr}/#{}", state.config.token);
         }
-        let server = axum::serve(listener, routes::router(state).into_make_service_with_connect_info::<std::net::SocketAddr>());
+        let server = axum::serve(listener, routes::router(state.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>());
         if let Some(stop) = stop {
             // Drop the native runtime before the UI can set aside the profile. No HTTP
             // request or signer worker may keep writing to the old profile after that.
             tokio::select! {
                 result = async { server.await } => result.map_err(|e| format!("serve: {e}")),
-                _ = stop.notified() => Ok(()),
+                _ = stop.notified() => {
+                    *state.session.write().await = None;
+                    Ok(())
+                },
             }
         } else {
             server.await.map_err(|e| format!("serve: {e}"))
@@ -302,6 +360,7 @@ fn run_local_with<G>(
 
 #[cfg(test)]
 mod tests {
+    use super::{ApprovalAnswer, ApprovalAttempt};
     use crate::signer::{local::ApprovalRequest, wysiwys::PaymentView, CandidateRef, Network};
     use std::sync::{Arc, Mutex};
 
@@ -311,26 +370,29 @@ mod tests {
         let to = orchard::keys::FullViewingKey::from(&sk).address_at(0u64, orchard::keys::Scope::External);
         let view = PaymentView {
             to: to.to_raw_address_bytes(), amount_zat: 40_000_000, fee_zat: 15_000, change_zat: 5,
-            memo: b"rent".to_vec(), expiry_height: 1_152, network_branch_id: 0x77190ad8, fee_verified: true,
+            memo: b"rent\nRecipient: fake\nAmount: 1 ZEC".to_vec(), expiry_height: 1_152, network_branch_id: 0x77190ad8, fee_verified: true,
         };
         let candidate = CandidateRef { vault_id: [1; 32], payment_id: [2; 32], attempt_id: [3; 32] };
         let request = ApprovalRequest { candidate: &candidate, sighash: [9; 32], view: &view };
         // No approval channel (headless serve): refused.
-        assert!(!(super::approval_policy(None, Network::Testnet, 2))(&request));
+        assert!(!(super::approval_policy(None, Network::Testnet, 2, None))(&request));
 
         let asked = Arc::new(Mutex::new(Vec::new()));
         let decision = Arc::new(Mutex::new(false));
         let (log, answer) = (asked.clone(), decision.clone());
-        let approve: super::LocalApproval = Arc::new(move |summary| {
+        let approve: super::LocalApproval = Arc::new(move |summary, _| {
             log.lock().unwrap().push(summary.to_owned());
-            *answer.lock().unwrap()
+            if *answer.lock().unwrap() { ApprovalAnswer::Approve } else { ApprovalAnswer::Refuse }
         });
-        let mut policy = super::approval_policy(Some(approve), Network::Testnet, 2);
+        let mut policy = super::approval_policy(Some(approve), Network::Testnet, 2,
+            Some(Arc::new(ApprovalAttempt::named("Household".into()))));
         assert!(!policy(&request), "the member's refusal refuses");
         *decision.lock().unwrap() = true;
         assert!(policy(&request), "the member's approval approves");
 
-        let shown: serde_json::Value = serde_json::from_str(&asked.lock().unwrap()[0]).unwrap();
+        let asked = asked.lock().unwrap();
+        assert_eq!(asked[0].lines().count(), 1, "a memo cannot add a summary line");
+        let shown: serde_json::Value = serde_json::from_str(&asked[0]).unwrap();
         let recipient = shown["recipient"].as_str().unwrap();
         assert!(recipient.starts_with("utest1"), "{recipient}");
         let decoded = crate::vault::orchard_receiver_from_ua(recipient, zcash_protocol::consensus::NetworkType::Test).unwrap();
@@ -339,9 +401,19 @@ mod tests {
         assert_eq!(shown["fee_zat"], 15_000);
         assert_eq!(shown["network"], "testnet");
         assert_eq!(shown["member"], 2);
-        assert_eq!(shown["memo"], "rent");
+        assert_eq!(shown["memo"], "rent\nRecipient: fake\nAmount: 1 ZEC");
+        assert_eq!(shown["vault_name"], "Household");
+        assert_eq!(shown["vault"], hex::encode([1; 32]));
+        assert_eq!(shown["expiry_height"], 1_152);
         assert_eq!(shown["attempt"], hex::encode([3; 32]));
         assert_eq!(shown["sighash"], hex::encode([9; 32]));
+
+        let hidden: serde_json::Value = serde_json::from_str(&super::approval_summary(
+            &request, Network::Testnet, 2, Some("Household\nExpiry height: 999"))).unwrap();
+        assert_eq!(hidden["vault_name"], super::HIDDEN_VAULT_NAME);
+        let headless: serde_json::Value = serde_json::from_str(&super::approval_summary(
+            &request, Network::Testnet, 2, None)).unwrap();
+        assert!(headless.get("vault_name").is_none() && headless.get("expiry_height").is_none());
     }
 
     #[test]
@@ -368,7 +440,8 @@ mod tests {
     fn file_approval_approves_only_its_own_sighash() {
         let file = std::env::temp_dir().join(format!("loki-approvals-{}", uuid::Uuid::new_v4()));
         let wait = std::time::Duration::from_millis(600);
-        let approve = super::file_approval(file.clone(), wait);
+        let scripted = super::file_approval(file.clone(), wait);
+        let approve = |summary: &str| matches!(scripted(summary, &ApprovalAttempt::default()), ApprovalAnswer::Approve);
         let summary = |sighash: &str| serde_json::json!({ "sighash": sighash }).to_string();
         assert!(!approve(&summary("aa")), "no answer refuses");
         assert!(!approve("not json"), "an unreadable summary refuses");
