@@ -6,7 +6,7 @@ class MainFlutterWindow: NSWindow {
 
   override func awakeFromNib() {
     let flutterViewController = FlutterViewController()
-    walletChannel = WalletChannel(messenger: flutterViewController.engine.binaryMessenger)
+    walletChannel = WalletChannel(messenger: flutterViewController.engine.binaryMessenger, window: self)
     styleMask.insert(.fullSizeContentView)
     titlebarAppearsTransparent = true
     titleVisibility = .hidden

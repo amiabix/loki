@@ -3,6 +3,11 @@ import FlutterMacOS
 
 @main
 class AppDelegate: FlutterAppDelegate {
+  override func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+    if NativeSigner.awaitingRecoveryAcknowledgment { return .terminateCancel }
+    return super.applicationShouldTerminate(sender)
+  }
+
   override func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
     return true
   }

@@ -48,6 +48,8 @@ class _LokiAppState extends State<LokiApp> {
 
 enum _Page {
   vaults,
+  create,
+  join,
   overview,
   setup,
   send,
@@ -73,14 +75,24 @@ class _Wallet extends StatefulWidget {
 
 class _WalletState extends State<_Wallet> {
   WalletApi get api => widget.api;
+  MacWalletApi? get macApi => api is MacWalletApi ? api as MacWalletApi : null;
   Timer? timer;
   bool polling = false,
       busy = false,
-      reviewing = false,
       loaded = false,
       open = false,
       locking = false;
+  bool? nativePrompt;
+  bool leavingNativePrompt = false;
+  bool get hideContent =>
+      (nativePrompt ?? (macApi != null)) || leavingNativePrompt || locking;
+  bool get canRecoverWalletKey =>
+      macApi != null && profile['can_recover_wallet_key'] == true;
+  bool get hasNativeFeedback => nativeStatus != null || canRecoverWalletKey;
+  bool get waitingForPreview =>
+      previewRequestGeneration == generation && nativePrompt != true;
   int generation = 0;
+  int? previewRequestGeneration;
   Json profile = {};
   List<Json> vaults = [], payments = [], addresses = [];
   List<({Json vault, Json payment})> approvals = [];
@@ -92,24 +104,46 @@ class _WalletState extends State<_Wallet> {
       loadError,
       dataError,
       scanError,
+      nativeStatus,
       coordinator;
   DateTime nextScan = DateTime.fromMillisecondsSinceEpoch(0);
   final verifyUntil = <String, DateTime>{};
   bool scanning = false, enteringOrigin = false;
   String pairingOrigin = '';
   _Page page = _Page.vaults;
+  _Page formBack = _Page.vaults;
+  ({Json vault, String attempt})? review;
 
   Json? get vault => vaults.where((v) => v['vault'] == vaultId).firstOrNull;
 
   @override
   void initState() {
     super.initState();
+    if (macApi case final mac?) unawaited(watchNativePrompt(mac));
     unawaited(poll());
+  }
+
+  Future<void> watchNativePrompt(MacWalletApi mac) async {
+    var receivedEvent = false;
+    mac.onNativePromptChanged((active) {
+      receivedEvent = true;
+      if (mounted) setState(() => nativePrompt = active);
+    });
+    var active = false;
+    try {
+      active = await mac.nativePromptActive();
+    } on MissingPluginException {
+      // Older native runners have no content-area callbacks.
+    } on PlatformException catch (e) {
+      if (mounted) setState(() => actionError = walletError(e));
+    }
+    if (mounted && !receivedEvent) setState(() => nativePrompt = active);
   }
 
   @override
   void dispose() {
     timer?.cancel();
+    macApi?.onNativePromptChanged(null);
     super.dispose();
   }
 
@@ -117,6 +151,7 @@ class _WalletState extends State<_Wallet> {
     generation++;
     open = false;
     page = _Page.vaults;
+    review = null;
     vaults = [];
     approvals = [];
     addresses = [];
@@ -135,8 +170,24 @@ class _WalletState extends State<_Wallet> {
     timer?.cancel();
     final epoch = generation;
     try {
+      if (macApi case final mac?) {
+        try {
+          final notice = await mac.nativeNotice();
+          if (mounted && notice != nativeStatus) {
+            setState(() => nativeStatus = notice);
+          }
+        } on MissingPluginException {
+          // Notices are optional on older native runners.
+        } on PlatformException {
+          // Failure to read an advisory notice must not block the wallet poll.
+        }
+      }
       final current = await api.profile();
       if (!mounted || locking || epoch != generation) return;
+      if (current['can_recover_wallet_key'] !=
+          profile['can_recover_wallet_key']) {
+        setState(() => profile = current);
+      }
       if (current['running'] != true) {
         setState(() {
           if (open) resetSession();
@@ -301,10 +352,33 @@ class _WalletState extends State<_Wallet> {
     }
   }
 
-  void go(_Page next, {String? id, String? attempt}) {
+  Future<void> go(_Page next, {String? id, String? attempt}) async {
+    if (!mounted ||
+        locking ||
+        leavingNativePrompt ||
+        waitingForPreview ||
+        (macApi != null && nativePrompt == null)) {
+      return;
+    }
+    if (macApi case final mac? when nativePrompt == true) {
+      final epoch = generation;
+      setState(() => leavingNativePrompt = true);
+      try {
+        await mac.leaveNativePrompt();
+      } catch (e) {
+        if (mounted && epoch == generation) {
+          setState(() => actionError = walletError(e));
+        }
+        return;
+      } finally {
+        if (mounted) setState(() => leavingNativePrompt = false);
+      }
+      if (!mounted || locking || epoch != generation) return;
+    }
     setState(() {
       generation++;
       actionError = dataError = null;
+      review = null;
       if (id != null && id != vaultId) {
         vaultId = id;
         balance = null;
@@ -314,6 +388,7 @@ class _WalletState extends State<_Wallet> {
         nextScan = DateTime.fromMillisecondsSinceEpoch(0);
       }
       if (next == _Page.history && page != _Page.history) verifyUntil.clear();
+      if (next == _Page.create || next == _Page.join) formBack = page;
       page = next;
       selection = attempt;
     });
@@ -321,15 +396,19 @@ class _WalletState extends State<_Wallet> {
   }
 
   Future<void> act(Future<void> Function() perform) async {
-    if (busy) return;
+    if (busy || hideContent) return;
+    final epoch = generation;
     setState(() {
       busy = true;
       actionError = null;
+      nativeStatus = null;
     });
     try {
       await perform();
     } catch (e) {
-      if (mounted) setState(() => actionError = walletError(e));
+      if (mounted && epoch == generation) {
+        setState(() => actionError = walletError(e));
+      }
     } finally {
       if (mounted) {
         setState(() => busy = false);
@@ -338,27 +417,50 @@ class _WalletState extends State<_Wallet> {
     }
   }
 
-  Future<void> lock() => act(() async {
+  Future<void> lock() async {
+    if (locking || (busy && !hideContent)) return;
     setState(() {
+      generation++;
       locking = true;
-      resetSession();
+      actionError = nativeStatus = null;
     });
     try {
       await api.lock();
-    } finally {
-      locking = false;
-    }
-  });
-
-  Future<void> showReview(Json target, String attempt) async {
-    if (reviewing) return;
-    setState(() => reviewing = true);
-    try {
-      await showPaymentReview(context, target, attempt, api.request);
+    } catch (e) {
+      if (mounted) setState(() => actionError = walletError(e));
     } finally {
       if (mounted) {
-        setState(() => reviewing = false);
+        setState(() {
+          resetSession();
+          locking = false;
+        });
         unawaited(poll());
+      }
+    }
+  }
+
+  void showReview(Json target, String attempt) {
+    if (!mounted || hideContent || review != null) return;
+    setState(() {
+      generation++;
+      actionError = null;
+      review = (vault: target, attempt: attempt);
+    });
+  }
+
+  Future<Json> requestReview(int epoch, String path, Json? body) async {
+    if (path != 'payment-approve') return api.request(path, body);
+    if (epoch != generation || hideContent) {
+      throw StateError('The payment preview is no longer active.');
+    }
+    if (macApi == null) return api.request(path, body);
+    // Wait for the native page to open before allowing navigation to cancel it.
+    setState(() => previewRequestGeneration = epoch);
+    try {
+      return await api.request(path, body);
+    } finally {
+      if (mounted && previewRequestGeneration == epoch) {
+        setState(() => previewRequestGeneration = null);
       }
     }
   }
@@ -378,7 +480,8 @@ class _WalletState extends State<_Wallet> {
   Widget build(BuildContext context) {
     final c = context.colors;
     final still =
-        reviewing ||
+        hideContent ||
+        review != null ||
         profile['reduce_motion'] == true ||
         page == _Page.send ||
         (page == _Page.history && selection != null);
@@ -387,11 +490,13 @@ class _WalletState extends State<_Wallet> {
       body: Stack(
         fit: StackFit.expand,
         children: [
-          if (!open || !{_Page.vaults, _Page.setup}.contains(page))
+          if (nativePrompt == true ||
+              !open ||
+              !{_Page.vaults, _Page.setup}.contains(page))
             Vortex(
               dark: c.dark,
               still: still || fresh,
-              locked: !open && !fresh,
+              locked: !open && !fresh && nativePrompt != true,
             ),
           if (open)
             Row(
@@ -404,16 +509,25 @@ class _WalletState extends State<_Wallet> {
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
                         topBar(),
-                        Expanded(
+                        walletBody(
                           child: SingleChildScrollView(
-                            key: ValueKey((page, vaultId)),
+                            key: ValueKey((
+                              page,
+                              vaultId,
+                              review?.vault['vault'],
+                              review?.attempt,
+                            )),
                             padding: const EdgeInsets.only(top: 17, bottom: 12),
                             child: Column(
                               crossAxisAlignment: CrossAxisAlignment.stretch,
                               children: [
+                                if (hasNativeFeedback) ...[
+                                  nativeFeedback(),
+                                  const SizedBox(height: 12),
+                                ],
                                 content(),
-                                if (actionError ?? dataError
-                                    case final message?) ...[
+                                if (actionError ?? dataError case final message?
+                                    when message != nativeStatus) ...[
                                   const SizedBox(height: 12),
                                   Notice(message),
                                 ],
@@ -421,45 +535,51 @@ class _WalletState extends State<_Wallet> {
                             ),
                           ),
                         ),
+                        if (coordinator case final origin?)
+                          Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 12),
+                            child: Wrap(
+                              spacing: 5,
+                              crossAxisAlignment: WrapCrossAlignment.center,
+                              children: [
+                                Text(
+                                  'Paired coordinator',
+                                  style: lokiSans(10, color: c.muted),
+                                ),
+                                Text(
+                                  origin,
+                                  style: lokiMono(9, color: c.muted),
+                                ),
+                              ],
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            )
+          else
+            Row(
+              children: [
+                SizedBox(width: 204, child: sidebar(setup: true, fresh: fresh)),
+                Expanded(
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(26, 0, 26, 3),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        topBar(),
+                        walletBody(child: fresh ? signerSetup() : locked()),
                         Padding(
                           padding: const EdgeInsets.symmetric(vertical: 12),
                           child: Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
                             children: [
-                              Icon(
-                                Icons.shield_outlined,
-                                color: c.muted,
-                                size: 13,
-                              ),
-                              const SizedBox(width: 5),
                               Text(
-                                'Secure Enclave',
+                                'This Mac',
                                 style: lokiSans(10, color: c.muted),
                               ),
-                              const SizedBox(width: 12),
-                              Expanded(
-                                child: coordinator == null
-                                    ? const SizedBox.shrink()
-                                    : Wrap(
-                                        spacing: 5,
-                                        crossAxisAlignment:
-                                            WrapCrossAlignment.center,
-                                        children: [
-                                          Text(
-                                            '·',
-                                            style: lokiSans(10, color: c.muted),
-                                          ),
-                                          Text(
-                                            'Paired coordinator',
-                                            style: lokiSans(10, color: c.muted),
-                                          ),
-                                          Text(
-                                            coordinator!,
-                                            style: lokiMono(9, color: c.muted),
-                                          ),
-                                        ],
-                                      ),
-                              ),
-                              const SizedBox(width: 10),
                               Text(
                                 'Testnet funds only',
                                 style: lokiSans(10, color: c.muted),
@@ -472,59 +592,69 @@ class _WalletState extends State<_Wallet> {
                   ),
                 ),
               ],
-            )
-          else if (fresh)
-            signerSetup()
-          else
-            locked(),
-          if (!open && !fresh)
-            Positioned(top: 4, right: 22, child: appearance()),
+            ),
         ],
       ),
     );
   }
 
-  Widget appearance() => PopupMenuButton<ThemeMode>(
-    tooltip: 'Appearance',
-    icon: Icon(Icons.contrast, size: 16, color: context.colors.muted),
-    initialValue: widget.theme,
-    onSelected: (mode) => act(() => widget.setTheme(mode)),
-    itemBuilder: (_) => const [
-      PopupMenuItem(value: ThemeMode.system, child: Text('Follow system')),
-      PopupMenuItem(value: ThemeMode.light, child: Text('Light')),
-      PopupMenuItem(value: ThemeMode.dark, child: Text('Dark')),
+  // Retain in-flight Dart work without painting, focusing, or exposing its UI.
+  Widget walletBody({required Widget child}) => Expanded(
+    child: Visibility(visible: !hideContent, maintainState: true, child: child),
+  );
+
+  Widget nativeFeedback() => Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    spacing: 8,
+    children: [
+      if (nativeStatus case final message?) Notice(message),
+      if (canRecoverWalletKey)
+        ActionChipButton(
+          'Review profile recovery',
+          Icons.key_outlined,
+          busy ? null : () => act(macApi!.recoverWalletKey),
+        ),
     ],
+  );
+
+  Widget appearance() => Padding(
+    padding: const EdgeInsets.only(right: 8),
+    child: Semantics(
+      label: 'Appearance',
+      child: SegmentedButton<ThemeMode>(
+        showSelectedIcon: false,
+        style: SegmentedButton.styleFrom(
+          textStyle: lokiSans(10),
+          visualDensity: VisualDensity.compact,
+          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        ),
+        segments: const [
+          ButtonSegment(value: ThemeMode.system, label: Text('System')),
+          ButtonSegment(value: ThemeMode.light, label: Text('Light')),
+          ButtonSegment(value: ThemeMode.dark, label: Text('Dark')),
+        ],
+        selected: {widget.theme},
+        onSelectionChanged: busy || hideContent
+            ? null
+            : (modes) => act(() => widget.setTheme(modes.single)),
+      ),
+    ),
+  );
+
+  Widget lockControl() => IconButton(
+    onPressed: locking || (busy && !hideContent) ? null : lock,
+    tooltip: 'Lock signer',
+    icon: Icon(Icons.lock_outline, size: 15, color: context.colors.muted),
   );
 
   Widget topBar() {
     final c = context.colors;
-    final crumb = switch (page) {
-      _Page.setup => 'Vault setup',
-      _Page.send => 'Send',
-      _Page.history => 'History',
-      _Page.receive => 'Vault addresses',
-      _Page.recovery => 'Recovery',
-      _Page.approvals => 'Approvals',
-      _ => 'Wallet',
-    };
     return SizedBox(
       height: 43,
       child: Row(
+        mainAxisAlignment: MainAxisAlignment.end,
         children: [
-          Icon(Icons.view_sidebar_outlined, size: 16, color: c.muted),
-          Container(
-            width: 1,
-            height: 15,
-            color: c.stroke,
-            margin: const EdgeInsets.symmetric(horizontal: 12),
-          ),
-          Text('LokiSigner', style: lokiSans(12, weight: 600)),
-          const SizedBox(width: 6),
-          Icon(Icons.chevron_right, size: 13, color: c.muted),
-          const SizedBox(width: 4),
-          Text(crumb, style: lokiSans(12, color: c.muted)),
-          const Spacer(),
-          appearance(),
+          if (nativePrompt != true) appearance(),
           Surface(
             radius: 14,
             color: c.panel.withValues(alpha: .85),
@@ -542,7 +672,7 @@ class _WalletState extends State<_Wallet> {
     );
   }
 
-  Widget sidebar() {
+  Widget sidebar({bool setup = false, bool fresh = false}) {
     final c = context.colors;
     Widget caption(String text) => Padding(
       padding: const EdgeInsets.fromLTRB(11, 0, 0, 8),
@@ -552,7 +682,7 @@ class _WalletState extends State<_Wallet> {
       String title,
       IconData icon,
       bool selected,
-      VoidCallback onTap, {
+      VoidCallback? onTap, {
       int count = 0,
     }) => Semantics(
       selected: selected,
@@ -563,7 +693,7 @@ class _WalletState extends State<_Wallet> {
         borderRadius: BorderRadius.circular(9),
         clipBehavior: Clip.antiAlias,
         child: InkWell(
-          onTap: onTap,
+          onTap: waitingForPreview ? null : onTap,
           child: Container(
             height: 35,
             padding: const EdgeInsets.symmetric(horizontal: 11),
@@ -657,56 +787,78 @@ class _WalletState extends State<_Wallet> {
                                 ),
                               ),
                               const SizedBox(height: 30),
-                              caption('Workspace'),
-                              nav(
-                                'All vaults',
-                                Icons.layers_outlined,
-                                page == _Page.vaults,
-                                () => go(_Page.vaults),
-                              ),
-                              nav(
-                                'Approvals',
-                                Icons.inbox_outlined,
-                                page == _Page.approvals,
-                                () => go(_Page.approvals),
-                                count: approvals.length,
-                              ),
-                              nav(
-                                'History',
-                                Icons.history,
-                                page == _Page.history,
-                                () => go(_Page.history),
-                              ),
-                              const SizedBox(height: 22),
-                              caption('Vaults'),
-                              for (final v in vaults)
+                              if (setup) ...[
+                                caption('On this Mac'),
                                 nav(
-                                  vaultName(v),
-                                  v['active'] == true
-                                      ? Icons.lock_outline
-                                      : Icons.pending_outlined,
-                                  v['vault'] == vaultId &&
-                                      {
-                                        _Page.overview,
-                                        _Page.setup,
-                                        _Page.send,
-                                      }.contains(page),
-                                  () => openVault(v),
+                                  'Signer setup',
+                                  Icons.laptop_mac,
+                                  fresh,
+                                  null,
                                 ),
-                              const SizedBox(height: 22),
-                              caption('Signer'),
-                              nav(
-                                'Vault addresses',
-                                Icons.qr_code,
-                                page == _Page.receive,
-                                () => go(_Page.receive),
-                              ),
-                              nav(
-                                'Recovery',
-                                Icons.key_outlined,
-                                page == _Page.recovery,
-                                () => go(_Page.recovery),
-                              ),
+                                nav(
+                                  'Local profile',
+                                  Icons.lock_outline,
+                                  !fresh,
+                                  null,
+                                ),
+                                nav(
+                                  'Recovery',
+                                  Icons.key_outlined,
+                                  false,
+                                  null,
+                                ),
+                              ] else ...[
+                                caption('Workspace'),
+                                nav(
+                                  'All vaults',
+                                  Icons.layers_outlined,
+                                  page == _Page.vaults,
+                                  () => go(_Page.vaults),
+                                ),
+                                nav(
+                                  'Approvals',
+                                  Icons.inbox_outlined,
+                                  page == _Page.approvals,
+                                  () => go(_Page.approvals),
+                                  count: approvals.length,
+                                ),
+                                nav(
+                                  'History',
+                                  Icons.history,
+                                  page == _Page.history,
+                                  () => go(_Page.history),
+                                ),
+                                const SizedBox(height: 22),
+                                caption('Vaults'),
+                                for (final v in vaults)
+                                  nav(
+                                    vaultName(v),
+                                    v['active'] == true
+                                        ? Icons.lock_outline
+                                        : Icons.pending_outlined,
+                                    v['vault'] == vaultId &&
+                                        {
+                                          _Page.overview,
+                                          _Page.setup,
+                                          _Page.send,
+                                        }.contains(page),
+                                    () => openVault(v),
+                                  ),
+                                const SizedBox(height: 22),
+                                caption('Signer'),
+                                nav(
+                                  'Vault addresses',
+                                  Icons.qr_code,
+                                  page == _Page.receive,
+                                  () => go(_Page.receive),
+                                ),
+                                nav(
+                                  'Recovery',
+                                  Icons.key_outlined,
+                                  page == _Page.recovery,
+                                  () => go(_Page.recovery),
+                                ),
+                              ],
                             ],
                           ),
                         ),
@@ -719,7 +871,7 @@ class _WalletState extends State<_Wallet> {
                             radius: 16,
                             backgroundColor: c.secondary,
                             child: Icon(
-                              Icons.person_outline,
+                              setup ? Icons.laptop_mac : Icons.person_outline,
                               color: c.ink,
                               size: 17,
                             ),
@@ -730,7 +882,9 @@ class _WalletState extends State<_Wallet> {
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
                                 Text(
-                                  profile['slot'] == null
+                                  setup
+                                      ? 'LokiSigner'
+                                      : profile['slot'] == null
                                       ? 'Member'
                                       : 'Member ${profile['slot']}',
                                   style: lokiSans(12, weight: 600),
@@ -742,15 +896,10 @@ class _WalletState extends State<_Wallet> {
                               ],
                             ),
                           ),
-                          IconButton(
-                            onPressed: busy ? null : lock,
-                            tooltip: 'Lock signer',
-                            icon: Icon(
-                              Icons.lock_outline,
-                              size: 15,
-                              color: c.muted,
-                            ),
-                          ),
+                          if (!setup || nativePrompt == true || locking)
+                            lockControl()
+                          else
+                            Icon(Icons.lock_outline, color: c.muted, size: 17),
                         ],
                       ),
                     ],
@@ -766,241 +915,119 @@ class _WalletState extends State<_Wallet> {
 
   Widget signerSetup() {
     final c = context.colors;
-    final actions = busy
-        ? null
-        : () => setState(() {
-            enteringOrigin = true;
-            actionError = null;
-          });
-    final originSubmit = busy || pairingOrigin.trim().isEmpty
-        ? null
-        : () => act(() => api.pair(pairingOrigin.trim()));
-    return Column(
-      children: [
-        SizedBox(
-          height: 43,
-          child: Padding(
-            padding: const EdgeInsets.only(left: 90, right: 24),
-            child: Row(
+    return SingleChildScrollView(
+      padding: const EdgeInsets.only(top: 16, bottom: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        spacing: 14,
+        children: [
+          LokiHead(
+            'Signer setup',
+            enteringOrigin ? 'Enter coordinator address' : 'Set up your signer',
+            enteringOrigin
+                ? 'Use the HTTPS origin shared by your vault organizer, without a page or path.'
+                : 'Pair a new signer with this Mac, or recover an existing signer.',
+          ),
+          Surface(
+            padding: const EdgeInsets.all(18),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              spacing: 12,
               children: [
-                Text('LokiSigner', style: lokiSans(12, weight: 600)),
-                const SizedBox(width: 6),
-                Icon(Icons.chevron_right, size: 13, color: c.muted),
-                const SizedBox(width: 4),
-                Text('Signer setup', style: lokiSans(12, color: c.muted)),
-                const Spacer(),
-                appearance(),
-                const StatusPill('Testnet'),
+                Row(
+                  children: [
+                    Expanded(
+                      child: LokiLabel(
+                        enteringOrigin
+                            ? 'Coordinator HTTPS origin'
+                            : 'Start on this Mac',
+                      ),
+                    ),
+                    if (enteringOrigin)
+                      Text('01 / 04', style: lokiMono(9, color: c.muted)),
+                  ],
+                ),
+                if (enteringOrigin)
+                  TextFormField(
+                    initialValue: pairingOrigin,
+                    autofocus: true,
+                    readOnly: busy,
+                    autocorrect: false,
+                    enableSuggestions: false,
+                    style: lokiMono(13),
+                    onChanged: (text) => setState(() {
+                      pairingOrigin = text;
+                      actionError = null;
+                    }),
+                    decoration: const InputDecoration(
+                      hintText: 'Enter HTTPS address',
+                      prefixIcon: Icon(Icons.link, size: 17),
+                    ),
+                  )
+                else ...[
+                  Text(
+                    '01   Pair a new signer',
+                    style: lokiSans(14, weight: 600),
+                  ),
+                  Text(
+                    'Use the coordinator’s HTTPS origin from your organizer.',
+                    style: lokiSans(12, color: c.muted),
+                  ),
+                  const Divider(),
+                  Text(
+                    '02   Restore instead',
+                    style: lokiSans(14, weight: 600),
+                  ),
+                  Text(
+                    'You’ll need 24 recovery words and the encrypted vault backup.',
+                    style: lokiSans(12, color: c.muted),
+                  ),
+                ],
               ],
             ),
           ),
-        ),
-        Expanded(
-          child: Align(
-            alignment: enteringOrigin
-                ? Alignment.center
-                : const Alignment(-.70, 0),
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.all(24),
-              child: enteringOrigin
-                  ? SizedBox(
-                      width: 700,
-                      child: Row(
-                        children: [
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              spacing: 12,
-                              children: [
-                                const Brand(),
-                                const SizedBox(height: 18),
-                                const LokiLabel('Pair this Mac'),
-                                for (final (i, label) in const [
-                                  'Enter address',
-                                  'Confirm coordinator',
-                                  'Confirm member slot',
-                                  'Review configuration',
-                                ].indexed)
-                                  Row(
-                                    spacing: 9,
-                                    children: [
-                                      CircleAvatar(
-                                        radius: 12,
-                                        backgroundColor: i == 0
-                                            ? c.mint
-                                            : c.secondary,
-                                        child: Text(
-                                          '${i + 1}',
-                                          style: lokiMono(
-                                            10,
-                                            color: i == 0 ? c.bg : c.muted,
-                                          ),
-                                        ),
-                                      ),
-                                      Flexible(
-                                        child: Text(
-                                          label,
-                                          style: lokiSans(
-                                            12,
-                                            color: i == 0 ? c.ink : c.muted,
-                                          ),
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                              ],
-                            ),
-                          ),
-                          SizedBox(
-                            width: 448,
-                            child: Surface(
-                              padding: const EdgeInsets.all(22),
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.stretch,
-                                spacing: 13,
-                                children: [
-                                  const LokiLabel('Coordinator address'),
-                                  Text(
-                                    'Pair this Mac',
-                                    style: lokiSans(
-                                      27,
-                                      weight: 600,
-                                      spacing: -1,
-                                    ),
-                                  ),
-                                  Text(
-                                    'Enter the HTTPS address your vault organizer gave you. Leave out any page or path.',
-                                    style: lokiSans(12, color: c.muted),
-                                  ),
-                                  LokiLabel(
-                                    'Coordinator HTTPS origin',
-                                    color: c.muted,
-                                  ),
-                                  TextFormField(
-                                    initialValue: pairingOrigin,
-                                    autofocus: true,
-                                    readOnly: busy,
-                                    autocorrect: false,
-                                    enableSuggestions: false,
-                                    style: lokiMono(13),
-                                    onChanged: (text) => setState(() {
-                                      pairingOrigin = text;
-                                      actionError = null;
-                                    }),
-                                    decoration: const InputDecoration(
-                                      hintText: 'https://wallet.example',
-                                      prefixIcon: Icon(Icons.link, size: 17),
-                                    ),
-                                  ),
-                                  Text(
-                                    busy
-                                        ? 'Complete the native signer prompts to continue.'
-                                        : 'You’ll confirm the address before this Mac contacts it.',
-                                    style: lokiSans(11, color: c.muted),
-                                  ),
-                                  if (actionError case final message?)
-                                    Notice(message),
-                                  const Divider(),
-                                  Wrap(
-                                    alignment: WrapAlignment.end,
-                                    spacing: 8,
-                                    children: [
-                                      ActionChipButton(
-                                        'Cancel',
-                                        Icons.close,
-                                        busy
-                                            ? null
-                                            : () => setState(() {
-                                                enteringOrigin = false;
-                                                actionError = null;
-                                              }),
-                                      ),
-                                      ActionChipButton(
-                                        'Continue',
-                                        Icons.arrow_forward,
-                                        originSubmit,
-                                        primary: true,
-                                      ),
-                                    ],
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                    )
-                  : SizedBox(
-                      width: 464,
-                      child: Surface(
-                        padding: const EdgeInsets.all(32),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          spacing: 13,
-                          children: [
-                            const Brand(),
-                            const SizedBox(height: 10),
-                            const LokiHead(
-                              'Shielded multisig',
-                              'Set up your signer',
-                              'Pair this Mac with your testnet coordinator, or restore a signer using your recovery words and backup.',
-                            ),
-                            if (actionError case final message?)
-                              Notice(message),
-                            Wrap(
-                              spacing: 8,
-                              runSpacing: 8,
-                              children: [
-                                ActionChipButton(
-                                  'Pair this Mac',
-                                  Icons.arrow_forward,
-                                  actions,
-                                  primary: true,
-                                ),
-                                ActionChipButton(
-                                  'Restore signer',
-                                  Icons.key_outlined,
-                                  busy ? null : () => act(api.restore),
-                                ),
-                              ],
-                            ),
-                            const SizedBox(height: 14),
-                            Row(
-                              spacing: 7,
-                              children: [
-                                Icon(
-                                  Icons.shield_outlined,
-                                  color: c.muted,
-                                  size: 15,
-                                ),
-                                Flexible(
-                                  child: Text(
-                                    'Your signing keys stay on this Mac.',
-                                    style: lokiSans(11, color: c.muted),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-            ),
+          Notice(
+            enteringOrigin
+                ? 'Next: check the address. Continue shows the canonical origin before any request is sent.'
+                : 'Adding or removing an enrolled fingerprint can make this Mac’s signer keys unusable. Keep your words and backup.',
           ),
-        ),
-        Padding(
-          padding: const EdgeInsets.fromLTRB(24, 12, 24, 16),
-          child: Row(
+          if (hasNativeFeedback) nativeFeedback(),
+          if (actionError case final message? when message != nativeStatus)
+            Notice(message),
+          if (busy) const LinearProgressIndicator(minHeight: 2),
+          Wrap(
+            alignment: WrapAlignment.end,
+            spacing: 8,
             children: [
-              Icon(Icons.laptop_mac, color: c.muted, size: 14),
-              const SizedBox(width: 6),
-              Text('This Mac', style: lokiSans(10, color: c.muted)),
-              const Spacer(),
-              Text('Testnet funds only', style: lokiSans(10, color: c.muted)),
+              ActionChipButton(
+                enteringOrigin ? 'Cancel' : 'Restore signer',
+                enteringOrigin ? Icons.close : Icons.key_outlined,
+                busy
+                    ? null
+                    : enteringOrigin
+                    ? () => setState(() {
+                        enteringOrigin = false;
+                        actionError = null;
+                      })
+                    : () => act(api.restore),
+              ),
+              ActionChipButton(
+                enteringOrigin ? 'Continue' : 'Pair this Mac',
+                Icons.arrow_forward,
+                busy || (enteringOrigin && pairingOrigin.trim().isEmpty)
+                    ? null
+                    : enteringOrigin
+                    ? () => act(() => api.pair(pairingOrigin.trim()))
+                    : () => setState(() {
+                        enteringOrigin = true;
+                        actionError = null;
+                      }),
+                primary: true,
+              ),
             ],
           ),
-        ),
-      ],
+        ],
+      ),
     );
   }
 
@@ -1027,10 +1054,15 @@ class _WalletState extends State<_Wallet> {
                 ),
                 const SizedBox(height: 12),
                 Text(
-                  'Enter your local profile passphrase in the macOS prompt to open LokiSigner on this Mac.',
+                  'Use your local profile passphrase to open LokiSigner on this Mac.',
                   style: lokiSans(13, color: c.muted),
                 ),
-                if (actionError ?? loadError case final message?) ...[
+                if (hasNativeFeedback) ...[
+                  const SizedBox(height: 12),
+                  nativeFeedback(),
+                ],
+                if (actionError ?? loadError case final message?
+                    when message != nativeStatus) ...[
                   const SizedBox(height: 12),
                   Notice(message),
                 ],
@@ -1070,14 +1102,29 @@ class _WalletState extends State<_Wallet> {
   }
 
   Widget content() {
+    final epoch = generation;
+    if (review case (:final vault, :final attempt)) {
+      return PaymentReview(
+        vault: vault,
+        attempt: attempt,
+        request: (path, [body]) => requestReview(epoch, path, body),
+        close: () => go(page, attempt: selection),
+      );
+    }
     final target = vault;
     return switch (page) {
       _Page.vaults => VaultLibrary(
         vaults: vaults,
         open: openVault,
         busy: busy,
-        create: () => vaultForm(false),
-        join: () => vaultForm(true),
+        create: () => go(_Page.create),
+        join: () => go(_Page.join),
+      ),
+      _Page.create || _Page.join => VaultForm(
+        join: page == _Page.join,
+        busy: busy,
+        cancel: () => go(formBack),
+        submit: (form) => submitVaultForm(page == _Page.join, form),
       ),
       _Page.setup when target != null => VaultSetup(
         vault: target,
@@ -1090,13 +1137,21 @@ class _WalletState extends State<_Wallet> {
             'roster_code': ceremony['roster_code'],
           });
         }),
-        startOver: () => vaultForm(false),
+        startOver: () => go(_Page.create),
       ),
       _Page.send when target != null => SendPage(
         vault: target,
         request: api.request,
-        back: () => go(_Page.overview),
-        published: (attempt) => go(_Page.history, attempt: attempt),
+        back: () {
+          if (epoch == generation && !hideContent) {
+            unawaited(go(_Page.overview));
+          }
+        },
+        published: (attempt) {
+          if (epoch == generation && !hideContent) {
+            unawaited(go(_Page.history, attempt: attempt));
+          }
+        },
       ),
       _Page.overview when target != null => overview(target),
       _Page.approvals => Column(
@@ -1124,7 +1179,9 @@ class _WalletState extends State<_Wallet> {
         request: api.request,
         explorer: api.explorer,
         review: (attempt) {
-          if (target != null) unawaited(showReview(target, attempt));
+          if (target != null && epoch == generation) {
+            showReview(target, attempt);
+          }
         },
         refresh: poll,
       ),
@@ -1134,18 +1191,13 @@ class _WalletState extends State<_Wallet> {
     };
   }
 
-  Future<void> vaultForm(bool join) async {
-    final form = await showDialog<Json>(
-      context: context,
-      builder: (_) => VaultForm(join: join),
-    );
-    if (!mounted || form == null) return;
-    await act(() async {
-      final result = await api.request(join ? 'join' : 'create', form);
-      if (!mounted) return;
-      go(_Page.setup, id: result['vault'] as String);
-    });
-  }
+  Future<void> submitVaultForm(bool join, Json form) => act(() async {
+    final epoch = generation;
+    final result = await api.request(join ? 'join' : 'create', form);
+    if (mounted && epoch == generation && !hideContent) {
+      await go(_Page.setup, id: result['vault'] as String);
+    }
+  });
 
   Widget overview(Json v) {
     final c = context.colors;
@@ -1350,7 +1402,7 @@ class _WalletState extends State<_Wallet> {
           ActionChipButton(
             'Review',
             Icons.arrow_forward,
-            reviewing ? null : () => showReview(v, p['attempt'] as String),
+            () => showReview(v, p['attempt'] as String),
           ),
         ],
       ),
@@ -1395,11 +1447,7 @@ class _WalletState extends State<_Wallet> {
                 const SizedBox(height: 8),
                 SelectableText(address, style: lokiMono(11)),
                 const SizedBox(height: 12),
-                ActionChipButton(
-                  'Copy address',
-                  Icons.copy_outlined,
-                  () => act(() => copyText(context, address, 'Address copied')),
-                ),
+                CopyButton('Copy address', address, 'Address copied'),
               ] else
                 Text(
                   row['error'] as String? ??
@@ -1473,17 +1521,4 @@ class Brand extends StatelessWidget {
   @override
   Widget build(BuildContext context) =>
       Text('LOKI', style: lokiSans(28, weight: 800, spacing: 5));
-}
-
-Future<void> copyText(
-  BuildContext context,
-  String value,
-  String feedback,
-) async {
-  await Clipboard.setData(ClipboardData(text: value));
-  if (context.mounted) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(feedback), duration: const Duration(seconds: 1)),
-    );
-  }
 }

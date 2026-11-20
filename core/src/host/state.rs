@@ -336,6 +336,7 @@ pub struct AppState {
     pub device_auth: std::sync::Mutex<Option<crate::signer::device_auth::DeviceRegistry>>,
     /// The member's native payment decision; `None` (headless) refuses every payment.
     pub approval: Option<super::LocalApproval>,
+    pub(super) notice: Option<super::LocalNotice>,
     /// The member's native roster-code comparison; `None` (headless) trusts the caller of
     /// `/api/agree`.
     pub roster_confirmation: Option<super::LocalRosterConfirmation>,
@@ -363,6 +364,7 @@ impl AppState {
             active_dkgs: std::sync::Mutex::new(BTreeSet::new()),
             device_auth: std::sync::Mutex::new(None),
             approval: None,
+            notice: None,
             roster_confirmation: None,
             roster_asking: std::sync::Mutex::new(None),
             roster_refused: std::sync::Mutex::new(BTreeSet::new()),

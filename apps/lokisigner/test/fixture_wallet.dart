@@ -12,7 +12,11 @@ class FixtureWallet implements WalletApi {
   static const txid =
       '8c7e5a103fc2b664a09ed4cbca4b9f51117fd1a59eedbe257f51bd80791a532e';
 
-  bool running, confirmed = true;
+  bool running,
+      confirmed = true,
+      inviting = false,
+      broadcast = true,
+      failed = false;
   final bool fresh;
   String coordinator = 'https://coordinator.example';
   String? openedTx, pairOrigin;
@@ -23,7 +27,8 @@ class FixtureWallet implements WalletApi {
     'amount_zat': '40000000',
     'recipient': recipient,
     'proposer': 2,
-    'phase': 'signing',
+    'phase': failed ? 'failed' : 'signing',
+    'can_discard': true,
   };
 
   @override
@@ -39,6 +44,12 @@ class FixtureWallet implements WalletApi {
     if (body != null) writes.add((path, body));
     final uri = Uri.parse(path);
     return switch (uri.path) {
+      'status' when uri.hasQuery && inviting => {
+        'phase': 'waiting_members',
+        'invites': [
+          {'slot': 2, 'code': 'test-invite'},
+        ],
+      },
       'status' when uri.hasQuery => {
         'phase': 'compare_roster',
         'fingerprint': 'd' * 64,
@@ -70,7 +81,7 @@ class FixtureWallet implements WalletApi {
         ],
       },
       'pending' => {
-        'pending': [pending],
+        'pending': [if (!failed) pending],
       },
       'balance' => {'balance_zat': 1248000000},
       'payments' => {
@@ -82,9 +93,15 @@ class FixtureWallet implements WalletApi {
             'amount_zat': '12000000',
             'fee_zat': '10000',
             'txid': txid,
-            'phase': confirmed ? 'confirmed' : 'broadcast',
+            'phase': confirmed
+                ? 'confirmed'
+                : broadcast
+                ? 'broadcast'
+                : 'signed',
             'mined_height': confirmed ? 3660192 : null,
             'recipient': recipient,
+            'can_send': !confirmed,
+            'can_replace': !confirmed && broadcast,
           },
           {
             'attempt': 'c' * 64,
@@ -103,6 +120,16 @@ class FixtureWallet implements WalletApi {
         'fee_zat': '10000',
         'change_zat': '59990000',
       },
+      'create' || 'join' => {'vault': reserve},
+      'payment-replace' => {
+        'attempt': 'e' * 64,
+        'recipient': recipient,
+        'amount_zat': '12000000',
+        'fee_zat': '10000',
+        'change_zat': '59990000',
+      },
+      'payment-discard' ||
+      'payment-send' ||
       'payment-publish' ||
       'payment-verify' ||
       'payment-approve' ||

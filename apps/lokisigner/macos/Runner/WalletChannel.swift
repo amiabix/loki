@@ -12,7 +12,7 @@ final class WalletChannel {
     private let signer: NativeSigner
     private let validLaunch: Bool
 
-    init(messenger: FlutterBinaryMessenger) {
+    init(messenger: FlutterBinaryMessenger, window: NSWindow) {
         channel = FlutterMethodChannel(name: "cash.loki/wallet", binaryMessenger: messenger)
         #if LOKI_VISUAL_ONLY
         let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -21,7 +21,10 @@ final class WalletChannel {
         let args = Self.launchArguments(CommandLine.arguments.dropFirst())
         #endif
         validLaunch = args != nil
-        signer = NativeSigner(args: nativeSignerArguments(args ?? []), link: nil, embedded: true)
+        signer = NativeSigner(args: nativeSignerArguments(args ?? []), link: nil, walletWindow: window)
+        signer.promptChanged = { [weak channel] active in
+            channel?.invokeMethod("nativePromptChanged", arguments: active)
+        }
         channel.setMethodCallHandler { [weak self] call, result in
             DispatchQueue.main.async {
                 guard let self else { result(FlutterMethodNotImplemented); return }
@@ -48,17 +51,28 @@ final class WalletChannel {
         let args = call.arguments as? [String: Any]
         let noArgs = call.arguments == nil || call.arguments is NSNull
         let invalid = failure(400, "Invalid wallet method arguments.")
-        let busy = failure(409, "Finish the current LokiSigner dialog or operation first.")
+        let busy = failure(409, "Finish the current LokiSigner review or operation first.")
         switch call.method {
+        case "nativePromptActive":
+            guard noArgs else { result(invalid); return }
+            result(signer.nativePromptActive)
+        case "leaveNativePrompt":
+            guard noArgs else { result(invalid); return }
+            signer.leaveNativePrompt()
+            result(nil)
+        case "nativeNotice":
+            guard noArgs else { result(invalid); return }
+            result(signer.walletNotice)
         case "profile":
             guard noArgs else { result(invalid); return }
             guard validLaunch else { result(failure(400, "Invalid LokiSigner launch arguments.")); return }
             var profile = signer.walletProfile()
+            profile["can_recover_wallet_key"] = signer.canRecoverWalletKey
             profile["reduce_motion"] = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
             if #available(macOS 26, *) { profile["liquid_glass"] = true }
             if profile["profile"] is String { result(profile) }
             else { result(failure(500, SignerStartFailure.dataFolderUnavailable.message)) }
-        case "unlock", "pair", "restore":
+        case "unlock", "pair", "restore", "recoverWalletKey":
             let origin = args?["origin"] as? String
             guard call.method == "pair" ? (origin != nil && args?.count == 1) : noArgs else { result(invalid); return }
             guard validLaunch else { result(failure(400, "Invalid LokiSigner launch arguments.")); return }
@@ -73,6 +87,7 @@ final class WalletChannel {
             }) else { result(busy); return }
             if let origin { signer.pairWallet(origin: origin.trimmingCharacters(in: .whitespacesAndNewlines)) }
             else if call.method == "restore" { signer.restoreWallet() }
+            else if call.method == "recoverWalletKey" { signer.recoverWalletKey() }
             else { signer.unlockWallet() }
             #endif
         case "lock":
@@ -112,7 +127,7 @@ final class WalletChannel {
                 guard reply["vault"] as? String == id, let backup = reply["backup"] as? String, !backup.isEmpty,
                       let data = try? JSONSerialization.data(withJSONObject: ["vault": id, "backup": backup]),
                       data.count <= 256 * 1024 else { result(self.failure(500, "Invalid encrypted backup.")); return }
-                guard NSApp.modalWindow == nil else { result(busy); return }
+                guard !self.signer.walletDialogOpen else { result(busy); return }
                 let panel = NSSavePanel()
                 panel.title = "Save encrypted LokiSigner backup"
                 panel.allowedContentTypes = [.json]

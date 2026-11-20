@@ -33,10 +33,10 @@ use super::{
 use crate::{
     candidate::{quote_fee, CandidateInputs},
     network::{VaultNetwork, TESTNET_NU7_BIRTH},
-    payment_transport::{coordinate, signer_loop},
+    payment_transport::{coordinate, participate},
     setup_transport::{Identity, PublicIdentity},
     signer::{
-        CandidateRef, Network, PublicPaymentParams, Signer,
+        local::SignerError, CandidateRef, Network, PublicPaymentParams, Signer,
     },
     signing_session::{AttemptId, MessageKind, SessionContext},
     state::MemberDir,
@@ -351,7 +351,7 @@ fn relay(identity: &Identity, url: &str) -> Result<FrostdTransport, String> {
 }
 
 /// Checks a candidate or signed PCZT against the reviewed terms; returns its sighash.
-fn review_candidate(bytes: &[u8], payment: &Payment, vault: &Vault) -> Result<[u8; 32], String> {
+fn review_candidate(bytes: &[u8], payment: &Payment, vault: &Vault) -> Result<[u8; 32], SignerError> {
     let parsed = pczt::Pczt::parse(bytes).map_err(|e| format!("candidate: {e:?}"))?;
     if *parsed.global().consensus_branch_id()
         != u32::from(BranchId::for_height(
@@ -360,7 +360,7 @@ fn review_candidate(bytes: &[u8], payment: &Payment, vault: &Vault) -> Result<[u
         ))
         || *parsed.global().expiry_height() != tx_expiry(payment)
     {
-        return Err("candidate network or expiry differs from reviewed intent".into());
+        return Err(SignerError::Other("candidate network or expiry differs from reviewed intent".into()));
     }
     let recipient =
         vault::orchard_receiver_from_ua(&payment.recipient, vault.network.network_type())?;
@@ -383,7 +383,7 @@ fn review_candidate(bytes: &[u8], payment: &Payment, vault: &Vault) -> Result<[u
                 .map_err(pczt::roles::verifier::OrchardError::Custom)
         })
         .map_err(|e| format!("candidate differs from reviewed intent: {e:?}"))?;
-    crate::signer::wysiwys::sighash_of_pczt(bytes, &vault.fvk)
+    crate::signer::wysiwys::checked_sighash_of_pczt(bytes, &vault.fvk)
 }
 
 /// A member's check of the proposer's sealed copy: the signed PCZT passes the review a signer
@@ -396,7 +396,7 @@ fn check_signed_copy(
     raw: &[u8],
     txid: &str,
 ) -> Result<(), String> {
-    let sighash = review_candidate(pczt, p, v)?;
+    let sighash = review_candidate(pczt, p, v).map_err(|e| e.to_string())?;
     let tx = zcash_primitives::transaction::Transaction::read(
         raw,
         BranchId::for_height(&v.network, BlockHeight::from_u32(p.target_height)),
@@ -1477,6 +1477,12 @@ fn sign(
     sign_with_opened(st, data, pass, p, v, owned, check_running, None)
 }
 
+fn notice_signing_refusal(notice: Option<&super::LocalNotice>, error: &SignerError) {
+    if let (Some(notice), SignerError::FeeUnverified(_)) = (notice, error) {
+        notice("payment-fee-unverified", "");
+    }
+}
+
 fn sign_with_opened(
     st: &Shared,
     data: &Path,
@@ -1552,7 +1558,8 @@ fn sign_with_opened(
             _ => {}
         }
     }
-    signer_loop(
+    let on_refusal = |error: &SignerError| notice_signing_refusal(st.notice.as_ref(), error);
+    participate(
         &tx,
         &ch,
         &mut signer,
@@ -1568,7 +1575,10 @@ fn sign_with_opened(
         &other_signers,
         check_running,
         &mut |bytes| {
-            let sighash = review_candidate(bytes, p, v)?;
+            // Review checks value commitments before round two, so it can refuse first.
+            let sighash = review_candidate(bytes, p, v)
+                .inspect_err(&on_refusal)
+                .map_err(|e| e.to_string())?;
             require_consent(data, pass, p)?;
             pin_sighash(data, pass, p, sighash)?;
             // The background coordinator runs in this process; hand it the candidate through
@@ -1579,6 +1589,7 @@ fn sign_with_opened(
             }
             Ok(())
         },
+        &on_refusal,
     )
 }
 
@@ -2509,6 +2520,26 @@ mod tests {
             ..Default::default()
         };
         review_candidate(&pczt, &p, &v).unwrap();
+
+        // A candidate with the right terms but no fee openings is blocked in the worker's
+        // review, before it can reach sign_approve. Only that typed refusal prompts a notice.
+        let unverified = pczt::roles::redactor::Redactor::new(pczt::Pczt::parse(&pczt).unwrap())
+            .redact_ironwood_with(|mut bundle| bundle.redact_actions(|mut action| action.clear_rcv()))
+            .finish()
+            .serialize()
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let notice: super::super::LocalNotice = std::sync::Arc::new(move |kind, message| {
+            tx.send((kind.to_owned(), message.to_owned())).unwrap();
+        });
+        let on_refusal = |error: &SignerError| notice_signing_refusal(Some(&notice), error);
+        let error = review_candidate(&unverified, &p, &v).inspect_err(&on_refusal).unwrap_err();
+        assert!(matches!(&error, SignerError::FeeUnverified(_)));
+        assert_eq!(error.to_string(), "action 0 value commitment: MissingValueCommitTrapdoor");
+        assert_eq!(rx.try_recv().unwrap(), ("payment-fee-unverified".into(), String::new()));
+        on_refusal(&SignerError::Other(error.to_string()));
+        assert!(rx.try_recv().is_err());
+
         // Once the proposer fixes a shorter real expiry, a candidate built for the bound is refused.
         p.signing_expiry = Some(p.expiry_height - 1);
         assert!(review_candidate(&pczt, &p, &v).is_err());

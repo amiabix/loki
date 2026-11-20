@@ -124,20 +124,134 @@ class _PaymentNote extends StatelessWidget {
   );
 }
 
+class _ReviewNotice extends StatelessWidget {
+  const _ReviewNotice(this.title, this.message, {this.warning = false});
+  final String title, message;
+  final bool warning;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = context.colors;
+    final tint = warning ? c.gold : c.mint;
+    return Surface(
+      color: Color.alphaBlend(tint.withValues(alpha: .07), c.panel),
+      padding: const EdgeInsets.all(14),
+      radius: 12,
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        spacing: 10,
+        children: [
+          Icon(
+            warning ? Icons.warning_amber : Icons.info_outline,
+            size: 17,
+            color: tint,
+          ),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              spacing: 4,
+              children: [
+                Text(title, style: lokiSans(12, weight: 600, color: tint)),
+                _PaymentNote(message),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _PaymentDetails extends StatelessWidget {
+  const _PaymentDetails(this.title, this.payment, this.vault);
+  final String title;
+  final Json payment, vault;
+
+  @override
+  Widget build(BuildContext context) {
+    final recipient = _text(payment['recipient']),
+        memo = _text(payment['memo']);
+    final destination = Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      spacing: 8,
+      children: [
+        if (recipient != null) ...[
+          LokiLabel('Recipient address', color: context.colors.muted),
+          SelectableText(recipient, style: lokiMono(11).copyWith(height: 1.4)),
+        ],
+        if (memo != null) ...[
+          LokiLabel('Memo (sender’s text)', color: context.colors.muted),
+          SelectableText(memo, style: lokiSans(12)),
+        ],
+      ],
+    );
+    final quote = Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      spacing: 8,
+      children: [
+        ValueRow(
+          'Amount',
+          _withUnit(payment['amount_zat'], fixed: true),
+          mono: true,
+        ),
+        if (_readZats(payment['fee_zat']) != null)
+          ValueRow(
+            'Network fee',
+            _withUnit(payment['fee_zat'], fixed: true),
+            mono: true,
+          ),
+        if (_readZats(payment['change_zat']) != null)
+          ValueRow(
+            'Change back to vault',
+            _withUnit(payment['change_zat'], fixed: true),
+            mono: true,
+          ),
+        ValueRow('Vault (creator’s label)', _vaultName(vault)),
+        if (_policy(vault) case final policy?)
+          ValueRow('Vault policy', '$policy approvals'),
+      ],
+    );
+    return Surface(
+      padding: const EdgeInsets.all(18),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        spacing: 11,
+        children: [
+          LokiLabel(title),
+          if (recipient == null && memo == null)
+            quote
+          else
+            LayoutBuilder(
+              builder: (context, bounds) => bounds.maxWidth >= 550
+                  ? Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      spacing: 22,
+                      children: [
+                        Expanded(child: destination),
+                        Expanded(child: quote),
+                      ],
+                    )
+                  : Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      spacing: 11,
+                      children: [destination, const Divider(), quote],
+                    ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
 class _AmountHeading extends StatelessWidget {
-  const _AmountHeading(
-    this.zats, {
-    this.fixed = false,
-    this.pending = false,
-    this.size = 25,
-  });
+  const _AmountHeading(this.zats, {this.pending = false, this.size = 25});
   final Object? zats;
-  final bool fixed, pending;
+  final bool pending;
   final double size;
 
   @override
   Widget build(BuildContext context) {
-    final value = amountTaz(zats, fixed: fixed);
+    final value = amountTaz(zats);
     return Text.rich(
       TextSpan(
         children: [
@@ -161,32 +275,46 @@ class _AmountHeading extends StatelessWidget {
   }
 }
 
-Future<bool?> _confirm(
-  BuildContext context,
-  String title,
-  Widget message,
-  String action, {
-  String cancel = 'Go back',
-}) => showDialog<bool>(
-  context: context,
-  builder: (context) => AlertDialog(
-    backgroundColor: context.colors.panel,
-    title: Text(title),
-    content: SingleChildScrollView(child: message),
-    actions: [
-      TextButton(
-        onPressed: () => Navigator.pop(context, false),
-        child: Text(cancel),
-      ),
-      ActionChipButton(
-        action,
-        Icons.arrow_forward,
-        () => Navigator.pop(context, true),
-        primary: true,
-      ),
-    ],
-  ),
-);
+class _Confirmation extends StatelessWidget {
+  const _Confirmation({
+    required this.title,
+    required this.message,
+    required this.action,
+    required this.confirm,
+    required this.cancel,
+  });
+  final String title, action;
+  final Widget message;
+  final VoidCallback confirm, cancel;
+
+  @override
+  Widget build(BuildContext context) => Surface(
+    padding: const EdgeInsets.all(15),
+    color: context.colors.secondary,
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      spacing: 10,
+      children: [
+        Text(title, style: lokiSans(16, weight: 600)),
+        message,
+        Wrap(
+          alignment: WrapAlignment.end,
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            ActionChipButton('Go back', Icons.close, cancel),
+            ActionChipButton(
+              action,
+              Icons.arrow_forward,
+              confirm,
+              primary: true,
+            ),
+          ],
+        ),
+      ],
+    ),
+  );
+}
 
 bool _hasQuote(Json quote) =>
     _readZats(quote['fee_zat']) != null &&
@@ -215,6 +343,7 @@ class _SendPageState extends State<SendPage> {
   final _memo = TextEditingController();
   Json? _draft;
   String? _busy, _error;
+  bool? _editAfterDiscard;
   bool _publishUncertain = false;
 
   @override
@@ -226,6 +355,7 @@ class _SendPageState extends State<SendPage> {
     _memo.clear();
     _draft = null;
     _busy = _error = null;
+    _editAfterDiscard = null;
     _publishUncertain = false;
   }
 
@@ -318,26 +448,27 @@ class _SendPageState extends State<SendPage> {
     }
   }
 
-  Future<void> _leaveDraft({required bool edit}) async {
+  void _leaveDraft({required bool edit}) {
     if (_busy != null) return;
-    final vault = _text(widget.vault['vault']),
-        attempt = _text(_draft?['attempt']);
-    if (attempt == null || _publishUncertain) {
+    if (_draft == null || _publishUncertain) {
       widget.back();
       return;
     }
-    if (vault == null) return;
-    setState(() => _busy = 'Working…');
+    setState(() => _editAfterDiscard = edit);
+  }
+
+  Future<void> _discardDraft() async {
+    final edit = _editAfterDiscard;
+    final vault = _text(widget.vault['vault']),
+        attempt = _text(_draft?['attempt']);
+    if (_busy != null || edit == null || vault == null || attempt == null) {
+      return;
+    }
+    setState(() {
+      _busy = 'Discarding…';
+      _editAfterDiscard = null;
+    });
     try {
-      final confirmed = await _confirm(
-        context,
-        'Discard this draft?',
-        const _PaymentNote(
-          'This releases the draft’s reserved input without sending it. You can prepare a new draft afterward.',
-        ),
-        'Discard draft',
-      );
-      if (confirmed != true || !_current(vault)) return;
       await widget.request('payment-discard', {
         'vault': vault,
         'attempt': attempt,
@@ -497,38 +628,49 @@ class _SendPageState extends State<SendPage> {
                 ),
         ),
         if (_error case final error?) _PaymentNote(error, error: true),
-        Wrap(
-          alignment: WrapAlignment.end,
-          spacing: 8,
-          runSpacing: 8,
-          children: [
-            ActionChipButton(
-              _publishUncertain ? 'Back' : 'Cancel',
-              Icons.close,
-              _busy == null ? () => _leaveDraft(edit: false) : null,
+        if (_editAfterDiscard != null)
+          _Confirmation(
+            title: 'Discard this draft?',
+            message: const _PaymentNote(
+              'This releases the draft’s reserved input without sending it. You can prepare a new draft afterward.',
             ),
-            if (_draft != null && !_publishUncertain)
+            action: 'Discard draft',
+            confirm: _discardDraft,
+            cancel: () => setState(() => _editAfterDiscard = null),
+          )
+        else
+          Wrap(
+            alignment: WrapAlignment.end,
+            spacing: 8,
+            runSpacing: 8,
+            children: [
               ActionChipButton(
-                'Edit details',
-                Icons.edit_outlined,
-                _busy == null ? () => _leaveDraft(edit: true) : null,
+                _publishUncertain ? 'Back' : 'Cancel',
+                Icons.close,
+                _busy == null ? () => _leaveDraft(edit: false) : null,
               ),
-            if (!_publishUncertain)
-              ActionChipButton(
-                _busy ??
-                    (_draft == null ? 'Prepare draft' : 'Request approvals'),
-                _draft == null ? Icons.arrow_forward : Icons.send_outlined,
-                _busy != null || _text(widget.vault['vault']) == null
-                    ? null
-                    : _draft == null
-                    ? _prepare
-                    : _hasQuote(_draft!)
-                    ? _publish
-                    : null,
-                primary: true,
-              ),
-          ],
-        ),
+              if (_draft != null && !_publishUncertain)
+                ActionChipButton(
+                  'Edit details',
+                  Icons.edit_outlined,
+                  _busy == null ? () => _leaveDraft(edit: true) : null,
+                ),
+              if (!_publishUncertain)
+                ActionChipButton(
+                  _busy ??
+                      (_draft == null ? 'Prepare draft' : 'Request approvals'),
+                  _draft == null ? Icons.arrow_forward : Icons.send_outlined,
+                  _busy != null || _text(widget.vault['vault']) == null
+                      ? null
+                      : _draft == null
+                      ? _prepare
+                      : _hasQuote(_draft!)
+                      ? _publish
+                      : null,
+                  primary: true,
+                ),
+            ],
+          ),
       ],
     );
   }
@@ -562,6 +704,19 @@ class HistoryPage extends StatefulWidget {
 class _HistoryPageState extends State<HistoryPage> {
   bool _busy = false;
   String? _error, _errorAttempt, _copied;
+  ({Json payment, String action, Json? draft})? _confirmation;
+  final _reviewHeading = GlobalKey();
+
+  void _openConfirmation(Json payment, String action, [Json? draft]) {
+    setState(
+      () => _confirmation = (payment: payment, action: action, draft: draft),
+    );
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_reviewHeading.currentContext case final context?) {
+        unawaited(Scrollable.ensureVisible(context));
+      }
+    });
+  }
 
   @override
   void didUpdateWidget(covariant HistoryPage oldWidget) {
@@ -569,62 +724,51 @@ class _HistoryPageState extends State<HistoryPage> {
     if (oldWidget.selected != widget.selected ||
         oldWidget.vault?['vault'] != widget.vault?['vault']) {
       _error = _errorAttempt = _copied = null;
+      _confirmation = null;
     }
   }
 
-  Future<void> _action(Json payment, String action) async {
+  Future<void> _action(
+    Json payment,
+    String action, {
+    bool? confirmed,
+    Json? draft,
+  }) async {
     final vault = _text(widget.vault?['vault']),
         attempt = _text(payment['attempt']);
     if (_busy || vault == null || attempt == null) return;
+    if (confirmed == null && (action == 'send' || action == 'discard')) {
+      _error = null;
+      _openConfirmation(payment, action);
+      return;
+    }
     final request = widget.request;
     final body = {'vault': vault, 'attempt': attempt};
-    bool current() => mounted && widget.vault?['vault'] == vault;
+    bool current() =>
+        mounted &&
+        widget.vault?['vault'] == vault &&
+        widget.selected == attempt;
     setState(() {
       _busy = true;
       _error = null;
     });
     String? replacement;
     try {
-      if (action == 'send') {
-        final again = payment['phase'] == 'broadcast';
-        final recipient = _text(payment['recipient']);
-        final confirmed = await _confirm(
-          context,
-          again ? 'Send this transaction again?' : 'Send this payment now?',
-          Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            spacing: 8,
-            children: [
-              _PaymentNote(
-                again
-                    ? 'This resubmits the same signed transaction. It does not create a new payment.'
-                    : 'This sends the signed transaction through your wallet.',
-              ),
-              ValueRow('Amount', _withUnit(payment['amount_zat']), mono: true),
-              if (recipient != null) ...[
-                LokiLabel('Recipient', color: context.colors.muted),
-                SelectableText(recipient, style: lokiMono(11)),
-              ],
-            ],
-          ),
-          again ? 'Send again' : 'Send now',
+      if (draft != null) {
+        final id = _text(draft['attempt'])!;
+        final next = {'vault': vault, 'attempt': id};
+        if (confirmed == true) {
+          await request('payment-publish', next);
+          replacement = id;
+        } else {
+          await request('payment-discard', next);
+        }
+      } else if (confirmed == true) {
+        await request(
+          action == 'send' ? 'payment-send' : 'payment-discard',
+          body,
         );
-        if (confirmed != true || !current()) return;
-        await request('payment-send', body);
-      } else if (action == 'discard') {
-        final confirmed = await _confirm(
-          context,
-          'Discard this payment?',
-          const _PaymentNote(
-            'This closes the request and releases its reserved input. It will not send a payment.',
-          ),
-          'Discard payment',
-        );
-        if (confirmed != true || !current()) return;
-        await request('payment-discard', body);
       } else {
-        final cancel = action == 'cancel';
         final draft = await request('payment-replace', {
           ...body,
           'mode': action,
@@ -637,38 +781,7 @@ class _HistoryPageState extends State<HistoryPage> {
             !_hasQuote(draft)) {
           throw const FormatException();
         }
-        if (!mounted || widget.vault?['vault'] != vault) return;
-        final confirmed = await _confirm(
-          context,
-          cancel ? 'Request a cancellation?' : 'Retry the same payment?',
-          Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            spacing: 10,
-            children: [
-              _PaymentNote(
-                cancel
-                    ? 'This proposes spending the same note back to the vault, less the network fee. It needs group approval and does not stop the original payment from being mined first.'
-                    : 'This proposes paying the same recipient using the same note. Only one of the two transactions can be mined. The retry follows the vault’s approval policy.',
-              ),
-              ValueRow('Amount', _withUnit(draft['amount_zat']), mono: true),
-              ValueRow('Network fee', _withUnit(draft['fee_zat']), mono: true),
-              ValueRow('Change', _withUnit(draft['change_zat']), mono: true),
-              LokiLabel('Recipient', color: context.colors.muted),
-              SelectableText(recipient, style: lokiMono(11)),
-            ],
-          ),
-          'Request approvals',
-          cancel: 'Discard draft',
-        );
-        if (!current()) return;
-        final next = {'vault': vault, 'attempt': id};
-        if (confirmed == true) {
-          await request('payment-publish', next);
-          replacement = id;
-        } else if (confirmed == false) {
-          await request('payment-discard', next);
-        }
+        if (current()) _openConfirmation(payment, action, draft);
       }
     } catch (_) {
       if (current()) {
@@ -682,10 +795,175 @@ class _HistoryPageState extends State<HistoryPage> {
         });
       }
     } finally {
-      if (mounted) setState(() => _busy = false);
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          if (confirmed != null && current()) _confirmation = null;
+        });
+      }
       if (current()) widget.refresh();
     }
     if (replacement != null && current()) widget.review(replacement);
+  }
+
+  Widget _confirmAction(
+    Json payment,
+    String action,
+    Json? draft,
+    Json? latest,
+  ) {
+    final again = payment['phase'] == 'broadcast';
+    final (title, actionLabel, cancelLabel, explanation) = switch (action) {
+      'send' when again => (
+        'Send the same transaction again',
+        'Send again',
+        'Cancel',
+        'Resubmit the same signed transaction to testnet. This does not create a new payment.',
+      ),
+      'send' => (
+        'Send signed payment',
+        'Send now',
+        'Cancel',
+        'Review the signed payment before broadcasting it to testnet.',
+      ),
+      'discard' => (
+        payment['phase'] == 'failed'
+            ? 'Discard failed payment'
+            : 'Discard payment request',
+        'Discard',
+        'Keep payment',
+        'Close this payment request without sending it.',
+      ),
+      'cancel' => (
+        'Request cancellation',
+        'Request approvals',
+        'Discard draft',
+        'Propose spending the same note back to the vault, less the network fee. Your vault’s approval policy still applies.',
+      ),
+      _ => (
+        'Retry payment',
+        'Request approvals',
+        'Discard draft',
+        'Propose paying the same recipient again using the same note. Your vault’s approval policy still applies.',
+      ),
+    };
+    final vault = widget.vault!;
+    final attempt = _text(payment['attempt'])!;
+    final canContinue =
+        latest != null &&
+        switch (action) {
+          // The draft remains actionable if the original merely expires.
+          'retry' ||
+          'cancel' => !{'confirmed', 'replaced'}.contains(latest['phase']),
+          'send' =>
+            !_settled(latest['phase']) &&
+                latest['can_send'] == true &&
+                latest['sending'] != true &&
+                latest['phase'] == payment['phase'] &&
+                latest['txid'] == payment['txid'],
+          _ => !_settled(latest['phase']) && latest['can_discard'] == true,
+        };
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      spacing: 14,
+      children: [
+        KeyedSubtree(
+          key: _reviewHeading,
+          child: LokiHead('History', title, explanation),
+        ),
+        if (draft != null)
+          const _ReviewNotice(
+            'The original payment may confirm first',
+            'Both transactions spend the same note, so only one can be mined. Requesting approvals does not stop the original payment.',
+            warning: true,
+          ),
+        _PaymentDetails(
+          draft == null ? 'Payment details' : 'Replacement quote',
+          draft ?? payment,
+          vault,
+        ),
+        if (action == 'send') ...[
+          Surface(
+            child: ExpansionTile(
+              title: const Text('Transaction reference'),
+              childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
+              children: [
+                if (_id(payment['txid']) case final txid?)
+                  _identifier(attempt, 'Transaction ID', txid, copy: false),
+                _identifier(attempt, 'Payment attempt', attempt, copy: false),
+              ],
+            ),
+          ),
+          const _ReviewNotice(
+            'Broadcast is not confirmation',
+            'History shows a payment as confirmed only after this wallet verifies it in a block.',
+          ),
+        ] else if (draft != null)
+          Surface(
+            padding: const EdgeInsets.all(15),
+            child: Column(
+              spacing: 10,
+              children: [
+                _identifier(
+                  attempt,
+                  'Original attempt ID',
+                  attempt,
+                  copy: false,
+                ),
+                _identifier(
+                  attempt,
+                  'New attempt ID',
+                  _text(draft['attempt'])!,
+                  copy: false,
+                ),
+              ],
+            ),
+          )
+        else
+          const _ReviewNotice(
+            'Releases the reserved input',
+            'Discarding releases this payment’s reservation on the input. Nothing is sent.',
+            warning: true,
+          ),
+        if (!canContinue && !_busy)
+          const _PaymentNote(
+            'This payment’s status changed. Return to History to check available actions.',
+            error: true,
+          ),
+        if (_busy) const LinearProgressIndicator(minHeight: 2),
+        const Divider(),
+        Wrap(
+          alignment: WrapAlignment.end,
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            ActionChipButton(
+              cancelLabel,
+              Icons.close,
+              _busy
+                  ? null
+                  : draft == null
+                  ? () => setState(() => _confirmation = null)
+                  : () => _action(
+                      payment,
+                      action,
+                      confirmed: false,
+                      draft: draft,
+                    ),
+            ),
+            ActionChipButton(
+              actionLabel,
+              action == 'discard' ? Icons.delete_outline : Icons.arrow_forward,
+              _busy || !canContinue
+                  ? null
+                  : () =>
+                        _action(payment, action, confirmed: true, draft: draft),
+              primary: true,
+            ),
+          ],
+        ),
+      ],
+    );
   }
 
   Future<void> _identifierAction(
@@ -795,7 +1073,7 @@ class _HistoryPageState extends State<HistoryPage> {
               const Expanded(child: LokiLabel('Transaction details')),
               IconButton(
                 tooltip: 'Close details',
-                onPressed: () => widget.select(null),
+                onPressed: _busy ? null : () => widget.select(null),
                 icon: Icon(Icons.close, size: 15, color: context.colors.muted),
                 visualDensity: VisualDensity.compact,
               ),
@@ -929,7 +1207,7 @@ class _HistoryPageState extends State<HistoryPage> {
             ? colors.mint.withValues(alpha: colors.dark ? .13 : .11)
             : null,
         child: InkWell(
-          onTap: () => widget.select(attempt),
+          onTap: _busy ? null : () => widget.select(attempt),
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
             child: Row(
@@ -1031,6 +1309,9 @@ class _HistoryPageState extends State<HistoryPage> {
     final selected = records
         .where((p) => p['attempt'] == widget.selected)
         .firstOrNull;
+    if (_confirmation case (:final payment, :final action, :final draft)) {
+      return _confirmAction(payment, action, draft, selected);
+    }
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       spacing: 24,
@@ -1172,30 +1453,24 @@ class _ApprovalStatus extends StatelessWidget {
   }
 }
 
-Future<void> showPaymentReview(
-  BuildContext context,
-  Json vault,
-  String attempt,
-  Request request,
-) async {
-  await showDialog<void>(
-    context: context,
-    barrierDismissible: false,
-    builder: (context) => _PaymentReview(vault, attempt, request),
-  );
-}
-
-class _PaymentReview extends StatefulWidget {
-  const _PaymentReview(this.vault, this.attempt, this.request);
+class PaymentReview extends StatefulWidget {
+  const PaymentReview({
+    super.key,
+    required this.vault,
+    required this.attempt,
+    required this.request,
+    required this.close,
+  });
   final Json vault;
   final String attempt;
   final Request request;
+  final VoidCallback close;
 
   @override
-  State<_PaymentReview> createState() => _PaymentReviewState();
+  State<PaymentReview> createState() => _PaymentReviewState();
 }
 
-class _PaymentReviewState extends State<_PaymentReview> {
+class _PaymentReviewState extends State<PaymentReview> {
   Json? _review, _status;
   Timer? _timer;
   bool _loading = false,
@@ -1322,237 +1597,136 @@ class _PaymentReviewState extends State<_PaymentReview> {
   @override
   Widget build(BuildContext context) {
     final colors = context.colors, status = _status, review = _review;
-    final policy = _policy(widget.vault);
     final replaces = _object(review?['replaces']);
-    final memo = _text(review?['memo']);
     final noLongerOpen =
         status != null &&
         (status['phase'] != 'signing' || status['error'] != null);
-    return PopScope(
-      canPop: !_approving,
-      child: Dialog(
-        backgroundColor: colors.panel,
-        insetPadding: const EdgeInsets.all(18),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
-        child: SizedBox(
-          width: 565,
-          child: Padding(
-            padding: const EdgeInsets.all(22),
+    final showingPreview =
+        !_alreadyRequested && !noLongerOpen && review != null;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      spacing: 10,
+      children: [
+        LokiHead(
+          'Proposal preview',
+          _alreadyRequested ? 'Approval requested' : 'Review proposal',
+          _alreadyRequested
+              ? 'Follow the signer’s progress here or in History.'
+              : 'Check the proposed recipient, amount, and fee before continuing to signer review.',
+        ),
+        if (replaces != null)
+          Surface(
+            color: colors.gold.withValues(alpha: .08),
+            radius: 12,
+            padding: const EdgeInsets.all(13),
             child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              spacing: 9,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              spacing: 6,
               children: [
-                Flexible(
-                  child: SingleChildScrollView(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      spacing: 8,
-                      children: [
-                        const Row(
-                          children: [
-                            Expanded(child: LokiLabel('Proposal preview')),
-                            StatusPill('Testnet'),
-                          ],
-                        ),
-                        Text(
-                          _alreadyRequested
-                              ? 'Approval requested'
-                              : 'Review this payment',
-                          style: const TextStyle(
-                            fontSize: 26,
-                            fontWeight: FontWeight.w600,
-                            letterSpacing: -.9,
-                          ),
-                        ),
-                        _PaymentNote(
-                          _alreadyRequested
-                              ? 'Follow the signer’s progress here or in History.'
-                              : 'Check the proposal’s amount and recipient before continuing to the native signer.',
-                        ),
-                        if (replaces != null)
-                          Surface(
-                            color: colors.gold.withValues(alpha: .08),
-                            radius: 12,
-                            padding: const EdgeInsets.all(13),
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              spacing: 6,
-                              children: [
-                                LokiLabel(
-                                  replaces['cancel'] == true
-                                      ? 'Cancels a stuck payment'
-                                      : 'Retries a stuck payment',
-                                  color: colors.gold,
-                                ),
-                                _PaymentNote(
-                                  'Replaces ${_short(_text(replaces['attempt']) ?? 'an earlier payment')}. Both proposals spend the same note, so at most one can be mined.',
-                                ),
-                                if (_readZats(replaces['amount_zat']) != null)
-                                  ValueRow(
-                                    'Original amount',
-                                    _withUnit(replaces['amount_zat']),
-                                    mono: true,
-                                  ),
-                                if (_text(replaces['recipient'])
-                                    case final original?)
-                                  SelectableText(original, style: lokiMono(10)),
-                              ],
-                            ),
-                          ),
-                        if (review != null)
-                          Surface(
-                            color: colors.secondary,
-                            radius: 12,
-                            padding: const EdgeInsets.all(17),
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.stretch,
-                              spacing: 7,
-                              children: [
-                                _AmountHeading(
-                                  review['amount_zat'],
-                                  fixed: true,
-                                  pending: true,
-                                ),
-                                LokiLabel('Recipient', color: colors.muted),
-                                SelectableText(
-                                  _text(review['recipient'])!,
-                                  style: lokiMono(
-                                    12,
-                                    color: colors.ink,
-                                  ).copyWith(height: 1.4),
-                                ),
-                                const Divider(height: 1),
-                                ValueRow(
-                                  'Network fee',
-                                  _withUnit(review['fee_zat'], fixed: true),
-                                  mono: true,
-                                ),
-                                ValueRow(
-                                  'Change back to vault',
-                                  _withUnit(review['change_zat'], fixed: true),
-                                  mono: true,
-                                ),
-                                ValueRow(
-                                  'Vault (creator’s label)',
-                                  _vaultName(widget.vault),
-                                ),
-                                if (policy != null)
-                                  ValueRow('Vault policy', '$policy approvals'),
-                                if (memo != null) ...[
-                                  LokiLabel(
-                                    'Memo (sender’s text)',
-                                    color: colors.muted,
-                                  ),
-                                  SelectableText(
-                                    memo,
-                                    style: TextStyle(
-                                      fontSize: 12,
-                                      color: colors.ink,
-                                    ),
-                                  ),
-                                ],
-                              ],
-                            ),
-                          ),
-                        if (status != null) ...[
-                          Align(
-                            alignment: Alignment.centerLeft,
-                            child: _phasePill(status),
-                          ),
-                          _ApprovalStatus(widget.vault, status),
-                        ],
-                        if (_loading || _approving)
-                          const LinearProgressIndicator(),
-                        if (_statusUnavailable)
-                          const _PaymentNote(
-                            'Could not refresh payment status. The app will keep checking.',
-                            error: true,
-                          ),
-                        if (status?['error'] != null)
-                          const _PaymentNote(
-                            'The signer reported a problem. Check History for available actions.',
-                            error: true,
-                          ),
-                        if (_approvalUnknown &&
-                            !_alreadyRequested &&
-                            !noLongerOpen)
-                          const _PaymentNote(
-                            'Could not confirm the approval request. Check the current status before trying again.',
-                            error: true,
-                          ),
-                        if (_reviewUnavailable &&
-                            !_alreadyRequested &&
-                            !noLongerOpen)
-                          const _PaymentNote(
-                            'This proposal is not available to review yet or cannot be approved on this device.',
-                            error: true,
-                          ),
-                        ExpansionTile(
-                          tilePadding: EdgeInsets.zero,
-                          minTileHeight: 34,
-                          title: Text(
-                            'Transaction identifiers',
-                            style: TextStyle(fontSize: 12, color: colors.muted),
-                          ),
-                          children: [
-                            const LokiLabel('Payment attempt'),
-                            SelectableText(widget.attempt, style: lokiMono(11)),
-                          ],
-                        ),
-                      ],
-                    ),
-                  ),
+                LokiLabel(
+                  replaces['cancel'] == true
+                      ? 'Cancels a stuck payment'
+                      : 'Retries a stuck payment',
+                  color: colors.gold,
                 ),
-                const Divider(height: 1),
-                if (!_alreadyRequested && !noLongerOpen)
-                  const Row(
-                    spacing: 8,
-                    children: [
-                      Icon(Icons.fingerprint, size: 21),
-                      Expanded(
-                        child: _PaymentNote(
-                          'Touch ID unlocks the key. Only native consent approves the payment.',
-                        ),
-                      ),
-                    ],
-                  ),
-                Wrap(
-                  alignment: WrapAlignment.end,
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: [
-                    ActionChipButton(
-                      'Close',
-                      Icons.close,
-                      _approving ? null : () => Navigator.pop(context),
-                    ),
-                    if (!_alreadyRequested &&
-                        !noLongerOpen &&
-                        review == null &&
-                        !_loading &&
-                        !_approving)
-                      ActionChipButton(
-                        'Reload proposal',
-                        Icons.refresh,
-                        _approvalUnknown && (_checking || _statusUnavailable)
-                            ? null
-                            : _loadReview,
-                      ),
-                    if (!_alreadyRequested && !noLongerOpen && review != null)
-                      ActionChipButton(
-                        _approving ? 'Opening signer…' : 'Continue to signer',
-                        Icons.arrow_forward,
-                        _canContinue ? _approve : null,
-                        primary: true,
-                      ),
-                  ],
+                _PaymentNote(
+                  'Replaces ${_short(_text(replaces['attempt']) ?? 'an earlier payment')}. Both proposals spend the same note, so at most one can be mined.',
                 ),
+                if (_readZats(replaces['amount_zat']) != null)
+                  ValueRow(
+                    'Original amount',
+                    _withUnit(replaces['amount_zat']),
+                    mono: true,
+                  ),
+                if (_text(replaces['recipient']) case final original?)
+                  SelectableText(original, style: lokiMono(10)),
               ],
             ),
           ),
+        if (review != null)
+          _PaymentDetails('Proposed payment', review, widget.vault),
+        if (showingPreview)
+          const _ReviewNotice(
+            'Not yet signed',
+            'Continuing opens the local signer. Touch ID unlocks the key; it does not approve this payment.',
+          ),
+        if (status != null && !showingPreview) ...[
+          Align(alignment: Alignment.centerLeft, child: _phasePill(status)),
+          _ApprovalStatus(widget.vault, status),
+        ],
+        if (_loading || _approving) const LinearProgressIndicator(),
+        if (_statusUnavailable)
+          const _PaymentNote(
+            'Could not refresh payment status. The app will keep checking.',
+            error: true,
+          ),
+        if (status?['error'] != null)
+          const _PaymentNote(
+            'The signer reported a problem. Check History for available actions.',
+            error: true,
+          ),
+        if (_approvalUnknown && !_alreadyRequested && !noLongerOpen)
+          const _PaymentNote(
+            'Could not confirm the approval request. Check the current status before trying again.',
+            error: true,
+          ),
+        if (_reviewUnavailable && !_alreadyRequested && !noLongerOpen)
+          const _PaymentNote(
+            'This proposal is not available to review yet or cannot be approved on this device.',
+            error: true,
+          ),
+        ExpansionTile(
+          tilePadding: EdgeInsets.zero,
+          minTileHeight: 34,
+          title: Text(
+            showingPreview
+                ? 'Approval status and identifiers'
+                : 'Transaction identifiers',
+            style: TextStyle(fontSize: 12, color: colors.muted),
+          ),
+          children: [
+            if (status != null && showingPreview) ...[
+              _phasePill(status),
+              _ApprovalStatus(widget.vault, status),
+              const SizedBox(height: 8),
+            ],
+            const LokiLabel('Payment attempt'),
+            SelectableText(widget.attempt, style: lokiMono(11)),
+          ],
         ),
-      ),
+        const Divider(height: 1),
+        Wrap(
+          alignment: WrapAlignment.end,
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            ActionChipButton(
+              'Back',
+              Icons.arrow_back,
+              _approving ? null : widget.close,
+            ),
+            if (!_alreadyRequested &&
+                !noLongerOpen &&
+                review == null &&
+                !_loading &&
+                !_approving)
+              ActionChipButton(
+                'Reload proposal',
+                Icons.refresh,
+                _approvalUnknown && (_checking || _statusUnavailable)
+                    ? null
+                    : _loadReview,
+              ),
+            if (!_alreadyRequested && !noLongerOpen && review != null)
+              ActionChipButton(
+                _approving ? 'Opening signer…' : 'Continue to signer',
+                Icons.arrow_forward,
+                _canContinue ? _approve : null,
+                primary: true,
+              ),
+          ],
+        ),
+      ],
     );
   }
 }

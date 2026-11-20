@@ -16,7 +16,57 @@ class Notice extends StatelessWidget {
   @override
   Widget build(BuildContext context) => Surface(
     padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-    child: Text(message, style: lokiSans(12, color: context.colors.muted)),
+    child: Semantics(
+      liveRegion: true,
+      child: Text(message, style: lokiSans(12, color: context.colors.muted)),
+    ),
+  );
+}
+
+class CopyButton extends StatefulWidget {
+  const CopyButton(this.label, this.value, this.success, {super.key});
+  final String label, value, success;
+
+  @override
+  State<CopyButton> createState() => _CopyButtonState();
+}
+
+class _CopyButtonState extends State<CopyButton> {
+  String? feedback;
+
+  @override
+  void didUpdateWidget(covariant CopyButton oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.value != oldWidget.value) feedback = null;
+  }
+
+  Future<void> copy() async {
+    final value = widget.value;
+    var message = widget.success;
+    try {
+      await Clipboard.setData(ClipboardData(text: value));
+    } catch (_) {
+      message = 'Could not copy to the clipboard.';
+    }
+    if (mounted && widget.value == value) setState(() => feedback = message);
+  }
+
+  @override
+  Widget build(BuildContext context) => Wrap(
+    spacing: 9,
+    runSpacing: 6,
+    crossAxisAlignment: WrapCrossAlignment.center,
+    children: [
+      ActionChipButton(widget.label, Icons.copy_outlined, copy),
+      if (feedback case final message?)
+        Semantics(
+          liveRegion: true,
+          child: Text(
+            message,
+            style: lokiSans(11, color: context.colors.muted),
+          ),
+        ),
+    ],
   );
 }
 
@@ -133,129 +183,234 @@ class VaultLibrary extends StatelessWidget {
 }
 
 class VaultForm extends StatefulWidget {
-  const VaultForm({super.key, required this.join});
-  final bool join;
+  const VaultForm({
+    super.key,
+    required this.join,
+    required this.busy,
+    required this.cancel,
+    required this.submit,
+  });
+  final bool join, busy;
+  final VoidCallback cancel;
+  final ValueChanged<Json> submit;
   @override
   State<VaultForm> createState() => _VaultFormState();
 }
 
 class _VaultFormState extends State<VaultForm> {
   final form = GlobalKey<FormState>();
-  String name = '', invite = '';
+  String name = '';
   int members = 3, threshold = 2;
+  ({
+    String code,
+    String name,
+    String coordinator,
+    int slot,
+    int members,
+    int threshold,
+  })?
+  invite;
 
-  String get code =>
-      Uri.tryParse(invite.trim())?.queryParameters['invite'] ?? invite.trim();
+  // An invitation preview is unverified; the signer still validates and enrolls it.
+  void readInvite(String input) {
+    invite = null;
+    final text = input.trim();
+    try {
+      final code = Uri.tryParse(text)?.queryParameters['invite'] ?? text;
+      if (code.isEmpty || code.length > 4096) return;
+      final fields = jsonDecode(
+        utf8.decode(base64Url.decode(base64Url.normalize(code))),
+      );
+      if (fields
+          case {
+            'name': final String name,
+            'creator_base_url': final String coordinator,
+            'slot': final int slot,
+            'members': final int members,
+            'threshold': final int threshold,
+          }
+          when name.trim().isNotEmpty && coordinator.isNotEmpty) {
+        invite = (
+          code: code,
+          name: name,
+          coordinator: coordinator,
+          slot: slot,
+          members: members,
+          threshold: threshold,
+        );
+      }
+    } on FormatException {
+      // Report invalid pasted content through the form, not a decoder error.
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     final joining = widget.join;
-    return AlertDialog(
-      title: Text(joining ? 'Join a vault' : 'Create a vault'),
-      content: SizedBox(
-        width: 400,
-        child: Form(
-          key: form,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text(
-                joining
-                    ? 'Paste the invite link or code from the creator. Compare the roster with the other members before creating keys.'
-                    : 'Choose how many members share custody and how many approvals a payment needs.',
-              ),
-              const SizedBox(height: 16),
-              if (joining)
-                TextFormField(
-                  autofocus: true,
-                  maxLines: 3,
-                  autocorrect: false,
-                  enableSuggestions: false,
-                  decoration: const InputDecoration(
-                    labelText: 'Invite link or code',
+    final details = invite;
+    Widget count(
+      String label,
+      int value,
+      int min,
+      int max,
+      ValueChanged<int> change,
+    ) => Surface(
+      color: context.colors.secondary,
+      radius: 10,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+      child: Row(
+        children: [
+          Expanded(child: LokiLabel(label, color: context.colors.muted)),
+          IconButton(
+            tooltip: 'Fewer $label',
+            onPressed: widget.busy || value <= min
+                ? null
+                : () => change(value - 1),
+            icon: const Icon(Icons.remove, size: 16),
+          ),
+          Text('$value', style: lokiMono(13)),
+          IconButton(
+            tooltip: 'More $label',
+            onPressed: widget.busy || value >= max
+                ? null
+                : () => change(value + 1),
+            icon: const Icon(Icons.add, size: 16),
+          ),
+        ],
+      ),
+    );
+
+    return Form(
+      key: form,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        spacing: 14,
+        children: [
+          LokiHead(
+            'Workspace',
+            joining ? 'Review vault invite' : 'Create vault',
+            joining
+                ? 'Paste the invitation from your vault organizer and check its details before joining.'
+                : 'Name your vault and choose how many members must approve each payment.',
+          ),
+          Surface(
+            padding: const EdgeInsets.all(18),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              spacing: 12,
+              children: [
+                LokiLabel(joining ? 'Invitation' : 'Vault details'),
+                if (joining)
+                  TextFormField(
+                    autofocus: true,
+                    readOnly: widget.busy,
+                    obscureText: true,
+                    autocorrect: false,
+                    enableSuggestions: false,
+                    decoration: const InputDecoration(
+                      labelText: 'Invite link or code',
+                    ),
+                    onChanged: (text) => setState(() => readInvite(text)),
+                    validator: (text) => text?.trim().isEmpty != false
+                        ? 'Paste an invitation.'
+                        : invite == null
+                        ? 'This invite could not be read. Check the link or ask your organizer for a new invite.'
+                        : null,
+                  )
+                else ...[
+                  TextFormField(
+                    autofocus: true,
+                    readOnly: widget.busy,
+                    decoration: const InputDecoration(labelText: 'Vault name'),
+                    onChanged: (value) => name = value.trim(),
+                    validator: (_) =>
+                        name.isEmpty || utf8.encode(name).length > 80
+                        ? 'Enter a vault name of 1–80 bytes.'
+                        : null,
                   ),
-                  onChanged: (text) => invite = text,
-                  validator: (_) =>
-                      code.isEmpty ? 'Paste an invitation.' : null,
-                )
-              else ...[
-                TextFormField(
-                  autofocus: true,
-                  decoration: const InputDecoration(labelText: 'Vault name'),
-                  onChanged: (value) => name = value.trim(),
-                  validator: (_) =>
-                      name.isEmpty || utf8.encode(name).length > 80
-                      ? 'Enter a vault name of 1–80 bytes.'
-                      : null,
-                ),
-                const SizedBox(height: 12),
-                Row(
-                  children: [
-                    Expanded(
-                      child: DropdownButton<int>(
-                        value: members,
-                        isExpanded: true,
-                        items: [
-                          for (var n = 3; n <= 16; n++)
-                            DropdownMenuItem(
-                              value: n,
-                              child: Text('$n members'),
-                            ),
-                        ],
-                        onChanged: (n) => setState(() {
-                          members = n!;
-                          if (threshold >= members) threshold = members - 1;
-                        }),
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: DropdownButton<int>(
-                        value: threshold,
-                        isExpanded: true,
-                        items: [
-                          for (var n = 2; n < members; n++)
-                            DropdownMenuItem(
-                              value: n,
-                              child: Text('$n approvals'),
-                            ),
-                        ],
-                        onChanged: (n) => setState(() => threshold = n!),
-                      ),
-                    ),
-                  ],
-                ),
+                  count(
+                    'members',
+                    members,
+                    3,
+                    16,
+                    (n) => setState(() {
+                      members = n;
+                      if (threshold >= members) threshold = members - 1;
+                    }),
+                  ),
+                  count('approvals', threshold, 2, members - 1, (n) {
+                    setState(() => threshold = n);
+                  }),
+                  const Divider(),
+                  ValueRow('Vault policy', '$threshold of $members approvals'),
+                  const ValueRow('Network', 'Testnet'),
+                ],
               ],
+            ),
+          ),
+          if (joining && details != null)
+            Surface(
+              padding: const EdgeInsets.all(18),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                spacing: 10,
+                children: [
+                  const LokiLabel('Details from the invite'),
+                  ValueRow('Vault name (set by creator)', details.name),
+                  ValueRow(
+                    'Vault policy',
+                    '${details.threshold} of ${details.members} approvals',
+                  ),
+                  ValueRow('Your member slot', 'Member ${details.slot}'),
+                  const ValueRow('Network', 'Testnet'),
+                  const Divider(),
+                  LokiLabel(
+                    'Creator endpoint in the invite',
+                    color: context.colors.muted,
+                  ),
+                  SelectableText(details.coordinator, style: lokiMono(11)),
+                ],
+              ),
+            ),
+          Notice(
+            joining
+                ? 'Only use an invite from your vault organizer. After you join, compare roster codes with every member over a trusted channel before creating keys.'
+                : 'You’ll get a separate invite for each other member. Share them privately and compare roster codes together before creating keys.',
+          ),
+          if (widget.busy) const LinearProgressIndicator(minHeight: 2),
+          const Divider(),
+          Wrap(
+            alignment: WrapAlignment.end,
+            spacing: 8,
+            children: [
+              ActionChipButton(
+                'Cancel',
+                Icons.close,
+                widget.busy ? null : widget.cancel,
+              ),
+              ActionChipButton(
+                joining ? 'Join vault' : 'Create vault',
+                joining ? Icons.link : Icons.add,
+                widget.busy
+                    ? null
+                    : () {
+                        if (!form.currentState!.validate()) return;
+                        widget.submit(
+                          joining
+                              ? {'invite': invite!.code}
+                              : {
+                                  'name': name,
+                                  'members': members,
+                                  'threshold': threshold,
+                                },
+                        );
+                      },
+                primary: true,
+              ),
             ],
           ),
-        ),
+        ],
       ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(context),
-          child: const Text('Cancel'),
-        ),
-        ActionChipButton(
-          joining ? 'Join vault' : 'Create vault',
-          joining ? Icons.link : Icons.add,
-          () {
-            if (form.currentState!.validate()) {
-              Navigator.pop(
-                context,
-                joining
-                    ? <String, dynamic>{'invite': code}
-                    : <String, dynamic>{
-                        'name': name,
-                        'members': members,
-                        'threshold': threshold,
-                      },
-              );
-            }
-          },
-          primary: true,
-        ),
-      ],
     );
   }
 }
@@ -361,21 +516,7 @@ class VaultSetup extends StatelessWidget {
                   if (invite['joined'] == true)
                     const StatusPill('Joined')
                   else if (invite['code'] case final String code)
-                    ActionChipButton(
-                      'Copy invite',
-                      Icons.copy_outlined,
-                      () async {
-                        await Clipboard.setData(ClipboardData(text: code));
-                        if (context.mounted) {
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(
-                              content: Text('Invite copied'),
-                              duration: Duration(seconds: 1),
-                            ),
-                          );
-                        }
-                      },
-                    ),
+                    CopyButton('Copy invite', code, 'Invite copied'),
                 ],
               ),
             ),
@@ -460,7 +601,7 @@ class VaultSetup extends StatelessWidget {
                       ? 'Codes differed. LokiSigner refuses this setup until it restarts.'
                       : confirmed
                       ? 'You confirmed. Waiting for the other members.'
-                      : 'Choose Codes match or Codes differ in the native signer prompt.',
+                      : 'Continue to compare the codes in LokiSigner.',
                   style: lokiSans(11, color: c.muted),
                 ),
               ),

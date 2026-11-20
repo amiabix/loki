@@ -91,11 +91,21 @@ func touchIDSetupAlert(_ error: NSError?) -> NSAlert {
     return alert
 }
 
-func canSetUpWithTouchID() -> Bool {
+private func touchIDSetupAlertIfNeeded() -> NSAlert? {
     var error: NSError?
     let context = LAContext()
-    guard !context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error) else { return true }
-    touchIDSetupAlert(error).runModal()
+    guard !context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error) else { return nil }
+    return touchIDSetupAlert(error)
+}
+
+func touchIDSetupFailure() -> SignerStartFailure? {
+    guard let alert = touchIDSetupAlertIfNeeded() else { return nil }
+    return .key("\(alert.messageText)\n\n\(alert.informativeText)")
+}
+
+func canSetUpWithTouchID() -> Bool {
+    guard let alert = touchIDSetupAlertIfNeeded() else { return true }
+    alert.runModal()
     return false
 }
 
@@ -126,31 +136,79 @@ final class RecoveryInput: @unchecked Sendable {
     }
 }
 
-func restoreInput(newProfile: Bool) -> Result<RecoveryInput, SignerStartFailure> {
-    // First-run restore was already checked before presenting the setup choice.
-    guard newProfile || canSetUpWithTouchID() else { return .failure(.cancelled) }
-    // Choose a file before collecting any secret, so the picker never shares a field editor with it.
+private func recoveryBackupPicker() -> NSOpenPanel {
     let picker = NSOpenPanel()
     picker.title = "Choose a LokiSigner recovery backup"
     picker.prompt = "Choose backup"
     picker.allowedContentTypes = [.json]
+    return picker
+}
+
+private struct RecoveryPrompt {
+    let words: NSSecureTextField
+    let pass: NSSecureTextField
+    private let newProfile: Bool
+
+    init(newProfile: Bool) {
+        self.newProfile = newProfile
+        words = NSSecureTextField(frame: NSRect(x: 0, y: newProfile ? 30 : 0, width: 400, height: 22))
+        words.placeholderString = "24 recovery words, separated by spaces"
+        words.setAccessibilityLabel("24 recovery words")
+        pass = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 400, height: 22))
+        pass.placeholderString = "New local profile passphrase"
+        pass.setAccessibilityLabel("New local profile passphrase")
+    }
+
+    func standaloneAlert() -> NSAlert {
+        let alert = NSAlert()
+        alert.messageText = "Restore a vault"
+        alert.informativeText = "Encrypted backup selected. Enter its 24 recovery words here, never on the wallet page."
+        let fields = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: newProfile ? 52 : 22))
+        fields.addSubview(words)
+        if newProfile { fields.addSubview(pass); words.nextKeyView = pass }
+        alert.accessoryView = fields
+        alert.addButton(withTitle: "Restore vault")
+        alert.addButton(withTitle: "Cancel")
+        return alert
+    }
+
+    func review() -> SignerReview {
+        let r = SignerReview.self
+        let entry = r.field("24 recovery words", words) + (newProfile ? r.field("New local profile passphrase", pass) : [])
+        return SignerReview(section: newProfile ? "Recovery · fresh profile" : "Recovery · unlocked profile",
+            title: newProfile ? "Restore your signer" : "Restore another vault",
+            intro: "Use the backup and words that match this signer’s identity.", content: [
+                r.card("Encrypted backup file", [r.label("Backup selected", weight: .semibold),
+                    r.label("Selected using the macOS file picker. Its contents stay local.", tone: r.muted)]),
+                r.card("Private entry on this Mac", entry + [r.label("Existing vault data will not be overwritten.", tone: r.muted)]),
+            ], hint: newProfile ? "Recovery words stay in the local signer." : "Your unlocked profile is kept.",
+            actions: [newProfile ? "Restore signer" : "Restore vault", "Cancel"], primary: 0)
+    }
+
+    func input(_ response: NSApplication.ModalResponse, file: URL) -> Result<RecoveryInput, SignerStartFailure> {
+        guard response == .alertFirstButtonReturn else { return .failure(.cancelled) }
+        guard !words.stringValue.isEmpty, !newProfile || !pass.stringValue.isEmpty else {
+            return .failure(newProfile ? .missingRecoveryInput : .missingRecoveryWords)
+        }
+        return .success(RecoveryInput(file: file.path, words: Array(words.stringValue.utf8), pass: Array(pass.stringValue.utf8)))
+    }
+
+    func clear() {
+        words.stringValue = ""
+        pass.stringValue = ""
+    }
+}
+
+func restoreInput(newProfile: Bool) -> Result<RecoveryInput, SignerStartFailure> {
+    // First-run restore was already checked before presenting the setup choice.
+    guard newProfile || canSetUpWithTouchID() else { return .failure(.cancelled) }
+    // Choose a file before collecting any secret, so the picker never shares a field editor with it.
+    let picker = recoveryBackupPicker()
     guard picker.runModal() == .OK, let file = picker.url else { return .failure(.cancelled) }
 
-    let alert = NSAlert()
-    alert.messageText = "Restore a vault"
-    alert.informativeText = "Encrypted backup selected. Enter its 24 recovery words here, never on the wallet page."
-    let fields = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: newProfile ? 52 : 22))
-    let words = NSSecureTextField(frame: NSRect(x: 0, y: newProfile ? 30 : 0, width: 400, height: 22))
-    words.placeholderString = "24 recovery words, separated by spaces"
-    words.setAccessibilityLabel("24 recovery words")
-    let pass = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 400, height: 22))
-    pass.placeholderString = "New local profile passphrase"
-    pass.setAccessibilityLabel("New local profile passphrase")
-    fields.addSubview(words)
-    if newProfile { fields.addSubview(pass); words.nextKeyView = pass }
-    alert.accessoryView = fields
-    alert.addButton(withTitle: "Restore vault")
-    alert.addButton(withTitle: "Cancel")
+    let prompt = RecoveryPrompt(newProfile: newProfile)
+    let alert = prompt.standaloneAlert()
+    let words = prompt.words
     alert.window.initialFirstResponder = words
     if let editor = alert.window.fieldEditor(true, for: words) as? NSTextView {
         editor.isContinuousSpellCheckingEnabled = false
@@ -162,15 +220,30 @@ func restoreInput(newProfile: Bool) -> Result<RecoveryInput, SignerStartFailure>
     let result = alert.runModal()
     defer {
         alert.window.endEditing(for: words)
-        alert.window.endEditing(for: pass)
-        words.stringValue = ""
-        pass.stringValue = ""
+        alert.window.endEditing(for: prompt.pass)
+        prompt.clear()
     }
-    guard result == .alertFirstButtonReturn else { return .failure(.cancelled) }
-    guard !words.stringValue.isEmpty, !newProfile || !pass.stringValue.isEmpty else {
-        return .failure(newProfile ? .missingRecoveryInput : .missingRecoveryWords)
+    return prompt.input(result, file: file)
+}
+
+@MainActor
+func restoreInput(newProfile: Bool, signer: NativeSigner, complete: @escaping (Result<RecoveryInput, SignerStartFailure>) -> Void) {
+    // NativeSigner preflights a fresh profile before starting the setup flow.
+    if !newProfile, let failure = touchIDSetupFailure() {
+        complete(.failure(failure))
+        return
     }
-    return .success(RecoveryInput(file: file.path, words: Array(words.stringValue.utf8), pass: Array(pass.stringValue.utf8)))
+    let picker = recoveryBackupPicker()
+    picker.begin { response in
+        guard response == .OK, let file = picker.url else { complete(.failure(.cancelled)); return }
+
+        let prompt = RecoveryPrompt(newProfile: newProfile)
+        signer.presentPrompt(prompt.review(), fields: newProfile ? [prompt.words, prompt.pass] : [prompt.words]) { response in
+            let input = prompt.input(response, file: file)
+            prompt.clear()
+            complete(input)
+        }
+    }
 }
 
 func recoveryError(_ reply: UnsafeMutablePointer<CChar>?) -> SignerStartFailure? {

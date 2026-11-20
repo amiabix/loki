@@ -276,7 +276,7 @@ fn run_local_with<G>(
             let endpoint = config.lokisigner_url().ok_or("LokiSigner needs a loopback listener")?;
             Ok::<_, &str>(connect::WalletTabs::new(endpoint, registration.coordinator.clone(), ask))
         }).transpose()?;
-        let state: state::Shared = std::sync::Arc::new(state::AppState { approval, roster_confirmation, fetched_config: fetched, wallet_tabs, ..state::AppState::new(config) });
+        let state: state::Shared = std::sync::Arc::new(state::AppState { approval, notice: notice.clone(), roster_confirmation, fetched_config: fetched, wallet_tabs, ..state::AppState::new(config) });
         let _scope = on_start(&state)?;
         let ready = registration::start(&state, pass, notice.as_ref()).await?;
         if state.config.native {

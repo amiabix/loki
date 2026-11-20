@@ -22,6 +22,28 @@ class MacWalletApi implements WalletApi {
   const MacWalletApi();
   static const _channel = MethodChannel('cash.loki/wallet');
 
+  Future<bool> nativePromptActive() async =>
+      await _channel.invokeMethod<bool>('nativePromptActive') ?? false;
+  Future<void> leaveNativePrompt() =>
+      _channel.invokeMethod('leaveNativePrompt');
+  Future<String?> nativeNotice() =>
+      _channel.invokeMethod<String>('nativeNotice');
+  Future<void> recoverWalletKey() => _channel.invokeMethod('recoverWalletKey');
+
+  void onNativePromptChanged(void Function(bool)? onChanged) {
+    _channel.setMethodCallHandler(
+      onChanged == null
+          ? null
+          : (call) async {
+              if (call.method != 'nativePromptChanged') {
+                throw MissingPluginException();
+              }
+              final active = call.arguments;
+              if (active is bool) onChanged(active);
+            },
+    );
+  }
+
   @override
   Future<Json> profile() async => _map(await _channel.invokeMethod('profile'));
   @override
