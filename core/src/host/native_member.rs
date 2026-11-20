@@ -3,7 +3,7 @@
 use std::{
     collections::BTreeMap,
     path::Path,
-    sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex},
+    sync::{Arc, Mutex},
 };
 
 use axum::{body::{to_bytes, Body}, http::{header, Method, Request, StatusCode}, Router};
@@ -22,8 +22,6 @@ const UPGRADE_VAULT: &str = "Open this vault in the wallet once to upgrade it.";
 struct NativeMember {
     state: Shared,
     viewing_keys: Mutex<BTreeMap<(String, u16), (SignerViewingKey, VaultNetwork)>>,
-    stop: Arc<tokio::sync::Notify>,
-    stopping: AtomicBool,
     runtime: Option<tokio::runtime::Handle>,
     router: Router,
     #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
@@ -31,20 +29,22 @@ struct NativeMember {
 }
 
 static RUNNING: Mutex<Option<Arc<NativeMember>>> = Mutex::new(None);
+#[cfg(test)]
+pub(super) static TEST_MEMBER: Mutex<()> = Mutex::new(());
 // The UI may request recovery, but only a local key failure for this launch grants it.
 static KEY_RECOVERY: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 
 struct NativeScope;
 
 impl NativeScope {
-    fn install(state: &Shared, stop: Arc<tokio::sync::Notify>, _notice: Option<LocalNotice>) -> Result<Self, String> {
+    fn install(state: &Shared, _notice: Option<LocalNotice>) -> Result<Self, String> {
         let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
         if running.is_some() {
             return Err("LokiSigner is already running.".into());
         }
         KEY_RECOVERY.lock().map_err(|_| "LokiSigner could not access profile recovery.")?.take();
-        *running = Some(Arc::new(NativeMember { state: state.clone(), viewing_keys: Mutex::default(), stop,
-            stopping: AtomicBool::new(false), runtime: tokio::runtime::Handle::try_current().ok(),
+        *running = Some(Arc::new(NativeMember { state: state.clone(), viewing_keys: Mutex::default(),
+            runtime: tokio::runtime::Handle::try_current().ok(),
             router: super::routes::router(state.clone()),
             #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
             notice: _notice,
@@ -73,16 +73,14 @@ pub(crate) fn run_native(
         fn drop(&mut self) { crate::seal_kdf::clear_session_cache(); }
     }
     let _cache = ClearCache;
-    let stop = Arc::new(tokio::sync::Notify::new());
     super::run_local_with(config, Some(pass), Some(notice.clone()), Some(approval), Some(roster_confirmation), fetched,
-        Some(&stop), connect, |state| NativeScope::install(state, stop.clone(), Some(notice)))
+        connect, |state| NativeScope::install(state, Some(notice)))
 }
 
 pub(crate) fn request_stop() -> bool {
     RUNNING.lock().is_ok_and(|running| running.as_ref().is_some_and(|member| {
-        member.stopping.store(true, Ordering::Release);
+        member.state.stopping.send_replace(true);
         if let Some(tabs) = &member.state.wallet_tabs { tabs.revoke_all(); }
-        member.stop.notify_one();
         true
     }))
 }
@@ -128,6 +126,7 @@ pub(crate) fn disconnect_wallet_tabs() {
 
 pub(crate) fn restore_running(words: Zeroizing<Vec<u8>>, file: &Path) -> Result<(), &'static str> {
     let member = RUNNING.lock().map_err(|_| super::native_recovery::REFUSED)?.clone()
+        .filter(|member| !member.state.is_stopping())
         .ok_or(super::native_recovery::LOCKED)?;
     super::native_recovery::restore_running(&member.state, words, file)
 }
@@ -171,7 +170,7 @@ pub(crate) fn wallet_request(path: &str, body: Option<Value>, export: bool) -> V
     fn dispatch(path: &str, body: Option<Value>, export: bool) -> Result<(StatusCode, Value), RequestError> {
         let path = request_route(path, body.is_some(), export)?;
         let member = RUNNING.lock().map_err(|_| REQUEST_LOCKED)?.clone().ok_or(REQUEST_LOCKED)?;
-        if member.stopping.load(Ordering::Acquire) { return Err(REQUEST_LOCKED); }
+        if member.state.is_stopping() { return Err(REQUEST_LOCKED); }
         let runtime = member.runtime.as_ref().ok_or(REQUEST_LOCKED)?;
         let invalid = (StatusCode::BAD_REQUEST, "invalid wallet request");
         let mut builder = Request::builder().uri(format!("/api/{path}")).extension(InProcess(()));
@@ -189,7 +188,7 @@ pub(crate) fn wallet_request(path: &str, body: Option<Value>, export: bool) -> V
         let request = builder.body(body).map_err(|_| invalid)?;
         let (active, mut router) = (member.clone(), member.router.clone());
         let task = runtime.spawn(async move {
-            if active.state.session.read().await.is_none() || active.stopping.load(Ordering::Acquire) {
+            if active.state.session.read().await.is_none() || active.state.is_stopping() {
                 return Err(REQUEST_LOCKED);
             }
             let response = router.call(request).await.expect("Axum router is infallible");
@@ -202,7 +201,7 @@ pub(crate) fn wallet_request(path: &str, body: Option<Value>, export: bool) -> V
             Ok((status, data))
         });
         let result = runtime.block_on(task).map_err(|_| REQUEST_LOCKED)?;
-        if member.stopping.load(Ordering::Acquire)
+        if member.state.is_stopping()
             || !RUNNING.lock().is_ok_and(|running| running.as_ref().is_some_and(|current| Arc::ptr_eq(current, &member))) {
             return Err(REQUEST_LOCKED);
         }
@@ -216,10 +215,10 @@ pub(crate) fn wallet_request(path: &str, body: Option<Value>, export: bool) -> V
 /// the result if its member stopped or was replaced while the worker was doing I/O.
 fn with_running_member<T>(query: impl FnOnce(&NativeMember) -> Result<T, &'static str>) -> Result<T, &'static str> {
     let member = RUNNING.lock().map_err(|_| LIST_ERROR)?.clone().ok_or(LOCKED)?;
-    if member.stopping.load(Ordering::Acquire) { return Err(LOCKED); }
+    if member.state.is_stopping() { return Err(LOCKED); }
     let result = query(&member);
     let running = RUNNING.lock().map_err(|_| LIST_ERROR)?;
-    if member.stopping.load(Ordering::Acquire) || !running.as_ref().is_some_and(|current| Arc::ptr_eq(current, &member)) {
+    if member.state.is_stopping() || !running.as_ref().is_some_and(|current| Arc::ptr_eq(current, &member)) {
         return Err(LOCKED);
     }
     result
@@ -313,7 +312,6 @@ mod tests {
     use reddsa_frost::frost::redpallas as frost;
     use zcash_protocol::consensus::NetworkType;
 
-    static TEST_MEMBER: Mutex<()> = Mutex::new(());
     const PASS: &str = "local test unlock";
     const SLOT: u16 = 2;
 
@@ -337,7 +335,7 @@ mod tests {
         let state = Arc::new(super::super::state::AppState::new(settings));
         let _scope = {
             let _runtime = runtime.enter();
-            NativeScope::install(&state, Arc::default(), None).unwrap()
+            NativeScope::install(&state, None).unwrap()
         };
         let dispatch = |path, body, export| wallet_request(path, body, export)["status"].as_u64().unwrap();
         assert_eq!(dispatch("registration", None, false), 401);
@@ -418,7 +416,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let notice: LocalNotice = Arc::new(move |kind, text| tx.send((kind.to_owned(), text.to_owned())).unwrap());
         for failure in [KeyFailure::Cancelled, KeyFailure::LockedOut, KeyFailure::Missing] {
-            let scope = NativeScope::install(&state, Arc::default(), Some(notice.clone())).unwrap();
+            let scope = NativeScope::install(&state, Some(notice.clone())).unwrap();
             let _fixture = super::super::state::apple_test::install(&data, move |_, _, create| {
                 assert!(!create);
                 Err(failure)
@@ -460,7 +458,7 @@ mod tests {
         let _test = TEST_MEMBER.lock().unwrap();
         let data = std::env::temp_dir().join(format!("loki-addresses-{}", uuid::Uuid::new_v4()));
         let state = Arc::new(crate::host::state::AppState::new(config(&data)));
-        let _native = NativeScope::install(&state, Arc::default(), None).unwrap();
+        let _native = NativeScope::install(&state, None).unwrap();
         *state.session.blocking_write() = Some(crate::host::state::Session {
             passphrase: Zeroizing::new(PASS.into()), data: data.clone(),
         });
@@ -566,13 +564,13 @@ mod tests {
     fn running_handle_refuses_second_install_and_discards_rows_after_replacement() {
         let _test = TEST_MEMBER.lock().unwrap();
         let state = Arc::new(crate::host::state::AppState::new(config(Path::new("unused"))));
-        let scope = NativeScope::install(&state, Arc::default(), None).unwrap();
-        assert_eq!(NativeScope::install(&state, Arc::default(), None).err().as_deref(), Some("LokiSigner is already running."));
+        let scope = NativeScope::install(&state, None).unwrap();
+        assert_eq!(NativeScope::install(&state, None).err().as_deref(), Some("LokiSigner is already running."));
 
         let mut replacement = None;
         let rows = with_running_member(|_| {
             drop(scope);
-            replacement = Some(NativeScope::install(&state, Arc::default(), None).unwrap());
+            replacement = Some(NativeScope::install(&state, None).unwrap());
             Ok(vec![json!({ "name": "Old member’s vault" })])
         });
         assert!(replacement.is_some());

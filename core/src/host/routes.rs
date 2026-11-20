@@ -154,6 +154,9 @@ async fn registration(State(st): State<Shared>) -> Reply {
 /// Require a device capability outside enrollment, ceremony peer calls, and the native
 /// connect handshake (which is origin- and loopback-checked before reaching this middleware).
 async fn auth(State(st): State<Shared>, req: Request, next: Next) -> Result<Response, Response> {
+    if st.is_stopping() {
+        return Err(err(StatusCode::UNAUTHORIZED, "profile is locked").into_response());
+    }
     // Only the embedded dispatcher can create this typed extension, never an HTTP client.
     #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
     if st.config.native && req.extensions().get::<super::native_member::InProcess>().is_some() {

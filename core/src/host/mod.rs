@@ -239,7 +239,7 @@ pub fn run_local(
     approval: Option<LocalApproval>,
     fetched: Option<FetchedConfig>,
 ) -> Result<(), String> {
-    run_local_with(config, pass, notice, approval, None, fetched, None, None, |_| Ok(()))
+    run_local_with(config, pass, notice, approval, None, fetched, None, |_| Ok(()))
 }
 
 fn run_local_with<G>(
@@ -249,7 +249,6 @@ fn run_local_with<G>(
     approval: Option<LocalApproval>,
     roster_confirmation: Option<LocalRosterConfirmation>,
     fetched: Option<FetchedConfig>,
-    stop: Option<&tokio::sync::Notify>,
     connect: Option<connect::LocalConnect>,
     on_start: impl FnOnce(&state::Shared) -> Result<G, String>,
 ) -> Result<(), String> {
@@ -265,7 +264,8 @@ fn run_local_with<G>(
         .build()
         .map_err(|e| format!("tokio runtime: {e}"))?;
 
-    runtime.block_on(async move {
+    let mut scope = None;
+    let result = runtime.block_on(async {
         let addr = std::net::SocketAddr::new(config.bind, config.port);
         let listener = tokio::net::TcpListener::bind(addr)
             .await
@@ -277,7 +277,7 @@ fn run_local_with<G>(
             Ok::<_, &str>(connect::WalletTabs::new(endpoint, registration.coordinator.clone(), ask))
         }).transpose()?;
         let state: state::Shared = std::sync::Arc::new(state::AppState { approval, notice: notice.clone(), roster_confirmation, fetched_config: fetched, wallet_tabs, ..state::AppState::new(config) });
-        let _scope = on_start(&state)?;
+        scope = Some(on_start(&state)?);
         let ready = registration::start(&state, pass, notice.as_ref()).await?;
         if state.config.native {
             if let Some(notice) = notice { notice(ready, ""); }
@@ -288,18 +288,25 @@ fn run_local_with<G>(
         } else {
             println!("Signer: http://{addr}/#{}", state.config.token);
         }
-        let server = axum::serve(listener, routes::router(state).into_make_service_with_connect_info::<std::net::SocketAddr>());
-        if let Some(stop) = stop {
+        let server = axum::serve(listener, routes::router(state.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>());
+        if state.config.native {
             // Drop the native runtime before the UI can set aside the profile. No HTTP
             // request or signer worker may keep writing to the old profile after that.
-            tokio::select! {
+            let result = tokio::select! {
                 result = async { server.await } => result.map_err(|e| format!("serve: {e}")),
-                _ = stop.notified() => Ok(()),
-            }
+                _ = state.wait_for_stop() => Ok(()),
+            };
+            state.stopping.send_replace(true);
+            state.session.write().await.take();
+            result
         } else {
             server.await.map_err(|e| format!("serve: {e}"))
         }
-    })
+    });
+    // Keep the profile claimed until its blocking workers have drained.
+    drop(runtime);
+    drop(scope);
+    result
 }
 
 #[cfg(test)]
