@@ -56,7 +56,7 @@ most one of them is ever mined.
 
 ## Try it
 
-On macOS, [build the LokiSigner Flutter app](apps/lokisigner/macos/README.md) to pair,
+On macOS, [build the LokiSigner Flutter app](apps/macos/README.md) to pair,
 set up a vault, and use a testnet wallet without a browser.
 
 Build the browser signer once, then run the wallet:

@@ -4,7 +4,7 @@ Use an Apple Silicon Mac with Xcode 26 or later, native `aarch64-apple-darwin` R
 
 ```sh
 export PATH="$HOME/tools/flutter/bin:$HOME/.cargo/bin:$PATH"
-cd apps/lokisigner
+cd apps
 flutter pub get
 flutter build macos --debug --config-only
 ```
@@ -63,8 +63,8 @@ xcodebuild -workspace macos/Runner.xcworkspace -scheme Runner -configuration Deb
 app="$PWD/build/native-visual/Build/Products/Debug/loki_signer.app"
 codesign --verify --deep --strict "$app"
 open "$app"
-mkdir -p ../../.amp/in/artifacts
-screencapture -i -w -o ../../.amp/in/artifacts/lokisigner-window.png
+mkdir -p ../.amp/in/artifacts
+screencapture -i -w -o ../.amp/in/artifacts/lokisigner-window.png
 ```
 
 In the Mac desktop session, click the LokiSigner window when the camera cursor appears. Do not capture any passphrase, recovery words or backup dialogs from the provisioned build.

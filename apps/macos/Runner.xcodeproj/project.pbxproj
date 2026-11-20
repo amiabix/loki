@@ -63,12 +63,12 @@
 
 /* Begin PBXFileReference section */
 		B73100100000000000000001 /* WalletChannel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WalletChannel.swift; sourceTree = "<group>"; };
-		B73100100000000000000002 /* Native.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Native.swift; path = ../../../core/signer-app/Sources/Native.swift; sourceTree = SOURCE_ROOT; };
-		B73100100000000000000003 /* Recovery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Recovery.swift; path = ../../../core/signer-app/Sources/Recovery.swift; sourceTree = SOURCE_ROOT; };
-		B73100100000000000000004 /* VaultAddresses.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = VaultAddresses.swift; path = ../../../core/signer-app/Sources/VaultAddresses.swift; sourceTree = SOURCE_ROOT; };
+		B73100100000000000000002 /* Native.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Native.swift; path = ../../core/signer-app/Sources/Native.swift; sourceTree = SOURCE_ROOT; };
+		B73100100000000000000003 /* Recovery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Recovery.swift; path = ../../core/signer-app/Sources/Recovery.swift; sourceTree = SOURCE_ROOT; };
+		B73100100000000000000004 /* VaultAddresses.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = VaultAddresses.swift; path = ../../core/signer-app/Sources/VaultAddresses.swift; sourceTree = SOURCE_ROOT; };
 		B73100100000000000000005 /* libse_backend.dylib */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.dylib"; name = libse_backend.dylib; path = LokiNative/libse_backend.dylib; sourceTree = DERIVED_FILE_DIR; };
 		B73100100000000000000006 /* libloki_poc.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; name = libloki_poc.a; path = LokiNative/libloki_poc.a; sourceTree = DERIVED_FILE_DIR; };
-		B73100100000000000000008 /* PromptPage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PromptPage.swift; path = ../../../core/signer-app/Sources/PromptPage.swift; sourceTree = SOURCE_ROOT; };
+		B73100100000000000000008 /* PromptPage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PromptPage.swift; path = ../../core/signer-app/Sources/PromptPage.swift; sourceTree = SOURCE_ROOT; };
 		333000ED22D3DE5D00554162 /* Warnings.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Warnings.xcconfig; sourceTree = "<group>"; };
 		335BBD1A22A9A15E00E9071D /* GeneratedPluginRegistrant.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = GeneratedPluginRegistrant.swift; sourceTree = "<group>"; };
 		33CC10ED2044A3C60003C045 /* loki_signer.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "loki_signer.app"; sourceTree = BUILT_PRODUCTS_DIR; };

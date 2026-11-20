@@ -7,7 +7,7 @@ if [[ "${ARCHS}" != arm64 || "$(rustc -vV | sed -n 's/^host: //p')" != aarch64-a
     exit 1
 fi
 
-core="$SRCROOT/../../../core"
+core="$SRCROOT/../../core"
 stage="$DERIVED_FILE_DIR/LokiNative"
 mkdir -p "$stage"
 if [[ "$CONFIGURATION" == Debug ]]; then profile=dev; else profile=release; fi
