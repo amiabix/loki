@@ -104,6 +104,8 @@ pub struct DevicePrompts {
 pub enum SignerError {
     /// The member declined the rendered payment on-device.
     MemberRefused,
+    /// The candidate fee could not be bound to its value commitments.
+    FeeUnverified(String),
     /// `pkg.message()` did not equal the sighash recomputed from the rendered PCZT. A
     /// malicious coordinator asking us to sign something other than what we rendered.
     SighashMismatch,
@@ -134,6 +136,7 @@ impl std::fmt::Display for SignerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SignerError::MemberRefused => write!(f, "member refused the rendered payment"),
+            SignerError::FeeUnverified(e) => write!(f, "{e}"),
             SignerError::SighashMismatch => write!(
                 f,
                 "REFUSED: SigningPackage.message() != sighash(rendered pczt) — \
@@ -1552,7 +1555,7 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
             ));
         }
         if !view.fee_verified {
-            return Err(SignerError::Other("candidate fee is unverified".into()));
+            return Err(SignerError::FeeUnverified("candidate fee is unverified".into()));
         }
         let parsed = pczt::Pczt::parse(pczt)
             .map_err(|e| SignerError::Other(format!("pczt parse: {e:?}")))?;
@@ -1570,8 +1573,7 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
         self.rendered.insert(cand.attempt_id, view.clone());
 
         // 2. Recompute the sighash from the SAME bytes, so consent binds to it (not just the view).
-        let local_sighash =
-            wysiwys::sighash_of_pczt(pczt, self.fvk()?).map_err(SignerError::Other)?;
+        let local_sighash = wysiwys::checked_sighash_of_pczt(pczt, self.fvk()?)?;
 
         // 3. The member decides on THAT render + candidate + sighash (policy/biometric).
         //    Refusal is first-class.
@@ -2001,9 +2003,10 @@ pub(crate) mod tests {
 
         let result = signer.sign_approve(&session, &cand, &payment_params(&fvk), &pczt, &pkg, &seed);
         assert!(
-            matches!(&result, Err(SignerError::Other(message)) if message == "candidate fee is unverified"),
+            matches!(&result, Err(SignerError::FeeUnverified(_))),
             "got {result:?}"
         );
+        assert_eq!(result.unwrap_err().to_string(), "candidate fee is unverified");
         assert_eq!(
             signer.nonces.state(&signer.nonce_id(&cand)),
             crate::signer::nonce::NonceState::Committed

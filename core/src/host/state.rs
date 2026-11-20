@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use tokio::sync::RwLock;
+use tokio::sync::{watch, RwLock};
 use zeroize::Zeroizing;
 
 use crate::signer::secure_element::{OpenError, SecureElement, SoftwareSecureElement, WrappedDek};
@@ -414,6 +414,8 @@ pub struct AppState {
     /// The last failed registration attempt, reported locally while registration retries.
     pub(super) registration_error: RwLock<Option<String>>,
     pub session: RwLock<Option<Session>>,
+    /// A native member never unlocks in place after stopping; each launch has its own signal.
+    pub(super) stopping: watch::Sender<bool>,
     pub ceremony: std::sync::Mutex<()>,
     pub payment: std::sync::Mutex<()>,
     pub active_payments: std::sync::Mutex<BTreeSet<String>>,
@@ -423,6 +425,7 @@ pub struct AppState {
     pub device_auth: std::sync::Mutex<Option<crate::signer::device_auth::DeviceRegistry>>,
     /// The member's native payment decision; `None` (headless) refuses every payment.
     pub approval: Option<super::LocalApproval>,
+    pub(super) notice: Option<super::LocalNotice>,
     /// The member's native roster-code comparison; `None` (headless) trusts the caller of
     /// `/api/agree`.
     pub roster_confirmation: Option<super::LocalRosterConfirmation>,
@@ -444,12 +447,14 @@ impl AppState {
             registration: RwLock::new(None),
             registration_error: RwLock::new(None),
             session: RwLock::new(None),
+            stopping: watch::Sender::new(false),
             ceremony: std::sync::Mutex::new(()),
             payment: std::sync::Mutex::new(()),
             active_payments: std::sync::Mutex::new(BTreeSet::new()),
             active_dkgs: std::sync::Mutex::new(BTreeSet::new()),
             device_auth: std::sync::Mutex::new(None),
             approval: None,
+            notice: None,
             roster_confirmation: None,
             roster_asking: std::sync::Mutex::new(None),
             roster_refused: std::sync::Mutex::new(BTreeSet::new()),
@@ -457,6 +462,14 @@ impl AppState {
             viewing_keys: std::sync::Mutex::new(BTreeMap::new()),
             fetched_config: None,
         }
+    }
+
+    pub(super) fn is_stopping(&self) -> bool {
+        *self.stopping.borrow()
+    }
+
+    pub(super) async fn wait_for_stop(&self) {
+        let _ = self.stopping.subscribe().wait_for(|stopping| *stopping).await;
     }
 }
 
