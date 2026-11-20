@@ -31,6 +31,8 @@ pub(crate) use native_member::{disconnect_wallet_tabs, run_native, request_stop 
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
 pub(crate) use native_member::restore_running as native_restore_running;
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+pub(crate) use native_member::wallet_request as native_wallet_request;
+#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
 pub(crate) use native_recovery::{clean_staging as native_clean_staging, profile_state as native_profile_state, restore_new as native_restore_new, REFUSED as NATIVE_RESTORE_REFUSED};
 #[cfg(feature = "relay-communication")]
 pub use nonce_witness::WitnessConfig;

@@ -1,0 +1,30 @@
+name: loki_signer
+description: LokiSigner native testnet wallet.
+publish_to: none
+version: 0.1.0+1
+
+environment:
+  sdk: ^3.14.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  material_ui: ^1.1.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - fonts/Inter-OFL.txt
+    - fonts/MartianMono-OFL.txt
+  fonts:
+    - family: Inter
+      fonts:
+        - asset: fonts/Inter.ttf
+    - family: Martian Mono
+      fonts:
+        - asset: fonts/Mono.ttf

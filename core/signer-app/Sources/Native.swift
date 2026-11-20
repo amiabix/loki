@@ -17,6 +17,9 @@ func loki_member_app_disconnect_wallet_tabs()
 @_silgen_name("loki_member_app_pairing_target")
 func loki_member_app_pairing_target(_ launch: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
 
+@_silgen_name("loki_member_app_pairing_link")
+private func loki_member_app_pairing_link(_ launch: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
+
 @_silgen_name("loki_member_app_configuration")
 func loki_member_app_configuration(_ launch: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
 
@@ -36,6 +39,10 @@ private func nativeQuery(_ query: (UnsafePointer<CChar>) -> UnsafeMutablePointer
         return ["error": "invalid launch"]
     }
     let reply = request.withCString { query($0) }
+    return nativeReply(reply)
+}
+
+func nativeReply(_ reply: UnsafeMutablePointer<CChar>?) -> [String: Any] {
     defer { loki_member_app_free(reply) }
     guard let reply = reply,
           let parsed = try? JSONSerialization.jsonObject(with: Data(String(cString: reply).utf8)) as? [String: Any]
@@ -186,6 +193,8 @@ private func nativeApprove(_ summary: UnsafePointer<CChar>?) -> Int32 {
     else { return 0 }
     var approved = false
     DispatchQueue.main.sync {
+        guard NativeSigner.walletDecisionAllowed else { return }
+        defer { NativeSigner.embeddedSigner?.resumeWalletWarnings() }
         let text = { (key: String) in request[key] as? String ?? "?" }
         let alert = NSAlert()
         alert.alertStyle = .warning
@@ -280,6 +289,8 @@ private func nativeConfirmRoster(_ summary: UnsafePointer<CChar>?) -> Int32 {
     else { return 0 }
     var answer: Int32 = 0
     DispatchQueue.main.sync {
+        guard NativeSigner.walletDecisionAllowed else { return }
+        defer { NativeSigner.embeddedSigner?.resumeWalletWarnings() }
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Do the roster codes match?"
@@ -361,25 +372,30 @@ private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointe
     let event = String(cString: kind), text = String(cString: message)
     if event == "registration-warning" || event == "registration-key" || event == "registration-key-gone" {
         // Rust supplies fixed copy here. Don't block its retry loop on an open dialog.
-        DispatchQueue.main.async { (NSApp.delegate as? NativeSigner)?.warnRegistration(event, message: text) }
+        DispatchQueue.main.async { NativeSigner.current?.warnRegistration(event, message: text) }
         return
     }
     if event == "startup-key" || event == "startup-key-gone" {
-        DispatchQueue.main.async { (NSApp.delegate as? NativeSigner)?.startupKeyFailure = event == "startup-key-gone" ? .keyGone(text) : .key(text) }
+        DispatchQueue.main.async { NativeSigner.current?.startupKeyFailure = event == "startup-key-gone" ? .keyGone(text) : .key(text) }
         return
     }
     // Synchronous delivery keeps recovery words on screen before registration continues.
     DispatchQueue.main.sync {
         let alert = NSAlert()
         if event == "ready" || event == "restore-ready" || event == "restore-pending" {
+            if let signer = NativeSigner.embeddedSigner, event == "ready" {
+                signer.didStart()
+                return
+            }
             alert.messageText = event == "ready" ? "LokiSigner is running" : "Vault restored"
-            let connect = "On this Mac, choose Connect LokiSigner in the wallet. If the wallet only offers to paste a link, ask the coordinator to update it. Keep LokiSigner running to approve and sign."
+            let connect = NativeSigner.embeddedSigner != nil ? "Keep LokiSigner running to approve and sign."
+                : "On this Mac, choose Connect LokiSigner in the wallet. If the wallet only offers to paste a link, ask the coordinator to update it. Keep LokiSigner running to approve and sign."
             alert.informativeText = event == "restore-pending"
                 ? "Your vault is saved on this Mac. LokiSigner will keep trying to reconnect, without your recovery words.\n\n\(connect)"
                 : connect
             alert.addButton(withTitle: "Done")
             alert.runModal()
-            (NSApp.delegate as? NativeSigner)?.didStart()
+            NativeSigner.current?.didStart()
         } else if event == "recovery" {
             alert.messageText = "Save your recovery words privately"
             alert.informativeText = text
@@ -390,6 +406,16 @@ private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointe
 }
 
 final class NativeSigner: NSObject, NSApplicationDelegate {
+    private static var embeddedMode = false
+    fileprivate static weak var embeddedSigner: NativeSigner?
+    fileprivate static var current: NativeSigner? { embeddedSigner ?? (NSApp.delegate as? NativeSigner) }
+    fileprivate static var walletDecisionAllowed: Bool { !embeddedMode || embeddedSigner?.canShowWalletDecision == true }
+    private let embedded: Bool
+    private var ready = false
+    private var stopping = false
+    private var walletCompletion: ((SignerStartFailure?) -> Void)?
+    private var lockCompletions: [() -> Void] = []
+    private let walletWork = DispatchGroup()
     private var running = false
     private var prompting = false {
         didSet {
@@ -407,9 +433,12 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
     private let args: [String]
     private let initialLink: String?
 
-    init(args: [String], link: String?) {
+    init(args: [String], link: String?, embedded: Bool = false) {
         self.args = args
         self.initialLink = link
+        self.embedded = embedded
+        super.init()
+        if embedded { Self.embeddedMode = true; Self.embeddedSigner = self }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -435,7 +464,129 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         nativeQuery({ loki_member_app_profile($0, action) }, ["args": args])
     }
 
+    private func startupProfile() -> [String: Any] {
+        let location = profile(cleanupNeeded ? 1 : 0)
+        if location["profile"] != nil { cleanupNeeded = false }
+        return location
+    }
+
+    var walletReady: Bool { ready && !stopping && !startingOver }
+    fileprivate var canShowWalletDecision: Bool { walletReady && !prompting && NSApp.modalWindow == nil }
+
+    func walletProfile() -> [String: Any] {
+        var value = profile()
+        value["running"] = walletReady
+        return value
+    }
+
+    func beginWalletOperation(_ completion: @escaping (SignerStartFailure?) -> Void) -> Bool {
+        guard !prompting, !stopping, !running || walletReady,
+              walletCompletion == nil, NSApp.modalWindow == nil else { return false }
+        walletCompletion = completion
+        return true
+    }
+
+    private func finishWalletOperation(_ failure: SignerStartFailure? = nil) {
+        prompting = false
+        retryLink = nil
+        let completion = walletCompletion
+        walletCompletion = nil
+        completion?(failure)
+    }
+
+    func unlockWallet() {
+        if walletReady { finishWalletOperation(); return }
+        start(nil)
+    }
+
+    func pairWallet(origin: String) {
+        guard !running else { finishWalletOperation(.differentPairing); return }
+        prompting = true
+        let state = startupProfile()
+        guard let profile = state["profile"] as? String else { retry(.dataFolderUnavailable, link: nil); return }
+        if profile == "fresh", !canSetUpWithTouchID() { finishWalletOperation(.cancelled); return }
+        let launch: [String: Any] = ["args": args, "restore_origin": origin]
+        let reply = nativeQuery(loki_member_app_pairing_target, launch)
+        guard let target = reply["target"] as? [String: Any], let coordinator = target["coordinator"] as? String,
+              coordinator.hasPrefix("https://") else { finishWalletOperation(.coordinatorOrigin); return }
+        let alert = NSAlert()
+        alert.messageText = "Contact this coordinator?"
+        alert.informativeText = """
+            Coordinator: \(coordinator)
+
+            Compare this address with the one your vault organizer gave you. No request has been sent yet. Continuing asks this coordinator to reserve a member slot.
+
+            Adding or removing a Touch ID fingerprint makes this Mac’s signer keys unusable. Save your recovery words and encrypted vault backups privately.
+            """
+        alert.addButton(withTitle: "Continue")
+        alert.addButton(withTitle: "Cancel")
+        guard runDecisionAlert(alert, escape: .alertSecondButtonReturn) == .alertFirstButtonReturn else {
+            finishWalletOperation(.cancelled); return
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let reply = nativeQuery(loki_member_app_pairing_link, launch)
+            DispatchQueue.main.async {
+                guard let link = reply["link"] as? String else { self.finishWalletOperation(.registrationRefused); return }
+                self.loadConfiguration(link: link, approvedOrigin: coordinator)
+            }
+        }
+    }
+
+    func restoreWallet() {
+        if walletReady { restoreVault(nil); return }
+        prompting = true
+        switch startupProfile()["profile"] as? String {
+        case "fresh":
+            if canSetUpWithTouchID() { beginRecovery() } else { finishWalletOperation(.cancelled) }
+        case "profile":
+            if !confirmSetAside() { finishWalletOperation(.cancelled) }
+        case "vault":
+            finishWalletOperation(.unlockToRestore)
+        default:
+            finishWalletOperation(.dataFolderUnavailable)
+        }
+    }
+
+    func lockWallet(_ completion: @escaping () -> Void) -> Bool {
+        if stopping { lockCompletions.append(completion); return true }
+        guard !prompting, !startingOver, NSApp.modalWindow == nil else { return false }
+        guard running else { completion(); return true }
+        stopping = true
+        lockCompletions.append(completion)
+        // If Rust already exited, its queued stopped() callback still drains and completes lock.
+        _ = loki_member_app_stop()
+        return true
+    }
+
+    func performWalletWork(_ work: @escaping () -> [String: Any],
+                           complete: @escaping ([String: Any]?) -> Void) -> Bool {
+        guard walletReady else { return false }
+        walletWork.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            let value = work()
+            DispatchQueue.main.async {
+                complete(self.walletReady ? value : nil)
+                self.walletWork.leave()
+                self.resumeWalletWarnings()
+            }
+        }
+        return true
+    }
+
     private func retry(_ failure: SignerStartFailure, link: String?) {
+        if embedded {
+            if failure.keyIsGone, let state = profile()["profile"] as? String, ["profile", "vault"].contains(state) {
+                prompting = true
+                let alert = NSAlert()
+                alert.messageText = "LokiSigner couldn’t use the local key"
+                alert.informativeText = failure.message
+                alert.addButton(withTitle: "OK")
+                alert.addButton(withTitle: "Set aside profile…")
+                if alert.runModal() == .alertSecondButtonReturn, confirmSetAside(recover: true) { return }
+            }
+            finishWalletOperation(failure)
+            return
+        }
         prompting = true
         retryLink = link
         let alert = retryAlert(failure, profile: profile()["profile"] as? String)
@@ -455,6 +606,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
     }
 
     private func confirmSetAside(recover: Bool = false) -> Bool {
+        if embedded, !canSetUpWithTouchID() { finishWalletOperation(.cancelled); return true }
         guard setAsideAlert(recover: recover).runModal() == .alertSecondButtonReturn else { return false }
         recoveringKey = recover
         if running {
@@ -479,25 +631,36 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         } else {
             let link = recover ? nil : queuedLink ?? retryLink
             DispatchQueue.main.async {
-                self.prompting = false
-                self.start(link)
+                if self.embedded {
+                    if canSetUpWithTouchID() { self.beginRecovery() } else { self.finishWalletOperation(.cancelled) }
+                } else {
+                    self.prompting = false
+                    self.start(link)
+                }
             }
         }
     }
 
     fileprivate func didStart() {
+        ready = true
         prompting = false
         queuedLink = nil
+        if embedded { finishWalletOperation() }
     }
 
     fileprivate func warnRegistration(_ event: String, message: String) {
-        guard running, !startingOver else { return }
+        guard running, !startingOver, !stopping else { return }
         registrationWarnings.append((event, message))
         showNextRegistrationWarning()
     }
 
+    fileprivate func resumeWalletWarnings() {
+        DispatchQueue.main.async { self.showNextRegistrationWarning() }
+    }
+
     private func showNextRegistrationWarning() {
-        guard running, !startingOver, !prompting, !registrationWarnings.isEmpty else { return }
+        guard running, !startingOver, !stopping, !prompting, !registrationWarnings.isEmpty else { return }
+        if embedded, NSApp.modalWindow != nil { return }
         prompting = true
         let warning = registrationWarnings.removeFirst()
         let recover = warning.event == "registration-key-gone"
@@ -507,9 +670,24 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
     }
 
     private func stopped(_ failure: SignerStartFailure, link: String?) {
+        ready = false
+        if embedded {
+            walletWork.notify(queue: .main) { self.finishStopped(failure, link: link) }
+        } else {
+            finishStopped(failure, link: link)
+        }
+    }
+
+    private func finishStopped(_ failure: SignerStartFailure, link: String?) {
         running = false
         registrationWarnings.removeAll()
-        if startingOver {
+        if stopping {
+            stopping = false
+            prompting = false
+            let completions = lockCompletions
+            lockCompletions.removeAll()
+            completions.forEach { $0() }
+        } else if startingOver {
             startingOver = false
             finishSetAside()
         } else {
@@ -535,13 +713,13 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
             prompting = false
             return
         }
-        let location = profile(cleanupNeeded ? 1 : 0)
+        let location = startupProfile()
         guard let state = location["profile"] as? String else {
             retry(location["error"] as? String == "data-folder-unavailable" ? .dataFolderUnavailable : .unexpected, link: link)
             return
         }
-        cleanupNeeded = false
         if state == "fresh" {
+            if embedded { finishWalletOperation(.pairingLinkNeeded); return }
             guard canSetUpWithTouchID() else { prompting = false; return }
             switch firstRunChoice() {
             case .alertSecondButtonReturn:
@@ -554,12 +732,14 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
                 return
             }
         }
+        loadConfiguration(link: link)
+    }
+
+    private func loadConfiguration(link: String?, approvedOrigin: String? = nil) {
         var launch: [String: Any] = ["args": args]
         if let link = link {
             launch["pairing_url"] = link
-            // First confirm the coordinator. Rust checks the whole link without any network
-            // request and returns its canonical origin and slot; LokiSigner contacts that
-            // coordinator only after the member continues.
+            // Validate the link locally before asking the member to fetch configuration.
             let reply = nativeQuery(loki_member_app_pairing_target, launch)
             guard let target = reply["target"] as? [String: Any], let origin = target["coordinator"] as? String,
                   let slot = (target["slot"] as? NSNumber)?.stringValue else {
@@ -567,6 +747,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
                 retry(different ? .differentPairing : .invalidLink, link: link)
                 return
             }
+            if let approvedOrigin, origin != approvedOrigin { retry(.invalidLink, link: link); return }
             guard confirmCoordinator(origin, title: "Pair this device with slot \(slot)?") else {
                 retry(.cancelled, link: link)
                 return
@@ -610,15 +791,20 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
             retry(.configuration, link: link)
             return
         }
+        if embedded, config["network"] as? String != "testnet" { retry(.testnetOnly, link: link); return }
         let alert = NSAlert()
         let slot = (config["slot"] as? NSNumber)?.stringValue ?? "?"
         let endpoints = configurationText(config)
-        if link != nil {
+        if embedded, link != nil {
+            alert.messageText = "Review signer configuration"
+            alert.informativeText = "Check the network and endpoints before saving them to your local profile.\n\nMember slot: \(slot)\n\(endpoints)\nYour passphrase stays on this Mac."
+        } else if link != nil {
             alert.messageText = "Pair this device with slot \(slot)?"
             alert.informativeText = "\(endpoints)\nCreate or unlock your local profile below. These values are saved once it unlocks."
         } else {
             alert.messageText = "Unlock your paired signer"
-            alert.informativeText = "\(endpoints)\nFor a new device, cancel and open a pairing link from the wallet. Your passphrase stays in this app."
+            alert.informativeText = embedded ? "\(endpoints)\nYour passphrase stays on this Mac."
+                : "\(endpoints)\nFor a new device, cancel and open a pairing link from the wallet. Your passphrase stays in this app."
         }
         let password = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 420, height: 26))
         password.placeholderString = "Local profile passphrase"
@@ -639,9 +825,14 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
             retry(.cancelled, link: link)
             return
         }
-        guard !password.stringValue.isEmpty else { retry(.emptyPassphrase, link: link); return }
+        guard !password.stringValue.isEmpty, !password.stringValue.contains("\0") else {
+            password.stringValue = ""
+            retry(.emptyPassphrase, link: link)
+            return
+        }
         var confirmed = launch
         confirmed["config"] = config
+        if embedded { confirmed["embedded"] = true }
         guard let json = try? JSONSerialization.data(withJSONObject: confirmed), let request = String(data: json, encoding: .utf8) else {
             password.stringValue = ""
             retry(.unexpected, link: link)
@@ -705,6 +896,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
             retry(.configuration, link: retryLink)
             return
         }
+        if embedded, config["network"] as? String != "testnet" { retry(.testnetOnly, link: retryLink); return }
         let alert = NSAlert()
         alert.messageText = "Review the signer configuration"
         alert.informativeText = configurationText(config)
@@ -712,6 +904,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         alert.addButton(withTitle: "Cancel")
         var confirmed = launch
         confirmed["config"] = config
+        if embedded { confirmed["embedded"] = true }
         guard alert.runModal() == .alertFirstButtonReturn else { retry(.cancelled, link: retryLink); return }
         guard let json = try? JSONSerialization.data(withJSONObject: confirmed), let request = String(data: json, encoding: .utf8) else {
             retry(.unexpected, link: retryLink)
@@ -752,10 +945,11 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         switch restoreInput(newProfile: false) {
         case .failure(let failure):
             if failure != .cancelled { showRecoveryResult(error: failure) }
-            prompting = false
+            if embedded { finishWalletOperation(failure) } else { prompting = false }
             return
         case .success(let value): input = value
         }
+        if embedded { walletWork.enter() }
         DispatchQueue.global(qos: .userInitiated).async {
             let error = input.file.withCString { file in
                 input.words.withUnsafeMutableBufferPointer { words in
@@ -763,6 +957,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
                 }
             }
             DispatchQueue.main.async {
+                defer { if self.embedded { self.walletWork.leave() } }
                 if error == .wrongProfile {
                     let state = self.profile()["profile"] as? String
                     let alert = NSAlert()
@@ -776,7 +971,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
                 } else {
                     showRecoveryResult(error: error)
                 }
-                self.prompting = false
+                if self.embedded { self.finishWalletOperation(error) } else { self.prompting = false }
             }
         }
     }
@@ -786,19 +981,23 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
     }
 }
 
-func runNativeSigner(arguments: [String], link: String?) -> Never {
+func nativeSignerArguments(_ arguments: [String]) -> [String] {
     var args = arguments
     if !args.contains("--data") {
         let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("LokiSigner")
         args += ["--data", root.path]
     }
     if !args.contains("--port") { args += ["--port", "0"] }
+    return args
+}
+
+func runNativeSigner(arguments: [String], link: String?) -> Never {
     let app = NSApplication.shared
     app.setActivationPolicy(.regular)
     let menu = NSMenu()
     let item = NSMenuItem()
     let actions = NSMenu()
-    let delegate = NativeSigner(args: args, link: link)
+    let delegate = NativeSigner(args: nativeSignerArguments(arguments), link: link)
     let vaultAddresses = VaultAddressesWindow()
     let showAddresses = actions.addItem(withTitle: "Vault addresses…", action: #selector(VaultAddressesWindow.show(_:)), keyEquivalent: "")
     showAddresses.target = vaultAddresses

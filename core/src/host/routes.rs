@@ -154,6 +154,11 @@ async fn registration(State(st): State<Shared>) -> Reply {
 /// Require a device capability outside enrollment, ceremony peer calls, and the native
 /// connect handshake (which is origin- and loopback-checked before reaching this middleware).
 async fn auth(State(st): State<Shared>, req: Request, next: Next) -> Result<Response, Response> {
+    // Only the embedded dispatcher can create this typed extension, never an HTTP client.
+    #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+    if st.config.native && req.extensions().get::<super::native_member::InProcess>().is_some() {
+        return Ok(next.run(req).await);
+    }
     if matches!(
         req.uri().path(),
         "/api/enroll" | "/api/agreed" | "/api/roster" | "/api/session"
@@ -263,7 +268,16 @@ async fn status(
                 Ok(v) => v,
                 Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
             };
-            ok(json!({ "phase": "home", "network": network, "profile": profile, "vaults": vaults }))
+            let mut reply = json!({ "phase": "home", "network": network, "profile": profile, "vaults": vaults });
+            if st.config.native {
+                // Report the running signer's pinned identity, not registration or relay health.
+                if let (Some(active), Ok(pinned)) = (&st.config.registration, super::RegistrationConfig::resume(&session.data, false)) {
+                    if active.coordinator == pinned.coordinator && active.slot == pinned.slot {
+                        reply["paired_coordinator"] = json!(pinned.coordinator);
+                    }
+                }
+            }
+            ok(reply)
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
     }

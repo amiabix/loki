@@ -3,10 +3,12 @@
 use std::{
     collections::BTreeMap,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex},
 };
 
+use axum::{body::{to_bytes, Body}, http::{header, Method, Request, StatusCode}, Router};
 use serde_json::{json, Value};
+use tonic::codegen::Service;
 use zeroize::Zeroizing;
 
 use crate::network::VaultNetwork;
@@ -21,6 +23,9 @@ struct NativeMember {
     state: Shared,
     viewing_keys: Mutex<BTreeMap<(String, u16), (SignerViewingKey, VaultNetwork)>>,
     stop: Arc<tokio::sync::Notify>,
+    stopping: AtomicBool,
+    runtime: Option<tokio::runtime::Handle>,
+    router: Router,
     #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
     notice: Option<LocalNotice>,
 }
@@ -39,6 +44,8 @@ impl NativeScope {
         }
         KEY_RECOVERY.lock().map_err(|_| "LokiSigner could not access profile recovery.")?.take();
         *running = Some(Arc::new(NativeMember { state: state.clone(), viewing_keys: Mutex::default(), stop,
+            stopping: AtomicBool::new(false), runtime: tokio::runtime::Handle::try_current().ok(),
+            router: super::routes::router(state.clone()),
             #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
             notice: _notice,
         }));
@@ -58,7 +65,7 @@ pub(crate) fn run_native(
     notice: LocalNotice,
     approval: LocalApproval,
     roster_confirmation: LocalRosterConfirmation,
-    connect: super::connect::LocalConnect,
+    connect: Option<super::connect::LocalConnect>,
     fetched: Option<FetchedConfig>,
 ) -> Result<(), String> {
     struct ClearCache;
@@ -68,11 +75,13 @@ pub(crate) fn run_native(
     let _cache = ClearCache;
     let stop = Arc::new(tokio::sync::Notify::new());
     super::run_local_with(config, Some(pass), Some(notice.clone()), Some(approval), Some(roster_confirmation), fetched,
-        Some(&stop), Some(connect), |state| NativeScope::install(state, stop.clone(), Some(notice)))
+        Some(&stop), connect, |state| NativeScope::install(state, stop.clone(), Some(notice)))
 }
 
 pub(crate) fn request_stop() -> bool {
     RUNNING.lock().is_ok_and(|running| running.as_ref().is_some_and(|member| {
+        member.stopping.store(true, Ordering::Release);
+        if let Some(tabs) = &member.state.wallet_tabs { tabs.revoke_all(); }
         member.stop.notify_one();
         true
     }))
@@ -123,13 +132,94 @@ pub(crate) fn restore_running(words: Zeroizing<Vec<u8>>, file: &Path) -> Result<
     super::native_recovery::restore_running(&member.state, words, file)
 }
 
+/// Authenticates only a request constructed here, not a header or an HTTP caller.
+#[derive(Clone)]
+pub(super) struct InProcess(());
+
+const REQUEST_LOCKED: (StatusCode, &str) = (StatusCode::UNAUTHORIZED, "profile is locked");
+type RequestError = (StatusCode, &'static str);
+
+fn request_route(path: &str, write: bool, export: bool) -> Result<&str, RequestError> {
+    let (route, query) = path.split_once('?').map_or((path, None), |(route, query)| (route, Some(query)));
+    let allowed = if export { !write && route == "recovery-backup" } else if write {
+        matches!(route, "create" | "join" | "agree" | "balance" | "payment-draft" | "payment-publish"
+            | "payment-review" | "payment-approve" | "payment-discard" | "payment-send" | "payment-replace" | "payment-verify")
+    } else {
+        matches!(route, "status" | "registration" | "payments" | "pending" | "payment-status" | "recovery-status")
+    };
+    if !allowed { return Err((StatusCode::NOT_FOUND, "unsupported wallet route")); }
+    if let Some(query) = query {
+        let mut seen = [false; 2];
+        for pair in query.split('&') {
+            let invalid = (StatusCode::BAD_REQUEST, "invalid wallet query");
+            let (name, value) = pair.split_once('=').ok_or(invalid)?;
+            let field = match (route, name) {
+                ("status" | "payments" | "pending" | "payment-status" | "recovery-status" | "recovery-backup", "vault") => 0,
+                ("payment-status", "attempt") => 1,
+                _ => return Err(invalid),
+            };
+            if seen[field] || value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) { return Err(invalid); }
+            seen[field] = true;
+        }
+    }
+    Ok(path)
+}
+
+/// Execute the same Axum handlers and validation on the member's own runtime, with no HTTP hop.
+/// Dropping the runtime at lock drains any blocking library workers before the UI reopens it.
+pub(crate) fn wallet_request(path: &str, body: Option<Value>, export: bool) -> Value {
+    fn dispatch(path: &str, body: Option<Value>, export: bool) -> Result<(StatusCode, Value), RequestError> {
+        let path = request_route(path, body.is_some(), export)?;
+        let member = RUNNING.lock().map_err(|_| REQUEST_LOCKED)?.clone().ok_or(REQUEST_LOCKED)?;
+        if member.stopping.load(Ordering::Acquire) { return Err(REQUEST_LOCKED); }
+        let runtime = member.runtime.as_ref().ok_or(REQUEST_LOCKED)?;
+        let invalid = (StatusCode::BAD_REQUEST, "invalid wallet request");
+        let mut builder = Request::builder().uri(format!("/api/{path}")).extension(InProcess(()));
+        let body = match body {
+            Some(body) if body.is_object() => {
+                if path == "join" && !ceremony::embedded_invite_target(&member.state.config, &body) {
+                    return Err((StatusCode::BAD_REQUEST, "invite does not name the paired coordinator or an allowed peer"));
+                }
+                builder = builder.method(Method::POST).header(header::CONTENT_TYPE, "application/json");
+                Body::from(body.to_string())
+            }
+            Some(_) => return Err(invalid),
+            None => Body::empty(),
+        };
+        let request = builder.body(body).map_err(|_| invalid)?;
+        let (active, mut router) = (member.clone(), member.router.clone());
+        let task = runtime.spawn(async move {
+            if active.state.session.read().await.is_none() || active.stopping.load(Ordering::Acquire) {
+                return Err(REQUEST_LOCKED);
+            }
+            let response = router.call(request).await.expect("Axum router is infallible");
+            let status = response.status();
+            let bad_reply = (StatusCode::INTERNAL_SERVER_ERROR, "invalid member reply");
+            let raw = to_bytes(response.into_body(), 4 * 1024 * 1024).await.map_err(|_| bad_reply)?;
+            let data = serde_json::from_slice::<Value>(&raw).ok().filter(Value::is_object)
+                .or_else(|| (!status.is_success()).then(|| json!({ "error": status.canonical_reason().unwrap_or("request failed") })))
+                .ok_or(bad_reply)?;
+            Ok((status, data))
+        });
+        let result = runtime.block_on(task).map_err(|_| REQUEST_LOCKED)?;
+        if member.stopping.load(Ordering::Acquire)
+            || !RUNNING.lock().is_ok_and(|running| running.as_ref().is_some_and(|current| Arc::ptr_eq(current, &member))) {
+            return Err(REQUEST_LOCKED);
+        }
+        result
+    }
+    let (status, data) = dispatch(path, body, export).unwrap_or_else(|(status, message)| (status, json!({ "error": message })));
+    json!({ "status": status.as_u16(), "data": data })
+}
+
 /// Snapshot the running member without keeping the process handle locked over a query. Discard
 /// the result if its member stopped or was replaced while the worker was doing I/O.
 fn with_running_member<T>(query: impl FnOnce(&NativeMember) -> Result<T, &'static str>) -> Result<T, &'static str> {
     let member = RUNNING.lock().map_err(|_| LIST_ERROR)?.clone().ok_or(LOCKED)?;
+    if member.stopping.load(Ordering::Acquire) { return Err(LOCKED); }
     let result = query(&member);
     let running = RUNNING.lock().map_err(|_| LIST_ERROR)?;
-    if !running.as_ref().is_some_and(|current| Arc::ptr_eq(current, &member)) {
+    if member.stopping.load(Ordering::Acquire) || !running.as_ref().is_some_and(|current| Arc::ptr_eq(current, &member)) {
         return Err(LOCKED);
     }
     result
@@ -174,14 +264,14 @@ impl NativeMember {
                 continue;
             }
             let Ok(c) = ceremony::load(data, pass, vault) else {
-                rows.push(json!({ "error": VAULT_ERROR }));
+                rows.push(json!({ "vault": vault, "error": VAULT_ERROR }));
                 continue;
             };
             let slot = c.my_slot;
             let label = vault_label(&c.name);
             let row = match self.address(data, pass, vault, slot) {
-                Ok((network, address)) => json!({ "name": label, "slot": slot, "network": network, "address": address }),
-                Err(error) => json!({ "name": label, "slot": slot, "error": error }),
+                Ok((network, address)) => json!({ "vault": vault, "name": label, "slot": slot, "network": network, "address": address }),
+                Err(error) => json!({ "vault": vault, "name": label, "slot": slot, "error": error }),
             };
             rows.push(row);
         }
@@ -237,6 +327,44 @@ mod tests {
     }
 
     #[test]
+    fn wallet_dispatch_requires_a_live_session_and_only_uses_wallet_routes() {
+        let _test = TEST_MEMBER.lock().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut settings = config(Path::new("unused"));
+        settings.registration = Some(super::super::RegistrationConfig::pairing(
+            &format!("loki://pair?origin=https%3A%2F%2Fwallet.example&slot=7&challenge={}", "ab".repeat(32)), false,
+        ).unwrap());
+        let state = Arc::new(super::super::state::AppState::new(settings));
+        let _scope = {
+            let _runtime = runtime.enter();
+            NativeScope::install(&state, Arc::default(), None).unwrap()
+        };
+        let dispatch = |path, body, export| wallet_request(path, body, export)["status"].as_u64().unwrap();
+        assert_eq!(dispatch("registration", None, false), 401);
+        *state.session.blocking_write() = Some(super::super::state::Session { data: "unused".into(), passphrase: Zeroizing::new(PASS.into()) });
+        assert_eq!(dispatch("registration", None, false), 409, "the underlying handler sees an unregistered member");
+        assert_eq!(runtime.block_on(super::super::routes::router(state.clone()).call(
+            Request::builder().uri("/api/registration").header("x-loki-token", "in-process").body(Body::empty()).unwrap(),
+        )).unwrap().status(), StatusCode::UNAUTHORIZED);
+        for path in ["/api/registration", "https://wallet.example/api/status", "//wallet.example/api/status", "status#other", "address", "recovery-backup",
+            "recovery-setup", "recovery-restore", "device-login", "connect", "lock", "unlock", "enroll", "session"] {
+            assert_eq!(dispatch(path, None, false), 404, "{path}");
+            assert_eq!(dispatch(path, Some(json!({})), false), 404, "{path}");
+        }
+        assert_eq!(dispatch("status?origin=https://wallet.example", None, false), 400);
+        assert_eq!(dispatch("registration", None, true), 404);
+        assert_eq!(dispatch("recovery-backup", None, true), 400, "only the backup handler is available to export");
+        let invite = {
+            use base64::Engine;
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json!({ "vault": "ab".repeat(32), "slot": 2,
+                "creator_base_url": "https://unapproved.example", "token": "unused", "members": 3, "threshold": 2, "name": "Test" }).to_string())
+        };
+        assert_eq!(dispatch("join", Some(json!({ "invite": invite })), false), 400);
+        assert!(request_stop());
+        assert_eq!(dispatch("registration", None, false), 401);
+    }
+
+    #[test]
     fn a_paired_native_app_runs_offline_and_only_sets_aside_after_stop() {
         let _test = TEST_MEMBER.lock().unwrap();
         let root = std::env::temp_dir().join(format!("loki-native-stop-{}", uuid::Uuid::new_v4()));
@@ -252,12 +380,15 @@ mod tests {
                 if kind != "recovery" { ready_tx.send((kind.to_owned(), message.to_owned())).unwrap(); }
             });
             stop_tx.send(run_native(settings, Zeroizing::new(PASS.into()), notice, Arc::new(|_| false),
-                Arc::new(|_| crate::host::RosterAnswer::Differ), Arc::new(|_, _, _| false), None)).unwrap();
+                Arc::new(|_| crate::host::RosterAnswer::Differ), Some(Arc::new(|_, _, _| false)), None)).unwrap();
         });
         let timeout = std::time::Duration::from_secs(10);
         let events: BTreeMap<_, _> = (0..2).map(|_| ready_rx.recv_timeout(timeout).unwrap()).collect();
         assert_eq!(events["registration-warning"], "LokiSigner couldn’t reach the coordinator. Your profile is unlocked and LokiSigner will keep trying in the background.");
         assert_eq!(events["ready"], "", "native readiness does not expose a local pairing link");
+        let status = wallet_request("status", None, false);
+        assert_eq!(status["status"], 200);
+        assert_eq!(status["data"]["paired_coordinator"], "https://127.0.0.1:1", "offline does not change the pinned origin");
         assert!(vault_addresses().unwrap().is_empty(), "local features work while offline");
         // A subsequent attempt still fails, but the modal warning is once per launch.
         assert_eq!(ready_rx.recv_timeout(std::time::Duration::from_secs(6)).unwrap_err(), std::sync::mpsc::RecvTimeoutError::Timeout);
@@ -357,7 +488,7 @@ mod tests {
             &id_hex, SLOT, 2, 3, "fixture", &public, &fvk, 4465026, VaultNetwork::Testnet,
         ).unwrap()).unwrap();
         write(&dir, "vault.sealed", &sealed);
-        let error_row = json!({ "name": "Shared reserve", "slot": SLOT,
+        let error_row = json!({ "vault": id_hex, "name": "Shared reserve", "slot": SLOT,
             "error": "LokiSigner could not verify this vault’s receive address." });
         assert_eq!(vault_addresses().unwrap(), vec![error_row.clone()], "a seal alone isn't enough");
 
@@ -365,7 +496,7 @@ mod tests {
         legacy["key_package"] = json!(hex::encode(share.serialize().unwrap()));
         legacy["vault_secret"] = json!(hex::encode(vs));
         write(&dir, "vault.sealed", &legacy);
-        let upgrade_row = json!({ "name": "Shared reserve", "slot": SLOT,
+        let upgrade_row = json!({ "vault": id_hex, "name": "Shared reserve", "slot": SLOT,
             "error": "Open this vault in the wallet once to upgrade it." });
         assert_eq!(vault_addresses().unwrap(), vec![upgrade_row.clone()], "legacy seal with no signer store");
         write(&dir, "vault.sealed", &sealed);
@@ -375,7 +506,7 @@ mod tests {
         let se = state.config.open_secure_element(&signer_dir, PASS).unwrap();
         let raw = encode_share(&share.serialize().unwrap(), &public.serialize().unwrap(), &vs);
         store.write(&se, FileKind::Share, 0, &raw).unwrap();
-        let correct = json!({ "name": "Shared reserve", "slot": SLOT, "network": "testnet", "address": expected });
+        let correct = json!({ "vault": id_hex, "name": "Shared reserve", "slot": SLOT, "network": "testnet", "address": expected });
         assert_eq!(vault_addresses().unwrap(), vec![correct.clone()]);
         #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
         {
@@ -468,7 +599,7 @@ mod tests {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if native {
                     run_native(config(data), Zeroizing::new(PASS.into()), notice, Arc::new(|_| false),
-                        Arc::new(|_| crate::host::RosterAnswer::Differ), Arc::new(|_, _, _| false), None)
+                        Arc::new(|_| crate::host::RosterAnswer::Differ), Some(Arc::new(|_, _, _| false)), None)
                 } else {
                     let config = super::super::config_from_args(&["--data".into(), data.to_str().unwrap().into(),
                         "--port".into(), "0".into()]).unwrap();

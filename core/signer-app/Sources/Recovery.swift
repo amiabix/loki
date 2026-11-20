@@ -8,7 +8,7 @@ enum SignerStartFailure: Error, Equatable {
     case missingRecoveryInput, missingRecoveryWords, invalidBackup, backupMismatch, wrongProfile
     case vaultExists, rosterUnavailable, rosterMismatch, restoredButStopped, unlockToRestore
     case notFresh, dataFolderUnavailable, protectedProfile, setAsideFailed
-    case key(String), keyGone(String), registrationRosterUnavailable
+    case key(String), keyGone(String), registrationRosterUnavailable, testnetOnly
 
     var keyIsGone: Bool {
         if case .keyGone = self { return true }
@@ -22,6 +22,7 @@ enum SignerStartFailure: Error, Equatable {
         case .invalidLink: return "This pairing link isn’t valid. Get a new link from the wallet and open it in LokiSigner."
         case .differentPairing: return "This link is for a different coordinator or member slot. Unlock your existing profile or use a link for its slot."
         case .configuration: return "LokiSigner couldn’t load its settings. Check your connection and try again."
+        case .testnetOnly: return "The LokiSigner wallet only supports testnet. This coordinator did not provide a testnet configuration."
         case .coordinatorOrigin: return "Enter the original coordinator’s HTTPS address, without a page or path, and try again."
         case .emptyPassphrase: return "Enter your local profile passphrase and try again."
         case .unlock: return "LokiSigner couldn’t unlock this profile. Check your passphrase and try again."

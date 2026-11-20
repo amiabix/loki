@@ -25,9 +25,9 @@ server ever holds a share.
   and fee it is about to sign, and anything that doesn't match is refused.
 - **The coordinator holds no keys**, it publishes the roster and relays messages, with no
   share, nonce or spend key, so it cannot sign anything on its own.
-- **Members only dial out**, all signing traffic goes through a
+- **Members only dial out for signing**, all signing traffic goes through a
   [`frostd`](https://github.com/ZcashFoundation/frost) relay that every party connects
-  to, so a member needs no open ports.
+  to. A native vault creator also needs a reachable HTTPS peer endpoint for setup.
 - **Nonces are single-use**, each signing nonce is claimed at two independent witness
   relays before it is used, so a restored or cloned device cannot sign twice with the same
   nonce.
@@ -37,7 +37,7 @@ server ever holds a share.
 | | Native | Browser |
 |---|---|---|
 | Where the share lives | On the member's machine, on macOS LokiSigner seals it under a Secure Enclave key | In the browser's private storage, sealed under a passkey or passphrase |
-| Approving a payment | A native dialog, with Face ID / Touch ID in LokiSigner | A signer page on its own origin, with a passkey prompt |
+| Approving a payment | A native dialog in LokiSigner. Touch ID unlocks the key; it does not approve the payment. | A signer page on its own origin, with a passkey prompt |
 
 The browser signer runs the same signer core compiled to WebAssembly, on a separate origin
 from the wallet, and whoever controls the site that serves it could capture the share.
@@ -55,6 +55,9 @@ A failed payment can be retried or cancelled, and since a retry spends the same 
 most one of them is ever mined.
 
 ## Try it
+
+On macOS, [build the LokiSigner Flutter app](apps/lokisigner/macos/README.md) to pair,
+set up a vault, and use a testnet wallet without a browser.
 
 Build the browser signer once, then run the wallet:
 
