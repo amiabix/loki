@@ -14,8 +14,9 @@ const cfg = await fetch("./config.json", { cache: "no-store" }).then((r) => r.js
 const wallet = cfg.walletOrigin;
 const rpId = cfg.rpId || location.hostname;
 const custodyPath = "/manage-custody";
+const paymentPath = "/approve-payment";
 const framed = window !== top;
-const embedded = framed && location.pathname !== custodyPath;
+const embedded = framed && location.pathname !== custodyPath && location.pathname !== paymentPath;
 const $ = (id) => document.getElementById(id);
 $("self-origin").textContent = location.origin;
 $("relay").textContent = `${cfg.frostdUrl || "none configured"} · nonce witnesses: ${cfg.nonceWitnesses?.map((w) => w.endpoint).join(", ") || "none (signing is refused)"}`;
@@ -27,7 +28,7 @@ class SignerError extends Error {
 // ─── one signer per storage partition ────────────────────────────────────────
 // The Worker holds exclusive OPFS handles and the crash-safe nonce store, so exactly one tab
 // may run it. This page holds a Web Lock for its lifetime; a second tab refuses every op
-// instead of racing the first over the same share and nonces. The custody tab never opens OPFS.
+// instead of racing the first over the same share and nonces. Top-level tabs never open OPFS.
 const owner = embedded && await new Promise((resolve) => {
   if (!navigator.locks) { resolve(false); return; }
   navigator.locks.request("loki-signer", { ifAvailable: true }, (lock) => {
@@ -407,20 +408,29 @@ function manageCustody() {
   } }]);
 }
 
-async function showCustodyControls() {
+async function connectToSignerFrame(cmd) {
+  if (!opener) return null;
   const { port1, port2 } = new MessageChannel();
   const context = await new Promise((resolve) => {
-    if (!opener) { resolve(null); return; }
     const timeout = setTimeout(() => resolve(null), 10000);
     port1.onmessage = ({ data }) => { clearTimeout(timeout); resolve(data); };
-    opener.postMessage({ cmd: "custody-connect" }, location.origin, [port2]);
+    opener.postMessage({ cmd }, location.origin, [port2]);
   });
   if (!context) {
     port1.close();
+    return null;
+  }
+  return { port: port1, context };
+}
+
+async function showCustodyControls() {
+  const connection = await connectToSignerFrame("custody-connect");
+  if (!connection) {
     void prompt("Signer controls unavailable", [el("p", { textContent: "Unlock the signer in your wallet and open signer controls from there. This tab does not access your wallet's stored shares." })], []);
     return;
   }
 
+  const { port: port1, context } = connection;
   const field = context.passkey ? null : passField("Passphrase", "current-password");
   const kept = el("input", { type: "checkbox" });
   const confirmed = await prompt("Remove the signer from this browser?", [
@@ -479,24 +489,92 @@ const asks = {
     } }]);
   },
 
-  // The terms the proposer announced, before this member sends its approval vote.
+  "payment-terms": (d) => openPaymentConsent("payment-terms", d),
+  "payment-sign": (d) => openPaymentConsent("payment-sign", d),
+};
+
+// This port belongs to one worker ask for one payment. Only the tab opened here can
+// connect; the wallet neither supplies the displayed details nor sees the answer.
+function openPaymentConsent(kind, details) {
+  const openedFor = current;
+  return prompt("Continue in the Loki signer tab", [
+    el("p", { textContent: `Review the payment in a separate tab. Check its address starts with ${location.origin}${paymentPath} before approving or entering any credentials.` }),
+  ], [{ ...cancelButton, value: null }, { label: "Open signer tab", abortable: true, run: (signal) => {
+    if (!openedFor || current !== openedFor) throw new SignerError("The signer session changed. Return to the wallet and try again.", 401);
+    const tab = window.open(paymentPath, "_blank");
+    if (!tab) throw new SignerError("Allow the signer to open a new tab and try again.", 400);
+    return new Promise((resolve, reject) => {
+      let port;
+      const finish = () => {
+        removeEventListener("message", connect);
+        signal.removeEventListener("abort", cancel);
+        clearInterval(closed);
+        clearTimeout(timeout);
+        port?.close();
+        tab.close();
+      };
+      const cancel = () => { finish(); resolve(null); };
+      const connect = (e) => {
+        if (e.source !== tab || e.origin !== location.origin || e.data?.cmd !== "payment-connect" || !e.ports[0]) return;
+        removeEventListener("message", connect);
+        clearTimeout(timeout);
+        if (current !== openedFor || tab.closed) { cancel(); return; }
+        port = e.ports[0];
+        port.onmessage = ({ data }) => {
+          if (current !== openedFor || tab.closed) { cancel(); return; }
+          finish();
+          resolve(data);
+        };
+        const passkey = openedFor.se === "passkey";
+        port.postMessage({ kind, details, passkey, credentialId: passkey ? rememberedCredential() : undefined });
+      };
+      addEventListener("message", connect);
+      signal.addEventListener("abort", cancel, { once: true });
+      const closed = setInterval(() => { if (tab.closed || current !== openedFor) cancel(); }, 500);
+      const timeout = setTimeout(() => {
+        finish();
+        reject(new SignerError("The signer tab could not connect. Allow tabs opened by the signer and try again.", 409));
+      }, 10000);
+    });
+  } }]);
+}
+
+// These prompts are only rendered by showPaymentConsent on the unframeable route.
+const paymentPrompts = {
   "payment-terms": (d) => prompt("Approve this payment request?", [
     facts([["To", d.recipient, true], ["Amount", zec(d.amount_zat)], ["Fee", zec(d.fee_zat)], ["Memo", d.memo || "(none)"],
-      ["Proposed by", `member ${d.proposer}`], ["Expires by height", d.expiry_height]]),
+      ["Proposed by", `member ${d.proposer}`], ["Expires by height", d.expiry_height],
+      ["Vault", d.vaultHex, true], ["Attempt", d.attemptHex, true]]),
     el("p", { textContent: "Nothing is signed yet: the transaction itself is checked against these terms before you sign." }),
   ], [{ label: "Decline", ghost: true, value: false }, { label: "Approve request", value: true }]),
 
   // The signer's OWN parse of the candidate transaction, after it matched the approved terms.
   // Signing needs a fresh passkey assertion (or the passphrase again).
-  "payment-sign": (d) => {
-    const field = reauthField();
+  "payment-sign": (d, { passkey, credentialId }) => {
+    const field = passkey ? null : passField("Passphrase", "current-password");
     return prompt("Sign this transaction?", [
       facts([["To", d.recipient_ua || d.recipient, true], ["Amount", zec(d.amount_zat)], ["Fee", `${zec(d.fee_zat)}${d.fee_verified ? "" : " (unverified)"}`],
-        ["Change", zec(d.change_zat)], ["Memo", d.memo_text || "(none)"], ["Expires at height", d.expiry_height], ["Sighash", d.sighash, true]]),
-      ...(field ? [el("label", { textContent: "Passphrase" }, field)] : []),
-    ], [{ label: "Decline", ghost: true, cancel: true, value: null }, { label: "Sign", abortable: true, run: (signal) => reauthValue(field, signal) }]);
+        ["Change", zec(d.change_zat)], ["Memo", d.memo_text || "(none)"], ["Expires at height", d.expiry_height],
+        ["Vault", d.vaultHex, true], ["Attempt", d.attemptHex, true], ["Sighash", d.sighash, true]]),
+      field ? el("label", { textContent: "Passphrase" }, field) : el("p", { textContent: `Verify with your passkey for ${rpId}.` }),
+    ], [{ label: "Decline", ghost: true, cancel: true, value: null }, { label: "Sign", abortable: true, run: async (signal) =>
+      field ? { method: "passphrase", passphrase: field.value } : { method: "platform", prfSecret: await prfSecret(credentialId, signal) },
+    }]);
   },
 };
+
+async function showPaymentConsent() {
+  const connection = await connectToSignerFrame("payment-connect");
+  if (!connection) {
+    void prompt("Payment review unavailable", [el("p", { textContent: "Return to the wallet and use the signer’s Open signer tab button to review a payment." })], []);
+    return;
+  }
+  const { port, context } = connection;
+  const value = await paymentPrompts[context.kind](context.details, context);
+  port.postMessage(value);
+  port.close();
+}
+
 async function answerAsk(d) {
   let reply;
   try { reply = { answer: d.ask, ok: true, value: await asks[d.kind](d.data) }; }
@@ -622,3 +700,4 @@ if (embedded) {
   } catch { failWorker(); }
 }
 if (!framed && location.pathname === custodyPath) void showCustodyControls();
+if (!framed && location.pathname === paymentPath) void showPaymentConsent();

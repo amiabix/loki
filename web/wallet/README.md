@@ -324,6 +324,12 @@ only to the signer frame that opened it, whose lock-owning worker verifies the c
 the shares from the wallet's actual storage partition. Use the wallet's recovery flow to restore
 from the saved words and backup.
 
+For browser payments, use **Open signer tab** and check that the separate tab's address is on
+the signer origin at `/approve-payment`. Review the request there if prompted. When the
+transaction is ready, open the signer tab to check the transaction details and verify with a passkey or
+passphrase. The wallet's embedded signer cannot approve the terms or collect the signing
+credential for a payment. Keep the wallet tab open while reviewing and signing.
+
 Before the first payment approval and after a witness identity changes, the signer asks for the
 [independently supplied witness fingerprint](../../core/signer-app/README.md#verify-the-witness-pair)
 and fresh passkey or passphrase verification. Get the fingerprint from the witness operators
