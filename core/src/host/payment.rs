@@ -2933,6 +2933,7 @@ mod tests {
             data: data.to_owned(),
             port: 0,
             bind: "127.0.0.1".parse().unwrap(),
+            peer_port: None,
             advertise_url: None,
             network: "testnet".into(),
             lightwalletd: None,
