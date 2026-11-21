@@ -127,7 +127,7 @@ final class SignerPresence: NSObject {
         self.lock = lock
         let anyInput = CGEventType(rawValue: UInt32.max)!
         timer = Timer(timeInterval: 5, repeats: true) { _ in
-            if CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: anyInput) >= 15 * 60 {
+            if Self.screenIsLocked || CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: anyInput) >= 15 * 60 {
                 lock()
             }
         }
@@ -143,9 +143,17 @@ final class SignerPresence: NSObject {
         RunLoop.main.add(timer, forMode: .modalPanel)
     }
 
+    private static var screenIsLocked: Bool {
+        // CoreGraphics reports the WindowServer session's lock bit; the distributed
+        // notification alone is not evidence, and this key is not a public constant.
+        let session = CGSessionCopyCurrentDictionary() as? [String: Any]
+        return session?["CGSSessionScreenIsLocked"] as? Bool == true
+    }
+
     @objc private func screenLocked(_ notification: Notification) {
+        guard Self.screenIsLocked else { return }
         if Thread.isMainThread { lock() }
-        else { DispatchQueue.main.async(execute: lock) }
+        else { RunLoop.main.perform(inModes: [.common, .modalPanel], block: lock) }
     }
 
     deinit {

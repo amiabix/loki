@@ -14,6 +14,7 @@
 //!   or its full path under `<data>/vaults`. Explicit input and export paths keep
 //!   their CLI meanings. The reply is `{"id":…,"ok":true,"result":…}` or
 //!   `{"id":…,"ok":false,"error":…}`, with the CLI's result and error strings.
+//!   Only scalar request IDs are echoed; missing or compound IDs yield `null`.
 //! * `{"op":"lock"}` or end of stdin stops the service: no new work is accepted,
 //!   commands in flight get [`STOP_GRACE`] to finish, then the session key cache and
 //!   the passphrase are zeroized and the process exits. A command still running then
@@ -80,40 +81,58 @@ fn wipe(value: &mut Value) {
     }
 }
 
-struct SensitiveFrame(serde_json::Map<String, Value>);
+struct SensitiveFrame(Value);
 
-impl Drop for SensitiveFrame {
-    fn drop(&mut self) {
-        for (mut name, mut value) in std::mem::take(&mut self.0) {
-            name.zeroize();
-            wipe(&mut value);
+impl SensitiveFrame {
+    fn parse(line: &str) -> Option<Self> {
+        let frame = Self(serde_json::from_str(line).ok()?);
+        frame.0.is_object().then_some(frame)
+    }
+
+    fn take_id(&mut self) -> Value {
+        match self.0.get_mut("id") {
+            Some(id @ (Value::Bool(_) | Value::Number(_) | Value::String(_))) => std::mem::take(id),
+            _ => Value::Null,
+        }
+    }
+
+    fn take_string(&mut self, name: &str) -> Option<String> {
+        match self.0.get_mut(name) {
+            Some(Value::String(text)) => Some(std::mem::take(text)),
+            _ => None,
         }
     }
 }
 
-fn take_string(frame: &mut serde_json::Map<String, Value>, name: &str) -> Option<String> {
-    match frame.remove(name) {
-        Some(Value::String(text)) => Some(text),
-        _ => None,
+impl Drop for SensitiveFrame {
+    fn drop(&mut self) {
+        wipe(&mut self.0);
     }
+}
+
+fn command_reply(id: Value, result: Result<Value, String>) -> Value {
+    let mut reply = json!({"ok":result.is_ok()});
+    reply["id"] = id;
+    match result {
+        Ok(result) => reply["result"] = result,
+        Err(error) => reply["error"] = Value::String(error),
+    }
+    reply
 }
 
 impl Service {
     /// Check an unlock frame against the profile and enable the session key cache.
     pub fn unlock(line: &str) -> Result<Self, String> {
-        let mut frame = match serde_json::from_str(line) {
-            Ok(Value::Object(frame)) => SensitiveFrame(frame),
-            _ => return Err("service_frame".into()),
-        };
-        let passphrase =
-            Zeroizing::new(take_string(&mut frame.0, "passphrase").unwrap_or_default());
+        let mut frame = SensitiveFrame::parse(line).ok_or("service_frame")?;
+        let passphrase = Zeroizing::new(frame.take_string("passphrase").unwrap_or_default());
         if frame.0.get("op").and_then(Value::as_str) != Some("unlock")
             || passphrase.is_empty()
             || passphrase.len() > 4096
         {
             return Err("service_frame".into());
         }
-        let data = PathBuf::from(take_string(&mut frame.0, "data").ok_or("service_frame")?);
+        let data = PathBuf::from(frame.take_string("data").ok_or("service_frame")?);
+        drop(frame);
         if !data.is_absolute() {
             return Err("service_frame".into());
         }
@@ -179,52 +198,54 @@ impl Service {
 
     /// Run one request frame and return its reply.
     pub fn handle(&self, line: &str) -> Value {
-        let mut frame = match serde_json::from_str(line) {
-            Ok(Value::Object(frame)) => SensitiveFrame(frame),
-            _ => return json!({"id":Value::Null,"ok":false,"error":"service_frame"}),
+        self.handle_frame(SensitiveFrame::parse(line))
+    }
+
+    fn handle_frame(&self, frame: Option<SensitiveFrame>) -> Value {
+        let Some(mut frame) = frame else {
+            return command_reply(Value::Null, Err("service_frame".into()));
         };
-        let id = frame.0.remove("id").unwrap_or(Value::Null);
-        let reply = |result: Result<Value, String>| match result {
-            Ok(result) => json!({"id":id,"ok":true,"result":result}),
-            Err(error) => json!({"id":id,"ok":false,"error":error}),
-        };
-        let op = frame
-            .0
-            .get("op")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        if !ALLOWED.contains(&op.as_str()) {
+        let id = frame.take_id();
+        let reply = |result| command_reply(id, result);
+        let op = frame.0["op"].as_str();
+        let Some(op) = ALLOWED.iter().copied().find(|&allowed| Some(allowed) == op) else {
             return reply(Err("service_command".into()));
-        }
-        let args = match frame.0.get("args") {
-            Some(Value::Array(args)) => args
-                .iter()
-                .map(|arg| arg.as_str().map(str::to_owned))
-                .collect::<Option<Vec<_>>>(),
-            _ => None,
         };
-        let Some(mut args) = args else {
+        let Some(raw_args) = frame.0.get_mut("args").and_then(Value::as_array_mut) else {
             return reply(Err("setup_arguments".into()));
         };
-        let needs_passphrase = !matches!(op.as_str(), "setup-config-check" | "setup-status");
+        let mut args = Zeroizing::new(Vec::with_capacity(raw_args.len()));
+        for arg in raw_args {
+            let Value::String(arg) = arg else {
+                return reply(Err("setup_arguments".into()));
+            };
+            args.push(std::mem::take(arg));
+        }
+        let needs_passphrase = !matches!(op, "setup-config-check" | "setup-status");
         if needs_passphrase && args.get(1).map(String::as_str) != Some("@session") {
             return reply(Err("setup_arguments".into()));
         }
-        let words = take_string(&mut frame.0, "words").map(Zeroizing::new);
-        let private = match take_string(&mut frame.0, "private_hex").map(Zeroizing::new) {
-            Some(text) => match hex::decode(text.as_bytes()) {
-                Ok(bytes) => Some(Zeroizing::new(bytes)),
-                Err(_) => return reply(Err("setup_file".into())),
-            },
+        let words = frame.take_string("words").map(Zeroizing::new);
+        let private = match frame.take_string("private_hex").map(Zeroizing::new) {
+            Some(text) => {
+                let mut bytes = Zeroizing::new(vec![0; text.len() / 2]);
+                if hex::decode_to_slice(text.as_bytes(), &mut bytes[..]).is_err() {
+                    return reply(Err("setup_file".into()));
+                }
+                Some(bytes)
+            }
             None => None,
         };
+        drop(frame);
         if op != "setup-config-check" {
             let Some(root) = args.first_mut() else {
                 return reply(Err("setup_arguments".into()));
             };
             match self.vault_root(root, op == "setup-join") {
-                Ok(path) => *root = path,
+                Ok(path) => {
+                    root.zeroize();
+                    *root = path;
+                }
                 Err(error) => return reply(Err(error)),
             }
         }
@@ -234,12 +255,16 @@ impl Service {
             words,
         };
         reply(if op.starts_with("setup-backup-") {
-            backup_command_with(&op, &args, &inputs).map(|output| match output {
-                BackupCommandOutput::Words(words) => json!({"words":words.as_str()}),
+            backup_command_with(op, &args, &inputs).map(|output| match output {
+                BackupCommandOutput::Words(mut words) => {
+                    let mut result = json!({});
+                    result["words"] = Value::String(std::mem::take(&mut *words));
+                    result
+                }
                 BackupCommandOutput::Public(status) => status,
             })
         } else {
-            command_with(&op, &args, &inputs)
+            command_with(op, &args, &inputs)
         })
     }
 }
@@ -293,31 +318,24 @@ pub fn serve(mut input: impl BufRead, output: Box<dyn Write + Send>) -> Result<(
     write_frame(&output, json!({"unlocked":true}));
     let running = Arc::new((Mutex::new(0usize), Condvar::new()));
     while let Some(line) = read_frame(&mut input) {
-        if serde_json::from_str::<Value>(&line)
-            .ok()
-            .and_then(|frame| frame.get("op").and_then(Value::as_str).map(str::to_owned))
-            .as_deref()
-            == Some("lock")
-        {
+        let mut frame = SensitiveFrame::parse(&line);
+        drop(line);
+        if frame.as_ref().and_then(|f| f.0["op"].as_str()) == Some("lock") {
             break;
         }
         {
             let mut count = running.0.lock().map_err(|_| "service_state")?;
             if *count >= MAX_IN_FLIGHT {
-                let id = serde_json::from_str::<Value>(&line)
-                    .ok()
-                    .and_then(|frame| frame.get("id").cloned())
-                    .unwrap_or(Value::Null);
-                write_frame(&output, json!({"id":id,"ok":false,"error":"service_busy"}));
+                let id = frame.as_mut().map_or(Value::Null, SensitiveFrame::take_id);
+                drop(frame);
+                write_frame(&output, command_reply(id, Err("service_busy".into())));
                 continue;
             }
             *count += 1;
         }
         let (service, output, running) = (service.clone(), output.clone(), running.clone());
         std::thread::spawn(move || {
-            let reply = service.handle(&line);
-            drop(line);
-            write_frame(&output, reply);
+            write_frame(&output, service.handle_frame(frame));
             if let Ok(mut count) = running.0.lock() {
                 *count -= 1;
                 running.1.notify_all();

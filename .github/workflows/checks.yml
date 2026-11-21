@@ -17,18 +17,34 @@ jobs:
         with:
           persist-credentials: false
       - name: Reject committed member secrets
+        shell: bash
+        env:
+          LC_ALL: C
         run: |
-          if git ls-files | grep -E '(^|/)(passphrase|[^/]+\.passphrase|profile\.sealed|vault\.card|wallet\.sqlite(-wal|-shm|-journal)?|\.unlock-[^/]*)$'; then
-            echo 'Member secrets must not be committed.' >&2
-            exit 1
-          fi
+          git ls-files -z | while IFS= read -r -d '' path; do
+            case "${path##*/}" in
+              passphrase|?*.passphrase|profile.sealed|vault.card|wallet.sqlite|wallet.sqlite-wal|wallet.sqlite-shm|wallet.sqlite-journal|.unlock-*)
+                printf 'Member secrets must not be committed: %q\n' "$path" >&2
+                exit 1
+                ;;
+            esac
+          done
       - name: Check secret ignore patterns
         run: |
           for candidate in member/passphrase member/operator.passphrase member/profile/profile.sealed member/card/vault.card member/wallet.sqlite member/wallet.sqlite-wal member/wallet.sqlite-shm member/wallet.sqlite-journal member/.unlock-test; do
-            git check-ignore -q --no-index "$candidate"
+            if ! git check-ignore -q --no-index "$candidate"; then
+              printf 'Expected Git to ignore %s\n' "$candidate" >&2
+              exit 1
+            fi
           done
           for candidate in communication/client/tests/fixtures/hosted-tls/server-key.pem core/tests/zip2005_keys.rs web/wallet/tests/registration.test.mjs; do
-            ! git check-ignore -q --no-index "$candidate"
+            status=0
+            git check-ignore -q --no-index "$candidate" || status=$?
+            case "$status" in
+              1) ;;
+              0) printf 'Git unexpectedly ignores %s\n' "$candidate" >&2; exit 1 ;;
+              *) printf 'git check-ignore failed for %s (status %s)\n' "$candidate" "$status" >&2; exit "$status" ;;
+            esac
           done
 
   rust:
