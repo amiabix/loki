@@ -15,8 +15,9 @@ const wallet = cfg.walletOrigin;
 const rpId = cfg.rpId || location.hostname;
 const custodyPath = "/manage-custody";
 const paymentPath = "/approve-payment";
+const receivePath = "/receive-address";
 const framed = window !== top;
-const embedded = framed && location.pathname !== custodyPath && location.pathname !== paymentPath;
+const embedded = framed && ![custodyPath, paymentPath, receivePath].includes(location.pathname);
 const $ = (id) => document.getElementById(id);
 $("self-origin").textContent = location.origin;
 $("relay").textContent = `${cfg.frostdUrl || "none configured"} · nonce witnesses: ${cfg.nonceWitnesses?.map((w) => w.endpoint).join(", ") || "none (signing is refused)"}`;
@@ -458,6 +459,61 @@ async function showCustodyControls() {
   void prompt("Signer removed", [el("p", { textContent: "This wallet's local shares were removed. Return to the wallet to restore from a recovery backup." })], []);
 }
 
+// The locked-down tab cannot read the wallet's storage partition. Send only the public
+// derivation from this frame's unlocked worker, and never accept operations on the port.
+async function openReceiveAddress(payment) {
+  const receive = await call({ op: "address", payment });
+  return prompt("Verify receive address", [
+    el("p", { textContent: `Open the read-only address in a separate tab. Check that the address bar shows ${location.origin} before copying.` }),
+  ], [{ ...cancelButton, value: null }, { label: "Open signer address", run: () => {
+    const tab = window.open(receivePath, "_blank");
+    if (!tab) throw new SignerError("Allow the signer to open a new tab and try again.", 400);
+    return new Promise((resolve, reject) => {
+      const wait = new AbortController();
+      const timeout = setTimeout(() => {
+        wait.abort();
+        tab.close();
+        reject(new SignerError("The signer tab could not connect. Try again.", 409));
+      }, 10000);
+      addEventListener("message", (e) => {
+        if (e.source !== tab || e.origin !== location.origin || e.data?.cmd !== "receive-connect" || !e.ports[0]) return;
+        clearTimeout(timeout);
+        wait.abort();
+        e.ports[0].postMessage(receive);
+        e.ports[0].close();
+        resolve(null);
+      }, { signal: wait.signal });
+    });
+  } }]);
+}
+
+async function showReceiveAddress() {
+  document.title = "Vault receive address · Loki signer";
+  const connection = await connectToSignerFrame("receive-connect");
+  window.opener = null;
+  if (!connection) {
+    void prompt("Receive address unavailable", [el("p", { textContent: "Unlock the signer in your wallet, select a vault, then choose Verify on signer." })], []);
+    return;
+  }
+  connection.port.close();
+  const { vault, network, address } = connection.context;
+  void prompt("Vault receive address", [
+    facts([["Vault ID", vault, true], ["Network", network], ["Address", address, true]]),
+    el("p", { textContent: "Copy from this tab, or compare the full vault ID and address before sharing the address shown in the wallet." }),
+  ], []);
+  const copy = el("button", { textContent: "Copy receive address", onclick: async () => {
+    try {
+      await navigator.clipboard.writeText(address);
+      $("error").textContent = "";
+      copy.textContent = "Copied";
+    } catch {
+      copy.textContent = "Copy receive address";
+      $("error").textContent = "Copy failed. Select the address above to copy it manually.";
+    }
+  } });
+  $("actions").append(copy);
+}
+
 // ─── Worker asks: on-device decisions ────────────────────────────────────────
 const zec = (zat) => `${(Number(zat) / 1e8).toFixed(8)} TAZ`;
 const asks = {
@@ -659,7 +715,8 @@ const ops = {
   "payment-approve": (p) => call({ op: "payment-approve", payment: relay(p) }),
   pending: (p) => call({ op: "pending", payment: { ...relay(p), lightwalletdGrpcWeb: cfg.lightwalletdGrpcWebUrl } }),
   vaults: () => call({ op: "vaults" }),
-  address: (p) => call({ op: "address", payment: p }),
+  address: async (p) => (await call({ op: "address", payment: p })).address,
+  "verify-address": openReceiveAddress,
   chain: (p) => call({ op: "chain", payment: { ...p, lightwalletdGrpcWeb: cfg.lightwalletdGrpcWebUrl } }),
   "payment-status": (p) => call({ op: "payment-status", payment: { ...relay(p), lightwalletdGrpcWeb: cfg.lightwalletdGrpcWebUrl } }),
   "recovery-setup": recoverySetup,
@@ -668,10 +725,10 @@ const ops = {
   restore,
   "manage-custody": manageCustody,
 };
-const UNLOCKED = new Set(["join", "payment-review", "payment-approve", "pending", "vaults", "address", "chain", "payment-status", "recovery-setup", "recovery-export", "recovery-status", "manage-custody"]);
+const UNLOCKED = new Set(["join", "payment-review", "payment-approve", "pending", "vaults", "address", "verify-address", "chain", "payment-status", "recovery-setup", "recovery-export", "recovery-status", "manage-custody"]);
 // Ops that may show a prompt run one at a time; the read-only ones answer alongside them
 // (the Worker refuses them with "busy" while a join or payment holds the vault).
-const PROMPTING = new Set(["create", "unlock", "join", "payment-approve", "recovery-setup", "recovery-export", "restore", "manage-custody"]);
+const PROMPTING = new Set(["create", "unlock", "join", "verify-address", "payment-approve", "recovery-setup", "recovery-export", "restore", "manage-custody"]);
 
 let queue = Promise.resolve(); // one op (and so one prompt) at a time
 addEventListener("message", (e) => {
@@ -701,3 +758,4 @@ if (embedded) {
 }
 if (!framed && location.pathname === custodyPath) void showCustodyControls();
 if (!framed && location.pathname === paymentPath) void showPaymentConsent();
+if (!framed && location.pathname === receivePath) void showReceiveAddress();

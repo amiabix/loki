@@ -114,7 +114,7 @@ function signerOrigin(): string {
 const SEALED = "loki_signer_sealed"; // localStorage: a share exists in this browser (first-paint hint only)
 // Setup and signing can include several minutes of ceremony or user interaction. Chain reads
 // can also take longer on the first scan and resume from their last saved batch.
-const LONG_CALLS = new Set(["create", "unlock", "join", "payment-approve", "recovery-setup", "recovery-export", "restore", "remove", "chain", "payment-status"]);
+const LONG_CALLS = new Set(["create", "unlock", "join", "verify-address", "payment-approve", "recovery-setup", "recovery-export", "restore", "remove", "chain", "payment-status"]);
 
 let grant: string | undefined;
 export function onboardingGrant(): string | undefined {
@@ -235,6 +235,7 @@ function browserSigner(origin: string): SignerModule {
       if (path === "pending") return { pending: await call("pending", payment) } as T;
       if (path === "payment-review" || path === "payment-approve") return call<T>(path, payment);
       if (path === "address") return { address: await call<string>("address", payment) } as T;
+      if (path === "verify-address") return call<T>(path, payment);
       if (path === "balance" || path === "payments") {
         const scan = await call<{ balance_zat: string; history: ChainTx[]; chain_trust: "provider_reported" }>("chain", payment);
         return (path === "balance"
