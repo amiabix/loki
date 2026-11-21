@@ -399,7 +399,7 @@ const ops = {
   has: () => call({ op: "has" }),
   status: () => {
     if (!current) throw new SignerError("Unlock your signer", 401);
-    return { ...current, persisted, relay: cfg.frostdUrl, origin: location.origin };
+    return { ...current, persisted, relay: cfg.frostdUrl, network: cfg.network, origin: location.origin };
   },
   create,
   unlock,

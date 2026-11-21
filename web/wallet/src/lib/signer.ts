@@ -178,12 +178,12 @@ function browserSigner(origin: string): SignerModule {
       const [path, query] = pathAndQuery.split("?");
       const args = { ...Object.fromEntries(new URLSearchParams(query ?? "")), ...(body as object) } as { vault?: string; attempt?: string };
       if (path === "status") {
-        const s = await call<{ profile: { id: string; name: string }; se: string; persisted: boolean | null; relay: string }>("status");
+        const s = await call<{ profile: { id: string; name: string }; se: string; persisted: boolean | null; relay: string; network: "testnet" | "regtest" }>("status");
         // The signer's own vaults (OPFS). Refused while a join/payment holds the signer; the
         // next status poll fills them in.
         const vaults = await call<{ vault: string; active: boolean }[]>("vaults").catch(() => undefined);
         if (args.vault) return browserVaultStatus(vaults, args.vault) as T;
-        return { phase: "home", network: "testnet", secure_element: s.se, profile: s.profile, persisted: s.persisted, relay: s.relay, vaults } as T;
+        return { phase: "home", network: s.network, secure_element: s.se, profile: s.profile, persisted: s.persisted, relay: s.relay, vaults } as T;
       }
       if (path === "lock") { await this.lock(); return {} as T; }
       // Join a vault (enroll → roster → agree → session → DKG). The member confirms every member

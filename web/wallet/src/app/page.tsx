@@ -173,7 +173,7 @@ export default function App() {
   ) : <Splash sub="Connecting…" />}</FullScreen>;
   if (!authed) return <Login notice={sessionError} onLoggedIn={() => { setAuthed(true); refreshStatus(); }} />;
 
-  const network = status?.network ?? "testnet";
+  const network = status?.network;
   const profile = status?.profile;
 
   return (
@@ -194,9 +194,11 @@ export default function App() {
               <span className="max-w-40 truncate" title={profile.name}>{profile.name}</span>
             </span>
           )}
-          <span className="eyebrow shrink-0 rounded-full border px-3 py-1" style={{ borderColor: "var(--border)" }}>
-            {network}
-          </span>
+          {network && (
+            <span className="eyebrow shrink-0 rounded-full border px-3 py-1" style={{ borderColor: "var(--border)" }}>
+              {network}
+            </span>
+          )}
           <ThemeToggle />
           <button onClick={signOut} className="min-h-11 shrink-0 px-1 text-muted transition hover:text-danger">
             Log out
@@ -1937,6 +1939,8 @@ function RecoveryCard({ vault }: { vault: string }) {
 
 // ─── send ─────────────────────────────────────────────────────────────────────
 
+type DraftQuote = { attempt: string; fee_zat: string; change_zat: string };
+
 function Send({
   vault,
   onBack,
@@ -1949,29 +1953,37 @@ function Send({
   const [recipient, setRecipient] = useState("");
   const [amountTaz, setAmountTaz] = useState("");
   const [memo, setMemo] = useState("");
-  const [draft, setDraft] = useState<{ attempt: string; fee_zat: string; change_zat: string } | null>(null);
+  const [draft, setDraft] = useState<(DraftQuote & { terms: Readonly<{ vault: string; recipient: string; amount_zat: string; memo: string }> }) | null>(null);
+  const termsVersion = useRef(0);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
+  const invalidateDraft = () => {
+    termsVersion.current++;
+    setDraft(null);
+    setErr(null);
+  };
+
   const prepareDraft = async () => {
+    const version = termsVersion.current;
     setBusy(true); setErr(null);
     try {
       const taz = parseFloat(amountTaz);
       if (!Number.isFinite(taz) || taz <= 0) throw new Error("Enter a valid amount in TAZ.");
       const amount_zat = String(Math.round(taz * 1e8));
-      const res = await api<{ attempt: string; fee_zat: string; change_zat: string }>(
-        "payment-draft", { vault: vault.vault, recipient, amount_zat, memo }
-      );
-      setDraft(res);
-    } catch (e) { setErr((e as Error).message); }
-    finally { setBusy(false); }
+      const terms = { vault: vault.vault, recipient, amount_zat, memo };
+      const quote = await api<DraftQuote>("payment-draft", terms);
+      if (version === termsVersion.current) setDraft({ ...quote, terms });
+    } catch (e) {
+      if (version === termsVersion.current) setErr((e as Error).message);
+    } finally { setBusy(false); }
   };
 
   const publish = async () => {
     if (!draft) return;
     setBusy(true); setErr(null);
     try {
-      await api("payment-publish", { vault: vault.vault, attempt: draft.attempt });
+      await api("payment-publish", { vault: draft.terms.vault, attempt: draft.attempt });
       onDraft(draft.attempt);
     } catch (e) { setErr((e as Error).message); }
     finally { setBusy(false); }
@@ -1987,7 +1999,7 @@ function Send({
           <input
             placeholder="Recipient address"
             value={recipient}
-            onChange={(e) => { setRecipient(e.target.value); setDraft(null); }}
+            onChange={(e) => { setRecipient(e.target.value); invalidateDraft(); }}
             className="glass mt-1.5 w-full rounded-full px-5 py-3 font-mono outline-none"
           />
         </label>
@@ -1999,7 +2011,7 @@ function Send({
             step="0.00000001"
             min="0"
             value={amountTaz}
-            onChange={(e) => { setAmountTaz(e.target.value); setDraft(null); }}
+            onChange={(e) => { setAmountTaz(e.target.value); invalidateDraft(); }}
             className="glass mt-1.5 w-full rounded-full px-5 py-3 font-mono outline-none"
           />
         </label>
@@ -2008,7 +2020,7 @@ function Send({
           <input
             placeholder="Memo (optional)"
             value={memo}
-            onChange={(e) => { setMemo(e.target.value); setDraft(null); }}
+            onChange={(e) => { setMemo(e.target.value); invalidateDraft(); }}
             className="glass mt-1.5 w-full rounded-full px-5 py-3 outline-none"
           />
         </label>
@@ -2017,10 +2029,11 @@ function Send({
       {draft && (
         <GlassCard className="mb-4">
           <h3 className="eyebrow mb-3">Transaction summary</h3>
-          <Row label="Recipient" value={short(recipient, 14, 10)} mono />
-          <Row label="Amount" value={`${amountTaz} TAZ`} mono />
+          <Row label="Recipient" value={short(draft.terms.recipient, 14, 10)} mono />
+          <Row label="Amount" value={`${zatToTaz(draft.terms.amount_zat)} TAZ`} mono />
           <Row label="Fee" value={`${zatToTaz(draft.fee_zat)} TAZ`} mono />
           <Row label="Change" value={`${zatToTaz(draft.change_zat)} TAZ`} mono />
+          {draft.terms.memo && <Row label="Memo" value={<span className="whitespace-pre-wrap">{draft.terms.memo}</span>} />}
         </GlassCard>
       )}
 
