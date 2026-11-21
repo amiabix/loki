@@ -46,7 +46,7 @@ use crate::{
     tx_finalize::{finalized_sighash, prove},
     vault,
     verify::{check_candidate, Expectations, Refusal},
-    wallet_store::{lightwalletd_endpoint, Lightwalletd, VaultWallet},
+    wallet_store::{lightwalletd_endpoint, Lightwalletd, VaultWallet, PROVIDER_REPORTED},
     zip2005,
 };
 
@@ -384,7 +384,7 @@ fn wallet(
         &birthday,
         pass,
     )?;
-    rt.block_on(w.sync(&mut client))?;
+    rt.block_on(w.sync_from_provider(&mut client, &birthday, url))?;
     Ok((w, client, rt))
 }
 fn relay(identity: &Identity, url: &str) -> Result<FrostdTransport, String> {
@@ -1085,7 +1085,7 @@ pub(super) async fn balance(State(st): State<Shared>, Json(body): Json<Value>) -
         let mode = if body["retry_touch_id"].as_bool() == Some(true) { VaultOpen::Retry } else { VaultOpen::Read };
         let v = load_vault_for_view(&st, &data, &pass, vault, mode)?;
         let (w, _, _) = wallet(&data, &pass, vault, &v, url(&st)?)?;
-        Ok(json!({"balance_zat": w.ironwood_balance_zat()?}))
+        Ok(json!({"balance_zat": w.ironwood_balance_zat()?, "chain_trust": PROVIDER_REPORTED}))
     })
     .await
 }
@@ -2480,7 +2480,7 @@ pub(super) async fn payments(
                 "error": p.error,
             }));
         }
-        Ok(json!({"payments":out}))
+        Ok(json!({"payments":out, "chain_trust": PROVIDER_REPORTED}))
     }).await
 }
 
@@ -2570,6 +2570,7 @@ pub(super) async fn status(
         let p = read_payment(&data, &pass, &vault, &attempt)?;
         Ok(json!({
             "phase": p.phase,
+            "chain_trust": PROVIDER_REPORTED,
             "approvals":p.approvals,"error":p.error,"approval_requested":p.approval_requested,
             "signatures_received": p.signed_pczt.is_some() || p.raw_tx.is_some() || matches!(p.phase.as_str(), "signed" | "broadcast" | "confirmed"),
             "txid": p.txid, "replaces": p.replaces, "replaced_by": p.replaced_by,

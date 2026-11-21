@@ -258,16 +258,24 @@ async function openVaultAny(signer, vaultHex) {
   return JSON.parse(signer.vaultOpen(vaultHex));
 }
 
-// The vault's balance and history from the chain itself: lightwalletd compact blocks from the
-// vault's birth (or the last block this Worker scanned) to the tip, trial-decrypted in wasm
-// (loki-signer-core chain_scan.rs). Nothing here comes from other members.
+// Trial decryption and checkpoint matching only establish what the configured provider reported.
 async function chainScan(signer, p) {
-  if (!p.lightwalletdGrpcWeb) throw new Error("This signer has no lightwalletd gRPC-web endpoint configured, so it cannot read the chain");
+  const source = p.lightwalletdGrpcWeb;
+  if (!source) throw new Error("This signer has no lightwalletd gRPC-web endpoint configured, so it cannot read the chain");
   await openVault(signer, p.vaultHex);
-  const tip = await latestHeight(p.lightwalletdGrpcWeb);
-  // Resumes from the sealed state the last scan saved (scanSave after each batch). A block that
-  // does not extend the saved tip means the chain reorganized: rescan once from the vault birth.
-  // ponytail: full rescan on any reorg; roll back a few blocks if vaults get old.
+  const tip = await latestHeight(source);
+  const matchesCheckpoint = async (height) => {
+    const blocks = await blockRange(source, height, height);
+    if (blocks.length !== 1) throw new Error("lightwalletd did not return exactly one checkpoint block");
+    return signer.scanMatchesCheckpoint(blocks[0]);
+  };
+  const saved = signer.scanStart(source);
+  let checkedTip = false;
+  if (saved != null) {
+    if (saved > tip || !(await matchesCheckpoint(saved))) signer.scanReset();
+    else checkedTip = saved === tip;
+  }
+  // A reorg may also happen after the checkpoint read. Retry once from vault birth.
   for (let rescanned = false; ;) {
     try {
       for (let next = signer.scanNext(); next <= tip; next = signer.scanNext()) {
@@ -281,7 +289,11 @@ async function chainScan(signer, p) {
       signer.scanReset();
     }
   }
-  return { tip, ...JSON.parse(signer.scanResult()) };
+  const result = JSON.parse(signer.scanResult());
+  if (result.height !== tip || (!checkedTip && !(await matchesCheckpoint(tip)))) {
+    throw new Error("lightwalletd did not provide a consistent scan through its reported tip; retry sync");
+  }
+  return { tip, ...result, chain_trust: "provider_reported" };
 }
 
 // A payment's status for the wallet: its terms and signing group from the proposer's notices,
@@ -294,9 +306,9 @@ async function paymentStatus(signer, p) {
   checkTerms(terms);
   const ended = notices.find((n) => n.kind === "cancelled" || n.kind === "failed")?.kind ?? null;
   const signers = notices.find((n) => n.kind === "start" && n.intent.signers?.length)?.intent.signers ?? [];
-  await chainScan(signer, p);
+  const { chain_trust } = await chainScan(signer, p);
   const spent = JSON.parse(signer.scanSpentBy(terms.note_selection[0]));
-  return { terms, signers, ended, spent };
+  return { terms, signers, ended, spent, chain_trust };
 }
 
 // The terms a proposer announced for this payment, read-only: nothing is approved or sent.

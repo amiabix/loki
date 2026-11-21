@@ -38,6 +38,7 @@ use zcash_client_sqlite::{
     ReceivedNoteId, WalletDb, util::SystemClock, wallet::init::init_wallet_db,
 };
 use zcash_keys::keys::UnifiedFullViewingKey;
+use zcash_primitives::block::BlockHash;
 use zcash_primitives::transaction::TxId;
 use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::{PoolType, ShieldedPool, memo::MemoBytes, value::Zatoshis};
@@ -45,7 +46,7 @@ use zeroize::Zeroizing;
 use zip321::{Payment, TransactionRequest};
 
 use crate::{member_state::MemberState, network::VaultNetwork};
-use zcash_client_backend::proto::service::{BlockId, Empty};
+use zcash_client_backend::proto::service::{BlockId, ChainSpec, Empty};
 use zcash_protocol::consensus::Parameters;
 
 type Database = WalletDb<Connection, VaultNetwork, SystemClock, UnwrapErr<SysRng>>;
@@ -204,6 +205,32 @@ pub fn lightwalletd_endpoint(url: &str) -> Result<tonic::transport::Endpoint, St
 
 pub type Lightwalletd = zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient<tonic::transport::Channel>;
 
+/// Agreement with the configured lightwalletd is not independent chain verification.
+pub const PROVIDER_REPORTED: &str = "provider_reported";
+
+async fn provider_tip(client: &mut Lightwalletd) -> Result<BlockHeight, String> {
+    client
+        .get_latest_block(ChainSpec {})
+        .await
+        .map_err(|e| format!("read lightwalletd tip: {e}"))?
+        .into_inner()
+        .height
+        .try_into()
+        .map_err(|_| "lightwalletd tip height out of range".into())
+}
+
+async fn provider_block_hash(client: &mut Lightwalletd, height: BlockHeight) -> Result<BlockHash, String> {
+    let block = client
+        .get_block(BlockId { height: u64::from(height), hash: vec![] })
+        .await
+        .map_err(|e| format!("read lightwalletd block at {height}: {e}"))?
+        .into_inner();
+    if block.height != u64::from(height) || block.hash.len() != 32 {
+        return Err(format!("lightwalletd returned an invalid checkpoint at {height}"));
+    }
+    Ok(block.hash())
+}
+
 /// The lightwalletd a member syncs from: `LOKI_LIGHTWALLETD`, or on regtest the one THS runs
 /// beside the `LOKI_RPC` node (THS shifts RPC 18232 and lightwalletd 9067 by one offset).
 pub fn lightwalletd_url(network: VaultNetwork) -> Option<String> {
@@ -265,12 +292,12 @@ pub async fn sync_member_wallet(
         &birthday,
         passphrase,
     )?;
-    wallet.sync(&mut client).await?;
+    wallet.sync_from_provider(&mut client, &birthday, url).await?;
     Ok((wallet, client))
 }
 
 impl VaultWallet {
-    pub async fn sync(&mut self, client: &mut Lightwalletd) -> Result<(), String> {
+    async fn sync(&mut self, client: &mut Lightwalletd) -> Result<(), String> {
         zcash_client_backend::sync::run(
             client,
             &self.network,
@@ -279,8 +306,7 @@ impl VaultWallet {
             100,
         )
         .await
-        .map_err(|e| format!("sync wallet: {e}"))?;
-        self.release_confirmed_reservations()
+        .map_err(|e| format!("sync wallet: {e}"))
     }
 
     pub fn open(
@@ -352,6 +378,12 @@ impl VaultWallet {
         })
         .optional()
         .map_err(|e| format!("wrong wallet passphrase or damaged database: {e}"))?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS ext_loki_chain_source (
+                id INTEGER PRIMARY KEY CHECK (id = 0), fingerprint TEXT NOT NULL
+            )",
+        )
+        .map_err(|e| format!("initialize wallet chain source: {e}"))?;
         rusqlite::vtab::array::load_module(&conn)
             .map_err(|e| format!("initialize wallet array queries: {e}"))?;
 
@@ -468,6 +500,67 @@ impl VaultWallet {
             .map_err(|e| format!("read scanned block hash: {e}"))?
             .map(|hash| hash.to_string())
             .ok_or_else(|| "wallet has no hash for its scanned height".into())
+    }
+
+    pub async fn sync_from_provider(
+        &mut self,
+        client: &mut Lightwalletd,
+        birthday: &AccountBirthday,
+        url: &str,
+    ) -> Result<(), String> {
+        let tip = provider_tip(client).await?;
+        if tip < birthday.height() {
+            return Err("lightwalletd tip is below this vault's birth".into());
+        }
+        let source = blake3::hash(url.as_bytes()).to_hex().to_string();
+        let matches_source = self.db.transactionally_with_extension(|_, ext| {
+            let saved = ext.query_row(
+                "SELECT fingerprint FROM ext_loki_chain_source WHERE id = 0",
+                [],
+                |row| row.get::<_, String>(0),
+            ).optional()?;
+            Ok::<_, rusqlite::Error>(saved.as_deref() == Some(source.as_str()))
+        }).map_err(|e| format!("read wallet chain source: {e}"))?;
+
+        let saved = self.db.get_max_height_hash()
+            .map_err(|e| format!("read wallet scan checkpoint: {e}"))?;
+        let rewind = match saved {
+            // Legacy or different provider: matching block hashes would not vouch for the
+            // compact transactions the old provider supplied. Rescan from the vault birth.
+            Some(_) if !matches_source => true,
+            Some((height, _)) if height > tip => true,
+            Some((height, hash)) => provider_block_hash(client, height).await? != hash,
+            None => false,
+        };
+        if rewind || !matches_source {
+            use zcash_client_sqlite::error::SqliteClientError;
+            self.db.transactionally_with_extension(|db, ext| {
+                if rewind {
+                    db.truncate_to_chain_state(birthday.prior_chain_state().clone())?;
+                }
+                ext.execute(
+                    "INSERT OR REPLACE INTO ext_loki_chain_source (id, fingerprint) VALUES (0, ?1)",
+                    [&source],
+                )?;
+                Ok::<_, SqliteClientError>(())
+            }).map_err(|e| format!("prepare wallet rescan without replacing the database: {e}"))?;
+        }
+
+        self.sync(client).await?;
+        let scanned = self.db.block_fully_scanned()
+            .map_err(|e| format!("read fully scanned block: {e}"))?
+            .ok_or("wallet did not scan any blocks")?;
+        let height = scanned.block_height();
+        let target = self.db.chain_height().map_err(|e| format!("read wallet scan target: {e}"))?;
+        if target != Some(height) {
+            return Err("wallet has not fully scanned the reported chain tip".into());
+        }
+        if height > provider_tip(client).await?
+            || provider_block_hash(client, height).await? != scanned.block_hash()
+        {
+            return Err("lightwalletd chain changed during the scan; retry sync".into());
+        }
+        self.release_confirmed_reservations()
     }
 
     pub fn mined_height(&self, txid: TxId) -> Result<Option<BlockHeight>, String> {

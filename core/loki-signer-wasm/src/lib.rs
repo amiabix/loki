@@ -602,6 +602,24 @@ impl Signer {
         self.scan_next_impl().map_err(|e| JsError::new(&e))
     }
 
+    /// Resume only a scan built against this configured provider, returning its saved height.
+    #[wasm_bindgen(js_name = scanStart)]
+    pub fn scan_start(&mut self, source: &str) -> Result<Option<u32>, JsError> {
+        self.scan_next()?;
+        let birth = self.vault.as_ref().and_then(|vs| vs.signer.confirmed_roster())
+            .ok_or_else(|| JsError::new("this vault has no confirmed roster"))?
+            .birth_height.unwrap_or(1);
+        let (_, scan) = self.scan.as_mut().ok_or_else(|| JsError::new("call scanNext first"))?;
+        scan.use_source(source, birth);
+        Ok(scan.height())
+    }
+
+    #[wasm_bindgen(js_name = scanMatchesCheckpoint)]
+    pub fn scan_matches_checkpoint(&self, block: &[u8]) -> Result<bool, JsError> {
+        let (_, scan) = self.scan.as_ref().ok_or_else(|| JsError::new("call scanNext first"))?;
+        scan.matches_checkpoint(block).map_err(|e| JsError::new(&e))
+    }
+
     /// Scan the next compact block (protobuf bytes from lightwalletd's `GetBlockRange`).
     #[wasm_bindgen(js_name = scanBlock)]
     pub fn scan_block(&mut self, block: &[u8]) -> Result<(), JsError> {
@@ -616,13 +634,11 @@ impl Signer {
         self.scan_save_impl().map_err(|e| JsError::new(&e))
     }
 
-    /// Forget the scan state (memory and OPFS); the next `scanNext` starts at the vault birth.
-    /// For a chain that no longer extends the saved tip (a reorganization).
+    /// Restart from vault birth without deleting the persisted snapshot before a replacement.
     #[wasm_bindgen(js_name = scanReset)]
     pub fn scan_reset(&mut self) -> Result<(), JsError> {
-        if let Some((id, _)) = self.scan.take() {
-            opfs_put(&scan_path(&id), &[], false).map_err(|e| JsError::new(&e))?;
-        }
+        let (_, scan) = self.scan.as_mut().ok_or_else(|| JsError::new("call scanNext first"))?;
+        scan.reset();
         Ok(())
     }
 
@@ -1293,7 +1309,6 @@ impl Signer {
             let (_, fvk) = vs.signer.hosted_metadata().map_err(|e| e.to_string())?;
             let birth = roster.birth_height.unwrap_or(1);
             // Resume from this browser's sealed scan state, if a scan ran before.
-            // An empty file is a scan never saved, or reset (`scanReset`).
             let saved = opfs_get(&scan_path(&vs.vref.vault_id))?.filter(|b| !b.is_empty());
             let scan = match saved {
                 Some(sealed) => {
