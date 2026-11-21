@@ -2519,8 +2519,21 @@ mod tests {
         std::fs::remove_dir_all(&data).unwrap();
     }
 
+    fn setup_recovery_locally(data: &Path, pass: &str) -> String {
+        let words = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let displayed = words.clone();
+        let notice: crate::host::LocalNotice = std::sync::Arc::new(move |_, phrase| {
+            *displayed.lock().unwrap() = Some(phrase.to_owned());
+            true
+        });
+        super::super::recovery::confirm_recovery(data, pass, &notice).unwrap();
+        super::super::recovery::seal_missing_backups(data, pass).unwrap();
+        drop(notice);
+        std::sync::Arc::try_unwrap(words).unwrap().into_inner().unwrap().unwrap()
+    }
+
     /// A vault that became active before the member set up recovery still gets its recovery
-    /// backup: right after `POST /api/recovery-setup`, and at the next unlock if it is missing.
+    /// backup: right after local setup, and at the next unlock if it is missing.
     #[tokio::test(flavor = "multi_thread")]
     async fn recovery_backup_is_sealed_for_an_already_active_vault_at_setup_and_unlock() {
         use crate::signer::recovery::RecoveryKey;
@@ -2550,9 +2563,7 @@ mod tests {
 
         assert!(call(reqwest::Method::POST, "/api/unlock", json!({"passphrase": pass})).await.unwrap().status().is_success());
         assert_eq!(status().await, json!({"recovery_identity": false, "recovery_backup": false}));
-        let words = call(reqwest::Method::POST, "/api/recovery-setup", json!({})).await.unwrap()
-            .json::<Value>().await.unwrap()["words"].as_str().unwrap().to_owned();
-        assert!(call(reqwest::Method::POST, "/api/recovery-setup", json!({"words": words})).await.unwrap().status().is_success());
+        let words = setup_recovery_locally(&data, pass);
         assert_eq!(status().await, json!({"recovery_identity": true, "recovery_backup": true}));
         let key = RecoveryKey::from_words(&words).unwrap();
         let opened = crate::signer::backup::verify_recovery(&BackupArtifact(std::fs::read(&backup).unwrap()), &key, &vault).unwrap();
@@ -2587,14 +2598,13 @@ mod tests {
         (base, token)
     }
 
-    /// Restore-on-new-device drill through the host recovery routes: the old device exports its
-    /// recovery backup, a CLEAN data dir restores it with the words over `POST
-    /// /api/recovery-restore`, the payment path opens its signer (`custody::open_signer`), and it
+    /// Restore-on-new-device drill: the old device exports its recovery backup, a CLEAN data dir
+    /// restores it locally, the payment path opens its signer (`custody::open_signer`), and it
     /// signs through the store's nonce dir at the restored epoch. A nonce the old device
     /// committed before the restore, and a package carrying that old commitment, are both
     /// refused afterwards.
     #[tokio::test(flavor = "multi_thread")]
-    async fn restore_on_new_device_over_routes_signs_and_refuses_pre_restore_nonce() {
+    async fn local_restore_on_new_device_signs_and_refuses_pre_restore_nonce() {
         use crate::signer::nonce::NonceStore;
         use crate::signer::secure_element::SoftwareSecureElement;
         let root = std::env::temp_dir().join(format!("loki-restore-drill-{}", Uuid::new_v4()));
@@ -2610,11 +2620,9 @@ mod tests {
         // Old device: an active vault, recovery set up, backup exported over the route.
         crate::profile::create(&old, pass, "Old").unwrap();
         let (_material, shares, public) = dealer_vault(&old, vault, pass);
+        let words = setup_recovery_locally(&old, pass);
         let (old_base, old_token) = spawn_host(&old).await;
         assert!(call(&old_base, &old_token, reqwest::Method::POST, "/api/unlock", json!({"passphrase": pass})).await.unwrap().status().is_success());
-        let words = call(&old_base, &old_token, reqwest::Method::POST, "/api/recovery-setup", json!({})).await.unwrap()
-            .json::<Value>().await.unwrap()["words"].as_str().unwrap().to_owned();
-        assert!(call(&old_base, &old_token, reqwest::Method::POST, "/api/recovery-setup", json!({"words": words})).await.unwrap().status().is_success());
         let backup = call(&old_base, &old_token, reqwest::Method::GET, &format!("/api/recovery-backup?vault={vault_hex}"), json!({}))
             .await.unwrap().json::<Value>().await.unwrap()["backup"].as_str().unwrap().to_owned();
 
@@ -2631,13 +2639,13 @@ mod tests {
 
         // New device: a clean data dir restores the backup pinned on the old signer.
         crate::profile::create(&new, pass, "New").unwrap();
+        let config = crate::host::config_from_args(&[
+            "--data".into(), new.to_str().unwrap().into(), "--port".into(), "3601".into(),
+        ]).unwrap();
+        let backup = BackupArtifact(hex::decode(&backup).unwrap());
+        restore_vault_from_backup(&new, &vault_hex, &words, Some(&backup.0), Some(&backup.fingerprint()), pass, &config).unwrap();
         let (new_base, new_token) = spawn_host(&new).await;
         assert!(call(&new_base, &new_token, reqwest::Method::POST, "/api/unlock", json!({"passphrase": pass})).await.unwrap().status().is_success());
-        let fingerprint = BackupArtifact(hex::decode(&backup).unwrap()).fingerprint();
-        let restored = call(&new_base, &new_token, reqwest::Method::POST, "/api/recovery-restore",
-            json!({"vault": vault_hex, "words": words, "backup": backup, "fingerprint": fingerprint})).await.unwrap();
-        assert_eq!(restored.status(), reqwest::StatusCode::OK);
-        assert_eq!(restored.json::<Value>().await.unwrap(), json!({"restored": true}));
         let status = call(&new_base, &new_token, reqwest::Method::GET, &format!("/api/recovery-status?vault={vault_hex}"), json!({}))
             .await.unwrap().json::<Value>().await.unwrap();
         assert_eq!(status, json!({"recovery_identity": true, "recovery_backup": true}));
@@ -2649,9 +2657,7 @@ mod tests {
         let sdir = signer_dir(&new, &vault_hex).unwrap();
         let new_nonces = sdir.join("nonces");
         assert!(!new_nonces.exists(), "a clean device starts with no nonces");
-        let st = AppState::new(crate::host::config_from_args(&[
-            "--data".into(), new.to_str().unwrap().into(), "--port".into(), "3601".into(),
-        ]).unwrap());
+        let st = AppState::new(config);
         let signer = crate::host::custody::open_signer(&st, &new, pass, &vault_hex, 1, Box::new(|_| false))
             .expect("the restored member opens for signing");
         let (group, _) = signer.hosted_metadata().unwrap();

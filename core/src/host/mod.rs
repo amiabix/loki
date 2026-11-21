@@ -38,6 +38,7 @@ pub(crate) use native_member::{set_log_sink as native_set_log_sink, status as na
 pub(crate) use native_recovery::{clean_staging as native_clean_staging, profile_state as native_profile_state, restore_new as native_restore_new, REFUSED as NATIVE_RESTORE_REFUSED};
 #[cfg(feature = "relay-communication")]
 pub use nonce_witness::WitnessConfig;
+pub use recovery::run_recovery_command;
 
 /// Device-local UI notifications; never forwarded to the coordinator or a log.
 /// Only recovery setup uses the result: true means the member confirmed saving the words.
@@ -350,6 +351,7 @@ fn run_local_with<G>(
     for url in config.peers.values() {
         crate::transport::require_tls_off_loopback(url)?;
     }
+    let _data_lock = if config.native { None } else { Some(recovery::lock_headless_data(&config.data)?) };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
