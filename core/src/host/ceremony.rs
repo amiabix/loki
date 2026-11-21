@@ -2538,13 +2538,13 @@ mod tests {
             assert!(registration::DeviceKey::open(&apple, pass).is_ok());
             crate::host::custody::open_signer(&AppState::new(apple), &moved, pass, &vault_hex, 1, Box::new(|_| false)).unwrap();
             let actual = tags.lock().unwrap();
-            let scope = std::fs::read_to_string(moved.join(NATIVE_KEY_SCOPE)).unwrap();
-            let vault = format!("cash.loki.member.kek.v2:{scope}:vault:{vault_hex}").into_bytes();
-            let device = format!("cash.loki.member.kek.v2:{scope}:device-auth").into_bytes();
-            assert_ne!(actual[0].2, vault, "a failed first restore does not publish its scope");
+            let restored = std::fs::read_to_string(moved.join("vaults").join(&vault_hex).join("signer/native-restored-key")).unwrap();
+            let vault = format!("cash.loki.member.kek.restore.v1:{restored}:signer").into_bytes();
+            let device = format!("cash.loki.member.kek.restore.v1:{restored}:device-auth").into_bytes();
+            assert_ne!(actual[0].2, vault, "a failed restore does not reuse its Keychain tags");
             assert_ne!(actual[1].2, device);
             assert_eq!(actual[2..], [
-                (false, true, vault.clone()), (true, true, device.clone()),
+                (false, true, vault.clone()), (true, true, device.clone()), (false, false, vault.clone()),
                 (true, false, device.clone()), (true, false, device), (false, false, vault),
             ]);
         }
