@@ -491,11 +491,17 @@ impl AppState {
         self.session_generation.load(Ordering::Acquire)
     }
 
-    pub(super) async fn activate_session(&self, generation: u64, session: Session) -> bool {
+    pub(super) async fn activate_session(self: &std::sync::Arc<Self>, generation: u64, session: Session) -> bool {
         let mut current = self.session.write().await;
         if self.session_generation() != generation { return false; }
         crate::seal_kdf::enable_session_cache(&session.passphrase);
+        let waiting = !super::ceremony::waiting_for_joiners(&session.data, &session.passphrase).is_empty();
         *current = Some(session);
+        drop(current);
+        // A creator restarted mid-setup answers joiners again without anyone opening the vault.
+        if waiting {
+            super::ceremony::spawn_join_relay(self);
+        }
         true
     }
 

@@ -1133,7 +1133,7 @@ fn session_reply(data: &Path, pass: &str, body: &Value) -> Result<Value, String>
 
 /// Starts the creator's loop that answers joiners over frostd, unless it runs. It holds the
 /// app state weakly and stops once the profile locks or no ceremony it created is still setting up.
-fn spawn_join_relay(st: &Shared) {
+pub(super) fn spawn_join_relay(st: &Shared) {
     if st.join_relay.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return;
     }
@@ -1158,6 +1158,15 @@ fn spawn_join_relay(st: &Shared) {
     });
 }
 
+/// Vaults this member created whose members are still joining.
+pub(super) fn waiting_for_joiners(data: &Path, pass: &str) -> Vec<String> {
+    std::fs::read_dir(data.join("vaults")).into_iter().flatten().flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|vault| dir(data, vault).is_ok_and(|d| !d.exists("vault.sealed")))
+        .filter(|vault| load(data, pass, vault).is_ok_and(|c| c.my_slot == 1 && c.slots.get(&1).is_some_and(|s| s.identity.is_some())))
+        .collect()
+}
+
 /// One pass of the creator's join relay: every two-member session a joiner opened with the
 /// creator is drained, and each request sealed to the creator for a ceremony it is still
 /// setting up is answered on that session. Returns whether there is still a ceremony to serve.
@@ -1165,11 +1174,7 @@ fn serve_joins(st: &Shared, relay: &mut Option<FrostdTransport>) -> Result<bool,
     let Some((data, pass)) = st.session.blocking_read().as_ref().map(|s| (s.data.clone(), s.passphrase.clone())) else {
         return Ok(false);
     };
-    let waiting: Vec<String> = std::fs::read_dir(data.join("vaults")).into_iter().flatten().flatten()
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|vault| dir(&data, vault).is_ok_and(|d| !d.exists("vault.sealed")))
-        .filter(|vault| load(&data, &pass, vault).is_ok_and(|c| c.my_slot == 1 && c.slots.get(&1).is_some_and(|s| s.identity.is_some())))
-        .collect();
+    let waiting = waiting_for_joiners(&data, &pass);
     if waiting.is_empty() {
         return Ok(false);
     }
@@ -1810,6 +1815,27 @@ mod tests {
 
     /// Two joiners on their own data dirs join, agree and finish DKG with the creator over
     /// frostd alone: the invite's HTTP URL is a closed port. Needs `FROSTD_URL`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unlocking_a_creator_mid_setup_restarts_its_join_loop() {
+        let data = std::env::temp_dir().join(format!("loki-join-unlock-{}", Uuid::new_v4()));
+        let st = member(&data, 3001, None).await;
+        let created = create(State(st.clone()), Json(json!({"name":"test","members":3,"threshold":2}))).await;
+        assert_eq!(created.0, StatusCode::OK, "{}", created.1 .0);
+        let running = |st: &Shared| st.join_relay.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(running(&st));
+        st.lock_session().await;
+        for _ in 0..50 {
+            if !running(&st) { break; }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(!running(&st), "the loop stops when the profile locks");
+        let session = Session { passphrase: Zeroizing::new("pass".into()), data: data.clone() };
+        assert!(st.activate_session(st.session_generation(), session).await);
+        assert!(running(&st), "unlock restarts the loop without a status call");
+        st.lock_session().await;
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_join_completes_over_frostd_without_the_creators_http_routes() {
         let Ok(url) = std::env::var("FROSTD_URL") else {
