@@ -328,12 +328,14 @@ and supply a single link followed by a newline over standard input from a privat
 Other member flags are the existing `loki_member_app` flags: network, lightwalletd, relay,
 nonce witnesses, and peer allowlist. Each overrides the coordinator's value for its field,
 for that launch only. For an HTTP ceremony between separate Macs, the creator needs a reachable
-HTTPS `--advertise-url` forwarded to its member service. Confirm that origin with the creator
-separately from the invite, then add it to each joiner's local `--peer <slot=origin>` allowlist.
+HTTPS `--advertise-url` and a separate `--peer-port`. Terminate TLS on a same-host proxy
+forwarding only to the ceremony listener at `127.0.0.1:<peer-port>`. Confirm that origin with
+the creator separately from the invite, then add it to each joiner's `--peer <slot=origin>`
+allowlist.
 The origin must resolve to public addresses; the joiner verifies TLS and does not follow redirects.
 Loopback origins on non-privileged ports are for co-located regtest or deliberate
 `--allow-loopback-peers` runs only.
-The private browser session still uses loopback; it is never sent to that public endpoint.
+Never forward the private browser API listener (`--port`); it requires a loopback bind.
 The link contains only origin, slot and a random claim, never runtime configuration or keys;
 the configuration comes from that origin, as described above.
 The native passphrase is passed to Rust in memory and the Swift byte buffer is immediately

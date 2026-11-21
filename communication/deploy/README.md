@@ -140,6 +140,11 @@ ORIGIN=https://localhost:3011 communication/deploy/frostd-tls.sh
 # -> wasm signer points at https://localhost:8443
 ```
 
+Use `UPSTREAM=127.0.0.1:2744` (the default), `[::1]:2744`, or a local Caddy socket
+address such as `unix//run/frostd.sock` for plaintext. Use literal IPs, not `localhost`
+or other DNS names. For a remote relay, use `UPSTREAM=https://frostd.example:2744`;
+Caddy verifies the upstream certificate and hostname against its system trust store.
+
 cloudflared works the same way for the public case (a `trycloudflare` tunnel to
 `127.0.0.1:2744` gives https), but it does not add CORS, so Caddy in front of frostd is
 still needed for the CORS headers; put cloudflared in front of Caddy, or use Caddy's own
@@ -183,9 +188,9 @@ keep it on loopback and put it behind a TLS terminator.
 Hosts ONLY the shared coordinator over a free cloudflared quick tunnel, so testers on
 other machines/networks join without hosting anything. It ensures frostd is reachable
 (ssh tunnel to `FROSTD_HOST`, default `omarchy`), opens
-`cloudflared tunnel --url http://localhost:$WEB_PORT`, captures the printed
-`https://*.trycloudflare.com` URL, and starts `node server.js` with `HOSTNAME` set to
-that host and `PUBLIC_PORT=443`, then prints the join URL. Requires `/opt/homebrew/bin/cloudflared`.
+`cloudflared tunnel --url http://127.0.0.1:$WEB_PORT`, captures the printed
+`https://*.trycloudflare.com` URL, and starts the loopback-only coordinator with
+`PUBLIC_ORIGIN` set to that URL. Requires `/opt/homebrew/bin/cloudflared`.
 
 ```sh
 communication/deploy/public-testnet.sh /absolute/new/pub-stack
@@ -193,12 +198,11 @@ communication/deploy/public-testnet.sh /absolute/new/pub-stack
 kill $(cat /absolute/new/pub-stack/pids)   # stop
 ```
 
-`PUBLIC_PORT=443` is load-bearing: `server.js` builds the request origin (which members'
-self-registration signatures are verified against) from this port, and `URL.origin` omits
-`:443` for https — so the derived origin is exactly `https://HOSTNAME`, matching the origin
-a member signs over. Without it the origin carries the loopback listen port and registration
-fails with "device signature does not verify". Ports default to `WEB_PORT=3011` to avoid the
-loopback test stack on `:3001`. frostd (`:2744`) is shared and supports concurrent sessions.
+When configuring another TLS proxy, point it at `127.0.0.1:$PORT` and set `PUBLIC_ORIGIN`
+to the exact public HTTPS origin (no path, trailing slash or default port). This replaces
+`HOSTNAME` and `PUBLIC_PORT`. Self-registration signs over that public origin; the coordinator
+doesn't trust request-supplied forwarding headers to choose it. `WEB_PORT` defaults to
+`3011` to avoid the loopback test stack on `:3001`. frostd (`:2744`) supports concurrent sessions.
 
 ## Packaged member (`run-member.sh`)
 
@@ -216,12 +220,13 @@ or share the link; the fragment authorizes the local API for the member process'
 If recovery is not set up, use the wallet to set it up and save the words privately.
 
 It self-registers to the coordinator URL (slot = 2nd arg), using `software` device storage.
-Until the peer-over-frostd change lands (gap A in the work definition), the payment review
-step is a direct member->member HTTP GET, so each member must be inbound-reachable to its
-peers: the wrapper gives the member its OWN cloudflared quick tunnel and advertises that
-https URL. Once gap A lands, members need zero inbound — set `NO_TUNNEL=1` (or pass
-`ADVERTISE_URL`) to skip the per-member tunnel. Tunables: `MEMBER_BIN`, `DATA`, `PORT`,
-`FROSTD_URL`, `LWD_URL`, `NETWORK`.
+The wrapper advertises an HTTPS tunnel to the ceremony-only listener on
+`127.0.0.1:$PEER_PORT` (default `4610 + slot`). Only enrollment, roster, agreement
+and session peer requests reach that listener; the full member API on `PORT` stays private.
+To use your own local TLS proxy instead, set `ADVERTISE_URL` to its public HTTPS origin and
+forward it only to `127.0.0.1:$PEER_PORT`. Choose an unused port distinct from `PORT`.
+For a local-only run, leave `ADVERTISE_URL` unset and set `NO_TUNNEL=1`.
+Other tunables: `MEMBER_BIN`, `DATA`, `FROSTD_URL`, `LWD_URL`, `NETWORK`.
 
 ### Upgrade from a version that logged pairing links
 

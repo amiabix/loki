@@ -8,6 +8,7 @@ use zeroize::Zeroizing;
 use super::state::{write_native_key_scope, Config, Session, Shared};
 use crate::signer::device_auth::{verify_device_signature, DeviceRegistry};
 use crate::state::MemberDir;
+use crate::transport::read_bounded;
 #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
 use crate::signer::secure_element_apple::KeyFailure;
 
@@ -104,13 +105,15 @@ pub(super) async fn fetch_roster(client: &reqwest::Client, origin: &str) -> Resu
 
     let mut response = client.get(format!("{origin}/api/members")).send().await.map_err(|_| COORDINATOR_UNREACHABLE)?;
     if !response.status().is_success() { return Err(COORDINATOR_UNREACHABLE); }
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|_| COORDINATOR_UNREACHABLE)? {
-        if body.len() + chunk.len() > 1024 * 1024 { return Err(COORDINATOR_UNREACHABLE); }
-        body.extend_from_slice(&chunk);
-    }
+    let body = read_bounded(&mut response, 1024 * 1024).await.map_err(|_| COORDINATOR_UNREACHABLE)?;
     serde_json::from_slice::<Roster>(&body).map(|r| r.slots).map_err(|_| COORDINATOR_UNREACHABLE)
 }
+
+#[derive(Deserialize)]
+struct RegistrationChallenge { challenge: String }
+
+#[derive(Deserialize)]
+struct RegistrationReply { member: PublicMember }
 
 #[derive(Serialize)]
 struct Enrollment {
@@ -168,27 +171,27 @@ impl std::fmt::Display for RegistrationFailure {
 
 // Only the coordinator's exact, bounded 400 refusal is a hint to reread its public roster.
 // No arbitrary response text is passed to the UI or treated as a slot number.
-async fn registration_response(mut response: reqwest::Response, step: &str, native: bool) -> Result<reqwest::Response, RegistrationFailure> {
-    if let Err(error) = response.error_for_status_ref() {
-        let error = format!("{step}: {error}");
-        if native && response.status() == reqwest::StatusCode::BAD_REQUEST {
-            let mut body = Vec::new();
-            while let Some(chunk) = response.chunk().await.map_err(|_| RegistrationFailure::Refused(error.clone()))? {
-                if body.len() + chunk.len() > 1024 { return Err(RegistrationFailure::Refused(error)); }
-                body.extend_from_slice(&chunk);
-            }
+async fn registration_response<T: serde::de::DeserializeOwned>(
+    mut response: reqwest::Response, step: &str, native: bool, cap: usize,
+) -> Result<T, RegistrationFailure> {
+    let status = response.status();
+    if !status.is_success() {
+        let error = format!("{step}: {status}");
+        if native && status == reqwest::StatusCode::BAD_REQUEST {
+            let body = read_bounded(&mut response, 1024).await.map_err(|_| RegistrationFailure::Refused(error.clone()))?;
             if serde_json::from_slice::<serde_json::Value>(&body).ok().as_ref().is_some_and(|json|
                 matches!(json["error"].as_str(), Some("registered identity cannot change slot" | "registered identity cannot change slot or relay key"))) {
                 return Err(RegistrationFailure::WrongSlot);
             }
         }
-        if native && response.status().is_client_error()
-            && !matches!(response.status(), reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_MANY_REQUESTS) {
+        if native && status.is_client_error()
+            && !matches!(status, reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_MANY_REQUESTS) {
             return Err(RegistrationFailure::Refused(error));
         }
         return Err(RegistrationFailure::Connection(error));
     }
-    Ok(response)
+    let body = read_bounded(&mut response, cap).await.map_err(|e| RegistrationFailure::Connection(format!("{step}: {e}")))?;
+    serde_json::from_slice(&body).map_err(|e| format!("{step}: {e}").into())
 }
 
 impl Enrollment {
@@ -346,11 +349,11 @@ async fn register(config: &Config, pass: &str, pairing_claim: Option<&str>, slot
     // After handing the request to the client even a lost response may mean the claim was used.
     if let (Some(notice), Some(claim)) = (notice, pairing_claim) { notice("pairing-claim-attempted", claim); }
     let response = client.execute(request).await.map_err(|e| RegistrationFailure::Connection(format!("registration challenge: {e}")))?;
-    let challenge: serde_json::Value = registration_response(response, "registration challenge", config.native).await?
-        .json().await.map_err(|e| e.to_string())?;
-    let challenge = challenge["challenge"].as_str().filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
-        .ok_or("invalid coordinator challenge")?;
-    let message = enrollment.message(&launch.coordinator, challenge);
+    let RegistrationChallenge { challenge } = registration_response(response, "registration challenge", config.native, 1024).await?;
+    if challenge.len() != 64 || !challenge.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return Err("invalid coordinator challenge".into());
+    }
+    let message = enrollment.message(&launch.coordinator, &challenge);
     let signature = device.sign(&message).map_err(RegistrationFailure::Device)?;
     verify_device_signature(&device_pub, &message, &signature)?;
     let mut body = serde_json::to_value(&enrollment).map_err(|e| e.to_string())?;
@@ -358,9 +361,7 @@ async fn register(config: &Config, pass: &str, pairing_claim: Option<&str>, slot
     body["signature"] = hex::encode(signature).into();
     let response = client.post(format!("{}/api/members", launch.coordinator))
         .json(&body).send().await.map_err(|e| RegistrationFailure::Connection(format!("self-registration: {e}")))?;
-    let reply: serde_json::Value = registration_response(response, "self-registration", config.native).await?
-        .json().await.map_err(|e| e.to_string())?;
-    let member: PublicMember = serde_json::from_value(reply["member"].clone()).map_err(|e| e.to_string())?;
+    let RegistrationReply { member } = registration_response(response, "self-registration", config.native, 8 * 1024).await?;
     if member.slot == 0 || slot.is_some_and(|s| s != member.slot) || member.signing_pubkey != enrollment.signing_pubkey
         || member.relay_pubkey != enrollment.relay_pubkey || member.advertise_url != enrollment.advertise_url
         || member.lokisigner_url != enrollment.lokisigner_url {
@@ -699,7 +700,7 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         for (path, code) in [("timeout", "registration-failed"), ("rate-limit", "registration-failed"), ("refusal", "registration-refused")] {
             let response = reqwest::get(format!("{origin}/{path}")).await.unwrap();
-            let error = registration_response(response, "registration challenge", true).await.unwrap_err();
+            let error = registration_response::<serde_json::Value>(response, "registration challenge", true, 1024).await.unwrap_err();
             assert_eq!(error.native_code(), code);
         }
     }

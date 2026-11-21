@@ -3,13 +3,16 @@
 //!
 //!   loki_member_app --data <dir> --port <n> [--network testnet] [--lightwalletd-url <url>]
 //!       [--frostd-url <url>] [--peer <slot=baseurl>]...
-//!       [--bind <IP>] [--advertise-url <url>] [--allow-loopback-peers]
+//!       [--bind <loopback-IP>] [--peer-port <n> --advertise-url <origin>] [--allow-loopback-peers]
 //!       [--secure-element <software|apple>]
 //!       [--coordinator-url <origin> --local-passphrase-file <path>
 //!        --registration-slot <public-slot> --profile-name <name>]
 //!       [--transport hosted --operator-bundle <cbor> --operator-key <hex>
 //!        --enrollment-issuer <path> --development-http]
 //!       [--nonce-witnesses <json>] [--approve-from <file>] [--pairing-stdout]
+//!
+//! A local TLS proxy may expose the ceremony-only listener on `127.0.0.1:<peer-port>`.
+//! Never proxy the private API on `--port`.
 //!
 //! `--pairing-stdout` is for launchers that connect stdout to a private pipe, never a log.
 //! Without `--approve-from` this process has no approval channel and refuses every payment;
