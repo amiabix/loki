@@ -36,7 +36,7 @@ import {
   type Slot,
   type RecoveryStatus,
 } from "@/lib/api";
-import { comparesInLokiSigner, emptyHistoryText, invitePreview, nativeRosterRefusal, pairingSecondsLeft, paymentLabel, rememberedVaultSlot, rememberVaultSlot, storageLabel, verifyPhrase } from "@/lib/wallet-ui";
+import { comparesInLokiSigner, emptyHistoryText, invitePreview, nativeRosterRefusal, pairingSecondsLeft, paymentLabel, rememberedVaultSlot, rememberVaultSlot, storageLabel } from "@/lib/wallet-ui";
 import { toggleTheme, useIsDark } from "@/lib/theme";
 import { useCeremonyStatus, usePayments, useStatus } from "@/lib/hooks";
 import type {
@@ -1139,6 +1139,7 @@ function CeremonyView({
         )}
         {cs.phase === "compare_roster" && !comparesInLokiSigner(cs) && (
           <CompareRoster
+            key={cs.roster_code ?? ""}
             creator={cs.invites !== undefined}
             vault={vault}
             fingerprint={cs.fingerprint}
@@ -1291,10 +1292,8 @@ function CompareRoster({
 }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  // Explicit out-of-band gate: the member must affirm they compared the code on a side channel
-  // before "Confirm" is enabled, so the check can't degrade into trusting the shown value.
+  // The parent keys this form by roster code so a status refresh cannot carry approval over.
   const [checked, setChecked] = useState(false);
-  const phrase = verifyPhrase(fingerprint);
 
   const [confirmedHere, setConfirmedHere] = useState(confirmed);
   useEffect(() => {
@@ -1315,20 +1314,19 @@ function CompareRoster({
 
   return (
     <div>
-      <p className="text-sm text-muted mb-4">
-        Security check: on a call or in person, make sure this code is{" "}
-        <span className="text-foreground">identical</span> for every member. Read the words aloud and
-        match the emoji. Matching codes prove you&apos;re all in the same vault and no one was swapped
-        in — don&apos;t trust the code on this screen alone.
-      </p>
-      {phrase && (
-        <GlassCard className="mb-4 text-center">
-          <h3 className="eyebrow mb-2">Compare this code</h3>
-          <p className="text-2xl mb-2" aria-label={`emoji ${phrase.emoji.join(" ")}`}>{phrase.emoji.join(" ")}</p>
-          <p className="font-mono text-lg font-semibold tracking-wide text-amber break-words">{phrase.words.join(" · ")}</p>
-          {rosterCode && <p className="font-mono text-xl font-semibold tracking-wide">{rosterCode}</p>}
-          <p className="mt-3 font-mono text-xs break-all text-muted">{fingerprint}</p>
-        </GlassCard>
+      {rosterCode ? (
+        <>
+          <p className="text-sm text-muted mb-4">
+            Security check: compare all 24 digits with every member on a call or in person.
+            Confirm only if everyone sees <span className="text-foreground">exactly the same code</span>.
+          </p>
+          <GlassCard className="mb-4 text-center">
+            <h3 className="eyebrow mb-2">Compare this code</h3>
+            <p className="font-mono text-base font-semibold tracking-wide text-amber sm:text-xl">{rosterCode}</p>
+          </GlassCard>
+        </>
+      ) : (
+        <p role="status" className="mb-4 text-sm text-muted">The signer has not provided a roster code. You can’t confirm members without it.</p>
       )}
       {creator && (
         <p className="pill text-muted mb-4">
@@ -1336,14 +1334,14 @@ function CompareRoster({
           {confirmations} of {members} confirmed
         </p>
       )}
-      {!confirmedHere && !allConfirmed && (
+      {rosterCode && !confirmedHere && !allConfirmed && (
         <>
           <label className="glass mb-3 flex items-start gap-3 rounded-2xl p-4 text-left text-sm text-foreground cursor-pointer">
             <input type="checkbox" className="mt-0.5 h-4 w-4 shrink-0 accent-amber" checked={checked}
               onChange={(e) => setChecked(e.target.checked)} />
-            <span>I compared this code with the other members out of band and it matches.</span>
+            <span>I compared all 24 digits with the other members and they match.</span>
           </label>
-          <Btn variant="amber" onClick={agree} disabled={busy || !fingerprint || !rosterCode || !checked}>
+          <Btn variant="amber" onClick={agree} disabled={busy || !fingerprint || !checked}>
             {busy ? "Confirming…" : "Confirm members"}
           </Btn>
         </>
