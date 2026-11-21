@@ -59,8 +59,9 @@ A LokiSigner member compares the roster code in LokiSigner, not on this page: **
 LokiSigner** opens LokiSigner's dialog, and only its **Codes match** records the agreement
 (see `core/signer-app/README.md`). The page knows LokiSigner asks because the member's vault
 status reports `roster_dialog`. A headless member paired with this tab (`loki_member_app`,
-`LokiSigner serve`) does not, so the page shows it the code to compare, as it always did. After confirming the roster, a member stays on **Verify
-members** until the creator has all confirmations and publishes the relay session. Waiting
+`LokiSigner serve`) does not, so the page shows the signer's 24-digit code. Compare all 24
+digits before confirming. After confirming the roster, a member stays on **Verify members**
+until the creator has all confirmations and publishes the relay session. Waiting
 for people has no key-generation timeout. A creator lock or temporary disconnect can be retried before key generation starts;
 an unlocked member restarted during that wait retains its confirmation. Once key generation
 has started, an interruption requires **Create a new vault**, new invitations, and a new code

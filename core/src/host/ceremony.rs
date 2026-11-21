@@ -779,7 +779,7 @@ pub(super) async fn status(st: Shared, vault: String) -> Reply {
             let differ = st.roster_refused.lock().map_err(|e| e.to_string())?.contains(&vault);
             value["roster_dialog"] = if differ { json!("codes_differ") } else if open { json!("open") } else { Value::Null };
         }
-        if c.my_slot == 1 {
+        if c.my_slot == 1 && matches!(phase, "waiting_for_members" | "compare_roster") {
             value["invites"] = json!(invitations(&c)?);
         }
         if let Some(error) = c.error {
