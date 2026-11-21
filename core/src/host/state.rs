@@ -167,6 +167,14 @@ pub(super) fn key_scope(config: &Config, profile: &Path) -> Result<Option<uuid::
 #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave")))]
 const SCOPED_VAULT_KEY: &str = "native-scoped-vault-key";
 
+#[cfg(all(target_os = "macos", feature = "apple-enclave"))]
+pub(super) const RESTORED_KEY: &str = "native-restored-key";
+
+#[cfg(all(target_os = "macos", feature = "apple-enclave"))]
+pub(super) fn restored_key_tag(restore: uuid::Uuid, role: &str) -> Vec<u8> {
+    format!("cash.loki.member.kek.restore.v1:{restore}:{role}").into_bytes()
+}
+
 #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave")))]
 fn vault_key_scope(config: &Config, profile: &Path, key_dir: &Path, published: Option<&Path>, create: bool) -> Result<(Option<uuid::Uuid>, String), String> {
     let mut scope = key_scope(config, profile)?;
@@ -201,20 +209,29 @@ pub(super) fn open_apple_element(dir: &Path, create: bool, published: Option<&Pa
     if create {
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(|_| KeyFailure::Other)?;
     }
-    let legacy = if scope.is_none() { legacy_key_dir(dir, published)? } else { PathBuf::new() };
-    let tag = apple_key_tag(&legacy, scope, role);
+    let restore = match std::fs::read_to_string(dir.join(RESTORED_KEY)) {
+        Ok(id) => Some(uuid::Uuid::parse_str(&id).map_err(|_| KeyFailure::Other)?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Err(KeyFailure::Other),
+    };
+    let tag = if let Some(restore) = restore {
+        restored_key_tag(restore, dir.file_name().and_then(|name| name.to_str()).ok_or(KeyFailure::Other)?)
+    } else {
+        let legacy = if scope.is_none() { legacy_key_dir(dir, published)? } else { PathBuf::new() };
+        apple_key_tag(&legacy, scope, role)
+    };
     #[cfg(test)]
-    if let Some(outcome) = apple_test::lookup(dir, &tag, create) {
-        outcome?;
+    if let Some(lookup) = apple_test::fixture(dir) {
+        lookup(dir, &tag, create)?;
         return SoftwareSecureElement::persistent(dir, "Apple test stand-in")
             .map(HostedSecureElement::software).map_err(|_| KeyFailure::Other);
     }
     let state = dir.join("biometry-state");
-    let state = Some(state.as_path());
     let key = match reason {
-        Some(reason) => AppleSecureElement::open_payment(&tag, state, reason),
-        None if create => AppleSecureElement::create_persistent(&tag, state),
-        None => AppleSecureElement::open_persistent(&tag, state),
+        Some(reason) => AppleSecureElement::open_payment(&tag, Some(&state), reason),
+        None if create && restore.is_some() => AppleSecureElement::create_staged(&tag, &state),
+        None if create => AppleSecureElement::create_persistent(&tag, Some(&state)),
+        None => AppleSecureElement::open_persistent(&tag, Some(&state)),
     };
     key.map(|key| HostedSecureElement::Apple(key, None))
 }
@@ -257,9 +274,8 @@ pub(super) mod apple_test {
         Fixture(root.to_owned())
     }
 
-    pub(super) fn lookup(dir: &Path, tag: &[u8], create: bool) -> Option<Result<(), KeyFailure>> {
-        let lookup = FIXTURES.lock().unwrap().iter().find(|(path, _)| dir.starts_with(path)).map(|(_, lookup)| lookup.clone());
-        lookup.map(|f| f(dir, tag, create))
+    pub(in crate::host) fn fixture(dir: &Path) -> Option<Lookup> {
+        FIXTURES.lock().unwrap().iter().find(|(path, _)| dir.starts_with(path)).map(|(_, lookup)| lookup.clone())
     }
 }
 
