@@ -63,7 +63,8 @@ const short = (s: string, head = 8, tail = 6) =>
 function extractInvite(raw: string): string {
   const s = raw.trim();
   try {
-    return new URL(s).searchParams.get("invite") ?? s;
+    const url = new URL(s);
+    return new URLSearchParams(url.hash.slice(1)).get("invite") ?? url.searchParams.get("invite") ?? s;
   } catch {
     return s;
   }
@@ -71,7 +72,7 @@ function extractInvite(raw: string): string {
 
 /** A shareable invite link for a join code — opens the app straight into Join. */
 function inviteLink(code: string): string {
-  return typeof window === "undefined" ? code : `${window.location.origin}/?invite=${code}`;
+  return typeof window === "undefined" ? code : `${window.location.origin}/#invite=${encodeURIComponent(code)}`;
 }
 
 // ─── navigation state ────────────────────────────────────────────────────────
@@ -96,14 +97,20 @@ export default function App() {
   const [pendingInvite, setPendingInvite] = useState<string | null>(null);
   const { data: status, error: statusError, refresh: refreshStatus } = useStatus(authed === true);
 
-  // Invite deep-link: opening /?invite=<code> (or a full link) drops you straight into Join once
-  // you're signed in — no codes to paste, no "pick a member". Held across the login gate.
+  // Keep new claims out of the initial request and hold them in memory across sign-in.
+  // Read legacy query links too, but remove both forms from the current history entry.
   useEffect(() => {
-    const code = new URLSearchParams(window.location.search).get("invite");
-    if (code) {
-      setPendingInvite(code);
-      window.history.replaceState(null, "", window.location.pathname);
+    const url = new URL(window.location.href);
+    const fragment = new URLSearchParams(url.hash.slice(1));
+    const code = fragment.get("invite") ?? url.searchParams.get("invite");
+    if (code === null) return;
+    if (fragment.has("invite")) {
+      fragment.delete("invite");
+      url.hash = fragment.toString();
     }
+    url.searchParams.delete("invite");
+    window.history.replaceState(window.history.state, "", url);
+    if (code) setPendingInvite(code);
   }, []);
 
   useEffect(() => {

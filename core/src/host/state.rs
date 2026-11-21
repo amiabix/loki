@@ -54,7 +54,7 @@ impl Config {
             .trim_end_matches('/').to_owned()
     }
 
-    pub(super) fn validate_peer_url(&self, base: &str) -> Result<(), String> {
+    pub(super) fn validate_peer_url(&self, base: &str) -> Result<reqwest::Url, String> {
         let url = reqwest::Url::parse(base).map_err(|_| "invalid member base URL")?;
         let origin = url.origin().ascii_serialization();
         let explicit_default = if url.port().is_none() {
@@ -68,11 +68,14 @@ impl Config {
             return Err("member URL must be a plain HTTP(S) origin".into());
         }
         // The co-located regtest demo, or an explicit operator opt-in, admits new loopback origins.
-        let local = (self.network == "regtest" || self.loopback_peers)
-            && matches!(url.host_str(), Some("127.0.0.1" | "[::1]"))
+        let loopback = matches!(url.host_str(), Some("127.0.0.1" | "[::1]"));
+        let local = loopback && (self.network == "regtest" || self.loopback_peers)
             && url.port().is_some_and(|p| p >= 1024);
-        if local || self.peers.values().any(|allowed| allowed == &origin || allowed == &explicit_default) {
-            Ok(())
+        // Outside the local demo, authenticate the locally configured peer name with TLS.
+        if local || (!loopback && url.scheme() == "https"
+            && self.peers.values().any(|allowed| allowed == &origin || allowed == &explicit_default))
+        {
+            Ok(url)
         } else {
             Err("member URL is not an allowed peer".into())
         }
