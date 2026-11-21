@@ -87,6 +87,9 @@ zcash_transparent = { package = "zakura-transparent", version = "=2.2.0" }
 sapling-crypto = { package = "zakura-sapling-crypto", version = "=2.2.0" }
 ciborium-io        = "0.2"
 
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
 [features]
 # Compile probes that reproduce the two blocked checkpoint-1 requirements.
 # Each FAILS TO COMPILE on purpose; the compiler error is the blocker report.
