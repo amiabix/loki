@@ -99,7 +99,7 @@ pub(crate) fn run_native(
     let roster_confirmation: LocalRosterConfirmation = Arc::new(move |summary|
         roster_stop.decision(super::RosterAnswer::NoAnswer, || roster_confirmation(summary)));
     super::run_local_with(config, Some(pass), Some(notice.clone()), Some(approval), Some(roster_confirmation),
-        fetched, Some(&stop.wake), Some(connect), |state| NativeScope::install(state, stop.clone(), Some(notice)))
+        fetched, false, Some(&stop.wake), Some(connect), |state| NativeScope::install(state, stop.clone(), Some(notice)))
 }
 
 pub(crate) fn request_stop() -> bool {
