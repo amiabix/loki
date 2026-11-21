@@ -982,8 +982,8 @@ pub(super) async fn agree(State(st): State<Shared>, Json(body): Json<Value>) -> 
 
 /// The member chose "Codes differ" in LokiSigner; it refuses this vault until it restarts.
 const ROSTER_CODES_DIFFER: &str = "roster codes differ: LokiSigner refuses this vault until it restarts";
-/// The LokiSigner dialog closed or timed out; a new request asks again.
-const ROSTER_NOT_CONFIRMED: &str = "roster code not confirmed in LokiSigner";
+/// No local prompt was available or the member did not answer; a new request can ask again.
+const ROSTER_NOT_CONFIRMED: &str = "roster code not confirmed locally";
 /// LokiSigner already shows a roster dialog.
 const ROSTER_ASKING: &str = "LokiSigner is already asking about a roster code";
 /// The setup changed while LokiSigner asked; nothing was recorded.
@@ -1577,35 +1577,38 @@ mod tests {
         std::fs::create_dir_all(&data).unwrap();
         let vault = hex::encode([8u8; 32]);
         let slots = (1..=3)
-            .map(|slot| (slot, Slot { identity: None, pending_token: Some("token".into()) }))
+            .map(|slot| (slot, Slot { identity: Some(WireIdentity::from_public(Identity::new(slot).public())), pending_token: None }))
             .collect();
-        let ceremony = Ceremony {
+        let mut ceremony = Ceremony {
             vault: vault.clone(), name: "test".into(), members: 3, threshold: 2,
             my_slot: 1, creator_base_url: String::new(), frostd_url: String::new(),
-            slots, fingerprint: Some("fingerprint".into()), agreed: BTreeSet::new(),
+            slots, fingerprint: None, agreed: BTreeSet::from([1, 2, 3]),
             session_id: None, coordinator_peer: None, vs_session_id: None,
             dkg_started: true, error: None, birth_height: None, roster_code: None, creator: None,
         };
+        let fingerprint = hex::encode(roster_of(&ceremony).unwrap().fingerprint());
+        let code = setup_roster_code(&ceremony, VaultNetwork::Regtest).unwrap();
+        ceremony.fingerprint = Some(fingerprint.clone());
+        ceremony.roster_code = Some(code.clone());
         save(&data, "pass", &ceremony).unwrap();
-        let st = std::sync::Arc::new(AppState::new(Config {
-            data: data.clone(), port: 3001, network: "regtest".into(), native: false,
-            lightwalletd: None, transport: "local".into(), operator_bundle: None,
-            operator_key: None, enrollment_issuer: None, development_http: false,
-            token: "test".into(), frostd_url: "http://127.0.0.1:2744".into(),
-            peers: BTreeMap::new(),
-            registration: None, bind: "127.0.0.1".parse().unwrap(), peer_port: None, advertise_url: None,
-            secure_element: "software".into(), nonce_witnesses: None, loopback_peers: false,
-        }));
+        let st = std::sync::Arc::new(AppState {
+            roster_confirmation: Some(std::sync::Arc::new(|_| panic!("interrupted setup must not open a local prompt"))),
+            ..AppState::new(test_config(&data, 3001))
+        });
         *st.session.write().await = Some(Session {
             passphrase: Zeroizing::new("pass".into()), data: data.clone(),
         });
 
         let reply = status(st.clone(), vault.clone()).await;
         assert_eq!(reply.1 .0["phase"], "setup_interrupted");
-        let reply = agree(State(st), Json(json!({"vault":vault,"fingerprint":"fingerprint","roster_code":"code"}))).await;
+        let reply = agree(State(st.clone()), agree_body(&vault, &fingerprint, &code)).await;
         assert_eq!(reply.0, StatusCode::BAD_REQUEST);
         assert!(reply.1 .0["error"].as_str().unwrap().contains("interrupted"));
-        assert!(load(&data, "pass", &vault).unwrap().dkg_started);
+        assert!(st.active_dkgs.lock().unwrap().is_empty());
+        let saved = load(&data, "pass", &vault).unwrap();
+        assert!(saved.dkg_started);
+        assert_eq!(saved.agreed, ceremony.agreed);
+        assert_eq!(saved.roster_code, ceremony.roster_code);
         std::fs::remove_dir_all(data).unwrap();
     }
 
@@ -1813,13 +1816,16 @@ mod tests {
         };
         let root = std::env::temp_dir().join(format!("loki-join-relay-{}", Uuid::new_v4()));
         let mut members = Vec::new();
+        let mut dialogs = Vec::new();
         for name in ["creator", "joiner2", "joiner3"] {
             let data = root.join(name);
             std::fs::create_dir_all(&data).unwrap();
             let config = Config { frostd_url: url.clone(), advertise_url: Some("http://127.0.0.1:9".into()), ..test_config(&data, 3601) };
-            let st = std::sync::Arc::new(AppState::new(config));
+            let (confirm, dialog) = Dialog::new();
+            let st = std::sync::Arc::new(AppState { roster_confirmation: Some(confirm), ..AppState::new(config) });
             *st.session.write().await = Some(Session { passphrase: Zeroizing::new("pass".into()), data });
             members.push(st);
+            dialogs.push(dialog);
         }
         // Locking ends every member's waits, so the runtime stops even when an assertion fails.
         struct LockOnDrop(Vec<Shared>);
@@ -1842,9 +1848,12 @@ mod tests {
             let reply = join(State(members[slot - 1].clone()), Json(json!({"invite":code}))).await;
             assert_eq!(reply.0, StatusCode::OK, "{}", reply.1 .0);
         }
-        for st in &members {
-            let (fingerprint, code, _) = compare(st, &vault).await;
-            let reply = agree(State(st.clone()), agree_body(&vault, &fingerprint, &code)).await;
+        for (st, dialog) in members.iter().zip(dialogs) {
+            let (fingerprint, code, signer_code) = compare(st, &vault).await;
+            let request = tokio::spawn(agree(State(st.clone()), agree_body(&vault, &fingerprint, &code)));
+            assert_eq!(dialog.open()["roster_code"], signer_code.as_str());
+            dialog.answer.send(crate::host::RosterAnswer::Match).unwrap();
+            let reply = request.await.unwrap();
             assert_eq!(reply.0, StatusCode::OK, "{}", reply.1 .0);
         }
         let mut addresses = BTreeSet::new();
