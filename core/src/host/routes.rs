@@ -182,15 +182,8 @@ fn str_field(body: &Value, name: &str) -> Result<String, Reply> {
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, format!("missing {name}")))
 }
 
-async fn set_session(st: &Shared, passphrase: Zeroizing<String>) {
-    crate::seal_kdf::enable_session_cache(&passphrase);
-    *st.session.write().await = Some(Session {
-        passphrase,
-        data: st.config.data.clone(),
-    });
-}
-
 async fn profile_create(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
+    let generation = st.session_generation();
     let (name, pass) = match (str_field(&body, "name"), str_field(&body, "passphrase")) {
         (Ok(n), Ok(p)) => (n, p),
         (Err(e), _) | (_, Err(e)) => return e,
@@ -201,12 +194,16 @@ async fn profile_create(State(st): State<Shared>, Json(body): Json<Value>) -> Re
     let reply = blocking(move || crate::profile::create(&data, &for_block, &name)).await;
     if reply.0 == StatusCode::OK {
         // Creating a profile unlocks it (the prototype's behaviour).
-        set_session(&st, passphrase).await;
+        let session = Session { passphrase, data: st.config.data.clone() };
+        if !st.activate_session(generation, session).await {
+            return err(StatusCode::CONFLICT, "profile created but signer was locked; unlock again");
+        }
     }
     reply
 }
 
 async fn unlock(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
+    let generation = st.session_generation();
     let pass = match str_field(&body, "passphrase") {
         Ok(p) => p,
         Err(e) => return e,
@@ -221,7 +218,9 @@ async fn unlock(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
     });
     match unlocked.await {
         Ok(Ok((session, profile))) => {
-            *st.session.write().await = Some(session);
+            if !st.activate_session(generation, session).await {
+                return err(StatusCode::CONFLICT, "signer was locked; unlock again");
+            }
             ok(json!({ "unlocked": true, "profile": profile }))
         }
         Ok(Err(e)) => err(StatusCode::UNAUTHORIZED, e),
@@ -230,16 +229,8 @@ async fn unlock(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
 }
 
 async fn lock(State(st): State<Shared>) -> Reply {
-    lock_session(&st).await;
+    st.lock_session().await;
     ok(json!({ "locked": true }))
-}
-
-pub(super) async fn lock_session(st: &Shared) {
-    let mut session = st.session.write().await;
-    *session = None;
-    if let Some(tabs) = &st.wallet_tabs { tabs.revoke_all(); }
-    drop(session);
-    crate::seal_kdf::clear_session_cache();
 }
 
 async fn status(

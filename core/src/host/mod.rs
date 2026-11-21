@@ -300,8 +300,8 @@ pub fn run(config: Config) -> Result<(), String> {
     run_local(config, None, None, None, None)
 }
 
-/// `fetched`: the configuration the native app fetched and the member confirmed; it is saved
-/// only once the profile unlocks. A member started here has no roster dialog: `/api/agree`
+/// `fetched`: the native app's confirmed configuration snapshot. Fresh settings without
+/// overrides are saved only after unlock. A member started here has no roster dialog: `/api/agree`
 /// trusts its caller to have compared the code. LokiSigner starts through `run_native`.
 pub fn run_local(
     config: Config,
@@ -368,7 +368,7 @@ fn run_local_with<G>(
             // The UI cannot restart or set aside the profile until those workers have drained.
             tokio::select! {
                 biased;
-                _ = stop.notified() => { routes::lock_session(&state).await; Ok(()) },
+                _ = stop.notified() => { state.lock_session().await; Ok(()) },
                 result = serve => result,
             }
         } else {

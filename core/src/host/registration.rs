@@ -387,6 +387,7 @@ pub(super) async fn start(st: &Shared, pass: Option<Zeroizing<String>>, notice: 
 /// member and not a log file.
 async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option<&super::LocalNotice>, interactive: bool) -> Result<&'static str, String> {
     let Some(launch) = &st.config.registration else { return Ok("ready"); };
+    let generation = st.session_generation();
     let pass = match pass {
         Some(pass) => pass,
         None => {
@@ -483,7 +484,7 @@ async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option
     tokio::task::spawn_blocking(move || super::recovery::seal_missing_backups_logged(&data, &secret))
         .await.map_err(|e| e.to_string())?;
     if !pairing { save_destination()?; }
-    *st.session.write().await = Some(session);
+    if !st.activate_session(generation, session).await { return Err("signer was locked; unlock again".into()); }
     if pairing { return Ok("ready"); }
     if restored {
         // The profile is already committed; registration can fail without losing the restore.
