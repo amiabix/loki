@@ -125,9 +125,11 @@ for n in 1 2 3; do
   link=$(curl -sf -m 10 -X POST -H 'Content-Type: application/json' -d "{\"slot\":$n}" "$coord/api/members/pairing" | jq -er .url) \
     || fail "the coordinator issued no pairing link for slot $n"
   printf '' | pbcopy
-  open -n "$app" --args pair "$link" --development-http --data "$root/m$n" --port "$port" \
+  printf '%s\n' "$link" | "$app/Contents/MacOS/LokiSigner" native --pairing-stdin --development-http --data "$root/m$n" --port "$port" \
     --network "$network" --lightwalletd-url "$lwd" --frostd-url "$frostd_url" \
-    --nonce-witnesses "$witnesses" --allow-loopback-peers
+    --nonce-witnesses "$witnesses" --allow-loopback-peers >"$root/m$n.log" 2>&1 &
+  echo $! >>"$root/pids"
+  unset link
   act "a LokiSigner window asks \"Pair this device with slot $n?\" (coordinator $coord). Within 2 minutes:
    1. type a new passphrase for member $n and click Pair            [Touch ID may be asked]
    2. write down the 24 recovery words, click \"I saved these words\"

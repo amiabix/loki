@@ -239,6 +239,7 @@ pub(super) async fn lock_session(st: &Shared) {
     *session = None;
     if let Some(tabs) = &st.wallet_tabs { tabs.revoke_all(); }
     drop(session);
+    super::native_member::clear_addresses_on_lock(st);
     crate::seal_kdf::clear_session_cache();
 }
 
