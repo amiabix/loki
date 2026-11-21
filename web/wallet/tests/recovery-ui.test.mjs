@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import ts from 'typescript';
-import { exportRecoveryBackup, removeBrowserSigner, restoreSigner, setupBrowserRecovery } from '../src/lib/api.ts';
+import { exportRecoveryBackup, manageBrowserCustody, restoreSigner, setupBrowserRecovery } from '../src/lib/api.ts';
 
 test('browser recovery calls go only to the browser signer, never to a paired native member', async () => {
   const sess = new Map();
@@ -15,7 +15,7 @@ test('browser recovery calls go only to the browser signer, never to a paired na
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url) => { fetched.push(url); throw new Error('no network expected'); };
   const calls = [setupBrowserRecovery, () => exportRecoveryBackup('a'.repeat(64)),
-    () => restoreSigner({ name: 'A', method: 'passphrase' }), removeBrowserSigner];
+    () => restoreSigner({ name: 'A', method: 'passphrase' }), manageBrowserCustody];
   try {
     // Browser kind: each call is dispatched to the signer (the Node mock serves none of them;
     // the signer origin does; locked, it asks to unlock first), and nothing is fetched here.

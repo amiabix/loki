@@ -69,8 +69,13 @@ String? _policy(Json vault) {
   return null;
 }
 
-bool _settled(Object? phase) =>
-    const {'confirmed', 'replaced', 'cancelled', 'expired'}.contains(phase);
+bool _settled(Object? phase) => const {
+  'confirmed',
+  'replaced',
+  'spent_unverified',
+  'cancelled',
+  'expired',
+}.contains(phase);
 
 String paymentPhase(Json payment) {
   final phase = payment['phase'];
@@ -88,6 +93,7 @@ String paymentPhase(Json payment) {
     'broadcast' => 'Awaiting confirmation',
     'confirmed' => 'Confirmed',
     'replaced' => 'Replaced',
+    'spent_unverified' => 'Input spent · payment unverified',
     'failed' => 'Failed',
     'discarding' => 'Releasing reserved input',
     'cancelled' => 'Cancelled',
@@ -854,7 +860,11 @@ class _HistoryPageState extends State<HistoryPage> {
         switch (action) {
           // The draft remains actionable if the original merely expires.
           'retry' ||
-          'cancel' => !{'confirmed', 'replaced'}.contains(latest['phase']),
+          'cancel' => !{
+            'confirmed',
+            'replaced',
+            'spent_unverified',
+          }.contains(latest['phase']),
           'send' =>
             !_settled(latest['phase']) &&
                 latest['can_send'] == true &&
@@ -896,7 +906,7 @@ class _HistoryPageState extends State<HistoryPage> {
           ),
           const _ReviewNotice(
             'Broadcast is not confirmation',
-            'History shows a payment as confirmed only after this wallet verifies it in a block.',
+            'The signer checks the payment against blocks reported by its lightwalletd provider.',
           ),
         ] else if (draft != null)
           Surface(
@@ -1093,10 +1103,16 @@ class _HistoryPageState extends State<HistoryPage> {
           if (!confirmed && policy != null)
             ValueRow('Vault policy', '$policy approvals'),
           if (confirmed)
-            const _PaymentNote('Confirmed on-chain by this wallet.'),
+            const _PaymentNote(
+              'Confirmed using data reported by lightwalletd.',
+            ),
           if (phase == 'broadcast')
             const _PaymentNote(
-              'Broadcast to the network. Your wallet has not confirmed it in a block yet.',
+              'Broadcast to the network. The signer has not matched it to a reported block yet.',
+            ),
+          if (phase == 'spent_unverified')
+            const _PaymentNote(
+              'Lightwalletd reported the input as spent. The signer could not verify the spending transaction.',
             ),
           if (phase == 'replaced')
             _PaymentNote(

@@ -22,11 +22,12 @@ import {
   PairingSlotTaken,
   pendingApprovals,
   exportRecoveryBackup,
-  removeBrowserSigner,
+  manageBrowserCustody,
   restoreSigner,
   setupBrowserRecovery,
   signerKind,
   recoveryBackup,
+  recoveryConfirm,
   recoveryRestore,
   recoverySetup,
   recoveryStatus,
@@ -36,7 +37,7 @@ import {
   type Slot,
   type RecoveryStatus,
 } from "@/lib/api";
-import { comparesInLokiSigner, emptyHistoryText, invitePreview, nativeRosterRefusal, pairingSecondsLeft, paymentLabel, rememberedVaultSlot, rememberVaultSlot, storageLabel, verifyPhrase } from "@/lib/wallet-ui";
+import { comparesInLokiSigner, emptyHistoryText, invitePreview, nativeRosterRefusal, pairingSecondsLeft, paymentLabel, rememberedVaultSlot, rememberVaultSlot, storageLabel } from "@/lib/wallet-ui";
 import { toggleTheme, useIsDark } from "@/lib/theme";
 import { useCeremonyStatus, usePayments, useStatus } from "@/lib/hooks";
 import type {
@@ -63,7 +64,8 @@ const short = (s: string, head = 8, tail = 6) =>
 function extractInvite(raw: string): string {
   const s = raw.trim();
   try {
-    return new URL(s).searchParams.get("invite") ?? s;
+    const url = new URL(s);
+    return new URLSearchParams(url.hash.slice(1)).get("invite") ?? url.searchParams.get("invite") ?? s;
   } catch {
     return s;
   }
@@ -71,7 +73,7 @@ function extractInvite(raw: string): string {
 
 /** A shareable invite link for a join code — opens the app straight into Join. */
 function inviteLink(code: string): string {
-  return typeof window === "undefined" ? code : `${window.location.origin}/?invite=${code}`;
+  return typeof window === "undefined" ? code : `${window.location.origin}/#invite=${encodeURIComponent(code)}`;
 }
 
 // ─── navigation state ────────────────────────────────────────────────────────
@@ -96,14 +98,20 @@ export default function App() {
   const [pendingInvite, setPendingInvite] = useState<string | null>(null);
   const { data: status, error: statusError, refresh: refreshStatus } = useStatus(authed === true);
 
-  // Invite deep-link: opening /?invite=<code> (or a full link) drops you straight into Join once
-  // you're signed in — no codes to paste, no "pick a member". Held across the login gate.
+  // Keep new claims out of the initial request and hold them in memory across sign-in.
+  // Read legacy query links too, but remove both forms from the current history entry.
   useEffect(() => {
-    const code = new URLSearchParams(window.location.search).get("invite");
-    if (code) {
-      setPendingInvite(code);
-      window.history.replaceState(null, "", window.location.pathname);
+    const url = new URL(window.location.href);
+    const fragment = new URLSearchParams(url.hash.slice(1));
+    const code = fragment.get("invite") ?? url.searchParams.get("invite");
+    if (code === null) return;
+    if (fragment.has("invite")) {
+      fragment.delete("invite");
+      url.hash = fragment.toString();
     }
+    url.searchParams.delete("invite");
+    window.history.replaceState(window.history.state, "", url);
+    if (code) setPendingInvite(code);
   }, []);
 
   useEffect(() => {
@@ -173,7 +181,7 @@ export default function App() {
   ) : <Splash sub="Connecting…" />}</FullScreen>;
   if (!authed) return <Login notice={sessionError} onLoggedIn={() => { setAuthed(true); refreshStatus(); }} />;
 
-  const network = status?.network ?? "testnet";
+  const network = status?.network;
   const profile = status?.profile;
 
   return (
@@ -194,9 +202,11 @@ export default function App() {
               <span className="max-w-40 truncate" title={profile.name}>{profile.name}</span>
             </span>
           )}
-          <span className="eyebrow shrink-0 rounded-full border px-3 py-1" style={{ borderColor: "var(--border)" }}>
-            {network}
-          </span>
+          {network && (
+            <span className="eyebrow shrink-0 rounded-full border px-3 py-1" style={{ borderColor: "var(--border)" }}>
+              {network}
+            </span>
+          )}
           <ThemeToggle />
           <button onClick={signOut} className="min-h-11 shrink-0 px-1 text-muted transition hover:text-danger">
             Log out
@@ -861,8 +871,7 @@ function Home({
   );
 }
 
-// The in-browser signer's recovery words and removal. Both run on the signer page: it shows
-// the words once and checks three of them, and it asks before deleting anything.
+// Recovery setup stays on the embedded signer; removal requires the separate signer tab.
 function BrowserSignerRecovery() {
   const [hasWords, setHasWords] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
@@ -883,7 +892,7 @@ function BrowserSignerRecovery() {
           : "Set up 24 recovery words. You need them, and each vault's backup file, to restore this signer in another browser."}
       </p>
       {hasWords === false && <Btn disabled={busy} onClick={() => run(async () => { await setupBrowserRecovery(); setHasWords(true); })}>Set up recovery words</Btn>}
-      <Btn variant="ghost" disabled={busy} onClick={() => run(async () => { await removeBrowserSigner(); window.location.reload(); })}>Remove signer from this browser</Btn>
+      <Btn variant="ghost" disabled={busy} onClick={() => run(async () => { if (await manageBrowserCustody()) window.location.reload(); })}>Manage browser signer</Btn>
       <ErrMsg msg={err} />
     </section>
   );
@@ -1139,6 +1148,7 @@ function CeremonyView({
         )}
         {cs.phase === "compare_roster" && !comparesInLokiSigner(cs) && (
           <CompareRoster
+            key={cs.roster_code ?? ""}
             creator={cs.invites !== undefined}
             vault={vault}
             fingerprint={cs.fingerprint}
@@ -1291,10 +1301,8 @@ function CompareRoster({
 }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  // Explicit out-of-band gate: the member must affirm they compared the code on a side channel
-  // before "Confirm" is enabled, so the check can't degrade into trusting the shown value.
+  // The parent keys this form by roster code so a status refresh cannot carry approval over.
   const [checked, setChecked] = useState(false);
-  const phrase = verifyPhrase(fingerprint);
 
   const [confirmedHere, setConfirmedHere] = useState(confirmed);
   useEffect(() => {
@@ -1315,20 +1323,19 @@ function CompareRoster({
 
   return (
     <div>
-      <p className="text-sm text-muted mb-4">
-        Security check: on a call or in person, make sure this code is{" "}
-        <span className="text-foreground">identical</span> for every member. Read the words aloud and
-        match the emoji. Matching codes prove you&apos;re all in the same vault and no one was swapped
-        in — don&apos;t trust the code on this screen alone.
-      </p>
-      {phrase && (
-        <GlassCard className="mb-4 text-center">
-          <h3 className="eyebrow mb-2">Compare this code</h3>
-          <p className="text-2xl mb-2" aria-label={`emoji ${phrase.emoji.join(" ")}`}>{phrase.emoji.join(" ")}</p>
-          <p className="font-mono text-lg font-semibold tracking-wide text-amber break-words">{phrase.words.join(" · ")}</p>
-          {rosterCode && <p className="font-mono text-xl font-semibold tracking-wide">{rosterCode}</p>}
-          <p className="mt-3 font-mono text-xs break-all text-muted">{fingerprint}</p>
-        </GlassCard>
+      {rosterCode ? (
+        <>
+          <p className="text-sm text-muted mb-4">
+            Security check: compare all 24 digits with every member on a call or in person.
+            Confirm only if everyone sees <span className="text-foreground">exactly the same code</span>.
+          </p>
+          <GlassCard className="mb-4 text-center">
+            <h3 className="eyebrow mb-2">Compare this code</h3>
+            <p className="font-mono text-base font-semibold tracking-wide text-amber sm:text-xl">{rosterCode}</p>
+          </GlassCard>
+        </>
+      ) : (
+        <p role="status" className="mb-4 text-sm text-muted">The signer has not provided a roster code. You can’t confirm members without it.</p>
       )}
       {creator && (
         <p className="pill text-muted mb-4">
@@ -1336,14 +1343,14 @@ function CompareRoster({
           {confirmations} of {members} confirmed
         </p>
       )}
-      {!confirmedHere && !allConfirmed && (
+      {rosterCode && !confirmedHere && !allConfirmed && (
         <>
           <label className="glass mb-3 flex items-start gap-3 rounded-2xl p-4 text-left text-sm text-foreground cursor-pointer">
             <input type="checkbox" className="mt-0.5 h-4 w-4 shrink-0 accent-amber" checked={checked}
               onChange={(e) => setChecked(e.target.checked)} />
-            <span>I compared this code with the other members out of band and it matches.</span>
+            <span>I compared all 24 digits with the other members and they match.</span>
           </label>
-          <Btn variant="amber" onClick={agree} disabled={busy || !fingerprint || !rosterCode || !checked}>
+          <Btn variant="amber" onClick={agree} disabled={busy || !fingerprint || !checked}>
             {busy ? "Confirming…" : "Confirm members"}
           </Btn>
         </>
@@ -1580,7 +1587,7 @@ function VaultOverview({
   const [balanceErr, setBalanceErr] = useState<string | null>(null);
   const [retrying, setRetrying] = useState(false);
   const needsTouchID = balanceErr === "Touch ID is required to open this vault.";
-  const [funding, setFunding] = useState(false);
+  const [funding, setFunding] = useState<"idle" | "requesting" | "unconfirmed">("idle");
   const [pending, setPending] = useState<PendingApproval[] | null>(null);
   const [pendingError, setPendingError] = useState<string | null>(null);
   const [pendingVersion, setPendingVersion] = useState(0);
@@ -1645,14 +1652,16 @@ function VaultOverview({
   };
 
   const requestFunds = async () => {
-    if (!address) return;
-    setFunding(true); setLoadErr(null);
+    if (!address || funding !== "idle") return;
+    setFunding("requesting"); setLoadErr(null);
     try {
-      await fund(address);
-      const r = await api<{ balance_zat: number }>("balance", { vault: vault.vault });
-      setBalance(r);
-    } catch (e) { setLoadErr((e as Error).message); }
-    finally { setFunding(false); }
+      const { mined } = await fund(address);
+      setFunding(mined ? "idle" : "unconfirmed");
+      if (mined) setLoadVersion((v) => v + 1);
+    } catch (e) {
+      setLoadErr((e as Error).message);
+      setFunding("idle");
+    }
   };
 
   return (
@@ -1721,7 +1730,7 @@ function VaultOverview({
 
       <GlassCard className="mb-4">
         <Row label="Policy" value={`${vault.threshold} of ${vault.members}`} mono />
-        <Row label="Vault ID" value={short(vault.vault)} mono />
+        <Row label="Vault ID" value={<FullValue value={vault.vault} label="vault ID" />} />
         {address && (
           <Row
             label="Address"
@@ -1734,7 +1743,7 @@ function VaultOverview({
         {signerKind() === "native" && (
           <p className="mt-3 text-sm leading-relaxed text-muted">
             Open <strong>Vault addresses…</strong> in LokiSigner. Give senders the address copied from LokiSigner,
-            or compare both addresses before sharing the one shown here.
+            or compare the full vault ID and address in both places before sharing the one shown here.
           </p>
         )}
       </GlassCard>
@@ -1752,13 +1761,19 @@ function VaultOverview({
           {address.startsWith("uregtest1") && (
             <button
               onClick={requestFunds}
-              disabled={funding}
+              disabled={funding !== "idle"}
               className="btn-glass rounded-full px-4 py-3 text-sm text-amber disabled:opacity-60"
             >
-              {funding ? "Funding…" : "Request test funds"}
+              {funding === "requesting" ? "Funding…" : funding === "unconfirmed" ? "Funding accepted" : "Request test funds"}
             </button>
           )}
         </div>
+      )}
+      {funding === "unconfirmed" && (
+        <p role="status" className="mb-4 text-sm text-muted">
+          The faucet accepted the transfer, but automatic mining could not be verified. Check the regtest node and
+          watch your balance instead of requesting funds again.
+        </p>
       )}
 
       {/* Testnet has no in-app faucet: send the member to an external one with the address. */}
@@ -1816,6 +1831,7 @@ function RecoveryCard({ vault }: { vault: string }) {
   const [words, setWords] = useState<string | null>(null);
   const [mode, setMode] = useState<"idle" | "restoring">("idle");
   const [entry, setEntry] = useState("");
+  const [fingerprint, setFingerprint] = useState("");
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -1850,7 +1866,17 @@ function RecoveryCard({ vault }: { vault: string }) {
     try {
       const { words } = await recoverySetup();
       setWords(words);
-      refresh();
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  };
+
+  const confirmSetup = async () => {
+    if (!words) return;
+    setBusy(true); setErr(null);
+    try {
+      await recoveryConfirm(words);
+      setWords(null);
+      await refresh();
     } catch (e) { setErr((e as Error).message); }
     finally { setBusy(false); }
   };
@@ -1858,9 +1884,9 @@ function RecoveryCard({ vault }: { vault: string }) {
   const restore = async () => {
     setBusy(true); setErr(null); setMsg(null);
     try {
-      await recoveryRestore(vault, entry.trim());
+      await recoveryRestore(vault, entry.trim(), fingerprint.trim() || undefined);
       setMsg("Access restored — your share is rebuilt.");
-      setMode("idle"); setEntry(""); refresh();
+      setMode("idle"); setEntry(""); setFingerprint(""); refresh();
     } catch (e) { setErr((e as Error).message); }
     finally { setBusy(false); }
   };
@@ -1887,15 +1913,15 @@ function RecoveryCard({ vault }: { vault: string }) {
       ) : !status ? null : words ? (
         <div>
           <p className="mb-2 text-xs text-amber">
-            Write these 24 words down and keep them offline. They are shown once. Restoring your
-            share also requires signing in to this account and a stored backup for this vault.
+            Write these 24 words down and keep them offline. Recovery is not active until you
+            confirm. Save each vault&apos;s encrypted backup and its fingerprint separately.
           </p>
           <div className="mb-3 grid grid-cols-2 gap-x-3 gap-y-2 rounded-xl border border-[var(--border)] bg-[var(--surface-2)] p-3 font-mono text-xs sm:grid-cols-3">
             {words.split(/\s+/).map((w, i) => (
               <span key={i}><span className="text-muted">{i + 1}.</span> {w}</span>
             ))}
           </div>
-          <Btn variant="mint" onClick={() => setWords(null)}>I&apos;ve saved them</Btn>
+          <Btn variant="mint" onClick={confirmSetup} disabled={busy}>{busy ? "Confirming…" : "I've saved them"}</Btn>
         </div>
       ) : mode === "restoring" ? (
         <div>
@@ -1908,11 +1934,13 @@ function RecoveryCard({ vault }: { vault: string }) {
             placeholder="word1 word2 … word24"
             className="glass mb-3 w-full rounded-2xl p-3 font-mono outline-none"
           />
+          <label htmlFor="restore-fingerprint" className="mb-2 block text-xs text-muted">SHA-256 fingerprint saved separately from your backup (required for a fresh restore)</label>
+          <input id="restore-fingerprint" value={fingerprint} onChange={(e) => setFingerprint(e.target.value)} autoComplete="off" spellCheck={false} className="glass mb-3 w-full rounded-2xl p-3 font-mono outline-none" />
           <div className="grid gap-3 sm:grid-cols-2">
             <Btn variant="mint" onClick={restore} disabled={busy || !entry.trim()}>
               {busy ? "Restoring…" : "Restore"}
             </Btn>
-            <Btn variant="ghost" onClick={() => { setMode("idle"); setErr(null); }}>Cancel</Btn>
+            <Btn variant="ghost" onClick={() => { setMode("idle"); setEntry(""); setFingerprint(""); setErr(null); }}>Cancel</Btn>
           </div>
         </div>
       ) : (
@@ -1937,6 +1965,8 @@ function RecoveryCard({ vault }: { vault: string }) {
 
 // ─── send ─────────────────────────────────────────────────────────────────────
 
+type DraftQuote = { attempt: string; fee_zat: string; change_zat: string };
+
 function Send({
   vault,
   onBack,
@@ -1949,29 +1979,37 @@ function Send({
   const [recipient, setRecipient] = useState("");
   const [amountTaz, setAmountTaz] = useState("");
   const [memo, setMemo] = useState("");
-  const [draft, setDraft] = useState<{ attempt: string; fee_zat: string; change_zat: string } | null>(null);
+  const [draft, setDraft] = useState<(DraftQuote & { terms: Readonly<{ vault: string; recipient: string; amount_zat: string; memo: string }> }) | null>(null);
+  const termsVersion = useRef(0);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
+  const invalidateDraft = () => {
+    termsVersion.current++;
+    setDraft(null);
+    setErr(null);
+  };
+
   const prepareDraft = async () => {
+    const version = termsVersion.current;
     setBusy(true); setErr(null);
     try {
       const taz = parseFloat(amountTaz);
       if (!Number.isFinite(taz) || taz <= 0) throw new Error("Enter a valid amount in TAZ.");
       const amount_zat = String(Math.round(taz * 1e8));
-      const res = await api<{ attempt: string; fee_zat: string; change_zat: string }>(
-        "payment-draft", { vault: vault.vault, recipient, amount_zat, memo }
-      );
-      setDraft(res);
-    } catch (e) { setErr((e as Error).message); }
-    finally { setBusy(false); }
+      const terms = { vault: vault.vault, recipient, amount_zat, memo };
+      const quote = await api<DraftQuote>("payment-draft", terms);
+      if (version === termsVersion.current) setDraft({ ...quote, terms });
+    } catch (e) {
+      if (version === termsVersion.current) setErr((e as Error).message);
+    } finally { setBusy(false); }
   };
 
   const publish = async () => {
     if (!draft) return;
     setBusy(true); setErr(null);
     try {
-      await api("payment-publish", { vault: vault.vault, attempt: draft.attempt });
+      await api("payment-publish", { vault: draft.terms.vault, attempt: draft.attempt });
       onDraft(draft.attempt);
     } catch (e) { setErr((e as Error).message); }
     finally { setBusy(false); }
@@ -1987,7 +2025,7 @@ function Send({
           <input
             placeholder="Recipient address"
             value={recipient}
-            onChange={(e) => { setRecipient(e.target.value); setDraft(null); }}
+            onChange={(e) => { setRecipient(e.target.value); invalidateDraft(); }}
             className="glass mt-1.5 w-full rounded-full px-5 py-3 font-mono outline-none"
           />
         </label>
@@ -1999,7 +2037,7 @@ function Send({
             step="0.00000001"
             min="0"
             value={amountTaz}
-            onChange={(e) => { setAmountTaz(e.target.value); setDraft(null); }}
+            onChange={(e) => { setAmountTaz(e.target.value); invalidateDraft(); }}
             className="glass mt-1.5 w-full rounded-full px-5 py-3 font-mono outline-none"
           />
         </label>
@@ -2008,7 +2046,7 @@ function Send({
           <input
             placeholder="Memo (optional)"
             value={memo}
-            onChange={(e) => { setMemo(e.target.value); setDraft(null); }}
+            onChange={(e) => { setMemo(e.target.value); invalidateDraft(); }}
             className="glass mt-1.5 w-full rounded-full px-5 py-3 outline-none"
           />
         </label>
@@ -2017,10 +2055,11 @@ function Send({
       {draft && (
         <GlassCard className="mb-4">
           <h3 className="eyebrow mb-3">Transaction summary</h3>
-          <Row label="Recipient" value={short(recipient, 14, 10)} mono />
-          <Row label="Amount" value={`${amountTaz} TAZ`} mono />
+          <Row label="Recipient" value={short(draft.terms.recipient, 14, 10)} mono />
+          <Row label="Amount" value={`${zatToTaz(draft.terms.amount_zat)} TAZ`} mono />
           <Row label="Fee" value={`${zatToTaz(draft.fee_zat)} TAZ`} mono />
           <Row label="Change" value={`${zatToTaz(draft.change_zat)} TAZ`} mono />
+          {draft.terms.memo && <Row label="Memo" value={<span className="whitespace-pre-wrap">{draft.terms.memo}</span>} />}
         </GlassCard>
       )}
 
@@ -2072,7 +2111,6 @@ function ReviewApprove({
   onBack: () => void;
 }) {
   const [review, setReview] = useState<PaymentReview | null>(null);
-  const [approved, setApproved] = useState(false);
   const [session, setSession] = useState<PaymentSession | null>(null);
   const [sessionError, setSessionError] = useState<string | null>(null);
   const [ownSlot, setOwnSlot] = useState<number | null>(null);
@@ -2080,12 +2118,12 @@ function ReviewApprove({
   const [err, setErr] = useState<string | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const triesRef = useRef(0);
+  const approved = session?.approval_requested === true;
 
   const fetchSession = useCallback(async () => {
     try {
       const value = await api<PaymentSession>(`payment-status?vault=${vault.vault}&attempt=${attempt}`);
       setSession(value);
-      if (value.approval_requested) setApproved(true);
       setSessionError(null);
     } catch (e) { setSessionError((e as Error).message); }
   }, [vault.vault, attempt]);
@@ -2131,13 +2169,27 @@ function ReviewApprove({
     setBusy(true); setErr(null);
     try {
       await api("payment-approve", { vault: vault.vault, attempt, review_token: review.review_token, intent_hash: review.intent_hash });
-      setApproved(true);
-      void fetchSession();
+      await fetchSession();
     } catch (e) { setErr((e as Error).message); }
     finally { setBusy(false); }
   };
 
   const isProposer = proposedHere ?? (session && ownSlot !== null ? session.intent.proposer === ownSlot : null);
+
+  if (session && ["confirmed", "replaced", "spent_unverified"].includes(session.phase)) {
+    return (
+      <GlassCard className="text-center">
+        <h2 className="mb-2 text-2xl font-semibold">{paymentLabel(session.phase, false, false)}</h2>
+        <p className="mb-4 text-sm text-muted">
+          {session.phase === "confirmed" ? "The mined transaction matches this payment attempt." :
+            session.phase === "replaced" ? "A different transaction spent this payment’s input on the current chain." :
+              "This payment’s input was spent on the current chain, but the spend hasn’t been verified as this payment."}
+        </p>
+        {session.approval_requested && <p className="mb-4 text-sm text-mint">You approved this payment.</p>}
+        <Btn variant="ghost" onClick={onBack}>Back to History</Btn>
+      </GlassCard>
+    );
+  }
 
   if (approved && session?.phase === "failed") {
     return (
@@ -2288,9 +2340,6 @@ function History({
 }) {
   const { data, error, refresh } = usePayments(vault.vault, true);
   const [sendingHere, setSendingHere] = useState<string | null>(null);
-  const [verifying, setVerifying] = useState<string | null>(null);
-  const [txids, setTxids] = useState<Record<string, string>>({});
-  const [verified, setVerified] = useState<Record<string, boolean>>({});
   const [err, setErr] = useState<string | null>(null);
 
   // Sends the signed transaction through this member's own lightwalletd, or sends it again.
@@ -2303,39 +2352,31 @@ function History({
     finally { setSendingHere(null); }
   };
 
+  const pending = data?.payments.find((p) => p.phase === "broadcast" && p.txid);
+  const verifying = pending?.attempt;
+  const verifyingTxid = pending?.txid;
   useEffect(() => {
-    if (!verifying) return;
-    const attempt = verifying;
-    const txid = txids[attempt];
-    if (!txid) return;
+    if (!verifying || !verifyingTxid) return;
     let timer: ReturnType<typeof setTimeout> | null = null;
     let cancelled = false;
     let tries = 0;
     const tick = async () => {
       try {
-        const res = await api<{ phase: string }>("payment-verify", { vault: vault.vault, attempt, txid });
-        if (!cancelled && res.phase === "confirmed") {
-          setVerified((p) => ({ ...p, [attempt]: true }));
-          setVerifying(null);
+        const res = await api<{ phase: string }>("payment-verify", { vault: vault.vault, attempt: verifying, txid: verifyingTxid });
+        if (!cancelled && res.phase !== "broadcast") {
+          refresh();
           return;
         }
       } catch {}
       tries += 1;
       // Cap at ~1min: the tx is broadcast and its id is shown; stop hammering the host if it's
       // slow to confirm (common on testnet) rather than polling forever and leaking timers.
-      if (cancelled || tries >= 40) { setVerifying(null); return; }
+      if (cancelled || tries >= 40) return;
       timer = setTimeout(tick, 1500);
     };
     timer = setTimeout(tick, 1500);
     return () => { cancelled = true; if (timer) clearTimeout(timer); };
-  }, [verifying, txids, vault.vault]);
-
-  useEffect(() => {
-    const pending = data?.payments.find((p) => p.phase === "broadcast" && p.txid && !txids[p.attempt]);
-    if (!pending?.txid || verifying) return;
-    setTxids((ids) => ({ ...ids, [pending.attempt]: pending.txid! }));
-    setVerifying(pending.attempt);
-  }, [data, txids, verifying]);
+  }, [verifying, verifyingTxid, vault.vault, refresh]);
 
   const payments = data?.payments ?? [];
 
@@ -2358,11 +2399,12 @@ function History({
       ) : (
         <div className="space-y-3">
           {payments.map((p) => {
-            const confirmed = !!verified[p.attempt] || p.phase === "confirmed";
+            const confirmed = p.phase === "confirmed";
             const replaced = p.phase === "replaced";
-            const txid = !replaced ? p.txid ?? txids[p.attempt] ?? null : null;
+            const unverified = p.phase === "spent_unverified";
+            const txid = p.txid;
             const sending = !!p.sending || sendingHere === p.attempt;
-            const settled = confirmed || replaced || ["cancelled", "expired"].includes(p.phase);
+            const settled = confirmed || replaced || unverified || ["cancelled", "expired"].includes(p.phase);
             return (
             <GlassCard key={p.attempt}>
               <div className="mb-2 flex flex-col items-start gap-3 sm:flex-row sm:justify-between">
@@ -2375,13 +2417,16 @@ function History({
                     Replaces payment {short(p.replaces.attempt, 6, 4)} with the same note{p.replaces.cancel ? "; the note goes back to the vault" : ""}.
                   </p>}
                 </div>
-                <span className={`rounded-full px-2.5 py-0.5 text-xs font-medium shrink-0 ${PHASE_PILL[confirmed ? "confirmed" : p.phase] ?? "border border-[var(--border)] bg-[var(--surface-2)] text-muted"}`}>
-                  {paymentLabel(confirmed ? "confirmed" : p.phase, false, sending && !settled)}
+                <span className={`rounded-full px-2.5 py-0.5 text-xs font-medium shrink-0 ${PHASE_PILL[p.phase] ?? "border border-[var(--border)] bg-[var(--surface-2)] text-muted"}`}>
+                  {paymentLabel(p.phase, false, sending && !settled)}
                 </span>
               </div>
               {p.signers && !txid && !settled && <SignerList signers={p.signers} threshold={vault.threshold} approvals={p.approvals} complete={p.phase === "approved"} />}
               {replaced && <p className="text-xs text-muted">
-                Another transaction spent this payment’s note in a mined block{p.replaced_by ? ` (${short(p.replaced_by, 8, 6)})` : ""}, so this one can never be mined. Its reservation is released.
+                Another transaction spent this payment’s note on the current chain{p.spent_by ? ` (${short(p.spent_by, 8, 6)})` : ""}.
+              </p>}
+              {unverified && <p className="text-xs text-muted">
+                This payment’s note was spent on the current chain{p.spent_by ? ` (${short(p.spent_by, 8, 6)})` : ""}, but the spend hasn’t been matched to this attempt.
               </p>}
               {txid && !confirmed && p.phase === "signed" && <p className="text-xs text-muted">
                 Signed by {vault.threshold} members. This device holds the final transaction{p.can_send ? " and can send it" : ""}.
@@ -2397,11 +2442,11 @@ function History({
                 >
                   Review / approve
                 </button>}
-                {p.can_discard && <button className="btn-glass flex-1 rounded-full px-4 py-2 text-sm" onClick={async () => {
+                {(p.can_discard || p.can_dismiss) && <button className="btn-glass flex-1 rounded-full px-4 py-2 text-sm" onClick={async () => {
                   setErr(null);
                   try { await api("payment-discard", { vault: vault.vault, attempt: p.attempt }); refresh(); }
                   catch (e) { setErr((e as Error).message); }
-                }}>{p.error || p.phase === "failed" ? "Discard failed payment" : "Cancel payment"}</button>}
+                }}>{p.can_dismiss ? "Dismiss on this device" : p.error || p.phase === "failed" ? "Discard failed payment" : "Cancel payment"}</button>}
                 {(p.can_send || sending) && !settled && (
                   <button
                     onClick={() => send(p.attempt)}

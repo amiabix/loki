@@ -30,25 +30,25 @@ open "$app"
 
 For a provisioned Release build, prepare with `flutter build macos --release --config-only`, then use `-configuration Release` in the Xcode command and `Build/Products/Release` for the app path. Do not pass the ad-hoc signing or visual-only overrides below to a provisioned build.
 
-Pair using a plain HTTPS coordinator origin, for example `https://wallet.example` without a path, trailing slash or credentials. The coordinator must serve a **testnet** `/api/signer-config` with HTTPS endpoints for frostd, lightwalletd and both nonce witnesses. The embedded app rejects loopback HTTP even on the same Mac. Real pairing, restore and signing use the existing Secure Enclave/Touch ID policy. A valid signature and matching provisioning profile are needed for the existing profile's Keychain items.
+Pair using a plain HTTPS coordinator origin, for example `https://wallet.example` without a path, trailing slash or credentials. The coordinator must serve a **testnet** `/api/signer-config` with HTTPS endpoints for frostd, lightwalletd and both nonce witnesses. When the app asks you to verify the witnesses, get the pair fingerprint from the witness operators through a trusted channel, not from the wallet. The embedded app rejects loopback HTTP even on the same Mac. Real pairing, restore and signing use the existing Secure Enclave/Touch ID policy. A valid signature and matching provisioning profile are needed for the existing profile's Keychain items.
 
 The workspace footer shows the active signer's pinned origin as **Paired coordinator**. It is read-only and does not indicate whether the coordinator is reachable.
 
 ### Vaults across Macs
 
-The coordinator origin is separate from the creator's peer endpoint. The creator places `--peer 1=...` in new invites; without it, those invites name the creator's loopback port and are unusable from a different Mac. Use a reachable TLS reverse proxy to forward the peer routes (`/api/enroll`, `/api/roster`, `/api/agreed`, `/api/session`) to the creator's fixed local port. `--advertise-url` is the member's own registration address; it does **not** set the invite URL. Pass flags as separate arguments, with canonical HTTPS origins, no trailing slash, path, query or credentials:
+The coordinator origin is separate from the creator's peer endpoint. The creator places `--peer 1=...` in new invites. For cross-Mac ceremonies, configure the dedicated loopback `--peer-port` and its public HTTPS `--advertise-url` together. Use a TLS reverse proxy to forward only peer routes (`/api/enroll`, `/api/roster`, `/api/agreed`, `/api/session`) to that peer port, **not** to the member API on `--port`. Pass flags as separate arguments, with canonical HTTPS origins, no trailing slash, path, query or credentials:
 
 ```sh
 # On the creator (quit an existing LokiSigner instance before relaunching):
-open "$app" --args --port 3601 \
+open "$app" --args --peer-port 3601 \
   --advertise-url https://creator-peer.example --peer 1=https://creator-peer.example
 
-# On a joiner (use its own advertised endpoint if it has one):
-open "$app" --args --port 3602 \
+# On a joiner with its own advertised endpoint:
+open "$app" --args --peer-port 3602 \
   --advertise-url https://joiner-peer.example --peer 1=https://creator-peer.example
 ```
 
-The joiner must trust the exact creator origin from its own `--peer` flag or its already-paired coordinator; a pasted invite cannot set a new network destination. The Runner also accepts `--data /absolute/path` to select a different local profile. Quit the app before changing launch flags. Keep the member listener on loopback and do not expose unrelated member routes in the reverse proxy.
+The joiner must configure the exact creator origin in its own `--peer` flag, even if that origin is also its paired coordinator. A pasted invite cannot set a new network destination. The Runner also accepts `--data /absolute/path` to select a different local profile. Quit the app before changing launch flags.
 
 ## Ad-hoc build and window capture
 

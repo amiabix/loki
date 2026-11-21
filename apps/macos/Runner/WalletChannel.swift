@@ -38,7 +38,7 @@ final class WalletChannel {
         var flags: [String] = []
         var rest = arguments.makeIterator()
         while let option = rest.next() {
-            let supported = ["--data", "--port", "--peer", "--advertise-url"]
+            let supported = ["--data", "--port", "--peer-port", "--peer", "--advertise-url"]
             if supported.contains(where: { option.hasPrefix($0 + "=") }) { return nil }
             if !supported.contains(option) { continue }
             guard let value = rest.next(), !value.isEmpty, !value.hasPrefix("--") else { return nil }
@@ -96,6 +96,9 @@ final class WalletChannel {
         case "addresses":
             guard noArgs else { result(invalid); return }
             run(result, work: { nativeReply(loki_member_app_vault_addresses()) }) { reply in
+                guard loki_member_app_can_view_addresses() != 0 else {
+                    result(self.failure(401, "LokiSigner is locked.")); return
+                }
                 guard let rows = reply["vaults"] as? [[String: Any]] else {
                     result(self.failure(500, reply["error"] as? String ?? "Couldn’t check vault addresses.")); return
                 }

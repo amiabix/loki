@@ -652,6 +652,12 @@ private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointe
         DispatchQueue.main.async { NativeSigner.embeddedSigner?.showBlockedFee() }
         return 0
     }
+    if event == "locked" {
+        RunLoop.main.perform(inModes: [.common, .modalPanel]) {
+            NativeSigner.current?.didLock()
+        }
+        return 0
+    }
     if event == "registration-warning" || event == "registration-key" || event == "registration-key-gone" {
         // Rust supplies fixed copy here. Don't block its retry loop on an open dialog.
         DispatchQueue.main.async { NativeSigner.current?.warnRegistration(event, message: text) }
@@ -727,7 +733,7 @@ private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointe
     }
 }
 
-final class NativeSigner: NSObject, NSApplicationDelegate {
+final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     fileprivate private(set) static var embeddedMode = false
     fileprivate static weak var embeddedSigner: NativeSigner?
     fileprivate static var current: NativeSigner? { embeddedSigner ?? (NSApp.delegate as? NativeSigner) }
@@ -766,7 +772,8 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
     private var presence: SignerPresence?
     private var lastStartError: String?
     private let args: [String]
-    private let initialLink: String?
+    private var initialLink: String?
+    let vaultAddresses = VaultAddressesWindow()
     private lazy var statusWindow = SignerStatusWindow(load: { [args = self.args] in
         nativeQuery(loki_member_app_status, ["args": args])
     }, localError: { [weak self] in self?.lastStartError }, canUnlock: { [weak self] in
@@ -792,20 +799,37 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         DispatchQueue.main.async {
             guard !self.opened else { return }
             self.opened = true
-            if self.initialLink == nil, self.profile()["profile"] as? String == "fresh" {
+            let link = self.initialLink
+            self.initialLink = nil
+            if link == nil, self.profile()["profile"] as? String == "fresh" {
                 self.showStatus(nil)
             } else {
-                self.start(self.initialLink)
+                self.start(link)
             }
         }
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
+        // An external event must never interrupt a live signer or offer to replace its profile.
+        guard !running, !lockingForAbsence else { return }
+        var failure = SignerStartFailure.invalidLink
+        for url in urls {
+            guard let link = unusedPairingLink(url.absoluteString) else { continue }
+            let reply = nativeQuery(loki_member_app_pairing_target, ["args": args, "pairing_url": link])
+            if reply["target"] != nil {
+                opened = true
+                initialLink = nil
+                if prompting || NSApp.modalWindow != nil { queuedLink = link }
+                else { start(link) }
+                return
+            }
+            if reply["error"] as? String == "different-pairing" { failure = .differentPairing }
+        }
+        guard !urls.isEmpty, !prompting, NSApp.modalWindow == nil else { return }
         opened = true
-        guard !lockingForAbsence else { return }
-        guard let link = urls.lazy.map(\.absoluteString).first(where: { self.unusedPairingLink($0) != nil }) else { return }
-        if prompting { queuedLink = link }
-        else { start(link) }
+        initialLink = nil
+        lastStartError = failure.message
+        showStatus(nil)
     }
 
     private func unusedPairingLink(_ link: String?) -> String? {
@@ -828,6 +852,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
     private func lockForAbsence() {
         guard running, !startingOver, !lockingForAbsence else { return }
         lockingForAbsence = true
+        didLock()
         SignerLog.write("LokiSigner locked because the Mac was unattended.")
         finishLockRequest()
         // The Swift worker can be starting before Rust installs its stop handle. Also unwind
@@ -978,6 +1003,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         lockCompletions.append(completion)
         // If Rust already exited, its queued stopped() callback still drains and completes lock.
         _ = loki_member_app_stop()
+        didLock()
         leaveNativePrompt()
         return true
     }
@@ -1059,7 +1085,8 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         recoveringKey = recover
         if running {
             startingOver = loki_member_app_stop() != 0
-            if !startingOver {
+            if startingOver { didLock() }
+            else {
                 DispatchQueue.main.async {
                     if self.running { self.retry(.setAsideFailed, link: self.retryLink) }
                 }
@@ -1096,7 +1123,13 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         ready = true
         prompting = false
         queuedLink = nil
+        vaultAddresses.setUnlocked(true)
         if embedded { finishWalletOperation() }
+    }
+
+    fileprivate func didLock() {
+        ready = false
+        vaultAddresses.setUnlocked(false)
     }
 
     fileprivate func warnRegistration(_ event: String, message: String) {
@@ -1125,7 +1158,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
     }
 
     private func stopped(_ failure: SignerStartFailure, link: String?) {
-        ready = false
+        didLock()
         if embedded {
             walletWork.notify(queue: .main) { self.finishStopped(failure, link: link) }
         } else {
@@ -1158,26 +1191,27 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         }
     }
 
-    func start(_ link: String?) {
-        guard !prompting, !lockingForAbsence else { return }
+    private func start(_ link: String?) {
+        guard !running, !prompting, !lockingForAbsence, NSApp.modalWindow == nil else { return }
         let link = unusedPairingLink(link)
+        var launch: [String: Any] = ["args": args]
+        var target: (origin: String, slot: String)?
+        if let link {
+            launch["pairing_url"] = link
+            let reply = nativeQuery(loki_member_app_pairing_target, launch)
+            guard let checked = reply["target"] as? [String: Any], let origin = checked["coordinator"] as? String,
+                  let slot = (checked["slot"] as? NSNumber)?.stringValue else {
+                lastStartError = (reply["error"] as? String == "different-pairing"
+                    ? SignerStartFailure.differentPairing : .invalidLink).message
+                showStatus(nil)
+                return
+            }
+            target = (origin, slot)
+        }
         prompting = true
         queuedLink = nil
         retryLink = link
         NSApp.activate(ignoringOtherApps: true)
-        if running {
-            if embedded { finishWalletOperation(); return }
-            let alert = NSAlert()
-            alert.messageText = "This signer is already running"
-            let state = profile()["profile"] as? String
-            alert.informativeText = state == "vault" ? SignerStartFailure.protectedProfile.message
-                : "This profile is unlocked. Quit to lock it, or start over if you intended to use a different profile."
-            alert.addButton(withTitle: "OK")
-            if state == "profile" { alert.addButton(withTitle: "Start over…") }
-            if alert.runModal() == .alertSecondButtonReturn, confirmStandaloneSetAside() { return }
-            prompting = false
-            return
-        }
         let location = startupProfile()
         guard let state = location["profile"] as? String else {
             retry(location["error"] as? String == "data-folder-unavailable" ? .dataFolderUnavailable : .unexpected, link: link)
@@ -1197,7 +1231,14 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
                 return
             }
         }
-        loadConfiguration(link: link)
+        if let target {
+            confirmCoordinator(target.origin, slot: target.slot) { answer in
+                guard answer == .alertFirstButtonReturn else { self.retry(.cancelled, link: link); return }
+                self.fetchConfiguration(link: link, launch: launch)
+            }
+        } else {
+            fetchConfiguration(link: link, launch: launch)
+        }
     }
 
     private func loadConfiguration(link: String?, approvedOrigin: String? = nil) {
@@ -1292,6 +1333,42 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         return flags.isEmpty ? [] : [SignerReview.info("Launch-only settings", "Overrides: \(flags.joined(separator: ", ")). The configuration shown is not saved.", warning: true)]
     }
 
+    private func confirmWitnesses(_ config: [String: Any], mismatch: Bool = false,
+                                  then: @escaping (String?) -> Void) {
+        guard let expected = config["witness_fingerprint"] as? String else { then(nil); return }
+        let instruction = "Paste the 64-character pair fingerprint from the witness operators through a channel you trust, not from the wallet. An old signing attempt cannot use replacement witnesses."
+        let warning = "That fingerprint does not match. Check it independently before approving."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 420, height: 26))
+        field.placeholderString = "Witness fingerprint"
+        field.setAccessibilityLabel("Witness fingerprint")
+        if embedded {
+            let r = SignerReview.self
+            let error = mismatch ? [r.info("Fingerprint mismatch", warning, warning: true)] : []
+            presentPrompt(SignerReview(section: "Signer configuration", title: "Verify the nonce witnesses",
+                intro: instruction, content: error + [r.card("Witness fingerprint", [field])],
+                hint: "Cancel leaves your configuration unchanged.", actions: ["Approve witnesses", "Cancel"], primary: 0),
+                fields: [field], completion: { answer in
+                    guard answer == .alertFirstButtonReturn else { then(nil); return }
+                    let code = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                    if code == expected { then(code) }
+                    else { self.confirmWitnesses(config, mismatch: true, then: then) }
+                })
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Verify the nonce witnesses"
+        alert.informativeText = instruction
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Approve witnesses")
+        alert.addButton(withTitle: "Cancel")
+        while runDecisionAlert(alert, escape: .alertSecondButtonReturn, fields: [field]) == .alertFirstButtonReturn {
+            let code = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if code == expected { then(code); return }
+            alert.informativeText = warning
+        }
+        then(nil)
+    }
+
     /// Shows the configuration before anything is saved; the member continues with exactly it.
     private func confirm(link: String?, launch: [String: Any], reply: [String: Any], fresh: Bool) {
         guard let config = reply["config"] as? [String: Any] else {
@@ -1300,6 +1377,15 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
             return
         }
         if embedded, config["network"] as? String != "testnet" { retry(.testnetOnly, link: link); return }
+        if config["confirm_witness_fingerprint"] as? Bool == true, launch["witness_confirmation"] == nil {
+            confirmWitnesses(config) { code in
+                guard let code else { self.retry(.cancelled, link: link); return }
+                var verified = launch
+                verified["witness_confirmation"] = code
+                self.confirm(link: link, launch: verified, reply: reply, fresh: fresh)
+            }
+            return
+        }
         let slot = (config["slot"] as? NSNumber)?.stringValue ?? "?"
         let password = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 420, height: 26))
         password.placeholderString = "Local profile passphrase"
@@ -1459,6 +1545,15 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
             return
         }
         if embedded, config["network"] as? String != "testnet" { retry(.testnetOnly, link: retryLink); return }
+        if config["confirm_witness_fingerprint"] as? Bool == true, launch["witness_confirmation"] == nil {
+            confirmWitnesses(config) { code in
+                guard let code else { self.retry(.cancelled, link: self.retryLink); return }
+                var verified = launch
+                verified["witness_confirmation"] = code
+                self.confirmRecovery(launch: verified, reply: reply)
+            }
+            return
+        }
         let next: (NSApplication.ModalResponse) -> Void = { answer in
             guard answer == .alertFirstButtonReturn else { self.retry(.cancelled, link: self.retryLink); return }
             self.restoreProfile(launch: launch, config: config)
@@ -1591,6 +1686,19 @@ final class NativeSigner: NSObject, NSApplicationDelegate {
         loki_member_app_disconnect_wallet_tabs()
     }
 
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(startOver(_:)) {
+            return !prompting && !lockingForAbsence && NSApp.modalWindow == nil && profile()["profile"] as? String == "profile"
+        }
+        return true
+    }
+
+    @objc fileprivate func startOver(_ sender: NSMenuItem) {
+        guard validateMenuItem(sender) else { return }
+        prompting = true
+        if !confirmStandaloneSetAside() { prompting = false }
+    }
+
     @objc func showStatus(_ sender: Any?) { statusWindow.show() }
 
     @objc func showLog(_ sender: Any?) { SignerLog.showInFinder() }
@@ -1613,13 +1721,14 @@ func runNativeSigner(arguments: [String], link: String?) -> Never {
     let item = NSMenuItem()
     let actions = NSMenu(title: "LokiSigner")
     let delegate = NativeSigner(args: nativeSignerArguments(arguments), link: link)
-    let vaultAddresses = VaultAddressesWindow()
     let status = actions.addItem(withTitle: "Status…", action: #selector(NativeSigner.showStatus(_:)), keyEquivalent: "")
     status.target = delegate
     let showAddresses = actions.addItem(withTitle: "Vault addresses…", action: #selector(VaultAddressesWindow.show(_:)), keyEquivalent: "")
-    showAddresses.target = vaultAddresses
+    showAddresses.target = delegate.vaultAddresses
     let restore = actions.addItem(withTitle: "Restore a vault…", action: #selector(NativeSigner.restoreVault(_:)), keyEquivalent: "")
     restore.target = delegate
+    let startOver = actions.addItem(withTitle: "Start over…", action: #selector(NativeSigner.startOver(_:)), keyEquivalent: "")
+    startOver.target = delegate
     let log = actions.addItem(withTitle: "Show Log in Finder", action: #selector(NativeSigner.showLog(_:)), keyEquivalent: "")
     log.target = delegate
     actions.addItem(.separator())
@@ -1630,7 +1739,7 @@ func runNativeSigner(arguments: [String], link: String?) -> Never {
     menu.addItem(item)
     app.mainMenu = menu
     app.delegate = delegate
-    withExtendedLifetime((delegate, vaultAddresses)) { app.run() }
+    withExtendedLifetime(delegate) { app.run() }
     exit(0)
 }
 
