@@ -602,11 +602,14 @@ impl Signer {
         self.scan_next_impl().map_err(|e| JsError::new(&e))
     }
 
-    /// Scan the next compact block (protobuf bytes from lightwalletd's `GetBlockRange`).
-    #[wasm_bindgen(js_name = scanBlock)]
-    pub fn scan_block(&mut self, block: &[u8]) -> Result<(), JsError> {
+    /// Scan one complete range of compact block protobufs from lightwalletd atomically.
+    #[wasm_bindgen(js_name = scanBlocks)]
+    pub fn scan_blocks(&mut self, start: u32, end: u32, blocks: Vec<js_sys::Uint8Array>) -> Result<(), JsError> {
         let (_, scan) = self.scan.as_mut().ok_or_else(|| JsError::new("call scanNext first"))?;
-        scan.scan(block).map_err(|e| JsError::new(&e))
+        if start != scan.next_height() || end < start || blocks.len().checked_sub(1) != Some((end - start) as usize) {
+            return Err(JsError::new("compact block range does not match this scan"));
+        }
+        scan.scan_batch(blocks.into_iter().map(|block| block.to_vec())).map_err(|e| JsError::new(&e))
     }
 
     /// Seal the scan state under the custody KEK and save it, so the next scan resumes here.

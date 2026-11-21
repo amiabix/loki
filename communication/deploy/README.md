@@ -113,11 +113,15 @@ slash), not `*` — `*` is incompatible with the `authorization` bearer header b
 ## lightwalletd behind gRPC-web + CORS for the in-browser signer (`lightwalletd-grpcweb.sh`)
 
 The in-browser signer scans the chain for its vault balance itself, from the signer page. A
-browser cannot make native gRPC calls (HTTP/2 trailers), and lightwalletd sends no CORS:
-`testnet.zec.rocks` answers a preflight with 404 and replies `application/grpc`.
-`lightwalletd-grpcweb.sh` runs Envoy (docker, `envoyproxy/envoy:v1.31.2`) with its `grpc_web`
-and CORS filters in front of lightwalletd, for ONE origin: the signer origin, where the scan
-runs. Only the `cash.z.wallet.sdk.rpc.CompactTxStreamer` service is routed.
+browser cannot make native gRPC calls (HTTP/2 trailers). `lightwalletd-grpcweb.sh` uses
+Node.js 22+ to translate binary gRPC-web to native gRPC over verified TLS. It enables CORS
+for the exact signer origin, not the wallet origin, and forwards only `GetLatestBlock` and
+height-only `GetBlockRange` (up to 500 blocks inclusive).
+
+The proxy allows four simultaneous RPCs per peer IP and 32 overall, with a 25-second
+deadline through the end of the response. A TLS terminator or tunnel shares the peer budget
+and should enforce its own per-client limits for fairness. Untrusted forwarding headers do
+not change the proxy's budget.
 
 ```sh
 ORIGIN=http://localhost:3002 communication/deploy/lightwalletd-grpcweb.sh
@@ -127,16 +131,16 @@ ORIGIN=http://localhost:3002 communication/deploy/lightwalletd-grpcweb.sh
 Check it answers the preflight for the signer origin and a gRPC-web call:
 
 ```sh
-curl -si -X OPTIONS http://127.0.0.1:9068/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo \
+curl -si -X OPTIONS http://127.0.0.1:9068/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock \
   -H 'Origin: http://localhost:3002' -H 'Access-Control-Request-Method: POST' \
   -H 'Access-Control-Request-Headers: content-type,x-grpc-web' | grep -i access-control
-printf '\0\0\0\0\0' | curl -s -X POST http://127.0.0.1:9068/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo \
+printf '\0\0\0\0\0' | curl -s -X POST http://127.0.0.1:9068/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock \
   -H 'Origin: http://localhost:3002' -H 'content-type: application/grpc-web+proto' -H 'x-grpc-web: 1' \
   --data-binary @- | strings | head -3
 ```
 
-The listener is plaintext, which suits a loopback dev signer origin; an https signer origin
-needs it behind TLS, as `frostd-tls.sh` puts frostd.
+The listener is plaintext and defaults to `LISTEN=127.0.0.1:9068`. For a public signer,
+keep it on loopback and put it behind a TLS terminator.
 
 ## Public HTTPS bringup (`public-testnet.sh`)
 

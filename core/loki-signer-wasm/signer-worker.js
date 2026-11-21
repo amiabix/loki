@@ -271,7 +271,8 @@ async function chainScan(signer, p) {
   for (let rescanned = false; ;) {
     try {
       for (let next = signer.scanNext(); next <= tip; next = signer.scanNext()) {
-        for (const block of await blockRange(p.lightwalletdGrpcWeb, next, Math.min(tip, next + 499))) signer.scanBlock(block);
+        const end = Math.min(tip, next + 499);
+        signer.scanBlocks(next, end, await blockRange(p.lightwalletdGrpcWeb, next, end));
         signer.scanSave();
       }
       break;
