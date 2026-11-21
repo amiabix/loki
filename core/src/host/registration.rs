@@ -54,13 +54,7 @@ impl RegistrationConfig {
     pub(super) fn from_args(args: &[String], development_http: bool) -> Result<Option<Self>, String> {
         let value = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
         if args.iter().any(|a| a == "--pairing-url") {
-            if args.iter().any(|a| matches!(a.as_str(), "--coordinator-url" | "--registration-slot")) {
-                return Err("pairing link already specifies coordinator and slot".into());
-            }
-            let mut launch = Self::pairing(&value("--pairing-url").ok_or("--pairing-url needs a link")?, development_http)?;
-            launch.passphrase_file = Some(value("--local-passphrase-file").ok_or("--local-passphrase-file is required for local unlock")?.into());
-            launch.name = value("--profile-name").unwrap_or_else(|| "Member".into());
-            return Ok(Some(launch));
+            return Err("pairing links are not accepted in command arguments".into());
         }
         let Some(coordinator) = value("--coordinator-url") else {
             if args.iter().any(|a| matches!(a.as_str(), "--coordinator-url" | "--local-passphrase-file" | "--registration-slot" | "--profile-name")) {
@@ -475,9 +469,9 @@ async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option
             else { println!("Member {} ({}) — save these recovery words privately (shown once): {}", launch.name, st.config.data.display(), words.as_str()); }
         }
     } else if !super::recovery::exists(&st.config.data) {
-        // Standard output is redirected (to a log file, typically beside the sealed share), so
+        // Standard output is redirected (for example, to a startup pipe), so
         // the words are never minted here. POST /api/recovery-setup returns them to the caller.
-        println!("{} ({}) — recovery words not set up: output is not a terminal, so they are not printed; set them up with POST /api/recovery-setup", launch.name, st.config.data.display());
+        eprintln!("{} ({}) — recovery words not set up: output is not a terminal, so they are not printed; set them up with POST /api/recovery-setup", launch.name, st.config.data.display());
     }
     let data = st.config.data.clone();
     let secret = pass.clone();
@@ -583,7 +577,7 @@ async fn keep_registering(st: Shared, pass: Zeroizing<String>, restored: bool, n
     loop {
         match register_once(&st, pass.clone(), pairing_claim.take(), None).await {
             Ok(member) => {
-                println!("Public roster slot: {}", member.slot);
+                eprintln!("Public roster slot: {}", member.slot);
                 return;
             }
             Err(e) => {

@@ -4,9 +4,9 @@ use loki_relay_protocol::{
     challenge::{self, ChallengeResponse},
     envelope,
     http::{decode_append_update, decode_creation},
-    nonce::{self, NonceReceipt},
+    nonce::{self, Claimant, ClaimProof, NonceReceipt},
     receipt,
-    types::{CreationResult, Id32, Object, ReceiptBody, RelayPin},
+    types::{CreationResult, Id32, Object, ReceiptBody, RelayPin, MAX_MEMBERS},
 };
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
@@ -19,6 +19,8 @@ const OBJECT_SCHEMA: &str =
     "-- Object schema is installed after mailbox authentication, including existing roots.\n";
 const NONCE_SCHEMA: &str =
     "-- First-writer-wins nonce claims survive relay restarts for the lifetime of this root.\n";
+// Budget for row keys, hashes, SQLite record headers and B-tree overhead, in addition to wire.
+const NONCE_ROW_BYTES: u64 = 512;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Limits {
@@ -189,6 +191,57 @@ impl Limits {
 }
 
 impl RelayStore {
+    /// Admit a vault member from a trusted roster. The offline operator reserves a separate
+    /// claim budget up front, so a claimant cannot consume another member's allotment.
+    pub fn enroll_nonce_claimant(
+        &mut self,
+        mailbox: Id32,
+        who: Claimant,
+        quota: u64,
+    ) -> RelayResult<()> {
+        if who.vault == [0; 32] || !(1..=MAX_MEMBERS).contains(&who.slot) || quota <= NONCE_ROW_BYTES
+            || ed25519_dalek::VerifyingKey::from_bytes(&who.key).map_or(true, |key| key.is_weak())
+        {
+            return Err(RelayError::MalformedRequest);
+        }
+        let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if setup_state(&tx, mailbox)?.is_some() {
+            return Err(RelayError::Capability);
+        }
+        let limit: u64 = tx.query_row(
+            "SELECT byte_quota FROM mailboxes WHERE id=?1", [mailbox.as_slice()], |r| r.get(0),
+        ).optional()?.ok_or(RelayError::Capability)?;
+        let relay_limit: u64 = tx.query_row("SELECT total_bytes FROM metadata", [], |r| r.get(0))?;
+        tx.execute_batch(SCHEMA.split_once(NONCE_SCHEMA).ok_or(RelayError::StorageUnavailable)?.1)?;
+        let prior: Option<(Vec<u8>, u64)> = tx.query_row(
+            "SELECT signing_key,quota FROM nonce_claimants WHERE mailbox=?1 AND vault=?2 AND slot=?3",
+            params![mailbox.as_slice(), who.vault.as_slice(), who.slot], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional()?;
+        let prior_quota = match prior {
+            Some((key, old_quota)) if key == who.key && old_quota <= quota => old_quota,
+            Some(_) => return Err(RelayError::Conflict),
+            None => 0,
+        };
+        // Legacy rows have no trustworthy owner. Charge their full storage to both shared
+        // budgets without rewriting them or resetting the old object-accounting counters.
+        for (scope, limit) in [(Some(mailbox.as_slice()), limit), (None, relay_limit)] {
+            let reserved: u64 = tx.query_row(
+                "SELECT (SELECT coalesce(sum(quota),0) FROM nonce_claimants WHERE ?1 IS NULL OR mailbox=?1)
+                      + (SELECT coalesce(sum(length(wire)+?2),0) FROM nonce_uses WHERE ?1 IS NULL OR mailbox=?1)",
+                params![scope, NONCE_ROW_BYTES], |r| r.get(0),
+            )?;
+            reserved.checked_add(quota - prior_quota).filter(|n| *n <= limit)
+                .ok_or(RelayError::QuotaExhausted)?;
+        }
+        tx.execute(
+            "INSERT INTO nonce_claimants (mailbox,vault,slot,signing_key,quota,used_bytes)
+             VALUES (?1,?2,?3,?4,?5,0) ON CONFLICT (mailbox,vault,slot) DO UPDATE SET quota=excluded.quota",
+            params![mailbox.as_slice(), who.vault.as_slice(), who.slot, who.key.as_slice(), quota],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Atomically claim a commitment ID. A duplicate is reported as `created=false`,
     /// even when its encrypted record is identical: it must never authorize re-signing.
     pub fn claim_nonce(
@@ -197,7 +250,7 @@ impl RelayStore {
         cid: Id32,
         challenge: Id32,
         wire: &[u8],
-        owner_read: &Capability,
+        proof: &ClaimProof,
     ) -> RelayResult<(bool, Vec<u8>)> {
         if wire.is_empty() || wire.len() > nonce::MAX_RECORD || challenge == [0; 32] {
             return Err(RelayError::MalformedRequest);
@@ -205,35 +258,33 @@ impl RelayStore {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let verifier: Option<Vec<u8>> = tx
-            .query_row(
-                "SELECT read_verifier FROM mailboxes WHERE id=?1",
-                [mailbox.as_slice()],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|_| RelayError::Capability)?;
-        let verifier: Id32 = verifier
-            .ok_or(RelayError::Capability)?
-            .try_into()
-            .map_err(|_| RelayError::StorageUnavailable)?;
-        if setup_state(&tx, mailbox)?.is_some() {
-            return Err(RelayError::Capability);
-        }
-        if !owner_read.verify(Role::Read, mailbox, &verifier) {
-            return Err(RelayError::Capability);
-        }
-        tx.execute_batch(
-            SCHEMA
-                .split_once(NONCE_SCHEMA)
-                .ok_or(RelayError::StorageUnavailable)?
-                .1,
+        let enrolled: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='nonce_claimants')",
+            [], |r| r.get(0),
         )?;
+        if !enrolled || setup_state(&tx, mailbox)?.is_some() {
+            return Err(RelayError::Capability);
+        }
+        let who = proof.claimant;
+        let (used, quota): (u64, u64) = tx.query_row(
+            "SELECT used_bytes,quota FROM nonce_claimants WHERE mailbox=?1 AND vault=?2 AND slot=?3 AND signing_key=?4",
+            params![mailbox.as_slice(), who.vault.as_slice(), who.slot, who.key.as_slice()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional()?.ok_or(RelayError::Capability)?;
+        let pin = RelayPin { key: self.root.public_key, run: self.root.run_id };
+        ed25519_dalek::VerifyingKey::from_bytes(&who.key)
+            .and_then(|key| key.verify_strict(
+                &nonce::claim_input(who, &pin, mailbox, cid, challenge, wire),
+                &ed25519_dalek::Signature::from_bytes(&proof.signature),
+            ))
+            .map_err(|_| RelayError::Capability)?;
         let record_hash: Id32 = Sha256::digest(wire).into();
         let old: Option<(Vec<u8>, Vec<u8>)> = tx
             .query_row(
-                "SELECT record_hash,wire FROM nonce_uses WHERE mailbox=?1 AND cid=?2",
-                params![mailbox.as_slice(), cid.as_slice()],
+                "SELECT record_hash,wire FROM nonce_uses WHERE mailbox=?1 AND cid=?2
+                 UNION ALL
+                 SELECT record_hash,wire FROM nonce_claims WHERE mailbox=?1 AND cid=?2 AND vault=?3 AND slot=?4 LIMIT 1",
+                params![mailbox.as_slice(), cid.as_slice(), who.vault.as_slice(), who.slot],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
@@ -246,45 +297,21 @@ impl RelayStore {
                     false
                 }
                 None => {
-                    let length = wire.len() as u64;
-                    let (used, quota): (u64, u64) = tx.query_row(
-                        "SELECT used_bytes,byte_quota FROM mailboxes WHERE id=?1",
-                        [mailbox.as_slice()],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )?;
-                    let (total, limit): (u64, u64) = tx.query_row(
-                        "SELECT used_bytes,total_bytes FROM metadata WHERE singleton=1",
-                        [],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )?;
-                    let add = |value: u64, bound: u64| {
-                        value
-                            .checked_add(length)
-                            .filter(|next| *next <= bound && *next <= i64::MAX as u64)
-                            .ok_or(RelayError::QuotaExhausted)
-                    };
-                    let next_used = add(used, quota)?;
-                    let next_total = add(total, limit)?;
+                    let next_used = used.checked_add(wire.len() as u64 + NONCE_ROW_BYTES)
+                        .filter(|n| *n <= quota).ok_or(RelayError::QuotaExhausted)?;
                     tx.execute(
-                    "INSERT INTO nonce_uses (mailbox,cid,record_hash,wire) VALUES (?1,?2,?3,?4)",
-                    params![mailbox.as_slice(), cid.as_slice(), record_hash.as_slice(), wire],
-                )?;
-                    tx.execute(
-                        "UPDATE mailboxes SET used_bytes=?1 WHERE id=?2",
-                        params![next_used, mailbox.as_slice()],
+                        "INSERT INTO nonce_claims (mailbox,vault,slot,cid,record_hash,wire) VALUES (?1,?2,?3,?4,?5,?6)",
+                        params![mailbox.as_slice(), who.vault.as_slice(), who.slot, cid.as_slice(), record_hash.as_slice(), wire],
                     )?;
                     tx.execute(
-                        "UPDATE metadata SET used_bytes=?1 WHERE singleton=1",
-                        [next_total],
+                        "UPDATE nonce_claimants SET used_bytes=?1 WHERE mailbox=?2 AND vault=?3 AND slot=?4",
+                        params![next_used, mailbox.as_slice(), who.vault.as_slice(), who.slot],
                     )?;
                     true
                 }
             };
         let body = nonce::encode_body(&NonceReceipt {
-            pin: RelayPin {
-                key: self.root.public_key,
-                run: self.root.run_id,
-            },
+            pin,
             mailbox,
             cid,
             record_hash,
@@ -923,10 +950,20 @@ mod fault_tests {
 
     #[test]
     fn nonce_claim_is_first_writer_wins_across_restart() {
+        use ed25519_dalek::{Signer, SigningKey};
         let (root, mut store) = fixture();
-        let key = Capability::new([2; 32]);
+        let key = SigningKey::from_bytes(&[2; 32]);
+        let who = Claimant { vault: [6; 32], slot: 1, key: key.verifying_key().to_bytes() };
+        let mailbox = [1; 32];
+        let cid = [9; 32];
+        let pin = RelayPin { key: store.public_key(), run: store.run_id() };
+        let proof = |n, wire: &[u8]| ClaimProof {
+            claimant: who,
+            signature: key.sign(&nonce::claim_input(who, &pin, mailbox, cid, [n; 32], wire)).to_bytes(),
+        };
+        store.enroll_nonce_claimant(mailbox, who, 1024).unwrap();
         let (created, first) = store
-            .claim_nonce([1; 32], [9; 32], [7; 32], b"sealed record", &key)
+            .claim_nonce(mailbox, cid, [7; 32], b"sealed record", &proof(7, b"sealed record"))
             .unwrap();
         assert!(created);
         let Value::Array(fields) = canonical::decode(&first, 512).unwrap() else {
@@ -939,21 +976,21 @@ mod fault_tests {
         drop(store);
         let mut reopened = RelayStore::open(root.path(), limits()).unwrap();
         let (created, repeat) = reopened
-            .claim_nonce([1; 32], [9; 32], [8; 32], b"sealed record", &key)
+            .claim_nonce(mailbox, cid, [8; 32], b"sealed record", &proof(8, b"sealed record"))
             .unwrap();
         assert!(!created);
         assert_ne!(first, repeat);
         assert_eq!(
-            reopened.claim_nonce([1; 32], [9; 32], [9; 32], b"other record", &key),
+            reopened.claim_nonce(mailbox, cid, [9; 32], b"other record", &proof(9, b"other record")),
             Err(RelayError::Conflict)
         );
         assert_eq!(
             reopened.claim_nonce(
-                [1; 32],
-                [9; 32],
+                mailbox,
+                cid,
                 [9; 32],
                 b"sealed record",
-                &Capability::new([3; 32])
+                &proof(7, b"sealed record")
             ),
             Err(RelayError::Capability)
         );
