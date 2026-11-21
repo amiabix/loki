@@ -53,6 +53,8 @@ struct Saved {
     network: String,
     frostd_url: String,
     lightwalletd_url: Option<String>,
+    #[serde(default)]
+    witness_fingerprint: Option<String>,
 }
 
 /// What LokiSigner shows the member before it pairs or unlocks, and then runs with unchanged.
@@ -66,6 +68,8 @@ pub struct NativeConfig {
     pub lightwalletd_url: Option<String>,
     /// The two witness endpoints, for the member to read.
     pub nonce_witnesses: [String; 2],
+    pub witness_fingerprint: String,
+    pub confirm_witness_fingerprint: bool,
     /// Fetched from `coordinator` for this launch.
     pub fetched: Option<Deployment>,
     /// Whether the fetched configuration is saved once the profile unlocks: not when a launch
@@ -150,10 +154,21 @@ impl NativeConfig {
             (None, Some(_)) => None,
             (None, None) => Some(config.data.join(WITNESSES)),
         };
+        config.approved_witness_fingerprint = Some(self.witness_fingerprint);
         config.network = self.network;
         config.frostd_url = self.frostd_url;
         config.lightwalletd = self.lightwalletd_url;
         Ok(self.fetched.map(|deployment| FetchedConfig { origin: self.coordinator, deployment, save: self.save }))
+    }
+
+    #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+    pub(crate) fn verify_witness_confirmation(&self, confirmation: Option<&str>) -> Result<(), String> {
+        if self.confirm_witness_fingerprint
+            && !confirmation.is_some_and(|code| code.eq_ignore_ascii_case(&self.witness_fingerprint))
+        {
+            return Err("the independently verified nonce witness fingerprint does not match".into());
+        }
+        Ok(())
     }
 
     /// The pairing link's coordinator and slot, or the paired ones for an unlock. A link for a
@@ -173,6 +188,7 @@ impl NativeConfig {
         let config = super::native_config_from_args(args)?;
         let (data, development_http) = (&config.data, config.development_http);
         let target = Self::target(&config, pairing_url)?;
+        let approved_fingerprint = read_saved(data)?.and_then(|saved| saved.witness_fingerprint);
         let saved = load(data, development_http)?;
         if let (Some((origin, _)), Some((coordinator, _))) = (&saved, &target) {
             if origin != coordinator { return Err(format!("the saved configuration belongs to {origin}, not {coordinator}")); }
@@ -186,11 +202,22 @@ impl NativeConfig {
             (Some((coordinator, _)), Some((_, None))) => Some(fetch(coordinator)
                 .map_err(|_| "saved-endpoints-refresh-failed")?),
             (Some((coordinator, _)), _) if pairing_url.is_some() => Some(fetch(coordinator)?),
-            (_, Some((_, Some(saved)))) => return Self::merge(args, target, Some(saved), None, development_http),
+            (_, Some((_, Some(saved)))) => {
+                let fingerprint = nonce_witness::fingerprint(&saved.nonce_witnesses);
+                // An old configuration was approved by URL only; migrate it only after the
+                // member confirms the exact pair, without fetching another pair first.
+                let migrate = flag("--nonce-witnesses").is_none()
+                    && approved_fingerprint.as_deref() != Some(&fingerprint);
+                let mut resolved = Self::merge(args, target, Some(saved.clone()), migrate.then_some(saved), development_http)?;
+                resolved.confirm_witness_fingerprint &= migrate;
+                return Ok(resolved);
+            }
             (Some((coordinator, _)), None) if !flags_complete => Some(fetch(coordinator)?),
             _ => None,
         };
-        Self::merge(args, target, fetched.clone(), fetched, development_http)
+        let mut resolved = Self::merge(args, target, fetched.clone(), fetched, development_http)?;
+        resolved.confirm_witness_fingerprint &= approved_fingerprint.as_deref() != Some(&resolved.witness_fingerprint);
+        Ok(resolved)
     }
 
     fn merge(args: &[String], target: Option<(String, u32)>, deployment: Option<Deployment>, fetched: Option<Deployment>, development_http: bool) -> Result<Self, String> {
@@ -207,9 +234,9 @@ impl NativeConfig {
             Some(path) => {
                 let witnesses = nonce_witness::read(Path::new(&path))?;
                 nonce_witness::check(&witnesses, development_http)?;
-                Some(witnesses.each_ref().map(|w| w.endpoint.clone()))
+                Some(witnesses)
             }
-            None => deployment.as_ref().map(|d| d.nonce_witnesses.each_ref().map(|w| w.endpoint.clone())),
+            None => deployment.as_ref().map(|d| d.nonce_witnesses.clone()),
         };
         let mut missing = Vec::new();
         if network.is_none() { missing.push("network"); }
@@ -225,12 +252,15 @@ impl NativeConfig {
             return Err(format!("LokiSigner is missing its {}: {source}", missing.join(", ")));
         }
         let (coordinator, slot) = target.ok_or("this signer is not paired yet: open a pairing link from the wallet")?;
+        let witnesses = nonce_witnesses.ok_or("missing nonce witnesses")?;
         Ok(Self {
             coordinator, slot,
             network: network.unwrap_or_default(),
             frostd_url: frostd_url.unwrap_or_default(),
             lightwalletd_url,
-            nonce_witnesses: nonce_witnesses.unwrap_or_default(),
+            nonce_witnesses: witnesses.each_ref().map(|w| w.endpoint.clone()),
+            witness_fingerprint: nonce_witness::fingerprint(&witnesses),
+            confirm_witness_fingerprint: flag("--nonce-witnesses").is_none(),
             save: fetched.is_some() && OVERRIDES.iter().all(|name| flag(name).is_none()),
             fetched,
         })
@@ -309,6 +339,7 @@ fn save(data: &Path, origin: &str, deployment: &Deployment) -> Result<(), String
     let saved = Saved {
         origin: origin.into(), network: deployment.network.clone(),
         frostd_url: deployment.frostd_url.clone(), lightwalletd_url: deployment.lightwalletd_url.clone(),
+        witness_fingerprint: Some(nonce_witness::fingerprint(&deployment.nonce_witnesses)),
     };
     let witnesses = Zeroizing::new(serde_json::to_vec(&deployment.nonce_witnesses).map_err(|e| e.to_string())?);
     write_private(dir.path(), WITNESSES, &witnesses)?;

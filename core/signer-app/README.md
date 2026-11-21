@@ -23,6 +23,8 @@ On the wallet's sign-in screen open **Use a native member app instead**. It has 
      signer** (or see restore below if this is a replacement Mac).
    - "Pair this device with slot N?" with the coordinator origin. Choose **Continue** only if
      it is the wallet's address.
+   - "Verify the nonce witnesses". Paste the pair fingerprint you received through a trusted
+     channel from the witness operators, not from the wallet.
    - "Pair this device with slot N?" again, with the network and endpoints that coordinator
      chose (see below). Enter a local profile passphrase and choose **Pair**. Approve the
      Enclave prompt if macOS shows one.
@@ -260,9 +262,8 @@ token to have compared the code with the other members.
 
 ## Signer configuration
 
-LokiSigner needs no terminal or flags. Its network, frostd relay, lightwalletd and the two
-nonce witnesses are chosen by **the coordinator whose origin the member confirmed** in the
-pairing dialog. That coordinator serves them at `GET <origin>/api/signer-config`. They are the
+LokiSigner needs no terminal or flags. The coordinator proposes the network, frostd relay,
+lightwalletd and two nonce witnesses at `GET <origin>/api/signer-config`. They are the
 values its signer origin gives the browser signer (`LOKI_NETWORK`, `LOKI_FROSTD_URL`,
 `LOKI_LIGHTWALLETD_URL` and `LOKI_NONCE_WITNESSES` in `core/loki-signer-wasm/serve.mjs`).
 
@@ -327,6 +328,31 @@ The link contains only origin, slot and a random claim, never runtime configurat
 the configuration comes from that origin, as described above.
 The native passphrase is passed to Rust in memory and the Swift byte buffer is immediately
 zeroed. `serve` retains S4a's local-file unlock for development automation only.
+
+### Verify the witness pair
+
+Members must independently verify the first witness pair and any replacement. After upgrading
+an older profile, verify the saved pair even if its endpoints did not change. Operators can
+compute the fingerprint from their trusted `--nonce-witnesses` JSON file:
+
+```sh
+node -e '
+const pair = JSON.parse(require("node:fs").readFileSync(process.argv[1]));
+const hash = require("node:crypto").createHash("sha256");
+hash.update("Loki_nonce_witness_pins_v1\0");
+for (const { key, run, mailbox } of pair) {
+  for (const field of [key, run, mailbox]) hash.update(Buffer.from(field));
+}
+console.log(hash.digest("hex"));
+' /path/to/witnesses.json
+```
+
+Share only the 64-character fingerprint with members, through a channel they trust independently
+of the wallet. It covers both witnesses' relay keys, run IDs and mailbox IDs in file order, not
+their URLs or credentials. An explicit local `--nonce-witnesses` file is itself trusted operator
+configuration. Outstanding attempts using legacy nonce records or a different pair need a fresh
+signing attempt, even after the replacement is approved. Do not delete existing burn records or
+relay claim history when upgrading or rotating witnesses.
 
 ## Verification
 

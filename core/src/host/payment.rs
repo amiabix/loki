@@ -2940,6 +2940,7 @@ mod tests {
             operator_bundle: None,
             // Two provisioned dev relays (`examples/provision_nonce_witnesses`).
             nonce_witnesses: std::env::var_os("LOKI_NONCE_WITNESSES").map(Into::into),
+            approved_witness_fingerprint: None,
             operator_key: None,
             enrollment_issuer: None,
             development_http: true,

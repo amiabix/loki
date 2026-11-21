@@ -1368,6 +1368,7 @@ mod tests {
             peers: BTreeMap::new(),
             registration: None, bind: "127.0.0.1".parse().unwrap(), advertise_url: None,
             secure_element: "software".into(), nonce_witnesses: None, loopback_peers: false,
+            approved_witness_fingerprint: None,
         }));
         *st.session.write().await = Some(Session {
             passphrase: Zeroizing::new("pass".into()), data: data.clone(),
@@ -1404,6 +1405,7 @@ mod tests {
             advertise_url: None,
             secure_element: "software".into(),
             nonce_witnesses: None,
+            approved_witness_fingerprint: None,
             loopback_peers: false,
         }));
         *st.session.write().await = Some(Session {
@@ -1485,6 +1487,7 @@ mod tests {
             peers: BTreeMap::new(),
             registration: None, bind: "127.0.0.1".parse().unwrap(), advertise_url: None,
             secure_element: "software".into(), nonce_witnesses: None, loopback_peers: false,
+            approved_witness_fingerprint: None,
         }));
         for (name, members, threshold, error) in [
             ("".to_owned(), 3, 2, "name must be 1 to 80 bytes"),
@@ -1535,6 +1538,7 @@ mod tests {
             peers: BTreeMap::new(),
             registration: None, bind: "127.0.0.1".parse().unwrap(), advertise_url: None,
             secure_element: "software".into(), nonce_witnesses: None, loopback_peers: false,
+            approved_witness_fingerprint: None,
         }));
         *st.session.write().await = Some(Session {
             passphrase: Zeroizing::new("pass".into()), data: data.clone(),
@@ -1599,6 +1603,7 @@ mod tests {
             peers: BTreeMap::new(),
             registration: None, bind: "127.0.0.1".parse().unwrap(), advertise_url: None,
             secure_element: "software".into(), nonce_witnesses: None, loopback_peers: false,
+            approved_witness_fingerprint: None,
         }
     }
 
@@ -1937,6 +1942,7 @@ mod tests {
             secure_element: "software".into(),
             operator_bundle: None,
             nonce_witnesses: None,
+            approved_witness_fingerprint: None,
             operator_key: None,
             enrollment_issuer: None,
             development_http: false,
@@ -2260,8 +2266,8 @@ mod tests {
         let peer = frost::keys::KeyPackage::try_from(shares[&id2].clone()).unwrap();
         let stale_id = hex::encode([[3u8; 32], [3u8; 32]].concat());
         let old_nonces = signer_dir(&old, &vault_hex).unwrap().join("nonces");
-        let old_commitment = NonceStore::open(&old_nonces).unwrap()
-            .commit(&stale_id, &SoftwareSecureElement::generate(), old_key.signing_share()).unwrap();
+        let old_commitment = NonceStore::open(&old_nonces, vault, 1).unwrap()
+            .commit(&stale_id, &SoftwareSecureElement::generate(), old_key.signing_share(), None).unwrap();
 
         // New device: a clean data dir restores from the exported backup and the words alone.
         crate::profile::create(&new, pass, "New").unwrap();
@@ -2294,9 +2300,9 @@ mod tests {
             .read(&se, crate::signer::store::FileKind::Share).unwrap().expect("the restored store holds the share");
         assert!(epoch > 0, "a restore bumps the share epoch");
         let key = frost::keys::KeyPackage::deserialize(&crate::signer::local::decode_share(&raw).unwrap().0).unwrap();
-        let store = NonceStore::open_at_epoch(&new_nonces, epoch).unwrap();
+        let store = NonceStore::open_at_epoch(&new_nonces, epoch, vault, 1).unwrap();
         let fresh_id = hex::encode([[4u8; 32], [4u8; 32]].concat());
-        let c1 = store.commit(&fresh_id, &se, key.signing_share()).unwrap();
+        let c1 = store.commit(&fresh_id, &se, key.signing_share(), None).unwrap();
         let (n2, c2) = frost::round1::commit(peer.signing_share(), &mut OsRng);
         let package_with = |own| {
             let commitments = BTreeMap::from([(id1, own), (id2, c2)]);
@@ -2305,7 +2311,7 @@ mod tests {
             (package, params, <[u8; 32]>::try_from(seed).unwrap())
         };
         let (package, params, seed) = package_with(c1);
-        let own = store.sign_and_burn(&fresh_id, &se, &package, &key, &seed, &|| false).unwrap();
+        let own = store.sign_and_burn(&fresh_id, &se, &package, &key, &seed, None, &|| false).unwrap();
         let theirs = frost_rerandomized::sign_with_randomizer_seed(&package, &n2, &peer, &seed).unwrap();
         let signature = frost_rerandomized::aggregate(&package, &BTreeMap::from([(id1, own), (id2, theirs)]), &group, &params)
             .expect("the restored member's share aggregates");
@@ -2315,13 +2321,13 @@ mod tests {
         // replaced by a fresh nonce for that id.
         std::fs::copy(old_nonces.join(format!("{stale_id}.nonce")), new_nonces.join(format!("{stale_id}.nonce"))).unwrap();
         let (package, _, seed) = package_with(old_commitment);
-        assert!(store.sign_and_burn(&stale_id, &se, &package, &key, &seed, &|| false).is_err());
-        assert!(store.commit(&stale_id, &se, key.signing_share()).is_err());
+        assert!(store.sign_and_burn(&stale_id, &se, &package, &key, &seed, None, &|| false).is_err());
+        assert!(store.commit(&stale_id, &se, key.signing_share(), None).is_err());
         assert!(!new_nonces.join(format!("{stale_id}.burn")).exists(), "no share was released");
         // A package carrying the pre-restore commitment is refused against the new nonce.
         let retry_id = hex::encode([[3u8; 32], [8u8; 32]].concat());
-        store.commit(&retry_id, &se, key.signing_share()).unwrap();
-        assert!(store.sign_and_burn(&retry_id, &se, &package, &key, &seed, &|| false).is_err());
+        store.commit(&retry_id, &se, key.signing_share(), None).unwrap();
+        assert!(store.sign_and_burn(&retry_id, &se, &package, &key, &seed, None, &|| false).is_err());
         assert!(!new_nonces.join(format!("{retry_id}.burn")).exists(), "no share was released");
         std::fs::remove_dir_all(root).unwrap();
     }

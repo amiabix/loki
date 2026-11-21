@@ -11,7 +11,7 @@ use std::{
 };
 
 #[cfg(feature = "relay-communication")]
-use loki_poc::signing_session::{NonceWitness, ReviewedPackage};
+use loki_poc::signing_session::{NonceWitness, ReviewedPackage, WitnessPins};
 use loki_poc::tx_finalize::finalized_sighash;
 use loki_poc::{
     candidate::{alpha_from_canonical_bytes, build_candidate, quote_fee, CandidateInputs},
@@ -638,7 +638,7 @@ fn commit(args: &[String]) -> Result<(), String> {
     let own = member.identity.public().id;
     let identity =
         loki_poc::setup_transport::Identity::from_secret_bytes(&member.identity.to_secret_bytes())?;
-    let relays = two_relays(args)?;
+    let relays = two_relays(args, None)?;
     let session = SigningSession::begin_sealed(
         &owner.join("signing"),
         context.clone(),
@@ -765,7 +765,7 @@ impl NonceWitness for TwoRelays {
 }
 
 #[cfg(feature = "relay-communication")]
-fn two_relays(args: &[String]) -> Result<TwoRelays, String> {
+fn two_relays(args: &[String], original: Option<WitnessPins>) -> Result<TwoRelays, String> {
     let root = Path::new(&args[0]);
     let loaded = loki_poc::relay_member::load(root, Path::new(&args[1]), Path::new(&args[2]))
         .map_err(|e| e.to_string())?;
@@ -777,10 +777,20 @@ fn two_relays(args: &[String]) -> Result<TwoRelays, String> {
         loaded.identity.public().id,
     )
     .map_err(|e| e.to_string())?;
-    let configured = config_store
+    let mut configured = config_store
         .routing(&db, &loaded)
         .map_err(|e| e.to_string())?
         .own;
+    if let Some(pins) = original {
+        let mut exact = Vec::with_capacity(2);
+        for (key, run, mailbox) in pins {
+            let index = configured.iter().position(|inbox| {
+                inbox.route.pin.key == key && inbox.route.pin.run == run && inbox.route.mailbox == mailbox
+            }).ok_or("an original nonce witness is no longer configured; start a new signing attempt")?;
+            exact.push(configured.swap_remove(index));
+        }
+        configured = exact;
+    }
     let http = RelayHttp::new().map_err(|e| e.to_string())?;
     let runtime = RelayRuntime::new().map_err(|e| e.to_string())?;
     let mut own: Vec<OwnerInbox> = Vec::new();
@@ -788,6 +798,9 @@ fn two_relays(args: &[String]) -> Result<TwoRelays, String> {
         match runtime.block_on(http.authenticate_endpoint(&inbox.route.pin, &inbox.route.endpoint))
         {
             Ok(()) => own.push(inbox),
+            Err(error) if original.is_some() => return Err(format!(
+                "original nonce witness unavailable: {error}; start a new signing attempt"
+            )),
             Err(loki_relay_client::ClientError::Transport) => continue,
             Err(error) => return Err(format!("nonce relay identity: {error}")),
         }
@@ -890,7 +903,8 @@ fn approve(args: &[String], reviewed_token: bool) -> Result<(), String> {
         let (_, intent) = manifest(&Path::new(&args[3]).join("payment.json"), member.network)?;
         confirm(&intent, reviewed.summary(), member.network)?;
     }
-    let mut relays = two_relays(args)?;
+    let original = session.witness_pins().ok_or("missing original witnesses; start a new signing attempt")?;
+    let mut relays = two_relays(args, Some(original))?;
     session.publish_approved_secured_to_roster(
         reviewed,
         &peer,

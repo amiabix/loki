@@ -435,8 +435,8 @@ impl<SE: SecureElement> LocalSigner<SE> {
         nonce_dir: PathBuf,
         approval: ApprovalPolicy,
     ) -> Result<Self, SignerError> {
-        let nonces =
-            NonceStore::open(&nonce_dir).map_err(|e| SignerError::Other(e.to_string()))?;
+        let nonces = NonceStore::open(&nonce_dir, vault_id, member_id)
+            .map_err(|e| SignerError::Other(e.to_string()))?;
         let sealed = SealedShare::seal(&se, 0, key_package_bytes).map_err(SignerError::Other)?;
         let mut signer = Self::bare(
             member_id, threshold, members, vault_id, label, network, se, nonces, approval,
@@ -550,7 +550,7 @@ impl<SE: SecureElement> LocalSigner<SE> {
             0,
             &Zeroizing::new(identity.to_secret_bytes())[..],
         )?;
-        let nonces = NonceStore::open(&store.nonce_dir())
+        let nonces = NonceStore::open(&store.nonce_dir(), vault_id, member_id)
             .map_err(|e| SignerError::Other(e.to_string()))?;
         let mut signer = Self::bare(
             member_id, 0, 0, vault_id, label, network, se, nonces, prompts.approval,
@@ -577,7 +577,7 @@ impl<SE: SecureElement> LocalSigner<SE> {
         if identity.public().id != store.member() {
             return Err(SignerError::Other("signer identity is for another member".into()));
         }
-        let nonces = NonceStore::open(&store.nonce_dir())
+        let nonces = NonceStore::open(&store.nonce_dir(), store.vault(), store.member())
             .map_err(|e| SignerError::Other(e.to_string()))?;
         let mut signer = Self::bare(
             store.member(),
@@ -797,6 +797,23 @@ impl<SE: SecureElement> LocalSigner<SE> {
     /// files were rolled back) never signs. The local durable burn record still applies.
     pub fn set_nonce_witness(&mut self, witness: Box<dyn NonceWitness + Send>) {
         self.nonce_witness = Some(witness);
+    }
+
+    /// Browser preflight: return the original witness pair only after authenticating the
+    /// pending nonce and checking that the package names that exact commitment.
+    pub fn nonce_claim_pins(
+        &self,
+        cand: &CandidateRef,
+        commitment: &frost::round1::SigningCommitments,
+    ) -> Result<crate::signing_session::WitnessPins, SignerError> {
+        let pins = self.nonce_witness.as_ref().ok_or_else(||
+            SignerError::Other("two nonce witnesses required".into()))?.pins();
+        let pending = self.nonces.pending_commitment(&self.nonce_id(cand), &self.se, pins)
+            .map_err(|e| SignerError::Other(e.to_string()))?;
+        if pending != *commitment {
+            return Err(SignerError::Other("own commitment differs from the pending nonce".into()));
+        }
+        Ok(pins)
     }
 
     /// Install the decision for an attempt after its signing group and expiry are fixed.
@@ -1509,7 +1526,8 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
         let id = self.nonce_id(cand);
         // Round 1 needs the share to derive the nonce; the key lives only for this call.
         let kp = self.open_key()?;
-        let commitment = self.nonces.commit(&id, &self.se, kp.signing_share());
+        let pins = self.nonce_witness.as_ref().map(|witness| witness.pins());
+        let commitment = self.nonces.commit(&id, &self.se, kp.signing_share(), pins);
         drop(kp);
         commitment.map_err(|e| SignerError::Other(e.to_string()))
     }
@@ -1592,35 +1610,13 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
             .try_into()
             .map_err(|_| SignerError::Other("randomizer seed is not 32 bytes".into()))?;
         let id = self.nonce_id(cand);
-        // 5. External anti-rollback: claim this committed nonce at both witnesses before any
-        //    share can leave. A burned nonce only replays its recorded partial (or refuses
-        //    reuse) and a missing one cannot sign, so neither is claimed.
-        if let Some(witness) = self.nonce_witness.as_mut() {
-            if self.nonces.state(&id) == crate::signer::nonce::NonceState::Committed {
-                let member = frost::Identifier::try_from(self.member_id)
-                    .map_err(|e| SignerError::Other(e.to_string()))?;
-                let commitment = pkg
-                    .signing_commitments()
-                    .get(&member)
-                    .ok_or_else(|| SignerError::Other("own commitment absent".into()))?;
-                let cid = crate::signing_session::nonce_claim_id(&self.vault_id, &member, commitment)
-                    .map_err(SignerError::Other)?;
-                let record = crate::signing_session::nonce_claim_record(&cid, &local_sighash, &seed);
-                witness
-                    .claim(cid, &record)
-                    .map_err(|e| SignerError::Other(format!("nonce witness refused: {e}")))?;
-            }
-        }
         let kp = self.open_key()?;
-        let share = self.nonces.sign_and_burn(&id, &self.se, pkg, &kp, &seed, &|| false);
+        let share = self.nonces.sign_and_burn(
+            &id, &self.se, pkg, &kp, &seed, self.nonce_witness.as_deref_mut(), &|| false,
+        );
         // The key is wiped here, before the partial leaves this call.
         drop(kp);
-        share.map_err(|e| match e {
-            crate::signer::nonce::NonceError::Reuse => {
-                SignerError::Other(crate::signer::nonce::NonceError::Reuse.to_string())
-            }
-            other => SignerError::Other(other.to_string()),
-        })
+        share.map_err(|e| SignerError::Other(e.to_string()))
     }
 
     fn rendered_payment(

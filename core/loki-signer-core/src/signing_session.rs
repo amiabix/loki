@@ -824,6 +824,20 @@ pub fn valid_witness_pins(pins: WitnessPins) -> bool {
             .all(|(key, run, mailbox)| *key != [0; 32] && *run != [0; 32] && *mailbox != [0; 32])
 }
 
+/// Operator-verifiable fingerprint of the exact ordered witness identities, not their URLs
+/// or access credentials. This stays stable when a route changes without replacing a witness.
+pub fn witness_fingerprint(pins: WitnessPins) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"Loki_nonce_witness_pins_v1\0");
+    for (key, run, mailbox) in pins {
+        hash.update(key);
+        hash.update(run);
+        hash.update(mailbox);
+    }
+    hash.finalize().into()
+}
+
 /// The witness claim ID of one member's nonce: bound to the vault, the member and the
 /// nonce's public commitment, so each nonce can be claimed exactly once.
 pub fn nonce_claim_id(
@@ -978,6 +992,11 @@ impl SigningSession {
 
     pub fn commitments(&self) -> &[frost::round1::SigningCommitments] {
         self.live.commitments()
+    }
+
+    /// The original pair authenticated by the sealed nonce record.
+    pub fn witness_pins(&self) -> Option<WitnessPins> {
+        self.witness_pins
     }
 
     /// Save one exact ciphertext for each other roster member before delivery.
@@ -1555,7 +1574,7 @@ impl AttemptStore {
         pins: WitnessPins,
     ) -> Result<(), String> {
         let mut raw = zeroize::Zeroizing::new(Vec::new());
-        raw.push(2);
+        raw.push(3);
         for (key, run, mailbox) in pins {
             raw.extend_from_slice(&key);
             raw.extend_from_slice(&run);
@@ -1568,6 +1587,7 @@ impl AttemptStore {
             raw.extend_from_slice(&length.to_be_bytes());
             raw.extend_from_slice(&serialized);
         }
+        raw.extend_from_slice(&Self::nonce_context(&live.context, &live.own_id));
         self.dir
             .write_sealed("nonces.sealed", &raw, passphrase)
             .map_err(|e| e.to_string())
@@ -1584,10 +1604,13 @@ impl AttemptStore {
                 .read_sealed("nonces.sealed", passphrase)
                 .map_err(|e| e.to_string())?,
         );
-        // v1 omitted mailbox IDs; reopening those nonce records could reuse a CID on
-        // a newly provisioned mailbox. Discard the attempt and start with fresh nonces.
-        if raw.len() < 195 || raw[0] != 2 {
+        // Older records are not bound to their exact signing context.
+        if raw.len() < 195 + 32 || raw[0] != 3 {
             return Err("invalid sealed nonce record".into());
+        }
+        let (raw, binding) = raw.split_at(raw.len() - 32);
+        if binding != Self::nonce_context(context, key.identifier()) {
+            return Err("sealed nonce belongs to another context; start a new signing attempt".into());
         }
         let pins = [
             (
@@ -1646,6 +1669,18 @@ impl AttemptStore {
             },
             pins,
         ))
+    }
+
+    fn nonce_context(context: &SessionContext, member: &frost::Identifier) -> [u8; 32] {
+        let mut binding = blake3::Hasher::new_derive_key("loki standalone signing nonce v3");
+        binding.update(&context.vault);
+        binding.update(&context.payment);
+        binding.update(&context.attempt.0);
+        binding.update(&member.serialize());
+        for id in &context.signers {
+            binding.update(&id.to_be_bytes());
+        }
+        *binding.finalize().as_bytes()
     }
 
     fn remove_nonces(&self) -> Result<(), String> {

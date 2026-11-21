@@ -408,6 +408,7 @@ async fn repair_handlers_require_unlock_consent_and_local_relay_and_original_vau
         transport: "local".into(),
         secure_element: "software".into(),
         operator_bundle: None, nonce_witnesses: None,
+        approved_witness_fingerprint: None,
         operator_key: None,
         enrollment_issuer: None,
         development_http: false,

@@ -285,6 +285,7 @@ fn parse_config(args: &[String], native: bool) -> Result<Config, String> {
         secure_element: value("--secure-element").unwrap_or_else(|| "software".into()),
         operator_bundle: value("--operator-bundle").map(PathBuf::from),
         nonce_witnesses: value("--nonce-witnesses").map(PathBuf::from),
+        approved_witness_fingerprint: None,
         operator_key: value("--operator-key"),
         enrollment_issuer: value("--enrollment-issuer").map(PathBuf::from),
         development_http: flag("--development-http"),

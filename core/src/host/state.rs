@@ -24,6 +24,7 @@ pub struct Config {
     pub operator_bundle: Option<PathBuf>,
     /// Two pinned external nonce-witness mailboxes; required for hosted signing.
     pub nonce_witnesses: Option<PathBuf>,
+    pub(super) approved_witness_fingerprint: Option<String>,
     pub operator_key: Option<String>,
     pub enrollment_issuer: Option<PathBuf>,
     pub development_http: bool,
@@ -514,6 +515,7 @@ mod tests {
             data: PathBuf::new(), port: 3001, network: "regtest".into(),
             lightwalletd: None, transport: "local".into(), secure_element: secure_element.into(),
             operator_bundle: None, nonce_witnesses: None, operator_key: None, enrollment_issuer: None,
+            approved_witness_fingerprint: None,
             development_http: false, token: "test".into(),
             frostd_url: "http://127.0.0.1:2744".into(), peers: BTreeMap::new(),
             loopback_peers: false,
