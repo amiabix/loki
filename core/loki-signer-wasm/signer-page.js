@@ -167,9 +167,9 @@ async function createPasskey(name, attachment, signal) {
 // only a hint: without it (cleared storage) the authenticator offers its discoverable Loki
 // passkeys for this rpId.
 function rememberedCredential() {
-  try { const h = localStorage.getItem(CRED); if (h) return fromHex(h); } catch {}
+  try { const h = localStorage.getItem(CRED); if (/^(?:[0-9a-f]{2})+$/.test(h ?? "")) return fromHex(h); } catch {}
 }
-async function prfSecret(id = embedded ? rememberedCredential() : undefined, signal) {
+async function passkeyAssertion(id, signal) {
   const assertion = await navigator.credentials.get({
     signal,
     publicKey: {
@@ -183,8 +183,20 @@ async function prfSecret(id = embedded ? rememberedCredential() : undefined, sig
   signal.throwIfAborted();
   const first = assertion.getClientExtensionResults().prf?.results?.first;
   if (!first || first.byteLength < 32) throw new SignerError("This passkey released no PRF secret. Use a passphrase instead.", 400);
-  if (embedded) { try { localStorage.setItem(CRED, toHex(new Uint8Array(assertion.rawId))); } catch {} }
-  return new Uint8Array(first).slice(0, 32);
+  return { prfSecret: new Uint8Array(first).slice(0, 32), id: toHex(new Uint8Array(assertion.rawId)) };
+}
+
+async function prfSecret(id, signal) {
+  return (await passkeyAssertion(id, signal)).prfSecret;
+}
+
+async function submitPasskey(id, signal, commit, submit) {
+  const assertion = await passkeyAssertion(id, signal);
+  commit();
+  const result = await submit({ prfSecret: assertion.prfSecret });
+  // A valid WebAuthn assertion is not necessarily the passkey that opens this signer.
+  try { localStorage.setItem(CRED, assertion.id); } catch {}
+  return result;
 }
 
 // Passphrase floor for the passphrase tier: long enough that the offline Argon2id guess
@@ -223,9 +235,7 @@ function newCustody(name, method, submit) {
     el("p", { textContent: `Your share is sealed under a passkey for ${rpId}. Touch/Face ID, a security key or your phone unlocks it.` }),
   ], [cancelButton, { label: "Create passkey", abortable: true, run: async (signal, commit) => {
     const id = await createPasskey(name, method === "platform" ? "platform" : "cross-platform", signal);
-    const secret = await prfSecret(id, signal);
-    commit();
-    return submit({ prfSecret: secret });
+    return submitPasskey(id, signal, commit, submit);
   } }]);
 }
 
@@ -245,12 +255,12 @@ async function unlock({ method }) {
     result = await prompt("Unlock your signer", [el("label", { textContent: "Passphrase" }, a)],
       [cancelButton, { label: "Unlock", run: () => call({ op: "unlock", method, passphrase: a.value }) }]);
   } else {
+    const hint = rememberedCredential();
+    const usePasskey = (label, id) => ({ label, abortable: true, run: (signal, commit) =>
+      submitPasskey(id, signal, commit, (secret) => call({ op: "unlock", method, ...secret })) });
     result = await prompt("Unlock your signer", [el("p", { textContent: `Use your passkey for ${rpId}.` })],
-      [cancelButton, { label: "Use passkey", abortable: true, run: async (signal, commit) => {
-        const secret = await prfSecret(undefined, signal);
-        commit();
-        return call({ op: "unlock", method, prfSecret: secret });
-      } }]);
+      [cancelButton, ...(hint ? [usePasskey("Use saved passkey", hint)] : []),
+        usePasskey(hint ? "Choose another passkey" : "Use passkey", undefined)]);
   }
   current = { profile: result, se: method === "passphrase" ? "software" : "passkey" };
   persisted = await navigator.storage?.persisted?.().catch(() => false) ?? false;
@@ -374,7 +384,7 @@ function manageCustody() {
         clearTimeout(timeout);
         port = e.ports[0];
         const passkey = openedFor.se === "passkey";
-        port.postMessage({ name: openedFor.profile.name, passkey, credentialId: passkey ? rememberedCredential() : undefined });
+        port.postMessage({ name: openedFor.profile.name, passkey });
         port.onmessage = async ({ data }) => {
           if (data?.cmd !== "confirm-removal" || removing || tab.closed) return;
           if (current !== openedFor || pending.size) {
@@ -440,7 +450,7 @@ async function showCustodyControls() {
     field ? el("label", { textContent: "Passphrase" }, field) : el("p", { textContent: `Verify with your passkey for ${rpId}.` }),
   ], [{ ...cancelButton, value: false }, { label: "Verify and remove signer", abortable: true, run: async (signal, commit) => {
     if (!kept.checked) throw new SignerError("Export your recovery backups first.", 400);
-    const secret = field ? { passphrase: field.value } : { prfSecret: await prfSecret(context.credentialId, signal) };
+    const secret = field ? { passphrase: field.value } : { prfSecret: await prfSecret(undefined, signal) };
     commit();
     if (field) field.value = "";
     await new Promise((resolve, reject) => {
