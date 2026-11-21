@@ -298,7 +298,7 @@ fn rebuild_signer<SE: SecureElement>(
         .map_err(|e| SignerError::Other(format!("FVK derivation: {e:?}")))?;
     // Fresh nonce epoch: strictly greater than the backed-up epoch.
     let next_epoch = material.backup_epoch + 1;
-    let nonces = NonceStore::open_at_epoch(&nonce_dir, next_epoch)
+    let nonces = NonceStore::open_at_epoch(&nonce_dir, next_epoch, material.vault_id, material.member_id)
         .map_err(|e| SignerError::Other(e.to_string()))?;
     let identity = if material.identity.is_empty() {
         None
@@ -584,7 +584,7 @@ mod tests {
 
         // --- Pre-restore signer (epoch 3): commit a nonce, capturing its sealed file. ---
         let old_nonce_dir = tempdir("old-nonces");
-        let pre = NonceStore::open_at_epoch(&old_nonce_dir, 3).unwrap();
+        let pre = NonceStore::open_at_epoch(&old_nonce_dir, 3, vault_id, material.member_id).unwrap();
         let cand = CandidateRef {
             vault_id,
             payment_id: [1u8; 32],
@@ -598,7 +598,7 @@ mod tests {
             s
         };
         let pre_se = SoftwareSecureElement::generate();
-        pre.commit(&nonce_id, &pre_se, key1.signing_share())
+        pre.commit(&nonce_id, &pre_se, key1.signing_share(), None)
             .unwrap();
         assert_eq!(pre.state(&nonce_id), NonceState::Committed);
 

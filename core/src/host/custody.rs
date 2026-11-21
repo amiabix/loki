@@ -103,7 +103,8 @@ pub(super) fn open_signer_with_reason(
     let threshold = public.min_signers().ok_or("share has no threshold")?;
     let members = u16::try_from(public.verifying_shares().len()).map_err(|_| "member count")?;
     let fvk = group_viewing_key(&public, &vs)?;
-    let nonces = NonceStore::open_at_epoch(&sdir.join("nonces"), epoch).map_err(|e| e.to_string())?;
+    let nonces = NonceStore::open_at_epoch(&sdir.join("nonces"), epoch, store.vault(), slot)
+        .map_err(|e| e.to_string())?;
     LocalSigner::from_restored(
         slot, threshold, members, store.vault(), vault.to_owned(), store.network(), se,
         &key, public_bytes, fvk, epoch, nonces, approval, None,

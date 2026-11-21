@@ -47,6 +47,12 @@ pub(super) fn check(config: &[WitnessConfig; 2], development: bool) -> Result<()
     Ok(())
 }
 
+pub(super) fn fingerprint(config: &[WitnessConfig; 2]) -> String {
+    hex::encode(crate::signing_session::witness_fingerprint(
+        config.each_ref().map(|w| (w.key, w.run, w.mailbox)),
+    ))
+}
+
 impl RelayWitness {
     /// LokiSigner's approved launch snapshot, or the headless `--nonce-witnesses` file.
     pub(super) fn for_member(st: &super::state::AppState, attempt: &str) -> Result<Self, String> {

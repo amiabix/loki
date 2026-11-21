@@ -854,6 +854,26 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
             """
     }
 
+    private func confirmWitnesses(_ config: [String: Any]) -> String? {
+        guard config["confirm_witness_fingerprint"] as? Bool == true else { return "" }
+        guard let expected = config["witness_fingerprint"] as? String else { return nil }
+        let alert = NSAlert()
+        alert.messageText = "Verify the nonce witnesses"
+        alert.informativeText = "Paste the 64-character pair fingerprint from the witness operators through a channel you trust, not from the wallet. An old signing attempt cannot use replacement witnesses."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 420, height: 26))
+        field.placeholderString = "Witness fingerprint"
+        field.setAccessibilityLabel("Witness fingerprint")
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Approve witnesses")
+        alert.addButton(withTitle: "Cancel")
+        while runDecisionAlert(alert, escape: .alertSecondButtonReturn, fields: [field]) == .alertFirstButtonReturn {
+            let code = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if code == expected { return code }
+            alert.informativeText = "That fingerprint does not match. Check it independently before approving."
+        }
+        return nil
+    }
+
     /// Shows the configuration before anything is saved; the member continues with exactly it.
     private func confirm(link: String?, launch: [String: Any], reply: [String: Any], fresh: Bool) {
         guard let config = reply["config"] as? [String: Any] else {
@@ -861,6 +881,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
             retry(refreshFailed ? .savedEndpointsRefreshFailed : .configuration, link: link)
             return
         }
+        guard let witnessConfirmation = confirmWitnesses(config) else { retry(.cancelled, link: link); return }
         let alert = NSAlert()
         let slot = (config["slot"] as? NSNumber)?.stringValue ?? "?"
         let endpoints = configurationText(config)
@@ -907,6 +928,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         guard !password.stringValue.isEmpty else { retry(.emptyPassphrase, link: link); return }
         var confirmed = launch
         confirmed["config"] = config
+        confirmed["witness_confirmation"] = witnessConfirmation
         if let name = nameField?.stringValue, !name.isEmpty { confirmed["profile_name"] = name }
         guard let json = try? JSONSerialization.data(withJSONObject: confirmed), let request = String(data: json, encoding: .utf8) else {
             password.stringValue = ""
@@ -973,6 +995,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
             retry(.configuration, link: retryLink)
             return
         }
+        guard let witnessConfirmation = confirmWitnesses(config) else { retry(.cancelled, link: retryLink); return }
         let alert = NSAlert()
         alert.messageText = "Review the signer configuration"
         alert.informativeText = configurationText(config)
@@ -980,6 +1003,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         alert.addButton(withTitle: "Cancel")
         var confirmed = launch
         confirmed["config"] = config
+        confirmed["witness_confirmation"] = witnessConfirmation
         guard alert.runModal() == .alertFirstButtonReturn else { retry(.cancelled, link: retryLink); return }
         guard let json = try? JSONSerialization.data(withJSONObject: confirmed), let request = String(data: json, encoding: .utf8) else {
             retry(.unexpected, link: retryLink)

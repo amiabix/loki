@@ -25,7 +25,8 @@ use loki_signer_core::vault::orchard_receiver_from_ua;
 use loki_signer_core::verify::{check_candidate, Expectations, Refusal};
 use loki_signer_core::signer::PublicPaymentParams;
 use loki_signer_core::signing_session::{
-    nonce_claim_id, nonce_claim_record, valid_witness_pins, NonceWitness, WitnessPins,
+    nonce_claim_id, nonce_claim_record, valid_witness_pins, witness_fingerprint, NonceWitness,
+    WitnessPins,
 };
 use zcash_protocol::consensus::{BlockHeight, BranchId, Parameters};
 use zcash_protocol::memo::MemoBytes;
@@ -199,6 +200,7 @@ pub const SALT_PATH: &str = "loki/device/kek.salt";
 /// The recovery identity's PUBLIC keys, 64 bytes like native `recovery.pub`: X25519 backup
 /// encryption (32) then Ed25519 device authorization (32). The 24 words are never written.
 pub const RECOVERY_PUB_PATH: &str = "loki/device/recovery.pub";
+const WITNESS_PINS_PATH: &str = "loki/device/witness-pins.sealed";
 
 /// The device file set the Worker pre-opens, as a JSON array, so the pre-open protocol has a
 /// single source of truth shared with `signer-worker.js` instead of drifting constants.
@@ -209,6 +211,7 @@ pub fn device_paths() -> String {
         "profile": PROFILE_PATH,
         "salt": SALT_PATH,
         "recovery": RECOVERY_PUB_PATH,
+        "witnessPins": WITNESS_PINS_PATH,
     })
     .to_string()
 }
@@ -347,6 +350,8 @@ impl Signer {
         self.kek = None;
         self.vault = None;
         self.pending_recovery = None;
+        self.witness_pins = None;
+        self.claimed.lock().unwrap().clear();
     }
 
     /// Whether an identity is currently held unlocked in memory.
@@ -820,13 +825,11 @@ impl Signer {
             .map_err(|e| JsError::new(&e))
     }
 
-    /// The two external nonce witnesses (JSON `[{key, run, mailbox}, ...]`, hex): the pins the
-    /// Worker's claims must match. Two distinct, nonzero witnesses are required (core
-    /// `valid_witness_pins`); without them `signApprove` refuses.
+    /// Enable only a previously approved pair, or the pair whose independently obtained
+    /// fingerprint the member just confirmed. The worker reauthenticates that consent.
     #[wasm_bindgen(js_name = setNonceWitnesses)]
-    pub fn set_nonce_witnesses(&mut self, pins_json: &str) -> Result<(), JsError> {
-        self.witness_pins = Some(parse_witness_pins(pins_json).map_err(|e| JsError::new(&e))?);
-        Ok(())
+    pub fn set_nonce_witnesses(&mut self, pins_json: &str, confirmation: Option<String>) -> Result<bool, JsError> {
+        self.set_nonce_witnesses_impl(pins_json, confirmation.as_deref()).map_err(|e| JsError::new(&e))
     }
 
     /// The claim this signature needs at both witnesses: `{cid, record}` (hex), from the core
@@ -834,8 +837,8 @@ impl Signer {
     /// `nonce_claim_record` over the confirmed sighash and the randomizer seed). The Worker
     /// claims it at both witnesses, then reports `nonceClaimed`.
     #[wasm_bindgen(js_name = nonceClaim)]
-    pub fn nonce_claim(&self, package_hex: &str, seed_hex: &str, sighash_hex: &str) -> Result<String, JsError> {
-        self.nonce_claim_impl(package_hex, seed_hex, sighash_hex).map_err(|e| JsError::new(&e))
+    pub fn nonce_claim(&self, attempt_hex: &str, package_hex: &str, seed_hex: &str, sighash_hex: &str) -> Result<String, JsError> {
+        self.nonce_claim_impl(attempt_hex, package_hex, seed_hex, sighash_hex).map_err(|e| JsError::new(&e))
     }
 
     /// Authorize this exact request inside the signer; the identity never leaves WASM.
@@ -1195,6 +1198,34 @@ fn hex32(s: &str) -> Result<[u8; 32], String> {
 }
 
 impl Signer {
+    fn set_nonce_witnesses_impl(&mut self, pins_json: &str, confirmation: Option<&str>) -> Result<bool, String> {
+        self.witness_pins = None;
+        self.claimed.lock().map_err(|_| "claim state poisoned")?.clear();
+        let pins = parse_witness_pins(pins_json)?;
+        let fingerprint = witness_fingerprint(pins);
+        let identity = self.identity.as_ref().ok_or("unlock the signer first")?.public();
+        let binding = loki_signer_core::signer::secure_element::file_binding(
+            "device-witness-pins", &identity.signing, identity.id,
+        );
+        let se = SoftwareSecureElement::from_kek(**self.kek.as_ref().ok_or("unlock the signer first")?);
+        let approved = opfs_get(WITNESS_PINS_PATH)?
+            .and_then(|raw| SealedShare::from_bytes(&raw).ok())
+            .and_then(|sealed| sealed.open_bound(&se, &binding).ok());
+        if approved.as_deref().map(Vec::as_slice) != Some(fingerprint.as_slice()) {
+            let Some(confirmation) = confirmation else { return Ok(false) };
+            if hex32(confirmation).ok() != Some(fingerprint) {
+                return Err("the independently verified nonce witness fingerprint does not match this configuration".into());
+            }
+            let sealed = SealedShare::seal_bound(&se, 0, &fingerprint, &binding)?.to_bytes();
+            opfs_put(WITNESS_PINS_PATH, &sealed, false)?;
+            if opfs_get(WITNESS_PINS_PATH)?.as_deref() != Some(sealed.as_slice()) {
+                return Err("nonce witness approval did not persist".into());
+            }
+        }
+        self.witness_pins = Some(pins);
+        Ok(true)
+    }
+
     /// This payment's candidate reference. The native host uses `payment_id == attempt_id ==
     /// attempt`, which also fixes the crash-safe nonce file name; mirror it.
     fn candidate_ref(&self, attempt_hex: &str) -> Result<(CandidateRef, [u8; 32]), String> {
@@ -1232,15 +1263,24 @@ impl Signer {
         .to_string())
     }
 
-    fn nonce_claim_impl(&self, package_hex: &str, seed_hex: &str, sighash_hex: &str) -> Result<String, String> {
+    fn nonce_claim_impl(&self, attempt_hex: &str, package_hex: &str, seed_hex: &str, sighash_hex: &str) -> Result<String, String> {
+        let (candidate, _) = self.candidate_ref(attempt_hex)?;
         let vs = self.vault.as_ref().ok_or("no active vault — call vaultOpen first")?;
         let package = frost::SigningPackage::deserialize(&hex::decode(package_hex).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
+        let sighash = hex32(sighash_hex)?;
+        if package.message().as_slice() != sighash {
+            return Err("signing package differs from the confirmed sighash".into());
+        }
         let member = frost::Identifier::try_from(vs.slot).map_err(|e| e.to_string())?;
         let commitment = package.signing_commitments().get(&member).ok_or("own commitment absent")?;
+        let pins = vs.signer.nonce_claim_pins(&candidate, commitment).map_err(|e| e.to_string())?;
         let cid = nonce_claim_id(&vs.vref.vault_id, &member, commitment)?;
-        let record = nonce_claim_record(&cid, &hex32(sighash_hex)?, &hex32(seed_hex)?);
-        Ok(serde_json::json!({ "cid": hex::encode(cid), "record": hex::encode(record) }).to_string())
+        let record = nonce_claim_record(&cid, &sighash, &hex32(seed_hex)?);
+        let pins = pins.map(|(key, run, mailbox)| serde_json::json!({
+            "key": hex::encode(key), "run": hex::encode(run), "mailbox": hex::encode(mailbox),
+        }));
+        Ok(serde_json::json!({ "cid": hex::encode(cid), "record": hex::encode(record), "pins": pins }).to_string())
     }
 
     fn reauth_check(&self, method: &str, passphrase: Option<String>, prf_secret: Option<Vec<u8>>) -> Result<(), String> {
@@ -1268,6 +1308,9 @@ impl Signer {
     }
 
     fn sign_commit_impl(&mut self, attempt_hex: &str) -> Result<String, String> {
+        if self.witness_pins.is_none() {
+            return Err("browser signing requires two approved nonce witnesses".into());
+        }
         let (cand, _) = self.candidate_ref(attempt_hex)?;
         let vs = self.vault.as_mut().ok_or("no active vault — call vaultJoin first")?;
         let commit = vs.signer.sign_commit(&vs.session, &cand).map_err(|e| e.to_string())?;

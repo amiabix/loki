@@ -49,8 +49,19 @@ impl Deployment {
 #[derive(Serialize, Deserialize)]
 #[serde(untagged, deny_unknown_fields)]
 enum Saved {
-    Generation { origin: String, deployment: Deployment },
+    Generation {
+        origin: String,
+        deployment: Deployment,
+        #[serde(default)]
+        witness_fingerprint: Option<String>,
+    },
     Legacy { origin: String, network: String, frostd_url: String, lightwalletd_url: Option<String> },
+}
+
+struct SavedDeployment {
+    origin: String,
+    deployment: Option<Deployment>,
+    witness_fingerprint: Option<String>,
 }
 
 /// What LokiSigner shows the member before it pairs or unlocks, and then runs with unchanged.
@@ -66,15 +77,18 @@ pub struct NativeConfig {
     pub nonce_witnesses: [String; 2],
     /// Include the full selected pair in the preview/apply comparison, not just its endpoints.
     witness_config: [WitnessConfig; 2],
+    pub witness_fingerprint: String,
+    pub confirm_witness_fingerprint: bool,
     /// Fetched from `coordinator` for this launch.
     pub fetched: Option<Deployment>,
-    /// Whether the fetched configuration is saved once the profile unlocks: not when a launch
+    /// Whether the approved configuration is saved once the profile unlocks: not when a launch
     /// flag overrides any field, because the member was then shown something else.
     pub save: bool,
 }
 
 /// The configuration approved for this launch. Witnesses are used from memory, including when
-/// selected from disk. A fresh fetch with no overrides is saved after the profile unlocks.
+/// selected from disk. A fresh fetch or newly confirmed saved pair is saved after unlock when
+/// there are no overrides.
 pub struct FetchedConfig {
     origin: String,
     deployment: Deployment,
@@ -113,7 +127,7 @@ impl NativeConfig {
     #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
     fn resolve_restore(args: &[String], origin: String, deployment: Deployment) -> Result<Self, String> {
         // The coordinator slot is unknown until we open the backup and find its identity.
-        Self::merge(args, Some((origin, 0)), Some(deployment.clone()), Some(deployment), super::native_config_from_args(args)?.development_http)
+        Self::merge(args, Some((origin, 0)), Some(deployment.clone()), Some(deployment), super::native_config_from_args(args)?.development_http, None)
     }
 
     #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
@@ -155,6 +169,16 @@ impl NativeConfig {
         Ok(Some(FetchedConfig { origin: self.coordinator, deployment, save: self.save }))
     }
 
+    #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+    pub(crate) fn verify_witness_confirmation(&self, confirmation: Option<&str>) -> Result<(), String> {
+        if self.confirm_witness_fingerprint
+            && !confirmation.is_some_and(|code| code.eq_ignore_ascii_case(&self.witness_fingerprint))
+        {
+            return Err("the independently verified nonce witness fingerprint does not match".into());
+        }
+        Ok(())
+    }
+
     /// The pairing link's coordinator and slot, or the paired ones for an unlock. A link for a
     /// coordinator or slot other than the paired one is refused.
     fn target(config: &Config, pairing_url: Option<&str>) -> Result<Option<(String, u32)>, String> {
@@ -173,26 +197,28 @@ impl NativeConfig {
         let (data, development_http) = (&config.data, config.development_http);
         let target = Self::target(&config, pairing_url)?;
         let saved = load(data, development_http)?;
-        if let (Some((origin, _)), Some((coordinator, _))) = (&saved, &target) {
+        if let (Some(SavedDeployment { origin, .. }), Some((coordinator, _))) = (&saved, &target) {
             if origin != coordinator { return Err(format!("the saved configuration belongs to {origin}, not {coordinator}")); }
         }
+        let approved_fingerprint = saved.as_ref().and_then(|saved| saved.witness_fingerprint.as_deref());
         let flag = |name: &str| value(args, name);
         let flags_complete = ["--network", "--frostd-url", "--nonce-witnesses"].iter().all(|name| flag(name).is_some())
             && (flag("--network").as_deref() == Some("regtest") || flag("--lightwalletd-url").is_some());
         // Refresh obsolete settings only from the pinned coordinator, even with complete flags.
         // Otherwise, an unlock uses saved settings, and a pairing link always fetches.
-        let fetched = match (&target, saved) {
-            (Some((coordinator, _)), Some((_, None))) => Some(fetch(coordinator)
+        let fetched = match (&target, &saved) {
+            (Some((coordinator, _)), Some(SavedDeployment { deployment: None, .. })) => Some(fetch(coordinator)
                 .map_err(|_| "saved-endpoints-refresh-failed")?),
             (Some((coordinator, _)), _) if pairing_url.is_some() => Some(fetch(coordinator)?),
-            (_, Some((_, Some(saved)))) => return Self::merge(args, target, Some(saved), None, development_http),
+            (_, Some(SavedDeployment { deployment: Some(saved), .. })) =>
+                return Self::merge(args, target, Some(saved.clone()), None, development_http, approved_fingerprint),
             (Some((coordinator, _)), None) if !flags_complete => Some(fetch(coordinator)?),
             _ => None,
         };
-        Self::merge(args, target, fetched.clone(), fetched, development_http)
+        Self::merge(args, target, fetched.clone(), fetched, development_http, approved_fingerprint)
     }
 
-    fn merge(args: &[String], target: Option<(String, u32)>, deployment: Option<Deployment>, fetched: Option<Deployment>, development_http: bool) -> Result<Self, String> {
+    fn merge(args: &[String], target: Option<(String, u32)>, deployment: Option<Deployment>, fetched: Option<Deployment>, development_http: bool, approved_fingerprint: Option<&str>) -> Result<Self, String> {
         if let (Some(deployment), Some((coordinator, _))) = (&deployment, &target) {
             deployment.check(development_http).map_err(|e| format!("signer configuration from {coordinator}: {e}"))?;
         }
@@ -225,6 +251,9 @@ impl NativeConfig {
         }
         let (coordinator, slot) = target.ok_or("this signer is not paired yet: open a pairing link from the wallet")?;
         let witness_config = witness_config.expect("missing configuration fields were checked");
+        let witness_fingerprint = nonce_witness::fingerprint(&witness_config);
+        let confirm_witness_fingerprint = flag("--nonce-witnesses").is_none()
+            && approved_fingerprint != Some(witness_fingerprint.as_str());
         Ok(Self {
             coordinator, slot,
             network: network.unwrap_or_default(),
@@ -232,7 +261,9 @@ impl NativeConfig {
             lightwalletd_url,
             nonce_witnesses: witness_config.each_ref().map(|w| w.endpoint.clone()),
             witness_config,
-            save: fetched.is_some() && OVERRIDES.iter().all(|name| flag(name).is_none()),
+            witness_fingerprint,
+            confirm_witness_fingerprint,
+            save: (fetched.is_some() || confirm_witness_fingerprint) && OVERRIDES.iter().all(|name| flag(name).is_none()),
             fetched,
         })
     }
@@ -281,13 +312,13 @@ fn read_saved(data: &Path) -> Result<Option<Saved>, String> {
 }
 
 /// Keep the origin pin even when legacy paths make the saved deployment unusable.
-fn load(data: &Path, development_http: bool) -> Result<Option<(String, Option<Deployment>)>, String> {
+fn load(data: &Path, development_http: bool) -> Result<Option<SavedDeployment>, String> {
     let Some(saved) = read_saved(data)? else { return Ok(None) };
-    let (origin, network, frostd_url, lightwalletd_url, witnesses) = match saved {
-        Saved::Generation { origin, deployment } =>
-            (origin, deployment.network, deployment.frostd_url, deployment.lightwalletd_url, Some(deployment.nonce_witnesses)),
+    let (origin, network, frostd_url, lightwalletd_url, witnesses, witness_fingerprint) = match saved {
+        Saved::Generation { origin, deployment, witness_fingerprint } =>
+            (origin, deployment.network, deployment.frostd_url, deployment.lightwalletd_url, Some(deployment.nonce_witnesses), witness_fingerprint),
         Saved::Legacy { origin, network, frostd_url, lightwalletd_url } =>
-            (origin, network, frostd_url, lightwalletd_url, None),
+            (origin, network, frostd_url, lightwalletd_url, None, None),
     };
     let has_path = |url, what| endpoint_has_path(url, development_http, what).map_err(|e| format!("saved signer configuration: {e}"));
     let frostd_path = has_path(&frostd_url, "frostd URL")?;
@@ -295,7 +326,7 @@ fn load(data: &Path, development_http: bool) -> Result<Option<(String, Option<De
         Some(url) => has_path(url, "lightwalletd URL")?,
         None => false,
     };
-    if frostd_path || lightwalletd_path { return Ok(Some((origin, None))); }
+    if frostd_path || lightwalletd_path { return Ok(Some(SavedDeployment { origin, deployment: None, witness_fingerprint })); }
     let deployment = Deployment {
         network, frostd_url, lightwalletd_url,
         nonce_witnesses: match witnesses {
@@ -304,7 +335,7 @@ fn load(data: &Path, development_http: bool) -> Result<Option<(String, Option<De
         },
     };
     deployment.check(development_http).map_err(|e| format!("saved signer configuration: {e}"))?;
-    Ok(Some((origin, Some(deployment))))
+    Ok(Some(SavedDeployment { origin, deployment: Some(deployment), witness_fingerprint }))
 }
 
 /// Save a configuration for `origin`. It must be the coordinator this profile is paired with,
@@ -320,7 +351,10 @@ fn save(data: &Path, origin: &str, deployment: &Deployment) -> Result<(), String
         return Err("this profile's configuration belongs to another coordinator".into());
     }
     let dir = crate::state::MemberDir::create(data, "").map_err(|e| e.to_string())?;
-    let saved = Saved::Generation { origin: origin.into(), deployment: deployment.clone() };
+    let saved = Saved::Generation {
+        origin: origin.into(), deployment: deployment.clone(),
+        witness_fingerprint: Some(nonce_witness::fingerprint(&deployment.nonce_witnesses)),
+    };
     let bytes = Zeroizing::new(serde_json::to_vec(&saved).map_err(|e| e.to_string())?);
     write_private(dir.path(), &bytes).map_err(|e| format!("{SAVED}: {e}"))
 }

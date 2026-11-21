@@ -355,6 +355,21 @@ const asks = {
     ...(d.birth_height != null ? [facts([["Vault birth height", d.birth_height]])] : []),
   ], [{ label: "Codes differ", ghost: true, value: false }, { label: "All codes match", value: true }]),
 
+  "nonce-witnesses": (endpoints) => {
+    const code = el("input", { type: "text", autocomplete: "off", spellcheck: false, maxLength: 64 });
+    const field = reauthField();
+    return prompt("Verify the nonce witnesses", [
+      facts(endpoints.map((endpoint, i) => [`Witness ${i + 1}`, endpoint, true])),
+      el("p", { textContent: "Get the 64-character pair fingerprint from the witness operators through a channel you trust, not from this wallet. An old signing attempt cannot use replacement witnesses." }),
+      el("label", { textContent: "Witness fingerprint" }, code),
+      ...(field ? [el("label", { textContent: "Passphrase" }, field)] : []),
+    ], [cancelButton, { label: "Approve witnesses", run: async () => {
+      const fingerprint = code.value.trim();
+      if (!/^[0-9a-f]{64}$/i.test(fingerprint)) throw new SignerError("Enter the complete 64-character hexadecimal fingerprint.", 400);
+      return { ...await reauthValue(field), fingerprint };
+    } }]);
+  },
+
   // The terms the proposer announced, before this member sends its approval vote.
   "payment-terms": (d) => prompt("Approve this payment request?", [
     facts([["To", d.recipient, true], ["Amount", zec(d.amount_zat)], ["Fee", zec(d.fee_zat)], ["Memo", d.memo || "(none)"],

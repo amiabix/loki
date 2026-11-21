@@ -463,10 +463,14 @@ pub unsafe extern "C" fn loki_member_app_restore_profile(
         if launch.is_null() || file.is_null() { return Err(error); }
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
-        struct Launch { args: Vec<String>, restore_origin: String, config: crate::host::NativeConfig }
+        struct Launch {
+            args: Vec<String>, restore_origin: String, config: crate::host::NativeConfig,
+            witness_confirmation: Option<String>,
+        }
         let launch: Launch = serde_json::from_slice(std::ffi::CStr::from_ptr(launch).to_bytes()).map_err(|_| error)?;
         let file = std::ffi::CStr::from_ptr(file).to_str().map_err(|_| error)?;
         let mut config = crate::host::native_config_from_args(&launch.args).map_err(|_| error)?;
+        launch.config.verify_witness_confirmation(launch.witness_confirmation.as_deref()).map_err(|_| error)?;
         let fetched = launch.config.apply_restore(&mut config, &launch.args, &launch.restore_origin).map_err(|_| error)?;
         crate::host::native_restore_new(&mut config, &pass, words, std::path::Path::new(file), &launch.restore_origin, fetched.as_ref())?;
         published = true;
@@ -528,6 +532,7 @@ pub unsafe extern "C" fn loki_member_app_pair(
             pairing_url: Option<String>,
             profile_name: Option<String>,
             config: crate::host::NativeConfig,
+            witness_confirmation: Option<String>,
         }
         let launch: Launch = serde_json::from_str(std::ffi::CStr::from_ptr(launch).to_str().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         let mut config = crate::host::native_config_from_args(&launch.args)?;
@@ -535,6 +540,7 @@ pub unsafe extern "C" fn loki_member_app_pair(
         config.validate_secure_element()?;
         // The values the member reviewed, checked again; never fetched a second time. A fetched
         // configuration is saved only after the profile unlocks.
+        launch.config.verify_witness_confirmation(launch.witness_confirmation.as_deref())?;
         let fetched = launch.config.apply(&mut config, &launch.args, launch.pairing_url.as_deref())?;
         let registration = match launch.pairing_url {
             Some(link) => {

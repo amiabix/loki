@@ -65,13 +65,18 @@ async function loadFrostd() {
 // Claim this signature's nonce at BOTH external witnesses (fresh, pinned-key receipts verified
 // in wasm-transport), then tell the signer; the core's witness check in signApprove accepts
 // only that claim. A duplicate at either relay (a nonce already used) refuses the signature.
-async function claimAtWitnesses(signer, witnesses, packageHex, seedHex, sighashHex) {
-  const { cid, record } = JSON.parse(signer.nonceClaim(packageHex, seedHex, sighashHex));
+async function claimAtWitnesses(signer, witnesses, attemptHex, packageHex, seedHex, sighashHex) {
+  const { cid, record, pins } = JSON.parse(signer.nonceClaim(attemptHex, packageHex, seedHex, sighashHex));
+  const routes = pins.map((pin) => witnesses.find((w) =>
+    ["key", "run", "mailbox"].every((field) => w[field].toLowerCase() === pin[field])));
+  if (routes.some((w) => !w)) throw new Error("An original nonce witness is missing; start a new signing attempt");
   const { claimNonce } = await loadTransport();
-  for (const w of witnesses) {
+  for (const w of routes) {
     const challenge = toHex(crypto.getRandomValues(new Uint8Array(32)));
     const proof = signer.nonceClaimProof(w.key, w.run, w.mailbox, cid, record, challenge);
-    if (!await claimNonce(w.endpoint, w.key, w.run, w.mailbox, cid, record, challenge, proof)) {
+    const created = await claimNonce(w.endpoint, w.key, w.run, w.mailbox, cid, record, challenge, proof)
+      .catch(() => { throw new Error("An original nonce witness is unavailable; start a new signing attempt"); });
+    if (!created) {
       throw new Error("This nonce was already claimed at a nonce witness; start a new signing attempt");
     }
   }
@@ -574,14 +579,21 @@ function activeGroup({ notice, start, blocked }, slot) {
 // The request is open to every member: the proposer fixes the signing group from the first
 // approvals to arrive. So this member approves, waits for the group, and commits a nonce only
 // if the group includes it; a commitment from outside the group would fail the round.
-async function drivePayment(signer, p) {
+async function drivePayment(signer, p, witnessPinsPath) {
   const { vaultHex, attemptHex } = p;
   // Like a native member without --nonce-witnesses: no witnesses, no signing — refused before
   // anything is approved or committed.
   if (!Array.isArray(p.nonceWitnesses) || p.nonceWitnesses.length !== 2) {
     throw new Error("This signer has no nonce witnesses configured, so it cannot sign");
   }
-  signer.setNonceWitnesses(JSON.stringify(p.nonceWitnesses.map(({ key, run, mailbox }) => ({ key, run, mailbox }))));
+  const pins = JSON.stringify(p.nonceWitnesses.map(({ key, run, mailbox }) => ({ key, run, mailbox })));
+  await opfsPreopenRead(witnessPinsPath);
+  if (!signer.setNonceWitnesses(pins)) {
+    const consent = await ask("nonce-witnesses", p.nonceWitnesses.map((w) => w.endpoint));
+    signer.reauth(consent.method, consent.passphrase, consent.prfSecret);
+    await opfsPreopenWrite(witnessPinsPath);
+    signer.setNonceWitnesses(pins, consent.fingerprint);
+  }
   const vault = await openVault(signer, vaultHex);
   const control = await frostdClient(signer, p);
   const { controlSessionId, notice: announced, start } = await findPayment(signer, control, vault, attemptHex, p);
@@ -662,7 +674,7 @@ async function drivePayment(signer, p) {
   if (!consent) throw new Error("You declined to sign this payment");
   await refresh();
   signer.reauth(consent.method, consent.passphrase, consent.prfSecret);
-  await claimAtWitnesses(signer, p.nonceWitnesses, packageHex, seedHex, review.sighash);
+  await claimAtWitnesses(signer, p.nonceWitnesses, attemptHex, packageHex, seedHex, review.sighash);
   const share = signer.signApprove(attemptHex, candidateHex, packageHex, seedHex, review.sighash, JSON.stringify({ ...terms, tx_expiry: expiry }));
   await fc.sendToCoordinator(seal(share, true));
   return { approved: true, signed: true, review };
@@ -777,7 +789,7 @@ self.onmessage = async (e) => {
         result = signer.vaultAddress();
         break;
       case "payment-approve":
-        result = await drivePayment(signer, payment);
+        result = await drivePayment(signer, payment, P.witnessPins);
         break;
       case "create":
         await preopenCreate(P, method);
