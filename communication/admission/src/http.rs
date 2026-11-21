@@ -55,8 +55,8 @@ pub fn router(store: Arc<Mutex<AdmissionStore>>) -> Router {
         Arc::new(AtomicBool::new(true)),
     )
 }
-/// As `router`, waking `provision` after every accepted mailbox command so the
-/// provisioner need not wait for its next tick. `/health` reflects worker readiness.
+/// As `router`, waking `provision` after accepted mailbox and terminal commands.
+/// `/health` reflects worker readiness.
 pub fn router_with_provisioning(
     store: Arc<Mutex<AdmissionStore>>,
     provision: Arc<Notify>,
@@ -123,7 +123,10 @@ async fn handle(
         Ok(request) => request,
         Err(error) => return public_error(StatusCode::BAD_REQUEST, error.code()),
     };
-    let mailbox = matches!(request.command, admission::AdmissionCommand::Mailbox { .. });
+    let wakes_provisioner = matches!(
+        request.command,
+        admission::AdmissionCommand::Mailbox { .. } | admission::AdmissionCommand::Terminal { .. }
+    );
     let (expected_method, path) = admission::request_target(&request.command);
     if method.as_str() != expected_method || uri.path() != path {
         return public_error(StatusCode::BAD_REQUEST, "malformed");
@@ -155,10 +158,6 @@ async fn handle(
             }
         }
     };
-    let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(now) => now.as_secs(),
-        Err(_) => return public_error(StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
-    };
     let provision = service.provision.clone();
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -166,10 +165,15 @@ async fn handle(
             .store
             .lock()
             .map_err(|_| AdmissionError::Unavailable)?;
-        store.execute(&body, credential.as_ref().map(|c| c.as_slice()), now)
+        store.execute(&body, credential.as_ref().map(|c| c.as_slice()), || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|now| now.as_secs())
+                .map_err(|_| AdmissionError::Unavailable)
+        })
     })
     .await;
-    if mailbox && matches!(result, Ok(Ok(_))) {
+    if wakes_provisioner && matches!(&result, Ok(Ok(reply)) if reply.error.is_none()) {
         provision.notify_one();
     }
     match result {

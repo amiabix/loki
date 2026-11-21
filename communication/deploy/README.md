@@ -33,6 +33,15 @@ The generated paths are:
 | `relay-{1,2,3}/`, `admission/` | Persistent service roots |
 | `issue-enrollment` | TEST issuer executable for a member app on this host |
 
+For an existing owned stack, upgrade all three relays before admission. New
+payment handoff mailboxes are usable before the activation vote, but their
+reserved bytes count against the grant on each relay and the relay's provisional
+budget. Admission promotes them after unanimous activation or retires them after
+an abandoned ceremony; keep the admission worker running to reconcile either
+decision. Relay expiry alone disables use without deleting data. Legacy payment
+mailboxes keep their previous durable lifecycle, and no nonce history is migrated
+or deleted. Do not roll back to relay binaries that do not enforce reservations.
+
 ## Single-host self-custody member stack (frostd)
 
 The audited DKG/signing on `main` runs over **frostd** (`FrostdTransport`), not the

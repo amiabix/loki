@@ -3,12 +3,14 @@ use loki_relay_protocol::{
     canonical::{self, Value},
     challenge::{self, ChallengeResponse},
     envelope,
-    http::{decode_append_update, decode_creation},
+    http::{decode_append_update, decode_creation, NamespaceAction},
     nonce::{self, Claimant, ClaimProof, NonceReceipt},
     receipt,
     types::{CreationResult, Id32, Object, ReceiptBody, RelayPin, MAX_MEMBERS},
 };
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
+use rusqlite::{
+    params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
+};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
@@ -73,6 +75,40 @@ fn setup_state(connection: &Connection, mailbox: Id32) -> RelayResult<Option<(u6
         )
         .optional()?)
 }
+// Separate from setup_namespaces: its autonomous janitor cannot know whether
+// admission durably certified activation just before the deadline.
+const PAYMENT_RESERVATIONS: &str = "CREATE TABLE IF NOT EXISTS payment_reservations (
+    mailbox BLOB PRIMARY KEY NOT NULL CHECK(length(mailbox)=32),
+    creation_digest BLOB NOT NULL CHECK(length(creation_digest)=32),
+    expires INTEGER NOT NULL CHECK(expires>0),
+    state INTEGER NOT NULL CHECK(state BETWEEN 0 AND 2)
+) STRICT;";
+const PAYMENT_RESERVED: u16 = 0;
+const PAYMENT_PROMOTED: u16 = 1;
+const PAYMENT_RETIRED: u16 = 2;
+
+fn payment_state(
+    connection: &Connection,
+    mailbox: Id32,
+) -> RelayResult<Option<(Vec<u8>, u64, u16)>> {
+    let installed: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='payment_reservations')", [], |r| r.get(0),
+    )?;
+    if !installed {
+        return Ok(None);
+    }
+    Ok(connection
+        .query_row(
+            "SELECT creation_digest,expires,state FROM payment_reservations WHERE mailbox=?1",
+            [mailbox.as_slice()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?)
+}
+fn permits_nonce_history(connection: &Connection, mailbox: Id32) -> RelayResult<bool> {
+    Ok(setup_state(connection, mailbox)?.is_none()
+        && payment_state(connection, mailbox)?.is_none_or(|(_, _, state)| state == PAYMENT_PROMOTED))
+}
 fn current_time() -> RelayResult<u64> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -82,6 +118,11 @@ fn current_time() -> RelayResult<u64> {
 fn setup_active(connection: &Connection, mailbox: Id32) -> RelayResult<()> {
     if let Some((expires, retired)) = setup_state(connection, mailbox)? {
         if retired || current_time()? >= expires {
+            return Err(RelayError::Capability);
+        }
+    }
+    if let Some((_, expires, state)) = payment_state(connection, mailbox)? {
+        if state == PAYMENT_RETIRED || (state == PAYMENT_RESERVED && current_time()? >= expires) {
             return Err(RelayError::Capability);
         }
     }
@@ -205,7 +246,7 @@ impl RelayStore {
             return Err(RelayError::MalformedRequest);
         }
         let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if setup_state(&tx, mailbox)?.is_some() {
+        if !permits_nonce_history(&tx, mailbox)? {
             return Err(RelayError::Capability);
         }
         let limit: u64 = tx.query_row(
@@ -262,7 +303,7 @@ impl RelayStore {
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='nonce_claimants')",
             [], |r| r.get(0),
         )?;
-        if !enrolled || setup_state(&tx, mailbox)?.is_some() {
+        if !enrolled || !permits_nonce_history(&tx, mailbox)? {
             return Err(RelayError::Capability);
         }
         let who = proof.claimant;
@@ -824,74 +865,92 @@ impl RelayStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let expected: Vec<u8> = transaction.query_row(
-            "SELECT provisioning_verifier FROM metadata WHERE singleton=1",
-            [],
-            |row| row.get(0),
-        )?;
-        let expected: Id32 = expected
-            .try_into()
-            .map_err(|_| RelayError::StorageUnavailable)?;
-        if !provision.verify_provision(self.root.run_id, &expected) {
-            return Err(RelayError::Capability);
-        }
+        authorize_provision(&transaction, self.root.run_id, provision)?;
         setup_active(&transaction, mailbox)?;
-        let creation = decode_creation(request)?;
-        transaction.execute_batch(
-            SCHEMA
-                .split_once(MAILBOX_SCHEMA)
-                .ok_or(RelayError::StorageUnavailable)?
-                .1,
-        )?;
-        let existing: Option<(Vec<u8>, u64, u64)> = transaction
-            .query_row(
-                "SELECT creation_request,byte_quota,append_revision FROM mailboxes WHERE id=?1",
-                [mailbox.as_slice()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        if let Some((original, quota, append_revision)) = existing {
-            if original != request {
-                return Err(RelayError::Conflict);
-            }
-            transaction.commit()?;
-            return Ok(CreationResult {
-                created: false,
-                run: self.root.run_id,
-                quota,
-                append_revision,
-            });
-        }
-        let (mailbox_bytes, total_bytes, mailbox_count): (u64, u64, u64) = transaction.query_row(
-            "SELECT mailbox_bytes,total_bytes,mailbox_count FROM metadata WHERE singleton=1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
-        let count: u64 =
-            transaction.query_row("SELECT count(*) FROM mailboxes", [], |row| row.get(0))?;
-        if creation.quota > mailbox_bytes || creation.quota > total_bytes || count >= mailbox_count
-        {
-            return Err(RelayError::QuotaExhausted);
-        }
-        transaction.execute(
-            "INSERT INTO mailboxes VALUES (?1,?2,?3,?4,?5,1,NULL,?6,0,1)",
-            params![
-                mailbox.as_slice(),
-                creation.read_verifier.as_slice(),
-                creation.append_verifier.as_slice(),
-                creation.admin_verifier.as_slice(),
-                request,
-                creation.quota
-            ],
-        )?;
+        install_mailboxes(&transaction)?;
+        let result = create_mailbox(&transaction, self.root.run_id, mailbox, request)?;
         transaction.commit()?;
-        Ok(CreationResult {
-            created: true,
-            run: self.root.run_id,
-            quota: creation.quota,
-            append_revision: 1,
-        })
+        Ok(result)
     }
+}
+
+fn authorize_provision(tx: &Transaction<'_>, run: Id32, provision: &Capability) -> RelayResult<()> {
+    let expected: Vec<u8> = tx.query_row(
+        "SELECT provisioning_verifier FROM metadata WHERE singleton=1",
+        [],
+        |row| row.get(0),
+    )?;
+    let expected: Id32 = expected
+        .try_into()
+        .map_err(|_| RelayError::StorageUnavailable)?;
+    if !provision.verify_provision(run, &expected) {
+        return Err(RelayError::Capability);
+    }
+    Ok(())
+}
+
+fn install_mailboxes(tx: &Transaction<'_>) -> RelayResult<()> {
+    tx.execute_batch(
+        SCHEMA
+            .split_once(MAILBOX_SCHEMA)
+            .ok_or(RelayError::StorageUnavailable)?
+            .1,
+    )?;
+    Ok(())
+}
+
+fn create_mailbox(
+    transaction: &Transaction<'_>,
+    run: Id32,
+    mailbox: Id32,
+    request: &[u8],
+) -> RelayResult<CreationResult> {
+    let creation = decode_creation(request)?;
+    let existing: Option<(Vec<u8>, u64, u64)> = transaction
+        .query_row(
+            "SELECT creation_request,byte_quota,append_revision FROM mailboxes WHERE id=?1",
+            [mailbox.as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    if let Some((original, quota, append_revision)) = existing {
+        if original != request {
+            return Err(RelayError::Conflict);
+        }
+        return Ok(CreationResult {
+            created: false,
+            run,
+            quota,
+            append_revision,
+        });
+    }
+    let (mailbox_bytes, total_bytes, mailbox_count): (u64, u64, u64) = transaction.query_row(
+        "SELECT mailbox_bytes,total_bytes,mailbox_count FROM metadata WHERE singleton=1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let count: u64 =
+        transaction.query_row("SELECT count(*) FROM mailboxes", [], |row| row.get(0))?;
+    if creation.quota > mailbox_bytes || creation.quota > total_bytes || count >= mailbox_count {
+        return Err(RelayError::QuotaExhausted);
+    }
+    transaction.execute(
+        "INSERT INTO mailboxes VALUES (?1,?2,?3,?4,?5,1,NULL,?6,0,1)",
+        params![
+            mailbox.as_slice(),
+            creation.read_verifier.as_slice(),
+            creation.append_verifier.as_slice(),
+            creation.admin_verifier.as_slice(),
+            request,
+            creation.quota
+        ],
+    )?;
+    Ok(CreationResult {
+        created: true,
+        run,
+        quota: creation.quota,
+        append_revision: 1,
+    })
 }
 
 #[cfg(test)]
@@ -1773,23 +1832,12 @@ impl RelayStore {
         request: &[u8],
         provision: &Capability,
     ) -> RelayResult<CreationResult> {
-        let (creation, expires, retire) = loki_relay_protocol::http::decode_setup_control(request)?;
-        let quota = decode_creation(&creation)?.quota;
-        let digest: Id32 = Sha256::digest(&creation).into();
+        let (creation, expires, action) =
+            loki_relay_protocol::http::decode_namespace_control(request)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let expected: Vec<u8> = tx.query_row(
-            "SELECT provisioning_verifier FROM metadata WHERE singleton=1",
-            [],
-            |r| r.get(0),
-        )?;
-        let expected: Id32 = expected
-            .try_into()
-            .map_err(|_| RelayError::StorageUnavailable)?;
-        if !provision.verify_provision(self.root.run_id, &expected) {
-            return Err(RelayError::Capability);
-        }
+        authorize_provision(&tx, self.root.run_id, provision)?;
         let now = current_time()?;
         if expires
             > now
@@ -1798,6 +1846,24 @@ impl RelayStore {
         {
             return Err(RelayError::MalformedRequest);
         }
+        let retire = match action {
+            NamespaceAction::ReserveSetup => false,
+            NamespaceAction::RetireSetup => true,
+            _ => {
+                let result = payment_control(
+                    &tx,
+                    self.root.run_id,
+                    mailbox,
+                    &creation,
+                    expires,
+                    now,
+                    action,
+                )?;
+                tx.commit()?;
+                return Ok(result);
+            }
+        };
+        let digest: Id32 = Sha256::digest(&creation).into();
         tx.execute_batch(include_str!("setup_schema.sql"))?;
         let prior: Option<(Vec<u8>, u64, bool)> = tx
             .query_row(
@@ -1814,6 +1880,9 @@ impl RelayStore {
                 return Err(RelayError::Capability);
             }
         } else {
+            if payment_state(&tx, mailbox)?.is_some() {
+                return Err(RelayError::Conflict);
+            }
             let installed:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='mailboxes')",[],|r|r.get(0))?;
             if installed {
                 let existing: bool = tx.query_row(
@@ -1842,7 +1911,7 @@ impl RelayStore {
             return Ok(CreationResult {
                 created: false,
                 run: self.root.run_id,
-                quota,
+                quota: decode_creation(&creation)?.quota,
                 append_revision: 1,
             });
         }
@@ -1920,4 +1989,92 @@ impl RelayStore {
         tx.commit()?;
         Ok(rows.len())
     }
+}
+
+fn payment_control(
+    tx: &Transaction<'_>,
+    run: Id32,
+    mailbox: Id32,
+    creation: &[u8],
+    expires: u64,
+    now: u64,
+    action: NamespaceAction,
+) -> RelayResult<CreationResult> {
+    let id = mailbox.as_slice();
+    let digest: Id32 = Sha256::digest(creation).into();
+    let quota = decode_creation(creation)?.quota;
+    tx.execute_batch(PAYMENT_RESERVATIONS)?;
+    install_mailboxes(tx)?;
+    let prior = payment_state(tx, mailbox)?;
+    let used: Option<u64> = tx
+        .query_row("SELECT used_bytes FROM mailboxes WHERE id=?1", [id], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    let state = if let Some((old, deadline, state)) = prior {
+        if old != digest || deadline != expires {
+            return Err(RelayError::Conflict);
+        }
+        state
+    } else {
+        // Never adopt a legacy mailbox or a setup tombstone as a payment reservation.
+        if used.is_some() || setup_state(tx, mailbox)?.is_some() {
+            return Err(RelayError::Conflict);
+        }
+        PAYMENT_RESERVED
+    };
+    let next = match action {
+        NamespaceAction::ReservePayment
+            if state != PAYMENT_RETIRED && (state == PAYMENT_PROMOTED || now < expires) =>
+        {
+            if used.is_none() {
+                let (reserved, limit): (u64, u64) = tx.query_row(
+                    "SELECT (SELECT COALESCE(sum(m.byte_quota),0) FROM payment_reservations p JOIN mailboxes m ON m.id=p.mailbox WHERE p.state=0), total_bytes FROM metadata WHERE singleton=1",
+                    [], |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                if reserved
+                    .checked_add(quota)
+                    .is_none_or(|total| total > limit)
+                {
+                    return Err(RelayError::QuotaExhausted);
+                }
+            }
+            state
+        }
+        NamespaceAction::PromotePayment if state != PAYMENT_RETIRED => PAYMENT_PROMOTED,
+        NamespaceAction::RetirePayment if state != PAYMENT_PROMOTED => PAYMENT_RETIRED,
+        _ => return Err(RelayError::Conflict),
+    };
+    let result = if next == PAYMENT_RETIRED {
+        if let Some(used) = used {
+            let nonce_history: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM nonce_uses WHERE mailbox=?1)
+                     OR EXISTS(SELECT 1 FROM nonce_claimants WHERE mailbox=?1)",
+                [id],
+                |r| r.get(0),
+            )?;
+            if nonce_history {
+                return Err(RelayError::StorageUnavailable);
+            }
+            tx.execute("DELETE FROM objects WHERE mailbox=?1", [id])?;
+            tx.execute("DELETE FROM mailboxes WHERE id=?1", [id])?;
+            tx.execute(
+                "UPDATE metadata SET used_bytes=used_bytes-?1 WHERE singleton=1",
+                [used],
+            )?;
+        }
+        CreationResult {
+            created: false,
+            run,
+            quota,
+            append_revision: 1,
+        }
+    } else {
+        create_mailbox(tx, run, mailbox, creation)?
+    };
+    tx.execute(
+        "INSERT INTO payment_reservations VALUES(?1,?2,?3,?4) ON CONFLICT(mailbox) DO UPDATE SET state=excluded.state",
+        params![id, digest.as_slice(), expires, next],
+    )?;
+    Ok(result)
 }
