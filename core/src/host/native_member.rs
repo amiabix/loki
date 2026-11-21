@@ -268,10 +268,10 @@ pub(crate) fn status(data: &Path, development_http: bool) -> Value {
     reply
 }
 
-pub(crate) fn restore_running(words: Zeroizing<Vec<u8>>, file: &Path) -> Result<(), &'static str> {
+pub(crate) fn restore_running(words: Zeroizing<Vec<u8>>, file: &Path, fingerprint: &str) -> Result<(), &'static str> {
     let member = RUNNING.lock().map_err(|_| super::native_recovery::REFUSED)?.clone()
         .ok_or(super::native_recovery::LOCKED)?;
-    super::native_recovery::restore_running(&member.state, words, file)
+    super::native_recovery::restore_running(&member.state, words, file, fingerprint)
 }
 
 /// Snapshot the running member without keeping the process handle locked over a query. Discard

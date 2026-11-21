@@ -1842,6 +1842,7 @@ function RecoveryCard({ vault }: { vault: string }) {
   const [mode, setMode] = useState<"idle" | "restoring">("idle");
   const [entry, setEntry] = useState("");
   const [fingerprint, setFingerprint] = useState("");
+  const [exportFingerprint, setExportFingerprint] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -1858,14 +1859,15 @@ function RecoveryCard({ vault }: { vault: string }) {
 
   const inApp = status?.recovery_in_app === true;
   const download = async () => {
-    setBusy(true); setErr(null);
+    setBusy(true); setErr(null); setExportFingerprint(null);
     try {
-      const { vault: id, backup } = await recoveryBackup(vault);
+      const { vault: id, backup, fingerprint } = await recoveryBackup(vault);
       const url = URL.createObjectURL(new Blob([JSON.stringify({ vault: id, backup })], { type: "application/json" }));
       const link = document.createElement("a");
       link.href = url;
       link.download = `loki-recovery-${vault}.json`;
       link.click();
+      setExportFingerprint(fingerprint ?? null);
       setTimeout(() => URL.revokeObjectURL(url), 0);
     } catch (e) { setErr((e as Error).message); }
     finally { setBusy(false); }
@@ -1919,6 +1921,10 @@ function RecoveryCard({ vault }: { vault: string }) {
           <Btn variant="ghost" disabled={busy || checking || !!statusError || !status?.recovery_backup} onClick={download}>
             {busy ? "Downloading…" : "Download encrypted backup"}
           </Btn>
+          {exportFingerprint && <p role="status" className="mt-3 text-xs text-muted">
+            Save this SHA-256 fingerprint separately for restore:<br />
+            <code className="select-all break-all text-foreground">{exportFingerprint}</code>
+          </p>}
         </div>
       ) : !status ? null : words ? (
         <div>
