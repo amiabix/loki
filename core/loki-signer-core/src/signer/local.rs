@@ -680,20 +680,37 @@ impl<SE: SecureElement> LocalSigner<SE> {
         Ok((public, self.fvk()?.clone()))
     }
 
-    /// Open a candidate PCZT the `proposer` signer sealed to this member for `context`,
-    /// using this signer's own setup identity. Returns the unsigned candidate bytes; the
-    /// caller still runs the WYSIWYS render + `sign_approve` (which re-derives and binds the
-    /// sighash) before any share is released. Used by the browser non-proposer pump, whose
-    /// transport layer lives in JS and so cannot open the member-to-member envelope itself.
-    pub fn open_candidate(
+    /// Open a hosted signing packet for the browser's relay pump.
+    pub fn open_hosted_signing(
         &self,
-        proposer: &PublicIdentity,
-        context: &crate::signing_session::SessionContext,
+        sender: &PublicIdentity,
+        context: &SessionContext,
         wire: &[u8],
+    ) -> Result<crate::signing_session::OpenedMessage, SignerError> {
+        let identity = self.identity.as_ref().ok_or(SignerError::NotReady)?;
+        if context.vault != self.vault_id || (sender.id != 0 && self.confirmed_roster()
+            .and_then(|r| r.members.get(&sender.id)) != Some(sender)) {
+            return Err(SignerError::Other("signing sender or vault differs from the roster".into()));
+        }
+        identity.open_session(sender, context, wire).map_err(SignerError::Other)
+    }
+
+    /// Seal this browser member's commitment or share to the pinned hosted coordinator.
+    pub fn seal_hosted_signing(
+        &self,
+        coordinator: &PublicIdentity,
+        context: &SessionContext,
+        kind: MessageKind,
+        body: &[u8],
     ) -> Result<Vec<u8>, SignerError> {
         let identity = self.identity.as_ref().ok_or(SignerError::NotReady)?;
-        crate::transport::SealedCandidate::open(identity, proposer, context, wire)
-            .map_err(SignerError::Other)
+        if coordinator.id != 0 || context.vault != self.vault_id
+            || !matches!(kind, MessageKind::HostedCommitment | MessageKind::HostedShare)
+            || !kind.valid_hosted_body(context, body)
+        {
+            return Err(SignerError::Other("invalid signing message for coordinator".into()));
+        }
+        identity.seal_session(coordinator, context, kind, body).map_err(SignerError::Other)
     }
 
     /// The roster this member confirmed at setup. Peers are looked up here, never taken from

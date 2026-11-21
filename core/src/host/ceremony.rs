@@ -88,7 +88,7 @@ pub(super) struct WireIdentity {
 }
 
 impl WireIdentity {
-    fn from_public(p: PublicIdentity) -> Self {
+    pub(super) fn from_public(p: PublicIdentity) -> Self {
         Self {
             id: p.id,
             signing: hex::encode(p.signing),

@@ -345,6 +345,9 @@ function openNotice(signer, vault, sessionId, owner, wire) {
       || i.expiry_height <= i.target_height || !Array.isArray(i.note_selection)
       || i.note_selection.length !== 1 || !hex32(i.note_selection[0])) return null;
     if (i.replaces !== undefined && (!hex32(i.replaces?.attempt) || typeof i.replaces.cancel !== "boolean")) return null;
+    const pin = i.coordinator;
+    if (pin !== undefined && (pin?.id !== 0 || !hex32(pin.signing) || !hex32(pin.encryption)
+      || vault.members.some((m) => m.signing === pin.signing || m.encryption === pin.encryption))) return null;
     if (!Array.isArray(i.signers)) return null;
     const validGroup = i.signers.length === vault.threshold
       && i.signers[0] === from && new Set(i.signers).size === vault.threshold
@@ -364,6 +367,7 @@ function openNotice(signer, vault, sessionId, owner, wire) {
       recipient: i.recipient, memo: i.memo, amount_zat: i.amount_zat, fee_zat: i.fee_zat, change_zat: i.change_zat,
       target_height: i.target_height, expiry_height: i.expiry_height, note_selection: i.note_selection,
       ...(i.replaces && { replaces: { attempt: i.replaces.attempt, cancel: i.replaces.cancel } }),
+      ...(pin && { coordinator: { id: 0, signing: pin.signing, encryption: pin.encryption } }),
     };
     return {
       from, kind, hash, txid, ...(kind === "signed" && { pczt }),
@@ -572,6 +576,11 @@ async function drivePayment(signer, p) {
   const { controlSessionId, notice: announced, start } = await findPayment(signer, control, vault, attemptHex, p);
   const proposer = vault.members.find((m) => m.id === announced.from);
   const terms = announced.intent;
+  // Trust the key in the authenticated payment terms, never signing-session metadata.
+  const coordinator = terms.coordinator;
+  if (!coordinator) {
+    throw new Error("This payment has no sealed signing coordinator; ask the proposer to create a fresh payment");
+  }
   const scope = controlScope(signer, p);
   const refresh = async () => {
     const state = await readControl(signer, control, vault, controlSessionId, proposer, scope);
@@ -596,14 +605,8 @@ async function drivePayment(signer, p) {
   }
   const { signers, signing_expiry: expiry } = group;
 
-  // The signing session's coordinator is the one-shot key that opened it.
   const fc = await frostdClient(signer, p);
-  const signingSessionId = announced.intent.session_id;
-  fc.useSession(signingSessionId);
-  const coordinatorPeer = JSON.parse(await fc.sessionInfo()).coordinator;
-  if (!coordinatorPeer || vault.members.some((m) => m.encryption === coordinatorPeer)) {
-    throw new Error("the payment's signing session has no coordinator");
-  }
+  fc.useSession(terms.session_id);
 
   // Pre-open this attempt's crash-safe nonce files (name = payment_id ++ attempt_id hex; the
   // native host sets both to the attempt), so the synchronous commit/sign can persist.
@@ -612,30 +615,29 @@ async function drivePayment(signer, p) {
   await opfsPreopenWrite(`${dir}/nonces/${nonceId}.nonce`);
   await opfsPreopenWrite(`${dir}/nonces/${nonceId}.burn`);
 
-  // Round 1: emit this member's public commitment to the coordinator.
-  await refresh();
-  await fc.sendToCoordinator(signer.signCommit(attemptHex));
-
-  // Collect the three inbound messages: the sealed candidate (from the proposer) and the
-  // signing package + 32-byte seed (from the coordinator). The 32-byte message is the seed;
-  // the longer coordinator message is the package.
   const signersCsv = signers.join(",");
-  let candidateHex = null, packageHex = null, seedHex = null;
+  const seal = (body, share) => signer.sealSigning(coordinator.signing, coordinator.encryption, signersCsv, attemptHex, body, share);
+  await refresh();
+  await fc.sendToCoordinator(seal(signer.signCommit(attemptHex), false));
+
+  // Accept one authenticated message of each expected kind, regardless of delivery order.
+  const received = new Map();
   const pollMs = Number(p.pollMs) || 200;
   const maxTicks = Number(p.maxTicks) || 1200;
   for (let tick = 0; tick < maxTicks; tick++) {
     for (const m of JSON.parse(await fc.recv())) {
-      if (m.from === proposer.encryption && candidateHex === null) {
-        candidateHex = signer.openCandidate(proposer.signing, proposer.encryption, proposer.id, signersCsv, attemptHex, m.message);
-      } else if (m.from === coordinatorPeer) {
-        if (m.message.length === 64) seedHex = m.message; // 32 bytes hex
-        else packageHex = m.message;
-      }
+      const sender = m.from === proposer.encryption ? proposer : m.from === coordinator.encryption ? coordinator : null;
+      if (!sender) continue;
+      try {
+        const { kind, body } = JSON.parse(signer.openSigning(sender.signing, sender.encryption, sender.id, signersCsv, attemptHex, m.message));
+        if (!received.has(kind)) received.set(kind, body);
+      } catch { /* not an authenticated round message for this attempt */ }
     }
-    if (candidateHex !== null && packageHex !== null && seedHex !== null) break;
+    if (received.size === 3) break;
     await sleep(pollMs);
   }
-  if (candidateHex === null || packageHex === null || seedHex === null) {
+  const candidateHex = received.get("candidate"), packageHex = received.get("package"), seedHex = received.get("seed");
+  if (!candidateHex || !packageHex || !seedHex) {
     throw new Error("payment signing messages did not arrive before the deadline");
   }
 
@@ -651,7 +653,7 @@ async function drivePayment(signer, p) {
   signer.reauth(consent.method, consent.passphrase, consent.prfSecret);
   await claimAtWitnesses(signer, p.nonceWitnesses, packageHex, seedHex, review.sighash);
   const share = signer.signApprove(attemptHex, candidateHex, packageHex, seedHex, review.sighash, JSON.stringify({ ...terms, tx_expiry: expiry }));
-  await fc.sendToCoordinator(share);
+  await fc.sendToCoordinator(seal(share, true));
   return { approved: true, signed: true, review };
 }
 
