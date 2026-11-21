@@ -222,6 +222,21 @@ impl Identity {
         self.signing.sign(device_pub).to_bytes()
     }
 
+    pub fn nonce_claim_proof(
+        &self,
+        vault: [u8; 32],
+        pin: &loki_relay_protocol::types::RelayPin,
+        mailbox: [u8; 32],
+        cid: [u8; 32],
+        challenge: [u8; 32],
+        record: &[u8],
+    ) -> loki_relay_protocol::nonce::ClaimProof {
+        use loki_relay_protocol::nonce::{self, Claimant, ClaimProof};
+        let claimant = Claimant { vault, slot: self.id, key: self.signing.verifying_key().to_bytes() };
+        let signature = self.signing.sign(&nonce::claim_input(claimant, pin, mailbox, cid, challenge, record)).to_bytes();
+        ClaimProof { claimant, signature }
+    }
+
     pub fn sign_setup_agreement(
         &self,
         vault: &[u8; 32],

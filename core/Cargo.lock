@@ -2119,6 +2119,7 @@ dependencies = [
  "hkdf 0.12.4",
  "hpke",
  "incrementalmerkletree",
+ "loki-relay-protocol",
  "p256",
  "prost",
  "rand",

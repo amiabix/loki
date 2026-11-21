@@ -77,6 +77,42 @@ core/target/release/loki_member_app --data /absolute/member-1 --port 3601 \
 (the SSRF guard otherwise rejects loopback peer URLs). The local-passphrase file must be
 mode 0600. This is a one-host TEST setup, not production HTTPS or independent operators.
 
+## Nonce witness enrollment and upgrades
+
+Signing needs fresh receipts from two independently operated witnesses. For a new pair,
+provision the mailboxes with `core/examples/provision_nonce_witnesses.rs`. For an existing
+pair, **reuse both relay roots and their existing mailboxes**; do not run `init` again,
+replace the output configuration, or restore an older copy of `relay.sqlite3`.
+
+Stop both witnesses before upgrading. At each stopped relay, enroll each signer using the
+vault ID, FROST slot and Ed25519 signing key from the member-confirmed vault roster (not an
+unverified coordinator registry or a relay login key). Use that relay's existing mailbox ID
+from the witness configuration. Standalone payment signers use their own configured inboxes
+as witnesses, so enroll each signer on the two inboxes it uses.
+
+```sh
+loki-relay-server enroll-nonce --root /path/to/relay-root \
+  --mailbox "$MAILBOX_HEX" --vault "$VAULT_HEX" --slot "$FROST_SLOT" \
+  --signing-key "$ED25519_PUBLIC_KEY_HEX" --quota-bytes 1048576
+```
+
+Enrollment installs the new policy in place, without deleting or reassigning any legacy
+claim. Legacy CIDs still block fresh receipts for that mailbox, regardless of who presents
+them. The relay reserves claim capacity separately from ordinary objects, using the existing
+mailbox and relay byte limits as ceilings for the claim ledger. Size the budgets for both
+ledgers; each claim consumes its record bytes plus a 512-byte row allowance. Legacy records
+also count against the claim budget. An enrollment that would exceed either ceiling fails
+without changing the root. A repeat with the same key can leave or increase its quota,
+but cannot replace that key or reset its usage. If a legacy ledger is already over budget,
+keep it intact and keep signing paused rather than creating an empty replacement.
+
+Restart the upgraded witnesses and update the native clients and both browser WASM packages
+before resuming signing. The public configuration contains only endpoints and pins. A `read`
+field in an old witness file is ignored by signing clients; the provisioning tool can still
+use it to check the mailbox. Read capabilities no longer authorize claims. For browser use,
+the witness TLS proxy must allow the signer origin, `PUT`, and the `Authorization`,
+`Content-Type`, and `X-Loki-Challenge` headers. Do not downgrade or roll either witness back.
+
 ## frostd behind TLS + CORS for the in-browser signer (`frostd-tls.sh`)
 
 The in-browser (wasm) signer (`core/wasm-transport`, W3) runs frostd's POST contract from
