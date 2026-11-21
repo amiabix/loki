@@ -300,6 +300,11 @@ pub fn run(config: Config) -> Result<(), String> {
     run_local(config, None, None, None, None)
 }
 
+/// Serve the member CLI. `pairing_stdout` reserves stdout for a bare link on a private pipe.
+pub fn run_headless(config: Config, approval: Option<LocalApproval>, pairing_stdout: bool) -> Result<(), String> {
+    run_local_with(config, None, None, approval, None, None, pairing_stdout, None, None, |_| Ok(()))
+}
+
 /// `fetched`: the configuration the native app fetched and the member confirmed; it is saved
 /// only once the profile unlocks. A member started here has no roster dialog: `/api/agree`
 /// trusts its caller to have compared the code. LokiSigner starts through `run_native`.
@@ -310,7 +315,7 @@ pub fn run_local(
     approval: Option<LocalApproval>,
     fetched: Option<FetchedConfig>,
 ) -> Result<(), String> {
-    run_local_with(config, pass, notice, approval, None, fetched, None, None, |_| Ok(()))
+    run_local_with(config, pass, notice, approval, None, fetched, false, None, None, |_| Ok(()))
 }
 
 fn run_local_with<G>(
@@ -320,6 +325,7 @@ fn run_local_with<G>(
     approval: Option<LocalApproval>,
     roster_confirmation: Option<LocalRosterConfirmation>,
     fetched: Option<FetchedConfig>,
+    pairing_stdout: bool,
     stop: Option<&tokio::sync::Notify>,
     connect: Option<connect::LocalConnect>,
     on_start: impl FnOnce(&state::Shared) -> Result<G, String>,
@@ -355,6 +361,10 @@ fn run_local_with<G>(
                 if let Some(notice) = notice { notice(ready, ""); }
             } else if let Some(notice) = notice {
                 notice(ready, &format!("http://{addr}/#{}", state.config.token));
+            } else if pairing_stdout {
+                use std::io::Write;
+                writeln!(std::io::stdout(), "http://{addr}/#{}", state.config.token)
+                    .map_err(|e| format!("pairing output: {e}"))?;
             } else if let Some(launch) = &state.config.registration {
                 println!("{} ({}) — Local pairing: http://{addr}/#{}", launch.name, state.config.data.display(), state.config.token);
             } else {

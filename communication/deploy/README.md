@@ -39,7 +39,7 @@ The audited DKG/signing on `main` runs over **frostd** (`FrostdTransport`), not 
 owned relays above. `selfcustody-testnet.sh` stands up the full self-custody stack on
 one host — the public-roster web coordinator plus N `loki_member_app` processes that
 self-register — then drives a t-of-n DKG to `active` and prints the shared address.
-Bash, Cargo, Node, Python 3, curl, and openssl are required.
+Bash, Cargo, Node, Python 3, curl 7.55+, and OpenSSL are required.
 
 ```sh
 communication/deploy/selfcustody-testnet.sh /absolute/new/member-stack
@@ -162,14 +162,18 @@ loopback test stack on `:3001`. frostd (`:2744`) is shared and supports concurre
 
 ## Packaged member (`run-member.sh`)
 
-Testers run a member from a release binary with no Rust toolchain:
+Testers run a member from an updated release binary with Bash, Python 3, and OpenSSL
+(no Rust toolchain needed). Run from a terminal that is not being recorded:
 
 ```sh
 ssh -N -L 2744:localhost:2744 omarchy   # frostd must be reachable on loopback
 communication/deploy/run-member.sh https://<coordinator>.trycloudflare.com 1
-# -> open in a browser to pair this device: http://127.0.0.1:3611/#<token>
 kill $(cat ./loki-member-1/pids)   # stop
 ```
+
+Paste the private pairing link shown on the terminal into the wallet. Do not capture
+or share the link; the fragment authorizes the local API for the member process's lifetime.
+If recovery is not set up, use the wallet to set it up and save the words privately.
 
 It self-registers to the coordinator URL (slot = 2nd arg), using `software` device storage.
 Until the peer-over-frostd change lands (gap A in the work definition), the payment review
@@ -178,6 +182,21 @@ peers: the wrapper gives the member its OWN cloudflared quick tunnel and adverti
 https URL. Once gap A lands, members need zero inbound — set `NO_TUNNEL=1` (or pass
 `ADVERTISE_URL`) to skip the per-member tunnel. Tunables: `MEMBER_BIN`, `DATA`, `PORT`,
 `FROSTD_URL`, `LWD_URL`, `NETWORK`.
+
+### Upgrade from a version that logged pairing links
+
+Both launchers now use a private pipe and keep diagnostics separate from pairing. Use an
+owned, mode-0700 data directory on a local filesystem, under a parent you trust. Keep its
+passphrase file at mode 0600; never replace it to rotate a session token.
+
+Stop affected member processes before restarting with the updated launcher and binary.
+Stopping the old process revokes its bearer, and the new process generates a fresh one;
+replace any saved wallet pairing link. Without opening or copying their contents, restrict
+or dispose of old member logs and any captured launcher output according to your retention
+policy. Preserve the profile state and its existing passphrase. Before reusing a legacy
+`run-member.sh` data directory, confirm that it and its passphrase are owned by you and
+are not symlinks, then restrict them to modes 0700 and 0600 respectively. The test-stack
+launcher still requires a new root; keep any old root needed for custody or recovery.
 
 ### Binaries
 

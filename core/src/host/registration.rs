@@ -474,9 +474,9 @@ async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option
             else { println!("Member {} ({}) — save these recovery words privately (shown once): {}", launch.name, st.config.data.display(), words.as_str()); }
         }
     } else if !super::recovery::exists(&st.config.data) {
-        // Standard output is redirected (to a log file, typically beside the sealed share), so
+        // Standard output is redirected (for example, to a startup pipe), so
         // the words are never minted here. POST /api/recovery-setup returns them to the caller.
-        println!("{} ({}) — recovery words not set up: output is not a terminal, so they are not printed; set them up with POST /api/recovery-setup", launch.name, st.config.data.display());
+        eprintln!("{} ({}) — recovery words not set up: output is not a terminal, so they are not printed; set them up with POST /api/recovery-setup", launch.name, st.config.data.display());
     }
     let data = st.config.data.clone();
     let secret = pass.clone();
@@ -582,7 +582,7 @@ async fn keep_registering(st: Shared, pass: Zeroizing<String>, restored: bool, n
     loop {
         match register_once(&st, pass.clone(), pairing_claim.take(), None).await {
             Ok(member) => {
-                println!("Public roster slot: {}", member.slot);
+                eprintln!("Public roster slot: {}", member.slot);
                 return;
             }
             Err(e) => {

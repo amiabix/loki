@@ -9,8 +9,9 @@
 //!        --registration-slot <public-slot> --profile-name <name>]
 //!       [--transport hosted --operator-bundle <cbor> --operator-key <hex>
 //!        --enrollment-issuer <path> --development-http]
-//!       [--nonce-witnesses <json>] [--approve-from <file>]
+//!       [--nonce-witnesses <json>] [--approve-from <file>] [--pairing-stdout]
 //!
+//! `--pairing-stdout` is for launchers that connect stdout to a private pipe, never a log.
 //! Without `--approve-from` this process has no approval channel and refuses every payment;
 //! members sign from the native app. `--approve-from` is for test harnesses only: see
 //! `host::file_approval`.
@@ -31,7 +32,8 @@ fn main() {
         .position(|a| a == "--approve-from")
         .and_then(|i| args.get(i + 1))
         .map(|file| host::file_approval(file.into(), std::time::Duration::from_secs(120)));
-    if let Err(error) = config.validate_secure_element().and_then(|_| host::run_local(config, None, None, approval, None)) {
+    let pairing_stdout = args.iter().any(|a| a == "--pairing-stdout");
+    if let Err(error) = config.validate_secure_element().and_then(|_| host::run_headless(config, approval, pairing_stdout)) {
         eprintln!("error: {error}");
         std::process::exit(1);
     }
