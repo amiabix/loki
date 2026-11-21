@@ -2090,12 +2090,12 @@ function Send({
 function SignerList({ signers, threshold, approvals = [], ready = false, complete = false }: { signers: number[]; threshold: number; approvals?: number[]; ready?: boolean; complete?: boolean }) {
   // Until the first approvals fix the signing group, any member may approve.
   const open = signers.length === 0;
-  const shown = open ? approvals : signers;
-  const count = open ? approvals.length : approvals.filter((id) => signers.includes(id)).length;
+  const recorded = new Set(approvals);
+  const shown = new Set([...signers, ...recorded]);
   return <div className="my-3">
-    <p className="text-xs text-muted">{ready ? "Signed · every member gets the transaction" : complete ? "Your signer finished · awaiting the signed transaction" : `${count} of ${threshold} approvals recorded here${open ? " · any member can approve" : ""}`}</p>
+    <p className="text-xs text-muted">{ready ? "Signed · every member gets the transaction" : complete ? "Your signer finished · awaiting the signed transaction" : `${recorded.size} of ${threshold} approvals recorded here${open ? " · any member can approve" : ""}`}</p>
     <div className="mt-2 flex flex-wrap gap-2">
-      {shown.map((slot) => <span key={slot} className="pill"><MemberAvatar slot={slot} size={24} /> Member {slot}{approvals.includes(slot) ? " · approved" : " · waiting"}</span>)}
+      {[...shown].map((slot) => <span key={slot} className="pill"><MemberAvatar slot={slot} size={24} /> Member {slot}{recorded.has(slot) ? " · approved" : " · proposed"}</span>)}
     </div>
   </div>;
 }
