@@ -218,7 +218,8 @@ async function joinCeremony(signer, p) {
 // (a roster member running the frostd relay) forwards each member's wires to its peers; this
 // member only ever sends to the coordinator and keeps the coordinator's relayed wires.
 async function driveDkg(signer, p) {
-  const { vaultHex, slot, label, network, rosterHex, frostdUrl, coordinatorPeer, sessionId } = p;
+  const { slot, label, network, rosterHex, frostdUrl, coordinatorPeer, sessionId } = p;
+  const vaultHex = await vaultPathId(p.vaultHex);
   for (const path of JSON.parse(vaultPaths(vaultHex))) await opfsPreopenWrite(path);
   // The backup also seals to the recovery public key; without one vaultJoin refuses.
   await opfsPreopenRead(JSON.parse(devicePaths()).recovery);
@@ -260,9 +261,25 @@ async function openVault(signer, vaultHex) {
   return vault;
 }
 async function openVaultAny(signer, vaultHex) {
-  if (!/^[0-9a-f]{64}$/.test(vaultHex ?? "")) throw new Error("invalid vault id");
+  vaultHex = await vaultPathId(vaultHex);
   for (const path of JSON.parse(vaultPaths(vaultHex))) await opfsPreopenWrite(path);
   return JSON.parse(signer.vaultOpen(vaultHex));
+}
+
+async function vaultPathId(id) {
+  if (!/^[0-9a-f]{64}$/i.test(id ?? "")) throw new Error("invalid vault id");
+  const canonical = id.toLowerCase();
+  const root = await navigator.storage.getDirectory();
+  let dir;
+  try { dir = await (await root.getDirectoryHandle("loki")).getDirectoryHandle("vaults"); }
+  catch (e) { if (e.name === "NotFoundError") return canonical; throw e; }
+  let existing;
+  for await (const [name] of dir.entries()) {
+    if (name.toLowerCase() !== canonical) continue;
+    if (existing) throw new Error("Multiple local vault directories match; keep both backups and resolve the conflict before restoring.");
+    existing = name;
+  }
+  return existing ?? canonical;
 }
 
 // Trial decryption and checkpoint matching only establish what the configured provider reported.
@@ -551,7 +568,7 @@ async function listVaults(signer) {
   if (!dir) return [];
   const out = [];
   for await (const [name, h] of dir.entries()) {
-    if (h.kind !== "directory" || !/^[0-9a-f]{64}$/.test(name)) continue;
+    if (h.kind !== "directory" || !/^[0-9a-f]{64}$/i.test(name)) continue;
     let v;
     try { v = await openVaultAny(signer, name); } catch { continue; } // setup never started
     out.push(vaultSummary(v, await readVaultName(h)));
@@ -634,7 +651,7 @@ async function drivePayment(signer, p, witnessPinsPath) {
   // Pre-open this attempt's crash-safe nonce files (name = payment_id ++ attempt_id hex; the
   // native host sets both to the attempt), so the synchronous commit/sign can persist.
   const nonceId = attemptHex + attemptHex;
-  const dir = `loki/vaults/${vaultHex}/signer`;
+  const dir = `loki/vaults/${await vaultPathId(vaultHex)}/signer`;
   await opfsPreopenWrite(`${dir}/nonces/${nonceId}.nonce`);
   await opfsPreopenWrite(`${dir}/nonces/${nonceId}.burn`);
 
@@ -726,7 +743,7 @@ self.onmessage = async (e) => {
     if (a) e.data.ok ? a.resolve(e.data.value) : a.reject(new Error(e.data.error));
     return;
   }
-  const { id, op, method, name, passphrase, prfSecret, join, payment, devicePubHex, vaultHex, words, blob } = e.data;
+  const { id, op, method, name, passphrase, prfSecret, join, payment, devicePubHex, vaultHex, words, blob, fingerprint } = e.data;
   // The Signer holds ONE open vault, and these ops each reopen one. A join, payment or
   // restore holds it, so the quick reads are refused while one runs (the wallet polls
   // again) and otherwise take turns, so no op swaps the vault under another mid-flight.
@@ -805,13 +822,15 @@ self.onmessage = async (e) => {
         signer.lock();
         result = null;
         break;
-      case "has-recovery":
+      case "recovery-status":
         await opfsPreopenRead(P.recovery);
-        result = signer.hasRecovery();
+        await opfsPreopenRead(P.legacyRecovery);
+        result = { recovery_identity: signer.hasRecovery(), legacy_recovery: signer.needsRecoveryMigration() };
         break;
       case "recovery-begin":
         // The words go only to the signer page, which shows them once.
         await opfsPreopenRead(P.recovery);
+        await opfsPreopenRead(P.legacyRecovery);
         result = signer.recoveryBegin();
         break;
       case "recovery-confirm":
@@ -819,16 +838,26 @@ self.onmessage = async (e) => {
         signer.recoveryConfirm();
         result = null;
         break;
-      case "recovery-backup":
-        for (const path of JSON.parse(vaultPaths(vaultHex))) await opfsPreopenWrite(path);
-        result = signer.recoveryBackup(vaultHex);
+      case "recovery-migrate":
+        await opfsPreopenRead(P.legacyRecovery);
+        await opfsPreopenWrite(P.recovery);
+        signer.recoveryMigrate(words);
+        result = null;
         break;
-      case "restore":
+      case "recovery-backup": {
+        const pathId = await vaultPathId(vaultHex);
+        for (const path of JSON.parse(vaultPaths(pathId))) await opfsPreopenRead(path);
+        result = signer.recoveryBackup(pathId);
+        break;
+      }
+      case "restore": {
+        const pathId = await vaultPathId(vaultHex);
         await preopenCreate(P, method);
         await opfsPreopenWrite(P.recovery);
-        for (const path of JSON.parse(vaultPaths(vaultHex))) await opfsPreopenWrite(path);
-        result = JSON.parse(signer.restoreSigner(method, name ?? "", passphrase, prfSecret, vaultHex, words, blob));
+        for (const path of JSON.parse(vaultPaths(pathId))) await opfsPreopenWrite(path);
+        result = JSON.parse(signer.restoreSigner(method, name ?? "", passphrase, prfSecret, pathId, words, blob, fingerprint));
         break;
+      }
       case "remove-verified": {
         // The page drains and blocks other ops during removal. Verify against the active
         // KEK in the same worker that holds this partition's custody and sync handles.

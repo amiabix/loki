@@ -348,7 +348,12 @@ pub(super) fn restore_running(st: &Shared, words: Zeroizing<Vec<u8>>, file: &Pat
     fs::create_dir_all(&parent).map_err(|_| REFUSED)?;
     let parent = parent.canonicalize().map_err(|_| REFUSED)?;
     let dest = parent.join(&vault);
-    if !absent(&dest)? { return Err(ALREADY_PRESENT); }
+    let ensure_absent = || {
+        // Re-resolve the alias after staged key verification, which can wait for Touch ID.
+        let existing = ceremony::dir(data, &vault).map_err(|_| REFUSED)?;
+        if absent(existing.path())? && absent(&dest)? { Ok(()) } else { Err(ALREADY_PRESENT) }
+    };
+    ensure_absent()?;
     let staged = Stage::new(&parent)?;
     let vault_dir = MemberDir::open(&staged.path, "");
     let signer = vault_dir.path().join("signer");
@@ -358,7 +363,7 @@ pub(super) fn restore_running(st: &Shared, words: Zeroizing<Vec<u8>>, file: &Pat
     }
     ceremony::restore_opened_backup(backup, data, &vault_dir, pass, &st.config, Some(&dest.join("signer")))
         .map_err(|e| super::state::member_key_message(&e).unwrap_or(REFUSED))?;
-    staged.publish(&dest, &signer, || if absent(&dest)? { Ok(()) } else { Err(ALREADY_PRESENT) })
+    staged.publish(&dest, &signer, ensure_absent)
 }
 
 #[cfg(test)]

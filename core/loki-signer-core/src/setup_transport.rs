@@ -274,6 +274,10 @@ impl Identity {
         Ok(proof)
     }
 
+    pub(crate) fn sign_recovery_backup(&self, domain_separated_payload: &[u8]) -> [u8; 64] {
+        self.signing.sign(domain_separated_payload).to_bytes()
+    }
+
     pub fn sign_setup_agreement(
         &self,
         vault: &[u8; 32],

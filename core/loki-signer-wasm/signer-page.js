@@ -270,6 +270,15 @@ async function reauthValue(field, signal) {
 // vault's recovery backup is ciphertext only the words open, so it is safe to download.
 async function recoverySetup() {
   if (!current) throw new SignerError("Unlock your signer", 401);
+  const status = await call({ op: "recovery-status" });
+  if (status.legacy_recovery) {
+    const saved = el("textarea", { autocomplete: "off", spellcheck: false, rows: 4 });
+    await prompt("Confirm your saved recovery words", [
+      el("p", { textContent: "Confirm your original words before making new backups. Existing backups will not change." }),
+      el("label", { textContent: "Your 24 recovery words" }, saved),
+    ], [cancelButton, { label: "Confirm", run: () => call({ op: "recovery-migrate", words: saved.value }) }]);
+    return { recovery: true };
+  }
   const words = (await call({ op: "recovery-begin" })).split(" ");
   await prompt("Write down your 24 recovery words", [
     el("p", { textContent: "They are shown only now. With them and a vault's recovery backup file, you can restore your signer in a new browser. Anyone who has both can sign as you." }),
@@ -293,8 +302,11 @@ async function recoverySetup() {
 // Download a vault's recovery backup on this origin. The wallet gets the same opaque bytes.
 async function recoveryExport({ vault }) {
   const blob = await call({ op: "recovery-backup", vaultHex: vault });
+  const fingerprint = toHex(new Uint8Array(await crypto.subtle.digest("SHA-256", blob)));
   await prompt("Save this vault's recovery backup", [
     el("p", { textContent: "Keep the file anywhere you like. It opens only with your 24 recovery words." }),
+    el("p", { textContent: "Write down this SHA-256 fingerprint separately to verify the file on restore:" }),
+    el("code", { className: "mono", textContent: fingerprint }),
   ], [cancelButton, { label: "Download backup", run: () => {
     const a = el("a", { href: URL.createObjectURL(new Blob([blob])), download: `loki-recovery-${vault}.bin` });
     a.click();
@@ -310,18 +322,23 @@ async function restore({ vault, name, method, backup }) {
   await persistent();
   const words = el("textarea", { autocomplete: "off", spellcheck: false, rows: 4 });
   const file = el("input", { type: "file" });
-  const given = typeof backup === "string" && /^([0-9a-f]{2})+$/.test(backup) && /^[0-9a-f]{64}$/.test(vault ?? "");
+  const fingerprint = el("input", { autocomplete: "off", spellcheck: false });
+  const given = typeof backup === "string" && /^([0-9a-f]{2})+$/i.test(backup) && /^[0-9a-f]{64}$/i.test(vault ?? "");
   const input = await prompt("Restore your signer", [
     el("label", { textContent: "Your 24 recovery words" }, words),
     given ? el("p", { className: "mono", textContent: `Backup for vault ${vault.slice(0, 16)}… provided by the wallet` })
       : el("label", { textContent: "The vault's recovery backup file" }, file),
+    el("label", { textContent: "SHA-256 fingerprint saved separately from the backup" }, fingerprint),
+    el("p", { textContent: "For an older backup you saved yourself, you can compute the fingerprint from that original offline copy. Do not use a value supplied with an untrusted file." }),
   ], [cancelButton, { label: "Continue", abortable: true, run: async () => {
     const typed = words.value.trim().toLowerCase().split(/\s+/).join(" ");
-    if (given) return { vaultHex: vault, words: typed, blob: fromHex(backup) };
+    const expected = fingerprint.value.trim();
+    if (!/^[0-9a-f]{64}$/i.test(expected)) throw new SignerError("Enter the 64-character SHA-256 fingerprint.", 400);
+    if (given) return { vaultHex: vault, words: typed, blob: fromHex(backup), fingerprint: expected };
     const f = file.files[0];
-    const vaultHex = vault || f?.name.match(/[0-9a-f]{64}/)?.[0];
+    const vaultHex = vault || f?.name.match(/[0-9a-f]{64}/i)?.[0];
     if (!f || !vaultHex) throw new SignerError("Choose the loki-recovery-<vault>.bin file you saved.", 400);
-    return { vaultHex, words: typed, blob: new Uint8Array(await f.arrayBuffer()) };
+    return { vaultHex, words: typed, blob: new Uint8Array(await f.arrayBuffer()), fingerprint: expected };
   } }]);
   name = String(name || "You");
   const result = await newCustody(name, method, (secret) => call({ op: "restore", method, name, ...input, ...secret }));
@@ -557,7 +574,7 @@ const ops = {
   "enroll-sign": enrollSign,
   // A vault backup must also seal to recovery words, so set them up before the first join.
   join: async (p) => {
-    if (!await call({ op: "has-recovery" })) await recoverySetup();
+    if (!(await call({ op: "recovery-status" })).recovery_identity) await recoverySetup();
     return call({ op: "join", join: relay(p) });
   },
   "payment-review": (p) => call({ op: "payment-review", payment: relay(p) }),
@@ -568,7 +585,7 @@ const ops = {
   chain: (p) => call({ op: "chain", payment: { ...p, lightwalletdGrpcWeb: cfg.lightwalletdGrpcWebUrl } }),
   "payment-status": (p) => call({ op: "payment-status", payment: { ...relay(p), lightwalletdGrpcWeb: cfg.lightwalletdGrpcWebUrl } }),
   "recovery-setup": recoverySetup,
-  "recovery-status": async () => ({ recovery_identity: await call({ op: "has-recovery" }) }),
+  "recovery-status": () => call({ op: "recovery-status" }),
   "recovery-export": recoveryExport,
   restore,
   "manage-custody": manageCustody,

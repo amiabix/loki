@@ -27,6 +27,7 @@ import {
   setupBrowserRecovery,
   signerKind,
   recoveryBackup,
+  recoveryConfirm,
   recoveryRestore,
   recoverySetup,
   recoveryStatus,
@@ -1830,6 +1831,7 @@ function RecoveryCard({ vault }: { vault: string }) {
   const [words, setWords] = useState<string | null>(null);
   const [mode, setMode] = useState<"idle" | "restoring">("idle");
   const [entry, setEntry] = useState("");
+  const [fingerprint, setFingerprint] = useState("");
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -1864,7 +1866,17 @@ function RecoveryCard({ vault }: { vault: string }) {
     try {
       const { words } = await recoverySetup();
       setWords(words);
-      refresh();
+    } catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
+  };
+
+  const confirmSetup = async () => {
+    if (!words) return;
+    setBusy(true); setErr(null);
+    try {
+      await recoveryConfirm(words);
+      setWords(null);
+      await refresh();
     } catch (e) { setErr((e as Error).message); }
     finally { setBusy(false); }
   };
@@ -1872,9 +1884,9 @@ function RecoveryCard({ vault }: { vault: string }) {
   const restore = async () => {
     setBusy(true); setErr(null); setMsg(null);
     try {
-      await recoveryRestore(vault, entry.trim());
+      await recoveryRestore(vault, entry.trim(), fingerprint.trim() || undefined);
       setMsg("Access restored — your share is rebuilt.");
-      setMode("idle"); setEntry(""); refresh();
+      setMode("idle"); setEntry(""); setFingerprint(""); refresh();
     } catch (e) { setErr((e as Error).message); }
     finally { setBusy(false); }
   };
@@ -1901,15 +1913,15 @@ function RecoveryCard({ vault }: { vault: string }) {
       ) : !status ? null : words ? (
         <div>
           <p className="mb-2 text-xs text-amber">
-            Write these 24 words down and keep them offline. They are shown once. Restoring your
-            share also requires signing in to this account and a stored backup for this vault.
+            Write these 24 words down and keep them offline. Recovery is not active until you
+            confirm. Save each vault&apos;s encrypted backup and its fingerprint separately.
           </p>
           <div className="mb-3 grid grid-cols-2 gap-x-3 gap-y-2 rounded-xl border border-[var(--border)] bg-[var(--surface-2)] p-3 font-mono text-xs sm:grid-cols-3">
             {words.split(/\s+/).map((w, i) => (
               <span key={i}><span className="text-muted">{i + 1}.</span> {w}</span>
             ))}
           </div>
-          <Btn variant="mint" onClick={() => setWords(null)}>I&apos;ve saved them</Btn>
+          <Btn variant="mint" onClick={confirmSetup} disabled={busy}>{busy ? "Confirming…" : "I've saved them"}</Btn>
         </div>
       ) : mode === "restoring" ? (
         <div>
@@ -1922,11 +1934,13 @@ function RecoveryCard({ vault }: { vault: string }) {
             placeholder="word1 word2 … word24"
             className="glass mb-3 w-full rounded-2xl p-3 font-mono outline-none"
           />
+          <label htmlFor="restore-fingerprint" className="mb-2 block text-xs text-muted">SHA-256 fingerprint saved separately from your backup (required for a fresh restore)</label>
+          <input id="restore-fingerprint" value={fingerprint} onChange={(e) => setFingerprint(e.target.value)} autoComplete="off" spellCheck={false} className="glass mb-3 w-full rounded-2xl p-3 font-mono outline-none" />
           <div className="grid gap-3 sm:grid-cols-2">
             <Btn variant="mint" onClick={restore} disabled={busy || !entry.trim()}>
               {busy ? "Restoring…" : "Restore"}
             </Btn>
-            <Btn variant="ghost" onClick={() => { setMode("idle"); setErr(null); }}>Cancel</Btn>
+            <Btn variant="ghost" onClick={() => { setMode("idle"); setEntry(""); setFingerprint(""); setErr(null); }}>Cancel</Btn>
           </div>
         </div>
       ) : (

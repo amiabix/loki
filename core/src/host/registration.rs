@@ -425,11 +425,11 @@ async fn register(config: &Config, pass: &str, pairing_claim: Option<&str>, slot
 /// unlocks and headless launches serve immediately and retry registration in the background.
 pub(super) async fn start(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option<&super::LocalNotice>) -> Result<&'static str, String> {
     use std::io::IsTerminal;
-    start_with(st, pass, notice, std::io::stdout().is_terminal()).await
+    let interactive = std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
+    start_with(st, pass, notice, interactive).await
 }
 
-/// `interactive`: standard output is a terminal, so recovery words printed there reach the
-/// member and not a log file.
+/// `interactive`: both streams are terminals, so the member can see and acknowledge the words.
 async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option<&super::LocalNotice>, interactive: bool) -> Result<&'static str, String> {
     let Some(launch) = &st.config.registration else { return Ok("ready"); };
     let generation = st.session_generation();
@@ -513,16 +513,17 @@ async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option
         // even if someone deleted one of its files after publication.
         if !super::recovery::exists(&st.config.data) { return Err("The restored recovery identity is missing.".into()); }
     } else if let Some(notice) = notice.filter(|_| native) {
-        super::recovery::confirm_recovery(&st.config.data, notice)?;
-    } else if notice.is_some() || interactive {
-        if let Some(words) = super::recovery::establish_recovery(&st.config.data).await? {
-            if let Some(notice) = notice { notice("recovery", words.as_str()); }
-            else { println!("Member {} ({}) — save these recovery words privately (shown once): {}", launch.name, st.config.data.display(), words.as_str()); }
-        }
+        super::recovery::confirm_recovery(&st.config.data, &pass, notice)?;
+    } else if interactive {
+        let notice: super::LocalNotice = std::sync::Arc::new(|_, words| {
+            println!("Save these 24 recovery words privately (shown once):\n{words}\nType YES and press Enter after saving them.");
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer).is_ok() && answer.trim() == "YES"
+        });
+        super::recovery::confirm_recovery(&st.config.data, &pass, &notice)?;
     } else if !super::recovery::exists(&st.config.data) {
-        // Standard output is redirected (for example, to a startup pipe), so
-        // the words are never minted here. POST /api/recovery-setup returns them to the caller.
-        eprintln!("{} ({}) — recovery words not set up: output is not a terminal, so they are not printed; set them up with POST /api/recovery-setup", launch.name, st.config.data.display());
+        // Diagnostics stay off the startup pipe.
+        eprintln!("{} ({}) — recovery words not set up: begin and confirm with POST /api/recovery-setup", launch.name, st.config.data.display());
     }
     let data = st.config.data.clone();
     let secret = pass.clone();
@@ -1210,19 +1211,17 @@ mod tests {
         std::fs::remove_dir_all(data).unwrap();
     }
 
-    /// Words printed to a redirected standard output land in a log file beside the sealed share,
-    /// so without a notice hook they are minted at startup only for an interactive terminal.
+    /// A redirected launch must start without recovery keys or a terminal prompt. The member
+    /// uses the authenticated HTTP confirmation flow after startup instead.
     #[tokio::test]
     async fn recovery_words_are_not_minted_at_startup_when_output_is_not_a_terminal() {
-        for interactive in [false, true] {
-            let data = std::env::temp_dir().join(format!("loki-pair-words-{}", uuid::Uuid::new_v4()));
-            let state = pairing_state(&data);
-            start_with(&state, Some(Zeroizing::new("unlock".into())), None, interactive).await.unwrap();
-            assert_eq!(data.join("recovery.pub").exists(), interactive, "interactive: {interactive}");
-            assert!(state.session.read().await.is_some());
-            failed_attempt(&state).await;
-            std::fs::remove_dir_all(data).unwrap();
-        }
+        let data = std::env::temp_dir().join(format!("loki-pair-words-{}", uuid::Uuid::new_v4()));
+        let state = pairing_state(&data);
+        start_with(&state, Some(Zeroizing::new("unlock".into())), None, false).await.unwrap();
+        assert!(!data.join("recovery.pub").exists());
+        assert!(state.session.read().await.is_some());
+        failed_attempt(&state).await;
+        std::fs::remove_dir_all(data).unwrap();
     }
 
     /// An unreachable coordinator does not stop the member app: the local API serves an

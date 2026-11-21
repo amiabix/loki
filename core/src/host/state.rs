@@ -436,6 +436,7 @@ pub struct AppState {
     pub session: RwLock<Option<Session>>,
     // Lock and activation both modify session state under the session write lock.
     pub(super) session_generation: AtomicU64,
+    pub(super) pending_recovery: std::sync::Mutex<Option<Vec<u8>>>,
     pub ceremony: std::sync::Mutex<()>,
     pub payment: std::sync::Mutex<()>,
     pub active_payments: std::sync::Mutex<BTreeSet<String>>,
@@ -467,6 +468,7 @@ impl AppState {
             registration_error: RwLock::new(None),
             session: RwLock::new(None),
             session_generation: AtomicU64::new(0),
+            pending_recovery: std::sync::Mutex::new(None),
             ceremony: std::sync::Mutex::new(()),
             payment: std::sync::Mutex::new(()),
             active_payments: std::sync::Mutex::new(BTreeSet::new()),
@@ -497,6 +499,7 @@ impl AppState {
     pub(super) async fn lock_session(self: &std::sync::Arc<Self>) {
         let mut current = self.session.write().await;
         *current = None;
+        if let Ok(mut pending) = self.pending_recovery.lock() { *pending = None; }
         if let Some(tabs) = &self.wallet_tabs { tabs.revoke_all(); }
         crate::seal_kdf::clear_session_cache();
         self.session_generation.fetch_add(1, Ordering::Release);

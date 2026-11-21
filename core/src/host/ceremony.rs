@@ -176,8 +176,24 @@ fn vault_bytes(vault: &str) -> Result<[u8; 32], String> {
 }
 
 pub(super) fn dir(data: &Path, vault: &str) -> Result<MemberDir, String> {
-    vault_bytes(vault)?;
-    Ok(MemberDir::open(&data.join("vaults"), vault))
+    let canonical = hex::encode(vault_bytes(vault)?);
+    let parent = data.join("vaults");
+    let entries = match std::fs::read_dir(&parent) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(MemberDir::open(&parent, &canonical)),
+        Err(e) => return Err(e.to_string()),
+    };
+    // Use a unique legacy spelling in place: renaming it could orphan path-bound keys.
+    let mut existing = None;
+    for entry in entries {
+        let name = entry.map_err(|e| e.to_string())?.file_name();
+        if let Some(name) = name.to_str().filter(|name| name.eq_ignore_ascii_case(&canonical)) {
+            if existing.replace(name.to_owned()).is_some() {
+                return Err("multiple directories for this vault; preserve both and resolve the conflict before restoring".into());
+            }
+        }
+    }
+    Ok(MemberDir::open(&parent, existing.as_deref().unwrap_or(&canonical)))
 }
 
 pub(super) fn load(data: &Path, pass: &str, vault: &str) -> Result<Ceremony, String> {
@@ -185,15 +201,15 @@ pub(super) fn load(data: &Path, pass: &str, vault: &str) -> Result<Ceremony, Str
         .read_sealed("ceremony.sealed", pass)
         .map_err(|e| e.to_string())?;
     let c: Ceremony = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
-    if c.vault != vault {
+    if vault_bytes(&c.vault)? != vault_bytes(vault)? {
         return Err("ceremony vault mismatch".into());
     }
     Ok(c)
 }
 
 fn save(data: &Path, pass: &str, c: &Ceremony) -> Result<(), String> {
-    let root = data.join("vaults");
-    let d = MemberDir::create(&root, &c.vault).map_err(|e| e.to_string())?;
+    let path = dir(data, &c.vault)?;
+    let d = MemberDir::create(path.path(), "").map_err(|e| e.to_string())?;
     save_to(&d, pass, c)
 }
 
@@ -1933,7 +1949,7 @@ mod tests {
         let mut pubkeys = Vec::with_capacity(64);
         pubkeys.extend_from_slice(&rkey.public_bytes());
         pubkeys.extend_from_slice(&rkey.signing_public());
-        std::fs::write(data.join("recovery.pub"), &pubkeys).unwrap();
+        crate::host::recovery::adopt_recovery(&data, &rkey, pass).unwrap();
         drop(rkey);
 
         let (material, shares, public) = dealer_vault(&data, vault, pass);
@@ -1943,6 +1959,7 @@ mod tests {
         // Activation seals the recovery backup — the wiring under test.
         crate::host::recovery::seal_vault_backup(&data, &sdir, &vault, pass).unwrap();
         let blob = std::fs::read(crate::host::recovery::backup_file(&sdir)).unwrap();
+        let fingerprint = BackupArtifact(blob.clone()).fingerprint();
         assert!(
             !blob.windows(share_bytes.len()).any(|w| w == share_bytes.as_slice()),
             "the recovery backup is HPKE ciphertext, never the share plaintext",
@@ -1978,12 +1995,12 @@ mod tests {
 
         // Wrong words cannot open the backup, and restore needs the exported blob here.
         let (other, _) = RecoveryKey::generate().unwrap();
-        assert!(restore_vault_from_backup(&data, &vault_hex, &other, Some(&blob), pass, &config).is_err());
-        assert!(restore_vault_from_backup(&data, &vault_hex, &words, None, pass, &config).is_err());
+        assert!(restore_vault_from_backup(&data, &vault_hex, &other, Some(&blob), Some(&fingerprint), pass, &config).is_err());
+        assert!(restore_vault_from_backup(&data, &vault_hex, &words, None, Some(&fingerprint), pass, &config).is_err());
         // A profile that already holds another member identity is never overwritten.
         let root = MemberDir::create(&data, "").unwrap();
         root.write_sealed("identity.sealed", &Identity::new(1).to_secret_bytes(), pass).unwrap();
-        let conflict = restore_vault_from_backup(&data, &vault_hex, &words, Some(&blob), pass, &config);
+        let conflict = restore_vault_from_backup(&data, &vault_hex, &words, Some(&blob), Some(&fingerprint), pass, &config);
         assert!(conflict.unwrap_err().contains("different member identity"));
         assert!(!dir(&data, &vault_hex).unwrap().exists("vault.sealed"));
         std::fs::remove_dir_all(&data).unwrap();
@@ -1993,7 +2010,7 @@ mod tests {
         other_pub.extend_from_slice(&other_key.signing_public());
         MemberDir::create(&data, "").unwrap();
         std::fs::write(data.join("recovery.pub"), &other_pub).unwrap();
-        let conflict = restore_vault_from_backup(&data, &vault_hex, &words, Some(&blob), pass, &config);
+        let conflict = restore_vault_from_backup(&data, &vault_hex, &words, Some(&blob), Some(&fingerprint), pass, &config);
         assert!(conflict.unwrap_err().contains("different recovery words"));
         assert!(!dir(&data, &vault_hex).unwrap().exists("vault.sealed"));
         assert!(!data.join("identity.sealed").exists());
@@ -2001,13 +2018,13 @@ mod tests {
         std::fs::remove_dir_all(&data).unwrap();
 
         // The real words restore a member the payment path can open and sign with.
-        restore_vault_from_backup(&data, &vault_hex, &words, Some(&blob), pass, &config).unwrap();
+        restore_vault_from_backup(&data, &vault_hex, &words, Some(&blob), Some(&fingerprint), pass, &config).unwrap();
         crate::host::payment::load_vault(&AppState::new(make_config()), &data, pass, &vault_hex)
             .expect("the restored member opens for signing");
         // Restore brings the recovery identity: `recovery.pub` holds both public keys of these
         // words, so a later start or recovery setup does not mint a second set.
         assert_eq!(std::fs::read(data.join("recovery.pub")).unwrap(), pubkeys);
-        assert!(tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(crate::host::recovery::establish_recovery(&data)).unwrap().is_none());
+        assert!(crate::host::recovery::exists(&data));
 
         // `vault.sealed` is public metadata only. The restored member completes a rerandomized
         // FROST round with member 2 using the key package from the signer store, read through
@@ -2036,7 +2053,7 @@ mod tests {
         assert_eq!(group.verifying_key(), public.verifying_key());
         assert_eq!(std::fs::read(crate::host::recovery::backup_file(&sdir)).unwrap(), blob);
         assert!(
-            restore_vault_from_backup(&data, &vault_hex, &words, Some(&blob), pass, &config).is_err(),
+            restore_vault_from_backup(&data, &vault_hex, &words, Some(&blob), Some(&fingerprint), pass, &config).is_err(),
             "never replace an existing vault",
         );
 
@@ -2077,14 +2094,14 @@ mod tests {
         assert_eq!(unchanged, legacy);
         assert!(sdir.join("backup.sealed").exists());
         // The same share migrates once: vault.sealed keeps exactly its public metadata, the
-        // passphrase copy goes, the recovery backup stays, and the member still opens.
+        // unusable passphrase copy is not trusted for conversion, and the member still opens.
         legacy["key_package"] = json!(hex::encode(restored.serialize().unwrap()));
         write_legacy(&legacy);
         crate::host::payment::load_vault(&AppState::new(make_config()), &data, pass, &vault_hex)
             .expect("the migrated member opens for signing");
         let migrated: Value = serde_json::from_slice(&vdir.read_sealed("vault.sealed", pass).unwrap()).unwrap();
         assert_eq!(migrated, sealed);
-        assert!(!sdir.join("backup.sealed").exists());
+        assert!(sdir.join("backup.sealed").exists());
         assert_eq!(std::fs::read(crate::host::recovery::backup_file(&sdir)).unwrap(), blob);
         crate::host::payment::load_vault(&AppState::new(make_config()), &data, pass, &vault_hex).unwrap();
 
@@ -2217,6 +2234,7 @@ mod tests {
         assert_eq!(status().await, json!({"recovery_identity": false, "recovery_backup": false}));
         let words = call(reqwest::Method::POST, "/api/recovery-setup", json!({})).await.unwrap()
             .json::<Value>().await.unwrap()["words"].as_str().unwrap().to_owned();
+        assert!(call(reqwest::Method::POST, "/api/recovery-setup", json!({"words": words})).await.unwrap().status().is_success());
         assert_eq!(status().await, json!({"recovery_identity": true, "recovery_backup": true}));
         let key = RecoveryKey::from_words(&words).unwrap();
         let opened = crate::signer::backup::verify_recovery(&BackupArtifact(std::fs::read(&backup).unwrap()), &key, &vault).unwrap();
@@ -2278,6 +2296,7 @@ mod tests {
         assert!(call(&old_base, &old_token, reqwest::Method::POST, "/api/unlock", json!({"passphrase": pass})).await.unwrap().status().is_success());
         let words = call(&old_base, &old_token, reqwest::Method::POST, "/api/recovery-setup", json!({})).await.unwrap()
             .json::<Value>().await.unwrap()["words"].as_str().unwrap().to_owned();
+        assert!(call(&old_base, &old_token, reqwest::Method::POST, "/api/recovery-setup", json!({"words": words})).await.unwrap().status().is_success());
         let backup = call(&old_base, &old_token, reqwest::Method::GET, &format!("/api/recovery-backup?vault={vault_hex}"), json!({}))
             .await.unwrap().json::<Value>().await.unwrap()["backup"].as_str().unwrap().to_owned();
 
@@ -2292,12 +2311,13 @@ mod tests {
         let old_commitment = NonceStore::open(&old_nonces, vault, 1).unwrap()
             .commit(&stale_id, &SoftwareSecureElement::generate(), old_key.signing_share(), None).unwrap();
 
-        // New device: a clean data dir restores from the exported backup and the words alone.
+        // New device: a clean data dir restores the backup pinned on the old signer.
         crate::profile::create(&new, pass, "New").unwrap();
         let (new_base, new_token) = spawn_host(&new).await;
         assert!(call(&new_base, &new_token, reqwest::Method::POST, "/api/unlock", json!({"passphrase": pass})).await.unwrap().status().is_success());
+        let fingerprint = BackupArtifact(hex::decode(&backup).unwrap()).fingerprint();
         let restored = call(&new_base, &new_token, reqwest::Method::POST, "/api/recovery-restore",
-            json!({"vault": vault_hex, "words": words, "backup": backup})).await.unwrap();
+            json!({"vault": vault_hex, "words": words, "backup": backup, "fingerprint": fingerprint})).await.unwrap();
         assert_eq!(restored.status(), reqwest::StatusCode::OK);
         assert_eq!(restored.json::<Value>().await.unwrap(), json!({"restored": true}));
         let status = call(&new_base, &new_token, reqwest::Method::GET, &format!("/api/recovery-status?vault={vault_hex}"), json!({}))
@@ -2690,6 +2710,7 @@ pub(super) fn restore_vault_from_backup(
     vault: &str,
     words: &str,
     backup: Option<&[u8]>,
+    fingerprint: Option<&str>,
     pass: &str,
     config: &super::Config,
 ) -> Result<(), String> {
@@ -2701,7 +2722,13 @@ pub(super) fn restore_vault_from_backup(
         None => std::fs::read(&local)
             .map_err(|_| "no recovery backup for this vault; supply the exported backup".to_string())?,
     };
-    restore_opened_backup(RecoveryBackup::open(vault, key, blob)?, data, &dir, pass, config, None)
+    let artifact = BackupArtifact(blob);
+    if let Some(fingerprint) = fingerprint {
+        artifact.check_fingerprint(fingerprint)?;
+    } else if !dir.exists("vault.sealed") {
+        return Err("a fresh restore needs the independently saved SHA-256 fingerprint of the backup".into());
+    }
+    restore_opened_backup(RecoveryBackup::open(vault, key, artifact.0)?, data, &dir, pass, config, None)
 }
 
 pub(super) struct RecoveryBackup {
@@ -2714,8 +2741,9 @@ pub(super) struct RecoveryBackup {
 impl RecoveryBackup {
     pub(super) fn open(vault: &str, key: crate::signer::recovery::RecoveryKey, blob: Vec<u8>) -> Result<Self, String> {
         let artifact = BackupArtifact(blob);
-        let material = crate::signer::backup::verify_recovery(&artifact, &key, &vault_bytes(vault)?)?;
-        Ok(Self { material, key, blob: artifact.0, vault: vault.into() })
+        let vault_id = vault_bytes(vault)?;
+        let material = crate::signer::backup::verify_recovery(&artifact, &key, &vault_id)?;
+        Ok(Self { material, key, blob: artifact.0, vault: hex::encode(vault_id) })
     }
 }
 
@@ -2727,32 +2755,18 @@ pub(super) fn restore_opened_backup(backup: RecoveryBackup, data: &Path, dest: &
     let local = super::recovery::backup_file(&sdir);
     let pp = frost::keys::PublicKeyPackage::deserialize(&material.public_package)
         .map_err(|e| e.to_string())?;
-    let kp = frost::keys::KeyPackage::deserialize(&material.key_package).map_err(|e| e.to_string())?;
-    let id = frost::Identifier::try_from(material.member_id).map_err(|e| e.to_string())?;
-    if kp.identifier() != &id || kp.verifying_key() != pp.verifying_key()
-        || pp.min_signers() != Some(material.threshold)
-        || pp.verifying_shares().len() != usize::from(material.members)
-        || pp.verifying_shares().get(&id) != Some(kp.verifying_share()) {
-        return Err("recovery share differs from its public vault metadata".into());
-    }
     // Signing needs every member's relay identity, which only the backup's roster carries.
     // `verify_recovery` already bound that roster to this vault and to the backup's identity.
     if material.roster.is_empty() || material.identity.is_empty() {
         return Err("this backup has no roster, so it cannot rebuild a member that signs".into());
     }
     let roster = crate::member_state::Roster::from_bytes(&material.roster)?;
-    if roster.threshold != material.threshold || roster.members.len() != usize::from(material.members) {
-        return Err("recovery roster differs from its vault metadata".into());
-    }
     let network = match material.network {
         Network::Regtest => VaultNetwork::Regtest,
         Network::Testnet => VaultNetwork::Testnet,
     };
     if network.label() != config.network {
         return Err("recovery backup is for a different network".into());
-    }
-    if dest.exists("vault.sealed") {
-        return Err("vault already exists; restore into a fresh device profile".into());
     }
     // The profile's identity serves every vault it holds, so restore never replaces one.
     let root = MemberDir::open(data, ".");
@@ -2771,6 +2785,29 @@ pub(super) fn restore_opened_backup(backup: RecoveryBackup, data: &Path, dest: &
     // The words that open this backup become the profile's recovery identity, so a later start
     // or recovery setup never mints a second, unrelated set the backup is not sealed to.
     let write_recovery = super::recovery::check_recovery(data, &key)?;
+    if dest.exists("vault.sealed") {
+        // Repair only the export of an already restored headless vault; never touch its
+        // live share or epoch. The unlocked device store is the independent trust anchor.
+        if published_key_dir.is_some() || write_identity || write_recovery
+            || std::fs::read(&local).is_ok_and(|prior| prior == blob) {
+            return Err("vault already exists; restore into a fresh device profile".into());
+        }
+        let installed = load(data, pass, vault)?;
+        let installed_roster = roster_of(&installed)?;
+        if installed.birth_height != material.birth_height || installed_roster.threshold != roster.threshold
+            || !installed_roster.members.values().eq(roster.members.values()) {
+            return Err("recovery backup does not match this vault's installed roster".into());
+        }
+        let store = crate::signer::store::SignerStore::open(&sdir)?;
+        let se = config.open_secure_element(&sdir, pass)?;
+        let expected = crate::signer::local::encode_share(&material.key_package, &material.public_package, &material.group_sk);
+        if store.vault() != vault_id || store.member() != material.member_id || store.network() != material.network
+            || !store.read(&se, crate::signer::store::FileKind::Share)?
+                .is_some_and(|(_, share)| share.as_slice() == expected.as_slice()) {
+            return Err("recovery backup does not match this vault's installed share".into());
+        }
+        return super::recovery::install_backup(&sdir, &blob);
+    }
     let mut ceremony = Ceremony {
         vault: vault.to_owned(),
         name: material.label.clone(),
@@ -2825,12 +2862,10 @@ pub(super) fn restore_opened_backup(backup: RecoveryBackup, data: &Path, dest: &
             .map_err(|e| e.to_string())?;
     }
     if write_recovery {
-        super::recovery::adopt_recovery(data, &key)?;
+        super::recovery::adopt_recovery(data, &key, pass)?;
     }
     // Keep the backup on the new device so it can be exported again.
-    if !local.exists() {
-        std::fs::write(&local, &blob).map_err(|e| e.to_string())?;
-    }
+    super::recovery::install_backup(&sdir, &blob)?;
     save_to(dest, pass, &ceremony)?;
     // Written last: `vault.sealed` is what marks the vault active.
     dest.write_sealed("vault.sealed", &bytes, pass)
