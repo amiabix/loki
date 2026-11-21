@@ -338,7 +338,11 @@ and supply a single link followed by a newline over standard input from a privat
 
 Other member flags are the existing `loki_member_app` flags: network, lightwalletd, relay,
 nonce witnesses, and peer allowlist. Each overrides the coordinator's value for its field,
-for that launch only. For an HTTP ceremony between separate Macs, the creator needs a reachable
+for that launch only. Members on separate Macs join over frostd: the invite names the creator's
+identity, each joiner seals its requests to the creator on the shared relay, and the creator
+answers while it is unlocked. The creator exposes no endpoint for this, but every member must
+use the same frostd (`--frostd-url`). Older invites without the creator's identity still join
+over HTTP. For that HTTP ceremony, the creator needs a reachable
 HTTPS `--advertise-url` and a separate `--peer-port`. Terminate TLS on a same-host proxy
 forwarding only to the ceremony listener at `127.0.0.1:<peer-port>`. Confirm that origin with
 the creator separately from the invite, then add it to each joiner's `--peer <slot=origin>`
