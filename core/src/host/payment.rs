@@ -92,6 +92,8 @@ struct Payment {
     approvals: Vec<u16>,
     #[serde(default)]
     start_requested: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    coordinator: Option<WireIdentity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     coordinator_secret: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -477,6 +479,12 @@ fn check_intent(p: &Payment, v: &Vault) -> Result<(), String> {
     if let Some(r) = &p.replaces {
         hex32(&r.attempt)?;
     }
+    if let Some(coordinator) = &p.coordinator {
+        let pin = coordinator.public(0)?;
+        if v.peers.values().any(|peer| peer.encryption == pin.encryption || peer.signing == pin.signing) {
+            return Err("payment coordinator must have its own identity".into());
+        }
+    }
     Ok(())
 }
 /// A replacement spends the note of the payment it replaces, and a Retry keeps its terms. A
@@ -541,6 +549,9 @@ fn public_intent(p: &Payment) -> Value {
     }
     if let Some(expiry) = p.signing_expiry {
         intent["signing_expiry"] = json!(expiry);
+    }
+    if let Some(coordinator) = &p.coordinator {
+        intent["coordinator"] = json!(coordinator);
     }
     intent
 }
@@ -1151,6 +1162,7 @@ pub(super) async fn publish(State(st): State<Shared>, Json(body): Json<Value>) -
             .collect::<Vec<_>>();
         let ch = tx.open(&peers, 4).map_err(|e| e.to_string())?;
         p.session_id = Some(ch.session_id());
+        p.coordinator = Some(WireIdentity::from_public(coord.public()));
         p.coordinator_secret = Some(hex::encode(&*Zeroizing::new(coord.to_secret_bytes())));
         p.phase = "signing".into();
         let mut control = relay(&v.identity, &st.config.frostd_url)?;
@@ -1662,6 +1674,8 @@ fn sign_with_opened(
     // Both external nonce witnesses must be configured; without them this member refuses to
     // sign, before it joins the session or unwraps the share.
     let witness = super::nonce_witness::RelayWitness::for_member(st, &p.attempt)?;
+    // The proposer authenticated this key with the payment terms, not via frostd metadata.
+    let coordinator = p.coordinator.as_ref().ok_or("missing sealed signing coordinator; create a fresh payment")?.public(0)?;
     let mut tx = relay(&v.identity, &st.config.frostd_url)?;
     let ch = tx
         .join(p.session_id.ok_or("missing signing session")?)
@@ -1739,10 +1753,10 @@ fn sign_with_opened(
         &v.public,
         frost::Identifier::try_from(v.slot).map_err(|e| e.to_string())?,
         &params,
-        proposer,
         &v.identity,
         &context,
         &v.peers[&p.proposer],
+        &coordinator,
         &other_signers,
         check_running,
         &|| match &fresh_approval {
@@ -1961,6 +1975,9 @@ fn aggregate(
         )
         .map_err(|e| e.to_string())?,
     )?;
+    if p.coordinator.as_ref().ok_or("missing sealed signing coordinator; create a fresh payment")?.public(0)? != coord.public() {
+        return Err("signing coordinator key differs from the published payment".into());
+    }
     let mut tx = relay(&coord, &st.config.frostd_url)?;
     let ch = tx
         .join(p.session_id.ok_or("missing signing session")?)
@@ -1974,7 +1991,7 @@ fn aggregate(
         .signers
         .iter()
         .zip(&ids)
-        .map(|(slot, id)| (*id, Peer(v.peers[slot].encryption)))
+        .map(|(slot, id)| (*id, v.peers[slot].clone()))
         .collect();
     let dir = member_dir(data, &p.vault)?;
     let file = candidate_file(&p.attempt);
@@ -1986,7 +2003,8 @@ fn aggregate(
         &peer_of,
         v.threshold,
         OsRng,
-        &p.attempt,
+        &coord,
+        &signing_context(p)?,
         check_running,
         || match dir.read_sealed(&file, pass) {
             Ok(bytes) => Ok(Some(bytes)),
@@ -3436,6 +3454,7 @@ mod tests {
         let mut signing = relay(&coord, &url).unwrap();
         let signing_ch = signing.open(&everyone, 4).unwrap();
         p.session_id = Some(signing_ch.session_id());
+        p.coordinator = Some(WireIdentity::from_public(coord.public()));
         let mut control = relay(&a.identity, &url).unwrap();
         let control_ch = control.open(&everyone, 4).unwrap();
         p.control_session_id = Some(control_ch.session_id());
@@ -3691,6 +3710,7 @@ mod tests {
             control_session_id: None,
             approvals: vec![1, 3],
             start_requested: true,
+            coordinator: Some(WireIdentity::from_public(coord.public())),
             coordinator_secret: Some(hex::encode(coord.to_secret_bytes())),
             review_token: None,
             approval_requested: true,
