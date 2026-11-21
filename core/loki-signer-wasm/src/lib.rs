@@ -41,7 +41,7 @@ use loki_signer_core::signer::{
 };
 use loki_signer_core::signer::wysiwys::{describe_pczt, sighash_of_pczt};
 use loki_signer_core::signer::DkgInput;
-use loki_signer_core::signing_session::{AttemptId, SessionContext};
+use loki_signer_core::signing_session::{AttemptId, MessageKind, SessionContext};
 use loki_signer_core::frost;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -502,6 +502,16 @@ impl Signer {
         Ok(hex::encode(identity.authorize_device(&device_pub)))
     }
 
+    #[wasm_bindgen(js_name = authorizeDeviceReplacement)]
+    pub fn authorize_device_replacement(&self, origin: &str, device_pub_hex: &str, challenge_hex: &str, generation: u64) -> Result<String, JsError> {
+        let identity = self.identity.as_ref().ok_or_else(|| JsError::new("unlock the signer first"))?;
+        let mut device = [0; 65];
+        hex::decode_to_slice(device_pub_hex, &mut device).map_err(|e| JsError::new(&e.to_string()))?;
+        let mut challenge = [0; 32];
+        hex::decode_to_slice(challenge_hex, &mut challenge).map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(hex::encode(identity.authorize_device_replacement(origin, &device, &challenge, generation)))
+    }
+
     /// Create-or-reopen this member's vault signer, confirm the coordinator's roster, and
     /// begin DKG. Returns the `VaultRef` JSON. The Worker must pre-open `vaultPaths(vaultHex)`
     /// for write first. `roster` is the coordinator's setup document (`setup_version: 2`).
@@ -607,6 +617,24 @@ impl Signer {
         self.scan_next_impl().map_err(|e| JsError::new(&e))
     }
 
+    /// Resume only a scan built against this configured provider, returning its saved height.
+    #[wasm_bindgen(js_name = scanStart)]
+    pub fn scan_start(&mut self, source: &str) -> Result<Option<u32>, JsError> {
+        self.scan_next()?;
+        let birth = self.vault.as_ref().and_then(|vs| vs.signer.confirmed_roster())
+            .ok_or_else(|| JsError::new("this vault has no confirmed roster"))?
+            .birth_height.unwrap_or(1);
+        let (_, _, scan) = self.scan.as_mut().ok_or_else(|| JsError::new("call scanNext first"))?;
+        scan.use_source(source, birth);
+        Ok(scan.height())
+    }
+
+    #[wasm_bindgen(js_name = scanMatchesCheckpoint)]
+    pub fn scan_matches_checkpoint(&self, block: &[u8]) -> Result<bool, JsError> {
+        let (_, _, scan) = self.scan.as_ref().ok_or_else(|| JsError::new("call scanNext first"))?;
+        scan.matches_checkpoint(block).map_err(|e| JsError::new(&e))
+    }
+
     /// Scan one complete range of compact block protobufs from lightwalletd atomically.
     #[wasm_bindgen(js_name = scanBlocks)]
     pub fn scan_blocks(&mut self, start: u32, end: u32, blocks: Vec<js_sys::Uint8Array>) -> Result<(), JsError> {
@@ -624,13 +652,11 @@ impl Signer {
         self.scan_save_impl().map_err(|e| JsError::new(&e))
     }
 
-    /// Forget the scan state (memory and OPFS); the next `scanNext` starts at the vault birth.
-    /// For a chain that no longer extends the saved tip (a reorganization).
+    /// Restart from vault birth without deleting the persisted snapshot before a replacement.
     #[wasm_bindgen(js_name = scanReset)]
     pub fn scan_reset(&mut self) -> Result<(), JsError> {
-        if let Some((id, _, _)) = self.scan.take() {
-            opfs_put(&scan_path(&id), &[], false).map_err(|e| JsError::new(&e))?;
-        }
+        let (_, _, scan) = self.scan.as_mut().ok_or_else(|| JsError::new("call scanNext first"))?;
+        scan.reset();
         Ok(())
     }
 
@@ -718,29 +744,56 @@ impl Signer {
         self.sign_commit_impl(attempt_hex).map_err(|e| JsError::new(&e))
     }
 
-    /// Open a candidate the `proposer` signer sealed to this member over frostd for this
-    /// attempt. Returns the unsigned candidate PCZT (hex) to review + approve. `signers_csv`
-    /// is the comma-separated slot list the proposer sealed under (sorted internally to match).
-    /// No share is released here. Reopen the vault first.
-    #[wasm_bindgen(js_name = openCandidate)]
-    pub fn open_candidate(
+    /// Open the expected sender's candidate, package, or seed for this hosted attempt.
+    #[wasm_bindgen(js_name = openSigning)]
+    pub fn open_signing(
         &self,
-        proposer_signing_hex: &str,
-        proposer_enc_hex: &str,
-        proposer_id: u16,
+        signing_hex: &str,
+        encryption_hex: &str,
+        sender_id: u16,
         signers_csv: &str,
         attempt_hex: &str,
         wire_hex: &str,
     ) -> Result<String, JsError> {
-        self.open_candidate_impl(
-            proposer_signing_hex,
-            proposer_enc_hex,
-            proposer_id,
-            signers_csv,
-            attempt_hex,
-            wire_hex,
-        )
-        .map_err(|e| JsError::new(&e))
+        let open = || -> Result<String, String> {
+            let (vs, context) = self.hosted_signing_context(attempt_hex, signers_csv)?;
+            let sender = PublicIdentity { id: sender_id, signing: hex32(signing_hex)?, encryption: hex32(encryption_hex)? };
+            let wire = hex::decode(wire_hex).map_err(|e| e.to_string())?;
+            let opened = vs.signer.open_hosted_signing(&sender, &context, &wire).map_err(|e| e.to_string())?;
+            let kind = match (sender_id, opened.kind()) {
+                (0, MessageKind::HostedPackage) => "package",
+                (0, MessageKind::HostedSeed) => "seed",
+                (1.., MessageKind::Candidate) => "candidate",
+                _ => return Err("unexpected hosted signing message kind".into()),
+            };
+            if !opened.kind().valid_hosted_body(&context, opened.body()) {
+                return Err("invalid hosted signing message".into());
+            }
+            Ok(serde_json::json!({"kind": kind, "body": hex::encode(opened.body())}).to_string())
+        };
+        open().map_err(|e| JsError::new(&e))
+    }
+
+    /// Seal a commitment or share to the coordinator announced by the proposer.
+    #[wasm_bindgen(js_name = sealSigning)]
+    pub fn seal_signing(
+        &self,
+        signing_hex: &str,
+        encryption_hex: &str,
+        signers_csv: &str,
+        attempt_hex: &str,
+        body_hex: &str,
+        share: bool,
+    ) -> Result<String, JsError> {
+        let seal = || -> Result<String, String> {
+            let (vs, context) = self.hosted_signing_context(attempt_hex, signers_csv)?;
+            let coordinator = PublicIdentity { id: 0, signing: hex32(signing_hex)?, encryption: hex32(encryption_hex)? };
+            let body = hex::decode(body_hex).map_err(|e| e.to_string())?;
+            let kind = if share { MessageKind::HostedShare } else { MessageKind::HostedCommitment };
+            vs.signer.seal_hosted_signing(&coordinator, &context, kind, &body)
+                .map(hex::encode).map_err(|e| e.to_string())
+        };
+        seal().map_err(|e| JsError::new(&e))
     }
 
     /// Open a message a vault member sealed to this one on a payment's frostd control session
@@ -1254,21 +1307,12 @@ impl Signer {
         commit.serialize().map(hex::encode).map_err(|e| e.to_string())
     }
 
-    fn open_candidate_impl(
+    fn hosted_signing_context(
         &self,
-        proposer_signing_hex: &str,
-        proposer_enc_hex: &str,
-        proposer_id: u16,
-        signers_csv: &str,
         attempt_hex: &str,
-        wire_hex: &str,
-    ) -> Result<String, String> {
+        signers_csv: &str,
+    ) -> Result<(&VaultState, SessionContext), String> {
         let vs = self.vault.as_ref().ok_or("no active vault — call vaultJoin first")?;
-        let proposer = PublicIdentity {
-            id: proposer_id,
-            signing: hex32(proposer_signing_hex)?,
-            encryption: hex32(proposer_enc_hex)?,
-        };
         let mut signers: Vec<u16> = signers_csv
             .split(',')
             .map(str::trim)
@@ -1283,12 +1327,7 @@ impl Signer {
             attempt: AttemptId(attempt),
             signers,
         };
-        let wire = hex::decode(wire_hex).map_err(|e| e.to_string())?;
-        let bytes = vs
-            .signer
-            .open_candidate(&proposer, &context, &wire)
-            .map_err(|e| e.to_string())?;
-        Ok(hex::encode(bytes))
+        Ok((vs, context))
     }
 
     fn open_control_impl(&self, session_id: &str, from_hex: &str, wire_hex: &str) -> Result<String, String> {

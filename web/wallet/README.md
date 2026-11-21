@@ -40,8 +40,9 @@ original local unlock file; no shares or recovery identity are migrated automati
 The member process creates/unlocks its profile **locally**, then authorizes its P-256 device
 key with its existing Ed25519 identity. It requests a one-use challenge and signs a transcript
 binding the coordinator origin, requested slot, identity keys, advertised endpoint and nonce.
-The Node verifier uses the same Ed25519 enrollment / P-256 SHA-256 verification protocol as
-`signer/device_auth.rs` and `host/device.rs`; the Rust client reuses the enrollment verifier.
+Replacing a registered device also requires a fresh identity signature for that coordinator,
+new key, challenge, and next generation. The coordinator saves the new device, consumed proof,
+and public roster together; a former device cannot rotate back using its old enrollment proof.
 This proves key possession, **not hardware attestation**. The software development backend
 and an Enclave key produce the same wire proofs.
 
@@ -69,6 +70,15 @@ comparison by every member. The failed vault and its diagnostic error remain ava
 
 `LOKI_DEV_FAUCET=1` enables the optional local-origin regtest faucet; it receives only a public
 regtest address. It is off by default, and the supplied launcher binds Next to localhost.
+
+## Production coordinator behind TLS
+
+After building, use `npm start` (the custom server). It listens on `127.0.0.1:$PORT`
+(`3001` by default), with `http://localhost:$PORT` as the local development origin.
+Point a same-host TLS proxy or tunnel at that loopback address and set `PUBLIC_ORIGIN`
+to the exact external HTTPS origin, for example `https://wallet.example`. This replaces
+`HOSTNAME` and `PUBLIC_PORT`. The coordinator uses `PUBLIC_ORIGIN`, not client forwarding
+headers, to reconstruct the origin for member registration.
 
 ## In-browser signer: enroll → discover → DKG
 
@@ -118,21 +128,30 @@ coordinator + frostd. Payment review/approve are wired through `request()` the s
 
 ## Registry and limits
 
-`.access.json` (or `LOKI_REGISTRY`) contains only `{access: [{slot, signing_pubkey, relay_pubkey,
-advertise_url, lokisigner_url?}]}`. The optional signed `lokisigner_url` field tells everyone
+`/api/members` returns only public roster rows: `{slot, signing_pubkey, relay_pubkey,
+advertise_url, lokisigner_url?}`. The optional signed `lokisigner_url` field tells everyone
 reading `/api/members` that the slot uses LokiSigner and which loopback port it currently
 listens on. It is not a capability. Deploy this coordinator and wallet before updating
-LokiSigner; see the [version matrix](../../core/signer-app/README.md#build-and-pair). Do not roll
-back the coordinator until roster rows containing the field are removed: an older `/api/members`
-rejects those rows and fails for everyone. A visited website can use the port and the open
-ceremony routes to learn whether LokiSigner is running, subject to local network permission.
-Safari may block the wallet's loopback request; this has not been verified. Old hosted registry formats
-fail closed; retire those files privately and self-register existing devices into a fresh
-public roster. Never copy old access records into
-it. The adjacent `.challenges` file contains only short-lived public enrollment proofs and
-nonces; consumption persists across Next workers and restarts. At most 256 live challenges
-are accepted, each expires after two minutes. If a worker crashes while holding `.lock`, stop
-all web workers before removing that lock. The roster is discovery, not authority to spend.
+LokiSigner; see the [version matrix](../../core/signer-app/README.md#build-and-pair). A visited
+website can use the port and the open ceremony routes to learn whether LokiSigner is running,
+subject to local network permission.
+Safari may block the wallet's loopback request; this has not been verified.
+
+The coordinator stores the roster, device generations, and challenges in one owner-only
+snapshot at `.access.json` (or `LOKI_REGISTRY`). Before upgrading, stop all old coordinator
+workers and back up the registry and its `.devices` sidecar together. The first write imports
+valid public roster rows and device bindings. Old pending challenges are not imported; issue
+new pairing links. Do not mix coordinator versions or roll back to the old split-file format:
+doing so would lose generations and revocations. Older registries containing hosted secrets
+still fail closed and are not migrated. At most 256 live coordinator challenges are accepted;
+each expires after two minutes. If a worker crashes while holding `.lock`, stop all coordinator
+workers before removing the lock. The roster is discovery, not authority to spend.
+
+Device-local login challenges expire after two minutes, with at most 16 issues per device
+session grant and 256 overall in that window. To renew a revoked key, an authorized local
+client requests its generation from `POST /api/device-renewal` with `device_pub`. It signs
+that generation and public key offline with `RecoveryKey::authorize_device_renewal` and submits
+the authorization to `POST /api/device-enroll`. Never send recovery words to the coordinator.
 
 LokiSigner sends a tab its device session only after the member allows that tab's code in
 the native app. The coordinator-served JavaScript can still read a grant held by its own tab;
@@ -225,6 +244,14 @@ What a deploy must provide on the signer server (`serve.mjs` env):
 | `LOKI_LIGHTWALLETD_URL` | the lightwalletd native members sync from |
 | `LOKI_LIGHTWALLETD_GRPCWEB_URL` | lightwalletd behind gRPC-web + CORS for the signer origin (`communication/deploy/lightwalletd-grpcweb.sh`); the browser signer scans the chain through it for its vault balance and history |
 | `LOKI_SIGNER_PORT` | listen port (default 3002) |
+
+Wallet chain results carry `chain_trust: "provider_reported"`. The native and browser
+signers check their saved block against the configured lightwalletd, even with no new
+blocks. A fork, shorter chain, changed endpoint, or legacy scan with no recorded
+endpoint can require a rescan from the vault's birth. The browser tracks the gRPC-web
+URL; if the proxy's upstream changes, change the configured URL to trigger a rescan.
+These checks do not independently authenticate compact transactions or prove consensus
+or inclusion. Use a lightwalletd backed by a node you trust for balances and mining status.
 
 The coordinator (this app) serves the same values to the native signer at
 `GET /api/signer-config`: network, frostd, lightwalletd and the witnesses, read from

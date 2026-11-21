@@ -61,11 +61,11 @@ export function browserVaultStatus(vaults: { vault: string; active: boolean }[] 
   return { phase: vaults?.some((v) => v.vault === vault && v.active) ? "active" : "creating_keys" };
 }
 
-/** One transaction from the browser signer's own chain scan (loki-signer-core chain_scan.rs). */
+/** One transaction observed in the configured provider's compact blocks. */
 export type ChainTx = { txid: string; height: number; received_zat: number; change_zat: number; spent_zat: number };
 
 /** The History list from the chain scan: what each transaction did to the vault. A spend shows
- *  its net outflow (amount sent plus fee); every entry is mined, by construction. */
+ *  its net outflow (amount sent plus fee); the provider reported every entry as mined. */
 export function chainPayments(history: ChainTx[]): Payment[] {
   return history.map((t) => {
     const sent = t.spent_zat > 0;
@@ -76,7 +76,7 @@ export function chainPayments(history: ChainTx[]): Payment[] {
 }
 
 /** A payment's status on the browser signer. The terms and signing group come from the
- *  proposer's notices; "confirmed" only from the chain: the scan saw its input note spent. */
+ *  proposer's notices; the spend observation comes from the configured provider. */
 export function chainPaymentSession(r: {
   terms: { proposer: number; recipient: string; amount_zat: number; fee_zat: number };
   signers: number[];
@@ -190,9 +190,9 @@ function browserSigner(origin: string): SignerModule {
       const origin = window.location.origin;
       const enrollment = await call<Record<string, string>>("enroll-begin");
       // No advertise_url (frostd-only) and no slot (coordinator allocates).
-      const { challenge } = await postJson<{ challenge: string }>(`${origin}/api/members/challenge`, enrollment);
-      const { signature } = await call<{ signature: string }>("enroll-sign", { challenge });
-      const { member } = await postJson<{ member: EnrolledMember }>(`${origin}/api/members`, { ...enrollment, challenge, signature });
+      const reply = await postJson<{ challenge: string; replacement_generation?: number }>(`${origin}/api/members/challenge`, enrollment);
+      const proof = await call<{ signature: string; replacement_authorization?: string }>("enroll-sign", reply);
+      const { member } = await postJson<{ member: EnrolledMember }>(`${origin}/api/members`, { ...enrollment, challenge: reply.challenge, ...proof });
       return member;
     },
     async request<T>(pathAndQuery: string, body?: unknown): Promise<T> {
@@ -218,10 +218,16 @@ function browserSigner(origin: string): SignerModule {
       if (path === "pending") return { pending: await call("pending", payment) } as T;
       if (path === "payment-review" || path === "payment-approve") return call<T>(path, payment);
       if (path === "address") return { address: await call<string>("address", payment) } as T;
-      // Balance, History and a payment's status from the signer's own scan of the chain.
-      if (path === "balance") return { balance_zat: Number((await call<{ balance_zat: string }>("chain", payment)).balance_zat) } as T;
-      if (path === "payments") return { payments: chainPayments((await call<{ history: ChainTx[] }>("chain", payment)).history) } as T;
-      if (path === "payment-status") return chainPaymentSession(await call("payment-status", payment)) as T;
+      if (path === "balance" || path === "payments") {
+        const scan = await call<{ balance_zat: string; history: ChainTx[]; chain_trust: "provider_reported" }>("chain", payment);
+        return (path === "balance"
+          ? { balance_zat: Number(scan.balance_zat), chain_trust: scan.chain_trust }
+          : { payments: chainPayments(scan.history), chain_trust: scan.chain_trust }) as T;
+      }
+      if (path === "payment-status") {
+        const status = await call<Parameters<typeof chainPaymentSession>[0] & { chain_trust: "provider_reported" }>("payment-status", payment);
+        return { ...chainPaymentSession(status), chain_trust: status.chain_trust } as T;
+      }
       // Recovery words are shown, typed and checked on the signer page; only the opaque
       // backup ciphertext ({backup} from recovery-export) and public results come back.
       if (path === "recovery-setup" || path === "recovery-export" || path === "recovery-status") return call<T>(path, body);

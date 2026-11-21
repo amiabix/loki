@@ -54,21 +54,15 @@ pub(super) fn fingerprint(config: &[WitnessConfig; 2]) -> String {
 }
 
 impl RelayWitness {
-    /// This member's witnesses: the `--nonce-witnesses` file (named by a flag or saved), or the
-    /// ones LokiSigner fetched from its coordinator for this launch.
+    /// LokiSigner's approved launch snapshot, or the headless `--nonce-witnesses` file.
     pub(super) fn for_member(st: &super::state::AppState, attempt: &str) -> Result<Self, String> {
         let development = st.config.development_http;
-        let config = match (&st.config.nonce_witnesses, &st.fetched_config) {
-            (None, Some(fetched)) => fetched.witnesses(),
-            (path, _) => read(path.as_deref().ok_or("hosted signing requires --nonce-witnesses <file>")?)?,
-        };
-        if st.config.approved_witness_fingerprint.as_ref().is_some_and(|approved| *approved != fingerprint(&config)) {
-            return Err("nonce witnesses changed after member confirmation; reopen LokiSigner to review the configuration".into());
+        match (&st.config.nonce_witnesses, &st.fetched_config) {
+            (None, Some(fetched)) => Self::from_config(fetched.witnesses(), development, attempt),
+            (path, _) => Self::open(path.as_deref(), development, attempt),
         }
-        Self::from_config(config, development, attempt)
     }
 
-    #[cfg(test)]
     pub(super) fn open(path: Option<&Path>, development: bool, attempt: &str) -> Result<Self, String> {
         Self::from_config(read(path.ok_or("hosted signing requires --nonce-witnesses <file>")?)?, development, attempt)
     }

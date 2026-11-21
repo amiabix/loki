@@ -72,7 +72,7 @@ impl SessionContext {
 }
 
 #[repr(u8)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum MessageKind {
     Invite = 1,
     Commitment = 2,
@@ -86,6 +86,11 @@ pub enum MessageKind {
     /// A hosted member's authenticated request for a payment intent, and its reply.
     PeerRequest = 9,
     PeerReply = 10,
+    HostedCommitment = 11,
+    HostedAlpha = 12,
+    HostedPackage = 13,
+    HostedSeed = 14,
+    HostedShare = 15,
 }
 
 impl TryFrom<u8> for MessageKind {
@@ -102,12 +107,52 @@ impl TryFrom<u8> for MessageKind {
             8 => Ok(Self::Candidate),
             9 => Ok(Self::PeerRequest),
             10 => Ok(Self::PeerReply),
+            11 => Ok(Self::HostedCommitment),
+            12 => Ok(Self::HostedAlpha),
+            13 => Ok(Self::HostedPackage),
+            14 => Ok(Self::HostedSeed),
+            15 => Ok(Self::HostedShare),
             _ => Err("unknown signing message type".into()),
         }
     }
 }
 
 impl MessageKind {
+    pub(crate) fn permits(self, context: &SessionContext, sender: u16, recipient: u16) -> bool {
+        if sender == recipient {
+            return false;
+        }
+        let selected = |id| context.signers.contains(&id);
+        let selected_member = |id| (1..=crate::member_state::MAX_MEMBERS).contains(&id) && selected(id);
+        match self {
+            Self::HostedCommitment | Self::HostedShare => selected_member(sender) && recipient == 0,
+            Self::HostedAlpha | Self::HostedPackage | Self::HostedSeed => sender == 0 && selected_member(recipient),
+            _ => selected(sender)
+                && (1..=crate::member_state::MAX_MEMBERS).contains(&recipient)
+                && (selected(recipient) || matches!(self, Self::Package | Self::Share)),
+        }
+    }
+
+    /// Check the encoding before a hosted message counts toward round progress.
+    pub fn valid_hosted_body(self, context: &SessionContext, body: &[u8]) -> bool {
+        match self {
+            Self::HostedCommitment => frost::round1::SigningCommitments::deserialize(body).is_ok(),
+            Self::HostedAlpha => <&[u8; 32]>::try_from(body).is_ok_and(|alpha| {
+                crate::candidate::alpha_from_canonical_bytes(alpha).is_some()
+            }),
+            Self::HostedSeed => body.len() == 32,
+            Self::HostedPackage => frost::SigningPackage::deserialize(body).is_ok_and(|package| {
+                let commitments = package.signing_commitments();
+                commitments.len() == context.signers.len() && context.signers.iter().all(|slot| {
+                    frost::Identifier::try_from(*slot).is_ok_and(|id| commitments.contains_key(&id))
+                })
+            }),
+            Self::HostedShare => frost::round2::SignatureShare::deserialize(body).is_ok(),
+            Self::Candidate => pczt::Pczt::parse(body).is_ok(),
+            _ => false,
+        }
+    }
+
     pub fn max_body(self) -> usize {
         match self {
             Self::Package | Self::Candidate => 4 * 1024 * 1024,
@@ -115,6 +160,8 @@ impl MessageKind {
                 64 * 1024
             }
             Self::Receipt | Self::Abort | Self::PeerRequest => 1024,
+            Self::HostedCommitment | Self::HostedPackage => 64 * 1024,
+            Self::HostedAlpha | Self::HostedSeed | Self::HostedShare => 32,
         }
     }
 }

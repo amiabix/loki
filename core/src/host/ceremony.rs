@@ -88,7 +88,7 @@ pub(super) struct WireIdentity {
 }
 
 impl WireIdentity {
-    fn from_public(p: PublicIdentity) -> Self {
+    pub(super) fn from_public(p: PublicIdentity) -> Self {
         Self {
             id: p.id,
             signing: hex::encode(p.signing),
@@ -1393,9 +1393,8 @@ mod tests {
             operator_key: None, enrollment_issuer: None, development_http: false,
             token: "test".into(), frostd_url: "http://127.0.0.1:2744".into(),
             peers: BTreeMap::new(),
-            registration: None, bind: "127.0.0.1".parse().unwrap(), advertise_url: None,
+            registration: None, bind: "127.0.0.1".parse().unwrap(), peer_port: None, advertise_url: None,
             secure_element: "software".into(), nonce_witnesses: None, loopback_peers: false,
-            approved_witness_fingerprint: None,
         }));
         *st.session.write().await = Some(Session {
             passphrase: Zeroizing::new("pass".into()), data: data.clone(),
@@ -1429,10 +1428,10 @@ mod tests {
             peers: BTreeMap::new(),
             registration: None,
             bind: "127.0.0.1".parse().unwrap(),
+            peer_port: None,
             advertise_url: None,
             secure_element: "software".into(),
             nonce_witnesses: None,
-            approved_witness_fingerprint: None,
             loopback_peers: false,
         }));
         *st.session.write().await = Some(Session {
@@ -1512,9 +1511,8 @@ mod tests {
             operator_key: None, enrollment_issuer: None, development_http: false,
             token: "test".into(), frostd_url: "http://127.0.0.1:2744".into(),
             peers: BTreeMap::new(),
-            registration: None, bind: "127.0.0.1".parse().unwrap(), advertise_url: None,
+            registration: None, bind: "127.0.0.1".parse().unwrap(), peer_port: None, advertise_url: None,
             secure_element: "software".into(), nonce_witnesses: None, loopback_peers: false,
-            approved_witness_fingerprint: None,
         }));
         for (name, members, threshold, error) in [
             ("".to_owned(), 3, 2, "name must be 1 to 80 bytes"),
@@ -1563,9 +1561,8 @@ mod tests {
             operator_key: None, enrollment_issuer: None, development_http: false,
             token: "test".into(), frostd_url: "http://127.0.0.1:2744".into(),
             peers: BTreeMap::new(),
-            registration: None, bind: "127.0.0.1".parse().unwrap(), advertise_url: None,
+            registration: None, bind: "127.0.0.1".parse().unwrap(), peer_port: None, advertise_url: None,
             secure_element: "software".into(), nonce_witnesses: None, loopback_peers: false,
-            approved_witness_fingerprint: None,
         }));
         *st.session.write().await = Some(Session {
             passphrase: Zeroizing::new("pass".into()), data: data.clone(),
@@ -1628,9 +1625,8 @@ mod tests {
             operator_key: None, enrollment_issuer: None, development_http: false,
             token: "test".into(), frostd_url: "http://127.0.0.1:2744".into(),
             peers: BTreeMap::new(),
-            registration: None, bind: "127.0.0.1".parse().unwrap(), advertise_url: None,
+            registration: None, bind: "127.0.0.1".parse().unwrap(), peer_port: None, advertise_url: None,
             secure_element: "software".into(), nonce_witnesses: None, loopback_peers: false,
-            approved_witness_fingerprint: None,
         }
     }
 
@@ -1962,6 +1958,7 @@ mod tests {
             data: data.clone(),
             port: 3001,
             bind: "127.0.0.1".parse().unwrap(),
+            peer_port: None,
             advertise_url: None,
             network: "regtest".into(),
             lightwalletd: None,
@@ -1969,7 +1966,6 @@ mod tests {
             secure_element: "software".into(),
             operator_bundle: None,
             nonce_witnesses: None,
-            approved_witness_fingerprint: None,
             operator_key: None,
             enrollment_issuer: None,
             development_http: false,

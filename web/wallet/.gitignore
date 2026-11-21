@@ -37,6 +37,7 @@ yarn-error.log*
 .members.json
 .session-secret
 .access.json
+.access.json.devices
 .access.json.challenges
 .access.json.challenges.*.tmp
 .access.json.lock

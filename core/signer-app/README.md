@@ -281,12 +281,13 @@ values its signer origin gives the browser signer (`LOKI_NETWORK`, `LOKI_FROSTD_
   signing would refuse. The request follows no redirect and times out. The app shows a fixed
   message on failure, not the coordinator’s reply or HTTP status.
 - **Saved once unlocked, and pinned.** The configuration is saved only after the local profile
-  unlocks, owner-only (0600) in the data directory: `signer-config.json` with the coordinator
-  origin it came from, and the witnesses in `nonce-witnesses.json`, the `--nonce-witnesses`
-  format. A wrong passphrase saves nothing. A configuration from any coordinator other than the
-  paired one is refused and the saved one is left as it was. A new pairing link for the same
-  coordinator and slot refreshes it once the member confirms and unlocks. Quit the running
-  signer before opening a link to refresh its configuration.
+  unlocks. The coordinator origin, network, endpoints, witness pair and verified fingerprint are
+  atomically saved together in the owner-only (0600) `signer-config.json`. Older configurations
+  without a fingerprint require confirmation before the upgrade. A legacy `nonce-witnesses.json`
+  is never used with the new configuration. A wrong passphrase saves nothing. LokiSigner refuses
+  configuration from another coordinator without changing the saved configuration. A new pairing
+  link for the same coordinator and slot refreshes it once the member confirms and unlocks.
+  Quit the running signer before opening a link to refresh its configuration.
 - **Unlock.** A plain launch shows and uses the saved configuration. A profile paired before
   configurations were saved fetches it once from its paired coordinator.
 - **Flags.** An explicit `--network`, `--frostd-url`, `--lightwalletd-url` or
@@ -328,12 +329,14 @@ and supply a single link followed by a newline over standard input from a privat
 Other member flags are the existing `loki_member_app` flags: network, lightwalletd, relay,
 nonce witnesses, and peer allowlist. Each overrides the coordinator's value for its field,
 for that launch only. For an HTTP ceremony between separate Macs, the creator needs a reachable
-HTTPS `--advertise-url` forwarded to its member service. Confirm that origin with the creator
-separately from the invite, then add it to each joiner's local `--peer <slot=origin>` allowlist.
+HTTPS `--advertise-url` and a separate `--peer-port`. Terminate TLS on a same-host proxy
+forwarding only to the ceremony listener at `127.0.0.1:<peer-port>`. Confirm that origin with
+the creator separately from the invite, then add it to each joiner's `--peer <slot=origin>`
+allowlist.
 The origin must resolve to public addresses; the joiner verifies TLS and does not follow redirects.
 Loopback origins on non-privileged ports are for co-located regtest or deliberate
 `--allow-loopback-peers` runs only.
-The private browser session still uses loopback; it is never sent to that public endpoint.
+Never forward the private browser API listener (`--port`); it requires a loopback bind.
 The link contains only origin, slot and a random claim, never runtime configuration or keys;
 the configuration comes from that origin, as described above.
 The native passphrase is passed to Rust in memory and the Swift byte buffer is immediately

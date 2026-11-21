@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::RwLock;
 use zeroize::Zeroizing;
@@ -16,6 +17,7 @@ pub struct Config {
     pub data: PathBuf,
     pub port: u16,
     pub bind: std::net::IpAddr,
+    pub(super) peer_port: Option<u16>,
     pub advertise_url: Option<String>,
     pub network: String,
     pub lightwalletd: Option<String>,
@@ -24,7 +26,6 @@ pub struct Config {
     pub operator_bundle: Option<PathBuf>,
     /// Two pinned external nonce-witness mailboxes; required for hosted signing.
     pub nonce_witnesses: Option<PathBuf>,
-    pub(super) approved_witness_fingerprint: Option<String>,
     pub operator_key: Option<String>,
     pub enrollment_issuer: Option<PathBuf>,
     pub development_http: bool,
@@ -43,15 +44,15 @@ impl Config {
     pub(super) fn lokisigner_url(&self) -> Option<String> {
         if !self.native || self.port == 0 { return None; }
         let host = match self.bind {
-            std::net::IpAddr::V4(ip) if ip == std::net::Ipv4Addr::LOCALHOST || ip.is_unspecified() => "127.0.0.1",
-            std::net::IpAddr::V6(ip) if ip.is_loopback() || ip.is_unspecified() => "[::1]",
+            std::net::IpAddr::V4(ip) if ip == std::net::Ipv4Addr::LOCALHOST => "127.0.0.1",
+            std::net::IpAddr::V6(ip) if ip.is_loopback() => "[::1]",
             _ => return None,
         };
         Some(format!("http://{host}:{}", self.port))
     }
 
     pub(super) fn base_url(&self) -> String {
-        self.advertise_url.clone().unwrap_or_else(|| format!("http://127.0.0.1:{}", self.port))
+        self.advertise_url.clone().unwrap_or_else(|| format!("http://{}", std::net::SocketAddr::new(self.bind, self.port)))
             .trim_end_matches('/').to_owned()
     }
 
@@ -417,13 +418,12 @@ pub struct Session {
 }
 
 impl Session {
-    /// Validate the sealed profile with this passphrase and prime the KDF cache.
+    /// Validate the sealed profile without activating the session or its cache.
     pub fn unlock(
         data: PathBuf,
         passphrase: Zeroizing<String>,
     ) -> Result<(Self, serde_json::Value), String> {
         let profile = crate::profile::open(&data, &passphrase)?;
-        crate::seal_kdf::enable_session_cache(&passphrase);
         Ok((Self { passphrase, data }, profile))
     }
 }
@@ -434,13 +434,15 @@ pub struct AppState {
     /// The last failed registration attempt, reported locally while registration retries.
     pub(super) registration_error: RwLock<Option<String>>,
     pub session: RwLock<Option<Session>>,
+    // Lock and activation both modify session state under the session write lock.
+    pub(super) session_generation: AtomicU64,
     pub ceremony: std::sync::Mutex<()>,
     pub payment: std::sync::Mutex<()>,
     pub active_payments: std::sync::Mutex<BTreeSet<String>>,
     pub active_dkgs: std::sync::Mutex<BTreeSet<String>>,
     /// Device login registry, built lazily from `data/recovery.pub` + `data/devices.json` once
     /// a recovery identity exists. Holds outstanding challenges in-process across requests.
-    pub device_auth: std::sync::Mutex<Option<crate::signer::device_auth::DeviceRegistry>>,
+    pub(super) device_auth: std::sync::Mutex<Option<super::device::DeviceState>>,
     /// The member's native payment decision; `None` (headless) refuses every payment.
     pub approval: Option<super::LocalApproval>,
     /// The member's native roster-code comparison; `None` (headless) trusts the caller of
@@ -453,7 +455,7 @@ pub struct AppState {
     pub(super) wallet_tabs: Option<super::connect::WalletTabs>,
     /// Each opened vault's viewing key; `None` means a cancelled open needs an explicit retry.
     pub(super) viewing_keys: std::sync::Mutex<BTreeMap<String, Option<orchard::keys::FullViewingKey>>>,
-    /// The signer configuration LokiSigner fetched for this launch, saved once the profile unlocks.
+    /// LokiSigner's confirmed launch snapshot. Fresh settings without overrides are saved on unlock.
     pub(super) fetched_config: Option<super::FetchedConfig>,
 }
 
@@ -464,6 +466,7 @@ impl AppState {
             registration: RwLock::new(None),
             registration_error: RwLock::new(None),
             session: RwLock::new(None),
+            session_generation: AtomicU64::new(0),
             ceremony: std::sync::Mutex::new(()),
             payment: std::sync::Mutex::new(()),
             active_payments: std::sync::Mutex::new(BTreeSet::new()),
@@ -477,6 +480,29 @@ impl AppState {
             viewing_keys: std::sync::Mutex::new(BTreeMap::new()),
             fetched_config: None,
         }
+    }
+
+    pub(super) fn session_generation(&self) -> u64 {
+        self.session_generation.load(Ordering::Acquire)
+    }
+
+    pub(super) async fn activate_session(&self, generation: u64, session: Session) -> bool {
+        let mut current = self.session.write().await;
+        if self.session_generation() != generation { return false; }
+        crate::seal_kdf::enable_session_cache(&session.passphrase);
+        *current = Some(session);
+        true
+    }
+
+    pub(super) async fn lock_session(self: &std::sync::Arc<Self>) {
+        let mut current = self.session.write().await;
+        *current = None;
+        if let Some(tabs) = &self.wallet_tabs { tabs.revoke_all(); }
+        crate::seal_kdf::clear_session_cache();
+        self.session_generation.fetch_add(1, Ordering::Release);
+        drop(current);
+        #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+        super::native_member::clear_addresses_on_lock(self);
     }
 }
 
@@ -530,11 +556,10 @@ mod tests {
     fn config(secure_element: &str) -> Config {
         Config {
             registration: None, native: false,
-            bind: "127.0.0.1".parse().unwrap(), advertise_url: None,
+            bind: "127.0.0.1".parse().unwrap(), peer_port: None, advertise_url: None,
             data: PathBuf::new(), port: 3001, network: "regtest".into(),
             lightwalletd: None, transport: "local".into(), secure_element: secure_element.into(),
             operator_bundle: None, nonce_witnesses: None, operator_key: None, enrollment_issuer: None,
-            approved_witness_fingerprint: None,
             development_http: false, token: "test".into(),
             frostd_url: "http://127.0.0.1:2744".into(), peers: BTreeMap::new(),
             loopback_peers: false,

@@ -46,7 +46,7 @@ use crate::{
     tx_finalize::{finalized_sighash, prove},
     vault,
     verify::{check_candidate, Expectations, Refusal},
-    wallet_store::{lightwalletd_endpoint, Lightwalletd, VaultWallet},
+    wallet_store::{lightwalletd_endpoint, Lightwalletd, VaultWallet, PROVIDER_REPORTED},
     zip2005,
 };
 
@@ -92,6 +92,8 @@ struct Payment {
     approvals: Vec<u16>,
     #[serde(default)]
     start_requested: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    coordinator: Option<WireIdentity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     coordinator_secret: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -384,7 +386,7 @@ fn wallet(
         &birthday,
         pass,
     )?;
-    rt.block_on(w.sync(&mut client))?;
+    rt.block_on(w.sync_from_provider(&mut client, &birthday, url))?;
     Ok((w, client, rt))
 }
 fn relay(identity: &Identity, url: &str) -> Result<FrostdTransport, String> {
@@ -477,6 +479,12 @@ fn check_intent(p: &Payment, v: &Vault) -> Result<(), String> {
     if let Some(r) = &p.replaces {
         hex32(&r.attempt)?;
     }
+    if let Some(coordinator) = &p.coordinator {
+        let pin = coordinator.public(0)?;
+        if v.peers.values().any(|peer| peer.encryption == pin.encryption || peer.signing == pin.signing) {
+            return Err("payment coordinator must have its own identity".into());
+        }
+    }
     Ok(())
 }
 /// A replacement spends the note of the payment it replaces, and a Retry keeps its terms. A
@@ -541,6 +549,9 @@ fn public_intent(p: &Payment) -> Value {
     }
     if let Some(expiry) = p.signing_expiry {
         intent["signing_expiry"] = json!(expiry);
+    }
+    if let Some(coordinator) = &p.coordinator {
+        intent["coordinator"] = json!(coordinator);
     }
     intent
 }
@@ -1085,7 +1096,7 @@ pub(super) async fn balance(State(st): State<Shared>, Json(body): Json<Value>) -
         let mode = if body["retry_touch_id"].as_bool() == Some(true) { VaultOpen::Retry } else { VaultOpen::Read };
         let v = load_vault_for_view(&st, &data, &pass, vault, mode)?;
         let (w, _, _) = wallet(&data, &pass, vault, &v, url(&st)?)?;
-        Ok(json!({"balance_zat": w.ironwood_balance_zat()?}))
+        Ok(json!({"balance_zat": w.ironwood_balance_zat()?, "chain_trust": PROVIDER_REPORTED}))
     })
     .await
 }
@@ -1151,6 +1162,7 @@ pub(super) async fn publish(State(st): State<Shared>, Json(body): Json<Value>) -
             .collect::<Vec<_>>();
         let ch = tx.open(&peers, 4).map_err(|e| e.to_string())?;
         p.session_id = Some(ch.session_id());
+        p.coordinator = Some(WireIdentity::from_public(coord.public()));
         p.coordinator_secret = Some(hex::encode(&*Zeroizing::new(coord.to_secret_bytes())));
         p.phase = "signing".into();
         let mut control = relay(&v.identity, &st.config.frostd_url)?;
@@ -1663,6 +1675,8 @@ fn sign_with_opened(
     // sign, before it joins the session or unwraps the share.
     let witness = super::nonce_witness::RelayWitness::for_member(st, &p.attempt)?
         .authorize(hex32(&p.vault)?, &v.identity)?;
+    // The proposer authenticated this key with the payment terms, not via frostd metadata.
+    let coordinator = p.coordinator.as_ref().ok_or("missing sealed signing coordinator; create a fresh payment")?.public(0)?;
     let mut tx = relay(&v.identity, &st.config.frostd_url)?;
     let ch = tx
         .join(p.session_id.ok_or("missing signing session")?)
@@ -1740,10 +1754,10 @@ fn sign_with_opened(
         &v.public,
         frost::Identifier::try_from(v.slot).map_err(|e| e.to_string())?,
         &params,
-        proposer,
         &v.identity,
         &context,
         &v.peers[&p.proposer],
+        &coordinator,
         &other_signers,
         check_running,
         &|| match &fresh_approval {
@@ -1962,6 +1976,9 @@ fn aggregate(
         )
         .map_err(|e| e.to_string())?,
     )?;
+    if p.coordinator.as_ref().ok_or("missing sealed signing coordinator; create a fresh payment")?.public(0)? != coord.public() {
+        return Err("signing coordinator key differs from the published payment".into());
+    }
     let mut tx = relay(&coord, &st.config.frostd_url)?;
     let ch = tx
         .join(p.session_id.ok_or("missing signing session")?)
@@ -1975,7 +1992,7 @@ fn aggregate(
         .signers
         .iter()
         .zip(&ids)
-        .map(|(slot, id)| (*id, Peer(v.peers[slot].encryption)))
+        .map(|(slot, id)| (*id, v.peers[slot].clone()))
         .collect();
     let dir = member_dir(data, &p.vault)?;
     let file = candidate_file(&p.attempt);
@@ -1987,7 +2004,8 @@ fn aggregate(
         &peer_of,
         v.threshold,
         OsRng,
-        &p.attempt,
+        &coord,
+        &signing_context(p)?,
         check_running,
         || match dir.read_sealed(&file, pass) {
             Ok(bytes) => Ok(Some(bytes)),
@@ -2481,7 +2499,7 @@ pub(super) async fn payments(
                 "error": p.error,
             }));
         }
-        Ok(json!({"payments":out}))
+        Ok(json!({"payments":out, "chain_trust": PROVIDER_REPORTED}))
     }).await
 }
 
@@ -2571,6 +2589,7 @@ pub(super) async fn status(
         let p = read_payment(&data, &pass, &vault, &attempt)?;
         Ok(json!({
             "phase": p.phase,
+            "chain_trust": PROVIDER_REPORTED,
             "approvals":p.approvals,"error":p.error,"approval_requested":p.approval_requested,
             "signatures_received": p.signed_pczt.is_some() || p.raw_tx.is_some() || matches!(p.phase.as_str(), "signed" | "broadcast" | "confirmed"),
             "txid": p.txid, "replaces": p.replaces, "replaced_by": p.replaced_by,
@@ -2933,6 +2952,7 @@ mod tests {
             data: data.to_owned(),
             port: 0,
             bind: "127.0.0.1".parse().unwrap(),
+            peer_port: None,
             advertise_url: None,
             network: "testnet".into(),
             lightwalletd: None,
@@ -2941,7 +2961,6 @@ mod tests {
             operator_bundle: None,
             // Two provisioned dev relays (`examples/provision_nonce_witnesses`).
             nonce_witnesses: std::env::var_os("LOKI_NONCE_WITNESSES").map(Into::into),
-            approved_witness_fingerprint: None,
             operator_key: None,
             enrollment_issuer: None,
             development_http: true,
@@ -3438,6 +3457,7 @@ mod tests {
         let mut signing = relay(&coord, &url).unwrap();
         let signing_ch = signing.open(&everyone, 4).unwrap();
         p.session_id = Some(signing_ch.session_id());
+        p.coordinator = Some(WireIdentity::from_public(coord.public()));
         let mut control = relay(&a.identity, &url).unwrap();
         let control_ch = control.open(&everyone, 4).unwrap();
         p.control_session_id = Some(control_ch.session_id());
@@ -3693,6 +3713,7 @@ mod tests {
             control_session_id: None,
             approvals: vec![1, 3],
             start_requested: true,
+            coordinator: Some(WireIdentity::from_public(coord.public())),
             coordinator_secret: Some(hex::encode(coord.to_secret_bytes())),
             review_token: None,
             approval_requested: true,

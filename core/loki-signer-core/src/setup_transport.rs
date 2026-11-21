@@ -225,6 +225,15 @@ impl Identity {
         self.signing.sign(device_pub).to_bytes()
     }
 
+    /// Authorize replacing the coordinator's current device, for one challenge and generation.
+    pub fn authorize_device_replacement(&self, origin: &str, device_pub: &[u8], challenge: &[u8; 32], generation: u64) -> [u8; 64] {
+        let identity = hex::encode(self.public().signing);
+        let device = hex::encode(device_pub);
+        let nonce = hex::encode(challenge);
+        let message = format!("loki-member-device-replacement-v1\n{origin}\n{identity}\n{device}\n{generation}\n{nonce}");
+        self.signing.sign(message.as_bytes()).to_bytes()
+    }
+
     pub fn nonce_claim_proof(
         &self,
         vault: [u8; 32],
@@ -584,13 +593,7 @@ impl Identity {
         body: &[u8],
     ) -> Result<Vec<u8>, String> {
         context.validate()?;
-        if self.id == recipient.id
-            || !context.signers.contains(&self.id)
-            || !(1..=crate::member_state::MAX_MEMBERS).contains(&recipient.id)
-            || (!context.signers.contains(&recipient.id)
-                && !matches!(kind, MessageKind::Package | MessageKind::Share))
-            || body.len() > kind.max_body()
-        {
+        if !kind.permits(context, self.id, recipient.id) || body.len() > kind.max_body() {
             return Err("invalid signing sender, recipient, or body size".into());
         }
         let version = if context.signers.len() == 2 { 1 } else { 2 };
@@ -674,12 +677,6 @@ impl Identity {
         let signers_end = 105 + context.signers.len() * 2;
         let meta_end = signers_end + 9;
         let inner_header = meta_end + 32;
-        if sender.id == recipient
-            || !context.signers.contains(&sender.id)
-            || !(1..=crate::member_state::MAX_MEMBERS).contains(&recipient)
-        {
-            return Err("sender or recipient outside signing attempt".into());
-        }
         let key = self.session_key(box_peer, context)?;
         let inner = XChaCha20Poly1305::new(&key.into())
             .decrypt(
@@ -704,10 +701,8 @@ impl Identity {
             return Err("signing inner context mismatch".into());
         }
         let kind = MessageKind::try_from(inner[signers_end + 4])?;
-        if !context.signers.contains(&recipient)
-            && !matches!(kind, MessageKind::Package | MessageKind::Share)
-        {
-            return Err("non-signer may receive only package or share copies".into());
+        if !kind.permits(context, sender.id, recipient) {
+            return Err("sender or recipient not allowed for signing message kind".into());
         }
         let size = u32::from_be_bytes(inner[signers_end + 5..meta_end].try_into().unwrap()) as usize;
         if size > kind.max_body() || inner_header + size + SIGNATURE > inner.len() {

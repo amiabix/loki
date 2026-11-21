@@ -81,8 +81,8 @@ pub extern "C" fn loki_signer_enclave_dkg_member_selftest() -> i32 {
 
 /// Run the LIVE member-app signer (the axum coordinator + frostd DKG/payment loop) inside the
 /// provisioned app, with the member's FROST share held in the Secure Enclave. This is the real
-/// native signer: `LokiSigner serve --data <dir> --port <n> --frostd-url <url> --advertise-url
-/// <url> --peer <slot=url>...`. Reads the member args from this process's own argv (skipping the
+/// native signer: `LokiSigner serve --data <dir> --port <n> --frostd-url <url> --peer-port <n>
+/// --advertise-url <origin> --peer <slot=url>...`. Reads the member args from its argv (skipping the
 /// binary name and the `serve` verb), forces the Apple Enclave backend, and serves. Blocks.
 #[cfg(feature = "relay-communication")]
 #[no_mangle]
