@@ -36,42 +36,6 @@ export function emptyHistoryText(lokiSigner: boolean): string {
     : "Payments sent and received by this vault will appear here.";
 }
 
-// A short, human-comparable rendering of the roster fingerprint, so members can read it aloud on a
-// call or eyeball it on another phone instead of trusting a coordinator-shown hex string. Pure and
-// deterministic; the fingerprint itself is untouched. Every byte folds into every slot (XOR), so a
-// swapped roster cannot collide by matching a shared prefix.
-const VERIFY_WORDS = [
-  "anchor", "apple", "arrow", "bacon", "badge", "beach", "bird", "blade",
-  "bloom", "bolt", "brick", "cabin", "cable", "camel", "candle", "cargo",
-  "cedar", "cliff", "cloud", "clover", "coral", "crane", "crown", "daisy",
-  "delta", "dragon", "eagle", "ember", "falcon", "fern", "flame", "forest",
-  "frost", "garden", "ginger", "globe", "grape", "harbor", "hawk", "honey",
-  "island", "jaguar", "jungle", "kettle", "lagoon", "lantern", "lemon", "lotus",
-  "maple", "marble", "meadow", "meteor", "mint", "moon", "nebula", "ocean",
-  "olive", "orbit", "otter", "panda", "parrot", "pearl", "pepper", "planet",
-  "pond", "prism", "quartz", "quill", "rabbit", "raven", "reef", "river",
-  "rocket", "ruby", "saddle", "sage", "salmon", "shadow", "shark", "shell",
-  "silver", "sloth", "spark", "sphinx", "spruce", "star", "storm", "summit",
-  "swan", "tiger", "timber", "topaz", "torch", "trail", "tulip", "turtle",
-  "velvet", "violet", "walnut", "whale", "willow", "wolf", "zebra", "zephyr",
-];
-const VERIFY_EMOJI = ["🦊", "🐻", "🦉", "🐢", "🐙", "🦋", "🌵", "🍀", "🔥", "❄️", "🌙", "⚡", "🌊", "🍎", "🚀", "💎"];
-
-export function verifyPhrase(fingerprint: string | undefined): { words: string[]; emoji: string[] } | null {
-  const hex = fingerprint?.trim().toLowerCase();
-  if (!hex || hex.length % 2 !== 0 || !/^[0-9a-f]+$/.test(hex)) return null;
-  const bytes = Uint8Array.from(hex.match(/../g)!, (b) => parseInt(b, 16));
-  const fold = (slots: number) => {
-    const acc = new Uint8Array(slots);
-    bytes.forEach((b, i) => { acc[i % slots] ^= b; });
-    return acc;
-  };
-  return {
-    words: Array.from(fold(5), (b) => VERIFY_WORDS[b % VERIFY_WORDS.length]),
-    emoji: Array.from(fold(4), (b) => VERIFY_EMOJI[b % VERIFY_EMOJI.length]),
-  };
-}
-
 // shortcut: status omits the viewer's slot; retain successful joins until the API exposes it.
 export function rememberVaultSlot(profile: string | undefined, vault: string, slot: number) {
   if (!profile) return;

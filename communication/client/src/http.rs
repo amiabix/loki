@@ -59,9 +59,9 @@ impl RelayHttp {
     pub async fn claim_nonce(
         &self,
         route: &RelayRoute,
-        owner_read: &Secret32,
         cid: Id32,
         wire: &[u8],
+        authorize: impl FnOnce(Id32) -> nonce::ClaimProof,
     ) -> ClientResult<bool> {
         crate::validate_endpoint(&route.endpoint, self.development)?;
         if wire.is_empty() || wire.len() > nonce::MAX_RECORD {
@@ -69,6 +69,7 @@ impl RelayHttp {
         }
         let mut challenge = [0; 32];
         getrandom::fill(&mut challenge).map_err(|_| ClientError::Crypto)?;
+        let proof = authorize(challenge);
         let url = format!(
             "{}/v1/mailboxes/{}/nonces/{}",
             route.endpoint.trim_end_matches('/'),
@@ -78,7 +79,7 @@ impl RelayHttp {
         let mut response = self
             .client
             .put(url)
-            .header(AUTHORIZATION, bearer(owner_read)?)
+            .header(AUTHORIZATION, format!("{}{}", nonce::CLAIM_SCHEME, hex::encode(proof.to_bytes())))
             .header(CONTENT_TYPE, "application/octet-stream")
             .header("x-loki-challenge", hex::encode(challenge))
             .body(wire.to_vec())

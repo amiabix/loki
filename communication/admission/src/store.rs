@@ -375,7 +375,10 @@ impl AdmissionStore {
             self.ceremony_seconds,
             self.storage_bytes,
         );
-        if matches!(result, Err(Error::Storage | Error::Unavailable)) {
+        if matches!(
+            result,
+            Err(Error::Storage | Error::StorageBusy | Error::Unavailable)
+        ) {
             return Err(result.err().ok_or(Error::Storage)?);
         }
         let should_save:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM claims WHERE ceremony=?1 AND slot=?2 AND signing=?3 AND encryption=?4)",params![request.command.ceremony().as_slice(),request.device.id,request.device.signing.as_slice(),request.device.encryption.as_slice()],|r|r.get(0))?;
@@ -409,12 +412,18 @@ impl AdmissionStore {
         Ok(reply)
     }
     pub fn pending(&self, now: u64, limit: usize) -> Result<Vec<ProvisionIntent>> {
-        self.pending_kind(now, limit, false)
+        self.pending_kind(now, limit, false, 1)
     }
     pub fn pending_retirement(&self, now: u64, limit: usize) -> Result<Vec<ProvisionIntent>> {
-        self.pending_kind(now, limit, true)
+        self.pending_kind(now, limit, true, 1)
     }
-    fn pending_kind(&self, now: u64, limit: usize, retire: bool) -> Result<Vec<ProvisionIntent>> {
+    pub(crate) fn pending_kind(
+        &self,
+        now: u64,
+        limit: usize,
+        retire: bool,
+        first_relay: usize,
+    ) -> Result<Vec<ProvisionIntent>> {
         if now > i64::MAX as u64 || !(1..=3).contains(&limit) {
             return Err(Error::Malformed);
         }
@@ -423,9 +432,17 @@ impl AdmissionStore {
         } else {
             "m.retired=0 AND m.provisioned=0 AND ((c.terminal=0 AND c.deadline>?1) OR (c.terminal=2 AND m.purpose=2))"
         };
-        let sql=format!("SELECT m.ceremony,m.slot,m.relay,m.purpose,m.mailbox,m.request,m.quota,c.deadline FROM mailboxes m JOIN ceremonies c ON c.id=m.ceremony WHERE m.next_retry<=?1 AND ({condition}) ORDER BY m.next_retry,m.relay,m.slot,m.purpose LIMIT ?2");
+        // Take the oldest due row on each relay before considering a second row there.
+        let sql = format!(
+            "SELECT m.ceremony,m.slot,m.relay,m.purpose,m.mailbox,m.request,m.quota,c.deadline
+             FROM mailboxes m JOIN ceremonies c ON c.id=m.ceremony
+             WHERE m.next_retry<=?1 AND ({condition})
+             ORDER BY row_number() OVER(PARTITION BY m.relay
+                 ORDER BY m.next_retry,m.ceremony,m.slot,m.purpose), (m.relay+3-?3)%3
+             LIMIT ?2"
+        );
         let mut query = self.connection.prepare(&sql)?;
-        let rows = query.query_map(params![now, limit], |r| {
+        let rows = query.query_map(params![now, limit, first_relay], |r| {
             Ok((
                 r.get::<_, Vec<u8>>(0)?,
                 r.get::<_, u16>(1)?,

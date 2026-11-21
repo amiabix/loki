@@ -729,6 +729,8 @@ fn package(args: &[String]) -> Result<(), String> {
 #[cfg(feature = "relay-communication")]
 struct TwoRelays {
     own: Vec<OwnerInbox>,
+    identity: loki_relay_client::CommIdentity,
+    vault: [u8; 32],
     http: RelayHttp,
     runtime: RelayRuntime,
 }
@@ -754,7 +756,9 @@ impl NonceWitness for TwoRelays {
         for inbox in &self.own[..2] {
             let created = self
                 .runtime
-                .block_on(self.http.claim_nonce(&inbox.route, &inbox.read, cid, wire))
+                .block_on(self.http.claim_nonce(&inbox.route, cid, wire, |challenge| {
+                    self.identity.nonce_claim_proof(self.vault, &inbox.route, cid, challenge, wire)
+                }))
                 .map_err(|e| format!("nonce relay claim: {e}"))?;
             if !created {
                 return Err("nonce already claimed; start a new signing attempt".into());
@@ -801,7 +805,7 @@ fn two_relays(args: &[String]) -> Result<TwoRelays, String> {
     {
         return Err("two distinct reachable configured relays required for nonce safety".into());
     }
-    Ok(TwoRelays { own, http, runtime })
+    Ok(TwoRelays { own, identity: loaded.identity, vault: loaded.roster.vault, http, runtime })
 }
 
 #[cfg(feature = "relay-communication")]

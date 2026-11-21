@@ -63,6 +63,7 @@ zcash_client_sqlite = { package = "zakura-client-sqlite", version = "=0.1.0-rc7"
 zcash_keys = { package = "zakura-keys", version = "=2.2.0", features = ["orchard", "unstable-frost"] }
 rusqlite = { version = "=0.37.0", features = ["bundled-sqlcipher-vendored-openssl"] }
 async-trait = "0.1"
+prost = "0.14"
 tonic = { version = "0.14.6", features = ["transport", "tls-webpki-roots"] }
 rustls = { version = "0.23", features = ["aws_lc_rs"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }

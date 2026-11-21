@@ -2,7 +2,7 @@ use crate::{
     store::{HashPresence, PutClass},
     Capability, Limits, RelayError, RelayResult, RelayStore, StoredResult,
 };
-use loki_relay_protocol::types::{CreationResult, Id32, Object, Page};
+use loki_relay_protocol::{nonce::ClaimProof, types::{CreationResult, Id32, Object, Page}};
 use std::{
     path::PathBuf,
     sync::{
@@ -165,7 +165,7 @@ enum Command {
         Id32,
         Id32,
         Vec<u8>,
-        Capability,
+        ClaimProof,
         ReplySender<(bool, Vec<u8>)>,
     ),
     Get(Id32, Id32, Capability, ReplySender<Vec<u8>>),
@@ -246,9 +246,9 @@ impl DbHandle {
                             let result = store.put(mailbox, &object, &capability);
                             complete(reply, result);
                         }
-                        Command::ClaimNonce(mailbox, cid, challenge, wire, capability, reply) => {
+                        Command::ClaimNonce(mailbox, cid, challenge, wire, proof, reply) => {
                             let result =
-                                store.claim_nonce(mailbox, cid, challenge, &wire, &capability);
+                                store.claim_nonce(mailbox, cid, challenge, &wire, &proof);
                             complete(reply, result);
                         }
                         Command::Get(mailbox, hash, capability, reply) => {
@@ -441,10 +441,10 @@ impl DbHandle {
         cid: Id32,
         challenge: Id32,
         wire: Vec<u8>,
-        owner_read: Capability,
+        proof: ClaimProof,
     ) -> RelayResult<DbReply<(bool, Vec<u8>)>> {
         self.admit_fresh(|reply| {
-            Command::ClaimNonce(mailbox, cid, challenge, wire, owner_read, reply)
+            Command::ClaimNonce(mailbox, cid, challenge, wire, proof, reply)
         })
     }
     pub fn page(
