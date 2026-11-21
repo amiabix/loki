@@ -41,6 +41,7 @@ threshold=${THRESHOLD:-2}
 web_port=${WEB_PORT:-3001}
 base_port=${BASE_PORT:-3601}
 coordinator="http://localhost:$web_port"
+[[ $members =~ ^([3-9]|1[0-6])$ ]] || launch_error "MEMBERS must be in 3..16"
 
 mkdir -p -- "$(dirname -- "$root")"
 mkdir -- "$root" || launch_error "the stack requires a new root: $root"
@@ -56,7 +57,16 @@ member_bin="$core/target/release/loki_member_app"
 
 echo "== coordinator on :$web_port =="
 private_output "$root/coordinator.log"
+grants='{'
+for n in $(seq 1 "$members"); do
+  grant=$(openssl rand -hex 32)
+  onboarding[n]=$grant
+  digest=$(printf '%s' "$grant" | openssl dgst -sha256 -r)
+  grants+="\"${digest%% *}\":$n,"
+done
+grants="${grants%,}}"
 ( cd "$web" && export HOSTNAME=localhost PORT="$web_port" PUBLIC_PORT="$web_port" LOKI_REGISTRY="$root/registry.json" \
+  LOKI_ONBOARDING_GRANTS="$grants" \
   && exec node server.js >"$root/coordinator.log" 2>&1 ) &
 echo $! >> "$root/pids"
 for _ in {1..50}; do curl -sf --max-time 1 "$coordinator/api/members" >/dev/null && break; sleep 0.2; done
@@ -70,7 +80,7 @@ for n in $(seq 1 "$members"); do
   ports[n]=$port
   pass="$root/member-$n.pass"
   ensure_passphrase "$pass"
-  start_member "$port" "$root/member-$n.log" "$root/pids" \
+  LOKI_ONBOARDING_GRANT="${onboarding[n]}" start_member "$port" "$root/member-$n.log" "$root/pids" \
     "$member_bin" --data "$root/member-$n" --port "$port" --network "$network" \
     --lightwalletd-url "$lwd" --frostd-url "$frostd" \
     --allow-loopback-peers --secure-element software --development-http \
@@ -79,6 +89,7 @@ for n in $(seq 1 "$members"); do
   tokens[n]=${pairing_link##*#}
   unset pairing_link
 done
+unset onboarding grant
 
 # Readiness means the local API is ready, not that background registration has finished.
 registered=0

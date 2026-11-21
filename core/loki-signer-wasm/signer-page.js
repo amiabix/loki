@@ -418,14 +418,16 @@ async function enrollBegin() {
 }
 // Sign the coordinator's registration transcript. The coordinator is the wallet origin; the
 // transcript binds it, the enrollment above and the coordinator's challenge — nothing else.
-async function enrollSign({ challenge, replacement_generation }) {
+async function enrollSign({ challenge, replacement_generation, relay_challenge_pubkey }) {
   if (!enrollment) throw new SignerError("Start enrollment first", 400);
   if (typeof challenge !== "string" || !/^[0-9a-f]{64}$/.test(challenge)) throw new SignerError("invalid challenge", 400);
+  if (typeof relay_challenge_pubkey !== "string" || !/^[0-9a-f]{64}$/.test(relay_challenge_pubkey)) throw new SignerError("invalid relay challenge key", 400);
   const e = enrollment;
   const transcript = ["loki-member-registration-v1", wallet, 0, e.signing_pubkey, e.relay_pubkey, "", e.device_pubkey, challenge].join("\n");
   const pair = await deviceKeypair();
   const sig = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, pair.privateKey, new TextEncoder().encode(transcript));
-  const proof = { signature: toHex(new Uint8Array(sig)) };
+  const relay_proof = await call({ op: "relay-registration-proof", origin: wallet, challenge, key: relay_challenge_pubkey });
+  const proof = { signature: toHex(new Uint8Array(sig)), relay_proof };
   if (replacement_generation !== undefined) {
     if (!Number.isSafeInteger(replacement_generation) || replacement_generation < 1) throw new SignerError("invalid replacement generation", 400);
     proof.replacement_authorization = await call({ op: "authorize-device-replacement", origin: wallet, devicePubHex: e.device_pubkey, challenge, generation: replacement_generation });

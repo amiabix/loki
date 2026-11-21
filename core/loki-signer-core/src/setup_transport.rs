@@ -249,6 +249,31 @@ impl Identity {
         ClaimProof { claimant, signature }
     }
 
+    /// Prove control of the roster relay key without signing a frostd login challenge.
+    pub fn relay_registration_proof(
+        &self,
+        origin: &str,
+        challenge: &[u8; 32],
+        coordinator_key: &[u8; 32],
+    ) -> Result<[u8; 32], String> {
+        let shared = self.encryption.diffie_hellman(&PublicKey::from(*coordinator_key));
+        if !shared.was_contributory() {
+            return Err("invalid coordinator relay challenge key".into());
+        }
+        let public = self.public();
+        let context = format!(
+            "loki-relay-registration-v1\n{origin}\n{}\n{}\n{}",
+            hex::encode(public.signing),
+            hex::encode(public.encryption),
+            hex::encode(challenge),
+        );
+        let mut proof = [0; 32];
+        hkdf::Hkdf::<sha2::Sha256>::new(None, shared.as_bytes())
+            .expand(context.as_bytes(), &mut proof)
+            .map_err(|_| "invalid relay proof length")?;
+        Ok(proof)
+    }
+
     pub fn sign_setup_agreement(
         &self,
         vault: &[u8; 32],

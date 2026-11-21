@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use super::state::{write_native_key_scope, Config, Session, Shared};
+use crate::member_state::MAX_MEMBERS;
 use crate::signer::device_auth::{verify_device_signature, DeviceRegistry};
 use crate::state::MemberDir;
 use crate::transport::read_bounded;
@@ -36,7 +37,7 @@ impl RegistrationConfig {
         if pairs.len() != 3 { return Err("unexpected pairing fields".into()); }
         let coordinator = plain_origin(&get("origin")?, development_http)?;
         let raw_slot = get("slot")?;
-        let slot = raw_slot.parse::<u32>().ok().filter(|s| *s > 0 && s.to_string() == raw_slot).ok_or("invalid pairing slot")?;
+        let slot = raw_slot.parse::<u32>().ok().filter(|s| valid_slot(*s) && s.to_string() == raw_slot).ok_or("invalid pairing slot")?;
         let challenge = get("challenge")?;
         if challenge.len() != 64 || !challenge.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
             return Err("invalid pairing challenge".into());
@@ -46,7 +47,7 @@ impl RegistrationConfig {
 
     pub fn resume(data: &std::path::Path, development_http: bool) -> Result<Self, String> {
         let saved: PairedCoordinator = serde_json::from_slice(&std::fs::read(data.join("paired-coordinator.json")).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-        if saved.slot == 0 { return Err("invalid saved slot".into()); }
+        if !valid_slot(saved.slot) { return Err("invalid saved slot".into()); }
         Ok(Self { coordinator: plain_origin(&saved.origin, development_http)?, slot: Some(saved.slot),
             passphrase_file: None, name: "Member".into(), pairing_challenge: None })
     }
@@ -63,11 +64,22 @@ impl RegistrationConfig {
             return Ok(None);
         };
         let coordinator = plain_origin(&coordinator, development_http)?;
-        let slot = value("--registration-slot").map(|v| v.parse::<u32>().ok().filter(|s| *s > 0)
-            .ok_or("--registration-slot requires a positive integer")).transpose()?;
+        let slot = value("--registration-slot").map(|v| v.parse::<u32>().ok().filter(|s| valid_slot(*s))
+            .ok_or("--registration-slot is outside the supported slot range")).transpose()?;
+        let pairing_challenge = match std::env::var("LOKI_PAIRING_CLAIM") {
+            Ok(value) if slot.is_some() && lowercase_key(&value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            _ => return Err("invalid coordinator pairing reservation".into()),
+        };
         let passphrase_file = value("--local-passphrase-file").ok_or("--local-passphrase-file is required for local unlock")?.into();
-        Ok(Some(Self { coordinator, slot, passphrase_file: Some(passphrase_file), name: value("--profile-name").unwrap_or_else(|| "Member".into()), pairing_challenge: None }))
+        Ok(Some(Self { coordinator, slot, passphrase_file: Some(passphrase_file), name: value("--profile-name").unwrap_or_else(|| "Member".into()), pairing_challenge }))
     }
+}
+
+pub(super) fn valid_slot(slot: u32) -> bool { (1..=u32::from(MAX_MEMBERS)).contains(&slot) }
+
+fn lowercase_key(hex: &str) -> bool {
+    hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -98,23 +110,33 @@ pub(super) struct PublicMember {
 const COORDINATOR_UNREACHABLE: &str = "LokiSigner couldn’t reach the coordinator. Check your connection, then try again.";
 
 #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave")))]
-pub(super) async fn fetch_roster(client: &reqwest::Client, origin: &str) -> Result<Vec<PublicMember>, &'static str> {
+pub(super) async fn fetch_roster(client: &reqwest::Client, origin: &str, signing: &str) -> Result<Vec<PublicMember>, &'static str> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Roster { slots: Vec<PublicMember> }
 
-    let mut response = client.get(format!("{origin}/api/members")).send().await.map_err(|_| COORDINATOR_UNREACHABLE)?;
+    let url = reqwest::Url::parse_with_params(&format!("{origin}/api/members"), [("signing_pubkey", signing)])
+        .map_err(|_| COORDINATOR_UNREACHABLE)?;
+    let mut response = client.get(url).send().await.map_err(|_| COORDINATOR_UNREACHABLE)?;
     if !response.status().is_success() { return Err(COORDINATOR_UNREACHABLE); }
-    let body = read_bounded(&mut response, 1024 * 1024).await.map_err(|_| COORDINATOR_UNREACHABLE)?;
-    serde_json::from_slice::<Roster>(&body).map(|r| r.slots).map_err(|_| COORDINATOR_UNREACHABLE)
+    let body = read_bounded(&mut response, 8 * 1024).await.map_err(|_| COORDINATOR_UNREACHABLE)?;
+    let roster = serde_json::from_slice::<Roster>(&body).map_err(|_| COORDINATOR_UNREACHABLE)?;
+    if roster.slots.len() > 1 || roster.slots.iter().any(|m| !m.signing_pubkey.eq_ignore_ascii_case(signing)) {
+        return Err(COORDINATOR_UNREACHABLE);
+    }
+    Ok(roster.slots)
 }
 
 #[derive(Deserialize)]
 struct RegistrationChallenge {
     challenge: String,
+    relay_challenge_pubkey: String,
     #[serde(default, deserialize_with = "decode_replacement_generation")]
     replacement_generation: Option<u64>,
 }
+
+#[cfg(test)]
+pub(super) const TEST_RELAY_CHALLENGE_KEY: &str = "0900000000000000000000000000000000000000000000000000000000000000";
 
 fn decode_replacement_generation<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
     let generation = u64::deserialize(d)?;
@@ -322,8 +344,8 @@ async fn registration_device(config: &Config, pass: &str, _client: &reqwest::Cli
                 .map_err(|_| DeviceKeyError::CoordinatorUnavailable(COORDINATOR_UNREACHABLE))?;
             if pinned.coordinator != _origin { return Err(unreachable); }
         }
-        let roster = fetch_roster(_client, _origin).await.map_err(DeviceKeyError::CoordinatorUnavailable)?;
-        if roster.iter().any(|member| member.slot == 0 || [&member.signing_pubkey, &member.relay_pubkey]
+        let roster = fetch_roster(_client, _origin, _signing_key).await.map_err(DeviceKeyError::CoordinatorUnavailable)?;
+        if roster.iter().any(|member| !valid_slot(member.slot) || [&member.signing_pubkey, &member.relay_pubkey]
             .iter().any(|key| key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()))) {
             return Err(unreachable);
         }
@@ -356,24 +378,33 @@ async fn register(config: &Config, pass: &str, pairing_claim: Option<&str>, slot
     };
     let mut claim = serde_json::to_value(&enrollment).map_err(|e| e.to_string())?;
     if let Some(challenge) = pairing_claim { claim["pairing_challenge"] = challenge.into(); }
+    else if !config.native {
+        if let Ok(grant) = std::env::var("LOKI_ONBOARDING_GRANT") {
+            if !lowercase_key(&grant) { return Err("invalid onboarding grant".into()); }
+            claim["onboarding_grant"] = grant.into();
+        }
+    }
     let request = client.post(format!("{}/api/members/challenge", launch.coordinator))
         .json(&claim).build().map_err(|e| e.to_string())?;
     // After handing the request to the client even a lost response may mean the claim was used.
     if let (Some(notice), Some(claim)) = (notice, pairing_claim) { notice("pairing-claim-attempted", claim); }
     let response = client.execute(request).await.map_err(|e| RegistrationFailure::Connection(format!("registration challenge: {e}")))?;
-    let RegistrationChallenge { challenge, replacement_generation } =
+    let RegistrationChallenge { challenge, replacement_generation, relay_challenge_pubkey } =
         registration_response(response, "registration challenge", config.native, 1024).await?;
-    if challenge.len() != 64 || !challenge.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+    if !lowercase_key(&challenge) || !lowercase_key(&relay_challenge_pubkey) {
         return Err("invalid coordinator challenge".into());
     }
+    let mut nonce = [0; 32];
+    let mut coordinator_key = [0; 32];
+    hex::decode_to_slice(&challenge, &mut nonce).map_err(|e| e.to_string())?;
+    hex::decode_to_slice(&relay_challenge_pubkey, &mut coordinator_key).map_err(|e| e.to_string())?;
     let message = enrollment.message(&launch.coordinator, &challenge);
     let signature = device.sign(&message).map_err(RegistrationFailure::Device)?;
     verify_device_signature(&device_pub, &message, &signature)?;
     let mut body = serde_json::to_value(&enrollment).map_err(|e| e.to_string())?;
     body["signature"] = hex::encode(signature).into();
+    body["relay_proof"] = hex::encode(identity.relay_registration_proof(&launch.coordinator, &nonce, &coordinator_key)?).into();
     if let Some(generation) = replacement_generation {
-        let mut nonce = [0; 32];
-        hex::decode_to_slice(&challenge, &mut nonce).map_err(|e| e.to_string())?;
         let proof = identity.authorize_device_replacement(&launch.coordinator, &device_pub, &nonce, generation);
         body["replacement_authorization"] = hex::encode(proof).into();
     }
@@ -381,7 +412,7 @@ async fn register(config: &Config, pass: &str, pairing_claim: Option<&str>, slot
     let response = client.post(format!("{}/api/members", launch.coordinator))
         .json(&body).send().await.map_err(|e| RegistrationFailure::Connection(format!("self-registration: {e}")))?;
     let RegistrationReply { member } = registration_response(response, "self-registration", config.native, 8 * 1024).await?;
-    if member.slot == 0 || slot.is_some_and(|s| s != member.slot) || member.signing_pubkey != enrollment.signing_pubkey
+    if !valid_slot(member.slot) || slot.is_some_and(|s| s != member.slot) || member.signing_pubkey != enrollment.signing_pubkey
         || member.relay_pubkey != enrollment.relay_pubkey || member.advertise_url != enrollment.advertise_url
         || member.lokisigner_url != enrollment.lokisigner_url {
         return Err("coordinator returned a different identity".into());
@@ -547,7 +578,7 @@ async fn register_member(st: &Shared, pass: Zeroizing<String>, pairing_claim: Op
             return match attempt(pinned.slot) {
                 Err(RegistrationFailure::WrongSlot) => {
                     let identity = super::ceremony::identity(&config.data, &pass, 1)?.public();
-                    let roster = super::native_recovery::read_roster(&pinned.coordinator)?;
+                    let roster = super::native_recovery::read_roster(&pinned.coordinator, &identity.signing)?;
                     let slot = super::native_recovery::restored_slot(&identity, &roster)?;
                     if Some(slot) == pinned.slot || !config.data.join(RESTORE_PENDING).is_file() {
                         return Err(RegistrationFailure::WrongSlot);
@@ -590,8 +621,8 @@ async fn keep_registering(st: Shared, pass: Zeroizing<String>, restored: bool, n
     #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
     let mut shown_key_errors = std::collections::HashSet::new();
     // The coordinator consumes a pairing claim even when its reply is lost, so only the first
-    // attempt carries it. Later attempts resume against the saved coordinator and slot, which
-    // the coordinator accepts once the claim's reservation expires (or as the same identity).
+    // attempt carries it. Later attempts can resume pending enrollment or refresh an enrolled
+    // identity. If the uncompleted reservation expires, request a fresh link.
     let mut pairing_claim = st.config.registration.as_ref().and_then(|launch| launch.pairing_challenge.clone());
     if restored { tokio::time::sleep(wait).await; }
     loop {
@@ -867,7 +898,7 @@ mod tests {
                 async move { Json(json!({"member": {"slot": body["slot"], "signing_pubkey": body["signing_pubkey"],
                     "relay_pubkey": body["relay_pubkey"], "advertise_url": body["advertise_url"]}})) }
             }))
-            .route("/api/members/challenge", post(|| async { Json(json!({"challenge": "ab".repeat(32)})) }));
+            .route("/api/members/challenge", post(|| async { Json(json!({"challenge": "ab".repeat(32), "relay_challenge_pubkey": TEST_RELAY_CHALLENGE_KEY})) }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -979,7 +1010,7 @@ mod tests {
                             exchange.1.notified().await;
                             return Err(StatusCode::SERVICE_UNAVAILABLE);
                         }
-                        if refused { Err(StatusCode::BAD_REQUEST) } else { Ok(Json(json!({ "challenge": "cd".repeat(32) }))) }
+                        if refused { Err(StatusCode::BAD_REQUEST) } else { Ok(Json(json!({ "challenge": "cd".repeat(32), "relay_challenge_pubkey": TEST_RELAY_CHALLENGE_KEY }))) }
                     }
                 }))
                 .route("/api/members", post(move |Json(body): Json<Value>| {
@@ -1146,7 +1177,7 @@ mod tests {
         let app = Router::new()
             .route("/api/members/challenge", post(move |Json(body): Json<Value>| {
                 c.lock().unwrap().push(body.get("pairing_challenge").is_some());
-                async { Json(json!({ "challenge": "cd".repeat(32) })) }
+                async { Json(json!({ "challenge": "cd".repeat(32), "relay_challenge_pubkey": TEST_RELAY_CHALLENGE_KEY })) }
             }))
             .route("/api/members", post(move |Json(body): Json<Value>| {
                 // The first registration reply is lost; the next one succeeds.
@@ -1262,7 +1293,7 @@ mod tests {
         let pass = "registration repair fixture";
         std::fs::create_dir(&data).unwrap();
         let identity = super::super::ceremony::identity(&data, pass, 1).unwrap().public();
-        let matched = json!({ "slot": 19, "signing_pubkey": hex::encode(identity.signing),
+        let matched = json!({ "slot": 9, "signing_pubkey": hex::encode(identity.signing),
             "relay_pubkey": hex::encode(identity.encryption), "advertise_url": "http://127.0.0.1:3601" });
         let mut wrong_relay = matched.clone();
         wrong_relay["relay_pubkey"] = json!("different relay key");
@@ -1337,7 +1368,7 @@ mod tests {
         let app = Router::new()
             .route("/api/members/challenge", post(|Json(body): Json<Value>| async move {
                 assert_eq!(body["lokisigner_url"], LOCAL);
-                Json(json!({"challenge": "cd".repeat(32)}))
+                Json(json!({"challenge": "cd".repeat(32), "relay_challenge_pubkey": TEST_RELAY_CHALLENGE_KEY}))
             }))
             .route("/api/members", post(move |Json(body): Json<Value>| {
                 let reply = replies.fetch_add(1, Ordering::SeqCst);

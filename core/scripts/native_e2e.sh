@@ -50,7 +50,7 @@ frostd_url=http://127.0.0.1:2744
 app=${APP:-$core/signer-app/out/LokiSigner.app}
 
 say "preflight ($network)"
-for tool in curl jq nc cargo npm pbcopy pbpaste open; do
+for tool in curl jq nc cargo npm openssl pbcopy pbpaste open; do
   command -v "$tool" >/dev/null || fail "$tool is required (see the runbook's prerequisites)"
 done
 command -v frostd >/dev/null || fail 'frostd is not on PATH: cargo install --git https://github.com/ZcashFoundation/frost-zcash-demo frostd --locked'
@@ -110,7 +110,13 @@ for pid in "${relay_pids[@]}"; do wait "$pid"; done
 awk -v a="${relay_pids[0]}" -v b="${relay_pids[1]}" '$0 != a && $0 != b' "$root/pids" >"$root/pids.next"
 mv "$root/pids.next" "$root/pids"
 [[ -d $repo/web/wallet/node_modules ]] || ( cd "$repo/web/wallet" && { npm ci || npm ci --legacy-peer-deps; } )
-( cd "$repo/web/wallet" && LOKI_REGISTRY="$root/registry.json" LOKI_DEV_FAUCET=1 \
+grants='{}'
+for n in 1 2 3; do
+  onboarding[n]=$(openssl rand -hex 32)
+  digest=$(printf '%s' "${onboarding[n]}" | openssl dgst -sha256 -r)
+  grants=$(jq --arg digest "${digest%% *}" --argjson slot "$n" '.[$digest] = $slot' <<<"$grants")
+done
+( cd "$repo/web/wallet" && LOKI_REGISTRY="$root/registry.json" LOKI_DEV_FAUCET=1 LOKI_ONBOARDING_GRANTS="$grants" \
     exec nohup npx next dev --hostname 127.0.0.1 --port "$web_port" ) >"$root/coordinator.log" 2>&1 &
 echo $! >>"$root/pids"
 wait_for 180 "coordinator did not start; see $root/coordinator.log" curl -sf -m 5 "$coord/api/members" -o /dev/null
@@ -128,8 +134,10 @@ registered() { curl -sf -m 5 "$coord/api/members" | jq -e --argjson s "$1" 'any(
 for n in 1 2 3; do
   port=$((base_port+n))
   say "pair member $n (slot $n, local API :$port)"
-  link=$(curl -sf -m 10 -X POST -H 'Content-Type: application/json' -d "{\"slot\":$n}" "$coord/api/members/pairing" | jq -er .url) \
+  link=$(printf '{"slot":%d,"onboarding_grant":"%s"}' "$n" "${onboarding[n]}" |
+    curl -qsf -m 10 -H 'Content-Type: application/json' --data-binary @- "$coord/api/members/pairing" | jq -er .url) \
     || fail "the coordinator issued no pairing link for slot $n"
+  unset 'onboarding[n]'
   printf '' | pbcopy
   printf '%s\n' "$link" | "$app/Contents/MacOS/LokiSigner" native --pairing-stdin --development-http --data "$root/m$n" --port "$port" \
     --network "$network" --lightwalletd-url "$lwd" --frostd-url "$frostd_url" \

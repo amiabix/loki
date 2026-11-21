@@ -2381,7 +2381,7 @@ mod tests {
         let signing = hex::encode(identity.signing);
         let relay = hex::encode(identity.encryption);
         // Coordinator slot deliberately differs from the backup's FROST member id.
-        let entry = json!({"slot": 31, "signing_pubkey": signing, "relay_pubkey": relay, "advertise_url": "http://127.0.0.1:10000"});
+        let entry = json!({"slot": 11, "signing_pubkey": signing, "relay_pubkey": relay, "advertise_url": "http://127.0.0.1:10000"});
         let mut wrong_relay = entry.clone();
         wrong_relay["relay_pubkey"] = json!(hex::encode([78; 32]));
         let roster = Arc::new(Mutex::new(vec![wrong_relay.clone()]));
@@ -2403,10 +2403,10 @@ mod tests {
                 received.lock().unwrap().push(body);
                 async move {
                     use axum::http::StatusCode;
-                    if slot != Some(47) {
+                    if slot != Some(14) {
                         return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "registered identity cannot change slot"}))));
                     }
-                    Ok(Json(json!({"challenge": "ab".repeat(32)})))
+                    Ok(Json(json!({"challenge": "ab".repeat(32), "relay_challenge_pubkey": registration::TEST_RELAY_CHALLENGE_KEY})))
                 }
             }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2446,9 +2446,9 @@ mod tests {
             assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None), Err(mismatch));
             assert!(!data.exists());
             *roster.lock().unwrap() = vec![entry.clone(), entry.clone()];
-            assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None), Err(mismatch));
+            assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None), Err("roster-unavailable"));
             assert!(!data.exists());
-            *roster.lock().unwrap() = vec![wrong_relay, entry];
+            *roster.lock().unwrap() = vec![entry];
             settings.secure_element = "invalid fixture backend".into();
             assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None), Err(refused));
             assert!(!data.exists(), "even a failure during installation must not publish the profile");
@@ -2474,7 +2474,7 @@ mod tests {
         let old_pub = std::fs::read(data.join("recovery.pub")).unwrap();
         assert_eq!(old_pub, [key.public_bytes(), key.signing_public()].concat());
         assert!(crate::host::state::read_native_key_scope(&data).unwrap().is_some());
-        assert_eq!(settings.registration.as_ref().unwrap().slot, Some(31));
+        assert_eq!(settings.registration.as_ref().unwrap().slot, Some(11));
         let state = Arc::new(AppState::new(settings));
         let notice: crate::host::LocalNotice = Arc::new(|_, _| panic!("restored profile must never mint new words"));
         let unlock = || Some(Zeroizing::new(pass.into()));
@@ -2525,11 +2525,11 @@ mod tests {
         let mut resumed = config();
         resumed.registration = Some(RegistrationConfig::resume(&data, true).unwrap());
         let resumed = Arc::new(AppState::new(resumed));
-        roster.lock().unwrap().iter_mut().filter(|m| m["relay_pubkey"] == relay).for_each(|m| m["slot"] = json!(47));
+        roster.lock().unwrap().iter_mut().filter(|m| m["relay_pubkey"] == relay).for_each(|m| m["slot"] = json!(14));
         assert_eq!(registration::start(&resumed, unlock(), Some(&notice)).await.unwrap(), "restore-ready");
         let registered = resumed.registration.read().await.clone().unwrap();
-        assert_eq!(registered.slot, 47);
-        assert_eq!(RegistrationConfig::resume(&data, true).unwrap().slot, Some(47));
+        assert_eq!(registered.slot, 14);
+        assert_eq!(RegistrationConfig::resume(&data, true).unwrap().slot, Some(14));
         assert_eq!(registered.signing_pubkey, signing);
         assert_eq!(registered.relay_pubkey, relay);
         assert!(!data.join(registration::RESTORE_PENDING).exists());
@@ -2578,7 +2578,7 @@ mod tests {
             ]);
         }
         let sent = enrollment.lock().unwrap();
-        assert_eq!(sent.iter().map(|request| request["slot"].as_u64().unwrap()).collect::<Vec<_>>(), [31, 31, 47]);
+        assert_eq!(sent.iter().map(|request| request["slot"].as_u64().unwrap()).collect::<Vec<_>>(), [11, 11, 14]);
         for request in sent.iter() {
             assert_eq!(request.as_object().unwrap().keys().collect::<Vec<_>>(), ["advertise_url", "authorization", "device_pubkey", "lokisigner_url", "relay_pubkey", "signing_pubkey", "slot"]);
             assert_eq!(request["lokisigner_url"], "http://127.0.0.1:10001");
