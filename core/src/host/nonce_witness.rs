@@ -48,8 +48,7 @@ pub(super) fn check(config: &[WitnessConfig; 2], development: bool) -> Result<()
 }
 
 impl RelayWitness {
-    /// This member's witnesses: the `--nonce-witnesses` file (named by a flag or saved), or the
-    /// ones LokiSigner fetched from its coordinator for this launch.
+    /// LokiSigner's approved launch snapshot, or the headless `--nonce-witnesses` file.
     pub(super) fn for_member(st: &super::state::AppState, attempt: &str) -> Result<Self, String> {
         let development = st.config.development_http;
         match (&st.config.nonce_witnesses, &st.fetched_config) {

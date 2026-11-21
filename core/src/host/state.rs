@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::RwLock;
 use zeroize::Zeroizing;
@@ -417,13 +418,12 @@ pub struct Session {
 }
 
 impl Session {
-    /// Validate the sealed profile with this passphrase and prime the KDF cache.
+    /// Validate the sealed profile without activating the session or its cache.
     pub fn unlock(
         data: PathBuf,
         passphrase: Zeroizing<String>,
     ) -> Result<(Self, serde_json::Value), String> {
         let profile = crate::profile::open(&data, &passphrase)?;
-        crate::seal_kdf::enable_session_cache(&passphrase);
         Ok((Self { passphrase, data }, profile))
     }
 }
@@ -434,6 +434,8 @@ pub struct AppState {
     /// The last failed registration attempt, reported locally while registration retries.
     pub(super) registration_error: RwLock<Option<String>>,
     pub session: RwLock<Option<Session>>,
+    // Lock and activation both modify session state under the session write lock.
+    pub(super) session_generation: AtomicU64,
     pub ceremony: std::sync::Mutex<()>,
     pub payment: std::sync::Mutex<()>,
     pub active_payments: std::sync::Mutex<BTreeSet<String>>,
@@ -453,7 +455,7 @@ pub struct AppState {
     pub(super) wallet_tabs: Option<super::connect::WalletTabs>,
     /// Each opened vault's viewing key; `None` means a cancelled open needs an explicit retry.
     pub(super) viewing_keys: std::sync::Mutex<BTreeMap<String, Option<orchard::keys::FullViewingKey>>>,
-    /// The signer configuration LokiSigner fetched for this launch, saved once the profile unlocks.
+    /// LokiSigner's confirmed launch snapshot. Fresh settings without overrides are saved on unlock.
     pub(super) fetched_config: Option<super::FetchedConfig>,
 }
 
@@ -464,6 +466,7 @@ impl AppState {
             registration: RwLock::new(None),
             registration_error: RwLock::new(None),
             session: RwLock::new(None),
+            session_generation: AtomicU64::new(0),
             ceremony: std::sync::Mutex::new(()),
             payment: std::sync::Mutex::new(()),
             active_payments: std::sync::Mutex::new(BTreeSet::new()),
@@ -477,6 +480,29 @@ impl AppState {
             viewing_keys: std::sync::Mutex::new(BTreeMap::new()),
             fetched_config: None,
         }
+    }
+
+    pub(super) fn session_generation(&self) -> u64 {
+        self.session_generation.load(Ordering::Acquire)
+    }
+
+    pub(super) async fn activate_session(&self, generation: u64, session: Session) -> bool {
+        let mut current = self.session.write().await;
+        if self.session_generation() != generation { return false; }
+        crate::seal_kdf::enable_session_cache(&session.passphrase);
+        *current = Some(session);
+        true
+    }
+
+    pub(super) async fn lock_session(self: &std::sync::Arc<Self>) {
+        let mut current = self.session.write().await;
+        *current = None;
+        if let Some(tabs) = &self.wallet_tabs { tabs.revoke_all(); }
+        crate::seal_kdf::clear_session_cache();
+        self.session_generation.fetch_add(1, Ordering::Release);
+        drop(current);
+        #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+        super::native_member::clear_addresses_on_lock(self);
     }
 }
 
