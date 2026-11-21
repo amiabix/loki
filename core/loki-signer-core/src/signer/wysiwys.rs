@@ -15,6 +15,7 @@
 //! - fee: inputs minus outputs, from the opened values.
 //! - network: the consensus branch id committed in the PCZT global (the bytes bind it).
 
+use super::local::SignerError;
 use crate::verify::{check_change_decryption, open_output};
 use orchard::{
     keys::FullViewingKey,
@@ -172,16 +173,24 @@ pub fn describe_pczt(pczt_bytes: &[u8], vault_fvk: &FullViewingKey) -> Result<Pa
 /// signing path uses (`signing_session`), so the sighash is only produced for a PCZT
 /// whose openings match its commitments for this vault's key.
 pub fn sighash_of_pczt(pczt_bytes: &[u8], vault_fvk: &FullViewingKey) -> Result<[u8; 32], String> {
+    checked_sighash_of_pczt(pczt_bytes, vault_fvk).map_err(|e| e.to_string())
+}
+
+/// The same checks, retaining the fee refusal for device-local signing callers.
+pub fn checked_sighash_of_pczt(
+    pczt_bytes: &[u8],
+    vault_fvk: &FullViewingKey,
+) -> Result<[u8; 32], SignerError> {
     use pczt::roles::signer::Signer;
     let parsed = pczt::Pczt::parse(pczt_bytes).map_err(|e| format!("pczt parse: {e:?}"))?;
-    let mut err: Option<String> = None;
+    let mut err = None;
     let checked = Verifier::new(parsed)
         .with_ironwood::<String, _>(|bundle| {
-            let run = || -> Result<(), String> {
+            let run = || -> Result<(), SignerError> {
                 for (i, action) in bundle.actions().iter().enumerate() {
-                    action
-                        .verify_cv_net()
-                        .map_err(|e| format!("action {i} value commitment: {e:?}"))?;
+                    action.verify_cv_net().map_err(|e| {
+                        SignerError::FeeUnverified(format!("action {i} value commitment: {e:?}"))
+                    })?;
                     action
                         .spend()
                         .verify_nullifier(Some(vault_fvk))

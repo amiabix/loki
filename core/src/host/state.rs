@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::sync::RwLock;
+use tokio::sync::{watch, RwLock};
 use zeroize::Zeroizing;
 
 use crate::signer::secure_element::{OpenError, SecureElement, SoftwareSecureElement, WrappedDek};
@@ -434,6 +434,8 @@ pub struct AppState {
     /// The last failed registration attempt, reported locally while registration retries.
     pub(super) registration_error: RwLock<Option<String>>,
     pub session: RwLock<Option<Session>>,
+    /// A native member never unlocks in place after stopping; each launch has its own signal.
+    pub(super) stopping: watch::Sender<bool>,
     // Lock and activation both modify session state under the session write lock.
     pub(super) session_generation: AtomicU64,
     pub(super) pending_recovery: std::sync::Mutex<Option<Vec<u8>>>,
@@ -446,6 +448,7 @@ pub struct AppState {
     pub(super) device_auth: std::sync::Mutex<Option<super::device::DeviceState>>,
     /// The member's native payment decision; `None` (headless) refuses every payment.
     pub approval: Option<super::LocalApproval>,
+    pub(super) notice: Option<super::LocalNotice>,
     /// The member's native roster-code comparison; `None` (headless) trusts the caller of
     /// `/api/agree`.
     pub roster_confirmation: Option<super::LocalRosterConfirmation>,
@@ -467,6 +470,7 @@ impl AppState {
             registration: RwLock::new(None),
             registration_error: RwLock::new(None),
             session: RwLock::new(None),
+            stopping: watch::Sender::new(false),
             session_generation: AtomicU64::new(0),
             pending_recovery: std::sync::Mutex::new(None),
             ceremony: std::sync::Mutex::new(()),
@@ -475,6 +479,7 @@ impl AppState {
             active_dkgs: std::sync::Mutex::new(BTreeSet::new()),
             device_auth: std::sync::Mutex::new(None),
             approval: None,
+            notice: None,
             roster_confirmation: None,
             roster_asking: std::sync::Mutex::new(None),
             roster_refused: std::sync::Mutex::new(BTreeSet::new()),
@@ -483,6 +488,13 @@ impl AppState {
             fetched_config: None,
         }
     }
+    pub(super) fn is_stopping(&self) -> bool {
+        *self.stopping.borrow()
+    }
+
+    pub(super) async fn wait_for_stop(&self) {
+        let _ = self.stopping.subscribe().wait_for(|stopping| *stopping).await;
+    }
 
     pub(super) fn session_generation(&self) -> u64 {
         self.session_generation.load(Ordering::Acquire)
@@ -490,7 +502,7 @@ impl AppState {
 
     pub(super) async fn activate_session(&self, generation: u64, session: Session) -> bool {
         let mut current = self.session.write().await;
-        if self.session_generation() != generation { return false; }
+        if self.session_generation() != generation || self.is_stopping() { return false; }
         crate::seal_kdf::enable_session_cache(&session.passphrase);
         *current = Some(session);
         true

@@ -33,7 +33,7 @@ pub(crate) use native_member::can_view_addresses as native_can_view_addresses;
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
 pub(crate) use native_member::restore_running as native_restore_running;
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
-pub(crate) use native_member::{set_log_sink as native_set_log_sink, status as native_status};
+pub(crate) use native_member::{set_log_sink as native_set_log_sink, status as native_status, wallet_request as native_wallet_request};
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
 pub(crate) use native_recovery::{clean_staging as native_clean_staging, profile_state as native_profile_state, restore_new as native_restore_new, REFUSED as NATIVE_RESTORE_REFUSED};
 #[cfg(feature = "relay-communication")]
@@ -332,7 +332,7 @@ fn run_local_with<G>(
     roster_confirmation: Option<LocalRosterConfirmation>,
     fetched: Option<FetchedConfig>,
     pairing_stdout: bool,
-    stop: Option<&tokio::sync::Notify>,
+    stopping: Option<tokio::sync::watch::Sender<bool>>,
     connect: Option<connect::LocalConnect>,
     on_start: impl FnOnce(&state::Shared) -> Result<G, String>,
 ) -> Result<(), String> {
@@ -356,7 +356,8 @@ fn run_local_with<G>(
         .build()
         .map_err(|e| format!("tokio runtime: {e}"))?;
 
-    runtime.block_on(async move {
+    let mut scope = None;
+    let result = runtime.block_on(async {
         let addr = std::net::SocketAddr::new(config.bind, config.port);
         let listener = tokio::net::TcpListener::bind(addr)
             .await
@@ -371,8 +372,11 @@ fn run_local_with<G>(
             let endpoint = config.lokisigner_url().ok_or("LokiSigner needs a loopback listener")?;
             Ok::<_, &str>(connect::WalletTabs::new(endpoint, registration.coordinator.clone(), ask))
         }).transpose()?;
-        let state: state::Shared = std::sync::Arc::new(state::AppState { approval, roster_confirmation, fetched_config: fetched, wallet_tabs, ..state::AppState::new(config) });
-        let _scope = on_start(&state)?;
+        let native = stopping.is_some();
+        let state = std::sync::Arc::new(state::AppState { approval, notice: notice.clone(), roster_confirmation,
+            fetched_config: fetched, wallet_tabs, stopping: stopping.unwrap_or_else(|| tokio::sync::watch::Sender::new(false)),
+            ..state::AppState::new(config) });
+        scope = Some(on_start(&state)?);
         let serve = async {
             let ready = registration::start(&state, pass, notice.as_ref()).await?;
             if state.config.native {
@@ -399,18 +403,23 @@ fn run_local_with<G>(
             };
             tokio::try_join!(local, peers).map(|_| ()).map_err(|e| format!("serve: {e}"))
         };
-        if let Some(stop) = stop {
-            // Clear the session before dropping the runtime: blocking workers check it to exit.
-            // The UI cannot restart or set aside the profile until those workers have drained.
-            tokio::select! {
+        if native {
+            let result = tokio::select! {
                 biased;
-                _ = stop.notified() => { state.lock_session().await; Ok(()) },
+                _ = state.wait_for_stop() => Ok(()),
                 result = serve => result,
-            }
+            };
+            state.stopping.send_replace(true);
+            state.lock_session().await;
+            result
         } else {
             serve.await
         }
-    })
+    });
+    // Keep the profile claimed until its blocking workers have drained.
+    drop(runtime);
+    drop(scope);
+    result
 }
 
 #[cfg(test)]

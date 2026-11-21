@@ -165,6 +165,15 @@ struct Invite {
     name: String,
 }
 
+#[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+pub(super) fn embedded_invite_target(config: &super::Config, body: &Value) -> bool {
+    let Some(invite) = body["invite"].as_str().filter(|s| s.len() <= 4096)
+        .and_then(|s| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s).ok())
+        .and_then(|bytes| serde_json::from_slice::<Invite>(&bytes).ok()) else { return false; };
+    let url = invite.creator_base_url.as_str();
+    url.starts_with("https://") && config.validate_peer_url(url).is_ok()
+}
+
 /// Shared roster policy, including the member cap.
 use crate::member_state::valid_policy;
 
