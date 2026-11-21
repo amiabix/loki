@@ -13,6 +13,9 @@ import { requirePersistentStorage, requireShare } from "./storage-guard.js";
 const cfg = await fetch("./config.json", { cache: "no-store" }).then((r) => r.json());
 const wallet = cfg.walletOrigin;
 const rpId = cfg.rpId || location.hostname;
+const custodyPath = "/manage-custody";
+const framed = window !== top;
+const embedded = framed && location.pathname !== custodyPath;
 const $ = (id) => document.getElementById(id);
 $("self-origin").textContent = location.origin;
 $("relay").textContent = `${cfg.frostdUrl || "none configured"} · nonce witnesses: ${cfg.nonceWitnesses?.map((w) => w.endpoint).join(", ") || "none (signing is refused)"}`;
@@ -21,11 +24,11 @@ class SignerError extends Error {
   constructor(message, status = 500) { super(message); this.status = status; }
 }
 
-// ─── one signer per browser profile ──────────────────────────────────────────
+// ─── one signer per storage partition ────────────────────────────────────────
 // The Worker holds exclusive OPFS handles and the crash-safe nonce store, so exactly one tab
 // may run it. This page holds a Web Lock for its lifetime; a second tab refuses every op
-// instead of racing the first over the same share and nonces.
-const owner = await new Promise((resolve) => {
+// instead of racing the first over the same share and nonces. The custody tab never opens OPFS.
+const owner = embedded && await new Promise((resolve) => {
   if (!navigator.locks) { resolve(false); return; }
   navigator.locks.request("loki-signer", { ifAvailable: true }, (lock) => {
     resolve(!!lock);
@@ -37,6 +40,7 @@ const owner = await new Promise((resolve) => {
 let worker, workerFailure, dismissPrompt;
 const pending = new Map();
 let seq = 0;
+let removing = false;
 function failWorker() {
   if (workerFailure) return;
   workerFailure = new SignerError("The browser signer worker stopped or could not start. Try again.", 503);
@@ -59,6 +63,7 @@ function receiveWorker(e) {
 async function call(msg) {
   if (workerFailure) throw workerFailure;
   if (!worker) throw new SignerError("Your signer is open in another tab. Close it there and reload.", 409);
+  if (removing && msg.op !== "remove-verified") throw new SignerError("Signer removal is in progress. Try again in a moment.", 409);
   const id = ++seq;
   return new Promise((resolve, reject) => {
     pending.set(id, { resolve, reject });
@@ -89,7 +94,7 @@ function prompt(title, body, buttons) {
   $("body").replaceChildren(...body);
   $("error").textContent = "";
   main.hidden = false;
-  parent.postMessage({ cmd: "show" }, wallet);
+  if (embedded) parent.postMessage({ cmd: "show" }, wallet);
   return new Promise((resolve, reject) => {
     const wait = new AbortController();
     const actions = $("actions");
@@ -98,7 +103,7 @@ function prompt(title, body, buttons) {
       main.hidden = true;
       $("body").replaceChildren();
       actions.replaceChildren();
-      parent.postMessage({ cmd: "hide" }, wallet);
+      if (embedded) parent.postMessage({ cmd: "hide" }, wallet);
       fn();
     };
     dismissPrompt = (error) => done(() => reject(error));
@@ -160,9 +165,10 @@ async function createPasskey(name, attachment, signal) {
 // A fresh user-verified assertion releasing the PRF secret. The remembered credential id is
 // only a hint: without it (cleared storage) the authenticator offers its discoverable Loki
 // passkeys for this rpId.
-async function prfSecret(credentialId, signal) {
-  let id = credentialId;
-  if (!id) { try { const h = localStorage.getItem(CRED); if (h) id = fromHex(h); } catch {} }
+function rememberedCredential() {
+  try { const h = localStorage.getItem(CRED); if (h) return fromHex(h); } catch {}
+}
+async function prfSecret(id = embedded ? rememberedCredential() : undefined, signal) {
   const assertion = await navigator.credentials.get({
     signal,
     publicKey: {
@@ -176,7 +182,7 @@ async function prfSecret(credentialId, signal) {
   signal.throwIfAborted();
   const first = assertion.getClientExtensionResults().prf?.results?.first;
   if (!first || first.byteLength < 32) throw new SignerError("This passkey released no PRF secret. Use a passphrase instead.", 400);
-  try { localStorage.setItem(CRED, toHex(new Uint8Array(assertion.rawId))); } catch {}
+  if (embedded) { try { localStorage.setItem(CRED, toHex(new Uint8Array(assertion.rawId))); } catch {} }
   return new Uint8Array(first).slice(0, 32);
 }
 
@@ -323,20 +329,106 @@ async function restore({ vault, name, method, backup }) {
   return { ...result, persisted };
 }
 
-// Delete this browser's signer, only after the member confirms every vault's recovery
-// backup is exported and the words are kept: without them the shares here are gone.
-async function remove() {
-  const kept = el("input", { type: "checkbox" });
-  await prompt("Remove the signer from this browser?", [
-    el("p", { textContent: "This deletes your sealed identity and every vault share in this browser. You can sign again only by restoring from your 24 recovery words and each vault's recovery backup file." }),
-    el("label", {}, kept, " I exported every vault's recovery backup and I have my 24 words"),
-  ], [cancelButton, { label: "Remove signer", run: async () => {
-    if (!kept.checked) throw new SignerError("Export your recovery backups first.", 400);
-    return call({ op: "remove" });
+// Only the tab opened by this signer frame can send a removal confirmation. Its private port
+// bridges the two storage partitions without giving the top-level tab a worker or a lock.
+function manageCustody() {
+  return prompt("Open signer controls", [
+    el("p", { textContent: `Continue in a separate tab. Check its address is ${location.origin} before verifying your identity there.` }),
+  ], [{ ...cancelButton, value: false }, { label: "Open signer controls", run: (signal) => {
+    const openedFor = current;
+    if (!openedFor || !worker) throw new SignerError("Unlock your signer first", 401);
+    const tab = window.open(custodyPath, "_blank");
+    if (!tab) throw new SignerError("Allow the signer to open a new tab and try again.", 400);
+
+    return new Promise((resolve, reject) => {
+      let port;
+      const finish = () => {
+        removeEventListener("message", connect);
+        signal.removeEventListener("abort", abort);
+        clearInterval(closed);
+        clearTimeout(timeout);
+        port?.close();
+      };
+      const abort = () => { finish(); tab.close(); resolve(false); };
+      const connect = (e) => {
+        if (e.source !== tab || e.origin !== location.origin || e.data?.cmd !== "custody-connect" || !e.ports[0]) return;
+        removeEventListener("message", connect);
+        clearTimeout(timeout);
+        port = e.ports[0];
+        const passkey = openedFor.se === "passkey";
+        port.postMessage({ name: openedFor.profile.name, passkey, credentialId: passkey ? rememberedCredential() : undefined });
+        port.onmessage = async ({ data }) => {
+          if (data?.cmd !== "confirm-removal" || removing || tab.closed) return;
+          if (current !== openedFor || pending.size) {
+            port.postMessage({ error: current !== openedFor ? "The signer session changed. Return to the wallet and open signer controls again." : "The signer is busy. Try again in a moment." });
+            return;
+          }
+          removing = true;
+          try {
+            const secret = passkey ? { method: "platform", prfSecret: data.prfSecret } : { method: "passphrase", passphrase: data.passphrase };
+            await call({ op: "remove-verified", ...secret });
+            current = null;
+            enrollment = null;
+            try { localStorage.removeItem(CRED); } catch {}
+            port.postMessage({ removed: true });
+            finish();
+            resolve(true);
+          } catch (e) {
+            port.postMessage({ error: e.message || String(e) });
+          } finally { removing = false; }
+        };
+      };
+      addEventListener("message", connect);
+      const closed = setInterval(() => { if (tab.closed && !removing) { finish(); resolve(false); } }, 500);
+      const timeout = setTimeout(() => {
+        finish();
+        tab.close();
+        reject(new SignerError("The signer tab could not connect. Allow tabs opened by the signer and try again.", 409));
+      }, 10000);
+      signal.addEventListener("abort", abort, { once: true });
+    });
   } }]);
-  current = null;
-  enrollment = null;
-  return null;
+}
+
+async function showCustodyControls() {
+  const { port1, port2 } = new MessageChannel();
+  const context = await new Promise((resolve) => {
+    if (!opener) { resolve(null); return; }
+    const timeout = setTimeout(() => resolve(null), 10000);
+    port1.onmessage = ({ data }) => { clearTimeout(timeout); resolve(data); };
+    opener.postMessage({ cmd: "custody-connect" }, location.origin, [port2]);
+  });
+  if (!context) {
+    port1.close();
+    void prompt("Signer controls unavailable", [el("p", { textContent: "Unlock the signer in your wallet and open signer controls from there. This tab does not access your wallet's stored shares." })], []);
+    return;
+  }
+
+  const field = context.passkey ? null : passField("Passphrase", "current-password");
+  const kept = el("input", { type: "checkbox" });
+  const confirmed = await prompt("Remove the signer from this browser?", [
+    facts([["Signer", context.name], ["Wallet", wallet]]),
+    el("p", { textContent: "This deletes the sealed identity and every vault share this wallet uses in this browser. You can sign again only by restoring from your 24 recovery words and each vault's recovery backup file." }),
+    el("label", {}, kept, " I exported every vault's recovery backup and I have my 24 words"),
+    field ? el("label", { textContent: "Passphrase" }, field) : el("p", { textContent: `Verify with your passkey for ${rpId}.` }),
+  ], [{ ...cancelButton, value: false }, { label: "Verify and remove signer", abortable: true, run: async (signal, commit) => {
+    if (!kept.checked) throw new SignerError("Export your recovery backups first.", 400);
+    const secret = field ? { passphrase: field.value } : { prfSecret: await prfSecret(context.credentialId, signal) };
+    commit();
+    if (field) field.value = "";
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new SignerError("No response. Return to your wallet to check whether the signer was removed.")), 15000);
+      port1.onmessage = ({ data }) => {
+        clearTimeout(timeout);
+        data.removed ? resolve() : reject(new SignerError(data.error));
+      };
+      port1.postMessage({ cmd: "confirm-removal", ...secret });
+    });
+    return true;
+  } }]);
+  port1.close();
+  if (!confirmed) { window.close(); return; }
+  void prompt("Signer removed", [el("p", { textContent: "This wallet's local shares were removed. Return to the wallet to restore from a recovery backup." })], []);
 }
 
 // ─── Worker asks: on-device decisions ────────────────────────────────────────
@@ -479,16 +571,16 @@ const ops = {
   "recovery-status": async () => ({ recovery_identity: await call({ op: "has-recovery" }) }),
   "recovery-export": recoveryExport,
   restore,
-  remove,
+  "manage-custody": manageCustody,
 };
-const UNLOCKED = new Set(["join", "payment-review", "payment-approve", "pending", "vaults", "address", "chain", "payment-status", "recovery-setup", "recovery-export", "recovery-status"]);
+const UNLOCKED = new Set(["join", "payment-review", "payment-approve", "pending", "vaults", "address", "chain", "payment-status", "recovery-setup", "recovery-export", "recovery-status", "manage-custody"]);
 // Ops that may show a prompt run one at a time; the read-only ones answer alongside them
 // (the Worker refuses them with "busy" while a join or payment holds the vault).
-const PROMPTING = new Set(["create", "unlock", "join", "payment-approve", "recovery-setup", "recovery-export", "restore", "remove"]);
+const PROMPTING = new Set(["create", "unlock", "join", "payment-approve", "recovery-setup", "recovery-export", "restore", "manage-custody"]);
 
 let queue = Promise.resolve(); // one op (and so one prompt) at a time
 addEventListener("message", (e) => {
-  if (e.origin !== wallet || e.source !== parent || parent === window) return;
+  if (!embedded || e.origin !== wallet || e.source !== parent) return;
   const { id, op, params } = e.data ?? {};
   if (typeof id !== "number" || !Object.hasOwn(ops, op)) return;
   const run = async () => {
@@ -503,7 +595,7 @@ addEventListener("message", (e) => {
   if (PROMPTING.has(op)) queue = queue.then(run);
   else run();
 });
-if (parent !== window) {
+if (embedded) {
   if (!owner) parent.postMessage({ cmd: "ready" }, wallet); // Report the existing other-tab error per call.
   else try {
     worker = new Worker("./signer-worker.js", { type: "module" });
@@ -512,3 +604,4 @@ if (parent !== window) {
     worker.addEventListener("messageerror", failWorker);
   } catch { failWorker(); }
 }
+if (!framed && location.pathname === custodyPath) void showCustodyControls();

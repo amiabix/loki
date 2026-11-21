@@ -277,9 +277,18 @@ mainnet. LokiSigner shows these values when it pairs and saves them (see
 
 The signer origin itself must be **stable**. The share (OPFS), the device-login key (IndexedDB)
 and the passkey (rpId) are all bound to it. A new hostname per run (for example a fresh
-trycloudflare URL) gives an empty signer that cannot open the old share. Only one tab per browser
-profile may run the signer: a Web Lock guards the Worker, its share and its nonce store. Other
-tabs refuse signer operations until the first one closes.
+trycloudflare URL) gives an empty signer that cannot open the old share. Only one tab per
+storage partition may run the signer: a Web Lock guards the Worker, its share and its nonce
+store. Other tabs using that partition refuse signer operations until the first one closes.
+
+To remove a browser signer, save the 24 recovery words and download every vault's recovery
+backup before opening **Manage browser signer** in the unlocked wallet. Use **Open signer
+controls**, check the separate tab's address is the signer origin, and confirm removal with a
+fresh passkey verification or passphrase. Keep the wallet tab open until removal succeeds.
+The confirmation page cannot be embedded and does not open browser custody storage. It talks
+only to the signer frame that opened it, whose lock-owning worker verifies the credential and removes
+the shares from the wallet's actual storage partition. Use the wallet's recovery flow to restore
+from the saved words and backup.
 
 Before the first payment approval and after a witness identity changes, the signer asks for the
 [independently supplied witness fingerprint](../../core/signer-app/README.md#verify-the-witness-pair)

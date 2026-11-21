@@ -22,7 +22,7 @@ import {
   PairingSlotTaken,
   pendingApprovals,
   exportRecoveryBackup,
-  removeBrowserSigner,
+  manageBrowserCustody,
   restoreSigner,
   setupBrowserRecovery,
   signerKind,
@@ -870,8 +870,7 @@ function Home({
   );
 }
 
-// The in-browser signer's recovery words and removal. Both run on the signer page: it shows
-// the words once and checks three of them, and it asks before deleting anything.
+// Recovery setup stays on the embedded signer; removal requires the separate signer tab.
 function BrowserSignerRecovery() {
   const [hasWords, setHasWords] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
@@ -892,7 +891,7 @@ function BrowserSignerRecovery() {
           : "Set up 24 recovery words. You need them, and each vault's backup file, to restore this signer in another browser."}
       </p>
       {hasWords === false && <Btn disabled={busy} onClick={() => run(async () => { await setupBrowserRecovery(); setHasWords(true); })}>Set up recovery words</Btn>}
-      <Btn variant="ghost" disabled={busy} onClick={() => run(async () => { await removeBrowserSigner(); window.location.reload(); })}>Remove signer from this browser</Btn>
+      <Btn variant="ghost" disabled={busy} onClick={() => run(async () => { if (await manageBrowserCustody()) window.location.reload(); })}>Manage browser signer</Btn>
       <ErrMsg msg={err} />
     </section>
   );
