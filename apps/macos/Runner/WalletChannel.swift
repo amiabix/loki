@@ -1,0 +1,194 @@
+import AppKit
+import FlutterMacOS
+import UniformTypeIdentifiers
+
+@_silgen_name("loki_member_app_wallet_request")
+private func loki_member_app_wallet_request(_ path: UnsafePointer<CChar>, _ body: UnsafePointer<CChar>?,
+    _ export: Int32) -> UnsafeMutablePointer<CChar>?
+
+@MainActor
+final class WalletChannel {
+    private let channel: FlutterMethodChannel
+    private let signer: NativeSigner
+    private let validLaunch: Bool
+
+    init(messenger: FlutterBinaryMessenger, window: NSWindow) {
+        channel = FlutterMethodChannel(name: "cash.loki/wallet", binaryMessenger: messenger)
+        #if LOKI_VISUAL_ONLY
+        let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let args: [String]? = ["--data", root.appendingPathComponent("LokiSignerVisual").path]
+        #else
+        let args = Self.launchArguments(CommandLine.arguments.dropFirst())
+        #endif
+        validLaunch = args != nil
+        signer = NativeSigner(args: nativeSignerArguments(args ?? []), link: nil, walletWindow: window)
+        signer.promptChanged = { [weak channel] active in
+            channel?.invokeMethod("nativePromptChanged", arguments: active)
+        }
+        channel.setMethodCallHandler { [weak self] call, result in
+            DispatchQueue.main.async {
+                guard let self else { result(FlutterMethodNotImplemented); return }
+                self.handle(call, result: result)
+            }
+        }
+    }
+
+    private static func launchArguments(_ arguments: ArraySlice<String>) -> [String]? {
+        // Only process launch arguments may configure peers; ignore Flutter/Launch Services flags.
+        var flags: [String] = []
+        var rest = arguments.makeIterator()
+        while let option = rest.next() {
+            let supported = ["--data", "--port", "--peer-port", "--peer", "--advertise-url"]
+            if supported.contains(where: { option.hasPrefix($0 + "=") }) { return nil }
+            if !supported.contains(option) { continue }
+            guard let value = rest.next(), !value.isEmpty, !value.hasPrefix("--") else { return nil }
+            flags.append(contentsOf: [option, value])
+        }
+        return flags
+    }
+
+    private func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+        let args = call.arguments as? [String: Any]
+        let noArgs = call.arguments == nil || call.arguments is NSNull
+        let invalid = failure(400, "Invalid wallet method arguments.")
+        let busy = failure(409, "Finish the current LokiSigner review or operation first.")
+        switch call.method {
+        case "nativePromptActive":
+            guard noArgs else { result(invalid); return }
+            result(signer.nativePromptActive)
+        case "leaveNativePrompt":
+            guard noArgs else { result(invalid); return }
+            signer.leaveNativePrompt()
+            result(nil)
+        case "nativeNotice":
+            guard noArgs else { result(invalid); return }
+            result(signer.walletNotice)
+        case "profile":
+            guard noArgs else { result(invalid); return }
+            guard validLaunch else { result(failure(400, "Invalid LokiSigner launch arguments.")); return }
+            var profile = signer.walletProfile()
+            profile["can_recover_wallet_key"] = signer.canRecoverWalletKey
+            profile["reduce_motion"] = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+            if #available(macOS 26, *) { profile["liquid_glass"] = true }
+            if profile["profile"] is String { result(profile) }
+            else { result(failure(500, SignerStartFailure.dataFolderUnavailable.message)) }
+        case "unlock", "pair", "restore", "recoverWalletKey":
+            let origin = args?["origin"] as? String
+            guard call.method == "pair" ? (origin != nil && args?.count == 1) : noArgs else { result(invalid); return }
+            guard validLaunch else { result(failure(400, "Invalid LokiSigner launch arguments.")); return }
+            #if LOKI_VISUAL_ONLY
+            result(failure(403, "This visual-only build cannot unlock, pair or restore a signer."))
+            #else
+            guard signer.beginWalletOperation({ error in
+                if let error {
+                    let status = error == .cancelled ? 499 : (error == .unlock ? 401 : 400)
+                    result(self.failure(status, error.message))
+                } else { result(nil) }
+            }) else { result(busy); return }
+            if let origin { signer.pairWallet(origin: origin.trimmingCharacters(in: .whitespacesAndNewlines)) }
+            else if call.method == "restore" { signer.restoreWallet() }
+            else if call.method == "recoverWalletKey" { signer.recoverWalletKey() }
+            else { signer.unlockWallet() }
+            #endif
+        case "lock":
+            guard noArgs else { result(invalid); return }
+            if !signer.lockWallet({ result(nil) }) { result(busy) }
+        case "addresses":
+            guard noArgs else { result(invalid); return }
+            run(result, work: { nativeReply(loki_member_app_vault_addresses()) }) { reply in
+                guard loki_member_app_can_view_addresses() != 0 else {
+                    result(self.failure(401, "LokiSigner is locked.")); return
+                }
+                guard let rows = reply["vaults"] as? [[String: Any]] else {
+                    result(self.failure(500, reply["error"] as? String ?? "Couldn’t check vault addresses.")); return
+                }
+                result(rows.map { row -> [String: Any] in
+                    guard row["address"] != nil, row["network"] as? String != "testnet" else { return row }
+                    var row = row
+                    row.removeValue(forKey: "address")
+                    row["error"] = "This vault is not on testnet."
+                    return row
+                })
+            }
+        case "request":
+            guard let path = args?["path"] as? String, !path.isEmpty, path.utf8.count <= 256, !path.contains("\0"),
+                  args?.keys.allSatisfy({ $0 == "path" || $0 == "body" }) == true else { result(invalid); return }
+            let body = args?["body"]
+            var json: String?
+            if let body, !(body is NSNull) {
+                guard let map = body as? [String: Any], JSONSerialization.isValidJSONObject(map),
+                      let data = try? JSONSerialization.data(withJSONObject: map), data.count <= 1024 * 1024 else {
+                    result(invalid); return
+                }
+                json = String(decoding: data, as: UTF8.self)
+            }
+            request(path: path, body: json, result: result) { result($0) }
+        case "export":
+            guard let vault = args?["vault"] as? String, args?.count == 1, isHexID(vault) else { result(invalid); return }
+            let id = vault.lowercased()
+            request(path: "recovery-backup?vault=\(id)", export: true, result: result) { reply in
+                guard reply["vault"] as? String == id, let backup = reply["backup"] as? String, !backup.isEmpty,
+                      let data = try? JSONSerialization.data(withJSONObject: ["vault": id, "backup": backup]),
+                      data.count <= 256 * 1024 else { result(self.failure(500, "Invalid encrypted backup.")); return }
+                guard !self.signer.walletDialogOpen else { result(busy); return }
+                let panel = NSSavePanel()
+                panel.title = "Save encrypted LokiSigner backup"
+                panel.allowedContentTypes = [.json]
+                panel.nameFieldStringValue = "loki-recovery-\(id).json"
+                guard panel.runModal() == .OK, let file = panel.url else { result(self.failure(499, "Backup save cancelled.")); return }
+                guard self.signer.walletReady else { result(self.failure(401, "LokiSigner is locked.")); return }
+                do {
+                    try data.write(to: file, options: .atomic)
+                    result(nil)
+                } catch { result(self.failure(500, "Couldn’t save the encrypted backup.")) }
+            }
+        case "explorer":
+            guard let txid = args?["txid"] as? String, args?.count == 1, isHexID(txid),
+                  let url = URL(string: "https://testnet.zecblock.com/tx/\(txid.lowercased())") else { result(invalid); return }
+            if NSWorkspace.shared.open(url) { result(nil) }
+            else { result(failure(500, "Couldn’t open the transaction explorer.")) }
+        case "appearance":
+            guard let mode = args?["mode"] as? String, args?.count == 1 else { result(invalid); return }
+            switch mode {
+            case "light": NSApp.appearance = NSAppearance(named: .aqua)
+            case "dark": NSApp.appearance = NSAppearance(named: .darkAqua)
+            case "system": NSApp.appearance = nil
+            default: result(invalid); return
+            }
+            result(nil)
+        default:
+            result(FlutterMethodNotImplemented)
+        }
+    }
+
+    private func request(path: String, body: String? = nil, export: Bool = false, result: @escaping FlutterResult,
+                         complete: @escaping ([String: Any]) -> Void) {
+        run(result, work: {
+            nativeReply(path.withCString { path in
+                if let body { return body.withCString { loki_member_app_wallet_request(path, $0, export ? 1 : 0) } }
+                return loki_member_app_wallet_request(path, nil, export ? 1 : 0)
+            })
+        }) { reply in
+            let status = reply["status"] as? Int ?? 500
+            let data = reply["data"] as? [String: Any] ?? [:]
+            if (200..<300).contains(status) { complete(data) }
+            else { result(self.failure(status, data["error"] as? String ?? "LokiSigner request failed.")) }
+        }
+    }
+
+    private func run(_ result: @escaping FlutterResult, work: @escaping () -> [String: Any],
+                     complete: @escaping ([String: Any]) -> Void) {
+        if !signer.performWalletWork(work, complete: { reply in
+            if let reply { complete(reply) }
+            else { result(self.failure(401, "LokiSigner is locked.")) }
+        }) { result(failure(401, "LokiSigner is locked.")) }
+    }
+
+    private func failure(_ status: Int, _ message: String) -> FlutterError {
+        FlutterError(code: String(status), message: message, details: nil)
+    }
+
+    private func isHexID(_ value: String) -> Bool {
+        value.utf8.count == 64 && value.utf8.allSatisfy { (48...57).contains($0) || (65...70).contains($0) || (97...102).contains($0) }
+    }
+}
