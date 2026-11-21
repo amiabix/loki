@@ -24,6 +24,22 @@ use std::time::Duration;
 use zeroize::Zeroizing;
 
 const MAX_CONTROL: usize = 4096;
+
+struct PublicDns;
+
+impl reqwest::dns::Resolve for PublicDns {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let public: Vec<_> = tokio::net::lookup_host((name.as_str(), 0)).await?
+                .filter(|addr| crate::operator_config::public_destination(addr.ip())).collect();
+            if public.is_empty() {
+                return Err(std::io::Error::other("relay DNS returned no public destination").into());
+            }
+            Ok(Box::new(public.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
 pub struct RelayHttp {
     client: Client,
     development: bool,
@@ -127,6 +143,7 @@ impl RelayHttp {
             // guard:proxy
             .no_proxy()
             // end:proxy
+            .dns_resolver(std::sync::Arc::new(PublicDns))
             .no_gzip()
             .no_brotli()
             .no_deflate()
