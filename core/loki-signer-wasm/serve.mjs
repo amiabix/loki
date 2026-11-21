@@ -99,7 +99,15 @@ const csp = [
 
 createServer((req, res) => {
   if (req.method !== "GET" && req.method !== "HEAD") { res.writeHead(405).end(); return; }
-  const path = new URL(req.url, "http://x").pathname;
+  const target = req.url;
+  if (!/^\/(?!\/)[^\s\\#]*$/.test(target)) { res.writeHead(400).end(); return; }
+  let path;
+  try {
+    path = new URL(target, "http://x").pathname;
+  } catch {
+    res.writeHead(400).end();
+    return;
+  }
   const key = path === "/" ? "/signer.html" : path;
   const body = bundle.get(key);
   const type = body ? types[extname(key)] || "application/octet-stream" : "text/plain";
