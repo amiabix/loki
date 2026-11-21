@@ -712,7 +712,7 @@ async function drivePayment(signer, p, witnessPinsPath) {
   // member sees those terms on the signer page first; declining sends nothing.
   let group = activeGroup({ notice: announced, start }, vault.slot);
   if (!group) {
-    if (!await ask("payment-terms", terms)) throw new Error("You declined this payment request");
+    if (!await ask("payment-terms", { ...terms, vaultHex, attemptHex })) throw new Error("You declined this payment request");
     group = await refresh();
     if (!group) {
       const approval = JSON.stringify({ kind: "approval", hash: announced.hash, intent: terms, txid: null });
@@ -766,7 +766,7 @@ async function drivePayment(signer, p, witnessPinsPath) {
   const review = JSON.parse(signer.paymentCheck(candidateHex, JSON.stringify({ ...terms, tx_expiry: expiry })));
   const txid = reviewedTxid(review);
   if (record.txid && record.txid !== txid) throw new Error("this attempt already has different reviewed effects");
-  const consent = await ask("payment-sign", review);
+  const consent = await ask("payment-sign", { ...review, vaultHex, attemptHex });
   if (!consent) throw new Error("You declined to sign this payment");
   await refresh();
   signer.reauth(consent.method, consent.passphrase, consent.prfSecret);
