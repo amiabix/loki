@@ -35,8 +35,9 @@ use crate::{
         local::{roster_code, ApprovalPolicy, BackupDevice, DevicePrompts, LocalSigner, RosterDecision, SignerError},
         Network, Signer,
     },
+    signing_session::{MessageKind, SessionContext},
     state::MemberDir,
-    transport::{FrostdLoginKey, FrostdTransport, Outbound, Peer, RelayLog, Transport},
+    transport::{FrostdLoginKey, FrostdTransport, Outbound, Peer, RelayLog, SealedPeer, Transport},
     vault, zip2005,
 };
 
@@ -152,6 +153,9 @@ pub(super) struct Ceremony {
     // The roster code this member confirmed in `agree`; the signer's roster prompt matches it.
     #[serde(default)]
     roster_code: Option<String>,
+    // A joiner's copy of the creator's identity from the invite: requests go to it over frostd.
+    #[serde(default)]
+    creator: Option<WireIdentity>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -163,6 +167,11 @@ struct Invite {
     members: u16,
     threshold: u16,
     name: String,
+    // The creator's identity and relay: a joiner reaches the creator over frostd, not HTTP.
+    #[serde(default)]
+    creator: Option<WireIdentity>,
+    #[serde(default)]
+    frostd_url: Option<String>,
 }
 
 /// Shared roster policy, including the member cap.
@@ -327,6 +336,8 @@ fn invitations(c: &Ceremony) -> Result<Vec<Value>, String> {
                     members: c.members,
                     threshold: c.threshold,
                     name: c.name.clone(),
+                    creator: c.slots.get(&1).and_then(|s| s.identity.clone()),
+                    frostd_url: Some(c.frostd_url.clone()),
                 })
                 .map_err(|e| e.to_string())?,
             );
@@ -338,6 +349,72 @@ fn invitations(c: &Ceremony) -> Result<Vec<Value>, String> {
 enum PeerRequestError {
     Unavailable(String),
     Rejected(String),
+}
+
+impl PeerRequestError {
+    fn message(self) -> String {
+        match self {
+            Self::Unavailable(message) | Self::Rejected(message) => message,
+        }
+    }
+}
+
+/// A joiner's request `op` (enroll, roster, agreed or session) to the creator: sealed over
+/// frostd when the invite named the creator, otherwise to the creator's HTTP route.
+fn ask_creator(config: &Config, data: &Path, pass: &str, c: &Ceremony, op: &str) -> Result<Value, PeerRequestError> {
+    let mut body = joiner_auth(c).map_err(PeerRequestError::Rejected)?;
+    let Some(creator) = &c.creator else {
+        if op == "enroll" {
+            body["identity"] = json!(c.slots.get(&c.my_slot).and_then(|s| s.identity.as_ref()));
+        }
+        return peer_request_result(config, &c.creator_base_url, &format!("/api/{op}"), body);
+    };
+    body["op"] = json!(op);
+    let me = identity(data, pass, c.my_slot).map_err(PeerRequestError::Rejected)?;
+    let creator = creator.public(1).map_err(PeerRequestError::Rejected)?;
+    relay_request(&c.frostd_url, &me, &creator, &c.vault, &body)
+}
+
+/// The sealed-envelope context of one join exchange between the creator (slot 1) and a joiner.
+fn join_context(vault: &str, session: Uuid, slot: u16) -> Result<SessionContext, String> {
+    Ok(SessionContext::control(vault_bytes(vault)?, session, 1, slot))
+}
+
+/// One join request over frostd: the joiner opens a session of itself and the creator, seals
+/// `body` to the creator, and waits for the creator's sealed reply on that session.
+fn relay_request(url: &str, me: &Identity, creator: &PublicIdentity, vault: &str, body: &Value)
+    -> Result<Value, PeerRequestError>
+{
+    use PeerRequestError::{Rejected, Unavailable};
+    let mut tx = super::payment::relay(me, url).map_err(Unavailable)?;
+    let ch = tx.open(&[Peer(me.public().encryption), Peer(creator.encryption)], 2)
+        .map_err(|e| Unavailable(e.to_string()))?;
+    let context = join_context(vault, ch.session_id(), me.public().id).map_err(Rejected)?;
+    let sealed = SealedPeer::seal_join(me, creator, &context, &serde_json::to_vec(body).map_err(|e| Rejected(e.to_string()))?)
+        .map_err(Rejected)?;
+    let reply = (|| {
+        tx.send(&ch, &[Peer(creator.encryption)], &Outbound::Peer(sealed))
+            .map_err(|e| Unavailable(e.to_string()))?;
+        // The creator polls frostd about once a second.
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(250));
+            for msg in tx.recv(&ch, false).map_err(|e| Unavailable(e.to_string()))? {
+                let Ok(opened) = me.open_session(creator, &context, &msg.message) else { continue };
+                if msg.from.0 != creator.encryption || opened.kind() != MessageKind::PeerReply {
+                    continue;
+                }
+                let reply: Value = serde_json::from_slice(opened.body()).map_err(|e| Rejected(e.to_string()))?;
+                return match reply["error"].as_str() {
+                    Some(e @ ("roster pending" | "session pending")) => Err(Unavailable(e.into())),
+                    Some(e) => Err(Rejected(e.into())),
+                    None => Ok(reply),
+                };
+            }
+        }
+        Err(Unavailable("the creator did not answer over frostd".into()))
+    })();
+    let _ = tx.close(ch);
+    reply
 }
 
 // Allow global unicast only, excluding special-use and transition ranges.
@@ -352,12 +429,6 @@ fn public_peer_address(ip: IpAddr) -> bool {
             && !matches!(ip.segments(), [0x2001, 0..=0x1ff | 0xdb8, ..] | [0x2002, ..]
                 | [0x3fff, 0..=0xfff, ..]),
     }
-}
-
-fn peer_request(config: &Config, base: &str, route: &str, body: Value) -> Result<Value, String> {
-    peer_request_result(config, base, route, body).map_err(|error| match error {
-        PeerRequestError::Unavailable(message) | PeerRequestError::Rejected(message) => message,
-    })
 }
 
 fn peer_request_result(config: &Config, base: &str, route: &str, body: Value) -> Result<Value, PeerRequestError> {
@@ -492,8 +563,10 @@ pub(super) async fn create(State(st): State<Shared>, Json(body): Json<Value>) ->
             error: None,
             birth_height: None,
             roster_code: None,
+            creator: None,
         };
         save(&data, &pass, &c)?;
+        spawn_join_relay(&st);
         Ok(json!({"vault":c.vault,"invites":invitations(&c)?}))
     })
     .await
@@ -522,6 +595,11 @@ pub(super) async fn join(State(st): State<Shared>, Json(body): Json<Value>) -> R
     {
         return err(StatusCode::BAD_REQUEST, "invalid invite");
     }
+    if let Some(creator) = &invite.creator {
+        if let Err(e) = creator.public(1) {
+            return err(StatusCode::BAD_REQUEST, e);
+        }
+    }
     let (data, pass) = match unlocked(&st).await {
         Ok(x) => x,
         Err(e) => return e,
@@ -530,9 +608,6 @@ pub(super) async fn join(State(st): State<Shared>, Json(body): Json<Value>) -> R
         let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
         let me = identity(&data, &pass, invite.slot)?;
         let wire = WireIdentity::from_public(me.public());
-        let enrollment = json!({
-            "vault":invite.vault,"slot":invite.slot,"token":invite.token,"identity":wire
-        });
         let mut slots = BTreeMap::new();
         slots.insert(
             invite.slot,
@@ -559,12 +634,14 @@ pub(super) async fn join(State(st): State<Shared>, Json(body): Json<Value>) -> R
             error: None,
             birth_height: None,
             roster_code: None,
+            creator: invite.creator,
         };
         let exists = dir(&data, &c.vault)?.exists("ceremony.sealed");
         if exists {
             let old = load(&data, &pass, &c.vault)?;
             if old.my_slot != c.my_slot
                 || old.creator_base_url != c.creator_base_url
+                || old.creator != c.creator
                 || old
                     .slots
                     .get(&c.my_slot)
@@ -578,7 +655,7 @@ pub(super) async fn join(State(st): State<Shared>, Json(body): Json<Value>) -> R
                 return Err("existing ceremony does not match invite".into());
             }
         }
-        peer_request(&st.config, &c.creator_base_url, "/api/enroll", enrollment)?;
+        ask_creator(&st.config, &data, &pass, &c, "enroll").map_err(PeerRequestError::message)?;
         if !exists {
             save(&data, &pass, &c)?;
         }
@@ -604,36 +681,41 @@ pub(super) async fn enroll(State(st): State<Shared>, Json(body): Json<Value>) ->
         Ok(x) => x,
         Err(e) => return e,
     };
-    blocking(move || {
-        let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
-        let mut c = load(&data, &pass, &vault)?;
-        if c.my_slot != 1 {
-            return Err("only creator can enroll".into());
+    blocking(move || enroll_member(&st, &data, &pass, &vault, slot, &token, wire)).await
+}
+
+/// The creator records `wire` in `slot` for the holder of that slot's invite token.
+fn enroll_member(st: &Shared, data: &Path, pass: &str, vault: &str, slot: u16, token: &str, wire: WireIdentity)
+    -> Result<Value, String>
+{
+    wire.public(slot)?;
+    let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
+    let mut c = load(data, pass, vault)?;
+    if c.my_slot != 1 {
+        return Err("only creator can enroll".into());
+    }
+    let target = c.slots.get_mut(&slot).ok_or("unknown slot")?;
+    let expected = target.pending_token.as_ref().ok_or("missing slot token")?;
+    if !token_eq(expected, token) {
+        return Err("invalid invite token".into());
+    }
+    if let Some(existing) = &target.identity {
+        if existing != &wire {
+            return Err("slot already enrolled".into());
         }
-        let target = c.slots.get_mut(&slot).ok_or("unknown slot")?;
-        let expected = target.pending_token.as_ref().ok_or("missing slot token")?;
-        if !token_eq(expected, &token) {
-            return Err("invalid invite token".into());
+    } else {
+        target.identity = Some(wire);
+    }
+    if c.slots.values().all(|s| s.identity.is_some()) {
+        c.fingerprint = Some(hex::encode(roster_of(&c)?.fingerprint()));
+        // Fixed with the roster so every member can show the roster code before agreeing.
+        let network = VaultNetwork::parse(&st.config.network)?;
+        if network == VaultNetwork::Testnet && c.birth_height.is_none() {
+            c.birth_height = Some(setup_birth_height(network, 1, None, || testnet_tip(st, network))?);
         }
-        if let Some(existing) = &target.identity {
-            if existing != &wire {
-                return Err("slot already enrolled".into());
-            }
-        } else {
-            target.identity = Some(wire);
-        }
-        if c.slots.values().all(|s| s.identity.is_some()) {
-            c.fingerprint = Some(hex::encode(roster_of(&c)?.fingerprint()));
-            // Fixed with the roster so every member can show the roster code before agreeing.
-            let network = VaultNetwork::parse(&st.config.network)?;
-            if network == VaultNetwork::Testnet && c.birth_height.is_none() {
-                c.birth_height = Some(setup_birth_height(network, 1, None, || testnet_tip(&st, network))?);
-            }
-        }
-        save(&data, &pass, &c)?;
-        Ok(json!({"ok":true}))
-    })
-    .await
+    }
+    save(data, pass, &c)?;
+    Ok(json!({"ok":true}))
 }
 
 fn token_eq(expected: &str, given: &str) -> bool {
@@ -689,17 +771,7 @@ pub(super) async fn roster(State(st): State<Shared>, Json(body): Json<Value>) ->
         Ok(x) => x,
         Err(e) => return e,
     };
-    let reply = blocking(move || {
-        let c = for_joiner(&data, &pass, &body)?;
-        let fingerprint = c.fingerprint.ok_or("roster pending")?;
-        let roster: BTreeMap<_, _> = c
-            .slots
-            .into_iter()
-            .map(|(slot, s)| (slot, s.identity))
-            .collect();
-        Ok(json!({"fingerprint":fingerprint,"roster":roster,"birth_height":c.birth_height}))
-    })
-    .await;
+    let reply = blocking(move || roster_reply(&data, &pass, &body)).await;
     if reply.1 .0["error"] == "roster pending" {
         err(StatusCode::NOT_FOUND, "roster pending")
     } else {
@@ -707,11 +779,22 @@ pub(super) async fn roster(State(st): State<Shared>, Json(body): Json<Value>) ->
     }
 }
 
-fn refresh_roster(config: &Config, c: &mut Ceremony) -> Result<(), String> {
+fn roster_reply(data: &Path, pass: &str, body: &Value) -> Result<Value, String> {
+    let c = for_joiner(data, pass, body)?;
+    let fingerprint = c.fingerprint.ok_or("roster pending")?;
+    let roster: BTreeMap<_, _> = c
+        .slots
+        .into_iter()
+        .map(|(slot, s)| (slot, s.identity))
+        .collect();
+    Ok(json!({"fingerprint":fingerprint,"roster":roster,"birth_height":c.birth_height}))
+}
+
+fn refresh_roster(config: &Config, data: &Path, pass: &str, c: &mut Ceremony) -> Result<(), String> {
     if c.my_slot == 1 {
         return Ok(());
     }
-    let remote = peer_request(config, &c.creator_base_url, "/api/roster", joiner_auth(c)?)?;
+    let remote = ask_creator(config, data, pass, c, "roster").map_err(PeerRequestError::message)?;
     let fingerprint = remote["fingerprint"]
         .as_str()
         .ok_or("missing roster fingerprint")?;
@@ -766,7 +849,7 @@ pub(super) async fn status(st: Shared, vault: String) -> Reply {
         let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
         let mut c = load(&data, &pass, &vault)?;
         if c.my_slot != 1 && c.fingerprint.is_none() {
-            if refresh_roster(&st.config, &mut c).is_ok() {
+            if refresh_roster(&st.config, &data, &pass, &mut c).is_ok() {
                 save(&data, &pass, &c)?;
             }
         }
@@ -797,6 +880,9 @@ pub(super) async fn status(st: Shared, vault: String) -> Reply {
         }
         if c.my_slot == 1 && matches!(phase, "waiting_for_members" | "compare_roster") {
             value["invites"] = json!(invitations(&c)?);
+            if !active {
+                spawn_join_relay(&st);
+            }
         }
         if let Some(error) = c.error {
             value["error"] = json!(error);
@@ -946,7 +1032,7 @@ fn agreement(
     if c.dkg_started || c.error.is_some() {
         return Err("DKG interrupted or already running; create a fresh vault if interrupted".into());
     }
-    refresh_roster(config, &mut c)?;
+    refresh_roster(config, data, pass, &mut c)?;
     if c.fingerprint.as_deref() != Some(fingerprint) {
         return Err("roster fingerprint mismatch".into());
     }
@@ -960,7 +1046,7 @@ fn agreement(
 /// Tells the creator (a joiner only) and records this member's agreement and confirmed code.
 fn record_agreement(config: &Config, data: &Path, pass: &str, mut c: Ceremony, code: String) -> Result<Value, String> {
     if c.my_slot != 1 {
-        peer_request(config, &c.creator_base_url, "/api/agreed", joiner_auth(&c)?)?;
+        ask_creator(config, data, pass, &c, "agreed").map_err(PeerRequestError::message)?;
     }
     c.agreed.insert(c.my_slot);
     c.roster_code = Some(code);
@@ -998,21 +1084,22 @@ pub(super) async fn agreed(State(st): State<Shared>, Json(body): Json<Value>) ->
     let work_data = data.clone();
     let work_pass = pass.clone();
     let work_st = st.clone();
-    let reply = blocking(move || {
-        let _guard = work_st.ceremony.lock().map_err(|e| e.to_string())?;
-        let mut c = for_joiner(&work_data, &work_pass, &body)?;
-        if c.fingerprint.is_none() {
-            return Err("roster pending".into());
-        }
-        c.agreed.insert(slot);
-        save(&work_data, &work_pass, &c)?;
-        Ok(json!({"ok":true}))
-    })
-    .await;
+    let reply = blocking(move || agreed_member(&work_st, &work_data, &work_pass, &body, slot)).await;
     if reply.0 == StatusCode::OK {
         spawn_dkg(st, vault, data, pass);
     }
     reply
+}
+
+fn agreed_member(st: &Shared, data: &Path, pass: &str, body: &Value, slot: u16) -> Result<Value, String> {
+    let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
+    let mut c = for_joiner(data, pass, body)?;
+    if c.fingerprint.is_none() {
+        return Err("roster pending".into());
+    }
+    c.agreed.insert(slot);
+    save(data, pass, &c)?;
+    Ok(json!({"ok":true}))
 }
 
 pub(super) async fn session(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
@@ -1020,26 +1107,129 @@ pub(super) async fn session(State(st): State<Shared>, Json(body): Json<Value>) -
         Ok(x) => x,
         Err(e) => return e,
     };
-    let reply = blocking(move || {
-        let c = for_joiner(&data, &pass, &body)?;
-        if let Some(error) = c.error {
-            return Err(format!("Creator setup failed: {error}"));
-        }
-        if c.agreed.len() != usize::from(c.members) {
-            return Err("session pending".into());
-        }
-        Ok(json!({
-            "session_id": c.session_id.ok_or("session pending")?,
-            "coordinator_peer": c.coordinator_peer,
-            "vs_session_id": c.vs_session_id,
-            "birth_height": c.birth_height,
-        }))
-    })
-    .await;
+    let reply = blocking(move || session_reply(&data, &pass, &body)).await;
     if reply.1 .0["error"] == "session pending" {
         err(StatusCode::NOT_FOUND, "session pending")
     } else {
         reply
+    }
+}
+
+fn session_reply(data: &Path, pass: &str, body: &Value) -> Result<Value, String> {
+    let c = for_joiner(data, pass, body)?;
+    if let Some(error) = c.error {
+        return Err(format!("Creator setup failed: {error}"));
+    }
+    if c.agreed.len() != usize::from(c.members) {
+        return Err("session pending".into());
+    }
+    Ok(json!({
+        "session_id": c.session_id.ok_or("session pending")?,
+        "coordinator_peer": c.coordinator_peer,
+        "vs_session_id": c.vs_session_id,
+        "birth_height": c.birth_height,
+    }))
+}
+
+/// Starts the creator's loop that answers joiners over frostd, unless it runs. It holds the
+/// app state weakly and stops once the profile locks or no ceremony it created is still setting up.
+fn spawn_join_relay(st: &Shared) {
+    if st.join_relay.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let weak = std::sync::Arc::downgrade(st);
+    tokio::task::spawn_blocking(move || {
+        let mut relay = None;
+        while let Some(st) = weak.upgrade() {
+            match serve_joins(&st, &mut relay) {
+                Ok(true) => {}
+                Ok(false) => {
+                    st.join_relay.store(false, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("join relay: {e}");
+                    relay = None;
+                }
+            }
+            drop(st);
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    });
+}
+
+/// One pass of the creator's join relay: every two-member session a joiner opened with the
+/// creator is drained, and each request sealed to the creator for a ceremony it is still
+/// setting up is answered on that session. Returns whether there is still a ceremony to serve.
+fn serve_joins(st: &Shared, relay: &mut Option<FrostdTransport>) -> Result<bool, String> {
+    let Some((data, pass)) = st.session.blocking_read().as_ref().map(|s| (s.data.clone(), s.passphrase.clone())) else {
+        return Ok(false);
+    };
+    let waiting: Vec<String> = std::fs::read_dir(data.join("vaults")).into_iter().flatten().flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|vault| dir(&data, vault).is_ok_and(|d| !d.exists("vault.sealed")))
+        .filter(|vault| load(&data, &pass, vault).is_ok_and(|c| c.my_slot == 1 && c.slots.get(&1).is_some_and(|s| s.identity.is_some())))
+        .collect();
+    if waiting.is_empty() {
+        return Ok(false);
+    }
+    let me = identity(&data, &pass, 1)?;
+    let mine = me.public().encryption;
+    let tx = match relay {
+        Some(tx) => tx,
+        None => relay.insert(super::payment::relay(&me, &st.config.frostd_url)?),
+    };
+    for session in tx.list_sessions().map_err(|e| e.to_string())? {
+        let Ok((participants, Some(owner))) = tx.session_details(session) else { continue };
+        // Payment and DKG sessions have every member, or an owner outside them.
+        if participants.len() != 2 || owner == mine || !participants.contains(&mine) || !participants.contains(&owner) {
+            continue;
+        }
+        let ch = tx.join(session).map_err(|e| e.to_string())?;
+        for msg in tx.recv_control_bounded(session, Duration::from_secs(5)).map_err(|e| e.to_string())? {
+            let Some((joiner, context, body)) = open_join(&me, &waiting, session, &msg.from.0, &msg.message) else {
+                continue;
+            };
+            let reply = answer_join(st, &data, &pass, &joiner, body).unwrap_or_else(|e| json!({"error": e}));
+            let sealed = SealedPeer::seal(&me, &joiner, &context, MessageKind::PeerReply,
+                &serde_json::to_vec(&reply).map_err(|e| e.to_string())?)?;
+            tx.send(&ch, &[Peer(joiner.encryption)], &Outbound::Peer(sealed)).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(true)
+}
+
+/// A join request relay sender `from` sealed to the creator `me` for one of the `waiting`
+/// vaults on `session`: the joiner's identity, the context to answer under, and the request.
+fn open_join(me: &Identity, waiting: &[String], session: Uuid, from: &[u8; 32], wire: &[u8])
+    -> Option<(PublicIdentity, SessionContext, Value)>
+{
+    let (joiner, sealed) = SealedPeer::join_sender(from, wire).ok()?;
+    waiting.iter().find_map(|vault| {
+        let context = join_context(vault, session, joiner.id).ok()?;
+        let opened = me.open_session(&joiner, &context, sealed).ok()?;
+        let body: Value = serde_json::from_slice(opened.body()).ok()?;
+        if opened.kind() != MessageKind::PeerRequest || body["vault"] != vault.as_str() || body["slot"] != joiner.id {
+            return None;
+        }
+        Some((joiner.clone(), context, body))
+    })
+}
+
+/// The creator's answer to one joiner request: the same logic as the HTTP routes.
+fn answer_join(st: &Shared, data: &Path, pass: &str, joiner: &PublicIdentity, body: Value) -> Result<Value, String> {
+    let vault = body["vault"].as_str().ok_or("missing vault")?.to_owned();
+    let token = body["token"].as_str().ok_or("missing token")?;
+    match body["op"].as_str() {
+        Some("enroll") => enroll_member(st, data, pass, &vault, joiner.id, token, WireIdentity::from_public(joiner.clone())),
+        Some("roster") => roster_reply(data, pass, &body),
+        Some("agreed") => {
+            let reply = agreed_member(st, data, pass, &body, joiner.id)?;
+            spawn_dkg(st.clone(), vault, data.to_owned(), Zeroizing::new(pass.to_owned()));
+            Ok(reply)
+        }
+        Some("session") => session_reply(data, pass, &body),
+        _ => Err("unknown join request".into()),
     }
 }
 
@@ -1163,9 +1353,7 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
                 if st.session.blocking_read().is_none() {
                     return Ok(json!({"ok":true}));
                 }
-                match peer_request_result(
-                    &st.config, &c.creator_base_url, "/api/session", joiner_auth(&c)?,
-                ) {
+                match ask_creator(&st.config, data, pass, &c, "session") {
                     Ok(response) => {
                         let id = response["session_id"].as_str()
                             .and_then(|id| Uuid::parse_str(id).ok()).ok_or("invalid creator session")?;
@@ -1378,6 +1566,7 @@ mod tests {
             error: None,
             birth_height: None,
             roster_code: None,
+            creator: None,
         };
         let fingerprint = roster_of(&c).unwrap().fingerprint();
         assert_eq!(fingerprint, roster_of(&c).unwrap().fingerprint());
@@ -1400,7 +1589,7 @@ mod tests {
             my_slot: 1, creator_base_url: String::new(), frostd_url: String::new(),
             slots, fingerprint: Some("fingerprint".into()), agreed: BTreeSet::new(),
             session_id: None, coordinator_peer: None, vs_session_id: None,
-            dkg_started: true, error: None, birth_height: None, roster_code: None,
+            dkg_started: true, error: None, birth_height: None, roster_code: None, creator: None,
         };
         save(&data, "pass", &ceremony).unwrap();
         let st = std::sync::Arc::new(AppState::new(Config {
@@ -1557,6 +1746,127 @@ mod tests {
             assert_eq!(invite.creator_base_url, "https://creator.example");
         }
         std::fs::remove_dir_all(data).unwrap();
+    }
+
+    /// The creator answers only a join request sealed by the identity it names, for a vault it
+    /// is setting up, and only with that slot's invite token.
+    #[tokio::test]
+    async fn a_forged_or_wrong_token_join_request_is_refused() {
+        let data = std::env::temp_dir().join(format!("loki-join-forged-{}", Uuid::new_v4()));
+        let st = member(&data, 3601, None).await;
+        let created = create(State(st.clone()), Json(json!({"name":"test","members":3,"threshold":2}))).await;
+        let vault = created.1 .0["vault"].as_str().unwrap().to_owned();
+        let invite: Invite = serde_json::from_slice(&base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(created.1 .0["invites"][0]["code"].as_str().unwrap()).unwrap()).unwrap();
+        let creator = identity(&data, "pass", 1).unwrap();
+        assert!(invite.creator == Some(WireIdentity::from_public(creator.public())));
+        let (joiner, attacker) = (Identity::new(2), Identity::new(2));
+        let session = Uuid::new_v4();
+        let context = join_context(&vault, session, 2).unwrap();
+        let body = json!({"op":"enroll","vault":vault,"slot":2,"token":invite.token});
+        let wire = |own: &Identity, context: &SessionContext, body: &Value| {
+            Outbound::Peer(SealedPeer::seal_join(own, &creator.public(), context, &serde_json::to_vec(body).unwrap()).unwrap())
+                .to_bytes().unwrap()
+        };
+        let from = joiner.public().encryption;
+        let honest = wire(&joiner, &context, &body);
+        assert!(open_join(&creator, &[vault.clone()], session, &from, &honest).is_some());
+
+        // Sealed by another key than the relay sender's, signed by another key than the one it
+        // names, unsealed, for another session, or naming another slot: none opens.
+        let mut renamed = wire(&attacker, &context, &body);
+        renamed[2..34].copy_from_slice(&joiner.public().signing);
+        let mut unsealed = honest[..34].to_vec();
+        unsealed.extend(serde_json::to_vec(&body).unwrap());
+        let mut other_slot = honest.clone();
+        other_slot[..2].copy_from_slice(&3u16.to_be_bytes());
+        for (from, forged) in [
+            (from, wire(&attacker, &context, &body)),
+            (attacker.public().encryption, renamed),
+            (from, unsealed),
+            (from, wire(&joiner, &join_context(&vault, Uuid::new_v4(), 2).unwrap(), &body)),
+            (from, other_slot),
+        ] {
+            assert!(open_join(&creator, &[vault.clone()], session, &from, &forged).is_none());
+        }
+        assert!(open_join(&creator, &[hex::encode([1u8; 32])], session, &from, &honest).is_none());
+
+        let (joiner_public, _, _) = open_join(&creator, &[vault.clone()], session, &from, &honest).unwrap();
+        for (op, error) in [("enroll", "invalid invite token"), ("roster", "invalid member token"), ("session", "invalid member token")] {
+            let wrong = json!({"op":op,"vault":vault,"slot":2,"token":tokens_other(&invite.token)});
+            assert_eq!(answer_join(&st, &data, "pass", &joiner_public, wrong).unwrap_err(), error);
+        }
+        assert!(load(&data, "pass", &vault).unwrap().slots[&2].identity.is_none());
+        assert_eq!(answer_join(&st, &data, "pass", &joiner_public, body).unwrap(), json!({"ok":true}));
+        assert!(load(&data, "pass", &vault).unwrap().slots[&2].identity == Some(WireIdentity::from_public(joiner.public())));
+        *st.session.write().await = None;
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    /// A token of the same length that differs in its last byte.
+    fn tokens_other(token: &str) -> String {
+        format!("{}{}", &token[..token.len() - 1], if token.ends_with('A') { 'B' } else { 'A' })
+    }
+
+    /// Two joiners on their own data dirs join, agree and finish DKG with the creator over
+    /// frostd alone: the invite's HTTP URL is a closed port. Needs `FROSTD_URL`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_join_completes_over_frostd_without_the_creators_http_routes() {
+        let Ok(url) = std::env::var("FROSTD_URL") else {
+            eprintln!("FROSTD_URL unset; skipped");
+            return;
+        };
+        let root = std::env::temp_dir().join(format!("loki-join-relay-{}", Uuid::new_v4()));
+        let mut members = Vec::new();
+        for name in ["creator", "joiner2", "joiner3"] {
+            let data = root.join(name);
+            std::fs::create_dir_all(&data).unwrap();
+            let config = Config { frostd_url: url.clone(), advertise_url: Some("http://127.0.0.1:9".into()), ..test_config(&data, 3601) };
+            let st = std::sync::Arc::new(AppState::new(config));
+            *st.session.write().await = Some(Session { passphrase: Zeroizing::new("pass".into()), data });
+            members.push(st);
+        }
+        // Locking ends every member's waits, so the runtime stops even when an assertion fails.
+        struct LockOnDrop(Vec<Shared>);
+        impl Drop for LockOnDrop {
+            fn drop(&mut self) {
+                for st in &self.0 {
+                    if let Ok(mut session) = st.session.try_write() { *session = None; }
+                }
+            }
+        }
+        let _lock = LockOnDrop(members.clone());
+        let created = create(State(members[0].clone()), Json(json!({"name":"relay","members":3,"threshold":2}))).await;
+        assert_eq!(created.0, StatusCode::OK, "{}", created.1 .0);
+        let vault = created.1 .0["vault"].as_str().unwrap().to_owned();
+        for slot in 2..=3usize {
+            let code = created.1 .0["invites"].as_array().unwrap().iter()
+                .find(|item| item["slot"] == slot).unwrap()["code"].as_str().unwrap();
+            let invite: Invite = serde_json::from_slice(&base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(code).unwrap()).unwrap();
+            assert_eq!(invite.creator_base_url, "http://127.0.0.1:9");
+            let reply = join(State(members[slot - 1].clone()), Json(json!({"invite":code}))).await;
+            assert_eq!(reply.0, StatusCode::OK, "{}", reply.1 .0);
+        }
+        for st in &members {
+            let (fingerprint, code, _) = compare(st, &vault).await;
+            let reply = agree(State(st.clone()), agree_body(&vault, &fingerprint, &code)).await;
+            assert_eq!(reply.0, StatusCode::OK, "{}", reply.1 .0);
+        }
+        let mut addresses = BTreeSet::new();
+        for st in &members {
+            let deadline = std::time::Instant::now() + Duration::from_secs(180);
+            loop {
+                let reply = status(st.clone(), vault.clone()).await.1 .0;
+                if reply["phase"] == "active" { break; }
+                assert!(reply.get("error").is_none() && std::time::Instant::now() < deadline, "{reply}");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            let query = BTreeMap::from([("vault".to_owned(), vault.clone())]);
+            addresses.insert(address(State(st.clone()), Query(query)).await.1 .0["address"].as_str().unwrap().to_owned());
+        }
+        assert_eq!(addresses.len(), 1, "{addresses:?}");
+        drop(_lock);
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -1733,7 +2043,15 @@ mod tests {
                 .find(|item| item["slot"] == slot).unwrap()["code"].as_str().unwrap().to_owned();
             invites.insert(slot, code.clone());
             let reply = match (slot, joiner) {
-                (2, Some(joiner)) => join(State(joiner.clone()), Json(json!({"invite":code}))).await,
+                // An invite without the creator's identity: the joiner reaches the creator over
+                // HTTP, so the test needs no relay.
+                (2, Some(joiner)) => {
+                    let mut fields: Value = serde_json::from_slice(
+                        &base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&code).unwrap()).unwrap();
+                    fields.as_object_mut().unwrap().remove("creator");
+                    let code = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(fields.to_string());
+                    join(State(joiner.clone()), Json(json!({"invite":code}))).await
+                }
                 _ => {
                     let invite: Invite = serde_json::from_slice(
                         &base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&code).unwrap()).unwrap();
@@ -2829,6 +3147,7 @@ pub(super) fn restore_opened_backup(backup: RecoveryBackup, data: &Path, dest: &
         error: None,
         birth_height: material.birth_height,
         roster_code: None,
+        creator: None,
     };
     // The ceremony records the relay roster's fingerprint, not the setup document's.
     let fingerprint = hex::encode(roster_of(&ceremony)?.fingerprint());
