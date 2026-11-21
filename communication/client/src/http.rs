@@ -221,7 +221,25 @@ impl RelayHttp {
         expires: u64,
         retire: bool,
     ) -> ClientResult<CreationResult> {
-        let request = loki_relay_protocol::http::encode_setup_control(creation, expires, retire)?;
+        use loki_relay_protocol::http::NamespaceAction;
+        let action = if retire {
+            NamespaceAction::RetireSetup
+        } else {
+            NamespaceAction::ReserveSetup
+        };
+        self.namespace_control(route, provision, creation, expires, action)
+            .await
+    }
+    pub async fn namespace_control(
+        &self,
+        route: &RelayRoute,
+        provision: &Secret32,
+        creation: &[u8],
+        expires: u64,
+        action: loki_relay_protocol::http::NamespaceAction,
+    ) -> ClientResult<CreationResult> {
+        let request =
+            loki_relay_protocol::http::encode_namespace_control(creation, expires, action)?;
         let creation = decode_creation(creation)?;
         let (status, body) = self.control(route, provision, &request, "/setup").await?;
         if status != 200 && status != 201 {

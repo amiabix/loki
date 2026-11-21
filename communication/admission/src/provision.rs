@@ -80,14 +80,14 @@ impl OwnedProvisioner {
             .is_ok();
         let success = if !authenticated {
             false
-        } else if intent.purpose() == 1 {
+        } else if let Some(action) = intent.action {
             self.http
-                .setup_control(
+                .namespace_control(
                     &route,
                     &self.credentials[index],
                     intent.request(),
                     intent.expires(),
-                    intent.retire(),
+                    action,
                 )
                 .await
                 .is_ok()

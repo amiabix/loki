@@ -641,7 +641,7 @@ async fn control_request(
         return Err(RelayError::MalformedRequest);
     }
     if uri.path().ends_with("/setup") {
-        loki_relay_protocol::http::decode_setup_control(&body)?;
+        loki_relay_protocol::http::decode_namespace_control(&body)?;
         let result = db
             .setup_control(mailbox, body.to_vec(), capability)?
             .receive()
