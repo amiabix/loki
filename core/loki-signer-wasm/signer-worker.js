@@ -22,7 +22,7 @@ import {
   opfsCloseAll,
 } from "./pkg/snippets/loki-signer-core-8724841f4db15c9f/js/opfs_fs.js";
 import { blockRange, latestHeight } from "./lightwalletd.js";
-import { controlInbox, endsRequest, idbStore } from "./control-inbox.js";
+import { controlInbox, endsRequest, idbStore, MAX_CONTROL_SESSIONS } from "./control-inbox.js";
 import { vaultSummary, saveVaultName, readVaultName } from "./vault-list.js";
 
 // Ops run concurrently (a status read during a join), and two pre-opens of one path racing
@@ -289,11 +289,10 @@ async function chainScan(signer, p) {
 async function paymentStatus(signer, p) {
   const vault = await openVault(signer, p.vaultHex);
   const control = await frostdClient(signer, p);
-  const { notices } = await findPayment(signer, control, vault, p.attemptHex, p);
-  const terms = notices[notices.length - 1].intent;
-  checkTerms(terms);
-  const ended = notices.find((n) => n.kind === "cancelled" || n.kind === "failed")?.kind ?? null;
-  const signers = notices.find((n) => n.kind === "start" && n.intent.signers?.length)?.intent.signers ?? [];
+  const { notice, start } = await findPayment(signer, control, vault, p.attemptHex, p);
+  const terms = notice.intent;
+  const ended = notice.kind === "cancelled" || notice.kind === "failed" ? notice.kind : null;
+  const signers = start?.intent.signers ?? [];
   await chainScan(signer, p);
   const spent = JSON.parse(signer.scanSpentBy(terms.note_selection[0]));
   return { terms, signers, ended, spent };
@@ -304,9 +303,7 @@ async function paymentStatus(signer, p) {
 async function paymentTerms(signer, p) {
   const vault = await openVault(signer, p.vaultHex);
   const control = await frostdClient(signer, p);
-  const { notices } = await findPayment(signer, control, vault, p.attemptHex, p);
-  const t = notices[notices.length - 1].intent;
-  checkTerms(t);
+  const { notice: { intent: t } } = await findPayment(signer, control, vault, p.attemptHex, p);
   return { review_token: p.attemptHex, recipient: t.recipient, amount_zat: String(t.amount_zat), fee_zat: String(t.fee_zat), memo: t.memo };
 }
 
@@ -320,57 +317,175 @@ async function frostdClient(signer, p) {
   return fc;
 }
 
-// Drain this member's inbox on a payment control session and open each sealed message under
-// the confirmed roster. Anything that does not open (a non-member, another session) is dropped.
-// Returns every message opened on that session so far (control-inbox.js), not just new ones.
 const controlHistory = controlInbox(idbStore());
-async function readControl(signer, control, sessionId) {
-  const raw = await controlHistory(sessionId, async () => {
+// These are control states, not evidence of a finalized or mined transaction.
+const noticeOrder = ["intent", "start", "signed", "broadcast", "confirmed", "failed", "cancelled"];
+// PeerReply permits a 64 KiB body, which can round up to a 128 KiB sealed bucket.
+const MAX_CONTROL_WIRE = 2 * (128 * 1024 + 53);
+const MAX_CONTROL_BATCH = 256;
+const hex32 = (s) => typeof s === "string" && /^[0-9a-f]{64}$/.test(s);
+const uuid = (s) => typeof s === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(s);
+const txHex = (s) => typeof s === "string" && s.length % 2 === 0 && /^[0-9a-f]+$/.test(s);
+
+function openNotice(signer, vault, sessionId, owner, wire) {
+  try {
+    const { from, body } = JSON.parse(signer.openControl(sessionId, wire.from, wire.message));
+    const { kind, hash, intent: i, txid, pczt, raw_tx } = JSON.parse(body);
+    if (from !== owner.id || !noticeOrder.includes(kind) || !hex32(hash)
+      || (kind !== "signed" && wire.message.length > 16 * 1024)
+      || !i || i.proposer !== from || i.vault !== vault.vault_id || !hex32(i.attempt)
+      || i.control_session_id !== sessionId || !uuid(i.session_id) || i.session_id === sessionId
+      || typeof i.phase !== "string" || typeof i.recipient !== "string" || !i.recipient.length
+      || typeof i.memo !== "string" || new TextEncoder().encode(i.memo).length > 512
+      || ![i.amount_zat, i.fee_zat, i.change_zat].every((n) => Number.isSafeInteger(n) && n >= 0 && n <= 2_100_000_000_000_000)
+      || !i.amount_zat || ![i.target_height, i.expiry_height].every((h) => Number.isInteger(h) && h >= 0 && h <= 0xffffffff)
+      || i.expiry_height <= i.target_height || !Array.isArray(i.note_selection)
+      || i.note_selection.length !== 1 || !hex32(i.note_selection[0])) return null;
+    if (i.replaces !== undefined && (!hex32(i.replaces?.attempt) || typeof i.replaces.cancel !== "boolean")) return null;
+    if (!Array.isArray(i.signers)) return null;
+    const validGroup = i.signers.length === vault.threshold
+      && i.signers[0] === from && new Set(i.signers).size === vault.threshold
+      && i.signers.every((slot) => vault.members.some((m) => m.id === slot));
+    // Older starts did not fix a separate expiry; they used the approved bound.
+    const fixesGroup = kind === "start" || kind === "signed";
+    const expiry = i.signing_expiry ?? (fixesGroup ? i.expiry_height : undefined);
+    if ((i.signers.length || fixesGroup) && !validGroup
+      || (expiry != null && (!Number.isInteger(expiry) || expiry <= i.target_height || expiry > i.expiry_height))) return null;
+    const sent = kind === "signed" || kind === "broadcast" || kind === "confirmed";
+    if ((sent || txid != null) && !hex32(txid)) return null;
+    if (kind === "signed" && (!txHex(pczt) || !txHex(raw_tx))) return null;
+    // This projection matches the native hash's immutable fields; phase, group and actual
+    // signing expiry are excluded. Compare the terms too, not just the proposer's hash label.
+    const intent = {
+      vault: i.vault, attempt: i.attempt, proposer: from, session_id: i.session_id, control_session_id: sessionId,
+      recipient: i.recipient, memo: i.memo, amount_zat: i.amount_zat, fee_zat: i.fee_zat, change_zat: i.change_zat,
+      target_height: i.target_height, expiry_height: i.expiry_height, note_selection: i.note_selection,
+      ...(i.replaces && { replaces: { attempt: i.replaces.attempt, cancel: i.replaces.cancel } }),
+    };
+    return {
+      from, kind, hash, txid, ...(kind === "signed" && { pczt }),
+      termsKey: JSON.stringify(intent),
+      intent: { ...intent, phase: i.phase, signers: i.signers, signing_expiry: expiry },
+    };
+  } catch { return null; } // Authentication or decoding failed.
+}
+
+function selectNotices(signer, vault, sessionId, owner, wires) {
+  let notice, start, signed;
+  for (const wire of wires) {
+    const event = openNotice(signer, vault, sessionId, owner, wire);
+    if (!event || (notice && (event.hash !== notice.event.hash || event.termsKey !== notice.event.termsKey))) continue;
+    if (event.kind === "start" || event.kind === "signed") {
+      const fixed = (start ?? signed)?.event.intent;
+      if (fixed && (event.intent.signing_expiry !== fixed.signing_expiry
+        || String(event.intent.signers) !== String(fixed.signers))) continue;
+    }
+    const entry = { wire, event };
+    if (event.kind === "start") start ??= entry;
+    if (event.kind === "signed") signed ??= entry;
+    if (!notice || noticeOrder.indexOf(event.kind) > noticeOrder.indexOf(notice.event.kind)) notice = entry;
+  }
+  if (!notice) return null;
+  return {
+    notice: notice.event, start: start?.event, signed: signed?.event,
+    wires: [...new Set([start?.wire, signed?.wire, notice.wire].filter(Boolean))],
+  };
+}
+
+function controlOwner(vault, info) {
+  const participants = new Set(info.participants);
+  if (info.participants.length !== vault.members.length || !vault.members.every((m) => participants.has(m.encryption))) return null;
+  return vault.members.find((m) => m.id !== vault.slot && m.encryption === info.coordinator);
+}
+
+// Match the whole roster before draining. If two local vaults share a roster, try the other
+// vault before discarding its one-shot notice; the sealed envelope binds the actual vault.
+async function readControl(signer, control, vault, sessionId, owner, scope, info) {
+  let reduced = null;
+  await controlHistory([scope, sessionId], async (saved) => {
+    if (saved.blocked || saved.vault && saved.vault !== vault.vault_id || saved.wires.length > MAX_CONTROL_BATCH) return [];
     control.useSession(sessionId);
     return JSON.parse(await control.recv());
+  }, async (saved, fresh) => {
+    if (saved.vault && saved.vault !== vault.vault_id) return saved;
+    const unique = new Map();
+    let bytes = 0;
+    let blocked = saved.blocked ?? false;
+    for (const batch of [saved.wires, fresh]) {
+      if (batch.length > MAX_CONTROL_BATCH) blocked = true;
+      for (const wire of batch.slice(0, MAX_CONTROL_BATCH)) {
+        const msg = wire?.message;
+        if (wire?.from !== owner.encryption || typeof msg !== "string" || !msg.length
+          || msg.length > MAX_CONTROL_WIRE || unique.has(msg)) continue;
+        bytes += msg.length;
+        if (bytes > 4 * 1024 * 1024) { blocked = true; break; }
+        unique.set(msg, { from: owner.encryption, message: msg });
+      }
+    }
+    const wires = [...unique.values()];
+    const record = (name, state) => ({
+      vault: name, wires: state.wires, blocked,
+      // Don't discard legacy data if only a prefix could be checked.
+      migrated: !blocked && !saved.vault && saved.wires.some((w) => state.wires.some((m) => m.message === w?.message)),
+    });
+    reduced = selectNotices(signer, vault, sessionId, owner, wires);
+    if (!reduced && info && wires.length && !saved.vault) {
+      const dir = await vaultDirectory();
+      try {
+        if (dir) for await (const [name, h] of dir.entries()) {
+          if (name === vault.vault_id || h.kind !== "directory" || !hex32(name)) continue;
+          let other;
+          try { other = await openVault(signer, name); } catch { continue; }
+          const proposer = controlOwner(other, info);
+          if (!proposer) continue;
+          const match = selectNotices(signer, other, sessionId, proposer, wires);
+          if (match) return record(name, match);
+        }
+      } finally { await openVault(signer, vault.vault_id); }
+    }
+    if (!reduced) return saved;
+    // A destructive read went over budget. A dropped terminal event could make the
+    // retained start stale, so never authorize signing from this partial record.
+    reduced.blocked = blocked;
+    if (saved.vault && blocked === saved.blocked && reduced.wires.length === saved.wires.length
+      && reduced.wires.every((wire, i) => wire.message === saved.wires[i].message)) return saved;
+    return record(vault.vault_id, reduced);
   });
-  const out = [];
-  for (const m of raw) {
-    try {
-      const { from, body } = JSON.parse(signer.openControl(sessionId, m.from, m.message));
-      out.push({ from, ...JSON.parse(body) });
-    } catch { /* not a control message sealed to this member */ }
-  }
-  return out;
+  return reduced;
 }
 
-// A proposer notice about this payment: the sender is the proposer and the session ids match.
-function aboutPayment(msg, vault, attemptHex, controlSessionId) {
-  const i = msg.intent;
-  return i && msg.from === i.proposer && i.attempt === attemptHex && i.vault === vault.vault_id
-    && i.control_session_id === controlSessionId && i.session_id && i.session_id !== controlSessionId;
+const controlScope = (signer, p) => JSON.stringify([p.frostdUrl, signer.frostdPubkey()]);
+
+async function controlSessions(control, scope) {
+  const ids = await control.list_sessions();
+  if (ids.length > MAX_CONTROL_SESSIONS) throw new Error("too many relay sessions to check for payments");
+  const live = new Set(ids);
+  await controlHistory.prune(scope, live);
+  return live;
 }
 
-// Find the payment's control session the way native members do (payment.rs `sync_control`):
-// a session a vault member opened with every member as a participant, where that member sealed
-// a notice about this attempt. A signing session is opened by a one-shot coordinator key, so it
-// never matches. Notices already drained there are kept (readControl), and other payments'
-// sessions are read once and skipped.
+// A signing session has a one-shot coordinator, not a confirmed vault member.
 async function findPayment(signer, control, vault, attemptHex, p) {
-  const ids = new Map(vault.members.map((m) => [m.encryption, m.id]));
+  const scope = controlScope(signer, p);
   const skip = new Set();
   const pollMs = Number(p.findPollMs) || 2000;
   const maxTicks = Number(p.findMaxTicks) || 30;
   for (let tick = 0; tick < maxTicks; tick++) {
-    for (const sessionId of await control.list_sessions()) {
+    for (const sessionId of await controlSessions(control, scope)) {
       if (skip.has(sessionId)) continue;
       control.useSession(sessionId);
       const info = JSON.parse(await control.sessionInfo());
-      const owner = ids.get(info.coordinator);
-      if (owner === undefined || owner === vault.slot
-        || info.participants.length !== ids.size || !info.participants.every((k) => ids.has(k))) {
+      const owner = controlOwner(vault, info);
+      if (!owner) {
         skip.add(sessionId);
         continue;
       }
-      const msgs = await readControl(signer, control, sessionId);
-      const notices = msgs.filter((m) => m.from === owner && aboutPayment(m, vault, attemptHex, sessionId));
-      if (notices.length > 0) return { controlSessionId: sessionId, notices };
-      if (msgs.length > 0) skip.add(sessionId);
+      const state = await readControl(signer, control, vault, sessionId, owner, scope, info);
+      if (state?.notice.intent.attempt === attemptHex) {
+        if (state.blocked) throw new Error("this payment's notice history exceeded the inbox limit");
+        return { controlSessionId: sessionId, ...state };
+      }
+      if (state) skip.add(sessionId);
     }
     await sleep(pollMs);
   }
@@ -383,31 +498,34 @@ async function findPayment(signer, control, vault, attemptHex, p) {
 async function listPending(signer, vaultHex, p) {
   const vault = await openVault(signer, vaultHex);
   const control = await frostdClient(signer, p);
-  const ids = new Map(vault.members.map((m) => [m.encryption, m.id]));
+  const scope = controlScope(signer, p);
   const pending = new Map();
-  for (const sessionId of await control.list_sessions()) {
+  for (const sessionId of await controlSessions(control, scope)) {
     control.useSession(sessionId);
     const info = JSON.parse(await control.sessionInfo());
-    const owner = ids.get(info.coordinator);
-    if (owner === undefined || owner === vault.slot
-      || info.participants.length !== ids.size || !info.participants.every((k) => ids.has(k))) continue;
-    for (const m of await readControl(signer, control, sessionId)) {
-      const i = m.intent;
-      if (m.from !== owner || !i || !/^[0-9a-f]{64}$/.test(i.attempt ?? "") || !aboutPayment(m, vault, i.attempt, sessionId)) continue;
-      if (endsRequest(m, vault.slot)) { pending.set(i.attempt, null); continue; }
-      if (pending.get(i.attempt) === null) continue;
-      pending.set(i.attempt, { attempt: i.attempt, amount_zat: String(i.amount_zat), recipient: i.recipient, proposer: i.proposer });
-    }
+    const owner = controlOwner(vault, info);
+    if (!owner) continue;
+    const state = await readControl(signer, control, vault, sessionId, owner, scope, info);
+    if (!state) continue;
+    const { notice: m } = state;
+    const i = m.intent;
+    if (state.blocked || endsRequest(m, vault.slot)) { pending.set(i.attempt, null); continue; }
+    if (pending.get(i.attempt) === null) continue;
+    pending.set(i.attempt, { attempt: i.attempt, amount_zat: String(i.amount_zat), recipient: i.recipient, proposer: m.from });
   }
   return [...pending.values()].filter(Boolean);
 }
 
+async function vaultDirectory() {
+  try {
+    return await (await (await navigator.storage.getDirectory()).getDirectoryHandle("loki")).getDirectoryHandle("vaults");
+  } catch { return null; } // no vault yet
+}
+
 // Every vault this browser holds a signer for, from its own OPFS (loki/vaults/<id>/signer).
 async function listVaults(signer) {
-  let dir;
-  try {
-    dir = await (await (await navigator.storage.getDirectory()).getDirectoryHandle("loki")).getDirectoryHandle("vaults");
-  } catch { return []; } // no vault yet
+  const dir = await vaultDirectory();
+  if (!dir) return [];
   const out = [];
   for await (const [name, h] of dir.entries()) {
     if (h.kind !== "directory" || !/^[0-9a-f]{64}$/.test(name)) continue;
@@ -418,18 +536,15 @@ async function listVaults(signer) {
   return out;
 }
 
-// The proposer's latest word on the signing group: `start` names it and fixes the signing
-// expiry (outside the intent hash, like the group), `cancelled` and `failed` end the request.
-// Plain `intent` re-announcements change nothing.
-function groupFrom(notices) {
-  for (const n of notices) {
-    if (n.kind === "cancelled") throw new Error("the proposer cancelled this payment");
-    if (n.kind === "failed") throw new Error("the proposer could not complete this payment");
-    if (n.kind === "start" && n.intent.signers?.length) {
-      return { signers: n.intent.signers, signingExpiry: n.intent.signing_expiry ?? null };
-    }
+function activeGroup({ notice, start, blocked }, slot) {
+  if (blocked) throw new Error("this payment's notice history exceeded the inbox limit");
+  if (endsRequest(notice, slot)) {
+    if (notice.kind === "cancelled") throw new Error("the proposer cancelled this payment");
+    if (notice.kind === "failed") throw new Error("the proposer could not complete this payment");
+    if (notice.kind === "start") throw new Error("enough members already approved this payment");
+    throw new Error("the proposer ended this signing request");
   }
-  return null;
+  return start?.intent;
 }
 
 // Drive this NON-proposer member through one payment signing attempt over frostd, mirroring
@@ -451,33 +566,32 @@ async function drivePayment(signer, p) {
   signer.setNonceWitnesses(JSON.stringify(p.nonceWitnesses.map(({ key, run, mailbox }) => ({ key, run, mailbox }))));
   const vault = await openVault(signer, vaultHex);
   const control = await frostdClient(signer, p);
-  const { controlSessionId, notices } = await findPayment(signer, control, vault, attemptHex, p);
-  const announced = notices[notices.length - 1];
+  const { controlSessionId, notice: announced, start } = await findPayment(signer, control, vault, attemptHex, p);
   const proposer = vault.members.find((m) => m.id === announced.from);
-
   const terms = announced.intent;
-  checkTerms(terms);
+  const scope = controlScope(signer, p);
+  const refresh = async () => {
+    const state = await readControl(signer, control, vault, controlSessionId, proposer, scope);
+    if (!state || state.notice.hash !== announced.hash || state.notice.termsKey !== announced.termsKey) {
+      throw new Error("the payment's approved terms are no longer available");
+    }
+    return activeGroup(state, vault.slot);
+  };
 
   // Approve on the control session: a sealed {kind:"approval"} for the terms the proposer
   // announced, which the proposer records (payment.rs `sync_control`). Durable at frostd. The
   // member sees those terms on the signer page first; declining sends nothing.
-  let group = groupFrom(notices);
-  if (group && !group.signers.includes(vault.slot)) throw new Error("enough members already approved this payment");
+  let group = activeGroup({ notice: announced, start }, vault.slot);
   if (!group) {
     if (!await ask("payment-terms", terms)) throw new Error("You declined this payment request");
-    const approval = JSON.stringify({ kind: "approval", hash: announced.hash, intent: terms, txid: null });
-    await control.sendToPeer(proposer.encryption, signer.sealControl(controlSessionId, proposer.id, approval));
-    group = await waitForSigningGroup(signer, control, vault, attemptHex, controlSessionId, proposer.id, p);
+    group = await refresh();
+    if (!group) {
+      const approval = JSON.stringify({ kind: "approval", hash: announced.hash, intent: terms, txid: null });
+      await control.sendToPeer(proposer.encryption, signer.sealControl(controlSessionId, proposer.id, approval));
+      group = await waitForSigningGroup(refresh, p);
+    }
   }
-  const { signers, signingExpiry } = group;
-  if (!signers.includes(vault.slot)) return { approved: true, signed: false };
-  // The transaction's real expiry is fixed by `start` (about seven days above the proposer's
-  // tip) and must lie above the anchor and no later than the approved bound (payment.rs
-  // `check_intent`). Without one, the approved bound is the expiry.
-  const expiry = signingExpiry ?? terms.expiry_height;
-  if (!Number.isSafeInteger(expiry) || expiry <= terms.target_height || expiry > terms.expiry_height) {
-    throw new Error("the proposer's signing expiry is outside the approved terms");
-  }
+  const { signers, signing_expiry: expiry } = group;
 
   // The signing session's coordinator is the one-shot key that opened it.
   const fc = await frostdClient(signer, p);
@@ -496,6 +610,7 @@ async function drivePayment(signer, p) {
   await opfsPreopenWrite(`${dir}/nonces/${nonceId}.burn`);
 
   // Round 1: emit this member's public commitment to the coordinator.
+  await refresh();
   await fc.sendToCoordinator(signer.signCommit(attemptHex));
 
   // Collect the three inbound messages: the sealed candidate (from the proposer) and the
@@ -529,6 +644,7 @@ async function drivePayment(signer, p) {
   const review = JSON.parse(signer.paymentCheck(candidateHex, JSON.stringify({ ...terms, tx_expiry: expiry })));
   const consent = await ask("payment-sign", review);
   if (!consent) throw new Error("You declined to sign this payment");
+  await refresh();
   signer.reauth(consent.method, consent.passphrase, consent.prfSecret);
   await claimAtWitnesses(signer, p.nonceWitnesses, packageHex, seedHex, review.sighash);
   const share = signer.signApprove(attemptHex, candidateHex, packageHex, seedHex, review.sighash, JSON.stringify({ ...terms, tx_expiry: expiry }));
@@ -536,26 +652,14 @@ async function drivePayment(signer, p) {
   return { approved: true, signed: true, review };
 }
 
-// The announced terms, shape-checked before they are shown (payment.rs `check_intent`). The
-// wasm `paymentCheck` re-checks every value against the candidate itself.
-function checkTerms(t) {
-  const ok = t && typeof t.recipient === "string" && typeof t.memo === "string"
-    && [t.amount_zat, t.fee_zat, t.change_zat, t.target_height, t.expiry_height].every(Number.isSafeInteger)
-    && t.amount_zat > 0 && t.expiry_height > t.target_height
-    && Array.isArray(t.note_selection) && t.note_selection.length === 1;
-  if (!ok) throw new Error("the proposer announced invalid payment terms");
-}
-
 // Wait on the control session until the proposer names the signing group. Nothing secret is
 // committed while waiting, so giving up here is safe: approving again resumes the wait.
-async function waitForSigningGroup(signer, control, vault, attemptHex, controlSessionId, proposerId, p) {
+async function waitForSigningGroup(refresh, p) {
   const pollMs = Number(p.groupPollMs) || 2000;
   const maxTicks = Number(p.groupMaxTicks) || 900; // 30 minutes at the default poll
   for (let tick = 0; tick < maxTicks; tick++) {
     await sleep(pollMs);
-    const notices = (await readControl(signer, control, controlSessionId))
-      .filter((m) => m.from === proposerId && aboutPayment(m, vault, attemptHex, controlSessionId));
-    const group = groupFrom(notices);
+    const group = await refresh();
     if (group) return group;
   }
   throw new Error("Your approval is recorded, but not enough members approved yet. Open this payment again later to sign.");
