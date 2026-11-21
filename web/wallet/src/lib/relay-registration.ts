@@ -2,8 +2,12 @@ import { createPrivateKey, createPublicKey, diffieHellman, generateKeyPairSync, 
 
 const FIELD_PRIME = Buffer.from("7f" + "ff".repeat(30) + "ed", "hex");
 
-export function newRelayChallenge() {
-  const { privateKey, publicKey } = generateKeyPairSync("x25519");
+export function newRelayChallenge(seed?: Buffer) {
+  const privateKey = seed ? createPrivateKey({
+    key: Buffer.concat([Buffer.from("302e020100300506032b656e04220420", "hex"), seed]),
+    format: "der", type: "pkcs8",
+  }) : generateKeyPairSync("x25519").privateKey;
+  const publicKey = createPublicKey(privateKey);
   return {
     publicKey: Buffer.from(publicKey.export({ format: "jwk" }).x!, "base64url").toString("hex"),
     privateKey: privateKey.export({ format: "der", type: "pkcs8" }).toString("hex"),

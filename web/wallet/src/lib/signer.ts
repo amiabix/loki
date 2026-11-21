@@ -93,7 +93,8 @@ export function chainPaymentSession(r: {
     signatures_received: confirmed,
     txid: confirmed ? r.spent?.txid : null,
     spent_by: confirmed ? null : r.spent?.txid ?? null,
-    approvals: r.signers.filter((slot) => slot !== r.slot || r.approved === true),
+    // The proposer supplies the signing list; only our own stored decision proves approval here.
+    approvals: r.approved === true && r.slot !== undefined ? [r.slot] : [],
     approval_requested: r.approved === true,
     intent: { proposer: r.terms.proposer, signers: r.signers, recipient: r.terms.recipient, amount_zat: r.terms.amount_zat, fee_zat: r.terms.fee_zat, open_approval: true },
   };

@@ -1015,7 +1015,7 @@ fn outgoing_pending_count(connection: &Connection) -> ClientResult<u64> {
 const GROUP_OPEN: &str = "EXISTS (
     SELECT 1 FROM staged_sources s
     WHERE s.group_id=g.group_id
-    AND NOT EXISTS (SELECT 1 FROM source_rejections j WHERE j.root_hash=s.root_hash AND j.reason='incomplete_expired')
+    AND NOT EXISTS (SELECT 1 FROM source_rejections j WHERE j.root_hash=s.root_hash)
     AND (
         EXISTS (
             SELECT 1 FROM pending_downloads d
@@ -1032,8 +1032,7 @@ const GROUP_OPEN: &str = "EXISTS (
             )
         )
         OR (
-            NOT EXISTS (SELECT 1 FROM source_rejections j WHERE j.root_hash=s.root_hash)
-            AND NOT EXISTS (SELECT 1 FROM incoming_originals i WHERE i.source_root=s.root_hash)
+            NOT EXISTS (SELECT 1 FROM incoming_originals i WHERE i.source_root=s.root_hash)
             AND NOT EXISTS (SELECT 1 FROM incoming_conflicts c WHERE c.source_root=s.root_hash)
             AND NOT EXISTS (SELECT 1 FROM logical_records l WHERE l.source_root=s.root_hash)
             AND NOT EXISTS (SELECT 1 FROM outgoing_recipients o WHERE o.root_hash=s.root_hash)
@@ -3096,16 +3095,7 @@ impl ClientStore {
             SELECT s.root_hash,'incomplete_expired',NULL FROM staged_sources s
             JOIN incomplete_leases l ON l.group_id=s.group_id WHERE l.expires_ms<=?1 AND {ROOT_MISSING}"), [now])?;
         if expired != 0 {
-            // Retire only speculative downloads, never an advertised missing entry or
-            // a requirement still shared by another live root.
-            let abandoned = "EXISTS(SELECT 1 FROM staged_requirements r JOIN source_rejections j ON j.root_hash=r.root_hash
-                    WHERE r.hash=d.source_hash AND j.reason='incomplete_expired')
-                AND NOT EXISTS(SELECT 1 FROM staged_requirements r WHERE r.hash=d.source_hash
-                    AND NOT EXISTS(SELECT 1 FROM source_rejections j WHERE j.root_hash=r.root_hash))
-                AND NOT EXISTS(SELECT 1 FROM incoming_journal j WHERE j.relay_key=d.relay_key AND j.run=d.run
-                    AND j.mailbox=d.mailbox AND j.source_hash=d.source_hash AND j.disposition='missing')";
-            transaction.execute(&format!("DELETE FROM download_auth_wait AS d WHERE {abandoned}"), [])?;
-            transaction.execute(&format!("DELETE FROM pending_downloads AS d WHERE {abandoned}"), [])?;
+            discard_rejected_downloads(&transaction, None)?;
             transaction.execute("DELETE FROM incomplete_leases WHERE expires_ms<=?1", [now])?;
         }
         transaction.commit()?;
@@ -3367,6 +3357,10 @@ impl ClientStore {
             "INSERT INTO source_rejections VALUES(?1,?2,?3)",
             params![root, reason, body_digest],
         )?;
+        discard_rejected_downloads(&transaction, Some(root))?;
+        transaction.execute(&format!("DELETE FROM incomplete_leases AS l
+            WHERE l.group_id=(SELECT group_id FROM staged_sources WHERE root_hash=?1)
+            AND NOT EXISTS(SELECT 1 FROM staged_sources s WHERE s.group_id=l.group_id AND {ROOT_MISSING})"), [root])?;
         transaction.commit()?;
         Ok(())
     }
@@ -3375,6 +3369,19 @@ impl ClientStore {
 const ROOT_MISSING: &str = "NOT EXISTS(SELECT 1 FROM source_rejections j WHERE j.root_hash=s.root_hash)
     AND EXISTS(SELECT 1 FROM staged_requirements r WHERE r.root_hash=s.root_hash
         AND NOT EXISTS(SELECT 1 FROM ciphertext_objects c WHERE c.hash=r.hash))";
+
+fn discard_rejected_downloads(connection: &Connection, root: Option<&Id32>) -> ClientResult<()> {
+    // Retain advertised missing entries and requirements shared by any non-rejected root.
+    let abandoned = "EXISTS(SELECT 1 FROM staged_requirements r JOIN source_rejections j ON j.root_hash=r.root_hash
+            WHERE r.hash=d.source_hash AND (r.root_hash=?1 OR (?1 IS NULL AND j.reason='incomplete_expired')))
+        AND NOT EXISTS(SELECT 1 FROM staged_requirements r WHERE r.hash=d.source_hash
+            AND NOT EXISTS(SELECT 1 FROM source_rejections j WHERE j.root_hash=r.root_hash))
+        AND NOT EXISTS(SELECT 1 FROM incoming_journal j WHERE j.relay_key=d.relay_key AND j.run=d.run
+            AND j.mailbox=d.mailbox AND j.source_hash=d.source_hash AND j.disposition='missing')";
+    connection.execute(&format!("DELETE FROM download_auth_wait AS d WHERE {abandoned}"), [root])?;
+    connection.execute(&format!("DELETE FROM pending_downloads AS d WHERE {abandoned}"), [root])?;
+    Ok(())
+}
 
 fn read_ack_link(row: &rusqlite::Row<'_>) -> rusqlite::Result<AckLink> {
     Ok(AckLink {

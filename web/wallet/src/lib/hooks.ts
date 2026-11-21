@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "./api";
-import type { CeremonyStatus, Payment, StatusResponse } from "./types";
+import type { CeremonyStatus, ChainProvenance, Payment, StatusResponse } from "./types";
 
 /** Poll every 1.5s while `active` is true. Returns latest value + manual refresh. */
 function usePoll<T>(
@@ -64,8 +64,8 @@ export function useCeremonyStatus(vault: string, active: boolean) {
 }
 
 export function usePayments(vault: string, active: boolean) {
-  return usePoll<{ payments: Payment[] }>(
-    () => api<{ payments: Payment[] }>(`payments?vault=${encodeURIComponent(vault)}`),
+  return usePoll<ChainProvenance & { payments: Payment[] }>(
+    () => api(`payments?vault=${encodeURIComponent(vault)}`),
     active,
   );
 }

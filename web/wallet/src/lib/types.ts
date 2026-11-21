@@ -54,6 +54,8 @@ export type CeremonyStatus = {
 /** The stuck payment a replacement request replaces; it spends the same note. */
 export type Replaces = { attempt: string; cancel: boolean };
 
+export type ChainProvenance = { chain_trust?: "provider_reported" };
+
 export type Payment = {
   attempt: string;
   phase: string;
@@ -80,7 +82,7 @@ export type Payment = {
   signers?: number[];
 };
 
-export type PaymentSession = {
+export type PaymentSession = ChainProvenance & {
   phase: string;
   signatures_received: boolean;
   txid?: string | null;
