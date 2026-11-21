@@ -579,7 +579,7 @@ const ops = {
   },
   "payment-review": (p) => call({ op: "payment-review", payment: relay(p) }),
   "payment-approve": (p) => call({ op: "payment-approve", payment: relay(p) }),
-  pending: (p) => call({ op: "pending", payment: relay(p) }),
+  pending: (p) => call({ op: "pending", payment: { ...relay(p), lightwalletdGrpcWeb: cfg.lightwalletdGrpcWebUrl } }),
   vaults: () => call({ op: "vaults" }),
   address: (p) => call({ op: "address", payment: p }),
   chain: (p) => call({ op: "chain", payment: { ...p, lightwalletdGrpcWeb: cfg.lightwalletdGrpcWebUrl } }),

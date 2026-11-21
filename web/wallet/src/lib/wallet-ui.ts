@@ -14,7 +14,9 @@ export function invitePreview(code: string): { vault: string; name: string; memb
 
 export function paymentLabel(phase: string, ready: boolean, sending: boolean): string {
   if (phase === "confirmed") return "Confirmed";
-  if (phase === "replaced") return "Replaced · will never be sent";
+  if (phase === "replaced") return "Replaced";
+  if (phase === "spent_unverified") return "Input spent · payment unverified";
+  if (phase === "awaiting_verification") return "Awaiting transaction verification";
   if (phase === "broadcast") return "Awaiting confirmation";
   if (phase === "expired") return "Expired";
   if (phase === "failed") return "Failed · not sent";

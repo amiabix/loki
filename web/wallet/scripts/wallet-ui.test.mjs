@@ -26,7 +26,7 @@ test("pending payments never look sent and internal phase names stay hidden", ()
   assert.equal(paymentLabel("expired", true, true), "Expired");
   assert.equal(paymentLabel("signed", false, false), "Signed · not sent yet");
   assert.equal(paymentLabel("signed", false, true), "Sending");
-  assert.equal(paymentLabel("replaced", false, true), "Replaced · will never be sent");
+  assert.equal(paymentLabel("replaced", false, true), "Replaced");
   assert.equal(paymentLabel("unknown_internal_phase", false, false), "Status unavailable");
 });
 

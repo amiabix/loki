@@ -1336,12 +1336,23 @@ fn confirm_mined(args: &[String]) -> Result<(), String> {
     if member.network != VaultNetwork::Testnet {
         return Err("confirm-mined requires a Testnet wallet".into());
     }
-    let mut bytes: [u8; 32] = hex::decode(&args[4]).map_err(|_| "invalid txid")?
-        .try_into().map_err(|_| "txid must be 32 bytes")?;
-    bytes.reverse();
-    let txid = TxId::from_bytes(bytes);
-    let wallet = wallet(&member, &owner, &pass)?;
+    let requested = TxId::from_hex(&args[4]).ok_or("invalid txid")?;
+    let work = Path::new(&args[3]);
+    private_work(work)?;
+    let (context, intent) = manifest(&work.join("payment.json"), member.network)?;
+    check_manifest_roster(&member.roster, &context, &intent)?;
+    let (_, txid) = read_final_transaction(&owner, &context, &pass)?
+        .ok_or("no sealed finalized transaction for this attempt; use verify for a discovered spend")?;
+    if requested != txid {
+        return Err("txid differs from the sealed finalized transaction".into());
+    }
+    let mut wallet = wallet(&member, &owner, &pass)?;
     let height = wallet.mined_height(txid)?.ok_or("transaction is not mined in this wallet")?;
+    for input in &intent.input_nullifiers {
+        if wallet.mined_spend(input)? != Some(txid) {
+            return Err("the sealed transaction did not spend this payment's inputs on the scanned chain".into());
+        }
+    }
     let tip = wallet.scanned_height()?.ok_or("wallet has not scanned any blocks")?;
     let confirmations = tip.checked_sub(u32::from(height))
         .ok_or("wallet scan is behind the mined transaction")? + 1;

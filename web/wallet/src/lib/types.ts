@@ -70,7 +70,7 @@ export type Payment = {
   // The payment looks stuck: any member may replace it by spending the same note.
   can_replace?: boolean;
   replaces?: Replaces | null;
-  replaced_by?: string | null;
+  spent_by?: string | null;
   error?: string | null;
   txid?: string | null;
   direction?: "sent" | "received";
@@ -84,6 +84,7 @@ export type PaymentSession = {
   phase: string;
   signatures_received: boolean;
   txid?: string | null;
+  spent_by?: string | null;
   replaces?: Replaces | null;
   approvals: number[];
   approval_requested: boolean;
