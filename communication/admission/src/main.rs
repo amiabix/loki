@@ -254,11 +254,10 @@ fn dispatch() -> Result<()> {
                 }
             }
         });
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                let _ = tokio::signal::ctrl_c().await;
-            })
-            .await
-            .map_err(|_| Error::Unavailable)
+        loki_http_ingress::serve(listener, app, async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await;
+        Ok(())
     })
 }

@@ -301,6 +301,14 @@ Build the communication workspace with Rust 1.89 and the PoC signer with Rust 1.
 
 Each of the three relay stores has its own persistent root, signing key, run identifier and provisioning capability. Serve its private loopback listener through a TLS reverse proxy. Initialize with an immutable HTTPS public origin matching the proxy hostname; neither forwarded headers nor redirects change the trusted endpoint. Clients verify the platform certificate chain and hostname and the signed relay challenge against the operator bundle. Listen/private origin and signed/public origin are separate settings.
 
+The owned relay and admission listeners cap open HTTP/1 connections at 128 each,
+request headers at 16 KiB, and header reads at five seconds. Admission gives
+unverified body reads up to three seconds in a separate pool (four per TCP peer).
+`/health` does not use the request or body pools, but shares the connection cap.
+The backend counts the socket peer, not `Forwarded` or `X-Forwarded-For`, so
+clients behind a proxy share its backend allowance. Enforce per-client connection
+and body limits at the TLS proxy using client identity established at that boundary.
+
 The admission service requires a signed operator bundle, its trusted configuration key, its own signing key and the three provisioning files. Keep operator capabilities exclusively on the service hosts, outside any member data root. Give them mode 0600 and their parent directories mode 0700. Admission provisioning records contain owner-generated verifiers; the service never creates member read/admin secrets. Store the admission SQLite database and its tombstones on durable encrypted storage. Back up the database coherently, including its WAL or a SQLite backup, and test recovery before operating it. Reusing an operation ID with changed bytes is refused.
 
 Configure an enrollment verifier explicitly. Creation is denied when no issuer is configured. Production enrollment issuance is an integration with the chosen authentication and abuse-control system; this branch does not choose or deploy that provider. The signer supports a scoped grant for its saved creator identity or a configured issuer executable. The executable receives only the public device signing key, operator bundle path and policy and returns a signed grant on stdout. Do not put issuer private keys or operator capabilities in the signer. Issuance failure retains the pending identity, and native setup persists the exact successful grant before an admission request. Owned fixtures use test keys solely in private disposable roots.

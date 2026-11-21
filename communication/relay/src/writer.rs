@@ -1,8 +1,11 @@
 use crate::{
     store::{HashPresence, PutClass},
-    Capability, Limits, RelayError, RelayResult, RelayStore, StoredResult,
+    Capability, Limits, RelayError, RelayResult, RelayStore, Role, StoredResult,
 };
-use loki_relay_protocol::{nonce::ClaimProof, types::{CreationResult, Id32, Object, Page}};
+use loki_relay_protocol::{
+    nonce::ClaimProof,
+    types::{CreationResult, Id32, Object, Page},
+};
 use std::{
     path::PathBuf,
     sync::{
@@ -377,6 +380,31 @@ impl DbHandle {
             .map_err(|_| RelayError::StorageUnavailable)?
     }
 
+    pub(crate) fn authenticate(
+        &self,
+        target: Option<(Id32, Role)>,
+        capability: &Capability,
+    ) -> RelayResult<()> {
+        if self.stopping.load(Ordering::Acquire) {
+            return Err(RelayError::StorageUnavailable);
+        }
+        RelayStore::authenticate_committed(&self.root, target, capability)
+    }
+
+    pub(crate) fn authenticate_nonce(
+        &self,
+        mailbox: Id32,
+        cid: Id32,
+        challenge: Id32,
+        wire: &[u8],
+        proof: &ClaimProof,
+    ) -> RelayResult<()> {
+        if self.stopping.load(Ordering::Acquire) {
+            return Err(RelayError::StorageUnavailable);
+        }
+        RelayStore::authenticate_committed_nonce(&self.root, mailbox, cid, challenge, wire, proof)
+    }
+
     pub fn create(
         &self,
         mailbox: Id32,
@@ -397,9 +425,8 @@ impl DbHandle {
         self.admit_fresh(|sender| Command::CleanupSetup(now, sender))
     }
     pub fn challenge(&self, nonce: Id32) -> RelayResult<DbReply<Vec<u8>>> {
-        let (sender, reply) = reply();
-        self.admit(Command::Challenge(nonce, sender))?;
-        Ok(reply)
+        // Public identity checks must not consume reserved writer progress.
+        self.admit_fresh(|sender| Command::Challenge(nonce, sender))
     }
     pub fn rotate(
         &self,
