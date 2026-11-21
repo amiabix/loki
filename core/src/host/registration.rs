@@ -53,13 +53,7 @@ impl RegistrationConfig {
     pub(super) fn from_args(args: &[String], development_http: bool) -> Result<Option<Self>, String> {
         let value = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
         if args.iter().any(|a| a == "--pairing-url") {
-            if args.iter().any(|a| matches!(a.as_str(), "--coordinator-url" | "--registration-slot")) {
-                return Err("pairing link already specifies coordinator and slot".into());
-            }
-            let mut launch = Self::pairing(&value("--pairing-url").ok_or("--pairing-url needs a link")?, development_http)?;
-            launch.passphrase_file = Some(value("--local-passphrase-file").ok_or("--local-passphrase-file is required for local unlock")?.into());
-            launch.name = value("--profile-name").unwrap_or_else(|| "Member".into());
-            return Ok(Some(launch));
+            return Err("pairing links are not accepted in command arguments".into());
         }
         let Some(coordinator) = value("--coordinator-url") else {
             if args.iter().any(|a| matches!(a.as_str(), "--coordinator-url" | "--local-passphrase-file" | "--registration-slot" | "--profile-name")) {

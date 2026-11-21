@@ -1730,7 +1730,7 @@ function VaultOverview({
 
       <GlassCard className="mb-4">
         <Row label="Policy" value={`${vault.threshold} of ${vault.members}`} mono />
-        <Row label="Vault ID" value={short(vault.vault)} mono />
+        <Row label="Vault ID" value={<FullValue value={vault.vault} label="vault ID" />} />
         {address && (
           <Row
             label="Address"
@@ -1743,7 +1743,7 @@ function VaultOverview({
         {signerKind() === "native" && (
           <p className="mt-3 text-sm leading-relaxed text-muted">
             Open <strong>Vault addresses…</strong> in LokiSigner. Give senders the address copied from LokiSigner,
-            or compare both addresses before sharing the one shown here.
+            or compare the full vault ID and address in both places before sharing the one shown here.
           </p>
         )}
       </GlassCard>
