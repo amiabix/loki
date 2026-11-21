@@ -14,7 +14,10 @@ use loki_relay_protocol::{
     canonical::{self, Value},
 };
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
@@ -46,13 +49,18 @@ async fn guard(State(service): State<Service>, mut request: Request, next: Next)
     }
 }
 pub fn router(store: Arc<Mutex<AdmissionStore>>) -> Router {
-    router_with_provisioning(store, Arc::new(Notify::new()))
+    router_with_provisioning(
+        store,
+        Arc::new(Notify::new()),
+        Arc::new(AtomicBool::new(true)),
+    )
 }
 /// As `router`, waking `provision` after every accepted mailbox command so the
-/// provisioner need not wait for its next tick.
+/// provisioner need not wait for its next tick. `/health` reflects worker readiness.
 pub fn router_with_provisioning(
     store: Arc<Mutex<AdmissionStore>>,
     provision: Arc<Notify>,
+    ready: Arc<AtomicBool>,
 ) -> Router {
     let deadline = Duration::from_secs(
         store
@@ -67,7 +75,16 @@ pub fn router_with_provisioning(
         provision,
     };
     Router::new()
-        .route("/health", get(|| async { StatusCode::OK }))
+        .route(
+            "/health",
+            get(move || async move {
+                if ready.load(Ordering::Relaxed) {
+                    StatusCode::OK
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            }),
+        )
         .route("/v1/setup", post(handle))
         .route("/v1/setup/{ceremony}", get(handle))
         .route("/v1/setup/{ceremony}/claims/{slot}", post(handle))

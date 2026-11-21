@@ -1,12 +1,14 @@
 //! Local-only restore. Neither the words nor backup bytes are submitted to the coordinator.
 
-use std::{fs, io::Read, path::{Path, PathBuf}};
+use std::{fs, io::{self, Read}, path::{Path, PathBuf}};
 
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
 use super::{ceremony::{self, RecoveryBackup}, recovery, registration::{self, PublicMember, RESTORE_PENDING}, state::{write_native_key_scope, Shared, NATIVE_KEY_SCOPE}, Config, FetchedConfig, RegistrationConfig};
 use crate::{setup_transport::{Identity, PublicIdentity}, signer::{recovery::RecoveryKey, Network}, state::MemberDir};
+#[cfg(all(target_os = "macos", feature = "apple-enclave"))]
+use {super::state::{restored_key_tag, RESTORED_KEY}, crate::signer::secure_element_apple::{AppleSecureElement, KeyFailure}};
 
 // Stable restore reply codes; Recovery.swift owns the member-facing copy.
 pub(crate) const REFUSED: &str = "restore-refused";
@@ -18,6 +20,8 @@ const NOT_FRESH: &str = "profile-not-fresh";
 const DATA_LOCATION: &str = "data-folder-unavailable";
 const ROSTER_UNAVAILABLE: &str = "roster-unavailable";
 const ROSTER_MISMATCH: &str = "roster-mismatch";
+#[cfg(all(target_os = "macos", feature = "apple-enclave"))]
+const KEYCHAIN_STAGE: &str = "restore-keychain-stage";
 
 fn open_backup(file: &Path, words: Zeroizing<Vec<u8>>) -> Result<RecoveryBackup, &'static str> {
     const LIMIT: u64 = 256 * 1024;
@@ -60,10 +64,26 @@ impl Stage {
         builder.create(&path).map_err(|_| REFUSED)?;
         let active = fs::File::open(&path).map_err(|_| REFUSED)?;
         active.try_lock().map_err(|_| REFUSED)?;
+        // A concurrent startup may have reclaimed the empty directory before we locked it.
+        if !path.is_dir() { return Err(REFUSED); }
         Ok(Self { path, _active: active })
     }
 
-    fn publish(&self, dest: &Path) -> Result<(), &'static str> {
+    #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
+    fn prepare_keys(&self, dirs: &[&Path]) -> Result<(), &'static str> {
+        let id = staging_id(&self.path).ok_or(REFUSED)?.to_string();
+        for dir in dirs {
+            MemberDir::create(dir, "").and_then(|dir| dir.write_text(RESTORED_KEY, &id)).map_err(|_| REFUSED)?;
+        }
+        // Reserve the attempt's tags durably before the first Keychain operation.
+        // The journal moves with the directory at the same publication commit point.
+        let journal = self.path.join(KEYCHAIN_STAGE);
+        fs::write(&journal, id).and_then(|_| fs::File::open(&journal)?.sync_all())
+            .and_then(|_| self._active.sync_all())
+            .and_then(|_| fs::File::open(parent(&self.path))?.sync_all()).map_err(|_| REFUSED)
+    }
+
+    fn publish(&self, dest: &Path, _signer_dir: &Path, prepare_dest: impl FnOnce() -> Result<(), &'static str>) -> Result<(), &'static str> {
         fn sync_tree(dir: &Path) -> std::io::Result<()> {
             for entry in fs::read_dir(dir)? {
                 let entry = entry?;
@@ -73,6 +93,11 @@ impl Stage {
             fs::File::open(dir)?.sync_all()
         }
         sync_tree(&self.path).map_err(|_| REFUSED)?;
+        #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
+        if self.path.join(KEYCHAIN_STAGE).try_exists().map_err(|_| REFUSED)? {
+            verify_staged_signer(_signer_dir)?;
+        }
+        prepare_dest()?;
         fs::rename(&self.path, dest).map_err(|_| REFUSED)?;
         // Once published, don't ask the member to retry by reporting a failed flush.
         let _ = fs::File::open(dest.parent().expect("restore destination has a parent")).and_then(|f| f.sync_all());
@@ -81,13 +106,61 @@ impl Stage {
 }
 
 impl Drop for Stage {
-    fn drop(&mut self) { let _ = fs::remove_dir_all(&self.path); }
+    fn drop(&mut self) { discard_stage(&self.path); }
+}
+
+#[cfg(all(target_os = "macos", feature = "apple-enclave"))]
+fn verify_staged_signer(dir: &Path) -> Result<(), &'static str> {
+    use super::state::{open_apple_element, HostedSecureElement};
+    use crate::signer::store::{FileKind, SignerStore};
+
+    let se = open_apple_element(dir, false, None, None, "", None).map_err(KeyFailure::message)?;
+    if let HostedSecureElement::Apple(key, _) = &se {
+        key.confirm_staged_biometry(None).map_err(KeyFailure::message)?;
+    }
+    let store = SignerStore::open(dir).map_err(|_| REFUSED)?;
+    let _share = store.read(&se, FileKind::Share)
+        .map_err(|e| super::state::member_key_message(&e).unwrap_or(REFUSED))?.ok_or(REFUSED)?;
+    if let HostedSecureElement::Apple(key, _) = &se {
+        let state = dir.join("biometry-state");
+        key.confirm_staged_biometry(Some(&state)).map_err(KeyFailure::message)?;
+        fs::File::open(state).and_then(|f| f.sync_all())
+            .and_then(|_| fs::File::open(dir)?.sync_all()).map_err(|_| REFUSED)?;
+    }
+    Ok(())
+}
+
+// Called only with the staging directory locked, never on a published path.
+fn discard_stage(path: &Path) {
+    #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
+    match fs::read_to_string(path.join(KEYCHAIN_STAGE)) {
+        Ok(journal) => {
+            let Some(id) = staging_id(path).filter(|id| id.to_string() == journal) else { return };
+            #[cfg(test)]
+            let stand_in = super::state::apple_test::fixture(path).is_some();
+            #[cfg(not(test))]
+            let stand_in = false;
+            if !stand_in {
+                let mut cleaned = true;
+                for role in ["signer", "device-auth"] {
+                    cleaned &= AppleSecureElement::discard_staged(&restored_key_tag(id, role)).is_ok();
+                }
+                if !cleaned {
+                    eprintln!("restore staging: could not discard a staged key; will retry on startup");
+                    return;
+                }
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {},
+        Err(_) => return,
+    }
+    let _ = fs::remove_dir_all(path);
 }
 
 fn absent(path: &Path) -> Result<bool, &'static str> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(false),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
         Err(_) => Err(REFUSED),
     }
 }
@@ -101,11 +174,13 @@ fn entries(path: &Path) -> Result<impl Iterator<Item = Result<fs::DirEntry, &'st
     Ok(entries.into_iter().flatten().map(|e| e.map_err(|_| REFUSED)))
 }
 
+fn staging_id(path: &Path) -> Option<uuid::Uuid> {
+    let suffix = path.file_name()?.to_str()?.strip_prefix(".loki-restore-")?;
+    uuid::Uuid::parse_str(suffix).ok().filter(|id| id.get_version_num() == 4 && id.to_string() == suffix)
+}
+
 fn staging_dir(entry: &fs::DirEntry) -> bool {
-    entry.file_type().is_ok_and(|kind| kind.is_dir()) && entry.file_name().to_str()
-        .and_then(|name| name.strip_prefix(".loki-restore-"))
-        .is_some_and(|suffix| uuid::Uuid::parse_str(suffix).is_ok_and(|id|
-            id.get_version_num() == 4 && id.hyphenated().to_string() == suffix))
+    entry.file_type().is_ok_and(|kind| kind.is_dir()) && staging_id(&entry.path()).is_some()
 }
 
 fn parent(data: &Path) -> &Path {
@@ -133,7 +208,7 @@ pub(crate) fn clean_staging(data: &Path) {
             if Some(entry.file_name().as_os_str()) != skip && staging_dir(&entry) {
                 let Ok(active) = fs::File::open(entry.path()) else { continue };
                 // A different signer launch using the same parent may be restoring now.
-                if active.try_lock().is_ok() { let _ = fs::remove_dir_all(entry.path()); }
+                if active.try_lock().is_ok() { discard_stage(&entry.path()); }
             }
         }
     }
@@ -228,9 +303,14 @@ pub(crate) fn restore_new(
     let staged = Stage::new(&parent)?;
     let vault = hex::encode(backup.material.vault_id);
     let vault_dir = MemberDir::open(&staged.path.join("vaults"), &vault);
+    let signer = vault_dir.path().join("signer");
     let final_key_dir = dest.join("vaults").join(&vault).join("signer");
     crate::profile::create(&staged.path, pass, name).map_err(|_| REFUSED)?;
     write_native_key_scope(&staged.path).map_err(|_| REFUSED)?;
+    #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
+    if config.secure_element == "apple" {
+        staged.prepare_keys(&[&signer, &staged.path.join("device-auth")])?;
+    }
     ceremony::restore_opened_backup(backup, &staged.path, &vault_dir, pass, config, Some(&final_key_dir))
         .map_err(|e| super::state::member_key_message(&e).unwrap_or(REFUSED))?;
     #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
@@ -241,11 +321,12 @@ pub(crate) fn restore_new(
     registration::save_coordinator(&staged.path, &origin, slot).map_err(|_| REFUSED)?;
     if let Some(fetched) = fetched { fetched.save_unlocked(&staged.path).map_err(|_| REFUSED)?; }
     fs::write(staged.path.join(RESTORE_PENDING), []).map_err(|_| REFUSED)?;
-    if profile_state(&dest)? != "fresh" { return Err(NOT_FRESH); }
-    // An existing nonempty directory cannot be atomically replaced. Preserve its leftovers
-    // separately, after all of the new profile's material has been staged.
-    if entries(&dest)?.next().transpose()?.is_some() { archive(&dest)?; }
-    staged.publish(&dest)?;
+    staged.publish(&dest, &signer, || {
+        if profile_state(&dest)? != "fresh" { return Err(NOT_FRESH); }
+        // Preserve leftovers separately, only after the new profile has been verified.
+        if entries(&dest)?.next().transpose()?.is_some() { archive(&dest)?; }
+        Ok(())
+    })?;
     config.registration = Some(RegistrationConfig {
         coordinator: origin, slot: Some(slot), passphrase_file: None, name: name.into(), pairing_challenge: None,
     });
@@ -270,9 +351,14 @@ pub(super) fn restore_running(st: &Shared, words: Zeroizing<Vec<u8>>, file: &Pat
     if !absent(&dest)? { return Err(ALREADY_PRESENT); }
     let staged = Stage::new(&parent)?;
     let vault_dir = MemberDir::open(&staged.path, "");
+    let signer = vault_dir.path().join("signer");
+    #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
+    if st.config.secure_element == "apple" {
+        staged.prepare_keys(&[&signer])?;
+    }
     ceremony::restore_opened_backup(backup, data, &vault_dir, pass, &st.config, Some(&dest.join("signer")))
         .map_err(|e| super::state::member_key_message(&e).unwrap_or(REFUSED))?;
-    staged.publish(&dest)
+    staged.publish(&dest, &signer, || if absent(&dest)? { Ok(()) } else { Err(ALREADY_PRESENT) })
 }
 
 #[cfg(test)]

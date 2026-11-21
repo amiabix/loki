@@ -370,6 +370,12 @@ pub extern "C" fn loki_member_app_vault_addresses() -> *mut std::ffi::c_char {
     std::ffi::CString::new(reply.to_string()).map_or(std::ptr::null_mut(), std::ffi::CString::into_raw)
 }
 
+#[cfg(feature = "relay-communication")]
+#[no_mangle]
+pub extern "C" fn loki_member_app_can_view_addresses() -> i32 {
+    i32::from(crate::host::native_can_view_addresses())
+}
+
 /// Frees a string returned by one of the LokiSigner JSON entry points.
 ///
 /// # Safety
