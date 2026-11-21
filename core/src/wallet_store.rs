@@ -836,6 +836,39 @@ impl VaultWallet {
         Ok(())
     }
 
+    /// Transfer a draft's locks to its finalized transaction as one write. Finishers can also
+    /// acquire unreserved inputs, and retries can renew locks already owned by this txid.
+    pub fn reserve_broadcast_inputs(
+        &mut self,
+        attempt: LockOwner,
+        txid: TxId,
+        nullifiers: &[[u8; 32]],
+        expiry_height: u32,
+    ) -> Result<(), String> {
+        let outputs = self.input_refs(nullifiers)?;
+        let account = self.account()?;
+        self.db
+            .transactionally_with_extension(|db, _| {
+                let tip = db.block_fully_scanned()?.ok_or("wallet has not scanned any blocks")?;
+                if outputs.is_empty() || expiry_height <= u32::from(tip.block_height()) {
+                    return Err("payment has no inputs or has expired".into());
+                }
+                let notes = db.get_unspent_ironwood_notes_at_historical_height(account, tip.block_height())?;
+                for output in &outputs {
+                    if !notes.iter().any(|note| {
+                        note.txid() == output.txid() && u32::from(note.output_index()) == output.output_index()
+                    }) {
+                        return Err("payment input is no longer unspent".into());
+                    }
+                    db.unlock_output(output, attempt)?;
+                }
+                db.lock_outputs(&outputs, txid.into(), BlockHeight::from_u32(expiry_height))
+                    .map_err(|e| io::Error::other(format!("reserve payment inputs: {e:?}")))?;
+                Ok::<(), Box<dyn std::error::Error>>(())
+            })
+            .map_err(|e| e.to_string())
+    }
+
     /// Releases `owner`'s reservation of a payment's still-unspent inputs.
     pub fn release_inputs(&mut self, owner: LockOwner, nullifiers: &[[u8; 32]]) -> Result<(), String> {
         for output in self.input_refs(nullifiers)? {

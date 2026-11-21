@@ -2422,11 +2422,11 @@ function History({
                 >
                   Review / approve
                 </button>}
-                {p.can_discard && <button className="btn-glass flex-1 rounded-full px-4 py-2 text-sm" onClick={async () => {
+                {(p.can_discard || p.can_dismiss) && <button className="btn-glass flex-1 rounded-full px-4 py-2 text-sm" onClick={async () => {
                   setErr(null);
                   try { await api("payment-discard", { vault: vault.vault, attempt: p.attempt }); refresh(); }
                   catch (e) { setErr((e as Error).message); }
-                }}>{p.error || p.phase === "failed" ? "Discard failed payment" : "Cancel payment"}</button>}
+                }}>{p.can_dismiss ? "Dismiss on this device" : p.error || p.phase === "failed" ? "Discard failed payment" : "Cancel payment"}</button>}
                 {(p.can_send || sending) && !settled && (
                   <button
                     onClick={() => send(p.attempt)}

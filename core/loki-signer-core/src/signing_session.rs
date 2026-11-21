@@ -1399,6 +1399,41 @@ impl SigningSession {
         self.store.abort()
     }
 
+    /// Replay the original package without reopening (or needing) the signer's nonce.
+    pub fn republish_saved_package(
+        root: &Path,
+        context: &SessionContext,
+        own: u16,
+        passphrase: &str,
+        mailbox: &Mailbox,
+    ) -> Result<bool, String> {
+        let store = AttemptStore::reopen(root, context, own)?;
+        if !store.dir.path().join("package.sealed").try_exists().map_err(|e| e.to_string())? {
+            return Ok(false);
+        }
+        let (_, wires) = store.resend_package(passphrase)?;
+        for wire in wires {
+            mailbox.append(&wire).map_err(|e| e.to_string())?;
+        }
+        Ok(true)
+    }
+
+    /// A durable package can exist before the approval decision or share does.
+    pub fn recover_share_if_saved(
+        root: &Path,
+        context: &SessionContext,
+        own: u16,
+        passphrase: &str,
+        mailbox: &Mailbox,
+    ) -> Result<bool, String> {
+        let store = AttemptStore::reopen(root, context, own)?;
+        if !store.dir.path().join("share.sealed").try_exists().map_err(|e| e.to_string())? {
+            return Ok(false);
+        }
+        store.publish(mailbox, passphrase)?;
+        Ok(true)
+    }
+
     pub fn recover_share(
         root: &Path,
         context: &SessionContext,

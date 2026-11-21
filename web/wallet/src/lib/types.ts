@@ -63,6 +63,7 @@ export type Payment = {
   approvals?: number[];
   approval_requested?: boolean;
   can_discard?: boolean;
+  can_dismiss?: boolean;
   // This member holds the signed transaction and can send it, or send it again.
   can_send?: boolean;
   sending?: boolean;
