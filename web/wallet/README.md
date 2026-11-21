@@ -69,6 +69,15 @@ comparison by every member. The failed vault and its diagnostic error remain ava
 `LOKI_DEV_FAUCET=1` enables the optional local-origin regtest faucet; it receives only a public
 regtest address. It is off by default, and the supplied launcher binds Next to localhost.
 
+## Production coordinator behind TLS
+
+After building, use `npm start` (the custom server). It listens on `127.0.0.1:$PORT`
+(`3001` by default), with `http://localhost:$PORT` as the local development origin.
+Point a same-host TLS proxy or tunnel at that loopback address and set `PUBLIC_ORIGIN`
+to the exact external HTTPS origin, for example `https://wallet.example`. This replaces
+`HOSTNAME` and `PUBLIC_PORT`. The coordinator uses `PUBLIC_ORIGIN`, not client forwarding
+headers, to reconstruct the origin for member registration.
+
 ## In-browser signer: enroll → discover → DKG
 
 An in-browser signer (`src/lib/signer.ts`, the wasm core in `core/loki-signer-wasm`) has no

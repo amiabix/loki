@@ -320,9 +320,10 @@ core/signer-app/out/LokiSigner.app/Contents/MacOS/LokiSigner pair 'loki://pair?.
 
 Other member flags are the existing `loki_member_app` flags: network, lightwalletd, relay,
 nonce witnesses, and peer allowlist. Each overrides the coordinator's value for its field,
-for that launch only. For members on separate Macs, configure a reachable
-HTTPS `--advertise-url` (forwarded to the member service) and the allowed `--peer` origins.
-The private browser session still uses loopback; it is never sent to that public endpoint.
+for that launch only. For members on separate Macs, configure a reachable HTTPS
+`--advertise-url`, a separate `--peer-port`, and the allowed `--peer` origins. Terminate TLS
+on a same-host proxy forwarding to the ceremony-only listener at `127.0.0.1:<peer-port>`.
+Never forward the private browser API listener (`--port`); it requires a loopback bind.
 The link contains only origin, slot and a random claim, never runtime configuration or keys;
 the configuration comes from that origin, as described above.
 The native passphrase is passed to Rust in memory and the Swift byte buffer is immediately

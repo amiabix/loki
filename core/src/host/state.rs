@@ -16,6 +16,7 @@ pub struct Config {
     pub data: PathBuf,
     pub port: u16,
     pub bind: std::net::IpAddr,
+    pub(super) peer_port: Option<u16>,
     pub advertise_url: Option<String>,
     pub network: String,
     pub lightwalletd: Option<String>,
@@ -42,15 +43,15 @@ impl Config {
     pub(super) fn lokisigner_url(&self) -> Option<String> {
         if !self.native || self.port == 0 { return None; }
         let host = match self.bind {
-            std::net::IpAddr::V4(ip) if ip == std::net::Ipv4Addr::LOCALHOST || ip.is_unspecified() => "127.0.0.1",
-            std::net::IpAddr::V6(ip) if ip.is_loopback() || ip.is_unspecified() => "[::1]",
+            std::net::IpAddr::V4(ip) if ip == std::net::Ipv4Addr::LOCALHOST => "127.0.0.1",
+            std::net::IpAddr::V6(ip) if ip.is_loopback() => "[::1]",
             _ => return None,
         };
         Some(format!("http://{host}:{}", self.port))
     }
 
     pub(super) fn base_url(&self) -> String {
-        self.advertise_url.clone().unwrap_or_else(|| format!("http://127.0.0.1:{}", self.port))
+        self.advertise_url.clone().unwrap_or_else(|| format!("http://{}", std::net::SocketAddr::new(self.bind, self.port)))
             .trim_end_matches('/').to_owned()
     }
 
@@ -510,7 +511,7 @@ mod tests {
     fn config(secure_element: &str) -> Config {
         Config {
             registration: None, native: false,
-            bind: "127.0.0.1".parse().unwrap(), advertise_url: None,
+            bind: "127.0.0.1".parse().unwrap(), peer_port: None, advertise_url: None,
             data: PathBuf::new(), port: 3001, network: "regtest".into(),
             lightwalletd: None, transport: "local".into(), secure_element: secure_element.into(),
             operator_bundle: None, nonce_witnesses: None, operator_key: None, enrollment_issuer: None,

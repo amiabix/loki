@@ -3,13 +3,16 @@
 //!
 //!   loki_member_app --data <dir> --port <n> [--network testnet] [--lightwalletd-url <url>]
 //!       [--frostd-url <url>] [--peer <slot=baseurl>]...
-//!       [--bind <IP>] [--advertise-url <url>]
+//!       [--bind <loopback-IP>] [--peer-port <n> --advertise-url <origin>]
 //!       [--secure-element <software|apple>]
 //!       [--coordinator-url <origin> --local-passphrase-file <path>
 //!        --registration-slot <public-slot> --profile-name <name>]
 //!       [--transport hosted --operator-bundle <cbor> --operator-key <hex>
 //!        --enrollment-issuer <path> --development-http]
 //!       [--nonce-witnesses <json>] [--approve-from <file>]
+//!
+//! A local TLS proxy may expose the ceremony-only listener on `127.0.0.1:<peer-port>`.
+//! Never proxy the private API on `--port`.
 //!
 //! Without `--approve-from` this process has no approval channel and refuses every payment;
 //! members sign from the native app. `--approve-from` is for test harnesses only: see

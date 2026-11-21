@@ -1366,7 +1366,7 @@ mod tests {
             operator_key: None, enrollment_issuer: None, development_http: false,
             token: "test".into(), frostd_url: "http://127.0.0.1:2744".into(),
             peers: BTreeMap::new(),
-            registration: None, bind: "127.0.0.1".parse().unwrap(), advertise_url: None,
+            registration: None, bind: "127.0.0.1".parse().unwrap(), peer_port: None, advertise_url: None,
             secure_element: "software".into(), nonce_witnesses: None, loopback_peers: false,
         }));
         *st.session.write().await = Some(Session {
@@ -1401,6 +1401,7 @@ mod tests {
             peers: BTreeMap::new(),
             registration: None,
             bind: "127.0.0.1".parse().unwrap(),
+            peer_port: None,
             advertise_url: None,
             secure_element: "software".into(),
             nonce_witnesses: None,
@@ -1483,7 +1484,7 @@ mod tests {
             operator_key: None, enrollment_issuer: None, development_http: false,
             token: "test".into(), frostd_url: "http://127.0.0.1:2744".into(),
             peers: BTreeMap::new(),
-            registration: None, bind: "127.0.0.1".parse().unwrap(), advertise_url: None,
+            registration: None, bind: "127.0.0.1".parse().unwrap(), peer_port: None, advertise_url: None,
             secure_element: "software".into(), nonce_witnesses: None, loopback_peers: false,
         }));
         for (name, members, threshold, error) in [
@@ -1533,7 +1534,7 @@ mod tests {
             operator_key: None, enrollment_issuer: None, development_http: false,
             token: "test".into(), frostd_url: "http://127.0.0.1:2744".into(),
             peers: BTreeMap::new(),
-            registration: None, bind: "127.0.0.1".parse().unwrap(), advertise_url: None,
+            registration: None, bind: "127.0.0.1".parse().unwrap(), peer_port: None, advertise_url: None,
             secure_element: "software".into(), nonce_witnesses: None, loopback_peers: false,
         }));
         *st.session.write().await = Some(Session {
@@ -1597,7 +1598,7 @@ mod tests {
             operator_key: None, enrollment_issuer: None, development_http: false,
             token: "test".into(), frostd_url: "http://127.0.0.1:2744".into(),
             peers: BTreeMap::new(),
-            registration: None, bind: "127.0.0.1".parse().unwrap(), advertise_url: None,
+            registration: None, bind: "127.0.0.1".parse().unwrap(), peer_port: None, advertise_url: None,
             secure_element: "software".into(), nonce_witnesses: None, loopback_peers: false,
         }
     }
@@ -1930,6 +1931,7 @@ mod tests {
             data: data.clone(),
             port: 3001,
             bind: "127.0.0.1".parse().unwrap(),
+            peer_port: None,
             advertise_url: None,
             network: "regtest".into(),
             lightwalletd: None,
