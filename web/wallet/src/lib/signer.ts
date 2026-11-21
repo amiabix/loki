@@ -75,23 +75,26 @@ export function chainPayments(history: ChainTx[]): Payment[] {
   });
 }
 
-/** A payment's status on the browser signer. The terms and signing group come from the
- *  proposer's notices; the spend observation comes from the configured provider. */
+/** A spend reported by the configured provider identifies the attempt only if the signer checked the same txid. */
 export function chainPaymentSession(r: {
   terms: { proposer: number; recipient: string; amount_zat: number; fee_zat: number };
   signers: number[];
   ended?: "cancelled" | "failed" | null;
+  closed?: boolean;
   spent: { txid: string; height: number } | null;
+  txid?: string | null;
+  approved?: boolean;
+  slot?: number;
 }): PaymentSession {
+  const confirmed = r.spent !== null && r.spent.txid === r.txid;
   return {
-    phase: r.spent ? "confirmed" : r.ended ?? "signing",
-    signatures_received: !!r.spent,
-    txid: r.spent?.txid ?? null,
-    // The proposer forms the signing group from the first approvals, so its members approved.
-    approvals: r.signers,
-    // Not known on the browser signer before the chain shows the payment (its approval is sent,
-    // not kept); false keeps the Approve button for a request this member has not signed.
-    approval_requested: !!r.spent,
+    phase: confirmed ? "confirmed" : r.spent ? (r.txid ? "replaced" : "spent_unverified") :
+      r.ended ?? (r.closed ? "awaiting_verification" : "signing"),
+    signatures_received: confirmed,
+    txid: confirmed ? r.spent?.txid : null,
+    spent_by: confirmed ? null : r.spent?.txid ?? null,
+    approvals: r.signers.filter((slot) => slot !== r.slot || r.approved === true),
+    approval_requested: r.approved === true,
     intent: { proposer: r.terms.proposer, signers: r.signers, recipient: r.terms.recipient, amount_zat: r.terms.amount_zat, fee_zat: r.terms.fee_zat, open_approval: true },
   };
 }

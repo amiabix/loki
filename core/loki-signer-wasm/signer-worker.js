@@ -320,18 +320,58 @@ async function chainScan(signer, p) {
   return { tip, ...result, chain_trust: "provider_reported" };
 }
 
-// A payment's status for the wallet: its terms and signing group from the proposer's notices,
-// and whether the chain scan saw its one input note spent (and in which transaction).
+// Local decisions and checked effects, never the proposer's claimed approval or txid.
+let paymentRecords;
+async function paymentRecord(key, record) {
+  paymentRecords ??= new Promise((resolve, reject) => {
+    const req = indexedDB.open("loki_payment_records", 1);
+    req.onupgradeneeded = () => req.result.createObjectStore("attempts");
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  const tx = (await paymentRecords).transaction("attempts", record ? "readwrite" : "readonly", { durability: "strict" });
+  const store = tx.objectStore("attempts");
+  const req = record ? store.put(record, key) : store.get(key);
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = () => resolve(req.result ?? {});
+    tx.onabort = () => reject(tx.error ?? new Error("could not save payment verification"));
+  });
+}
+async function paymentKey(signer, notice) {
+  const scope = JSON.stringify([signer.frostdPubkey(), notice.hash, notice.termsKey]);
+  const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(scope)));
+  return btoa(String.fromCharCode(...hash));
+}
+// paymentCheck only accepts an Ironwood-only v6 candidate. Its shielded sighash is its
+// effects txid in wire byte order (ZIP 233); the display txid reverses those bytes.
+const reviewedTxid = (review) => review.sighash.match(/../g).reverse().join("");
+
+// A payment's status for the wallet: relay terms, this member's own decision, and the
+// chain's spend as separate facts. Only matching checked effects identify the attempt.
 async function paymentStatus(signer, p) {
   const vault = await openVault(signer, p.vaultHex);
   const control = await frostdClient(signer, p);
-  const { notice, start } = await findPayment(signer, control, vault, p.attemptHex, p);
+  const { notice, start, signed } = await findPayment(signer, control, vault, p.attemptHex, p);
   const terms = notice.intent;
   const ended = notice.kind === "cancelled" || notice.kind === "failed" ? notice.kind : null;
   const signers = start?.intent.signers ?? [];
+  const key = await paymentKey(signer, notice);
+  const record = await paymentRecord(key);
   const { chain_trust } = await chainScan(signer, p);
   const spent = JSON.parse(signer.scanSpentBy(terms.note_selection[0]));
-  return { terms, signers, ended, spent, chain_trust };
+  let txid = record.txid ?? null;
+  if (spent && !txid && signed) {
+    // An authenticated copy supplies candidate effects, not proof of a broadcast or approval.
+    try {
+      const review = JSON.parse(signer.paymentCheck(signed.pczt, JSON.stringify({ ...terms, tx_expiry: signed.intent.signing_expiry })));
+      if (reviewedTxid(review) === spent.txid) txid = spent.txid;
+    } catch { /* An unchecked copy cannot identify the spend. */ }
+    if (txid) {
+      await paymentRecord(key, { ...record, txid });
+    }
+  }
+  const closed = endsRequest(notice, vault.slot);
+  return { terms, signers, ended, closed, spent, txid, approved: record.approved === true, slot: vault.slot, chain_trust };
 }
 
 // The terms a proposer announced for this payment, read-only: nothing is approved or sent.
@@ -551,9 +591,13 @@ async function listPending(signer, vaultHex, p) {
     const i = m.intent;
     if (state.blocked || endsRequest(m, vault.slot)) { pending.set(i.attempt, null); continue; }
     if (pending.get(i.attempt) === null) continue;
-    pending.set(i.attempt, { attempt: i.attempt, amount_zat: String(i.amount_zat), recipient: i.recipient, proposer: m.from });
+    pending.set(i.attempt, { attempt: i.attempt, amount_zat: String(i.amount_zat), recipient: i.recipient, proposer: m.from, note: i.note_selection[0] });
   }
-  return [...pending.values()].filter(Boolean);
+  const requests = [...pending.values()].filter(Boolean);
+  if (!requests.length) return [];
+  await chainScan(signer, p);
+  // A spent input ends this request's opportunity to sign, but doesn't identify the payment.
+  return requests.flatMap(({ note, ...request }) => JSON.parse(signer.scanSpentBy(note)) ? [] : [request]);
 }
 
 async function vaultDirectory() {
@@ -621,6 +665,8 @@ async function drivePayment(signer, p, witnessPinsPath) {
   if (!coordinator) {
     throw new Error("This payment has no sealed signing coordinator; ask the proposer to create a fresh payment");
   }
+  const key = await paymentKey(signer, announced);
+  const record = await paymentRecord(key);
   const scope = controlScope(signer, p);
   const refresh = async () => {
     const state = await readControl(signer, control, vault, controlSessionId, proposer, scope);
@@ -687,13 +733,18 @@ async function drivePayment(signer, p, witnessPinsPath) {
   // with a fresh passkey assertion (or the passphrase again), and signApprove releases the
   // share only for the sighash the member confirmed.
   const review = JSON.parse(signer.paymentCheck(candidateHex, JSON.stringify({ ...terms, tx_expiry: expiry })));
+  const txid = reviewedTxid(review);
+  if (record.txid && record.txid !== txid) throw new Error("this attempt already has different reviewed effects");
   const consent = await ask("payment-sign", review);
   if (!consent) throw new Error("You declined to sign this payment");
   await refresh();
   signer.reauth(consent.method, consent.passphrase, consent.prfSecret);
+  await paymentRecord(key, { ...record, txid });
   await claimAtWitnesses(signer, p.nonceWitnesses, attemptHex, packageHex, seedHex, review.sighash);
   const share = signer.signApprove(attemptHex, candidateHex, packageHex, seedHex, review.sighash, JSON.stringify({ ...terms, tx_expiry: expiry }));
   await fc.sendToCoordinator(seal(share, true));
+  // Keep a terms-only approval or an interrupted share send retryable in the wallet.
+  await paymentRecord(key, { approved: true, txid });
   return { approved: true, signed: true, review };
 }
 

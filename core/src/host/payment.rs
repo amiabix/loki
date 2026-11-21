@@ -43,7 +43,7 @@ use crate::{
     signing_session::{AttemptId, MessageKind, SessionContext},
     state::MemberDir,
     transport::{FrostdLoginKey, FrostdTransport, Outbound, Peer, SealedPeer, Transport},
-    tx_finalize::{finalized_sighash, prove},
+    tx_finalize::{finalized_sighash, prove, verify_ironwood_authorization},
     vault,
     verify::{check_candidate, Expectations, Refusal},
     wallet_store::{lightwalletd_endpoint, Lightwalletd, VaultWallet, PROVIDER_REPORTED},
@@ -61,7 +61,7 @@ struct Replaces {
     cancel: bool,
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 struct Payment {
     attempt: String,
     vault: String,
@@ -107,10 +107,14 @@ struct Payment {
     broadcast_requested: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     txid: Option<String>,
+    /// Legacy txids may have come from a notice or from input-only attribution.
+    #[serde(default)]
+    tx_verified: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    broadcast_hint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     signed_pczt: Option<String>,
-    /// The final transaction. The proposer and every member that checked its sealed copy keep
-    /// it until the payment settles, so any of them can send it again.
+    /// Kept after settlement too: a reorg can make these exact bytes sendable again.
     #[serde(skip_serializing_if = "Option::is_none")]
     raw_tx: Option<String>,
     /// The proposer sent every member its sealed copy of `raw_tx`.
@@ -118,10 +122,10 @@ struct Payment {
     copies_sent: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     replaces: Option<Replaces>,
-    /// The mined transaction that spent this payment's note instead of its own.
+    /// The mined spend on the current chain, when it isn't attributed to this attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     replaced_by: Option<String>,
-    /// The block that mined this payment's own transaction, while it is `confirmed`.
+    /// The block that spent the input, whether or not this attempt is verified.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mined_height: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -402,7 +406,11 @@ fn relay(identity: &Identity, url: &str) -> Result<FrostdTransport, String> {
 /// Checks a candidate or signed PCZT against the reviewed terms; returns its sighash.
 fn review_candidate(bytes: &[u8], payment: &Payment, vault: &Vault) -> Result<[u8; 32], String> {
     let parsed = pczt::Pczt::parse(bytes).map_err(|e| format!("candidate: {e:?}"))?;
-    if *parsed.global().consensus_branch_id()
+    if *parsed.global().tx_version() != zcash_protocol::constants::V6_TX_VERSION
+        || !parsed.transparent().inputs().is_empty() || !parsed.transparent().outputs().is_empty()
+        || !parsed.sapling().spends().is_empty() || !parsed.sapling().outputs().is_empty()
+        || !parsed.orchard().actions().is_empty()
+        || *parsed.global().consensus_branch_id()
         != u32::from(BranchId::for_height(
             &vault.network,
             BlockHeight::from_u32(payment.target_height),
@@ -444,21 +452,59 @@ fn check_signed_copy(
     pczt: &[u8],
     raw: &[u8],
     txid: &str,
+    pinned: Option<[u8; 32]>,
 ) -> Result<(), String> {
     let sighash = review_candidate(pczt, p, v)?;
+    if pinned.is_some_and(|hash| hash != sighash) {
+        return Err("signed transaction differs from the locally reviewed candidate".into());
+    }
+    check_final_transaction(p, raw, txid, sighash)
+}
+
+fn check_final_transaction(p: &Payment, mut raw: &[u8], txid: &str, sighash: [u8; 32]) -> Result<(), String> {
     let tx = zcash_primitives::transaction::Transaction::read(
-        raw,
-        BranchId::for_height(&v.network, BlockHeight::from_u32(p.target_height)),
+        &mut raw,
+        BranchId::Nu7,
     )
     .map_err(|e| format!("signed transaction: {e}"))?;
-    if tx.txid().to_string() != txid
+    if !raw.is_empty() || tx.version() != zcash_primitives::transaction::TxVersion::V6
+        || tx.txid().to_string() != txid
         || u32::from(tx.expiry_height()) != tx_expiry(p)
         || finalized_sighash(&tx)? != sighash
     {
         return Err("signed transaction differs from the reviewed payment".into());
     }
+    verify_ironwood_authorization(&tx, sighash)
+}
+
+/// A proposer can send the valid copy before or after any of the status hints.
+fn accept_signed_copy(p: &mut Payment, v: &Vault, body: &Value, expiry: Option<u32>, pinned: Option<[u8; 32]>) -> Result<(), String> {
+    let txid = body["txid"].as_str().ok_or("missing txid")?;
+    let raw = body["raw_tx"].as_str().ok_or("missing transaction")?;
+    if p.tx_verified && p.txid.as_deref() != Some(txid) {
+        return Err("txid differs from the verified transaction".into());
+    }
+    let pczt = hex::decode(body["pczt"].as_str().ok_or("missing PCZT")?).map_err(|e| e.to_string())?;
+    if p.signing_expiry.is_some() && p.signing_expiry != expiry {
+        return Err("expiry differs from the one fixed at start".into());
+    }
+    let mut fixed = p.clone();
+    fixed.signing_expiry = expiry;
+    check_signed_copy(&fixed, v, &pczt, &hex::decode(raw).map_err(|e| e.to_string())?, txid, pinned)?;
+    p.signing_expiry = expiry;
+    if !p.tx_verified && matches!(p.phase.as_str(), "confirmed" | "replaced") {
+        // The old chain attribution used unverified identity; re-scan it.
+        p.phase = "awaiting_verification".into();
+    } else if !settled(p) || p.phase == "cancelled" {
+        p.phase = if p.broadcast_hint.as_deref() == Some(txid) { "broadcast" } else { "signed" }.into();
+    }
+    p.txid = Some(txid.to_owned());
+    p.tx_verified = true;
+    p.raw_tx = Some(raw.to_owned());
+    p.error = None;
     Ok(())
 }
+
 /// The payment terms every member reviews. The signing group is not part of them: any member
 /// may approve, and the group is fixed later (`signing_group`, `check_signers`).
 fn check_intent(p: &Payment, v: &Vault) -> Result<(), String> {
@@ -619,12 +665,20 @@ fn signing_went_ahead(earlier: &Payment, slot: u16) -> bool {
 
 /// No longer being tracked as an in-flight payment on this device.
 fn settled(p: &Payment) -> bool {
-    matches!(p.phase.as_str(), "confirmed" | "replaced" | "cancelled" | "expired" | "dismissed")
+    matches!(p.phase.as_str(), "confirmed" | "replaced" | "spent_unverified" | "cancelled" | "expired" | "dismissed")
 }
 
 /// This member holds the signed transaction and may send it, or send it again.
 fn can_send(p: &Payment) -> bool {
-    matches!(p.phase.as_str(), "signed" | "broadcast") && p.raw_tx.is_some()
+    matches!(p.phase.as_str(), "signed" | "broadcast") && p.tx_verified && p.raw_tx.is_some()
+}
+
+fn reported_phase(p: &Payment) -> &str {
+    if !p.tx_verified && matches!(p.phase.as_str(), "signed" | "broadcast" | "confirmed" | "replaced") {
+        "awaiting_verification"
+    } else {
+        &p.phase
+    }
 }
 
 /// How long a payment past its approvals may show no progress before members may replace it.
@@ -782,43 +836,24 @@ fn sync_control_inner(url: &str, data: &Path, pass: &str, vault: &str, v: &Vault
             }
             match read_payment(data, pass, vault, &incoming.attempt) {
                 Ok(mut p) => {
-                    if intent_hash(&p) != intent_hash(&incoming) || settled(&p) {
+                    if intent_hash(&p) != intent_hash(&incoming) {
                         continue;
                     }
                     // The proposer's sealed copy of the final transaction, sent before it
-                    // broadcasts: kept until the payment settles, so this member can send it.
+                    // broadcasts. Hints and legacy bytes cannot prevent a verified copy arriving.
                     if peer.id == p.proposer
                         && body["kind"] == "signed"
-                        && p.raw_tx.is_none()
-                        && matches!(p.phase.as_str(), "signing" | "approved" | "not_selected" | "failed")
+                        && (!p.tx_verified || p.raw_tx.is_none())
+                        && !matches!(p.phase.as_str(), "draft" | "discarding" | "dismissed")
                     {
-                        let copy = || -> Result<(String, String), String> {
-                            let txid = body["txid"].as_str().ok_or("missing txid")?;
-                            let raw = body["raw_tx"].as_str().ok_or("missing transaction")?;
-                            if p.txid.as_deref().is_some_and(|id| id != txid) {
-                                return Err("txid differs from the broadcast notice".into());
-                            }
-                            let pczt = hex::decode(body["pczt"].as_str().ok_or("missing PCZT")?)
-                                .map_err(|e| e.to_string())?;
-                            if p.signing_expiry.is_some() && p.signing_expiry != incoming.signing_expiry {
-                                return Err("expiry differs from the one fixed at start".into());
-                            }
-                            let mut fixed = p.clone();
-                            fixed.signing_expiry = incoming.signing_expiry;
-                            check_signed_copy(&fixed, v, &pczt, &hex::decode(raw).map_err(|e| e.to_string())?, txid)?;
-                            Ok((txid.to_owned(), raw.to_owned()))
-                        };
-                        match copy() {
-                            Ok((txid, raw)) => {
-                                p.signing_expiry = incoming.signing_expiry;
-                                p.txid = Some(txid);
-                                p.raw_tx = Some(raw);
-                                p.phase = "signed".into();
-                                p.error = None;
-                                save_payment(data, pass, &p)?;
-                            }
+                        let pinned = pinned_sighash(data, pass, &p)?;
+                        match accept_signed_copy(&mut p, v, &body, incoming.signing_expiry, pinned) {
+                            Ok(()) => save_payment(data, pass, &p)?,
                             Err(_) => eprintln!("payment {}: error checking signed copy", p.attempt),
                         }
+                        continue;
+                    }
+                    if settled(&p) {
                         continue;
                     }
                     // A cancellation notice doesn't prove a round this member joined cannot
@@ -859,17 +894,15 @@ fn sync_control_inner(url: &str, data: &Path, pass: &str, vault: &str, v: &Vault
                         continue;
                     }
                     if peer.id == p.proposer
-                        && matches!(p.phase.as_str(), "approved" | "not_selected" | "signed" | "broadcast")
                         && matches!(body["kind"].as_str(), Some("broadcast" | "confirmed"))
                     {
                         let Some(txid) = body["txid"].as_str().filter(|s| hex32(s).is_ok()) else {
                             continue;
                         };
-                        if p.txid.as_deref().is_some_and(|id| id != txid) {
-                            continue;
+                        p.broadcast_hint = Some(txid.to_owned());
+                        if p.tx_verified && p.phase == "signed" && p.txid.as_deref() == Some(txid) {
+                            p.phase = "broadcast".into();
                         }
-                        p.txid = Some(txid.to_owned());
-                        p.phase = "broadcast".into();
                         save_payment(data, pass, &p)?;
                         continue;
                     }
@@ -906,7 +939,7 @@ fn sync_control_inner(url: &str, data: &Path, pass: &str, vault: &str, v: &Vault
                     save_payment(data, pass, &p)?;
                 }
                 Err(_)
-                    if body["kind"] == "intent"
+                    if matches!(body["kind"].as_str(), Some("intent" | "signed"))
                         && peer.id == proposer
                         && !payment_dir(data, vault)?
                             .path()
@@ -914,8 +947,10 @@ fn sync_control_inner(url: &str, data: &Path, pass: &str, vault: &str, v: &Vault
                             .try_exists()
                             .map_err(|e| e.to_string())? =>
                 {
+                    let expiry = incoming.signing_expiry;
                     incoming.phase = "signing".into();
-                    // Only a `start` from the proposer fixes the group and the expiry.
+                    // Clear the unsigned proposal's claimed local state. A checked signed
+                    // copy can also establish the expiry before the original notice arrives.
                     incoming.signers.clear();
                     incoming.signing_expiry = None;
                     incoming.coordinator_secret = None;
@@ -926,19 +961,28 @@ fn sync_control_inner(url: &str, data: &Path, pass: &str, vault: &str, v: &Vault
                     incoming.approvals.clear();
                     incoming.start_requested = false;
                     incoming.txid = None;
+                    incoming.tx_verified = false;
+                    incoming.broadcast_hint = None;
                     incoming.signed_pczt = None;
                     incoming.raw_tx = None;
                     incoming.copies_sent = false;
                     incoming.replaced_by = None;
+                    incoming.mined_height = None;
                     incoming.error = None;
                     incoming.failure_reason = None;
                     if check_replacement(data, pass, v, &incoming).is_err() {
                         eprintln!("payment {}: error checking replacement request", incoming.attempt);
                         continue;
                     }
-                    // A retry of a payment this member already approved needs no new approval;
-                    // the next `restore_workers` starts its signing.
-                    if approved_before(data, pass, v, &incoming) {
+                    if body["kind"] == "signed" {
+                        let pinned = pinned_sighash(data, pass, &incoming)?;
+                        if accept_signed_copy(&mut incoming, v, &body, expiry, pinned).is_err() {
+                            eprintln!("payment {}: error checking signed copy", incoming.attempt);
+                            continue;
+                        }
+                    } else if approved_before(data, pass, v, &incoming) {
+                        // A retry of a payment this member already approved needs no new approval;
+                        // the next `restore_workers` starts its signing.
                         record_consent(data, pass, &incoming)?;
                         incoming.approval_requested = true;
                         record_approval(&mut incoming, v.slot);
@@ -1019,72 +1063,53 @@ fn draft_expiry(tip: u32, network: VaultNetwork) -> Result<u32, String> {
     .ok_or_else(|| "expiry overflow".into())
 }
 
-/// Settles this member's payments against its scanned chain, then reserves exactly the notes
-/// of locally authorized payments still in flight, so ordinary drafts pick other notes.
-/// A payment whose note a mined block spent is `confirmed` when the spend is its own
-/// transaction and `replaced` otherwise; the mempool never counts. Runs under `st.payment`.
+/// Settles this member's payments against its scanned chain and reconciles input reservations.
+/// A mined spend is a confirmation only when it matches verified effects. Unknown attribution
+/// stays separate from a known replacement; the mempool never counts. Runs under `st.payment`.
 fn reconcile(data: &Path, pass: &str, vault: &str, slot: u16, w: &mut VaultWallet) -> Result<(), String> {
     let tip = w.scanned_height()?.ok_or("wallet has no scanned blocks")?;
-    let before = local_attempts(data, vault)?
-        .iter()
-        .filter_map(|attempt| read_payment(data, pass, vault, attempt).ok())
-        .collect::<Vec<_>>();
     let mut live = BTreeMap::new();
-    for p in &before {
-        let note = hex32(p.note_selection.first().ok_or("payment has no input note")?)?;
-        let mut p = p.clone();
+    for attempt in local_attempts(data, vault)? {
+        let Ok(before) = read_payment(data, pass, vault, &attempt) else { continue };
+        if matches!(before.phase.as_str(), "cancelled" | "dismissed") { continue; }
+        let note = hex32(before.note_selection.first().ok_or("payment has no input note")?)?;
+        let mut p = before.clone();
         let spend_id = w.mined_spend(&note)?;
         let mined = spend_id.map(|txid| txid.to_string());
-        // A reorg can drop the block that settled it: it is in flight again until a block
-        // settles it anew (below) or its expiry passes.
-        let settled_by = if p.phase == "confirmed" { &p.txid } else { &p.replaced_by };
-        if matches!(p.phase.as_str(), "confirmed" | "replaced") && mined != *settled_by {
-            p.phase = if p.txid.is_some() { "broadcast" } else { "failed" }.into();
-            p.replaced_by = None;
-            p.mined_height = None;
+        if !p.tx_verified && (p.raw_tx.is_some() || mined.is_some()) {
+            if let Some(hash) = pinned_sighash(data, pass, &p)? {
+                // For a v6 Ironwood-only transaction the shielded sighash is the effects txid.
+                // The same input by itself, or the proposer's txid, proves no such match.
+                let expected = zcash_primitives::transaction::TxId::from_bytes(hash).to_string();
+                let checked_raw = p.raw_tx.as_ref().and_then(|raw| hex::decode(raw).ok())
+                    .is_some_and(|raw| check_final_transaction(&p, &raw, &expected, hash).is_ok());
+                if checked_raw || mined.as_ref() == Some(&expected) {
+                    p.txid = Some(expected);
+                    p.tx_verified = true;
+                    if !checked_raw {
+                        // Same mined effects need not mean these legacy bytes were authorized.
+                        p.raw_tx = None;
+                    }
+                }
+            }
+        }
+        p.replaced_by = None;
+        p.mined_height = spend_id.map(|txid| w.mined_height(txid)).transpose()?.flatten().map(u32::from);
+        if let Some(spend) = mined {
+            if p.tx_verified && p.txid.as_ref() == Some(&spend) {
+                p.phase = "confirmed".into();
+            } else {
+                p.phase = if p.tx_verified { "replaced" } else { "spent_unverified" }.into();
+                p.replaced_by = Some(spend);
+            }
+        } else if tip > tx_expiry(&p) {
+            p.phase = "expired".into();
+        } else if settled(&p) || matches!(reported_phase(&p), "awaiting_verification") {
+            p.phase = if p.tx_verified { "broadcast" } else if p.signed_pczt.is_some() { "ready" }
+                else if p.txid.is_some() || p.raw_tx.is_some() { "awaiting_verification" } else { "failed" }.into();
+        }
+        if p != before {
             save_payment(data, pass, &p)?;
-        }
-        if !settled(&p) {
-            let siblings = || {
-                before.iter().filter(|q| q.attempt != p.attempt && q.note_selection == p.note_selection)
-            };
-            let settle = match mined {
-                Some(spend) if p.txid.as_deref() == Some(spend.as_str()) => "confirmed",
-                // The spend is another transaction: one this member knows, or any other while
-                // it knows this payment's own txid.
-                Some(spend)
-                    if p.txid.is_some()
-                        || siblings().any(|q| q.txid.as_deref() == Some(spend.as_str())) =>
-                {
-                    p.replaced_by = Some(spend);
-                    "replaced"
-                }
-                // This member never learned the txid. When no other payment of the note could
-                // be the spend, it is this one.
-                Some(spend)
-                    if !siblings().any(|q| q.txid.is_none() && !settled(q) && q.phase != "draft") =>
-                {
-                    p.txid = Some(spend);
-                    "confirmed"
-                }
-                Some(_) => "",
-                // No block past the expiry height can include it.
-                None if tip > tx_expiry(&p) => "expired",
-                None => "",
-            };
-            if !settle.is_empty() {
-                p.phase = settle.into();
-                p.raw_tx = None;
-                p.signed_pczt = None;
-                save_payment(data, pass, &p)?;
-            }
-        }
-        // Also fills in payments confirmed before the height was kept.
-        if p.phase == "confirmed" && p.mined_height.is_none() {
-            if let Some(height) = spend_id.map(|txid| w.mined_height(txid)).transpose()?.flatten() {
-                p.mined_height = Some(height.into());
-                save_payment(data, pass, &p)?;
-            }
         }
         // Control notices cannot authorize locking this member's wallet. A started local
         // round retains its reservation even if a reorg temporarily puts the anchor ahead.
@@ -1851,6 +1876,16 @@ fn require_consent(data: &Path, pass: &str, p: &Payment) -> Result<(), String> {
     }
     Ok(())
 }
+
+fn pinned_sighash(data: &Path, pass: &str, p: &Payment) -> Result<Option<[u8; 32]>, String> {
+    let dir = payment_dir(data, &p.vault)?;
+    let file = format!("{}.consent-sighash", p.attempt);
+    match dir.read_sealed(&file, pass) {
+        Ok(hash) => Ok(Some(hash.as_slice().try_into().map_err(|_| "invalid stored sighash")?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
 /// Pins the first reviewed candidate's sighash for the attempt; a different one is refused.
 fn pin_sighash(data: &Path, pass: &str, p: &Payment, sighash: [u8; 32]) -> Result<(), String> {
     let dir = payment_dir(data, &p.vault)?;
@@ -2104,8 +2139,8 @@ fn broadcast(
 
 /// The proposer's finish, run on its own as soon as the signatures combine and again after a
 /// restart: builds the final transaction, seals a copy to every member, and only then
-/// broadcasts it. Each step is saved before the next. The raw transaction is kept until the
-/// payment settles, so the proposer and every member holding the copy can send it again.
+/// broadcasts it. Each step is saved before the next, and the raw transaction remains available
+/// if a reorg reopens the payment.
 fn deliver(
     st: &Shared,
     data: &Path,
@@ -2131,10 +2166,17 @@ fn deliver(
         if p.proposer != v.slot || !matches!(p.phase.as_str(), "ready" | "signed") {
             return Ok(p);
         }
-        if p.raw_tx.is_none() {
+        if !p.tx_verified || p.raw_tx.is_none() {
             let (raw, txid) = build_transaction(&p, &w, &mut client, &rt)?;
+            if p.tx_verified && p.txid.as_deref() != Some(&txid) {
+                return Err("finalized transaction differs from the verified transaction".into());
+            }
+            let pczt = hex::decode(p.signed_pczt.as_deref().ok_or("missing signed PCZT")?)
+                .map_err(|e| e.to_string())?;
+            check_signed_copy(&p, &v, &pczt, &raw, &txid, pinned_sighash(data, pass, &p)?)?;
             p.raw_tx = Some(hex::encode(&raw));
             p.txid = Some(txid);
+            p.tx_verified = true;
             p.phase = "signed".into();
             save_payment(data, pass, &p)?;
         }
@@ -2186,10 +2228,7 @@ pub(super) async fn send(State(st): State<Shared>, Json(body): Json<Value>) -> R
                     return Err(e);
                 }
             };
-            return Ok(json!({"phase":p.phase,"txid":p.txid}));
-        }
-        if !can_send(&p) {
-            return Err("this member holds no signed transaction for this payment".into());
+            return Ok(json!({"phase":reported_phase(&p),"txid":p.txid.filter(|_| p.tx_verified)}));
         }
         let (p, mut client, rt) = {
             let _guard = st.payment.lock().map_err(|e| e.to_string())?;
@@ -2203,7 +2242,10 @@ pub(super) async fn send(State(st): State<Shared>, Json(body): Json<Value>) -> R
             (read_payment(&data, &pass, &vault, &attempt)?, client, rt)
         };
         if !can_send(&p) {
-            return Ok(json!({"phase":p.phase,"txid":p.txid}));
+            if settled(&p) {
+                return Ok(json!({"phase":reported_phase(&p),"txid":p.txid.filter(|_| p.tx_verified)}));
+            }
+            return Err("this member holds no verified signed transaction for this payment".into());
         }
         broadcast(&mut client, &rt, &p)?;
         let _guard = st.payment.lock().map_err(|e| e.to_string())?;
@@ -2223,18 +2265,16 @@ pub(super) async fn verify(State(st): State<Shared>, Json(body): Json<Value>) ->
         let (vault, attempt) = pair(&body)?;
         let v = load_vault(&st, &data, &pass, &vault)?;
         let txid = required(&body, "txid")?;
-        let id = zcash_primitives::transaction::TxId::from_hex(txid).ok_or("invalid txid")?;
-        if read_payment(&data, &pass, &vault, &attempt)?.txid.as_deref() != Some(txid) {
-            return Err("txid differs from this payment".into());
-        }
         let (mut w, _, _) = wallet(&data, &pass, &vault, &v, url(&st)?)?;
         reconcile(&data, &pass, &vault, v.slot, &mut w)?;
         let p = read_payment(&data, &pass, &vault, &attempt)?;
-        let mined_height = w.mined_height(id)?;
+        if !p.tx_verified || p.txid.as_deref() != Some(txid) {
+            return Err("txid differs from this payment's verified transaction".into());
+        }
         if p.proposer == v.slot && matches!(p.phase.as_str(), "broadcast" | "confirmed") {
             let _ = send_control(&st.config.frostd_url, &v, &p, &p.phase, &members(&v));
         }
-        Ok(json!({"phase":p.phase,"mined_height":mined_height.map(u32::from)}))
+        Ok(json!({"phase":p.phase,"mined_height":if p.phase == "confirmed" { p.mined_height } else { None }}))
     })
     .await
 }
@@ -2298,10 +2338,8 @@ fn all_payments(data: &Path, pass: &str, vault: &str) -> Result<Vec<Payment>, St
         .collect()
 }
 
-/// While the profile is unlocked and the vault has published payments that have not settled,
-/// rescans the chain every `WATCH_EVERY` and settles them (`reconcile`), so every member marks
-/// a payment confirmed, replaced or expired from mined blocks without anyone opening it. It
-/// also reads the control sessions, so members pick up the proposer's signed copy.
+/// Keep published payments reconciled while unlocked, including payments settled on a chain
+/// that can reorganize. Also read control sessions to pick up the proposer's signed copy.
 fn watch_chain(st: &Shared, data: &Path, pass: &str, vault: &str) -> Result<(), String> {
     let key = format!("chain/{vault}");
     if !st.active_payments.lock().map_err(|e| e.to_string())?.insert(key.clone()) {
@@ -2319,7 +2357,7 @@ fn watch_chain(st: &Shared, data: &Path, pass: &str, vault: &str) -> Result<(), 
                     let _guard = st.payment.lock().map_err(|e| e.to_string())?;
                     all_payments(&data, &pass, &vault)?
                         .iter()
-                        .any(|p| !settled(p) && p.control_session_id.is_some())
+                        .any(|p| !matches!(p.phase.as_str(), "cancelled" | "dismissed") && p.control_session_id.is_some())
                 };
                 if in_flight {
                     let v = load_vault(&st, &data, &pass, &vault)?;
@@ -2519,9 +2557,9 @@ pub(super) async fn payments(
             let busy = active.contains(&format!("{}/{}", p.vault, p.attempt));
             let finishing = p.proposer == v.slot && matches!(p.phase.as_str(), "ready" | "signed");
             out.push(json!({
-                "attempt": p.attempt, "phase": p.phase, "proposer": p.proposer,
+                "attempt": p.attempt, "phase": reported_phase(p), "proposer": p.proposer,
                 "recipient": p.recipient, "amount_zat": p.amount_zat.to_string(), "fee_zat": p.fee_zat.to_string(),
-                "txid": if matches!(p.phase.as_str(), "signed" | "broadcast" | "confirmed") { p.txid.clone() } else { None },
+                "txid": if p.tx_verified && matches!(p.phase.as_str(), "signed" | "broadcast" | "confirmed") { p.txid.clone() } else { None },
                 "signers": p.signers, "approvals": p.approvals, "approval_requested": p.approval_requested,
                 "can_discard": p.proposer == v.slot && discardable(&data, p).is_ok(),
                 "can_dismiss": can_dismiss(p, v.slot),
@@ -2529,7 +2567,9 @@ pub(super) async fn payments(
                 "can_send": !busy && (can_send(p) || finishing),
                 "sending": busy && finishing,
                 "can_replace": stuck(&data, &v, p, &all)?,
-                "replaces": p.replaces, "replaced_by": p.replaced_by, "mined_height": p.mined_height,
+                "replaces": p.replaces, "spent_by": p.replaced_by,
+                "replaced_by": if p.phase == "replaced" && p.tx_verified { p.replaced_by.as_deref() } else { None },
+                "mined_height": p.mined_height,
                 "target_height": p.target_height, "expiry_height": p.expiry_height,
                 "signing_expiry": p.signing_expiry, "tx_expiry": held_tx_expiry(&v, p),
                 "error": p.error,
@@ -2624,11 +2664,12 @@ pub(super) async fn status(
         let _ = sync_control(&st.config.frostd_url, &data, &pass, &vault, &v);
         let p = read_payment(&data, &pass, &vault, &attempt)?;
         Ok(json!({
-            "phase": p.phase,
+            "phase": reported_phase(&p),
             "chain_trust": PROVIDER_REPORTED,
             "approvals":p.approvals,"error":p.error,"approval_requested":p.approval_requested,
-            "signatures_received": p.signed_pczt.is_some() || p.raw_tx.is_some() || matches!(p.phase.as_str(), "signed" | "broadcast" | "confirmed"),
-            "txid": p.txid, "replaces": p.replaces, "replaced_by": p.replaced_by,
+            "signatures_received": p.signed_pczt.is_some() || p.tx_verified,
+            "txid": p.txid.filter(|_| p.tx_verified), "replaces": p.replaces, "spent_by": p.replaced_by,
+            "replaced_by": if p.phase == "replaced" && p.tx_verified { p.replaced_by.as_deref() } else { None },
             "intent": {
                 "proposer": p.proposer,
                 "signers": p.signers,
@@ -3616,14 +3657,12 @@ mod tests {
         save_payment(data_c, "pass", &reported).unwrap();
         proposer.txid = Some(hex::encode([6; 32]));
         send_control(&url, &a, &proposer, "confirmed", &members(&a)).unwrap();
-        for (data, m) in [(data_b, &b), (data_c, &c)] {
+        for (data, m, phase) in [(data_b, &b, "not_selected"), (data_c, &c, "approved")] {
             sync_control(&url, data, "pass", &vault, m).unwrap();
-            assert_eq!(
-                read_payment(data, "pass", &vault, &p.attempt)
-                    .unwrap()
-                    .phase,
-                "broadcast"
-            );
+            let local = read_payment(data, "pass", &vault, &p.attempt).unwrap();
+            assert_eq!(local.phase, phase);
+            assert_eq!(local.broadcast_hint, proposer.txid);
+            assert!(local.txid.is_none());
         }
         reported.phase = "signing".into();
         reported.txid = None;
@@ -3813,6 +3852,7 @@ mod tests {
             .position(|a| a.spend().nullifier() == &note.nullifier(&fvk).to_bytes())
             .unwrap();
         let (raw, txid) = prove(pczt, sighash, vec![(index, path)], anchor.to_bytes()).unwrap();
+        assert_eq!(txid, zcash_primitives::transaction::TxId::from_bytes(sighash), "Ironwood-only v6 review commits to the effects txid");
         p.raw_tx = Some(hex::encode(&raw));
         p.txid = Some(txid.to_string());
         p.phase = "signed".into();
@@ -4021,6 +4061,7 @@ mod tests {
             phase: phase.into(),
             control_session_id: Some(Uuid::new_v4()),
             txid: txid.map(|t| zcash_primitives::transaction::TxId::from_bytes(t).to_string()),
+            tx_verified: txid.is_some(),
             raw_tx: txid.map(|_| "raw".into()),
             expiry_height: height + 100,
             ..Default::default()
@@ -4030,7 +4071,7 @@ mod tests {
         // the second never learned the stuck payment's txid, only its replacement's.
         for (stuck_txid, replacement_txid, stuck_ends, replacement_ends) in [
             (Some([12; 32]), mined_id, "replaced", "confirmed"),
-            (None, Some([13; 32]), "confirmed", "replaced"),
+            (None, Some([13; 32]), "spent_unverified", "replaced"),
         ] {
             let data = std::env::temp_dir().join(format!("loki-reconcile-{}", Uuid::new_v4()));
             let stuck = payment(1, 0, "failed", stuck_txid);
@@ -4057,13 +4098,13 @@ mod tests {
                 let ends = p.phase.as_str();
                 assert_eq!(
                     p.replaced_by.as_deref(),
-                    (ends == "replaced").then(|| mined.to_string()).as_deref()
+                    (ends != "confirmed").then(|| mined.to_string()).as_deref()
                 );
             }
             assert_eq!(
                 [s.txid, r.txid].iter().filter(|t| t.as_deref() == Some(mined.to_string().as_str())).count(),
-                1,
-                "exactly one payment is the mined transaction"
+                usize::from(replacement_ends == "confirmed"),
+                "only a verified match identifies the mined payment"
             );
             // The open request's note is reserved for every draft; the expired one's is not.
             let other = zcash_client_backend::wallet::LockOwner::new([99; 32]);
@@ -4115,6 +4156,7 @@ mod tests {
             note_selection: vec![hex::encode(notes[0].nullifier(&fvk).to_bytes())],
             phase: "broadcast".into(),
             txid: Some(mined.to_string()),
+            tx_verified: true,
             raw_tx: Some("raw".into()),
             expiry_height: height + 100,
             ..Default::default()
@@ -4136,6 +4178,8 @@ mod tests {
         let reopened = read();
         assert_eq!(reopened.phase, "broadcast", "a payment whose spend a reorg dropped is not confirmed");
         assert_eq!(reopened.txid, Some(mined.to_string()));
+        assert!(can_send(&reopened));
+        assert_eq!(reopened.raw_tx, p.raw_tx);
         assert_eq!(reopened.mined_height, None);
         let other = zcash_client_backend::wallet::LockOwner::new([99; 32]);
         assert!(
@@ -4244,6 +4288,7 @@ mod tests {
         readiness.phase = "signed".into();
         assert!(!can_send(&readiness), "a member sends only a transaction it holds");
         readiness.raw_tx = Some("checked transaction".into());
+        readiness.tx_verified = true;
         assert!(can_send(&readiness));
         readiness.phase = "replaced".into();
         assert!(!can_send(&readiness), "a replaced payment is never sent");

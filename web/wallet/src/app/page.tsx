@@ -2111,7 +2111,6 @@ function ReviewApprove({
   onBack: () => void;
 }) {
   const [review, setReview] = useState<PaymentReview | null>(null);
-  const [approved, setApproved] = useState(false);
   const [session, setSession] = useState<PaymentSession | null>(null);
   const [sessionError, setSessionError] = useState<string | null>(null);
   const [ownSlot, setOwnSlot] = useState<number | null>(null);
@@ -2119,12 +2118,12 @@ function ReviewApprove({
   const [err, setErr] = useState<string | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const triesRef = useRef(0);
+  const approved = session?.approval_requested === true;
 
   const fetchSession = useCallback(async () => {
     try {
       const value = await api<PaymentSession>(`payment-status?vault=${vault.vault}&attempt=${attempt}`);
       setSession(value);
-      if (value.approval_requested) setApproved(true);
       setSessionError(null);
     } catch (e) { setSessionError((e as Error).message); }
   }, [vault.vault, attempt]);
@@ -2170,13 +2169,27 @@ function ReviewApprove({
     setBusy(true); setErr(null);
     try {
       await api("payment-approve", { vault: vault.vault, attempt, review_token: review.review_token, intent_hash: review.intent_hash });
-      setApproved(true);
-      void fetchSession();
+      await fetchSession();
     } catch (e) { setErr((e as Error).message); }
     finally { setBusy(false); }
   };
 
   const isProposer = proposedHere ?? (session && ownSlot !== null ? session.intent.proposer === ownSlot : null);
+
+  if (session && ["confirmed", "replaced", "spent_unverified"].includes(session.phase)) {
+    return (
+      <GlassCard className="text-center">
+        <h2 className="mb-2 text-2xl font-semibold">{paymentLabel(session.phase, false, false)}</h2>
+        <p className="mb-4 text-sm text-muted">
+          {session.phase === "confirmed" ? "The mined transaction matches this payment attempt." :
+            session.phase === "replaced" ? "A different transaction spent this payment’s input on the current chain." :
+              "This payment’s input was spent on the current chain, but the spend hasn’t been verified as this payment."}
+        </p>
+        {session.approval_requested && <p className="mb-4 text-sm text-mint">You approved this payment.</p>}
+        <Btn variant="ghost" onClick={onBack}>Back to History</Btn>
+      </GlassCard>
+    );
+  }
 
   if (approved && session?.phase === "failed") {
     return (
@@ -2327,9 +2340,6 @@ function History({
 }) {
   const { data, error, refresh } = usePayments(vault.vault, true);
   const [sendingHere, setSendingHere] = useState<string | null>(null);
-  const [verifying, setVerifying] = useState<string | null>(null);
-  const [txids, setTxids] = useState<Record<string, string>>({});
-  const [verified, setVerified] = useState<Record<string, boolean>>({});
   const [err, setErr] = useState<string | null>(null);
 
   // Sends the signed transaction through this member's own lightwalletd, or sends it again.
@@ -2342,39 +2352,31 @@ function History({
     finally { setSendingHere(null); }
   };
 
+  const pending = data?.payments.find((p) => p.phase === "broadcast" && p.txid);
+  const verifying = pending?.attempt;
+  const verifyingTxid = pending?.txid;
   useEffect(() => {
-    if (!verifying) return;
-    const attempt = verifying;
-    const txid = txids[attempt];
-    if (!txid) return;
+    if (!verifying || !verifyingTxid) return;
     let timer: ReturnType<typeof setTimeout> | null = null;
     let cancelled = false;
     let tries = 0;
     const tick = async () => {
       try {
-        const res = await api<{ phase: string }>("payment-verify", { vault: vault.vault, attempt, txid });
-        if (!cancelled && res.phase === "confirmed") {
-          setVerified((p) => ({ ...p, [attempt]: true }));
-          setVerifying(null);
+        const res = await api<{ phase: string }>("payment-verify", { vault: vault.vault, attempt: verifying, txid: verifyingTxid });
+        if (!cancelled && res.phase !== "broadcast") {
+          refresh();
           return;
         }
       } catch {}
       tries += 1;
       // Cap at ~1min: the tx is broadcast and its id is shown; stop hammering the host if it's
       // slow to confirm (common on testnet) rather than polling forever and leaking timers.
-      if (cancelled || tries >= 40) { setVerifying(null); return; }
+      if (cancelled || tries >= 40) return;
       timer = setTimeout(tick, 1500);
     };
     timer = setTimeout(tick, 1500);
     return () => { cancelled = true; if (timer) clearTimeout(timer); };
-  }, [verifying, txids, vault.vault]);
-
-  useEffect(() => {
-    const pending = data?.payments.find((p) => p.phase === "broadcast" && p.txid && !txids[p.attempt]);
-    if (!pending?.txid || verifying) return;
-    setTxids((ids) => ({ ...ids, [pending.attempt]: pending.txid! }));
-    setVerifying(pending.attempt);
-  }, [data, txids, verifying]);
+  }, [verifying, verifyingTxid, vault.vault, refresh]);
 
   const payments = data?.payments ?? [];
 
@@ -2397,11 +2399,12 @@ function History({
       ) : (
         <div className="space-y-3">
           {payments.map((p) => {
-            const confirmed = !!verified[p.attempt] || p.phase === "confirmed";
+            const confirmed = p.phase === "confirmed";
             const replaced = p.phase === "replaced";
-            const txid = !replaced ? p.txid ?? txids[p.attempt] ?? null : null;
+            const unverified = p.phase === "spent_unverified";
+            const txid = p.txid;
             const sending = !!p.sending || sendingHere === p.attempt;
-            const settled = confirmed || replaced || ["cancelled", "expired"].includes(p.phase);
+            const settled = confirmed || replaced || unverified || ["cancelled", "expired"].includes(p.phase);
             return (
             <GlassCard key={p.attempt}>
               <div className="mb-2 flex flex-col items-start gap-3 sm:flex-row sm:justify-between">
@@ -2414,13 +2417,16 @@ function History({
                     Replaces payment {short(p.replaces.attempt, 6, 4)} with the same note{p.replaces.cancel ? "; the note goes back to the vault" : ""}.
                   </p>}
                 </div>
-                <span className={`rounded-full px-2.5 py-0.5 text-xs font-medium shrink-0 ${PHASE_PILL[confirmed ? "confirmed" : p.phase] ?? "border border-[var(--border)] bg-[var(--surface-2)] text-muted"}`}>
-                  {paymentLabel(confirmed ? "confirmed" : p.phase, false, sending && !settled)}
+                <span className={`rounded-full px-2.5 py-0.5 text-xs font-medium shrink-0 ${PHASE_PILL[p.phase] ?? "border border-[var(--border)] bg-[var(--surface-2)] text-muted"}`}>
+                  {paymentLabel(p.phase, false, sending && !settled)}
                 </span>
               </div>
               {p.signers && !txid && !settled && <SignerList signers={p.signers} threshold={vault.threshold} approvals={p.approvals} complete={p.phase === "approved"} />}
               {replaced && <p className="text-xs text-muted">
-                Another transaction spent this payment’s note in a mined block{p.replaced_by ? ` (${short(p.replaced_by, 8, 6)})` : ""}, so this one can never be mined. Its reservation is released.
+                Another transaction spent this payment’s note on the current chain{p.spent_by ? ` (${short(p.spent_by, 8, 6)})` : ""}.
+              </p>}
+              {unverified && <p className="text-xs text-muted">
+                This payment’s note was spent on the current chain{p.spent_by ? ` (${short(p.spent_by, 8, 6)})` : ""}, but the spend hasn’t been matched to this attempt.
               </p>}
               {txid && !confirmed && p.phase === "signed" && <p className="text-xs text-muted">
                 Signed by {vault.threshold} members. This device holds the final transaction{p.can_send ? " and can send it" : ""}.
