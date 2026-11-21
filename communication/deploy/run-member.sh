@@ -15,7 +15,7 @@
 #
 # Env:
 #   MEMBER_BIN   path to loki_member_app  (default <repo>/core/target/release/loki_member_app)
-#   DATA         member data dir          (default ./loki-member-<slot>)
+#   DATA         member data dir          (default <repo>/loki-state/member-<slot>)
 #   PORT         local member port        (default 3610 + slot)
 #   PEER_PORT    ceremony backend port    (default 4610 + slot)
 #   FROSTD_URL   frostd loopback url       (default http://127.0.0.1:2744)
@@ -36,7 +36,10 @@ repo=$(cd "$deploy/../.." && pwd -P)
 source "$deploy/member-launch.sh"
 
 member_bin=${MEMBER_BIN:-$repo/core/target/release/loki_member_app}
-data=${DATA:-$PWD/loki-member-$slot}
+if [[ -z ${DATA:-} && ( -e $PWD/loki-member-$slot || -L $PWD/loki-member-$slot ) ]]; then
+  launch_error "legacy member state found: set DATA=./loki-member-$slot to reuse its existing passphrase and state"
+fi
+data=${DATA:-$repo/loki-state/member-$slot}
 [[ $data == /* ]] || data=$PWD/$data
 while [[ $data == */ && $data != / ]]; do data=${data%/}; done
 port=${PORT:-$((3610 + slot))}
@@ -56,6 +59,12 @@ if [[ -n $advertise || ${NO_TUNNEL:-} != 1 ]]; then
   fi
 fi
 { exec 7>/dev/tty; } 2>/dev/null || launch_error "a terminal is required to show the private pairing link"
+if [[ -z ${DATA:-} ]]; then
+  root=${data%/*}
+  [[ -e $root || -L $root ]] || mkdir -p -- "$root"
+  [[ ! -L $root && -d $root && -O $root && $(find "$root" -prune -perm 700 -print) == "$root" ]] \
+    || launch_error "default state root must be an owned, non-symlink directory with mode 0700: $root"
+fi
 mkdir -p "$data"
 lock_launch "$data"
 [[ ! -L $data/state && ( ! -e $data/state || ( -d $data/state && -O $data/state ) ) ]] \

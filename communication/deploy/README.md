@@ -222,8 +222,13 @@ Testers run a member from an updated release binary with Bash, Python 3, and Ope
 ```sh
 ssh -N -L 2744:localhost:2744 omarchy   # frostd must be reachable on loopback
 communication/deploy/run-member.sh https://<coordinator>.trycloudflare.com 1
-kill $(cat ./loki-member-1/pids)   # stop
+kill $(cat ./loki-state/member-1/pids)   # stop
 ```
+
+New launches default to the ignored, owner-only `loki-state/member-<slot>` under the
+repository root. For a member launched with the old default, keep its directory and
+passphrase together and set `DATA` to that existing directory before restarting (for
+example, `DATA=./loki-member-1` from the original working directory).
 
 Paste the private pairing link shown on the terminal into the wallet. Do not capture
 or share the link; the fragment authorizes the local API for the member process's lifetime.
