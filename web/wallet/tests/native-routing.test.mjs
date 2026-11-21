@@ -79,8 +79,10 @@ test('the wallet asks for a pairing link, then for the same slot again only once
     await assert.rejects(requestPairingLink(first.slot), (e) => e instanceof PairingSlotTaken && /^Slot 1 was taken, possibly by another member\. .*another slot\.$/.test(e.message));
 
     // Once it expired, a new link is for slot 1 again, with a new claim.
-    const file = process.env.LOKI_REGISTRY + '.challenges';
-    writeFileSync(file, JSON.stringify(JSON.parse(readFileSync(file)).map((c) => c.pairing_slot === 1 ? { ...c, expires: 0 } : c)));
+    const file = process.env.LOKI_REGISTRY;
+    const snapshot = JSON.parse(readFileSync(file));
+    snapshot.challenges = snapshot.challenges.map((c) => c.pairing_slot === 1 ? { ...c, expires: 0 } : c);
+    writeFileSync(file, JSON.stringify(snapshot));
     const again = await requestPairingLink(first.slot);
     assert.deepEqual(bodies.at(-1), { slot: 1 });
     assert.equal(again.slot, 1);

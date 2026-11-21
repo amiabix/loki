@@ -352,9 +352,9 @@ async fn register(config: &Config, pass: &str, pairing_claim: Option<&str>, slot
     // After handing the request to the client even a lost response may mean the claim was used.
     if let (Some(notice), Some(claim)) = (notice, pairing_claim) { notice("pairing-claim-attempted", claim); }
     let response = client.execute(request).await.map_err(|e| RegistrationFailure::Connection(format!("registration challenge: {e}")))?;
-    let challenge: serde_json::Value = registration_response(response, "registration challenge", config.native).await?
+    let challenge_reply: serde_json::Value = registration_response(response, "registration challenge", config.native).await?
         .json().await.map_err(|e| e.to_string())?;
-    let challenge = challenge["challenge"].as_str().filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+    let challenge = challenge_reply["challenge"].as_str().filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
         .ok_or("invalid coordinator challenge")?;
     let message = enrollment.message(&launch.coordinator, challenge);
     let signature = device.sign(&message).map_err(RegistrationFailure::Device)?;
@@ -362,6 +362,14 @@ async fn register(config: &Config, pass: &str, pairing_claim: Option<&str>, slot
     let mut body = serde_json::to_value(&enrollment).map_err(|e| e.to_string())?;
     body["challenge"] = challenge.into();
     body["signature"] = hex::encode(signature).into();
+    if let Some(value) = challenge_reply.get("replacement_generation") {
+        let generation = value.as_u64().filter(|n| (1..=9_007_199_254_740_991).contains(n))
+            .ok_or("invalid coordinator replacement generation")?;
+        let mut nonce = [0; 32];
+        hex::decode_to_slice(challenge, &mut nonce).map_err(|e| e.to_string())?;
+        let proof = identity.authorize_device_replacement(&launch.coordinator, &device_pub, &nonce, generation);
+        body["replacement_authorization"] = hex::encode(proof).into();
+    }
     let response = client.post(format!("{}/api/members", launch.coordinator))
         .json(&body).send().await.map_err(|e| RegistrationFailure::Connection(format!("self-registration: {e}")))?;
     let reply: serde_json::Value = registration_response(response, "self-registration", config.native).await?
@@ -1381,7 +1389,7 @@ mod tests {
         registry.enroll(&public, &identity.authorize_device(&public)).unwrap();
         let mut e = Enrollment { slot: Some(1), signing_pubkey: hex::encode(identity.public().signing), relay_pubkey: hex::encode(identity.public().encryption), advertise_url: "http://127.0.0.1:3601".into(), lokisigner_url: None, device_pubkey: hex::encode(&public), authorization: hex::encode(identity.authorize_device(&public)) };
         let origin = "http://localhost:3001";
-        let challenge = hex::encode(registry.issue_challenge());
+        let challenge = hex::encode(registry.issue_challenge([0; 32]).unwrap());
         let message = e.message(origin, &challenge);
         let sig: Signature = sk.sign(&message);
         let sig = sig.to_der();
