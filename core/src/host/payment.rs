@@ -102,6 +102,9 @@ struct Payment {
     approval_requested: bool,
     #[serde(default)]
     approval_started: bool,
+    /// This member explicitly chose to send the final copy, independently of approval.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    broadcast_requested: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     txid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -467,6 +470,7 @@ fn check_intent(p: &Payment, v: &Vault) -> Result<(), String> {
         || p.note_selection.len() != 1
         || p.amount_zat == 0
         || p.expiry_height <= p.target_height
+        || p.expiry_height > draft_expiry(p.target_height.saturating_add(2), v.network)?
         || p.signing_expiry.is_some_and(|e| e <= p.target_height || e > p.expiry_height)
     {
         return Err("invalid payment intent".into());
@@ -615,9 +619,9 @@ fn signing_went_ahead(earlier: &Payment, slot: u16) -> bool {
         )
 }
 
-/// Its note is free again: spent on chain, cancelled, or the payment can no longer be mined.
+/// No longer being tracked as an in-flight payment on this device.
 fn settled(p: &Payment) -> bool {
-    matches!(p.phase.as_str(), "confirmed" | "replaced" | "cancelled" | "expired")
+    matches!(p.phase.as_str(), "confirmed" | "replaced" | "cancelled" | "expired" | "dismissed")
 }
 
 /// This member holds the signed transaction and may send it, or send it again.
@@ -819,9 +823,11 @@ fn sync_control_inner(url: &str, data: &Path, pass: &str, vault: &str, v: &Vault
                         }
                         continue;
                     }
-                    // The proposer discarded its failed attempt; it never released its own
-                    // share, and it signs in every group, so the attempt can never complete.
-                    if peer.id == p.proposer && body["kind"] == "cancelled" && p.phase == "failed" {
+                    // A cancellation notice doesn't prove a round this member joined cannot
+                    // finish elsewhere. Keep that round's reservation until scan or expiry.
+                    if peer.id == p.proposer && body["kind"] == "cancelled"
+                        && p.phase == "failed" && !p.approval_started
+                    {
                         p.phase = "cancelled".into();
                         save_payment(data, pass, &p)?;
                         continue;
@@ -918,6 +924,7 @@ fn sync_control_inner(url: &str, data: &Path, pass: &str, vault: &str, v: &Vault
                     incoming.review_token = None;
                     incoming.approval_requested = false;
                     incoming.approval_started = false;
+                    incoming.broadcast_requested = false;
                     incoming.approvals.clear();
                     incoming.start_requested = false;
                     incoming.txid = None;
@@ -1000,23 +1007,25 @@ fn heights(w: &VaultWallet, v: &Vault) -> Result<(u32, u32), String> {
     // one that has not reached it. The wallet funds only from notes with at least 3
     // confirmations (`ConfirmationsPolicy::default`), so the selected note is in the tree here.
     let anchor = tip.checked_sub(2).ok_or("wallet has too few scanned blocks")?;
-    let expiry = tip
-        .checked_add(match v.network {
-            VaultNetwork::Regtest => 8_064,
-            VaultNetwork::Testnet => 24_192,
-        })
-        .ok_or("expiry overflow")?
-        .div_ceil(1_152)
-        .checked_mul(1_152)
-        .ok_or("expiry overflow")?;
-    Ok((anchor, expiry))
+    Ok((anchor, draft_expiry(tip, v.network)?))
+}
+
+fn draft_expiry(tip: u32, network: VaultNetwork) -> Result<u32, String> {
+    tip.checked_add(match network {
+        VaultNetwork::Regtest => 8_064,
+        VaultNetwork::Testnet => 24_192,
+    })
+    .ok_or("expiry overflow")?
+    .div_ceil(1_152)
+    .checked_mul(1_152)
+    .ok_or_else(|| "expiry overflow".into())
 }
 
 /// Settles this member's payments against its scanned chain, then reserves exactly the notes
-/// of the payments still in flight, so ordinary drafts pick other notes. A payment whose note a
-/// mined block spent is `confirmed` when the spend is its own transaction and `replaced`
-/// otherwise; the mempool never counts. Runs under `st.payment`.
-fn reconcile(data: &Path, pass: &str, vault: &str, w: &mut VaultWallet) -> Result<(), String> {
+/// of locally authorized payments still in flight, so ordinary drafts pick other notes.
+/// A payment whose note a mined block spent is `confirmed` when the spend is its own
+/// transaction and `replaced` otherwise; the mempool never counts. Runs under `st.payment`.
+fn reconcile(data: &Path, pass: &str, vault: &str, slot: u16, w: &mut VaultWallet) -> Result<(), String> {
     let tip = w.scanned_height()?.ok_or("wallet has no scanned blocks")?;
     let before = local_attempts(data, vault)?
         .iter()
@@ -1079,11 +1088,16 @@ fn reconcile(data: &Path, pass: &str, vault: &str, w: &mut VaultWallet) -> Resul
                 save_payment(data, pass, &p)?;
             }
         }
-        if !settled(&p) {
-            live.entry(note).or_insert((
-                zcash_client_backend::wallet::LockOwner::new(hex32(&p.attempt)?),
-                tx_expiry(&p),
-            ));
+        // Control notices cannot authorize locking this member's wallet. A started local
+        // round retains its reservation even if a reorg temporarily puts the anchor ahead.
+        let expiry = tx_expiry(&p);
+        if !settled(&p)
+            && (p.proposer == slot || p.approval_requested || p.broadcast_requested)
+            && (p.target_height <= tip || p.approval_started || p.broadcast_requested)
+            && expiry > tip
+            && live.get(&note).is_none_or(|&(_, held_expiry)| expiry > held_expiry)
+        {
+            live.insert(note, (zcash_client_backend::wallet::LockOwner::new(hex32(&p.attempt)?), expiry));
         }
     }
     w.set_reservations(&live)
@@ -1113,9 +1127,9 @@ pub(super) async fn draft(State(st): State<Shared>, Json(body): Json<Value>) -> 
         let memo = body["memo"].as_str().unwrap_or("");
         let memo_bytes = MemoBytes::from_bytes(memo.as_bytes()).map_err(|e| format!("memo: {e:?}"))?;
         let (mut w, _, _) = wallet(&data, &pass, vault, &v, url(&st)?)?;
-        // Reserve the notes of every request published so far, so this draft picks another.
+        // Refresh locally authorized reservations before selecting a note.
         let _ = sync_control(&st.config.frostd_url, &data, &pass, vault, &v);
-        reconcile(&data, &pass, vault, &mut w)?;
+        reconcile(&data, &pass, vault, v.slot, &mut w)?;
         let (anchor, expiry) = heights(&w, &v)?;
         let funding = w.propose_with_confirmation_wait(address, Some(amount), memo_bytes.clone(), st.config.native)?;
         let first = *funding.notes.first().ok_or("wallet proposed no Ironwood notes")?;
@@ -1611,11 +1625,14 @@ fn prepare_sign<'a>(
     p: &mut Payment,
     v: &'a Vault,
 ) -> Result<Option<CandidateInputs<'a>>, String> {
+    let (w, mut client, rt) = wallet(data, pass, &p.vault, v, url(st)?)?;
+    let tip = w.scanned_height()?.ok_or("wallet has no scanned blocks")?;
+    if p.target_height > tip || tx_expiry(p) <= tip {
+        return Err("payment anchor or expiry is outside the scanned chain's signing window".into());
+    }
     let mut owned = None;
     if p.proposer == v.slot {
-        let (w, mut client, rt) = wallet(data, pass, &p.vault, v, url(st)?)?;
         if p.signing_expiry.is_none() {
-            let tip = w.scanned_height()?.ok_or("wallet has no scanned blocks")?;
             p.signing_expiry = Some(signing_expiry(tip, p.expiry_height)?);
             check_intent(p, v).map_err(|_| "the approved expiry bound has passed; replace the payment")?;
         }
@@ -2111,7 +2128,7 @@ fn deliver(
     let (mut p, mut client, rt) = {
         let _guard = st.payment.lock().map_err(|e| e.to_string())?;
         let (mut w, mut client, rt) = wallet(data, pass, vault, &v, url(st)?)?;
-        reconcile(data, pass, vault, &mut w)?;
+        reconcile(data, pass, vault, v.slot, &mut w)?;
         let mut p = read_payment(data, pass, vault, attempt)?;
         if p.proposer != v.slot || !matches!(p.phase.as_str(), "ready" | "signed") {
             return Ok(p);
@@ -2179,7 +2196,12 @@ pub(super) async fn send(State(st): State<Shared>, Json(body): Json<Value>) -> R
         let (p, mut client, rt) = {
             let _guard = st.payment.lock().map_err(|e| e.to_string())?;
             let (mut w, client, rt) = wallet(&data, &pass, &vault, &v, url(&st)?)?;
-            reconcile(&data, &pass, &vault, &mut w)?;
+            let mut local = read_payment(&data, &pass, &vault, &attempt)?;
+            if can_send(&local) && !local.broadcast_requested && local.proposer != v.slot {
+                local.broadcast_requested = true;
+                save_payment(&data, &pass, &local)?;
+            }
+            reconcile(&data, &pass, &vault, v.slot, &mut w)?;
             (read_payment(&data, &pass, &vault, &attempt)?, client, rt)
         };
         if !can_send(&p) {
@@ -2208,7 +2230,7 @@ pub(super) async fn verify(State(st): State<Shared>, Json(body): Json<Value>) ->
             return Err("txid differs from this payment".into());
         }
         let (mut w, _, _) = wallet(&data, &pass, &vault, &v, url(&st)?)?;
-        reconcile(&data, &pass, &vault, &mut w)?;
+        reconcile(&data, &pass, &vault, v.slot, &mut w)?;
         let p = read_payment(&data, &pass, &vault, &attempt)?;
         let mined_height = w.mined_height(id)?;
         if p.proposer == v.slot && matches!(p.phase.as_str(), "broadcast" | "confirmed") {
@@ -2234,7 +2256,7 @@ pub(super) async fn replace(State(st): State<Shared>, Json(body): Json<Value>) -
         let v = load_vault(&st, &data, &pass, &vault)?;
         let (mut w, _, _) = wallet(&data, &pass, &vault, &v, url(&st)?)?;
         let _ = sync_control(&st.config.frostd_url, &data, &pass, &vault, &v);
-        reconcile(&data, &pass, &vault, &mut w)?;
+        reconcile(&data, &pass, &vault, v.slot, &mut w)?;
         let old = read_payment(&data, &pass, &vault, &replaced)?;
         if !stuck(&data, &v, &old, &all_payments(&data, &pass, &vault)?)? {
             return Err("only a stuck payment can be replaced".into());
@@ -2308,7 +2330,7 @@ fn watch_chain(st: &Shared, data: &Path, pass: &str, vault: &str) -> Result<(), 
                     let _guard = st.payment.lock().map_err(|e| e.to_string())?;
                     let (mut w, _, _) = wallet(&data, &pass, &vault, &v, url(&st)?)?;
                     let _ = sync_control(&st.config.frostd_url, &data, &pass, &vault, &v);
-                    reconcile(&data, &pass, &vault, &mut w)?;
+                    reconcile(&data, &pass, &vault, v.slot, &mut w)?;
                 }
                 Ok(in_flight)
             };
@@ -2344,6 +2366,15 @@ fn restore_workers(st: &Shared, data: &Path, pass: &str, vault: &str, slot: u16)
         ensure_worker(st, data, pass, vault, &attempt, slot)?;
     }
     watch_chain(st, data, pass, vault)
+}
+
+fn can_dismiss(p: &Payment, slot: u16) -> bool {
+    p.proposer != slot
+        && !p.approval_requested
+        && !p.approval_started
+        && !p.broadcast_requested
+        && matches!(p.phase.as_str(), "signing" | "not_selected" | "failed")
+        && p.raw_tx.is_none()
 }
 
 fn discardable(data: &Path, p: &Payment) -> Result<(), String> {
@@ -2438,12 +2469,18 @@ fn stop_payment(
 }
 
 /// Discards a draft or a failed unsigned payment, or cancels a request still collecting
-/// approvals, and releases its reserved note.
+/// approvals, and releases its reserved note. An unapproved peer proposal is only hidden here.
 pub(super) async fn discard(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
     with_body(st, body, |st, data, pass, body| {
         let (vault, attempt) = pair(&body)?;
         let v = load_vault(&st, &data, &pass, &vault)?;
         let mut p = read_payment(&data, &pass, &vault, &attempt)?;
+        if can_dismiss(&p, v.slot) {
+            // Keep a local tombstone so replayed notices cannot recreate the proposal.
+            p.phase = "dismissed".into();
+            save_payment(&data, &pass, &p)?;
+            return Ok(json!({"phase":"dismissed"}));
+        }
         stop_payment(&st, &data, &pass, &v, &mut p)?;
         let (mut w, _, _) = wallet(&data, &pass, &vault, &v, url(&st)?)?;
         w.release_inputs(
@@ -2480,7 +2517,7 @@ pub(super) async fn payments(
         let all = all_payments(&data, &pass, &vault)?;
         let active = st.active_payments.lock().map_err(|e| e.to_string())?.clone();
         let mut out = Vec::new();
-        for p in &all {
+        for p in all.iter().filter(|p| p.phase != "dismissed") {
             let busy = active.contains(&format!("{}/{}", p.vault, p.attempt));
             let finishing = p.proposer == v.slot && matches!(p.phase.as_str(), "ready" | "signed");
             out.push(json!({
@@ -2489,6 +2526,7 @@ pub(super) async fn payments(
                 "txid": if matches!(p.phase.as_str(), "signed" | "broadcast" | "confirmed") { p.txid.clone() } else { None },
                 "signers": p.signers, "approvals": p.approvals, "approval_requested": p.approval_requested,
                 "can_discard": p.proposer == v.slot && discardable(&data, p).is_ok(),
+                "can_dismiss": can_dismiss(p, v.slot),
                 // Any member holding the checked transaction may send it, or send it again.
                 "can_send": !busy && (can_send(p) || finishing),
                 "sending": busy && finishing,
@@ -4012,7 +4050,7 @@ mod tests {
                 &notes,
                 Some(mined),
             );
-            reconcile(&data, "pass", &vault, &mut w).unwrap();
+            reconcile(&data, "pass", &vault, 1, &mut w).unwrap();
             let read = |p: &Payment| read_payment(&data, "pass", &vault, &p.attempt).unwrap();
             let (s, r) = (read(&stuck), read(&replacement));
             assert_eq!((s.phase.as_str(), r.phase.as_str()), (stuck_ends, replacement_ends));
@@ -4038,7 +4076,7 @@ mod tests {
             let mut cancelled = read(&open);
             cancelled.phase = "cancelled".into();
             save_payment(&data, "pass", &cancelled).unwrap();
-            reconcile(&data, "pass", &vault, &mut w).unwrap();
+            reconcile(&data, "pass", &vault, 1, &mut w).unwrap();
             w.reserve_inputs(other, &[notes[1].nullifier(&fvk).to_bytes()], height + 50).unwrap();
             drop(w);
             std::fs::remove_dir_all(data).unwrap();
@@ -4090,13 +4128,13 @@ mod tests {
         };
         let read = || read_payment(&data, "pass", &vault, &p.attempt).unwrap();
 
-        reconcile(&data, "pass", &vault, &mut branch("mined", Some(mined))).unwrap();
+        reconcile(&data, "pass", &vault, 1, &mut branch("mined", Some(mined))).unwrap();
         assert_eq!(read().phase, "confirmed");
         assert_eq!(read().mined_height, Some(height + 1), "the block that mined it");
 
         // The block that mined it is reorged out; the new branch has no spend of the note.
         let mut w = branch("reorged", None);
-        reconcile(&data, "pass", &vault, &mut w).unwrap();
+        reconcile(&data, "pass", &vault, 1, &mut w).unwrap();
         let reopened = read();
         assert_eq!(reopened.phase, "broadcast", "a payment whose spend a reorg dropped is not confirmed");
         assert_eq!(reopened.txid, Some(mined.to_string()));
@@ -4109,7 +4147,7 @@ mod tests {
 
         // A branch that mines another transaction spending the note: it was replaced.
         let rival = TxId::from_bytes([13; 32]);
-        reconcile(&data, "pass", &vault, &mut branch("rival", Some(rival))).unwrap();
+        reconcile(&data, "pass", &vault, 1, &mut branch("rival", Some(rival))).unwrap();
         let replaced = read();
         assert_eq!(replaced.phase, "replaced");
         assert_eq!(replaced.replaced_by, Some(rival.to_string()));
