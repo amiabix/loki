@@ -466,6 +466,16 @@ impl RelayHttp {
             .header(AUTHORIZATION, bearer(read)?)
             .send()
             .await?;
+        // An intermediary need not return Loki's error media type or Retry-After format.
+        let reason = match response.status().as_u16() {
+            429 => Some("capacity"),
+            503 => Some("storage"),
+            500 | 502 | 504 => Some("transport"),
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            return Ok(PageRead::Unavailable { reason, sample: Vec::new() });
+        }
         let held = hold_page(&mut response).await?;
         classify_page(route, after, limit, held)
     }
