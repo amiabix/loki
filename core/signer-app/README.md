@@ -64,7 +64,9 @@ a new pairing link waits for the registration result before reporting success.
 If you cancel, enter the wrong passphrase, or LokiSigner cannot start, choose **Try again**
 or **Quit**. If the coordinator refuses a pairing, retry the saved pairing or get a new link
 from the wallet. When the existing profile has no vault data, **Start over…** lets you set it
-aside before pairing or restoring. LokiSigner moves the whole data folder to a dated sibling;
+aside before pairing or restoring. Choose it from the **LokiSigner** menu or a retry dialog.
+Opening a pairing link while the signer is running does not interrupt it or replace its profile.
+LokiSigner moves the whole data folder to a dated sibling;
 it deletes neither the folder nor its old keys in the Keychain. New and restored native profiles
 save a public random `native-key-scope`. The device login key and each new vault key use that
 scope and a distinct role, so they keep the same tags when the folder moves on the same Mac and
@@ -198,12 +200,12 @@ copy your words into the system clipboard or type them into the wallet.
 ## Verify a receive address
 
 In the **LokiSigner** menu, open **Vault addresses…**. Each active vault shows its network,
-your member slot, and the full receive address with a **Copy address** button. macOS may ask
-for Touch ID when LokiSigner first opens a vault's signer store. Use **Refresh** if you finish
-setting up a vault while the window is open.
+your member slot, and the full vault ID and receive address with a **Copy address** button.
+macOS may ask for Touch ID when LokiSigner first opens a vault's signer store. Use **Refresh**
+if you finish setting up a vault while the window is open. The window clears when the signer locks.
 
-Give senders the address copied from LokiSigner, or compare the full addresses before sharing
-the one on the wallet page. A page served by the coordinator could substitute a different
+Give senders the address copied from LokiSigner, or expand **Vault ID** and **Address** in the
+wallet and compare both full values before sharing. A page served by the coordinator could substitute a different
 address and redirect deposits. LokiSigner derives the address from the device-bound signer's
 group viewing key and checks it against the local public metadata. If it cannot verify a
 vault's address, it shows an error and offers nothing to copy. Vault names are creator-supplied
@@ -282,7 +284,8 @@ values its signer origin gives the browser signer (`LOKI_NETWORK`, `LOKI_FROSTD_
   origin it came from, and the witnesses in `nonce-witnesses.json`, the `--nonce-witnesses`
   format. A wrong passphrase saves nothing. A configuration from any coordinator other than the
   paired one is refused and the saved one is left as it was. A new pairing link for the same
-  coordinator and slot refreshes it once the member confirms and unlocks.
+  coordinator and slot refreshes it once the member confirms and unlocks. Quit the running
+  signer before opening a link to refresh its configuration.
 - **Unlock.** A plain launch shows and uses the saved configuration. A profile paired before
   configurations were saved fetches it once from its paired coordinator.
 - **Flags.** An explicit `--network`, `--frostd-url`, `--lightwalletd-url` or
@@ -312,16 +315,23 @@ HTTP coordinators need an explicit development launch:
 
 ```sh
 core/signer-app/out/LokiSigner.app/Contents/MacOS/LokiSigner native --development-http
-# Or launch with a link and member configuration:
-core/signer-app/out/LokiSigner.app/Contents/MacOS/LokiSigner pair 'loki://pair?...' \
+# Or launch with member configuration, then click Open LokiSigner in the wallet:
+core/signer-app/out/LokiSigner.app/Contents/MacOS/LokiSigner native \
   --data /path/to/member --port 3601 --development-http \
   --frostd-url http://127.0.0.1:2744 --nonce-witnesses /path/to/witnesses.json
 ```
 
+Do not pass a pairing link on a command line. Automation can launch `native --pairing-stdin`
+and supply a single link followed by a newline over standard input from a private pipe.
+
 Other member flags are the existing `loki_member_app` flags: network, lightwalletd, relay,
 nonce witnesses, and peer allowlist. Each overrides the coordinator's value for its field,
-for that launch only. For members on separate Macs, configure a reachable
-HTTPS `--advertise-url` (forwarded to the member service) and the allowed `--peer` origins.
+for that launch only. For an HTTP ceremony between separate Macs, the creator needs a reachable
+HTTPS `--advertise-url` forwarded to its member service. Confirm that origin with the creator
+separately from the invite, then add it to each joiner's local `--peer <slot=origin>` allowlist.
+The origin must resolve to public addresses; the joiner verifies TLS and does not follow redirects.
+Loopback origins on non-privileged ports are for co-located regtest or deliberate
+`--allow-loopback-peers` runs only.
 The private browser session still uses loopback; it is never sent to that public endpoint.
 The link contains only origin, slot and a random claim, never runtime configuration or keys;
 the configuration comes from that origin, as described above.

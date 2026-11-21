@@ -39,7 +39,7 @@ The audited DKG/signing on `main` runs over **frostd** (`FrostdTransport`), not 
 owned relays above. `selfcustody-testnet.sh` stands up the full self-custody stack on
 one host — the public-roster web coordinator plus N `loki_member_app` processes that
 self-register — then drives a t-of-n DKG to `active` and prints the shared address.
-Bash, Cargo, Node, Python 3, curl, and openssl are required.
+Bash, Cargo, Node, Python 3, curl 7.55+, and OpenSSL are required.
 
 ```sh
 communication/deploy/selfcustody-testnet.sh /absolute/new/member-stack
@@ -77,6 +77,42 @@ core/target/release/loki_member_app --data /absolute/member-1 --port 3601 \
 (the SSRF guard otherwise rejects loopback peer URLs). The local-passphrase file must be
 mode 0600. This is a one-host TEST setup, not production HTTPS or independent operators.
 
+## Nonce witness enrollment and upgrades
+
+Signing needs fresh receipts from two independently operated witnesses. For a new pair,
+provision the mailboxes with `core/examples/provision_nonce_witnesses.rs`. For an existing
+pair, **reuse both relay roots and their existing mailboxes**; do not run `init` again,
+replace the output configuration, or restore an older copy of `relay.sqlite3`.
+
+Stop both witnesses before upgrading. At each stopped relay, enroll each signer using the
+vault ID, FROST slot and Ed25519 signing key from the member-confirmed vault roster (not an
+unverified coordinator registry or a relay login key). Use that relay's existing mailbox ID
+from the witness configuration. Standalone payment signers use their own configured inboxes
+as witnesses, so enroll each signer on the two inboxes it uses.
+
+```sh
+loki-relay-server enroll-nonce --root /path/to/relay-root \
+  --mailbox "$MAILBOX_HEX" --vault "$VAULT_HEX" --slot "$FROST_SLOT" \
+  --signing-key "$ED25519_PUBLIC_KEY_HEX" --quota-bytes 1048576
+```
+
+Enrollment installs the new policy in place, without deleting or reassigning any legacy
+claim. Legacy CIDs still block fresh receipts for that mailbox, regardless of who presents
+them. The relay reserves claim capacity separately from ordinary objects, using the existing
+mailbox and relay byte limits as ceilings for the claim ledger. Size the budgets for both
+ledgers; each claim consumes its record bytes plus a 512-byte row allowance. Legacy records
+also count against the claim budget. An enrollment that would exceed either ceiling fails
+without changing the root. A repeat with the same key can leave or increase its quota,
+but cannot replace that key or reset its usage. If a legacy ledger is already over budget,
+keep it intact and keep signing paused rather than creating an empty replacement.
+
+Restart the upgraded witnesses and update the native clients and both browser WASM packages
+before resuming signing. The public configuration contains only endpoints and pins. A `read`
+field in an old witness file is ignored by signing clients; the provisioning tool can still
+use it to check the mailbox. Read capabilities no longer authorize claims. For browser use,
+the witness TLS proxy must allow the signer origin, `PUT`, and the `Authorization`,
+`Content-Type`, and `X-Loki-Challenge` headers. Do not downgrade or roll either witness back.
+
 ## frostd behind TLS + CORS for the in-browser signer (`frostd-tls.sh`)
 
 The in-browser (wasm) signer (`core/wasm-transport`, W3) runs frostd's POST contract from
@@ -113,11 +149,15 @@ slash), not `*` — `*` is incompatible with the `authorization` bearer header b
 ## lightwalletd behind gRPC-web + CORS for the in-browser signer (`lightwalletd-grpcweb.sh`)
 
 The in-browser signer scans the chain for its vault balance itself, from the signer page. A
-browser cannot make native gRPC calls (HTTP/2 trailers), and lightwalletd sends no CORS:
-`testnet.zec.rocks` answers a preflight with 404 and replies `application/grpc`.
-`lightwalletd-grpcweb.sh` runs Envoy (docker, `envoyproxy/envoy:v1.31.2`) with its `grpc_web`
-and CORS filters in front of lightwalletd, for ONE origin: the signer origin, where the scan
-runs. Only the `cash.z.wallet.sdk.rpc.CompactTxStreamer` service is routed.
+browser cannot make native gRPC calls (HTTP/2 trailers). `lightwalletd-grpcweb.sh` uses
+Node.js 22+ to translate binary gRPC-web to native gRPC over verified TLS. It enables CORS
+for the exact signer origin, not the wallet origin, and forwards only `GetLatestBlock` and
+height-only `GetBlockRange` (up to 500 blocks inclusive).
+
+The proxy allows four simultaneous RPCs per peer IP and 32 overall, with a 25-second
+deadline through the end of the response. A TLS terminator or tunnel shares the peer budget
+and should enforce its own per-client limits for fairness. Untrusted forwarding headers do
+not change the proxy's budget.
 
 ```sh
 ORIGIN=http://localhost:3002 communication/deploy/lightwalletd-grpcweb.sh
@@ -127,16 +167,16 @@ ORIGIN=http://localhost:3002 communication/deploy/lightwalletd-grpcweb.sh
 Check it answers the preflight for the signer origin and a gRPC-web call:
 
 ```sh
-curl -si -X OPTIONS http://127.0.0.1:9068/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo \
+curl -si -X OPTIONS http://127.0.0.1:9068/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock \
   -H 'Origin: http://localhost:3002' -H 'Access-Control-Request-Method: POST' \
   -H 'Access-Control-Request-Headers: content-type,x-grpc-web' | grep -i access-control
-printf '\0\0\0\0\0' | curl -s -X POST http://127.0.0.1:9068/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo \
+printf '\0\0\0\0\0' | curl -s -X POST http://127.0.0.1:9068/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock \
   -H 'Origin: http://localhost:3002' -H 'content-type: application/grpc-web+proto' -H 'x-grpc-web: 1' \
   --data-binary @- | strings | head -3
 ```
 
-The listener is plaintext, which suits a loopback dev signer origin; an https signer origin
-needs it behind TLS, as `frostd-tls.sh` puts frostd.
+The listener is plaintext and defaults to `LISTEN=127.0.0.1:9068`. For a public signer,
+keep it on loopback and put it behind a TLS terminator.
 
 ## Public HTTPS bringup (`public-testnet.sh`)
 
@@ -162,14 +202,18 @@ loopback test stack on `:3001`. frostd (`:2744`) is shared and supports concurre
 
 ## Packaged member (`run-member.sh`)
 
-Testers run a member from a release binary with no Rust toolchain:
+Testers run a member from an updated release binary with Bash, Python 3, and OpenSSL
+(no Rust toolchain needed). Run from a terminal that is not being recorded:
 
 ```sh
 ssh -N -L 2744:localhost:2744 omarchy   # frostd must be reachable on loopback
 communication/deploy/run-member.sh https://<coordinator>.trycloudflare.com 1
-# -> open in a browser to pair this device: http://127.0.0.1:3611/#<token>
 kill $(cat ./loki-member-1/pids)   # stop
 ```
+
+Paste the private pairing link shown on the terminal into the wallet. Do not capture
+or share the link; the fragment authorizes the local API for the member process's lifetime.
+If recovery is not set up, use the wallet to set it up and save the words privately.
 
 It self-registers to the coordinator URL (slot = 2nd arg), using `software` device storage.
 Until the peer-over-frostd change lands (gap A in the work definition), the payment review
@@ -178,6 +222,21 @@ peers: the wrapper gives the member its OWN cloudflared quick tunnel and adverti
 https URL. Once gap A lands, members need zero inbound — set `NO_TUNNEL=1` (or pass
 `ADVERTISE_URL`) to skip the per-member tunnel. Tunables: `MEMBER_BIN`, `DATA`, `PORT`,
 `FROSTD_URL`, `LWD_URL`, `NETWORK`.
+
+### Upgrade from a version that logged pairing links
+
+Both launchers now use a private pipe and keep diagnostics separate from pairing. Use an
+owned, mode-0700 data directory on a local filesystem, under a parent you trust. Keep its
+passphrase file at mode 0600; never replace it to rotate a session token.
+
+Stop affected member processes before restarting with the updated launcher and binary.
+Stopping the old process revokes its bearer, and the new process generates a fresh one;
+replace any saved wallet pairing link. Without opening or copying their contents, restrict
+or dispose of old member logs and any captured launcher output according to your retention
+policy. Preserve the profile state and its existing passphrase. Before reusing a legacy
+`run-member.sh` data directory, confirm that it and its passphrase are owned by you and
+are not symlinks, then restrict them to modes 0700 and 0600 respectively. The test-stack
+launcher still requires a new root; keep any old root needed for custody or recovery.
 
 ### Binaries
 

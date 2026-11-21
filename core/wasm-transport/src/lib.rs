@@ -24,7 +24,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
-use zeroize::Zeroizing;
 
 /// Only TLS, or plain HTTP to this machine, may carry relay traffic. Same rule as
 /// `transport::require_tls_off_loopback` — a browser can only reach frostd over https,
@@ -284,13 +283,12 @@ impl WasmFrostdTransport {
 
 /// One external nonce witness (a relay mailbox), as the operator provisions it for native
 /// members (`core/src/host/nonce_witness.rs` `WitnessConfig`): the relay's pinned signing key
-/// and run, the mailbox, and the mailbox's owner-read capability.
+/// and run, and the mailbox.
 pub struct NonceWitnessRoute {
     pub endpoint: String,
     pub key: [u8; 32],
     pub run: [u8; 32],
     pub mailbox: [u8; 32],
-    pub read: Zeroizing<[u8; 32]>,
 }
 
 const RECEIPT_CAP: usize = 4096;
@@ -305,20 +303,16 @@ pub async fn claim_nonce(
     route: &NonceWitnessRoute,
     cid: [u8; 32],
     record: &[u8],
+    challenge: [u8; 32],
+    proof: [u8; loki_relay_protocol::nonce::CLAIM_PROOF_LEN],
 ) -> Result<bool, String> {
-    use base64::Engine;
     use loki_relay_protocol::{canonical::{self, Value}, nonce};
     use sha2::Digest;
     require_tls_off_loopback(&route.endpoint)?;
     if record.is_empty() || record.len() > nonce::MAX_RECORD {
         return Err("nonce witness record size".into());
     }
-    let mut challenge = [0u8; 32];
-    rand::Rng::fill_bytes(&mut rand::rng(), &mut challenge);
-    let token = Zeroizing::new(format!(
-        "Bearer {}",
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(*route.read)
-    ));
+    let token = format!("{}{}", nonce::CLAIM_SCHEME, hex::encode(proof));
     let url = format!(
         "{}/v1/mailboxes/{}/nonces/{}",
         route.endpoint.trim_end_matches('/'),
@@ -327,7 +321,7 @@ pub async fn claim_nonce(
     );
     let resp = client
         .put(url)
-        .header("authorization", token.as_str())
+        .header("authorization", token)
         .header("content-type", "application/octet-stream")
         .header("x-loki-challenge", hex::encode(challenge))
         .body(record.to_vec())
@@ -394,19 +388,21 @@ mod wasm_api {
         key_hex: String,
         run_hex: String,
         mailbox_hex: String,
-        read_hex: String,
         cid_hex: String,
         record_hex: String,
+        challenge_hex: String,
+        proof_hex: String,
     ) -> Result<bool, JsError> {
         let route = NonceWitnessRoute {
             endpoint,
             key: hex32(&key_hex)?,
             run: hex32(&run_hex)?,
             mailbox: hex32(&mailbox_hex)?,
-            read: Zeroizing::new(hex32(&read_hex)?),
         };
         let record = hex::decode(record_hex).map_err(je)?;
-        claim_nonce(&reqwest::Client::new(), &route, hex32(&cid_hex)?, &record).await.map_err(je)
+        let mut proof = [0; loki_relay_protocol::nonce::CLAIM_PROOF_LEN];
+        hex::decode_to_slice(proof_hex, &mut proof).map_err(je)?;
+        claim_nonce(&reqwest::Client::new(), &route, hex32(&cid_hex)?, &record, hex32(&challenge_hex)?, proof).await.map_err(je)
     }
 
     /// A logged-in browser frostd client bound to one DKG session. Addressed on the relay by
@@ -566,25 +562,34 @@ mod live {
         (secret, pubkey)
     }
 
-    /// Live: the two dev witness relays `core/scripts/native_e2e.sh` provisions, named by
-    /// `LOKI_NONCE_WITNESSES` (the native `[WitnessConfig; 2]` JSON). A fresh claim is accepted
+    /// Live: two dev witness relays enrolled for the fixture identity, named by
+    /// `LOKI_NONCE_TEST_WITNESSES` (the native `[WitnessConfig; 2]` JSON). A fresh claim is accepted
     /// at each; the same claim again is a duplicate; a receipt from an unpinned key is refused.
     #[tokio::test]
-    #[ignore = "needs two provisioned witness relays (LOKI_NONCE_WITNESSES)"]
+    #[ignore = "needs two enrolled dev witness relays (LOKI_NONCE_TEST_WITNESSES)"]
     async fn witnesses_accept_a_claim_once_and_refuse_a_duplicate() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use loki_relay_protocol::{nonce::{self, Claimant, ClaimProof}, types::RelayPin};
         #[derive(serde::Deserialize)]
-        struct Config { endpoint: String, key: [u8; 32], run: [u8; 32], mailbox: [u8; 32], read: [u8; 32] }
-        let path = std::env::var("LOKI_NONCE_WITNESSES").expect("LOKI_NONCE_WITNESSES");
+        struct Config { endpoint: String, key: [u8; 32], run: [u8; 32], mailbox: [u8; 32] }
+        let path = std::env::var("LOKI_NONCE_TEST_WITNESSES").expect("LOKI_NONCE_TEST_WITNESSES");
         let configs: [Config; 2] = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         let client = reqwest::Client::new();
         let mut cid = [0u8; 32];
         rand::Rng::fill_bytes(&mut rand::rng(), &mut cid);
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let claimant = Claimant { vault: [8; 32], slot: 1, key: key.verifying_key().to_bytes() };
         for c in configs {
-            let route = NonceWitnessRoute { endpoint: c.endpoint, key: c.key, run: c.run, mailbox: c.mailbox, read: Zeroizing::new(c.read) };
-            assert!(claim_nonce(&client, &route, cid, b"first use").await.unwrap(), "fresh claim");
-            assert!(!claim_nonce(&client, &route, cid, b"first use").await.unwrap(), "duplicate is not fresh");
+            let route = NonceWitnessRoute { endpoint: c.endpoint, key: c.key, run: c.run, mailbox: c.mailbox };
+            let pin = RelayPin { key: c.key, run: c.run };
+            let proof = |n| ClaimProof {
+                claimant,
+                signature: key.sign(&nonce::claim_input(claimant, &pin, c.mailbox, cid, [n; 32], b"first use")).to_bytes(),
+            }.to_bytes();
+            assert!(claim_nonce(&client, &route, cid, b"first use", [1; 32], proof(1)).await.unwrap(), "fresh claim");
+            assert!(!claim_nonce(&client, &route, cid, b"first use", [2; 32], proof(2)).await.unwrap(), "duplicate is not fresh");
             let forged = NonceWitnessRoute { key: [9; 32], ..route };
-            assert!(claim_nonce(&client, &forged, cid, b"first use").await.is_err(), "unpinned key");
+            assert!(claim_nonce(&client, &forged, cid, b"first use", [3; 32], proof(3)).await.is_err(), "unpinned key");
         }
     }
 
