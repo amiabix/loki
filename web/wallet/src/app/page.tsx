@@ -65,7 +65,7 @@ function extractInvite(raw: string): string {
   const s = raw.trim();
   try {
     const url = new URL(s);
-    return new URLSearchParams(url.hash.slice(1)).get("invite") ?? url.searchParams.get("invite") ?? s;
+    return url.searchParams.has("invite") ? "" : new URLSearchParams(url.hash.slice(1)).get("invite") ?? s;
   } catch {
     return s;
   }
@@ -98,18 +98,14 @@ export default function App() {
   const [pendingInvite, setPendingInvite] = useState<string | null>(null);
   const { data: status, error: statusError, refresh: refreshStatus } = useStatus(authed === true);
 
-  // Keep new claims out of the initial request and hold them in memory across sign-in.
-  // Read legacy query links too, but remove both forms from the current history entry.
+  // Fragments stay out of the initial request. Keep the claim only in memory across sign-in.
   useEffect(() => {
     const url = new URL(window.location.href);
     const fragment = new URLSearchParams(url.hash.slice(1));
-    const code = fragment.get("invite") ?? url.searchParams.get("invite");
+    const code = fragment.get("invite");
     if (code === null) return;
-    if (fragment.has("invite")) {
-      fragment.delete("invite");
-      url.hash = fragment.toString();
-    }
-    url.searchParams.delete("invite");
+    fragment.delete("invite");
+    url.hash = fragment.toString();
     window.history.replaceState(window.history.state, "", url);
     if (code) setPendingInvite(code);
   }, []);
@@ -1003,16 +999,16 @@ function JoinVault({
   onJoined: (vault: string) => void;
 }) {
   const [invite, setInvite] = useState(initialInvite ?? "");
-  const preview = invitePreview(extractInvite(invite));
+  const code = extractInvite(invite);
+  const preview = invitePreview(code);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
   const submit = async () => {
+    if (!code) return;
     setBusy(true); setErr(null);
     try {
-      // Accept a full invite link or a raw code — pull the code out of a pasted URL.
-      const res = await api<{ vault: string }>("join", { invite: extractInvite(invite) });
-      const preview = invitePreview(extractInvite(invite));
+      const res = await api<{ vault: string }>("join", { invite: code });
       if (preview?.vault === res.vault) rememberVaultSlot(profileId, res.vault, preview.slot);
       onJoined(res.vault);
     } catch (e) { setErr((e as Error).message); }
@@ -1048,7 +1044,7 @@ function JoinVault({
         </> : <p className="text-sm text-muted">{invite ? "Preview unavailable for this invite. Ask the creator for the vault name and approval requirement before joining." : "Paste an invite to see its vault name and approval requirement."}</p>}
       </GlassCard>
       <div className="mt-4">
-        <Btn onClick={submit} disabled={!invite || busy}>
+        <Btn onClick={submit} disabled={!code || busy}>
           {busy ? "Joining…" : "Join →"}
         </Btn>
       </div>
