@@ -883,10 +883,15 @@ self.onmessage = async (e) => {
       case "payment-status":
         result = await paymentStatus(signer, payment);
         break;
-      case "address":
-        await openVault(signer, payment.vaultHex);
-        result = signer.vaultAddress();
+      case "address": {
+        const vaultHex = await vaultPathId(payment.vaultHex);
+        // A receive-address lookup must not create files for a missing vault.
+        for (const path of JSON.parse(vaultPaths(vaultHex))) await opfsPreopenRead(path);
+        const vault = JSON.parse(signer.vaultOpen(vaultHex));
+        if (!vault.ready) throw new Error("this vault is not active yet");
+        result = { vault: vault.vault_id, network: vault.network, address: signer.vaultAddress() };
         break;
+      }
       case "payment-approve":
         result = await drivePayment(signer, payment, P.witnessPins);
         break;

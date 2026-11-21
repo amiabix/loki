@@ -315,6 +315,12 @@ trycloudflare URL) gives an empty signer that cannot open the old share. Only on
 storage partition may run the signer: a Web Lock guards the Worker, its share and its nonce
 store. Other tabs using that partition refuse signer operations until the first one closes.
 
+Before sharing a browser vault's receive address, choose **Verify on signer** in the vault
+and **Open signer address** in the signer prompt. Check the new tab's origin in the browser
+address bar, then copy from that tab or compare the full vault ID and address. The read-only
+tab cannot be framed. The signer worker derives the address in the wallet's storage partition
+and passes only the public vault ID, network and address to the new tab.
+
 To remove a browser signer, save the 24 recovery words and download every vault's recovery
 backup before opening **Manage browser signer** in the unlocked wallet. Use **Open signer
 controls**, check the separate tab's address is the signer origin, and confirm removal with a

@@ -1579,6 +1579,8 @@ function VaultOverview({
   const [balance, setBalance] = useState<{ balance_zat: number } | null>(null);
   const [copied, setCopied] = useState(false);
   const [copyFailed, setCopyFailed] = useState(false);
+  const [verifyingAddress, setVerifyingAddress] = useState(false);
+  const [verifyError, setVerifyError] = useState<string | null>(null);
   const [loadVersion, setLoadVersion] = useState(0);
   const [loadErr, setLoadErr] = useState<string | null>(null);
   const [balanceErr, setBalanceErr] = useState<string | null>(null);
@@ -1646,6 +1648,14 @@ function VaultOverview({
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch { setCopyFailed(true); }
+  };
+
+  const verifyAddress = async () => {
+    setVerifyingAddress(true);
+    setVerifyError(null);
+    try { await api("verify-address", { vault: vault.vault }); }
+    catch (e) { setVerifyError((e as Error).message); }
+    finally { setVerifyingAddress(false); }
   };
 
   const requestFunds = async () => {
@@ -1737,11 +1747,21 @@ function VaultOverview({
           />
         )}
         {!address && !loadErr && <p role="status" className="mt-3 text-sm text-muted">Loading receive address…</p>}
-        {signerKind() === "native" && (
+        {signerKind() === "native" ? (
           <p className="mt-3 text-sm leading-relaxed text-muted">
             Open <strong>Vault addresses…</strong> in LokiSigner. Give senders the address copied from LokiSigner,
             or compare the full vault ID and address in both places before sharing the one shown here.
           </p>
+        ) : (
+          <>
+            <p className="mt-3 text-sm leading-relaxed text-muted">
+              Copy from the signer&apos;s own tab, or compare the full vault ID and address before sharing the address shown here.
+            </p>
+            <Btn variant="ghost" className="mt-3 text-sm" disabled={verifyingAddress} onClick={verifyAddress}>
+              {verifyingAddress ? "Waiting for the signer…" : "Verify on signer"}
+            </Btn>
+            <ErrMsg msg={verifyError} />
+          </>
         )}
       </GlassCard>
 
