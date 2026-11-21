@@ -27,9 +27,6 @@ import {
   setupBrowserRecovery,
   signerKind,
   recoveryBackup,
-  recoveryConfirm,
-  recoveryRestore,
-  recoverySetup,
   recoveryStatus,
   type CustodyMethod,
   type PairingLink,
@@ -1822,18 +1819,10 @@ function BrowserBackupCard({ vault }: { vault: string }) {
 
 // ─── recovery ───────────────────────────────────────────────────────────────
 
-/**
- * Per-vault recovery status. LokiSigner only exposes the encrypted backup; a headless
- * member keeps the original HTTP setup and restore controls.
- */
+/** The member app exposes status and encrypted backups, not the recovery words. */
 function RecoveryCard({ vault }: { vault: string }) {
   const [status, setStatus] = useState<RecoveryStatus | null>(null);
-  const [words, setWords] = useState<string | null>(null);
-  const [mode, setMode] = useState<"idle" | "restoring">("idle");
-  const [entry, setEntry] = useState("");
-  const [fingerprint, setFingerprint] = useState("");
   const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
   const [statusError, setStatusError] = useState<string | null>(null);
@@ -1861,40 +1850,10 @@ function RecoveryCard({ vault }: { vault: string }) {
     finally { setBusy(false); }
   };
 
-  const setup = async () => {
-    setBusy(true); setErr(null);
-    try {
-      const { words } = await recoverySetup();
-      setWords(words);
-    } catch (e) { setErr((e as Error).message); }
-    finally { setBusy(false); }
-  };
-
-  const confirmSetup = async () => {
-    if (!words) return;
-    setBusy(true); setErr(null);
-    try {
-      await recoveryConfirm(words);
-      setWords(null);
-      await refresh();
-    } catch (e) { setErr((e as Error).message); }
-    finally { setBusy(false); }
-  };
-
-  const restore = async () => {
-    setBusy(true); setErr(null); setMsg(null);
-    try {
-      await recoveryRestore(vault, entry.trim(), fingerprint.trim() || undefined);
-      setMsg("Access restored — your share is rebuilt.");
-      setMode("idle"); setEntry(""); setFingerprint(""); refresh();
-    } catch (e) { setErr((e as Error).message); }
-    finally { setBusy(false); }
-  };
-
   return (
     <GlassCard>
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-        <h3 data-screen-heading={!inApp && (words || mode === "restoring") ? true : undefined} className="eyebrow">{inApp ? "Recovery" : words ? "Save your recovery phrase" : mode === "restoring" ? "Restore your share" : "Recovery"}</h3>
+        <h3 className="eyebrow">Recovery</h3>
         <span className="text-xs text-muted">
           {checking ? "Checking recovery…" : statusError ? "Status unavailable" : status?.recovery_identity ? (status.recovery_backup ? "backed up" : "no vault backup yet") : "not set up"}
         </span>
@@ -1902,62 +1861,24 @@ function RecoveryCard({ vault }: { vault: string }) {
 
       {statusError && <div className="mb-3"><ErrMsg msg={`Could not check recovery: ${statusError}`} /><Btn variant="ghost" onClick={refresh}>Retry recovery status</Btn></div>}
       {checking && <p role="status" className="mb-3 text-sm text-muted">Loading recovery status…</p>}
-      {inApp ? (
+      {status && (
         <div>
-          <p className="mb-2 text-xs text-muted">Use LokiSigner for recovery words and for restoring vaults. Never enter your words on this page.</p>
-          <p className="mb-3 text-xs text-muted">Save the encrypted backup somewhere other than this Mac. If you lose this Mac without the file, the words alone cannot restore this vault.</p>
+          {inApp ? (
+            <>
+              <p className="mb-2 text-xs text-muted">Use LokiSigner for recovery words and for restoring vaults. Never enter your words on this page.</p>
+              <p className="mb-3 text-xs text-muted">Save the encrypted backup somewhere other than this Mac. If you lose this Mac without the file, the words alone cannot restore this vault.</p>
+            </>
+          ) : (
+            <>
+              <p className="mb-2 text-xs text-muted">Stop the member app before managing recovery. In the signer&apos;s private terminal, run <code>loki_member_app recovery-setup --data &lt;dir&gt;</code> to set up and confirm your words, or use <code>loki_member_app recovery-restore</code> with your backup and its fingerprint. Never enter your words on this page.</p>
+              <p className="mb-3 text-xs text-muted">Save the encrypted backup off-device and separately record its SHA-256 fingerprint from the original signer. The words alone cannot restore this vault.</p>
+            </>
+          )}
           <Btn variant="ghost" disabled={busy || checking || !!statusError || !status?.recovery_backup} onClick={download}>
             {busy ? "Downloading…" : "Download encrypted backup"}
           </Btn>
         </div>
-      ) : !status ? null : words ? (
-        <div>
-          <p className="mb-2 text-xs text-amber">
-            Write these 24 words down and keep them offline. Recovery is not active until you
-            confirm. Save each vault&apos;s encrypted backup and its fingerprint separately.
-          </p>
-          <div className="mb-3 grid grid-cols-2 gap-x-3 gap-y-2 rounded-xl border border-[var(--border)] bg-[var(--surface-2)] p-3 font-mono text-xs sm:grid-cols-3">
-            {words.split(/\s+/).map((w, i) => (
-              <span key={i}><span className="text-muted">{i + 1}.</span> {w}</span>
-            ))}
-          </div>
-          <Btn variant="mint" onClick={confirmSetup} disabled={busy}>{busy ? "Confirming…" : "I've saved them"}</Btn>
-        </div>
-      ) : mode === "restoring" ? (
-        <div>
-          <label htmlFor="restore-words" className="mb-2 block text-xs text-muted">Enter your 24 recovery words to rebuild your share.</label>
-          <textarea
-            id="restore-words"
-            value={entry}
-            onChange={(e) => setEntry(e.target.value)}
-            rows={3}
-            placeholder="word1 word2 … word24"
-            className="glass mb-3 w-full rounded-2xl p-3 font-mono outline-none"
-          />
-          <label htmlFor="restore-fingerprint" className="mb-2 block text-xs text-muted">SHA-256 fingerprint saved separately from your backup (required for a fresh restore)</label>
-          <input id="restore-fingerprint" value={fingerprint} onChange={(e) => setFingerprint(e.target.value)} autoComplete="off" spellCheck={false} className="glass mb-3 w-full rounded-2xl p-3 font-mono outline-none" />
-          <div className="grid gap-3 sm:grid-cols-2">
-            <Btn variant="mint" onClick={restore} disabled={busy || !entry.trim()}>
-              {busy ? "Restoring…" : "Restore"}
-            </Btn>
-            <Btn variant="ghost" onClick={() => { setMode("idle"); setEntry(""); setFingerprint(""); setErr(null); }}>Cancel</Btn>
-          </div>
-        </div>
-      ) : (
-        <div className="grid gap-3 sm:grid-cols-2">
-          {status && !statusError && !status.recovery_identity && (
-            <Btn variant="mint" onClick={setup} disabled={busy || checking}>
-              {busy ? "Setting up…" : "Set up recovery"}
-            </Btn>
-          )}
-          <Btn variant="ghost" disabled={checking || !!statusError || !status?.recovery_backup} onClick={() => { setMode("restoring"); setMsg(null); }}>
-            Restore access
-          </Btn>
-        </div>
       )}
-
-      {!inApp && !words && mode === "idle" && status && !statusError && !checking && !status.recovery_backup && <p className="mt-3 text-xs text-muted">No stored backup is available for this vault. A phrase alone cannot restore it here.</p>}
-      {!inApp && msg && <p role="status" className="mt-3 rounded-xl bg-mint/5 p-3 text-sm text-mint">{msg}</p>}
       <ErrMsg msg={err} />
     </GlassCard>
   );

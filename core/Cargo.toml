@@ -36,6 +36,7 @@ rand_zp            = { package = "rand", version = "0.10" }
 rand_chacha        = "0.3"
 blake2b_simd       = "1"
 blake3             = "1.8"
+rpassword          = "7" # Hidden input for local member-app recovery prompts.
 zeroize            = "1"
 bip39              = { version = "2.2.2", default-features = false, features = ["std", "zeroize"] }
 zip32              = "=0.2.1"

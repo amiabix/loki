@@ -195,20 +195,37 @@ FROSTD_URL=http://127.0.0.1:2744 node --test core/scripts/test_confirmation_wait
 
 ## Payment approval and recovery
 
-Headless recovery setup uses two authenticated requests to `POST /api/recovery-setup`.
-Send `{}` to begin. Save the returned words offline, then send `{ "words": "…" }` to activate
-them. A restart or lock before confirmation leaves setup uncommitted. The same confirmation
-also works for a legacy headless profile if you still have its original words. Keep the
-passphrase backup if you cannot confirm the original words. Interactive headless startup also
-asks you to acknowledge the words after displaying them.
+### Headless member recovery
 
-For fresh headless restores, `POST /api/recovery-restore` takes `vault`, `words`, `backup` (hex)
-and `fingerprint` (SHA-256 of the decoded backup bytes, as hex). Save that fingerprint separately
-while exporting from the original signer (`GET /api/recovery-backup?vault=…` returns it).
-The browser signer displays it during export and asks
-for it on restore. A legacy backup still works: use a fingerprint from your own trusted offline
-copy, never one supplied alongside an untrusted download. For browser backups hash the `.bin`
-bytes; for headless JSON backups hash the decoded `backup` field, not the JSON file.
+The wallet can check recovery status and download an encrypted backup. It cannot display,
+confirm, or take recovery words. Use a private terminal on the signer, without logging or recording it.
+
+1. Create a member profile as usual, then stop the member process. Run
+   `loki_member_app recovery-setup --data /path/to/member`. Enter the profile passphrase,
+   save the 24 words offline, and type `YES` to confirm. Cancelling before `YES` leaves setup
+   uncommitted. Already-confirmed words are not shown or replaced. For an unconfirmed legacy
+   profile, the command asks for its original words; keep the passphrase backup if you don't
+   have them. Interactive startup with `--coordinator-url` still offers setup.
+2. Restart the signer. After a vault has a backup, save its **Download encrypted backup** JSON
+   off-device. Separately record the SHA-256 fingerprint from the original signer: run
+   `shasum -a 256 /path/to/member/vaults/<vault-id>/signer/recovery.backup` on that machine.
+   The fingerprint is of the encrypted bytes, not the JSON file. Do not trust a fingerprint
+   supplied alongside an untrusted download.
+3. On the replacement device, create a fresh profile by starting the member app **without**
+   `--coordinator-url`, then stop it. In its private terminal run:
+
+   ```sh
+   loki_member_app recovery-restore --data /path/to/new-member \
+     --backup /path/to/loki-recovery-export.json --fingerprint <saved-sha256>
+   ```
+
+   Use the signer's normal `--network testnet`, `--secure-element apple`, or `--frostd-url`
+   settings when applicable. Enter the new profile's passphrase and the original 24 words at
+   the hidden prompts. Restart the member app normally and reconnect the wallet using the new
+   pairing link. The backup must match the independently saved fingerprint and the vault's roster.
+
+The browser signer displays its own fingerprint during export and asks for it on restore.
+For a legacy browser backup, hash the trusted offline `.bin` file.
 Existing browser profiles must re-enter their original words in the signer before making new
 backups. This does not rewrite existing backup files.
 

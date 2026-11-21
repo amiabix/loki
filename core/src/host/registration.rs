@@ -515,15 +515,10 @@ async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option
     } else if let Some(notice) = notice.filter(|_| native) {
         super::recovery::confirm_recovery(&st.config.data, &pass, notice)?;
     } else if interactive {
-        let notice: super::LocalNotice = std::sync::Arc::new(|_, words| {
-            println!("Save these 24 recovery words privately (shown once):\n{words}\nType YES and press Enter after saving them.");
-            let mut answer = String::new();
-            std::io::stdin().read_line(&mut answer).is_ok() && answer.trim() == "YES"
-        });
-        super::recovery::confirm_recovery(&st.config.data, &pass, &notice)?;
+        super::recovery::confirm_recovery(&st.config.data, &pass, &super::recovery::terminal_notice())?;
     } else if !super::recovery::exists(&st.config.data) {
         // Diagnostics stay off the startup pipe.
-        eprintln!("{} ({}) — recovery words not set up: begin and confirm with POST /api/recovery-setup", launch.name, st.config.data.display());
+        eprintln!("{} ({}) — recovery words not set up: stop the app and run loki_member_app recovery-setup in a private terminal", launch.name, st.config.data.display());
     }
     let data = st.config.data.clone();
     let secret = pass.clone();

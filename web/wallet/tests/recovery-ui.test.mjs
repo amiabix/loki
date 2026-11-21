@@ -52,8 +52,10 @@ test('the wallet Recovery card distinguishes LokiSigner from a paired headless m
 
   const status = { recovery_identity: true, recovery_backup: true };
   const headless = render(status);
-  assert.match(headless, /Restore access/);
-  assert.doesNotMatch(headless, /Download encrypted backup|Use LokiSigner/);
+  assert.match(headless, /loki_member_app recovery-setup/);
+  assert.match(headless, /loki_member_app recovery-restore/);
+  assert.match(headless, /Download encrypted backup/);
+  assert.doesNotMatch(headless, /Use LokiSigner|Restore access|<textarea|<input/);
   const lokiSigner = render({ ...status, recovery_in_app: true });
   assert.match(lokiSigner, /Download encrypted backup/);
   assert.match(lokiSigner, /Use LokiSigner/);
