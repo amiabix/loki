@@ -1,5 +1,5 @@
-//! The vault's Ironwood balance and history from lightwalletd compact blocks, for a signer with
-//! no wallet database (the in-browser signer). Trial decryption is zcash_client_backend's
+//! The vault's Ironwood balance and history as reported by lightwalletd compact blocks, for a
+//! signer with no wallet database (the in-browser signer). Trial decryption is zcash_client_backend's
 //! `scan_block`, the scanner the native wallet runs through `scan_cached_blocks`. Spends are
 //! found by matching every compact action's nullifier against the vault's own notes, so the
 //! scan state is just those notes plus the last block scanned.
@@ -118,12 +118,28 @@ pub struct ChainScan {
     prior: Option<BlockMetadata>,
     /// Where a fresh scan starts: the vault's birth height.
     birth: u32,
+    source: Option<String>,
 }
 
 impl ChainScan {
     pub fn new(network: VaultNetwork, fvk: &FullViewingKey, birth: u32) -> Result<Self, String> {
         let ufvk = UnifiedFullViewingKey::from_orchard_fvk(fvk.clone()).map_err(|e| format!("vault viewing key: {e:?}"))?;
-        Ok(Self { network, keys: ScanningKeys::from_account_ufvks([(0u32, ufvk)]), notes: BTreeMap::new(), prior: None, birth })
+        Ok(Self { network, keys: ScanningKeys::from_account_ufvks([(0u32, ufvk)]), notes: BTreeMap::new(), prior: None, birth, source: None })
+    }
+
+    /// A new provider cannot vouch for compact transactions scanned from the old one,
+    /// even if both providers report identical block hashes.
+    pub fn use_source(&mut self, source: &str, birth: u32) {
+        if self.source.as_deref() != Some(source) || self.birth != birth {
+            self.reset();
+            self.birth = birth;
+            self.source = Some(source.to_owned());
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.prior = None;
+        self.notes.clear();
     }
 
     /// The last block scanned, if any.
@@ -134,6 +150,17 @@ impl ChainScan {
     /// The height of the next block to scan.
     pub fn next_height(&self) -> u32 {
         self.height().map_or(self.birth, |h| h.saturating_add(1))
+    }
+
+    /// Check the provider's block at the persisted height without accepting any transaction data.
+    pub fn matches_checkpoint(&self, bytes: &[u8]) -> Result<bool, String> {
+        let prior = self.prior.as_ref().ok_or("no scanned block to check")?;
+        let mut block = CompactBlock::decode(bytes).map_err(|e| format!("checkpoint block: {e}"))?;
+        if block.height != u64::from(prior.block_height()) {
+            return Err("lightwalletd returned an invalid scan checkpoint".into());
+        }
+        validate_compact_block(&mut block)?;
+        Ok(block.hash() == prior.block_hash())
     }
 
     /// Scan the next compact block (protobuf bytes, as lightwalletd streams it). Blocks must
@@ -217,7 +244,7 @@ impl ChainScan {
             ironwood: m.ironwood_tree_size(),
         });
         let notes = self.notes.iter().map(|(nf, n)| (hex::encode(nf), n.clone())).collect();
-        serde_json::to_vec(&Saved { version: 1, birth: self.birth, tip, notes }).expect("scan state serializes")
+        serde_json::to_vec(&Saved { version: 1, birth: self.birth, tip, notes, source: self.source.clone() }).expect("scan state serializes")
     }
 
     /// Resume from [`Self::to_bytes`].
@@ -227,6 +254,7 @@ impl ChainScan {
             return Err(format!("scan state version {} is not supported", saved.version));
         }
         let mut scan = Self::new(network, fvk, saved.birth)?;
+        scan.source = saved.source;
         scan.prior = saved.tip.map(|t| -> Result<_, String> {
             let hash: [u8; 32] = hex::decode(&t.hash).ok().and_then(|h| h.try_into().ok()).ok_or("scan state: bad block hash")?;
             Ok(BlockMetadata::from_parts(t.height.into(), BlockHash(hash), t.sapling, t.orchard, t.ironwood))
@@ -277,7 +305,7 @@ impl ChainScan {
 struct Tip { height: u32, hash: String, sapling: Option<u32>, orchard: Option<u32>, ironwood: Option<u32> }
 
 #[derive(Serialize, Deserialize)]
-struct Saved { version: u8, birth: u32, tip: Option<Tip>, notes: Vec<(String, Received)> }
+struct Saved { version: u8, birth: u32, tip: Option<Tip>, notes: Vec<(String, Received)>, source: Option<String> }
 
 /// A compact transaction id as explorers show it (byte-reversed hex).
 fn tx_id(bytes: &[u8]) -> String {

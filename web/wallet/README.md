@@ -245,6 +245,14 @@ What a deploy must provide on the signer server (`serve.mjs` env):
 | `LOKI_LIGHTWALLETD_GRPCWEB_URL` | lightwalletd behind gRPC-web + CORS for the signer origin (`communication/deploy/lightwalletd-grpcweb.sh`); the browser signer scans the chain through it for its vault balance and history |
 | `LOKI_SIGNER_PORT` | listen port (default 3002) |
 
+Wallet chain results carry `chain_trust: "provider_reported"`. The native and browser
+signers check their saved block against the configured lightwalletd, even with no new
+blocks. A fork, shorter chain, changed endpoint, or legacy scan with no recorded
+endpoint can require a rescan from the vault's birth. The browser tracks the gRPC-web
+URL; if the proxy's upstream changes, change the configured URL to trigger a rescan.
+These checks do not independently authenticate compact transactions or prove consensus
+or inclusion. Use a lightwalletd backed by a node you trust for balances and mining status.
+
 The coordinator (this app) serves the same values to the native signer at
 `GET /api/signer-config`: network, frostd, lightwalletd and the witnesses, read from
 `${NEXT_PUBLIC_SIGNER_ORIGIN}/config.json` on each request (the origin is inlined at build time,
