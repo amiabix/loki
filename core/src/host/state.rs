@@ -418,6 +418,8 @@ pub struct AppState {
     pub payment: std::sync::Mutex<()>,
     pub active_payments: std::sync::Mutex<BTreeSet<String>>,
     pub active_dkgs: std::sync::Mutex<BTreeSet<String>>,
+    /// The creator's frostd loop answering joiners is running (`ceremony::spawn_join_relay`).
+    pub(super) join_relay: std::sync::atomic::AtomicBool,
     /// Device login registry, built lazily from `data/recovery.pub` + `data/devices.json` once
     /// a recovery identity exists. Holds outstanding challenges in-process across requests.
     pub device_auth: std::sync::Mutex<Option<crate::signer::device_auth::DeviceRegistry>>,
@@ -448,6 +450,7 @@ impl AppState {
             payment: std::sync::Mutex::new(()),
             active_payments: std::sync::Mutex::new(BTreeSet::new()),
             active_dkgs: std::sync::Mutex::new(BTreeSet::new()),
+            join_relay: std::sync::atomic::AtomicBool::new(false),
             device_auth: std::sync::Mutex::new(None),
             approval: None,
             roster_confirmation: None,

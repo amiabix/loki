@@ -459,6 +459,21 @@ mod wasm_api {
             self.session.ok_or_else(|| JsError::new("no session bound — call useSession first"))
         }
 
+        /// Open a session of these participants (hex pubkeys) and bind it; returns its id. A
+        /// joiner opens one with the vault creator for each join request.
+        #[wasm_bindgen(js_name = openSession)]
+        pub async fn open_session(&mut self, peers: Vec<String>) -> Result<String, JsError> {
+            let peers = peers.iter().map(|p| hex32(p)).collect::<Result<Vec<_>, _>>()?;
+            let session = self.inner.open(&peers, 2).await.map_err(je)?;
+            self.session = Some(session);
+            Ok(session.to_string())
+        }
+
+        /// Close the bound session this member opened.
+        pub async fn close(&self) -> Result<(), JsError> {
+            self.inner.close(self.session()?).await.map_err(je)
+        }
+
         /// The bound session's participants and the member who opened it (its coordinator), as
         /// JSON `{participants: [hex], coordinator: hex | null}`.
         #[wasm_bindgen(js_name = sessionInfo)]

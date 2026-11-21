@@ -387,7 +387,7 @@ fn wallet(
     rt.block_on(w.sync(&mut client))?;
     Ok((w, client, rt))
 }
-fn relay(identity: &Identity, url: &str) -> Result<FrostdTransport, String> {
+pub(super) fn relay(identity: &Identity, url: &str) -> Result<FrostdTransport, String> {
     let raw = Zeroizing::new(identity.to_secret_bytes());
     let secret: [u8; 32] = raw[34..].try_into().map_err(|_| "identity secret length")?;
     // Log in to the relay with the member's own X25519 key, so its relay address matches the

@@ -136,6 +136,34 @@ impl SealedPeer {
         }
         own.seal_session(recipient, context, kind, body).map(Self)
     }
+
+    /// A joiner's request to a vault creator that does not know the joiner yet. The joiner's
+    /// slot and signing key go in the clear before the envelope; the creator takes the
+    /// encryption key from the relay sender ([`SealedPeer::join_sender`]), so the envelope opens
+    /// only for that identity.
+    pub fn seal_join(
+        own: &Identity,
+        creator: &PublicIdentity,
+        context: &SessionContext,
+        body: &[u8],
+    ) -> Result<Self, String> {
+        let me = own.public();
+        let mut wire = me.id.to_be_bytes().to_vec();
+        wire.extend_from_slice(&me.signing);
+        wire.extend(own.seal_session(creator, context, MessageKind::PeerRequest, body)?);
+        Ok(Self(wire))
+    }
+
+    /// The identity a join request from relay sender `from` names, and its envelope.
+    pub fn join_sender<'a>(from: &[u8; 32], wire: &'a [u8]) -> Result<(PublicIdentity, &'a [u8]), String> {
+        if wire.len() < 34 {
+            return Err("short join request".into());
+        }
+        let signing: [u8; 32] = wire[2..34].try_into().unwrap();
+        ed25519_dalek::VerifyingKey::from_bytes(&signing).map_err(|_| "invalid joiner signing key")?;
+        let id = u16::from_be_bytes([wire[0], wire[1]]);
+        Ok((PublicIdentity { id, signing, encryption: *from }, &wire[34..]))
+    }
 }
 
 /// A candidate PCZT end-to-end encrypted and signed from one selected signer to another.
