@@ -14,7 +14,9 @@ export function invitePreview(code: string): { vault: string; name: string; memb
 
 export function paymentLabel(phase: string, ready: boolean, sending: boolean): string {
   if (phase === "confirmed") return "Confirmed";
-  if (phase === "replaced") return "Replaced · will never be sent";
+  if (phase === "replaced") return "Replaced";
+  if (phase === "spent_unverified") return "Input spent · payment unverified";
+  if (phase === "awaiting_verification") return "Awaiting transaction verification";
   if (phase === "broadcast") return "Awaiting confirmation";
   if (phase === "expired") return "Expired";
   if (phase === "failed") return "Failed · not sent";
@@ -34,42 +36,6 @@ export function emptyHistoryText(lokiSigner: boolean): string {
   return lokiSigner
     ? "Outgoing payment requests and sent payments will appear here. Incoming deposits aren’t listed."
     : "Payments sent and received by this vault will appear here.";
-}
-
-// A short, human-comparable rendering of the roster fingerprint, so members can read it aloud on a
-// call or eyeball it on another phone instead of trusting a coordinator-shown hex string. Pure and
-// deterministic; the fingerprint itself is untouched. Every byte folds into every slot (XOR), so a
-// swapped roster cannot collide by matching a shared prefix.
-const VERIFY_WORDS = [
-  "anchor", "apple", "arrow", "bacon", "badge", "beach", "bird", "blade",
-  "bloom", "bolt", "brick", "cabin", "cable", "camel", "candle", "cargo",
-  "cedar", "cliff", "cloud", "clover", "coral", "crane", "crown", "daisy",
-  "delta", "dragon", "eagle", "ember", "falcon", "fern", "flame", "forest",
-  "frost", "garden", "ginger", "globe", "grape", "harbor", "hawk", "honey",
-  "island", "jaguar", "jungle", "kettle", "lagoon", "lantern", "lemon", "lotus",
-  "maple", "marble", "meadow", "meteor", "mint", "moon", "nebula", "ocean",
-  "olive", "orbit", "otter", "panda", "parrot", "pearl", "pepper", "planet",
-  "pond", "prism", "quartz", "quill", "rabbit", "raven", "reef", "river",
-  "rocket", "ruby", "saddle", "sage", "salmon", "shadow", "shark", "shell",
-  "silver", "sloth", "spark", "sphinx", "spruce", "star", "storm", "summit",
-  "swan", "tiger", "timber", "topaz", "torch", "trail", "tulip", "turtle",
-  "velvet", "violet", "walnut", "whale", "willow", "wolf", "zebra", "zephyr",
-];
-const VERIFY_EMOJI = ["🦊", "🐻", "🦉", "🐢", "🐙", "🦋", "🌵", "🍀", "🔥", "❄️", "🌙", "⚡", "🌊", "🍎", "🚀", "💎"];
-
-export function verifyPhrase(fingerprint: string | undefined): { words: string[]; emoji: string[] } | null {
-  const hex = fingerprint?.trim().toLowerCase();
-  if (!hex || hex.length % 2 !== 0 || !/^[0-9a-f]+$/.test(hex)) return null;
-  const bytes = Uint8Array.from(hex.match(/../g)!, (b) => parseInt(b, 16));
-  const fold = (slots: number) => {
-    const acc = new Uint8Array(slots);
-    bytes.forEach((b, i) => { acc[i % slots] ^= b; });
-    return acc;
-  };
-  return {
-    words: Array.from(fold(5), (b) => VERIFY_WORDS[b % VERIFY_WORDS.length]),
-    emoji: Array.from(fold(4), (b) => VERIFY_EMOJI[b % VERIFY_EMOJI.length]),
-  };
 }
 
 // shortcut: status omits the viewer's slot; retain successful joins until the API exposes it.

@@ -69,6 +69,7 @@ globalThis.fetch = (input, init) => {
 const replies = new Map();
 const asked = [];
 globalThis.self = globalThis;
+self.addEventListener = () => {};
 self.postMessage = (msg) => {
   if (msg.ask !== undefined) {
     // The member accepts the roster and confirms the roster code on the signer page.
@@ -102,7 +103,9 @@ const freePort = () => new Promise((ok) => { const s = createServer().listen(0, 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function memberApp(data, port) {
-  const child = spawn(bin, ["--data", data, "--port", String(port), "--frostd-url", frostdUrl, "--advertise-url", "http://127.0.0.1:9"], { stdio: ["ignore", "pipe", "pipe"] });
+  // The advertised URL is a closed port; the peer listener it would front is never dialed.
+  const peerPort = await freePort();
+  const child = spawn(bin, ["--data", data, "--port", String(port), "--frostd-url", frostdUrl, "--peer-port", String(peerPort), "--advertise-url", "http://127.0.0.1:9"], { stdio: ["ignore", "pipe", "pipe"] });
   let log = "";
   child.stdout.on("data", (b) => { log += b; });
   child.stderr.on("data", (b) => { log += b; });

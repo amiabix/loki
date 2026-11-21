@@ -59,9 +59,9 @@ impl RelayHttp {
     pub async fn claim_nonce(
         &self,
         route: &RelayRoute,
-        owner_read: &Secret32,
         cid: Id32,
         wire: &[u8],
+        authorize: impl FnOnce(Id32) -> nonce::ClaimProof,
     ) -> ClientResult<bool> {
         crate::validate_endpoint(&route.endpoint, self.development)?;
         if wire.is_empty() || wire.len() > nonce::MAX_RECORD {
@@ -69,6 +69,7 @@ impl RelayHttp {
         }
         let mut challenge = [0; 32];
         getrandom::fill(&mut challenge).map_err(|_| ClientError::Crypto)?;
+        let proof = authorize(challenge);
         let url = format!(
             "{}/v1/mailboxes/{}/nonces/{}",
             route.endpoint.trim_end_matches('/'),
@@ -78,7 +79,7 @@ impl RelayHttp {
         let mut response = self
             .client
             .put(url)
-            .header(AUTHORIZATION, bearer(owner_read)?)
+            .header(AUTHORIZATION, format!("{}{}", nonce::CLAIM_SCHEME, hex::encode(proof.to_bytes())))
             .header(CONTENT_TYPE, "application/octet-stream")
             .header("x-loki-challenge", hex::encode(challenge))
             .body(wire.to_vec())
@@ -220,7 +221,25 @@ impl RelayHttp {
         expires: u64,
         retire: bool,
     ) -> ClientResult<CreationResult> {
-        let request = loki_relay_protocol::http::encode_setup_control(creation, expires, retire)?;
+        use loki_relay_protocol::http::NamespaceAction;
+        let action = if retire {
+            NamespaceAction::RetireSetup
+        } else {
+            NamespaceAction::ReserveSetup
+        };
+        self.namespace_control(route, provision, creation, expires, action)
+            .await
+    }
+    pub async fn namespace_control(
+        &self,
+        route: &RelayRoute,
+        provision: &Secret32,
+        creation: &[u8],
+        expires: u64,
+        action: loki_relay_protocol::http::NamespaceAction,
+    ) -> ClientResult<CreationResult> {
+        let request =
+            loki_relay_protocol::http::encode_namespace_control(creation, expires, action)?;
         let creation = decode_creation(creation)?;
         let (status, body) = self.control(route, provision, &request, "/setup").await?;
         if status != 200 && status != 201 {
@@ -465,6 +484,16 @@ impl RelayHttp {
             .header(AUTHORIZATION, bearer(read)?)
             .send()
             .await?;
+        // An intermediary need not return Loki's error media type or Retry-After format.
+        let reason = match response.status().as_u16() {
+            429 => Some("capacity"),
+            503 => Some("storage"),
+            500 | 502 | 504 => Some("transport"),
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            return Ok(PageRead::Unavailable { reason, sample: Vec::new() });
+        }
         let held = hold_page(&mut response).await?;
         classify_page(route, after, limit, held)
     }

@@ -14,14 +14,21 @@ function usePoll<T>(
   const [error, setError] = useState<string | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fetcherRef = useRef(fetcher);
+  const requested = useRef(0);
+  const applied = useRef(0);
   fetcherRef.current = fetcher;
 
   const run = useCallback(async () => {
+    const request = ++requested.current;
     try {
       const d = await fetcherRef.current();
+      if (request < applied.current) return;
+      applied.current = request;
       setData(d);
       setError(null);
     } catch (e) {
+      if (request < applied.current) return;
+      applied.current = request;
       setError((e as Error).message);
     }
   }, []);

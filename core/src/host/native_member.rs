@@ -21,7 +21,6 @@ struct NativeMember {
     state: Shared,
     viewing_keys: Mutex<BTreeMap<(String, u16), (SignerViewingKey, VaultNetwork)>>,
     stop: Arc<NativeStop>,
-    #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
     notice: Option<LocalNotice>,
 }
 
@@ -46,16 +45,13 @@ static KEY_RECOVERY: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 struct NativeScope;
 
 impl NativeScope {
-    fn install(state: &Shared, stop: Arc<NativeStop>, _notice: Option<LocalNotice>) -> Result<Self, String> {
+    fn install(state: &Shared, stop: Arc<NativeStop>, notice: Option<LocalNotice>) -> Result<Self, String> {
         let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
         if running.is_some() {
             return Err("LokiSigner is already running.".into());
         }
         KEY_RECOVERY.lock().map_err(|_| "LokiSigner could not access profile recovery.")?.take();
-        *running = Some(Arc::new(NativeMember { state: state.clone(), viewing_keys: Mutex::default(), stop,
-            #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
-            notice: _notice,
-        }));
+        *running = Some(Arc::new(NativeMember { state: state.clone(), viewing_keys: Mutex::default(), stop, notice }));
         Ok(Self)
     }
 }
@@ -99,7 +95,7 @@ pub(crate) fn run_native(
     let roster_confirmation: LocalRosterConfirmation = Arc::new(move |summary|
         roster_stop.decision(super::RosterAnswer::NoAnswer, || roster_confirmation(summary)));
     super::run_local_with(config, Some(pass), Some(notice.clone()), Some(approval), Some(roster_confirmation),
-        fetched, Some(&stop.wake), Some(connect), |state| NativeScope::install(state, stop.clone(), Some(notice)))
+        fetched, false, Some(&stop.wake), Some(connect), |state| NativeScope::install(state, stop.clone(), Some(notice)))
 }
 
 pub(crate) fn request_stop() -> bool {
@@ -108,6 +104,25 @@ pub(crate) fn request_stop() -> bool {
         if let Some(tabs) = &member.state.wallet_tabs { tabs.close(); }
         member.stop.wake.notify_one();
         true
+    }))
+}
+
+pub(super) fn clear_addresses_on_lock(state: &Shared) {
+    let member = RUNNING.lock().ok().and_then(|running| {
+        running.as_ref().filter(|member| Arc::ptr_eq(&member.state, state)).cloned()
+    });
+    if let Some(member) = member {
+        member.viewing_keys.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        if let Some(notice) = &member.notice { notice("locked", ""); }
+    }
+}
+
+/// A main-thread check before displaying or copying a result. Never wait for a session writer.
+#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+pub(crate) fn can_view_addresses() -> bool {
+    RUNNING.lock().is_ok_and(|running| running.as_ref().is_some_and(|member| {
+        !member.stop.requested.load(Ordering::Acquire)
+            && member.state.session.try_read().is_ok_and(|session| session.is_some())
     }))
 }
 
@@ -316,7 +331,7 @@ impl NativeMember {
             let slot = c.my_slot;
             let label = vault_label(&c.name);
             let row = match self.address(data, pass, vault, slot, &c.name) {
-                Ok((network, address)) => json!({ "name": label, "slot": slot, "network": network, "address": address }),
+                Ok((network, address)) => json!({ "vault": vault, "name": label, "slot": slot, "network": network, "address": address }),
                 Err(error) => json!({ "name": label, "slot": slot, "error": error }),
             };
             rows.push(row);
@@ -619,7 +634,7 @@ mod tests {
         let se = SoftwareSecureElement::persistent(&signer_dir, PASS).unwrap();
         let raw = encode_share(&share.serialize().unwrap(), &public.serialize().unwrap(), &vs);
         store.write(&se, FileKind::Share, 0, &raw).unwrap();
-        let correct = json!({ "name": "Shared reserve", "slot": SLOT, "network": "testnet", "address": expected });
+        let correct = json!({ "vault": id_hex, "name": "Shared reserve", "slot": SLOT, "network": "testnet", "address": expected });
         assert_eq!(vault_addresses().unwrap(), vec![correct.clone()]);
         #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
         {

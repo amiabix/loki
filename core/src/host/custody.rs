@@ -29,7 +29,6 @@ use crate::{
         store::{FileKind, SignerStore},
         Network,
     },
-    state::MemberDir,
     vault, zip2005,
 };
 
@@ -103,7 +102,8 @@ pub(super) fn open_signer_with_reason(
     let threshold = public.min_signers().ok_or("share has no threshold")?;
     let members = u16::try_from(public.verifying_shares().len()).map_err(|_| "member count")?;
     let fvk = group_viewing_key(&public, &vs)?;
-    let nonces = NonceStore::open_at_epoch(&sdir.join("nonces"), epoch).map_err(|e| e.to_string())?;
+    let nonces = NonceStore::open_at_epoch(&sdir.join("nonces"), epoch, store.vault(), slot)
+        .map_err(|e| e.to_string())?;
     LocalSigner::from_restored(
         slot, threshold, members, store.vault(), vault.to_owned(), store.network(), se,
         &key, public_bytes, fvk, epoch, nonces, approval, None,
@@ -243,7 +243,7 @@ pub(super) fn is_legacy(sealed: &Value) -> bool {
 ///    address, so signing works without `vault.sealed`'s copy;
 /// 3. only then rewrites `vault.sealed` (atomically) without `key_package` and `vault_secret`,
 ///    deletes the software KEK the store no longer uses (apple), and deletes the passphrase-only
-///    `backup.sealed` once the recovery backup sealed to the 24 words exists.
+///    `backup.sealed` only after publishing a verified replacement to confirmed words.
 ///
 /// Recovery is untouched: `recovery.backup` and the words open exactly as before. Limits: the
 /// old files are unlinked, not securely erased, so a copy taken before migration (or a disk
@@ -309,7 +309,7 @@ pub(super) fn migrate(
     object.remove("vault_secret");
     let bytes = zeroize::Zeroizing::new(serde_json::to_vec(&stripped).map_err(|e| e.to_string())?);
     // `write_sealed` never replaces a file: seal to a temporary name, then rename over.
-    let vdir = MemberDir::open(&data.join("vaults"), vault);
+    let vdir = super::ceremony::dir(data, vault)?;
     let temp = format!(".vault.sealed.{}.migrate", uuid::Uuid::new_v4());
     vdir.write_sealed(&temp, &bytes, pass).map_err(|e| e.to_string())?;
     std::fs::rename(vdir.path().join(&temp), vdir.path().join("vault.sealed"))
@@ -321,8 +321,10 @@ pub(super) fn migrate(
     if old.is_some() {
         std::fs::remove_file(&software_kek).map_err(|e| format!("remove software KEK: {e}"))?;
     }
-    if super::recovery::backup_file(&sdir).exists() {
-        super::recovery::drop_passphrase_backup(&sdir)?;
+    // The migrated vault is usable even if an old backup is corrupt. Keep that backup
+    // and report the conversion error, rather than treating presence as verification.
+    if let Err(e) = super::recovery::seal_vault_backup(data, &sdir, &id, pass) {
+        eprintln!("recovery backup not converted for vault {vault}: {e}");
     }
     Ok(())
 }
