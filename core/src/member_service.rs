@@ -10,7 +10,9 @@
 //! * Each later frame is `{"id":…,"op":<setup command>,"args":[…]}` with the same
 //!   arguments as `loki_setup_member <op>`, except that the passphrase argument is
 //!   `@session`, private input is `@private` (bytes in `private_hex`) and backup words
-//!   are `@words` (text in `words`). The reply is `{"id":…,"ok":true,"result":…}` or
+//!   are `@words` (text in `words`). A vault target is a lowercase 32-byte hex ID
+//!   or its full path under `<data>/vaults`. Explicit input and export paths keep
+//!   their CLI meanings. The reply is `{"id":…,"ok":true,"result":…}` or
 //!   `{"id":…,"ok":false,"error":…}`, with the CLI's result and error strings.
 //! * `{"op":"lock"}` or end of stdin stops the service: no new work is accepted,
 //!   commands in flight get [`STOP_GRACE`] to finish, then the session key cache and
@@ -21,14 +23,15 @@
 //! `.setup.lock` only while it runs and drops it, as the CLI does, so other tools see
 //! the same locks. What the service adds is one process: the Tokio runtime, relay
 //! connections and endpoint checks, and the Argon2id keys for this passphrase stay
-//! warm between commands. Nothing is written that the CLI would not write, and the
-//! passphrase never reaches a file, argv, the environment or stderr.
+//! warm between commands. The passphrase never reaches a file, argv, the
+//! environment or stderr.
 
+use crate::setup_ceremony::journal;
 use crate::setup_relay::{backup_command_with, command_with, BackupCommandOutput, Inputs};
 use crate::state::MemberDir;
 use serde_json::{json, Value};
 use std::io::{BufRead, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use zeroize::{Zeroize, Zeroizing};
@@ -60,6 +63,7 @@ const FRAME_LIMIT: usize = 64 * 1024;
 pub struct Service {
     passphrase: Zeroizing<String>,
     data: PathBuf,
+    vaults: PathBuf,
 }
 
 fn wipe(value: &mut Value) {
@@ -113,9 +117,14 @@ impl Service {
         if !data.is_absolute() {
             return Err("service_frame".into());
         }
+        let resolved = data.canonicalize().map_err(|_| "service_unlock")?;
+        let profile = MemberDir::open(&resolved, "profile");
+        journal::check_private_root(profile.path()).map_err(|_| "service_unlock")?;
+        journal::checked_file(&profile.path().join("profile.sealed"))
+            .map_err(|_| "service_unlock")?;
         // The profile key is the first cached derivation; a failed check forgets it.
         crate::seal_kdf::enable_session_cache(&passphrase);
-        let checked = MemberDir::open(&data, "profile")
+        let checked = profile
             .read_sealed("profile.sealed", &passphrase)
             .ok()
             .map(Zeroizing::new)
@@ -125,11 +134,47 @@ impl Service {
             crate::seal_kdf::clear_session_cache();
             return Err("service_unlock".into());
         }
-        Ok(Self { passphrase, data })
+        Ok(Self {
+            passphrase,
+            data,
+            vaults: resolved.join("vaults"),
+        })
     }
 
-    pub fn data(&self) -> &std::path::Path {
+    pub fn data(&self) -> &Path {
         &self.data
+    }
+
+    fn vault_root(&self, target: &str, joining: bool) -> Result<String, String> {
+        const ERROR: &str = "setup_vault_path";
+        let target = Path::new(target);
+        let id = target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(ERROR)?;
+        if id.len() != 64 || !id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return Err(ERROR.into());
+        }
+        let root = self.vaults.join(id);
+        if target != Path::new(id) && target != root && target != self.data.join("vaults").join(id)
+        {
+            return Err(ERROR.into());
+        }
+        // Build from the unlocked profile, never from a request path. Private-root
+        // checks reject symlinks at either level as well as public directories.
+        for path in [&self.vaults, &root] {
+            if joining {
+                #[cfg(unix)]
+                match rustix::fs::mkdir(path, rustix::fs::Mode::RWXU) {
+                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                    Err(_) => return Err(ERROR.into()),
+                }
+            }
+            journal::check_private_root(path).map_err(|_| ERROR)?;
+        }
+        root.into_os_string()
+            .into_string()
+            .map_err(|_| ERROR.into())
     }
 
     /// Run one request frame and return its reply.
@@ -159,9 +204,13 @@ impl Service {
                 .collect::<Option<Vec<_>>>(),
             _ => None,
         };
-        let Some(args) = args else {
+        let Some(mut args) = args else {
             return reply(Err("setup_arguments".into()));
         };
+        let needs_passphrase = !matches!(op.as_str(), "setup-config-check" | "setup-status");
+        if needs_passphrase && args.get(1).map(String::as_str) != Some("@session") {
+            return reply(Err("setup_arguments".into()));
+        }
         let words = take_string(&mut frame.0, "words").map(Zeroizing::new);
         let private = match take_string(&mut frame.0, "private_hex").map(Zeroizing::new) {
             Some(text) => match hex::decode(text.as_bytes()) {
@@ -170,8 +219,17 @@ impl Service {
             },
             None => None,
         };
+        if op != "setup-config-check" {
+            let Some(root) = args.first_mut() else {
+                return reply(Err("setup_arguments".into()));
+            };
+            match self.vault_root(root, op == "setup-join") {
+                Ok(path) => *root = path,
+                Err(error) => return reply(Err(error)),
+            }
+        }
         let inputs = Inputs {
-            passphrase: Some(self.passphrase.clone()),
+            passphrase: needs_passphrase.then(|| self.passphrase.clone()),
             private,
             words,
         };
