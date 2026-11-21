@@ -138,12 +138,21 @@ After your vault is active, choose **Download encrypted backup** in the wallet's
 card. The ciphertext is stored in your LokiSigner profile on this Mac, not by the coordinator.
 **Keep the downloaded JSON somewhere other than this Mac.** If you lose the Mac and the file,
 the 24 words alone cannot recover the vault. Export one file per vault and store your words
-privately, separately from the files. Together the words and a file can recover your share.
+privately, separately from the files. Independently save each backup’s SHA-256 fingerprint
+from the original export. You’ll need it to authenticate the backup at restore time.
+
+For older exports, get the fingerprint from the original signer, or calculate it from an
+offline copy you already trust: hex-decode the JSON `backup` value, then SHA-256 the resulting
+ciphertext bytes (not the JSON file or the hex text). Use that fingerprint with the same
+exported ciphertext. A hash computed from an untrusted download, or supplied with it, does
+not establish authenticity. If you have neither an independent fingerprint nor a trusted
+copy or original signer, LokiSigner cannot safely restore that backup.
 
 On a new Mac, open LokiSigner without a pairing link. Choose **Restore from recovery words**,
 enter the original coordinator's HTTPS origin, confirm it, and review the signer configuration.
-Choose one backup file in LokiSigner, enter the 24 words, and set a new local profile passphrase.
-LokiSigner opens the file locally and checks that both recovered public identity keys identify
+Choose one backup file in LokiSigner, enter its independently saved fingerprint and 24 words,
+and set a new local profile passphrase. LokiSigner checks the fingerprint before opening the
+backup, then checks that both recovered public identity keys identify
 exactly one slot in the coordinator's roster. It saves the recovered vault and identity together,
 then registers the new Mac in that slot without reserving a new one. If the connection fails
 after saving, keep LokiSigner running or reopen and unlock it to retry. If the coordinator
@@ -185,7 +194,8 @@ back to its original name and location to undo the set-aside. If a new profile n
 location, move it out of the way without deleting it first.
 
 Restore each additional backup from **LokiSigner → Restore a vault…** in the unlocked app.
-It must belong to the same member and recovery words. It will not replace an existing vault.
+It needs the same independent fingerprint check and must belong to the same member and recovery
+words. It will not replace an existing vault.
 After the replacement registers, the coordinator's device binding and advertised endpoint
 point to the new Mac; the member slot and identity keys stay the same. This does not erase or
 revoke the old Mac's local share. Quit and retire the old signer if you still have it: a Mac

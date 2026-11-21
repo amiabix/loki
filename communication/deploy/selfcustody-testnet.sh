@@ -106,7 +106,7 @@ api() { # api <member> <method> <path> [json-body]
   local args=(-X "$method")
   if [[ -n $body ]]; then args+=(-H 'content-type: application/json' -d "$body"); fi
   # curl reads the bearer from stdin, never from its process arguments.
-  printf 'x-loki-token: %s\n' "${tokens[member]}" | curl -q -s --noproxy '*' --max-time 30 \
+  printf 'x-loki-token: %s\n' "${tokens[member]}" | curl -q -s --noproxy '*' --max-time "$([[ $path == /api/agree ]] && echo 130 || echo 30)" \
     -H @- "${args[@]}" "http://127.0.0.1:${ports[member]}$path"
 }
 jq_py() { python3 -c "import sys,json;d=json.load(sys.stdin);print($1)"; }

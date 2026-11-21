@@ -98,10 +98,45 @@ pub enum RosterAnswer {
 }
 
 /// The member's own comparison of a vault's roster code before key generation, asked on this
-/// device (the native app's dialog). Receives the summary `/api/agree` derives from the setup
-/// document as JSON. Only [`RosterAnswer::Match`] records agreement. Without one (headless),
-/// `/api/agree` trusts its caller to have compared the code.
+/// device. Receives the summary `/api/agree` derives from the setup document as JSON.
+/// Only [`RosterAnswer::Match`] records agreement; no local answer means no agreement.
 pub type LocalRosterConfirmation = std::sync::Arc<dyn Fn(&str) -> RosterAnswer + Send + Sync>;
+
+fn terminal_roster_confirmation(summary: &str) -> RosterAnswer {
+    #[cfg(unix)]
+    {
+        use rustix::{
+            event::{poll, PollFd, PollFlags, Timespec}, process::getpgrp,
+            termios::{tcflush, tcgetattr, tcgetpgrp, LocalModes, QueueSelector},
+        };
+        use std::io::{BufRead, Read, Write};
+        let ask = || -> Option<RosterAnswer> {
+            let facts: serde_json::Value = serde_json::from_str(summary).ok()?;
+            let code = facts["roster_code"].as_str()?;
+            let mut tty = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty").ok()?;
+            if tcgetpgrp(&tty).ok()? != getpgrp()
+                || !tcgetattr(&tty).ok()?.local_modes.contains(LocalModes::ICANON) { return None; }
+            tcflush(&tty, QueueSelector::IFlush).ok()?;
+            writeln!(tty, "\nLokiSigner — compare the roster on every signer's trusted screen or terminal.\n{summary}\nType the exact roster code if all codes match, or 'differ' if they do not:").ok()?;
+            let mut fds = [PollFd::new(&tty, PollFlags::IN)];
+            if poll(&mut fds, Some(&Timespec { tv_sec: 120, tv_nsec: 0 })).ok()? == 0 ||
+                !fds[0].revents().contains(PollFlags::IN) || tcgetpgrp(&tty).ok()? != getpgrp() {
+                return None;
+            }
+            let mut answer = String::new();
+            std::io::BufReader::new(tty.take(64)).read_line(&mut answer).ok()?;
+            if !answer.ends_with('\n') { return None; }
+            match answer.trim() {
+                text if text == code => Some(RosterAnswer::Match),
+                "differ" => Some(RosterAnswer::Differ),
+                _ => None,
+            }
+        };
+        ask().unwrap_or(RosterAnswer::NoAnswer)
+    }
+    #[cfg(not(unix))]
+    { let _ = summary; RosterAnswer::NoAnswer }
+}
 
 /// What a native window shows in place of a vault name it will not show.
 pub(crate) const HIDDEN_VAULT_NAME: &str = "Name hidden (unsupported characters)";
@@ -303,17 +338,18 @@ fn parse_config(args: &[String], native: bool) -> Result<Config, String> {
 
 /// Build the axum app and serve on the configured bind IP and port. Blocks.
 pub fn run(config: Config) -> Result<(), String> {
-    run_local(config, None, None, None, None)
+    run_headless(config, None, false)
 }
 
 /// Serve the member CLI. `pairing_stdout` reserves stdout for a bare link on a private pipe.
 pub fn run_headless(config: Config, approval: Option<LocalApproval>, pairing_stdout: bool) -> Result<(), String> {
-    run_local_with(config, None, None, approval, None, None, pairing_stdout, None, None, |_| Ok(()))
+    let confirm = std::sync::Arc::new(terminal_roster_confirmation);
+    run_local_with(config, None, None, approval, Some(confirm), None, pairing_stdout, None, None, |_| Ok(()))
 }
 
 /// `fetched`: the native app's confirmed configuration snapshot. Fresh settings without
-/// overrides are saved only after unlock. A member started here has no roster dialog: `/api/agree`
-/// trusts its caller to have compared the code. LokiSigner starts through `run_native`.
+/// overrides are saved only after unlock. Without a local roster prompt this entry point
+/// cannot agree. LokiSigner starts through `run_native`.
 pub fn run_local(
     config: Config,
     pass: Option<zeroize::Zeroizing<String>>,

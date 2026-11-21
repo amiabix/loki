@@ -30,6 +30,6 @@ test('payment status uses the reviewed transaction and keeps personal approval s
   assert.equal(mined.txid, 'd2'.repeat(32));
   assert.equal(mined.signatures_received, true);
   assert.equal(mined.approval_requested, false, 'mining does not prove the local member approved');
-  assert.deepEqual(mined.approvals, [1], 'the proposer cannot report this member as approved');
+  assert.deepEqual(mined.approvals, [], 'the signing list is not approval evidence');
   assert.equal(chainPaymentSession({ terms, signers: [], ended: 'cancelled', spent: null }).phase, 'cancelled');
 });

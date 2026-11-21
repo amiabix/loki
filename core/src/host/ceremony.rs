@@ -150,8 +150,8 @@ pub(super) struct Ceremony {
     // matches the creator's byte-for-byte (joiners must not reconstruct it from a guess).
     #[serde(default)]
     birth_height: Option<u32>,
-    // The roster code this member confirmed in `agree`; the signer's roster prompt matches it.
-    #[serde(default)]
+    // Do not resume from older agreement records, which may have come from HTTP alone.
+    #[serde(default, rename = "locally_confirmed_roster_code")]
     roster_code: Option<String>,
     // A joiner's copy of the creator's identity from the invite: requests go to it over frostd.
     #[serde(default)]
@@ -854,12 +854,15 @@ pub(super) async fn status(st: Shared, vault: String) -> Reply {
             }
         }
         let active = dir(&data, &vault)?.exists("vault.sealed");
+        let local_agreed = c.agreed.contains(&c.my_slot);
+        let confirmed = local_agreed && (active || c.roster_code.is_some());
+        let confirmations = c.agreed.len() - usize::from(local_agreed && !confirmed);
         let running_here = st.active_dkgs.lock().map_err(|e| e.to_string())?.contains(&vault);
         let phase = if active {
             "active"
         } else if c.error.is_some() || (c.dkg_started && !running_here) {
             "setup_interrupted"
-        } else if c.dkg_started || (c.my_slot == 1 && c.agreed.len() == usize::from(c.members)) {
+        } else if c.dkg_started || (c.my_slot == 1 && confirmations == usize::from(c.members)) {
             "creating_keys"
         } else if c.fingerprint.is_some() {
             "compare_roster"
@@ -867,13 +870,13 @@ pub(super) async fn status(st: Shared, vault: String) -> Reply {
             "waiting_for_members"
         };
         let mut value = json!({"phase":phase,"members":c.members,"threshold":c.threshold,
-            "confirmations":c.agreed.len(),"confirmed":c.agreed.contains(&c.my_slot),
+            "confirmations":confirmations,"confirmed":confirmed,
             "fingerprint":c.fingerprint,"secure_element":st.config.secure_element});
         if c.fingerprint.is_some() {
             value["roster_code"] = json!(setup_roster_code(&c, VaultNetwork::parse(&st.config.network)?).ok());
         }
         // LokiSigner asks the member to compare the code; the page shows where that stands.
-        if st.roster_confirmation.is_some() {
+        if st.config.native && st.roster_confirmation.is_some() {
             let open = st.roster_asking.lock().map_err(|e| e.to_string())?.as_deref() == Some(vault.as_str());
             let differ = st.roster_refused.lock().map_err(|e| e.to_string())?.contains(&vault);
             value["roster_dialog"] = if differ { json!("codes_differ") } else if open { json!("open") } else { Value::Null };
@@ -921,12 +924,8 @@ fn spawn_dkg(st: Shared, vault: String, data: std::path::PathBuf, pass: Zeroizin
 /// `POST /api/agree`: this member agrees to the roster whose fingerprint and 24-digit code the
 /// request names, once setup has not started, the roster is fresh and both match.
 ///
-/// With LokiSigner's roster channel attached ([`AppState::roster_confirmation`]), the request
-/// cannot agree by itself: LokiSigner shows the member the code derived here and only their
-/// "Codes match" records agreement. A headless member (`loki_member_app`, `LokiSigner serve`)
-/// has no screen and trusts its caller to have compared the code with the other members.
-///
-/// [`AppState::roster_confirmation`]: super::state::AppState::roster_confirmation
+/// The request only opens a local prompt (LokiSigner or the foreground terminal).
+/// Without an affirmative answer, it never records this member's agreement.
 pub(super) async fn agree(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
     let (Some(vault), Some(fingerprint), Some(roster_code)) =
         (body["vault"].as_str(), body["fingerprint"].as_str(), body["roster_code"].as_str())
@@ -945,11 +944,7 @@ pub(super) async fn agree(State(st): State<Shared>, Json(body): Json<Value>) -> 
     let reply = blocking(move || {
         let (st, data, pass, vault) = (&work_st, &work_data, &work_pass, &work_vault);
         let network = VaultNetwork::parse(&st.config.network)?;
-        let Some(confirm) = st.roster_confirmation.clone() else {
-            let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
-            let (c, code) = agreement(&st.config, data, pass, vault, &fingerprint, &roster_code, network)?;
-            return record_agreement(&st.config, data, pass, c, code);
-        };
+        let confirm = st.roster_confirmation.as_ref().ok_or(ROSTER_NOT_CONFIRMED)?;
         let _asking = RosterAsking::claim(st, vault)?;
         let summary = {
             let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
@@ -1340,8 +1335,8 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
         if c.dkg_started || c.error.is_some() || dir(data, vault_id)?.exists("vault.sealed") {
             return Ok(json!({"ok":true}));
         }
-        if (c.my_slot == 1 && c.agreed.len() != usize::from(c.members))
-            || (c.my_slot != 1 && !c.agreed.contains(&c.my_slot))
+        if c.roster_code.is_none() || !c.agreed.contains(&c.my_slot)
+            || (c.my_slot == 1 && c.agreed.len() != usize::from(c.members))
         {
             return Ok(json!({"ok":true}));
         }
@@ -1929,10 +1924,9 @@ mod tests {
         }
         let reply = agree(State(st.clone()),
             Json(json!({"vault":vault,"fingerprint":fingerprint,"roster_code":code}))).await;
-        assert_eq!(reply.0, StatusCode::OK, "{}", reply.1 .0);
+        assert_eq!(reply.1 .0["error"], ROSTER_NOT_CONFIRMED);
         let c = load(&data, "pass", &vault).unwrap();
-        assert!(c.agreed.contains(&1));
-        assert_eq!(c.roster_code.as_deref(), Some(code.as_str()));
+        assert!(c.agreed.is_empty() && c.roster_code.is_none());
 
         // On Testnet the code covers the birth height fixed with the roster.
         let mut c = c;
@@ -1997,7 +1991,8 @@ mod tests {
     /// An unlocked member on `data`, with LokiSigner's roster dialog when `dialog` is given.
     async fn member(data: &Path, port: u16, dialog: Option<crate::host::LocalRosterConfirmation>) -> Shared {
         std::fs::create_dir_all(data).unwrap();
-        let st = std::sync::Arc::new(AppState { roster_confirmation: dialog, ..AppState::new(test_config(data, port)) });
+        let config = Config { native: dialog.is_some(), ..test_config(data, port) };
+        let st = std::sync::Arc::new(AppState { roster_confirmation: dialog, ..AppState::new(config) });
         *st.session.write().await = Some(Session { passphrase: Zeroizing::new("pass".into()), data: data.to_owned() });
         st
     }
@@ -2715,6 +2710,8 @@ mod tests {
         });
         let file = root.join("recovery.json");
         let document = exported(&material);
+        let fingerprint_of = |doc: &Value| backup::BackupArtifact(hex::decode(doc["backup"].as_str().unwrap()).unwrap()).fingerprint();
+        let anchor = fingerprint_of(&document);
         let identity = Identity::from_secret_bytes(&material.identity).unwrap().public();
         let signing = hex::encode(identity.signing);
         let relay = hex::encode(identity.encryption);
@@ -2765,7 +2762,14 @@ mod tests {
         let bad_file = "invalid-backup";
         let mismatch = "roster-mismatch";
         let secret = |words: &str| Zeroizing::new(words.as_bytes().to_vec());
+        let restore_new = |settings: &mut Config, words: &str, origin: &str| {
+            native_recovery::restore_new(settings, pass, secret(words), &file, &anchor, origin, None)
+        };
         tokio::task::block_in_place(|| {
+            // A legitimate but different export of the very same material must not match.
+            std::fs::write(&file, exported(&material).to_string()).unwrap();
+            assert_eq!(restore_new(&mut settings, &words, &origin), Err("backup-fingerprint-mismatch"));
+            assert!(!data.exists());
             for (contents, input, expected) in [
                 (document.to_string(), other_words.as_str(), refused),
                 (wrong_vault.to_string(), words.as_str(), refused),
@@ -2774,35 +2778,35 @@ mod tests {
                 (format!(r#"{{"vault":"{vault_hex}","vault":"{vault_hex}","backup":{}}}"#, document["backup"]), words.as_str(), bad_file),
             ] {
                 std::fs::write(&file, contents).unwrap();
-                assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(input), &file, &origin, None), Err(expected));
+                assert_eq!(restore_new(&mut settings, input, &origin), Err(expected));
                 assert!(!data.exists());
             }
             assert_eq!(roster_reads.load(Ordering::SeqCst), 0, "invalid backups never reach the roster lookup");
             std::fs::write(&file, document.to_string()).unwrap();
-            assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &format!("{origin}/wallet"), None),
+            assert_eq!(restore_new(&mut settings, &words, &format!("{origin}/wallet")),
                 Err("roster-unavailable"));
-            assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None), Err(mismatch));
+            assert_eq!(restore_new(&mut settings, &words, &origin), Err(mismatch));
             assert!(!data.exists());
             *roster.lock().unwrap() = vec![entry.clone(), entry.clone()];
-            assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None), Err("roster-unavailable"));
+            assert_eq!(restore_new(&mut settings, &words, &origin), Err("roster-unavailable"));
             assert!(!data.exists());
             *roster.lock().unwrap() = vec![entry];
             settings.secure_element = "invalid fixture backend".into();
-            assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None), Err(refused));
+            assert_eq!(restore_new(&mut settings, &words, &origin), Err(refused));
             assert!(!data.exists(), "even a failure during installation must not publish the profile");
             settings.secure_element = "software".into();
             crate::profile::create(&data, pass, "Mistaken new member").unwrap();
-            assert!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None).is_err());
+            assert!(restore_new(&mut settings, &words, &origin).is_err());
             native_recovery::set_aside(&data, false).unwrap();
             std::fs::create_dir_all(data.join("signer")).unwrap();
             std::fs::write(data.join("signer/share.sealed"), b"unrecognised data").unwrap();
-            assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None),
+            assert_eq!(restore_new(&mut settings, &words, &origin),
                 Err("profile-not-fresh"));
             assert_eq!(std::fs::read(data.join("signer/share.sealed")).unwrap(), b"unrecognised data");
             std::fs::remove_dir_all(data.join("signer")).unwrap();
             std::fs::create_dir_all(data.join("profile")).unwrap();
             std::fs::write(data.join(NATIVE_KEY_SCOPE), b"interrupted write").unwrap();
-            native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None).unwrap();
+            restore_new(&mut settings, &words, &origin).unwrap();
             let archives: Vec<_> = std::fs::read_dir(&root).unwrap().map(|e| e.unwrap().path())
                 .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("restored-set-aside-")).collect();
             assert_eq!(archives.len(), 2);
@@ -2822,17 +2826,21 @@ mod tests {
 
         let s = state.clone();
         tokio::task::block_in_place(|| {
-            assert_eq!(native_recovery::restore_running(&s, secret(&words), &file), Err("profile-locked"));
+            let restore_running = |fingerprint: &str| native_recovery::restore_running(&s, secret(&words), &file, fingerprint);
+            assert_eq!(restore_running(&anchor), Err("profile-locked"));
             *s.session.blocking_write() = Some(crate::host::state::Session::unlock(data.clone(), Zeroizing::new(pass.into())).unwrap().0);
-            assert_eq!(native_recovery::restore_running(&s, secret(&words), &file), Err("vault-exists"));
+            assert_eq!(restore_running(""), Err("backup-fingerprint-mismatch"));
+            assert_eq!(restore_running(&anchor), Err("vault-exists"));
             let signer = crate::host::custody::open_signer(&s, &data, pass, &vault_hex, 1, Box::new(|_| false)).unwrap();
             assert_eq!(signer.hosted_metadata().unwrap().0.verifying_key(), public.verifying_key());
 
             // Same words with another member's valid backup must not install into a running profile.
             let (other_member, _, _) = dealer_vault(&root.join("other"), [7; 32], pass);
-            std::fs::write(&file, exported(&other_member).to_string()).unwrap();
+            let other_export = exported(&other_member);
+            let other_anchor = fingerprint_of(&other_export);
+            std::fs::write(&file, other_export.to_string()).unwrap();
             let wrong_profile = "wrong-profile";
-            assert_eq!(native_recovery::restore_running(&s, secret(&words), &file), Err(wrong_profile));
+            assert_eq!(restore_running(&other_anchor), Err(wrong_profile));
             assert!(!dir(&data, &hex::encode([7; 32])).unwrap().path().exists());
 
             // Another vault for the same member: change the vault-bound roster and fingerprint.
@@ -2843,14 +2851,16 @@ mod tests {
             vault_roster["vault"] = json!(another_hex);
             another_vault.roster = serde_json::to_vec(&vault_roster).unwrap();
             another_vault.roster_fingerprint = crate::member_state::Roster::from_bytes(&another_vault.roster).unwrap().fingerprint();
-            std::fs::write(&file, exported(&another_vault).to_string()).unwrap();
+            let another_export = exported(&another_vault);
+            let another_anchor = fingerprint_of(&another_export);
+            std::fs::write(&file, another_export.to_string()).unwrap();
             let other_pub = [other_key.public_bytes(), other_key.signing_public()].concat();
             std::fs::write(data.join("recovery.pub"), &other_pub).unwrap();
-            assert_eq!(native_recovery::restore_running(&s, secret(&words), &file), Err(wrong_profile));
+            assert_eq!(restore_running(&another_anchor), Err(wrong_profile));
             assert_eq!(std::fs::read(data.join("recovery.pub")).unwrap(), other_pub);
             assert!(!dir(&data, &another_hex).unwrap().path().exists());
             std::fs::write(data.join("recovery.pub"), &old_pub).unwrap();
-            native_recovery::restore_running(&s, secret(&words), &file).unwrap();
+            restore_running(&another_anchor).unwrap();
             assert!(dir(&data, &another_hex).unwrap().exists("vault.sealed"));
         });
 
@@ -2890,11 +2900,11 @@ mod tests {
             });
             std::fs::write(&file, document.to_string()).unwrap();
             tokio::task::block_in_place(|| {
-                assert_eq!(native_recovery::restore_new(&mut apple, pass, secret(&words), &file, &origin, None),
+                assert_eq!(restore_new(&mut apple, &words, &origin),
                     Err(KeyFailure::Cancelled.message()));
                 assert!(!apple.data.exists());
                 block_device.store(false, Ordering::SeqCst);
-                native_recovery::restore_new(&mut apple, pass, secret(&words), &file, &origin, None).unwrap();
+                restore_new(&mut apple, &words, &origin).unwrap();
             });
             assert!(!apple.data.join("device-registration-confirmed").exists());
             assert!(registration::DeviceKey::open(&apple, pass).is_ok());
