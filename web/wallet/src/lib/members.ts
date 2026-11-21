@@ -232,6 +232,7 @@ export async function issuePairingChallenge(raw: unknown, origin: string) {
   fields(body, ["slot", "onboarding_grant"]);
   publicOrigin(origin);
   const grant = grantDigest(body.onboarding_grant);
+  grantedSlot(grant);
   const requested = body.slot === undefined ? undefined : registrationSlot(body.slot);
   return changeRegistry((state, now) => {
     const { pinned, prior } = availableGrant(state, grant);
@@ -259,12 +260,14 @@ export async function issuePairingChallenge(raw: unknown, origin: string) {
 
 export async function issueRegistrationChallenge(raw: unknown, origin: string) {
   const { pairing_challenge, onboarding_grant, ...identity } = object(raw);
+  const suppliedGrant = onboarding_grant === undefined ? undefined : grantDigest(onboarding_grant);
+  if (suppliedGrant !== undefined) grantedSlot(suppliedGrant);
   const e = enrollment(identity);
   publicOrigin(origin);
+  const nonce = pairing_challenge === undefined ? undefined : hex(pairing_challenge, 32);
   return changeRegistry((state, now) => {
     let claimed: Challenge | undefined;
-    if (pairing_challenge !== undefined) {
-      const nonce = hex(pairing_challenge, 32);
+    if (nonce !== undefined) {
       claimed = state.challenges.find((c) => c.challenge === nonce && !c.enrollment);
       if (!claimed) throw new Error("unknown, expired or changed pairing challenge");
       state.challenges = state.challenges.filter((c) => c !== claimed);
@@ -289,7 +292,7 @@ export async function issueRegistrationChallenge(raw: unknown, origin: string) {
         if (pending.grant) {
           availableGrant(state, pending.grant);
           // A native/headless retry can resume its claimed link; direct signup still needs its grant.
-          if (!pending.paired && grantDigest(onboarding_grant) !== pending.grant) throw new Error("a valid onboarding grant is required");
+          if (!pending.paired && suppliedGrant !== pending.grant) throw new Error("a valid onboarding grant is required");
         }
         pending.enrollment = e;
         return { challenge: pending.challenge, relay_challenge_pubkey: pending.relay!.publicKey, ...replacement };
@@ -305,7 +308,8 @@ export async function issueRegistrationChallenge(raw: unknown, origin: string) {
         // An orphan from the legacy split write already owns this slot and device binding.
         freeSlot(occupied(state, e.signing_pubkey), previous.slot);
       } else {
-        grant = claimed?.grant ?? grantDigest(onboarding_grant);
+        grant = claimed?.grant ?? suppliedGrant;
+        if (grant === undefined) throw new Error("a valid onboarding grant is required");
         const { pinned, prior } = availableGrant(state, grant);
         if (!claimed && prior && now < prior.retry_after) throw new Error("onboarding grant issuance is rate limited");
         if (challenges.some((c) => c.grant === grant)) throw new Error("onboarding grant already has a pending registration");
