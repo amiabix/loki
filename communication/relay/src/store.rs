@@ -129,10 +129,11 @@ fn setup_active(connection: &Connection, mailbox: Id32) -> RelayResult<()> {
     Ok(())
 }
 
-fn authenticate_append(
+fn authenticate_mailbox(
     connection: &Connection,
     mailbox: Id32,
-    append: &Capability,
+    role: Role,
+    capability: &Capability,
 ) -> RelayResult<()> {
     let provisioned: bool = connection.query_row(
         "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type='table' AND name='mailboxes')",
@@ -142,22 +143,57 @@ fn authenticate_append(
     if !provisioned {
         return Err(RelayError::Capability);
     }
+    let sql = match role {
+        Role::Read => "SELECT read_verifier FROM mailboxes WHERE id=?1",
+        Role::Append => "SELECT append_verifier FROM mailboxes WHERE id=?1",
+        Role::Admin => "SELECT admin_verifier FROM mailboxes WHERE id=?1",
+    };
     let verifier: Option<Vec<u8>> = connection
-        .query_row(
-            "SELECT append_verifier FROM mailboxes WHERE id=?1",
-            [mailbox.as_slice()],
-            |row| row.get(0),
-        )
+        .query_row(sql, [mailbox.as_slice()], |row| row.get(0))
         .optional()?;
     let verifier: Id32 = verifier
         .ok_or(RelayError::Capability)?
         .try_into()
         .map_err(|_| RelayError::StorageUnavailable)?;
     setup_active(connection, mailbox)?;
-    if !append.verify(Role::Append, mailbox, &verifier) {
+    if !capability.verify(role, mailbox, &verifier) {
         return Err(RelayError::Capability);
     }
     Ok(())
+}
+
+fn authenticate_nonce(
+    connection: &Connection,
+    pin: &RelayPin,
+    mailbox: Id32,
+    cid: Id32,
+    challenge: Id32,
+    wire: &[u8],
+    proof: &ClaimProof,
+) -> RelayResult<(u64, u64)> {
+    let enrolled: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='nonce_claimants')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !enrolled || !permits_nonce_history(connection, mailbox)? {
+        return Err(RelayError::Capability);
+    }
+    let who = proof.claimant;
+    let accounting = connection.query_row(
+        "SELECT used_bytes,quota FROM nonce_claimants WHERE mailbox=?1 AND vault=?2 AND slot=?3 AND signing_key=?4",
+        params![mailbox.as_slice(), who.vault.as_slice(), who.slot, who.key.as_slice()],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ).optional()?.ok_or(RelayError::Capability)?;
+    ed25519_dalek::VerifyingKey::from_bytes(&who.key)
+        .and_then(|key| {
+            key.verify_strict(
+                &nonce::claim_input(who, pin, mailbox, cid, challenge, wire),
+                &ed25519_dalek::Signature::from_bytes(&proof.signature),
+            )
+        })
+        .map_err(|_| RelayError::Capability)?;
+    Ok(accounting)
 }
 
 fn configure(connection: &Connection) -> RelayResult<()> {
@@ -283,6 +319,24 @@ impl RelayStore {
         Ok(())
     }
 
+    pub(crate) fn authenticate_committed_nonce(
+        root: &Path,
+        mailbox: Id32,
+        cid: Id32,
+        challenge: Id32,
+        wire: &[u8],
+        proof: &ClaimProof,
+    ) -> RelayResult<()> {
+        let connection = open_committed_readonly(&root.join("relay.sqlite3"))?;
+        let pin = connection.query_row(
+            "SELECT receipt_public_key,run_id FROM metadata WHERE singleton=1",
+            [],
+            |row| Ok(RelayPin { key: row.get(0)?, run: row.get(1)? }),
+        )?;
+        authenticate_nonce(&connection, &pin, mailbox, cid, challenge, wire, proof)?;
+        Ok(())
+    }
+
     /// Atomically claim a commitment ID. A duplicate is reported as `created=false`,
     /// even when its encrypted record is identical: it must never authorize re-signing.
     pub fn claim_nonce(
@@ -299,26 +353,9 @@ impl RelayStore {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let enrolled: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='nonce_claimants')",
-            [], |r| r.get(0),
-        )?;
-        if !enrolled || !permits_nonce_history(&tx, mailbox)? {
-            return Err(RelayError::Capability);
-        }
-        let who = proof.claimant;
-        let (used, quota): (u64, u64) = tx.query_row(
-            "SELECT used_bytes,quota FROM nonce_claimants WHERE mailbox=?1 AND vault=?2 AND slot=?3 AND signing_key=?4",
-            params![mailbox.as_slice(), who.vault.as_slice(), who.slot, who.key.as_slice()],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        ).optional()?.ok_or(RelayError::Capability)?;
         let pin = RelayPin { key: self.root.public_key, run: self.root.run_id };
-        ed25519_dalek::VerifyingKey::from_bytes(&who.key)
-            .and_then(|key| key.verify_strict(
-                &nonce::claim_input(who, &pin, mailbox, cid, challenge, wire),
-                &ed25519_dalek::Signature::from_bytes(&proof.signature),
-            ))
-            .map_err(|_| RelayError::Capability)?;
+        let (used, quota) = authenticate_nonce(&tx, &pin, mailbox, cid, challenge, wire, proof)?;
+        let who = proof.claimant;
         let record_hash: Id32 = Sha256::digest(wire).into();
         let old: Option<(Vec<u8>, Vec<u8>)> = tx
             .query_row(
@@ -742,6 +779,29 @@ impl RelayStore {
         })
     }
 
+    /// Advisory ingress check; the writer still enforces current operation-specific authority.
+    pub(crate) fn authenticate_committed(
+        root: &Path,
+        target: Option<(Id32, Role)>,
+        capability: &Capability,
+    ) -> RelayResult<()> {
+        let connection = open_committed_readonly(&root.join("relay.sqlite3"))?;
+        if let Some((mailbox, role)) = target {
+            return authenticate_mailbox(&connection, mailbox, role, capability);
+        }
+        let (run, verifier): (Vec<u8>, Vec<u8>) = connection.query_row(
+            "SELECT run_id,provisioning_verifier FROM metadata WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let run = run.try_into().map_err(|_| RelayError::StorageUnavailable)?;
+        let verifier = verifier.try_into().map_err(|_| RelayError::StorageUnavailable)?;
+        if !capability.verify_provision(run, &verifier) {
+            return Err(RelayError::Capability);
+        }
+        Ok(())
+    }
+
     /// Read the last committed snapshot on a short-lived connection.
     /// Does not take the root lock, insert, allocate a sequence, or charge quota.
     /// A missing object table is fresh so the first authenticated put can install it.
@@ -752,7 +812,7 @@ impl RelayStore {
         append: &Capability,
     ) -> RelayResult<PutClass> {
         let connection = open_committed_readonly(&root.join("relay.sqlite3"))?;
-        authenticate_append(&connection, mailbox, append)?;
+        authenticate_mailbox(&connection, mailbox, Role::Append, append)?;
         let objects: bool = connection.query_row(
             "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type='table' AND name='objects')",
             [],
@@ -790,7 +850,7 @@ impl RelayStore {
         append: &Capability,
     ) -> RelayResult<HashPresence> {
         let connection = open_committed_readonly(&root.join("relay.sqlite3"))?;
-        authenticate_append(&connection, mailbox, append)?;
+        authenticate_mailbox(&connection, mailbox, Role::Append, append)?;
         let objects: bool = connection.query_row(
             "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type='table' AND name='objects')",
             [],

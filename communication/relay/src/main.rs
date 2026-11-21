@@ -230,10 +230,7 @@ fn serve(args: ServeArgs) -> RelayResult<()> {
         io::stdout()
             .flush()
             .map_err(|_| RelayError::StorageUnavailable)?;
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
-            .await
-            .map_err(|_| RelayError::StorageUnavailable)?;
+        loki_http_ingress::serve(listener, app, shutdown_signal()).await;
         cleanup.abort();
         let _ = cleanup.await;
         owner.shutdown().await
