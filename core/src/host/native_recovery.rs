@@ -262,14 +262,14 @@ pub(super) fn set_aside(data: &Path, key_gone: bool) -> Result<(), &'static str>
     }
 }
 
-pub(super) fn read_roster(origin: &str) -> Result<Vec<PublicMember>, &'static str> {
+pub(super) fn read_roster(origin: &str, signing: &[u8; 32]) -> Result<Vec<PublicMember>, &'static str> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| ROSTER_UNAVAILABLE)?;
     runtime.block_on(async {
         let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(15)).build().map_err(|_| ROSTER_UNAVAILABLE)?;
-        // A plain GET: never send words, backup data, recovered keys, or a candidate slot here.
-        registration::fetch_roster(&client, origin).await.map_err(|_| ROSTER_UNAVAILABLE)
+        // The lookup sends only the derived public identity, never recovery words or backup data.
+        registration::fetch_roster(&client, origin, &hex::encode(signing)).await.map_err(|_| ROSTER_UNAVAILABLE)
     })
 }
 
@@ -277,7 +277,7 @@ pub(super) fn restored_slot(identity: &PublicIdentity, members: &[PublicMember])
     let (signing, relay) = (hex::encode(identity.signing), hex::encode(identity.encryption));
     let mut matches = members.iter().filter(|m| m.signing_pubkey == signing && m.relay_pubkey == relay);
     match (matches.next(), matches.next()) {
-        (Some(m), None) if m.slot > 0 => Ok(m.slot),
+        (Some(m), None) if registration::valid_slot(m.slot) => Ok(m.slot),
         _ => Err(ROSTER_MISMATCH),
     }
 }
@@ -292,7 +292,7 @@ pub(crate) fn restore_new(
     let network = match backup.material.network { Network::Regtest => "regtest", Network::Testnet => "testnet" };
     if network != config.network { return Err(REFUSED); }
     let identity = Identity::from_secret_bytes(&backup.material.identity).map_err(|_| REFUSED)?.public();
-    let slot = restored_slot(&identity, &read_roster(&origin)?)?;
+    let slot = restored_slot(&identity, &read_roster(&origin, &identity.signing)?)?;
 
     let name = "Member";
     let data = data_location(&config.data)?;

@@ -16,8 +16,9 @@
 #      broadcast and confirms.
 #   5. A fourth member started against an unreachable coordinator serves its local API.
 #
-# Needs a running frostd and the web app as the coordinator, for example:
-#   LOKI_REGISTRY=/abs/roster.json npx next dev --hostname localhost -p 3001   (in web/wallet)
+# Needs a running frostd and the web app as the coordinator. Configure three grants
+# pinned to slots 1..3 (see web/wallet/README.md), and set LOKI_ONBOARDING_GRANT_1,
+# LOKI_ONBOARDING_GRANT_2, and LOKI_ONBOARDING_GRANT_3 to the respective bearers.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -108,10 +109,16 @@ wait_for() {
   fail "$what"
 }
 roster_entry() { curl -sf -m 10 "$coordinator/api/members" | jq -c --argjson slot "$1" '.slots[] | select(.slot == $slot)'; }
-device_of() { jq -r --argjson slot "$1" '.[] | select(.slot == $slot) | .device_pubkey' "$LOKI_REGISTRY.devices"; }
+device_of() { jq -r --argjson slot "$1" '.devices[] | select(.slot == $slot) | .device_pubkey' "$LOKI_REGISTRY"; }
 
 echo "== three members register with $coordinator and create a 2-of-3 vault"
-for i in 1 2 3; do with_coordinator "$i" "$tmp/$i"; done
+for i in 1 2 3; do
+  grant_var="LOKI_ONBOARDING_GRANT_$i"
+  onboarding[i]=${!grant_var:?set $grant_var}
+  unset "$grant_var"
+done
+for i in 1 2 3; do LOKI_ONBOARDING_GRANT="${onboarding[i]}" with_coordinator "$i" "$tmp/$i"; done
+unset onboarding
 for i in 1 2 3; do
   wait_for "member $i registers to slot $i" 60 registered "$i"
   grep -q 'recovery words not set up: output is not a terminal' "$tmp/$i.log" || fail "member $i did not report the skipped recovery words"

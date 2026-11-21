@@ -465,6 +465,16 @@ impl Signer {
         sign_challenge(identity, challenge).map_err(|e| JsError::new(&e))
     }
 
+    #[wasm_bindgen(js_name = relayRegistrationProof)]
+    pub fn relay_registration_proof(&self, origin: &str, challenge: &str, key: &str) -> Result<String, JsError> {
+        let identity = self.identity.as_ref().ok_or_else(|| JsError::new("unlock the signer first"))?;
+        let mut nonce = [0; 32];
+        let mut public = [0; 32];
+        hex::decode_to_slice(challenge, &mut nonce).map_err(|_| JsError::new("invalid registration challenge"))?;
+        hex::decode_to_slice(key, &mut public).map_err(|_| JsError::new("invalid coordinator relay challenge key"))?;
+        identity.relay_registration_proof(origin, &nonce, &public).map(hex::encode).map_err(|e| JsError::new(&e))
+    }
+
     /// This member's public enrollment identity for the coordinator's public roster:
     /// `signing_pubkey` (the Ed25519 member identity) and `relay_pubkey` (= the X25519 frostd
     /// login pubkey, this member's relay address). Hex JSON. The browser POSTs these, plus a

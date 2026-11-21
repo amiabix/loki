@@ -39,7 +39,7 @@ The audited DKG/signing on `main` runs over **frostd** (`FrostdTransport`), not 
 owned relays above. `selfcustody-testnet.sh` stands up the full self-custody stack on
 one host — the public-roster web coordinator plus N `loki_member_app` processes that
 self-register — then drives a t-of-n DKG to `active` and prints the shared address.
-Bash, Cargo, Node, Python 3, curl 7.55+, and OpenSSL are required.
+Bash, Cargo, Node.js 24+, Python 3, curl 7.55+, and OpenSSL are required.
 
 ```sh
 communication/deploy/selfcustody-testnet.sh /absolute/new/member-stack
@@ -62,7 +62,8 @@ and keep the default `FROSTD_URL`:
 ssh -N -L 2744:localhost:2744 your-frostd-host   # then run selfcustody-testnet.sh
 ```
 
-One member app on its own:
+One member app on its own (for first enrollment, set `LOKI_ONBOARDING_GRANT` to
+an [operator-issued grant](../../web/wallet/README.md#onboarding-grants) pinned to slot 1):
 
 ```sh
 core/target/release/loki_member_app --data /absolute/member-1 --port 3601 \
@@ -220,6 +221,9 @@ or share the link; the fragment authorizes the local API for the member process'
 If recovery is not set up, use the wallet to set it up and save the words privately.
 
 It self-registers to the coordinator URL (slot = 2nd arg), using `software` device storage.
+For first enrollment, set `LOKI_ONBOARDING_GRANT` to a grant pinned to that slot, or
+use `join-loki.sh <https-coordinator-url> [slot]` with the grant to reserve an eligible slot
+before launch. Existing members can restart with `run-member.sh` without a grant.
 The wrapper advertises an HTTPS tunnel to the ceremony-only listener on
 `127.0.0.1:$PEER_PORT` (default `4610 + slot`). Only enrollment, roster, agreement
 and session peer requests reach that listener; the full member API on `PORT` stays private.

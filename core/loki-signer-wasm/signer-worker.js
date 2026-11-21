@@ -748,6 +748,11 @@ self.onmessage = async (e) => {
         result = signer.authorizeDeviceReplacement(origin, devicePubHex, challenge, BigInt(generation));
         break;
       }
+      case "relay-registration-proof": {
+        const { origin, challenge, key } = e.data;
+        result = signer.relayRegistrationProof(origin, challenge, key);
+        break;
+      }
       case "join":
         result = await joinCeremony(signer, join);
         break;

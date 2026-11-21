@@ -8,34 +8,19 @@ S3 nonce state and the two Gap-C witnesses are unchanged.
 
 ## Co-located development
 
-Use `bash core/scripts/enclave_local.sh 2` from the repository root, after building the existing
-Enclave signer (`bash core/signer-app/build.sh`) and installing the existing wallet dependencies.
-The script starts the web and two member processes with separate data directories and local
-unlock files. Signer stdout goes to the terminal, not web logs. Save each member's recovery
-words privately when shown. The script uses a new `public-roster.json`; old hosted data is
-left intact. It will not restart processes already occupying the ports.
-
-Alternatively, start Next in this directory:
+Use Node.js 24 or newer. For a disposable software-signer stack with grants configured
+automatically, see [`selfcustody-testnet.sh`](../../communication/deploy/README.md).
+For a separate local coordinator, configure the [onboarding grants](#onboarding-grants)
+and start Next in this directory:
 
 ```sh
 LOKI_REGISTRY=/absolute/path/public-roster.json npx next dev --hostname localhost -p 3001
 ```
 
-Then, in **each member's terminal**, with the two witness routes configured:
-
-```sh
-export LOKI_NONCE_WITNESSES=/absolute/path/witnesses.json
-bash core/scripts/member_local.sh 1
-# In another terminal, with the same witness config:
-bash core/scripts/member_local.sh 2
-```
-
-Paths above are from the repository root. `member_local.sh` defaults to the existing Enclave
-app. `LOKI_SECURE_ELEMENT=software` selects the explicitly insecure development backend and
-`core/target/debug/loki_member_app`. `NETWORK`, `LWD`, `FROSTD_URL`, `LOKI_MEMBER_DATA`,
-`LOKI_COORDINATOR`, and `LOKI_LOCAL_PASSPHRASE_FILE` override the member-local configuration.
-For an existing member, point `LOKI_MEMBER_DATA/<slot>` at its existing data and supply its
-original local unlock file; no shares or recovery identity are migrated automatically.
+Open the onboarding link in the wallet to pair a native LokiSigner. For a direct
+headless start, see the [member binary example](../../communication/deploy/README.md)
+and configure both nonce witness routes. Keep each member's data and local unlock
+file separate. Save recovery words privately when shown.
 
 The member process creates/unlocks its profile **locally**, then authorizes its P-256 device
 key with its existing Ed25519 identity. It requests a one-use challenge and signs a transcript
@@ -105,9 +90,9 @@ web` in `core/loki-signer-wasm`, and `wasm-pack build --target web` in `core/was
    - the browser generates a non-extractable **WebCrypto P-256 device key** (persisted in
      IndexedDB, reused on re-enroll) and the Worker's `authorizeDevice()` signs it with the
      member identity — the same Ed25519/P-256 proof as `core/src/host/registration.rs`;
-   - `POST /api/members/challenge` → the browser signs the registration transcript
-     (`advertise_url` is `""`) with the device key (ECDSA P-256 / SHA-256, IEEE-P1363) →
-     `POST /api/members` returns the allocated member and `slot`.
+   - `POST /api/members/challenge` with the first-time onboarding grant → the browser signs the
+     registration transcript with the device key and proves possession of the relay key against
+     the coordinator's one-use X25519 challenge → `POST /api/members` returns the member and slot.
 3. **Discover** the ceremony params. The public coordinator (this Next app) owns only the roster;
    the DKG session is run by the vault **creator** (slot 1), which serves `vaultHex`, the setup
    doc (`rosterHex`, `setup_version: 2`), the frostd `sessionId` and `coordinatorPeer` from its
@@ -137,15 +122,17 @@ website can use the port and the open ceremony routes to learn whether LokiSigne
 subject to local network permission.
 Safari may block the wallet's loopback request; this has not been verified.
 
-The coordinator stores the roster, device generations, and challenges in one owner-only
+Native setup and recovery use `GET /api/members?signing_pubkey=<lowercase hex>` to look up
+at most one public row without downloading the roster.
+
+The coordinator stores the roster, device generations, onboarding history, and challenges in one owner-only
 snapshot at `.access.json` (or `LOKI_REGISTRY`). Before upgrading, stop all old coordinator
-workers and back up the registry and its `.devices` sidecar together. The first write imports
-valid public roster rows and device bindings. Old pending challenges are not imported; issue
-new pairing links. Do not mix coordinator versions or roll back to the old split-file format:
-doing so would lose generations and revocations. Older registries containing hosted secrets
-still fail closed and are not migrated. At most 256 live coordinator challenges are accepted;
-each expires after two minutes. If a worker crashes while holding `.lock`, stop all coordinator
-workers before removing the lock. The roster is discovery, not authority to spend.
+workers and back up the registry and any legacy `.devices` sidecar together. Update signer
+clients for the relay proof, and reissue pairing links. Do not run old and new workers on the
+same registry or roll back to the old split-file format. Older registries containing hosted
+secrets still fail closed. Legacy out-of-range rows are preserved but cannot re-enroll. The
+adjacent `.mutex.sqlite` file serializes writes; SQLite releases the lock when a process exits.
+Do not remove it while any process uses the registry. The roster is discovery, not authority to spend.
 
 Device-local login challenges expire after two minutes, with at most 16 issues per device
 session grant and 256 overall in that window. To renew a revoked key, an authorized local
@@ -157,6 +144,33 @@ LokiSigner sends a tab its device session only after the member allows that tab'
 the native app. The coordinator-served JavaScript can still read a grant held by its own tab;
 device-side consent remains required for signing. Co-location under one OS account is not
 independent custody against that OS operator.
+
+### Onboarding grants
+
+The coordinator admits at most 16 active members in slots 1–16. Configure
+`LOKI_ONBOARDING_GRANTS` as a JSON object of SHA-256 digests of the lowercase hex bearer
+strings. A value of `null` lets the coordinator pick the lowest free slot; set an integer
+from 1 to 16 only when the operator wants to pin that grant. For one automatic grant:
+
+```sh
+grant=$(openssl rand -hex 32)
+digest=$(printf '%s' "$grant" | openssl dgst -sha256 -r)
+export LOKI_ONBOARDING_GRANTS="{\"${digest%% *}\":null}"
+```
+
+Share `${grant}` privately with the new member, not the digest. For the wallet, append
+`#onboarding=<grant>` to the wallet URL; the page holds it in memory after reading it.
+For headless onboarding, set `LOKI_ONBOARDING_GRANT` before running `join-loki.sh`.
+Do not put the bearer in a query string, process arguments, or logs. Each grant admits
+one identity. Equivalent requests reuse a live challenge; a grant cannot issue another
+until its two-minute issuance window ends. Pairing has eight reservations separate
+from the 32 registration challenges. Existing members can refresh or replace their
+device without a new grant. If an unfinished pairing expires, obtain a new link.
+
+To permanently retire a roster identity and release its slot, use the same registry path
+as the coordinator: `LOKI_REGISTRY=/path/to/registry.json node scripts/retire-member.ts <signing_pubkey>`.
+This retains the identity and device tombstones. It does not revoke vault shares or delete
+member recovery data.
 
 ## Checks
 
