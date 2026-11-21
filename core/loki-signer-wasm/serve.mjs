@@ -93,7 +93,6 @@ const csp = [
   "img-src 'self'",
   "base-uri 'none'",
   "form-action 'none'",
-  `frame-ancestors ${walletOrigin}`, // only the wallet may embed the signer
 ].join("; ");
 
 createServer((req, res) => {
@@ -108,15 +107,17 @@ createServer((req, res) => {
     return;
   }
   const key = path === "/" ? "/signer.html" : path;
-  const body = bundle.get(key);
-  const type = body ? types[extname(key)] || "application/octet-stream" : "text/plain";
+  const custodyControls = key === "/manage-custody";
+  const asset = custodyControls ? "/signer.html" : key;
+  const body = bundle.get(asset);
+  const type = body ? types[extname(asset)] || "application/octet-stream" : "text/plain";
   res.writeHead(body ? 200 : 404, {
     "Content-Type": type.startsWith("text/") ? `${type}; charset=utf-8` : type,
     "Cache-Control": "no-store",
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
     "Cross-Origin-Resource-Policy": "same-origin",
-    "Content-Security-Policy": csp,
+    "Content-Security-Policy": `${csp}; frame-ancestors ${custodyControls ? "'none'" : walletOrigin}`,
   });
   res.end(req.method === "HEAD" ? undefined : body ?? "not found");
 }).listen(port, () => console.log(`loki signer origin on http://localhost:${port} (wallet ${walletOrigin}) build ${build.bundle}`));

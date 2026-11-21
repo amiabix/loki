@@ -322,11 +322,12 @@ export async function exportRecoveryBackup(vault: string): Promise<{ backup: str
 /** Fresh browser: restore a vault member from its words (typed on the signer page) and its backup:
  *  the file the member picks there, or `backup` (hex ciphertext) + `vault` the wallet already holds. */
 export async function restoreSigner(opts: CreateSignerOpts & { vault?: string; backup?: string }): Promise<SignerSession> { browserOnly(); return signer.request("restore", opts); }
-/** Delete this browser's signer after the member confirms the backups are exported. */
-export async function removeBrowserSigner(): Promise<void> {
+/** Open signer controls and report whether the member removed custody in the signer tab. */
+export async function manageBrowserCustody(): Promise<boolean> {
   browserOnly();
-  await signer.request("remove", {});
-  forgetSession();
+  const removed = await signer.request<boolean>("manage-custody");
+  if (removed) forgetSession();
+  return removed;
 }
 export type PendingApproval = { attempt: string; amount_zat: string; recipient: string; proposer: number; replaces?: { attempt: string; cancel: boolean } | null };
 export function pendingApprovals(vault: string): Promise<{ pending: PendingApproval[] }> { return api(`pending?vault=${vault}`); }

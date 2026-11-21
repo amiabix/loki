@@ -727,14 +727,14 @@ self.onmessage = async (e) => {
     return;
   }
   const { id, op, method, name, passphrase, prfSecret, join, payment, devicePubHex, vaultHex, words, blob } = e.data;
-  // The Signer holds ONE open vault, and these ops each reopen one. A join, payment, restore
-  // or removal holds it, so the quick reads are refused while one runs (the wallet polls
+  // The Signer holds ONE open vault, and these ops each reopen one. A join, payment or
+  // restore holds it, so the quick reads are refused while one runs (the wallet polls
   // again) and otherwise take turns, so no op swaps the vault under another mid-flight.
-  const holds = op === "join" || op === "payment-approve" || op === "restore" || op === "remove";
+  const holds = op === "join" || op === "payment-approve" || op === "restore";
   const reads = op === "payment-review" || op === "pending" || op === "vaults" || op === "address" || op === "recovery-backup" || op === "chain" || op === "payment-status";
   let release = () => {};
   try {
-    if (reads && busy) throw new Error(`the signer is busy with a ${{ join: "vault setup", "payment-approve": "payment", restore: "restore", remove: "removal" }[busy]}; try again when it finishes`);
+    if (reads && busy) throw new Error(`the signer is busy with a ${{ join: "vault setup", "payment-approve": "payment", restore: "restore" }[busy]}; try again when it finishes`);
     if (holds) busy = op;
     if (reads || holds) {
       const prev = turn;
@@ -829,12 +829,14 @@ self.onmessage = async (e) => {
         for (const path of JSON.parse(vaultPaths(vaultHex))) await opfsPreopenWrite(path);
         result = JSON.parse(signer.restoreSigner(method, name ?? "", passphrase, prfSecret, vaultHex, words, blob));
         break;
-      case "remove": {
-        // Delete every signer file in this browser: release the sync handles, then the tree.
-        signer.lock();
-        opfsCloseAll();
+      case "remove-verified": {
+        // The page drains and blocks other ops during removal. Verify against the active
+        // KEK in the same worker that holds this partition's custody and sync handles.
+        signer.reauth(method, passphrase, prfSecret);
         const root = await navigator.storage.getDirectory();
+        opfsCloseAll();
         await root.removeEntry("loki", { recursive: true }).catch((e) => { if (e.name !== "NotFoundError") throw e; });
+        signer.lock();
         result = null;
         break;
       }
