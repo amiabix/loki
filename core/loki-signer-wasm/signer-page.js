@@ -4,7 +4,7 @@
 // origin's JS, never in wallet-page JS. It owns the signer Worker (signer-worker.js).
 //
 // The wallet talks to it only over postMessage, carrying public data: {id, op, params} in,
-// {id, ok, result | error, status} out, plus {cmd: "ready" | "show" | "hide"} so the wallet
+// {id, ok, result | error, status} out, plus {cmd: "ready" | "failed" | "show" | "hide"} so the wallet
 // can reveal the iframe while a prompt needs the member. Messages from any origin other than
 // the configured wallet origin, or from any window other than the embedding parent, are dropped.
 
@@ -34,30 +34,36 @@ const owner = await new Promise((resolve) => {
 });
 
 // ─── the Worker ──────────────────────────────────────────────────────────────
-const worker = owner ? new Worker("./signer-worker.js", { type: "module" }) : null;
+let worker, workerFailure, dismissPrompt;
 const pending = new Map();
 let seq = 0;
-const loaded = new Promise((resolve) => {
-  if (!worker) { resolve(); return; }
-  worker.addEventListener("message", function onload(e) {
-    if (e.data?.cmd === "loaded") { worker.removeEventListener("message", onload); resolve(); }
-  });
-});
-worker?.addEventListener("message", (e) => {
+function failWorker() {
+  if (workerFailure) return;
+  workerFailure = new SignerError("The browser signer worker stopped or could not start. Try again.", 503);
+  worker?.terminate();
+  dismissPrompt?.(workerFailure);
+  for (const p of pending.values()) p.reject(workerFailure);
+  pending.clear();
+  parent.postMessage({ cmd: "failed", error: workerFailure.message }, wallet);
+}
+function receiveWorker(e) {
   const d = e.data ?? {};
+  if (d.cmd === "loaded") { parent.postMessage({ cmd: "ready" }, wallet); return; }
+  if (d.cmd === "failed") { failWorker(); return; }
   if (d.ask !== undefined) { answerAsk(d); return; }
   const p = pending.get(d.id);
   if (!p) return;
   pending.delete(d.id);
   d.ok ? p.resolve(d.result) : p.reject(new SignerError(d.error ?? "signer error"));
-});
+}
 async function call(msg) {
+  if (workerFailure) throw workerFailure;
   if (!worker) throw new SignerError("Your signer is open in another tab. Close it there and reload.", 409);
-  await loaded;
   const id = ++seq;
   return new Promise((resolve, reject) => {
     pending.set(id, { resolve, reject });
-    worker.postMessage({ id, ...msg });
+    try { worker.postMessage({ id, ...msg }); }
+    catch { failWorker(); }
   });
 }
 
@@ -77,6 +83,7 @@ function facts(rows) {
 // `run` (async, called inside the click so WebAuthn keeps its user activation) may throw to
 // keep the prompt open with the error shown, or return the value to resolve with.
 function prompt(title, body, buttons) {
+  if (workerFailure) throw workerFailure;
   const main = $("prompt");
   $("title").textContent = title;
   $("body").replaceChildren(...body);
@@ -84,18 +91,38 @@ function prompt(title, body, buttons) {
   main.hidden = false;
   parent.postMessage({ cmd: "show" }, wallet);
   return new Promise((resolve, reject) => {
-    const done = (fn) => { main.hidden = true; parent.postMessage({ cmd: "hide" }, wallet); fn(); };
-    $("actions").replaceChildren(...buttons.map((b) => {
+    const wait = new AbortController();
+    const actions = $("actions");
+    const done = (fn) => {
+      wait.abort(); dismissPrompt = undefined;
+      main.hidden = true;
+      $("body").replaceChildren();
+      actions.replaceChildren();
+      parent.postMessage({ cmd: "hide" }, wallet);
+      fn();
+    };
+    dismissPrompt = (error) => done(() => reject(error));
+    actions.replaceChildren(...buttons.map((b) => {
       const btn = el("button", { textContent: b.label, className: b.ghost ? "ghost" : "" });
       btn.onclick = async () => {
-        for (const x of $("actions").children) x.disabled = true;
+        if (b.cancel) {
+          if ("value" in b) done(() => resolve(b.value)); // A worker decision can decline explicitly.
+          else dismissPrompt(new SignerError("Cancelled on the signer", 400));
+          return;
+        }
+        for (const [i, x] of Array.from(actions.children).entries()) x.disabled = !(b.abortable && buttons[i].cancel);
+        // A credential prompt can be cancelled, but not a write already dispatched to the worker.
+        const commit = () => {
+          wait.signal.throwIfAborted();
+          for (const x of actions.children) x.disabled = true;
+        };
         try {
-          const v = b.run ? await b.run() : b.value;
-          if (b.cancel) done(() => reject(new SignerError("Cancelled on the signer", 400)));
-          else done(() => resolve(v));
+          const v = b.run ? await b.run(wait.signal, commit) : b.value;
+          if (!wait.signal.aborted) done(() => resolve(v));
         } catch (e) {
+          if (wait.signal.aborted) return;
           $("error").textContent = e.message || String(e);
-          for (const x of $("actions").children) x.disabled = false;
+          for (const x of actions.children) x.disabled = false;
         }
       };
       return btn;
@@ -111,8 +138,9 @@ const toHex = (b) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join(
 const fromHex = (h) => Uint8Array.from(h.match(/../g) ?? [], (x) => parseInt(x, 16));
 const random = (n) => crypto.getRandomValues(new Uint8Array(n));
 
-async function createPasskey(name, attachment) {
+async function createPasskey(name, attachment, signal) {
   const cred = await navigator.credentials.create({
+    signal,
     publicKey: {
       challenge: random(32),
       rp: { id: rpId, name: "Loki" },
@@ -122,21 +150,21 @@ async function createPasskey(name, attachment) {
       extensions: { prf: { eval: { first: PRF_SALT } } },
     },
   });
+  signal.throwIfAborted();
   if (!cred.getClientExtensionResults().prf?.enabled) {
     throw new SignerError("This authenticator has no PRF support. Use a passphrase instead.", 400);
   }
-  const id = new Uint8Array(cred.rawId);
-  try { localStorage.setItem(CRED, toHex(id)); } catch {}
-  return id;
+  return new Uint8Array(cred.rawId);
 }
 
 // A fresh user-verified assertion releasing the PRF secret. The remembered credential id is
 // only a hint: without it (cleared storage) the authenticator offers its discoverable Loki
 // passkeys for this rpId.
-async function prfSecret(credentialId) {
+async function prfSecret(credentialId, signal) {
   let id = credentialId;
   if (!id) { try { const h = localStorage.getItem(CRED); if (h) id = fromHex(h); } catch {} }
   const assertion = await navigator.credentials.get({
+    signal,
     publicKey: {
       challenge: random(32),
       rpId,
@@ -145,6 +173,7 @@ async function prfSecret(credentialId) {
       extensions: { prf: { eval: { first: PRF_SALT } } },
     },
   });
+  signal.throwIfAborted();
   const first = assertion.getClientExtensionResults().prf?.results?.first;
   if (!first || first.byteLength < 32) throw new SignerError("This passkey released no PRF secret. Use a passphrase instead.", 400);
   try { localStorage.setItem(CRED, toHex(new Uint8Array(assertion.rawId))); } catch {}
@@ -185,9 +214,11 @@ function newCustody(name, method, submit) {
   }
   return prompt("Create a passkey for your signer", [
     el("p", { textContent: `Your share is sealed under a passkey for ${rpId}. Touch/Face ID, a security key or your phone unlocks it.` }),
-  ], [cancelButton, { label: "Create passkey", run: async () => {
-    const id = await createPasskey(name, method === "platform" ? "platform" : "cross-platform");
-    return submit({ prfSecret: await prfSecret(id) });
+  ], [cancelButton, { label: "Create passkey", abortable: true, run: async (signal, commit) => {
+    const id = await createPasskey(name, method === "platform" ? "platform" : "cross-platform", signal);
+    const secret = await prfSecret(id, signal);
+    commit();
+    return submit({ prfSecret: secret });
   } }]);
 }
 
@@ -208,7 +239,11 @@ async function unlock({ method }) {
       [cancelButton, { label: "Unlock", run: () => call({ op: "unlock", method, passphrase: a.value }) }]);
   } else {
     result = await prompt("Unlock your signer", [el("p", { textContent: `Use your passkey for ${rpId}.` })],
-      [cancelButton, { label: "Use passkey", run: async () => call({ op: "unlock", method, prfSecret: await prfSecret() }) }]);
+      [cancelButton, { label: "Use passkey", abortable: true, run: async (signal, commit) => {
+        const secret = await prfSecret(undefined, signal);
+        commit();
+        return call({ op: "unlock", method, prfSecret: secret });
+      } }]);
   }
   current = { profile: result, se: method === "passphrase" ? "software" : "passkey" };
   persisted = await navigator.storage?.persisted?.().catch(() => false) ?? false;
@@ -220,8 +255,8 @@ async function unlock({ method }) {
 function reauthField() {
   return current?.se === "passkey" ? null : passField("Passphrase", "current-password");
 }
-async function reauthValue(field) {
-  return field ? { method: "passphrase", passphrase: field.value } : { method: "platform", prfSecret: await prfSecret() };
+async function reauthValue(field, signal) {
+  return field ? { method: "passphrase", passphrase: field.value } : { method: "platform", prfSecret: await prfSecret(undefined, signal) };
 }
 
 // ─── recovery: 24 words shown once, backups sealed to them ──────────────────
@@ -274,7 +309,7 @@ async function restore({ vault, name, method, backup }) {
     el("label", { textContent: "Your 24 recovery words" }, words),
     given ? el("p", { className: "mono", textContent: `Backup for vault ${vault.slice(0, 16)}… provided by the wallet` })
       : el("label", { textContent: "The vault's recovery backup file" }, file),
-  ], [cancelButton, { label: "Continue", run: async () => {
+  ], [cancelButton, { label: "Continue", abortable: true, run: async () => {
     const typed = words.value.trim().toLowerCase().split(/\s+/).join(" ");
     if (given) return { vaultHex: vault, words: typed, blob: fromHex(backup) };
     const f = file.files[0];
@@ -335,14 +370,14 @@ const asks = {
       facts([["To", d.recipient_ua || d.recipient, true], ["Amount", zec(d.amount_zat)], ["Fee", `${zec(d.fee_zat)}${d.fee_verified ? "" : " (unverified)"}`],
         ["Change", zec(d.change_zat)], ["Memo", d.memo_text || "(none)"], ["Expires at height", d.expiry_height], ["Sighash", d.sighash, true]]),
       ...(field ? [el("label", { textContent: "Passphrase" }, field)] : []),
-    ], [{ label: "Decline", ghost: true, value: null }, { label: "Sign", run: () => reauthValue(field) }]);
+    ], [{ label: "Decline", ghost: true, cancel: true, value: null }, { label: "Sign", abortable: true, run: (signal) => reauthValue(field, signal) }]);
   },
 };
 async function answerAsk(d) {
   let reply;
   try { reply = { answer: d.ask, ok: true, value: await asks[d.kind](d.data) }; }
   catch (e) { reply = { answer: d.ask, ok: false, error: e.message || String(e) }; }
-  worker.postMessage(reply);
+  if (!workerFailure) worker.postMessage(reply);
 }
 
 // ─── enrollment: the device-login key lives on the signer origin ────────────────────────
@@ -436,6 +471,7 @@ addEventListener("message", (e) => {
   if (typeof id !== "number" || !Object.hasOwn(ops, op)) return;
   const run = async () => {
     try {
+      if (workerFailure) throw workerFailure;
       if (UNLOCKED.has(op) && !current) throw new SignerError("Unlock your signer", 401);
       parent.postMessage({ id, ok: true, result: await ops[op](params ?? {}) }, wallet);
     } catch (err) {
@@ -445,4 +481,12 @@ addEventListener("message", (e) => {
   if (PROMPTING.has(op)) queue = queue.then(run);
   else run();
 });
-if (parent !== window) parent.postMessage({ cmd: "ready" }, wallet);
+if (parent !== window) {
+  if (!owner) parent.postMessage({ cmd: "ready" }, wallet); // Report the existing other-tab error per call.
+  else try {
+    worker = new Worker("./signer-worker.js", { type: "module" });
+    worker.addEventListener("message", receiveWorker);
+    worker.addEventListener("error", failWorker);
+    worker.addEventListener("messageerror", failWorker);
+  } catch { failWorker(); }
+}
