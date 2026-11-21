@@ -425,7 +425,7 @@ pub(super) async fn create(State(st): State<Shared>, Json(body): Json<Value>) ->
                 .peers
                 .get(&1)
                 .cloned()
-                .unwrap_or_else(|| format!("http://127.0.0.1:{}", st.config.port)),
+                .unwrap_or_else(|| st.config.base_url()),
             frostd_url: st.config.frostd_url.clone(),
             slots,
             fingerprint: None,
@@ -1497,6 +1497,22 @@ mod tests {
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(reply["error"], error, "{members} {threshold}");
         }
+    }
+
+    #[tokio::test]
+    async fn invites_carry_the_advertised_url() {
+        let data = std::env::temp_dir().join(format!("loki-advertise-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&data).unwrap();
+        let config = Config { advertise_url: Some("https://creator.example/".into()), ..test_config(&data, 3001) };
+        let st = std::sync::Arc::new(AppState::new(config));
+        *st.session.write().await = Some(Session { passphrase: Zeroizing::new("pass".into()), data: data.clone() });
+        let created = create(State(st), Json(json!({"name":"test","members":3,"threshold":2}))).await;
+        for item in created.1 .0["invites"].as_array().unwrap() {
+            let invite: Invite = serde_json::from_slice(&base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(item["code"].as_str().unwrap()).unwrap()).unwrap();
+            assert_eq!(invite.creator_base_url, "https://creator.example");
+        }
+        std::fs::remove_dir_all(data).unwrap();
     }
 
     #[test]
