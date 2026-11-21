@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::{watch, RwLock};
 use zeroize::Zeroizing;
@@ -16,6 +17,7 @@ pub struct Config {
     pub data: PathBuf,
     pub port: u16,
     pub bind: std::net::IpAddr,
+    pub(super) peer_port: Option<u16>,
     pub advertise_url: Option<String>,
     pub network: String,
     pub lightwalletd: Option<String>,
@@ -42,19 +44,19 @@ impl Config {
     pub(super) fn lokisigner_url(&self) -> Option<String> {
         if !self.native || self.port == 0 { return None; }
         let host = match self.bind {
-            std::net::IpAddr::V4(ip) if ip == std::net::Ipv4Addr::LOCALHOST || ip.is_unspecified() => "127.0.0.1",
-            std::net::IpAddr::V6(ip) if ip.is_loopback() || ip.is_unspecified() => "[::1]",
+            std::net::IpAddr::V4(ip) if ip == std::net::Ipv4Addr::LOCALHOST => "127.0.0.1",
+            std::net::IpAddr::V6(ip) if ip.is_loopback() => "[::1]",
             _ => return None,
         };
         Some(format!("http://{host}:{}", self.port))
     }
 
     pub(super) fn base_url(&self) -> String {
-        self.advertise_url.clone().unwrap_or_else(|| format!("http://127.0.0.1:{}", self.port))
+        self.advertise_url.clone().unwrap_or_else(|| format!("http://{}", std::net::SocketAddr::new(self.bind, self.port)))
             .trim_end_matches('/').to_owned()
     }
 
-    pub(super) fn validate_peer_url(&self, base: &str) -> Result<(), String> {
+    pub(super) fn validate_peer_url(&self, base: &str) -> Result<reqwest::Url, String> {
         let url = reqwest::Url::parse(base).map_err(|_| "invalid member base URL")?;
         let origin = url.origin().ascii_serialization();
         let explicit_default = if url.port().is_none() {
@@ -68,11 +70,14 @@ impl Config {
             return Err("member URL must be a plain HTTP(S) origin".into());
         }
         // The co-located regtest demo, or an explicit operator opt-in, admits new loopback origins.
-        let local = (self.network == "regtest" || self.loopback_peers)
-            && matches!(url.host_str(), Some("127.0.0.1" | "[::1]"))
+        let loopback = matches!(url.host_str(), Some("127.0.0.1" | "[::1]"));
+        let local = loopback && (self.network == "regtest" || self.loopback_peers)
             && url.port().is_some_and(|p| p >= 1024);
-        if local || self.peers.values().any(|allowed| allowed == &origin || allowed == &explicit_default) {
-            Ok(())
+        // Outside the local demo, authenticate the locally configured peer name with TLS.
+        if local || (!loopback && url.scheme() == "https"
+            && self.peers.values().any(|allowed| allowed == &origin || allowed == &explicit_default))
+        {
+            Ok(url)
         } else {
             Err("member URL is not an allowed peer".into())
         }
@@ -167,6 +172,14 @@ pub(super) fn key_scope(config: &Config, profile: &Path) -> Result<Option<uuid::
 #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave")))]
 const SCOPED_VAULT_KEY: &str = "native-scoped-vault-key";
 
+#[cfg(all(target_os = "macos", feature = "apple-enclave"))]
+pub(super) const RESTORED_KEY: &str = "native-restored-key";
+
+#[cfg(all(target_os = "macos", feature = "apple-enclave"))]
+pub(super) fn restored_key_tag(restore: uuid::Uuid, role: &str) -> Vec<u8> {
+    format!("cash.loki.member.kek.restore.v1:{restore}:{role}").into_bytes()
+}
+
 #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave")))]
 fn vault_key_scope(config: &Config, profile: &Path, key_dir: &Path, published: Option<&Path>, create: bool) -> Result<(Option<uuid::Uuid>, String), String> {
     let mut scope = key_scope(config, profile)?;
@@ -201,20 +214,29 @@ pub(super) fn open_apple_element(dir: &Path, create: bool, published: Option<&Pa
     if create {
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(|_| KeyFailure::Other)?;
     }
-    let legacy = if scope.is_none() { legacy_key_dir(dir, published)? } else { PathBuf::new() };
-    let tag = apple_key_tag(&legacy, scope, role);
+    let restore = match std::fs::read_to_string(dir.join(RESTORED_KEY)) {
+        Ok(id) => Some(uuid::Uuid::parse_str(&id).map_err(|_| KeyFailure::Other)?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Err(KeyFailure::Other),
+    };
+    let tag = if let Some(restore) = restore {
+        restored_key_tag(restore, dir.file_name().and_then(|name| name.to_str()).ok_or(KeyFailure::Other)?)
+    } else {
+        let legacy = if scope.is_none() { legacy_key_dir(dir, published)? } else { PathBuf::new() };
+        apple_key_tag(&legacy, scope, role)
+    };
     #[cfg(test)]
-    if let Some(outcome) = apple_test::lookup(dir, &tag, create) {
-        outcome?;
+    if let Some(lookup) = apple_test::fixture(dir) {
+        lookup(dir, &tag, create)?;
         return SoftwareSecureElement::persistent(dir, "Apple test stand-in")
             .map(HostedSecureElement::software).map_err(|_| KeyFailure::Other);
     }
     let state = dir.join("biometry-state");
-    let state = Some(state.as_path());
     let key = match reason {
-        Some(reason) => AppleSecureElement::open_payment(&tag, state, reason),
-        None if create => AppleSecureElement::create_persistent(&tag, state),
-        None => AppleSecureElement::open_persistent(&tag, state),
+        Some(reason) => AppleSecureElement::open_payment(&tag, Some(&state), reason),
+        None if create && restore.is_some() => AppleSecureElement::create_staged(&tag, &state),
+        None if create => AppleSecureElement::create_persistent(&tag, Some(&state)),
+        None => AppleSecureElement::open_persistent(&tag, Some(&state)),
     };
     key.map(|key| HostedSecureElement::Apple(key, None))
 }
@@ -257,9 +279,8 @@ pub(super) mod apple_test {
         Fixture(root.to_owned())
     }
 
-    pub(super) fn lookup(dir: &Path, tag: &[u8], create: bool) -> Option<Result<(), KeyFailure>> {
-        let lookup = FIXTURES.lock().unwrap().iter().find(|(path, _)| dir.starts_with(path)).map(|(_, lookup)| lookup.clone());
-        lookup.map(|f| f(dir, tag, create))
+    pub(in crate::host) fn fixture(dir: &Path) -> Option<Lookup> {
+        FIXTURES.lock().unwrap().iter().find(|(path, _)| dir.starts_with(path)).map(|(_, lookup)| lookup.clone())
     }
 }
 
@@ -397,13 +418,12 @@ pub struct Session {
 }
 
 impl Session {
-    /// Validate the sealed profile with this passphrase and prime the KDF cache.
+    /// Validate the sealed profile without activating the session or its cache.
     pub fn unlock(
         data: PathBuf,
         passphrase: Zeroizing<String>,
     ) -> Result<(Self, serde_json::Value), String> {
         let profile = crate::profile::open(&data, &passphrase)?;
-        crate::seal_kdf::enable_session_cache(&passphrase);
         Ok((Self { passphrase, data }, profile))
     }
 }
@@ -416,13 +436,16 @@ pub struct AppState {
     pub session: RwLock<Option<Session>>,
     /// A native member never unlocks in place after stopping; each launch has its own signal.
     pub(super) stopping: watch::Sender<bool>,
+    // Lock and activation both modify session state under the session write lock.
+    pub(super) session_generation: AtomicU64,
+    pub(super) pending_recovery: std::sync::Mutex<Option<Vec<u8>>>,
     pub ceremony: std::sync::Mutex<()>,
     pub payment: std::sync::Mutex<()>,
     pub active_payments: std::sync::Mutex<BTreeSet<String>>,
     pub active_dkgs: std::sync::Mutex<BTreeSet<String>>,
     /// Device login registry, built lazily from `data/recovery.pub` + `data/devices.json` once
     /// a recovery identity exists. Holds outstanding challenges in-process across requests.
-    pub device_auth: std::sync::Mutex<Option<crate::signer::device_auth::DeviceRegistry>>,
+    pub(super) device_auth: std::sync::Mutex<Option<super::device::DeviceState>>,
     /// The member's native payment decision; `None` (headless) refuses every payment.
     pub approval: Option<super::LocalApproval>,
     pub(super) notice: Option<super::LocalNotice>,
@@ -436,7 +459,7 @@ pub struct AppState {
     pub(super) wallet_tabs: Option<super::connect::WalletTabs>,
     /// Each opened vault's viewing key; `None` means a cancelled open needs an explicit retry.
     pub(super) viewing_keys: std::sync::Mutex<BTreeMap<String, Option<orchard::keys::FullViewingKey>>>,
-    /// The signer configuration LokiSigner fetched for this launch, saved once the profile unlocks.
+    /// LokiSigner's confirmed launch snapshot. Fresh settings without overrides are saved on unlock.
     pub(super) fetched_config: Option<super::FetchedConfig>,
 }
 
@@ -448,6 +471,8 @@ impl AppState {
             registration_error: RwLock::new(None),
             session: RwLock::new(None),
             stopping: watch::Sender::new(false),
+            session_generation: AtomicU64::new(0),
+            pending_recovery: std::sync::Mutex::new(None),
             ceremony: std::sync::Mutex::new(()),
             payment: std::sync::Mutex::new(()),
             active_payments: std::sync::Mutex::new(BTreeSet::new()),
@@ -463,13 +488,36 @@ impl AppState {
             fetched_config: None,
         }
     }
-
     pub(super) fn is_stopping(&self) -> bool {
         *self.stopping.borrow()
     }
 
     pub(super) async fn wait_for_stop(&self) {
         let _ = self.stopping.subscribe().wait_for(|stopping| *stopping).await;
+    }
+
+    pub(super) fn session_generation(&self) -> u64 {
+        self.session_generation.load(Ordering::Acquire)
+    }
+
+    pub(super) async fn activate_session(&self, generation: u64, session: Session) -> bool {
+        let mut current = self.session.write().await;
+        if self.session_generation() != generation || self.is_stopping() { return false; }
+        crate::seal_kdf::enable_session_cache(&session.passphrase);
+        *current = Some(session);
+        true
+    }
+
+    pub(super) async fn lock_session(self: &std::sync::Arc<Self>) {
+        let mut current = self.session.write().await;
+        *current = None;
+        if let Ok(mut pending) = self.pending_recovery.lock() { *pending = None; }
+        if let Some(tabs) = &self.wallet_tabs { tabs.revoke_all(); }
+        crate::seal_kdf::clear_session_cache();
+        self.session_generation.fetch_add(1, Ordering::Release);
+        drop(current);
+        #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+        super::native_member::clear_addresses_on_lock(self);
     }
 }
 
@@ -523,7 +571,7 @@ mod tests {
     fn config(secure_element: &str) -> Config {
         Config {
             registration: None, native: false,
-            bind: "127.0.0.1".parse().unwrap(), advertise_url: None,
+            bind: "127.0.0.1".parse().unwrap(), peer_port: None, advertise_url: None,
             data: PathBuf::new(), port: 3001, network: "regtest".into(),
             lightwalletd: None, transport: "local".into(), secure_element: secure_element.into(),
             operator_bundle: None, nonce_witnesses: None, operator_key: None, enrollment_issuer: None,

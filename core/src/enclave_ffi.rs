@@ -81,8 +81,8 @@ pub extern "C" fn loki_signer_enclave_dkg_member_selftest() -> i32 {
 
 /// Run the LIVE member-app signer (the axum coordinator + frostd DKG/payment loop) inside the
 /// provisioned app, with the member's FROST share held in the Secure Enclave. This is the real
-/// native signer: `LokiSigner serve --data <dir> --port <n> --frostd-url <url> --advertise-url
-/// <url> --peer <slot=url>...`. Reads the member args from this process's own argv (skipping the
+/// native signer: `LokiSigner serve --data <dir> --port <n> --frostd-url <url> --peer-port <n>
+/// --advertise-url <origin> --peer <slot=url>...`. Reads the member args from its argv (skipping the
 /// binary name and the `serve` verb), forces the Apple Enclave backend, and serves. Blocks.
 #[cfg(feature = "relay-communication")]
 #[no_mangle]
@@ -411,6 +411,12 @@ pub extern "C" fn loki_member_app_vault_addresses() -> *mut std::ffi::c_char {
     std::ffi::CString::new(reply.to_string()).map_or(std::ptr::null_mut(), std::ffi::CString::into_raw)
 }
 
+#[cfg(feature = "relay-communication")]
+#[no_mangle]
+pub extern "C" fn loki_member_app_can_view_addresses() -> i32 {
+    i32::from(crate::host::native_can_view_addresses())
+}
+
 /// Frees a string returned by one of the LokiSigner JSON entry points.
 ///
 /// # Safety
@@ -498,10 +504,16 @@ pub unsafe extern "C" fn loki_member_app_restore_profile(
         if launch.is_null() || file.is_null() { return Err(error); }
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
-        struct Launch { args: Vec<String>, restore_origin: String, config: crate::host::NativeConfig, #[serde(default)] embedded: bool }
+        struct Launch {
+            args: Vec<String>, restore_origin: String, config: crate::host::NativeConfig,
+            witness_confirmation: Option<String>,
+            #[serde(default)]
+            embedded: bool,
+        }
         let launch: Launch = serde_json::from_slice(std::ffi::CStr::from_ptr(launch).to_bytes()).map_err(|_| error)?;
         let file = std::ffi::CStr::from_ptr(file).to_str().map_err(|_| error)?;
         let mut config = crate::host::native_config_from_args(&launch.args).map_err(|_| error)?;
+        launch.config.verify_witness_confirmation(launch.witness_confirmation.as_deref()).map_err(|_| error)?;
         let fetched = launch.config.apply_restore(&mut config, &launch.args, &launch.restore_origin).map_err(|_| error)?;
         if launch.embedded { crate::host::NativeConfig::validate_wallet(&config).map_err(|_| error)?; }
         crate::host::native_restore_new(&mut config, &pass, words, std::path::Path::new(file), &launch.restore_origin, fetched.as_ref())?;
@@ -566,6 +578,7 @@ pub unsafe extern "C" fn loki_member_app_pair(
             config: crate::host::NativeConfig,
             #[serde(default)]
             embedded: bool,
+            witness_confirmation: Option<String>,
         }
         let launch: Launch = serde_json::from_str(std::ffi::CStr::from_ptr(launch).to_str().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         let mut config = crate::host::native_config_from_args(&launch.args)?;
@@ -573,6 +586,7 @@ pub unsafe extern "C" fn loki_member_app_pair(
         config.validate_secure_element()?;
         // The values the member reviewed, checked again; never fetched a second time. A fetched
         // configuration is saved only after the profile unlocks.
+        launch.config.verify_witness_confirmation(launch.witness_confirmation.as_deref())?;
         let fetched = launch.config.apply(&mut config, &launch.args, launch.pairing_url.as_deref())?;
         if launch.embedded { crate::host::NativeConfig::validate_wallet(&config)?; }
         let registration = match launch.pairing_url {

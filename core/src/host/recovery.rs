@@ -33,14 +33,17 @@ fn pubkey_file(data: &Path) -> PathBuf {
 }
 
 /// The member's recovery backup-encryption public key, if a recovery identity is established.
+#[cfg(test)]
 pub(super) fn read_encryption_pubkey(data: &Path) -> Option<[u8; 32]> {
-    fs::read(pubkey_file(data)).ok()?.get(..32)?.try_into().ok()
+    let keys = <[u8; 64]>::try_from(fs::read(pubkey_file(data)).ok()?).ok()?;
+    keys[..32].try_into().ok()
 }
 
 /// The member's recovery device-authorization public key (the Ed25519 key that authorizes
 /// replacement devices). Second half of `data/recovery.pub`.
 pub(super) fn read_authz_pubkey(data: &Path) -> Option<[u8; 32]> {
-    fs::read(pubkey_file(data)).ok()?.get(32..64)?.try_into().ok()
+    let keys = <[u8; 64]>::try_from(fs::read(pubkey_file(data)).ok()?).ok()?;
+    keys[32..].try_into().ok()
 }
 
 /// The opaque recovery backup for a vault lives beside its sealed share.
@@ -51,24 +54,33 @@ pub(super) fn backup_file(signer_dir: &Path) -> PathBuf {
 /// Seal this vault's recovery backup: re-seal the share held in the passphrase-sealed
 /// `backup.sealed` to the member's recovery words (HPKE to its recovery public key), so a
 /// replacement device can restore from the words and an exported copy of this file.
-/// Called at vault activation. A no-op (not an error) when no
-/// recovery identity is established, when `backup.sealed` is absent, or when the recovery
-/// backup already exists — so it is safe to call idempotently.
+/// Called at vault activation. A no-op when no recovery identity is established or when
+/// `backup.sealed` is absent. An existing target alone is not proof of a usable backup.
 ///
-/// Once the recovery backup is written, `backup.sealed` is deleted: it is a copy of the share
-/// under the profile passphrase alone, which the device-bound store must not have beside it.
+/// Delete `backup.sealed` only after publication to confirmed words. Legacy profiles keep
+/// their passphrase copy until the member supplies their original words.
 pub(super) fn seal_vault_backup(
     data: &Path,
     signer_dir: &Path,
     vault_id: &[u8; 32],
     pass: &str,
 ) -> Result<(), String> {
-    let Some(recovery_pub) = read_encryption_pubkey(data) else {
-        return Ok(());
+    let keys = match fs::read(pubkey_file(data)) {
+        Ok(keys) if keys.len() == 64 => keys,
+        Ok(_) => return Err("recovery.pub is incomplete; keep your passphrase backup".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.to_string()),
     };
     let target = backup_file(signer_dir);
-    if target.exists() {
-        return drop_passphrase_backup(signer_dir);
+    let confirmed = match MemberDir::open(data, "").read_sealed("recovery.confirmed", pass) {
+        Ok(record) if record == keys => true,
+        Ok(_) => return Err("recovery.pub differs from the confirmed recipient; keep your existing backups".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e.to_string()),
+    };
+    if !confirmed && target.try_exists().map_err(|e| e.to_string())? {
+        // Legacy setup may never have delivered the words. Don't discard either copy.
+        return Ok(());
     }
     let sealed = match MemberDir::open(signer_dir, "").read_sealed("backup.sealed", pass) {
         Ok(bytes) => bytes,
@@ -76,33 +88,42 @@ pub(super) fn seal_vault_backup(
         Err(e) => return Err(e.to_string()),
     };
     let material = backup::verify(&BackupArtifact(sealed), pass, vault_id)?;
-    let artifact = backup::create_to_recovery(&material, &recovery_pub)?;
-    // Written whole before the passphrase copy goes, so a crash never leaves neither.
-    let temp = signer_dir.join(format!(".recovery.backup.{}.tmp", uuid::Uuid::new_v4()));
-    fs::File::create(&temp)
-        .and_then(|mut f| f.write_all(&artifact.0).and_then(|_| f.sync_all()))
-        .and_then(|_| fs::rename(&temp, &target))
-        .and_then(|_| fs::File::open(signer_dir)?.sync_all())
-        .map_err(|e| {
-            let _ = fs::remove_file(&temp);
-            e.to_string()
-        })?;
-    drop_passphrase_backup(signer_dir)
+    let artifact = backup::create_to_recovery(&material, keys[..32].try_into().unwrap())?;
+    publish(&target, &artifact.0, confirmed).map_err(|e| e.to_string())?;
+    if confirmed {
+        match fs::remove_file(signer_dir.join("backup.sealed")) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(format!("remove backup.sealed: {e}")),
+            _ => (),
+        }
+    }
+    Ok(())
 }
 
-/// Delete the passphrase-only `backup.sealed` copy of the share, if present.
-pub(super) fn drop_passphrase_backup(signer_dir: &Path) -> Result<(), String> {
-    match fs::remove_file(signer_dir.join("backup.sealed")) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!("remove backup.sealed: {e}")),
-        _ => Ok(()),
-    }
+/// Publish verified bytes in place, never exposing a partial export.
+pub(super) fn install_backup(signer_dir: &Path, blob: &[u8]) -> Result<(), String> {
+    publish(&backup_file(signer_dir), blob, true).map_err(|e| e.to_string())
+}
+
+fn publish(path: &Path, bytes: &[u8], replace: bool) -> std::io::Result<()> {
+    let parent = path.parent().unwrap();
+    let temp = parent.join(format!(".recovery.{}.tmp", uuid::Uuid::new_v4()));
+    let mut file = fs::File::create_new(&temp)?;
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        if replace { fs::rename(&temp, path)?; }
+        else { fs::hard_link(&temp, path)?; }
+        fs::File::open(parent)?.sync_all()
+    })();
+    let _ = fs::remove_file(&temp);
+    result
 }
 
 /// Seal the missing recovery backup of every active vault. Vaults that became active before
 /// the recovery identity existed have none; this runs at unlock and after recovery setup.
 /// Each vault is attempted; the errors are returned together.
 pub(super) fn seal_missing_backups(data: &Path, pass: &str) -> Result<(), String> {
-    if read_encryption_pubkey(data).is_none() {
+    if !pubkey_file(data).try_exists().map_err(|e| e.to_string())? {
         return Ok(());
     }
     let entries = match fs::read_dir(data.join("vaults")) {
@@ -142,22 +163,6 @@ fn public_keys(key: &RecoveryKey) -> Vec<u8> {
     pubkeys
 }
 
-/// Write `recovery.pub` only if it does not exist. Returns false when it already exists.
-fn create_public_keys(data: &Path, pubkeys: &[u8]) -> Result<bool, String> {
-    let path = pubkey_file(data);
-    // Never replace an identity created by a concurrent request.
-    let mut file = match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
-        Err(e) => return Err(e.to_string()),
-    };
-    if let Err(e) = file.write_all(pubkeys) {
-        let _ = fs::remove_file(&path);
-        return Err(e.to_string());
-    }
-    Ok(true)
-}
-
 /// Restore brings the recovery identity with it: these words must be this profile's recovery
 /// identity. Returns true when `recovery.pub` is absent and must be written with
 /// [`adopt_recovery`]; refuses when the profile already has different words.
@@ -172,11 +177,20 @@ pub(super) fn check_recovery(data: &Path, key: &RecoveryKey) -> Result<bool, Str
 }
 
 /// Make these words the profile's recovery identity (public keys only).
-pub(super) fn adopt_recovery(data: &Path, key: &RecoveryKey) -> Result<(), String> {
-    if !create_public_keys(data, &public_keys(key))? {
-        check_recovery(data, key)?;
+pub(super) fn adopt_recovery(data: &Path, key: &RecoveryKey, pass: &str) -> Result<(), String> {
+    let keys = public_keys(key);
+    match publish(&pubkey_file(data), &keys, false) {
+        Ok(()) => (),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => { check_recovery(data, key)?; }
+        Err(e) => return Err(e.to_string()),
     }
-    Ok(())
+    let root = MemberDir::open(data, "");
+    match root.write_sealed("recovery.confirmed", &keys, pass) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists
+            && root.read_sealed("recovery.confirmed", pass).is_ok_and(|saved| saved == keys) => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// Whether this profile has a recovery identity.
@@ -184,51 +198,65 @@ pub(super) fn exists(data: &Path) -> bool {
     pubkey_file(data).exists()
 }
 
-/// Native startup must not adopt words the member never confirmed saving.
-pub(super) fn confirm_recovery(data: &Path, notice: &super::LocalNotice) -> Result<(), String> {
+/// Interactive startup must not adopt words the member never confirmed saving.
+pub(super) fn confirm_recovery(data: &Path, pass: &str, notice: &super::LocalNotice) -> Result<(), String> {
     if pubkey_file(data).try_exists().map_err(|e| e.to_string())? { return Ok(()); }
     let (words, key) = RecoveryKey::generate()?;
     if !notice("recovery", words.as_str()) { return Err("recovery-not-confirmed".into()); }
-    adopt_recovery(data, &key)
-}
-
-/// Establish the recovery identity once. Only public keys are persisted; existing identities
-/// are left untouched and their words can never be reshown.
-pub async fn establish_recovery(data: &Path) -> Result<Option<Zeroizing<String>>, String> {
-    if pubkey_file(data).try_exists().map_err(|e| e.to_string())? {
-        return Ok(None);
-    }
-    let (words, key) = RecoveryKey::generate()?;
-    Ok(create_public_keys(data, &public_keys(&key))?.then_some(words))
+    adopt_recovery(data, &key, pass)
 }
 
 pub(super) async fn in_app_only() -> Reply {
     err(StatusCode::FORBIDDEN, "Manage recovery words and restore vaults in LokiSigner.")
 }
 
-/// Headless only: POST /api/recovery-setup — establish the recovery identity once and return the 24 words for
-/// the member to write down. Persists only the public keys; refuses if one already exists (the
-/// words can never be reshown). Requires an unlocked session (a deliberate member action).
-pub(super) async fn setup(State(st): State<Shared>) -> Reply {
+/// Headless only: `{}` begins setup; `{ "words": ... }` confirms the words saved by the member.
+/// Keep only pending public keys in memory, so a lost response or restart cannot activate them.
+pub(super) async fn setup(State(st): State<Shared>, Json(mut body): Json<Value>) -> Reply {
     let (data, pass) = {
         let session = st.session.read().await;
-        match session.as_ref() {
-            Some(s) => (s.data.clone(), s.passphrase.clone()),
-            None => return err(StatusCode::UNAUTHORIZED, "unlock before setting up recovery"),
+        let Some(session) = session.as_ref() else {
+            return err(StatusCode::UNAUTHORIZED, "unlock before setting up recovery");
+        };
+        let Ok(mut pending) = st.pending_recovery.lock() else {
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "recovery setup unavailable");
+        };
+        if body.as_object().is_some_and(|fields| fields.is_empty()) {
+            match pubkey_file(&session.data).try_exists() {
+                Ok(false) => (),
+                Ok(true) => return err(StatusCode::CONFLICT, "a recovery identity is already established"),
+                Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            }
+            return match RecoveryKey::generate() {
+                Ok((words, key)) => {
+                    *pending = Some(public_keys(&key));
+                    ok(json!({ "words": words.as_str() }))
+                }
+                Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+            };
         }
+        let Some(Value::String(words)) = body.as_object_mut().and_then(|fields| fields.remove("words")) else {
+            return err(StatusCode::BAD_REQUEST, "provide the saved recovery words to confirm setup");
+        };
+        let key = match RecoveryKey::from_words(&Zeroizing::new(words)) {
+            Ok(key) => key,
+            Err(e) => return err(StatusCode::BAD_REQUEST, e),
+        };
+        match check_recovery(&session.data, &key) {
+            Ok(true) if pending.as_ref() != Some(&public_keys(&key)) => {
+                return err(StatusCode::CONFLICT, "these words are not pending; begin recovery setup again");
+            }
+            Ok(_) => (),
+            Err(e) => return err(StatusCode::CONFLICT, e),
+        }
+        if let Err(e) = adopt_recovery(&session.data, &key, &session.passphrase) {
+            return err(StatusCode::INTERNAL_SERVER_ERROR, e);
+        }
+        *pending = None;
+        (session.data.clone(), session.passphrase.clone())
     };
-    // Returned once, never stored. The member writes these down; they are the only way to open
-    // recovery backups and to authorize a replacement device.
-    match establish_recovery(&data).await {
-        Ok(Some(words)) => {
-            // Vaults that are already active get their backup now; the words are returned
-            // even if sealing fails, and the next unlock retries it.
-            let _ = tokio::task::spawn_blocking(move || seal_missing_backups_logged(&data, &pass)).await;
-            ok(json!({ "words": words.as_str() }))
-        }
-        Ok(None) => err(StatusCode::CONFLICT, "a recovery identity is already established"),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
-    }
+    let _ = tokio::task::spawn_blocking(move || seal_missing_backups_logged(&data, &pass)).await;
+    ok(json!({ "confirmed": true }))
 }
 
 /// GET /api/recovery-status — whether a recovery identity exists and whether this vault has a
@@ -266,7 +294,11 @@ pub(super) async fn fetch(
         Err(e) => return err(StatusCode::BAD_REQUEST, e),
     };
     match fs::read(backup_file(&dir)) {
-        Ok(blob) => ok(json!({ "vault": vault, "backup": hex::encode(blob) })),
+        Ok(blob) if st.config.native => ok(json!({ "vault": vault.to_ascii_lowercase(), "backup": hex::encode(blob) })),
+        Ok(blob) => {
+            let artifact = BackupArtifact(blob);
+            ok(json!({ "vault": vault.to_ascii_lowercase(), "backup": hex::encode(&artifact.0), "fingerprint": artifact.fingerprint() }))
+        }
         Err(_) => err(StatusCode::NOT_FOUND, "no recovery backup for this vault"),
     }
 }
@@ -294,8 +326,13 @@ pub(super) async fn restore(State(st): State<Shared>, Json(body): Json<Value>) -
         Some(Ok(blob)) => Some(blob),
         Some(Err(_)) => return err(StatusCode::BAD_REQUEST, "backup must be hex"),
     };
-    match super::ceremony::restore_vault_from_backup(&data, vault, words.trim(), backup.as_deref(), &pass, &st.config) {
-        Ok(()) => ok(json!({ "restored": true })),
-        Err(e) => err(StatusCode::BAD_REQUEST, e),
-    }
+    let (st, vault, words) = (st.clone(), vault.to_owned(), Zeroizing::new(words.to_owned()));
+    let fingerprint = body.get("fingerprint").and_then(Value::as_str).map(str::to_owned);
+    super::routes::blocking(move || {
+        let _restore = st.ceremony.lock().map_err(|e| e.to_string())?;
+        super::ceremony::restore_vault_from_backup(
+            &data, &vault, &words, backup.as_deref(), fingerprint.as_deref(), &pass, &st.config,
+        )?;
+        Ok(json!({ "restored": true }))
+    }).await
 }

@@ -24,7 +24,6 @@ struct NativeMember {
     viewing_keys: Mutex<BTreeMap<(String, u16), (SignerViewingKey, VaultNetwork)>>,
     runtime: Option<tokio::runtime::Handle>,
     router: Router,
-    #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
     notice: Option<LocalNotice>,
 }
 
@@ -37,7 +36,7 @@ static KEY_RECOVERY: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 struct NativeScope;
 
 impl NativeScope {
-    fn install(state: &Shared, _notice: Option<LocalNotice>) -> Result<Self, String> {
+    fn install(state: &Shared, notice: Option<LocalNotice>) -> Result<Self, String> {
         let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
         if running.is_some() {
             return Err("LokiSigner is already running.".into());
@@ -46,8 +45,7 @@ impl NativeScope {
         *running = Some(Arc::new(NativeMember { state: state.clone(), viewing_keys: Mutex::default(),
             runtime: tokio::runtime::Handle::try_current().ok(),
             router: super::routes::router(state.clone()),
-            #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
-            notice: _notice,
+            notice,
         }));
         Ok(Self)
     }
@@ -96,7 +94,7 @@ pub(crate) fn run_native(
         if *roster_stop.borrow() { super::RosterAnswer::NoAnswer } else { answer }
     });
     super::run_local_with(config, Some(pass), Some(notice.clone()), Some(approval), Some(roster_confirmation),
-        fetched, Some(stop), connect, |state| NativeScope::install(state, Some(notice)))
+        fetched, false, Some(stop), connect, |state| NativeScope::install(state, Some(notice)))
 }
 
 pub(crate) fn request_stop() -> bool {
@@ -104,6 +102,25 @@ pub(crate) fn request_stop() -> bool {
         member.state.stopping.send_replace(true);
         if let Some(tabs) = &member.state.wallet_tabs { tabs.close(); }
         true
+    }))
+}
+
+pub(super) fn clear_addresses_on_lock(state: &Shared) {
+    let member = RUNNING.lock().ok().and_then(|running| {
+        running.as_ref().filter(|member| Arc::ptr_eq(&member.state, state)).cloned()
+    });
+    if let Some(member) = member {
+        member.viewing_keys.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        if let Some(notice) = &member.notice { notice("locked", ""); }
+    }
+}
+
+/// A main-thread check before displaying or copying a result. Never wait for a session writer.
+#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+pub(crate) fn can_view_addresses() -> bool {
+    RUNNING.lock().is_ok_and(|running| running.as_ref().is_some_and(|member| {
+        !member.state.is_stopping()
+            && member.state.session.try_read().is_ok_and(|session| session.is_some())
     }))
 }
 
@@ -296,13 +313,14 @@ pub(crate) fn wallet_request(path: &str, body: Option<Value>, export: bool) -> V
         let path = request_route(path, body.is_some(), export)?;
         let member = RUNNING.lock().map_err(|_| REQUEST_LOCKED)?.clone().ok_or(REQUEST_LOCKED)?;
         if member.state.is_stopping() { return Err(REQUEST_LOCKED); }
+        let generation = member.state.session_generation();
         let runtime = member.runtime.as_ref().ok_or(REQUEST_LOCKED)?;
         let invalid = (StatusCode::BAD_REQUEST, "invalid wallet request");
         let mut builder = Request::builder().uri(format!("/api/{path}")).extension(InProcess(()));
         let body = match body {
             Some(body) if body.is_object() => {
                 if path == "join" && !ceremony::embedded_invite_target(&member.state.config, &body) {
-                    return Err((StatusCode::BAD_REQUEST, "invite does not name the paired coordinator or an allowed peer"));
+                    return Err((StatusCode::BAD_REQUEST, "invite does not name an allowed HTTPS peer"));
                 }
                 builder = builder.method(Method::POST).header(header::CONTENT_TYPE, "application/json");
                 Body::from(body.to_string())
@@ -313,7 +331,8 @@ pub(crate) fn wallet_request(path: &str, body: Option<Value>, export: bool) -> V
         let request = builder.body(body).map_err(|_| invalid)?;
         let (active, mut router) = (member.clone(), member.router.clone());
         let task = runtime.spawn(async move {
-            if active.state.session.read().await.is_none() || active.state.is_stopping() {
+            if active.state.session.read().await.is_none() || active.state.is_stopping()
+                || active.state.session_generation() != generation {
                 return Err(REQUEST_LOCKED);
             }
             let response = router.call(request).await.expect("Axum router is infallible");
@@ -326,7 +345,7 @@ pub(crate) fn wallet_request(path: &str, body: Option<Value>, export: bool) -> V
             Ok((status, data))
         });
         let result = runtime.block_on(task).map_err(|_| REQUEST_LOCKED)?;
-        if member.state.is_stopping()
+        if member.state.is_stopping() || member.state.session_generation() != generation
             || !RUNNING.lock().is_ok_and(|running| running.as_ref().is_some_and(|current| Arc::ptr_eq(current, &member))) {
             return Err(REQUEST_LOCKED);
         }

@@ -25,6 +25,7 @@ import Security
 //   -13 biometry locked out   -14 interaction unavailable   -15 biometry unavailable
 //   -16 no enrollment   -17 invalidated   -18 accessory disconnected   -19 accessory not paired
 //   -20 authentication failed with no recorded enrollment state
+//   -21 enrollment changed during restore
 
 private let algo = SecKeyAlgorithm.eciesEncryptionCofactorX963SHA256AESGCM
 // ECDSA over SHA-256 of the message, ASN.1/DER (X9.62) output — the device login-challenge
@@ -198,6 +199,46 @@ public func se_open_persistent(_ tagPtr: UnsafePointer<UInt8>, _ tagLen: Int,
     return openPersistent(tagPtr, tagLen, createIfMissing != 0, statePath, nil, outHandle)
 }
 
+@_cdecl("se_create_staged")
+public func se_create_staged(_ tagPtr: UnsafePointer<UInt8>, _ tagLen: Int,
+                             _ statePath: UnsafePointer<CChar>, _ outHandle: UnsafeMutablePointer<UInt64>) -> Int {
+    return openPersistent(tagPtr, tagLen, true, statePath, nil, outHandle, staging: true)
+}
+
+// Called after the staged store has unwrapped its actual share. The recorded hash was
+// sampled before key creation; don't publish unless it is still the same enrollment.
+@_cdecl("se_confirm_staged_biometry")
+public func se_confirm_staged_biometry(_ handle: UInt64, _ statePath: UnsafePointer<CChar>?) -> Int {
+    guard let recorded = fetch(handle)?.biometry else { return -4 }
+    let current = keychain.biometry()
+    if let failure = current.failure { return failure == -16 ? -21 : failure }
+    guard let state = current.state else { return -4 }
+    guard state == recorded else { return -21 }
+    if let statePath {
+        let url = URL(fileURLWithFileSystemRepresentation: statePath, isDirectory: false, relativeTo: nil)
+        do { try state.write(to: url, options: .atomic) } catch { return -4 }
+    }
+    return 0
+}
+
+@_cdecl("se_discard_staged")
+public func se_discard_staged(_ tagPtr: UnsafePointer<UInt8>, _ tagLen: Int) -> Int {
+    // The caller supplies a tag reserved for one restore attempt and one key role.
+    let context = LAContext()
+    context.interactionNotAllowed = true
+    defer { context.invalidate() }
+    let query: [String: Any] = [
+        kSecClass as String: kSecClassKey,
+        kSecAttrApplicationTag as String: Data(bytes: tagPtr, count: tagLen),
+        kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+        kSecAttrKeyClass as String: kSecAttrKeyClassPrivate,
+        kSecUseDataProtectionKeychain as String: true,
+        kSecUseAuthenticationContext as String: context,
+    ]
+    let status = SecItemDelete(query as CFDictionary)
+    return status == errSecSuccess || status == errSecItemNotFound ? 0 : -4
+}
+
 // Also used for short-lived viewing-key opens; only the reason and handle lifetime differ.
 @_cdecl("se_open_payment")
 public func se_open_payment(_ tagPtr: UnsafePointer<UInt8>, _ tagLen: Int,
@@ -208,7 +249,7 @@ public func se_open_payment(_ tagPtr: UnsafePointer<UInt8>, _ tagLen: Int,
 
 private func openPersistent(_ tagPtr: UnsafePointer<UInt8>, _ tagLen: Int, _ creating: Bool,
                             _ statePath: UnsafePointer<CChar>?, _ paymentReason: String?,
-                            _ outHandle: UnsafeMutablePointer<UInt64>) -> Int {
+                            _ outHandle: UnsafeMutablePointer<UInt64>, staging: Bool = false) -> Int {
     let fd: Int32?
     if creating {
         guard let path = keychain.lockPath(), let locked = creationLock(path) else { return -4 }
@@ -234,6 +275,7 @@ private func openPersistent(_ tagPtr: UnsafePointer<UInt8>, _ tagLen: Int, _ cre
     let status = keychain.lookup(query as CFDictionary, &out)
     if let result = persistentLookupResult(status, createIfMissing: creating) {
         guard result == 0 else { return checkedBiometricFailure(result, recorded: recorded, current: keychain.biometry) }
+        guard !staging else { return -4 } // A restore tag is fresh, never a shared or reused key.
         guard let r = out, CFGetTypeID(r) == SecKeyGetTypeID() else { return -4 }
         let key = r as! SecKey
         if let reason = paymentReason {
@@ -274,14 +316,18 @@ private func openPersistent(_ tagPtr: UnsafePointer<UInt8>, _ tagLen: Int, _ cre
     // A lookup may stop seeing a key after biometrics change, even with its record still present.
     let missing = checkedBiometricFailure(-6, recorded: recorded, current: keychain.biometry)
     guard missing == -6 else { return missing }
-    let before = keychain.biometry().state
+    let before = keychain.biometry()
+    if staging {
+        if let failure = before.failure { return failure }
+        guard before.state != nil else { return -4 }
+    }
     let (key, failure) = keychain.create(tag)
     guard let key else {
         // Security can wrap a preflight failure as an undifferentiated auth failure.
         if [-4, -5, -7, -12].contains(failure), let reason = keychain.biometry().failure, reason != -12 { return reason }
         return failure
     }
-    let state = before ?? keychain.biometry().state
+    let state = before.state ?? keychain.biometry().state
     if let state, let stateURL {
         do { try state.write(to: stateURL, options: .atomic) } catch { return -4 }
     }

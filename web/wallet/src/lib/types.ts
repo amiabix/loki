@@ -63,13 +63,14 @@ export type Payment = {
   approvals?: number[];
   approval_requested?: boolean;
   can_discard?: boolean;
+  can_dismiss?: boolean;
   // This member holds the signed transaction and can send it, or send it again.
   can_send?: boolean;
   sending?: boolean;
   // The payment looks stuck: any member may replace it by spending the same note.
   can_replace?: boolean;
   replaces?: Replaces | null;
-  replaced_by?: string | null;
+  spent_by?: string | null;
   error?: string | null;
   txid?: string | null;
   direction?: "sent" | "received";
@@ -83,6 +84,7 @@ export type PaymentSession = {
   phase: string;
   signatures_received: boolean;
   txid?: string | null;
+  spent_by?: string | null;
   replaces?: Replaces | null;
   approvals: number[];
   approval_requested: boolean;
