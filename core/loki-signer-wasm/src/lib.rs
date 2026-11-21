@@ -275,8 +275,8 @@ pub struct Signer {
     witness_pins: Option<WitnessPins>,
     /// Claims both witnesses confirmed for this signature (cid, record), consumed by the core.
     claimed: Arc<Mutex<Vec<([u8; 32], Vec<u8>)>>>,
-    /// The open vault's chain scan (vault id, scan state), started by `scanNext`.
-    scan: Option<([u8; 32], ChainScan)>,
+    /// The open vault's chain scan (vault id, network, scan state), started by `scanNext`.
+    scan: Option<([u8; 32], VaultNetwork, ChainScan)>,
 }
 
 impl Default for Signer {
@@ -605,11 +605,11 @@ impl Signer {
     /// Scan the next compact block (protobuf bytes from lightwalletd's `GetBlockRange`).
     #[wasm_bindgen(js_name = scanBlock)]
     pub fn scan_block(&mut self, block: &[u8]) -> Result<(), JsError> {
-        let (_, scan) = self.scan.as_mut().ok_or_else(|| JsError::new("call scanNext first"))?;
+        let (_, _, scan) = self.scan.as_mut().ok_or_else(|| JsError::new("call scanNext first"))?;
         scan.scan(block).map_err(|e| JsError::new(&e))
     }
 
-    /// Seal the scan state under the custody KEK and save it, so the next scan resumes here.
+    /// Seal and save the scan state bound to its vault and network, so the next scan resumes here.
     /// Pre-open `vaultPaths(vaultHex)` for write first.
     #[wasm_bindgen(js_name = scanSave)]
     pub fn scan_save(&self) -> Result<(), JsError> {
@@ -620,7 +620,7 @@ impl Signer {
     /// For a chain that no longer extends the saved tip (a reorganization).
     #[wasm_bindgen(js_name = scanReset)]
     pub fn scan_reset(&mut self) -> Result<(), JsError> {
-        if let Some((id, _)) = self.scan.take() {
+        if let Some((id, _, _)) = self.scan.take() {
             opfs_put(&scan_path(&id), &[], false).map_err(|e| JsError::new(&e))?;
         }
         Ok(())
@@ -630,7 +630,7 @@ impl Signer {
     /// `{txid, height}`, or `null` while the scan has not seen it spent.
     #[wasm_bindgen(js_name = scanSpentBy)]
     pub fn scan_spent_by(&self, nullifier_hex: &str) -> Result<String, JsError> {
-        let (_, scan) = self.scan.as_ref().ok_or_else(|| JsError::new("call scanNext first"))?;
+        let (_, _, scan) = self.scan.as_ref().ok_or_else(|| JsError::new("call scanNext first"))?;
         let nf: [u8; 32] = hex::decode(nullifier_hex).ok().and_then(|b| b.try_into().ok()).ok_or_else(|| JsError::new("invalid nullifier"))?;
         Ok(match scan.spent_by(&nf) {
             Some((txid, height)) => serde_json::json!({ "txid": txid, "height": height }),
@@ -642,7 +642,7 @@ impl Signer {
     /// `{height, balance_zat, history}` from the blocks scanned so far.
     #[wasm_bindgen(js_name = scanResult)]
     pub fn scan_result(&self) -> Result<String, JsError> {
-        let (_, scan) = self.scan.as_ref().ok_or_else(|| JsError::new("call scanNext first"))?;
+        let (_, _, scan) = self.scan.as_ref().ok_or_else(|| JsError::new("call scanNext first"))?;
         Ok(serde_json::json!({
             "height": scan.height(),
             "balance_zat": scan.balance_zat().to_string(),
@@ -842,6 +842,10 @@ pub fn vault_paths(vault_hex: &str) -> String {
 /// The vault's sealed chain-scan state (`scanSave`).
 fn scan_path(vault_id: &[u8; 32]) -> String {
     format!("{}/scan.sealed", vault_dir(&hex::encode(vault_id)))
+}
+
+fn scan_binding(vault_id: &[u8; 32], network: VaultNetwork) -> String {
+    format!("Loki_browser_scan_v1:{}:{}", network.label(), hex::encode(vault_id))
 }
 
 /// OPFS-backed [`BackupDevice`]: the in-ceremony backup `LocalSigner::backup` saves and
@@ -1281,30 +1285,34 @@ impl Signer {
     }
 
     fn scan_save_impl(&self) -> Result<(), String> {
-        let (id, scan) = self.scan.as_ref().ok_or("call scanNext first")?;
+        let (id, network, scan) = self.scan.as_ref().ok_or("call scanNext first")?;
         let se = SoftwareSecureElement::from_kek(*self.kek.clone().ok_or("unlock the signer first")?);
-        opfs_put(&scan_path(id), &SealedShare::seal(&se, 0, &scan.to_bytes())?.to_bytes(), false)
+        let binding = scan_binding(id, *network);
+        let sealed = SealedShare::seal_bound(&se, 0, &scan.to_bytes(), binding.as_bytes())?;
+        opfs_put(&scan_path(id), &sealed.to_bytes(), false)
     }
 
     fn scan_next_impl(&mut self) -> Result<u32, String> {
         let vs = self.vault.as_ref().ok_or("open the vault first")?;
-        if self.scan.as_ref().map(|(id, _)| *id) != Some(vs.vref.vault_id) {
-            let roster = vs.signer.confirmed_roster().ok_or("this vault has no confirmed roster")?;
+        let id = vs.vref.vault_id;
+        let roster = vs.signer.confirmed_roster().ok_or("this vault has no confirmed roster")?;
+        let network = roster.network;
+        if self.scan.as_ref().map(|(id, network, _)| (*id, *network)) != Some((id, network)) {
             let (_, fvk) = vs.signer.hosted_metadata().map_err(|e| e.to_string())?;
-            let birth = roster.birth_height.unwrap_or(1);
-            // Resume from this browser's sealed scan state, if a scan ran before.
-            // An empty file is a scan never saved, or reset (`scanReset`).
-            let saved = opfs_get(&scan_path(&vs.vref.vault_id))?.filter(|b| !b.is_empty());
+            let se = SoftwareSecureElement::from_kek(*self.kek.clone().ok_or("unlock the signer first")?);
+            let binding = scan_binding(&id, network);
+            // Legacy or mismatched snapshots are rebuildable caches, not migration inputs.
+            let saved = opfs_get(&scan_path(&id))?
+                .and_then(|raw| SealedShare::from_bytes(&raw).ok())
+                .and_then(|sealed| sealed.open_bound(&se, binding.as_bytes()).ok())
+                .and_then(|plain| ChainScan::from_bytes(network, &fvk, &plain).ok());
             let scan = match saved {
-                Some(sealed) => {
-                    let se = SoftwareSecureElement::from_kek(*self.kek.clone().ok_or("unlock the signer first")?);
-                    ChainScan::from_bytes(roster.network, &fvk, &SealedShare::from_bytes(&sealed)?.open(&se)?)?
-                }
-                None => ChainScan::new(roster.network, &fvk, birth)?,
+                Some(scan) => scan,
+                None => ChainScan::new(network, &fvk, roster.birth_height.unwrap_or(1))?,
             };
-            self.scan = Some((vs.vref.vault_id, scan));
+            self.scan = Some((id, network, scan));
         }
-        let (_, scan) = self.scan.as_ref().expect("set above");
+        let (_, _, scan) = self.scan.as_ref().expect("set above");
         Ok(scan.next_height())
     }
 
