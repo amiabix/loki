@@ -1580,7 +1580,7 @@ function VaultOverview({
   const [balanceErr, setBalanceErr] = useState<string | null>(null);
   const [retrying, setRetrying] = useState(false);
   const needsTouchID = balanceErr === "Touch ID is required to open this vault.";
-  const [funding, setFunding] = useState(false);
+  const [funding, setFunding] = useState<"idle" | "requesting" | "unconfirmed">("idle");
   const [pending, setPending] = useState<PendingApproval[] | null>(null);
   const [pendingError, setPendingError] = useState<string | null>(null);
   const [pendingVersion, setPendingVersion] = useState(0);
@@ -1645,14 +1645,16 @@ function VaultOverview({
   };
 
   const requestFunds = async () => {
-    if (!address) return;
-    setFunding(true); setLoadErr(null);
+    if (!address || funding !== "idle") return;
+    setFunding("requesting"); setLoadErr(null);
     try {
-      await fund(address);
-      const r = await api<{ balance_zat: number }>("balance", { vault: vault.vault });
-      setBalance(r);
-    } catch (e) { setLoadErr((e as Error).message); }
-    finally { setFunding(false); }
+      const { mined } = await fund(address);
+      setFunding(mined ? "idle" : "unconfirmed");
+      if (mined) setLoadVersion((v) => v + 1);
+    } catch (e) {
+      setLoadErr((e as Error).message);
+      setFunding("idle");
+    }
   };
 
   return (
@@ -1752,13 +1754,19 @@ function VaultOverview({
           {address.startsWith("uregtest1") && (
             <button
               onClick={requestFunds}
-              disabled={funding}
+              disabled={funding !== "idle"}
               className="btn-glass rounded-full px-4 py-3 text-sm text-amber disabled:opacity-60"
             >
-              {funding ? "Funding…" : "Request test funds"}
+              {funding === "requesting" ? "Funding…" : funding === "unconfirmed" ? "Funding accepted" : "Request test funds"}
             </button>
           )}
         </div>
+      )}
+      {funding === "unconfirmed" && (
+        <p role="status" className="mb-4 text-sm text-muted">
+          The faucet accepted the transfer, but automatic mining could not be verified. Check the regtest node and
+          watch your balance instead of requesting funds again.
+        </p>
       )}
 
       {/* Testnet has no in-app faucet: send the member to an external one with the address. */}
