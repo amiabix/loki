@@ -3,7 +3,7 @@
 //!
 //!   loki_member_app --data <dir> --port <n> [--network testnet] [--lightwalletd-url <url>]
 //!       [--frostd-url <url>] [--peer <slot=baseurl>]...
-//!       [--bind <IP>] [--advertise-url <url>]
+//!       [--bind <IP>] [--advertise-url <url>] [--allow-loopback-peers]
 //!       [--secure-element <software|apple>]
 //!       [--coordinator-url <origin> --local-passphrase-file <path>
 //!        --registration-slot <public-slot> --profile-name <name>]

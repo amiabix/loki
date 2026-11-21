@@ -320,8 +320,12 @@ core/signer-app/out/LokiSigner.app/Contents/MacOS/LokiSigner pair 'loki://pair?.
 
 Other member flags are the existing `loki_member_app` flags: network, lightwalletd, relay,
 nonce witnesses, and peer allowlist. Each overrides the coordinator's value for its field,
-for that launch only. For members on separate Macs, configure a reachable
-HTTPS `--advertise-url` (forwarded to the member service) and the allowed `--peer` origins.
+for that launch only. For an HTTP ceremony between separate Macs, the creator needs a reachable
+HTTPS `--advertise-url` forwarded to its member service. Confirm that origin with the creator
+separately from the invite, then add it to each joiner's local `--peer <slot=origin>` allowlist.
+The origin must resolve to public addresses; the joiner verifies TLS and does not follow redirects.
+Loopback origins on non-privileged ports are for co-located regtest or deliberate
+`--allow-loopback-peers` runs only.
 The private browser session still uses loopback; it is never sent to that public endpoint.
 The link contains only origin, slot and a random claim, never runtime configuration or keys;
 the configuration comes from that origin, as described above.
