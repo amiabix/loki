@@ -42,6 +42,7 @@ import { toggleTheme, useIsDark } from "@/lib/theme";
 import { useCeremonyStatus, usePayments, useStatus } from "@/lib/hooks";
 import type {
   CeremonyStatus,
+  ChainProvenance,
   InviteSlot,
   Payment,
   PaymentReview,
@@ -1561,6 +1562,12 @@ function BackupPhase({
 
 // ─── vault overview ───────────────────────────────────────────────────────────
 
+function ProviderProvenance({ chain_trust }: ChainProvenance) {
+  return chain_trust === "provider_reported" && (
+    <p className="mb-3 text-xs text-muted">Reported by your chain provider · not independently verified</p>
+  );
+}
+
 function VaultOverview({
   vault,
   onSend,
@@ -1575,7 +1582,8 @@ function VaultOverview({
   onBack: () => void;
 }) {
   const [address, setAddress] = useState<string | null>(null);
-  const [balance, setBalance] = useState<{ balance_zat: number } | null>(null);
+  type Balance = ChainProvenance & { balance_zat: number };
+  const [balance, setBalance] = useState<Balance | null>(null);
   const [copied, setCopied] = useState(false);
   const [copyFailed, setCopyFailed] = useState(false);
   const [loadVersion, setLoadVersion] = useState(0);
@@ -1614,7 +1622,7 @@ function VaultOverview({
       .catch((e) => active && setLoadErr((e as Error).message));
     // Poll the balance so a deposit (or a still-scanning signer) shows up without a reload.
     const loadBalance = () =>
-      api<{ balance_zat: number }>("balance", { vault: vault.vault })
+      api<Balance>("balance", { vault: vault.vault })
         .then((r) => { if (active) { setBalance(r); setBalanceErr(null); } })
         .catch((e) => active && setBalanceErr((e as Error).message));
     loadBalance();
@@ -1629,7 +1637,7 @@ function VaultOverview({
     if (needsTouchID) {
       setRetrying(true);
       try {
-        setBalance(await api<{ balance_zat: number }>("balance", { vault: vault.vault, retry_touch_id: true }));
+        setBalance(await api<Balance>("balance", { vault: vault.vault, retry_touch_id: true }));
         setBalanceErr(null);
       } catch (e) { setBalanceErr((e as Error).message); }
       finally { setRetrying(false); }
@@ -1668,10 +1676,11 @@ function VaultOverview({
         <span className="pill shrink-0 font-mono text-muted">{vault.threshold}/{vault.members}</span>
       </div>
       <p className="eyebrow mb-2">Balance</p>
-      <div className="mb-6 font-mono text-3xl font-semibold [overflow-wrap:anywhere] sm:text-4xl">
+      <div className="mb-2 font-mono text-3xl font-semibold [overflow-wrap:anywhere] sm:text-4xl">
         {balance ? zatToTaz(balance.balance_zat) : "—"}
         <span className="ml-2 text-xl text-muted">TAZ</span>
       </div>
+      {balance && <ProviderProvenance chain_trust={balance.chain_trust} />}
 
       {!balance && !balanceErr && (
         <p role="status" className="glass mb-4 rounded-2xl p-4 text-sm text-muted">Loading balance…</p>
@@ -2177,10 +2186,11 @@ function ReviewApprove({
       <GlassCard className="text-center">
         <h2 className="mb-2 text-2xl font-semibold">{paymentLabel(session.phase, false, false)}</h2>
         <p className="mb-4 text-sm text-muted">
-          {session.phase === "confirmed" ? "The mined transaction matches this payment attempt." :
-            session.phase === "replaced" ? "A different transaction spent this payment’s input on the current chain." :
-              "This payment’s input was spent on the current chain, but the spend hasn’t been verified as this payment."}
+          {session.phase === "confirmed" ? "The reported mined transaction matches this payment attempt." :
+            session.phase === "replaced" ? "A different transaction was reported to have spent this payment’s input." :
+              "This payment’s input was reported spent, but the spend hasn’t been matched to this payment."}
         </p>
+        <ProviderProvenance chain_trust={session.chain_trust} />
         {session.approval_requested && <p className="mb-4 text-sm text-mint">You approved this payment.</p>}
         <Btn variant="ghost" onClick={onBack}>Back to History</Btn>
       </GlassCard>
@@ -2380,6 +2390,7 @@ function History({
     <div>
       <BackLink onClick={onBack} />
       <h2 className="mb-4 text-2xl font-semibold">History</h2>
+      <ProviderProvenance chain_trust={data?.chain_trust} />
 
       {error && <div className="mb-4"><ErrMsg msg={error} /><Btn variant="ghost" onClick={refresh}>Retry history</Btn></div>}
 
@@ -2419,10 +2430,10 @@ function History({
               </div>
               {p.signers && !txid && !settled && <SignerList signers={p.signers} threshold={vault.threshold} approvals={p.approvals} complete={p.phase === "approved"} />}
               {replaced && <p className="text-xs text-muted">
-                Another transaction spent this payment’s note on the current chain{p.spent_by ? ` (${short(p.spent_by, 8, 6)})` : ""}.
+                Another transaction was reported to have spent this payment’s note{p.spent_by ? ` (${short(p.spent_by, 8, 6)})` : ""}.
               </p>}
               {unverified && <p className="text-xs text-muted">
-                This payment’s note was spent on the current chain{p.spent_by ? ` (${short(p.spent_by, 8, 6)})` : ""}, but the spend hasn’t been matched to this attempt.
+                This payment’s note was reported spent{p.spent_by ? ` (${short(p.spent_by, 8, 6)})` : ""}, but the spend hasn’t been matched to this attempt.
               </p>}
               {txid && !confirmed && p.phase === "signed" && <p className="text-xs text-muted">
                 Signed by {vault.threshold} members. This device holds the final transaction{p.can_send ? " and can send it" : ""}.
@@ -2468,7 +2479,7 @@ function History({
               {p.can_replace && <ReplacePanel vault={vault} payment={p} onStarted={onReview} />}
               {txid && confirmed && (
                 <p className="mt-1.5 text-center text-[11px] text-muted">
-                  Confirmed on-chain by your wallet{p.mined_height ? ` at block ${p.mined_height.toLocaleString()}` : ""}.{" "}
+                  Reported mined{p.mined_height ? ` at block ${p.mined_height.toLocaleString()}` : ""}.{" "}
                   <a href={`https://testnet.zecblock.com/tx/${txid}`} target="_blank" rel="noreferrer" className="text-mint underline">View on ZecBlock ↗</a>. Tap the id to copy.
                 </p>
               )}
