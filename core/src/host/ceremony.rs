@@ -149,8 +149,8 @@ pub(super) struct Ceremony {
     // matches the creator's byte-for-byte (joiners must not reconstruct it from a guess).
     #[serde(default)]
     birth_height: Option<u32>,
-    // The roster code this member confirmed in `agree`; the signer's roster prompt matches it.
-    #[serde(default)]
+    // Do not resume from older agreement records, which may have come from HTTP alone.
+    #[serde(default, rename = "locally_confirmed_roster_code")]
     roster_code: Option<String>,
 }
 
@@ -771,12 +771,15 @@ pub(super) async fn status(st: Shared, vault: String) -> Reply {
             }
         }
         let active = dir(&data, &vault)?.exists("vault.sealed");
+        let local_agreed = c.agreed.contains(&c.my_slot);
+        let confirmed = local_agreed && (active || c.roster_code.is_some());
+        let confirmations = c.agreed.len() - usize::from(local_agreed && !confirmed);
         let running_here = st.active_dkgs.lock().map_err(|e| e.to_string())?.contains(&vault);
         let phase = if active {
             "active"
         } else if c.error.is_some() || (c.dkg_started && !running_here) {
             "setup_interrupted"
-        } else if c.dkg_started || (c.my_slot == 1 && c.agreed.len() == usize::from(c.members)) {
+        } else if c.dkg_started || (c.my_slot == 1 && confirmations == usize::from(c.members)) {
             "creating_keys"
         } else if c.fingerprint.is_some() {
             "compare_roster"
@@ -784,13 +787,13 @@ pub(super) async fn status(st: Shared, vault: String) -> Reply {
             "waiting_for_members"
         };
         let mut value = json!({"phase":phase,"members":c.members,"threshold":c.threshold,
-            "confirmations":c.agreed.len(),"confirmed":c.agreed.contains(&c.my_slot),
+            "confirmations":confirmations,"confirmed":confirmed,
             "fingerprint":c.fingerprint,"secure_element":st.config.secure_element});
         if c.fingerprint.is_some() {
             value["roster_code"] = json!(setup_roster_code(&c, VaultNetwork::parse(&st.config.network)?).ok());
         }
         // LokiSigner asks the member to compare the code; the page shows where that stands.
-        if st.roster_confirmation.is_some() {
+        if st.config.native && st.roster_confirmation.is_some() {
             let open = st.roster_asking.lock().map_err(|e| e.to_string())?.as_deref() == Some(vault.as_str());
             let differ = st.roster_refused.lock().map_err(|e| e.to_string())?.contains(&vault);
             value["roster_dialog"] = if differ { json!("codes_differ") } else if open { json!("open") } else { Value::Null };
@@ -835,12 +838,8 @@ fn spawn_dkg(st: Shared, vault: String, data: std::path::PathBuf, pass: Zeroizin
 /// `POST /api/agree`: this member agrees to the roster whose fingerprint and 24-digit code the
 /// request names, once setup has not started, the roster is fresh and both match.
 ///
-/// With LokiSigner's roster channel attached ([`AppState::roster_confirmation`]), the request
-/// cannot agree by itself: LokiSigner shows the member the code derived here and only their
-/// "Codes match" records agreement. A headless member (`loki_member_app`, `LokiSigner serve`)
-/// has no screen and trusts its caller to have compared the code with the other members.
-///
-/// [`AppState::roster_confirmation`]: super::state::AppState::roster_confirmation
+/// The request only opens a local prompt (LokiSigner or the foreground terminal).
+/// Without an affirmative answer, it never records this member's agreement.
 pub(super) async fn agree(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
     let (Some(vault), Some(fingerprint), Some(roster_code)) =
         (body["vault"].as_str(), body["fingerprint"].as_str(), body["roster_code"].as_str())
@@ -859,11 +858,7 @@ pub(super) async fn agree(State(st): State<Shared>, Json(body): Json<Value>) -> 
     let reply = blocking(move || {
         let (st, data, pass, vault) = (&work_st, &work_data, &work_pass, &work_vault);
         let network = VaultNetwork::parse(&st.config.network)?;
-        let Some(confirm) = st.roster_confirmation.clone() else {
-            let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
-            let (c, code) = agreement(&st.config, data, pass, vault, &fingerprint, &roster_code, network)?;
-            return record_agreement(&st.config, data, pass, c, code);
-        };
+        let confirm = st.roster_confirmation.as_ref().ok_or(ROSTER_NOT_CONFIRMED)?;
         let _asking = RosterAsking::claim(st, vault)?;
         let summary = {
             let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
@@ -1150,8 +1145,8 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
         if c.dkg_started || c.error.is_some() || dir(data, vault_id)?.exists("vault.sealed") {
             return Ok(json!({"ok":true}));
         }
-        if (c.my_slot == 1 && c.agreed.len() != usize::from(c.members))
-            || (c.my_slot != 1 && !c.agreed.contains(&c.my_slot))
+        if c.roster_code.is_none() || !c.agreed.contains(&c.my_slot)
+            || (c.my_slot == 1 && c.agreed.len() != usize::from(c.members))
         {
             return Ok(json!({"ok":true}));
         }
@@ -1619,10 +1614,9 @@ mod tests {
         }
         let reply = agree(State(st.clone()),
             Json(json!({"vault":vault,"fingerprint":fingerprint,"roster_code":code}))).await;
-        assert_eq!(reply.0, StatusCode::OK, "{}", reply.1 .0);
+        assert_eq!(reply.1 .0["error"], ROSTER_NOT_CONFIRMED);
         let c = load(&data, "pass", &vault).unwrap();
-        assert!(c.agreed.contains(&1));
-        assert_eq!(c.roster_code.as_deref(), Some(code.as_str()));
+        assert!(c.agreed.is_empty() && c.roster_code.is_none());
 
         // On Testnet the code covers the birth height fixed with the roster.
         let mut c = c;
@@ -1687,7 +1681,8 @@ mod tests {
     /// An unlocked member on `data`, with LokiSigner's roster dialog when `dialog` is given.
     async fn member(data: &Path, port: u16, dialog: Option<crate::host::LocalRosterConfirmation>) -> Shared {
         std::fs::create_dir_all(data).unwrap();
-        let st = std::sync::Arc::new(AppState { roster_confirmation: dialog, ..AppState::new(test_config(data, port)) });
+        let config = Config { native: dialog.is_some(), ..test_config(data, port) };
+        let st = std::sync::Arc::new(AppState { roster_confirmation: dialog, ..AppState::new(config) });
         *st.session.write().await = Some(Session { passphrase: Zeroizing::new("pass".into()), data: data.to_owned() });
         st
     }

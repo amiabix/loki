@@ -1129,8 +1129,7 @@ function CeremonyView({
         {cs.phase === "waiting_for_members" && (
           <WaitingForMembers invites={cs.invites ?? []} />
         )}
-        {/* Only LokiSigner's roster channel reports `roster_dialog`; any other member, including
-            a headless one paired with this tab, compares the code shown here. */}
+        {/* Only LokiSigner's native window reports `roster_dialog`. */}
         {cs.phase === "compare_roster" && comparesInLokiSigner(cs) && (
           <NativeCompareRoster
             creator={cs.invites !== undefined}
@@ -1317,10 +1316,16 @@ function CompareRoster({
   };
 
   const allConfirmed = members > 0 && confirmations >= members;
+  const headless = signerKind() === "native";
 
   return (
     <div>
-      {rosterCode ? (
+      {rosterCode && headless ? (
+        <p className="text-sm text-muted mb-4">
+          Request confirmation to show the code in your signer&apos;s terminal. Compare all 24 digits
+          with the other members on their trusted screens or terminals, then answer in your terminal.
+        </p>
+      ) : rosterCode ? (
         <>
           <p className="text-sm text-muted mb-4">
             Security check: compare all 24 digits with every member on a call or in person.
@@ -1342,13 +1347,13 @@ function CompareRoster({
       )}
       {rosterCode && !confirmedHere && !allConfirmed && (
         <>
-          <label className="glass mb-3 flex items-start gap-3 rounded-2xl p-4 text-left text-sm text-foreground cursor-pointer">
+          {!headless && <label className="glass mb-3 flex items-start gap-3 rounded-2xl p-4 text-left text-sm text-foreground cursor-pointer">
             <input type="checkbox" className="mt-0.5 h-4 w-4 shrink-0 accent-amber" checked={checked}
               onChange={(e) => setChecked(e.target.checked)} />
             <span>I compared all 24 digits with the other members and they match.</span>
-          </label>
-          <Btn variant="amber" onClick={agree} disabled={busy || !fingerprint || !checked}>
-            {busy ? "Confirming…" : "Confirm members"}
+          </label>}
+          <Btn variant="amber" onClick={agree} disabled={busy || !fingerprint || (!headless && !checked)}>
+            {headless ? (busy ? "Check your signer’s terminal…" : "Request local confirmation") : (busy ? "Confirming…" : "Confirm members")}
           </Btn>
         </>
       )}

@@ -106,6 +106,6 @@ echo "member slot $slot running; registering with $coordinator"
 printf 'Private pairing link (do not share or log): %s\n' "$pairing_link" >&7
 unset pairing_link
 echo "Set up recovery in the wallet if needed; save the words privately, then confirm."
+echo "Keep this launcher in the foreground for local roster confirmation. Press Ctrl-C to stop."
 echo "=============================================================="
-trap - EXIT INT TERM
-printf 'Member still running; stop with: kill $(cat -- %q)\n' "$data/pids"
+wait
