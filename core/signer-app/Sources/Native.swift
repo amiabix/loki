@@ -1020,8 +1020,10 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
                 input.file.withCString { file in
                     input.words.withUnsafeMutableBufferPointer { words in
                         input.pass.withUnsafeMutableBufferPointer { pass in
-                            recoveryError(loki_member_app_restore_profile(request, words.baseAddress, words.count,
-                                pass.baseAddress, pass.count, file, nativeNotice, nativeApprove, nativeConfirmRoster, nativeConnect))
+                            input.fingerprint.withCString { fingerprint in
+                                recoveryError(loki_member_app_restore_profile(request, words.baseAddress, words.count,
+                                    pass.baseAddress, pass.count, file, fingerprint, nativeNotice, nativeApprove, nativeConfirmRoster, nativeConnect))
+                            }
                         }
                     }
                 }
@@ -1051,7 +1053,9 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         DispatchQueue.global(qos: .userInitiated).async {
             let error = input.file.withCString { file in
                 input.words.withUnsafeMutableBufferPointer { words in
-                    recoveryError(loki_member_app_restore_vault(words.baseAddress, words.count, file))
+                    input.fingerprint.withCString { fingerprint in
+                        recoveryError(loki_member_app_restore_vault(words.baseAddress, words.count, file, fingerprint))
+                    }
                 }
             }
             DispatchQueue.main.async {

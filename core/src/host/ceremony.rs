@@ -2716,6 +2716,8 @@ mod tests {
         });
         let file = root.join("recovery.json");
         let document = exported(&material);
+        let fingerprint_of = |doc: &Value| backup::BackupArtifact(hex::decode(doc["backup"].as_str().unwrap()).unwrap()).fingerprint();
+        let anchor = fingerprint_of(&document);
         let identity = Identity::from_secret_bytes(&material.identity).unwrap().public();
         let signing = hex::encode(identity.signing);
         let relay = hex::encode(identity.encryption);
@@ -2766,7 +2768,14 @@ mod tests {
         let bad_file = "invalid-backup";
         let mismatch = "roster-mismatch";
         let secret = |words: &str| Zeroizing::new(words.as_bytes().to_vec());
+        let restore_new = |settings: &mut Config, words: &str, origin: &str| {
+            native_recovery::restore_new(settings, pass, secret(words), &file, &anchor, origin, None)
+        };
         tokio::task::block_in_place(|| {
+            // A legitimate but different export of the very same material must not match.
+            std::fs::write(&file, exported(&material).to_string()).unwrap();
+            assert_eq!(restore_new(&mut settings, &words, &origin), Err("backup-fingerprint-mismatch"));
+            assert!(!data.exists());
             for (contents, input, expected) in [
                 (document.to_string(), other_words.as_str(), refused),
                 (wrong_vault.to_string(), words.as_str(), refused),
@@ -2775,35 +2784,35 @@ mod tests {
                 (format!(r#"{{"vault":"{vault_hex}","vault":"{vault_hex}","backup":{}}}"#, document["backup"]), words.as_str(), bad_file),
             ] {
                 std::fs::write(&file, contents).unwrap();
-                assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(input), &file, &origin, None), Err(expected));
+                assert_eq!(restore_new(&mut settings, input, &origin), Err(expected));
                 assert!(!data.exists());
             }
             assert_eq!(roster_reads.load(Ordering::SeqCst), 0, "invalid backups never reach the roster lookup");
             std::fs::write(&file, document.to_string()).unwrap();
-            assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &format!("{origin}/wallet"), None),
+            assert_eq!(restore_new(&mut settings, &words, &format!("{origin}/wallet")),
                 Err("roster-unavailable"));
-            assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None), Err(mismatch));
+            assert_eq!(restore_new(&mut settings, &words, &origin), Err(mismatch));
             assert!(!data.exists());
             *roster.lock().unwrap() = vec![entry.clone(), entry.clone()];
-            assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None), Err("roster-unavailable"));
+            assert_eq!(restore_new(&mut settings, &words, &origin), Err("roster-unavailable"));
             assert!(!data.exists());
             *roster.lock().unwrap() = vec![entry];
             settings.secure_element = "invalid fixture backend".into();
-            assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None), Err(refused));
+            assert_eq!(restore_new(&mut settings, &words, &origin), Err(refused));
             assert!(!data.exists(), "even a failure during installation must not publish the profile");
             settings.secure_element = "software".into();
             crate::profile::create(&data, pass, "Mistaken new member").unwrap();
-            assert!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None).is_err());
+            assert!(restore_new(&mut settings, &words, &origin).is_err());
             native_recovery::set_aside(&data, false).unwrap();
             std::fs::create_dir_all(data.join("signer")).unwrap();
             std::fs::write(data.join("signer/share.sealed"), b"unrecognised data").unwrap();
-            assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None),
+            assert_eq!(restore_new(&mut settings, &words, &origin),
                 Err("profile-not-fresh"));
             assert_eq!(std::fs::read(data.join("signer/share.sealed")).unwrap(), b"unrecognised data");
             std::fs::remove_dir_all(data.join("signer")).unwrap();
             std::fs::create_dir_all(data.join("profile")).unwrap();
             std::fs::write(data.join(NATIVE_KEY_SCOPE), b"interrupted write").unwrap();
-            native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None).unwrap();
+            restore_new(&mut settings, &words, &origin).unwrap();
             let archives: Vec<_> = std::fs::read_dir(&root).unwrap().map(|e| e.unwrap().path())
                 .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("restored-set-aside-")).collect();
             assert_eq!(archives.len(), 2);
@@ -2823,17 +2832,21 @@ mod tests {
 
         let s = state.clone();
         tokio::task::block_in_place(|| {
-            assert_eq!(native_recovery::restore_running(&s, secret(&words), &file), Err("profile-locked"));
+            let restore_running = |fingerprint: &str| native_recovery::restore_running(&s, secret(&words), &file, fingerprint);
+            assert_eq!(restore_running(&anchor), Err("profile-locked"));
             *s.session.blocking_write() = Some(crate::host::state::Session::unlock(data.clone(), Zeroizing::new(pass.into())).unwrap().0);
-            assert_eq!(native_recovery::restore_running(&s, secret(&words), &file), Err("vault-exists"));
+            assert_eq!(restore_running(""), Err("backup-fingerprint-mismatch"));
+            assert_eq!(restore_running(&anchor), Err("vault-exists"));
             let signer = crate::host::custody::open_signer(&s, &data, pass, &vault_hex, 1, Box::new(|_| false)).unwrap();
             assert_eq!(signer.hosted_metadata().unwrap().0.verifying_key(), public.verifying_key());
 
             // Same words with another member's valid backup must not install into a running profile.
             let (other_member, _, _) = dealer_vault(&root.join("other"), [7; 32], pass);
-            std::fs::write(&file, exported(&other_member).to_string()).unwrap();
+            let other_export = exported(&other_member);
+            let other_anchor = fingerprint_of(&other_export);
+            std::fs::write(&file, other_export.to_string()).unwrap();
             let wrong_profile = "wrong-profile";
-            assert_eq!(native_recovery::restore_running(&s, secret(&words), &file), Err(wrong_profile));
+            assert_eq!(restore_running(&other_anchor), Err(wrong_profile));
             assert!(!dir(&data, &hex::encode([7; 32])).unwrap().path().exists());
 
             // Another vault for the same member: change the vault-bound roster and fingerprint.
@@ -2844,14 +2857,16 @@ mod tests {
             vault_roster["vault"] = json!(another_hex);
             another_vault.roster = serde_json::to_vec(&vault_roster).unwrap();
             another_vault.roster_fingerprint = crate::member_state::Roster::from_bytes(&another_vault.roster).unwrap().fingerprint();
-            std::fs::write(&file, exported(&another_vault).to_string()).unwrap();
+            let another_export = exported(&another_vault);
+            let another_anchor = fingerprint_of(&another_export);
+            std::fs::write(&file, another_export.to_string()).unwrap();
             let other_pub = [other_key.public_bytes(), other_key.signing_public()].concat();
             std::fs::write(data.join("recovery.pub"), &other_pub).unwrap();
-            assert_eq!(native_recovery::restore_running(&s, secret(&words), &file), Err(wrong_profile));
+            assert_eq!(restore_running(&another_anchor), Err(wrong_profile));
             assert_eq!(std::fs::read(data.join("recovery.pub")).unwrap(), other_pub);
             assert!(!dir(&data, &another_hex).unwrap().path().exists());
             std::fs::write(data.join("recovery.pub"), &old_pub).unwrap();
-            native_recovery::restore_running(&s, secret(&words), &file).unwrap();
+            restore_running(&another_anchor).unwrap();
             assert!(dir(&data, &another_hex).unwrap().exists("vault.sealed"));
         });
 
@@ -2891,11 +2906,11 @@ mod tests {
             });
             std::fs::write(&file, document.to_string()).unwrap();
             tokio::task::block_in_place(|| {
-                assert_eq!(native_recovery::restore_new(&mut apple, pass, secret(&words), &file, &origin, None),
+                assert_eq!(restore_new(&mut apple, &words, &origin),
                     Err(KeyFailure::Cancelled.message()));
                 assert!(!apple.data.exists());
                 block_device.store(false, Ordering::SeqCst);
-                native_recovery::restore_new(&mut apple, pass, secret(&words), &file, &origin, None).unwrap();
+                restore_new(&mut apple, &words, &origin).unwrap();
             });
             assert!(!apple.data.join("device-registration-confirmed").exists());
             assert!(registration::DeviceKey::open(&apple, pass).is_ok());

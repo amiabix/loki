@@ -414,17 +414,18 @@ fn restore_reply(result: Result<(), &'static str>) -> *mut std::ffi::c_char {
 /// JSON reply with [`loki_member_app_free`].
 ///
 /// # Safety
-/// `file` must be null or a live NUL-terminated path. `words` must be null or a writable
+/// `file` and `fingerprint` must be null or live NUL-terminated strings. `words` must be null or a writable
 /// buffer of `len` bytes (not NUL-terminated); all `len` bytes are cleared.
 #[cfg(feature = "relay-communication")]
 #[no_mangle]
-pub unsafe extern "C" fn loki_member_app_restore_vault(words: *mut u8, len: usize, file: *const std::ffi::c_char) -> *mut std::ffi::c_char {
+pub unsafe extern "C" fn loki_member_app_restore_vault(words: *mut u8, len: usize, file: *const std::ffi::c_char, fingerprint: *const std::ffi::c_char) -> *mut std::ffi::c_char {
     let error = crate::host::NATIVE_RESTORE_REFUSED;
     let result = std::panic::catch_unwind(|| {
         let words = take_restore_secret(words, len)?;
-        if file.is_null() { return Err(error); }
+        if file.is_null() || fingerprint.is_null() { return Err(error); }
         let file = std::ffi::CStr::from_ptr(file).to_str().map_err(|_| error)?;
-        crate::host::native_restore_running(words, std::path::Path::new(file))
+        let fingerprint = std::ffi::CStr::from_ptr(fingerprint).to_str().map_err(|_| error)?;
+        crate::host::native_restore_running(words, std::path::Path::new(file), fingerprint)
     });
     restore_reply(result.unwrap_or(Err(error)))
 }
@@ -433,7 +434,7 @@ pub unsafe extern "C" fn loki_member_app_restore_vault(words: *mut u8, len: usiz
 /// the member loop; a refusal returns JSON, freed with [`loki_member_app_free`].
 ///
 /// # Safety
-/// `launch` and `file` must be null or live NUL-terminated UTF-8 strings. `words` and `pass`
+/// `launch`, `file` and `fingerprint` must be null or live NUL-terminated UTF-8 strings. `words` and `pass`
 /// must be null or disjoint writable buffers of the given lengths and are cleared. `notify`
 /// and the decision callbacks follow the lifetime contract of [`loki_member_app_pair`].
 #[cfg(feature = "relay-communication")]
@@ -443,6 +444,7 @@ pub unsafe extern "C" fn loki_member_app_restore_profile(
     words: *mut u8, words_len: usize,
     pass: *mut u8, pass_len: usize,
     file: *const std::ffi::c_char,
+    fingerprint: *const std::ffi::c_char,
     notify: NativeNotice,
     approve: NativeApprove,
     confirm_roster: NativeConfirmRoster,
@@ -460,7 +462,7 @@ pub unsafe extern "C" fn loki_member_app_restore_profile(
             if text.contains('\0') { return Err(error); }
             zeroize::Zeroizing::new(text.to_owned())
         };
-        if launch.is_null() || file.is_null() { return Err(error); }
+        if launch.is_null() || file.is_null() || fingerprint.is_null() { return Err(error); }
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Launch {
@@ -469,10 +471,11 @@ pub unsafe extern "C" fn loki_member_app_restore_profile(
         }
         let launch: Launch = serde_json::from_slice(std::ffi::CStr::from_ptr(launch).to_bytes()).map_err(|_| error)?;
         let file = std::ffi::CStr::from_ptr(file).to_str().map_err(|_| error)?;
+        let fingerprint = std::ffi::CStr::from_ptr(fingerprint).to_str().map_err(|_| error)?;
         let mut config = crate::host::native_config_from_args(&launch.args).map_err(|_| error)?;
         launch.config.verify_witness_confirmation(launch.witness_confirmation.as_deref()).map_err(|_| error)?;
         let fetched = launch.config.apply_restore(&mut config, &launch.args, &launch.restore_origin).map_err(|_| error)?;
-        crate::host::native_restore_new(&mut config, &pass, words, std::path::Path::new(file), &launch.restore_origin, fetched.as_ref())?;
+        crate::host::native_restore_new(&mut config, &pass, words, std::path::Path::new(file), fingerprint, &launch.restore_origin, fetched.as_ref())?;
         published = true;
         let notice = native_notice(notify);
         crate::host::run_native(config, pass, notice, native_approval(approve),
@@ -589,14 +592,14 @@ mod native_pairing_tests {
         extern "C" fn notice(_: *const std::ffi::c_char, _: *const std::ffi::c_char) -> i32 { 0 }
         extern "C" fn refuse(_: *const std::ffi::c_char) -> i32 { 0 }
         let reply = unsafe { super::loki_member_app_restore_profile(std::ptr::null(),
-            words.as_mut_ptr(), words.len(), pass.as_mut_ptr(), pass.len(), std::ptr::null(), notice, refuse_approval, refuse, refuse_connect) };
+            words.as_mut_ptr(), words.len(), pass.as_mut_ptr(), pass.len(), std::ptr::null(), std::ptr::null(), notice, refuse_approval, refuse, refuse_connect) };
         assert!(words.iter().chain(&pass).all(|&b| b == 0));
         let error: serde_json::Value = serde_json::from_slice(unsafe { std::ffi::CStr::from_ptr(reply) }.to_bytes()).unwrap();
         unsafe { super::loki_member_app_free(reply); }
         assert_eq!(error, serde_json::json!({"error": "restore-refused"}));
 
         let mut words = [b'X'; 4097];
-        let reply = unsafe { super::loki_member_app_restore_vault(words.as_mut_ptr(), words.len(), std::ptr::null()) };
+        let reply = unsafe { super::loki_member_app_restore_vault(words.as_mut_ptr(), words.len(), std::ptr::null(), std::ptr::null()) };
         assert!(words.iter().all(|&b| b == 0));
         let refused: serde_json::Value = serde_json::from_slice(unsafe { std::ffi::CStr::from_ptr(reply) }.to_bytes()).unwrap();
         unsafe { super::loki_member_app_free(reply); }
