@@ -91,6 +91,7 @@ pub fn router(state: Shared) -> Router {
         .route("/api/recovery-backup", get(recovery::fetch))
         .route("/api/recovery-restore", recovery_restore)
         .route("/api/device-enroll", post(device::enroll))
+        .route("/api/device-renewal", post(device::renewal))
         .route("/api/device-challenge", get(device::challenge))
         .route("/api/device-login", post(device::login))
         .route("/api/device-revoke", post(device::revoke))

@@ -190,9 +190,9 @@ function browserSigner(origin: string): SignerModule {
       const origin = window.location.origin;
       const enrollment = await call<Record<string, string>>("enroll-begin");
       // No advertise_url (frostd-only) and no slot (coordinator allocates).
-      const { challenge } = await postJson<{ challenge: string }>(`${origin}/api/members/challenge`, enrollment);
-      const { signature } = await call<{ signature: string }>("enroll-sign", { challenge });
-      const { member } = await postJson<{ member: EnrolledMember }>(`${origin}/api/members`, { ...enrollment, challenge, signature });
+      const reply = await postJson<{ challenge: string; replacement_generation?: number }>(`${origin}/api/members/challenge`, enrollment);
+      const proof = await call<{ signature: string; replacement_authorization?: string }>("enroll-sign", reply);
+      const { member } = await postJson<{ member: EnrolledMember }>(`${origin}/api/members`, { ...enrollment, challenge: reply.challenge, ...proof });
       return member;
     },
     async request<T>(pathAndQuery: string, body?: unknown): Promise<T> {

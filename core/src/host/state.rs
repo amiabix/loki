@@ -442,7 +442,7 @@ pub struct AppState {
     pub active_dkgs: std::sync::Mutex<BTreeSet<String>>,
     /// Device login registry, built lazily from `data/recovery.pub` + `data/devices.json` once
     /// a recovery identity exists. Holds outstanding challenges in-process across requests.
-    pub device_auth: std::sync::Mutex<Option<crate::signer::device_auth::DeviceRegistry>>,
+    pub(super) device_auth: std::sync::Mutex<Option<super::device::DeviceState>>,
     /// The member's native payment decision; `None` (headless) refuses every payment.
     pub approval: Option<super::LocalApproval>,
     /// The member's native roster-code comparison; `None` (headless) trusts the caller of

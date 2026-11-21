@@ -730,6 +730,11 @@ self.onmessage = async (e) => {
       case "authorize-device":
         result = signer.authorizeDevice(devicePubHex);
         break;
+      case "authorize-device-replacement": {
+        const { origin, challenge, generation } = e.data;
+        result = signer.authorizeDeviceReplacement(origin, devicePubHex, challenge, BigInt(generation));
+        break;
+      }
       case "join":
         result = await joinCeremony(signer, join);
         break;

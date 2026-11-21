@@ -497,6 +497,16 @@ impl Signer {
         Ok(hex::encode(identity.authorize_device(&device_pub)))
     }
 
+    #[wasm_bindgen(js_name = authorizeDeviceReplacement)]
+    pub fn authorize_device_replacement(&self, origin: &str, device_pub_hex: &str, challenge_hex: &str, generation: u64) -> Result<String, JsError> {
+        let identity = self.identity.as_ref().ok_or_else(|| JsError::new("unlock the signer first"))?;
+        let mut device = [0; 65];
+        hex::decode_to_slice(device_pub_hex, &mut device).map_err(|e| JsError::new(&e.to_string()))?;
+        let mut challenge = [0; 32];
+        hex::decode_to_slice(challenge_hex, &mut challenge).map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(hex::encode(identity.authorize_device_replacement(origin, &device, &challenge, generation)))
+    }
+
     /// Create-or-reopen this member's vault signer, confirm the coordinator's roster, and
     /// begin DKG. Returns the `VaultRef` JSON. The Worker must pre-open `vaultPaths(vaultHex)`
     /// for write first. `roster` is the coordinator's setup document (`setup_version: 2`).

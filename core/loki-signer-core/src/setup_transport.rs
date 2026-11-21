@@ -225,6 +225,15 @@ impl Identity {
         self.signing.sign(device_pub).to_bytes()
     }
 
+    /// Authorize replacing the coordinator's current device, for one challenge and generation.
+    pub fn authorize_device_replacement(&self, origin: &str, device_pub: &[u8], challenge: &[u8; 32], generation: u64) -> [u8; 64] {
+        let identity = hex::encode(self.public().signing);
+        let device = hex::encode(device_pub);
+        let nonce = hex::encode(challenge);
+        let message = format!("loki-member-device-replacement-v1\n{origin}\n{identity}\n{device}\n{generation}\n{nonce}");
+        self.signing.sign(message.as_bytes()).to_bytes()
+    }
+
     pub fn nonce_claim_proof(
         &self,
         vault: [u8; 32],

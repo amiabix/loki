@@ -40,8 +40,9 @@ original local unlock file; no shares or recovery identity are migrated automati
 The member process creates/unlocks its profile **locally**, then authorizes its P-256 device
 key with its existing Ed25519 identity. It requests a one-use challenge and signs a transcript
 binding the coordinator origin, requested slot, identity keys, advertised endpoint and nonce.
-The Node verifier uses the same Ed25519 enrollment / P-256 SHA-256 verification protocol as
-`signer/device_auth.rs` and `host/device.rs`; the Rust client reuses the enrollment verifier.
+Replacing a registered device also requires a fresh identity signature for that coordinator,
+new key, challenge, and next generation. The coordinator saves the new device, consumed proof,
+and public roster together; a former device cannot rotate back using its old enrollment proof.
 This proves key possession, **not hardware attestation**. The software development backend
 and an Enclave key produce the same wire proofs.
 
@@ -127,21 +128,30 @@ coordinator + frostd. Payment review/approve are wired through `request()` the s
 
 ## Registry and limits
 
-`.access.json` (or `LOKI_REGISTRY`) contains only `{access: [{slot, signing_pubkey, relay_pubkey,
-advertise_url, lokisigner_url?}]}`. The optional signed `lokisigner_url` field tells everyone
+`/api/members` returns only public roster rows: `{slot, signing_pubkey, relay_pubkey,
+advertise_url, lokisigner_url?}`. The optional signed `lokisigner_url` field tells everyone
 reading `/api/members` that the slot uses LokiSigner and which loopback port it currently
 listens on. It is not a capability. Deploy this coordinator and wallet before updating
-LokiSigner; see the [version matrix](../../core/signer-app/README.md#build-and-pair). Do not roll
-back the coordinator until roster rows containing the field are removed: an older `/api/members`
-rejects those rows and fails for everyone. A visited website can use the port and the open
-ceremony routes to learn whether LokiSigner is running, subject to local network permission.
-Safari may block the wallet's loopback request; this has not been verified. Old hosted registry formats
-fail closed; retire those files privately and self-register existing devices into a fresh
-public roster. Never copy old access records into
-it. The adjacent `.challenges` file contains only short-lived public enrollment proofs and
-nonces; consumption persists across Next workers and restarts. At most 256 live challenges
-are accepted, each expires after two minutes. If a worker crashes while holding `.lock`, stop
-all web workers before removing that lock. The roster is discovery, not authority to spend.
+LokiSigner; see the [version matrix](../../core/signer-app/README.md#build-and-pair). A visited
+website can use the port and the open ceremony routes to learn whether LokiSigner is running,
+subject to local network permission.
+Safari may block the wallet's loopback request; this has not been verified.
+
+The coordinator stores the roster, device generations, and challenges in one owner-only
+snapshot at `.access.json` (or `LOKI_REGISTRY`). Before upgrading, stop all old coordinator
+workers and back up the registry and its `.devices` sidecar together. The first write imports
+valid public roster rows and device bindings. Old pending challenges are not imported; issue
+new pairing links. Do not mix coordinator versions or roll back to the old split-file format:
+doing so would lose generations and revocations. Older registries containing hosted secrets
+still fail closed and are not migrated. At most 256 live coordinator challenges are accepted;
+each expires after two minutes. If a worker crashes while holding `.lock`, stop all coordinator
+workers before removing the lock. The roster is discovery, not authority to spend.
+
+Device-local login challenges expire after two minutes, with at most 16 issues per device
+session grant and 256 overall in that window. To renew a revoked key, an authorized local
+client requests its generation from `POST /api/device-renewal` with `device_pub`. It signs
+that generation and public key offline with `RecoveryKey::authorize_device_renewal` and submits
+the authorization to `POST /api/device-enroll`. Never send recovery words to the coordinator.
 
 LokiSigner sends a tab its device session only after the member allows that tab's code in
 the native app. The coordinator-served JavaScript can still read a grant held by its own tab;
