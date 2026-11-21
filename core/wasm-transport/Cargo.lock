@@ -632,6 +632,7 @@ dependencies = [
  "ed25519-dalek",
  "getrandom 0.4.3",
  "hex",
+ "js-sys",
  "loki-relay-protocol",
  "rand",
  "reqwest",
@@ -642,6 +643,7 @@ dependencies = [
  "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "web-sys",
  "x25519-dalek",
  "xeddsa",
 ]
