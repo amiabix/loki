@@ -32,6 +32,9 @@ const FINAL_STATUS_MAGIC: &[u8; 8] = b"LOKIFSV1";
 const HEADER: usize = 8 + 32 + 2 + 2 + 24 + 4;
 const PUBLIC_HEADER: usize = 8 + 32 + 2 + 4;
 const SIGNATURE: usize = 64;
+const COURIER_PAYLOAD_LIMIT: usize = 64 * 1024;
+/// Largest local courier envelope (encrypted round two, including its AEAD tag).
+pub const MAX_COURIER_ENVELOPE: usize = HEADER + COURIER_PAYLOAD_LIMIT + 16 + SIGNATURE;
 const SESSION_MAGIC: &[u8; 8] = b"LOKISGN1";
 const SESSION_INNER: &[u8; 8] = b"LOKISGIP";
 const SESSION_HEADER: usize = 8 + 1 + 24 + 4;
@@ -222,6 +225,21 @@ impl Identity {
         self.signing.sign(device_pub).to_bytes()
     }
 
+    pub fn nonce_claim_proof(
+        &self,
+        vault: [u8; 32],
+        pin: &loki_relay_protocol::types::RelayPin,
+        mailbox: [u8; 32],
+        cid: [u8; 32],
+        challenge: [u8; 32],
+        record: &[u8],
+    ) -> loki_relay_protocol::nonce::ClaimProof {
+        use loki_relay_protocol::nonce::{self, Claimant, ClaimProof};
+        let claimant = Claimant { vault, slot: self.id, key: self.signing.verifying_key().to_bytes() };
+        let signature = self.signing.sign(&nonce::claim_input(claimant, pin, mailbox, cid, challenge, record)).to_bytes();
+        ClaimProof { claimant, signature }
+    }
+
     pub fn sign_setup_agreement(
         &self,
         vault: &[u8; 32],
@@ -331,7 +349,7 @@ impl Identity {
             return Err("wrong DKG round-one envelope".into());
         }
         let size = u32::from_be_bytes(wire[42..46].try_into().unwrap()) as usize;
-        if size > 64 * 1024 || wire.len() != PUBLIC_HEADER + size + SIGNATURE {
+        if size > COURIER_PAYLOAD_LIMIT || wire.len() != PUBLIC_HEADER + size + SIGNATURE {
             return Err("invalid DKG round-one length".into());
         }
         let verify = VerifyingKey::from_bytes(&sender.signing).map_err(|_| "invalid sender key")?;
@@ -398,7 +416,7 @@ impl Identity {
             return Err("DKG envelope belongs to another vault or member".into());
         }
         let size = u32::from_be_bytes(wire[68..72].try_into().unwrap()) as usize;
-        if size > 64 * 1024 + 16 || wire.len() != HEADER + size + SIGNATURE {
+        if size > COURIER_PAYLOAD_LIMIT + 16 || wire.len() != HEADER + size + SIGNATURE {
             return Err("invalid DKG envelope length".into());
         }
         let verify = VerifyingKey::from_bytes(&sender.signing).map_err(|_| "invalid sender key")?;

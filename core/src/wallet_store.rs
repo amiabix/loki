@@ -4,6 +4,7 @@ use std::{
     fs, io,
     path::Path,
     sync::Mutex,
+    time::Duration,
 };
 
 use argon2::Argon2;
@@ -19,7 +20,7 @@ use rusqlite::{Connection, OptionalExtension};
 use zcash_address::ZcashAddress;
 use zcash_client_backend::{
     data_api::{
-        AccountBirthday, AccountPurpose, MaxSpendMode, OutputLockStore, WalletRead, WalletWrite,
+        AccountBirthday, AccountPurpose, MaxSpendMode, OutputLockStore, WalletCommitmentTrees, WalletRead, WalletWrite,
         chain::{
             BlockCache, BlockSource, ChainState, error::Error as ScanError, scan_cached_blocks,
         },
@@ -45,8 +46,12 @@ use zeroize::Zeroizing;
 use zip321::{Payment, TransactionRequest};
 
 use crate::{member_state::MemberState, network::VaultNetwork};
-use zcash_client_backend::proto::service::{BlockId, Empty};
+use loki_signer_core::chain_scan::{checked_next_tree_sizes, tree_sizes};
+use zcash_client_backend::proto::service::{BlockId, ChainSpec, Empty, ShieldedProtocol};
 use zcash_protocol::consensus::Parameters;
+
+mod lightwalletd;
+pub use lightwalletd::Lightwalletd;
 
 type Database = WalletDb<Connection, VaultNetwork, SystemClock, UnwrapErr<SysRng>>;
 
@@ -202,8 +207,6 @@ pub fn lightwalletd_endpoint(url: &str) -> Result<tonic::transport::Endpoint, St
     Ok(endpoint)
 }
 
-pub type Lightwalletd = zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient<tonic::transport::Channel>;
-
 /// The lightwalletd a member syncs from: `LOKI_LIGHTWALLETD`, or on regtest the one THS runs
 /// beside the `LOKI_RPC` node (THS shifts RPC 18232 and lightwalletd 9067 by one offset).
 pub fn lightwalletd_url(network: VaultNetwork) -> Option<String> {
@@ -271,15 +274,71 @@ pub async fn sync_member_wallet(
 
 impl VaultWallet {
     pub async fn sync(&mut self, client: &mut Lightwalletd) -> Result<(), String> {
-        zcash_client_backend::sync::run(
-            client,
-            &self.network,
-            &DownloadedBlocks::default(),
-            &mut self.db,
-            100,
-        )
-        .await
-        .map_err(|e| format!("sync wallet: {e}"))?;
+        let deadline = Duration::from_secs(30);
+        let tip = tokio::time::timeout(deadline, client.get_latest_block(ChainSpec {}))
+            .await.map_err(|_| "lightwalletd latest block deadline exceeded")?
+            .map_err(|e| format!("lightwalletd latest block: {e}"))?
+            .into_inner().height;
+        if tip >= u64::from(u32::MAX) {
+            return Err("lightwalletd tip height out of range".into());
+        }
+        let tip = BlockHeight::from_u32(tip as u32);
+        self.db.put_sapling_subtree_roots(0, &client.subtree_roots(ShieldedProtocol::Sapling, tip).await?)
+            .map_err(|e| format!("save Sapling roots: {e}"))?;
+        self.db.put_orchard_subtree_roots(0, &client.subtree_roots(ShieldedProtocol::Orchard, tip).await?)
+            .map_err(|e| format!("save Orchard roots: {e}"))?;
+        self.db.put_ironwood_subtree_roots(0, &client.subtree_roots(ShieldedProtocol::Ironwood, tip).await?)
+            .map_err(|e| format!("save Ironwood roots: {e}"))?;
+        self.db.update_chain_tip(tip).map_err(|e| format!("save chain tip: {e}"))?;
+
+        // Follow Zakura's scan priorities, but finish and validate a bounded page before
+        // passing it to the scanner. Re-read the queue after commits or a rewind.
+        let mut last_page = None;
+        let mut last_rewind = None;
+        while let Some(range) = self.db.suggest_scan_ranges().map_err(|e| e.to_string())?
+            .into_iter().find(|range| !range.is_empty())
+        {
+            let start = range.block_range().start;
+            let end = range.block_range().end.min(BlockHeight::from_u32(u32::from(start).saturating_add(100)));
+            let page = ScanRange::from_parts(start..end, range.priority());
+            if last_page.as_ref() == Some(&page) {
+                return Err("wallet scan range did not advance".into());
+            }
+            let blocks = client.blocks(start, end - 1).await?;
+            let previous = start - 1;
+            let state = tokio::time::timeout(deadline, client.get_tree_state(BlockId { height: previous.into(), hash: vec![] }))
+                .await.map_err(|_| "lightwalletd tree state deadline exceeded")?
+                .map_err(|e| format!("lightwalletd tree state: {e}"))?.into_inner().to_chain_state()
+                .map_err(|e| format!("parse lightwalletd tree state: {e}"))?;
+            if state.block_height() != previous || blocks[0].prev_hash != state.block_hash().0 {
+                return Err("lightwalletd tree state does not match the requested block range".into());
+            }
+            let prior = self.db.block_metadata(previous).map_err(|e| e.to_string())?
+                .filter(|m| m.block_hash() == state.block_hash());
+            let checkpoint_sizes = [state.final_sapling_tree().tree_size(), state.final_orchard_tree().tree_size(), state.final_ironwood_tree().tree_size()];
+            if checkpoint_sizes.iter().any(|&size| size > u64::from(u32::MAX)) {
+                return Err("lightwalletd checkpoint tree size out of range".into());
+            }
+            let mut sizes = prior.as_ref().map_or(checkpoint_sizes.map(|size| Some(size as u32)), tree_sizes);
+            for block in &blocks {
+                sizes = checked_next_tree_sizes(block, sizes)?;
+            }
+            let cache = DownloadedBlocks::default();
+            cache.insert(blocks).await.map_err(|e| e.to_string())?;
+            match scan_cached_blocks(&self.network, &cache, &mut self.db, start, &state, page.len()) {
+                Ok(_) => last_page = Some(page),
+                Err(ScanError::Scan(zcash_client_backend::scanning::ScanError::PrevHashMismatch { at_height })) => {
+                    let rewind = at_height.saturating_sub(10);
+                    if last_rewind.is_some_and(|last| rewind >= last) {
+                        return Err("wallet scan did not progress after rewinding".into());
+                    }
+                    self.db.truncate_to_height(rewind).map_err(|e| format!("rewind wallet: {e}"))?;
+                    last_rewind = Some(rewind);
+                    last_page = None;
+                }
+                Err(e) => return Err(format!("sync wallet: {e}")),
+            }
+        }
         self.release_confirmed_reservations()
     }
 

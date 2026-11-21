@@ -69,7 +69,9 @@ async function claimAtWitnesses(signer, witnesses, packageHex, seedHex, sighashH
   const { cid, record } = JSON.parse(signer.nonceClaim(packageHex, seedHex, sighashHex));
   const { claimNonce } = await loadTransport();
   for (const w of witnesses) {
-    if (!await claimNonce(w.endpoint, w.key, w.run, w.mailbox, w.read, cid, record)) {
+    const challenge = toHex(crypto.getRandomValues(new Uint8Array(32)));
+    const proof = signer.nonceClaimProof(w.key, w.run, w.mailbox, cid, record, challenge);
+    if (!await claimNonce(w.endpoint, w.key, w.run, w.mailbox, cid, record, challenge, proof)) {
       throw new Error("This nonce was already claimed at a nonce witness; start a new signing attempt");
     }
   }
@@ -271,7 +273,8 @@ async function chainScan(signer, p) {
   for (let rescanned = false; ;) {
     try {
       for (let next = signer.scanNext(); next <= tip; next = signer.scanNext()) {
-        for (const block of await blockRange(p.lightwalletdGrpcWeb, next, Math.min(tip, next + 499))) signer.scanBlock(block);
+        const end = Math.min(tip, next + 499);
+        signer.scanBlocks(next, end, await blockRange(p.lightwalletdGrpcWeb, next, end));
         signer.scanSave();
       }
       break;
@@ -814,4 +817,8 @@ self.onmessage = async (e) => {
   }
 };
 
-self.postMessage({ cmd: "loaded" });
+self.addEventListener("unhandledrejection", () => self.postMessage({ cmd: "failed" }));
+try {
+  await ready;
+  self.postMessage({ cmd: "loaded" });
+} catch { self.postMessage({ cmd: "failed" }); }

@@ -1673,7 +1673,8 @@ fn sign_with_opened(
 ) -> Result<(), RoundError> {
     // Both external nonce witnesses must be configured; without them this member refuses to
     // sign, before it joins the session or unwraps the share.
-    let witness = super::nonce_witness::RelayWitness::for_member(st, &p.attempt)?;
+    let witness = super::nonce_witness::RelayWitness::for_member(st, &p.attempt)?
+        .authorize(hex32(&p.vault)?, &v.identity)?;
     // The proposer authenticated this key with the payment terms, not via frostd metadata.
     let coordinator = p.coordinator.as_ref().ok_or("missing sealed signing coordinator; create a fresh payment")?.public(0)?;
     let mut tx = relay(&v.identity, &st.config.frostd_url)?;
@@ -2950,6 +2951,7 @@ mod tests {
             data: data.to_owned(),
             port: 0,
             bind: "127.0.0.1".parse().unwrap(),
+            peer_port: None,
             advertise_url: None,
             network: "testnet".into(),
             lightwalletd: None,

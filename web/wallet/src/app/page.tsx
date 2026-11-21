@@ -36,7 +36,7 @@ import {
   type Slot,
   type RecoveryStatus,
 } from "@/lib/api";
-import { comparesInLokiSigner, emptyHistoryText, invitePreview, nativeRosterRefusal, pairingSecondsLeft, paymentLabel, rememberedVaultSlot, rememberVaultSlot, storageLabel, verifyPhrase } from "@/lib/wallet-ui";
+import { comparesInLokiSigner, emptyHistoryText, invitePreview, nativeRosterRefusal, pairingSecondsLeft, paymentLabel, rememberedVaultSlot, rememberVaultSlot, storageLabel } from "@/lib/wallet-ui";
 import { toggleTheme, useIsDark } from "@/lib/theme";
 import { useCeremonyStatus, usePayments, useStatus } from "@/lib/hooks";
 import type {
@@ -63,7 +63,8 @@ const short = (s: string, head = 8, tail = 6) =>
 function extractInvite(raw: string): string {
   const s = raw.trim();
   try {
-    return new URL(s).searchParams.get("invite") ?? s;
+    const url = new URL(s);
+    return new URLSearchParams(url.hash.slice(1)).get("invite") ?? url.searchParams.get("invite") ?? s;
   } catch {
     return s;
   }
@@ -71,7 +72,7 @@ function extractInvite(raw: string): string {
 
 /** A shareable invite link for a join code — opens the app straight into Join. */
 function inviteLink(code: string): string {
-  return typeof window === "undefined" ? code : `${window.location.origin}/?invite=${code}`;
+  return typeof window === "undefined" ? code : `${window.location.origin}/#invite=${encodeURIComponent(code)}`;
 }
 
 // ─── navigation state ────────────────────────────────────────────────────────
@@ -96,14 +97,20 @@ export default function App() {
   const [pendingInvite, setPendingInvite] = useState<string | null>(null);
   const { data: status, error: statusError, refresh: refreshStatus } = useStatus(authed === true);
 
-  // Invite deep-link: opening /?invite=<code> (or a full link) drops you straight into Join once
-  // you're signed in — no codes to paste, no "pick a member". Held across the login gate.
+  // Keep new claims out of the initial request and hold them in memory across sign-in.
+  // Read legacy query links too, but remove both forms from the current history entry.
   useEffect(() => {
-    const code = new URLSearchParams(window.location.search).get("invite");
-    if (code) {
-      setPendingInvite(code);
-      window.history.replaceState(null, "", window.location.pathname);
+    const url = new URL(window.location.href);
+    const fragment = new URLSearchParams(url.hash.slice(1));
+    const code = fragment.get("invite") ?? url.searchParams.get("invite");
+    if (code === null) return;
+    if (fragment.has("invite")) {
+      fragment.delete("invite");
+      url.hash = fragment.toString();
     }
+    url.searchParams.delete("invite");
+    window.history.replaceState(window.history.state, "", url);
+    if (code) setPendingInvite(code);
   }, []);
 
   useEffect(() => {
@@ -173,7 +180,7 @@ export default function App() {
   ) : <Splash sub="Connecting…" />}</FullScreen>;
   if (!authed) return <Login notice={sessionError} onLoggedIn={() => { setAuthed(true); refreshStatus(); }} />;
 
-  const network = status?.network ?? "testnet";
+  const network = status?.network;
   const profile = status?.profile;
 
   return (
@@ -194,9 +201,11 @@ export default function App() {
               <span className="max-w-40 truncate" title={profile.name}>{profile.name}</span>
             </span>
           )}
-          <span className="eyebrow shrink-0 rounded-full border px-3 py-1" style={{ borderColor: "var(--border)" }}>
-            {network}
-          </span>
+          {network && (
+            <span className="eyebrow shrink-0 rounded-full border px-3 py-1" style={{ borderColor: "var(--border)" }}>
+              {network}
+            </span>
+          )}
           <ThemeToggle />
           <button onClick={signOut} className="min-h-11 shrink-0 px-1 text-muted transition hover:text-danger">
             Log out
@@ -1139,6 +1148,7 @@ function CeremonyView({
         )}
         {cs.phase === "compare_roster" && !comparesInLokiSigner(cs) && (
           <CompareRoster
+            key={cs.roster_code ?? ""}
             creator={cs.invites !== undefined}
             vault={vault}
             fingerprint={cs.fingerprint}
@@ -1291,10 +1301,8 @@ function CompareRoster({
 }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  // Explicit out-of-band gate: the member must affirm they compared the code on a side channel
-  // before "Confirm" is enabled, so the check can't degrade into trusting the shown value.
+  // The parent keys this form by roster code so a status refresh cannot carry approval over.
   const [checked, setChecked] = useState(false);
-  const phrase = verifyPhrase(fingerprint);
 
   const [confirmedHere, setConfirmedHere] = useState(confirmed);
   useEffect(() => {
@@ -1315,20 +1323,19 @@ function CompareRoster({
 
   return (
     <div>
-      <p className="text-sm text-muted mb-4">
-        Security check: on a call or in person, make sure this code is{" "}
-        <span className="text-foreground">identical</span> for every member. Read the words aloud and
-        match the emoji. Matching codes prove you&apos;re all in the same vault and no one was swapped
-        in — don&apos;t trust the code on this screen alone.
-      </p>
-      {phrase && (
-        <GlassCard className="mb-4 text-center">
-          <h3 className="eyebrow mb-2">Compare this code</h3>
-          <p className="text-2xl mb-2" aria-label={`emoji ${phrase.emoji.join(" ")}`}>{phrase.emoji.join(" ")}</p>
-          <p className="font-mono text-lg font-semibold tracking-wide text-amber break-words">{phrase.words.join(" · ")}</p>
-          {rosterCode && <p className="font-mono text-xl font-semibold tracking-wide">{rosterCode}</p>}
-          <p className="mt-3 font-mono text-xs break-all text-muted">{fingerprint}</p>
-        </GlassCard>
+      {rosterCode ? (
+        <>
+          <p className="text-sm text-muted mb-4">
+            Security check: compare all 24 digits with every member on a call or in person.
+            Confirm only if everyone sees <span className="text-foreground">exactly the same code</span>.
+          </p>
+          <GlassCard className="mb-4 text-center">
+            <h3 className="eyebrow mb-2">Compare this code</h3>
+            <p className="font-mono text-base font-semibold tracking-wide text-amber sm:text-xl">{rosterCode}</p>
+          </GlassCard>
+        </>
+      ) : (
+        <p role="status" className="mb-4 text-sm text-muted">The signer has not provided a roster code. You can’t confirm members without it.</p>
       )}
       {creator && (
         <p className="pill text-muted mb-4">
@@ -1336,14 +1343,14 @@ function CompareRoster({
           {confirmations} of {members} confirmed
         </p>
       )}
-      {!confirmedHere && !allConfirmed && (
+      {rosterCode && !confirmedHere && !allConfirmed && (
         <>
           <label className="glass mb-3 flex items-start gap-3 rounded-2xl p-4 text-left text-sm text-foreground cursor-pointer">
             <input type="checkbox" className="mt-0.5 h-4 w-4 shrink-0 accent-amber" checked={checked}
               onChange={(e) => setChecked(e.target.checked)} />
-            <span>I compared this code with the other members out of band and it matches.</span>
+            <span>I compared all 24 digits with the other members and they match.</span>
           </label>
-          <Btn variant="amber" onClick={agree} disabled={busy || !fingerprint || !rosterCode || !checked}>
+          <Btn variant="amber" onClick={agree} disabled={busy || !fingerprint || !checked}>
             {busy ? "Confirming…" : "Confirm members"}
           </Btn>
         </>
@@ -1723,7 +1730,7 @@ function VaultOverview({
 
       <GlassCard className="mb-4">
         <Row label="Policy" value={`${vault.threshold} of ${vault.members}`} mono />
-        <Row label="Vault ID" value={short(vault.vault)} mono />
+        <Row label="Vault ID" value={<FullValue value={vault.vault} label="vault ID" />} />
         {address && (
           <Row
             label="Address"
@@ -1736,7 +1743,7 @@ function VaultOverview({
         {signerKind() === "native" && (
           <p className="mt-3 text-sm leading-relaxed text-muted">
             Open <strong>Vault addresses…</strong> in LokiSigner. Give senders the address copied from LokiSigner,
-            or compare both addresses before sharing the one shown here.
+            or compare the full vault ID and address in both places before sharing the one shown here.
           </p>
         )}
       </GlassCard>
@@ -1945,6 +1952,8 @@ function RecoveryCard({ vault }: { vault: string }) {
 
 // ─── send ─────────────────────────────────────────────────────────────────────
 
+type DraftQuote = { attempt: string; fee_zat: string; change_zat: string };
+
 function Send({
   vault,
   onBack,
@@ -1957,29 +1966,37 @@ function Send({
   const [recipient, setRecipient] = useState("");
   const [amountTaz, setAmountTaz] = useState("");
   const [memo, setMemo] = useState("");
-  const [draft, setDraft] = useState<{ attempt: string; fee_zat: string; change_zat: string } | null>(null);
+  const [draft, setDraft] = useState<(DraftQuote & { terms: Readonly<{ vault: string; recipient: string; amount_zat: string; memo: string }> }) | null>(null);
+  const termsVersion = useRef(0);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
+  const invalidateDraft = () => {
+    termsVersion.current++;
+    setDraft(null);
+    setErr(null);
+  };
+
   const prepareDraft = async () => {
+    const version = termsVersion.current;
     setBusy(true); setErr(null);
     try {
       const taz = parseFloat(amountTaz);
       if (!Number.isFinite(taz) || taz <= 0) throw new Error("Enter a valid amount in TAZ.");
       const amount_zat = String(Math.round(taz * 1e8));
-      const res = await api<{ attempt: string; fee_zat: string; change_zat: string }>(
-        "payment-draft", { vault: vault.vault, recipient, amount_zat, memo }
-      );
-      setDraft(res);
-    } catch (e) { setErr((e as Error).message); }
-    finally { setBusy(false); }
+      const terms = { vault: vault.vault, recipient, amount_zat, memo };
+      const quote = await api<DraftQuote>("payment-draft", terms);
+      if (version === termsVersion.current) setDraft({ ...quote, terms });
+    } catch (e) {
+      if (version === termsVersion.current) setErr((e as Error).message);
+    } finally { setBusy(false); }
   };
 
   const publish = async () => {
     if (!draft) return;
     setBusy(true); setErr(null);
     try {
-      await api("payment-publish", { vault: vault.vault, attempt: draft.attempt });
+      await api("payment-publish", { vault: draft.terms.vault, attempt: draft.attempt });
       onDraft(draft.attempt);
     } catch (e) { setErr((e as Error).message); }
     finally { setBusy(false); }
@@ -1995,7 +2012,7 @@ function Send({
           <input
             placeholder="Recipient address"
             value={recipient}
-            onChange={(e) => { setRecipient(e.target.value); setDraft(null); }}
+            onChange={(e) => { setRecipient(e.target.value); invalidateDraft(); }}
             className="glass mt-1.5 w-full rounded-full px-5 py-3 font-mono outline-none"
           />
         </label>
@@ -2007,7 +2024,7 @@ function Send({
             step="0.00000001"
             min="0"
             value={amountTaz}
-            onChange={(e) => { setAmountTaz(e.target.value); setDraft(null); }}
+            onChange={(e) => { setAmountTaz(e.target.value); invalidateDraft(); }}
             className="glass mt-1.5 w-full rounded-full px-5 py-3 font-mono outline-none"
           />
         </label>
@@ -2016,7 +2033,7 @@ function Send({
           <input
             placeholder="Memo (optional)"
             value={memo}
-            onChange={(e) => { setMemo(e.target.value); setDraft(null); }}
+            onChange={(e) => { setMemo(e.target.value); invalidateDraft(); }}
             className="glass mt-1.5 w-full rounded-full px-5 py-3 outline-none"
           />
         </label>
@@ -2025,10 +2042,11 @@ function Send({
       {draft && (
         <GlassCard className="mb-4">
           <h3 className="eyebrow mb-3">Transaction summary</h3>
-          <Row label="Recipient" value={short(recipient, 14, 10)} mono />
-          <Row label="Amount" value={`${amountTaz} TAZ`} mono />
+          <Row label="Recipient" value={short(draft.terms.recipient, 14, 10)} mono />
+          <Row label="Amount" value={`${zatToTaz(draft.terms.amount_zat)} TAZ`} mono />
           <Row label="Fee" value={`${zatToTaz(draft.fee_zat)} TAZ`} mono />
           <Row label="Change" value={`${zatToTaz(draft.change_zat)} TAZ`} mono />
+          {draft.terms.memo && <Row label="Memo" value={<span className="whitespace-pre-wrap">{draft.terms.memo}</span>} />}
         </GlassCard>
       )}
 
