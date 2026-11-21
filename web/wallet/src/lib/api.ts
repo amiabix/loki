@@ -282,9 +282,10 @@ export async function logout(): Promise<boolean> {
 }
 
 /** Development faucet accepts only a public regtest address. */
-export async function fund(address: string): Promise<void> {
+export async function fund(address: string): Promise<{ mined: boolean }> {
   const res = await fetch("/api/fund", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address }) });
   if (!res.ok) throw new Error((await res.json()).error ?? "could not request funds");
+  return { mined: res.status === 200 };
 }
 export type RecoveryStatus = { recovery_identity: boolean; recovery_backup: boolean; recovery_in_app?: boolean };
 export function recoveryStatus(vault: string): Promise<RecoveryStatus> { return api(`recovery-status?vault=${vault}`); }
