@@ -69,7 +69,9 @@ async function claimAtWitnesses(signer, witnesses, packageHex, seedHex, sighashH
   const { cid, record } = JSON.parse(signer.nonceClaim(packageHex, seedHex, sighashHex));
   const { claimNonce } = await loadTransport();
   for (const w of witnesses) {
-    if (!await claimNonce(w.endpoint, w.key, w.run, w.mailbox, w.read, cid, record)) {
+    const challenge = toHex(crypto.getRandomValues(new Uint8Array(32)));
+    const proof = signer.nonceClaimProof(w.key, w.run, w.mailbox, cid, record, challenge);
+    if (!await claimNonce(w.endpoint, w.key, w.run, w.mailbox, cid, record, challenge, proof)) {
       throw new Error("This nonce was already claimed at a nonce witness; start a new signing attempt");
     }
   }

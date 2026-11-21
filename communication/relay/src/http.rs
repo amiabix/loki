@@ -380,7 +380,12 @@ async fn nonce_route(
         if method != Method::PUT {
             return Err(RelayError::MalformedRequest);
         }
-        let owner_read = capability(&headers)?;
+        let token = single(&headers, "authorization")?
+            .and_then(|raw| raw.strip_prefix(nonce::CLAIM_SCHEME))
+            .ok_or(RelayError::Capability)?;
+        let mut raw = [0; nonce::CLAIM_PROOF_LEN];
+        hex::decode_to_slice(token, &mut raw).map_err(|_| RelayError::Capability)?;
+        let proof = nonce::ClaimProof::from_bytes(raw);
         let length = request_headers(&headers, &method)?;
         let challenge =
             id(single(&headers, "x-loki-challenge")?.ok_or(RelayError::MalformedRequest)?)?;
@@ -398,7 +403,7 @@ async fn nonce_route(
             return Err(RelayError::MalformedRequest);
         }
         let (created, receipt) = db
-            .claim_nonce(mailbox, cid, challenge, wire.to_vec(), owner_read)?
+            .claim_nonce(mailbox, cid, challenge, wire.to_vec(), proof)?
             .receive()
             .await?;
         Ok(binary(

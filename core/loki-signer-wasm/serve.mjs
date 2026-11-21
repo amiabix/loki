@@ -16,8 +16,7 @@
 //                         (space-separated CSP sources; default: loopback member apps)
 //   LOKI_NONCE_WITNESSES  the two nonce-witness relays every signature is claimed at: the same
 //                         JSON file a native member takes with --nonce-witnesses. Without it
-//                         the browser signer refuses to sign. NOTE: each entry's mailbox
-//                         `read` capability is served to every page load of this origin.
+//                         the browser signer refuses to sign. Only routes and pins are public.
 //   LOKI_NETWORK          the deployment's network, testnet (default) or regtest; mainnet is
 //                         refused. A regtest stack must set it, or LokiSigner is told testnet. Served for the native signer (LokiSigner), which reads this
 //                         config through the wallet's /api/signer-config.
@@ -46,7 +45,7 @@ const lightwalletdGrpcWebUrl = process.env.LOKI_LIGHTWALLETD_GRPCWEB_URL || "";
 const hex = (bytes) => Buffer.from(bytes).toString("hex");
 const nonceWitnesses = process.env.LOKI_NONCE_WITNESSES
   ? JSON.parse(readFileSync(process.env.LOKI_NONCE_WITNESSES, "utf8")).map((w) => ({
-      endpoint: w.endpoint, key: hex(w.key), run: hex(w.run), mailbox: hex(w.mailbox), read: hex(w.read),
+      endpoint: w.endpoint, key: hex(w.key), run: hex(w.run), mailbox: hex(w.mailbox),
     }))
   : [];
 

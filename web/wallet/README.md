@@ -219,7 +219,7 @@ What a deploy must provide on the signer server (`serve.mjs` env):
 | `LOKI_WALLET_ORIGIN` | the one wallet origin allowed to frame and message the signer (`frame-ancestors`, postMessage check) |
 | `LOKI_FROSTD_URL` | the frostd relay the signer logs in to. It is shown to the member and not settable from the wallet page. One relay only. |
 | `LOKI_RP_ID` | WebAuthn rpId. It **must stay the same across deploys** or passkeys stop unlocking. |
-| `LOKI_NONCE_WITNESSES` | the two nonce-witness relays every signature is claimed at (the native `--nonce-witnesses` file). Each mailbox `read` capability is served publicly in `config.json`. |
+| `LOKI_NONCE_WITNESSES` | the two nonce-witness routes every signature is claimed at (the native `--nonce-witnesses` file). Both witnesses must [enroll each vault signer](../../communication/deploy/README.md#nonce-witness-enrollment-and-upgrades); `config.json` serves only endpoints and pins. |
 | `LOKI_NETWORK` | `testnet` (default) or `regtest`; mainnet is refused at startup. A regtest stack **must** set `regtest`, or LokiSigner is told testnet. |
 | `LOKI_LIGHTWALLETD_URL` | the lightwalletd native members sync from |
 | `LOKI_LIGHTWALLETD_GRPCWEB_URL` | lightwalletd behind gRPC-web + CORS for the signer origin (`communication/deploy/lightwalletd-grpcweb.sh`); the browser signer scans the chain through it for its vault balance and history |

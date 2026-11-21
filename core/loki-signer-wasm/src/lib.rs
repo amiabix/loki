@@ -772,6 +772,19 @@ impl Signer {
         self.nonce_claim_impl(package_hex, seed_hex, sighash_hex).map_err(|e| JsError::new(&e))
     }
 
+    /// Authorize this exact request inside the signer; the identity never leaves WASM.
+    #[wasm_bindgen(js_name = nonceClaimProof)]
+    pub fn nonce_claim_proof(&self, key: &str, run: &str, mailbox: &str, cid: &str, record: &str, challenge: &str) -> Result<String, JsError> {
+        let proof = (|| -> Result<_, String> {
+            let vs = self.vault.as_ref().ok_or("no active vault — call vaultOpen first")?;
+            let pins = (hex32(key)?, hex32(run)?, hex32(mailbox)?);
+            let record = hex::decode(record).map_err(|e| e.to_string())?;
+            vs.signer.nonce_claim_proof(pins, hex32(cid)?, hex32(challenge)?, &record)
+                .map_err(|e| e.to_string())
+        })().map_err(|e| JsError::new(&e))?;
+        Ok(hex::encode(proof.to_bytes()))
+    }
+
     /// Both witnesses issued a FRESH, verified claim receipt for `{cid, record}`. The core's
     /// witness check inside `signApprove` accepts exactly this claim, once.
     #[wasm_bindgen(js_name = nonceClaimed)]
