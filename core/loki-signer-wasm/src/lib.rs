@@ -607,11 +607,14 @@ impl Signer {
         self.scan_next_impl().map_err(|e| JsError::new(&e))
     }
 
-    /// Scan the next compact block (protobuf bytes from lightwalletd's `GetBlockRange`).
-    #[wasm_bindgen(js_name = scanBlock)]
-    pub fn scan_block(&mut self, block: &[u8]) -> Result<(), JsError> {
+    /// Scan one complete range of compact block protobufs from lightwalletd atomically.
+    #[wasm_bindgen(js_name = scanBlocks)]
+    pub fn scan_blocks(&mut self, start: u32, end: u32, blocks: Vec<js_sys::Uint8Array>) -> Result<(), JsError> {
         let (_, _, scan) = self.scan.as_mut().ok_or_else(|| JsError::new("call scanNext first"))?;
-        scan.scan(block).map_err(|e| JsError::new(&e))
+        if start != scan.next_height() || end < start || blocks.len().checked_sub(1) != Some((end - start) as usize) {
+            return Err(JsError::new("compact block range does not match this scan"));
+        }
+        scan.scan_batch(blocks.into_iter().map(|block| block.to_vec())).map_err(|e| JsError::new(&e))
     }
 
     /// Seal and save the scan state bound to its vault and network, so the next scan resumes here.
@@ -773,6 +776,19 @@ impl Signer {
     #[wasm_bindgen(js_name = nonceClaim)]
     pub fn nonce_claim(&self, attempt_hex: &str, package_hex: &str, seed_hex: &str, sighash_hex: &str) -> Result<String, JsError> {
         self.nonce_claim_impl(attempt_hex, package_hex, seed_hex, sighash_hex).map_err(|e| JsError::new(&e))
+    }
+
+    /// Authorize this exact request inside the signer; the identity never leaves WASM.
+    #[wasm_bindgen(js_name = nonceClaimProof)]
+    pub fn nonce_claim_proof(&self, key: &str, run: &str, mailbox: &str, cid: &str, record: &str, challenge: &str) -> Result<String, JsError> {
+        let proof = (|| -> Result<_, String> {
+            let vs = self.vault.as_ref().ok_or("no active vault — call vaultOpen first")?;
+            let pins = (hex32(key)?, hex32(run)?, hex32(mailbox)?);
+            let record = hex::decode(record).map_err(|e| e.to_string())?;
+            vs.signer.nonce_claim_proof(pins, hex32(cid)?, hex32(challenge)?, &record)
+                .map_err(|e| e.to_string())
+        })().map_err(|e| JsError::new(&e))?;
+        Ok(hex::encode(proof.to_bytes()))
     }
 
     /// Both witnesses issued a FRESH, verified claim receipt for `{cid, record}`. The core's

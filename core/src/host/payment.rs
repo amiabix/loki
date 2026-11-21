@@ -1661,7 +1661,8 @@ fn sign_with_opened(
 ) -> Result<(), RoundError> {
     // Both external nonce witnesses must be configured; without them this member refuses to
     // sign, before it joins the session or unwraps the share.
-    let witness = super::nonce_witness::RelayWitness::for_member(st, &p.attempt)?;
+    let witness = super::nonce_witness::RelayWitness::for_member(st, &p.attempt)?
+        .authorize(hex32(&p.vault)?, &v.identity)?;
     let mut tx = relay(&v.identity, &st.config.frostd_url)?;
     let ch = tx
         .join(p.session_id.ok_or("missing signing session")?)

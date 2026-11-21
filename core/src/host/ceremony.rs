@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    net::IpAddr,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -22,7 +23,7 @@ use zeroize::Zeroizing;
 
 use super::{
     routes::{blocking, err},
-    state::Shared,
+    state::{Config, Shared},
 };
 use crate::{
     frost_roster::FrostRoster,
@@ -323,37 +324,75 @@ enum PeerRequestError {
     Rejected(String),
 }
 
-fn peer_request(method: &str, url: &str, body: Option<Value>) -> Result<Value, String> {
-    peer_request_result(method, url, body).map_err(|error| match error {
+// Allow global unicast only, excluding special-use and transition ranges.
+fn public_peer_address(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => !matches!(ip.octets(),
+            [0 | 10 | 127 | 224..=255, ..]
+            | [100, 64..=127, ..] | [169, 254, ..] | [172, 16..=31, ..] | [192, 168, ..]
+            | [192, 0, 0 | 2, _] | [192, 88, 99, _] | [198, 18 | 19, ..]
+            | [198, 51, 100, _] | [203, 0, 113, _]),
+        IpAddr::V6(ip) => matches!(ip.segments(), [0x2000..=0x3fff, ..])
+            && !matches!(ip.segments(), [0x2001, 0..=0x1ff | 0xdb8, ..] | [0x2002, ..]
+                | [0x3fff, 0..=0xfff, ..]),
+    }
+}
+
+fn peer_request(config: &Config, base: &str, route: &str, body: Value) -> Result<Value, String> {
+    peer_request_result(config, base, route, body).map_err(|error| match error {
         PeerRequestError::Unavailable(message) | PeerRequestError::Rejected(message) => message,
     })
 }
 
-fn peer_request_result(method: &str, url: &str, body: Option<Value>) -> Result<Value, PeerRequestError> {
+fn peer_request_result(config: &Config, base: &str, route: &str, body: Value) -> Result<Value, PeerRequestError> {
+    use PeerRequestError::{Rejected, Unavailable};
+    let mut url = config.validate_peer_url(base).map_err(Rejected)?;
+    url.set_path(route);
     let runtime = tokio::runtime::Runtime::new()
-        .map_err(|e| PeerRequestError::Unavailable(e.to_string()))?;
+        .map_err(|e| Unavailable(e.to_string()))?;
     runtime.block_on(async {
-        let client = reqwest::Client::builder()
+        let mut client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|e| PeerRequestError::Unavailable(e.to_string()))?;
-        let req = if method == "POST" {
-            client.post(url).json(&body.unwrap_or(json!({})))
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none());
+        let refused = || Rejected("creator origin must use public addresses outside local development".into());
+        let host = url.host_str().ok_or_else(refused)?;
+        if let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
+            // The origin policy only admits these two literals in local development.
+            if !matches!(host, "127.0.0.1" | "[::1]") && !public_peer_address(ip) {
+                return Err(refused());
+            }
         } else {
-            client.get(url)
-        };
-        let response = req.send().await.map_err(|e| PeerRequestError::Unavailable(e.to_string()))?;
+            let port = url.port_or_known_default().ok_or_else(refused)?;
+            let addresses: Vec<_> = tokio::time::timeout(Duration::from_secs(10), tokio::net::lookup_host((host, port)))
+                .await.map_err(|_| Unavailable("creator DNS lookup timed out".into()))?
+                .map_err(|e| Unavailable(format!("creator DNS lookup failed: {e}")))?
+                .collect();
+            if addresses.is_empty() {
+                return Err(Unavailable("creator DNS returned no addresses".into()));
+            }
+            if addresses.iter().any(|address| !public_peer_address(address.ip())) {
+                return Err(refused());
+            }
+            // Dial only the checked answers; retain the configured hostname for TLS.
+            client = client.resolve_to_addrs(host, &addresses);
+        }
+        let client = client.build().map_err(|e| Unavailable(e.to_string()))?;
+        let response = client.post(url).json(&body).send().await.map_err(|e| Unavailable(e.to_string()))?;
         let status = response.status();
-        let value: Value = response.json().await.map_err(|e| PeerRequestError::Unavailable(e.to_string()))?;
+        if status.is_redirection() {
+            return Err(Rejected("creator redirected the ceremony request".into()));
+        }
+        let value: Value = response.json().await.map_err(|e| Unavailable(e.to_string()))?;
         if !status.is_success() {
             let message = value["error"]
                 .as_str()
                 .unwrap_or("peer request failed")
                 .to_owned();
             return Err(if status.is_server_error() || matches!(status.as_u16(), 401 | 404 | 408 | 429) {
-                PeerRequestError::Unavailable(message)
+                Unavailable(message)
             } else {
-                PeerRequestError::Rejected(message)
+                Rejected(message)
             });
         }
         Ok(value)
@@ -467,9 +506,6 @@ pub(super) async fn join(State(st): State<Shared>, Json(body): Json<Value>) -> R
     {
         return err(StatusCode::BAD_REQUEST, "invalid invite");
     }
-    if let Err(e) = crate::transport::require_tls_off_loopback(&invite.creator_base_url) {
-        return err(StatusCode::BAD_REQUEST, e);
-    }
     let (data, pass) = match unlocked(&st).await {
         Ok(x) => x,
         Err(e) => return e,
@@ -478,13 +514,9 @@ pub(super) async fn join(State(st): State<Shared>, Json(body): Json<Value>) -> R
         let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
         let me = identity(&data, &pass, invite.slot)?;
         let wire = WireIdentity::from_public(me.public());
-        peer_request(
-            "POST",
-            &format!("{}/api/enroll", invite.creator_base_url),
-            Some(json!({
-                "vault":invite.vault,"slot":invite.slot,"token":invite.token,"identity":wire
-            })),
-        )?;
+        let enrollment = json!({
+            "vault":invite.vault,"slot":invite.slot,"token":invite.token,"identity":wire
+        });
         let mut slots = BTreeMap::new();
         slots.insert(
             invite.slot,
@@ -512,7 +544,8 @@ pub(super) async fn join(State(st): State<Shared>, Json(body): Json<Value>) -> R
             birth_height: None,
             roster_code: None,
         };
-        if dir(&data, &c.vault)?.exists("ceremony.sealed") {
+        let exists = dir(&data, &c.vault)?.exists("ceremony.sealed");
+        if exists {
             let old = load(&data, &pass, &c.vault)?;
             if old.my_slot != c.my_slot
                 || old.creator_base_url != c.creator_base_url
@@ -528,7 +561,9 @@ pub(super) async fn join(State(st): State<Shared>, Json(body): Json<Value>) -> R
             {
                 return Err("existing ceremony does not match invite".into());
             }
-        } else {
+        }
+        peer_request(&st.config, &c.creator_base_url, "/api/enroll", enrollment)?;
+        if !exists {
             save(&data, &pass, &c)?;
         }
         Ok(json!({"vault":invite.vault}))
@@ -656,15 +691,11 @@ pub(super) async fn roster(State(st): State<Shared>, Json(body): Json<Value>) ->
     }
 }
 
-fn refresh_roster(c: &mut Ceremony) -> Result<(), String> {
+fn refresh_roster(config: &Config, c: &mut Ceremony) -> Result<(), String> {
     if c.my_slot == 1 {
         return Ok(());
     }
-    let remote = peer_request(
-        "POST",
-        &format!("{}/api/roster", c.creator_base_url),
-        Some(joiner_auth(c)?),
-    )?;
+    let remote = peer_request(config, &c.creator_base_url, "/api/roster", joiner_auth(c)?)?;
     let fingerprint = remote["fingerprint"]
         .as_str()
         .ok_or("missing roster fingerprint")?;
@@ -719,7 +750,7 @@ pub(super) async fn status(st: Shared, vault: String) -> Reply {
         let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
         let mut c = load(&data, &pass, &vault)?;
         if c.my_slot != 1 && c.fingerprint.is_none() {
-            if refresh_roster(&mut c).is_ok() {
+            if refresh_roster(&st.config, &mut c).is_ok() {
                 save(&data, &pass, &c)?;
             }
         }
@@ -748,7 +779,7 @@ pub(super) async fn status(st: Shared, vault: String) -> Reply {
             let differ = st.roster_refused.lock().map_err(|e| e.to_string())?.contains(&vault);
             value["roster_dialog"] = if differ { json!("codes_differ") } else if open { json!("open") } else { Value::Null };
         }
-        if c.my_slot == 1 {
+        if c.my_slot == 1 && matches!(phase, "waiting_for_members" | "compare_roster") {
             value["invites"] = json!(invitations(&c)?);
         }
         if let Some(error) = c.error {
@@ -814,13 +845,13 @@ pub(super) async fn agree(State(st): State<Shared>, Json(body): Json<Value>) -> 
         let network = VaultNetwork::parse(&st.config.network)?;
         let Some(confirm) = st.roster_confirmation.clone() else {
             let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
-            let (c, code) = agreement(data, pass, vault, &fingerprint, &roster_code, network)?;
-            return record_agreement(data, pass, c, code);
+            let (c, code) = agreement(&st.config, data, pass, vault, &fingerprint, &roster_code, network)?;
+            return record_agreement(&st.config, data, pass, c, code);
         };
         let _asking = RosterAsking::claim(st, vault)?;
         let summary = {
             let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
-            let (c, code) = agreement(data, pass, vault, &fingerprint, &roster_code, network)?;
+            let (c, code) = agreement(&st.config, data, pass, vault, &fingerprint, &roster_code, network)?;
             roster_summary(&c, network, &code)
         };
         // The member may take minutes to compare codes by phone: other requests need the
@@ -841,9 +872,9 @@ pub(super) async fn agree(State(st): State<Shared>, Json(body): Json<Value>) -> 
         }
         // Everything is checked again: the member confirmed the code of the roster shown, and
         // the request names that same code, so any change to the roster or the setup refuses.
-        let (c, code) = agreement(data, pass, vault, &fingerprint, &roster_code, network)
+        let (c, code) = agreement(&st.config, data, pass, vault, &fingerprint, &roster_code, network)
             .map_err(|e| format!("{ROSTER_CHANGED}: {e}"))?;
-        record_agreement(data, pass, c, code)
+        record_agreement(&st.config, data, pass, c, code)
     })
     .await;
     if reply.0 == StatusCode::OK {
@@ -893,13 +924,13 @@ impl Drop for RosterAsking<'_> {
 /// from the creator, and the request's fingerprint and code are this roster's. Returns the
 /// ceremony and the code of its setup document.
 fn agreement(
-    data: &Path, pass: &str, vault: &str, fingerprint: &str, roster_code: &str, network: VaultNetwork,
+    config: &Config, data: &Path, pass: &str, vault: &str, fingerprint: &str, roster_code: &str, network: VaultNetwork,
 ) -> Result<(Ceremony, String), String> {
     let mut c = load(data, pass, vault)?;
     if c.dkg_started || c.error.is_some() {
         return Err("DKG interrupted or already running; create a fresh vault if interrupted".into());
     }
-    refresh_roster(&mut c)?;
+    refresh_roster(config, &mut c)?;
     if c.fingerprint.as_deref() != Some(fingerprint) {
         return Err("roster fingerprint mismatch".into());
     }
@@ -911,13 +942,9 @@ fn agreement(
 }
 
 /// Tells the creator (a joiner only) and records this member's agreement and confirmed code.
-fn record_agreement(data: &Path, pass: &str, mut c: Ceremony, code: String) -> Result<Value, String> {
+fn record_agreement(config: &Config, data: &Path, pass: &str, mut c: Ceremony, code: String) -> Result<Value, String> {
     if c.my_slot != 1 {
-        peer_request(
-            "POST",
-            &format!("{}/api/agreed", c.creator_base_url),
-            Some(joiner_auth(&c)?),
-        )?;
+        peer_request(config, &c.creator_base_url, "/api/agreed", joiner_auth(&c)?)?;
     }
     c.agreed.insert(c.my_slot);
     c.roster_code = Some(code);
@@ -1121,7 +1148,7 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
                     return Ok(json!({"ok":true}));
                 }
                 match peer_request_result(
-                    "POST", &format!("{}/api/session", c.creator_base_url), Some(joiner_auth(&c)?),
+                    &st.config, &c.creator_base_url, "/api/session", joiner_auth(&c)?,
                 ) {
                     Ok(response) => {
                         let id = response["session_id"].as_str()
@@ -2544,13 +2571,13 @@ mod tests {
             assert!(registration::DeviceKey::open(&apple, pass).is_ok());
             crate::host::custody::open_signer(&AppState::new(apple), &moved, pass, &vault_hex, 1, Box::new(|_| false)).unwrap();
             let actual = tags.lock().unwrap();
-            let scope = std::fs::read_to_string(moved.join(NATIVE_KEY_SCOPE)).unwrap();
-            let vault = format!("cash.loki.member.kek.v2:{scope}:vault:{vault_hex}").into_bytes();
-            let device = format!("cash.loki.member.kek.v2:{scope}:device-auth").into_bytes();
-            assert_ne!(actual[0].2, vault, "a failed first restore does not publish its scope");
+            let restored = std::fs::read_to_string(moved.join("vaults").join(&vault_hex).join("signer/native-restored-key")).unwrap();
+            let vault = format!("cash.loki.member.kek.restore.v1:{restored}:signer").into_bytes();
+            let device = format!("cash.loki.member.kek.restore.v1:{restored}:device-auth").into_bytes();
+            assert_ne!(actual[0].2, vault, "a failed restore does not reuse its Keychain tags");
             assert_ne!(actual[1].2, device);
             assert_eq!(actual[2..], [
-                (false, true, vault.clone()), (true, true, device.clone()),
+                (false, true, vault.clone()), (true, true, device.clone()), (false, false, vault.clone()),
                 (true, false, device.clone()), (true, false, device), (false, false, vault),
             ]);
         }

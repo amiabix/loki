@@ -816,6 +816,19 @@ impl<SE: SecureElement> LocalSigner<SE> {
         Ok(pins)
     }
 
+    /// Sign with the active vault identity, not a transport key or a public capability.
+    pub fn nonce_claim_proof(
+        &self,
+        (key, run, mailbox): ([u8; 32], [u8; 32], [u8; 32]),
+        cid: [u8; 32],
+        challenge: [u8; 32],
+        record: &[u8],
+    ) -> Result<loki_relay_protocol::nonce::ClaimProof, SignerError> {
+        let identity = self.identity.as_ref().ok_or(SignerError::NotReady)?;
+        let pin = loki_relay_protocol::types::RelayPin { key, run };
+        Ok(identity.nonce_claim_proof(self.vault_id, &pin, mailbox, cid, challenge, record))
+    }
+
     /// Install the decision for an attempt after its signing group and expiry are fixed.
     pub fn set_approval_policy(&mut self, approval: ApprovalPolicy) {
         self.approval = approval;
