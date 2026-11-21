@@ -96,7 +96,7 @@ echo "=============================================================="
 echo "member slot $slot running; registering with $coordinator"
 printf 'Private pairing link (do not share or log): %s\n' "$pairing_link" >&7
 unset pairing_link
-echo "Set up recovery in the wallet if needed; keep the words private."
+echo "Set up recovery in the wallet if needed; save the words privately, then confirm."
 echo "=============================================================="
 trap - EXIT INT TERM
 printf 'Member still running; stop with: kill $(cat -- %q)\n' "$data/pids"

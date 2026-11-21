@@ -195,6 +195,23 @@ FROSTD_URL=http://127.0.0.1:2744 node --test core/scripts/test_confirmation_wait
 
 ## Payment approval and recovery
 
+Headless recovery setup uses two authenticated requests to `POST /api/recovery-setup`.
+Send `{}` to begin. Save the returned words offline, then send `{ "words": "…" }` to activate
+them. A restart or lock before confirmation leaves setup uncommitted. The same confirmation
+also works for a legacy headless profile if you still have its original words. Keep the
+passphrase backup if you cannot confirm the original words. Interactive headless startup also
+asks you to acknowledge the words after displaying them.
+
+For fresh headless restores, `POST /api/recovery-restore` takes `vault`, `words`, `backup` (hex)
+and `fingerprint` (SHA-256 of the decoded backup bytes, as hex). Save that fingerprint separately
+while exporting from the original signer (`GET /api/recovery-backup?vault=…` returns it).
+The browser signer displays it during export and asks
+for it on restore. A legacy backup still works: use a fingerprint from your own trusted offline
+copy, never one supplied alongside an untrusted download. For browser backups hash the `.bin`
+bytes; for headless JSON backups hash the decoded `backup` field, not the JSON file.
+Existing browser profiles must re-enter their original words in the signer before making new
+backups. This does not rewrite existing backup files.
+
 Publishing creates separate encrypted control and signing relay sessions. Each selected member’s
 approval inbox discovers pending requests over the control session without a copied attempt ID.
 Review the full recipient, amount and fee, then approve on each selected member. Waiting for people

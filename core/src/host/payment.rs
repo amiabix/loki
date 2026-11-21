@@ -193,12 +193,10 @@ fn pair(body: &Value) -> Result<(String, String), String> {
     Ok((vault, attempt))
 }
 fn member_dir(data: &Path, vault: &str) -> Result<MemberDir, String> {
-    hex32(vault)?;
-    Ok(MemberDir::open(&data.join("vaults"), vault))
+    super::ceremony::dir(data, vault)
 }
 fn payment_dir(data: &Path, vault: &str) -> Result<MemberDir, String> {
-    hex32(vault)?;
-    MemberDir::create(&data.join("vaults").join(vault), "payments").map_err(|e| e.to_string())
+    MemberDir::create(member_dir(data, vault)?.path(), "payments").map_err(|e| e.to_string())
 }
 fn read_payment(data: &Path, pass: &str, vault: &str, attempt: &str) -> Result<Payment, String> {
     hex32(attempt)?;
@@ -256,7 +254,7 @@ fn load_vault_with<Fvk>(
             .map_err(|e| e.to_string())?,
     );
     let v: Value = serde_json::from_slice(&sealed).map_err(|e| e.to_string())?;
-    if required(&v, "vault")? != vault || v["key_derivation"] != zip2005::VERSION {
+    if hex32(required(&v, "vault")?)? != hex32(vault)? || v["key_derivation"] != zip2005::VERSION {
         return Err("sealed vault identity or derivation mismatch".into());
     }
     let network = VaultNetwork::parse(required(&v, "network")?)?;
@@ -297,7 +295,7 @@ fn load_vault_with<Fvk>(
             .map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    if c["vault"] != vault || c["my_slot"] != slot || c["threshold"] != threshold {
+    if hex32(required(&c, "vault")?)? != hex32(vault)? || c["my_slot"] != slot || c["threshold"] != threshold {
         return Err("ceremony and vault differ".into());
     }
     let mut peers = BTreeMap::new();

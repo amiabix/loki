@@ -121,12 +121,17 @@ for i in 1 2 3; do LOKI_ONBOARDING_GRANT="${onboarding[i]}" with_coordinator "$i
 unset onboarding
 for i in 1 2 3; do
   wait_for "member $i registers to slot $i" 60 registered "$i"
-  grep -q 'recovery words not set up: output is not a terminal' "$tmp/$i.log" || fail "member $i did not report the skipped recovery words"
+  grep -q 'recovery words not set up' "$tmp/$i.log" || fail "member $i did not report the skipped recovery words"
   [[ ! -e "$tmp/$i/recovery.pub" ]] || fail "member $i minted recovery words into a log"
 done
 echo "registered slots 1..3; no recovery words were minted into the member logs"
+confirm_recovery() {
+  api "$1" POST /api/recovery-setup "$(jq -nc --arg words "$2" '{words:$words}')" |
+    jq -e '.confirmed' >/dev/null
+}
 for i in 1 2; do
-  api "$i" POST /api/recovery-setup '{}' | jq -e '(.words | split(" ") | length) == 24' >/dev/null || fail "recovery setup $i"
+  words="$(api "$i" POST /api/recovery-setup '{}' | jq -er '.words')" || fail "recovery setup $i"
+  confirm_recovery "$i" "$words" || fail "recovery confirmation $i"
 done
 created="$(api 1 POST /api/create '{"name":"Testnet restore vault","members":3,"threshold":2}')" || fail "create: $created"
 vault="$(jq -er '.vault' <<<"$created")" || fail vault
@@ -149,9 +154,11 @@ for i in 1 2; do recovery "$i" | jq -e '.recovery_identity and .recovery_backup'
 echo "== member 3 sets up recovery only after the vault is active"
 recovery 3 | jq -e '(.recovery_identity | not) and (.recovery_backup | not)' >/dev/null || fail "member 3 already has recovery"
 words="$(api 3 POST /api/recovery-setup '{}' | jq -er '.words')" || fail 'recovery setup 3'
+confirm_recovery 3 "$words" || fail 'recovery confirmation 3'
 recovery 3 | jq -e '.recovery_identity and .recovery_backup' >/dev/null || fail "member 3 has no backup after recovery setup"
 echo "member 3 has a recovery backup after setting up recovery late"
 backup="$(api 3 GET "/api/recovery-backup?vault=$vault" | jq -er '.backup')" || fail 'export backup'
+fingerprint="$(printf %s "$backup" | xxd -r -p | openssl dgst -sha256 -r | cut -d' ' -f1)"
 old_roster="$(roster_entry 3)"
 old_device="$(device_of 3)"
 [[ -n "$old_device" ]] || fail 'no device binding for slot 3'
@@ -165,7 +172,7 @@ echo "== a fresh profile on a new data directory restores from the words and the
 new="$tmp/3-new-device"
 start 3 "$new"
 api 3 POST /api/profile-create "$(jq -nc --arg passphrase "$(passphrase 3)" '{name:"Member 3",passphrase:$passphrase}')" >/dev/null || fail 'profile 3'
-restored="$(api 3 POST /api/recovery-restore "$(jq -nc --arg vault "$vault" --arg words "$words" --arg backup "$backup" '{vault:$vault,words:$words,backup:$backup}')")" || fail "restore: $restored"
+restored="$(api 3 POST /api/recovery-restore "$(jq -nc --arg vault "$vault" --arg words "$words" --arg backup "$backup" --arg fingerprint "$fingerprint" '{vault:$vault,words:$words,backup:$backup,fingerprint:$fingerprint}')")" || fail "restore: $restored"
 phase_is 3 active || fail 'restored vault is not active'
 recovery 3 | jq -e '.recovery_identity and .recovery_backup' >/dev/null || fail 'restore did not bring the recovery identity'
 again="$(api_raw 3 POST /api/recovery-setup '{}')"
