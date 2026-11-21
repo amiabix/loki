@@ -29,6 +29,8 @@ pub use native_config::{Deployment, FetchedConfig, NativeConfig};
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
 pub(crate) use native_member::{disconnect_wallet_tabs, run_native, request_stop as native_request_stop, set_aside as native_set_aside, vault_addresses as native_vault_addresses};
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+pub(crate) use native_member::can_view_addresses as native_can_view_addresses;
+#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
 pub(crate) use native_member::restore_running as native_restore_running;
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
 pub(crate) use native_member::{set_log_sink as native_set_log_sink, status as native_status};
@@ -259,6 +261,10 @@ fn parse_config(args: &[String], native: bool) -> Result<Config, String> {
     } else {
         std::net::Ipv4Addr::LOCALHOST.into()
     };
+    let peer_port = if flag("--peer-port") {
+        Some(value("--peer-port").and_then(|p| p.parse::<u16>().ok()).filter(|&p| p != 0)
+            .ok_or("--peer-port requires a nonzero port")?)
+    } else { None };
     if flag("--secure-element") && value("--secure-element").is_none() {
         return Err("--secure-element requires <software|apple>".into());
     }
@@ -276,7 +282,7 @@ fn parse_config(args: &[String], native: bool) -> Result<Config, String> {
     let network = value("--network").unwrap_or_else(|| "regtest".into());
     crate::network::VaultNetwork::parse(&network)?;
     Ok(Config {
-        data, port, bind, native,
+        data, port, bind, peer_port, native,
         registration: RegistrationConfig::from_args(args, flag("--development-http"))?,
         advertise_url: value("--advertise-url"),
         network,
@@ -300,6 +306,11 @@ pub fn run(config: Config) -> Result<(), String> {
     run_local(config, None, None, None, None)
 }
 
+/// Serve the member CLI. `pairing_stdout` reserves stdout for a bare link on a private pipe.
+pub fn run_headless(config: Config, approval: Option<LocalApproval>, pairing_stdout: bool) -> Result<(), String> {
+    run_local_with(config, None, None, approval, None, None, pairing_stdout, None, None, |_| Ok(()))
+}
+
 /// `fetched`: the configuration the native app fetched and the member confirmed; it is saved
 /// only once the profile unlocks. A member started here has no roster dialog: `/api/agree`
 /// trusts its caller to have compared the code. LokiSigner starts through `run_native`.
@@ -310,7 +321,7 @@ pub fn run_local(
     approval: Option<LocalApproval>,
     fetched: Option<FetchedConfig>,
 ) -> Result<(), String> {
-    run_local_with(config, pass, notice, approval, None, fetched, None, None, |_| Ok(()))
+    run_local_with(config, pass, notice, approval, None, fetched, false, None, None, |_| Ok(()))
 }
 
 fn run_local_with<G>(
@@ -320,10 +331,19 @@ fn run_local_with<G>(
     approval: Option<LocalApproval>,
     roster_confirmation: Option<LocalRosterConfirmation>,
     fetched: Option<FetchedConfig>,
+    pairing_stdout: bool,
     stop: Option<&tokio::sync::Notify>,
     connect: Option<connect::LocalConnect>,
     on_start: impl FnOnce(&state::Shared) -> Result<G, String>,
 ) -> Result<(), String> {
+    if !config.bind.is_loopback() {
+        return Err("the member HTTP API requires a loopback --bind; use a local TLS proxy to --peer-port for remote ceremony traffic".into());
+    }
+    match (config.peer_port, config.advertise_url.as_deref()) {
+        (Some(_), Some(origin)) => { registration::plain_origin(origin, true)?; }
+        (None, None) => {}
+        _ => return Err("--peer-port and --advertise-url must be set together".into()),
+    }
     // rustls has no default provider; install one before any relay/lightwalletd TLS.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     // Peer origins must use TLS off loopback (preserved from main's hardening).
@@ -343,6 +363,10 @@ fn run_local_with<G>(
             .map_err(|e| format!("bind {addr}: {e}"))?;
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
         config.port = addr.port();
+        let peer_listener = if let Some(port) = config.peer_port {
+            let addr = std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), port);
+            Some(tokio::net::TcpListener::bind(addr).await.map_err(|e| format!("peer bind {addr}: {e}"))?)
+        } else { None };
         let wallet_tabs = connect.zip(config.registration.as_ref()).map(|(ask, registration)| {
             let endpoint = config.lokisigner_url().ok_or("LokiSigner needs a loopback listener")?;
             Ok::<_, &str>(connect::WalletTabs::new(endpoint, registration.coordinator.clone(), ask))
@@ -355,13 +379,25 @@ fn run_local_with<G>(
                 if let Some(notice) = notice { notice(ready, ""); }
             } else if let Some(notice) = notice {
                 notice(ready, &format!("http://{addr}/#{}", state.config.token));
+            } else if pairing_stdout {
+                use std::io::Write;
+                writeln!(std::io::stdout(), "http://{addr}/#{}", state.config.token)
+                    .map_err(|e| format!("pairing output: {e}"))?;
             } else if let Some(launch) = &state.config.registration {
                 println!("{} ({}) — Local pairing: http://{addr}/#{}", launch.name, state.config.data.display(), state.config.token);
             } else {
                 println!("Signer: http://{addr}/#{}", state.config.token);
             }
-            axum::serve(listener, routes::router(state.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>())
-                .await.map_err(|e| format!("serve: {e}"))
+            let local = async {
+                axum::serve(listener, routes::router(state.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>()).await
+            };
+            let peers = async {
+                if let Some(listener) = peer_listener {
+                    axum::serve(listener, routes::peer_router(state.clone())).await?;
+                }
+                Ok(())
+            };
+            tokio::try_join!(local, peers).map(|_| ()).map_err(|e| format!("serve: {e}"))
         };
         if let Some(stop) = stop {
             // Clear the session before dropping the runtime: blocking workers check it to exit.

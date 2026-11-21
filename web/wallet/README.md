@@ -60,8 +60,9 @@ A LokiSigner member compares the roster code in LokiSigner, not on this page: **
 LokiSigner** opens LokiSigner's dialog, and only its **Codes match** records the agreement
 (see `core/signer-app/README.md`). The page knows LokiSigner asks because the member's vault
 status reports `roster_dialog`. A headless member paired with this tab (`loki_member_app`,
-`LokiSigner serve`) does not, so the page shows it the code to compare, as it always did. After confirming the roster, a member stays on **Verify
-members** until the creator has all confirmations and publishes the relay session. Waiting
+`LokiSigner serve`) does not, so the page shows the signer's 24-digit code. Compare all 24
+digits before confirming. After confirming the roster, a member stays on **Verify members**
+until the creator has all confirmations and publishes the relay session. Waiting
 for people has no key-generation timeout. A creator lock or temporary disconnect can be retried before key generation starts;
 an unlocked member restarted during that wait retains its confirmation. Once key generation
 has started, an interruption requires **Create a new vault**, new invitations, and a new code
@@ -69,6 +70,15 @@ comparison by every member. The failed vault and its diagnostic error remain ava
 
 `LOKI_DEV_FAUCET=1` enables the optional local-origin regtest faucet; it receives only a public
 regtest address. It is off by default, and the supplied launcher binds Next to localhost.
+
+## Production coordinator behind TLS
+
+After building, use `npm start` (the custom server). It listens on `127.0.0.1:$PORT`
+(`3001` by default), with `http://localhost:$PORT` as the local development origin.
+Point a same-host TLS proxy or tunnel at that loopback address and set `PUBLIC_ORIGIN`
+to the exact external HTTPS origin, for example `https://wallet.example`. This replaces
+`HOSTNAME` and `PUBLIC_PORT`. The coordinator uses `PUBLIC_ORIGIN`, not client forwarding
+headers, to reconstruct the origin for member registration.
 
 ## In-browser signer: enroll → discover → DKG
 
@@ -229,7 +239,7 @@ What a deploy must provide on the signer server (`serve.mjs` env):
 | `LOKI_WALLET_ORIGIN` | the one wallet origin allowed to frame and message the signer (`frame-ancestors`, postMessage check) |
 | `LOKI_FROSTD_URL` | the frostd relay the signer logs in to. It is shown to the member and not settable from the wallet page. One relay only. |
 | `LOKI_RP_ID` | WebAuthn rpId. It **must stay the same across deploys** or passkeys stop unlocking. |
-| `LOKI_NONCE_WITNESSES` | the two nonce-witness relays every signature is claimed at (the native `--nonce-witnesses` file). Each mailbox `read` capability is served publicly in `config.json`. |
+| `LOKI_NONCE_WITNESSES` | the two nonce-witness routes every signature is claimed at (the native `--nonce-witnesses` file). Both witnesses must [enroll each vault signer](../../communication/deploy/README.md#nonce-witness-enrollment-and-upgrades); `config.json` serves only endpoints and pins. |
 | `LOKI_NETWORK` | `testnet` (default) or `regtest`; mainnet is refused at startup. A regtest stack **must** set `regtest`, or LokiSigner is told testnet. |
 | `LOKI_LIGHTWALLETD_URL` | the lightwalletd native members sync from |
 | `LOKI_LIGHTWALLETD_GRPCWEB_URL` | lightwalletd behind gRPC-web + CORS for the signer origin (`communication/deploy/lightwalletd-grpcweb.sh`); the browser signer scans the chain through it for its vault balance and history |

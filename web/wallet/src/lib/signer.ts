@@ -109,10 +109,15 @@ function signerOrigin(): string {
 }
 
 const SEALED = "loki_signer_sealed"; // localStorage: a share exists in this browser (first-paint hint only)
+// Setup and signing can include several minutes of ceremony or user interaction. Chain reads
+// can also take longer on the first scan and resume from their last saved batch.
+const LONG_CALLS = new Set(["create", "unlock", "join", "payment-approve", "recovery-setup", "recovery-export", "restore", "remove", "chain", "payment-status"]);
 
 async function postJson<T>(url: string, body: unknown): Promise<T> {
-  const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const signal = AbortSignal.timeout(30_000);
+  const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal });
   const data = await res.json().catch(() => ({}));
+  signal.throwIfAborted();
   if (!res.ok) throw new ApiError(data.error ?? "coordinator request failed", res.status);
   return data as T;
 }
@@ -125,33 +130,49 @@ function browserSigner(origin: string): SignerModule {
   frame.title = "Loki signer";
   frame.allow = `publickey-credentials-create ${origin}; publickey-credentials-get ${origin}`;
   Object.assign(frame.style, { position: "fixed", inset: "0", width: "100%", height: "100%", border: "0", zIndex: "1000", display: "none", colorScheme: "normal" });
-  document.body.append(frame);
 
-  const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+  const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   let seq = 0;
-  let ready: () => void;
-  const loaded = new Promise<void>((resolve, reject) => {
-    ready = resolve;
-    setTimeout(() => reject(new ApiError(`The signer at ${origin} did not load`, 503)), 15000);
-  });
+  let failure: ApiError | undefined;
+  const { promise: loaded, resolve: ready, reject: notReady } = Promise.withResolvers<void>();
+  const startup = setTimeout(() => fail(new ApiError(`The signer at ${origin} did not load. Try again.`, 503)), 15_000);
   loaded.catch(() => {});
-  window.addEventListener("message", (e: MessageEvent) => {
+  function fail(error: ApiError) {
+    if (failure) return;
+    failure = error;
+    clearTimeout(startup);
+    notReady(error);
+    for (const p of pending.values()) { clearTimeout(p.timer); p.reject(error); }
+    pending.clear();
+    window.removeEventListener("message", receive);
+    frame.remove(); // Stop the old worker and hide any prompt before a retry opens a new signer.
+    browser = undefined;
+  }
+  function receive(e: MessageEvent) {
     if (e.origin !== origin || e.source !== frame.contentWindow) return;
     const d = e.data ?? {};
-    if (d.cmd === "ready") { ready(); return; }
+    if (d.cmd === "ready") { clearTimeout(startup); ready(); return; }
+    if (d.cmd === "failed") { fail(new ApiError(d.error ?? "The browser signer stopped. Try again.", 503)); return; }
     if (d.cmd === "show") { frame.style.display = "block"; return; }
     if (d.cmd === "hide") { frame.style.display = "none"; return; }
     const p = pending.get(d.id);
     if (!p) return;
     pending.delete(d.id);
+    clearTimeout(p.timer);
     d.ok ? p.resolve(d.result) : p.reject(new ApiError(d.error ?? "signer error", d.status ?? 500));
-  });
+  }
+  window.addEventListener("message", receive);
+  document.body.append(frame);
   async function call<T>(op: string, params?: unknown): Promise<T> {
     await loaded;
+    if (failure) throw failure;
     const id = ++seq;
     return new Promise<T>((resolve, reject) => {
-      pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
-      frame.contentWindow!.postMessage({ id, op, params }, origin);
+      const timer = setTimeout(() => fail(new ApiError(`The browser signer did not finish ${op}. Unlock it and try again.`, 504)),
+        LONG_CALLS.has(op) ? 15 * 60_000 : 60_000);
+      pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer });
+      try { frame.contentWindow!.postMessage({ id, op, params }, origin); }
+      catch { fail(new ApiError("Could not reach the browser signer. Try again.", 503)); }
     });
   }
   const opened = (s: SignerSession) => { try { localStorage.setItem(SEALED, "1"); } catch {} return s; };
@@ -178,12 +199,13 @@ function browserSigner(origin: string): SignerModule {
       const [path, query] = pathAndQuery.split("?");
       const args = { ...Object.fromEntries(new URLSearchParams(query ?? "")), ...(body as object) } as { vault?: string; attempt?: string };
       if (path === "status") {
-        const s = await call<{ profile: { id: string; name: string }; se: string; persisted: boolean | null; relay: string }>("status");
+        const s = await call<{ profile: { id: string; name: string }; se: string; persisted: boolean | null; relay: string; network: "testnet" | "regtest" }>("status");
         // The signer's own vaults (OPFS). Refused while a join/payment holds the signer; the
         // next status poll fills them in.
         const vaults = await call<{ vault: string; active: boolean }[]>("vaults").catch(() => undefined);
+        if (failure) throw failure;
         if (args.vault) return browserVaultStatus(vaults, args.vault) as T;
-        return { phase: "home", network: "testnet", secure_element: s.se, profile: s.profile, persisted: s.persisted, relay: s.relay, vaults } as T;
+        return { phase: "home", network: s.network, secure_element: s.se, profile: s.profile, persisted: s.persisted, relay: s.relay, vaults } as T;
       }
       if (path === "lock") { await this.lock(); return {} as T; }
       // Join a vault (enroll → roster → agree → session → DKG). The member confirms every member
@@ -275,17 +297,16 @@ const mockSigner: SignerModule = {
 // DOM and no browser storage, get the mock. No probe, no silent fallback: if the signer origin
 // is missing or unreachable, signer calls fail.
 
-let implPromise: Promise<SignerModule> | null = null;
-function impl(): Promise<SignerModule> {
-  implPromise ??= (async () => (typeof document === "undefined" ? mockSigner : browserSigner(signerOrigin())))();
-  return implPromise;
+let browser: SignerModule | undefined;
+function impl(): SignerModule {
+  return typeof document === "undefined" ? mockSigner : (browser ??= browserSigner(signerOrigin()));
 }
 
 export const signer: SignerModule = {
-  hasSigner: async () => (await impl()).hasSigner(),
-  createSigner: async (opts) => (await impl()).createSigner(opts),
-  unlock: async (opts) => (await impl()).unlock(opts),
-  lock: async () => (await impl()).lock(),
-  enroll: async (coordinatorOrigin) => (await impl()).enroll(coordinatorOrigin),
-  async request<T = unknown>(path: string, body?: unknown): Promise<T> { return (await impl()).request<T>(path, body); },
+  hasSigner: async () => impl().hasSigner(),
+  createSigner: async (opts) => impl().createSigner(opts),
+  unlock: async (opts) => impl().unlock(opts),
+  lock: async () => impl().lock(),
+  enroll: async (coordinatorOrigin) => impl().enroll(coordinatorOrigin),
+  async request<T = unknown>(path: string, body?: unknown): Promise<T> { return impl().request<T>(path, body); },
 };

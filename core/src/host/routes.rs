@@ -37,6 +37,20 @@ where
     }
 }
 
+fn ceremony_routes() -> Router<Shared> {
+    Router::new()
+        .route("/api/enroll", post(ceremony::enroll))
+        .route("/api/roster", post(ceremony::roster))
+        .route("/api/agreed", post(ceremony::agreed))
+        .route("/api/session", post(ceremony::session))
+}
+
+pub(super) fn peer_router(state: Shared) -> Router {
+    ceremony_routes()
+        .layer(middleware::from_fn_with_state(state.clone(), browser_origin))
+        .with_state(state)
+}
+
 pub fn router(state: Shared) -> Router {
     // Headless automation keeps both secret-bearing routes. With LokiSigner, neither route
     // even extracts a body: malformed JSON (including its contents) cannot reach an error.
@@ -58,11 +72,7 @@ pub fn router(state: Shared) -> Router {
         .route("/api/registration", get(registration))
         .route("/api/create", post(ceremony::create))
         .route("/api/join", post(ceremony::join))
-        .route("/api/enroll", post(ceremony::enroll))
-        .route("/api/roster", post(ceremony::roster))
         .route("/api/agree", post(ceremony::agree))
-        .route("/api/agreed", post(ceremony::agreed))
-        .route("/api/session", post(ceremony::session))
         .route("/api/address", get(ceremony::address))
         .route("/api/balance", post(payment::balance))
         .route("/api/payment-draft", post(payment::draft))
@@ -86,6 +96,7 @@ pub fn router(state: Shared) -> Router {
         .route("/api/device-login", post(device::login))
         .route("/api/device-revoke", post(device::revoke))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
+        .merge(ceremony_routes())
         .layer(middleware::from_fn_with_state(state.clone(), browser_origin))
         .with_state(state)
 }
@@ -99,10 +110,8 @@ async fn browser_origin(State(st): State<Shared>, req: Request, next: Next) -> R
         let Some(tabs) = &st.wallet_tabs else { return StatusCode::NOT_FOUND.into_response(); };
         if !tabs.permits_request(&req) { return StatusCode::FORBIDDEN.into_response(); }
     }
-    // The ceremony endpoints are token-authenticated, member-to-member calls (also exempt from
-    // the process token in `auth`): a native peer reaches them with no `Origin` and so skips the
-    // pairing check. The browser signer runs its join worker on a separate origin and needs CORS
-    // on these four routes. The invite token gates ceremony access, not detection of the listener.
+    // The browser signer's join worker runs on a separate origin and needs CORS on these four
+    // routes. Ceremony handlers check the invite token, not the local process token.
     let open_ceremony = matches!(
         req.uri().path(),
         "/api/enroll" | "/api/agreed" | "/api/roster" | "/api/session"
@@ -151,13 +160,10 @@ async fn registration(State(st): State<Shared>) -> Reply {
     }
 }
 
-/// Require a device capability outside enrollment, ceremony peer calls, and the native
-/// connect handshake (which is origin- and loopback-checked before reaching this middleware).
+/// Require a device capability except for the native connect handshake (which is origin-
+/// and loopback-checked before reaching this middleware).
 async fn auth(State(st): State<Shared>, req: Request, next: Next) -> Result<Response, Response> {
-    if matches!(
-        req.uri().path(),
-        "/api/enroll" | "/api/agreed" | "/api/roster" | "/api/session"
-    ) || (req.uri().path() == "/api/connect" && st.wallet_tabs.is_some()) {
+    if req.uri().path() == "/api/connect" && st.wallet_tabs.is_some() {
         return Ok(next.run(req).await);
     }
     let presented = req
@@ -240,6 +246,8 @@ pub(super) async fn lock_session(st: &Shared) {
     *session = None;
     if let Some(tabs) = &st.wallet_tabs { tabs.revoke_all(); }
     drop(session);
+    #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+    super::native_member::clear_addresses_on_lock(st);
     crate::seal_kdf::clear_session_cache();
 }
 
