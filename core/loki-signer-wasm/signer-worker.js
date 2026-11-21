@@ -708,4 +708,8 @@ self.onmessage = async (e) => {
   }
 };
 
-self.postMessage({ cmd: "loaded" });
+self.addEventListener("unhandledrejection", () => self.postMessage({ cmd: "failed" }));
+try {
+  await ready;
+  self.postMessage({ cmd: "loaded" });
+} catch { self.postMessage({ cmd: "failed" }); }
