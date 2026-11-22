@@ -36,8 +36,11 @@ RUSTFLAGS="$flags" cargo build --release --locked --features relay-communication
 for crate in loki-signer-wasm wasm-transport; do
   RUSTFLAGS="$flags --cfg getrandom_backend=\"wasm_js\"" \
     wasm-pack build "$crate" --release --no-opt --target web -- --locked
-  raw="$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/${crate//-/_}.wasm"
   pkg="$build/src/core/$crate/pkg"
+  # wasm-transport's package is named loki-wasm-transport, unlike its directory.
+  module=${crate//-/_}
+  if [[ $crate == wasm-transport ]]; then module=loki_wasm_transport; fi
+  raw="$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/$module.wasm"
   first_raw=$(shasum -a 256 "$raw")
   printf '%s\n' "$first_raw" >> "$build/raw.manifest"
   find "$pkg" -type f ! -name .gitignore -print0 | sort -z | xargs -0 shasum -a 256 > "$build/$crate.first"
