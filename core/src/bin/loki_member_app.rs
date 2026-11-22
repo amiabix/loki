@@ -10,6 +10,9 @@
 //!       [--transport hosted --operator-bundle <cbor> --operator-key <hex>
 //!        --enrollment-issuer <path> --development-http]
 //!       [--nonce-witnesses <json>] [--approve-from <file>] [--pairing-stdout]
+//!   loki_member_app recovery-setup --data <dir>
+//!   loki_member_app recovery-restore --data <dir> --backup <export.json> --fingerprint <sha256>
+//!       [--network testnet] [--secure-element <software|apple>] [--frostd-url <url>]
 //!
 //! A local TLS proxy may expose the ceremony-only listener on `127.0.0.1:<peer-port>`.
 //! Never proxy the private API on `--port`.
@@ -23,6 +26,13 @@ use loki_poc::host;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if matches!(args.first().map(String::as_str), Some("recovery-setup" | "recovery-restore")) {
+        if let Err(error) = host::run_recovery_command(&args) {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let config = match host::config_from_args(&args) {
         Ok(c) => c,
         Err(e) => {

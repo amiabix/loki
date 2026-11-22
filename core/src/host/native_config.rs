@@ -128,26 +128,6 @@ impl NativeConfig {
         Ok(())
     }
 
-    /// Called only after AppKit confirms the origin. The one-shot POST reserves a slot.
-    #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
-    pub(crate) fn request_pairing_link(args: &[String], origin: &str) -> Result<String, String> {
-        #[derive(Deserialize)]
-        struct PairingLink { url: String, slot: u32 }
-        let origin = super::registration::plain_origin(origin, false)?;
-        let config = super::native_config_from_args(args)?;
-        let paired = paired_coordinator(&config.data, false)?;
-        if paired.as_ref().is_some_and(|(pinned, _)| pinned != &origin) {
-            return Err("this profile is paired to a different coordinator".into());
-        }
-        let slot = paired.map(|(_, slot)| slot);
-        let body = slot.map_or_else(|| serde_json::json!({}), |slot| serde_json::json!({ "slot": slot }));
-        let reply: PairingLink = coordinator_json(&origin, "/api/members/pairing", Some(body))?;
-        if Self::pairing_target(args, &reply.url)? != (origin, reply.slot) || slot.is_some_and(|slot| slot != reply.slot) {
-            return Err("pairing link does not match the confirmed coordinator and slot".into());
-        }
-        Ok(reply.url)
-    }
-
     #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
     pub(crate) fn preview_restore(args: &[String], origin: &str) -> Result<Self, String> {
         let origin = Self::recovery_origin(args, origin)?;
@@ -413,22 +393,13 @@ fn write_private(dir: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// The caller checks what it returns. Errors name only the origin and the HTTP status: the
 /// reply's own text never reaches the member.
 fn fetch(origin: &str) -> Result<Deployment, String> {
-    coordinator_json(origin, "/api/signer-config", None)
-}
-
-fn coordinator_json<T: serde::de::DeserializeOwned>(origin: &str, path: &str, post: Option<serde_json::Value>) -> Result<T, String> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
     runtime.block_on(async {
         let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(15)).build().map_err(|e| e.to_string())?;
         let failed = |e: reqwest::Error| if e.is_timeout() { format!("{origin} did not answer in time") } else { format!("could not reach {origin}") };
-        let url = format!("{origin}{path}");
-        let request = match post {
-            Some(body) => client.post(url).json(&body),
-            None => client.get(url),
-        };
-        let mut reply = request.send().await.map_err(failed)?;
+        let mut reply = client.get(format!("{origin}/api/signer-config")).send().await.map_err(failed)?;
         let status = reply.status();
         let mut body = Vec::new();
         while let Some(chunk) = reply.chunk().await.map_err(failed)? {

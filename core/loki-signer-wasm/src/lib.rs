@@ -42,6 +42,7 @@ use loki_signer_core::signer::{
 use loki_signer_core::signer::wysiwys::{describe_pczt, sighash_of_pczt};
 use loki_signer_core::signer::DkgInput;
 use loki_signer_core::signing_session::{AttemptId, MessageKind, SessionContext};
+use loki_signer_core::transport::{Outbound, SealedPeer};
 use loki_signer_core::frost;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -851,6 +852,22 @@ impl Signer {
             .map_err(|e| JsError::new(&e))
     }
 
+    /// Seal a join request (`body_json`) from this member, as `slot`, to the vault creator
+    /// named in the invite (`creator_json`, `{id, signing, encryption}` hex) on the join
+    /// session `session_id` the member opened. Returns the wire (hex) to send to the creator.
+    #[wasm_bindgen(js_name = joinSeal)]
+    pub fn join_seal(&self, vault_hex: &str, session_id: &str, slot: u16, creator_json: &str, body_json: &str) -> Result<String, JsError> {
+        self.join_seal_impl(vault_hex, session_id, slot, creator_json, body_json)
+            .map_err(|e| JsError::new(&e))
+    }
+
+    /// Open the creator's reply to a join request on `session_id`; returns its body (JSON text).
+    #[wasm_bindgen(js_name = joinOpen)]
+    pub fn join_open(&self, vault_hex: &str, session_id: &str, slot: u16, creator_json: &str, wire_hex: &str) -> Result<String, JsError> {
+        self.join_open_impl(vault_hex, session_id, slot, creator_json, wire_hex)
+            .map_err(|e| JsError::new(&e))
+    }
+
     /// Enable only a previously approved pair, or the pair whose independently obtained
     /// fingerprint the member just confirmed. The worker reauthenticates that consent.
     #[wasm_bindgen(js_name = setNonceWitnesses)]
@@ -928,6 +945,38 @@ struct VaultState {
 /// owns `backup.sealed` beside them.
 fn vault_dir(vault_hex: &str) -> String {
     format!("loki/vaults/{vault_hex}/signer")
+}
+
+enum StoredVault {
+    Absent,
+    Restored(BackupArtifact),
+    Pending,
+    Confirmed,
+}
+
+fn stored_vault(dir: &str) -> Result<StoredVault, String> {
+    let meta = opfs_get(&format!("{dir}/signer.meta"))?.is_some();
+    let share = opfs_get(&format!("{dir}/share.sealed"))?.is_some();
+    if let Some(bytes) = opfs_get(&format!("{dir}/backup.sealed"))? {
+        // DKG does not save a backup until it has a share. A same-ID join interrupted
+        // before then may have left metadata beside the original restored backup.
+        if !meta || !share {
+            return Ok(StoredVault::Restored(BackupArtifact(bytes)));
+        }
+    }
+    let roster = opfs_get(&format!("{dir}/roster.sealed"))?.is_some();
+    if meta {
+        return Ok(if roster { StoredVault::Confirmed } else { StoredVault::Pending });
+    }
+    for file in ["identity.sealed", "setup.sealed", "recovery.backup"] {
+        if opfs_get(&format!("{dir}/{file}"))?.is_some() {
+            return Err("incomplete vault data exists; preserve it before retrying setup".into());
+        }
+    }
+    if roster || share {
+        return Err("incomplete vault data exists; preserve it before retrying setup".into());
+    }
+    Ok(StoredVault::Absent)
 }
 
 /// The deterministic file set the Worker pre-opens (for write) before a DKG call, mirroring
@@ -1409,6 +1458,40 @@ impl Signer {
         Ok(hex::encode(sealed))
     }
 
+    /// This member as `slot`, the creator, and the join exchange's context on `session_id`.
+    fn join_parties(&self, vault_hex: &str, session_id: &str, slot: u16, creator_json: &str)
+        -> Result<(Identity, PublicIdentity, SessionContext), String>
+    {
+        let identity = self.identity.as_ref().ok_or("unlock the signer first")?;
+        let creator: serde_json::Value = serde_json::from_str(creator_json).map_err(|e| e.to_string())?;
+        if creator["id"] != 1 {
+            return Err("the invite's creator is not member 1".into());
+        }
+        let creator = PublicIdentity {
+            id: 1,
+            signing: hex32(creator["signing"].as_str().ok_or("creator signing key")?)?,
+            encryption: hex32(creator["encryption"].as_str().ok_or("creator encryption key")?)?,
+        };
+        let session = uuid::Uuid::parse_str(session_id).map_err(|e| e.to_string())?;
+        let context = SessionContext::control(hex32(vault_hex)?, session, 1, slot);
+        Ok((restamp(identity, slot)?, creator, context))
+    }
+
+    fn join_seal_impl(&self, vault_hex: &str, session_id: &str, slot: u16, creator_json: &str, body_json: &str) -> Result<String, String> {
+        let (me, creator, context) = self.join_parties(vault_hex, session_id, slot, creator_json)?;
+        let sealed = SealedPeer::seal_join(&me, &creator, &context, body_json.as_bytes())?;
+        Ok(hex::encode(Outbound::Peer(sealed).to_bytes().map_err(|e| e.to_string())?))
+    }
+
+    fn join_open_impl(&self, vault_hex: &str, session_id: &str, slot: u16, creator_json: &str, wire_hex: &str) -> Result<String, String> {
+        let (me, creator, context) = self.join_parties(vault_hex, session_id, slot, creator_json)?;
+        let opened = me.open_session(&creator, &context, &hex::decode(wire_hex).map_err(|e| e.to_string())?)?;
+        if opened.kind() != MessageKind::PeerReply {
+            return Err("not the creator's join reply".into());
+        }
+        String::from_utf8(opened.body().to_vec()).map_err(|e| e.to_string())
+    }
+
     fn sign_approve_impl(
         &mut self,
         attempt_hex: &str,
@@ -1479,23 +1562,22 @@ impl Signer {
         let vault_id = hex32(vault_hex)?;
         let prompts = browser_prompts(&dir, &kek, vault_id, None, None, self.approved.clone());
         let se = SoftwareSecureElement::from_kek(*kek);
-        let mut signer = if opfs_exists(&format!("{dir}/signer.meta")) {
-            LocalSigner::open(std::path::Path::new(&dir), se, "vault".into(), prompts)
-                .map_err(|e| e.to_string())?
-        } else if let Some(sealed) = opfs_get(&format!("{dir}/backup.sealed"))? {
-            // A member restored from its recovery words (`restoreSigner`): no DKG files, only
-            // the backup, re-sealed under this browser's KEK. Rebuilt on every open, with its
-            // nonces in the same `nonces/` dir at the restore epoch.
-            let artifact = BackupArtifact(sealed);
-            let pass = hex::encode(*kek);
-            let roster = backup::verify(&artifact, &pass, &vault_id)?.roster;
-            let nonces = std::path::PathBuf::from(format!("{dir}/nonces"));
-            let mut signer = backup::restore(&artifact, &pass, &vault_id, se, nonces, prompts.approval)
-                .map_err(|e| e.to_string())?;
-            signer.adopt_restored_roster(&roster, prompts.connect).map_err(|e| e.to_string())?;
-            signer
-        } else {
-            return Err("this browser holds no signer for that vault".into());
+        let mut signer = match stored_vault(&dir)? {
+            StoredVault::Pending | StoredVault::Confirmed =>
+                LocalSigner::open(std::path::Path::new(&dir), se, "vault".into(), prompts)
+                    .map_err(|e| e.to_string())?,
+            StoredVault::Restored(artifact) => {
+                // Restore re-seals the backup under this browser's KEK. Rebuild with the
+                // same nonce directory and restore epoch every time.
+                let pass = hex::encode(*kek);
+                let roster = backup::verify(&artifact, &pass, &vault_id)?.roster;
+                let nonces = std::path::PathBuf::from(format!("{dir}/nonces"));
+                let mut signer = backup::restore(&artifact, &pass, &vault_id, se, nonces, prompts.approval)
+                    .map_err(|e| e.to_string())?;
+                signer.adopt_restored_roster(&roster, prompts.connect).map_err(|e| e.to_string())?;
+                signer
+            }
+            StoredVault::Absent => return Err("this browser holds no signer for that vault".into()),
         };
         let net = browser_network(signer.network())?;
         let session = signer
@@ -1560,6 +1642,7 @@ impl Signer {
         let net = parse_network(network)?;
         let recovery = self.recovery_recipient()?.ok_or("confirm your recovery words before joining a vault")?;
         let stamped = restamp(identity, slot)?;
+        let own = stamped.public();
         let dir = vault_dir(vault_hex);
         let se = SoftwareSecureElement::from_kek(*kek);
         let prompts = browser_prompts(
@@ -1571,10 +1654,10 @@ impl Signer {
             self.approved.clone(),
         );
         let path = std::path::Path::new(&dir);
-        let mut signer = if opfs_exists(&format!("{dir}/signer.meta")) {
-            LocalSigner::open(path, se, label.to_string(), prompts)
-        } else {
-            LocalSigner::create_with_identity(
+        let mut signer = match stored_vault(&dir)? {
+            StoredVault::Restored(_) => return Err("this vault is already restored; open it instead of joining".into()),
+            StoredVault::Pending | StoredVault::Confirmed => LocalSigner::open(path, se, label.to_string(), prompts),
+            StoredVault::Absent => LocalSigner::create_with_identity(
                 path,
                 se,
                 net,
@@ -1583,12 +1666,17 @@ impl Signer {
                 label.to_string(),
                 prompts,
                 stamped,
-            )
+            ),
         }
         .map_err(|e| e.to_string())?;
         let connection = signer
             .connect("https://coordinator", net, b"browser dkg")
             .map_err(|e| e.to_string())?;
+        if connection.member.id != slot || connection.member.signing != own.signing
+            || connection.member.encryption != own.encryption
+        {
+            return Err("join request does not match this vault's local member".into());
+        }
         let session = connection.session;
         let existing = signer.list_vaults(&session).map_err(|e| e.to_string())?;
         let vref = if existing.is_empty() {
@@ -1596,7 +1684,15 @@ impl Signer {
                 .dkg_begin(&session, roster)
                 .map_err(|e| e.to_string())?
         } else {
-            existing.into_iter().next().expect("non-empty")
+            let vref = existing.into_iter().next().expect("non-empty");
+            let stored = signer.confirmed_roster().ok_or("vault has no confirmed roster")?;
+            let incoming = Roster::from_bytes(roster).map_err(|e| e.to_string())?;
+            if vref.vault_id != vault_id || stored.fingerprint() != incoming.fingerprint()
+                || local::roster_code(&stored.fingerprint()) != confirmed_code
+            {
+                return Err("join request does not match this vault's confirmed roster".into());
+            }
+            vref
         };
         let out = vault_ref_json(&vref);
         self.vault = Some(VaultState {

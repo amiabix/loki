@@ -266,11 +266,11 @@ pub(crate) fn status(data: &Path, development_http: bool) -> Value {
     reply
 }
 
-pub(crate) fn restore_running(words: Zeroizing<Vec<u8>>, file: &Path) -> Result<(), &'static str> {
+pub(crate) fn restore_running(words: Zeroizing<Vec<u8>>, file: &Path, fingerprint: &str) -> Result<(), &'static str> {
     let member = RUNNING.lock().map_err(|_| super::native_recovery::REFUSED)?.clone()
         .filter(|member| !member.state.is_stopping())
         .ok_or(super::native_recovery::LOCKED)?;
-    super::native_recovery::restore_running(&member.state, words, file)
+    super::native_recovery::restore_running(&member.state, words, file, fingerprint)
 }
 
 /// Authenticates only a request constructed here, not a header or an HTTP caller.
@@ -319,8 +319,9 @@ pub(crate) fn wallet_request(path: &str, body: Option<Value>, export: bool) -> V
         let mut builder = Request::builder().uri(format!("/api/{path}")).extension(InProcess(()));
         let body = match body {
             Some(body) if body.is_object() => {
-                if path == "join" && !ceremony::embedded_invite_target(&member.state.config, &body) {
-                    return Err((StatusCode::BAD_REQUEST, "invite does not name an allowed HTTPS peer"));
+                if path == "join" {
+                    ceremony::embedded_invite_target(&member.state.config, &body)
+                        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
                 }
                 builder = builder.method(Method::POST).header(header::CONTENT_TYPE, "application/json");
                 Body::from(body.to_string())

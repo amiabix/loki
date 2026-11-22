@@ -438,11 +438,12 @@ pub struct AppState {
     pub(super) stopping: watch::Sender<bool>,
     // Lock and activation both modify session state under the session write lock.
     pub(super) session_generation: AtomicU64,
-    pub(super) pending_recovery: std::sync::Mutex<Option<Vec<u8>>>,
     pub ceremony: std::sync::Mutex<()>,
     pub payment: std::sync::Mutex<()>,
     pub active_payments: std::sync::Mutex<BTreeSet<String>>,
     pub active_dkgs: std::sync::Mutex<BTreeSet<String>>,
+    /// The creator's frostd loop answering joiners is running (`ceremony::spawn_join_relay`).
+    pub(super) join_relay: std::sync::atomic::AtomicBool,
     /// Device login registry, built lazily from `data/recovery.pub` + `data/devices.json` once
     /// a recovery identity exists. Holds outstanding challenges in-process across requests.
     pub(super) device_auth: std::sync::Mutex<Option<super::device::DeviceState>>,
@@ -472,11 +473,11 @@ impl AppState {
             session: RwLock::new(None),
             stopping: watch::Sender::new(false),
             session_generation: AtomicU64::new(0),
-            pending_recovery: std::sync::Mutex::new(None),
             ceremony: std::sync::Mutex::new(()),
             payment: std::sync::Mutex::new(()),
             active_payments: std::sync::Mutex::new(BTreeSet::new()),
             active_dkgs: std::sync::Mutex::new(BTreeSet::new()),
+            join_relay: std::sync::atomic::AtomicBool::new(false),
             device_auth: std::sync::Mutex::new(None),
             approval: None,
             notice: None,
@@ -500,18 +501,23 @@ impl AppState {
         self.session_generation.load(Ordering::Acquire)
     }
 
-    pub(super) async fn activate_session(&self, generation: u64, session: Session) -> bool {
+    pub(super) async fn activate_session(self: &std::sync::Arc<Self>, generation: u64, session: Session) -> bool {
         let mut current = self.session.write().await;
         if self.session_generation() != generation || self.is_stopping() { return false; }
         crate::seal_kdf::enable_session_cache(&session.passphrase);
+        let waiting = !super::ceremony::waiting_for_joiners(&session.data, &session.passphrase).is_empty();
         *current = Some(session);
+        drop(current);
+        // A creator restarted mid-setup answers joiners again without anyone opening the vault.
+        if waiting {
+            super::ceremony::spawn_join_relay(self);
+        }
         true
     }
 
     pub(super) async fn lock_session(self: &std::sync::Arc<Self>) {
         let mut current = self.session.write().await;
         *current = None;
-        if let Ok(mut pending) = self.pending_recovery.lock() { *pending = None; }
         if let Some(tabs) = &self.wallet_tabs { tabs.revoke_all(); }
         crate::seal_kdf::clear_session_cache();
         self.session_generation.fetch_add(1, Ordering::Release);

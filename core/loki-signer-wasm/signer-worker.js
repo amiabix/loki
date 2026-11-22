@@ -125,10 +125,36 @@ async function poll(fn, p) {
   throw lastErr ?? new Error("ceremony step timed out");
 }
 
-// Decode a creator invite and run the native joiner dance against the creator's member app
+// One join request to the creator over frostd, as native joiners send it (ceremony.rs
+// `relay_request`): a session of this member and the creator, the request sealed to the creator
+// in wasm (the invite token never crosses the relay in the clear), and the creator's sealed reply.
+async function relayRequest(signer, fc, invite, op) {
+  const { vault, slot, token, creator } = invite;
+  const creatorJson = JSON.stringify(creator);
+  const sessionId = await fc.openSession([signer.frostdPubkey(), creator.encryption]);
+  try {
+    await fc.sendToPeer(creator.encryption, signer.joinSeal(vault, sessionId, slot, creatorJson, JSON.stringify({ op, vault, slot, token })));
+    for (let i = 0; i < 40; i++) {
+      await sleep(250);
+      for (const m of JSON.parse(await fc.recv())) {
+        if (m.from !== creator.encryption) continue;
+        let reply;
+        try { reply = JSON.parse(signer.joinOpen(vault, sessionId, slot, creatorJson, m.message)); } catch { continue; }
+        if (reply.error) throw new Error(reply.error);
+        return reply;
+      }
+    }
+    throw new Error("the creator did not answer over frostd");
+  } finally {
+    await fc.close().catch(() => {});
+  }
+}
+
+// Decode a creator invite and run the native joiner dance with the creator's member app
 // (core/src/host/ceremony.rs: enroll → poll roster → agree → poll session), then hand the
-// assembled DKG params to driveDkg. The four endpoints are token-authenticated member-to-member
-// calls the creator CORS-opens for browser joiners (routes.rs `browser_origin`). The setup
+// assembled DKG params to driveDkg. An invite naming the creator's identity goes over frostd
+// (relayRequest); an older one POSTs the token-authenticated endpoints the creator CORS-opens
+// for browser joiners (routes.rs `browser_origin`). The setup
 // document the creator feeds its own dkg_begin is rebuilt here from the polled roster — the
 // roster fingerprint is over PARSED content (member_state::Roster::fingerprint), so field/byte
 // order is irrelevant and only the values must match.
@@ -142,11 +168,16 @@ async function joinCeremony(signer, p) {
   // restamp only overwrites the id bytes) stamped with the slot id. Needs the signer unlocked.
   const material = JSON.parse(signer.enrollMaterial());
   const identity = { id: slot, signing: material.signing_pubkey, encryption: material.relay_pubkey };
-  await postJson(`${base}/api/enroll`, { vault, slot, token, identity });
+  const auth = { vault, slot, token };
+  const frostdUrl = p.frostdUrl ?? invite.frostd_url;
+  const fc = invite.creator ? await frostdClient(signer, { frostdUrl }) : null;
+  const request = (op) => fc
+    ? relayRequest(signer, fc, invite, op)
+    : postJson(`${base}/api/${op}`, op === "enroll" ? { ...auth, identity } : auth);
+  await request("enroll");
 
   // Poll until the full roster is published (fingerprint present).
-  const auth = { vault, slot, token };
-  const rosterResp = await poll(() => postJson(`${base}/api/roster`, auth), p);
+  const rosterResp = await poll(() => request("roster"), p);
   const roster = rosterResp.roster;
 
   // The creator must not have swapped our slot's identity.
@@ -173,10 +204,10 @@ async function joinCeremony(signer, p) {
   }
 
   // Agree, then poll for the creator's frostd session + coordinator relay peer (+ birth_height).
-  await postJson(`${base}/api/agreed`, auth);
+  await request("agreed");
   const session = await poll(
     () =>
-      postJson(`${base}/api/session`, auth).then((s) =>
+      request("session").then((s) =>
         s.session_id && s.coordinator_peer && (network !== "testnet" || s.birth_height != null)
           ? s
           : Promise.reject(new Error("session pending"))),
@@ -204,7 +235,7 @@ async function joinCeremony(signer, p) {
     network,
     rosterHex,
     birthHeight: doc.birth_height,
-    frostdUrl: p.frostdUrl,
+    frostdUrl,
     sessionId: session.session_id,
     coordinatorPeer: session.coordinator_peer,
     pollMs: p.pollMs,
@@ -681,7 +712,7 @@ async function drivePayment(signer, p, witnessPinsPath) {
   // member sees those terms on the signer page first; declining sends nothing.
   let group = activeGroup({ notice: announced, start }, vault.slot);
   if (!group) {
-    if (!await ask("payment-terms", terms)) throw new Error("You declined this payment request");
+    if (!await ask("payment-terms", { ...terms, vaultHex, attemptHex })) throw new Error("You declined this payment request");
     group = await refresh();
     if (!group) {
       const approval = JSON.stringify({ kind: "approval", hash: announced.hash, intent: terms, txid: null });
@@ -735,7 +766,7 @@ async function drivePayment(signer, p, witnessPinsPath) {
   const review = JSON.parse(signer.paymentCheck(candidateHex, JSON.stringify({ ...terms, tx_expiry: expiry })));
   const txid = reviewedTxid(review);
   if (record.txid && record.txid !== txid) throw new Error("this attempt already has different reviewed effects");
-  const consent = await ask("payment-sign", review);
+  const consent = await ask("payment-sign", { ...review, vaultHex, attemptHex });
   if (!consent) throw new Error("You declined to sign this payment");
   await refresh();
   signer.reauth(consent.method, consent.passphrase, consent.prfSecret);
@@ -852,10 +883,15 @@ self.onmessage = async (e) => {
       case "payment-status":
         result = await paymentStatus(signer, payment);
         break;
-      case "address":
-        await openVault(signer, payment.vaultHex);
-        result = signer.vaultAddress();
+      case "address": {
+        const vaultHex = await vaultPathId(payment.vaultHex);
+        // A receive-address lookup must not create files for a missing vault.
+        for (const path of JSON.parse(vaultPaths(vaultHex))) await opfsPreopenRead(path);
+        const vault = JSON.parse(signer.vaultOpen(vaultHex));
+        if (!vault.ready) throw new Error("this vault is not active yet");
+        result = { vault: vault.vault_id, network: vault.network, address: signer.vaultAddress() };
         break;
+      }
       case "payment-approve":
         result = await drivePayment(signer, payment, P.witnessPins);
         break;

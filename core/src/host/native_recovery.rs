@@ -6,7 +6,7 @@ use serde::Deserialize;
 use zeroize::Zeroizing;
 
 use super::{ceremony::{self, RecoveryBackup}, recovery, registration::{self, PublicMember, RESTORE_PENDING}, state::{write_native_key_scope, Shared, NATIVE_KEY_SCOPE}, Config, FetchedConfig, RegistrationConfig};
-use crate::{setup_transport::{Identity, PublicIdentity}, signer::{recovery::RecoveryKey, Network}, state::MemberDir};
+use crate::{setup_transport::{Identity, PublicIdentity}, signer::{backup::BackupArtifact, recovery::RecoveryKey, Network}, state::MemberDir};
 #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
 use {super::state::{restored_key_tag, RESTORED_KEY}, crate::signer::secure_element_apple::{AppleSecureElement, KeyFailure}};
 
@@ -14,6 +14,7 @@ use {super::state::{restored_key_tag, RESTORED_KEY}, crate::signer::secure_eleme
 pub(crate) const REFUSED: &str = "restore-refused";
 pub(super) const LOCKED: &str = "profile-locked";
 const BAD_FILE: &str = "invalid-backup";
+const BAD_FINGERPRINT: &str = "backup-fingerprint-mismatch";
 const WRONG_PROFILE: &str = "wrong-profile";
 const ALREADY_PRESENT: &str = "vault-exists";
 const NOT_FRESH: &str = "profile-not-fresh";
@@ -23,7 +24,7 @@ const ROSTER_MISMATCH: &str = "roster-mismatch";
 #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
 const KEYCHAIN_STAGE: &str = "restore-keychain-stage";
 
-fn open_backup(file: &Path, words: Zeroizing<Vec<u8>>) -> Result<RecoveryBackup, &'static str> {
+fn open_backup(file: &Path, words: Zeroizing<Vec<u8>>, fingerprint: &str) -> Result<RecoveryBackup, &'static str> {
     const LIMIT: u64 = 256 * 1024;
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -40,10 +41,11 @@ fn open_backup(file: &Path, words: Zeroizing<Vec<u8>>) -> Result<RecoveryBackup,
     if export.vault.len() != 64 || !export.vault.bytes().all(is_hex) || !export.backup.bytes().all(is_hex) {
         return Err(BAD_FILE);
     }
-    let blob = hex::decode(export.backup).map_err(|_| BAD_FILE)?;
+    let artifact = BackupArtifact(hex::decode(export.backup).map_err(|_| BAD_FILE)?);
+    artifact.check_fingerprint(fingerprint).map_err(|_| BAD_FINGERPRINT)?;
     let key = RecoveryKey::from_words(std::str::from_utf8(&words).map_err(|_| REFUSED)?).map_err(|_| REFUSED)?;
     drop(words);
-    RecoveryBackup::open(&export.vault, key, blob).map_err(|_| REFUSED)
+    RecoveryBackup::open(&export.vault, key, artifact.0).map_err(|_| REFUSED)
 }
 
 /// Stage beside the destination so a same-filesystem rename is the only publication step.
@@ -283,9 +285,10 @@ pub(super) fn restored_slot(identity: &PublicIdentity, members: &[PublicMember])
 }
 
 pub(crate) fn restore_new(
-    config: &mut Config, pass: &str, words: Zeroizing<Vec<u8>>, file: &Path, origin: &str, fetched: Option<&FetchedConfig>,
+    config: &mut Config, pass: &str, words: Zeroizing<Vec<u8>>, file: &Path, fingerprint: &str,
+    origin: &str, fetched: Option<&FetchedConfig>,
 ) -> Result<(), &'static str> {
-    let backup = open_backup(file, words)?;
+    let backup = open_backup(file, words, fingerprint)?;
     if pass.is_empty() || config.registration.is_some() { return Err(REFUSED); }
     if profile_state(&config.data)? != "fresh" { return Err(NOT_FRESH); }
     let origin = registration::plain_origin(origin, config.development_http).map_err(|_| ROSTER_UNAVAILABLE)?;
@@ -333,8 +336,8 @@ pub(crate) fn restore_new(
     Ok(())
 }
 
-pub(super) fn restore_running(st: &Shared, words: Zeroizing<Vec<u8>>, file: &Path) -> Result<(), &'static str> {
-    let backup = open_backup(file, words)?;
+pub(super) fn restore_running(st: &Shared, words: Zeroizing<Vec<u8>>, file: &Path, fingerprint: &str) -> Result<(), &'static str> {
+    let backup = open_backup(file, words, fingerprint)?;
     let session = st.session.blocking_read();
     let session = session.as_ref().ok_or(LOCKED)?;
     let (data, pass) = (&session.data, &session.passphrase);

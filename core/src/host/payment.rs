@@ -410,7 +410,11 @@ fn relay_login(identity: &Identity) -> Result<FrostdLoginKey, String> {
     Ok(FrostdLoginKey::from_secret_bytes(secret))
 }
 
-fn payment_relay(st: &AppState, identity: &Identity, failure_notice: bool) -> Result<FrostdTransport, String> {
+pub(super) fn relay(identity: &Identity, url: &str) -> Result<FrostdTransport, String> {
+    FrostdTransport::new(url, relay_login(identity)?).map_err(|e| e.to_string())
+}
+
+pub(super) fn payment_relay(st: &AppState, identity: &Identity, failure_notice: bool) -> Result<FrostdTransport, String> {
     // Only refusal cleanup may use the relay during shutdown. Bound the whole submission
     // (including login and every recipient), never waiting for a peer to receive it.
     let (stop, deadline) = if st.config.native && failure_notice {
@@ -2733,10 +2737,6 @@ mod tests {
         NoteVersion,
     };
     use pasta_curves::pallas;
-
-    fn relay(identity: &Identity, url: &str) -> Result<FrostdTransport, String> {
-        FrostdTransport::new(url, relay_login(identity)?).map_err(|e| e.to_string())
-    }
 
     fn send_control(url: &str, v: &Vault, p: &Payment, kind: &str, slots: &[u16]) -> Result<(), String> {
         super::send_control(&state(Path::new("unused"), url), v, p, kind, slots)

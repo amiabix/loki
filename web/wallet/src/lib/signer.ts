@@ -93,7 +93,8 @@ export function chainPaymentSession(r: {
     signatures_received: confirmed,
     txid: confirmed ? r.spent?.txid : null,
     spent_by: confirmed ? null : r.spent?.txid ?? null,
-    approvals: r.signers.filter((slot) => slot !== r.slot || r.approved === true),
+    // The proposer supplies the signing list; only our own stored decision proves approval here.
+    approvals: r.approved === true && r.slot !== undefined ? [r.slot] : [],
     approval_requested: r.approved === true,
     intent: { proposer: r.terms.proposer, signers: r.signers, recipient: r.terms.recipient, amount_zat: r.terms.amount_zat, fee_zat: r.terms.fee_zat, open_approval: true },
   };
@@ -114,7 +115,7 @@ function signerOrigin(): string {
 const SEALED = "loki_signer_sealed"; // localStorage: a share exists in this browser (first-paint hint only)
 // Setup and signing can include several minutes of ceremony or user interaction. Chain reads
 // can also take longer on the first scan and resume from their last saved batch.
-const LONG_CALLS = new Set(["create", "unlock", "join", "payment-approve", "recovery-setup", "recovery-export", "restore", "remove", "chain", "payment-status"]);
+const LONG_CALLS = new Set(["create", "unlock", "join", "verify-address", "payment-approve", "recovery-setup", "recovery-export", "restore", "remove", "chain", "payment-status"]);
 
 let grant: string | undefined;
 export function onboardingGrant(): string | undefined {
@@ -235,6 +236,7 @@ function browserSigner(origin: string): SignerModule {
       if (path === "pending") return { pending: await call("pending", payment) } as T;
       if (path === "payment-review" || path === "payment-approve") return call<T>(path, payment);
       if (path === "address") return { address: await call<string>("address", payment) } as T;
+      if (path === "verify-address") return call<T>(path, payment);
       if (path === "balance" || path === "payments") {
         const scan = await call<{ balance_zat: string; history: ChainTx[]; chain_trust: "provider_reported" }>("chain", payment);
         return (path === "balance"
