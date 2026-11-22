@@ -11,6 +11,11 @@ final class WalletChannel {
     private let channel: FlutterMethodChannel
     private let signer: NativeSigner
     private let validLaunch: Bool
+    // At most one invite claim from an associated-domain link, held in memory only and never
+    // logged. It is bound to the pinned coordinator and slot and never invokes a wallet method.
+    private var claim: (code: String, coordinator: String, slot: Int)?
+    private static weak var current: WalletChannel?
+    private static var early: URL?
 
     init(messenger: FlutterBinaryMessenger, window: NSWindow) {
         channel = FlutterMethodChannel(name: "cash.loki/wallet", binaryMessenger: messenger)
@@ -25,12 +30,59 @@ final class WalletChannel {
         signer.promptChanged = { [weak channel] active in
             channel?.invokeMethod("nativePromptChanged", arguments: active)
         }
+        // Any end of an unlocked session drops a claim held for it. A link that arrives later,
+        // while locked, stays for the next explicit unlock.
+        signer.sessionEnded = { [weak self] in self?.claim = nil }
         channel.setMethodCallHandler { [weak self] call, result in
             DispatchQueue.main.async {
                 guard let self else { result(FlutterMethodNotImplemented); return }
                 self.handle(call, result: result)
             }
         }
+        Self.current = self
+        if let url = Self.early { Self.early = nil; _ = offer(url) }
+    }
+
+    /// The app delegate passes HTTPS links here, on cold launch or while running.
+    static func receive(_ url: URL) -> Bool {
+        guard let current else { early = url; return true }
+        return current.offer(url)
+    }
+
+    private func offer(_ url: URL) -> Bool {
+        #if LOKI_VISUAL_ONLY
+        return false
+        #else
+        guard validLaunch, let target = signer.pairedTarget,
+              let code = Self.inviteCode(url, origin: target.coordinator) else { return false }
+        claim = (code, target.coordinator, target.slot)
+        channel.invokeMethod("inviteArrived", arguments: nil)
+        return true
+        #endif
+    }
+
+    /// Only `https://<pinned coordinator>/#invite=<code>` is a claim. The query form, other hosts,
+    /// paths, credentials and extra fragment fields are ignored, like the web wallet does.
+    static func inviteCode(_ url: URL, origin: String) -> String? {
+        guard let link = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let pinned = URLComponents(string: origin),
+              link.scheme == "https", pinned.scheme == "https",
+              let host = link.host?.lowercased(), host == pinned.host?.lowercased(), link.port == pinned.port,
+              link.user == nil, link.password == nil, link.query == nil, link.path.isEmpty || link.path == "/",
+              let fragment = link.percentEncodedFragment, fragment.hasPrefix("invite="),
+              let code = String(fragment.dropFirst(7)).removingPercentEncoding,
+              (1...4096).contains(code.utf8.count),
+              code.utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || $0 == 45 || $0 == 95 })
+        else { return nil }
+        return code
+    }
+
+    /// Dart takes the claim once the profile is unlocked; a claim for another profile is dropped.
+    private func takeInvite() -> String? {
+        guard let held = claim, signer.walletReady else { return nil }
+        claim = nil
+        guard let target = signer.pairedTarget, target.coordinator == held.coordinator, target.slot == held.slot else { return nil }
+        return held.code
     }
 
     private static func launchArguments(_ arguments: ArraySlice<String>) -> [String]? {
@@ -38,7 +90,7 @@ final class WalletChannel {
         var flags: [String] = []
         var rest = arguments.makeIterator()
         while let option = rest.next() {
-            let supported = ["--data", "--port", "--peer-port", "--peer", "--advertise-url"]
+            let supported = ["--data", "--port", "--peer", "--peer-port", "--advertise-url"]
             if supported.contains(where: { option.hasPrefix($0 + "=") }) { return nil }
             if !supported.contains(option) { continue }
             guard let value = rest.next(), !value.isEmpty, !value.hasPrefix("--") else { return nil }
@@ -72,26 +124,33 @@ final class WalletChannel {
             if #available(macOS 26, *) { profile["liquid_glass"] = true }
             if profile["profile"] is String { result(profile) }
             else { result(failure(500, SignerStartFailure.dataFolderUnavailable.message)) }
+        case "pendingInvite":
+            guard noArgs else { result(invalid); return }
+            result(takeInvite())
         case "unlock", "pair", "restore", "recoverWalletKey":
-            let origin = args?["origin"] as? String
-            guard call.method == "pair" ? (origin != nil && args?.count == 1) : noArgs else { result(invalid); return }
+            let link = args?["link"] as? String
+            guard call.method == "pair" ? (link != nil && args?.count == 1) : noArgs else { result(invalid); return }
             guard validLaunch else { result(failure(400, "Invalid LokiSigner launch arguments.")); return }
             #if LOKI_VISUAL_ONLY
             result(failure(403, "This visual-only build cannot unlock, pair or restore a signer."))
             #else
+            // A new or restored profile must not inherit a claim bound to the old one.
+            if call.method != "unlock" { claim = nil }
             guard signer.beginWalletOperation({ error in
+                if error == .cancelled { self.claim = nil }
                 if let error {
                     let status = error == .cancelled ? 499 : (error == .unlock ? 401 : 400)
                     result(self.failure(status, error.message))
                 } else { result(nil) }
             }) else { result(busy); return }
-            if let origin { signer.pairWallet(origin: origin.trimmingCharacters(in: .whitespacesAndNewlines)) }
+            if let link { signer.pairWallet(link: link.trimmingCharacters(in: .whitespacesAndNewlines)) }
             else if call.method == "restore" { signer.restoreWallet() }
             else if call.method == "recoverWalletKey" { signer.recoverWalletKey() }
             else { signer.unlockWallet() }
             #endif
         case "lock":
             guard noArgs else { result(invalid); return }
+            claim = nil
             if !signer.lockWallet({ result(nil) }) { result(busy) }
         case "addresses":
             guard noArgs else { result(invalid); return }

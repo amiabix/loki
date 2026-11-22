@@ -9,7 +9,9 @@ abstract interface class WalletApi {
   Future<Json> profile();
   Future<Json> request(String path, [Json? body]);
   Future<void> unlock();
-  Future<void> pair(String origin);
+  Future<void> pair(String link);
+  // One invite link that opened this app, taken once after unlock; null when none.
+  Future<String?> pendingInvite();
   Future<void> restore();
   Future<void> lock();
   Future<List<Json>> addresses();
@@ -30,11 +32,17 @@ class MacWalletApi implements WalletApi {
       _channel.invokeMethod<String>('nativeNotice');
   Future<void> recoverWalletKey() => _channel.invokeMethod('recoverWalletKey');
 
-  void onNativePromptChanged(void Function(bool)? onChanged) {
+  void onNativePromptChanged(
+    void Function(bool)? onChanged, {
+    void Function()? onInvite,
+  }) {
     _channel.setMethodCallHandler(
       onChanged == null
           ? null
           : (call) async {
+              if (call.method == 'inviteArrived' && onInvite != null) {
+                return onInvite();
+              }
               if (call.method != 'nativePromptChanged') {
                 throw MissingPluginException();
               }
@@ -53,8 +61,17 @@ class MacWalletApi implements WalletApi {
   @override
   Future<void> unlock() => _channel.invokeMethod('unlock');
   @override
-  Future<void> pair(String origin) =>
-      _channel.invokeMethod('pair', {'origin': origin});
+  Future<void> pair(String link) =>
+      _channel.invokeMethod('pair', {'link': link});
+  @override
+  Future<String?> pendingInvite() async {
+    try {
+      return await _channel.invokeMethod<String>('pendingInvite');
+    } on MissingPluginException {
+      return null;
+    }
+  }
+
   @override
   Future<void> restore() => _channel.invokeMethod('restore');
   @override

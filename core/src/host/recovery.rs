@@ -1,4 +1,4 @@
-//! Member host wiring for the native-signer recovery flow.
+//! Member host wiring for local recovery and wallet-safe backup export.
 //!
 //! Establishes the member's recovery identity (24 words shown ONCE; only the PUBLIC keys are
 //! persisted) and serves the independent recovery backup blob. Each per-vault backup is HPKE
@@ -8,15 +8,11 @@
 //! public key the signer seals to, and hands the stored blob back for a restore.
 
 use std::fs;
-use std::io::Write;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
-use axum::{
-    extract::{Query, State},
-    http::StatusCode,
-    Json,
-};
-use serde_json::{json, Value};
+use axum::{extract::{Query, State}, http::StatusCode};
+use serde_json::json;
 use std::collections::BTreeMap;
 use zeroize::Zeroizing;
 
@@ -206,57 +202,81 @@ pub(super) fn confirm_recovery(data: &Path, pass: &str, notice: &super::LocalNot
     adopt_recovery(data, &key, pass)
 }
 
-pub(super) async fn in_app_only() -> Reply {
-    err(StatusCode::FORBIDDEN, "Manage recovery words and restore vaults in LokiSigner.")
+/// Neither wallet route extracts a body, even when it contains invalid JSON.
+pub(super) async fn local_only(State(st): State<Shared>) -> Reply {
+    let message = if st.config.native {
+        "Manage recovery words and restore vaults in LokiSigner."
+    } else {
+        "Stop the member app and run loki_member_app recovery-setup or recovery-restore in its terminal."
+    };
+    err(StatusCode::FORBIDDEN, message)
 }
 
-/// Headless only: `{}` begins setup; `{ "words": ... }` confirms the words saved by the member.
-/// Keep only pending public keys in memory, so a lost response or restart cannot activate them.
-pub(super) async fn setup(State(st): State<Shared>, Json(mut body): Json<Value>) -> Reply {
-    let (data, pass) = {
-        let session = st.session.read().await;
-        let Some(session) = session.as_ref() else {
-            return err(StatusCode::UNAUTHORIZED, "unlock before setting up recovery");
-        };
-        let Ok(mut pending) = st.pending_recovery.lock() else {
-            return err(StatusCode::INTERNAL_SERVER_ERROR, "recovery setup unavailable");
-        };
-        if body.as_object().is_some_and(|fields| fields.is_empty()) {
-            match pubkey_file(&session.data).try_exists() {
-                Ok(false) => (),
-                Ok(true) => return err(StatusCode::CONFLICT, "a recovery identity is already established"),
-                Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+pub(super) fn terminal_notice() -> super::LocalNotice {
+    std::sync::Arc::new(|_, words| {
+        println!("Save these 24 recovery words privately (shown once):\n{words}\nType YES and press Enter after saving them.");
+        let mut answer = Zeroizing::new(String::new());
+        io::stdin().read_line(&mut answer).is_ok() && answer.trim() == "YES"
+    })
+}
+
+/// The HTTP process and offline commands must not write the same member data concurrently.
+pub(super) fn lock_headless_data(data: &Path) -> Result<fs::File, String> {
+    if !data.try_exists().map_err(|e| e.to_string())? {
+        MemberDir::create(data, "").map_err(|e| e.to_string())?;
+    }
+    let file = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+        .open(data.join("member-app.lock")).map_err(|e| e.to_string())?;
+    file.try_lock().map_err(|e| format!("could not lock member data; stop the running member app first: {e}"))?;
+    Ok(file)
+}
+
+/// One-shot recovery commands. No HTTP listener or wallet session exists in this process.
+pub fn run_recovery_command(args: &[String]) -> Result<(), String> {
+    let (command, flags) = args.split_first().ok_or("missing recovery command")?;
+    let mut config_args = flags.to_vec();
+    config_args.extend(["--port".into(), "0".into()]);
+    let config = super::config_from_args(&config_args)?;
+    config.validate_secure_element()?;
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err("run recovery in a private interactive terminal, without pipes or logs".into());
+    }
+    let data = &config.data;
+    if !crate::profile::exists(data) {
+        return Err("create a member profile before running recovery".into());
+    }
+    let _lock = lock_headless_data(data)?;
+    let prompt = |label| rpassword::prompt_password(label).map(Zeroizing::new).map_err(|e| e.to_string());
+    let pass = prompt("Profile passphrase: ")?;
+    crate::profile::open(data, &pass)?;
+    match command.as_str() {
+        "recovery-setup" => {
+            if exists(data) && !data.join("recovery.confirmed").try_exists().map_err(|e| e.to_string())? {
+                let words = prompt("Original 24 recovery words (hidden): ")?;
+                let key = RecoveryKey::from_words(&words)?;
+                adopt_recovery(data, &key, &pass)?;
+            } else {
+                confirm_recovery(data, &pass, &terminal_notice())?;
             }
-            return match RecoveryKey::generate() {
-                Ok((words, key)) => {
-                    *pending = Some(public_keys(&key));
-                    ok(json!({ "words": words.as_str() }))
-                }
-                Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
-            };
+            seal_missing_backups(data, &pass)?;
+            println!("Recovery is configured.");
         }
-        let Some(Value::String(words)) = body.as_object_mut().and_then(|fields| fields.remove("words")) else {
-            return err(StatusCode::BAD_REQUEST, "provide the saved recovery words to confirm setup");
-        };
-        let key = match RecoveryKey::from_words(&Zeroizing::new(words)) {
-            Ok(key) => key,
-            Err(e) => return err(StatusCode::BAD_REQUEST, e),
-        };
-        match check_recovery(&session.data, &key) {
-            Ok(true) if pending.as_ref() != Some(&public_keys(&key)) => {
-                return err(StatusCode::CONFLICT, "these words are not pending; begin recovery setup again");
-            }
-            Ok(_) => (),
-            Err(e) => return err(StatusCode::CONFLICT, e),
+        "recovery-restore" => {
+            #[derive(serde::Deserialize)]
+            struct Export { vault: String, backup: String }
+            let option = |name| flags.iter().position(|arg| arg == name).and_then(|i| flags.get(i + 1));
+            let file = option("--backup").ok_or("--backup <export.json> is required")?;
+            let fingerprint = option("--fingerprint").ok_or("--fingerprint <sha256> from the original signer is required")?;
+            let export: Export = serde_json::from_reader(fs::File::open(file).map_err(|e| e.to_string())?)
+                .map_err(|_| "invalid recovery backup file")?;
+            let backup = hex::decode(export.backup.trim()).map_err(|_| "backup must be hex")?;
+            let words = prompt("24 recovery words (hidden): ")?;
+            super::ceremony::restore_vault_from_backup(data, &export.vault, &words, Some(&backup), Some(fingerprint), &pass, &config)?;
+            println!("Vault restored.");
         }
-        if let Err(e) = adopt_recovery(&session.data, &key, &session.passphrase) {
-            return err(StatusCode::INTERNAL_SERVER_ERROR, e);
-        }
-        *pending = None;
-        (session.data.clone(), session.passphrase.clone())
-    };
-    let _ = tokio::task::spawn_blocking(move || seal_missing_backups_logged(&data, &pass)).await;
-    ok(json!({ "confirmed": true }))
+        _ => return Err("unknown recovery command".into()),
+    }
+    Ok(())
 }
 
 /// GET /api/recovery-status — whether a recovery identity exists and whether this vault has a
@@ -301,38 +321,4 @@ pub(super) async fn fetch(
         }
         Err(_) => err(StatusCode::NOT_FOUND, "no recovery backup for this vault"),
     }
-}
-
-/// Headless only: POST /api/recovery-restore { vault, words, backup? } — rebuild this member's vault from a
-/// recovery backup using the 24 words. `backup` is the hex blob exported with
-/// `GET /api/recovery-backup`, needed on a new device; without it the stored blob is used.
-/// Requires an unlocked session (the restored vault is sealed under the profile passphrase).
-pub(super) async fn restore(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
-    let (data, pass) = {
-        let session = st.session.read().await;
-        match session.as_ref() {
-            Some(s) => (s.data.clone(), s.passphrase.clone()),
-            None => return err(StatusCode::UNAUTHORIZED, "unlock before restoring"),
-        }
-    };
-    let (Some(vault), Some(words)) = (
-        body.get("vault").and_then(Value::as_str),
-        body.get("words").and_then(Value::as_str),
-    ) else {
-        return err(StatusCode::BAD_REQUEST, "missing vault or words");
-    };
-    let backup = match body.get("backup").and_then(Value::as_str).map(|b| hex::decode(b.trim())) {
-        None => None,
-        Some(Ok(blob)) => Some(blob),
-        Some(Err(_)) => return err(StatusCode::BAD_REQUEST, "backup must be hex"),
-    };
-    let (st, vault, words) = (st.clone(), vault.to_owned(), Zeroizing::new(words.to_owned()));
-    let fingerprint = body.get("fingerprint").and_then(Value::as_str).map(str::to_owned);
-    super::routes::blocking(move || {
-        let _restore = st.ceremony.lock().map_err(|e| e.to_string())?;
-        super::ceremony::restore_vault_from_backup(
-            &data, &vault, &words, backup.as_deref(), fingerprint.as_deref(), &pass, &st.config,
-        )?;
-        Ok(json!({ "restored": true }))
-    }).await
 }

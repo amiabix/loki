@@ -307,9 +307,6 @@ export async function fund(address: string): Promise<{ mined: boolean }> {
 export type RecoveryStatus = { recovery_identity: boolean; recovery_backup: boolean; recovery_in_app?: boolean };
 export function recoveryStatus(vault: string): Promise<RecoveryStatus> { return api(`recovery-status?vault=${vault}`); }
 export function recoveryBackup(vault: string): Promise<{ vault: string; backup: string; fingerprint?: string }> { return api(`recovery-backup?vault=${vault}`); }
-export function recoverySetup(): Promise<{ words: string }> { return api("recovery-setup", {}); }
-export function recoveryConfirm(words: string): Promise<{ confirmed: boolean }> { return api("recovery-setup", { words }); }
-export function recoveryRestore(vault: string, words: string, fingerprint?: string): Promise<{ restored: boolean }> { return api("recovery-restore", { vault, words, fingerprint }); }
 
 // The in-browser signer's recovery. The words are shown, re-typed and entered only on the
 // signer page; the wallet sees public results and the opaque backup ciphertext.

@@ -215,7 +215,7 @@ void main() {
     });
     expect(find.text('Set up vault'), findsOneWidget);
     await tap(tester, find.text('Copy invite'));
-    expect(copied, 'test-invite');
+    expect(copied, '${api.coordinator}/#invite=test-invite');
     expect(find.text('Invite copied'), findsOneWidget);
     expect(find.byType(SnackBar), findsNothing);
 
@@ -253,6 +253,20 @@ void main() {
     await tester.enterText(
       find.byType(TextField),
       'https://example.test/?invite=$code',
+    );
+    await tap(tester, find.text('Join vault'));
+    expect(find.text('Ops vault'), findsNothing);
+    expect(find.textContaining('no longer accepted'), findsOneWidget);
+    await tester.enterText(
+      find.byType(TextField),
+      'https://example.test/#invite=$code',
+    );
+    await tap(tester, find.text('Join vault'));
+    expect(find.text('Ops vault'), findsNothing);
+    expect(find.textContaining('only reads invite links'), findsOneWidget);
+    await tester.enterText(
+      find.byType(TextField),
+      '${api.coordinator}/#invite=$code',
     );
     await tester.pump();
     expect(find.text('Ops vault'), findsOneWidget);
@@ -518,7 +532,7 @@ void main() {
   );
 
   testWidgets(
-    'First launch sends only the entered origin to the native pairing flow',
+    'First launch sends only the entered pairing link to the native pairing flow',
     (tester) async {
       final api = FixtureWallet(running: false, fresh: true);
       await start(tester, api);
@@ -526,14 +540,15 @@ void main() {
       expect(find.text('TESTNET'), findsOneWidget);
       expect(find.text('Testnet funds only'), findsOneWidget);
       await tap(tester, find.text('Pair this Mac'));
-      expect(find.text('01 / 04'), findsOneWidget);
-      expect(api.pairOrigin, isNull);
-      const origin = 'https://other.example:8443';
-      await tester.enterText(find.byType(TextField), '  $origin  ');
+      expect(find.text('01 / 03'), findsOneWidget);
+      expect(api.pairLink, isNull);
+      const link =
+          'loki://pair?coordinator=https://other.example:8443&slot=2&challenge=one-use';
+      await tester.enterText(find.byType(TextField), '  $link  ');
       await tester.pump();
-      expect(api.pairOrigin, isNull);
+      expect(api.pairLink, isNull);
       await tap(tester, find.text('Continue'));
-      expect(api.pairOrigin, origin);
+      expect(api.pairLink, link);
       expect(find.text('All vaults'), findsWidgets);
       await tester.pumpWidget(const SizedBox());
     },

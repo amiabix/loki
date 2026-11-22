@@ -214,6 +214,14 @@ to the exact public HTTPS origin (no path, trailing slash or default port). This
 doesn't trust request-supplied forwarding headers to choose it. `WEB_PORT` defaults to
 `3011` to avoid the loopback test stack on `:3001`. frostd (`:2744`) supports concurrent sessions.
 
+Share vault invites as `/#invite=…`, never as `/?invite=…`. The wallet rejects the
+old query form before rendering. It cannot prevent the first request from reaching a
+proxy or its access logs: redact query strings at ingress and restrict existing logs
+that may contain invites. Treat tokens sent as query parameters as exposed. For an
+unfinished setup, stop using the affected ceremony and create a fresh vault ceremony
+with new tokens; merely changing `?` to `#` does not rotate a token. Keep any existing
+funded vault and its backups intact and investigate unexpected members with your group.
+
 ## Packaged member (`run-member.sh`)
 
 Testers run a member from an updated release binary with Bash, Python 3, and OpenSSL
@@ -222,8 +230,13 @@ Testers run a member from an updated release binary with Bash, Python 3, and Ope
 ```sh
 ssh -N -L 2744:localhost:2744 omarchy   # frostd must be reachable on loopback
 communication/deploy/run-member.sh https://<coordinator>.trycloudflare.com 1
-kill $(cat ./loki-member-1/pids)   # stop
+kill $(cat ./loki-state/member-1/pids)   # stop
 ```
+
+New launches default to the ignored, owner-only `loki-state/member-<slot>` under the
+repository root. For a member launched with the old default, keep its directory and
+passphrase together and set `DATA` to that existing directory before restarting (for
+example, `DATA=./loki-member-1` from the original working directory).
 
 Paste the private pairing link shown on the terminal into the wallet. Do not capture
 or share the link; the fragment authorizes the local API for the member process's lifetime.

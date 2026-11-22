@@ -44,10 +44,6 @@ test("confirmed members tolerate delayed confirmations, creator outages and pre-
       return result;
     };
     await api(existing ? "unlock" : "profile-create", { name: `Member ${slot}`, passphrase });
-    if (!existing) {
-      const { words } = await api("recovery-setup", {});
-      await api("recovery-setup", { words });
-    }
     return { child, api, port: Number(url.port) };
   }
   async function stop(member) {

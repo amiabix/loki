@@ -20,9 +20,6 @@ func loki_member_app_disconnect_wallet_tabs()
 @_silgen_name("loki_member_app_pairing_target")
 func loki_member_app_pairing_target(_ launch: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
 
-@_silgen_name("loki_member_app_pairing_link")
-private func loki_member_app_pairing_link(_ launch: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
-
 @_silgen_name("loki_member_app_configuration")
 func loki_member_app_configuration(_ launch: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
 
@@ -742,6 +739,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
     private weak var walletWindow: NSWindow?
     private var promptPage: SignerPromptPage?
     var promptChanged: ((Bool) -> Void)?
+    var sessionEnded: (() -> Void)?
     var walletNotice: String?
     private(set) var canRecoverWalletKey = false
     var nativePromptActive: Bool { promptPage != nil }
@@ -921,6 +919,12 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         return false
     }
 
+    var pairedTarget: (coordinator: String, slot: Int)? {
+        let saved = profile()
+        guard let origin = saved["coordinator"] as? String, let slot = (saved["slot"] as? NSNumber)?.intValue else { return nil }
+        return (origin, slot)
+    }
+
     func walletProfile() -> [String: Any] {
         var value = profile()
         value["running"] = walletReady
@@ -948,34 +952,14 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         start(nil)
     }
 
-    func pairWallet(origin: String) {
+    func pairWallet(link: String) {
         guard !running else { finishWalletOperation(.differentPairing); return }
         prompting = true
         let state = startupProfile()
         guard let profile = state["profile"] as? String else { retry(.dataFolderUnavailable, link: nil); return }
         if profile == "fresh", !canSetUp() { return }
-        let launch: [String: Any] = ["args": args, "restore_origin": origin]
-        let reply = nativeQuery(loki_member_app_pairing_target, launch)
-        guard let target = reply["target"] as? [String: Any], let coordinator = target["coordinator"] as? String,
-              coordinator.hasPrefix("https://") else { finishWalletOperation(.coordinatorOrigin); return }
-        let r = SignerReview.self
-        presentPrompt(SignerReview(section: "Signer setup · 02 / 04", title: "Confirm coordinator",
-            intro: "Compare this full HTTPS origin with the address your organizer gave you.", content: [
-                r.origin("First connection", coordinator, "No request has been sent."),
-                r.card("What Continue allows", [r.label("Request a member slot", weight: .semibold),
-                    r.label("This Mac contacts only the confirmed origin.", tone: r.muted),
-                    r.label("Review before pairing", weight: .semibold),
-                    r.label("You’ll see the returned slot and configuration before saving anything.", tone: r.muted)]),
-            ], hint: "This step does not pair the signer.", actions: ["Continue", "Cancel"], primary: 0)) { answer in
-            guard answer == .alertFirstButtonReturn else { self.finishWalletOperation(.cancelled); return }
-            DispatchQueue.global(qos: .userInitiated).async {
-                let reply = nativeQuery(loki_member_app_pairing_link, launch)
-                DispatchQueue.main.async {
-                    guard let link = reply["link"] as? String else { self.finishWalletOperation(.registrationRefused); return }
-                    self.loadConfiguration(link: link, approvedOrigin: coordinator)
-                }
-            }
-        }
+        guard let link = unusedPairingLink(link) else { finishWalletOperation(.invalidLink); return }
+        loadConfiguration(link: link)
     }
 
     func restoreWallet() {
@@ -1128,6 +1112,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
     }
 
     fileprivate func didLock() {
+        if ready { sessionEnded?() }
         ready = false
         vaultAddresses.setUnlocked(false)
     }
@@ -1241,7 +1226,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         }
     }
 
-    private func loadConfiguration(link: String?, approvedOrigin: String? = nil) {
+    private func loadConfiguration(link: String?) {
         var launch: [String: Any] = ["args": args]
         if let link = link {
             launch["pairing_url"] = link
@@ -1253,8 +1238,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
                 retry(different ? .differentPairing : .invalidLink, link: link)
                 return
             }
-            if let approvedOrigin, origin != approvedOrigin { retry(.invalidLink, link: link); return }
-            confirmCoordinator(origin, slot: slot, previouslyConfirmed: approvedOrigin != nil) { answer in
+            confirmCoordinator(origin, slot: slot) { answer in
                 guard answer == .alertFirstButtonReturn else { self.retry(.cancelled, link: link); return }
                 self.fetchConfiguration(link: link, launch: launch)
             }
@@ -1272,7 +1256,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         }
     }
 
-    private func confirmCoordinator(_ origin: String, slot: String? = nil, previouslyConfirmed: Bool = false,
+    private func confirmCoordinator(_ origin: String, slot: String? = nil,
                                     then: @escaping (NSApplication.ModalResponse) -> Void) {
         if embedded {
             let r = SignerReview.self
@@ -1280,8 +1264,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
             if let slot {
                 review = SignerReview(section: "Signer setup · 03 / 04", title: "Confirm member slot",
                     intro: "Check which slot this Mac will use.", content: [
-                        r.origin(previouslyConfirmed ? "Confirmed coordinator" : "Coordinator", origin,
-                                 previouslyConfirmed ? "This is the same origin you authorized." : "Only continue if this is the origin you intended."),
+                        r.origin("Coordinator", origin, "Only continue if this is the origin you intended."),
                         r.card("Returned slot", [r.label("Member \(slot)", size: 26, weight: .semibold, mono: true),
                             r.label("Continue to fetch the signer configuration. Nothing has been saved.", tone: r.muted)]),
                     ], hint: "Check the member slot before continuing.", actions: ["Continue", "Cancel"], primary: 0)
@@ -1606,8 +1589,10 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
                 input.file.withCString { file in
                     input.words.withUnsafeMutableBufferPointer { words in
                         input.pass.withUnsafeMutableBufferPointer { pass in
-                            recoveryError(loki_member_app_restore_profile(request, words.baseAddress, words.count,
-                                pass.baseAddress, pass.count, file, nativeNotice, nativeApprove, nativeConfirmRoster, nativeConnect))
+                            input.fingerprint.withCString { fingerprint in
+                                recoveryError(loki_member_app_restore_profile(request, words.baseAddress, words.count,
+                                    pass.baseAddress, pass.count, file, fingerprint, nativeNotice, nativeApprove, nativeConfirmRoster, nativeConnect))
+                            }
                         }
                     }
                 }
@@ -1644,7 +1629,9 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         DispatchQueue.global(qos: .userInitiated).async {
             let error = input.file.withCString { file in
                 input.words.withUnsafeMutableBufferPointer { words in
-                    recoveryError(loki_member_app_restore_vault(words.baseAddress, words.count, file))
+                    input.fingerprint.withCString { fingerprint in
+                        recoveryError(loki_member_app_restore_vault(words.baseAddress, words.count, file, fingerprint))
+                    }
                 }
             }
             DispatchQueue.main.async {
