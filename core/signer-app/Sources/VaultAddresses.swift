@@ -1,10 +1,10 @@
 import AppKit
 
 @_silgen_name("loki_member_app_vault_addresses")
-private func loki_member_app_vault_addresses() -> UnsafeMutablePointer<CChar>?
+func loki_member_app_vault_addresses() -> UnsafeMutablePointer<CChar>?
 
 @_silgen_name("loki_member_app_can_view_addresses")
-private func loki_member_app_can_view_addresses() -> Int32
+func loki_member_app_can_view_addresses() -> Int32
 
 private struct VaultAddressReply: Decodable {
     struct Vault: Decodable {
