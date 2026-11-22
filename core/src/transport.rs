@@ -8,12 +8,12 @@
 //! speaks its JSON contract directly; login proves possession of the [`FrostdLoginKey`]
 //! secret via XEdDSA over the server challenge (`frostd/src/functions.rs::login`).
 
-use std::time::Duration;
+use std::{future::{pending, Future}, time::Duration};
 
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
-use tokio::runtime::Runtime;
+use tokio::{runtime::Runtime, sync::watch, time::Instant};
 use uuid::Uuid;
 
 pub use loki_signer_core::transport::*;
@@ -80,6 +80,8 @@ pub struct FrostdTransport {
     me: Peer,
     login: FrostdLoginKey,
     token: Option<Uuid>,
+    stop: Option<watch::Receiver<bool>>,
+    deadline: Option<Instant>,
 }
 
 // Wire types mirrored from `frost_client::api` (frostd speaks these). Kept local so core
@@ -150,6 +152,15 @@ impl FrostdTransport {
     /// `base_url` like `http://127.0.0.1:2744` (or `https://…` with TLS in production,
     /// ws3 §6). Logs in with `login`.
     pub fn new(base_url: &str, login: FrostdLoginKey) -> Result<Self, TransportError> {
+        Self::with_limits(base_url, login, None, None)
+    }
+
+    pub(crate) fn with_limits(
+        base_url: &str,
+        login: FrostdLoginKey,
+        stop: Option<watch::Receiver<bool>>,
+        deadline: Option<Instant>,
+    ) -> Result<Self, TransportError> {
         let url = tls_url(base_url).map_err(TransportError::Http)?;
         if !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() {
             return Err(TransportError::Http("invalid relay base URL".into()));
@@ -167,9 +178,30 @@ impl FrostdTransport {
             me: login.peer(),
             login,
             token: None,
+            stop,
+            deadline,
         };
         t.login()?;
         Ok(t)
+    }
+
+    fn run<T>(&self, request: impl Future<Output = Result<T, TransportError>>) -> Result<T, TransportError> {
+        self.runtime.block_on(async {
+            tokio::select! {
+                biased;
+                _ = async {
+                    if let Some(mut stop) = self.stop.clone() {
+                        let _ = stop.wait_for(|stopped| *stopped).await;
+                    } else { pending::<()>().await; }
+                } => Err(TransportError::Http("profile is locked".into())),
+                _ = async {
+                    if let Some(deadline) = self.deadline {
+                        tokio::time::sleep_until(deadline).await;
+                    } else { pending::<()>().await; }
+                } => Err(TransportError::Http("failure notice deadline elapsed".into())),
+                result = request => result,
+            }
+        })
     }
 
     async fn post<O: for<'de> Deserialize<'de>>(
@@ -204,7 +236,7 @@ impl FrostdTransport {
         let client = self.client.clone();
         let secret = self.login.to_secret_bytes();
         let me = self.me.0;
-        let token = self.runtime.block_on(async move {
+        let token = self.run(async move {
             let ch: ChallengeOut =
                 Self::post(&client, format!("{base}/challenge"), None, json!({}), CONTROL_CAP).await?;
             let signing = xeddsa::xed25519::PrivateKey::from(&*secret);
@@ -235,7 +267,7 @@ impl FrostdTransport {
     /// behind NAT uses this to find the signing session a proposer enlisted it in without
     /// any inbound reachability (the relay keys sessions by participant pubkey).
     pub fn list_sessions(&self) -> Result<Vec<Uuid>, TransportError> {
-        let out: ListSessionsOut = self.runtime.block_on(Self::post(
+        let out: ListSessionsOut = self.run(Self::post(
             &self.client,
             format!("{}/list_sessions", self.base_url),
             self.token,
@@ -252,7 +284,7 @@ impl FrostdTransport {
     }
 
     pub fn session_details(&self, session: Uuid) -> Result<(Vec<[u8; 32]>, Option<[u8; 32]>), TransportError> {
-        let out: SessionInfoOut = self.runtime.block_on(Self::post(
+        let out: SessionInfoOut = self.run(Self::post(
             &self.client,
             format!("{}/get_session_info", self.base_url),
             self.token,
@@ -267,7 +299,7 @@ impl FrostdTransport {
     }
 
     fn receive(&self, session: Uuid, as_coordinator: bool, timeout: Duration) -> Result<Vec<Incoming>, TransportError> {
-        let out: ReceiveOut = self.runtime.block_on(async {
+        let out: ReceiveOut = self.run(async {
             tokio::time::timeout(timeout, Self::post(
                 &self.client,
                 format!("{}/receive", self.base_url),
@@ -292,7 +324,7 @@ impl Transport for FrostdTransport {
         let client = self.client.clone();
         let token = self.token;
         let pubkeys: Vec<String> = peers.iter().map(|p| hex::encode(p.0)).collect();
-        let out: CreateOut = self.runtime.block_on(Self::post(
+        let out: CreateOut = self.run(Self::post(
             &client,
             format!("{base}/create_new_session"),
             token,
@@ -323,7 +355,7 @@ impl Transport for FrostdTransport {
         let client = self.client.clone();
         let token = self.token;
         let recipients: Vec<String> = to.iter().map(|p| hex::encode(p.0)).collect();
-        self.runtime.block_on(Self::post::<serde_json::Value>(
+        self.run(Self::post::<serde_json::Value>(
             &client,
             format!("{base}/send"),
             token,
@@ -345,7 +377,7 @@ impl Transport for FrostdTransport {
         let base = self.base_url.clone();
         let client = self.client.clone();
         let token = self.token;
-        self.runtime.block_on(Self::post::<serde_json::Value>(
+        self.run(Self::post::<serde_json::Value>(
             &client,
             format!("{base}/close_session"),
             token,
@@ -359,6 +391,30 @@ impl Transport for FrostdTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stalled_relay_login_obeys_stop_or_the_cleanup_deadline() {
+        let stall = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", stall.local_addr().unwrap());
+        for cancel in [true, false] {
+            let (stop, listen) = watch::channel(false);
+            let cancel = cancel.then(|| std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                stop.send_replace(true);
+            }));
+            let start = Instant::now();
+            let transport = FrostdTransport::with_limits(&url, FrostdLoginKey::from_secret_bytes([7; 32]),
+                cancel.as_ref().map(|_| listen), cancel.is_none().then(|| start + Duration::from_millis(150)));
+            assert!(start.elapsed() < Duration::from_secs(2));
+            let expected = if let Some(worker) = cancel {
+                worker.join().unwrap();
+                "profile is locked"
+            } else {
+                "failure notice deadline elapsed"
+            };
+            assert!(transport.err().unwrap().to_string().contains(expected));
+        }
+    }
 
     #[test]
     fn relay_url_needs_tls_off_loopback() {

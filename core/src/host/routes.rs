@@ -156,6 +156,14 @@ async fn registration(State(st): State<Shared>) -> Reply {
 /// Require a device capability except for the native connect handshake (which is origin-
 /// and loopback-checked before reaching this middleware).
 async fn auth(State(st): State<Shared>, req: Request, next: Next) -> Result<Response, Response> {
+    if st.is_stopping() {
+        return Err(err(StatusCode::UNAUTHORIZED, "profile is locked").into_response());
+    }
+    // Only the embedded dispatcher can create this typed extension, never an HTTP client.
+    #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+    if st.config.native && req.extensions().get::<super::native_member::InProcess>().is_some() {
+        return Ok(next.run(req).await);
+    }
     if req.uri().path() == "/api/connect" && st.wallet_tabs.is_some() {
         return Ok(next.run(req).await);
     }
@@ -258,7 +266,16 @@ async fn status(
                 Ok(v) => v,
                 Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
             };
-            ok(json!({ "phase": "home", "network": network, "secure_element": secure_element, "profile": profile, "vaults": vaults }))
+            let mut reply = json!({ "phase": "home", "network": network, "secure_element": secure_element, "profile": profile, "vaults": vaults });
+            if st.config.native {
+                // Report the running signer's pinned identity, not registration or relay health.
+                if let (Some(active), Ok(pinned)) = (&st.config.registration, super::RegistrationConfig::resume(&session.data, false)) {
+                    if active.coordinator == pinned.coordinator && active.slot == pinned.slot {
+                        reply["paired_coordinator"] = json!(pinned.coordinator);
+                    }
+                }
+            }
+            ok(reply)
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
     }

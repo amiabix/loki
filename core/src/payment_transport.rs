@@ -142,6 +142,38 @@ where
     T::Error: std::fmt::Display,
     S::Error: std::fmt::Display,
 {
+    participate(
+        transport, channel, signer, session, candidate_ref, group_vk, own_id, params,
+        own, context, proposer, coordinator, other_signers, check_running, before_share, accept_candidate,
+        &|_| {},
+    )
+}
+
+/// The hosted signer can observe a round-two refusal locally before it becomes a string.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn participate<T: Transport, S: Signer>(
+    transport: &T,
+    channel: &T::Channel,
+    signer: &mut S,
+    session: &Session,
+    candidate_ref: &CandidateRef,
+    group_vk: &frost::keys::PublicKeyPackage,
+    own_id: frost::Identifier,
+    params: &PublicPaymentParams,
+    own: &Identity,
+    context: &SessionContext,
+    proposer: &PublicIdentity,
+    coordinator: &PublicIdentity,
+    other_signers: &[PublicIdentity],
+    check_running: &dyn Fn() -> Result<(), String>,
+    before_share: &dyn Fn() -> Result<(), String>,
+    accept_candidate: &mut dyn FnMut(&[u8]) -> Result<(), String>,
+    on_sign_refusal: &dyn Fn(&S::Error),
+) -> Result<(), RoundError>
+where
+    T::Error: std::fmt::Display,
+    S::Error: std::fmt::Display,
+{
     use MessageKind::*;
     context.validate()?;
     let own_slot = own.public().id;
@@ -206,6 +238,7 @@ where
     }
     check_running()?;
     let share = signer.sign_approve(session, candidate_ref, params, candidate_bytes, &package, &seed)
+        .inspect_err(on_sign_refusal)
         .map_err(|e| format!("sign_approve: {e}"))?;
     before_share()?;
     Ok(send(transport, channel, own, coordinator, context, HostedShare, &share.serialize())?)

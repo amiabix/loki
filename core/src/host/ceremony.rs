@@ -174,6 +174,33 @@ struct Invite {
     frostd_url: Option<String>,
 }
 
+/// The embedded wallet's join precheck, before the shared `join` handler runs. A relay invite
+/// must carry a valid creator identity: it joins through this member's own frostd, never the
+/// relay or HTTP endpoint the invite names, so its `creator_base_url` (often loopback) is not
+/// checked. Only a legacy invite may contact an explicitly allowed HTTPS peer directly.
+#[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+pub(super) fn embedded_invite_target(config: &super::Config, body: &Value) -> Result<(), &'static str> {
+    const INVALID: &str = "invalid invite";
+    let raw: Value = body["invite"].as_str().filter(|s| s.len() <= 4096)
+        .and_then(|s| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .filter(Value::is_object).ok_or(INVALID)?;
+    let relay = !raw["creator"].is_null() || !raw["frostd_url"].is_null();
+    let invite: Invite = serde_json::from_value(raw).map_err(|_| INVALID)?;
+    if relay {
+        invite.creator.as_ref().ok_or("relay invite has no creator identity")?
+            .public(1).map_err(|_| "relay invite has an invalid creator identity")?;
+        return crate::transport::require_tls_off_loopback(&config.frostd_url)
+            .map_err(|_| "this signer has no usable relay for a relay invite");
+    }
+    let url = invite.creator_base_url.as_str();
+    if url.starts_with("https://") && config.validate_peer_url(url).is_ok() {
+        Ok(())
+    } else {
+        Err("invite does not name an allowed HTTPS peer")
+    }
+}
+
 /// Shared roster policy, including the member cap.
 use crate::member_state::valid_policy;
 
@@ -1177,7 +1204,7 @@ fn serve_joins(st: &Shared, relay: &mut Option<FrostdTransport>) -> Result<bool,
     let mine = me.public().encryption;
     let tx = match relay {
         Some(tx) => tx,
-        None => relay.insert(super::payment::relay(&me, &st.config.frostd_url)?),
+        None => relay.insert(super::payment::payment_relay(st, &me, false)?),
     };
     for session in tx.list_sessions().map_err(|e| e.to_string())? {
         let Ok((participants, Some(owner))) = tx.session_details(session) else { continue };

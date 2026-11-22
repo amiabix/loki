@@ -118,6 +118,17 @@ impl NativeConfig {
     }
 
     #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+    pub(crate) fn validate_wallet(config: &Config) -> Result<(), String> {
+        if config.network != "testnet" || config.development_http || !config.bind.is_loopback() {
+            return Err("the embedded signer requires testnet, HTTPS and a loopback listener".into());
+        }
+        for url in config.peers.values().chain(config.advertise_url.iter()) {
+            super::registration::plain_origin(url, false)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
     pub(crate) fn preview_restore(args: &[String], origin: &str) -> Result<Self, String> {
         let origin = Self::recovery_origin(args, origin)?;
         let deployment = fetch(&origin)?;
