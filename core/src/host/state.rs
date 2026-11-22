@@ -284,7 +284,7 @@ pub(super) mod apple_test {
     }
 }
 
-pub(super) fn member_key_message(_error: &str) -> Option<&'static str> {
+pub(crate) fn member_key_message(_error: &str) -> Option<&'static str> {
     #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
     return crate::signer::secure_element_apple::member_key_message(_error);
     #[cfg(not(all(target_os = "macos", feature = "apple-enclave")))]
@@ -522,7 +522,7 @@ impl AppState {
         crate::seal_kdf::clear_session_cache();
         self.session_generation.fetch_add(1, Ordering::Release);
         drop(current);
-        #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+        #[cfg(any(test, all(feature = "relay-communication", any(all(target_os = "macos", feature = "apple-enclave"), all(target_os = "linux", feature = "linux-desktop")))))]
         super::native_member::clear_addresses_on_lock(self);
     }
 }

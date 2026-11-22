@@ -111,13 +111,13 @@ impl NativeConfig {
         Self::resolve(args, pairing_url, fetch)
     }
 
-    #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+    #[cfg(all(feature = "relay-communication", any(all(target_os = "macos", feature = "apple-enclave"), all(target_os = "linux", feature = "linux-desktop"))))]
     pub(crate) fn recovery_origin(args: &[String], origin: &str) -> Result<String, String> {
         let config = super::native_config_from_args(args)?;
         super::registration::plain_origin(origin, config.development_http)
     }
 
-    #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+    #[cfg(all(feature = "relay-communication", any(all(target_os = "macos", feature = "apple-enclave"), all(target_os = "linux", feature = "linux-desktop"))))]
     pub(crate) fn validate_wallet(config: &Config) -> Result<(), String> {
         if config.network != "testnet" || config.development_http || !config.bind.is_loopback() {
             return Err("the embedded signer requires testnet, HTTPS and a loopback listener".into());
@@ -128,20 +128,20 @@ impl NativeConfig {
         Ok(())
     }
 
-    #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+    #[cfg(all(feature = "relay-communication", any(all(target_os = "macos", feature = "apple-enclave"), all(target_os = "linux", feature = "linux-desktop"))))]
     pub(crate) fn preview_restore(args: &[String], origin: &str) -> Result<Self, String> {
         let origin = Self::recovery_origin(args, origin)?;
         let deployment = fetch(&origin)?;
         Self::resolve_restore(args, origin, deployment)
     }
 
-    #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+    #[cfg(all(feature = "relay-communication", any(all(target_os = "macos", feature = "apple-enclave"), all(target_os = "linux", feature = "linux-desktop"))))]
     fn resolve_restore(args: &[String], origin: String, deployment: Deployment) -> Result<Self, String> {
         // The coordinator slot is unknown until we open the backup and find its identity.
         Self::merge(args, Some((origin, 0)), Some(deployment.clone()), Some(deployment), super::native_config_from_args(args)?.development_http, None)
     }
 
-    #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+    #[cfg(all(feature = "relay-communication", any(all(target_os = "macos", feature = "apple-enclave"), all(target_os = "linux", feature = "linux-desktop"))))]
     pub(crate) fn apply_restore(self, config: &mut Config, args: &[String], origin: &str) -> Result<Option<FetchedConfig>, String> {
         let origin = Self::recovery_origin(args, origin)?;
         let deployment = self.fetched.clone().ok_or("missing restored profile configuration")?;
@@ -180,7 +180,7 @@ impl NativeConfig {
         Ok(Some(FetchedConfig { origin: self.coordinator, deployment, save: self.save }))
     }
 
-    #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+    #[cfg(all(feature = "relay-communication", any(all(target_os = "macos", feature = "apple-enclave"), all(target_os = "linux", feature = "linux-desktop"))))]
     pub(crate) fn verify_witness_confirmation(&self, confirmation: Option<&str>) -> Result<(), String> {
         if self.confirm_witness_fingerprint
             && !confirmation.is_some_and(|code| code.eq_ignore_ascii_case(&self.witness_fingerprint))

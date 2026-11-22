@@ -25,7 +25,7 @@ use super::{new_token, state::Shared};
 const DEADLINE: Duration = Duration::from_secs(110);
 const COOLDOWN: Duration = Duration::from_secs(5);
 // The wallet polls every 1.5 s. Allow for browsers throttling background timers to one minute.
-#[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+#[cfg(any(test, all(feature = "relay-communication", any(all(target_os = "macos", feature = "apple-enclave"), all(target_os = "linux", feature = "linux-desktop")))))]
 const RECENT_ACTIVITY: Duration = Duration::from_secs(90);
 
 pub(crate) type LocalConnect = Arc<dyn Fn(&str, &str, &ConnectAttempt) -> bool + Send + Sync>;
@@ -90,7 +90,7 @@ impl WalletTabs {
         true
     }
 
-    #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+    #[cfg(any(test, all(feature = "relay-communication", any(all(target_os = "macos", feature = "apple-enclave"), all(target_os = "linux", feature = "linux-desktop")))))]
     pub(super) fn count(&self) -> usize {
         let grants = self.grants.lock().unwrap();
         let now = Instant::now();
@@ -101,7 +101,7 @@ impl WalletTabs {
         self.clear(false);
     }
 
-    #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+    #[cfg(any(test, all(feature = "relay-communication", any(all(target_os = "macos", feature = "apple-enclave"), all(target_os = "linux", feature = "linux-desktop")))))]
     pub(super) fn close(&self) {
         self.clear(true);
     }

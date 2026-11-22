@@ -160,7 +160,7 @@ async fn auth(State(st): State<Shared>, req: Request, next: Next) -> Result<Resp
         return Err(err(StatusCode::UNAUTHORIZED, "profile is locked").into_response());
     }
     // Only the embedded dispatcher can create this typed extension, never an HTTP client.
-    #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+    #[cfg(any(test, all(feature = "relay-communication", any(all(target_os = "macos", feature = "apple-enclave"), all(target_os = "linux", feature = "linux-desktop")))))]
     if st.config.native && req.extensions().get::<super::native_member::InProcess>().is_some() {
         return Ok(next.run(req).await);
     }

@@ -25,7 +25,7 @@ pub use loki_signer_core::{
 #[cfg(test)]
 mod coordinator;
 pub mod coordinator_boundary;
-#[cfg(all(feature = "apple-enclave", target_os = "macos"))]
+#[cfg(any(all(feature = "apple-enclave", target_os = "macos"), all(feature = "linux-desktop", target_os = "linux")))]
 pub mod enclave_ffi;
 pub mod frost_roster;
 #[cfg(test)]

@@ -178,7 +178,7 @@ struct Invite {
 /// must carry a valid creator identity: it joins through this member's own frostd, never the
 /// relay or HTTP endpoint the invite names, so its `creator_base_url` (often loopback) is not
 /// checked. Only a legacy invite may contact an explicitly allowed HTTPS peer directly.
-#[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+#[cfg(any(test, all(feature = "relay-communication", any(all(target_os = "macos", feature = "apple-enclave"), all(target_os = "linux", feature = "linux-desktop")))))]
 pub(super) fn embedded_invite_target(config: &super::Config, body: &Value) -> Result<(), &'static str> {
     const INVALID: &str = "invalid invite";
     let raw: Value = body["invite"].as_str().filter(|s| s.len() <= 4096)

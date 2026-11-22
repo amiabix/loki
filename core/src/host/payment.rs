@@ -1419,7 +1419,7 @@ fn record_failure(st: &Shared, data: &Path, pass: &str, vault: &str, attempt: &s
     reason: Option<FailureReason>,
 ) {
     let Ok(mut p) = read_payment(data, pass, vault, attempt) else { return };
-    #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+    #[cfg(any(test, all(feature = "relay-communication", any(all(target_os = "macos", feature = "apple-enclave"), all(target_os = "linux", feature = "linux-desktop")))))]
     if st.config.native && matches!(p.phase.as_str(), "signing" | "ready" | "signed")
         && !payment_dir(data, vault).is_ok_and(|dir| dir.exists(&refused_file(attempt))) {
         super::native_member::emit_for(st, super::native_member::Event::PaymentFailed);
@@ -1583,9 +1583,9 @@ fn payment_worker(
         poll.1.clone()
     };
     let check_running = || {
-        #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+        #[cfg(any(test, all(feature = "relay-communication", any(all(target_os = "macos", feature = "apple-enclave"), all(target_os = "linux", feature = "linux-desktop")))))]
         let result = if st.config.native { super::native_member::check_signing(st, poll_control) } else { poll_control() };
-        #[cfg(not(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))))]
+        #[cfg(not(any(test, all(feature = "relay-communication", any(all(target_os = "macos", feature = "apple-enclave"), all(target_os = "linux", feature = "linux-desktop"))))))]
         let result = poll_control();
         if let Some(approval) = &approval {
             if result.is_err() { approval.end(ApprovalEnd::Failed); }
@@ -1596,7 +1596,7 @@ fn payment_worker(
     let sign_member = || -> Result<(), RoundError> {
         if st.config.native { check_running()?; }
         sign_with_opened(st, data, pass, &p, &v, owned, &check_running, opened, approval.clone())?;
-        #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+        #[cfg(any(test, all(feature = "relay-communication", any(all(target_os = "macos", feature = "apple-enclave"), all(target_os = "linux", feature = "linux-desktop")))))]
         if st.config.native { super::native_member::emit_for(st, super::native_member::Event::PaymentSigned); }
         Ok(())
     };
@@ -1761,7 +1761,7 @@ fn sign_with_opened(
         let (data, pass) = (data.to_owned(), Zeroizing::new(pass.to_owned()));
         move || {
             let refresh = || refresh_approval(&st, &data, &pass, &p, &v, &tx, &attempt);
-            #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+            #[cfg(any(test, all(feature = "relay-communication", any(all(target_os = "macos", feature = "apple-enclave"), all(target_os = "linux", feature = "linux-desktop")))))]
             if st.config.native { return super::native_member::check_signing(&st, refresh); }
             refresh()
         }
