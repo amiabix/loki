@@ -83,7 +83,7 @@ type View =
   | { id: "ceremony"; vault: string }
   | { id: "overview"; vault: VaultSummary }
   | { id: "send"; vault: VaultSummary }
-  | { id: "review"; vault: VaultSummary; attempt: string; proposedHere?: boolean }
+  | { id: "review"; vault: VaultSummary; attempt: string; proposer?: number; proposedHere?: boolean }
   | { id: "history"; vault: VaultSummary };
 
 // ─── root ─────────────────────────────────────────────────────────────────────
@@ -346,7 +346,10 @@ function ViewRouter({
           vault={view.vault}
           onSend={() => onNavigate({ id: "send", vault: view.vault })}
           onHistory={() => onNavigate({ id: "history", vault: view.vault })}
-          onApprove={(attempt) => onNavigate({ id: "review", vault: view.vault, attempt, proposedHere: false })}
+          onApprove={({ attempt, proposer }) => onNavigate({
+            id: "review", vault: view.vault, attempt,
+            proposer: signerKind() === "browser" ? proposer : undefined, proposedHere: false,
+          })}
           onBack={() => onNavigate({ id: "home" })}
         />
       );
@@ -365,6 +368,7 @@ function ViewRouter({
           proposedHere={view.proposedHere}
           vault={view.vault}
           attempt={view.attempt}
+          proposer={view.proposer}
           onBack={() => onNavigate({ id: "history", vault: view.vault })}
         />
       );
@@ -372,6 +376,7 @@ function ViewRouter({
       return (
         <History
           vault={view.vault}
+          network={status?.network}
           onReview={(attempt) => onNavigate({ id: "review", vault: view.vault, attempt })}
           onBack={() => onNavigate({ id: "overview", vault: view.vault })}
         />
@@ -820,6 +825,7 @@ function Home({
   onNavigate: (v: View) => void;
   onRefresh: () => void;
 }) {
+  const browser = signerKind() === "browser";
   return (
     <div>
       <div className="mb-6 flex flex-col items-start gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -834,7 +840,7 @@ function Home({
           <h3 className="eyebrow mb-3">{title}</h3>
           {items.length === 0 ? <GlassCard className="py-8 text-center text-sm text-muted">
             <p className="mb-2 font-display text-lg font-semibold text-foreground">No active vaults yet</p>
-            <p>{vaults.length ? "Finish setup below to activate your vault." : "Create one or join with an invite link."}</p>
+            <p>{vaults.length ? "Finish setup below to activate your vault." : browser ? "Join with an invite link." : "Create one or join with an invite link."}</p>
           </GlassCard> : <div className="space-y-2.5">{items.map((v) => (
             <button key={v.vault}
               onClick={() => onNavigate(v.active === false ? { id: "ceremony", vault: v.vault } : { id: "overview", vault: v })}
@@ -853,20 +859,20 @@ function Home({
       ))}
 
       <div className="grid gap-3 sm:grid-cols-2">
-        <Btn variant="mint" onClick={() => onNavigate({ id: "create-vault" })}>
+        {!browser && <Btn variant="mint" onClick={() => onNavigate({ id: "create-vault" })}>
           Create vault
-        </Btn>
+        </Btn>}
         <Btn variant="ghost" onClick={() => onNavigate({ id: "join-vault" })}>
           Join vault
         </Btn>
       </div>
-      {signerKind() === "browser" && <BrowserSignerRecovery />}
+      {browser && <BrowserSignerRecovery onRestored={onRefresh} />}
     </div>
   );
 }
 
-// Recovery setup stays on the embedded signer; removal requires the separate signer tab.
-function BrowserSignerRecovery() {
+// The embedded signer starts recovery and custody operations in a separate signer tab.
+function BrowserSignerRecovery({ onRestored }: { onRestored: () => void }) {
   const [hasWords, setHasWords] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -886,6 +892,7 @@ function BrowserSignerRecovery() {
           : "Set up 24 recovery words. You need them, and each vault's backup file, to restore this signer in another browser."}
       </p>
       {hasWords === false && <Btn disabled={busy} onClick={() => run(async () => { await setupBrowserRecovery(); setHasWords(true); })}>Set up recovery words</Btn>}
+      <Btn variant="ghost" disabled={busy} onClick={() => run(async () => { await restoreSigner({}); onRestored(); })}>Restore another vault</Btn>
       <Btn variant="ghost" disabled={busy} onClick={() => run(async () => { if (await manageBrowserCustody()) window.location.reload(); })}>Manage browser signer</Btn>
       <ErrMsg msg={err} />
     </section>
@@ -1446,7 +1453,7 @@ function VaultOverview({
   vault: VaultSummary;
   onSend: () => void;
   onHistory: () => void;
-  onApprove: (attempt: string) => void;
+  onApprove: (payment: PendingApproval) => void;
   onBack: () => void;
 }) {
   const [address, setAddress] = useState<string | null>(null);
@@ -1534,12 +1541,18 @@ function VaultOverview({
   };
 
   const requestFunds = async () => {
-    if (!address || funding !== "idle") return;
+    if (!address || funding === "requesting") return;
     setFunding("requesting"); setLoadErr(null);
     try {
-      const { mined } = await fund(address);
+      const storageKey = `loki_funding:${vault.vault}:${address}`;
+      const attempt = sessionStorage.getItem(storageKey) ?? crypto.randomUUID();
+      sessionStorage.setItem(storageKey, attempt);
+      const { mined } = await fund(address, attempt);
       setFunding(mined ? "idle" : "unconfirmed");
-      if (mined) setLoadVersion((v) => v + 1);
+      if (mined) {
+        sessionStorage.removeItem(storageKey);
+        setLoadVersion((v) => v + 1);
+      }
     } catch (e) {
       setLoadErr((e as Error).message);
       setFunding("idle");
@@ -1591,7 +1604,7 @@ function VaultOverview({
           <GlassCard className="border-2 border-amber/60 bg-amber/10 ring-4 ring-amber/15">
             <div className="space-y-3">
               {pending.map((p) => (
-                <div key={p.attempt} className="flex flex-col gap-3 border-b border-[var(--border)] pb-3 last:border-0 last:pb-0 sm:flex-row sm:items-center sm:justify-between">
+                <div key={`${p.proposer}:${p.attempt}`} className="flex flex-col gap-3 border-b border-[var(--border)] pb-3 last:border-0 last:pb-0 sm:flex-row sm:items-center sm:justify-between">
                   <div className="min-w-0">
                     <p className="font-mono text-base font-semibold">{zatToTaz(p.amount_zat)} TAZ</p>
                     <p className="truncate font-mono text-[11px] text-muted">to {short(p.recipient, 12, 8)}</p>
@@ -1599,7 +1612,7 @@ function VaultOverview({
                     {p.replaces && <p className="mt-1 text-[11px] text-amber">{p.replaces.cancel ? "Cancels" : "Retries"} stuck payment {short(p.replaces.attempt, 6, 4)} with the same note</p>}
                   </div>
                   <button
-                    onClick={() => onApprove(p.attempt)}
+                    onClick={() => onApprove(p)}
                     className="btn-primary shrink-0 rounded-full px-5 py-2.5 text-sm font-semibold"
                   >
                     Review &amp; approve →
@@ -1654,18 +1667,18 @@ function VaultOverview({
           {address.startsWith("uregtest1") && (
             <button
               onClick={requestFunds}
-              disabled={funding !== "idle"}
+              disabled={funding === "requesting"}
               className="btn-glass rounded-full px-4 py-3 text-sm text-amber disabled:opacity-60"
             >
-              {funding === "requesting" ? "Funding…" : funding === "unconfirmed" ? "Funding accepted" : "Request test funds"}
+              {funding === "requesting" ? "Funding…" : funding === "unconfirmed" ? "Check funding" : "Request test funds"}
             </button>
           )}
         </div>
       )}
       {funding === "unconfirmed" && (
         <p role="status" className="mb-4 text-sm text-muted">
-          The faucet accepted the transfer, but automatic mining could not be verified. Check the regtest node and
-          watch your balance instead of requesting funds again.
+          The faucet accepted the transfer, but it has not confirmed that it was mined.
+          Checking funding again will reuse the same transfer request.
         </p>
       )}
 
@@ -1682,7 +1695,7 @@ function VaultOverview({
       )}
 
       <div className="mb-4 grid grid-cols-2 gap-3">
-        <Btn variant="mint" onClick={onSend}>Send</Btn>
+        {signerKind() !== "browser" && <Btn variant="mint" onClick={onSend}>Send</Btn>}
         <Btn variant="ghost" onClick={onHistory}>History</Btn>
       </div>
 
@@ -1692,7 +1705,7 @@ function VaultOverview({
 }
 
 // Download this vault's recovery backup from the in-browser signer: ciphertext only the 24
-// words open, saved on the signer page (the wallet sees the same opaque bytes).
+// words open, saved from the separate signer tab.
 function BrowserBackupCard({ vault }: { vault: string }) {
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState(false);
@@ -1925,12 +1938,14 @@ function ReviewApprove({
   proposedHere,
   vault,
   attempt,
+  proposer,
   onBack,
 }: {
   profileId?: string;
   proposedHere?: boolean;
   vault: VaultSummary;
   attempt: string;
+  proposer?: number;
   onBack: () => void;
 }) {
   const [review, setReview] = useState<PaymentReview | null>(null);
@@ -1945,11 +1960,13 @@ function ReviewApprove({
 
   const fetchSession = useCallback(async () => {
     try {
-      const value = await api<PaymentSession>(`payment-status?vault=${vault.vault}&attempt=${attempt}`);
+      const query = new URLSearchParams({ vault: vault.vault, attempt });
+      if (proposer !== undefined) query.set("proposer", String(proposer));
+      const value = await api<PaymentSession>(`payment-status?${query}`);
       setSession(value);
       setSessionError(null);
     } catch (e) { setSessionError((e as Error).message); }
-  }, [vault.vault, attempt]);
+  }, [vault.vault, attempt, proposer]);
   useEffect(() => {
     setOwnSlot(rememberedVaultSlot(profileId, vault.vault));
   }, [profileId, vault.vault]);
@@ -1961,7 +1978,7 @@ function ReviewApprove({
 
   const fetchReview = useCallback(async () => {
     try {
-      const r = await api<PaymentReview>("payment-review", { vault: vault.vault, attempt });
+      const r = await api<PaymentReview>("payment-review", { vault: vault.vault, attempt, proposer });
       setReview(r);
       setErr(null);
     } catch (e) {
@@ -1970,7 +1987,7 @@ function ReviewApprove({
       triesRef.current += 1;
       if (triesRef.current >= 10) setErr((e as Error).message);
     }
-  }, [vault.vault, attempt]);
+  }, [vault.vault, attempt, proposer]);
 
   useEffect(() => {
     if (approved) return;
@@ -1991,7 +2008,7 @@ function ReviewApprove({
     if (!review) return;
     setBusy(true); setErr(null);
     try {
-      await api("payment-approve", { vault: vault.vault, attempt, review_token: review.review_token, intent_hash: review.intent_hash });
+      await api("payment-approve", { vault: vault.vault, attempt, proposer, review_token: review.review_token, intent_hash: review.intent_hash });
       await fetchSession();
     } catch (e) { setErr((e as Error).message); }
     finally { setBusy(false); }
@@ -2155,10 +2172,12 @@ function ReplacePanel({ vault, payment, onStarted }: {
 
 function History({
   vault,
+  network,
   onReview,
   onBack,
 }: {
   vault: VaultSummary;
+  network?: StatusResponse["network"];
   onReview: (attempt: string) => void;
   onBack: () => void;
 }) {
@@ -2298,7 +2317,8 @@ function History({
               {txid && confirmed && (
                 <p className="mt-1.5 text-center text-[11px] text-muted">
                   Reported mined{p.mined_height ? ` at block ${p.mined_height.toLocaleString()}` : ""}.{" "}
-                  <a href={`https://testnet.zecblock.com/tx/${txid}`} target="_blank" rel="noreferrer" className="text-mint underline">View on ZecBlock ↗</a>. Tap the id to copy.
+                  {network === "testnet" && <><a href={`https://testnet.zecblock.com/tx/${txid}`} target="_blank" rel="noreferrer" className="text-mint underline">View on ZecBlock ↗</a>.{" "}</>}
+                  Tap the id to copy.
                 </p>
               )}
             </GlassCard>

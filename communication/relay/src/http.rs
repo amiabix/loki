@@ -45,6 +45,7 @@ struct Gate {
     inner: Arc<Mutex<GateCounts>>,
     screening: PeerGate,
     rejected_body: PeerGate,
+    duplicate_body: PeerGate,
     witness_body: PeerGate,
     identity: PeerGate,
     db: DbHandle,
@@ -76,6 +77,7 @@ impl Gate {
             inner: Arc::new(Mutex::new(GateCounts { total: 0, fresh: 0 })),
             screening: PeerGate::new(64, REQUEST_CONCURRENCY),
             rejected_body: PeerGate::new(16, 4),
+            duplicate_body: PeerGate::new(8, 2),
             witness_body: PeerGate::new(16, 4),
             identity: PeerGate::new(16, 8),
             db,
@@ -100,7 +102,7 @@ impl Gate {
         })
     }
 
-    /// A read, or a PUT whose committed hash is already present. Not a fresh body.
+    /// A read, not a request that still needs to upload a body.
     fn try_acquire_progress(&self) -> Option<RequestPermit> {
         let mut counts = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         if counts.total >= REQUEST_CONCURRENCY {
@@ -200,15 +202,19 @@ async fn admit_checked(gate: Gate, mut request: Request, next: Next) -> RelayRes
         }
         Err(error) => return Err(error),
     };
+    let fresh = write.then(|| gate.try_acquire_fresh()).flatten();
+    if write && fresh.is_none() && matches!(presence, Some(HashPresence::Committed)) {
+        let _permit = gate
+            .duplicate_body
+            .try_acquire(request.extensions())
+            .ok_or(RelayError::RateLimit)?;
+        request.extensions_mut().insert(AdmissionMark::Reserved);
+        return Ok(next.run(request).await);
+    }
     let _permit = if !write {
         gate.try_acquire_progress()
-    } else if let Some(fresh) = gate.try_acquire_fresh() {
-        Some(fresh)
-    } else if matches!(presence, Some(HashPresence::Committed)) {
-        request.extensions_mut().insert(AdmissionMark::Reserved);
-        gate.try_acquire_progress()
     } else {
-        None
+        fresh
     }
     .ok_or(RelayError::RateLimit)?;
     Ok(next.run(request).await)
@@ -429,13 +435,31 @@ async fn nonce_route(Extension(gate): Extension<Gate>, request: Request) -> Resp
         let mut raw = [0; nonce::CLAIM_PROOF_LEN];
         hex::decode_to_slice(token, &mut raw).map_err(|_| RelayError::Capability)?;
         let proof = nonce::ClaimProof::from_bytes(raw);
-        let length = request_headers(headers, request.method())?;
+        let length =
+            request_headers(headers, request.method())?.ok_or(RelayError::MalformedRequest)?;
+        if length > nonce::MAX_RECORD {
+            return Err(RelayError::ObjectTooLarge);
+        }
         let challenge =
             id(single(headers, "x-loki-challenge")?.ok_or(RelayError::MalformedRequest)?)?;
-        if challenge == [0; 32] {
+        if length == 0 || challenge == [0; 32] {
             return Err(RelayError::MalformedRequest);
         }
-        // The signature covers the record, so isolate the read and proof check from the writer.
+        let record_hash =
+            id(single(headers, nonce::RECORD_HASH_HEADER)?.ok_or(RelayError::MalformedRequest)?)?;
+        let screening = gate
+            .screening
+            .try_acquire(request.extensions())
+            .ok_or(RelayError::RateLimit)?;
+        let db = gate.db.clone();
+        // Verify enrollment and the signature over the advertised hash before reserving a body slot.
+        let proof = tokio::task::spawn_blocking(move || {
+            let _screening = screening;
+            db.authenticate_nonce(mailbox, cid, challenge, record_hash, &proof)?;
+            Ok::<_, RelayError>(proof)
+        })
+        .await
+        .map_err(|_| RelayError::StorageUnavailable)??;
         let ingress = gate
             .witness_body
             .try_acquire(request.extensions())
@@ -453,20 +477,13 @@ async fn nonce_route(Extension(gate): Extension<Gate>, request: Request) -> Resp
                 RelayError::MalformedRequest
             }
         })?;
-        if wire.is_empty()
-            || wire.len() > nonce::MAX_RECORD
-            || length.is_some_and(|n| n != wire.len())
-        {
+        if length != wire.len() {
             return Err(RelayError::MalformedRequest);
         }
-        let db = gate.db.clone();
-        let (wire, proof) = tokio::task::spawn_blocking(move || {
-            let _ingress = ingress;
-            db.authenticate_nonce(mailbox, cid, challenge, &wire, &proof)?;
-            Ok::<_, RelayError>((wire, proof))
-        })
-        .await
-        .map_err(|_| RelayError::StorageUnavailable)??;
+        if Id32::from(Sha256::digest(&wire)) != record_hash {
+            return Err(RelayError::Capability);
+        }
+        drop(ingress);
         let _permit = gate.try_acquire_fresh().ok_or(RelayError::RateLimit)?;
         let (created, receipt) = gate
             .db

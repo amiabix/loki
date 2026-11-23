@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 pub const SIGNATURE_DOMAIN: &[u8] = b"Loki_Relay_Nonce_v1\0";
 pub const MAX_RECORD: usize = 65_536;
 pub const CLAIM_SCHEME: &str = "LokiNonce ";
+pub const RECORD_HASH_HEADER: &str = "x-loki-record-sha256";
 pub const CLAIM_PROOF_LEN: usize = 130;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,6 +57,26 @@ pub fn claim_input(
     challenge: Id32,
     record: &[u8],
 ) -> Vec<u8> {
+    claim_input_for_hash(
+        who,
+        pin,
+        mailbox,
+        cid,
+        challenge,
+        Sha256::digest(record).into(),
+    )
+}
+
+/// Verify a claim proof against the advertised digest before reading the record.
+/// The caller must still check that the received record hashes to this digest.
+pub fn claim_input_for_hash(
+    who: Claimant,
+    pin: &RelayPin,
+    mailbox: Id32,
+    cid: Id32,
+    challenge: Id32,
+    record_hash: Id32,
+) -> Vec<u8> {
     let mut input = b"Loki_Relay_NonceClaim_v1\0".to_vec();
     input.extend_from_slice(&who.slot.to_be_bytes());
     for field in [
@@ -66,7 +87,7 @@ pub fn claim_input(
         mailbox,
         cid,
         challenge,
-        Sha256::digest(record).into(),
+        record_hash,
     ] {
         input.extend_from_slice(&field);
     }
@@ -77,6 +98,8 @@ pub fn claim_input(
 pub struct NonceReceipt {
     pub pin: RelayPin,
     pub mailbox: Id32,
+    pub vault: Id32,
+    pub slot: u16,
     pub cid: Id32,
     pub record_hash: Id32,
     pub challenge: Id32,
@@ -85,7 +108,7 @@ pub struct NonceReceipt {
 
 pub fn encode_body(receipt: &NonceReceipt) -> WireResult<Vec<u8>> {
     canonical::encode(&Value::Array(vec![
-        Value::Integer(1.into()),
+        Value::Integer(2.into()),
         Value::Bytes(receipt.pin.key.to_vec()),
         Value::Bytes(receipt.pin.run.to_vec()),
         Value::Bytes(receipt.mailbox.to_vec()),
@@ -93,6 +116,8 @@ pub fn encode_body(receipt: &NonceReceipt) -> WireResult<Vec<u8>> {
         Value::Bytes(receipt.record_hash.to_vec()),
         Value::Bytes(receipt.challenge.to_vec()),
         Value::Integer(u64::from(receipt.created).into()),
+        Value::Bytes(receipt.vault.to_vec()),
+        Value::Integer(receipt.slot.into()),
     ]))
 }
 
@@ -101,7 +126,7 @@ pub fn decode_body(raw: &[u8]) -> WireResult<NonceReceipt> {
     let Value::Array(fields) = value else {
         return Err(WireError::Schema);
     };
-    if fields.len() != 8 || fields[0] != Value::Integer(1.into()) {
+    if fields.len() != 10 || fields[0] != Value::Integer(2.into()) {
         return Err(WireError::Schema);
     }
     let id = |index: usize| -> WireResult<Id32> {
@@ -115,12 +140,17 @@ pub fn decode_body(raw: &[u8]) -> WireResult<NonceReceipt> {
         Value::Integer(n) if n == 1.into() => true,
         _ => return Err(WireError::Schema),
     };
+    let Value::Integer(slot) = fields[9] else {
+        return Err(WireError::Schema);
+    };
     Ok(NonceReceipt {
         pin: RelayPin {
             key: id(1)?,
             run: id(2)?,
         },
         mailbox: id(3)?,
+        vault: id(8)?,
+        slot: u16::try_from(i128::from(slot)).map_err(|_| WireError::Schema)?,
         cid: id(4)?,
         record_hash: id(5)?,
         challenge: id(6)?,

@@ -168,7 +168,7 @@ fn authenticate_nonce(
     mailbox: Id32,
     cid: Id32,
     challenge: Id32,
-    wire: &[u8],
+    record_hash: Id32,
     proof: &ClaimProof,
 ) -> RelayResult<(u64, u64)> {
     let enrolled: bool = connection.query_row(
@@ -188,7 +188,7 @@ fn authenticate_nonce(
     ed25519_dalek::VerifyingKey::from_bytes(&who.key)
         .and_then(|key| {
             key.verify_strict(
-                &nonce::claim_input(who, pin, mailbox, cid, challenge, wire),
+                &nonce::claim_input_for_hash(who, pin, mailbox, cid, challenge, record_hash),
                 &ed25519_dalek::Signature::from_bytes(&proof.signature),
             )
         })
@@ -324,7 +324,7 @@ impl RelayStore {
         mailbox: Id32,
         cid: Id32,
         challenge: Id32,
-        wire: &[u8],
+        record_hash: Id32,
         proof: &ClaimProof,
     ) -> RelayResult<()> {
         let connection = open_committed_readonly(&root.join("relay.sqlite3"))?;
@@ -333,7 +333,7 @@ impl RelayStore {
             [],
             |row| Ok(RelayPin { key: row.get(0)?, run: row.get(1)? }),
         )?;
-        authenticate_nonce(&connection, &pin, mailbox, cid, challenge, wire, proof)?;
+        authenticate_nonce(&connection, &pin, mailbox, cid, challenge, record_hash, proof)?;
         Ok(())
     }
 
@@ -354,9 +354,9 @@ impl RelayStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let pin = RelayPin { key: self.root.public_key, run: self.root.run_id };
-        let (used, quota) = authenticate_nonce(&tx, &pin, mailbox, cid, challenge, wire, proof)?;
-        let who = proof.claimant;
         let record_hash: Id32 = Sha256::digest(wire).into();
+        let (used, quota) = authenticate_nonce(&tx, &pin, mailbox, cid, challenge, record_hash, proof)?;
+        let who = proof.claimant;
         let old: Option<(Vec<u8>, Vec<u8>)> = tx
             .query_row(
                 "SELECT record_hash,wire FROM nonce_uses WHERE mailbox=?1 AND cid=?2
@@ -391,6 +391,8 @@ impl RelayStore {
         let body = nonce::encode_body(&NonceReceipt {
             pin,
             mailbox,
+            vault: who.vault,
+            slot: who.slot,
             cid,
             record_hash,
             challenge,
@@ -522,6 +524,14 @@ impl RelayStore {
             return Err(RelayError::StorageUnavailable);
         }
         configure(&connection)?;
+        let has_setup: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='setup_namespaces')",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_setup {
+            connection.execute_batch(include_str!("setup_schema.sql"))?;
+        }
         Ok(Self {
             root,
             connection,
@@ -1940,6 +1950,9 @@ impl RelayStore {
                 return Err(RelayError::Capability);
             }
         } else {
+            if !retire && expires <= now {
+                return Err(RelayError::MalformedRequest);
+            }
             if payment_state(&tx, mailbox)?.is_some() {
                 return Err(RelayError::Conflict);
             }
@@ -1961,7 +1974,7 @@ impl RelayStore {
         }
         if retire {
             tx.execute(
-                "UPDATE setup_namespaces SET retired=1 WHERE mailbox=?1",
+                "UPDATE setup_namespaces SET retired=1 WHERE mailbox=?1 AND retired=0",
                 [mailbox.as_slice()],
             )?;
         }
@@ -1984,10 +1997,15 @@ impl RelayStore {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let installed:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='setup_namespaces')",[],|r|r.get(0))?;
+        let installed: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='setup_namespaces')",
+            [],
+            |row| row.get(0),
+        )?;
         if !installed {
             return Ok(0);
         }
+        const BATCH: u32 = 64;
         let mailboxes_installed: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='mailboxes')",
             [],
@@ -1995,16 +2013,24 @@ impl RelayStore {
         )?;
         if !mailboxes_installed {
             tx.execute(
-                "UPDATE setup_namespaces SET retired=1 WHERE expires<=?1",
-                [now],
+                "UPDATE setup_namespaces SET retired=1 WHERE mailbox IN
+                 (SELECT mailbox FROM setup_namespaces WHERE retired=0 AND expires<=?1 LIMIT ?2)",
+                params![now, BATCH],
             )?;
             tx.commit()?;
             return Ok(0);
         }
-        let mut q=tx.prepare("SELECT n.mailbox,m.used_bytes FROM setup_namespaces n JOIN mailboxes m ON m.id=n.mailbox WHERE n.retired=1 OR n.expires<=?1")?;
+        // Start the retired lookup from actual mailboxes, not the accumulating tombstones.
+        let mut q = tx.prepare(
+            "SELECT n.mailbox,m.used_bytes FROM mailboxes m CROSS JOIN setup_namespaces n ON n.mailbox=m.id
+             WHERE n.retired=1
+             UNION ALL
+             SELECT n.mailbox,m.used_bytes FROM setup_namespaces n LEFT JOIN mailboxes m ON m.id=n.mailbox
+             WHERE n.retired=0 AND n.expires<=?1 LIMIT ?2",
+        )?;
         let rows = q
-            .query_map([now], |r| {
-                Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, u64>(1)?))
+            .query_map(params![now, BATCH], |r| {
+                Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Option<u64>>(1)?))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(q);
@@ -2018,7 +2044,13 @@ impl RelayStore {
             [],
             |r| r.get(0),
         )?;
+        let mut removed = 0;
         for (mailbox, used) in &rows {
+            tx.execute(
+                "UPDATE setup_namespaces SET retired=1 WHERE mailbox=?1 AND retired=0",
+                [mailbox],
+            )?;
+            let Some(used) = used else { continue };
             if nonces_installed {
                 let nonces: u64 = tx.query_row(
                     "SELECT count(*) FROM nonce_uses WHERE mailbox=?1",
@@ -2037,17 +2069,10 @@ impl RelayStore {
                 [used],
             )?;
             tx.execute("DELETE FROM mailboxes WHERE id=?1", [mailbox])?;
-            tx.execute(
-                "UPDATE setup_namespaces SET retired=1 WHERE mailbox=?1",
-                [mailbox],
-            )?;
+            removed += 1;
         }
-        tx.execute(
-            "UPDATE setup_namespaces SET retired=1 WHERE expires<=?1",
-            [now],
-        )?;
         tx.commit()?;
-        Ok(rows.len())
+        Ok(removed)
     }
 }
 
