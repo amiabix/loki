@@ -1,4 +1,3 @@
-//! A read-only proof that the configured endpoint currently holds its pinned relay key.
 use crate::{
     canonical::{self, Value},
     types::{Id32, RelayPin},

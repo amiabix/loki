@@ -21,7 +21,6 @@ const OBJECT_SCHEMA: &str =
     "-- Object schema is installed after mailbox authentication, including existing roots.\n";
 const NONCE_SCHEMA: &str =
     "-- First-writer-wins nonce claims survive relay restarts for the lifetime of this root.\n";
-// Budget for row keys, hashes, SQLite record headers and B-tree overhead, in addition to wire.
 const NONCE_ROW_BYTES: u64 = 512;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,8 +40,6 @@ pub struct Pragmas {
 }
 
 fn open_committed_readonly(path: &Path) -> RelayResult<Connection> {
-    // SQLITE_OPEN_NOFOLLOW rejects any symlink in the full path. Resolve
-    // directory symlinks such as /var, and still refuse a symlink database file.
     let metadata = std::fs::symlink_metadata(path)?;
     if !metadata.is_file() {
         return Err(RelayError::StorageUnavailable);
@@ -75,8 +72,6 @@ fn setup_state(connection: &Connection, mailbox: Id32) -> RelayResult<Option<(u6
         )
         .optional()?)
 }
-// Separate from setup_namespaces: its autonomous janitor cannot know whether
-// admission durably certified activation just before the deadline.
 const PAYMENT_RESERVATIONS: &str = "CREATE TABLE IF NOT EXISTS payment_reservations (
     mailbox BLOB PRIMARY KEY NOT NULL CHECK(length(mailbox)=32),
     creation_digest BLOB NOT NULL CHECK(length(creation_digest)=32),
@@ -213,14 +208,12 @@ pub struct StoredResult {
     pub receipt: Vec<u8>,
 }
 
-/// Advisory classification of a committed snapshot. `put` repeats every check.
 #[derive(Debug, Eq, PartialEq)]
 pub enum PutClass {
     Duplicate(StoredResult),
     Fresh,
 }
 
-/// Hash-only view of the committed snapshot. Exact bytes stay in `classify_committed`.
 #[derive(Debug, Eq, PartialEq)]
 pub enum HashPresence {
     Fresh,
@@ -247,7 +240,6 @@ fn bounded_put_barrier() {
 }
 
 pub struct RelayStore {
-    // Close SQLite before releasing the identity lock.
     connection: Connection,
     root: Root,
     #[cfg(test)]
@@ -268,8 +260,6 @@ impl Limits {
 }
 
 impl RelayStore {
-    /// Admit a vault member from a trusted roster. The offline operator reserves a separate
-    /// claim budget up front, so a claimant cannot consume another member's allotment.
     pub fn enroll_nonce_claimant(
         &mut self,
         mailbox: Id32,
@@ -299,8 +289,6 @@ impl RelayStore {
             Some(_) => return Err(RelayError::Conflict),
             None => 0,
         };
-        // Legacy rows have no trustworthy owner. Charge their full storage to both shared
-        // budgets without rewriting them or resetting the old object-accounting counters.
         for (scope, limit) in [(Some(mailbox.as_slice()), limit), (None, relay_limit)] {
             let reserved: u64 = tx.query_row(
                 "SELECT (SELECT coalesce(sum(quota),0) FROM nonce_claimants WHERE ?1 IS NULL OR mailbox=?1)
@@ -337,8 +325,6 @@ impl RelayStore {
         Ok(())
     }
 
-    /// Atomically claim a commitment ID. A duplicate is reported as `created=false`,
-    /// even when its encrypted record is identical: it must never authorize re-signing.
     pub fn claim_nonce(
         &mut self,
         mailbox: Id32,
@@ -406,8 +392,6 @@ impl RelayStore {
         tx.commit()?;
         Ok((created, receipt))
     }
-    /// Create a new root with a fresh receipt seed and caller-supplied provisioning material.
-    /// The caller computes the protocol provisioning verifier; this layer only persists it.
     pub fn init(
         root: &Path,
         run_id: [u8; 32],
@@ -449,7 +433,6 @@ impl RelayStore {
             page_barrier: None,
         })
     }
-    /// Open existing state without creating a database or replacing secrets.
     pub fn open(root: &Path, limits: Limits) -> RelayResult<Self> {
         limits.validate()?;
         let root = Root::open(root)?;
@@ -769,7 +752,6 @@ impl RelayStore {
         }
         #[cfg(test)]
         if fault == Some(PutFault::CommitError) {
-            // Simulate a failed commit before SQLite commits; this is not an I/O fault.
             transaction.rollback()?;
             return Err(RelayError::StorageUnavailable);
         }
@@ -789,7 +771,6 @@ impl RelayStore {
         })
     }
 
-    /// Advisory ingress check; the writer still enforces current operation-specific authority.
     pub(crate) fn authenticate_committed(
         root: &Path,
         target: Option<(Id32, Role)>,
@@ -812,9 +793,6 @@ impl RelayStore {
         Ok(())
     }
 
-    /// Read the last committed snapshot on a short-lived connection.
-    /// Does not take the root lock, insert, allocate a sequence, or charge quota.
-    /// A missing object table is fresh so the first authenticated put can install it.
     pub fn classify_committed(
         root: &Path,
         mailbox: Id32,
@@ -851,8 +829,6 @@ impl RelayStore {
         Ok(PutClass::Fresh)
     }
 
-    /// Auth-first presence check. A missing object table is fresh, so the first put can install it.
-    /// This does not compare bytes, allocate a sequence, or charge quota.
     pub fn classify_committed_hash(
         root: &Path,
         mailbox: Id32,
@@ -1299,7 +1275,6 @@ mod fault_tests {
             .connection
             .pragma_query_value(None, "page_count", |r| r.get(0))
             .unwrap();
-        // The page ceiling must be applied to the connection that executes PUT.
         store
             .connection
             .pragma_update(None, "max_page_count", pages)
@@ -1437,7 +1412,6 @@ mod fault_tests {
             assert!(Instant::now() < deadline, "child never reached barrier");
             std::thread::sleep(Duration::from_millis(10));
         }
-        // Observe from an independent reader while the child is alive at the barrier.
         let observer = Connection::open(root.path().join("relay.sqlite3")).unwrap();
         let visible: u64 = observer
             .query_row("SELECT count(*) FROM objects", [], |r| r.get(0))
@@ -2020,7 +1994,6 @@ impl RelayStore {
             tx.commit()?;
             return Ok(0);
         }
-        // Start the retired lookup from actual mailboxes, not the accumulating tombstones.
         let mut q = tx.prepare(
             "SELECT n.mailbox,m.used_bytes FROM mailboxes m CROSS JOIN setup_namespaces n ON n.mailbox=m.id
              WHERE n.retired=1
@@ -2102,7 +2075,6 @@ fn payment_control(
         }
         state
     } else {
-        // Never adopt a legacy mailbox or a setup tombstone as a payment reservation.
         if used.is_some() || setup_state(tx, mailbox)?.is_some() {
             return Err(RelayError::Conflict);
         }

@@ -423,8 +423,6 @@ fn ceremony_restarts_every_complete_phase_and_preserves_saved_ciphertext() {
         }
         drop(engines);
         std::fs::remove_dir_all(root).unwrap();
-        // The DKG-born shares sign: a quorum of exactly `threshold` members (the last ones)
-        // produces a rerandomized signature that verifies under the group key.
         sign_with_quorum(&keys, &group.unwrap(), threshold, count);
     }
 }

@@ -1,6 +1,3 @@
-//! New-signer setup tests: the v2 DKG through `LocalSigner`'s own storage, the on-device
-//! roster code, resume, cleanup, and the round-two leak the v2 envelopes close.
-
 use super::*;
 use crate::setup_transport::PublicIdentity;
 use crate::signer::secure_element::SoftwareSecureElement;
@@ -19,7 +16,6 @@ fn tempdir(tag: &str) -> PathBuf {
     p
 }
 
-/// Where the member keeps its backup in these tests.
 #[derive(Clone, Default)]
 struct Shelf(Arc<Mutex<Option<Vec<u8>>>>);
 
@@ -47,7 +43,6 @@ impl BackupDevice for TestBackup {
     }
 }
 
-/// The member's device: what it showed, and what the member answers.
 #[derive(Clone)]
 struct Device {
     codes: Arc<Mutex<Vec<String>>>,
@@ -132,7 +127,6 @@ impl Member {
         }
     }
 
-    /// Restart: reopen the signer from its data directory and reconnect.
     fn reopen(&mut self) {
         let se = SoftwareSecureElement::persistent(&self.dir, PASS).unwrap();
         self.signer =
@@ -196,7 +190,6 @@ type Inbox = BTreeMap<u16, Vec<DkgInput>>;
 
 fn route(from: u16, wires: Vec<DkgWire>, count: u16, inbox: &mut Inbox, tape: &mut Vec<Vec<u8>>) {
     for wire in wires {
-        // The relay tape keeps each distinct message once; members resend saved ones.
         if !tape.iter().any(|t| t.as_slice() == wire.as_bytes()) {
             tape.push(wire.as_bytes().to_vec());
         }
@@ -213,8 +206,6 @@ fn route(from: u16, wires: Vec<DkgWire>, count: u16, inbox: &mut Inbox, tape: &m
     }
 }
 
-/// One coordinator pass: every member steps with what arrived, and its outgoing messages
-/// are routed and recorded on the relay tape.
 fn exchange(
     members: &mut [Member],
     vault: &VaultRef,
@@ -234,7 +225,6 @@ fn phase(m: &Member) -> DkgPhase {
     m.signer.setup.as_ref().unwrap().core.phase()
 }
 
-/// Drive a confirmed setup to `ready`: rounds, certificates, backups and receipts.
 fn complete(members: &mut [Member], vault: &VaultRef, tape: &mut Vec<Vec<u8>>) {
     let mut inbox = Inbox::new();
     for _ in 0..6 {
@@ -259,9 +249,6 @@ fn complete(members: &mut [Member], vault: &VaultRef, tape: &mut Vec<Vec<u8>>) {
     }
 }
 
-/// Rebuild the group signing key from plaintext round-two packages, keyed by
-/// (sender, recipient): interpolate each sender's constant term from the shares it sent
-/// and add them up. Returns the group key it implies.
 fn rebuild_group_key(packages: &BTreeMap<(u16, u16), Vec<u8>>, threshold: u16) -> Option<[u8; 32]> {
     use frost_core::Group;
     use std::collections::BTreeSet;
@@ -303,7 +290,6 @@ fn rebuild_group_key(packages: &BTreeMap<(u16, u16), Vec<u8>>, threshold: u16) -
     Some(bytes)
 }
 
-/// The group key with either Y parity, since part 3 normalizes it to even Y.
 fn same_group_key(rebuilt: [u8; 32], group: [u8; 32]) -> bool {
     use frost_core::Group;
     let point = frost::PallasGroup::deserialize(&rebuilt).unwrap();
@@ -339,7 +325,6 @@ fn new_signer_setup_reaches_ready_only_after_every_receipt_and_signs() {
             "every device shows the same code"
         );
 
-        // Before ready: no address, and signing is refused.
         assert!(matches!(members[0].release(), Err(SignerError::NotReady)));
         let mut tape = Vec::new();
         complete(&mut members, &vault_ref, &mut tape);
@@ -355,14 +340,12 @@ fn new_signer_setup_reaches_ready_only_after_every_receipt_and_signs() {
             .all(|a| a == &addresses[0] && a.vault_id == vault));
         assert!(addresses[0].address.starts_with("uregtest"));
 
-        // The fresh setup key is gone from every saved checkpoint.
         for m in &members {
             let store = SignerStore::open(&m.dir).unwrap();
             let (_, raw) = store.read(&m.signer.se, FileKind::Setup).unwrap().unwrap();
             assert!(!SetupCheckpoint::decode(&raw).unwrap().core.has_fresh_key());
         }
 
-        // The DKG-born share signs a candidate for the group key (2-of-n fixture).
         if threshold != 2 {
             continue;
         }
@@ -397,10 +380,6 @@ fn new_signer_setup_reaches_ready_only_after_every_receipt_and_signs() {
     }
 }
 
-/// Guard 1: record every setup message the relay carried and try to rebuild the vault's
-/// group key, even with every member's long-lived identity keys. It must fail on v2. The
-/// same attacker succeeds against the formats it replaces: plaintext round-two packages,
-/// and v1 envelopes sealed to the long-lived encryption keys.
 #[test]
 fn recorded_relay_traffic_cannot_rebuild_the_group_key() {
     let (threshold, count, vault) = (2u16, 3u16, [61u8; 32]);
@@ -410,7 +389,6 @@ fn recorded_relay_traffic_cannot_rebuild_the_group_key() {
     complete(&mut members, &vault_ref, &mut tape);
     let group = group_key(&members[0]);
 
-    // The attacker also holds every member's long-lived identity (signing + encryption).
     let identities: BTreeMap<u16, Identity> = members
         .iter()
         .map(|m| {
@@ -432,7 +410,6 @@ fn recorded_relay_traffic_cannot_rebuild_the_group_key() {
         let parsed = DkgWire::parse(wire.clone()).unwrap();
         let recipient = parsed.recipient().unwrap();
         let sender = identities[&parsed.sender()].public();
-        // Long-lived keys do not open v2 envelopes.
         if let Ok(plain) = identities[&recipient].open_round2(&sender, &vault, wire) {
             recovered.insert((parsed.sender(), recipient), plain[32..].to_vec());
         }
@@ -441,7 +418,6 @@ fn recorded_relay_traffic_cannot_rebuild_the_group_key() {
     assert!(recovered.is_empty());
     assert!(rebuild_group_key(&recovered, threshold).is_none());
 
-    // Control: the same attacker against the formats v2 replaces.
     let mut starting = BTreeMap::new();
     let mut round1 = BTreeMap::new();
     for id in 1..=count {
@@ -484,10 +460,8 @@ fn recorded_relay_traffic_cannot_rebuild_the_group_key() {
             .unwrap()
             .try_into()
             .unwrap();
-    // Plaintext packages (the leak in the earlier signer path): immediate rebuild.
     let rebuilt = rebuild_group_key(&plaintext, threshold).unwrap();
     assert!(same_group_key(rebuilt, control_key));
-    // v1 envelopes: a later compromise of the long-lived encryption keys opens them all.
     let opened: BTreeMap<_, _> = v1_tape
         .iter()
         .map(|(sender, recipient, wire)| {
@@ -509,7 +483,6 @@ fn restart_between_rounds_re_emits_identical_bytes_and_completes() {
     let vault = [62u8; 32];
     let (mut members, document) = setup_members(2, 3, vault);
     let vault_ref = begin(&mut members, &document);
-    // Restart right after the roster confirmation too.
     for m in members.iter_mut() {
         m.reopen();
     }
@@ -533,7 +506,6 @@ fn restart_between_rounds_re_emits_identical_bytes_and_completes() {
         );
         exchange(&mut members, &vault_ref, &mut inbox, &mut tape).unwrap();
     }
-    // Peers saw only identical copies, so nobody raised equivocation.
     complete(&mut members, &vault_ref, &mut tape);
     for m in members.iter_mut() {
         m.reopen();
@@ -552,8 +524,6 @@ fn swapped_or_rolled_back_files_are_rejected_or_only_abort() {
     exchange(&mut members, &vault_ref, &mut inbox, &mut tape).unwrap();
     let round1_checkpoint = std::fs::read(members[0].dir.join("setup.sealed")).unwrap();
 
-    // Rolled back while no share exists yet: member 1 reopens in round one, re-encrypts
-    // round two with new randomness, and its peers see a second, different envelope.
     exchange(&mut members, &vault_ref, &mut inbox, &mut tape).unwrap();
     assert_eq!(phase(&members[0]), DkgPhase::Round2);
     let saved: Vec<_> = members
@@ -575,7 +545,6 @@ fn swapped_or_rolled_back_files_are_rejected_or_only_abort() {
         "a rolled-back member's new round two must make a peer abort"
     );
 
-    // Fresh vault to check swapped files and a rollback across the share.
     let vault = [64u8; 32];
     let (mut members, document) = setup_members(2, 3, vault);
     let vault_ref = begin(&mut members, &document);
@@ -591,13 +560,11 @@ fn swapped_or_rolled_back_files_are_rejected_or_only_abort() {
         "identity.sealed",
     ] {
         let own = std::fs::read(members[0].dir.join(file)).unwrap();
-        // Another member's file of the same type.
         std::fs::copy(members[1].dir.join(file), members[0].dir.join(file)).unwrap();
         assert!(
             members[0].try_reopen().is_err(),
             "{file} from another member must not open"
         );
-        // The same member's file under another type's name.
         let other = if file == "setup.sealed" {
             "share.sealed"
         } else {
@@ -615,13 +582,10 @@ fn swapped_or_rolled_back_files_are_rejected_or_only_abort() {
         std::fs::write(members[0].dir.join(file), &own).unwrap();
         members[0].try_reopen().unwrap();
     }
-    // A setup checkpoint rolled back behind the saved share.
     let own = std::fs::read(members[0].dir.join("setup.sealed")).unwrap();
     std::fs::write(members[0].dir.join("setup.sealed"), &early).unwrap();
     assert!(members[0].try_reopen().is_err());
     std::fs::write(members[0].dir.join("setup.sealed"), &own).unwrap();
-    // A crash after the certified checkpoint was saved but before the share file was
-    // written: the checkpoint holds the share, so reopening writes the same share again.
     let share = std::fs::read(members[0].dir.join("share.sealed")).unwrap();
     std::fs::remove_file(members[0].dir.join("share.sealed")).unwrap();
     members[0].reopen();
@@ -636,7 +600,6 @@ fn swapped_or_rolled_back_files_are_rejected_or_only_abort() {
         }
     );
 
-    // A crash between saving the confirmed roster and its empty setup.
     let (mut members, document) = setup_members(2, 3, [65u8; 32]);
     let vault_ref = begin(&mut members, &document);
     std::fs::remove_file(members[0].dir.join("setup.sealed")).unwrap();
@@ -657,8 +620,6 @@ fn a_bad_message_after_the_share_exists_is_refused_and_the_share_kept() {
     }
     assert!(members.iter().all(|m| phase(m) == DkgPhase::Certified));
 
-    // Member 2 signs messages that differ from what member 1 saved: a backup receipt
-    // over another body, and a second certificate.
     let liar = members[1].signer.identity.as_ref().unwrap();
     let forged = [
         liar.sign_backup(&vault, b"a different backup body")
@@ -675,7 +636,6 @@ fn a_bad_message_after_the_share_exists_is_refused_and_the_share_kept() {
         assert_eq!(phase(&members[0]), DkgPhase::Certified);
         members[0].try_reopen().expect("the signer still opens");
     }
-    // The setup carries on: backups, every real receipt, ready, and the same group key.
     let before = group_key(&members[0]);
     members[0].reopen();
     let count = members.len() as u16;
@@ -765,7 +725,6 @@ fn roster_gate_rejects_bad_rosters_before_showing_a_code() {
         doc["members"][member][field] = value;
         doc
     };
-    // A small-order (weak) Ed25519 key: the identity point.
     let mut weak = [0u8; 32];
     weak[0] = 1;
     expect_rejected(
@@ -820,7 +779,6 @@ fn roster_gate_rejects_bad_rosters_before_showing_a_code() {
     let mut doc = base.clone();
     doc["setup_version"] = 1.into();
     expect_rejected(first, &doc, "setup_version 1");
-    // The untouched roster still goes through.
     first.signer.dkg_begin(&first.session, &document).unwrap();
 }
 
@@ -829,7 +787,6 @@ fn coordinator_key_swap_changes_the_code_and_the_signer_refuses() {
     let vault = [68u8; 32];
     let (mut members, document) = setup_members(2, 3, vault);
     let base: serde_json::Value = serde_json::from_slice(&document).unwrap();
-    // The coordinator swaps member 2's keys for its own in member 1's list only.
     let attacker = Identity::new(2).public();
     let mut swapped = base.clone();
     swapped["members"][1]["signing"] = hex::encode(attacker.signing).into();
@@ -846,7 +803,6 @@ fn coordinator_key_swap_changes_the_code_and_the_signer_refuses() {
     );
     assert!(!members[0].dir.join("roster.sealed").exists());
 
-    // One fake list sent to everyone: member 3 is replaced, so member 3 refuses outright.
     let mut fake = base.clone();
     let impostor = Identity::new(3).public();
     fake["members"][2]["signing"] = hex::encode(impostor.signing).into();
@@ -906,11 +862,9 @@ fn roster_code_is_24_digits_and_covers_every_field() {
             assert_ne!(roster_code(&roster.fingerprint()), shown, "{variant}");
         }
     }
-    // An explicit regtest network is the default network: same roster, same code.
     assert_eq!(code(&variants[4]), shown);
 }
 
-/// Sign a second, different round one as `member` (a member running modified software).
 fn equivocating_round1(member: &Member, document: &[u8]) -> Vec<u8> {
     let roster = ValidatedRoster::new(Roster::from_bytes(document).unwrap()).unwrap();
     let identity = member.signer.identity.as_ref().unwrap();
@@ -925,12 +879,10 @@ fn equivocation_on_frost_round1_aborts_and_the_abort_is_final() {
     let vault_ref = begin(&mut members, &document);
     let mut inbox = Inbox::new();
     let mut tape = Vec::new();
-    // Everyone emits round one.
     for m in members.iter_mut() {
         let out = m.signer.dkg_step(&m.session, &vault_ref, &[]).unwrap();
         route(m.id, out, 3, &mut inbox, &mut tape);
     }
-    // Member 2 shows member 1 a different, validly signed round one than member 3 saw.
     let other = equivocating_round1(&members[1], &document);
     for input in inbox.get_mut(&1).unwrap().iter_mut() {
         if input.sender == 2 {
@@ -956,14 +908,12 @@ fn equivocation_on_frost_round1_aborts_and_the_abort_is_final() {
     assert!(!stopped.is_empty());
     for m in members.iter_mut().filter(|m| stopped.contains(&m.id)) {
         assert!(m.signer.setup.as_ref().unwrap().core.is_wiped());
-        // Final: the same or fresh inputs never restart it.
         assert!(matches!(
             m.signer.dkg_step(&m.session, &vault_ref, &[]),
             Err(SignerError::SetupAborted(_))
         ));
     }
 
-    // Two different round ones from one member, seen by the same member: immediate abort.
     let vault = [72u8; 32];
     let (mut members, document) = setup_members(2, 3, vault);
     let vault_ref = begin(&mut members, &document);
@@ -996,7 +946,6 @@ fn forged_or_unsigned_round1_and_substituted_fresh_keys_are_rejected() {
             *wire = impostor.sign_round1(vault, &body).unwrap();
         }),
         ("substituted fresh key", |wire, _, _| {
-            // Body: commitment (32) then fresh key (32), after the 46-byte header.
             wire[46 + 32] ^= 1;
         }),
         ("unsigned", |wire, _, _| {
@@ -1055,7 +1004,6 @@ fn cancel_timeout_and_no_match_save_nothing() {
     late.reopen();
     assert!(late.signer.list_vaults(&late.session).unwrap().is_empty());
 
-    // After a cancel the member can still compare and confirm.
     *members[0].device.decision.lock().unwrap() = RosterDecision::Match;
     members[0].begin(&document).unwrap();
 }
@@ -1087,12 +1035,9 @@ fn address_release_needs_ready_and_an_approved_session() {
     let mut tape = Vec::new();
     complete(&mut members, &vault_ref, &mut tape);
     members[0].release().unwrap();
-    // A wrong passphrase cannot open the signer's KEK.
     assert!(SoftwareSecureElement::persistent(&members[0].dir, "wrong").is_err());
 }
 
-/// General t-of-n on the new signer path: a DKG to ready, then a quorum of exactly `t`
-/// DKG-born signers drives the keyless loop to a signed candidate.
 #[test]
 fn general_policies_run_the_dkg_and_sign() {
     use crate::signer::coordination::{drive_to_signed_pczt, PaymentIntent, QuorumMember};
@@ -1125,7 +1070,6 @@ fn general_policies_run_the_dkg_and_sign() {
             members[0].signer.public_package_bytes().unwrap(),
         )
         .unwrap();
-        // The quorum is the last `threshold` members, so member 1 is not always in it.
         let mut quorum: Vec<QuorumMember<'_, _>> = members
             .iter_mut()
             .skip(usize::from(count - threshold))
@@ -1163,15 +1107,11 @@ fn control_messages_open_only_from_the_confirmed_roster_member_on_their_session(
     let session = uuid::Uuid::new_v4();
     let body = br#"{"kind":"approval"}"#;
     let wire = members[2].signer.seal_control(session, 1, body).unwrap();
-    // The proposer opens it from its stored roster, after a restart too.
     members[0].reopen();
     let opened = members[0].signer.open_control(session, &members[2].public.encryption, &wire);
     assert_eq!(opened.unwrap(), (3, body.to_vec()));
-    // Bound to its control session.
     assert!(members[0].signer.open_control(uuid::Uuid::new_v4(), &members[2].public.encryption, &wire).is_err());
-    // A relay that relabels the sender cannot pass it off as another member's.
     assert!(members[0].signer.open_control(session, &members[1].public.encryption, &wire).is_err());
-    // An outsider claiming member 1's id and the relay sender of member 1 is refused.
     let outsider = Identity::new(1);
     let forged = outsider
         .seal_session(
@@ -1183,6 +1123,5 @@ fn control_messages_open_only_from_the_confirmed_roster_member_on_their_session(
         .unwrap();
     assert!(members[2].signer.open_control(session, &members[0].public.encryption, &forged).is_err());
     assert!(members[2].signer.open_control(session, &outsider.public().encryption, &forged).is_err());
-    // Only roster members are recipients.
     assert!(members[2].signer.seal_control(session, 4, body).is_err());
 }

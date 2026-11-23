@@ -1,15 +1,5 @@
-//! Shared PCZT finalization used by both payment binaries, so the Ironwood proving +
-//! extraction path lives in exactly one place.
-//!
-//! [`prove`] sets the chain anchor and spend witnesses on an approved, signed PCZT,
-//! refuses if that changes the approved sighash, proves the Ironwood (Orchard NU6.3)
-//! spends, and extracts the broadcastable transaction bytes + its txid.
-
 use zcash_primitives::transaction::{Transaction, TxId};
 
-/// Compute the v6 shielded sighash of finalized bytes for comparison with the PCZT.
-/// The transaction crate requires a transparent signing context even when the bundle is
-/// absent, so map only that empty slot to its effects-only authorization type.
 pub fn finalized_sighash(tx: &Transaction) -> Result<[u8; 32], String> {
     use zcash_primitives::transaction::{Authorization, TransactionData};
     struct ShieldedOnly;
@@ -44,7 +34,6 @@ fn ironwood_verifying_key() -> &'static orchard::circuit::VerifyingKey {
     })
 }
 
-/// Check the authorizing data, which is not committed to by the transaction ID.
 pub fn verify_ironwood_authorization(tx: &Transaction, sighash: [u8; 32]) -> Result<(), String> {
     use rand_zp::{rand_core::UnwrapErr, rngs::SysRng};
     let bundle = tx.ironwood_bundle().ok_or("missing Ironwood bundle")?;
@@ -56,10 +45,6 @@ pub fn verify_ironwood_authorization(tx: &Transaction, sighash: [u8; 32]) -> Res
     Ok(())
 }
 
-/// Finalize an approved, signed PCZT into a broadcastable transaction.
-///
-/// `sighash` is the sighash the members approved; proving refuses if applying the anchor
-/// or witnesses changes it (`anchor or witnesses changed the approved transaction effects`).
 pub fn prove(
     signed: pczt::Pczt,
     sighash: [u8; 32],

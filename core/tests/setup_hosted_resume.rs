@@ -85,7 +85,6 @@ fn prepare(
         return Ok(vec![]);
     }
     let p = accepted.context().policy();
-    // Each callback is supplied its own author's ID by the authenticated native envelope.
     let author = u16::from_be_bytes(
         outgoing.values().next().ok_or("empty")?[40..42]
             .try_into()

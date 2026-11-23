@@ -61,8 +61,6 @@ impl ProvisionIntent {
 }
 const SCHEMA: &str = include_str!("schema.sql");
 const TERMINAL_NOTICES: &str = include_str!("terminal_notices.sql");
-/// Databases made before vaults grew past 4 members (user_version 0 and 1) bound member
-/// counts and slots at 4. Each pair is (narrow, wide) and appears in exactly one table.
 const WIDENED: [(&str, &str); 3] = [
     (
         "CHECK(member_count IN(3,4))",
@@ -78,7 +76,6 @@ const WIDENED: [(&str, &str); 3] = [
     ),
 ];
 const SCHEMA_VERSION: u64 = 3;
-// State 0 is legacy: the relay may already hold permanent data for these mailboxes.
 const RESERVATIONS: &str = "
 ALTER TABLE mailboxes ADD COLUMN payment_state INTEGER NOT NULL DEFAULT 0 CHECK(payment_state BETWEEN 0 AND 2);
 ALTER TABLE operations ADD COLUMN slot INTEGER NOT NULL DEFAULT 0 CHECK(slot BETWEEN 0 AND 16);
@@ -94,9 +91,6 @@ fn narrow_schema() -> String {
         })
 }
 
-/// Widen the version-1 CHECK constraints in place. Every saved row already satisfies the
-/// wider bound, so only the schema text changes (SQLite's documented `writable_schema`
-/// procedure for constraint changes); integrity is checked before committing.
 fn widen_checks(tx: &Transaction<'_>) -> Result<()> {
     let version: i64 = tx.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
     tx.execute_batch("PRAGMA writable_schema=ON;")?;
@@ -424,7 +418,6 @@ impl AdmissionStore {
         ) {
             return Err(result.err().ok_or(Error::Storage)?);
         }
-        // Only committed transitions need exact replay. Notices are already stored by slot.
         let should_save = tx.total_changes() != changes
             && (result.is_ok()
                 || matches!(
@@ -437,8 +430,6 @@ impl AdmissionStore {
             );
         let reply = response(&self.signer, &request, digest, result)?;
         if should_save {
-            // Checkpoints are the only repeatable transition. Leave room for every
-            // bounded transition (claims, routes, terminal votes), regardless of this cap.
             if matches!(request.command, Command::Checkpoint { .. }) && reply.error.is_none() {
                 let count: u64 = tx.query_row(
                     "SELECT count(*) FROM operations WHERE ceremony=?1 AND slot=?2",
@@ -481,14 +472,12 @@ impl AdmissionStore {
             return Err(Error::Malformed);
         }
         let condition = if retire {
-            // A deadline observed outside the write transaction is not a decision.
             "m.retired=0 AND ((m.purpose=1 AND c.terminal!=0)
               OR (m.payment_state=1 AND c.terminal IN(1,3,4)))"
         } else {
             "m.retired=0 AND ((c.terminal=0 AND c.deadline>?1 AND m.provisioned=0)
               OR (c.terminal=2 AND m.purpose=2 AND (m.provisioned=0 OR m.payment_state=1)))"
         };
-        // Take the oldest due row on each relay before considering a second row there.
         let sql = format!(
             "SELECT m.ceremony,m.slot,m.relay,m.purpose,m.mailbox,m.request,m.quota,c.deadline,m.payment_state,c.terminal
              FROM mailboxes m JOIN ceremonies c ON c.id=m.ceremony

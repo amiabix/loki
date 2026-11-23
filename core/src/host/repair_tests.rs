@@ -258,7 +258,6 @@ fn wired_repair(threshold: u16, members: u16, lost: u16, fault: Option<Fault>) {
     let expected = keys[&frost::Identifier::try_from(lost).unwrap()]
         .serialize()
         .unwrap();
-    // `vault.sealed` is public metadata; signing reads the share from the signer store.
     assert!(stored.get("key_package").is_none() && stored.get("vault_secret").is_none());
     let sdir = super::super::ceremony::signer_dir(&data, &hex::encode(vault)).unwrap();
     let se = crate::signer::secure_element::SoftwareSecureElement::persistent(&sdir, "replacement pass").unwrap();
@@ -458,7 +457,6 @@ async fn repair_handlers_require_unlock_consent_and_local_relay_and_original_vau
         .contains("not locally configured"));
     assert!(!data.exists());
 
-    // Authenticate helpers against their sealed DKG roster and vault, not invite claims.
     let (shares, public) = frost::keys::generate_with_dealer(
         3,
         2,
@@ -469,7 +467,6 @@ async fn repair_handlers_require_unlock_consent_and_local_relay_and_original_vau
     let id = frost::Identifier::try_from(1u16).unwrap();
     let key = frost::keys::KeyPackage::try_from(shares[&id].clone()).unwrap();
     let root = MemberDir::create(&data, "").unwrap();
-    // This profile first joined another vault at slot 3; this vault uses local slot 1.
     let mut identity_bytes = Zeroizing::new(identities[0].to_secret_bytes());
     identity_bytes[..2].copy_from_slice(&3u16.to_be_bytes());
     root.write_sealed("identity.sealed", &*identity_bytes, "pass")
@@ -522,7 +519,6 @@ async fn repair_handlers_require_unlock_consent_and_local_relay_and_original_vau
         .as_str()
         .unwrap()
         .contains("original roster"));
-    // An existing vault must be refused before opening any relay session.
     let body = json!({"vault":invite.vault,"threshold":2,"roster":invite.roster,"roster_fingerprint":fingerprint,"helpers":[2,3],"lost":1});
     let reply = repair_begin(State(st.clone()), Json(body)).await;
     assert!(reply.1 .0["error"]

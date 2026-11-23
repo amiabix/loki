@@ -1,20 +1,3 @@
-//! "What you see is what you sign" (ws1-signer §5.4, invariant 3).
-//!
-//! Parses a PCZT and returns the payment facts DERIVED FROM THE BYTES — never from any
-//! caller-supplied label. The member approves THIS on-device. A malicious coordinator
-//! that claims recipient X while the PCZT actually pays Y is caught here, because every
-//! field below comes from the PCZT openings + the vault viewing key, not from the claim.
-//!
-//! Derivation:
-//! - recipient / amount / change: each output note is reconstructed from its openings
-//!   (`verify::open_output`), then classified as change iff its address equals the vault's
-//!   own internal address, otherwise it is the payment. Nonzero change must also decrypt
-//!   with the vault's internal viewing key. No expected recipient is consulted.
-//! - memo: the vault is the SENDER, so it recovers its own output's memo from
-//!   `enc_ciphertext` using the esk/pk_d of the reconstructed note.
-//! - fee: inputs minus outputs, from the opened values.
-//! - network: the consensus branch id committed in the PCZT global (the bytes bind it).
-
 use super::local::SignerError;
 use crate::verify::{check_change_decryption, open_output};
 use orchard::{
@@ -28,30 +11,18 @@ use orchard::{
 use pczt::roles::verifier::{OrchardError, Verifier};
 use zcash_note_encryption::{try_output_recovery_with_pkd_esk, Domain};
 
-/// Exactly the facts the member confirms on the signer. All derived from PCZT bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PaymentView {
-    /// Raw 43-byte Orchard address of the real payee, from the PCZT.
     pub to: [u8; 43],
     pub amount_zat: u64,
     pub fee_zat: u64,
     pub change_zat: u64,
-    /// The payee's memo, recovered from the ciphertext.
     pub memo: Vec<u8>,
-    /// Height after which the transaction cannot be mined, from the signed PCZT.
     pub expiry_height: u32,
-    /// Consensus branch id the PCZT commits to (e.g. NU7); several networks can share it.
     pub network_branch_id: u32,
-    /// `true` iff every action's declared spend/output value was bound to its `cv_net`
-    /// value commitment (`verify_cv_net`), so the rendered fee is the one the sighash
-    /// commits to — not a forgeable, self-declared number. `false` when any action is
-    /// missing its `rcv` trapdoor (e.g. a not-yet-IO-finalized PCZT); the fee is then
-    /// `amount_in - amount_out` of UNVERIFIED openings and MUST be shown as such.
     pub fee_verified: bool,
 }
 
-/// Parse `pczt_bytes` with the vault's viewing key and return what the member will sign.
-/// Errors on a structurally invalid PCZT or one whose payment cannot be fully reviewed.
 pub fn describe_pczt(pczt_bytes: &[u8], vault_fvk: &FullViewingKey) -> Result<PaymentView, String> {
     let parsed = pczt::Pczt::parse(pczt_bytes).map_err(|e| format!("pczt parse: {e:?}"))?;
     if *parsed.global().tx_version() != zcash_protocol::constants::V6_TX_VERSION {
@@ -79,16 +50,9 @@ pub fn describe_pczt(pczt_bytes: &[u8], vault_fvk: &FullViewingKey) -> Result<Pa
     let mut change_zat: u64 = 0;
     let mut total_in: u64 = 0;
     let mut total_out: u64 = 0;
-    // Fee integrity: a spend's declared value is only trustworthy once it is bound to the
-    // action's `cv_net` value commitment (the thing the sighash commits to). We start
-    // "verified" and clear it the moment any action lacks its `rcv` trapdoor or fails the
-    // binding — so a PCZT that hands us self-declared, uncommitted values renders an
-    // explicitly UNVERIFIED fee rather than a forgeable one.
     let mut fee_verified = true;
     let mut inner: Result<(), String> = Ok(());
 
-    // The Verifier yields the parsed `orchard::pczt::Bundle`, whose actions carry the
-    // openings `open_output` needs. We only read; `check_candidate` uses the same path.
     Verifier::new(parsed)
         .with_ironwood::<String, _>(|bundle| {
             let mut run = || -> Result<(), String> {
@@ -101,10 +65,6 @@ pub fn describe_pczt(pczt_bytes: &[u8], vault_fvk: &FullViewingKey) -> Result<Pa
                     {
                         return Err("pczt already carries a spend witness".into());
                     }
-                    // Bind this action's declared values to its value commitment. If the
-                    // trapdoor is absent or the commitment disagrees, the declared spend
-                    // value is not something the sighash commits to: keep reading for the
-                    // render but mark the fee unverified.
                     if action.verify_cv_net().is_err() {
                         fee_verified = false;
                     }
@@ -128,13 +88,11 @@ pub fn describe_pczt(pczt_bytes: &[u8], vault_fvk: &FullViewingKey) -> Result<Pa
                         continue;
                     }
                     if value == 0 {
-                        continue; // builder padding, not a payment
+                        continue;
                     }
                     if payee.is_some() {
                         return Err("pczt has more than one non-change payment output".into());
                     }
-                    // Recover the payee memo from the ciphertext as the SENDER (vault):
-                    // recovery with the reconstructed esk/pk_d also checks the transmitted epk.
                     let memo = recover_memo(action, &note)
                         .ok_or_else(|| format!("output {i} memo cannot be recovered"))?;
                     payee = Some((recipient, value, memo));
@@ -164,19 +122,10 @@ pub fn describe_pczt(pczt_bytes: &[u8], vault_fvk: &FullViewingKey) -> Result<Pa
     })
 }
 
-/// Independently recompute the FROST signing message (shielded sighash) from the PCZT
-/// bytes — the exact value a correct `SigningPackage.message()` must equal.
-///
-/// This is the WYSIWYS-to-signature binding: the member approves what [`describe_pczt`]
-/// rendered; this proves the `SigningPackage` the coordinator asks us to sign actually
-/// commits to THOSE bytes. It re-runs the same value/nullifier/rk bindings the live
-/// signing path uses (`signing_session`), so the sighash is only produced for a PCZT
-/// whose openings match its commitments for this vault's key.
 pub fn sighash_of_pczt(pczt_bytes: &[u8], vault_fvk: &FullViewingKey) -> Result<[u8; 32], String> {
     checked_sighash_of_pczt(pczt_bytes, vault_fvk).map_err(|e| e.to_string())
 }
 
-/// The same checks, retaining the fee refusal for device-local signing callers.
 pub fn checked_sighash_of_pczt(
     pczt_bytes: &[u8],
     vault_fvk: &FullViewingKey,
@@ -215,7 +164,6 @@ pub fn checked_sighash_of_pczt(
         .shielded_sighash())
 }
 
-/// Rebuild the on-chain action and recover the note plaintext (incl. memo) as the sender.
 fn recover_memo(action: &orchard::pczt::Action, note: &orchard::note::Note) -> Option<Vec<u8>> {
     let enc = &action.output().encrypted_note();
     let enc_ct: [u8; 580] = enc.enc_ciphertext.as_slice().try_into().ok()?;
@@ -259,7 +207,6 @@ mod tests {
     const SPEND_VALUE: u64 = 625_000_000;
     const AMOUNT: u64 = 40_000_000;
 
-    /// A real serialized regtest PCZT paying `recipient` with `memo`, sent by `fvk`.
     fn sample_pczt_with(
         recipient: orchard::Address,
         memo: &[u8],
@@ -443,11 +390,8 @@ mod tests {
         assert!(err.contains("unsupported transaction version"), "got {err}");
     }
 
-    // describe_pczt reports the TRUE recipient derived from the bytes, defeating a
-    // coordinator that "claims" a different payee (ws1-signer §5.4, acceptance test 4).
     #[test]
     fn describe_catches_claimed_vs_real_recipient() {
-        // Two distinct recipient addresses; the PCZT really pays `real`.
         let (_, fvk0, _) = sample_pczt(
             {
                 let rng = rand_core::OsRng;
@@ -466,19 +410,17 @@ mod tests {
             b"loki wysiwys",
         );
         let real = fvk0.address_at(7u64, Scope::External);
-        let claimed = fvk0.address_at(99u64, Scope::External); // what a liar would display
+        let claimed = fvk0.address_at(99u64, Scope::External);
 
         let (bytes, fvk, change) = sample_pczt(real, b"loki wysiwys");
         let view = describe_pczt(&bytes, &fvk).unwrap();
 
-        // Derived-from-bytes recipient equals the real payee, never the claim.
         assert_eq!(view.to, real.to_raw_address_bytes());
         assert_ne!(view.to, claimed.to_raw_address_bytes());
         assert_eq!(view.amount_zat, AMOUNT);
         assert_eq!(view.change_zat, change);
         assert!(view.fee_zat > 0);
         assert_eq!(view.expiry_height, 1_152);
-        // Memo recovered from the ciphertext, padded to 512 bytes.
         assert!(view.memo.starts_with(b"loki wysiwys"));
     }
 }

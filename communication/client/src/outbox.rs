@@ -12,8 +12,6 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use zeroize::{Zeroize, Zeroizing};
 
-/// Identifies caller intent independently of the newly allocated message ID.
-/// This local metadata digest carries no preparation or authentication authority.
 pub fn outbox_intent_digest(body: &MessageBody) -> ClientResult<Id32> {
     let mut normalized = body.clone();
     normalized.key.message = [0; 32];
@@ -147,7 +145,6 @@ pub(crate) fn validate(
     })
 }
 
-/// Caller policy for the extra relay pin. It does not read acknowledgements or release capacity.
 pub enum ThirdPass {
     StopAfterStored,
     ContinueThird,
@@ -158,7 +155,6 @@ pub struct UploadPass {
     pub stopped_third: bool,
 }
 
-/// Opaque whole-vault status. Fields stay private so one message cannot release another.
 pub struct DeliveryReport {
     key: LogicalKey,
     source_root: Id32,
@@ -197,7 +193,6 @@ impl DeliveryReport {
         two_keys(&self.whole)
     }
 
-    /// Pin key and run pairs that cover every required object of one recipient.
     pub fn member_pins(&self, recipient: MemberId) -> &[(Id32, Id32)] {
         recipient
             .checked_sub(1)
@@ -206,7 +201,6 @@ impl DeliveryReport {
             .unwrap_or(&[])
     }
 
-    /// Pin key and run pairs complete for every required object of all roster copies.
     pub fn whole_pins(&self) -> &[(Id32, Id32)] {
         &self.whole
     }
@@ -274,7 +268,6 @@ fn certified_route(
     })
 }
 
-/// Sends one due attempt for each certified row. A missing config reference returns before any PUT.
 pub async fn upload_pending(
     store: &mut ClientStore,
     http: &RelayHttp,

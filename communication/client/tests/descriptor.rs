@@ -962,8 +962,6 @@ fn config_reference_no_orphan_adoption_or_capabilities() {
         .unwrap()
         .map(Result::unwrap)
         .collect();
-    // Names are the schema.sql CREATE TABLE contract in sqlite_master order.
-    // They are written here and are not loaded from this database.
     assert_eq!(
         tables,
         [

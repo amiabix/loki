@@ -8,8 +8,6 @@ pub const TESTNET_NU7_BIRTH: u32 = 4_465_026;
 
 const MAINNET_REFUSED: &str = "mainnet network is refused: Loki is Testnet-only";
 
-/// The one gate for a raw address or consensus network type. No wildcard: a chain
-/// `zcash_protocol` adds later must be decided here, not defaulted in.
 pub fn refuse_mainnet(network: NetworkType) -> Result<NetworkType, String> {
     match network {
         NetworkType::Test | NetworkType::Regtest => Ok(network),
@@ -17,7 +15,6 @@ pub fn refuse_mainnet(network: NetworkType) -> Result<NetworkType, String> {
     }
 }
 
-/// The only chains on which this research wallet may create vaults.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VaultNetwork {
     Regtest,
@@ -34,8 +31,6 @@ impl VaultNetwork {
         }
     }
 
-    /// Refuses any chain lightwalletd reports other than this vault's. lightwalletd names
-    /// regtest "test" too, so the chains are told apart by Sapling activation.
     pub fn require_lightwalletd_chain(self, chain_name: &str, sapling_activation: u64) -> Result<(), String> {
         if chain_name != "test"
             || Some(sapling_activation) != self.activation_height(NetworkUpgrade::Sapling).map(u64::from)
@@ -91,7 +86,6 @@ mod tests {
     #[test]
     fn no_vault_network_maps_to_mainnet() {
         for network in [VaultNetwork::Regtest, VaultNetwork::Testnet] {
-            // A new variant fails to compile here; add it to this match and the list above.
             match network {
                 VaultNetwork::Regtest | VaultNetwork::Testnet => {}
             }
@@ -103,7 +97,6 @@ mod tests {
 
     #[test]
     fn a_mainnet_lightwalletd_is_refused() {
-        // Mainnet lightwalletd reports chain "main" with Sapling at 419200.
         for network in [VaultNetwork::Regtest, VaultNetwork::Testnet] {
             assert!(network.require_lightwalletd_chain("main", 419_200).is_err());
             assert!(network.require_lightwalletd_chain("test", 419_200).is_err());

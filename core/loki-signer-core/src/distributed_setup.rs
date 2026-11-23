@@ -1,9 +1,3 @@
-//! One member's dealerless DKG state. No process ever holds another member's secret package.
-//!
-//! The caller must authenticate each sender and encrypt every round-two package before
-//! transport. This module does not make a vault active: a certificate exchange and the
-//! ZIP 2005 viewing-key derivation are still required.
-
 use std::collections::BTreeMap;
 
 use blake2b_simd::Params;
@@ -45,7 +39,6 @@ fn expected_ids(members: u16) -> Vec<u16> {
     (1..=members).collect()
 }
 
-/// Any general t-of-n: at least one signer, threshold no larger than the roster.
 fn valid_policy(threshold: u16, members: u16) -> bool {
     1 <= threshold && threshold <= members
 }
@@ -177,7 +170,6 @@ impl Round2Member {
 }
 
 impl Completed {
-    /// The caller must authenticate the sender of each digest before passing it here.
     pub fn certificate_digest(&self) -> [u8; 32] {
         let hash = Params::new()
             .hash_length(32)
@@ -303,7 +295,6 @@ struct SecretCoefficients(Vec<pasta_curves::pallas::Scalar>);
 impl Drop for SecretCoefficients {
     fn drop(&mut self) {
         for scalar in &mut self.0 {
-            // The vector owns each live scalar; volatile writes prevent removal of the wipe.
             unsafe {
                 std::ptr::write_volatile(scalar, pasta_curves::pallas::Scalar::zero());
             }
@@ -589,10 +580,7 @@ impl Completed {
 mod tests {
     use super::*;
 
-    /// Drive the dealerless DKG end to end for a general t-of-n roster and return every
-    /// member's certified result. No hardcoded shape: this exercises the general path.
     fn run_dkg(threshold: u16, members: u16) -> Vec<Certified> {
-        // Round 1: each member starts and broadcasts its round-one package.
         let mut starting = Vec::new();
         let mut round1 = BTreeMap::new();
         for id in 1..=members {
@@ -601,7 +589,6 @@ mod tests {
             starting.push(member);
         }
 
-        // Round 2: each member advances, producing one round-two package per peer.
         let mut round2_members = Vec::new();
         let mut outgoing = Vec::new();
         for member in starting {
@@ -610,7 +597,6 @@ mod tests {
             round2_members.push(r2);
         }
 
-        // Deliver to each member the round-two package addressed to it from every peer.
         let mut completed = Vec::new();
         for (i, r2) in round2_members.iter().enumerate() {
             let own = (i as u16) + 1;
@@ -624,7 +610,6 @@ mod tests {
             completed.push(r2.finish(&incoming).unwrap());
         }
 
-        // Certify: every member must agree on the transcript and group key.
         let digests: BTreeMap<u16, [u8; 32]> = (1..=members)
             .zip(completed.iter().map(|c| c.certificate_digest()))
             .collect();
@@ -641,7 +626,6 @@ mod tests {
             let certified = run_dkg(t, n);
             assert_eq!(certified.len(), usize::from(n));
 
-            // Every member derived the same group key.
             let group_ak = certified[0].group_ak;
             assert!(certified.iter().all(|c| c.group_ak == group_ak));
 
@@ -650,7 +634,6 @@ mod tests {
             assert_eq!(public.min_signers(), Some(t));
             assert_eq!(public.verifying_shares().len(), usize::from(n));
 
-            // The DKG-produced shares sign, aggregate, and verify for a size-t quorum.
             let keys: BTreeMap<_, _> = certified
                 .iter()
                 .enumerate()

@@ -1,22 +1,3 @@
-//! Loki G1 POC — checkpoint 1: pin and prove the library path.
-//!
-//! This crate exists to answer four questions from the brief with code rather than
-//! with reading. Each is a named test or a compile probe.
-//!
-//!   C1.1  Is the FROST Pallas ciphersuite available?            -> PASS
-//!   C1.2  Can an FVK be built from a DKG group `ak`
-//!         plus ZIP 2005 `use_qsk = true`?                       -> LOCAL, UNREVIEWED
-//!   C1.3  Does the deferred v6 PCZT path exist?                 -> PASS
-//!   C1.4  Can the builder accept a caller-selected `alpha`?     -> BLOCKED
-//!
-//! Orchard's ZIP 2005 API is still absent. The local derivation in `zip2005` is checked
-//! against an independent vector and used in a mined regtest payment, but needs review. The
-//! `probe-zip2005` feature still records the missing upstream API. C1.4 is supplied by
-//! an isolated patch to vendored orchard; see vendor/README.md.
-
-// Moved into `loki-signer-core` (the dependency-clean, wasm-compilable signer core) and
-// re-exported here so the rest of this crate keeps using `crate::builder`, `crate::signer`,
-// `crate::member_state`, … unchanged. See that crate's lib.rs for the module list.
 pub use loki_signer_core::{
     builder, candidate, distributed_setup, dkg_core, intent, member_state, network,
     payment_manifest, randomizer, seal_kdf, setup_transport, signer, signing_session,
@@ -33,73 +14,31 @@ mod nonce_binding;
 pub mod payment_transport;
 pub mod profile;
 pub mod refresh;
-// The per-member HTTP coordinator (axum) that fronts the account + hosted-vault ceremony
-// for the web UI, driving the library in-process. Not feature-gated: it speaks frostd, not
-// the retiring relay stack; only its relay nonce-witness adapter needs `relay-communication`.
 pub mod host;
-// RETIRING (WS3/WS4): Loki's bespoke relay stack — `relay_member`, `setup_relay`,
-// `member_service`, and their `setup_backup`/`setup_retry` helpers — is being replaced
-// by the audited ZF `frostd` relay via `transport::FrostdTransport` (ws3 §2, ws4 §4).
-// It is already behind the off-by-default `relay-communication` feature and kept only so
-// the old flow still compiles during migration; the product build routes DKG + signing
-// messages through `transport` instead (typed `Outbound` sends; the signer's v2 DKG wires
-// via the `signer::coordination` drivers and the coordinator's `RelayLog`). The old flow
-// is on the same v2 round two and setup version 2, so it never sends round two under the
-// long-lived identity keys. The thin roster/admission layer (`setup_ceremony`,
-// invitations, the `VaultCertificate`) stays — that is what frostd does NOT provide
-// (ws3 §4). Do not add new callers of the modules below.
 #[cfg(feature = "relay-communication")]
 pub mod relay_member;
 pub mod rpc;
 pub mod scan;
 pub mod scanstate;
 pub mod setup_ceremony;
-// Reusable rerandomized FROST signing driver over a WS3 Transport (frostd).
 pub mod sign_transport;
 pub mod transport;
 pub mod tx_finalize;
 pub mod wallet_store;
 pub mod witness;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Compile probe for the one blocked requirement.
-//
-//   cargo build --features probe-zip2005   -> the ZIP 2005 blocker, verbatim
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// C1.2 probe. The brief requires an FVK built from a DKG-derived group `ak` plus the
-/// ZIP 2005 `use_qsk = true` derivation, and states that a pre-ZIP-2005 method alone is
-/// not a pass. ZIP 2005 specifies, for FROST-generated keys:
-///
-/// ```text
-///     qsk  --H^qk-->  qk
-///     rivk_ext = H^rivk_ext_qk(ak, nk)          <- keyed by qk, selected by use_qsk
-/// ```
-///
-/// None of `qsk`, `qk` or `rivk_ext` exists in orchard. This probe names them.
 #[cfg(feature = "probe-zip2005")]
 pub fn probe_zip2005(ak: [u8; 32], nk: [u8; 32], qsk: [u8; 32]) -> orchard::keys::FullViewingKey {
-    // Each of the three lines below is the smallest call that would satisfy the
-    // requirement. All three fail: the items do not exist in orchard 0.16.0.
     let qk = orchard::keys::QuantumIntermediateKey::from(&qsk);
     let rivk_ext = orchard::keys::CommitIvkRandomness::from_qk(&qk, &ak, &nk);
-    orchard::keys::FullViewingKey::from_parts_with_qsk(ak, nk, rivk_ext, /* use_qsk */ true)
+    orchard::keys::FullViewingKey::from_parts_with_qsk(ak, nk, rivk_ext, true)
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// The two requirements that DO hold.
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod checkpoint_1 {
     use reddsa_frost::frost::redpallas as frost;
     use std::collections::BTreeMap;
 
-    /// C1.1 — the FROST Pallas ciphersuite, end to end.
-    ///
-    /// DKG is exercised separately below; this covers key generation, preprocessing,
-    /// rerandomized signing, share verification and aggregation, which is the list the
-    /// brief asks to confirm.
     #[test]
     fn c1_1_frost_pallas_signs_with_a_saved_randomizer_seed() {
         let mut rng = rand_core::OsRng;
@@ -161,7 +100,6 @@ mod checkpoint_1 {
             .expect("verifies under the randomized group key");
     }
 
-    /// C1.1 — distributed key generation, no dealer.
     #[test]
     fn c1_1_dkg_three_members_reach_one_group_key() {
         use frost::keys::dkg;
@@ -212,11 +150,6 @@ mod checkpoint_1 {
         );
     }
 
-    /// C1.2, as far as it can go: validate the saved group-key encoding and compose
-    /// the documented test-only FVK. ZIP 2005 remains a separate setup path.
-    ///
-    /// **This is the pre-ZIP-2005 path and the brief says it is NOT a pass for G1.**
-    /// It is recorded here to show exactly how far the available APIs reach.
     #[test]
     fn c1_2_group_key_becomes_an_address_but_only_pre_zip2005() {
         use orchard::keys::{FullViewingKey, Scope, SpendingKey};
@@ -226,7 +159,6 @@ mod checkpoint_1 {
             frost::keys::generate_with_dealer(3, 2, frost::keys::IdentifierList::Default, rng)
                 .unwrap();
 
-        // 32 bytes is the only common currency between the two crate universes.
         let group_ak: [u8; 32] = pubkeys
             .verifying_key()
             .serialize()
@@ -234,9 +166,6 @@ mod checkpoint_1 {
             .try_into()
             .expect("a RedPallas verifying key is 32 bytes");
 
-        // nk and rivk still have to come from somewhere. ZIP 2005 says rivk_ext should be
-        // H^rivk_ext_qk(ak, nk) keyed by the quantum intermediate key. That derivation
-        // does not exist, so this borrows them from an ordinary wallet instead.
         let carrier = FullViewingKey::from(&SpendingKey::from_bytes([3u8; 32]).unwrap());
         let mut bytes = carrier.to_bytes();
         bytes[0..32].copy_from_slice(&group_ak);
@@ -251,10 +180,6 @@ mod checkpoint_1 {
         );
     }
 
-    /// C1.3 — the deferred v6 PCZT path exists and is Ironwood-aware.
-    ///
-    /// Compiling this test at all is the assertion: these paths resolve in
-    /// zcash_primitives 0.31.0-pre.0 and pczt 0.10.0-pre.0.
     #[test]
     fn c1_3_deferred_pczt_builder_and_ironwood_roles_resolve() {
         #[allow(unused_imports)]
@@ -265,7 +190,6 @@ mod checkpoint_1 {
         #[allow(unused_imports)]
         use zcash_primitives::transaction::builder::DeferredPcztBuilder;
 
-        // Named so a future reader can see which symbols were confirmed present.
         fn _confirmed<P>(_: Option<DeferredPcztBuilder<P>>, _: Option<Pczt>) {}
     }
 }

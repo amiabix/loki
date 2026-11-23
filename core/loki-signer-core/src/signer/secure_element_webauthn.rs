@@ -24,12 +24,8 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
-/// Domain separation for the WebAuthn-PRF-derived KEK. Distinct from any other use of the
-/// same passkey's PRF so the KEK can't collide with a differently-scoped secret.
 const KEK_INFO: &[u8] = b"Loki_signer_webauthn_prf_kek_v1";
 
-/// A KEK sourced from a WebAuthn PRF secret. Wraps/unwraps DEKs in the identical format as
-/// [`SoftwareSecureElement`]; the share seal path is untouched.
 pub struct WebAuthnSecureElement {
     inner: SoftwareSecureElement,
 }
@@ -46,13 +42,7 @@ impl WebAuthnSecureElement {
     }
 }
 
-/// The KEK bytes a WebAuthn PRF secret derives (HKDF-SHA256 over the fixed domain `info`).
-/// Exposed so the in-browser signer can seal its per-vault files under the identical custody
-/// KEK that wraps the device identity, without reconstructing a `SecureElement` it can't read
-/// the KEK back out of.
 pub fn prf_kek(prf_secret: &[u8; 32]) -> [u8; 32] {
-    // PRF output is already uniform HMAC material, so extract with no salt; expand pins the
-    // domain. A 32-byte OKM is always a valid HKDF-SHA256 length.
     let hk = Hkdf::<Sha256>::new(None, prf_secret);
     let mut kek = Zeroizing::new([0u8; 32]);
     hk.expand(KEK_INFO, &mut *kek)
@@ -83,7 +73,6 @@ mod tests {
         let se = WebAuthnSecureElement::from_prf_secret(&prf);
         let sealed = SealedShare::seal(&se, 3, share).unwrap();
 
-        // A signer that re-derives from the SAME PRF secret reopens the share unchanged.
         let se_again = WebAuthnSecureElement::from_prf_secret(&prf);
         let reopened = SealedShare::from_bytes(&sealed.to_bytes()).unwrap();
         assert_eq!(&**reopened.open(&se_again).unwrap(), share);
@@ -107,15 +96,12 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
 
-        // Tier 3: the existing software fallback, reused as-is.
         let se = SoftwareSecureElement::persistent(&dir, "correct horse battery staple").unwrap();
         let sealed = SealedShare::seal(&se, 0, b"share").unwrap();
 
-        // Reopen after a "restart": reconstruct the KEK from the same passphrase.
         let se_again =
             SoftwareSecureElement::persistent(&dir, "correct horse battery staple").unwrap();
         assert_eq!(&**sealed.open(&se_again).unwrap(), b"share");
-        // Wrong passphrase can't even reconstruct the element.
         assert!(SoftwareSecureElement::persistent(&dir, "wrong").is_err());
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -5,7 +5,6 @@ import { signerConfigResponse, signerOrigin } from '../src/lib/signer-config.ts'
 
 const hex = (n) => n.toString(16).padStart(2, '0').repeat(32);
 const witness = (n, endpoint) => ({ endpoint, key: hex(n), run: hex(n + 1), mailbox: hex(n + 2), read: hex(n + 3) });
-// What core/loki-signer-wasm/serve.mjs serves at /config.json.
 const served = () => ({
   walletOrigin: 'http://localhost:3001', frostdUrl: 'https://frostd.example', rpId: 'signer.example',
   nonceWitnesses: [witness(1, 'https://w1.example'), witness(5, 'https://w2.example')],
@@ -25,7 +24,6 @@ test('the coordinator serves the signer origin\'s configuration to LokiSigner, a
   try {
     const ok = await get();
     assert.equal(ok.status, 200);
-    // Only what the native signer needs, with witnesses in the native `--nonce-witnesses` shape.
     assert.deepEqual(ok.body, {
       network: 'testnet', frostdUrl: 'https://frostd.example', lightwalletdUrl: 'https://lwd.example:443',
       nonceWitnesses: [1, 5].map((n, i) => ({ endpoint: `https://w${i + 1}.example`, key: Array(32).fill(n),
@@ -52,7 +50,6 @@ test('the coordinator serves the signer origin\'s configuration to LokiSigner, a
   } finally {
     await new Promise((resolve) => signer.close(resolve));
   }
-  // Unreachable, or no signer origin configured: a clear error, never a configuration.
   const unreachable = await signerConfigResponse(origin, 'production');
   assert.equal(unreachable.status, 502);
   assert.match((await unreachable.json()).error, /unreachable/);

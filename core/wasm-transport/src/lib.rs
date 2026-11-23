@@ -1,33 +1,8 @@
-//! W3: a browser transport to the audited ZF `frostd` relay, over the Fetch API,
-//! async-native, no tokio runtime.
-//!
-//! `core/src/transport.rs`'s [`FrostdTransport`] speaks frostd's JSON-over-HTTP contract
-//! with `reqwest::Client` driven by `self.runtime.block_on` — a tokio runtime that cannot
-//! exist in a browser. This crate speaks the **same** contract (the 8 frostd endpoints,
-//! the same hex-or-bin wire types, the same XEdDSA login) but `.await`s each request
-//! directly: on `wasm32` the browser's Fetch API drives the futures with no runtime.
-//!
-//! Why a separate crate and not a `cfg(wasm32)` impl inside `core`: `loki-poc` pulls
-//! orchard/tonic/rusqlite and does not compile to wasm; only the wire does. When the
-//! signer core compiles to wasm (W1), this slots under the signer's transport seam. The
-//! method set mirrors `transport::Transport` (open/join/send/recv/close) but is **async**
-//! and takes **opaque bytes**: the typed `Outbound` / sealed-envelope layer lives above
-//! transport (`Outbound::to_bytes` is what crosses the wire), so the browser boundary
-//! moves exactly those bytes. See `sealed-envelope layer above transport is unchanged`.
-//!
-//! The sync `Transport` trait (`fn send(..) -> Result<..>`) cannot be implemented on wasm
-//! as-is: there is no way to block on a future in the browser. Integration therefore needs
-//! an async seam (an async trait, or the caller awaiting these methods). Flagged in the
-//! W3 report.
-
 use reqwest::{Client, RequestBuilder, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
 
-/// Only TLS, or plain HTTP to this machine, may carry relay traffic. Same rule as
-/// `transport::require_tls_off_loopback` — a browser can only reach frostd over https,
-/// but the check is identical so a native caller behaves the same.
 pub fn require_tls_off_loopback(base_url: &str) -> Result<(), String> {
     tls_url(base_url).map(|_| ())
 }
@@ -140,7 +115,6 @@ async fn fetch_bounded(request: RequestBuilder, cap: usize) -> Result<(StatusCod
         }.await;
         Ok((status, if status.is_success() { body? } else { body.unwrap_or_default() }))
     }.await;
-    // Stop the browser pulling an unread remainder after rejecting a response.
     controller.abort();
     result
 }
@@ -163,17 +137,12 @@ impl std::fmt::Display for TransportError {
 }
 impl std::error::Error for TransportError {}
 
-/// One inbound message: who sent it (sender frostd pubkey) and the opaque public bytes.
-/// Mirrors `transport::Incoming`; the E2E seal/open is the layer above.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Incoming {
     pub from: [u8; 32],
     pub message: Vec<u8>,
 }
 
-// Wire types mirrored from `frost_client::api` exactly as `core/src/transport.rs` mirrors
-// them (frostd serializes byte fields as lower-hex via `serdect`).
-// Keep these client budgets in sync with the native transport.
 const MAX_MSG_SIZE: usize = 65_535;
 const MAX_RECEIVE_MESSAGES: usize = 1024;
 const RECEIVE_CAP: usize = 8 * 1024 * 1024;
@@ -231,11 +200,6 @@ fn decode_message<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::
     hex::decode(s).map_err(serde::de::Error::custom)
 }
 
-/// A browser `frostd` client for one logged-in member. Addressed on the relay by the
-/// public half of its X25519 login key. It never holds that key's secret: the key owner (the
-/// wasm signer) signs the challenge and hands over only the signature
-/// ([`login_signed`](Self::login_signed)).
-/// Unlike [`FrostdTransport`](../core) it owns no tokio runtime — every method `.await`s.
 pub struct WasmFrostdTransport {
     base_url: String,
     client: Client,
@@ -244,8 +208,6 @@ pub struct WasmFrostdTransport {
 }
 
 impl WasmFrostdTransport {
-    /// `base_url` like `https://relay.example` (https off loopback). `me` is the X25519 login
-    /// public key (the relay address). Log in before any session call.
     pub fn new(base_url: &str, me: [u8; 32]) -> Result<Self, TransportError> {
         Ok(Self {
             base_url: relay_base_url(base_url).map_err(TransportError::Http)?,
@@ -273,15 +235,11 @@ impl WasmFrostdTransport {
             .map_err(|e| TransportError::Decode(e.to_string()))
     }
 
-    /// Fetch a login challenge. The key owner XEdDSA-signs its 16 UUID bytes and passes the
-    /// signature to [`login_signed`](Self::login_signed).
     pub async fn challenge(&self) -> Result<Uuid, TransportError> {
         let ch: ChallengeOut = self.post("challenge", json!({}), CONTROL_CAP).await?;
         Ok(ch.challenge)
     }
 
-    /// Present a signed challenge and cache the bearer token. Byte-for-byte the scheme frostd
-    /// verifies (`frostd/src/functions.rs::login`), same as the native path.
     pub async fn login_signed(&mut self, challenge: Uuid, signature: [u8; 64]) -> Result<(), TransportError> {
         let out: LoginOut = self
             .post(
@@ -298,8 +256,6 @@ impl WasmFrostdTransport {
         Ok(())
     }
 
-    /// Coordinator-only: create a session for the full roster. Returns the session id
-    /// (participants `join` it by id — frostd has no explicit join).
     pub async fn open(&self, peers: &[[u8; 32]], message_count: u8) -> Result<Uuid, TransportError> {
         let pubkeys: Vec<String> = peers.iter().map(hex::encode).collect();
         let out: CreateOut = self
@@ -312,8 +268,6 @@ impl WasmFrostdTransport {
         Ok(out.session_id)
     }
 
-    /// Send one message to recipients. Empty `to` means "to the coordinator" (frostd
-    /// convention). `message` is the opaque public bytes (`Outbound::to_bytes` upstream).
     pub async fn send(&self, session: Uuid, to: &[[u8; 32]], message: &[u8]) -> Result<(), TransportError> {
         if message.len() > MAX_MSG_SIZE {
             return Err(TransportError::Decode("relay message too large".into()));
@@ -332,9 +286,6 @@ impl WasmFrostdTransport {
         Ok(())
     }
 
-    /// Drain this member's inbox for the session. `as_coordinator` selects the coordinator
-    /// mailbox. frostd's `receive` returns whatever is queued immediately (not a long poll),
-    /// so the browser caller polls this on a timer — no WebSocket needed.
     pub async fn recv(&self, session: Uuid, as_coordinator: bool) -> Result<Vec<Incoming>, TransportError> {
         let out: ReceiveOut = self
             .post(
@@ -349,13 +300,11 @@ impl WasmFrostdTransport {
         Ok(out.msgs.into_iter().map(|m| Incoming { from: m.sender.0, message: m.msg }).collect())
     }
 
-    /// Every session id this member is a participant/coordinator of (NAT-free discovery).
     pub async fn list_sessions(&self) -> Result<Vec<Uuid>, TransportError> {
         let out: ListSessionsOut = self.post("list_sessions", json!({}), LIST_CAP).await?;
         Ok(out.session_ids)
     }
 
-    /// The participant pubkeys of one session, and the pubkey of the member who opened it.
     pub async fn session_info(&self, session: Uuid) -> Result<(Vec<[u8; 32]>, Option<[u8; 32]>), TransportError> {
         let out: SessionInfoOut = self
             .post("get_session_info", json!({ "session_id": session }), INFO_CAP)
@@ -363,7 +312,6 @@ impl WasmFrostdTransport {
         Ok((out.pubkeys.into_iter().map(|k| k.0).collect(), out.coordinator_pubkey.map(|k| k.0)))
     }
 
-    /// Coordinator-only: close the session (frostd rejects non-coordinator closes).
     pub async fn close(&self, session: Uuid) -> Result<(), TransportError> {
         self.post::<serde_json::Value>("close_session", json!({ "session_id": session }), CONTROL_CAP)
             .await?;
@@ -371,9 +319,6 @@ impl WasmFrostdTransport {
     }
 }
 
-/// One external nonce witness (a relay mailbox), as the operator provisions it for native
-/// members (`core/src/host/nonce_witness.rs` `WitnessConfig`): the relay's pinned signing key
-/// and run, and the mailbox.
 pub struct NonceWitnessRoute {
     pub endpoint: String,
     pub key: [u8; 32],
@@ -383,11 +328,6 @@ pub struct NonceWitnessRoute {
 
 const RECEIPT_CAP: usize = 4096;
 
-/// Claim `cid` once at one witness, the same request and receipt check as the native relay
-/// client (`loki_relay_client::RelayHttp::claim_nonce`): PUT the record under a fresh
-/// challenge, then accept only a canonical receipt signed by the PINNED relay key that binds
-/// this mailbox, claimant, CID, record hash and challenge. `Ok(true)` is a fresh claim; `Ok(false)` an
-/// existing one (a duplicate, which a signer must treat as a refusal).
 pub async fn claim_nonce(
     route: &NonceWitnessRoute,
     cid: [u8; 32],
@@ -448,9 +388,6 @@ pub async fn claim_nonce(
     Ok(receipt.created)
 }
 
-/// JS bindings (W1G): the signer Worker drives DKG by pumping these async methods between
-/// the synchronous wasm `Signer` and frostd. A thin wrapper over [`WasmFrostdTransport`] that
-/// holds the one session id the coordinator published, so the Worker passes only opaque hex.
 #[cfg(target_arch = "wasm32")]
 mod wasm_api {
     use super::*;
@@ -466,8 +403,6 @@ mod wasm_api {
         Ok(value)
     }
 
-    /// Claim a nonce at one external witness: `true` only for a fresh claim whose receipt the
-    /// pinned relay key signed (see [`claim_nonce`]); `false` for an existing claim. Hex args.
     #[wasm_bindgen(js_name = claimNonce)]
     pub async fn claim_nonce_js(
         endpoint: String,
@@ -494,8 +429,6 @@ mod wasm_api {
         claim_nonce(&route, hex32(&cid_hex)?, &record, hex32(&challenge_hex)?, proof).await.map_err(je)
     }
 
-    /// A logged-in browser frostd client bound to one DKG session. Addressed on the relay by
-    /// the member's X25519 login pubkey (the `encryption` key enrolled for its slot).
     #[wasm_bindgen]
     pub struct FrostdClient {
         inner: WasmFrostdTransport,
@@ -504,20 +437,16 @@ mod wasm_api {
 
     #[wasm_bindgen]
     impl FrostdClient {
-        /// `base_url` is the TLS frostd (https off loopback). `pubkey_hex` is the member's
-        /// X25519 login public key, from the wasm signer's `frostdPubkey()`. No secret here.
         #[wasm_bindgen(constructor)]
         pub fn new(base_url: &str, pubkey_hex: &str) -> Result<FrostdClient, JsError> {
             let inner = WasmFrostdTransport::new(base_url, hex32(pubkey_hex)?).map_err(je)?;
             Ok(Self { inner, session: None })
         }
 
-        /// A fresh login challenge (UUID string) for the wasm signer's `frostdSignChallenge`.
         pub async fn challenge(&self) -> Result<String, JsError> {
             Ok(self.inner.challenge().await.map_err(je)?.to_string())
         }
 
-        /// Log in with the challenge and the signer's XEdDSA signature (hex), caching the token.
         #[wasm_bindgen(js_name = loginSigned)]
         pub async fn login_signed(&mut self, challenge: &str, signature_hex: &str) -> Result<(), JsError> {
             let challenge = Uuid::parse_str(challenge).map_err(je)?;
@@ -526,12 +455,10 @@ mod wasm_api {
             self.inner.login_signed(challenge, sig).await.map_err(je)
         }
 
-        /// Every session id this member participates in (NAT-free discovery), as hex strings.
         pub async fn list_sessions(&self) -> Result<Vec<String>, JsError> {
             Ok(self.inner.list_sessions().await.map_err(je)?.iter().map(Uuid::to_string).collect())
         }
 
-        /// Bind the coordinator's published session id; send/recv address it.
         #[wasm_bindgen(js_name = useSession)]
         pub fn use_session(&mut self, session_id: &str) -> Result<(), JsError> {
             self.session = Some(Uuid::parse_str(session_id).map_err(je)?);
@@ -542,8 +469,6 @@ mod wasm_api {
             self.session.ok_or_else(|| JsError::new("no session bound — call useSession first"))
         }
 
-        /// Open a session of these participants (hex pubkeys) and bind it; returns its id. A
-        /// joiner opens one with the vault creator for each join request.
         #[wasm_bindgen(js_name = openSession)]
         pub async fn open_session(&mut self, peers: Vec<String>) -> Result<String, JsError> {
             let peers = peers.iter().map(|p| hex32(p)).collect::<Result<Vec<_>, _>>()?;
@@ -552,13 +477,10 @@ mod wasm_api {
             Ok(session.to_string())
         }
 
-        /// Close the bound session this member opened.
         pub async fn close(&self) -> Result<(), JsError> {
             self.inner.close(self.session()?).await.map_err(je)
         }
 
-        /// The bound session's participants and the member who opened it (its coordinator), as
-        /// JSON `{participants: [hex], coordinator: hex | null}`.
         #[wasm_bindgen(js_name = sessionInfo)]
         pub async fn session_info(&self) -> Result<String, JsError> {
             let (participants, owner) = self.inner.session_info(self.session()?).await.map_err(je)?;
@@ -569,7 +491,6 @@ mod wasm_api {
             .to_string())
         }
 
-        /// Send one DKG wire (hex) to the coordinator (frostd empty-recipient convention).
         #[wasm_bindgen(js_name = sendToCoordinator)]
         pub async fn send_to_coordinator(&self, msg_hex: &str) -> Result<(), JsError> {
             if msg_hex.len() > 2 * MAX_MSG_SIZE {
@@ -579,8 +500,6 @@ mod wasm_api {
             self.inner.send(self.session()?, &[], &msg).await.map_err(je)
         }
 
-        /// Send one message (hex) to a single peer (hex pubkey) on the bound session — the
-        /// explicit-recipient path the native host uses for control messages (`&[Peer(..)]`).
         #[wasm_bindgen(js_name = sendToPeer)]
         pub async fn send_to_peer(&self, peer_hex: &str, msg_hex: &str) -> Result<(), JsError> {
             if msg_hex.len() > 2 * MAX_MSG_SIZE {
@@ -590,8 +509,6 @@ mod wasm_api {
             self.inner.send(self.session()?, &[hex32(peer_hex)?], &msg).await.map_err(je)
         }
 
-        /// Drain this member's inbox; returns a JSON array of `{from, message}` (both hex).
-        /// The Worker keeps only messages whose `from` is the coordinator peer.
         pub async fn recv(&self) -> Result<String, JsError> {
             let msgs = self.inner.recv(self.session()?, false).await.map_err(je)?;
             let out: Vec<serde_json::Value> = msgs
@@ -617,11 +534,8 @@ mod tests {
         }
     }
 
-    // The request/response shaping is the wire contract; prove it serializes/deserializes
-    // exactly as frostd speaks it (lower-hex byte fields), independent of any network.
     #[test]
     fn wire_shapes_match_frostd_contract() {
-        // receive response → Incoming, sender+msg are lower-hex.
         let raw = json!({
             "msgs": [
                 { "sender": "aa".repeat(32), "msg": hex::encode([1u8, 2, 3]) }
@@ -639,13 +553,11 @@ mod tests {
             .collect();
         assert_eq!(incoming, vec![Incoming { from: [0xaa; 32], message: vec![1, 2, 3] }]);
 
-        // session info response → raw pubkeys.
         let raw = json!({ "pubkeys": ["bb".repeat(32)] }).to_string();
         let info: SessionInfoOut = serde_json::from_str(&raw).unwrap();
         let keys: Vec<[u8; 32]> = info.pubkeys.into_iter().map(|k| k.0).collect();
         assert_eq!(keys, vec![[0xbb; 32]]);
 
-        // challenge / login / create / list_sessions decode.
         let c: ChallengeOut = serde_json::from_value(json!({ "challenge": Uuid::nil() })).unwrap();
         assert_eq!(c.challenge, Uuid::nil());
         let _: LoginOut = serde_json::from_value(json!({ "access_token": Uuid::nil() })).unwrap();
@@ -655,24 +567,16 @@ mod tests {
     }
 }
 
-/// Live round-trip against a frostd reachable on loopback (ssh -N -L 2744:localhost:2744
-/// omarchy). Ignored by default — run with `--ignored` when the tunnel is up. Exercises
-/// the full fetch wire: challenge → login → create → send → receive → close.
 #[cfg(test)]
 mod live {
     use super::*;
 
     fn gen_login() -> ([u8; 32], [u8; 32]) {
-        // The relay address is the X25519 public half of the login secret, derived exactly
-        // as the native transport does (`PublicKey::from(&StaticSecret)`).
         let secret = [7u8; 32];
         let pubkey = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(secret)).to_bytes();
         (secret, pubkey)
     }
 
-    /// Live: two dev witness relays enrolled for the fixture identity, named by
-    /// `LOKI_NONCE_TEST_WITNESSES` (the native `[WitnessConfig; 2]` JSON). A fresh claim is accepted
-    /// at each; the same claim again is a duplicate; a receipt from an unpinned key is refused.
     #[tokio::test]
     #[ignore = "needs two enrolled dev witness relays (LOKI_NONCE_TEST_WITNESSES)"]
     async fn witnesses_accept_a_claim_once_and_refuse_a_duplicate() {
@@ -709,15 +613,12 @@ mod live {
         let signing = xeddsa::xed25519::PrivateKey::from(&secret);
         let sig: [u8; 64] = xeddsa::Sign::sign(&signing, challenge.as_bytes(), rand::rng());
         t.login_signed(challenge, sig).await.expect("login");
-        // One-member session with self as the only participant: create, send to coordinator,
-        // drain the coordinator mailbox, close.
         let session = t.open(&[me], 1).await.expect("create");
         t.send(session, &[], b"hello frostd over fetch").await.expect("send");
         let msgs = t.recv(session, true).await.expect("receive");
         assert_eq!(msgs, vec![Incoming { from: me, message: b"hello frostd over fetch".to_vec() }]);
         let sessions = t.list_sessions().await.expect("list");
         assert!(sessions.contains(&session));
-        // Members tell a payment's control session from its signing session by who opened it.
         assert_eq!(t.session_info(session).await.expect("info"), (vec![me], Some(me)));
         t.close(session).await.expect("close");
     }

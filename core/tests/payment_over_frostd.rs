@@ -30,7 +30,6 @@ struct MemoryTransport {
     me: Peer,
     coordinator: Peer,
     inboxes: Arc<Mutex<BTreeMap<[u8; 32], Vec<Incoming>>>>,
-    /// Every message the relay carried, as a relay operator would see it.
     relayed: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
@@ -121,8 +120,6 @@ fn two_of_three_payment_pczt_verifies_in_memory() {
         },
         |channel| *channel,
     );
-    // The relay carried sealed commitments, candidates, packages, seeds and shares,
-    // but never a readable candidate or the vault's viewing key.
     let fvk = fvk.to_bytes();
     let relayed = relayed.lock().unwrap();
     assert!(relayed.len() >= 8, "relay carried {} messages", relayed.len());
@@ -249,7 +246,6 @@ where
     let session = session_id(&channel);
     let member_transports: Vec<_> = identities.iter().map(make_transport).collect();
     let signer_network = if network == VaultNetwork::Testnet { Network::Testnet } else { Network::Regtest };
-    // One reference per spend, so each spend commits under its own nonce id.
     let candidates: Vec<_> = (0..spends)
         .map(|i| CandidateRef { vault_id: [1; 32], payment_id: [7; 32], attempt_id: [9 + i; 32] })
         .collect();
@@ -325,7 +321,6 @@ where
         let sighash = pczt::roles::signer::Signer::new(parsed.clone())
             .unwrap()
             .shielded_sighash();
-        // Every spent note carries its own valid signature under its own randomized key.
         for note in &notes {
             let action = parsed
                 .ironwood()

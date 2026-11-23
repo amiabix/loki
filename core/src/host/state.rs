@@ -9,10 +9,8 @@ use crate::signer::secure_element::{OpenError, SecureElement, SoftwareSecureElem
 #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
 use crate::signer::secure_element_apple::{AppleSecureElement, KeyFailure};
 
-/// Launch configuration for one member coordinator (one process per member).
 pub struct Config {
     pub registration: Option<super::RegistrationConfig>,
-    /// The GUI entry points own local recovery and may use a profile-scoped Apple key tag.
     pub(super) native: bool,
     pub data: PathBuf,
     pub port: u16,
@@ -24,19 +22,13 @@ pub struct Config {
     pub transport: String,
     pub secure_element: String,
     pub operator_bundle: Option<PathBuf>,
-    /// Two pinned external nonce-witness mailboxes; required for hosted signing.
     pub nonce_witnesses: Option<PathBuf>,
     pub operator_key: Option<String>,
     pub enrollment_issuer: Option<PathBuf>,
     pub development_http: bool,
-    /// Headless capability, printed in the signer link. Empty for LokiSigner, which
-    /// authenticates only with individually approved wallet-tab tokens.
     pub token: String,
     pub frostd_url: String,
-    /// Operator URL allowlist for remote peers; vault slots never resolve through this map.
     pub peers: BTreeMap<u16, String>,
-    /// Operator opt-in: admit new loopback peer origins outside regtest, for a co-located
-    /// demo where every signer runs on this host. Off by default so real deployments stay locked.
     pub loopback_peers: bool,
 }
 
@@ -69,11 +61,9 @@ impl Config {
             || url.path() != "/" || (origin != base && explicit_default != base) {
             return Err("member URL must be a plain HTTP(S) origin".into());
         }
-        // The co-located regtest demo, or an explicit operator opt-in, admits new loopback origins.
         let loopback = matches!(url.host_str(), Some("127.0.0.1" | "[::1]"));
         let local = loopback && (self.network == "regtest" || self.loopback_peers)
             && url.port().is_some_and(|p| p >= 1024);
-        // Outside the local demo, authenticate the locally configured peer name with TLS.
         if local || (!loopback && url.scheme() == "https"
             && self.peers.values().any(|allowed| allowed == &origin || allowed == &explicit_default))
         {
@@ -102,7 +92,6 @@ impl Config {
         result
     }
 
-    // A staged vault must use the same Enclave key after its directory is published.
     pub(super) fn create_secure_element(&self, dir: &Path, pass: &str, published: Option<&Path>, profile: &Path) -> Result<HostedSecureElement, String> {
         self.open_element(dir, pass, true, published, profile, None)
     }
@@ -183,12 +172,9 @@ pub(super) fn restored_key_tag(restore: uuid::Uuid, role: &str) -> Vec<u8> {
 #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave")))]
 fn vault_key_scope(config: &Config, profile: &Path, key_dir: &Path, published: Option<&Path>, create: bool) -> Result<(Option<uuid::Uuid>, String), String> {
     let mut scope = key_scope(config, profile)?;
-    // The first release with profile scopes used them only for device keys. Existing
-    // vault seals without this marker still use their original path tag.
     if scope.is_some() && !create && !key_dir.join(SCOPED_VAULT_KEY).try_exists().map_err(|e| e.to_string())? {
         scope = None;
     }
-    // Only the vault ID (the parent of signer/) is part of the role, never a staging name.
     let role = if scope.is_some() {
         let id = published.unwrap_or(key_dir).parent().and_then(Path::file_name).and_then(|name| name.to_str()).ok_or("invalid vault key directory")?;
         format!("vault:{id}")
@@ -196,8 +182,6 @@ fn vault_key_scope(config: &Config, profile: &Path, key_dir: &Path, published: O
     Ok((scope, role))
 }
 
-/// The scoped form survives a folder move. For a staged restore, pass the scope read from
-/// the staged profile and use the published directory only as the legacy fallback.
 #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave")))]
 pub(super) fn apple_key_tag(dir: &Path, scope: Option<uuid::Uuid>, role: &str) -> Vec<u8> {
     if let Some(scope) = scope {
@@ -243,12 +227,10 @@ pub(super) fn open_apple_element(dir: &Path, create: bool, published: Option<&Pa
 
 #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
 fn legacy_key_dir(dir: &Path, published: Option<&Path>) -> Result<PathBuf, KeyFailure> {
-    // Keep existing tags compatible, including the eventual location of a staged key.
     Ok(match published {
         Some(path) => path.to_owned(),
         None => match dir.canonicalize() {
             Ok(path) => path,
-            // The login key can exist even if its directory was never published or was removed.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && dir.file_name().is_some() => {
                 let parent = dir.parent().ok_or(KeyFailure::Other)?.canonicalize().map_err(|_| KeyFailure::Other)?;
                 parent.join(dir.file_name().unwrap())
@@ -409,16 +391,12 @@ pub(super) mod scope_test {
     }
 }
 
-/// The unlocked profile. Holds only the passphrase + data root (no live connections);
-/// the hosted relay runtime is a process-wide singleton in `setup_relay`. Mirrors
-/// `member_service::Service` but shaped for the HTTP + `spawn_blocking` model.
 pub struct Session {
     pub passphrase: Zeroizing<String>,
     pub data: PathBuf,
 }
 
 impl Session {
-    /// Validate the sealed profile without activating the session or its cache.
     pub fn unlock(
         data: PathBuf,
         passphrase: Zeroizing<String>,
@@ -431,63 +409,39 @@ impl Session {
 pub struct AppState {
     pub config: Config,
     pub(super) registration: RwLock<Option<super::registration::PublicMember>>,
-    /// The last failed registration attempt, reported locally while registration retries.
     pub(super) registration_error: RwLock<Option<String>>,
     pub session: RwLock<Option<Session>>,
-    /// A native member never unlocks in place after stopping; each launch has its own signal.
     pub(super) stopping: watch::Sender<bool>,
-    // Lock and activation both modify session state under the session write lock.
     pub(super) session_generation: AtomicU64,
     pub ceremony: std::sync::Mutex<()>,
     pub payment: std::sync::Mutex<()>,
     pub active_payments: std::sync::Mutex<BTreeSet<String>>,
-    /// Logged-in relay connections for control messages, by login key (see `payment::RelayLease`).
     pub(super) relays: std::sync::Mutex<BTreeMap<[u8; 32], super::payment::CachedRelay>>,
-    /// Per vault: held while that vault's control mailbox is being drained and applied.
     pub(super) control_receivers: std::sync::Mutex<BTreeMap<String, std::sync::Arc<std::sync::Mutex<()>>>>,
-    /// Per vault: the background control sync's state, reported to the wallet.
     pub(super) control_status: std::sync::Mutex<BTreeMap<String, super::payment::ControlStatus>>,
-    /// Per (vault, frostd session): the roster member who owns it, or `None` for a session that
-    /// isn't this vault's control mailbox. A session's owner and members never change.
     pub(super) control_sessions: std::sync::Mutex<BTreeMap<(String, uuid::Uuid), Option<u16>>>,
     pub active_dkgs: std::sync::Mutex<BTreeSet<String>>,
-    /// The creator's frostd loop answering joiners is running (`ceremony::spawn_join_relay`).
     pub(super) join_relay: std::sync::atomic::AtomicBool,
-    /// Device login registry, built lazily from `data/recovery.pub` + `data/devices.json` once
-    /// a recovery identity exists. Holds outstanding challenges in-process across requests.
     pub(super) device_auth: std::sync::Mutex<Option<super::device::DeviceState>>,
-    /// The member's native payment decision; `None` (headless) refuses every payment.
     pub approval: Option<super::LocalApproval>,
     pub(super) notice: Option<super::LocalNotice>,
-    /// The member's native roster-code comparison; `None` (headless) trusts the caller of
-    /// `/api/agree`.
     pub roster_confirmation: Option<super::LocalRosterConfirmation>,
-    /// The vault whose roster code the native app is asking about; it asks about one at a time.
     pub(super) roster_asking: std::sync::Mutex<Option<String>>,
-    /// Vaults whose codes the member said differ, refused until the app restarts.
     pub(super) roster_refused: std::sync::Mutex<BTreeSet<String>>,
     pub(super) wallet_tabs: Option<super::connect::WalletTabs>,
-    /// Each opened vault's viewing key; `None` means a cancelled open needs an explicit retry.
     pub(super) viewing_keys: std::sync::Mutex<BTreeMap<String, Option<orchard::keys::FullViewingKey>>>,
-    /// True until the first registration attempt after unlock finishes. Its device-key Touch ID
-    /// prompt comes first; vault opens wait so two prompts never race (and cancel each other).
     pub(super) first_registration: (std::sync::Mutex<bool>, std::sync::Condvar),
-    /// Per vault: deposits seen by the last wallet scan, listed in History.
     pub(super) received: std::sync::Mutex<BTreeMap<String, Vec<crate::wallet_store::Received>>>,
-    /// LokiSigner's confirmed launch snapshot. Fresh settings without overrides are saved on unlock.
     pub(super) fetched_config: Option<super::FetchedConfig>,
 }
 
 impl AppState {
-    /// Marks whether the first registration attempt after unlock is still running.
     pub(super) fn set_first_registration(&self, running: bool) {
         let (lock, changed) = &self.first_registration;
         if let Ok(mut flag) = lock.lock() { *flag = running; }
         changed.notify_all();
     }
 
-    /// Waits (at most `limit`) for the first registration attempt, so its Touch ID prompt is
-    /// answered before another one appears.
     pub(super) fn after_first_registration(&self, limit: std::time::Duration) {
         let (lock, changed) = &self.first_registration;
         if let Ok(flag) = lock.lock() {
@@ -544,7 +498,6 @@ impl AppState {
         let waiting = !super::ceremony::waiting_for_joiners(&session.data, &session.passphrase).is_empty();
         *current = Some(session);
         drop(current);
-        // A creator restarted mid-setup answers joiners again without anyone opening the vault.
         if waiting {
             super::ceremony::spawn_join_relay(self);
         }

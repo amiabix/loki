@@ -2,7 +2,6 @@ use crate::{ClientError, ClientResult};
 use loki_relay_protocol::WireError;
 use std::net::IpAddr;
 
-// Conservative Internet-unicast allowlist; mapped and transition IPv6 are not accepted.
 pub(crate) fn public_destination(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {

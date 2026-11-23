@@ -1,7 +1,3 @@
-//! Reference regtest wallet for proving control of a ZIP 32 Orchard account.
-//! This is a wallet-side adapter, not an API that an arbitrary Zcash wallet exposes.
-// shortcut: custom RedPallas account proof is regtest only; replace with a reviewed wallet signing capability before custody.
-
 use std::{
     env, fs,
     path::Path,
@@ -21,7 +17,6 @@ use reddsa_frost::{orchard::SpendAuth, Signature, VerificationKey};
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
-// The unique canonical encoding of the Pallas identity.
 const PALLAS_IDENTITY: [u8; 32] = [0; 32];
 
 fn now() -> Result<u64, String> {
@@ -76,7 +71,6 @@ fn verify(challenge: &Value, proof: &Value) -> Result<[u8; 32], String> {
     let ak = bytes::<32>(proof, "account_ak")?;
     let key =
         VerificationKey::<SpendAuth>::try_from(ak).map_err(|_| "invalid Orchard account key")?;
-    // RedDSA accepts the identity, but it cannot prove control of an account.
     if ak == PALLAS_IDENTITY {
         return Err("Orchard account key is the identity; see README.md for rebind steps".into());
     }

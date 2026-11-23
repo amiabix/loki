@@ -220,8 +220,6 @@ fn dispatch() -> Result<()> {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut retry = Duration::from_secs(1);
             loop {
-                // A new mailbox command wakes the provisioner at once; the 1 s tick
-                // remains the fallback for retries and cleanup.
                 tokio::select! {
                     _ = interval.tick() => {}
                     _ = provision.notified() => {}

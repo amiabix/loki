@@ -1,10 +1,3 @@
-//! The member-owned HTTP device (axum). One process per member, started locally by
-//! that member. Profile unlock, custody, ceremony and payment signing stay here; the web
-//! coordinator only publishes public artifacts. This process drives the audited library. All library calls run on `spawn_blocking` because the hosted relay
-//! stack blocks on its own runtime (see `setup_relay::shared_runtime`).
-
-/// Records a fixed diagnostic event in the native app's log. A no-op for other members and builds.
-/// `$event` is only compiled where the native log exists.
 macro_rules! native_event {
     ($st:expr, $event:expr) => {{
         let state: &crate::host::state::AppState = $st;
@@ -60,8 +53,6 @@ pub(crate) use native_recovery::{clean_staging as native_clean_staging, profile_
 pub use nonce_witness::WitnessConfig;
 pub use recovery::run_recovery_command;
 
-/// Device-local UI notifications; never forwarded to the coordinator or a log.
-/// Only recovery setup uses the result: true means the member confirmed saving the words.
 pub type LocalNotice = std::sync::Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
 
 #[derive(Default)]
@@ -71,7 +62,6 @@ pub struct ApprovalAttempt {
     waiting: std::sync::atomic::AtomicBool,
 }
 
-/// Fixed status codes for the native approval's borrowed cancellation callback.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum ApprovalEnd {
@@ -102,25 +92,15 @@ impl ApprovalAttempt {
 
 pub enum ApprovalAnswer { Approve, Refuse, Timeout }
 
-/// The member's own decision on one payment, asked on this device (the native app's dialog).
-/// Receives the signer-derived summary as JSON and the lifetime of this approval attempt.
-/// Without one, every payment is refused: HTTP or relay requests never approve on their own.
 pub type LocalApproval = std::sync::Arc<dyn Fn(&str, &ApprovalAttempt) -> ApprovalAnswer + Send + Sync>;
 
-/// The member's answer when LokiSigner asks them to compare a vault's roster code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RosterAnswer {
-    /// "Codes match": every member sees the same code.
     Match,
-    /// "Codes differ": this vault is refused until the app restarts.
     Differ,
-    /// The dialog closed or timed out, or the request could not be shown. A retry may ask again.
     NoAnswer,
 }
 
-/// The member's own comparison of a vault's roster code before key generation, asked on this
-/// device. Receives the summary `/api/agree` derives from the setup document as JSON.
-/// Only [`RosterAnswer::Match`] records agreement; no local answer means no agreement.
 pub type LocalRosterConfirmation = std::sync::Arc<dyn Fn(&str) -> RosterAnswer + Send + Sync>;
 
 fn terminal_roster_confirmation(summary: &str) -> RosterAnswer {
@@ -159,15 +139,8 @@ fn terminal_roster_confirmation(summary: &str) -> RosterAnswer {
     { let _ = summary; RosterAnswer::NoAnswer }
 }
 
-/// What a native window shows in place of a vault name it will not show.
 pub(crate) const HIDDEN_VAULT_NAME: &str = "Name hidden (unsupported characters)";
 
-/// The creator's vault name as LokiSigner shows it, in the roster dialog and in
-/// "Vault addresses…". A name is shown as written or hidden whole, never cleaned: hidden when
-/// it has no letter, is longer than 80 characters or holds a control character, whitespace other than a
-/// space, a format character (Cf, such as bidi overrides and zero-width joiners), a default
-/// ignorable character (such as variation selectors and U+034F), or a run of more than three
-/// combining marks, which draw outside a one-line box.
 pub(crate) fn vault_label(name: &str) -> &str {
     use icu_properties::{props::{DefaultIgnorableCodePoint, GeneralCategory, GeneralCategoryGroup}, CodePointMapData, CodePointSetData};
     let category = CodePointMapData::<GeneralCategory>::new();
@@ -184,8 +157,6 @@ pub(crate) fn vault_label(name: &str) -> &str {
     if unsupported || !has_letter { HIDDEN_VAULT_NAME } else { name }
 }
 
-/// The signer's [`ApprovalPolicy`](crate::signer::local::ApprovalPolicy): route each request
-/// to the member's local decision, and refuse when no approval channel is attached.
 pub fn approval_policy(
     approval: Option<LocalApproval>,
     network: crate::signer::Network,
@@ -225,10 +196,6 @@ pub fn approval_policy(
     })
 }
 
-/// A scripted reviewer in place of the native dialog (`loki_member_app --approve-from <file>`),
-/// for test harnesses. Each request's summary is printed as an `approval-request <json>` line
-/// on stderr; the member approves only when `approve <sighash>` for that request appears in
-/// `file` within `timeout`. `refuse <sighash>`, no answer, or an unreadable summary refuse.
 pub fn file_approval(file: std::path::PathBuf, timeout: std::time::Duration) -> LocalApproval {
     std::sync::Arc::new(move |summary, _| {
         let Some(sighash) = serde_json::from_str::<serde_json::Value>(summary)
@@ -253,8 +220,6 @@ pub fn file_approval(file: std::path::PathBuf, timeout: std::time::Duration) -> 
     })
 }
 
-/// What the member reviews: the payee, amounts and network the signer derived itself from the
-/// PCZT bytes, and the candidate and sighash its consent binds to.
 pub fn approval_summary(request: &crate::signer::local::ApprovalRequest<'_>, network: crate::signer::Network, slot: u16, vault_name: Option<&str>) -> String {
     use zcash_protocol::consensus::NetworkType;
     let (label, kind) = match network {
@@ -284,8 +249,6 @@ pub fn approval_summary(request: &crate::signer::local::ApprovalRequest<'_>, net
     summary.to_string()
 }
 
-/// Parse member-app CLI args into a `Config`. Shared by the `loki_member_app` bin and the native
-/// signer app's FFI `serve` entry point, so both build the member identically.
 pub fn config_from_args(args: &[String]) -> Result<Config, String> {
     parse_config(args, false)
 }
@@ -357,20 +320,15 @@ fn parse_config(args: &[String], native: bool) -> Result<Config, String> {
     })
 }
 
-/// Build the axum app and serve on the configured bind IP and port. Blocks.
 pub fn run(config: Config) -> Result<(), String> {
     run_headless(config, None, false)
 }
 
-/// Serve the member CLI. `pairing_stdout` reserves stdout for a bare link on a private pipe.
 pub fn run_headless(config: Config, approval: Option<LocalApproval>, pairing_stdout: bool) -> Result<(), String> {
     let confirm = std::sync::Arc::new(terminal_roster_confirmation);
     run_local_with(config, None, None, approval, Some(confirm), None, pairing_stdout, None, None, |_| Ok(()))
 }
 
-/// `fetched`: the native app's confirmed configuration snapshot. Fresh settings without
-/// overrides are saved only after unlock. Without a local roster prompt this entry point
-/// cannot agree. LokiSigner starts through `run_native`.
 pub fn run_local(
     config: Config,
     pass: Option<zeroize::Zeroizing<String>>,
@@ -401,9 +359,7 @@ fn run_local_with<G>(
         (None, None) => {}
         _ => return Err("--peer-port and --advertise-url must be set together".into()),
     }
-    // rustls has no default provider; install one before any relay/lightwalletd TLS.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    // Peer origins must use TLS off loopback (preserved from main's hardening).
     for url in config.peers.values() {
         crate::transport::require_tls_off_loopback(url)?;
     }
@@ -474,7 +430,6 @@ fn run_local_with<G>(
             serve.await
         }
     });
-    // Keep the profile claimed until its blocking workers have drained.
     drop(runtime);
     drop(scope);
     result
@@ -496,7 +451,6 @@ mod tests {
         };
         let candidate = CandidateRef { vault_id: [1; 32], payment_id: [2; 32], attempt_id: [3; 32] };
         let request = ApprovalRequest { candidate: &candidate, sighash: [9; 32], view: &view };
-        // No approval channel (headless serve): refused.
         assert!(!(super::approval_policy(None, Network::Testnet, 2, None))(&request));
 
         let asked = Arc::new(Mutex::new(Vec::new()));
@@ -549,10 +503,8 @@ mod tests {
             "1234 5678 9012 3456 7890 1234".into(), "１２３４".into(), "1234-5678".into(), "1234\u{05b0}".into(),
             "Rent\nChoose Codes match".to_owned(), "a\u{0085}b".into(), "a\u{2028}b".into(), "a\u{202e}b".into(),
             "a\u{001b}[2Jb".into(), "a\u{200b}b".into(), "a\u{feff}b".into(), "a\tb".into(),
-            // Format and default ignorable characters the review found shown as written.
             "a\u{0600}b".into(), "a\u{13430}b".into(), "a\u{1bca0}b".into(), "a\u{1d173}b".into(),
             "a\u{e0100}b".into(), "a\u{034f}b".into(), "a\u{fe0f}b".into(), "a\u{3164}b".into(),
-            // A base letter with 39 combining marks draws far outside its line.
             format!("a{}", "\u{0301}".repeat(39)), marks(4), "é".repeat(81),
         ] {
             assert_eq!(super::vault_label(&hidden), super::HIDDEN_VAULT_NAME, "{hidden:?}");

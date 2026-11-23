@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Opens N separate LokiSigner members on this Mac for testnet testing, one process per profile.
-# Member 1 uses the default profile; member N > 1 uses ~/Library/Application Support/LokiSigner-memberN.
-# Each window is titled "LokiSigner — Member <slot>" once its profile is paired.
-#
-#   apps/macos/scripts/run-members.sh 3                      # LokiSigner from /Applications
-#   APP=/path/to/loki_signer.app apps/macos/scripts/run-members.sh 3
 set -euo pipefail
 
 count="${1:-}"

@@ -17,10 +17,7 @@ test('browser recovery calls go only to the browser signer, never to a paired na
   const calls = [setupBrowserRecovery, () => exportRecoveryBackup('a'.repeat(64)),
     () => restoreSigner({ name: 'A', method: 'passphrase' }), manageBrowserCustody];
   try {
-    // Browser kind: each call is dispatched to the signer (the Node mock serves none of them;
-    // the signer origin does; locked, it asks to unlock first), and nothing is fetched here.
     for (const call of calls) await assert.rejects(call(), /does not serve|Unlock your signer/);
-    // A tab paired with a native member refuses them before any request.
     sess.set('loki_device_session', JSON.stringify({ endpoint: 'http://127.0.0.1:3602', capability: 'A'.repeat(43) }));
     for (const call of calls) await assert.rejects(call(), /native member/);
     assert.deepEqual(fetched, []);
@@ -30,8 +27,6 @@ test('browser recovery calls go only to the browser signer, never to a paired na
 });
 
 test('the wallet Recovery card distinguishes LokiSigner from a paired headless member', () => {
-  // Render the actual page component without Next's app shell. Model its first render after
-  // the member status arrives; both sessions report the same signerKind to the wallet.
   const source = readFileSync(new URL('../src/app/page.tsx', import.meta.url), 'utf8');
   const page = ts.createSourceFile('page.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
   const card = page.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'RecoveryCard');

@@ -9,12 +9,10 @@
 use crate::signer::secure_element::SealedShare;
 use crate::signer::secure_element_apple::AppleSecureElement;
 
-/// Returns 0 on success; small nonzero codes mark which step failed.
 #[no_mangle]
 pub extern "C" fn loki_signer_enclave_selftest() -> i32 {
     let tag = b"cash.loki.signer.share.v1";
 
-    // Wallet init: open the persistent Enclave KEK and seal the member's share under it.
     let se = match AppleSecureElement::create_persistent(tag, None) {
         Ok(s) => s,
         Err(_) => return 1,
@@ -28,7 +26,6 @@ pub extern "C" fn loki_signer_enclave_selftest() -> i32 {
     drop(sealed);
     drop(se);
 
-    // Next launch: reopen the SAME Enclave key by tag and unseal the share.
     let se2 = match AppleSecureElement::open_persistent(tag, None) {
         Ok(s) => s,
         Err(_) => return 3,
@@ -104,8 +101,6 @@ pub extern "C" fn loki_member_app_serve() -> i32 {
     0
 }
 
-/// The native app's payment dialog: 1 approves, 2 timed out, everything else refuses.
-/// The cancellation callback and its context are borrowed for this call only.
 pub type NativeApprove = extern "C" fn(
     *const std::ffi::c_char,
     *const std::ffi::c_void,
@@ -139,7 +134,6 @@ pub type NativeConnect = extern "C" fn(
 #[cfg(feature = "relay-communication")]
 fn native_connect(ask: NativeConnect) -> crate::host::LocalConnect {
     extern "C" fn cancelled(context: *const std::ffi::c_void) -> i32 {
-        // The attempt is borrowed for the whole synchronous call to Swift below.
         i32::from(unsafe { &*context.cast::<crate::host::ConnectAttempt>() }.cancelled())
     }
     std::sync::Arc::new(move |origin, code, attempt| {
@@ -148,17 +142,12 @@ fn native_connect(ask: NativeConnect) -> crate::host::LocalConnect {
     })
 }
 
-/// Revoke every tab's grant without locking the local profile or stopping the app.
 #[cfg(feature = "relay-communication")]
 #[no_mangle]
 pub extern "C" fn loki_member_app_disconnect_wallet_tabs() {
     crate::host::disconnect_wallet_tabs();
 }
 
-/// Native payment-approval selftest: a 2-of-3 vault created by real v2 DKG signs one payment,
-/// and each quorum member's `sign_approve` asks the app's dialog through `approve`, exactly as
-/// the live member does. Shares use the software element, so it runs without enrolled
-/// biometrics. Returns 0 when signed, 3 when the member refused.
 #[no_mangle]
 pub extern "C" fn loki_signer_approval_selftest(approve: NativeApprove) -> i32 {
     use crate::host::{ApprovalAnswer, ApprovalAttempt, ApprovalEnd, LocalApproval};
@@ -167,7 +156,6 @@ pub extern "C" fn loki_signer_approval_selftest(approve: NativeApprove) -> i32 {
         let ask = native_approval(approve);
         let ask: LocalApproval = if std::env::args().any(|arg| arg == "--cancel-approval") {
             Arc::new(move |summary, attempt| {
-                // This presentation-only fixture can never approve the underlying test payment.
                 let mut summary: serde_json::Value = serde_json::from_str(summary).unwrap();
                 summary["memo"] = "Rent for November\nRecipient: imitation\nAmount: 0.00000001 ZEC\u{202e}".into();
                 std::thread::scope(|scope| {
@@ -178,7 +166,6 @@ pub extern "C" fn loki_signer_approval_selftest(approve: NativeApprove) -> i32 {
                     ask(&summary.to_string(), attempt);
                     cancel.join().unwrap();
                 });
-                // Leave the closed-request notice on screen briefly in the self-test.
                 std::thread::sleep(Duration::from_secs(4));
                 ApprovalAnswer::Refuse
             })
@@ -216,7 +203,6 @@ fn native_approval_does_not_sign_after_cancellation() {
     extern "C" fn late(_: *const c_char, context: *const c_void, cancelled: extern "C" fn(*const c_void) -> i32) -> i32 {
         if cancelled(context) != 0 { return -1; }
         unsafe { &*context.cast::<crate::host::ApprovalAttempt>() }.end(crate::host::ApprovalEnd::Failed);
-        // Simulate the member clicking just as the attempt ends, before Swift can close.
         SAW_END.store(cancelled(context) == 1, Ordering::Relaxed);
         1
     }
@@ -224,9 +210,6 @@ fn native_approval_does_not_sign_after_cancellation() {
     assert!(SAW_END.load(Ordering::Relaxed));
 }
 
-/// The native app's roster dialog: receives the roster summary JSON `/api/agree` derived and
-/// returns 1 when the member chose "Codes match" and 2 when they chose "Codes differ".
-/// Anything else (closed, timed out, unreadable) is no answer, and nothing is recorded.
 pub type NativeConfirmRoster = extern "C" fn(*const std::ffi::c_char) -> i32;
 
 #[cfg(feature = "relay-communication")]
@@ -245,8 +228,6 @@ fn native_roster_confirmation(confirm: NativeConfirmRoster) -> crate::host::Loca
 #[serde(deny_unknown_fields)]
 struct NativeLaunch { args: Vec<String>, pairing_url: Option<String>, restore_origin: Option<String> }
 
-/// Answers one native query on `launch` (`{"args": [...], "pairing_url": "loki://pair?..."?}`)
-/// as a JSON string, freed by [`loki_member_app_free`].
 #[cfg(feature = "relay-communication")]
 unsafe fn native_query(
     launch: *const std::ffi::c_char,
@@ -289,7 +270,6 @@ pub unsafe extern "C" fn loki_member_app_profile(launch: *const std::ffi::c_char
         });
         if let Ok(paired) = crate::host::RegistrationConfig::resume(&data, config.development_http) {
             reply["slot"] = serde_json::json!(paired.slot);
-            // Local only: binds a pending invite link to the pinned coordinator while locked.
             reply["coordinator"] = serde_json::json!(paired.coordinator);
         }
         Ok(reply)
@@ -302,8 +282,6 @@ pub extern "C" fn loki_member_app_stop() -> i32 {
     i32::from(crate::host::native_request_stop())
 }
 
-/// Install the native app's in-process sink for fixed diagnostic events only. The sink must
-/// be callable on any thread for the lifetime of the app; its string is borrowed per call.
 #[cfg(feature = "relay-communication")]
 #[no_mangle]
 pub extern "C" fn loki_member_app_set_log_sink(sink: extern "C" fn(*const std::ffi::c_char)) {
@@ -387,9 +365,6 @@ pub unsafe extern "C" fn loki_member_app_configuration(launch: *const std::ffi::
     })
 }
 
-/// Lists active vault receive addresses for the running native member, as `{"vaults": [...]}`
-/// or `{"error": "..."}`. Call off the main thread: opening a signer may prompt for Touch ID.
-/// Free the result (which may be null) with [`loki_member_app_free`].
 #[cfg(feature = "relay-communication")]
 #[no_mangle]
 pub extern "C" fn loki_member_app_vault_addresses() -> *mut std::ffi::c_char {
@@ -575,8 +550,6 @@ pub unsafe extern "C" fn loki_member_app_pair(
         let mut config = crate::host::native_config_from_args(&launch.args)?;
         if config.registration.is_some() { return Err("native pairing accepts registration only through its pairing link".into()); }
         config.validate_secure_element()?;
-        // The values the member reviewed, checked again; never fetched a second time. A fetched
-        // configuration is saved only after the profile unlocks.
         launch.config.verify_witness_confirmation(launch.witness_confirmation.as_deref())?;
         let fetched = launch.config.apply(&mut config, &launch.args, launch.pairing_url.as_deref())?;
         if launch.embedded { crate::host::NativeConfig::validate_wallet(&config)?; }
@@ -664,7 +637,7 @@ mod native_pairing_tests {
         extern "C" fn refuse(_: *const std::ffi::c_char) -> i32 { 0 }
         let mut pass = b"native passphrase\0".to_vec();
         let code = unsafe { super::loki_member_app_pair(launch.as_ptr(), pass.as_mut_ptr().cast(), notice, refuse_approval, refuse, refuse_connect) };
-        assert_eq!(code, 1); // Invalid config fails before any Enclave operation.
+        assert_eq!(code, 1);
         assert!(pass.iter().all(|b| *b == 0));
     }
 
@@ -701,8 +674,6 @@ mod native_pairing_tests {
         value
     }
 
-    /// Only the dialog's "Codes match" (1) agrees and only "Codes differ" (2) refuses the vault;
-    /// any other value is no answer. The dialog receives the summary unchanged.
     #[test]
     fn the_roster_dialog_answers_map_to_match_differ_or_no_answer() {
         use crate::host::RosterAnswer;
@@ -719,8 +690,6 @@ mod native_pairing_tests {
         }
     }
 
-    /// The member confirms the link's coordinator before LokiSigner contacts it: the target
-    /// is read from the link alone (this origin is unreachable) and in its canonical form.
     #[test]
     fn a_pairing_target_is_checked_without_contacting_the_coordinator() {
         let data = std::env::temp_dir().join(format!("loki-native-target-{}", uuid::Uuid::new_v4()));

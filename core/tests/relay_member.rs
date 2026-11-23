@@ -819,7 +819,6 @@ fn sealed_revision_codec_owner_credentials_requests_and_saved_couriers() {
         relay: 0,
         request: zeroize::Zeroizing::new(changed),
     });
-    // Changing a quota alone remains a valid saved request; changing an authority does not.
     if let PendingRequest::Create { request, .. } = &mut wrong.pending[0] {
         request[5] ^= 1;
     }
@@ -1292,7 +1291,6 @@ fn owner_cannot_reprovision_with_persisted_signing_nonces() {
     f.store
         .prepare_provision(&mut f.db, &f.members[0], &provision_targets())
         .unwrap();
-    // Simulate losing transport state while the member's signing state survives.
     fs::rename(f.root.join("transport"), f.root.join("lost-transport")).unwrap();
     f.db = loki_relay_client::ClientStore::open(&f.root.join("transport"), &f.members[0].roster, 1)
         .unwrap();
@@ -1592,7 +1590,6 @@ fn accept_control_request(listener: &std::net::TcpListener) -> (std::net::TcpStr
         }
         let text = String::from_utf8(raw.clone()).unwrap();
         if text.starts_with("HEAD / HTTP/1.1") {
-            // Local port probes are not provisioning requests.
             write!(stream, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").unwrap();
             continue;
         }
@@ -2813,7 +2810,6 @@ impl std::ops::Deref for RetainedFixture {
 }
 
 fn retained_root(f: &Fixture) -> PathBuf {
-    // ClientStore rejects a member root when an ancestor is a symlink. macOS temp dirs sit under /var.
     f.root.canonicalize().expect("retained root")
 }
 
@@ -3040,7 +3036,6 @@ fn status_line_public(line: &str) -> bool {
 }
 
 fn chunked_payload(mark: u8) -> Vec<u8> {
-    // Above the 65,536-byte complete-object ceiling, so the outbox must be a transfer of chunks.
     let mut payload = vec![mark; 70_000];
     payload[..34].copy_from_slice(b"relay-8.2a-chunked-payload-marker!");
     payload
@@ -3377,7 +3372,6 @@ fn communication_cli_missing_referenced_sealed_config_fails_closed() {
     private(&higher, false);
     let missing = member_cli(&status);
     assert_eq!(missing.status.code(), Some(1), "missing seal exit");
-    // bounded_read maps a missing seal's NotFound metadata to MemberError::Io. A different ciphertext stays Sealed.
     assert_eq!(member_stderr(&missing).trim(), "member_io");
     assert!(!member_stdout(&missing).contains("inbox member="), "missing seal adopted");
     let stale = config_owner(&member).encode(&member, 1).unwrap();

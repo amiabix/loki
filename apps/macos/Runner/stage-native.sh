@@ -12,7 +12,6 @@ stage="$DERIVED_FILE_DIR/LokiNative"
 mkdir -p "$stage"
 if [[ "$CONFIGURATION" == Debug ]]; then profile=dev; else profile=release; fi
 
-# Use the actual build-script output for this Cargo invocation, not another profile's dylib.
 if ! cargo build --manifest-path "$core/Cargo.toml" --locked -p loki-poc --lib --profile "$profile" \
     --features apple-enclave,relay-communication --message-format=json-render-diagnostics > "$stage/cargo.jsonl"; then
     python3 -c 'import json, sys; [sys.stderr.write(m["message"].get("rendered") or "") for m in map(json.loads, sys.stdin) if m["reason"] == "compiler-message"]' < "$stage/cargo.jsonl"

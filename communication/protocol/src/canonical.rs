@@ -107,7 +107,6 @@ pub fn decode(bytes: &[u8], max: usize) -> WireResult<Value> {
     if !remaining.is_empty() {
         return Err(WireError::Canonical);
     }
-    // Screening bounds every container before the allocating decoder runs.
     let value: Value = ciborium::de::from_reader(bytes)?;
     if encode(&value)? != bytes {
         return Err(WireError::Canonical);
@@ -115,7 +114,6 @@ pub fn decode(bytes: &[u8], max: usize) -> WireResult<Value> {
     Ok(value)
 }
 
-/// Historical message and configuration envelopes retain the text-free subset.
 pub fn decode_without_text(bytes: &[u8], max: usize) -> WireResult<Value> {
     fn reject_text(value: &Value) -> WireResult<()> {
         match value {

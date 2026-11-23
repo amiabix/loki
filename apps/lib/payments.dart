@@ -46,7 +46,6 @@ String _withUnit(Object? zats, {bool fixed = false}) {
   return value == '—' ? value : '$value TAZ';
 }
 
-/// Unix seconds as `YYYY-MM-DD HH:MM:SS UTC`, or null.
 String? _utc(Object? seconds) {
   if (seconds is! int || seconds <= 0) return null;
   final t = DateTime.fromMillisecondsSinceEpoch(seconds * 1000, isUtc: true);
@@ -359,7 +358,6 @@ class _SendPageState extends State<SendPage> {
   String? _busy, _error;
   bool? _editAfterDiscard;
   bool _publishUncertain = false;
-  // What the vault can pay now, from the signer's local wallet (`balance`).
   Json? _funds;
   bool _fundsLoading = false, _fundsFailed = false;
 
@@ -402,8 +400,6 @@ class _SendPageState extends State<SendPage> {
     }
   }
 
-  /// Why the entered amount can't be funded right now, or null if it can or
-  /// the amounts aren't known. The signer still decides when drafting.
   String? _fundingBlock() {
     final funds = _funds, entered = _amountZats(_amount.text);
     if (funds == null || entered == null) return null;
@@ -990,7 +986,6 @@ class _HistoryPageState extends State<HistoryPage> {
     final canContinue =
         latest != null &&
         switch (action) {
-          // The draft remains actionable if the original merely expires.
           'retry' || 'cancel' => !{
             'confirmed',
             'replaced',
@@ -1335,7 +1330,6 @@ class _HistoryPageState extends State<HistoryPage> {
         ? 'Received'
         : payment['amount_is_net'] == true
         ? 'Net outflow'
-        // Once mined, a retry is simply a sent payment; its details still name what it replaced.
         : confirmed
         ? (replaces?['cancel'] == true ? 'Cancelled payment' : 'Sent')
         : replaces != null
@@ -1392,7 +1386,6 @@ class _HistoryPageState extends State<HistoryPage> {
                           fontWeight: FontWeight.w600,
                         ),
                       ),
-                      // A deposit has no recipient to show; name its transaction instead.
                       if (recipient ?? _id(payment['txid']) case final shown?)
                         Text(
                           _short(shown),

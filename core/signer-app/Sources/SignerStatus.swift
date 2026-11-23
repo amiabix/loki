@@ -136,7 +136,6 @@ final class SignerPresence: NSObject {
             observers.append((workspace, workspace.addObserver(forName: name, object: nil, queue: .main) { _ in lock() }))
         }
         let screenLock = Notification.Name("com.apple.screenIsLocked")
-        // Distributed delivery must not wait until the user returns to the app.
         distributed.addObserver(self, selector: #selector(screenLocked(_:)), name: screenLock,
             object: nil, suspensionBehavior: .deliverImmediately)
         RunLoop.main.add(timer, forMode: .common)
@@ -144,8 +143,6 @@ final class SignerPresence: NSObject {
     }
 
     private static var screenIsLocked: Bool {
-        // CoreGraphics reports the WindowServer session's lock bit; the distributed
-        // notification alone is not evidence, and this key is not a public constant.
         let session = CGSessionCopyCurrentDictionary() as? [String: Any]
         return session?["CGSSessionScreenIsLocked"] as? Bool == true
     }

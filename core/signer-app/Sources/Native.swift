@@ -139,10 +139,9 @@ func runDecisionAlert(_ alert: NSAlert, timeout: TimeInterval? = nil,
         let focused = window.firstResponder
         let editing = fields.firstIndex { $0 === focused || (focused != nil && $0.currentEditor() === focused) }
         switch event.keyCode {
-        case 36, 76: // Return, keypad Enter
+        case 36, 76:
             return nil
-        case 48: // Tab / Shift-Tab
-            // Keep the field reachable even when macOS Keyboard Navigation is off.
+        case 48:
             guard !event.isARepeat else { return nil }
             let reverse = event.modifierFlags.contains(.shift)
             let current = editing.map { buttons.count + $0 } ?? controls.firstIndex { $0 === focused }
@@ -150,11 +149,11 @@ func runDecisionAlert(_ alert: NSAlert, timeout: TimeInterval? = nil,
                 ?? (reverse ? controls.count - 1 : 0)
             window.makeFirstResponder(controls[next])
             return nil
-        case 49: // Space
+        case 49:
             if editing != nil { return event }
             if !event.isARepeat { buttons.first { $0 === focused }?.performClick(nil) }
             return nil
-        case 53: // Escape
+        case 53:
             if !event.isARepeat { NSApp.stopModal(withCode: escape) }
             return nil
         default:
@@ -187,7 +186,6 @@ func runDecisionAlert(_ alert: NSAlert, timeout: TimeInterval? = nil,
     return alert.runModal()
 }
 
-/// The signer callback runs on a worker. The main thread remains free for wallet navigation.
 private func walletDecision(timeout: TimeInterval, escape: NSApplication.ModalResponse,
                             makeReview: @escaping () -> SignerReview?,
                             makeAlert: @escaping () -> NSAlert) -> NSApplication.ModalResponse {
@@ -211,7 +209,6 @@ private func walletDecision(timeout: TimeInterval, escape: NSApplication.ModalRe
     return answer
 }
 
-/// An unanswered payment request times out after this long, or sooner if the round ends.
 private let approvalTimeout: TimeInterval = 120
 private let approvalTimedOut = NSApplication.ModalResponse(rawValue: 1003)
 
@@ -220,12 +217,10 @@ private final class ApprovalNotifications: NSObject, UNUserNotificationCenterDel
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
                                 withCompletionHandler complete: @escaping (UNNotificationPresentationOptions) -> Void) {
-        // The wallet-triggered alert may have activated the app since we asked for attention.
         complete(notification.request.identifier.hasPrefix("payment-approval-") ? [.banner, .list] : [])
     }
 }
 
-// Keep the last unanswered request visible even with system notifications disabled.
 private var approvalEndedWindow: NSPanel?
 
 private func showApprovalEnded(_ state: Int32) {
@@ -324,15 +319,11 @@ private struct PaymentReview: Decodable {
     }
 }
 
-/// The member's decision on one payment, called by the signer from a worker thread just
-/// before it would release its signature share. The cancellation context is borrowed until
-/// this call returns. Returns 1 only for an explicit approval and 2 for a local timeout.
 private func nativeApprove(_ summary: UnsafePointer<CChar>?, _ context: UnsafeRawPointer?,
                            _ cancellation: ConnectCancellation) -> Int32 {
     guard let summary, let context,
           let payment = try? JSONDecoder().decode(PaymentReview.self, from: Data(String(cString: summary).utf8))
     else { return 0 }
-    // The core already refuses before consent. Reject an unverified callback at this boundary too.
     guard payment.fee_verified else {
         DispatchQueue.main.async { NativeSigner.embeddedSigner?.showBlockedFee() }
         return 0
@@ -369,7 +360,6 @@ private func nativeApprove(_ summary: UnsafePointer<CChar>?, _ context: UnsafeRa
             box.borderType = .bezelBorder
             box.hasVerticalScroller = true
             let memoText = NSTextView(frame: NSRect(x: 0, y: 0, width: width, height: 84))
-            // Only LF is a layout character, and only within this clipped scroll view.
             memoText.string = memo.components(separatedBy: "\n").map(untrustedText).joined(separator: "\n")
             memoText.isEditable = false
             memoText.isRichText = false
@@ -396,12 +386,9 @@ private func nativeApprove(_ summary: UnsafePointer<CChar>?, _ context: UnsafeRa
     }
 }
 
-/// Poll from the caller, not the main thread; a different alert's modal loop must be
-/// free to finish. The same deadline bounds both the queue and the decision.
 private func waitForApprovalDialog(cancellation: @escaping () -> Int32, timeout: TimeInterval,
                                    walletReview: (() -> SignerReview?)? = nil,
                                    present: @escaping (TimeInterval, @escaping () -> Bool) -> NSApplication.ModalResponse) -> Int32 {
-    // Connect and roster alerts can occupy the main dispatch queue while they run modally.
     func onMainRunLoop<T>(_ body: @escaping () -> T) -> T {
         var result: T?
         let work = DispatchWorkItem { result = body() }
@@ -460,7 +447,6 @@ private func waitForApprovalDialog(cancellation: @escaping () -> Int32, timeout:
                 if walletPresenter == nil && NativeSigner.walletDecisionAllowed {
                     guard let review = walletReview() else { return 0 }
                     walletPresenter = signer
-                    // The worker owns the deadline, so time spent queued counts against it.
                     signer.presentPrompt(review, escape: .alertFirstButtonReturn) { walletAnswer = $0 }
                 }
                 return nil
@@ -480,16 +466,10 @@ private func waitForApprovalDialog(cancellation: @escaping () -> Int32, timeout:
     }
 }
 
-/// An unanswered roster comparison is refused after this long; members compare by phone.
 private let rosterTimeout: TimeInterval = 600
 
-/// The most combining marks shown in a row; the rest are dropped so text stays in its line.
 private let combiningMarksShown = 3
 
-/// Another party's text, such as a vault name from the creator, as one plain line. Rust already
-/// hides a name with control, format, default-ignorable or line-breaking characters or with a
-/// long run of combining marks (`vault_label`). This is the second layer: any such character
-/// that still arrives becomes U+FFFD, and a run of combining marks is cut to three.
 func untrustedText(_ text: String) -> String {
     let replaced: Set<Unicode.GeneralCategory> = [.control, .format, .lineSeparator, .paragraphSeparator]
     let marks: Set<Unicode.GeneralCategory> = [.nonspacingMark, .enclosingMark]
@@ -511,8 +491,6 @@ func untrustedText(_ text: String) -> String {
     return String(scalars)
 }
 
-/// A bordered one-line box holding another party's text, apart from the app's own wording.
-/// The text is truncated at the box's edge and its drawing is clipped to the box.
 func untrustedLine(_ text: String) -> NSTextField {
     let field = NSTextField(labelWithString: untrustedText(text))
     field.isBordered = true
@@ -527,10 +505,6 @@ func untrustedLine(_ text: String) -> NSTextField {
     return field
 }
 
-/// The member's comparison of a vault's roster code, called by the member from a worker thread
-/// when the wallet asks to agree to a roster. The code is the one Rust derived from the setup
-/// document key generation will use. Returns 1 for an explicit "Codes match" and 2 for
-/// "Codes differ"; closing the dialog, a malformed request or the timeout return 0.
 private func nativeConfirmRoster(_ summary: UnsafePointer<CChar>?) -> Int32 {
     guard let summary = summary,
           let request = try? JSONSerialization.jsonObject(with: Data(String(cString: summary).utf8)) as? [String: Any],
@@ -615,8 +589,6 @@ private func nativeConnect(_ origin: UnsafePointer<CChar>?, _ code: UnsafePointe
     }
 }
 
-/// Only answer the request whose code matches the wallet tab. The borrowed cancellation
-/// check is used only while the C callback is live, including during the modal run loop.
 func showConnectDialog(origin: String, code: String, cancelled: @escaping () -> Bool) -> Bool {
     guard !cancelled(), NSApp.modalWindow == nil else { return false }
     let alert = NSAlert()
@@ -656,7 +628,6 @@ private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointe
         return 0
     }
     if event == "registration-warning" || event == "registration-key" || event == "registration-key-gone" || event == "registration-ok" {
-        // Rust supplies fixed copy here. Don't block its retry loop on an open dialog.
         DispatchQueue.main.async { NativeSigner.current?.warnRegistration(event, message: text) }
         return 0
     }
@@ -664,7 +635,6 @@ private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointe
         DispatchQueue.main.async { NativeSigner.current?.startupKeyFailure = event == "startup-key-gone" ? .keyGone(text) : .key(text) }
         return 0
     }
-    // Do not finish pairing unless the member explicitly confirms saving the words.
     if event == "recovery" {
         guard !Thread.isMainThread else { return 0 }
         let done = DispatchSemaphore(value: 0)
@@ -765,7 +735,6 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
     private var startingOver = false
     private var recoveringKey = false
     private var discardingPending = false
-    /// The wallet notice currently shows a registration warning (cleared on "registration-ok").
     private var registrationNoticeShown = false
     fileprivate private(set) var lockingForAbsence = false
     fileprivate var showingRecoveryWords = false
@@ -811,7 +780,6 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
-        // An external event must never interrupt a live signer or offer to replace its profile.
         guard !running, !lockingForAbsence else { return }
         var failure = SignerStartFailure.invalidLink
         for url in urls {
@@ -856,8 +824,6 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         didLock()
         SignerLog.write("LokiSigner locked because the Mac was unattended.")
         finishLockRequest()
-        // The Swift worker can be starting before Rust installs its stop handle. Also unwind
-        // any stacked decision panels without discarding the one-time recovery words.
         let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in self?.finishLockRequest() }
         RunLoop.main.add(timer, forMode: .common)
         RunLoop.main.add(timer, forMode: .modalPanel)
@@ -886,7 +852,6 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
     func presentPrompt(_ review: SignerReview, fields: [NSTextField] = [], timeout: TimeInterval? = nil,
                        escape: NSApplication.ModalResponse? = .abort,
                        completion: @escaping (NSApplication.ModalResponse) -> Void) {
-        // Recovery words must remain available if the user minimized the window during setup.
         guard let parent = walletWindow, (parent.isVisible || escape == nil), !walletDialogOpen else { completion(.abort); return }
         let page = SignerPromptPage(review, fields: fields, timeout: timeout, escape: escape) { [weak self] answer in
             self?.promptPage = nil
@@ -988,7 +953,6 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         walletNotice = nil
         canRecoverWalletKey = false
         lockCompletions.append(completion)
-        // If Rust already exited, its queued stopped() callback still drains and completes lock.
         _ = loki_member_app_stop()
         didLock()
         leaveNativePrompt()
@@ -1035,7 +999,6 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
             if confirmStandaloneSetAside(recover: failure.keyIsGone) { return }
         default: break
         }
-        // Don't nest modal panels or keep a previous passphrase field alive on retry.
         DispatchQueue.main.async {
             self.prompting = false
             self.start(self.queuedLink ?? (failure == .differentPairing ? nil : self.retryLink))
@@ -1047,8 +1010,6 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         confirmSetAside(recover: true)
     }
 
-    /// A pairing whose registration never finished left a profile without recovery words or
-    /// vaults. Set it aside (renamed, not deleted) so the member can pair this Mac again.
     func discardPendingProfile() {
         prompting = true
         let state = startupProfile()
@@ -1150,7 +1111,6 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
     fileprivate func warnRegistration(_ event: String, message: String) {
         guard running, !startingOver, !lockingForAbsence, !stopping else { return }
         if event == "registration-ok" {
-            // A later attempt registered: drop the warning an earlier one left, nothing else.
             if registrationNoticeShown { walletNotice = nil }
             registrationNoticeShown = false
             registrationWarnings.removeAll()
@@ -1196,7 +1156,6 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
             lockTimer?.invalidate()
             lockTimer = nil
             lockingForAbsence = false
-            // Resume only on an explicit Unlock, never from the consumed pairing claim.
             queuedLink = nil
             retryLink = nil
             prompting = false
@@ -1268,7 +1227,6 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         var launch: [String: Any] = ["args": args]
         if let link = link {
             launch["pairing_url"] = link
-            // Validate the link locally before asking the member to fetch configuration.
             let reply = nativeQuery(loki_member_app_pairing_target, launch)
             guard let target = reply["target"] as? [String: Any], let origin = target["coordinator"] as? String,
                   let slot = (target["slot"] as? NSNumber)?.stringValue else {
@@ -1287,7 +1245,6 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
 
     private func fetchConfiguration(link: String?, launch: [String: Any]) {
         let fresh = link != nil && profile()["profile"] as? String == "fresh"
-        // A pairing link, or an unlock with nothing saved, asks the coordinator; keep the UI live.
         DispatchQueue.global(qos: .userInitiated).async {
             let reply = nativeQuery(loki_member_app_configuration, launch)
             DispatchQueue.main.async { self.confirm(link: link, launch: launch, reply: reply, fresh: fresh) }
@@ -1390,7 +1347,6 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         then(nil)
     }
 
-    /// Shows the configuration before anything is saved; the member continues with exactly it.
     private func confirm(link: String?, launch: [String: Any], reply: [String: Any], fresh: Bool) {
         guard let config = reply["config"] as? [String: Any] else {
             let refreshFailed = reply["error"] as? String == "saved-endpoints-refresh-failed"
@@ -1511,7 +1467,6 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
                 default: failure = .unexpected
                 }
                 self.startupKeyFailure = nil
-                // A local failure before the claim was sent leaves the link usable.
                 self.stopped(failure, link: code == 0 ? nil : self.unusedPairingLink(link))
             }
         }
@@ -1768,8 +1723,6 @@ func runNativeSigner(arguments: [String], link: String?) -> Never {
     exit(0)
 }
 
-/// `LokiSigner approve`: a real 2-of-3 DKG and payment whose quorum members each ask the
-/// payment dialog above before signing. Exit 0 = signed after approval, 3 = refused.
 final class ApprovalSelftest: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.activate(ignoringOtherApps: true)
@@ -1788,7 +1741,6 @@ final class ApprovalSelftest: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Exercise the same main-queue modal ownership as Connect and roster.
     private func checkQueuedApproval(expire: Bool) {
         let blocker = NSAlert()
         blocker.messageText = "Existing dialog (approval self-test)"

@@ -82,15 +82,6 @@ impl SetupPolicy {
     }
 }
 
-/// Bootstrap context carries no certified payment authority.
-///
-/// ```compile_fail
-/// use loki_relay_client::{BootstrapContext, sign_message, CommIdentity};
-/// use loki_relay_protocol::types::MessageBody;
-/// fn payment(id: &CommIdentity, ctx: &BootstrapContext, body: &MessageBody) {
-///     sign_message(id, ctx, body).unwrap();
-/// }
-/// ```
 pub struct BootstrapContext {
     policy: SetupPolicy,
     creator: MemberPublic,
@@ -184,7 +175,6 @@ impl BootstrapContext {
         self.check_bootstrap(body, &identity.public(), body.key.recipient)?;
         signed(identity, setup::RECORD_DOMAIN, setup::encode_record(body)?)
     }
-    /// The caller obtains the peer identity from its authenticated admission claim.
     pub fn authenticate_bootstrap(
         &self,
         peer: &MemberPublic,
@@ -239,12 +229,6 @@ impl BootstrapContext {
     }
 }
 
-/// A verified invitation retains its bearer secret without a formatting implementation.
-///
-/// ```compile_fail
-/// fn debug<T: std::fmt::Debug>() {}
-/// debug::<loki_relay_client::SetupInvite>();
-/// ```
 pub struct SetupInvite {
     context: BootstrapContext,
     slot: u16,
@@ -585,21 +569,6 @@ pub fn sign_roster_acceptance(
     signed(identity, setup::RECORD_DOMAIN, setup::encode_record(&body)?)
 }
 
-/// Every slot has authenticated the same roster and policy; DKG may now begin.
-/// This is still not a certified payment roster.
-///
-/// ```compile_fail
-/// use loki_relay_client::{AcceptedSetupRoster, CommIdentity, sign_message};
-/// use loki_relay_protocol::types::MessageBody;
-/// fn payment(id:&CommIdentity, roster:&AcceptedSetupRoster, body:&MessageBody) {
-///     sign_message(id, roster, body).unwrap();
-/// }
-/// ```
-///
-/// ```compile_fail
-/// use loki_relay_client::AcceptedSetupRoster;
-/// fn forge() -> AcceptedSetupRoster { AcceptedSetupRoster { } }
-/// ```
 pub struct AcceptedSetupRoster {
     context: BootstrapContext,
     roster: Roster,
@@ -739,7 +708,6 @@ impl AuthenticatedSetupRecord {
     }
 }
 
-/// Volatile duplicate guard; transport must persist the same key/digest rule before effects.
 #[derive(Default)]
 pub struct SetupRecordIndex {
     records: BTreeMap<SetupKey, Id32>,

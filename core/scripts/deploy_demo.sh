@@ -1,12 +1,4 @@
 #!/usr/bin/env bash
-# Regtest demo on one host. Ten member processes sit behind the
-# web wallet; each tester reaches EXACTLY ONE signer via an unguessable capability link
-# (https://<public>/#<slug>). Brings a 2-of-10 vault to `active`, funds it, then builds and
-# serves the web wallet. Everything runs under setsid so it survives SSH logout.
-#
-#   PUBLIC_URL=https://<ngrok-host> bash deploy_demo.sh
-#
-# This is not independent signer custody. Use a fresh data directory for each run.
 set -euo pipefail
 umask 077
 
@@ -29,7 +21,7 @@ declare -a TOK SLUG
 mine() { curl -s -u unused:unused -H 'Content-Type: application/json' \
   -d "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"generate\",\"params\":[$1]}" "$RPC" >/dev/null 2>&1; }
 
-api() { # api <member> <GET|POST> <path> [body]
+api() {
   local i=$1 m=$2 p=$3 b=${4:-} port=$((BASE+$1))
   if [ "$m" = POST ]; then
     curl -fsS -m 300 -X POST "http://127.0.0.1:$port$p" \

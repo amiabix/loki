@@ -3,14 +3,11 @@ import 'package:flutter/services.dart';
 typedef Json = Map<String, dynamic>;
 typedef Request = Future<Json> Function(String path, [Json? body]);
 
-// Only wallet data crosses this boundary. Key material, session credentials,
-// passphrases, recovery words, and signing decisions stay with the native signer.
 abstract interface class WalletApi {
   Future<Json> profile();
   Future<Json> request(String path, [Json? body]);
   Future<void> unlock();
   Future<void> pair(String link);
-  // One invite link that opened this app, taken once after unlock; null when none.
   Future<String?> pendingInvite();
   Future<void> restore();
   Future<void> lock();
@@ -31,7 +28,6 @@ class MacWalletApi implements WalletApi {
   Future<String?> nativeNotice() =>
       _channel.invokeMethod<String>('nativeNotice');
   Future<void> recoverWalletKey() => _channel.invokeMethod('recoverWalletKey');
-  // Sets aside a profile whose pairing registration never finished.
   Future<void> discardPendingProfile() =>
       _channel.invokeMethod('discardPendingProfile');
 
@@ -93,7 +89,6 @@ class MacWalletApi implements WalletApi {
       _channel.invokeMethod('appearance', {'mode': mode});
 }
 
-// StandardMessageCodec returns Map<Object?, Object?>, including at nested levels.
 dynamic _decode(Object? value) => switch (value) {
   Map() => <String, dynamic>{
     for (final entry in value.entries)
@@ -107,14 +102,11 @@ Json _map(Object? value) => _decode(value) as Json;
 List<Json> jsonRows(Object? value) =>
     value is List ? value.map(_map).toList() : [];
 
-/// The host's stable code for one of its own error sentences, if it sent one.
 String? walletErrorCode(Object error) => switch (error) {
   PlatformException(:final details) when details is String => details,
   _ => null,
 };
 
-/// One line to show for a failed request: our own sentence for a known code,
-/// otherwise the signer's text after `sanitizeLine`.
 String walletError(Object error) =>
     describeError(walletErrorCode(error), switch (error) {
       PlatformException(:final message) => message,
@@ -123,8 +115,6 @@ String walletError(Object error) =>
     }) ??
     'LokiSigner could not complete this operation. Try again.';
 
-/// Like [walletError], but an uncoded reason follows [lead] so the user still
-/// knows which step failed.
 String walletErrorWith(String lead, Object error) {
   final known = _errorSentences[walletErrorCode(error)];
   if (known != null) return known;
@@ -153,7 +143,6 @@ const _failureSentences = <String, String>{
   'share_deadline': 'The signing round timed out waiting for members.',
 };
 
-/// Our sentence for a known [code], else the sanitized [text], else null.
 String? describeError(String? code, String? text) {
   final known = _errorSentences[code];
   if (known != null) return known;
@@ -162,8 +151,6 @@ String? describeError(String? code, String? text) {
   return line.isEmpty ? null : line;
 }
 
-/// Why a payment failed: our sentence for its `failure_reason`, else its
-/// sanitized `error` text, else null.
 String? paymentFailure(Json? payment) {
   if (payment == null) return null;
   final reason = payment['failure_reason'];

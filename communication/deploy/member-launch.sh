@@ -1,5 +1,4 @@
-# Shared by the two headless launchers (Bash on Linux/macOS).
-set +ax # Never auto-export or trace the bearer.
+set +ax
 unset pairing_link
 umask 077
 
@@ -9,7 +8,6 @@ lock_launch() {
   local dir=$1
   [[ ! -L $dir && -d $dir && -O $dir && $(find "$dir" -prune -perm 700 -print) == "$dir" ]] \
     || launch_error "launch directory must be an owned, non-symlink directory with mode 0700: $dir"
-  # Lock the directory inode. The actual services inherit fd 9, so the lock survives the launcher.
   exec 9<"$dir"
   python3 -c 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)' 2>/dev/null \
     || launch_error "could not lock $dir (already running, or Python 3/flock unavailable)"
@@ -22,7 +20,6 @@ check_launch_file() {
 
 private_output() {
   check_launch_file "$1"
-  # Replace, rather than truncate, an old inode that may be broadly readable or hard-linked.
   rm -f -- "$1"
   (set -C; : > "$1")
 }
@@ -43,7 +40,6 @@ ensure_passphrase() {
 }
 
 cleanup_launch() {
-  # Never use a persisted PID list as authority to signal processes.
   local pid
   for pid in $(jobs -pr) $(jobs -ps); do kill "$pid" 2>/dev/null || true; done
 }
@@ -55,7 +51,6 @@ start_member() {
   private_output "$log"
   ready=$(mktemp -d "$dir/.ready-XXXXXXXX")
   mkfifo "$ready/link"
-  # Open both ends before the spawn so even early child failure has a bounded wait.
   exec 8<>"$ready/link"
   rm -- "$ready/link"
   rmdir -- "$ready"

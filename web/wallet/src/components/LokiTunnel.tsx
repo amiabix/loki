@@ -3,8 +3,6 @@
 import { useEffect, useRef } from "react";
 import { useIsDark } from "@/lib/theme";
 
-// The "vault tunnel": ellipses receding to a vanishing point, radial lines through them,
-// and particles rising inside the mouth. 2D canvas; colours come from globals.css tokens.
 type Disc = { p: number; x: number; y: number; w: number; h: number };
 type Particle = { x: number; sx: number; dx: number; y: number; vy: number; r: number; a: number };
 
@@ -15,13 +13,12 @@ const TAU = Math.PI * 2;
 const linear = (t: number) => t;
 const easeInExpo = (t: number) => (t === 0 ? 0 : Math.pow(2, 10 * t - 10));
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
-// Aura: emerald → gold → back, scrolled one full tile every 5 s (the reference's CSS loop).
 const AURA_STOPS: [number, string][] = [
   [0, "#2fd8a8"], [0.165, "#e8b44a20"], [0.33, "#e8b44a"], [0.495, "#2fd8a820"],
   [0.66, "#2fd8a8"], [0.855, "#e8b44a60"], [1, "#2fd8a8"],
 ];
 const AURA_PERIOD = 5000;
-const AURA_SCALE = 0.5; // a soft gradient; half resolution is indistinguishable
+const AURA_SCALE = 0.5;
 
 export function LokiTunnel({ calm = false }: { calm?: boolean }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -41,7 +38,6 @@ export function LokiTunnel({ calm = false }: { calm?: boolean }) {
     const stroke = css.getPropertyValue("--tunnel-line").trim();
     const dot = css.getPropertyValue("--tunnel-particle").trim();
     const dotAlpha = parseFloat(css.getPropertyValue("--tunnel-particle-alpha")) || 1;
-    // Calm (send/review) and reduced motion both get one static frame.
     const still = calm || window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
     let w = 0, h = 0, dpr = 1;
@@ -80,14 +76,11 @@ export function LokiTunnel({ calm = false }: { calm?: boolean }) {
       const rect = canvas.getBoundingClientRect();
       w = rect.width; h = rect.height;
       dpr = Math.min(window.devicePixelRatio || 1, 2);
-      // The moving layer redraws 30 times a second, so it renders at 1x; the static lines stay sharp.
       canvas.width = Math.round(w);
       canvas.height = Math.round(h);
-      // Shifted down from the reference (.45/.95) so the mouth sits behind the content.
       start = { x: w * 0.5, y: h * 0.58, w: w * 0.75, h: h * 0.7 };
       end = { x: w * 0.5, y: h * 1.08 };
 
-      // The clip disc is where the discs' bottom edge stops rising and starts falling.
       discs = [];
       let prevBottom = h;
       for (let i = 0; i < DISCS; i++) {
@@ -102,7 +95,6 @@ export function LokiTunnel({ calm = false }: { calm?: boolean }) {
       clipPath.ellipse(clip.x, clip.y, clip.w, clip.h, 0, 0, TAU);
       clipPath.rect(clip.x - clip.w, 0, clip.w * 2, clip.y);
 
-      // Radial lines through every disc: static, so drawn once on their own canvas underneath.
       lines.width = Math.round(w * dpr);
       lines.height = Math.round(h * dpr);
       lctx.scale(dpr, dpr);
@@ -128,7 +120,6 @@ export function LokiTunnel({ calm = false }: { calm?: boolean }) {
       area = { sw, ew, h: h * 0.85, x1: clip.x - sw / 2, x2: clip.x - ew / 2 };
       particles = Array.from({ length: PARTICLES }, () => newParticle(true));
 
-      // Aura tile: the 20deg gradient over twice the aura's height, painted once.
       const ar = aura.getBoundingClientRect();
       aura.width = Math.max(1, Math.round(ar.width * AURA_SCALE));
       aura.height = Math.max(1, Math.round(ar.height * AURA_SCALE));
@@ -180,8 +171,6 @@ export function LokiTunnel({ calm = false }: { calm?: boolean }) {
       }
     };
 
-    // Steps are per 60 Hz frame (as the reference), scaled to elapsed time. Drawn at ~30 fps
-    // from a timer: the motion is slow, and a per-vsync rAF loop alone keeps the compositor busy.
     let raf = 0, timer = 0, last = 0;
     const frame = (t: number) => {
       timer = window.setTimeout(() => { raf = requestAnimationFrame(frame); }, 1000 / 30);

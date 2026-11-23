@@ -60,8 +60,6 @@ pub struct SetupRecord {
     pub prerequisites: Vec<Id32>,
     pub payload: Vec<u8>,
 }
-/// Setup record format version. Version 2 is the fresh-key round-two DKG format; a member
-/// or operator on another version is refused before any key generation.
 pub const SETUP_VERSION: u16 = 2;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SetupCapabilities {

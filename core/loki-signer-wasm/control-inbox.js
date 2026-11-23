@@ -1,6 +1,3 @@
-// Frostd's receive is destructive and offers no cursor. The worker serializes reads and
-// marks each destructive drain before receiving. Retry a failed commit before the next
-// receive; after a crash the durable marker prevents use of a possibly stale start.
 export function controlInbox(store = memoryStore()) {
   let dirty;
   async function flush() {
@@ -41,8 +38,6 @@ function memoryStore() {
 
 export const MAX_CONTROL_SESSIONS = 256;
 
-// Keep legacy ciphertext readable until it can be authenticated and compacted. New records
-// are scoped to the relay and device, and still contain only sealed payment terms.
 export function idbStore(name = "loki_control") {
   const db = new Promise((resolve, reject) => {
     const req = indexedDB.open(name, 2);
@@ -106,9 +101,6 @@ export function idbStore(name = "loki_control") {
   };
 }
 
-// Whether a proposer notice ends a request for this member (slot): cancelled, failed, already
-// signed or sent, or a signing group that leaves this member out. Kept notices outlive the
-// request, so the inbox must drop it on these, not only when the notices stop coming.
 export function endsRequest(msg, slot) {
   if (["cancelled", "failed", "signed", "broadcast", "confirmed"].includes(msg.kind)) return true;
   return msg.kind === "start" && !!msg.intent?.signers?.length && !msg.intent.signers.includes(slot);

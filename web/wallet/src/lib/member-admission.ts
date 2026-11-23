@@ -27,11 +27,8 @@ export function grantDigest(value: unknown): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
-/** Grant digests and their pinned slot (`null` = lowest free slot), as stored in the registry. */
 export type RegisteredGrants = Record<string, number | null>;
 
-/** The grants the operator added with `scripts/grants.ts`. They live in the registry, so a new
- *  grant needs no restart. */
 function onboardingGrants(registered: RegisteredGrants): [string, number | null][] {
   return Object.entries(registered);
 }

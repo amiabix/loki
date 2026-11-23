@@ -1,7 +1,6 @@
 use std::fmt;
 use zeroize::Zeroizing;
 
-/// Kept in memory and zeroized on drop. Do not pass secrets to env, argv, or logs.
 pub struct SecretString(Zeroizing<String>);
 
 impl SecretString {

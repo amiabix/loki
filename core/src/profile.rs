@@ -1,7 +1,3 @@
-//! The account profile: a passphrase-sealed `{version, id, name}` under `<data>/profile/`.
-//! One profile namespaces a member's vaults. Lifted from the `loki_setup_member` bin so
-//! both the CLI and the `loki_member_app` coordinator share one implementation.
-
 use std::path::Path;
 
 use rand_core::{OsRng, RngCore};
@@ -13,7 +9,6 @@ fn valid_name(name: &str) -> bool {
     !name.is_empty() && name.len() <= 80
 }
 
-/// Create (and seal) a new profile. Errors if one already exists at `root`.
 pub fn create(root: &Path, passphrase: &str, name: &str) -> Result<Value, String> {
     let label = name.trim();
     if !valid_name(label) {
@@ -32,7 +27,6 @@ pub fn create(root: &Path, passphrase: &str, name: &str) -> Result<Value, String
     Ok(profile)
 }
 
-/// Open and validate an existing sealed profile. Also the passphrase check for unlock.
 pub fn open(root: &Path, passphrase: &str) -> Result<Value, String> {
     let dir = MemberDir::open(root, "profile");
     let raw = dir
@@ -51,7 +45,6 @@ pub fn open(root: &Path, passphrase: &str) -> Result<Value, String> {
     Ok(profile)
 }
 
-/// Whether a sealed profile exists at `root` (without the passphrase).
 pub fn exists(root: &Path) -> bool {
     root.join("profile").join("profile.sealed").is_file()
 }

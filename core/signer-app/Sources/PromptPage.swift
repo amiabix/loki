@@ -1,6 +1,5 @@
 import AppKit
 
-// These are native document components; their contents and actions never cross the wallet bridge.
 struct SignerReview {
     let section: String
     let title: String
@@ -200,20 +199,14 @@ private final class ReviewDisclosure: NSButton {
     }
 }
 
-/// When a native prompt may take input, kept apart from AppKit. Input counts only after the window
-/// has stayed key for `delay` (anti-clickjacking), and a click that focuses the window or starts the
-/// delay never reaches a control.
 struct PromptArming {
     static let delay: TimeInterval = 1
 
-    /// Uptime from which input counts; infinity until armed.
     private(set) var acceptsInput = TimeInterval.infinity
     private var pending: TimeInterval?
 
     enum Click: Equatable {
-        /// The window isn't key: make it key and drop the click.
         case focusWindow
-        /// The window is key but the delay never started (a missed notification): start it and drop the click.
         case arm
         case deliver
         case drop
@@ -221,15 +214,12 @@ struct PromptArming {
 
     var armed: Bool { acceptsInput.isFinite }
 
-    /// The window became key at `now`. Returns how long to wait before calling `delayElapsed`.
     mutating func becameKey(at now: TimeInterval) -> TimeInterval {
         acceptsInput = .infinity
         pending = now + Self.delay
         return Self.delay
     }
 
-    /// Arms only if the window is still key and visible when the delay ends. Otherwise the delay is
-    /// spent, so the next click in a key window starts a new one instead of being dropped forever.
     mutating func delayElapsed(windowIsKey: Bool, visible: Bool) -> Bool {
         guard let deadline = pending else { return false }
         pending = nil
@@ -245,7 +235,6 @@ struct PromptArming {
 
     func accepts(_ time: TimeInterval) -> Bool { time >= acceptsInput }
 
-    /// A mouse-down inside the prompt, at event time `time`.
     func click(at time: TimeInterval, windowIsKey: Bool) -> Click {
         guard windowIsKey else { return .focusWindow }
         if accepts(time) { return .deliver }
@@ -253,7 +242,6 @@ struct PromptArming {
     }
 }
 
-/// A regular document view in the wallet window. No modal session or Flutter decision channel.
 final class SignerPromptPage: NSView {
     private let fields: [NSTextField]
     private let buttons: [NSButton]
@@ -263,7 +251,6 @@ final class SignerPromptPage: NSView {
     private var arming = PromptArming()
     private let hint: NSTextField
     private let readyHint: String
-    /// Shown while the prompt ignores input, so a locked prompt says how to unlock it.
     static let waitingHint = "Click here to review this request."
     private var enable: Timer?
     private var timeout: Timer?
@@ -354,7 +341,6 @@ final class SignerPromptPage: NSView {
         guard let host = parent.contentView else { finish(.abort); return }
         previousResponder = parent.firstResponder
         host.addSubview(self, positioned: .above, relativeTo: nil)
-        // Match the Flutter content slot; leave its sidebar, title controls, and footer usable.
         NSLayoutConstraint.activate([
             leadingAnchor.constraint(equalTo: host.leadingAnchor, constant: 230),
             trailingAnchor.constraint(equalTo: host.trailingAnchor, constant: -26),
@@ -371,7 +357,6 @@ final class SignerPromptPage: NSView {
             center.addObserver(forName: NSWindow.didBecomeKeyNotification, object: parent, queue: nil) { [weak self] _ in self?.arm() },
             center.addObserver(forName: NSWindow.didResignKeyNotification, object: parent, queue: nil) { [weak self] _ in self?.disarm() },
             center.addObserver(forName: NSWindow.willCloseNotification, object: parent, queue: nil) { [weak self] _ in self?.finish(.abort) },
-            // A prompt that became key while minimized couldn't arm; arm when it is shown again.
             center.addObserver(forName: NSWindow.didDeminiaturizeNotification, object: parent, queue: nil) { [weak self, weak parent] _ in
                 if parent?.isKeyWindow == true { self?.arm() }
             },
@@ -422,8 +407,6 @@ final class SignerPromptPage: NSView {
         hint.stringValue = Self.waitingHint
     }
 
-    /// Makes the prompt's window key in response to the user's own click. The click is dropped;
-    /// `didBecomeKey` then starts the usual delay. Unsolicited prompts never call this.
     private func focusWindow(_ window: NSWindow) {
         if !NSApp.isActive { NSApp.activate(ignoringOtherApps: true) }
         window.makeKeyAndOrderFront(nil)
@@ -443,9 +426,9 @@ final class SignerPromptPage: NSView {
             }
         }
         if event.modifierFlags.contains(.command), event.keyCode == 12 || event.keyCode == 13 {
-            return requiresAcknowledgment ? nil : event // Quit / Close
+            return requiresAcknowledgment ? nil : event
         }
-        if event.keyCode == 53 { // Escape never accepts.
+        if event.keyCode == 53 {
             if let escape, arming.accepts(event.timestamp), !event.isARepeat { finish(escape) }
             return nil
         }
@@ -454,7 +437,7 @@ final class SignerPromptPage: NSView {
         guard editing != nil || focused === self || (focused as? NSView)?.isDescendant(of: self) == true else { return event }
         guard arming.accepts(event.timestamp) else { return nil }
         switch event.keyCode {
-        case 36, 76: return nil // Never default to a decision.
+        case 36, 76: return nil
         case 48:
             guard !event.isARepeat else { return nil }
             let controls: [NSView] = fields.map { $0 as NSView } + buttons.map { $0 as NSView } + disclosures(in: self)
@@ -481,7 +464,6 @@ final class SignerPromptPage: NSView {
         finish(now >= expiry ? .abort : NSApplication.ModalResponse(rawValue: NSApplication.ModalResponse.alertFirstButtonReturn.rawValue + sender.tag))
     }
 
-    // Recovery words are shown once: require acknowledgment instead of letting navigation discard them.
     func leave() { if escape != nil { finish(.abort) } }
 
     func finish(_ answer: NSApplication.ModalResponse) {

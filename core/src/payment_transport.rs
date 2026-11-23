@@ -1,11 +1,3 @@
-//! Keyless PCZT signing over an opaque relay transport.
-//!
-//! A payment may spend up to `MAX_SPENDS` notes. Every spend is its own Orchard action under its
-//! own randomized key, so it needs its own nonce, randomiser, signing package and signature
-//! share. All spends sign the same sighash and travel in one round: each hosted message carries
-//! one value per spend (`encode_hosted`). Each spend has its own `CandidateRef`, so its nonce id
-//! is distinct and the nonce store's single-use rule holds per spend.
-
 use std::{collections::BTreeMap, time::{Duration, Instant}};
 
 use reddsa_frost::frost::redpallas as frost;
@@ -94,7 +86,6 @@ where
 
 fn receive_deadline() -> Instant { Instant::now() + Duration::from_secs(120) }
 
-/// The per-spend values of a hosted message, which must carry exactly `spends` of them.
 fn spend_values(message: &OpenedMessage, spends: usize) -> Result<Vec<&[u8]>, String> {
     decode_hosted(message.body())
         .filter(|items| items.len() == spends)
@@ -116,7 +107,6 @@ where
     let attempt = hex::encode(context.attempt.0);
     let message = Outbound::Signing(SealedSigning::seal(own, peer, context, kind, body)?);
     let address = Peer(peer.encryption);
-    // frostd routes an empty recipient list to the channel's coordinator mailbox.
     let recipients = if peer.id == 0 { &[] } else { std::slice::from_ref(&address) };
     match transport.send(channel, recipients, &message) {
         Ok(()) => { eprintln!("payment {attempt}: frostd sent {kind:?}"); Ok(()) }
@@ -127,11 +117,6 @@ where
     }
 }
 
-/// Commit, optionally build the candidate as proposer, then sign the candidate-bound package.
-/// The nonce, key package, viewing key, and selected note stay inside this process. The
-/// candidate crosses the relay only sealed from the proposer to each other selected signer;
-/// every signer passes it to `accept_candidate` (review, and for the proposer the local
-/// hand-off to its coordinator) before using it.
 #[allow(clippy::too_many_arguments)]
 pub fn signer_loop<T: Transport, S: Signer>(
     transport: &T,
@@ -162,7 +147,6 @@ where
     )
 }
 
-/// The hosted signer can observe a round-two refusal locally before it becomes a string.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn participate<T: Transport, S: Signer>(
     transport: &T,
@@ -205,7 +189,6 @@ where
         return Err("invalid hosted signing context".into());
     }
     check_running()?;
-    // One single-use nonce per spend, each under its own id.
     let mut commitments = Vec::with_capacity(spends);
     for candidate_ref in candidate_refs {
         commitments.push(signer.sign_commit(session, candidate_ref).map_err(|e| format!("sign_commit: {e}"))?);
@@ -244,9 +227,6 @@ where
         .shielded_sighash();
     let packages = spend_values(&got[&(0, HostedPackage)], spends)?;
     let seeds = spend_values(&got[&(0, HostedSeed)], spends)?;
-    // Check every spend before any share is made: each package names the candidate's sighash
-    // and this signer's own commitment for that spend, and each randomized key is a distinct
-    // spend of the candidate.
     let mut checked = Vec::with_capacity(spends);
     let mut keys: Vec<[u8; 32]> = Vec::with_capacity(spends);
     for ((package, seed), commitment) in packages.into_iter().zip(seeds).zip(&commitments) {
@@ -270,7 +250,6 @@ where
         checked.push((package, seed));
     }
     check_running()?;
-    // The member approves once for the payment; each spend then burns its own nonce.
     let mut shares = Vec::with_capacity(spends);
     for (candidate_ref, (package, seed)) in candidate_refs.iter().zip(&checked) {
         let share = signer.sign_approve(session, candidate_ref, params, candidate_bytes, package, seed)
@@ -282,9 +261,6 @@ where
     Ok(send(transport, channel, own, coordinator, context, HostedShare, &encode_hosted(&shares)?)?)
 }
 
-/// Gather a threshold of commitments, request the proposer candidate, aggregate, and apply.
-/// `peer_ids[0]` is the designated proposer. The candidate never comes over the relay:
-/// `local_candidate` polls the proposer's local hand-off and returns `None` until it exists.
 pub fn coordinate<T: Transport>(
     transport: &T,
     channel: &T::Channel,
@@ -315,7 +291,6 @@ where
     }
     let expected = |kind| peer_ids.iter().map(|id| (&peer_of[id], kind)).collect::<Vec<_>>();
     let received = recv_until(transport, channel, own, context, &expected(HostedCommitment), check_running)?;
-    // Per spend: every signer's commitment for that spend.
     let mut commitments = vec![BTreeMap::new(); spends];
     for id in peer_ids {
         let values = spend_values(&received[&(peer_of[id].id, HostedCommitment)], spends)?;

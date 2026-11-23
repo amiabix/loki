@@ -1,13 +1,3 @@
-//! What a scan remembers between runs.
-//!
-//! A scan that starts at genesis every time is fine on a 70-block regtest chain and
-//! impossible at mainnet height. This state remembers how far it got, the Ironwood
-//! commitments it saw, and the vault's own actions. A birth scan also stores the node's
-//! frontier before its first block, so it never needs earlier commitments.
-//!
-//! The scanned commitment stream is kept because [`crate::witness`] needs it to
-//! rebuild the tree and check its root against the node's anchor.
-
 use std::io::Write as _;
 use std::path::Path;
 
@@ -17,11 +7,6 @@ use rand_core::{OsRng, RngCore};
 use crate::scan::{vault_ivks, vault_note_at, Chain, RawAction, VaultNote};
 use crate::witness::BirthWitnesses;
 
-/// One Ironwood action the vault owns, kept exactly as the node reported it.
-///
-/// The decrypted note is deliberately not stored: orchard's `Note` has no byte encoding,
-/// and re-deriving it costs one trial decryption per vault note, which is nothing next to
-/// reading the chain again.
 pub struct Found {
     pub height: u32,
     pub txid: String,
@@ -29,26 +14,16 @@ pub struct Found {
     pub action: RawAction,
 }
 
-/// Everything a scan carries forward to the next one.
 #[derive(Default)]
 pub struct ScanState {
-    /// The last block height whose actions are already recorded here. `0` means nothing
-    /// has been scanned, which is also what the first run sees.
     pub tip: u64,
-    /// The canonical hash of `tip`; absent in legacy cache files.
     pub tip_hash: Option<[u8; 32]>,
-    /// A node frontier at the block before this vault's birth, when this is a birth scan.
     pub birth_height: Option<u64>,
     pub checkpoint_hash: Option<[u8; 32]>,
     pub checkpoint_tree: Option<Vec<u8>>,
     position_offset: u64,
-    /// Ironwood commitments scanned after genesis or the birth checkpoint, in append order.
     pub cmxs: Vec<[u8; 32]>,
-    /// Every nullifier in the scanned blocks, in the same order as `cmxs`. A vault note
-    /// whose nullifier appears here has already been spent, by this vault or by anyone
-    /// else holding the key, and must not be offered as an input again.
     pub nfs: Vec<[u8; 32]>,
-    /// The vault's own actions, in the same order.
     pub found: Vec<Found>,
 }
 
@@ -93,7 +68,6 @@ impl ScanState {
         Ok(witnesses)
     }
 
-    /// Record one transaction's Ironwood actions, keeping the vault's own.
     pub fn push(
         &mut self,
         fvk: &FullViewingKey,
@@ -103,8 +77,6 @@ impl ScanState {
         actions: &[RawAction],
     ) {
         for raw in actions {
-            // A commitment's position is the number of commitments appended before it,
-            // which is exactly what the note commitment tree does.
             let position = self.position_offset + self.cmxs.len() as u64;
             self.cmxs.push(raw.cmx);
             self.nfs.push(raw.nullifier);
@@ -119,14 +91,6 @@ impl ScanState {
         }
     }
 
-    /// The vault's **unspent** notes, rebuilt from the stored actions.
-    ///
-    /// Built by the same code as a live scan ([`vault_note_at`]), so a note recovered
-    /// from disk cannot drift from one found on the wire.
-    ///
-    /// A note whose nullifier has already appeared on the chain is dropped: it is gone,
-    /// and a proposer handed it would build a candidate the network rejects as a double
-    /// spend.
     pub fn notes(&self, fvk: &FullViewingKey) -> Result<Vec<VaultNote>, String> {
         let ivks = vault_ivks(fvk);
         let spent: std::collections::HashSet<_> = self.nfs.iter().collect();
@@ -149,7 +113,6 @@ impl ScanState {
             .collect()
     }
 
-    /// The same value a full chain scan returns, without having read the chain again.
     pub fn into_chain(self, fvk: &FullViewingKey) -> Result<Chain, String> {
         if self.birth_height.is_some() {
             return Err("birth scan has no genesis commitment stream".into());
@@ -162,7 +125,6 @@ impl ScanState {
         })
     }
 
-    /// Read state left by an earlier scan. A missing file is the first scan, not an error.
     pub fn load(path: &Path) -> Result<Self, String> {
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
@@ -173,7 +135,6 @@ impl ScanState {
             .map_err(|line| format!("{}:{line}: malformed scan state", path.display()))
     }
 
-    /// Parse [`ScanState::encode`]'s text; the error is the 1-based bad line.
     pub fn decode(text: &str) -> Result<Self, usize> {
         let mut state = Self::default();
         for (i, line) in text.lines().enumerate() {
@@ -210,7 +171,6 @@ impl ScanState {
                     state.cmxs.push(field(&mut f).ok_or_else(bad)?);
                     state.nfs.push(field(&mut f).ok_or_else(bad)?);
                 }
-                // Spend records written by an older chain cache; nothing reads them now.
                 Some("s") => {}
                 Some("n") => {
                     let height = f.next().and_then(|v| v.parse().ok()).ok_or_else(bad)?;
@@ -241,8 +201,6 @@ impl ScanState {
         Ok(state)
     }
 
-    /// One record per line, hex throughout: the text is big enough to want to look at
-    /// with `grep` when a scan disagrees with the node.
     pub fn encode(&self) -> String {
         use std::fmt::Write as _;
         let mut out = String::new();
@@ -286,7 +244,6 @@ impl ScanState {
         out
     }
 
-    /// Write the state for the next scan to pick up.
     pub fn save(&self, path: &Path) -> Result<(), String> {
         let io = |e: std::io::Error| format!("{}: {e}", path.display());
         let mut random = [0u8; 8];
@@ -315,7 +272,6 @@ impl ScanState {
     }
 }
 
-/// The next whitespace-separated field, as exactly `N` bytes of hex.
 fn field<'a, const N: usize>(f: &mut impl Iterator<Item = &'a str>) -> Option<[u8; N]> {
     hex::decode(f.next()?).ok()?.try_into().ok()
 }
@@ -337,13 +293,7 @@ mod tests {
         FullViewingKey::from(&SpendingKey::from_bytes([seed; 32]).unwrap())
     }
 
-    /// One Ironwood action as the node's JSON reports it, carrying a note for `fvk`.
-    ///
-    /// `cv` and `rk` only have to be structurally valid points for the action to be
-    /// rebuilt; `ak` is one, so it stands in for both.
     fn action_json(fvk: &FullViewingKey, value: u64, seed: u8) -> serde_json::Value {
-        // The action's rho IS its nullifier field, so the note has to be built from the
-        // same bytes or the domain the scanner derives would not decrypt it.
         let nf = [seed; 32];
         let rho = Rho::from_bytes(&nf).unwrap();
         let rseed = RandomSeed::from_bytes([seed.wrapping_add(1); 32], &rho).unwrap();
@@ -373,10 +323,6 @@ mod tests {
         serde_json::json!({ "txid": txid, "ironwood": { "actions": actions } })
     }
 
-    /// Six blocks, `blocks[h - 1]` being block `h` as `getblock` would return it.
-    ///
-    /// Vault notes sit behind decoys, in more than one block and more than one
-    /// transaction, so a wrong position would not survive by luck.
     fn canned_chain(
         vault: &FullViewingKey,
         decoy: &FullViewingKey,
@@ -542,7 +488,6 @@ mod tests {
         state.save(&path).unwrap();
         let mut state = ScanState::load(&path).unwrap();
 
-        // The replacement action spends a vault note but appends the same commitment.
         chain[4]["tx"][1]["ironwood"]["actions"][0]["nullifier"] =
             serde_json::json!(hex::encode(spent));
         rebranch(&mut chain, 4);
@@ -576,8 +521,6 @@ mod tests {
         assert_eq!(notes[0].value_zat, 150);
     }
 
-    /// A reorg below the saved tip that drops the block's vault note entirely: the resumed scan
-    /// must not keep offering the note it saw on the old branch.
     #[test]
     fn reorg_that_drops_a_note_below_the_saved_tip_forgets_it() {
         let vault = a_fvk(3);
@@ -670,8 +613,6 @@ mod tests {
         std::fs::remove_file(&linked).unwrap();
     }
 
-    /// The whole point: stopping, saving, and resuming must land on exactly the chain a
-    /// single uninterrupted scan produces.
     #[test]
     fn an_incremental_scan_matches_a_full_one() {
         let vault = a_fvk(3);
@@ -690,8 +631,6 @@ mod tests {
         scan_blocks(&vault, &mut full, 6, get).unwrap();
         assert_eq!(fetched.get(), 7, "a full scan rechecks its tip");
 
-        // Two runs with the state written and read back between them, which is what two
-        // separate processes would do.
         let mut part = ScanState::default();
         scan_blocks(&vault, &mut part, 3, get).unwrap();
         let path = std::env::temp_dir().join(format!("loki-scanstate-{}.txt", std::process::id()));
@@ -732,15 +671,12 @@ mod tests {
             assert_eq!(a.cmx, b.cmx);
             assert_eq!(a.nullifier, b.nullifier);
         }
-        // And the positions are the ones the tree would assign: the decoys count too.
         assert_eq!(
             full.notes.iter().map(|n| n.position).collect::<Vec<_>>(),
             vec![1, 3, 5]
         );
     }
 
-    /// A chain shorter than the stored one is a different chain, so the state must be
-    /// thrown away rather than appended to.
     #[test]
     fn a_shorter_chain_forces_a_rescan() {
         let vault = a_fvk(3);
@@ -786,7 +722,6 @@ mod tests {
         let mut state = ScanState::load(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
 
-        // The next action spends that note and sends its output to another account.
         let mut action = action_json(&decoy, 1, 20);
         action["nullifier"] = serde_json::json!(hex::encode(spent));
         chain.push(serde_json::json!({

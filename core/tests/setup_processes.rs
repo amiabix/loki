@@ -501,7 +501,6 @@ fn three_processes_create_one_vault_without_sharing_secrets() {
             "backup verify: {}",
             String::from_utf8_lossy(&checked.stderr)
         );
-        // The member can reopen the words until the final card has been made.
         assert!(member.join("secrets/backup-words.sealed").exists());
         if id < 3 {
             let pending = Command::new(exe)
@@ -628,8 +627,6 @@ fn three_processes_create_one_vault_without_sharing_secrets() {
             String::from_utf8_lossy(&repeated.stderr)
         );
     }
-    // The payment CLI must reject bad local context before it can create an
-    // attempt record or publish any commitment.
     let pay = env!("CARGO_BIN_EXE_loki_member_payment");
     let work = root.join("payment-cli-faults");
     fs::create_dir(&work).unwrap();
@@ -706,8 +703,6 @@ fn three_processes_create_one_vault_without_sharing_secrets() {
     assert!(String::from_utf8_lossy(&wrong_certificate.stderr).contains("roster differs"));
     assert!(!first.join("signing").exists());
 
-    // A killed signer cannot reuse the attempt. A fresh attempt ID starts a
-    // distinct local record, while resend refuses before a share was saved.
     manifest["vault"] = serde_json::Value::String(hex::encode([7u8; 32]));
     fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
     let start = || {

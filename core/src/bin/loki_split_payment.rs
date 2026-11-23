@@ -1,12 +1,3 @@
-//! End-to-end 2-of-3 Testnet self-send driven through the keyless `Signer` seam
-//! (`signer::Signer` / `LocalSigner`), not the relay `SigningSession`. The coordinator
-//! logic (build candidate, run both FROST rounds via `sign_commit`/`sign_approve`,
-//! aggregate, apply) lives inline here because there is no `drive_to_signed_pczt` helper
-//! on this branch — the seam only exposes the per-member trait methods.
-//!
-//! Spends 2,000,000 zat of disposable TAZ back to the vault's own external address,
-//! signed by member-1 + member-2, then proves, broadcasts and confirms a real txid.
-
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -31,11 +22,8 @@ use zcash_protocol::value::Zatoshis;
 const URL: &str = "https://testnet.zec.rocks:443";
 const AMOUNT: u64 = 2_000_000;
 
-/// Copied verbatim from `loki_member_payment::prove` (lines 932-979): apply anchor +
-/// witnesses, re-check the sighash is unchanged, prove, finalize, extract.
 use loki_poc::tx_finalize::prove;
 
-/// Build a signer holding this member's real vault share, sealed in a software SE.
 fn signer_for(
     m: &MemberState,
     nonce_dir: PathBuf,
@@ -74,7 +62,6 @@ fn run() -> Result<(), String> {
     let pass1 = dir1.join("passphrase");
     let pass2 = dir2.join("passphrase");
 
-    // 1. Open both members' sealed vault state.
     let m1 = member_state::open(&dir1, &pass1, &root.join("roster-1.json"))?;
     let m2 = member_state::open(&dir2, &pass2, &root.join("roster-2.json"))?;
     let pass1s = std::fs::read_to_string(&pass1).map_err(|e| e.to_string())?;
@@ -85,7 +72,6 @@ fn run() -> Result<(), String> {
         .build()
         .map_err(|e| e.to_string())?;
 
-    // 2. Incremental sync of member-1's wallet.
     let (mut wallet, mut client): (_, Lightwalletd) =
         rt.block_on(sync_member_wallet(&m1, &dir1, pass1s, URL))?;
     let height = wallet
@@ -93,9 +79,6 @@ fn run() -> Result<(), String> {
         .ok_or("wallet has not scanned any blocks")?;
     eprintln!("synced member-1 wallet to height {height}");
 
-    // 3. Node-less tree state -> frontier + anchor. Guard that the wallet scan is caught up
-    // to the tip and agrees with lightwalletd's tree state at `height` (same checks the
-    // reference `finish` uses), so the witnesses and anchor are consistent.
     let info = rt
         .block_on(client.get_lightd_info(Empty {}))
         .map_err(|e| format!("lightwalletd info: {e}"))?
@@ -124,14 +107,8 @@ fn run() -> Result<(), String> {
         .value()
         .cloned()
         .ok_or("scanned Ironwood tree is empty")?;
-    // Anchor the wallet-generated witnesses root to is the depth-padded commitment-tree
-    // root (`tree.root()`), NOT the natural-level `frontier.root(None)`.
     let anchor = tree.root().to_bytes();
 
-    // 4. Select notes + ZIP-317 fee/change via the wallet's own proposal. The seam signs
-    // one spend per single-use nonce, so a multi-note selection runs the two FROST rounds
-    // once PER input (each input gets its own CandidateRef attempt → own nonce in both
-    // signers, own commitment set, own alpha, own SigningPackage).
     let recipient = m1.fvk.address_at(0u64, Scope::External);
     let memo = MemoBytes::from_bytes(b"loki seam self-send").map_err(|e| format!("memo: {e:?}"))?;
     let amount = Zatoshis::from_u64(AMOUNT).map_err(|e| format!("amount: {e:?}"))?;
@@ -164,7 +141,6 @@ fn run() -> Result<(), String> {
         notes.len(), funding.fee_zat, funding.change_zat
     );
 
-    // Witnesses in the same (nullifier) order as the notes.
     let witnesses_by_null: Vec<([u8; 32], orchard::tree::MerklePath)> = nulls
         .iter()
         .copied()
@@ -176,7 +152,6 @@ fn run() -> Result<(), String> {
         )
         .collect();
 
-    // 5. Two LocalSigners over the real shares; connect each for a session.
     let nonce_root = std::env::temp_dir().join(format!("loki-split-nonce-{}", std::process::id()));
     let mut s1 = signer_for(&m1, nonce_root.join("m1"))?;
     let mut s2 = signer_for(&m2, nonce_root.join("m2"))?;
@@ -193,8 +168,6 @@ fn run() -> Result<(), String> {
     let id2 = *m2.key.identifier();
     let payment_id = rand_bytes();
 
-    // 6. Round 1 through the seam, once per spend: each signer persists its own nonce and
-    // returns a commitment. Build the per-spend commitment set, seed and alpha.
     let cands: Vec<CandidateRef> = (0..notes.len())
         .map(|_| CandidateRef { vault_id: m1.vault, payment_id, attempt_id: rand_bytes() })
         .collect();
@@ -224,7 +197,6 @@ fn run() -> Result<(), String> {
         sets.push(set);
     }
 
-    // One candidate PCZT carrying every spend's alpha.
     let built = build_candidate(
         &m1.network,
         &inputs,
@@ -239,11 +211,9 @@ fn run() -> Result<(), String> {
     let pczt_bytes = pczt.serialize().map_err(|e| format!("serialize: {e:?}"))?;
     let sighash = wysiwys::sighash_of_pczt(&pczt_bytes, &m1.fvk)?;
 
-    // 7. Round 2 + aggregation, once per spend, then apply each aggregate to its action.
     let parsed = pczt::Pczt::parse(&pczt_bytes).map_err(|e| format!("parse: {e:?}"))?;
     let mut signer_role =
         pczt::roles::signer::Signer::new(parsed.clone()).map_err(|e| format!("signer role: {e:?}"))?;
-    // Spend i of this candidate corresponds to input note i (same builder order).
     for (i, cand) in cands.iter().enumerate() {
         let pkg = frost::SigningPackage::new(sets[i].clone(), &sighash);
         let share1 = s1
@@ -289,7 +259,6 @@ fn run() -> Result<(), String> {
     }
     let signed = signer_role.finish();
 
-    // Sanity: the seam's sighash must match the signed PCZT's sighash.
     let signed_sighash = pczt::roles::signer::Signer::new(signed.clone())
         .map_err(|e| format!("signed sighash: {e:?}"))?
         .shielded_sighash();
@@ -297,7 +266,6 @@ fn run() -> Result<(), String> {
         return Err("signed PCZT sighash differs from the approved sighash".into());
     }
 
-    // 8. Prove + extract the raw transaction. Witnesses keyed to action index by nullifier.
     let witnesses = witnesses_by_null
         .into_iter()
         .map(|(nf, path)| {
@@ -313,7 +281,6 @@ fn run() -> Result<(), String> {
     let (raw, txid) = prove(signed, sighash, witnesses, anchor)?;
     eprintln!("proved txid={txid}");
 
-    // 9. Broadcast.
     let sent = rt
         .block_on(client.send_transaction(RawTransaction { data: raw.clone(), height: 0 }))
         .map_err(|e| format!("send_transaction: {e}"))?
@@ -327,7 +294,6 @@ fn run() -> Result<(), String> {
     }
     eprintln!("broadcast accepted: {}", sent.error_message);
 
-    // 10. Confirm via short incremental re-sync loop.
     let mut confirmations: u32 = 0;
     for attempt in 0..8 {
         std::thread::sleep(Duration::from_secs(20));

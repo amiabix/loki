@@ -1,18 +1,4 @@
 #!/usr/bin/env bash
-# Testnet end to end: an open payment request signed by the first approvers and broadcast,
-# with a seven-day expiry; a failed payment that another member retries on the same note,
-# which a member that approved the failed one approves without being asked; then a request
-# that the proposer cancels.
-#
-# By default this starts three members and creates a new 2-of-3 vault. With VAULT and
-# TOKEN_DIR it reuses three running members on BASE_PORT+1..3 that are already in that
-# active vault; TOKEN_DIR holds each member's API token as <i>.token, its log as <i>.log,
-# and the members must have been started with `--approve-from TOKEN_DIR/<i>.approvals`.
-#
-# Members sign only with an approval channel and two nonce witnesses. This script starts
-# two witness relays (or uses NONCE_WITNESSES, which needs separate operator enrollment) and runs each
-# member with `--approve-from`: it reads the signer's own `approval-request` summary from the
-# member's log and approves only the recipient, amount and network it proposed.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -34,7 +20,6 @@ pids=()
 witness_pids=()
 held=()
 cleanup() {
-  # Release what this run reserved and did not get to spend.
   for attempt in "${held[@]}"; do api 1 POST /api/payment-discard "$(pair "$attempt")" >/dev/null 2>&1 || true; done
   for pid in "${pids[@]}" "${witness_pids[@]}"; do kill "$pid" 2>/dev/null || true; done
   wait 2>/dev/null || true
@@ -152,7 +137,6 @@ for i in 1 2 3; do
 done
 echo "Back up all three member directories before funding: $tmp"
 if [[ -z ${NONCE_WITNESSES:-} ]]; then
-  # This isolated run created the vault, controls both witnesses and just confirmed the roster.
   joined=$(jq -ce '.invites[] | select(.slot == 2) | .code | gsub("-"; "+") | gsub("_"; "/") |
     . + ("=" * ((4 - length % 4) % 4)) | @base64d | fromjson | {vault, slot, token}' <<<"$created")
   roster=$(api 1 POST /api/roster "$joined" | jq -er --arg f "$fingerprint" 'select(.fingerprint == $f) | .roster')
@@ -174,7 +158,6 @@ else
 fi
 fi
 address="$(api 1 GET "/api/address?vault=$vault" | jq -er '.address')" || fail address
-# Without RECIPIENT the vault pays itself, so the test spends nothing but fees.
 recipient="${RECIPIENT:-$address}"
 echo "vault $vault"
 echo "Fund this vault with an Ironwood note worth more than amount plus fee: $address"
@@ -187,7 +170,6 @@ done
 [[ "$ready" == true ]] || fail "funding not scanned within $funding_timeout seconds"
 echo "balance: $(jq -r '.balance_zat' <<<"$balance") zat"
 
-# Each member's signer asks before it signs; answer from the summary it derived itself.
 review_signing() {
   local i="$1" seen=' ' summary sighash
   while sleep 1; do
@@ -211,7 +193,6 @@ for i in 1 2 3; do review_signing "$i" & pids+=("$!"); done
 draft() {
   api 1 POST /api/payment-draft "$(jq -nc --arg vault "$vault" --arg recipient "$recipient" --arg amount_zat "$AMOUNT_ZAT" --arg memo "$1" '{vault:$vault,recipient:$recipient,amount_zat:$amount_zat,memo:$memo}')"
 }
-# A received note becomes spendable only after enough confirmations; retry until it is.
 draft_when_spendable() {
   local out=''
   for ((n=0; n<funding_timeout; n+=30)); do
@@ -235,7 +216,6 @@ approve() {
 phase() { api "$1" GET "/api/payment-status?vault=$vault&attempt=$2" | jq -r '.phase'; }
 has_phase() { [[ "$(phase "$1" "$2")" == "$3" ]]; }
 pending() { api "$1" GET "/api/pending?vault=$vault" | jq -e --arg attempt "$2" 'any(.pending[]; .attempt == $attempt)' >/dev/null; }
-# The proposer's view; listing also drains its control messages.
 proposer_has() { api 1 GET "/api/payments?vault=$vault" | jq -e --arg attempt "$1" "any(.payments[]; .attempt == \$attempt and ($2))" >/dev/null; }
 wait_for() {
   local what="$1" tries="$2"
@@ -244,8 +224,6 @@ wait_for() {
   fail "$what"
 }
 phases() { for i in 1 2 3; do echo "  member $i: $(phase "$i" "$1")"; done; }
-# The transaction member $1 holds for payment $2 expires about seven days (8,064 blocks) after
-# the tip it was signed at, below the approved bound; prints its expiry height.
 check_expiry() {
   local p
   p="$(api "$1" GET "/api/payments?vault=$vault" | jq -c --arg attempt "$2" '.payments[] | select(.attempt == $attempt)')"
@@ -271,7 +249,6 @@ wait_for 'signing group [1,3]' 60 proposer_has "$attempt" '.signers == [1,3]'
 wait_for 'member 2 is not selected' 300 has_phase 2 "$attempt" not_selected
 ! pending 2 "$attempt" || fail 'member 2 still lists the request'
 echo "signing group [1,3]; member 2 not_selected and off its pending list"
-# The proposer sends on its own once the signatures combine, after sealing a copy to every member.
 wait_for 'proposer did not send' 600 proposer_has "$attempt" '.phase == "broadcast" or .phase == "confirmed"'
 phases "$attempt"
 txid="$(api 1 GET "/api/payments?vault=$vault" | jq -er --arg attempt "$attempt" '.payments[] | select(.attempt == $attempt) | .txid')" || fail txid
@@ -291,7 +268,6 @@ publish "$attempt"
 for i in 2 3; do wait_for "member $i sees the request" 60 pending "$i" "$attempt"; done
 approve 2 "$attempt"
 wait_for 'proposer records member 2' 60 proposer_has "$attempt" '.approvals == [2]'
-# Member 2 goes away after approving, so the round the proposer starts with it fails.
 api 2 POST /api/lock '{}' | jq -e '.locked' >/dev/null || fail 'lock 2'
 approve 1 "$attempt"
 wait_for 'signing group [1,2]' 60 proposer_has "$attempt" '.signers == [1,2]'
@@ -305,7 +281,6 @@ echo "member 3 retries it as $retry"
 api 3 POST /api/payment-publish "$(pair "$retry")" | jq -e '.phase == "signing" and (.approved | not)' >/dev/null || fail 'publish retry'
 retry_seen() { api 2 GET "/api/payments?vault=$vault" | jq -e --arg attempt "$retry" 'any(.payments[]; .attempt == $attempt)' >/dev/null; }
 wait_for 'member 2 sees the retry' 60 retry_seen
-# No approve call for member 2: its app approves the retry when it reads the request.
 ! pending 2 "$retry" || fail 'member 2 was asked to approve the retry'
 api 2 GET "/api/payments?vault=$vault" | jq -e --arg attempt "$retry" 'any(.payments[]; .attempt == $attempt and .approval_requested)' >/dev/null || fail 'member 2 did not approve the retry'
 echo "member 2 approved the retry by itself"
@@ -319,7 +294,6 @@ approve_retry() {
 approve_retry
 echo "member 3 approved its retry"
 wait_for 'retry signing group [3,2]' 120 retry_by '.signers == [3,2]'
-# Member 2 lists payments as its screen does, which starts its signing.
 retry_sent() { api 2 GET "/api/payments?vault=$vault" >/dev/null; retry_by '.phase == "broadcast" or .phase == "confirmed"'; }
 wait_for 'retry was not sent' 600 retry_sent
 txid="$(api 3 GET "/api/payments?vault=$vault" | jq -er --arg attempt "$retry" '.payments[] | select(.attempt == $attempt) | .txid')" || fail txid
@@ -349,7 +323,6 @@ for i in 2 3; do wait_for "member $i sees the request" 60 pending "$i" "$attempt
 approve 2 "$attempt"
 wait_for 'proposer records member 2' 60 proposer_has "$attempt" '.approvals == [2] and .can_discard'
 phases "$attempt"
-# Reserve every other note that could fund this amount, so only the cancel can free one.
 while other="$(draft 'reserves another note')"; do
   held+=("$(jq -er '.attempt' <<<"$other")")
   (( ${#held[@]} <= 20 )) || fail 'too many spendable notes'

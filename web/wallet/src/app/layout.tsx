@@ -18,11 +18,8 @@ export const metadata: Metadata = {
   description: "A shielded Zcash multisig wallet.",
 };
 
-// Render the shell per-request so a deploy is reflected immediately — never serve a
-// statically-cached HTML that pins returning visitors to an old build's chunks.
 export const dynamic = "force-dynamic";
 
-/** The signer origin from the server's runtime configuration, or none (the signer then fails closed). */
 function runtimeSignerOrigin(): string | undefined {
   try { return signerOrigin(); } catch { return undefined; }
 }
@@ -32,15 +29,11 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html
       lang="en"
-      // The pre-paint script below sets data-theme before React hydrates.
       suppressHydrationWarning
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
       <head>
-        {/* The signer iframe's origin, chosen by server configuration only (signer.ts reads it). */}
         {origin && <meta name="loki-signer-origin" content={origin} />}
-        {/* Apply a pinned theme before paint so a light pin on a dark system (or vice versa)
-            doesn't flash. Unpinned users fall through to CSS prefers-color-scheme. */}
         <script
           dangerouslySetInnerHTML={{
             __html:

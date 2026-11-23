@@ -80,9 +80,6 @@ class _Wallet extends StatefulWidget {
 
 class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
   WalletApi get api => widget.api;
-  // A cancelled Touch ID prompt leaves the vault's key closed for this session. Ask again by
-  // itself, but only while the window is in front: at most once a minute, and right away when
-  // the member comes back to the window.
   DateTime touchIdAgainAfter = DateTime.fromMillisecondsSinceEpoch(0);
   bool appActive = true;
   MacWalletApi? get macApi => api is MacWalletApi ? api as MacWalletApi : null;
@@ -99,7 +96,6 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
   bool get canRecoverWalletKey =>
       macApi != null && profile['can_recover_wallet_key'] == true;
   bool get hasNativeFeedback => nativeStatus != null || canRecoverWalletKey;
-  // The profile was written but the coordinator never accepted its registration.
   bool get pairingPending => profile['pairing_pending'] == true;
   bool get waitingForPreview =>
       previewRequestGeneration == generation && nativePrompt != true;
@@ -107,7 +103,6 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
   int? previewRequestGeneration;
   Json profile = {};
   List<Json> vaults = [], payments = [], addresses = [];
-  // Per vault: the signer's background relay sync (`sync` on payments/pending).
   Map<String, Json> relaySync = {};
   List<({Json vault, Json payment})> approvals = [];
   Json ceremony = {}, recovery = {};
@@ -124,11 +119,8 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
   final verifyUntil = <String, DateTime>{};
   bool scanning = false, enteringLink = false;
   String pairingLink = '';
-  // An invite link that opened the app: taken from the native side once unlocked, then shown
-  // in Join for review. Never persisted; a lock or leaving Join drops it.
   bool inviteWaiting = true;
   String? joinInvite, joinPrefill;
-  // Remounts the create/join form; never derived from the invite, which is a bearer secret.
   int formSerial = 0;
   static const _formPages = {
     _Page.create,
@@ -167,7 +159,6 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
     try {
       active = await mac.nativePromptActive();
     } on MissingPluginException {
-      // Older native runners have no content-area callbacks.
     } on PlatformException catch (e) {
       if (mounted) setState(() => actionError = walletError(e));
     }
@@ -225,9 +216,7 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
             setState(() => nativeStatus = notice);
           }
         } on MissingPluginException {
-          // Notices are optional on older native runners.
         } on PlatformException {
-          // Failure to read an advisory notice must not block the wallet poll.
         }
       }
       final current = await api.profile();
@@ -277,7 +266,6 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
       if (inviteWaiting && !_formPages.contains(page)) {
         inviteWaiting = false;
         final taken = await api.pendingInvite();
-        // A claim taken for a session that has since changed is dropped, not kept.
         if (!mounted || locking || epoch != generation) return;
         if (taken != null) joinInvite = taken;
       }
@@ -297,7 +285,6 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
           DateTime.now().isAfter(nextScan)) {
         unawaited(scan(id, epoch));
       }
-      // Fetch the selected vault's data first; another vault's relay can't stall setup.
       if (id != null && view == _Page.setup && !active) {
         final result = await api.request('status?vault=$id');
         if (mounted && epoch == generation) {
@@ -386,7 +373,6 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
       }
     } catch (e) {
       final touchId = walletErrorCode(e) == 'touch_id_required';
-      // TEMPORARY verbose diagnostics (stdout goes to the profile's verbose log).
       verbose(
         'balance scan failed (retry=$retryTouchId, active=$appActive): ${walletError(e)}',
       );
@@ -408,7 +394,6 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
     } finally {
       scanning = false;
     }
-    // The vault is closed only because a Touch ID prompt was cancelled: prompt again now.
     if (askAgain && mounted && epoch == generation) {
       await scan(id, epoch, retryTouchId: true);
     }
@@ -438,7 +423,6 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
         'txid': payment['txid'],
       });
     } catch (_) {
-      // A missing confirmation is expected on testnet. History must keep 'Broadcast'.
     } finally {
       scanning = false;
     }
@@ -554,7 +538,6 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
       throw StateError('The payment preview is no longer active.');
     }
     if (macApi == null) return api.request(path, body);
-    // Wait for the native page to open before allowing navigation to cancel it.
     setState(() => previewRequestGeneration = epoch);
     try {
       return await api.request(path, body);
@@ -703,12 +686,10 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
     );
   }
 
-  // Retain in-flight Dart work without painting, focusing, or exposing its UI.
   Widget walletBody({required Widget child}) => Expanded(
     child: Visibility(visible: !hideContent, maintainState: true, child: child),
   );
 
-  /// The current vault's relay sync, so a slow relay reads as "syncing", not a frozen app.
   Widget? syncLine() {
     final id = vaultId;
     final sync = id == null ? null : relaySync[id];
@@ -1154,8 +1135,6 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
     );
   }
 
-  /// The one place a pairing link is typed, for a fresh profile or one whose
-  /// registration never finished. The link is one-use and is not kept.
   Widget pairingLinkField() => TextFormField(
     initialValue: pairingLink,
     autofocus: true,
@@ -1415,7 +1394,6 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
     final pending = approvals
         .where((a) => a.vault['vault'] == v['vault'])
         .toList();
-    // The newest confirmed payments; History lists every record.
     final recent = payments
         .where((p) => p['phase'] == 'confirmed')
         .take(5)

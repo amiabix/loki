@@ -1,13 +1,3 @@
-//! WS3 transport, `frostd` implementation. The stable [`Transport`] trait and the public
-//! message set ([`Outbound`], [`Incoming`], [`Peer`], [`RelayLog`], …) live in
-//! `loki-signer-core` (dependency-clean, wasm-compilable); this module re-exports them and
-//! adds [`FrostdTransport`], the reqwest/tokio `frostd` client that `loki-poc` owns.
-//!
-//! `frostd` is an honest-but-curious JSON-over-HTTP(S) relay: it queues opaque bytes keyed
-//! by session + recipient pubkey and hands them back on `receive`. [`FrostdTransport`]
-//! speaks its JSON contract directly; login proves possession of the [`FrostdLoginKey`]
-//! secret via XEdDSA over the server challenge (`frostd/src/functions.rs::login`).
-
 use std::{future::{pending, Future}, time::Duration};
 
 use reqwest::Client;
@@ -18,7 +8,6 @@ use uuid::Uuid;
 
 pub use loki_signer_core::transport::*;
 
-/// Only TLS, or plain HTTP to this machine, may carry relay or peer traffic.
 pub fn require_tls_off_loopback(base_url: &str) -> Result<(), String> {
     tls_url(base_url).map(|_| ())
 }
@@ -53,7 +42,6 @@ pub(crate) async fn read_bounded(response: &mut reqwest::Response, cap: usize) -
     Ok(body)
 }
 
-/// An open frostd session for one logged-in member.
 #[derive(Clone, Debug)]
 pub struct FrostdChannel {
     pub session: Uuid,
@@ -69,10 +57,6 @@ impl FrostdChannel {
     }
 }
 
-/// `frostd` client for one member's app or the coordinator. Owns its own tokio runtime
-/// (same block-on pattern as `setup_relay`) and a logged-in bearer token. Its address is
-/// the public half of its [`FrostdLoginKey`], whose secret only XEdDSA-signs the login
-/// challenge.
 pub struct FrostdTransport {
     base_url: String,
     client: Client,
@@ -84,12 +68,6 @@ pub struct FrostdTransport {
     deadline: Option<Instant>,
 }
 
-// Wire types mirrored from `frost_client::api` (frostd speaks these). Kept local so core
-// does not take the version-conflicting `frost-client` crate as a dependency (ADOPTION
-// §2: core is on frost-core 3.0.0, frost-client on 2.x — embedding it would duplicate the
-// crypto crates). The audited relay binary is unchanged; only its JSON contract is here.
-// Keep these client budgets in sync with wasm-transport. MAX_MSG_SIZE is frostd's send limit;
-// receive also needs a batch budget because frostd drains the entire pending queue at once.
 const MAX_MSG_SIZE: usize = 65_535;
 const MAX_RECEIVE_MESSAGES: usize = 1024;
 const RECEIVE_CAP: usize = 8 * 1024 * 1024;
@@ -133,7 +111,6 @@ struct ReceiveOut {
 #[serde(transparent)]
 struct HexKey(#[serde(deserialize_with = "decode_key")] [u8; 32]);
 
-// frostd serializes byte fields as lower-hex strings (`serdect` hex-or-bin). Mirror that.
 fn decode_key<'de, D: serde::Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
     let mut key = [0; 32];
     hex::decode_to_slice(String::deserialize(d)?, &mut key).map_err(serde::de::Error::custom)?;
@@ -149,8 +126,6 @@ fn decode_message<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::
 }
 
 impl FrostdTransport {
-    /// `base_url` like `http://127.0.0.1:2744` (or `https://…` with TLS in production,
-    /// ws3 §6). Logs in with `login`.
     pub fn new(base_url: &str, login: FrostdLoginKey) -> Result<Self, TransportError> {
         Self::with_limits(base_url, login, None, None)
     }
@@ -185,13 +160,10 @@ impl FrostdTransport {
         Ok(t)
     }
 
-    /// The relay address this transport logged in as.
     pub(crate) fn login_peer(&self) -> [u8; 32] {
         self.me.0
     }
 
-    /// Shuts the owned runtime down without blocking, so a transport kept between requests can be
-    /// dropped from any thread, including inside another runtime.
     pub(crate) fn close_in_background(self) {
         self.runtime.shutdown_background();
     }
@@ -240,8 +212,6 @@ impl FrostdTransport {
             .map_err(|e| TransportError::Decode(e.to_string()))
     }
 
-    /// `challenge` → XEdDSA-sign it with the X25519 secret → `login`, caching the token.
-    /// This is exactly what frostd verifies in `functions.rs::login`.
     fn login(&mut self) -> Result<(), TransportError> {
         let base = self.base_url.clone();
         let client = self.client.clone();
@@ -251,9 +221,6 @@ impl FrostdTransport {
             let ch: ChallengeOut =
                 Self::post(&client, format!("{base}/challenge"), None, json!({}), CONTROL_CAP).await?;
             let signing = xeddsa::xed25519::PrivateKey::from(&*secret);
-            // xeddsa 1.1.0's `CryptoRng` is the rand 0.10 trait shape; `rand_zp::rng()`
-            // (the OS-seeded ThreadRng, a `CryptoRng`) satisfies it. core aliases rand 0.10
-            // as `rand_zp`. XEdDSA uses it only to randomize the challenge signature.
             let sig: [u8; 64] =
                 xeddsa::Sign::sign(&signing, ch.challenge.as_bytes(), rand_zp::rng());
             let out: LoginOut = Self::post(
@@ -274,9 +241,6 @@ impl FrostdTransport {
         Ok(())
     }
 
-    /// Every session id this logged-in member is a participant or coordinator of. A member
-    /// behind NAT uses this to find the signing session a proposer enlisted it in without
-    /// any inbound reachability (the relay keys sessions by participant pubkey).
     pub fn list_sessions(&self) -> Result<Vec<Uuid>, TransportError> {
         let out: ListSessionsOut = self.run(Self::post(
             &self.client,
@@ -288,8 +252,6 @@ impl FrostdTransport {
         Ok(out.session_ids)
     }
 
-    /// The participant pubkeys of one session, so a member can tell a payment quorum from
-    /// an unrelated session before it drains the mailbox.
     pub fn session_info(&self, session: Uuid) -> Result<Vec<[u8; 32]>, TransportError> {
         Ok(self.session_details(session)?.0)
     }
@@ -349,8 +311,6 @@ impl Transport for FrostdTransport {
     }
 
     fn join(&mut self, session: Uuid) -> Result<FrostdChannel, TransportError> {
-        // frostd has no explicit join: a participant is already in the session (the
-        // coordinator listed its pubkey at create time). The channel is just the id.
         Ok(FrostdChannel {
             session,
             me: self.me.clone(),

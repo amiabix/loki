@@ -6,8 +6,6 @@ func fail(_ msg: String) -> Never {
     exit(1)
 }
 
-// 1. Access control — private-key usage only (no biometric, so this runs non-interactively).
-//    The real backend adds .biometryCurrentSet for Face/Touch ID; that's the next step.
 var acErr: Unmanaged<CFError>?
 guard let access = SecAccessControlCreateWithFlags(
     kCFAllocatorDefault,
@@ -33,14 +31,12 @@ guard let priv = SecKeyCreateRandomKey(attrs as CFDictionary, &keyErr) else {
 guard let pub = SecKeyCopyPublicKey(priv) else { fail("SecKeyCopyPublicKey") }
 print("OK  created P-256 key in the Secure Enclave (ephemeral, token=SecureEnclave)")
 
-// 3. Prove the private key is NON-EXPORTABLE: external representation must be refused.
 var expErr: Unmanaged<CFError>?
 if SecKeyCopyExternalRepresentation(priv, &expErr) != nil {
     fail("SECURITY: private key is exportable (must not be)")
 }
 print("OK  private key is non-exportable (SecKeyCopyExternalRepresentation refused)")
 
-// 4. wrap_dek — random 32-byte DEK, ECIES-encrypt to the Enclave public key.
 var dek = Data(count: 32)
 let rc = dek.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }
 guard rc == errSecSuccess else { fail("SecRandomCopyBytes") }
@@ -52,7 +48,6 @@ guard let wrapped = SecKeyCreateEncryptedData(pub, algo, dek as CFData, &encErr)
 }
 print("OK  wrap_dek -> \(wrapped.count) bytes ciphertext")
 
-// 5. unwrap_dek — decrypt with the Enclave private key (this is what biometric would gate).
 var decErr: Unmanaged<CFError>?
 guard let unwrapped = SecKeyCreateDecryptedData(priv, algo, wrapped as CFData, &decErr) as Data? else {
     fail("unwrap_dek SecKeyCreateDecryptedData: \(decErr!.takeRetainedValue())")

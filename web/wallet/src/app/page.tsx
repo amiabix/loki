@@ -48,8 +48,6 @@ import type {
   VaultSummary,
 } from "@/lib/types";
 
-// ─── util ────────────────────────────────────────────────────────────────────
-
 const zatToTaz = (zat: number | string) => {
   const n = Number(zat) / 1e8;
   return Number.isFinite(n) ? n.toLocaleString(undefined, { maximumFractionDigits: 8 }) : "—";
@@ -58,7 +56,6 @@ const zatToTaz = (zat: number | string) => {
 const short = (s: string, head = 8, tail = 6) =>
   s.length > head + tail + 1 ? `${s.slice(0, head)}…${s.slice(-tail)}` : s;
 
-/** Pull the invite code out of a pasted link, or return the trimmed input as-is. */
 function extractInvite(raw: string): string {
   const s = raw.trim();
   try {
@@ -69,12 +66,9 @@ function extractInvite(raw: string): string {
   }
 }
 
-/** A shareable invite link for a join code — opens the app straight into Join. */
 function inviteLink(code: string): string {
   return typeof window === "undefined" ? code : `${window.location.origin}/#invite=${encodeURIComponent(code)}`;
 }
-
-// ─── navigation state ────────────────────────────────────────────────────────
 
 type View =
   | { id: "home" }
@@ -86,17 +80,13 @@ type View =
   | { id: "review"; vault: VaultSummary; attempt: string; proposer?: number; proposedHere?: boolean }
   | { id: "history"; vault: VaultSummary };
 
-// ─── root ─────────────────────────────────────────────────────────────────────
-
 export default function App() {
-  // null = still checking the device session; false = show login; true = signed in.
   const [authed, setAuthed] = useState<boolean | null>(null);
   const [sessionError, setSessionError] = useState<string | null>(null);
   const [view, setView] = useState<View>({ id: "home" });
   const [pendingInvite, setPendingInvite] = useState<string | null>(null);
   const { data: status, error: statusError, refresh: refreshStatus } = useStatus(authed === true);
 
-  // Fragments stay out of the initial request. Keep the claim only in memory across sign-in.
   useEffect(() => {
     const url = new URL(window.location.href);
     const fragment = new URLSearchParams(url.hash.slice(1));
@@ -117,7 +107,6 @@ export default function App() {
 
   const checkSession = useCallback(async () => {
     setAuthed(null); setSessionError(null);
-    // A reload keeps the slot but not the grant. Reconnect without waiting for the browser signer.
     if (lastLokiSignerSlot() !== undefined && signerKind() === "browser") {
       setAuthed(false);
       return;
@@ -134,9 +123,6 @@ export default function App() {
   }, []);
   useEffect(() => { void checkSession(); }, [checkSession]);
 
-  // Same desync can bite mid-use (the host restarts after sign-in): a later status comes back
-  // "locked", or an action 401s with "profile is locked"/"not signed in". Bounce to Login
-  // rather than surface a cryptic error — unlocking locally reconnects the device.
   useEffect(() => {
     const lockedPhase = status?.phase === "locked" || status?.phase === "new_profile";
     if (authed === true && lockedPhase) {
@@ -145,9 +131,6 @@ export default function App() {
     }
   }, [authed, status]);
 
-  // Any action (Join, Create, …) that hits a locked/expired host fires `loki:auth-lost` from
-  // the api() helper — route straight to Login so the user never sees a dead "profile is
-  // locked" on an action screen.
   useEffect(() => {
     const onAuthLost = () => {
       setView({ id: "home" });
@@ -223,8 +206,6 @@ export default function App() {
   );
 }
 
-// ─── screen wrapper ───────────────────────────────────────────────────────────
-
 function useScreenFocus() {
   const ref = useRef<HTMLDivElement>(null);
   const [announcement, setAnnouncement] = useState("");
@@ -266,8 +247,6 @@ function Screen({ children }: { children: React.ReactNode }) {
     </motion.div>
   );
 }
-
-// ─── view router ──────────────────────────────────────────────────────────────
 
 function ViewRouter({
   view,
@@ -384,8 +363,6 @@ function ViewRouter({
   }
 }
 
-// ─── shared primitives ────────────────────────────────────────────────────────
-
 function Row({ label, value, mono }: { label: string; value: React.ReactNode; mono?: boolean }) {
   return (
     <div className="flex flex-col gap-1 border-b border-[var(--border)] py-3 last:border-0 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
@@ -443,8 +420,6 @@ function ErrMsg({ msg }: { msg: string | null }) {
   return <p role="alert" className="mt-3 rounded-xl border border-danger/25 bg-[var(--surface-2)] px-4 py-3 text-left text-sm leading-relaxed text-danger [overflow-wrap:anywhere]">{msg}</p>;
 }
 
-// Every member gets a stable colour from their slot, so everyone sees the same person in the
-// same colour across the ceremony, approvals, and history.
 const MEMBER_COLORS = ["#2f69ff", "#e24d78", "#17b890", "#9b51e0", "#f29e0a", "#00b4d8", "#ff6b3d", "#4c6ef5"];
 function memberColor(slot: number) {
   return MEMBER_COLORS[(Math.max(1, slot) - 1) % MEMBER_COLORS.length];
@@ -464,8 +439,6 @@ function MemberAvatar({ slot, name, size = 28 }: { slot: number; name?: string; 
   );
 }
 
-// Light/dark toggle. Shows the current theme's glyph (sun in light, moon in dark); a click
-// pins the opposite and persists it. Reads on both themes via --muted / --ink tokens.
 function ThemeToggle() {
   const dark = useIsDark();
   return (
@@ -477,12 +450,10 @@ function ThemeToggle() {
       className="grid h-11 w-11 shrink-0 place-items-center rounded-full text-muted transition hover:text-[var(--ink)]"
     >
       {dark ? (
-        // moon
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
           <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
         </svg>
       ) : (
-        // sun
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
           <circle cx="12" cy="12" r="4" />
           <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
@@ -491,8 +462,6 @@ function ThemeToggle() {
     </button>
   );
 }
-
-// ─── sign in ──────────────────────────────────────────────────────────────────
 
 function FullScreen({ children, calm = false }: { children: React.ReactNode; calm?: boolean }) {
   const { ref, announcement } = useScreenFocus();
@@ -524,17 +493,14 @@ function Splash({ sub }: { sub: string }) {
 // phone) unlocks the sealed share, with a passphrase fallback for machines without
 // WebAuthn. No install, no 127.0.0.1 pairing link. Tiers match definition §2.B.
 function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string | null }) {
-  const [existing, setExisting] = useState<boolean>(hasSignerHint); // a share sealed here? sync guess, confirmed below
+  const [existing, setExisting] = useState<boolean>(hasSignerHint);
   const [mode, setMode] = useState<"passkey" | "passphrase">("passkey");
-  const [platform, setPlatform] = useState(false); // biometric authenticator present?
+  const [platform, setPlatform] = useState(false);
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
-    // A signer error (another tab holds the signer, or the signer origin is unreachable) is
-    // shown, not mistaken for "no signer here".
-    // A share this browser had but the signer lost (404) offers Restore, not Unlock.
     hasSigner().then(setExisting).catch((e) => { setErr((e as Error).message); if ((e as ApiError).status === 404) setExisting(false); });
     const pk = (window as unknown as { PublicKeyCredential?: { isUserVerifyingPlatformAuthenticatorAvailable?: () => Promise<boolean> } }).PublicKeyCredential;
     pk?.isUserVerifyingPlatformAuthenticatorAvailable?.().then(setPlatform).catch(() => setPlatform(false));
@@ -544,8 +510,6 @@ function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string 
   const go = async (method: CustodyMethod) => {
     setBusy(true); setErr(null);
     try {
-      // The passkey ceremony or passphrase entry happens in the signer's own window (its
-      // origin), which opens over this page; this page never sees the secret.
       if (unlocking) await unlock({ method });
       else await createSigner({ name: name.trim() || "You", method });
       onLoggedIn();
@@ -564,7 +528,7 @@ function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string 
     if (!nativeOpen) return;
     const loading = new AbortController();
     listSlots(loading.signal).then(setApps).catch(() => {
-      if (!loading.signal.aborted) setApps([]); // An existing headless member can still paste.
+      if (!loading.signal.aborted) setApps([]);
     });
     return () => loading.abort();
   }, [nativeOpen]);
@@ -615,8 +579,6 @@ function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string 
       )}
 
       {!unlocking && (
-        // A fresh browser: rebuild a vault member from its 24 words and backup file, entered on
-        // the signer page, sealed under the passkey or passphrase chosen above.
         <button className="mt-3 min-h-11 w-full text-sm text-mint" disabled={busy}
           onClick={async () => {
             setBusy(true); setErr(null);
@@ -635,9 +597,6 @@ function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string 
         {unlocking ? "Set up a different signer instead" : "Already have a signer here? Unlock it"}
       </button>
 
-      {/* A native member app (LokiSigner / loki_member_app) instead of the browser signer: this
-          tab then drives that member over its loopback device API. A new app first takes a
-          pairing link (step 1); an app that is already paired goes straight to step 2. */}
       <details open={nativeOpen} className="mt-4 text-xs text-muted" onToggle={(e) => setNativeOpen(e.currentTarget.open)}>
         <summary className="min-h-11 cursor-pointer hover:text-mint">Use a native member app instead</summary>
         <h2 className="mb-1 mt-3 text-sm font-semibold text-[var(--ink)]">1 · Pair a new native signer</h2>
@@ -656,7 +615,6 @@ function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string 
             </select>
           </label>}
           {selected === undefined && lokiSigners.length === 0 && <p role="status" className="my-2">Reading the member roster…</p>}
-          {/* Starting a browser-signer action unmounts and cancels a pending native connection. */}
           {selected !== undefined && !busy && <NativeTabConnection key={selected} member={selectedMember} slot={selectedSlot} disabled={nativeBusy}
             onBusy={setNativeBusy} onConnected={onLoggedIn} />}
         </>}
@@ -665,21 +623,17 @@ function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string 
   </FullScreen>;
 }
 
-// Step 1 of pairing a native member app: a `loki://pair` link from the coordinator. Each
-// request reserves a slot for 120 s and the coordinator caps pending reservations, so only the
-// member asks for a new link, never a timer. While the link is out, and for a minute after it
-// lapses, the public roster shows whether LokiSigner registered that slot.
 const ROSTER_POLL_MS = 3000;
 const ROSTER_GRACE_MS = 60_000;
 
 function NativePairingLink({ open, onReserved, onRegistered }: { open: boolean; onReserved: (slot: number) => void; onRegistered: (roster: Slot[]) => void }) {
   const [link, setLink] = useState<PairingLink | null>(null);
-  const [slot, setSlot] = useState<number>(); // a new link asks for this slot again
+  const [slot, setSlot] = useState<number>();
   const [registered, setRegistered] = useState<number | null>(null);
   const [now, setNow] = useState(0);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  const [copied, setCopied] = useState<boolean | null>(null); // null: not copied, false: copy failed
+  const [copied, setCopied] = useState<boolean | null>(null);
 
   const request = async (want: number | undefined) => {
     setBusy(true); setErr(null); setCopied(null);
@@ -688,7 +642,6 @@ function NativePairingLink({ open, onReserved, onRegistered }: { open: boolean; 
       setSlot(issued.slot); setNow(Date.now()); setLink(issued); setRegistered(null);
       onReserved(issued.slot);
     } catch (e) {
-      // A taken slot stays taken: stop watching it, and let the next link take a new slot.
       if (e instanceof PairingSlotTaken) setSlot(undefined);
       setLink(null); setErr((e as Error).message);
     }
@@ -712,13 +665,12 @@ function NativePairingLink({ open, onReserved, onRegistered }: { open: boolean; 
       try {
         const roster = await listSlots();
         if (!stopped && roster.some((m) => m.slot === link.slot)) { setRegistered(link.slot); onRegistered(roster); }
-      } catch {} // the next poll retries
+      } catch {}
     }, ROSTER_POLL_MS);
     return () => { stopped = true; clearInterval(tick); clearInterval(poll); };
   }, [watching, link, onRegistered]);
 
   if (registered !== null) {
-    // The roster shows only that some identity registered this slot, not that it is this member's.
     return <>
       <p role="status" className="my-2 font-medium text-mint">
         Slot {registered} now appears on the roster. If LokiSigner is running and paired with that slot, connect below.
@@ -770,7 +722,6 @@ function NativePairingLink({ open, onReserved, onRegistered }: { open: boolean; 
   </>;
 }
 
-// Describe protection on the signer host, not custody inside this browser.
 function SecureStorageBadge({ se }: { se?: string }) {
   const { enclave, label, detail } = storageLabel(se, signerKind());
   return (
@@ -791,9 +742,6 @@ function AccountNumber() {
   }, []);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  // Register this browser's signer in the coordinator's public roster (frostd-only member, no
-  // advertised URL). The signer signs the registration on its own origin; registering the same
-  // identity again returns the same slot, so this also recovers the number after a reload.
   const register = async () => {
     setBusy(true); setErr(null);
     try {
@@ -809,8 +757,6 @@ function AccountNumber() {
     <ErrMsg msg={err} />
   </div>;
 }
-
-// ─── home ─────────────────────────────────────────────────────────────────────
 
 function Home({
   profile,
@@ -871,7 +817,6 @@ function Home({
   );
 }
 
-// The embedded signer starts recovery and custody operations in a separate signer tab.
 function BrowserSignerRecovery({ onRestored }: { onRestored: () => void }) {
   const [hasWords, setHasWords] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
@@ -899,8 +844,6 @@ function BrowserSignerRecovery({ onRestored }: { onRestored: () => void }) {
   );
 }
 
-// ─── create vault ─────────────────────────────────────────────────────────────
-
 function CreateVault({
   profileId,
   onBack,
@@ -916,7 +859,6 @@ function CreateVault({
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  // the host requires 2 <= threshold < members <= 16
   const t = Math.min(threshold, members - 1);
   const submit = async () => {
     setBusy(true); setErr(null);
@@ -990,8 +932,6 @@ function CreateVault({
   );
 }
 
-// ─── join vault ───────────────────────────────────────────────────────────────
-
 function JoinVault({
   profileId,
   initialInvite,
@@ -1058,10 +998,6 @@ function JoinVault({
   );
 }
 
-// ─── ceremony ─────────────────────────────────────────────────────────────────
-
-// The phases the host actually emits (see host/ceremony.rs status): waiting → roster → keys →
-// active. Backup is done inside the key-generation step, not as its own phase.
 const CEREMONY_PHASES: CeremonyStatus["phase"][] = [
   "waiting_for_members",
   "compare_roster",
@@ -1129,7 +1065,6 @@ function CeremonyView({
         {cs.phase === "waiting_for_members" && (
           <WaitingForMembers invites={cs.invites ?? []} />
         )}
-        {/* Only LokiSigner's native window reports `roster_dialog`. */}
         {cs.phase === "compare_roster" && comparesInLokiSigner(cs) && (
           <NativeCompareRoster
             creator={cs.invites !== undefined}
@@ -1221,8 +1156,6 @@ function WaitingForMembers({ invites }: { invites: InviteSlot[] }) {
       setCopyFailed(slot);
     }
   };
-  // A joiner's status carries no invite list (only the creator holds it), so an empty
-  // array here means the viewer has already joined and is just waiting for the others.
   if (invites.length === 0) {
     return (
       <GlassCard>
@@ -1291,7 +1224,6 @@ function CompareRoster({
 }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  // The parent keys this form by roster code so a status refresh cannot carry approval over.
   const [checked, setChecked] = useState(false);
 
   const [confirmedHere, setConfirmedHere] = useState(confirmed);
@@ -1302,7 +1234,6 @@ function CompareRoster({
   const agree = async () => {
     setBusy(true); setErr(null);
     try {
-      // The signer accepts agreement only with the 24-digit code it derives itself, the one shown.
       await api("agree", { vault, fingerprint, roster_code: rosterCode });
       setConfirmedHere(true);
     } catch (e) { setErr((e as Error).message); }
@@ -1359,8 +1290,6 @@ function CompareRoster({
   );
 }
 
-/** A LokiSigner member compares the code in LokiSigner, which records agreement only when the
- *  member chooses "Codes match" there. This page never shows the code it was sent to compare. */
 function NativeCompareRoster({
   creator = false,
   vault,
@@ -1387,8 +1316,6 @@ function NativeCompareRoster({
   const ask = async () => {
     setAsking(true); setErr(null);
     try {
-      // The request names the code the member's signer derived; LokiSigner shows it and agrees
-      // only when the member chooses "Codes match" there.
       await api("agree", { vault, fingerprint, roster_code: rosterCode });
       setConfirmedHere(true);
     } catch (e) {
@@ -1397,7 +1324,6 @@ function NativeCompareRoster({
   };
 
   const allConfirmed = members > 0 && confirmations >= members;
-  // The member's own status reports a confirmation made after this page lost the request.
   const done = confirmed || confirmedHere || allConfirmed;
   const waiting = !done && (asking || dialog === "open");
   const refusal = err ?? (dialog === "codes_differ" ? nativeRosterRefusal("roster codes differ", true) : null);
@@ -1435,8 +1361,6 @@ function NativeCompareRoster({
   );
 }
 
-// ─── vault overview ───────────────────────────────────────────────────────────
-
 function ProviderProvenance({ chain_trust }: ChainProvenance) {
   return chain_trust === "provider_reported" && (
     <p className="mb-3 text-xs text-muted">Reported by your chain provider · not independently verified</p>
@@ -1473,8 +1397,6 @@ function VaultOverview({
   const [pendingError, setPendingError] = useState<string | null>(null);
   const [pendingVersion, setPendingVersion] = useState(0);
 
-  // Poll for payments another member proposed that need THIS member's approval — the co-signer's
-  // inbox. Without this a co-signer has no way to discover a pending payment to approve.
   useEffect(() => {
     let active = true;
     const load = () =>
@@ -1492,12 +1414,9 @@ function VaultOverview({
   useEffect(() => {
     let active = true;
     setLoadErr(null);
-    // Load independently: a hosted vault's balance can be unavailable (needs a scan /
-    // roster the signer can't open), but the address must still render.
     api<{ address: string }>(`address?vault=${vault.vault}`)
       .then((r) => { if (active) { setAddress(r.address); setLoadErr(null); } })
       .catch((e) => active && setLoadErr((e as Error).message));
-    // Poll the balance so a deposit (or a still-scanning signer) shows up without a reload.
     const loadBalance = () =>
       api<Balance>("balance", { vault: vault.vault })
         .then((r) => { if (active) { setBalance(r); setBalanceErr(null); } })
@@ -1663,7 +1582,6 @@ function VaultOverview({
           >
             {copied ? "✓ Copied" : "Copy address"}
           </button>
-          {/* Regtest has an on-demand in-app faucet; testnet funds come from an external one. */}
           {address.startsWith("uregtest1") && (
             <button
               onClick={requestFunds}
@@ -1682,7 +1600,6 @@ function VaultOverview({
         </p>
       )}
 
-      {/* Testnet has no in-app faucet: send the member to an external one with the address. */}
       {address && !address.startsWith("uregtest1") && (
         <a
           href="https://faucet.testnet.valargroup.dev"
@@ -1704,8 +1621,6 @@ function VaultOverview({
   );
 }
 
-// Download this vault's recovery backup from the in-browser signer: ciphertext only the 24
-// words open, saved from the separate signer tab.
 function BrowserBackupCard({ vault }: { vault: string }) {
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState(false);
@@ -1726,9 +1641,6 @@ function BrowserBackupCard({ vault }: { vault: string }) {
   );
 }
 
-// ─── recovery ───────────────────────────────────────────────────────────────
-
-/** The member app exposes status and encrypted backups, not the recovery words. */
 function RecoveryCard({ vault }: { vault: string }) {
   const [status, setStatus] = useState<RecoveryStatus | null>(null);
   const [exportFingerprint, setExportFingerprint] = useState<string | null>(null);
@@ -1798,8 +1710,6 @@ function RecoveryCard({ vault }: { vault: string }) {
     </GlassCard>
   );
 }
-
-// ─── send ─────────────────────────────────────────────────────────────────────
 
 type DraftQuote = { attempt: string; fee_zat: string; change_zat: string };
 
@@ -1919,7 +1829,6 @@ function Send({
 }
 
 function SignerList({ signers, threshold, approvals = [], ready = false, complete = false }: { signers: number[]; threshold: number; approvals?: number[]; ready?: boolean; complete?: boolean }) {
-  // Until the first approvals fix the signing group, any member may approve.
   const open = signers.length === 0;
   const recorded = new Set(approvals);
   const shown = new Set([...signers, ...recorded]);
@@ -1930,8 +1839,6 @@ function SignerList({ signers, threshold, approvals = [], ready = false, complet
     </div>
   </div>;
 }
-
-// ─── review / approve ─────────────────────────────────────────────────────────
 
 function ReviewApprove({
   profileId,
@@ -1982,8 +1889,6 @@ function ReviewApprove({
       setReview(r);
       setErr(null);
     } catch (e) {
-      // Early polls are expected to miss (the proposer may not have published yet); only after
-      // ~15s of failures surface the error so the user isn't stranded on a forever-spinner.
       triesRef.current += 1;
       if (triesRef.current >= 10) setErr((e as Error).message);
     }
@@ -2126,8 +2031,6 @@ function ReviewApprove({
   );
 }
 
-// ─── history ──────────────────────────────────────────────────────────────────
-
 const PHASE_PILL: Record<string, string> = {
   preparing: "border border-[var(--border)] bg-[var(--surface-2)] text-muted",
   approved: "bg-amber/15 text-amber",
@@ -2137,7 +2040,6 @@ const PHASE_PILL: Record<string, string> = {
   replaced: "border border-danger/40 bg-danger/10 text-danger",
 };
 
-/** Replace a stuck payment with a new request that spends exactly its note. */
 function ReplacePanel({ vault, payment, onStarted }: {
   vault: VaultSummary; payment: Payment; onStarted: (attempt: string) => void;
 }) {
@@ -2185,7 +2087,6 @@ function History({
   const [sendingHere, setSendingHere] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
-  // Sends the signed transaction through this member's own lightwalletd, or sends it again.
   const send = async (attempt: string) => {
     setSendingHere(attempt); setErr(null);
     try {
@@ -2212,8 +2113,6 @@ function History({
         }
       } catch {}
       tries += 1;
-      // Cap at ~1min: the tx is broadcast and its id is shown; stop hammering the host if it's
-      // slow to confirm (common on testnet) rather than polling forever and leaking timers.
       if (cancelled || tries >= 40) return;
       timer = setTimeout(tick, 1500);
     };

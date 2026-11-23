@@ -36,7 +36,6 @@ pub(super) type HostedSigner = LocalSigner<HostedSecureElement>;
 
 const FILES: [FileKind; 4] = [FileKind::Identity, FileKind::Roster, FileKind::Setup, FileKind::Share];
 
-/// A missing metadata file does not make a directory with sealed signer data new.
 pub(super) fn has_signer_data(dir: &Path) -> Result<bool, String> {
     for file in ["signer.meta", "identity.sealed", "roster.sealed", "setup.sealed", "share.sealed"] {
         if dir.join(file).try_exists().map_err(|_| "LokiSigner could not access the signer folder.")? {
@@ -63,9 +62,6 @@ fn group_viewing_key(public: &frost::keys::PublicKeyPackage, vs: &[u8; 32]) -> R
     zip2005::frost_viewing_key(&ak, vs).map_err(|e| format!("group viewing key: {e:?}"))
 }
 
-/// Open member `slot`'s signer for `vault` from its store, under the configured element. A
-/// DKG-made store is revalidated against its certified setup ([`LocalSigner::open`]); a store
-/// restored from the recovery words holds only the share and opens from it.
 pub(super) fn open_signer(
     st: &AppState,
     data: &Path,
@@ -121,9 +117,6 @@ pub(super) enum VaultOpen {
 const NEEDS_TOUCH_ID: &str = "Touch ID is required to open this vault.";
 const CANCELLED_TOUCH_ID: &str = "Touch ID was cancelled.";
 
-/// The vault's group viewing key, from the opened signer (one store open per process, then
-/// cached in memory), checked against the public metadata in `vault.sealed` (`sealed`).
-/// Migrates a pre-fix `vault.sealed` first.
 pub(super) fn viewing_key(
     st: &AppState,
     data: &Path,
@@ -135,7 +128,6 @@ pub(super) fn viewing_key(
     open: impl FnOnce() -> Result<SignerViewingKey, String>,
 ) -> Result<FullViewingKey, String> {
     if !matches!(mode, VaultOpen::Payment) {
-        // One Touch ID prompt at a time: the signer's own registration prompt first.
         st.after_first_registration(std::time::Duration::from_secs(90));
     }
     let mut cache = st.viewing_keys.lock().map_err(|e| e.to_string())?;
@@ -154,7 +146,6 @@ pub(super) fn viewing_key(
         }
         open()
     })().map_err(|error| {
-        // Keep the cancellation under the same lock as the open so queued reads can't reprompt.
         eprintln!("[verbose] vault {}: viewing key open ({mode_name}) failed: {error}", &vault[..8.min(vault.len())]);
         if !matches!(mode, VaultOpen::Payment) && st.config.native && st.config.secure_element == "apple"
             && error.rsplit(": ").next() == Some(CANCELLED_TOUCH_ID)
@@ -199,7 +190,6 @@ pub(super) fn vault_touch_id_reason(st: &AppState, action: &str, vault: &str, na
     })
 }
 
-/// Store-derived values, kept together so the native window can recheck a fresh seal on cache hits.
 #[derive(Clone)]
 pub(super) struct SignerViewingKey {
     fvk: FullViewingKey,
@@ -210,7 +200,6 @@ impl SignerViewingKey {
     pub(super) fn open(
         st: &AppState, data: &Path, pass: &str, vault: &str, slot: u16, reason: Option<&str>,
     ) -> Result<(Self, VaultNetwork), String> {
-        // Never signs or enters a cache: only the viewing key outlives this open.
         let signer = open_signer_with_reason(st, data, pass, vault, slot, Box::new(|_| false), reason)?;
         Self::from_signer(&signer)
     }
@@ -236,7 +225,6 @@ impl SignerViewingKey {
     }
 }
 
-/// Whether `vault.sealed` still carries the share or the vault secret.
 pub(super) fn is_legacy(sealed: &Value) -> bool {
     sealed.get("key_package").is_some() || sealed.get("vault_secret").is_some()
 }
@@ -286,8 +274,6 @@ pub(super) fn migrate(
     } else {
         None
     };
-    // A partially migrated store already relies on its Enclave key. Only allow a fresh key
-    // when no signer exists or every file still opens with the original software KEK.
     let new_key = store.as_ref().is_none_or(|store| {
         old.as_ref().is_some_and(|old| FILES.iter().all(|&file| store.read(old, file).is_ok()))
     });
@@ -317,7 +303,6 @@ pub(super) fn migrate(
     object.remove("key_package");
     object.remove("vault_secret");
     let bytes = zeroize::Zeroizing::new(serde_json::to_vec(&stripped).map_err(|e| e.to_string())?);
-    // `write_sealed` never replaces a file: seal to a temporary name, then rename over.
     let vdir = super::ceremony::dir(data, vault)?;
     let temp = format!(".vault.sealed.{}.migrate", uuid::Uuid::new_v4());
     vdir.write_sealed(&temp, &bytes, pass).map_err(|e| e.to_string())?;
@@ -330,15 +315,12 @@ pub(super) fn migrate(
     if old.is_some() {
         std::fs::remove_file(&software_kek).map_err(|e| format!("remove software KEK: {e}"))?;
     }
-    // The migrated vault is usable even if an old backup is corrupt. Keep that backup
-    // and report the conversion error, rather than treating presence as verification.
     if let Err(e) = super::recovery::seal_vault_backup(data, &sdir, &id, pass) {
         eprintln!("recovery backup not converted for vault {vault}: {e}");
     }
     Ok(())
 }
 
-/// Whether two share files hold the same key package, public package and `vs`.
 fn same_share(a: &[u8], b: &[u8]) -> Result<bool, String> {
     let ((ka, pa, va), (kb, pb, vb)) = (decode_share(a)?, decode_share(b)?);
     let key = |k: &[u8]| frost::keys::KeyPackage::deserialize(k).map_err(|e| e.to_string());
@@ -346,8 +328,6 @@ fn same_share(a: &[u8], b: &[u8]) -> Result<bool, String> {
     Ok(key(&ka)? == key(&kb)? && public(&pa)? == public(&pb)? && va == vb)
 }
 
-/// Reseal every store file `from` still opens under `to`, keeping its epoch. Files already
-/// under `to` are skipped, so an interrupted run resumes; a file neither opens is an error.
 fn reseal(store: &SignerStore, from: &impl SecureElement, to: &impl SecureElement) -> Result<(), String> {
     for kind in FILES {
         if store.read(to, kind).is_ok() {
@@ -420,7 +400,6 @@ mod tests {
         let (old, new) = (SoftwareSecureElement::generate(), SoftwareSecureElement::generate());
         store.write(&old, FileKind::Identity, 0, b"identity").unwrap();
         store.write(&old, FileKind::Share, 3, b"share").unwrap();
-        // An interrupted earlier run already moved the identity.
         store.write(&new, FileKind::Identity, 0, b"identity").unwrap();
         reseal(&store, &old, &new).unwrap();
         assert_eq!(&**store.read(&new, FileKind::Identity).unwrap().unwrap().1, b"identity");

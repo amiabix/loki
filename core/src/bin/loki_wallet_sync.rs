@@ -58,9 +58,6 @@ async fn sync(args: &[String]) -> Result<(), String> {
 mod tests {
     use loki_poc::wallet_store::lightwalletd_endpoint;
 
-    /// Live, network-gated: the configured endpoint reaches a real public Testnet
-    /// lightwalletd over TLS and reports the Testnet chain. `LOKI_TEST_LIGHTWALLETD`
-    /// overrides the default server. Ignored by default so the suite stays offline.
     #[tokio::test]
     #[ignore = "network: hits a public Testnet lightwalletd"]
     async fn reaches_public_testnet_lightwalletd() {

@@ -24,7 +24,6 @@ pub enum PendingRequest {
 }
 pub struct LocalConfig {
     pub provisioned: Option<Vec<u64>>,
-    /// Verified append revisions for the active rotation generation. Zero means that generation is prepared and not yet verified.
     pub rotated: Option<Vec<u64>>,
     pub own: Vec<OwnerInbox>,
     pub self_wire: Option<Vec<u8>>,
@@ -648,7 +647,6 @@ fn has_persisted_nonces(root: &Path) -> MemberResult<bool> {
     Ok(false)
 }
 fn unseal(raw: &[u8], pass: &str) -> MemberResult<Zeroizing<Vec<u8>>> {
-    // Use the existing sealed format on the same bounded bytes that were hashed.
     if raw.len() < SEAL_HEADER + 16 || raw.len() > MAX_SEALED || &raw[..9] != SEAL_MAGIC {
         return Err(MemberError::Sealed);
     }
@@ -689,8 +687,6 @@ impl ConfigStore {
             pass: Zeroizing::new(passphrase.to_owned()),
         })
     }
-    // The hosted adapter must validate scoped admission receipts before activation.
-    // This storage step preserves the exact certified configuration across a pointer crash.
     pub(crate) fn install_scoped_configuration(
         &self,
         db: &mut ClientStore,
@@ -809,7 +805,6 @@ impl ConfigStore {
                     return Err(MemberError::Sealed);
                 }
                 if !same_revision {
-                    // Adopt only the next file whose operation and exact requests authorize it.
                     if config.operation.is_none() {
                         return Err(MemberError::Sealed);
                     }
@@ -2303,7 +2298,6 @@ fn same_pending(a: &LocalConfig, b: &LocalConfig) -> bool {
 }
 
 fn verifier_matches(actual: Id32, expected: Id32) -> bool {
-    // This existing type compares bytes in constant time; from_bytes performs no hashing.
     blake3::Hash::from_bytes(actual) == blake3::Hash::from_bytes(expected)
 }
 

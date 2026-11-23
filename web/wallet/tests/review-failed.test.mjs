@@ -5,7 +5,6 @@ import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import ts from 'typescript';
 
-// Render the actual ReviewApprove component once this member approved, with the session preset.
 function render(session) {
   const source = readFileSync(new URL('../src/app/page.tsx', import.meta.url), 'utf8');
   const page = ts.createSourceFile('page.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
@@ -14,7 +13,6 @@ function render(session) {
   const { outputText } = ts.transpileModule(screen.getText(page), { compilerOptions: { jsx: ts.JsxEmit.React } });
   const load = new Function('React', 'useState', 'useCallback', 'useEffect', 'useRef', 'api', 'rememberedVaultSlot',
     'GlassCard', 'Btn', 'ErrMsg', 'SignerList', 'BackLink', 'Row', 'zatToTaz', 'short', `${outputText}\nreturn ReviewApprove;`);
-  // review and session; approval comes from the signer's session response.
   const preset = [null, session];
   let call = 0;
   const useState = (initial) => React.useState(call < preset.length ? preset[call++] : initial);

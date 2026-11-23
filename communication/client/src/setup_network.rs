@@ -186,9 +186,6 @@ impl SetupTransport<'_> {
         let net = SetupNet::new(self.operators, self.development)?;
         self.drive_once_with(store, routes, &net).await
     }
-    /// One drive over all three relays at once, reusing `net`'s connections and
-    /// endpoint checks. Each network phase has a `request_seconds` deadline: a slow or
-    /// failing relay defers only its own route.
     pub async fn drive_once_with(
         &self,
         store: &mut SetupStore,
@@ -212,9 +209,6 @@ impl SetupTransport<'_> {
         retries: &mut usize,
     ) -> ClientResult<()> {
         store.reconcile_deferred(self)?;
-        // Plan: everything that needs the store, before any request.
-        // Every network phase gets its own deadline: a relay that hangs through the
-        // first phase is dropped from the later ones and must not use up their time.
         let limit = std::time::Duration::from_secs(self.operators.limits().request_seconds);
         let phase_deadline = || tokio::time::Instant::now() + limit;
         let mut plans = Vec::new();
@@ -243,7 +237,6 @@ impl SetupTransport<'_> {
                 uploads,
             });
         }
-        // Network, first half: endpoint check, uploads and the inbox page, all relays at once.
         let deadline = phase_deadline();
         let first = join_all(
             plans
@@ -252,7 +245,6 @@ impl SetupTransport<'_> {
                 .collect(),
         )
         .await;
-        // Objects already held locally are not downloaded again.
         let mut held = BTreeMap::new();
         for listed in first.iter().flatten() {
             for entry in listed.page.entries() {
@@ -263,8 +255,6 @@ impl SetupTransport<'_> {
                 }
             }
         }
-        // Network, second half: each missing object from the first relay that lists it,
-        // then (only after a failure) from every other relay that lists it.
         let mut owner = BTreeMap::new();
         for (index, listed) in first.iter().enumerate() {
             if let Ok(listed) = listed {
@@ -332,9 +322,6 @@ impl SetupTransport<'_> {
         for objects in retry {
             held.extend(objects);
         }
-        // Only receipt-verified listings schedule downloads. Setup senders publish each
-        // chunk as its own entry; an unsigned manifest never expands the network work.
-        // Apply, in relay order: receipts, then the page exactly as a sequential drive would.
         for (plan, listed) in plans.iter().zip(first) {
             let listed = match listed {
                 Ok(listed) => listed,
@@ -417,7 +404,6 @@ impl SetupTransport<'_> {
                 )?;
             }
         }
-        // A later listing (including another relay's) can complete a saved root.
         for object in store.pending_roots()? {
             let disposition = self.consume_root(store, &object, &BTreeMap::new())?;
             if !matches!(disposition, RootDisposition::Pending) {
@@ -441,7 +427,7 @@ impl SetupTransport<'_> {
         let requirements = match self.inspect(root) {
             Ok(requirements) => requirements,
             Err(ClientError::MissingObjects(hashes)) if hashes.is_empty() => {
-                return Ok(RootDisposition::Settled); // Standalone chunk entry.
+                return Ok(RootDisposition::Settled);
             }
             Err(_) => return Ok(RootDisposition::Rejected),
         };
@@ -468,8 +454,6 @@ impl SetupTransport<'_> {
         plan: &RelayPlan<'_>,
         deadline: tokio::time::Instant,
     ) -> Result<Listed, RelayFailure> {
-        // The deadline applies to each request here, so receipts from uploads that
-        // finished before it expires are returned and saved rather than dropped.
         let own = plan.own;
         if !matches!(
             tokio::time::timeout_at(deadline, net.authenticate(&own.route.pin, &own.route.endpoint))
@@ -517,11 +501,8 @@ impl SetupTransport<'_> {
         }
     }
 }
-/// At most this many requests are in flight to one relay from one drive.
 const IN_FLIGHT: usize = 4;
-/// A relay endpoint check is reused for this long; any failure on that relay clears it.
 const ENDPOINT_TTL: std::time::Duration = std::time::Duration::from_secs(600);
-/// Connections and endpoint checks shared by consecutive setup drives.
 pub struct SetupNet {
     http: RelayHttp,
     verified: std::sync::Mutex<BTreeMap<(Id32, String), std::time::Instant>>,
@@ -533,9 +514,6 @@ impl SetupNet {
             verified: std::sync::Mutex::new(BTreeMap::new()),
         })
     }
-    /// `authenticate_endpoint` is a reachability and pin check that does not
-    /// authenticate later requests (every receipt, page and object is verified on
-    /// its own), so a recent success can be reused.
     async fn authenticate(
         &self,
         pin: &loki_relay_protocol::types::RelayPin,
@@ -609,7 +587,6 @@ async fn fetch_objects(net: &SetupNet, own: &OwnerInbox, wanted: Vec<Id32>) -> V
     }
     out
 }
-/// Poll every future to completion on the current task; output order matches input.
 pub async fn join_all<F: std::future::Future>(futures: Vec<F>) -> Vec<F::Output> {
     let mut pending: Vec<_> = futures.into_iter().map(|f| Some(Box::pin(f))).collect();
     let mut output: Vec<Option<F::Output>> = pending.iter().map(|_| None).collect();
@@ -636,8 +613,6 @@ pub async fn join_all<F: std::future::Future>(futures: Vec<F>) -> Vec<F::Output>
     output.into_iter().flatten().collect()
 }
 impl SetupStore {
-    /// Whether a drive now would upload anything: a saved record or acknowledgement
-    /// not yet stored on a relay whose retry time has come.
     pub fn has_due_uploads(&self, t: &SetupTransport<'_>) -> ClientResult<bool> {
         for route in t.operators.relay_routes() {
             if self.route_due(&route.pin.key)? && !self.uploads(&route.pin.key, 1)?.is_empty() {

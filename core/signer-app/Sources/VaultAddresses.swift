@@ -143,7 +143,6 @@ final class VaultAddressesWindow: NSObject {
             row.orientation = .vertical
             row.alignment = .leading
             row.spacing = 6
-            // The creator's label is plain, single-line display text, not part of an instruction.
             let label = NSTextField(labelWithString: "Vault name (set by creator):")
             label.textColor = .secondaryLabelColor
             let name = untrustedLine(vault.name ?? "Unavailable")

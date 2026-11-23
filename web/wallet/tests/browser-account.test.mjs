@@ -3,8 +3,6 @@ import { test } from 'node:test';
 import { unlock } from '../src/lib/api.ts';
 import { signer } from '../src/lib/signer.ts';
 
-// A browser signer registered before a reload: unlocking again keeps its account number (its
-// public roster slot), found by its signing key, so the page does not offer Register again.
 test('unlocking a registered browser signer remembers its roster slot', async () => {
   const sess = new Map();
   globalThis.sessionStorage = { getItem: (k) => sess.get(k) ?? null, setItem: (k, v) => sess.set(k, v), removeItem: (k) => sess.delete(k) };
@@ -21,7 +19,6 @@ test('unlocking a registered browser signer remembers its roster slot', async ()
   try {
     await unlock({ method: 'platform' });
     assert.deepEqual(JSON.parse(sess.get('loki_me')), { slot: 4 });
-    // Not registered yet: no slot, and no failure.
     signer.unlock = async () => ({ profile: { id: 'ef'.repeat(32), name: 'New' } });
     await unlock({ method: 'platform' });
     assert.equal(JSON.parse(sess.get('loki_me')).slot, undefined);

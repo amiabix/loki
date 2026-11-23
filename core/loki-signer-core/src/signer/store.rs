@@ -68,7 +68,6 @@ fn network_label(network: Network) -> &'static str {
 }
 
 impl SignerStore {
-    /// Create the data directory (owner-only) and its public metadata, once.
     pub fn create(
         dir: &Path,
         network: Network,
@@ -95,7 +94,6 @@ impl SignerStore {
         })
     }
 
-    /// Reopen an existing data directory from its public metadata.
     pub fn open(dir: &Path) -> Result<Self, String> {
         let meta: serde_json::Value = serde_json::from_slice(
             &read_file(dir, META).map_err(|e| format!("signer metadata: {e}"))?,
@@ -145,7 +143,6 @@ impl SignerStore {
         file_binding(kind.name(), &self.vault, self.member)
     }
 
-    /// Seal and atomically replace one file.
     pub fn write(
         &self,
         se: &impl SecureElement,
@@ -158,8 +155,6 @@ impl SignerStore {
             .map_err(|e| format!("signer {} file: {e}", kind.name()))
     }
 
-    /// Open one file, or `None` if it does not exist. A file sealed for another type,
-    /// vault or member, or under another element, is an error.
     pub fn read(
         &self,
         se: &impl SecureElement,

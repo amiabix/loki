@@ -3,7 +3,6 @@ import Foundation
 import LocalAuthentication
 import Security
 
-// Run unsigned: swiftc -D SE_TESTS se_backend.swift se_backend_tests.swift -o <output> && <output>
 @main
 enum BackendTests {
     static func main() {
@@ -108,7 +107,7 @@ enum BackendTests {
         run(false, -6)
         for (status, failure) in failures {
             lookupStatus = status
-            let expected = failure == -12 ? -20 : failure // No recorded state yet.
+            let expected = failure == -12 ? -20 : failure
             run(false, expected)
             run(true, expected)
         }
@@ -134,9 +133,9 @@ enum BackendTests {
         run(true, 0)
         precondition(proofs == 1)
         proof = -14
-        run(true, -14) // interaction blocked is not evidence of invalidation
+        run(true, -14)
         proof = -12
-        run(true, -12) // a failed match with unchanged enrollment is retryable
+        run(true, -12)
         current = Biometry(state: Data([2, 68, 21]), failure: nil)
         run(true, -17)
         proof = -11
@@ -151,13 +150,13 @@ enum BackendTests {
         lookupStatus = errSecAuthFailed
         run(false, -17)
         current = Biometry(state: Data([1, 68, 21]), failure: nil)
-        run(false, -20) // different APIs aren't comparable
+        run(false, -20)
         current = Biometry(state: nil, failure: -15)
-        run(false, -12) // closed lid is not proof of new fingerprints
+        run(false, -12)
         current = Biometry(state: nil, failure: -16)
-        run(false, -17) // all fingerprints removed
+        run(false, -17)
         try! FileManager.default.removeItem(atPath: statePath)
-        run(false, -20) // a legacy profile lacks evidence of invalidation
+        run(false, -20)
         precondition(creations == 2)
     }
 

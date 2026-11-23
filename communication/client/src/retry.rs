@@ -17,7 +17,6 @@ fn ceiling(attempts: u64) -> ClientResult<u64> {
     Ok(scaled.min(CEILING_MS))
 }
 
-/// Rejects a draw outside the inclusive delay for this attempt count.
 pub(crate) fn delay_from_draw(attempts: u64, draw: u64) -> ClientResult<u64> {
     let ceiling = ceiling(attempts)?;
     if (FLOOR_MS..=ceiling).contains(&draw) {
@@ -27,7 +26,6 @@ pub(crate) fn delay_from_draw(attempts: u64, draw: u64) -> ClientResult<u64> {
     }
 }
 
-/// One unbiased OS draw on `250..=min(30000, 250 * 2^min(attempts, 7))`.
 pub(crate) fn sample_delay(attempts: u64) -> ClientResult<u64> {
     let ceiling = ceiling(attempts)?;
     let width = ceiling - FLOOR_MS + 1;

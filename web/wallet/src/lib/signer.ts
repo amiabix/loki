@@ -1,17 +1,5 @@
 "use client";
 
-// ─────────────────────────────────────────────────────────────────────────────
-// The wallet's seam to the in-browser signer.
-//
-// The signer (the Rust FROST core compiled to wasm, in a Web Worker, its share sealed in
-// OPFS) runs on its OWN origin — core/loki-signer-wasm/serve.mjs — embedded here in an iframe.
-// This page never holds the share, never runs the passkey PRF ceremony and never sees the
-// passphrase: those happen on the signer-origin page, which also shows the roster code and
-// every payment for the member to confirm. This file only exchanges public data with it over
-// postMessage. The in-memory mock below exists for SSR and Node tests only; a browser build
-// never falls back to it.
-// ─────────────────────────────────────────────────────────────────────────────
-
 import type { Payment, PaymentSession } from "./types";
 
 export class ApiError extends Error {
@@ -19,53 +7,32 @@ export class ApiError extends Error {
   constructor(message: string, status: number) { super(message); this.status = status; }
 }
 
-/** Thrown for member paths the in-browser signer does not serve. */
 export class SignerPending extends ApiError {
   constructor(path: string) { super(`the in-browser signer does not serve "${path}"`, 501); }
 }
 
-/** Custody tiers, all backed by the same `SecureElement` trait (definition §2.B). */
 export type CustodyMethod = "platform" | "roaming" | "passphrase";
-/** The custody secret itself (passphrase or passkey) is entered on the signer origin. */
 export interface CreateSignerOpts { name: string; method: CustodyMethod }
 export interface UnlockOpts { method: CustodyMethod }
 export interface SignerSession { slot?: number; profile: { id: string; name: string }; persisted?: boolean | null }
-/** A public-roster member, as the coordinator's `/api/members` returns it. */
 export interface EnrolledMember { slot: number; signing_pubkey: string; relay_pubkey: string; advertise_url: string }
 
-/**
- * The signer contract. `request` is the in-process equivalent of the old member HTTP API,
- * dispatched to the signer origin for the paths it serves (status, lock, join, pending, address,
- * payment-review, payment-approve); other paths throw `SignerPending`.
- */
 export interface SignerModule {
-  /** True once a share is sealed in this browser → Unlock, not Create. */
   hasSigner(): Promise<boolean>;
-  /** Generate + seal a new share under the chosen custody backend (entered on the signer origin). */
   createSigner(opts: CreateSignerOpts): Promise<SignerSession>;
   /** Open the sealed share (Touch/Face ID, security key, phone, or passphrase, on the signer origin). */
   unlock(opts: UnlockOpts): Promise<SignerSession>;
-  /** Drop the in-memory share; the session ends. */
   lock(): Promise<void>;
-  /** Register this signer into this coordinator's public roster (frostd-only, no advertise_url)
-   *  and return the allocated member — its `slot` is the DKG slot. */
   enroll(coordinatorOrigin?: string): Promise<EnrolledMember>;
-  /** In-process member call — the old per-member HTTP, now dispatched to the signer. */
   request<T = unknown>(path: string, body?: unknown): Promise<T>;
 }
 
-/** One vault's setup phase for `status?vault=` (the wallet's setup screen). The browser signer's
- *  `join` resolves only once its vault is active, so any vault it does not report active is
- *  still creating keys. */
 export function browserVaultStatus(vaults: { vault: string; active: boolean }[] | undefined, vault: string): { phase: "active" | "creating_keys" } {
   return { phase: vaults?.some((v) => v.vault === vault && v.active) ? "active" : "creating_keys" };
 }
 
-/** One transaction observed in the configured provider's compact blocks. */
 export type ChainTx = { txid: string; height: number; received_zat: number; change_zat: number; spent_zat: number };
 
-/** The History list from the chain scan: what each transaction did to the vault. A spend shows
- *  its net outflow (amount sent plus fee); the provider reported every entry as mined. */
 export function chainPayments(history: ChainTx[]): Payment[] {
   return history.map((t) => {
     const sent = t.spent_zat > 0;
@@ -75,7 +42,6 @@ export function chainPayments(history: ChainTx[]): Payment[] {
   });
 }
 
-/** A spend reported by the configured provider identifies the attempt only if the signer checked the same txid. */
 export function chainPaymentSession(r: {
   terms: { proposer: number; recipient: string; amount_zat: number; fee_zat: number };
   signers: number[];
@@ -93,19 +59,12 @@ export function chainPaymentSession(r: {
     signatures_received: confirmed,
     txid: confirmed ? r.spent?.txid : null,
     spent_by: confirmed ? null : r.spent?.txid ?? null,
-    // The proposer supplies the signing list; only our own stored decision proves approval here.
     approvals: r.approved === true && r.slot !== undefined ? [r.slot] : [],
     approval_requested: r.approved === true,
     intent: { proposer: r.terms.proposer, signers: r.signers, recipient: r.terms.recipient, amount_zat: r.terms.amount_zat, fee_zat: r.terms.fee_zat, open_approval: true },
   };
 }
 
-// ─── the signer origin (iframe + postMessage) ────────────────────────────────
-
-/** The signer origin from the coordinator's runtime configuration (LOKI_SIGNER_ORIGIN), rendered
- *  into the page's head by the server layout, else the build's NEXT_PUBLIC_SIGNER_ORIGIN. Never
- *  taken from the URL. `next dev` defaults to the local signer server on :3002. A production
- *  deploy without one fails closed: every signer call rejects. */
 function signerOrigin(): string {
   const rendered = document.head.querySelector('meta[name="loki-signer-origin"]')?.getAttribute("content");
   const configured = rendered || process.env.NEXT_PUBLIC_SIGNER_ORIGIN;
@@ -114,9 +73,7 @@ function signerOrigin(): string {
   throw new ApiError("This deploy has no signer origin (LOKI_SIGNER_ORIGIN), so the signer is unavailable", 503);
 }
 
-const SEALED = "loki_signer_sealed"; // localStorage: a share exists in this browser (first-paint hint only)
-// Setup and signing can include several minutes of ceremony or user interaction. Chain reads
-// can also take longer on the first scan and resume from their last saved batch.
+const SEALED = "loki_signer_sealed";
 const LONG_CALLS = new Set(["create", "unlock", "join", "verify-address", "payment-approve", "recovery-setup", "recovery-export", "restore", "remove", "chain", "payment-status"]);
 
 let grant: string | undefined;
@@ -142,8 +99,6 @@ async function postJson<T>(url: string, body: unknown): Promise<T> {
 }
 
 function browserSigner(origin: string): SignerModule {
-  // The signer page shows its own prompts; this frame is revealed (full-window overlay) only
-  // while it asks for the member, on its {cmd:"show"} / {cmd:"hide"}.
   const frame = document.createElement("iframe");
   frame.src = `${origin}/`;
   frame.title = "Loki signer";
@@ -164,7 +119,7 @@ function browserSigner(origin: string): SignerModule {
     for (const p of pending.values()) { clearTimeout(p.timer); p.reject(error); }
     pending.clear();
     window.removeEventListener("message", receive);
-    frame.remove(); // Stop the old worker and hide any prompt before a retry opens a new signer.
+    frame.remove();
     browser = undefined;
   }
   function receive(e: MessageEvent) {
@@ -202,13 +157,11 @@ function browserSigner(origin: string): SignerModule {
     unlock: async ({ method }) => opened(await call<SignerSession>("unlock", { method })),
     async lock() { await call("lock"); },
     async enroll(coordinatorOrigin?: string): Promise<EnrolledMember> {
-      // The signer binds its registration transcript to this wallet origin, the coordinator.
       if (coordinatorOrigin && coordinatorOrigin !== window.location.origin) {
         throw new ApiError("The signer registers only with this wallet's coordinator", 400);
       }
       const origin = window.location.origin;
       const enrollment = await call<Record<string, string>>("enroll-begin");
-      // No advertise_url (frostd-only) and no slot (coordinator allocates).
       const reply = await postJson<{ challenge: string; replacement_generation?: number; relay_challenge_pubkey: string }>(`${origin}/api/members/challenge`, { ...enrollment, onboarding_grant: onboardingGrant() });
       const proof = await call<{ signature: string; replacement_authorization?: string; relay_proof: string }>("enroll-sign", reply);
       const { member } = await postJson<{ member: EnrolledMember }>(`${origin}/api/members`, { ...enrollment, challenge: reply.challenge, ...proof });
@@ -220,20 +173,13 @@ function browserSigner(origin: string): SignerModule {
       const args = { ...Object.fromEntries(new URLSearchParams(query ?? "")), ...(body as object) } as { vault?: string; attempt?: string; proposer?: string | number };
       if (path === "status") {
         const s = await call<{ profile: { id: string; name: string }; se: string; persisted: boolean | null; relay: string; network: "testnet" | "regtest" }>("status");
-        // The signer's own vaults (OPFS). Refused while a join/payment holds the signer; the
-        // next status poll fills them in.
         const vaults = await call<{ vault: string; active: boolean }[]>("vaults").catch(() => undefined);
         if (failure) throw failure;
         if (args.vault) return browserVaultStatus(vaults, args.vault) as T;
         return { phase: "home", network: s.network, secure_element: s.se, profile: s.profile, persisted: s.persisted, relay: s.relay, vaults } as T;
       }
       if (path === "lock") { await this.lock(); return {} as T; }
-      // Join a vault (enroll → roster → agree → session → DKG). The member confirms every member
-      // and the roster code on the signer page; the relay is the signer origin's own config.
       if (path === "join") return call<T>("join", body);
-      // Payments other members proposed: list them, read one's announced terms, and approve it.
-      // Approving opens the signer page, which checks the transaction against those terms and
-      // asks the member to confirm with a fresh passkey assertion (or the passphrase).
       const { proposer } = args;
       const payment = { vaultHex: args.vault, attemptHex: args.attempt,
         proposer: typeof proposer === "string" && /^[1-9]\d*$/.test(proposer) ? Number(proposer) : proposer };
@@ -251,7 +197,6 @@ function browserSigner(origin: string): SignerModule {
         const status = await call<Parameters<typeof chainPaymentSession>[0] & { chain_trust: "provider_reported" }>("payment-status", payment);
         return { ...chainPaymentSession(status), chain_trust: status.chain_trust } as T;
       }
-      // Recovery words and backup downloads stay in the separate signer tab.
       if (path === "recovery-setup" || path === "recovery-export" || path === "recovery-status") return call<T>(path, body);
       if (path === "restore") { const r = await call<T>(path, body); try { localStorage.setItem(SEALED, "1"); } catch {} return r; }
       if (path === "manage-custody") {
@@ -264,15 +209,10 @@ function browserSigner(origin: string): SignerModule {
   };
 }
 
-// ─── mock implementation (SSR / Node tests only) ─────────────────────────────
+const SESSION = "loki_signer_session";
 
-const SESSION = "loki_signer_session"; // sessionStorage: the unlocked session
-
-/** Synchronous best-guess "a share is sealed here" for the first paint; hasSigner() confirms. */
 export function hasSignerHint(): boolean { try { return localStorage.getItem(SEALED) !== null; } catch { return false; } }
 
-/** The signer's answer to "is a share sealed here?". This (wallet) origin remembers that one was:
- *  if the signer origin's storage was since cleared (evicted), say so rather than offer Create. */
 export function checkShare(has: boolean): boolean {
   if (!has && hasSignerHint()) {
     throw new ApiError("Your signer's share is missing from this browser: its storage was cleared. Restore it from your 24 recovery words and a vault's recovery backup file.", 404);
@@ -312,8 +252,6 @@ const mockSigner: SignerModule = {
   async enroll(): Promise<EnrolledMember> { throw new SignerPending("enroll"); },
   async request<T>(path: string): Promise<T> {
     const s = session();
-    // Status is the only member call the onboarding lifecycle needs; serve it so a
-    // fresh signer reaches Home.
     if (path === "status") {
       if (!s) throw new ApiError("Unlock your signer", 401);
       return { phase: "home", network: "testnet", secure_element: s.se, profile: s.profile, vaults: [] } as T;
@@ -323,11 +261,6 @@ const mockSigner: SignerModule = {
     throw new SignerPending(path);
   },
 };
-
-// ─── dispatcher ──────────────────────────────────────────────────────────────
-// A real browser (a DOM) always gets the signer origin; only SSR and Node tests, which have no
-// DOM and no browser storage, get the mock. No probe, no silent fallback: if the signer origin
-// is missing or unreachable, signer calls fail.
 
 let browser: SignerModule | undefined;
 function impl(): SignerModule {

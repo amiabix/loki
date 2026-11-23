@@ -1,32 +1,3 @@
-//! In-process executor for hosted setup commands (`loki_member_service`).
-//!
-//! The member app starts one service per unlocked profile and talks to it over the
-//! child's stdin and stdout only, one JSON object per line:
-//!
-//! * The first frame is `{"op":"unlock","data":<data root>,"passphrase":…}`. The
-//!   passphrase is checked by opening `profile/profile.sealed` and is then held only in
-//!   this process's memory. The reply is `{"unlocked":true}`; a wrong passphrase ends
-//!   the service.
-//! * Each later frame is `{"id":…,"op":<setup command>,"args":[…]}` with the same
-//!   arguments as `loki_setup_member <op>`, except that the passphrase argument is
-//!   `@session`, private input is `@private` (bytes in `private_hex`) and backup words
-//!   are `@words` (text in `words`). A vault target is a lowercase 32-byte hex ID
-//!   or its full path under `<data>/vaults`. Explicit input and export paths keep
-//!   their CLI meanings. The reply is `{"id":…,"ok":true,"result":…}` or
-//!   `{"id":…,"ok":false,"error":…}`, with the CLI's result and error strings.
-//!   Only scalar request IDs are echoed; missing or compound IDs yield `null`.
-//! * `{"op":"lock"}` or end of stdin stops the service: no new work is accepted,
-//!   commands in flight get [`STOP_GRACE`] to finish, then the session key cache and
-//!   the passphrase are zeroized and the process exits. A command still running then
-//!   is abandoned exactly as when the app kills a CLI process.
-//!
-//! Only [`ALLOWED`] commands run. Each command opens its setup, holds the vault's
-//! `.setup.lock` only while it runs and drops it, as the CLI does, so other tools see
-//! the same locks. What the service adds is one process: the Tokio runtime, relay
-//! connections and endpoint checks, and the Argon2id keys for this passphrase stay
-//! warm between commands. The passphrase never reaches a file, argv, the
-//! environment or stderr.
-
 use crate::setup_ceremony::journal;
 use crate::setup_relay::{backup_command_with, command_with, BackupCommandOutput, Inputs};
 use crate::state::MemberDir;
@@ -37,7 +8,6 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use zeroize::{Zeroize, Zeroizing};
 
-/// The hosted setup commands the service runs. Anything else is refused.
 pub const ALLOWED: &[&str] = &[
     "setup-config-check",
     "setup-status",
@@ -54,11 +24,8 @@ pub const ALLOWED: &[&str] = &[
     "setup-backup-verify",
     "setup-backup-finalize",
 ];
-/// Commands running at once; the app schedules at most two vaults plus user actions.
 pub const MAX_IN_FLIGHT: usize = 4;
-/// How long commands in flight may finish after Lock or end of input.
 pub const STOP_GRACE: Duration = Duration::from_secs(4);
-/// Longest accepted frame, in bytes.
 const FRAME_LIMIT: usize = 64 * 1024;
 
 pub struct Service {
@@ -121,7 +88,6 @@ fn command_reply(id: Value, result: Result<Value, String>) -> Value {
 }
 
 impl Service {
-    /// Check an unlock frame against the profile and enable the session key cache.
     pub fn unlock(line: &str) -> Result<Self, String> {
         let mut frame = SensitiveFrame::parse(line).ok_or("service_frame")?;
         let passphrase = Zeroizing::new(frame.take_string("passphrase").unwrap_or_default());
@@ -141,7 +107,6 @@ impl Service {
         journal::check_private_root(profile.path()).map_err(|_| "service_unlock")?;
         journal::checked_file(&profile.path().join("profile.sealed"))
             .map_err(|_| "service_unlock")?;
-        // The profile key is the first cached derivation; a failed check forgets it.
         crate::seal_kdf::enable_session_cache(&passphrase);
         let checked = profile
             .read_sealed("profile.sealed", &passphrase)
@@ -179,8 +144,6 @@ impl Service {
         {
             return Err(ERROR.into());
         }
-        // Build from the unlocked profile, never from a request path. Private-root
-        // checks reject symlinks at either level as well as public directories.
         for path in [&self.vaults, &root] {
             if joining {
                 #[cfg(unix)]
@@ -196,7 +159,6 @@ impl Service {
             .map_err(|_| ERROR.into())
     }
 
-    /// Run one request frame and return its reply.
     pub fn handle(&self, line: &str) -> Value {
         self.handle_frame(SensitiveFrame::parse(line))
     }
@@ -275,8 +237,6 @@ impl Drop for Service {
     }
 }
 
-/// Read one line of at most [`FRAME_LIMIT`] bytes into a zeroizing buffer. `None` at
-/// end of input or on an oversized or unreadable frame.
 fn read_frame(input: &mut impl BufRead) -> Option<Zeroizing<String>> {
     let mut line = Zeroizing::new(String::new());
     match input
@@ -300,8 +260,6 @@ fn write_frame(output: &Mutex<Box<dyn Write + Send>>, mut value: Value) {
     }
 }
 
-/// Serve frames from `input` until Lock or end of input. Returns once no command is in
-/// flight or [`STOP_GRACE`] has passed; the session cache is cleared either way.
 pub fn serve(mut input: impl BufRead, output: Box<dyn Write + Send>) -> Result<(), String> {
     let output = Arc::new(Mutex::new(output));
     let Some(first) = read_frame(&mut input) else {
@@ -356,7 +314,6 @@ pub fn serve(mut input: impl BufRead, output: Box<dyn Write + Send>) -> Result<(
         }
     }
     crate::seal_kdf::clear_session_cache();
-    // Threads still running hold their own clone; the process exits right after this.
     if let Ok(mut service) = Arc::try_unwrap(service) {
         service.passphrase.zeroize();
     }
@@ -420,7 +377,6 @@ mod tests {
         )
     }
 
-    // The session cache is process-wide; the cases run in one test so they never interleave.
     #[test]
     fn service_unlocks_runs_only_allowed_commands_and_clears_keys_on_stop() {
         let _serial = crate::seal_kdf::TEST_LOCK
@@ -432,7 +388,6 @@ mod tests {
         let unlock = |pass: &str| {
             json!({"op":"unlock","data":root.to_str().unwrap(),"passphrase":pass}).to_string()
         };
-        // A wrong passphrase is refused and nothing else runs.
         let (result, replies) = run(&[
             unlock("wrong pass"),
             json!({"id":1,"op":"setup-status","args":["x"]}).to_string(),
@@ -444,14 +399,11 @@ mod tests {
         );
         assert_eq!(crate::seal_kdf::cache_len(), 0);
 
-        // Unlock caches the profile key; dropping the service clears it.
         let service = Service::unlock(&unlock("service pass")).unwrap();
         assert_eq!(crate::seal_kdf::cache_len(), 1);
         drop(service);
         assert_eq!(crate::seal_kdf::cache_len(), 0);
 
-        // Unknown and non-setup commands are refused; allowed ones get the CLI's
-        // own errors; Lock stops before later frames and clears the key cache.
         let missing = root.join("no-such-vault");
         let (result, replies) = run(&[
             unlock("service pass"),
@@ -472,7 +424,6 @@ mod tests {
             replies[0],
             json!({"id":1,"ok":false,"error":"service_command"})
         );
-        // The service never reads a passphrase file.
         assert_eq!(
             replies[1],
             json!({"id":2,"ok":false,"error":"setup_arguments"})
@@ -488,13 +439,11 @@ mod tests {
             "Lock zeroizes the key cache"
         );
 
-        // End of input stops the service the same way.
         let (result, replies) = run(&[unlock("service pass")]);
         assert_eq!(result, Ok(()));
         assert_eq!(replies, vec![json!({"unlocked":true})]);
         assert_eq!(crate::seal_kdf::cache_len(), 0);
 
-        // A first frame that is not an unlock is refused.
         let (result, _) = run(&[json!({"id":1,"op":"setup-status","args":["x"]}).to_string()]);
         assert_eq!(result, Err("service_frame".into()));
         std::fs::remove_dir_all(root).unwrap();

@@ -33,12 +33,10 @@ use std::{
 use zeroize::{Zeroize, Zeroizing};
 const ERROR: &str = "setup_hosted";
 
-/// A hosted setup policy: t-of-n with 2 <= t < n <= 16.
 fn supported_policy(threshold: u16, count: u16) -> bool {
     crate::member_state::valid_policy(threshold, usize::from(count))
 }
 
-/// Parse a "t-of-n" policy label.
 fn parse_policy(label: &str) -> Option<(u16, u16)> {
     let (threshold, count) = label.split_once("-of-")?;
     let (threshold, count) = (threshold.parse().ok()?, count.parse().ok()?);
@@ -701,8 +699,6 @@ impl CachedStatus {
     }
 }
 
-/// One runtime per process, so pooled relay and admission connections outlive a
-/// single operation (a long-lived member service reuses them across steps).
 fn shared_runtime() -> Result<&'static RelayRuntime, String> {
     static RUNTIME: std::sync::OnceLock<RelayRuntime> = std::sync::OnceLock::new();
     if let Some(runtime) = RUNTIME.get() {
@@ -712,15 +708,11 @@ fn shared_runtime() -> Result<&'static RelayRuntime, String> {
     let _ = RUNTIME.set(runtime);
     RUNTIME.get().ok_or_else(|| ERROR.into())
 }
-/// How long a long-lived process reuses an admission state during DKG and backups.
 const RELAXED_STATE: std::time::Duration = std::time::Duration::from_secs(10);
-/// The last admission state fetched per setup root in this process.
 static RECENT_STATE: std::sync::Mutex<
     BTreeMap<PathBuf, (std::time::Instant, loki_relay_client::VerifiedAdmissionReply)>,
 > = std::sync::Mutex::new(BTreeMap::new());
 type SharedClients = (std::sync::Arc<AdmissionHttp>, std::sync::Arc<SetupNet>);
-/// HTTP clients per verified operator bundle and development flag, shared by every
-/// setup opened in this process.
 fn shared_clients(operators: &OperatorSet, development: bool) -> Result<SharedClients, String> {
     static CLIENTS: std::sync::Mutex<BTreeMap<([u8; 32], bool), SharedClients>> =
         std::sync::Mutex::new(BTreeMap::new());
@@ -751,8 +743,6 @@ pub struct HostedSetup {
     runtime: &'static RelayRuntime,
     http: std::sync::Arc<AdmissionHttp>,
     net: std::sync::Arc<SetupNet>,
-    /// The admission state read once per operation; claims and mailbox rows only
-    /// change between operations, and every caller re-validates the reply.
     admission_state: std::sync::Mutex<Option<loki_relay_client::VerifiedAdmissionReply>>,
     retry: std::sync::Arc<crate::setup_retry::AdmissionRetry>,
     _member_lock: MemberLock,
@@ -1265,7 +1255,6 @@ impl HostedSetup {
             }
         }))
     }
-    /// Send several pre-signed, idempotent admission requests at once.
     fn execute_admissions(
         &self,
         packages: &[&[u8]],
@@ -1319,11 +1308,6 @@ impl HostedSetup {
             Err(_) => Err("setup_admission".into()),
         }
     }
-    /// Whether this member's last step was in DKG or the provisional backups. The roster
-    /// is accepted then, so claims are immutable and the setup mailboxes provisioned;
-    /// the admission state only reports a terminal ceremony, which peers also announce
-    /// through the transport. A long-lived process asks at most every [`RELAXED_STATE`]
-    /// then; a CLI process asks once per step, as before.
     fn relaxed_admission(&self) -> bool {
         Self::cached_status(&self.root).is_ok_and(|status| {
             matches!(
@@ -1332,13 +1316,11 @@ impl HostedSetup {
             )
         })
     }
-    /// Forget the memo of the current operation only.
     fn begin_operation(&self) {
         if let Ok(mut state) = self.admission_state.lock() {
             *state = None;
         }
     }
-    /// Forget every remembered admission state after this process changed it.
     fn admission_changed(&self) {
         self.begin_operation();
         if let Ok(mut recent) = RECENT_STATE.lock() {
@@ -1452,9 +1434,6 @@ impl HostedSetup {
             .collect();
         if !unregistered.is_empty() {
             let previous = inventory.registered;
-            // The requests are signed and saved in the inventory, and AdmissionRetry
-            // makes a re-send idempotent, so all of them go out at once and one journal
-            // generation records every success.
             let packages: Vec<&[u8]> = unregistered
                 .iter()
                 .map(|index| inventory.requests[*index].as_slice())
@@ -1883,7 +1862,6 @@ impl HostedSetup {
             VaultNetwork::Regtest => {}
             VaultNetwork::Testnet => {
                 value["network"] = serde_json::json!("testnet");
-                // shortcut: scanning starts at NU7 activation; add a signed birth height if scans become too slow.
                 value["birth_height"] = serde_json::json!(TESTNET_NU7_BIRTH);
             }
         }
@@ -2069,7 +2047,6 @@ impl HostedSetup {
             }
         };
         let key = self.acceptance_key()?;
-        // Commit this member's acceptance once its Join or proposal is stored and acked.
         let commit_acceptance = |store: &mut SetupStore| -> Result<(), String> {
         let ready = store
             .progress_for(&transport, &routes, &previous)
@@ -2139,7 +2116,6 @@ impl HostedSetup {
         self.runtime
             .block_on(transport.drive_once_with(&mut store, &routes, &self.net))
             .map_err(|_| "setup_transport")?;
-        // The drive may have completed the gate; commit now rather than next step.
         commit_acceptance(&mut store)?;
         if let Some(accepted) = self.accepted_from_store(&store, &transport, &roster)? {
             return self.ceremony_step(
@@ -2265,9 +2241,6 @@ impl HostedSetup {
             self.context.development,
         )
         .map_err(|_| "setup_transport")?;
-        // drive → process → drive: fetch what peers sent since the last step first, so
-        // it is processed now, and upload whatever processing produced before returning.
-        // `may_drive` is false when the caller has just driven.
         if may_drive {
             self.runtime
                 .block_on(transport.drive_once_with(store, routes, &self.net))
@@ -2922,7 +2895,6 @@ impl HostedSetup {
             .block_on(transport.drive_once_with(&mut store, &routes, &self.net))
             .map_err(|_| "setup_transport")?;
         if !proposal_prepared {
-            // The last Join may have arrived in this drive: propose now, not next step.
             routes.peers = self.received_join_descriptors(&store, &transport, claimed)?;
             if routes.peers.len() + 1 == self.context.count as usize {
                 self.prepare_roster_proposal(&mut store, &transport, &routes, claimed)?;
@@ -3094,7 +3066,6 @@ impl HostedSetup {
             .block_on(transport.drive_once_with(&mut store, &routes, &self.net))
             .map_err(|_| "setup_transport")?;
         if store.has_due_uploads(&transport).map_err(|_| "setup_transport")? {
-            // Acknowledge what that drive fetched (the creator's proposal) right away.
             self.runtime
                 .block_on(transport.drive_once_with(&mut store, &routes, &self.net))
                 .map_err(|_| "setup_transport")?;
@@ -3102,8 +3073,6 @@ impl HostedSetup {
         let progress = store
             .progress_for(&transport, &routes, &key)
             .map_err(|_| "setup_transport")?;
-        // The drive above may have fetched the creator's proposal. Report it only after the
-        // full admitted roster is known, so a fresh partial claim list never reads as a mismatch.
         if claimed.len() == self.context.count as usize && progress.stored_groups == 1 {
             if let Some(proposal) =
                 self.authenticated_proposal(&store, &transport, claimed, &routes.own)?
@@ -3551,7 +3520,6 @@ impl HostedSetup {
         )
     }
     pub fn step(&mut self) -> Result<SetupStatus, String> {
-        // The admission state is memoized within one operation only.
         self.begin_operation();
         let status = if matches!(self.journal.latest().ok_or(ERROR)?.payload[0], 0..=3)
             && self.transport_is_terminal()?
@@ -3727,10 +3695,6 @@ fn private_passphrase(path: &str) -> Result<Zeroizing<String>, String> {
     crate::seal_kdf::enable_session_cache(&passphrase);
     Ok(passphrase)
 }
-/// Secret inputs a caller already holds in memory, used by the member service in
-/// place of the CLI's private files. An argument of `@session`, `@private` or
-/// `@words` selects the matching field; a caller with a session passphrase never
-/// has a passphrase read from a file.
 #[derive(Default)]
 pub struct Inputs {
     pub passphrase: Option<Zeroizing<String>>,
@@ -3758,7 +3722,6 @@ impl Inputs {
                 Ok(words.clone())
             }
             (_, "@words") => Err("setup_file".into()),
-            // Recovery words are never a session secret.
             (_, path) => private_text(path),
         }
     }

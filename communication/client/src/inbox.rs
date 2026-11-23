@@ -21,7 +21,6 @@ const SAMPLE_ROWS: i64 = 1024;
 const SAMPLE_BYTES: i64 = 8 * 1024 * 1024;
 const SAMPLE_MAX: usize = 4096;
 
-/// Stable journal and download-rejection codes. The text is the persisted reason.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QuarantineReason {
     Receipt,
@@ -49,7 +48,6 @@ impl fmt::Display for QuarantineReason {
     }
 }
 
-/// Untrusted transport input for one advertised object. It is not an authentication proof.
 #[derive(Clone, Eq, PartialEq)]
 pub enum DownloadOutcome {
     Cached(Object),
@@ -79,7 +77,6 @@ impl fmt::Debug for DownloadOutcome {
 #[derive(Clone, Copy)]
 enum Class<'a> {
     Cache(&'a [u8]),
-    /// Ciphertext is already stored and checked. No new object bytes are written.
     Stored,
     Task,
     Tomb(QuarantineReason),
@@ -120,7 +117,6 @@ fn as_i64(n: u64) -> ClientResult<i64> {
     i64::try_from(n).map_err(|_| ClientError::Wire(WireError::Bounds))
 }
 
-/// Bad shape covers nothing. Invalid entry lengths stay in range so they can be journaled.
 fn validate_shape(route: &RelayRoute, page: &Page) -> ClientResult<()> {
     if page.mailbox != route.mailbox {
         return Err(ClientError::Wire(WireError::Schema));
@@ -195,7 +191,6 @@ fn receipt_matches(route: &RelayRoute, page: &Page, index: usize) -> bool {
 }
 
 fn object_failure(object: &Object, hash: &Id32, wire_length: u64) -> Option<QuarantineReason> {
-    // Untrusted download bytes are not hashed until the wire is inside the framed cap.
     if object.wire.len() > 65536 || object.wire.len() as u64 != wire_length || !framed_len(wire_length) {
         return Some(QuarantineReason::Length);
     }
@@ -270,7 +265,6 @@ fn classify_outcomes<'a>(
     if !missing && rejects.is_empty() && cache_fail.is_none() && !caches.is_empty() && same_cache {
         return Class::Cache(caches[0]);
     }
-    // No outcome is a durable missing task. Absence must not skip the position.
     if caches.is_empty() && rejects.is_empty() && cache_fail.is_none() {
         return Class::Task;
     }
@@ -475,7 +469,6 @@ fn sample_over_budget(quarantine: bool, len: i64, totals: (i64, i64, i64, i64)) 
     shared_rows || shared_bytes || own
 }
 
-/// Both tables take ids from `diagnostic_ids`, so the smaller id is the older sample.
 fn evict_oldest_sample(tx: &rusqlite::Connection) -> ClientResult<bool> {
     let quarantine_id: Option<i64> = tx
         .query_row(
@@ -524,7 +517,6 @@ fn fit_sample(tx: &rusqlite::Connection, len: i64) -> ClientResult<()> {
     fit_diagnostic(tx, len, true)
 }
 
-/// Ids come from one counter, including ids already stored before catalog 6.
 fn allocate_sample_id(tx: &rusqlite::Connection) -> ClientResult<i64> {
     let id: i64 = tx.query_row("SELECT next_id FROM diagnostic_ids WHERE singleton=1", [], |row| {
         row.get(0)
@@ -560,12 +552,6 @@ fn sample_is_new(
 }
 
 impl ClientStore {
-    /// Journals every covered position, then advances the route cursor in the same transaction.
-    ///
-    /// The cursor means durable transport capture. Saved ciphertext stays unauthenticated, and
-    /// this transaction does not retire an earlier download task. An invalid receipt or
-    /// advertised length remains a per-sequence journal tombstone. Existing download rejections
-    /// stay untouched and do not replace a validated cache.
     pub fn capture_page(
         &mut self,
         route: &RelayRoute,
@@ -772,7 +758,6 @@ fn bind_capture_scope(
     if body.owner != public.id || body.vault != roster.vault || body.roster != roster_digest(roster)? {
         return Err(ClientError::Identity);
     }
-    // The same three-route match upload uses. A foreign key or mailbox is not this store's inbox.
     if !crate::outbox::inboxes_match(&config.own, &body.relays) {
         return Err(ClientError::Config);
     }
@@ -1012,13 +997,10 @@ fn record_route_failure(
     } else {
         note_route_retry(store, route, now_ms, reason)?;
     }
-    // The reason is already durable. A full sample budget must not roll it back.
     let _ = save_page_sample(store, route, sample);
     Ok(())
 }
 
-/// One transport pass. Store and owner association is checked once before any route or download work.
-/// Each owned route is independent, and download completion does not move a cursor.
 pub async fn poll_transport(
     store: &mut ClientStore,
     http: &RelayHttp,
@@ -1049,12 +1031,6 @@ pub async fn poll_transport(
     recover_downloads(store, http, config, &reference, now_ms).await
 }
 
-/// One client pass: capture, authenticate, commit, reconcile references, then upload.
-///
-/// Each owned route already fails independently inside `poll_transport`. A missing
-/// sealed configuration still commits local originals and Received copies, then
-/// returns `Config` before any upload. Upload reads only rows already in `logical_records`.
-/// The extra relay pin stays on the existing stop-after-stored policy.
 pub async fn poll_once(
     store: &mut ClientStore,
     http: &RelayHttp,
@@ -1073,7 +1049,6 @@ pub async fn poll_once(
         Err(ClientError::Config) => true,
         Err(error) => return Err(error),
     };
-    // Publication is local. A full page budget must not skip outboxes that are already saved.
     let published = publish_candidates(store, roster, identity);
     let reconciled = crate::received::reconcile_received(store, roster, identity);
     let uploaded = if transport_blocked {
@@ -1090,11 +1065,6 @@ pub async fn poll_once(
     Ok(())
 }
 
-/// Commit every staged candidate that authenticates.
-///
-/// Self-delivery, a Received message, a partial set, and quarantine produce no
-/// acknowledgement. One such candidate does not stop the next message. Routing
-/// is not required for the three saved copies.
 fn publish_candidates(
     store: &mut ClientStore,
     roster: &Roster,
@@ -1207,7 +1177,6 @@ async fn capture_loaded(
     let route = &inbox.route;
     let mut downloads = Vec::new();
     for (index, entry) in page.entries.iter().enumerate() {
-        // Position length and receipt stay with capture_page. One bad advertisement must not reject the hash.
         if !framed_len(entry.wire_length) || !receipt_matches(route, page, index) {
             continue;
         }
@@ -1290,7 +1259,6 @@ async fn recover_one(
     now_ms: u64,
     task: &PendingDownload,
 ) -> ClientResult<()> {
-    // A valid object cached through another relay retires this task before auth wait, backoff, or route lookup.
     if let Some(saved) = store.saved_object(&task.source_hash)? {
         return if let Some(reason) = wire_failure(&saved.wire, &task.source_hash) {
             let sample = prefix(&saved.wire).to_vec();
@@ -1486,7 +1454,6 @@ fn settle_download(
         }
     }
     let insert_wire = validated.as_ref().filter(|_| cipher.is_none());
-    // Task length is the covered advertisement. A different valid wire stays cached and still records Length.
     let reason_code = if let Some(wire) = validated.as_ref() {
         if wire.len() as i64 != stored_len {
             Some(QuarantineReason::Length.code())
@@ -1599,17 +1566,12 @@ fn settle_download(
 const RECOVERY_PAGE: u16 = 100;
 const MAX_STAGED_OBJECTS: usize = 275;
 
-/// Readonly application readiness. Pending does not drop the candidate or withhold a future Received.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CandidateReadiness {
     Ready,
     Pending,
 }
 
-/// One application prerequisite and the readiness of its full chain.
-///
-/// This is not recovery metadata. A staged claim is not Ready, and a committed row is not
-/// Resolved until its exact dependency edges have been walked.
 pub struct PrerequisiteStatus {
     prerequisite: MessageRef,
     readiness: CandidateReadiness,
@@ -1625,11 +1587,6 @@ impl PrerequisiteStatus {
     }
 }
 
-/// Authenticated message and complete source kept in memory until publication.
-///
-/// `readiness` describes other authenticated candidates in this batch. It is not stored and
-/// it is not proof that a committed dependency chain is ready. Recovery rows are not
-/// authentication proof either.
 pub struct AuthenticatedCandidate {
     message: AuthenticatedMessage,
     source: CompleteSource,
@@ -1649,7 +1606,6 @@ impl AuthenticatedCandidate {
         &self.prerequisites
     }
 
-    /// Ready only when every prerequisite chain is ready. An empty list is ready.
     pub fn readiness(&self) -> CandidateReadiness {
         if self.prerequisites.iter().all(|status| status.readiness == CandidateReadiness::Ready) {
             CandidateReadiness::Ready
@@ -1665,10 +1621,6 @@ struct Opened {
     source: CompleteSource,
 }
 
-/// Stage verified roots and return complete authenticated candidates.
-///
-/// Partial manifests stay staged. Nothing here writes an original, an application row, or an acknowledgement.
-/// Download rejections do not veto a cached object that matches the current source set.
 pub fn authenticate_staged(
     store: &mut ClientStore,
     roster: &Roster,
@@ -1747,7 +1699,6 @@ fn classify_cached(
     let Some(object) = store.saved_object(&hash)? else {
         return Ok(());
     };
-    // One covered packet's failure is durable for that hash. It does not stop the rest of the page.
     match TransferAssembler::inspect(roster, identity, &object)? {
         RootInspection::Chunk => Ok(()),
         RootInspection::Invalid(reason) => store.reject_source_root(&hash, reason, None),
@@ -1768,7 +1719,6 @@ fn admit_single(
         Err(error) => return store.reject_source_root(&object.hash, source_reason(&error), None),
     };
     let (message, source) = transfer.into_parts();
-    // The group is the verified binding. The ciphertext hash is not shared with another message.
     let group_id = crate::transfer::source_group_id(&message.body().key, message.digest(), source.recipient(), None)?;
     let bound = BoundSource {
         root_hash: object.hash,
@@ -1780,7 +1730,6 @@ fn admit_single(
     };
     match stage_or_wait(store, &bound)? {
         Some(StageResult::Staged | StageResult::Refreshed | StageResult::Unchanged) => {
-            // Route refresh already happened. A settled root is not another candidate.
             if store.incoming_root_settled(&object.hash)? {
                 return Ok(());
             }
@@ -1811,7 +1760,6 @@ fn admit_manifest(
             Some(_) | None => objects.push((*requirement.hash(), wire)),
         }
     }
-    // A reused transfer id does not merge a different vault, roster, sender, message, digest, or recipient.
     let group_id = crate::transfer::source_group_id(
         manifest.key(),
         manifest.digest(),
@@ -2000,11 +1948,6 @@ impl<'a> ReadinessWalk<'a> {
         }
     }
 
-    /// Iterative walk. A finite acyclic chain becomes Ready at any depth.
-    ///
-    /// A node stays Pending when an exact prerequisite is missing, the saved source does not
-    /// authenticate, or a back-edge reaches a node already being resolved. No depth or batch
-    /// ceiling turns a complete chain Pending, and a partial load is not marked Ready.
     fn readiness(&mut self, start: PrerequisiteNode) -> ClientResult<CandidateReadiness> {
         let mut stack = vec![(start, false)];
         while let Some((node, finishing)) = stack.pop() {
@@ -2045,8 +1988,6 @@ impl<'a> ReadinessWalk<'a> {
         })
     }
 
-    /// Prefer this pass's authenticated body. Incoming rows keep their stored edges.
-    /// An outgoing record is reopened from the owner's saved recipient copy.
     fn edge_nodes(&self, node: &PrerequisiteNode) -> ClientResult<Option<Vec<PrerequisiteNode>>> {
         let refs = if let Some(position) = self.index.get(node) {
             Some(self.opened[*position].message.body().prerequisites.clone())
@@ -2079,10 +2020,6 @@ impl<'a> ReadinessWalk<'a> {
     }
 }
 
-/// Authenticate the owner's saved copy of one authored message and return its prerequisites.
-///
-/// A missing object, a short requirement page, or a failed open stays unavailable. It is not
-/// an empty ready list. The plaintext is dropped with the authenticated message.
 fn outgoing_prerequisites(
     store: &ClientStore,
     roster: &Roster,
@@ -2178,12 +2115,6 @@ fn prerequisite_node(message: &AuthenticatedMessage) -> PrerequisiteNode {
     }
 }
 
-/// Ready or pending for one committed message.
-///
-/// `authenticate_staged` skips a published root, so a candidate's in-memory
-/// readiness cannot observe an ancestor that arrives later. This walk uses the
-/// same iterative exact edges and reopens an authored copy from saved ciphertext.
-/// Nothing is written, including no ready flag and no further acknowledgement.
 pub fn committed_readiness(
     store: &ClientStore,
     roster: &Roster,

@@ -138,7 +138,6 @@ fn setup_storage_quota_is_per_relay_and_purpose() {
     assert!(store.apply(&state, None, 2592101).is_ok());
 }
 
-/// Rewrite a current root's schema back to version 1 (at most 4 members).
 fn narrow_to_version_one(external: &rusqlite::Connection) {
     external
         .execute_batch(
@@ -202,8 +201,6 @@ fn terminal_notice_schema_migrates_only_unversioned_legacy_roots() {
     ));
 }
 
-/// A version-1 root (bounded at 4 members) keeps its ceremonies and accepts larger
-/// vaults after the in-place widening.
 #[test]
 fn version_one_root_widens_in_place_for_larger_vaults() {
     let db = OwnedDb::new();

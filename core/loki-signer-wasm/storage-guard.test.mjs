@@ -1,4 +1,3 @@
-// node --test core/loki-signer-wasm/storage-guard.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { requirePersistentStorage, requireShare, SHARE_MISSING } from "./storage-guard.js";

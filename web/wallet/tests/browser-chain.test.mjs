@@ -2,7 +2,6 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { chainPayments, chainPaymentSession } from '../src/lib/signer.ts';
 
-// The browser signer's history comes from its own chain scan (one entry per transaction).
 test('chain history becomes the wallet History list', () => {
   const history = [
     { txid: 'd2'.repeat(32), height: 4639094, received_zat: 0, change_zat: 740000, spent_zat: 780000 },

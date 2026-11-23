@@ -1,9 +1,3 @@
-//! Narrow Ironwood note scanning for the CLI wallet path.
-//!
-//! It trial-decrypts verbose block actions, keeping vault notes and witnesses.
-//! Testnet starts at the vault's certified birth checkpoint; regtest retains its
-//! short-chain scan. This is still a CLI research scanner, not a durable wallet store.
-
 use orchard::{
     keys::{FullViewingKey, IncomingViewingKey, PreparedIncomingViewingKey, Scope},
     note::{ExtractedNoteCommitment, Note, Nullifier, TransmittedNoteCiphertext},
@@ -17,7 +11,6 @@ use zcash_note_encryption::try_note_decryption;
 use crate::scanstate::ScanState;
 use crate::witness::BirthWitnesses;
 
-/// One Ironwood action as the node reports it.
 #[derive(Clone, Debug)]
 pub struct RawAction {
     pub cv: [u8; 32],
@@ -29,26 +22,17 @@ pub struct RawAction {
     pub out_ciphertext: [u8; 80],
 }
 
-/// A note the vault owns, with everything checkpoint 3 needs to spend it.
 #[derive(Clone, Debug)]
 pub struct VaultNote {
     pub height: u32,
     pub txid: String,
-    /// Position of this action's commitment in the Ironwood note commitment tree,
-    /// counting every Ironwood action in every block in order.
     pub position: u64,
     pub value_zat: u64,
     pub note: Note,
     pub cmx: [u8; 32],
-    /// The nullifier this note will have when the vault spends it. Derived from the
-    /// vault's own viewing key, not copied from the action that created it.
     pub nullifier: [u8; 32],
 }
 
-/// Rebuild an [`Action`] from the node's JSON so it can be trial-decrypted.
-///
-/// Returns `None` if any field is structurally invalid, which for our own regtest chain
-/// would mean the node and these crates disagree about the wire format.
 fn rebuild(raw: &RawAction) -> Option<Action<()>> {
     let enc: [u8; 580] = raw.enc_ciphertext.as_slice().try_into().ok()?;
 
@@ -67,29 +51,18 @@ fn rebuild(raw: &RawAction) -> Option<Action<()>> {
     .ok()
 }
 
-/// Trial-decrypt one action with the vault's incoming viewing key.
 pub fn try_decrypt(ivk: &PreparedIncomingViewingKey, raw: &RawAction) -> Option<Note> {
     let action = rebuild(raw)?;
-    // The domain is derived from the action's own rho, so each action decrypts under
-    // the domain it was encrypted with.
     let domain = IronwoodDomain::for_action(&action);
     try_note_decryption::<IronwoodDomain, Action<()>>(&domain, ivk, &action)
         .map(|(note, _, _)| note)
 }
 
-/// The vault's external incoming viewing key, prepared for repeated trial decryption.
-///
-/// External only. Coinbase funding arrives at the external address, which is all the
-/// funding scan needs. Change goes to the INTERNAL address, so anything that has to see
-/// change must use [`vault_ivks`] instead; getting this wrong is why the first run of the
-/// effects check could not decrypt the change output.
 pub fn vault_ivk(fvk: &FullViewingKey) -> PreparedIncomingViewingKey {
     let ivk: IncomingViewingKey = fvk.to_ivk(Scope::External);
     PreparedIncomingViewingKey::new(&ivk)
 }
 
-/// Both scopes, external first. A full view of the vault's own outputs needs both:
-/// payments land on a diversified external address, change lands on the internal one.
 pub fn vault_ivks(fvk: &FullViewingKey) -> [PreparedIncomingViewingKey; 2] {
     [
         PreparedIncomingViewingKey::new(&fvk.to_ivk(Scope::External)),
@@ -97,10 +70,6 @@ pub fn vault_ivks(fvk: &FullViewingKey) -> [PreparedIncomingViewingKey; 2] {
     ]
 }
 
-/// Scan a block's Ironwood actions, keeping those the vault owns.
-///
-/// `start_position` is the number of Ironwood actions seen in all earlier blocks, so
-/// positions are assigned in the same order the note commitment tree appends them.
 pub fn scan_block(
     fvk: &FullViewingKey,
     ivks: &[PreparedIncomingViewingKey],
@@ -122,10 +91,6 @@ pub fn scan_block(
     (found, position)
 }
 
-/// What the vault learns from one action, or `None` if the action is not addressed to it.
-///
-/// Shared by the live scan and by [`crate::scanstate::ScanState`] rebuilding a note it
-/// stored earlier, so a note recovered from disk cannot drift from one found on the wire.
 pub(crate) fn vault_note_at(
     fvk: &FullViewingKey,
     ivks: &[PreparedIncomingViewingKey],
@@ -134,9 +99,6 @@ pub(crate) fn vault_note_at(
     position: u64,
     raw: &RawAction,
 ) -> Option<VaultNote> {
-    // Every scope in turn. External finds coinbase funding and payments to a
-    // diversified address; internal finds change. A scan that only tried external
-    // would silently miss every change note the vault owns.
     let note = ivks.iter().find_map(|ivk| try_decrypt(ivk, raw))?;
     Some(VaultNote {
         height,
@@ -144,27 +106,21 @@ pub(crate) fn vault_note_at(
         position,
         value_zat: note.value().inner(),
         cmx: raw.cmx,
-        // The spend nullifier is a function of the note and the vault's key.
         nullifier: note.nullifier(fvk).to_bytes(),
         note,
     })
 }
 
-/// One Ironwood action's `cmx`, as the node's JSON reports it.
 pub fn hex32(v: &serde_json::Value, key: &str) -> Option<[u8; 32]> {
     hex::decode(v[key].as_str()?).ok()?.try_into().ok()
 }
 
-/// Everything a full-chain scan produces.
 pub struct Chain {
-    /// Notes the vault owns, in tree-append order.
     pub notes: Vec<VaultNote>,
-    /// Every Ironwood commitment on the chain, in append order.
     pub cmxs: Vec<[u8; 32]>,
     pub tip: u64,
 }
 
-/// A fresh vault's notes and witnesses, scanned from its certified birth block.
 pub struct BirthChain {
     pub notes: Vec<VaultNote>,
     pub witnesses: BirthWitnesses,
@@ -230,9 +186,6 @@ where
     })
 }
 
-/// Scan a newly created vault from the block after its saved tree checkpoint.
-/// shortcut: rescans from birth on each command; persist witnesses once Testnet
-/// vaults routinely span more than a few days of blocks.
 pub fn scan_chain_from_birth(
     rpc: &crate::rpc::Rpc,
     fvk: &FullViewingKey,
@@ -284,29 +237,12 @@ fn birth_checkpoint(
     Ok((hash, tree, root))
 }
 
-/// Scan every block for the vault's Ironwood notes and collect the commitment stream.
-///
-/// This is what makes a second device independent: a finisher that runs this derives the
-/// note position and the witness from the chain itself, rather than from a file an
-/// approver wrote. It is the same narrow fixture as before, just callable.
 pub fn scan_chain(rpc: &crate::rpc::Rpc, fvk: &FullViewingKey) -> Result<Chain, String> {
     let mut state = ScanState::default();
     scan_to_tip(rpc, fvk, &mut state)?;
     state.into_chain(fvk)
 }
 
-/// [`scan_chain`], but only over the blocks that are new since the last run.
-///
-/// `path` is a file this owns: it holds how far the last scan got, the commitment stream
-/// it collected and the vault's own actions, so a second run checks its saved-tip block
-/// and reads blocks mined since the first. The result is the same `Chain` a full scan
-/// returns — including the whole commitment stream, which is what
-/// [`crate::witness::witness_for`] needs to rebuild
-/// the tree and check its root against the node's anchor.
-///
-/// A shorter chain, a changed saved-tip block, or a legacy cache without a block hash
-/// is rescanned from scratch. A disconnected chain or a tip that changes during the
-/// scan is refused without replacing the saved state.
 pub fn scan_chain_cached(
     rpc: &crate::rpc::Rpc,
     fvk: &FullViewingKey,
@@ -326,8 +262,6 @@ pub fn scan_chain_cached(
     })
 }
 
-/// Cache only the commitments after `birth_height`, using the node's frontier before it.
-/// shortcut: witnesses replay the cached suffix each run; persist them when that grows large.
 pub fn scan_chain_cached_from_birth(
     rpc: &crate::rpc::Rpc,
     fvk: &FullViewingKey,
@@ -390,7 +324,6 @@ pub fn scan_chain_cached_from_birth(
     })
 }
 
-/// Bring `state` up to the node's current tip.
 fn scan_to_tip(
     rpc: &crate::rpc::Rpc,
     fvk: &FullViewingKey,
@@ -406,11 +339,6 @@ fn scan_to_tip(
     })
 }
 
-/// Scan the blocks `state` has not seen yet, up to and including `to`.
-///
-/// `get_block` is the only thing this needs from the node, which is what lets a test run
-/// the real scan over a canned chain.
-/// Discard `state` on error; an interrupted block may have added some actions.
 pub fn scan_blocks<F>(
     fvk: &FullViewingKey,
     state: &mut ScanState,
@@ -420,7 +348,6 @@ pub fn scan_blocks<F>(
 where
     F: Fn(u64) -> Result<serde_json::Value, String>,
 {
-    // A saved height alone cannot identify a chain after a reorg.
     if to < state.tip
         || (state.tip > 0
             && (state.tip_hash.is_none()
@@ -469,11 +396,6 @@ fn block_hash(block: &serde_json::Value, height: u64) -> Result<[u8; 32], String
     hex32(block, "hash").ok_or_else(|| format!("block {height} has no valid hash"))
 }
 
-/// One transaction's Ironwood actions, as the node's JSON reports them.
-///
-/// A single unparsable action is fatal: on our own regtest chain it would mean the node
-/// and these crates disagree about the wire format, and a scan that silently skipped it
-/// would assign every later note the wrong tree position.
 pub fn parse_actions(actions: &[serde_json::Value], txid: &str) -> Result<Vec<RawAction>, String> {
     let raws: Vec<RawAction> = actions
         .iter()
@@ -499,7 +421,6 @@ pub fn parse_actions(actions: &[serde_json::Value], txid: &str) -> Result<Vec<Ra
     Ok(raws)
 }
 
-/// The node's own Ironwood anchor at `height`.
 pub fn chain_anchor(rpc: &crate::rpc::Rpc, height: u64) -> Result<[u8; 32], String> {
     let state = rpc.json("z_gettreestate", &format!("[\"{height}\"]"))?;
     anchor_from_treestate(&state)
@@ -555,10 +476,6 @@ mod birth_tests {
     }
 }
 
-/// Trial-decrypt one action, keeping the memo as well as the note.
-///
-/// The effects check needs the memo: an output with the right value to the right address
-/// but a different memo is not the payment that was approved.
 pub fn try_decrypt_with_memo(
     ivk: &PreparedIncomingViewingKey,
     raw: &RawAction,

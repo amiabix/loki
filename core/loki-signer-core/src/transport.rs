@@ -1,32 +1,3 @@
-//! WS3 transport: move DKG wires and sealed payment signing messages between the coordinator and the
-//! signers over the audited ZF `frostd` relay (`docs/product/ws3-transport.md`).
-//!
-//! `frostd` is an honest-but-curious JSON-over-HTTP(S) relay: it queues opaque bytes
-//! keyed by session + recipient pubkey and hands them back on `receive`. It never
-//! inspects the payload (`frostd/src/functions.rs` `send`/`receive` just move
-//! `Msg { sender, msg }`).
-//!
-//! What may be sent is a closed set, [`Outbound`]: a [`DkgWire`] (only the signer makes
-//! one; round two is a v2 envelope sealed under one-setup fresh keys, so recorded relay
-//! traffic does not open even after a later compromise of the long-lived identity keys),
-//! or a sealed payment message. The low-level FROST variants are used by the protocol
-//! harness, not the hosted payment driver. The transport does not handle secret nonces or
-//! viewing keys.
-//!
-//! The [`Transport`] trait is the stable interface (ws3 §5) so the serverless
-//! Zcash-memo transport can be added later behind the same methods without touching
-//! WS1/WS2. The `frostd` implementation (`FrostdTransport`) lives in `loki-poc`, which
-//! owns the reqwest/tokio client; this crate is dependency-clean so it compiles to wasm.
-//!
-//! Addressing: a member's app is named on the relay by the public key of its own
-//! [`FrostdLoginKey`], a dedicated X25519 key used only to log in to frostd. It is NOT
-//! the member's setup identity: the setup identity's keys stay inside the signer. Login
-//! proves possession of the login secret via XEdDSA over the server challenge — the
-//! exact scheme `frostd` verifies (`frostd/src/functions.rs::login`, `xed25519`).
-//!
-//! [`RelayLog`] is the coordinator's record of every DKG wire it relayed, so it can
-//! redeliver after a restart; it is deleted once the vault is active.
-
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -41,12 +12,9 @@ use crate::{
     signing_session::{MessageKind, SessionContext},
 };
 
-/// A member address on the relay: its 32-byte frostd/X25519 public key.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Peer(pub [u8; 32]);
 
-/// A dedicated frostd login key. Only logs in to the relay; it never seals, signs or
-/// opens a protocol message, and it is not derived from the setup identity.
 pub struct FrostdLoginKey(StaticSecret);
 
 impl FrostdLoginKey {
@@ -62,49 +30,23 @@ impl FrostdLoginKey {
         Zeroizing::new(self.0.to_bytes())
     }
 
-    /// This app's address on the relay.
     pub fn peer(&self) -> Peer {
         Peer(PublicKey::from(&self.0).to_bytes())
     }
 }
 
-/// Everything a member's app or the coordinator may hand the relay. Raw bytes are not
-/// an option:
-///
-/// ```compile_fail
-/// use loki_signer_core::transport::{Peer, Transport};
-/// fn leak<T: Transport>(t: &T, ch: &T::Channel, to: &[Peer], secret: &[u8]) {
-///     t.send(ch, to, secret).unwrap();
-/// }
-/// ```
-///
-/// and a [`crate::signer::CandidatePczt`] reaches the relay only sealed in a
-/// [`SealedCandidate`], neither of which an outside caller can forge the bytes of:
-///
-/// ```compile_fail
-/// let candidate = loki_signer_core::signer::CandidatePczt(vec![0u8; 200]);
-/// ```
-///
-/// ```compile_fail
-/// let sealed = loki_signer_core::transport::SealedCandidate(vec![0u8; 200]);
-/// ```
 pub enum Outbound {
-    /// A setup message produced by the signer.
     Dkg(DkgWire),
     Commitments(frost::round1::SigningCommitments),
-    /// The proposer signer's unsigned candidate, sealed to one other selected signer.
     Candidate(SealedCandidate),
     Package(frost::SigningPackage),
     RandomizerSeed([u8; 32]),
     Share(frost::round2::SignatureShare),
-    /// One hosted signing message sealed to its selected participant or coordinator.
     Signing(SealedSigning),
-    /// A hosted member's sealed payment-session request or reply, relayed for discovery.
     Peer(SealedPeer),
 }
 
 impl Outbound {
-    /// The bytes the relay carries.
     pub fn to_bytes(&self) -> Result<Vec<u8>, TransportError> {
         let encoding = |e: frost::Error| TransportError::Decode(e.to_string());
         match self {
@@ -137,9 +79,6 @@ impl SealedSigning {
     }
 }
 
-/// One member's payment-session request or reply, sealed to another member with the same
-/// roster identity and [`SessionContext`] the HTTP path used. The relay carries only the
-/// ciphertext; the recipient opens it with [`Identity::open_session`].
 pub struct SealedPeer(Vec<u8>);
 
 impl SealedPeer {
@@ -156,10 +95,6 @@ impl SealedPeer {
         own.seal_session(recipient, context, kind, body).map(Self)
     }
 
-    /// A joiner's request to a vault creator that does not know the joiner yet. The joiner's
-    /// slot and signing key go in the clear before the envelope; the creator takes the
-    /// encryption key from the relay sender ([`SealedPeer::join_sender`]), so the envelope opens
-    /// only for that identity.
     pub fn seal_join(
         own: &Identity,
         creator: &PublicIdentity,
@@ -173,7 +108,6 @@ impl SealedPeer {
         Ok(Self(wire))
     }
 
-    /// The identity a join request from relay sender `from` names, and its envelope.
     pub fn join_sender<'a>(from: &[u8; 32], wire: &'a [u8]) -> Result<(PublicIdentity, &'a [u8]), String> {
         if wire.len() < 34 {
             return Err("short join request".into());
@@ -185,9 +119,6 @@ impl SealedPeer {
     }
 }
 
-/// A candidate PCZT end-to-end encrypted and signed from one selected signer to another.
-/// The candidate carries the vault's full viewing key and the payment's notes, amounts and
-/// addresses, so it never crosses the relay in the clear.
 pub struct SealedCandidate(Vec<u8>);
 
 impl SealedCandidate {
@@ -201,7 +132,6 @@ impl SealedCandidate {
             .map(Self)
     }
 
-    /// Open a candidate `sender` sealed to `own` for this attempt.
     pub fn open(
         own: &Identity,
         sender: &PublicIdentity,
@@ -216,45 +146,26 @@ impl SealedCandidate {
     }
 }
 
-/// One inbound message: who sent it and the opaque public bytes they sent. The relay
-/// authenticates `from` (it is the sender's logged-in pubkey); E2E auth of the body is
-/// Loki's sealed-message layer above this seam. The relay delivery itself is the
-/// "receipt" the `signing_session` relay-receipt rules consume (ws3 §5).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Incoming {
     pub from: Peer,
     pub message: Vec<u8>,
 }
 
-/// WS3 §5 transport interface, stable across `frostd` and the future memo transport.
-/// Sends take only an [`Outbound`]; inbound messages are opaque bytes for the receiver
-/// to parse.
 pub trait Transport {
     type Error;
     type Channel;
 
-    /// Open an authenticated channel for a signing/DKG session. `peers` is the full
-    /// roster (coordinator + participants) by frostd pubkey; `message_count` is the
-    /// number of logical messages the coordinator will send per participant (frostd
-    /// uses it to size the session). Only the coordinator calls `create`; participants
-    /// join an existing `session`.
     fn open(&mut self, peers: &[Peer], message_count: u8) -> Result<Self::Channel, Self::Error>;
 
-    /// Join an already-created session as a participant (coordinator shares `session`
-    /// out of band / via the roster layer, ws3 §4).
     fn join(&mut self, session: Uuid) -> Result<Self::Channel, Self::Error>;
 
-    /// Send one typed public message to the given recipients. Empty `to` means "to the
-    /// coordinator" (frostd convention).
     fn send(&self, channel: &Self::Channel, to: &[Peer], message: &Outbound)
         -> Result<(), Self::Error>;
 
-    /// Drain this member's inbox for the channel. `as_coordinator` selects the
-    /// coordinator mailbox when this member is also the coordinator.
     fn recv(&self, channel: &Self::Channel, as_coordinator: bool)
         -> Result<Vec<Incoming>, Self::Error>;
 
-    /// Close the session (coordinator only; frostd rejects non-coordinator closes).
     fn close(&self, channel: Self::Channel) -> Result<(), Self::Error>;
 }
 
@@ -283,9 +194,6 @@ const RELAY_LOG_MAGIC: &[u8; 8] = b"LOKIRLG1";
 const RELAY_LOG_ENTRIES: usize = 4096;
 const RELAY_LOG_WIRE: usize = 128 * 1024;
 
-/// The coordinator's log of every DKG wire it relayed, kept so it can redeliver after a
-/// restart. It holds only public wires (signed round ones, certificates and receipts,
-/// and v2 round-two envelopes it cannot open). Delete it once the vault is active.
 pub struct RelayLog {
     dir: PathBuf,
     members: u16,
@@ -297,7 +205,6 @@ fn log_error(e: impl std::fmt::Display) -> TransportError {
 }
 
 impl RelayLog {
-    /// Open (or start) the log for a vault of `members` members in `dir`.
     pub fn open(dir: &Path, members: u16) -> Result<Self, TransportError> {
         if !(2..=crate::member_state::MAX_MEMBERS).contains(&members) {
             return Err(log_error("member count"));
@@ -348,10 +255,6 @@ impl RelayLog {
         }
     }
 
-    /// Log a wire the relay delivered from member `from`, before forwarding it. Returns
-    /// the wire and its recipients, or `None` for an exact repeat already relayed (members
-    /// resend their saved messages). A different second message is logged and forwarded
-    /// too: the signers, not the coordinator, decide that it is a mismatch.
     pub fn relay(
         &mut self,
         from: u16,
@@ -387,8 +290,6 @@ impl RelayLog {
         crate::signer::durable::replace_durable(&self.dir, RELAY_LOG, &out).map_err(log_error)
     }
 
-    /// Every logged wire addressed to `member`, in relay order, to redeliver after a
-    /// restart.
     pub fn for_member(&self, member: u16) -> Vec<DkgWire> {
         self.entries
             .iter()
@@ -402,7 +303,6 @@ impl RelayLog {
             .collect()
     }
 
-    /// Number of distinct wires logged.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -411,7 +311,6 @@ impl RelayLog {
         self.entries.is_empty()
     }
 
-    /// True once every member's backup receipt has been relayed: the vault is active.
     pub fn active(&self) -> bool {
         let mut receipts = BTreeMap::new();
         for (from, bytes) in &self.entries {
@@ -422,7 +321,6 @@ impl RelayLog {
         receipts.len() == usize::from(self.members)
     }
 
-    /// Delete the log once the vault is active.
     pub fn delete(self) -> Result<(), TransportError> {
         if !self.active() {
             return Err(log_error("the vault is not active yet"));
@@ -447,12 +345,10 @@ mod tests {
         let identities: Vec<Identity> = (1..=3).map(Identity::new).collect();
         let round1 = identities[0].sign_round1(&vault, b"round one").unwrap();
         let mut log = RelayLog::open(&dir, 3).unwrap();
-        // The relay says member 2 sent member 1's wire: dropped, nothing logged.
         assert!(log.relay(2, round1.clone()).is_err());
         assert!(log.relay(1, b"not a wire".to_vec()).is_err());
         let (_, to) = log.relay(1, round1.clone()).unwrap().unwrap();
         assert_eq!(to, vec![2, 3]);
-        // Members resend saved messages: an exact repeat is not forwarded again.
         assert!(log.relay(1, round1.clone()).unwrap().is_none());
         assert!(!log.active());
 
@@ -471,7 +367,6 @@ mod tests {
         log.delete().unwrap();
         assert!(!dir.join(RELAY_LOG).exists());
 
-        // A damaged log does not open.
         std::fs::write(dir.join(RELAY_LOG), b"LOKIRLG1\x00\x01\x00\x00\x00\x09garbage").unwrap();
         assert!(RelayLog::open(&dir, 3).is_err());
     }

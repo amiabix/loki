@@ -1,4 +1,3 @@
-// node --test core/loki-signer-wasm/vault-list.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { vaultSummary, saveVaultName, readVaultName } from "./vault-list.js";
@@ -6,7 +5,6 @@ import { vaultSummary, saveVaultName, readVaultName } from "./vault-list.js";
 const id = "6df7e10161f47641fc2502bee89786fc3ba6886bd3d9e5398c1146f4c3191111";
 const vault = { vault_id: id, threshold: 2, members: [{}, {}, {}], ready: true };
 
-// The parts of an OPFS directory handle (worker side) the vault list uses.
 function memoryDir() {
   const files = new Map();
   return {

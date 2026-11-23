@@ -57,33 +57,22 @@ pub use lightwalletd::Lightwalletd;
 
 type Database = WalletDb<Connection, VaultNetwork, SystemClock, UnwrapErr<SysRng>>;
 
-/// The start of the draft error for funds that are not yet confirmed deeply enough to spend.
 pub const FUNDS_WAITING: &str = "Funds for this payment are waiting for confirmations.";
 
-/// A deposit into the vault: a mined transaction that pays the vault without spending any of its
-/// notes (so the vault's own payments, their change and cancellations are not counted).
 #[derive(Debug, Clone)]
 pub struct Received {
-    /// Display (big-endian) hex, as explorers show it.
     pub txid: String,
     pub value_zat: u64,
     pub mined_height: u32,
-    /// The block's timestamp (Unix seconds), when the wallet stored that block.
     pub block_time: Option<u64>,
 }
 
-/// What a vault can pay right now, read from the local wallet database only.
 #[derive(Debug, Clone)]
 pub struct Spendability {
-    /// Every unspent note, whatever its state.
     pub total_zat: u64,
-    /// Confirmed to `confirmations_required` and not reserved by an open payment.
     pub spendable_zat: u64,
-    /// Received but not spendable yet: waiting for confirmations or for scanning.
     pub pending_zat: u64,
-    /// Held by this device's open payments.
     pub reserved_zat: u64,
-    /// The notes behind `spendable_zat`, largest first.
     pub spendable_notes: Vec<orchard::note::Note>,
     pub confirmations_required: u32,
     pub scanned_height: u32,
@@ -94,7 +83,6 @@ pub struct VaultWallet {
     network: VaultNetwork,
 }
 
-/// What the wallet's input selector chose to fund one payment.
 pub struct Funding {
     pub notes: Vec<Note>,
     pub amount_zat: u64,
@@ -221,7 +209,6 @@ impl BlockSource for Blocks<'_> {
     }
 }
 
-/// A lightwalletd endpoint: HTTPS, or plain HTTP only on this machine.
 pub fn lightwalletd_endpoint(url: &str) -> Result<tonic::transport::Endpoint, String> {
     let endpoint = tonic::transport::Endpoint::from_shared(url.to_owned())
         .map_err(|e| format!("lightwalletd URL: {e}"))?;
@@ -232,7 +219,6 @@ pub fn lightwalletd_endpoint(url: &str) -> Result<tonic::transport::Endpoint, St
     {
         return Err("lightwalletd must use HTTPS, except on localhost".into());
     }
-    // tonic needs the webpki roots configured explicitly; the https scheme alone is not TLS.
     if uri.scheme_str() == Some("https") {
         return endpoint
             .tls_config(tonic::transport::ClientTlsConfig::new().with_webpki_roots())
@@ -241,7 +227,6 @@ pub fn lightwalletd_endpoint(url: &str) -> Result<tonic::transport::Endpoint, St
     Ok(endpoint)
 }
 
-/// Agreement with the configured lightwalletd is not independent chain verification.
 pub const PROVIDER_REPORTED: &str = "provider_reported";
 
 async fn provider_tip(client: &mut Lightwalletd) -> Result<BlockHeight, String> {
@@ -260,8 +245,6 @@ async fn provider_block_hash(client: &Lightwalletd, height: BlockHeight) -> Resu
     Ok(blocks[0].hash())
 }
 
-/// The lightwalletd a member syncs from: `LOKI_LIGHTWALLETD`, or on regtest the one THS runs
-/// beside the `LOKI_RPC` node (THS shifts RPC 18232 and lightwalletd 9067 by one offset).
 pub fn lightwalletd_url(network: VaultNetwork) -> Option<String> {
     if let Ok(url) = std::env::var("LOKI_LIGHTWALLETD") {
         return Some(url);
@@ -275,15 +258,12 @@ pub fn lightwalletd_url(network: VaultNetwork) -> Option<String> {
     Some(format!("http://{host}:{port}"))
 }
 
-/// Opens this member's wallet, creating it at the vault's birth if needed, and scans it to
-/// lightwalletd's tip.
 pub async fn sync_member_wallet(
     member: &MemberState,
     owner: &Path,
     passphrase: &str,
     url: &str,
 ) -> Result<(VaultWallet, Lightwalletd), String> {
-    // rustls 0.23 has no default crypto provider; install one before any TLS handshake.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let channel = lightwalletd_endpoint(url)?
         .connect_timeout(std::time::Duration::from_secs(10))
@@ -345,8 +325,6 @@ impl VaultWallet {
         }
         let sync_lock = options.open(owner.join("wallet.sqlite.sync.lock"))
             .map_err(|e| format!("open wallet sync lock: {e}"))?;
-        // The host drops its per-request runtime on stop; a blocking OS lock would
-        // hold that shutdown open. Wait asynchronously without losing cancellation.
         loop {
             match sync_lock.try_lock() {
                 Ok(()) => break,
@@ -369,8 +347,6 @@ impl VaultWallet {
             .map_err(|e| format!("save Ironwood roots: {e}"))?;
         self.db.update_chain_tip(tip).map_err(|e| format!("save chain tip: {e}"))?;
 
-        // Follow Zakura's scan priorities, but finish and validate a bounded page before
-        // passing it to the scanner. Re-read the queue after commits or a rewind.
         let mut last_page = None;
         let mut last_rewind = None;
         while let Some(range) = self.db.suggest_scan_ranges().map_err(|e| e.to_string())?
@@ -636,8 +612,6 @@ impl VaultWallet {
         let saved = self.db.get_max_height_hash()
             .map_err(|e| format!("read wallet scan checkpoint: {e}"))?;
         let rewind = match saved {
-            // Legacy or different provider: matching block hashes would not vouch for the
-            // compact transactions the old provider supplied. Rescan from the vault birth.
             Some(_) if !matches_source => true,
             Some((height, _)) if height > tip => true,
             Some((height, hash)) => provider_block_hash(client, height).await? != hash,
@@ -694,8 +668,6 @@ impl VaultWallet {
             })
     }
 
-    /// Splits the vault's Ironwood funds into spendable now, waiting and reserved, using the same
-    /// confirmation policy and lock rules as payment funding.
     pub fn spendability(&self) -> Result<Spendability, String> {
         let policy = ConfirmationsPolicy::default();
         let scanned_height = self.scanned_height()?.ok_or("wallet has no scanned balance yet")?;
@@ -740,7 +712,6 @@ impl VaultWallet {
             .map_err(|e| format!("read Ironwood notes: {e}"))
     }
 
-    /// A payment's input notes, in nullifier order, with witnesses to `frontier` at `height`.
     pub fn ironwood_inputs_at(
         &self,
         height: BlockHeight,
@@ -766,7 +737,6 @@ impl VaultWallet {
             .collect())
     }
 
-    /// The unspent vault notes with these nullifiers at `height`, in the same order.
     fn unspent_notes(
         &self,
         height: BlockHeight,
@@ -789,9 +759,6 @@ impl VaultWallet {
             .collect()
     }
 
-    /// Funds a payment from unreserved Ironwood notes with the wallet library's ZIP 317
-    /// selector: as many notes as `amount` needs (`None` spends all spendable notes), one
-    /// change output, and the library's default confirmation depths.
     pub fn propose(
         &mut self,
         recipient: orchard::Address,
@@ -844,8 +811,6 @@ impl VaultWallet {
                 };
                 propose(&mut self.db, confirmations, NoteSelection::PreferConsolidation)
                     .map_err(|error| {
-                        // A hosted payment spends at most MAX_SPENDS notes. Check whether lowering
-                        // just the confirmation depths would fund it, without reserving any notes.
                         let covers_one_note = |db: &mut Database, policy| {
                             propose(db, policy, NoteSelection::PreferSingle).is_ok_and(|proposal| {
                                 proposal.steps().first().shielded_inputs().is_some_and(|inputs| {
@@ -911,16 +876,12 @@ impl VaultWallet {
         })
     }
 
-    /// The most one payment can send right now, or `None` when nothing is spendable or a
-    /// full sweep would need more than `max_inputs` notes.
     pub fn max_spendable(&mut self, max_inputs: usize) -> Option<u64> {
         let own = self.viewing_key().ok()?.address_at(0u64, orchard::keys::Scope::External);
         let funding = self.propose(own, None, MemoBytes::empty()).ok()?;
         (funding.notes.len() <= max_inputs).then_some(funding.amount_zat)
     }
 
-    /// Reserves a payment's inputs for `owner` until `expiry_height`, so no other proposal on
-    /// this device selects them. Fails if another owner already holds one of them.
     pub fn reserve_inputs(
         &mut self,
         owner: LockOwner,
@@ -940,8 +901,6 @@ impl VaultWallet {
         Ok(())
     }
 
-    /// Transfer a draft's locks to its finalized transaction as one write. Finishers can also
-    /// acquire unreserved inputs, and retries can renew locks already owned by this txid.
     pub fn reserve_broadcast_inputs(
         &mut self,
         attempt: LockOwner,
@@ -973,7 +932,6 @@ impl VaultWallet {
             .map_err(|e| e.to_string())
     }
 
-    /// Releases `owner`'s reservation of a payment's still-unspent inputs.
     pub fn release_inputs(&mut self, owner: LockOwner, nullifiers: &[[u8; 32]]) -> Result<(), String> {
         for output in self.input_refs(nullifiers)? {
             self.db
@@ -983,9 +941,6 @@ impl VaultWallet {
         Ok(())
     }
 
-    /// Makes this wallet's reservations match `live`, the notes that payments still in flight
-    /// spend: each is reserved for its owner until the given height unless a reservation already
-    /// holds it, and every other reservation is released.
     pub fn set_reservations(
         &mut self,
         live: &BTreeMap<[u8; 32], (LockOwner, u32)>,
@@ -1021,16 +976,12 @@ impl VaultWallet {
             }
         }
         for (nf, (owner, expiry)) in live.iter().filter(|(nf, _)| !held.contains(*nf)) {
-            // A note this wallet has not scanned yet, has seen spent, or that is past the
-            // payment's expiry is not one a new draft could select either.
             let _ = self.reserve_inputs(*owner, &[*nf], *expiry);
         }
         Ok(())
     }
 
-    /// Every deposit into the vault in scanned blocks, newest first.
     pub fn received(&mut self) -> Result<Vec<Received>, String> {
-        // The extension interface returns one row, so fold the deposits into one JSON array.
         let rows: String = self.db
             .transactionally_with_extension(|_, ext| {
                 ext.query_row(
@@ -1063,8 +1014,6 @@ impl VaultWallet {
             .collect()
     }
 
-    /// The transaction in a scanned block that spent the vault note with this nullifier, if
-    /// any. Transactions that are only in the mempool never count.
     pub fn mined_spend(&mut self, nullifier: &[u8; 32]) -> Result<Option<TxId>, String> {
         self.db
             .transactionally_with_extension(|_, ext| {
@@ -1082,7 +1031,6 @@ impl VaultWallet {
             .map_err(|e: rusqlite::Error| format!("read note spend: {e}"))
     }
 
-    /// The unspent vault note with this nullifier at the scanned height.
     pub fn unspent_note(&self, nullifier: &[u8; 32]) -> Result<Note, String> {
         let height = self
             .scanned_height()?
@@ -1482,7 +1430,6 @@ mod tests {
                 }
             })
             .collect();
-        // Funding block, then enough empty blocks for the default ten confirmations.
         let mut blocks: Vec<CompactBlock> = (0..10u8)
             .map(|i| CompactBlock {
                 height: u64::from(height) + u64::from(i),
@@ -1511,14 +1458,12 @@ mod tests {
             wallet.propose(recipient, Some(Zatoshis::const_from_u64(zat)), MemoBytes::empty())
         };
 
-        // No single 50,000 note covers 100,000, so all three are spent in one payment.
         let funding = pay(&mut wallet, 100_000).unwrap();
         assert_eq!(funding.notes.len(), 3);
         assert_eq!((funding.amount_zat, funding.fee_zat, funding.change_zat), (100_000, 15_000, 35_000));
         assert_eq!(wallet.max_spendable(3), Some(135_000));
         assert_eq!(wallet.max_spendable(2), None);
 
-        // A note reserved by another draft is not offered again.
         let reserved = notes[0].nullifier(&fvk).to_bytes();
         let draft = LockOwner::new([1; 32]);
         wallet.reserve_inputs(draft, &[reserved], height + 100).unwrap();
@@ -1526,8 +1471,6 @@ mod tests {
         let funding = pay(&mut wallet, 60_000).unwrap();
         assert_eq!(funding.notes.len(), 2);
         assert!(funding.notes.iter().all(|note| note.nullifier(&fvk).to_bytes() != reserved));
-        // Reservations follow the payments still in flight: a note one of them spends stays
-        // reserved by whoever holds it, and every other reservation is released.
         let second = notes[1].nullifier(&fvk).to_bytes();
         let other = LockOwner::new([2; 32]);
         let live = |nfs: &[[u8; 32]]| -> BTreeMap<_, _> {

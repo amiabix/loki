@@ -20,7 +20,6 @@ fn sign_driver_two_of_three_verifies_over_frostd() {
         return;
     };
 
-    // Keys via a dealer (the DKG driver has its own test); here we exercise signing.
     let (shares, pubkeys) =
         frost::keys::generate_with_dealer(3, 2, frost::keys::IdentifierList::Default, rand_core::OsRng)
             .expect("keygen");
@@ -30,7 +29,6 @@ fn sign_driver_two_of_three_verifies_over_frostd() {
         .collect();
     let ids: Vec<frost::Identifier> = key_packages.keys().copied().collect();
 
-    // Member frostd addresses, paired to FROST ids by order.
     let identities: Vec<Identity> = (1u16..=3).map(Identity::new).collect();
     let peers: Vec<Peer> = identities.iter().map(|i| Peer(i.public().encryption)).collect();
     let peer_of: BTreeMap<frost::Identifier, Peer> = ids.iter().copied().zip(peers.iter().cloned()).collect();
@@ -39,7 +37,6 @@ fn sign_driver_two_of_three_verifies_over_frostd() {
     let signer_peers: Vec<Peer> = signers.iter().map(|id| peer_of[id].clone()).collect();
     let message: &[u8] = b"loki payment sighash (test)";
 
-    // Coordinator opens the session listing the two signers; signers join by its id.
     let coord = Identity::new(9);
     let coord_secret: [u8; 32] = coord.to_secret_bytes()[34..].try_into().unwrap();
     let mut coord_tx =

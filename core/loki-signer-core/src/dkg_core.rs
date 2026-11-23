@@ -1,32 +1,3 @@
-//! Shared DKG core for the hosted setup engine and the new signer (v2 setup format).
-//!
-//! A pure state machine: no storage, no I/O. It takes a [`ValidatedRoster`] and this
-//! member's [`Identity`], consumes the peers' messages for the current phase and returns
-//! the next state together with the exact outgoing messages, keyed by recipient. Callers
-//! save the returned state before they release any outgoing message, and resend saved
-//! bytes on a repeated request instead of calling the core again.
-//!
-//! Phases and messages:
-//! 1. **Round 1.** A random contribution, a [`FreshKey`] and FROST part 1. The body is
-//!    `commitment(contribution) || fresh public key || FROST round-one package`, signed
-//!    with the identity key (`LOKIR1V1`) and sent to every member.
-//! 2. **Round 2.** Every peer's round-one signature is verified against the roster. The
-//!    round-one transcript is `Round2Member::transcript` (FROST packages only). For each
-//!    peer, `contribution || FROST round-two package` is sealed in a v2 envelope
-//!    ([`Identity::seal_round2_v2`]) between the two fresh keys, binding the transcript.
-//! 3. **Finish.** Each envelope is verified and opened, its transcript must equal ours,
-//!    each contribution must match its round-one commitment, FROST part 3 runs and the
-//!    vault secret `vs` is computed. The certificate is signed and sent to every member.
-//!    The fresh key is not carried into this state.
-//! 4. **Certified.** Every member's certificate must equal ours.
-//!
-//! Any mismatch is final: the caller aborts and never re-fetches and retries.
-//!
-//! What the transcript catches: a member that equivocates on its FROST round-one package
-//! is caught at round two. Equivocation on the contribution commitment is caught at
-//! certificates through the `vs` hash. Equivocation on the fresh public key only makes the
-//! setup fail.
-
 use std::collections::BTreeMap;
 
 use reddsa_frost::frost::redpallas::{self as frost, keys::EvenY};
@@ -43,10 +14,8 @@ use crate::{
 const ERROR: &str = "setup_ceremony";
 const STATE_MAGIC: &[u8; 8] = b"LOKIDKS2";
 const MAX_WIRE: usize = 66 * 1024;
-/// Commitment plus fresh public key, in front of the FROST round-one package.
 const ROUND1_PREFIX: usize = 64;
 
-/// Where one member's DKG is. `Empty` is the state before round one and after a wipe.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum DkgPhase {
@@ -70,22 +39,17 @@ impl DkgPhase {
     }
 }
 
-/// One member's saved DKG state. Secret fields are zeroized on drop.
 pub struct DkgState {
     phase: DkgPhase,
     contribution: Zeroizing<[u8; 32]>,
     fresh: Option<FreshKey>,
     dkg: Zeroizing<Vec<u8>>,
-    /// Signed round-one wires, ours included.
     round1: BTreeMap<u16, Vec<u8>>,
-    /// The v2 envelopes each peer addressed to us, as received (encrypted).
     round2: BTreeMap<u16, Vec<u8>>,
-    /// Signed certificates, ours included.
     certificates: BTreeMap<u16, Vec<u8>>,
     vs: Zeroizing<[u8; 32]>,
 }
 
-/// Outgoing messages keyed by recipient member id.
 pub type Outgoing = BTreeMap<u16, Vec<u8>>;
 
 pub(crate) fn digest(personal: &[u8], parts: &[&[u8]]) -> [u8; 32] {
@@ -111,7 +75,6 @@ fn field(out: &mut Vec<u8>, value: &[u8], limit: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// Encode a member-id map with at most [`MAX_MEMBERS`] entries and ids `1..=MAX_MEMBERS`.
 pub fn encode_map(out: &mut Vec<u8>, values: &BTreeMap<u16, Vec<u8>>) -> Result<(), String> {
     if values.len() > usize::from(MAX_MEMBERS) {
         return Err(ERROR.into());
@@ -127,7 +90,6 @@ pub fn encode_map(out: &mut Vec<u8>, values: &BTreeMap<u16, Vec<u8>>) -> Result<
     Ok(())
 }
 
-/// A bounds-checked reader for the state and snapshot encodings.
 pub struct Reader<'a> {
     raw: &'a [u8],
     offset: usize,
@@ -198,7 +160,6 @@ impl DkgState {
         self.phase
     }
 
-    /// Whether this state still holds the fresh setup key.
     pub fn has_fresh_key(&self) -> bool {
         self.fresh.is_some()
     }
@@ -215,7 +176,6 @@ impl DkgState {
         &self.certificates
     }
 
-    /// The FROST `Completed` checkpoint (share and group key), from the certificate phase on.
     pub(crate) fn completed_checkpoint(&self) -> Result<Zeroizing<Vec<u8>>, String> {
         if (self.phase as u8) < DkgPhase::Certificate as u8 {
             return Err(ERROR.into());
@@ -223,13 +183,10 @@ impl DkgState {
         Ok(self.dkg.clone())
     }
 
-    /// The vault viewing secret agreed at finish. Zero before then.
     pub fn vault_secret(&self) -> &[u8; 32] {
         &self.vs
     }
 
-    /// Zeroize every secret and drop the fresh key, keeping the received messages as
-    /// history. Used on abort, cancel, timeout and terminal states.
     pub fn wipe(&mut self) {
         self.phase = DkgPhase::Empty;
         zeroize::Zeroize::zeroize(&mut *self.dkg);
@@ -239,7 +196,6 @@ impl DkgState {
         self.fresh = None;
     }
 
-    /// A deep copy, for transitions that must not touch the saved state on failure.
     pub fn duplicate(&self) -> Self {
         Self {
             phase: self.phase,
@@ -282,7 +238,6 @@ impl DkgState {
             Zeroizing::new(<[u8; 32]>::try_from(reader.take(32)?).map_err(|_| ERROR)?);
         let fresh_bytes =
             Zeroizing::new(<[u8; 32]>::try_from(reader.take(32)?).map_err(|_| ERROR)?);
-        // An all-zero field means the fresh key was removed (or never created).
         let fresh = (*fresh_bytes != [0; 32]).then(|| FreshKey::from_secret_bytes(&fresh_bytes));
         let dkg = Zeroizing::new(reader.field(64 * 1024)?.to_vec());
         let round1 = reader.map()?;
@@ -305,7 +260,6 @@ impl DkgState {
 
 #[cfg(any(test, feature = "test-support"))]
 impl DkgState {
-    /// A state filled with recognizable non-zero bytes, for storage-format tests.
     pub fn filled_for_tests(phase: DkgPhase, fill: u8) -> Self {
         let mut state = Self::empty();
         state.phase = phase;
@@ -316,7 +270,6 @@ impl DkgState {
         state
     }
 
-    /// Whether every secret is gone (zeroized contribution, `vs`, FROST state, fresh key).
     pub fn is_wiped(&self) -> bool {
         self.dkg.is_empty()
             && *self.contribution == [0; 32]
@@ -329,21 +282,18 @@ impl DkgState {
     }
 }
 
-/// A verified round-one body.
 struct Round1Body {
     commitment: [u8; 32],
     fresh: [u8; 32],
     frost: Vec<u8>,
 }
 
-/// The DKG core for one member of one validated roster.
 pub struct DkgCore<'a> {
     roster: &'a ValidatedRoster,
     identity: &'a Identity,
 }
 
 impl<'a> DkgCore<'a> {
-    /// The identity must appear in the roster, keys and all, under its member number.
     pub fn new(roster: &'a ValidatedRoster, identity: &'a Identity) -> Result<Self, String> {
         if roster.members.get(&identity.public().id) != Some(&identity.public()) {
             return Err(ERROR.into());
@@ -411,8 +361,6 @@ impl<'a> DkgCore<'a> {
             .collect()
     }
 
-    /// Keep exactly one message from every peer; our own entry, if present, must already
-    /// have been compared with what we sent.
     fn peer_records<'r>(
         &self,
         records: &'r BTreeMap<u16, Vec<u8>>,
@@ -431,8 +379,6 @@ impl<'a> DkgCore<'a> {
         Ok(peers)
     }
 
-    /// Round one: contribution, fresh key and FROST part 1. Returns the state to save
-    /// and the signed round-one wire for every member.
     pub fn start(&self) -> Result<(DkgState, Outgoing), String> {
         let mut state = DkgState::empty();
         rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut *state.contribution);
@@ -456,7 +402,6 @@ impl<'a> DkgCore<'a> {
         Ok((state, self.broadcast(&wire)))
     }
 
-    /// Advance by one phase with every peer's message for the current phase.
     pub fn advance(
         &self,
         state: &DkgState,
@@ -506,8 +451,6 @@ impl<'a> DkgCore<'a> {
                     .map_err(|_| ERROR)?,
             );
         }
-        // Our own copy is a signed transcript, so the hosted relay sees one record per
-        // member in every phase.
         wires.insert(
             self.own(),
             self.identity
@@ -569,7 +512,6 @@ impl<'a> DkgCore<'a> {
         next.dkg = completed.checkpoint()?;
         next.round1 = state.round1.clone();
         next.round2 = records.iter().map(|(id, w)| (*id, w.to_vec())).collect();
-        // The fresh key is not carried forward: the certificate state never holds it.
         let body = self.certificate_body_for(&completed, &next.vs);
         let wire = self
             .identity
@@ -615,8 +557,6 @@ impl<'a> DkgCore<'a> {
         body
     }
 
-    /// The body every member's certificate must carry: certificate digest, `vs` digest,
-    /// roster fingerprint and ZIP 2005 version.
     pub fn certificate_body(&self, state: &DkgState) -> Result<Vec<u8>, String> {
         if (state.phase as u8) < DkgPhase::Certificate as u8 {
             return Err(ERROR.into());
@@ -625,7 +565,6 @@ impl<'a> DkgCore<'a> {
         Ok(self.certificate_body_for(&completed, &state.vs))
     }
 
-    /// The certified share and group key. Available once every certificate matched.
     pub fn certified(&self, state: &DkgState) -> Result<Certified, String> {
         if state.phase != DkgPhase::Certified {
             return Err("setup_certificates_pending".into());
@@ -636,7 +575,6 @@ impl<'a> DkgCore<'a> {
         completed.certify(&digests)
     }
 
-    /// The vault's unified receive address, derived from the group key and `vs`.
     pub fn address(&self, state: &DkgState) -> Result<String, String> {
         let mut certified = self.certified(state)?;
         let _secret = Zeroizing::new(std::mem::take(&mut certified.key_package));
@@ -647,8 +585,6 @@ impl<'a> DkgCore<'a> {
         ))
     }
 
-    /// The 32-byte body each member signs as its backup receipt (`sign_backup`): vault,
-    /// roster fingerprint, group key, ZIP 2005 version, `vs` and the receive address.
     pub fn backup_body(&self, state: &DkgState) -> Result<[u8; 32], String> {
         let mut certified = self.certified(state)?;
         let _secret = Zeroizing::new(std::mem::take(&mut certified.key_package));
@@ -666,8 +602,6 @@ impl<'a> DkgCore<'a> {
         ))
     }
 
-    /// Reopen checks for a saved state. From the certificate phase on nothing is
-    /// decrypted: the fresh key no longer exists there.
     pub fn validate(&self, state: &DkgState) -> Result<(), String> {
         let own = self.own();
         for values in [&state.round1, &state.round2, &state.certificates] {
@@ -751,8 +685,6 @@ impl<'a> DkgCore<'a> {
                     .iter()
                     .map(|(id, package)| (*id, package.commitment()))
                     .collect();
-                // Even-Y is mandatory: part 3 normalizes the group key, so the recomputed
-                // key must be normalized the same way or half of all vaults fail here.
                 let public = frost::keys::PublicKeyPackage::from_dkg_commitments(&commitments)
                     .map_err(|_| ERROR)?
                     .into_even_y(None);
@@ -801,7 +733,6 @@ impl<'a> DkgCore<'a> {
     }
 }
 
-/// `Round2Member::transcript`, recomputed from the authenticated FROST round-one packages.
 fn round1_transcript(packages: &BTreeMap<u16, Vec<u8>>) -> [u8; 32] {
     let mut hash = blake2b_simd::Params::new()
         .hash_length(32)
@@ -818,7 +749,6 @@ fn round1_transcript(packages: &BTreeMap<u16, Vec<u8>>) -> [u8; 32] {
         .expect("32 byte digest")
 }
 
-/// Plaintext FROST round-two packages, wiped on drop.
 struct SecretPackages(BTreeMap<u16, Vec<u8>>);
 
 impl Drop for SecretPackages {

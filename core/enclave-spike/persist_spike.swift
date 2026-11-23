@@ -22,14 +22,14 @@ func createPersistentEnclaveKey() -> SecKey {
         kSecAttrTokenID as String: kSecAttrTokenIDSecureEnclave,
         kSecUseDataProtectionKeychain as String: true,
         kSecPrivateKeyAttrs as String: [
-            kSecAttrIsPermanent as String: true,          // <- persist across launches (needs signing)
+            kSecAttrIsPermanent as String: true,
             kSecAttrApplicationTag as String: tag,
             kSecAttrAccessControl as String: access,
         ],
     ]
     var err: Unmanaged<CFError>?
     guard let k = SecKeyCreateRandomKey(attrs as CFDictionary, &err) else {
-        fail("create persistent SE key: \(err!.takeRetainedValue())")   // -34018 when unsigned
+        fail("create persistent SE key: \(err!.takeRetainedValue())")
     }
     return k
 }
@@ -50,7 +50,6 @@ func loadPersistentEnclaveKey() -> SecKey {
 
 let algo = SecKeyAlgorithm.eciesEncryptionCofactorX963SHA256AESGCM
 
-// INIT: create + persist the Enclave KEK, wrap a DEK.
 let created = createPersistentEnclaveKey()
 guard let pub = SecKeyCopyPublicKey(created) else { fail("pub") }
 var dek = Data(count: 32)
@@ -58,7 +57,6 @@ _ = dek.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 32, $0.ba
 guard let wrapped = SecKeyCreateEncryptedData(pub, algo, dek as CFData, nil) as Data? else { fail("wrap") }
 print("OK  init: persistent Secure Enclave KEK created; DEK wrapped (\(wrapped.count)B)")
 
-// NEXT LAUNCH: reload the SAME key by tag, unwrap the DEK.
 let reloaded = loadPersistentEnclaveKey()
 guard let got = SecKeyCreateDecryptedData(reloaded, algo, wrapped as CFData, nil) as Data? else { fail("unwrap after reload") }
 guard got == dek else { fail("round-trip mismatch after reload") }

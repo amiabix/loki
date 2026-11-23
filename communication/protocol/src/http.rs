@@ -135,7 +135,6 @@ pub fn decode_creation_result(encoded: &[u8], created: bool) -> WireResult<(Id32
     let value = decode_metadata(encoded)?;
     let f = array(&value, 5)?;
     version(&f[0])?;
-    // The HTTP status supplies creation versus retry; the CBOR array has no boolean.
     Ok((
         id32(&f[1])?,
         CreationResult {

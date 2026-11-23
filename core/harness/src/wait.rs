@@ -1,8 +1,6 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Check immediately, then poll local readiness every 20 ms until the deadline.
-/// Returns elapsed time on success or timeout.
 pub fn until(deadline: Instant, mut ready: impl FnMut() -> bool) -> Result<Duration, Duration> {
     let start = Instant::now();
     loop {

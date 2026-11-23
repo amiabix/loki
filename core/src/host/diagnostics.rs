@@ -1,29 +1,21 @@
-//! Fixed diagnostic events for the native app's log file. Each one maps to our own wording;
-//! no coordinator, relay or peer text, address, amount or vault name is ever logged.
-// Only the native app has a log sink; other builds still type-check every event.
 #![cfg_attr(not(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))), allow(dead_code))]
 
 pub(super) use super::registration::Refusal;
 
-/// Why a draft could not be funded, recognised from the host's own error text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum DraftRefusal { WaitingForConfirmations, NoSingleNote, InsufficientFunds, Other }
 
-/// Why a signing attempt ended, without any peer or coordinator text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PaymentFailure { ApprovalTimeout, Refused, ShareDeadline, Other }
 
-// The file sink accepts only these messages, never a coordinator response, request or secret.
 pub(super) enum Event {
     Registered,
     RegistrationFailed,
     CoordinatorUnavailable,
     RegistrationRefused(Refusal),
     RegistrationKeyUnavailable,
-    /// A relay (frostd) sync failed. Logged once until the relay is reachable again.
     RelayUnavailable,
     RelayReachable,
-    /// A lightwalletd scan failed. Logged once until a scan succeeds again.
     WalletSyncFailed,
     WalletSynced,
     DraftRefused(DraftRefusal),
@@ -35,11 +27,8 @@ pub(super) enum Event {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Kind {
-    /// Logged.
     Info,
-    /// Logged and shown as the launch's last error.
     Error,
-    /// Logged only on a change between failing and working.
     Failing,
     Recovered,
 }
@@ -81,7 +70,6 @@ impl Event {
         }
     }
 
-    /// Which repeating condition a failing or recovered event belongs to.
     pub(super) fn condition(&self) -> Option<usize> {
         match self {
             Event::RelayUnavailable | Event::RelayReachable => Some(0),

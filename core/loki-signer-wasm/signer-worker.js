@@ -1,20 +1,3 @@
-// Module Web Worker hosting the stateful in-browser signer (Phase A: profile lifecycle).
-//
-// The signing/DKG core is synchronous and persists to OPFS through synchronous access
-// handles, which exist ONLY inside a Worker and must be acquired asynchronously FIRST. So
-// this worker owns the pre-open protocol: before each synchronous `Signer` call it awaits
-// `opfsPreopen{Write,Read}` on exactly the deterministic paths that op touches, then calls
-// the sync wasm method. The path set is `devicePaths()` from the wasm module — one source
-// of truth, no drift.
-//
-//   createSigner  preopenWrite: identity.sealed, profile.json, (passphrase) kek.salt
-//   hasSigner     preopenRead:  identity.sealed
-//   unlock        preopenRead:  identity.sealed, profile.json, (passphrase) kek.salt
-//   lock          no I/O
-//
-// One worker per page lifetime: OPFS sync handles are exclusive, so a single long-lived
-// Signer instance holds them; a page reload terminates it and releases them.
-
 import init, { Signer, devicePaths, vaultPaths } from "./pkg/loki_signer_wasm.js";
 import {
   opfsPreopenWrite as preopenWriteOnce,
@@ -25,9 +8,6 @@ import { blockRange, latestHeight } from "./lightwalletd.js";
 import { controlInbox, endsRequest, idbStore, MAX_CONTROL_SESSIONS } from "./control-inbox.js";
 import { vaultSummary, saveVaultName, readVaultName } from "./vault-list.js";
 
-// Ops run concurrently (a status read during a join), and two pre-opens of one path racing
-// would each try to take its exclusive sync handle; the second throws. Share one in-flight
-// pre-open per path instead.
 const inflight = new Map();
 function shared(open) {
   return (path) => {
@@ -40,14 +20,10 @@ const opfsPreopenWrite = shared(preopenWriteOnce);
 const opfsPreopenRead = shared(preopenReadOnce);
 
 const ready = init().then(() => {
-  const P = JSON.parse(devicePaths()); // { identity, profile, salt, recovery }
+  const P = JSON.parse(devicePaths());
   return { signer: new Signer(), P };
 });
 
-// The frostd transport is a SEPARATE wasm module (core/wasm-transport) so its reqwest dep tree
-// stays isolated from the signer core. It is loaded lazily, and only from its pinned path on
-// this (the signer) origin — never from a caller-supplied URL — so lifecycle-only pages never
-// fetch it and no page can swap the code that runs beside the signer.
 const TRANSPORT_URL = new URL("./wasm-transport/pkg/loki_wasm_transport.js", import.meta.url).href;
 let transport = null;
 async function loadTransport() {
@@ -62,9 +38,6 @@ async function loadFrostd() {
   return (await loadTransport()).FrostdClient;
 }
 
-// Claim this signature's nonce at BOTH external witnesses (fresh, pinned-key receipts verified
-// in wasm-transport), then tell the signer; the core's witness check in signApprove accepts
-// only that claim. A duplicate at either relay (a nonce already used) refuses the signature.
 async function claimAtWitnesses(signer, witnesses, attemptHex, spend, packageHex, seedHex, sighashHex) {
   const { cid, record, pins } = JSON.parse(signer.nonceClaim(attemptHex, spend, packageHex, seedHex, sighashHex));
   const routes = pins.map((pin) => witnesses.find((w) =>
@@ -83,8 +56,6 @@ async function claimAtWitnesses(signer, witnesses, attemptHex, spend, packageHex
   signer.nonceClaimed(cid, record);
 }
 
-// Testnet NU5 (Orchard) activation height (zakura-protocol consensus.rs, TestNetwork). No
-// Orchard vault can be born below it.
 const TESTNET_NU5_HEIGHT = 1_842_420;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -108,8 +79,6 @@ async function postJson(url, body) {
   return data;
 }
 
-// Retry `fn` until it resolves (the creator's roster/session endpoints 404 "pending" until
-// every member has enrolled/agreed), bounded so a stalled ceremony fails instead of hanging.
 async function poll(fn, p) {
   const pollMs = Number(p.joinPollMs) || 500;
   const max = Number(p.joinMaxTicks) || 240;
@@ -125,9 +94,6 @@ async function poll(fn, p) {
   throw lastErr ?? new Error("ceremony step timed out");
 }
 
-// One join request to the creator over frostd, as native joiners send it (ceremony.rs
-// `relay_request`): a session of this member and the creator, the request sealed to the creator
-// in wasm (the invite token never crosses the relay in the clear), and the creator's sealed reply.
 async function relayRequest(signer, fc, invite, op) {
   const { vault, slot, token, creator } = invite;
   const creatorJson = JSON.stringify(creator);
@@ -150,22 +116,12 @@ async function relayRequest(signer, fc, invite, op) {
   }
 }
 
-// Decode a creator invite and run the native joiner dance with the creator's member app
-// (core/src/host/ceremony.rs: enroll → poll roster → agree → poll session), then hand the
-// assembled DKG params to driveDkg. An invite naming the creator's identity goes over frostd
-// (relayRequest); an older one POSTs the token-authenticated endpoints the creator CORS-opens
-// for browser joiners (routes.rs `browser_origin`). The setup
-// document the creator feeds its own dkg_begin is rebuilt here from the polled roster — the
-// roster fingerprint is over PARSED content (member_state::Roster::fingerprint), so field/byte
-// order is irrelevant and only the values must match.
 async function joinCeremony(signer, p) {
   const invite = JSON.parse(new TextDecoder().decode(b64urlToBytes(p.invite)));
   const base = invite.creator_base_url.replace(/\/+$/, "");
   const { vault, slot, token, threshold, name } = invite;
   const network = p.network ?? "testnet";
 
-  // Our enrolled identity at the target slot: the device signing/relay keys (slot-independent;
-  // restamp only overwrites the id bytes) stamped with the slot id. Needs the signer unlocked.
   const material = JSON.parse(signer.enrollMaterial());
   const identity = { id: slot, signing: material.signing_pubkey, encryption: material.relay_pubkey };
   const auth = { vault, slot, token };
@@ -176,26 +132,19 @@ async function joinCeremony(signer, p) {
     : postJson(`${base}/api/${op}`, op === "enroll" ? { ...auth, identity } : auth);
   await request("enroll");
 
-  // Poll until the full roster is published (fingerprint present).
   const rosterResp = await poll(() => request("roster"), p);
   const roster = rosterResp.roster;
 
-  // The creator must not have swapped our slot's identity.
   const mine = roster[String(slot)];
   if (!mine || mine.signing !== identity.signing || mine.encryption !== identity.encryption) {
     throw new Error("creator roster changed this member's identity");
   }
 
-  // Rebuild the creator's setup document (setup_version 2), members sorted by slot. The
-  // testnet birth_height is NOT reconstructed from a guessed tip (it would mismatch the
-  // creator's and the DKG setup certificate would be refused) — it is adopted from the
-  // creator's published session below, so the document matches byte-for-byte.
   const members = Object.keys(roster)
     .map(Number)
     .sort((a, b) => a - b)
     .map((s) => ({ id: s, signing: roster[String(s)].signing, encryption: roster[String(s)].encryption }));
 
-  // The member sees EVERY member before telling the creator it agrees, not just its own slot.
   if (!Number.isSafeInteger(threshold) || threshold < 1 || threshold > members.length) {
     throw new Error("the invite's threshold does not fit the roster");
   }
@@ -203,7 +152,6 @@ async function joinCeremony(signer, p) {
     throw new Error("You rejected this vault's members");
   }
 
-  // Agree, then poll for the creator's frostd session + coordinator relay peer (+ birth_height).
   await request("agreed");
   const session = await poll(
     () =>
@@ -214,10 +162,6 @@ async function joinCeremony(signer, p) {
     p,
   );
 
-  // The creator's birth height: it is inside the roster fingerprint, so every member's roster
-  // code differs if the creator gave members different heights. Here it must at least be a
-  // real Orchard-era Testnet height. ponytail: no upper bound — the browser has no chain
-  // source to compare against; add one when the signer can reach a lightwalletd.
   const doc = { vault, threshold, setup_version: 2, network, members };
   if (network === "testnet") {
     const height = Number(session.birth_height);
@@ -243,21 +187,12 @@ async function joinCeremony(signer, p) {
   });
 }
 
-// Drive this member through create-or-reopen → confirm roster → DKG rounds ↔ frostd → backup
-// → active, then release the vault address. The signer core is synchronous (vaultJoin/vaultStep/
-// vaultBackup/vaultReady/vaultAddress); this loop owns the async frostd pump. The coordinator
-// (a roster member running the frostd relay) forwards each member's wires to its peers; this
-// member only ever sends to the coordinator and keeps the coordinator's relayed wires.
 async function driveDkg(signer, p) {
   const { slot, label, network, rosterHex, frostdUrl, coordinatorPeer, sessionId } = p;
   const vaultHex = await vaultPathId(p.vaultHex);
   for (const path of JSON.parse(vaultPaths(vaultHex))) await opfsPreopenWrite(path);
-  // The backup also seals to the recovery public key; without one vaultJoin refuses.
   await opfsPreopenRead(JSON.parse(devicePaths()).recovery);
 
-  // The 24-digit roster code, computed by the signer from the exact roster it will confirm,
-  // shown on the signer page for the member to compare with every other member. vaultJoin's
-  // roster prompt answers Match only for the code the member confirmed here.
   const roster = Uint8Array.from(rosterHex.match(/../g).map((b) => parseInt(b, 16)));
   const code = signer.rosterCode(roster);
   if (await ask("roster-code", { code, birth_height: p.birthHeight ?? null }) !== true) {
@@ -284,8 +219,6 @@ async function driveDkg(signer, p) {
   return { vault: vref.vault_id, address: signer.vaultAddress() };
 }
 
-// Reopen this browser's signer for an active vault from its own stored state. Every member
-// key the payment flow uses comes from the roster this member confirmed at setup.
 async function openVault(signer, vaultHex) {
   const vault = await openVaultAny(signer, vaultHex);
   if (!vault.ready) throw new Error("this vault is not active yet");
@@ -313,7 +246,6 @@ async function vaultPathId(id) {
   return existing ?? canonical;
 }
 
-// Trial decryption and checkpoint matching only establish what the configured provider reported.
 async function chainScan(signer, p) {
   const source = p.lightwalletdGrpcWeb;
   if (!source) throw new Error("This signer has no lightwalletd gRPC-web endpoint configured, so it cannot read the chain");
@@ -329,7 +261,6 @@ async function chainScan(signer, p) {
     if (saved > tip || !(await matchesCheckpoint(saved))) signer.scanReset();
     else checkedTip = saved === tip;
   }
-  // A reorg may also happen after the checkpoint read. Retry once from vault birth.
   for (let rescanned = false; ;) {
     try {
       for (let next = signer.scanNext(); next <= tip; next = signer.scanNext()) {
@@ -351,7 +282,6 @@ async function chainScan(signer, p) {
   return { tip, ...result, chain_trust: "provider_reported" };
 }
 
-// Local decisions and checked effects, never the proposer's claimed approval or txid.
 let paymentRecords;
 async function paymentRecord(key, record) {
   paymentRecords ??= new Promise((resolve, reject) => {
@@ -373,12 +303,8 @@ async function paymentKey(signer, notice) {
   const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(scope)));
   return btoa(String.fromCharCode(...hash));
 }
-// paymentCheck only accepts an Ironwood-only v6 candidate. Its shielded sighash is its
-// effects txid in wire byte order (ZIP 233); the display txid reverses those bytes.
 const reviewedTxid = (review) => review.sighash.match(/../g).reverse().join("");
 
-// A payment's status for the wallet: relay terms, this member's own decision, and the
-// chain's spend as separate facts. Only matching checked effects identify the attempt.
 async function paymentStatus(signer, p) {
   const vault = await openVault(signer, p.vaultHex);
   const control = await frostdClient(signer, p);
@@ -392,11 +318,10 @@ async function paymentStatus(signer, p) {
   const spent = JSON.parse(signer.scanSpentBy(terms.note_selection[0]));
   let txid = record.txid ?? null;
   if (spent && !txid && signed) {
-    // An authenticated copy supplies candidate effects, not proof of a broadcast or approval.
     try {
       const review = JSON.parse(signer.paymentCheck(signed.pczt, JSON.stringify({ ...terms, tx_expiry: signed.intent.signing_expiry })));
       if (reviewedTxid(review) === spent.txid) txid = spent.txid;
-    } catch { /* An unchecked copy cannot identify the spend. */ }
+    } catch { }
     if (txid) {
       await paymentRecord(key, { ...record, txid });
     }
@@ -405,8 +330,6 @@ async function paymentStatus(signer, p) {
   return { terms, signers, ended, closed, spent, txid, approved: record.approved === true, slot: vault.slot, chain_trust };
 }
 
-// The terms a proposer announced for this payment, read-only: nothing is approved or sent.
-// The wallet shows them before the member opens the approval on the signer page.
 async function paymentTerms(signer, p) {
   const vault = await openVault(signer, p.vaultHex);
   const control = await frostdClient(signer, p);
@@ -414,8 +337,6 @@ async function paymentTerms(signer, p) {
   return { review_token: p.attemptHex, recipient: t.recipient, amount_zat: String(t.amount_zat), fee_zat: String(t.fee_zat), memo: t.memo };
 }
 
-// Log in to frostd without the relay secret ever reaching JS: the transport fetches the
-// challenge, the wasm signer XEdDSA-signs it, and only the signature crosses back.
 async function frostdClient(signer, p) {
   const Client = await loadFrostd();
   const fc = new Client(p.frostdUrl, signer.frostdPubkey());
@@ -425,9 +346,7 @@ async function frostdClient(signer, p) {
 }
 
 const controlHistory = controlInbox(idbStore());
-// These are control states, not evidence of a finalized or mined transaction.
 const noticeOrder = ["intent", "start", "signed", "broadcast", "confirmed", "failed", "cancelled"];
-// PeerReply permits a 64 KiB body, which can round up to a 128 KiB sealed bucket.
 const MAX_CONTROL_WIRE = 2 * (128 * 1024 + 53);
 const MAX_CONTROL_BATCH = 256;
 const hex32 = (s) => typeof s === "string" && /^[0-9a-f]{64}$/.test(s);
@@ -456,7 +375,6 @@ function openNotice(signer, vault, sessionId, owner, wire) {
     const validGroup = i.signers.length === vault.threshold
       && i.signers[0] === from && new Set(i.signers).size === vault.threshold
       && i.signers.every((slot) => vault.members.some((m) => m.id === slot));
-    // Older starts did not fix a separate expiry; they used the approved bound.
     const fixesGroup = kind === "start" || kind === "signed";
     const expiry = i.signing_expiry ?? (fixesGroup ? i.expiry_height : undefined);
     if ((i.signers.length || fixesGroup) && !validGroup
@@ -464,8 +382,6 @@ function openNotice(signer, vault, sessionId, owner, wire) {
     const sent = kind === "signed" || kind === "broadcast" || kind === "confirmed";
     if ((sent || txid != null) && !hex32(txid)) return null;
     if (kind === "signed" && (!txHex(pczt) || !txHex(raw_tx))) return null;
-    // This projection matches the native hash's immutable fields; phase, group and actual
-    // signing expiry are excluded. Compare the terms too, not just the proposer's hash label.
     const intent = {
       vault: i.vault, attempt: i.attempt, proposer: from, session_id: i.session_id, control_session_id: sessionId,
       recipient: i.recipient, memo: i.memo, amount_zat: i.amount_zat, fee_zat: i.fee_zat, change_zat: i.change_zat,
@@ -478,7 +394,7 @@ function openNotice(signer, vault, sessionId, owner, wire) {
       termsKey: JSON.stringify(intent),
       intent: { ...intent, phase: i.phase, signers: i.signers, signing_expiry: expiry },
     };
-  } catch { return null; } // Authentication or decoding failed.
+  } catch { return null; }
 }
 
 function selectNotices(signer, vault, sessionId, owner, wires) {
@@ -509,8 +425,6 @@ function controlOwner(vault, info) {
   return vault.members.find((m) => m.id !== vault.slot && m.encryption === info.coordinator);
 }
 
-// Match the whole roster before draining. If two local vaults share a roster, try the other
-// vault before discarding its one-shot notice; the sealed envelope binds the actual vault.
 async function readControl(signer, control, vault, sessionId, owner, scope, info) {
   let reduced = null;
   await controlHistory([scope, sessionId], async (saved, markDraining) => {
@@ -535,8 +449,6 @@ async function readControl(signer, control, vault, sessionId, owner, scope, info
       }
     }
     const wires = [...unique.values()];
-    // Only a fresh copy of the selected notice can clear an interrupted drain. In
-    // particular, receiving an old intent must not make a cached start signable again.
     const reannounced = ({ notice }, target, proposer) => fresh.slice(0, MAX_CONTROL_BATCH).some((wire) => {
       if (wire?.from !== proposer.encryption || !unique.has(wire.message)) return false;
       const event = openNotice(signer, target, sessionId, proposer, wire);
@@ -546,7 +458,6 @@ async function readControl(signer, control, vault, sessionId, owner, scope, info
     });
     const record = (name, state, draining) => ({
       vault: name, wires: state.wires, blocked, draining,
-      // Don't discard legacy data if only a prefix could be checked.
       migrated: !blocked && !saved.vault && saved.wires.some((w) => state.wires.some((m) => m.message === w?.message)),
     });
     reduced = selectNotices(signer, vault, sessionId, owner, wires);
@@ -566,8 +477,6 @@ async function readControl(signer, control, vault, sessionId, owner, scope, info
     }
     if (!reduced) return blocked && !saved.blocked ? { ...saved, blocked } : saved;
     const draining = !!saved.draining && !reannounced(reduced, vault, owner);
-    // Keep newly authenticated wires even while signing is blocked. An interrupted drain
-    // must still accept later notices, unlike a session that exceeded the wire budget.
     reduced.blocked = blocked || draining;
     if (!saved.draining && saved.vault && blocked === saved.blocked && reduced.wires.length === saved.wires.length
       && reduced.wires.every((wire, i) => wire.message === saved.wires[i].message)) return saved;
@@ -586,7 +495,6 @@ async function controlSessions(control, scope) {
   return live;
 }
 
-// A signing session has a one-shot coordinator, not a confirmed vault member.
 async function findPayment(signer, control, vault, p) {
   const { attemptHex, proposer } = p;
   if (!Number.isInteger(proposer) || proposer === vault.slot || !vault.members.some((m) => m.id === proposer)) {
@@ -618,9 +526,6 @@ async function findPayment(signer, control, vault, p) {
   throw new Error("this payment was not found on the relay; it may be finished, cancelled or for another vault");
 }
 
-// Payments other members proposed in this vault that still want this member: one pass over the
-// relay's control sessions, read like findPayment. The proposer sends its notice once at publish
-// and again only after it approves, so a request stays listed from the notices readControl kept.
 async function listPending(signer, vaultHex, p) {
   const vault = await openVault(signer, vaultHex);
   const control = await frostdClient(signer, p);
@@ -643,17 +548,15 @@ async function listPending(signer, vaultHex, p) {
   const requests = [...pending.values()].filter(Boolean);
   if (!requests.length) return [];
   await chainScan(signer, p);
-  // A spent input ends this request's opportunity to sign, but doesn't identify the payment.
   return requests.flatMap(({ note, ...request }) => JSON.parse(signer.scanSpentBy(note)) ? [] : [request]);
 }
 
 async function vaultDirectory() {
   try {
     return await (await (await navigator.storage.getDirectory()).getDirectoryHandle("loki")).getDirectoryHandle("vaults");
-  } catch { return null; } // no vault yet
+  } catch { return null; }
 }
 
-// Every vault this browser holds a signer for, from its own OPFS (loki/vaults/<id>/signer).
 async function listVaults(signer) {
   const dir = await vaultDirectory();
   if (!dir) return [];
@@ -661,7 +564,7 @@ async function listVaults(signer) {
   for await (const [name, h] of dir.entries()) {
     if (h.kind !== "directory" || !/^[0-9a-f]{64}$/i.test(name)) continue;
     let v;
-    try { v = await openVaultAny(signer, name); } catch { continue; } // setup never started
+    try { v = await openVaultAny(signer, name); } catch { continue; }
     out.push(vaultSummary(v, await readVaultName(h)));
   }
   return out;
@@ -678,19 +581,8 @@ function activeGroup({ notice, start, blocked }, slot) {
   return start?.intent;
 }
 
-// Drive this NON-proposer member through one payment signing attempt over frostd, mirroring
-// the native `signer_loop`: find the payment on the relay → approve → wait for the signing
-// group → commit → receive the proposer's sealed candidate + the coordinator's signing package
-// and rerandomizer seed → WYSIWYS-review the candidate → release the signature share.
-// Everything comes from the relay and this member's own stored roster; no member serves HTTP.
-//
-// The request is open to every member: the proposer fixes the signing group from the first
-// approvals to arrive. So this member approves, waits for the group, and commits a nonce only
-// if the group includes it; a commitment from outside the group would fail the round.
 async function drivePayment(signer, p, witnessPinsPath) {
   const { vaultHex, attemptHex } = p;
-  // Like a native member without --nonce-witnesses: no witnesses, no signing — refused before
-  // anything is approved or committed.
   if (!Array.isArray(p.nonceWitnesses) || p.nonceWitnesses.length !== 2) {
     throw new Error("This signer has no nonce witnesses configured, so it cannot sign");
   }
@@ -707,7 +599,6 @@ async function drivePayment(signer, p, witnessPinsPath) {
   }
   const proposer = vault.members.find((m) => m.id === announced.from);
   const terms = announced.intent;
-  // Trust the key in the authenticated payment terms, never signing-session metadata.
   const coordinator = terms.coordinator;
   if (!coordinator) {
     throw new Error("This payment has no sealed signing coordinator; ask the proposer to create a fresh payment");
@@ -723,9 +614,6 @@ async function drivePayment(signer, p, witnessPinsPath) {
     return activeGroup(state, vault.slot);
   };
 
-  // Approve on the control session: a sealed {kind:"approval"} for the terms the proposer
-  // announced, which the proposer records (payment.rs `sync_control`). Durable at frostd. The
-  // member sees those terms on the signer page first; declining sends nothing.
   let group = activeGroup({ notice: announced, start }, vault.slot);
   if (!group) {
     if (!await ask("payment-terms", { ...terms, vaultHex, attemptHex })) throw new Error("You declined this payment request");
@@ -765,7 +653,6 @@ async function drivePayment(signer, p, witnessPinsPath) {
   const commitments = spendIndexes.map((i) => signer.signCommit(attemptHex, i));
   await fc.sendToCoordinator(seal(signer.hostedEncode(JSON.stringify(commitments)), false));
 
-  // Accept one authenticated message of each expected kind, regardless of delivery order.
   const received = new Map();
   const pollMs = Number(p.pollMs) || 200;
   const maxTicks = Number(p.maxTicks) || 1200;
@@ -776,7 +663,7 @@ async function drivePayment(signer, p, witnessPinsPath) {
       try {
         const { kind, body } = JSON.parse(signer.openSigning(sender.signing, sender.encryption, sender.id, signersCsv, attemptHex, m.message));
         if (!received.has(kind)) received.set(kind, body);
-      } catch { /* not an authenticated round message for this attempt */ }
+      } catch { }
     }
     if (received.size === 3) break;
     await sleep(pollMs);
@@ -787,11 +674,6 @@ async function drivePayment(signer, p, witnessPinsPath) {
   }
   const packages = perSpend(packagesHex), seeds = perSpend(seedsHex);
 
-  // The signer's own parse of the candidate must be exactly the approved terms (network,
-  // expiry, the input notes, recipient, amount, memo, change, fee) — refused otherwise,
-  // before the member is even asked. Then the member confirms that parse on the signer page
-  // with a fresh passkey assertion (or the passphrase again), and signApprove releases the
-  // share only for the sighash the member confirmed.
   const review = JSON.parse(signer.paymentCheck(candidateHex, JSON.stringify({ ...terms, tx_expiry: expiry })));
   const txid = reviewedTxid(review);
   if (record.txid && record.txid !== txid) throw new Error("this attempt already has different reviewed effects");
@@ -800,15 +682,12 @@ async function drivePayment(signer, p, witnessPinsPath) {
   await refresh();
   signer.reauth(consent.method, consent.passphrase, consent.prfSecret);
   await paymentRecord(key, { ...record, txid });
-  // Claim every spend's nonce at both witnesses before any share is made, then sign each spend
-  // under the one consent (every spend signs the same confirmed sighash).
   for (const i of spendIndexes) {
     await claimAtWitnesses(signer, p.nonceWitnesses, attemptHex, i, packages[i], seeds[i], review.sighash);
   }
   const shares = spendIndexes.map((i) =>
     signer.signApprove(attemptHex, i, candidateHex, packages[i], seeds[i], review.sighash, JSON.stringify({ ...terms, tx_expiry: expiry })));
   await fc.sendToCoordinator(seal(signer.hostedEncode(JSON.stringify(shares)), true));
-  // Keep a terms-only approval or an interrupted share send retryable in the wallet.
   await paymentRecord(key, { approved: true, txid });
   return { approved: true, signed: true, review };
 }
@@ -817,7 +696,7 @@ async function drivePayment(signer, p, witnessPinsPath) {
 // committed while waiting, so giving up here is safe: approving again resumes the wait.
 async function waitForSigningGroup(refresh, p) {
   const pollMs = Number(p.groupPollMs) || 2000;
-  const maxTicks = Number(p.groupMaxTicks) || 900; // 30 minutes at the default poll
+  const maxTicks = Number(p.groupMaxTicks) || 900;
   for (let tick = 0; tick < maxTicks; tick++) {
     await sleep(pollMs);
     const group = await refresh();
@@ -838,12 +717,10 @@ async function preopenUnlock(P, method) {
   if (method === "passphrase") await opfsPreopenRead(P.salt);
 }
 
-// On-device decisions: the worker asks the signer page (signer-page.js), which shows the
-// prompt on the signer origin and answers. The wallet page never sees or answers these.
 const asks = new Map();
 let askSeq = 0;
-let busy = null; // "join" | "payment-approve" while one holds the open vault
-let turn = Promise.resolve(); // vault ops take turns
+let busy = null;
+let turn = Promise.resolve();
 function ask(kind, data) {
   const id = ++askSeq;
   return new Promise((resolve, reject) => {
@@ -860,9 +737,6 @@ self.onmessage = async (e) => {
     return;
   }
   const { id, op, method, name, passphrase, prfSecret, join, payment, devicePubHex, vaultHex, words, blob, fingerprint } = e.data;
-  // The Signer holds ONE open vault, and these ops each reopen one. A join, payment or
-  // restore holds it, so the quick reads are refused while one runs (the wallet polls
-  // again) and otherwise take turns, so no op swaps the vault under another mid-flight.
   const holds = op === "join" || op === "payment-approve" || op === "restore";
   const reads = op === "payment-review" || op === "pending" || op === "vaults" || op === "address" || op === "recovery-backup" || op === "chain" || op === "payment-status";
   let release = () => {};
@@ -882,7 +756,6 @@ self.onmessage = async (e) => {
         result = signer.hasSigner();
         break;
       case "enroll-material":
-        // Public roster enrollment identity; the unlocked device identity is already in memory.
         result = JSON.parse(signer.enrollMaterial());
         break;
       case "authorize-device":
@@ -902,7 +775,6 @@ self.onmessage = async (e) => {
         result = await joinCeremony(signer, join);
         break;
       case "payment-review":
-        // The announced terms only; the candidate is checked against them inside approval.
         result = await paymentTerms(signer, payment);
         break;
       case "pending":
@@ -919,7 +791,6 @@ self.onmessage = async (e) => {
         break;
       case "address": {
         const vaultHex = await vaultPathId(payment.vaultHex);
-        // A receive-address lookup must not create files for a missing vault.
         for (const path of JSON.parse(vaultPaths(vaultHex))) await opfsPreopenRead(path);
         const vault = JSON.parse(signer.vaultOpen(vaultHex));
         if (!vault.ready) throw new Error("this vault is not active yet");
@@ -949,7 +820,6 @@ self.onmessage = async (e) => {
         result = { recovery_identity: signer.hasRecovery(), legacy_recovery: signer.needsRecoveryMigration() };
         break;
       case "recovery-begin":
-        // The words go only to the signer page, which shows them once.
         await opfsPreopenRead(P.recovery);
         await opfsPreopenRead(P.legacyRecovery);
         result = signer.recoveryBegin();
@@ -985,8 +855,6 @@ self.onmessage = async (e) => {
         break;
       }
       case "remove-verified": {
-        // The page drains and blocks other ops during removal. Verify against the active
-        // KEK in the same worker that holds this partition's custody and sync handles.
         signer.reauth(method, passphrase, prfSecret);
         const root = await navigator.storage.getDirectory();
         await controlHistory.clear();

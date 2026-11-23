@@ -27,8 +27,6 @@ pub(super) fn err(code: StatusCode, message: impl Into<String>) -> Reply {
     (code, Json(body))
 }
 
-/// A stable code for the host's own error sentences, so the wallet can show its own wording
-/// instead of the text. Errors without a code are shown only after sanitizing.
 pub(super) fn error_code(error: &str) -> Option<&'static str> {
     use payment::{ENOUGH_APPROVED, REPEATED_APPROVAL, TOO_MANY_NOTES};
     Some(match error {
@@ -46,8 +44,6 @@ pub(super) fn error_code(error: &str) -> Option<&'static str> {
     })
 }
 
-/// Run a blocking library call (which drives the relay runtime via `block_on`) off the
-/// async worker threads — calling it inline would panic (runtime-within-runtime).
 pub(super) async fn blocking<F>(f: F) -> Reply
 where
     F: FnOnce() -> Result<Value, String> + Send + 'static,
@@ -116,8 +112,6 @@ pub fn router(state: Shared) -> Router {
         .with_state(state)
 }
 
-/// Only the explicitly paired browser origin can read this device's API. The process
-/// capability is still required; CORS never authorizes a member action on its own.
 async fn browser_origin(State(st): State<Shared>, req: Request, next: Next) -> Response {
     let origin = req.headers().get("origin").cloned();
     let route = req.extensions().get::<axum::extract::MatchedPath>().cloned();
@@ -125,8 +119,6 @@ async fn browser_origin(State(st): State<Shared>, req: Request, next: Next) -> R
         let Some(tabs) = &st.wallet_tabs else { return StatusCode::NOT_FOUND.into_response(); };
         if !tabs.permits_request(&req) { return StatusCode::FORBIDDEN.into_response(); }
     }
-    // The browser signer's join worker runs on a separate origin and needs CORS on these four
-    // routes. Ceremony handlers check the invite token, not the local process token.
     let open_ceremony = matches!(
         req.uri().path(),
         "/api/enroll" | "/api/agreed" | "/api/roster" | "/api/session"
@@ -175,13 +167,10 @@ async fn registration(State(st): State<Shared>) -> Reply {
     }
 }
 
-/// Require a device capability except for the native connect handshake (which is origin-
-/// and loopback-checked before reaching this middleware).
 async fn auth(State(st): State<Shared>, req: Request, next: Next) -> Result<Response, Response> {
     if st.is_stopping() {
         return Err(err(StatusCode::UNAUTHORIZED, "profile is locked").into_response());
     }
-    // Only the embedded dispatcher can create this typed extension, never an HTTP client.
     #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
     if st.config.native && req.extensions().get::<super::native_member::InProcess>().is_some() {
         return Ok(next.run(req).await);
@@ -223,7 +212,6 @@ async fn profile_create(State(st): State<Shared>, Json(body): Json<Value>) -> Re
     let for_block = passphrase.clone();
     let reply = blocking(move || crate::profile::create(&data, &for_block, &name)).await;
     if reply.0 == StatusCode::OK {
-        // Creating a profile unlocks it (the prototype's behaviour).
         let session = Session { passphrase, data: st.config.data.clone() };
         if !st.activate_session(generation, session).await {
             return err(StatusCode::CONFLICT, "profile created but signer was locked; unlock again");
@@ -281,7 +269,6 @@ async fn status(
         };
         return ok(json!({ "phase": phase, "network": network, "secure_element": secure_element }));
     };
-    // Unlocked: re-read the profile for its name/id and list the member's vaults.
     match crate::profile::open(&session.data, &session.passphrase) {
         Ok(profile) => {
             let vaults = match ceremony::vault_summaries(&session.data, &session.passphrase) {
@@ -290,7 +277,6 @@ async fn status(
             };
             let mut reply = json!({ "phase": "home", "network": network, "secure_element": secure_element, "profile": profile, "vaults": vaults });
             if st.config.native {
-                // Report the running signer's pinned identity, not registration or relay health.
                 if let (Some(active), Ok(pinned)) = (&st.config.registration, super::RegistrationConfig::resume(&session.data, false)) {
                     if active.coordinator == pinned.coordinator && active.slot == pinned.slot {
                         reply["paired_coordinator"] = json!(pinned.coordinator);

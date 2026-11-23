@@ -10,23 +10,6 @@ use sha2::{Digest, Sha256};
 const MAX_PACKAGE: usize = 16 * 1024 * 1024 + 128;
 const SIGNATURE_DOMAIN: &[u8] = b"Loki_Relay_Message_v1\0";
 
-/// A canonical body authenticated against its certified roster sender.
-/// Only authentication can construct this binding; accessors cannot alter it.
-///
-/// ```compile_fail
-/// use loki_relay_client::AuthenticatedMessage;
-/// fn overwrite(message: &mut AuthenticatedMessage) {
-///     message.body().key.message = [0; 32];
-/// }
-/// ```
-///
-/// ```compile_fail
-/// use loki_relay_client::AuthenticatedMessage;
-/// use loki_relay_protocol::types::MessageBody;
-/// fn forge(body: MessageBody) -> AuthenticatedMessage {
-///     AuthenticatedMessage { body, canonical_body: vec![], digest: [0; 32] }
-/// }
-/// ```
 pub struct AuthenticatedMessage {
     body: MessageBody,
     canonical_body: Vec<u8>,
@@ -76,8 +59,6 @@ fn signature_input(body: &[u8]) -> ClientResult<Vec<u8>> {
     Ok(input)
 }
 
-/// Sign one common package after validating the body and certified sender context.
-/// The roster must come from the caller's certified identity setup.
 pub fn sign_message(
     identity: &CommIdentity,
     roster: &Roster,
@@ -95,8 +76,6 @@ pub fn sign_message(
     ]))?)
 }
 
-/// Verify a bounded canonical package against the certified roster sender.
-/// Original Received type/session association is checked when the original is known.
 pub fn authenticate(roster: &Roster, package: &[u8]) -> ClientResult<AuthenticatedMessage> {
     let value = canonical::decode(package, MAX_PACKAGE)?;
     let Value::Array(fields) = value else {

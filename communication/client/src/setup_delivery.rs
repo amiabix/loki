@@ -513,7 +513,6 @@ impl SetupTransport<'_> {
         }
         Ok(())
     }
-    /// Save this signed ciphertext bundle inside an authenticated sealed generation before publication.
     pub fn checkpoint_prepared(&self, prepared: &PreparedSetup) -> ClientResult<Vec<u8>> {
         use ed25519_dalek::Signer;
         self.validate_prepared(prepared)?;
@@ -562,7 +561,6 @@ impl SetupTransport<'_> {
         }
         Ok(raw)
     }
-    /// Restore exact saved objects; this never draws fresh encryption randomness.
     pub fn restore_prepared(&self, raw: &[u8]) -> ClientResult<PreparedSetup> {
         let wrapper = Temporary(canonical::decode(raw, PREPARED_LIMIT)?);
         let wrapper = fields(&wrapper.0, 2)?;

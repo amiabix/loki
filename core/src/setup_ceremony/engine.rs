@@ -57,14 +57,12 @@ pub struct CheckpointState {
     pub digest: [u8; 32],
     pub terminal: bool,
 }
-/// Implementations authenticate admission state and reconcile the saved operation without changing it.
 pub trait CheckpointAuthority {
     fn reconcile(&mut self, expected: &SavedCheckpoint) -> Result<CheckpointState, String>;
     fn reconcile_active(&mut self, expected: &SavedCheckpoint) -> Result<CheckpointState, String> {
         self.reconcile(expected)
     }
 }
-/// Native phase wires from authenticated setup records; transport noise is rejected before this boundary.
 pub struct CeremonyRecord {
     pub phase: CeremonyPhase,
     pub author: u16,
@@ -77,8 +75,6 @@ pub struct CeremonyStep {
 }
 struct Snapshot {
     phase: CeremonyPhase,
-    /// The shared DKG core state: contribution, fresh key (rounds one and two only),
-    /// FROST checkpoint, received messages, certificates and `vs`.
     core: DkgState,
     outgoing: BTreeMap<u16, Vec<u8>>,
     backups: BTreeMap<u16, Vec<u8>>,
@@ -102,7 +98,6 @@ fn field(out: &mut Vec<u8>, value: &[u8]) -> Result<(), String> {
     out.extend_from_slice(value);
     Ok(())
 }
-/// The core phase each engine phase must carry.
 fn core_phase(phase: CeremonyPhase) -> DkgPhase {
     match phase {
         CeremonyPhase::AwaitingRoster | CeremonyPhase::Starting | CeremonyPhase::Aborted => {
@@ -158,7 +153,6 @@ impl Snapshot {
             prepared,
         })
     }
-    /// A deep copy to build the next generation from.
     fn duplicate(&self) -> Self {
         Self {
             phase: self.phase,
@@ -168,16 +162,12 @@ impl Snapshot {
             prepared: self.prepared.clone(),
         }
     }
-    /// The phase of a saved generation. A `LOKIENG1` generation, written before the v2
-    /// round two, is only ever read for its phase: it is never turned into a v2 state and
-    /// its round-two messages are never reused.
     fn saved_phase(raw: &[u8]) -> Result<(CeremonyPhase, bool), String> {
         if raw.starts_with(b"LOKIENG1") {
             return Ok((CeremonyPhase::decode(*raw.get(8).ok_or(ERROR)?)?, true));
         }
         Ok((Self::decode(raw)?.phase, false))
     }
-    /// Terminal state: keep the received history, drop every secret and the fresh key.
     fn retire(&mut self) {
         self.phase = CeremonyPhase::Aborted;
         self.outgoing.clear();
@@ -231,8 +221,6 @@ impl SetupCeremony {
             journal.append(&Snapshot::ready().encode()?)?;
         }
         if Snapshot::saved_phase(&journal.latest().ok_or(ERROR)?.payload)?.1 {
-            // A setup begun before the v2 round two cannot continue; it is retired with
-            // `abort_saved_checkpoint` and a new setup starts.
             return Err("setup_fresh_vault_required".into());
         }
         let snapshot = Snapshot::decode(&journal.latest().ok_or(ERROR)?.payload)?;
@@ -295,8 +283,6 @@ impl SetupCeremony {
         if phase == CeremonyPhase::Aborted {
             return Ok(());
         }
-        // A legacy generation is retired with an empty v2 snapshot; the legacy
-        // generations stay in the journal.
         let mut snapshot = if legacy {
             Snapshot::ready()
         } else {
@@ -393,8 +379,6 @@ impl SetupCeremony {
             }
             _ => {}
         }
-        // Rounds, transcript, envelopes, certificates, even-Y group key and the fresh key's
-        // presence (rounds one and two) or absence (from the certificate state on).
         self.core()?.validate(&s.core)?;
         if s.phase as u8 >= CeremonyPhase::AwaitingBackups as u8 {
             let expected = self.backup_body()?;
@@ -482,12 +466,9 @@ impl SetupCeremony {
                 return Err("setup_fresh_vault_required".into());
             }
             self.live_start = false;
-            // Once entropy may have been used, failure cannot authorize another part1 invocation.
             self.poisoned = true;
             let mut next = Snapshot::ready();
             next.phase = CeremonyPhase::Round1Saved;
-            // The fresh key is created here and saved in the same generation as our signed
-            // round one, so both are saved or neither is.
             let (core, outgoing) = self.core()?.start()?;
             next.core = core;
             next.outgoing = outgoing;
@@ -658,7 +639,6 @@ impl SetupCeremony {
             serde_json::to_vec(&value.0).map_err(|_| ERROR)?,
         ))
     }
-    /// The caller decrypts the member's recovery card and supplies its recovered state for comparison.
     pub fn confirm_local_backup<F>(
         &mut self,
         recovered: &[u8],
@@ -693,8 +673,6 @@ impl SetupCeremony {
         }
         self.save(next, prepare)
     }
-    /// The caller supplies certified encrypted descriptors and captures the complete
-    /// delivery intent before the checkpoint can authorize any network publication.
     pub fn begin_payment_handoff<F>(
         &mut self,
         outgoing: &BTreeMap<u16, Vec<u8>>,
@@ -1063,9 +1041,6 @@ mod tests {
             assert_eq!(terminal.latest().unwrap().number, generation + 1);
             drop(terminal);
 
-            // A setup saved before the v2 round two (a `LOKIENG1` generation in round two)
-            // does not reopen, reports its saved phase, and is retired with a wiped v2
-            // snapshot while its legacy generation stays in the journal.
             let mut legacy = super::super::journal::Journal::open(
                 &member.path().join("setup-ceremony"),
                 "pass",
@@ -1160,10 +1135,6 @@ mod tests {
         drop(engine);
         std::fs::remove_dir_all(root).unwrap();
     }
-    /// Reopen from the certificate state recomputes the group key from the signed
-    /// round-one commitments without decrypting anything. Part 3 normalizes the key to
-    /// even Y, so the recomputation must too: cover vaults whose key needed the flip and
-    /// vaults whose key did not.
     #[test]
     fn certificate_reopen_without_decryption_accepts_both_even_y_parities() {
         use crate::dkg_core::{DkgCore, DkgPhase};

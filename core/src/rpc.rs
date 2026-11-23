@@ -1,5 +1,3 @@
-//! A minimal JSON-RPC client for local regtest and a loopback Testnet node.
-
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
@@ -18,7 +16,6 @@ impl Rpc {
         }
     }
 
-    /// A locally reachable public Testnet node. Refuse other chains before payment work.
     pub fn testnet() -> Result<Self, String> {
         use base64::Engine as _;
         let addr =
@@ -94,16 +91,10 @@ impl Rpc {
         Ok(rpc)
     }
 
-    /// The regtest node this process should talk to.
-    ///
-    /// `LOKI_RPC` overrides the default so a sandboxed chain can run on its own port and
-    /// cannot be confused with, or collide with, one started by the shell scripts. The
-    /// default is unchanged, so every existing script behaves exactly as before.
     pub fn regtest() -> Self {
         Rpc::new(&std::env::var("LOKI_RPC").unwrap_or_else(|_| "127.0.0.1:18232".to_string()))
     }
 
-    /// Issue a JSON-RPC call and return the `result` value.
     pub fn call(&self, method: &str, params: &str) -> Result<ciborium::value::Value, String> {
         let body = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{params}}}"#);
         let req = Zeroizing::new(format!(
@@ -145,11 +136,9 @@ impl Rpc {
                 return Err(format!("{method}: {e}"));
             }
         }
-        // Re-encode through serde_json; callers use the helper accessors below.
         Ok(ciborium::value::Value::Text(v["result"].to_string()))
     }
 
-    /// `method` returning raw `serde_json::Value`, which is what the callers want.
     pub fn json(&self, method: &str, params: &str) -> Result<serde_json::Value, String> {
         match self.call(method, params)? {
             ciborium::value::Value::Text(t) => {

@@ -33,10 +33,6 @@ use crate::{
     signer::{wysiwys, PublicPaymentParams},
 };
 
-/// Build one unsigned, unproven single-note candidate PCZT under `alpha`, from the vault's
-/// viewing key alone. This is the exact build the production signer runs — `LocalSigner`'s
-/// `build_single_note_pczt` delegates here — so what the builder emits is byte-for-byte what an
-/// in-browser signer's WYSIWYS check validates. No share, nonce, or secret is touched.
 pub fn build_unsigned<P: Parameters + Clone>(
     vault_fvk: &FullViewingKey,
     params_net: &P,
@@ -91,11 +87,6 @@ pub fn build_unsigned<P: Parameters + Clone>(
         .map_err(|e| format!("serialize: {e:?}"))
 }
 
-/// The `build(vault, intent) -> {pczt_unsigned, sighash}` half of the builder's HTTP surface:
-/// pick the vault's network parameters, build the unsigned candidate, and return it with the
-/// sighash the signers will independently recompute. `fee` and `change` are not returned
-/// separately — they are carried in the PCZT and re-derived by the signers' WYSIWYS check, so
-/// there is nothing here for a dishonest builder to misreport.
 pub fn build_candidate_for_vault(
     vault_fvk: &FullViewingKey,
     network: VaultNetwork,
@@ -135,12 +126,8 @@ mod tests {
     use reddsa_frost::frost::redpallas as frost;
     use zcash_protocol::{memo::MemoBytes, value::Zatoshis};
 
-    /// The builder produces an unsigned candidate that an in-browser signer's WYSIWYS check
-    /// accepts, and whose sighash the signer recomputes identically — all from the vault's
-    /// viewing key, with no share anywhere in the path.
     #[test]
     fn builder_unsigned_pczt_is_accepted_by_a_wysiwys_signer() {
-        // A real group viewing key. The builder is handed ONLY this fvk — never the shares.
         let (_shares, public) = frost::keys::generate_with_dealer(
             3,
             2,
@@ -156,7 +143,6 @@ mod tests {
             .unwrap();
         let fvk = zip2005::frost_viewing_key(&ak, &[42u8; 32]).unwrap();
 
-        // One vault note to spend, a recipient, an amount and a memo — the payment intent.
         let rho = Rho::from_bytes(&[1u8; 32]).unwrap();
         let rseed = RandomSeed::from_bytes([2u8; 32], &rho).unwrap();
         let note = orchard::Note::from_parts(
@@ -176,14 +162,11 @@ mod tests {
             target_height: 700,
             expiry_height: 1_152,
         };
-        // Stands in for a live quorum's re-randomizer (derived from round-1 commitments).
         let alpha = [9u8; 32];
 
         let (pczt_bytes, sighash) =
             build_candidate_for_vault(&fvk, VaultNetwork::Regtest, &params, note, &alpha).unwrap();
 
-        // The fee the builder used is the conventional ZIP 317 fee, re-derived here so the
-        // signer's expectations are independent of anything the builder claims.
         let fee: u64 = quote_fee(
             &crate::candidate::Regtest,
             &CandidateInputs {
@@ -209,8 +192,6 @@ mod tests {
             expiry_height: 1_152,
         };
 
-        // Exactly the signer-side WYSIWYS gate (host/payment.rs `review_candidate`): open the
-        // PCZT with the verifier and prove its effects equal the reviewed intent.
         let parsed = pczt::Pczt::parse(&pczt_bytes).unwrap();
         pczt::roles::verifier::Verifier::new(parsed)
             .with_ironwood::<Refusal, _>(|bundle| {
@@ -219,21 +200,15 @@ mod tests {
             })
             .expect("a WYSIWYS signer accepts the builder's candidate");
 
-        // The signer recomputes the sighash from the same bytes; the builder's matches it.
         let recomputed = wysiwys::sighash_of_pczt(&pczt_bytes, &fvk).unwrap();
         assert_eq!(recomputed, sighash, "signer's sighash must match the builder's");
 
-        // And the independent render agrees on recipient/amount/memo.
         let view = wysiwys::describe_pczt(&pczt_bytes, &fvk).unwrap();
         assert_eq!(view.to, recipient.to_raw_address_bytes());
         assert_eq!(view.amount_zat, 40_000_000);
-        // describe_pczt returns the 512-byte padded memo field; the intent text is its prefix.
         assert!(view.memo.starts_with(b"loki w4 builder"));
     }
 
-    /// A builder that tampers with the amount is caught by the signer's WYSIWYS check — the
-    /// reason the builder can be untrusted. The builder cannot both pay elsewhere and keep the
-    /// effects the signer reviewed.
     #[test]
     fn a_tampered_build_is_refused_by_the_signer() {
         let (_shares, public) = frost::keys::generate_with_dealer(
@@ -272,7 +247,6 @@ mod tests {
             build_candidate_for_vault(&fvk, VaultNetwork::Regtest, &params, note, &[9u8; 32])
                 .unwrap();
 
-        // The signer reviewed a 40_000_001-zat payment; the builder's candidate pays 40_000_000.
         let fee: u64 = quote_fee(
             &crate::candidate::Regtest,
             &CandidateInputs {

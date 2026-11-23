@@ -1,4 +1,3 @@
-//! Member-owned startup and public self-registration. No local credential leaves this process.
 use std::path::PathBuf;
 
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
@@ -170,8 +169,6 @@ enum RegistrationFailure {
     WrongSlot,
 }
 
-/// Why the coordinator refused a registration. It is recognised only from the coordinator's exact
-/// error text, so none of that text reaches logs or the UI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Refusal { ExpiredChallenge, GrantRequired, GrantUsed, SlotTaken, WrongSlot, Other }
 
@@ -222,8 +219,6 @@ impl std::fmt::Display for RegistrationFailure {
     }
 }
 
-// Only the coordinator's exact, bounded 400 refusal is a hint to reread its public roster.
-// No arbitrary response text is passed to the UI or treated as a slot number.
 async fn registration_response<T: serde::de::DeserializeOwned>(
     mut response: reqwest::Response, step: &str, native: bool, cap: usize,
 ) -> Result<T, RegistrationFailure> {
@@ -232,7 +227,6 @@ async fn registration_response<T: serde::de::DeserializeOwned>(
         let error = format!("{step}: {status}");
         if native && status.is_client_error()
             && !matches!(status, reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_MANY_REQUESTS) {
-            // The text only selects a fixed reason; it is never kept or shown.
             let body = read_bounded(&mut response, 1024).await.ok();
             let json = body.and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok());
             let reason = Refusal::from_coordinator(json.as_ref().and_then(|json| json["error"].as_str()));
@@ -318,7 +312,6 @@ impl DeviceKey {
             return Self::apple(config, &config.data, _create, None);
         }
         if config.secure_element != "software" { return Err(DeviceKeyError::Other("device key backend unavailable".into())); }
-        // Development stand-in only, selected by the existing software backend flag.
         let dir = MemberDir::create(&config.data, "device-auth").map_err(|e| DeviceKeyError::Other(e.to_string()))?;
         let key = match dir.read_sealed("login.sealed", pass) {
             Ok(raw) => SigningKey::from_slice(&Zeroizing::new(raw)).map_err(|e| DeviceKeyError::Other(e.to_string()))?,
@@ -369,16 +362,13 @@ async fn registration_device(config: &Config, pass: &str, _client: &reqwest::Cli
             return Err(unreachable);
         }
         if roster.iter().any(|member| member.signing_pubkey.eq_ignore_ascii_case(_signing_key)) { return opened; }
-        // A coordinator hiding this identity can only cause creation where no key exists.
         return DeviceKey::create(config, pass);
     }
     opened
 }
 
-/// `pairing_claim`: the one-use claim from a pairing link, sent on the first attempt only.
 async fn register(config: &Config, pass: &str, pairing_claim: Option<&str>, slot: Option<u32>, notice: Option<&super::LocalNotice>) -> Result<PublicMember, RegistrationFailure> {
     let launch = config.registration.as_ref().ok_or("self-registration not configured")?;
-    // Loopback is the device-local browser endpoint, even with an HTTPS coordinator.
     let advertise_url = plain_origin(&config.base_url(), true)?;
     let identity = super::ceremony::identity(&config.data, pass, 1)?;
     let signing_pubkey = hex::encode(identity.public().signing);
@@ -387,7 +377,6 @@ async fn register(config: &Config, pass: &str, pairing_claim: Option<&str>, slot
     let device = registration_device(config, pass, &client, &launch.coordinator, &signing_pubkey).await.map_err(RegistrationFailure::Device)?;
     let device_pub = device.public().map_err(RegistrationFailure::Device)?;
     let authorization = identity.authorize_device(&device_pub);
-    // Reuse the device enrollment verifier; this profile's identity authorizes the device.
     DeviceRegistry::new(identity.public().signing).enroll(&device_pub, &authorization)?;
     let enrollment = Enrollment {
         slot, signing_pubkey,
@@ -405,7 +394,6 @@ async fn register(config: &Config, pass: &str, pairing_claim: Option<&str>, slot
     }
     let request = client.post(format!("{}/api/members/challenge", launch.coordinator))
         .json(&claim).build().map_err(|e| e.to_string())?;
-    // After handing the request to the client even a lost response may mean the claim was used.
     if let (Some(notice), Some(claim)) = (notice, pairing_claim) { notice("pairing-claim-attempted", claim); }
     let response = client.execute(request).await.map_err(|e| RegistrationFailure::Connection(format!("registration challenge: {e}")))?;
     let RegistrationChallenge { challenge, replacement_generation, relay_challenge_pubkey } =
@@ -439,16 +427,12 @@ async fn register(config: &Config, pass: &str, pairing_claim: Option<&str>, slot
     Ok(member)
 }
 
-/// Unlock the profile. Native pairing (including Try again) registers before showing recovery
-/// words. A pending restore tries once and runs even on failure. Regular
-/// unlocks and headless launches serve immediately and retry registration in the background.
 pub(super) async fn start(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option<&super::LocalNotice>) -> Result<&'static str, String> {
     use std::io::IsTerminal;
     let interactive = std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
     start_with(st, pass, notice, interactive).await
 }
 
-/// `interactive`: both streams are terminals, so the member can see and acknowledge the words.
 async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option<&super::LocalNotice>, interactive: bool) -> Result<&'static str, String> {
     let Some(launch) = &st.config.registration else { return Ok("ready"); };
     let generation = st.session_generation();
@@ -500,7 +484,6 @@ async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option
     let pending = st.config.data.join(PAIRING_PENDING);
     let pairing = native && !restored && (launch.pairing_challenge.is_some() || pending.try_exists().map_err(|e| e.to_string())?);
     let save_destination = || -> Result<(), String> {
-        // Keep the resume destination before sending the one-use claim.
         if let Some(slot) = launch.slot { save_coordinator(&st.config.data, &launch.coordinator, slot)?; }
         if let Some(fetched) = st.fetched_config.as_ref().filter(|_| !restored) {
             if let Err(e) = fetched.save_unlocked(&st.config.data) {
@@ -510,14 +493,10 @@ async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option
         Ok(())
     };
     if pairing {
-        // Mark first registration before saving the pin, so no crash can leave a resumable pin
-        // that skips registration. An already-paired profile refreshing its settings stays usable offline.
         if !st.config.data.join("paired-coordinator.json").try_exists().map_err(|e| e.to_string())? {
             std::fs::write(&pending, []).map_err(|e| e.to_string())?;
         }
         save_destination()?;
-        // Complete enrollment before minting words: the slot then belongs to this identity,
-        // not to an expiring claim.
         register_once(st, pass.clone(), launch.pairing_challenge.clone(), notice.cloned()).await.map_err(|e| {
             eprintln!("native coordinator registration failed: {e}");
             e.native_code()
@@ -528,15 +507,12 @@ async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option
         }
     }
     if restored {
-        // A published restore already adopted its words. Never mint different words for it,
-        // even if someone deleted one of its files after publication.
         if !super::recovery::exists(&st.config.data) { return Err("The restored recovery identity is missing.".into()); }
     } else if let Some(notice) = notice.filter(|_| native) {
         super::recovery::confirm_recovery(&st.config.data, &pass, notice)?;
     } else if interactive {
         super::recovery::confirm_recovery(&st.config.data, &pass, &super::recovery::terminal_notice())?;
     } else if !super::recovery::exists(&st.config.data) {
-        // Diagnostics stay off the startup pipe.
         eprintln!("{} ({}) — recovery words not set up: stop the app and run loki_member_app recovery-setup in a private terminal", launch.name, st.config.data.display());
     }
     let data = st.config.data.clone();
@@ -547,7 +523,6 @@ async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option
     if !st.activate_session(generation, session).await { return Err("signer was locked; unlock again".into()); }
     if pairing { return Ok("ready"); }
     if restored {
-        // The profile is already committed; registration can fail without losing the restore.
         if register_once(st, pass.clone(), None, None).await.is_ok() { return Ok("restore-ready"); }
         *st.registration_error.write().await = Some(RESTORE_RETRY.into());
     }
@@ -558,8 +533,6 @@ async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option
 
 const PAIRING_PENDING: &str = "pairing-registration-pending";
 
-/// True while a native pairing has written its profile but the coordinator never accepted the
-/// registration (for example, the pairing link expired). Such a profile has no recovery words yet.
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
 pub(crate) fn pairing_pending(data: &std::path::Path) -> bool {
     data.join(PAIRING_PENDING).exists()
@@ -567,7 +540,6 @@ pub(crate) fn pairing_pending(data: &std::path::Path) -> bool {
 pub(super) const RESTORE_PENDING: &str = "restore-registration-pending";
 const RESTORE_RETRY: &str = "Vault restored. LokiSigner could not reconnect to the coordinator yet; it will retry without your recovery words.";
 
-/// One registration attempt; on success the public roster entry is saved and served.
 async fn register_once(st: &Shared, pass: Zeroizing<String>, pairing_claim: Option<String>, notice: Option<super::LocalNotice>) -> Result<PublicMember, RegistrationFailure> {
     let result = register_member(st, pass, pairing_claim, notice).await;
     native_event!(st, match &result {
@@ -634,26 +606,20 @@ async fn register_member(st: &Shared, pass: Zeroizing<String>, pairing_claim: Op
     Ok(member)
 }
 
-/// Retry registration with backoff (5 s doubling to 5 min) until the coordinator accepts it.
 async fn keep_registering(st: Shared, pass: Zeroizing<String>, restored: bool, notice: Option<super::LocalNotice>) {
     let mut wait = std::time::Duration::from_secs(5);
     let mut warning = notice.clone();
     #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
     let mut shown_key_errors = std::collections::HashSet::new();
-    // The coordinator consumes a pairing claim even when its reply is lost, so only the first
-    // attempt carries it. Later attempts can resume pending enrollment or refresh an enrolled
-    // identity. If the uncompleted reservation expires, request a fresh link.
     let mut pairing_claim = st.config.registration.as_ref().and_then(|launch| launch.pairing_challenge.clone());
     if restored { tokio::time::sleep(wait).await; }
     let mut warned = false;
     loop {
         let result = register_once(&st, pass.clone(), pairing_claim.take(), None).await;
-        // The first attempt's Touch ID prompt has been answered: vault opens may prompt now.
         st.set_first_registration(false);
         match result {
             Ok(member) => {
                 eprintln!("Public roster slot: {}", member.slot);
-                // Clear a warning an earlier attempt left in the app.
                 if warned { if let Some(notice) = &notice { notice("registration-ok", ""); } }
                 return;
             }
@@ -763,7 +729,6 @@ mod tests {
         assert!(RegistrationConfig::pairing(&local, true).is_ok());
     }
 
-    /// Wait for the first background registration attempt to fail and return its error.
     async fn failed_attempt(state: &Shared) -> String {
         for _ in 0..200 {
             if let Some(error) = state.registration_error.read().await.clone() { return error; }
@@ -776,7 +741,6 @@ mod tests {
         let mut config = super::super::config_from_args(&[
             "--data".into(), data.to_str().unwrap().into(), "--port".into(), "3601".into(),
         ]).unwrap();
-        // No local unlock file or plaintext-coordinator opt-in. The local endpoint is still valid.
         config.registration = Some(RegistrationConfig::pairing(&format!(
             "loki://pair?origin=https%3A%2F%2F127.0.0.1%3A1&slot=7&challenge={}", "ab".repeat(32)), false).unwrap());
         std::sync::Arc::new(super::super::state::AppState::new(config))
@@ -951,7 +915,7 @@ mod tests {
             "--coordinator-url".into(), origin, "--registration-slot".into(), "7".into(),
             "--local-passphrase-file".into(), unlock.to_str().unwrap().into(), "--development-http".into(),
         ]).unwrap();
-        config.secure_element = "apple".into(); // same path as LokiSigner serve
+        config.secure_element = "apple".into();
         let state = Arc::new(super::super::state::AppState::new(config));
         assert_eq!(start_with(&state, None, None, false).await.unwrap(), "ready");
         assert!(state.session.read().await.is_some());
@@ -994,7 +958,6 @@ mod tests {
             assert_eq!(words.split_whitespace().count(), 24);
             true
         });
-        // The coordinator is unreachable, yet the profile unlocks and startup succeeds.
         start(&state, Some(Zeroizing::new("native local unlock".into())), Some(&notice)).await.unwrap();
         assert!(state.session.read().await.is_some());
         let error = failed_attempt(&state).await;
@@ -1081,7 +1044,6 @@ mod tests {
                     false
                 });
                 if stop_first {
-                    // Model Lock dropping startup while the first registration request is still in flight.
                     tokio::select! {
                         result = start_with(&state, pass(), Some(&no_words), false) => panic!("startup returned before the stop: {result:?}"),
                         stopped = tokio::time::timeout(std::time::Duration::from_secs(10), exchange.0.notified()) => stopped.unwrap(),
@@ -1112,7 +1074,6 @@ mod tests {
                 assert_eq!(words.split_whitespace().count(), 24);
                 assert!(!observed.swap(true, Ordering::SeqCst), "words shown twice");
                 assert!(starting.session.try_read().unwrap().is_none(), "startup is not ready during the notice");
-                // Advance past the claim lifetime while the notice is still blocking startup.
                 claim_expired.store(true, Ordering::SeqCst);
                 let status = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(async {
                     reqwest::Client::new().post(format!("{endpoint}/api/members/challenge"))
@@ -1129,7 +1090,6 @@ mod tests {
             assert_eq!(*claims.lock().unwrap(), expected);
             drop(notice);
 
-            // A regular unlock reads the sealed name, not the default from resume().
             let mut config = Arc::try_unwrap(state).ok().unwrap().config;
             config.registration = Some(RegistrationConfig::resume(&data, true).unwrap());
             let state = Arc::new(super::super::state::AppState::new(config));
@@ -1209,8 +1169,6 @@ mod tests {
         }
     }
 
-    /// A pairing claim is consumed by the coordinator even when the reply is lost, so a retry
-    /// that resent it could never register. Only the first attempt carries the claim.
     #[tokio::test]
     async fn registration_retries_resume_without_the_consumed_pairing_claim() {
         use axum::{routing::post, Json, Router};
@@ -1224,7 +1182,6 @@ mod tests {
                 async { Json(json!({ "challenge": "cd".repeat(32), "relay_challenge_pubkey": TEST_RELAY_CHALLENGE_KEY })) }
             }))
             .route("/api/members", post(move |Json(body): Json<Value>| {
-                // The first registration reply is lost; the next one succeeds.
                 let first = p.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
                 async move {
                     if first { return Err(axum::http::StatusCode::BAD_GATEWAY); }
@@ -1254,8 +1211,6 @@ mod tests {
         std::fs::remove_dir_all(data).unwrap();
     }
 
-    /// A redirected launch must start without recovery keys or a terminal prompt. The member
-    /// uses the authenticated HTTP confirmation flow after startup instead.
     #[tokio::test]
     async fn recovery_words_are_not_minted_at_startup_when_output_is_not_a_terminal() {
         let data = std::env::temp_dir().join(format!("loki-pair-words-{}", uuid::Uuid::new_v4()));
@@ -1267,8 +1222,6 @@ mod tests {
         std::fs::remove_dir_all(data).unwrap();
     }
 
-    /// An unreachable coordinator does not stop the member app: the local API serves an
-    /// unlocked profile and reports the failed registration, which keeps retrying.
     #[tokio::test]
     async fn the_local_api_serves_while_coordinator_registration_fails() {
         let data = std::env::temp_dir().join(format!("loki-pair-serve-{}", uuid::Uuid::new_v4()));
@@ -1308,7 +1261,6 @@ mod tests {
         }
         let reported = reported.expect("the failed registration is reported locally");
         assert!(reported.contains("registration challenge:"), "{reported}");
-        // The app still serves after the failed attempt; its retry loop keeps it registering.
         assert_eq!(get("/api/status").await.unwrap().status(), reqwest::StatusCode::OK);
     }
 
@@ -1356,7 +1308,7 @@ mod tests {
 
         for (native, pending, entries, expected_reads) in [
             (true, false, vec![matched.clone()], 0),
-            (false, true, vec![matched.clone()], 0), // Headless refuses as before, without repinning.
+            (false, true, vec![matched.clone()], 0),
             (true, true, vec![wrong_relay], 1),
             (true, true, vec![matched.clone(), matched], 2),
         ] {
@@ -1421,7 +1373,7 @@ mod tests {
                     match reply {
                         0 => member["lokisigner_url"] = body["lokisigner_url"].clone(),
                         1 => member["lokisigner_url"] = "http://127.0.0.1:3602".into(),
-                        _ => {} // An absent field must not be silently accepted either.
+                        _ => {}
                     }
                     Json(json!({"member": member}))
                 }

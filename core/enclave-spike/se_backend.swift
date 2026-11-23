@@ -28,11 +28,8 @@ import Security
 //   -21 enrollment changed during restore
 
 private let algo = SecKeyAlgorithm.eciesEncryptionCofactorX963SHA256AESGCM
-// ECDSA over SHA-256 of the message, ASN.1/DER (X9.62) output — the device login-challenge
-// signature. The same Enclave key signs and wraps; no usage flag restricts it.
 private let sigAlgo = SecKeyAlgorithm.ecdsaSignatureMessageX962SHA256
 
-// Opaque handle table: Rust holds a u64, Swift owns the key and any scoped authorization.
 private var table: [UInt64: (key: SecKey, biometry: Data?, payment: LAContext?)] = [:]
 private var nextHandle: UInt64 = 1
 private let lock = NSLock()
@@ -67,8 +64,6 @@ public func se_open_ephemeral(_ outHandle: UnsafeMutablePointer<UInt64>) -> Int 
     outHandle.pointee = store(k)
     return 0
 }
-
-// MARK: - Persistent + biometric key (REQUIRES a signed binary — gated, not run unsigned)
 
 func persistentLookupResult(_ status: OSStatus, createIfMissing: Bool) -> Int? {
     switch status {
@@ -106,7 +101,6 @@ private func readBiometry() -> Biometry {
     var error: NSError?
     _ = context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error)
     let state: Data?
-    // Don't compare hashes across the two API formats after an OS upgrade.
     if #available(macOS 15, *) {
         state = context.domainState.biometry.stateHash.map { Data([2]) + $0 }
     } else {
@@ -131,8 +125,6 @@ func keyOperationFailure(_ failure: NSError?, fallback: Int) -> Int {
             }
         } else if current.domain == "CryptoTokenKit",
                   (current.userInfo["AKSError"] as? NSNumber)?.uint32Value == 0xe007c009 {
-            // Apple's DTS identifies this keybag error as an unusable key after a
-            // biometryCurrentSet change. A generic authentication failure is not proof.
             invalidated = true
         }
         error = current.userInfo[NSUnderlyingErrorKey] as? NSError
@@ -153,8 +145,6 @@ func checkedBiometricFailure(_ code: Int, recorded: Data?, current: () -> Biomet
     return code
 }
 
-// An application tag is not a unique Keychain key constraint. Hold one per-user lock
-// across lookup and creation, even when two processes are staging the same final path.
 private func defaultLockPath() -> String? {
     guard let support = try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
                                                       appropriateFor: nil, create: true) else { return nil }
@@ -191,7 +181,6 @@ func setTestKeychain(lockPath: @escaping () -> String?,
 private let keychain = Keychain()
 #endif
 
-// Only a creating caller with an explicit not-found result may persist a key.
 @_cdecl("se_open_persistent")
 public func se_open_persistent(_ tagPtr: UnsafePointer<UInt8>, _ tagLen: Int,
                                _ createIfMissing: Int32, _ statePath: UnsafePointer<CChar>?,
@@ -205,8 +194,6 @@ public func se_create_staged(_ tagPtr: UnsafePointer<UInt8>, _ tagLen: Int,
     return openPersistent(tagPtr, tagLen, true, statePath, nil, outHandle, staging: true)
 }
 
-// Called after the staged store has unwrapped its actual share. The recorded hash was
-// sampled before key creation; don't publish unless it is still the same enrollment.
 @_cdecl("se_confirm_staged_biometry")
 public func se_confirm_staged_biometry(_ handle: UInt64, _ statePath: UnsafePointer<CChar>?) -> Int {
     guard let recorded = fetch(handle)?.biometry else { return -4 }
@@ -223,7 +210,6 @@ public func se_confirm_staged_biometry(_ handle: UInt64, _ statePath: UnsafePoin
 
 @_cdecl("se_discard_staged")
 public func se_discard_staged(_ tagPtr: UnsafePointer<UInt8>, _ tagLen: Int) -> Int {
-    // The caller supplies a tag reserved for one restore attempt and one key role.
     let context = LAContext()
     context.interactionNotAllowed = true
     defer { context.invalidate() }
@@ -239,7 +225,6 @@ public func se_discard_staged(_ tagPtr: UnsafePointer<UInt8>, _ tagLen: Int) -> 
     return status == errSecSuccess || status == errSecItemNotFound ? 0 : -4
 }
 
-// Also used for short-lived viewing-key opens; only the reason and handle lifetime differ.
 @_cdecl("se_open_payment")
 public func se_open_payment(_ tagPtr: UnsafePointer<UInt8>, _ tagLen: Int,
                             _ statePath: UnsafePointer<CChar>?, _ reason: UnsafePointer<CChar>,
@@ -263,7 +248,6 @@ private func openPersistent(_ tagPtr: UnsafePointer<UInt8>, _ tagLen: Int, _ cre
     let recorded = stateURL.flatMap { try? Data(contentsOf: $0) }.flatMap { data in
         data.count > 1 && (data.first == 1 || data.first == 2) ? data : nil
     }
-    // Try to load an existing key by tag first.
     var query: [String: Any] = [
         kSecClass as String: kSecClassKey,
         kSecAttrApplicationTag as String: tag,
@@ -275,7 +259,7 @@ private func openPersistent(_ tagPtr: UnsafePointer<UInt8>, _ tagLen: Int, _ cre
     let status = keychain.lookup(query as CFDictionary, &out)
     if let result = persistentLookupResult(status, createIfMissing: creating) {
         guard result == 0 else { return checkedBiometricFailure(result, recorded: recorded, current: keychain.biometry) }
-        guard !staging else { return -4 } // A restore tag is fresh, never a shared or reused key.
+        guard !staging else { return -4 }
         guard let r = out, CFGetTypeID(r) == SecKeyGetTypeID() else { return -4 }
         let key = r as! SecKey
         if let reason = paymentReason {
@@ -287,8 +271,6 @@ private func openPersistent(_ tagPtr: UnsafePointer<UInt8>, _ tagLen: Int, _ cre
             guard authorized == 0 else {
                 return checkedBiometricFailure(authorized, recorded: recorded, current: keychain.biometry)
             }
-            // Only the explicit evaluation can show UI. Bind the authenticated context
-            // to the key reference used for every unwrap in this scope.
             context.interactionNotAllowed = true
             query[kSecUseAuthenticationContext as String] = context
             out = nil
@@ -313,7 +295,6 @@ private func openPersistent(_ tagPtr: UnsafePointer<UInt8>, _ tagLen: Int, _ cre
         outHandle.pointee = store(key, biometry: state)
         return 0
     }
-    // A lookup may stop seeing a key after biometrics change, even with its record still present.
     let missing = checkedBiometricFailure(-6, recorded: recorded, current: keychain.biometry)
     guard missing == -6 else { return missing }
     let before = keychain.biometry()
@@ -351,7 +332,6 @@ private func authorizePaymentKey(_ key: SecKey, _ context: LAContext, _ operatio
 }
 
 private func createPersistentKey(_ tag: Data) -> (SecKey?, Int) {
-    // Not found: create and persist it, biometric-gated.
     guard let ac = SecAccessControlCreateWithFlags(
         kCFAllocatorDefault, kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
         [.biometryCurrentSet, .privateKeyUsage], nil
@@ -375,14 +355,11 @@ private func createPersistentKey(_ tag: Data) -> (SecKey?, Int) {
 }
 
 private func provePersistentKey(_ key: SecKey) -> Int {
-    // Public operations can succeed after biometric invalidation. A private operation cannot.
     var failure: Unmanaged<CFError>?
     let challenge = Data("LokiSigner persistent key check".utf8)
     if SecKeyCreateSignature(key, sigAlgo, challenge as CFData, &failure) != nil { return 0 }
     return keyOperationFailure(failure.map { $0.takeRetainedValue() as Error as NSError }, fallback: -9)
 }
-
-// MARK: - wrap / unwrap (identical for both lifetimes)
 
 @_cdecl("se_wrap")
 public func se_wrap(_ handle: UInt64,
@@ -404,7 +381,6 @@ public func se_unwrap(_ handle: UInt64,
                       _ out: UnsafeMutablePointer<UInt8>, _ outCap: Int) -> Int {
     guard let (k, biometry, _) = fetch(handle) else { return -8 }
     let data = Data(bytes: ct, count: ctLen)
-    // Unscoped persistent keys prompt here. Scoped keys already have their authorization.
     var failure: Unmanaged<CFError>?
     guard var pt = SecKeyCreateDecryptedData(k, algo, data as CFData, &failure) as Data? else {
         let code = keyOperationFailure(failure.map { $0.takeRetainedValue() as Error as NSError }, fallback: -4)
@@ -415,8 +391,6 @@ public func se_unwrap(_ handle: UInt64,
     pt.copyBytes(to: out, count: pt.count)
     return pt.count
 }
-
-// MARK: - device login key (same Enclave key, ECDSA path)
 
 // Sign `msg` with the Enclave key (ECDSA/SHA-256, DER). On a persistent biometric key this
 // prompts Face/Touch ID — proof of user presence for a login challenge. The private op runs
@@ -437,9 +411,6 @@ public func se_sign(_ handle: UInt64,
     return sig.count
 }
 
-// Export the Enclave key's PUBLIC point as X9.63 uncompressed bytes (04 || X || Y, 65B for
-// P-256) — what Loki enrolls and verifies challenge signatures against. The private key never
-// leaves the Enclave (SecKeyCopyExternalRepresentation on it would refuse).
 @_cdecl("se_public_key")
 public func se_public_key(_ handle: UInt64,
                           _ out: UnsafeMutablePointer<UInt8>, _ outCap: Int) -> Int {

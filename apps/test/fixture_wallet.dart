@@ -1,6 +1,5 @@
 import 'package:loki_signer/wallet_api.dart';
 
-// UI-only signer double. Not imported by the product entry point.
 class FixtureWallet implements WalletApi {
   FixtureWallet({this.running = true, this.fresh = false});
   static const recipient =

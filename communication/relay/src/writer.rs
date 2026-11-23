@@ -38,7 +38,6 @@ impl<T> DbReply<T> {
     }
 }
 
-/// Keep this owner alive while serving; dropping it stops admission and drains accepted work.
 pub struct DbWriter {
     handle: DbHandle,
     done: Option<oneshot::Receiver<()>>,
@@ -46,12 +45,9 @@ pub struct DbWriter {
 impl DbWriter {
     fn stop(&self) {
         self.handle.stopping.store(true, Ordering::Release);
-        // Wake an idle receiver. A full queue already has work to wake it.
         let _ = self.handle.sender.try_send(Command::Stop);
     }
 
-    /// Stop admission and wait up to five seconds for the drain and root-lock release.
-    /// On timeout, accepted work continues on the thread while retaining the root lock.
     pub async fn shutdown(mut self) -> RelayResult<()> {
         self.stop();
         let done = self.done.take().ok_or(RelayError::StorageUnavailable)?;
@@ -153,7 +149,6 @@ fn complete<T>(reply: ReplySender<T>, result: RelayResult<T>) {
     if let Some(pause) = reply.pause {
         pause.wait();
     }
-    // Losing the HTTP receiver must never cancel an accepted transaction.
     let _ = reply.sender.send(result);
 }
 
@@ -182,8 +177,6 @@ enum Command {
 }
 
 impl DbHandle {
-    /// Open the connection and acquire the root lock on the dedicated database thread.
-    /// Provisioning a fresh root remains the existing offline RelayStore::init operation.
     pub async fn open(root: PathBuf, limits: Limits) -> RelayResult<(Self, DbWriter)> {
         let root = Arc::new(root);
         let (classify_tx, classify_rx) = std_mpsc::sync_channel(CLASSIFY_QUEUE_CAPACITY);
@@ -329,7 +322,6 @@ impl DbHandle {
         Ok(reply)
     }
 
-    /// Advisory snapshot on the classify thread. The caller still runs `put`.
     pub(crate) fn classify_put(
         &self,
         mailbox: Id32,
@@ -361,7 +353,6 @@ impl DbHandle {
         })
     }
 
-    /// Presence only. Callers still run `put` after the body is buffered.
     pub(crate) fn classify_hash(
         &self,
         mailbox: Id32,
@@ -433,7 +424,6 @@ impl DbHandle {
         self.admit_fresh(|sender| Command::CleanupSetup(now, sender))
     }
     pub fn challenge(&self, nonce: Id32) -> RelayResult<DbReply<Vec<u8>>> {
-        // Public identity checks must not consume reserved writer progress.
         self.admit_fresh(|sender| Command::Challenge(nonce, sender))
     }
     pub fn rotate(

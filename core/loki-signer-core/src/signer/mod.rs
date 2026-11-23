@@ -32,10 +32,6 @@ pub mod secure_element_webauthn;
 pub mod store;
 pub mod wysiwys;
 
-/// Browser-only self-test of the OPFS synchronous-store seam: write `bytes` at `path`,
-/// then read them back through the same `durable` backend the signer's store uses. The
-/// calling Worker must pre-open `path` (`opfsPreopenWrite`) first. Proves the wasm↔OPFS
-/// sync-handle path works in a real browser before the full store rides on it.
 #[cfg(target_arch = "wasm32")]
 pub fn opfs_selftest(path: &str, bytes: &[u8]) -> Result<Vec<u8>, String> {
     let p = std::path::Path::new(path);
@@ -45,7 +41,6 @@ pub fn opfs_selftest(path: &str, bytes: &[u8]) -> Result<Vec<u8>, String> {
     durable::read_file(dir, name).map_err(|e| e.to_string())
 }
 
-/// Split a deterministic OPFS path into `(dir, name)` for the `durable` backend.
 #[cfg(target_arch = "wasm32")]
 fn opfs_split(path: &str) -> Result<(&std::path::Path, &str), String> {
     let p = std::path::Path::new(path);
@@ -57,10 +52,6 @@ fn opfs_split(path: &str) -> Result<(&std::path::Path, &str), String> {
     Ok((dir, name))
 }
 
-/// Write `bytes` to the deterministic OPFS `path` through the signer's `durable` backend.
-/// `create_new` selects write-once (`true`, keeps existing content) vs. replace (`false`).
-/// The calling Worker must `opfsPreopenWrite(path)` first. Used by the stateful wasm signer
-/// for the pre-vault device files (`identity.sealed`, `profile.json`, `kek.salt`).
 #[cfg(target_arch = "wasm32")]
 pub fn opfs_put(path: &str, bytes: &[u8], create_new: bool) -> Result<(), String> {
     let (dir, name) = opfs_split(path)?;
@@ -72,8 +63,6 @@ pub fn opfs_put(path: &str, bytes: &[u8], create_new: bool) -> Result<(), String
     .map_err(|e| e.to_string())
 }
 
-/// Read the deterministic OPFS `path`, or `None` if absent. The calling Worker must
-/// `opfsPreopenRead(path)` first.
 #[cfg(target_arch = "wasm32")]
 pub fn opfs_get(path: &str) -> Result<Option<Vec<u8>>, String> {
     let (dir, name) = opfs_split(path)?;
@@ -84,8 +73,6 @@ pub fn opfs_get(path: &str) -> Result<Option<Vec<u8>>, String> {
     }
 }
 
-/// Whether the deterministic OPFS `path` exists with content. The calling Worker must
-/// `opfsPreopenRead(path)` first (an un-pre-opened path reads as absent).
 #[cfg(target_arch = "wasm32")]
 pub fn opfs_exists(path: &str) -> bool {
     match opfs_split(path) {
@@ -98,18 +85,15 @@ pub use crate::setup_transport::{DkgWire, DkgWireKind};
 use crate::signer::wysiwys::PaymentView;
 use reddsa_frost::frost::redpallas as frost;
 
-/// Opaque session handle. Carries no secret; it names an unlocked signer connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Session(pub [u8; 32]);
 
-/// Which network a coordinator is asking to connect for. Shown to the member on-device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Network {
     Regtest,
     Testnet,
 }
 
-/// Public vault metadata only — names, slots, setup status. No keys.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VaultRef {
     pub vault_id: [u8; 32],
@@ -119,9 +103,6 @@ pub struct VaultRef {
     pub ready: bool,
 }
 
-/// Public identity of the connected member: its roster id, Ed25519 setup signing key and
-/// long-lived X25519 encryption key (`setup_transport::Identity`). All zero for a signer
-/// built from a bare share with no setup identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemberIdentity {
     pub id: u16,
@@ -129,16 +110,12 @@ pub struct MemberIdentity {
     pub encryption: [u8; 32],
 }
 
-/// A session plus the public member identity it is bound to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Connection {
     pub session: Session,
     pub member: MemberIdentity,
 }
 
-/// One setup message handed to a signer, tagged with the member the coordinator says sent
-/// it. The tag is untrusted: the signer checks it against the message's own header and
-/// the sender's signature.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DkgInput {
     pub sender: u16,
@@ -146,8 +123,6 @@ pub struct DkgInput {
 }
 
 impl DkgInput {
-    /// A setup message the coordinator relayed, tagged with the sender its header names
-    /// (the relay's own sender is the coordinator).
     pub fn from_relay(bytes: Vec<u8>) -> Result<Self, String> {
         let wire = DkgWire::parse(bytes)?;
         Ok(Self {
@@ -157,17 +132,12 @@ impl DkgInput {
     }
 }
 
-/// The vault's receive address, released by a ready signer over a session the member
-/// approved on-device. Only [`Signer::release_address`] produces it. It carries no viewing
-/// key: the coordinator stays viewing-key-less.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReleasedAddress {
     pub vault_id: [u8; 32],
     pub address: String,
 }
 
-/// An unsigned, IO-finalized candidate PCZT built by the proposer signer. Public. Only a
-/// signer makes one, so it cannot carry arbitrary bytes onto the transport.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CandidatePczt(pub(crate) Vec<u8>);
 
@@ -181,7 +151,6 @@ impl CandidatePczt {
     }
 }
 
-/// Names a candidate the coordinator wants this member to commit/sign to. Public.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CandidateRef {
     pub vault_id: [u8; 32],
@@ -189,10 +158,6 @@ pub struct CandidateRef {
     pub attempt_id: [u8; 32],
 }
 
-/// The signing reference for spend `spend` of hosted payment `attempt`. Spend 0 is the attempt
-/// itself (so a one-note payment keeps its nonce file name); later spends derive their own
-/// `attempt_id`, so every spend has its own single-use nonce id (`payment_id ‖ attempt_id`).
-/// The native host and the browser co-signer both derive it here.
 pub fn hosted_spend_ref(vault_id: [u8; 32], attempt: [u8; 32], spend: usize) -> CandidateRef {
     let attempt_id = if spend == 0 {
         attempt
@@ -206,10 +171,6 @@ pub fn hosted_spend_ref(vault_id: [u8; 32], attempt: [u8; 32], spend: usize) -> 
     CandidateRef { vault_id, payment_id: attempt, attempt_id }
 }
 
-/// The PUBLIC payment effects the coordinator hands a signer to build an unsigned
-/// candidate. No viewing key, no note, no spend authority — just where the money goes,
-/// how much, the memo, and the validity window. The signer selects its own notes and
-/// uses its own held viewing key to build.
 #[derive(Clone)]
 pub struct PublicPaymentParams {
     pub recipient: orchard::Address,
@@ -243,8 +204,6 @@ pub struct PublicPaymentParams {
 pub trait Signer {
     type Error;
 
-    /// Show origin + network + challenge on the signer, biometric-unlock, return a
-    /// session bound to the member's PUBLIC identity. No secret crosses out.
     fn connect(
         &mut self,
         origin: &str,
@@ -252,24 +211,10 @@ pub trait Signer {
         challenge: &[u8],
     ) -> Result<Connection, Self::Error>;
 
-    /// Public vault metadata the member holds a share for.
     fn list_vaults(&self, session: &Session) -> Result<Vec<VaultRef>, Self::Error>;
 
-    /// Start a vault setup from the coordinator's roster document. The signer refuses a
-    /// roster without `"setup_version": 2` before anything else, runs the roster gate
-    /// (its own network and its full identity under its member number), then shows a
-    /// 24-digit code derived from the roster fingerprint on the device and blocks on the
-    /// member's match / no match / cancel decision under a deadline. Only a match saves
-    /// the roster. The coordinator never displays, confirms or cancels.
     fn dkg_begin(&mut self, session: &Session, roster: &[u8]) -> Result<VaultRef, Self::Error>;
 
-    /// Advance the confirmed setup with whatever peer messages have arrived, and return
-    /// this member's current outgoing messages. Each step saves its state, including the
-    /// exact outgoing bytes, before returning them, and a repeated call returns the saved
-    /// bytes again. The share is born INSIDE the signer and sealed before the certificate
-    /// is released; it is never returned. Before the share exists any mismatch is final:
-    /// the setup aborts and its secrets are wiped. After it, a bad message is refused and
-    /// the saved setup and share are kept.
     fn dkg_step(
         &mut self,
         session: &Session,
@@ -277,14 +222,8 @@ pub trait Signer {
         in_msgs: &[DkgInput],
     ) -> Result<Vec<DkgWire>, Self::Error>;
 
-    /// Run the on-device backup flow once every certificate matched: create the backup,
-    /// have the member store it and prove it reloads, then return this member's signed
-    /// backup receipt. The backup itself never crosses this seam. The vault is `ready`
-    /// only once every member's receipt has arrived through [`Signer::dkg_step`].
     fn backup(&mut self, session: &Session) -> Result<Vec<DkgWire>, Self::Error>;
 
-    /// The vault's receive address, once the vault is ready, over a session the member
-    /// approved on-device at [`Signer::connect`].
     fn release_address(&mut self, session: &Session) -> Result<ReleasedAddress, Self::Error>;
 
     /// Round 1: after the member's on-device "prepare" ack, return PUBLIC commitments.
@@ -295,12 +234,6 @@ pub trait Signer {
         cand: &CandidateRef,
     ) -> Result<frost::round1::SigningCommitments, Self::Error>;
 
-    /// Build the UNSIGNED candidate PCZT for this payment, under the coordinator-supplied
-    /// rerandomizers `alphas` (canonical 32-byte encodings, derived from the round-1
-    /// commitments), one per spent note. The signer uses its OWN held viewing key and its OWN
-    /// notes; the coordinator supplies only the public effects (`params`) and `alphas`. Returns
-    /// the serialized, IO-finalized candidate bytes that round 2 then renders and signs. The
-    /// coordinator never sees the viewing key or chooses the notes.
     fn build_candidate(
         &self,
         session: &Session,
@@ -309,15 +242,6 @@ pub trait Signer {
         alphas: &[[u8; 32]],
     ) -> Result<CandidatePczt, Self::Error>;
 
-    /// Round 2 (rerandomized): BLOCKS on in-signer parse + render + approval + sighash
-    /// binding. The signer independently parses `pczt`, checks its payment effects against
-    /// `params`, renders it (WYSIWYS), requires an approval decision, and VERIFIES that
-    /// `pkg.message()` equals the sighash recomputed from the rendered bytes — refusing
-    /// BEFORE touching the nonce/share if they differ. `params` comes from the coordinator;
-    /// the approval decision must use the independently derived render.
-    /// Only then is the PUBLIC partial signature produced under single-use nonce rules.
-    /// `randomizer` is the 32-byte rerandomization seed (the coordinator's public per-pair
-    /// seed; the randomizer scalar is regenerated from it + the commitments).
     fn sign_approve(
         &mut self,
         session: &Session,
@@ -328,8 +252,6 @@ pub trait Signer {
         randomizer: &[u8],
     ) -> Result<frost::round2::SignatureShare, Self::Error>;
 
-    /// What the member saw on-device for this candidate (for the coordinator's UI/audit).
-    /// Public facts only, derived from the PCZT.
     fn rendered_payment(
         &self,
         session: &Session,
@@ -341,13 +263,6 @@ pub trait Signer {
 
 #[cfg(test)]
 mod tests {
-    //! Type guard for the named return types of the signer seam.
-    //!
-    //! Every `Signer` success type is asserted to implement `PublicArtifact`, a marker
-    //! deliberately NOT implemented for any secret type, nor for raw bytes. Setup
-    //! messages cross as `DkgWire`, which only `setup_transport` constructs from a valid
-    //! setup-message frame.
-
     use super::*;
 
     /// Marker for types that are safe to cross the coordinator boundary. Implemented
@@ -370,26 +285,15 @@ mod tests {
 
     #[test]
     fn known_signer_return_types_are_public_artifacts() {
-        // Each line pins one `Signer` method's current success type. Opaque bytes need
-        // separate content checks; this cannot inspect newly added methods automatically.
-        assert_public::<Connection>(); // connect
-        assert_public::<Vec<VaultRef>>(); // list_vaults
-        assert_public::<VaultRef>(); // dkg_begin
-        assert_public::<Vec<DkgWire>>(); // dkg_step
-        assert_public::<Vec<DkgWire>>(); // backup
-        assert_public::<ReleasedAddress>(); // release_address
-        assert_public::<CandidatePczt>(); // build_candidate
-        assert_public::<frost::round1::SigningCommitments>(); // sign_commit
-        assert_public::<frost::round2::SignatureShare>(); // sign_approve
-        assert_public::<PaymentView>(); // rendered_payment
-                                        // disconnect returns ()
-
-        // Negative guard, stated in the type system: the secret types are NOT artifacts.
-        // Uncommenting any line below must fail to compile:
-        //   assert_public::<frost::keys::KeyPackage>();
-        //   assert_public::<frost::keys::SigningShare>();
-        //   assert_public::<frost::round1::SigningNonces>();
-        //   assert_public::<orchard::keys::FullViewingKey>();
-        //   assert_public::<Vec<u8>>();
+        assert_public::<Connection>();
+        assert_public::<Vec<VaultRef>>();
+        assert_public::<VaultRef>();
+        assert_public::<Vec<DkgWire>>();
+        assert_public::<Vec<DkgWire>>();
+        assert_public::<ReleasedAddress>();
+        assert_public::<CandidatePczt>();
+        assert_public::<frost::round1::SigningCommitments>();
+        assert_public::<frost::round2::SignatureShare>();
+        assert_public::<PaymentView>();
     }
 }

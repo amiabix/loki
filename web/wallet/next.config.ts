@@ -10,10 +10,6 @@ const nextConfig: NextConfig = {
       },
     },
   },
-  // Turbopack names the app chunk stably, so a code change can reuse a filename with new
-  // content. Served `immutable` (the default), that leaves returning visitors on stale JS after
-  // every deploy. Instead: always revalidate static chunks (ETag → 304 if unchanged, fresh JS if
-  // changed), and never cache the HTML shell so it always references the current build.
   async headers() {
     return [
       {

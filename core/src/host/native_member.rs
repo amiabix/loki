@@ -1,5 +1,3 @@
-//! In-process queries from LokiSigner, never from the loopback router.
-
 use std::{
     collections::BTreeMap,
     path::Path,
@@ -30,7 +28,6 @@ struct NativeMember {
 static RUNNING: Mutex<Option<Arc<NativeMember>>> = Mutex::new(None);
 #[cfg(test)]
 pub(super) static TEST_MEMBER: Mutex<()> = Mutex::new(());
-// The UI may request recovery, but only a local key failure for this launch grants it.
 static KEY_RECOVERY: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 
 struct NativeScope;
@@ -115,7 +112,6 @@ pub(super) fn clear_addresses_on_lock(state: &Shared) {
     }
 }
 
-/// A main-thread check before displaying or copying a result. Never wait for a session writer.
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
 pub(crate) fn can_view_addresses() -> bool {
     RUNNING.lock().is_ok_and(|running| running.as_ref().is_some_and(|member| {
@@ -135,7 +131,6 @@ pub(super) fn check_signing(state: &Shared, poll_control: impl FnOnce() -> Resul
     };
     check_unlocked()?;
     poll_control()?;
-    // The final call before the share is sent must catch a lock during the relay poll.
     check_unlocked()
 }
 
@@ -191,7 +186,6 @@ impl Diagnostics {
     fn record(&mut self, event: Event) {
         let (message, kind) = event.describe();
         if let Some(condition) = event.condition() {
-            // Polls repeat these every few seconds: log only the change.
             let failing = kind == Kind::Failing;
             if self.failing[condition] == failing { return; }
             self.failing[condition] = failing;
@@ -230,7 +224,6 @@ pub(crate) fn status(data: &Path, development_http: bool) -> Value {
         let active = !state.is_stopping();
         let unlocked = has_session && active;
         let count = if unlocked { state.wallet_tabs.as_ref().map_or(0, |tabs| tabs.count()) } else { 0 };
-        // Count on-disk vaults without opening shares or prompting for Touch ID.
         let vaults = unlocked.then(|| {
             match std::fs::read_dir(state.config.data.join("vaults")) {
                 Ok(entries) => Some(entries.flatten().filter(|entry| {
@@ -259,7 +252,6 @@ pub(crate) fn restore_running(words: Zeroizing<Vec<u8>>, file: &Path, fingerprin
     super::native_recovery::restore_running(&member.state, words, file, fingerprint)
 }
 
-/// Authenticates only a request constructed here, not a header or an HTTP caller.
 #[derive(Clone)]
 pub(super) struct InProcess(());
 
@@ -293,8 +285,6 @@ fn request_route(path: &str, write: bool, export: bool) -> Result<&str, RequestE
     Ok(path)
 }
 
-/// Execute the same Axum handlers and validation on the member's own runtime, with no HTTP hop.
-/// Dropping the runtime at lock drains any blocking library workers before the UI reopens it.
 pub(crate) fn wallet_request(path: &str, body: Option<Value>, export: bool) -> Value {
     fn dispatch(path: &str, body: Option<Value>, export: bool) -> Result<(StatusCode, Value), RequestError> {
         let path = request_route(path, body.is_some(), export)?;
@@ -339,7 +329,6 @@ pub(crate) fn wallet_request(path: &str, body: Option<Value>, export: bool) -> V
         }
         result
     }
-    // TEMPORARY verbose diagnostics: route (without query), status, time and the error text.
     let started = std::time::Instant::now();
     let route = path.split('?').next().unwrap_or(path).to_owned();
     let (status, data) = dispatch(path, body, export).unwrap_or_else(|(status, message)| (status, json!({ "error": message })));
@@ -352,8 +341,6 @@ pub(crate) fn wallet_request(path: &str, body: Option<Value>, export: bool) -> V
     json!({ "status": status.as_u16(), "data": data })
 }
 
-/// Snapshot the running member without keeping the process handle locked over a query. Discard
-/// the result if its member stopped or was replaced while the worker was doing I/O.
 fn with_running_member<T>(query: impl FnOnce(&NativeMember) -> Result<T, &'static str>) -> Result<T, &'static str> {
     let member = RUNNING.lock().map_err(|_| LIST_ERROR)?.clone().ok_or(LOCKED)?;
     if member.state.is_stopping() { return Err(LOCKED); }
@@ -365,7 +352,6 @@ fn with_running_member<T>(query: impl FnOnce(&NativeMember) -> Result<T, &'stati
     result
 }
 
-/// Called from a native worker thread, not a Tokio task or the app's main thread.
 pub(crate) fn vault_addresses() -> Result<Vec<Value>, &'static str> {
     vault_addresses_with(|| {})
 }
@@ -422,14 +408,12 @@ impl NativeMember {
     }
 
     fn address(&self, data: &Path, pass: &str, vault: &str, slot: u16, name: &str, generation: u64) -> Result<(&'static str, String), &'static str> {
-        // Don't migrate from vault.sealed or hold any host/cache lock over the Enclave prompt.
         let id = (vault.to_owned(), slot);
         let cached = self.viewing_keys.lock().map_err(|_| VAULT_ERROR)?.get(&id).cloned();
         let opened = cached.map_or_else(|| {
             let reason = super::custody::vault_touch_id_reason(&self.state, "verify the receive address for", vault, Some(name));
             SignerViewingKey::open(&self.state, data, pass, vault, slot, reason.as_deref())
         }, Ok);
-        // Read after any prompt, including when the store could not be opened for a legacy vault.
         let dir = ceremony::dir(data, vault).map_err(|_| VAULT_ERROR)?;
         let raw = Zeroizing::new(dir.read_sealed("vault.sealed", pass).map_err(|_| VAULT_ERROR)?);
         let sealed: Value = serde_json::from_slice(&raw).map_err(|_| VAULT_ERROR)?;
@@ -443,7 +427,6 @@ impl NativeMember {
             return Err(VAULT_ERROR);
         }
         let address = key.checked_address(&sealed, network).map_err(|_| VAULT_ERROR)?;
-        // Lock may have completed while Touch ID was open. Do not repopulate its cleared cache.
         let session = self.state.session.blocking_read();
         if session.is_none() || self.state.session_generation() != generation || self.state.is_stopping() {
             return Err(LOCKED);
@@ -462,7 +445,7 @@ mod tests {
             LINES.lock().unwrap().push(unsafe { std::ffi::CStr::from_ptr(line) }.to_str().unwrap().to_owned());
         }
         let mut quiet = Diagnostics::default();
-        quiet.record(Event::RelayUnavailable); // no sink: nothing to write, no panic
+        quiet.record(Event::RelayUnavailable);
         let mut diagnostics = Diagnostics { sink: Some(capture), ..Diagnostics::default() };
         diagnostics.record(Event::RelayReachable);
         for _ in 0..3 { diagnostics.record(Event::RelayUnavailable); }
@@ -510,7 +493,6 @@ mod tests {
 
         assert_eq!(check_signing(&state, || {
             assert!(request_stop());
-            // Shutdown has been requested, but the async runtime has not cleared the session.
             assert!(state.session.blocking_read().is_some());
             Ok(())
         }), Err("LokiSigner is locked".into()));
@@ -605,7 +587,6 @@ mod tests {
         assert_eq!(wallet["data"]["paired_coordinator"], "https://127.0.0.1:1", "offline does not change the pinned origin");
         assert!(vault_addresses().unwrap().is_empty(), "local features work while offline");
 
-        // Fake only the coordinator's public registration reply. Use the real tab handshake.
         let state = RUNNING.lock().unwrap().as_ref().unwrap().state.clone();
         let endpoint = state.config.lokisigner_url().unwrap();
         let member = super::super::registration::PublicMember {
@@ -633,7 +614,6 @@ mod tests {
         disconnect_wallet_tabs();
         assert_eq!(status(&data, false)["wallet_tabs"], 0);
         assert_eq!(access(&first).unwrap().status(), 401);
-        // A subsequent attempt still fails, but the modal warning is once per launch.
         assert_eq!(ready_rx.recv_timeout(std::time::Duration::from_secs(6)).unwrap_err(), std::sync::mpsc::RecvTimeoutError::Timeout);
 
         let second = connect();
@@ -812,7 +792,6 @@ mod tests {
             write(&dir, "vault.sealed", &invalid);
             assert_eq!(vault_addresses().unwrap(), vec![error_row.clone()], "changed {field}");
         }
-        // A consistent-looking address and network aren't evidence of the store's network.
         let mut wrong_network = sealed.clone();
         wrong_network["network"] = json!("regtest");
         wrong_network["group_address"] = json!(vault::regtest_unified_address(&fvk));
@@ -869,12 +848,11 @@ mod tests {
             let notice: LocalNotice = Arc::new(move |kind, _| {
                 assert_eq!(kind, "ready");
                 assert_eq!(RUNNING.lock().unwrap().is_some(), native);
-                // Only LokiSigner's entry attaches its roster dialog, and it is the one given.
                 let roster = RUNNING.lock().unwrap().as_ref()
                     .and_then(|member| member.state.roster_confirmation.as_ref().map(|confirm| confirm("{}")));
                 assert_eq!(roster, native.then_some(crate::host::RosterAnswer::Differ));
                 assert_eq!(std::thread::spawn(vault_addresses).join().unwrap(), Err("Unlock LokiSigner to view vault addresses."));
-                std::panic::panic_any(Ready); // Stop once startup reached ready, without leaving a listener running.
+                std::panic::panic_any(Ready);
             });
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if native {

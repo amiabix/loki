@@ -42,19 +42,15 @@ final class WalletChannel {
         validLaunch = launchProblem == nil
         self.window = window
         #if !LOKI_VISUAL_ONLY
-        // TEMPORARY: capture the member's verbose stderr per profile (see VerboseLog).
         if let index = signerArgs.firstIndex(of: "--data"), index + 1 < signerArgs.count {
             VerboseLog.start(dataFolder: signerArgs[index + 1])
         }
-        // Connects the member's fixed diagnostic events to ~/Library/Logs/LokiSigner.
         SignerLog.start()
         #endif
         signer = NativeSigner(args: signerArgs, link: nil, walletWindow: window)
         signer.promptChanged = { [weak channel] active in
             channel?.invokeMethod("nativePromptChanged", arguments: active)
         }
-        // Any end of an unlocked session drops a claim held for it. A link that arrives later,
-        // while locked, stays for the next explicit unlock.
         signer.sessionEnded = { [weak self] in self?.claim = nil }
         channel.setMethodCallHandler { [weak self] call, result in
             DispatchQueue.main.async {
@@ -158,8 +154,6 @@ final class WalletChannel {
             profile["can_recover_wallet_key"] = signer.canRecoverWalletKey
             profile["reduce_motion"] = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
             if #available(macOS 26, *) { profile["liquid_glass"] = true }
-            // Several signers on one Mac: name each window by its member slot (Mission Control,
-            // the Window menu and the Dock list it even though the title bar hides it).
             window?.title = (profile["slot"] as? NSNumber).map { "LokiSigner — Member \($0)" } ?? "LokiSigner"
             if profile["profile"] is String { result(profile) }
             else { result(failure(500, SignerStartFailure.dataFolderUnavailable.message)) }
@@ -173,7 +167,6 @@ final class WalletChannel {
             #if LOKI_VISUAL_ONLY
             result(failure(403, "This visual-only build cannot unlock, pair or restore a signer."))
             #else
-            // A new or restored profile must not inherit a claim bound to the old one.
             if call.method != "unlock" { claim = nil }
             guard signer.beginWalletOperation({ error in
                 if error == .cancelled { self.claim = nil }
@@ -271,7 +264,6 @@ final class WalletChannel {
             let status = reply["status"] as? Int ?? 500
             let data = reply["data"] as? [String: Any] ?? [:]
             if (200..<300).contains(status) { complete(data) }
-            // Backend text can quote a relay or lightwalletd; neutralise it before Flutter shows it.
             else { result(self.failure(status, untrustedText(data["error"] as? String ?? "LokiSigner request failed."),
                                        code: data["code"] as? String)) }
         }
@@ -297,10 +289,6 @@ final class WalletChannel {
 
 
 /// TEMPORARY verbose diagnostics. Everything this process writes to stdout and stderr (the
-/// member's own `eprintln!` lines, Swift and Flutter prints) goes to
-/// ~/Library/Logs/LokiSigner/<profile folder>.verbose.log, one timestamped line at a time.
-/// Unlike LokiSigner.log it can contain coordinator and relay error text and payment ids, so it
-/// stays private (0600 in a 0700 folder) and must be removed before release.
 enum VerboseLog {
     private final class Lines: @unchecked Sendable {
         var pending = Data()

@@ -4,7 +4,6 @@ import 'dart:ui' as ui;
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/widgets.dart';
 
-/// The decorative window background. Put it first in a full-window stack.
 class Vortex extends StatefulWidget {
   const Vortex({
     super.key,
@@ -54,7 +53,6 @@ class _VortexState extends State<Vortex> with SingleTickerProviderStateMixin {
   }
 
   void _tick(Duration elapsed) {
-    // The reference paints at 20 Hz and loops every 25 seconds.
     _cycle.value = (elapsed.inMilliseconds ~/ 50 % 500) / 500;
   }
 
@@ -83,7 +81,6 @@ class _VortexState extends State<Vortex> with SingleTickerProviderStateMixin {
 
 const _turn = 2 * math.pi;
 
-// The generator used in both Swift references.
 double Function() _random(int seed) => () {
   seed = (seed * 16807) % 2147483647;
   return seed / 2147483647;
@@ -126,7 +123,6 @@ class _VortexPainter extends CustomPainter {
       Paint()..color = dark ? const Color(0xff0a0c10) : const Color(0xfff6f7f9),
     );
 
-    // Mask the combined bloom, mesh and particles, not each stroke separately.
     canvas.saveLayer(bounds, Paint());
     const black = Color(0xff000000);
     final ui.Shader mask;
@@ -199,7 +195,6 @@ class _VortexPainter extends CustomPainter {
       );
     }
 
-    // The near lip occludes the lower part of the mesh inside the eye.
     final cx = eye.dx - w * 0.28 * _lipDepth.expansion;
     final cy = eye.dy + h * _lipDepth.rise;
     final rx = w * (0.024 + 1.08 * _lipDepth.expansion);

@@ -88,7 +88,6 @@ impl Gate {
         counts.total < REQUEST_CONCURRENCY && counts.fresh < FRESH_REQUEST_LIMIT
     }
 
-    /// One of 30 fresh slots. Never the leftover reserved progress slots.
     fn try_acquire_fresh(&self) -> Option<RequestPermit> {
         let mut counts = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         if !Self::fresh_available(&counts) {
@@ -102,7 +101,6 @@ impl Gate {
         })
     }
 
-    /// A read, not a request that still needs to upload a body.
     fn try_acquire_progress(&self) -> Option<RequestPermit> {
         let mut counts = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         if counts.total >= REQUEST_CONCURRENCY {
@@ -190,7 +188,6 @@ async fn admit_checked(gate: Gate, mut request: Request, next: Next) -> RelayRes
     let presence = match screened {
         Ok(presence) => presence,
         Err(RelayError::Capability) if write => {
-            // Preserve PUT body errors without granting writer capacity.
             let _permit = gate
                 .rejected_body
                 .try_acquire(request.extensions())
@@ -241,7 +238,6 @@ async fn health(request: Request) -> Response {
     }
 }
 
-/// The caller retains the DbWriter owner for the lifetime of this router.
 pub fn router(db: DbHandle) -> Router {
     let gate = Gate::new(db.clone());
     Router::new()
@@ -332,7 +328,6 @@ fn id(raw: &str) -> RelayResult<Id32> {
 }
 
 fn path(uri: &Uri) -> RelayResult<(Id32, Id32)> {
-    // Inspect the raw URI rather than decoded Path extractor values.
     let mut segments = uri.path().split('/');
     let parts = std::array::from_fn::<_, 6, _>(|_| segments.next().unwrap_or(""));
     if uri.query().is_some()
@@ -452,7 +447,6 @@ async fn nonce_route(Extension(gate): Extension<Gate>, request: Request) -> Resp
             .try_acquire(request.extensions())
             .ok_or(RelayError::RateLimit)?;
         let db = gate.db.clone();
-        // Verify enrollment and the signature over the advertised hash before reserving a body slot.
         let proof = tokio::task::spawn_blocking(move || {
             let _screening = screening;
             db.authenticate_nonce(mailbox, cid, challenge, record_hash, &proof)?;
@@ -562,8 +556,6 @@ async fn object_request(
         if matches!(admission, Some(AdmissionMark::Denied)) {
             return Err(RelayError::Capability);
         }
-        // Classification and queue admission run off the HTTP worker.
-        // The writer repeats validation, current auth, and the commit.
         let saved = enqueue_put(
             db,
             mailbox,
@@ -649,7 +641,6 @@ mod tests {
 const MAX_CONTROL_LEN: usize = 4096;
 
 fn control_path(uri: &Uri) -> RelayResult<(Id32, bool)> {
-    // Control paths must retain their raw spelling, just like object paths.
     let parts: Vec<_> = uri.path().split('/').collect();
     if uri.query().is_some()
         || !(parts.len() == 4 || parts.len() == 5)
@@ -712,7 +703,6 @@ async fn control_request(
 ) -> RelayResult<Response> {
     let (mailbox, rotate) = control_path(&uri)?;
     let capability = capability(&headers)?;
-    // Invalid authority can get a body error, but never enqueue a write.
     let capability = (!matches!(admission, Some(AdmissionMark::Denied)))
         .then_some(capability)
         .ok_or(RelayError::Capability);

@@ -49,7 +49,6 @@ use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 use reddsa_frost::frost::redpallas as frost;
 
-/// A 2-of-3 group with its key packages.
 struct Group {
     packages: BTreeMap<frost::Identifier, frost::keys::KeyPackage>,
     ids: Vec<frost::Identifier>,
@@ -76,12 +75,6 @@ fn group() -> Group {
     Group { packages, ids }
 }
 
-/// Scheme 1: a nonce pair derived deterministically from a seed and a package digest.
-///
-/// The signer's randomness is replaced by a stream keyed on what it is about to sign, so
-/// re-running the same publication reproduces the same nonce and a different package
-/// produces a different one. Only public API: `SigningNonces` is built through its normal
-/// constructor with a seeded stream standing in for the OS RNG.
 fn bound_nonces(
     share: &frost::keys::SigningShare,
     seed: &[u8; 32],
@@ -101,9 +94,6 @@ fn alpha(byte: u8) -> frost_rerandomized::Randomizer<frost::PallasBlake2b512> {
     frost_rerandomized::Randomizer::deserialize(&[byte; 32]).expect("canonical scalar")
 }
 
-/// Produce one share under a deliberately fixed scalar to isolate nonce binding.
-/// These adversarial tests vary the scalar independently of commitments; production
-/// review reconstructs parameters and signs using the saved library-generated seed.
 fn sign_one(
     g: &Group,
     me: &frost::Identifier,
@@ -113,7 +103,7 @@ fn sign_one(
     a: frost_rerandomized::Randomizer<frost::PallasBlake2b512>,
 ) -> Vec<u8> {
     let pkg = frost::SigningPackage::new(commitments, message);
-    #[allow(deprecated)] // Deliberately test independent scalar changes and nonce reuse.
+    #[allow(deprecated)]
     let share = frost_rerandomized::sign(&pkg, nonces, &g.packages[me], a).expect("sign");
     share.serialize()
 }
@@ -151,7 +141,6 @@ fn a2_baseline_reuse_is_detectable() {
         commitment_bytes(&mine),
         "the published commitment is the same in both runs, which is what makes this reuse",
     );
-    // This is the shape G3's extractOnReuse turns into a recovered key.
 }
 
 /// A.3 Scheme 1, same package replayed.
@@ -166,7 +155,6 @@ fn a3_same_package_replay_is_byte_identical() {
     let seed = [11u8; 32];
     let digest = b"proposal-1|pair-AC|sighash-abc";
 
-    // The co-signer is deterministic too, so the whole publication is reproducible.
     let theirs = bound_nonces(g.packages[&other].signing_share(), &[22u8; 32], digest);
 
     let first = bound_nonces(g.packages[&me].signing_share(), &seed, digest);
@@ -188,10 +176,6 @@ fn a3_same_package_replay_is_byte_identical() {
     );
 }
 
-/// A.4 Scheme 1, a different package.
-///
-/// A rolled-back device asked to sign something else must not reach the same nonce, or
-/// there is reuse to exploit.
 #[test]
 fn a4_a_different_package_changes_the_nonce() {
     let g = group();
@@ -216,23 +200,14 @@ fn a4_a_different_package_changes_the_nonce() {
     );
 }
 
-/// A.5 Scheme 1 under a re-committing co-signer. The step that decides whether binding to
-/// the package digest alone is sufficient.
-///
-/// Our nonce is bound to the package, so it does not move. But `rho` covers the whole
-/// commitment set, so if the other signer publishes a fresh commitment the binding factor
-/// changes underneath us. Same nonce, different share: the G3 reuse precondition, reached
-/// without the message changing at all.
 #[test]
 fn a5_a_recommitting_cosigner_defeats_package_binding() {
     let g = group();
     let (me, other) = (g.ids[0], g.ids[1]);
     let digest = b"proposal-1|pair-AC|sighash-abc";
 
-    // Bound, and identical across both runs by construction.
     let mine = bound_nonces(g.packages[&me].signing_share(), &[11u8; 32], digest);
 
-    // The co-signer commits twice. Nothing stops them: a commitment is cheap and public.
     let mut rng = rand_core::OsRng;
     let theirs_1 = frost::round1::SigningNonces::new(g.packages[&other].signing_share(), &mut rng);
     let theirs_2 = frost::round1::SigningNonces::new(g.packages[&other].signing_share(), &mut rng);
@@ -243,8 +218,6 @@ fn a5_a_recommitting_cosigner_defeats_package_binding() {
     let set_2: BTreeMap<_, _> =
         [(me, *mine.commitments()), (other, *theirs_2.commitments())].into();
 
-    // Same package digest, same message, same alpha, same nonce. Only the co-signer's
-    // commitment differs.
     let z1 = sign_one(&g, &me, &mine, set_1, b"the-message", alpha(7));
     let z2 = sign_one(&g, &me, &mine, set_2, b"the-message", alpha(7));
 
@@ -256,30 +229,18 @@ fn a5_a_recommitting_cosigner_defeats_package_binding() {
     );
 }
 
-/// A.6 Scheme 2, ordered binding. Does committing in a fixed order break the circle?
-///
-/// The obvious repair for A.5 is to bind the nonce to the co-signer's commitment as well,
-/// so a re-commitment moves our nonce instead of only moving `rho`. That is circular if
-/// both parties do it, since each would depend on the other's commitment. A fixed order
-/// looks like a way out: the lower identifier commits first bound to the package alone,
-/// and the higher binds to the package AND the lower's commitment.
-///
-/// This test runs both halves of that scheme and shows the asymmetry it produces.
 #[test]
 fn a6_ordered_binding_protects_only_the_second_signer() {
     let g = group();
     let (lo, hi) = (g.ids[0], g.ids[1]);
     let digest = b"proposal-1|pair-AC|sighash-abc";
 
-    // The lower identifier binds to the package only: it has nothing else yet.
     let lo_n = bound_nonces(g.packages[&lo].signing_share(), &[11u8; 32], digest);
 
-    // The higher binds to the package AND what the lower published.
     let mut ctx_1 = digest.to_vec();
     ctx_1.extend_from_slice(&commitment_bytes(&lo_n));
     let hi_n_1 = bound_nonces(g.packages[&hi].signing_share(), &[22u8; 32], &ctx_1);
 
-    // ── half one: the LOWER re-commits. The higher is protected. ────────────
     let lo_n_alt = bound_nonces(g.packages[&lo].signing_share(), &[99u8; 32], digest);
     let mut ctx_2 = digest.to_vec();
     ctx_2.extend_from_slice(&commitment_bytes(&lo_n_alt));
@@ -291,7 +252,6 @@ fn a6_ordered_binding_protects_only_the_second_signer() {
         "the second signer's nonce moves when the first re-commits, so it is never reused",
     );
 
-    // ── half two: the HIGHER re-commits. The lower is NOT protected. ────────
     let hi_other = {
         let mut c = ctx_1.clone();
         c.extend_from_slice(b"|a second commitment from the same signer");

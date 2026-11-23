@@ -49,8 +49,6 @@ pub fn router(store: Arc<Mutex<AdmissionStore>>) -> Router {
         Arc::new(AtomicBool::new(true)),
     )
 }
-/// As `router`, waking `provision` after accepted mailbox and terminal commands.
-/// `/health` reflects worker readiness.
 pub fn router_with_provisioning(
     store: Arc<Mutex<AdmissionStore>>,
     provision: Arc<Notify>,

@@ -1,4 +1,3 @@
-//! Disposable single-host TEST operator inputs. Never use these keys for custody.
 use ed25519_dalek::{Signer, SigningKey};
 use loki_relay_client::OperatorSet;
 use loki_relay_protocol::canonical::{self, Value};
@@ -175,7 +174,6 @@ fn grant(root: &Path, args: &[String]) -> Result<(), Box<dyn std::error::Error>>
         Value::Bytes(device.to_vec()),
         Value::Integer((now + 3600).into()),
         Value::Integer(1.into()),
-        // One setup and one message mailbox per member on each of the three relays.
         Value::Integer((6 * u64::from(members)).max(24).into()),
         Value::Bytes(operators.digest().to_vec()),
     ]))?;

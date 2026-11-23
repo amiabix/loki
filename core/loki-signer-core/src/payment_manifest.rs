@@ -1,5 +1,3 @@
-//! The exact payment intent shared by the payment signer and relay inbox.
-
 use crate::{
     intent::{ChangePolicy, Intent},
     member_state::MAX_MEMBERS,
@@ -10,7 +8,6 @@ use reddsa_frost::frost::redpallas as frost;
 use serde_json::{json, Value};
 
 pub const MAX_MANIFEST: usize = 8192;
-/// Notes one payment may spend: each is one Ironwood action and one FROST signature.
 pub const MAX_INPUTS: usize = 64;
 pub const PROPOSAL_DOMAIN: &[u8] = b"Loki_Proposal_v1\0";
 
@@ -42,7 +39,7 @@ fn number(value: &Value, field: &str) -> Result<u64, String> {
 
 pub fn manifest_pair(value: &Value) -> Result<[u16; 2], String> {
     let Some(pair) = value.get("pair") else {
-        return Ok([1, 2]); // Existing regtest manifests predate pair selection.
+        return Ok([1, 2]);
     };
     let ids = pair
         .as_array()
@@ -66,8 +63,6 @@ fn manifest_signers(value: &Value) -> Result<Vec<u16>, String> {
     match value["version"].as_u64() {
         Some(1) if value.get("signers").is_none() => Ok(manifest_pair(value)?.to_vec()),
         Some(2) if value.get("pair").is_none() => {
-            // One signer per threshold share. Two signers use the version 1 pair, so a
-            // signer list has 3 to 15 IDs (a vault has at most 16 members).
             let ids = value["signers"].as_array().ok_or("payment needs its signer IDs")?;
             if !(3..usize::from(MAX_MEMBERS)).contains(&ids.len()) {
                 return Err("payment needs 3 to 15 signer IDs".into());
@@ -305,7 +300,6 @@ mod tests {
         assert!(parse(&serde_json::to_vec(&value).unwrap()).is_err());
         value["signers"] = json!([1, 4, 2]);
         assert!(parse(&serde_json::to_vec(&value).unwrap()).is_err());
-        // 15-of-16: fifteen signers parse and match the certified policy; sixteen do not.
         value["signers"] = json!((1..=15).collect::<Vec<u16>>());
         let (context, intent) = parse(&serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(validate_roster([9; 32], 15, 1..=16, &context, &intent).is_ok());
