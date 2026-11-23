@@ -1659,7 +1659,7 @@ mod tests {
     #[wasm_bindgen_test]
     fn signing_is_refused_without_two_nonce_witnesses() {
         let mut signer = Signer::new();
-        let err = signer.sign_approve_impl(&"00".repeat(32), "", "", "", "", "{}").unwrap_err();
+        let err = signer.sign_approve_impl(&"00".repeat(32), 0, "", "", "", "", "{}").unwrap_err();
         assert!(err.contains("nonce witnesses"), "{err}");
         assert!(parse_witness_pins(&pins_json(1, 1)).is_err(), "the same witness twice");
         assert!(parse_witness_pins(&pins_json(0, 5)).is_err(), "a zero pin");
