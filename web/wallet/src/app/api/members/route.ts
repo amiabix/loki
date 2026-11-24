@@ -1,4 +1,5 @@
 import { connection } from "next/server";
+import { admitAttempt, clientAddress, refusal } from "@/lib/admission-limits";
 import { readRegistrationBody, registerMember, slots } from "@/lib/members";
 
 export async function GET(req: Request) {
@@ -12,9 +13,10 @@ export async function GET(req: Request) {
 
 export async function POST(req: Request) {
   try {
+    admitAttempt(clientAddress(req));
     const body = await readRegistrationBody(req);
     return Response.json({ member: await registerMember(body, new URL(req.url).origin) });
   } catch (error) {
-    return Response.json({ error: (error as Error).message }, { status: 400 });
+    return refusal(error);
   }
 }

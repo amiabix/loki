@@ -7,7 +7,7 @@ abstract interface class WalletApi {
   Future<Json> profile();
   Future<Json> request(String path, [Json? body]);
   Future<void> unlock();
-  Future<void> pair(String link);
+  Future<void> pair(String coordinatorOrLink);
   Future<String?> pendingInvite();
   Future<void> restore();
   Future<void> lock();
@@ -60,8 +60,8 @@ class MacWalletApi implements WalletApi {
   @override
   Future<void> unlock() => _channel.invokeMethod('unlock');
   @override
-  Future<void> pair(String link) =>
-      _channel.invokeMethod('pair', {'link': link});
+  Future<void> pair(String coordinatorOrLink) =>
+      _channel.invokeMethod('pair', {'link': coordinatorOrLink});
   @override
   Future<String?> pendingInvite() async {
     try {

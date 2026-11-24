@@ -1,10 +1,13 @@
+import { admitAttempt, clientAddress, refusal } from "@/lib/admission-limits";
 import { readRegistrationBody, issueRegistrationChallenge } from "@/lib/members";
 
 export async function POST(req: Request) {
   try {
+    const client = clientAddress(req);
+    admitAttempt(client);
     const body = await readRegistrationBody(req);
-    return Response.json(await issueRegistrationChallenge(body, new URL(req.url).origin));
+    return Response.json(await issueRegistrationChallenge(body, new URL(req.url).origin, client));
   } catch (error) {
-    return Response.json({ error: (error as Error).message }, { status: 400 });
+    return refusal(error);
   }
 }

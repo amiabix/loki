@@ -1,6 +1,6 @@
 # LokiSigner — member-owned native signer
 
-The native app claims a `loki://pair` link, sets up a persistent Secure Enclave P-256 device
+The native app pairs from a typed coordinator address (or a `loki://pair` link), sets up a persistent Secure Enclave P-256 device
 key for a new profile (or opens the existing key), and runs S4a self-registration. The coordinator receives public enrollment
 and a challenge signature. Profile passphrases, local session capabilities and FROST shares
 stay on the member device. The FROST share is encrypted with an Enclave-wrapped key; it is
@@ -13,7 +13,21 @@ LOKI_DEV_TEAM=B399KAT22M bash core/signer-app/build.sh
 open core/signer-app/out/LokiSigner.app
 ```
 
-On the wallet's sign-in screen open **Use a native member app instead**. It has two steps.
+The embedded app (the Flutter Runner, see [`apps/macos`](../../apps/macos/README.md)) pairs
+by address: choose **Pair this Mac**, type the coordinator address (for example
+`loki.megabyte.sh`), then review the coordinator and slot, the configuration, your passphrase
+and Touch ID. LokiSigner asks `POST /api/members/pairing` for the link itself and checks that it
+names the typed origin and the reserved slot. If the reservation expires before registration
+finishes, LokiSigner requests the same slot again without asking for your passphrase. If the
+reservation ran out before anything was signed, that happens by itself; if it ran out after
+Touch ID, LokiSigner first explains that Touch ID will ask once more. A refusal of that
+request is shown as its own reason, and only a slot registered to another member suggests
+removing the profile. A profile whose registration never finished asks for the address again,
+then unlocks and registers without a claim first, which also recovers a registration whose
+reply was lost; it requests its slot again only if that has expired.
+
+The standalone app and the wallet still work with links. On the wallet's sign-in screen open
+**Use a native member app instead**. It has two steps.
 
 1. **Pair a new native signer**: choose **Get a pairing link**. The wallet shows the reserved
    slot, the time left on the link, an **Open LokiSigner** button and **Copy link** (to open
@@ -23,8 +37,6 @@ On the wallet's sign-in screen open **Use a native member app instead**. It has 
      signer** (or see restore below if this is a replacement Mac).
    - "Pair this device with slot N?" with the coordinator origin. Choose **Continue** only if
      it is the wallet's address.
-   - "Verify the nonce witnesses". Paste the pair fingerprint you received through a trusted
-     channel from the witness operators, not from the wallet.
    - "Pair this device with slot N?" again, with the network and endpoints that coordinator
      chose (see below). Enter a local profile passphrase and choose **Pair**. Approve the
      Enclave prompt if macOS shows one.
@@ -39,8 +51,9 @@ On the wallet's sign-in screen open **Use a native member app instead**. It has 
    the wallet says so and you can continue to step 2. The roster alone cannot tell you whose
    app registered the slot. Compare the code on your own Mac before allowing the tab. When the two
    minutes run out first, the link and copy button go away; **Get a new link** asks for the
-   same slot again. A lapsed slot can go to another member: the wallet then says the slot was
-   taken, and the next link uses another slot. The wallet never asks for a new link by itself,
+   same slot again. While a link is live, nobody can ask for its slot, not even this wallet. A
+   lapsed slot can go to another member: the wallet then says the slot was taken, and the next
+   link uses another slot. The wallet never asks for a new link by itself,
    because each one reserves a slot.
 2. **Connect this wallet tab**: on **that same Mac**, unlock LokiSigner, select its slot in
    the wallet, and choose **Connect LokiSigner**. If the app is still registering, the tab
@@ -64,8 +77,8 @@ LokiSigner shows a warning, stays unlocked and keeps trying in the background. A
 a new pairing link waits for the registration result before reporting success.
 
 If you cancel, enter the wrong passphrase, or LokiSigner cannot start, choose **Try again**
-or **Quit**. If the coordinator refuses a pairing, retry the saved pairing or get a new link
-from the wallet. When the existing profile has no vault data, **Start over…** lets you set it
+or **Quit**. If the coordinator refuses a pairing, retry the saved pairing, pair again with
+the coordinator address, or get a new link from the wallet. When the existing profile has no vault data, **Start over…** lets you set it
 aside before pairing or restoring. Choose it from the **LokiSigner** menu or a retry dialog.
 Opening a pairing link while the signer is running does not interrupt it or replace its profile.
 LokiSigner moves the whole data folder to a dated sibling;
@@ -291,9 +304,8 @@ values its signer origin gives the browser signer (`LOKI_NETWORK`, `LOKI_FROSTD_
   signing would refuse. The request follows no redirect and times out. The app shows a fixed
   message on failure, not the coordinator’s reply or HTTP status.
 - **Saved once unlocked, and pinned.** The configuration is saved only after the local profile
-  unlocks. The coordinator origin, network, endpoints, witness pair and verified fingerprint are
-  atomically saved together in the owner-only (0600) `signer-config.json`. Older configurations
-  without a fingerprint require confirmation before the upgrade. A legacy `nonce-witnesses.json`
+  unlocks. The coordinator origin, network, endpoints, witness pair and its fingerprint are
+  atomically saved together in the owner-only (0600) `signer-config.json`. A legacy `nonce-witnesses.json`
   is never used with the new configuration. A wrong passphrase saves nothing. LokiSigner refuses
   configuration from another coordinator without changing the saved configuration. A new pairing
   link for the same coordinator and slot refreshes it once the member confirms and unlocks.
@@ -315,8 +327,10 @@ This applies only to the native app's pairing and unlock. `LokiSigner serve` and
 
 Pairing reserves a slot for 120 seconds. Both claim and registration are consumed once,
 including failed proofs; claiming does not extend the deadline. If it expires while saving
-recovery words, choose **Get a new link** in the wallet, which asks for the same slot (or,
-if another member took it meanwhile, a new one). After
+recovery words, enter the coordinator address again in LokiSigner (or choose **Get a new link**
+in the wallet), which asks for the same slot (or, from the wallet, a new one if another member
+took it meanwhile). A pairing started from an address renews an expired reservation once
+(after telling you Touch ID will ask again, if you had already approved). After
 a lost response, choose **Try again** and unlock; an outstanding reservation may need to expire before
 retry. Public device bindings prevent a different identity or slot from reusing the enrolled
 key.
@@ -356,11 +370,50 @@ the configuration comes from that origin, as described above.
 The native passphrase is passed to Rust in memory and the Swift byte buffer is immediately
 zeroed. `serve` retains S4a's local-file unlock for development automation only.
 
-### Verify the witness pair
+### Nonce witness changes
 
-Members must independently verify the first witness pair and any replacement. After upgrading
-an older profile, verify the saved pair even if its endpoints did not change. Operators can
-compute the fingerprint from their trusted `--nonce-witnesses` JSON file:
+Members never type a witness fingerprint. LokiSigner trusts the coordinator's witness pair
+only while the profile has no paired coordinator yet: a first pairing or a fresh restore. That
+pin is saved before the profile can sign, with the coordinator's full witness pair (keys, run
+IDs, mailboxes and URLs), even when launch-only flags keep the endpoints themselves unsaved; if
+the save fails, pairing or restore stops. A `--nonce-witnesses` file is launch-only too: that
+launch signs with it, but the pin is always the coordinator's pair. Unlocks run with the saved pair, so keeping it never
+depends on the coordinator. A paired profile with no saved pin treats any pair as a change.
+An existing pin is replaced only by a change the member approved with Touch ID, never by a
+retry, a refresh or a `--nonce-witnesses` launch (which keeps the saved pin). First use applies
+only when no pin exists. A pin that changed after the configuration was shown, or an approved
+change that can't be saved, stops startup and LokiSigner says so. If the new record is in place
+but its save can't be confirmed durable, LokiSigner says that the next unlock will most likely
+use it. With launch flags, the review shows which pair this launch signs with and which pair the
+next launch without flags uses.
+
+Every native launch (the wallet app, and the standalone app's native and serve modes, pairing,
+restore and witness approval) holds an exclusive lock on `<profile>.lock`, beside the profile
+folder, for its whole life. The lock is keyed on the folder's resolved absolute path, so a
+symlink, `.` or relative path to the same profile shares it. While one process holds it, no
+other can pair, restore, unlock or write that profile. After locking, the session reads and
+writes the profile only through the resolved path, so moving a symlink can't redirect it. Later:
+
+- **After each unlock** LokiSigner asks the paired coordinator once, in the background, for its
+  current `/api/signer-config`. A failed request is only logged; signing continues.
+- **A different pair** opens "The coordinator changed its nonce witnesses" with the saved and
+  new fingerprints (short form, full value selectable). **Keep current witnesses** is the
+  default and the Escape action and changes nothing; the screen may appear again after a later
+  unlock. Like a payment request, it never activates the app and waits for the member to focus it.
+- **Trust new witnesses** needs Touch ID. LokiSigner then fetches the configuration again and
+  saves the new pair only if the coordinator still serves exactly that pair and the saved
+  configuration is still the one this unlock runs with. Only the pair and its fingerprint change. The running signer
+  keeps the saved pair until the member locks and unlocks again. Nothing switches silently.
+- **A pairing link or refresh** that brings a different pair for the same coordinator shows
+  the same screen before the configuration review; pairing continues only after Touch ID.
+- A `--nonce-witnesses` launch flag overrides the pair for that launch and never prompts. With
+  any launch flag override, the background check is skipped, because nothing would be saved.
+- An approval applies only to the profile that is still running. If LokiSigner locks or the
+  profile is set aside before the save, nothing is written.
+
+Payments already in progress keep the pair they started with: their nonce records are bound to
+it. Operators can compute a pair's fingerprint from their trusted `--nonce-witnesses` JSON file,
+for members who want to compare it with the screen:
 
 ```sh
 node -e '
@@ -374,8 +427,8 @@ console.log(hash.digest("hex"));
 ' /path/to/witnesses.json
 ```
 
-Share only the 64-character fingerprint with members, through a channel they trust independently
-of the wallet. It covers both witnesses' relay keys, run IDs and mailbox IDs in file order, not
+Tell members before you rotate witnesses, through a channel they trust independently of the
+wallet. The fingerprint covers both witnesses' relay keys, run IDs and mailbox IDs in file order, not
 their URLs or credentials. An explicit local `--nonce-witnesses` file is itself trusted operator
 configuration. Outstanding attempts using legacy nonce records or a different pair need a fresh
 signing attempt, even after the replacement is approved. Do not delete existing burn records or

@@ -1043,9 +1043,9 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
         children: [
           LokiHead(
             'Signer setup',
-            enteringLink ? 'Enter pairing link' : 'Set up your signer',
+            enteringLink ? 'Enter coordinator address' : 'Set up your signer',
             enteringLink
-                ? 'Paste the one-use pairing link your coordinator issued for this member slot.'
+                ? 'Type the address of the coordinator you’re joining, for example loki.megabyte.sh. A pairing link from the wallet works too.'
                 : 'Pair a new signer with this Mac, or recover an existing signer.',
           ),
           Surface(
@@ -1058,7 +1058,7 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
                   children: [
                     Expanded(
                       child: LokiLabel(
-                        enteringLink ? 'Pairing link' : 'Start on this Mac',
+                        enteringLink ? 'Coordinator address' : 'Start on this Mac',
                       ),
                     ),
                     if (enteringLink)
@@ -1066,14 +1066,14 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
                   ],
                 ),
                 if (enteringLink)
-                  pairingLinkField()
+                  coordinatorAddressField()
                 else ...[
                   Text(
                     '01   Pair a new signer',
                     style: lokiSans(14, weight: 600),
                   ),
                   Text(
-                    'Use the one-use pairing link from your coordinator.',
+                    'Type your coordinator’s address, like loki.megabyte.sh.',
                     style: lokiSans(12, color: c.muted),
                   ),
                   const Divider(),
@@ -1091,7 +1091,7 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
           ),
           Notice(
             enteringLink
-                ? 'Next: check the coordinator and slot. Continue shows them before any request is sent.'
+                ? 'Next: LokiSigner asks the coordinator for a member slot, then shows you the coordinator and slot before anything is saved.'
                 : 'Adding or removing an enrolled fingerprint can make this Mac’s signer keys unusable. Keep your words and backup.',
           ),
           if (hasNativeFeedback) nativeFeedback(),
@@ -1121,7 +1121,7 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
                 busy || (enteringLink && pairingLink.trim().isEmpty)
                     ? null
                     : enteringLink
-                    ? submitPairingLink
+                    ? submitCoordinatorAddress
                     : () => setState(() {
                         enteringLink = true;
                         actionError = null;
@@ -1135,31 +1135,35 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
     );
   }
 
-  Widget pairingLinkField() => TextFormField(
+  Widget coordinatorAddressField() => TextFormField(
     initialValue: pairingLink,
     autofocus: true,
     readOnly: busy,
-    obscureText: true,
+    obscureText: pairingLink.trim().toLowerCase().startsWith('loki:'),
     autocorrect: false,
     enableSuggestions: false,
+    keyboardType: TextInputType.url,
     style: lokiMono(13),
     onChanged: (text) => setState(() {
       pairingLink = text;
       actionError = null;
     }),
+    onFieldSubmitted: (_) {
+      if (!busy && pairingLink.trim().isNotEmpty) submitCoordinatorAddress();
+    },
     decoration: const InputDecoration(
-      hintText: 'Paste pairing link',
-      prefixIcon: Icon(Icons.link, size: 17),
+      hintText: 'loki.megabyte.sh',
+      prefixIcon: Icon(Icons.dns_outlined, size: 17),
     ),
   );
 
-  void submitPairingLink() {
-    final link = pairingLink.trim();
+  void submitCoordinatorAddress() {
+    final entered = pairingLink.trim();
     setState(() {
       pairingLink = '';
       enteringLink = false;
     });
-    act(() => api.pair(link));
+    act(() => api.pair(entered));
   }
 
   Widget unfinishedPairing() => Column(
@@ -1167,9 +1171,9 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
     spacing: 10,
     children: [
       const Notice(
-        'This Mac’s registration with the coordinator didn’t finish. If the pairing link expired, ask the wallet for a new link for the same slot and paste it here.',
+        'This Mac’s registration with the coordinator didn’t finish. Enter the coordinator address again, then your passphrase: LokiSigner first tries to finish with this profile, and asks for its slot again only if that has expired.',
       ),
-      if (enteringLink) pairingLinkField(),
+      if (enteringLink) coordinatorAddressField(),
       Wrap(
         alignment: WrapAlignment.end,
         spacing: 8,
@@ -1193,12 +1197,12 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
                     }),
             ),
           ActionChipButton(
-            enteringLink ? 'Continue' : 'Paste a new pairing link',
-            Icons.link,
+            enteringLink ? 'Continue' : 'Pair again',
+            Icons.arrow_forward,
             busy || (enteringLink && pairingLink.trim().isEmpty)
                 ? null
                 : enteringLink
-                ? submitPairingLink
+                ? submitCoordinatorAddress
                 : () => setState(() {
                     enteringLink = true;
                     actionError = null;

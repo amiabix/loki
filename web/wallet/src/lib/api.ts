@@ -1,6 +1,6 @@
 "use client";
 
-import { signer, ApiError, onboardingGrant, type CreateSignerOpts, type EnrolledMember, type SignerSession, type UnlockOpts } from "./signer.ts";
+import { signer, ApiError, type CreateSignerOpts, type EnrolledMember, type SignerSession, type UnlockOpts } from "./signer.ts";
 import { isLokiSignerUrl } from "./lokisigner-url.ts";
 export { ApiError };
 export type { CustodyMethod, CreateSignerOpts, EnrolledMember, UnlockOpts } from "./signer";
@@ -178,9 +178,17 @@ export type PairingLink = { slot: number; url: string; expires: number };
 export class PairingSlotTaken extends Error {}
 const PAIRING_LINK = /^loki:\/\/pair\?[A-Za-z0-9%*._+=&-]+$/;
 const PAIRING_TTL_MS = 120_000;
-const PAIRING_REFUSALS: [string, (slot?: number) => string][] = [
-  ["a valid onboarding grant is required", () => "Open the onboarding link from your coordinator operator to pair a new signer."],
-  ["onboarding grant already used", () => "This onboarding link has already been used. Ask your coordinator operator for a new one."],
+function retryIn(header: string | null): string {
+  const seconds = /^\d{1,6}$/.test(header ?? "") ? Number(header) : NaN;
+  if (!(seconds > 0)) return "later";
+  if (seconds < 90) return "in about a minute";
+  if (seconds < 90 * 60) return `in about ${Math.round(seconds / 60)} minutes`;
+  return `in about ${Math.round(seconds / 3600)} hours`;
+}
+const PAIRING_REFUSALS: [string, (wait: string) => string][] = [
+  ["This coordinator has reached its sign-up limit", (wait) => `This coordinator has reached its sign-up limit for this hour. Try again ${wait}.`],
+  ["Too many pairing requests", (wait) => `Too many pairing requests from this network. Try again ${wait}.`],
+  ["no free slot", () => "All 16 member slots on this coordinator are taken."],
   ["too many pending registrations", () => "The coordinator has too many pairing links waiting. Try again in two minutes."],
   ["registration is busy", () => "The coordinator is busy registering another member. Try again in a moment."],
   ["expected an HTTPS origin", () => "This coordinator issues pairing links only over HTTPS. Open the wallet at its HTTPS address and try again."],
@@ -189,7 +197,7 @@ const PAIRING_REFUSALS: [string, (slot?: number) => string][] = [
 export async function requestPairingLink(slot?: number): Promise<PairingLink> {
   const res = await fetch("/api/members/pairing", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ slot, onboarding_grant: onboardingGrant() }), cache: "no-store",
+    body: JSON.stringify({ slot }), cache: "no-store",
   });
   const now = Date.now();
   const data = await res.json().catch(() => ({}));
@@ -199,7 +207,7 @@ export async function requestPairingLink(slot?: number): Promise<PairingLink> {
       throw new PairingSlotTaken(`${slot === undefined ? "That slot" : `Slot ${slot}`} was taken, possibly by another member. If LokiSigner is running and paired with that slot, connect in step 2. Otherwise get a new link; it will use another slot.`);
     }
     const known = PAIRING_REFUSALS.find(([prefix]) => error.startsWith(prefix));
-    throw new Error(known ? known[1](slot) : `The coordinator refused a pairing link (HTTP ${res.status}). Try again, or ask whoever runs it.`);
+    throw new Error(known ? known[1](retryIn(res.status === 429 ? res.headers.get("retry-after") : null)) : `The coordinator refused a pairing link (HTTP ${res.status}). Try again, or ask whoever runs it.`);
   }
   if (!Number.isSafeInteger(data.slot) || data.slot < 1 || !Number.isSafeInteger(data.expires)
     || typeof data.url !== "string" || !PAIRING_LINK.test(data.url)) {

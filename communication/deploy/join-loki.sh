@@ -8,9 +8,6 @@ fi
 coordinator=${1%/}
 slot=${2:-}
 [[ -z $slot || $slot =~ ^([1-9]|1[0-6])$ ]] || { echo "slot must be in 1..16" >&2; exit 2; }
-[[ ${LOKI_ONBOARDING_GRANT:-} =~ ^[0-9a-f]{64}$ ]] || { echo "an onboarding grant from the coordinator operator is required" >&2; exit 2; }
-grant=$LOKI_ONBOARDING_GRANT
-unset LOKI_ONBOARDING_GRANT
 
 deploy=$(cd "$(dirname "$0")" && pwd -P)
 repo=$(cd "$deploy/../.." && pwd -P)
@@ -34,9 +31,9 @@ else
   echo "frostd reachable via tunnel"
 fi
 
-requested_slot=
-if [[ -n $slot ]]; then requested_slot=",\"slot\":$slot"; fi
-if ! reservation=$(printf '{"onboarding_grant":"%s"%s}' "$grant" "$requested_slot" |
+body='{}'
+if [[ -n $slot ]]; then body="{\"slot\":$slot}"; fi
+if ! reservation=$(printf '%s' "$body" |
     curl -qfsS --globoff --proto '=https' --max-time 10 --max-filesize 4096 --data-binary @- -H 'Content-Type: application/json' "$coordinator/api/members/pairing" |
     python3 -c '
 import json, re, sys
