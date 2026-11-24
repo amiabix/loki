@@ -838,9 +838,14 @@ fn sync_control_inner(st: &AppState, data: &Path, pass: &str, vault: &str, v: &V
 }
 
 fn final_control_sessions(data: &Path, pass: &str, vault: &str) -> Result<BTreeSet<Uuid>, String> {
-    Ok(all_payments(data, pass, vault)?.iter()
-        .filter(|p| settled(p) && p.phase != "spent_unverified")
+    let payments = all_payments(data, pass, vault)?;
+    let live: BTreeSet<Uuid> = payments.iter()
+        .filter(|p| !(matches!(p.phase.as_str(), "confirmed" | "replaced") && p.tx_verified))
         .filter_map(|p| p.control_session_id)
+        .collect();
+    Ok(payments.iter()
+        .filter_map(|p| p.control_session_id)
+        .filter(|session| !live.contains(session))
         .collect())
 }
 
