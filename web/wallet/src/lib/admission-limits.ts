@@ -49,9 +49,14 @@ export function canonicalAddress(value: string): string | undefined {
     if (isIP(value) !== 6 || value.includes("%")) return undefined;
     const host = new URL(`http://[${value}]`).hostname.slice(1, -1);
     const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(host);
-    if (!mapped) return host;
-    const [high, low] = [parseInt(mapped[1], 16), parseInt(mapped[2], 16)];
-    return [high >> 8, high & 255, low >> 8, low & 255].join(".");
+    if (mapped) {
+      const [high, low] = [parseInt(mapped[1], 16), parseInt(mapped[2], 16)];
+      return [high >> 8, high & 255, low >> 8, low & 255].join(".");
+    }
+    // One client usually holds a whole /64, so count the network, not each address in it.
+    const [head, tail] = host.split("::").map((part) => (part ? part.split(":") : []));
+    const groups = tail ? [...head, ...Array(8 - head.length - tail.length).fill("0"), ...tail] : head;
+    return `${groups.slice(0, 4).join(":")}::/64`;
   } catch { return undefined; }
 }
 
@@ -64,25 +69,26 @@ export function clientAddress(req: Request): string {
 type Bucket = { table: Map<string, number[]>; overflow: number[] };
 const shared = globalThis as typeof globalThis & { lokiAdmissionBuckets?: Record<string, Bucket> };
 
-function charge(name: string, key: string, limits: { perMinute: number; perDay: number }, message: string,
+function charge(name: string, key: string, limits: { perMinute: number; perDay?: number }, message: string,
                 reasons: [Parameters<typeof logRefusal>[0], Parameters<typeof logRefusal>[0]], now: number) {
   const buckets = shared.lokiAdmissionBuckets ??= {};
   const bucket = buckets[name] ??= { table: new Map(), overflow: [] };
   const { table } = bucket;
+  const span = limits.perDay === undefined ? MINUTE : DAY;
   if (!table.has(key)) {
     for (const [oldest, seen] of table) {
-      if (table.size < MAX_CLIENTS || seen.some((at) => at > now - DAY)) break;
+      if (table.size < MAX_CLIENTS || seen.some((at) => at > now - span)) break;
       table.delete(oldest);
     }
   }
   const overflow = !table.has(key) && table.size >= MAX_CLIENTS;
-  const times = (overflow ? bucket.overflow : table.get(key) ?? []).filter((at) => at > now - DAY);
+  const times = (overflow ? bucket.overflow : table.get(key) ?? []).filter((at) => at > now - span);
   const save = (value: number[], latest: boolean) => {
     if (overflow) { bucket.overflow = value; return; }
     if (latest) table.delete(key);
     if (value.length || table.has(key)) table.set(key, value);
   };
-  if (times.length >= limits.perDay) {
+  if (limits.perDay !== undefined && times.length >= limits.perDay) {
     save(times, false);
     logRefusal(reasons[1]);
     throw new RateLimited(message, secondsUntil(times[times.length - limits.perDay] ?? now, DAY, now));
@@ -102,12 +108,12 @@ export function admitClient(client: string, now = performance.now()) {
 }
 
 export function admitAttempt(client: string, now = performance.now()) {
-  const limits = { perMinute: setting("LOKI_IP_REGISTRATION_PER_MINUTE", 60), perDay: Number.MAX_SAFE_INTEGER };
+  const limits = { perMinute: setting("LOKI_IP_REGISTRATION_PER_MINUTE", 60) };
   charge("registration", client, limits, ATTEMPT_LIMIT_MESSAGE, ["attempt minute limit", "attempt minute limit"], now);
 }
 
 export function admitResume(signing: string, now = performance.now()) {
-  charge("resume", signing, { perMinute: 6, perDay: Number.MAX_SAFE_INTEGER }, ATTEMPT_LIMIT_MESSAGE, ["resume limit", "resume limit"], now);
+  charge("resume", signing, { perMinute: 6 }, ATTEMPT_LIMIT_MESSAGE, ["resume limit", "resume limit"], now);
 }
 
 export function refusal(error: unknown): Response {

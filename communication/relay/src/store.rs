@@ -625,29 +625,7 @@ impl RelayStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let provisioned: bool = transaction.query_row(
-            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type='table' AND name='mailboxes')",
-            [],
-            |r| r.get(0),
-        )?;
-        if !provisioned {
-            return Err(RelayError::Capability);
-        }
-        let verifier: Option<Vec<u8>> = transaction
-            .query_row(
-                "SELECT append_verifier FROM mailboxes WHERE id=?1",
-                [mailbox.as_slice()],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let verifier: Id32 = verifier
-            .ok_or(RelayError::Capability)?
-            .try_into()
-            .map_err(|_| RelayError::StorageUnavailable)?;
-        setup_active(&transaction, mailbox)?;
-        if !append.verify(Role::Append, mailbox, &verifier) {
-            return Err(RelayError::Capability);
-        }
+        authenticate_mailbox(&transaction, mailbox, Role::Append, append)?;
         transaction.execute_batch(
             SCHEMA
                 .split_once(OBJECT_SCHEMA)
@@ -859,29 +837,7 @@ impl RelayStore {
 
     pub fn get(&mut self, mailbox: Id32, hash: Id32, read: &Capability) -> RelayResult<Vec<u8>> {
         let transaction = self.connection.transaction()?;
-        let provisioned: bool = transaction.query_row(
-            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type='table' AND name='mailboxes')",
-            [],
-            |r| r.get(0),
-        )?;
-        if !provisioned {
-            return Err(RelayError::Capability);
-        }
-        let verifier: Option<Vec<u8>> = transaction
-            .query_row(
-                "SELECT read_verifier FROM mailboxes WHERE id=?1",
-                [mailbox.as_slice()],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let verifier: Id32 = verifier
-            .ok_or(RelayError::Capability)?
-            .try_into()
-            .map_err(|_| RelayError::StorageUnavailable)?;
-        setup_active(&transaction, mailbox)?;
-        if !read.verify(Role::Read, mailbox, &verifier) {
-            return Err(RelayError::Capability);
-        }
+        authenticate_mailbox(&transaction, mailbox, Role::Read, read)?;
         let installed: bool = transaction.query_row(
             "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type='table' AND name='objects')",
             [],

@@ -33,15 +33,6 @@ pub mod store;
 pub mod wysiwys;
 
 #[cfg(target_arch = "wasm32")]
-pub fn opfs_selftest(path: &str, bytes: &[u8]) -> Result<Vec<u8>, String> {
-    let p = std::path::Path::new(path);
-    let dir = p.parent().ok_or("path needs a parent directory")?;
-    let name = p.file_name().and_then(|n| n.to_str()).ok_or("path needs a file name")?;
-    durable::write_durable(dir, name, bytes).map_err(|e| e.to_string())?;
-    durable::read_file(dir, name).map_err(|e| e.to_string())
-}
-
-#[cfg(target_arch = "wasm32")]
 fn opfs_split(path: &str) -> Result<(&std::path::Path, &str), String> {
     let p = std::path::Path::new(path);
     let dir = p.parent().ok_or("path needs a parent directory")?;
@@ -82,7 +73,6 @@ pub fn opfs_exists(path: &str) -> bool {
 }
 
 pub use crate::setup_transport::{DkgWire, DkgWireKind};
-use crate::signer::wysiwys::PaymentView;
 use reddsa_frost::frost::redpallas as frost;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -252,18 +242,13 @@ pub trait Signer {
         randomizer: &[u8],
     ) -> Result<frost::round2::SignatureShare, Self::Error>;
 
-    fn rendered_payment(
-        &self,
-        session: &Session,
-        cand: &CandidateRef,
-    ) -> Result<PaymentView, Self::Error>;
-
     fn disconnect(&mut self, session: Session) -> Result<(), Self::Error>;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::signer::wysiwys::PaymentView;
 
     /// Marker for types that are safe to cross the coordinator boundary. Implemented
     /// ONLY for public artifacts; never for shares, nonces, or viewing keys.

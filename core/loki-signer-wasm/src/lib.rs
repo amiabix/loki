@@ -1,16 +1,6 @@
-//! wasm-bindgen bindings for the in-browser FROST signer.
-//!
-//! Phase 3 slice: the trust-critical, persistence-free custody primitive, proven to run
-//! in the browser — seal/open a FROST share under a WebAuthn-PRF-derived KEK (W2's
-//! [`WebAuthnSecureElement`]). This is the piece the onboarding UX needs first: the share
-//! is wrapped under the passkey's PRF secret (released by Touch/Face ID / security key /
-//! phone) and persisted sealed; a reload re-derives the same KEK and reopens it.
-//!
-//! The full stateful `SignerModule` (web/wallet/src/lib/signer.ts) — `createSigner` →
-//! sealed share in OPFS, DKG/signing over the frostd transport, `request(path, body)` —
-//! builds on top of this once the synchronous OPFS store seam replaces `store.rs`'s
-//! `std::fs` (the core stays synchronous; the signer runs in a Web Worker where OPFS
-//! `createSyncAccessHandle` gives synchronous file I/O). See the Phase 3 report.
+//! wasm-bindgen bindings for the in-browser FROST signer. It runs in a Web Worker, keeps
+//! its sealed identity, shares and nonces in OPFS (synchronous access handles), and unlocks
+//! them with a KEK derived from a WebAuthn PRF secret or a passphrase.
 
 use loki_signer_core::setup_transport::{Identity, PublicIdentity};
 use loki_signer_core::signer::backup::{self, BackupArtifact, BackupMaterial};
@@ -35,7 +25,7 @@ use zcash_protocol::value::Zatoshis;
 use loki_signer_core::signer::secure_element::{
     fresh_kek_salt, SealedShare, SoftwareSecureElement,
 };
-use loki_signer_core::signer::secure_element_webauthn::{prf_kek, WebAuthnSecureElement};
+use loki_signer_core::signer::secure_element_webauthn::prf_kek;
 use loki_signer_core::signer::{
     opfs_exists, opfs_get, opfs_put, CandidateRef, Network, Session, Signer as SignerTrait,
     VaultRef,
@@ -122,35 +112,6 @@ fn prf32(prf_secret: &[u8]) -> Result<[u8; 32], String> {
     prf_secret
         .try_into()
         .map_err(|_| "WebAuthn PRF secret must be exactly 32 bytes".to_string())
-}
-
-fn seal_impl(prf_secret: &[u8], epoch: u64, plaintext: &[u8]) -> Result<Vec<u8>, String> {
-    let se = WebAuthnSecureElement::from_prf_secret(&prf32(prf_secret)?);
-    Ok(SealedShare::seal(&se, epoch, plaintext)?.to_bytes())
-}
-
-fn open_impl(prf_secret: &[u8], sealed: &[u8]) -> Result<Vec<u8>, String> {
-    let se = WebAuthnSecureElement::from_prf_secret(&prf32(prf_secret)?);
-    Ok(SealedShare::from_bytes(sealed)?.open(&se)?.to_vec())
-}
-
-#[wasm_bindgen(js_name = sealShareUnderPasskey)]
-pub fn seal_share_under_passkey(
-    prf_secret: &[u8],
-    epoch: u64,
-    plaintext: &[u8],
-) -> Result<Vec<u8>, JsError> {
-    seal_impl(prf_secret, epoch, plaintext).map_err(|e| JsError::new(&e))
-}
-
-#[wasm_bindgen(js_name = openShareWithPasskey)]
-pub fn open_share_with_passkey(prf_secret: &[u8], sealed: &[u8]) -> Result<Vec<u8>, JsError> {
-    open_impl(prf_secret, sealed).map_err(|e| JsError::new(&e))
-}
-
-#[wasm_bindgen(js_name = opfsSelftest)]
-pub fn opfs_selftest(path: &str, bytes: &[u8]) -> Result<Vec<u8>, JsError> {
-    loki_signer_core::signer::opfs_selftest(path, bytes).map_err(|e| JsError::new(&e))
 }
 
 pub const IDENTITY_PATH: &str = "loki/device/identity.sealed";
@@ -1071,6 +1032,9 @@ impl Signer {
             }
         }
         self.witness_pins = Some(pins);
+        if let Some(vs) = self.vault.as_mut() {
+            vs.signer.set_nonce_witness(Box::new(ClaimedAhead { pins, claimed: self.claimed.clone() }));
+        }
         Ok(true)
     }
 
@@ -1775,16 +1739,5 @@ mod tests {
         let mut prompts = browser_prompts("d", &[5u8; 32], material.vault_id, None, None, Arc::new(Mutex::new(None)));
         let err = prompts.backup.save(&backup::create(&material, &pass).unwrap()).unwrap_err();
         assert!(err.contains("recovery words"), "{err}");
-    }
-
-    #[wasm_bindgen_test]
-    fn prf_seal_open_round_trips_and_rejects_wrong_secret() {
-        let prf = [7u8; 32];
-        let share = b"a FROST signing share worth forging";
-
-        let sealed = seal_impl(&prf, 2, share).unwrap();
-        assert_eq!(open_impl(&prf, &sealed).unwrap(), share);
-        assert!(open_impl(&[8u8; 32], &sealed).is_err());
-        assert!(seal_impl(&[0u8; 16], 0, share).is_err());
     }
 }

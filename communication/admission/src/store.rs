@@ -458,9 +458,6 @@ impl AdmissionStore {
     pub fn pending(&self, now: u64, limit: usize) -> Result<Vec<ProvisionIntent>> {
         self.pending_kind(now, limit, false, 1)
     }
-    pub fn pending_retirement(&self, now: u64, limit: usize) -> Result<Vec<ProvisionIntent>> {
-        self.pending_kind(now, limit, true, 1)
-    }
     pub(crate) fn pending_kind(
         &self,
         now: u64,

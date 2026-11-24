@@ -1,7 +1,7 @@
 // WebAuthn PRF glue for the in-browser signer (ws1-signer §4, tiers 1 & 2).
 //
-// This is the ONLY place the passkey ceremony lives; the Rust `WebAuthnSecureElement`
-// (core/src/signer/secure_element_webauthn.rs) takes the 32-byte secret these functions return
+// This is the ONLY place the passkey ceremony lives; the Rust `prf_kek`
+// (core/loki-signer-core/src/signer/secure_element_webauthn.rs) takes the 32-byte secret these functions return
 // and derives the share-wrapping KEK (HKDF-SHA256). The secret never leaves the browser.
 //
 // Flow:

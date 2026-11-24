@@ -1,5 +1,5 @@
 use crate::{
-    store::{HashPresence, PutClass},
+    store::HashPresence,
     Capability, DbHandle, RelayError, RelayResult, Role,
 };
 use axum::{
@@ -505,21 +505,7 @@ async fn enqueue_put(
     capability: Capability,
     reserved_only: bool,
 ) -> RelayResult<crate::DbReply<crate::StoredResult>> {
-    tokio::task::spawn_blocking(move || {
-        if reserved_only {
-            let admission = db.classify_put(mailbox, object, capability)?;
-            return match admission.class {
-                Ok(PutClass::Fresh) => Err(RelayError::RateLimit),
-                Ok(PutClass::Duplicate(_))
-                | Err(RelayError::Conflict)
-                | Err(RelayError::Capability) => {
-                    db.put(mailbox, admission.object, admission.append)
-                }
-                Err(error) => Err(error),
-            };
-        }
-        db.put(mailbox, object, capability)
-    })
+    tokio::task::spawn_blocking(move || db.put_as(mailbox, object, capability, reserved_only))
     .await
     .map_err(|_| RelayError::StorageUnavailable)?
 }

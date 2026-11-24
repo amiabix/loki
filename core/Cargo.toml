@@ -21,7 +21,6 @@ orchard            = { package = "zakura-orchard", version = "=2.2.0" }
 zcash_primitives   = { package = "zakura-primitives", version = "=2.2.0" }
 pczt               = { package = "zakura-pczt", version = "=0.1.0-rc4", features = ["orchard", "signer", "io-finalizer", "prover", "spend-finalizer", "tx-extractor", "zcp-builder"] }
 reddsa_frost       = { package = "zakura-reddsa", version = "=2.2.0", features = ["frost"] }
-frost-core         = { version = "=3.0.0", features = ["serialization"] }
 frost-rerandomized = { version = "=3.0.0", features = ["serialization"] }
 pasta_curves       = { package = "zakura-pasta-curves", version = "=2.2.0" }
 group              = "0.14"

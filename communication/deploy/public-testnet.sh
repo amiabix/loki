@@ -13,6 +13,7 @@ web="$repo/web/wallet"
 
 frostd=${FROSTD_URL:-http://127.0.0.1:2744}
 frostd_host=${FROSTD_HOST:-omarchy}
+frostd_bin=${FROSTD_BIN:-/home/abix/frost-tools/target/debug/frostd}
 web_port=${WEB_PORT:-3011}
 cloudflared=/opt/homebrew/bin/cloudflared
 
@@ -33,7 +34,7 @@ else
   ssh -f -N -L 2744:localhost:2744 "$frostd_host" || true
   if ! reachable; then
     echo "starting frostd on $frostd_host"
-    ssh "$frostd_host" 'systemd-run --user --unit=frostd --collect /home/abix/frost-tools/target/debug/frostd -n -p 2744' || true
+    ssh "$frostd_host" "systemd-run --user --unit=frostd --collect $frostd_bin -n -p 2744" || true
     ssh -f -N -L 2744:localhost:2744 "$frostd_host" || true
     for _ in {1..25}; do reachable && break; sleep 0.4; done
   fi
@@ -53,7 +54,7 @@ done
 echo "coordinator public URL: $coordinator"
 
 echo "== coordinator (node server.js) PUBLIC_ORIGIN=$coordinator =="
-( cd "$web" && export PUBLIC_ORIGIN="$coordinator" PORT="$web_port" LOKI_REGISTRY="$root/registry.json" \
+( cd "$web" && export PUBLIC_ORIGIN="$coordinator" PORT="$web_port" LOKI_REGISTRY="$root/registry.json" LOKI_CLIENT_IP_HEADER=cf-connecting-ip \
   && exec node server.js >"$root/coordinator.log" 2>&1 ) &
 echo $! >> "$root/pids"
 for _ in {1..75}; do curl -sf --max-time 1 "http://127.0.0.1:$web_port/api/members" >/dev/null && break; sleep 0.2; done

@@ -220,6 +220,14 @@ test('pairing reserves one slot, claims once, and pins one device to one identit
     const { devices } = JSON.parse(readFileSync(process.env.LOKI_REGISTRY));
     assert.deepEqual(devices, [{ slot: 1, signing_pubkey: d.input.signing_pubkey, device_pubkey: moved2.input.device_pubkey,
       generation: 2, retired: [d.input.device_pubkey] }]);
+    const moved3 = newDevice(d);
+    const again = await members.issueRegistrationChallenge(moved3.input, origin);
+    assert.equal(again.replacement_generation, 3);
+    const authorization3 = sign(null, Buffer.from(['loki-member-device-replacement-v1', origin, moved3.input.signing_pubkey,
+      moved3.input.device_pubkey, 3, again.challenge].join('\n')), moved3.identity.privateKey).toString('hex');
+    assert.deepEqual(await members.registerMember(response(moved3, again, { replacement_authorization: authorization3 }), origin), member);
+    await assert.rejects(members.registerMember(response(moved2, replaced, { replacement_authorization }), origin), /challenge/);
+    assert.equal(JSON.parse(readFileSync(process.env.LOKI_REGISTRY)).devices[0].device_pubkey, moved3.input.device_pubkey);
     const thief = generateKeyPairSync('ed25519');
     await assert.rejects(members.issueRegistrationChallenge({ ...moved2.input, slot: undefined, signing_pubkey: thief.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('hex'),
       authorization: sign(null, Buffer.from(moved2.input.device_pubkey, 'hex'), thief.privateKey).toString('hex') }, origin), /device/);

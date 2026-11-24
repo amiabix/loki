@@ -199,11 +199,12 @@ The per-address counts live in memory, use the process's monotonic clock (a wall
 step changes nothing) and reset when the coordinator restarts. The hourly sign-up times are
 wall-clock and stored in the registry; a time later than the current clock still counts
 until the clock passes it. They track at
-most 10,000 addresses. When that's full, addresses idle for a day are dropped oldest first,
+most 10,000 addresses. When that's full, idle addresses are dropped oldest first (after a
+day for the pairing limits, after a minute for the per-minute registration limit),
 and if none are, new addresses share one overflow bucket with the same limits, so they're
 still admitted. The coordinator reads only the header named by `LOKI_CLIENT_IP_HEADER`,
 takes its first value and accepts it only if it's an IP address. IPv6 addresses are counted
-in one canonical spelling, and an IPv4-mapped IPv6 address counts as its IPv4 address. It never trusts `X-Forwarded-For` or any other
+by their /64 network, and an IPv4-mapped IPv6 address counts as its IPv4 address. It never trusts `X-Forwarded-For` or any other
 client header on its own. Without the setting, or when the header is missing or invalid,
 every request shares one bucket, so the limits still apply to everyone together. Set it
 only when a proxy you run always overwrites that header.

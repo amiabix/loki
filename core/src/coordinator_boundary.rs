@@ -150,13 +150,6 @@ mod tests {
             ) -> Result<reddsa_frost::frost::redpallas::round2::SignatureShare, ()> {
                 Err(())
             }
-            fn rendered_payment(
-                &self,
-                _: &Session,
-                _: &crate::signer::CandidateRef,
-            ) -> Result<crate::signer::wysiwys::PaymentView, ()> {
-                Err(())
-            }
             fn disconnect(&mut self, _: Session) -> Result<(), ()> {
                 Ok(())
             }

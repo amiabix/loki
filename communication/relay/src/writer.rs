@@ -440,8 +440,18 @@ impl DbHandle {
         object: Object,
         append: Capability,
     ) -> RelayResult<DbReply<StoredResult>> {
+        self.put_as(mailbox, object, append, false)
+    }
+    pub(crate) fn put_as(
+        &self,
+        mailbox: Id32,
+        object: Object,
+        append: Capability,
+        reserved_only: bool,
+    ) -> RelayResult<DbReply<StoredResult>> {
         let admission = self.classify_put(mailbox, object, append)?;
         let reserved = match admission.class {
+            Ok(PutClass::Fresh) if reserved_only => return Err(RelayError::RateLimit),
             Ok(PutClass::Fresh) => false,
             Ok(PutClass::Duplicate(_))
             | Err(RelayError::Conflict)

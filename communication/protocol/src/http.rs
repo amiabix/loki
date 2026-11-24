@@ -330,14 +330,6 @@ pub fn encode_namespace_control(
         uint(action as u64),
     ])
 }
-pub fn decode_setup_control(encoded: &[u8]) -> WireResult<(Vec<u8>, u64, bool)> {
-    let (creation, expires, action) = decode_namespace_control(encoded)?;
-    match action {
-        NamespaceAction::ReserveSetup => Ok((creation, expires, false)),
-        NamespaceAction::RetireSetup => Ok((creation, expires, true)),
-        _ => Err(WireError::Schema),
-    }
-}
 pub fn decode_namespace_control(encoded: &[u8]) -> WireResult<(Vec<u8>, u64, NamespaceAction)> {
     let value = decode_metadata(encoded)?;
     let f = array(&value, 4)?;

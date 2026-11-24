@@ -13,7 +13,6 @@ pub mod frost_roster;
 mod nonce_binding;
 pub mod payment_transport;
 pub mod profile;
-pub mod refresh;
 pub mod host;
 #[cfg(feature = "relay-communication")]
 pub mod relay_member;
@@ -21,7 +20,6 @@ pub mod rpc;
 pub mod scan;
 pub mod scanstate;
 pub mod setup_ceremony;
-pub mod sign_transport;
 pub mod transport;
 pub mod tx_finalize;
 pub mod wallet_store;

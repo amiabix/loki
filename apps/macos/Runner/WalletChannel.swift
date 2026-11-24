@@ -272,10 +272,12 @@ final class WalletChannel {
 }
 
 
-/// TEMPORARY verbose diagnostics. Everything this process writes to stdout and stderr (the
+/// TEMPORARY verbose diagnostics. Everything this process writes to stdout and stderr goes to
+/// ~/Library/Logs/LokiSigner/<profile>.verbose.log, which rotates once it passes 50 MB.
 enum VerboseLog {
     private final class Lines: @unchecked Sendable {
         var pending = Data()
+        var file: FileHandle?
         let formatter: ISO8601DateFormatter = {
             let formatter = ISO8601DateFormatter()
             formatter.formatOptions.insert(.withFractionalSeconds)
@@ -294,20 +296,15 @@ enum VerboseLog {
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700])
         let url = directory.appendingPathComponent("\(profile).verbose.log")
-        if let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? UInt64, size > limit {
-            let older = directory.appendingPathComponent("\(profile).verbose.previous.log")
-            try? FileManager.default.removeItem(at: older)
-            try? FileManager.default.moveItem(at: url, to: older)
-        }
-        let fd = open(url.path, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
-        guard fd >= 0 else { return }
-        let file = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        let older = directory.appendingPathComponent("\(profile).verbose.previous.log")
+        let lines = Lines()
+        lines.file = openLog(url, older: older)
+        guard lines.file != nil else { return }
         let pipe = Pipe()
         setvbuf(stdout, nil, _IOLBF, 0)
         dup2(pipe.fileHandleForWriting.fileDescriptor, STDOUT_FILENO)
         dup2(pipe.fileHandleForWriting.fileDescriptor, STDERR_FILENO)
         self.pipe = pipe
-        let lines = Lines()
         pipe.fileHandleForReading.readabilityHandler = { handle in
             let chunk = handle.availableData
             guard !chunk.isEmpty else { return }
@@ -318,9 +315,21 @@ enum VerboseLog {
                 var stamped = Data("\(lines.formatter.string(from: Date())) ".utf8)
                 stamped.append(line)
                 stamped.append(0x0A)
-                try? file.write(contentsOf: stamped)
+                try? lines.file?.write(contentsOf: stamped)
+            }
+            if let size = try? lines.file?.offset(), size > limit {
+                lines.file = openLog(url, older: older)
             }
         }
         FileHandle.standardError.write(Data("[verbose] LokiSigner \(ProcessInfo.processInfo.processIdentifier) started for profile \(profile)\n".utf8))
+    }
+
+    private static func openLog(_ url: URL, older: URL) -> FileHandle? {
+        if let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? UInt64, size > limit {
+            try? FileManager.default.removeItem(at: older)
+            try? FileManager.default.moveItem(at: url, to: older)
+        }
+        let fd = open(url.path, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        return fd >= 0 ? FileHandle(fileDescriptor: fd, closeOnDealloc: true) : nil
     }
 }
