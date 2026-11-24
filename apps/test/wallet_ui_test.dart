@@ -317,7 +317,7 @@ void main() {
       await tap(tester, find.text('Failed'));
       await tap(tester, find.text('Discard payment'));
       expect(find.text('Discard failed payment'), findsOneWidget);
-      expect(find.text('Releases the reserved input'), findsOneWidget);
+      expect(find.text('Releases the reserved notes'), findsOneWidget);
       expect(find.text(FixtureWallet.recipient), findsOneWidget);
       expect(find.text('TRANSACTIONS'), findsNothing);
       await tap(tester, find.text('Keep payment'));

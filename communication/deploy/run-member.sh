@@ -72,7 +72,7 @@ start_member "$port" "$data/member.log" "$data/pids" \
   --registration-slot "$slot" --profile-name "Member $slot" \
   ${advertise:+--peer-port "$peer_port" --advertise-url "$advertise"}
 
-curl -sf --max-time 10 "$coordinator/api/members" | grep -q "\"slot\": *$slot\|\"slot\":$slot" \
+curl -sf --max-time 10 "$coordinator/api/members" | grep -Eq "\"slot\": *$slot([,} ]|$)" \
   || { echo "warning: slot $slot not yet visible in $coordinator/api/members; registration retries, see $data/member.log" >&2; }
 
 echo "=============================================================="

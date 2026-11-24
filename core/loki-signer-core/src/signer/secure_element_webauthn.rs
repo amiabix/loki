@@ -1,46 +1,14 @@
-//! WebAuthn PRF backend of [`SecureElement`] (in-browser signer, ws1-signer §4
-//! "Hardware path" — the no-install tier).
-//!
-//! Like the Apple Enclave and the software fallback, this backend does NOT hold the FROST
-//! share: it only sources the KEK that wraps the per-share DEK. Here the KEK is derived from
-//! a **WebAuthn PRF secret** — a 32-byte secret bound to a passkey that the browser releases
-//! only after a user gesture. The same passkey (and therefore the same PRF secret, and the
-//! same KEK) can be fronted by:
-//!   1. a platform authenticator (Touch/Face ID, Windows Hello), or
-//!   2. a roaming/security key or cross-device phone passkey (hybrid/caBLE).
-//! Both tiers land in this one impl; only the WebAuthn ceremony differs, and that is JS in the
-//! browser (`core/web/webauthn_prf.js`). The Rust side takes the already-released PRF secret.
-//!
-//! Machines/browsers with no WebAuthn PRF use tier 3, the existing
-//! [`super::secure_element::SoftwareSecureElement::persistent`] (Argon2id-wrapped KEK +
-//! recovery words) — unchanged, just selected instead of this.
-//!
-//! The KEK is HKDF-SHA256(PRF secret) with a fixed domain-separation `info`, then the DEK
-//! wrap/unwrap is the proven [`SoftwareSecureElement`] format (XChaCha20-Poly1305). Nothing in
-//! [`super::secure_element::SealedShare`] changes; only the KEK source does.
+//! KEK for the in-browser signer, derived from a WebAuthn PRF secret: a 32-byte secret bound
+//! to a passkey that the browser releases only after a user gesture. The KEK is
+//! HKDF-SHA256(PRF secret) with a fixed domain-separation `info`; it is used with
+//! [`super::secure_element::SoftwareSecureElement::from_kek`], so the sealed format does not
+//! change. The passkey ceremony itself is JS (`core/web/webauthn_prf.js`).
 
-use super::secure_element::{OpenError, SecureElement, SoftwareSecureElement, WrappedDek};
 use hkdf::Hkdf;
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
 const KEK_INFO: &[u8] = b"Loki_signer_webauthn_prf_kek_v1";
-
-pub struct WebAuthnSecureElement {
-    inner: SoftwareSecureElement,
-}
-
-impl WebAuthnSecureElement {
-    /// Derive the KEK from a 32-byte WebAuthn PRF secret (the `prf.results.first` the browser
-    /// releases after the Touch/Face ID / security-key / phone gesture). The same passkey +
-    /// same salt always yields the same secret, so a reloaded signer re-derives the same KEK
-    /// and opens its sealed share.
-    pub fn from_prf_secret(prf_secret: &[u8; 32]) -> Self {
-        Self {
-            inner: SoftwareSecureElement::from_kek(prf_kek(prf_secret)),
-        }
-    }
-}
 
 pub fn prf_kek(prf_secret: &[u8; 32]) -> [u8; 32] {
     let hk = Hkdf::<Sha256>::new(None, prf_secret);
@@ -50,42 +18,9 @@ pub fn prf_kek(prf_secret: &[u8; 32]) -> [u8; 32] {
     *kek
 }
 
-impl SecureElement for WebAuthnSecureElement {
-    fn wrap_dek(&self, dek: &[u8; 32]) -> Result<WrappedDek, String> {
-        self.inner.wrap_dek(dek)
-    }
-
-    fn unwrap_dek(&self, wrapped: &WrappedDek) -> Result<Zeroizing<[u8; 32]>, OpenError> {
-        self.inner.unwrap_dek(wrapped)
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::signer::secure_element::SealedShare;
-
-    #[test]
-    fn prf_secret_seals_and_reopens_byte_identical() {
-        let prf = [9u8; 32];
-        let share = b"a FROST signing share worth forging";
-
-        let se = WebAuthnSecureElement::from_prf_secret(&prf);
-        let sealed = SealedShare::seal(&se, 3, share).unwrap();
-
-        let se_again = WebAuthnSecureElement::from_prf_secret(&prf);
-        let reopened = SealedShare::from_bytes(&sealed.to_bytes()).unwrap();
-        assert_eq!(&**reopened.open(&se_again).unwrap(), share);
-        assert_eq!(reopened.backup_epoch, 3);
-    }
-
-    #[test]
-    fn wrong_prf_secret_cannot_open() {
-        let se = WebAuthnSecureElement::from_prf_secret(&[1u8; 32]);
-        let wrong = WebAuthnSecureElement::from_prf_secret(&[2u8; 32]);
-        let sealed = SealedShare::seal(&se, 0, b"share").unwrap();
-        assert!(sealed.open(&wrong).is_err());
-    }
+    use crate::signer::secure_element::{SealedShare, SoftwareSecureElement};
 
     #[test]
     fn passphrase_fallback_path_seals_and_opens() {

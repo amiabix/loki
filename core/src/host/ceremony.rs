@@ -242,6 +242,7 @@ fn save_to(d: &MemberDir, pass: &str, c: &Ceremony) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     std::fs::rename(d.path().join(&temp), d.path().join("ceremony.sealed"))
+        .and_then(|_| std::fs::File::open(d.path())?.sync_all())
         .map_err(|e| e.to_string())
 }
 

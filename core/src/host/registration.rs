@@ -844,8 +844,13 @@ pub(super) fn save_coordinator(data: &std::path::Path, origin: &str, slot: u32) 
 fn write_coordinator(data: &std::path::Path, origin: &str, slot: u32) -> Result<(), String> {
     let saved = PairedCoordinator { origin: origin.into(), slot };
     let dir = MemberDir::create(data, "").map_err(|e| e.to_string())?;
-    dir.write_text("paired-coordinator.json.tmp", &serde_json::to_string(&saved).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    std::fs::rename(dir.path().join("paired-coordinator.json.tmp"), dir.path().join("paired-coordinator.json")).map_err(|e| e.to_string())
+    let raw = serde_json::to_vec(&saved).map_err(|e| e.to_string())?;
+    let tmp = dir.path().join("paired-coordinator.json.tmp");
+    std::fs::File::create(&tmp)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, &raw).and_then(|_| file.sync_all()))
+        .and_then(|_| std::fs::rename(&tmp, dir.path().join("paired-coordinator.json")))
+        .and_then(|_| std::fs::File::open(dir.path())?.sync_all())
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

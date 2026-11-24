@@ -312,7 +312,6 @@ pub struct LocalSigner<SE: SecureElement> {
     backup_device: Option<Box<dyn BackupDevice>>,
     session: Option<Session>,
     session_origin: Option<String>,
-    rendered: BTreeMap<[u8; 32], PaymentView>,
     approved: Option<([u8; 32], [u8; 32])>,
     candidate_notes: Vec<orchard::Note>,
 }
@@ -354,7 +353,6 @@ impl<SE: SecureElement> LocalSigner<SE> {
             backup_device: None,
             session: None,
             session_origin: None,
-            rendered: BTreeMap::new(),
             approved: None,
             candidate_notes: Vec::new(),
         }
@@ -1453,7 +1451,6 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
                 "candidate fee differs from ZIP-317 fee".into(),
             ));
         }
-        self.rendered.insert(cand.attempt_id, view.clone());
 
         let local_sighash = wysiwys::checked_sighash_of_pczt(pczt, self.fvk()?)?;
 
@@ -1479,20 +1476,6 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
         );
         drop(kp);
         share.map_err(|e| SignerError::Other(e.to_string()))
-    }
-
-    fn rendered_payment(
-        &self,
-        session: &Session,
-        cand: &CandidateRef,
-    ) -> Result<PaymentView, Self::Error> {
-        if self.session.as_ref() != Some(session) {
-            return Err(SignerError::NoSession);
-        }
-        self.rendered
-            .get(&cand.attempt_id)
-            .cloned()
-            .ok_or_else(|| SignerError::Other("no rendered payment for candidate".into()))
     }
 
     fn disconnect(&mut self, session: Session) -> Result<(), Self::Error> {

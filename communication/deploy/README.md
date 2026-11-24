@@ -206,10 +206,11 @@ keep it on loopback and put it behind a TLS terminator.
 
 Hosts ONLY the shared coordinator over a free cloudflared quick tunnel, so testers on
 other machines/networks join without hosting anything. It ensures frostd is reachable
-(ssh tunnel to `FROSTD_HOST`, default `omarchy`), opens
+(ssh tunnel to `FROSTD_HOST`, default `omarchy`, starting `FROSTD_BIN` there if needed), opens
 `cloudflared tunnel --url http://127.0.0.1:$WEB_PORT`, captures the printed
 `https://*.trycloudflare.com` URL, and starts the loopback-only coordinator with
-`PUBLIC_ORIGIN` set to that URL. Requires `/opt/homebrew/bin/cloudflared`.
+`PUBLIC_ORIGIN` set to that URL and `LOKI_CLIENT_IP_HEADER=cf-connecting-ip`, so rate limits
+count each client address. Requires `/opt/homebrew/bin/cloudflared`.
 
 ```sh
 communication/deploy/public-testnet.sh /absolute/new/pub-stack

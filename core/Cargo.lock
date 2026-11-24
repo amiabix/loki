@@ -2024,7 +2024,6 @@ dependencies = [
  "ciborium-io",
  "ed25519-dalek",
  "ff 0.14.0",
- "frost-core",
  "frost-rerandomized",
  "futures-util",
  "group 0.14.0",
