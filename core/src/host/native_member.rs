@@ -116,7 +116,7 @@ pub(super) fn clear_addresses_on_lock(state: &Shared) {
 }
 
 /// A main-thread check before displaying or copying a result. Never wait for a session writer.
-#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+#[cfg(all(feature = "relay-communication", any(all(target_os = "macos", feature = "apple-enclave"), all(target_os = "linux", feature = "linux-desktop"))))]
 pub(crate) fn can_view_addresses() -> bool {
     RUNNING.lock().is_ok_and(|running| running.as_ref().is_some_and(|member| {
         !member.state.is_stopping()
@@ -205,8 +205,8 @@ impl Diagnostics {
             Event::CoordinatorUnavailable => ("LokiSigner couldn’t reach the coordinator. Check your connection.", true),
             Event::RegistrationRefused => ("The coordinator refused to register this device.", true),
             Event::RegistrationKeyUnavailable => ("LokiSigner couldn’t use its device key to register.", true),
-            Event::PaymentApproved => ("Payment approved on this Mac.", false),
-            Event::PaymentRefused => ("Payment approval was refused or not completed on this Mac.", true),
+            Event::PaymentApproved => ("Payment approved on this device.", false),
+            Event::PaymentRefused => ("Payment approval was refused or not completed on this device.", true),
             Event::PaymentFailed => ("LokiSigner couldn’t complete the payment. Check the wallet for details.", true),
             Event::PaymentSigned => ("LokiSigner signed a payment.", false),
         };
@@ -633,7 +633,7 @@ mod tests {
         stop_rx.recv_timeout(timeout).unwrap().unwrap();
         worker.join().unwrap();
         assert!(state.session.blocking_read().is_none(), "stop clears the retained session");
-        let refused = "Payment approval was refused or not completed on this Mac.";
+        let refused = "Payment approval was refused or not completed on this device.";
         assert_eq!(status(&data, false)["last_error"], refused);
         #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
         {

@@ -432,7 +432,7 @@ void main() {
         },
         'payment-approve': () => approve.future,
       });
-      await start(tester, const MacWalletApi());
+      await start(tester, const NativeWalletApi());
       await _nativePromptChanged(true);
       snapshot.complete(false);
       await tester.pump();
@@ -494,7 +494,7 @@ void main() {
           return lock.future;
         },
       });
-      await start(tester, const MacWalletApi());
+      await start(tester, const NativeWalletApi());
       expect(find.text(notice), findsOneWidget);
       expect(find.text('Unlock your signer'), findsOneWidget);
       expectInline(tester);

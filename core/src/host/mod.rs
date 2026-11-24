@@ -9,9 +9,9 @@ mod custody;
 mod device;
 mod payment;
 mod native_config;
-#[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+#[cfg(any(test, all(feature = "relay-communication", any(all(target_os = "macos", feature = "apple-enclave"), all(target_os = "linux", feature = "linux-desktop")))))]
 mod native_member;
-#[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+#[cfg(any(test, all(feature = "relay-communication", any(all(target_os = "macos", feature = "apple-enclave"), all(target_os = "linux", feature = "linux-desktop")))))]
 mod native_recovery;
 mod nonce_witness;
 mod recovery;
@@ -22,20 +22,19 @@ mod routes;
 mod state;
 
 pub use state::Config;
-#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+#[cfg(all(feature = "relay-communication", any(all(target_os = "macos", feature = "apple-enclave"), all(target_os = "linux", feature = "linux-desktop"))))]
 pub(crate) use connect::{ConnectAttempt, LocalConnect};
 pub use registration::RegistrationConfig;
 pub use native_config::{Deployment, FetchedConfig, NativeConfig};
-#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
-pub(crate) use native_member::{disconnect_wallet_tabs, run_native, request_stop as native_request_stop, set_aside as native_set_aside, vault_addresses as native_vault_addresses};
-#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
-pub(crate) use native_member::can_view_addresses as native_can_view_addresses;
-#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
-pub(crate) use native_member::restore_running as native_restore_running;
-#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
-pub(crate) use native_member::{set_log_sink as native_set_log_sink, status as native_status, wallet_request as native_wallet_request};
-#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+#[cfg(all(feature = "relay-communication", any(all(target_os = "macos", feature = "apple-enclave"), all(target_os = "linux", feature = "linux-desktop"))))]
+pub(crate) use native_member::{can_view_addresses as native_can_view_addresses, disconnect_wallet_tabs, run_native,
+    request_stop as native_request_stop, restore_running as native_restore_running, set_aside as native_set_aside,
+    set_log_sink as native_set_log_sink, status as native_status, vault_addresses as native_vault_addresses,
+    wallet_request as native_wallet_request};
+#[cfg(all(feature = "relay-communication", any(all(target_os = "macos", feature = "apple-enclave"), all(target_os = "linux", feature = "linux-desktop"))))]
 pub(crate) use native_recovery::{clean_staging as native_clean_staging, profile_state as native_profile_state, restore_new as native_restore_new, REFUSED as NATIVE_RESTORE_REFUSED};
+#[cfg(all(feature = "relay-communication", any(all(target_os = "macos", feature = "apple-enclave"), all(target_os = "linux", feature = "linux-desktop"))))]
+pub(crate) use state::member_key_message as native_key_message;
 #[cfg(feature = "relay-communication")]
 pub use nonce_witness::WitnessConfig;
 pub use recovery::run_recovery_command;
@@ -74,7 +73,7 @@ impl ApprovalAttempt {
 
     fn ended(&self) -> Option<ApprovalEnd> { *self.state.lock().unwrap() }
 
-    #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
+    #[cfg(any(all(target_os = "macos", feature = "apple-enclave"), all(target_os = "linux", feature = "linux-desktop")))]
     pub(crate) fn cancellation_code(&self) -> u8 {
         self.ended().map_or(0, |reason| reason as u8)
     }
@@ -272,7 +271,7 @@ pub fn config_from_args(args: &[String]) -> Result<Config, String> {
 
 pub(crate) fn native_config_from_args(args: &[String]) -> Result<Config, String> {
     let mut config = parse_config(args, true)?;
-    config.secure_element = "apple".into();
+    config.secure_element = if cfg!(target_os = "linux") { "software" } else { "apple" }.into();
     Ok(config)
 }
 
@@ -387,7 +386,7 @@ fn run_local_with<G>(
     for url in config.peers.values() {
         crate::transport::require_tls_off_loopback(url)?;
     }
-    let _data_lock = if config.native { None } else { Some(recovery::lock_headless_data(&config.data)?) };
+    let _data_lock = if config.native && cfg!(target_os = "macos") { None } else { Some(recovery::lock_headless_data(&config.data)?) };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io' show Platform;
 import 'dart:ui' show ImageFilter;
 
 import 'package:flutter/services.dart';
@@ -10,7 +11,7 @@ import 'vaults.dart';
 import 'vortex.dart';
 import 'wallet_api.dart';
 
-void main() => runApp(const LokiApp(api: MacWalletApi()));
+void main() => runApp(LokiApp(api: NativeWalletApi(linux: Platform.isLinux)));
 
 class LokiApp extends StatefulWidget {
   const LokiApp({
@@ -75,7 +76,10 @@ class _Wallet extends StatefulWidget {
 
 class _WalletState extends State<_Wallet> {
   WalletApi get api => widget.api;
-  MacWalletApi? get macApi => api is MacWalletApi ? api as MacWalletApi : null;
+  NativeWalletApi? get macApi =>
+      api is NativeWalletApi ? api as NativeWalletApi : null;
+  bool get linux => macApi?.linux == true;
+  String get device => linux ? 'this device' : 'this Mac';
   Timer? timer;
   bool polling = false,
       busy = false,
@@ -136,7 +140,15 @@ class _WalletState extends State<_Wallet> {
     unawaited(poll());
   }
 
-  Future<void> watchNativePrompt(MacWalletApi mac) async {
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (macApi case final api? when api.linux) {
+      unawaited(api.nativePromptAppearance(context.colors.dark));
+    }
+  }
+
+  Future<void> watchNativePrompt(NativeWalletApi mac) async {
     var receivedEvent = false;
     mac.onNativePromptChanged(
       (active) {
@@ -530,13 +542,14 @@ class _WalletState extends State<_Wallet> {
         page == _Page.send ||
         (page == _Page.history && selection != null);
     final fresh = profile['profile'] == 'fresh';
+    final showVortex = nativePrompt == true
+        ? !linux
+        : !open || !{_Page.vaults, _Page.setup}.contains(page);
     return Scaffold(
       body: Stack(
         fit: StackFit.expand,
         children: [
-          if (nativePrompt == true ||
-              !open ||
-              !{_Page.vaults, _Page.setup}.contains(page))
+          if (showVortex)
             Vortex(
               dark: c.dark,
               still: still || fresh,
@@ -621,7 +634,7 @@ class _WalletState extends State<_Wallet> {
                             mainAxisAlignment: MainAxisAlignment.spaceBetween,
                             children: [
                               Text(
-                                'This Mac',
+                                linux ? 'This device' : 'This Mac',
                                 style: lokiSans(10, color: c.muted),
                               ),
                               Text(
@@ -832,10 +845,10 @@ class _WalletState extends State<_Wallet> {
                               ),
                               const SizedBox(height: 30),
                               if (setup) ...[
-                                caption('On this Mac'),
+                                caption('On $device'),
                                 nav(
                                   'Signer setup',
-                                  Icons.laptop_mac,
+                                  linux ? Icons.computer : Icons.laptop_mac,
                                   fresh,
                                   null,
                                 ),
@@ -915,7 +928,9 @@ class _WalletState extends State<_Wallet> {
                             radius: 16,
                             backgroundColor: c.secondary,
                             child: Icon(
-                              setup ? Icons.laptop_mac : Icons.person_outline,
+                              setup
+                                  ? (linux ? Icons.computer : Icons.laptop_mac)
+                                  : Icons.person_outline,
                               color: c.ink,
                               size: 17,
                             ),
@@ -934,13 +949,15 @@ class _WalletState extends State<_Wallet> {
                                   style: lokiSans(12, weight: 600),
                                 ),
                                 Text(
-                                  'This Mac',
+                                  linux ? 'This device' : 'This Mac',
                                   style: lokiSans(10, color: c.muted),
                                 ),
                               ],
                             ),
                           ),
-                          if (!setup || nativePrompt == true || locking)
+                          if (!setup ||
+                              (!linux && nativePrompt == true) ||
+                              locking)
                             lockControl()
                           else
                             Icon(Icons.lock_outline, color: c.muted, size: 17),
@@ -970,7 +987,7 @@ class _WalletState extends State<_Wallet> {
             enteringLink ? 'Enter pairing link' : 'Set up your signer',
             enteringLink
                 ? 'Paste the one-use pairing link your coordinator issued for this member slot.'
-                : 'Pair a new signer with this Mac, or recover an existing signer.',
+                : 'Pair a new signer with $device, or recover an existing signer.',
           ),
           Surface(
             padding: const EdgeInsets.all(18),
@@ -982,7 +999,7 @@ class _WalletState extends State<_Wallet> {
                   children: [
                     Expanded(
                       child: LokiLabel(
-                        enteringLink ? 'Pairing link' : 'Start on this Mac',
+                        enteringLink ? 'Pairing link' : 'Start on $device',
                       ),
                     ),
                     if (enteringLink)
@@ -1032,6 +1049,8 @@ class _WalletState extends State<_Wallet> {
           Notice(
             enteringLink
                 ? 'Next: check the coordinator and slot. Continue shows them before any request is sent.'
+                : linux
+                ? 'Your testnet keys are encrypted with your local passphrase. Keep your words and backup.'
                 : 'Adding or removing an enrolled fingerprint can make this Mac’s signer keys unusable. Keep your words and backup.',
           ),
           if (hasNativeFeedback) nativeFeedback(),
@@ -1056,7 +1075,7 @@ class _WalletState extends State<_Wallet> {
                     : () => act(api.restore),
               ),
               ActionChipButton(
-                enteringLink ? 'Continue' : 'Pair this Mac',
+                enteringLink ? 'Continue' : 'Pair $device',
                 Icons.arrow_forward,
                 busy || (enteringLink && pairingLink.trim().isEmpty)
                     ? null
@@ -1106,7 +1125,7 @@ class _WalletState extends State<_Wallet> {
                 ),
                 const SizedBox(height: 12),
                 Text(
-                  'Use your local profile passphrase to open LokiSigner on this Mac.',
+                  'Use your local profile passphrase to open LokiSigner on $device.',
                   style: lokiSans(13, color: c.muted),
                 ),
                 if (hasNativeFeedback) ...[
@@ -1159,6 +1178,7 @@ class _WalletState extends State<_Wallet> {
       return PaymentReview(
         vault: vault,
         attempt: attempt,
+        linux: linux,
         request: (path, [body]) => requestReview(epoch, path, body),
         close: () => go(page, attempt: selection),
       );
@@ -1468,10 +1488,10 @@ class _WalletState extends State<_Wallet> {
   Widget receive() => Column(
     crossAxisAlignment: CrossAxisAlignment.stretch,
     children: [
-      const LokiHead(
+      LokiHead(
         'Signer',
         'Vault addresses',
-        'Receive addresses are verified by this Mac before copying.',
+        'Receive addresses are verified by $device before copying.',
       ),
       const SizedBox(height: 20),
       Align(
@@ -1540,8 +1560,8 @@ class _WalletState extends State<_Wallet> {
                     : 'Choose an active vault to export a backup.',
               ),
               const SizedBox(height: 10),
-              const Text(
-                'The 24 words alone cannot recover a vault. Save the encrypted backup away from this Mac.',
+              Text(
+                'The 24 words alone cannot recover a vault. Save the encrypted backup away from $device.',
               ),
               const SizedBox(height: 12),
               Wrap(

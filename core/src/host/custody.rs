@@ -356,7 +356,8 @@ mod tests {
     use super::*;
 
     fn native_apple() -> AppState {
-        let config = super::super::native_config_from_args(&["--data".into(), "unused".into(), "--port".into(), "0".into()]).unwrap();
+        let mut config = super::super::native_config_from_args(&["--data".into(), "unused".into(), "--port".into(), "0".into()]).unwrap();
+        config.secure_element = "apple".into();
         AppState::new(config)
     }
 

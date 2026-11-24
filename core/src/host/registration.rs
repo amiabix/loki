@@ -109,7 +109,7 @@ pub(super) struct PublicMember {
 
 const COORDINATOR_UNREACHABLE: &str = "LokiSigner couldn’t reach the coordinator. Check your connection, then try again.";
 
-#[cfg(any(test, all(target_os = "macos", feature = "apple-enclave")))]
+#[cfg(any(test, all(target_os = "macos", feature = "apple-enclave"), all(target_os = "linux", feature = "linux-desktop")))]
 pub(super) async fn fetch_roster(client: &reqwest::Client, origin: &str, signing: &str) -> Result<Vec<PublicMember>, &'static str> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -543,7 +543,7 @@ const RESTORE_RETRY: &str = "Vault restored. LokiSigner could not reconnect to t
 /// One registration attempt; on success the public roster entry is saved and served.
 async fn register_once(st: &Shared, pass: Zeroizing<String>, pairing_claim: Option<String>, notice: Option<super::LocalNotice>) -> Result<PublicMember, RegistrationFailure> {
     let result = register_member(st, pass, pairing_claim, notice).await;
-    #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+    #[cfg(any(test, all(feature = "relay-communication", any(all(target_os = "macos", feature = "apple-enclave"), all(target_os = "linux", feature = "linux-desktop")))))]
     if st.config.native {
         use super::native_member::{emit_for, Event};
         emit_for(st, match &result {
@@ -564,7 +564,7 @@ async fn register_member(st: &Shared, pass: Zeroizing<String>, pairing_claim: Op
         let config = &owned.config;
         let launch = config.registration.as_ref().unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
-        #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+        #[cfg(any(test, all(feature = "relay-communication", any(all(target_os = "macos", feature = "apple-enclave"), all(target_os = "linux", feature = "linux-desktop")))))]
         if config.native && config.data.join(RESTORE_PENDING).is_file() {
             let pinned = RegistrationConfig::resume(&config.data, config.development_http)?;
             if pinned.coordinator != launch.coordinator || !config.data.join("identity.sealed").is_file() {

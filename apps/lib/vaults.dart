@@ -205,7 +205,7 @@ class VaultLibrary extends StatelessWidget {
               child: LokiHead(
                 'Workspace',
                 'All vaults',
-                'Your active vaults and setups in progress on this Mac.',
+                'Your active vaults and setups in progress on this device.',
               ),
             ),
             ActionChipButton('Join vault', Icons.link, busy ? null : join),
@@ -453,7 +453,7 @@ class _VaultFormState extends State<VaultForm> {
                     ),
                     SelectableText(creator, style: lokiMono(11)),
                     Text(
-                      'This older invite joins the creator directly. Its HTTPS origin must be an allowed peer on this Mac.',
+                      'This older invite joins the creator directly. Its HTTPS origin must be an allowed peer on this signer.',
                       style: lokiSans(11, color: context.colors.muted),
                     ),
                   ] else ...[

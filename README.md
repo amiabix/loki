@@ -36,8 +36,8 @@ server ever holds a share.
 
 | | Native | Browser |
 |---|---|---|
-| Where the share lives | On the member's machine, on macOS LokiSigner seals it under a Secure Enclave key | In the browser's private storage, sealed under a passkey or passphrase |
-| Approving a payment | A native dialog in LokiSigner. Touch ID unlocks the key; it does not approve the payment. | A signer page on its own origin, with a passkey prompt |
+| Where the share lives | On the member's machine: sealed under a Secure Enclave key on macOS, passphrase-protected on Linux | In the browser's private storage, sealed under a passkey or passphrase |
+| Approving a payment | A native signer dialog. On macOS, Touch ID unlocks the key; it does not approve the payment. | A signer page on its own origin, with a passkey prompt |
 
 The browser signer runs the same signer core compiled to WebAssembly, on a separate origin
 from the wallet, and whoever controls the site that serves it could capture the share.
@@ -67,10 +67,10 @@ cd ../wasm-transport    && wasm-pack build --target web
 cd ../../web/wallet     && npm install && npm run dev        # http://localhost:3001
 ```
 
-The signer must be served from its own origin and the relays need CORS for it, see
-[`web/wallet/README.md`](web/wallet/README.md) for the full setup,
-[`communication/deploy/`](communication/deploy/) for deploy scripts and
-[`core/signer-app/README.md`](core/signer-app/README.md) to build the macOS signer.
+The browser signer must be served from its own origin and the relays need CORS for it. See
+[`web/wallet/README.md`](web/wallet/README.md) for setup and [`communication/deploy/`](communication/deploy/) for deploy scripts.
+Build the Flutter desktop app for [Linux](apps/linux/README.md) or [macOS](apps/macos/README.md),
+or the [standalone macOS signer](core/signer-app/README.md).
 
 ### Regtest account-link recovery
 

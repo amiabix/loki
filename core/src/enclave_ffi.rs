@@ -1,4 +1,5 @@
-//! C-ABI entry points for the native signer app (`core/signer-app/`, LokiSigner.app).
+//! C-ABI entry points for the native signer apps. The enclave selftests and standalone
+//! `serve` entry point are macOS-only; Linux uses the embedded, passphrase-protected signer.
 //!
 //! The app is provisioned (Apple Team ID + profile), so — unlike a bare CLI — it is
 //! allowed to create a PERSISTENT, biometric-capable Secure Enclave key. This selftest
@@ -6,10 +7,11 @@
 //! under a persistent Enclave KEK, drops everything, reopens the SAME Enclave key by tag,
 //! and unseals — proving the share is held in the Enclave across "launches".
 
-use crate::signer::secure_element::SealedShare;
-use crate::signer::secure_element_apple::AppleSecureElement;
+#[cfg(target_os = "macos")]
+use crate::signer::{secure_element::SealedShare, secure_element_apple::AppleSecureElement};
 
 /// Returns 0 on success; small nonzero codes mark which step failed.
+#[cfg(target_os = "macos")]
 #[no_mangle]
 pub extern "C" fn loki_signer_enclave_selftest() -> i32 {
     let tag = b"cash.loki.signer.share.v1";
@@ -53,6 +55,7 @@ pub extern "C" fn loki_signer_enclave_selftest() -> i32 {
 /// quorum signs a payment the prover accepts. This is the ephemeral `cargo test`
 /// (`real_enclave_member_runs_dkg_and_signs`) with persistent keys — the share survives restart
 /// and `unwrap` is Face-ID-gated. Returns 0 on success.
+#[cfg(target_os = "macos")]
 #[no_mangle]
 pub extern "C" fn loki_signer_enclave_dkg_member_selftest() -> i32 {
     let tags: [&[u8]; 3] = [
@@ -84,7 +87,7 @@ pub extern "C" fn loki_signer_enclave_dkg_member_selftest() -> i32 {
 /// native signer: `LokiSigner serve --data <dir> --port <n> --frostd-url <url> --peer-port <n>
 /// --advertise-url <origin> --peer <slot=url>...`. Reads the member args from its argv (skipping the
 /// binary name and the `serve` verb), forces the Apple Enclave backend, and serves. Blocks.
-#[cfg(feature = "relay-communication")]
+#[cfg(all(target_os = "macos", feature = "relay-communication"))]
 #[no_mangle]
 pub extern "C" fn loki_member_app_serve() -> i32 {
     let args: Vec<String> = std::env::args().skip(2).collect();
@@ -159,6 +162,7 @@ pub extern "C" fn loki_member_app_disconnect_wallet_tabs() {
 /// and each quorum member's `sign_approve` asks the app's dialog through `approve`, exactly as
 /// the live member does. Shares use the software element, so it runs without enrolled
 /// biometrics. Returns 0 when signed, 3 when the member refused.
+#[cfg(target_os = "macos")]
 #[no_mangle]
 pub extern "C" fn loki_signer_approval_selftest(approve: NativeApprove) -> i32 {
     use crate::host::{ApprovalAnswer, ApprovalAttempt, ApprovalEnd, LocalApproval};
@@ -207,7 +211,7 @@ pub extern "C" fn loki_signer_approval_selftest(approve: NativeApprove) -> i32 {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 #[test]
 fn native_approval_does_not_sign_after_cancellation() {
     use std::ffi::{c_char, c_void};
@@ -357,7 +361,19 @@ pub unsafe extern "C" fn loki_member_app_wallet_request(path: *const std::ffi::c
             let Ok(value) = serde_json::from_slice(std::ffi::CStr::from_ptr(body).to_bytes()) else { return invalid(); };
             Some(value)
         };
-        crate::host::native_wallet_request(path, body, export == 1)
+        let response = crate::host::native_wallet_request(path, body, export == 1);
+        #[cfg(target_os = "linux")]
+        let response = {
+            let mut response = response;
+            // The Linux save dialog displays a separate fingerprint; don't change the HTTP reply.
+            if export == 1 && response["status"] == 200 {
+                if let Some(bytes) = response["data"]["backup"].as_str().and_then(|backup| hex::decode(backup).ok()) {
+                    response["data"]["fingerprint"] = crate::signer::backup::BackupArtifact(bytes).fingerprint().into();
+                }
+            }
+            response
+        };
+        response
     });
     let reply = result.unwrap_or_else(|_| serde_json::json!({ "status": 500, "data": { "error": "wallet request failed" } }));
     std::ffi::CString::new(reply.to_string()).map_or(std::ptr::null_mut(), std::ffi::CString::into_raw)
@@ -431,7 +447,7 @@ const RESTORED_BUT_STOPPED: &str = "restored-but-stopped";
 fn restore_reply(result: Result<(), &'static str>) -> *mut std::ffi::c_char {
     let reply = match result {
         Ok(()) => serde_json::json!({ "restored": true }),
-        Err(error) if crate::signer::secure_element_apple::member_key_message(error).is_some() =>
+        Err(error) if crate::host::native_key_message(error).is_some() =>
             serde_json::json!({ "error": "key-error", "key_error": error }),
         Err(error) => serde_json::json!({ "error": error }),
     };
@@ -510,7 +526,7 @@ pub unsafe extern "C" fn loki_member_app_restore_profile(
         let notice = native_notice(notify);
         crate::host::run_native(config, pass, notice, native_approval(approve),
             native_roster_confirmation(confirm_roster), (!launch.embedded).then(|| native_connect(connect)), fetched)
-            .map_err(|e| crate::signer::secure_element_apple::member_key_message(&e).unwrap_or(RESTORED_BUT_STOPPED))
+            .map_err(|e| crate::host::native_key_message(&e).unwrap_or(RESTORED_BUT_STOPPED))
     }));
     restore_reply(result.unwrap_or(Err(if published { RESTORED_BUT_STOPPED } else { error })))
 }
@@ -596,6 +612,7 @@ pub unsafe extern "C" fn loki_member_app_pair(
             "device-key" => 4,
             "registration-refused" => 5,
             "registration-failed" => 6,
+            #[cfg(target_os = "macos")]
             text if crate::signer::secure_element_apple::member_key_message(text).is_some() => {
                 use crate::signer::secure_element_apple::KeyFailure;
                 notice(if text == KeyFailure::Missing.message() { "startup-key-gone" } else { "startup-key" }, text);
@@ -638,6 +655,7 @@ mod native_pairing_tests {
         assert_eq!(refused, error);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn native_restore_replies_distinguish_key_errors_from_saved_but_stopped() {
         use crate::signer::secure_element_apple::KeyFailure;

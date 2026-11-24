@@ -859,8 +859,7 @@ class _HistoryPageState extends State<HistoryPage> {
         latest != null &&
         switch (action) {
           // The draft remains actionable if the original merely expires.
-          'retry' ||
-          'cancel' => !{
+          'retry' || 'cancel' => !{
             'confirmed',
             'replaced',
             'spent_unverified',
@@ -1476,11 +1475,13 @@ class PaymentReview extends StatefulWidget {
     required this.attempt,
     required this.request,
     required this.close,
+    this.linux = false,
   });
   final Json vault;
   final String attempt;
   final Request request;
   final VoidCallback close;
+  final bool linux;
 
   @override
   State<PaymentReview> createState() => _PaymentReviewState();
@@ -1662,9 +1663,11 @@ class _PaymentReviewState extends State<PaymentReview> {
         if (review != null)
           _PaymentDetails('Proposed payment', review, widget.vault),
         if (showingPreview)
-          const _ReviewNotice(
+          _ReviewNotice(
             'Not yet signed',
-            'Continuing opens the local signer. Touch ID unlocks the key; it does not approve this payment.',
+            widget.linux
+                ? 'Continuing opens signer review in this window. No payment is signed until you approve it there.'
+                : 'Continuing opens the local signer. Touch ID unlocks the key; it does not approve this payment.',
           ),
         if (status != null && !showingPreview) ...[
           Align(alignment: Alignment.centerLeft, child: _phasePill(status)),

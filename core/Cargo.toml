@@ -97,6 +97,7 @@ rustix = { version = "1", features = ["event", "fs", "process", "termios"] }
 probe-zip2005 = []
 # Apple Secure Enclave backend (macOS only): build.rs links enclave-spike/se_backend.swift.
 apple-enclave = ["loki-signer-core/apple-enclave"]
+linux-desktop = ["relay-communication"]
 setup-fault-injection = ["relay-communication"]
 relay-communication = []
 # Counts Argon2id derivations and prints `kdf_derivations=N` to stderr at exit.

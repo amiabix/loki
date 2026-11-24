@@ -236,7 +236,7 @@ pub(crate) fn profile_state(data: &Path) -> Result<&'static str, &'static str> {
             }
             // Allow only known files left by an interrupted native startup; everything else
             // requires explicit confirmation, even when we don't understand its contents.
-            Some(NATIVE_KEY_SCOPE | "paired-coordinator.json.tmp" | "signer-config.json.tmp" | "nonce-witnesses.json.tmp") if kind.is_file() => {},
+            Some(NATIVE_KEY_SCOPE | "paired-coordinator.json.tmp" | "signer-config.json.tmp" | "nonce-witnesses.json.tmp" | "member-app.lock") if kind.is_file() => {},
             _ => material = true,
         }
     }

@@ -20,10 +20,13 @@ abstract interface class WalletApi {
   Future<void> appearance(String mode);
 }
 
-class MacWalletApi implements WalletApi {
-  const MacWalletApi();
+class NativeWalletApi implements WalletApi {
+  const NativeWalletApi({this.linux = false});
+  final bool linux;
   static const _channel = MethodChannel('cash.loki/wallet');
 
+  Future<void> nativePromptAppearance(bool dark) =>
+      _channel.invokeMethod('nativePromptAppearance', dark);
   Future<bool> nativePromptActive() async =>
       await _channel.invokeMethod<bool>('nativePromptActive') ?? false;
   Future<void> leaveNativePrompt() =>
