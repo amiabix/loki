@@ -1,18 +1,19 @@
 import { createHmac, createPublicKey, randomBytes, timingSafeEqual, verify } from "node:crypto";
-import { closeSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { isLokiSignerUrl } from "./lokisigner-url.ts";
-import { freeSlot, grantDigest, grantedSlot, MAX_SLOT, otherPinnedSlots, registrationSlot, type RegisteredGrants } from "./member-admission.ts";
-import { registrationLock } from "./registration-lock.ts";
+import { admitClient, admitResume, checkSignups, logRefusal } from "./admission-limits.ts";
+import { freeSlot, MAX_SLOT, registrationSlot } from "./member-admission.ts";
+import { registrationLock, type RegistrationPool } from "./registration-lock.ts";
 import { newRelayChallenge, verifyRelayProof } from "./relay-registration.ts";
 
 export type Member = { slot: number; signing_pubkey: string; relay_pubkey: string; advertise_url: string; lokisigner_url?: string };
 type Enrollment = Omit<Member, "slot"> & { slot?: number; device_pubkey: string; authorization: string };
-type Challenge = { challenge: string; origin: string; enrollment?: Enrollment; pairing_slot?: number; expires: number; generation?: number; grant?: string; paired?: boolean; relay?: ReturnType<typeof newRelayChallenge> };
+type Challenge = { challenge: string; origin: string; enrollment?: Enrollment; pairing_slot?: number; expires: number; generation?: number; relay?: ReturnType<typeof newRelayChallenge> };
 type Device = { slot: number; signing_pubkey: string; device_pubkey: string; generation: number; retired: string[] };
-type GrantUse = { slot: number; retry_after: number; used: boolean };
-type Registry = { version: 1; access: Member[]; devices: Device[]; challenges: Challenge[]; grants: Record<string, GrantUse>; onboarding: RegisteredGrants; retired: string[]; replacement_key?: string };
+type Registry = { version: 1; access: Member[]; devices: Device[]; challenges: Challenge[]; signups: number[]; retired: string[]; replacement_key?: string };
 const CHALLENGE_TTL = 120_000;
+const MAX_PENDING_SLOTS = MAX_SLOT / 2;
 const publicFields = ["slot", "signing_pubkey", "relay_pubkey", "advertise_url", "lokisigner_url"];
 const enrollmentFields = [...publicFields, "device_pubkey", "authorization"];
 
@@ -78,7 +79,7 @@ export function slots(): Member[] {
 }
 
 function checkRegistryFields(data: Record<string, unknown>) {
-  fields(data, data.version === 1 ? ["version", "access", "devices", "challenges", "grants", "onboarding", "retired", "replacement_key"] : ["access"]);
+  fields(data, data.version === 1 ? ["version", "access", "devices", "challenges", "signups", "retired", "replacement_key"] : ["access"]);
 }
 
 function loadRegistry(file: string): Registry {
@@ -101,15 +102,9 @@ function loadRegistry(file: string): Registry {
   });
   const retired = data.retired === undefined ? [] : data.retired;
   if (!Array.isArray(retired)) throw new Error("invalid retired identities");
-  const grants = Object.fromEntries(Object.entries(object(data.grants === undefined ? {} : data.grants)).map(([key, raw]) => {
-    const use = object(raw);
-    fields(use, ["slot", "retry_after", "used"]);
-    if (typeof use.retry_after !== "number" || !Number.isSafeInteger(use.retry_after) || typeof use.used !== "boolean") throw new Error("invalid onboarding history");
-    return [hex(key, 32), { slot: registrationSlot(use.slot), retry_after: use.retry_after, used: use.used }];
-  }));
-  const onboarding = Object.fromEntries(Object.entries(object(data.onboarding === undefined ? {} : data.onboarding)).map(([key, slot]) =>
-    [hex(key, 32), slot === null ? null : registrationSlot(slot)]));
-  return { version: 1, access, devices, challenges, grants, onboarding, retired: retired.map((key) => hex(key, 32)),
+  const signups = data.signups === undefined ? [] : data.signups;
+  if (!Array.isArray(signups) || signups.some((at) => typeof at !== "number" || !Number.isSafeInteger(at))) throw new Error("invalid sign-up history");
+  return { version: 1, access, devices, challenges, signups, retired: retired.map((key) => hex(key, 32)),
     replacement_key: data.replacement_key === undefined ? undefined : hex(data.replacement_key, 32) };
 }
 export function memberById(id: number): Member | null {
@@ -126,16 +121,50 @@ function write(file: string, value: unknown) {
   } finally { rmSync(temp, { force: true }); }
 }
 
-async function changeRegistry<T>(change: (state: Registry, now: number) => T | Error): Promise<T> {
+function liveChallenges(state: Registry, now: number) {
+  state.challenges = state.challenges.filter((c) => c.expires > now && (c.enrollment ? !!c.relay : c.pairing_slot !== undefined));
+}
+
+const cache = globalThis as typeof globalThis & { lokiRegistrySnapshot?: { key: string; state: Registry } };
+
+function fileKey(file: string): string {
+  const stamp = (path: string) => {
+    try {
+      const s = statSync(path, { bigint: true });
+      return `${s.ino}:${s.size}:${s.mtimeNs}:${s.ctimeNs}`;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return "-";
+      throw error;
+    }
+  };
+  return `${file}\0${stamp(file)}\0${stamp(`${file}.devices`)}`;
+}
+
+function peekRegistry(now: number): Registry {
   const file = registryPath();
-  const unlock = await registrationLock(file);
+  const key = fileKey(file);
+  let snapshot = cache.lokiRegistrySnapshot;
+  if (snapshot?.key !== key) {
+    snapshot = cache.lokiRegistrySnapshot = { key, state: loadRegistry(file) };
+  }
+  const live = { ...snapshot.state };
+  liveChallenges(live, now);
+  return live;
+}
+
+async function changeRegistry<T>(pool: RegistrationPool, change: (state: Registry, now: number) => T | Error): Promise<T> {
+  const file = registryPath();
+  const unlock = await registrationLock(file, pool);
   try {
     const state = loadRegistry(file);
     const before = JSON.stringify(state);
     const now = Date.now();
-    state.challenges = state.challenges.filter((c) => c.expires > now && (c.enrollment ? !!c.relay : !!c.grant));
+    liveChallenges(state, now);
     const result = change(state, now);
-    if (JSON.stringify(state) !== before) write(file, state);
+    if (JSON.stringify(state) !== before) {
+      write(file, state);
+      cache.lokiRegistrySnapshot = { key: fileKey(file), state: structuredClone(state) };
+    }
     if (result instanceof Error) throw result;
     return result;
   } finally { unlock(); }
@@ -170,13 +199,20 @@ function checkDevice(e: Enrollment, bindings: Device[]): Device | undefined {
   return bindings.find((d) => d.signing_pubkey === e.signing_pubkey);
 }
 
-function occupied(state: Registry, signing?: string, automaticGrant?: string): Set<number> {
+function occupied(state: Registry, signing?: string): Set<number> {
   return new Set([
     ...state.access.map((m) => m.slot),
     ...state.devices.filter((d) => d.signing_pubkey !== signing && !state.retired.includes(d.signing_pubkey)).map((d) => d.slot),
     ...state.challenges.flatMap((c) => c.pairing_slot === undefined ? [] : [c.pairing_slot]),
-    ...(automaticGrant === undefined ? [] : otherPinnedSlots(automaticGrant, state.onboarding)),
   ]);
+}
+
+function checkPendingSlots(state: Registry) {
+  const held = new Set(state.challenges.flatMap((c) => c.pairing_slot === undefined ? [] : [c.pairing_slot]));
+  if (held.size >= MAX_PENDING_SLOTS) {
+    logRefusal("pending slots");
+    throw new Error("too many pending registrations");
+  }
 }
 
 function existingMember(e: Enrollment, state: Registry): Member | undefined {
@@ -188,16 +224,9 @@ function existingMember(e: Enrollment, state: Registry): Member | undefined {
   return existing;
 }
 
-function availableGrant(state: Registry, digest: string) {
-  const pinned = grantedSlot(digest, state.onboarding);
-  const prior = state.grants[digest];
-  if (prior?.used) throw new Error("onboarding grant already used");
-  return { pinned, prior };
-}
-
 export async function retireMember(signing: string): Promise<void> {
   hex(signing, 32);
-  await changeRegistry((state) => {
+  await changeRegistry("member", (state) => {
     if (state.retired.includes(signing)) return;
     if (!state.access.some((m) => m.signing_pubkey === signing) && !state.devices.some((d) => d.signing_pubkey === signing)) throw new Error("unknown member identity");
     state.retired.push(signing);
@@ -227,49 +256,72 @@ function replacementTag(key: string, prefix: Buffer, e: Enrollment, origin: stri
     .update(JSON.stringify([origin, generation, e])).digest().subarray(0, 16);
 }
 
+function replacementChallengeValid(key: string, challenge: string, e: Enrollment, origin: string, generation: number, now: number) {
+  const wire = Buffer.from(challenge, "hex");
+  const timestamp = wire.readBigUInt64BE();
+  return timestamp <= BigInt(now) && timestamp > BigInt(now - CHALLENGE_TTL)
+    && timingSafeEqual(wire.subarray(16), replacementTag(key, wire.subarray(0, 16), e, origin, generation));
+}
+
+function checkNewcomer(state: Registry, now: number, desired: number | undefined, signing?: string) {
+  if (state.access.length >= MAX_SLOT) throw new Error("no free slot (1..16)");
+  checkPendingSlots(state);
+  checkSignups(state.signups, now);
+  freeSlot(occupied(state, signing), desired);
+}
+
 function replacementRelay(key: string, challenge: string) {
   const seed = createHmac("sha256", Buffer.from(key, "hex")).update("replacement-relay/v1\0").update(challenge).digest();
   try { return newRelayChallenge(seed); } finally { seed.fill(0); }
 }
 
-export async function issuePairingChallenge(raw: unknown, origin: string) {
+export async function issuePairingChallenge(raw: unknown, origin: string, client?: string) {
   const body = object(raw);
-  fields(body, ["slot", "onboarding_grant"]);
+  fields(body, ["slot"]);
   publicOrigin(origin);
-  const grant = grantDigest(body.onboarding_grant);
-  grantedSlot(grant, loadRegistry(registryPath()).onboarding);
   const requested = body.slot === undefined ? undefined : registrationSlot(body.slot);
-  return changeRegistry((state, now) => {
-    const { pinned, prior } = availableGrant(state, grant);
-    if (requested !== undefined && requested !== (pinned ?? prior?.slot)) throw new Error("slot not authorized by onboarding grant");
-    let reservation = state.challenges.find((c) => c.grant === grant);
-    if (reservation) {
-      if (reservation.enrollment || reservation.origin !== origin || (pinned !== undefined && reservation.pairing_slot !== pinned)) throw new Error("onboarding grant already has a pending registration");
-    } else {
-      if (prior && now < prior.retry_after) throw new Error("onboarding grant issuance is rate limited");
-      if (state.access.length >= MAX_SLOT) throw new Error("no free slot (1..16)");
-      if (state.challenges.filter((c) => !c.enrollment).length >= MAX_SLOT / 2) throw new Error("too many pending registrations");
-      const id = freeSlot(occupied(state, undefined, pinned === undefined ? grant : undefined), pinned ?? requested);
-      const expires = now + CHALLENGE_TTL;
-      reservation = { challenge: randomBytes(32).toString("hex"), origin, pairing_slot: id, grant, expires };
-      state.challenges.push(reservation);
-      state.grants[grant] = { slot: id, retry_after: expires, used: false };
-    }
-    const { pairing_slot: id, challenge, expires } = reservation;
-    if (id === undefined) throw new Error("invalid pairing reservation");
+  if (client !== undefined) admitClient(client);
+  checkNewcomer(peekRegistry(Date.now()), Date.now(), requested);
+  return changeRegistry("newcomer", (state, now) => {
+    if (state.access.length >= MAX_SLOT) throw new Error("no free slot (1..16)");
+    checkPendingSlots(state);
+    state.signups = checkSignups(state.signups, now);
+    const id = freeSlot(occupied(state), requested);
+    const expires = now + CHALLENGE_TTL;
+    const challenge = randomBytes(32).toString("hex");
+    state.challenges.push({ challenge, origin, pairing_slot: id, expires });
     const query = new URLSearchParams({ origin, slot: String(id), challenge });
     return { slot: id, challenge, expires, url: `loki://pair?${query}` };
   });
 }
 
-export async function issueRegistrationChallenge(raw: unknown, origin: string) {
-  const { pairing_challenge, onboarding_grant, ...identity } = object(raw);
-  const suppliedGrant = onboarding_grant === undefined ? undefined : grantDigest(onboarding_grant);
-  if (suppliedGrant !== undefined) grantedSlot(suppliedGrant, loadRegistry(registryPath()).onboarding);
+export async function issueRegistrationChallenge(raw: unknown, origin: string, client?: string) {
+  const { pairing_challenge, ...identity } = object(raw);
   const e = enrollment(identity);
   publicOrigin(origin);
   const nonce = pairing_challenge === undefined ? undefined : hex(pairing_challenge, 32);
-  return changeRegistry((state, now) => {
+  const seen = peekRegistry(Date.now());
+  if (seen.retired.includes(e.signing_pubkey)) throw new Error("registration identity retired");
+  const registered = seen.access.some((m) => m.signing_pubkey === e.signing_pubkey) || seen.devices.some((d) => d.signing_pubkey === e.signing_pubkey);
+  const pending = seen.challenges.find((c) => c.enrollment?.signing_pubkey === e.signing_pubkey);
+  const resuming = pending !== undefined;
+  if (nonce === undefined && pending) {
+    const generation = seen.devices.find((d) => d.signing_pubkey === e.signing_pubkey)?.generation ?? 0;
+    if (pending.relay && pending.origin === origin && pending.generation === generation && JSON.stringify(pending.enrollment) === JSON.stringify(e)) {
+      return { challenge: pending.challenge, relay_challenge_pubkey: pending.relay.publicKey };
+    }
+    admitResume(e.signing_pubkey);
+  }
+  let charged = false;
+  if (nonce !== undefined) {
+    if (!seen.challenges.some((c) => c.challenge === nonce && !c.enrollment)) throw new Error("unknown, expired or changed pairing challenge");
+  } else if (!registered && !resuming) {
+    if (client !== undefined) admitClient(client);
+    charged = true;
+    checkNewcomer(seen, Date.now(), e.slot, e.signing_pubkey);
+  }
+  const pool: RegistrationPool = nonce === undefined && registered ? "member" : "newcomer";
+  return changeRegistry(pool, (state, now) => {
     let claimed: Challenge | undefined;
     if (nonce !== undefined) {
       claimed = state.challenges.find((c) => c.challenge === nonce && !c.enrollment);
@@ -300,15 +352,10 @@ export async function issueRegistrationChallenge(raw: unknown, origin: string) {
         const moved = old.lokisigner_url !== undefined && e.lokisigner_url !== undefined && old.slot === e.slot
           && old.device_pubkey === e.device_pubkey && old.relay_pubkey === e.relay_pubkey;
         if (claimed || pending.origin !== origin || pending.generation !== boundGeneration || (!same && !moved)) throw new Error("identity already has a pending registration");
-        if (pending.grant) {
-          availableGrant(state, pending.grant);
-          if (!pending.paired && suppliedGrant !== pending.grant) throw new Error("a valid onboarding grant is required");
-        }
         pending.enrollment = e;
         return { challenge: pending.challenge, relay_challenge_pubkey: pending.relay!.publicKey };
       }
       if (state.challenges.filter((c) => c.enrollment).length >= MAX_SLOT * 2) throw new Error("too many pending registrations");
-      let grant: string | undefined;
       let reserved: number | undefined;
       const expires = claimed?.expires ?? now + CHALLENGE_TTL;
       if (!existing && state.access.length >= MAX_SLOT) throw new Error("no free slot (1..16)");
@@ -316,21 +363,18 @@ export async function issueRegistrationChallenge(raw: unknown, origin: string) {
         registrationSlot(existing.slot);
       } else if (previous) {
         freeSlot(occupied(state, e.signing_pubkey), previous.slot);
+      } else if (claimed) {
+        reserved = freeSlot(occupied(state, e.signing_pubkey), claimed.pairing_slot);
       } else {
-        grant = claimed?.grant ?? suppliedGrant;
-        if (grant === undefined) throw new Error("a valid onboarding grant is required");
-        const { pinned, prior } = availableGrant(state, grant);
-        if (!claimed && prior && now < prior.retry_after) throw new Error("onboarding grant issuance is rate limited");
-        if (state.challenges.some((c) => c.grant === grant)) throw new Error("onboarding grant already has a pending registration");
-        const permitted = pinned ?? claimed?.pairing_slot ?? prior?.slot;
-        const desired = e.slot;
-        if (desired !== undefined && desired !== permitted) throw new Error("slot not authorized by onboarding grant");
-        reserved = freeSlot(occupied(state, e.signing_pubkey, pinned === undefined && !claimed ? grant : undefined), pinned ?? claimed?.pairing_slot ?? desired);
-        state.grants[grant] = { slot: reserved, retry_after: expires, used: false };
+        if (pool === "member") throw new Error("registration changed; request a new challenge");
+        checkPendingSlots(state);
+        state.signups = checkSignups(state.signups, now);
+        reserved = freeSlot(occupied(state, e.signing_pubkey), e.slot);
+        if (!charged && client !== undefined) admitClient(client);
       }
       const challenge = randomBytes(32).toString("hex");
       const relay = newRelayChallenge();
-      state.challenges.push({ challenge, origin, enrollment: e, generation: boundGeneration, pairing_slot: reserved, grant, paired: claimed !== undefined || undefined, relay, expires });
+      state.challenges.push({ challenge, origin, enrollment: e, generation: boundGeneration, pairing_slot: reserved, relay, expires });
       return { challenge, relay_challenge_pubkey: relay.publicKey };
     } catch (error) {
       if (claimed && error instanceof Error) return error;
@@ -347,7 +391,16 @@ export async function registerMember(raw: unknown, origin: string): Promise<Memb
   const challenge = hex(rawChallenge, 32);
   const signature = typeof rawSignature === "string" && /^[0-9a-f]{128,144}$/.test(rawSignature) ? Buffer.from(rawSignature, "hex") : null;
   if (!signature) throw new Error("invalid device signature");
-  return changeRegistry((state, now) => {
+  const now = Date.now();
+  const seen = peekRegistry(now);
+  if (!seen.challenges.some((c) => c.challenge === challenge && c.enrollment)) {
+    let next: number | undefined;
+    try { next = replacementGeneration(e, seen, seen.devices.find((d) => d.signing_pubkey === e.signing_pubkey)); } catch { next = undefined; }
+    if (next === undefined || !seen.replacement_key || !replacementChallengeValid(seen.replacement_key, challenge, e, origin, next, now)) {
+      throw new Error("unknown, expired or changed registration challenge");
+    }
+  }
+  return changeRegistry("member", (state, now) => {
     const issued = state.challenges.find((c) => c.challenge === challenge && c.enrollment);
     if (issued) state.challenges = state.challenges.filter((c) => c !== issued);
     try {
@@ -357,10 +410,7 @@ export async function registerMember(raw: unknown, origin: string): Promise<Memb
       let relay = issued?.relay;
       if (next !== undefined) {
         const key = state.replacement_key;
-        const wire = Buffer.from(challenge, "hex");
-        const timestamp = wire.readBigUInt64BE();
-        if (issued || !key || timestamp > BigInt(now) || timestamp <= BigInt(now - CHALLENGE_TTL) ||
-            !timingSafeEqual(wire.subarray(16), replacementTag(key, wire.subarray(0, 16), e, origin, next))) {
+        if (issued || !key || !replacementChallengeValid(key, challenge, e, origin, next, now)) {
           throw new Error("unknown, expired or changed registration challenge");
         }
         if (replacement_authorization === undefined) throw new Error("replacement authorization is required");
@@ -383,11 +433,10 @@ export async function registerMember(raw: unknown, origin: string): Promise<Memb
       } else if (previous) {
         id = freeSlot(occupied(state, e.signing_pubkey), previous.slot);
       } else {
-        if (!issued?.grant || issued.pairing_slot === undefined) throw new Error("a valid onboarding grant is required");
-        const { pinned, prior } = availableGrant(state, issued.grant);
-        if (!prior || prior.slot !== issued.pairing_slot || (pinned !== undefined && pinned !== prior.slot)) throw new Error("slot not authorized by onboarding grant");
+        if (!issued || issued.pairing_slot === undefined) throw new Error("unknown, expired or changed registration challenge");
+        state.signups = checkSignups(state.signups, now);
         id = freeSlot(occupied(state, e.signing_pubkey), issued.pairing_slot);
-        prior.used = true;
+        state.signups.push(now);
       }
       const member: Member = { slot: id, signing_pubkey: e.signing_pubkey, relay_pubkey: e.relay_pubkey, advertise_url: e.advertise_url, ...lokiSignerField(e.lokisigner_url) };
       if (!previous || next !== undefined) {
@@ -419,39 +468,4 @@ export async function readRegistrationBody(req: Request): Promise<unknown> {
     }
   } finally { reader.releaseLock(); }
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
-}
-
-export type GrantRow = { digest: string; slot: number | null; state: "unused" | "pending" | "used" };
-
-function grantState(state: Registry, digest: string): GrantRow["state"] {
-  if (state.grants[digest]?.used) return "used";
-  return state.challenges.some((c) => c.grant === digest) ? "pending" : "unused";
-}
-
-export async function registerOnboardingGrant(digest: string, slot?: number): Promise<void> {
-  const pinned = slot === undefined ? null : registrationSlot(slot);
-  if (!/^[0-9a-f]{64}$/.test(digest)) throw new Error("a grant digest is 64 lowercase hex characters");
-  await changeRegistry((state) => {
-    const open = Object.keys(state.onboarding).filter((d) => d !== digest && grantState(state, d) !== "used").length;
-    if (open >= MAX_SLOT) return new Error("16 grants are already unused; prune or use some first");
-    state.onboarding[digest] = pinned;
-  });
-}
-
-export async function addOnboardingGrant(slot?: number): Promise<string> {
-  const bearer = randomBytes(32).toString("hex");
-  await registerOnboardingGrant(grantDigest(bearer), slot);
-  return bearer;
-}
-
-export async function listOnboardingGrants(): Promise<GrantRow[]> {
-  return changeRegistry((state) => Object.entries(state.onboarding).map(([digest, slot]) => ({ digest, slot, state: grantState(state, digest) })));
-}
-
-export async function pruneOnboardingGrants(): Promise<number> {
-  return changeRegistry((state) => {
-    const used = Object.keys(state.onboarding).filter((d) => grantState(state, d) === "used");
-    for (const digest of used) delete state.onboarding[digest];
-    return used.length;
-  });
 }

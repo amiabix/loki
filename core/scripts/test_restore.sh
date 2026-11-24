@@ -89,13 +89,7 @@ roster_entry() { curl -sf -m 10 "$coordinator/api/members" | jq -c --argjson slo
 device_of() { jq -r --argjson slot "$1" '.devices[] | select(.slot == $slot) | .device_pubkey' "$LOKI_REGISTRY"; }
 
 echo "== three members register with $coordinator and create a 2-of-3 vault"
-for i in 1 2 3; do
-  grant_var="LOKI_ONBOARDING_GRANT_$i"
-  onboarding[i]=${!grant_var:?set $grant_var}
-  unset "$grant_var"
-done
-for i in 1 2 3; do LOKI_ONBOARDING_GRANT="${onboarding[i]}" with_coordinator "$i" "$tmp/$i"; done
-unset onboarding
+for i in 1 2 3; do with_coordinator "$i" "$tmp/$i"; done
 for i in 1 2 3; do
   wait_for "member $i registers to slot $i" 60 registered "$i"
   grep -q 'recovery words not set up' "$tmp/$i.log" || fail "member $i did not report the skipped recovery words"
