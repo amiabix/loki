@@ -1,5 +1,3 @@
-//! Public vault membership and frostd addresses for FROST drivers.
-
 use std::collections::BTreeMap;
 
 use blake2b_simd::Params;

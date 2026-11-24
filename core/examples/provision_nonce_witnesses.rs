@@ -1,4 +1,3 @@
-//! Provision persistent nonce witnesses with the existing Loki relay protocol.
 use loki_poc::host::WitnessConfig;
 use loki_relay_client::{RelayHttp, Secret32};
 use loki_relay_protocol::{http::encode_creation, types::{Creation, RelayPin, RelayRoute}};
@@ -23,7 +22,6 @@ struct Pending {
     requests: [Vec<u8>; 2],
 }
 
-// The provisioning tool alone keeps the read capability to verify an existing mailbox.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ProvisionedWitness {
     #[serde(flatten)]
@@ -56,7 +54,7 @@ fn write_private(path: &Path, value: &impl serde::Serialize) -> Result<()> {
     let result = (|| -> Result<()> {
         file.write_all(&raw)?;
         file.sync_all()?;
-        fs::hard_link(&temp, path)?; // Publish complete bytes without replacing existing pins.
+        fs::hard_link(&temp, path)?;
         File::open(path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")))?.sync_all()?;
         Ok(())
     })();

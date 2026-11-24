@@ -16,7 +16,6 @@
 
 const PRF_SALT = new TextEncoder().encode("loki/signer/share-kek/v1");
 
-// A relying-party-scoped, non-secret user handle. One passkey per signer identity.
 function randomBytes(n) {
   const b = new Uint8Array(n);
   crypto.getRandomValues(b);
@@ -33,25 +32,23 @@ export async function createSignerPasskey({
   rpId = location.hostname,
   rpName = "Loki",
   userName,
-  authenticator, // "platform" | "cross-platform" | undefined
+  authenticator,
 } = {}) {
   const cred = await navigator.credentials.create({
     publicKey: {
-      challenge: randomBytes(32), // registration challenge; verified server-side if you attest
+      challenge: randomBytes(32),
       rp: { id: rpId, name: rpName },
       user: { id: randomBytes(16), name: userName, displayName: userName },
       pubKeyCredParams: [
-        { type: "public-key", alg: -7 }, // ES256
-        { type: "public-key", alg: -257 }, // RS256
+        { type: "public-key", alg: -7 },
+        { type: "public-key", alg: -257 },
       ],
       authenticatorSelection: {
-        authenticatorAttachment: authenticator, // undefined => any
+        authenticatorAttachment: authenticator,
         residentKey: "required",
         userVerification: "required",
       },
       extensions: {
-        // Ask for PRF up front so we can detect authenticators that don't support it and fall
-        // back to the passphrase tier BEFORE the user commits a share to this passkey.
         prf: { eval: { first: PRF_SALT } },
       },
     },
@@ -59,19 +56,13 @@ export async function createSignerPasskey({
 
   const ext = cred.getClientExtensionResults();
   const prfSupported = !!(ext.prf && ext.prf.enabled);
-  // Some platforms (notably Chrome on the create() call) report `enabled` but defer the first
-  // PRF evaluation to a subsequent get(). `prfSupported === false` => this authenticator has no
-  // PRF; the UI must offer the passphrase fallback (tier 3) instead.
   return { credentialId: new Uint8Array(cred.rawId), prfSupported };
 }
 
-// Tier 1/2 unlock: release the 32-byte PRF secret. Returns a Uint8Array(32) to hand straight to
-// the wasm `WebAuthnSecureElement::from_prf_secret`. With a resident key, `allowCredentials` can
-// be empty and the authenticator discovers the credential itself.
 export async function unlockPrfSecret({ rpId = location.hostname } = {}) {
   const assertion = await navigator.credentials.get({
     publicKey: {
-      challenge: randomBytes(32), // fresh anti-replay challenge each unlock
+      challenge: randomBytes(32),
       rpId,
       userVerification: "required",
       extensions: {
@@ -84,7 +75,6 @@ export async function unlockPrfSecret({ rpId = location.hostname } = {}) {
   if (!results || !results.first) {
     throw new Error("WebAuthn PRF not available on this authenticator; use the passphrase tier");
   }
-  // `results.first` is an ArrayBuffer of (typically) 32 bytes of HMAC output from the passkey.
   const secret = new Uint8Array(results.first);
   if (secret.length < 32) {
     throw new Error(`PRF secret too short: ${secret.length} bytes`);

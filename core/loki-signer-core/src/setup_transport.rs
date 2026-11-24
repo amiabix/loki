@@ -1,13 +1,3 @@
-//! Signed, recipient-only transport for one DKG round-two share.
-//! A public identity must be checked against the group's out-of-band roster first.
-//!
-//! Two round-two formats exist:
-//! - v1 (`LOKIDKG1`, [`Identity::seal_round2`]) encrypts to the recipient's long-lived
-//!   encryption key. It is retained for legacy compatibility, not used in new setups.
-//! - v2 (`LOKIDKG2`, [`Identity::seal_round2_v2`]) encrypts between two one-setup
-//!   [`FreshKey`]s announced in the signed round-one bodies and binds the round-one
-//!   transcript. Both the local courier and the hosted engine use v2.
-
 use crate::signing_session::{MessageKind, OpenedMessage, SessionContext};
 use blake2b_simd::Params;
 use chacha20poly1305::{
@@ -22,7 +12,6 @@ use zeroize::Zeroizing;
 const MAGIC: &[u8; 8] = b"LOKIDKG1";
 
 const MAGIC_V2: &[u8; 8] = b"LOKIDKG2";
-/// v2 header: magic, vault, sender, recipient, round-one transcript, nonce, length.
 const HEADER_V2: usize = 8 + 32 + 2 + 2 + 32 + 24 + 4;
 const ROUND1_MAGIC: &[u8; 8] = b"LOKIR1V1";
 const AGREEMENT_MAGIC: &[u8; 8] = b"LOKIAGV1";
@@ -33,16 +22,12 @@ const HEADER: usize = 8 + 32 + 2 + 2 + 24 + 4;
 const PUBLIC_HEADER: usize = 8 + 32 + 2 + 4;
 const SIGNATURE: usize = 64;
 const COURIER_PAYLOAD_LIMIT: usize = 64 * 1024;
-/// Largest local courier envelope (encrypted round two, including its AEAD tag).
 pub const MAX_COURIER_ENVELOPE: usize = HEADER_V2 + COURIER_PAYLOAD_LIMIT + 16 + SIGNATURE;
 const SESSION_MAGIC: &[u8; 8] = b"LOKISGN1";
 const SESSION_INNER: &[u8; 8] = b"LOKISGIP";
 const SESSION_HEADER: usize = 8 + 1 + 24 + 4;
 const SESSION_LIMIT: usize = SESSION_HEADER + 8 * 1024 * 1024 + 16;
 
-/// A member's one-setup X25519 key for v2 round-two envelopes. Created with the
-/// round-one contribution, announced in the signed round-one body, and removed once the
-/// certificate state is saved.
 pub struct FreshKey(StaticSecret);
 
 impl FreshKey {
@@ -54,7 +39,6 @@ impl FreshKey {
         PublicKey::from(&self.0).to_bytes()
     }
 
-    /// These bytes must only be written inside a sealed checkpoint.
     pub fn to_secret_bytes(&self) -> Zeroizing<[u8; 32]> {
         Zeroizing::new(self.0.to_bytes())
     }
@@ -64,23 +48,14 @@ impl FreshKey {
     }
 }
 
-/// What a setup message is, read from its marker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DkgWireKind {
-    /// Signed round-one body (`LOKIR1V1`), sent to every member.
     Round1,
-    /// v2 recipient-encrypted, signed round-two envelope (`LOKIDKG2`).
     Round2,
-    /// Signed certificate (`LOKICRV1`), sent to every member.
     Certificate,
-    /// Signed backup receipt (`LOKIBKV1`), sent to every member.
     BackupReceipt,
 }
 
-/// A setup message as it leaves a signer: signed (round one, certificate, backup
-/// receipt) or recipient-encrypted (round two). Only this module constructs it, and only
-/// from bytes with a valid setup-message frame, so a signer cannot hand raw secret bytes
-/// to the coordinator through the `Signer` seam.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DkgWire {
     kind: DkgWireKind,
@@ -90,13 +65,6 @@ pub struct DkgWire {
 }
 
 impl DkgWire {
-    /// Frame-check `bytes` as a setup message. Signatures are not checked here; the
-    /// receiving member verifies them against its roster.
-    ///
-    /// `pub` across the `loki-signer-core` → `loki-poc` seam (it was crate-private when
-    /// both lived in one crate). The "only the signer constructs a DkgWire" guard is now a
-    /// workspace-level convention; the wasm-bindgen API, not Rust visibility, is the
-    /// boundary against untrusted JS callers.
     pub fn parse(bytes: Vec<u8>) -> Result<Self, String> {
         let kind = wire_kind(&bytes).ok_or("not a setup message")?;
         let sender = u16::from_be_bytes(bytes[40..42].try_into().unwrap());
@@ -136,7 +104,6 @@ impl DkgWire {
         self.sender
     }
 
-    /// `None` for messages sent to every member.
     pub fn recipient(&self) -> Option<u16> {
         self.recipient
     }
@@ -150,7 +117,6 @@ impl DkgWire {
     }
 }
 
-/// The setup-message kind named by `bytes`' marker, if any.
 pub fn wire_kind(bytes: &[u8]) -> Option<DkgWireKind> {
     if bytes.len() < PUBLIC_HEADER {
         return None;
@@ -186,7 +152,6 @@ impl Identity {
         }
     }
 
-    /// These bytes must only be written through the sealed member store.
     pub fn to_secret_bytes(&self) -> [u8; 66] {
         let mut bytes = [0u8; 66];
         bytes[..2].copy_from_slice(&self.id.to_be_bytes());
@@ -200,8 +165,6 @@ impl Identity {
             return Err("invalid DKG identity length".into());
         }
         let id = u16::from_be_bytes(bytes[..2].try_into().unwrap());
-        // 1..=MAX_MEMBERS are vault members; id 0 is the ephemeral frostd session coordinator
-        // (never a FROST participant), which the hosted payment flow seals and reloads.
         if id != 0 && !(1..=crate::member_state::MAX_MEMBERS).contains(&id) {
             return Err("invalid DKG member id".into());
         }
@@ -220,12 +183,10 @@ impl Identity {
         }
     }
 
-    /// Authorize a device login key using the same Ed25519 enrollment proof as recovery.
     pub fn authorize_device(&self, device_pub: &[u8]) -> [u8; 64] {
         self.signing.sign(device_pub).to_bytes()
     }
 
-    /// Authorize replacing the coordinator's current device, for one challenge and generation.
     pub fn authorize_device_replacement(&self, origin: &str, device_pub: &[u8], challenge: &[u8; 32], generation: u64) -> [u8; 64] {
         let identity = hex::encode(self.public().signing);
         let device = hex::encode(device_pub);
@@ -249,7 +210,6 @@ impl Identity {
         ClaimProof { claimant, signature }
     }
 
-    /// Prove control of the roster relay key without signing a frostd login challenge.
     pub fn relay_registration_proof(
         &self,
         origin: &str,
@@ -506,10 +466,6 @@ impl Identity {
             .expect("BLAKE2b output is 32 bytes"))
     }
 
-    /// v2 round-two envelope. `plaintext` is encrypted under a key derived from the two
-    /// members' one-setup [`FreshKey`]s, the vault, both member ids and the round-one
-    /// `transcript`. The header (vault, sender, recipient, transcript, nonce, length) is
-    /// the AEAD associated data, and the whole envelope is signed with the identity key.
     pub fn seal_round2_v2(
         &self,
         fresh: &FreshKey,
@@ -548,8 +504,6 @@ impl Identity {
         Ok(header)
     }
 
-    /// Check a v2 envelope's frame, header and sender signature without decrypting it.
-    /// Reopen uses this once the fresh key is gone.
     pub fn verify_round2_v2(
         sender: &PublicIdentity,
         recipient: u16,
@@ -586,8 +540,6 @@ impl Identity {
         Ok(())
     }
 
-    /// Open a v2 envelope addressed to this member: verify the signature and header
-    /// (including that its transcript equals ours), then decrypt.
     pub fn open_round2_v2(
         &self,
         fresh: &FreshKey,
@@ -612,8 +564,6 @@ impl Identity {
             .map_err(|_| "DKG decryption failed".into())
     }
 
-    /// Encrypt a signing packet. All context, member IDs, type, and body are inside
-    /// the AEAD. The outer envelope exposes only a version, nonce, and length bucket.
     pub fn seal_session(
         &self,
         recipient: &PublicIdentity,
@@ -669,8 +619,6 @@ impl Identity {
         Ok(header)
     }
 
-    /// Try a specific roster peer and locally selected attempt context. Wrong-context
-    /// packets cannot decrypt, so a shared mailbox can carry unrelated attempts.
     pub fn open_session(
         &self,
         sender: &PublicIdentity,
@@ -680,8 +628,6 @@ impl Identity {
         self.open_session_inner(sender, sender, self.id, context, wire)
     }
 
-    /// Reopen one of this member's own exact outbound wires from its sealed outbox.
-    /// This lets a selected signer finish after restart without keeping nonce secrets.
     pub fn open_sent_session(
         &self,
         recipient: &PublicIdentity,
@@ -793,8 +739,6 @@ impl Identity {
     }
 }
 
-/// BLAKE2b key derivation for v2 round-two envelopes, over the fresh-key DH, the vault,
-/// both member ids (low first) and the round-one transcript.
 fn fresh_box_key(
     own: &FreshKey,
     own_id: u16,
@@ -834,7 +778,6 @@ fn session_transcript(meta: &[u8], body: &[u8], version: u8) -> [u8; 32] {
     hash.finalize().into()
 }
 
-/// Validate only the public bucketed envelope. All identifying data is encrypted.
 pub fn session_envelope(wire: &[u8]) -> Result<(), String> {
     if wire.len() < SESSION_HEADER + 1024 + 16
         || wire.len() > SESSION_LIMIT

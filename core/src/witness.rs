@@ -1,12 +1,3 @@
-//! Build an authentication path for a vault note from the chain's commitment stream.
-//!
-//! The node does not hand out witnesses. Regtest rebuilds from every commitment;
-//! Testnet starts from a birth checkpoint and extends incremental witnesses for
-//! notes the vault owns.
-//!
-//! The result is checked against the node's own anchor before it is used, so a mistake
-//! here fails loudly rather than producing a transaction consensus will reject.
-
 use incrementalmerkletree::{
     frontier::CommitmentTree as FrontierTree, witness::IncrementalWitness, Hashable, Level,
 };
@@ -17,7 +8,6 @@ use orchard::{
 use std::{collections::BTreeMap, io::Cursor};
 use zcash_primitives::merkle_tree::read_commitment_tree;
 
-/// Witnesses for notes created after a node-provided birth-height tree checkpoint.
 pub struct BirthWitnesses {
     tree: FrontierTree<MerkleHashOrchard, 32>,
     witnesses: BTreeMap<u64, IncrementalWitness<MerkleHashOrchard, 32>>,
@@ -119,20 +109,13 @@ mod checkpoint_tests {
     }
 }
 
-/// Orchard and Ironwood share a tree depth of 32.
 const DEPTH: usize = 32;
 
-/// The whole commitment tree, as levels of nodes.
-///
-/// `levels[0]` is the leaves; `levels[l+1]` is `levels[l]` paired and combined. Missing
-/// right-hand children are the empty root for that level, which is how an incomplete
-/// tree is padded.
 pub struct CommitmentTree {
     levels: Vec<Vec<MerkleHashOrchard>>,
 }
 
 impl CommitmentTree {
-    /// Build from every commitment in the order the chain appended them.
     pub fn build(cmxs: &[[u8; 32]]) -> Result<Self, String> {
         let leaves: Vec<MerkleHashOrchard> = cmxs
             .iter()
@@ -162,7 +145,6 @@ impl CommitmentTree {
         Ok(CommitmentTree { levels })
     }
 
-    /// The tree root, which must equal the node's anchor.
     pub fn root(&self) -> MerkleHashOrchard {
         self.levels[DEPTH]
             .first()
@@ -170,7 +152,6 @@ impl CommitmentTree {
             .unwrap_or_else(|| MerkleHashOrchard::empty_root(Level::from(DEPTH as u8)))
     }
 
-    /// The authentication path for the leaf at `position`.
     pub fn path(&self, position: u64) -> Result<MerklePath, String> {
         if position >= self.levels[0].len() as u64 {
             return Err(format!(
@@ -193,10 +174,6 @@ impl CommitmentTree {
     }
 }
 
-/// Build a path and prove it reaches `expected_anchor`.
-///
-/// This is the check that makes the rebuilt tree trustworthy: if our ordering or padding
-/// were wrong, the root would differ from what the node computed.
 pub fn witness_for(
     cmxs: &[[u8; 32]],
     position: u64,
@@ -215,7 +192,6 @@ pub fn witness_for(
 
     let path = tree.path(position)?;
 
-    // And the path itself must reach the same root from this leaf.
     let cmx = ExtractedNoteCommitment::from_bytes(&cmxs[position as usize])
         .into_option()
         .ok_or("the note's own cmx is invalid")?;

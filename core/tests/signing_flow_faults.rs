@@ -51,7 +51,6 @@ impl NonceWitness for WrongRelays {
 struct ReprovisionedMailbox;
 impl NonceWitness for ReprovisionedMailbox {
     fn pins(&self) -> loki_poc::signing_session::WitnessPins {
-        // Same relay keys and runs, but fresh mailboxes have empty consumed-CID ledgers.
         [([7; 32], [8; 32], [17; 32]), ([9; 32], [10; 32], [18; 32])]
     }
     fn claim(&mut self, _: [u8; 32], _: &[u8]) -> Result<(), String> {
@@ -425,7 +424,6 @@ fn run_review_and_rollback(member_count: u16, pair: [u16; 2]) {
     )
     .unwrap();
     fs::copy(bob_attempt.join("started"), legacy_attempt.join("started")).unwrap();
-    // v1 records contain relay key and run, but no mailbox binding. They must fail closed.
     let current_nonces = MemberDir::open(
         &bob_root.join(hex::encode(ctx.payment)),
         &hex::encode(ctx.attempt.0),
@@ -478,7 +476,7 @@ fn run_review_and_rollback(member_count: u16, pair: [u16; 2]) {
         fvk.clone(),
         "pass"
     )
-    .is_err()); // A second tab cannot open the same nonce set while Bob is active.
+    .is_err());
     drop(bob);
     let mut bob = SigningSession::reopen_sealed(
         &bob_root,

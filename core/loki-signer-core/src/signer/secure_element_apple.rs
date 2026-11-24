@@ -28,8 +28,6 @@ use super::secure_element::{OpenError, SecureElement, WrappedDek};
 use std::{ffi::{c_char, CString}, os::unix::ffi::OsStrExt, path::Path};
 use zeroize::Zeroizing;
 
-// C-ABI surface implemented in se_backend.swift. Lengths are `isize`-shaped `Int` on the
-// Swift side; we pass `isize`. Negative returns are error codes (see se_backend.swift).
 extern "C" {
     fn se_open_ephemeral(out_handle: *mut u64) -> isize;
     fn se_open_persistent(tag: *const u8, tag_len: isize, create_if_missing: i32, state_path: *const c_char, out_handle: *mut u64) -> isize;
@@ -63,7 +61,6 @@ pub enum KeyFailure {
 
 const KEY_GONE: &str = "This LokiSigner key is missing or no longer usable. Set aside this profile, then choose “Restore from recovery words” with your recovery words and downloaded backup file.";
 
-// Stable Swift ABI codes and fixed member copy. Unknown codes never cross into the UI.
 const FAILURES: &[(isize, KeyFailure, &str)] = &[
     (-6, KeyFailure::Missing, KEY_GONE),
     (-17, KeyFailure::Invalidated, KEY_GONE),
@@ -100,8 +97,6 @@ impl std::fmt::Display for KeyFailure {
     }
 }
 
-/// Extract only fixed key errors for native surfaces that otherwise redact host errors.
-/// SignerStore may have prepended a file label to the element error.
 pub fn member_key_message(error: &str) -> Option<&'static str> {
     let text = error.rsplit(": ").next().unwrap_or(error);
     FAILURES.iter().map(|(_, _, message)| *message).find(|message| *message == text)
@@ -114,7 +109,6 @@ pub struct AppleSecureElement {
 }
 
 impl AppleSecureElement {
-    /// Open a fresh process-lifetime Enclave key. No signing identity required.
     pub fn ephemeral() -> Result<Self, String> {
         let mut handle = 0u64;
         let rc = unsafe { se_open_ephemeral(&mut handle) };
@@ -124,17 +118,14 @@ impl AppleSecureElement {
         Ok(Self { handle })
     }
 
-    /// Open the persistent, biometric-gated key without ever creating a replacement.
     pub fn open_persistent(tag: &[u8], state: Option<&Path>) -> Result<Self, KeyFailure> {
         Self::persistent(tag, state, false, None)
     }
 
-    /// For new sealed data only: reuse a key for `tag` or create it if it is absent.
     pub fn create_persistent(tag: &[u8], state: Option<&Path>) -> Result<Self, KeyFailure> {
         Self::persistent(tag, state, true, None)
     }
 
-    /// Create under a restore-only tag that the caller has already journaled for rollback.
     pub fn create_staged(tag: &[u8], state: &Path) -> Result<Self, KeyFailure> {
         let state = CString::new(state.as_os_str().as_bytes()).map_err(|_| KeyFailure::Other)?;
         let mut handle = 0;
@@ -142,8 +133,6 @@ impl AppleSecureElement {
         if rc == 0 { Ok(Self { handle }) } else { Err(KeyFailure::from_code(rc)) }
     }
 
-    /// Compare with the enrollment sampled at staging. After a successful private
-    /// operation, pass its state path to record the verified enrollment before publication.
     pub fn confirm_staged_biometry(&self, state: Option<&Path>) -> Result<(), KeyFailure> {
         let state = state.map(|path| CString::new(path.as_os_str().as_bytes())).transpose().map_err(|_| KeyFailure::Other)?;
         let ptr = state.as_ref().map_or(std::ptr::null(), |path| path.as_ptr());
@@ -156,9 +145,6 @@ impl AppleSecureElement {
         if rc == 0 { Ok(()) } else { Err(KeyFailure::from_code(rc)) }
     }
 
-    /// Authorize this existing vault key for one payment or one viewing-key open.
-    /// Dropping the handle invalidates the context; it is never eligible for device login
-    /// or returned to an app-wide cache.
     pub fn open_payment(tag: &[u8], state: Option<&Path>, reason: &str) -> Result<Self, KeyFailure> {
         let reason = CString::new(reason).map_err(|_| KeyFailure::Other)?;
         Self::persistent(tag, state, false, Some(&reason))
@@ -182,11 +168,7 @@ impl AppleSecureElement {
 }
 
 impl AppleSecureElement {
-    /// Sign `msg` with the Enclave key (ECDSA/SHA-256, DER) — the device login-challenge
-    /// signature. On a persistent biometric key this prompts Face/Touch ID; the private op
-    /// stays inside the Enclave. Verified by [`crate::signer::device_auth::DeviceRegistry`].
     pub fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, KeyFailure> {
-        // A P-256 ECDSA DER signature is <= 72 bytes; 128 is a comfortable ceiling.
         let mut out = vec![0u8; 128];
         let n = unsafe {
             se_sign(self.handle, msg.as_ptr(), msg.len() as isize, out.as_mut_ptr(), out.len() as isize)
@@ -198,8 +180,6 @@ impl AppleSecureElement {
         Ok(out)
     }
 
-    /// The Enclave key's PUBLIC point, X9.63 uncompressed (`04 || X || Y`, 65 bytes for P-256).
-    /// This is what Loki enrolls as the device key; the private key never leaves the Enclave.
     pub fn public_key_sec1(&self) -> Result<Vec<u8>, KeyFailure> {
         let mut out = vec![0u8; 128];
         let n = unsafe { se_public_key(self.handle, out.as_mut_ptr(), out.len() as isize) };
@@ -217,8 +197,6 @@ impl Drop for AppleSecureElement {
     }
 }
 
-// ECIES(P-256, X9.63-SHA256, AES-GCM) ciphertext of a 32-byte DEK is 113 bytes (measured
-// in the spike); 256 is a comfortable ceiling. The unwrap output is exactly the 32-byte DEK.
 const WRAP_OUT_CAP: usize = 256;
 
 impl SecureElement for AppleSecureElement {

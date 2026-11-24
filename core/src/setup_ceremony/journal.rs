@@ -53,7 +53,6 @@ fn checked_links(metadata: &fs::Metadata, directory: bool, links: u64) -> Result
         unsafe extern "C" {
             fn geteuid() -> u32;
         }
-        // The effective user ID identifies the owner of this process's private files.
         let uid = unsafe { geteuid() };
         let mode = if directory { 0o700 } else { 0o600 };
         if metadata.uid() == uid

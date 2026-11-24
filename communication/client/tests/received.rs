@@ -531,8 +531,6 @@ fn incoming_crash_reordered_relays_one_ack_link_received_atomic() {
 
 #[test]
 fn incoming_crash_original_ack_sqlite_full_received_atomic() {
-    // Genuine SQLITE_FULL is the writer connection's max_page_count, observed on the
-    // acknowledgement ciphertext insert before ClientError mapping. The library owns that case.
     library_case("store::incoming_crash_tests::incoming_crash_original_ack_sqlite_full");
 }
 
@@ -747,7 +745,6 @@ struct PeerShot {
     wire_len: u64,
 }
 
-/// Scripted HTTP peer. It is not a relay process.
 struct LossyServer {
     port: u16,
     stop: Arc<AtomicBool>,
@@ -2023,8 +2020,6 @@ fn received_reference_invalid_then_same_signer_counts() {
 
 #[test]
 fn received_reference_from_a_sixth_member_is_recovered() {
-    // A 2-of-6 vault: recovery must count a Received from member 6 and list all six
-    // recipients, not only the first four or five.
     let roster = Roster {
         vault: [72; 32],
         members: (1..=6).map(|id| support::identity(id).public()).collect(),
@@ -2090,7 +2085,6 @@ fn received_reference_from_a_sixth_member_is_recovered() {
     assert_eq!(history[0].phase, ReferencePhase::Resolved);
     let status = received_status(&store, &roster, &alice, original.key(), original.digest()).unwrap();
     assert!(status.member_received(6));
-    // Every member gets its own copy, and recovery lists them all.
     assert_eq!(
         store
             .recover_recipients(original.key())

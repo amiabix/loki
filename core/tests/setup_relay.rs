@@ -451,7 +451,6 @@ fn run_owned_services_flow(mode: OwnedFlow, network: &str) {
             Value::Bytes(identity.public().signing.to_vec()),
             Value::Integer((now + 3600).into()),
             Value::Integer(1.into()),
-            // A setup and a handoff mailbox per member on each of the three relays.
             Value::Integer((6 * u64::from(count)).max(24).into()),
             Value::Bytes(operators.digest().to_vec()),
         ]))
@@ -773,8 +772,6 @@ fn run_owned_services_flow(mode: OwnedFlow, network: &str) {
         }
         let mut reopened = HostedSetup::open(member.path(), "pass").unwrap();
         let public = reopened.step().unwrap().public_json();
-        // The step that receives the last Join also proposes the roster, so it reports
-        // the proposal unless publishing it is still pending.
         assert!(
             matches!(
                 public["phase"].as_str(),
@@ -806,8 +803,6 @@ fn run_owned_services_flow(mode: OwnedFlow, network: &str) {
             let path = services.root.join(format!("peer-{count}-{slot}"));
             let mut peer = HostedSetup::open(&path, "peer-pass").unwrap();
             let limit = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            // A joiner must report the proposal from its own step, not only through
-            // `setup-info`; the app refreshes the fingerprint on that phase change.
             loop {
                 let public = peer.step().unwrap().public_json();
                 if public["phase"] == "roster_proposed" {
@@ -979,7 +974,6 @@ fn run_owned_services_flow(mode: OwnedFlow, network: &str) {
                 ));
                 return;
             }
-            // Peers that already saved round 1 let the same step reach round 2.
             assert!(matches!(
                 public["phase"].as_str(),
                 Some("round1_saved" | "round2_saved")

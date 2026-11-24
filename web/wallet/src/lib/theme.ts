@@ -2,9 +2,6 @@
 
 import { useEffect, useState } from "react";
 
-// Light/dark theme. Nothing stored → follow the system preference (the CSS handles that
-// case on its own via prefers-color-scheme). A click pins a choice in localStorage and sets
-// data-theme on <html>, which wins over the system preference both ways.
 const KEY = "loki_theme";
 type Theme = "light" | "dark";
 
@@ -33,7 +30,6 @@ export function toggleTheme() {
   window.dispatchEvent(new Event("loki:theme"));
 }
 
-// Resolved current theme, reactive to the toggle and to system changes (when unpinned).
 export function useIsDark(): boolean {
   const [dark, setDark] = useState(false); // SSR-safe; corrected on mount
   useEffect(() => {

@@ -24,10 +24,6 @@ pub enum NonceError {
     /// The same nonce id was asked to sign a DIFFERENT package or randomizer than it burned for.
     /// FROST security breaks on nonce reuse; this is never recoverable.
     Reuse,
-    /// A nonce committed under an earlier backup/nonce epoch was presented after a
-    /// restore bumped the epoch (ws1-signer §8: "restore resets to a fresh nonce
-    /// epoch and must not replay an old one"). Never recoverable — the member must
-    /// re-commit under the current epoch.
     StaleEpoch,
     Io(String),
     Other(String),
@@ -69,14 +65,10 @@ pub struct NonceStore {
 }
 
 impl NonceStore {
-    /// Open at epoch 0 (a store that was never restored).
     pub fn open(dir: &Path, vault: [u8; 32], member: u16) -> io::Result<Self> {
         Self::open_at_epoch(dir, 0, vault, member)
     }
 
-    /// Open at an explicit epoch. A restore bumps the share's `backup_epoch` and opens the
-    /// (fresh) nonce dir at that same epoch, so nonces stamped with any lower epoch are
-    /// refused by [`NonceStore::sign_and_burn`].
     pub fn open_at_epoch(dir: &Path, epoch: u64, vault: [u8; 32], member: u16) -> io::Result<Self> {
         create_dir_all(dir)?;
         Ok(Self {
@@ -160,7 +152,6 @@ impl NonceStore {
         let sealed = SealedShare::seal_bound(se, self.epoch, record, &self.binding(name))
             .map_err(NonceError::Other)?.to_bytes();
         write_durable(&self.dir, name, &sealed)?;
-        // A write-once collision or a short OPFS write must not release an unrecorded result.
         if read_file(&self.dir, name)? != sealed {
             return Err(NonceError::Other("nonce record did not persist; start a new signing attempt".into()));
         }
@@ -173,8 +164,6 @@ impl NonceStore {
         ))
     }
 
-    /// Round 1: generate a single-use nonce, PERSIST it (sealed + fsync'd), then return
-    /// the public commitment. The persist happens before the caller may emit anything.
     pub fn commit(
         &self,
         id: &str,
@@ -198,8 +187,6 @@ impl NonceStore {
         }
         let (nonces, commitment) =
             frost::round1::commit(signing_share, &mut rand_core::OsRng);
-        // The serialized secret nonce is as sensitive as the share once a partial exists:
-        // wipe it after sealing (`SigningNonces` itself zeroizes on drop).
         let serialized = zeroize::Zeroizing::new(
             nonces
                 .serialize()
@@ -216,7 +203,6 @@ impl NonceStore {
             .map_err(|e| NonceError::Other(e.to_string()))
     }
 
-    // Browser network preflight: only claim the actual pending commitment at its original pair.
     pub(super) fn pending_commitment(
         &self,
         id: &str,
@@ -286,15 +272,11 @@ impl NonceStore {
         let share = frost_rerandomized::sign_with_randomizer_seed(signing_package, &nonces, key, seed)
             .map_err(|e| NonceError::Other(e.to_string()))?;
 
-        // The authenticated winner is durable before this call can release the share.
         record.extend_from_slice(digest.as_bytes());
         record.extend_from_slice(&share.serialize());
         self.persist_record(&burn, se, &record)?;
 
         if inject_crash_after_burn() {
-            // Simulate a power loss after the burn is durable but before the nonce file
-            // is removed. The nonce file still exists; the burn file exists. Recovery
-            // must treat this as burned (resend the partial), never reuse the nonce.
             return Err(NonceError::Other("crash injected after burn".into()));
         }
 
@@ -304,7 +286,6 @@ impl NonceStore {
         Ok(share)
     }
 
-    /// State after a (possibly crashed) attempt, for tests and recovery.
     pub fn state(&self, id: &str) -> NonceState {
         let nonce = file_exists(&self.dir, &Self::nonce_name(id));
         let burn = file_exists(&self.dir, &Self::burn_name(id));
@@ -331,7 +312,6 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
 
-    /// A 2-of-2 key set and a rerandomized signing package over `msg`, for one signer.
     fn fixture(
         msg: [u8; 32],
     ) -> (
@@ -354,7 +334,6 @@ mod tests {
             frost::keys::KeyPackage::try_from(shares.get(&id1).unwrap().clone()).unwrap();
         let kp2 =
             frost::keys::KeyPackage::try_from(shares.get(&id2).unwrap().clone()).unwrap();
-        // Peer's commitment, needed to form a well-populated signing package.
         let (_n2, c2) = frost::round1::commit(kp2.signing_share(), &mut rand_core::OsRng);
         let (n1, c1) = frost::round1::commit(kp1.signing_share(), &mut rand_core::OsRng);
         let mut commitments = BTreeMap::new();
@@ -388,24 +367,16 @@ mod tests {
             .get(&frost::Identifier::try_from(2u16).unwrap())
             .unwrap();
 
-        // Round 1: persist-before-emit.
         let committed = store.commit("c0", &se, kp.signing_share(), None).unwrap();
         assert_eq!(store.state("c0"), NonceState::Committed);
         let pkg = pkg_for(&kp, &committed, &peer, msg);
 
-        // Round 2 with a crash injected right after the burn record is durable.
         let err = store
             .sign_and_burn("c0", &se, &pkg, &kp, &seed, None, &|| true)
             .unwrap_err();
         assert!(matches!(err, NonceError::Other(_)));
-        // The burn record exists; the state reads as Burned despite the nonce file
-        // still being on disk (burn wins).
         assert_eq!(store.state("c0"), NonceState::Burned);
 
-        // Recovery: retrying for the SAME message resends the recorded partial and
-        // NEVER re-signs with the nonce. The guarantee is that the recovered partial is
-        // stable across repeated calls (idempotent) — a stranded or re-generated nonce
-        // would either fail or differ.
         let resent1 = store
             .sign_and_burn("c0", &se, &pkg, &kp, &seed, None, &|| false)
             .unwrap();
@@ -431,7 +402,6 @@ mod tests {
             .sign_and_burn("r0", &se, &pkg_a, &kp, &seed, None, &|| false)
             .unwrap();
 
-        // A second signing request binding the SAME nonce id to a different message.
         let msg_b = [8u8; 32];
         let pkg_b = pkg_for(&kp, &committed, &peer, msg_b);
         let err = store

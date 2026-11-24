@@ -32,8 +32,6 @@ struct Member<SE: SecureElement> {
     dir: std::path::PathBuf,
 }
 
-/// An in-memory backup store with no recovery identity — enough to satisfy the signer's
-/// save-and-prove-load step during DKG.
 #[derive(Clone, Default)]
 struct MemBackup(Arc<Mutex<Option<Vec<u8>>>>);
 
@@ -69,11 +67,9 @@ fn prompts(reviewed: ReviewedPayment, mut native: Option<ApprovalPolicy>) -> Dev
             if reviewed.as_ref() != Some(&(*request.candidate, request.view.clone())) {
                 return false;
             }
-            // The native selftest explicitly approves one intent and pins its first candidate.
             if *approved_sighash.get_or_insert(request.sighash) != request.sighash {
                 return false;
             }
-            // Then the member's own decision, when a native approval channel is attached.
             native.as_mut().map_or(true, |approve| approve(request))
         }),
     }
@@ -106,10 +102,6 @@ fn tempdir(id: u16) -> std::path::PathBuf {
     p
 }
 
-/// Build `members` real signers whose shares are held by `make_se(id)`, run the full v2 DKG
-/// in-process, then have the first `threshold` of them sign a payment the prover accepts.
-/// `Ok(())` means every share was generated and sealed through its SecureElement and the
-/// quorum produced a verified signature — the native-member lifecycle end to end.
 pub fn prove_dkg_member<SE: SecureElement>(
     threshold: u16,
     members: u16,
@@ -118,8 +110,6 @@ pub fn prove_dkg_member<SE: SecureElement>(
     prove_dkg_member_with(threshold, members, make_se, |_| None)
 }
 
-/// [`prove_dkg_member`] where member `id`'s payment approval also asks `native(id)`, the
-/// member's own decision (the signer app's dialog). A refusal stops the payment.
 pub fn prove_dkg_member_with<SE: SecureElement>(
     threshold: u16,
     members: u16,
@@ -228,7 +218,6 @@ fn setup_members<SE: SecureElement>(
 fn sign_payment<SE: SecureElement>(
     threshold: u16, cand: CandidateRef, ms: &mut [Member<SE>], approvals: &[ReviewedPayment],
 ) -> Result<(), String> {
-    // Every member derives the same vault address; a quorum signs a payment to it.
     let mut addresses = Vec::new();
     for m in ms.iter_mut() {
         addresses.push(
@@ -314,7 +303,6 @@ mod tests {
         *reviewed.lock().unwrap() = Some((candidate, view.clone()));
         assert!((device.approval)(&request));
         assert!(!(device.approval)(&super::super::local::ApprovalRequest { sighash: [6; 32], ..request }));
-        // The member's native refusal overrides a recorded intent.
         let mut refusing = prompts(reviewed.clone(), Some(Box::new(|_| false)));
         assert!(!(refusing.approval)(&request));
     }

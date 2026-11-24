@@ -39,34 +39,22 @@ use reddsa_frost::frost::redpallas as frost;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-// std::time::Instant has no time source on wasm32-unknown-unknown; web-time maps it onto
-// performance.now() with the same API, so the roster-deadline logic is unchanged.
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 #[cfg(target_arch = "wasm32")]
 use web_time::Instant;
 use zeroize::Zeroizing;
 
-/// The member's on-device approval decision for a rendered payment. In a real signer this
-/// is a full-screen confirmation + biometric prompt; here it is a policy callback so the
-/// tests can drive approve/refuse deterministically (ws1-signer §7: "a callback/policy is
-/// fine for tests").
 pub type ApprovalPolicy = Box<dyn FnMut(&ApprovalRequest<'_>) -> bool + Send>;
 
-/// What the member is asked to approve: the independently rendered payment, the candidate it
-/// belongs to, and the sighash recomputed from the same PCZT bytes — so consent binds to the
-/// exact thing that will be signed, not just the human-readable view.
 pub struct ApprovalRequest<'a> {
     pub candidate: &'a CandidateRef,
     pub sighash: [u8; 32],
     pub view: &'a PaymentView,
 }
 
-/// The member's on-device decision on a coordinator connection, shown with the
-/// coordinator's origin and network. Only an approved session may receive the address.
 pub type ConnectApproval = Box<dyn FnMut(&str, Network) -> bool + Send>;
 
-/// What the member answered after comparing the roster code with the other members.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RosterDecision {
     Match,
@@ -74,22 +62,14 @@ pub enum RosterDecision {
     Cancelled,
 }
 
-/// The on-device roster comparison: shows the 24-digit code and returns the member's
-/// decision. The signer enforces [`DevicePrompts::roster_deadline`] around it.
 pub type RosterConfirmation = Box<dyn FnMut(&str) -> RosterDecision + Send>;
 
-/// The member's backup storage, driven on the device during [`Signer::backup`].
 pub trait BackupDevice: Send {
-    /// Ask the member for the backup passphrase. `None` means the member cancelled.
     fn passphrase(&mut self) -> Option<Zeroizing<String>>;
-    /// Store the sealed backup where the member keeps it.
     fn save(&mut self, artifact: &BackupArtifact) -> Result<(), String>;
-    /// Load the stored backup back, to prove it reloads.
     fn load(&mut self) -> Result<BackupArtifact, String>;
 }
 
-/// The on-device decisions a setup-capable signer needs, supplied at construction so the
-/// coordinator can never answer for the member.
 pub struct DevicePrompts {
     pub connect: ConnectApproval,
     pub roster: RosterConfirmation,
@@ -98,37 +78,20 @@ pub struct DevicePrompts {
     pub approval: ApprovalPolicy,
 }
 
-/// Error surface of the local signer. A refusal (member declined, or a binding failed) is
-/// a first-class, non-secret outcome (ws1-signer §7).
 #[derive(Debug)]
 pub enum SignerError {
-    /// The member declined the rendered payment on-device.
     MemberRefused,
-    /// The candidate fee could not be bound to its value commitments.
     FeeUnverified(String),
-    /// `pkg.message()` did not equal the sighash recomputed from the rendered PCZT. A
-    /// malicious coordinator asking us to sign something other than what we rendered.
     SighashMismatch,
-    /// The signer is not connected / the session is unknown.
     NoSession,
-    /// No share is sealed yet (DKG not complete).
     NoShare,
-    /// The member refused the coordinator connection on-device.
     ConnectRefused,
-    /// The setup roster failed a check, or the member said the codes do not match.
     RosterRejected(String),
-    /// The member cancelled on the device.
     Cancelled,
-    /// The member did not decide before the deadline.
     TimedOut,
-    /// The setup hit a mismatch or a bad message. Final: its secrets are wiped.
     SetupAborted(String),
-    /// After the share exists, a setup message was refused. The saved setup and the
-    /// share are kept; the step's progress is saved.
     MessageRefused(String),
-    /// The vault is not ready: certificates or backup receipts are missing.
     NotReady,
-    /// A protocol/parse/io failure, carried as text.
     Other(String),
 }
 
@@ -163,12 +126,8 @@ impl From<String> for SignerError {
     }
 }
 
-/// The setup format version a new-path roster must declare (C9).
 pub const SETUP_VERSION: u64 = 2;
 
-/// The roster code compared on the device: 24 digits in six groups of four (about 80
-/// bits), derived from the roster fingerprint. Digits, so it cannot be confused with
-/// recovery words.
 pub fn roster_code(fingerprint: &[u8; 32]) -> String {
     let hash = blake2b_simd::Params::new()
         .hash_length(16)
@@ -193,7 +152,6 @@ fn kind_code(kind: DkgWireKind) -> u8 {
     }
 }
 
-/// The incoming message kind each core phase waits for.
 fn expected_kind(phase: DkgPhase) -> Option<DkgWireKind> {
     match phase {
         DkgPhase::Empty => None,
@@ -207,9 +165,6 @@ fn expected_kind(phase: DkgPhase) -> Option<DkgWireKind> {
 const SETUP_MAGIC: &[u8; 8] = b"LOKISGS1";
 const MAX_SETUP_WIRE: usize = 66 * 1024;
 
-/// The signer's saved setup: the core state, the exact messages it last released, the
-/// peer messages it accepted but has not consumed yet (as received, encrypted where they
-/// were encrypted), and the backup receipts. Saved before any message is released.
 struct SetupCheckpoint {
     core: DkgState,
     outgoing: Vec<Vec<u8>>,
@@ -239,7 +194,6 @@ impl SetupCheckpoint {
         }
     }
 
-    /// Abort: wipe the fresh key, the FROST state and every saved message.
     fn wipe(&mut self) {
         self.core.wipe();
         self.outgoing.clear();
@@ -304,7 +258,6 @@ impl SetupCheckpoint {
     }
 }
 
-/// The share file: key package, group public package and `vs`.
 pub fn encode_share(key_package: &[u8], public_package: &[u8], vs: &[u8; 32]) -> Zeroizing<Vec<u8>> {
     let mut out = Zeroizing::new(Vec::new());
     out.extend_from_slice(&(key_package.len() as u32).to_be_bytes());
@@ -343,38 +296,24 @@ pub struct LocalSigner<SE: SecureElement> {
     label: String,
     network: Network,
     se: SE,
-    /// The signer's data directory. `None` for a signer built from a bare share.
     store: Option<SignerStore>,
-    /// The member's setup identity (Ed25519 signing + X25519 encryption keys).
     identity: Option<Identity>,
-    /// The roster the member confirmed on-device, and its exact document.
     roster: Option<(ValidatedRoster, Vec<u8>)>,
-    /// The saved setup, from the roster confirmation on.
     setup: Option<SetupCheckpoint>,
-    /// The member's FROST share, sealed at rest. Present once DKG completes (or when the
-    /// signer is constructed from a restored/dealer-dealt share for tests).
     sealed_share: Option<SealedShare>,
-    /// The group `PublicKeyPackage`, serialized. Public.
     public_package: Option<Vec<u8>>,
-    /// The vault viewing key, derived from the group key and the real `vs`. Stays inside
-    /// the signer: used to render payments and build candidates.
     vault_fvk: Option<FullViewingKey>,
     nonces: NonceStore,
     approval: ApprovalPolicy,
     connect_approval: Option<ConnectApproval>,
-    /// External nonce witnesses claimed before each fresh signature share is released.
     nonce_witness: Option<Box<dyn NonceWitness + Send>>,
     roster_confirmation: Option<RosterConfirmation>,
     roster_deadline: Duration,
     backup_device: Option<Box<dyn BackupDevice>>,
     session: Option<Session>,
-    /// The origin shown and approved on-device for the current session.
     session_origin: Option<String>,
-    /// Rendered payments, keyed by candidate attempt id, for `rendered_payment`.
     rendered: BTreeMap<[u8; 32], PaymentView>,
-    /// This signer's own spendable vault notes (scanned member-side with its own fvk). The
-    /// proposer selects from these when it builds a candidate; the coordinator never sees
-    /// them. Empty until set by the signer's owner (`set_candidate_notes`).
+    approved: Option<([u8; 32], [u8; 32])>,
     candidate_notes: Vec<orchard::Note>,
 }
 
@@ -416,6 +355,7 @@ impl<SE: SecureElement> LocalSigner<SE> {
             session: None,
             session_origin: None,
             rendered: BTreeMap::new(),
+            approved: None,
             candidate_notes: Vec::new(),
         }
     }
@@ -450,11 +390,6 @@ impl<SE: SecureElement> LocalSigner<SE> {
         Ok(signer)
     }
 
-    /// Build a signing-ready signer from a member's already-opened, certified vault state
-    /// ([`crate::member_state::open`]). The sealed `vault.sealed` material — this member's
-    /// `KeyPackage`, the group `PublicKeyPackage`, and the vault FVK — is re-sealed under
-    /// this device's `se`; no new DKG runs. This is the path that drives a real funded vault
-    /// through the [`Signer`] seam.
     pub fn from_vault_member(
         state: &crate::member_state::MemberState,
         se: SE,
@@ -480,11 +415,6 @@ impl<SE: SecureElement> LocalSigner<SE> {
         Ok(signer)
     }
 
-    /// Reconstruct a signer from a verified backup on a FRESH data root
-    /// ([`crate::signer::backup::restore`]). The share is re-sealed under this device's
-    /// `se`; `nonces` is a nonce store already opened at the bumped epoch, so any nonce
-    /// committed before the restore is hard-refused (ws1-signer §8). `epoch` is carried so
-    /// subsequent `sign_commit`s stamp the fresh epoch too.
     #[allow(clippy::too_many_arguments)]
     pub fn from_restored(
         member_id: u16,
@@ -513,9 +443,6 @@ impl<SE: SecureElement> LocalSigner<SE> {
         Ok(signer)
     }
 
-    /// Take a member slot: create the signer's data directory under `dir`, bound to one
-    /// vault and member number, and a fresh setup identity. Threshold and member count
-    /// come later, from the roster the member confirms in [`Signer::dkg_begin`].
     pub fn create(
         dir: &Path,
         se: SE,
@@ -528,7 +455,6 @@ impl<SE: SecureElement> LocalSigner<SE> {
         Self::create_with_identity(dir, se, network, vault_id, member_id, label, prompts, Identity::new(member_id))
     }
 
-    /// Use an identity enrolled before the hosted ceremony starts.
     #[allow(clippy::too_many_arguments)]
     pub fn create_with_identity(
         dir: &Path,
@@ -567,10 +493,6 @@ impl<SE: SecureElement> LocalSigner<SE> {
         Ok(signer)
     }
 
-    /// Reopen a signer created with [`LocalSigner::create`] after a restart. Every saved
-    /// file must open under this element and belong to this vault and member; the saved
-    /// setup is revalidated (without decrypting anything once the fresh key is gone), and
-    /// a saved share must match the setup's certified group key.
     pub fn open(dir: &Path, se: SE, label: String, prompts: DevicePrompts) -> Result<Self, SignerError> {
         let store = SignerStore::open(dir)?;
         let (_, raw) = store
@@ -612,7 +534,6 @@ impl<SE: SecureElement> LocalSigner<SE> {
         signer.store = Some(store);
         let mut installed = None;
         let setup = match (&signer.roster, setup) {
-            // A crash between saving the confirmed roster and its empty setup.
             (Some(_), None) if share.is_none() => {
                 let setup = SetupCheckpoint::new();
                 signer.save_setup(&setup)?;
@@ -636,8 +557,6 @@ impl<SE: SecureElement> LocalSigner<SE> {
                             Some(signer.checked_share(&core, &setup.core, &key, public, &vs, *epoch)?);
                     }
                     (None, false) => {}
-                    // A crash after the certificate-phase setup was saved but before its
-                    // share file was written: the setup holds the share.
                     (None, true) => {
                         installed = Some(
                             signer
@@ -645,7 +564,6 @@ impl<SE: SecureElement> LocalSigner<SE> {
                                 .map_err(SignerError::Other)?,
                         );
                     }
-                    // A share without a certified setup: a file was rolled back or swapped.
                     _ => {
                         return Err(SignerError::Other(
                             "signer files are inconsistent (rolled back?)".into(),
@@ -666,14 +584,10 @@ impl<SE: SecureElement> LocalSigner<SE> {
         Ok(signer)
     }
 
-    /// The group verifying (public) key package, once DKG has completed. Public.
     pub fn public_package_bytes(&self) -> Option<&[u8]> {
         self.public_package.as_deref()
     }
 
-    /// Public vault metadata (group public-key package + full viewing key) for an active
-    /// signer, without touching the sealed share. The hosted member records it in
-    /// `vault.sealed` and scans with it; the share itself never leaves the signer.
     pub fn hosted_metadata(&self) -> Result<(frost::keys::PublicKeyPackage, FullViewingKey), SignerError> {
         self.require_ready()?;
         let public = frost::keys::PublicKeyPackage::deserialize(
@@ -683,7 +597,6 @@ impl<SE: SecureElement> LocalSigner<SE> {
         Ok((public, self.fvk()?.clone()))
     }
 
-    /// Open a hosted signing packet for the browser's relay pump.
     pub fn open_hosted_signing(
         &self,
         sender: &PublicIdentity,
@@ -698,7 +611,6 @@ impl<SE: SecureElement> LocalSigner<SE> {
         identity.open_session(sender, context, wire).map_err(SignerError::Other)
     }
 
-    /// Seal this browser member's commitment or share to the pinned hosted coordinator.
     pub fn seal_hosted_signing(
         &self,
         coordinator: &PublicIdentity,
@@ -716,19 +628,10 @@ impl<SE: SecureElement> LocalSigner<SE> {
         identity.seal_session(coordinator, context, kind, body).map_err(SignerError::Other)
     }
 
-    /// The roster this member confirmed at setup. Peers are looked up here, never taken from
-    /// keys a network reply supplies.
     pub fn confirmed_roster(&self) -> Option<&Roster> {
         self.roster.as_ref().map(|(roster, _)| roster.roster())
     }
 
-    /// Give a signer restored from a backup ([`crate::signer::backup::restore`]) the roster
-    /// document that backup carried, so it can seal and open control messages with its peers
-    /// again. Only for a restored signer (no data directory, no roster or setup yet); the
-    /// document passes the same roster gate as setup and must match the restored vault size.
-    /// `connect` is the member's on-device connection prompt: a restored signer built from a
-    /// bare share has none, so without it every session stays unapproved and the member can
-    /// never release its address.
     pub fn adopt_restored_roster(&mut self, document: &[u8], connect: ConnectApproval) -> Result<(), SignerError> {
         if self.store.is_some() || self.roster.is_some() || self.setup.is_some() {
             return Err(SignerError::Other("only a restored signer adopts its backup roster".into()));
@@ -746,9 +649,6 @@ impl<SE: SecureElement> LocalSigner<SE> {
         self.network
     }
 
-    /// Open a message another member sealed to this one on a payment's control session. The
-    /// sender is the confirmed-roster member whose relay key is `sender_relay`. Returns its
-    /// member id and the message body.
     pub fn open_control(
         &self,
         session: uuid::Uuid,
@@ -774,7 +674,6 @@ impl<SE: SecureElement> LocalSigner<SE> {
         Ok((sender.id, opened.body().to_vec()))
     }
 
-    /// Seal a control-session message from this member to confirmed-roster member `recipient`.
     pub fn seal_control(
         &self,
         session: uuid::Uuid,
@@ -794,9 +693,6 @@ impl<SE: SecureElement> LocalSigner<SE> {
             .map_err(SignerError::Other)
     }
 
-    /// The device-side "abandon this setup" action: wipe the setup's fresh key, FROST
-    /// state and saved messages, and refuse to continue it. Also done automatically on
-    /// any mismatch before the share exists.
     pub fn abandon_setup(&mut self) -> Result<(), SignerError> {
         let mut setup = self
             .setup
@@ -812,15 +708,10 @@ impl<SE: SecureElement> LocalSigner<SE> {
         saved
     }
 
-    /// Require a claim at both external nonce witnesses before every fresh signature share:
-    /// a nonce whose claim is refused or already taken (for example after the local nonce
-    /// files were rolled back) never signs. The local durable burn record still applies.
     pub fn set_nonce_witness(&mut self, witness: Box<dyn NonceWitness + Send>) {
         self.nonce_witness = Some(witness);
     }
 
-    /// Browser preflight: return the original witness pair only after authenticating the
-    /// pending nonce and checking that the package names that exact commitment.
     pub fn nonce_claim_pins(
         &self,
         cand: &CandidateRef,
@@ -836,7 +727,6 @@ impl<SE: SecureElement> LocalSigner<SE> {
         Ok(pins)
     }
 
-    /// Sign with the active vault identity, not a transport key or a public capability.
     pub fn nonce_claim_proof(
         &self,
         (key, run, mailbox): ([u8; 32], [u8; 32], [u8; 32]),
@@ -849,36 +739,28 @@ impl<SE: SecureElement> LocalSigner<SE> {
         Ok(identity.nonce_claim_proof(self.vault_id, &pin, mailbox, cid, challenge, record))
     }
 
-    /// Install the decision for an attempt after its signing group and expiry are fixed.
     pub fn set_approval_policy(&mut self, approval: ApprovalPolicy) {
         self.approval = approval;
+        self.approved = None;
     }
 
-    /// Give this signer the vault notes it may spend. These are scanned member-side with
-    /// this signer's own fvk (`wallet_store::sync_member_wallet`); they never cross the
-    /// coordinator seam. The proposer signer selects from them in `build_candidate`.
     pub fn set_candidate_notes(&mut self, notes: Vec<orchard::Note>) {
         self.candidate_notes = notes;
     }
 
-    /// Build the IO-finalized, unsigned single-note candidate under `params`, the signer's
-    /// OWN fvk, its OWN selected note, and the coordinator-supplied `alpha`. The `P` is the
-    /// signer's own network parameters — never supplied by the coordinator.
-    fn build_single_note_pczt<P: zcash_protocol::consensus::Parameters + Clone>(
+    fn build_pczt<P: zcash_protocol::consensus::Parameters + Clone>(
         &self,
         params_net: &P,
         params: &crate::signer::PublicPaymentParams,
-        alpha: &[u8; 32],
+        alphas: &[[u8; 32]],
     ) -> Result<Vec<u8>, SignerError> {
-        // ponytail: first-note selection; swap for real coin selection when multi-note lands.
-        let note = *self
-            .candidate_notes
-            .first()
-            .ok_or_else(|| SignerError::Other("signer holds no spendable note".into()))?;
-        // The PCZT build is share-free; it lives in `crate::builder` so the untrusted
-        // server-side builder (W4) runs this identical path. Only note selection and the
-        // viewing key stay here.
-        crate::builder::build_unsigned(self.fvk()?, params_net, params, note, alpha)
+        if self.candidate_notes.is_empty() {
+            return Err(SignerError::Other("signer holds no spendable note".into()));
+        }
+        if self.candidate_notes.len() != alphas.len() {
+            return Err(SignerError::Other("the coordinator sent a randomiser count that differs from the payment's notes".into()));
+        }
+        crate::builder::build_unsigned(self.fvk()?, params_net, params, &self.candidate_notes, alphas)
             .map_err(SignerError::Other)
     }
 
@@ -915,8 +797,6 @@ impl<SE: SecureElement> LocalSigner<SE> {
         Ok(())
     }
 
-    /// Whether every certificate and every member's backup receipt is in. A signer built
-    /// from a bare share is ready by construction.
     fn is_ready(&self) -> bool {
         match (&self.setup, &self.roster) {
             (None, _) => self.sealed_share.is_some(),
@@ -937,8 +817,6 @@ impl<SE: SecureElement> LocalSigner<SE> {
         }
     }
 
-    /// The shared roster gate plus this signer's checks: `"setup_version": 2` first, then
-    /// its own network, its vault, and its full identity under its member number.
     fn check_roster(&self, document: &[u8]) -> Result<ValidatedRoster, SignerError> {
         let reject = |e: &str| SignerError::RosterRejected(e.to_string());
         let value: serde_json::Value =
@@ -980,8 +858,6 @@ impl<SE: SecureElement> LocalSigner<SE> {
         self.vault_fvk = Some(share.fvk);
     }
 
-    /// Check a share born in (or reloaded for) the certified setup: it must match the
-    /// setup's group key and `vs`; the viewing key is derived from the real `vs`.
     #[allow(clippy::too_many_arguments)]
     fn checked_share(
         &self,
@@ -1019,9 +895,6 @@ impl<SE: SecureElement> LocalSigner<SE> {
         })
     }
 
-    /// One `dkg_step`: start round one if needed, accept the inputs, then advance through
-    /// every phase whose messages are complete. Each advance is saved before the next, and
-    /// `setup` always equals the last saved state, even when this returns an error.
     fn advance_setup(
         &mut self,
         setup: &mut SetupCheckpoint,
@@ -1041,7 +914,6 @@ impl<SE: SecureElement> LocalSigner<SE> {
         inputs: &[DkgInput],
         share: &mut Option<InstalledShare>,
     ) -> Result<(), StepError> {
-        // Before the share exists a failure is final; after it, the saved setup is kept.
         let fail = |state: &SetupCheckpoint, error: String| {
             if holds_share(state) {
                 StepError::Kept(error)
@@ -1060,7 +932,6 @@ impl<SE: SecureElement> LocalSigner<SE> {
         let core = DkgCore::new(roster, identity).map_err(|e| fail(setup, e))?;
         let own = self.member_id;
         if holds_share(setup) && self.sealed_share.is_none() {
-            // A write of the share file failed after its setup was saved: finish it now.
             *share = Some(self.restore_share(&core, &setup.core).map_err(|e| fail(setup, e))?);
         }
         if setup.core.phase() == DkgPhase::Empty {
@@ -1078,7 +949,6 @@ impl<SE: SecureElement> LocalSigner<SE> {
                 if !holds_share(&next) {
                     return Err(StepError::Abort(error));
                 }
-                // One bad message must not cost a member the share it already holds.
                 refused.push(error);
             }
         }
@@ -1101,7 +971,6 @@ impl<SE: SecureElement> LocalSigner<SE> {
                         Ok(body) if body.as_slice() == expected => {
                             next.backups.insert(sender, wire);
                         }
-                        // Dropped, so the member's real receipt can still arrive.
                         _ => refused.push(format!(
                             "member {sender}'s backup receipt is for a different vault"
                         )),
@@ -1123,8 +992,6 @@ impl<SE: SecureElement> LocalSigner<SE> {
             let (state, outgoing) = match core.advance(&next.core, &records) {
                 Ok(advanced) => advanced,
                 Err(error) if holds_share(&next) => {
-                    // The certificates disagree. The vault never becomes ready, but the
-                    // share and the saved setup stay for the member to inspect.
                     refused.push(error);
                     break;
                 }
@@ -1134,16 +1001,11 @@ impl<SE: SecureElement> LocalSigner<SE> {
                 next.pending.remove(&(kind_code(kind), *id));
             }
             next.core = state;
-            // Keep earlier phases' messages: a peer may not have them yet when this
-            // member moves through several phases in one step.
             for wire in released(&outgoing, own) {
                 if !next.outgoing.contains(&wire) {
                     next.outgoing.push(wire);
                 }
             }
-            // The certificate-phase setup holds the share, so it is saved before the share
-            // file is written; `open` rebuilds a missing share file from it. Nothing is
-            // released until this step returns.
             self.save_setup(&next).map_err(|e| fail(setup, e.to_string()))?;
             *setup = next.duplicate();
             if next.core.phase() == DkgPhase::Certificate {
@@ -1159,7 +1021,6 @@ impl<SE: SecureElement> LocalSigner<SE> {
         }
     }
 
-    /// Write the share file from a certificate-phase setup and check it against that setup.
     fn restore_share(&self, core: &DkgCore<'_>, state: &DkgState) -> Result<InstalledShare, String> {
         let completed =
             crate::distributed_setup::Completed::restore_checkpoint(&state.completed_checkpoint()?)?;
@@ -1177,20 +1038,15 @@ impl<SE: SecureElement> LocalSigner<SE> {
     }
 }
 
-/// How a `dkg_step` failed.
 enum StepError {
-    /// Before the share exists: final, the setup is wiped.
     Abort(String),
-    /// After the share exists: the bad messages are refused and the saved setup is kept.
     Kept(String),
 }
 
-/// Whether the share has been born in this setup (certificate phase or later).
 fn holds_share(setup: &SetupCheckpoint) -> bool {
     !setup.aborted && (setup.core.phase() as u8) >= DkgPhase::Certificate as u8
 }
 
-/// Check one tagged input and queue it as pending, or drop it as a repeat.
 fn accept_input(
     roster: &ValidatedRoster,
     identity: &Identity,
@@ -1235,7 +1091,6 @@ fn accept_input(
         DkgWireKind::BackupReceipt => {
             identity.verify_backup(peer, &vault, &input.bytes)?;
         }
-        // Checked against our transcript when round two is consumed.
         DkgWireKind::Round2 => {}
     }
     let key = (kind_code(wire.kind()), wire.sender());
@@ -1250,16 +1105,12 @@ fn accept_input(
     }
 }
 
-/// A checked share ready to install: sealed under the element, with its public package
-/// and the viewing key derived from the real `vs`.
 struct InstalledShare {
     sealed: SealedShare,
     public_package: Vec<u8>,
     fvk: FullViewingKey,
 }
 
-/// The messages this member releases from a core step: one copy of each distinct wire,
-/// without the member's own copy.
 fn released(outgoing: &crate::dkg_core::Outgoing, own: u16) -> Vec<Vec<u8>> {
     let mut wires: Vec<Vec<u8>> = Vec::new();
     for (recipient, wire) in outgoing {
@@ -1293,8 +1144,6 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
                 network, self.network
             )));
         }
-        // A setup-capable signer shows the origin and network and asks the member. A
-        // signer built from a bare share has no prompt; its sessions are never approved.
         let approved = match self.connect_approval.as_mut() {
             Some(approve) => {
                 if !approve(origin, network) {
@@ -1304,7 +1153,6 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
             }
             None => false,
         };
-        // Session id binds the challenge so a replayed connect gets a distinct handle.
         let mut sid = [0u8; 32];
         let h = blake3::hash(challenge);
         sid.copy_from_slice(h.as_bytes());
@@ -1331,7 +1179,6 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
     fn list_vaults(&self, session: &Session) -> Result<Vec<VaultRef>, Self::Error> {
         self.check_session(session)?;
         if self.store.is_some() && self.roster.is_none() {
-            // A member slot with no confirmed roster yet holds no vault.
             return Ok(vec![]);
         }
         Ok(vec![VaultRef {
@@ -1351,7 +1198,6 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
         if self.roster.is_some() || self.setup.is_some() {
             return Err(SignerError::Other("this signer's setup has already begun".into()));
         }
-        // Version, roster gate, network and own identity: all before the code is shown.
         let validated = self.check_roster(roster)?;
         let code = roster_code(&validated.fingerprint());
         let confirm = self
@@ -1415,8 +1261,6 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
         match self.advance_setup(&mut setup, in_msgs) {
             Ok(()) => {}
             Err(StepError::Abort(error)) => {
-                // Any mismatch before the share exists is final: wipe the setup's secrets
-                // and saved messages, never re-fetch and retry.
                 setup.wipe();
                 let _ = self.save_setup(&setup);
                 self.setup = Some(setup);
@@ -1477,7 +1321,6 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
         let passphrase = device.passphrase().ok_or(SignerError::Cancelled)?;
         let artifact = backup::create(&material, &passphrase).map_err(SignerError::Other)?;
         device.save(&artifact).map_err(SignerError::Other)?;
-        // Prove the stored backup reloads with what the member remembers.
         let reloaded = device.load().map_err(SignerError::Other)?;
         let again = device.passphrase().ok_or(SignerError::Cancelled)?;
         let back = backup::verify(&reloaded, &again, &self.vault_id).map_err(SignerError::Other)?;
@@ -1513,9 +1356,6 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
             Some(setup) => DkgCore::new(roster, identity)
                 .and_then(|core| core.address(&setup.core))
                 .map_err(SignerError::Other)?,
-            // A member restored from its backup holds the vault FVK its DKG derived
-            // (`frost_viewing_key(ak, vs)`, the same key `DkgCore::address` encodes), not the
-            // setup transcript.
             None => crate::vault::unified_address(
                 self.vault_fvk.as_ref().ok_or(SignerError::NotReady)?,
                 zcash_protocol::consensus::Parameters::network_type(&roster.roster().network),
@@ -1532,16 +1372,14 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
         session: &Session,
         _cand: &CandidateRef,
         params: &crate::signer::PublicPaymentParams,
-        alpha: &[u8; 32],
+        alphas: &[[u8; 32]],
     ) -> Result<CandidatePczt, Self::Error> {
         self.check_session(session)?;
         self.require_ready()?;
-        // Build under the signer's OWN network parameters: the coordinator supplied neither
-        // the fvk nor a `Parameters` instance.
         match self.network {
-            Network::Regtest => self.build_single_note_pczt(&crate::candidate::Regtest, params, alpha),
+            Network::Regtest => self.build_pczt(&crate::candidate::Regtest, params, alphas),
             Network::Testnet => {
-                self.build_single_note_pczt(&zcash_protocol::consensus::TEST_NETWORK, params, alpha)
+                self.build_pczt(&zcash_protocol::consensus::TEST_NETWORK, params, alphas)
             }
         }
         .map(CandidatePczt)
@@ -1557,7 +1395,6 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
         }
         self.require_ready()?;
         let id = self.nonce_id(cand);
-        // Round 1 needs the share to derive the nonce; the key lives only for this call.
         let kp = self.open_key()?;
         let pins = self.nonce_witness.as_ref().map(|witness| witness.pins());
         let commitment = self.nonces.commit(&id, &self.se, kp.signing_share(), pins);
@@ -1578,10 +1415,8 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
             return Err(SignerError::NoSession);
         }
 
-        // 1. INDEPENDENTLY render what this PCZT pays — from the bytes, not any claim.
         self.require_ready()?;
         let view = wysiwys::describe_pczt(pczt, self.fvk()?).map_err(SignerError::Other)?;
-        // The PCZT carries a branch ID, not the requested target height itself.
         let height = zcash_protocol::consensus::BlockHeight::from_u32(params.target_height);
         let branch = match self.network {
             Network::Regtest => {
@@ -1620,18 +1455,14 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
         }
         self.rendered.insert(cand.attempt_id, view.clone());
 
-        // 2. Recompute the sighash from the SAME bytes, so consent binds to it (not just the view).
         let local_sighash = wysiwys::checked_sighash_of_pczt(pczt, self.fvk()?)?;
 
-        // 3. The member decides on THAT render + candidate + sighash (policy/biometric).
-        //    Refusal is first-class.
-        if !(self.approval)(&ApprovalRequest { candidate: cand, sighash: local_sighash, view: &view }) {
+        let decided = self.approved == Some((cand.payment_id, local_sighash));
+        if !decided && !(self.approval)(&ApprovalRequest { candidate: cand, sighash: local_sighash, view: &view }) {
             return Err(SignerError::MemberRefused);
         }
+        self.approved = Some((cand.payment_id, local_sighash));
 
-        // 4. BINDING (the must-fix): require the SigningPackage to name exactly that sighash.
-        //    Done BEFORE the nonce/share is touched, so a mismatched package can never consume
-        //    a nonce or release a share.
         if pkg.message().as_slice() != local_sighash {
             return Err(SignerError::SighashMismatch);
         }
@@ -1646,7 +1477,6 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
         let share = self.nonces.sign_and_burn(
             &id, &self.se, pkg, &kp, &seed, self.nonce_witness.as_deref_mut(), &|| false,
         );
-        // The key is wiped here, before the partial leaves this call.
         drop(kp);
         share.map_err(|e| SignerError::Other(e.to_string()))
     }
@@ -1705,12 +1535,6 @@ pub(crate) mod tests {
         p
     }
 
-    /// A one-note candidate paying `fvk.address_at(7)` from `fvk`, under `member`+`peer`
-    /// commitments and a rerandomization `seed`. `finalize` toggles IO finalization, which
-    /// is what populates the `rcv` trapdoors (→ `fee_verified`).
-    ///
-    /// Returns (pczt_bytes, signing_package, seed) where the package's message is the real
-    /// sighash of the bytes.
     #[allow(clippy::type_complexity)]
     pub(crate) fn candidate_and_package(
         fvk: &FullViewingKey,
@@ -1744,8 +1568,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// [`candidate_and_package`] paying `extra_fee_zat` above the ZIP-317 fee: a balanced,
-    /// correctly committed PCZT a dishonest proposer can build with a fixed fee rule.
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn candidate_with_fee(
         fvk: &FullViewingKey,
@@ -1757,7 +1579,6 @@ pub(crate) mod tests {
         finalize: bool,
         extra_fee_zat: u64,
     ) -> (Vec<u8>, frost::SigningPackage, [u8; 32]) {
-        // Commitment set drives the seed-derived alpha used to randomize the single spend.
         let mut set = BTreeMap::new();
         set.insert(*key.identifier(), own_commit);
         set.insert(peer_id, peer_commit);
@@ -1807,7 +1628,6 @@ pub(crate) mod tests {
             use zcash_primitives::transaction::builder::{BundlePadding, DeferredPcztBuilder};
             use zcash_protocol::consensus::BlockHeight;
 
-            // A proposer can build a balanced PCZT with an arbitrary fixed fee.
             let mut builder = DeferredPcztBuilder::new::<std::convert::Infallible>(
                 Regtest,
                 BlockHeight::from_u32(inputs.target_height),
@@ -1857,7 +1677,6 @@ pub(crate) mod tests {
         (bytes, pkg, seed_bytes)
     }
 
-    /// A 2-of-3 dealer keyset and the vault FVK derived from its group verifying key.
     fn dealer_vault() -> (
         BTreeMap<frost::Identifier, frost::keys::SecretShare>,
         frost::keys::PublicKeyPackage,
@@ -1887,7 +1706,6 @@ pub(crate) mod tests {
             .session
     }
 
-    /// The coordinator's public request every test candidate is built from.
     pub(crate) fn payment_params(fvk: &FullViewingKey) -> crate::signer::PublicPaymentParams {
         crate::signer::PublicPaymentParams {
             recipient: fvk.address_at(7u64, Scope::External),
@@ -1898,8 +1716,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// A ready member-1 signer with a live round-1 commitment for `attempt`, plus member 2's
-    /// key and commitment that complete the package.
     #[allow(clippy::type_complexity)]
     fn committed_signer(
         attempt: u8,
@@ -1978,9 +1794,6 @@ pub(crate) mod tests {
             .expect("matching request may sign");
     }
 
-    // A forged-VALUE candidate: a dishonest proposer builds a balanced, correctly committed
-    // PCZT whose fee is 1 ZEC above ZIP-317 (the excess comes out of change). Every value
-    // binding holds, so only the fee rule catches it — before approval or the nonce.
     #[test]
     fn sign_approve_refuses_valid_high_fee_before_approval_or_nonce_use() {
         let (mut signer, session, cand, key1, key2, own, peer, public, fvk) = committed_signer(18);
@@ -2010,9 +1823,6 @@ pub(crate) mod tests {
         );
     }
 
-    // A forged-FEE candidate: stripping every `rcv` trapdoor leaves the declared values
-    // unbound to `cv_net`, so the rendered fee is a self-declared number (`fee_verified ==
-    // false`). The signer refuses before approval, and the nonce stays unused.
     #[test]
     fn sign_approve_refuses_unverified_fee_before_approval_or_nonce_use() {
         let (mut signer, session, cand, key1, key2, own, peer, public, fvk) = committed_signer(19);
@@ -2065,8 +1875,6 @@ pub(crate) mod tests {
         (signer, kp)
     }
 
-    // (a) sign_approve REFUSES when pkg.message() != sighash(rendered pczt), and SUCCEEDS
-    //     when they match. This is the must-fix WYSIWYS→signature binding (threat §5.4).
     #[test]
     fn sign_approve_binds_package_message_to_rendered_sighash() {
         let (shares, public, fvk) = dealer_vault();
@@ -2078,9 +1886,7 @@ pub(crate) mod tests {
             attempt_id: [9u8; 32],
         };
 
-        // Round 1 inside the signer: it persists the nonce and gives us the commitment.
         let own_commit = signer.sign_commit(&session, &cand).unwrap();
-        // A peer commitment to populate the package.
         let key2 = frost::keys::KeyPackage::try_from(
             shares
                 .get(&frost::Identifier::try_from(2u16).unwrap())
@@ -2101,7 +1907,6 @@ pub(crate) mod tests {
             true,
         );
 
-        // Tampered package: same commitments, WRONG message (not the pczt's sighash).
         let bad_pkg = frost::SigningPackage::new(
             good_pkg.signing_commitments().clone(),
             &[0xabu8; 32],
@@ -2111,21 +1916,18 @@ pub(crate) mod tests {
             matches!(refused, Err(SignerError::SighashMismatch)),
             "a package naming a different sighash must be REFUSED, got {refused:?}"
         );
-        // And the nonce was NOT burned by the refused attempt.
         assert_eq!(
             signer.nonces.state(&signer.nonce_id(&cand)),
             crate::signer::nonce::NonceState::Committed,
             "refused binding must not touch the nonce"
         );
 
-        // Matching package: binding passes, a real partial signature is produced.
         let share = signer
             .sign_approve(&session, &cand, &payment_params(&fvk), &pczt, &good_pkg, &seed)
             .expect("matching sighash must sign");
         assert_eq!(share.serialize().len(), 32);
     }
 
-    /// Both witnesses as one first-writer-wins claim set, like two relay mailboxes.
     #[derive(Clone, Default)]
     struct Witnesses(std::sync::Arc<std::sync::Mutex<Vec<[u8; 32]>>>, bool);
 
@@ -2143,9 +1945,6 @@ pub(crate) mod tests {
         }
     }
 
-    // The external witnesses gate every fresh share: a refused claim releases nothing and
-    // keeps the nonce; a nonce whose local files were rolled back after it signed cannot
-    // sign again, because its claim is already taken.
     #[test]
     fn nonce_witness_claim_gates_the_share_and_blocks_rolled_back_nonces() {
         let (shares, public, fvk) = dealer_vault();
@@ -2167,22 +1966,18 @@ pub(crate) mod tests {
         let (pczt, pkg, seed) = candidate_and_package(&fvk, &key1, &public, *key2.identifier(), peer, own, true);
         let id = signer.nonce_id(&cand);
 
-        // A refusing witness: no share, and the nonce is neither burned nor consumed.
         let refused = signer.sign_approve(&session, &cand, &payment_params(&fvk), &pczt, &pkg, &seed);
         assert!(matches!(&refused, Err(SignerError::Other(e)) if e.contains("nonce witness refused")), "{refused:?}");
         assert_eq!(signer.nonces.state(&id), crate::signer::nonce::NonceState::Committed);
 
-        // Two working witnesses: the claim is taken once and the share is released.
         signer.set_nonce_witness(Box::new(witnesses.clone()));
         let snapshot: Vec<_> = std::fs::read_dir(&nonce_dir).unwrap().flatten()
             .map(|e| (e.path(), std::fs::read(e.path()).unwrap())).collect();
         let share = signer.sign_approve(&session, &cand, &payment_params(&fvk), &pczt, &pkg, &seed).expect("claimed nonce signs");
         assert_eq!(witnesses.0.lock().unwrap().len(), 1);
-        // An identical resend replays the recorded partial without a second claim.
         assert_eq!(signer.sign_approve(&session, &cand, &payment_params(&fvk), &pczt, &pkg, &seed).unwrap(), share);
         assert_eq!(witnesses.0.lock().unwrap().len(), 1);
 
-        // Roll the local nonce files back to before the burn: the witnesses refuse.
         for entry in std::fs::read_dir(&nonce_dir).unwrap().flatten() {
             std::fs::remove_file(entry.path()).unwrap();
         }
@@ -2194,11 +1989,6 @@ pub(crate) mod tests {
         assert!(matches!(&replayed, Err(SignerError::Other(e)) if e.contains("already claimed")), "{replayed:?}");
     }
 
-    // (a'') The browser `paymentReview` seam: it renders the candidate (describe_pczt) and
-    //       INDEPENDENTLY recomputes the sighash (sighash_of_pczt) the exact same way the
-    //       native path does, with NO share released. The recomputed sighash must equal the
-    //       message a correct SigningPackage commits to, and a tampered candidate must not
-    //       reproduce it (so sign_approve's binding would refuse to release a share).
     #[test]
     fn payment_review_recomputes_candidate_sighash_and_tamper_is_refused() {
         let (shares, public, fvk) = dealer_vault();
@@ -2219,16 +2009,12 @@ pub(crate) mod tests {
             &fvk, &key1, &public, *key2.identifier(), peer_commit, own_commit, true,
         );
 
-        // paymentReview = describe + recompute-sighash, both over the vault viewing key.
         let view = wysiwys::describe_pczt(&pczt, &fvk).unwrap();
         let sighash = wysiwys::sighash_of_pczt(&pczt, &fvk).unwrap();
         assert_eq!(view.amount_zat, AMOUNT);
         assert!(view.fee_verified);
-        // The recomputed sighash is EXACTLY what the real SigningPackage commits to.
         assert_eq!(pkg.message().as_slice(), sighash);
 
-        // Flip a byte: the candidate no longer reproduces that sighash (refused outright, or a
-        // different hash that sign_approve's `pkg.message() == sighash` gate would reject).
         let mut bad = pczt.clone();
         *bad.last_mut().unwrap() ^= 0xff;
         match wysiwys::sighash_of_pczt(&bad, &fvk) {
@@ -2237,7 +2023,6 @@ pub(crate) mod tests {
         }
     }
 
-    // (a') a member refusal is first-class and does not consume the nonce.
     #[test]
     fn member_refusal_is_first_class_and_leaves_nonce() {
         let (shares, public, fvk) = dealer_vault();
@@ -2255,7 +2040,7 @@ pub(crate) mod tests {
             public.serialize().unwrap(),
             fvk.clone(),
             tempdir("refuse"),
-            Box::new(|_view| false), // member declines
+            Box::new(|_view| false),
         )
         .unwrap();
         let session = connect_signer(&mut signer);
@@ -2291,15 +2076,6 @@ pub(crate) mod tests {
         );
     }
 
-    // (c) fee integrity: the rendered fee is only reported as trusted when every action's
-    //     declared spend/output value is BOUND to its `cv_net` value commitment via `rcv`
-    //     (`verify_cv_net`) — the same binding the sighash commits to. Here the real
-    //     candidate carries `rcv`, so the binding runs AND passes: the fee is verified and
-    //     equals total_in - total_out, not a self-declared number.
-    //
-    //     The opposite (`fee_verified == false`) is the guard for a PCZT whose `rcv` is
-    //     absent or whose values do not match the commitment; the redactor reaches it in
-    //     `sign_approve_refuses_unverified_fee_before_approval_or_nonce_use`.
     #[test]
     fn fee_is_verified_when_values_bind_to_commitments() {
         let (shares, public, fvk) = dealer_vault();
@@ -2327,12 +2103,9 @@ pub(crate) mod tests {
             view.fee_verified,
             "a candidate whose values bind to cv_net must report a VERIFIED fee"
         );
-        // The verified fee is the real spend-minus-output difference.
         assert_eq!(view.fee_zat, SPEND_VALUE - AMOUNT - view.change_zat);
         assert!(view.fee_zat > 0);
 
-        // Same bytes, independent check: every action's cv_net binds its declared values.
-        // If any did not, describe_pczt would have cleared fee_verified above.
         let parsed = pczt::Pczt::parse(&pczt).unwrap();
         let mut all_bound = true;
         pczt::roles::verifier::Verifier::new(parsed)
@@ -2348,9 +2121,6 @@ pub(crate) mod tests {
         assert_eq!(all_bound, view.fee_verified);
     }
 
-    // (U1) A LocalSigner built from an existing sealed vault member share (the real
-    //      member_state::MemberState material) is signing-ready: it does round 1
-    //      (sign_commit) and round 2 (sign_approve) on a candidate for the group key.
     #[test]
     fn signer_from_vault_member_can_sign_a_candidate() {
         use crate::member_state::{MemberState, Roster};
@@ -2362,7 +2132,6 @@ pub(crate) mod tests {
         let key1 = frost::keys::KeyPackage::try_from(shares.get(&id1).unwrap().clone()).unwrap();
         let key2 = frost::keys::KeyPackage::try_from(shares.get(&id2).unwrap().clone()).unwrap();
 
-        // Three member identities drive the certified roster; the signer is member 1.
         let identities: Vec<Identity> = (1..=3).map(Identity::new).collect();
         let vault = [7u8; 32];
         let members: Vec<_> = identities
@@ -2405,7 +2174,6 @@ pub(crate) mod tests {
         .unwrap();
         let session = connect_signer(&mut signer);
 
-        // list_vaults exposes the loaded vault; member 1 holds a share for it.
         let vaults = signer.list_vaults(&session).unwrap();
         assert_eq!(vaults.len(), 1);
         assert_eq!(vaults[0].vault_id, vault);

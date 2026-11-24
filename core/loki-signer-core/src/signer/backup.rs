@@ -1,24 +1,3 @@
-//! Member share BACKUP / RESTORE (ws1-signer §2, §5, §8).
-//!
-//! A FROST share is NOT seed-derivable — it is one point of a dealerless DKG. The only
-//! way a member recovers signing ability on a new device is to have backed up the sealed
-//! material itself. This module produces a single portable artifact that carries exactly
-//! what [`LocalSigner::with_sealed_share`] needs to sign again, and restores it onto a
-//! fresh data root.
-//!
-//! Crypto reuse (no new primitives, ws1-signer §3): the artifact is sealed with the SAME
-//! [`SealedShare`] / [`SecureElement`] hierarchy used at rest, except the KEK is derived
-//! from the member's backup passphrase via the one project-wide Argon2id
-//! ([`crate::seal_kdf`]) rather than a device-bound element — so the blob is portable to a
-//! new device, which is the whole point of a backup. The on-disk/over-the-wire artifact is
-//! therefore AEAD ciphertext under a passphrase-derived KEK; the plaintext share never
-//! leaves memory unsealed.
-//!
-//! Nonce-epoch reset (ws1-signer §8): every artifact carries a `backup_epoch`. [`restore`]
-//! reconstructs the signer at `backup_epoch + 1` and opens its (fresh) nonce store at that
-//! bumped epoch, so any nonce committed before the restore is hard-refused afterwards
-//! (see [`crate::signer::nonce`]).
-
 use crate::seal_kdf;
 use crate::signer::local::{ApprovalPolicy, LocalSigner, SignerError};
 use crate::signer::nonce::NonceStore;
@@ -70,9 +49,6 @@ fn take_bytes<'a>(raw: &'a [u8], at: &mut usize) -> Result<&'a [u8], String> {
     Ok(slice)
 }
 
-/// Everything needed to rebuild a member's signer on a new device. The share plaintext
-/// (`key_package`) lives here only transiently; the sealed artifact ([`BackupArtifact`])
-/// is what crosses a disk/QR/cloud boundary.
 pub struct BackupMaterial {
     pub member_id: u16,
     pub threshold: u16,
@@ -80,29 +56,17 @@ pub struct BackupMaterial {
     pub network: Network,
     pub vault_id: [u8; 32],
     pub label: String,
-    /// The group's privately agreed ZIP-2005 viewing-key secret (`group_sk`), needed to
-    /// re-derive the vault FVK on the new device. Public-to-the-group but vault-private.
     pub group_sk: [u8; 32],
-    /// This member's FROST `KeyPackage`, serialized. The one non-seed-derivable secret.
     pub key_package: Zeroizing<Vec<u8>>,
-    /// The group `PublicKeyPackage`, serialized. Public.
     pub public_package: Vec<u8>,
-    /// The epoch this backup was taken at. [`restore`] bumps past it.
     pub backup_epoch: u64,
-    /// The member's setup identity (`Identity::to_secret_bytes`), so a restored device
-    /// holds an identity that is in its own roster. Empty for a bare-share backup.
     pub identity: Zeroizing<Vec<u8>>,
-    /// The confirmed roster document. Empty for a bare-share backup.
     pub roster: Vec<u8>,
-    /// Fingerprint of `roster`; all zero for a bare-share backup.
     pub roster_fingerprint: [u8; 32],
-    /// The vault's birth height on Testnet.
     pub birth_height: Option<u32>,
 }
 
 impl BackupMaterial {
-    /// The group verifying key (`ak`), read from the public package. The FVK is
-    /// `frost_viewing_key(ak, group_sk)`.
     fn group_ak(&self) -> Result<[u8; 32], String> {
         let public = reddsa_frost::frost::redpallas::keys::PublicKeyPackage::deserialize(
             &self.public_package,
@@ -191,8 +155,6 @@ impl BackupMaterial {
     }
 }
 
-/// The sealed, portable backup. `magic || SealedShare(plaintext, passphrase-KEK)`.
-/// The share plaintext is never in these bytes — only AEAD ciphertext.
 pub struct BackupArtifact(pub Vec<u8>);
 
 impl BackupArtifact {
@@ -200,8 +162,6 @@ impl BackupArtifact {
         hex::encode(Sha256::digest(&self.0))
     }
 
-    /// Compare with a fingerprint from the original signer or a known-good offline copy,
-    /// not with a fingerprint supplied alongside an untrusted backup.
     pub fn check_fingerprint(&self, expected: &str) -> Result<(), String> {
         if hex::decode(expected.trim()).ok().as_deref() != Some(&Sha256::digest(&self.0)[..]) {
             return Err("backup does not match the independently saved SHA-256 fingerprint".into());
@@ -210,7 +170,6 @@ impl BackupArtifact {
     }
 }
 
-/// Argon2id salt for the backup KEK: the vault id (stable, non-secret, vault-scoped).
 fn backup_salt(vault_id: &[u8; 32]) -> &[u8] {
     vault_id
 }
@@ -233,11 +192,6 @@ pub fn create(material: &BackupMaterial, passphrase: &str) -> Result<BackupArtif
     Ok(BackupArtifact(out))
 }
 
-/// VERIFY (ws1-signer §9: "force the member to save and prove-load their recovery
-/// artifact"): reopen the artifact with the passphrase and recover the material. A member
-/// runs this right after [`create`] to prove the backup is loadable before the vault
-/// activates. Also round-trips through the FROST deserializers so a corrupt share is
-/// caught here, not at first signature.
 pub fn verify(
     artifact: &BackupArtifact,
     passphrase: &str,
@@ -253,9 +207,6 @@ pub fn verify(
     validate_material(material, vault_id)
 }
 
-/// Shared post-decode checks for any backup artifact, however it was sealed: it is for this
-/// vault, its share + public package parse and derive a valid FVK, and (when present) its
-/// identity is the one its own roster names.
 fn validate_material(material: BackupMaterial, vault_id: &[u8; 32]) -> Result<BackupMaterial, String> {
     if &material.vault_id != vault_id {
         return Err("backup is for a different vault".into());
@@ -277,7 +228,6 @@ fn validate_material(material: BackupMaterial, vault_id: &[u8; 32]) -> Result<Ba
     zip2005::frost_viewing_key(&ak, &material.group_sk)
         .map_err(|e| format!("backup cannot derive the vault FVK: {e:?}"))?;
     if !material.roster.is_empty() {
-        // The restored identity must be the one its own roster names.
         let roster = crate::member_state::Roster::from_bytes(&material.roster)?;
         let identity = crate::setup_transport::Identity::from_secret_bytes(&material.identity)?;
         if roster.fingerprint() != material.roster_fingerprint
@@ -315,9 +265,6 @@ pub fn restore<SE: SecureElement>(
     rebuild_signer(material, se, nonce_dir, approval)
 }
 
-/// Reconstruct a signing-ready signer from already-validated material, re-sealing the share
-/// under the NEW device's `se` and opening the nonce store at `backup_epoch + 1`. Shared by
-/// the passphrase ([`restore`]) and recovery-words ([`restore_recovery`]) restore paths.
 fn rebuild_signer<SE: SecureElement>(
     material: BackupMaterial,
     se: SE,
@@ -327,7 +274,6 @@ fn rebuild_signer<SE: SecureElement>(
     let ak = material.group_ak().map_err(SignerError::Other)?;
     let fvk = zip2005::frost_viewing_key(&ak, &material.group_sk)
         .map_err(|e| SignerError::Other(format!("FVK derivation: {e:?}")))?;
-    // Fresh nonce epoch: strictly greater than the backed-up epoch.
     let next_epoch = material.backup_epoch.checked_add(1)
         .ok_or_else(|| SignerError::Other("backup epoch overflow".into()))?;
     let nonces = NonceStore::open_at_epoch(&nonce_dir, next_epoch, material.vault_id, material.member_id)
@@ -358,11 +304,6 @@ fn rebuild_signer<SE: SecureElement>(
     )
 }
 
-/// RECOVERY BACKUP: seal `material` to a words-derived recovery PUBLIC key (RFC 9180 HPKE),
-/// vault-scoped. Needs only the public key, so the signer makes a fresh backup for every new
-/// vault without re-entering its recovery words; only the matching recovery key (the 24 words)
-/// can reopen it. The service may hold this artifact — it is opaque ciphertext to anyone but
-/// the words-holder. See [`crate::signer::recovery`].
 pub fn create_to_recovery(
     material: &BackupMaterial,
     recovery_pub: &[u8; 32],
@@ -386,9 +327,6 @@ pub fn create_to_recovery(
     Ok(BackupArtifact(out))
 }
 
-/// Open and validate recovery material. V1 has no author signature. V2 proves that the
-/// embedded member signed the payload, but does not establish that the member or vault is
-/// trusted. Importers must independently authenticate the artifact before installing it.
 pub fn verify_recovery(
     artifact: &BackupArtifact,
     recovery: &crate::signer::recovery::RecoveryKey,
@@ -419,10 +357,6 @@ pub fn verify_recovery(
     validate_material(material, vault_id)
 }
 
-/// RESTORE from a recovery-sealed artifact onto a fresh data root (the new-phone path):
-/// re-derive the recovery key from the 24 words, open the service-held backup, and rebuild a
-/// signing-ready signer under this device's `se`. Mirrors [`restore`]; `nonce_dir` MUST be a
-/// fresh/empty directory.
 #[allow(clippy::too_many_arguments)]
 pub fn restore_recovery<SE: SecureElement>(
     artifact: &BackupArtifact,
@@ -456,7 +390,6 @@ mod tests {
         p
     }
 
-    /// A 2-of-3 dealer vault: member-1 share + public package + a fresh group_sk.
     fn fixture() -> (BackupMaterial, frost::keys::PublicKeyPackage) {
         let (shares, public) = frost::keys::generate_with_dealer(
             3,
@@ -502,21 +435,17 @@ mod tests {
         })).unwrap();
         material.roster_fingerprint = crate::member_state::Roster::from_bytes(&material.roster).unwrap().fingerprint();
 
-        // First launch: words + recovery key. Back up to the PUBLIC key only.
         let (words, key) = RecoveryKey::generate().unwrap();
         let art = create_to_recovery(&material, &key.public_bytes()).unwrap();
         drop(key);
-        // The share plaintext never appears in the artifact bytes.
         assert!(!art
             .0
             .windows(material.key_package.len())
             .any(|w| w == material.key_package.as_slice()));
 
-        // Wrong words cannot open it.
         let (other, _) = RecoveryKey::generate().unwrap();
         assert!(verify_recovery(&art, &RecoveryKey::from_words(&other).unwrap(), &vault_id).is_err());
 
-        // New phone: re-derive from the SAME words, restore onto a clean root, and sign.
         let restored_key = RecoveryKey::from_words(&words).unwrap();
         let mut signer = restore_recovery(
             &art,
@@ -602,15 +531,12 @@ mod tests {
         assert!(other.adopt_restored_roster(&doc([8u8; 32]), connect()).is_err(), "a roster for another vault");
         let mut signer = restore_one();
         assert!(signer.confirmed_roster().is_none());
-        // Without the adopted connect prompt a restored member's session is never approved.
         let unapproved = signer.connect("https://coordinator", Network::Regtest, b"before").unwrap().session;
         assert!(matches!(signer.release_address(&unapproved), Err(SignerError::ConnectRefused)));
         signer.adopt_restored_roster(&roster, connect()).unwrap();
         assert_eq!(signer.confirmed_roster().unwrap().members.len(), 3);
         assert!(signer.adopt_restored_roster(&roster, connect()).is_err(), "adopted once");
 
-        // Restored, the member connects, releases the vault's address (from the FVK the backup
-        // re-derives, as the DKG did) and can commit a signing nonce.
         let session = signer.connect("https://coordinator", Network::Regtest, b"after").unwrap().session;
         let released = signer.release_address(&session).unwrap();
         let fvk = zip2005::frost_viewing_key(&material.group_ak().unwrap(), &material.group_sk).unwrap();
@@ -624,12 +550,10 @@ mod tests {
     fn artifact_is_ciphertext_and_verifies_only_with_the_passphrase() {
         let (material, _public) = fixture();
         let art = create(&material, "correct horse").unwrap();
-        // The share plaintext never appears in the artifact bytes.
         assert!(!art
             .0
             .windows(material.key_package.len())
             .any(|w| w == material.key_package.as_slice()));
-        // Wrong passphrase fails; right one recovers the material.
         assert!(verify(&art, "wrong", &material.vault_id).is_err());
         let back = verify(&art, "correct horse", &material.vault_id).unwrap();
         assert_eq!(back.member_id, 1);
@@ -638,9 +562,6 @@ mod tests {
         assert_eq!(back.group_sk, material.group_sk);
     }
 
-    // Acceptance (a): backup -> restore on a CLEAN data root yields a share that signs a
-    // candidate for its group key. (b): a nonce committed BEFORE restore is hard-refused
-    // after restore.
     #[test]
     fn restore_on_clean_root_signs_and_refuses_pre_restore_nonce() {
         let (material, public) = fixture();
@@ -654,7 +575,6 @@ mod tests {
         let fvk = zip2005::frost_viewing_key(&ak, &material.group_sk).unwrap();
         let key1 = frost::keys::KeyPackage::deserialize(&material.key_package).unwrap();
 
-        // --- Pre-restore signer (epoch 3): commit a nonce, capturing its sealed file. ---
         let old_nonce_dir = tempdir("old-nonces");
         let pre = NonceStore::open_at_epoch(&old_nonce_dir, 3, vault_id, material.member_id).unwrap();
         let cand = CandidateRef {
@@ -674,7 +594,6 @@ mod tests {
             .unwrap();
         assert_eq!(pre.state(&nonce_id), NonceState::Committed);
 
-        // --- BACKUP then RESTORE onto a CLEAN data root (fresh dir, new element). ---
         let art = create(&material, "pw").unwrap();
         let fresh_nonce_dir = tempdir("fresh-nonces");
         let mut signer = restore(
@@ -687,15 +606,12 @@ mod tests {
         )
         .unwrap();
 
-        // The restored signer signs a candidate for the group key (clean-root happy path).
         let session = signer
             .connect("http://coordinator.test", Network::Regtest, b"c")
             .unwrap()
             .session;
         let own = signer.sign_commit(&session, &cand).unwrap();
         let key2 = {
-            // A stand-in peer commitment from a second dealer share of the same vault.
-            // (We only need a well-formed package over the pczt's real sighash.)
             let (shares, _p) = frost::keys::generate_with_dealer(
                 3,
                 2,
@@ -725,9 +641,6 @@ mod tests {
             .expect("restored share must sign a candidate for its group key");
         assert_eq!(share.serialize().len(), 32);
 
-        // --- (b) The pre-restore nonce file, dropped into the restored store, is refused. ---
-        // Copy the stale (epoch-3) nonce file into the fresh (epoch-4) store, as a
-        // rollback/replay attacker would, and confirm the restored signer never signs it.
         let stale = std::fs::read(old_nonce_dir.join(format!("{nonce_id}.nonce"))).unwrap();
         let cand2 = CandidateRef {
             vault_id,

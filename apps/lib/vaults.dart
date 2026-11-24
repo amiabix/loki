@@ -11,9 +11,6 @@ const _retiredLink =
 const _otherLink =
     'LokiSigner only reads invite links from your paired coordinator. Paste the invite code instead.';
 
-/// The invite code from pasted text, or why LokiSigner refuses it. A bare code passes through.
-/// A full link must be exactly `<paired coordinator>/#invite=<code>`, the same rule as a link
-/// opened in the app: HTTPS, no credentials, path or query, and no other fragment fields.
 ({String? code, String? error}) inviteCode(String text, String? coordinator) {
   if (!text.contains(':') && !text.contains('/')) {
     return (code: text, error: null);
@@ -47,7 +44,6 @@ const _otherLink =
   }
 }
 
-/// A share link on the pinned wallet origin; the code alone when no HTTPS origin is pinned.
 String inviteLink(String? coordinator, String code) {
   final origin = coordinator == null ? null : Uri.tryParse(coordinator);
   if (origin == null ||
@@ -276,7 +272,6 @@ class _VaultFormState extends State<VaultForm> {
     if (widget.initialInvite case final code?) readInvite(code);
   }
 
-  // An invitation preview is unverified; the signer still validates and enrolls it.
   void readInvite(String input) {
     invite = null;
     final (:code, :error) = inviteCode(input.trim(), widget.coordinator);
@@ -307,8 +302,6 @@ class _VaultFormState extends State<VaultForm> {
               threshold < members &&
               slot >= 2 &&
               slot <= members) {
-        // A relay invite carries the creator's identity; the signer reaches it over its own
-        // relay, so the endpoint and relay named in the invite are not destinations.
         final relay = fields['creator'] != null || fields['frostd_url'] != null;
         if (relay && fields['creator'] is! Map) return;
         invite = (
@@ -321,7 +314,6 @@ class _VaultFormState extends State<VaultForm> {
         );
       }
     } on FormatException {
-      // Report invalid pasted content through the form, not a decoder error.
     }
   }
 
@@ -581,7 +573,8 @@ class VaultSetup extends StatelessWidget {
           )
         else if (phase == 'setup_interrupted') ...[
           Notice(
-            status['error'] as String? ?? 'Key generation was interrupted. Use a new vault and new invitations.',
+            describeError(null, status['error'] as String?) ??
+                'Key generation was interrupted. Use a new vault and new invitations.',
           ),
           const SizedBox(height: 10),
           Align(

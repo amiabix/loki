@@ -57,7 +57,6 @@ pub async fn serve(mut listener: TcpListener, app: Router, shutdown: impl Future
     .await;
 }
 
-/// Count only outstanding work, by actual socket peer (never forwarded headers).
 #[derive(Clone)]
 pub struct PeerGate {
     total: Arc<Semaphore>,

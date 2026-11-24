@@ -1,8 +1,3 @@
-//! Automatic Received preparation.
-//!
-//! Encryption stays in memory until `ClientStore::commit_incoming` commits the original and
-//! every recipient copy together. A saved acknowledgement is not encrypted again.
-
 use crate::store::SavedRecord;
 use crate::{
     prepare_outbox, AuthenticatedMessage, AuthenticatedTransfer, ClientError, ClientResult,
@@ -38,10 +33,6 @@ fn original_target(original: &AuthenticatedMessage) -> MessageRef {
     }
 }
 
-/// Received body for one acknowledgement attempt.
-///
-/// `message_id` is the author's fresh random id, or the id already stored on `ack_links`.
-/// The caller binding stays separate and stable. This function does not draw randomness.
 pub(crate) fn received_body(
     author: MemberId,
     original: &AuthenticatedMessage,
@@ -62,10 +53,6 @@ pub(crate) fn received_body(
     })
 }
 
-/// Prove this prepared outbox acknowledges the original now being committed.
-///
-/// The logical message id is the random id already inside the prepared key. The opened
-/// author copy must use that id and this original's target, session, audience, and prerequisite.
 pub(crate) fn bound_ack(
     roster: &Roster,
     identity: &CommIdentity,
@@ -130,11 +117,6 @@ fn ack_blocked(store: &ClientStore, source: &CompleteSource) -> ClientResult<boo
     Ok(false)
 }
 
-/// Prepare encrypted Received copies for every roster member for a foreign test message.
-///
-/// Self-delivery, an incoming Received, a partial set, and a quarantined root produce no
-/// acknowledgement. A saved original also produces none: the commit reuses the saved link
-/// and ciphertext instead of sealing another copy. Nothing is uploaded from here.
 pub fn prepare_received(
     store: &ClientStore,
     identity: &CommIdentity,
@@ -155,8 +137,6 @@ pub fn prepare_received(
     if !foreign_test || ack_blocked(store, source)? {
         return Ok(None);
     }
-    // Either digest means this identity is already saved. Conflict and duplicate both keep
-    // the existing acknowledgement, so preparation must not seal or draw another message id.
     if store.incoming_saved_digest(&message.body().key)?.is_some() {
         return Ok(None);
     }
@@ -166,11 +146,6 @@ pub fn prepare_received(
     Ok(Some(prepare_outbox(identity, roster, &body)?))
 }
 
-/// Whole-vault Received view for one exact test digest.
-///
-/// Fields stay private so a relay receipt cannot be turned into an acknowledgement.
-/// The author slot is the committed test message on this store. The other audience
-/// members each need their own certified Received. Stored completion is a different report.
 pub struct ReceivedStatus {
     key: LogicalKey,
     digest: Id32,
@@ -193,19 +168,14 @@ impl ReceivedStatus {
         self.session
     }
 
-    /// The author's committed test is present. A Received from the author is not required.
     pub fn author_committed(&self) -> bool {
         self.author_committed
     }
 
-    /// One certified signer other than the author. Repeated sources still count once.
     pub fn member_received(&self, member: MemberId) -> bool {
         member != self.key.sender && self.peers.contains(&member)
     }
 
-    /// Authoritative local test plus every other audience member.
-    ///
-    /// This does not read relay receipts and does not release Stored capacity.
     pub fn whole_vault(&self) -> bool {
         self.author_committed
             && loki_relay_protocol::types::valid_member_count(self.audience.len())
@@ -238,8 +208,6 @@ struct AckObservation {
     outcome: AckOutcome,
 }
 
-/// Process bounded, persisted work. An early acknowledgement is selected after
-/// the target arrives; neither the scheduling index nor a receipt certifies it.
 pub fn reconcile_received(
     store: &mut ClientStore,
     roster: &Roster,
@@ -286,7 +254,6 @@ pub fn reconcile_received(
     Ok(())
 }
 
-/// Readonly Received status. Index phase and receipt rows are not consulted.
 pub fn received_status(
     store: &ClientStore,
     roster: &Roster,

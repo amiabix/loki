@@ -341,7 +341,6 @@ fn run_signing_attempt(member_count: u16, pair: [u16; 2], secured: bool) {
     drop(a);
     drop(b);
 
-    // Carol loads everything from her own encrypted mailbox after both signers close.
     let carol_inbox = relay.read_for(&carol, &roster, &context).unwrap();
     let carol_package = carol_inbox
         .iter()
@@ -397,7 +396,6 @@ fn run_signing_attempt(member_count: u16, pair: [u16; 2], secured: bool) {
         sighash
     );
 
-    // Alice can also finish after restart using only her sealed outbound wire and inbox.
     let saved =
         SigningSession::saved_share_wires(&root.join("alice"), &context, first_signer, "alice pass").unwrap();
     let own_share = alice_copy
@@ -494,8 +492,6 @@ fn three_signer_attempt_binds_the_exact_sorted_set() {
     let wire = alice.seal_session(&bob.public(), &context, MessageKind::Commitment, b"three-signers").unwrap();
     assert_eq!(wire[8], 2);
     assert_eq!(bob.open_session(&alice.public(), &context, &wire).unwrap().body(), b"three-signers");
-    // Empty, zero-id, duplicate, and unsorted sets are still refused; a general t-of-n
-    // set with a larger id (e.g. member 5) is now accepted.
     for signers in [vec![], vec![0, 1], vec![1, 2, 2], vec![1, 4, 2]] {
         let mut changed = context.clone();
         changed.signers = signers;

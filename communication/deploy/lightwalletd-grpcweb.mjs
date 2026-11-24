@@ -16,14 +16,12 @@ const service = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/";
 const latest = `${service}GetLatestBlock`, range = `${service}GetBlockRange`;
 const mime = "application/grpc-web+proto";
 const deadlineMs = 25_000;
-const maxRequest = 23; // envelope + two height-only BlockIDs (uint32 height varints)
+const maxRequest = 23;
 const maxResponse = 32 * 1024 * 1024;
 const trustForwarded = process.env.TRUST_FORWARDED === "1";
 const active = new Map();
 let total = 0;
 
-// Accept only the signer wire format, not hash selectors, extra protobuf fields, multiple
-// messages, or compression. Pass the original bytes upstream only after proving the range.
 function validRequest(path, bytes) {
   if (bytes.length < 5 || bytes[0] !== 0 || bytes.readUInt32BE(1) !== bytes.length - 5) return false;
   if (path === latest) return bytes.length === 5;
@@ -85,7 +83,6 @@ const server = createServer({ headersTimeout: 5_000, requestTimeout: 30_000, con
     const bytes = Buffer.concat(chunks, length);
     if (!validRequest(req.url, bytes)) return fail(400);
 
-    // An opted-in loopback proxy must set or append the IP it actually accepted.
     const socketPeer = req.socket.remoteAddress;
     const forwarded = trustForwarded && ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(socketPeer)
       ? req.headers["x-forwarded-for"]?.split(",").at(-1)?.trim()
@@ -112,7 +109,7 @@ const server = createServer({ headersTimeout: 5_000, requestTimeout: 30_000, con
     stream.once("response", (headers) => {
       if (res.destroyed || res.writableEnded) return;
       if (headers[":status"] !== 200 || !/^application\/grpc(?:\+proto)?(?:;|$)/.test(headers["content-type"] ?? "")) return fail(502);
-      if (headers["grpc-status"] !== undefined) trailers = headers; // trailers-only gRPC response
+      if (headers["grpc-status"] !== undefined) trailers = headers;
       res.writeHead(200, { "content-type": mime });
     });
     stream.once("trailers", (headers) => { trailers = headers; });

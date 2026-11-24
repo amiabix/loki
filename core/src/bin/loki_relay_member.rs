@@ -1,6 +1,3 @@
-//! Communication member commands. Arguments are paths and public identifiers.
-//! Secret bytes stay in sealed files and are never written to stdout or stderr.
-
 use loki_poc::relay_member::{
     load_with_signing_identity, ConfigStore, CourierImport, LoadedMember, MemberError, ProvisionTarget,
 };
@@ -292,7 +289,6 @@ struct Session {
 fn open_session(root: &Path, pass: &Path, roster: &Path) -> Result<Session, Exit> {
     let (member, signing_identity) = load_with_signing_identity(root, pass, roster).map_err(Exit::Member)?;
     let configs = ConfigStore::open(root, pass).map_err(Exit::Member)?;
-    // Transport state stays a direct child of the certified member root.
     let db = ClientStore::open(
         &root.join("transport"),
         &member.roster,
@@ -407,7 +403,6 @@ fn send(
     print_logical(&session.db, &saved)
 }
 
-/// Commit one outbox message (or find the one already saved for `request_id`).
 fn save_payload(
     session: &mut Session,
     payload: &[u8],
@@ -432,7 +427,6 @@ fn save_payload(
             .collect(),
         session: signing_attempt,
         prerequisites: Vec::new(),
-        // shortcut: kind 1 carries opaque inner signing envelopes until the relay protocol assigns an application kind.
         payload: Payload::Test(payload.to_vec()),
     };
     let intent = outbox_intent_digest(&body).map_err(|error| {
@@ -452,7 +446,6 @@ fn save_payload(
             .map_err(|_| Exit::Member(MemberError::Io))?;
         let prepared = prepare_outbox(&session.member.identity, &session.member.roster, &body)
             .map_err(Exit::Client)?;
-        // The caller binding and every recipient object are durable before any upload command.
         session
             .db
             .commit_outbox(
@@ -503,7 +496,6 @@ fn proposal_scope(context: &SessionContext, proposer: u16) -> Id32 {
         .finalize().into()
 }
 
-/// Check a local proposal, pin its work manifest and commit it to the outbox.
 fn save_proposal(
     session: &mut Session,
     root: &Path,
@@ -545,8 +537,6 @@ fn payments_path(root: &Path, payments: &Path) -> Result<PathBuf, Exit> {
     Ok(owner.join("payments"))
 }
 
-/// Write each authenticated proposal to `<root>/payments/<scope>/payment.json` once.
-/// Leave legacy attempt-only directories untouched; proposals are reopened from the inbox.
 fn import_saved_proposals(
     session: &Session,
     root: &Path,
@@ -796,11 +786,9 @@ fn save_signing(session: &mut Session, work: &PaymentWork, wire: &[u8], request:
     save_payload(session, wire, request, Some(work.context.attempt.0))
 }
 
-/// Append only exact-context messages sealed by their outer author to this member.
 fn export_saved_signing(session: &Session, work: &PaymentWork) -> Result<usize, Exit> {
     let mail = work.path.join("mailbox");
     let mailbox = Mailbox::new(&mail).map_err(|_| Exit::Member(MemberError::Io))?;
-    // The signing CLI may have created this inside the already private work directory.
     if !fs::symlink_metadata(&mail).is_ok_and(|meta| meta.is_dir()) {
         return Err(Exit::Member(MemberError::Permissions));
     }
@@ -808,7 +796,6 @@ fn export_saved_signing(session: &Session, work: &PaymentWork) -> Result<usize, 
     visit_pages(
         |after| session.db.recover_incoming_originals(after, PAGE),
         |row| {
-            // The old outer attempt tag is a search hint, never an authorization or work key.
             if row.session != Some(work.context.attempt.0) || row.kind != 1 {
                 return Ok(());
             }
@@ -840,16 +827,6 @@ fn export_saved_signing(session: &Session, work: &PaymentWork) -> Result<usize, 
     Ok(count)
 }
 
-/// One payment sync in one session: what `send-proposal` for each queued proposal,
-/// `send-signing` for each saved wire, `upload`, `poll --once`, `import-proposals`,
-/// `export-signing` for each attempt and `status` did as separate processes.
-///
-/// The plan is a JSON file `{"proposals":[<payment.json>…], "signing":[{"attempt",
-/// "work","wire"}…], "export":[{"attempt","work"}…], "import":bool}`. Every message is
-/// committed before any request, then one poll uploads and receives. The report on
-/// stdout is JSON: for each proposal and signing message its id and whether it is
-/// stored on every member's relays, the imported and rejected proposal counts, and
-/// the exported wire count. Report keys are the scoped work directory names.
 fn payment_sync(root: &Path, pass: &Path, roster: &Path, plan: &Path) -> Result<(), Exit> {
     let raw = read_exact(plan, 1024 * 1024, false)?;
     let plan: serde_json::Value =
@@ -1105,7 +1082,6 @@ fn status(
     let runtime = runtime()?;
     let http = RelayHttp::new().map_err(Exit::Client)?;
     let member_id = session.member.identity.public().id;
-    // Read the owner's inboxes from cursor 0. Entries and object gets do not advance saved cursors.
     runtime.block_on(async {
         for inbox in &own {
             match verify_inbox(&http, inbox).await {
@@ -1169,7 +1145,6 @@ fn readiness(root: &Path, pass: &Path, roster: &Path) -> Result<(), Exit> {
 }
 
 fn print_diagnostics(session: &Session) -> Result<(), Exit> {
-    // Transport counters and capture metadata. They do not authenticate a message.
     let cursors = page_rows(
         |after| session.db.recover_route_cursors(after, PAGE),
         DIAGNOSTIC_ROW_BOUND,
@@ -1276,7 +1251,6 @@ fn print_diagnostics(session: &Session) -> Result<(), Exit> {
 }
 
 fn public_reason(reason: &str) -> String {
-    // A stored reason is metadata. Only a short token is a status field.
     let token = !reason.is_empty()
         && reason.len() <= 64
         && reason.as_bytes()[0].is_ascii_lowercase()
@@ -1296,7 +1270,6 @@ fn prepare_selected_rotation(session: &mut Session) -> Result<(), Exit> {
         .load(&session.db, &session.member)
         .map_err(Exit::Member)?
         .ok_or(Exit::Member(MemberError::Sealed))?;
-    // Authenticated sealed state chooses the generation. A later command must not replay the first prepare.
     local.authenticated(&session.member).map_err(Exit::Member)?;
     if local.rotated.is_some() {
         session

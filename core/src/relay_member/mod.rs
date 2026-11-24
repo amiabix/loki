@@ -77,7 +77,6 @@ fn private_metadata(metadata: &fs::Metadata) -> MemberResult<()> {
     extern "C" {
         fn geteuid() -> u32;
     }
-    // geteuid has no arguments or failure condition; only the effective file owner is accepted.
     let uid = unsafe { geteuid() };
     if metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
         return Err(MemberError::Permissions);
@@ -100,7 +99,6 @@ fn member_root(path: &Path) -> MemberResult<()> {
         extern "C" {
             fn geteuid() -> u32;
         }
-        // Setup may use a public parent directory; its private secrets directory protects sealed files.
         let uid = unsafe { geteuid() };
         if m.uid() != uid || m.mode() & 0o022 != 0 {
             return Err(MemberError::Permissions);
@@ -153,7 +151,6 @@ fn bounded_read(path: &Path, limit: usize, private: bool) -> MemberResult<Zeroiz
     Ok(bytes)
 }
 fn sealed(path: &Path, pass: &str) -> MemberResult<Zeroizing<Vec<u8>>> {
-    // Decrypt the same LOKISEAL format from one bounded handle, avoiding read_sealed's unbounded reopen.
     let raw = bounded_read(path, MAX_SEALED, true)?;
     if raw.len() < SEAL_HEADER + 16 || &raw[..9] != SEAL_MAGIC {
         return Err(MemberError::Sealed);

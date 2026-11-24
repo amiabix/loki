@@ -84,7 +84,6 @@ fn setup_negotiation_rejects_incapable_peer_before_dkg() {
     assert_eq!(SETUP_VERSION, 2);
     assert!(SetupCapabilities::current().supports(SETUP_VERSION, 3));
     assert!(SetupCapabilities::current().supports(SETUP_VERSION, 4));
-    // A peer on the v1 DKG format is refused before any key generation.
     assert!(!SetupCapabilities::current().supports(1, 4));
     assert!(!SetupCapabilities::current().supports(3, 4));
     let legacy = SetupCapabilities {

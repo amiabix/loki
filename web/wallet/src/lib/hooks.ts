@@ -4,7 +4,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "./api";
 import type { CeremonyStatus, ChainProvenance, Payment, StatusResponse } from "./types";
 
-/** Poll every 1.5s while `active` is true. Returns latest value + manual refresh. */
 function usePoll<T>(
   fetcher: () => Promise<T>,
   active: boolean,

@@ -34,7 +34,6 @@ const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_STREAM_BYTES: usize = 32 * 1024 * 1024;
 const MAX_BLOCKS: u64 = 500;
 const ROOTS_PER_PAGE: usize = 512;
-// 32-bit tree sizes and 16-level subtrees.
 const MAX_ROOTS: u32 = u32::MAX >> 16;
 
 pub struct Lightwalletd {
@@ -207,7 +206,7 @@ impl Lightwalletd {
             let mut messages = Vec::new();
             let mut bytes = 0;
             while let Some(message) = stream.message().await? {
-                bytes += message.len() + 5; // Include the envelope and any unknown protobuf fields.
+                bytes += message.len() + 5;
                 if bytes > max_bytes || messages.len() >= count {
                     return Err(Status::resource_exhausted(
                         "lightwalletd response exceeds its stream budget",
@@ -244,7 +243,6 @@ impl DerefMut for Lightwalletd {
     }
 }
 
-// Count the wire bytes before protobuf decoding can discard unknown fields or expand allocations.
 struct WireCodec<Q>(PhantomData<Q>);
 struct WireBytes;
 

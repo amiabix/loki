@@ -18,7 +18,6 @@ cargo build --release --locked --manifest-path "$workspace/Cargo.toml" \
 bin="$workspace/target/release"
 "$bin/loki-owned-test-inputs" init "$root" "$bin/loki-relay-server"
 
-# The member app invokes this private issuer with its device key and bundle.
 printf -v quoted_bin '%q' "$bin/loki-owned-test-inputs"
 printf -v quoted_root '%q' "$root"
 printf '#!/usr/bin/env bash\nexec %s grant %s "$@"\n' "$quoted_bin" "$quoted_root" > "$root/issue-enrollment"

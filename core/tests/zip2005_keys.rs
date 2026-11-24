@@ -8,8 +8,6 @@ fn frost_viewing_key_keeps_the_zip2005_nullifier_key_but_changes_rivk() {
     let ak: [u8; 32] = ordinary.to_bytes()[..32].try_into().unwrap();
 
     let frost = loki_poc::zip2005::frost_viewing_key(&ak, &secret).unwrap();
-    // Independently computed with Python hashlib/blake3 and integer reduction
-    // using the Pasta field moduli, from ZIP 2005's specified domains.
     assert_eq!(
         hex::encode(frost.to_bytes()),
         concat!(
@@ -29,8 +27,6 @@ fn frost_viewing_key_keeps_the_zip2005_nullifier_key_but_changes_rivk() {
 
 #[test]
 fn frost_viewing_key_matches_second_independent_vector() {
-    // Computed from ZIP 2005 with Python hashlib, blake3 and integer reduction.
-    // The fixed ak is the valid Orchard group-key encoding used in the first vector.
     let ak = hex::decode("c605c0eb00d6bb40b6d058a7308f85883a9b589feb7c4d07265951d415fb1e34")
         .unwrap()
         .try_into()

@@ -1,11 +1,8 @@
-//! Confidential randomizer seeds associated with one fixed candidate spend.
-
 use reddsa_frost::frost::redpallas as frost;
 use std::collections::BTreeMap;
 
 type Commitments = BTreeMap<frost::Identifier, frost::round1::SigningCommitments>;
 
-/// The seed is confidential; association metadata detects accidental session mixing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SeedRecord {
     pub version: u32,
@@ -124,7 +121,6 @@ impl SeedRecord {
         })
     }
 
-    /// Validate the saved association before reconstructing candidate parameters.
     pub fn validate(
         &self,
         proposal_id: &[u8; 32],

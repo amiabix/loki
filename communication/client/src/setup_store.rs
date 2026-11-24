@@ -17,7 +17,6 @@ const DEFERRED_SCHEMA: &str =
 const PENDING_ROOTS_SCHEMA: &str =
     "CREATE TABLE pending_roots (hash BLOB PRIMARY KEY REFERENCES objects(hash), expires_ms INTEGER NOT NULL CHECK(expires_ms>0)) STRICT;\n";
 const BUDGET: u64 = 256 * 1024 * 1024;
-/// Stores made before vaults grew past 4 members bound recipients at 4.
 const NARROW_RECIPIENT: &str = "recipient BETWEEN 1 AND 4)";
 const WIDE_RECIPIENT: &str = "recipient BETWEEN 1 AND 16)";
 pub struct SetupStore {
@@ -80,7 +79,6 @@ pub(crate) fn add_object(c: &Connection, o: &Object) -> ClientResult<()> {
     Ok(())
 }
 impl SetupStore {
-    /// Completed setup retires inboxes that already returned a stored receipt.
     pub fn clear_retries_for_stored_routes(&self) -> ClientResult<()> {
         self.connection.execute(
             "DELETE FROM retries WHERE pin IN (SELECT DISTINCT pin FROM stored)",
@@ -151,7 +149,6 @@ impl SetupStore {
             File::open(&path)?.sync_all()?;
         }
         if crate::store::validate_schema(&c, SCHEMA).is_err() {
-            // Recognize exact previous catalogs before adding derived pending work.
             let previous = SCHEMA.strip_suffix(PENDING_ROOTS_SCHEMA).ok_or(ClientError::Storage)?;
             let narrow = previous.replace(WIDE_RECIPIENT, NARROW_RECIPIENT);
             let without_deferred =

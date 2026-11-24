@@ -1,5 +1,3 @@
-//! HTTP enrollment and frostd DKG for one sealed member vault.
-
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::IpAddr,
@@ -68,12 +66,9 @@ impl BackupDevice for HostedBackup {
     }
 }
 
-/// The hosted member's device prompts. The hosted flow already required the member's roster
-/// agreement, and payment approval goes to `approval` (the member's native decision).
 pub(super) fn hosted_prompts(signer_dir: &Path, pass: &str, approval: ApprovalPolicy) -> DevicePrompts {
     DevicePrompts {
         connect: Box::new(|_, _| true),
-        // Only the hosted DKG compares a roster code (`roster_decision`); every other open refuses.
         roster: Box::new(|_| RosterDecision::NoMatch),
         roster_deadline: Duration::from_secs(60),
         backup: Box::new(HostedBackup { dir: signer_dir.to_owned(), pass: Zeroizing::new(pass.to_owned()) }),
@@ -146,14 +141,10 @@ pub(super) struct Ceremony {
     vs_session_id: Option<Uuid>,
     dkg_started: bool,
     error: Option<String>,
-    // The creator's testnet birth height, published to joiners so their setup document
-    // matches the creator's byte-for-byte (joiners must not reconstruct it from a guess).
     #[serde(default)]
     birth_height: Option<u32>,
-    // Do not resume from older agreement records, which may have come from HTTP alone.
     #[serde(default, rename = "locally_confirmed_roster_code")]
     roster_code: Option<String>,
-    // A joiner's copy of the creator's identity from the invite: requests go to it over frostd.
     #[serde(default)]
     creator: Option<WireIdentity>,
 }
@@ -167,17 +158,12 @@ struct Invite {
     members: u16,
     threshold: u16,
     name: String,
-    // The creator's identity and relay: a joiner reaches the creator over frostd, not HTTP.
     #[serde(default)]
     creator: Option<WireIdentity>,
     #[serde(default)]
     frostd_url: Option<String>,
 }
 
-/// The embedded wallet's join precheck, before the shared `join` handler runs. A relay invite
-/// must carry a valid creator identity: it joins through this member's own frostd, never the
-/// relay or HTTP endpoint the invite names, so its `creator_base_url` (often loopback) is not
-/// checked. Only a legacy invite may contact an explicitly allowed HTTPS peer directly.
 #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
 pub(super) fn embedded_invite_target(config: &super::Config, body: &Value) -> Result<(), &'static str> {
     const INVALID: &str = "invalid invite";
@@ -201,7 +187,6 @@ pub(super) fn embedded_invite_target(config: &super::Config, body: &Value) -> Re
     }
 }
 
-/// Shared roster policy, including the member cap.
 use crate::member_state::valid_policy;
 
 fn vault_bytes(vault: &str) -> Result<[u8; 32], String> {
@@ -219,7 +204,6 @@ pub(super) fn dir(data: &Path, vault: &str) -> Result<MemberDir, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(MemberDir::open(&parent, &canonical)),
         Err(e) => return Err(e.to_string()),
     };
-    // Use a unique legacy spelling in place: renaming it could orphan path-bound keys.
     let mut existing = None;
     for entry in entries {
         let name = entry.map_err(|e| e.to_string())?.file_name();
@@ -261,8 +245,6 @@ fn save_to(d: &MemberDir, pass: &str, c: &Ceremony) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Summaries of every vault this member belongs to, for the home screen. Best-effort: a vault
-/// whose ceremony file won't open (or isn't a 32-byte id) is skipped, not fatal to the list.
 pub(super) fn vault_summaries(data: &Path, pass: &str) -> Result<Vec<Value>, String> {
     let root = data.join("vaults");
     let entries = match std::fs::read_dir(&root) {
@@ -279,8 +261,6 @@ pub(super) fn vault_summaries(data: &Path, pass: &str) -> Result<Vec<Value>, Str
             continue;
         }
         if let Ok(c) = load(data, pass, &vault) {
-            // `active` lets the home screen route a still-setting-up vault back to the
-            // ceremony flow instead of the (unavailable) wallet view.
             let active = dir(data, &vault).map(|d| d.exists("vault.sealed")).unwrap_or(false);
             out.push(json!({
                 "vault": c.vault,
@@ -306,7 +286,6 @@ pub(super) fn identity(data: &Path, pass: &str, slot: u16) -> Result<Identity, S
             if raw.len() != 66 {
                 return Err("invalid DKG identity length".into());
             }
-            // Keys belong to the profile; the FROST slot belongs to each vault.
             raw[..2].copy_from_slice(&slot.to_be_bytes());
             Identity::from_secret_bytes(&raw)
         }
@@ -386,8 +365,6 @@ impl PeerRequestError {
     }
 }
 
-/// A joiner's request `op` (enroll, roster, agreed or session) to the creator: sealed over
-/// frostd when the invite named the creator, otherwise to the creator's HTTP route.
 fn ask_creator(config: &Config, data: &Path, pass: &str, c: &Ceremony, op: &str) -> Result<Value, PeerRequestError> {
     let mut body = joiner_auth(c).map_err(PeerRequestError::Rejected)?;
     let Some(creator) = &c.creator else {
@@ -402,13 +379,10 @@ fn ask_creator(config: &Config, data: &Path, pass: &str, c: &Ceremony, op: &str)
     relay_request(&c.frostd_url, &me, &creator, &c.vault, &body)
 }
 
-/// The sealed-envelope context of one join exchange between the creator (slot 1) and a joiner.
 fn join_context(vault: &str, session: Uuid, slot: u16) -> Result<SessionContext, String> {
     Ok(SessionContext::control(vault_bytes(vault)?, session, 1, slot))
 }
 
-/// One join request over frostd: the joiner opens a session of itself and the creator, seals
-/// `body` to the creator, and waits for the creator's sealed reply on that session.
 fn relay_request(url: &str, me: &Identity, creator: &PublicIdentity, vault: &str, body: &Value)
     -> Result<Value, PeerRequestError>
 {
@@ -422,7 +396,6 @@ fn relay_request(url: &str, me: &Identity, creator: &PublicIdentity, vault: &str
     let reply = (|| {
         tx.send(&ch, &[Peer(creator.encryption)], &Outbound::Peer(sealed))
             .map_err(|e| Unavailable(e.to_string()))?;
-        // The creator polls frostd about once a second.
         for _ in 0..40 {
             std::thread::sleep(Duration::from_millis(250));
             for msg in tx.recv(&ch, false).map_err(|e| Unavailable(e.to_string()))? {
@@ -444,7 +417,6 @@ fn relay_request(url: &str, me: &Identity, creator: &PublicIdentity, vault: &str
     reply
 }
 
-// Allow global unicast only, excluding special-use and transition ranges.
 fn public_peer_address(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => !matches!(ip.octets(),
@@ -472,7 +444,6 @@ fn peer_request_result(config: &Config, base: &str, route: &str, body: Value) ->
         let refused = || Rejected("creator origin must use public addresses outside local development".into());
         let host = url.host_str().ok_or_else(refused)?;
         if let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
-            // The origin policy only admits these two literals in local development.
             if !matches!(host, "127.0.0.1" | "[::1]") && !public_peer_address(ip) {
                 return Err(refused());
             }
@@ -488,7 +459,6 @@ fn peer_request_result(config: &Config, base: &str, route: &str, body: Value) ->
             if addresses.iter().any(|address| !public_peer_address(address.ip())) {
                 return Err(refused());
             }
-            // Dial only the checked answers; retain the configured hostname for TLS.
             client = client.resolve_to_addrs(host, &addresses);
         }
         let client = client.build().map_err(|e| Unavailable(e.to_string()))?;
@@ -711,7 +681,6 @@ pub(super) async fn enroll(State(st): State<Shared>, Json(body): Json<Value>) ->
     blocking(move || enroll_member(&st, &data, &pass, &vault, slot, &token, wire)).await
 }
 
-/// The creator records `wire` in `slot` for the holder of that slot's invite token.
 fn enroll_member(st: &Shared, data: &Path, pass: &str, vault: &str, slot: u16, token: &str, wire: WireIdentity)
     -> Result<Value, String>
 {
@@ -735,7 +704,6 @@ fn enroll_member(st: &Shared, data: &Path, pass: &str, vault: &str, slot: u16, t
     }
     if c.slots.values().all(|s| s.identity.is_some()) {
         c.fingerprint = Some(hex::encode(roster_of(&c)?.fingerprint()));
-        // Fixed with the roster so every member can show the roster code before agreeing.
         let network = VaultNetwork::parse(&st.config.network)?;
         if network == VaultNetwork::Testnet && c.birth_height.is_none() {
             c.birth_height = Some(setup_birth_height(network, 1, None, || testnet_tip(st, network))?);
@@ -756,8 +724,6 @@ fn token_eq(expected: &str, given: &str) -> bool {
         == 0
 }
 
-/// The creator's ceremony, opened for an enrolled joiner that proves its slot with its
-/// invite token. Every failure is the same error, so it does not reveal which vaults exist.
 fn for_joiner(data: &Path, pass: &str, body: &Value) -> Result<Ceremony, String> {
     const DENIED: &str = "invalid member token";
     let (Some(vault), Some(slot), Some(token)) = (
@@ -775,7 +741,6 @@ fn for_joiner(data: &Path, pass: &str, body: &Value) -> Result<Ceremony, String>
     }
 }
 
-/// What a joiner presents to the creator's `for_joiner` endpoints.
 fn joiner_auth(c: &Ceremony) -> Result<Value, String> {
     let token = c
         .slots
@@ -902,7 +867,6 @@ pub(super) async fn status(st: Shared, vault: String) -> Reply {
         if c.fingerprint.is_some() {
             value["roster_code"] = json!(setup_roster_code(&c, VaultNetwork::parse(&st.config.network)?).ok());
         }
-        // LokiSigner asks the member to compare the code; the page shows where that stands.
         if st.config.native && st.roster_confirmation.is_some() {
             let open = st.roster_asking.lock().map_err(|e| e.to_string())?.as_deref() == Some(vault.as_str());
             let differ = st.roster_refused.lock().map_err(|e| e.to_string())?.contains(&vault);
@@ -948,11 +912,6 @@ fn spawn_dkg(st: Shared, vault: String, data: std::path::PathBuf, pass: Zeroizin
     });
 }
 
-/// `POST /api/agree`: this member agrees to the roster whose fingerprint and 24-digit code the
-/// request names, once setup has not started, the roster is fresh and both match.
-///
-/// The request only opens a local prompt (LokiSigner or the foreground terminal).
-/// Without an affirmative answer, it never records this member's agreement.
 pub(super) async fn agree(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
     let (Some(vault), Some(fingerprint), Some(roster_code)) =
         (body["vault"].as_str(), body["fingerprint"].as_str(), body["roster_code"].as_str())
@@ -978,8 +937,6 @@ pub(super) async fn agree(State(st): State<Shared>, Json(body): Json<Value>) -> 
             let (c, code) = agreement(&st.config, data, pass, vault, &fingerprint, &roster_code, network)?;
             roster_summary(&c, network, &code)
         };
-        // The member may take minutes to compare codes by phone: other requests need the
-        // ceremony lock meanwhile, so it is not held while LokiSigner asks.
         let answer = confirm(&summary);
         eprintln!("roster code: member {answer:?}");
         match answer {
@@ -994,8 +951,6 @@ pub(super) async fn agree(State(st): State<Shared>, Json(body): Json<Value>) -> 
         if st.session.blocking_read().is_none() {
             return Err(format!("{ROSTER_CHANGED}: profile is locked"));
         }
-        // Everything is checked again: the member confirmed the code of the roster shown, and
-        // the request names that same code, so any change to the roster or the setup refuses.
         let (c, code) = agreement(&st.config, data, pass, vault, &fingerprint, &roster_code, network)
             .map_err(|e| format!("{ROSTER_CHANGED}: {e}"))?;
         record_agreement(&st.config, data, pass, c, code)
@@ -1007,22 +962,14 @@ pub(super) async fn agree(State(st): State<Shared>, Json(body): Json<Value>) -> 
     reply
 }
 
-/// The member chose "Codes differ" in LokiSigner; it refuses this vault until it restarts.
 const ROSTER_CODES_DIFFER: &str = "roster codes differ: LokiSigner refuses this vault until it restarts";
-/// No local prompt was available or the member did not answer; a new request can ask again.
 const ROSTER_NOT_CONFIRMED: &str = "roster code not confirmed locally";
-/// LokiSigner already shows a roster dialog.
 const ROSTER_ASKING: &str = "LokiSigner is already asking about a roster code";
-/// The setup changed while LokiSigner asked; nothing was recorded.
 const ROSTER_CHANGED: &str = "the vault setup changed while LokiSigner was asking; nothing was recorded";
 
-/// Marks the one roster dialog LokiSigner shows, for as long as it is open.
 struct RosterAsking<'a>(&'a super::state::AppState);
 
 impl<'a> RosterAsking<'a> {
-    /// Claims the dialog for `vault`, unless one is open or the member said its codes differ.
-    /// Both are checked under the `roster_asking` lock: a "Codes differ" is recorded before its
-    /// dialog's claim is released, so no request can open another dialog for that vault.
     fn claim(st: &'a super::state::AppState, vault: &str) -> Result<Self, String> {
         let mut asking = st.roster_asking.lock().map_err(|e| e.to_string())?;
         if st.roster_refused.lock().map_err(|e| e.to_string())?.contains(vault) {
@@ -1044,9 +991,6 @@ impl Drop for RosterAsking<'_> {
     }
 }
 
-/// `agree`'s checks, under the ceremony lock: setup has not started, the roster is refreshed
-/// from the creator, and the request's fingerprint and code are this roster's. Returns the
-/// ceremony and the code of its setup document.
 fn agreement(
     config: &Config, data: &Path, pass: &str, vault: &str, fingerprint: &str, roster_code: &str, network: VaultNetwork,
 ) -> Result<(Ceremony, String), String> {
@@ -1065,7 +1009,6 @@ fn agreement(
     Ok((c, code))
 }
 
-/// Tells the creator (a joiner only) and records this member's agreement and confirmed code.
 fn record_agreement(config: &Config, data: &Path, pass: &str, mut c: Ceremony, code: String) -> Result<Value, String> {
     if c.my_slot != 1 {
         ask_creator(config, data, pass, &c, "agreed").map_err(PeerRequestError::message)?;
@@ -1076,9 +1019,6 @@ fn record_agreement(config: &Config, data: &Path, pass: &str, mut c: Ceremony, c
     Ok(json!({"ok":true}))
 }
 
-/// What LokiSigner shows the member before they agree: the code of the setup document
-/// `dkg_begin` receives, and the vault it is for. The name comes from the creator's invite, so
-/// it is shown as written or hidden, by the same rule as "Vault addresses…".
 fn roster_summary(c: &Ceremony, network: VaultNetwork, code: &str) -> String {
     json!({
         "vault_name": super::vault_label(&c.name),
@@ -1153,8 +1093,6 @@ fn session_reply(data: &Path, pass: &str, body: &Value) -> Result<Value, String>
     }))
 }
 
-/// Starts the creator's loop that answers joiners over frostd, unless it runs. It holds the
-/// app state weakly and stops once the profile locks or no ceremony it created is still setting up.
 pub(super) fn spawn_join_relay(st: &Shared) {
     if st.join_relay.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return;
@@ -1180,7 +1118,6 @@ pub(super) fn spawn_join_relay(st: &Shared) {
     });
 }
 
-/// Vaults this member created whose members are still joining.
 pub(super) fn waiting_for_joiners(data: &Path, pass: &str) -> Vec<String> {
     std::fs::read_dir(data.join("vaults")).into_iter().flatten().flatten()
         .filter_map(|entry| entry.file_name().into_string().ok())
@@ -1189,9 +1126,6 @@ pub(super) fn waiting_for_joiners(data: &Path, pass: &str) -> Vec<String> {
         .collect()
 }
 
-/// One pass of the creator's join relay: every two-member session a joiner opened with the
-/// creator is drained, and each request sealed to the creator for a ceremony it is still
-/// setting up is answered on that session. Returns whether there is still a ceremony to serve.
 fn serve_joins(st: &Shared, relay: &mut Option<FrostdTransport>) -> Result<bool, String> {
     let Some((data, pass)) = st.session.blocking_read().as_ref().map(|s| (s.data.clone(), s.passphrase.clone())) else {
         return Ok(false);
@@ -1208,7 +1142,6 @@ fn serve_joins(st: &Shared, relay: &mut Option<FrostdTransport>) -> Result<bool,
     };
     for session in tx.list_sessions().map_err(|e| e.to_string())? {
         let Ok((participants, Some(owner))) = tx.session_details(session) else { continue };
-        // Payment and DKG sessions have every member, or an owner outside them.
         if participants.len() != 2 || owner == mine || !participants.contains(&mine) || !participants.contains(&owner) {
             continue;
         }
@@ -1226,8 +1159,6 @@ fn serve_joins(st: &Shared, relay: &mut Option<FrostdTransport>) -> Result<bool,
     Ok(true)
 }
 
-/// A join request relay sender `from` sealed to the creator `me` for one of the `waiting`
-/// vaults on `session`: the joiner's identity, the context to answer under, and the request.
 fn open_join(me: &Identity, waiting: &[String], session: Uuid, from: &[u8; 32], wire: &[u8])
     -> Option<(PublicIdentity, SessionContext, Value)>
 {
@@ -1243,7 +1174,6 @@ fn open_join(me: &Identity, waiting: &[String], session: Uuid, from: &[u8; 32], 
     })
 }
 
-/// The creator's answer to one joiner request: the same logic as the HTTP routes.
 fn answer_join(st: &Shared, data: &Path, pass: &str, joiner: &PublicIdentity, body: Value) -> Result<Value, String> {
     let vault = body["vault"].as_str().ok_or("missing vault")?.to_owned();
     let token = body["token"].as_str().ok_or("missing token")?;
@@ -1320,10 +1250,7 @@ fn testnet_tip(st: &Shared, network: VaultNetwork) -> Result<u32, String> {
     u32::try_from(info.block_height).map_err(|_| "chain height overflow".into())
 }
 
-/// The setup document `dkg_begin` receives, and its birth height. `agree`, `status` and
-/// `run_background` all use these bytes, so the code a member confirms is the code the signer shows.
 fn setup_document(c: &Ceremony, network: VaultNetwork) -> Result<(Vec<u8>, u32), String> {
-    // The creator fixes the testnet birth height in `enroll`, when the roster completes.
     let birth_height = setup_birth_height(network, c.my_slot, c.birth_height,
         || Err("testnet birth height is not fixed yet".into()))?;
     let roster = roster_of(c)?;
@@ -1346,7 +1273,6 @@ fn setup_roster_code(c: &Ceremony, network: VaultNetwork) -> Result<String, Stri
     Ok(roster_code(&crate::member_state::Roster::from_bytes(&document)?.fingerprint()))
 }
 
-/// The signer's roster prompt: only the code this member confirmed matches.
 fn roster_decision(confirmed: Option<&str>, code: &str) -> RosterDecision {
     if confirmed == Some(code) { RosterDecision::Match } else { RosterDecision::NoMatch }
 }
@@ -1396,8 +1322,6 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
                         }
                         break;
                     }
-                    // Human confirmation has no key-generation deadline. The creator only
-                    // publishes a session after every member has confirmed the roster.
                     Err(PeerRequestError::Unavailable(_)) => std::thread::sleep(Duration::from_secs(1)),
                     Err(PeerRequestError::Rejected(error)) => return Err(format!("Waiting for creator: {error}")),
                 }
@@ -1421,7 +1345,6 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
             &c.frostd_url, FrostdLoginKey::from_secret_bytes(secret),
         ).map_err(|e| e.to_string())?;
         let (session_id, coordinator, coordinator_peer) = if c.my_slot == 1 {
-            // frostd requires a distinct session opener; id 0 is not a DKG member.
             let coord = Identity::new(0);
             let raw = Zeroizing::new(coord.to_secret_bytes());
             let coord_secret: [u8; 32] = raw[34..].try_into()
@@ -1455,9 +1378,7 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
             VaultNetwork::Regtest => Network::Regtest,
             VaultNetwork::Testnet => Network::Testnet,
         };
-        // DKG never signs a payment; any request still goes to the member, or is refused.
         let mut prompts = hosted_prompts(&signer_dir, pass, super::approval_policy(st.approval.clone(), signer_network, c.my_slot, None));
-        // Matches only the code this member confirmed in `agree`.
         let confirmed = c.roster_code.clone();
         prompts.roster = Box::new(move |code| roster_decision(confirmed.as_deref(), code));
         let mut signer = if existing {
@@ -1518,8 +1439,6 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
         if let Some(log) = log {
             if log.active() { log.delete().map_err(|e| e.to_string())?; }
         }
-        // Keep the frostd session open until the relay's TTL; peers may still be finishing.
-        // vault.sealed records public metadata only; the share stays in the signer store.
         let (public, fvk) = signer.hosted_metadata().map_err(|e| e.to_string())?;
         let sealed = vault_sealed_bytes(
             &c.vault, c.my_slot, c.threshold, c.members,
@@ -1529,9 +1448,6 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
         dir(data, vault_id)?
             .write_sealed("vault.sealed", &sealed, pass)
             .map_err(|e| e.to_string())?;
-        // The vault is now active: seal this member's recovery backup (share HPKE-sealed to its
-        // recovery words) so a lost device can restore the share from the words. Without a
-        // recovery identity yet, recovery setup or the next unlock seals it instead.
         super::recovery::seal_vault_backup(data, &signer_dir, &roster.vault_id, pass)?;
         Ok(json!({"ok":true}))
     })();
@@ -1720,7 +1636,6 @@ mod tests {
         }
         let status = status(st.clone(), vault.clone()).await;
         assert_eq!(status.1 .0["phase"], "compare_roster");
-        // Only an enrolled joiner with its own invite token may read the roster.
         for body in [
             json!({"vault":vault}),
             json!({"vault":vault,"slot":2,"token":tokens[&3]}),
@@ -1778,8 +1693,6 @@ mod tests {
         std::fs::remove_dir_all(data).unwrap();
     }
 
-    /// The creator answers only a join request sealed by the identity it names, for a vault it
-    /// is setting up, and only with that slot's invite token.
     #[tokio::test]
     async fn a_forged_or_wrong_token_join_request_is_refused() {
         let data = std::env::temp_dir().join(format!("loki-join-forged-{}", Uuid::new_v4()));
@@ -1802,8 +1715,6 @@ mod tests {
         let honest = wire(&joiner, &context, &body);
         assert!(open_join(&creator, &[vault.clone()], session, &from, &honest).is_some());
 
-        // Sealed by another key than the relay sender's, signed by another key than the one it
-        // names, unsealed, for another session, or naming another slot: none opens.
         let mut renamed = wire(&attacker, &context, &body);
         renamed[2..34].copy_from_slice(&joiner.public().signing);
         let mut unsealed = honest[..34].to_vec();
@@ -1833,13 +1744,10 @@ mod tests {
         std::fs::remove_dir_all(data).unwrap();
     }
 
-    /// A token of the same length that differs in its last byte.
     fn tokens_other(token: &str) -> String {
         format!("{}{}", &token[..token.len() - 1], if token.ends_with('A') { 'B' } else { 'A' })
     }
 
-    /// Two joiners on their own data dirs join, agree and finish DKG with the creator over
-    /// frostd alone: the invite's HTTP URL is a closed port. Needs `FROSTD_URL`.
     #[tokio::test(flavor = "multi_thread")]
     async fn unlocking_a_creator_mid_setup_restarts_its_join_loop() {
         let data = std::env::temp_dir().join(format!("loki-join-unlock-{}", Uuid::new_v4()));
@@ -1880,7 +1788,6 @@ mod tests {
             members.push(st);
             dialogs.push(dialog);
         }
-        // Locking ends every member's waits, so the runtime stops even when an assertion fails.
         struct LockOnDrop(Vec<Shared>);
         impl Drop for LockOnDrop {
             fn drop(&mut self) {
@@ -1966,7 +1873,6 @@ mod tests {
         assert!(status.get("roster_dialog").is_none(), "a headless member has no roster dialog");
         let fingerprint = status["fingerprint"].as_str().unwrap().to_owned();
         let code = status["roster_code"].as_str().unwrap().to_owned();
-        // The code the signer derives in `dkg_begin` from the document `run_background` hands it.
         let c = load(&data, "pass", &vault).unwrap();
         let (document, _) = setup_document(&c, VaultNetwork::Regtest).unwrap();
         let validated = crate::member_state::ValidatedRoster::new(
@@ -1990,7 +1896,6 @@ mod tests {
         let c = load(&data, "pass", &vault).unwrap();
         assert!(c.agreed.is_empty() && c.roster_code.is_none());
 
-        // On Testnet the code covers the birth height fixed with the roster.
         let mut c = c;
         assert!(setup_roster_code(&c, VaultNetwork::Testnet).is_err());
         c.birth_height = Some(TESTNET_NU7_BIRTH + 1);
@@ -2020,7 +1925,6 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let config = Config { secure_element: element.into(), ..test_config(&data, addr.port()) };
-            // Status describes the configuration; no platform key is needed to report it.
             let st = std::sync::Arc::new(AppState::new(config));
             let router = crate::host::routes::router(st.clone());
             tokio::spawn(async move { axum::serve(listener, router).await });
@@ -2050,7 +1954,6 @@ mod tests {
         }
     }
 
-    /// An unlocked member on `data`, with LokiSigner's roster dialog when `dialog` is given.
     async fn member(data: &Path, port: u16, dialog: Option<crate::host::LocalRosterConfirmation>) -> Shared {
         std::fs::create_dir_all(data).unwrap();
         let config = Config { native: dialog.is_some(), ..test_config(data, port) };
@@ -2059,8 +1962,6 @@ mod tests {
         st
     }
 
-    /// LokiSigner's roster dialog, scripted: each summary it is asked about arrives on
-    /// `asked`, and it waits for the test's answer on `answer`.
     struct Dialog {
         asked: std::sync::mpsc::Receiver<String>,
         answer: std::sync::mpsc::Sender<crate::host::RosterAnswer>,
@@ -2078,7 +1979,6 @@ mod tests {
             (confirm, Self { asked, answer })
         }
 
-        /// The summary of the dialog now open.
         fn open(&self) -> Value {
             serde_json::from_str(&self.asked.recv_timeout(Duration::from_secs(30)).expect("LokiSigner was not asked")).unwrap()
         }
@@ -2088,8 +1988,6 @@ mod tests {
         }
     }
 
-    /// A creator's 2-of-3 vault named `name` whose roster is complete. Returns the vault and
-    /// each joiner slot's invite.
     async fn complete_roster(creator: &Shared, name: &str, joiner: Option<&Shared>) -> (String, BTreeMap<u16, String>) {
         let created = create(State(creator.clone()), Json(json!({"name":name,"members":3,"threshold":2}))).await;
         assert_eq!(created.0, StatusCode::OK, "{}", created.1 .0);
@@ -2100,8 +1998,6 @@ mod tests {
                 .find(|item| item["slot"] == slot).unwrap()["code"].as_str().unwrap().to_owned();
             invites.insert(slot, code.clone());
             let reply = match (slot, joiner) {
-                // An invite without the creator's identity: the joiner reaches the creator over
-                // HTTP, so the test needs no relay.
                 (2, Some(joiner)) => {
                     let mut fields: Value = serde_json::from_slice(
                         &base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&code).unwrap()).unwrap();
@@ -2122,8 +2018,6 @@ mod tests {
         (vault, invites)
     }
 
-    /// The fingerprint and code `/api/status` gives the page, and the code the signer derives
-    /// in `dkg_begin` from the setup document `run_background` hands it.
     async fn compare(st: &Shared, vault: &str) -> (String, String, String) {
         let status = status(st.clone(), vault.to_owned()).await.1 .0;
         assert_eq!(status["phase"], "compare_roster", "{status}");
@@ -2144,9 +2038,6 @@ mod tests {
         assert!(c.agreed.is_empty() && c.roster_code.is_none(), "agreement recorded: {:?}", c.agreed);
     }
 
-    /// A joiner with LokiSigner attached agrees only through the dialog: a correct request the
-    /// member does not confirm records nothing here and tells the creator nothing. The dialog
-    /// shows the code of the setup document, and the creator's vault name as one line.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_native_joiner_agrees_only_when_the_member_confirms_the_code_in_lokisigner() {
         use crate::host::RosterAnswer;
@@ -2157,8 +2048,6 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, router).await });
         let (dialog, lokisigner) = Dialog::new();
         let joiner = member(&root.join("joiner"), 3602, Some(dialog)).await;
-        // An agreement starts the joiner's wait for the creator's session; locking ends it, so
-        // the test runtime can stop even when an assertion fails.
         struct LockOnDrop(Shared);
         impl Drop for LockOnDrop {
             fn drop(&mut self) {
@@ -2172,7 +2061,6 @@ mod tests {
         assert_eq!(code, signer_code);
         let creator_heard = || load(&creator.config.data, "pass", &vault).unwrap().agreed.contains(&2);
 
-        // A wrong code is refused before any dialog.
         let wrong = format!("{}{}", &code[..28], if code.ends_with('0') { '1' } else { '0' });
         let reply = agree(State(joiner.clone()), agree_body(&vault, &fingerprint, &wrong)).await;
         assert_eq!(reply.1 .0["error"], "roster code mismatch");
@@ -2205,9 +2093,6 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
-    /// While LokiSigner asks, the ceremony lock is free and a second request is refused without
-    /// a second dialog. A roster that changes while the dialog is open is refused even when
-    /// the member confirms the code shown.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_roster_dialog_holds_no_lock_asks_once_and_refuses_a_changed_roster() {
         let data = std::env::temp_dir().join(format!("loki-roster-dialog-{}", Uuid::new_v4()));
@@ -2224,7 +2109,6 @@ mod tests {
             .await.expect("a second request waited for a second dialog");
         assert_eq!(second.1 .0["error"], ROSTER_ASKING);
         lokisigner.not_asked();
-        // Slot 3's identity changes while the dialog is open.
         let mut c = load(&data, "pass", &vault).unwrap();
         c.slots.get_mut(&3).unwrap().identity = Some(WireIdentity::from_public(Identity::new(3).public()));
         save(&data, "pass", &c).unwrap();
@@ -2236,8 +2120,6 @@ mod tests {
         std::fs::remove_dir_all(data).unwrap();
     }
 
-    /// After "Codes differ" the vault is refused without asking until LokiSigner restarts; a
-    /// restarted LokiSigner asks again.
     #[tokio::test(flavor = "multi_thread")]
     async fn codes_differ_refuses_the_vault_until_lokisigner_restarts() {
         let data = std::env::temp_dir().join(format!("loki-roster-differ-{}", Uuid::new_v4()));
@@ -2266,8 +2148,6 @@ mod tests {
         std::fs::remove_dir_all(data).unwrap();
     }
 
-    /// A request that reaches the claim after another request's "Codes differ" opens no
-    /// dialog: the refusal is checked under the same lock as the open dialog.
     #[tokio::test]
     async fn a_refused_vault_cannot_claim_the_dialog() {
         let data = std::env::temp_dir().join(format!("loki-roster-claim-{}", Uuid::new_v4()));
@@ -2282,8 +2162,6 @@ mod tests {
         std::fs::remove_dir_all(data).ok();
     }
 
-    /// A profile locked while LokiSigner asks records nothing, even when the member then
-    /// chooses "Codes match".
     #[tokio::test(flavor = "multi_thread")]
     async fn a_profile_locked_while_lokisigner_asks_records_nothing() {
         let data = std::env::temp_dir().join(format!("loki-roster-locked-{}", Uuid::new_v4()));
@@ -2301,12 +2179,6 @@ mod tests {
         std::fs::remove_dir_all(data).unwrap();
     }
 
-    /// Recovery WORDS loop (ship-blocker fix): the vault seals a per-vault recovery backup at
-    /// activation, and a member whose local state is destroyed restores its signing share from
-    /// the 24 words alone. Reproduces the post-DKG state (`recovery.pub` + `backup.sealed`) and
-    /// drives the real host seal (`recovery::seal_vault_backup`) and restore
-    /// (`restore_vault_from_backup`) paths — the loop QA could not run because nothing sealed the
-    /// backup.
     #[test]
     fn recovery_backup_seals_at_activation_and_restores_the_share_from_words() {
         use crate::signer::recovery::RecoveryKey;
@@ -2318,7 +2190,6 @@ mod tests {
         let vault_hex = hex::encode(vault);
         let pass = "pass";
 
-        // Registration establishes the recovery identity (words shown once; only pubkeys stored).
         let (words, rkey) = RecoveryKey::generate().unwrap();
         MemberDir::create(&data, "").unwrap();
         let mut pubkeys = Vec::with_capacity(64);
@@ -2331,7 +2202,6 @@ mod tests {
         let share_bytes = material.key_package.to_vec();
         let sdir = signer_dir(&data, &vault_hex).unwrap();
 
-        // Activation seals the recovery backup — the wiring under test.
         crate::host::recovery::seal_vault_backup(&data, &sdir, &vault, pass).unwrap();
         let blob = std::fs::read(crate::host::recovery::backup_file(&sdir)).unwrap();
         let fingerprint = BackupArtifact(blob.clone()).fingerprint();
@@ -2340,8 +2210,6 @@ mod tests {
             "the recovery backup is HPKE ciphertext, never the share plaintext",
         );
 
-        // DESTROY the device: wipe the entire data root (share store, backups, identity, pubkeys).
-        // The new device starts empty; the member brings only the exported blob and the words.
         std::fs::remove_dir_all(&data).unwrap();
         let sdir = signer_dir(&data, &vault_hex).unwrap();
 
@@ -2368,18 +2236,15 @@ mod tests {
         };
         let config = make_config();
 
-        // Wrong words cannot open the backup, and restore needs the exported blob here.
         let (other, _) = RecoveryKey::generate().unwrap();
         assert!(restore_vault_from_backup(&data, &vault_hex, &other, Some(&blob), Some(&fingerprint), pass, &config).is_err());
         assert!(restore_vault_from_backup(&data, &vault_hex, &words, None, Some(&fingerprint), pass, &config).is_err());
-        // A profile that already holds another member identity is never overwritten.
         let root = MemberDir::create(&data, "").unwrap();
         root.write_sealed("identity.sealed", &Identity::new(1).to_secret_bytes(), pass).unwrap();
         let conflict = restore_vault_from_backup(&data, &vault_hex, &words, Some(&blob), Some(&fingerprint), pass, &config);
         assert!(conflict.unwrap_err().contains("different member identity"));
         assert!(!dir(&data, &vault_hex).unwrap().exists("vault.sealed"));
         std::fs::remove_dir_all(&data).unwrap();
-        // A profile whose recovery identity is another set of words is refused before any write.
         let other_key = RecoveryKey::from_words(&other).unwrap();
         let mut other_pub = other_key.public_bytes().to_vec();
         other_pub.extend_from_slice(&other_key.signing_public());
@@ -2392,18 +2257,12 @@ mod tests {
         assert_eq!(std::fs::read(data.join("recovery.pub")).unwrap(), other_pub);
         std::fs::remove_dir_all(&data).unwrap();
 
-        // The real words restore a member the payment path can open and sign with.
         restore_vault_from_backup(&data, &vault_hex, &words, Some(&blob), Some(&fingerprint), pass, &config).unwrap();
         crate::host::payment::load_vault(&AppState::new(make_config()), &data, pass, &vault_hex)
             .expect("the restored member opens for signing");
-        // Restore brings the recovery identity: `recovery.pub` holds both public keys of these
-        // words, so a later start or recovery setup does not mint a second set.
         assert_eq!(std::fs::read(data.join("recovery.pub")).unwrap(), pubkeys);
         assert!(crate::host::recovery::exists(&data));
 
-        // `vault.sealed` is public metadata only. The restored member completes a rerandomized
-        // FROST round with member 2 using the key package from the signer store, read through
-        // the configured element as the payment path does; the aggregate verifies.
         let sealed: Value = serde_json::from_slice(&dir(&data, &vault_hex).unwrap().read_sealed("vault.sealed", pass).unwrap()).unwrap();
         assert!(sealed.get("key_package").is_none() && sealed.get("vault_secret").is_none());
         let element = config.open_secure_element(&sdir, pass).unwrap();
@@ -2432,9 +2291,6 @@ mod tests {
             "never replace an existing vault",
         );
 
-        // Read the restored share back through the real store + device element (the production
-        // signing path) and prove it is byte-identical to the original and derives the vault's
-        // viewing key — i.e. it signs for this group.
         let se = SoftwareSecureElement::persistent(&sdir, pass).unwrap();
         let (_epoch, raw) = SignerStore::open(&sdir)
             .unwrap()
@@ -2450,8 +2306,6 @@ mod tests {
         zip2005::frost_viewing_key(&ak, &restored_vs)
             .expect("the restored share derives the vault FVK — it can sign for this group");
 
-        // A vault written before device-bound custody carried the share and `vs` in
-        // `vault.sealed`, with a passphrase-sealed `backup.sealed` beside the store.
         let vdir = dir(&data, &vault_hex).unwrap();
         let write_legacy = |legacy: &Value| {
             std::fs::remove_file(vdir.path().join("vault.sealed")).unwrap();
@@ -2462,14 +2316,11 @@ mod tests {
         legacy["key_package"] = json!(hex::encode(peer.serialize().unwrap()));
         write_legacy(&legacy);
         MemberDir::open(&sdir, "").write_sealed("backup.sealed", b"passphrase copy", pass).unwrap();
-        // A share in vault.sealed that differs from the store's stops migration, changing nothing.
         let refused = crate::host::payment::load_vault(&AppState::new(make_config()), &data, pass, &vault_hex);
         assert!(refused.err().unwrap().contains("different share"));
         let unchanged: Value = serde_json::from_slice(&vdir.read_sealed("vault.sealed", pass).unwrap()).unwrap();
         assert_eq!(unchanged, legacy);
         assert!(sdir.join("backup.sealed").exists());
-        // The same share migrates once: vault.sealed keeps exactly its public metadata, the
-        // unusable passphrase copy is not trusted for conversion, and the member still opens.
         legacy["key_package"] = json!(hex::encode(restored.serialize().unwrap()));
         write_legacy(&legacy);
         crate::host::payment::load_vault(&AppState::new(make_config()), &data, pass, &vault_hex)
@@ -2499,8 +2350,6 @@ mod tests {
         std::fs::remove_dir_all(&data).unwrap();
     }
 
-    /// An active 2-of-3 dealer vault where this member is slot 1: `backup.sealed` written exactly
-    /// as the signer does during DKG (`HostedBackup::save`), and a `vault.sealed` marker.
     fn dealer_vault(
         data: &Path,
         vault: [u8; 32],
@@ -2521,7 +2370,6 @@ mod tests {
         .unwrap();
         let id1 = frost::Identifier::try_from(1u16).unwrap();
         let kp1 = frost::keys::KeyPackage::try_from(shares[&id1].clone()).unwrap();
-        // The DKG roster names every member's relay identity, which signing needs.
         let ids: Vec<_> = (1..=3).map(Identity::new).collect();
         let roster = serde_json::to_vec(&json!({
             "vault": vault_hex, "threshold": 2, "setup_version": 2, "network": "regtest",
@@ -2551,7 +2399,6 @@ mod tests {
             .unwrap()
             .write_sealed("backup.sealed", &backup::create(&material, pass).unwrap().0, pass)
             .unwrap();
-        // Only its presence marks the vault active for the backup sweep.
         dir(data, &vault_hex).unwrap().write_sealed("vault.sealed", b"{}", pass).unwrap();
         (material, shares, public)
     }
@@ -2589,8 +2436,6 @@ mod tests {
         std::sync::Arc::try_unwrap(words).unwrap().into_inner().unwrap().unwrap()
     }
 
-    /// A vault that became active before the member set up recovery still gets its recovery
-    /// backup: right after local setup, and at the next unlock if it is missing.
     #[tokio::test(flavor = "multi_thread")]
     async fn recovery_backup_is_sealed_for_an_already_active_vault_at_setup_and_unlock() {
         use crate::signer::recovery::RecoveryKey;
@@ -2626,10 +2471,8 @@ mod tests {
         let opened = crate::signer::backup::verify_recovery(&BackupArtifact(std::fs::read(&backup).unwrap()), &key, &vault).unwrap();
         assert_eq!(opened.member_id, 1);
 
-        // Sealing it deleted the passphrase-only copy of the share.
         assert!(!signer_dir(&data, &vault_hex).unwrap().join("backup.sealed").exists());
 
-        // Recovery set up while the backup could not be sealed: the next unlock seals it.
         std::fs::remove_file(&backup).unwrap();
         MemberDir::open(&signer_dir(&data, &vault_hex).unwrap(), "")
             .write_sealed("backup.sealed", &crate::signer::backup::create(&material, pass).unwrap().0, pass)
@@ -2642,7 +2485,6 @@ mod tests {
         std::fs::remove_dir_all(data).unwrap();
     }
 
-    /// A host serving `data` on a loopback port: its base URL and API token.
     async fn spawn_host(data: &Path) -> (String, String) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -2655,11 +2497,6 @@ mod tests {
         (base, token)
     }
 
-    /// Restore-on-new-device drill: the old device exports its recovery backup, a CLEAN data dir
-    /// restores it locally, the payment path opens its signer (`custody::open_signer`), and it
-    /// signs through the store's nonce dir at the restored epoch. A nonce the old device
-    /// committed before the restore, and a package carrying that old commitment, are both
-    /// refused afterwards.
     #[tokio::test(flavor = "multi_thread")]
     async fn local_restore_on_new_device_signs_and_refuses_pre_restore_nonce() {
         use crate::signer::nonce::NonceStore;
@@ -2674,7 +2511,6 @@ mod tests {
             client.request(method, format!("{base}{path}")).header("x-loki-token", token).json(&body).send()
         };
 
-        // Old device: an active vault, recovery set up, backup exported over the route.
         crate::profile::create(&old, pass, "Old").unwrap();
         let (_material, shares, public) = dealer_vault(&old, vault, pass);
         let words = setup_recovery_locally(&old, pass);
@@ -2683,8 +2519,6 @@ mod tests {
         let backup = call(&old_base, &old_token, reqwest::Method::GET, &format!("/api/recovery-backup?vault={vault_hex}"), json!({}))
             .await.unwrap().json::<Value>().await.unwrap()["backup"].as_str().unwrap().to_owned();
 
-        // Before the restore the old device commits a nonce for an attempt (epoch 0, its own
-        // element, id = payment || attempt).
         let id1 = frost::Identifier::try_from(1u16).unwrap();
         let id2 = frost::Identifier::try_from(2u16).unwrap();
         let old_key = frost::keys::KeyPackage::try_from(shares[&id1].clone()).unwrap();
@@ -2694,7 +2528,6 @@ mod tests {
         let old_commitment = NonceStore::open(&old_nonces, vault, 1).unwrap()
             .commit(&stale_id, &SoftwareSecureElement::generate(), old_key.signing_share(), None).unwrap();
 
-        // New device: a clean data dir restores the backup pinned on the old signer.
         crate::profile::create(&new, pass, "New").unwrap();
         let config = crate::host::config_from_args(&[
             "--data".into(), new.to_str().unwrap().into(), "--port".into(), "3601".into(),
@@ -2707,10 +2540,6 @@ mod tests {
             .await.unwrap().json::<Value>().await.unwrap();
         assert_eq!(status, json!({"recovery_identity": true, "recovery_backup": true}));
 
-        // The restored member signs: the payment path opens its signer from the store (a
-        // restored store opens through `LocalSigner::from_restored`), the store's nonce dir at
-        // the restored share epoch emits a share, and the share aggregates with member 2's into
-        // a signature under the group key.
         let sdir = signer_dir(&new, &vault_hex).unwrap();
         let new_nonces = sdir.join("nonces");
         assert!(!new_nonces.exists(), "a clean device starts with no nonces");
@@ -2741,14 +2570,11 @@ mod tests {
             .expect("the restored member's share aggregates");
         params.randomized_verifying_key().verify(&[6u8; 32], &signature).unwrap();
 
-        // The old device's nonce file, replayed into the new device, never signs and is never
-        // replaced by a fresh nonce for that id.
         std::fs::copy(old_nonces.join(format!("{stale_id}.nonce")), new_nonces.join(format!("{stale_id}.nonce"))).unwrap();
         let (package, _, seed) = package_with(old_commitment);
         assert!(store.sign_and_burn(&stale_id, &se, &package, &key, &seed, None, &|| false).is_err());
         assert!(store.commit(&stale_id, &se, key.signing_share(), None).is_err());
         assert!(!new_nonces.join(format!("{stale_id}.burn")).exists(), "no share was released");
-        // A package carrying the pre-restore commitment is refused against the new nonce.
         let retry_id = hex::encode([[3u8; 32], [8u8; 32]].concat());
         store.commit(&retry_id, &se, key.signing_share(), None).unwrap();
         assert!(store.sign_and_burn(&retry_id, &se, &package, &key, &seed, None, &|| false).is_err());
@@ -2783,7 +2609,6 @@ mod tests {
         let identity = Identity::from_secret_bytes(&material.identity).unwrap().public();
         let signing = hex::encode(identity.signing);
         let relay = hex::encode(identity.encryption);
-        // Coordinator slot deliberately differs from the backup's FROST member id.
         let entry = json!({"slot": 11, "signing_pubkey": signing, "relay_pubkey": relay, "advertise_url": "http://127.0.0.1:10000"});
         let mut wrong_relay = entry.clone();
         wrong_relay["relay_pubkey"] = json!(hex::encode([78; 32]));
@@ -2834,7 +2659,6 @@ mod tests {
             native_recovery::restore_new(settings, pass, secret(words), &file, &anchor, origin, None)
         };
         tokio::task::block_in_place(|| {
-            // A legitimate but different export of the very same material must not match.
             std::fs::write(&file, exported(&material).to_string()).unwrap();
             assert_eq!(restore_new(&mut settings, &words, &origin), Err("backup-fingerprint-mismatch"));
             assert!(!data.exists());
@@ -2902,7 +2726,6 @@ mod tests {
             let signer = crate::host::custody::open_signer(&s, &data, pass, &vault_hex, 1, Box::new(|_| false)).unwrap();
             assert_eq!(signer.hosted_metadata().unwrap().0.verifying_key(), public.verifying_key());
 
-            // Same words with another member's valid backup must not install into a running profile.
             let (other_member, _, _) = dealer_vault(&root.join("other"), [7; 32], pass);
             let other_export = exported(&other_member);
             let other_anchor = fingerprint_of(&other_export);
@@ -2911,7 +2734,6 @@ mod tests {
             assert_eq!(restore_running(&other_anchor), Err(wrong_profile));
             assert!(!dir(&data, &hex::encode([7; 32])).unwrap().path().exists());
 
-            // Another vault for the same member: change the vault-bound roster and fingerprint.
             let mut another_vault = material;
             another_vault.vault_id = [6; 32];
             let another_hex = hex::encode(another_vault.vault_id);
@@ -2932,12 +2754,10 @@ mod tests {
             assert!(dir(&data, &another_hex).unwrap().exists("vault.sealed"));
         });
 
-        // If the coordinator still gives the old slot, keep the restored app usable.
         assert_eq!(registration::start(&state, unlock(), Some(&notice)).await.unwrap(), "restore-pending");
         assert_eq!(state.registration_error.read().await.as_deref(), Some("Vault restored. LokiSigner could not reconnect to the coordinator yet; it will retry without your recovery words."));
         assert!(data.join(registration::RESTORE_PENDING).exists());
 
-        // Restart from disk. Its saved coordinator/slot and local passphrase are enough.
         let mut resumed = config();
         resumed.registration = Some(RegistrationConfig::resume(&data, true).unwrap());
         let resumed = Arc::new(AppState::new(resumed));
@@ -3057,7 +2877,6 @@ mod tests {
 
 }
 
-// ---- self-custody helpers ported from the speedmaster host (device pairing + recovery restore) ----
 pub(super) fn signer_dir(data: &Path, vault: &str) -> Result<PathBuf, String> {
     Ok(dir(data, vault)?.path().join("signer"))
 }
@@ -3097,10 +2916,6 @@ pub(super) fn vault_sealed_bytes(
     serde_json::to_vec(&sealed).map(Zeroizing::new).map_err(|e| e.to_string())
 }
 
-/// Recovery restore: rebuild this member's vault from a recovery backup opened with the
-/// member's 24 words, so the payment path can re-open the vault and sign exactly as after the
-/// original ceremony. `backup` is the exported blob (`GET /api/recovery-backup`) a member
-/// brings to a new device; without it the blob stored beside the signer is used.
 pub(super) fn restore_vault_from_backup(
     data: &Path,
     vault: &str,
@@ -3151,8 +2966,6 @@ pub(super) fn restore_opened_backup(backup: RecoveryBackup, data: &Path, dest: &
     let local = super::recovery::backup_file(&sdir);
     let pp = frost::keys::PublicKeyPackage::deserialize(&material.public_package)
         .map_err(|e| e.to_string())?;
-    // Signing needs every member's relay identity, which only the backup's roster carries.
-    // `verify_recovery` already bound that roster to this vault and to the backup's identity.
     if material.roster.is_empty() || material.identity.is_empty() {
         return Err("this backup has no roster, so it cannot rebuild a member that signs".into());
     }
@@ -3164,7 +2977,6 @@ pub(super) fn restore_opened_backup(backup: RecoveryBackup, data: &Path, dest: &
     if network.label() != config.network {
         return Err("recovery backup is for a different network".into());
     }
-    // The profile's identity serves every vault it holds, so restore never replaces one.
     let root = MemberDir::open(data, ".");
     let write_identity = match root.read_sealed("identity.sealed", pass) {
         Ok(existing) => {
@@ -3178,12 +2990,8 @@ pub(super) fn restore_opened_backup(backup: RecoveryBackup, data: &Path, dest: &
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
         Err(e) => return Err(e.to_string()),
     };
-    // The words that open this backup become the profile's recovery identity, so a later start
-    // or recovery setup never mints a second, unrelated set the backup is not sealed to.
     let write_recovery = super::recovery::check_recovery(data, &key)?;
     if dest.exists("vault.sealed") {
-        // Repair only the export of an already restored headless vault; never touch its
-        // live share or epoch. The unlocked device store is the independent trust anchor.
         if published_key_dir.is_some() || write_identity || write_recovery
             || std::fs::read(&local).is_ok_and(|prior| prior == blob) {
             return Err("vault already exists; restore into a fresh device profile".into());
@@ -3227,7 +3035,6 @@ pub(super) fn restore_opened_backup(backup: RecoveryBackup, data: &Path, dest: &
         roster_code: None,
         creator: None,
     };
-    // The ceremony records the relay roster's fingerprint, not the setup document's.
     let fingerprint = hex::encode(roster_of(&ceremony)?.fingerprint());
     ceremony.fingerprint = Some(fingerprint.clone());
     let ak: [u8; 32] = pp.verifying_key().serialize().map_err(|e| e.to_string())?
@@ -3237,7 +3044,6 @@ pub(super) fn restore_opened_backup(backup: RecoveryBackup, data: &Path, dest: &
     let bytes = vault_sealed_bytes(
         vault, material.member_id, material.threshold, material.members, &fingerprint,
         &pp, &fvk,
-        // Regtest vaults are born at height 2 (`setup_birth_height`); Testnet backups carry theirs.
         material.birth_height.unwrap_or(2), network,
     )?;
     let (se, existing) = setup_signer_element(config, &sdir, pass, published_key_dir, data)?;
@@ -3261,17 +3067,13 @@ pub(super) fn restore_opened_backup(backup: RecoveryBackup, data: &Path, dest: &
     if write_recovery {
         super::recovery::adopt_recovery(data, &key, pass)?;
     }
-    // Keep the backup on the new device so it can be exported again.
     super::recovery::install_backup(&sdir, &blob)?;
     save_to(dest, pass, &ceremony)?;
-    // Written last: `vault.sealed` is what marks the vault active.
     dest.write_sealed("vault.sealed", &bytes, pass)
         .map_err(|e| e.to_string())?;
     Ok(())
 }
 
-/// Re-derive a vault's FROST roster from stored ceremony state, verifying it still matches the
-/// recorded fingerprint. Used by the repair flow to rebuild roster-dependent artifacts.
 pub(super) fn repair_roster(data: &Path, pass: &str, vault: &str) -> Result<FrostRoster, String> {
     let c = load(data, pass, vault)?;
     let roster = roster_of(&c)?;

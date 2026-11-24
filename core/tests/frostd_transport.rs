@@ -54,9 +54,6 @@ fn tempdir(tag: &str) -> PathBuf {
     p
 }
 
-/// An in-memory relay with frostd's contract: an empty recipient list goes to the
-/// coordinator's mailbox, and `recv` drains the caller's mailbox. It records every
-/// payload it carried.
 #[derive(Clone, Default)]
 struct MemoryRelay(Arc<Mutex<RelayState>>);
 
@@ -68,7 +65,6 @@ struct RelayState {
 }
 
 impl MemoryRelay {
-    /// The relay loses everything still queued for the members.
     fn drop_member_queues(&self) {
         self.0.lock().unwrap().boxes.retain(|(_, coordinator), _| *coordinator);
     }
@@ -157,14 +153,12 @@ impl BackupDevice for Shelf {
     }
 }
 
-/// One member: the storage-backed signer plus the code its device showed.
 struct Member {
     id: u16,
     dir: PathBuf,
     signer: LocalSigner<SoftwareSecureElement>,
     session: Session,
     codes: Arc<Mutex<Vec<String>>>,
-    /// The roster identity the signer was created with, kept by the member's app.
     identity: Identity,
 }
 
@@ -209,7 +203,6 @@ impl Member {
         }
     }
 
-    /// The member's device restarts: reopen the signer from its data directory.
     fn restart(&mut self) {
         let se = SoftwareSecureElement::persistent(&self.dir, "member pass").unwrap();
         self.signer =
@@ -227,7 +220,6 @@ impl Member {
     }
 }
 
-/// Poll until `want` messages arrived (frostd is store-and-forward).
 fn recv_until<T: Transport>(t: &T, ch: &T::Channel, coordinator: bool, want: usize) -> Vec<Incoming>
 where
     T::Error: std::fmt::Debug,
@@ -243,9 +235,6 @@ where
     panic!("the relay did not deliver {want} messages (got {})", got.len());
 }
 
-/// A full 2-of-3 setup and a signed candidate over `T`. `restart_coordinator` reopens the
-/// relay log mid-setup (after `lose_queues` dropped what the relay still held for the
-/// members) and redelivers from it.
 fn setup_and_sign<T>(
     members_tx: Vec<(T, T::Channel)>,
     member_peers: Vec<Peer>,
@@ -264,7 +253,6 @@ where
     let log_dir = tempdir("relay-log");
     let mut log = RelayLog::open(&log_dir, count).unwrap();
 
-    // The coordinator assembles the roster from what each signer's connect returned.
     let roster = serde_json::json!({
         "vault": hex::encode(vault),
         "threshold": threshold,
@@ -301,12 +289,9 @@ where
                 }
             }
         }
-        // Wait until the coordinator holds what the members just sent.
         std::thread::sleep(Duration::from_millis(50));
         relay_dkg(&mut log, &coord, &coord_ch, &peers).unwrap();
         if pass == 1 {
-            // The coordinator restarts and the relay lost the queued deliveries: reopen the
-            // log and redeliver everything. A member's device restarts too.
             lose_queues();
             drop(log);
             log = RelayLog::open(&log_dir, count).unwrap();
@@ -322,15 +307,12 @@ where
     for m in &members {
         assert!(m.ready(), "member {} must be ready after every receipt", m.id);
     }
-    // Every member derived the same vault secret, so the same group viewing key.
     let viewing: Vec<_> = members.iter().map(|m| m.signer.hosted_metadata().unwrap().1.to_bytes()).collect();
     assert!(viewing.iter().all(|fvk| *fvk == viewing[0]));
-    // Active: the coordinator deletes its relay log.
     assert!(log.active());
     log.delete().unwrap();
     assert!(!log_dir.join("dkg-relay.log").exists());
 
-    // Every member releases the same address; pay a note to it.
     let addresses: Vec<String> = members
         .iter_mut()
         .map(|m| m.signer.release_address(&m.session).unwrap().address)
@@ -355,7 +337,6 @@ where
     )
     .unwrap();
 
-    // ---- Signing: members 1 and 2, every message typed ----
     let cand = CandidateRef {
         vault_id: vault,
         payment_id: [7; 32],
@@ -394,15 +375,13 @@ where
         target_height: 700,
         expiry_height: 1_152,
     };
-    // The proposer's app answers the build request with the signer's candidate.
     let candidate = members[0]
         .signer
-        .build_candidate(&members[0].session, &cand, &intent, &alpha)
+        .build_candidate(&members[0].session, &cand, &intent, &[alpha])
         .unwrap();
     let sighash = pczt::roles::signer::Signer::new(pczt::Pczt::parse(candidate.as_bytes()).unwrap())
         .unwrap()
         .shielded_sighash();
-    // The proposer seals the candidate to the other signer; it never crosses in the clear.
     let context = SessionContext {
         vault,
         payment: cand.payment_id,
@@ -458,8 +437,6 @@ where
     addresses
 }
 
-/// What crossed the relay: every setup message is a well-formed wire, every round-two
-/// message is a v2 envelope, and none decodes as a plaintext round-two package.
 fn audit(tape: &[Vec<u8>]) {
     let mut round2 = 0;
     let mut setup = 0;
@@ -476,7 +453,6 @@ fn audit(tape: &[Vec<u8>]) {
             );
         }
     }
-    // Six round-two envelopes, each sent once by its member and once by the coordinator.
     assert!(round2 >= 12, "round two crossed the relay ({round2} envelopes)");
     assert!(setup > round2);
 }
@@ -541,7 +517,6 @@ fn new_signer_setup_and_signing_over_real_frostd() {
             (t, ch)
         })
         .collect();
-    // frostd keeps queued messages across a coordinator restart, so nothing is lost.
     let addresses = setup_and_sign(
         members,
         member_peers,

@@ -1,4 +1,3 @@
-//! A relay's durable, first-writer-wins claim on one FROST nonce commitment.
 use crate::{
     canonical::{self, Value},
     types::{Id32, RelayPin},
@@ -46,9 +45,6 @@ impl ClaimProof {
     }
 }
 
-/// This authorization is usable only for this enrolled vault slot, witness, and exact claim.
-/// CID binds the public FROST commitment; the relay keeps authenticated CIDs slot-scoped
-/// so another enrolled signer cannot consume one by submitting the same opaque ID.
 pub fn claim_input(
     who: Claimant,
     pin: &RelayPin,
@@ -67,8 +63,6 @@ pub fn claim_input(
     )
 }
 
-/// Verify a claim proof against the advertised digest before reading the record.
-/// The caller must still check that the received record hashes to this digest.
 pub fn claim_input_for_hash(
     who: Claimant,
     pin: &RelayPin,

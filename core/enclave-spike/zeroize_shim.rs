@@ -1,6 +1,3 @@
-//! Std-only stand-in for the `zeroize` crate, enough to compile the shipped
-//! `AppleSecureElement` module in the offline FFI verifier. Built as an rlib and passed
-//! via `--extern zeroize=`. Real zeroize-on-drop is a crate concern, not an FFI concern.
 #![crate_name = "zeroize"]
 
 use std::ops::{Deref, DerefMut};

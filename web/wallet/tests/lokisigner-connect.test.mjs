@@ -7,7 +7,6 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import ts from 'typescript';
 import { api, connectLokiSigner, hasLokiSignerSession, lastLokiSignerSlot } from '../src/lib/api.ts';
 
-// Compile just this JSX module so the existing Node test command can render the production component.
 const componentUrl = new URL('../src/components/NativeTabConnection.tsx', import.meta.url);
 const jsx = registerHooks({ load(url, context, next) {
   if (url !== componentUrl.href) return next(url, context);
@@ -67,7 +66,6 @@ test('duplicating an approved tab copies the slot but needs its own Allow, and a
   const tab1 = new Map();
   const fixture = tabFixture(t, async (url, options = {}) => {
     if (url === '/api/members') {
-      // The first launch's row is visible before the app has consumed its registration reply.
       const endpoint = launch === 1 ? old : current;
       return Response.json({ slots: [{ ...member, lokisigner_url: endpoint }] });
     }
@@ -98,7 +96,7 @@ test('duplicating an approved tab copies the slot but needs its own Allow, and a
   statusToken = token('1');
   assert.equal((await first.api('status')).phase, 'home');
 
-  const tab2 = new Map(tab1); // The browser duplicates sessionStorage, not the JS module.
+  const tab2 = new Map(tab1);
   fixture.use(tab2);
   assert.equal(duplicate.lastLokiSignerSlot(), member.slot);
   assert.equal(duplicate.hasLokiSignerSession(), false);
@@ -213,7 +211,6 @@ test('only a code followed by a token in a live request can persist a grant', as
   assert.equal(tab.size, 0);
 
   frames = [code, grant];
-  // The fake stream deliberately delivers a valid decision even after we cancel the request.
   await assert.rejects(connectLokiSigner(member.slot, (event) => {
     if (event.phase === 'compare') request.abort();
   }, request.signal), { name: 'AbortError' });

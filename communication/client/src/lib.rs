@@ -36,7 +36,6 @@ pub enum ClientError {
     Transport,
     Receipt,
     Conflict,
-    /// Entries cursor is ahead of retained history. The caller keeps its cursor.
     Cursor,
 }
 

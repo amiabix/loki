@@ -1,16 +1,9 @@
-//! Test-only on-disk state for the three member processes.
-//!
-//! Plain files under a per-member directory. The brief permits this and is explicit
-//! about what it does **not** establish: there is no crash or rollback guarantee here,
-//! and nothing in this module is evidence for G3.
-
 use std::{
     fs, io,
     io::Write,
     path::{Path, PathBuf},
 };
 
-/// One member's private directory. Never committed; see `.gitignore`.
 pub struct MemberDir(PathBuf);
 
 impl MemberDir {
@@ -58,31 +51,6 @@ impl MemberDir {
     }
 }
 
-// --- Encryption at rest -------------------------------------------------------------
-//
-// `write_hex` above puts a member's FROST signing share on disk as plain text. That is
-// what the brief permits for a prototype, but it makes the directory itself the secret,
-// so the sealed pair below exists alongside it: same directory, same file names, but the
-// bytes are encrypted under a passphrase-derived key.
-//
-// Construction: Argon2id (default parameters: 19 MiB, t=2, p=1) stretches the passphrase
-// over a per-file random salt into a 32-byte key; XChaCha20-Poly1305 encrypts under a
-// per-encryption random nonce. The extended nonce is the reason for the X variant — 24
-// random bytes will not collide, so no counter has to be kept across writes.
-//
-// File layout, little more than a header stapled to the ciphertext:
-//
-//     0..9    magic and format version, b"LOKISEAL\x01"
-//     9..25   Argon2id salt, fresh per file
-//     25..49  XChaCha20-Poly1305 nonce, fresh per encryption
-//     49..    ciphertext, Poly1305 tag appended
-//
-// The whole 49-byte header is passed as associated data, so the salt and nonce are
-// covered by the tag: editing them is as detectable as editing the ciphertext.
-//
-// This file format does not defend against an attacker who can read the process's
-// memory while a member is signing.
-
 use chacha20poly1305::{
     aead::{Aead, Payload},
     KeyInit, XChaCha20Poly1305, XNonce,
@@ -94,8 +62,6 @@ const SEAL_SALT: usize = 16;
 const SEAL_NONCE: usize = 24;
 const SEAL_HEADER: usize = SEAL_MAGIC.len() + SEAL_SALT + SEAL_NONCE;
 
-/// Stretch the passphrase over `salt` into a cipher. Fails only on invalid parameters,
-/// which here means a salt shorter than Argon2's minimum — i.e. a corrupt header.
 fn seal_cipher(passphrase: &str, salt: &[u8]) -> io::Result<XChaCha20Poly1305> {
     let key = crate::seal_kdf::derive(passphrase, salt)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid sealing salt"))?;
@@ -103,8 +69,6 @@ fn seal_cipher(passphrase: &str, salt: &[u8]) -> io::Result<XChaCha20Poly1305> {
 }
 
 impl MemberDir {
-    /// Write `bytes` encrypted under `passphrase`, refusing to replace an existing file.
-    /// Each call draws a fresh salt and nonce.
     pub fn write_sealed(&self, file: &str, bytes: &[u8], passphrase: &str) -> io::Result<()> {
         let mut header = [0u8; SEAL_HEADER];
         header[..SEAL_MAGIC.len()].copy_from_slice(SEAL_MAGIC);
@@ -154,9 +118,6 @@ impl MemberDir {
         result
     }
 
-    /// Read a file written by [`MemberDir::write_sealed`]. A wrong passphrase, a damaged
-    /// header, or a single flipped bit anywhere in the file is an `InvalidData` error --
-    /// the Poly1305 tag is checked before any plaintext is returned.
     pub fn read_sealed(&self, file: &str, passphrase: &str) -> io::Result<Vec<u8>> {
         let raw = fs::read(self.0.join(file))?;
         if raw.len() < SEAL_HEADER || &raw[..SEAL_MAGIC.len()] != SEAL_MAGIC {
@@ -193,8 +154,6 @@ impl MemberDir {
 mod tests {
     use super::*;
 
-    /// A scratch member directory. No `tempfile` in the graph, and the OS random name
-    /// is enough to keep concurrent test threads from colliding.
     fn scratch(tag: &str) -> MemberDir {
         let mut suffix = [0u8; 8];
         OsRng.fill_bytes(&mut suffix);
@@ -272,7 +231,6 @@ mod tests {
         dir.write_sealed("key_package.hex", b"a share worth forging", "correct horse")
             .unwrap();
 
-        // Flip one bit in the first ciphertext byte, past the header.
         let path = dir.path().join("key_package.hex");
         let mut raw = fs::read(&path).unwrap();
         raw[SEAL_HEADER] ^= 0x01;
@@ -303,12 +261,6 @@ mod tests {
         );
     }
 
-    /// Two seals of the same secret must differ: a reused salt or nonce would show up
-    /// here as identical files.
-    /// Tampering with the SALT takes a different path from tampering with the ciphertext:
-    /// the wrong salt derives the wrong key, so this never even reaches a tag comparison
-    /// on the right key. Worth its own case, because a format that authenticated only the
-    /// ciphertext would pass the flipped-bit test and fail this one.
     #[test]
     fn a_flipped_salt_bit_is_detected() {
         let md = scratch("salt");
@@ -317,7 +269,7 @@ mod tests {
 
         let path = md.path().join("k.sealed");
         let mut raw = fs::read(&path).unwrap();
-        raw[SEAL_MAGIC.len()] ^= 1; // first byte of the salt
+        raw[SEAL_MAGIC.len()] ^= 1;
         fs::write(&path, &raw).unwrap();
 
         assert!(

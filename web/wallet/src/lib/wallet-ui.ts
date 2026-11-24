@@ -1,4 +1,3 @@
-/** Invite metadata is a preview only; the existing join endpoint validates the invite. */
 export function invitePreview(code: string): { vault: string; name: string; members: number; threshold: number; slot: number } | null {
   try {
     const raw = atob(code.replace(/-/g, "+").replace(/_/g, "/"));
@@ -20,7 +19,7 @@ export function paymentLabel(phase: string, ready: boolean, sending: boolean): s
   if (phase === "broadcast") return "Awaiting confirmation";
   if (phase === "expired") return "Expired";
   if (phase === "failed") return "Failed · not sent";
-  if (phase === "discarding") return "Releasing reserved input";
+  if (phase === "discarding") return "Releasing reserved notes";
   if (phase === "cancelled") return "Cancelled";
   if (sending) return "Sending";
   if (ready) return "Ready to send";
@@ -38,7 +37,6 @@ export function emptyHistoryText(lokiSigner: boolean): string {
     : "Payments sent and received by this vault will appear here.";
 }
 
-// shortcut: status omits the viewer's slot; retain successful joins until the API exposes it.
 export function rememberVaultSlot(profile: string | undefined, vault: string, slot: number) {
   if (!profile) return;
   try { localStorage.setItem(`loki_slot:${profile}:${vault}`, String(slot)); } catch {}
@@ -52,23 +50,14 @@ export function rememberedVaultSlot(profile: string | undefined, vault: string):
   } catch { return null; }
 }
 
-/** Whole seconds before a pairing link lapses, rounded up; 0 once expired. The coordinator
- *  keeps a reservation while `expires > now`, so the link is gone at `now === expires`. */
 export function pairingSecondsLeft(expires: number, now: number): number {
   return expires > now ? Math.ceil((expires - now) / 1000) : 0;
 }
 
-/** Whether this member asks LokiSigner's dialog to agree to a roster. Only a member with
- *  LokiSigner's roster channel reports `roster_dialog` in its vault status (null while no dialog
- *  is open); a headless member paired with this tab does not, and agrees on the page's request,
- *  so the page shows it the code to compare as before. */
 export function comparesInLokiSigner(status: object): boolean {
   return Object.hasOwn(status, "roster_dialog");
 }
 
-/** What a native member reads when LokiSigner recorded no agreement to a roster. `answered` is
- *  false when the request lost its connection before LokiSigner replied. The member's own error
- *  prefixes come from `agree` in core/src/host/ceremony.rs. */
 export function nativeRosterRefusal(message: string, answered: boolean): string {
   if (!answered) return "This page lost its connection to LokiSigner. If its dialog is still open, answer it there; this page moves on once you choose Codes match.";
   if (message.startsWith("roster codes differ")) return "You chose Codes differ in LokiSigner, so it will not agree to this vault. Tell the creator and the other members: someone may have been swapped in. If you chose it by mistake, quit and reopen LokiSigner, pair this tab again, and compare once more.";

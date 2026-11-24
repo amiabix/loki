@@ -26,8 +26,6 @@ use super::state::Shared;
 use crate::signer::device_auth::{device_id, DeviceRegistry};
 use axum::http::StatusCode;
 
-/// One persisted enrolled device: its SEC1 P-256 public key, the recovery authorization that
-/// admitted it (re-verified on load), and whether it is still active.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StoredDevice {
@@ -43,7 +41,6 @@ struct StoredDevice {
 pub(super) struct DeviceState {
     registry: DeviceRegistry,
     stored: Vec<StoredDevice>,
-    // A second member process must not cache an independent registry for this profile.
     _lock: fs::File,
 }
 
@@ -79,9 +76,6 @@ fn save_stored(data: &Path, devices: &[StoredDevice]) -> Result<(), String> {
     result.map_err(|e| e.to_string())
 }
 
-/// Rebuild the registry from disk: bind it to the recovery device-authorization key and
-/// re-enroll each persisted device (which re-verifies its authorization), then re-apply
-/// revocations. Errors if no recovery identity has been established yet.
 fn build_registry(data: &Path, stored: &[StoredDevice]) -> Result<DeviceRegistry, String> {
     let authz = super::recovery::read_authz_pubkey(data)
         .ok_or("no recovery identity yet — run recovery setup first")?;
@@ -145,9 +139,6 @@ fn hex_field(body: &Value, name: &str) -> Result<Vec<u8>, Reply> {
         })
 }
 
-/// Run `f` against the in-process registry, lazily building it from disk on first use. The
-/// guard is held only for the synchronous closure (no `.await` inside), so it never blocks a
-/// worker across a yield point.
 fn with_registry<F>(st: &Shared, f: F) -> Reply
 where
     F: FnOnce(&mut DeviceState) -> Reply,
@@ -160,15 +151,12 @@ where
         }
     }
     let reply = f(guard.as_mut().unwrap());
-    // A post-rename sync failure may leave the new snapshot visible. Never keep serving a
-    // cached version after an ambiguous write; the next request reloads disk under the lock.
     if reply.0 == StatusCode::INTERNAL_SERVER_ERROR {
         *guard = None;
     }
     reply
 }
 
-/// POST /api/device-enroll { device_pub, authorization } — enroll a recovery-authorized device.
 pub(super) async fn enroll(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
     let device_pub = match hex_field(&body, "device_pub") {
         Ok(v) => v,
@@ -240,7 +228,6 @@ pub(super) async fn enroll(State(st): State<Shared>, Json(body): Json<Value>) ->
     })
 }
 
-/// POST /api/device-renewal { device_pub } — get the current generation for a revoked key.
 pub(super) async fn renewal(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
     let id = match hex_field(&body, "device_pub") {
         Ok(v) => match device_id(&v) {
@@ -256,7 +243,6 @@ pub(super) async fn renewal(State(st): State<Shared>, Json(body): Json<Value>) -
         let generation = match state.stored[i].renewal_generation {
             Some(g) => g,
             None => {
-                // A legacy revoked record has no renewal generation until its first request.
                 let mut generation = [0; 32];
                 OsRng.fill_bytes(&mut generation);
                 let mut stored = state.stored.clone();
@@ -272,7 +258,6 @@ pub(super) async fn renewal(State(st): State<Shared>, Json(body): Json<Value>) -
     })
 }
 
-/// GET /api/device-challenge — issue a one-time random login challenge.
 pub(super) async fn challenge(State(st): State<Shared>, headers: HeaderMap) -> Reply {
     let Some(token) = headers.get("x-loki-token") else {
         return err(StatusCode::UNAUTHORIZED, "missing device grant");
@@ -287,7 +272,6 @@ pub(super) async fn challenge(State(st): State<Shared>, headers: HeaderMap) -> R
     })
 }
 
-/// POST /api/device-login { device_pub, challenge, signature } — verify a device's response.
 pub(super) async fn login(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
     let (device_pub, challenge, signature) = match (
         hex_field(&body, "device_pub"),
@@ -312,7 +296,6 @@ pub(super) async fn login(State(st): State<Shared>, Json(body): Json<Value>) -> 
     })
 }
 
-/// Revoke locally, never on the authority of a shared wallet token.
 pub(super) async fn revoke(State(st): State<Shared>, req: Request) -> Reply {
     #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
     let local = st.config.native && req.extensions().get::<super::native_member::InProcess>().is_some();
@@ -368,7 +351,6 @@ mod tests {
         p
     }
 
-    // Write a recovery identity's public keys where build_registry expects them.
     fn write_recovery_pub(data: &Path, key: &RecoveryKey) {
         let mut pubkeys = Vec::new();
         pubkeys.extend_from_slice(&key.public_bytes());
@@ -382,7 +364,6 @@ mod tests {
         let (_words, recovery) = RecoveryKey::generate().unwrap();
         write_recovery_pub(&data, &recovery);
 
-        // Enroll a device: persist its recovery authorization.
         let sk = SigningKey::random(&mut rand_core::OsRng);
         let device_pub = sk
             .verifying_key()
@@ -402,7 +383,6 @@ mod tests {
         )
         .unwrap();
 
-        // Rebuild from disk (restart): the device logs in.
         let mut state = DeviceState::open(&data).unwrap();
         let challenge = state.registry.issue_challenge([0; 32]).unwrap();
         let sig: Signature = sk.sign(&challenge);
@@ -412,8 +392,6 @@ mod tests {
             .expect("reloaded device logs in");
         drop(state);
 
-        // A tampered devices.json whose authorization is for a DIFFERENT recovery key is
-        // refused on rebuild (re-verification), so it cannot inject an unauthorized device.
         let (_w2, other) = RecoveryKey::generate().unwrap();
         save_stored(
             &data,
@@ -431,7 +409,6 @@ mod tests {
             "forged authorization is rejected on reload"
         );
 
-        // A revoked device stays revoked across a rebuild.
         save_stored(
             &data,
             &[StoredDevice {

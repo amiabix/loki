@@ -667,8 +667,6 @@ impl HostedSetup {
             }
         }
         if may_drive {
-            // Every unregistered handoff mailbox in one step: the requests are saved and
-            // signed, and a re-send is idempotent.
             let unregistered: Vec<usize> = (0..3).filter(|index| !registered.contains(index)).collect();
             if !unregistered.is_empty() {
                 let packages: Vec<&[u8]> = unregistered

@@ -14,8 +14,6 @@ fn outbox_schema_layout() {
         .unwrap()
         .map(Result::unwrap)
         .collect();
-    // Names are the schema.sql CREATE TABLE contract in sqlite_master order.
-    // They are written here and are not loaded from this database.
     assert_eq!(
         tables,
         [
@@ -3723,7 +3721,6 @@ mod upload_retry_failover {
         rows.len()
     }
 
-    // Scripted 401 and 507 stand in for relay HTTP. Exact duplicate PUT and read under quota stay on the relay store gate.
     #[test]
     fn upload_retry_append_change_sleeps_until_config_and_revision() {
         let prepared = prepare_outbox(
@@ -3984,11 +3981,9 @@ mod upload_retry_failover {
         assert_identity(&store, &logical.key, &wires, &before);
     }
 
-    /// Per-owner relay mask for the scripted stored-pair peer. Default is closed.
     #[derive(Clone)]
     struct StoredPolicy {
         owner_relays: [[bool; 3]; 4],
-        /// 0 keeps every hash, 1 keeps roots only, 2 keeps non-roots only.
         root_mode: u8,
         roots: Vec<Id32>,
         acknowledge: bool,
@@ -4104,7 +4099,6 @@ mod upload_retry_failover {
         }
     }
 
-    /// Scripted loopback signer. A 200 response with an empty CBOR array is an acknowledgement, not a stored receipt.
     fn serve_pair(listener: TcpListener, stop: Arc<AtomicBool>, state: Arc<Mutex<PairState>>) {
         while !stop.load(Ordering::Relaxed) {
             match listener.accept() {
@@ -4395,7 +4389,6 @@ mod upload_retry_failover {
 
     #[test]
     fn stored_pair() {
-        // These listeners are scripted HTTP signers, not loki-relay-server.
         let order = sorted_seeds();
         let low = order[0];
         let mid = order[1];

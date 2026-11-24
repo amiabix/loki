@@ -1,28 +1,21 @@
-// The deployment's signer configuration for the native signer (LokiSigner), served by this
-// coordinator at /api/signer-config. Its one source is the signer origin's own /config.json
-// (core/loki-signer-wasm/serve.mjs), which the browser signer runs with; nothing is copied here.
-// The witness configuration contains only routes and public pins.
-
 export type WitnessConfig = { endpoint: string; key: number[]; run: number[]; mailbox: number[] };
 export type SignerConfig = {
   network: "testnet" | "regtest";
   frostdUrl: string;
   lightwalletdUrl: string | null;
-  /** The native `--nonce-witnesses` shape: 32-byte values as byte arrays. */
   nonceWitnesses: [WitnessConfig, WitnessConfig];
 };
 
-/** The signer origin the wallet embeds: NEXT_PUBLIC_SIGNER_ORIGIN, or the local signer server
- *  under `next dev`, as `signer.ts` resolves it. A production build without one has none.
- *  The defaults name `process.env.NEXT_PUBLIC_SIGNER_ORIGIN` directly so Next inlines it at build
- *  time, exactly as in `signer.ts`; a deploy that sets it only for the build still has it here. */
-export function signerOrigin(configured: string | undefined = process.env.NEXT_PUBLIC_SIGNER_ORIGIN, mode: string | undefined = process.env.NODE_ENV): string {
-  if (configured) return new URL(configured).origin;
-  if (mode !== "production") return "http://localhost:3002";
-  throw new Error("this coordinator has no signer origin (NEXT_PUBLIC_SIGNER_ORIGIN), so it serves no signer configuration");
+export function configuredSignerOrigin(): string | undefined {
+  return process.env.LOKI_SIGNER_ORIGIN || process.env.NEXT_PUBLIC_SIGNER_ORIGIN;
 }
 
-/** Read and check the signer origin's configuration: no redirect, a timeout, never mainnet. */
+export function signerOrigin(configured: string | undefined = configuredSignerOrigin(), mode: string | undefined = process.env.NODE_ENV): string {
+  if (configured) return new URL(configured).origin;
+  if (mode !== "production") return "http://localhost:3002";
+  throw new Error("this coordinator has no signer origin (LOKI_SIGNER_ORIGIN or NEXT_PUBLIC_SIGNER_ORIGIN), so it serves no signer configuration");
+}
+
 export async function signerConfig(origin: string, timeoutMs = 10_000): Promise<SignerConfig> {
   let reply: Response;
   try {
@@ -56,8 +49,7 @@ export async function signerConfig(origin: string, timeoutMs = 10_000): Promise<
   };
 }
 
-/** The /api/signer-config reply: the configuration, or a clear error; never cached. */
-export async function signerConfigResponse(configured: string | undefined = process.env.NEXT_PUBLIC_SIGNER_ORIGIN, mode: string | undefined = process.env.NODE_ENV): Promise<Response> {
+export async function signerConfigResponse(configured: string | undefined = configuredSignerOrigin(), mode: string | undefined = process.env.NODE_ENV): Promise<Response> {
   const headers = { "Cache-Control": "no-store" };
   try {
     return Response.json(await signerConfig(signerOrigin(configured, mode)), { headers });

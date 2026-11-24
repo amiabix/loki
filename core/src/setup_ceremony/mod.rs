@@ -16,8 +16,6 @@ use crate::{
 use crate::network::TESTNET_NU7_BIRTH;
 use std::collections::BTreeMap;
 
-/// Setup format version carried in the agreement payload (C9). A member on another
-/// format computes a different payload, so agreement fails before any key generation.
 pub const SETUP_VERSION: u8 = 2;
 
 pub struct AcceptedCeremonyRoster {
@@ -27,8 +25,6 @@ pub struct AcceptedCeremonyRoster {
     transport_required: bool,
 }
 impl AcceptedCeremonyRoster {
-    /// The shared roster gate plus the hosted-only checks: the network label and a
-    /// non-zero operator digest.
     fn validate(
         roster: Roster,
         network: &str,
@@ -105,7 +101,6 @@ impl AcceptedCeremonyRoster {
             self.transport_required,
         )
     }
-    // This digest identifies an existing hosted journal; it grants no ceremony authority.
     #[cfg(any(feature = "relay-communication", test))]
     pub(crate) fn hosted_context_digest(
         roster: &Roster,

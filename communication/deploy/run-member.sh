@@ -1,28 +1,4 @@
 #!/usr/bin/env bash
-# Run one self-custody member against a public coordinator, from a packaged binary.
-#
-#   run-member.sh <coordinator-url> <slot>
-#
-# Self-registers to the coordinator (the browser-origin middleware only accepts the
-# coordinator URL the member was launched with), then prints the local pairing link
-# to open in a browser. The binary needs no Rust toolchain.
-#
-# Remote ceremony peers use a free cloudflared quick tunnel to the member's separate,
-# ceremony-only loopback listener. Never tunnel the private member API on PORT.
-#
-# frostd must be reachable on loopback (https off loopback is enforced): forward the
-# shared relay first, e.g.  ssh -N -L 2744:localhost:2744 omarchy
-#
-# Env:
-#   MEMBER_BIN   path to loki_member_app  (default <repo>/core/target/release/loki_member_app)
-#   DATA         member data dir          (default <repo>/loki-state/member-<slot>)
-#   PORT         local member port        (default 3610 + slot)
-#   PEER_PORT    ceremony backend port    (default 4610 + slot)
-#   FROSTD_URL   frostd loopback url       (default http://127.0.0.1:2744)
-#   LWD_URL      lightwalletd base url     (default https://testnet.zec.rocks:443)
-#   NETWORK      vault network             (default testnet)
-#   ADVERTISE_URL  use your own TLS proxy to PEER_PORT (default: own cloudflared tunnel)
-#   NO_TUNNEL=1    skip the per-member tunnel
 set -euo pipefail
 
 if [[ $# != 2 || $1 != http* || ! $2 =~ ^[0-9]+$ ]]; then
@@ -96,8 +72,6 @@ start_member "$port" "$data/member.log" "$data/pids" \
   --registration-slot "$slot" --profile-name "Member $slot" \
   ${advertise:+--peer-port "$peer_port" --advertise-url "$advertise"}
 
-# The member serves locally even when the coordinator refuses or is unreachable; it keeps
-# retrying registration and logs each failure to member.log.
 curl -sf --max-time 10 "$coordinator/api/members" | grep -q "\"slot\": *$slot\|\"slot\":$slot" \
   || { echo "warning: slot $slot not yet visible in $coordinator/api/members; registration retries, see $data/member.log" >&2; }
 

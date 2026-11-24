@@ -145,8 +145,6 @@ fn parse_listen(raw: &str) -> RelayResult<SocketAddr> {
     if !loopback {
         return Err(RelayError::MalformedRequest);
     }
-    // Descriptor clients reject a selected port of 0. Binding would replace it
-    // with an ephemeral port and persist a URL the client cannot use.
     if address.port() == 0 {
         return Err(RelayError::MalformedRequest);
     }

@@ -1,6 +1,3 @@
-//! One exact signer set per attempt and its encrypted courier mailbox.
-//! A caller must review the full exact PCZT and its locally derived sighash before `sign`.
-
 use crate::{
     intent::Intent,
     payment_manifest::MAX_INPUTS,
@@ -16,11 +13,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Upper bound on sealed outbox copies (one per other roster member). Rosters fit u16,
-/// but this bounds reads of a possibly corrupt sealed file.
 const MAX_OUTBOX_COPIES: usize = u16::MAX as usize;
 
-/// Random per retry. The payment ID remains the canonical intent ID.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AttemptId(pub [u8; 32]);
 
@@ -37,7 +31,6 @@ pub struct SessionContext {
     pub vault: [u8; 32],
     pub payment: [u8; 32],
     pub attempt: AttemptId,
-    /// The exact two or three signers, sorted by roster member ID.
     pub signers: Vec<u16>,
 }
 
@@ -55,8 +48,6 @@ impl SessionContext {
         Ok(())
     }
 
-    /// The sealed-envelope context between members `a` and `b` on one payment's frostd
-    /// control session, where the proposer announces the payment and members approve it.
     pub fn control(vault: [u8; 32], session: uuid::Uuid, a: u16, b: u16) -> Self {
         let mut hash = blake3::Hasher::new_derive_key("loki payment control session v1");
         hash.update(&vault);
@@ -81,9 +72,7 @@ pub enum MessageKind {
     Receipt = 5,
     Abort = 6,
     Consuming = 7,
-    /// A hosted proposer's candidate PCZT, sealed to one other selected signer.
     Candidate = 8,
-    /// A hosted member's authenticated request for a payment intent, and its reply.
     PeerRequest = 9,
     PeerReply = 10,
     HostedCommitment = 11,
@@ -117,6 +106,40 @@ impl TryFrom<u8> for MessageKind {
     }
 }
 
+pub const MAX_SPENDS: usize = 8;
+
+pub fn encode_hosted(items: &[Vec<u8>]) -> Result<Vec<u8>, String> {
+    if items.is_empty() || items.len() > MAX_SPENDS {
+        return Err(format!("a hosted round carries 1 to {MAX_SPENDS} spends"));
+    }
+    let mut body = vec![items.len() as u8];
+    for item in items {
+        let len = u16::try_from(item.len()).map_err(|_| "hosted value too large")?;
+        body.extend_from_slice(&len.to_be_bytes());
+        body.extend_from_slice(item);
+    }
+    Ok(body)
+}
+
+pub fn decode_hosted(body: &[u8]) -> Option<Vec<&[u8]>> {
+    let (&count, mut rest) = body.split_first()?;
+    if count == 0 || usize::from(count) > MAX_SPENDS {
+        return None;
+    }
+    let mut items = Vec::with_capacity(usize::from(count));
+    for _ in 0..count {
+        let (len, tail) = rest.split_first_chunk::<2>()?;
+        let len = usize::from(u16::from_be_bytes(*len));
+        if tail.len() < len {
+            return None;
+        }
+        let (item, tail) = tail.split_at(len);
+        items.push(item);
+        rest = tail;
+    }
+    rest.is_empty().then_some(items)
+}
+
 impl MessageKind {
     pub(crate) fn permits(self, context: &SessionContext, sender: u16, recipient: u16) -> bool {
         if sender == recipient {
@@ -133,24 +156,26 @@ impl MessageKind {
         }
     }
 
-    /// Check the encoding before a hosted message counts toward round progress.
     pub fn valid_hosted_body(self, context: &SessionContext, body: &[u8]) -> bool {
-        match self {
-            Self::HostedCommitment => frost::round1::SigningCommitments::deserialize(body).is_ok(),
-            Self::HostedAlpha => <&[u8; 32]>::try_from(body).is_ok_and(|alpha| {
+        if self == Self::Candidate {
+            return pczt::Pczt::parse(body).is_ok();
+        }
+        let Some(items) = decode_hosted(body) else { return false };
+        items.into_iter().all(|item| match self {
+            Self::HostedCommitment => frost::round1::SigningCommitments::deserialize(item).is_ok(),
+            Self::HostedAlpha => <&[u8; 32]>::try_from(item).is_ok_and(|alpha| {
                 crate::candidate::alpha_from_canonical_bytes(alpha).is_some()
             }),
-            Self::HostedSeed => body.len() == 32,
-            Self::HostedPackage => frost::SigningPackage::deserialize(body).is_ok_and(|package| {
+            Self::HostedSeed => item.len() == 32,
+            Self::HostedPackage => frost::SigningPackage::deserialize(item).is_ok_and(|package| {
                 let commitments = package.signing_commitments();
                 commitments.len() == context.signers.len() && context.signers.iter().all(|slot| {
                     frost::Identifier::try_from(*slot).is_ok_and(|id| commitments.contains_key(&id))
                 })
             }),
-            Self::HostedShare => frost::round2::SignatureShare::deserialize(body).is_ok(),
-            Self::Candidate => pczt::Pczt::parse(body).is_ok(),
+            Self::HostedShare => frost::round2::SignatureShare::deserialize(item).is_ok(),
             _ => false,
-        }
+        })
     }
 
     pub fn max_body(self) -> usize {
@@ -161,7 +186,7 @@ impl MessageKind {
             }
             Self::Receipt | Self::Abort | Self::PeerRequest => 1024,
             Self::HostedCommitment | Self::HostedPackage => 64 * 1024,
-            Self::HostedAlpha | Self::HostedSeed | Self::HostedShare => 32,
+            Self::HostedAlpha | Self::HostedSeed | Self::HostedShare => 1 + MAX_SPENDS * (2 + 32),
         }
     }
 }
@@ -173,9 +198,7 @@ pub struct OpenedMessage {
     pub(crate) recipient: u16,
     pub(crate) kind: MessageKind,
     pub(crate) body: Vec<u8>,
-    /// Hash of the exact authenticated envelope. A retry resends those same bytes.
     pub(crate) wire_hash: [u8; 32],
-    /// Hash of vault/payment/attempt/signers/sender/recipient/type and exact plaintext.
     pub(crate) transcript_hash: [u8; 32],
 }
 
@@ -203,7 +226,6 @@ impl OpenedMessage {
     }
 }
 
-/// Append-only opaque courier. Filenames are hashes of encrypted envelopes.
 pub struct Mailbox(PathBuf);
 
 impl Mailbox {
@@ -290,7 +312,6 @@ impl Mailbox {
     }
 }
 
-/// Nonces exist only in this object. Dropping it abandons an unsigned attempt.
 struct LiveAttempt {
     context: SessionContext,
     own_id: frost::Identifier,
@@ -298,7 +319,6 @@ struct LiveAttempt {
     commitments: Vec<frost::round1::SigningCommitments>,
 }
 
-/// Produced only after checking the exact candidate and every spend locally.
 pub struct ReviewedBatch {
     context: SessionContext,
     group_ak: [u8; 32],
@@ -317,8 +337,6 @@ impl ReviewedBatch {
     }
 }
 
-/// Recompute approval from a member's own intent, vault key, and exact PCZT bytes.
-/// No sender-provided sighash or alpha is trusted. All spends pass before a token exists.
 pub fn review_batch(
     context: &SessionContext,
     intent: &Intent,
@@ -588,8 +606,6 @@ impl LiveAttempt {
         &self.commitments
     }
 
-    /// Call only after independent full-candidate, seed/rk, and local sighash review.
-    /// Consumes every nonce before any fallible signature operation; a refusal burns the attempt.
     fn sign(
         &mut self,
         key: &frost::keys::KeyPackage,
@@ -642,15 +658,12 @@ impl LiveAttempt {
     }
 }
 
-/// Exact candidate, both members' commitments, and library-generated seeds.
-/// The wire body is encrypted as one Package message.
 pub struct PackagePayload {
     pub candidate: Vec<u8>,
     pub commitments: Vec<BTreeMap<frost::Identifier, frost::round1::SigningCommitments>>,
     pub seeds: Vec<[u8; 32]>,
 }
 
-/// Values the member app must present before it calls `publish_approved`.
 pub struct ReviewSummary {
     pub vault: [u8; 32],
     pub payment: [u8; 32],
@@ -679,7 +692,6 @@ impl ReviewedPackage {
         &self.summary
     }
 
-    /// Binds a displayed review to this exact member package; it is not member consent.
     pub fn review_token(&self) -> [u8; 32] {
         let mut hash = blake3::Hasher::new();
         hash.update(if self.summary.signers.len() == 2 { b"Loki_review_token_v1\0" } else { b"Loki_review_token_v2\0" });
@@ -802,7 +814,6 @@ impl PackagePayload {
     }
 }
 
-/// Parse one authenticated Commitment packet from the selected peer.
 pub fn commitments_from_message(
     context: &SessionContext,
     message: &OpenedMessage,
@@ -842,9 +853,6 @@ pub fn commitments_from_message(
     Ok(commitments)
 }
 
-/// Regtest member signing path: review, consume volatile nonces, seal exact shares, publish.
-/// A crash before the sealed outbox exists abandons the attempt; after that, `recover_share`
-/// can resend only the exact encrypted wire and cannot recreate nonces.
 pub struct SigningSession {
     context: SessionContext,
     approved_intent: Intent,
@@ -859,7 +867,6 @@ pub struct SigningSession {
     witness_pins: Option<WitnessPins>,
 }
 
-/// (relay public key, relay run ID, mailbox), fixed before commitments are published.
 pub type WitnessPins = [([u8; 32], [u8; 32], [u8; 32]); 2];
 
 pub fn valid_witness_pins(pins: WitnessPins) -> bool {
@@ -871,8 +878,6 @@ pub fn valid_witness_pins(pins: WitnessPins) -> bool {
             .all(|(key, run, mailbox)| *key != [0; 32] && *run != [0; 32] && *mailbox != [0; 32])
 }
 
-/// Operator-verifiable fingerprint of the exact ordered witness identities, not their URLs
-/// or access credentials. This stays stable when a route changes without replacing a witness.
 pub fn witness_fingerprint(pins: WitnessPins) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut hash = Sha256::new();
@@ -885,8 +890,6 @@ pub fn witness_fingerprint(pins: WitnessPins) -> [u8; 32] {
     hash.finalize().into()
 }
 
-/// The witness claim ID of one member's nonce: bound to the vault, the member and the
-/// nonce's public commitment, so each nonce can be claimed exactly once.
 pub fn nonce_claim_id(
     vault: &[u8; 32],
     member: &frost::Identifier,
@@ -900,9 +903,6 @@ pub fn nonce_claim_id(
     Ok(hash.finalize().into())
 }
 
-/// The record a signer claims at the nonce witnesses for one use of a nonce: the claim ID and
-/// a digest of what the nonce signs, so no sighash or randomizer reaches the relay operators.
-/// One derivation for `LocalSigner::sign_approve` and any signer that claims ahead of it.
 pub fn nonce_claim_record(cid: &[u8; 32], sighash: &[u8; 32], randomizer: &[u8; 32]) -> Vec<u8> {
     let mut digest = blake3::Hasher::new();
     digest.update(b"Loki_hosted_nonce_use_v1\0");
@@ -913,8 +913,6 @@ pub fn nonce_claim_record(cid: &[u8; 32], sighash: &[u8; 32], randomizer: &[u8; 
     record
 }
 
-/// Implementations must verify fresh signed receipts from two fixed, distinct relay
-/// identities. Operators must be checked separately. A duplicate claim is a refusal.
 pub trait NonceWitness {
     fn pins(&self) -> WitnessPins;
     fn claim(&mut self, cid: [u8; 32], encrypted_record: &[u8]) -> Result<(), String>;
@@ -1041,12 +1039,10 @@ impl SigningSession {
         self.live.commitments()
     }
 
-    /// The original pair authenticated by the sealed nonce record.
     pub fn witness_pins(&self) -> Option<WitnessPins> {
         self.witness_pins
     }
 
-    /// Save one exact ciphertext for each other roster member before delivery.
     pub fn publish_package_to_roster(
         &self,
         roster: &BTreeMap<u16, PublicIdentity>,
@@ -1182,8 +1178,6 @@ impl SigningSession {
         })
     }
 
-    /// Called only after the local member explicitly confirms `reviewed.summary()`.
-    /// A saved share can be republished byte-for-byte; a conflicting package is refused.
     pub fn publish_approved(
         &mut self,
         reviewed: ReviewedPackage,
@@ -1253,8 +1247,6 @@ impl SigningSession {
         self.store.publish(mailbox, passphrase)
     }
 
-    /// Relay-backed approval for a persisted attempt. Both claims must be fresh
-    /// before the local decision is fsynced and any signature share is computed.
     pub fn publish_approved_secured(
         &mut self,
         reviewed: ReviewedPackage,
@@ -1272,8 +1264,6 @@ impl SigningSession {
         )
     }
 
-    /// The caller supplies its certified roster. Validate its complete audience before
-    /// claiming nonces, then compute each share once and persist every recipient copy.
     pub fn publish_approved_secured_to_roster(
         &mut self,
         reviewed: ReviewedPackage,
@@ -1399,7 +1389,6 @@ impl SigningSession {
         self.store.abort()
     }
 
-    /// Replay the original package without reopening (or needing) the signer's nonce.
     pub fn republish_saved_package(
         root: &Path,
         context: &SessionContext,
@@ -1418,7 +1407,6 @@ impl SigningSession {
         Ok(true)
     }
 
-    /// A durable package can exist before the approval decision or share does.
     pub fn recover_share_if_saved(
         root: &Path,
         context: &SessionContext,
@@ -1444,7 +1432,6 @@ impl SigningSession {
         AttemptStore::reopen(root, context, own)?.publish(mailbox, passphrase)
     }
 
-    /// Read only the two original ciphertext copies; no nonce or signing call is possible.
     pub fn saved_share_wires(
         root: &Path,
         context: &SessionContext,
@@ -1504,8 +1491,6 @@ fn decode_share_body(
     Ok(shares)
 }
 
-/// Secret-free finisher step. Verifies the full candidate and both share batches,
-/// then applies valid signatures. The caller builds its own chain witness/anchor later.
 pub fn aggregate_and_apply(
     context: &SessionContext,
     intent: &Intent,
@@ -1616,7 +1601,6 @@ pub fn aggregate_and_apply(
     Ok((signer.finish(), reviewed.sighash, indices))
 }
 
-/// Member-local monotone record. A reopened `Started` record has no nonce and is abandoned.
 struct AttemptStore {
     dir: MemberDir,
 }
@@ -1686,7 +1670,6 @@ impl AttemptStore {
                 .read_sealed("nonces.sealed", passphrase)
                 .map_err(|e| e.to_string())?,
         );
-        // Older records are not bound to their exact signing context.
         if raw.len() < 195 + 32 || raw[0] != 3 {
             return Err("invalid sealed nonce record".into());
         }
@@ -1879,7 +1862,6 @@ impl AttemptStore {
             .collect()
     }
 
-    /// Save exact encrypted share envelope bytes before their first delivery.
     fn save_share(
         &self,
         wires: &[Vec<u8>],
@@ -1998,5 +1980,23 @@ impl AttemptStore {
             .and_then(|f| f.sync_all())
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod hosted_body_tests {
+    use super::*;
+
+    #[test]
+    fn hosted_bodies_carry_one_to_eight_whole_values_and_nothing_else() {
+        let items = vec![vec![1u8; 32], vec![2u8; 5]];
+        let body = encode_hosted(&items).unwrap();
+        assert_eq!(decode_hosted(&body).unwrap(), vec![&items[0][..], &items[1][..]]);
+        assert!(encode_hosted(&[]).is_err());
+        assert!(encode_hosted(&vec![vec![0u8]; MAX_SPENDS + 1]).is_err());
+        assert!(decode_hosted(&[body.clone(), vec![0]].concat()).is_none());
+        assert!(decode_hosted(&body[..body.len() - 1]).is_none());
+        assert!(decode_hosted(&[0]).is_none());
+        assert!(decode_hosted(&[MAX_SPENDS as u8 + 1, 0, 0]).is_none());
     }
 }

@@ -1,8 +1,3 @@
-//! FROST viewing-key derivation from ZIP 2005 (2026.8.0).
-//!
-//! This path is limited to regtest until an independent implementation checks its
-//! vectors and the key and backup flow is reviewed. The ZIP is still Proposed.
-
 use blake2b_simd::Params;
 use ff::{FromUniformBytes, PrimeField};
 use orchard::keys::FullViewingKey;
@@ -15,7 +10,6 @@ const NK_DOMAIN: u8 = 0x07;
 const QSK_DOMAIN: u8 = 0x0c;
 const RIVK_EXT_DOMAIN: u8 = 0x0d;
 
-/// The exact ZIP 2005 derivation this vault state commits to.
 pub const VERSION: &str = "zip2005-use-qsk-2026.8.0";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -34,8 +28,6 @@ fn expand(key: &[u8; 32], domain: u8, data: &[u8]) -> [u8; 64] {
     *state.finalize().as_array()
 }
 
-/// Derive an Orchard-protocol FVK from a FROST DKG group key and the group's
-/// privately agreed `sk`, using ZIP 2005's `use_qsk = true` branch.
 pub fn frost_viewing_key(
     group_ak: &[u8; 32],
     group_sk: &[u8; 32],

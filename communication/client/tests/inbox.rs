@@ -291,8 +291,6 @@ fn incoming_crash_capture_atomic_missing_position_survives_restart() {
     );
     assert_eq!(pending[0].source_hash, missing.hash);
 
-    // Scripted directory input, not loki-relay-server. The stale page starts the
-    // capture transaction; compare-and-set must roll it back onto cursor 4.
     let old_cursor = cursor(&store, &route);
     assert_eq!(old_cursor, Some(4));
     let journal_before = store.recover_journal(&route, 0, 100).unwrap();
@@ -328,7 +326,6 @@ fn incoming_crash_capture_atomic_missing_position_survives_restart() {
     wires_match(&store, &later);
     assert!(store.saved_object(&missing.hash).unwrap().is_none());
 
-    // A signed receipt with one flipped signature byte is not a Stored capture.
     let rejected = framed(5);
     let mut forged = receipt(&route, rejected.hash, rejected.wire.len() as u64, 5);
     let end = forged.len() - 1;
@@ -383,8 +380,6 @@ fn incoming_crash_capture_atomic_missing_position_survives_restart() {
 
 #[test]
 fn incoming_crash_capture_atomic_sqlite_full() {
-    // The writing connection must lower max_page_count to its own page_count and
-    // observe SQLITE_FULL on the ciphertext insert. That case lives in the library.
     library_case("store::incoming_crash_tests::incoming_crash_capture_sqlite_full");
 }
 
@@ -432,7 +427,6 @@ fn expect_primary_key(result: rusqlite::Result<usize>, table: &str) {
 
 #[test]
 fn incoming_schema() {
-    // These pins are scripted directory input, not loki-relay-server.
     let route_a = route();
     let mut route_b = route();
     route_b.mailbox = [4; 32];
@@ -817,7 +811,6 @@ struct ScriptedPeer {
 }
 
 impl ScriptedPeer {
-    /// Loopback fixture for one mailbox. This is not loki-relay-server.
     fn start(first: Vec<u8>, later: Vec<u8>, objects: Vec<(Id32, Vec<u8>)>, missing: Id32) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -1011,8 +1004,6 @@ fn member_config(port: u16) -> (ClientConfig, loki_relay_client::AuthenticatedDe
 
 #[test]
 fn incoming_crash_download_recovery_restarts_and_caches_before_retire() {
-    // Scripted loopback HTTP peer, not loki-relay-server. The first two object
-    // reads are a missing response. Restart must keep cursor 2 and the task.
     let route = route();
     let first = framed(1);
     let missing = framed(2);
@@ -1115,7 +1106,6 @@ fn incoming_crash_download_recovery_restarts_and_caches_before_retire() {
 
 #[test]
 fn incoming_crash_download_recovery_sample_cap_lets_later_entry_progress() {
-    // Directory pages, not loki-relay-server. Samples are untrusted diagnostics.
     let route = route();
     let root = recovery_root("sample-cap");
     let mut store = ClientStore::open(&root, &support::roster(), 2).unwrap();
@@ -1234,8 +1224,6 @@ fn incoming_crash_download_recovery_sample_cap_lets_later_entry_progress() {
 
 #[test]
 fn incoming_crash_download_recovery_budget_keeps_outstanding_task() {
-    // The library case lowers the configured page budget. It is not SQLITE_FULL
-    // and it is not SIGKILL. The wrapper only checks that one real case passed.
     library_case(
         "store::incoming_crash_tests::download_recovery_budget_keeps_pending_and_stops_admission",
     );
@@ -1329,7 +1317,6 @@ fn orphan_chunk(roster: &loki_relay_protocol::types::Roster, n: u16, marker: &[u
 }
 
 fn forged_sender_object(roster: &loki_relay_protocol::types::Roster, marker: &[u8]) -> Object {
-    // Alice is the claimed sender. Bob's key produces the signature. sign_message refuses this.
     let body = message_body(roster, 1, [0xF1; 32], Vec::new(), marker.to_vec());
     let encoded = encode_message(&body).unwrap();
     let mut input = b"Loki_Relay_Message_v1\0".to_vec();
@@ -1428,7 +1415,6 @@ fn assert_no_ack_or_original(store: &ClientStore) {
 }
 
 fn journal_has_no_body_digest(store: &ClientStore, route: &RelayRoute) {
-    // A null digest is not proof that plaintext is absent. Callers also scan artifacts.
     let mut after = 0u64;
     let mut seen = false;
     loop {
@@ -1468,7 +1454,6 @@ fn collect_staged(store: &ClientStore) -> Vec<loki_relay_client::StagedSource> {
 
 #[test]
 fn staged_auth() {
-    // Directory receipts use the scripted pin. This peer is not loki-relay-server.
     let roster = support::roster();
     let alice = support::identity(1);
     let bob = support::identity(2);
@@ -1537,7 +1522,6 @@ fn staged_auth() {
     assert_no_ack_or_original(&store);
     assert_marker_absent(&root, &marker);
 
-    // This digest matches no opened or committed body. It is a missing reference, not a cycle.
     let missing_ref = MessageRef {
         sender: 3,
         message: [32; 32],
@@ -1594,8 +1578,6 @@ fn staged_auth() {
 
 #[test]
 fn staged_auth_synthetic_dependency_cycle() {
-    // Simulated graph metadata. The signed bodies have empty prerequisites and do not
-    // contain a SHA-256 cycle. The edges inserted below are exact digest back-edges.
     let roster = support::roster();
     let alice = support::identity(1);
     let bob = support::identity(2);
@@ -1695,9 +1677,6 @@ fn staged_auth_synthetic_dependency_cycle() {
 
 #[test]
 fn staged_auth_orphan_chunks_leave_pending_count_zero() {
-    // 128 sealed orphan chunks exercise the pending-slot width. They do not fill the
-    // 512 MiB storage budget, and this case does not claim that saturation row.
-    // The peer is scripted directory input, not loki-relay-server.
     let roster = support::roster();
     let alice = support::identity(1);
     let route = route();
@@ -1734,9 +1713,6 @@ fn staged_auth_orphan_chunks_leave_pending_count_zero() {
 
 #[test]
 fn staged_auth_mixed_pending_admission() {
-    // Outgoing recipient rows and incoming groups share the 128 cap. Orphan ciphertext
-    // is not the filler, and this case does not saturate the storage budget.
-    // The peer is scripted directory input, not loki-relay-server.
     let roster = support::roster();
     let alice = support::identity(1);
     let bob = support::identity(2);
@@ -1810,8 +1786,6 @@ fn staged_auth_mixed_pending_admission() {
     }));
     assert_eq!(store.pending_transfer_count().unwrap(), 128);
 
-    // Incoming groups now occupy the two seats left by 126 outgoing rows.
-    // A new Alice outbox must be refused in that direction as well.
     let blocked_body = message_body(&roster, 1, [0xE4; 32], Vec::new(), marker.to_vec());
     let blocked = prepare_outbox(&alice, &roster, &blocked_body).unwrap();
     let blocked_request = [0xE5; 32];

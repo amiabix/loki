@@ -8,8 +8,6 @@ class AppDelegate: FlutterAppDelegate {
     return super.applicationShouldTerminate(sender)
   }
 
-  // Associated-domain HTTPS links only. The channel keeps a claim for the pinned coordinator and
-  // the wallet shows it in Join after unlock; a link never pairs, joins or approves anything.
   override func application(_ application: NSApplication, continue userActivity: NSUserActivity,
                    restorationHandler: @escaping ([any NSUserActivityRestoring]) -> Void) -> Bool {
     if userActivity.activityType == NSUserActivityTypeBrowsingWeb, let url = userActivity.webpageURL {

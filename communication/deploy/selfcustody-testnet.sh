@@ -1,24 +1,4 @@
 #!/usr/bin/env bash
-# Single-host self-custody bringup for the v2 (frostd) stack on main.
-#
-# Stands up the public-roster web coordinator plus N member apps that self-register,
-# then drives a t-of-n DKG ceremony to `active` and prints the shared testnet address.
-# Each member holds its own share; the coordinator only ever sees public roster data.
-#
-# This is NOT the owned-relay operator toolkit (bringup.sh) — main's ceremony speaks
-# frostd, not the owned relays. Point FROSTD_URL at a reachable frostd. frostd must be
-# https off loopback (transport::require_tls_off_loopback); for a remote plaintext dev
-# relay, forward it to loopback first, e.g. `ssh -N -L 2744:localhost:2744 host` and use
-# the default http://127.0.0.1:2744.
-#
-# Env:
-#   FROSTD_URL   frostd base url           (default http://127.0.0.1:2744)
-#   LWD_URL      lightwalletd base url     (default https://testnet.zec.rocks:443)
-#   NETWORK      vault network             (default testnet)
-#   MEMBERS      member count n            (default 3)
-#   THRESHOLD    approvals t               (default 2)
-#   WEB_PORT     coordinator port          (default 3001)
-#   BASE_PORT    first member port         (default 3601)
 set -euo pipefail
 
 if [[ $# != 1 || $1 != /* ]]; then
@@ -57,16 +37,13 @@ member_bin="$core/target/release/loki_member_app"
 
 echo "== coordinator on :$web_port =="
 private_output "$root/coordinator.log"
-grants='{'
 for n in $(seq 1 "$members"); do
   grant=$(openssl rand -hex 32)
   onboarding[n]=$grant
   digest=$(printf '%s' "$grant" | openssl dgst -sha256 -r)
-  grants+="\"${digest%% *}\":$n,"
+  ( cd "$web" && LOKI_REGISTRY="$root/registry.json" node scripts/grants.ts register "${digest%% *}" --slot "$n" )
 done
-grants="${grants%,}}"
 ( cd "$web" && export HOSTNAME=localhost PORT="$web_port" PUBLIC_PORT="$web_port" LOKI_REGISTRY="$root/registry.json" \
-  LOKI_ONBOARDING_GRANTS="$grants" \
   && exec node server.js >"$root/coordinator.log" 2>&1 ) &
 echo $! >> "$root/pids"
 for _ in {1..50}; do curl -sf --max-time 1 "$coordinator/api/members" >/dev/null && break; sleep 0.2; done
@@ -91,7 +68,6 @@ for n in $(seq 1 "$members"); do
 done
 unset onboarding grant
 
-# Readiness means the local API is ready, not that background registration has finished.
 registered=0
 for _ in {1..75}; do
   registered=$(curl -sf --max-time 1 "$coordinator/api/members" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["slots"]))' 2>/dev/null) || registered=0
@@ -101,11 +77,10 @@ done
 [[ $registered == "$members" ]] || { echo "roster has $registered of $members members" >&2; exit 1; }
 echo "roster: $registered/$members members self-registered"
 
-api() { # api <member> <method> <path> [json-body]
+api() {
   local member=$1 method=$2 path=$3 body=${4:-}
   local args=(-X "$method")
   if [[ -n $body ]]; then args+=(-H 'content-type: application/json' -d "$body"); fi
-  # curl reads the bearer from stdin, never from its process arguments.
   printf 'x-loki-token: %s\n' "${tokens[member]}" | curl -q -s --noproxy '*' --max-time "$([[ $path == /api/agree ]] && echo 130 || echo 30)" \
     -H @- "${args[@]}" "http://127.0.0.1:${ports[member]}$path"
 }

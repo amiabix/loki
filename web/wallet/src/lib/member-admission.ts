@@ -27,20 +27,18 @@ export function grantDigest(value: unknown): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
-function onboardingGrants(): [string, number | null][] {
-  const data: unknown = JSON.parse(process.env.LOKI_ONBOARDING_GRANTS ?? "{}");
-  if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error("invalid onboarding configuration");
-  const grants = Object.entries(data);
-  if (grants.length > MAX_SLOT || grants.some(([key]) => !DIGEST.test(key))) throw new Error("invalid onboarding configuration");
-  return grants.map(([key, value]) => [key, value === null ? null : registrationSlot(value)]);
+export type RegisteredGrants = Record<string, number | null>;
+
+function onboardingGrants(registered: RegisteredGrants): [string, number | null][] {
+  return Object.entries(registered);
 }
 
-export function grantedSlot(digest: string): number | undefined {
-  const found = onboardingGrants().find(([key]) => key === digest);
+export function grantedSlot(digest: string, registered: RegisteredGrants): number | undefined {
+  const found = onboardingGrants(registered).find(([key]) => key === digest);
   if (!found) throw new Error("a valid onboarding grant is required");
   return found[1] ?? undefined;
 }
 
-export function otherPinnedSlots(digest: string): number[] {
-  return onboardingGrants().flatMap(([key, slot]) => key !== digest && slot !== null ? [slot] : []);
+export function otherPinnedSlots(digest: string, registered: RegisteredGrants): number[] {
+  return onboardingGrants(registered).flatMap(([key, slot]) => key !== digest && slot !== null ? [slot] : []);
 }

@@ -5,18 +5,17 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import * as members from '../src/lib/members.ts';
+import { admitGrant } from './grants.mjs';
 
 const origin = 'http://localhost:3001';
 function grant(slot = null) {
   const onboarding_grant = randomBytes(32).toString('hex');
-  const digest = createHash('sha256').update(onboarding_grant).digest('hex');
-  process.env.LOKI_ONBOARDING_GRANTS = JSON.stringify({ ...JSON.parse(process.env.LOKI_ONBOARDING_GRANTS ?? '{}'), [digest]: slot });
+  admitGrant(createHash('sha256').update(onboarding_grant).digest('hex'), slot);
   return { onboarding_grant };
 }
 function cleanup(dir) {
   rmSync(dir, { recursive: true, force: true });
   delete process.env.LOKI_REGISTRY;
-  delete process.env.LOKI_ONBOARDING_GRANTS;
 }
 function relayProof(d, { challenge, relay_challenge_pubkey }) {
   const publicKey = createPublicKey({ key: { kty: 'OKP', crv: 'X25519', x: Buffer.from(relay_challenge_pubkey, 'hex').toString('base64url') }, format: 'jwk' });
@@ -34,7 +33,6 @@ function device(slot, { advertise_url = 'http://127.0.0.1:3601' } = {}) {
     authorization: sign(null, Buffer.from(device_pubkey, 'hex'), identity.privateKey).toString('hex') };
   return { input, key, identity, relay };
 }
-// The same identity on a new device: a fresh device key, authorized by the identity's key.
 function newDevice(d) {
   const key = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
   const jwk = key.publicKey.export({ format: 'jwk' });
@@ -85,24 +83,20 @@ test('a frostd-only in-browser signer enrolls without an advertise_url, beside n
   const dir = mkdtempSync(join(tmpdir(), 'loki-roster-frostd-'));
   process.env.LOKI_REGISTRY = join(dir, '.access.json');
   try {
-    // No advertise_url: the browser signer has no inbound peer HTTP (peer-over-frostd).
     const browser = device(undefined, { advertise_url: null });
     const challenge = await members.issueRegistrationChallenge({ ...browser.input, ...grant() }, origin);
     const member = await members.registerMember(response(browser, challenge), origin);
     assert.equal(member.slot, 1);
     assert.equal(member.advertise_url, '', 'frostd-only member stores an empty advertise_url');
     assert.deepEqual(members.memberById(1), member);
-    // A native member that still advertises a loopback origin registers alongside it.
     const native = device();
     const nativeChallenge = await members.issueRegistrationChallenge({ ...native.input, ...grant() }, origin);
     const nativeMember = await members.registerMember(response(native, nativeChallenge), origin);
     assert.equal(nativeMember.slot, 2);
     assert.equal(nativeMember.advertise_url, 'http://127.0.0.1:3601');
-    // response() signs the original v1 transcript for both the browser and the headless member.
     assert.equal(Object.hasOwn(member, 'lokisigner_url'), false);
     assert.equal(Object.hasOwn(nativeMember, 'lokisigner_url'), false);
     assert.equal(members.slots().length, 2);
-    // A non-empty advertise_url that is not a valid origin is still rejected.
     await assert.rejects(members.issueRegistrationChallenge(device(undefined, { advertise_url: 'not-an-origin' }).input, origin));
   } finally { cleanup(dir); }
 });
@@ -214,7 +208,6 @@ test('pairing reserves one slot, claims once, and pins one device to one identit
     await assert.rejects(members.issuePairingChallenge({ slot: 1, ...competing }, origin), /slot/);
     const next = await members.issuePairingChallenge(grant(), origin);
     assert.equal(next.slot, 2);
-    // A different identity cannot reuse the same device, even with valid authorization.
     const other = generateKeyPairSync('ed25519');
     const moved = { ...d.input, slot: 2, signing_pubkey: other.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('hex'),
       authorization: sign(null, Buffer.from(d.input.device_pubkey, 'hex'), other.privateKey).toString('hex') };
@@ -224,7 +217,6 @@ test('pairing reserves one slot, claims once, and pins one device to one identit
     assert.deepEqual(await reloaded.registerMember(response(d, renewed), origin), member);
     const rotated = device(1);
     await assert.rejects(members.issueRegistrationChallenge({ ...rotated.input, signing_pubkey: d.input.signing_pubkey }, origin));
-    // The same identity may move to a new device; its slot and relay key stay pinned.
     const moved2 = newDevice(d);
     await assert.rejects(members.issueRegistrationChallenge({ ...moved2.input, slot: 2 }, origin), /slot/);
     await assert.rejects(members.issueRegistrationChallenge({ ...moved2.input, relay_pubkey: randomBytes(32).toString('hex') }, origin), /relay key/);
@@ -237,7 +229,6 @@ test('pairing reserves one slot, claims once, and pins one device to one identit
     const { devices } = JSON.parse(readFileSync(process.env.LOKI_REGISTRY));
     assert.deepEqual(devices, [{ slot: 1, signing_pubkey: d.input.signing_pubkey, device_pubkey: moved2.input.device_pubkey,
       generation: 2, retired: [d.input.device_pubkey] }]);
-    // The new device key is now bound to this identity; another identity still cannot take it.
     const thief = generateKeyPairSync('ed25519');
     await assert.rejects(members.issueRegistrationChallenge({ ...moved2.input, slot: undefined, signing_pubkey: thief.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('hex'),
       authorization: sign(null, Buffer.from(moved2.input.device_pubkey, 'hex'), thief.privateKey).toString('hex') }, origin), /device/);
@@ -304,7 +295,6 @@ test('a binding saved before a crashed roster write still reserves and recovers 
   try {
     const d = device();
     const { signing_pubkey, device_pubkey, relay_pubkey, advertise_url } = d.input;
-    // Legacy crash after the binding write but before the roster write.
     writeFileSync(process.env.LOKI_REGISTRY + '.devices', JSON.stringify([{ slot: 1, signing_pubkey, device_pubkey }]));
     const first = { slot: 1, signing_pubkey, relay_pubkey, advertise_url };
     const pair = await members.issuePairingChallenge(grant(), origin);

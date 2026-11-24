@@ -26,9 +26,6 @@ use frost::keys::{KeyPackage, PublicKeyPackage};
 use frost::{Identifier, PallasBlake2b512};
 use std::collections::BTreeMap;
 
-/// Step 1, run by each helper. `helpers` is the full helper set (threshold-many identifiers,
-/// including this helper itself); `lost` is the member being repaired. Returns one [`Delta`]
-/// to deliver to each helper in the set.
 pub fn helper_part1(
     helpers: &[Identifier],
     helper_key_package: &KeyPackage,
@@ -43,16 +40,10 @@ pub fn helper_part1(
     .map_err(|e| format!("repair part1: {e}"))
 }
 
-/// Step 2, run by each helper: sum the deltas it received — one from every helper, including
-/// its own — into the single sigma it sends to the member being repaired.
 pub fn helper_part2(deltas: &[Delta]) -> Sigma {
     frost::keys::repairable::repair_share_part2(deltas)
 }
 
-/// Step 3, run by the member being repaired: rebuild its [`KeyPackage`] from the helpers'
-/// sigmas, then check the rebuilt signing share against the group's public verifying share for
-/// this identifier. A share that does not match the public commitment is rejected, so a
-/// member never trusts a botched or malicious repair.
 pub fn repaired_part3(
     sigmas: &[Sigma],
     identifier: Identifier,
@@ -74,8 +65,6 @@ pub fn repaired_part3(
 mod tests {
     use super::*;
 
-    /// Deal a t-of-n vault, "lose" one member's share, and have `threshold` other members run
-    /// the ceremony. The rebuilt share must equal the dealt one (so it signs for the group).
     fn repair(threshold: u16, members: u16, lost_id: u16) {
         let (shares, public) = frost::keys::generate_with_dealer(
             members,
@@ -90,7 +79,6 @@ mod tests {
             .collect();
         let lost = Identifier::try_from(lost_id).unwrap();
 
-        // Helpers: the first `threshold` members other than the lost one.
         let helpers: Vec<Identifier> = kps
             .keys()
             .copied()
@@ -99,13 +87,11 @@ mod tests {
             .collect();
         assert_eq!(helpers.len(), threshold as usize);
 
-        // Part 1: each helper produces a delta for every helper (routed helper -> helper).
         let part1: BTreeMap<Identifier, BTreeMap<Identifier, Delta>> = helpers
             .iter()
             .map(|h| (*h, helper_part1(&helpers, &kps[h], lost).unwrap()))
             .collect();
 
-        // Part 2: helper `l` collects the delta addressed to it from every helper `j`.
         let sigmas: Vec<Sigma> = helpers
             .iter()
             .map(|l| {
@@ -114,7 +100,6 @@ mod tests {
             })
             .collect();
 
-        // Part 3: the lost member rebuilds + verifies, and the share matches the dealt one.
         let repaired = repaired_part3(&sigmas, lost, &public).unwrap();
         assert_eq!(
             repaired.signing_share(),
@@ -135,8 +120,6 @@ mod tests {
 
     #[test]
     fn deltas_and_sigmas_survive_the_wire() {
-        // The secret additive shares serialize for the encrypted member channel and reload
-        // byte-identically.
         let (shares, _public) = frost::keys::generate_with_dealer(
             3,
             2,
@@ -173,14 +156,11 @@ mod tests {
         let lost = Identifier::try_from(3u16).unwrap();
         let h: Vec<Identifier> = kps.keys().copied().filter(|id| *id != lost).take(2).collect();
 
-        // (a) A sub-threshold helper set is refused at step 1 — the ceremony cannot even start.
         assert!(
             helper_part1(&h[..1], &kps[&h[0]], lost).is_err(),
             "fewer than `threshold` helpers must be rejected at part 1"
         );
 
-        // (b) Right helpers, but a CORRUPTED sigma (one helper omits the other's delta): part 3's
-        // check against the public verifying share refuses the bad share instead of trusting it.
         let part1: BTreeMap<Identifier, BTreeMap<Identifier, Delta>> = h
             .iter()
             .map(|x| (*x, helper_part1(&h, &kps[x], lost).unwrap()))
@@ -189,7 +169,7 @@ mod tests {
             .iter()
             .map(|l| helper_part2(&h.iter().map(|j| part1[j][l]).collect::<Vec<_>>()))
             .collect();
-        sigmas[0] = helper_part2(&[part1[&h[0]][&h[0]]]); // only one of the two required deltas
+        sigmas[0] = helper_part2(&[part1[&h[0]][&h[0]]]);
         assert!(
             repaired_part3(&sigmas, lost, &public).is_err(),
             "a corrupted sigma must be caught by the public-verifying-share check"

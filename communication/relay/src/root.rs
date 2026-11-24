@@ -163,7 +163,6 @@ impl Root {
 
 impl Drop for Root {
     fn drop(&mut self) {
-        // Release explicitly when a spawned child temporarily inherits the descriptor.
         let _ = self._lock.unlock();
     }
 }

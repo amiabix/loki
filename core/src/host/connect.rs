@@ -1,4 +1,3 @@
-//! One explicit local decision per browser response. There is no launch-wide GUI token.
 use std::{
     collections::HashMap,
     convert::Infallible,
@@ -21,10 +20,8 @@ use serde_json::json;
 
 use super::{new_token, state::Shared};
 
-// Leave a margin below the browser's response timeout, even if the main thread is busy.
 const DEADLINE: Duration = Duration::from_secs(110);
 const COOLDOWN: Duration = Duration::from_secs(5);
-// The wallet polls every 1.5 s. Allow for browsers throttling background timers to one minute.
 #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
 const RECENT_ACTIVITY: Duration = Duration::from_secs(90);
 
@@ -41,8 +38,6 @@ impl ConnectAttempt {
     }
 }
 
-// The body owns this guard, not the worker. A dropped HTTP stream closes the native prompt
-// even while the worker is in AppKit. The worker can never mint a token on its own.
 struct ResponseAttempt(Arc<ConnectAttempt>);
 
 impl Drop for ResponseAttempt {
@@ -151,12 +146,10 @@ pub(super) async fn request(State(st): State<Shared>, member: Result<Json<Member
     let registered = st.registration.read().await.as_ref().is_some_and(|r|
         member.slot == r.slot && member.signing_pubkey == r.signing_pubkey && member.relay_pubkey == r.relay_pubkey);
     if !registered { return StatusCode::TOO_EARLY.into_response(); }
-    // Lock must either cancel this attempt or prevent it from starting.
     let session = st.session.read().await;
     if session.is_none() { return StatusCode::FORBIDDEN.into_response(); }
     let Some(attempt) = tabs.begin() else { return StatusCode::TOO_MANY_REQUESTS.into_response(); };
     drop(session);
-    // A short code is for human comparison, not an HTTP credential or a lookup key.
     let code = format!("{:06}", (OsRng.next_u64() % 1_000_000));
     let worker = {
         let (ask, origin, code, attempt) = (tabs.ask.clone(), tabs.origin.clone(), code.clone(), attempt.clone());
@@ -169,7 +162,6 @@ pub(super) async fn request(State(st): State<Shared>, member: Result<Json<Member
         let attempt = &response_attempt.0;
         let approved = matches!(tokio::time::timeout_at(attempt.deadline.into(), worker).await, Ok(Ok(true)));
         let token = approved.then(|| st.wallet_tabs.as_ref().unwrap().issue(attempt)).flatten();
-        // Retain the drop guard even if the stream is discarded without polling this future.
         drop(response_attempt);
         line(token.map_or_else(|| json!({ "refused": true }), |token| json!({ "token": token })))
     });
@@ -322,7 +314,6 @@ mod tests {
                 assert_eq!(reply.json::<Value>().await.unwrap(), json!({"error": "invalid process token"}));
             }
         }
-        // The registration still matches, but a locked profile cannot start a fresh dialog.
         empty(app.connect().header("origin", ORIGIN).send().await.unwrap(), StatusCode::FORBIDDEN).await;
         assert!(prompts.try_recv().is_err());
 
@@ -386,7 +377,7 @@ mod tests {
         app.registered().await;
         let response = app.connect().header("origin", ORIGIN).send().await.unwrap();
         let code = tokio::time::timeout(Duration::from_secs(1), prompts.recv()).await.unwrap().unwrap();
-        app.tabs().revoke_all(); // The same operation the LokiSigner menu invokes.
+        app.tabs().revoke_all();
         allow.send(true).unwrap();
         let frames: Vec<Value> = response.text().await.unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
         assert_eq!(frames, [json!({"code": code}), json!({"refused": true})]);
@@ -398,7 +389,7 @@ mod tests {
         for ask in [Arc::new(|_: &str, _: &str, _: &ConnectAttempt| false) as LocalConnect,
             Arc::new(|_, _, attempt| {
                 while !attempt.cancelled() { std::thread::sleep(Duration::from_millis(5)); }
-                true // An answer after the deadline may not issue anything.
+                true
             })] {
             let app = Host::start(Some(ask), Duration::from_millis(100), Duration::from_secs(5)).await;
             app.registered().await;

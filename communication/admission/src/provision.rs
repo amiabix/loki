@@ -98,7 +98,6 @@ impl OwnedProvisioner {
                 .is_ok()
         };
         let elapsed = started.elapsed();
-        // Round up so time in flight cannot eat into the whole-second retry delay.
         let finished = now
             .saturating_add(elapsed.as_secs())
             .saturating_add(u64::from(elapsed.subsec_nanos() != 0));
@@ -131,8 +130,6 @@ impl OwnedProvisioner {
         .await
         .map_err(|_| AdmissionError::Storage)??;
 
-        // Reserve a slot for each kind and rotate its first relay. Give spare
-        // slots to relays not in the batch before doubling up on any one relay.
         let mut pending = pending.into_iter();
         let mut retirements = retirements.into_iter();
         let mut batch: Vec<_> = pending

@@ -1,26 +1,4 @@
 #!/usr/bin/env bash
-# Testnet end to end: a member moves to a new device with its recovery words and exported
-# backup, re-registers with the coordinator to its old slot with a new device key, and signs a
-# payment that is broadcast and confirmed. Also shows that a member started against an
-# unreachable coordinator keeps serving its local API.
-#
-#   1. Three members register with the coordinator (slots 1..3) and create a 2-of-3 vault.
-#      Their output goes to log files, so none of them mints recovery words at startup.
-#      Members 1 and 2 set up recovery before the vault; member 3 only after it is active,
-#      and still ends up with a recovery backup.
-#   2. Member 3 exports its backup, is stopped, and its data directory is deleted.
-#   3. A fresh profile on a new data directory, started WITHOUT --coordinator-url, restores
-#      from the words and the exported file, then restarts with --coordinator-url and
-#      re-registers to slot 3 under the same identity with a new device key.
-#   4. Member 1 proposes a payment; the restored member 3 approves and signs it; it is
-#      broadcast and confirms.
-#   5. A fourth member started against an unreachable coordinator serves its local API.
-#
-# Run in a private terminal: you will confirm recovery for three disposable members and
-# re-enter member 3's original words during the restore. Do not record the terminal session.
-# Needs a running frostd and the web app as the coordinator. Configure three grants
-# pinned to slots 1..3 (see web/wallet/README.md), and set LOKI_ONBOARDING_GRANT_1,
-# LOKI_ONBOARDING_GRANT_2, and LOKI_ONBOARDING_GRANT_3 to the respective bearers.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -63,7 +41,6 @@ api_raw() {
     curl -sS -m 600 "http://127.0.0.1:$((base_port+i))$path" -H "X-Loki-Token: $token" -w '\n%{http_code}'
   fi
 }
-# Body of a 2xx reply; fails the call otherwise.
 api() {
   local out code
   out="$(api_raw "$@")"
@@ -74,7 +51,6 @@ api() {
 }
 passphrase() { printf 'testnet restore member %s' "$1"; }
 
-# start <slot> <data dir> [extra args...]: start a member on BASE_PORT+slot and save its token.
 start() {
   local i="$1" data="$2" token=''
   shift 2
@@ -96,7 +72,6 @@ start() {
   printf '%s' "$token" >"$tmp/$i.token"
 }
 stop() { kill "${pid[$1]}"; wait "${pid[$1]}" 2>/dev/null || true; unset "pid[$1]"; }
-# with_coordinator <slot> <data dir>: start registering with the coordinator to that slot.
 with_coordinator() {
   local i="$1" data="$2" pass="$tmp/$1.pass"
   [[ -f "$pass" ]] || { passphrase "$i" >"$pass"; chmod 600 "$pass"; }
@@ -230,12 +205,10 @@ approve() {
   echo "member $i approved"
 }
 proposer_has() { api 1 GET "/api/payments?vault=$vault" | jq -e --arg attempt "$attempt" "any(.payments[]; .attempt == \$attempt and ($1))" >/dev/null; }
-# The restored member approves first, so it joins the proposer in the signing group.
 approve 3
 wait_for 'proposer records member 3' 60 proposer_has '.approvals == [3]'
 approve 1
 wait_for 'signing group [1,3]' 60 proposer_has '.signers == [1,3]'
-# The proposer sends on its own once the signatures combine, after sealing a copy to every member.
 wait_for 'proposer did not send' 600 proposer_has '.phase == "broadcast" or .phase == "confirmed"'
 txid="$(api 1 GET "/api/payments?vault=$vault" | jq -er --arg attempt "$attempt" '.payments[] | select(.attempt == $attempt) | .txid')" || fail txid
 echo "broadcast txid: $txid (signed by members 1 and restored 3)"

@@ -1,9 +1,3 @@
-//! The vault's Ironwood balance and history as reported by lightwalletd compact blocks, for a
-//! signer with no wallet database (the in-browser signer). Trial decryption is zcash_client_backend's
-//! `scan_block`, the scanner the native wallet runs through `scan_cached_blocks`. Spends are
-//! found by matching every compact action's nullifier against the vault's own notes, so the
-//! scan state is just those notes plus the last block scanned.
-
 use std::collections::BTreeMap;
 
 use orchard::keys::FullViewingKey;
@@ -19,8 +13,6 @@ use zcash_primitives::block::{BlockHash, BlockHeader};
 
 use crate::network::VaultNetwork;
 
-/// Validate the fields Zakura's scanner reads through infallible accessors. If a header
-/// was supplied, normalize to its hashes so all later checks use the same representation.
 pub fn validate_compact_block(block: &mut CompactBlock) -> Result<(), String> {
     if block.height >= u64::from(u32::MAX) {
         return Err("compact block height out of range".into());
@@ -53,7 +45,6 @@ pub fn validate_compact_block(block: &mut CompactBlock) -> Result<(), String> {
     Ok(())
 }
 
-/// Check commitment-tree arithmetic before invoking the underlying scanner.
 pub fn tree_sizes(prior: &BlockMetadata) -> [Option<u32>; 3] {
     [prior.sapling_tree_size(), prior.orchard_tree_size(), prior.ironwood_tree_size()]
 }
@@ -85,38 +76,29 @@ pub fn checked_next_tree_sizes(block: &CompactBlock, sizes: [Option<u32>; 3]) ->
     Ok(next)
 }
 
-/// One note the vault received.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Received {
     pub height: u32,
     pub txid: String,
     pub value_zat: u64,
-    /// Change back to the vault (internal scope), not an incoming payment.
     pub change: bool,
-    /// The transaction that spent it and its height, once seen on chain.
     pub spent_in: Option<(String, u32)>,
 }
 
-/// What one transaction did to the vault, from the chain alone.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct TxEffect {
     pub txid: String,
     pub height: u32,
-    /// Received at the vault's external address.
     pub received_zat: u64,
-    /// Returned to the vault as change.
     pub change_zat: u64,
-    /// Value of the vault notes this transaction spent.
     pub spent_zat: u64,
 }
 
 pub struct ChainScan {
     network: VaultNetwork,
     keys: ScanningKeys<u32, (u32, zip32::Scope)>,
-    /// Keyed by each note's spend nullifier.
     notes: BTreeMap<[u8; 32], Received>,
     prior: Option<BlockMetadata>,
-    /// Where a fresh scan starts: the vault's birth height.
     birth: u32,
     source: Option<String>,
 }
@@ -127,8 +109,6 @@ impl ChainScan {
         Ok(Self { network, keys: ScanningKeys::from_account_ufvks([(0u32, ufvk)]), notes: BTreeMap::new(), prior: None, birth, source: None })
     }
 
-    /// A new provider cannot vouch for compact transactions scanned from the old one,
-    /// even if both providers report identical block hashes.
     pub fn use_source(&mut self, source: &str, birth: u32) {
         if self.source.as_deref() != Some(source) || self.birth != birth {
             self.reset();
@@ -142,17 +122,14 @@ impl ChainScan {
         self.notes.clear();
     }
 
-    /// The last block scanned, if any.
     pub fn height(&self) -> Option<u32> {
         self.prior.as_ref().map(|m| m.block_height().into())
     }
 
-    /// The height of the next block to scan.
     pub fn next_height(&self) -> u32 {
         self.height().map_or(self.birth, |h| h.saturating_add(1))
     }
 
-    /// Check the provider's block at the persisted height without accepting any transaction data.
     pub fn matches_checkpoint(&self, bytes: &[u8]) -> Result<bool, String> {
         let prior = self.prior.as_ref().ok_or("no scanned block to check")?;
         let mut block = CompactBlock::decode(bytes).map_err(|e| format!("checkpoint block: {e}"))?;
@@ -163,13 +140,10 @@ impl ChainScan {
         Ok(block.hash() == prior.block_hash())
     }
 
-    /// Scan the next compact block (protobuf bytes, as lightwalletd streams it). Blocks must
-    /// come in order; one that does not extend the last block scanned is refused.
     pub fn scan(&mut self, block: &[u8]) -> Result<(), String> {
         self.scan_batch([block])
     }
 
-    /// Accept the page atomically without copying the entire saved note history.
     pub fn scan_batch(&mut self, blocks: impl IntoIterator<Item = impl AsRef<[u8]>>) -> Result<(), String> {
         let mut prior = self.prior;
         let start = self.next_height();
@@ -186,7 +160,6 @@ impl ChainScan {
                 if next != start {
                     return Err("compact block stream has inconsistent parent hashes".into());
                 }
-                // Finish validating the page before asking the caller to reconcile a fork.
                 forked = true;
                 prior = None;
             }
@@ -204,7 +177,6 @@ impl ChainScan {
                         height: next,
                         txid: tx.txid().to_string(),
                         value_zat: out.note().0.value().inner(),
-                        // By scope: the library's own change flag needs the spends it was not given.
                         change: out.recipient_key_scope() == Some(zip32::Scope::Internal),
                         spent_in: None,
                     });
@@ -233,8 +205,6 @@ impl ChainScan {
         Ok(())
     }
 
-    /// The scan state to persist: the vault's notes and the last block scanned. Holds the
-    /// vault's history, so the caller seals it.
     pub fn to_bytes(&self) -> Vec<u8> {
         let tip = self.prior.as_ref().map(|m| Tip {
             height: m.block_height().into(),
@@ -247,7 +217,6 @@ impl ChainScan {
         serde_json::to_vec(&Saved { version: 1, birth: self.birth, tip, notes, source: self.source.clone() }).expect("scan state serializes")
     }
 
-    /// Resume from [`Self::to_bytes`].
     pub fn from_bytes(network: VaultNetwork, fvk: &FullViewingKey, saved: &[u8]) -> Result<Self, String> {
         let saved: Saved = serde_json::from_slice(saved).map_err(|e| format!("scan state: {e}"))?;
         if saved.version != 1 {
@@ -266,7 +235,6 @@ impl ChainScan {
         Ok(scan)
     }
 
-    /// Unspent Ironwood value, as `VaultWallet::ironwood_balance_zat` counts it.
     pub fn balance_zat(&self) -> u64 {
         self.notes.values().filter(|n| n.spent_in.is_none()).map(|n| n.value_zat).sum()
     }
@@ -275,12 +243,10 @@ impl ChainScan {
         self.notes.values()
     }
 
-    /// The transaction (and height) that spent the vault note with this spend nullifier.
     pub fn spent_by(&self, nullifier: &[u8; 32]) -> Option<&(String, u32)> {
         self.notes.get(nullifier)?.spent_in.as_ref()
     }
 
-    /// Every transaction that touched the vault, newest first.
     pub fn history(&self) -> Vec<TxEffect> {
         let mut by_tx: BTreeMap<String, TxEffect> = BTreeMap::new();
         fn entry<'a>(by_tx: &'a mut BTreeMap<String, TxEffect>, txid: &str, height: u32) -> &'a mut TxEffect {
@@ -307,7 +273,6 @@ struct Tip { height: u32, hash: String, sapling: Option<u32>, orchard: Option<u3
 #[derive(Serialize, Deserialize)]
 struct Saved { version: u8, birth: u32, tip: Option<Tip>, notes: Vec<(String, Received)>, source: Option<String> }
 
-/// A compact transaction id as explorers show it (byte-reversed hex).
 fn tx_id(bytes: &[u8]) -> String {
     bytes.iter().rev().map(|b| format!("{b:02x}")).collect()
 }
@@ -330,7 +295,6 @@ mod tests {
         FullViewingKey::from(&SpendingKey::from_bytes([seed; 32]).unwrap())
     }
 
-    /// An Ironwood output to `to`, as a compact action that spends `nf_old`.
     fn action(to: &FullViewingKey, scope: Scope, value: u64, nf_old: Nullifier) -> (Note, CompactOrchardAction) {
         let note = Note::new(to.address_at(0u32, scope), NoteValue::from_raw(value), Rho::from_nf_old(nf_old), NoteVersion::V3, rand_zp::rng());
         let enc = IronwoodNoteEncryption::new(None, note, [0u8; 512]);
@@ -367,7 +331,6 @@ mod tests {
         assert_eq!(scan.balance_zat(), 50_000);
         assert_eq!(scan.history(), vec![TxEffect { txid: "aa".repeat(32), height: H as u32, received_zat: 50_000, change_zat: 0, spent_zat: 0 }]);
 
-        // The vault spends that note and gets change back on its internal address.
         let (_, change) = action(&vault, Scope::Internal, 39_000, paid.nullifier(&vault));
         scan.scan(&block(H + 1, 0xa1, 0xa0, vec![(0xbb, vec![change])], 3)).unwrap();
         assert_eq!(scan.balance_zat(), 39_000);
@@ -399,13 +362,11 @@ mod tests {
         assert_eq!(resumed.next_height(), H as u32 + 1);
         assert_eq!(resumed.balance_zat(), 50_000);
         assert_eq!(resumed.history(), scan.history());
-        // The spend in the next block is found from the restored notes.
         let (_, change) = action(&vault, Scope::Internal, 39_000, paid.nullifier(&vault));
         assert_eq!(resumed.spent_by(&paid.nullifier(&vault).to_bytes()), None);
         resumed.scan(&block(H + 1, 0xa1, 0xa0, vec![(0xbb, vec![change])], 2)).unwrap();
         assert_eq!(resumed.balance_zat(), 39_000);
         assert_eq!(resumed.spent_by(&paid.nullifier(&vault).to_bytes()), Some(&("bb".repeat(32), H as u32 + 1)));
-        // A block that does not extend the saved tip is still refused.
         let mut again = ChainScan::from_bytes(VaultNetwork::Testnet, &vault, &saved).unwrap();
         assert!(again.scan(&block(H + 1, 0xa1, 0x55, vec![], 1)).is_err());
         assert!(ChainScan::from_bytes(VaultNetwork::Testnet, &vault, b"not a scan").is_err());

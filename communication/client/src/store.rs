@@ -13,16 +13,12 @@ use std::{
 
 pub(crate) const SCHEMA: &str = include_str!("schema.sql");
 
-/// The transport schema for a vault of `count` members: the 3-member schema with every
-/// member-number bound raised to `count`.
 fn member_schema(count: usize) -> &'static str {
     static SCHEMAS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     if count == 3 {
         return SCHEMA;
     }
     let schemas = SCHEMAS.get_or_init(|| {
-        // Without the template text `replace` would return the 3-member schema unchanged,
-        // and the stored schema would still validate against it.
         assert!(
             SCHEMA.contains(MEMBER_BOUND),
             "schema.sql lost its member-number bound"
@@ -53,7 +49,7 @@ mod member_schema_tests {
 }
 const STORAGE_BUDGET: u64 = 512 * 1024 * 1024;
 const PENDING_TRANSFERS: u64 = 128;
-const INCOMPLETE_TOTAL: u64 = 32; // Leave at least half of polling intake for complete messages.
+const INCOMPLETE_TOTAL: u64 = 32;
 const INCOMPLETE_TTL_MS: u64 = 10 * 60 * 1000;
 
 fn incomplete_per_sender(members: usize) -> u64 {
@@ -130,9 +126,6 @@ fn inbox_work_parts(count: usize) -> (&'static str, &'static str) {
 
 const CURRENT_CATALOG: u8 = 7;
 
-/// Widen CHECK constraints in place by rewriting the schema text: every saved row already
-/// satisfies the wider bound, so the file content does not change (SQLite's documented
-/// `writable_schema` procedure for constraint changes). Checks integrity afterwards.
 pub(crate) fn widen_checks(connection: &mut Connection, narrow: &str, wide: &str) -> ClientResult<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let version: i64 = transaction.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
@@ -198,7 +191,6 @@ impl ConfigReference {
         Ok(Self { revision, hash })
     }
 
-    /// Hashes exact sealed ciphertext bytes; this does not authenticate or publish a configuration.
     pub fn from_ciphertext(revision: u64, exact_ciphertext: &[u8]) -> ClientResult<Self> {
         let reference = Self::new(revision, [0; 32])?;
         Ok(Self {
@@ -238,7 +230,6 @@ impl Drop for RootLock {
 }
 
 pub struct ClientStore {
-    // Field order keeps SQLite closed before releasing the root lock.
     pub(crate) connection: Connection,
     pub(crate) storage_budget: u64,
     member_count: usize,
@@ -251,7 +242,6 @@ pub(crate) fn check_owner(metadata: &fs::Metadata, mode: u32, directory: bool) -
     unsafe extern "C" {
         fn geteuid() -> u32;
     }
-    // geteuid takes no arguments and returns the process's effective Unix user ID.
     let uid = unsafe { geteuid() };
     if metadata.uid() != uid
         || metadata.permissions().mode() & 0o7777 != mode
@@ -424,8 +414,6 @@ impl ClientStore {
         member_schema(self.member_count)
     }
 
-    /// Creates a new dedicated transport root, or validates an existing complete root.
-    /// The roster is supplied by the certified member adapter; no association overrides are accepted.
     pub fn open(root: &Path, roster: &Roster, owner: MemberId) -> ClientResult<Self> {
         let digest = roster_digest(roster)?;
         if owner == 0 || !roster.members.iter().any(|member| member.id == owner) {
@@ -496,7 +484,6 @@ impl ClientStore {
             } else {
                 inbox_work_parts(roster.members.len()).1
             };
-            // A raised page ceiling still reuses free pages in an over-budget file.
             admit_storage_growth(&transaction, STORAGE_BUDGET)?;
             transaction.execute_batch(addition)?;
             if prior < 6 {
@@ -541,7 +528,6 @@ impl ClientStore {
         read_reference(&self.connection)
     }
 
-    /// Publishes only the pointer. The sealed-file publisher must sync its file and directory first.
     pub fn record_config_revision(&mut self, reference: &ConfigReference) -> ClientResult<()> {
         let transaction = self
             .connection
@@ -605,7 +591,6 @@ pub struct RecoveryUpload {
     pub acknowledged: bool,
 }
 
-/// Structural reference state. It does not authenticate a message or advance a cursor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReferencePhase {
     Pending,
@@ -624,7 +609,6 @@ pub struct RouteCursor {
     pub position: u64,
 }
 
-/// Advertised capture. `receipt` and `wire_length` are untrusted metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JournalCapture {
     pub relay_key: Id32,
@@ -677,7 +661,6 @@ pub struct StagedRequirement {
     pub wire_length: u64,
 }
 
-/// Verified manifest or single-root binding. Claims are written only at insert.
 pub(crate) struct BoundSource {
     pub root_hash: Id32,
     pub root_wire_length: u64,
@@ -695,12 +678,9 @@ pub(crate) enum StageResult {
     Rejected,
 }
 
-/// Where an exact committed digest stores its prerequisite edges.
 pub(crate) enum CommittedChain {
     Missing,
-    /// Edges persisted for an incoming original. Empty means no further prerequisites.
     Incoming(Vec<MessageRef>),
-    /// Authored logical record. Its edges are in the owner ciphertext, not incoming dependencies.
     Outgoing,
 }
 
@@ -714,10 +694,6 @@ pub struct IncomingOriginal {
     pub source_root: Id32,
 }
 
-/// One committed logical identity. The columns are lookup metadata.
-///
-/// Kind and session stay in the database and are not copied here. Callers open
-/// the saved ciphertext for those values. `incoming` selects the membership table.
 pub(crate) struct SavedRecord {
     pub digest: Id32,
     pub source_root: Id32,
@@ -734,9 +710,6 @@ pub struct AckLink {
     pub request_id: Id32,
 }
 
-/// Result of one immediate original/acknowledgement transaction.
-///
-/// `Duplicate` and `Conflict` leave the saved original in place. Neither variant uploads.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommitDisposition {
     New,
@@ -755,7 +728,6 @@ pub struct EarlyReceived {
     pub phase: ReferencePhase,
 }
 
-/// Derived prerequisite state. `phase` is metadata, not application readiness.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IncomingDependency {
     pub cursor: u64,
@@ -812,7 +784,6 @@ fn row_key(row: &rusqlite::Row<'_>, start: usize) -> rusqlite::Result<LogicalKey
 }
 
 impl ClientStore {
-    /// Checks public association against the current database without changing it.
     pub fn check_association(&self, roster: &Roster, owner: MemberId) -> ClientResult<()> {
         if owner == 0 || !roster.members.iter().any(|member| member.id == owner) {
             return Err(ClientError::Identity);
@@ -824,7 +795,6 @@ impl ClientStore {
         Ok(())
     }
 
-    /// Pages local metadata only. Recovery views carry no preparation or authentication authority.
     pub fn recover_logical(&self, after: u64, limit: u16) -> ClientResult<Vec<RecoveryLogical>> {
         page_bounds(after, limit)?;
         let mut statement = self.connection.prepare(
@@ -925,7 +895,6 @@ impl ClientStore {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Returns saved bytes only; receipt verification remains the later consumer's responsibility.
     pub fn saved_receipt(&self, upload: &RecoveryUpload) -> ClientResult<Option<Vec<u8>>> {
         Ok(self.connection.query_row(
             "SELECT receipt FROM verified_receipts WHERE vault=?1 AND roster=?2 AND sender=?3 AND message_id=?4 AND recipient=?5 AND hash=?6 AND relay_key=?7 AND run=?8 AND mailbox=?9 AND length(receipt) BETWEEN 1 AND 4096",
@@ -976,8 +945,6 @@ pub(crate) fn admit_storage_growth(connection: &Connection, budget: u64) -> Clie
     if effective == 0 || effective > limit.max(allocated) {
         return Err(ClientError::Storage);
     }
-    // SQLite raises an undersized page ceiling to the current allocation;
-    // its remaining free pages do not authorize growth above our budget.
     if allocated > limit {
         return Err(ClientError::Capacity);
     }
@@ -1005,13 +972,6 @@ fn outgoing_pending_count(connection: &Connection) -> ClientResult<u64> {
         .map_err(Into::into)
 }
 
-/// A group stays open while required bytes are still absent or a root is unclassified.
-///
-/// A pending download whose ciphertext is already cached is stale bookkeeping. It does not
-/// keep a published root in the shared count, and the task, reason, and cursor stay. A root
-/// that is not rejected, published, or tied to an exact saved digest stays open. Another
-/// incomplete root in the same group does too. Claimed identity without that digest does not
-/// retire a different body.
 const GROUP_OPEN: &str = "EXISTS (
     SELECT 1 FROM staged_sources s
     WHERE s.group_id=g.group_id
@@ -1242,11 +1202,6 @@ fn insert_request(
     Ok(())
 }
 
-/// Insert one prepared outbox into the caller's transaction.
-///
-/// The caller begins the immediate transaction, admits capacity, and commits.
-/// This writes ciphertext, the logical record, all roster recipient sets, and the
-/// caller mapping. It does not start another transaction or upload.
 fn persist_prepared_outbox(
     connection: &Connection,
     prepared: &crate::PreparedOutbox,
@@ -1443,10 +1398,6 @@ fn note_body_digest(connection: &Connection, root: &Id32, digest: &Id32) -> Clie
     Ok(())
 }
 
-/// Record the authenticated digest on an alternate root when a page is available.
-///
-/// An exact duplicate still succeeds when the store cannot grow. The saved original and
-/// acknowledgement are left untouched.
 fn try_note_alternate_root(
     connection: &Connection,
     budget: u64,
@@ -1564,8 +1515,6 @@ fn insert_conflict_objects(
     Ok(())
 }
 
-/// Prerequisite source stays null. The edge is immutable, and a later exact original
-/// resolves by sender, message, and digest rather than by rewriting this row.
 fn insert_dependency_edges(
     connection: &Connection,
     message: &crate::AuthenticatedMessage,
@@ -1611,8 +1560,6 @@ fn insert_incoming_original(
     )?;
     insert_original_objects(connection, key, source.required_hashes())?;
     insert_dependency_edges(connection, message)?;
-    // The application row is the test effect. It has no readiness column. A matching
-    // original is not treated as a cycle-free ready chain; missing edges stay pending.
     if kind == 1 {
         connection.execute(
             "INSERT INTO incoming_application VALUES(?1,?2,?3,?4)",
@@ -1679,7 +1626,6 @@ fn reuse_saved_ack(
     let Some((saved_ack, saved_request)) = saved else {
         return Err(ClientError::Storage);
     };
-    // The message id is the random value stored with the first commit. The caller id stays derived.
     if saved_request != request_id {
         return Err(ClientError::Storage);
     }
@@ -1718,7 +1664,6 @@ fn reconcile_self(
     source: &crate::CompleteSource,
 ) -> ClientResult<CommitDisposition> {
     let Some(logical) = logical_at(&transaction, &message.body().key)? else {
-        // No outgoing record means this copy is not the author's committed message.
         return Err(ClientError::Identity);
     };
     if logical.digest == *message.digest()
@@ -1729,15 +1674,12 @@ fn reconcile_self(
         commit_reuse(transaction)?;
         return Ok(CommitDisposition::Duplicate);
     }
-    // A different body under the author's id is evidence only. The outgoing record stays.
     save_conflict(&transaction, budget, message, source, root)?;
     transaction.commit()?;
     Ok(CommitDisposition::Conflict)
 }
 
 impl ClientStore {
-    /// Look up a prior caller operation before allocating or encrypting a fresh message.
-    /// The returned view is recovery metadata, not authentication authority.
     pub fn lookup_outbox_request(
         &self,
         request_id: &Id32,
@@ -1746,21 +1688,6 @@ impl ClientStore {
         request_at(&self.connection, request_id, expected_intent, self.member_count)
     }
 
-    /// Commit all recipient bytes and the caller binding before exposing any work.
-    /// Routing is deferred until an authenticated configuration consumer binds it.
-    ///
-    /// ```compile_fail
-    /// use loki_relay_client::PreparedOutbox;
-    /// fn mix(first: &mut PreparedOutbox, second: &PreparedOutbox) {
-    ///     first.recipients()[1] = second.recipients()[1];
-    /// }
-    /// ```
-    /// ```compile_fail
-    /// use loki_relay_client::PreparedOutbox;
-    /// fn inject(first: &mut PreparedOutbox, second: &PreparedOutbox) {
-    ///     first.recipients()[1].objects()[0] = second.recipients()[1].objects()[0].clone();
-    /// }
-    /// ```
     pub fn commit_outbox(
         &mut self,
         roster: &Roster,
@@ -1802,7 +1729,6 @@ impl ClientStore {
         let logical = logical_at(&transaction, key)?.ok_or(ClientError::Storage)?;
         #[cfg(test)]
         outbox_commit_tests::checkpoint(&transaction, 1)?;
-        // Test pause holds the uncommitted outbox transaction. Production builds omit it.
         #[cfg(test)]
         outbox_commit_tests::pause_barrier("before-commit");
         transaction.commit()?;
@@ -2065,8 +1991,6 @@ fn upload_key_params(upload: &RecoveryUpload) -> [&dyn rusqlite::ToSql; 9] {
 }
 
 impl ClientStore {
-    /// Binds committed recipient objects to the opened self descriptor and peer descriptors.
-    /// A missing peer leaves only that recipient unrouted. No network call is made.
     pub fn bind_upload_routes(
         &mut self,
         roster: &Roster,
@@ -2204,7 +2128,6 @@ impl ClientStore {
         Ok(uploads)
     }
 
-    /// Reloads one work row and its rejection after earlier writes in the same pass.
     pub(crate) fn upload_eligibility(
         &self,
         upload: &RecoveryUpload,
@@ -2269,7 +2192,6 @@ impl ClientStore {
         Ok(())
     }
 
-    /// Reloads the work row and stores the next attempt. Acknowledged rows are left unchanged.
     pub fn schedule_upload_retry(
         &mut self,
         upload: &RecoveryUpload,
@@ -2329,7 +2251,6 @@ impl ClientStore {
         Ok(())
     }
 
-    /// Publishes one verified receipt for the reloaded work row. The selector is not authority.
     pub fn commit_upload_receipt(
         &mut self,
         upload: &RecoveryUpload,
@@ -2422,15 +2343,12 @@ impl ClientStore {
         if changed != 1 {
             return Err(ClientError::Storage);
         }
-        // Test pause sits after the receipt insert and before durable commit.
         #[cfg(test)]
         outbox_commit_tests::pause_barrier("before-receipt");
         transaction.commit()?;
         Ok(())
     }
 
-    /// Reloads the committed message and re-verifies every saved receipt.
-    /// The returned report cannot be supplied back as capacity authority.
     pub fn delivery_report(
         &mut self,
         roster: &Roster,
@@ -2447,8 +2365,6 @@ impl ClientStore {
         Ok(report)
     }
 
-    /// Inserts the completion marker only after a fresh whole-vault union.
-    /// A second call for the same logical row and source root changes nothing.
     pub fn release_stored_capacity(
         &mut self,
         roster: &Roster,
@@ -2496,7 +2412,6 @@ impl ClientStore {
         Ok(report)
     }
 
-    /// Shared pending total: outgoing route rows plus nonterminal incoming groups.
     pub fn pending_transfer_count(&self) -> ClientResult<u64> {
         pending_transfer_total(&self.connection)
     }
@@ -2518,7 +2433,6 @@ impl ClientStore {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Returns advertised capture metadata, including length 0 or 123 and an empty receipt.
     pub fn recover_journal(
         &self,
         route: &RelayRoute,
@@ -2611,7 +2525,6 @@ impl ClientStore {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Pages requirements in ordinal order. `None` starts at ordinal 0; `Some(ordinal)` resumes after it.
     pub fn recover_staged_requirements(
         &self,
         root_hash: &Id32,
@@ -2658,7 +2571,6 @@ impl ClientStore {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Reopen a committed incoming message from its saved ciphertext, checking the certified sender again.
     pub fn open_incoming(
         &self,
         roster: &Roster,
@@ -2727,7 +2639,6 @@ impl ClientStore {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Sample length only. The bytes are not authentication evidence.
     pub fn recover_diagnostic_samples(
         &self,
         after: u64,
@@ -2750,7 +2661,6 @@ impl ClientStore {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Every early Received reference with its derived phase. Resolved rows are not pending.
     pub fn recover_early_received(
         &self,
         roster: &Roster,
@@ -2764,7 +2674,6 @@ impl ClientStore {
         if stored != owner {
             return Err(ClientError::Identity);
         }
-        // Every roster member, as integer literals: the roster has up to 16 members.
         let members = members
             .iter()
             .map(MemberId::to_string)
@@ -2822,7 +2731,6 @@ impl ClientStore {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Every dependency with its derived phase. A matching original is resolved, not pending.
     pub fn recover_dependencies(
         &self,
         after: u64,
@@ -2888,10 +2796,6 @@ impl ClientStore {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Transport-captured cached hashes, including a staged root that may need new coverage.
-    ///
-    /// Outgoing ciphertext with no incoming journal row is not selected. A source rejection
-    /// stays excluded. A download rejection does not hide an independently valid object.
     pub(crate) fn covered_cached_hashes(
         &self,
         after: Option<&Id32>,
@@ -2905,10 +2809,6 @@ impl ClientStore {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Classify one exact committed digest without reading a staged claim.
-    ///
-    /// An outgoing `logical_records` row is not given the incoming dependency table.
-    /// `commit_outbox` does not write that table, so an empty read would drop authored edges.
     pub(crate) fn committed_chain(
         &self,
         vault: &Id32,
@@ -2946,30 +2846,18 @@ impl ClientStore {
         Ok(CommittedChain::Incoming(rows.collect::<Result<_, _>>()?))
     }
 
-    /// Digest of a saved incoming original, if this logical identity already has one.
     pub(crate) fn incoming_saved_digest(&self, key: &LogicalKey) -> ClientResult<Option<Id32>> {
         Ok(existing_original(&self.connection, key)?.map(|saved| saved.digest))
     }
 
-    /// Cached and quarantined journal presence for one hash. Missing rows are neither.
     pub(crate) fn root_journal_state(&self, root: &Id32) -> ClientResult<(bool, bool)> {
         journal_state(&self.connection, root)
     }
 
-    /// True when this root is already a terminal incoming or outgoing association.
-    ///
-    /// Pending downloads are ignored here. Callers that still need the shared slot use `GROUP_OPEN`.
     pub(crate) fn incoming_root_settled(&self, root: &Id32) -> ClientResult<bool> {
         Ok(self.incoming_source_published(root)? || root_terminal(&self.connection, root)?)
     }
 
-    /// Save one authenticated original and, for a foreign test message, its Received outbox.
-    ///
-    /// The immediate transaction is the whole boundary: the original, its source membership,
-    /// dependency edges, and all roster acknowledgement copies commit together or not at all.
-    /// Candidate readiness is not an argument. Dependency sources stay null so a later exact
-    /// match is derived instead of rewriting an immutable edge. No plaintext, credential,
-    /// receipt, or network write is produced.
     pub fn commit_incoming(
         &mut self,
         roster: &Roster,
@@ -3043,7 +2931,6 @@ impl ClientStore {
             let request_id = crate::received::ack_request_id(owner, message);
             admit_storage_growth(&transaction, self.storage_budget)?;
             insert_incoming_original(&transaction, message, source, kind, &root)?;
-            // The original root is terminal before the three acknowledgement copies are counted.
             admit_outbox(&transaction, self.storage_budget, self.member_count)?;
             persist_prepared_outbox(&transaction, prepared, &validated, &request_id)?;
             transaction.execute(
@@ -3102,12 +2989,6 @@ impl ClientStore {
         Ok(())
     }
 
-    /// Insert one verified source, its group, and its immutable requirements.
-    ///
-    /// The shared pending total includes outgoing rows. A group that is already open
-    /// does not take another slot. An existing source keeps its claims and refreshes
-    /// coverage without another slot. An exact no-op does not admit storage growth.
-    /// Cached completion does not close the group.
     pub(crate) fn stage_bound_source(&mut self, source: &BoundSource) -> ClientResult<StageResult> {
         if !(1..=self.member_count as u16).contains(&source.key.sender) || source.objects.len() > 274 {
             return Err(ClientError::Wire(WireError::Schema));
@@ -3192,8 +3073,6 @@ impl ClientStore {
         Ok(StageResult::Staged)
     }
 
-    /// Use the committed prerequisite only to schedule work. The source and its
-    /// target still need authentication, including when the expected digest differs.
     pub(crate) fn received_original_work(&self, limit: u16) -> ClientResult<Vec<IncomingOriginal>> {
         let mut statement = self.connection.prepare(
             "SELECT i.rowid,i.vault,i.roster,i.sender,i.message_id,i.digest,i.kind,i.session,i.source_root
@@ -3238,7 +3117,6 @@ impl ClientStore {
         ).optional()?)
     }
 
-    /// Saved logical or incoming row for this identity. Neither table is signature proof.
     pub(crate) fn saved_record(&self, key: &LogicalKey) -> ClientResult<Option<SavedRecord>> {
         let outgoing = read_saved(
             &self.connection,
@@ -3258,7 +3136,6 @@ impl ClientStore {
         }
     }
 
-    /// Incoming membership in ordinal order. Ordinal 0 is the transfer root.
     pub(crate) fn incoming_hashes(&self, key: &LogicalKey) -> ClientResult<Vec<Id32>> {
         ordered_hashes(
             &self.connection,
@@ -3268,7 +3145,6 @@ impl ClientStore {
         )
     }
 
-    /// One recipient copy in ordinal order. The last hash is the transfer root.
     pub(crate) fn outgoing_hashes(
         &self,
         key: &LogicalKey,
@@ -3285,11 +3161,6 @@ impl ClientStore {
         )
     }
 
-    /// Record the first certified reference for recovery.
-    ///
-    /// `early_received_refs` is immutable and its primary key omits the acknowledgement
-    /// message, the session, and the source root. An existing row is left unchanged.
-    /// Absence of a free slot does not drop the saved acknowledgement.
     pub(crate) fn note_received_ref(
         &mut self,
         target: &LogicalKey,
@@ -3331,7 +3202,6 @@ impl ClientStore {
         Ok(())
     }
 
-    /// Permanent source rejection. The ciphertext stays. No transfer group is created.
     pub(crate) fn reject_source_root(
         &mut self,
         root: &Id32,
@@ -3371,7 +3241,6 @@ const ROOT_MISSING: &str = "NOT EXISTS(SELECT 1 FROM source_rejections j WHERE j
         AND NOT EXISTS(SELECT 1 FROM ciphertext_objects c WHERE c.hash=r.hash))";
 
 fn discard_rejected_downloads(connection: &Connection, root: Option<&Id32>) -> ClientResult<()> {
-    // Retain advertised missing entries and requirements shared by any non-rejected root.
     let abandoned = "EXISTS(SELECT 1 FROM staged_requirements r JOIN source_rejections j ON j.root_hash=r.root_hash
             WHERE r.hash=d.source_hash AND (r.root_hash=?1 OR (?1 IS NULL AND j.reason='incomplete_expired')))
         AND NOT EXISTS(SELECT 1 FROM staged_requirements r WHERE r.hash=d.source_hash
@@ -3407,7 +3276,6 @@ fn read_received_original(row: &rusqlite::Row<'_>) -> rusqlite::Result<IncomingO
 
 fn seed_incomplete_leases(connection: &Connection, members: usize) -> ClientResult<()> {
     let now = crate::retry::now_ms()?.max(1);
-    // Preserve recoverable legacy groups, but retire over-quota work on first intake.
     connection.execute(&format!("WITH missing AS (
             SELECT s.group_id,min(s.claimed_sender) AS sender,min(s.rowid) AS first_seen
             FROM staged_sources s WHERE s.group_id IS NOT NULL AND {ROOT_MISSING} GROUP BY s.group_id
@@ -3658,7 +3526,6 @@ fn apply_wanted(connection: &Connection, root: &Id32, planned: &WantedPlan) -> C
                 params![task.relay_key, task.run, task.mailbox, task.hash],
             )?;
         }
-        // A historical download rejection stays and does not veto this verified length.
         connection.execute(
             "INSERT INTO pending_downloads (relay_key, run, mailbox, source_hash, wire_length, attempts, retry_at) VALUES(?1,?2,?3,?4,?5,0,0)",
             params![task.relay_key, task.run, task.mailbox, task.hash, task.wire_length],
@@ -3713,7 +3580,6 @@ mod outbox_commit_tests {
         Ok(())
     }
 
-    /// Sleeps only when a fixture child asks for this stage. Unset in ordinary tests.
     pub(super) fn pause_barrier(kind: &str) {
         let Ok(stage) = std::env::var("RELAY_6_6_BARRIER") else {
             return;
@@ -4227,7 +4093,6 @@ mod outbox_commit_tests {
         );
     }
 
-/// Process-kill and idempotent PUT evidence for the outbox commit and receipt boundaries.
 mod crash {
     use super::*;
     use crate::{
@@ -4606,8 +4471,6 @@ mod crash {
         let sealed = seal_descriptor(identity, roster, &descriptor, &owner_public).unwrap();
         let opened = open_descriptor(identity, roster, &sealed.wire).unwrap();
         let reference = ConfigReference::from_ciphertext(1, &sealed.wire).unwrap();
-        // A restarted process keeps the committed pointer. Resealing the same routes
-        // must not replace that pointer just to upload.
         if store.config_reference().unwrap().is_none() {
             store.record_config_revision(&reference).unwrap();
         }
@@ -4820,7 +4683,6 @@ mod crash {
     }
 
     fn handle(mut stream: TcpStream, pins: &[PinSecret], state: &Mutex<RelayState>, third: [u8; 32]) {
-        // A stalled accepted socket must not block listener shutdown.
         stream.set_nonblocking(false).expect("fixture socket mode");
         stream
             .set_read_timeout(Some(SOCKET_WAIT))
@@ -4917,7 +4779,6 @@ mod crash {
         );
     }
 
-    /// Commit, bind the published routes, then upload. A barrier env stops inside that sequence.
     async fn commit_then_upload(root: &Path, routes: &Path, appends: &Path) -> crate::UploadPass {
         let (roster, identity, body, prepared) = fixture();
         write_expected(&root.parent().unwrap().join("expected.json"), &body, &prepared);
@@ -5001,8 +4862,6 @@ mod crash {
         let (puts, entries) = relay.counts();
         assert!(puts >= 1, "commit-then-upload accepted no PUT");
         assert!(entries >= 1, "commit-then-upload stored no object");
-        // install_routes leaves peers empty, so Bob and Carol stay unrouted and
-        // whole-vault Stored is impossible. The author third pin is still reachable.
         assert_eq!(pass.needs_route, vec![2, 3], "needs_route lost Bob or Carol");
         assert!(
             !pass.stopped_third,
@@ -5190,8 +5049,6 @@ mod crash {
         )
         .await
         .unwrap();
-        // The barrier above still stops on the first lesser-pin receipt. This
-        // later pass has no whole-vault pair, so the author third pin is uploaded.
         assert_eq!(pass.needs_route, vec![2, 3], "needs_route lost Bob or Carol");
         assert!(
             !pass.stopped_third,
@@ -5249,8 +5106,6 @@ mod crash {
     }
 
     fn clamp_to_sqlite_full(connection: &Connection) {
-        // Fill the receipt table's own pages. Another table's full page still leaves
-        // this root page able to accept one receipt without allocating.
         connection.pragma_update(None, "foreign_keys", "OFF").unwrap();
         let pages: i64 = connection
             .pragma_query_value(None, "page_count", |row| row.get(0))
@@ -5386,7 +5241,6 @@ mod crash {
 }
 }
 
-/// Incoming capture and acknowledgement DiskFull cases. Inert unless a case below arms it.
 #[cfg(test)]
 pub(crate) mod incoming_crash_tests {
     use super::{configure_storage_limit, ClientStore, STORAGE_BUDGET};
@@ -5418,7 +5272,6 @@ pub(crate) mod incoming_crash_tests {
         static SAW_DISK_FULL: Cell<bool> = const { Cell::new(false) };
     }
 
-    /// Checks the raw SQLite code only while an incoming library case is armed.
     pub(crate) fn observe_allocating_insert(result: &Result<usize, rusqlite::Error>) {
         if !ARMED.with(Cell::get) {
             return;
@@ -5779,8 +5632,6 @@ pub(crate) mod incoming_crash_tests {
         assert_eq!(cursor(&store, &route), cursor_before);
     }
 
-    /// One page of configured budget is below the allocated file. SQLite keeps
-    /// max_page_count at page_count, so this refusal is not SQLITE_FULL.
     fn configure_below_allocated(store: &mut ClientStore) {
         let page_size: u64 = store
             .connection
@@ -5817,7 +5668,6 @@ pub(crate) mod incoming_crash_tests {
         }, &[DownloadOutcome::Missing(missing.hash)]).unwrap();
         let page_size: u64 = store.connection.pragma_query_value(None, "page_size", |r| r.get(0)).unwrap();
         let allocated: u64 = store.connection.pragma_query_value(None, "page_count", |r| r.get(0)).unwrap();
-        // A reduced test budget reaches real staging admission with a small flood.
         store.storage_budget = (allocated + 48) * page_size;
         configure_storage_limit(&store.connection, store.storage_budget).unwrap();
         let context = crate::SealContext { domain: crate::SealDomain::Message,

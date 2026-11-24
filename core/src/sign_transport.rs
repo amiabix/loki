@@ -1,14 +1,3 @@
-//! Rerandomized FROST signing over a WS3 [`Transport`] (frostd). Two roles, both exchanging
-//! only public bytes over the relay (nonces, shares and key packages never cross it):
-//!  - [`sign_as_participant`]: a signer commits, receives the signing package + randomizer
-//!    seed from the coordinator, and returns its partial signature.
-//!  - [`coordinate`]: the keyless coordinator gathers commitments, builds the signing package
-//!    over the sighash + a fresh rerandomizer, hands them to the signers, and aggregates the
-//!    shares into a group signature valid under the randomized group key.
-//!
-//! Productionises the signing half of `tests/frostd_transport.rs`. The sighash itself (for a
-//! payment, the PCZT sighash built with the rerandomizer alpha) is supplied by the caller.
-
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -39,9 +28,6 @@ where
     Err(format!("relay delivered {} of {want} expected messages", got.len()))
 }
 
-/// Signer side: commit, await the signing package + randomizer seed (sent in that order by
-/// the coordinator), and return the partial signature — which is also sent to the
-/// coordinator. The signing nonce stays in this process and never touches the relay.
 pub fn sign_as_participant<T: Transport>(
     transport: &T,
     channel: &T::Channel,
@@ -66,10 +52,6 @@ where
     Ok(())
 }
 
-/// Coordinator side (keyless): gather commitments from `signers`, build the signing package
-/// over `message` (the sighash) plus a fresh rerandomizer, hand both to each signer, and
-/// aggregate the shares. Returns the group signature and the randomized params (to verify or
-/// apply to the PCZT). The coordinator holds no key material.
 pub fn coordinate<T: Transport>(
     transport: &T,
     channel: &T::Channel,

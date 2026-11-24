@@ -1,5 +1,3 @@
-//! Local-only restore. Neither the words nor backup bytes are submitted to the coordinator.
-
 use std::{fs, io::{self, Read}, path::{Path, PathBuf}};
 
 use serde::Deserialize;
@@ -10,7 +8,6 @@ use crate::{setup_transport::{Identity, PublicIdentity}, signer::{backup::Backup
 #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
 use {super::state::{restored_key_tag, RESTORED_KEY}, crate::signer::secure_element_apple::{AppleSecureElement, KeyFailure}};
 
-// Stable restore reply codes; Recovery.swift owns the member-facing copy.
 pub(crate) const REFUSED: &str = "restore-refused";
 pub(super) const LOCKED: &str = "profile-locked";
 const BAD_FILE: &str = "invalid-backup";
@@ -48,8 +45,6 @@ fn open_backup(file: &Path, words: Zeroizing<Vec<u8>>, fingerprint: &str) -> Res
     RecoveryBackup::open(&export.vault, key, artifact.0).map_err(|_| REFUSED)
 }
 
-/// Stage beside the destination so a same-filesystem rename is the only publication step.
-/// A failed or interrupted restore cannot leave an active half-written vault/profile.
 struct Stage {
     path: PathBuf,
     _active: fs::File,
@@ -66,7 +61,6 @@ impl Stage {
         builder.create(&path).map_err(|_| REFUSED)?;
         let active = fs::File::open(&path).map_err(|_| REFUSED)?;
         active.try_lock().map_err(|_| REFUSED)?;
-        // A concurrent startup may have reclaimed the empty directory before we locked it.
         if !path.is_dir() { return Err(REFUSED); }
         Ok(Self { path, _active: active })
     }
@@ -77,8 +71,6 @@ impl Stage {
         for dir in dirs {
             MemberDir::create(dir, "").and_then(|dir| dir.write_text(RESTORED_KEY, &id)).map_err(|_| REFUSED)?;
         }
-        // Reserve the attempt's tags durably before the first Keychain operation.
-        // The journal moves with the directory at the same publication commit point.
         let journal = self.path.join(KEYCHAIN_STAGE);
         fs::write(&journal, id).and_then(|_| fs::File::open(&journal)?.sync_all())
             .and_then(|_| self._active.sync_all())
@@ -101,7 +93,6 @@ impl Stage {
         }
         prepare_dest()?;
         fs::rename(&self.path, dest).map_err(|_| REFUSED)?;
-        // Once published, don't ask the member to retry by reporting a failed flush.
         let _ = fs::File::open(dest.parent().expect("restore destination has a parent")).and_then(|f| f.sync_all());
         Ok(())
     }
@@ -132,7 +123,6 @@ fn verify_staged_signer(dir: &Path) -> Result<(), &'static str> {
     Ok(())
 }
 
-// Called only with the staging directory locked, never on a published path.
 fn discard_stage(path: &Path) {
     #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
     match fs::read_to_string(path.join(KEYCHAIN_STAGE)) {
@@ -190,9 +180,8 @@ fn parent(data: &Path) -> &Path {
 }
 
 fn data_location(data: &Path) -> Result<PathBuf, &'static str> {
-    // The configured root may be a symlink. Don't follow symlinks among its contents.
     if let Some(name) = data.file_name() {
-        let link = parent(data).join(name); // Inspect the last component without a trailing slash.
+        let link = parent(data).join(name);
         if fs::symlink_metadata(&link).is_ok_and(|m| m.is_symlink()) {
             return link.canonicalize().ok().filter(|path| path.is_dir()).ok_or(DATA_LOCATION);
         }
@@ -209,14 +198,12 @@ pub(crate) fn clean_staging(data: &Path) {
         for entry in entries.flatten() {
             if Some(entry.file_name().as_os_str()) != skip && staging_dir(&entry) {
                 let Ok(active) = fs::File::open(entry.path()) else { continue };
-                // A different signer launch using the same parent may be restoring now.
                 if active.try_lock().is_ok() { discard_stage(&entry.path()); }
             }
         }
     }
 }
 
-/// Treat even partial ceremonies and unreadable vaults as belonging to the member.
 pub(crate) fn profile_state(data: &Path) -> Result<&'static str, &'static str> {
     let mut material = false;
     for entry in entries(&data_location(data)?)? {
@@ -234,8 +221,6 @@ pub(crate) fn profile_state(data: &Path) -> Result<&'static str, &'static str> {
             Some("profile" | "device-auth") => {
                 material |= !kind.is_dir() || entries(&entry.path())?.next().transpose()?.is_some();
             }
-            // Allow only known files left by an interrupted native startup; everything else
-            // requires explicit confirmation, even when we don't understand its contents.
             Some(NATIVE_KEY_SCOPE | "paired-coordinator.json.tmp" | "signer-config.json.tmp" | "nonce-witnesses.json.tmp") if kind.is_file() => {},
             _ => material = true,
         }
@@ -255,7 +240,6 @@ pub(super) fn set_aside(data: &Path, key_gone: bool) -> Result<(), &'static str>
     match profile_state(&dest)? {
         state if state == "profile" || (state == "vault" && key_gone) => {
             archive(&dest)?;
-            // Preserve a root symlink and give it a fresh target to pair or restore into.
             if dest != data { MemberDir::create(&dest, "").map_err(|_| REFUSED)?; }
             Ok(())
         }
@@ -270,7 +254,6 @@ pub(super) fn read_roster(origin: &str, signing: &[u8; 32]) -> Result<Vec<Public
     runtime.block_on(async {
         let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(15)).build().map_err(|_| ROSTER_UNAVAILABLE)?;
-        // The lookup sends only the derived public identity, never recovery words or backup data.
         registration::fetch_roster(&client, origin, &hex::encode(signing)).await.map_err(|_| ROSTER_UNAVAILABLE)
     })
 }
@@ -326,7 +309,6 @@ pub(crate) fn restore_new(
     fs::write(staged.path.join(RESTORE_PENDING), []).map_err(|_| REFUSED)?;
     staged.publish(&dest, &signer, || {
         if profile_state(&dest)? != "fresh" { return Err(NOT_FRESH); }
-        // Preserve leftovers separately, only after the new profile has been verified.
         if entries(&dest)?.next().transpose()?.is_some() { archive(&dest)?; }
         Ok(())
     })?;
@@ -352,7 +334,6 @@ pub(super) fn restore_running(st: &Shared, words: Zeroizing<Vec<u8>>, file: &Pat
     let parent = parent.canonicalize().map_err(|_| REFUSED)?;
     let dest = parent.join(&vault);
     let ensure_absent = || {
-        // Re-resolve the alias after staged key verification, which can wait for Touch ID.
         let existing = ceremony::dir(data, &vault).map_err(|_| REFUSED)?;
         if absent(existing.path())? && absent(&dest)? { Ok(()) } else { Err(ALREADY_PRESENT) }
     };

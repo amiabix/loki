@@ -4,15 +4,12 @@ use crate::{
 };
 use sha2::{Digest, Sha256};
 
-/// Largest vault: a policy is t-of-n with 2 ≤ t < n ≤ `MAX_MEMBERS`.
 pub const MAX_MEMBERS: u16 = 16;
 
-/// Whether `threshold`-of-`members` is a supported vault policy.
 pub fn valid_policy(threshold: u16, members: u16) -> bool {
     2 <= threshold && threshold < members && members <= MAX_MEMBERS
 }
 
-/// Whether a vault may have `members` members (3 to `MAX_MEMBERS`).
 pub fn valid_member_count(members: usize) -> bool {
     (3..=usize::from(MAX_MEMBERS)).contains(&members)
 }

@@ -30,7 +30,7 @@ enum SignerStartFailure: Error, Equatable {
         case .emptyPassphrase: return "Enter your local profile passphrase and try again."
         case .unlock: return "LokiSigner couldn’t unlock this profile. Check your passphrase and try again."
         case .deviceKey: return "This Mac couldn’t use the device key LokiSigner needs to connect. Try again, or set aside the profile if it has no vaults."
-        case .registrationRefused: return "The coordinator refused this pairing. Try again to use the saved slot. If it has gone to another member, ask the coordinator for a new pairing link."
+        case .registrationRefused: return "The coordinator refused this pairing. If the pairing link expired, paste a new link for the same slot. If the slot has gone to another member, ask the coordinator for a new pairing link."
         case .registrationFailed: return "LokiSigner couldn’t finish connecting to the coordinator. Check your connection and try again."
         case .registrationRosterUnavailable: return "LokiSigner couldn’t reach the coordinator. Check your connection, then try again."
         case .key(let message), .keyGone(let message): return message
@@ -128,7 +128,6 @@ func firstRunChoice() -> NSApplication.ModalResponse {
     return alert.runModal()
 }
 
-// After the main thread hands this off, only the restore worker accesses these buffers.
 final class RecoveryInput: @unchecked Sendable {
     let file: String
     let fingerprint: String
@@ -223,9 +222,7 @@ private struct RecoveryPrompt {
 }
 
 func restoreInput(newProfile: Bool) -> Result<RecoveryInput, SignerStartFailure> {
-    // First-run restore was already checked before presenting the setup choice.
     guard newProfile || canSetUpWithTouchID() else { return .failure(.cancelled) }
-    // Choose a file before collecting any secret, so the picker never shares a field editor with it.
     let picker = recoveryBackupPicker()
     guard picker.runModal() == .OK, let file = picker.url else { return .failure(.cancelled) }
 
@@ -251,7 +248,6 @@ func restoreInput(newProfile: Bool) -> Result<RecoveryInput, SignerStartFailure>
 
 @MainActor
 func restoreInput(newProfile: Bool, signer: NativeSigner, complete: @escaping (Result<RecoveryInput, SignerStartFailure>) -> Void) {
-    // NativeSigner preflights a fresh profile before starting the setup flow.
     if !newProfile, let failure = touchIDSetupFailure() {
         complete(.failure(failure))
         return

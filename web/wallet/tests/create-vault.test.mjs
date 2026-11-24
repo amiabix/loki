@@ -5,7 +5,6 @@ import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import ts from 'typescript';
 
-// Render the actual CreateVault component with its state preset (name, members, threshold).
 function render(members, threshold) {
   const source = readFileSync(new URL('../src/app/page.tsx', import.meta.url), 'utf8');
   const page = ts.createSourceFile('page.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
@@ -24,13 +23,11 @@ function render(members, threshold) {
   return { html, members: selects[0], thresholds: selects[1] };
 }
 
-// The host accepts 2 <= t < n <= 16 (`valid_policy`); the form offers only that.
 test('the create-vault form offers only thresholds below the member count', () => {
   const three = render(3, 2);
   assert.deepEqual(three.members, Array.from({ length: 14 }, (_, i) => i + 3));
   assert.deepEqual(three.thresholds, [2]);
   assert.deepEqual(render(5, 2).thresholds, [2, 3, 4]);
   assert.deepEqual(render(16, 2).thresholds.at(-1), 15);
-  // A threshold left over from a larger member count drops to the highest allowed.
   assert.match(render(3, 3).html, /2 of 3 approvals/);
 });

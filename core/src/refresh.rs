@@ -1,36 +1,5 @@
-//! Share refresh — retire a leaked signing share without moving the vault.
-//!
-//! THREAT-MODEL.md measures the blast radius: one leaked share is survivable in a
-//! 2-of-3 group, two is total loss. So the only response that matters is being able to
-//! invalidate the leaked share before a second one leaks, and the only response that is
-//! *usable* is one that does not move the coins: the Zcash address is derived from the
-//! group verifying key (`vault::test_only_fvk`), so a rotation that changed `ak` would
-//! strand every existing note and be worse than doing nothing.
-//!
-//! The scheme that gives exactly that is additive resharing: every member adds their
-//! piece of a fresh sharing of *zero*. The Lagrange interpolation of the new shares is
-//! `secret + 0`, so the group key is untouched, while each individual share is a new
-//! random value that has no relation to the old one. `frost_core` implements it in
-//! `keys::refresh`; `reddsa`'s redpallas module does not re-export it, but its key types
-//! are plain aliases of the `frost_core` generics over `PallasBlake2b512`
-//! (reddsa-0.5.2/src/frost/redpallas.rs:286,300,306), so the generic functions apply
-//! directly. The two wrappers below exist only to pin the ciphersuite.
-//!
-//! This is the trusted-dealer variant. "Trusted" overstates it: the refreshing shares
-//! are shares of zero, so whoever computes them learns nothing about the group secret
-//! and cannot forge with them. They do have to be delivered confidentially — a
-//! refreshing share disclosed alongside the old share reconstructs the new one.
-//! `frost_core::keys::refresh` also has a no-dealer DKG variant (`refresh_dkg_part1` /
-//! `_part2` / `refresh_dkg_shares`) if that delivery assumption is unacceptable.
-
 use reddsa_frost::frost::redpallas as frost;
 
-/// The dealer half: compute one refreshing share per member, plus the new public key
-/// package. `members` must list every identifier that keeps a share — anyone omitted is
-/// removed from the group, which is the other thing this primitive is for.
-///
-/// The returned [`frost::keys::PublicKeyPackage`] carries the *same* verifying key and
-/// new verifying shares.
 pub fn compute_refreshing_shares(
     pubkeys: frost::keys::PublicKeyPackage,
     members: &[frost::Identifier],
@@ -39,9 +8,6 @@ pub fn compute_refreshing_shares(
     frost_core::keys::refresh::compute_refreshing_shares(pubkeys, members, rng)
 }
 
-/// The member half: fold a refreshing share into the share this member already holds.
-/// The old [`frost::keys::KeyPackage`] must be destroyed afterwards — it stays valid
-/// against the *old* public key package, and that is the whole point of rotating.
 pub fn refresh_share(
     refreshing_share: frost::keys::SecretShare,
     current: &frost::keys::KeyPackage,
@@ -57,7 +23,6 @@ mod tests {
 
     type Wallets = BTreeMap<frost::Identifier, frost::keys::KeyPackage>;
 
-    /// A fresh 2-of-3 group, in the shape the rest of the POC uses.
     fn group() -> (Wallets, frost::keys::PublicKeyPackage) {
         let (shares, pubkeys) = frost::keys::generate_with_dealer(
             3,
@@ -74,7 +39,6 @@ mod tests {
         (wallets, pubkeys)
     }
 
-    /// Rotate every member's share. Returns the new wallets and the new public package.
     fn rotate(
         wallets: &Wallets,
         pubkeys: frost::keys::PublicKeyPackage,
@@ -84,7 +48,6 @@ mod tests {
             compute_refreshing_shares(pubkeys, &ids, &mut rand_core::OsRng)
                 .expect("a zero-sharing for all three members");
 
-        // `compute_refreshing_shares` returns the shares in the order of `ids`.
         let new_wallets = ids
             .iter()
             .zip(refreshing)
@@ -109,8 +72,6 @@ mod tests {
         regtest_unified_address(&test_only_fvk(&ak).expect("a DKG group key is a valid ak"))
     }
 
-    /// Sign `msg` with exactly the first two members of `wallets`, verifying against
-    /// `pubkeys`. Mirrors `c1_1_frost_pallas_signs_with_a_saved_randomizer_seed`.
     fn sign_2_of_3(
         wallets: &Wallets,
         pubkeys: &frost::keys::PublicKeyPackage,
@@ -128,8 +89,6 @@ mod tests {
         )
     }
 
-    /// The signing half, with the signer set named explicitly so a test can mix an old
-    /// key package in with a new one.
     fn sign_with(
         signers: &[(frost::Identifier, &frost::keys::KeyPackage)],
         pubkeys: &frost::keys::PublicKeyPackage,
@@ -163,9 +122,6 @@ mod tests {
         params.randomized_verifying_key().verify(msg, &sig)
     }
 
-    /// THE headline property. Rotation must be invisible from the chain's point of view:
-    /// if the address moved, every note already paid to the vault would be stranded and
-    /// the feature would be a liability rather than an incident response.
     #[test]
     fn c5_rotation_leaves_the_vault_address_byte_identical() {
         let (wallets, pubkeys) = group();
@@ -177,8 +133,6 @@ mod tests {
         assert_eq!(before, after, "the vault address must survive a rotation");
     }
 
-    /// Rotation is not cosmetic: every member's secret share is a different scalar
-    /// afterwards, which is what makes the leaked copy worthless.
     #[test]
     fn c5_every_signing_share_actually_changes() {
         let (wallets, pubkeys) = group();
@@ -193,7 +147,6 @@ mod tests {
         }
     }
 
-    /// The new shares still sign, under the same group key, at the same threshold.
     #[test]
     fn c5_new_shares_sign_under_the_same_group_key() {
         let (wallets, pubkeys) = group();
@@ -208,15 +161,13 @@ mod tests {
         assert_eq!(new_wallets.len(), 3, "the group is still 2 of 3");
     }
 
-    /// The point of the exercise. A leaked share, replayed after rotation alongside an
-    /// honest refreshed one, must not aggregate into a usable signature.
     #[test]
     fn c5_a_leaked_old_share_no_longer_aggregates() {
         let (wallets, pubkeys) = group();
         let (new_wallets, new_pubkeys) = rotate(&wallets, pubkeys);
 
         let ids: Vec<_> = wallets.keys().copied().take(2).collect();
-        let leaked = &wallets[&ids[0]]; // the attacker's stale copy
+        let leaked = &wallets[&ids[0]];
         let honest = &new_wallets[&ids[1]];
 
         let err = sign_with(
@@ -226,8 +177,6 @@ mod tests {
         )
         .expect_err("a retired share must not help produce a signature");
 
-        // Aggregation checks each signature share against the refreshed verifying share,
-        // so the stale one is caught by name rather than producing a bad signature.
         assert_eq!(
             err,
             frost::Error::InvalidSignatureShare {
@@ -236,10 +185,6 @@ mod tests {
         );
     }
 
-    /// And the converse, so the test above is not passing for an unrelated reason: the
-    /// old shares as a complete set still work against the OLD public package. Rotation
-    /// invalidates them only once the group has moved on, which is why the old key
-    /// packages have to be destroyed rather than merely superseded.
     #[test]
     fn c5_old_shares_remain_valid_against_the_old_package() {
         let (wallets, pubkeys) = group();

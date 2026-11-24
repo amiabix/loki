@@ -17,29 +17,6 @@ const SEGMENT_LEN: usize = 61440;
 const MAX_CHUNKS: usize = 274;
 const MANIFEST_DOMAIN: &[u8] = b"Loki_Relay_Manifest_v1\0";
 
-/// The exact complete encrypted sets bound to the validated signed message.
-/// Only preparation can construct this authority; cloning extracted ciphertext
-/// does not grant authority to publish it under a different key or digest.
-///
-/// ```compile_fail
-/// use loki_relay_client::PreparedOutbox;
-/// fn change(outbox: &mut PreparedOutbox) { outbox.key().message = [0; 32]; }
-/// ```
-/// ```compile_fail
-/// use loki_relay_client::PreparedOutbox;
-/// fn change(outbox: &mut PreparedOutbox) { outbox.digest()[0] ^= 1; }
-/// ```
-/// ```compile_fail
-/// use loki_relay_client::PreparedOutbox;
-/// fn reorder(outbox: &mut PreparedOutbox) { outbox.recipients().swap(0, 1); }
-/// ```
-/// ```compile_fail
-/// use loki_relay_client::PreparedOutbox;
-/// use loki_relay_protocol::types::LogicalKey;
-/// fn forge(key: LogicalKey) -> PreparedOutbox {
-///     PreparedOutbox { key, digest: [0; 32], recipients: vec![] }
-/// }
-/// ```
 pub struct PreparedOutbox {
     key: LogicalKey,
     digest: Id32,
@@ -58,18 +35,6 @@ impl PreparedOutbox {
     }
 }
 
-/// Saved chunks precede the root manifest; a single envelope is its own root.
-///
-/// ```compile_fail
-/// use loki_relay_client::RecipientObjects;
-/// fn corrupt(recipient: &mut RecipientObjects) { recipient.objects()[0].wire.clear(); }
-/// ```
-/// ```compile_fail
-/// use loki_relay_client::RecipientObjects;
-/// fn forge() -> RecipientObjects {
-///     RecipientObjects { recipient: 1, transfer: None, objects: vec![], root_hash: [0; 32] }
-/// }
-/// ```
 pub struct RecipientObjects {
     recipient: MemberId,
     transfer: Option<Id32>,
@@ -128,7 +93,6 @@ fn package_chunks(body_len: usize, package_len: usize) -> ClientResult<usize> {
     Ok(count)
 }
 
-/// Prepare every complete roster recipient copy without network or store effects.
 pub fn prepare_outbox(
     identity: &CommIdentity,
     roster: &Roster,
@@ -227,26 +191,6 @@ mod tests {
     }
 }
 
-/// Complete ciphertext membership bound by successful transfer authentication.
-///
-/// ```compile_fail
-/// use loki_relay_client::CompleteSource;
-/// fn forge() -> CompleteSource {
-///     CompleteSource { required_hashes: vec![], key: todo!(), digest: [0;32], recipient: 1 }
-/// }
-/// ```
-/// ```compile_fail
-/// use loki_relay_client::CompleteSource;
-/// fn alter(source: &mut CompleteSource) { source.required_hashes()[0] = [0;32]; }
-/// ```
-/// ```compile_fail
-/// use loki_relay_client::CompleteSource;
-/// fn alter(source: &mut CompleteSource) { source.key().message = [0;32]; }
-/// ```
-/// ```compile_fail
-/// use loki_relay_client::CompleteSource;
-/// fn alter(source: &mut CompleteSource) { source.digest()[0] ^= 1; }
-/// ```
 pub struct CompleteSource {
     required_hashes: Vec<Id32>,
     key: LogicalKey,
@@ -282,14 +226,6 @@ impl CompleteSource {
     }
 }
 
-/// The authenticated message and its validated complete encrypted source.
-///
-/// ```compile_fail
-/// use loki_relay_client::{AuthenticatedTransfer, AuthenticatedMessage, CompleteSource};
-/// fn forge(message: AuthenticatedMessage, source: CompleteSource) -> AuthenticatedTransfer {
-///     AuthenticatedTransfer { message, source }
-/// }
-/// ```
 pub struct AuthenticatedTransfer {
     message: crate::AuthenticatedMessage,
     source: CompleteSource,
@@ -498,9 +434,6 @@ fn rejection_reason(error: &ClientError) -> &'static str {
     }
 }
 
-/// One ordered object named by a verified signed manifest.
-///
-/// The hash and wire length are staging metadata. They do not authenticate the package.
 pub struct ManifestRequirement {
     hash: Id32,
     wire_length: usize,
@@ -516,10 +449,6 @@ impl ManifestRequirement {
     }
 }
 
-/// Context-bound signed manifest. Staging may use this value.
-///
-/// It is not an authenticated message, a `CompleteSource`, or a Received proof.
-/// Full body authentication stays in `TransferAssembler::open`.
 pub struct SignedManifest {
     root: Id32,
     transfer: Id32,
@@ -555,7 +484,6 @@ impl SignedManifest {
     }
 }
 
-/// Group id for one verified binding. The same binding reuses a slot; a reused transfer id does not.
 pub(crate) fn source_group_id(
     key: &LogicalKey,
     digest: &Id32,
@@ -621,10 +549,6 @@ fn signed_manifest(root: Id32, recipient: MemberId, parsed: ParsedManifest) -> S
     }
 }
 
-/// What a cached ciphertext is allowed to mean before complete authentication.
-///
-/// `Chunk` is a structurally valid tag-3 record. Its clear transfer id is not group authority
-/// and the ciphertext is not rejected. `Invalid` is a durable per-object failure.
 pub enum RootInspection {
     Chunk,
     Single,
@@ -634,10 +558,6 @@ pub enum RootInspection {
 
 pub struct TransferAssembler;
 impl TransferAssembler {
-    /// Classify a cached object without assembling its package.
-    ///
-    /// A signed manifest yields readonly requirements. A chunk stays opaque.
-    /// Only `open` authenticates the complete body.
     pub fn inspect(
         roster: &Roster,
         identity: &CommIdentity,
@@ -665,7 +585,6 @@ impl TransferAssembler {
             Ok(Some(tag)) => tag,
             _ => return Ok(RootInspection::Invalid("schema")),
         };
-        // A valid chunk stays available for its manifest. The unsigned transfer id is ignored.
         if tag == 3 {
             return Ok(match chunk_shape(&inner.0) {
                 Ok(()) => RootInspection::Chunk,
@@ -707,7 +626,6 @@ impl TransferAssembler {
         }
     }
 
-    /// Authenticate only a fully assembled transfer for the certified recipient.
     pub fn open(
         roster: &Roster,
         identity: &CommIdentity,

@@ -1,13 +1,3 @@
-// The signer-origin page. It runs on its own origin (serve.mjs), embedded by the wallet in an
-// iframe, and is the ONLY place the custody secrets are entered: the passkey PRF ceremony, the
-// passphrase, the roster-code comparison and every payment approval happen here, in this
-// origin's JS, never in wallet-page JS. It owns the signer Worker (signer-worker.js).
-//
-// The wallet talks to it only over postMessage, carrying public data: {id, op, params} in,
-// {id, ok, result | error, status} out, plus {cmd: "ready" | "failed" | "show" | "hide"} so the wallet
-// can reveal the iframe while a prompt needs the member. Messages from any origin other than
-// the configured wallet origin, or from any window other than the embedding parent, are dropped.
-
 import { requirePersistentStorage, requireShare } from "./storage-guard.js";
 
 const cfg = await fetch("./config.json", { cache: "no-store" }).then((r) => r.json());
@@ -36,11 +26,10 @@ const owner = embedded && await new Promise((resolve) => {
   if (!navigator.locks) { resolve(false); return; }
   navigator.locks.request("loki-signer", { ifAvailable: true }, (lock) => {
     resolve(!!lock);
-    return lock ? new Promise(() => {}) : undefined; // held until this page unloads
+    return lock ? new Promise(() => {}) : undefined;
   });
 });
 
-// ─── the Worker ──────────────────────────────────────────────────────────────
 let worker, workerFailure, dismissPrompt;
 const pending = new Map();
 let seq = 0;
@@ -76,7 +65,6 @@ async function call(msg) {
   });
 }
 
-// ─── prompts ─────────────────────────────────────────────────────────────────
 function el(tag, props = {}, ...children) {
   const n = Object.assign(document.createElement(tag), props);
   for (const c of children) n.append(c);
@@ -88,9 +76,6 @@ function facts(rows) {
   return dl;
 }
 
-// Show one prompt and resolve with the value of the button the member pressed. A button's
-// `run` (async, called inside the click so WebAuthn keeps its user activation) may throw to
-// keep the prompt open with the error shown, or return the value to resolve with.
 function prompt(title, body, buttons) {
   if (workerFailure) throw workerFailure;
   const main = $("prompt");
@@ -115,12 +100,11 @@ function prompt(title, body, buttons) {
       const btn = el("button", { textContent: b.label, className: b.ghost ? "ghost" : "" });
       btn.onclick = async () => {
         if (b.cancel) {
-          if ("value" in b) done(() => resolve(b.value)); // A worker decision can decline explicitly.
+          if ("value" in b) done(() => resolve(b.value));
           else dismissPrompt(new SignerError("Cancelled on the signer", 400));
           return;
         }
         for (const [i, x] of Array.from(actions.children).entries()) x.disabled = !(b.abortable && buttons[i].cancel);
-        // A credential prompt can be cancelled, but not a write already dispatched to the worker.
         const commit = () => {
           wait.signal.throwIfAborted();
           for (const x of actions.children) x.disabled = true;
@@ -140,7 +124,6 @@ function prompt(title, body, buttons) {
 }
 const cancelButton = { label: "Cancel", ghost: true, cancel: true };
 
-// ─── WebAuthn PRF (the custody secret is released here, on the signer origin) ─────────────
 const PRF_SALT = new TextEncoder().encode("loki/signer/share-kek/v1");
 const CRED = "loki_passkey_cred";
 const toHex = (b) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
@@ -166,9 +149,6 @@ async function createPasskey(name, attachment, signal) {
   return new Uint8Array(cred.rawId);
 }
 
-// A fresh user-verified assertion releasing the PRF secret. The remembered credential id is
-// only a hint: without it (cleared storage) the authenticator offers its discoverable Loki
-// passkeys for this rpId.
 function rememberedCredential() {
   try { const h = localStorage.getItem(CRED); if (/^(?:[0-9a-f]{2})+$/.test(h ?? "")) return fromHex(h); } catch {}
 }
@@ -197,7 +177,6 @@ async function submitPasskey(id, signal, commit, submit) {
   const assertion = await passkeyAssertion(id, signal);
   commit();
   const result = await submit({ prfSecret: assertion.prfSecret }, assertion.id);
-  // A valid WebAuthn assertion is not necessarily the passkey that opens this signer.
   if (embedded) rememberCredential(assertion.id);
   return result;
 }
@@ -206,26 +185,19 @@ function rememberCredential(id) {
   try { localStorage.setItem(CRED, id); } catch {}
 }
 
-// Passphrase floor for the passphrase tier: long enough that the offline Argon2id guess
-// cost dominates. ponytail: length-only rule; add a strength estimator if users pick weak long phrases.
 const MIN_PASSPHRASE = 12;
 function passField(label, autocomplete) {
   return el("input", { type: "password", autocomplete, spellcheck: false, placeholder: label });
 }
 
-// ─── custody: create / unlock / reauthorize ──────────────────────────────────
-let current = null; // { profile, se }
+let current = null;
 let persisted = null;
 
-// A share is sealed only while the browser keeps this origin's storage persistent
-// (storage-guard.js); each unlock re-reads it so a lost grant shows in status.
 async function persistent() {
   await requirePersistentStorage(navigator.storage);
   persisted = true;
 }
 
-// Ask for a new custody secret (a passphrase typed twice, or a new passkey) and pass it to
-// `submit`, which seals the signer under it.
 function newCustody(name, method, submit) {
   if (method === "passphrase") {
     const a = passField("Passphrase", "new-password"), b = passField("Repeat passphrase", "new-password");
@@ -274,8 +246,6 @@ async function unlock({ method }) {
   return { profile: result, persisted };
 }
 
-// A fresh proof the member is present, for one approval: a new passkey assertion, or the
-// passphrase typed again. The Worker checks it re-derives the unlocked KEK before signing.
 function reauthField() {
   return current?.se === "passkey" ? null : passField("Passphrase", "current-password");
 }
@@ -341,9 +311,6 @@ async function showRecoveryExport({ vault, blob }) {
   } }]);
 }
 
-// Restore a vault member into this browser from its words and backup file.
-// The backup is opaque ciphertext, so the wallet may hand it over (`backup`, hex, with its
-// `vault`), e.g. one the member kept with the coordinator; otherwise the member picks the file.
 async function restore({ vault, name, method = "platform", backup }) {
   const existing = current !== null;
   if (!existing && await call({ op: "has" })) throw new SignerError("Unlock your signer before restoring another vault", 401);
@@ -388,8 +355,6 @@ async function showRestore({ vault, name, method, backup, existing }, _context, 
   return newCustody(name, method, (secret, credentialId) => submit({ input, secret, credentialId }));
 }
 
-// Only the tab opened by this signer frame can send a removal confirmation. Its private port
-// bridges the two storage partitions without giving the top-level tab a worker or a lock.
 function manageCustody() {
   return prompt("Open signer controls", [
     el("p", { textContent: `Continue in a separate tab. Check its address is ${location.origin} before verifying your identity there.` }),
@@ -499,8 +464,6 @@ async function showCustodyControls() {
   void prompt("Signer removed", [el("p", { textContent: "This wallet's local shares were removed. Return to the wallet to restore from a recovery backup." })], []);
 }
 
-// The locked-down tab cannot read the wallet's storage partition. Send only the public
-// derivation from this frame's unlocked worker, and never accept operations on the port.
 async function openReceiveAddress(payment) {
   const receive = await call({ op: "address", payment });
   return prompt("Verify receive address", [
@@ -554,7 +517,6 @@ async function showReceiveAddress() {
   $("actions").append(copy);
 }
 
-// ─── Worker asks: on-device decisions ────────────────────────────────────────
 const zec = (zat) => `${(Number(zat) / 1e8).toFixed(8)} TAZ`;
 const asks = {
   "roster-members": (d) => openTopLevelConsent(joinPath, "roster-members", d),
@@ -585,8 +547,6 @@ async function openRecovery(kind, details, submit) {
   return value;
 }
 
-// One private port for the tab opened by this launcher. A recovery write, if any, is
-// supplied by the frame so the tab cannot choose an operation or open custody storage.
 function openTopLevelConsent(path, kind, details, submit) {
   const openedFor = current;
   return prompt("Continue in the Loki signer tab", [
@@ -644,15 +604,12 @@ function openTopLevelConsent(path, kind, details, submit) {
   } }]);
 }
 
-// These prompts are only rendered by showTopLevelConsent on their unframeable routes.
 const joinPrompts = {
-  // The full member list, before this member tells the creator it agrees.
   "roster-members": (d) => prompt(`Join "${d.name}"?`, [
     el("p", { textContent: `${d.threshold} of ${d.members.length} members must approve each payment. Network: ${d.network}. You are member ${d.slot}.` }),
     el("ul", {}, ...d.members.map((m) => el("li", { className: "mono", textContent: `#${m.id}${m.id === d.slot ? " (you)" : ""} signing ${m.signing.slice(0, 16)}… relay ${m.encryption.slice(0, 16)}…` }))),
   ], [{ label: "Reject", ghost: true, value: false }, { label: "These are the members", value: true }]),
 
-  // The 24-digit roster code, compared out of band with every other member.
   "roster-code": (d) => prompt("Compare this code with every other member", [
     el("p", { className: "code", textContent: d.code }),
     el("p", { textContent: "Every member's signer must show exactly these digits. If any differ, someone changed the vault setup." }),
@@ -681,8 +638,6 @@ const paymentPrompts = {
     el("p", { textContent: "Nothing is signed yet: the transaction itself is checked against these terms before you sign." }),
   ], [{ label: "Decline", ghost: true, value: false }, { label: "Approve request", value: true }]),
 
-  // The signer's OWN parse of the candidate transaction, after it matched the approved terms.
-  // Signing needs a fresh passkey assertion (or the passphrase again).
   "payment-sign": (d, { passkey, credentialId }) => {
     const field = passkey ? null : passField("Passphrase", "current-password");
     return prompt("Sign this transaction?", [
@@ -705,7 +660,6 @@ async function showTopLevelConsent(prompts) {
     return;
   }
   const { port, context } = connection;
-  // For writes the frame closes this tab on success and sends errors back for retry.
   const submit = (data) => new Promise((_, reject) => {
     port.onmessage = ({ data: { error } }) => reject(new SignerError(error));
     port.postMessage(data);
@@ -726,9 +680,6 @@ async function answerAsk(d) {
   if (!workerFailure) worker.postMessage(reply);
 }
 
-// ─── enrollment: the device-login key lives on the signer origin ────────────────────────
-// A non-extractable P-256 key in this origin's IndexedDB, authorized by the member identity in
-// wasm. The wallet sees only public enrollment material and the transcript signature.
 function idb() {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open("loki_signer", 1);
@@ -762,8 +713,6 @@ async function enrollBegin() {
   enrollment = { signing_pubkey: material.signing_pubkey, relay_pubkey: material.relay_pubkey, device_pubkey, authorization };
   return enrollment;
 }
-// Sign the coordinator's registration transcript. The coordinator is the wallet origin; the
-// transcript binds it, the enrollment above and the coordinator's challenge — nothing else.
 async function enrollSign({ challenge, replacement_generation, relay_challenge_pubkey }) {
   if (!enrollment) throw new SignerError("Start enrollment first", 400);
   if (typeof challenge !== "string" || !/^[0-9a-f]{64}$/.test(challenge)) throw new SignerError("invalid challenge", 400);
@@ -781,7 +730,6 @@ async function enrollSign({ challenge, replacement_generation, relay_challenge_p
   return proof;
 }
 
-// ─── the wallet bridge ───────────────────────────────────────────────────────
 const relay = (p) => ({ ...p, frostdUrl: cfg.frostdUrl, nonceWitnesses: cfg.nonceWitnesses });
 const ops = {
   has: () => call({ op: "has" }),
@@ -794,7 +742,6 @@ const ops = {
   lock: async () => { if (worker) await call({ op: "lock" }); current = null; enrollment = null; return null; },
   "enroll-begin": enrollBegin,
   "enroll-sign": enrollSign,
-  // A vault backup must also seal to recovery words, so set them up before the first join.
   join: async (p) => {
     if (!(await call({ op: "recovery-status" })).recovery_identity) await recoverySetup();
     return call({ op: "join", join: { ...relay(p), network: cfg.network } });
@@ -814,11 +761,9 @@ const ops = {
   "manage-custody": manageCustody,
 };
 const UNLOCKED = new Set(["join", "payment-review", "payment-approve", "pending", "vaults", "address", "verify-address", "chain", "payment-status", "recovery-setup", "recovery-export", "recovery-status", "manage-custody"]);
-// Ops that may show a prompt run one at a time; the read-only ones answer alongside them
-// (the Worker refuses them with "busy" while a join or payment holds the vault).
 const PROMPTING = new Set(["create", "unlock", "join", "verify-address", "payment-approve", "recovery-setup", "recovery-export", "restore", "manage-custody"]);
 
-let queue = Promise.resolve(); // one op (and so one prompt) at a time
+let queue = Promise.resolve();
 addEventListener("message", (e) => {
   if (!embedded || e.origin !== wallet || e.source !== parent) return;
   const { id, op, params } = e.data ?? {};
@@ -836,7 +781,7 @@ addEventListener("message", (e) => {
   else run();
 });
 if (embedded) {
-  if (!owner) parent.postMessage({ cmd: "ready" }, wallet); // Report the existing other-tab error per call.
+  if (!owner) parent.postMessage({ cmd: "ready" }, wallet);
   else try {
     worker = new Worker("./signer-worker.js", { type: "module" });
     worker.addEventListener("message", receiveWorker);

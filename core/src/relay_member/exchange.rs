@@ -152,7 +152,6 @@ pub(crate) fn atomic_publish(directory: &Path, name: &str, bytes: &[u8]) -> Memb
     let mut file = options.open(&temp).map_err(|_| MemberError::Io)?;
     file.write_all(bytes).map_err(|_| MemberError::Io)?;
     sync(&file, 1)?;
-    // A failed publication retains its private temporary file for inspection.
     match fs::hard_link(&temp, &path) {
         Ok(()) => (),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {

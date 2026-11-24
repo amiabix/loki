@@ -7,12 +7,11 @@ const button = "btn-glass w-full min-w-0 rounded-full px-5 py-3.5 font-medium tr
 
 export function NativeTabConnection({ member, slot, disabled, onBusy, onConnected }: {
   member?: Slot;
-  slot?: number; // May be a slot just reserved with the pairing link, not yet on the roster.
+  slot?: number;
   disabled: boolean;
   onBusy: (busy: boolean) => void;
   onConnected: () => void;
 }) {
-  // Existing members select their flow from the signed registration field, not tab state.
   const lokiSigner = slot !== undefined && (!member || member.lokisigner_url !== undefined);
   const [link, setLink] = useState("");
   const [progress, setProgress] = useState<ConnectProgress>();

@@ -31,19 +31,14 @@ pub fn device_id(device_pub: &[u8]) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("bad device key: {e}"))
 }
 
-/// The service-side record of the devices allowed to act for one recovery identity.
 #[derive(Clone)]
 pub struct DeviceRegistry {
     recovery_signing_pub: [u8; 32],
-    /// SEC1-encoded device public key -> still active (set to `false` on revoke).
     devices: BTreeMap<Vec<u8>, bool>,
-    /// Nonce -> issuance time, grant digest, used (retained until expiry for rate accounting).
     challenges: BTreeMap<[u8; 32], (Instant, [u8; 32], bool)>,
 }
 
 impl DeviceRegistry {
-    /// A fresh registry bound to a recovery identity's device-authorization public key
-    /// ([`crate::signer::recovery::RecoveryKey::signing_public`]).
     pub fn new(recovery_signing_pub: [u8; 32]) -> Self {
         Self {
             recovery_signing_pub,
@@ -52,9 +47,6 @@ impl DeviceRegistry {
         }
     }
 
-    /// Enroll a device the recovery identity has authorized. `device_pub` is a SEC1 P-256
-    /// point; `authorization` is `RecoveryKey::authorize_device(device_pub)`. Rejects a bad
-    /// authorization (wrong recovery key) or an unparseable device key.
     pub fn enroll(&mut self, device_pub: &[u8], authorization: &[u8; 64]) -> Result<(), String> {
         let id = device_id(device_pub)?;
         if self.devices.get(&id) == Some(&false) {
@@ -65,7 +57,6 @@ impl DeviceRegistry {
         Ok(())
     }
 
-    /// The store supplies the current profile/device generation, never the requester.
     pub fn enroll_renewal(
         &mut self,
         device_pub: &[u8],
@@ -79,7 +70,6 @@ impl DeviceRegistry {
         Ok(())
     }
 
-    /// Expire login challenges, and limit issuance even when a caller immediately uses them.
     pub fn issue_challenge(&mut self, grant: [u8; 32]) -> Option<[u8; 32]> {
         let now = Instant::now();
         self.challenges
@@ -100,9 +90,6 @@ impl DeviceRegistry {
         Some(challenge)
     }
 
-    /// Verify a device's response to a challenge this registry issued. The challenge is
-    /// consumed (one-time), so a captured response cannot be replayed; the device must be
-    /// enrolled and not revoked.
     pub fn verify_login(
         &mut self,
         device_pub: &[u8],
@@ -127,8 +114,6 @@ impl DeviceRegistry {
         }
     }
 
-    /// Revoke a compromised device. Its future logins fail; re-keying the vault to retire its
-    /// share is a separate group action.
     pub fn revoke(&mut self, device_pub: &[u8]) {
         if let Ok(id) = device_id(device_pub) {
             if let Some(active) = self.devices.get_mut(&id) {
@@ -139,8 +124,6 @@ impl DeviceRegistry {
     }
 }
 
-/// Shared P-256 verifier for login nonces and domain-separated registration transcripts.
-/// Apple signs messages with ECDSA/SHA-256; accept its DER and the fixed-width encoding.
 pub fn verify_device_signature(
     device_pub: &[u8],
     message: &[u8],
@@ -161,8 +144,6 @@ mod tests {
     use crate::signer::recovery::RecoveryKey;
     use p256::ecdsa::{signature::Signer, SigningKey};
 
-    /// A software stand-in for the Enclave login key: a P-256 signing key + its SEC1 public
-    /// point, returning DER signatures just like `ecdsaSignatureMessageX962SHA256`.
     fn device() -> (SigningKey, Vec<u8>) {
         let sk = SigningKey::random(&mut rand_core::OsRng);
         let pubkey = sk
@@ -196,18 +177,15 @@ mod tests {
         let mut registry = DeviceRegistry::new(recovery.signing_public());
         let (sk, device_pub) = device();
 
-        // New phone: the recovery words authorize this device key, then it enrolls.
         let authz = recovery.authorize_device(&device_pub);
         registry.enroll(&device_pub, &authz).unwrap();
 
-        // Daily login: challenge -> device signs -> verified.
         let challenge = registry.issue_challenge([0; 32]).unwrap();
         let sig = sign(&sk, &challenge);
         registry
             .verify_login(&device_pub, &challenge, &sig)
             .unwrap();
 
-        // The same (challenge, signature) cannot be replayed — the challenge was consumed.
         assert!(registry
             .verify_login(&device_pub, &challenge, &sig)
             .is_err());
@@ -219,7 +197,6 @@ mod tests {
         let mut registry = DeviceRegistry::new(recovery.signing_public());
         let (_sk, device_pub) = device();
 
-        // Authorization made by a DIFFERENT recovery identity (an attacker's words).
         let (_w2, other) = RecoveryKey::generate().unwrap();
         let forged = other.authorize_device(&device_pub);
         assert!(registry.enroll(&device_pub, &forged).is_err());
@@ -251,14 +228,12 @@ mod tests {
             .enroll(&device_pub, &recovery.authorize_device(&device_pub))
             .unwrap();
 
-        // Unknown device (never enrolled).
         let (sk2, other_pub) = device();
         let challenge = registry.issue_challenge([0; 32]).unwrap();
         assert!(registry
             .verify_login(&other_pub, &challenge, &sign(&sk2, &challenge))
             .is_err());
 
-        // A challenge the registry never issued (attacker-chosen).
         let bogus = [9u8; 32];
         assert!(registry
             .verify_login(&device_pub, &bogus, &sign(&sk, &bogus))
@@ -275,7 +250,6 @@ mod tests {
             .unwrap();
 
         let issued = registry.issue_challenge([0; 32]).unwrap();
-        // Device signs a different nonce than the one issued.
         let sig = sign(&sk, &[1u8; 32]);
         assert!(registry.verify_login(&device_pub, &issued, &sig).is_err());
     }

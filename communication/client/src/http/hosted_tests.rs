@@ -21,7 +21,6 @@ fn trusted_client() -> RelayHttp {
     RelayHttp {
         client: RelayHttp::client_builder()
             .timeout(Duration::from_secs(3))
-            // The owned TLS fixture is not a permitted production destination.
             .resolve("localhost", "127.0.0.1:0".parse().unwrap())
             .resolve("mismatch.example", "127.0.0.1:0".parse().unwrap())
             .tls_certs_only([reqwest::Certificate::from_pem(ROOT).unwrap()])

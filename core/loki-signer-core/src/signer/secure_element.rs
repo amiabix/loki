@@ -48,29 +48,21 @@ impl std::fmt::Display for OpenError {
 /// behind it (ws1-signer §4 "Hardware path"). A KEK never leaves the element — only
 /// wrapped DEKs cross this boundary.
 pub trait SecureElement {
-    /// Wrap a freshly generated 32-byte DEK under the element's KEK.
     fn wrap_dek(&self, dek: &[u8; 32]) -> Result<WrappedDek, String>;
-    /// Release the DEK after unlock. The caller must zeroize the result.
     fn unwrap_dek(&self, wrapped: &WrappedDek) -> Result<Zeroizing<[u8; 32]>, OpenError>;
 }
 
-/// Software fallback KEK (desktop without a TPM, ws1-signer §4 reduced-guarantee row).
-/// The KEK sits in process memory; a real element keeps it non-exportable. The wrap
-/// format is XChaCha20-Poly1305(KEK) over the DEK, so the on-disk DEK is ciphertext.
 pub struct SoftwareSecureElement {
     kek: Zeroizing<[u8; 32]>,
 }
 
 impl SoftwareSecureElement {
-    /// A random KEK. In production this handle is the element itself, not raw bytes.
     pub fn generate() -> Self {
         let mut kek = Zeroizing::new([0u8; 32]);
         OsRng.fill_bytes(&mut *kek);
         Self { kek }
     }
 
-    /// Reconstruct from a persisted KEK (software fallback only; real elements never
-    /// expose this). Used so a restarted process can unwrap DEKs it sealed before.
     pub fn from_kek(kek: [u8; 32]) -> Self {
         Self {
             kek: Zeroizing::new(kek),
@@ -115,10 +107,6 @@ impl SoftwareSecureElement {
         Ok(Self::from_kek(kek))
     }
 
-    /// Derive the KEK straight from a passphrase over an explicit `salt` (Argon2id, the same
-    /// stretch as the native `kek.sealed`). The in-browser signer owns its salt file in OPFS
-    /// rather than the native `MemberDir` sealed-KEK layout, so this skips `std::fs` entirely
-    /// while keeping the derivation identical. Pair with [`fresh_kek_salt`] on first create.
     pub fn from_passphrase(passphrase: &str, salt: &[u8]) -> Result<Self, String> {
         let kek = crate::seal_kdf::derive(passphrase, salt)
             .map_err(|_| "passphrase KEK derivation failed (salt too short?)".to_string())?;
@@ -130,8 +118,6 @@ impl SoftwareSecureElement {
     }
 }
 
-/// A fresh 16-byte Argon2id salt for [`SoftwareSecureElement::from_passphrase`]. The
-/// in-browser signer persists this beside the sealed share so a reload re-derives the KEK.
 pub fn fresh_kek_salt() -> [u8; 16] {
     let mut salt = [0u8; 16];
     OsRng.fill_bytes(&mut salt);
@@ -186,7 +172,6 @@ impl SecureElement for SoftwareSecureElement {
 const SHARE_MAGIC: &[u8; 8] = b"LOKISHR1";
 const SHARE_AAD: &[u8] = b"Loki_signer_share_seal_v1";
 
-/// The associated data binding one signer file to its type, vault and member.
 pub fn file_binding(kind: &str, vault: &[u8; 32], member: u16) -> Vec<u8> {
     let mut out = b"Loki_signer_file_v2".to_vec();
     out.push(kind.len() as u8);
@@ -202,8 +187,6 @@ pub fn file_binding(kind: &str, vault: &[u8; 32], member: u16) -> Vec<u8> {
 /// which needs the matching [`SecureElement`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SealedShare {
-    /// Rolls forward on restore-from-backup so a rolled-back store is detectable
-    /// (ws1-signer §5, ties to nonce epoch in §8).
     pub backup_epoch: u64,
     wrapped_dek: WrappedDek,
     nonce: [u8; 24],
@@ -211,7 +194,6 @@ pub struct SealedShare {
 }
 
 impl SealedShare {
-    /// Seal `share` with a fresh random DEK wrapped by `se`. Plaintext never persists.
     pub fn seal(
         se: &impl SecureElement,
         backup_epoch: u64,
@@ -220,8 +202,6 @@ impl SealedShare {
         Self::seal_with_aad(se, backup_epoch, share, SHARE_AAD)
     }
 
-    /// Seal under a caller-supplied binding, so the blob opens only for the same binding.
-    /// Signer storage binds each file to its type, vault and member ([`file_binding`]).
     pub fn seal_bound(
         se: &impl SecureElement,
         backup_epoch: u64,
@@ -257,13 +237,10 @@ impl SealedShare {
         })
     }
 
-    /// Unwrap the DEK via `se`, then AEAD-decrypt the share. Caller zeroizes the result.
     pub fn open(&self, se: &impl SecureElement) -> Result<Zeroizing<Vec<u8>>, String> {
         self.open_bound(se, SHARE_AAD).map_err(|e| e.to_string())
     }
 
-    /// Open a blob sealed with [`SealedShare::seal_bound`] under the same `binding`. A blob
-    /// moved to another file type, vault or member fails authentication.
     pub fn open_bound(
         &self,
         se: &impl SecureElement,
@@ -283,7 +260,6 @@ impl SealedShare {
         Ok(Zeroizing::new(plain))
     }
 
-    /// The exact ciphertext blob to write to disk. Never contains the share plaintext.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(SHARE_MAGIC);
@@ -328,7 +304,6 @@ mod tests {
         let share = b"a FROST signing share worth forging";
         let sealed = SealedShare::seal(&se, 1, share).unwrap();
         let blob = sealed.to_bytes();
-        // The plaintext share never appears in the on-disk bytes.
         assert!(!blob.windows(share.len()).any(|w| w == share));
         let reopened = SealedShare::from_bytes(&blob).unwrap();
         assert_eq!(reopened, sealed);
@@ -342,7 +317,6 @@ mod tests {
         let se = SoftwareSecureElement::from_passphrase("correct horse battery staple", &salt);
         let se = se.unwrap();
         let sealed = SealedShare::seal(&se, 0, b"device identity secret").unwrap();
-        // Same passphrase + same salt re-derive the KEK and reopen.
         let again =
             SoftwareSecureElement::from_passphrase("correct horse battery staple", &salt).unwrap();
         assert_eq!(
@@ -352,7 +326,6 @@ mod tests {
                 .unwrap(),
             b"device identity secret"
         );
-        // Wrong passphrase derives a different KEK and cannot open.
         let wrong = SoftwareSecureElement::from_passphrase("wrong", &salt).unwrap();
         assert!(sealed.open(&wrong).is_err());
     }

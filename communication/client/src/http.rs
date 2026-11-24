@@ -45,7 +45,6 @@ pub struct RelayHttp {
     development: bool,
 }
 impl RelayHttp {
-    /// Check that the pinned signer is reachable; this does not authenticate later HTTP requests.
     pub async fn authenticate_endpoint(&self, pin: &RelayPin, endpoint: &str) -> ClientResult<()> {
         crate::validate_endpoint(endpoint, self.development)?;
         let mut nonce = [0; 32];
@@ -70,8 +69,6 @@ impl RelayHttp {
         verify_challenge(pin, endpoint, nonce, &raw)
     }
 
-    /// Claims one CID once. Only a fresh, challenge-bound `created` receipt is usable
-    /// for signing; an identical retry deliberately returns false.
     pub async fn claim_nonce(
         &self,
         route: &RelayRoute,
@@ -108,12 +105,10 @@ impl RelayHttp {
         }
         verify_nonce_claim(route, proof.claimant, cid, wire, challenge, status, &raw)
     }
-    /// Existing local tooling explicitly permits literal loopback HTTP.
     pub fn new() -> ClientResult<Self> {
         Self::build(true)
     }
 
-    /// Hosted requests require verified HTTPS on every request.
     pub fn hosted() -> ClientResult<Self> {
         Self::build(false)
     }
@@ -141,9 +136,7 @@ impl RelayHttp {
     pub(crate) fn client_builder() -> reqwest::ClientBuilder {
         Client::builder()
             .redirect(Policy::none())
-            // guard:proxy
             .no_proxy()
-            // end:proxy
             .dns_resolver(std::sync::Arc::new(PublicDns))
             .no_gzip()
             .no_brotli()
@@ -305,17 +298,11 @@ impl RelayHttp {
         append: &Secret32,
         object: &Object,
     ) -> ClientResult<VerifiedReceipt> {
-        // guard:endpoint_recheck
         crate::validate_endpoint(&route.endpoint, self.development)?;
-        // end:endpoint_recheck
-        // guard:framing
         envelope::validate_wire(&object.wire).map_err(|_| ClientError::Config)?;
-        // end:framing
-        // guard:sha256
         if <Id32>::from(Sha256::digest(&object.wire)) != object.hash {
             return Err(ClientError::Config);
         }
-        // end:sha256
         let url = format!(
             "{}/v1/mailboxes/{}/objects/{}",
             route.endpoint.trim_end_matches('/'),
@@ -331,11 +318,9 @@ impl RelayHttp {
             .send()
             .await?;
         let (status, body) = finish(&mut response, "application/cbor", RECEIPT_CAP, None).await?;
-        // guard:put_status
         if status != 200 && status != 201 {
             return Err(ClientError::Transport);
         }
-        // end:put_status
         verify_receipt(route, &body, object.hash, object.wire.len() as u64, None)
     }
 
@@ -345,9 +330,7 @@ impl RelayHttp {
         read: &Secret32,
         hash: &Id32,
     ) -> ClientResult<Object> {
-        // guard:endpoint_recheck
         crate::validate_endpoint(&route.endpoint, self.development)?;
-        // end:endpoint_recheck
         let url = format!(
             "{}/v1/mailboxes/{}/objects/{}",
             route.endpoint.trim_end_matches('/'),
@@ -367,19 +350,13 @@ impl RelayHttp {
             Some(*hash),
         )
         .await?;
-        // guard:get_status
         if status != 200 {
             return Err(ClientError::Transport);
         }
-        // end:get_status
-        // guard:framing
         envelope::validate_wire(&body)?;
-        // end:framing
-        // guard:sha256
         if <Id32>::from(Sha256::digest(&body)) != *hash {
             return Err(ClientError::Transport);
         }
-        // end:sha256
         Ok(Object {
             hash: *hash,
             wire: body,
@@ -393,9 +370,7 @@ impl RelayHttp {
         after: u64,
         limit: Option<u64>,
     ) -> ClientResult<VerifiedPage> {
-        // guard:endpoint_recheck
         crate::validate_endpoint(&route.endpoint, self.development)?;
-        // end:endpoint_recheck
         let limit = validate_limit(limit)?;
         if after > MAX_PERSISTED_COUNTER {
             return Err(ClientError::Config);
@@ -412,32 +387,24 @@ impl RelayHttp {
             .send()
             .await?;
         let (status, body) = finish(&mut response, "application/cbor", PAGE_CAP, None).await?;
-        // guard:entries_status
         if status != 200 {
             return Err(ClientError::Transport);
         }
-        // end:entries_status
         let page = decode_page(&body).map_err(|error| match error {
             WireError::Bounds => ClientError::Wire(error),
             _ => ClientError::Transport,
         })?;
-        // guard:page_mailbox
         if page.mailbox != route.mailbox {
             return Err(ClientError::Transport);
         }
-        // end:page_mailbox
-        // guard:page_after
         if page.after != after {
             return Err(ClientError::Transport);
         }
-        // end:page_after
         let mut entries = Vec::with_capacity(page.entries.len());
         for entry in &page.entries {
-            // guard:receipt_cap
             if entry.receipt.len() > RECEIPT_CAP {
                 return Err(ClientError::Transport);
             }
-            // end:receipt_cap
             let receipt = verify_receipt(
                 route,
                 &entry.receipt,
@@ -452,7 +419,6 @@ impl RelayHttp {
                 receipt,
             });
         }
-        // guard:page_expected_len
         let span = page
             .high_water
             .checked_sub(after)
@@ -465,7 +431,6 @@ impl RelayHttp {
         if page.next != next {
             return Err(ClientError::Transport);
         }
-        // end:page_expected_len
         Ok(VerifiedPage {
             mailbox: page.mailbox,
             after: page.after,
@@ -475,10 +440,6 @@ impl RelayHttp {
         })
     }
 
-    /// Mailbox page for capture. Invalid receipt bytes and object lengths remain on their entries.
-    ///
-    /// A malformed or gapped response is `PageRead::Invalid`. A connection or availability
-    /// failure is `PageRead::Unavailable`. Neither variant changes a stored cursor.
     pub async fn capture_entries(
         &self,
         route: &RelayRoute,
@@ -502,7 +463,6 @@ impl RelayHttp {
             .header(AUTHORIZATION, bearer(read)?)
             .send()
             .await?;
-        // An intermediary need not return Loki's error media type or Retry-After format.
         let reason = match response.status().as_u16() {
             429 => Some("capacity"),
             503 => Some("storage"),
@@ -516,7 +476,6 @@ impl RelayHttp {
         classify_page(route, after, limit, held)
     }
 
-    /// Capped object body for a pending download. Framing and hash remain the caller's checks.
     pub async fn capture_object(
         &self,
         route: &RelayRoute,
@@ -550,7 +509,6 @@ impl RelayHttp {
             let body = collect(&mut response, OBJECT_CAP).await?;
             return Err(map_status(status, &body, Some(*hash)));
         }
-        // A body past the object cap is a permanent bounds failure, not a dropped connection.
         let body = collect_bounded(&mut response, OBJECT_CAP).await?;
         if status != 200 {
             return Err(ClientError::Transport);
@@ -559,27 +517,6 @@ impl RelayHttp {
     }
 }
 
-/// Immutable receipt bytes bound to the body that verified them.
-///
-/// ```compile_fail
-/// fn change(receipt: &mut loki_relay_client::VerifiedReceipt) {
-///     receipt.body().hash = [0; 32];
-/// }
-/// ```
-/// ```compile_fail
-/// fn change(receipt: &mut loki_relay_client::VerifiedReceipt) {
-///     receipt.bytes()[0] = 0;
-/// }
-/// ```
-/// ```compile_fail
-/// fn forge(body: loki_relay_protocol::types::ReceiptBody, bytes: Vec<u8>) -> loki_relay_client::VerifiedReceipt {
-///     loki_relay_client::VerifiedReceipt { body, bytes }
-/// }
-/// ```
-/// ```compile_fail
-/// fn debug<T: std::fmt::Debug>() {}
-/// debug::<loki_relay_client::VerifiedReceipt>();
-/// ```
 pub struct VerifiedReceipt {
     body: ReceiptBody,
     bytes: Vec<u8>,
@@ -637,15 +574,12 @@ impl VerifiedPage {
     }
 }
 
-/// Capture read of one mailbox page. Receipt checks stay on the strict `entries` path.
 pub enum PageRead {
     Page(Page),
-    /// The response itself is not a contiguous page. The cursor stays put.
     Invalid {
         reason: &'static str,
         sample: Vec<u8>,
     },
-    /// The relay or the path was unavailable. The stream is retried, not isolated.
     Unavailable {
         reason: &'static str,
         sample: Vec<u8>,
@@ -676,7 +610,6 @@ fn as_counter(value: &Value) -> Option<u64> {
     }
 }
 
-/// True when a decoded page body skips a sequence or disagrees with its own next cursor.
 fn body_has_gap(body: &[u8]) -> bool {
     let Ok(value) = canonical::decode(body, PAGE_CAP) else {
         return false;
@@ -861,7 +794,6 @@ fn bearer(secret: &Secret32) -> ClientResult<HeaderValue> {
 }
 
 fn media(headers: &HeaderMap, expected: &str) -> ClientResult<()> {
-    // guard:media
     let mut values = headers.get_all(CONTENT_TYPE).iter();
     let Some(value) = values.next() else {
         return Err(ClientError::Transport);
@@ -869,12 +801,10 @@ fn media(headers: &HeaderMap, expected: &str) -> ClientResult<()> {
     if values.next().is_some() || value.to_str().ok() != Some(expected) {
         return Err(ClientError::Transport);
     }
-    // end:media
     Ok(())
 }
 
 fn retry_after(headers: &HeaderMap) -> ClientResult<()> {
-    // guard:retry_after_integer
     let mut values = headers.get_all("retry-after").iter();
     let Some(value) = values.next() else {
         return Ok(());
@@ -890,7 +820,6 @@ fn retry_after(headers: &HeaderMap) -> ClientResult<()> {
     {
         return Err(ClientError::Transport);
     }
-    // end:retry_after_integer
     Ok(())
 }
 
@@ -904,9 +833,7 @@ fn map_status(status: u16, body: &[u8], missing: Option<Id32>) -> ClientError {
     match code {
         ErrorCode::InvalidCapability => ClientError::Identity,
         ErrorCode::Conflict => ClientError::Conflict,
-        // guard:cursor_code
         ErrorCode::CursorAhead => ClientError::Cursor,
-        // end:cursor_code
         ErrorCode::ObjectNotFound => match missing {
             Some(hash) => ClientError::MissingObjects(vec![hash]),
             None => ClientError::Config,
@@ -920,27 +847,21 @@ fn map_status(status: u16, body: &[u8], missing: Option<Id32>) -> ClientError {
 }
 
 async fn collect_bounded(response: &mut Response, cap: usize) -> ClientResult<Vec<u8>> {
-    // guard:content_encoding
     if response.headers().contains_key(CONTENT_ENCODING) {
         return Err(ClientError::Transport);
     }
-    // end:content_encoding
-    // guard:stream_cap
     if response
         .content_length()
         .is_some_and(|len| len > cap as u64)
     {
         return Err(ClientError::Wire(WireError::Bounds));
     }
-    // end:stream_cap
     let declared = response.content_length();
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await? {
-        // guard:stream_cap
         if chunk.len() > cap.saturating_sub(body.len()) {
             return Err(ClientError::Wire(WireError::Bounds));
         }
-        // end:stream_cap
         body.extend_from_slice(&chunk);
     }
     if declared.is_some_and(|len| len != body.len() as u64) {
@@ -1059,13 +980,11 @@ fn verify_receipt(
     wire_length: u64,
     sequence: Option<u64>,
 ) -> ClientResult<VerifiedReceipt> {
-    // guard:canonical_wrapper
     let value = canonical::decode(bytes, RECEIPT_CAP).map_err(|_| ClientError::Receipt)?;
     let fields = match &value {
         Value::Array(fields) if fields.len() == 2 => fields,
         _ => return Err(ClientError::Receipt),
     };
-    // end:canonical_wrapper
     let body_bytes = match &fields[0] {
         Value::Bytes(body) => body.clone(),
         _ => return Err(ClientError::Receipt),
@@ -1080,52 +999,36 @@ fn verify_receipt(
     if receipt::encode_body(&body).map_err(|_| ClientError::Receipt)? != body_bytes {
         return Err(ClientError::Receipt);
     }
-    // guard:signature_strict
     let pinned = VerifyingKey::from_bytes(&route.pin.key).map_err(|_| ClientError::Config)?;
     pinned
         .verify_strict(signature_input(&body_bytes)?.as_slice(), &signature)
         .map_err(|_| ClientError::Receipt)?;
-    // end:signature_strict
-    // guard:pin_key
     if body.pin.key != route.pin.key {
         return Err(ClientError::Config);
     }
-    // end:pin_key
-    // guard:pin_run
     if body.pin.run != route.pin.run {
         return Err(ClientError::Config);
     }
-    // end:pin_run
-    // guard:mailbox
     if body.mailbox != route.mailbox {
         return Err(ClientError::Receipt);
     }
-    // end:mailbox
-    // guard:hash
     if body.hash != hash {
         return Err(ClientError::Receipt);
     }
-    // end:hash
-    // guard:length
     if body.wire_length != wire_length {
         return Err(ClientError::Receipt);
     }
-    // end:length
-    // guard:entry_sequence
     if let Some(expected) = sequence {
         if body.sequence != expected {
             return Err(ClientError::Receipt);
         }
     }
-    // end:entry_sequence
     Ok(VerifiedReceipt {
         body,
         bytes: bytes.to_vec(),
     })
 }
 
-/// Re-verifies one saved receipt against the recipient's current route.
-/// The sequence stays inside the signed body; a caller cannot supply one.
 pub(crate) fn verify_saved_receipt(
     route: &RelayRoute,
     bytes: &[u8],

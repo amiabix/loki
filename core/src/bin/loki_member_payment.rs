@@ -1,6 +1,3 @@
-//! CLI bridge from separately created vaults to the FROST signing session.
-//! The shared directory is a local test courier; it is not a wallet relay or durable inbox.
-
 use std::{
     collections::BTreeMap,
     env, fs,
@@ -46,7 +43,6 @@ use zeroize::{Zeroize, Zeroizing};
 
 fn signer_set_from_name(name: &str, threshold: u16) -> Result<Vec<u16>, String> {
     let signers = name.bytes().map(|label| match label {
-        // Members 1 to 16 are letters A to P.
         b'A'..=b'P' => Ok(u16::from(label - b'A' + 1)),
         _ => Err("signer set must use member letters A through P".to_owned()),
     }).collect::<Result<Vec<_>, _>>()?;
@@ -95,7 +91,6 @@ fn member_rpc(member: &MemberState) -> Result<Rpc, String> {
     }
 }
 
-/// This member's wallet, first synced from lightwalletd when one is configured.
 fn wallet(member: &MemberState, owner: &Path, pass: &str) -> Result<VaultWallet, String> {
     match lightwalletd_url(member.network) {
         Some(url) => Ok(runtime()?.block_on(sync_member_wallet(member, owner, pass, &url))?.0),
@@ -112,7 +107,6 @@ fn runtime() -> Result<tokio::runtime::Runtime, String> {
         .map_err(|e| format!("start lightwalletd client: {e}"))
 }
 
-/// The wallet scan at the node's tip, checked against the node's own tree and block hash.
 fn synced_wallet(
     member: &MemberState, owner: &Path, pass: &str, rpc: &Rpc,
 ) -> Result<(VaultWallet, u32, NonEmptyFrontier<MerkleHashOrchard>), String> {
@@ -300,7 +294,7 @@ fn prepare(args: &[String], sweep: bool) -> Result<(), String> {
     let expiry = tip
         .checked_add(match member.network {
             VaultNetwork::Regtest => 8_064,
-            VaultNetwork::Testnet => 24_192, // roughly one week at Testnet's 25-second blocks
+            VaultNetwork::Testnet => 24_192,
         })
         .ok_or("expiry overflow")?
         .div_ceil(1_152)
@@ -356,8 +350,6 @@ fn prepare(args: &[String], sweep: bool) -> Result<(), String> {
     let mut file = options
         .open(&target)
         .map_err(|e| format!("{}: {e}", target.display()))?;
-    // Hold the inputs for this attempt so this member's next draft funds itself elsewhere.
-    // Only a saved manifest can release them later, so undo both if either step fails.
     let owner = LockOwner::new(attempt.0);
     let saved = wallet
         .reserve_inputs(owner, &intent.input_nullifiers, expiry)
@@ -708,7 +700,6 @@ fn package(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
     let session = reopen_signer(&member, &owner, &pass, &context, &intent)?;
-    // Another process may have saved the package before we acquired the signing lock.
     if SigningSession::republish_saved_package(&owner.join("signing"), &context, own, &pass, &mailbox)? {
         println!("payment package published; members may review");
         return Ok(());
@@ -880,7 +871,6 @@ fn review(args: &[String]) -> Result<(), String> {
 
 #[cfg(feature = "relay-communication")]
 fn approve(args: &[String], reviewed_token: bool) -> Result<(), String> {
-    // The caller must obtain explicit member consent to the displayed review; the token only binds bytes.
     if args.len() != if reviewed_token { 5 } else { 4 } {
         return Err(if reviewed_token {
             "approve-reviewed <member-dir> <passphrase-file> <roster.json> <work-dir> <review-token>"
@@ -1096,7 +1086,6 @@ fn finish(args: &[String], broadcast: bool) -> Result<(), String> {
         let (raw, txid) = prove(signed, sighash, witnesses, anchor)?;
         let (file, binding) = final_transaction_record(&context);
         let record = [&binding[..], txid.as_ref(), &raw].concat();
-        // A concurrent finisher cannot replace the first complete record.
         match MemberDir::open(&owner, "").write_sealed(&file, &record, &pass) {
             Ok(()) => (raw, txid),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
@@ -1107,7 +1096,6 @@ fn finish(args: &[String], broadcast: bool) -> Result<(), String> {
     } else {
         saved.unwrap()
     };
-    // Sync the directory also when retrying a write interrupted just after publication.
     #[cfg(unix)]
     fs::File::open(&owner).and_then(|dir| dir.sync_all()).map_err(|e| e.to_string())?;
     if wallet.mined_height(txid)?.is_none() {
@@ -1135,7 +1123,6 @@ fn finish(args: &[String], broadcast: bool) -> Result<(), String> {
             if result.is_err() && rpc.json("getrawtransaction", &format!("[\"{txid}\",0]"))
                 .is_ok_and(|reply| reply.as_str() == Some(&raw_hex)) { Ok(()) } else { result }
         };
-        // A rejection can follow an accepted send. Only a scan or expiry frees the inputs.
         sent.map_err(|e| format!("{e}; transaction {txid} saved, rerun finish to retry"))?;
     }
     let txid = txid.to_string();
@@ -1306,9 +1293,6 @@ fn verify(args: &[String]) -> Result<(), String> {
     {
         return Err("mined amount or change differs from approved intent".into());
     }
-    // Where it was mined, so a later recheck can ask only whether that block is still
-    // on the chain (`chain-check`).
-    // A node that does not report the block leaves the recheck to a full `verify`.
     let location = tx_json["blockhash"]
         .as_str()
         .filter(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
@@ -1360,7 +1344,6 @@ fn confirm_mined(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether block `hash` is still the chain's block at `height` (`getblockhash` only).
 fn chain_check(args: &[String]) -> Result<(), String> {
     let [network, height, hash] = args else {
         return Err("chain-check <regtest|testnet> <height> <block-hash>".into());
@@ -1408,8 +1391,6 @@ fn mined_spend_in_block(
     Ok(None)
 }
 
-/// Chain-derived txid discovery is a hint only. `verify` checks the exact
-/// approved candidate against the mined transaction before the app confirms it.
 fn find_mined(args: &[String]) -> Result<(), String> {
     if args.len() != 4 {
         return Err("find-mined <member-dir> <passphrase-file> <roster.json> <work-dir>".into());
@@ -1488,7 +1469,6 @@ fn receive(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// The node's block height only (`getblockcount`), for expiry checks that need no scan.
 fn tip(args: &[String]) -> Result<(), String> {
     if !args.is_empty() {
         return Err("tip".into());

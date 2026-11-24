@@ -1,12 +1,3 @@
-//! Test-only fixture for `wallet/test_hosted_app_flow.py`: initializes three owned
-//! development relays plus the admission signing material, signs a development
-//! operator bundle, and issues scoped enrollment grants.
-//!
-//! Every key here is a fixed, public test value. Never use this outside a disposable
-//! regtest run.
-//!
-//!   hosted_ops init <root> <relay-bin> <port1> <port2> <port3> <admission-port>
-//!   hosted_ops grant --device-key HEX --operator-bundle PATH --policy 2-of-N
 use ed25519_dalek::{Signer, SigningKey};
 use loki_relay_client::OperatorSet;
 use loki_relay_protocol::{admission, canonical::{self, Value}};
@@ -22,7 +13,6 @@ fn write(path: &Path, bytes: &[u8]) {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args[1].as_str() {
-        // init <root> <relay-bin> <port1> <port2> <port3> <admission-port>
         "init" => {
             let root = Path::new(&args[2]);
             fs::create_dir(root).unwrap();
@@ -74,7 +64,6 @@ fn main() {
             fs::write(root.join("provision-order"), order.join(" ")).unwrap();
             println!("{}", hex::encode(signer.verifying_key().to_bytes()));
         }
-        // grant --device-key HEX --operator-bundle PATH --policy 2-of-N
         "grant" => {
             let get = |k: &str| args.iter().position(|a| a == k).map(|i| args[i + 1].clone()).unwrap();
             let device = hex::decode(get("--device-key")).unwrap();

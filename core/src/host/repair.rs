@@ -1,28 +1,3 @@
-//! Relay-coordinated, member-local RTS share repair for hosted vaults.
-//!
-//! POST /api/repair-begin on the replacement: {vault, threshold, roster: [{id,
-//! signing, encryption}], roster_fingerprint, helpers: [id, ...], lost}. Pin the
-//! original roster fingerprint out of band, as in DKG. Returns {invite, fingerprint}.
-//! POST /api/repair-contribute on EACH helper: {invite, approve: fingerprint}.
-//! The member must compare that fingerprint with the replacement before approving:
-//! it authorizes that replacement identity, lost slot, helper set and fresh session.
-//! Both endpoints require the process token and an unlocked local profile. Poll either
-//! with {vault, session_id} for status; no peer HTTP endpoint or invite URL is fetched.
-//!
-//! All participants sign fresh-key announcements bound to the complete invitation.
-//! Helpers compare original sealed metadata digests before generating Deltas. Deltas
-//! and Sigmas (including original vault metadata) use DKG's signed, fresh-key E2E boxes;
-//! the frostd relay and its ephemeral session opener only handle ciphertext.
-//! Duplicate, replayed, wrong-session and wrong-identifier messages fail closed.
-//! Attempts expire after ten minutes. Transient receive errors are retried, but an
-//! ambiguous send or process restart requires a NEW begin and fresh helper consent.
-//! Consumed invitation records survive restart; ephemeral repair secrets never do.
-//!
-//! This restores vault.sealed only, never overwriting it. Device enrollment/revocation,
-//! identity restoration, native SecureElement signer state and backup refresh remain
-//! separate operations. RTS restores the SAME share/address, does not revoke a
-//! compromised share, and the underlying RTS implementation remains unaudited.
-
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
@@ -340,7 +315,6 @@ fn sender<'a>(
         .ok_or_else(|| "repair message from an unapproved sender".into())
 }
 
-/// Same Transport and v2 envelopes as DKG; only member-local code opens repair parts.
 fn run_ceremony<T: Transport>(
     tx: &T,
     ch: &T::Channel,
@@ -618,7 +592,6 @@ fn relay(identity: &Identity, url: &str) -> Result<FrostdTransport, String> {
 }
 fn claim(data: &Path, pass: &str, invite: &Invitation) -> Result<(), String> {
     let dir = MemberDir::create(&data.join("vaults"), &invite.vault).map_err(|e| e.to_string())?;
-    // Atomic no-replace write: even after a restart, one session can generate RTS parts only once.
     dir.write_sealed(
         &format!("repair.{}.sealed", invite.session_id),
         &encode(invite)?,
@@ -733,7 +706,6 @@ pub(super) async fn repair_contribute(State(st): State<Shared>, Json(body): Json
         let invite: Invitation =
             serde_json::from_value(body["invite"].clone()).map_err(|e| e.to_string())?;
         invite.validate()?;
-        // No caller-controlled URL is fetched, including redirects to creator peers.
         if invite.frostd_url != st.config.frostd_url || invite.network != st.config.network {
             return Err("repair relay or network is not locally configured".into());
         }
@@ -760,13 +732,6 @@ pub(super) async fn repair_contribute(State(st): State<Shared>, Json(body): Json
     .await
 }
 
-/// Reconstruct and verify the lost member's key, then create its `vault.sealed`.
-///
-/// The caller supplies authenticated original vault metadata and exactly one decrypted
-/// Sigma per approved helper from the same repair session. Map keys are authenticated
-/// sender identifiers, not sender claims. This checks membership, count, and the recovered
-/// public commitment; it cannot authenticate the session or the metadata itself.
-/// An existing vault is never overwritten, including on concurrent repair attempts.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn restore_vault_from_repair(
     data: &Path,
@@ -863,7 +828,6 @@ mod tests {
         };
         let dir = MemberDir::open(&data.join("vaults"), &vault);
 
-        // Invalid contributions must not create a vault, even if their sum is correct.
         let mut missing = parts.clone();
         missing.remove(&helpers[0]);
         assert!(restore(&missing, 2, &public).is_err());
@@ -903,7 +867,6 @@ mod tests {
         let restored = frost::keys::KeyPackage::deserialize(&key_bytes).unwrap();
         assert_eq!(restored.signing_share(), keys[&lost].signing_share());
         assert_eq!(restored.serialize().unwrap(), keys[&lost].serialize().unwrap());
-        // The original DKG payload binds the share to its unchanged address and metadata.
         let ak: [u8; 32] = public.verifying_key().serialize().unwrap().try_into().unwrap();
         let fvk = crate::zip2005::frost_viewing_key(&ak, &vault_secret).unwrap();
         let original = super::super::ceremony::vault_sealed_bytes(

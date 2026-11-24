@@ -104,7 +104,6 @@ fn relay_retry_and_reordering_preserve_two_authenticated_messages() {
             .body(),
         b"x"
     );
-    // Any vault member up to 16 can receive the package; member 17 cannot exist.
     let sixteenth = Identity::new(16);
     let sixteenth_copy = alice
         .seal_session(&sixteenth.public(), &ctx, MessageKind::Package, b"x")

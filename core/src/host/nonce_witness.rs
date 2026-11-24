@@ -1,6 +1,3 @@
-//! Hosted signing uses the same fresh, signed nonce claims as standalone signing.
-//! The operator supplies two independently managed, pre-provisioned relay mailboxes.
-
 use std::{io::Read, path::Path};
 use loki_relay_client::RelayHttp;
 use loki_relay_protocol::types::{RelayPin, RelayRoute};
@@ -9,7 +6,6 @@ use crate::signing_session::{NonceWitness, WitnessPins};
 use zeroize::Zeroizing;
 
 #[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-// Ignore the retired `read` field in old files; never serialize or use it.
 pub struct WitnessConfig {
     pub endpoint: String,
     pub key: [u8; 32],
@@ -25,7 +21,6 @@ pub(super) struct RelayWitness {
     runtime: tokio::runtime::Runtime,
 }
 
-/// Read a `--nonce-witnesses` file: two [`WitnessConfig`] entries.
 pub(super) fn read(path: &Path) -> Result<[WitnessConfig; 2], String> {
     let mut raw = Zeroizing::new(Vec::new());
     std::fs::File::open(path).map_err(|e| format!("nonce witnesses: {e}"))?
@@ -34,8 +29,6 @@ pub(super) fn read(path: &Path) -> Result<[WitnessConfig; 2], String> {
     serde_json::from_slice(&raw).map_err(|_| "invalid nonce witness configuration".into())
 }
 
-/// What every witness configuration passes before hosted signing uses it: two distinct,
-/// nonzero witness identities at valid relay endpoints (HTTPS, or loopback HTTP in development).
 pub(super) fn check(config: &[WitnessConfig; 2], development: bool) -> Result<(), String> {
     if !crate::signing_session::valid_witness_pins(std::array::from_fn(|i| (config[i].key, config[i].run, config[i].mailbox))) {
         return Err("two distinct nonzero nonce witnesses required".into());
@@ -54,7 +47,6 @@ pub(super) fn fingerprint(config: &[WitnessConfig; 2]) -> String {
 }
 
 impl RelayWitness {
-    /// LokiSigner's approved launch snapshot, or the headless `--nonce-witnesses` file.
     pub(super) fn for_member(st: &super::state::AppState, attempt: &str) -> Result<Self, String> {
         let development = st.config.development_http;
         match (&st.config.nonce_witnesses, &st.fetched_config) {
@@ -152,9 +144,6 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
-    /// Live: two dev relays enrolled for the fixture identity, named by
-    /// `LOKI_NONCE_TEST_WITNESSES`. A fresh claim is accepted by both; the same claim again is
-    /// refused, which is what blocks a rolled-back nonce from signing twice.
     #[test]
     fn provisioned_relays_accept_a_claim_once_and_refuse_a_duplicate() {
         let Some(path) = std::env::var_os("LOKI_NONCE_TEST_WITNESSES") else { return };

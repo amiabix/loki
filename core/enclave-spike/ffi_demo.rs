@@ -10,8 +10,6 @@ extern "C" {
     fn se_unwrap(ct: *const u8, ct_len: isize, out: *mut u8, out_cap: isize) -> isize;
 }
 
-/// The Apple Enclave backend of loki's `SecureElement` trait (ephemeral key for this demo).
-/// Drops into core/src/signer/secure_element.rs as `AppleSecureElement` behind the same trait.
 struct AppleSecureElement;
 
 impl AppleSecureElement {
@@ -33,7 +31,6 @@ impl AppleSecureElement {
 }
 
 fn main() {
-    // A DEK, exactly as loki's signer generates it to seal a FROST share at wallet init.
     let mut dek = [0u8; 32];
     File::open("/dev/urandom").unwrap().read_exact(&mut dek).unwrap();
 

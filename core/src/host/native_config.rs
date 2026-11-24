@@ -1,15 +1,3 @@
-//! The configuration LokiSigner, the native member app, runs with on a normal launch: network,
-//! frostd, lightwalletd and the two nonce witnesses. The coordinator whose origin the member
-//! confirmed chooses them. It serves the browser signer's own values at `/api/signer-config`.
-//! LokiSigner asks only after the member confirmed that origin, shows the values before it
-//! pairs or unlocks, and saves them owner-only in the data directory, pinned to that
-//! coordinator, once the profile has unlocked. An explicit launch flag overrides its field for
-//! that launch only, and then nothing is saved. Only the native path (`loki_member_app_pair`)
-//! uses this; the headless `loki_member_app` and `LokiSigner serve` keep their flags and defaults.
-//!
-//! Nothing the coordinator sends is echoed in an error: the member reads these errors in
-//! LokiSigner's own dialogs.
-
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -18,16 +6,11 @@ use zeroize::Zeroizing;
 use super::nonce_witness::{self, WitnessConfig};
 use super::{Config, RegistrationConfig};
 
-/// One complete configuration generation, including the pinned coordinator origin.
 const SAVED: &str = "signer-config.json";
-/// Read only for profiles with the old split configuration.
 const LEGACY_WITNESSES: &str = "nonce-witnesses.json";
 const FETCH_LIMIT: usize = 65_536;
-/// The flags that override a coordinator's value for one field.
 const OVERRIDES: [&str; 4] = ["--network", "--frostd-url", "--lightwalletd-url", "--nonce-witnesses"];
 
-/// The deployment's signer configuration, as `GET <coordinator>/api/signer-config` serves it.
-/// Untrusted until [`Deployment::check`] passes.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Deployment {
@@ -64,7 +47,6 @@ struct SavedDeployment {
     witness_fingerprint: Option<String>,
 }
 
-/// What LokiSigner shows the member before it pairs or unlocks, and then runs with unchanged.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeConfig {
@@ -73,22 +55,14 @@ pub struct NativeConfig {
     pub network: String,
     pub frostd_url: String,
     pub lightwalletd_url: Option<String>,
-    /// The two witness endpoints, for the member to read.
     pub nonce_witnesses: [String; 2],
-    /// Include the full selected pair in the preview/apply comparison, not just its endpoints.
     witness_config: [WitnessConfig; 2],
     pub witness_fingerprint: String,
     pub confirm_witness_fingerprint: bool,
-    /// Fetched from `coordinator` for this launch.
     pub fetched: Option<Deployment>,
-    /// Whether the approved configuration is saved once the profile unlocks: not when a launch
-    /// flag overrides any field, because the member was then shown something else.
     pub save: bool,
 }
 
-/// The configuration approved for this launch. Witnesses are used from memory, including when
-/// selected from disk. A fresh fetch or newly confirmed saved pair is saved after unlock when
-/// there are no overrides.
 pub struct FetchedConfig {
     origin: String,
     deployment: Deployment,
@@ -98,15 +72,12 @@ pub struct FetchedConfig {
 impl FetchedConfig {
     pub(super) fn witnesses(&self) -> [WitnessConfig; 2] { self.deployment.nonce_witnesses.clone() }
 
-    /// Called once the profile has unlocked, after the paired coordinator is saved.
     pub(super) fn save_unlocked(&self, data: &Path) -> Result<(), String> {
         if self.save { save(data, &self.origin, &self.deployment) } else { Ok(()) }
     }
 }
 
 impl NativeConfig {
-    /// The configuration a native launch with these arguments and pairing link would use.
-    /// Fetches from the coordinator for a pairing link or when the saved settings need replacing.
     pub fn preview(args: &[String], pairing_url: Option<&str>) -> Result<Self, String> {
         Self::resolve(args, pairing_url, fetch)
     }
@@ -137,7 +108,6 @@ impl NativeConfig {
 
     #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
     fn resolve_restore(args: &[String], origin: String, deployment: Deployment) -> Result<Self, String> {
-        // The coordinator slot is unknown until we open the backup and find its identity.
         Self::merge(args, Some((origin, 0)), Some(deployment.clone()), Some(deployment), super::native_config_from_args(args)?.development_http, None)
     }
 
@@ -149,16 +119,11 @@ impl NativeConfig {
         self.apply_resolved(config, resolved)
     }
 
-    /// The coordinator and slot a pairing link names, checked without any network request, for
-    /// the member to confirm before LokiSigner asks that coordinator for anything.
     pub fn pairing_target(args: &[String], pairing_url: &str) -> Result<(String, u32), String> {
         let config = super::native_config_from_args(args)?;
         Self::target(&config, Some(pairing_url))?.ok_or_else(|| "invalid pairing link".into())
     }
 
-    /// Run with the configuration the member saw: resolve it again from the same launch, using
-    /// the shown fetch instead of a second one. Runtime witnesses use the checked snapshot, so
-    /// subsequent file changes cannot mix them with the other settings.
     pub fn apply(self, config: &mut Config, args: &[String], pairing_url: Option<&str>) -> Result<Option<FetchedConfig>, String> {
         let shown = self.fetched.clone();
         let resolved = Self::resolve(args, pairing_url, |_| shown.ok_or_else(|| "the confirmed configuration is missing".to_string()))?;
@@ -190,8 +155,6 @@ impl NativeConfig {
         Ok(())
     }
 
-    /// The pairing link's coordinator and slot, or the paired ones for an unlock. A link for a
-    /// coordinator or slot other than the paired one is refused.
     fn target(config: &Config, pairing_url: Option<&str>) -> Result<Option<(String, u32)>, String> {
         let paired = paired_coordinator(&config.data, config.development_http)?;
         let Some(link) = pairing_url else { return Ok(paired) };
@@ -215,8 +178,6 @@ impl NativeConfig {
         let flag = |name: &str| value(args, name);
         let flags_complete = ["--network", "--frostd-url", "--nonce-witnesses"].iter().all(|name| flag(name).is_some())
             && (flag("--network").as_deref() == Some("regtest") || flag("--lightwalletd-url").is_some());
-        // Refresh obsolete settings only from the pinned coordinator, even with complete flags.
-        // Otherwise, an unlock uses saved settings, and a pairing link always fetches.
         let fetched = match (&target, &saved) {
             (Some((coordinator, _)), Some(SavedDeployment { deployment: None, .. })) => Some(fetch(coordinator)
                 .map_err(|_| "saved-endpoints-refresh-failed")?),
@@ -280,7 +241,6 @@ impl NativeConfig {
     }
 }
 
-/// A flag's value, read the way `config_from_args` reads it.
 fn value(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
 }
@@ -290,15 +250,11 @@ fn endpoint(url: &str, development_http: bool, what: &str) -> Result<(), String>
     Ok(())
 }
 
-/// Remote endpoints need TLS; loopback plaintext only in an explicit development launch. The
-/// URL is shown to the member, so whitespace, control characters and non-ASCII are refused
-/// (`Url::parse` would silently drop tabs and newlines), and the error never repeats it.
 fn endpoint_has_path(url: &str, development_http: bool, what: &str) -> Result<bool, String> {
     let refused = || format!("the {what} is not a plain HTTPS URL; loopback HTTP requires --development-http");
     if !url.is_ascii() || url.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control()) { return Err(refused()); }
     let parsed = reqwest::Url::parse(url).map_err(|_| refused())?;
     let loopback = matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
-    // Check the spelling shown to the member: URL parsing can normalize a path to `/`.
     let authority_and_path = url[parsed.scheme().len()..].strip_prefix("://").ok_or_else(&refused)?;
     if !parsed.username().is_empty() || parsed.password().is_some() || parsed.query().is_some() || parsed.fragment().is_some()
         || !(parsed.scheme() == "https" || (development_http && loopback && parsed.scheme() == "http")) {
@@ -322,7 +278,6 @@ fn read_saved(data: &Path) -> Result<Option<Saved>, String> {
     serde_json::from_slice(&raw).map(Some).map_err(|e| format!("saved signer configuration: {e}"))
 }
 
-/// Keep the origin pin even when legacy paths make the saved deployment unusable.
 fn load(data: &Path, development_http: bool) -> Result<Option<SavedDeployment>, String> {
     let Some(saved) = read_saved(data)? else { return Ok(None) };
     let (origin, network, frostd_url, lightwalletd_url, witnesses, witness_fingerprint) = match saved {
@@ -349,8 +304,6 @@ fn load(data: &Path, development_http: bool) -> Result<Option<SavedDeployment>, 
     Ok(Some(SavedDeployment { origin, deployment: Some(deployment), witness_fingerprint }))
 }
 
-/// Save a configuration for `origin`. It must be the coordinator this profile is paired with,
-/// or, before pairing completes, the one whose configuration is already saved.
 fn save(data: &Path, origin: &str, deployment: &Deployment) -> Result<(), String> {
     let pinned = match paired_coordinator(data, true)? {
         Some((paired, _)) => Some(paired),
@@ -370,7 +323,6 @@ fn save(data: &Path, origin: &str, deployment: &Deployment) -> Result<(), String
     write_private(dir.path(), &bytes).map_err(|e| format!("{SAVED}: {e}"))
 }
 
-/// Publish the complete owner-only record with one rename, then sync the directory entry.
 fn write_private(dir: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::{fs, io::Write};
     let tmp = dir.join(format!("{SAVED}.{}.tmp", uuid::Uuid::new_v4()));
@@ -389,9 +341,6 @@ fn write_private(dir: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// `GET <origin>/api/signer-config`, following no redirect, with a timeout and a size limit.
-/// The caller checks what it returns. Errors name only the origin and the HTTP status: the
-/// reply's own text never reaches the member.
 fn fetch(origin: &str) -> Result<Deployment, String> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
@@ -449,8 +398,6 @@ mod tests {
         std::fs::write(data.join("paired-coordinator.json"), json!({ "origin": origin, "slot": slot }).to_string()).unwrap();
     }
 
-    /// Confirm a pairing link as the native dialog does: preview with `served`, apply, then save
-    /// as `registration::start` does once the profile has unlocked.
     fn confirm(data: &Path, origin: &str, served: Value) -> Config {
         let (args, link) = (args(data, &[]), link(origin, 7));
         let shown = NativeConfig::resolve(&args, Some(&link), |_| Ok(deployment(served))).unwrap();
@@ -468,8 +415,6 @@ mod tests {
 
     fn ok(body: Value) -> Option<(u16, String)> { Some((200, body.to_string())) }
 
-    /// A local coordinator serving `/api/signer-config`: the status and body in `reply`, or, when
-    /// it is `None`, a redirect to a path that serves a valid configuration.
     fn mock_coordinator() -> (String, Reply) {
         use axum::{http::StatusCode, response::{IntoResponse, Redirect}, routing::get, Json, Router};
         let reply: Reply = Arc::new(Mutex::new(None));
@@ -550,8 +495,6 @@ mod tests {
         assert!(!data.exists());
     }
 
-    /// The member reads these errors in LokiSigner's own alert, so nothing the coordinator sends
-    /// may appear in them: not an error body, not a field name, not a value.
     #[test]
     fn nothing_the_coordinator_sends_reaches_an_error() {
         let (origin, reply) = mock_coordinator();
@@ -576,8 +519,6 @@ mod tests {
         assert!(!data.exists());
     }
 
-    /// `Url::parse` drops tabs and newlines, so a URL that parses can still show the member
-    /// extra lines. Every endpoint shown must be exactly what it looks like.
     #[test]
     fn endpoints_with_hidden_characters_are_refused_without_being_repeated() {
         for url in ["https://frostd.example/\nCoordinator: https://wallet.good.example", "https://frostd.example/\tCoordinator: wallet.good",
@@ -594,7 +535,6 @@ mod tests {
         let data = temp("shown");
         let link = link("https://coordinator.example", 7);
         let fetch = |_: &str| -> Result<Deployment, String> { Ok(deployment(served())) };
-        // A configuration changed after it was shown is refused.
         let plain = args(&data, &[]);
         for change in [|c: &mut NativeConfig| c.frostd_url = "https://elsewhere.example".into(),
             |c: &mut NativeConfig| c.network = "regtest".into(), |c: &mut NativeConfig| c.save = !c.save] {
@@ -604,8 +544,6 @@ mod tests {
             let error = shown.apply(&mut config, &plain, Some(&link)).err().expect("a changed configuration is refused");
             assert!(error.contains("changed after it was shown"), "{error}");
         }
-        // A flag overrides its field for this launch only: the member saw the flag's value, so
-        // the coordinator's configuration is not saved.
         let flagged = args(&data, &["--frostd-url", "https://mine.example"]);
         let shown = NativeConfig::resolve(&flagged, Some(&link), fetch).unwrap();
         assert_eq!(shown.frostd_url, "https://mine.example");
@@ -618,8 +556,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(data);
     }
 
-    /// A wrong passphrase, or a first pairing that never unlocks, leaves nothing saved: the
-    /// configuration is written where the paired coordinator is, after the profile unlocks.
     #[tokio::test]
     async fn the_configuration_is_saved_only_once_the_profile_unlocks() {
         let data = temp("unlock");
@@ -635,7 +571,6 @@ mod tests {
         };
         let notice: super::super::LocalNotice = Arc::new(|_, _| true);
         let wrong = state();
-        // This launch signs with the fetched witnesses from memory, before anything is saved.
         let opened = wrong.clone();
         assert!(tokio::task::spawn_blocking(move || super::super::nonce_witness::RelayWitness::for_member(&opened, "test").is_ok()).await.unwrap());
         assert!(super::super::registration::start(&wrong, Some(Zeroizing::new("wrong passphrase".into())), Some(&notice)).await.is_err());
@@ -658,7 +593,7 @@ mod tests {
         let shown = NativeConfig::resolve(&args, None, |_| Ok(deployment(served()))).unwrap();
         let mut config = super::super::native_config_from_args(&args).unwrap();
         let fetched_config = shown.apply(&mut config, &args, None).unwrap();
-        std::fs::create_dir(data.join(SAVED)).unwrap(); // Block the atomic rename.
+        std::fs::create_dir(data.join(SAVED)).unwrap();
         assert!(fetched_config.as_ref().unwrap().save_unlocked(&data).is_err());
         config.registration = Some(RegistrationConfig::resume(&data, false).unwrap());
         let state = Arc::new(super::super::state::AppState { fetched_config, ..super::super::state::AppState::new(config) });
@@ -685,7 +620,6 @@ mod tests {
             assert_eq!(std::fs::metadata(data.join(SAVED)).unwrap().permissions().mode() & 0o777, 0o600);
         }
 
-        // A plain unlock takes the saved values, including both witnesses, without fetching.
         let no_fetch = |_: &str| -> Result<Deployment, String> { panic!("an unlock with a saved configuration fetched") };
         let plain = args(&data, &[]);
         let shown = NativeConfig::resolve(&plain, None, no_fetch).unwrap();
@@ -696,7 +630,6 @@ mod tests {
         use crate::signing_session::NonceWitness;
         assert_eq!(witness.pins(), [([1; 32], [2; 32], [3; 32]), ([5; 32], [6; 32], [7; 32])]);
 
-        // A flag overrides its field only.
         let unlock = args(&data, &["--frostd-url", "https://mine.example"]);
         let shown = NativeConfig::resolve(&unlock, None, no_fetch).unwrap();
         assert_eq!(shown.frostd_url, "https://mine.example");
@@ -708,7 +641,6 @@ mod tests {
         let regtest = args(&data, &["--network", "regtest"]);
         assert_eq!(NativeConfig::resolve(&regtest, None, no_fetch).unwrap().network, "regtest");
 
-        // A new link for the same coordinator and slot refreshes it once the member confirms.
         let mut refreshed = served();
         refreshed["frostdUrl"] = json!("https://frostd2.example");
         confirm(&data, "https://coordinator.example", refreshed);
@@ -789,14 +721,12 @@ mod tests {
             let error = NativeConfig::resolve(&args(&data, &[]), Some(&link), fetch).err().unwrap();
             assert_eq!(error, "different-pairing");
         }
-        // A configuration claiming to be from another coordinator is refused when applied.
         let mut forged = NativeConfig::resolve(&args(&data, &[]), None, fetch).unwrap();
         forged.coordinator = "https://other.example".into();
         forged.fetched = Some(deployment(other.clone()));
         let mut config = super::super::config_from_args(&args(&data, &[])).unwrap();
         assert!(forged.apply(&mut config, &args(&data, &[]), None).is_err());
         assert!(save(&data, "https://other.example", &deployment(other.clone())).is_err());
-        // Before pairing completes, the saved configuration's origin pins it.
         std::fs::remove_file(data.join("paired-coordinator.json")).unwrap();
         let error = NativeConfig::resolve(&args(&data, &[]), Some(&link("https://other.example", 7)), fetch).err().unwrap();
         assert!(error.contains("belongs to https://coordinator.example"), "{error}");
@@ -812,13 +742,11 @@ mod tests {
         for field in ["network", "frostd URL", "lightwalletd URL", "nonce witnesses"] {
             assert!(error.contains(field), "{field}: {error}");
         }
-        // A testnet coordinator without a lightwalletd: only that is missing.
         let mut served = served();
         served["lightwalletdUrl"] = Value::Null;
         let error = NativeConfig::resolve(&args(&data, &[]), Some(&link("https://coordinator.example", 7)), |_| Ok(deployment(served.clone())))
             .err().unwrap();
         assert!(error.contains("missing its lightwalletd URL: the coordinator https://coordinator.example"), "{error}");
-        // Every field from flags, but no pairing: the signer says it is not paired.
         let witnesses = data.join("w.json");
         std::fs::create_dir_all(&data).unwrap();
         std::fs::write(&witnesses, serde_json::to_vec(&served["nonceWitnesses"]).unwrap()).unwrap();

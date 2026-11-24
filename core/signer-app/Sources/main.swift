@@ -16,7 +16,6 @@ if mode == "native" {
         FileHandle.standardError.write(Data("Open pairing links in the wallet, not in command arguments.\n".utf8))
         exit(2)
     }
-    // Apple events are the normal handoff; automation may pipe one line on private stdin.
     let link = args.contains("--pairing-stdin") ? readLine() : nil
     SignerLog.start()
     runNativeSigner(arguments: args.filter { $0 != "--pairing-stdin" }, link: link)
@@ -121,7 +120,6 @@ func loadKey() -> SecKey {
 let algo = SecKeyAlgorithm.eciesEncryptionCofactorX963SHA256AESGCM
 wipe()
 
-// INIT: create + persist the Enclave KEK, wrap a random DEK.
 let created = createKey()
 guard let pub = SecKeyCopyPublicKey(created) else { fail("pub") }
 var dek = Data(count: 32)
@@ -129,7 +127,6 @@ _ = dek.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 32, $0.ba
 guard let wrapped = SecKeyCreateEncryptedData(pub, algo, dek as CFData, nil) as Data? else { fail("wrap") }
 print("OK  init: persistent Secure Enclave KEK created\(biometric ? " (biometric-gated)" : ""); DEK wrapped \(wrapped.count)B")
 
-// NEXT LAUNCH: reload the SAME key by tag, unwrap (biometric mode triggers Touch ID here).
 let reloaded = loadKey()
 guard let got = SecKeyCreateDecryptedData(reloaded, algo, wrapped as CFData, nil) as Data? else { fail("unwrap after reload") }
 guard got == dek else { fail("round-trip mismatch after reload") }

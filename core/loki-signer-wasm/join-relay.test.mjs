@@ -1,11 +1,3 @@
-// A browser member joins a vault over frostd through the real worker (signer-worker.js
-// `joinCeremony`) and the real wasm pkgs, with a native creator and a native joiner
-// (loki_member_app). The invite's creator URL is a closed port, so frostd is the only channel.
-// Node lacks the Worker globals, OPFS and IndexedDB: they are shimmed in memory below.
-//
-//   FROSTD_URL=http://127.0.0.1:2744 LOKI_MEMBER_APP_BIN=.../loki_member_app node join-relay.test.mjs
-//
-// Build both pkgs first (wasm-pack build --dev --target web, here and in ../wasm-transport).
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -18,7 +10,6 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const { FROSTD_URL: frostdUrl, LOKI_MEMBER_APP_BIN: bin } = process.env;
 
-// ── In-memory OPFS: directory/file handles and synchronous access handles. ──
 function notFound() { return new DOMException("not found", "NotFoundError"); }
 function fileHandle(name) {
   const f = { kind: "file", name, data: new Uint8Array(0) };
@@ -54,9 +45,7 @@ function dirHandle(name) {
 }
 const root = dirHandle("");
 Object.defineProperty(globalThis.navigator, "storage", { value: { getDirectory: async () => root }, configurable: true });
-// control-inbox.js opens IndexedDB when the worker loads; the join path never reads it.
 globalThis.indexedDB = { open: () => ({}) };
-// wasm-bindgen fetches each module's .wasm next to its JS; node's fetch has no file: URLs.
 const netFetch = globalThis.fetch;
 globalThis.fetch = (input, init) => {
   const url = input instanceof URL ? input : new URL(String(input?.url ?? input));
@@ -65,14 +54,12 @@ globalThis.fetch = (input, init) => {
     : netFetch(input, init);
 };
 
-// ── The worker, as the signer page talks to it. ──
 const replies = new Map();
 const asked = [];
 globalThis.self = globalThis;
 self.addEventListener = () => {};
 self.postMessage = (msg) => {
   if (msg.ask !== undefined) {
-    // The member accepts the roster and confirms the roster code on the signer page.
     asked.push({ kind: msg.kind, data: msg.data });
     queueMicrotask(() => self.onmessage({ data: { answer: msg.ask, ok: true, value: true } }));
   } else if (msg.id !== undefined) {
@@ -88,8 +75,6 @@ function worker(op, fields = {}) {
   });
 }
 
-// The worker loads wasm-transport from ./wasm-transport/pkg beside it (serve.mjs maps that
-// path); a scratch copy of the worker gets that layout through symlinks.
 function workerDir() {
   const dir = mkdtempSync(join(tmpdir(), "loki-join-worker-"));
   for (const f of ["signer-worker.js", "lightwalletd.js", "control-inbox.js", "vault-list.js"]) copyFileSync(join(here, f), join(dir, f));
@@ -103,7 +88,6 @@ const freePort = () => new Promise((ok) => { const s = createServer().listen(0, 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function memberApp(data, port) {
-  // The advertised URL is a closed port; the peer listener it would front is never dialed.
   const peerPort = await freePort();
   const child = spawn(bin, ["--data", data, "--port", String(port), "--frostd-url", frostdUrl, "--peer-port", String(peerPort), "--advertise-url", "http://127.0.0.1:9"], { stdio: ["ignore", "pipe", "pipe"] });
   let log = "";
@@ -153,7 +137,7 @@ test("a browser member joins over frostd with a native creator and joiner, and a
     await worker("recovery-begin");
     await worker("recovery-confirm");
     const browser = worker("join", { join: { invite: invite(3), network: "regtest", frostdUrl, label: "Browser relay vault" } });
-    browser.catch(() => {}); // awaited below; the natives' steps run meanwhile
+    browser.catch(() => {});
     await joiner.api("POST", "/api/join", { invite: invite(2) });
 
     const codes = new Set();
@@ -165,7 +149,6 @@ test("a browser member joins over frostd with a native creator and joiner, and a
       await m.api("POST", "/api/agree", { vault, fingerprint: status.fingerprint, roster_code: status.roster_code });
       codes.add(status.roster_code);
     }
-    // The code the browser's signer showed is the code every native member confirmed.
     const shown = await until(async () => asked.find((a) => a.kind === "roster-code"), "the browser's roster code");
     assert.deepEqual([...codes], [shown.data.code]);
 

@@ -1,19 +1,4 @@
 #!/usr/bin/env bash
-# Native end to end on one Mac: three LokiSigner app instances pair with a local coordinator,
-# create a 2-of-3 vault, receive funds, and send a payment that members 1 and 2 approve in
-# LokiSigner's own dialog. Where a person must act in an app the script prints ">> YOU:" and
-# carries on by itself once it sees the result.
-#
-#   NETWORK=regtest bash core/scripts/native_e2e.sh /abs/new/root   # local THS v0.3.0 chain
-#   NETWORK=testnet bash core/scripts/native_e2e.sh /abs/new/root   # testnet.zec.rocks
-#   bash core/scripts/native_e2e.sh stop /abs/root                  # quit its apps and services
-#
-# Starts frostd, two nonce-witness relays and the coordinator (web/wallet) itself; the chain
-# (THS for regtest, lightwalletd for testnet) must already be reachable.
-# Env: APP (default core/signer-app/out/LokiSigner.app, built with build.sh when missing),
-# LIGHTWALLETD_URL, RPC_URL and THS_URL (regtest node and faucet), WEB_PORT (3001),
-# BASE_PORT (3600; members listen on +1..+3), AMOUNT_ZAT, RECIPIENT (default: the vault
-# itself, so only the fee is spent), FUNDING_TIMEOUT, CONFIRM_TIMEOUT (seconds).
 set -euo pipefail
 
 poc="$(cd "$(dirname "$0")/.." && pwd -P)"
@@ -78,7 +63,7 @@ echo "lightwalletd: $lwd"
 
 mkdir -p "$root"; chmod 700 "$root"; : >"$root/pids"
 bg() { local log=$1; shift; nohup "$@" >"$root/$log.log" 2>&1 & echo $! >>"$root/pids"; }
-wait_for() { # wait_for <seconds> <what> <command...>
+wait_for() {
   local secs=$1 what=$2 n; shift 2
   for ((n=0; n<secs; n+=2)); do "$@" && return; sleep 2; done
   fail "$what (waited ${secs}s)"
@@ -110,19 +95,18 @@ for pid in "${relay_pids[@]}"; do wait "$pid"; done
 awk -v a="${relay_pids[0]}" -v b="${relay_pids[1]}" '$0 != a && $0 != b' "$root/pids" >"$root/pids.next"
 mv "$root/pids.next" "$root/pids"
 [[ -d $repo/web/wallet/node_modules ]] || ( cd "$repo/web/wallet" && { npm ci || npm ci --legacy-peer-deps; } )
-grants='{}'
 for n in 1 2 3; do
   onboarding[n]=$(openssl rand -hex 32)
   digest=$(printf '%s' "${onboarding[n]}" | openssl dgst -sha256 -r)
-  grants=$(jq --arg digest "${digest%% *}" --argjson slot "$n" '.[$digest] = $slot' <<<"$grants")
+  ( cd "$repo/web/wallet" && LOKI_REGISTRY="$root/registry.json" node scripts/grants.ts register "${digest%% *}" --slot "$n" )
 done
-( cd "$repo/web/wallet" && LOKI_REGISTRY="$root/registry.json" LOKI_DEV_FAUCET=1 LOKI_ONBOARDING_GRANTS="$grants" \
+( cd "$repo/web/wallet" && LOKI_REGISTRY="$root/registry.json" LOKI_DEV_FAUCET=1 \
     exec nohup npx next dev --hostname 127.0.0.1 --port "$web_port" ) >"$root/coordinator.log" 2>&1 &
 echo $! >>"$root/pids"
 wait_for 180 "coordinator did not start; see $root/coordinator.log" curl -sf -m 5 "$coord/api/members" -o /dev/null
 echo "coordinator: $coord (roster $root/registry.json)"
 
-api() { # api <member> GET|POST <path> [json]
+api() {
   local n=$1 method=$2 path=$3 body=${4:-}
   local args=(--fail-with-body -sS -m 600 -H "X-Loki-Token: $(cat "$root/m$n.token")")
   [[ $method == POST ]] && args+=(-X POST -H 'Content-Type: application/json' -d "$body")
@@ -185,7 +169,6 @@ for n in 1 2; do
   mailbox=$(jq -er --argjson i "$((n-1))" '.[$i].mailbox | map((. / 16 | floor), (. % 16)) |
     map(. as $nibble | "0123456789abcdef"[$nibble:$nibble + 1]) | join("")' "$witnesses")
   for i in 1 2 3; do
-    # These three local apps just confirmed their roster, using these same profile keys.
     key=$(api "$i" GET /api/registration | jq -er --argjson slot "$i" 'select(.slot == $slot) | .signing_pubkey')
     "$relay" enroll-nonce --root "$root/relay-$n" --mailbox "$mailbox" --vault "$vault" \
       --slot "$i" --signing-key "$key" --quota-bytes 1048576 || fail "witness $n enrollment for member $i"
@@ -205,7 +188,6 @@ if [[ $network == regtest ]]; then
   paid=$(curl -sf -m 120 -X POST "$ths/api/v1/faucet/address" -H 'Content-Type: application/json' \
     -d "$(jq -nc --arg a "$address" --arg k "$key" '{address:$a,amount_zatoshi:500000000,idempotency_key:$k}')") \
     || fail "the THS faucet at $ths refused"
-  # THS v0.3.0 answers once the payment is mined (block_hash set); later versions answer early.
   faucet_mined() {
     jq -e '.block_hash != null or .status == "confirmed"' <<<"$paid" >/dev/null && return
     paid=$(curl -sf -m 10 "$ths/api/v1/faucet/address?idempotency_key=$key") || true

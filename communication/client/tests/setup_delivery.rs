@@ -406,7 +406,6 @@ fn prerequisites_are_transitive_and_store_association_is_checked_on_every_commit
     std::fs::remove_dir_all(path).unwrap();
 }
 
-/// Relay request deadline in the operator bundle of the delivery test.
 const REQUEST_SECONDS: u64 = 3;
 
 #[tokio::test]
@@ -604,8 +603,6 @@ async fn peers_arrive_independently_after_creator_offline_and_ack_survives_reope
         let unavailable = servers.remove(0);
         unavailable.abort();
         let _ = unavailable.await;
-        // With four members the first relay accepts connections but never answers: the
-        // drive must still finish within one relay deadline and store on the other two.
         let hanging = if n == 4 {
             let (_, endpoint, _) = routes.iter().find(|(_, _, index)| *index == 1).unwrap();
             let listener = tokio::net::TcpListener::bind(endpoint.trim_start_matches("http://"))
@@ -1233,7 +1230,6 @@ fn setup_store_migrates_only_the_exact_legacy_catalog() {
         let path = root();
         drop(SetupStore::open(&path, &transport).unwrap());
         let sql = rusqlite::Connection::open(path.join("setup.sqlite3")).unwrap();
-        // The oldest catalog: no `deferred` table and recipients bounded at 4.
         let version: i64 = sql.query_row("PRAGMA schema_version", [], |r| r.get(0)).unwrap();
         sql.execute_batch("DROP TABLE pending_roots; DROP TABLE deferred; PRAGMA writable_schema=ON;").unwrap();
         sql.execute(

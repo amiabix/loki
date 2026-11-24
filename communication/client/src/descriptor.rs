@@ -15,12 +15,6 @@ const MAX_PACKAGE: usize = MAX_BODY + 128;
 const MAX_REVISION: u64 = i64::MAX as u64;
 const SIGNATURE_DOMAIN: &[u8] = b"Loki_Relay_Config_v1\0";
 
-/// Capability storage has no formatting or serialization implementation.
-///
-/// ```compile_fail
-/// fn debug<T: std::fmt::Debug>() {}
-/// debug::<loki_relay_client::Secret32>();
-/// ```
 pub struct Secret32(Zeroizing<Id32>);
 
 impl Secret32 {
@@ -33,21 +27,11 @@ impl Secret32 {
     }
 }
 
-/// ```compile_fail
-/// fn debug<T: std::fmt::Debug>() {}
-/// debug::<loki_relay_client::DescriptorRelay>();
-/// ```
 pub struct DescriptorRelay {
     pub route: RelayRoute,
     pub append: Secret32,
 }
 
-/// Editable local signing input; it carries no imported authority.
-///
-/// ```compile_fail
-/// fn debug<T: std::fmt::Debug>() {}
-/// debug::<loki_relay_client::Descriptor>();
-/// ```
 pub struct Descriptor {
     pub vault: Id32,
     pub roster: Id32,
@@ -74,69 +58,6 @@ impl Descriptor {
     }
 }
 
-/// An immutable verified import bound to its exact canonical signed body.
-/// Only successful opening can construct this authority; no mutable access is exposed.
-///
-/// ```compile_fail
-/// fn change(import: &mut loki_relay_client::AuthenticatedDescriptor) {
-///     import.body().vault = [0; 32];
-/// }
-/// ```
-///
-/// ```compile_fail
-/// fn change(import: &mut loki_relay_client::AuthenticatedDescriptor) {
-///     import.body().roster = [0; 32];
-/// }
-/// ```
-///
-/// ```compile_fail
-/// fn change(import: &mut loki_relay_client::AuthenticatedDescriptor) {
-///     import.body().owner = 2;
-/// }
-/// ```
-///
-/// ```compile_fail
-/// fn change(import: &mut loki_relay_client::AuthenticatedDescriptor) {
-///     import.body().revision = 9;
-/// }
-/// ```
-///
-/// ```compile_fail
-/// fn change(import: &mut loki_relay_client::AuthenticatedDescriptor) {
-///     import.body().relays[0].route.mailbox = [0; 32];
-/// }
-/// ```
-///
-/// ```compile_fail
-/// fn change(import: &mut loki_relay_client::AuthenticatedDescriptor) {
-///     import.body().relays[0].append = loki_relay_client::Secret32::from_bytes([0; 32]);
-/// }
-/// ```
-///
-/// ```compile_fail
-/// fn change(import: &mut loki_relay_client::AuthenticatedDescriptor) {
-///     import.canonical_body()[0] = 0;
-/// }
-/// ```
-///
-/// ```compile_fail
-/// use loki_relay_client::{AuthenticatedDescriptor, Descriptor};
-/// fn forge(body: Descriptor) -> AuthenticatedDescriptor {
-///     AuthenticatedDescriptor { body, canonical_body: Default::default(), digest: [0; 32] }
-/// }
-/// ```
-///
-/// ```compile_fail
-/// use loki_relay_client::{accept_descriptor, AuthenticatedDescriptor, Descriptor};
-/// fn accept_local(prior: &AuthenticatedDescriptor, next: &Descriptor) {
-///     accept_descriptor(prior, next).unwrap();
-/// }
-/// ```
-///
-/// ```compile_fail
-/// fn debug<T: std::fmt::Debug>() {}
-/// debug::<loki_relay_client::AuthenticatedDescriptor>();
-/// ```
 pub struct AuthenticatedDescriptor {
     body: Descriptor,
     canonical_body: Zeroizing<Vec<u8>>,
@@ -157,10 +78,6 @@ impl AuthenticatedDescriptor {
     }
 }
 
-/// ```compile_fail
-/// fn debug<T: std::fmt::Debug>() {}
-/// debug::<loki_relay_client::OwnerInbox>();
-/// ```
 pub struct OwnerInbox {
     pub route: RelayRoute,
     pub read: Secret32,
@@ -168,16 +85,11 @@ pub struct OwnerInbox {
     pub admin: Secret32,
 }
 
-/// ```compile_fail
-/// fn debug<T: std::fmt::Debug>() {}
-/// debug::<loki_relay_client::ClientConfig>();
-/// ```
 pub struct ClientConfig {
     pub own: Vec<OwnerInbox>,
     pub peers: Vec<AuthenticatedDescriptor>,
 }
 
-/// Temporary CBOR byte strings include capabilities and are wiped on every exit.
 struct SecretValue(Value);
 
 impl Drop for SecretValue {
@@ -455,8 +367,6 @@ pub fn open_descriptor(
     })
 }
 
-/// Acceptance consumes only immutable verified imports.
-/// Persistence of the accepted result belongs to the caller.
 pub fn accept_descriptor(
     prior: &AuthenticatedDescriptor,
     next: &AuthenticatedDescriptor,

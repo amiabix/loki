@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
+import { signerOrigin } from "../lib/signer-config";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -17,21 +18,22 @@ export const metadata: Metadata = {
   description: "A shielded Zcash multisig wallet.",
 };
 
-// Render the shell per-request so a deploy is reflected immediately — never serve a
-// statically-cached HTML that pins returning visitors to an old build's chunks.
 export const dynamic = "force-dynamic";
 
+function runtimeSignerOrigin(): string | undefined {
+  try { return signerOrigin(); } catch { return undefined; }
+}
+
 export default function RootLayout({ children }: { children: React.ReactNode }) {
+  const origin = runtimeSignerOrigin();
   return (
     <html
       lang="en"
-      // The pre-paint script below sets data-theme before React hydrates.
       suppressHydrationWarning
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
       <head>
-        {/* Apply a pinned theme before paint so a light pin on a dark system (or vice versa)
-            doesn't flash. Unpinned users fall through to CSS prefers-color-scheme. */}
+        {origin && <meta name="loki-signer-origin" content={origin} />}
         <script
           dangerouslySetInnerHTML={{
             __html:

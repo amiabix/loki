@@ -38,8 +38,6 @@ mod backend {
         Ok(temp)
     }
 
-    /// Create `name` once: fsync a temporary file, then hard-link it into place. An existing
-    /// `name` is kept, so a write-once record is never replaced.
     pub(crate) fn write_durable(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
         let final_path = dir.join(name);
         let temp = write_temp(dir, name, bytes)?;
@@ -52,15 +50,12 @@ mod backend {
         fs::File::open(dir)?.sync_all()
     }
 
-    /// Replace `name` atomically: fsync a temporary file, then rename it over `name`. A crash
-    /// leaves either the old or the new contents, never a mix.
     pub(crate) fn replace_durable(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
         let temp = write_temp(dir, name, bytes)?;
         fs::rename(&temp, dir.join(name))?;
         fs::File::open(dir)?.sync_all()
     }
 
-    /// Remove `name` if present, then fsync the directory. Removing a missing file succeeds.
     pub(crate) fn remove_durable(dir: &Path, name: &str) -> io::Result<()> {
         match fs::remove_file(dir.join(name)) {
             Ok(()) => {}
@@ -70,18 +65,14 @@ mod backend {
         fs::File::open(dir)?.sync_all()
     }
 
-    /// Read `name`; `ErrorKind::NotFound` when it is absent (callers map that to `None`).
     pub(crate) fn read_file(dir: &Path, name: &str) -> io::Result<Vec<u8>> {
         fs::read(dir.join(name))
     }
 
-    /// Whether `name` exists under `dir`.
     pub(crate) fn file_exists(dir: &Path, name: &str) -> bool {
         dir.join(name).exists()
     }
 
-    /// Remove `name` without a directory fsync (the caller fsyncs when it needs to). A
-    /// missing file is not an error.
     pub(crate) fn remove_file(dir: &Path, name: &str) -> io::Result<()> {
         match fs::remove_file(dir.join(name)) {
             Ok(()) => Ok(()),
@@ -90,7 +81,6 @@ mod backend {
         }
     }
 
-    /// Create the signer data directory owner-only (0700), idempotently.
     pub(crate) fn create_dir_private(dir: &Path) -> io::Result<()> {
         #[cfg(unix)]
         {
@@ -103,12 +93,10 @@ mod backend {
         Ok(())
     }
 
-    /// Create `dir` and any missing parents.
     pub(crate) fn create_dir_all(dir: &Path) -> io::Result<()> {
         fs::create_dir_all(dir)
     }
 
-    /// fsync the directory so prior renames/removes are durable.
     pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
         fs::File::open(dir)?.sync_all()
     }
@@ -116,16 +104,6 @@ mod backend {
 
 #[cfg(target_arch = "wasm32")]
 mod backend {
-    //! OPFS-backed implementation. Each `(dir, name)` is a path key under the OPFS root the
-    //! worker set up; `js/opfs_fs.js` resolves it to a `FileSystemSyncAccessHandle`. The
-    //! handle for a path must be pre-opened by the worker (async `opfsPreopen`) before the
-    //! synchronous core touches it — see that file for the contract. Durability is `flush()`
-    //! inside `opfsWrite`; OPFS has no atomic rename, so `replace_durable` overwrites in
-    //! place after flush.
-    //!
-    //! ponytail: in-place overwrite, no atomic rename (OPFS has none). The nonce invariant
-    //! only needs flush-before-emit, which holds; a torn `replace_durable` is bounded to the
-    //! sealed `.sealed` files, which are re-derivable, not the write-once nonce/burn records.
     use std::{io, path::Path};
     use wasm_bindgen::prelude::*;
 
@@ -178,7 +156,6 @@ mod backend {
         js_mkdir(&dir.to_string_lossy()).map_err(err)
     }
     pub(crate) fn sync_dir(_dir: &Path) -> io::Result<()> {
-        // OPFS flushes per file inside `opfsWrite`; there is no directory handle to fsync.
         Ok(())
     }
 }

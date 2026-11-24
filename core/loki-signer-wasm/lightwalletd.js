@@ -1,8 +1,5 @@
-// lightwalletd over gRPC-web (communication/deploy/lightwalletd-grpcweb.sh), for the signer's
-// chain scan. Only the two calls the scan needs; each message is hand-encoded protobuf.
-
 const varint = (n) => { const out = []; for (; n >= 0x80; n = Math.floor(n / 0x80)) out.push((n % 0x80) | 0x80); out.push(n); return out; };
-const blockId = (height) => [0x08, ...varint(height)]; // BlockID { height = 1 }
+const blockId = (height) => [0x08, ...varint(height)];
 const field = (tag, bytes) => [tag, ...varint(bytes.length), ...bytes];
 const MAX_BLOCKS = 500;
 const MAX_HEIGHT = 0xfffffffe;
@@ -99,7 +96,6 @@ export function frames(buf, method = "call", headers = new Headers()) {
   return parser.finish();
 }
 
-// The chain tip height (GetLatestBlock -> BlockID, height = field 1).
 export async function latestHeight(base) {
   const [msg] = await call(base, "GetLatestBlock", [], 1);
   if (msg[0] !== 0x08) throw new Error("lightwalletd GetLatestBlock: no height");
@@ -111,7 +107,6 @@ export async function latestHeight(base) {
   throw new Error("lightwalletd GetLatestBlock: bad height");
 }
 
-// Compact blocks start..end inclusive, each as its protobuf bytes.
 export function blockRange(base, start, end) {
   const count = end - start + 1;
   if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end > MAX_HEIGHT || count < 1 || count > MAX_BLOCKS) {

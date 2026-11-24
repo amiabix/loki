@@ -3,7 +3,6 @@ import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { setTimeout as delay } from "node:timers/promises";
 
-// Share the budget across the route bundles in the coordinator's Node process.
 const shared = globalThis as typeof globalThis & {
   lokiRegistrationBudget?: { tokens: number; updated: number; inFlight: number };
 };
@@ -22,15 +21,14 @@ export async function registrationLock(file: string): Promise<() => void> {
   };
   try {
     mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
-    // Only the SQLite write lock is used here. The JSON snapshot remains authoritative.
     lock = new DatabaseSync(`${file}.mutex.sqlite`, { timeout: 0 });
     const deadline = performance.now() + 5000;
     for (;;) {
       try {
         lock.exec("BEGIN IMMEDIATE");
-        return unlock; // Ends the transaction; never unlink the lock database.
+        return unlock;
       } catch (error) {
-        if ((Number((error as { errcode?: number }).errcode) & 0xff) !== 5) throw error; // SQLITE_BUSY
+        if ((Number((error as { errcode?: number }).errcode) & 0xff) !== 5) throw error;
         if (performance.now() >= deadline) throw new Error("registration is busy");
         await delay(25);
       }

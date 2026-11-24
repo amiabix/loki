@@ -1,13 +1,3 @@
-//! Crash drill for the signer nonce store (`signer::nonce`): a process killed at each
-//! persistence point, then restarted on the same directory and device element, never signs two
-//! messages with one nonce. A crash is modelled by the files that point leaves on disk; a restart
-//! is a new `NonceStore` over that directory.
-//!
-//! Already covered elsewhere: the crash after the burn record is durable and before the nonce
-//! file is removed, retried for the same message (`nonce.rs`
-//! `crash_after_burn_leaves_no_stranded_or_duplicated_nonce`), and reuse for a different message
-//! after a completed sign (`nonce.rs` `reuse_for_a_different_message_is_hard_refused`), which is
-//! also the state a crash after the nonce is removed leaves.
 use loki_poc::signer::{
     nonce::{NonceError, NonceState, NonceStore},
     secure_element::SoftwareSecureElement,
@@ -42,7 +32,6 @@ impl Drill {
         Self { dir, key: key(1), peer }
     }
 
-    /// The process after a restart: a fresh store on the same directory, same device element.
     fn restart(&self) -> (NonceStore, SoftwareSecureElement) {
         (NonceStore::open(&self.dir, [1; 32], 1).unwrap(), SoftwareSecureElement::from_kek([7; 32]))
     }
@@ -67,8 +56,6 @@ impl Drop for Drill {
     }
 }
 
-/// Crash while the nonce is being written, before it is linked into place: only the temporary
-/// file exists and no commitment left the process. The restart is a fresh round 1.
 #[test]
 fn crash_while_persisting_the_nonce_leaves_no_usable_nonce() {
     let d = Drill::new();
@@ -81,8 +68,6 @@ fn crash_while_persisting_the_nonce_leaves_no_usable_nonce() {
     assert_eq!(d.sign(&store, &se, own, 2).unwrap_err(), NonceError::Reuse);
 }
 
-/// Crash after the nonce is durable but before its commitment was emitted: the restart emits
-/// the SAME commitment for that id, never a second nonce, and that nonce signs only one message.
 #[test]
 fn crash_after_persist_before_emit_recovers_the_same_commitment() {
     let d = Drill::new();
@@ -98,9 +83,6 @@ fn crash_after_persist_before_emit_recovers_the_same_commitment() {
     assert_eq!(d.sign(&store, &se, first, 1).unwrap().serialize(), share.serialize());
 }
 
-/// Crash in round 2 after the share is computed but before the burn record is linked: the
-/// partial never left the process. The restart still holds the committed nonce, signs once,
-/// and refuses any second message.
 #[test]
 fn crash_before_burn_is_durable_signs_at_most_one_message() {
     let d = Drill::new();
@@ -116,9 +98,6 @@ fn crash_before_burn_is_durable_signs_at_most_one_message() {
     assert_eq!(d.sign(&store, &se, own, 1).unwrap().serialize(), share.serialize());
 }
 
-/// Crash after the burn record is durable but before the nonce file is removed, then a retry
-/// for a DIFFERENT message: the nonce file is still on disk, but the burn wins and the second
-/// message is refused. (The same-message retry is covered in `nonce.rs`.)
 #[test]
 fn crash_after_burn_then_a_different_message_is_refused() {
     let d = Drill::new();

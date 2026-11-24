@@ -1,6 +1,3 @@
-//! In-process v2 DKG and signing. SoftwareSecureElement keeps its KEK in process memory;
-//! this exercises signer primitives, not hardware custody or the hosted product flow.
-
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -175,7 +172,6 @@ fn prompts() -> DevicePrompts {
     }
 }
 
-/// Run one isolated distributed setup and sign a one-note candidate with its first quorum.
 pub fn ceremony_and_sign(count: u16, threshold: u16) -> Result<Measurements, String> {
     if !valid_policy(threshold, usize::from(count)) {
         return Err("invalid threshold or member count".into());

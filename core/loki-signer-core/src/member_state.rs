@@ -1,5 +1,3 @@
-//! Validated state produced by the separate-member setup ceremony.
-
 use std::{collections::BTreeMap, fs, path::Path};
 
 use blake2b_simd::Params;
@@ -21,29 +19,20 @@ pub struct Roster {
     pub network: VaultNetwork,
     pub birth_height: Option<u32>,
     pub members: BTreeMap<u16, PublicIdentity>,
-    /// The setup format version a new-path roster declares (`"setup_version": 2`). Absent on
-    /// old-path rosters, which keep their earlier fingerprint label.
     pub setup_version: Option<u16>,
     legacy: bool,
     explicit_network: bool,
 }
 
-/// Largest roster either setup path accepts (C5): `2 <= t < n <= 16`.
 pub const MAX_MEMBERS: u16 = 16;
 
-/// The general t-of-n policy: at least two signers, at least one spare member, at most
-/// [`MAX_MEMBERS`] members.
 pub fn valid_policy(threshold: u16, members: usize) -> bool {
     2 <= threshold && usize::from(threshold) < members && members <= usize::from(MAX_MEMBERS)
 }
 
-/// Why the shared roster gate refused a roster. The hosted path maps these onto its
-/// existing `setup_policy` / `setup_identity` error strings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RosterRejection {
-    /// Vault id, threshold, member count or member numbering is outside the policy.
     Policy,
-    /// A weak, shared or non-contributory member key.
     Identity,
 }
 
@@ -56,14 +45,9 @@ impl std::fmt::Display for RosterRejection {
     }
 }
 
-/// A roster that passed the shared setup gate (A7). The DKG core accepts nothing else, so
-/// no setup path can skip these checks. Each path adds its own checks on top.
 pub struct ValidatedRoster(Roster);
 
 impl ValidatedRoster {
-    /// The rules shared by the hosted engine and the new signer: a non-zero vault id,
-    /// `2 <= t < n <= 16` with ids `1..=n`, and per member a strong Ed25519 signing key and
-    /// a contributory X25519 encryption key, none shared with another member.
     pub fn new(roster: Roster) -> Result<Self, RosterRejection> {
         Self::check(&roster)?;
         Ok(Self(roster))
@@ -79,7 +63,6 @@ impl ValidatedRoster {
         }
         let mut signing = std::collections::BTreeSet::new();
         let mut encryption = std::collections::BTreeSet::new();
-        // Any fixed secret works: a small-order public key gives an all-zero shared secret.
         let probe = x25519_dalek::StaticSecret::from([1; 32]);
         for (&id, member) in &roster.members {
             let key = ed25519_dalek::VerifyingKey::from_bytes(&member.signing)
@@ -220,7 +203,6 @@ impl Roster {
 
     pub fn fingerprint(&self) -> [u8; 32] {
         if let Some(version) = self.setup_version {
-            // A new label only when the field is present, so existing rosters hash unchanged.
             let mut hash = Params::new()
                 .hash_length(32)
                 .personal(b"Loki_roster_v4")
@@ -281,9 +263,6 @@ pub struct MemberState {
 }
 
 impl MemberState {
-    /// The first block the wallet scans: the certified birth on Testnet, block 2 on regtest.
-    /// Light-client sync starts from the tree state before the birth, and lightwalletd cannot
-    /// serve height 0; a regtest vault cannot be paid in block 1, mined before it existed.
     pub fn wallet_birth(&self) -> u32 {
         self.birth_height.unwrap_or(2)
     }

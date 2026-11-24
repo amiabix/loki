@@ -12,6 +12,11 @@ import 'wallet_api.dart';
 
 void main() => runApp(const LokiApp(api: MacWalletApi()));
 
+/// TEMPORARY verbose diagnostics: stdout goes to the profile's verbose log (VerboseLog.swift
+/// part of WalletChannel.swift). Remove before release.
+// ignore: avoid_print
+void verbose(String message) => print('[verbose] dart $message');
+
 class LokiApp extends StatefulWidget {
   const LokiApp({
     super.key,
@@ -73,8 +78,10 @@ class _Wallet extends StatefulWidget {
   State<_Wallet> createState() => _WalletState();
 }
 
-class _WalletState extends State<_Wallet> {
+class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
   WalletApi get api => widget.api;
+  DateTime touchIdAgainAfter = DateTime.fromMillisecondsSinceEpoch(0);
+  bool appActive = true;
   MacWalletApi? get macApi => api is MacWalletApi ? api as MacWalletApi : null;
   Timer? timer;
   bool polling = false,
@@ -89,12 +96,14 @@ class _WalletState extends State<_Wallet> {
   bool get canRecoverWalletKey =>
       macApi != null && profile['can_recover_wallet_key'] == true;
   bool get hasNativeFeedback => nativeStatus != null || canRecoverWalletKey;
+  bool get pairingPending => profile['pairing_pending'] == true;
   bool get waitingForPreview =>
       previewRequestGeneration == generation && nativePrompt != true;
   int generation = 0;
   int? previewRequestGeneration;
   Json profile = {};
   List<Json> vaults = [], payments = [], addresses = [];
+  Map<String, Json> relaySync = {};
   List<({Json vault, Json payment})> approvals = [];
   Json ceremony = {}, recovery = {};
   Object? balance;
@@ -110,11 +119,8 @@ class _WalletState extends State<_Wallet> {
   final verifyUntil = <String, DateTime>{};
   bool scanning = false, enteringLink = false;
   String pairingLink = '';
-  // An invite link that opened the app: taken from the native side once unlocked, then shown
-  // in Join for review. Never persisted; a lock or leaving Join drops it.
   bool inviteWaiting = true;
   String? joinInvite, joinPrefill;
-  // Remounts the create/join form; never derived from the invite, which is a bearer secret.
   int formSerial = 0;
   static const _formPages = {
     _Page.create,
@@ -132,6 +138,7 @@ class _WalletState extends State<_Wallet> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     if (macApi case final mac?) unawaited(watchNativePrompt(mac));
     unawaited(poll());
   }
@@ -152,7 +159,6 @@ class _WalletState extends State<_Wallet> {
     try {
       active = await mac.nativePromptActive();
     } on MissingPluginException {
-      // Older native runners have no content-area callbacks.
     } on PlatformException catch (e) {
       if (mounted) setState(() => actionError = walletError(e));
     }
@@ -161,9 +167,20 @@ class _WalletState extends State<_Wallet> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     timer?.cancel();
     macApi?.onNativePromptChanged(null);
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    appActive = state == AppLifecycleState.resumed;
+    verbose('app lifecycle: ${state.name}');
+    if (appActive) {
+      touchIdAgainAfter = DateTime.fromMillisecondsSinceEpoch(0);
+      nextScan = DateTime.fromMillisecondsSinceEpoch(0);
+    }
   }
 
   void resetSession() {
@@ -199,15 +216,14 @@ class _WalletState extends State<_Wallet> {
             setState(() => nativeStatus = notice);
           }
         } on MissingPluginException {
-          // Notices are optional on older native runners.
         } on PlatformException {
-          // Failure to read an advisory notice must not block the wallet poll.
         }
       }
       final current = await api.profile();
       if (!mounted || locking || epoch != generation) return;
       if (current['can_recover_wallet_key'] !=
-          profile['can_recover_wallet_key']) {
+              profile['can_recover_wallet_key'] ||
+          current['pairing_pending'] != profile['pairing_pending']) {
         setState(() => profile = current);
       }
       if (current['running'] != true) {
@@ -250,7 +266,6 @@ class _WalletState extends State<_Wallet> {
       if (inviteWaiting && !_formPages.contains(page)) {
         inviteWaiting = false;
         final taken = await api.pendingInvite();
-        // A claim taken for a session that has since changed is dropped, not kept.
         if (!mounted || locking || epoch != generation) return;
         if (taken != null) joinInvite = taken;
       }
@@ -270,7 +285,6 @@ class _WalletState extends State<_Wallet> {
           DateTime.now().isAfter(nextScan)) {
         unawaited(scan(id, epoch));
       }
-      // Fetch the selected vault's data first; another vault's relay can't stall setup.
       if (id != null && view == _Page.setup && !active) {
         final result = await api.request('status?vault=$id');
         if (mounted && epoch == generation) {
@@ -282,12 +296,12 @@ class _WalletState extends State<_Wallet> {
       } else if (id != null &&
           active &&
           (view == _Page.history || view == _Page.overview)) {
-        final result = jsonRows(
-          (await api.request('payments?vault=$id'))['payments'],
-        );
+        final reply = await api.request('payments?vault=$id');
+        final result = jsonRows(reply['payments']);
         if (!mounted || epoch != generation) return;
         setState(() {
           payments = result;
+          if (reply['sync'] case final Json sync) relaySync[id] = sync;
           dataError = null;
         });
         if (!scanning) unawaited(verifyBroadcast(id, result));
@@ -307,6 +321,9 @@ class _WalletState extends State<_Wallet> {
         final inbox = await Future.wait(
           list.where((v) => v['active'] == true).map((v) async {
             final rows = await api.request('pending?vault=${v['vault']}');
+            if (rows['sync'] case final Json sync) {
+              relaySync[v['vault'] as String] = sync;
+            }
             return jsonRows(rows['pending']).map((p) => (vault: v, payment: p));
           }),
         );
@@ -337,24 +354,48 @@ class _WalletState extends State<_Wallet> {
     }
   }
 
-  Future<void> scan(String id, int epoch) async {
+  Future<void> scan(String id, int epoch, {bool retryTouchId = false}) async {
     if (scanning) return;
     scanning = true;
     nextScan = DateTime.now().add(const Duration(seconds: 10));
+    var askAgain = false;
     try {
-      final result = await api.request('balance', {'vault': id});
+      final result = await api.request('balance', {
+        'vault': id,
+        if (retryTouchId) 'retry_touch_id': true,
+      });
       if (mounted && epoch == generation) {
         setState(() {
           balance = result['balance_zat'];
           scanError = null;
+          dataError = null;
         });
       }
-    } catch (_) {
-      if (mounted && epoch == generation) {
-        setState(() => scanError = 'Balance could not sync. Retrying…');
+    } catch (e) {
+      final touchId = walletErrorCode(e) == 'touch_id_required';
+      verbose(
+        'balance scan failed (retry=$retryTouchId, active=$appActive): ${walletError(e)}',
+      );
+      askAgain =
+          touchId &&
+          !retryTouchId &&
+          appActive &&
+          DateTime.now().isAfter(touchIdAgainAfter);
+      if (askAgain) {
+        verbose('asking for Touch ID again to open the vault');
+        touchIdAgainAfter = DateTime.now().add(const Duration(minutes: 1));
+      } else if (mounted && epoch == generation) {
+        setState(
+          () => scanError = touchId
+              ? 'Touch ID is needed to open this vault. LokiSigner will ask again.'
+              : 'Balance could not sync. Retrying…',
+        );
       }
     } finally {
       scanning = false;
+    }
+    if (askAgain && mounted && epoch == generation) {
+      await scan(id, epoch, retryTouchId: true);
     }
   }
 
@@ -382,7 +423,6 @@ class _WalletState extends State<_Wallet> {
         'txid': payment['txid'],
       });
     } catch (_) {
-      // A missing confirmation is expected on testnet. History must keep 'Broadcast'.
     } finally {
       scanning = false;
     }
@@ -498,7 +538,6 @@ class _WalletState extends State<_Wallet> {
       throw StateError('The payment preview is no longer active.');
     }
     if (macApi == null) return api.request(path, body);
-    // Wait for the native page to open before allowing navigation to cancel it.
     setState(() => previewRequestGeneration = epoch);
     try {
       return await api.request(path, body);
@@ -579,6 +618,11 @@ class _WalletState extends State<_Wallet> {
                             ),
                           ),
                         ),
+                        if (syncLine() case final line?)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 12),
+                            child: line,
+                          ),
                         if (coordinator case final origin?)
                           Padding(
                             padding: const EdgeInsets.symmetric(vertical: 12),
@@ -642,10 +686,42 @@ class _WalletState extends State<_Wallet> {
     );
   }
 
-  // Retain in-flight Dart work without painting, focusing, or exposing its UI.
   Widget walletBody({required Widget child}) => Expanded(
     child: Visibility(visible: !hideContent, maintainState: true, child: child),
   );
+
+  Widget? syncLine() {
+    final id = vaultId;
+    final sync = id == null ? null : relaySync[id];
+    if (sync == null) return null;
+    final c = context.colors;
+    final failing = sync['last_error'] != null;
+    final last = sync['last_ok_at'];
+    final String text;
+    if (failing) {
+      text = 'Relay unreachable. Retrying…';
+    } else if (sync['in_progress'] == true && last == null) {
+      text = 'Syncing with the relay…';
+    } else if (last is int) {
+      final age = DateTime.now().millisecondsSinceEpoch ~/ 1000 - last;
+      text = age < 5
+          ? 'Up to date'
+          : 'Updated ${age < 60 ? '${age}s' : '${age ~/ 60} min'} ago';
+    } else {
+      text = 'Syncing with the relay…';
+    }
+    return Row(
+      spacing: 6,
+      children: [
+        Icon(
+          failing ? Icons.cloud_off_outlined : Icons.sync,
+          size: 12,
+          color: failing ? c.gold : c.muted,
+        ),
+        Text(text, style: lokiSans(10, color: failing ? c.gold : c.muted)),
+      ],
+    );
+  }
 
   Widget nativeFeedback() => Column(
     crossAxisAlignment: CrossAxisAlignment.start,
@@ -990,23 +1066,7 @@ class _WalletState extends State<_Wallet> {
                   ],
                 ),
                 if (enteringLink)
-                  TextFormField(
-                    initialValue: pairingLink,
-                    autofocus: true,
-                    readOnly: busy,
-                    obscureText: true,
-                    autocorrect: false,
-                    enableSuggestions: false,
-                    style: lokiMono(13),
-                    onChanged: (text) => setState(() {
-                      pairingLink = text;
-                      actionError = null;
-                    }),
-                    decoration: const InputDecoration(
-                      hintText: 'Paste pairing link',
-                      prefixIcon: Icon(Icons.link, size: 17),
-                    ),
-                  )
+                  pairingLinkField()
                 else ...[
                   Text(
                     '01   Pair a new signer',
@@ -1061,15 +1121,7 @@ class _WalletState extends State<_Wallet> {
                 busy || (enteringLink && pairingLink.trim().isEmpty)
                     ? null
                     : enteringLink
-                    ? () {
-                        // The link is one-use: don't keep it once it has been submitted.
-                        final link = pairingLink.trim();
-                        setState(() {
-                          pairingLink = '';
-                          enteringLink = false;
-                        });
-                        act(() => api.pair(link));
-                      }
+                    ? submitPairingLink
                     : () => setState(() {
                         enteringLink = true;
                         actionError = null;
@@ -1082,6 +1134,80 @@ class _WalletState extends State<_Wallet> {
       ),
     );
   }
+
+  Widget pairingLinkField() => TextFormField(
+    initialValue: pairingLink,
+    autofocus: true,
+    readOnly: busy,
+    obscureText: true,
+    autocorrect: false,
+    enableSuggestions: false,
+    style: lokiMono(13),
+    onChanged: (text) => setState(() {
+      pairingLink = text;
+      actionError = null;
+    }),
+    decoration: const InputDecoration(
+      hintText: 'Paste pairing link',
+      prefixIcon: Icon(Icons.link, size: 17),
+    ),
+  );
+
+  void submitPairingLink() {
+    final link = pairingLink.trim();
+    setState(() {
+      pairingLink = '';
+      enteringLink = false;
+    });
+    act(() => api.pair(link));
+  }
+
+  Widget unfinishedPairing() => Column(
+    crossAxisAlignment: CrossAxisAlignment.stretch,
+    spacing: 10,
+    children: [
+      const Notice(
+        'This Mac’s registration with the coordinator didn’t finish. If the pairing link expired, ask the wallet for a new link for the same slot and paste it here.',
+      ),
+      if (enteringLink) pairingLinkField(),
+      Wrap(
+        alignment: WrapAlignment.end,
+        spacing: 8,
+        runSpacing: 8,
+        children: [
+          if (macApi case final mac? when !enteringLink)
+            ActionChipButton(
+              'Remove this profile',
+              Icons.delete_outline,
+              busy ? null : () => act(mac.discardPendingProfile),
+            ),
+          if (enteringLink)
+            ActionChipButton(
+              'Cancel',
+              Icons.close,
+              busy
+                  ? null
+                  : () => setState(() {
+                      enteringLink = false;
+                      pairingLink = '';
+                    }),
+            ),
+          ActionChipButton(
+            enteringLink ? 'Continue' : 'Paste a new pairing link',
+            Icons.link,
+            busy || (enteringLink && pairingLink.trim().isEmpty)
+                ? null
+                : enteringLink
+                ? submitPairingLink
+                : () => setState(() {
+                    enteringLink = true;
+                    actionError = null;
+                  }),
+          ),
+        ],
+      ),
+    ],
+  );
 
   Widget locked() {
     final c = context.colors;
@@ -1101,7 +1227,11 @@ class _WalletState extends State<_Wallet> {
                 const LokiLabel('Shielded multisig'),
                 const SizedBox(height: 14),
                 Text(
-                  !loaded ? 'Opening LokiSigner…' : 'Unlock your signer',
+                  !loaded
+                      ? 'Opening LokiSigner…'
+                      : pairingPending
+                      ? 'Finish pairing'
+                      : 'Unlock your signer',
                   style: lokiSans(26, weight: 600, spacing: -1),
                 ),
                 const SizedBox(height: 12),
@@ -1117,6 +1247,10 @@ class _WalletState extends State<_Wallet> {
                     when message != nativeStatus) ...[
                   const SizedBox(height: 12),
                   Notice(message),
+                ],
+                if (loaded && pairingPending) ...[
+                  const SizedBox(height: 12),
+                  unfinishedPairing(),
                 ],
                 const SizedBox(height: 18),
                 Row(
@@ -1262,7 +1396,7 @@ class _WalletState extends State<_Wallet> {
         .toList();
     final recent = payments
         .where((p) => p['phase'] == 'confirmed')
-        .take(2)
+        .take(5)
         .toList();
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -1384,7 +1518,9 @@ class _WalletState extends State<_Wallet> {
                             radius: 15,
                             backgroundColor: c.secondary,
                             child: Icon(
-                              Icons.north_east,
+                              p['direction'] == 'received'
+                                  ? Icons.south_west
+                                  : Icons.north_east,
                               size: 14,
                               color: c.muted,
                             ),
@@ -1401,7 +1537,12 @@ class _WalletState extends State<_Wallet> {
                                   style: lokiSans(12, weight: 600),
                                 ),
                                 Text(
-                                  shortId(p['recipient'] as String? ?? ''),
+                                  shortId(
+                                    (p['recipient'] as String?)?.isNotEmpty ==
+                                            true
+                                        ? p['recipient'] as String
+                                        : p['txid'] as String? ?? '',
+                                  ),
                                   style: lokiMono(9, color: c.muted),
                                 ),
                               ],
@@ -1506,7 +1647,7 @@ class _WalletState extends State<_Wallet> {
                 CopyButton('Copy address', address, 'Address copied'),
               ] else
                 Text(
-                  row['error'] as String? ??
+                  describeError(null, row['error'] as String?) ??
                       'LokiSigner could not verify the receive address.',
                 ),
             ],

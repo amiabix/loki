@@ -1,10 +1,3 @@
-//! Checkpoint 4's approval binding: what a signer must prove about a candidate before it
-//! will emit a share.
-//!
-//! Every value here is checked against the PCZT and its cryptographic openings. Nothing
-//! is taken from a proposer annotation, and no check is silently skipped when a field is
-//! missing: an absent opening is a refusal, not a pass.
-
 use orchard::{
     keys::{FullViewingKey, OutgoingViewingKey, Scope},
     note::{ExtractedNoteCommitment, Rho},
@@ -15,9 +8,7 @@ use zcash_note_encryption::{try_note_decryption, Domain};
 use zcash_primitives::transaction::fees::zip317::{GRACE_ACTIONS, MARGINAL_FEE};
 use zcash_protocol::memo::MemoBytes;
 
-/// What the signer requires of a candidate, derived from the intent and the vault key.
 pub struct Expectations {
-    /// Exactly these notes may be spent. An exact set, not a subset.
     pub input_nullifiers: Vec<[u8; 32]>,
     pub recipient: [u8; 43],
     pub amount_zat: u64,
@@ -27,7 +18,6 @@ pub struct Expectations {
     pub expiry_height: u32,
 }
 
-/// Why a candidate was refused. Each variant is a line in the brief's checklist.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Refusal {
     WrongNetworkOrVersion(String),
@@ -105,10 +95,6 @@ impl std::fmt::Display for Refusal {
     }
 }
 
-/// Rebuild an output's note from the openings the PCZT carries.
-///
-/// An action's output rho is the nullifier of the note that action spends. Returns the
-/// reconstructed note, or a refusal naming the missing or inconsistent part.
 pub(crate) fn open_output(
     action: &orchard::pczt::Action,
     label: &str,
@@ -140,7 +126,6 @@ pub(crate) fn open_output(
         Refusal::OpeningsDoNotMatchCommitment(format!("{label}: openings do not form a note"))
     })?;
 
-    // The openings must produce exactly the commitment the action carries.
     if &ExtractedNoteCommitment::from(note.commitment()) != out.cmx() {
         return Err(Refusal::OpeningsDoNotMatchCommitment(format!(
             "{label}: recomputed cmx differs"
@@ -150,13 +135,6 @@ pub(crate) fn open_output(
     Ok((note, recipient.to_raw_address_bytes(), value.inner()))
 }
 
-/// Verify the transmitted note ciphertext and key by re-encryption.
-///
-/// `enc_ciphertext` is a deterministic function of the note and its memo: the ephemeral
-/// secret is derived from the note's rseed, so there is no randomness left to differ.
-/// Re-encrypting with the expected memo and comparing bytes therefore binds the memo, the
-/// openings and the ciphertext together. A proposer cannot swap the memo without the
-/// ciphertext changing.
 fn check_memo(
     action: &orchard::pczt::Action,
     note: &Note,
@@ -180,7 +158,6 @@ fn check_memo(
     Ok(())
 }
 
-/// Verify that the vault can discover the reviewed change in a scan.
 pub(crate) fn check_change_decryption(
     action: &orchard::pczt::Action,
     note: &Note,
@@ -192,8 +169,6 @@ pub(crate) fn check_change_decryption(
     }
     let domain = IronwoodDomain::for_pczt_action(action);
     let ivk = vault_fvk.to_ivk(Scope::Internal).prepare();
-    // Recipient decryption checks the transmitted key and commitment. Also match the
-    // address and value being reviewed against the decrypted plaintext.
     if !try_note_decryption(&domain, &ivk, action).is_some_and(|(decrypted, recipient, _)| {
         recipient == note.recipient() && decrypted.value() == note.value()
     }) {
@@ -204,14 +179,11 @@ pub(crate) fn check_change_decryption(
     Ok(())
 }
 
-/// The full approval check. Returns the first refusal, or `Ok` if the candidate is
-/// exactly the payment the intent describes.
 pub fn check_candidate(
     bundle: &orchard::pczt::Bundle,
     vault_fvk: &FullViewingKey,
     want: &Expectations,
 ) -> Result<(), Refusal> {
-    // ── inputs: the real spend set must equal the intent's, exactly ─────────
     let mut real_nullifiers = Vec::new();
     let mut total_in: u64 = 0;
 
@@ -251,15 +223,12 @@ pub fn check_candidate(
         });
     }
 
-    // ── outputs: every one opened, committed to, and memo-bound ─────────────
     let change_address = vault_fvk
         .address_at(0u64, Scope::Internal)
         .to_raw_address_bytes();
     let want_memo =
         MemoBytes::from_bytes(&want.memo).map_err(|e| Refusal::MemoDiffers(format!("{e:?}")))?;
     let empty_memo = MemoBytes::empty();
-    // The builder pads a bundle with one output per spend beyond the two real outputs:
-    // zero value, to a random address, with an all-zero memo.
     let padding_memo = MemoBytes::from_bytes(&[0; 512]).expect("512 bytes is a valid memo");
 
     let mut payments = 0usize;
@@ -293,7 +262,6 @@ pub fn check_candidate(
                     found: value,
                 });
             }
-            // Change carries no memo; proving that binds it as tightly as the payment.
             check_memo(action, &note, &empty_memo, &label)?;
             check_change_decryption(action, &note, vault_fvk, &label)?;
             changes += 1;
@@ -304,8 +272,6 @@ pub fn check_candidate(
                 "{label}: {value} zat to an address the intent does not name"
             )));
         } else {
-            // A zero-value output to neither address would still move nothing, but it is
-            // not something this intent asked for.
             return Err(Refusal::ExtraOutputOrPool(format!(
                 "{label}: an output to an address the intent does not name"
             )));
@@ -330,7 +296,6 @@ pub fn check_candidate(
         });
     }
 
-    // ── fee: implied by the transaction, compared with the intent ───────────
     let implied_fee = total_in.checked_sub(total_out).ok_or(Refusal::FeeDiffers {
         expected: want.fee_zat,
         found: 0,
@@ -341,7 +306,6 @@ pub fn check_candidate(
             found: implied_fee,
         });
     }
-    // The fee must be the conventional ZIP 317 fee for the action count, never more.
     let zip317_fee = u64::from(MARGINAL_FEE) * bundle.actions().len().max(GRACE_ACTIONS) as u64;
     if want.fee_zat != zip317_fee {
         return Err(Refusal::FeeDiffers {
@@ -374,12 +338,10 @@ mod tests {
         want: Expectations,
     }
 
-    /// One honest candidate, built the way `propose` builds them.
     fn fixture() -> Fixture {
         fixture_with(1)
     }
 
-    /// An honest candidate spending `spends` notes that split `SPEND_VALUE` between them.
     fn fixture_with(spends: u8) -> Fixture {
         let rng = rand_core::OsRng;
         let (_shares, pubkeys) =
@@ -457,16 +419,12 @@ mod tests {
         }
     }
 
-    /// The honest candidate is approved. Without this, every tamper case below would
-    /// pass for the wrong reason.
     #[test]
     fn c4_honest_candidate_is_approved() {
         let f = fixture();
         assert_eq!(check_candidate(&f.bundle, &f.fvk, &f.want), Ok(()));
     }
 
-    /// Spending three or more notes makes the builder add padding outputs, which signers
-    /// accept only up to that count.
     #[test]
     fn multi_note_candidates_with_padding_are_approved() {
         for spends in [2, 3, 5] {
@@ -476,9 +434,6 @@ mod tests {
         }
     }
 
-    /// Tamper with one expectation at a time and confirm the signer refuses. A refusal
-    /// here is what stops a share being emitted: `review_sign` reviews every candidate
-    /// before it signs any of them.
     fn refuses(mutate: impl FnOnce(&mut Expectations)) -> Refusal {
         let f = fixture();
         let mut want = f.want;
@@ -496,7 +451,6 @@ mod tests {
     #[test]
     fn c4_tampered_amount_is_refused() {
         let r = refuses(|w| w.amount_zat += 1);
-        // A different amount means no output matches the payment address at that value.
         assert!(
             matches!(
                 r,
@@ -542,8 +496,6 @@ mod tests {
         assert!(matches!(r, Refusal::InputSetDiffers { .. }), "got {r}");
     }
 
-    /// The change address is derived from the vault key, not read from the intent, so a
-    /// candidate paying change elsewhere is refused even if the amount is right.
     #[test]
     fn c4_change_to_a_foreign_address_is_refused() {
         let f = fixture();
@@ -556,8 +508,6 @@ mod tests {
         })
         .unwrap();
 
-        // Checking the same bundle against a DIFFERENT vault key means its change output
-        // no longer lands on that vault's internal address.
         let r = check_candidate(&f.bundle, &other, &f.want)
             .expect_err("change to another vault's address must be refused");
         assert!(
@@ -569,8 +519,6 @@ mod tests {
         );
     }
 
-    /// Expiry is carried in the PCZT global, which `review_sign` checks separately; this
-    /// records that the value reaching the check is the one the builder used.
     #[test]
     fn c4_expiry_is_carried_for_checking() {
         let f = fixture();

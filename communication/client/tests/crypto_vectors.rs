@@ -7,8 +7,6 @@ use serde_json::Value;
 
 type SelectedKem = X25519HkdfSha256;
 
-// This public-vector adapter satisfies HPKE's RNG bound only in this test target.
-// It supplies IKM to DeriveKeyPair; it must never generate production secrets.
 struct VectorIkmRng {
     ikm: [u8; 32],
     fills: usize,
@@ -118,7 +116,6 @@ fn selected_suite_vectors() {
         "published encapsulated key"
     );
 
-    // Open published ciphertext independently of the sender's computed ciphertext.
     let published_enc = <SelectedKem as Kem>::EncappedKey::from_bytes(&bytes(row, "enc"))
         .expect("published encapsulated key");
     let mut receiver = setup_receiver::<ChaCha20Poly1305, HkdfSha256, SelectedKem>(
@@ -136,7 +133,6 @@ fn selected_suite_vectors() {
         257,
         "all published sequence cases retained"
     );
-    // Sequential RFC context cases characterize HPKE; production seals one padded record.
     for (sequence, encryption) in encryptions.iter().enumerate() {
         let pt = bytes(encryption, "pt");
         let aad = bytes(encryption, "aad");

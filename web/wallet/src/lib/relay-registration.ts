@@ -15,13 +15,12 @@ export function newRelayChallenge(seed?: Buffer) {
 }
 
 export function verifyRelayProof(privateKey: string, proof: string, origin: string, signing: string, relay: string, challenge: string): boolean {
-  // X25519 accepts aliases by masking/reducing u. The registry must bind a single encoding.
   if (Buffer.from(relay, "hex").reverse().compare(FIELD_PRIME) >= 0) return false;
   const publicKey = createPublicKey({ key: { kty: "OKP", crv: "X25519", x: Buffer.from(relay, "hex").toString("base64url") }, format: "jwk" });
   const key = createPrivateKey({ key: Buffer.from(privateKey, "hex"), format: "der", type: "pkcs8" });
   let shared: Buffer;
   try { shared = diffieHellman({ privateKey: key, publicKey }); }
-  catch { return false; } // OpenSSL rejects low-order peer keys.
+  catch { return false; }
   try {
     const context = `loki-relay-registration-v1\n${origin}\n${signing}\n${relay}\n${challenge}`;
     const expected = Buffer.from(hkdfSync("sha256", shared, "", context, 32));
