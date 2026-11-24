@@ -483,20 +483,37 @@ async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option
     }).await.map_err(|e| e.to_string())??;
     let pending = st.config.data.join(PAIRING_PENDING);
     let pairing = native && !restored && (launch.pairing_challenge.is_some() || pending.try_exists().map_err(|e| e.to_string())?);
-    let save_destination = || -> Result<(), String> {
-        if let Some(slot) = launch.slot { save_coordinator(&st.config.data, &launch.coordinator, slot)?; }
-        if let Some(fetched) = st.fetched_config.as_ref().filter(|_| !restored) {
-            if let Err(e) = fetched.save_unlocked(&st.config.data) {
-                eprintln!("could not save signer configuration for future launches: {e}");
+    let save_destination = |first_pairing: bool| -> Result<(), String> {
+        if let Some(fetched) = st.fetched_config.as_ref().filter(|fetched| !fetched.staged()) {
+            if first_pairing {
+                fetched.save_first_use(&st.config.data).map_err(|e| {
+                    eprintln!("could not save the signer configuration for this first pairing: {e}");
+                    if e == super::native_config::SAVED_UNSYNCED { "signer-config-unsynced" } else { "signer-config-not-saved" }.to_string()
+                })?;
+            } else {
+                match fetched.save_unlocked(&st.config.data) {
+                    Err(e) if e == super::native_config::SAVED_UNSYNCED && fetched.approved_change() => {
+                        eprintln!("signer configuration: {e}");
+                        return Err("signer-config-unsynced".into());
+                    }
+                    Err(e) if e == super::native_config::PIN_CONFLICT || fetched.approved_change() => {
+                        eprintln!("signer configuration not saved: {e}");
+                        return Err("signer-config-not-saved".into());
+                    }
+                    Err(e) => eprintln!("could not save signer configuration for future launches: {e}"),
+                    Ok(()) => {},
+                }
             }
         }
+        if let Some(slot) = launch.slot { save_coordinator(&st.config.data, &launch.coordinator, slot)?; }
         Ok(())
     };
     if pairing {
-        if !st.config.data.join("paired-coordinator.json").try_exists().map_err(|e| e.to_string())? {
+        let first_pairing = !st.config.data.join("paired-coordinator.json").try_exists().map_err(|e| e.to_string())?;
+        if first_pairing {
             std::fs::write(&pending, []).map_err(|e| e.to_string())?;
         }
-        save_destination()?;
+        save_destination(first_pairing)?;
         register_once(st, pass.clone(), launch.pairing_challenge.clone(), notice.cloned()).await.map_err(|e| {
             eprintln!("native coordinator registration failed: {e}");
             e.native_code()
@@ -519,7 +536,7 @@ async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option
     let secret = pass.clone();
     tokio::task::spawn_blocking(move || super::recovery::seal_missing_backups_logged(&data, &secret))
         .await.map_err(|e| e.to_string())?;
-    if !pairing { save_destination()?; }
+    if !pairing { save_destination(false)?; }
     if !st.activate_session(generation, session).await { return Err("signer was locked; unlock again".into()); }
     if pairing { return Ok("ready"); }
     if restored {

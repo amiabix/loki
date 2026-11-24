@@ -102,6 +102,22 @@ pub(crate) fn request_stop() -> bool {
     }))
 }
 
+#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+pub(super) fn running_state(data: &Path) -> Option<Shared> {
+    RUNNING.lock().ok()?.as_ref()
+        .filter(|member| member.state.config.data == data && !member.state.is_stopping())
+        .map(|member| member.state.clone())
+}
+
+#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+pub(super) fn while_running<T>(state: &Shared, work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let running = RUNNING.lock().map_err(|_| "LokiSigner could not check that it is running")?;
+    if !running.as_ref().is_some_and(|member| Arc::ptr_eq(&member.state, state)) || state.is_stopping() {
+        return Err("LokiSigner was locked, so it saved nothing".into());
+    }
+    work()
+}
+
 pub(super) fn clear_addresses_on_lock(state: &Shared) {
     let member = RUNNING.lock().ok().and_then(|running| {
         running.as_ref().filter(|member| Arc::ptr_eq(&member.state, state)).cloned()
@@ -201,7 +217,7 @@ pub(crate) fn set_log_sink(sink: extern "C" fn(*const std::ffi::c_char)) {
     DIAGNOSTICS.lock().unwrap().sink = Some(sink);
 }
 
-fn emit(event: Event) {
+pub(super) fn emit(event: Event) {
     DIAGNOSTICS.lock().unwrap().record(event);
 }
 
