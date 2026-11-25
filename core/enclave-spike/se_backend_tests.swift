@@ -89,14 +89,15 @@ enum BackendTests {
             return proof
         }, biometry: { current })
 
-        func run(_ create: Bool, _ expected: Int) {
+        func run(_ create: Bool, _ expected: Int, staged: Bool = false) {
             let before = lookups
             wantsLock = create
             var handle: UInt64 = 0
             let status = tag.withUnsafeBytes { bytes in
                 statePath.withCString { path in
-                    se_open_persistent(bytes.bindMemory(to: UInt8.self).baseAddress!, tag.count,
-                                       create ? 1 : 0, path, &handle)
+                    staged ? se_create_staged(bytes.bindMemory(to: UInt8.self).baseAddress!, tag.count, path, &handle)
+                        : se_open_persistent(bytes.bindMemory(to: UInt8.self).baseAddress!, tag.count,
+                                             create ? 1 : 0, path, &handle)
                 }
             }
             precondition(status == expected && lookups == before + 1)
@@ -107,9 +108,8 @@ enum BackendTests {
         run(false, -6)
         for (status, failure) in failures {
             lookupStatus = status
-            let expected = failure == -12 ? -20 : failure
-            run(false, expected)
-            run(true, expected)
+            run(false, failure)
+            run(true, failure)
         }
         lookupStatus = errSecSuccess
         lookupValue = "not a key" as NSString
@@ -119,12 +119,13 @@ enum BackendTests {
         lookupStatus = errSecItemNotFound
         creationFailure = -12
         current = Biometry(state: nil, failure: -16)
-        run(true, -16)
+        run(true, -12)
         creationFailure = nil
-        current = Biometry(state: enrollment, failure: nil)
+        current = Biometry(state: nil, failure: -15)
         run(true, 0)
-        precondition((try! Data(contentsOf: URL(fileURLWithPath: statePath))) == enrollment)
-        precondition(creations == 2 && proofs == 0)
+        run(true, 0, staged: true)
+        precondition(!FileManager.default.fileExists(atPath: statePath), "new keys record no biometry state")
+        precondition(creations == 3 && proofs == 0)
 
         lookupStatus = errSecSuccess
         lookupValue = softwareKey
@@ -137,27 +138,36 @@ enum BackendTests {
         proof = -12
         run(true, -12)
         current = Biometry(state: Data([2, 68, 21]), failure: nil)
-        run(true, -17)
+        run(true, -12)
+        current = Biometry(state: nil, failure: -16)
+        run(true, -12)
         proof = -11
         run(true, -11)
         proof = -13
         run(true, -13)
-        precondition(creations == 2 && proofs == 6)
+        precondition(creations == 3 && proofs == 7)
 
+        // Legacy .biometryCurrentSet profile: its recorded state still detects a dead key.
+        try! enrollment.write(to: URL(fileURLWithPath: statePath))
+        current = Biometry(state: Data([2, 68, 21]), failure: nil)
         lookupStatus = errSecItemNotFound
         run(false, -17)
         run(true, -17)
         lookupStatus = errSecAuthFailed
         run(false, -17)
         current = Biometry(state: Data([1, 68, 21]), failure: nil)
-        run(false, -20)
+        run(false, -12)
         current = Biometry(state: nil, failure: -15)
         run(false, -12)
         current = Biometry(state: nil, failure: -16)
         run(false, -17)
-        try! FileManager.default.removeItem(atPath: statePath)
-        run(false, -20)
-        precondition(creations == 2)
+        current = Biometry(state: enrollment, failure: nil)
+        lookupStatus = errSecItemNotFound
+        run(true, 0)
+        precondition(!FileManager.default.fileExists(atPath: statePath), "a replaced key drops the legacy state")
+        lookupStatus = errSecAuthFailed
+        run(false, -12)
+        precondition(creations == 4)
     }
 
     static func paymentScope() {
@@ -216,7 +226,7 @@ enum BackendTests {
                 se_close(handle)
             }
             var error: NSError?
-            precondition(!contexts.last!.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error))
+            precondition(!contexts.last!.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error))
             precondition(error?.code == LAError.Code.invalidContext.rawValue)
         }
         precondition(contexts.count == 3 && bound == 2)

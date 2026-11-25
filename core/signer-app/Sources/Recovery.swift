@@ -88,24 +88,11 @@ func touchIDSetupAlert(_ error: NSError?) -> NSAlert {
     let code = error.flatMap { $0.domain == LAError.errorDomain ? LAError.Code(rawValue: $0.code) : nil }
     let alert = NSAlert()
     alert.alertStyle = .warning
-    switch code {
-    case .biometryNotAvailable:
-        alert.messageText = "Touch ID is not available right now"
-        alert.informativeText = "If you’re using a MacBook, open its lid and try again. To set up LokiSigner, you need a Mac or an accessory with Touch ID."
-    case .biometryDisconnected:
-        alert.messageText = "Your Touch ID accessory is disconnected"
-        alert.informativeText = "Reconnect it and try again."
-    case .biometryNotPaired:
-        alert.messageText = "No Touch ID accessory is paired"
-        alert.informativeText = "Pair it with this Mac and try again."
-    case .biometryNotEnrolled:
-        alert.messageText = "No fingerprint is enrolled for Touch ID"
-        alert.informativeText = "Add a fingerprint in System Settings, then try again."
-    case .biometryLockout:
-        alert.messageText = "Touch ID is locked out"
-        alert.informativeText = "Unlock your Mac with its password, then try again."
-    default:
-        alert.messageText = "Touch ID cannot be used right now"
+    if code == .passcodeNotSet {
+        alert.messageText = "This Mac account has no login password"
+        alert.informativeText = "Set one in System Settings, then try again."
+    } else {
+        alert.messageText = "Touch ID or your Mac password cannot be used right now"
         alert.informativeText = "Unlock your Mac and try again in LokiSigner."
     }
     alert.addButton(withTitle: "OK")
@@ -115,7 +102,7 @@ func touchIDSetupAlert(_ error: NSError?) -> NSAlert {
 private func touchIDSetupAlertIfNeeded() -> NSAlert? {
     var error: NSError?
     let context = LAContext()
-    guard !context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error) else { return nil }
+    guard !context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &error) else { return nil }
     return touchIDSetupAlert(error)
 }
 
@@ -136,7 +123,7 @@ func firstRunChoice() -> NSApplication.ModalResponse {
     alert.informativeText = """
         Pair a new signer, or restore your existing member using its 24 recovery words and an encrypted vault backup file.
 
-        Adding or removing a Touch ID fingerprint makes this Mac’s signer keys unusable. To get your vault back, you’ll need your recovery words and the encrypted backup file downloaded from the wallet.
+        LokiSigner unlocks with Touch ID or your Mac password. If this Mac’s signer keys are lost, you’ll need your recovery words and the encrypted backup file downloaded from the wallet.
         """
     alert.addButton(withTitle: "Pair a new signer")
     alert.addButton(withTitle: "Restore from recovery words")

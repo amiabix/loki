@@ -32,9 +32,9 @@ The standalone app and the wallet still work with links. On the wallet's sign-in
 1. **Pair a new native signer**: choose **Get a pairing link**. The wallet shows the reserved
    slot, the time left on the link, an **Open LokiSigner** button and **Copy link** (to open
    it on the member's Mac yourself). LokiSigner then asks, in this order:
-   - On first launch, LokiSigner checks that Touch ID is available, enrolled and not locked out.
-     Setup stops if it isn't ready. Read the fingerprint-change warning and choose **Pair a new
-     signer** (or see restore below if this is a replacement Mac).
+   - On first launch, LokiSigner checks that Touch ID or the Mac password can be used.
+     Setup stops if neither can. Choose **Pair a new signer** (or see restore below if this is
+     a replacement Mac).
    - "Pair this device with slot N?" with the coordinator origin. Choose **Continue** only if
      it is the wallet's address.
    - "Pair this device with slot N?" again, with the network and endpoints that coordinator
@@ -96,17 +96,18 @@ written during restore staging. Without that marker, a missing device key may be
 only if the saved coordinator's roster can be read and does not list this profile’s identity.
 An unreadable roster does not authorize key creation.
 
-New Secure Enclave keys record the public LocalAuthentication enrolment state in a
-`biometry-state` file beside the corresponding sealed data. LokiSigner uses a change in that
-state to distinguish a fingerprint change from a failed match; it never stores fingerprints.
+New Secure Enclave keys unlock with Touch ID or the Mac password (`.userPresence`), so they
+work with the lid closed, without a Touch ID keyboard and after fingerprint changes. Older
+profiles keep their Touch ID-only key; their `biometry-state` file still tells a fingerprint
+change from a failed match.
 When setup reuses a key left by an interrupted attempt, it verifies one private-key use
 before sealing new data under that key.
 
-`NativeSigner.start` checks Touch ID once when it sees a fresh profile, before pairing or
+`NativeSigner.start` checks Touch ID or the Mac password once when it sees a fresh profile, before pairing or
 first-run recovery asks for a passphrase or words. **Restore a vault…** checks it before
 collecting words in an unlocked profile. Neither check runs in `serve` or the headless binary.
 
-Adding or removing a fingerprint invalidates this Mac's signer keys. Copying a profile to
+Adding or removing a fingerprint invalidates only an older profile's keys. Copying a profile to
 another Mac does not copy its keys. LokiSigner does not create a replacement when opening
 sealed data. If you only moved an older profile that uses path-based tags on the same Mac,
 putting the folder back at its original path can recover access. A cancelled Touch ID prompt

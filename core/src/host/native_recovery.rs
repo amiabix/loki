@@ -104,22 +104,13 @@ impl Drop for Stage {
 
 #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
 fn verify_staged_signer(dir: &Path) -> Result<(), &'static str> {
-    use super::state::{open_apple_element, HostedSecureElement};
+    use super::state::open_apple_element;
     use crate::signer::store::{FileKind, SignerStore};
 
     let se = open_apple_element(dir, false, None, None, "", None).map_err(KeyFailure::message)?;
-    if let HostedSecureElement::Apple(key, _) = &se {
-        key.confirm_staged_biometry(None).map_err(KeyFailure::message)?;
-    }
     let store = SignerStore::open(dir).map_err(|_| REFUSED)?;
     let _share = store.read(&se, FileKind::Share)
         .map_err(|e| super::state::member_key_message(&e).unwrap_or(REFUSED))?.ok_or(REFUSED)?;
-    if let HostedSecureElement::Apple(key, _) = &se {
-        let state = dir.join("biometry-state");
-        key.confirm_staged_biometry(Some(&state)).map_err(KeyFailure::message)?;
-        fs::File::open(state).and_then(|f| f.sync_all())
-            .and_then(|_| fs::File::open(dir)?.sync_all()).map_err(|_| REFUSED)?;
-    }
     Ok(())
 }
 

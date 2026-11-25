@@ -115,7 +115,7 @@ pub(super) enum VaultOpen {
 }
 
 const NEEDS_TOUCH_ID: &str = "Touch ID is required to open this vault.";
-const CANCELLED_TOUCH_ID: &str = "Touch ID was cancelled.";
+const CANCELLED_TOUCH_ID: &str = "Touch ID or password entry was cancelled.";
 
 pub(super) fn viewing_key(
     st: &AppState,
