@@ -14,7 +14,7 @@ open core/signer-app/out/LokiSigner.app
 ```
 
 The embedded app (the Flutter Runner, see [`apps/macos`](../../apps/macos/README.md)) pairs
-by address: choose **Pair this Mac**, type the coordinator address (for example
+by address: choose **Connect**, type the coordinator address (for example
 `loki.megabyte.sh`), then review the coordinator and slot, the configuration, your passphrase
 and Touch ID. LokiSigner asks `POST /api/members/pairing` for the link itself and checks that it
 names the typed origin and the reserved slot. If the reservation expires before registration
@@ -397,11 +397,11 @@ writes the profile only through the resolved path, so moving a symlink can't red
 
 - **After each unlock** LokiSigner asks the paired coordinator once, in the background, for its
   current `/api/signer-config`. A failed request is only logged; signing continues.
-- **A different pair** opens "The coordinator changed its nonce witnesses" with the saved and
-  new fingerprints (short form, full value selectable). **Keep current witnesses** is the
+- **A different pair** opens "Your Loki server changed its signing safety servers" with the saved and
+  new fingerprints (short form, full value selectable). **Keep current safety servers** is the
   default and the Escape action and changes nothing; the screen may appear again after a later
   unlock. Like a payment request, it never activates the app and waits for the member to focus it.
-- **Trust new witnesses** needs Touch ID. LokiSigner then fetches the configuration again and
+- **Trust new safety servers** needs Touch ID. LokiSigner then fetches the configuration again and
   saves the new pair only if the coordinator still serves exactly that pair and the saved
   configuration is still the one this unlock runs with. Only the pair and its fingerprint change. The running signer
   keeps the saved pair until the member locks and unlocks again. Nothing switches silently.

@@ -243,12 +243,12 @@ private func showApprovalEnded(_ state: Int32) {
     case 2: reason = "You did not answer the payment request in time."
     case 3: reason = "Another member did not answer the payment request in time."
     case 4: reason = "Another member refused the payment."
-    case 5: reason = "The signing round timed out waiting for members."
-    default: reason = "This payment attempt ended before LokiSigner could complete it."
+    case 5: reason = "Time ran out waiting for members to sign."
+    default: reason = "This payment attempt ended before Loki could finish it."
     }
     if NativeSigner.embeddedMode {
         if let signer = NativeSigner.embeddedSigner, signer.walletReady {
-            signer.walletNotice = reason + " LokiSigner did not approve it."
+            signer.walletNotice = reason + " Loki did not approve it."
         }
         return
     }
@@ -258,7 +258,7 @@ private func showApprovalEnded(_ state: Int32) {
     panel.title = state == 2 ? "Payment approval timed out" : "Payment request ended"
     panel.isReleasedWhenClosed = false
     panel.hidesOnDeactivate = false
-    let label = NSTextField(wrappingLabelWithString: reason + " LokiSigner did not approve it.")
+    let label = NSTextField(wrappingLabelWithString: reason + " Loki did not approve it.")
     panel.contentView = NSView(frame: frame)
     label.frame = frame.insetBy(dx: 16, dy: 12)
     panel.contentView?.addSubview(label)
@@ -308,9 +308,9 @@ private struct PaymentReview: Decodable {
             (memo.isEmpty ? [] : [r.label("Memo · sender’s text", size: 12, tone: r.muted), r.quote(memo)]))
         let breakdown = r.card("Transaction breakdown", [
             r.row("Network fee", zec(fee_zat)),
-            r.label("✓  Fee verified by signer", size: 11, weight: .semibold, tone: r.mint),
-            r.row("Change to vault", zec(change_zat)), r.row("Network", "Testnet"), r.row("Branch ID", branch_id),
-            r.row("Expiry height", String(expiry_height)),
+            r.label("✓  Fee checked on this Mac", size: 11, weight: .semibold, tone: r.mint),
+            r.row("Change to vault", zec(change_zat)), r.row("Network", "Testnet"), r.row("Network version", branch_id),
+            r.row("Expires at block", String(expiry_height)),
         ])
         let amountValue = zec(amount_zat)
         let amountText = r.label(amountValue, size: 31, weight: .semibold, tone: r.gold, mono: true, wrap: false)
@@ -325,15 +325,15 @@ private struct PaymentReview: Decodable {
         memberInfo.widthAnchor.constraint(equalToConstant: 122).isActive = true
         memberInfo.trailingAnchor.constraint(equalTo: summary.trailingAnchor).isActive = true
         summary.alignment = .centerY
-        let identifiers = r.disclosure("Signing identifiers · 4", [
+        let identifiers = r.disclosure("Technical details · 4", [
             r.row("Vault ID", vault, wide: true), r.row("Payment ID", payment, wide: true),
-            r.row("Attempt ID", attempt, wide: true), r.row("Signature hash", sighash, wide: true),
+            r.row("Attempt ID", attempt, wide: true), r.row("Transaction fingerprint", sighash, wide: true),
         ])
         return SignerReview(section: "Approvals", title: "Review payment",
-            intro: "Compare the transaction read by this Mac with the payment you intend.",
+            intro: "This Mac read these details from the transaction itself. Approve only if they match the payment you meant to make.",
             content: [r.surface(summary, padding: 17, tone: r.hero, radius: 14), r.split(destination, breakdown),
                       r.card("Vault name", [r.quote(vault_name)]), identifiers],
-            hint: "No answer in 2 minutes: this signer refuses.", actions: ["Refuse", "Approve and sign"], primary: 1)
+            hint: "If you don’t answer in 2 minutes, Loki refuses.", actions: ["Refuse", "Approve and sign"], primary: 1)
     }
 }
 
@@ -428,8 +428,8 @@ private func waitForApprovalDialog(cancellation: @escaping () -> Int32, timeout:
                 RunLoop.main.perform(inModes: [.default, .modalPanel]) {
                     guard waiting else { return }
                     let content = UNMutableNotificationContent()
-                    content.title = "LokiSigner payment request"
-                    content.body = "Open LokiSigner to review a payment awaiting approval."
+                    content.title = "Loki payment request"
+                    content.body = "Open Loki to review a payment that needs your approval."
                     center.add(UNNotificationRequest(identifier: id, content: content, trigger: nil)) { _ in
                         RunLoop.main.perform(inModes: [.default, .modalPanel]) {
                             if !waiting { center.removeDeliveredNotifications(withIdentifiers: [id]) }
@@ -537,24 +537,24 @@ private func nativeConfirmRoster(_ summary: UnsafePointer<CChar>?) -> Int32 {
     let answer = walletDecision(timeout: rosterTimeout, escape: .abort, makeReview: {
         guard network == "testnet", member > 0, threshold > 0, members >= threshold else { return nil }
         let r = SignerReview.self
-        let codeCard = r.card("Roster code · computed on this Mac", [
+        let codeCard = r.card("Safety code · made on this Mac", [
             r.tiles(code.components(separatedBy: " ")),
             r.label("Choose Codes match only if everyone reads back the same code.", tone: r.muted),
         ], emphasized: true)
         let policyNumber = r.column([r.label("\(threshold) of \(members)", size: 26, weight: .semibold, mono: true),
-                                     r.label("Approvals required", size: 12, tone: r.muted)], spacing: 4)
+                                     r.label("Approvals needed", size: 12, tone: r.muted)], spacing: 4)
         let slotNumber = r.column([r.label(String(format: "%02d", member), size: 26, weight: .semibold, mono: true),
-                                   r.label("Your member slot", size: 12, tone: r.muted)], spacing: 4)
+                                   r.label("Your member number", size: 12, tone: r.muted)], spacing: 4)
         let facts = NSStackView(views: [policyNumber, slotNumber])
         facts.distribution = .fillEqually
-        let policy = r.card("Vault policy", [facts,
+        let policy = r.card("Vault rules", [facts,
             r.label("Vault name · set by creator", size: 12, tone: r.muted), r.quote(name)])
         let mismatch = r.card("If one group differs", [r.label("Stop the setup", weight: .semibold),
-            r.label("A different code may mean a member was substituted. Choose Codes differ and check the roster together.", tone: r.muted),
+            r.label("A different code may mean someone was swapped into this vault. Choose Codes differ and check the member list together.", tone: r.muted),
             r.row("Network", "Testnet")])
-        return SignerReview(section: "Vault setup", title: "Compare roster codes",
+        return SignerReview(section: "Vault setup", title: "Compare safety codes",
             intro: "Compare all six groups with every other member, by phone or in person.",
-            content: [codeCard, r.split(policy, mismatch)], hint: "No answer in 10 minutes: no match is recorded.",
+            content: [codeCard, r.split(policy, mismatch)], hint: "If you don’t answer in 10 minutes, the codes are not confirmed.",
             actions: ["Codes differ", "Codes match"], primary: 1)
     }) {
         let alert = NSAlert()
@@ -664,9 +664,9 @@ private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointe
         DispatchQueue.main.async {
             if let signer = NativeSigner.embeddedSigner {
                 let r = SignerReview.self
-                signer.presentPrompt(SignerReview(section: "Pairing", title: "Approve once more",
-                    intro: text, content: [r.info("Why Touch ID asks again", "Your first approval answered the reservation that ran out. The new one needs its own approval. Your passphrase isn’t needed again.")],
-                    hint: "Cancel stops pairing; you can pair again later with the coordinator address.",
+                signer.presentPrompt(SignerReview(section: "Connect", title: "Approve once more",
+                    intro: text, content: [r.info("Why Touch ID asks again", "Your first approval was for a hold that ran out. The new hold needs its own approval. You don’t need to enter your passphrase again.")],
+                    hint: "Cancel stops connecting. You can connect again later with your Loki server address.",
                     actions: ["Continue", "Cancel"], primary: 0), escape: .alertSecondButtonReturn) { answer in
                     renew = answer == .alertFirstButtonReturn
                     done.signal()
@@ -695,9 +695,9 @@ private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointe
                 let numbered = words.enumerated().map { String(format: "%02d", $0.offset + 1) + " " + $0.element }
                 let review = SignerReview(section: "Recovery", title: "Save your recovery words",
                     intro: "Write all 24 words down privately, in their numbered order.", content: [
-                        r.card("One-time recovery words", [r.tiles(numbered, secret: true)]),
+                        r.card("Your recovery words · shown once", [r.tiles(numbered, secret: true)]),
                         r.info("You need two things to restore", "Keep your written words and the encrypted backup file for each vault. Never share either in chat."),
-                    ], hint: "Only explicit acknowledgment finishes this step.", actions: ["I saved these words"], primary: 0)
+                    ], hint: "This step finishes only when you confirm you saved the words.", actions: ["I saved these words"], primary: 0)
                 signer.presentPrompt(review, escape: nil) { answer in
                     acknowledged = answer == .alertFirstButtonReturn
                     done.signal()
@@ -730,7 +730,7 @@ private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointe
                 signer.didStart()
                 if event != "ready" {
                     signer.walletNotice = event == "restore-pending"
-                        ? "Your vault is saved on this Mac. LokiSigner will keep trying to reconnect without your recovery words."
+                        ? "Your vault is saved on this Mac. Loki will keep trying to reconnect, and won’t need your recovery words."
                         : "Vault restored on this Mac."
                 }
                 return 0
@@ -787,7 +787,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
     private var attemptedPairingClaims: Set<String> = []
     private var addressLinks: Set<String> = []
     private var resumeRenewal = false
-    private static let renewalTouchID = "The coordinator holds this Mac’s slot for two minutes. If that runs out while you’re still reviewing, LokiSigner asks for the same slot again by itself, and Touch ID asks only once. If it runs out after you approve with Touch ID, LokiSigner asks you before requesting the slot again, and Touch ID then asks once more."
+    private static let renewalTouchID = "Your Loki server holds a spot for this Mac for two minutes. If the hold runs out while you’re still reviewing, Loki asks for the same spot again by itself, and Touch ID asks only once. If it runs out after you approve with Touch ID, Loki asks you before asking for the spot again, and Touch ID then asks once more."
     private var startingOver = false
     private var recoveringKey = false
     private var discardingPending = false
@@ -925,12 +925,12 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         guard walletReady else { return }
         let r = SignerReview.self
         if !canShowWalletDecision {
-            walletNotice = "Payment blocked: the signer could not verify the fee. This Mac did not sign."
+            walletNotice = "Payment blocked: Loki could not check the fee. This Mac did not sign."
             return
         }
         presentPrompt(SignerReview(section: "Approvals", title: "Payment blocked",
             intro: "This Mac could not verify the fee from the transaction.", content: [
-                r.info("Fee not verified", "The declared fee is not proven by the transaction. The signer stopped before asking for a signature.", warning: true),
+                r.info("Fee not verified", "The transaction does not prove the fee it claims. Loki stopped before asking you to sign.", warning: true),
                 r.card("Signing decision", [r.label("No signature was requested", weight: .semibold),
                     r.label("There’s nothing to approve on this Mac. Return to the payment to check its status.", tone: r.muted)]),
             ], hint: "No override is available.", actions: ["Back to approvals"])) { _ in }
@@ -1099,10 +1099,10 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         }
         guard canSetUp() else { return }
         let r = SignerReview.self
-        presentPrompt(SignerReview(section: "Pairing", title: "Remove this unregistered profile?",
-            intro: "The coordinator never accepted this Mac’s registration, so this profile has no recovery words or vaults yet.",
-            content: [r.info("Nothing is deleted", "LokiSigner renames the local data folder and returns to Pair this Mac. Pair again with the coordinator address.")],
-            hint: "Cancel keeps this profile.", actions: ["Cancel", "Remove and pair again"], primary: 1, destructive: true)) { answer in
+        presentPrompt(SignerReview(section: "Connect", title: "Remove this unfinished setup?",
+            intro: "Your Loki server never finished adding this Mac, so this profile has no recovery words or vaults yet.",
+            content: [r.info("Nothing is deleted", "Loki renames the local data folder and goes back to the start. Then connect again with your Loki server address.")],
+            hint: "Cancel keeps this profile.", actions: ["Cancel", "Remove and connect again"], primary: 1, destructive: true)) { answer in
             guard answer == .alertSecondButtonReturn else { self.finishWalletOperation(.cancelled); return }
             self.discardingPending = true
             self.setAside(recover: false)
@@ -1115,7 +1115,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         let r = SignerReview.self
         presentPrompt(SignerReview(section: "Profile recovery", title: "Set aside this profile?",
             intro: recover ? "The secure key for this profile is no longer available." : "Set aside this local profile to start recovery.",
-            content: [r.info("This moves the entire profile", "LokiSigner renames the local data folder, including identity, pairing and any vault data. Nothing is deleted.", warning: true),
+            content: [r.info("This moves the entire profile", "Loki renames the local data folder, including this Mac’s identity, server connection and any vault data. Nothing is deleted.", warning: true),
                 r.card("Before starting over", [r.label("Locate your encrypted backup file for each vault you want to recover."),
                     r.label("Check that you also have the matching written recovery words.")])],
             hint: "Cancel leaves this profile where it is.", actions: ["Cancel", "Set aside and start over"], primary: 1, destructive: true)) { answer in
@@ -1340,18 +1340,17 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
             let r = SignerReview.self
             let review: SignerReview
             if let slot {
-                review = SignerReview(section: "Signer setup · 03 / 04", title: "Confirm member slot",
-                    intro: "Check which slot this Mac will use.", content: [
-                        r.origin("Coordinator", origin, "Only continue if this is the origin you intended."),
-                        r.card("Returned slot", [r.label("Member \(slot)", size: 26, weight: .semibold, mono: true),
-                            r.label("Continue to fetch the signer configuration. Nothing has been saved.", tone: r.muted)]),
-                    ], hint: "Check the member slot before continuing.", actions: ["Continue", "Cancel"], primary: 0)
+                review = SignerReview(section: "Set up Loki · 03 / 04", title: "Confirm your member number",
+                    intro: "Continue to load the server’s settings. Nothing has been saved yet.", content: [
+                        r.origin("Loki server", origin, "Only continue if this is the server you meant."),
+                        r.surface(r.label("Member \(slot)", size: 26, weight: .semibold, mono: true), padding: 17, tone: r.hero, radius: 14),
+                    ], hint: "Cancel stops setup.", actions: ["Continue", "Cancel"], primary: 0)
             } else {
-                review = SignerReview(section: "Recovery · fresh profile", title: "Confirm original coordinator",
-                    intro: "Use the same HTTPS coordinator as the profile you are restoring.", content: [
-                        r.origin("Original coordinator", origin, "Check this full address before contacting it."),
-                        r.info("Why the original coordinator matters", "LokiSigner uses its roster to find the identity in your backup. It cannot transfer the profile to a different coordinator."),
-                    ], hint: "Continue requests its configuration.", actions: ["Continue", "Cancel"], primary: 0)
+                review = SignerReview(section: "Recovery · new profile", title: "Confirm your original Loki server",
+                    intro: "Use the same Loki server as the profile you are restoring.", content: [
+                        r.origin("Original Loki server", origin, "Check this full address before Loki contacts it."),
+                        r.info("Why the original server matters", "Loki uses that server’s member list to find you in your backup. It can’t move the profile to a different server."),
+                    ], hint: "Continue loads the server’s settings.", actions: ["Continue", "Cancel"], primary: 0)
             }
             presentPrompt(review, escape: .alertSecondButtonReturn, completion: then)
             return
@@ -1382,9 +1381,9 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
     private func endpointRows(_ config: [String: Any]) -> [NSView] {
         let r = SignerReview.self
         let field = { (key: String) in config[key] as? String ?? "None" }
-        let rows = [r.row("FROST relay", field("frostd_url")), r.row("Lightwalletd", field("lightwalletd_url"))]
+        let rows = [r.row("Signing server", field("frostd_url")), r.row("Blockchain server", field("lightwalletd_url"))]
         return rows + (config["nonce_witnesses"] as? [String] ?? []).enumerated().map {
-            r.row("Nonce witness \($0.offset + 1)", $0.element)
+            r.row("Signing safety server \($0.offset + 1)", $0.element)
         }
     }
 
@@ -1417,13 +1416,13 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
     private func confirmWitnessChange(saved: String?, offered: String, coordinator: String, unsolicited: Bool = false,
                                       then: @escaping (Bool) -> Void) {
         let none = "None saved on this Mac"
-        let title = "The coordinator changed its nonce witnesses"
-        let warning = "Only trust the new witnesses if the coordinator’s operator told you they changed. If you weren’t expecting this, the coordinator may be compromised: keep the current witnesses and contact the operator."
+        let title = "Your Loki server changed its signing safety servers"
+        let warning = "Only trust the new safety servers if the person who runs your Loki server told you they changed. If you weren’t expecting this, your Loki server may be compromised: keep the current safety servers and contact the person who runs it."
         let decided: (Bool) -> Void = { trust in
             guard trust else { loki_member_app_keep_witnesses(); then(false); return }
             let context = LAContext()
             context.evaluatePolicy(.deviceOwnerAuthentication,
-                                   localizedReason: "Trust the new nonce witnesses for \(coordinator)") { success, _ in
+                                   localizedReason: "Trust the new signing safety servers for \(coordinator)") { success, _ in
                 DispatchQueue.main.async {
                     if !success { loki_member_app_keep_witnesses() }
                     then(success)
@@ -1437,13 +1436,13 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
                 return r.column([r.row(name, shortFingerprint(value)),
                                  r.label(value, size: 11, tone: r.muted, mono: true, selectable: true)], spacing: 4)
             }
-            presentPrompt(SignerReview(section: "Signer configuration", title: title,
-                intro: "LokiSigner keeps signing with the current witnesses unless you trust the new ones with Touch ID or your Mac password.", content: [
-                    r.origin("Coordinator", coordinator, "It now serves a different nonce witness pair."),
-                    r.card("Witness pair fingerprints", [pair("Current", saved), pair("New", offered)]),
-                    r.info("Check with the operator first", warning, warning: true),
-                ], hint: "Keeping the current witnesses changes nothing.",
-                actions: ["Keep current witnesses", "Trust new witnesses"], primary: 0),
+            presentPrompt(SignerReview(section: "Server settings", title: title,
+                intro: "Loki keeps signing with the current safety servers unless you trust the new ones with Touch ID or your Mac password.", content: [
+                    r.origin("Loki server", coordinator, "It now lists different signing safety servers."),
+                    r.card("Safety server fingerprints", [pair("Current", saved), pair("New", offered)]),
+                    r.info("Check with whoever runs the server first", warning, warning: true),
+                ], hint: "Keeping the current safety servers changes nothing.",
+                actions: ["Keep current safety servers", "Trust new safety servers"], primary: 0),
                 escape: .alertFirstButtonReturn) { decided($0 == .alertSecondButtonReturn) }
             return
         }
@@ -1456,8 +1455,8 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         full.isSelectable = true
         full.frame = NSRect(x: 0, y: 0, width: 420, height: 56)
         alert.accessoryView = full
-        alert.addButton(withTitle: "Keep current witnesses")
-        alert.addButton(withTitle: "Trust new witnesses")
+        alert.addButton(withTitle: "Keep current safety servers")
+        alert.addButton(withTitle: "Trust new safety servers")
         var attention: Int?
         if unsolicited && !NSApp.isActive { attention = NSApp.requestUserAttention(.informationalRequest) }
         let answer = runDecisionAlert(alert, escape: .alertFirstButtonReturn, activate: !unsolicited)
@@ -1499,7 +1498,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         confirmWitnessChange(saved: change.saved, offered: change.offered, coordinator: coordinator, unsolicited: true) { trusted in
             guard trusted else { finish(nil); return }
             guard self.ready, self.running, !self.stopping, !self.startingOver, !self.lockingForAbsence else {
-                finish("LokiSigner was locked, so it kept the current nonce witnesses.")
+                finish("Loki was locked, so it kept the current signing safety servers.")
                 return
             }
             let launch: [String: Any] = ["args": self.args, "offered_fingerprint": change.offered]
@@ -1509,12 +1508,12 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
                 DispatchQueue.main.async {
                     defer { self.walletWork.leave() }
                     if reply["trusted"] as? Bool == true, reply["unsynced"] as? Bool == true {
-                        finish("LokiSigner replaced the saved nonce witnesses, but couldn’t confirm the save finished. The next unlock will most likely use the new witnesses. If LokiSigner asks about them again, review them again.")
+                        finish("Loki replaced the saved signing safety servers, but couldn’t confirm the save finished. The next unlock will most likely use the new ones. If Loki asks about them again, review them again.")
                     } else if reply["trusted"] as? Bool == true {
-                        finish("LokiSigner saved the new nonce witnesses. Signing uses them after you lock and unlock LokiSigner again.")
+                        finish("Loki saved the new signing safety servers. Signing uses them after you lock and unlock Loki again.")
                     } else {
-                        let reason = reply["error"] as? String ?? "LokiSigner couldn’t save them."
-                        finish("LokiSigner kept the current nonce witnesses: \(reason)")
+                        let reason = reply["error"] as? String ?? "Loki couldn’t save them."
+                        finish("Loki kept the current signing safety servers: \(reason)")
                     }
                 }
             }
@@ -1524,7 +1523,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
     private func reportWitnessChange(_ message: String) {
         if embedded { walletNotice = message; return }
         let alert = NSAlert()
-        alert.messageText = "Nonce witnesses"
+        alert.messageText = "Signing safety servers"
         alert.informativeText = message
         alert.addButton(withTitle: "OK")
         prompting = true
@@ -1576,23 +1575,28 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         if embedded {
             let r = SignerReview.self
             let pairing = link != nil
-            let renewal = renewable ? [r.info("If the slot reservation runs out", Self.renewalTouchID)] : []
-            let origin = r.origin(pairing ? "Coordinator" : "Paired coordinator", config["coordinator"] as? String ?? "",
-                                  "Member slot \(slot) · Testnet")
+            let renewal = renewable ? [r.info("If the hold runs out", Self.renewalTouchID)] : []
+            let origin = r.origin(pairing ? "Loki server" : "Your Loki server", config["coordinator"] as? String ?? "",
+                                  "Member \(slot) · Testnet")
+            // Only older profiles keep a Touch ID-only key, which a fingerprint change can break.
+            let touchIDOnlyKey = args.firstIndex(of: "--data").map { index in index + 1 < args.count
+                && FileManager.default.fileExists(atPath: URL(fileURLWithPath: args[index + 1]).appendingPathComponent("biometry-state").path) } == true
             let local = (nameField.map { r.field("Profile name (optional)", $0) } ?? []) + r.field("Local profile passphrase", password)
             let content = pairing
-                ? [r.split(r.card("Signer endpoints", endpointRows(config)), r.card("Local profile",
-                      [r.label("Protect this signer", weight: .semibold)] + local + [r.label("Your passphrase stays on this Mac. Configuration is saved only after unlock, unless overridden for this launch.", tone: r.muted)]))]
-                : [r.split(r.card("Profile access", local), r.card("Touch ID", [r.label("Keep your recovery backup", weight: .semibold),
-                      r.label("Changing enrolled fingerprints can make these keys unusable. Keep your words and encrypted backup to recover them.", tone: r.muted)])),
-                   r.disclosure("Signer endpoints", endpointRows(config))]
-            presentPrompt(SignerReview(section: pairing ? "Signer setup · 04 / 04" : "This Mac",
-                title: pairing ? "Review configuration" : "Unlock signer",
-                intro: pairing ? "Check the endpoints chosen by the coordinator before pairing this Mac."
+                ? [r.split(r.card("Server details", endpointRows(config)), r.card("Local profile",
+                      [r.label("Protect Loki on this Mac", weight: .semibold)] + local + [r.label("Your passphrase stays on this Mac. These settings are saved only after you unlock, unless you changed them for this launch only.", tone: r.muted)]))]
+                : [touchIDOnlyKey
+                      ? r.split(r.card("Profile access", local), r.card("Touch ID", [r.label("Keep your recovery backup", weight: .semibold),
+                          r.label("Adding or removing a Touch ID fingerprint can make these keys stop working. Keep your recovery words and backup file so you can recover them.", tone: r.muted)]))
+                      : r.card("Profile access", local),
+                   r.disclosure("Server details", endpointRows(config))]
+            presentPrompt(SignerReview(section: pairing ? "Set up Loki · 04 / 04" : "This Mac",
+                title: pairing ? "Review server settings" : "Unlock Loki",
+                intro: pairing ? "Check the servers your Loki server chose before you connect this Mac."
                     : "Unlocking opens the local profile. It never approves a payment.",
                 content: [origin] + content + renewal + launchOverrideNotice(config),
-                hint: pairing ? "Pairing is not a payment approval." : "The coordinator address is read-only.",
-                actions: [pairing ? "Pair" : "Unlock", "Cancel"], primary: 0), fields: fields,
+                hint: pairing ? "Connecting does not approve any payment." : "The Loki server address can’t be changed here.",
+                actions: [pairing ? "Connect" : "Unlock", "Cancel"], primary: 0), fields: fields,
                 escape: .alertSecondButtonReturn, completion: confirmed)
         } else {
             let alert = NSAlert()
@@ -1670,18 +1674,18 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
     private func beginRecovery() {
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 420, height: 26))
         field.placeholderString = "https://wallet.example"
-        field.setAccessibilityLabel("Original coordinator HTTPS address")
+        field.setAccessibilityLabel("Original Loki server address")
         let next: (NSApplication.ModalResponse) -> Void = { answer in
             guard answer == .alertFirstButtonReturn else { self.retry(.cancelled, link: self.retryLink); return }
             self.loadRecoveryConfiguration(origin: field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines))
         }
         if embedded {
             let r = SignerReview.self
-            presentPrompt(SignerReview(section: "Recovery · fresh profile", title: "Enter original coordinator",
-                intro: "Use the HTTPS origin this signer was paired with.", content: [
-                    r.card("Original coordinator HTTPS origin", [field]),
-                    r.info("Next: check the address", "Continue shows the canonical origin for you to confirm before contacting it."),
-                ], hint: "Use the origin without a page or path.", actions: ["Continue", "Cancel"], primary: 0), fields: [field], completion: next)
+            presentPrompt(SignerReview(section: "Recovery · new profile", title: "Enter your original Loki server",
+                intro: "Use the server address your old Mac was connected to.", content: [
+                    r.card("Original Loki server address", [field]),
+                    r.info("Next: check the address", "Continue shows the full address so you can confirm it before Loki contacts it."),
+                ], hint: "Enter just the server address, without a page or path.", actions: ["Continue", "Cancel"], primary: 0), fields: [field], completion: next)
             return
         }
         let alert = NSAlert()
@@ -1732,10 +1736,10 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         }
         if embedded {
             let r = SignerReview.self
-            presentPrompt(SignerReview(section: "Recovery · fresh profile", title: "Review recovery configuration",
-                intro: "Confirm the network and endpoints before choosing the encrypted backup.", content: [
-                    r.origin("Original coordinator", config["coordinator"] as? String ?? "", "Testnet · Member slot is resolved from the backup and roster."),
-                    r.card("Signer endpoints", endpointRows(config)),
+            presentPrompt(SignerReview(section: "Recovery · new profile", title: "Review server settings",
+                intro: "Check the network and servers before you choose your backup file.", content: [
+                    r.origin("Original Loki server", config["coordinator"] as? String ?? "", "Testnet · Your member number comes from your backup and the server’s member list."),
+                    r.card("Server details", endpointRows(config)),
                 ] + launchOverrideNotice(config), hint: "Continue opens the macOS file picker.", actions: ["Continue", "Cancel"], primary: 0), completion: next)
             return
         }
@@ -1899,9 +1903,9 @@ func lockSignerProfile(_ args: [String]) -> (args: [String], problem: String?) {
         return (locked, nil)
     }
     if reply["error"] as? String == "profile-in-use" {
-        return (args, "This profile is already open in another LokiSigner window. Use that window, or quit it first.")
+        return (args, "This profile is already open in another Loki window. Use that window, or quit it first.")
     }
-    return (args, "LokiSigner couldn’t lock its profile folder. Check that the folder is available, then open LokiSigner again.")
+    return (args, "Loki couldn’t lock its profile folder. Check that the folder is available, then open Loki again.")
 }
 
 func runNativeSigner(arguments: [String], link: String?) -> Never {

@@ -156,20 +156,20 @@ void main() {
       expect(find.text('0.00010000 TAZ'), findsOneWidget);
       expect(find.text('0.59990000 TAZ'), findsOneWidget);
       expect(find.text('Not yet signed'), findsOneWidget);
-      expect(find.text('Paired coordinator'), findsOneWidget);
+      expect(find.text('Loki server'), findsOneWidget);
       expectInline(tester);
       expect(api.writes.where((e) => e.$1 == 'payment-approve'), isEmpty);
       await tap(tester, find.text('Back'));
       expect(find.text('Review proposal'), findsNothing);
       expect(api.writes.where((e) => e.$1 == 'payment-approve'), isEmpty);
       await tap(tester, find.text('Review'));
-      final continueButton = find.text('Continue to signer');
+      final continueButton = find.text('Continue to approval');
       expect(
         continueButton.hitTestable(),
         findsOneWidget,
         reason: 'Button location: ${tester.getRect(continueButton)}',
       );
-      await tap(tester, find.text('Continue to signer'));
+      await tap(tester, find.text('Continue to approval'));
       expect(api.writes.singleWhere((e) => e.$1 == 'payment-approve').$2, {
         'vault': FixtureWallet.studio,
         'attempt': FixtureWallet.proposal,
@@ -443,7 +443,7 @@ void main() {
       expect(find.text('Create vault'), findsOneWidget);
       await tap(tester, find.text('Studio vault').first);
       await tap(tester, find.text('Review'));
-      await tap(tester, find.text('Continue to signer'));
+      await tap(tester, find.text('Continue to approval'));
       await tap(tester, find.text('History'));
       expect(find.text('Review proposal'), findsOneWidget);
       expect(leaves, 0);
@@ -496,7 +496,7 @@ void main() {
       });
       await start(tester, const MacWalletApi());
       expect(find.text(notice), findsOneWidget);
-      expect(find.text('Unlock your signer'), findsOneWidget);
+      expect(find.text('Unlock Loki'), findsOneWidget);
       expectInline(tester);
       final recovery = find.text('Review profile recovery');
       expect(recovery, findsOneWidget);
@@ -505,10 +505,10 @@ void main() {
       expect(recoveries, 1);
       await _nativePromptChanged(true);
       await tester.pump();
-      expect(find.text('Unlock your signer'), findsNothing);
+      expect(find.text('Unlock Loki'), findsNothing);
       expect(recovery, findsNothing);
       final lockButton = find.byWidgetPredicate(
-        (w) => w is IconButton && w.tooltip == 'Lock signer',
+        (w) => w is IconButton && w.tooltip == 'Lock Loki',
       );
       await tap(tester, lockButton);
       expect(locks, 1);
@@ -521,7 +521,7 @@ void main() {
       lock.complete();
       await tester.pump();
       await tester.pump(const Duration(seconds: 3));
-      expect(find.text('Unlock your signer'), findsOneWidget);
+      expect(find.text('Unlock Loki'), findsOneWidget);
       expect(recovery, findsNothing);
       expect(
         find.text('This Mac cannot access the old profile key.'),
@@ -536,10 +536,10 @@ void main() {
     (tester) async {
       final api = FixtureWallet(running: false, fresh: true);
       await start(tester, api);
-      expect(find.text('Set up your signer'), findsOneWidget);
+      expect(find.text('Set up Loki on this Mac'), findsOneWidget);
       expect(find.text('TESTNET'), findsOneWidget);
-      expect(find.text('Testnet funds only'), findsOneWidget);
-      await tap(tester, find.text('Pair this Mac'));
+      expect(find.text('Testnet funds only'), findsNothing);
+      await tap(tester, find.text('Connect'));
       expect(find.text('01 / 03'), findsOneWidget);
       expect(api.pairLink, isNull);
       const link =
@@ -572,14 +572,14 @@ void main() {
       expect(find.text(original), findsOneWidget);
       await tap(tester, find.text('Reserve vault').first);
       expect(find.text(original), findsOneWidget);
-      await tap(tester, find.byTooltip('Lock signer'));
+      await tap(tester, find.byTooltip('Lock Loki'));
       expect(api.running, isFalse);
       expect(find.text('Studio vault'), findsNothing);
-      expect(find.text('Paired coordinator'), findsNothing);
+      expect(find.text('Loki server'), findsNothing);
       expect(find.text(original), findsNothing);
 
       api.coordinator = next;
-      await tap(tester, find.text('Unlock signer'));
+      await tap(tester, find.text('Unlock'));
       expect(find.text('Studio vault'), findsWidgets);
       expect(find.text(original), findsNothing);
       final displayedOrigin = find.text(next);

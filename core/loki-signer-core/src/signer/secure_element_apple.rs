@@ -55,7 +55,7 @@ pub enum KeyFailure {
     Other,
 }
 
-const KEY_GONE: &str = "This LokiSigner key is missing or no longer usable. Set aside this profile, then choose “Restore from recovery words” with your recovery words and downloaded backup file.";
+const KEY_GONE: &str = "This Mac’s Loki key is missing or can no longer be used. Set this profile aside, then restore from backup with your recovery words and downloaded backup file.";
 
 const FAILURES: &[(isize, KeyFailure, &str)] = &[
     (-6, KeyFailure::Missing, KEY_GONE),
@@ -68,7 +68,7 @@ const FAILURES: &[(isize, KeyFailure, &str)] = &[
     (-16, KeyFailure::BiometryNotEnrolled, "No fingerprint is enrolled for Touch ID. Add one in System Settings, then try again."),
     (-18, KeyFailure::BiometryDisconnected, "Your Touch ID accessory is disconnected. Reconnect it and try again."),
     (-19, KeyFailure::BiometryNotPaired, "No Touch ID accessory is paired. Pair it with this Mac and try again."),
-    (-4, KeyFailure::Other, "LokiSigner could not access its Secure Enclave key."),
+    (-4, KeyFailure::Other, "Loki could not use this Mac’s secure key."),
 ];
 
 impl KeyFailure {
@@ -239,7 +239,7 @@ mod tests {
             (-16, "No fingerprint is enrolled for Touch ID. Add one in System Settings, then try again."),
             (-18, "Your Touch ID accessory is disconnected. Reconnect it and try again."),
             (-19, "No Touch ID accessory is paired. Pair it with this Mac and try again."),
-            (-34018, "LokiSigner could not access its Secure Enclave key."),
+            (-34018, "Loki could not use this Mac’s secure key."),
         ] {
             assert_eq!(KeyFailure::from_code(code).message(), expected);
             assert_eq!(member_key_message(&format!("signer share file: {expected}")), Some(expected));

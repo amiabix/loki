@@ -14,12 +14,12 @@ enum SignerStartFailure: Error, Equatable {
 
     static func renewalRefusal(_ code: Int32) -> String {
         switch code {
-        case 15: return "The coordinator is limiting new pairings right now. Try again later."
-        case 16: return "The coordinator has no free member slot right now. Try again later, or ask whoever runs it."
-        case 17: return "Another member registered this slot. Remove this profile and pair again with the coordinator address."
-        case 20: return "The coordinator is holding this member slot right now. Wait two minutes for the hold to expire, then pair again with the coordinator address. This profile can still finish."
-        case 18: return "LokiSigner couldn’t reach the coordinator to renew this Mac’s reservation. Check your connection, then pair again with the coordinator address."
-        default: return "The coordinator didn’t renew this Mac’s reservation. Try again, or ask whoever runs it."
+        case 15: return "Your Loki server is limiting new connections right now. Try again later."
+        case 16: return "Your Loki server has no free member spot right now. Try again later, or ask whoever runs it."
+        case 17: return "Another member already took this spot. Remove this profile and connect again with your Loki server address."
+        case 20: return "Your Loki server is holding this member spot right now. Wait two minutes for the hold to end, then connect again with your Loki server address. This profile can still finish."
+        case 18: return "Loki couldn’t reach your Loki server to renew this Mac’s hold. Check your internet connection, then connect again with your Loki server address."
+        default: return "Your Loki server didn’t renew this Mac’s hold. Try again, or ask whoever runs it."
         }
     }
 
@@ -30,42 +30,42 @@ enum SignerStartFailure: Error, Equatable {
 
     var message: String {
         switch self {
-        case .cancelled: return "You cancelled. Try again to continue setting up or unlocking LokiSigner."
-        case .pairingLinkNeeded: return "Enter the coordinator address in LokiSigner, or open a pairing link from the wallet, then try again."
-        case .invalidLink: return "This pairing link isn’t valid. Get a new link from the wallet and open it in LokiSigner."
-        case .differentPairing: return "This link is for a different coordinator or member slot. Unlock your existing profile or use a link for its slot."
-        case .configuration: return "LokiSigner couldn’t load its settings. Check your connection and try again."
-        case .witnessesSaveUncertain: return "LokiSigner saved the nonce witnesses, but couldn’t confirm the save finished, so it didn’t start and signed nothing. The next unlock will most likely use those witnesses. If LokiSigner asks about them again, review them again."
-        case .witnessesNotSaved: return "LokiSigner couldn’t save the nonce witnesses for this profile, so it didn’t start and signed nothing. If you approved new witnesses, they did not take effect. Check that the profile folder is writable, then try again."
-        case .testnetOnly: return "The LokiSigner wallet only supports testnet. This coordinator did not provide a testnet configuration."
-        case .savedEndpointsRefreshFailed: return "A saved server address contains a path LokiSigner no longer supports. LokiSigner couldn’t load updated settings from your paired coordinator. Check that you can reach the coordinator, or ask its operator for help, then try again."
-        case .coordinatorOrigin: return "Enter the original coordinator’s HTTPS address, without a page or path, and try again."
+        case .cancelled: return "You cancelled. Try again to keep setting up or unlocking Loki."
+        case .pairingLinkNeeded: return "Enter your Loki server address, or open a connection link from the wallet, then try again."
+        case .invalidLink: return "This connection link isn’t valid. Get a new link from the wallet and open it in Loki."
+        case .differentPairing: return "This link is for a different Loki server or member. Unlock your existing profile, or use a link for that member."
+        case .configuration: return "Loki couldn’t load its settings. Check your internet connection and try again."
+        case .witnessesSaveUncertain: return "Loki saved the signing safety servers, but couldn’t confirm the save finished, so it didn’t start and signed nothing. The next unlock will most likely use those servers. If Loki asks about them again, review them again."
+        case .witnessesNotSaved: return "Loki couldn’t save the signing safety servers for this profile, so it didn’t start and signed nothing. If you approved new ones, they did not take effect. Check that the profile folder can be written to, then try again."
+        case .testnetOnly: return "Loki only works on testnet. This Loki server isn’t set up for testnet."
+        case .savedEndpointsRefreshFailed: return "A saved server address uses a format Loki no longer supports, and Loki couldn’t load new settings from your Loki server. Check that you can reach the server, or ask whoever runs it for help, then try again."
+        case .coordinatorOrigin: return "Enter your original Loki server address, without a page or path, and try again."
         case .invalidProfileName: return "Choose a short, single-line profile name without invisible formatting characters, or leave it blank to use Member."
         case .emptyPassphrase: return "Enter your local profile passphrase and try again."
-        case .unlock: return "LokiSigner couldn’t unlock this profile. Check your passphrase and try again."
-        case .deviceKey: return "This Mac couldn’t use the device key LokiSigner needs to connect. Try again, or set aside the profile if it has no vaults."
-        case .registrationRefused: return "The coordinator refused this pairing. Enter the coordinator address to try the same slot again. If the slot has gone to another member, remove this profile and pair again."
-        case .registrationExpired: return "The pairing expired before this Mac finished registering. Enter the coordinator address again; LokiSigner asks for the same slot."
+        case .unlock: return "Loki couldn’t unlock this profile. Check your passphrase and try again."
+        case .deviceKey: return "This Mac couldn’t use the key Loki needs to connect. Try again, or set this profile aside if it has no vaults."
+        case .registrationRefused: return "Your Loki server refused to add this Mac. Enter the server address to try the same spot again. If another member has taken that spot, remove this profile and connect again."
+        case .registrationExpired: return "Time ran out before this Mac finished joining. Enter your Loki server address again. Loki asks for the same spot."
         case .pairingRefused(let message): return message
-        case .registrationFailed: return "LokiSigner couldn’t finish connecting to the coordinator. Check your connection and try again."
-        case .registrationRosterUnavailable: return "LokiSigner couldn’t reach the coordinator. Check your connection, then try again."
+        case .registrationFailed: return "Loki couldn’t finish connecting to your Loki server. Check your internet connection and try again."
+        case .registrationRosterUnavailable: return "Loki couldn’t reach your Loki server. Check your internet connection, then try again."
         case .key(let message), .keyGone(let message): return message
-        case .unexpected: return "LokiSigner couldn’t finish this step. Try again."
+        case .unexpected: return "Loki couldn’t finish this step. Try again."
         case .missingRecoveryInput: return "Enter your recovery words and a new local passphrase, then try again."
         case .missingRecoveryWords: return "Enter your recovery words and try again."
-        case .invalidBackup: return "Choose a valid LokiSigner recovery backup file and try again."
-        case .backupMismatch: return "LokiSigner couldn’t restore this vault. Check the recovery words and backup, then try again."
-        case .badBackupFingerprint: return "Enter the matching 64-character SHA-256 fingerprint from your original signer or a known-good offline copy. Don’t use a fingerprint supplied with an untrusted file."
+        case .invalidBackup: return "Choose a valid Loki backup file and try again."
+        case .backupMismatch: return "Loki couldn’t restore this vault. Check your recovery words and backup file, then try again."
+        case .badBackupFingerprint: return "Enter the matching 64-character backup fingerprint you saved from your original Mac or a trusted offline copy. Don’t use a fingerprint that came with an untrusted file."
         case .wrongProfile: return "These recovery words or this backup don’t match the unlocked profile. Check that they belong to this member and try again."
-        case .vaultExists: return "This vault already has data in the profile. LokiSigner didn’t replace it. Choose a different backup."
-        case .rosterUnavailable: return "LokiSigner couldn’t read the coordinator’s member list. Check the coordinator and your connection, then try again."
-        case .rosterMismatch: return "The coordinator’s member list doesn’t show exactly one slot for this backup. Check that you entered the original coordinator and try again."
+        case .vaultExists: return "This vault already has data in the profile. Loki didn’t replace it. Choose a different backup."
+        case .rosterUnavailable: return "Loki couldn’t read your Loki server’s member list. Check the server address and your internet connection, then try again."
+        case .rosterMismatch: return "Your Loki server’s member list doesn’t match this backup to exactly one member. Check that you entered your original Loki server and try again."
         case .restoredButStopped: return "Your vault was saved. Try unlocking again; you don’t need your recovery words."
-        case .unlockToRestore: return "Unlock LokiSigner before restoring another vault."
+        case .unlockToRestore: return "Unlock Loki before restoring another vault."
         case .notFresh: return "This data folder is no longer ready for a first restore. If the profile has no vaults, set it aside and try again."
-        case .dataFolderUnavailable: return "LokiSigner’s data folder points to a location this Mac can’t open. Reconnect the drive or fix the folder link, then try again."
-        case .protectedProfile: return "This profile holds vault data that may include a share. LokiSigner won’t set it aside. To restore a different member, use another Mac or macOS account."
-        case .setAsideFailed: return "LokiSigner couldn’t set aside this profile. Try again."
+        case .dataFolderUnavailable: return "Loki’s data folder points to a location this Mac can’t open. Reconnect the drive or fix the folder link, then try again."
+        case .protectedProfile: return "This profile holds vault data that may include your part of a vault key. Loki won’t set it aside. To restore a different member, use another Mac or macOS account."
+        case .setAsideFailed: return "Loki couldn’t set aside this profile. Try again."
         }
     }
 }
@@ -93,7 +93,7 @@ func touchIDSetupAlert(_ error: NSError?) -> NSAlert {
         alert.informativeText = "Set one in System Settings, then try again."
     } else {
         alert.messageText = "Touch ID or your Mac password cannot be used right now"
-        alert.informativeText = "Unlock your Mac and try again in LokiSigner."
+        alert.informativeText = "Unlock your Mac and try again in Loki."
     }
     alert.addButton(withTitle: "OK")
     return alert
@@ -147,7 +147,7 @@ final class RecoveryInput: @unchecked Sendable {
 
 private func recoveryBackupPicker() -> NSOpenPanel {
     let picker = NSOpenPanel()
-    picker.title = "Choose a LokiSigner recovery backup"
+    picker.title = "Choose your Loki backup file"
     picker.prompt = "Choose backup"
     picker.allowedContentTypes = [.json]
     return picker
@@ -162,8 +162,8 @@ private struct RecoveryPrompt {
     init(newProfile: Bool) {
         self.newProfile = newProfile
         fingerprint = NSTextField(frame: NSRect(x: 0, y: newProfile ? 60 : 30, width: 400, height: 22))
-        fingerprint.placeholderString = "Independently saved backup fingerprint (64 hex characters)"
-        fingerprint.setAccessibilityLabel("Independently saved backup fingerprint")
+        fingerprint.placeholderString = "Backup fingerprint you saved separately (64 characters)"
+        fingerprint.setAccessibilityLabel("Backup fingerprint you saved separately")
         words = NSSecureTextField(frame: NSRect(x: 0, y: newProfile ? 30 : 0, width: 400, height: 22))
         words.placeholderString = "24 recovery words, separated by spaces"
         words.setAccessibilityLabel("24 recovery words")
@@ -191,18 +191,18 @@ private struct RecoveryPrompt {
 
     func review() -> SignerReview {
         let r = SignerReview.self
-        let entry = r.field("Backup fingerprint · saved independently", fingerprint) + r.field("24 recovery words", words)
+        let entry = r.field("Backup fingerprint · the one you saved separately", fingerprint) + r.field("24 recovery words", words)
             + (newProfile ? r.field("New local profile passphrase", pass) : [])
-        return SignerReview(section: newProfile ? "Recovery · fresh profile" : "Recovery · unlocked profile",
-            title: newProfile ? "Restore your signer" : "Restore another vault",
-            intro: "Use the backup and words that match this signer’s identity.", content: [
+        return SignerReview(section: newProfile ? "Recovery · new profile" : "Recovery · unlocked profile",
+            title: newProfile ? "Restore Loki on this Mac" : "Restore another vault",
+            intro: "Use the backup file and recovery words for this member.", content: [
                 r.card("Encrypted backup file", [r.label("Backup selected", weight: .semibold),
-                    r.label("Selected using the macOS file picker. Its contents stay local.", tone: r.muted)]),
+                    r.label("You chose it with the macOS file picker. Its contents stay on this Mac.", tone: r.muted)]),
                 r.card("Private entry on this Mac", entry + [
-                    r.label("Use the fingerprint from your original signer or a known-good offline copy, never one supplied with this file.", tone: r.muted),
+                    r.label("Use the fingerprint you saved from your original Mac or a trusted offline copy. Never use one that came with this file.", tone: r.muted),
                     r.label("Existing vault data will not be overwritten.", tone: r.muted)]),
-            ], hint: newProfile ? "Recovery words stay in the local signer." : "Your unlocked profile is kept.",
-            actions: [newProfile ? "Restore signer" : "Restore vault", "Cancel"], primary: 0)
+            ], hint: newProfile ? "Your recovery words stay in Loki on this Mac." : "Your unlocked profile is kept.",
+            actions: [newProfile ? "Restore" : "Restore vault", "Cancel"], primary: 0)
     }
 
     func input(_ response: NSApplication.ModalResponse, file: URL) -> Result<RecoveryInput, SignerStartFailure> {

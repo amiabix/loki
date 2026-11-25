@@ -586,7 +586,7 @@ async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option
 }
 
 const PAIRING_PENDING: &str = "pairing-registration-pending";
-const RENEW_NOTICE: &str = "The coordinator’s reservation for this Mac ran out before registration finished. LokiSigner can ask for the same slot again. Touch ID will then ask once more, because the new reservation needs its own approval.";
+const RENEW_NOTICE: &str = "Your Loki server held a spot for this Mac, but the hold ran out before setup finished. Loki can ask for the same spot again. Touch ID will then ask once more, because the new hold needs its own approval.";
 
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
 pub(crate) fn pairing_pending(data: &std::path::Path) -> bool {

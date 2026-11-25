@@ -30,7 +30,7 @@ final class WalletChannel {
         #endif
         var signerArgs = nativeSignerArguments(args ?? [])
         if args == nil {
-            launchProblem = "Invalid LokiSigner launch arguments."
+            launchProblem = "Invalid Loki launch arguments."
         } else {
             let locked = lockSignerProfile(signerArgs)
             signerArgs = locked.args
@@ -119,7 +119,7 @@ final class WalletChannel {
         let args = call.arguments as? [String: Any]
         let noArgs = call.arguments == nil || call.arguments is NSNull
         let invalid = failure(400, "Invalid wallet method arguments.")
-        let busy = failure(409, "Finish the current LokiSigner review or operation first.")
+        let busy = failure(409, "Finish the current Loki review or step first.")
         switch call.method {
         case "nativePromptActive":
             guard noArgs else { result(invalid); return }
@@ -133,12 +133,12 @@ final class WalletChannel {
             result(signer.walletNotice)
         case "profile":
             guard noArgs else { result(invalid); return }
-            guard validLaunch else { result(failure(400, launchProblem ?? "Invalid LokiSigner launch arguments.")); return }
+            guard validLaunch else { result(failure(400, launchProblem ?? "Invalid Loki launch arguments.")); return }
             var profile = signer.walletProfile()
             profile["can_recover_wallet_key"] = signer.canRecoverWalletKey
             profile["reduce_motion"] = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
             if #available(macOS 26, *) { profile["liquid_glass"] = true }
-            window?.title = (profile["slot"] as? NSNumber).map { "LokiSigner — Member \($0)" } ?? "LokiSigner"
+            window?.title = (profile["slot"] as? NSNumber).map { "Loki — Member \($0)" } ?? "Loki"
             if profile["profile"] is String { result(profile) }
             else { result(failure(500, SignerStartFailure.dataFolderUnavailable.message)) }
         case "pendingInvite":
@@ -147,9 +147,9 @@ final class WalletChannel {
         case "unlock", "pair", "restore", "recoverWalletKey", "discardPendingProfile":
             let link = args?["link"] as? String
             guard call.method == "pair" ? (link != nil && args?.count == 1) : noArgs else { result(invalid); return }
-            guard validLaunch else { result(failure(400, launchProblem ?? "Invalid LokiSigner launch arguments.")); return }
+            guard validLaunch else { result(failure(400, launchProblem ?? "Invalid Loki launch arguments.")); return }
             #if LOKI_VISUAL_ONLY
-            result(failure(403, "This visual-only build cannot unlock, pair or restore a signer."))
+            result(failure(403, "This preview build can’t unlock, connect or restore."))
             #else
             if call.method != "unlock" { claim = nil }
             guard signer.beginWalletOperation({ error in
@@ -173,7 +173,7 @@ final class WalletChannel {
             guard noArgs else { result(invalid); return }
             run(result, work: { nativeReply(loki_member_app_vault_addresses()) }) { reply in
                 guard loki_member_app_can_view_addresses() != 0 else {
-                    result(self.failure(401, "LokiSigner is locked.")); return
+                    result(self.failure(401, "Loki is locked.")); return
                 }
                 guard let rows = reply["vaults"] as? [[String: Any]] else {
                     result(self.failure(500, reply["error"] as? String ?? "Couldn’t check vault addresses.")); return
@@ -208,11 +208,11 @@ final class WalletChannel {
                       data.count <= 256 * 1024 else { result(self.failure(500, "Invalid encrypted backup.")); return }
                 guard !self.signer.walletDialogOpen else { result(busy); return }
                 let panel = NSSavePanel()
-                panel.title = "Save encrypted LokiSigner backup"
+                panel.title = "Save your encrypted Loki backup"
                 panel.allowedContentTypes = [.json]
                 panel.nameFieldStringValue = "loki-recovery-\(id).json"
                 guard panel.runModal() == .OK, let file = panel.url else { result(self.failure(499, "Backup save cancelled.")); return }
-                guard self.signer.walletReady else { result(self.failure(401, "LokiSigner is locked.")); return }
+                guard self.signer.walletReady else { result(self.failure(401, "Loki is locked.")); return }
                 do {
                     try data.write(to: file, options: .atomic)
                     result(nil)
@@ -248,7 +248,7 @@ final class WalletChannel {
             let status = reply["status"] as? Int ?? 500
             let data = reply["data"] as? [String: Any] ?? [:]
             if (200..<300).contains(status) { complete(data) }
-            else { result(self.failure(status, untrustedText(data["error"] as? String ?? "LokiSigner request failed."),
+            else { result(self.failure(status, untrustedText(data["error"] as? String ?? "Loki request failed."),
                                        code: data["code"] as? String)) }
         }
     }
@@ -257,8 +257,8 @@ final class WalletChannel {
                      complete: @escaping ([String: Any]) -> Void) {
         if !signer.performWalletWork(work, complete: { reply in
             if let reply { complete(reply) }
-            else { result(self.failure(401, "LokiSigner is locked.")) }
-        }) { result(failure(401, "LokiSigner is locked.")) }
+            else { result(self.failure(401, "Loki is locked.")) }
+        }) { result(failure(401, "Loki is locked.")) }
     }
 
     /// `code` is the host's stable error code; the wallet maps it to its own wording.

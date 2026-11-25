@@ -113,7 +113,7 @@ String walletError(Object error) =>
       FormatException(:final message) => message,
       _ => null,
     }) ??
-    'LokiSigner could not complete this operation. Try again.';
+    'Loki could not complete this step. Try again.';
 
 String walletErrorWith(String lead, Object error) {
   final known = _errorSentences[walletErrorCode(error)];
@@ -131,7 +131,7 @@ const _errorSentences = <String, String>{
       'The vault does not have enough spendable funds for this amount plus the network fee.',
   'invalid_address': 'That is not a valid Orchard address for this network.',
   'invalid_amount': 'Enter an amount greater than zero.',
-  'profile_locked': 'LokiSigner is locked. Unlock it and try again.',
+  'profile_locked': 'Loki is locked. Unlock it and try again.',
   'enough_approved': 'Enough members have already approved this payment.',
   'approval_repeated':
       'This approval was already sent or the payment changed. Replace a failed attempt instead.',
@@ -140,7 +140,7 @@ const _errorSentences = <String, String>{
 const _failureSentences = <String, String>{
   'approval_timeout': 'Another member did not answer the payment request in time.',
   'refused': 'A member refused the payment.',
-  'share_deadline': 'The signing round timed out waiting for members.',
+  'share_deadline': 'Time ran out waiting for members to sign.',
 };
 
 String? describeError(String? code, String? text) {

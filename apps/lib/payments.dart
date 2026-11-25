@@ -221,7 +221,7 @@ class _PaymentDetails extends StatelessWidget {
           ),
         ValueRow('Vault (creator’s label)', _vaultName(vault)),
         if (_policy(vault) case final policy?)
-          ValueRow('Vault policy', '$policy approvals'),
+          ValueRow('Approvals needed', '$policy approvals'),
       ],
     );
     return Surface(
@@ -477,7 +477,7 @@ class _SendPageState extends State<SendPage> {
       if (_text(draft['attempt']) == null) throw const FormatException();
       setState(() {
         _draft = draft;
-        if (!_hasQuote(draft)) _error = 'The signer did not return a complete quote. Discard the draft and prepare it again.';
+        if (!_hasQuote(draft)) _error = 'Loki did not return a complete quote. Discard the draft and prepare it again.';
       });
     } catch (e) {
       if (_current(vault)) {
@@ -635,7 +635,7 @@ class _SendPageState extends State<SendPage> {
     if (funds == null) {
       return _PaymentNote(
         _fundsFailed
-            ? 'Could not read the spendable balance. The signer still checks funds when you prepare the draft.'
+            ? 'Could not read the spendable balance. Loki still checks funds when you prepare the draft.'
             : 'Reading the spendable balance…',
         error: _fundsFailed,
       );
@@ -692,7 +692,7 @@ class _SendPageState extends State<SendPage> {
             lines: 4,
           ),
           _field(
-            'Amount (TAZ)',
+            'Amount in TAZ (testnet ZEC)',
             _amount,
             hint: 'Enter amount',
             mono: true,
@@ -1032,7 +1032,7 @@ class _HistoryPageState extends State<HistoryPage> {
           ),
           const _ReviewNotice(
             'Broadcast is not confirmation',
-            'The signer checks the payment against blocks reported by its lightwalletd provider.',
+            'Loki checks the payment against blocks reported by its blockchain server.',
           ),
         ] else if (draft != null)
           Surface(
@@ -1230,18 +1230,18 @@ class _HistoryPageState extends State<HistoryPage> {
               mono: true,
             ),
           if (!confirmed && policy != null)
-            ValueRow('Vault policy', '$policy approvals'),
+            ValueRow('Approvals needed', '$policy approvals'),
           if (confirmed)
             const _PaymentNote(
-              'Confirmed using data reported by lightwalletd.',
+              'Confirmed using data from the blockchain server.',
             ),
           if (phase == 'broadcast')
             const _PaymentNote(
-              'Broadcast to the network. The signer has not matched it to a reported block yet.',
+              'Sent to the network. Loki has not seen it in a block yet.',
             ),
           if (phase == 'spent_unverified')
             const _PaymentNote(
-              'Lightwalletd reported the input as spent. The signer could not verify the spending transaction.',
+              'The blockchain server reports these funds as spent. Loki could not verify the transaction that spent them.',
             ),
           if (phase == 'replaced')
             _PaymentNote(
@@ -1553,7 +1553,7 @@ class _ApprovalStatus extends StatelessWidget {
   Widget build(BuildContext context) {
     final approvals = status['approvals'];
     if (status['signatures_received'] == true) {
-      return const _PaymentNote('The signer has the signed transaction data.');
+      return const _PaymentNote('Loki has the signed transaction data.');
     }
     if (approvals is! List ||
         !const {
@@ -1752,8 +1752,8 @@ class _PaymentReviewState extends State<PaymentReview> {
           'Proposal preview',
           _alreadyRequested ? 'Approval requested' : 'Review proposal',
           _alreadyRequested
-              ? 'Follow the signer’s progress here or in History.'
-              : 'Check the proposed recipient, amount, and fee before continuing to signer review.',
+              ? 'Follow its progress here or in History.'
+              : 'Check the proposed recipient, amount, and fee before you continue to approval.',
         ),
         if (replaces != null)
           Surface(
@@ -1789,7 +1789,7 @@ class _PaymentReviewState extends State<PaymentReview> {
         if (showingPreview)
           const _ReviewNotice(
             'Not yet signed',
-            'Continuing opens the local signer. Touch ID unlocks the key; it does not approve this payment.',
+            'Continuing opens the approval screen on this Mac. Touch ID unlocks the key. It does not approve this payment.',
           ),
         if (status != null && !showingPreview) ...[
           Align(alignment: Alignment.centerLeft, child: _phasePill(status)),
@@ -1803,7 +1803,7 @@ class _PaymentReviewState extends State<PaymentReview> {
           ),
         if (status?['error'] != null)
           _PaymentNote(
-            '${paymentFailure(status) ?? 'The signer reported a problem.'} Check History for available actions.',
+            '${paymentFailure(status) ?? 'Loki reported a problem.'} Check History for available actions.',
             error: true,
           ),
         if (_approvalUnknown && !_alreadyRequested && !noLongerOpen)
@@ -1860,7 +1860,7 @@ class _PaymentReviewState extends State<PaymentReview> {
               ),
             if (!_alreadyRequested && !noLongerOpen && review != null)
               ActionChipButton(
-                _approving ? 'Opening signer…' : 'Continue to signer',
+                _approving ? 'Opening approval…' : 'Continue to approval',
                 Icons.arrow_forward,
                 _canContinue ? _approve : null,
                 primary: true,
