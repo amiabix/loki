@@ -1422,7 +1422,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         let decided: (Bool) -> Void = { trust in
             guard trust else { loki_member_app_keep_witnesses(); then(false); return }
             let context = LAContext()
-            context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics,
+            context.evaluatePolicy(.deviceOwnerAuthentication,
                                    localizedReason: "Trust the new nonce witnesses for \(coordinator)") { success, _ in
                 DispatchQueue.main.async {
                     if !success { loki_member_app_keep_witnesses() }
@@ -1438,7 +1438,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
                                  r.label(value, size: 11, tone: r.muted, mono: true, selectable: true)], spacing: 4)
             }
             presentPrompt(SignerReview(section: "Signer configuration", title: title,
-                intro: "LokiSigner keeps signing with the current witnesses unless you trust the new ones with Touch ID.", content: [
+                intro: "LokiSigner keeps signing with the current witnesses unless you trust the new ones with Touch ID or your Mac password.", content: [
                     r.origin("Coordinator", coordinator, "It now serves a different nonce witness pair."),
                     r.card("Witness pair fingerprints", [pair("Current", saved), pair("New", offered)]),
                     r.info("Check with the operator first", warning, warning: true),

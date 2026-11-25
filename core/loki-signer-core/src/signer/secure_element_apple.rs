@@ -10,9 +10,8 @@
 //! - [`AppleSecureElement::ephemeral`] — process-lifetime key, no keychain, no signing
 //!   identity. Works unsigned and offline; this is what the FFI verifier exercises today.
 //! - [`AppleSecureElement::open_persistent`] — `kSecAttrIsPermanent` + `kSecAttrApplicationTag`
-//!   with biometric access control (`.biometryCurrentSet | .privateKeyUsage`), so
-//!   `unwrap_dek` is gated behind Face/Touch ID and the key dies if enrolled biometrics
-//!   change. **Requires the binary signed with an Apple Team ID** (a free personal team is
+//!   with user-presence access control (`.userPresence | .privateKeyUsage`), so
+//!   `unwrap_dek` is gated behind Touch ID or the Mac password. **Requires the binary signed with an Apple Team ID** (a free personal team is
 //!   enough); unsigned, key creation fails with `errSecMissingEntitlement` (-34018).
 //!
 //! The Swift side lives in `core/enclave-spike/se_backend.swift` (built to a dylib). Wiring
@@ -33,7 +32,6 @@ extern "C" {
     fn se_open_persistent(tag: *const u8, tag_len: isize, create_if_missing: i32, state_path: *const c_char, out_handle: *mut u64) -> isize;
     fn se_open_payment(tag: *const u8, tag_len: isize, state_path: *const c_char, reason: *const c_char, out_handle: *mut u64) -> isize;
     fn se_create_staged(tag: *const u8, tag_len: isize, state_path: *const c_char, out_handle: *mut u64) -> isize;
-    fn se_confirm_staged_biometry(handle: u64, state_path: *const c_char) -> isize;
     fn se_discard_staged(tag: *const u8, tag_len: isize) -> isize;
     fn se_wrap(handle: u64, dek: *const u8, dek_len: isize, out: *mut u8, out_cap: isize) -> isize;
     fn se_unwrap(handle: u64, ct: *const u8, ct_len: isize, out: *mut u8, out_cap: isize) -> isize;
@@ -48,14 +46,12 @@ pub enum KeyFailure {
     Invalidated,
     Cancelled,
     AuthenticationFailed,
-    AuthenticationFailedWithoutState,
     LockedOut,
     InteractionNotAllowed,
     BiometryUnavailable,
     BiometryNotEnrolled,
     BiometryDisconnected,
     BiometryNotPaired,
-    RestoreEnrollmentChanged,
     Other,
 }
 
@@ -64,16 +60,14 @@ const KEY_GONE: &str = "This LokiSigner key is missing or no longer usable. Set 
 const FAILURES: &[(isize, KeyFailure, &str)] = &[
     (-6, KeyFailure::Missing, KEY_GONE),
     (-17, KeyFailure::Invalidated, KEY_GONE),
-    (-11, KeyFailure::Cancelled, "Touch ID was cancelled."),
-    (-12, KeyFailure::AuthenticationFailed, "Touch ID did not verify your fingerprint. Try again."),
-    (-20, KeyFailure::AuthenticationFailedWithoutState, "Touch ID did not verify your fingerprint. Try again. If you added or removed a fingerprint, restore using your recovery words and downloaded backup file on another Mac or in another macOS account."),
+    (-11, KeyFailure::Cancelled, "Touch ID or password entry was cancelled."),
+    (-12, KeyFailure::AuthenticationFailed, "Touch ID or your Mac password did not verify. Try again."),
     (-13, KeyFailure::LockedOut, "Touch ID is locked out. Unlock your Mac with its password, then try again."),
-    (-14, KeyFailure::InteractionNotAllowed, "Touch ID cannot prompt right now. Unlock your Mac and try again in LokiSigner."),
+    (-14, KeyFailure::InteractionNotAllowed, "macOS cannot ask for Touch ID or your Mac password right now. Unlock your Mac and try again in LokiSigner."),
     (-15, KeyFailure::BiometryUnavailable, "Touch ID is not available right now. If you’re using a MacBook, open its lid and try again."),
     (-16, KeyFailure::BiometryNotEnrolled, "No fingerprint is enrolled for Touch ID. Add one in System Settings, then try again."),
     (-18, KeyFailure::BiometryDisconnected, "Your Touch ID accessory is disconnected. Reconnect it and try again."),
     (-19, KeyFailure::BiometryNotPaired, "No Touch ID accessory is paired. Pair it with this Mac and try again."),
-    (-21, KeyFailure::RestoreEnrollmentChanged, "Touch ID enrollment changed during restore. Try restoring again."),
     (-4, KeyFailure::Other, "LokiSigner could not access its Secure Enclave key."),
 ];
 
@@ -131,13 +125,6 @@ impl AppleSecureElement {
         let mut handle = 0;
         let rc = unsafe { se_create_staged(tag.as_ptr(), tag.len() as isize, state.as_ptr(), &mut handle) };
         if rc == 0 { Ok(Self { handle }) } else { Err(KeyFailure::from_code(rc)) }
-    }
-
-    pub fn confirm_staged_biometry(&self, state: Option<&Path>) -> Result<(), KeyFailure> {
-        let state = state.map(|path| CString::new(path.as_os_str().as_bytes())).transpose().map_err(|_| KeyFailure::Other)?;
-        let ptr = state.as_ref().map_or(std::ptr::null(), |path| path.as_ptr());
-        let rc = unsafe { se_confirm_staged_biometry(self.handle, ptr) };
-        if rc == 0 { Ok(()) } else { Err(KeyFailure::from_code(rc)) }
     }
 
     pub fn discard_staged(tag: &[u8]) -> Result<(), KeyFailure> {
@@ -244,11 +231,10 @@ mod tests {
         for (code, expected) in [
             (-6, KEY_GONE),
             (-17, KEY_GONE),
-            (-11, "Touch ID was cancelled."),
-            (-12, "Touch ID did not verify your fingerprint. Try again."),
-            (-20, "Touch ID did not verify your fingerprint. Try again. If you added or removed a fingerprint, restore using your recovery words and downloaded backup file on another Mac or in another macOS account."),
+            (-11, "Touch ID or password entry was cancelled."),
+            (-12, "Touch ID or your Mac password did not verify. Try again."),
             (-13, "Touch ID is locked out. Unlock your Mac with its password, then try again."),
-            (-14, "Touch ID cannot prompt right now. Unlock your Mac and try again in LokiSigner."),
+            (-14, "macOS cannot ask for Touch ID or your Mac password right now. Unlock your Mac and try again in LokiSigner."),
             (-15, "Touch ID is not available right now. If you’re using a MacBook, open its lid and try again."),
             (-16, "No fingerprint is enrolled for Touch ID. Add one in System Settings, then try again."),
             (-18, "Your Touch ID accessory is disconnected. Reconnect it and try again."),

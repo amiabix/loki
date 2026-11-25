@@ -13,7 +13,8 @@ import Security
 //   - EPHEMERAL  (se_open_ephemeral): kSecAttrIsPermanent=false, no keychain, no signing
 //     identity needed. Works offline, unsigned, today — this is what the FFI verifier runs.
 //   - PERSISTENT (se_open_persistent): kSecAttrIsPermanent=true + kSecAttrApplicationTag,
-//     biometric access control (.biometryCurrentSet | .privateKeyUsage). Needs the binary
+//     user-presence access control (.userPresence | .privateKeyUsage: Touch ID or the Mac
+//     password). Profiles created with .biometryCurrentSet keep that ACL. Needs the binary
 //     signed with an Apple Team ID (free personal team is enough); unsigned it returns
 //     errSecMissingEntitlement (-34018). Gated here, not reachable on this unsigned build.
 //
@@ -24,8 +25,6 @@ import Security
 //   -10 public-key export failed   -11 cancelled   -12 authentication failed
 //   -13 biometry locked out   -14 interaction unavailable   -15 biometry unavailable
 //   -16 no enrollment   -17 invalidated   -18 accessory disconnected   -19 accessory not paired
-//   -20 authentication failed with no recorded enrollment state
-//   -21 enrollment changed during restore
 
 private let algo = SecKeyAlgorithm.eciesEncryptionCofactorX963SHA256AESGCM
 private let sigAlgo = SecKeyAlgorithm.ecdsaSignatureMessageX962SHA256
@@ -132,14 +131,16 @@ func keyOperationFailure(_ failure: NSError?, fallback: Int) -> Int {
     return invalidated ? -17 : result
 }
 
+// Only legacy .biometryCurrentSet profiles have a recorded biometry state; their key dies
+// when the enrollment changes. New keys record none, so this never fires for them.
 func checkedBiometricFailure(_ code: Int, recorded: Data?, current: () -> Biometry) -> Int {
     guard code != -11 && code != -13 && code != -17 else { return code }
-    guard let recorded else { return code == -12 ? -20 : code }
+    guard let recorded else { return code }
     let now = current()
     if now.failure == -13 { return -13 }
     if now.failure == -16 { return -17 }
     if let state = now.state {
-        if state.first != recorded.first { return code == -12 ? -20 : code }
+        if state.first != recorded.first { return code }
         if state != recorded { return -17 }
     }
     return code
@@ -192,20 +193,6 @@ public func se_open_persistent(_ tagPtr: UnsafePointer<UInt8>, _ tagLen: Int,
 public func se_create_staged(_ tagPtr: UnsafePointer<UInt8>, _ tagLen: Int,
                              _ statePath: UnsafePointer<CChar>, _ outHandle: UnsafeMutablePointer<UInt64>) -> Int {
     return openPersistent(tagPtr, tagLen, true, statePath, nil, outHandle, staging: true)
-}
-
-@_cdecl("se_confirm_staged_biometry")
-public func se_confirm_staged_biometry(_ handle: UInt64, _ statePath: UnsafePointer<CChar>?) -> Int {
-    guard let recorded = fetch(handle)?.biometry else { return -4 }
-    let current = keychain.biometry()
-    if let failure = current.failure { return failure == -16 ? -21 : failure }
-    guard let state = current.state else { return -4 }
-    guard state == recorded else { return -21 }
-    if let statePath {
-        let url = URL(fileURLWithFileSystemRepresentation: statePath, isDirectory: false, relativeTo: nil)
-        do { try state.write(to: url, options: .atomic) } catch { return -4 }
-    }
-    return 0
 }
 
 @_cdecl("se_discard_staged")
@@ -288,31 +275,18 @@ private func openPersistent(_ tagPtr: UnsafePointer<UInt8>, _ tagLen: Int, _ cre
                 return checkedBiometricFailure(proof, recorded: recorded, current: keychain.biometry)
             }
         }
-        let state = recorded ?? (creating ? keychain.biometry().state : nil)
-        if recorded == nil, let state, let stateURL {
-            do { try state.write(to: stateURL, options: .atomic) } catch { return -4 }
-        }
-        outHandle.pointee = store(key, biometry: state)
+        outHandle.pointee = store(key, biometry: recorded)
         return 0
     }
     let missing = checkedBiometricFailure(-6, recorded: recorded, current: keychain.biometry)
     guard missing == -6 else { return missing }
-    let before = keychain.biometry()
-    if staging {
-        if let failure = before.failure { return failure }
-        guard before.state != nil else { return -4 }
-    }
     let (key, failure) = keychain.create(tag)
-    guard let key else {
-        // Security can wrap a preflight failure as an undifferentiated auth failure.
-        if [-4, -5, -7, -12].contains(failure), let reason = keychain.biometry().failure, reason != -12 { return reason }
-        return failure
+    guard let key else { return failure }
+    // A legacy state left beside a replaced key must not judge the new one.
+    if let stateURL, (try? stateURL.checkResourceIsReachable()) == true {
+        do { try FileManager.default.removeItem(at: stateURL) } catch { return -4 }
     }
-    let state = before.state ?? keychain.biometry().state
-    if let state, let stateURL {
-        do { try state.write(to: stateURL, options: .atomic) } catch { return -4 }
-    }
-    outHandle.pointee = store(key, biometry: state)
+    outHandle.pointee = store(key)
     return 0
 }
 
@@ -334,7 +308,7 @@ private func authorizePaymentKey(_ key: SecKey, _ context: LAContext, _ operatio
 private func createPersistentKey(_ tag: Data) -> (SecKey?, Int) {
     guard let ac = SecAccessControlCreateWithFlags(
         kCFAllocatorDefault, kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
-        [.biometryCurrentSet, .privateKeyUsage], nil
+        [.privateKeyUsage, .userPresence], nil
     ) else { return (nil, -7) }
     let attrs: [String: Any] = [
         kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
@@ -392,8 +366,8 @@ public func se_unwrap(_ handle: UInt64,
     return pt.count
 }
 
-// Sign `msg` with the Enclave key (ECDSA/SHA-256, DER). On a persistent biometric key this
-// prompts Face/Touch ID — proof of user presence for a login challenge. The private op runs
+// Sign `msg` with the Enclave key (ECDSA/SHA-256, DER). On a persistent key this
+// prompts Touch ID or the Mac password — proof of user presence for a login challenge. The private op runs
 // inside the Secure Enclave; only the signature comes back.
 @_cdecl("se_sign")
 public func se_sign(_ handle: UInt64,
