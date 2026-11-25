@@ -9,7 +9,7 @@ import 'wallet_api.dart';
 const _retiredLink =
     'This kind of invite link is no longer accepted. Ask the vault creator for a new invite.';
 const _otherLink =
-    'LokiSigner only reads invite links from your paired coordinator. Paste the invite code instead.';
+    'Loki only reads invite links from your Loki server. Paste the invite code instead.';
 
 ({String? code, String? error}) inviteCode(String text, String? coordinator) {
   if (!text.contains(':') && !text.contains('/')) {
@@ -416,7 +416,7 @@ class _VaultFormState extends State<VaultForm> {
                     setState(() => threshold = n);
                   }),
                   const Divider(),
-                  ValueRow('Vault policy', '$threshold of $members approvals'),
+                  ValueRow('Approvals needed', '$threshold of $members approvals'),
                   const ValueRow('Network', 'Testnet'),
                 ],
               ],
@@ -432,26 +432,26 @@ class _VaultFormState extends State<VaultForm> {
                   const LokiLabel('Details from the invite'),
                   ValueRow('Vault name (set by creator)', details.name),
                   ValueRow(
-                    'Vault policy',
+                    'Approvals needed',
                     '${details.threshold} of ${details.members} approvals',
                   ),
-                  ValueRow('Your member slot', 'Member ${details.slot}'),
+                  ValueRow('Your member number', 'Member ${details.slot}'),
                   const ValueRow('Network', 'Testnet'),
                   const Divider(),
                   if (details.legacyCreator case final creator?) ...[
                     LokiLabel(
-                      'Creator endpoint in the invite',
+                      'Creator’s address in the invite',
                       color: context.colors.muted,
                     ),
                     SelectableText(creator, style: lokiMono(11)),
                     Text(
-                      'This older invite joins the creator directly. Its HTTPS origin must be an allowed peer on this Mac.',
+                      'This older invite connects to the creator directly. Its address must be on this Mac’s allowed list.',
                       style: lokiSans(11, color: context.colors.muted),
                     ),
                   ] else ...[
-                    const ValueRow('Route', 'This signer’s relay'),
+                    const ValueRow('Connection', 'Through your signing server'),
                     Text(
-                      'LokiSigner joins through the relay configured for this signer and checks the creator’s identity from the invite. It contacts no address named in the invite.',
+                      'Loki joins through the signing server set up on this Mac and checks the creator’s identity from the invite. It never contacts an address named in the invite.',
                       style: lokiSans(11, color: context.colors.muted),
                     ),
                   ],
@@ -460,8 +460,8 @@ class _VaultFormState extends State<VaultForm> {
             ),
           Notice(
             joining
-                ? 'Only use an invite from your vault organizer. Joining approves no payment. After you join, compare roster codes with every member over a trusted channel before creating keys.'
-                : 'You’ll get a separate invite for each other member. Share them privately and compare roster codes together before creating keys.',
+                ? 'Only use an invite from your vault organizer. Joining does not approve any payment. After you join, compare safety codes with every member, by phone or in person, before creating keys.'
+                : 'You’ll get a separate invite for each other member. Share them privately and compare safety codes together before creating keys.',
           ),
           if (widget.busy) const LinearProgressIndicator(minHeight: 2),
           const Divider(),
@@ -569,12 +569,12 @@ class VaultSetup extends StatelessWidget {
           roster(context)
         else if (phase == 'creating_keys')
           const Notice(
-            'Creating keys on the member devices. Keep LokiSigner open while the ceremony completes.',
+            'Setting up the vault on each member’s device. Keep Loki open until setup finishes.',
           )
         else if (phase == 'setup_interrupted') ...[
           Notice(
             describeError(null, status['error'] as String?) ??
-                'Key generation was interrupted. Use a new vault and new invitations.',
+                'Vault setup was interrupted. Create a new vault and send new invitations.',
           ),
           const SizedBox(height: 10),
           Align(
@@ -591,8 +591,8 @@ class VaultSetup extends StatelessWidget {
         else ...[
           Notice(
             invites.isEmpty
-                ? 'Waiting for the other members. Leave LokiSigner open to follow setup.'
-                : 'Give each member their own invite link over a trusted channel. They can paste it in Join vault.',
+                ? 'Waiting for the other members. Keep Loki open to follow setup.'
+                : 'Send each member their own invite link, privately, in a way you trust. They paste it in Join vault.',
           ),
           for (final invite in invites) ...[
             const SizedBox(height: 8),
@@ -636,15 +636,15 @@ class VaultSetup extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          const LokiLabel('Roster verification'),
+          const LokiLabel('Member check'),
           const SizedBox(height: 13),
           Text(
-            'Do the roster codes match?',
+            'Do the safety codes match?',
             style: lokiSans(21, weight: 600, spacing: -.65),
           ),
           const SizedBox(height: 12),
           Text(
-            'Compare all six groups with every member over a trusted channel, such as a phone call or in person.',
+            'Compare all six groups with every member in a way you trust, such as a phone call or in person.',
             style: lokiSans(13, color: c.muted),
           ),
           if (groups.isNotEmpty) ...[
@@ -677,7 +677,7 @@ class VaultSetup extends StatelessWidget {
           ValueRow('Policy', policy(vault)),
           if (vault['my_slot'] case final int slot) ...[
             const SizedBox(height: 9),
-            ValueRow('Your slot', 'Member $slot'),
+            ValueRow('Your member number', 'Member $slot'),
           ],
           if (status['confirmations'] case final int count) ...[
             const SizedBox(height: 9),
@@ -691,16 +691,16 @@ class VaultSetup extends StatelessWidget {
               Expanded(
                 child: Text(
                   refused
-                      ? 'Codes differed. LokiSigner refuses this setup until it restarts.'
+                      ? 'The codes did not match. Loki refuses this setup until it restarts.'
                       : confirmed
                       ? 'You confirmed. Waiting for the other members.'
-                      : 'Continue to compare the codes in LokiSigner.',
+                      : 'Continue to compare the codes in Loki.',
                   style: lokiSans(11, color: c.muted),
                 ),
               ),
               if (!confirmed && !refused)
                 ActionChipButton(
-                  'Compare in LokiSigner',
+                  'Compare in Loki',
                   Icons.shield_outlined,
                   busy ||
                           waiting ||

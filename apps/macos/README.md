@@ -22,7 +22,7 @@ Set `LOKI_DEV_TEAM` to the Apple Developer team used for the standalone signer. 
 xcodebuild -workspace macos/Runner.xcworkspace -scheme Runner -configuration Debug \
   -destination 'platform=macOS,arch=arm64' -derivedDataPath "$PWD/build/native-provisioned" \
   -allowProvisioningUpdates DEVELOPMENT_TEAM="$LOKI_DEV_TEAM" build
-app="$PWD/build/native-provisioned/Build/Products/Debug/loki_signer.app"
+app="$PWD/build/native-provisioned/Build/Products/Debug/Loki.app"
 codesign --verify --deep --strict "$app"
 codesign -d --entitlements - "$app"
 open "$app"
@@ -30,11 +30,11 @@ open "$app"
 
 For a provisioned Release build, prepare with `flutter build macos --release --config-only`, then use `-configuration Release` in the Xcode command and `Build/Products/Release` for the app path. Do not pass the ad-hoc signing or visual-only overrides below to a provisioned build.
 
-To pair, choose **Pair this Mac** and type the coordinator address, for example `loki.megabyte.sh` (a bare host means HTTPS; paths, queries and credentials are refused). LokiSigner asks that coordinator for a member slot, checks that the returned `loki://pair` link names the same origin and the slot it reserved, then shows the coordinator and slot before anything is saved. Continue with the configuration review, passphrase and Touch ID. A one-use `loki://pair` link from the wallet, pasted in the same field, works as before. The coordinator admits anyone who knows its address, within its [admission rate limits](../../web/wallet/README.md#admission-and-rate-limits). The coordinator holds the slot for two minutes. If that runs out while you're still reviewing, LokiSigner asks for the same slot again by itself before anything is signed. If it runs out after you approved with Touch ID, LokiSigner says so and, if you continue, asks for the same slot once more; Touch ID then asks again, because the new reservation needs its own approval (Cancel stops like any other setup step). If the coordinator refuses that request, LokiSigner shows its reason: a slot that's only held asks you to wait for the hold to expire, and only a slot the public roster shows registered to another member suggests removing this profile. For a profile whose registration didn't finish, **Finish pairing** asks for the address again and unlocks the profile: it first tries to register without a new reservation, which also recovers a registration whose reply was lost, and asks for its slot again only if that has expired. The coordinator must serve a **testnet** `/api/signer-config` with HTTPS endpoints for frostd, lightwalletd and both nonce witnesses. The embedded app rejects loopback HTTP even on the same Mac. Real pairing, restore and signing use the Secure Enclave key, unlocked with Touch ID or the Mac password. A valid signature and matching provisioning profile are needed for the existing profile's Keychain items. An existing profile unlocks and reconnects without a new link.
+To pair, choose **Connect** and type the coordinator address, for example `loki.megabyte.sh` (a bare host means HTTPS; paths, queries and credentials are refused). LokiSigner asks that coordinator for a member slot, checks that the returned `loki://pair` link names the same origin and the slot it reserved, then shows the coordinator and slot before anything is saved. Continue with the configuration review, passphrase and Touch ID. A one-use `loki://pair` link from the wallet, pasted in the same field, works as before. The coordinator admits anyone who knows its address, within its [admission rate limits](../../web/wallet/README.md#admission-and-rate-limits). The coordinator holds the slot for two minutes. If that runs out while you're still reviewing, LokiSigner asks for the same slot again by itself before anything is signed. If it runs out after you approved with Touch ID, LokiSigner says so and, if you continue, asks for the same slot once more; Touch ID then asks again, because the new reservation needs its own approval (Cancel stops like any other setup step). If the coordinator refuses that request, LokiSigner shows its reason: a slot that's only held asks you to wait for the hold to expire, and only a slot the public roster shows registered to another member suggests removing this profile. For a profile whose registration didn't finish, **Finish connecting** asks for the address again and unlocks the profile: it first tries to register without a new reservation, which also recovers a registration whose reply was lost, and asks for its slot again only if that has expired. The coordinator must serve a **testnet** `/api/signer-config` with HTTPS endpoints for frostd, lightwalletd and both nonce witnesses. The embedded app rejects loopback HTTP even on the same Mac. Real pairing, restore and signing use the Secure Enclave key, unlocked with Touch ID or the Mac password. A valid signature and matching provisioning profile are needed for the existing profile's Keychain items. An existing profile unlocks and reconnects without a new link.
 
-Pairing never asks for a witness fingerprint. LokiSigner trusts the coordinator's nonce witness pair the first time and saves it. After each unlock it checks the coordinator once in the background; if the coordinator now serves a different pair, LokiSigner shows **The coordinator changed its nonce witnesses** with both fingerprints. Signing keeps the saved pair until you choose **Trust new witnesses** and confirm with Touch ID or the Mac password; the new pair applies from the next unlock. Only trust it if the coordinator's operator told you the witnesses changed. Otherwise choose **Keep current witnesses** and contact the operator.
+Pairing never asks for a witness fingerprint. LokiSigner trusts the coordinator's nonce witness pair the first time and saves it. After each unlock it checks the coordinator once in the background; if the coordinator now serves a different pair, LokiSigner shows **Your Loki server changed its signing safety servers** with both fingerprints. Signing keeps the saved pair until you choose **Trust new safety servers** and confirm with Touch ID or the Mac password; the new pair applies from the next unlock. Only trust it if the coordinator's operator told you the witnesses changed. Otherwise choose **Keep current safety servers** and contact the operator.
 
-The workspace footer shows the active signer's pinned origin as **Paired coordinator**. It is read-only and does not indicate whether the coordinator is reachable.
+The workspace footer shows the active signer's pinned origin as **Loki server**. It is read-only and does not indicate whether the coordinator is reachable.
 
 ### Vaults across Macs
 
@@ -60,10 +60,10 @@ For legacy invites the joiner must configure the exact creator origin with `--pe
 To test a 2-of-3 vault alone, run one LokiSigner process per member profile:
 
 ```sh
-apps/macos/scripts/run-members.sh 3   # or APP=/path/to/loki_signer.app apps/macos/scripts/run-members.sh 3
+apps/macos/scripts/run-members.sh 3   # or APP=/path/to/Loki.app apps/macos/scripts/run-members.sh 3
 ```
 
-Member 1 uses the default profile and members 2 and up use `~/Library/Application Support/LokiSigner-memberN`. Once paired, each window is titled **LokiSigner — Member N** in Mission Control, the Window menu and the Dock. Each profile folder can be open in only one process at a time: a second LokiSigner on the same `--data` folder refuses to pair or unlock and says the profile is already open. The lock file sits next to the folder (`<folder>.lock`).
+Member 1 uses the default profile and members 2 and up use `~/Library/Application Support/LokiSigner-memberN`. Once paired, each window is titled **Loki — Member N** in Mission Control, the Window menu and the Dock. Each profile folder can be open in only one process at a time: a second LokiSigner on the same `--data` folder refuses to pair or unlock and says the profile is already open. The lock file sits next to the folder (`<folder>.lock`).
 
 ### Opening invite links in the app (operator setup)
 
@@ -88,7 +88,7 @@ xcodebuild -workspace macos/Runner.xcworkspace -scheme Runner -configuration Deb
   CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= PROVISIONING_PROFILE_SPECIFIER= \
   CODE_SIGN_ENTITLEMENTS=Runner/Visual.entitlements PRODUCT_BUNDLE_IDENTIFIER=cash.loki.signer.visual \
   'SWIFT_ACTIVE_COMPILATION_CONDITIONS=DEBUG LOKI_VISUAL_ONLY' build
-app="$PWD/build/native-visual/Build/Products/Debug/loki_signer.app"
+app="$PWD/build/native-visual/Build/Products/Debug/Loki.app"
 codesign --verify --deep --strict "$app"
 open "$app"
 mkdir -p ../.amp/in/artifacts

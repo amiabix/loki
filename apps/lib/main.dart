@@ -35,7 +35,7 @@ class _LokiAppState extends State<LokiApp> {
 
   @override
   Widget build(BuildContext context) => MaterialApp(
-    title: 'LokiSigner',
+    title: 'Loki',
     debugShowCheckedModeBanner: false,
     theme: lokiTheme(false),
     darkTheme: lokiTheme(true),
@@ -387,7 +387,7 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
       } else if (mounted && epoch == generation) {
         setState(
           () => scanError = touchId
-              ? 'Touch ID is needed to open this vault. LokiSigner will ask again.'
+              ? 'Touch ID is needed to open this vault. Loki will ask again.'
               : 'Balance could not sync. Retrying…',
         );
       }
@@ -631,7 +631,7 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
                               crossAxisAlignment: WrapCrossAlignment.center,
                               children: [
                                 Text(
-                                  'Paired coordinator',
+                                  'Loki server',
                                   style: lokiSans(10, color: c.muted),
                                 ),
                                 Text(
@@ -659,22 +659,7 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
                       children: [
                         topBar(),
                         walletBody(child: fresh ? signerSetup() : locked()),
-                        Padding(
-                          padding: const EdgeInsets.symmetric(vertical: 12),
-                          child: Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                            children: [
-                              Text(
-                                'This Mac',
-                                style: lokiSans(10, color: c.muted),
-                              ),
-                              Text(
-                                'Testnet funds only',
-                                style: lokiSans(10, color: c.muted),
-                              ),
-                            ],
-                          ),
-                        ),
+                        const SizedBox(height: 12),
                       ],
                     ),
                   ),
@@ -699,16 +684,16 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
     final last = sync['last_ok_at'];
     final String text;
     if (failing) {
-      text = 'Relay unreachable. Retrying…';
+      text = 'Can’t reach the server. Retrying…';
     } else if (sync['in_progress'] == true && last == null) {
-      text = 'Syncing with the relay…';
+      text = 'Syncing with the server…';
     } else if (last is int) {
       final age = DateTime.now().millisecondsSinceEpoch ~/ 1000 - last;
       text = age < 5
           ? 'Up to date'
           : 'Updated ${age < 60 ? '${age}s' : '${age ~/ 60} min'} ago';
     } else {
-      text = 'Syncing with the relay…';
+      text = 'Syncing with the server…';
     }
     return Row(
       spacing: 6,
@@ -763,7 +748,7 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
 
   Widget lockControl() => IconButton(
     onPressed: locking || (busy && !hideContent) ? null : lock,
-    tooltip: 'Lock signer',
+    tooltip: 'Lock Loki',
     icon: Icon(Icons.lock_outline, size: 15, color: context.colors.muted),
   );
 
@@ -848,10 +833,13 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
       ),
     );
     final systemGlass = profile['liquid_glass'] == true;
+    // Concentric with the window corner (~17 pt on macOS 26+, ~10 pt before); the
+    // traffic lights sit 12 pt inside this inset (MainFlutterWindow.sidebarInset).
+    final inset = systemGlass ? 8.0 : 4.0, radius = systemGlass ? 9.0 : 6.0;
     return Padding(
-      padding: const EdgeInsets.all(8),
+      padding: EdgeInsets.all(inset),
       child: ClipRRect(
-        borderRadius: BorderRadius.circular(17),
+        borderRadius: BorderRadius.circular(radius),
         child: Stack(
           fit: StackFit.expand,
           children: [
@@ -864,7 +852,7 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
               filter: ImageFilter.blur(sigmaX: 22, sigmaY: 22),
               child: DecoratedBox(
                 decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(17),
+                  borderRadius: BorderRadius.circular(radius),
                   border: Border.all(color: c.stroke),
                   gradient: systemGlass
                       ? null
@@ -909,24 +897,15 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
                               const SizedBox(height: 30),
                               if (setup) ...[
                                 caption('On this Mac'),
-                                nav(
-                                  'Signer setup',
-                                  Icons.laptop_mac,
-                                  fresh,
-                                  null,
-                                ),
-                                nav(
-                                  'Local profile',
-                                  Icons.lock_outline,
-                                  !fresh,
-                                  null,
-                                ),
-                                nav(
-                                  'Recovery',
-                                  Icons.key_outlined,
-                                  false,
-                                  null,
-                                ),
+                                if (fresh)
+                                  nav('Setup', Icons.laptop_mac, true, null)
+                                else
+                                  nav(
+                                    'Local profile',
+                                    Icons.lock_outline,
+                                    true,
+                                    null,
+                                  ),
                               ] else ...[
                                 caption('Workspace'),
                                 nav(
@@ -965,7 +944,7 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
                                     () => openVault(v),
                                   ),
                                 const SizedBox(height: 22),
-                                caption('Signer'),
+                                caption('On this Mac'),
                                 nav(
                                   'Vault addresses',
                                   Icons.qr_code,
@@ -1003,7 +982,7 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
                               children: [
                                 Text(
                                   setup
-                                      ? 'LokiSigner'
+                                      ? 'Loki'
                                       : profile['slot'] == null
                                       ? 'Member'
                                       : 'Member ${profile['slot']}',
@@ -1042,11 +1021,11 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
         spacing: 14,
         children: [
           LokiHead(
-            'Signer setup',
-            enteringLink ? 'Enter coordinator address' : 'Set up your signer',
+            'Setup',
+            enteringLink ? 'Enter your Loki server' : 'Set up Loki on this Mac',
             enteringLink
-                ? 'Type the address of the coordinator you’re joining, for example loki.megabyte.sh. A pairing link from the wallet works too.'
-                : 'Pair a new signer with this Mac, or recover an existing signer.',
+                ? 'Nothing is saved until you confirm the server and your member number. A connection link from the wallet works too.'
+                : null,
           ),
           Surface(
             padding: const EdgeInsets.all(18),
@@ -1054,45 +1033,33 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
               crossAxisAlignment: CrossAxisAlignment.stretch,
               spacing: 12,
               children: [
-                Row(
-                  children: [
-                    Expanded(
-                      child: LokiLabel(
-                        enteringLink ? 'Coordinator address' : 'Start on this Mac',
-                      ),
-                    ),
-                    if (enteringLink)
-                      Text('01 / 03', style: lokiMono(9, color: c.muted)),
-                  ],
-                ),
-                if (enteringLink)
-                  coordinatorAddressField()
-                else ...[
+                if (enteringLink) ...[
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: Text('01 / 03', style: lokiMono(9, color: c.muted)),
+                  ),
+                  coordinatorAddressField(),
+                ] else ...[
                   Text(
-                    '01   Pair a new signer',
+                    '01   Connect to a server',
                     style: lokiSans(14, weight: 600),
                   ),
                   Text(
-                    'Type your coordinator’s address, like loki.megabyte.sh.',
+                    'Enter your Loki server’s address.',
                     style: lokiSans(12, color: c.muted),
                   ),
                   const Divider(),
                   Text(
-                    '02   Restore instead',
+                    '02   Restore from backup',
                     style: lokiSans(14, weight: 600),
                   ),
                   Text(
-                    'You’ll need 24 recovery words and the encrypted vault backup.',
+                    'You’ll need your 24 recovery words and your backup file.',
                     style: lokiSans(12, color: c.muted),
                   ),
                 ],
               ],
             ),
-          ),
-          Notice(
-            enteringLink
-                ? 'Next: LokiSigner asks the coordinator for a member slot, then shows you the coordinator and slot before anything is saved.'
-                : 'Adding or removing an enrolled fingerprint can make this Mac’s signer keys unusable. Keep your words and backup.',
           ),
           if (hasNativeFeedback) nativeFeedback(),
           if (actionError case final message? when message != nativeStatus)
@@ -1103,7 +1070,7 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
             spacing: 8,
             children: [
               ActionChipButton(
-                enteringLink ? 'Cancel' : 'Restore signer',
+                enteringLink ? 'Cancel' : 'Restore from backup',
                 enteringLink ? Icons.close : Icons.key_outlined,
                 busy
                     ? null
@@ -1116,7 +1083,7 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
                     : () => act(api.restore),
               ),
               ActionChipButton(
-                enteringLink ? 'Continue' : 'Pair this Mac',
+                enteringLink ? 'Continue' : 'Connect',
                 Icons.arrow_forward,
                 busy || (enteringLink && pairingLink.trim().isEmpty)
                     ? null
@@ -1151,9 +1118,10 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
     onFieldSubmitted: (_) {
       if (!busy && pairingLink.trim().isNotEmpty) submitCoordinatorAddress();
     },
-    decoration: const InputDecoration(
-      hintText: 'loki.megabyte.sh',
-      prefixIcon: Icon(Icons.dns_outlined, size: 17),
+    decoration: InputDecoration(
+      hintText: 'your-server.example',
+      hintStyle: lokiMono(13, color: context.colors.muted.withValues(alpha: .55)),
+      prefixIcon: const Icon(Icons.dns_outlined, size: 17),
     ),
   );
 
@@ -1171,7 +1139,7 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
     spacing: 10,
     children: [
       const Notice(
-        'This Mac’s registration with the coordinator didn’t finish. Enter the coordinator address again, then your passphrase: LokiSigner first tries to finish with this profile, and asks for its slot again only if that has expired.',
+        'This Mac didn’t finish joining the Loki server. Enter the server address again, then your passphrase. Loki first tries to finish with this profile. It asks for the same spot again only if the hold on it has expired.',
       ),
       if (enteringLink) coordinatorAddressField(),
       Wrap(
@@ -1197,7 +1165,7 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
                     }),
             ),
           ActionChipButton(
-            enteringLink ? 'Continue' : 'Pair again',
+            enteringLink ? 'Continue' : 'Connect again',
             Icons.arrow_forward,
             busy || (enteringLink && pairingLink.trim().isEmpty)
                 ? null
@@ -1232,15 +1200,15 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
                 const SizedBox(height: 14),
                 Text(
                   !loaded
-                      ? 'Opening LokiSigner…'
+                      ? 'Opening Loki…'
                       : pairingPending
-                      ? 'Finish pairing'
-                      : 'Unlock your signer',
+                      ? 'Finish connecting'
+                      : 'Unlock Loki',
                   style: lokiSans(26, weight: 600, spacing: -1),
                 ),
                 const SizedBox(height: 12),
                 Text(
-                  'Use your local profile passphrase to open LokiSigner on this Mac.',
+                  'Enter your passphrase to open Loki on this Mac.',
                   style: lokiSans(13, color: c.muted),
                 ),
                 if (hasNativeFeedback) ...[
@@ -1257,26 +1225,14 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
                   unfinishedPairing(),
                 ],
                 const SizedBox(height: 18),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    Flexible(
-                      child: Text(
-                        'Testnet only',
-                        style: lokiMono(9, color: c.muted),
-                      ),
-                    ),
-                    const SizedBox(width: 6),
-                    Flexible(
-                      flex: 3,
-                      child: ActionChipButton(
-                        'Unlock signer',
-                        Icons.lock_open,
-                        busy || !loaded ? null : () => act(api.unlock),
-                        primary: true,
-                      ),
-                    ),
-                  ],
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: ActionChipButton(
+                    'Unlock',
+                    Icons.lock_open,
+                    busy || !loaded ? null : () => act(api.unlock),
+                    primary: true,
+                  ),
                 ),
                 if (busy)
                   const Padding(
@@ -1614,7 +1570,7 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
     crossAxisAlignment: CrossAxisAlignment.stretch,
     children: [
       const LokiHead(
-        'Signer',
+        'On this Mac',
         'Vault addresses',
         'Receive addresses are verified by this Mac before copying.',
       ),
@@ -1652,7 +1608,7 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
               ] else
                 Text(
                   describeError(null, row['error'] as String?) ??
-                      'LokiSigner could not verify the receive address.',
+                      'Loki could not verify the receive address.',
                 ),
             ],
           ),
@@ -1667,7 +1623,7 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         const LokiHead(
-          'Signer',
+          'On this Mac',
           'Recovery',
           'Keep each vault’s encrypted backup separate from your recovery words.',
         ),

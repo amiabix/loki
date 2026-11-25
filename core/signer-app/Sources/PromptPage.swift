@@ -287,7 +287,7 @@ final class SignerPromptPage: NSView {
         }
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
-        let kicker = SignerReview.caption(review.section + "  /  Local signer")
+        let kicker = SignerReview.caption(review.section + "  /  Loki on this Mac")
         let title = SignerReview.label(review.title, size: 31, weight: .semibold)
         let detail = SignerReview.label(review.intro, tone: SignerReview.muted)
         let body = SignerReview.column([kicker, title, detail] + review.content, spacing: 11)
